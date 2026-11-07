@@ -12,6 +12,9 @@ FROM ${CUDA_RUNTIME_IMAGE} AS binary
 ARG REL_VERSION
 ARG CUDA_COMPUTE_CAP=80
 ARG GITHUB_REPOSITORY=spiceai/spiceai
+# sha256 of the downloaded release asset. When set, the build fails on any
+# other file. spiced_docker.yml passes the sha256 publish_release recorded.
+ARG SPICED_SHA256=
 
 RUN if [ -z "$REL_VERSION" ]; then echo "REL_VERSION build-arg is required" >&2; exit 1; fi
 
@@ -26,6 +29,7 @@ RUN set -eux; \
     asset="spiced_cuda_${CUDA_COMPUTE_CAP}_linux_x86_64.tar.gz"; \
     base_url="https://github.com/${GITHUB_REPOSITORY}/releases/download/v${REL_VERSION}/${asset}"; \
     curl -fSLo /tmp/spiced.tar.gz "${base_url}"; \
+    if [ -n "${SPICED_SHA256}" ]; then echo "${SPICED_SHA256}  /tmp/spiced.tar.gz" | sha256sum -c -; fi; \
     tar -C /root -xzf /tmp/spiced.tar.gz; \
     chmod +x /root/spiced; \
     rm -f /tmp/spiced.tar.gz

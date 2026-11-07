@@ -16,15 +16,15 @@ limitations under the License.
 
 use std::{
     collections::HashMap,
-    env,
-    ffi::OsString,
     path::{Path, PathBuf},
     sync::{Arc, LazyLock},
     time::{Duration, Instant},
 };
 
 use crate::{
-    configure_test_datafusion, init_tracing,
+    configure_test_datafusion,
+    docker::RunningContainer,
+    init_tracing,
     utils::{run_query, runtime_ready_check, test_request_context, wait_until_true},
 };
 use anyhow::{Context, Result, anyhow};
@@ -32,14 +32,13 @@ use app::AppBuilder;
 use arrow::array::{AsArray, RecordBatch};
 use arrow::datatypes::{Int64Type, SchemaRef};
 use arrow::util::pretty::pretty_format_batches;
-use aws_sdk_credential_bridge::{S3CredentialProvider, get_or_init_sdk_config};
 use chrono::Utc;
 use datafusion::common::TableReference;
 #[cfg(feature = "duckdb")]
 use duckdb::Connection;
 use futures::{StreamExt, future::try_join_all};
 use object_store::{
-    ClientOptions, ObjectMeta, ObjectStore, ObjectStoreExt,
+    ObjectMeta, ObjectStore, ObjectStoreExt,
     aws::AmazonS3Builder,
     path::{Path as ObjectPath, PathPart},
 };
@@ -47,7 +46,7 @@ use runtime::{Runtime, status::ComponentStatus};
 use runtime_acceleration::snapshot::{
     AccelerationEngine, ForceCreate, SnapshotBehavior as RuntimeSnapshotBehavior, SnapshotManager,
 };
-use serde_json::{Value, json};
+use serde_json::Value;
 use spicepod::acceleration::{
     RefreshMode, SnapshotsCompaction, SnapshotsCreationPolicy, SnapshotsTrigger,
 };
@@ -69,27 +68,35 @@ use tokio::{
 };
 use uuid::Uuid;
 
-const SNAPSHOT_BUCKET: &str = "spiceai-snapshot-integration-tests";
-const SNAPSHOT_REGION: &str = "us-west-2";
+const SNAPSHOT_BUCKET: &str = crate::rustfs::S3_BUCKET;
 const TAXI_TRIPS_DATASET_NAME: &str = "taxi_trips";
 
 static SNAPSHOT_TEST_MUTEX: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
 
+/// A snapshot location in a `RustFS` container this test owns, and a client for it.
 struct SnapshotS3Context {
     store: Arc<dyn ObjectStore>,
+    endpoint: String,
     prefix: String,
     base_path: ObjectPath,
+    _object_store: RunningContainer,
 }
 
 impl SnapshotS3Context {
     async fn new(test_name: &str) -> Result<Self> {
-        let store = build_snapshot_store().await?;
+        let object_store =
+            crate::rustfs::start_object_store(&format!("spice_test_rustfs_{test_name}")).await?;
+        let endpoint = format!("http://127.0.0.1:{}", object_store.host_port(9000)?);
+        crate::rustfs::create_bucket(&endpoint).await?;
+        let store = build_snapshot_store(&endpoint)?;
         let prefix = format!("{test_name}/{}", Uuid::now_v7());
         let base_path = ObjectPath::from(prefix.clone());
         Ok(Self {
             store,
+            endpoint,
             prefix,
             base_path,
+            _object_store: object_store,
         })
     }
 
@@ -225,6 +232,23 @@ struct SnapshotFixture {
 }
 
 impl SnapshotFixture {
+    /// Points the fixture at a new, empty local acceleration path, so the next
+    /// runtime starts with no local data and bootstraps from the published
+    /// snapshot. The earlier runtime's files are left where they are: a runtime
+    /// that ran earlier in this process can keep its Cayenne metastore open, and
+    /// a metastore deleted and recreated under the same path is not one the
+    /// next runtime can read.
+    fn restart_on_empty_local_storage(&mut self) {
+        let name = self
+            .local_db_path
+            .file_name()
+            .map(|name| name.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        self.local_db_path = self
+            .local_db_path
+            .with_file_name(format!("restarted_{name}"));
+    }
+
     fn dataset(
         &self,
         snapshot_behavior: DatasetSnapshotBehavior,
@@ -238,7 +262,11 @@ impl SnapshotFixture {
         }
 
         let mut accel_params: HashMap<String, String> = HashMap::from([(
-            format!("{}_file", self.engine),
+            if self.engine == "cayenne" {
+                "cayenne_file_path".to_string()
+            } else {
+                format!("{}_file", self.engine)
+            },
             self.local_db_path.to_string_lossy().to_string(),
         )]);
         for (key, value) in extra_accel_params {
@@ -284,42 +312,115 @@ impl SnapshotFixture {
         Ok(runtime)
     }
 
-    /// A `SnapshotManager` for `taxi_trips` that snapshots the `DuckDB` file at
+    /// A `SnapshotManager` for `taxi_trips` that snapshots the acceleration at
     /// `local_db_path` into this fixture's location.
+    ///
+    /// For Cayenne the layout and the snapshot engine come from the runtime's Cayenne
+    /// accelerator for a dataset at `local_db_path`, as they do for a dataset the
+    /// runtime loads, so a snapshot published here has the dataset-level data root
+    /// and the metastore slice that a Cayenne bootstrap restores.
     async fn snapshot_manager(
         &self,
-        runtime: &Runtime,
+        runtime: &Arc<Runtime>,
         local_db_path: PathBuf,
         compaction: SnapshotsCompaction,
         policy: SnapshotsCreationPolicy,
     ) -> Result<SnapshotManager> {
-        let runtime_snapshots = runtime
-            .app()
-            .read()
+        match self.engine {
+            "cayenne" => {
+                self.cayenne_snapshot_manager(runtime, &local_db_path, compaction, policy)
+                    .await
+            }
+            #[cfg(feature = "duckdb")]
+            "duckdb" => Ok(SnapshotManager::try_new(
+                TAXI_TRIPS_DATASET_NAME.to_string(),
+                snapshot_behavior(runtime, compaction).await?,
+                runtime_acceleration::snapshot::AccelerationLayout::file(local_db_path),
+                AccelerationEngine::DuckDB,
+            )
             .await
-            .as_ref()
-            .map(|app| app.dataset_snapshots(&spicepod::acceleration::Acceleration::default()))
-            .ok_or_else(|| anyhow!("Runtime snapshots configuration unavailable"))?;
-        let snapshot_behavior = RuntimeSnapshotBehavior::enabled(
-            runtime_snapshots,
-            runtime.secrets_weak(),
-            runtime.tokio_io_runtime(),
-            compaction,
+            .ok_or_else(|| anyhow!("Failed to initialize SnapshotManager"))?
+            .with_snapshots_creation_policy(policy)),
+            other => Err(anyhow!("unsupported fixture engine {other}")),
+        }
+    }
+
+    async fn cayenne_snapshot_manager(
+        &self,
+        runtime: &Arc<Runtime>,
+        local_db_path: &Path,
+        compaction: SnapshotsCompaction,
+        policy: SnapshotsCreationPolicy,
+    ) -> Result<SnapshotManager> {
+        let spicepod_dataset = build_dataset(
+            &self.dataset_from,
+            TAXI_TRIPS_DATASET_NAME,
+            &self.dataset_params,
+            DatasetSnapshotBehavior::Enabled,
+            &HashMap::from([(
+                "cayenne_file_path".to_string(),
+                local_db_path.to_string_lossy().to_string(),
+            )]),
+            "cayenne",
+            RefreshOnStartup::Auto,
         );
+        let app = runtime
+            .read_app()
+            .await
+            .ok_or_else(|| anyhow!("The runtime has no app"))?;
+        let dataset =
+            runtime::component::dataset::builder::DatasetBuilder::try_from(spicepod_dataset)
+                .map_err(|err| anyhow!("Building the taxi_trips dataset: {err}"))?
+                .with_app(app)
+                .with_runtime(Arc::clone(runtime))
+                .build()
+                .map_err(|err| anyhow!("Building the taxi_trips dataset: {err}"))?;
+        let accelerator = runtime
+            .accelerator_engine_registry()
+            .get_accelerator_engine(runtime_acceleration::Engine::Cayenne)
+            .await
+            .ok_or_else(|| anyhow!("The runtime has no Cayenne accelerator"))?;
+        let snapshot_engine = accelerator
+            .snapshot_engine_for_source(&dataset)
+            .await
+            .ok_or_else(|| anyhow!("The Cayenne accelerator returned no snapshot engine"))?;
+
         Ok(SnapshotManager::try_new(
             TAXI_TRIPS_DATASET_NAME.to_string(),
-            snapshot_behavior,
-            runtime_acceleration::snapshot::AccelerationLayout::file(local_db_path),
-            AccelerationEngine::DuckDB,
+            snapshot_behavior(runtime, compaction).await?,
+            accelerator.acceleration_layout(&dataset),
+            AccelerationEngine::Cayenne,
         )
         .await
         .ok_or_else(|| anyhow!("Failed to initialize SnapshotManager"))?
+        .with_snapshot_engine(snapshot_engine)
         .with_snapshots_creation_policy(policy))
     }
 
     async fn cleanup(self) -> Result<()> {
         self.context.cleanup().await
     }
+}
+
+/// The runtime's snapshot settings for a `taxi_trips` acceleration, for a
+/// `SnapshotManager` a test drives itself.
+async fn snapshot_behavior(
+    runtime: &Runtime,
+    compaction: SnapshotsCompaction,
+) -> Result<RuntimeSnapshotBehavior> {
+    let runtime_snapshots = runtime
+        .app()
+        .read()
+        .await
+        .as_ref()
+        .map(|app| app.dataset_snapshots(&spicepod::acceleration::Acceleration::default()))
+        .ok_or_else(|| anyhow!("Runtime snapshots configuration unavailable"))?;
+    Ok(RuntimeSnapshotBehavior::enabled(
+        runtime_snapshots,
+        runtime.secrets_weak(),
+        runtime.tokio_io_runtime(),
+        compaction,
+    ))
 }
 
 fn build_dataset(
@@ -351,33 +452,20 @@ fn build_snapshots_config(
     context: &SnapshotS3Context,
     behavior: BootstrapOnFailureBehavior,
 ) -> Snapshots {
-    let mut param_map = HashMap::from([("s3_region".to_string(), SNAPSHOT_REGION.to_string())]);
-
-    if env::var("AWS_PROFILE").is_ok() {
-        param_map.insert("s3_auth".to_string(), "iam_role".to_string());
-    } else {
-        param_map.insert("s3_auth".to_string(), "key".to_string());
-        param_map.insert(
+    let param_map = HashMap::from([
+        ("s3_region".to_string(), "us-east-1".to_string()),
+        ("s3_endpoint".to_string(), context.endpoint.clone()),
+        ("allow_http".to_string(), "true".to_string()),
+        ("s3_auth".to_string(), "key".to_string()),
+        (
             "s3_key".to_string(),
-            "${secrets:AWS_SNAPSHOT_KEY}".to_string(),
-        );
-        param_map.insert(
+            crate::rustfs::S3_ACCESS_KEY.to_string(),
+        ),
+        (
             "s3_secret".to_string(),
-            "${secrets:AWS_SNAPSHOT_SECRET}".to_string(),
-        );
-        param_map.extend(crate::utils::aws_session_token_param(
-            "s3_session_token",
-            "AWS_SNAPSHOT_SESSION_TOKEN",
-        ));
-    }
-
-    if let Ok(endpoint) = env::var("AWS_SNAPSHOT_ENDPOINT") {
-        param_map.insert(
-            "allow_http".to_string(),
-            endpoint.starts_with("http://").to_string(),
-        );
-        param_map.insert("s3_endpoint".to_string(), endpoint);
-    }
+            crate::rustfs::S3_SECRET_KEY.to_string(),
+        ),
+    ]);
 
     Snapshots {
         enabled: true,
@@ -387,106 +475,18 @@ fn build_snapshots_config(
     }
 }
 
-#[expect(clippy::expect_used)]
-fn build_metadata_document(
-    context: &SnapshotS3Context,
-    dataset_name: &str,
-    snapshot_objects: &[ObjectMeta],
-    schema: &SchemaRef,
-) -> Value {
-    let location = context.location_uri();
-    let last_updated_ms = Utc::now().timestamp_millis();
-
-    let mut snapshots: Vec<Value> = snapshot_objects
-        .iter()
-        .enumerate()
-        .map(|(idx, meta)| {
-            let timestamp_ms = meta.last_modified.timestamp_millis();
-            let snapshot_path = format!("s3://{SNAPSHOT_BUCKET}/{}", meta.location);
-            let checksum = meta.e_tag.clone().unwrap_or_default();
-            json!({
-                "snapshot-id": idx,
-                "timestamp-ms": timestamp_ms,
-                "snapshot": snapshot_path,
-                "snapshot-checksum": checksum,
-                "snapshot-checksum-algorithm": if checksum.is_empty() { Value::Null } else { Value::from("ETag") },
-                "snapshot-size": meta.size,
-            })
-        })
-        .collect();
-
-    snapshots.sort_by_key(|value| {
-        value
-            .get("timestamp-ms")
-            .and_then(Value::as_i64)
-            .unwrap_or(0)
-    });
-
-    let current_snapshot_id = snapshots
-        .last()
-        .and_then(|value| value.get("snapshot-id").and_then(Value::as_i64))
-        .unwrap_or(0);
-
-    let schema_json = serde_json::to_value(schema.as_ref()).expect("Serializing schema to JSON");
-
-    json!({
-        "format-version": 1,
-        "location": location,
-        "last-updated-ms": last_updated_ms,
-        dataset_name: {
-            "name": dataset_name,
-            "schemas": [
-                { "schema-id": 0, "schema": schema_json }
-            ],
-            "current-schema-id": 0,
-            "snapshots": snapshots,
-            "current-snapshot-id": current_snapshot_id,
-            "properties": {},
-        }
-    })
-}
-
-async fn build_snapshot_store() -> Result<Arc<dyn ObjectStore>> {
-    let mut builder = AmazonS3Builder::from_env()
-        .with_bucket_name(SNAPSHOT_BUCKET)
-        .with_region(SNAPSHOT_REGION)
-        .with_client_options(ClientOptions::default());
-
-    // An S3-compatible store (e.g. MinIO) in place of AWS, for running the suite locally.
-    if let Ok(endpoint) = env::var("AWS_SNAPSHOT_ENDPOINT") {
-        builder = builder
-            .with_allow_http(endpoint.starts_with("http://"))
-            .with_endpoint(endpoint);
-    }
-
-    if let (Ok(key), Ok(secret)) = (
-        env::var("AWS_SNAPSHOT_KEY"),
-        env::var("AWS_SNAPSHOT_SECRET"),
-    ) {
-        builder = builder
-            .with_access_key_id(key)
-            .with_secret_access_key(secret);
-        if let Ok(token) = env::var("AWS_SNAPSHOT_SESSION_TOKEN") {
-            builder = builder.with_token(token);
-        }
-    } else {
-        let config = get_or_init_sdk_config()
-            .await
-            .map_err(|err| anyhow!("Failed to initialize AWS credentials: {err}"))?;
-        let Some(config) = config else {
-            return Err(anyhow!(
-                "AWS credentials are required to run snapshot integration tests. Provide AWS_SNAPSHOT_KEY/AWS_SNAPSHOT_SECRET or configure AWS_PROFILE."
-            ));
-        };
-        builder = builder.with_credentials(Arc::new(
-            S3CredentialProvider::from_config(config.as_ref())
-                .context("Loading AWS credentials from environment")?,
-        ));
-    }
-
-    Ok(Arc::new(builder.build().context(
-        "Building Amazon S3 object store client for snapshots",
-    )?))
+fn build_snapshot_store(endpoint: &str) -> Result<Arc<dyn ObjectStore>> {
+    Ok(Arc::new(
+        AmazonS3Builder::new()
+            .with_bucket_name(SNAPSHOT_BUCKET)
+            .with_region("us-east-1")
+            .with_endpoint(endpoint)
+            .with_allow_http(true)
+            .with_access_key_id(crate::rustfs::S3_ACCESS_KEY)
+            .with_secret_access_key(crate::rustfs::S3_SECRET_KEY)
+            .build()
+            .context("Building the S3 client for the snapshot location")?,
+    ))
 }
 
 async fn load_runtime(rt: Arc<Runtime>) -> Result<()> {
@@ -497,7 +497,16 @@ async fn load_runtime(rt: Arc<Runtime>) -> Result<()> {
     Ok(())
 }
 
+#[cfg(feature = "duckdb")]
 async fn prepare_duckdb_fixture(test_name: &str) -> Result<SnapshotFixture> {
+    prepare_fixture(test_name, "duckdb").await
+}
+
+async fn prepare_cayenne_fixture(test_name: &str) -> Result<SnapshotFixture> {
+    prepare_fixture(test_name, "cayenne").await
+}
+
+async fn prepare_fixture(test_name: &str, engine: &'static str) -> Result<SnapshotFixture> {
     configure_test_datafusion();
 
     let context = SnapshotS3Context::new(test_name).await?;
@@ -508,7 +517,7 @@ async fn prepare_duckdb_fixture(test_name: &str) -> Result<SnapshotFixture> {
         .await
         .context("Writing sample CSV for dataset source")?;
     let dataset_from = format!("file://{}", sample_source_path.display());
-    let local_db_path = temp_dir.path().join("taxi_trips.duckdb");
+    let local_db_path = temp_dir.path().join(format!("taxi_trips.{engine}"));
 
     let dataset_params = HashMap::from([
         ("file_format".to_string(), "csv".to_string()),
@@ -517,7 +526,11 @@ async fn prepare_duckdb_fixture(test_name: &str) -> Result<SnapshotFixture> {
 
     let mut accel_params = HashMap::new();
     accel_params.insert(
-        "duckdb_file".to_string(),
+        if engine == "cayenne" {
+            "cayenne_file_path".to_string()
+        } else {
+            "duckdb_file".to_string()
+        },
         local_db_path.to_string_lossy().to_string(),
     );
 
@@ -527,7 +540,7 @@ async fn prepare_duckdb_fixture(test_name: &str) -> Result<SnapshotFixture> {
         &dataset_params,
         DatasetSnapshotBehavior::Enabled,
         &accel_params,
-        "duckdb",
+        engine,
         RefreshOnStartup::Auto,
     );
 
@@ -557,22 +570,18 @@ async fn prepare_duckdb_fixture(test_name: &str) -> Result<SnapshotFixture> {
 
     // Shutdown resigns the snapshot writer lease, and a snapshot that has not
     // taken the lease by then is skipped, so the first snapshot is awaited first.
-    let snapshot_objects = context
+    context
         .wait_for_snapshot_objects(TAXI_TRIPS_DATASET_NAME, 1, Duration::from_mins(1))
         .await?;
 
     runtime.shutdown().await;
 
-    let metadata = build_metadata_document(
-        &context,
-        TAXI_TRIPS_DATASET_NAME,
-        &snapshot_objects,
-        &schema,
-    );
-    context
-        .write_metadata(&metadata)
-        .await
-        .context("Writing initial snapshot metadata")?;
+    // The runtime's own `metadata.json` is what a bootstrap reads, so the fixture
+    // keeps it as published.
+    let initial_snapshot_count = context
+        .published_snapshots(TAXI_TRIPS_DATASET_NAME)
+        .await?
+        .len();
 
     Ok(SnapshotFixture {
         context,
@@ -582,8 +591,8 @@ async fn prepare_duckdb_fixture(test_name: &str) -> Result<SnapshotFixture> {
         dataset_params,
         schema,
         baseline,
-        engine: "duckdb",
-        initial_snapshot_count: snapshot_objects.len(),
+        engine,
+        initial_snapshot_count,
     })
 }
 
@@ -648,22 +657,18 @@ async fn prepare_sqlite_fixture(test_name: &str) -> Result<SnapshotFixture> {
 
     // Shutdown resigns the snapshot writer lease, and a snapshot that has not
     // taken the lease by then is skipped, so the first snapshot is awaited first.
-    let snapshot_objects = context
+    context
         .wait_for_snapshot_objects(TAXI_TRIPS_DATASET_NAME, 1, Duration::from_mins(1))
         .await?;
 
     runtime.shutdown().await;
 
-    let metadata = build_metadata_document(
-        &context,
-        TAXI_TRIPS_DATASET_NAME,
-        &snapshot_objects,
-        &schema,
-    );
-    context
-        .write_metadata(&metadata)
-        .await
-        .context("Writing initial snapshot metadata")?;
+    // The runtime's own `metadata.json` is what a bootstrap reads, so the fixture
+    // keeps it as published.
+    let initial_snapshot_count = context
+        .published_snapshots(TAXI_TRIPS_DATASET_NAME)
+        .await?
+        .len();
 
     Ok(SnapshotFixture {
         context,
@@ -674,36 +679,8 @@ async fn prepare_sqlite_fixture(test_name: &str) -> Result<SnapshotFixture> {
         schema,
         baseline,
         engine: "sqlite",
-        initial_snapshot_count: snapshot_objects.len(),
+        initial_snapshot_count,
     })
-}
-
-fn remove_existing_local_files(path: &Path) {
-    let candidates = [
-        path.to_path_buf(),
-        path_with_appended_suffix(path, "-wal"),
-        path.with_added_extension("wal"),
-        path_with_appended_suffix(path, "-shm"),
-    ];
-    for candidate in candidates {
-        if let Err(err) = std::fs::remove_file(&candidate)
-            && err.kind() != std::io::ErrorKind::NotFound
-        {
-            tracing::warn!(
-                "Failed to remove local acceleration file {}: {err}",
-                candidate.display()
-            );
-        }
-    }
-}
-
-fn path_with_appended_suffix(path: &Path, suffix: &str) -> PathBuf {
-    let mut file_name = path
-        .file_name()
-        .map(OsString::from)
-        .expect("database path should include a file name");
-    file_name.push(suffix);
-    path.with_file_name(file_name)
 }
 
 /// Appends `count` copies of the CSV's last data row, growing the source without
@@ -750,16 +727,15 @@ async fn count_table_rows(runtime: &Arc<Runtime>, table: &str) -> Result<i64> {
         .ok_or_else(|| anyhow!("COUNT(*) column is not a BIGINT"))
 }
 
-#[cfg(feature = "duckdb")]
 #[tokio::test]
-async fn snapshot_int_test1_duckdb_bootstrap_from_s3() -> Result<()> {
+async fn snapshot_int_test1_cayenne_bootstrap_from_s3() -> Result<()> {
     let _guard = init_tracing(Some("integration=debug,info"));
     let _test_lock = SNAPSHOT_TEST_MUTEX.lock().await;
     test_request_context()
         .scope(async {
-            let fixture = prepare_duckdb_fixture("snapshot_int_test1").await?;
+            let mut fixture = prepare_cayenne_fixture("snapshot_int_test1").await?;
 
-            remove_existing_local_files(&fixture.local_db_path);
+            fixture.restart_on_empty_local_storage();
 
             let dataset = fixture.dataset(
                 DatasetSnapshotBehavior::Enabled,
@@ -812,16 +788,15 @@ async fn snapshot_int_test1_duckdb_bootstrap_from_s3() -> Result<()> {
         .await
 }
 
-#[cfg(feature = "duckdb")]
 #[tokio::test]
-async fn snapshot_int_test2_duckdb_bootstrap_without_federation() -> Result<()> {
+async fn snapshot_int_test2_cayenne_bootstrap_without_federation() -> Result<()> {
     let _guard = init_tracing(Some("integration=debug,info"));
     let _test_lock = SNAPSHOT_TEST_MUTEX.lock().await;
     test_request_context()
         .scope(async {
-            let fixture = prepare_duckdb_fixture("snapshot_int_test2").await?;
+            let mut fixture = prepare_cayenne_fixture("snapshot_int_test2").await?;
 
-            remove_existing_local_files(&fixture.local_db_path);
+            fixture.restart_on_empty_local_storage();
 
             let dataset = fixture.dataset(
                 DatasetSnapshotBehavior::BootstrapOnly,
@@ -877,9 +852,9 @@ async fn snapshot_int_test3_sqlite_bootstrap_from_s3() -> Result<()> {
     let _test_lock = SNAPSHOT_TEST_MUTEX.lock().await;
     test_request_context()
         .scope(async {
-            let fixture = prepare_sqlite_fixture("snapshot_int_test3").await?;
+            let mut fixture = prepare_sqlite_fixture("snapshot_int_test3").await?;
 
-            remove_existing_local_files(&fixture.local_db_path);
+            fixture.restart_on_empty_local_storage();
 
             let dataset = fixture.dataset(
                 DatasetSnapshotBehavior::Enabled,
@@ -921,14 +896,13 @@ async fn snapshot_int_test3_sqlite_bootstrap_from_s3() -> Result<()> {
         .await
 }
 
-#[cfg(feature = "duckdb")]
 #[tokio::test]
 async fn snapshot_int_test4_existing_acceleration_skips_snapshot_download() -> Result<()> {
     let _guard = init_tracing(Some("integration=debug,info"));
     let _test_lock = SNAPSHOT_TEST_MUTEX.lock().await;
     test_request_context()
         .scope(async {
-            let fixture = prepare_duckdb_fixture("snapshot_int_test4").await?;
+            let fixture = prepare_cayenne_fixture("snapshot_int_test4").await?;
 
             let dataset = fixture.dataset(
                 DatasetSnapshotBehavior::Enabled,
@@ -974,14 +948,13 @@ async fn snapshot_int_test4_existing_acceleration_skips_snapshot_download() -> R
         .await
 }
 
-#[cfg(feature = "duckdb")]
 #[tokio::test]
 async fn snapshot_int_test5_creates_and_uses_snapshot_on_restart() -> Result<()> {
     let _guard = init_tracing(Some("integration=debug,info"));
     let _test_lock = SNAPSHOT_TEST_MUTEX.lock().await;
     test_request_context()
         .scope(async {
-            let fixture = prepare_duckdb_fixture("snapshot_int_test5").await?;
+            let mut fixture = prepare_cayenne_fixture("snapshot_int_test5").await?;
 
             let metadata = fixture.context.metadata_json().await?;
             assert_eq!(
@@ -1027,7 +1000,7 @@ async fn snapshot_int_test5_creates_and_uses_snapshot_on_restart() -> Result<()>
                 );
             }
 
-            remove_existing_local_files(&fixture.local_db_path);
+            fixture.restart_on_empty_local_storage();
 
             let dataset = fixture.dataset(
                 DatasetSnapshotBehavior::Enabled,
@@ -1069,14 +1042,13 @@ async fn snapshot_int_test5_creates_and_uses_snapshot_on_restart() -> Result<()>
         .await
 }
 
-#[cfg(feature = "duckdb")]
 #[tokio::test]
 async fn snapshot_int_test6_concurrent_snapshot_writes_retry() -> Result<()> {
     let _guard = init_tracing(Some("integration=debug,info"));
     let _test_lock = SNAPSHOT_TEST_MUTEX.lock().await;
     test_request_context()
         .scope(async {
-            let fixture = prepare_duckdb_fixture("snapshot_int_test6").await?;
+            let fixture = prepare_cayenne_fixture("snapshot_int_test6").await?;
             let schema = Arc::clone(fixture.schema());
             let runtime = fixture
                 .snapshots_only_runtime("snapshot_int_test6_concurrent")
@@ -1094,8 +1066,8 @@ async fn snapshot_int_test6_concurrent_snapshot_writes_retry() -> Result<()> {
             let writers_dir = TempDir::new().context("Creating directory for writer files")?;
             let mut managers = Vec::with_capacity(10);
             for writer in 0..10 {
-                let local_db_path = writers_dir.path().join(format!("taxi_trips_{writer}.duckdb"));
-                fs::copy(&fixture.local_db_path, &local_db_path)
+                let local_db_path = writers_dir.path().join(format!("taxi_trips_{writer}"));
+                copy_snapshot_directory(&fixture.local_db_path, &local_db_path)
                     .await
                     .context("Copying the acceleration file for a writer")?;
                 // Always: this test is about concurrent creation, not the on_change skip.
@@ -1159,14 +1131,13 @@ async fn snapshot_int_test6_concurrent_snapshot_writes_retry() -> Result<()> {
         .await
 }
 
-#[cfg(feature = "duckdb")]
 #[tokio::test]
 async fn snapshot_int_test7_respects_current_snapshot_metadata_selection() -> Result<()> {
     let _guard = init_tracing(Some("integration=debug,info"));
     let _test_lock = SNAPSHOT_TEST_MUTEX.lock().await;
     test_request_context()
         .scope(async {
-            let fixture = prepare_duckdb_fixture("snapshot_int_test7").await?;
+            let mut fixture = prepare_cayenne_fixture("snapshot_int_test7").await?;
             let schema = Arc::clone(fixture.schema());
             let runtime = fixture
                 .snapshots_only_runtime("snapshot_int_test7_prepare")
@@ -1180,32 +1151,13 @@ async fn snapshot_int_test7_respects_current_snapshot_metadata_selection() -> Re
                 )
                 .await?;
 
-            let conn = Connection::open(&fixture.local_db_path)
-                .context("Opening DuckDB acceleration file for modification")?;
-            conn.execute("DROP TABLE IF EXISTS taxi_trips_modified", [])
-                .context("Cleaning up temporary snapshot modification table")?;
-            conn.execute(
-                "CREATE TABLE taxi_trips_modified AS SELECT * FROM taxi_trips",
-                [],
+            crate::acceleration::query_cayenne_file(
+                &fixture.local_db_path,
+                TAXI_TRIPS_DATASET_NAME,
+                "INSERT OVERWRITE taxi_trips SELECT * REPLACE (COALESCE(passenger_count, 0) + 100 AS passenger_count) FROM taxi_trips",
             )
-            .context("Creating temporary snapshot modification table")?;
-            conn.execute(
-                "UPDATE taxi_trips_modified SET passenger_count = COALESCE(passenger_count, 0) + 100",
-                [],
-            )
-            .context("Updating DuckDB acceleration file to change snapshot contents")?;
-            conn.execute("DROP VIEW IF EXISTS taxi_trips", [])
-                .context("Dropping existing taxi_trips view prior to replacement")?;
-            conn.execute("DROP TABLE IF EXISTS taxi_trips", [])
-                .context("Dropping existing taxi_trips table prior to replacement")?;
-            conn.execute(
-                "CREATE TABLE taxi_trips AS SELECT * FROM taxi_trips_modified",
-                [],
-            )
-            .context("Replacing taxi_trips table with modified data")?;
-            conn.execute("DROP TABLE taxi_trips_modified", [])
-                .context("Cleaning up temporary snapshot modification table")?;
-            drop(conn);
+            .await
+            .context("Updating Cayenne acceleration to change snapshot contents")?;
 
             // Snapshot objects are named to the second. Publishing the modified
             // snapshot within the second the original was published in would
@@ -1252,7 +1204,7 @@ async fn snapshot_int_test7_respects_current_snapshot_metadata_selection() -> Re
 
             runtime.shutdown().await;
 
-            remove_existing_local_files(&fixture.local_db_path);
+            fixture.restart_on_empty_local_storage();
 
             let dataset = fixture.dataset(
                 DatasetSnapshotBehavior::Enabled,
@@ -1299,7 +1251,7 @@ async fn snapshot_int_test8_duckdb_compaction_reduces_snapshot_size() -> Result<
     let _test_lock = SNAPSHOT_TEST_MUTEX.lock().await;
     test_request_context()
         .scope(async {
-            let fixture = prepare_duckdb_fixture("snapshot_int_test8").await?;
+            let mut fixture = prepare_duckdb_fixture("snapshot_int_test8").await?;
             let schema = Arc::clone(fixture.schema());
 
             // Step 1: Create database fragmentation by inserting and deleting data
@@ -1430,7 +1382,7 @@ async fn snapshot_int_test8_duckdb_compaction_reduces_snapshot_size() -> Result<
             runtime.shutdown().await;
 
             // Step 4: Verify the compacted snapshot can be downloaded and used
-            remove_existing_local_files(&fixture.local_db_path);
+            fixture.restart_on_empty_local_storage();
 
             // The manager published the compacted snapshot as current, so a restart
             // bootstraps from it.
@@ -1487,14 +1439,13 @@ async fn snapshot_int_test8_duckdb_compaction_reduces_snapshot_size() -> Result<
         .await
 }
 
-#[cfg(feature = "duckdb")]
 #[tokio::test]
 async fn snapshot_int_test9_onchange_policy_skips_when_no_changes() -> Result<()> {
     let _guard = init_tracing(Some("integration=debug,info"));
     let _test_lock = SNAPSHOT_TEST_MUTEX.lock().await;
     test_request_context()
         .scope(async {
-            let fixture = prepare_duckdb_fixture("snapshot_int_test9").await?;
+            let fixture = prepare_cayenne_fixture("snapshot_int_test9").await?;
             let schema = Arc::clone(fixture.schema());
             let runtime = fixture
                 .snapshots_only_runtime("snapshot_int_test9_onchange")
@@ -1594,7 +1545,6 @@ async fn snapshot_int_test9_onchange_policy_skips_when_no_changes() -> Result<()
         .await
 }
 
-#[cfg(feature = "duckdb")]
 #[tokio::test]
 async fn snapshot_int_test10_onchange_policy_skips_interval_based_snapshots() -> Result<()> {
     let _guard = init_tracing(Some("integration=debug,info"));
@@ -1621,7 +1571,7 @@ async fn snapshot_int_test10_onchange_policy_skips_interval_based_snapshots() ->
 
             let mut accel_params = HashMap::new();
             accel_params.insert(
-                "duckdb_file".to_string(),
+                "cayenne_file_path".to_string(),
                 local_db_path.to_string_lossy().to_string(),
             );
 
@@ -1632,7 +1582,7 @@ async fn snapshot_int_test10_onchange_policy_skips_interval_based_snapshots() ->
                 &dataset_params,
                 DatasetSnapshotBehavior::CreateOnly,
                 &accel_params,
-                "duckdb",
+                "cayenne",
                 RefreshOnStartup::Auto,
             );
             if let Some(ref mut accel) = dataset.acceleration {
@@ -1682,7 +1632,6 @@ async fn snapshot_int_test10_onchange_policy_skips_interval_based_snapshots() ->
         .await
 }
 
-#[cfg(feature = "duckdb")]
 #[tokio::test]
 async fn snapshot_int_test11_interval_based_snapshots() -> Result<()> {
     let _guard = init_tracing(Some("integration=debug,info"));
@@ -1709,7 +1658,7 @@ async fn snapshot_int_test11_interval_based_snapshots() -> Result<()> {
 
             let mut accel_params = HashMap::new();
             accel_params.insert(
-                "duckdb_file".to_string(),
+                "cayenne_file_path".to_string(),
                 local_db_path.to_string_lossy().to_string(),
             );
 
@@ -1720,7 +1669,7 @@ async fn snapshot_int_test11_interval_based_snapshots() -> Result<()> {
                 &dataset_params,
                 DatasetSnapshotBehavior::CreateOnly,
                 &accel_params,
-                "duckdb",
+                "cayenne",
                 RefreshOnStartup::Auto,
             );
             if let Some(ref mut accel) = dataset.acceleration {
@@ -1770,7 +1719,6 @@ async fn snapshot_int_test11_interval_based_snapshots() -> Result<()> {
         .await
 }
 
-#[cfg(feature = "duckdb")]
 #[tokio::test]
 async fn snapshot_int_test12_onchange_policy_skips_refresh_based_snapshots() -> Result<()> {
     let _guard = init_tracing(Some("integration=debug,info"));
@@ -1797,7 +1745,7 @@ async fn snapshot_int_test12_onchange_policy_skips_refresh_based_snapshots() -> 
 
             let mut accel_params = HashMap::new();
             accel_params.insert(
-                "duckdb_file".to_string(),
+                "cayenne_file_path".to_string(),
                 local_db_path.to_string_lossy().to_string(),
             );
 
@@ -1808,7 +1756,7 @@ async fn snapshot_int_test12_onchange_policy_skips_refresh_based_snapshots() -> 
                 &dataset_params,
                 DatasetSnapshotBehavior::CreateOnly,
                 &accel_params,
-                "duckdb",
+                "cayenne",
                 RefreshOnStartup::Auto,
             );
             dataset.time_column = Some("tpep_pickup_datetime".to_string());
@@ -1891,7 +1839,6 @@ async fn snapshot_int_test12_onchange_policy_skips_refresh_based_snapshots() -> 
         .await
 }
 
-#[cfg(feature = "duckdb")]
 #[tokio::test]
 async fn snapshot_int_test13_refresh_based_snapshots() -> Result<()> {
     let _guard = init_tracing(Some("integration=debug,info"));
@@ -1918,7 +1865,7 @@ async fn snapshot_int_test13_refresh_based_snapshots() -> Result<()> {
 
             let mut accel_params = HashMap::new();
             accel_params.insert(
-                "duckdb_file".to_string(),
+                "cayenne_file_path".to_string(),
                 local_db_path.to_string_lossy().to_string(),
             );
 
@@ -1929,7 +1876,7 @@ async fn snapshot_int_test13_refresh_based_snapshots() -> Result<()> {
                 &dataset_params,
                 DatasetSnapshotBehavior::CreateOnly,
                 &accel_params,
-                "duckdb",
+                "cayenne",
                 RefreshOnStartup::Auto,
             );
             if let Some(ref mut accel) = dataset.acceleration {
@@ -2008,7 +1955,6 @@ async fn snapshot_int_test13_refresh_based_snapshots() -> Result<()> {
 /// Rows appended to the source between the two arms of
 /// `snapshot_int_test14_file_create_skips_snapshot_bootstrap`, which is what makes a
 /// bootstrap and a rebuild-from-source land on different row counts.
-#[cfg(feature = "duckdb")]
 const FILE_CREATE_EXTRA_ROWS: usize = 5;
 
 /// `mode: file_create` must not bootstrap the snapshot it just discarded.
@@ -2023,14 +1969,13 @@ const FILE_CREATE_EXTRA_ROWS: usize = 5;
 /// checkpoint, `refresh_on_startup: auto` skips the startup refresh. The second
 /// arm grows the source and switches to `file_create`, so a bootstrap and a
 /// rebuild-from-source produce different row counts.
-#[cfg(feature = "duckdb")]
 #[tokio::test]
 async fn snapshot_int_test14_file_create_skips_snapshot_bootstrap() -> Result<()> {
     let _guard = init_tracing(Some("integration=debug,info"));
     let _test_lock = SNAPSHOT_TEST_MUTEX.lock().await;
     test_request_context()
         .scope(async {
-            let fixture = prepare_duckdb_fixture("snapshot_int_test14").await?;
+            let mut fixture = prepare_cayenne_fixture("snapshot_int_test14").await?;
             let source_path = PathBuf::from(
                 fixture
                     .dataset_from
@@ -2040,7 +1985,7 @@ async fn snapshot_int_test14_file_create_skips_snapshot_bootstrap() -> Result<()
                     })?,
             );
 
-            remove_existing_local_files(&fixture.local_db_path);
+            fixture.restart_on_empty_local_storage();
 
             let snapshot_rows = {
                 let dataset = fixture.dataset(
@@ -2100,16 +2045,31 @@ async fn snapshot_int_test14_file_create_skips_snapshot_bootstrap() -> Result<()
 
             let runtime = Arc::new(Runtime::builder().with_app(app).build().await);
             load_runtime(Arc::clone(&runtime)).await?;
-            let rebuilt_rows = count_rows(&runtime)
+            let loaded_rows = count_rows(&runtime)
                 .await
                 .context("Counting rows after the file_create restart")?;
+            assert_ne!(
+                loaded_rows, snapshot_rows,
+                "file_create should not bootstrap back the snapshot it deleted"
+            );
+
+            // A file_create load does not refresh from the source on its own yet
+            // (#15919, guarded by known-failing/cayenne/cayenne-file-create-reload.yaml),
+            // so the rebuild from the grown source is requested here.
+            let source_rows = snapshot_rows + i64::try_from(FILE_CREATE_EXTRA_ROWS)?;
+            crate::acceleration::trigger_refresh(&runtime, TAXI_TRIPS_DATASET_NAME).await?;
+            let deadline = Instant::now() + Duration::from_mins(1);
+            let mut rebuilt_rows = loaded_rows;
+            while rebuilt_rows != source_rows && Instant::now() < deadline {
+                sleep(Duration::from_millis(100)).await;
+                rebuilt_rows = count_rows(&runtime).await.unwrap_or(rebuilt_rows);
+            }
             runtime.shutdown().await;
 
             assert_eq!(
-                rebuilt_rows,
-                snapshot_rows + i64::try_from(FILE_CREATE_EXTRA_ROWS)?,
-                "file_create should have rebuilt the acceleration from the grown source; \
-                 {snapshot_rows} rows means the snapshot it deleted was bootstrapped back"
+                rebuilt_rows, source_rows,
+                "file_create should rebuild the acceleration from the grown source \
+                 ({source_rows} rows), but it holds {rebuilt_rows} rows"
             );
 
             fixture.cleanup().await
@@ -2927,4 +2887,22 @@ async fn snapshot_int_test_cayenne_bootstrap_serves_lookups_from_its_index() -> 
             Ok(())
         })
         .await
+}
+
+/// Copy a stopped file-mode Cayenne acceleration, including its metastore.
+async fn copy_snapshot_directory(source: &Path, destination: &Path) -> Result<()> {
+    let mut pending = vec![(source.to_path_buf(), destination.to_path_buf())];
+    while let Some((source, destination)) = pending.pop() {
+        fs::create_dir_all(&destination).await?;
+        let mut entries = fs::read_dir(&source).await?;
+        while let Some(entry) = entries.next_entry().await? {
+            let destination = destination.join(entry.file_name());
+            if entry.file_type().await?.is_dir() {
+                pending.push((entry.path(), destination));
+            } else {
+                fs::copy(entry.path(), destination).await?;
+            }
+        }
+    }
+    Ok(())
 }

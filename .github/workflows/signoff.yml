@@ -82,6 +82,14 @@ on:
         required: false
         type: boolean
         default: false
+      runs_on:
+        description: 'The type of runner to use for the sign-off job'
+        required: false
+        type: choice
+        default: spiceai-macos
+        options:
+          - spiceai-macos
+          - signoff
 
 # Coarse, pre-resolution guard: it only collapses re-dispatches that used the
 # *same* input form, because `concurrency` is evaluated before any step runs and
@@ -269,7 +277,7 @@ jobs:
       cancel-in-progress: true
     # Standard pool, not `spiceai-macos-large`. A dispatched sign-off takes a
     # `spiceai-macos` runner instead of waiting on the large pool.
-    runs-on: spiceai-macos
+    runs-on: ${{ inputs.runs_on }}
     environment: ci-build
     # This pool terminates a job at ~360 minutes, and that arrives
     # as `cancelled` with no failed step — the same shape as the
@@ -460,7 +468,7 @@ jobs:
           token: ${{ github.token }}
           bucket: sccache
           region: us-west-1
-          immutable-objects: "true"
+          immutable-objects: 'true'
           otel-endpoint: spicehq/spiceio
           otel-api-key: ${{ secrets.SCP_SPICEHQ_SPICEIO_API_KEY }}
           otel-region: us-west-2
