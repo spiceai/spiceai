@@ -10591,6 +10591,9 @@ impl CayenneTableProvider {
             table_metadata.vortex_config.cold_tier_enabled(),
         )
         .await?;
+        context.record_tombstones_from_open(
+            pk_deletion_snapshot_for_strategy(&pk_deletion_strategy).max_delete_sequence(),
+        );
         let pk_deletion_mode = Self::resolve_pk_deletion_mode(&table_metadata, &context);
 
         let listing_table = Self::create_listing_table(
@@ -22568,6 +22571,7 @@ impl CayenneTableProvider {
                 return Err(Error::DataFusion { source });
             }
         };
+        let with_deletes_for_metrics = Arc::clone(&with_deletes);
         let stream = match datafusion_physical_plan::execute_stream(with_deletes, state.task_ctx())
         {
             Ok(s) => s,
@@ -22784,6 +22788,10 @@ impl CayenneTableProvider {
 
             self.listing_table.store(new_listing_table);
             self.update_current_snapshot_id(&new_snapshot_id);
+            // As for a subset merge of protected snapshots: the tombstones stay, and
+            // the reclaim that takes them out counts the rows they hid here.
+            self.context
+                .record_rows_removed_before_reclaim(rows_deleted_by(&with_deletes_for_metrics));
             // An append-only table keeps the files this pass left unmerged on the trigger
             // counter, so the next trigger takes them on rather than waiting for as many new
             // files as the trigger asks for; every other table counts afresh.
@@ -26782,6 +26790,7 @@ impl CayenneTableProvider {
             // As for the bake: a tombstone recorded meanwhile only shrinks the
             // difference, which overstates the yield.
             let held_before_clear = self.pk_deletion_snapshot().delete_len();
+            let held_tombstones_from_open = self.holds_tombstones_from_open();
             match &scope {
                 // `All` is unreachable here (this rewrite always captures a
                 // folded set) and the position-delete scope clears every
@@ -26812,7 +26821,11 @@ impl CayenneTableProvider {
             }
             let reclaimed =
                 held_before_clear.saturating_sub(self.pk_deletion_snapshot().delete_len());
-            self.record_reclaim_yield(&rewrite_plan, rewrite_position_deletes, reclaimed);
+            self.record_reclaim_yield(
+                &rewrite_plan,
+                rewrite_position_deletes || held_tombstones_from_open,
+                reclaimed,
+            );
 
             // [sound output_ordering attestation] This rewrite consolidated the
             // entire snapshot into a single globally-sorted, non-overlapping run
@@ -29223,6 +29236,7 @@ impl CayenneTableProvider {
         // spread every key across every output file and leave a predicate on the
         // key nothing to prune.
         let range_bounds = self.merge_range_bounds(&input_statistics, &merged_plan, write_shards);
+        let merged_plan_for_metrics = Arc::clone(&merged_plan);
         let stream = datafusion_physical_plan::execute_stream(merged_plan, state.task_ctx())?;
         let plan_build_ms = phase2_start.elapsed().as_millis();
 
@@ -29404,6 +29418,11 @@ impl CayenneTableProvider {
         #[cfg(test)]
         self.run_test_pre_publish_hook().await;
 
+        // The merge left its superseded rows out but kept their tombstones, which
+        // may still hide rows in files it did not read: the reclaim that takes them
+        // out of the index counts these rows (see `super::deletion_yield`).
+        self.context
+            .record_rows_removed_before_reclaim(rows_deleted_by(&merged_plan_for_metrics));
         // Catalog committed — bring the in-memory protected set into agreement
         // under the scan fence. Scans capture the deletion snapshot and
         // protected-snapshot map while holding `listing_fence.read()`, so the
@@ -30347,6 +30366,7 @@ impl CayenneTableProvider {
             // A writer recording a tombstone meanwhile only shrinks the difference,
             // which overstates the yield: the error is toward baking as before.
             let held_before_prune = self.pk_deletion_snapshot().delete_len();
+            let held_tombstones_from_open = self.holds_tombstones_from_open();
             // Boxed: the bake is one of the crate's largest futures (see
             // `snapshot_bytes_for_merge_budget`), and the prune's state need not grow it.
             Box::pin(self.prune_deletion_index_after_bake(
@@ -30358,8 +30378,23 @@ impl CayenneTableProvider {
             .await?;
             let reclaimed =
                 held_before_prune.saturating_sub(self.pk_deletion_snapshot().delete_len());
-            self.record_reclaim_yield(&bake_plan, bake_position_deletes, reclaimed);
+            self.record_reclaim_yield(
+                &bake_plan,
+                bake_position_deletes || held_tombstones_from_open,
+                reclaimed,
+            );
             self.context.record_bake_prune(held_before_prune, reclaimed);
+            tracing::debug!(
+                target: "cayenne::compaction",
+                table = self.table_metadata.table_name.as_str(),
+                held_before_prune,
+                tombstones_reclaimed = reclaimed,
+                rows_removed = rows_deleted_by(&bake_plan),
+                measured = !(bake_position_deletes || held_tombstones_from_open),
+                yield_per_thousand = self.context.deletion_index_yield_per_thousand(),
+                effective_trigger = self.context.effective_bake_deletion_index_trigger(),
+                "Seq-prefix bake recorded its deletion index yield"
+            );
         } else {
             // The prune was withheld: the bake pruned nothing.
             self.context
@@ -32266,22 +32301,42 @@ impl CayenneTableProvider {
         !self.pk_deletion_strategy.position_cache().load().is_empty()
     }
 
-    /// Record a reclaim's yield (see [`super::deletion_yield`]), unless its scan
-    /// ran with position deletes it could not count, in which case the yield
-    /// measured before it stands.
+    /// Whether the deletion index may still hold a tombstone loaded at open, whose
+    /// rows a rewrite before the process started may have removed uncounted (see
+    /// [`super::deletion_yield`]). Read before a reclaim takes tombstones out.
+    /// Once none is held, none returns, so the walk stops.
+    fn holds_tombstones_from_open(&self) -> bool {
+        let Some(through) = self.context.tombstones_from_open_through() else {
+            return false;
+        };
+        if self
+            .pk_deletion_snapshot()
+            .holds_delete_at_or_below(through)
+        {
+            return true;
+        }
+        self.context.forget_tombstones_from_open();
+        false
+    }
+
+    /// Record a reclaim's yield (see [`super::deletion_yield`]), unless it cannot
+    /// be measured — its scan ran with position deletes it could not count, or it
+    /// took out tombstones loaded at open — in which case the yield measured
+    /// before it stands.
     fn record_reclaim_yield(
         &self,
         plan: &Arc<dyn ExecutionPlan>,
-        position_deletes_applied: bool,
+        unmeasurable: bool,
         tombstones_reclaimed: usize,
     ) {
-        if position_deletes_applied {
+        let tombstones_reclaimed = u64::try_from(tombstones_reclaimed).unwrap_or(u64::MAX);
+        if unmeasurable {
+            self.context
+                .record_unmeasured_deletion_index_reclaim(tombstones_reclaimed);
             return;
         }
-        self.context.record_deletion_index_yield(
-            rows_deleted_by(plan),
-            u64::try_from(tombstones_reclaimed).unwrap_or(u64::MAX),
-        );
+        self.context
+            .record_deletion_index_yield(rows_deleted_by(plan), tombstones_reclaimed);
     }
 
     /// Drop the position deletes that target files of `snapshot_ids` — snapshots
@@ -64430,6 +64485,136 @@ mod tests {
             provider.context.effective_bake_deletion_index_trigger(),
             2 * configured
         );
+    }
+
+    /// A subset merge that already left out the row a tombstone hides keeps the
+    /// tombstone, so the bake that takes it out of the index finds no row left to
+    /// remove. The merge's row counts toward that bake's yield: the tombstone hid
+    /// a real row, and the table keeps its configured trigger.
+    #[tokio::test]
+    async fn a_bake_counts_rows_a_subset_merge_removed_before_it() {
+        let ctx = SessionContext::new();
+        let (provider, _tmp, _ids) = build_seq_prefix_fixture_with_config(
+            "bake_yield_after_subset",
+            ctx.runtime_env(),
+            &[10, 20, 30, 40, 50],
+            VortexConfig {
+                inline_max_rows: 0,
+                deletion_mode: crate::metadata::DeletionMode::Key,
+                // Arm the protected tier for the explicit subset merge below.
+                compaction_trigger_protected_snapshots: 2,
+                compaction_background_interval_ms: 3_600_000,
+                ..VortexConfig::default()
+            },
+        )
+        .await;
+        let configured = provider.context.bake_deletion_index_trigger();
+        install_int64_deletes(&provider, &[(0, 15)]);
+        assert!(
+            provider
+                .compact_protected_snapshots_subset(2)
+                .await
+                .expect("subset merge should not error"),
+            "the two oldest snapshots must merge"
+        );
+        assert_eq!(
+            provider.pk_deletion_snapshot().delete_len(),
+            1,
+            "the subset merge keeps the tombstone"
+        );
+        assert!(
+            provider
+                .bake_seq_prefix_protected_snapshots()
+                .await
+                .expect("bake should not error"),
+            "the merged prefix must bake"
+        );
+        assert_eq!(
+            provider.pk_deletion_snapshot().delete_len(),
+            0,
+            "the bake takes the tombstone out"
+        );
+        assert_eq!(
+            collect_id_value_pairs(&ctx, &provider, "bake_yield_after_subset").await,
+            vec![(1, 10), (2, 20), (3, 30), (4, 40)],
+        );
+        assert_eq!(
+            provider.context.effective_bake_deletion_index_trigger(),
+            configured
+        );
+    }
+
+    /// A bake that takes out tombstones the index held when the table opened
+    /// cannot count the rows a rewrite removed before then, so it records no
+    /// yield. Once it has taken them all out, the table stops tracking them, so
+    /// the next reclaim measures again.
+    #[tokio::test]
+    async fn a_bake_of_tombstones_from_open_keeps_its_trigger() {
+        let ctx = SessionContext::new();
+        let (provider, _tmp, _ids) = build_seq_prefix_fixture(
+            "bake_yield_from_open",
+            ctx.runtime_env(),
+            &[10, 20, 30, 40, 50],
+        )
+        .await;
+        let configured = provider.context.bake_deletion_index_trigger();
+        install_int64_deletes(&provider, &[(1_000, 15), (1_001, 15), (1_002, 15)]);
+        provider.context.record_tombstones_from_open(Some(15));
+        assert!(
+            provider
+                .bake_seq_prefix_protected_snapshots()
+                .await
+                .expect("bake should not error"),
+            "the older prefix {{0,1}} must bake"
+        );
+        assert_eq!(
+            provider.context.effective_bake_deletion_index_trigger(),
+            configured,
+            "a bake of tombstones from open records no yield"
+        );
+        assert!(
+            !provider.holds_tombstones_from_open(),
+            "the bake took out every tombstone from open"
+        );
+        assert_eq!(provider.context.tombstones_from_open_through(), None);
+    }
+
+    /// A table reopened over durable tombstones tracks them as tombstones from
+    /// open, up to the highest delete sequence it loaded.
+    #[tokio::test]
+    async fn a_reopened_table_tracks_its_tombstones_from_open() {
+        let ctx = SessionContext::new();
+        let runtime_env = ctx.runtime_env();
+        let config = VortexConfig {
+            inline_max_rows: 0,
+            deletion_mode: crate::metadata::DeletionMode::Key,
+            compaction_background_interval_ms: 0,
+            ..VortexConfig::default()
+        };
+        let (provider, catalog, _tmp) = create_cdc_upsert_table_with_vortex_config(
+            "yield_reopen_tombstones",
+            Arc::clone(&runtime_env),
+            config,
+        )
+        .await;
+        assert_eq!(provider.context.tombstones_from_open_through(), None);
+        let schema = Arc::clone(&provider.table_metadata.schema);
+        insert_batch(
+            &provider,
+            id_value_batch(Arc::clone(&schema), &[1, 2], &[10, 20]),
+        )
+        .await;
+        insert_batch(&provider, id_value_batch(schema, &[1], &[11])).await;
+        let held = provider.pk_deletion_snapshot().max_delete_sequence();
+        assert!(held.is_some(), "precondition: the upsert left a tombstone");
+        drop(provider);
+
+        let reopened = CayenneTableProviderBuilder::new(catalog, runtime_env)
+            .open("yield_reopen_tombstones")
+            .await
+            .expect("reopen");
+        assert_eq!(scan_sorted_ids(&reopened).await, vec![1, 2]);
+        assert_eq!(reopened.context.tombstones_from_open_through(), held);
     }
 
     /// A reclaim on an `auto` table still on position deletes, whose tombstones
