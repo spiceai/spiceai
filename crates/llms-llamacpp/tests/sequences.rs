@@ -157,6 +157,161 @@ async fn a_sequence_outside_the_context_is_refused_not_asserted() {
     );
 }
 
+/// A prompt checkpoint saved for one sequence restores into that sequence, beside another that
+/// holds its own prompt: sequence 1 reuses a turn's prefix and then drafts and replies exactly as
+/// the same turn read whole into sequence 1 of a fresh context does. As spiced's prompt cache does
+/// for a model with recurrent layers, turn 1 is read in two spans split four tokens before its
+/// end, sequence 1's recurrent state and draft-head state saved between them; turn 2 restores
+/// both, cuts sequence 1's caches back to the split, and reads only its own tokens. Sequence 0
+/// holds the same other prompt in both contexts, so a save or restore that reached it, or one
+/// that missed sequence 1, changes what sequence 1 computes.
+#[tokio::test]
+async fn a_sequence_restores_its_own_checkpoint_beside_another() {
+    let gguf = qwen35_gguf().await;
+    let backend = Backend::get();
+    let model = Model::load(backend, &gguf, &ModelParams::default().with_load_mtp(true))
+        .expect("Qwen3.5-0.8B loads with its MTP layer");
+    let tokens = |text: &str| {
+        model
+            .vocab()
+            .tokenize(text, false, true)
+            .expect("the prompt tokenizes")
+    };
+    let question = "Name the planets of the solar system in order, one per line.";
+    let answer = "Mercury\nVenus\nEarth\nMars\nJupiter\nSaturn\nUranus\nNeptune";
+    let turn1 = tokens(&format!(
+        "<|im_start|>user\n{question}<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n"
+    ));
+    let turn2 = tokens(&format!(
+        "<|im_start|>user\n{question}<|im_end|>\n<|im_start|>assistant\n{answer}<|im_end|>\n<|im_start|>user\nNow describe each of them in one sentence.<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n"
+    ));
+    let other = tokens(
+        "<|im_start|>user\nExplain how a refrigerator keeps food cold, step by step.<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n",
+    );
+    let at = turn1.len() - 4;
+    assert_eq!(
+        turn1[..at],
+        turn2[..at],
+        "turn 2 repeats turn 1 up to the split"
+    );
+
+    let reused = {
+        let mut spec = drafting(&model, backend, 2);
+        read_seq(&mut spec, 0, &other, 0..other.len());
+        read_seq(&mut spec, 1, &turn1, 0..at);
+        let checkpoint = spec
+            .target()
+            .partial_state_seq(1)
+            .expect("sequence 1's recurrent state saves");
+        let head = spec.state(1).expect("sequence 1's head state");
+        read_seq(&mut spec, 1, &turn1, at..turn1.len());
+        let _ = generate_seq(&mut spec, 1, &turn1, 24);
+        assert!(
+            spec.target_mut().restore_partial_state_seq(1, &checkpoint),
+            "sequence 1's checkpoint restores"
+        );
+        if let Some(head) = &head {
+            spec.restore_state(1, head)
+                .expect("sequence 1's head state restores");
+        }
+        assert!(
+            spec.target_mut().truncate_seq(1, position(at))
+                && spec.draft_mut().truncate_seq(1, position(at)),
+            "sequence 1's caches cut back to the split"
+        );
+        read_seq(&mut spec, 1, &turn2, at..turn2.len());
+        generate_seq(&mut spec, 1, &turn2, 48)
+    };
+    let fresh = {
+        let mut spec = drafting(&model, backend, 2);
+        read_seq(&mut spec, 0, &other, 0..other.len());
+        read_seq(&mut spec, 1, &turn2, 0..at);
+        read_seq(&mut spec, 1, &turn2, at..turn2.len());
+        generate_seq(&mut spec, 1, &turn2, 48)
+    };
+
+    assert!(
+        reused.0.iter().any(|draft| !draft.is_empty()),
+        "sequence 1 drafted, so its head state is exercised"
+    );
+    assert_eq!(reused.0, fresh.0, "turn 2's drafts in sequence 1");
+    assert_eq!(reused.1, fresh.1, "turn 2's reply in sequence 1");
+}
+
+fn position(n: usize) -> i32 {
+    i32::try_from(n).expect("a position")
+}
+
+/// Decodes `prompt[span]` into sequence `seq` in one batch, the prompt's last token an output,
+/// and hands the batch to the draft head, as spiced reads a prompt span.
+fn read_seq(spec: &mut Mtp<'_>, seq: i32, prompt: &[Token], span: std::ops::Range<usize>) {
+    let mut batch = Batch::new(512);
+    for pos in span {
+        batch
+            .add_seq(prompt[pos], position(pos), seq, pos + 1 == prompt.len())
+            .expect("the span fits a batch");
+    }
+    spec.target_mut().decode(&batch).expect("the span decodes");
+    spec.process(&batch).expect("the head reads the span");
+}
+
+/// After `prompt` is read whole into sequence `seq`: `steps` verify steps for that sequence
+/// alone, as spiced's MTP loop runs them. Returns the drafts and the reply.
+fn generate_seq(spec: &mut Mtp<'_>, seq: i32, prompt: &[Token], steps: usize) -> Generation {
+    spec.begin(seq, prompt).expect("drafting begins");
+    let mut sampler = Sampler::greedy();
+    let mut history = prompt.to_vec();
+    // the last read batch's last row is the prompt's last token
+    let mut id = sampler.sample(spec.target(), -1);
+    let mut batch = Batch::new(512);
+    let mut generation = Generation::default();
+    for _ in 0..steps {
+        let n_past = position(history.len());
+        let draft = spec.draft(seq, n_past, id, &history).expect("a draft");
+        assert!(
+            spec.draft_mut().truncate_seq(seq, n_past),
+            "the head's cache rolls back"
+        );
+        batch.clear();
+        batch.add_seq(id, n_past, seq, true).expect("fits");
+        for (i, &token) in draft.iter().enumerate() {
+            batch
+                .add_seq(token, n_past + 1 + position(i), seq, true)
+                .expect("fits");
+        }
+        spec.target_mut()
+            .decode(&batch)
+            .expect("the verify batch decodes");
+        spec.process(&batch)
+            .expect("the head reads the verify batch");
+        history.push(id);
+        generation.1.push(id);
+        let mut accepted = 0;
+        let next = loop {
+            let token = sampler.sample(spec.target(), position(accepted));
+            if accepted < draft.len() && token == draft[accepted] {
+                history.push(token);
+                generation.1.push(token);
+                accepted += 1;
+            } else {
+                break token;
+            }
+        };
+        if !draft.is_empty() {
+            spec.accept(seq, u16::try_from(accepted).expect("a draft length"))
+                .expect("the draft is accepted");
+        }
+        let kept = position(history.len());
+        assert!(
+            spec.target_mut().truncate_seq(seq, kept) && spec.draft_mut().truncate_seq(seq, kept),
+            "the rejected drafts leave both caches"
+        );
+        generation.0.push(draft);
+        id = next;
+    }
+    generation
+}
+
 /// A target context holding `n_seq` sequences on one shared cache, and Qwen3.5-0.8B's MTP layer
 /// drafting up to [`N_DRAFT`] tokens for each, with as many recurrent state snapshots per
 /// sequence as a verify batch rolls back over.
