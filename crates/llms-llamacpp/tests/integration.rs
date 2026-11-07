@@ -28,6 +28,7 @@ limitations under the License.
 // The engine registers itself through a `linkme` slice, which only a linked crate fills.
 use llms_llamacpp as _;
 
+mod batching;
 mod content_parts;
 mod differential;
 mod distributed;
