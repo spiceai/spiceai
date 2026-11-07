@@ -1024,46 +1024,6 @@ async fn duckdb_binary_literal_filters_agree_with_local_evaluation() -> Result<(
         .await
 }
 
-/// Every row a statement returns, each rendered as `col|col|…` (`NULL` for a
-/// null), sorted so two answers compare as multisets.
-async fn sorted_rows(rt: &Runtime, sql: &str) -> Result<Vec<String>, String> {
-    use arrow::util::display::{ArrayFormatter, FormatOptions};
-
-    let batches: Vec<RecordBatch> = rt
-        .datafusion()
-        .query_builder(sql)
-        .build()
-        .run()
-        .await
-        .map_err(|e| format!("query `{sql}` failed: {e}"))?
-        .data
-        .try_collect()
-        .await
-        .map_err(|e| format!("query `{sql}` collect failed: {e}"))?;
-
-    let options = FormatOptions::default().with_null("NULL");
-    let mut rows = Vec::new();
-    for batch in &batches {
-        let formatters = batch
-            .columns()
-            .iter()
-            .map(|column| ArrayFormatter::try_new(column.as_ref(), &options))
-            .collect::<Result<Vec<_>, _>>()
-            .map_err(|e| format!("failed to format the rows of `{sql}`: {e}"))?;
-        for row in 0..batch.num_rows() {
-            rows.push(
-                formatters
-                    .iter()
-                    .map(|formatter| formatter.value(row).to_string())
-                    .collect::<Vec<_>>()
-                    .join("|"),
-            );
-        }
-    }
-    rows.sort_unstable();
-    Ok(rows)
-}
-
 /// A union input's own `ORDER BY` and `LIMIT` choose which of *that input's*
 /// rows reach the union, and must keep doing so when the union is federated.
 /// The unparser keeps them inside that input's own derived table; written on
