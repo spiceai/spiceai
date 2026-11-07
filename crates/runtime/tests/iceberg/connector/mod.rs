@@ -104,8 +104,8 @@ async fn iceberg_integration_test_cayenne_acceleration_restart() -> Result<(), a
     let _tracing = init_tracing(None);
     test_request_context()
         .scope(async {
-            let acceleration_dir =
-                tempfile::tempdir().context("Creating the Cayenne acceleration directory both runtimes share")?;
+            let acceleration_dir = tempfile::tempdir()
+                .context("Creating the Cayenne acceleration directory both runtimes share")?;
             let mut dataset = make_iceberg_dataset("tpch_sf1", "customer", "customer")?;
             dataset.acceleration = Some(Acceleration {
                 enabled: true,

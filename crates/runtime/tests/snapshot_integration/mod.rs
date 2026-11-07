@@ -244,7 +244,9 @@ impl SnapshotFixture {
             .file_name()
             .map(|name| name.to_string_lossy().into_owned())
             .unwrap_or_default();
-        self.local_db_path = self.local_db_path.with_file_name(format!("restarted_{name}"));
+        self.local_db_path = self
+            .local_db_path
+            .with_file_name(format!("restarted_{name}"));
     }
 
     fn dataset(
@@ -366,14 +368,13 @@ impl SnapshotFixture {
             .read_app()
             .await
             .ok_or_else(|| anyhow!("The runtime has no app"))?;
-        let dataset = runtime::component::dataset::builder::DatasetBuilder::try_from(
-            spicepod_dataset,
-        )
-        .map_err(|err| anyhow!("Building the taxi_trips dataset: {err}"))?
-        .with_app(app)
-        .with_runtime(Arc::clone(runtime))
-        .build()
-        .map_err(|err| anyhow!("Building the taxi_trips dataset: {err}"))?;
+        let dataset =
+            runtime::component::dataset::builder::DatasetBuilder::try_from(spicepod_dataset)
+                .map_err(|err| anyhow!("Building the taxi_trips dataset: {err}"))?
+                .with_app(app)
+                .with_runtime(Arc::clone(runtime))
+                .build()
+                .map_err(|err| anyhow!("Building the taxi_trips dataset: {err}"))?;
         let accelerator = runtime
             .accelerator_engine_registry()
             .get_accelerator_engine(runtime_acceleration::Engine::Cayenne)
@@ -456,8 +457,14 @@ fn build_snapshots_config(
         ("s3_endpoint".to_string(), context.endpoint.clone()),
         ("allow_http".to_string(), "true".to_string()),
         ("s3_auth".to_string(), "key".to_string()),
-        ("s3_key".to_string(), crate::rustfs::S3_ACCESS_KEY.to_string()),
-        ("s3_secret".to_string(), crate::rustfs::S3_SECRET_KEY.to_string()),
+        (
+            "s3_key".to_string(),
+            crate::rustfs::S3_ACCESS_KEY.to_string(),
+        ),
+        (
+            "s3_secret".to_string(),
+            crate::rustfs::S3_SECRET_KEY.to_string(),
+        ),
     ]);
 
     Snapshots {

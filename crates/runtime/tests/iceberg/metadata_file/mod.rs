@@ -41,9 +41,10 @@ use spicepod::{
 };
 
 use crate::{
-    configure_test_datafusion,
-    init_tracing,
-    rustfs::{S3_ACCESS_KEY, S3_BUCKET, S3_SECRET_KEY, create_bucket, s3_client, start_object_store},
+    configure_test_datafusion, init_tracing,
+    rustfs::{
+        S3_ACCESS_KEY, S3_BUCKET, S3_SECRET_KEY, create_bucket, s3_client, start_object_store,
+    },
     utils::{run_query, test_request_context, wait_until_true},
 };
 
