@@ -1985,6 +1985,7 @@ async fn start_anonymous_telemetry(
             spicepod_name.map_or_else(|| "unknown", String::as_str),
             telemetry_properties,
             cpu_budget::cpu_budget().configured_cores(),
+            env!("GIT_COMMIT_SHA"),
         )
         .await;
     }

@@ -94,8 +94,8 @@ fn main() {
     // crash is not a panic: without this the process dies silently with exit 139.
     // Attaching runs before the banner but reports after it, so the banner stays the
     // first line of the log. The version goes in so a report names the build that
-    // produced it.
-    let crash_reporting = spiced::crash_handler::install(&get_version_string());
+    // produced it, without the commit, which a crash report has as a field of its own.
+    let crash_reporting = spiced::crash_handler::install(&version_without_commit());
 
     let (mut args, open_telemetry_deprecated, flight_chosen, http_chosen) = {
         let mut matches = spiced::Args::command().get_matches();
@@ -255,21 +255,17 @@ fn load_and_run(mut args: spiced::Args) -> Result<(), Box<dyn std::error::Error>
     Ok(())
 }
 
+/// The version `--version` prints and every run opens with, naming the commit it
+/// was built from: `v2.5.0+models (6c9b6e4a7e)`.
 fn get_version_string() -> String {
-    if cfg!(feature = "release") {
-        format!("v{}{}", env!("CARGO_PKG_VERSION"), build_metadata())
-    } else {
-        let mut version = format!(
-            "v{}-build.{}",
-            env!("CARGO_PKG_VERSION"),
-            env!("GIT_COMMIT_HASH")
-        );
-        if cfg!(feature = "dev") {
-            version.push_str("-dev");
-        }
-        version.push_str(build_metadata());
-        version
-    }
+    format!("{} ({})", version_without_commit(), env!("GIT_COMMIT_HASH"))
+}
+
+/// The semver version of this build, without the commit: `v2.5.0+models`, or
+/// `v2.5.0-unstable-dev+models` for a `dev` build.
+fn version_without_commit() -> String {
+    let dev = if cfg!(feature = "dev") { "-dev" } else { "" };
+    format!("v{}{dev}{}", env!("CARGO_PKG_VERSION"), build_metadata())
 }
 
 /// Build metadata conforming to <https://semver.org/#spec-item-10>

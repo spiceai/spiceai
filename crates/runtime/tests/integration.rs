@@ -78,7 +78,6 @@ mod cache;
 mod catalog;
 mod cayenne;
 mod cayenne_catalog_ddl;
-#[cfg(feature = "duckdb")]
 mod clickbench;
 mod clickhouse;
 mod cluster;
@@ -164,6 +163,7 @@ mod results_cache;
 mod results_cache_warmup;
 #[cfg(all(unix, feature = "duckdb", feature = "postgres"))]
 mod retention;
+mod rustfs;
 mod s3;
 mod s3_folder_marker;
 mod s3_location_pruning;

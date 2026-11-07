@@ -2477,6 +2477,7 @@ async fn executor_bind_app(
     );
     let secret_store_names: Vec<String> = app_def.secrets.iter().map(|s| s.name.clone()).collect();
     *rt.app.write().await = Some(app_def);
+    rt.search_primary_keys.update(Arc::clone(&rt.app)).await;
 
     // Create a cluster client for secrets. This channel outlives every secret
     // resolution on the executor, so it is the one that most needs the keepalive

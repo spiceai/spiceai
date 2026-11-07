@@ -923,6 +923,7 @@ impl RuntimeBuilder {
             model_loads: Arc::default(),
             tool_loads: Arc::default(),
             tool_udfs: Arc::default(),
+            search_primary_keys: runtime_search::search_engine::ExplicitPrimaryKeys::default(),
             view_loads: Arc::default(),
             telemetry_config: self.telemetry_config,
             snapshot_sources: Arc::default(),

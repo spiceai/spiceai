@@ -1,0 +1,29 @@
+name: anthropic-static-token
+description: >
+  An Anthropic model authenticates with a static `anthropic_auth_token`, sent as
+  a bearer token and read through `${secrets:…}`: a chat completion answers.
+  Needs SPICE_ANTHROPIC_AUTH_TOKEN, a real token. CI mints a short-lived one
+  from its GitHub OIDC token (.github/actions/anthropic-token) right before
+  this script.
+
+spicepod:
+  version: v1
+  kind: Spicepod
+  name: anthropic-static-token
+  models:
+    - from: anthropic:claude-sonnet-4-6
+      name: claude
+      params:
+        anthropic_auth_token: ${secrets:SPICE_ANTHROPIC_AUTH_TOKEN}
+
+steps:
+  - start: {}
+  - http:
+      method: POST
+      path: /v1/chat/completions
+      headers: { content-type: application/json }
+      body: '{"model": "claude", "messages": [{"role": "user", "content": "Reply with the single word pong and nothing else."}]}'
+    expect:
+      status: 200
+      json:
+        - { pointer: /choices/0/message/content, matches: '(?i)pong' }

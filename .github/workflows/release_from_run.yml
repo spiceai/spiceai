@@ -1,5 +1,11 @@
 name: release_from_run
 
+# Recovery publish for release lines cut before build_release and
+# publish_release existed (2.4 and earlier), whose tag builds still publish
+# their own binaries. Newer releases are published only by publish_release.
+# workflow_dispatch needs the file on the default branch, so it stays here
+# until those lines are retired.
+
 on:
   workflow_dispatch:
     inputs:
