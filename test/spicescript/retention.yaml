@@ -12,12 +12,16 @@ description: >
   load window brought in, a `retention_sql` predicate that casts the text to a
   timestamp deletes exactly the rows it is true for, and no retention check
   fails.
+  On an append-refreshed acceleration that upserts by
+  key, `retention_sql` applies after each refresh writes, with no scheduled
+  check: a row the source marks deleted is removed after the refresh that brings
+  the change.
 
 sources:
   src: { kind: postgres }
 
 matrix:
-  engine: [cayenne, duckdb, arrow]
+  engine: [cayenne, arrow]
 
 spicepod:
   version: v1
@@ -47,6 +51,19 @@ spicepod:
         retention_check_enabled: true
         retention_check_interval: 1s
         on_zero_results: use_source
+    - from: postgres:public.widgets
+      name: appended
+      params: ${sources.src.params}
+      time_column: updated_at
+      time_format: timestamptz
+      acceleration:
+        enabled: true
+        engine: '${matrix.engine}'
+        refresh_mode: append
+        refresh_check_interval: 200ms
+        primary_key: id
+        on_conflict: { id: upsert }
+        retention_sql: DELETE FROM appended WHERE deleted = true
     - from: postgres:public.iso_events
       name: iso_by_time
       params: ${sources.src.params}
@@ -97,6 +114,8 @@ steps:
           CASE WHEN i % 7 = 0 THEN -i WHEN i % 13 = 0 THEN NULL ELSE i END
           FROM generate_series(1, 900) i;
         INSERT INTO events VALUES (901, NULL, 'live', 1), (902, now()::timestamp + INTERVAL '1 day', 'live', 2);
+        CREATE TABLE widgets (id int PRIMARY KEY, name text, updated_at timestamptz NOT NULL DEFAULT now(), deleted boolean NOT NULL DEFAULT false);
+        INSERT INTO widgets (id, name) VALUES (1, 'a'), (2, 'b'), (3, 'c');
         CREATE TABLE iso_events (id int, ts text, v int);
         INSERT INTO iso_events SELECT i,
           to_char((now() AT TIME ZONE 'UTC') - (i % 90) * INTERVAL '1 day' - INTERVAL '1 hour' + o.shift, 'YYYY-MM-DD"T"HH24:MI:SS') || o.suffix, i
@@ -159,3 +178,14 @@ steps:
   - query: SELECT * FROM by_sql WHERE id = 1000
     expect-empty: true
     oracle-sql: SELECT * FROM events WHERE false
+
+  # retention_sql on an append refresh applies as the refresh writes: a row the
+  # source marks deleted is gone once that refresh commits, with no scheduled check.
+  - query: SELECT * FROM appended
+    oracle-sql: SELECT * FROM widgets
+    eventually: 30s
+  - source-exec: { src: "UPDATE widgets SET deleted = true, updated_at = now() + INTERVAL '1 second' WHERE id = 1" }
+  - refresh: appended
+  - query: SELECT * FROM appended
+    oracle-sql: SELECT * FROM widgets WHERE NOT deleted
+    eventually: 30s

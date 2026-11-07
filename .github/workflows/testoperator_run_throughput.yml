@@ -334,6 +334,40 @@ jobs:
         with:
           keyspace: tpch_sf1
 
+      # Short-lived AWS credentials, kept out of the job's environment and passed to the step below.
+      - name: Assume the Databricks Delta role
+        id: aws-databricks-delta
+        uses: aws-actions/configure-aws-credentials@e1253824e5c10ff9df46874f81ed3ec929e19cfd # v6.3.0
+        with:
+          role-to-assume: ${{ secrets.NEW_AWS_DATABRICKS_DELTA_ROLE_ARN }}
+          role-session-name: gha-databricks-delta-${{ github.run_id }}
+          role-duration-seconds: 21600
+          aws-region: us-east-1
+          output-env-credentials: false
+          output-credentials: true
+
+      - name: Assume the S3 and Glue role
+        id: aws-s3-athena
+        uses: aws-actions/configure-aws-credentials@e1253824e5c10ff9df46874f81ed3ec929e19cfd # v6.3.0
+        with:
+          role-to-assume: ${{ secrets.AWS_S3_ATHENA_ROLE_ARN }}
+          role-session-name: gha-s3-athena-${{ github.run_id }}
+          role-duration-seconds: 21600
+          aws-region: us-east-1
+          output-env-credentials: false
+          output-credentials: true
+
+      - name: Assume the DynamoDB role
+        id: aws-dynamodb
+        uses: aws-actions/configure-aws-credentials@e1253824e5c10ff9df46874f81ed3ec929e19cfd # v6.3.0
+        with:
+          role-to-assume: ${{ secrets.AWS_DYNAMODB_ROLE_ARN }}
+          role-session-name: gha-dynamodb-${{ github.run_id }}
+          role-duration-seconds: 21600
+          aws-region: us-east-1
+          output-env-credentials: false
+          output-credentials: true
+
       - name: Run the throughput test - ${{ github.event.inputs.spicepod_path }}
         run: |
           rm -rf .spice/data
@@ -355,14 +389,18 @@ jobs:
           DATABRICKS_OIDC_CLIENT_ID: ${{ vars.DATABRICKS_OIDC_CLIENT_ID }}
           DATABRICKS_OIDC_AUDIENCE: ${{ vars.DATABRICKS_OIDC_AUDIENCE }}
           DATABRICKS_CLUSTER_ID: ${{ vars.NEW_DATABRICKS_CLUSTER_ID }}
-          AWS_DATABRICKS_DELTA_ACCESS_KEY_ID: ${{ secrets.NEW_AWS_DATABRICKS_DELTA_ACCESS_KEY_ID }}
-          AWS_DATABRICKS_DELTA_SECRET_ACCESS_KEY: ${{ secrets.NEW_AWS_DATABRICKS_DELTA_SECRET_ACCESS_KEY }}
-          AWS_ACCESS_KEY_ID: ${{ secrets.AWS_S3_ATHENA_ACCESS_KEY_ID }}
-          AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_S3_ATHENA_SECRET_ACCESS_KEY }}
-          AWS_DYNAMODB_ACCESS_KEY_ID: ${{ secrets.AWS_DYNAMODB_ACCESS_KEY_ID }}
-          AWS_DYNAMODB_SECRET_ACCESS_KEY: ${{ secrets.AWS_DYNAMODB_SECRET_ACCESS_KEY }}
-          GLUE_AWS_KEY: ${{ secrets.AWS_S3_ATHENA_ACCESS_KEY_ID }}
-          GLUE_AWS_SECRET: ${{ secrets.AWS_S3_ATHENA_SECRET_ACCESS_KEY }}
+          AWS_DATABRICKS_DELTA_ACCESS_KEY_ID: ${{ steps.aws-databricks-delta.outputs.aws-access-key-id }}
+          AWS_DATABRICKS_DELTA_SECRET_ACCESS_KEY: ${{ steps.aws-databricks-delta.outputs.aws-secret-access-key }}
+          AWS_DATABRICKS_DELTA_SESSION_TOKEN: ${{ steps.aws-databricks-delta.outputs.aws-session-token }}
+          AWS_ACCESS_KEY_ID: ${{ steps.aws-s3-athena.outputs.aws-access-key-id }}
+          AWS_SECRET_ACCESS_KEY: ${{ steps.aws-s3-athena.outputs.aws-secret-access-key }}
+          AWS_SESSION_TOKEN: ${{ steps.aws-s3-athena.outputs.aws-session-token }}
+          AWS_DYNAMODB_ACCESS_KEY_ID: ${{ steps.aws-dynamodb.outputs.aws-access-key-id }}
+          AWS_DYNAMODB_SECRET_ACCESS_KEY: ${{ steps.aws-dynamodb.outputs.aws-secret-access-key }}
+          AWS_DYNAMODB_SESSION_TOKEN: ${{ steps.aws-dynamodb.outputs.aws-session-token }}
+          GLUE_AWS_KEY: ${{ steps.aws-s3-athena.outputs.aws-access-key-id }}
+          GLUE_AWS_SECRET: ${{ steps.aws-s3-athena.outputs.aws-secret-access-key }}
+          GLUE_AWS_SESSION_TOKEN: ${{ steps.aws-s3-athena.outputs.aws-session-token }}
           SNOWFLAKE_ACCOUNT: ${{ secrets.SNOWFLAKE_ACCOUNT }}
           SNOWFLAKE_PASSWORD: ${{ secrets.SNOWFLAKE_PASSWORD }}
           SNOWFLAKE_USERNAME: ${{ secrets.SNOWFLAKE_USERNAME }}

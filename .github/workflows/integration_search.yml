@@ -58,14 +58,28 @@ jobs:
       - name: Set up Rust
         uses: ./.github/actions/setup-rust
 
+      # The step below builds the tests before it runs them, so the credentials last as long as
+      # the job's default 6-hour limit.
+      - name: Assume the S3 Vectors role
+        id: aws-s3-vectors
+        uses: aws-actions/configure-aws-credentials@e1253824e5c10ff9df46874f81ed3ec929e19cfd # v6.3.0
+        with:
+          role-to-assume: ${{ secrets.AWS_S3_VECTORS_ROLE_ARN }}
+          role-session-name: gha-s3-vectors-${{ github.run_id }}
+          role-duration-seconds: 21600
+          aws-region: us-east-1
+          output-env-credentials: false
+          output-credentials: true
+
       - name: Run search integration tests
         env:
           # Metal runners do not have `xcrun metal`
           # See `https://github.com/EricLBuehler/mistral.rs/pull/1311`
           MISTRALRS_METAL_PRECOMPILE: 0
           INSTA_UPDATE: ${{ github.event_name == 'schedule' && 'always' || github.event.inputs.update_snapshots }}
-          AWS_S3_VECTORS_KEY: ${{ secrets.AWS_S3_VECTORS_KEY }}
-          AWS_S3_VECTORS_SECRET: ${{ secrets.AWS_S3_VECTORS_SECRET }}
+          AWS_S3_VECTORS_KEY: ${{ steps.aws-s3-vectors.outputs.aws-access-key-id }}
+          AWS_S3_VECTORS_SECRET: ${{ steps.aws-s3-vectors.outputs.aws-secret-access-key }}
+          AWS_S3_VECTORS_SESSION_TOKEN: ${{ steps.aws-s3-vectors.outputs.aws-session-token }}
           # ARN of the pre-seeded, long-lived S3 Vectors index the S3VectorsFallback permutation
           # falls back to (its zero-row acceleration never populates the index itself).
           AWS_S3_VECTORS_FALLBACK_INDEX_ARN: ${{ vars.AWS_S3_VECTORS_FALLBACK_INDEX_ARN }}
