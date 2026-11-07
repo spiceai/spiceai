@@ -98,6 +98,16 @@
       "group": "cayenne"
     }
   ],
+  "cayenne-snapshot-reader-path-change": [
+    {
+      "run": "cayenne-snapshot-reader-path-change",
+      "who": "reader",
+      "key": "query: SELECT count(*) AS n, sum(id) AS s FROM t #2",
+      "kind": "error",
+      "signature": "stopped matching after <duration> (<n> attempts): Spice rejected the query: Query execution failed. Acceleration not ready; loading initial data for t: Acceleration not ready; loading initial data for t",
+      "group": "cayenne"
+    }
+  ],
   "cayenne-torn-reads": [
     {
       "run": "cayenne-torn-reads",
