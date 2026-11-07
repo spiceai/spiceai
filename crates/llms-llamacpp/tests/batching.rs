@@ -21,11 +21,12 @@ limitations under the License.
 use std::num::NonZeroU32;
 use std::path::Path;
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::Duration;
 
+use async_openai::types::chat::ChatCompletionResponseStream;
 use futures::StreamExt;
 use llms::chat::{Chat, LocalModelOptions, ReasoningDefault};
-use llms_llamacpp::LlamaCpp;
+use llms_llamacpp::{LlamaCpp, STREAM_BUFFER};
 use serde_json::{Value, json};
 
 use crate::mtp::qwen35_gguf;
@@ -93,6 +94,79 @@ const PROMPTS_MTP: [&str; 4] = [
     "List the days of the week starting from Monday, one per line. Reply with only the days.",
     "List the months of the year starting from January, one per line. Reply with only the months.",
 ];
+/// How long a request beside another may take to stream: a request that cannot be served
+/// until the other's client reads would never finish.
+const SERVED_WITHIN: Duration = Duration::from_secs(60);
+
+/// A streamed reply's content, and how many chunks carried it.
+struct Streamed {
+    text: String,
+    chunks: usize,
+}
+
+async fn streamed(model: &Arc<dyn Chat>, body: Value) -> Streamed {
+    let mut stream = model.chat_stream(request(body)).await.expect("a stream");
+    let mut reply = Streamed {
+        text: String::new(),
+        chunks: 0,
+    };
+    while let Some(chunk) = stream.next().await {
+        for choice in chunk.expect("a chunk").choices {
+            if let Some(content) = choice.delta.content.filter(|c| !c.is_empty()) {
+                reply.chunks += 1;
+                reply.text.push_str(&content);
+            }
+        }
+    }
+    reply
+}
+
+/// Reads `stream` up to its first chunk of content, and returns the content read.
+async fn first_content(stream: &mut ChatCompletionResponseStream) -> String {
+    let mut text = String::new();
+    while text.is_empty() {
+        let chunk = stream
+            .next()
+            .await
+            .expect("the reply streams content")
+            .expect("a chunk");
+        for choice in chunk.choices {
+            text.extend(choice.delta.content);
+        }
+    }
+    text
+}
+
+/// Reads `stream` until it has streamed `chunks` chunks of content, and returns their content.
+async fn content_chunks(stream: &mut ChatCompletionResponseStream, chunks: usize) -> String {
+    let mut text = String::new();
+    let mut read = 0;
+    while read < chunks {
+        let chunk = stream
+            .next()
+            .await
+            .expect("the reply streams that many chunks")
+            .expect("a chunk");
+        for choice in chunk.choices {
+            if let Some(content) = choice.delta.content.filter(|c| !c.is_empty()) {
+                read += 1;
+                text.push_str(&content);
+            }
+        }
+    }
+    text
+}
+
+/// The content left in `stream`.
+async fn rest(mut stream: ChatCompletionResponseStream) -> String {
+    let mut text = String::new();
+    while let Some(chunk) = stream.next().await {
+        for choice in chunk.expect("a chunk").choices {
+            text.extend(choice.delta.content);
+        }
+    }
+    text
+}
 
 /// Each prompt's reply, served one at a time on a model that holds one sequence, then all at
 /// once on one that holds as many as there are prompts.
@@ -259,105 +333,89 @@ async fn a_next_turn_reuses_its_prefix_beside_another_request_and_replies_as_alo
     );
 }
 
-/// A request that arrives while another is answering streams its first token before the other
-/// sends its last: the second request does not wait for the first one's reply to end.
+/// A request that arrives while another is answering is served while the other's client has
+/// stopped reading. The first reply holds more tokens than a client buffers, so one request at a
+/// time would wait on that client and never reach the second request. The second reply is as
+/// long, so it is still decoding when the first client's buffer fills, and a step that waited on
+/// that client would stall it too. Served together, the second reply arrives whole while the
+/// first is paused, and both replies are as alone. The prompt is the one confident reply longer
+/// than a client's buffer, so both requests send it; replies of different prompts are kept apart
+/// in `requests_served_together_reply_as_each_does_alone`.
 #[tokio::test]
 async fn a_request_arriving_mid_reply_streams_before_the_first_one_ends() {
     let gguf = qwen3_gguf().await;
-    let counting = "Count from 1 to 200, separated by commas. Reply with only the numbers.";
-    let (long_alone, short_alone) = {
+    let alone = {
         let model = load(&gguf, "qwen3-0.6b", 1, 4096).await;
-        (
-            reply(&model, body("qwen3-0.6b", counting, 300)).await,
-            reply(&model, body("qwen3-0.6b", "Say hello.", 16)).await,
-        )
+        streamed(&model, body("qwen3-0.6b", PROMPTS[0], 96)).await
     };
+    assert!(
+        alone.chunks > STREAM_BUFFER,
+        "the reply streams {} chunks, which a client that stops reading buffers whole \
+         ({STREAM_BUFFER}), so it could end without its client",
+        alone.chunks
+    );
     let model = load(&gguf, "qwen3-0.6b", 2, 4096).await;
-    let mut long = model
-        .chat_stream(request(body("qwen3-0.6b", counting, 300)))
+    let mut first = model
+        .chat_stream(request(body("qwen3-0.6b", PROMPTS[0], 96)))
         .await
         .expect("a stream");
-    let mut long_text = String::new();
-    // the long reply is under way before the short request is sent
-    loop {
-        let chunk = long
-            .next()
-            .await
-            .expect("the long reply streams")
-            .expect("a chunk");
-        let started = chunk
-            .choices
-            .iter()
-            .any(|c| c.delta.content.as_ref().is_some_and(|t| !t.is_empty()));
-        for choice in chunk.choices {
-            long_text.extend(choice.delta.content);
-        }
-        if started {
-            break;
-        }
-    }
-    let short_model = Arc::clone(&model);
-    let short = tokio::spawn(async move {
-        let mut stream = short_model
-            .chat_stream(request(body("qwen3-0.6b", "Say hello.", 16)))
-            .await
-            .expect("a stream");
-        let mut first = None;
-        let mut text = String::new();
-        while let Some(chunk) = stream.next().await {
-            for choice in chunk.expect("a chunk").choices {
-                if let Some(content) = choice.delta.content.filter(|c| !c.is_empty()) {
-                    first.get_or_insert_with(Instant::now);
-                    text.push_str(&content);
-                }
-            }
-        }
-        (first, text)
-    });
-    while let Some(chunk) = long.next().await {
-        for choice in chunk.expect("a chunk").choices {
-            long_text.extend(choice.delta.content);
-        }
-    }
-    let long_ended = Instant::now();
-    let (short_first, short_text) = short.await.expect("the short request runs");
-    let short_first = short_first.expect("the short reply streams content");
+    // the first reply is under way, then its client stops reading
+    let mut first_text = first_content(&mut first).await;
+    let second = tokio::time::timeout(
+        SERVED_WITHIN,
+        streamed(&model, body("qwen3-0.6b", PROMPTS[0], 96)),
+    )
+    .await
+    .expect("the second request replies while the first reply's client is not reading");
+    first_text.push_str(&rest(first).await);
     assert_eq!(
-        (long_text, short_text),
-        (long_alone, short_alone),
+        (first_text, second.text),
+        (alone.text.clone(), alone.text),
         "the replies served together, against alone"
-    );
-    assert!(
-        short_first < long_ended,
-        "the short reply's first token came {:?} after the long reply ended",
-        short_first.duration_since(long_ended)
     );
 }
 
-/// A client that leaves while its request decodes beside another's leaves the other's reply as
-/// it is alone.
+/// A client that leaves while its request waits beside another's leaves the other's reply as it
+/// is alone. The leaving client reads one chunk and no more, and its reply holds more tokens
+/// than a client buffers, so once the other request has streamed more chunks than that buffer,
+/// the leaving request is paused on its full buffer, still holding its sequence. The client goes
+/// then, while the other reply still has tokens to decode. The prompt is the one confident reply
+/// longer than a client's buffer, so both requests send it.
 #[tokio::test]
 async fn a_client_leaving_mid_batch_leaves_the_other_reply_unchanged() {
     let gguf = qwen3_gguf().await;
     let alone = {
         let model = load(&gguf, "qwen3-0.6b", 1, 4096).await;
-        reply(&model, body("qwen3-0.6b", PROMPTS[0], 96)).await
+        streamed(&model, body("qwen3-0.6b", PROMPTS[0], 96)).await
     };
+    assert!(
+        alone.chunks > STREAM_BUFFER + 1,
+        "the reply streams {} chunks, which its client buffers whole ({STREAM_BUFFER}), so it \
+         could end before the client goes",
+        alone.chunks
+    );
     let model = load(&gguf, "qwen3-0.6b", 2, 4096).await;
     let mut leaving = model
-        .chat_stream(request(body("qwen3-0.6b", PROMPTS[1], 300)))
+        .chat_stream(request(body("qwen3-0.6b", PROMPTS[0], 96)))
         .await
         .expect("a stream");
-    let _ = leaving.next().await;
-    let staying = {
-        let model = Arc::clone(&model);
-        tokio::spawn(async move { reply(&model, body("qwen3-0.6b", PROMPTS[0], 96)).await })
-    };
-    // the leaving client reads a few more chunks while the other request runs, then goes
-    for _ in 0..4 {
-        let _ = leaving.next().await;
-    }
+    first_content(&mut leaving).await;
+    let mut staying = model
+        .chat_stream(request(body("qwen3-0.6b", PROMPTS[0], 96)))
+        .await
+        .expect("a stream");
+    // by the time the other request has streamed more chunks than a client buffers, the
+    // leaving request has filled its client's buffer and waits
+    let mut staying_text = tokio::time::timeout(
+        SERVED_WITHIN,
+        content_chunks(&mut staying, STREAM_BUFFER + 1),
+    )
+    .await
+    .expect("the other request streams while the leaving one waits");
     drop(leaving);
-    let staying = staying.await.expect("the other request runs");
-    assert_eq!(staying, alone, "the reply beside a client that left");
+    staying_text.push_str(&rest(staying).await);
+    assert_eq!(
+        staying_text, alone.text,
+        "the reply beside a client that left"
+    );
 }
