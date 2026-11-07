@@ -14,35 +14,34 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-//! Dirty/clean partitioning of datalake (cold) files for carry-forward
-//! promotion.
+//! Which durable tombstones a warm-to-datalake promotion must keep.
 //!
-//! Incremental promotion rewrites only the cold files a tombstone may touch
-//! (**dirty**) and carries every other file (**clean**) forward by manifest
-//! reference — never re-reading it from the object store. Classification runs
-//! entirely from in-memory manifest data: each cold file's persisted
-//! statistics blob yields a per-PK-column min/max hyper-rectangle, and a file
-//! is dirty iff any tombstoned key falls inside its rectangle. Cold files are
-//! curve-clustered on the PK by default, so rectangles are tight and a
-//! tombstone hits few files.
+//! A promotion writes only the warm tier's live rows into new datalake (cold)
+//! files and carries every existing cold file forward by manifest reference,
+//! never re-reading or rewriting it. A cold file therefore keeps the rows an
+//! upsert or delete has since superseded, and the tombstones that superseded
+//! them are what hide those rows at read time: the read path applies a
+//! tombstone to a cold file only when the tombstone is newer than every row in
+//! the file (`delete_sequence > ColdTierFile::max_sequence`), the same rule a
+//! protected snapshot applies against its creation threshold.
 //!
-//! When a file carries a per-file PK bloom (`ColdTierFile::pk_bloom`), a
-//! tombstone must ALSO bloom-hit to dirty the file. Both tests individually
-//! never miss a hosted key (true bounds contain it; blooms have no false
-//! negatives for inserted keys), so their intersection doesn't either — while
-//! the bloom rejects ~99% of in-band-but-absent keys, exactly the precision
-//! rectangles lose as carried files' PK ranges drift across promotions. The
-//! rectangle stays first: bloom false positives compound with tombstone count
-//! ((1-p)^T per file), so the bloom is only probed for the few tombstones the
-//! rectangle cannot exclude.
+//! A tombstone can still hide a cold row only when it is newer than that file
+//! AND its key may be in the file. Key membership is decided entirely from
+//! in-memory manifest data: each cold file's persisted statistics blob yields a
+//! per-PK-column min/max hyper-rectangle, and when the file carries a per-file
+//! PK bloom (`ColdTierFile::pk_bloom`) the key must ALSO bloom-hit. Both tests
+//! individually never miss a hosted key (true bounds contain it; blooms have no
+//! false negatives for inserted keys), so their intersection doesn't either —
+//! while the bloom rejects ~99% of in-band-but-absent keys, exactly the
+//! precision rectangles lose as carried files' PK ranges drift across
+//! promotions. The rectangle stays first, so the bloom is only probed for the
+//! few tombstones the rectangle cannot exclude.
 //!
-//! Detection is CONSERVATIVE in the safe direction: a false positive costs an
-//! extra rewrite; a missed tombstone is impossible. Any file whose statistics
-//! are absent/undecodable — or any key that cannot be compared — classifies as
-//! dirty (bloom-only when a bloom is present). This conservatism is what
-//! preserves the promotion commit's invariant that the deletion index fully
-//! drains: every tombstone's potential host file is in the rewrite set, so
-//! every tombstone is physically applied.
+//! Detection is CONSERVATIVE in the safe direction: a false positive keeps a
+//! tombstone that hides nothing; a missed one would resurrect a superseded
+//! cold row. Any file whose statistics are absent/undecodable — or any key that
+//! cannot be compared — counts as possibly holding the key (bloom-only when a
+//! bloom is present).
 
 use std::sync::Arc;
 
@@ -57,33 +56,24 @@ use crate::row_converter::{Row, RowConverter};
 use crate::stats::statistics_from_persisted_blob;
 
 /// `SessionConfig` extension supplying the exact cold files the scan branch
-/// must read. Attached ONLY by the promotion's private session so the
-/// carry-forward rewrite reads the dirty files and nothing else; user-query
-/// sessions never carry it, so queries always see the full captured manifest.
+/// must read. Attached ONLY by the promotion's private session, which supplies
+/// none: a promotion reads the warm tier alone and carries every cold file
+/// forward by manifest reference. User-query sessions never carry it, so
+/// queries always see the full captured manifest.
 ///
-/// Carries the classified manifest ROWS, not their URLs, so the rewrite stream
-/// is built from the listing the classification ran against. See
-/// [`cold_files_for_scan`] for why that has to replace the scan's own capture.
+/// Carries manifest ROWS, not their URLs; see [`cold_files_for_scan`] for why
+/// a supplied set replaces the scan's own capture rather than filtering it.
 #[derive(Debug)]
 pub(crate) struct ColdScanFiles(pub Arc<Vec<ColdTierFile>>);
 
-/// Resolve which cold files a scan branch reads: the promotion's classified
-/// rows when its private session supplies them, else the caller's fenced
-/// manifest capture.
+/// Resolve which cold files a scan branch reads: the rows the promotion's
+/// private session supplies, else the caller's fenced manifest capture.
 ///
 /// `promotion` REPLACES `captured` — it is deliberately not intersected with
 /// it. The two are independent reads of `cayenne_cold_tier_file` with no lock
 /// held across them, so they can disagree, and intersecting silently yields
-/// the smaller set: a file classified dirty but missing from `captured` would
-/// be dropped from the rewrite while the promotion's commit still retires it,
-/// carrying its rows forward by neither manifest reference nor rewrite. Every
-/// file the promotion classified is one it listed from the manifest, so
-/// reading them is always the correct rewrite input.
-///
-/// Should a retired file's object have since been GC'd, the scan fails with a
-/// `NotFound` rather than dropping rows — the same trade
-/// [`super::table::CayenneTableProvider::run_cold_tier_gc_tick`] already makes
-/// for a long-running query, and the right one for an accelerator.
+/// the smaller set (#12708). A promotion supplies an empty set, so its read of
+/// the visible rows covers the warm tier and no cold file at all.
 pub(crate) fn cold_files_for_scan<'a>(
     captured: &'a [ColdTierFile],
     promotion: Option<&'a ColdScanFiles>,
@@ -94,30 +84,14 @@ pub(crate) fn cold_files_for_scan<'a>(
     }
 }
 
-/// The cold manifest split for one promotion pass.
-pub(crate) struct ColdFilePartition {
-    /// May contain a tombstoned key — must be re-read and rewritten.
-    pub dirty: Vec<ColdTierFile>,
-    /// Provably untouched by every tombstone — carried forward by manifest
-    /// reference.
-    pub clean: Vec<ColdTierFile>,
-    /// Tombstoned keys the split was computed against (observability only).
-    pub tombstones: usize,
-    /// Clean files excluded by their min/max rectangle alone (no tombstone
-    /// inside the bounds).
-    pub cleared_by_min_max: usize,
-    /// Clean files a tombstone's rectangle contained but every bloom probe
-    /// rejected — rewrites avoided purely by the bloom refinement.
-    pub cleared_by_bloom: usize,
-}
-
 /// Decode `RowConverter`-encoded tombstone keys into row-major
 /// `ScalarValue` tuples (one inner `Vec` per key, one value per PK column).
 ///
 /// # Errors
 ///
 /// Returns an error when the bytes are malformed for this converter's schema
-/// — callers treat that as "cannot classify" and fall back to all-dirty.
+/// — callers treat that as "cannot decide which tombstones to keep" and skip
+/// the promotion.
 pub(crate) fn decode_tombstone_keys(
     converter: &RowConverter,
     keys: &[Box<[u8]>],
@@ -141,8 +115,9 @@ pub(crate) fn decode_tombstone_keys(
 /// # Errors
 ///
 /// Returns an error when a key is not exactly 8 bytes — callers treat that
-/// as "cannot classify". Truncating a longer buffer would decode a wrong
-/// value and could misclassify a truly-dirty file as clean.
+/// as "cannot decide which tombstones to keep". Truncating a longer buffer
+/// would decode a wrong value and could drop a tombstone that still hides a
+/// cold row.
 pub(crate) fn decode_int64_tombstone_keys(
     keys: &[Box<[u8]>],
 ) -> Result<Vec<Vec<ScalarValue>>, arrow_schema::ArrowError> {
@@ -164,7 +139,7 @@ pub(crate) fn decode_int64_tombstone_keys(
 /// per-file PK blooms insert (the Int64 fast path's deletion vectors persist
 /// raw big-endian bytes — a different representation). `None` when any key is
 /// not a single non-null `Int64` or conversion fails — the caller then
-/// classifies by rectangle only (the safe default, not an error).
+/// decides by rectangle only (the safe default, not an error).
 pub(crate) fn encode_int64_bloom_probes(
     converter: &RowConverter,
     keys: &[Vec<ScalarValue>],
@@ -185,9 +160,9 @@ pub(crate) fn encode_int64_bloom_probes(
     )
 }
 
-/// A cold file's PK bloom, parsed on first probe only — clean-by-rectangle
-/// files never pay the parse. A missing/corrupt bloom probes as "MAY contain"
-/// (conservative), degrading that file to rectangle-only classification.
+/// A cold file's PK bloom, parsed on first probe only — files the rectangle
+/// excludes never pay the parse. A missing/corrupt bloom probes as "MAY
+/// contain" (conservative), degrading that file to the rectangle test alone.
 enum LazyBloom<'a> {
     Unparsed(Option<&'a [u8]>),
     Parsed(Option<PkBloom>),
@@ -205,94 +180,89 @@ impl LazyBloom<'_> {
     }
 }
 
-/// Split `cold_files` into dirty/clean against the tombstoned keys.
+/// The lowest delete sequence among `tombstones` that may still hide a row of
+/// one of `cold_files`, or `None` when none can.
 ///
-/// `tombstone_keys` is row-major (`decode_tombstone_keys` output); an empty
-/// set classifies everything clean. `pk_indices` are the PK columns' indices
-/// in `schema`, in primary-key order (matching each key tuple's order).
+/// `tombstones` pairs each tombstoned key — row-major, one value per PK column
+/// in primary-key order (`decode_tombstone_keys` output) — with the sequence of
+/// its newest delete. `pk_indices` are the PK columns' indices in `schema`, in
+/// that same order.
 ///
-/// `bloom_probes` optionally refines the rectangle test: the same tombstones
-/// in the byte encoding the per-file PK blooms insert (index-aligned with
-/// `tombstone_keys` — composite DV keys are already that encoding; Int64 keys
-/// go through [`encode_int64_bloom_probes`]). A file with a usable bloom is
-/// dirty only if a rectangle-contained tombstone ALSO bloom-hits. `None`, a
-/// length mismatch, or a bloom-less file falls back to rectangle-only.
-pub(crate) fn partition_cold_files(
-    cold_files: Vec<ColdTierFile>,
-    tombstone_keys: &[Vec<ScalarValue>],
+/// A tombstone may hide a row of a cold file when it is newer than the file
+/// (`delete_sequence > max_sequence`, the rule the read path applies) and its
+/// key falls inside the file's rectangle and, when the file has a usable bloom,
+/// bloom-hits. `bloom_probes` are the same tombstones in the byte encoding the
+/// per-file PK blooms insert, index-aligned with `tombstones` (composite DV
+/// keys are already that encoding; Int64 keys go through
+/// [`encode_int64_bloom_probes`]). `None`, a length mismatch, or a bloom-less
+/// file falls back to the rectangle alone.
+///
+/// Tombstones are checked oldest first and the first that may hide a row ends
+/// the search, so the common case — the oldest tombstone still masks a
+/// superseded cold row — costs one probe pass.
+pub(crate) fn lowest_cold_relevant_tombstone_sequence(
+    cold_files: &[ColdTierFile],
+    tombstones: &[(Vec<ScalarValue>, i64)],
     bloom_probes: Option<&[Box<[u8]>]>,
     schema: &Arc<Schema>,
     pk_indices: &[usize],
-) -> ColdFilePartition {
-    if tombstone_keys.is_empty() {
-        return ColdFilePartition {
-            dirty: Vec::new(),
-            clean: cold_files,
-            tombstones: 0,
-            cleared_by_min_max: 0,
-            cleared_by_bloom: 0,
-        };
-    }
+) -> Option<i64> {
     // A misaligned probe set can't be trusted — degrade to rectangle-only
     // rather than probing the wrong bytes.
-    let probes = bloom_probes.filter(|p| p.len() == tombstone_keys.len());
+    let probes = bloom_probes.filter(|p| p.len() == tombstones.len());
+    let mut files: Vec<ColdFileKeyTest<'_>> = cold_files
+        .iter()
+        .map(|file| ColdFileKeyTest {
+            max_sequence: file.max_sequence,
+            bounds: pk_bounds_from_manifest(file, schema, pk_indices),
+            bloom: LazyBloom::Unparsed(probes.and(file.pk_bloom.as_deref())),
+        })
+        .collect();
+    let mut ordered: Vec<(&[ScalarValue], i64, Option<&[u8]>)> = tombstones
+        .iter()
+        .enumerate()
+        .map(|(i, (key, delete_sequence))| {
+            let probe = probes.and_then(|p| p.get(i)).map(Box::as_ref);
+            (key.as_slice(), *delete_sequence, probe)
+        })
+        .collect();
+    ordered.sort_unstable_by_key(|(_, delete_sequence, _)| *delete_sequence);
+    ordered
+        .into_iter()
+        .find(|(key, delete_sequence, probe)| {
+            files
+                .iter_mut()
+                .any(|file| file.may_hide(key, *delete_sequence, *probe))
+        })
+        .map(|(_, delete_sequence, _)| delete_sequence)
+}
 
-    let mut dirty = Vec::new();
-    let mut clean = Vec::new();
-    let mut cleared_by_min_max = 0usize;
-    let mut cleared_by_bloom = 0usize;
-    for file in cold_files {
-        let bounds = pk_bounds_from_manifest(&file, schema, pk_indices);
-        let mut bloom = LazyBloom::Unparsed(probes.and(file.pk_bloom.as_deref()));
-        // Which test did the excluding: `rect_hit` records whether any
-        // tombstone survived the rectangle, so a clean verdict is attributable
-        // to the rectangle (`!rect_hit`) or to the bloom refinement.
-        let mut rect_hit = false;
-        let is_dirty = match (&bounds, probes) {
-            (Some(bounds), Some(probes)) => {
-                tombstone_keys
-                    .iter()
-                    .zip(probes.iter())
-                    .any(|(key, probe)| {
-                        let contained = key_within_bounds(key, bounds);
-                        rect_hit |= contained;
-                        contained && bloom.maybe_contains(probe)
-                    })
-            }
-            (Some(bounds), None) => tombstone_keys
-                .iter()
-                .any(|key| key_within_bounds(key, bounds)),
-            // No usable statistics → cannot prove clean by bounds; a bloom
-            // (when present) can still clear the file on its own.
-            (None, Some(probes)) => {
-                rect_hit = true; // no rectangle to credit
-                probes.iter().any(|probe| bloom.maybe_contains(probe))
-            }
-            (None, None) => true,
-        };
-        if is_dirty {
-            dirty.push(file);
-        } else {
-            if rect_hit {
-                cleared_by_bloom += 1;
-            } else {
-                cleared_by_min_max += 1;
-            }
-            clean.push(file);
-        }
-    }
-    ColdFilePartition {
-        dirty,
-        clean,
-        tombstones: tombstone_keys.len(),
-        cleared_by_min_max,
-        cleared_by_bloom,
+/// One cold file's side of the "may this tombstone hide a row here" test.
+struct ColdFileKeyTest<'a> {
+    max_sequence: i64,
+    bounds: Option<Vec<(ScalarValue, ScalarValue)>>,
+    bloom: LazyBloom<'a>,
+}
+
+impl ColdFileKeyTest<'_> {
+    fn may_hide(
+        &mut self,
+        key: &[ScalarValue],
+        delete_sequence: i64,
+        probe: Option<&[u8]>,
+    ) -> bool {
+        delete_sequence > self.max_sequence
+            && self
+                .bounds
+                .as_ref()
+                .is_none_or(|bounds| key_within_bounds(key, bounds))
+            && probe.is_none_or(|probe| self.bloom.maybe_contains(probe))
     }
 }
 
 /// Extract the per-PK-column `[min, max]` bounds from a cold file's persisted
 /// statistics blob. `None` when the blob is missing/undecodable or any PK
-/// column lacks concrete, non-null bounds (→ conservative dirty).
+/// column lacks concrete, non-null bounds (→ conservatively "may contain").
 fn pk_bounds_from_manifest(
     file: &ColdTierFile,
     schema: &Arc<Schema>,
@@ -352,7 +322,7 @@ pub(crate) fn pk_byte_range_from_manifest(
 
 /// Whether a key tuple falls inside every per-column bound (point-in-
 /// hyper-rectangle). Incomparable values (type mismatch, NULL) count as
-/// "inside" — conservative dirty.
+/// "inside" — conservatively "may contain".
 fn key_within_bounds(key: &[ScalarValue], bounds: &[(ScalarValue, ScalarValue)]) -> bool {
     key.iter().zip(bounds.iter()).all(|(v, (min, max))| {
         match (v.partial_cmp(min), v.partial_cmp(max)) {
@@ -545,8 +515,20 @@ mod composite_key_tests {
         );
     }
 
+    /// Pair decoded keys with one delete sequence each, as the promotion does.
+    fn with_sequences(
+        keys: Vec<Vec<ScalarValue>>,
+        sequences: &[i64],
+    ) -> Vec<(Vec<ScalarValue>, i64)> {
+        assert_eq!(keys.len(), sequences.len(), "one sequence per key");
+        keys.into_iter().zip(sequences.iter().copied()).collect()
+    }
+
+    /// Every file in these tests holds rows up to sequence 100.
+    const NEWER: i64 = 200;
+
     #[test]
-    fn orderline_delivery_tombstones_dirty_only_their_o_id_band() {
+    fn only_a_tombstone_inside_a_files_band_keeps_it() {
         // Three cold generations of orderline data, banded by ol_o_id (the
         // realistic clustering outcome for this key shape).
         let files = vec![
@@ -554,64 +536,111 @@ mod composite_key_tests {
             cold_file("f2", (1001, 2000)),
             cold_file("f3", (2001, 3000)),
         ];
-        // Delivery-like updates: tombstones for two orders around o_id 1500,
-        // any warehouse/district — should hit ONLY the middle band.
-        let keys = [(7, 3, 1500, 1), (12, 9, 1520, 4)];
+        // An o_id beyond every band is newer than every file but can hide
+        // nothing; the delivery-like tombstone in the middle band can.
+        let keys = [(7, 3, 99_999, 1), (12, 9, 1520, 4)];
         let (converter, bytes) = encode_keys(&keys);
         let decoded = decode_tombstone_keys(&converter, &bytes).expect("decode");
-
-        let partition =
-            partition_cold_files(files, &decoded, None, &orderline_schema(), &PK_INDICES);
-        let dirty: Vec<&str> = partition
-            .dirty
-            .iter()
-            .map(|f| f.file_url.as_str())
-            .collect();
-        let clean: Vec<&str> = partition
-            .clean
-            .iter()
-            .map(|f| f.file_url.as_str())
-            .collect();
+        let tombstones = with_sequences(decoded, &[NEWER, NEWER + 1]);
         assert_eq!(
-            dirty,
-            vec!["f2"],
-            "only the o_id band containing the tombstones is dirty"
+            lowest_cold_relevant_tombstone_sequence(
+                &files,
+                &tombstones,
+                None,
+                &orderline_schema(),
+                &PK_INDICES,
+            ),
+            Some(NEWER + 1),
+            "the out-of-band tombstone is older but hides nothing; the in-band one decides"
         );
-        assert_eq!(clean, vec!["f1", "f3"], "sibling bands are provably clean");
-        assert_eq!(partition.tombstones, 2);
-        assert_eq!(
-            partition.cleared_by_min_max, 2,
-            "both clean files were excluded by rectangle alone"
-        );
-        assert_eq!(partition.cleared_by_bloom, 0);
     }
 
     #[test]
-    fn tombstone_outside_every_pk_dimension_leaves_all_clean() {
+    fn a_tombstone_outside_every_pk_dimension_keeps_nothing() {
         let files = vec![cold_file("f1", (1, 1000)), cold_file("f2", (1001, 2000))];
-        // o_id beyond every band: nothing is dirty.
         let keys = [(7, 3, 99_999, 1)];
         let (converter, bytes) = encode_keys(&keys);
         let decoded = decode_tombstone_keys(&converter, &bytes).expect("decode");
-        let partition =
-            partition_cold_files(files, &decoded, None, &orderline_schema(), &PK_INDICES);
-        assert!(partition.dirty.is_empty());
-        assert_eq!(partition.clean.len(), 2);
+        assert_eq!(
+            lowest_cold_relevant_tombstone_sequence(
+                &files,
+                &with_sequences(decoded, &[NEWER]),
+                None,
+                &orderline_schema(),
+                &PK_INDICES,
+            ),
+            None
+        );
     }
 
     #[test]
-    fn missing_stats_blob_is_conservatively_dirty() {
-        let mut file = cold_file("f1", (1, 1000));
-        file.statistics_blob = Vec::new(); // undecodable
-        let keys = [(7, 3, 99_999, 1)]; // would be clean if stats existed
+    fn a_tombstone_no_newer_than_the_file_never_applies_to_it() {
+        // The file holds rows up to sequence 100: a delete at or below that was
+        // already applied when the file was written, so it can hide nothing
+        // there however well its key matches.
+        let files = vec![cold_file("f1", (1, 1000))];
+        let keys = [(7, 3, 500, 1), (8, 3, 600, 1)];
         let (converter, bytes) = encode_keys(&keys);
         let decoded = decode_tombstone_keys(&converter, &bytes).expect("decode");
-        let partition =
-            partition_cold_files(vec![file], &decoded, None, &orderline_schema(), &PK_INDICES);
         assert_eq!(
-            partition.dirty.len(),
-            1,
-            "no stats -> cannot prove clean -> dirty"
+            lowest_cold_relevant_tombstone_sequence(
+                &files,
+                &with_sequences(decoded.clone(), &[99, 100]),
+                None,
+                &orderline_schema(),
+                &PK_INDICES,
+            ),
+            None,
+            "a delete at or below the file's max sequence is already in the file"
+        );
+        assert_eq!(
+            lowest_cold_relevant_tombstone_sequence(
+                &files,
+                &with_sequences(decoded, &[100, 101]),
+                None,
+                &orderline_schema(),
+                &PK_INDICES,
+            ),
+            Some(101),
+            "the first delete above the file's max sequence applies to it"
+        );
+    }
+
+    #[test]
+    fn the_lowest_relevant_sequence_is_returned_whatever_the_input_order() {
+        let files = vec![cold_file("f1", (1, 1000))];
+        let keys = [(1, 1, 10, 1), (2, 2, 20, 2), (3, 3, 30, 3)];
+        let (converter, bytes) = encode_keys(&keys);
+        let decoded = decode_tombstone_keys(&converter, &bytes).expect("decode");
+        assert_eq!(
+            lowest_cold_relevant_tombstone_sequence(
+                &files,
+                &with_sequences(decoded, &[NEWER + 9, NEWER + 3, NEWER + 6]),
+                None,
+                &orderline_schema(),
+                &PK_INDICES,
+            ),
+            Some(NEWER + 3)
+        );
+    }
+
+    #[test]
+    fn missing_stats_blob_conservatively_keeps_the_tombstone() {
+        let mut file = cold_file("f1", (1, 1000));
+        file.statistics_blob = Vec::new(); // undecodable
+        let keys = [(7, 3, 99_999, 1)]; // outside the band the stats would give
+        let (converter, bytes) = encode_keys(&keys);
+        let decoded = decode_tombstone_keys(&converter, &bytes).expect("decode");
+        assert_eq!(
+            lowest_cold_relevant_tombstone_sequence(
+                &[file],
+                &with_sequences(decoded, &[NEWER]),
+                None,
+                &orderline_schema(),
+                &PK_INDICES,
+            ),
+            Some(NEWER),
+            "no stats -> cannot rule the key out -> keep the tombstone"
         );
     }
 
@@ -627,47 +656,63 @@ mod composite_key_tests {
     }
 
     #[test]
-    fn bloom_refinement_clears_in_band_but_absent_keys() {
+    fn bloom_refinement_drops_in_band_but_absent_keys() {
         // Two files with IDENTICAL o_id bands — the clustering-degraded case
-        // where rectangles alone cannot tell them apart.
-        let host_keys = [(1, 1, 500, 1)];
-        let other_keys = [(2, 2, 600, 1)];
+        // where rectangles alone cannot tell them apart. Neither bloom holds the
+        // tombstoned key.
         let mut f1 = cold_file("f1", (1, 1000));
-        f1.pk_bloom = Some(bloom_over(&host_keys));
+        f1.pk_bloom = Some(bloom_over(&[(1, 1, 500, 1)]));
         let mut f2 = cold_file("f2", (1, 1000));
-        f2.pk_bloom = Some(bloom_over(&other_keys));
+        f2.pk_bloom = Some(bloom_over(&[(2, 2, 600, 1)]));
+        let files = vec![f1, f2];
 
+        let (converter, bytes) = encode_keys(&[(9, 9, 900, 9)]);
+        let decoded = decode_tombstone_keys(&converter, &bytes).expect("decode");
+        let tombstones = with_sequences(decoded, &[NEWER]);
+
+        assert_eq!(
+            lowest_cold_relevant_tombstone_sequence(
+                &files,
+                &tombstones,
+                None,
+                &orderline_schema(),
+                &PK_INDICES,
+            ),
+            Some(NEWER),
+            "rectangles alone cannot rule the key out"
+        );
+        // Composite DV bytes ARE the bloom probe encoding — passed through.
+        assert_eq!(
+            lowest_cold_relevant_tombstone_sequence(
+                &files,
+                &tombstones,
+                Some(&bytes),
+                &orderline_schema(),
+                &PK_INDICES,
+            ),
+            None,
+            "both blooms miss the key, so it can hide nothing"
+        );
+    }
+
+    #[test]
+    fn bloom_hit_keeps_the_tombstone() {
+        let host_keys = [(1, 1, 500, 1)];
+        let mut file = cold_file("f1", (1, 1000));
+        file.pk_bloom = Some(bloom_over(&host_keys));
         let (converter, bytes) = encode_keys(&host_keys);
         let decoded = decode_tombstone_keys(&converter, &bytes).expect("decode");
-
-        // Rectangle-only: both files dirty (tombstone is in both bands).
-        let rect_only = partition_cold_files(
-            vec![f1.clone(), f2.clone()],
-            &decoded,
-            None,
-            &orderline_schema(),
-            &PK_INDICES,
-        );
-        assert_eq!(rect_only.dirty.len(), 2, "rectangles alone cannot exclude");
-
-        // Bloom refinement: only the actual host file is dirty. Composite DV
-        // bytes ARE the bloom probe encoding — passed through verbatim.
-        let refined = partition_cold_files(
-            vec![f1, f2],
-            &decoded,
-            Some(&bytes),
-            &orderline_schema(),
-            &PK_INDICES,
-        );
-        let dirty: Vec<&str> = refined.dirty.iter().map(|f| f.file_url.as_str()).collect();
-        let clean: Vec<&str> = refined.clean.iter().map(|f| f.file_url.as_str()).collect();
-        assert_eq!(dirty, vec!["f1"], "only the bloom-hit host file is dirty");
-        assert_eq!(clean, vec!["f2"], "in-band but bloom-missed file is clean");
         assert_eq!(
-            refined.cleared_by_bloom, 1,
-            "the clean verdict is attributed to the bloom, not the rectangle"
+            lowest_cold_relevant_tombstone_sequence(
+                &[file],
+                &with_sequences(decoded, &[NEWER]),
+                Some(&bytes),
+                &orderline_schema(),
+                &PK_INDICES,
+            ),
+            Some(NEWER),
+            "a bloom never misses a key the file holds"
         );
-        assert_eq!(refined.cleared_by_min_max, 0);
     }
 
     #[test]
@@ -676,73 +721,74 @@ mod composite_key_tests {
         let file = cold_file("f1", (1, 1000)); // pk_bloom: None
         let (converter, bytes) = encode_keys(&keys);
         let decoded = decode_tombstone_keys(&converter, &bytes).expect("decode");
-        let partition = partition_cold_files(
-            vec![file],
-            &decoded,
-            Some(&bytes),
-            &orderline_schema(),
-            &PK_INDICES,
-        );
         assert_eq!(
-            partition.dirty.len(),
-            1,
-            "no bloom -> in-band tombstone keeps the file dirty"
+            lowest_cold_relevant_tombstone_sequence(
+                &[file],
+                &with_sequences(decoded, &[NEWER]),
+                Some(&bytes),
+                &orderline_schema(),
+                &PK_INDICES,
+            ),
+            Some(NEWER),
+            "no bloom -> an in-band tombstone is kept"
         );
     }
 
     #[test]
-    fn missing_stats_with_bloom_classifies_by_bloom_alone() {
+    fn missing_stats_with_bloom_decides_by_bloom_alone() {
         let host_keys = [(1, 1, 500, 1)];
-        let absent_keys = [(9, 9, 900, 9)];
         let mut file = cold_file("f1", (1, 1000));
         file.statistics_blob = Vec::new(); // no rectangle
         file.pk_bloom = Some(bloom_over(&host_keys));
+        let files = [file];
 
-        let (converter, absent_bytes) = encode_keys(&absent_keys);
+        let (converter, absent_bytes) = encode_keys(&[(9, 9, 900, 9)]);
         let decoded = decode_tombstone_keys(&converter, &absent_bytes).expect("decode");
-        let partition = partition_cold_files(
-            vec![file.clone()],
-            &decoded,
-            Some(&absent_bytes),
-            &orderline_schema(),
-            &PK_INDICES,
-        );
-        assert!(
-            partition.dirty.is_empty(),
-            "bloom miss proves clean even without stats"
+        assert_eq!(
+            lowest_cold_relevant_tombstone_sequence(
+                &files,
+                &with_sequences(decoded, &[NEWER]),
+                Some(&absent_bytes),
+                &orderline_schema(),
+                &PK_INDICES,
+            ),
+            None,
+            "a bloom miss rules the key out even without stats"
         );
 
         let (converter, host_bytes) = encode_keys(&host_keys);
         let decoded = decode_tombstone_keys(&converter, &host_bytes).expect("decode");
-        let partition = partition_cold_files(
-            vec![file],
-            &decoded,
-            Some(&host_bytes),
-            &orderline_schema(),
-            &PK_INDICES,
+        assert_eq!(
+            lowest_cold_relevant_tombstone_sequence(
+                &files,
+                &with_sequences(decoded, &[NEWER]),
+                Some(&host_bytes),
+                &orderline_schema(),
+                &PK_INDICES,
+            ),
+            Some(NEWER),
+            "a bloom hit keeps the tombstone"
         );
-        assert_eq!(partition.dirty.len(), 1, "bloom hit keeps the file dirty");
     }
 
     #[test]
     fn misaligned_probes_degrade_to_rectangle_only() {
         let keys = [(1, 1, 500, 1), (2, 2, 600, 1)];
         let mut file = cold_file("f1", (1, 1000));
-        // Bloom over NEITHER key: aligned probes would prove the file clean.
+        // Bloom over NEITHER key: aligned probes would rule both keys out.
         file.pk_bloom = Some(bloom_over(&[(3, 3, 700, 3)]));
         let (converter, bytes) = encode_keys(&keys);
         let decoded = decode_tombstone_keys(&converter, &bytes).expect("decode");
-        let partition = partition_cold_files(
-            vec![file],
-            &decoded,
-            Some(&bytes[..1]), // wrong length: cannot be trusted
-            &orderline_schema(),
-            &PK_INDICES,
-        );
         assert_eq!(
-            partition.dirty.len(),
-            1,
-            "misaligned probes must not be used; rectangle keeps the file dirty"
+            lowest_cold_relevant_tombstone_sequence(
+                &[file],
+                &with_sequences(decoded, &[NEWER, NEWER + 1]),
+                Some(&bytes[..1]), // wrong length: cannot be trusted
+                &orderline_schema(),
+                &PK_INDICES,
+            ),
+            Some(NEWER),
+            "misaligned probes must not be used; the rectangle keeps the tombstone"
         );
     }
 
@@ -857,8 +903,9 @@ mod scan_file_selection_tests {
 
     #[test]
     fn a_promotion_with_no_dirty_files_reads_nothing() {
-        // Every cold file was provably untouched: the rewrite carries the warm
-        // tier alone, and the capture must not leak clean files back in.
+        // A promotion supplies an empty set: it reads the warm tier alone and
+        // carries every cold file forward, so the capture must not leak a cold
+        // file back into its read.
         let captured = vec![cold_file("s3://c/a.vortex")];
         let dirty = ColdScanFiles(Arc::new(Vec::new()));
         assert!(
