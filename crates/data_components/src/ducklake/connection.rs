@@ -92,12 +92,14 @@ impl MetadataConnection {
             MetadataDatabase::Postgres if is_postgres_uri(rest) => {
                 without_password(&postgres_uri(rest).map_err(unreadable)?, &["password"])
             }
-            MetadataDatabase::Postgres => {
-                without_password_in(rest, &libpq_pairs(rest).map_err(unreadable)?, &["password"])
-            }
+            MetadataDatabase::Postgres => without_password_in(
+                rest,
+                &pairs(rest, Syntax::Libpq).map_err(unreadable)?,
+                &["password"],
+            ),
             MetadataDatabase::Mysql => without_password_in(
                 rest,
-                &mysql_pairs(rest).map_err(unreadable)?,
+                &pairs(rest, Syntax::Mysql).map_err(unreadable)?,
                 &["password", "passwd"],
             ),
         };
@@ -187,53 +189,78 @@ const UNTERMINATED_QUOTE: &str = "an unterminated quote";
 const MISSING_EQUALS: &str = "a parameter without `=`";
 const TRAILING_BACKSLASH: &str = "a `\\` at its end";
 
-/// The pairs of a libpq `key = value` string: a value may be quoted with `'`,
-/// and a backslash escapes the next character, quoted or not.
-fn libpq_pairs(s: &str) -> Result<Vec<Pair>, &'static str> {
-    pairs(s, '\'', true)
+/// How a `key = value` connection string is written.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Syntax {
+    /// libpq's: a value may be quoted with `'`, and a backslash escapes the
+    /// next character, quoted or not.
+    Libpq,
+    /// The `MySQL` extension's: a key or a value may be quoted with `"`, inside
+    /// which a backslash escapes `\` or `"`.
+    Mysql,
 }
 
-/// The pairs of a `MySQL` extension's string: a value may be quoted with `"`,
-/// inside which a backslash escapes `\` or `"`.
-fn mysql_pairs(s: &str) -> Result<Vec<Pair>, &'static str> {
-    pairs(s, '"', false)
+/// Whitespace as libpq and the `MySQL` extension read it: what C's `isspace`
+/// reads in the C locale. `char::is_whitespace` also reads other characters,
+/// such as a no-break space, that both read as part of a value.
+fn is_space(c: char) -> bool {
+    matches!(c, ' ' | '\t' | '\n' | '\x0b' | '\x0c' | '\r')
 }
 
-fn pairs(s: &str, quote: char, escape_unquoted: bool) -> Result<Vec<Pair>, &'static str> {
+/// Reads a key or value that opened with `quote` into `out`, through its
+/// closing quote, where a backslash escapes the next character. Returns the
+/// byte offset after the closing quote.
+fn read_quoted(
+    chars: &mut std::iter::Peekable<std::str::CharIndices<'_>>,
+    quote: char,
+    out: &mut String,
+) -> Result<usize, &'static str> {
+    loop {
+        match chars.next().ok_or(UNTERMINATED_QUOTE)? {
+            (_, '\\') => out.push(chars.next().ok_or(UNTERMINATED_QUOTE)?.1),
+            (i, c) if c == quote => return Ok(i + c.len_utf8()),
+            (_, c) => out.push(c),
+        }
+    }
+}
+
+fn pairs(s: &str, syntax: Syntax) -> Result<Vec<Pair>, &'static str> {
+    let quote = match syntax {
+        Syntax::Libpq => '\'',
+        Syntax::Mysql => '"',
+    };
     let mut chars = s.char_indices().peekable();
     let mut result = Vec::new();
     loop {
-        while chars.next_if(|(_, c)| c.is_whitespace()).is_some() {}
+        while chars.next_if(|&(_, c)| is_space(c)).is_some() {}
         let Some(&(start, _)) = chars.peek() else {
             return Ok(result);
         };
         let mut key = String::new();
-        while let Some((_, c)) = chars.next_if(|(_, c)| *c != '=' && !c.is_whitespace()) {
-            key.push(c);
+        if syntax == Syntax::Mysql && chars.next_if(|&(_, c)| c == quote).is_some() {
+            read_quoted(&mut chars, quote, &mut key)?;
+        } else {
+            while let Some((_, c)) = chars.next_if(|&(_, c)| c != '=' && !is_space(c)) {
+                key.push(c);
+            }
         }
-        while chars.next_if(|(_, c)| c.is_whitespace()).is_some() {}
-        if key.is_empty() || chars.next_if(|(_, c)| *c == '=').is_none() {
+        while chars.next_if(|&(_, c)| is_space(c)).is_some() {}
+        if key.is_empty() || chars.next_if(|&(_, c)| c == '=').is_none() {
             return Err(MISSING_EQUALS);
         }
-        while chars.next_if(|(_, c)| c.is_whitespace()).is_some() {}
+        while chars.next_if(|&(_, c)| is_space(c)).is_some() {}
         let mut value = String::new();
-        let end = if chars.next_if(|(_, c)| *c == quote).is_some() {
-            loop {
-                match chars.next().ok_or(UNTERMINATED_QUOTE)? {
-                    (_, '\\') => value.push(chars.next().ok_or(UNTERMINATED_QUOTE)?.1),
-                    (i, c) if c == quote => break i + c.len_utf8(),
-                    (_, c) => value.push(c),
-                }
-            }
+        let end = if chars.next_if(|&(_, c)| c == quote).is_some() {
+            read_quoted(&mut chars, quote, &mut value)?
         } else {
             let mut end = s.len();
             while let Some(&(i, c)) = chars.peek() {
-                if c.is_whitespace() {
+                if is_space(c) {
                     end = i;
                     break;
                 }
                 chars.next();
-                if c == '\\' && escape_unquoted {
+                if c == '\\' && syntax == Syntax::Libpq {
                     value.push(chars.next().ok_or(TRAILING_BACKSLASH)?.1);
                 } else {
                     value.push(c);
@@ -257,14 +284,19 @@ const BAD_QUERY: &str = "a query parameter without `=`";
 
 /// The pairs a libpq URI sets, in libpq's names, from
 /// `postgresql://[user[:password]@][host][:port][,...][/dbname][?param=value&...]`,
-/// with each part percent-decoded.
+/// with each part percent-decoded. The parts are found in libpq's order: the
+/// user information ends at the first `@` before any `/`, even past a `?`,
+/// the hosts at the next `/` or `?`, and the database name at the next `?`.
 fn postgres_uri(s: &str) -> Result<Vec<(String, String)>, &'static str> {
     let rest = s.split_once("://").map_or(s, |(_, rest)| rest);
-    let (rest, query) = rest.split_once('?').unwrap_or((rest, ""));
-    let (authority, dbname) = rest.split_once('/').unwrap_or((rest, ""));
-    let (userinfo, hosts) = match authority.split_once('@') {
-        Some((userinfo, hosts)) => (Some(userinfo), hosts),
-        None => (None, authority),
+    let (userinfo, rest) = match rest.find(['@', '/']) {
+        Some(at) if rest[at..].starts_with('@') => (Some(&rest[..at]), &rest[at + 1..]),
+        _ => (None, rest),
+    };
+    let (hosts, rest) = rest.split_at(rest.find(['/', '?']).unwrap_or(rest.len()));
+    let (dbname, query) = match rest.strip_prefix('/') {
+        Some(rest) => rest.split_once('?').unwrap_or((rest, "")),
+        None => ("", rest.strip_prefix('?').unwrap_or(rest)),
     };
     let mut pairs = Vec::new();
     if let Some(userinfo) = userinfo {
@@ -569,6 +601,65 @@ mod tests {
                 Some("hunter2".to_string())
             )
         );
+    }
+
+    /// libpq ends a URI's user information at its first `@` before any `/`,
+    /// so a `?` before that `@` is part of the password, not a query.
+    #[test]
+    fn a_uri_password_may_hold_a_question_mark() {
+        assert_eq!(
+            split("postgres:postgresql://u:a?password=X@127.0.0.1:5432/db1"),
+            (
+                "postgres:user='u' host='127.0.0.1' port='5432' dbname='db1'".to_string(),
+                Some("a?password=X".to_string())
+            )
+        );
+        assert_eq!(
+            split("postgresql://u:a?password=X@localhost:5432/db2?sslmode=disable"),
+            (
+                "postgres:user='u' host='localhost' port='5432' dbname='db2' sslmode='disable'"
+                    .to_string(),
+                Some("a?password=X".to_string())
+            )
+        );
+    }
+
+    /// Only the ASCII whitespace C's `isspace` reads separates pairs, as in
+    /// libpq and the `MySQL` extension: a no-break space or an em space is part
+    /// of the value, and a vertical tab separates.
+    #[test]
+    fn only_ascii_whitespace_separates_pairs() {
+        for s in [
+            "postgres:dbname=db1\u{a0}password=wrong host=127.0.0.1 user=u",
+            "mysql:host=h\u{2003}password=p",
+        ] {
+            assert_eq!(split(s), (s.to_string(), None), "{s}");
+        }
+        assert_eq!(
+            split("postgres:dbname=db1\x0bpassword=p host=h"),
+            (
+                "postgres:dbname=db1 host=h".to_string(),
+                Some("p".to_string())
+            )
+        );
+    }
+
+    /// The `MySQL` extension reads a key as it reads a value, so a quoted
+    /// `password` or `passwd`, in any case, is the password.
+    #[test]
+    fn a_quoted_mysql_key_is_read() {
+        for key in [r#""password""#, r#""PASSWD""#, r#""pass\"wd""#] {
+            let s = format!("mysql:{key}=quoted-secret-1 host=127.0.0.1 port=33306 user=root");
+            let expected = if key.contains('\\') {
+                (s.clone(), None)
+            } else {
+                (
+                    "mysql:host=127.0.0.1 port=33306 user=root".to_string(),
+                    Some("quoted-secret-1".to_string()),
+                )
+            };
+            assert_eq!(split(&s), expected, "{key}");
+        }
     }
 
     /// A string without a password, and any other database's string, is

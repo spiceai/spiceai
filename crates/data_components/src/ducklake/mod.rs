@@ -177,14 +177,13 @@ fn write_join_identity(
     hasher.write(path.as_bytes());
     // Separates the parts, so ("ab", "c") and ("a", "bc") differ.
     hasher.write_u8(0);
-    match MetadataConnection::parse(connection_string) {
-        Ok(metadata) => hasher.write(metadata.path.as_bytes()),
-        Err(_) => {
-            // No UTF-8 string holds the byte 0xff, so this is no connection
-            // string's identity.
-            hasher.write_u8(0xff);
-            hasher.write_u64(UNREADABLE_POOLS.fetch_add(1, Ordering::Relaxed));
-        }
+    if let Ok(metadata) = MetadataConnection::parse(connection_string) {
+        hasher.write(metadata.path.as_bytes());
+    } else {
+        // No UTF-8 string holds the byte 0xff, so this is no connection
+        // string's identity.
+        hasher.write_u8(0xff);
+        hasher.write_u64(UNREADABLE_POOLS.fetch_add(1, Ordering::Relaxed));
     }
     hasher.write_u8(0);
     hasher.write(catalog_name.as_bytes());
@@ -648,6 +647,16 @@ mod tests {
                 "mysql:password=mysql-two host=127.0.0.1 database=lake",
                 &["mysql-one", "mysql-two"][..],
             ),
+            (
+                r#"mysql:"password"=quoted-one host=127.0.0.1 database=lake"#,
+                r#"mysql:"PASSWD"=quoted-two host=127.0.0.1 database=lake"#,
+                &["quoted-one", "quoted-two"][..],
+            ),
+            (
+                "postgres:postgresql://spice:a?password=uri-one@127.0.0.1:5432/lake",
+                "postgres:postgresql://spice:b?password=uri-two@127.0.0.1:5432/lake",
+                &["uri-one", "uri-two", "a?password", "b?password"][..],
+            ),
             // A password emptied by a later pair is still a secret.
             (
                 "postgres:dbname=lake user=spice password=overridden-one password=",
@@ -745,6 +754,20 @@ mod tests {
                 "{path} {connection_string} {catalog_name}"
             );
         }
+        // libpq reads both passwords as `a?password=X` and reaches database
+        // `db1` on one host and `db2` on another.
+        assert_ne!(
+            super::join_context(
+                ":memory:",
+                "postgres:postgresql://u:a?password=X@127.0.0.1:5432/db1",
+                "lake"
+            ),
+            super::join_context(
+                ":memory:",
+                "postgres:postgresql://u:a?password=X@localhost:5432/db2",
+                "lake"
+            ),
+        );
     }
 
     /// A string whose password cannot be held apart never reaches the hasher;
