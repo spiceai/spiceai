@@ -841,6 +841,17 @@ where
     /// both simplest-correct and cheap. The single run's tag is its true max
     /// surviving delete seq, so subsequent protected probes skip it precisely.
     fn prune_deletes_at_or_below(&self, cutoff: i64, bloom_hash_of: impl Fn(&K) -> u64) -> Self {
+        self.prune_deletes_retaining(cutoff, |_| true, bloom_hash_of)
+    }
+
+    /// [`Self::prune_deletes_at_or_below`], additionally dropping every entry
+    /// whose key `retain` rejects, whatever its sequences.
+    fn prune_deletes_retaining(
+        &self,
+        cutoff: i64,
+        retain: impl Fn(&K) -> bool,
+        bloom_hash_of: impl Fn(&K) -> u64,
+    ) -> Self {
         // Fuse every key's sides across all tiers (runs + active), taking the
         // per-side max — identical to a full-index probe — then apply the cutoff
         // to the fused delete side. Fusing BEFORE the cutoff is essential: a key
@@ -871,6 +882,9 @@ where
         let mut delete_hashes: Vec<u64> = Vec::new();
 
         for (key, entry) in &fused {
+            if !retain(key) {
+                continue;
+            }
             let delete_seq = if entry.delete_seq != SEQUENCE_ABSENT && entry.delete_seq > cutoff {
                 entry.delete_seq
             } else {
@@ -1533,6 +1547,20 @@ impl DeletionIndex {
         }
     }
 
+    /// [`Self::prune_deletes_at_or_below`] that also drops every entry whose key
+    /// is not in `keys`: the index a datalake promotion keeps when only those
+    /// keys' tombstones may still hide a datalake row.
+    #[must_use]
+    pub fn prune_deletes_retaining_keys(&self, cutoff: i64, keys: &HashSet<i64>) -> Self {
+        Self {
+            core: self.core.prune_deletes_retaining(
+                cutoff,
+                |pk| keys.contains(pk),
+                |pk| hash_key_i64(*pk),
+            ),
+        }
+    }
+
     /// [`Self::prune_deletes_at_or_below`] over this index's frozen runs alone, to
     /// splice over a later version of it with [`Self::with_pruned_prefix`].
     #[must_use]
@@ -1922,6 +1950,20 @@ impl KeyDeletionIndex {
             core: self
                 .core
                 .prune_deletes_at_or_below(cutoff, |key_hash| bloom_half(*key_hash)),
+        }
+    }
+
+    /// Key-based counterpart of [`DeletionIndex::prune_deletes_retaining_keys`];
+    /// `keys` holds the retained keys' row encodings.
+    #[must_use]
+    pub fn prune_deletes_retaining_keys(&self, cutoff: i64, keys: &[Box<[u8]>]) -> Self {
+        let hashes: HashSet<u128> = keys.iter().map(|key| hash_key_128(key)).collect();
+        Self {
+            core: self.core.prune_deletes_retaining(
+                cutoff,
+                |key_hash| hashes.contains(key_hash),
+                |key_hash| bloom_half(*key_hash),
+            ),
         }
     }
 
