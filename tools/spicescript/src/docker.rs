@@ -833,6 +833,28 @@ fn runner_label() -> HashMap<&'static str, String> {
     HashMap::from([(RUNNER_LABEL, std::process::id().to_string())])
 }
 
+/// Whether the Docker daemon runs rootless. Its `host` network is then
+/// `RootlessKit`'s namespace, not this machine's: a container there still
+/// reaches other containers' published ports at 127.0.0.1, because the daemon
+/// listens for them inside that namespace too, but nothing that listens only
+/// on this machine's loopback, such as `spiced`.
+pub async fn daemon_is_rootless() -> bool {
+    static ROOTLESS: tokio::sync::OnceCell<bool> = tokio::sync::OnceCell::const_new();
+    *ROOTLESS
+        .get_or_init(|| async {
+            let Ok(docker) = Docker::connect_with_local_defaults() else {
+                return false;
+            };
+            docker
+                .info()
+                .await
+                .ok()
+                .and_then(|info| info.security_options)
+                .is_some_and(|options| options.iter().any(|o| o == "name=rootless"))
+        })
+        .await
+}
+
 pub fn free_port() -> Result<u16> {
     const LOW: u16 = 20000;
     const HIGH: u16 = 32768;

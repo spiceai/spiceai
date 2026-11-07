@@ -1126,6 +1126,7 @@ async fn create_instances(
                             // certificates, which the image has none of.
                             "/etc/ssl/certs:/etc/ssl/certs:ro".to_string(),
                         ],
+                        rootless: crate::docker::daemon_is_rootless().await,
                     });
                 }
                 executors.push(executor);
