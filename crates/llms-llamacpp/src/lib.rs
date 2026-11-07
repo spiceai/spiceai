@@ -199,8 +199,9 @@ fn draft_len(kind: DraftKind, mtp: i32) -> i32 {
     }
 }
 
-/// How many streamed tokens may wait for a slow client before decoding pauses.
-const STREAM_BUFFER: usize = 64;
+/// How many streamed tokens may wait for a slow client before decoding pauses. Tests read it
+/// to send a reply longer than a client that stops reading can buffer.
+pub const STREAM_BUFFER: usize = 64;
 
 /// The most choices one request may ask for, as `OpenAI`'s `n` allows.
 const MAX_CHOICES: u8 = 128;
