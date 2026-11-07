@@ -142,6 +142,44 @@ async fn requests_beyond_the_cache_wait_their_turn_and_reply_as_alone() {
     assert_eq!(together, alone, "replies served together, against alone");
 }
 
+/// A request that needs the room idle sequences' caches hold gets it, even when no other request
+/// runs. On a 1024-token context, two requests with prompts of about 450 tokens run together and
+/// leave that much cached in each sequence; a third, whose prompt of about 680 tokens shares
+/// nothing with them but the chat template's opening, fits only once the cache it does not reuse
+/// is emptied. It replies as it does alone, rather
+/// than failing when the cache has no room for its prompt.
+#[tokio::test]
+async fn idle_caches_give_up_their_room_to_a_request_that_needs_it() {
+    let gguf = qwen3_gguf().await;
+    let listing = |thing: &str, n: usize| -> String {
+        let items: Vec<String> = (1..=n).map(|i| format!("{thing} {i} is ready.")).collect();
+        format!("{} Reply with only the word OK.", items.join(" "))
+    };
+    let first = [listing("Box", 60), listing("Crate", 60)];
+    let third = listing("Parcel", 90);
+    let alone = {
+        let model = load(&gguf, "qwen3-0.6b", 1, 1024).await;
+        reply(&model, body("qwen3-0.6b", &third, 8)).await
+    };
+    let model = load(&gguf, "qwen3-0.6b", 2, 1024).await;
+    let filled = futures::future::join_all(
+        first
+            .iter()
+            .map(|prompt| reply(&model, body("qwen3-0.6b", prompt, 8))),
+    )
+    .await;
+    assert!(
+        filled.iter().all(|reply| !reply.is_empty()),
+        "both earlier requests replied: {filled:?}"
+    );
+    let after = model
+        .chat_request(request(body("qwen3-0.6b", &third, 8)))
+        .await
+        .map(|reply| reply.choices[0].message.content.clone().unwrap_or_default())
+        .map_err(|e| e.to_string());
+    assert_eq!(after, Ok(alone), "the third reply, against alone");
+}
+
 /// A request that arrives while another is answering streams its first token before the other
 /// sends its last: the second request does not wait for the first one's reply to end.
 #[tokio::test]

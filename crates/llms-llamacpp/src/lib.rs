@@ -144,6 +144,10 @@ fn load_weights<'a>(
 /// Tokens decoded per forward pass while reading the prompt.
 const PROMPT_BATCH: usize = 512;
 
+/// The most requests one model decodes together. A step's batch holds each one's next token and
+/// draft, which stays well within the context's batch size (`PROMPT_BATCH`).
+const MAX_CONCURRENT: u32 = 8;
+
 /// The context size when the model sets no `context_length`.
 const DEFAULT_CONTEXT: u32 = 8192;
 
@@ -406,7 +410,10 @@ impl LlamaCpp {
         let (freed_tx, freed_rx) = std_mpsc::channel::<()>();
         let name = options.reasoning.model_name.to_string();
         let file = file_name(&first);
-        let concurrent = options.concurrent_requests.map_or(1, NonZeroU32::get);
+        let concurrent = options
+            .concurrent_requests
+            .map_or(1, NonZeroU32::get)
+            .min(MAX_CONCURRENT);
         thread::Builder::new()
             .name("llama-cpp".to_string())
             .spawn(move || {

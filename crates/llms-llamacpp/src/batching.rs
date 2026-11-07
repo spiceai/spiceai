@@ -21,10 +21,11 @@ limitations under the License.
 //! the next step.
 //!
 //! A request is admitted with room for its whole possible reply, its prompt plus `max_tokens`
-//! or the rest of the context, so a running request never runs out of cache; one that does not
-//! fit beside the running ones waits, and the requests behind it wait in order. A model that is
+//! or the rest of the context, so a running request never runs out of cache. The caches of idle
+//! sequences give up their room first, longest unused first; a request that still does not fit
+//! beside the running ones waits, and the requests behind it wait in order. A model that is
 //! otherwise idle admits any request whose prompt fits the context, as one request at a time
-//! does.
+//! does, after emptying every cache but the one it reuses.
 
 use std::collections::VecDeque;
 use std::sync::Arc;
@@ -294,7 +295,9 @@ fn run<'m, S: Shared<'m>>(
                 Err(_) => return,
             }
         }
-        loop {
+        // a few at a time, so requests arriving faster than they are taken cannot hold off the
+        // steps of the running ones
+        for _ in 0..slots.len() {
             match jobs.try_recv() {
                 Ok(job) => waiting.push_back(job),
                 Err(std_mpsc::TryRecvError::Empty) => break,
@@ -340,8 +343,10 @@ fn admit<'m, S: Shared<'m>>(
             .unwrap_or(n_ctx)
             .min(n_ctx.saturating_sub(prompt_len));
         let reserve = prompt_len + reply + shared.n_draft() + 1;
+        // With nothing running, the request is served as it would be alone, whatever room the
+        // idle caches gave up.
         let running = slots.iter().any(|slot| slot.running.is_some());
-        if running && !make_room(shared, slots, free, reserve, n_ctx) {
+        if !make_room(shared, slots, free, reserve, n_ctx) && running {
             return;
         }
         let Some(job) = waiting.pop_front() else {
