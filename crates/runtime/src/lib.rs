@@ -332,6 +332,24 @@ pub enum Error {
     #[snafu(display("Unable to create view: {reason}"))]
     UnableToCreateView { reason: String },
 
+    /// A dataset selects the `duckdb` vector engine, removed in v2.5. Only that dataset
+    /// fails to load.
+    #[snafu(display(
+        "Failed to load dataset '{}': {}",
+        dataset.escape_debug(),
+        runtime_component::vector_engine::removed_vector_engine_message()
+    ))]
+    DatasetVectorEngineRemoved { dataset: String },
+
+    /// A view selects the `duckdb` vector engine, removed in v2.5. Only that view fails
+    /// to load.
+    #[snafu(display(
+        "Failed to load view '{}': {}",
+        view_name.escape_debug(),
+        runtime_component::vector_engine::removed_vector_engine_message()
+    ))]
+    ViewVectorEngineRemoved { view_name: String },
+
     /// A dataset's acceleration sets an engine removed in v2.5. Only that dataset fails to
     /// load: Spice never switches it to Cayenne on its own.
     #[snafu(display(
@@ -788,6 +806,8 @@ pub struct Runtime {
     tool_loads: Arc<init::model::LoadTasks>,
     /// Names of the SQL functions registered for `as_sql` tools.
     tool_udfs: Arc<parking_lot::Mutex<HashSet<String>>>,
+    /// The installed app's `row_id` keys, read by `/v1/search` and `vector_search`.
+    search_primary_keys: runtime_search::search_engine::ExplicitPrimaryKeys,
     /// Startup view registrations still waiting, cancelled when a Spicepod change replaces or removes the view.
     view_loads: Arc<init::view_loads::ViewLoads>,
 

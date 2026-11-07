@@ -32,6 +32,7 @@ concurrency:
 
 jobs:
   test-attestation-signoff:
+    environment: secret-free
     name: Unit tests for the Attestation sign-off logic
     # GitHub-hosted on purpose: this is a sub-second check and must not queue
     # behind the saturated self-hosted pool.

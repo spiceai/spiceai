@@ -52,8 +52,8 @@ tracing.workspace = true
 tracing-futures.workspace = true
 util = { path = "../util", features = ["datafusion"] }
 
-mistralrs = { git = "https://github.com/spiceai/mistral.rs", rev = "e40436e44aa1fc558c0ddb2c7d4430bcc1ce8e4c", optional = true } # branch: spiceai (spiceai/mistral.rs#55: candle zip 9.1; includes #52 tool-call parser, #53, #54)
-mistralrs-core = { git = "https://github.com/spiceai/mistral.rs", rev = "e40436e44aa1fc558c0ddb2c7d4430bcc1ce8e4c", package = "mistralrs-core", optional = true } # branch: spiceai (spiceai/mistral.rs#55: candle zip 9.1; includes #52 tool-call parser, #53, #54)
+mistralrs = { git = "https://github.com/spiceai/mistral.rs", rev = "d7ddf3bb84ad753e6da385c02e9f8e16bc9a39ec", optional = true } # branch: spiceai (spiceai/mistral.rs#58: Mistral [THINK] reasoning; on #55, which includes #52, #53, #54)
+mistralrs-core = { git = "https://github.com/spiceai/mistral.rs", rev = "d7ddf3bb84ad753e6da385c02e9f8e16bc9a39ec", package = "mistralrs-core", optional = true } # branch: spiceai (spiceai/mistral.rs#58: Mistral [THINK] reasoning; on #55, which includes #52, #53, #54)
 rand.workspace = true
 
 tei_backend = { package = "text-embeddings-backend", git = "https://github.com/spiceai/text-embeddings-inference.git", optional = true, rev = "ac4e457936bc11c9b4fee453f2be33133d3146d8", features = [

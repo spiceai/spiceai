@@ -120,7 +120,7 @@ impl Provider {
     /// token CI authenticates with, when it is set.
     fn credential_secret(self) -> &'static str {
         match self {
-            Self::OpenAi | Self::OpenAiReasoning => "SPICE_OPENAI_API_KEY",
+            Self::OpenAi | Self::OpenAiReasoning => crate::utils::openai_credential_secret(),
             Self::Anthropic => crate::utils::anthropic_credential_secret(),
             Self::Xai => "SPICE_XAI_API_KEY",
         }

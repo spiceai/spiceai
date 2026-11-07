@@ -252,7 +252,7 @@ impl Secrets {
     /// end of the precedence order — i.e. consulted **last** by the
     /// `${ secrets:KEY }` walk, after every spicepod-declared store.
     ///
-    /// Does **not** survive [`Self::load_from`], which clears the registry.
+    /// Does **not** survive [`Self::load_from`], which replaces the registry.
     /// A store that must outlive a spicepod reload belongs in
     /// [`Self::register_builtin_store`].
     pub fn register_store(&mut self, name: impl Into<String>, store: Arc<dyn SecretStore>) {
@@ -261,7 +261,7 @@ impl Secrets {
 
     /// Registers a store the runtime owns: appended at the lowest precedence
     /// like [`Self::register_store`], but **re-applied after every
-    /// [`Self::load_from`]** instead of being cleared with the
+    /// [`Self::load_from`]** instead of being replaced with the
     /// spicepod-declared stores.
     ///
     /// This is how control-plane-delivered secrets participate in the default
@@ -276,15 +276,16 @@ impl Secrets {
         self.stores.insert(name, store);
     }
 
-    /// Append the built-in stores at the end of the precedence order.
+    /// Append noncolliding built-in stores at the end of `stores`.
     ///
-    /// Called at the very end of [`Self::load_from`], after the `reverse()`
-    /// that establishes spicepod precedence, so a built-in is consulted last —
-    /// a user-declared store holding the same key wins. `entry` keeps a
-    /// spicepod store of the same name authoritative over the built-in.
-    fn append_builtin_stores(&mut self) {
+    /// Called on the replacement map at the end of [`Self::load_from`], after
+    /// the `reverse()` that establishes spicepod precedence, so a built-in is
+    /// consulted last — a user-declared store holding the same key wins.
+    /// `entry` keeps a spicepod store of the same name authoritative over the
+    /// built-in.
+    fn append_builtin_stores_into(&self, stores: &mut IndexMap<String, Arc<dyn SecretStore>>) {
         for (name, store) in &self.builtin_stores {
-            self.stores
+            stores
                 .entry(name.clone())
                 .or_insert_with(|| Arc::clone(store));
         }
@@ -302,13 +303,20 @@ impl Secrets {
     /// original initialization error instead of reporting the store as
     /// undefined.
     ///
+    /// On error or cancellation before this method returns `Ok`, the previously
+    /// published store map is left intact (including any built-ins registered
+    /// through [`Self::register_builtin_store`]).
+    ///
     /// # Errors
     ///
     /// Returns an error when the `from` field references an unknown store or when a store
     /// requires (or disallows) a selector and the config is invalid.
     pub async fn load_from(&mut self, secrets: &[SpicepodSecret]) -> Result<()> {
-        self.stores.clear();
-        self.scheduler_search = None;
+        // Build the replacement registry off to the side. The live
+        // `self.stores` map (and `scheduler_search`) stay untouched until
+        // every configured provider validates, so a failed or cancelled
+        // reload cannot drop a retained built-in or leave the active map
+        // empty mid-flight.
 
         // Restore trunk's non-overwriting export of the default `.env` /
         // `.env.local` before any store initializes. AWS Secrets Manager
@@ -324,6 +332,7 @@ impl Secrets {
         // already did.
         let bootstrap_env: Arc<dyn SecretStore> = load_default_store();
 
+        let mut next_stores: IndexMap<String, Arc<dyn SecretStore>> = IndexMap::new();
         let mut any_healthy_store_loaded = false;
         for secret in secrets {
             let store_type = spicepod_secret_store_type(secret, bootstrap_env.as_ref()).await?;
@@ -350,7 +359,7 @@ impl Secrets {
                 }
             };
 
-            self.stores.insert(secret.name.clone(), secret_store);
+            next_stores.insert(secret.name.clone(), secret_store);
         }
 
         if !any_healthy_store_loaded {
@@ -361,17 +370,23 @@ impl Secrets {
             // so `${ env:KEY }` / `${ secrets:KEY }` resolve as before.
             // `or_insert_with` keeps a user-configured store named `env` (or
             // its placeholder) authoritative over the implicit default.
-            self.stores
+            next_stores
                 .entry("env".to_string())
                 .or_insert_with(load_default_store_exporting);
         }
 
         // Reverse the order of the secret stores to maintain the expected precedence order.
-        self.stores.reverse();
+        next_stores.reverse();
 
         // After the reverse, so built-ins land at the lowest precedence — a
         // user-declared store holding the same key still wins.
-        self.append_builtin_stores();
+        self.append_builtin_stores_into(&mut next_stores);
+
+        // Publish transactionally: swap the live map only after validation
+        // and built-in re-attachment succeeded. Mirror the prior success-path
+        // reset of `scheduler_search` here so a failed reload cannot clear it.
+        self.stores = next_stores;
+        self.scheduler_search = None;
 
         Ok(())
     }
@@ -1295,7 +1310,7 @@ mod tests {
         }
     }
 
-    /// A built-in store must survive `load_from`, which clears the registry.
+    /// A built-in store must survive `load_from`, which replaces the registry.
     /// This is the bug the built-in list exists to close: a delivered store
     /// registered through `register_store` was silently dropped by the next
     /// spicepod load, failing every component that referenced it.
@@ -1307,7 +1322,7 @@ mod tests {
             std::sync::Arc::new(MapStore::new(&[("delivered_key", "from-cloud")])),
         );
 
-        // A reload with no `secrets:` section clears the registry and reloads
+        // A reload with no `secrets:` section replaces the registry and reloads
         // the default `env` store.
         secrets.load_from(&[]).await.expect("reload succeeds");
 
@@ -1334,7 +1349,7 @@ mod tests {
                 .await
                 .expect("an unregistered store is not an error, just no answer")
                 .is_none(),
-            "a non-built-in store is cleared by load_from"
+            "a non-built-in store is replaced by load_from"
         );
     }
 
@@ -1398,6 +1413,101 @@ mod tests {
             .expect("present");
         assert_eq!(value.expose_secret(), "second");
     }
+
+    /// An invalid configured provider must not wipe a retained built-in: the
+    /// replacement registry is built off to the side and only published after
+    /// every `from:` validates. (F1 / `BuiltinSurvivesReload`.)
+    #[tokio::test]
+    async fn builtin_store_survives_an_invalid_secrets_reload() {
+        let mut secrets = super::Secrets::new();
+        secrets.register_builtin_store(
+            "runtime",
+            std::sync::Arc::new(MapStore::new(&[("delivered_key", "synthetic-value")])),
+        );
+
+        let invalid = spicepod::component::secret::Secret {
+            from: "does-not-exist".into(),
+            name: "bad".into(),
+            description: None,
+            params: None,
+        };
+        assert!(
+            secrets.load_from(&[invalid]).await.is_err(),
+            "unknown provider must fail the reload"
+        );
+
+        let value = secrets
+            .get_secret_from_stores("delivered_key", &only("runtime"))
+            .await
+            .expect("lookup")
+            .expect("an invalid configured store must not drop a runtime-owned store");
+        assert_eq!(value.expose_secret(), "synthetic-value");
+    }
+
+    /// A successful reload still installs the new configured stores and keeps
+    /// noncolliding built-ins attached at lowest precedence.
+    #[tokio::test]
+    async fn successful_reload_keeps_noncolliding_builtins() {
+        let mut secrets = super::Secrets::new();
+        secrets.register_builtin_store(
+            "runtime",
+            std::sync::Arc::new(MapStore::new(&[("delivered_key", "synthetic-value")])),
+        );
+
+        secrets
+            .load_from(&[env_spicepod_secret("myenv")])
+            .await
+            .expect("reload succeeds");
+
+        assert!(
+            secrets.stores.contains_key("myenv"),
+            "configured store must be published"
+        );
+        let value = secrets
+            .get_secret_from_stores("delivered_key", &only("runtime"))
+            .await
+            .expect("lookup")
+            .expect("noncolliding built-in must survive a successful reload");
+        assert_eq!(value.expose_secret(), "synthetic-value");
+    }
+
+    /// A spicepod-configured store whose name collides with a built-in keeps
+    /// user-configured precedence (`entry` does not overwrite it).
+    #[tokio::test]
+    async fn configured_store_keeps_precedence_over_same_named_builtin() {
+        let mut secrets = super::Secrets::new();
+        secrets.register_builtin_store(
+            "myenv",
+            std::sync::Arc::new(MapStore::new(&[("delivered_key", "from-builtin")])),
+        );
+
+        secrets
+            .load_from(&[env_spicepod_secret("myenv")])
+            .await
+            .expect("reload succeeds");
+
+        // The configured `env` store occupies `myenv`; the built-in MapStore
+        // was not inserted under that name, so its key is not reachable there.
+        assert!(
+            secrets
+                .get_secret_from_stores("delivered_key", &only("myenv"))
+                .await
+                .expect("lookup")
+                .is_none(),
+            "user-configured store of the same name must win over the built-in"
+        );
+        assert!(
+            secrets.stores.contains_key("myenv"),
+            "configured store remains registered under the colliding name"
+        );
+    }
+
+    // Cancellation mid-flight is safe by construction: `load_from` never
+    // mutates `self.stores` until the replacement map is fully built, so
+    // dropping the future before it returns `Ok` leaves built-ins intact.
+    // A unit test that actually polls into a `Pending` provider init would
+    // need a hangable store hook; the invalid-provider Err path above
+    // exercises the same "exit before publish" contract.
 
     /// The registry swap on the executor bind path must not wait behind an
     /// in-flight expansion. Holding the read guard over the (network-bound)

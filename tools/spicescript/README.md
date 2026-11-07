@@ -152,9 +152,9 @@ steps:
 
 | Kind | What it is |
 | --- | --- |
-| `postgres`, `mysql`, `clickhouse` | A database in Docker. Each instance gets its own database inside it. `${sources.<name>.params}` holds the connector parameters. |
+| `postgres`, `mysql`, `clickhouse` | A database in Docker. Each instance gets its own database inside it. `${sources.<name>.params}` holds the connector parameters. A run's `mysql` sources share a Docker network, where `${sources.<name>.peer_host}` and `${sources.<name>.peer_port}` reach one from another, so one can replicate from another. |
 | `kafka` | Redpanda (`v26.1.6`), with a topic prefix per instance. Tables are `<namespace>_<table>`, created with three partitions on first write. Connector params include bootstrap servers and PLAINTEXT security. |
-| `mongodb` | MongoDB (`8.0`) single-node replica set, with a database per instance. Connector params include its connection string. |
+| `mongodb` | MongoDB (`9.0`) single-node replica set, with a database per instance. Connector params include its connection string. |
 | `dynamodb` | LocalStack (`4.9`), with a table-name prefix per instance. Tables are `<namespace>_<table>`, created on first write with a numeric or string HASH key and `NEW_AND_OLD_IMAGES` streams. Connector params include endpoint, region and test credentials. |
 | `rustfs` | An S3-compatible store with conditional writes, with a bucket per instance, managed with the `aws` CLI. `${sources.<name>.params}` holds the `s3_*` parameters. `.bucket`, `.endpoint`, `.key` and `.secret` serve other uses, such as a Cayenne data tier or a state location. `.shared_bucket` is one bucket every instance shares, for two variants that act as replicas over one state location. |
 | `files` | A directory per instance (`${sources.<name>.path}`) holding generated Parquet or CSV part files. |
@@ -214,7 +214,7 @@ with each other, and each ran the writes separately.
 **Variants** are [JSON merge patches](https://www.rfc-editor.org/rfc/rfc7386).
 `spicepod:` patches the whole spicepod, and `datasets:` patches datasets by name
 (`*` for all), since a merge patch replaces a list wholesale. A variant may also
-set `env:`, and `when: { <matrix key>: <value> }` to exist only in some
+set `env:` for `spiced`, whose values take the same placeholders, and `when: { <matrix key>: <value> }` to exist only in some
 combinations. Variants run in alphabetical order, and the first is the one the
 others are compared with.
 

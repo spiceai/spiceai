@@ -109,7 +109,6 @@ better data, not coverage.
 | Concern | Where it lives instead |
 |---------|------------------------|
 | Latency / throughput vs DuckDB or chDB | `crates/cayenne/benches/vs_duckdb_*`, `vs_chdb_*` |
-| Perf matrix / `must_beat` spicepods | `tools/testoperator/dispatch/perf-cayenne-vs-duckdb/` |
 | How to run Criterion benches | `docs/dev/cayenne_vs_duckdb_benchmarks.md` |
 
 ## What runs

@@ -11,6 +11,9 @@ inputs:
   minio_secret_key:
     description: 'MinIO secret key'
     required: true
+  minio_session_token:
+    description: 'Session token of temporary MinIO credentials; the alias then comes from MC_HOST_spice-minio.'
+    required: false
   source_path:
     description: 'Path to the file to upload'
     required: true
@@ -23,6 +26,11 @@ runs:
   steps:
     - name: Install MinIO client
       shell: bash
+      env:
+        MINIO_ENDPOINT: ${{ inputs.minio_endpoint }}
+        MINIO_ACCESS_KEY: ${{ inputs.minio_access_key }}
+        MINIO_SECRET_KEY: ${{ inputs.minio_secret_key }}
+        MINIO_SESSION_TOKEN: ${{ inputs.minio_session_token }}
       run: |
         if ! command -v mc &> /dev/null; then
           sudo apt update && sudo apt install wget -y
@@ -30,7 +38,11 @@ runs:
           sudo wget https://public-data.spiceai.org/mc.linux-amd64.RELEASE.2025-08-13T08-35-41Z -O /usr/local/bin/mc
           sudo chmod +x /usr/local/bin/mc
         fi
-        mc alias set spice-minio ${{ inputs.minio_endpoint }} ${{ inputs.minio_access_key }} ${{ inputs.minio_secret_key }}
+        if [[ -n "$MINIO_SESSION_TOKEN" ]]; then
+          echo "MC_HOST_spice-minio=${MINIO_ENDPOINT%%://*}://${MINIO_ACCESS_KEY}:${MINIO_SECRET_KEY}:${MINIO_SESSION_TOKEN}@${MINIO_ENDPOINT#*://}" >> "$GITHUB_ENV"
+        else
+          mc alias set spice-minio "$MINIO_ENDPOINT" "$MINIO_ACCESS_KEY" "$MINIO_SECRET_KEY"
+        fi
 
     - name: Upload to MinIO
       shell: bash

@@ -39,7 +39,6 @@ use datafusion::logical_expr::{ColumnarValue, DocSection, Documentation, Signatu
 use datafusion::{
     catalog::{Session, TableFunctionImpl, TableProvider},
     common::Column,
-    common::TableReference,
     datasource::{DefaultTableSource, TableType},
     error::{DataFusionError, Result as DataFusionResult},
     logical_expr::{Operator, SortExpr, expr::ScalarFunction},
@@ -77,6 +76,7 @@ use runtime_request_context::{AsyncMarker, RequestContext};
 use runtime_search::{
     candidate::vector::ChunkedNonIndexVectorGeneration,
     embeddings::table::EmbeddingTable,
+    search_engine::ExplicitPrimaryKeys,
     udtf::{EmbeddingColumnConfig, table_ref_from_column_expr},
 };
 
@@ -179,12 +179,12 @@ pub struct VectorSearchTableFunc {
     // store a pointer to use for Hash/Eq since UDTF impls require this trait bound but we cannot feasibly make `DataFusion` implement them.
     df_ptr: u64,
 
-    explicit_pks: HashMap<TableReference, Vec<String>>,
+    explicit_pks: ExplicitPrimaryKeys,
 }
 
 impl PartialEq for VectorSearchTableFunc {
     fn eq(&self, other: &Self) -> bool {
-        self.df_ptr == other.df_ptr && self.explicit_pks == other.explicit_pks
+        self.df_ptr == other.df_ptr && self.explicit_pks.ptr_eq(&other.explicit_pks)
     }
 }
 
@@ -217,7 +217,7 @@ pub fn parse_limit_scalar(scalar: &ScalarValue) -> Result<u64, DataFusionError> 
 
 impl VectorSearchTableFunc {
     #[must_use]
-    pub fn new(df: Weak<DataFusion>, explicit_pks: HashMap<TableReference, Vec<String>>) -> Self {
+    pub fn new(df: Weak<DataFusion>, explicit_pks: ExplicitPrimaryKeys) -> Self {
         let ptr = df.as_ptr().addr() as u64;
         Self {
             df,
@@ -379,20 +379,6 @@ impl VectorSearchTableFunc {
             if let Some((es_indexes, _)) = find_index_in_table_provider::<ElasticsearchIndex>(tbl) {
                 vector_indexes.extend(
                     es_indexes
-                        .into_iter()
-                        .map(|c| Arc::new(c.clone()) as Arc<dyn SearchIndex>),
-                );
-            }
-        }
-
-        #[cfg(feature = "duckdb")]
-        {
-            use search::index::duckdb::DuckDBVectorIndex;
-            if let Some((duckdb_indexes, _)) =
-                find_index_in_table_provider::<DuckDBVectorIndex>(tbl)
-            {
-                vector_indexes.extend(
-                    duckdb_indexes
                         .into_iter()
                         .map(|c| Arc::new(c.clone()) as Arc<dyn SearchIndex>),
                 );
@@ -585,7 +571,6 @@ impl TableFunctionImpl for VectorSearchTableFunc {
             let pks = self
                 .explicit_pks
                 .get(&args.tbl)
-                .cloned()
                 .or_else(|| get_primary_keys(&table_provider).ok());
 
             let model_name = embedding_table_provider

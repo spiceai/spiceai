@@ -64,10 +64,9 @@ fn create_sql_worker(name: &str, sql: &str, cron: &str) -> Worker {
 
 fn get_openai_model(model: impl Into<String>, name: impl Into<String>) -> Model {
     let mut model = Model::new(format!("openai:{}", model.into()), name);
-    model.params.insert(
-        "openai_api_key".to_string(),
-        "${ secrets:SPICE_OPENAI_API_KEY }".into(),
-    );
+    model
+        .params
+        .extend(crate::utils::openai_credential_params());
     model.params.insert("tools".into(), "auto".into());
     model
 }
@@ -78,7 +77,7 @@ async fn test_worker_with_cron() -> Result<(), anyhow::Error> {
 
     test_request_context()
         .scope_retry(3, || async {
-            verify_env_secret_exists("SPICE_OPENAI_API_KEY")
+            verify_env_secret_exists(crate::utils::openai_credential_secret())
                 .await
                 .map_err(anyhow::Error::msg)?;
 
@@ -146,7 +145,7 @@ async fn test_sql_worker_with_cron() -> Result<(), anyhow::Error> {
 
     test_request_context()
         .scope_retry(3, || async {
-            verify_env_secret_exists("SPICE_OPENAI_API_KEY")
+            verify_env_secret_exists(crate::utils::openai_credential_secret())
                 .await
                 .map_err(anyhow::Error::msg)?;
 

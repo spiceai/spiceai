@@ -240,6 +240,6 @@ key ever written under a strict prefix, so each run leaves about a thousand
 records in the share's `.spiceio-locks/`, which nothing may remove. The spiceio
 leg therefore runs only for changes to this crate, its harness or the workflow,
 and when the workflow is dispatched by hand. Dependency-only changes run the
-other legs. The spiceio leg needs the `UNAS_SMB_PASS` secret and does not run
+other legs. The spiceio leg needs the `SMB_PASSWORD` secret and does not run
 without it. Both oracles are test dependencies. This qualifies the
 library path; it is not a Cayenne/runtime integration test.

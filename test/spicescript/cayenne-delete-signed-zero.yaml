@@ -1,0 +1,38 @@
+name: cayenne-delete-signed-zero
+description: >
+  A DELETE on a Cayenne acceleration without a primary key removes exactly the rows
+  its predicate is true for when one float column holds -0.0 and another 0.0: SQL
+  holds them equal, so `a <> b` is false on those rows, which a read and a DELETE
+  agree on with PostgreSQL. Vortex compares floats by their bits, so the delete
+  must not hand it that comparison.
+sources:
+  src: { kind: postgres }
+spicepod:
+  version: v1
+  kind: Spicepod
+  name: cayenne-delete-signed-zero
+  datasets:
+    - from: postgres:public.src
+      name: ev
+      params: ${sources.src.params}
+      access: read_write
+      acceleration: { enabled: true, engine: cayenne, mode: file, refresh_mode: full, write_mode: acceleration }
+defaults:
+  expect: { oracle: src }
+steps:
+  - source-exec:
+      src: |
+        CREATE TABLE src (id bigint, a double precision, b double precision);
+        INSERT INTO src SELECT g, CASE g % 3 WHEN 0 THEN '-0'::float8 WHEN 1 THEN 1 ELSE 0 END, 0 FROM generate_series(1, 200000) g;
+        CREATE TABLE model AS SELECT * FROM src;
+  - start: {}
+  - query: SELECT count(*) AS n, sum(id) AS s FROM ev
+    oracle-sql: SELECT count(*) AS n, sum(id) AS s FROM model
+  # A read compares -0.0 and 0.0 as SQL does.
+  - query: SELECT id FROM ev WHERE a <> b
+    oracle-sql: SELECT id FROM model WHERE a <> b
+  - spice-exec: DELETE FROM ev WHERE a <> b
+  - source-exec: { src: DELETE FROM model WHERE a <> b }
+  # Exactly the rows PostgreSQL keeps survive, not only as many of them.
+  - query: SELECT id FROM ev
+    oracle-sql: SELECT id FROM model

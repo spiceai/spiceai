@@ -78,7 +78,6 @@ mod cache;
 mod catalog;
 mod cayenne;
 mod cayenne_catalog_ddl;
-#[cfg(feature = "duckdb")]
 mod clickbench;
 mod clickhouse;
 mod cluster;
@@ -89,24 +88,12 @@ mod cosmosdb;
 mod databricks_delta;
 #[cfg(all(feature = "delta_lake", feature = "databricks"))]
 mod databricks_delta_catalog;
-#[cfg(all(feature = "delta_lake", feature = "databricks"))]
-mod databricks_delta_catalog_m2m;
-#[cfg(all(feature = "delta_lake", feature = "databricks"))]
-mod databricks_delta_m2m;
 #[cfg(all(feature = "spark", feature = "databricks"))]
 mod databricks_spark;
 #[cfg(all(feature = "spark", feature = "databricks"))]
 mod databricks_spark_catalog;
-#[cfg(all(feature = "spark", feature = "databricks"))]
-mod databricks_spark_catalog_m2m;
-#[cfg(all(feature = "spark", feature = "databricks"))]
-mod databricks_spark_m2m;
 #[cfg(feature = "databricks")]
 mod databricks_sql_warehouse;
-#[cfg(feature = "databricks")]
-mod databricks_sql_warehouse_m2m;
-#[cfg(feature = "databricks")]
-mod databricks_sql_warehouse_permissions;
 mod dataset_availability;
 mod datasets_api;
 #[cfg(feature = "delta_lake")]
@@ -176,6 +163,7 @@ mod results_cache;
 mod results_cache_warmup;
 #[cfg(all(unix, feature = "duckdb", feature = "postgres"))]
 mod retention;
+mod rustfs;
 mod s3;
 mod s3_folder_marker;
 mod s3_location_pruning;
