@@ -7,6 +7,7 @@ datasets:
     name: customer
     params:
       dynamodb_aws_region: ap-northeast-2
+      dynamodb_aws_auth: key
       dynamodb_aws_access_key_id: ${ env:AWS_DYNAMODB_ACCESS_KEY_ID }
       dynamodb_aws_secret_access_key: ${ env:AWS_DYNAMODB_SECRET_ACCESS_KEY }
       dynamodb_aws_session_token: ${ env:AWS_DYNAMODB_SESSION_TOKEN }
@@ -16,6 +17,7 @@ datasets:
     name: lineitem
     params:
       dynamodb_aws_region: ap-northeast-2
+      dynamodb_aws_auth: key
       dynamodb_aws_access_key_id: ${ env:AWS_DYNAMODB_ACCESS_KEY_ID }
       dynamodb_aws_secret_access_key: ${ env:AWS_DYNAMODB_SECRET_ACCESS_KEY }
       dynamodb_aws_session_token: ${ env:AWS_DYNAMODB_SESSION_TOKEN }
@@ -25,6 +27,7 @@ datasets:
     name: nation
     params:
       dynamodb_aws_region: ap-northeast-2
+      dynamodb_aws_auth: key
       dynamodb_aws_access_key_id: ${ env:AWS_DYNAMODB_ACCESS_KEY_ID }
       dynamodb_aws_secret_access_key: ${ env:AWS_DYNAMODB_SECRET_ACCESS_KEY }
       dynamodb_aws_session_token: ${ env:AWS_DYNAMODB_SESSION_TOKEN }
@@ -34,6 +37,7 @@ datasets:
     name: orders
     params:
       dynamodb_aws_region: ap-northeast-2
+      dynamodb_aws_auth: key
       dynamodb_aws_access_key_id: ${ env:AWS_DYNAMODB_ACCESS_KEY_ID }
       dynamodb_aws_secret_access_key: ${ env:AWS_DYNAMODB_SECRET_ACCESS_KEY }
       dynamodb_aws_session_token: ${ env:AWS_DYNAMODB_SESSION_TOKEN }
@@ -43,6 +47,7 @@ datasets:
     name: part
     params:
       dynamodb_aws_region: ap-northeast-2
+      dynamodb_aws_auth: key
       dynamodb_aws_access_key_id: ${ env:AWS_DYNAMODB_ACCESS_KEY_ID }
       dynamodb_aws_secret_access_key: ${ env:AWS_DYNAMODB_SECRET_ACCESS_KEY }
       dynamodb_aws_session_token: ${ env:AWS_DYNAMODB_SESSION_TOKEN }
@@ -52,6 +57,7 @@ datasets:
     name: partsupp
     params:
       dynamodb_aws_region: ap-northeast-2
+      dynamodb_aws_auth: key
       dynamodb_aws_access_key_id: ${ env:AWS_DYNAMODB_ACCESS_KEY_ID }
       dynamodb_aws_secret_access_key: ${ env:AWS_DYNAMODB_SECRET_ACCESS_KEY }
       dynamodb_aws_session_token: ${ env:AWS_DYNAMODB_SESSION_TOKEN }
@@ -61,6 +67,7 @@ datasets:
     name: region
     params:
       dynamodb_aws_region: ap-northeast-2
+      dynamodb_aws_auth: key
       dynamodb_aws_access_key_id: ${ env:AWS_DYNAMODB_ACCESS_KEY_ID }
       dynamodb_aws_secret_access_key: ${ env:AWS_DYNAMODB_SECRET_ACCESS_KEY }
       dynamodb_aws_session_token: ${ env:AWS_DYNAMODB_SESSION_TOKEN }
@@ -70,6 +77,7 @@ datasets:
     name: supplier
     params:
       dynamodb_aws_region: ap-northeast-2
+      dynamodb_aws_auth: key
       dynamodb_aws_access_key_id: ${ env:AWS_DYNAMODB_ACCESS_KEY_ID }
       dynamodb_aws_secret_access_key: ${ env:AWS_DYNAMODB_SECRET_ACCESS_KEY }
       dynamodb_aws_session_token: ${ env:AWS_DYNAMODB_SESSION_TOKEN }

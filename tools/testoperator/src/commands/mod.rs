@@ -1022,6 +1022,10 @@ mod tests {
     /// - `mssql`, `mssql[catalog]` and `odbc[athena]`: their TPC-H tables hold
     ///   different text columns than the parquet the TPC-H answer files were
     ///   computed from, so no answer file is their oracle.
+    /// - The TPC-H sources that hold `DuckDB` 1.x data — Databricks, Glue, Oracle,
+    ///   Spice Cloud, Snowflake, `DynamoDB` and `BigQuery`: `DuckDB` 1.x writes
+    ///   different free-text columns than `dbgen`, so Q2, Q10, Q13 and Q20 cannot
+    ///   match the answer files.
     ///
     /// - The six `ClickBench` arms whose acceleration holds only part of the
     ///   source, because a runner cannot hold all of it: their `refresh_sql` keeps
@@ -1038,11 +1042,26 @@ mod tests {
         "clickbench/sf1/accelerated/s3[parquet]-postgres.yaml",
         "clickbench/sf1/accelerated/s3[parquet]-sqlite[memory].yaml",
         "clickbench/sf1/accelerated/s3[parquet]-turso[file].yaml",
+        "tpch/sf1/accelerated/databricks[delta_lake]-duckdb[file].yaml",
+        "tpch/sf1/federated/adbc[bigquery].yaml",
+        "tpch/sf1/federated/databricks[catalog].yaml",
+        "tpch/sf1/federated/databricks[delta_lake].yaml",
+        "tpch/sf1/federated/databricks[sql_warehouse].yaml",
+        "tpch/sf1/federated/dynamodb.yaml",
+        "tpch/sf1/federated/glue[catalog].yaml",
         "tpch/sf1/federated/glue[csv].yaml",
+        "tpch/sf1/federated/glue[parquet].yaml",
         "tpch/sf1/federated/iceberg[hadoop].yaml",
         "tpch/sf1/federated/mssql.yaml",
         "tpch/sf1/federated/mssql[catalog].yaml",
         "tpch/sf1/federated/odbc[athena].yaml",
+        "tpch/sf1/federated/odbc[databricks].yaml",
+        "tpch/sf1/federated/oracle.yaml",
+        "tpch/sf1/federated/oracle[catalog].yaml",
+        "tpch/sf1/federated/snowflake[catalog].yaml",
+        "tpch/sf1/federated/spark[databricks].yaml",
+        "tpch/sf1/federated/spicecloud.yaml",
+        "tpch/sf1/federated/spicecloud[catalog].yaml",
     ];
 
     /// rustc `--test` names this module's tests `commands::tests::<fn>`.
@@ -1167,7 +1186,7 @@ mod tests {
                         assert_eq!(
                             bench.validate_results,
                             Some(false),
-                            "{dispatch_name} is opted out of result validation because TPC-H Q6 is known-wrong; keep `validate_results: false`"
+                            "{dispatch_name} is opted out of result validation for the reason in its dispatch file; keep `validate_results: false`"
                         );
                         checked += 1;
                     }
