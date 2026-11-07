@@ -1889,6 +1889,24 @@ async fn sums_of_a_column_plus_literals_with_distinct_or_filter_keep_their_rows(
     }
 }
 
+/// A `+` over two columns a subquery computes stays checked even where the
+/// sum cannot leave its type. `DataFusion` inlines the subquery's projection
+/// into the outer one, and a plain `a + b` whose `b` is NULL then folds to
+/// NULL without evaluating `a`, so `a`'s error would be lost.
+#[tokio::test]
+async fn an_operand_a_subquery_computes_keeps_its_error() {
+    let ctx = checked_session();
+    let overflow = "SELECT CAST(a AS BIGINT) + CAST(b AS BIGINT) \
+        FROM (SELECT CAST(big + 1 AS INT) AS a, CAST(NULL AS INT) AS b FROM t WHERE id = 1)";
+    let error = query_error(&ctx, overflow).await;
+    assert!(contains_overflow(&error), "`{overflow}`: {error}");
+
+    let narrowing = "SELECT CAST(a AS BIGINT) + CAST(b AS BIGINT) \
+        FROM (SELECT CAST(big AS SMALLINT) AS a, CAST(NULL AS SMALLINT) AS b FROM t WHERE id = 1)";
+    let error = query_error(&ctx, narrowing).await;
+    assert!(error.contains("Int16"), "`{narrowing}`: {error}");
+}
+
 /// The rewrite's `COUNT` has no `DISTINCT` or `FILTER`, so checked `SUM`
 /// declines a `SUM(x + k)` with either, whichever caller offers it.
 /// `DataFusion`'s own pass offers neither, so only a direct call reaches

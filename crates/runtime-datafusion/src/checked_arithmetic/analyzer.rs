@@ -20,12 +20,16 @@ limitations under the License.
 //! still see the original operators. The leftover local expressions cannot be
 //! folded by `SimplifyExpressions` with wrapping kernels.
 //!
-//! A `+` or `-` stays as written when its operands' values keep every result
-//! inside its type and neither operand can raise an error. The wrapping kernel
-//! cannot wrap there, so it returns what the checked one would; and
-//! `DataFusion` simplifies some plain operators by dropping an operand
-//! (`A + NULL` to `NULL`, `A * 0` to `0`), which may only drop one that has no
-//! error to raise. `CAST(smallint_column AS BIGINT) + 1` is the common case.
+//! A `+` or `-` stays as written when one operand is a non-NULL integer
+//! literal, its operands' values keep every result inside its type, and
+//! neither operand can raise an error. The wrapping kernel cannot wrap there,
+//! so it returns what the checked one would. `DataFusion` simplifies some
+//! plain operators by dropping an operand (`A + NULL` to `NULL`, `A * 0` to
+//! `0`), which must never drop one with an error to raise. A column can become
+//! any expression once `DataFusion` inlines a subquery's projection into this
+//! one, including a NULL beside a failing operand; a non-NULL literal stays
+//! one, so `A + 1` keeps `A`. `CAST(smallint_column AS BIGINT) + 1` is the
+//! common case.
 //!
 //! Only columns, literals and casts of them are looked into, at most
 //! [`MAX_CAST_DEPTH`] casts deep, so the check costs the same at every
@@ -120,9 +124,9 @@ fn rewrite_integer_arith(expr: Expr, schema: &DFSchema) -> Transformed<Expr> {
 /// unknown and the operator stays checked.
 const MAX_CAST_DEPTH: usize = 4;
 
-/// Whether `left op right` can stay the plain operator: it is a `+` or `-`,
-/// neither operand can raise an error, and it cannot leave `data_type` (see
-/// the module documentation).
+/// Whether `left op right` can stay the plain operator: it is a `+` or `-`
+/// with a non-NULL integer literal on one side, neither operand can raise an
+/// error, and it cannot leave `data_type` (see the module documentation).
 fn stays_plain(
     op: Operator,
     left: &Expr,
@@ -131,6 +135,7 @@ fn stays_plain(
     schema: &DFSchema,
 ) -> bool {
     matches!(op, Operator::Plus | Operator::Minus)
+        && (is_integer_literal(left) || is_integer_literal(right))
         && raises_no_error(left, schema, MAX_CAST_DEPTH)
         && raises_no_error(right, schema, MAX_CAST_DEPTH)
         && cannot_overflow(op, left, right, data_type, schema)
@@ -212,6 +217,11 @@ fn type_range(data_type: &DataType) -> Option<ValueRange> {
         _ => return None,
     };
     Some(ValueRange { min, max })
+}
+
+/// Whether `expr` is a non-NULL integer literal.
+fn is_integer_literal(expr: &Expr) -> bool {
+    matches!(expr, Expr::Literal(value, _) if integer_literal(value).is_some())
 }
 
 /// The value of a non-null integer literal.
