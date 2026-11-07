@@ -131,30 +131,6 @@
     {
       "run": "builtins",
       "who": "federated",
-      "key": "query: SELECT id, date_part('month', try_cast(ts AS timestamp)) AS m FROM cust ORDER BY id",
-      "kind": "error",
-      "signature": "Spice rejected the query: Tonic error: code: 'Client specified an invalid argument', message: \"Failed to execute query.\\nQuery execution failed.\\nERROR: syntax error at or near \\\"AS\\\"\\nSQLSTATE: 42601\\nFor details, refer to the PostgreSQL manual: https://www.postgresql.org/docs/17/index.html\": code:",
-      "group": "federation-postgres"
-    },
-    {
-      "run": "builtins",
-      "who": "federated",
-      "key": "query: SELECT id, extract(month FROM try_cast(ts AS timestamp)) AS m FROM cust ORDER BY id",
-      "kind": "error",
-      "signature": "Spice rejected the query: Tonic error: code: 'Client specified an invalid argument', message: \"Failed to execute query.\\nQuery execution failed.\\nERROR: syntax error at or near \\\"AS\\\"\\nSQLSTATE: 42601\\nFor details, refer to the PostgreSQL manual: https://www.postgresql.org/docs/17/index.html\": code:",
-      "group": "federation-postgres"
-    },
-    {
-      "run": "builtins",
-      "who": "federated",
-      "key": "query: SELECT id, date_trunc('month', try_cast(ts AS timestamp)) AS m FROM cust ORDER BY id",
-      "kind": "error",
-      "signature": "Spice rejected the query: Tonic error: code: 'Client specified an invalid argument', message: \"Failed to execute query.\\nQuery execution failed.\\nERROR: syntax error at or near \\\"AS\\\"\\nSQLSTATE: 42601\\nFor details, refer to the PostgreSQL manual: https://www.postgresql.org/docs/17/index.html\": code:",
-      "group": "federation-postgres"
-    },
-    {
-      "run": "builtins",
-      "who": "federated",
       "key": "query: SELECT median(qty) AS m FROM cust",
       "kind": "error",
       "signature": "Spice rejected the query: Tonic error: code: 'Client specified an invalid argument', message: \"Failed to execute query.\\nQuery execution failed.\\nERROR: function median(integer) does not exist\\nHINT: No function matches the given name and argument types. You might need to add explicit type casts.\\nS",
