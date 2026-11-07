@@ -17,7 +17,8 @@ limitations under the License.
 use std::sync::Arc;
 
 use arrow::array::{
-    ArrayRef, Decimal128Array, Int32Array, Int64Array, RecordBatch, StringArray, UInt64Array,
+    ArrayRef, Decimal128Array, Float64Array, Int32Array, Int64Array, RecordBatch, StringArray,
+    UInt64Array,
 };
 use arrow::datatypes::{DataType, Field, Schema};
 use arrow::util::display::array_value_to_string;
@@ -33,9 +34,9 @@ use datafusion::prelude::SessionContext;
 use crate::analyzer_rule::AnalyzerRulesBuilder;
 use crate::checked_arithmetic::op::checked_op_udf;
 use crate::checked_arithmetic::{
-    CHECKED_ADD_UDF_NAME, CHECKED_MUL_UDF_NAME, CHECKED_SUB_UDF_NAME, CheckedIntegerOverflow,
-    install_checked_eager_aggregation, install_checked_single_distinct, plain_arithmetic,
-    register_checked_arithmetic,
+    CHECKED_ADD_UDF_NAME, CHECKED_MUL_UDF_NAME, CHECKED_SUB_UDF_NAME,
+    CHECKED_SUM_PLUS_COUNT_UDF_NAME, CheckedIntegerOverflow, install_checked_eager_aggregation,
+    install_checked_single_distinct, plain_arithmetic, register_checked_arithmetic,
 };
 use crate::session_config::get_df_default_config;
 
@@ -1692,5 +1693,158 @@ async fn plain_arithmetic_restores_the_operators_of_an_update_and_a_delete() {
             vanilla.display_indent().to_string(),
             "`{sql}`"
         );
+    }
+}
+
+/// The number of aggregate expressions in each `Aggregate` of `plan`.
+fn aggregate_widths(plan: &datafusion::logical_expr::LogicalPlan) -> Vec<usize> {
+    use datafusion::common::tree_node::{TreeNode, TreeNodeRecursion};
+    use datafusion::logical_expr::LogicalPlan;
+
+    let mut widths = Vec::new();
+    plan.apply(|node| {
+        if let LogicalPlan::Aggregate(aggregate) = node {
+            widths.push(aggregate.aggr_expr.len());
+        }
+        Ok(TreeNodeRecursion::Continue)
+    })
+    .expect("walk plan");
+    widths
+}
+
+/// The checked session runs `sql` as `DataFusion` alone does: the same number
+/// of aggregates, and the same answer.
+async fn assert_aggregates_and_rows_match_vanilla(
+    checked: &SessionContext,
+    vanilla: &SessionContext,
+    sql: &str,
+    expected_rows: &[&str],
+) -> String {
+    let vanilla_plan = optimized_plan(vanilla, sql).await;
+    let checked_plan = optimized_plan(checked, sql).await;
+    assert_eq!(
+        aggregate_widths(&checked_plan),
+        aggregate_widths(&vanilla_plan),
+        "`{sql}` aggregates as many expressions as DataFusion's own plan:\nchecked:\n{}\nvanilla:\n{}",
+        checked_plan.display_indent(),
+        vanilla_plan.display_indent()
+    );
+    for ctx in [checked, vanilla] {
+        let batches = ctx
+            .sql(sql)
+            .await
+            .unwrap_or_else(|error| panic!("`{sql}` plans: {error}"))
+            .collect()
+            .await
+            .unwrap_or_else(|error| panic!("`{sql}` runs: {error}"));
+        assert_eq!(render_rows(&batches), expected_rows, "`{sql}`");
+    }
+    checked_plan.display_indent().to_string()
+}
+
+/// `SUM(x + 1), SUM(x + 2), ...` over a column whose `x + k` cannot overflow
+/// is one `SUM(x)` and one `COUNT(x)`, as `DataFusion` plans it (`ClickBench`
+/// Q29 sums 90 of them), not one checked `SUM` per literal. NULL rows count
+/// in neither, and a group with only NULLs sums to NULL.
+#[tokio::test]
+async fn sums_of_a_column_plus_literals_share_one_sum_and_one_count() {
+    let checked = checked_session();
+    let vanilla = vanilla_session();
+    let nullable = RecordBatch::try_new(
+        Arc::new(Schema::new(vec![
+            Field::new("g", DataType::Int64, false),
+            Field::new("i", DataType::Int32, true),
+        ])),
+        vec![
+            Arc::new(Int64Array::from(vec![1, 1, 1, 2])) as ArrayRef,
+            Arc::new(Int32Array::from(vec![Some(i32::MAX), None, Some(3), None])),
+        ],
+    )
+    .expect("nullable batch");
+    for ctx in [&checked, &vanilla] {
+        register_table(ctx, "n", nullable.clone());
+    }
+
+    for (sql, expected) in [
+        (
+            "SELECT SUM(i + 1), SUM(i + 2), SUM(i + 3) FROM t",
+            vec!["4294967300 4294967304 4294967308"],
+        ),
+        (
+            "SELECT g, SUM(i + 1), SUM(1 + i), SUM(i + 10) FROM n GROUP BY g ORDER BY g",
+            vec!["1 2147483652 2147483652 2147483670", "2 NULL NULL NULL"],
+        ),
+    ] {
+        let plan =
+            assert_aggregates_and_rows_match_vanilla(&checked, &vanilla, sql, &expected).await;
+        assert_plan_ran(&plan, sql, &[CHECKED_SUM_PLUS_COUNT_UDF_NAME, "count("]);
+        assert!(
+            !plan.contains(CHECKED_ADD_UDF_NAME),
+            "`{sql}` adds nothing per row that can overflow:\n{plan}"
+        );
+    }
+}
+
+/// The rewrite keeps checked `SUM`'s answer to a total that is not an `Int64`.
+#[tokio::test]
+async fn sums_of_a_column_plus_literals_error_when_the_total_overflows() {
+    let sql = "SELECT SUM(i + 4611686018427387904), SUM(i + 4611686018427387905) FROM t";
+    let ctx = checked_session();
+    let plan = optimized_plan(&ctx, sql).await.display_indent().to_string();
+    assert_plan_ran(&plan, sql, &[CHECKED_SUM_PLUS_COUNT_UDF_NAME]);
+    let error = query_error(&ctx, sql).await;
+    assert!(
+        error.contains("Overflow in SUM of BIGINT: the total is not representable as an Int64"),
+        "`{sql}`: {error}"
+    );
+}
+
+/// A `SUM` of anything but an integer keeps `DataFusion`'s own rewrite.
+#[tokio::test]
+async fn sums_of_a_float_column_plus_literals_keep_the_builtin_rewrite() {
+    let checked = checked_session();
+    let vanilla = vanilla_session();
+    let floats = RecordBatch::try_new(
+        Arc::new(Schema::new(vec![Field::new("x", DataType::Float64, true)])),
+        vec![Arc::new(Float64Array::from(vec![Some(1.0), Some(2.0), None])) as ArrayRef],
+    )
+    .expect("float batch");
+    for ctx in [&checked, &vanilla] {
+        register_table(ctx, "f", floats.clone());
+    }
+    let sql = "SELECT SUM(x + 0.5), SUM(x + 1.5), SUM(x + 2.5) FROM f";
+    let plan =
+        assert_aggregates_and_rows_match_vanilla(&checked, &vanilla, sql, &["4.0 6.0 8.0"]).await;
+    assert_plan_ran(&plan, sql, &["count("]);
+}
+
+/// An integer operator gets the checked kernel only where its operands'
+/// values can take the result out of its type, counting the range a plain
+/// operator below it already widened.
+#[tokio::test]
+async fn only_an_operator_that_can_overflow_gets_the_checked_kernel() {
+    let ctx = checked_session();
+    for (sql, checked_kernels) in [
+        // INT widened to BIGINT, plus a literal, cannot leave BIGINT.
+        ("SELECT i + 1, i - 1, i * 2 FROM t", 0),
+        // INT times INT fits in BIGINT; twice that can reach 2^63.
+        ("SELECT CAST(i AS BIGINT) * CAST(i AS BIGINT) * 2 FROM t", 1),
+        // A BIGINT column has no room for a literal.
+        ("SELECT big + 1 FROM t", 1),
+        // Neither has INT plus INT.
+        ("SELECT i + CAST(1 AS INT) FROM t", 1),
+        // A literal past the room the column leaves.
+        ("SELECT i + 9223372036854775807 FROM t", 1),
+    ] {
+        let plan = optimized_plan(&ctx, sql).await.display_indent().to_string();
+        let found: usize = [
+            CHECKED_ADD_UDF_NAME,
+            CHECKED_SUB_UDF_NAME,
+            CHECKED_MUL_UDF_NAME,
+        ]
+        .iter()
+        .map(|name| plan.matches(name).count())
+        .sum();
+        assert_eq!(found, checked_kernels, "`{sql}`:\n{plan}");
     }
 }

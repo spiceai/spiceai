@@ -19,15 +19,23 @@ limitations under the License.
 //! Federation has already claimed remote subplans by this point, so remotes
 //! still see the original operators. The leftover local expressions cannot be
 //! folded by `SimplifyExpressions` with wrapping kernels.
+//!
+//! An operator whose operands' values keep every result inside its type stays
+//! as written: the wrapping kernel cannot wrap there, so it returns what the
+//! checked one would. `CAST(smallint_column AS BIGINT) + 1` is the common case.
+//! Left a plain `+`, it is still the `SUM(x + 1), SUM(x + 2), ...` shape that
+//! `DataFusion` rewrites to one `SUM(x)` and one `COUNT(x)` (see
+//! [`CheckedSum`](super::CheckedSum)).
 
 use std::sync::Arc;
 
+use arrow::datatypes::DataType;
 use datafusion::common::tree_node::{Transformed, TreeNode};
-use datafusion::common::{DFSchema, Result};
+use datafusion::common::{DFSchema, Result, ScalarValue};
 use datafusion::config::ConfigOptions;
-use datafusion::logical_expr::expr::BinaryExpr;
+use datafusion::logical_expr::expr::{BinaryExpr, Cast, TryCast};
 use datafusion::logical_expr::expr_rewriter::NamePreserver;
-use datafusion::logical_expr::{Expr, ExprSchemable, LogicalPlan};
+use datafusion::logical_expr::{Expr, ExprSchemable, LogicalPlan, Operator};
 use datafusion::optimizer::AnalyzerRule;
 
 use super::is_integer_arith_type;
@@ -89,8 +97,158 @@ fn rewrite_integer_arith(expr: Expr, schema: &DFSchema) -> Transformed<Expr> {
     let (Ok(left_type), Ok(right_type)) = (left.get_type(schema), right.get_type(schema)) else {
         return Transformed::no(Expr::BinaryExpr(BinaryExpr { left, op, right }));
     };
-    if left_type != right_type || !is_integer_arith_type(&left_type) {
+    if left_type != right_type
+        || !is_integer_arith_type(&left_type)
+        || cannot_overflow(op, &left, &right, &left_type, schema)
+    {
         return Transformed::no(Expr::BinaryExpr(BinaryExpr { left, op, right }));
     }
     Transformed::yes(udf.call(vec![*left, *right]))
+}
+
+/// Whether `left op right` stays inside `data_type` for every value its
+/// operands can take, so the wrapping operator returns what the checked kernel
+/// would.
+fn cannot_overflow(
+    op: Operator,
+    left: &Expr,
+    right: &Expr,
+    data_type: &DataType,
+    schema: &DFSchema,
+) -> bool {
+    let (Some(left), Some(right), Some(bounds)) = (
+        value_range(left, schema),
+        value_range(right, schema),
+        type_range(data_type),
+    ) else {
+        return false;
+    };
+    op_range(op, left, right).is_some_and(|range| bounds.contains(range))
+}
+
+/// The closed range of values an integer expression can take.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct ValueRange {
+    min: i128,
+    max: i128,
+}
+
+impl ValueRange {
+    fn point(value: i128) -> Self {
+        Self {
+            min: value,
+            max: value,
+        }
+    }
+
+    fn contains(self, other: Self) -> bool {
+        self.min <= other.min && other.max <= self.max
+    }
+}
+
+/// Every value of an integer `data_type`; `None` for any other type.
+fn type_range(data_type: &DataType) -> Option<ValueRange> {
+    let (min, max) = match data_type {
+        DataType::Int8 => (i128::from(i8::MIN), i128::from(i8::MAX)),
+        DataType::Int16 => (i128::from(i16::MIN), i128::from(i16::MAX)),
+        DataType::Int32 => (i128::from(i32::MIN), i128::from(i32::MAX)),
+        DataType::Int64 => (i128::from(i64::MIN), i128::from(i64::MAX)),
+        DataType::UInt8 => (0, i128::from(u8::MAX)),
+        DataType::UInt16 => (0, i128::from(u16::MAX)),
+        DataType::UInt32 => (0, i128::from(u32::MAX)),
+        DataType::UInt64 => (0, i128::from(u64::MAX)),
+        _ => return None,
+    };
+    Some(ValueRange { min, max })
+}
+
+/// The value of a non-null integer literal.
+fn integer_literal(value: &ScalarValue) -> Option<i128> {
+    match value {
+        ScalarValue::Int8(value) => value.map(i128::from),
+        ScalarValue::Int16(value) => value.map(i128::from),
+        ScalarValue::Int32(value) => value.map(i128::from),
+        ScalarValue::Int64(value) => value.map(i128::from),
+        ScalarValue::UInt8(value) => value.map(i128::from),
+        ScalarValue::UInt16(value) => value.map(i128::from),
+        ScalarValue::UInt32(value) => value.map(i128::from),
+        ScalarValue::UInt64(value) => value.map(i128::from),
+        _ => None,
+    }
+}
+
+/// The values `expr` can take when it is an integer: its type's range,
+/// narrowed through literals, widening casts, and the operators this rule
+/// leaves in place. `None` when `expr` is not an integer or cannot be typed
+/// against `schema`.
+///
+/// Every answer holds for any value the expression can produce, because an
+/// expression this does not look into answers with the whole range of its
+/// type.
+fn value_range(expr: &Expr, schema: &DFSchema) -> Option<ValueRange> {
+    match expr {
+        Expr::Alias(alias) => value_range(&alias.expr, schema),
+        Expr::Literal(value, _) => integer_literal(value).map(ValueRange::point),
+        // A cast that returns a value returns one of its target type (CAST
+        // errors and TRY_CAST yields NULL on a value that does not fit). Only
+        // a cast every operand value fits keeps the operand's narrower range.
+        Expr::Cast(Cast {
+            expr: operand,
+            field,
+        })
+        | Expr::TryCast(TryCast {
+            expr: operand,
+            field,
+        }) => {
+            let bounds = type_range(field.data_type())?;
+            Some(
+                value_range(operand, schema)
+                    .filter(|range| bounds.contains(*range))
+                    .unwrap_or(bounds),
+            )
+        }
+        // An operator left in place either cannot leave its type or is not
+        // one this rule checks; either way its result is a value of its type.
+        Expr::BinaryExpr(BinaryExpr { left, op, right }) => {
+            let bounds = type_range(&expr.get_type(schema).ok()?)?;
+            let range = value_range(left, schema)
+                .zip(value_range(right, schema))
+                .and_then(|(left, right)| op_range(*op, left, right));
+            Some(
+                range
+                    .filter(|range| bounds.contains(*range))
+                    .unwrap_or(bounds),
+            )
+        }
+        _ => type_range(&expr.get_type(schema).ok()?),
+    }
+}
+
+/// The range of `left op right` over every pair of operand values; `None` when
+/// `op` is not `+` / `-` / `*` or a bound does not fit in `i128`.
+fn op_range(op: Operator, left: ValueRange, right: ValueRange) -> Option<ValueRange> {
+    match op {
+        Operator::Plus => Some(ValueRange {
+            min: left.min.checked_add(right.min)?,
+            max: left.max.checked_add(right.max)?,
+        }),
+        Operator::Minus => Some(ValueRange {
+            min: left.min.checked_sub(right.max)?,
+            max: left.max.checked_sub(right.min)?,
+        }),
+        Operator::Multiply => {
+            // A product of two intervals takes its extremes at their corners.
+            let corners = [
+                left.min.checked_mul(right.min)?,
+                left.min.checked_mul(right.max)?,
+                left.max.checked_mul(right.min)?,
+                left.max.checked_mul(right.max)?,
+            ];
+            Some(ValueRange {
+                min: corners.into_iter().min()?,
+                max: corners.into_iter().max()?,
+            })
+        }
+        _ => None,
+    }
 }

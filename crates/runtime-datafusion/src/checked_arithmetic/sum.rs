@@ -48,15 +48,17 @@ use arrow::datatypes::{
 };
 use datafusion::common::{Result, ScalarValue, exec_err, internal_err, not_impl_err};
 use datafusion::functions_aggregate::sum::sum_udaf;
+use datafusion::logical_expr::expr::AggregateFunction;
 use datafusion::logical_expr::function::{AccumulatorArgs, StateFieldsArgs};
 use datafusion::logical_expr::utils::{AggregateOrderSensitivity, format_state_name};
 use datafusion::logical_expr::{
-    Accumulator, AggregateUDF, AggregateUDFImpl, Documentation, EmitTo, GroupsAccumulator,
-    ReversedUDAF, SetMonotonicity, Signature, StatisticsArgs,
+    Accumulator, AggregateUDF, AggregateUDFImpl, Documentation, EmitTo, Expr, GroupsAccumulator,
+    Operator, ReversedUDAF, SetMonotonicity, Signature, StatisticsArgs,
 };
 use datafusion::physical_expr::NullState;
 
 use super::is_checked_sum_return_type;
+use super::sum_plus_literal::sum_plus_literal;
 
 /// Wide enough for any pair of `i64`/`u64` totals that can still cancel to a
 /// representable `SUM` result. `DECIMAL128_MAX_PRECISION` is 38.
@@ -206,6 +208,40 @@ impl AggregateUDFImpl for CheckedSum {
         self.inner.value_from_stats(statistics_args)
     }
 
+    /// `DataFusion` offers `SUM(arg + literal)` here when several `SUM`s share
+    /// `arg`, to rewrite to `SUM(arg) + literal * COUNT(arg)`. The built-in's
+    /// rewrite adds and multiplies with wrapping kernels, so an integer `arg`
+    /// gets the exact one in `sum_plus_literal` (signed) or none (unsigned,
+    /// left as written); any other type keeps the built-in's.
+    fn simplify_expr_op_literal(
+        &self,
+        agg_function: &AggregateFunction,
+        arg: &Expr,
+        op: Operator,
+        lit: &Expr,
+        arg_is_left: bool,
+    ) -> Result<Option<Expr>> {
+        let Expr::Literal(value, _) = lit else {
+            return Ok(None);
+        };
+        let data_type = value.data_type();
+        if data_type.is_signed_integer() {
+            let k = match value {
+                ScalarValue::Int8(k) => k.map(i64::from),
+                ScalarValue::Int16(k) => k.map(i64::from),
+                ScalarValue::Int32(k) => k.map(i64::from),
+                ScalarValue::Int64(k) => *k,
+                _ => None,
+            };
+            return Ok(k.and_then(|k| sum_plus_literal(agg_function, arg, op, k)));
+        }
+        if data_type.is_unsigned_integer() {
+            return Ok(None);
+        }
+        self.inner
+            .simplify_expr_op_literal(agg_function, arg, op, lit, arg_is_left)
+    }
+
     fn coerce_types(&self, arg_types: &[DataType]) -> Result<Vec<DataType>> {
         self.inner.coerce_types(arg_types)
     }
@@ -223,7 +259,7 @@ impl AggregateUDFImpl for CheckedSum {
     }
 }
 
-fn int64_overflow() -> datafusion::error::DataFusionError {
+pub(super) fn int64_overflow() -> datafusion::error::DataFusionError {
     datafusion::error::DataFusionError::Execution(
         "Overflow in SUM of BIGINT: the total is not representable as an Int64".to_string(),
     )
@@ -235,7 +271,7 @@ fn uint64_overflow() -> datafusion::error::DataFusionError {
     )
 }
 
-fn checked_sum_state_type() -> DataType {
+pub(super) fn checked_sum_state_type() -> DataType {
     DataType::Decimal128(CHECKED_SUM_STATE_PRECISION, CHECKED_SUM_STATE_SCALE)
 }
 
