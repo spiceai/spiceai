@@ -48,7 +48,7 @@ use arrow::datatypes::{
 };
 use datafusion::common::{Result, ScalarValue, exec_err, internal_err, not_impl_err};
 use datafusion::functions_aggregate::sum::sum_udaf;
-use datafusion::logical_expr::expr::AggregateFunction;
+use datafusion::logical_expr::expr::{AggregateFunction, AggregateFunctionParams};
 use datafusion::logical_expr::function::{AccumulatorArgs, StateFieldsArgs};
 use datafusion::logical_expr::utils::{AggregateOrderSensitivity, format_state_name};
 use datafusion::logical_expr::{
@@ -224,6 +224,21 @@ impl AggregateUDFImpl for CheckedSum {
         lit: &Expr,
         _arg_is_left: bool,
     ) -> Result<Option<Expr>> {
+        // The rewrite's `COUNT` counts every non-NULL `arg`, which is the set
+        // of rows a plain `SUM` adds and not the set a `DISTINCT` or `FILTER`
+        // one adds. `DataFusion` offers only plain aggregates here
+        // (`candidate_linear_param`); declining the rest keeps the answer
+        // exact if it ever offers more.
+        let AggregateFunctionParams {
+            args: _,
+            distinct,
+            filter,
+            order_by,
+            null_treatment,
+        } = &agg_function.params;
+        if *distinct || filter.is_some() || !order_by.is_empty() || null_treatment.is_some() {
+            return Ok(None);
+        }
         // `+` only, as the built-in, so the operand order does not matter.
         if op != Operator::Plus {
             return Ok(None);

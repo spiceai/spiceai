@@ -35,8 +35,9 @@ use crate::analyzer_rule::AnalyzerRulesBuilder;
 use crate::checked_arithmetic::op::checked_op_udf;
 use crate::checked_arithmetic::{
     CHECKED_ADD_UDF_NAME, CHECKED_MUL_UDF_NAME, CHECKED_SUB_UDF_NAME,
-    CHECKED_SUM_PLUS_COUNT_UDF_NAME, CheckedIntegerOverflow, install_checked_eager_aggregation,
-    install_checked_single_distinct, plain_arithmetic, register_checked_arithmetic,
+    CHECKED_SUM_PLUS_COUNT_UDF_NAME, CHECKED_SUM_WIDEN_UDF_NAME, CheckedIntegerOverflow,
+    checked_sum_udaf, install_checked_eager_aggregation, install_checked_single_distinct,
+    plain_arithmetic, register_checked_arithmetic,
 };
 use crate::session_config::get_df_default_config;
 
@@ -1820,6 +1821,113 @@ async fn sums_over_two_casts_of_one_column_plus_literals_plan() {
         .await
         .unwrap_or_else(|error| panic!("`{sql}` runs: {error}"));
     assert_eq!(render_rows(&batches), vec!["5 7 9 11"], "`{sql}`");
+}
+
+/// `DISTINCT` and `FILTER` change which rows a `SUM` adds, so a `SUM(x + k)`
+/// with either keeps a `SUM` of its own, while plain sums of the same column
+/// beside it still share one wide `SUM` and `COUNT`. The rows match plain
+/// `DataFusion`'s and the sums worked by hand.
+#[tokio::test]
+async fn sums_of_a_column_plus_literals_with_distinct_or_filter_keep_their_rows() {
+    let checked = checked_session();
+    let vanilla = vanilla_session();
+    let repeated = RecordBatch::try_new(
+        Arc::new(Schema::new(vec![Field::new("i", DataType::Int32, true)])),
+        vec![Arc::new(Int32Array::from(vec![
+            Some(1),
+            Some(1),
+            Some(2),
+            None,
+            Some(5),
+        ])) as ArrayRef],
+    )
+    .expect("repeated batch");
+    for ctx in [&checked, &vanilla] {
+        register_table(ctx, "r", repeated.clone());
+    }
+
+    // (query, whether it plans the shared `SUM` and `COUNT`, its row)
+    for (sql, shared, expected) in [
+        // DISTINCT i + 1 adds 2, 3 and 6; DISTINCT i + 2 adds 3, 4 and 7.
+        (
+            "SELECT SUM(DISTINCT i + 1), SUM(DISTINCT i + 2) FROM r",
+            false,
+            "11 14",
+        ),
+        // The filter keeps i = 2 and i = 5.
+        (
+            "SELECT SUM(i + 1) FILTER (WHERE i > 1), SUM(i + 2) FILTER (WHERE i > 1) FROM r",
+            false,
+            "9 11",
+        ),
+        // i + 2 over 1, 1, 2, 5 adds 17; i + 3 adds 21.
+        (
+            "SELECT SUM(i + 1) FILTER (WHERE i > 1), SUM(i + 2), SUM(i + 3) FROM r",
+            true,
+            "9 17 21",
+        ),
+    ] {
+        let plan = optimized_plan(&checked, sql)
+            .await
+            .display_indent()
+            .to_string();
+        assert_eq!(
+            plan.contains(CHECKED_SUM_PLUS_COUNT_UDF_NAME),
+            shared,
+            "`{sql}` plans the shared SUM and COUNT: {shared}\n{plan}"
+        );
+        for ctx in [&checked, &vanilla] {
+            let batches = ctx
+                .sql(sql)
+                .await
+                .unwrap_or_else(|error| panic!("`{sql}` plans: {error}"))
+                .collect()
+                .await
+                .unwrap_or_else(|error| panic!("`{sql}` runs: {error}"));
+            assert_eq!(render_rows(&batches), vec![expected], "`{sql}`");
+        }
+    }
+}
+
+/// The rewrite's `COUNT` has no `DISTINCT` or `FILTER`, so checked `SUM`
+/// declines a `SUM(x + k)` with either, whichever caller offers it.
+/// `DataFusion`'s own pass offers neither, so only a direct call reaches
+/// this.
+#[test]
+fn checked_sum_declines_a_distinct_or_filtered_sum_plus_literal() {
+    use datafusion::logical_expr::Expr;
+    use datafusion::logical_expr::expr::AggregateFunction;
+    use datafusion::prelude::{col, lit};
+
+    let sum = checked_sum_udaf();
+    let arg = col("i");
+    let offer = |distinct: bool, filter: Option<Box<Expr>>| {
+        let aggregate = AggregateFunction::new_udf(
+            Arc::clone(&sum),
+            vec![arg.clone() + lit(1_i64)],
+            distinct,
+            filter,
+            vec![],
+            None,
+        );
+        sum.simplify_expr_op_literal(&aggregate, &arg, Operator::Plus, &lit(1_i64), true)
+            .expect("simplify_expr_op_literal")
+    };
+
+    let plain = offer(false, None)
+        .expect("a plain SUM(i + 1) is rewritten")
+        .to_string();
+    assert!(
+        plain.contains(CHECKED_SUM_PLUS_COUNT_UDF_NAME)
+            && plain.contains(CHECKED_SUM_WIDEN_UDF_NAME),
+        "a plain SUM(i + 1) becomes the shared SUM and COUNT: {plain}"
+    );
+    assert_eq!(offer(true, None), None, "SUM(DISTINCT i + 1)");
+    assert_eq!(
+        offer(false, Some(Box::new(col("i").gt(lit(1_i64))))),
+        None,
+        "SUM(i + 1) FILTER (WHERE i > 1)"
+    );
 }
 
 /// The rewrite keeps checked `SUM`'s answer to a total that is not an `Int64`.
