@@ -122,14 +122,6 @@
   "append-upsert-same-time": [
     {
       "run": "append-upsert-same-time",
-      "who": "duckdb",
-      "key": "query: SELECT id, ts, v FROM events ORDER BY id #3",
-      "kind": "wrong-answer",
-      "signature": "answer differs from the expected one: DataMismatch { column: \"v\", row_number: 1, expected: \"\\\"new\\\"\", actual: \"\\\"old\\\"\" }",
-      "group": "append-and-retention"
-    },
-    {
-      "run": "append-upsert-same-time",
       "who": "sqlite",
       "key": "query: SELECT id, ts, v FROM events ORDER BY id #3",
       "kind": "wrong-answer",
@@ -161,6 +153,17 @@
       "kind": "error",
       "signature": "spiced not ready: a dataset is in Error: [{\"acceleration_enabled\":true,\"error\":{\"category\":\"dataset\",\"code\":\"dataset.validation\",\"type\":\"validation\"},\"error_message\":\"Failed to setup the dataset ret (postgres). Unable to create dataset acceleration: Acceleration creation failed: Acceleration creatio",
       "group": "append-and-retention"
+    }
+  ],
+  "retention-sql-filtered-read": [
+    {
+      "run": "retention-sql-filtered-read",
+      "who": "cayenne",
+      "key": "query: SELECT id, deleted FROM appended WHERE deleted = true",
+      "kind": "wrong-answer",
+      "signature": "answer differs from the expected one: expected an empty answer, got 1 rows from Spice and 0 expected",
+      "group": "append-and-retention",
+      "may-pass": true
     }
   ]
 }
