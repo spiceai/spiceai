@@ -4,13 +4,13 @@ expression: resp?
 ---
 [
   {
-    "id": 796,
-    "question": "Two lines intersect, and angle 2 measures \\(40^\\circ\\). What is the measure of angle 3?",
+    "id": 404,
+    "question": "Given that \\( \\angle BAC = 110^\\circ \\), find \\( x \\) if \\( x \\) is the measure of \\( \\angle BAC \\).",
     "trunc(text_search(qs, Utf8(\"angles\"), question)._score,Int64(3))": 5.071
   },
   {
-    "id": 404,
-    "question": "Given that \\( \\angle BAC = 110^\\circ \\), find \\( x \\) if \\( x \\) is the measure of \\( \\angle BAC \\).",
+    "id": 796,
+    "question": "Two lines intersect, and angle 2 measures \\(40^\\circ\\). What is the measure of angle 3?",
     "trunc(text_search(qs, Utf8(\"angles\"), question)._score,Int64(3))": 5.071
   },
   {
