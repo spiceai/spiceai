@@ -23,7 +23,6 @@ limitations under the License.
 use std::{path::PathBuf, process::ExitCode};
 
 use anyhow::{Context, Result, bail};
-use clap::Parser;
 
 mod cleanup;
 mod compare;
@@ -45,13 +44,13 @@ mod template;
 mod tlp;
 mod tpch;
 
-#[derive(Parser)]
-#[command(about = "Run scenario scripts against spiced")]
+/// The command-line arguments of a run (`testoperator script`).
+#[derive(clap::Args)]
 #[expect(
     clippy::struct_excessive_bools,
     reason = "independent command-line switches"
 )]
-struct Cli {
+pub struct Args {
     /// Script files, or directories of `*.yaml` scripts.
     #[arg(required = true)]
     scripts: Vec<PathBuf>,
@@ -175,9 +174,12 @@ struct Cli {
     cell_width: usize,
 }
 
-#[tokio::main]
-async fn main() -> ExitCode {
-    match run(Cli::parse()).await {
+/// The process exit code for a run's outcome: 0 when every check passed (or
+/// the run only recorded failures), 1 when a check failed, and 2, after
+/// printing the error, when the run could not finish.
+#[must_use]
+pub fn exit_code(outcome: &Result<bool>) -> ExitCode {
+    match outcome {
         Ok(true) => ExitCode::SUCCESS,
         Ok(false) => ExitCode::FAILURE,
         Err(e) => {
@@ -187,7 +189,15 @@ async fn main() -> ExitCode {
     }
 }
 
-async fn run(cli: Cli) -> Result<bool> {
+/// Runs the scripts `cli` names and reports every check. Returns whether the
+/// run passed: no check failed outside the expected-failure ledgers, or the
+/// run was recording them.
+///
+/// # Errors
+///
+/// When a script or its corpus fails to parse, a `spiced` binary or a source
+/// can't be set up, or a ledger or recording can't be read or written.
+pub async fn run(cli: Args) -> Result<bool> {
     // Retried comparisons would print every intermediate mismatch; the runner
     // reports the last one with both answers.
     result_compare::set_print_diagnostics(false);

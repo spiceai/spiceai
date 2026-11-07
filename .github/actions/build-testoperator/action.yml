@@ -148,7 +148,7 @@ runs:
       if: inputs.force_rebuild == 'true' || (steps.minio-download.outputs.found != 'true' && steps.cache-testoperator.outputs.cache-hit != 'true')
       shell: bash
       run: |
-        cargo build -p testoperator --release --features models
+        cargo build -p testoperator --release
       env:
         AWS_ACCESS_KEY_ID: ${{ inputs.minio_access_key }}
         AWS_SECRET_ACCESS_KEY: ${{ inputs.minio_secret_key }}
