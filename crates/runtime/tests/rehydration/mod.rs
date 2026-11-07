@@ -49,9 +49,6 @@ use spicepod::{
 use tracing::instrument;
 use util::{RetryError, fibonacci_backoff::FibonacciBackoffBuilder, retry};
 
-#[cfg(feature = "duckdb")]
-mod duckdb;
-
 #[cfg(feature = "sqlite")]
 mod sqlite;
 
@@ -67,8 +64,7 @@ async fn spill_to_disk_and_rehydration() -> Result<(), anyhow::Error> {
         let running_container = Arc::new(running_container);
 
         let config = vec![
-            #[cfg(feature = "duckdb")]
-            ("duckdb", Some("spill_to_disk_duckdb.db")),
+            ("cayenne", Some("spill_to_disk_cayenne")),
             #[cfg(feature = "sqlite")]
             ("sqlite", Some("spill_to_disk_sqlite.db")),
         ];
@@ -133,7 +129,11 @@ async fn execute_spill_to_disk_and_rehydration(
         path_with_appended_suffix(&accelerated_db_file_path, "-shm"),
     ] {
         if std::fs::metadata(&file_path).is_ok() {
-            std::fs::remove_file(&file_path).context("should remove local database")?;
+            if file_path.is_dir() {
+                std::fs::remove_dir_all(&file_path).context("should remove local database")?;
+            } else {
+                std::fs::remove_file(&file_path).context("should remove local database")?;
+            }
         }
     }
 
@@ -242,12 +242,12 @@ async fn get_locally_persisted_records(
     db_file_path: &Path,
     query: &str,
 ) -> Result<Vec<RecordBatch>, anyhow::Error> {
-    let db_file_path = db_file_path.to_string_lossy();
     let query_result = match engine {
-        #[cfg(feature = "duckdb")]
-        "duckdb" => duckdb::query_local_db(db_file_path.as_ref(), query).await?,
+        "cayenne" => {
+            return crate::acceleration::query_cayenne_file(db_file_path, "lineitem", query).await;
+        }
         #[cfg(feature = "sqlite")]
-        "sqlite" => sqlite::query_local_db(db_file_path.as_ref(), query).await?,
+        "sqlite" => sqlite::query_local_db(&db_file_path.to_string_lossy(), query).await?,
         _ => Err(anyhow::anyhow!("Unsupported engine: {engine}"))?,
     };
 
@@ -339,7 +339,11 @@ fn create_test_dataset(
     if let Some(db_file_path) = db_file_path {
         let params = SpicepodParams::from_string_map(
             vec![(
-                format!("{acceleration_engine}_file"),
+                if acceleration_engine == "cayenne" {
+                    "cayenne_file_path".to_string()
+                } else {
+                    format!("{acceleration_engine}_file")
+                },
                 db_file_path.to_string(),
             )]
             .into_iter()

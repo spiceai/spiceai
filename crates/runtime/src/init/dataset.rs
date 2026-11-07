@@ -4166,7 +4166,7 @@ mod tests {
 
         #[test]
         fn other_engines_are_told_on_conflict_is_removed_in_3_0() {
-            for engine in ["arrow", "duckdb"] {
+            for engine in ["arrow", "sqlite"] {
                 let mut acceleration = acceleration(engine, Some("upsert"));
                 for (mode, refresh_mode) in [
                     (Mode::File, None),
@@ -4193,7 +4193,7 @@ mod tests {
 
         #[test]
         fn changes_recommend_persistent_cayenne() {
-            let mut acceleration = acceleration("duckdb", Some("upsert"));
+            let mut acceleration = acceleration("sqlite", Some("upsert"));
             assert_eq!(acceleration.mode, Mode::Memory);
             for (mode, refresh_mode) in [
                 (Mode::Memory, None),
@@ -4463,7 +4463,7 @@ mod tests {
         for (acceleration, named) in [
             (
                 spicepod::acceleration::Acceleration {
-                    engine: Some("duckdb".to_string()),
+                    engine: Some("sqlite".to_string()),
                     ..durable_write_back_acceleration()
                 },
                 "acceleration.engine: cayenne",
@@ -7098,6 +7098,6 @@ use the Enterprise distribution of Spice.ai. Learn more at https://docs.spice.ai
 }
 
 #[cfg(test)]
-#[cfg(all(feature = "snapshots", feature = "duckdb"))]
+#[cfg(all(feature = "snapshots", feature = "sqlite"))]
 #[path = "dataset_snapshot_bootstrap_tests.rs"]
 mod snapshot_bootstrap_tests;

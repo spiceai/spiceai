@@ -964,7 +964,7 @@ mod tests {
     fn an_engine_the_snapshots_were_not_created_with_is_rejected() {
         let mut declared = snapshot_dataset();
         declared.acceleration = Some(spicepod_acceleration::Acceleration {
-            engine: Some("duckdb".to_string()),
+            engine: Some("sqlite".to_string()),
             ..Default::default()
         });
         let source = source(&declared);
@@ -976,13 +976,13 @@ mod tests {
         assert_eq!(
             message,
             format!(
-                "Invalid configuration for 'acceleration.engine': Dataset 'modules' reads snapshots from 's3://bucket-b/snapshots/' that were created with the 'cayenne' engine, but `acceleration.engine` is 'duckdb'. Remove `acceleration.engine`, which a snapshot dataset takes from its snapshots. See: {SNAPSHOT_SOURCE_DOCS}"
+                "Invalid configuration for 'acceleration.engine': Dataset 'modules' reads snapshots from 's3://bucket-b/snapshots/' that were created with the 'cayenne' engine, but `acceleration.engine` is 'sqlite'. Remove `acceleration.engine`, which a snapshot dataset takes from its snapshots. See: {SNAPSHOT_SOURCE_DOCS}"
             )
         );
 
         assert!(
             source
-                .acceleration(&TableReference::bare("modules"), Engine::DuckDB)
+                .acceleration(&TableReference::bare("modules"), Engine::Sqlite)
                 .is_ok(),
             "the engine the snapshots were created with is accepted"
         );

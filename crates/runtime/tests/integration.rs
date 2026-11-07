@@ -174,7 +174,7 @@ mod schema_evolution;
 mod sharepoint;
 #[cfg(feature = "snapshots")]
 mod snapshot_integration;
-#[cfg(all(feature = "snapshots", feature = "duckdb"))]
+#[cfg(all(feature = "snapshots", feature = "sqlite"))]
 mod snapshot_source;
 #[cfg(feature = "snowflake")]
 mod snowflake;

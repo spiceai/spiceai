@@ -272,9 +272,9 @@ fn writer_dataset(name: &str, csv: &Path, engine: &str, dir: &Path) -> Dataset {
         ("csv_has_header".to_string(), "true".to_string()),
     ])));
     let engine_params = match engine {
-        "duckdb" => HashMap::from([(
-            "duckdb_file".to_string(),
-            dir.join(format!("{name}.duckdb")).display().to_string(),
+        "sqlite" => HashMap::from([(
+            "sqlite_file".to_string(),
+            dir.join(format!("{name}.sqlite")).display().to_string(),
         )]),
         _ => HashMap::from([
             (
@@ -378,7 +378,7 @@ async fn load(rt: &Arc<Runtime>) -> Result<()> {
 }
 
 /// A reader configured with nothing but the location and `file_format: snapshot`
-/// serves a Cayenne and a `DuckDB` snapshot, each in the engine that created it, from
+/// serves a Cayenne and a `SQLite` snapshot, each in the engine that created it, from
 /// a copy of the writer's snapshots in another bucket, and follows newer snapshots.
 #[tokio::test]
 async fn reads_replicated_snapshots_in_the_engine_that_created_them() -> Result<()> {
@@ -406,7 +406,7 @@ async fn replicated_snapshots_scenario(rustfs: Rustfs, modules: &str, orders: &s
     let writer_app = AppBuilder::new("snapshot_source_writer")
         .with_snapshots(writer_snapshots(rustfs, &prefix))
         .with_dataset(writer_dataset(modules, &modules_csv, "cayenne", dir.path()))
-        .with_dataset(writer_dataset(orders, &orders_csv, "duckdb", dir.path()))
+        .with_dataset(writer_dataset(orders, &orders_csv, "sqlite", dir.path()))
         .build();
     let reader_app = AppBuilder::new("snapshot_source_reader")
         .with_dataset(reader_dataset(rustfs, modules, &prefix))
@@ -432,7 +432,7 @@ async fn replicated_snapshots_scenario(rustfs: Rustfs, modules: &str, orders: &s
         );
     }
     // Each snapshot is restored into the engine that created it: Cayenne data in the
-    // dataset's data directory, DuckDB in a file named for the dataset and location.
+    // dataset's data directory, SQLite in a file named for the dataset and location.
     let modules_copies = local_copies(modules);
     assert!(
         modules_copies
@@ -444,7 +444,7 @@ async fn replicated_snapshots_scenario(rustfs: Rustfs, modules: &str, orders: &s
     assert!(
         orders_copies.iter().any(|path| path
             .extension()
-            .is_some_and(|extension| extension == "duckdb")),
+            .is_some_and(|extension| extension == "sqlite")),
         "{orders_copies:?}"
     );
 
@@ -697,7 +697,7 @@ async fn a_moved_dataset_never_serves_the_previous_locations_rows() -> Result<()
 async fn moved_scenario(rustfs: Rustfs, modules: &str) -> Result<()> {
     let prefix = unique("snapshots");
     let dir = TempDir::new()?;
-    let writer = publish_and_replicate(rustfs, &prefix, modules, dir.path(), "duckdb").await?;
+    let writer = publish_and_replicate(rustfs, &prefix, modules, dir.path(), "sqlite").await?;
     writer.shutdown().await;
 
     // The first location, restored and served.
@@ -783,7 +783,7 @@ async fn projected_scenario(rustfs: Rustfs, modules: &str) -> Result<()> {
     let dir = TempDir::new()?;
     let modules_csv = dir.path().join("modules.csv");
     std::fs::write(&modules_csv, INITIAL_CSV)?;
-    let mut projected = writer_dataset(modules, &modules_csv, "duckdb", dir.path());
+    let mut projected = writer_dataset(modules, &modules_csv, "sqlite", dir.path());
     if let Some(acceleration) = projected.acceleration.as_mut() {
         acceleration.refresh_sql = Some(format!("SELECT id FROM {modules}"));
     }
@@ -1435,7 +1435,7 @@ async fn refuses_cayenne_paths_for_another_engines_snapshots() -> Result<()> {
 async fn other_engine_paths_scenario(rustfs: Rustfs, modules: &str) -> Result<()> {
     let prefix = unique("snapshots");
     let dir = TempDir::new()?;
-    let writer = publish_and_replicate(rustfs, &prefix, modules, dir.path(), "duckdb").await?;
+    let writer = publish_and_replicate(rustfs, &prefix, modules, dir.path(), "sqlite").await?;
     writer.shutdown().await;
 
     let mut dataset = reader_dataset(rustfs, modules, &prefix);
@@ -1459,7 +1459,7 @@ async fn other_engine_paths_scenario(rustfs: Rustfs, modules: &str) -> Result<()
 
     let table = datafusion::common::TableReference::bare(modules);
     let expected = format!(
-        "Dataset '{modules}' reads snapshots from 's3://{READER_BUCKET}/{prefix}/' that were created with the 'duckdb' engine, so `acceleration.params.cayenne_file_path`, which sets where a Cayenne copy is kept, does not apply"
+        "Dataset '{modules}' reads snapshots from 's3://{READER_BUCKET}/{prefix}/' that were created with the 'sqlite' engine, so `acceleration.params.cayenne_file_path`, which sets where a Cayenne copy is kept, does not apply"
     );
     let deadline = Instant::now() + Duration::from_secs(30);
     let mut status = None;

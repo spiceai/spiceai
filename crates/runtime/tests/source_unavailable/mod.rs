@@ -661,7 +661,6 @@ async fn a_dataset_changed_while_its_source_is_down_loads_once_the_source_is_rea
 
 /// Accelerated datasets whose acceleration is already on disk when the runtime
 /// starts with the source down or slow (#14610).
-#[cfg(feature = "duckdb")]
 mod served_from_acceleration {
     use std::{collections::HashMap, path::Path, sync::Arc, time::Duration};
 
@@ -690,19 +689,19 @@ mod served_from_acceleration {
         utils::{run_query, wait_until_true},
     };
 
-    /// A `DuckDB` file acceleration that refreshes every second, so a refresh is due
+    /// A `Cayenne` file acceleration that refreshes every second, so a refresh is due
     /// as soon as the runtime restarts.
     fn dataset(prefix: &str, duckdb_file: &Path, ready_state: ReadyState) -> SpicepodDataset {
         let mut dataset = SpicepodDataset::new(format!("{prefix}://orders"), "orders");
         dataset.ready_state = ready_state;
         dataset.acceleration = Some(Acceleration {
             enabled: true,
-            engine: Some("duckdb".to_string()),
+            engine: Some("cayenne".to_string()),
             mode: Mode::File,
             refresh_mode: Some(RefreshMode::Full),
             refresh_check_interval: Some("1s".to_string()),
             params: Some(Params::from_string_map(HashMap::from([(
-                "duckdb_file".to_string(),
+                "cayenne_file_path".to_string(),
                 duckdb_file.to_string_lossy().to_string(),
             )]))),
             ..Default::default()
@@ -1026,18 +1025,18 @@ mod served_from_acceleration {
         Ok(())
     }
 
-    /// `orders_view` reading `orders` with `sql`, accelerated in the `DuckDB` file
+    /// `orders_view` reading `orders` with `sql`, accelerated in the `Cayenne` file
     /// `duckdb_file` and refreshed every second.
     fn accelerated_orders_view(duckdb_file: &Path, sql: &str) -> View {
         let mut view = View::new("orders_view".to_string());
         view.sql = Some(sql.to_string());
         view.acceleration = Some(Acceleration {
             enabled: true,
-            engine: Some("duckdb".to_string()),
+            engine: Some("cayenne".to_string()),
             mode: Mode::File,
             refresh_check_interval: Some("1s".to_string()),
             params: Some(Params::from_string_map(HashMap::from([(
-                "duckdb_file".to_string(),
+                "cayenne_file_path".to_string(),
                 duckdb_file.to_string_lossy().to_string(),
             )]))),
             ..Default::default()

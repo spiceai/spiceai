@@ -130,12 +130,6 @@ async fn check_engine(engine: &str) -> anyhow::Result<()> {
         .await
 }
 
-#[cfg(feature = "duckdb")]
-#[tokio::test]
-async fn duckdb_filter_only_scan_keeps_its_rows() -> anyhow::Result<()> {
-    check_engine("duckdb").await
-}
-
 #[cfg(feature = "sqlite")]
 #[tokio::test]
 async fn sqlite_filter_only_scan_keeps_its_rows() -> anyhow::Result<()> {

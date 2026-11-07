@@ -229,7 +229,7 @@ async fn test_retention_sql() -> Result<(), anyhow::Error> {
                 .with_dataset(make_s3_dataset(
                     "spiceai-public-datasets/taxi_small_samples/taxi_sample.parquet",
                     "taxi_trips",
-                    "duckdb",
+                    "cayenne",
                     "DELETE FROM taxi_trips WHERE VendorID != 2 OR Airport_fee != 1.75",
                     Some("tpep_pickup_datetime"),
                     Some("1000000000w"), // Some large retention period to ensure data is not fitlered out by time
@@ -286,7 +286,7 @@ async fn test_retention_sql() -> Result<(), anyhow::Error> {
 }
 
 #[tokio::test]
-async fn test_duckdb_append_refresh_preserves_timestamptz() -> Result<(), anyhow::Error> {
+async fn test_cayenne_append_refresh_preserves_timestamptz() -> Result<(), anyhow::Error> {
     let _tracing = init_tracing(Some("integration=debug,info"));
     register_test_connectors().await;
 
@@ -369,7 +369,7 @@ SET
             dataset.acceleration = Some(Acceleration {
                 enabled: true,
                 mode: Mode::File,
-                engine: Some("duckdb".to_string()),
+                engine: Some("cayenne".to_string()),
                 refresh_mode: Some(RefreshMode::Append),
                 refresh_check_interval: Some("200ms".to_string()),
                 retention_sql: Some("DELETE FROM widgets WHERE deleted = true".to_string()),

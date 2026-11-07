@@ -12,7 +12,7 @@ limitations under the License.
 */
 
 use super::*;
-use accelerator_duckdb as _;
+use accelerator_sqlite as _;
 use arrow::array::Int64Array;
 use runtime_acceleration::snapshot::{
     AccelerationEngine, AccelerationLayout, ForceCreate, SnapshotBehavior, SnapshotManager,
@@ -58,13 +58,13 @@ impl Fixture {
         if reader {
             dataset.acceleration = Some(spicepod::acceleration::Acceleration {
                 enabled: true,
-                engine: Some("duckdb".to_string()),
+                engine: Some("sqlite".to_string()),
                 mode: spicepod::acceleration::Mode::File,
                 refresh_mode: Some(spicepod::acceleration::RefreshMode::Snapshot),
                 refresh_check_interval: Some("100ms".to_string()),
                 snapshots: spicepod::acceleration::SnapshotBehavior::BootstrapOnly,
                 params: Some(Params::from_string_map(HashMap::from([(
-                    "duckdb_file".to_string(),
+                    "sqlite_file".to_string(),
                     self.directory
                         .path()
                         .join("reader.db")
@@ -94,9 +94,9 @@ impl Fixture {
         let path = self.directory.path().join("writer.db");
         let writer_path = path.clone();
         tokio::task::spawn_blocking(move || {
-            let connection = duckdb::Connection::open(writer_path).expect("writer database");
+            let connection = rusqlite::Connection::open(writer_path).expect("writer database");
             connection
-                .execute_batch("CREATE TABLE orders AS SELECT 42::BIGINT AS id")
+                .execute_batch("CREATE TABLE orders AS SELECT CAST(42 AS INTEGER) AS id")
                 .expect("writer rows");
         })
         .await
@@ -110,7 +110,7 @@ impl Fixture {
                 spicepod::acceleration::SnapshotsCompaction::Disabled,
             ),
             AccelerationLayout::File { path },
-            AccelerationEngine::DuckDB,
+            AccelerationEngine::Sqlite,
         )
         .await
         .expect("snapshot manager");
@@ -206,7 +206,7 @@ async fn snapshot_bootstrap_does_not_block_startup_and_default_warn_recovers() {
     drop(runtime);
     let path = fixture.directory.path().join("reader.db");
     tokio::task::spawn_blocking(move || {
-        let connection = duckdb::Connection::open(path).expect("restored database reopens");
+        let connection = rusqlite::Connection::open(path).expect("restored database reopens");
         let id: i64 = connection
             .query_row("SELECT id FROM orders", [], |row| row.get(0))
             .expect("restored database has no stale WAL");
@@ -334,7 +334,7 @@ async fn snapshot_bootstrap_keeps_serving_during_path_change() {
         .as_mut()
         .expect("acceleration")
         .params = Some(Params::from_string_map(HashMap::from([(
-        "duckdb_file".to_string(),
+        "sqlite_file".to_string(),
         fixture
             .directory
             .path()
@@ -376,7 +376,7 @@ fn app_with_reader_path(fixture: &Fixture, file: &str) -> App {
         .as_mut()
         .expect("acceleration")
         .params = Some(Params::from_string_map(HashMap::from([(
-        "duckdb_file".to_string(),
+        "sqlite_file".to_string(),
         fixture
             .directory
             .path()
@@ -476,11 +476,11 @@ fn walk(root: &std::path::Path) -> Vec<String> {
     files
 }
 
-/// A file-mode `DuckDB` dataset over `csv`, accelerated into `duckdb_file`.
-fn duckdb_dataset(
+/// A file-mode `SQLite` dataset over `csv`, accelerated into `sqlite_file`.
+fn sqlite_dataset(
     directory: &std::path::Path,
     csv: &str,
-    duckdb_file: &str,
+    sqlite_file: &str,
     acceleration: spicepod::acceleration::Acceleration,
 ) -> PodDataset {
     let mut dataset = PodDataset::new(format!("file:{}", directory.join(csv).display()), "orders");
@@ -490,11 +490,11 @@ fn duckdb_dataset(
     )])));
     dataset.acceleration = Some(spicepod::acceleration::Acceleration {
         enabled: true,
-        engine: Some("duckdb".to_string()),
+        engine: Some("sqlite".to_string()),
         mode: spicepod::acceleration::Mode::File,
         params: Some(Params::from_string_map(HashMap::from([(
-            "duckdb_file".to_string(),
-            directory.join(duckdb_file).to_string_lossy().into_owned(),
+            "sqlite_file".to_string(),
+            directory.join(sqlite_file).to_string_lossy().into_owned(),
         )]))),
         ..acceleration
     });
@@ -514,7 +514,7 @@ async fn shutdown_releases_the_snapshot_writer_lease() {
             }),
             ..Default::default()
         })
-        .with_dataset(duckdb_dataset(
+        .with_dataset(sqlite_dataset(
             directory.path(),
             "rows.csv",
             "writer.db",
@@ -577,7 +577,7 @@ async fn runtime_state_location_holds_snapshots_without_a_snapshots_section() {
 
     let writer_app = app::AppBuilder::new("snapshot_writer")
         .with_runtime(runtime_config.clone())
-        .with_dataset(duckdb_dataset(
+        .with_dataset(sqlite_dataset(
             directory.path(),
             "rows.csv",
             "writer.db",
@@ -642,7 +642,7 @@ async fn runtime_state_location_holds_snapshots_without_a_snapshots_section() {
 
     let reader_app = app::AppBuilder::new("snapshot_reader")
         .with_runtime(runtime_config)
-        .with_dataset(duckdb_dataset(
+        .with_dataset(sqlite_dataset(
             directory.path(),
             "reader_rows.csv",
             "reader.db",
