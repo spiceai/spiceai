@@ -25,7 +25,7 @@ use crate::dataconnector::http_rate_control;
 use crate::dataconnector::parameters::ConnectorParams;
 use crate::token_providers::databricks::{
     AUTH_MODE_DESCRIPTION, AUTH_MODES, AuthCredentials, build_auth_credentials,
-    get_m2m_token_provider, get_u2m_token_provider,
+    get_m2m_token_provider, get_u2m_token_provider, get_workload_identity_token_provider,
 };
 use async_trait::async_trait;
 use data_components::Read;
@@ -135,6 +135,8 @@ pub const PARAMETERS: &[ParameterSpec] = &[
     // Databricks M2M Service Principal credentials
     ParameterSpec::component("client_id").description("The client ID of the Databricks service principal."),
     ParameterSpec::component("client_secret").secret().description("The client secret of the Databricks service principal."),
+    ParameterSpec::component("oidc_token_filepath").description("A file that holds the workload's identity token, read again for every exchange, such as a Kubernetes projected service account token. With `databricks_client_id`, it authenticates with workload identity federation."),
+    ParameterSpec::component("token_audience").description("The audience of the identity token Spice requests from a GitHub Actions job, such as the Databricks account ID. With `databricks_client_id`, it authenticates with workload identity federation."),
 
     // S3 storage options
     ParameterSpec::component("aws_region")
@@ -303,6 +305,18 @@ impl CatalogConnector for Databricks {
                         connector_component: ConnectorComponent::from(catalog),
                     })?
             }
+            AuthCredentials::WorkloadIdentity(identity) => get_workload_identity_token_provider(
+                &format!("catalog '{}' (databricks)", catalog.name),
+                endpoint,
+                identity,
+                &runtime.token_provider_registry,
+            )
+            .await
+            .map_err(|source| super::Error::UnableToGetCatalogProvider {
+                connector: "databricks".to_string(),
+                source: source.into(),
+                connector_component: ConnectorComponent::from(catalog),
+            })?,
         };
 
         // Copy the catalog params into the dataset params, and allow user to override
@@ -510,6 +524,10 @@ fn table_reference_creator_spark(uc_table: &UCTable) -> Option<TableReference> {
 }
 
 fn table_reference_creator_delta_lake(uc_table: &UCTable) -> Option<TableReference> {
+    if uc_table.is_catalog_managed() {
+        tracing::warn!("{}", uc_table.catalog_managed_skip_warning());
+        return None;
+    }
     let storage_location = uc_table.storage_location.as_deref()?;
     // Don't append a trailing slash here — `DeltaTable::from` calls
     // `ensure_folder_location` which already adds one when needed.
@@ -560,6 +578,18 @@ async fn create_token_provider_for_catalog(
                     connector_component: ConnectorComponent::from(catalog),
                 })
         }
+        AuthCredentials::WorkloadIdentity(identity) => get_workload_identity_token_provider(
+            &format!("catalog '{}' (databricks)", catalog.name),
+            endpoint,
+            identity,
+            &token_provider_registry,
+        )
+        .await
+        .map_err(|source| super::Error::UnableToGetCatalogProvider {
+            connector: "databricks".to_string(),
+            source: source.into(),
+            connector_component: ConnectorComponent::from(catalog),
+        }),
     }
 }
 
@@ -677,6 +707,7 @@ mod tests {
             columns: vec![],
             storage_location: storage_location.map(ToString::to_string),
             table_id: None,
+            properties: std::collections::HashMap::new(),
         }
     }
 
@@ -744,6 +775,15 @@ mod tests {
     }
 
     #[test]
+    fn test_table_reference_creator_delta_lake_skips_catalog_managed() {
+        let mut table = make_uc_table(Some("s3://bucket/tables/t"));
+        table
+            .properties
+            .insert("delta.feature.catalogManaged".into(), "supported".into());
+        assert!(table_reference_creator_delta_lake(&table).is_none());
+    }
+
+    #[test]
     fn test_table_reference_creator_delta_lake_without_storage() {
         let table = make_uc_table(None);
         assert!(
@@ -802,6 +842,7 @@ mod tests {
             columns: vec![],
             storage_location: Some("s3://bucket/orders".to_string()),
             table_id: None,
+            properties: std::collections::HashMap::new(),
         };
         let reference =
             table_reference_creator_spark(&table).expect("spark creator should always return Some");

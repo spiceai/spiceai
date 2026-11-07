@@ -496,7 +496,6 @@ async fn stored_rows(rt: &Arc<Runtime>) -> Result<Vec<ExpectedRow>, anyhow::Erro
     Ok(sorted(actual_rows(&run_query(rt, SELECT_ALL).await?)))
 }
 
-#[cfg(not(windows))]
 #[tokio::test]
 async fn otlp_logs_round_trip_through_cayenne_and_survive_a_restart() -> Result<(), anyhow::Error> {
     let _tracing = init_tracing(Some("integration=debug,info"));
@@ -602,7 +601,6 @@ async fn otlp_logs_round_trip_through_cayenne_and_survive_a_restart() -> Result<
 
 /// A logs dataset needs Cayenne: with another engine it fails to load with the fix, and the
 /// receiver refuses exports as retryable while it is not loaded.
-#[cfg(not(windows))]
 #[tokio::test]
 async fn otlp_logs_dataset_without_cayenne_fails_to_load() -> Result<(), anyhow::Error> {
     let _tracing = init_tracing(Some("integration=debug,info"));

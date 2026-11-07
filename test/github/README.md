@@ -34,8 +34,8 @@ GitHub's GraphQL `repository.stargazers` read requires it: the
 [permission reproduction](https://github.com/spiceai/spiceai/actions/runs/34186688336)
 returns `FORBIDDEN` with `contents: read` (and with `read-all`), and one row with
 `contents: write`. Removing `email` from the query does not change that result.
-Checkout does not persist the token. The existing organization App credentials
-remain separate for organization and App-authentication tests.
+Checkout does not persist the token. Organization tests use a token from a
+separate App, whose key stays in Azure Key Vault.
 
 `check_permissions.py` verifies the full one-row stargazers selection before
 the live tests start. HTTP-success responses containing GraphQL errors fail;
@@ -53,11 +53,9 @@ python3 -m unittest discover -s test/github -p test_permissions.py -v
 GITHUB_TOKEN=... python3 test/github/check_permissions.py --artifacts /tmp/github-api-results
 ```
 
-For local integration testing, supply `GITHUB_TOKEN`, `GITHUB_ORG_TOKEN`, and
-the app credentials `GITHUB_CLIENT_ID`, `GITHUB_INSTALLATION_ID`, and
-`GITHUB_PRIVATE_KEY` through the environment or the runtime's dotenv secret
-store. Set `SPICE_GITHUB_TEST_REQUIRED=1` to fail on missing credentials, as CI
-does. Keep the same package selection and features as your existing build.
+For local integration testing, supply `GITHUB_TOKEN` and `GITHUB_ORG_TOKEN`
+through the environment or the runtime's dotenv secret store. Set
+`SPICE_GITHUB_TEST_REQUIRED=1` to fail on missing credentials, as CI does. Keep the same package selection and features as your existing build.
 An OAuth token or classic personal access token also needs `read:user` or
 `user:email` for the requested user email fields, and `read:org` for organization
 membership. Repository access alone is insufficient for the full suite.

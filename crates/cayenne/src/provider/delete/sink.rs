@@ -50,7 +50,8 @@ limitations under the License.
 use super::super::Error;
 use super::super::deletion_index::{DeletionIndex, KeyDeletionIndex};
 use super::super::deletion_strategy::{
-    Int64PkDeletionSnapshot, PkDeletionStrategyWithCache, RowConverterDeletionSnapshot,
+    Int64PkDeletionSnapshot, PkDeletionStrategyWithCache, PositionDeletionVector,
+    RowConverterDeletionSnapshot,
 };
 use super::super::memory_account::CayenneMemoryAccount;
 use super::super::on_conflict::{PkDeletionSnapshot, pk_deletion_snapshot_for_strategy};
@@ -172,11 +173,26 @@ enum PreparedDeletionCache {
         keys: HashSet<Box<[u8]>>,
         sequence: Option<i64>,
     },
+    /// Each data file's complete deletion vector after this delete, keyed by the
+    /// file's path: the positions it already held plus the ones this delete adds.
+    Positions {
+        vectors: HashMap<String, Arc<PositionDeletionVector>>,
+    },
 }
 
 impl PreparedDeletionPublish {
     pub(crate) fn delete_files(&self) -> &[DeleteFile] {
         &self.delete_files
+    }
+
+    /// Whether this delete's files are position deletion vectors that each hold
+    /// every position deleted from their data file, and so replace the earlier
+    /// vectors for that file.
+    pub(crate) fn replaces_earlier_deletion_vectors(&self) -> bool {
+        // See `CayenneDeletionSink::position_deletion_vectors_replaced_by` for why a
+        // primary-key table's vectors never replace each other.
+        matches!(self.publish, PreparedDeletionCache::Positions { .. })
+            && self.strategy.is_position_based()
     }
 
     pub(crate) fn deleted_count(&self) -> u64 {
@@ -246,6 +262,19 @@ impl PreparedDeletionPublish {
                         ))
                     });
                 }
+            }
+            PreparedDeletionCache::Positions { vectors } => {
+                // Unchanged files keep sharing their vectors with the previous
+                // snapshot through the inner `Arc`s; only the outer map is copied.
+                self.strategy.position_cache().rcu(|current| {
+                    let mut next = HashMap::clone(current);
+                    next.extend(
+                        vectors
+                            .iter()
+                            .map(|(path, vector)| (path.clone(), Arc::clone(vector))),
+                    );
+                    Arc::new(next)
+                });
             }
         }
         self.table_memory
@@ -520,6 +549,10 @@ pub struct CayenneDeletionSink {
     /// index it is judged by (see [`DeleteScanSource::tombstones_at_capture`]). `None` on
     /// internal persist-only helpers, which capture without them.
     capture_locks: Option<CaptureLocks>,
+    /// The owning table's `file_deletion_fence`, which removing the files of
+    /// superseded position deletion vectors waits for. `None` leaves those files
+    /// on disk.
+    file_deletion_fence: Option<Arc<tokio::sync::RwLock<()>>>,
 }
 
 /// The locks a coherent (listing, deletion index) capture holds, outer first.
@@ -584,6 +617,64 @@ impl CayenneDeletionSink {
             count_exact: false,
             scan_input_version: None,
             capture_locks: None,
+            file_deletion_fence: None,
+        }
+    }
+
+    /// Wire the owning table's `file_deletion_fence`, so a position delete removes
+    /// the files of the deletion vectors it supersedes.
+    #[must_use]
+    pub(crate) fn with_file_deletion_fence(
+        mut self,
+        file_deletion_fence: Arc<tokio::sync::RwLock<()>>,
+    ) -> Self {
+        self.file_deletion_fence = Some(file_deletion_fence);
+        self
+    }
+
+    /// The table's catalog rows for the position deletion vectors that
+    /// `delete_files` replace: every earlier row naming one of their data files.
+    ///
+    /// Only for a table with no primary key. Each vector in `delete_files` holds
+    /// every position deleted from its data file, because it was built from the
+    /// position cache, which every committed vector of the table updates. The
+    /// caller holds the table's write lock, which every writer of such a table's
+    /// vectors holds, so no row can be added or removed between this read and the
+    /// commit that removes these rows. A primary-key table on position deletes
+    /// also publishes vectors from a staged upsert that holds only that upsert's
+    /// positions and does not take the write lock, so its rows are never replaced.
+    pub(crate) async fn position_deletion_vectors_replaced_by(
+        &self,
+        delete_files: &[DeleteFile],
+    ) -> super::super::Result<Vec<DeleteFile>> {
+        let data_files: HashSet<&str> = delete_files
+            .iter()
+            .filter_map(|file| file.source_data_file_path.as_deref())
+            .collect();
+        if data_files.is_empty() {
+            return Ok(Vec::new());
+        }
+        let new_paths: HashSet<&str> = delete_files.iter().map(|file| file.path.as_str()).collect();
+        Ok(self
+            .catalog
+            .get_table_delete_files(&self.table_metadata.table_id)
+            .await?
+            .into_iter()
+            .filter(|row| {
+                !new_paths.contains(row.path.as_str())
+                    && row
+                        .source_data_file_path
+                        .as_deref()
+                        .is_some_and(|data_file| data_files.contains(data_file))
+            })
+            .collect())
+    }
+
+    /// Remove the files of `replaced` vector rows once the commit that dropped them
+    /// has succeeded. See [`super::vector_io::remove_dropped_deletion_vector_files`].
+    pub(crate) fn remove_replaced_deletion_vector_files(&self, replaced: Vec<DeleteFile>) {
+        if let Some(fence) = &self.file_deletion_fence {
+            super::vector_io::remove_dropped_deletion_vector_files(replaced, Arc::clone(fence));
         }
     }
 
@@ -631,10 +722,6 @@ impl CayenneDeletionSink {
         self
     }
 
-    pub(super) fn notify_scan_input_change(&self) {
-        bump_scan_input_version(self.scan_input_version.as_deref());
-    }
-
     /// Set whether this sink must return an exact, verified deleted-row count.
     ///
     /// `true` (a user-visible `DELETE`, where "rows affected" is shown to the
@@ -645,11 +732,6 @@ impl CayenneDeletionSink {
     pub(crate) fn with_exact_count(mut self, exact: bool) -> Self {
         self.count_exact = exact;
         self
-    }
-
-    fn refresh_deletion_memory_accounting(&self) {
-        self.table_memory
-            .set_deletion_bytes(self.pk_deletion_strategy.approx_resident_bytes());
     }
 
     fn assigned_delete_sequence(
@@ -1198,13 +1280,6 @@ impl CayenneDeletionSink {
     pub(crate) async fn prepare_delete(
         &self,
     ) -> super::super::Result<Option<PreparedDeletionPublish>> {
-        if self.pk_deletion_strategy.is_position_based() {
-            return Err(Error::Internal {
-                table: self.table_metadata.table_name.clone(),
-                message: "Staged delete publication is unsupported for position-based deletes"
-                    .to_string(),
-            });
-        }
         let ctx = SessionContext::new_with_config_rt(
             util::session_state::session_config(),
             Arc::clone(&self.runtime_env),
@@ -1219,6 +1294,15 @@ impl CayenneDeletionSink {
                 .map(|source| Arc::clone(&source.table))
                 .collect();
             self.prepare_delete_all_rows_from_tables(&ctx, &plain).await
+        } else if self.pk_deletion_strategy.is_position_based() {
+            // As in `delete_from`: a position tombstone can only hide the version it
+            // matched, so the per-snapshot visibility rules carry nothing for it.
+            let position_tables: Vec<Arc<ListingTable>> = all_tables
+                .iter()
+                .map(|source| Arc::clone(&source.table))
+                .collect();
+            self.prepare_delete_filtered_rows_position_based(&ctx, &position_tables)
+                .await
         } else {
             self.prepare_delete_filtered_rows_from_tables(&ctx, &all_tables)
                 .await
@@ -1442,10 +1526,6 @@ impl CayenneDeletionSink {
             cleanup_armed: true,
             scan_input_version: self.scan_input_version.as_ref().map(Arc::clone),
         })
-    }
-
-    async fn cleanup_uncommitted_delete_file(path: &str) {
-        cleanup_uncommitted_delete_paths(&[std::path::PathBuf::from(path)]).await;
     }
 }
 

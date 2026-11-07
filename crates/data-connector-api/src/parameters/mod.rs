@@ -25,6 +25,7 @@ limitations under the License.
 use std::sync::Arc;
 
 use app::App;
+use app::spicepod::component::runtime::RuntimeMode;
 use arrow_schema::SchemaRef;
 use async_trait::async_trait;
 use data_http_rate_control::HttpRateControlRegistry;
@@ -78,6 +79,10 @@ pub trait ConnectorContext: Send + Sync {
     /// The loaded app, for the runtime-level configuration a connector consults
     /// (e.g. `runtime.params`, `runtime.flight`).
     fn app(&self) -> Arc<App>;
+
+    /// The deployment profile the runtime started with. A reload cannot change
+    /// it, so it can differ from the loaded app's `runtime.mode`.
+    fn runtime_mode(&self) -> RuntimeMode;
 
     /// The process-wide per-origin HTTP rate-control registry, so connectors
     /// sharing an origin share one limiter.
@@ -163,4 +168,21 @@ pub struct ConnectorParams {
     pub unsupported_type_action: Option<UnsupportedTypeAction>,
     pub component: ConnectorComponent,
     pub io_runtime: Handle,
+}
+
+impl ConnectorParams {
+    /// The value of parameter `name` if the component's spicepod sets it, and `None` if it is
+    /// left at its default. [`Parameters`] fills in each spec's default, so whether the
+    /// parameter was set is read from the spicepod's own params.
+    #[must_use]
+    pub fn user_set(&self, name: &str) -> Option<&str> {
+        let spicepod_params = match &self.component {
+            ConnectorComponent::Dataset(dataset) => &dataset.params,
+            ConnectorComponent::Catalog(catalog) => &catalog.params,
+        };
+        spicepod_params
+            .contains_key(&self.parameters.user_param(name).0)
+            .then(|| self.parameters.get(name).expose().ok())
+            .flatten()
+    }
 }

@@ -1,7 +1,7 @@
 use std::sync::Arc;
 
-use crate::http::v1::chat::{KEEP_ALIVE_INTERVAL, OpenaiErrorEvent, openai_error_to_response};
-use async_openai::error::{ApiError, OpenAIError};
+use crate::http::v1::chat::{KEEP_ALIVE_INTERVAL, OpenaiErrorEvent, api_error_status};
+use async_openai::error::{ApiError, OpenAIError, WrappedError};
 use async_openai::traits::EventType;
 use async_openai::types::responses::{
     CreateResponse, OutputItem, OutputMessageContent, Response as OpenAIResponse,
@@ -20,12 +20,11 @@ use itertools::Itertools;
 use runtime_request_context::{AsyncMarker, RequestContext};
 use std::convert::Infallible;
 use std::time::Duration;
-use tokio::sync::RwLock;
 use tracing::{Instrument, Span};
 
-use crate::{Runtime, model::LLMResponsesModelStore, status::RuntimeStatus};
+use crate::{Runtime, status::RuntimeStatus};
 use llms::responses::Responses;
-use model_capabilities::{Capability, Refusal, require};
+use model_capabilities::Refusal;
 
 fn extract_text(resp: &OpenAIResponse) -> String {
     resp.output
@@ -42,48 +41,127 @@ fn extract_text(resp: &OpenAIResponse) -> String {
         .join("\n")
 }
 
-/// The response to a request naming a model that has no Responses API handler.
-fn responses_refusal(model_id: &str, refusal: &Refusal, status: &RuntimeStatus) -> Response {
-    match refusal {
-        Refusal::Unsupported(capabilities) if capabilities.has(Capability::Chat) => {
-            let provider = capabilities.provider().short_name();
-            openai_error_to_response(OpenAIError::ApiError(ApiError {
-                message: format!(
-                    "Model '{model_id}' uses provider '{provider}' which does not support the OpenAI Responses API. Use /v1/chat/completions for this model or configure a model provider that supports Responses."
-                ),
-                r#type: Some("invalid_request_error".to_string()),
-                param: Some("model".to_string()),
-                code: Some("invalid_request_error".to_string()),
-            }))
+/// An error in the `OpenAI` API's envelope, `{"error": {...}}`, which its SDKs read on every
+/// error response.
+fn error_envelope(
+    status: StatusCode,
+    message: impl Into<String>,
+    r#type: &str,
+    param: Option<&str>,
+    code: Option<&str>,
+) -> Response {
+    api_error_envelope(
+        status,
+        ApiError {
+            message: message.into(),
+            r#type: Some(r#type.to_string()),
+            param: param.map(str::to_string),
+            code: code.map(str::to_string),
+        },
+    )
+}
+
+fn api_error_envelope(status: StatusCode, error: ApiError) -> Response {
+    (status, Json(WrappedError { error })).into_response()
+}
+
+/// A model's error, in the `OpenAI` API's envelope. An error that is not the provider's own
+/// answer is reported without its detail, which can name the provider's address; it is in
+/// the runtime's log.
+fn openai_error_envelope(error: OpenAIError) -> Response {
+    match error {
+        OpenAIError::ApiError(api_error) => {
+            api_error_envelope(api_error_status(&api_error), api_error)
         }
+        OpenAIError::InvalidArgument(message) => error_envelope(
+            StatusCode::BAD_REQUEST,
+            message,
+            "invalid_request_error",
+            None,
+            None,
+        ),
+        _ => error_envelope(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "The model failed to answer. The runtime's log has the cause.",
+            "server_error",
+            None,
+            None,
+        ),
+    }
+}
+
+/// `models` as an English list of quoted names: `'a', 'b' and 'c'`.
+fn quoted_list(models: &[String]) -> String {
+    let quoted: Vec<String> = models.iter().map(|model| format!("'{model}'")).collect();
+    match quoted.as_slice() {
+        [] => String::new(),
+        [only] => only.clone(),
+        [rest @ .., last] => format!("{} and {last}", rest.join(", ")),
+    }
+}
+
+/// The response to a request naming a model that has no Responses API handler. `served` is
+/// every model `/v1/responses` serves, sorted, which a request naming no loaded model is told.
+fn responses_refusal(
+    model_id: &str,
+    refusal: &Refusal,
+    status: &RuntimeStatus,
+    served: &[String],
+) -> Response {
+    match refusal {
+        // A chat model never reaches here: it is answered through its chat completions.
         Refusal::Unsupported(capabilities) => {
             let provider = capabilities.provider();
-            openai_error_to_response(OpenAIError::ApiError(ApiError {
-                message: format!(
+            error_envelope(
+                StatusCode::BAD_REQUEST,
+                format!(
                     "Model '{model_id}' uses provider '{provider}' which is a decision model and does not support the OpenAI Responses API or chat completions. Use POST /v1/decisions, or the SQL decision functions such as ai_if, instead."
                 ),
-                r#type: Some("invalid_request_error".to_string()),
-                param: Some("model".to_string()),
-                code: Some("invalid_request_error".to_string()),
-            }))
+                "invalid_request_error",
+                Some("model"),
+                Some("invalid_request_error"),
+            )
         }
-        Refusal::Unavailable => {
-            let error_response = serde_json::json!({
-                "message": format!("model '{model_id}' is unavailable via /v1/responses"),
-                "type": "service_unavailable_error",
-                "param": "model",
-                "code": "service_unavailable",
-            });
-
-            (StatusCode::SERVICE_UNAVAILABLE, Json(error_response)).into_response()
-        }
+        Refusal::Unavailable => error_envelope(
+            StatusCode::SERVICE_UNAVAILABLE,
+            format!("model '{model_id}' is unavailable via /v1/responses"),
+            "service_unavailable_error",
+            Some("model"),
+            Some("service_unavailable"),
+        ),
         Refusal::NotFound => {
-            let message = status
-                .unavailable_model_reason(model_id)
-                .unwrap_or_else(|| format!("model '{model_id}' not found"));
-            (StatusCode::NOT_FOUND, message).into_response()
+            let message = status.unavailable_model_reason(model_id).unwrap_or_else(|| {
+                if served.is_empty() {
+                    format!(
+                        "Model '{model_id}' is not in this Spicepod, which serves no chat model. Add one under `models`. See: https://spiceai.org/docs/components/models"
+                    )
+                } else {
+                    format!(
+                        "Model '{model_id}' is not in this Spicepod, which serves {}. Name one of them. See: https://spiceai.org/docs/components/models",
+                        quoted_list(served)
+                    )
+                }
+            });
+            error_envelope(
+                StatusCode::NOT_FOUND,
+                message,
+                "invalid_request_error",
+                Some("model"),
+                Some("model_not_found"),
+            )
         }
     }
+}
+
+/// The models `/v1/responses` serves, sorted, for an error that has to name them.
+async fn served_models(rt: &Runtime) -> Vec<String> {
+    let mut served: Vec<String> = rt
+        .responses_supported_model_names()
+        .await
+        .into_iter()
+        .collect();
+    served.sort_unstable();
+    served
 }
 
 #[cfg_attr(feature = "openapi", utoipa::path(
@@ -179,7 +257,6 @@ fn responses_refusal(model_id: &str, refusal: &Refusal, status: &RuntimeStatus) 
 ))]
 pub(crate) async fn post(
     Extension(rt): Extension<Arc<Runtime>>,
-    Extension(llms): Extension<Arc<RwLock<LLMResponsesModelStore>>>,
     Json(req): Json<CreateResponse>,
 ) -> Response {
     let context = RequestContext::current(AsyncMarker::new().await);
@@ -192,7 +269,13 @@ pub(crate) async fn post(
     );
 
     let Some(model_id) = req.model.clone() else {
-        return (StatusCode::BAD_REQUEST, "model is required").into_response();
+        return error_envelope(
+            StatusCode::BAD_REQUEST,
+            "`model` is required: name one of the Spicepod's models.",
+            "invalid_request_error",
+            Some("model"),
+            Some("missing_required_parameter"),
+        );
     };
     span.in_scope(
         || tracing::info!(target: "task_history", model = %model_id, api = "responses", "labels"),
@@ -205,19 +288,17 @@ pub(crate) async fn post(
         let model_id = model_id.clone();
         let stream = req.stream.unwrap_or(false);
 
-        let model = {
-            let capabilities = rt.model_capabilities();
-            let capabilities = capabilities.read().await;
-            require(
-                &capabilities,
-                &*llms.read().await,
-                &model_id,
-                Capability::Responses,
-            )
-        };
-        let model = match model {
+        let model = match rt.responses_model(&model_id).await {
             Ok(model) => model,
-            Err(refusal) => return responses_refusal(&model_id, &refusal, &rt.status()),
+            Err(refusal) => {
+                // Only a request naming no loaded model is told which ones are served.
+                let served = if matches!(refusal, Refusal::NotFound) {
+                    served_models(&rt).await
+                } else {
+                    Vec::new()
+                };
+                return responses_refusal(&model_id, &refusal, &rt.status(), &served);
+            }
         };
 
         if stream {
@@ -238,7 +319,7 @@ pub(crate) async fn post(
                 Err(e) => {
                     tracing::error!(target: "task_history", parent: &span_clone, "{e}");
 
-                    openai_error_to_response(e)
+                    openai_error_envelope(e)
                 }
             }
         }
@@ -264,7 +345,7 @@ async fn create_response_sse_response(
         Ok(stream) => stream,
         Err(e) => {
             tracing::error!(target: "task_history", parent: &span, "{e}");
-            return openai_error_to_response(e);
+            return openai_error_envelope(e);
         }
     };
 
@@ -504,6 +585,7 @@ mod tests {
             "anthropic_model",
             &Refusal::Unsupported(capabilities("anthropic:claude-3-5-sonnet")),
             &RuntimeStatus::new(),
+            &[],
         );
 
         assert_eq!(response.status(), StatusCode::BAD_REQUEST);
@@ -516,9 +598,15 @@ mod tests {
         let body_json: serde_json::Value =
             serde_json::from_slice(&body).expect("body should be valid json");
 
-        assert_eq!(body_json["type"].as_str(), Some("invalid_request_error"));
-        assert_eq!(body_json["param"].as_str(), Some("model"));
-        assert_eq!(body_json["code"].as_str(), Some("invalid_request_error"));
+        assert_eq!(
+            body_json["error"]["type"].as_str(),
+            Some("invalid_request_error")
+        );
+        assert_eq!(body_json["error"]["param"].as_str(), Some("model"));
+        assert_eq!(
+            body_json["error"]["code"].as_str(),
+            Some("invalid_request_error")
+        );
     }
 
     #[tokio::test]
@@ -527,6 +615,7 @@ mod tests {
             "temporary_model",
             &Refusal::Unavailable,
             &RuntimeStatus::new(),
+            &[],
         );
 
         assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
@@ -540,15 +629,46 @@ mod tests {
             serde_json::from_slice(&body).expect("body should be valid json");
 
         assert_eq!(
-            body_json["message"].as_str(),
+            body_json["error"]["message"].as_str(),
             Some("model 'temporary_model' is unavailable via /v1/responses")
         );
         assert_eq!(
-            body_json["type"].as_str(),
+            body_json["error"]["type"].as_str(),
             Some("service_unavailable_error")
         );
-        assert_eq!(body_json["param"].as_str(), Some("model"));
-        assert_eq!(body_json["code"].as_str(), Some("service_unavailable"));
+        assert_eq!(body_json["error"]["param"].as_str(), Some("model"));
+        assert_eq!(
+            body_json["error"]["code"].as_str(),
+            Some("service_unavailable")
+        );
+    }
+
+    #[tokio::test]
+    async fn a_model_not_in_the_spicepod_is_told_which_ones_are() {
+        let response = responses_refusal(
+            "gpt-5",
+            &Refusal::NotFound,
+            &RuntimeStatus::new(),
+            &["claude".to_string(), "qwen".to_string()],
+        );
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+        let body = response
+            .into_body()
+            .collect()
+            .await
+            .expect("body should be readable")
+            .to_bytes();
+        let body_json: serde_json::Value =
+            serde_json::from_slice(&body).expect("body should be valid json");
+        assert_eq!(
+            body_json,
+            serde_json::json!({"error": {
+                "message": "Model 'gpt-5' is not in this Spicepod, which serves 'claude' and 'qwen'. Name one of them. See: https://spiceai.org/docs/components/models",
+                "type": "invalid_request_error",
+                "param": "model",
+                "code": "model_not_found",
+            }})
+        );
     }
 
     #[tokio::test]
@@ -557,6 +677,7 @@ mod tests {
             "jev_model",
             &Refusal::Unsupported(capabilities("typesafe:jev")),
             &RuntimeStatus::new(),
+            &[],
         );
 
         assert_eq!(response.status(), StatusCode::BAD_REQUEST);
@@ -569,9 +690,12 @@ mod tests {
         let body_json: serde_json::Value =
             serde_json::from_slice(&body).expect("body should be valid json");
 
-        assert_eq!(body_json["type"].as_str(), Some("invalid_request_error"));
-        assert_eq!(body_json["param"].as_str(), Some("model"));
-        let message = body_json["message"].as_str().expect("message");
+        assert_eq!(
+            body_json["error"]["type"].as_str(),
+            Some("invalid_request_error")
+        );
+        assert_eq!(body_json["error"]["param"].as_str(), Some("model"));
+        let message = body_json["error"]["message"].as_str().expect("message");
         assert!(
             message.contains("/v1/decisions"),
             "message should direct callers to /v1/decisions: {message}"

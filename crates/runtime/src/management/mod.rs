@@ -1,5 +1,5 @@
 /*
-Copyright 2024-2025 The Spice.ai OSS Authors
+Copyright 2024-2026 The Spice.ai OSS Authors
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -36,8 +36,12 @@ use datafusion::{
     logical_expr::LogicalPlanBuilder,
     prelude::{DataFrame, SessionContext, col, lit},
 };
+use runtime_secrets::{ParamStr, Secrets, get_params_with_secrets, iter_secret_references};
 use secrecy::{ExposeSecret, SecretString};
-use snafu::{ResultExt, Snafu};
+use snafu::{ResultExt, Snafu, ensure};
+use spice_cloud_client::endpoints::{
+    DEFAULT_REGION as SPICE_CLOUD_DEFAULT_REGION, flight_endpoint as spice_cloud_flight_endpoint,
+};
 use spicepod::component::management::Management as SpicepodManagement;
 use tokio::sync::RwLock;
 use tokio_util::sync::CancellationToken;
@@ -56,9 +60,9 @@ use crate::{
         DataFusion, SPICE_RUNTIME_SCHEMA, builder::get_df_default_config, error::SpiceExternalError,
     },
     dataupdate::{DataUpdate, UpdateType},
+    status::ComponentStatus,
     task_history::DEFAULT_TASK_HISTORY_TABLE,
 };
-use runtime_secrets::{Secrets, get_params_with_secrets};
 
 #[derive(Debug, Snafu)]
 pub enum Error {
@@ -94,9 +98,34 @@ pub(crate) async fn init_management(
         return Ok(());
     }
 
+    let status = runtime.status();
+    let endpoint_hint = management_endpoint_from_raw_params(&config.params);
+    status.update_management(ComponentStatus::Initializing, endpoint_hint.clone());
+
     match Management::try_from(config, runtime).await {
-        Ok(management) => management.start().await,
-        Err(e) => Err(e),
+        Ok(management) => {
+            let endpoint = management.endpoint.clone();
+            match management.start().await {
+                Ok(()) => {
+                    status.update_management(ComponentStatus::Ready, endpoint);
+                    Ok(())
+                }
+                Err(err) => {
+                    status.update_management(
+                        ComponentStatus::error_with_message(err.to_string()),
+                        endpoint,
+                    );
+                    Err(err)
+                }
+            }
+        }
+        Err(err) => {
+            status.update_management(
+                ComponentStatus::error_with_message(err.to_string()),
+                endpoint_hint,
+            );
+            Err(err)
+        }
     }
 }
 
@@ -109,6 +138,7 @@ pub(crate) struct Management {
     runtime: Arc<Runtime>,
     api_key: SecretString,
     params: HashMap<String, SecretString>,
+    endpoint: String,
 }
 
 impl Management {
@@ -118,20 +148,17 @@ impl Management {
     ) -> Result<Self, Error> {
         let secrets = runtime.secrets();
 
-        let api_key: SecretString = if config.api_key.is_empty() {
-            return Err(Error::MissingRequiredSecret {
-                name: "api_key".to_string(),
-            });
-        } else {
-            resolve_secret(&secrets, &config.api_key).await
-        };
-
+        // Validate `api_key` before region so a missing secret is not hidden
+        // behind a dataset-key `spiceai_region` error from the spice.ai connector.
+        let api_key = resolve_api_key(&secrets, &config.api_key).await?;
         let params = get_params_with_secrets(secrets, &config.params).await;
+        let endpoint = management_endpoint(&params);
 
         Ok(Self {
             runtime,
             api_key,
             params,
+            endpoint,
         })
     }
 
@@ -194,25 +221,7 @@ impl Management {
     }
 
     async fn init_task_history_sink_table(&self) -> Result<(), Error> {
-        let mut params = HashMap::new();
-        params.insert(
-            "spiceai_api_key".to_string(),
-            self.api_key.expose_secret().to_string(),
-        );
-
-        if let Some(flight_endpoint) = self.params.get("data_endpoint") {
-            params.insert(
-                "spiceai_endpoint".to_string(),
-                flight_endpoint.expose_secret().to_string(),
-            );
-        }
-
-        if let Some(region) = self.params.get("region") {
-            params.insert(
-                "spiceai_region".to_string(),
-                region.expose_secret().to_string(),
-            );
-        }
+        let params = spiceai_sink_params(&self.api_key, &self.params);
 
         let sink = get_spiceai_table_provider(
             TASK_HISTORY_SINK_TABLE,
@@ -403,17 +412,204 @@ fn is_table_not_ready_error(e: &DataFusionError) -> bool {
     false
 }
 
-// Resolve a secret by key, returning the secret string if found, or the original key if not.
-async fn resolve_secret(secrets: &Arc<RwLock<Secrets>>, key: &str) -> SecretString {
+/// Resolves `management.api_key` before any Cloud region is considered.
+///
+/// A `${ store:key }` reference that does not resolve — and an empty value —
+/// become `Missing required secret: api_key`, matching the documented
+/// troubleshooting table.
+async fn resolve_api_key(
+    secrets: &Arc<RwLock<Secrets>>,
+    api_key: &str,
+) -> Result<SecretString, Error> {
+    ensure!(
+        !api_key.trim().is_empty(),
+        MissingRequiredSecretSnafu { name: "api_key" }
+    );
+
     let secrets = Secrets::snapshot(secrets).await;
-    if let Ok(Some(secret)) = secrets.get_secret(key).await {
-        secret
-    } else {
-        SecretString::new(key.to_string().into())
+
+    if iter_secret_references(api_key).next().is_some() {
+        let injected = secrets.inject_secrets("api_key", ParamStr(api_key)).await;
+        ensure!(
+            !injected.expose_secret().trim().is_empty(),
+            MissingRequiredSecretSnafu { name: "api_key" }
+        );
+        return Ok(injected);
     }
+
+    if let Ok(Some(secret)) = secrets.get_secret(api_key).await {
+        return Ok(secret);
+    }
+
+    Ok(SecretString::new(api_key.to_string().into()))
+}
+
+fn optional_secret_param(params: &HashMap<String, SecretString>, key: &str) -> Option<String> {
+    params
+        .get(key)
+        .map(|value| value.expose_secret().to_string())
+        .filter(|value| !value.is_empty())
+}
+
+/// Connector params for the Cloud management sink.
+///
+/// When neither `region` nor `data_endpoint` is set, uses the documented Spice
+/// Cloud default region so the `api_key`-only `management:` block works.
+fn spiceai_sink_params(
+    api_key: &SecretString,
+    params: &HashMap<String, SecretString>,
+) -> HashMap<String, String> {
+    let mut sink = HashMap::new();
+    sink.insert(
+        "spiceai_api_key".to_string(),
+        api_key.expose_secret().to_string(),
+    );
+
+    if let Some(endpoint) = optional_secret_param(params, "data_endpoint") {
+        sink.insert("spiceai_endpoint".to_string(), endpoint);
+    }
+
+    if let Some(region) = optional_secret_param(params, "region") {
+        sink.insert("spiceai_region".to_string(), region);
+    } else if !sink.contains_key("spiceai_endpoint") {
+        sink.insert(
+            "spiceai_region".to_string(),
+            SPICE_CLOUD_DEFAULT_REGION.to_string(),
+        );
+    }
+
+    sink
+}
+
+fn resolve_management_endpoint(region: Option<&str>, data_endpoint: Option<&str>) -> String {
+    if let Some(endpoint) = data_endpoint.filter(|value| !value.is_empty()) {
+        return endpoint.to_string();
+    }
+
+    let region = region
+        .filter(|value| !value.is_empty())
+        .unwrap_or(SPICE_CLOUD_DEFAULT_REGION);
+    spice_cloud_flight_endpoint(region)
+}
+
+fn management_endpoint(params: &HashMap<String, SecretString>) -> String {
+    resolve_management_endpoint(
+        optional_secret_param(params, "region").as_deref(),
+        optional_secret_param(params, "data_endpoint").as_deref(),
+    )
+}
+
+fn management_endpoint_from_raw_params(params: &HashMap<String, String>) -> String {
+    resolve_management_endpoint(
+        params.get("region").map(String::as_str),
+        params.get("data_endpoint").map(String::as_str),
+    )
 }
 
 fn retry_strategy() -> FibonacciBackoff {
     // Retry up to 10 times, with a maximum interval of 55 seconds between retries
     FibonacciBackoffBuilder::new().max_retries(Some(10)).build()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn secret_map(pairs: &[(&str, &str)]) -> HashMap<String, SecretString> {
+        pairs
+            .iter()
+            .map(|(key, value)| ((*key).to_string(), SecretString::from(*value)))
+            .collect()
+    }
+
+    #[test]
+    fn minimal_block_defaults_spice_cloud_region() {
+        let api_key = SecretString::from("000000|bogus");
+        let params = spiceai_sink_params(&api_key, &HashMap::new());
+        assert_eq!(
+            params.get("spiceai_region").map(String::as_str),
+            Some(SPICE_CLOUD_DEFAULT_REGION)
+        );
+        assert!(!params.contains_key("spiceai_endpoint"));
+        assert_eq!(
+            management_endpoint(&HashMap::new()),
+            spice_cloud_flight_endpoint(SPICE_CLOUD_DEFAULT_REGION)
+        );
+        assert_eq!(
+            management_endpoint_from_raw_params(&HashMap::new()),
+            spice_cloud_flight_endpoint(SPICE_CLOUD_DEFAULT_REGION)
+        );
+    }
+
+    #[test]
+    fn explicit_region_is_preserved() {
+        let api_key = SecretString::from("key");
+        let params = spiceai_sink_params(&api_key, &secret_map(&[("region", "eu-central-1")]));
+        assert_eq!(
+            params.get("spiceai_region").map(String::as_str),
+            Some("eu-central-1")
+        );
+    }
+
+    #[test]
+    fn data_endpoint_does_not_default_region() {
+        let api_key = SecretString::from("key");
+        let params = spiceai_sink_params(
+            &api_key,
+            &secret_map(&[("data_endpoint", "http://127.0.0.1:50051")]),
+        );
+        assert!(
+            !params.contains_key("spiceai_region"),
+            "a local data_endpoint must not invent a Cloud region: {params:?}"
+        );
+        assert_eq!(
+            params.get("spiceai_endpoint").map(String::as_str),
+            Some("http://127.0.0.1:50051")
+        );
+    }
+
+    #[test]
+    fn empty_region_is_treated_as_unset() {
+        let api_key = SecretString::from("key");
+        let params = spiceai_sink_params(&api_key, &secret_map(&[("region", "")]));
+        assert_eq!(
+            params.get("spiceai_region").map(String::as_str),
+            Some(SPICE_CLOUD_DEFAULT_REGION)
+        );
+    }
+
+    #[tokio::test]
+    async fn empty_api_key_is_missing_secret() {
+        let secrets = Arc::new(RwLock::new(Secrets::new()));
+        let err = resolve_api_key(&secrets, "")
+            .await
+            .expect_err("empty api_key must fail");
+        assert!(
+            err.to_string()
+                .starts_with("Missing required secret: api_key"),
+            "got: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn unresolved_secret_reference_is_missing_secret() {
+        let secrets = Arc::new(RwLock::new(Secrets::new()));
+        let err = resolve_api_key(&secrets, "${secrets:MANAGEMENT_TEST_UNSET_API_KEY}")
+            .await
+            .expect_err("missing secret must fail");
+        assert!(
+            err.to_string()
+                .starts_with("Missing required secret: api_key"),
+            "got: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn literal_api_key_is_kept() {
+        let secrets = Arc::new(RwLock::new(Secrets::new()));
+        let key = resolve_api_key(&secrets, "000000|bogus")
+            .await
+            .expect("literal api_key");
+        assert_eq!(key.expose_secret(), "000000|bogus");
+    }
 }

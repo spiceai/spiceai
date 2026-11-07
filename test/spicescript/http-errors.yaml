@@ -1,0 +1,53 @@
+name: http-errors
+description: >
+  Client mistakes over HTTP are answered 4xx with a message naming the
+  mistake: SQL that does not parse, an unknown table or column, an error
+  evaluating the query, a write to a read-only dataset, DDL outside a
+  writable catalog, an empty query, search over a dataset with nothing to
+  search, malformed JSON bodies, an unknown model, and an unknown dataset.
+
+sources:
+  src: { kind: postgres }
+
+spicepod:
+  version: v1
+  kind: Spicepod
+  name: http-errors
+  datasets:
+    - { from: postgres:public.t, name: t, params: '${sources.src.params}', acceleration: { enabled: true, engine: cayenne, mode: file } }
+
+defaults:
+  cluster-partition-by: { '*': id }
+
+steps:
+  - source-exec: { src: "CREATE TABLE t (id int PRIMARY KEY, v text); INSERT INTO t VALUES (1, 'a')" }
+  - start: {}
+  - http: { method: POST, path: /v1/sql, body: 'SELEC 1' }
+    expect: { status: 400, body-matches: ['SELEC'] }
+  - http: { method: POST, path: /v1/sql, body: 'SELECT * FROM nope' }
+    expect: { status: 400, body-matches: ["'[a-z.]*nope' not found"] }
+  - http: { method: POST, path: /v1/sql, body: 'SELECT nope FROM t' }
+    expect: { status: 400, body-matches: ['No field named nope'] }
+  - http: { method: POST, path: /v1/sql, body: 'SELECT 1/0' }
+    expect: { status: 400, body-matches: ['Divide by zero'] }
+  - http: { method: POST, path: /v1/sql, body: "SELECT CAST('x' AS INT)" }
+    expect: { status: 400, body-matches: ["Cannot cast string 'x'"] }
+  - http: { method: POST, path: /v1/sql, body: "INSERT INTO t VALUES (2, 'b')" }
+    expect: { status: 400, body-matches: ["read-only dataset 't'", 'read_write'] }
+  - http: { method: POST, path: /v1/sql, body: 'DROP TABLE t' }
+    expect: { status: 400, body-matches: ['read_write_create'] }
+  - http: { method: POST, path: /v1/sql, body: '' }
+    expect: { status: 400, body-matches: ['No SQL statements'] }
+  - http: { method: POST, path: /v1/search, headers: { content-type: application/json }, body: '{"text": "a", "datasets": ["t"]}' }
+    expect: { status: 400, body-matches: ['no embeddings or full text search'] }
+  - http: { method: POST, path: /v1/search, headers: { content-type: application/json }, body: '{nope' }
+    expect: { status: 400, body-matches: ['parse the request body as JSON'] }
+  - http: { method: POST, path: /v1/datasets/t/acceleration/refresh, headers: { content-type: application/json }, body: '{nope' }
+    expect: { status: 400, body-matches: ['parse the request body as JSON'] }
+  - http: { method: POST, path: /v1/chat/completions, headers: { content-type: application/json }, body: '{"model": "nope", "messages": [{"role": "user", "content": "hi"}]}' }
+    expect: { status: 404, body-matches: ["model 'nope' not found"] }
+  - http: { path: /v1/datasets/nope }
+    expect: { status: 404 }
+  # The table is untouched by the refused statements.
+  - query: SELECT id, v FROM t
+    expect: { rows: [['1', a]] }

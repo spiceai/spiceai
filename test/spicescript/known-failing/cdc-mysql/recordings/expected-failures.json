@@ -1,0 +1,84 @@
+{
+  "mysql-cdc-row-image-override": [
+    {
+      "run": "mysql-cdc-row-image-override",
+      "who": "default",
+      "key": "query: SELECT * FROM docs #2",
+      "kind": "wrong-answer",
+      "signature": "still failing after <n> attempts over <duration>: answer differs from the expected one: DataMismatch { column: \"version\", row_number: 1, expected: \"\\\"2\\\"\", actual: \"\\\"1\\\"\" }",
+      "group": "cdc-mysql"
+    },
+    {
+      "run": "mysql-cdc-row-image-override",
+      "who": "default",
+      "key": "query: SELECT * FROM docs #3",
+      "kind": "wrong-answer",
+      "signature": "still failing after <n> attempts over <duration>: answer differs from the expected one: RowCountMismatch { expected: 4, actual: 3 }",
+      "group": "cdc-mysql"
+    },
+    {
+      "run": "mysql-cdc-row-image-override",
+      "who": "default",
+      "key": "restart: {}",
+      "kind": "error",
+      "signature": "spiced not ready: a dataset is in Error: [{\"acceleration_enabled\":true,\"error\":{\"category\":\"dataset\",\"code\":\"dataset.unknown\",\"type\":\"unknown\"},\"error_message\":\"External error: Failed to build deferred change batch: binlog decode error: row image carries 1 of 4 columns. Spice requires `binlog_row_im",
+      "group": "cdc-mysql"
+    }
+  ],
+  "mysql-cdc-shared-binlog-purged-status": [
+    {
+      "run": "mysql-cdc-shared-binlog-purged-status[engine=duckdb]",
+      "who": "default",
+      "key": "assert-status: {\"dataset\":\"b\",\"message-contains\":\"mysql_replication_invalid_checkpoint_behavior\",\"status\":\"Error\"}",
+      "kind": "error",
+      "signature": "expected a message containing 'mysql_replication_invalid_checkpoint_behavior', saw status=Error ready=false message=External error: shared mysql binlog stream terminated",
+      "group": "cdc-mysql",
+      "may-pass": true
+    },
+    {
+      "run": "mysql-cdc-shared-binlog-purged-status[engine=duckdb]",
+      "who": "default",
+      "key": "assert-status: {\"dataset\":\"c\",\"message-contains\":\"mysql_replication_invalid_checkpoint_behavior\",\"status\":\"Error\"}",
+      "kind": "error",
+      "signature": "expected a message containing 'mysql_replication_invalid_checkpoint_behavior', saw status=Error ready=false message=External error: shared mysql binlog stream terminated",
+      "group": "cdc-mysql",
+      "may-pass": true
+    },
+    {
+      "run": "mysql-cdc-shared-binlog-purged-status[engine=duckdb]",
+      "who": "default",
+      "key": "assert-status: {\"dataset\":\"a\",\"message-contains\":\"mysql_replication_invalid_checkpoint_behavior\",\"status\":\"Error\"}",
+      "kind": "error",
+      "signature": "expected a message containing 'mysql_replication_invalid_checkpoint_behavior', saw status=Error ready=false message=External error: shared mysql binlog stream terminated",
+      "group": "cdc-mysql",
+      "may-pass": true
+    },
+    {
+      "run": "mysql-cdc-shared-binlog-purged-status[engine=cayenne]",
+      "who": "default",
+      "key": "assert-status: {\"dataset\":\"a\",\"message-contains\":\"mysql_replication_invalid_checkpoint_behavior\",\"status\":\"Error\"}",
+      "kind": "error",
+      "signature": "expected a message containing 'mysql_replication_invalid_checkpoint_behavior', saw status=Error ready=false message=External error: shared mysql binlog stream terminated",
+      "group": "cdc-mysql",
+      "may-pass": true
+    },
+    {
+      "run": "mysql-cdc-shared-binlog-purged-status[engine=cayenne]",
+      "who": "default",
+      "key": "assert-status: {\"dataset\":\"b\",\"message-contains\":\"mysql_replication_invalid_checkpoint_behavior\",\"status\":\"Error\"}",
+      "kind": "error",
+      "signature": "expected a message containing 'mysql_replication_invalid_checkpoint_behavior', saw status=Error ready=false message=External error: shared mysql binlog stream terminated",
+      "group": "cdc-mysql",
+      "may-pass": true
+    },
+    {
+      "run": "mysql-cdc-shared-binlog-purged-status[engine=cayenne]",
+      "who": "default",
+      "key": "assert-status: {\"dataset\":\"c\",\"message-contains\":\"mysql_replication_invalid_checkpoint_behavior\",\"status\":\"Error\"}",
+      "kind": "error",
+      "signature": "expected a message containing 'mysql_replication_invalid_checkpoint_behavior', saw status=Error ready=false message=External error: shared mysql binlog stream terminated",
+      "group": "cdc-mysql",
+      "may-pass": true
+    }
+  ]
+}

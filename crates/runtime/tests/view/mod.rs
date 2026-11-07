@@ -18,7 +18,10 @@ use arrow::array::RecordBatch;
 use datafusion::common::TableReference;
 use futures::TryStreamExt;
 use runtime::Runtime;
-use runtime::{component::view::ViewBuilder, dataaccelerator::spice_sys::dataset_checkpointer};
+use runtime::{
+    component::view::{View as RuntimeView, ViewBuilder},
+    dataaccelerator::spice_sys::dataset_checkpointer,
+};
 use runtime_acceleration::sidecar::OpenOption;
 use runtime_acceleration::snapshot::SnapshotBehavior;
 use spicepod::acceleration::{Acceleration, Mode, RefreshMode, ZeroResultsAction};
@@ -31,31 +34,23 @@ use crate::{
     utils::{register_test_connectors, runtime_ready_check, test_request_context},
 };
 
-#[cfg(feature = "duckdb")]
 #[tokio::test]
-async fn accelerated_view_duckdb() -> Result<(), anyhow::Error> {
-    use datafusion_table_providers::sql::db_connection_pool::{
-        DbConnectionPool, duckdbpool::DuckDbConnectionPool,
-    };
-    use duckdb::AccessMode;
-
+async fn accelerated_view_cayenne() -> Result<(), anyhow::Error> {
     let _tracing = init_tracing(Some("integration=debug,info"));
     register_test_connectors().await;
 
     test_request_context()
         .scope(async {
-            // Clean up any existing acceleration file
-            if std::path::Path::new("./taxi_trips_vw.db").exists() {
-                std::fs::remove_file("./taxi_trips_vw.db").expect("to remove file");
-            }
+            let temp_dir = tempfile::tempdir()?;
+            let db_path = temp_dir.path().join("cayenne");
 
             let dataset = Dataset::new("s3://spiceai-public-datasets/taxi_small_samples/taxi_sample.parquet", "taxi_trips");
             let mut view = View::new("taxi_trips_vw".to_string());
             view.sql = Some("SELECT VendorID, AVG(trip_distance) AS avg_trip_distance, AVG(fare_amount) AS avg_fare_amount FROM taxi_trips GROUP BY VendorID".to_string());
             view.acceleration = Some(Acceleration {
-                params: get_params(&Mode::File, Some("./taxi_trips_vw.db".to_string()), "duckdb"),
+                params: get_params(&Mode::File, Some(db_path.display().to_string()), "cayenne"),
                 enabled: true,
-                engine: Some("duckdb".to_string()),
+                engine: Some("cayenne".to_string()),
                 mode: Mode::File,
                 refresh_mode: Some(RefreshMode::Full),
                 ..Acceleration::default()
@@ -88,8 +83,11 @@ async fn accelerated_view_duckdb() -> Result<(), anyhow::Error> {
             }
             runtime_ready_check(&rt).await;
 
-            let view = ViewBuilder::try_from(view_copy).expect("to parse view")
-                .build_with(Arc::clone(&rt), Arc::new(app_copy));
+            let view = RuntimeView::new(
+                ViewBuilder::try_from(view_copy).expect("to parse view").build(),
+                Arc::clone(&rt),
+                Arc::new(app_copy),
+            );
 
             // Ensure Checkpoint is created after initial view load (poll since checkpoint creation is async)
             let checkpoint = dataset_checkpointer(
@@ -114,7 +112,7 @@ async fn accelerated_view_duckdb() -> Result<(), anyhow::Error> {
                 .expect("Failed to get last checkpoint time");
             assert!(last_checkpoint_time.is_some(), "Last checkpoint time is not set");
 
-            // Test explain to ensure duckdb is used
+            // Test the accelerated view plan
             let query_result = rt
                 .datafusion()
                 .query_builder("EXPLAIN SELECT * FROM taxi_trips_vw ORDER BY avg_trip_distance;")
@@ -129,7 +127,7 @@ async fn accelerated_view_duckdb() -> Result<(), anyhow::Error> {
 
             let pretty = arrow::util::pretty::pretty_format_batches(&query_result)
                 .map_err(|e| anyhow::Error::msg(e.to_string()))?;
-            insta::assert_snapshot!("duckdb_query_explain", pretty);
+            insta::assert_snapshot!("cayenne_query_explain", pretty);
 
             // Test query output
             let query_result = rt
@@ -146,46 +144,39 @@ async fn accelerated_view_duckdb() -> Result<(), anyhow::Error> {
 
             let pretty = arrow::util::pretty::pretty_format_batches(&query_result)
                 .map_err(|e| anyhow::Error::msg(e.to_string()))?;
-            insta::assert_snapshot!("duckdb_query_result", pretty);
+            insta::assert_snapshot!("cayenne_query_result", pretty);
 
             rt.shutdown().await;
             drop(rt);
 
-            tokio::time::sleep(std::time::Duration::from_secs(1)).await;
-
-            let pool = DuckDbConnectionPool::new_file("./taxi_trips_vw.db", &AccessMode::ReadWrite)
-                .expect("valid path");
-            let conn_dyn = pool.connect().await.expect("valid connection");
-            let conn = conn_dyn.as_sync().expect("sync connection");
-            let result: Vec<RecordBatch> = conn
-                .query_arrow(
-                    "SELECT dataset_name FROM spice_sys_dataset_checkpoint",
-                    &[],
-                    None,
-                )
-                .expect("query executes")
-                .try_collect::<Vec<RecordBatch>>()
-                .await
-                .expect("collects results");
+            let metadata_path = db_path.join("metadata/cayenne.db");
+            let names = tokio::task::spawn_blocking(move || -> anyhow::Result<Vec<String>> {
+                let conn = rusqlite::Connection::open(metadata_path)?;
+                let mut statement = conn.prepare("SELECT dataset_name FROM spice_sys_dataset_checkpoint")?;
+                Ok(statement.query_map([], |row| row.get(0))?.collect::<Result<Vec<_>, _>>()?)
+            }).await??;
+            let result = vec![RecordBatch::try_from_iter(vec![(
+                "dataset_name",
+                Arc::new(arrow::array::StringArray::from(names)) as arrow::array::ArrayRef,
+            )])?];
 
             let pretty = arrow::util::pretty::pretty_format_batches(&result)
                 .map_err(|e| anyhow::Error::msg(e.to_string()))?;
-            insta::assert_snapshot!("duckdb_spice_sys_dataset_checkpoint", pretty);
+            insta::assert_snapshot!("cayenne_spice_sys_dataset_checkpoint", pretty);
 
-            let persisted_records: Vec<RecordBatch> = conn
-                .query_arrow("SELECT * FROM taxi_trips_vw ORDER BY avg_trip_distance", &[], None)
-                .expect("query executes")
-                .try_collect::<Vec<RecordBatch>>()
-                .await
-                .expect("collects results");
+            let persisted_records = crate::acceleration::query_cayenne_file(
+                &db_path,
+                "taxi_trips_vw",
+                "SELECT * FROM taxi_trips_vw ORDER BY avg_trip_distance",
+            ).await?;
 
             let persisted_records_pretty =
                 arrow::util::pretty::pretty_format_batches(&persisted_records)
                     .map_err(|e| anyhow::Error::msg(e.to_string()))?;
-            insta::assert_snapshot!("duckdb_persisted_records", persisted_records_pretty);
+            insta::assert_snapshot!("cayenne_persisted_records", persisted_records_pretty);
 
             // Remove the file
-            std::fs::remove_file("./taxi_trips_vw.db").expect("to remove file");
+            std::fs::remove_dir_all(&db_path).expect("to remove Cayenne directory");
 
             Ok(())
         })
@@ -1055,6 +1046,139 @@ async fn test_failing_dataset_only_blocks_dependent_views() -> Result<(), anyhow
                 Some(&runtime::status::ComponentStatus::Ready),
                 "the replaced dataset's old retry must not keep running"
             );
+
+            rt.shutdown().await;
+            Ok(())
+        })
+        .await
+}
+
+async fn view_row_count(rt: &Arc<Runtime>, view: &str) -> Result<usize, String> {
+    let batches = rt
+        .datafusion()
+        .query_builder(&format!("SELECT * FROM {view}"))
+        .build()
+        .run()
+        .await
+        .map_err(|e| e.to_string())?
+        .data
+        .try_collect::<Vec<RecordBatch>>()
+        .await
+        .map_err(|e| e.to_string())?;
+    Ok(batches.iter().map(RecordBatch::num_rows).sum())
+}
+
+/// A Spicepod change that replaces or removes a dataset re-registers the views
+/// that read it, directly, through other views or through a `localpod` child the
+/// change reloads, so they read what the Spicepod now declares.
+#[tokio::test]
+async fn test_view_follows_a_replaced_or_removed_dataset() -> Result<(), anyhow::Error> {
+    let _tracing = init_tracing(Some("integration=debug,info"));
+    register_test_connectors().await;
+
+    test_request_context()
+        .scope(async {
+            let temp_dir = tempfile::tempdir().expect("create temp dir");
+            let file =
+                |name: &str| format!("file:{}", temp_dir.path().join(name).to_string_lossy());
+            std::fs::write(temp_dir.path().join("a.csv"), "id\n1\n2").expect("write file");
+            std::fs::write(temp_dir.path().join("b.csv"), "id\n1\n2\n3").expect("write file");
+
+            let accelerated = |mut dataset: Dataset| {
+                dataset.acceleration = Some(Acceleration {
+                    enabled: true,
+                    engine: Some("arrow".to_string()),
+                    refresh_mode: Some(RefreshMode::Full),
+                    ..Acceleration::default()
+                });
+                dataset
+            };
+            let view = |name: &str, sql: &str| {
+                let mut view = View::new(name.to_string());
+                view.sql = Some(sql.to_string());
+                view
+            };
+            let views = [
+                view("v", "SELECT * FROM t"),
+                // Reads `v` by a qualified name.
+                view("w", "SELECT * FROM public.v"),
+                // Reads `v` only in a subquery.
+                view(
+                    "s",
+                    "SELECT id FROM (VALUES (1), (2), (3)) AS x(id) WHERE id IN (SELECT id FROM v)",
+                ),
+                // Reads a `localpod` child whose parent the change edits.
+                view("vc", "SELECT * FROM c"),
+            ];
+            let app = |t: Option<&str>, p: &str| {
+                let mut builder =
+                    app::AppBuilder::new("test_view_follows_a_replaced_or_removed_dataset")
+                        .with_dataset(accelerated(Dataset::new(file(p), "p")))
+                        .with_dataset(accelerated(Dataset::new("localpod:p", "c")));
+                if let Some(t) = t {
+                    builder = builder.with_dataset(Dataset::new(file(t), "t"));
+                }
+                for view in &views {
+                    builder = builder.with_view(view.clone());
+                }
+                builder.build()
+            };
+            let counts = async |rt: &Arc<Runtime>| {
+                let mut counts = Vec::new();
+                for view in ["v", "w", "s", "vc"] {
+                    counts.push(view_row_count(rt, view).await);
+                }
+                counts
+            };
+
+            configure_test_datafusion();
+            let rt = Arc::new(
+                Runtime::builder()
+                    .with_app(app(Some("a.csv"), "a.csv"))
+                    .build()
+                    .await,
+            );
+            Arc::clone(&rt).load_components().await;
+            runtime_ready_check(&rt).await;
+            assert_eq!(counts(&rt).await, vec![Ok(2); 4]);
+
+            assert!(
+                Arc::clone(&rt)
+                    .apply_app(Arc::new(app(Some("b.csv"), "b.csv")))
+                    .await
+            );
+            let mut last = Vec::new();
+            for _ in 0..120 {
+                last = counts(&rt).await;
+                if last == vec![Ok(3); 4] {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+            }
+            assert_eq!(
+                last,
+                vec![Ok(3); 4],
+                "v, w, s and vc must read the replaced datasets' 3 rows"
+            );
+
+            assert!(
+                Arc::clone(&rt)
+                    .apply_app(Arc::new(app(None, "b.csv")))
+                    .await
+            );
+            let mut last = Vec::new();
+            for _ in 0..120 {
+                last = counts(&rt).await;
+                if last[..3].iter().all(Result::is_err) {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+            }
+            assert!(
+                last[..3].iter().all(Result::is_err),
+                "v, w and s must stop answering once `t` is removed, got {last:?}"
+            );
+            assert_eq!(last[3], Ok(3), "vc does not read `t`");
 
             rt.shutdown().await;
             Ok(())

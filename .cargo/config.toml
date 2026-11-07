@@ -19,11 +19,7 @@ rustflags = ["-Ctarget-feature=+neon,+fp16,+fhm", "-Clink-arg=-fuse-ld=lld"]
 #
 # That failure mode is silent in a way an assertion failure is not: the process
 # aborts with "has overflowed its stack" and the test contributes NO result line,
-# so the coverage disappears instead of going red. On a 2 MiB stack
-# `cayenne mutation_property_test prop_sequential_{cold,key,position}_impl_turso`
-# and `cold_tier_test …promotion_racing_stage_b_finalize_impl_turso` abort rather
-# than run, and `prop_sequential_memory_impl_turso` sits within 64 KiB of the
-# limit, so unrelated code motion flips it either way.
+# so the coverage disappears instead of going red.
 #
 # 8 MiB matches what the runtime binary is separately documented to want for deep
 # plans (`crates/test-framework/src/queries/README.md`) and clears the measured

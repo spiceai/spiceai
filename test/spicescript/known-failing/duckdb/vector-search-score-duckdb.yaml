@@ -1,0 +1,41 @@
+# Known failing (#15549): vector_search on a DuckDB acceleration reports a different
+# _score (0.655) from Arrow, Cayenne and the exact cosine similarity over the
+# stored embeddings (0.8275), though it ranks the rows the same.
+name: vector-search-score-duckdb
+description: >
+  vector_search's _score is the cosine similarity of the row's embedding to
+  the query's, on every acceleration engine.
+
+sources:
+  src: { kind: postgres }
+
+variants:
+  duckdb: {}
+
+spicepod:
+  version: v1
+  kind: Spicepod
+  name: vector-search-score-duckdb
+  embeddings:
+    - from: model2vec:minishlab/potion-base-2M
+      name: potion
+  datasets:
+    - from: postgres:public.docs
+      name: docs
+      params: ${sources.src.params}
+      acceleration: { enabled: true, engine: duckdb, refresh_mode: full }
+      columns:
+        - name: body
+          embeddings: [{ from: potion, row_id: [id] }]
+
+steps:
+  - source-exec:
+      src: { file: ../../seed/search-postgres.sql }
+  - start: { ready-timeout: 300s }
+  - query: >-
+      SELECT v.id, round(v._score, 4) AS s FROM vector_search(docs, 'fox fox fox') v ORDER BY v._score DESC, v.id LIMIT 10
+    id: scores
+  - query: >-
+      SELECT id, round(1 - cosine_distance(body_embedding, embed('fox fox fox', 'potion')), 4) AS s FROM docs
+      WHERE body_embedding IS NOT NULL ORDER BY s DESC, id LIMIT 10
+    expect: { same-as: scores }

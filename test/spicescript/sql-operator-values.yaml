@@ -1,0 +1,434 @@
+{
+  "name": "sql-operator-values",
+  "description": "Documented operator semantics checked against literal expected values over both protocols.",
+  "spicepod": {
+    "version": "v1",
+    "kind": "Spicepod",
+    "name": "sql-operator-values"
+  },
+  "steps": [
+    {
+      "start": {}
+    },
+    {
+      "query": "SELECT 2 + 3 AS value",
+      "protocols": [
+        "flightsql",
+        "http"
+      ],
+      "expect": {
+        "rows": [
+          [
+            "5"
+          ]
+        ]
+      }
+    },
+    {
+      "query": "SELECT 2 - 3 AS value",
+      "protocols": [
+        "flightsql",
+        "http"
+      ],
+      "expect": {
+        "rows": [
+          [
+            "-1"
+          ]
+        ]
+      }
+    },
+    {
+      "query": "SELECT 2 * 3 AS value",
+      "protocols": [
+        "flightsql",
+        "http"
+      ],
+      "expect": {
+        "rows": [
+          [
+            "6"
+          ]
+        ]
+      }
+    },
+    {
+      "query": "SELECT -7 / 3 AS value",
+      "protocols": [
+        "flightsql",
+        "http"
+      ],
+      "expect": {
+        "rows": [
+          [
+            "-2"
+          ]
+        ]
+      }
+    },
+    {
+      "query": "SELECT -7 % 3 AS value",
+      "protocols": [
+        "flightsql",
+        "http"
+      ],
+      "expect": {
+        "rows": [
+          [
+            "-1"
+          ]
+        ]
+      }
+    },
+    {
+      "query": "SELECT 2 = 3 AS value",
+      "protocols": [
+        "flightsql",
+        "http"
+      ],
+      "expect": {
+        "rows": [
+          [
+            "false"
+          ]
+        ]
+      }
+    },
+    {
+      "query": "SELECT 2 != 3 AS value",
+      "protocols": [
+        "flightsql",
+        "http"
+      ],
+      "expect": {
+        "rows": [
+          [
+            "true"
+          ]
+        ]
+      }
+    },
+    {
+      "query": "SELECT 2 < 3 AS value",
+      "protocols": [
+        "flightsql",
+        "http"
+      ],
+      "expect": {
+        "rows": [
+          [
+            "true"
+          ]
+        ]
+      }
+    },
+    {
+      "query": "SELECT 2 <= 2 AS value",
+      "protocols": [
+        "flightsql",
+        "http"
+      ],
+      "expect": {
+        "rows": [
+          [
+            "true"
+          ]
+        ]
+      }
+    },
+    {
+      "query": "SELECT 3 > 2 AS value",
+      "protocols": [
+        "flightsql",
+        "http"
+      ],
+      "expect": {
+        "rows": [
+          [
+            "true"
+          ]
+        ]
+      }
+    },
+    {
+      "query": "SELECT 3 >= 3 AS value",
+      "protocols": [
+        "flightsql",
+        "http"
+      ],
+      "expect": {
+        "rows": [
+          [
+            "true"
+          ]
+        ]
+      }
+    },
+    {
+      "query": "SELECT NULL <=> NULL AS value",
+      "protocols": [
+        "flightsql",
+        "http"
+      ],
+      "expect": {
+        "rows": [
+          [
+            "true"
+          ]
+        ]
+      }
+    },
+    {
+      "query": "SELECT NULL IS DISTINCT FROM 1 AS value",
+      "protocols": [
+        "flightsql",
+        "http"
+      ],
+      "expect": {
+        "rows": [
+          [
+            "true"
+          ]
+        ]
+      }
+    },
+    {
+      "query": "SELECT NULL IS NOT DISTINCT FROM NULL AS value",
+      "protocols": [
+        "flightsql",
+        "http"
+      ],
+      "expect": {
+        "rows": [
+          [
+            "true"
+          ]
+        ]
+      }
+    },
+    {
+      "query": "SELECT TRUE AND NULL AS value",
+      "protocols": [
+        "flightsql",
+        "http"
+      ],
+      "expect": {
+        "rows": [
+          [
+            null
+          ]
+        ]
+      }
+    },
+    {
+      "query": "SELECT FALSE AND NULL AS value",
+      "protocols": [
+        "flightsql",
+        "http"
+      ],
+      "expect": {
+        "rows": [
+          [
+            "false"
+          ]
+        ]
+      }
+    },
+    {
+      "query": "SELECT TRUE OR NULL AS value",
+      "protocols": [
+        "flightsql",
+        "http"
+      ],
+      "expect": {
+        "rows": [
+          [
+            "true"
+          ]
+        ]
+      }
+    },
+    {
+      "query": "SELECT NOT NULL::BOOLEAN AS value",
+      "protocols": [
+        "flightsql",
+        "http"
+      ],
+      "expect": {
+        "rows": [
+          [
+            null
+          ]
+        ]
+      }
+    },
+    {
+      "query": "SELECT 6 & 3 AS value",
+      "protocols": [
+        "flightsql",
+        "http"
+      ],
+      "expect": {
+        "rows": [
+          [
+            "2"
+          ]
+        ]
+      }
+    },
+    {
+      "query": "SELECT 6 | 3 AS value",
+      "protocols": [
+        "flightsql",
+        "http"
+      ],
+      "expect": {
+        "rows": [
+          [
+            "7"
+          ]
+        ]
+      }
+    },
+    {
+      "query": "SELECT 6 # 3 AS value",
+      "protocols": [
+        "flightsql",
+        "http"
+      ],
+      "expect": {
+        "rows": [
+          [
+            "5"
+          ]
+        ]
+      }
+    },
+    {
+      "query": "SELECT 6 >> 1 AS value",
+      "protocols": [
+        "flightsql",
+        "http"
+      ],
+      "expect": {
+        "rows": [
+          [
+            "3"
+          ]
+        ]
+      }
+    },
+    {
+      "query": "SELECT 3 << 1 AS value",
+      "protocols": [
+        "flightsql",
+        "http"
+      ],
+      "expect": {
+        "rows": [
+          [
+            "6"
+          ]
+        ]
+      }
+    },
+    {
+      "query": "SELECT 'ab' || 'cd' AS value",
+      "protocols": [
+        "flightsql",
+        "http"
+      ],
+      "expect": {
+        "rows": [
+          [
+            "abcd"
+          ]
+        ]
+      }
+    },
+    {
+      "query": "SELECT CAST(42 AS VARCHAR) AS value",
+      "protocols": [
+        "flightsql",
+        "http"
+      ],
+      "expect": {
+        "rows": [
+          [
+            "42"
+          ]
+        ]
+      }
+    },
+    {
+      "query": "SELECT '42'::BIGINT AS value",
+      "protocols": [
+        "flightsql",
+        "http"
+      ],
+      "expect": {
+        "rows": [
+          [
+            "42"
+          ]
+        ]
+      }
+    },
+    {
+      "query": "SELECT 'Apple' ~* 'apple' AS value",
+      "protocols": [
+        "flightsql",
+        "http"
+      ],
+      "expect": {
+        "rows": [
+          [
+            "true"
+          ]
+        ]
+      }
+    },
+    {
+      "query": "SELECT 'Apple' !~ 'apple' AS value",
+      "protocols": [
+        "flightsql",
+        "http"
+      ],
+      "expect": {
+        "rows": [
+          [
+            "true"
+          ]
+        ]
+      }
+    },
+    {
+      "query": "SELECT [1,2,3] @> [1,2] AS value",
+      "protocols": [
+        "flightsql",
+        "http"
+      ],
+      "expect": {
+        "rows": [
+          [
+            "true"
+          ]
+        ]
+      }
+    },
+    {
+      "query": "SELECT [1,2] <@ [1,2,3] AS value",
+      "protocols": [
+        "flightsql",
+        "http"
+      ],
+      "expect": {
+        "rows": [
+          [
+            "true"
+          ]
+        ]
+      }
+    }
+  ]
+}

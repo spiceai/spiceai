@@ -15,7 +15,7 @@
 
 [![GitHub Actions Workflow Status - build](https://img.shields.io/github/actions/workflow/status/spiceai/spiceai/build_nightly.yml?branch=trunk&label=build)](https://github.com/spiceai/spiceai/actions/workflows/build_nightly.yml?query=branch%3Atrunk)
 [![GitHub Actions Workflow Status - docker build](https://img.shields.io/github/actions/workflow/status/spiceai/spiceai/spiced_docker_dev.yml?branch=trunk&label=docker%20build)](https://github.com/spiceai/spiceai/actions/workflows/spiced_docker_dev.yml?query=branch%3Atrunk)
-[![GitHub Actions Workflow Status - unit tests](https://img.shields.io/github/actions/workflow/status/spiceai/spiceai/build_and_release.yml?branch=trunk&label=unit%20tests)](https://github.com/spiceai/spiceai/actions/workflows/build_and_release.yml?query=branch%3Atrunk)
+[![GitHub Actions Workflow Status - unit tests](https://img.shields.io/github/actions/workflow/status/spiceai/spiceai/build_release.yml?branch=trunk&label=unit%20tests)](https://github.com/spiceai/spiceai/actions/workflows/build_release.yml?query=branch%3Atrunk)
 [![GitHub Actions Workflow Status - integration tests](https://img.shields.io/github/actions/workflow/status/spiceai/spiceai/integration.yml?branch=trunk&label=integration%20tests)](https://github.com/spiceai/spiceai/actions/workflows/integration.yml?query=branch%3Atrunk)
 
 </div>
@@ -104,7 +104,7 @@ Spice extends Apache Ballista with **multi-active scheduler HA coordinated throu
 
 ### Spice Cayenne — the acceleration engine that powers Spice
 
-Cayenne is built on the [Vortex columnar format](https://github.com/vortex-data/vortex) and a transactional SQLite (or Turso) metastore, and is tuned end to end for high-rate CDC ingestion and low-latency queries on the same table — multi-file acceleration without DuckDB's single-file ceiling. **Generally available** since v2.0, it runs fully in RAM (`mode: memory`) or durably on local disk or S3 Express One Zone (`mode: file`), with an optional cold tier on object storage.
+Cayenne is built on the [Vortex columnar format](https://github.com/vortex-data/vortex) and a transactional SQLite metastore, and is tuned end to end for high-rate CDC ingestion and low-latency queries on the same table — multi-file acceleration without DuckDB's single-file ceiling. **Generally available** since v2.0, it runs fully in RAM (`mode: memory`) or durably on local disk or S3 Express One Zone (`mode: file`), with an optional cold tier on object storage.
 
 - **Point lookups and selective joins** — `indexes` builds secondary indexes, so a lookup that pins every indexed column to a value reads the matching rows instead of scanning, and in `mode: file` a selective hash join probes the index with its join keys instead of scanning the table.
 - **A data layout that prunes** — In `mode: file`, `cayenne_cluster_by` (or `CREATE TABLE … CLUSTER BY`) clusters the rows in every tier's data files on one or more columns, and full refreshes write key-range files, so filtered queries open only the files that can match.
@@ -123,7 +123,7 @@ Connect to any Iceberg catalog (REST, AWS Glue, Hadoop), query tables with full 
 
 ### Petabyte-scale hybrid search
 
-Native **Amazon S3 Vectors** (Day 1 launch partner) for billions of vectors at up to 90% lower cost than traditional vector DBs. Plus DuckDB HNSW and Elasticsearch kNN as `.vectors.engine` backends. Spice manages the full lifecycle — ingestion → embedding (AWS Bedrock, Google Vertex AI, HuggingFace, OpenAI, Model2Vec for 500x faster static embeddings, multi-vector ColBERT-style late interaction with MaxSim) → indexing → query. Vector and full-text indexes serve from a warm in-memory tier by default, and full-text search pushes SQL filters down into the Tantivy index. SQL-integrated via `vector_search`, `text_search`, `rrf` (reciprocal rank fusion), and `rerank` UDTFs.
+Native **Amazon S3 Vectors** (Day 1 launch partner) for billions of vectors at up to 90% lower cost than traditional vector DBs. Plus Elasticsearch kNN as a `.vectors.engine` backend, and Cayenne indexes embedding columns for `vector_search` itself. Spice manages the full lifecycle — ingestion → embedding (AWS Bedrock, Google Vertex AI, HuggingFace, OpenAI, Model2Vec for 500x faster static embeddings, multi-vector ColBERT-style late interaction with MaxSim) → indexing → query. Vector and full-text indexes serve from a warm in-memory tier by default, and full-text search pushes SQL filters down into the Tantivy index. SQL-integrated via `vector_search`, `text_search`, `rrf` (reciprocal rank fusion), and `rerank` UDTFs.
 
 ```sql
 SELECT * FROM rerank(
@@ -291,12 +291,14 @@ See more demos on [YouTube](https://www.youtube.com/playlist?list=PLesJrUXEx3U9a
 | Name       | Description                       | Status            | Engine Modes     |
 | ---------- | --------------------------------- | ----------------- | ---------------- |
 | `cayenne`  | [Spice Cayenne (Vortex)][cayenne] | Stable            | `memory`, `file` |
-| `arrow`    | [In-Memory Arrow Records][arrow]  | Stable            | `memory`         |
-| `duckdb`   | Embedded [DuckDB][duckdb]         | Stable            | `memory`, `file` |
-| `postgres` | Attached [PostgreSQL][postgres] (Spice.ai Enterprise) | Release Candidate | N/A |
-| `sqlite`   | Embedded [SQLite][sqlite]         | Release Candidate | `memory`, `file` |
+| `arrow`    | [In-Memory Arrow Records][arrow]  | Deprecated        | `memory`         |
+| `duckdb`   | Embedded [DuckDB][duckdb]         | Deprecated        | `memory`, `file` |
+| `postgres` | Attached [PostgreSQL][postgres] (Spice.ai Enterprise) | Deprecated | N/A |
+| `sqlite`   | Embedded [SQLite][sqlite]         | Deprecated        | `memory`, `file` |
 
-An acceleration with no `engine` uses `cayenne`, or `arrow` on Windows.
+An acceleration with no `engine` uses `cayenne`.
+
+Every accelerator other than `cayenne` is deprecated in v2.4 and will be removed in v2.5. Spice logs a warning naming the datasets and views still using one; set `engine: cayenne` (or remove `engine`) on each to migrate, then delete the old engine's acceleration files and snapshots. Accelerations that hold data their source does not, such as `write_mode: acceleration`, should stay on v2.4 until that data is moved. See the [migration guide](https://spiceai.org/docs/components/data-accelerators/cayenne/migration).
 
 [arrow]: https://spiceai.org/docs/components/data-accelerators/arrow
 [cayenne]: https://spiceai.org/docs/components/data-accelerators/cayenne
@@ -339,8 +341,9 @@ Configured as `.vectors.engine` on a column-level embedding.
 | Name            | Description                                                          | Status |
 | --------------- | -------------------------------------------------------------------- | ------ |
 | `s3_vectors`    | Amazon S3 Vectors for petabyte-scale vector storage and querying     | Alpha  |
-| `duckdb`        | DuckDB with HNSW vector index                                        | Alpha  |
 | `elasticsearch`<sup>†</sup> | Elasticsearch with kNN                                  | Alpha  |
+
+The `duckdb` vector engine was removed in v2.5, and a dataset or view that sets it fails to load. A Cayenne acceleration indexes embedding columns for `vector_search` without a `vectors` block. See the [migration guide](https://spiceai.org/docs/components/data-accelerators/cayenne/migration#migrating-the-duckdb-vector-engine).
 
 <sup>†</sup> Available in Spice.ai Enterprise; not included in the open-source release binaries. To use it with the open-source runtime, build with `make install SPICED_NON_DEFAULT_FEATURES=elasticsearch`.
 
@@ -454,7 +457,13 @@ On **Windows** using PowerShell:
 iex ((New-Object System.Net.WebClient).DownloadString("https://install.spiceai.org/Install.ps1"))
 ```
 
-> **Note:** Native Windows runtime builds are not provided in v2.0+. Use [WSL](https://learn.microsoft.com/en-us/windows/wsl/) for local development.
+> **Note:** The Spice runtime (`spiced`) does not run natively on Windows. Run it under [WSL](https://learn.microsoft.com/en-us/windows/wsl/) with the Linux CLI, or in Docker from the directory that holds your `spicepod.yaml`:
+>
+> ```powershell
+> docker run -p 8090:8090 -p 50051:50051 -v "${PWD}:/app" spiceai/spiceai --http 0.0.0.0:8090 --flight 0.0.0.0:50051
+> ```
+>
+> The Windows `spice` CLI connects to a runtime in WSL or Docker on its default ports, so `spice sql` and `spice status` work from PowerShell. `spice run` and `spice install` on native Windows point you to WSL.
 
 ### Usage
 

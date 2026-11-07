@@ -1,0 +1,1805 @@
+/*
+Copyright 2024-2026 The Spice.ai OSS Authors
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+     https://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+*/
+
+//! Runs a script: once per matrix combination, on every *instance* — a
+//! `spiced` binary (a target) crossed with a variant.
+//!
+//! Instances run either in lockstep (every instance finishes a step before
+//! any starts the next) or one after another. Either way each query's final
+//! answer is kept, and after the run every instance's answer is compared with
+//! the first instance's, so variants and targets must agree even where the
+//! script names no oracle.
+
+use std::{
+    collections::BTreeMap,
+    fmt::Write as _,
+    path::{Path, PathBuf},
+    sync::Arc,
+    time::{Duration, Instant},
+};
+
+use anyhow::{Context, Result, anyhow, bail, ensure};
+
+use arrow::array::RecordBatch;
+
+use indexmap::IndexMap;
+
+use serde_json::{Map, Value, json};
+
+use crate::{
+    compare,
+    script::{Action, RunVariants, Script, Step, Timing, VariantSpec, matrix_combinations},
+    source::{self, Source},
+    spiced::{ContainerRun, Spiced},
+    template,
+};
+
+tokio::task_local! {
+    /// Under `--jobs`, a script's output, printed whole when it finishes so
+    /// that scripts running side by side do not interleave their lines.
+    static OUTPUT: std::cell::RefCell<String>;
+}
+
+/// Writes a line of a script's output: to its buffer under `--jobs`, else
+/// straight out.
+pub(crate) fn emit(line: &str) {
+    let buffered = OUTPUT.try_with(|out| {
+        let mut out = out.borrow_mut();
+        out.push_str(line);
+        out.push('\n');
+    });
+    if buffered.is_err() {
+        println!("{line}");
+    }
+}
+
+macro_rules! say {
+    ($($arg:tt)*) => { $crate::runner::emit(&format!($($arg)*)) };
+}
+
+mod api;
+mod background;
+mod checks;
+mod cluster;
+mod generators;
+mod query;
+mod steps;
+
+use api::{http_step, refresh, source_query, spice_cli};
+use background::{start_background, stop_background};
+use checks::{assert_files, assert_log, assert_status, metric_value, wait_metric};
+use cluster::{
+    cluster_args, make_cluster_ready, start_executors, undistributed_engine,
+    unpartitionable_acceleration,
+};
+use generators::{random_queries, run_slt, tlp};
+use query::{check_error_text, explain, run_query};
+use steps::{describe, one_line, run_instance_step, run_source_step};
+
+/// Runs `work` with its output collected instead of printed, and returns
+/// both.
+async fn buffered<T>(work: impl std::future::Future<Output = T>) -> (T, String) {
+    OUTPUT
+        .scope(std::cell::RefCell::new(String::new()), async {
+            let value = work.await;
+            let out = OUTPUT.with(std::cell::RefCell::take);
+            (value, out)
+        })
+        .await
+}
+
+/// Runs a script with its output collected instead of printed, and returns
+/// both.
+pub async fn run_script_buffered(
+    script: &Script,
+    options: &Options,
+    slots: &Slots,
+) -> (Result<Report>, String) {
+    buffered(run_script(script, options, slots)).await
+}
+
+/// The `--jobs` budget: one slot per `spiced` process running at once.
+/// Waiters are served in the order they asked, so the longest scripts, which
+/// ask first, start first.
+pub struct Slots {
+    semaphore: Arc<tokio::sync::Semaphore>,
+    size: u32,
+}
+
+impl Slots {
+    pub fn new(size: usize) -> Self {
+        let size = u32::try_from(size.max(1)).unwrap_or(u32::MAX);
+        Self {
+            semaphore: Arc::new(tokio::sync::Semaphore::new(size as usize)),
+            size,
+        }
+    }
+
+    /// Waits for `n` slots (all of them when `n` is more than there are),
+    /// counting the time they are held toward each of `busy`.
+    async fn take(&self, n: u32, busy: &[Arc<Busy>]) -> Result<Held> {
+        let permit = Arc::clone(&self.semaphore)
+            .acquire_many_owned(n.clamp(1, self.size))
+            .await
+            .context("the --jobs budget was closed")?;
+        for b in busy {
+            b.enter();
+        }
+        Ok(Held {
+            _permit: permit,
+            busy: busy.to_vec(),
+        })
+    }
+}
+
+/// The time a script, or one of its matrix combinations, holds slots: the
+/// time it runs, without the time it waits for them. Overlapping holds by
+/// several instances count once.
+#[derive(Default)]
+pub struct Busy(parking_lot::Mutex<BusyState>);
+
+#[derive(Default)]
+struct BusyState {
+    holding: usize,
+    since: Option<Instant>,
+    total: Duration,
+}
+
+impl Busy {
+    fn enter(&self) {
+        self.enter_at(Instant::now());
+    }
+
+    fn leave(&self) {
+        self.leave_at(Instant::now());
+    }
+
+    pub fn total(&self) -> Duration {
+        self.total_at(Instant::now())
+    }
+
+    // The `_at` forms take the clock reading, so a test can drive them with
+    // exact instants instead of sleeping.
+    fn enter_at(&self, now: Instant) {
+        let mut state = self.0.lock();
+        if state.holding == 0 {
+            state.since = Some(now);
+        }
+        state.holding += 1;
+    }
+
+    fn leave_at(&self, now: Instant) {
+        let mut state = self.0.lock();
+        state.holding = state.holding.saturating_sub(1);
+        if state.holding == 0
+            && let Some(since) = state.since.take()
+        {
+            state.total += now.saturating_duration_since(since);
+        }
+    }
+
+    fn total_at(&self, now: Instant) -> Duration {
+        let state = self.0.lock();
+        state.total
+            + state
+                .since
+                .map_or(Duration::ZERO, |since| now.saturating_duration_since(since))
+    }
+}
+
+/// [`Slots`] taken for one matrix combination of a script, their time counted
+/// toward the script's tracker and the combination's.
+struct ComboSlots<'a> {
+    slots: &'a Slots,
+    busy: [Arc<Busy>; 2],
+}
+
+impl ComboSlots<'_> {
+    async fn take(&self, n: u32) -> Result<Held> {
+        self.slots.take(n, &self.busy).await
+    }
+}
+
+/// Slots taken from [`Slots`]; their time counts toward each tracker until
+/// they are dropped.
+struct Held {
+    _permit: tokio::sync::OwnedSemaphorePermit,
+    busy: Vec<Arc<Busy>>,
+}
+
+impl Drop for Held {
+    fn drop(&mut self) {
+        for b in &self.busy {
+            b.leave();
+        }
+    }
+}
+
+/// The `spiced` processes one instance of `script` runs at once: itself, and
+/// its executors on a cluster.
+fn instance_weight(script: &Script, options: &Options) -> u32 {
+    let cluster = (options.cluster || script.defaults.cluster.is_some())
+        && script.defaults.executor_args.is_none();
+    let processes = if cluster {
+        1 + script.defaults.cluster.as_ref().map_or(1, |c| c.executors)
+    } else {
+        1 + usize::from(script.defaults.executor_args.is_some())
+    };
+    u32::try_from(processes).unwrap_or(u32::MAX)
+}
+
+/// How a combination's instances run.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Schedule {
+    /// Each instance is a job of its own, holding its slots while it runs.
+    Independent,
+    /// Every instance a step at a time, for scripts whose variants work
+    /// together or that stop and start a source all instances share.
+    Lockstep,
+    /// Alone, one instance after another, holding every slot.
+    Exclusive,
+}
+
+fn schedule(script: &Script, steps: &[Step]) -> Schedule {
+    if script.defaults.exclusive {
+        Schedule::Exclusive
+    } else if script.defaults.run_variants == RunVariants::SideBySide
+        || steps.iter().any(|s| {
+            matches!(
+                s.action,
+                Action::StartSource(_)
+                    | Action::StopSource(_)
+                    | Action::PauseSource(_)
+                    | Action::UnpauseSource(_)
+            )
+        })
+    {
+        Schedule::Lockstep
+    } else {
+        Schedule::Independent
+    }
+}
+
+const DEFAULT_READY_TIMEOUT: Duration = Duration::from_mins(3);
+
+/// `--max-wait`: the longest any wait for a condition may take, whatever the
+/// script asks for. Scripts that are expected to fail pay every wait in full,
+/// so a run of them is bounded by this instead.
+static MAX_WAIT: std::sync::OnceLock<Duration> = std::sync::OnceLock::new();
+
+/// Sets `--max-wait` for this run.
+pub fn set_max_wait(limit: Duration) {
+    let _ = MAX_WAIT.set(limit);
+}
+
+/// A wait's limit, capped by `--max-wait`.
+fn max_wait(limit: Duration) -> Duration {
+    MAX_WAIT.get().map_or(limit, |cap| limit.min(*cap))
+}
+
+/// Whether a check's attempt under `timing`, retried since `started`, is its
+/// outcome: `None` to try again.
+fn settled<T>(timing: Timing, started: Instant, attempt: Result<T>) -> Option<Result<T>> {
+    match (timing, attempt) {
+        (Timing::Once, result) => Some(result),
+        (Timing::Eventually(_), Ok(seen)) => Some(Ok(seen)),
+        (Timing::Eventually(limit), Err(e)) if started.elapsed() >= max_wait(limit) => Some(Err(e)),
+        (Timing::Consistently(_), Err(e)) => Some(Err(e)),
+        (Timing::Consistently(limit), Ok(seen)) if started.elapsed() >= limit => Some(Ok(seen)),
+        _ => None,
+    }
+}
+
+const POLL: Duration = Duration::from_millis(500);
+
+#[derive(Debug, Clone)]
+pub struct Target {
+    pub name: String,
+    pub binary: PathBuf,
+}
+
+pub struct Options {
+    pub targets: Vec<Target>,
+    /// `--from`: the binary every instance starts on, in place of any
+    /// script's `from:`; an `upgrade` step moves it to its target's.
+    pub from_override: Option<PathBuf>,
+    /// Each rendered `from:` of the selected runs, with its release and binary.
+    pub releases: BTreeMap<String, crate::release::BaseRelease>,
+    /// Run every instance as a cluster scheduler with one executor.
+    pub cluster: bool,
+    pub work_dir: PathBuf,
+    pub keep: bool,
+    pub spice_cli: PathBuf,
+    /// The directory holding this run's node mTLS CA and certificates
+    /// (`ca.crt`, `<role>.crt`, `<role>.key`), generated when it starts.
+    pub pki: PathBuf,
+    /// `--log-capture`: where a script with a failure leaves its logs.
+    pub log_capture: Option<PathBuf>,
+}
+
+/// A failed check: where it ran, which step, and what went wrong.
+#[derive(Debug, Clone)]
+pub struct Failure {
+    /// The script and matrix combination, as `name[key=value,…]`.
+    pub run: String,
+    /// The instance, `variants` for a comparison between them, or empty for
+    /// the combination as a whole.
+    pub who: String,
+    pub step: usize,
+    /// The step's ledger key; for a failure outside any step, its kind.
+    pub key: String,
+    pub what: String,
+    /// Within a generator step, the generated query's number.
+    pub query: Option<u64>,
+    /// Within a generator step, the known-defect shapes the query contains.
+    pub labels: Vec<String>,
+    pub message: String,
+}
+
+impl Failure {
+    /// A failure outside any step: starting sources or instances.
+    fn outside_steps(run: &str, who: &str, message: &str) -> Self {
+        Self {
+            run: run.to_string(),
+            who: who.to_string(),
+            step: 0,
+            key: "setup".into(),
+            what: "setup".into(),
+            query: None,
+            labels: Vec::new(),
+            message: message.to_string(),
+        }
+    }
+
+    /// Whether this failure is outside any step; steps are numbered from 1.
+    pub fn is_outside_steps(&self) -> bool {
+        self.step == 0 && self.what == "setup"
+    }
+}
+
+impl std::fmt::Display for Failure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let who = if self.who.is_empty() {
+            String::new()
+        } else {
+            format!(" {}", self.who)
+        };
+        let query = self
+            .query
+            .map(|q| format!(" query {q}"))
+            .unwrap_or_default();
+        write!(
+            f,
+            "{}{who} step {} {}{query}\n{}",
+            self.run, self.step, self.what, self.message
+        )
+    }
+}
+
+/// A generator step's failed queries, each a failure of its own.
+#[derive(Debug)]
+pub(super) struct QueryFailures {
+    pub summary: String,
+    pub failed: Vec<QueryFailure>,
+}
+
+#[derive(Debug)]
+pub(super) struct QueryFailure {
+    pub number: u64,
+    pub text: String,
+    pub problem: String,
+    pub labels: Vec<String>,
+}
+
+impl std::fmt::Display for QueryFailures {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.summary)
+    }
+}
+
+impl std::error::Error for QueryFailures {}
+
+#[derive(Default)]
+pub struct Report {
+    pub passed: usize,
+    pub failures: Vec<Failure>,
+    /// How long the script held slots: its run time, without the time it
+    /// waited for them.
+    pub ran: Duration,
+}
+
+struct Instance {
+    label: String,
+    variant: String,
+    spiced: Spiced,
+    /// The binary under test, which an `upgrade` step starts.
+    target_binary: PathBuf,
+    base_release: Option<crate::release::BaseRelease>,
+    /// The cluster executors started beside `spiced` (by `--cluster`,
+    /// `defaults.cluster` or `defaults.executor-args`), spares last.
+    executors: Vec<Spiced>,
+    /// How many of `executors` the cluster runs; the rest are spares that
+    /// `add-executor` starts one at a time.
+    active_executors: usize,
+    spicepod_yaml: String,
+    /// The rendered spicepod, which `patch:` on a start changes.
+    spicepod: Value,
+    /// The namespace this instance owns in each source.
+    namespaces: BTreeMap<String, String>,
+    /// Set when a lifecycle step failed; later steps are skipped.
+    broken: Option<String>,
+    /// The final answer of each query step, by step index.
+    answers: BTreeMap<usize, Vec<RecordBatch>>,
+    /// Answers of queries that carry an `id`.
+    named: BTreeMap<String, Vec<RecordBatch>>,
+    /// What `${…}` placeholders resolve to, in the spicepod and in step SQL.
+    context: Value,
+    /// The `spice` CLI that `spice` steps run.
+    spice_cli: PathBuf,
+    /// Generated inputs shared across runs (TPC-H files).
+    cache_dir: PathBuf,
+    /// Work running in the background, by id, until a `stop-background`.
+    background: BTreeMap<String, Background>,
+    /// `/metrics` scrapes taken by `mark-metrics`, by id.
+    metric_marks: BTreeMap<String, String>,
+    /// When this instance began each corpus's queries, by corpus position:
+    /// the start of the `eventually` limit they share.
+    corpus_started: BTreeMap<usize, Instant>,
+}
+
+/// How long `spiced` gets to shut down after SIGTERM before `stop` and
+/// `restart` count the shutdown as failed.
+/// How long `stop` and `restart` steps give `spiced` to exit on SIGTERM: more
+/// than its own 30 s for draining connections, which clients still sending
+/// requests (a background reader) use in full.
+const STOP_TIMEOUT: Duration = Duration::from_secs(45);
+
+/// How long a finished script's instances get to stop on SIGTERM before they
+/// are killed. Shutdown itself is checked by `stop` and `restart` steps, at
+/// `STOP_TIMEOUT`; at the end of a script it only costs time.
+const TEARDOWN_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// The image cluster executors run in under `defaults.cluster.containers`:
+/// a Linux `spiced` needs nothing beyond its base libraries.
+const EXECUTOR_IMAGE: &str = "ubuntu:26.04";
+
+/// The partition assignment interval a cluster runs with (see
+/// `make_cluster_ready`).
+const CLUSTER_ASSIGNMENT_INTERVAL: &str = "2s";
+
+/// A background task and what it has seen so far.
+struct Background {
+    stop: Arc<std::sync::atomic::AtomicBool>,
+    tasks: Vec<tokio::task::JoinHandle<()>>,
+    stats: Arc<parking_lot::Mutex<BackgroundStats>>,
+}
+
+#[derive(Default)]
+struct BackgroundStats {
+    iterations: u64,
+    latencies: Vec<Duration>,
+    /// Every failure's time and message, in order.
+    errors: Vec<(chrono::DateTime<chrono::Utc>, String)>,
+}
+
+impl Instance {
+    fn sql(&self, text: &str) -> Result<String> {
+        template::substitute_text(text, &self.context)
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum SourceState {
+    Running,
+    Stopped,
+    Paused,
+}
+
+struct Sources {
+    by_name: IndexMap<String, Arc<dyn Source>>,
+    state: BTreeMap<String, SourceState>,
+    /// Each source's resolved kind (`postgres`, `mysql`).
+    kinds: BTreeMap<String, String>,
+}
+
+impl Sources {
+    fn get(&self, name: &str) -> Result<&dyn Source> {
+        self.by_name
+            .get(name)
+            .map(AsRef::as_ref)
+            .ok_or_else(|| anyhow!("unknown source '{name}'"))
+    }
+
+    async fn set(&mut self, name: &str, target: SourceState) -> Result<()> {
+        let current = *self
+            .state
+            .get(name)
+            .ok_or_else(|| anyhow!("unknown source '{name}'"))?;
+        if current == target {
+            return Ok(());
+        }
+        let container = self
+            .get(name)?
+            .container()
+            .ok_or_else(|| anyhow!("source '{name}' has no server to stop, start or pause"))?;
+        match (current, target) {
+            (a, b) if a == b => {}
+            (SourceState::Running, SourceState::Stopped) => container.stop().await?,
+            (SourceState::Running, SourceState::Paused) => container.pause().await?,
+            (SourceState::Stopped, SourceState::Running) => container.resume().await?,
+            (SourceState::Paused, SourceState::Running) => container.unpause().await?,
+            (SourceState::Paused, SourceState::Stopped) => {
+                container.unpause().await?;
+                container.stop().await?;
+            }
+            (SourceState::Stopped, SourceState::Paused) => {
+                bail!("source '{name}' is stopped; start it before pausing it")
+            }
+            _ => unreachable!("every pair of states is handled"),
+        }
+        self.state.insert(name.to_string(), target);
+        Ok(())
+    }
+}
+
+pub async fn run_script(script: &Script, options: &Options, slots: &Slots) -> Result<Report> {
+    let script_busy = Arc::new(Busy::default());
+    let runs = matrix_combinations(&script.matrix)
+        .into_iter()
+        .enumerate()
+        .map(|(combo_index, combo)| {
+            let script_busy = Arc::clone(&script_busy);
+            async move {
+                let run_label = script.run_label(&combo);
+                let run_id = format!(
+                    "{}-{combo_index}-{}",
+                    sanitize(&script.name),
+                    std::process::id()
+                );
+                buffered(async {
+                    match &script.description {
+                        Some(d) => say!("== {run_label}: {}", one_line(d, 120)),
+                        None => say!("== {run_label}"),
+                    }
+                    let started = Instant::now();
+                    let combo_busy = Arc::new(Busy::default());
+                    let combo_slots = ComboSlots {
+                        slots,
+                        busy: [Arc::clone(&script_busy), Arc::clone(&combo_busy)],
+                    };
+                    let mut report = Report::default();
+                    if let Err(e) = run_combination(
+                        script,
+                        options,
+                        &combo_slots,
+                        &combo,
+                        &run_id,
+                        &run_label,
+                        &mut report,
+                    )
+                    .await
+                    {
+                        report.failures.push(Failure::outside_steps(
+                            &run_label,
+                            "",
+                            &format!("{e:#}"),
+                        ));
+                    }
+                    let ran = combo_busy.total();
+                    say!(
+                        "== {run_label} finished: ran {:.1}s, waited {:.1}s for slots",
+                        ran.as_secs_f64(),
+                        started.elapsed().saturating_sub(ran).as_secs_f64()
+                    );
+                    report
+                })
+                .await
+            }
+        });
+    // Combinations run side by side as slots allow; their output keeps
+    // their order.
+    let mut report = Report::default();
+    for (part, out) in futures::future::join_all(runs).await {
+        say!("{}", out.trim_end_matches('\n'));
+        report.passed += part.passed;
+        report.failures.extend(part.failures);
+    }
+    report.ran = script_busy.total();
+    Ok(report)
+}
+
+async fn run_combination(
+    script: &Script,
+    options: &Options,
+    slots: &ComboSlots<'_>,
+    combo: &Map<String, Value>,
+    run_id: &str,
+    run_label: &str,
+    report: &mut Report,
+) -> Result<()> {
+    if options.from_override.is_none()
+        && let Some(from) = script.render_from(combo)?
+    {
+        let release = options
+            .releases
+            .get(&from)
+            .context("base release was not fetched")?;
+        say!("   from   v{} ({from})", release.version);
+    }
+    // The steps of this matrix combination.
+    let steps: Vec<Step> = script
+        .steps
+        .iter()
+        .filter(|s| when_matches(&s.when, combo))
+        .cloned()
+        .collect();
+    let schedule = schedule(script, &steps);
+    let weight = instance_weight(script, options);
+    let instance_count =
+        u32::try_from(options.targets.len() * script.variants.len().max(1)).unwrap_or(u32::MAX);
+    // Sources start only once the first instance has its slots, so waiting
+    // combinations hold no containers.
+    let first_permit = slots
+        .take(match schedule {
+            Schedule::Independent => weight,
+            Schedule::Lockstep => weight.saturating_mul(instance_count),
+            Schedule::Exclusive => u32::MAX,
+        })
+        .await?;
+    let mut sources = Sources {
+        by_name: IndexMap::new(),
+        state: BTreeMap::new(),
+        kinds: BTreeMap::new(),
+    };
+    let result = async {
+        let matrix_ctx = json!({ "matrix": combo });
+        let mut resolved = Vec::new();
+        for (name, spec) in &script.sources {
+            let kind = template::substitute_text(&spec.kind, &matrix_ctx)?;
+            let version = spec
+                .version
+                .as_deref()
+                .map(|v| template::substitute_text(v, &matrix_ctx))
+                .transpose()?;
+            resolved.push((name, spec, kind, version));
+        }
+        let mut duckdb_releases = Vec::new();
+        for (name, _, kind, version) in &resolved {
+            if matches!(kind.as_str(), "duckdb" | "ducklake") {
+                let release = source::duckdb_cli::version(version.as_deref())?;
+                duckdb_releases.push(((*name).clone(), kind.clone(), release));
+            }
+        }
+        one_duckdb_release(&duckdb_releases)?;
+        for (name, spec, kind, version) in resolved {
+            let src = source::start(
+                name,
+                run_id,
+                &kind,
+                version.as_deref(),
+                &options.work_dir.join(run_id).join("sources"),
+                spec,
+            )
+            .await
+            .with_context(|| format!("Failed to start source '{name}' ({kind})"))?;
+            sources.by_name.insert(name.clone(), Arc::from(src));
+            sources.state.insert(name.clone(), SourceState::Running);
+            sources.kinds.insert(name.clone(), kind);
+        }
+        let mut instances = create_instances(script, options, combo, run_id, &sources).await?;
+        match schedule {
+            Schedule::Lockstep => {
+                run_lockstep(
+                    script,
+                    &steps,
+                    &mut instances,
+                    &mut sources,
+                    report,
+                    run_label,
+                )
+                .await;
+            }
+            Schedule::Exclusive => {
+                for instance in &mut instances {
+                    for name in script.sources.keys() {
+                        sources.set(name, SourceState::Running).await?;
+                    }
+                    run_sequential(script, &steps, instance, &mut sources, report, run_label).await;
+                }
+            }
+            Schedule::Independent => {
+                run_independent(
+                    script,
+                    &steps,
+                    &mut instances,
+                    &sources,
+                    slots,
+                    weight,
+                    first_permit,
+                    report,
+                    run_label,
+                )
+                .await;
+            }
+        }
+        if script.defaults.compare_variants {
+            let all: Vec<&Instance> = instances.iter().collect();
+            compare_instances(
+                &steps,
+                &all,
+                script.defaults.compare_to.as_deref(),
+                report,
+                run_label,
+            )?;
+        } else if options.targets.len() > 1 {
+            // Variants may differ from one another, but each answers the same
+            // on every binary.
+            let mut by_variant: IndexMap<&str, Vec<&Instance>> = IndexMap::new();
+            for instance in &instances {
+                by_variant
+                    .entry(instance.variant.as_str())
+                    .or_default()
+                    .push(instance);
+            }
+            for group in by_variant.values() {
+                compare_instances(&steps, group, None, report, run_label)?;
+            }
+        }
+        // Every process of every instance at once.
+        let mut stopping = Vec::new();
+        for instance in &mut instances {
+            stopping.push(instance.spiced.stop(TEARDOWN_TIMEOUT));
+            for executor in &mut instance.executors {
+                stopping.push(executor.stop(TEARDOWN_TIMEOUT));
+            }
+        }
+        let _ = futures::future::join_all(stopping).await;
+        for instance in &mut instances {
+            if !instance.answers.is_empty() || instance.broken.is_some() {
+                say!(
+                    "   {} log: {}",
+                    instance.label,
+                    instance.spiced.log_path().display()
+                );
+            }
+        }
+        Ok::<_, anyhow::Error>(())
+    }
+    .await;
+
+    if let Some(root) = &options.log_capture
+        && (result.is_err() || !report.failures.is_empty())
+    {
+        let dir = combination_capture_dir(&capture_dir(root, script), script, run_label);
+        capture_combination(&sources, run_id, &options.work_dir.join(run_id), &dir).await;
+    }
+    if !options.keep {
+        for src in sources.by_name.values() {
+            if let Err(e) = src.remove().await {
+                say!("warning: {e:#}");
+            }
+        }
+    }
+    result
+}
+
+/// `--log-capture`'s directory for a script: one per script, by name.
+pub fn capture_dir(root: &Path, script: &Script) -> PathBuf {
+    root.join(sanitize(&script.name))
+}
+
+/// A matrix combination's directory within its script's: the script's own
+/// for a script without a matrix, else one named by the combination's values.
+fn combination_capture_dir(script_dir: &Path, script: &Script, run_label: &str) -> PathBuf {
+    let dir_name = |label: &str| {
+        label
+            .strip_prefix(script.name.as_str())
+            .map(|combo| sanitize(combo).trim_matches('_').to_string())
+            .unwrap_or_default()
+    };
+    let labels = script.run_labels();
+    let names: Vec<String> = labels.iter().map(|label| dir_name(label)).collect();
+    let name = match labels.iter().position(|label| label == run_label) {
+        Some(index) => distinct_name(&names, index),
+        None => dir_name(run_label),
+    };
+    if name.is_empty() {
+        script_dir.to_path_buf()
+    } else {
+        script_dir.join(name)
+    }
+}
+
+/// `names[index]`, a [`sanitize`]d name, followed by its position after a
+/// `-` when another of `names` is the same. Names that differ only in case or
+/// punctuation (`a-b` and `a_b`) sanitize the same, and the `-` is never part
+/// of a sanitized name, so the result names only this one.
+fn distinct_name(names: &[String], index: usize) -> String {
+    let name = &names[index];
+    if names.iter().filter(|other| *other == name).count() > 1 {
+        format!("{name}-{}", index + 1)
+    } else {
+        name.clone()
+    }
+}
+
+/// Saves what a failed combination leaves to read into `dir`: each source
+/// container's output as `<source>.log`, for a failure that may be the
+/// source's (a broker that never came back, a database that restarted into
+/// recovery), and from `work`, the run's directory, every instance's
+/// `spiced.log`, spicepod, sqllogictest reports and random-query
+/// failures at their paths there.
+/// A log that cannot be saved is a warning: the run's own failure is the one
+/// to report.
+async fn capture_combination(sources: &Sources, run_id: &str, work: &Path, dir: &Path) {
+    if let Err(e) = tokio::fs::create_dir_all(dir).await {
+        say!("warning: Failed to create {}: {e}", dir.display());
+        return;
+    }
+    // Containers are named `spicescript-<run id>-<source>[-<part>]`.
+    let prefix = format!("spicescript-{run_id}-");
+    let containers: Vec<_> = sources
+        .by_name
+        .values()
+        .flat_map(|src| src.containers())
+        .collect();
+    let names: Vec<String> = containers
+        .iter()
+        .map(|container| {
+            sanitize(
+                container
+                    .name
+                    .strip_prefix(&prefix)
+                    .unwrap_or(&container.name),
+            )
+        })
+        .collect();
+    for (index, container) in containers.iter().enumerate() {
+        let path = dir.join(format!("{}.log", distinct_name(&names, index)));
+        if let Err(e) = container.save_logs(&path).await {
+            say!("warning: {e:#}");
+        }
+    }
+    let (work, to) = (work.to_path_buf(), dir.to_path_buf());
+    match tokio::task::spawn_blocking(move || copy_instance_logs(&work, &work, &to)).await {
+        Ok(Ok(())) => {}
+        Ok(Err(e)) => say!("warning: {e:#}"),
+        Err(e) => say!("warning: copying instance logs panicked: {e}"),
+    }
+    say!("   logs captured in {}", dir.display());
+}
+
+/// Copies the log-like files under `dir` (instance and executor
+/// `spiced.log`s, spicepods, sqllogictest reports) from `root` to `to`,
+/// keeping their paths below `root`; data files stay behind.
+fn copy_instance_logs(root: &Path, dir: &Path, to: &Path) -> Result<()> {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return Ok(());
+    };
+    for entry in entries {
+        let path = entry?.path();
+        if path.is_dir() {
+            copy_instance_logs(root, &path, to)?;
+            continue;
+        }
+        let name = path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or_default();
+        let wanted = name == "spiced.log"
+            || name == "spicepod.yaml"
+            || ((name.starts_with("slt-") || name.starts_with("random-queries-seed"))
+                && path.extension().is_some_and(|x| x == "txt"));
+        if !wanted {
+            continue;
+        }
+        let target = to.join(path.strip_prefix(root)?);
+        if let Some(parent) = target.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        std::fs::copy(&path, &target).with_context(|| {
+            format!("Failed to copy {} to {}", path.display(), target.display())
+        })?;
+    }
+    Ok(())
+}
+
+async fn create_instances(
+    script: &Script,
+    options: &Options,
+    combo: &Map<String, Value>,
+    run_id: &str,
+    sources: &Sources,
+) -> Result<Vec<Instance>> {
+    let default_variant = IndexMap::from([("default".to_string(), VariantSpec::default())]);
+    let variants = if script.variants.is_empty() {
+        &default_variant
+    } else {
+        &script.variants
+    };
+    let base_release = if options.from_override.is_none() {
+        script
+            .render_from(combo)?
+            .map(|from| {
+                options
+                    .releases
+                    .get(&from)
+                    .context("base release was not fetched")
+            })
+            .transpose()?
+    } else {
+        None
+    };
+    let release_binary = base_release.map(|release| &release.binary);
+    let mut instances = Vec::new();
+    for target in &options.targets {
+        for (variant_name, variant) in variants {
+            if !when_matches(&variant.when, combo) {
+                continue;
+            }
+            let index = instances.len();
+            let label = if options.targets.len() > 1 {
+                format!("{}/{variant_name}", target.name)
+            } else {
+                variant_name.clone()
+            };
+            let dir = options.work_dir.join(run_id).join(sanitize(&label));
+            let mut namespaces = BTreeMap::new();
+            let mut source_ctx = Map::new();
+            for (name, src) in &sources.by_name {
+                let namespace = format!("i{index}_{}", sanitize(variant_name));
+                let created = src.create_namespace(&namespace).await?;
+                let mut entry = created.extra;
+                entry.insert("namespace".into(), json!(namespace));
+                let kind = sources.kinds.get(name).map_or("", String::as_str);
+                let (from_prefix, from_suffix, file_based) = table_from(kind, &entry);
+                let mut table_params = created.params.clone();
+                if file_based && let Value::Object(map) = &mut table_params {
+                    map.entry("file_format").or_insert_with(|| json!("parquet"));
+                }
+                entry.insert("params".into(), created.params);
+                entry.insert("table_params".into(), table_params);
+                entry.insert("from_prefix".into(), json!(from_prefix));
+                entry.insert("from_suffix".into(), json!(from_suffix));
+                source_ctx.insert(name.clone(), Value::Object(entry));
+                namespaces.insert(name.clone(), namespace);
+            }
+            let context = json!({
+                "sources": source_ctx,
+                "matrix": combo,
+                "variant": { "name": variant_name },
+                "instance": { "name": label, "dir": dir.display().to_string(), "port": crate::docker::free_port()?,
+                    "executor_port": crate::docker::free_port()?, "http_port": crate::docker::free_port()? },
+                "script": { "dir": std::path::absolute(&script.dir)?.display().to_string() },
+                "pki": { "dir": options.pki.display().to_string() },
+            });
+            let mut spicepod = script.spicepod.clone();
+            template::apply_variant(&mut spicepod, variant)
+                .with_context(|| format!("variant '{variant_name}'"))?;
+            let mut spicepod = template::substitute(&spicepod, &context)?;
+            disable_results_cache_unless_configured(&mut spicepod);
+            let cluster = (options.cluster || script.defaults.cluster.is_some())
+                && script.defaults.executor_args.is_none();
+            let containers = cluster
+                && script
+                    .defaults
+                    .cluster
+                    .as_ref()
+                    .is_some_and(|c| c.containers);
+            if cluster {
+                if spicepod.pointer("/runtime/mode").and_then(Value::as_str) == Some("sidecar") {
+                    say!(
+                        "   skip {label:<20} runtime.mode: sidecar does not run as a cluster node"
+                    );
+                    continue;
+                }
+                if let Some(engine) = undistributed_engine(&spicepod) {
+                    // A cluster accelerates only into Cayenne and Arrow.
+                    say!("   skip {label:<20} the '{engine}' engine does not run in a cluster");
+                    continue;
+                }
+                if let Some(reason) = unpartitionable_acceleration(&spicepod) {
+                    say!("   skip {label:<20} {reason}");
+                    continue;
+                }
+                if containers && !cfg!(target_os = "linux") {
+                    // A container runs the binary under test, which must be
+                    // a Linux one, on the host's network.
+                    say!("   skip {label:<20} executors in containers run only on Linux");
+                    continue;
+                }
+                make_cluster_ready(&mut spicepod, &dir, &script.defaults.cluster_partition_by);
+            }
+            let context_for_steps = context.clone();
+            let spicepod_yaml = yaml::to_string(&spicepod)?;
+            let spicepod = spicepod.clone();
+            // Placeholders in a variant's environment name the run's sources, as in the spicepod.
+            let mut env = variant
+                .env
+                .iter()
+                .map(|(key, value)| Ok((key.clone(), template::substitute_text(value, &context)?)))
+                .collect::<Result<BTreeMap<_, _>>>()?;
+            // DuckDB sources install the library matching the CLI. Make it
+            // discoverable by name without changing the harness environment.
+            for entry in context["sources"]
+                .as_object()
+                .into_iter()
+                .flat_map(|sources| sources.values())
+            {
+                if let Some(dir) = entry.get("library_dir").and_then(Value::as_str) {
+                    let key = if cfg!(target_os = "macos") {
+                        "DYLD_FALLBACK_LIBRARY_PATH"
+                    } else {
+                        "LD_LIBRARY_PATH"
+                    };
+                    let previous = env.get(key).cloned().or_else(|| std::env::var(key).ok());
+                    let mut paths = vec![PathBuf::from(dir)];
+                    if let Some(previous) = previous {
+                        paths.extend(std::env::split_paths(&previous));
+                    } else if cfg!(target_os = "macos") {
+                        // Setting DYLD_FALLBACK_LIBRARY_PATH replaces its defaults.
+                        if let Some(home) = std::env::var_os("HOME") {
+                            paths.push(PathBuf::from(home).join("lib"));
+                        }
+                        paths.extend([PathBuf::from("/usr/local/lib"), PathBuf::from("/usr/lib")]);
+                    }
+                    env.insert(
+                        key.into(),
+                        std::env::join_paths(paths)?.into_string().map_err(|_| {
+                            anyhow::anyhow!("DuckDB library search path is not UTF-8")
+                        })?,
+                    );
+                }
+            }
+            // Spice derives replication slot names from this, so instances
+            // sharing a source do not take each other's slots.
+            env.insert("SPICE_INSTANCE_ID".into(), format!("{run_id}-{index}"));
+            let first_binary = options
+                .from_override
+                .as_ref()
+                .or(release_binary)
+                .cloned()
+                .unwrap_or_else(|| target.binary.clone());
+            let executor_count = script.defaults.cluster.as_ref().map_or(1, |c| c.executors);
+            let spare_count = script.defaults.cluster.as_ref().map_or(0, |c| c.spare);
+            let cluster_args = if cluster {
+                Some(cluster_args(
+                    &options.pki,
+                    &context,
+                    executor_count + spare_count,
+                )?)
+            } else {
+                None
+            };
+            let executor_args: Vec<Value> = match &cluster_args {
+                Some((_, executors)) => executors.iter().map(|a| json!(a)).collect(),
+                None => script
+                    .defaults
+                    .executor_args
+                    .iter()
+                    .map(|a| json!(a))
+                    .collect(),
+            };
+            let mut executors = Vec::new();
+            for (n, args) in executor_args.iter().enumerate() {
+                let name = if executor_args.len() == 1 {
+                    "executor".to_string()
+                } else {
+                    format!("executor-{n}")
+                };
+                // Each process its own identity: two live instances sharing one
+                // at a state location are refused.
+                let mut executor_env = env.clone();
+                executor_env.insert(
+                    "SPICE_INSTANCE_ID".into(),
+                    format!("{run_id}-{index}-{name}"),
+                );
+                let mut executor =
+                    Spiced::new(first_binary.clone(), dir.join(&name), executor_env)?;
+                let args = template::substitute(args, &context)?;
+                executor.set_extra_args(serde_json::from_value(args)?);
+                executor.set_api_key(script.defaults.api_key.clone())?;
+                if containers {
+                    let work_dir = std::path::absolute(&options.work_dir)?;
+                    let script_dir = std::path::absolute(&script.dir)?;
+                    executor.set_container(ContainerRun {
+                        image: EXECUTOR_IMAGE.to_string(),
+                        name: format!("spicescript-{}-{run_id}-{index}-{name}", std::process::id())
+                            .replace(|c: char| !c.is_ascii_alphanumeric() && c != '-', "-"),
+                        volumes: vec![
+                            format!("{0}:{0}", work_dir.display()),
+                            format!("{0}:{0}:ro", script_dir.display()),
+                            // The cluster's TLS clients load the system's root
+                            // certificates, which the image has none of.
+                            "/etc/ssl/certs:/etc/ssl/certs:ro".to_string(),
+                        ],
+                    });
+                }
+                executors.push(executor);
+            }
+            let mut spiced = Spiced::new(first_binary, dir, env)?;
+            if let Some(port) = context["instance"]["http_port"]
+                .as_u64()
+                .and_then(|p| u16::try_from(p).ok())
+            {
+                spiced.set_http_port(port);
+            }
+            spiced.set_api_key(script.defaults.api_key.clone())?;
+            spiced.set_tls(script.defaults.tls.as_ref().map(|t| script.dir.join(&t.ca)))?;
+            let args = template::substitute(&json!(script.defaults.spiced_args), &context)?;
+            let mut args: Vec<String> = serde_json::from_value(args)?;
+            if let Some((scheduler, _)) = &cluster_args {
+                args.extend(scheduler.iter().cloned());
+            }
+            spiced.set_extra_args(args);
+            instances.push(Instance {
+                label,
+                variant: variant_name.clone(),
+                spiced,
+                target_binary: target.binary.clone(),
+                base_release: base_release.cloned(),
+                active_executors: executors.len().saturating_sub(spare_count),
+                executors,
+                spicepod_yaml,
+                spicepod,
+                namespaces,
+                broken: None,
+                answers: BTreeMap::new(),
+                metric_marks: BTreeMap::new(),
+                named: BTreeMap::new(),
+                context: context_for_steps,
+                spice_cli: options.spice_cli.clone(),
+                background: BTreeMap::new(),
+                cache_dir: options.work_dir.join("cache"),
+                corpus_started: BTreeMap::new(),
+            });
+        }
+    }
+    Ok(instances)
+}
+
+fn is_source_step(action: &Action) -> bool {
+    matches!(
+        action,
+        Action::StartSource(_)
+            | Action::StopSource(_)
+            | Action::PauseSource(_)
+            | Action::UnpauseSource(_)
+            | Action::Sleep(_)
+    )
+}
+
+async fn run_lockstep(
+    script: &Script,
+    steps: &[Step],
+    instances: &mut [Instance],
+    sources: &mut Sources,
+    report: &mut Report,
+    run_label: &str,
+) {
+    for step in steps {
+        if is_source_step(&step.action) {
+            let outcome = run_source_step(&step.action, sources).await;
+            record(report, run_label, "all", step, outcome);
+            continue;
+        }
+        let shared: &Sources = sources;
+        let outcomes = futures::future::join_all(
+            instances
+                .iter_mut()
+                .filter(|i| i.broken.is_none() && applies(step, i))
+                .map(|instance| async move {
+                    let outcome = run_instance_step(script, instance, step, shared).await;
+                    (instance, outcome)
+                }),
+        )
+        .await;
+        for (instance, mut outcome) in outcomes {
+            note_broken(instance, step, &mut outcome).await;
+            record(report, run_label, &instance.label, step, outcome);
+        }
+    }
+}
+
+async fn run_sequential(
+    script: &Script,
+    steps: &[Step],
+    instance: &mut Instance,
+    sources: &mut Sources,
+    report: &mut Report,
+    run_label: &str,
+) {
+    for step in steps {
+        if instance.broken.is_some() || !applies(step, instance) {
+            continue;
+        }
+        let mut outcome = if is_source_step(&step.action) {
+            run_source_step(&step.action, sources).await
+        } else {
+            run_instance_step(script, instance, step, sources).await
+        };
+        note_broken(instance, step, &mut outcome).await;
+        record(report, run_label, &instance.label, step, outcome);
+    }
+}
+
+/// Runs each instance as a job of its own: the first on the slots the
+/// combination took, the others as slots free up. Each stops its processes
+/// as soon as it finishes, releasing its slots; its output and results join
+/// the combination's in instance order.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "one call site, each argument distinct"
+)]
+async fn run_independent(
+    script: &Script,
+    steps: &[Step],
+    instances: &mut [Instance],
+    sources: &Sources,
+    slots: &ComboSlots<'_>,
+    weight: u32,
+    first_permit: Held,
+    report: &mut Report,
+    run_label: &str,
+) {
+    let mut first_permit = Some(first_permit);
+    let jobs = instances.iter_mut().map(|instance| {
+        let held = first_permit.take();
+        buffered(async move {
+            let mut part = Report::default();
+            let _permit = match held {
+                Some(permit) => permit,
+                None => match slots.take(weight).await {
+                    Ok(permit) => permit,
+                    Err(e) => {
+                        part.failures.push(Failure::outside_steps(
+                            run_label,
+                            &instance.label,
+                            &format!("{e:#}"),
+                        ));
+                        return part;
+                    }
+                },
+            };
+            for step in steps {
+                if instance.broken.is_some() || !applies(step, instance) {
+                    continue;
+                }
+                let mut outcome = match &step.action {
+                    Action::Sleep(d) => {
+                        tokio::time::sleep(*d).await;
+                        Ok(String::new())
+                    }
+                    _ => run_instance_step(script, instance, step, sources).await,
+                };
+                note_broken(instance, step, &mut outcome).await;
+                record(&mut part, run_label, &instance.label, step, outcome);
+            }
+            stop_processes(instance).await;
+            part
+        })
+    });
+    for (part, out) in futures::future::join_all(jobs).await {
+        if !out.is_empty() {
+            say!("{}", out.trim_end_matches('\n'));
+        }
+        report.passed += part.passed;
+        report.failures.extend(part.failures);
+    }
+}
+
+/// Stops an instance's `spiced` and executors together.
+async fn stop_processes(instance: &mut Instance) {
+    let mut stopping = vec![instance.spiced.stop(TEARDOWN_TIMEOUT)];
+    for executor in &mut instance.executors {
+        stopping.push(executor.stop(TEARDOWN_TIMEOUT));
+    }
+    let _ = futures::future::join_all(stopping).await;
+}
+
+/// Whether every condition of a place (a variant, or `key=value` on the
+/// matrix) holds for the instance.
+fn at_place(place: &[String], instance: &Instance) -> bool {
+    place
+        .iter()
+        .all(|condition| match condition.split_once('=') {
+            Some((key, value)) => instance.context["matrix"]
+                .get(key)
+                .is_some_and(|v| match v {
+                    Value::String(s) => s == value,
+                    other => serde_json::from_str::<Value>(value).ok().as_ref() == Some(other),
+                }),
+            None => condition == instance.variant.as_str(),
+        })
+}
+
+fn applies(step: &Step, instance: &Instance) -> bool {
+    let variant = instance.variant.as_str();
+    (step.only.is_empty() || step.only.iter().any(|v| v == variant))
+        && !step.except.iter().any(|v| v == variant)
+}
+
+/// A failed lifecycle step leaves `spiced` in an unknown state, so the
+/// instance's remaining steps are skipped. Any other failed step is a failed
+/// check, and the script goes on.
+async fn note_broken(instance: &mut Instance, step: &Step, outcome: &mut Result<String>) {
+    let lifecycle = matches!(
+        step.action,
+        Action::Start { .. }
+            | Action::Stop
+            | Action::Kill { .. }
+            | Action::Restart { .. }
+            | Action::WaitReady { .. }
+    );
+    if outcome.is_ok() && matches!(step.action, Action::Start { .. } | Action::Restart { .. }) {
+        if let Err(error) = check_base_release_features(instance).await {
+            *outcome = Err(error);
+        }
+    } else if lifecycle
+        && instance.spiced.binary != instance.target_binary
+        && let Some(release) = &instance.base_release
+        && let Some(error) = outcome.as_ref().err()
+    {
+        *outcome = Err(anyhow::anyhow!(
+            "{error:#} (on base release v{})",
+            release.version
+        ));
+    }
+    if lifecycle && let Err(error) = outcome {
+        instance.broken = Some(format!("step {}: {error:#}", step.index));
+    }
+}
+
+async fn check_base_release_features(instance: &Instance) -> Result<()> {
+    if instance.spiced.binary == instance.target_binary {
+        return Ok(());
+    }
+    let Some(release) = &instance.base_release else {
+        return Ok(());
+    };
+    for spiced in std::iter::once(&instance.spiced)
+        .chain(instance.executors.iter().take(instance.active_executors))
+    {
+        let path = spiced.log_path();
+        let log = tokio::fs::read_to_string(&path)
+            .await
+            .with_context(|| format!("Failed to read {}", path.display()))?;
+        if let Some(message) = base_release_feature_gap(&log, &release.version, &release.spec) {
+            bail!("{message}");
+        }
+    }
+    Ok(())
+}
+
+fn base_release_feature_gap(log: &str, version: &str, spec: &str) -> Option<String> {
+    let text = checks::strip_ansi(log);
+    let line = text
+        .lines()
+        .find(|line| line.contains("included in the Enterprise distribution of Spice.ai"))?
+        .trim();
+    let line = line
+        .split_once(char::is_whitespace)
+        .filter(|(timestamp, _)| chrono::DateTime::parse_from_rfc3339(timestamp).is_ok())
+        .map_or(line, |(_, rest)| rest.trim_start());
+    Some(format!(
+        "base release v{version} (from: {spec}) lacks a feature this script uses; it logged: {line}. OSS release builds have only the `release` and `models` features, so a script that needs another (such as `snapshots`) cannot upgrade from a release; pass --from with a build that has it."
+    ))
+}
+
+fn record(report: &mut Report, run_label: &str, who: &str, step: &Step, outcome: Result<String>) {
+    let what = describe(&step.action);
+    match outcome {
+        Ok(detail) => {
+            report.passed += 1;
+            say!("   ok   {who:<20} {:>3} {what}{detail}", step.index);
+        }
+        Err(e) => {
+            say!("   FAIL {who:<20} {:>3} {what}", step.index);
+            let failure = |query: Option<u64>, labels: Vec<String>, message: String| Failure {
+                run: run_label.to_string(),
+                who: who.to_string(),
+                step: step.index,
+                key: step.key.clone(),
+                what: what.clone(),
+                query,
+                labels,
+                message,
+            };
+            match e.downcast_ref::<QueryFailures>() {
+                Some(queries) => {
+                    for q in &queries.failed {
+                        report.failures.push(failure(
+                            Some(q.number),
+                            q.labels.clone(),
+                            format!("{}\n      {}", q.problem, q.text),
+                        ));
+                    }
+                }
+                None => report
+                    .failures
+                    .push(failure(None, Vec::new(), format!("{e:#}"))),
+            }
+        }
+    }
+}
+
+/// How a dataset names table `t` of a source of this kind: `from:
+/// <prefix>t<suffix>`, plus whether it is a directory of files (which then
+/// needs a `file_format`), so one spicepod line serves a matrix over sources.
+/// `spiced` loads one `DuckDB` library, so the `duckdb` and `ducklake` sources of
+/// one run must use the same release. Each entry is a source's name, kind and
+/// resolved release.
+fn one_duckdb_release(sources: &[(String, String, String)]) -> Result<()> {
+    let Some((first, first_kind, release)) = sources.first() else {
+        return Ok(());
+    };
+    if let Some((name, kind, other)) = sources.iter().find(|(_, _, r)| r != release) {
+        anyhow::bail!(
+            "Sources '{first}' ({first_kind}) and '{name}' ({kind}) use DuckDB {release} and {other}, but spiced loads one DuckDB library. Give them the same `version`, or remove both to use --duckdb-version or the newest release in test/duckdb_versions.json."
+        );
+    }
+    Ok(())
+}
+
+fn table_from(kind: &str, entry: &Map<String, Value>) -> (String, String, bool) {
+    let field = |key: &str| entry.get(key).and_then(Value::as_str).unwrap_or_default();
+    match kind {
+        "postgres" => ("postgres:public.".into(), String::new(), false),
+        "kafka" | "dynamodb" => (
+            format!("{kind}:{}_", field("namespace")),
+            String::new(),
+            false,
+        ),
+        "mongodb" => ("mongodb:".into(), String::new(), false),
+        "mysql" | "clickhouse" | "duckdb" => (format!("{kind}:"), String::new(), false),
+        "ducklake" => ("ducklake:main.".into(), String::new(), false),
+        "iceberg" => (
+            format!(
+                "iceberg:{}/v1/namespaces/{}/tables/",
+                field("catalog"),
+                field("namespace")
+            ),
+            String::new(),
+            false,
+        ),
+        "rustfs" => (format!("s3://{}/", field("bucket")), "/".into(), true),
+        "files" => (format!("file://{}/", field("path")), "/".into(), true),
+        _ => (String::new(), String::new(), false),
+    }
+}
+
+/// Whether a matrix combination satisfies a `when:`: each key's value equals
+/// the combination's, or, given as a list, contains it.
+fn when_matches(when: &Map<String, Value>, combo: &Map<String, Value>) -> bool {
+    when.iter()
+        .all(|(key, wanted)| match (wanted, combo.get(key)) {
+            (Value::Array(any), Some(value)) => any.contains(value),
+            (wanted, value) => value == Some(wanted),
+        })
+}
+
+fn disable_results_cache_unless_configured(spicepod: &mut Value) {
+    let Some(root) = spicepod.as_object_mut() else {
+        return;
+    };
+    let runtime = root.entry("runtime").or_insert_with(|| json!({}));
+    let Some(runtime) = runtime.as_object_mut() else {
+        return;
+    };
+    let caching = runtime.entry("caching").or_insert_with(|| json!({}));
+    let Some(caching) = caching.as_object_mut() else {
+        return;
+    };
+    caching
+        .entry("sql_results")
+        .or_insert_with(|| json!({ "enabled": false }));
+}
+
+/// Applies a start's `patch:` to the instance's spicepod, for this and every
+/// later start.
+fn apply_patch(instance: &mut Instance, patch: Option<&VariantSpec>) -> Result<()> {
+    let Some(patch) = patch else {
+        return Ok(());
+    };
+    ensure!(
+        patch.env.is_empty(),
+        "a start's `patch` cannot change `env`; an instance's environment is fixed when it is created"
+    );
+    let resolved = VariantSpec {
+        spicepod: patch
+            .spicepod
+            .as_ref()
+            .map(|p| template::substitute(p, &instance.context))
+            .transpose()?,
+        datasets: patch
+            .datasets
+            .iter()
+            .map(|(k, v)| Ok((k.clone(), template::substitute(v, &instance.context)?)))
+            .collect::<Result<_>>()?,
+        catalogs: patch
+            .catalogs
+            .iter()
+            .map(|(k, v)| Ok((k.clone(), template::substitute(v, &instance.context)?)))
+            .collect::<Result<_>>()?,
+        env: patch.env.clone(),
+        when: Map::new(),
+    };
+    template::apply_variant(&mut instance.spicepod, &resolved)?;
+    instance.spicepod_yaml = yaml::to_string(&instance.spicepod)?;
+    Ok(())
+}
+
+fn namespace(instance: &Instance, source: &str) -> Result<String> {
+    instance
+        .namespaces
+        .get(source)
+        .cloned()
+        .ok_or_else(|| anyhow!("unknown source '{source}'"))
+}
+
+/// Every instance must have given the same final answer to every query.
+fn compare_instances(
+    steps: &[Step],
+    instances: &[&Instance],
+    compare_to: Option<&str>,
+    report: &mut Report,
+    run_label: &str,
+) -> Result<()> {
+    if instances.len() < 2 {
+        return Ok(());
+    }
+    for step in steps {
+        let Action::Query(q) = &step.action else {
+            continue;
+        };
+        let mut answers: Vec<(&str, &Vec<RecordBatch>)> = instances
+            .iter()
+            .filter_map(|i| i.answers.get(&step.index).map(|a| (i.label.as_str(), a)))
+            .collect();
+        // The reference variant goes first, so every other is compared with it.
+        if let Some(reference) = compare_to
+            && let Some(at) = instances
+                .iter()
+                .filter(|i| i.answers.contains_key(&step.index))
+                .position(|i| i.variant == reference)
+        {
+            answers.swap(0, at);
+        }
+        let Some(((base_label, base), rest)) = answers.split_first() else {
+            continue;
+        };
+        let mut mismatches = String::new();
+        for (label, answer) in rest {
+            if let Some(diff) = compare::compare(label, &q.sql, answer, base, q.expect_empty)? {
+                let _ = writeln!(mismatches, "{label} vs {base_label}: {diff}");
+            }
+        }
+        if mismatches.is_empty() {
+            report.passed += 1;
+        } else {
+            say!(
+                "   FAIL {:<20} {:>3} instances disagree",
+                "variants",
+                step.index
+            );
+            report.failures.push(Failure {
+                run: run_label.to_string(),
+                who: "variants".into(),
+                step: step.index,
+                key: step.key.clone(),
+                what: format!("instances disagree on: {}", one_line(&q.sql, 120)),
+                query: None,
+                labels: Vec::new(),
+                message: mismatches,
+            });
+        }
+    }
+    Ok(())
+}
+
+fn sanitize(s: &str) -> String {
+    s.chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() {
+                c.to_ascii_lowercase()
+            } else {
+                '_'
+            }
+        })
+        .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use serde_json::json;
+
+    use super::*;
+
+    #[test]
+    fn a_corpus_shares_one_eventually_limit_and_nothing_else_does() {
+        let eventually = Timing::Eventually(Duration::from_secs(30));
+        let t0 = Instant::now();
+        let later = t0 + Duration::from_secs(40);
+        let mut started = BTreeMap::new();
+        assert_eq!(
+            query::retry_since(eventually, Some(4), &mut started, t0),
+            t0
+        );
+        assert_eq!(
+            query::retry_since(eventually, Some(4), &mut started, later),
+            t0,
+            "a later query of the same corpus counts from the corpus's first"
+        );
+        assert_eq!(
+            query::retry_since(eventually, Some(9), &mut started, later),
+            later
+        );
+        assert_eq!(
+            query::retry_since(eventually, None, &mut started, later),
+            later
+        );
+        assert_eq!(
+            query::retry_since(
+                Timing::Consistently(Duration::from_secs(5)),
+                Some(4),
+                &mut started,
+                later
+            ),
+            later,
+            "`consistently` must hold for its whole length from each query"
+        );
+    }
+
+    #[test]
+    fn busy_counts_overlapping_holds_once_and_no_idle_time() {
+        // One hold, a second overlapping it, the first ends, the second ends,
+        // then idle, each a step apart on a clock the test sets.
+        let busy = Busy::default();
+        let t0 = Instant::now();
+        let step = Duration::from_millis(40);
+        busy.enter_at(t0);
+        busy.enter_at(t0 + step);
+        busy.leave_at(t0 + step * 2);
+        busy.leave_at(t0 + step * 3);
+        // Held for 3 steps (120 ms). Each hold counted on its own would be
+        // 160 ms, and counting the idle time 200 ms.
+        assert_eq!(busy.total_at(t0 + step * 5), step * 3);
+    }
+
+    #[test]
+    fn matrix_is_the_cartesian_product_in_declaration_order() {
+        let matrix = IndexMap::from([
+            (
+                "source".to_string(),
+                vec![json!("postgres"), json!("mysql")],
+            ),
+            ("mode".to_string(), vec![json!("file"), json!("memory")]),
+        ]);
+        let combos: Vec<Value> = matrix_combinations(&matrix)
+            .into_iter()
+            .map(Value::Object)
+            .collect();
+        assert_eq!(
+            combos,
+            vec![
+                json!({ "source": "postgres", "mode": "file" }),
+                json!({ "source": "postgres", "mode": "memory" }),
+                json!({ "source": "mysql", "mode": "file" }),
+                json!({ "source": "mysql", "mode": "memory" }),
+            ]
+        );
+        assert_eq!(matrix_combinations(&IndexMap::new()), vec![Map::new()]);
+    }
+
+    #[test]
+    fn combinations_differing_only_in_punctuation_capture_apart() {
+        let script = Script::parse(
+            "name: s\nspicepod: {}\nmatrix: { k: [a-b, a_b, c], m: [x] }\nsteps: [{ start: {} }]",
+        )
+        .expect("script parses");
+        let dirs: Vec<PathBuf> = script
+            .run_labels()
+            .iter()
+            .map(|label| combination_capture_dir(Path::new("cap/s"), &script, label))
+            .collect();
+        assert_eq!(
+            dirs,
+            [
+                PathBuf::from("cap/s/k_a_b_m_x-1"),
+                PathBuf::from("cap/s/k_a_b_m_x-2"),
+                PathBuf::from("cap/s/k_c_m_x"),
+            ]
+        );
+        let plain =
+            Script::parse("name: s\nspicepod: {}\nsteps: [{ start: {} }]").expect("script parses");
+        assert_eq!(
+            combination_capture_dir(Path::new("cap/s"), &plain, "s"),
+            PathBuf::from("cap/s")
+        );
+    }
+}
+
+#[cfg(test)]
+mod table_from_tests {
+    use super::*;
+
+    #[test]
+    fn each_source_kind_names_a_table_the_way_spice_reads_it() {
+        let entry = json!({ "catalog": "http://127.0.0.1:1", "namespace": "i0_x", "bucket": "b", "path": "/d" });
+        let entry = entry.as_object().expect("an object");
+        let named = |kind: &str| {
+            let (prefix, suffix, files) = table_from(kind, entry);
+            (format!("{prefix}t{suffix}"), files)
+        };
+        assert_eq!(named("postgres"), ("postgres:public.t".into(), false));
+        assert_eq!(named("kafka"), ("kafka:i0_x_t".into(), false));
+        assert_eq!(named("mongodb"), ("mongodb:t".into(), false));
+        assert_eq!(named("dynamodb"), ("dynamodb:i0_x_t".into(), false));
+        assert_eq!(named("mysql"), ("mysql:t".into(), false));
+        assert_eq!(named("clickhouse"), ("clickhouse:t".into(), false));
+        assert_eq!(named("duckdb"), ("duckdb:t".into(), false));
+        assert_eq!(named("ducklake"), ("ducklake:main.t".into(), false));
+        assert_eq!(
+            named("iceberg"),
+            (
+                "iceberg:http://127.0.0.1:1/v1/namespaces/i0_x/tables/t".into(),
+                false
+            )
+        );
+        assert_eq!(named("rustfs"), ("s3://b/t/".into(), true));
+        assert_eq!(named("files"), ("file:///d/t/".into(), true));
+    }
+
+    #[test]
+    fn duckdb_sources_of_one_run_use_one_release() {
+        let source = |name: &str, kind: &str, release: &str| {
+            (name.to_string(), kind.to_string(), release.to_string())
+        };
+        one_duckdb_release(&[]).expect("no DuckDB sources");
+        one_duckdb_release(&[
+            source("src", "duckdb", "2.0.0"),
+            source("lake", "ducklake", "2.0.0"),
+        ])
+        .expect("one release");
+        assert_eq!(
+            one_duckdb_release(&[
+                source("src", "duckdb", "2.0.0"),
+                source("lake", "ducklake", "1.5.6")
+            ])
+            .expect_err("two releases")
+            .to_string(),
+            "Sources 'src' (duckdb) and 'lake' (ducklake) use DuckDB 2.0.0 and 1.5.6, but spiced loads one DuckDB library. Give them the same `version`, or remove both to use --duckdb-version or the newest release in test/duckdb_versions.json."
+        );
+    }
+}
+
+#[cfg(test)]
+mod base_release_tests {
+    use super::base_release_feature_gap;
+
+    #[test]
+    fn enterprise_warning_names_the_release_feature_and_override() {
+        let log = "2026-10-27T12:34:56.123Z INFO runtime: Starting Spice.ai\n2026-10-27T12:34:56.456Z \x1b[33mWARN\x1b[0m runtime_acceleration::snapshot::behavior: Acceleration Snapshots are included in the Enterprise distribution of Spice.ai. Learn more at https://docs.spice.ai/docs/enterprise\n2026-10-27T12:34:56.789Z WARN runtime: Other features are included in the Enterprise distribution of Spice.ai\n";
+        assert_eq!(
+            base_release_feature_gap(log, "2.4.0", "2.4.x"),
+            Some("base release v2.4.0 (from: 2.4.x) lacks a feature this script uses; it logged: WARN runtime_acceleration::snapshot::behavior: Acceleration Snapshots are included in the Enterprise distribution of Spice.ai. Learn more at https://docs.spice.ai/docs/enterprise. OSS release builds have only the `release` and `models` features, so a script that needs another (such as `snapshots`) cannot upgrade from a release; pass --from with a build that has it.".to_string())
+        );
+        assert_eq!(
+            base_release_feature_gap("INFO runtime: ready", "2.4.0", "2.4.x"),
+            None
+        );
+    }
+}

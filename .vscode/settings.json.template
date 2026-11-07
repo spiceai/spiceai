@@ -1,5 +1,7 @@
 // Copy this file to `settings.json` and tweak the `features` array to enable optional features in VSCode.
-// Clippy args mirror the CI deny-set in `make lint-rust`, minus `expect_used` (allowed in tests by CI).
+// Clippy args mirror the CI deny-set in `make lint-rust` (`expect_used` is denied by the workspace lints).
+// One difference: rust-analyzer also checks benches and examples, which `make lint-rust` does not lint,
+// so unfulfilled `#[expect]`s are allowed here rather than surfacing errors no gate reports.
 {
   "[rust]": {
     "editor.defaultFormatter": "rust-lang.rust-analyzer",

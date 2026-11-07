@@ -64,7 +64,8 @@ static PARAMETERS: LazyLock<Vec<ParameterSpec>> = LazyLock::new(|| {
         ParameterSpec::component("pass")
             .secret()
             .description("The password for SMB authentication."),
-        ParameterSpec::component("port").description("The port to connect to. Defaults to 445."),
+        ParameterSpec::component("port")
+            .description("The port to connect to. Defaults to the port in the URL, or 445."),
         ParameterSpec::runtime("client_timeout")
             .description("The timeout setting for SMB client connections."),
     ]);
@@ -133,9 +134,16 @@ impl ListingTableConnector for SMB {
             }
         })?;
 
+        listing::set_port_from_param(&mut smb_url, &self.params, "port").map_err(|message| {
+            data_connector_api::DataConnectorError::InvalidConfigurationNoSource {
+                dataconnector: format!("{self}"),
+                connector_component: ConnectorComponent::from(dataset),
+                message,
+            }
+        })?;
         smb_url.set_fragment(Some(&listing::build_fragments(
             &self.params,
-            vec!["port", "user", "pass", "client_timeout"],
+            vec!["user", "pass", "client_timeout"],
         )));
 
         Ok(smb_url)

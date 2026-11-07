@@ -1,0 +1,103 @@
+name: snapshots-object-store
+description: >
+  Cayenne snapshots kept in an S3-compatible store (rustfs) under
+  `runtime.state.location`: written after a refresh that changes the data;
+  started on empty local storage with the source down, the acceleration is
+  bootstrapped from the newest snapshot in the store and serves it; once the
+  source is back a refresh catches up. The same with the snapshot location
+  given per dataset.
+
+sources:
+  src: { kind: postgres }
+  lake: { kind: rustfs }
+
+variants:
+  runtime-state: {}
+  dataset-location:
+    spicepod:
+      runtime: { state: null }
+    datasets:
+      t:
+        acceleration:
+          snapshots_location: s3://${sources.lake.bucket}/per-dataset/
+          snapshots_params:
+            s3_endpoint: ${sources.lake.endpoint}
+            s3_region: us-east-1
+            s3_auth: key
+            s3_key: ${sources.lake.key}
+            s3_secret: ${sources.lake.secret}
+            allow_http: 'true'
+
+spicepod:
+  version: v1
+  kind: Spicepod
+  name: snapshots-object-store
+  runtime:
+    state:
+      location: s3://${sources.lake.bucket}/state/
+      params:
+        s3_endpoint: ${sources.lake.endpoint}
+        s3_region: us-east-1
+        s3_auth: key
+        s3_key: ${sources.lake.key}
+        s3_secret: ${sources.lake.secret}
+        allow_http: 'true'
+  datasets:
+    - from: postgres:public.t
+      name: t
+      params: ${sources.src.params}
+      acceleration:
+        enabled: true
+        engine: cayenne
+        mode: file
+        refresh_mode: full
+        refresh_check_interval: 1h
+        snapshots: enabled
+        params:
+          cayenne_file_path: ${instance.dir}/accel-1/data
+          cayenne_metadata_dir: ${instance.dir}/accel-1/meta
+
+defaults:
+  expect: { oracle: src }
+  compare-variants: false
+
+steps:
+  - source-exec:
+      src: |
+        CREATE TABLE t (id int PRIMARY KEY, v text, n numeric(10, 2));
+        INSERT INTO t SELECT i, 'v' || i, i * 1.25 FROM generate_series(1, 500) i;
+  - start: {}
+  - query: SELECT id, v, n FROM t
+  - assert-log: { contains: 'Snapshot created dataset=t' }
+    eventually: 30s
+  - assert-objects: { source: lake, prefix: state/snapshots/, min: 1 }
+    only: runtime-state
+  - assert-objects: { source: lake, prefix: per-dataset/, min: 1 }
+    only: dataset-location
+
+  - source-exec: { src: "UPDATE t SET v = 'changed' WHERE id <= 50; DELETE FROM t WHERE id > 450" }
+  - refresh: t
+  - query: SELECT id, v, n FROM t
+    id: latest
+  - assert-log:
+      count: { 'Snapshot created dataset=t\b': '>=2' }
+    eventually: 30s
+
+  # Empty local storage, source down: bootstrapped from the store.
+  - stop: {}
+  - stop-source: src
+  - start:
+      ready: false
+      patch:
+        datasets:
+          t: { acceleration: { params: { cayenne_file_path: '${instance.dir}/accel-2/data', cayenne_metadata_dir: '${instance.dir}/accel-2/meta' } } }
+  - query: SELECT id, v, n FROM t
+    expect: { same-as: latest }
+    eventually: 60s
+  - assert-files: { contains: '^accel-2/' }
+
+  - start-source: src
+  - source-exec: { src: "INSERT INTO t VALUES (1000, 'after', 1.00)" }
+  - refresh: t
+  - query: SELECT id, v, n FROM t
+    eventually: 60s

@@ -31,6 +31,11 @@ limitations under the License.
 //! full, so a partition that lost its index fails the test rather than
 //! returning the same rows through a full scan.
 
+#![expect(
+    clippy::expect_used,
+    reason = "set-up and helpers outside `#[test]` functions fail fast with `expect`"
+)]
+
 use std::{
     path::{Path, PathBuf},
     sync::Arc,

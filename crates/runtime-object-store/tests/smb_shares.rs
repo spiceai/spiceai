@@ -47,11 +47,10 @@ fn live_server() -> Option<LiveServer> {
     let host = std::env::var("SPICE_SMB_TEST_HOST").ok()?;
     let user = std::env::var("SPICE_SMB_TEST_USER").ok()?;
     let pass = std::env::var("SPICE_SMB_TEST_PASS").ok()?;
-    let port = host.rsplit_once(':').map_or("445", |(_, port)| port);
     // Encoded the way the connector encodes it, so a password holding `&`,
-    // `%`, `=` or `#` survives the fragment.
+    // `%`, `=` or `#` survives the fragment. The connector puts the port in
+    // the URL, not the fragment.
     let fragment = url::form_urlencoded::Serializer::new(String::new())
-        .append_pair("port", port)
         .append_pair("user", &user)
         .append_pair("pass", &pass)
         .finish();

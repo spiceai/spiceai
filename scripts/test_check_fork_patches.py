@@ -26,12 +26,18 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from check_fork_patches import (  # noqa: E402
+    DUCKDB_BROTLI_BLOCK_SWITCH_MARKER,
+    DUCKDB_BROTLI_DECODER_MARKER,
+    DUCKDB_BROTLI_DECODER_SUFFIX,
+    DUCKDB_BROTLI_HEADER_SUFFIX,
     DUCKDB_RS_REPO,
     DUCKDB_THRIFT_EQUALITY_MARKER,
     DUCKDB_THRIFT_HEADER_SUFFIX,
     LEDGER,
     LOCK,
+    brotli_fix_problems,
     drift,
+    duckdb_brotli_block_switch,
     duckdb_thrift_iterator_equality,
     gap_accounting,
     ledger_pins,
@@ -302,6 +308,47 @@ check(
     True,
 )
 check("the duckdb-rs repo constant is set", DUCKDB_RS_REPO, "duckdb-rs")
+
+print("\nduckdb-rs Brotli block-switch fix")
+
+
+def _tarball_with(files: dict[str, str], dest: Path) -> Path:
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    with tarfile.open(dest, "w:gz") as tf:
+        for suffix, text in files.items():
+            payload = text.encode()
+            info = tarfile.TarInfo(name=f"duckdb/{suffix}")
+            info.size = len(payload)
+            tf.addfile(info, io.BytesIO(payload))
+    return dest
+
+
+_PATCHED_HEADER = f"  {DUCKDB_BROTLI_BLOCK_SWITCH_MARKER} SEPARATOR \\\n"
+_UNPATCHED_HEADER = "  /* -17 code is reserved */ \\\n"
+_PATCHED_DECODER = f"  if (s->num_block_types[tree_type] < 2) {{\n    {DUCKDB_BROTLI_DECODER_MARKER}\n  }}\n"
+_UNPATCHED_DECODER = "  if (max_block_type <= 1) {\n    return BROTLI_FALSE;\n  }\n"
+
+_tmp = Path(__file__).resolve().parent / ".test_brotli_tmp"
+try:
+    for name, files, want in (
+        ("a patched header and decoder are accepted",
+         {DUCKDB_BROTLI_HEADER_SUFFIX: _PATCHED_HEADER, DUCKDB_BROTLI_DECODER_SUFFIX: _PATCHED_DECODER}, 0),
+        ("an unpatched header is rejected",
+         {DUCKDB_BROTLI_HEADER_SUFFIX: _UNPATCHED_HEADER, DUCKDB_BROTLI_DECODER_SUFFIX: _PATCHED_DECODER}, 1),
+        ("a patched header with an unpatched decoder is rejected",
+         {DUCKDB_BROTLI_HEADER_SUFFIX: _PATCHED_HEADER, DUCKDB_BROTLI_DECODER_SUFFIX: _UNPATCHED_DECODER}, 1),
+        ("a patched header with no decoder is rejected",
+         {DUCKDB_BROTLI_HEADER_SUFFIX: _PATCHED_HEADER}, 1),
+    ):
+        tarball = _tarball_with(files, _tmp / "brotli.tar.gz")
+        check(name, len(brotli_fix_problems(tarball, A)), want)
+finally:
+    import shutil
+
+    shutil.rmtree(_tmp, ignore_errors=True)
+
+_live = duckdb_brotli_block_switch(pinned_forks(LOCK.read_text(encoding="utf-8")))
+check("the shipped duckdb-rs pin carries the Brotli block-switch fix", _live, [])
 
 
 

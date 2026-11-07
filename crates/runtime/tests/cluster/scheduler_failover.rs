@@ -479,7 +479,6 @@ async fn run_failover(recovery_timeout: Duration) -> Result<(), anyhow::Error> {
 /// Graceful loss (SIGTERM): the scheduler deregisters on shutdown, so recovery
 /// is fast (no heartbeat-TTL wait).
 #[tokio::test(flavor = "multi_thread")]
-#[cfg(not(target_os = "windows"))]
 async fn recovers_job_after_scheduler_loss_sigterm() -> Result<(), anyhow::Error> {
     let _tracing = init_tracing(Some("integration=debug,info"));
     test_request_context()
@@ -494,7 +493,6 @@ async fn recovers_job_after_scheduler_loss_sigterm() -> Result<(), anyhow::Error
 /// expiry — would require a subprocess harness and is not covered here. The
 /// larger timeout reflects the TTL-expiry budget that path would need.
 #[tokio::test(flavor = "multi_thread")]
-#[cfg(not(target_os = "windows"))]
 async fn recovers_job_after_scheduler_loss_sigkill() -> Result<(), anyhow::Error> {
     let _tracing = init_tracing(Some("integration=debug,info"));
     test_request_context()
@@ -615,7 +613,6 @@ async fn run_runtime_state_layout() -> Result<(), anyhow::Error> {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-#[cfg(not(target_os = "windows"))]
 async fn runtime_state_scheduler_writes_under_cluster_folder() -> Result<(), anyhow::Error> {
     let _tracing = init_tracing(Some("integration=debug,info"));
     test_request_context()

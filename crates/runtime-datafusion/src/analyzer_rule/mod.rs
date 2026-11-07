@@ -27,6 +27,7 @@ pub use correlated_filter_push_down::{CorrelatedFilterPushDown, federation_analy
 
 use std::sync::Arc;
 
+use crate::checked_arithmetic::CheckedIntegerOverflow;
 use datafusion::optimizer::AnalyzerRule;
 use datafusion::optimizer::analyzer::{
     resolve_grouping_function::ResolveGroupingFunction, type_coercion::TypeCoercion,
@@ -76,6 +77,9 @@ impl AnalyzerRulesBuilder {
             // After coercion has placed the float-literal-to-decimal casts, and
             // before the optimizer folds them inexactly (#14970).
             Arc::new(ExactFloatLiteralDecimalCast::new()) as Arc<dyn AnalyzerRule + Send + Sync>,
+            // After coercion, before SimplifyExpressions can fold integer
+            // literals with wrapping kernels.
+            Arc::new(CheckedIntegerOverflow::new()) as Arc<dyn AnalyzerRule + Send + Sync>,
         ]);
         rules.into_iter().chain(self.extra_rules).collect()
     }

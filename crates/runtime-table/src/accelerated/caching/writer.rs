@@ -28,7 +28,7 @@ use arrow::array::{
     make_array,
 };
 use arrow::buffer::{BooleanBuffer, Buffer, NullBuffer};
-use arrow::datatypes::{DataType, SchemaRef};
+use arrow::datatypes::{DataType, Schema, SchemaRef};
 use data_components::http::provider::{HttpExec, HttpFetchCompletion};
 use datafusion::common::tree_node::{TreeNode, TreeNodeRecursion};
 use datafusion::common::{DataFusionError, Result, ScalarValue, TableReference};
@@ -704,16 +704,11 @@ impl CacheSinkWriter {
             .collect::<Result<Vec<_>>>()?;
         let canonical = canonical_request_filters(&request.filters);
         if request.replaces_existing
+            && canonical.is_none()
             && batches.iter().all(|batch| batch.num_rows() == 0)
-            && (canonical
-                .as_ref()
-                .is_none_or(|filters| filters.len() != REQUEST_KEY_COLUMNS.len())
-                || REQUEST_KEY_COLUMNS
-                    .iter()
-                    .any(|name| self.schema.column_with_name(name).is_none()))
         {
             return Err(DataFusionError::Plan(
-                "An empty cache replacement requires the complete logical request key".into(),
+                "An empty cache replacement requires filters that name one request".into(),
             ));
         }
         let mut filters = canonical
@@ -733,6 +728,8 @@ impl CacheSinkWriter {
         // query/body does not delete other responses stored under the same path.
         if let Some(first) = batches.iter().find(|batch| batch.num_rows() > 0) {
             filters.extend(CacheRefreshHelper::extract_filters_from_row(first, 0)?);
+        } else {
+            filters.extend(unsent_request_key_filters(&filters, &self.schema));
         }
         if filters.is_empty() {
             return Err(DataFusionError::Plan(
@@ -866,8 +863,9 @@ pub(super) fn prepare_source_fetch(
 }
 
 /// Accept only request-key predicates that describe one request. This does not
-/// infer omitted dimensions or normalize HTTP metadata; nonempty response rows
-/// supply the storage scope. Response predicates cannot authorize replacement.
+/// infer omitted dimensions or normalize HTTP metadata; a response row supplies
+/// them to the storage scope, or [`unsent_request_key_filters`] when the
+/// response is empty. Response predicates cannot authorize replacement.
 pub(super) fn canonical_request_filters(filters: &[Expr]) -> Option<Vec<Expr>> {
     let mut values: BTreeMap<usize, Option<&str>> = BTreeMap::new();
     let mut pending: Vec<_> = filters.iter().collect();
@@ -927,6 +925,25 @@ pub(super) fn canonical_request_filters(filters: &[Expr]) -> Option<Vec<Expr>> {
             })
             .collect(),
     )
+}
+
+/// The request-key columns a response row would have supplied, for a response
+/// with no rows: each column `schema` stores and `filters` leave open is pinned
+/// to `''`, which the HTTP connector stores for a request part it sends no value
+/// for. A cache fill is a single page, whose rows store the request's own path,
+/// query and body, so these complete the key its rows are stored under.
+fn unsent_request_key_filters(filters: &[Expr], schema: &Schema) -> Vec<Expr> {
+    REQUEST_KEY_COLUMNS
+        .into_iter()
+        .filter(|name| {
+            schema.column_with_name(name).is_some()
+                && !filters
+                    .iter()
+                    .flat_map(Expr::column_refs)
+                    .any(|column| column.name == *name)
+        })
+        .map(|name| col(name).eq(lit("")))
+        .collect()
 }
 
 /// Columns the HTTP connector builds a request from. It ignores predicates on

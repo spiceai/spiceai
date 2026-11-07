@@ -146,7 +146,7 @@ async fn test_acceleration_postgres_checkpoint() -> Result<(), anyhow::Error> {
                 arrow::util::pretty::pretty_format_batches(&decimal_result).expect("pretty print");
             insta::assert_snapshot!(pretty_decimal);
 
-            running_container.remove().await?;
+            running_container.cleanup().await;
 
             Ok(())
         })
@@ -260,7 +260,7 @@ async fn test_postgres_checkpoint_set_schema_preserves_the_freshness_clock()
         "a schema-only write must not create a checkpoint row"
     );
 
-    running_container.remove().await?;
+    running_container.cleanup().await;
 
     Ok(())
 }

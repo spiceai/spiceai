@@ -24,7 +24,10 @@ use arrow_tools::metadata_keys::{
 use datafusion::{
     common::TableReference,
     common::tree_node::TreeNodeRecursion,
-    execution::SendableRecordBatchStream,
+    execution::{
+        SendableRecordBatchStream,
+        memory_pool::{MemoryConsumer, MemoryPool},
+    },
     logical_expr::LogicalPlan,
     physical_plan::{ExecutionPlan, stream::RecordBatchStreamAdapter},
 };
@@ -259,6 +262,9 @@ const MAX_ENCODING_COMPRESSION_RATIO: usize = 16;
 /// start of the read, not the moment the result is stored: a change landing in
 /// between has to disqualify the entry. The same instant anchors the entry's TTL
 /// and stale window.
+///
+/// The batches held for the cache are reserved in `memory_pool`; when the pool
+/// cannot grant a batch, the result is not cached and the stream continues.
 #[must_use]
 #[expect(clippy::implicit_hasher)]
 pub fn to_cached_record_batch_stream(
@@ -268,11 +274,20 @@ pub fn to_cached_record_batch_stream(
     input_tables: Arc<HashSet<TableReference>>,
     read_started_at: std::time::Instant,
     physical_plan: Option<Arc<dyn ExecutionPlan>>,
+    memory_pool: &Arc<dyn MemoryPool>,
 ) -> SendableRecordBatchStream {
     let schema = stream.schema();
+    let memory_pool = Arc::clone(memory_pool);
     let cache_schema = Arc::clone(&schema);
 
     let cached_result_stream = stream! {
+        // The copies held for the cache are charged to the query memory pool, so
+        // concurrent cacheable queries cannot hold more than the pool allows. A
+        // refused grow only abandons caching, so the consumer is spillable and
+        // leaves the pool's unspillable headroom to operators that cannot give up.
+        let reservation = MemoryConsumer::new("QueryResultsCache")
+            .with_can_spill(true)
+            .register(&memory_pool);
         let mut records: Vec<RecordBatch> = Vec::new();
         let mut records_size: usize = 0;
         // Set on any `Err` the stream yields, at any position. A prefix of
@@ -298,10 +313,17 @@ pub fn to_cached_record_batch_stream(
         };
 
         while let Some(batch_result) = stream.next().await {
-            if batch_result.is_err() {
+            if batch_result.is_err() && !stream_failed {
+                // The result will not be cached, so nothing more is held for it.
                 stream_failed = true;
+                records.clear();
+                records.shrink_to_fit();
+                reservation.free();
             }
-            if records_size < raw_size_limit && let Ok(batch) = &batch_result {
+            if !stream_failed
+                && records_size < raw_size_limit
+                && let Ok(batch) = &batch_result
+            {
                 // Accumulate compacted batches, not the batches as they arrive.
                 // A `LIMIT`/`OFFSET` plan yields zero-copy slices, so holding
                 // one keeps its whole scan batch alive until the stream drains
@@ -311,13 +333,26 @@ pub fn to_cached_record_batch_stream(
                 // Measure before copying, so the copy is only paid for a result
                 // that can still be cached: `compacted_memory_size` is what the
                 // batch will occupy, computed without allocating.
-                records_size = records_size
-                    .saturating_add(arrow_tools::record_batch::compacted_memory_size(batch));
-                if records_size < raw_size_limit {
+                let batch_size = arrow_tools::record_batch::compacted_memory_size(batch);
+                records_size = records_size.saturating_add(batch_size);
+                let fits = records_size < raw_size_limit
+                    && reservation
+                        .try_grow(batch_size)
+                        .inspect_err(|e| {
+                            tracing::debug!(
+                                "Not caching the query result: the query memory pool cannot hold it: {e}"
+                            );
+                        })
+                        .is_ok();
+                if fits {
                     records.push(arrow_tools::record_batch::compact_retained_buffers(batch));
                 } else {
+                    // Over the size limit, or the memory pool cannot hold the
+                    // copy: caching is abandoned for this result.
+                    records_size = usize::MAX;
                     records.clear();
                     records.shrink_to_fit();
+                    reservation.free();
                 }
             } else if !records.is_empty() && records_size >= raw_size_limit {
                 // The result can no longer fit in the cache: eagerly drop the
@@ -890,6 +925,7 @@ pub(crate) mod tests {
             Arc::new(input_tables),
             read_started_at,
             None,
+            &test_memory_pool(),
         );
         while wrapped.next().await.is_some() {}
 
@@ -906,6 +942,78 @@ pub(crate) mod tests {
             )
             .expect("valid cache provider"),
         )
+    }
+
+    fn test_memory_pool() -> Arc<dyn MemoryPool> {
+        Arc::new(datafusion::execution::memory_pool::UnboundedMemoryPool::default())
+    }
+
+    /// Drains two 1000-row batches through the caching wrapper with a pool of
+    /// `pool_limit` bytes, and reports whether the result was stored, the rows
+    /// the stream yielded, and the bytes still reserved afterwards.
+    async fn drain_with_pool_limit(pool_limit: usize) -> (bool, usize, usize) {
+        use datafusion::error::DataFusionError;
+        use futures::TryStreamExt;
+
+        let provider = test_cache_provider();
+        let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)]));
+        let batches: Vec<Result<RecordBatch, DataFusionError>> = (0..2)
+            .map(|i| {
+                RecordBatch::try_new(
+                    Arc::clone(&schema),
+                    vec![Arc::new(arrow::array::Int64Array::from_iter_values(
+                        i * 1000..(i + 1) * 1000,
+                    ))],
+                )
+                .map_err(DataFusionError::from)
+            })
+            .collect();
+        let pool: Arc<dyn MemoryPool> = Arc::new(
+            datafusion::execution::memory_pool::GreedyMemoryPool::new(pool_limit),
+        );
+        let key = RawCacheKey::new(46);
+        let rows: usize = to_cached_record_batch_stream(
+            Arc::clone(&provider),
+            Box::pin(RecordBatchStreamAdapter::new(
+                Arc::clone(&schema),
+                futures::stream::iter(batches),
+            )),
+            key,
+            Arc::new(HashSet::from([TableReference::bare("t")])),
+            std::time::Instant::now(),
+            None,
+            &pool,
+        )
+        .try_collect::<Vec<_>>()
+        .await
+        .expect("the stream yields no errors")
+        .iter()
+        .map(RecordBatch::num_rows)
+        .sum();
+        let stored = provider
+            .get_raw_key(&key)
+            .await
+            .expect("cache access should succeed")
+            .is_some();
+        (stored, rows, pool.reserved())
+    }
+
+    /// The copies held for the cache are charged to the query memory pool. A
+    /// result the pool cannot hold is not cached, and the query still returns
+    /// every row.
+    #[tokio::test]
+    async fn a_result_the_memory_pool_cannot_hold_is_not_cached_and_still_streams() {
+        assert_eq!(
+            drain_with_pool_limit(1 << 20).await,
+            (true, 2000, 0),
+            "a pool with room caches the result"
+        );
+        // Room for the first 1000-row batch (8000 bytes) but not the second.
+        assert_eq!(
+            drain_with_pool_limit(12_000).await,
+            (false, 2000, 0),
+            "a pool without room for the whole result skips caching, streams every row and releases what it reserved"
+        );
     }
 
     fn test_cache_provider() -> Arc<QueryResultsCacheProvider> {
@@ -1212,6 +1320,7 @@ pub(crate) mod tests {
             Arc::new(HashSet::from(["local_table".into()])),
             std::time::Instant::now(),
             None,
+            &test_memory_pool(),
         );
 
         let output_batches = cached_stream
@@ -1287,6 +1396,7 @@ pub(crate) mod tests {
             Arc::new(HashSet::from(["http_table".into()])),
             std::time::Instant::now(),
             None,
+            &test_memory_pool(),
         );
 
         let output_batches = cached_stream
@@ -1362,6 +1472,7 @@ pub(crate) mod tests {
             Arc::new(HashSet::from(["http_table".into()])),
             std::time::Instant::now(),
             None,
+            &test_memory_pool(),
         );
 
         let output_batches = cached_stream
@@ -1384,7 +1495,7 @@ pub(crate) mod tests {
 
     /// Every real consumer of this stream (`QueryResult::collect_batches`'s
     /// `try_collect`, the HTTP JSON writer's `?`-propagating loop in
-    /// `json_array_body_from_batches`, and the Flight encoder's `return` on
+    /// `sql_body_from_batches`, and the Flight encoder's `return` on
     /// `Err` in `crates/runtime/src/flight/mod.rs`) stops polling on the
     /// first `Err` item. `stream!` compiles to a generator that only
     /// advances past a `yield` when polled again, so with every caller
@@ -1431,6 +1542,7 @@ pub(crate) mod tests {
             Arc::new(HashSet::from(["some_table".into()])),
             std::time::Instant::now(),
             None,
+            &test_memory_pool(),
         );
 
         let result = cached_stream.try_collect::<Vec<_>>().await;
@@ -1499,6 +1611,7 @@ pub(crate) mod tests {
             Arc::new(HashSet::from(["some_table".into()])),
             std::time::Instant::now(),
             None,
+            &test_memory_pool(),
         );
 
         // Poll to completion regardless of the `Err` in the middle — unlike
@@ -1981,6 +2094,7 @@ pub(crate) mod tests {
             Arc::new(HashSet::from(["test_table".into()])),
             std::time::Instant::now(),
             None,
+            &test_memory_pool(),
         );
 
         // Consume the stream to trigger caching.
@@ -2074,6 +2188,7 @@ pub(crate) mod tests {
             Arc::new(HashSet::from(["test_table".into()])),
             std::time::Instant::now(),
             None,
+            &test_memory_pool(),
         );
 
         let _output = cached_stream
@@ -2156,6 +2271,7 @@ pub(crate) mod tests {
             Arc::new(HashSet::from(["test_table".into()])),
             std::time::Instant::now(),
             None,
+            &test_memory_pool(),
         );
 
         let _output = cached_stream
@@ -2227,6 +2343,7 @@ pub(crate) mod tests {
             Arc::new(HashSet::from(["test_table".into()])),
             std::time::Instant::now(),
             None,
+            &test_memory_pool(),
         );
 
         let output = cached_stream
@@ -2284,6 +2401,7 @@ pub(crate) mod tests {
             Arc::new(HashSet::from(["local_table".into()])),
             std::time::Instant::now(),
             None,
+            &test_memory_pool(),
         );
 
         let output_batches = cached_stream
@@ -2349,6 +2467,7 @@ pub(crate) mod tests {
             Arc::new(HashSet::from(["local_table".into()])),
             std::time::Instant::now(),
             None,
+            &test_memory_pool(),
         );
 
         let _output = cached_stream
@@ -2412,6 +2531,7 @@ pub(crate) mod tests {
             Arc::new(HashSet::from(["test_table".into()])),
             std::time::Instant::now(),
             None,
+            &test_memory_pool(),
         );
 
         let _output = cached_stream
@@ -2490,6 +2610,7 @@ pub(crate) mod tests {
             Arc::new(HashSet::from(["docs".into()])),
             std::time::Instant::now(),
             None,
+            &test_memory_pool(),
         );
 
         let output = cached_stream

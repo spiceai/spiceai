@@ -428,22 +428,7 @@ async fn file_identity(path: &Path) -> std::io::Result<String> {
         let meta = tokio::fs::metadata(path).await?;
         Ok(format!("unix {} {}", meta.dev(), meta.ino()))
     }
-    #[cfg(windows)]
-    {
-        use std::os::windows::fs::MetadataExt;
-        let meta = tokio::fs::metadata(path).await?;
-        let volume = meta.volume_serial_number().ok_or_else(|| {
-            std::io::Error::new(
-                std::io::ErrorKind::Unsupported,
-                "volume serial number unavailable",
-            )
-        })?;
-        let index = meta.file_index().ok_or_else(|| {
-            std::io::Error::new(std::io::ErrorKind::Unsupported, "file index unavailable")
-        })?;
-        Ok(format!("windows {volume} {index}"))
-    }
-    #[cfg(not(any(unix, windows)))]
+    #[cfg(not(unix))]
     {
         let _ = path;
         Err(std::io::Error::new(

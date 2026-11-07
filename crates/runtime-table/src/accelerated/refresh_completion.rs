@@ -76,6 +76,10 @@ struct CompletionState {
     /// Highest [`RefreshRequestId`] whose refresh has been recorded complete
     /// *successfully*. Terminal failures do not move this.
     completed: RefreshRequestId,
+    /// Highest [`RefreshRequestId`] passed to [`RefreshCompletion::record`]: a
+    /// requested refresh that completed. Untriggered completions do not move
+    /// this.
+    recorded: RefreshRequestId,
     /// Highest [`RefreshRequestId`] whose refresh failed and will not be
     /// retried. Distinct from `completed` so success waiters do not treat a
     /// one-shot load failure as a loaded table.
@@ -107,6 +111,7 @@ impl RefreshCompletion {
             state: watch::Sender::new(CompletionState {
                 issued: 0,
                 completed: 0,
+                recorded: 0,
                 failed: 0,
                 closed: false,
             }),
@@ -142,8 +147,10 @@ impl RefreshCompletion {
         // `max` rather than assignment: completions arrive in request order
         // today, and a reordering must not walk the threshold backwards and
         // un-answer a waiter that has already been released.
-        self.state
-            .send_modify(|state| state.completed = state.completed.max(id));
+        self.state.send_modify(|state| {
+            state.completed = state.completed.max(id);
+            state.recorded = state.recorded.max(id);
+        });
     }
 
     /// Records that the refresh requested as `id` failed and will not be retried.
@@ -163,7 +170,8 @@ impl RefreshCompletion {
     /// apply loop, which streams rather than answering triggers.
     ///
     /// Such a completion answers every waiter taken before it and none taken
-    /// after, which is all an uncorrelated signal can honestly claim.
+    /// after, which is all an uncorrelated signal can honestly claim. It never
+    /// answers a [`Self::waiter_for`] waiter.
     ///
     /// One transition rather than `record(self.issue())`: the intermediate state
     /// of that pair is a request that has been issued and not completed, and a
@@ -193,6 +201,22 @@ impl RefreshCompletion {
     #[must_use]
     pub fn next(&self) -> RefreshCompletionWaiter {
         self.waiter(false)
+    }
+
+    /// Takes a waiter answered by the recorded outcome of the refresh requested
+    /// as `id`, or of a later request.
+    ///
+    /// This is the question a caller that issued the request itself is asking.
+    /// Only [`Self::record`] and [`Self::record_terminal_failure`] decide it, so
+    /// an untriggered completion, before or after the request's own outcome,
+    /// cannot report it loaded.
+    #[must_use]
+    pub fn waiter_for(&self, id: RefreshRequestId) -> RefreshCompletionWaiter {
+        RefreshCompletionWaiter {
+            receiver: self.state.subscribe(),
+            threshold: id.saturating_sub(1),
+            decided_by: DecidedBy::Requests,
+        }
     }
 
     /// Takes a waiter for the first refresh recorded since the table was built,
@@ -272,6 +296,7 @@ impl RefreshCompletion {
         RefreshCompletionWaiter {
             receiver,
             threshold,
+            decided_by: DecidedBy::AnyCompletion,
         }
     }
 }
@@ -340,6 +365,16 @@ pub struct RefreshCompletionWaiter {
     /// The [`RefreshRequestId`] a recorded completion has to exceed to answer
     /// this waiter. See [`RefreshCompletion::waiter`].
     threshold: RefreshRequestId,
+    decided_by: DecidedBy,
+}
+
+/// Which successful completions answer a [`RefreshCompletionWaiter`].
+#[derive(Debug, Clone, Copy)]
+enum DecidedBy {
+    /// Any completion, requested or untriggered.
+    AnyCompletion,
+    /// Only completions recorded for a request.
+    Requests,
 }
 
 impl RefreshCompletionWaiter {
@@ -376,7 +411,11 @@ impl RefreshCompletionWaiter {
     /// earlier waiter the same way a later `record` does today.
     fn decided_outcome(&self) -> Option<RefreshCompletionOutcome> {
         let state = *self.receiver.borrow();
-        if state.closed || state.completed > self.threshold {
+        let completed = match self.decided_by {
+            DecidedBy::AnyCompletion => state.completed,
+            DecidedBy::Requests => state.recorded,
+        };
+        if state.closed || completed > self.threshold {
             Some(RefreshCompletionOutcome::Answered)
         } else if state.failed > self.threshold {
             Some(RefreshCompletionOutcome::TerminalFailure)
@@ -896,5 +935,43 @@ mod tests {
                 && warmup_settled,
             "a one-shot failure must settle warmup without looking like success"
         );
+    }
+
+    /// A CDC table reloads its partitions on request while its change stream keeps
+    /// applying. An apply in between is not the reload, so it must not answer
+    /// the caller waiting for the reload it requested.
+    #[tokio::test]
+    async fn an_untriggered_completion_does_not_answer_an_outstanding_request() {
+        let completion = RefreshCompletion::new();
+        let id = completion.issue();
+        let waiter = completion.waiter_for(id);
+
+        completion.record_untriggered();
+        let waiter = match timeout(SHORT, waiter.wait()).await {
+            Ok(outcome) => panic!("an apply answered the requested reload: {outcome:?}"),
+            Err(_) => completion.waiter_for(id),
+        };
+
+        completion.record(id);
+        let outcome = timeout(SHORT, waiter.wait())
+            .await
+            .expect("the requested reload's completion must answer its waiter");
+        assert_eq!(outcome, RefreshCompletionOutcome::Answered);
+    }
+
+    /// A change stream keeps applying after a reload fails. A caller that reads
+    /// the reload's outcome only after such an apply must still see the failure.
+    #[tokio::test]
+    async fn an_untriggered_completion_after_a_failed_request_does_not_answer_it() {
+        let completion = RefreshCompletion::new();
+        let id = completion.issue();
+        let waiter = completion.waiter_for(id);
+
+        completion.record_terminal_failure(id);
+        completion.record_untriggered();
+        let outcome = timeout(SHORT, waiter.wait())
+            .await
+            .expect("a terminal failure must end the wait");
+        assert_eq!(outcome, RefreshCompletionOutcome::TerminalFailure);
     }
 }

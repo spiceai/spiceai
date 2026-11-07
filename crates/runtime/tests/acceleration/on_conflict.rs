@@ -92,48 +92,48 @@ INSERT INTO event_logs (event_name, event_timestamp) VALUES
                 port,
             );
 
-            let duckdb_mem_on_conflict_upsert = create_sqlite_or_duckdb_test_dataset(
+            let cayenne_mem_on_conflict_upsert = create_file_or_memory_test_dataset(
                 OnConflictBehavior::Upsert,
                 "postgres:event_logs",
-                "duckdb_mem_on_conflict_upsert",
+                "cayenne_mem_on_conflict_upsert",
                 None,
                 port,
                 Mode::Memory,
-                "duckdb",
+                "cayenne",
             );
 
-            let duckdb_mem_on_conflict_drop = create_sqlite_or_duckdb_test_dataset(
+            let cayenne_mem_on_conflict_drop = create_file_or_memory_test_dataset(
                 OnConflictBehavior::Drop,
                 "postgres:event_logs",
-                "duckdb_mem_on_conflict_drop",
+                "cayenne_mem_on_conflict_drop",
                 None,
                 port,
                 Mode::Memory,
-                "duckdb",
+                "cayenne",
             );
 
-            let duckdb_file_path = random_db_name();
-            let duckdb_file_on_conflict_upsert = create_sqlite_or_duckdb_test_dataset(
+            let cayenne_file_path = random_db_name();
+            let cayenne_file_on_conflict_upsert = create_file_or_memory_test_dataset(
                 OnConflictBehavior::Upsert,
                 "postgres:event_logs",
-                "duckdb_file_on_conflict_upsert",
-                Some(duckdb_file_path.clone()),
+                "cayenne_file_on_conflict_upsert",
+                Some(cayenne_file_path.clone()),
                 port,
                 Mode::File,
-                "duckdb",
+                "cayenne",
             );
 
-            let duckdb_file_on_conflict_drop = create_sqlite_or_duckdb_test_dataset(
+            let cayenne_file_on_conflict_drop = create_file_or_memory_test_dataset(
                 OnConflictBehavior::Drop,
                 "postgres:event_logs",
-                "duckdb_file_on_conflict_drop",
-                Some(duckdb_file_path.clone()),
+                "cayenne_file_on_conflict_drop",
+                Some(cayenne_file_path.clone()),
                 port,
                 Mode::File,
-                "duckdb",
+                "cayenne",
             );
 
-            let sqlite_mem_on_conflict_upsert = create_sqlite_or_duckdb_test_dataset(
+            let sqlite_mem_on_conflict_upsert = create_file_or_memory_test_dataset(
                 OnConflictBehavior::Upsert,
                 "postgres:event_logs",
                 "sql_mem_on_conflict_upsert",
@@ -143,7 +143,7 @@ INSERT INTO event_logs (event_name, event_timestamp) VALUES
                 "sqlite",
             );
 
-            let sqlite_mem_on_conflict_drop = create_sqlite_or_duckdb_test_dataset(
+            let sqlite_mem_on_conflict_drop = create_file_or_memory_test_dataset(
                 OnConflictBehavior::Drop,
                 "postgres:event_logs",
                 "sql_mem_on_conflict_drop",
@@ -154,7 +154,7 @@ INSERT INTO event_logs (event_name, event_timestamp) VALUES
             );
 
             let sqlite_upsert_file_path = random_db_name();
-            let sqlite_file_on_conflict_upsert = create_sqlite_or_duckdb_test_dataset(
+            let sqlite_file_on_conflict_upsert = create_file_or_memory_test_dataset(
                 OnConflictBehavior::Upsert,
                 "postgres:event_logs",
                 "sql_file_on_conflict_upsert",
@@ -165,7 +165,7 @@ INSERT INTO event_logs (event_name, event_timestamp) VALUES
             );
 
             let sqlite_drop_file_path = random_db_name();
-            let sqlite_file_on_conflict_drop = create_sqlite_or_duckdb_test_dataset(
+            let sqlite_file_on_conflict_drop = create_file_or_memory_test_dataset(
                 OnConflictBehavior::Drop,
                 "postgres:event_logs",
                 "sql_file_on_conflict_drop",
@@ -178,10 +178,10 @@ INSERT INTO event_logs (event_name, event_timestamp) VALUES
             let app = AppBuilder::new("on_conflict_behavior")
                 .with_dataset(pg_on_conflict_upsert)
                 .with_dataset(pg_on_conflict_drop)
-                .with_dataset(duckdb_mem_on_conflict_upsert)
-                .with_dataset(duckdb_mem_on_conflict_drop)
-                .with_dataset(duckdb_file_on_conflict_upsert)
-                .with_dataset(duckdb_file_on_conflict_drop)
+                .with_dataset(cayenne_mem_on_conflict_upsert)
+                .with_dataset(cayenne_mem_on_conflict_drop)
+                .with_dataset(cayenne_file_on_conflict_upsert)
+                .with_dataset(cayenne_file_on_conflict_drop)
                 .with_dataset(sqlite_mem_on_conflict_upsert)
                 .with_dataset(sqlite_mem_on_conflict_drop)
                 .with_dataset(sqlite_file_on_conflict_upsert)
@@ -229,24 +229,24 @@ WHERE event_name = 'File Download'
                 "SELECT * FROM pg_on_conflict_drop order by event_id asc",
             )
             .await?;
-            let duckdb_mem_upsert_data = get_query_result(
+            let cayenne_mem_upsert_data = get_query_result(
                 &rt,
-                "SELECT * FROM duckdb_mem_on_conflict_upsert order by event_id asc",
+                "SELECT * FROM cayenne_mem_on_conflict_upsert order by event_id asc",
             )
             .await?;
-            let duckdb_mem_drop_data = get_query_result(
+            let cayenne_mem_drop_data = get_query_result(
                 &rt,
-                "SELECT * FROM duckdb_mem_on_conflict_drop order by event_id asc",
+                "SELECT * FROM cayenne_mem_on_conflict_drop order by event_id asc",
             )
             .await?;
-            let duckdb_file_upsert_data = get_query_result(
+            let cayenne_file_upsert_data = get_query_result(
                 &rt,
-                "SELECT * FROM duckdb_file_on_conflict_upsert order by event_id asc",
+                "SELECT * FROM cayenne_file_on_conflict_upsert order by event_id asc",
             )
             .await?;
-            let duckdb_file_drop_data = get_query_result(
+            let cayenne_file_drop_data = get_query_result(
                 &rt,
-                "SELECT * FROM duckdb_file_on_conflict_drop order by event_id asc",
+                "SELECT * FROM cayenne_file_on_conflict_drop order by event_id asc",
             )
             .await?;
             let sqlite_mem_upsert_data = get_query_result(
@@ -296,17 +296,19 @@ WHERE event_name = 'File Download'
 
             assert_batches_eq!(upsert_expected_result, &pg_upsert_data);
             assert_batches_eq!(drop_expected_result, &pg_drop_data);
-            assert_batches_eq!(upsert_expected_result, &duckdb_mem_upsert_data);
-            assert_batches_eq!(drop_expected_result, &duckdb_mem_drop_data);
-            assert_batches_eq!(upsert_expected_result, &duckdb_file_upsert_data);
-            assert_batches_eq!(drop_expected_result, &duckdb_file_drop_data);
+            assert_batches_eq!(upsert_expected_result, &cayenne_mem_upsert_data);
+            // A Cayenne table with a primary key keeps the last version of a key
+            // whatever its `on_conflict` (#14576), so its `drop` tables hold the update.
+            assert_batches_eq!(upsert_expected_result, &cayenne_mem_drop_data);
+            assert_batches_eq!(upsert_expected_result, &cayenne_file_upsert_data);
+            assert_batches_eq!(upsert_expected_result, &cayenne_file_drop_data);
             assert_batches_eq!(upsert_expected_result, &sqlite_mem_upsert_data);
             assert_batches_eq!(drop_expected_result, &sqlite_mem_drop_data);
             assert_batches_eq!(upsert_expected_result, &sqlite_file_upsert_data);
             assert_batches_eq!(drop_expected_result, &sqlite_file_drop_data);
 
-            running_container.remove().await?;
-            std::fs::remove_file(&duckdb_file_path).expect("File should be removed");
+            running_container.cleanup().await;
+            std::fs::remove_dir_all(&cayenne_file_path).expect("File should be removed");
             std::fs::remove_file(&sqlite_upsert_file_path).expect("File should be removed");
             std::fs::remove_file(&sqlite_drop_file_path).expect("File should be removed");
             std::fs::remove_file(format!("{sqlite_upsert_file_path}-shm"))
@@ -366,7 +368,7 @@ fn create_postgres_test_dataset(
     dataset
 }
 
-fn create_sqlite_or_duckdb_test_dataset(
+fn create_file_or_memory_test_dataset(
     on_conflict: OnConflictBehavior,
     from: &str,
     name: &str,

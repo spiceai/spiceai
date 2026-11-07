@@ -76,7 +76,6 @@ async fn wait_ready(rt: &Arc<Runtime>) {
 }
 
 #[tokio::test]
-#[expect(clippy::expect_used)]
 async fn warmup_record_persist_restart_refresh_ready_cache_hit() {
     let request_context = Arc::new(
         RequestContext::builder(Protocol::Internal)

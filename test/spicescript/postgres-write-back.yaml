@@ -1,0 +1,393 @@
+name: postgres-write-back
+description: >
+  PostgreSQL CDC into file-mode Cayenne, with and without
+  `write_mode: write_back`. A write-back dataset refuses a write outside a
+  transaction; a committed transaction reaches PostgreSQL once and its echo
+  over CDC does not overwrite what Spice committed, while other writers'
+  changes land; timestamps keep their microseconds both ways; a dataset
+  bootstraps with or without an explicit replication slot; a changes dataset
+  needs a primary key (declared or the table's own); and
+  `cayenne_pk_conflict_detection: none` is refused where it would lose writes.
+
+sources:
+  src: { kind: postgres }
+
+spicepod:
+  version: v1
+  kind: Spicepod
+  name: postgres-write-back
+  datasets:
+    # Write-back datasets: writable, replicating, CDC-fed, keyed by id.
+    - from: postgres:public.wb_plain
+      name: wb_plain
+      params: { $merge: '${sources.src.params}', pg_replication_slot: 'wb_plain_${sources.src.namespace}' }
+      access: read_write
+      replication: { enabled: true }
+      acceleration: { enabled: true, engine: cayenne, mode: file, refresh_mode: changes, write_mode: write_back, primary_key: id }
+    - from: postgres:public.wb_echo
+      name: wb_echo
+      params: { $merge: '${sources.src.params}', pg_replication_slot: 'wb_echo_${sources.src.namespace}' }
+      access: read_write
+      replication: { enabled: true }
+      acceleration: { enabled: true, engine: cayenne, mode: file, refresh_mode: changes, write_mode: write_back, primary_key: id }
+    - from: postgres:public.wb_noslot
+      name: wb_noslot
+      params: ${sources.src.params}
+      access: read_write
+      replication: { enabled: true }
+      acceleration: { enabled: true, engine: cayenne, mode: file, refresh_mode: changes, write_mode: write_back, primary_key: id }
+    - from: postgres:public.wb_counter
+      name: wb_counter
+      params: { $merge: '${sources.src.params}', pg_replication_slot: 'wb_counter_${sources.src.namespace}' }
+      access: read_write
+      replication: { enabled: true }
+      acceleration: { enabled: true, engine: cayenne, mode: file, refresh_mode: changes, write_mode: write_back, primary_key: id }
+    - from: postgres:public.wb_precision
+      name: wb_precision
+      params: { $merge: '${sources.src.params}', pg_replication_slot: 'wb_precision_${sources.src.namespace}' }
+      access: read_write
+      replication: { enabled: true }
+      acceleration: { enabled: true, engine: cayenne, mode: file, refresh_mode: changes, write_mode: write_back, primary_key: id }
+    - from: postgres:public.wb_big
+      name: wb_big
+      params: { $merge: '${sources.src.params}', pg_replication_slot: 'wb_big_${sources.src.namespace}' }
+      access: read_write
+      replication: { enabled: true }
+      acceleration: { enabled: true, engine: cayenne, mode: file, refresh_mode: changes, write_mode: write_back, primary_key: id }
+
+    # Plain CDC readers.
+    - from: postgres:public.cdc_plain
+      name: cdc_plain
+      params: { $merge: '${sources.src.params}', pg_replication_slot: 'cdc_plain_${sources.src.namespace}' }
+      acceleration: { enabled: true, engine: cayenne, mode: file, refresh_mode: changes, primary_key: id }
+    # REPLICA IDENTITY FULL does not give a table a key.
+    - from: postgres:public.cdc_keyless
+      name: cdc_keyless
+      params: ${sources.src.params}
+      acceleration: { enabled: true, engine: cayenne, mode: file, refresh_mode: changes }
+    - from: postgres:public.cdc_keyless
+      name: cdc_keyed
+      params: ${sources.src.params}
+      acceleration: { enabled: true, engine: cayenne, mode: file, refresh_mode: changes, primary_key: k }
+    # The table's own primary key, not declared on the dataset.
+    - from: postgres:public.cdc_source_key
+      name: cdc_source_key
+      params: ${sources.src.params}
+      acceleration: { enabled: true, engine: cayenne, mode: file, refresh_mode: changes }
+
+    # cayenne_pk_conflict_detection: none, refused for a keyed CDC dataset and
+    # a write-back one, accepted for a read-only full refresh; pkd_ctl is the
+    # control on the same slot.
+    - from: postgres:public.pkd_cdc
+      name: pkd_cdc
+      params: { $merge: '${sources.src.params}', pg_replication_slot: 'pkd_${sources.src.namespace}' }
+      acceleration: { enabled: true, engine: cayenne, mode: file, refresh_mode: changes, primary_key: id,
+        params: { cayenne_pk_conflict_detection: none } }
+    - from: postgres:public.pkd_wb
+      name: pkd_wb
+      params: { $merge: '${sources.src.params}', pg_replication_slot: 'pkd_${sources.src.namespace}' }
+      access: read_write
+      replication: { enabled: true }
+      acceleration: { enabled: true, engine: cayenne, mode: file, refresh_mode: changes, write_mode: write_back, primary_key: id,
+        params: { cayenne_pk_conflict_detection: none } }
+    - from: postgres:public.pkd_ctl
+      name: pkd_ctl
+      params: { $merge: '${sources.src.params}', pg_replication_slot: 'pkd_${sources.src.namespace}' }
+      acceleration: { enabled: true, engine: cayenne, mode: file, refresh_mode: changes, primary_key: id }
+    - from: postgres:public.pkd_ro
+      name: pkd_ro
+      params: ${sources.src.params}
+      acceleration: { enabled: true, engine: cayenne, mode: file, refresh_mode: full, write_mode: acceleration, primary_key: id,
+        params: { cayenne_pk_conflict_detection: none } }
+
+defaults:
+  expect: { oracle: src }
+
+# The trigger on wb_echo stamps every n below 1000 with +1000 at the source,
+# so the row PostgreSQL stores is never the row Spice committed: an echo that
+# overwrote Spice's row would show. It is idempotent because a delivery is an
+# upsert, which fires the trigger for INSERT and again for UPDATE. The seed
+# row is written before the trigger exists.
+#
+# A row written straight to PostgreSQL after a delivery has committed there
+# commits later in the WAL, and replication delivers in commit order, so once
+# Spice serves it the delivery's echo has been processed.
+steps:
+  - source-exec:
+      src: |
+        CREATE TABLE wb_plain (id int PRIMARY KEY, n int NOT NULL);
+        INSERT INTO wb_plain VALUES (1, 10);
+        CREATE TABLE wb_echo (id int PRIMARY KEY, n int NOT NULL);
+        INSERT INTO wb_echo VALUES (1, 10);
+        CREATE FUNCTION bump_wb_echo() RETURNS trigger AS $$
+        BEGIN
+          IF NEW.n < 1000 THEN NEW.n := NEW.n + 1000; END IF;
+          RETURN NEW;
+        END;
+        $$ LANGUAGE plpgsql;
+        CREATE TRIGGER bump_wb_echo_trigger BEFORE INSERT OR UPDATE ON wb_echo
+          FOR EACH ROW EXECUTE FUNCTION bump_wb_echo();
+        CREATE TABLE wb_noslot (id int PRIMARY KEY, amount int NOT NULL);
+        INSERT INTO wb_noslot VALUES (1, 10);
+        CREATE TABLE wb_counter (id int PRIMARY KEY, value bigint NOT NULL);
+        INSERT INTO wb_counter VALUES (1, 0);
+        CREATE TABLE wb_precision (id int PRIMARY KEY, wall timestamp, instant timestamptz, n int);
+        INSERT INTO wb_precision VALUES (0, NULL, NULL, 0);
+        CREATE TABLE wb_big (id bigint PRIMARY KEY, value bigint NOT NULL);
+        INSERT INTO wb_big VALUES (9007199254740993, 7);
+        CREATE TABLE wb_gate (open boolean NOT NULL);
+        INSERT INTO wb_gate VALUES (false);
+        CREATE FUNCTION wb_big_gate() RETURNS trigger AS $$
+        BEGIN
+          IF NOT (SELECT open FROM wb_gate) THEN RAISE EXCEPTION 'wb_big is closed for delivery'; END IF;
+          RETURN NEW;
+        END;
+        $$ LANGUAGE plpgsql;
+        CREATE TRIGGER wb_big_gate_trigger BEFORE INSERT OR UPDATE ON wb_big
+          FOR EACH ROW EXECUTE FUNCTION wb_big_gate();
+        CREATE TABLE cdc_plain (id int PRIMARY KEY, amount int NOT NULL);
+        INSERT INTO cdc_plain VALUES (1, 10);
+        CREATE TABLE cdc_keyless (k text NOT NULL, v int NOT NULL);
+        ALTER TABLE cdc_keyless REPLICA IDENTITY FULL;
+        INSERT INTO cdc_keyless VALUES ('a', 1), ('b', 2);
+        CREATE TABLE cdc_source_key (id int PRIMARY KEY, v int NOT NULL);
+        INSERT INTO cdc_source_key VALUES (1, 1), (2, 2);
+        CREATE TABLE pkd_cdc (id int PRIMARY KEY, n int NOT NULL);
+        INSERT INTO pkd_cdc VALUES (1, 10);
+        CREATE TABLE pkd_wb (id int PRIMARY KEY, n int NOT NULL);
+        INSERT INTO pkd_wb VALUES (1, 10);
+        CREATE TABLE pkd_ctl (id int PRIMARY KEY, n int NOT NULL);
+        INSERT INTO pkd_ctl VALUES (1, 10);
+        CREATE TABLE pkd_ro (id int PRIMARY KEY, n int NOT NULL);
+        INSERT INTO pkd_ro VALUES (1, 10);
+  # Three datasets are refused, so the runtime is never ready.
+  - start: { ready: false }
+
+  # Refusals.
+  - assert-status:
+      dataset: cdc_keyless
+      status: Error
+      message-contains: >-
+        Table `public.cdc_keyless` has no primary key, and `refresh_mode: changes` needs
+        one to apply UPDATE and DELETE events. Set `acceleration.primary_key` to the
+        columns that identify a row. Postgres sends those columns with every change
+        only under `REPLICA IDENTITY FULL` (run
+        `ALTER TABLE public.cdc_keyless REPLICA IDENTITY FULL;`) or
+        `REPLICA IDENTITY USING INDEX` on a unique index over them.
+        See: https://spiceai.org/docs/features/cdc/postgres-replication
+    eventually: 60s
+  - assert-status:
+      dataset: pkd_cdc
+      status: Error
+      message-contains: >-
+        Failed to register dataset pkd_cdc (postgres): 'cayenne_pk_conflict_detection: none'
+        turns off the primary-key check Cayenne uses to replace a stored row, but this
+        dataset applies its source's changes ('refresh_mode: changes'), so a change to an
+        existing key would add a second row for that key instead of replacing it. Set
+        'cayenne_pk_conflict_detection' to 'auto', its default.
+        See: https://spiceai.org/docs/components/data-accelerators/cayenne
+    eventually: 60s
+  - assert-status:
+      dataset: pkd_wb
+      status: Error
+      message-contains: >-
+        Failed to register dataset pkd_wb (postgres): 'cayenne_pk_conflict_detection: none'
+        turns off the primary-key check Cayenne uses to replace a stored row, but this
+        dataset uses 'acceleration.write_mode: write_back', which records each committed
+        write for delivery from that check, so every write would be acknowledged and never
+        reach the source. Set 'cayenne_pk_conflict_detection' to 'auto', its default.
+        See: https://spiceai.org/docs/components/data-accelerators/cayenne
+    eventually: 60s
+  - query: SELECT id, n FROM pkd_ro
+    eventually: 60s
+
+  # Every other dataset bootstraps, with or without an explicit slot.
+  - query: SELECT id, n FROM wb_plain
+    eventually: 60s
+  - query: SELECT id, n FROM wb_echo
+    eventually: 60s
+  - query: SELECT id, amount FROM wb_noslot
+    eventually: 60s
+  - query: SELECT id, value FROM wb_counter
+    eventually: 60s
+  - query: SELECT id, n FROM wb_precision
+    eventually: 60s
+  - query: SELECT id, amount FROM cdc_plain
+    eventually: 60s
+  - query: SELECT k, v FROM cdc_keyed
+    oracle-sql: SELECT k, v FROM cdc_keyless
+    eventually: 60s
+  - query: SELECT id, v FROM cdc_source_key
+    eventually: 60s
+  - query: SELECT id, n FROM pkd_ctl
+    eventually: 60s
+  - query: SELECT id, value FROM wb_big
+    eventually: 60s
+
+  # A write-back dataset takes writes only in a transaction.
+  - spice-exec: INSERT INTO wb_plain (id, n) VALUES (2, 50)
+    expect-error: "Failed to write to dataset 'wb_plain': a dataset with 'acceleration.write_mode: write_back' accepts writes only inside a transaction, because only a transaction records the write durably for delivery to the federated source. Send the statement as one 'BEGIN; ...; COMMIT;' body."
+  - spice-exec: UPDATE wb_plain SET n = 11 WHERE id = 1
+    expect-error: "a dataset with 'acceleration.write_mode: write_back' accepts writes only inside a transaction"
+  - source-query: { src: "SELECT count(*) FROM wb_plain" }
+    expect: { rows: [['1']] }
+  - query: SELECT id, n FROM wb_plain
+
+  # Source changes follow into every reader, keyed by a declared key or the
+  # table's own.
+  - source-exec:
+      src: |
+        INSERT INTO cdc_plain VALUES (2, 20);
+        UPDATE cdc_keyless SET v = 10 WHERE k = 'a';
+        DELETE FROM cdc_keyless WHERE k = 'b';
+        UPDATE cdc_source_key SET v = 10 WHERE id = 1;
+        DELETE FROM cdc_source_key WHERE id = 2;
+        UPDATE pkd_ctl SET n = 20 WHERE id = 1;
+  - query: SELECT id, amount FROM cdc_plain
+    eventually: 30s
+  - query: SELECT k, v FROM cdc_keyed
+    oracle-sql: SELECT k, v FROM cdc_keyless
+    eventually: 30s
+    expect: { rows: [[a, '10']] }
+  - query: SELECT id, v FROM cdc_source_key
+    eventually: 30s
+    expect: { rows: [['1', '10']] }
+  - query: SELECT id, n FROM pkd_ctl
+    eventually: 30s
+    expect: { rows: [['1', '20']] }
+  # The refused datasets stay refused.
+  - assert-status: { dataset: pkd_cdc, status: Error }
+    consistently: 10s
+  - assert-status: { dataset: pkd_wb, status: Error }
+
+  # A transaction on a dataset without an explicit slot reaches the source.
+  - spice-exec: 'BEGIN; INSERT INTO wb_noslot (id, amount) VALUES (2, 20); COMMIT;'
+  - source-query: { src: "SELECT id, amount FROM wb_noslot ORDER BY id" }
+    expect: { rows: [['1', '10'], ['2', '20']] }
+    eventually: 30s
+
+  # A transaction's echo is dropped while a foreign write lands.
+  - spice-exec: 'BEGIN; INSERT INTO wb_echo (id, n) VALUES (2, 50); COMMIT;'
+  - source-query: { src: "SELECT n FROM wb_echo WHERE id = 2" }
+    expect: { rows: [['1050']] }
+    eventually: 30s
+  - source-exec: { src: "INSERT INTO wb_echo VALUES (9, 7)" }
+  - query: SELECT n FROM wb_echo WHERE id = 9
+    expect: { rows: [['1007']] }
+    eventually: 30s
+  - query: SELECT id, n FROM wb_echo
+    expect: { rows: [['1', '10'], ['2', '50'], ['9', '1007']] }
+  - source-query: { src: "SELECT id, n FROM wb_echo ORDER BY id" }
+    expect: { rows: [['1', '10'], ['2', '1050'], ['9', '1007']] }
+  # And over an existing key.
+  - spice-exec: 'BEGIN; INSERT INTO wb_echo (id, n) VALUES (2, 60); COMMIT;'
+  - source-query: { src: "SELECT n FROM wb_echo WHERE id = 2" }
+    expect: { rows: [['1060']] }
+    eventually: 30s
+  - source-exec: { src: "INSERT INTO wb_echo VALUES (11, 7)" }
+  - query: SELECT n FROM wb_echo WHERE id = 11
+    expect: { rows: [['1007']] }
+    eventually: 30s
+  - query: SELECT id, n FROM wb_echo
+    expect: { rows: [['1', '10'], ['2', '60'], ['9', '1007'], ['11', '1007']] }
+
+  # A primary-key point lookup ordered by the key, after a transactional
+  # commit at the source.
+  - query: SELECT id, value FROM wb_counter WHERE id = 1 ORDER BY id
+  - source-exec: { src: 'BEGIN; UPDATE wb_counter SET value = value + 1 WHERE id = 1; COMMIT;' }
+  - query: SELECT value FROM wb_counter WHERE id = 1
+    expect: { rows: [['1']] }
+    eventually: 30s
+  - query: SELECT id, value FROM wb_counter WHERE id = 1 ORDER BY id
+    expect: { rows: [['1', '1']] }
+  - query: SELECT id, value FROM wb_counter WHERE id IN (1) ORDER BY id
+    expect: { rows: [['1', '1']] }
+  - query: SELECT id, value FROM wb_counter WHERE id = 1 ORDER BY id DESC
+    expect: { rows: [['1', '1']] }
+
+  # Timestamps keep their microseconds through a write-back and its echo.
+  # PostgreSQL renders them with to_char, so the expected text is what was
+  # written; Spice must serve the same instants.
+  - spice-exec: >-
+      BEGIN; INSERT INTO wb_precision VALUES
+      (1, CAST('2026-01-02 03:04:05.000001' AS TIMESTAMP), CAST('2026-01-02T03:04:05.000001Z' AS TIMESTAMP WITH TIME ZONE), 1),
+      (2, CAST('2026-01-02 03:04:05.123456' AS TIMESTAMP), CAST('2026-01-02T03:04:05.123456+09:00' AS TIMESTAMP WITH TIME ZONE), 1),
+      (3, CAST('1969-12-31 23:59:59.123456' AS TIMESTAMP), CAST('1969-12-31T23:59:59.123456-07:00' AS TIMESTAMP WITH TIME ZONE), 1),
+      (4, CAST('2026-01-02 03:04:05' AS TIMESTAMP), CAST('2026-01-02T03:04:05Z' AS TIMESTAMP WITH TIME ZONE), 1);
+      COMMIT;
+  - source-query: { src: "SELECT id, to_char(wall, 'YYYY-MM-DD HH24:MI:SS.US'), to_char(instant AT TIME ZONE 'UTC', 'YYYY-MM-DD HH24:MI:SS.US') FROM wb_precision WHERE id > 0 ORDER BY id" }
+    expect: { rows: [
+      ['1', '2026-01-02 03:04:05.000001', '2026-01-02 03:04:05.000001'],
+      ['2', '2026-01-02 03:04:05.123456', '2026-01-01 18:04:05.123456'],
+      ['3', '1969-12-31 23:59:59.123456', '1970-01-01 06:59:59.123456'],
+      ['4', '2026-01-02 03:04:05.000000', '2026-01-02 03:04:05.000000']] }
+    eventually: 30s
+  - query: SELECT id, wall, instant FROM wb_precision WHERE id > 0
+    expect: { rows: [
+      ['1', '2026-01-02T03:04:05.000001', '2026-01-02T03:04:05.000001Z'],
+      ['2', '2026-01-02T03:04:05.123456', '2026-01-01T18:04:05.123456Z'],
+      ['3', '1969-12-31T23:59:59.123456', '1970-01-01T06:59:59.123456Z'],
+      ['4', '2026-01-02T03:04:05', '2026-01-02T03:04:05Z']] }
+    id: precision-inserted
+  - source-exec: { src: "UPDATE wb_precision SET n = n + 1 WHERE id = 0" }
+  - query: SELECT n FROM wb_precision WHERE id = 0
+    eventually: 30s
+  - query: SELECT id, wall, instant FROM wb_precision WHERE id > 0
+    expect: { same-as: precision-inserted }
+
+  # A transaction writes a table once.
+  - spice-exec: "BEGIN; UPDATE wb_precision SET wall = CAST('2026-02-03 03:04:05.000001' AS TIMESTAMP), instant = CAST('2026-02-03T03:04:05.000001Z' AS TIMESTAMP WITH TIME ZONE), n = 2 WHERE id = 1; COMMIT;"
+  - spice-exec: "BEGIN; UPDATE wb_precision SET wall = CAST('2026-02-03 03:04:05.123456' AS TIMESTAMP), instant = CAST('2026-02-03T03:04:05.123456+09:00' AS TIMESTAMP WITH TIME ZONE), n = 2 WHERE id = 2; COMMIT;"
+  - source-query: { src: "SELECT id, to_char(wall, 'YYYY-MM-DD HH24:MI:SS.US'), to_char(instant AT TIME ZONE 'UTC', 'YYYY-MM-DD HH24:MI:SS.US') FROM wb_precision WHERE id IN (1, 2) ORDER BY id" }
+    expect: { rows: [
+      ['1', '2026-02-03 03:04:05.000001', '2026-02-03 03:04:05.000001'],
+      ['2', '2026-02-03 03:04:05.123456', '2026-02-02 18:04:05.123456']] }
+    eventually: 30s
+  - query: SELECT id, wall, instant FROM wb_precision WHERE id IN (1, 2)
+    expect: { rows: [
+      ['1', '2026-02-03T03:04:05.000001', '2026-02-03T03:04:05.000001Z'],
+      ['2', '2026-02-03T03:04:05.123456', '2026-02-02T18:04:05.123456Z']] }
+    id: precision-updated
+  - source-exec: { src: "UPDATE wb_precision SET n = n + 1 WHERE id = 0" }
+  - query: SELECT n FROM wb_precision WHERE id = 0
+    eventually: 30s
+  - query: SELECT id, wall, instant FROM wb_precision WHERE id IN (1, 2)
+    expect: { same-as: precision-updated }
+
+  # Nanoseconds: Spice keeps them; PostgreSQL stores microseconds.
+  - spice-exec: "BEGIN; INSERT INTO wb_precision VALUES (7, CAST('2026-01-02 03:04:05.123456789' AS TIMESTAMP), CAST('2026-01-02T03:04:05.123456789Z' AS TIMESTAMP WITH TIME ZONE), 1); COMMIT;"
+  - source-query: { src: "SELECT to_char(wall, 'US'), to_char(instant, 'US') FROM wb_precision WHERE id = 7" }
+    expect: { rows: [['123456', '123457']] }
+    eventually: 30s
+  - source-exec: { src: "UPDATE wb_precision SET n = n + 1 WHERE id = 0" }
+  - query: SELECT n FROM wb_precision WHERE id = 0
+    eventually: 30s
+  - query: SELECT wall, instant FROM wb_precision WHERE id = 7
+    expect: { rows: [['2026-01-02T03:04:05.123456789', '2026-01-02T03:04:05.123456789Z']] }
+
+  # NULL timestamps both ways.
+  - spice-exec: "BEGIN; UPDATE wb_precision SET wall = NULL, instant = NULL, n = 3 WHERE id = 1; COMMIT;"
+  - source-query: { src: "SELECT wall IS NULL AND instant IS NULL, n FROM wb_precision WHERE id = 1" }
+    expect: { rows: [['t', '3']] }
+    eventually: 30s
+  - source-exec: { src: "UPDATE wb_precision SET n = n + 1 WHERE id = 0" }
+  - query: SELECT n FROM wb_precision WHERE id = 0
+    eventually: 30s
+  - query: SELECT wall IS NULL AND instant IS NULL AS both_null FROM wb_precision WHERE id = 1
+    expect: { rows: [['true']] }
+
+  # A bigint key above 2^53 reaches the source, and only through delivery: the
+  # gate trigger refuses every write until it opens, so the write waits as a
+  # pending key until then.
+  - spice-exec: "BEGIN; UPDATE wb_big SET value = 4242 WHERE id = 9007199254740993; COMMIT;"
+  - query: SELECT id, value FROM wb_big
+    expect: { rows: [['9007199254740993', '4242']] }
+  - wait-metric: { name: dataset_acceleration_write_back_pending_keys, labels: { dataset: wb_big }, above: 0, timeout: 30s }
+  - source-query: { src: "SELECT id, value FROM wb_big" }
+    expect: { rows: [['9007199254740993', '7']] }
+    consistently: 5s
+  - source-exec: { src: "UPDATE wb_gate SET open = true" }
+  - source-query: { src: "SELECT id, value FROM wb_big" }
+    expect: { rows: [['9007199254740993', '4242']] }
+    eventually: 60s
+  - wait-metric: { name: dataset_acceleration_write_back_pending_keys, labels: { dataset: wb_big }, below: 1, timeout: 30s }

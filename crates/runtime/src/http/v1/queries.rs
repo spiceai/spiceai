@@ -659,10 +659,6 @@ pub(crate) async fn cancel(
     Extension(rt): Extension<Arc<Runtime>>,
     Path(query_id): Path<String>,
 ) -> Response {
-    if let Some(response) = super::require_write_access().await {
-        return response;
-    }
-
     let executor = match get_executor(&rt) {
         Ok(e) => e,
         Err(resp) => return resp,
@@ -702,10 +698,6 @@ pub(crate) async fn cancel_active(
     Extension(rt): Extension<Arc<Runtime>>,
     Path(query_id): Path<String>,
 ) -> Response {
-    if let Some(response) = super::require_write_access().await {
-        return response;
-    }
-
     let parsed_uuid = match uuid::Uuid::parse_str(&query_id) {
         Ok(uuid) => uuid,
         Err(e) => {
@@ -759,10 +751,6 @@ pub(crate) async fn cancel_active(
     )
 ))]
 pub(crate) async fn list_active(Extension(rt): Extension<Arc<Runtime>>) -> Response {
-    if let Some(response) = super::require_write_access().await {
-        return response;
-    }
-
     let caller = crate::jobs::current_job_owner().await;
     let registry = rt.df.query_cancel_registry();
     let queries: Vec<ActiveQuerySummary> = registry
@@ -1035,41 +1023,6 @@ mod tests {
             .await
             .expect("response body should be readable");
         serde_json::from_slice(&body).expect("response body should be valid JSON")
-    }
-
-    #[tokio::test]
-    async fn list_active_requires_write_access() {
-        let rt = test_runtime().await;
-        let context = Arc::new(RequestContextBuilder::new(Protocol::Http).build());
-        context
-            .set_auth_principal(Arc::new(ApiKey::ReadOnly {
-                key: "read-only".to_string(),
-            }) as AuthPrincipalRef)
-            .expect("auth principal should be set");
-
-        let response = context.scope(list_active(Extension(rt))).await;
-
-        assert_eq!(response.status(), StatusCode::FORBIDDEN);
-    }
-
-    #[tokio::test]
-    async fn cancel_active_requires_write_access() {
-        let rt = test_runtime().await;
-        let context = Arc::new(RequestContextBuilder::new(Protocol::Http).build());
-        context
-            .set_auth_principal(Arc::new(ApiKey::ReadOnly {
-                key: "read-only".to_string(),
-            }) as AuthPrincipalRef)
-            .expect("auth principal should be set");
-
-        let response = context
-            .scope(cancel_active(
-                Extension(rt),
-                Path(Uuid::new_v4().to_string()),
-            ))
-            .await;
-
-        assert_eq!(response.status(), StatusCode::FORBIDDEN);
     }
 
     #[tokio::test]

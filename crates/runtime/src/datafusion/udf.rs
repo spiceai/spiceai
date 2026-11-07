@@ -42,7 +42,6 @@ use runtime_search::full_text_udtf::TextSearchTableFunc;
 use runtime_search::rerank::{RERANK_UDTF_NAME, RerankModelStores, RerankTableFunc};
 use runtime_search::rrf;
 use runtime_search::rrf::RRF_UDF_NAME;
-use runtime_search::search_engine::parse_explicit_primary_keys;
 use runtime_search::udtf::{TEXT_SEARCH_UDTF_NAME, VECTOR_SEARCH_UDTF_NAME};
 use runtime_secrets::{ExposeSecret, get_params_with_secrets};
 #[cfg(not(feature = "models"))]
@@ -89,7 +88,8 @@ pub async fn register_udfs(runtime: &crate::Runtime) {
         Arc::new(ExecutorTableFunc::new(Arc::downgrade(&runtime.df))),
     );
 
-    let explicit_pks = parse_explicit_primary_keys(runtime.app()).await;
+    let explicit_pks = runtime.search_primary_keys.clone();
+    explicit_pks.update(runtime.app()).await;
     ctx.register_udf(
         VectorSearchTableFunc::new(Arc::downgrade(&runtime.df), explicit_pks.clone()).into(),
     );
@@ -175,6 +175,12 @@ pub async fn register_udfs(runtime: &crate::Runtime) {
         runtime.status(),
     )
     .register(ctx);
+
+    // Places the remaining async calls (`ai`, async user functions). Runs after the
+    // decision rule, which places decision calls itself.
+    ctx.add_optimizer_rule(Arc::new(
+        runtime_datafusion_udfs::async_placement::AsyncCallPlacement,
+    ));
 
     in_tracing_context_async(register_user_functions(runtime, ctx)).await;
 }
@@ -441,10 +447,7 @@ pub async fn apply_function_diff(
     new_app: &Arc<app::App>,
 ) {
     if apply_function_diff_inner(runtime, current_app, new_app).await {
-        runtime.df.clear_cached_plans().await;
-        if let Some(results) = runtime.df.results_cache_provider() {
-            results.invalidate_all().await;
-        }
+        runtime.df.clear_cached_plans_and_results().await;
     }
 }
 
@@ -753,6 +756,9 @@ mod deny_list_registration_tests {
             runtime_decide::AI_CLASSIFY_NAME,
             runtime_decide::AI_SCORE_NAME,
             runtime_decide::AI_DECIDE_NAME,
+            runtime_datafusion::checked_arithmetic::CHECKED_ADD_UDF_NAME,
+            runtime_datafusion::checked_arithmetic::CHECKED_SUB_UDF_NAME,
+            runtime_datafusion::checked_arithmetic::CHECKED_MUL_UDF_NAME,
         ]
         .iter()
         .map(ToString::to_string)
@@ -1028,6 +1034,21 @@ mod tests {
     /// The no-arg probe, for a name answered by name alone.
     fn make_named_expr(name: &str) -> Expr {
         make_named_call(name, vec![])
+    }
+
+    #[test]
+    fn deny_list_blocks_checked_integer_helpers() {
+        let support = deny_spice_specific_functions();
+        for name in [
+            runtime_datafusion::checked_arithmetic::CHECKED_ADD_UDF_NAME,
+            runtime_datafusion::checked_arithmetic::CHECKED_SUB_UDF_NAME,
+            runtime_datafusion::checked_arithmetic::CHECKED_MUL_UDF_NAME,
+        ] {
+            assert!(
+                !support.supports(&make_named_expr(name), None),
+                "{name} must stay local; remotes do not implement the checked kernels"
+            );
+        }
     }
 
     #[test]

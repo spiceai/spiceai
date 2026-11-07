@@ -184,6 +184,10 @@ impl DataConnector for FullTextConnector {
         self.inner_connector.supports_changes_stream()
     }
 
+    fn supports_partitioned_changes(&self) -> bool {
+        self.inner_connector.supports_partitioned_changes()
+    }
+
     fn supports_durable_write_back_delivery(&self) -> bool {
         self.inner_connector.supports_durable_write_back_delivery()
     }

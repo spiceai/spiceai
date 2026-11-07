@@ -62,6 +62,7 @@ jobs:
   # heavy jobs below and the other workflows run the full suite. This is what
   # replaces running all checks on every PR push.
   attestation:
+    environment: secret-free
     # GitHub-hosted: self-hosted runners don't run for fork PRs, which would
     # leave external contributors' required Attestation check unreported and
     # stuck.
@@ -277,7 +278,7 @@ jobs:
               return;
             }
 
-            const rustAffecting = /(^(crates|bin|tools|vendor)\/|\.(rs|snap|proto)$|(^|\/)Cargo\.(toml|lock)$|(^|\/)rust-toolchain(\.toml)?$|(^|\/)\.cargo\/|(^|\/)\.?(clippy|rustfmt)\.toml$|(^|\/)nextest\.toml$|(^|\/)layers\.toml$|^scripts\/(test_)?check_(crate_layers|table_layers|rust_gate_paths|module_reachability|fork_patches|bench_mysql_load_nulls)\.py$|^scripts\/(test_)?rust_guard_common\.py$|^docs\/dev\/fork_patches\.md$|^(Makefile|version\.txt)$|^test\/tpc-bench\/(Makefile|mysql-null-spec\.awk)$|^test\/tls\/|^test\/spicepods\/tpch\/sf1\/accelerated\/postgres\[catalog\]\[changes\]\.yaml$|^test\/source_versions\.json$)/;
+            const rustAffecting = /(^(crates|bin|tools|vendor)\/|\.(rs|snap|proto)$|(^|\/)Cargo\.(toml|lock)$|(^|\/)rust-toolchain(\.toml)?$|(^|\/)\.cargo\/|(^|\/)\.?(clippy|rustfmt)\.toml$|(^|\/)nextest\.toml$|(^|\/)layers\.toml$|^scripts\/(test_)?check_(crate_layers|table_layers|rust_gate_paths|module_reachability|fork_patches|bench_mysql_load_nulls)\.py$|^scripts\/(test_)?rust_guard_common\.py$|^scripts\/(test_)?nextest_build_targets\.py$|^docs\/dev\/fork_patches\.md$|^(Makefile|version\.txt)$|^test\/tpc-bench\/(Makefile|mysql-null-spec\.awk)$|^test\/tls\/|^test\/spicepods\/tpch\/sf1\/accelerated\/postgres\[catalog\]\[changes\]\.yaml$|^test\/source_versions\.json$)/;
             for (const file of files) {
               // A rename off a .rs path changes Rust sources even though the new
               // name doesn't match, so both sides of the rename must be clean.
@@ -625,6 +626,7 @@ jobs:
   # every PR push. `check_changes` lets docs-only merges skip the build and still
   # report success (a required check can't be skipped via paths-ignore).
   check_changes:
+    environment: secret-free
     if: ${{ github.event_name != 'pull_request' }}
     # The pool of the three required builds below, which all wait on this job.
     # On the `spiceai-macos` minis it queued 13.7 min at the median and 64.7 min
@@ -655,12 +657,13 @@ jobs:
   lint-rust:
     name: Rust Lint
     runs-on: spiceai-macos-large
+    environment: ci-build
     # Slowest observed success in the 2026-07-25..08-08 window: 126 min.
     timeout-minutes: 300
     needs: check_changes
     if: ${{ github.event_name != 'pull_request' }}
     env:
-      HAS_SPICEIO_SECRET: ${{ secrets.UNAS_SMB_PASS != '' }}
+      HAS_SPICEIO_SECRET: ${{ secrets.SMB_PASSWORD != '' }}
 
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -690,7 +693,7 @@ jobs:
         uses: spiceai/spiceio/.github/actions/setup@dd13a600d4af72fb179563000674f76812208534 # v0.11.0 assets; no gh; strips Authorization on cross-host redirect
         with:
           smb-url: smb://runner@192.168.3.148/ai_platform_dev
-          smb-pass: ${{ secrets.UNAS_SMB_PASS }}
+          smb-pass: ${{ secrets.SMB_PASSWORD }}
           token: ${{ github.token }}
           bucket: sccache
           region: us-west-1
@@ -705,10 +708,7 @@ jobs:
         if: needs.check_changes.outputs.relevant_changes == 'true'
         uses: ./.github/actions/setup-sccache
         with:
-          minio_endpoint: ${{ secrets.TEST_MINIO_ENDPOINT }}
           spiceio_endpoint: ${{ steps.setup-spiceio.outputs.endpoint }}
-          minio_access_key: ${{ secrets.TEST_MINIO_ACCESS_KEY }}
-          minio_secret_key: ${{ secrets.TEST_MINIO_SECRET_KEY }}
 
       - name: Install Protoc
         if: needs.check_changes.outputs.relevant_changes == 'true'
@@ -727,8 +727,6 @@ jobs:
         run: make lint-rust
         env:
           RUSTC_WRAPPER: ${{ env.RUSTC_WRAPPER }}
-          AWS_ACCESS_KEY_ID: ${{ secrets.TEST_MINIO_ACCESS_KEY }}
-          AWS_SECRET_ACCESS_KEY: ${{ secrets.TEST_MINIO_SECRET_KEY }}
           RUST_PROFILE: ${{ env.RUST_PROFILE }}
 
       - name: Show sccache stats
@@ -757,12 +755,13 @@ jobs:
   build-test:
     name: Build and Test
     runs-on: spiceai-macos-large
+    environment: ci-build
     # Slowest observed success in the 2026-07-25..08-08 window: 117 min.
     timeout-minutes: 300
     needs: [check_changes]
     if: ${{ github.event_name != 'pull_request' }}
     env:
-      HAS_SPICEIO_SECRET: ${{ secrets.UNAS_SMB_PASS != '' }}
+      HAS_SPICEIO_SECRET: ${{ secrets.SMB_PASSWORD != '' }}
 
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -831,7 +830,7 @@ jobs:
         uses: spiceai/spiceio/.github/actions/setup@dd13a600d4af72fb179563000674f76812208534 # v0.11.0 assets; no gh; strips Authorization on cross-host redirect
         with:
           smb-url: smb://runner@192.168.3.148/ai_platform_dev
-          smb-pass: ${{ secrets.UNAS_SMB_PASS }}
+          smb-pass: ${{ secrets.SMB_PASSWORD }}
           token: ${{ github.token }}
           bucket: sccache
           region: us-west-1
@@ -846,10 +845,7 @@ jobs:
         if: needs.check_changes.outputs.relevant_changes == 'true'
         uses: ./.github/actions/setup-sccache
         with:
-          minio_endpoint: ${{ secrets.TEST_MINIO_ENDPOINT }}
           spiceio_endpoint: ${{ steps.setup-spiceio.outputs.endpoint }}
-          minio_access_key: ${{ secrets.TEST_MINIO_ACCESS_KEY }}
-          minio_secret_key: ${{ secrets.TEST_MINIO_SECRET_KEY }}
 
       - name: Install Protoc
         if: needs.check_changes.outputs.relevant_changes == 'true'
@@ -863,7 +859,7 @@ jobs:
         if: needs.check_changes.outputs.relevant_changes == 'true'
         uses: ./.github/actions/setup-cc
 
-      # No separate CLI build: nextest's `--tests` build already emits the `spice`
+      # No separate CLI build: nextest's build already emits the `spice`
       # binary, since cargo builds a package's bins alongside that package's
       # integration tests, so a CLI link error fails nextest itself. `verify-cli`
       # asserts the binary is there and runs, so the gate reports it if cargo ever
@@ -874,16 +870,8 @@ jobs:
         run: make nextest verify-cli
         env:
           RUSTC_WRAPPER: ${{ env.RUSTC_WRAPPER }}
-          AWS_ACCESS_KEY_ID: ${{ secrets.TEST_MINIO_ACCESS_KEY }}
-          AWS_SECRET_ACCESS_KEY: ${{ secrets.TEST_MINIO_SECRET_KEY }}
           RUST_PROFILE: ${{ env.RUST_PROFILE }}
-          AWS_S3_CLIENT_ID: ${{ secrets.AWS_S3_CLIENT_ID }}
-          AWS_S3_IDENTITY_POOL_ID: ${{ secrets.AWS_S3_IDENTITY_POOL_ID }}
-          AWS_S3_USERNAME: ${{ secrets.AWS_S3_USERNAME }}
-          AWS_S3_PASSWORD: ${{ secrets.AWS_S3_PASSWORD }}
-          AWS_COGNITO_IDP_URI: ${{ vars.AWS_COGNITO_IDP_URI }}
           AWS_REGION: ${{ vars.AWS_REGION }}
-          AWS_ROLE_ARN: ${{ secrets.AWS_ROLE_ARN }}
           INSTA_UPDATE: ${{ github.event.inputs.update_snapshots || 'no' }}
           # Lighter Cayenne fuzz/race depth for the merge-queue gate (see
           # crates/cayenne/tests/mutation_property_test.rs and common::env_scale);
@@ -895,8 +883,6 @@ jobs:
         if: needs.check_changes.outputs.relevant_changes == 'true'
         env:
           RUSTC_WRAPPER: ${{ env.RUSTC_WRAPPER }}
-          AWS_ACCESS_KEY_ID: ${{ secrets.TEST_MINIO_ACCESS_KEY }}
-          AWS_SECRET_ACCESS_KEY: ${{ secrets.TEST_MINIO_SECRET_KEY }}
         run: cargo build -p testoperator --all-features --locked
 
       - name: Show sccache stats
@@ -954,12 +940,13 @@ jobs:
   build-install-release:
     name: Build (release profile)
     runs-on: spiceai-macos-large
+    environment: ci-build
     # Slowest observed success in the 2026-07-25..08-08 window: 106 min.
     timeout-minutes: 300
     needs: [check_changes]
     if: ${{ github.event_name != 'pull_request' }}
     env:
-      HAS_SPICEIO_SECRET: ${{ secrets.UNAS_SMB_PASS != '' }}
+      HAS_SPICEIO_SECRET: ${{ secrets.SMB_PASSWORD != '' }}
 
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -977,7 +964,7 @@ jobs:
         uses: spiceai/spiceio/.github/actions/setup@dd13a600d4af72fb179563000674f76812208534 # v0.11.0 assets; no gh; strips Authorization on cross-host redirect
         with:
           smb-url: smb://runner@192.168.3.148/ai_platform_dev
-          smb-pass: ${{ secrets.UNAS_SMB_PASS }}
+          smb-pass: ${{ secrets.SMB_PASSWORD }}
           token: ${{ github.token }}
           bucket: sccache
           region: us-west-1
@@ -992,10 +979,7 @@ jobs:
         if: needs.check_changes.outputs.relevant_changes == 'true'
         uses: ./.github/actions/setup-sccache
         with:
-          minio_endpoint: ${{ secrets.TEST_MINIO_ENDPOINT }}
           spiceio_endpoint: ${{ steps.setup-spiceio.outputs.endpoint }}
-          minio_access_key: ${{ secrets.TEST_MINIO_ACCESS_KEY }}
-          minio_secret_key: ${{ secrets.TEST_MINIO_SECRET_KEY }}
 
       - name: Install Protoc
         if: needs.check_changes.outputs.relevant_changes == 'true'
@@ -1014,8 +998,6 @@ jobs:
         env:
           RUSTC_WRAPPER: ${{ env.RUSTC_WRAPPER }}
           RUST_PROFILE: release
-          AWS_ACCESS_KEY_ID: ${{ secrets.TEST_MINIO_ACCESS_KEY }}
-          AWS_SECRET_ACCESS_KEY: ${{ secrets.TEST_MINIO_SECRET_KEY }}
         run: make install
 
       - name: make install-cli
@@ -1023,8 +1005,6 @@ jobs:
         env:
           RUSTC_WRAPPER: ${{ env.RUSTC_WRAPPER }}
           RUST_PROFILE: release
-          AWS_ACCESS_KEY_ID: ${{ secrets.TEST_MINIO_ACCESS_KEY }}
-          AWS_SECRET_ACCESS_KEY: ${{ secrets.TEST_MINIO_SECRET_KEY }}
         run: make install-cli
 
       - name: make install-spiced
@@ -1032,8 +1012,6 @@ jobs:
         env:
           RUSTC_WRAPPER: ${{ env.RUSTC_WRAPPER }}
           RUST_PROFILE: release
-          AWS_ACCESS_KEY_ID: ${{ secrets.TEST_MINIO_ACCESS_KEY }}
-          AWS_SECRET_ACCESS_KEY: ${{ secrets.TEST_MINIO_SECRET_KEY }}
         run: make install-spiced
 
       - name: Show sccache stats

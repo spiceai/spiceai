@@ -6,7 +6,7 @@
 //
 //     https://www.apache.org/licenses/LICENSE-2.0
 
-//! Peak memory under a fixed budget: Cayenne vs DuckDB.
+//! Peak memory under a fixed budget: Cayenne vs `DuckDB`.
 //!
 //! Every other `vs_duckdb_*` bench runs Cayenne on `RuntimeEnv::default()` —
 //! an UNLIMITED memory pool — so none of them can see whether Cayenne lives
@@ -20,19 +20,19 @@
 //!   tracker, wired into BOTH the table's `RuntimeEnv` (write path) and the
 //!   query `SessionContext` (scan path), mirroring spiced's single shared
 //!   `RuntimeEnv`.
-//! - **DuckDB**: `SET memory_limit='<budget>'` on the same file-backed DB.
+//! - **`DuckDB`**: `SET memory_limit='<budget>'` on the same file-backed DB.
 //!
 //! Three workloads per budget: a filtered scan-aggregate, a GROUP BY with
 //! 16Ki groups, and a PK upsert from parquet (the CDC replace shape).
 //!
 //! Reported signals, per (engine, workload, budget):
 //! - criterion wall-clock (latency at the budget);
-//! - `pool high-water` lines on stderr — the maximum bytes the DataFusion
+//! - `pool high-water` lines on stderr — the maximum bytes the `DataFusion`
 //!   pool had reserved at any point during the lane (Cayenne), best-effort
-//!   `duckdb_memory()` usage (DuckDB);
+//!   `duckdb_memory()` usage (`DuckDB`);
 //! - a hard assert that Cayenne's pool high-water never exceeds the budget
 //!   (the operator contract — exceeding it is a bug, not a slow lane);
-//! - a lane that cannot complete at a budget (ResourcesExhausted) is
+//! - a lane that cannot complete at a budget (`ResourcesExhausted`) is
 //!   SKIPPED with an explanatory stderr line rather than panicking — "needs
 //!   more than 256 MiB for this workload" is a finding, not a crash.
 //!
@@ -61,6 +61,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
+use arrow::array::Array as _;
 use arrow::array::RecordBatch;
 use criterion::{BenchmarkId, Criterion, criterion_group, criterion_main};
 use datafusion::common::Result as DataFusionResult;
@@ -69,7 +70,7 @@ use datafusion::execution::memory_pool::{
 };
 use datafusion::execution::runtime_env::{RuntimeEnv, RuntimeEnvBuilder};
 use datafusion::prelude::SessionContext;
-use duckdb::Connection;
+use duckdb_oracle::Connection;
 use tokio::runtime::Runtime;
 
 use common::{
@@ -88,7 +89,7 @@ const MEMORY_BUDGETS: &[(&str, usize)] = &[
     ("16GiB", 16 * 1024 * 1024 * 1024),
 ];
 
-/// Rows in the pre-loaded fixture. Matches `vs_duckdb_scaling`'s READ_ROWS
+/// Rows in the pre-loaded fixture. Matches `vs_duckdb_scaling`'s `READ_ROWS`
 /// so latency lanes are comparable across benches.
 const BASE_ROWS: usize = 1_048_576;
 
@@ -107,7 +108,7 @@ const GROUPBY_SQL: &str = "SELECT name, SUM(value) FROM t GROUP BY name";
 // ---------------------------------------------------------------------------
 
 /// Wraps the production pool shape (`TrackConsumersPool<GreedyMemoryPool>`)
-/// and records the maximum total reservation ever observed. DataFusion's
+/// and records the maximum total reservation ever observed. `DataFusion`'s
 /// `MemoryPool::reserved()` only reports the CURRENT reservation; the budget
 /// question is about the peak.
 #[derive(Debug)]
@@ -153,7 +154,7 @@ impl std::fmt::Display for HighWaterPool {
 }
 
 impl MemoryPool for HighWaterPool {
-    fn name(&self) -> &str {
+    fn name(&self) -> &'static str {
         "HighWaterPool"
     }
 
@@ -281,6 +282,10 @@ async fn try_upsert_from_parquet(
         .map_or(0, |rows| rows.value(0)))
 }
 
+#[expect(
+    clippy::cast_precision_loss,
+    reason = "Memory usage is displayed as approximate MiB"
+)]
 fn eprintln_lane_memory(engine: &str, workload: &str, budget_label: &str, bytes: u64) {
     eprintln!(
         "memory_budget: {engine}/{workload}@{budget_label} pool high-water = {bytes} bytes \
@@ -289,13 +294,18 @@ fn eprintln_lane_memory(engine: &str, workload: &str, budget_label: &str, bytes:
     );
 }
 
-/// Best-effort DuckDB memory usage via `duckdb_memory()` (sum of
+/// Best-effort `DuckDB` memory usage via `duckdb_memory()` (sum of
 /// `memory_usage_bytes` across its internal allocators).
 fn duckdb_memory_bytes(conn: &Connection) -> Option<i64> {
-    conn.prepare("SELECT COALESCE(SUM(memory_usage_bytes), 0) FROM duckdb_memory()")
-        .ok()?
-        .query_row([], |row| row.get::<_, i64>(0))
-        .ok()
+    let batches = conn
+        .query("SELECT CAST(COALESCE(SUM(memory_usage_bytes), 0) AS BIGINT) FROM duckdb_memory()")
+        .ok()?;
+    let values = batches
+        .first()?
+        .column(0)
+        .as_any()
+        .downcast_ref::<arrow::array::Int64Array>()?;
+    (!values.is_empty() && !values.is_null(0)).then(|| values.value(0))
 }
 
 // ---------------------------------------------------------------------------
@@ -317,7 +327,7 @@ fn bench_memory_budget(c: &mut Criterion) {
     write_parquet(&make_batch(schema(), 0, UPSERT_ROWS), &upsert_parquet);
 
     for &(budget_label, budget_bytes) in MEMORY_BUDGETS {
-        // All Cayenne metastore lanes (Sqlite, plus Turso when compiled in) —
+        // All Cayenne metastore lanes —
         // consistent with every other vs_duckdb_* bench, so memory-budget
         // numbers stay directly comparable across the paired suite.
         for &cay_lane in common::CAYENNE_LANES {
@@ -448,18 +458,24 @@ fn bench_memory_budget(c: &mut Criterion) {
                     BenchmarkId::new(format!("duckdb_{workload}"), budget_label),
                     |b| {
                         b.iter(|| {
-                            let mut stmt = fixture.conn.prepare(sql).expect("duckdb prepare");
-                            let mut rows = stmt.query([]).expect("duckdb query");
-                            let mut n: i64 = 0;
-                            while let Some(_row) = rows.next().expect("duckdb row") {
-                                n += 1;
-                            }
+                            let n: usize = fixture
+                                .conn
+                                .query(sql)
+                                .expect("duckdb query")
+                                .iter()
+                                .map(RecordBatch::num_rows)
+                                .sum();
                             black_box(n);
                         });
                     },
                 );
                 if let Some(bytes) = duckdb_memory_bytes(&fixture.conn) {
-                    eprintln_lane_memory("duckdb", workload, budget_label, bytes.max(0) as u64);
+                    eprintln_lane_memory(
+                        "duckdb",
+                        workload,
+                        budget_label,
+                        bytes.max(0).cast_unsigned(),
+                    );
                 }
             }
         }
@@ -483,7 +499,12 @@ fn bench_memory_budget(c: &mut Criterion) {
                 });
             });
             if let Some(bytes) = duckdb_memory_bytes(&fixture.conn) {
-                eprintln_lane_memory("duckdb", "upsert_16k", budget_label, bytes.max(0) as u64);
+                eprintln_lane_memory(
+                    "duckdb",
+                    "upsert_16k",
+                    budget_label,
+                    bytes.max(0).cast_unsigned(),
+                );
             }
         }
     }

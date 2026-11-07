@@ -1,0 +1,45 @@
+# Known failing (#15550).
+name: postgres-write-through-arithmetic
+description: >
+  Under `write_mode: write_through` to PostgreSQL, an UPDATE that sets a
+  column from arithmetic on an int, smallint or numeric column is applied as
+  it is on bigint, double and text columns. Today it is refused with
+  "Expression not supported CAST(CAST(i AS Int64) + Int64(1) AS Int32)": the
+  widening Spice adds for the arithmetic cannot be written back.
+
+sources:
+  src: { kind: postgres }
+
+spicepod:
+  version: v1
+  kind: Spicepod
+  name: postgres-write-through-arithmetic
+  datasets:
+    - from: postgres:public.a
+      name: a
+      params: { $merge: '${sources.src.params}', pg_replication_slot: 'wtna_${sources.src.namespace}' }
+      access: read_write
+      replication: { enabled: true }
+      acceleration: { enabled: true, engine: cayenne, mode: file, refresh_mode: changes, write_mode: write_through, primary_key: id }
+
+defaults:
+  expect: { oracle: src }
+
+steps:
+  - source-exec:
+      src: |
+        CREATE TABLE a (id int PRIMARY KEY, i int, b bigint, s smallint, d numeric(10, 2), f double precision, t text);
+        INSERT INTO a SELECT g, g, g, g, g, g, 'x' FROM generate_series(1, 5) g;
+  - start: {}
+  - query: SELECT * FROM a
+    eventually: 30s
+  # Accepted today.
+  - spice-exec: UPDATE a SET b = b + 1, f = f * 2, t = t || 'y' WHERE id = 1
+  # Refused today.
+  - spice-exec: UPDATE a SET i = i + 1 WHERE id = 2
+  - spice-exec: UPDATE a SET s = s + 1 WHERE id = 3
+  - spice-exec: UPDATE a SET d = d + 1 WHERE id = 4
+  - query: SELECT * FROM a
+    eventually: 30s
+  - query: SELECT i, s, d FROM a WHERE id IN (2, 3, 4) ORDER BY id
+    expect: { rows: [['3', '2', '2.00'], ['3', '4', '3.00'], ['4', '4', '5.00']] }

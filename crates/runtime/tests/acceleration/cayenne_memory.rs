@@ -80,7 +80,6 @@ async fn refresh(rt: &Arc<Runtime>, table: &str) -> Result<(), anyhow::Error> {
 /// must ATOMICALLY REPLACE the in-RAM tier), and confirm no data files touch disk.
 /// No primary key — the common Arrow (full-refresh) case.
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
-#[cfg(not(target_os = "windows"))]
 async fn test_cayenne_memory_mode_full_refresh_and_query() -> Result<(), anyhow::Error> {
     let _tracing = crate::init_tracing(Some("integration=debug,info"));
 
@@ -197,10 +196,6 @@ async fn test_cayenne_memory_mode_full_refresh_and_query() -> Result<(), anyhow:
 }
 
 // ── #12008: DML against a `mode: memory` Cayenne acceleration ──────────────
-//
-// One `cfg` for the whole section rather than one per test: the engine is not
-// built on Windows, so without it the helpers below compile there with no callers.
-#[cfg(not(target_os = "windows"))]
 mod dml {
     use super::*;
     use super::{execute_sql, refresh};

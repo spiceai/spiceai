@@ -26,11 +26,13 @@ limitations under the License.
 #![expect(deprecated)]
 
 use super::super::vector_io::{DeletionIdentifier, DeletionVectorWriteSpec, DeletionVectorWriter};
-use super::CayenneDeletionSink;
+use super::{CayenneDeletionSink, PreparedDeletionCache, PreparedDeletionPublish};
 use crate::provider::Error;
 use crate::provider::deletion_strategy::PositionDeletionVector;
 use crate::provider::utils::convert_to_u64_box;
 use crate::row_converter::{OwnedRow, RowConverter};
+use arrow::array::{Array, RecordBatch, RecordBatchOptions, StructArray, UInt64Array};
+use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use datafusion::datasource::listing::ListingTable;
 use datafusion::execution::context::SessionContext;
 use datafusion::optimizer::analyzer::type_coercion::TypeCoercionRewriter;
@@ -38,13 +40,13 @@ use datafusion_common::DFSchema;
 use datafusion_common::tree_node::TreeNode;
 use datafusion_expr::Expr;
 use datafusion_expr::execution_props::ExecutionProps;
-use datafusion_physical_expr::create_physical_expr;
+use datafusion_expr::utils::split_conjunction_owned;
 use datafusion_physical_expr::expressions as phys_expr;
+use datafusion_physical_expr::{PhysicalExpr, create_physical_expr};
 use futures::StreamExt;
 use object_store::ObjectStore;
 use roaring::RoaringBitmap;
 use std::collections::HashMap;
-use std::path::PathBuf;
 
 use object_store::path::Path as ObjectStorePath;
 use std::sync::{Arc, LazyLock};
@@ -55,32 +57,6 @@ use vortex::layout::layouts::row_idx::row_idx;
 use vortex_datafusion::DefaultExpressionConvertor;
 use vortex_datafusion::ExpressionConvertor;
 use vortex_session::VortexSession;
-
-struct PositionDeleteCleanup(Vec<PathBuf>);
-
-impl Drop for PositionDeleteCleanup {
-    fn drop(&mut self) {
-        let paths = std::mem::take(&mut self.0);
-        if let Ok(runtime) = tokio::runtime::Handle::try_current() {
-            runtime.spawn(async move {
-                crate::provider::delete::cleanup_uncommitted_delete_paths(&paths).await;
-            });
-        } else {
-            std::thread::spawn(move || {
-                for path in paths {
-                    match std::fs::remove_file(path) {
-                        Ok(()) => {}
-                        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-                        Err(error) => tracing::warn!(
-                            %error,
-                            "Failed to clean uncommitted deletion-vector file"
-                        ),
-                    }
-                }
-            });
-        }
-    }
-}
 
 static MAX_CONCURRENT_FILE_SCANS: LazyLock<usize> =
     LazyLock::new(|| cpu_budget::cpu_budget().cayenne_max_concurrent_file_scans());
@@ -107,6 +83,29 @@ impl CayenneDeletionSink {
         ctx: &SessionContext,
         tables: &[Arc<ListingTable>],
     ) -> crate::provider::Result<u64> {
+        let row_ids = self.scan_filtered_rows_position_based(ctx, tables).await?;
+        self.persist_position_based_deletions(row_ids).await
+    }
+
+    /// [`Self::delete_filtered_rows_position_based`] up to its catalog commit: the
+    /// deletion vectors are written, and the caller commits them (alongside its
+    /// inline-data rewrite) and then publishes them. `None` when no row matched.
+    pub(super) async fn prepare_delete_filtered_rows_position_based(
+        &self,
+        ctx: &SessionContext,
+        tables: &[Arc<ListingTable>],
+    ) -> crate::provider::Result<Option<PreparedDeletionPublish>> {
+        let row_ids = self.scan_filtered_rows_position_based(ctx, tables).await?;
+        self.prepare_position_based_deletions(row_ids).await
+    }
+
+    /// The file-local positions of the rows the filter matches in `tables`, per
+    /// data file, leaving out rows a deletion vector already hides.
+    async fn scan_filtered_rows_position_based(
+        &self,
+        ctx: &SessionContext,
+        tables: &[Arc<ListingTable>],
+    ) -> crate::provider::Result<HashMap<String, Vec<u64>>> {
         let table_name = &self.table_metadata.table_name;
 
         if self.filters.is_empty() {
@@ -119,15 +118,8 @@ impl CayenneDeletionSink {
 
         let mut per_file_row_ids: HashMap<String, Vec<u64>> = HashMap::new();
 
-        // Build Vortex filter once - all tables share the same schema
-        let df_schema = DFSchema::try_from(self.schema.as_ref().clone())?;
-        let vortex_filter = build_vortex_filter(&self.filters, &df_schema)
-            .map_err(datafusion_common::DataFusionError::External)?;
-
-        tracing::debug!(
-            vortex_filter = ?vortex_filter,
-            "Converted filters to Vortex expression for position-based deletion"
-        );
+        // Plan the filter once - all tables share the same schema.
+        let position_filter = self.position_filter()?;
 
         for table in tables {
             let table_scan_start = std::time::Instant::now();
@@ -173,16 +165,28 @@ impl CayenneDeletionSink {
                     let file_path = pf.path().to_string();
                     let vortex_session = vortex_session.clone();
                     let object_store = Arc::clone(&object_store);
-                    let vortex_filter = vortex_filter.clone();
+                    let position_filter = &position_filter;
                     scan_futures.push(async move {
-                        let result = self
-                            .scan_file_for_new_deletions(
-                                &file_path,
-                                &vortex_session,
-                                &object_store,
-                                vortex_filter.as_ref(),
-                            )
-                            .await;
+                        let result = match position_filter {
+                            PositionFilter::Vortex(vortex_filter) => {
+                                self.scan_file_for_new_deletions(
+                                    &file_path,
+                                    &vortex_session,
+                                    &object_store,
+                                    vortex_filter.as_ref(),
+                                )
+                                .await
+                            }
+                            PositionFilter::DataFusion(filter) => {
+                                self.scan_file_for_filter_matches(
+                                    &file_path,
+                                    &vortex_session,
+                                    &object_store,
+                                    filter,
+                                )
+                                .await
+                            }
+                        };
                         (file_path, result)
                     });
                 }
@@ -221,7 +225,7 @@ impl CayenneDeletionSink {
 
         if per_file_row_ids.is_empty() {
             tracing::debug!("No new deletions to persist");
-            return Ok(0);
+            return Ok(per_file_row_ids);
         }
 
         let total_new_deletions: usize = per_file_row_ids.values().map(std::vec::Vec::len).sum();
@@ -232,8 +236,7 @@ impl CayenneDeletionSink {
             "Position-based delete: persisting deletions"
         );
 
-        self.persist_position_based_deletions(per_file_row_ids)
-            .await
+        Ok(per_file_row_ids)
     }
 
     /// Delete rows by hash-probing key columns against a set of matched keys.
@@ -481,6 +484,239 @@ impl CayenneDeletionSink {
         }
 
         Ok(new_row_ids)
+    }
+
+    /// Splits the delete's filters on `AND` into the conjuncts each file's Vortex scan
+    /// evaluates and the rest, which `DataFusion` evaluates over the rows the scan
+    /// returns.
+    ///
+    /// A conjunct goes into the scan only when the read path's pushdown check accepts
+    /// it and Vortex can express it: Vortex evaluates some predicates it can express
+    /// differently from SQL, such as a comparison of two float columns, where it tells
+    /// `-0.0` from `0.0`. A row is deleted only when every conjunct is TRUE, so
+    /// filtering by the pushed conjuncts first selects the same rows, and lets the scan
+    /// skip files and chunks by their statistics: a retention filter on an ISO 8601 text
+    /// column pairs the instant comparison with a text bound Vortex can evaluate.
+    fn position_filter(&self) -> crate::provider::Result<PositionFilter> {
+        let table_name = &self.table_metadata.table_name;
+        let df_schema = DFSchema::try_from(self.schema.as_ref().clone())?;
+        let convertor = DefaultExpressionConvertor::default();
+        let execution_props = ExecutionProps::new();
+        let mut pushed = Vec::new();
+        let mut rest = Vec::new();
+        for conjunct in self
+            .filters
+            .iter()
+            .flat_map(|filter| split_conjunction_owned(filter.clone()))
+        {
+            let mut rewriter = TypeCoercionRewriter::new(&df_schema);
+            let conjunct = conjunct.rewrite(&mut rewriter)?.data;
+            let physical = create_physical_expr(
+                &conjunct,
+                &df_schema,
+                &execution_props,
+                &datafusion::logical_expr::physical_planning_context::PhysicalPlanningContext::default(),
+            )?;
+            let expression = if convertor.can_be_pushed_down(&physical, self.schema.as_ref()) {
+                build_vortex_filter(std::slice::from_ref(&conjunct), &df_schema)
+                    .ok()
+                    .flatten()
+            } else {
+                None
+            };
+            match expression {
+                Some(expression) => pushed.push(expression),
+                None => rest.push(conjunct),
+            }
+        }
+        let pushed = pushed.into_iter().reduce(vortex::expr::and);
+        if rest.is_empty() {
+            tracing::debug!(
+                table = %table_name,
+                vortex_filter = ?pushed,
+                "Position-based delete filter evaluated by Vortex"
+            );
+            return Ok(PositionFilter::Vortex(pushed));
+        }
+        tracing::debug!(
+            table = %table_name,
+            vortex_filter = ?pushed,
+            datafusion_conjuncts = rest.len(),
+            "Position-based delete filter evaluated by Vortex and DataFusion"
+        );
+        let (_, schema) = self.filtered_delete_projection(&rest)?;
+        let filters = Self::build_physical_filters(&rest, &schema)?;
+        Ok(PositionFilter::DataFusion(DataFusionPositionFilter {
+            pushed,
+            schema,
+            filters,
+        }))
+    }
+
+    /// The file-local positions of the rows of one data file that `filter` matches,
+    /// leaving out rows a deletion vector already hides.
+    ///
+    /// The scan applies the pushed conjuncts and the existing deletion vector, and
+    /// returns each remaining row's `row_idx()` beside the columns `DataFusion` needs.
+    /// A row matches where every conjunct is TRUE, as with a Vortex filter: a conjunct
+    /// that is NULL for a row deletes nothing.
+    async fn scan_file_for_filter_matches(
+        &self,
+        file_path: &str,
+        vortex_session: &VortexSession,
+        object_store: &Arc<dyn ObjectStore>,
+        filter: &DataFusionPositionFilter,
+    ) -> crate::provider::Result<Vec<u64>> {
+        use vortex::dtype::Nullability;
+        use vortex::expr::{get_item, pack, root};
+
+        let table_name = &self.table_metadata.table_name;
+
+        let already_deleted = {
+            let cache = self
+                .pk_deletion_strategy
+                .position_based_cache()
+                .ok_or_else(|| Error::Internal {
+                    table: table_name.clone(),
+                    message:
+                        "scan_file_for_filter_matches called with incompatible PkDeletionStrategy"
+                            .to_string(),
+                })?;
+            cache
+                .load()
+                .get(file_path)
+                .map(|deletion_vector| deletion_vector.access_plan())
+        };
+
+        let vxf = vortex_session
+            .open_options()
+            .open_object_store(object_store, ObjectStorePath::from(file_path))
+            .await
+            .map_err(|e| Error::Vortex {
+                operation: "open vortex file for filtered deletion scan",
+                table: table_name.clone(),
+                source: Box::new(e),
+            })?;
+
+        // The filter's columns, then each row's file-local position under a name no
+        // column of the table has.
+        let mut position_name = String::from("__position");
+        while filter.schema.column_with_name(&position_name).is_some() {
+            position_name.push('_');
+        }
+        let projection = pack(
+            filter
+                .schema
+                .fields()
+                .iter()
+                .map(|field| {
+                    (
+                        field.name().clone(),
+                        get_item(field.name().as_str(), root()),
+                    )
+                })
+                .chain(std::iter::once((position_name.clone(), row_idx()))),
+            Nullability::NonNullable,
+        )
+        .bind(vxf.dtype())
+        .map_err(|e| Error::Vortex {
+            operation: "bind vortex filtered deletion scan projection",
+            table: table_name.clone(),
+            source: Box::new(e),
+        })?;
+        let mut scan_builder = vxf
+            .scan()
+            .map_err(|e| Error::Vortex {
+                operation: "build vortex scan for filtered deletion",
+                table: table_name.clone(),
+                source: Box::new(e),
+            })?
+            .with_projection(projection);
+        if let Some(access_plan) = already_deleted {
+            scan_builder = access_plan.apply_to_builder(scan_builder);
+        }
+        if let Some(pushed) = &filter.pushed {
+            let pushed = pushed.bind(vxf.dtype()).map_err(|e| Error::Vortex {
+                operation: "bind vortex filtered deletion scan filter",
+                table: table_name.clone(),
+                source: Box::new(e),
+            })?;
+            scan_builder = scan_builder.with_filter(pushed);
+        }
+
+        let mut stream = scan_builder.into_stream().map_err(|e| Error::Vortex {
+            operation: "start vortex scan stream for filtered deletion",
+            table: table_name.clone(),
+            source: Box::new(e),
+        })?;
+
+        // The filter's columns with their positions after them, so the rows the
+        // filters keep say where they are.
+        let mut fields = filter.schema.fields().to_vec();
+        fields.push(Arc::new(Field::new(
+            position_name.as_str(),
+            DataType::UInt64,
+            false,
+        )));
+        let batch_schema = Arc::new(Schema::new(fields));
+
+        let mut matching_positions: Vec<u64> = Vec::new();
+        while let Some(chunk_result) = stream.next().await {
+            let chunk = chunk_result.map_err(|e| Error::Vortex {
+                operation: "read vortex chunk for filtered deletion",
+                table: table_name.clone(),
+                source: Box::new(e),
+            })?;
+            let arrow_array = chunk.into_arrow_preferred().map_err(|e| Error::Vortex {
+                operation: "convert vortex chunk to arrow for filtered deletion",
+                table: table_name.clone(),
+                source: Box::new(e),
+            })?;
+            if arrow_array.is_empty() {
+                continue;
+            }
+            let rows = arrow_array
+                .as_any()
+                .downcast_ref::<StructArray>()
+                .ok_or_else(|| Error::Internal {
+                    table: table_name.clone(),
+                    message: "Vortex filtered deletion scan did not return StructArray".to_string(),
+                })?;
+
+            let mut columns = Vec::with_capacity(batch_schema.fields().len());
+            for field in batch_schema.fields() {
+                let column = rows
+                    .column_by_name(field.name())
+                    .ok_or_else(|| Error::Internal {
+                        table: table_name.clone(),
+                        message: format!(
+                            "Column '{}' not found in the filtered deletion scan of Vortex file '{file_path}'",
+                            field.name()
+                        ),
+                    })?;
+                // The file can hold a column in another Arrow type than the table's
+                // (a string as `Utf8View`, say); the filters were planned for the table's.
+                columns.push(arrow::compute::cast(column, field.data_type())?);
+            }
+            let batch = RecordBatch::try_new_with_options(
+                Arc::clone(&batch_schema),
+                columns,
+                &RecordBatchOptions::new().with_row_count(Some(rows.len())),
+            )?;
+
+            let matched = self.apply_physical_filters_to_batch(batch, &filter.filters)?;
+            let positions = matched
+                .columns()
+                .last()
+                .and_then(|column| column.as_any().downcast_ref::<UInt64Array>())
+                .ok_or_else(|| Error::Internal {
+                    table: table_name.clone(),
+                    message: "Filtered deletion batch lost its position column".to_string(),
+                })?;
+            matching_positions.extend_from_slice(positions.values());
+        }
+
+        Ok(matching_positions)
     }
 
     /// Scan a single Vortex file and find rows whose key columns match `matched_keys`.
@@ -787,7 +1023,9 @@ impl CayenneDeletionSink {
     ///
     /// 1. Merges new positions with existing deletions from the cache
     /// 2. Writes a combined deletion vector per source file
-    /// 3. Updates the in-memory cache
+    /// 3. Commits it to the catalog — on a table with no primary key, in place of
+    ///    the file's earlier vectors, whose files it then removes
+    /// 4. Updates the in-memory cache
     ///
     /// The deletion vector file contains ALL deleted positions (existing + new),
     /// enabling the scan to skip all deleted rows in a single lookup.
@@ -803,10 +1041,53 @@ impl CayenneDeletionSink {
         &self,
         row_ids: HashMap<String, Vec<u64>>,
     ) -> crate::provider::Result<u64> {
+        let Some(mut prepared) = self.prepare_position_based_deletions(row_ids).await? else {
+            return Ok(0);
+        };
+        let replaced = if prepared.replaces_earlier_deletion_vectors() {
+            self.position_deletion_vectors_replaced_by(prepared.delete_files())
+                .await?
+        } else {
+            Vec::new()
+        };
+        let delete_files = prepared.delete_files().to_vec();
+        if replaced.is_empty() {
+            self.catalog.add_delete_files(delete_files).await?;
+        } else {
+            self.catalog
+                .commit_delete_files_with_inlined_rewrite(
+                    delete_files,
+                    &self.table_metadata.table_id,
+                    Vec::new(),
+                    Vec::new(),
+                    replaced
+                        .iter()
+                        .map(|row| row.delete_file_id.clone())
+                        .collect(),
+                )
+                .await?;
+        }
+        prepared.mark_catalog_committed();
+        let deleted = prepared.deleted_count();
+        prepared.publish()?;
+        self.remove_replaced_deletion_vector_files(replaced);
+        Ok(deleted)
+    }
+
+    /// Write one deletion vector per data file in `row_ids`, holding the
+    /// positions the file already had deleted plus the new ones, and stage them
+    /// for a catalog commit. `None` when `row_ids` adds no new deletion.
+    ///
+    /// The written files are removed if the returned publish is dropped before
+    /// [`PreparedDeletionPublish::mark_catalog_committed`].
+    pub(super) async fn prepare_position_based_deletions(
+        &self,
+        row_ids: HashMap<String, Vec<u64>>,
+    ) -> crate::provider::Result<Option<PreparedDeletionPublish>> {
         let table_name = &self.table_metadata.table_name;
 
         if row_ids.is_empty() {
-            return Ok(0);
+            return Ok(None);
         }
 
         // The per-file position-delete cache. For PK-less tables this is the
@@ -897,57 +1178,65 @@ impl CayenneDeletionSink {
         }
 
         if specs.is_empty() {
-            return Ok(0);
+            return Ok(None);
         }
 
         let results = writer.write(specs).await?;
-        for result in &results {
-            if matches!(&result.identifiers, DeletionIdentifier::KeyBased(_)) {
-                for written in &results {
-                    Self::cleanup_uncommitted_delete_file(&written.delete_file.path).await;
-                }
-                return Err(Error::Internal {
-                    table: table_name.clone(),
-                    message: "Unexpected key-based deletion in position-based sink".to_string(),
-                });
-            }
-        }
         let delete_files = results
-            .into_iter()
-            .map(|result| result.delete_file)
-            .collect::<Vec<_>>();
-        let cleanup_paths = delete_files
             .iter()
-            .map(|delete_file| delete_file.path.clone())
+            .map(|result| result.delete_file.clone())
             .collect::<Vec<_>>();
-        let mut cleanup_guard =
-            PositionDeleteCleanup(cleanup_paths.iter().map(PathBuf::from).collect());
-        if let Err(error) = self.catalog.add_delete_files(delete_files).await {
-            super::super::cleanup_uncommitted_delete_paths(&cleanup_guard.0).await;
-            cleanup_guard.0.clear();
-            return Err(error.into());
+        // Armed from here, so every exit below removes the files just written.
+        let prepared = PreparedDeletionPublish {
+            strategy: self.pk_deletion_strategy.clone(),
+            table_memory: Arc::clone(&self.table_memory),
+            delete_files,
+            publish: PreparedDeletionCache::Positions {
+                vectors: cache_updates,
+            },
+            deleted_count: convert_to_u64_box(new_deletion_count, "new deletion count").map_err(
+                |e| Error::Internal {
+                    table: table_name.clone(),
+                    message: e.to_string(),
+                },
+            )?,
+            cleanup_armed: true,
+            scan_input_version: self.scan_input_version.as_ref().map(Arc::clone),
+        };
+        if results
+            .iter()
+            .any(|result| matches!(&result.identifiers, DeletionIdentifier::KeyBased(_)))
+        {
+            return Err(Error::Internal {
+                table: table_name.clone(),
+                message: "Unexpected key-based deletion in position-based sink".to_string(),
+            });
         }
-        cleanup_guard.0.clear();
-
-        // Build a fresh snapshot. Cloning the outer HashMap now only clones
-        // small (String, Arc<PositionDeletionVector>) entries — unchanged files
-        // share their bitmap/access-plan data with the previous snapshot through
-        // the inner Arc. Then overlay the cache_updates entries for files that
-        // changed in THIS commit. The pre-inner-Arc revision unconditionally
-        // cloned every file's full bitmap on every commit, turning the write into
-        // O(total deleted rows across all files) per call.
-        let mut updated_map = (*cached_deleted_row_ids.load_full()).clone();
-        updated_map.extend(cache_updates);
-        cached_deleted_row_ids.store(Arc::new(updated_map));
-        self.refresh_deletion_memory_accounting();
-        self.notify_scan_input_change();
-
-        // Return count of NEW deletions
-        convert_to_u64_box(new_deletion_count, "new deletion count").map_err(|e| Error::Internal {
-            table: table_name.clone(),
-            message: e.to_string(),
-        })
+        Ok(Some(prepared))
     }
+}
+
+/// How a position-based delete finds the rows its filters match in one data file.
+enum PositionFilter {
+    /// Every conjunct is pushed into the file's Vortex scan, which then yields only
+    /// the positions of the rows it matches. `None` matches every row.
+    Vortex(Option<vortex::expr::Expression>),
+    /// Some conjunct is not pushed (Vortex cannot express it, as a cast from a string
+    /// column to a timestamp, or would evaluate it differently, as a comparison of two
+    /// float columns): the pushed conjuncts go into the scan, and `DataFusion`
+    /// evaluates the rest over the rows the scan returns.
+    DataFusion(DataFusionPositionFilter),
+}
+
+/// A delete's filters split for a file scan: the conjuncts Vortex can express go
+/// into the scan, and `DataFusion` evaluates the rest over the rows it returns.
+struct DataFusionPositionFilter {
+    /// The conjuncts Vortex can express, joined by `AND`; `None` when there are none.
+    pushed: Option<vortex::expr::Expression>,
+    /// The columns the remaining conjuncts read, with the table's types.
+    schema: SchemaRef,
+    /// The remaining conjuncts, planned against `schema`.
+    filters: Vec<Arc<dyn PhysicalExpr>>,
 }
 
 /// Build a combined Vortex filter expression from `DataFusion` logical filters.

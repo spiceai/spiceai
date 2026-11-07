@@ -233,7 +233,8 @@ github_compare_files HEAD
 
     def test_nextest_filter_cannot_hide_failure(self):
         # Run the repository's actual nextest + verify-cli recipes. Only workspace
-        # selection and lint are adapted to this dependency-free external crate.
+        # selection, lint and the libduckdb install are adapted to this
+        # dependency-free external crate, which loads no DuckDB.
         makefile = re.sub(r"(?m)^NEXTEST_SELECTION :=[^\n]*(?:\n\t[^\n]*)*",
                           "NEXTEST_SELECTION := --workspace", (REPO / "Makefile").read_text())
         makefile = re.sub(r"(?m)^NEXTEST_FILTER :=.*$", "NEXTEST_FILTER := kind(=lib)", makefile)
@@ -256,6 +257,9 @@ inherits = "dev"
         self.write(".config/nextest.toml", "[profile.default]\nretries = 0\n")
         self.write("version.txt", "0.1.0\n")
         self.write("scripts/verify_cli_build.py", (REPO / "scripts/verify_cli_build.py").read_text())
+        self.write("scripts/nextest_build_targets.py", (REPO / "scripts/nextest_build_targets.py").read_text())
+        # `nextest` puts the directory this prints on ADBC_DRIVER_PATH.
+        self.write("scripts/libduckdb.py", "import pathlib\nprint(pathlib.Path(__file__).parent)\n")
         self.run_ok("cargo", "generate-lockfile", "--offline")
         self.commit()
         for controls in (
@@ -320,7 +324,8 @@ inherits = "dev"
             words = shlex.split(line)
             if "cargo" in words and "--features" in words:
                 features.append(set(words[words.index("--features") + 1].split(",")))
-        self.assertEqual(len(features), 4, result.stdout)
+        # One clippy pass (`lint-rust`), `nextest`, and `verify-cli`.
+        self.assertEqual(len(features), 3, result.stdout)
         for selected in features:
             self.assertIn("cayenne/result-correctness-duckdb", selected)
             self.assertIn("rate-control", selected)

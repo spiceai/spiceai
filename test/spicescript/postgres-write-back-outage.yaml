@@ -1,0 +1,81 @@
+name: postgres-write-back-outage
+description: >
+  Write-back keeps every write it acknowledges: writes accepted while Postgres
+  is down are served at once, survive a kill with their delivery still pending,
+  and reach Postgres exactly once when it returns; after that the acceleration
+  and the source agree.
+
+sources:
+  src: { kind: postgres }
+
+spicepod:
+  version: v1
+  kind: Spicepod
+  name: postgres-write-back-outage
+  datasets:
+    - from: postgres:public.accounts
+      name: accounts
+      access: read_write
+      replication: { enabled: true }
+      params: ${sources.src.params}
+      acceleration:
+        enabled: true
+        engine: cayenne
+        mode: file
+        refresh_mode: changes
+        write_mode: write_back
+        primary_key: id
+
+defaults:
+  expect: { oracle: src }
+
+steps:
+  - source-exec:
+      src: |
+        CREATE TABLE accounts (id bigint PRIMARY KEY, owner text NOT NULL, balance numeric(12, 2) NOT NULL);
+        INSERT INTO accounts SELECT i, 'owner ' || i, i * 1.50 FROM generate_series(1, 100) AS i;
+  - start: {}
+  - query: SELECT * FROM accounts
+    eventually: 60s
+
+  # The source goes away; writes are still accepted and served at once.
+  - stop-source: src
+  - spice-exec: "BEGIN; UPDATE accounts SET balance = 500.00 WHERE id IN (1, 2, 3); COMMIT;"
+  - spice-exec: "BEGIN; INSERT INTO accounts VALUES (101, 'written while down', 42.00); COMMIT;"
+  - query: SELECT count(*), sum(balance) FROM accounts
+    expect: { rows: [["101", "9108.00"]] }
+
+  # A kill with those deliveries pending, then everything comes back.
+  - kill-spiced: {}
+  - start-source: src
+  - start: {}
+  - query: SELECT count(*), sum(balance) FROM accounts
+    expect: { rows: [["101", "9108.00"]] }
+    eventually: 60s
+    id: after-kill
+  # Postgres now holds each write once (the oracle is the source itself).
+  - query: SELECT * FROM accounts
+    eventually: 60s
+
+  # Pending again, then a clean restart.
+  - pause-source: src
+  - spice-exec: "BEGIN; UPDATE accounts SET balance = 600.00 WHERE id = 4; COMMIT;"
+  - restart: { ready: false }
+  - unpause-source: src
+  - query: SELECT * FROM accounts
+    eventually: 60s
+  - query: SELECT count(*), sum(balance) FROM accounts
+    expect: { rows: [["101", "9702.00"]] }
+    eventually: 30s
+
+  # A write at the source to a key whose write through Spice is still pending:
+  # whichever wins, Spice and the source end up holding the same row.
+  - pause-source: src
+  - spice-exec: "BEGIN; UPDATE accounts SET owner = 'through spice' WHERE id = 5; COMMIT;"
+  - unpause-source: src
+  - source-exec: { src: "UPDATE accounts SET owner = 'at the source' WHERE id = 5" }
+  - query: SELECT * FROM accounts
+    eventually: 60s
+  - query: SELECT owner FROM accounts WHERE id = 5
+    show: true
+    eventually: 30s

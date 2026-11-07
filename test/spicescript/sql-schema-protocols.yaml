@@ -1,0 +1,33 @@
+name: sql-schema-protocols
+description: >
+  Flight SQL advertises the schema it streams for literal-sensitive decimal
+  expressions and bound parameters, including NULLs and empty results.
+
+spicepod:
+  version: v1
+  kind: Spicepod
+  name: sql-schema-protocols
+
+steps:
+  - start: {}
+  - query: SELECT round(CAST($1 AS DECIMAL(10,3)), 2) AS value
+    protocols: [flightsql]
+    parameters: ['1.255']
+    expect: { rows: [['1.26']] }
+  - query: SELECT round(avg(x), 2) AS value FROM (VALUES (CAST(1.25 AS DECIMAL(10,2))), (2.50)) t(x)
+    protocols: [flightsql]
+    parameters: []
+    expect: { rows: [['1.88']] }
+  - query: SELECT CAST($1 AS BIGINT) AS value
+    protocols: [flightsql]
+    parameters: [null]
+    expect: { rows: [[null]] }
+  - query: SELECT CAST($1 AS INT) + CAST($2 AS INT) AS value
+    protocols: [flightsql]
+    parameters: [1, 2]
+    expect: { rows: [['3']] }
+  - query: SELECT CAST($1 AS INT) AS value WHERE FALSE
+    protocols: [flightsql]
+    parameters: [1]
+    expect-empty: true
+    expect: { rows: [] }

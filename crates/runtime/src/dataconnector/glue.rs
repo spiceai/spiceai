@@ -19,19 +19,16 @@ use app::App;
 use async_trait::async_trait;
 use aws_config::SdkConfig;
 use aws_credential_types::provider::error::CredentialsError;
+use aws_sdk_credential_bridge::S3CredentialProvider;
 use aws_sdk_glue::{Client, error::DisplayErrorContext, types::Table};
 use aws_sdk_s3::config::ProvideCredentials;
 use datafusion::catalog::TableProvider;
 use iceberg::{
     CatalogBuilder, NamespaceIdent, TableIdent,
-    io::{
-        S3_ACCESS_KEY_ID, S3_ENDPOINT, S3_PATH_STYLE_ACCESS, S3_REGION, S3_SECRET_ACCESS_KEY,
-        S3_SESSION_TOKEN,
-    },
+    io::{S3_ENDPOINT, S3_PATH_STYLE_ACCESS, S3_REGION},
 };
 use iceberg_catalog_glue::{
-    AWS_ACCESS_KEY_ID, AWS_REGION_NAME, AWS_SECRET_ACCESS_KEY, AWS_SESSION_TOKEN,
-    GLUE_CATALOG_PROP_CATALOG_ID, GLUE_CATALOG_PROP_WAREHOUSE, GlueCatalogBuilder,
+    AWS_REGION_NAME, GLUE_CATALOG_PROP_CATALOG_ID, GLUE_CATALOG_PROP_WAREHOUSE, GlueCatalogBuilder,
 };
 use iceberg_datafusion::IcebergTableProvider;
 use iceberg_storage_opendal::OpenDalStorageFactory;
@@ -109,6 +106,14 @@ pub enum Error {
         "No storage location specified for table '{table}'. Ensure the table has a valid S3 location in AWS Glue. For help, visit: https://docs.spiceai.org/components/data-connectors/glue"
     ))]
     MissingStorageLocation { table: String },
+    #[snafu(display(
+        "Dataset '{dataset}' cannot read Glue table '{table}' from location {location:?}, which is not an s3:// URL, so no request is sent and the table cannot be read. Set the table location in AWS Glue to an s3:// URL. For help, visit: https://docs.spiceai.org/components/data-connectors/glue"
+    ))]
+    UnsupportedStorageLocation {
+        dataset: String,
+        table: String,
+        location: String,
+    },
 }
 
 #[derive(Clone, Debug)]
@@ -455,7 +460,9 @@ async fn create_iceberg_provider(
         }
     })?;
 
-    let credentials = config
+    // Fails dataset load early with a clear error when no credentials resolve. The catalog and
+    // FileIO resolve their own credentials from `config` on each request, so they refresh.
+    config
         .credentials_provider()
         .ok_or_else(|| {
             let e = Error::MissingCredentials;
@@ -487,35 +494,22 @@ async fn create_iceberg_provider(
         }
     })?;
 
+    let s3_credential_loader = S3CredentialProvider::from_config(config)
+        .map_err(|e| super::DataConnectorError::InvalidConfiguration {
+            dataconnector: PREFIX.to_string(),
+            connector_component: dataset.into(),
+            message: e.to_string(),
+            source: Box::new(e),
+        })?
+        .into_custom_loader();
+
     let mut props = HashMap::from([
-        (
-            AWS_ACCESS_KEY_ID.to_string(),
-            credentials.access_key_id().to_string(),
-        ),
-        (
-            AWS_SECRET_ACCESS_KEY.to_string(),
-            credentials.secret_access_key().to_string(),
-        ),
         (AWS_REGION_NAME.to_string(), region.to_string()),
-        (
-            S3_ACCESS_KEY_ID.to_string(),
-            credentials.access_key_id().to_string(),
-        ),
-        (
-            S3_SECRET_ACCESS_KEY.to_string(),
-            credentials.secret_access_key().to_string(),
-        ),
         (S3_REGION.to_string(), region.to_string()),
     ]);
 
-    if let Some(session_token) = credentials.session_token() {
-        props.insert(AWS_SESSION_TOKEN.to_string(), session_token.to_string());
-        props.insert(S3_SESSION_TOKEN.to_string(), session_token.to_string());
-    }
-
-    // Disable OpenDAL's automatic credential loading from environment variables and config files.
-    // As we provide explicit credentials, we don't want OpenDAL to pick up AWS_SESSION_TOKEN
-    // or other credentials from the environment that may not be valid for this specific connection.
+    // OpenDAL must take credentials only from `s3_credential_loader`, never from the environment
+    // or config files, which may not belong to this connection.
     props.insert("s3.disable-config-load".to_string(), "true".to_string());
 
     props.extend(s3_addressing_props(params, &metadata_location));
@@ -531,11 +525,12 @@ async fn create_iceberg_provider(
 
     let storage_factory: Arc<dyn iceberg::io::StorageFactory> =
         Arc::new(OpenDalStorageFactory::S3 {
-            customized_credential_load: None,
+            customized_credential_load: Some(s3_credential_loader),
         });
 
     let catalog: Arc<dyn iceberg::Catalog> = Arc::new(
         GlueCatalogBuilder::default()
+            .with_sdk_config(config.clone())
             .with_storage_factory(storage_factory)
             .load("glue", props)
             .await
@@ -622,7 +617,15 @@ async fn create_s3_provider(
         });
     };
 
-    let from = ensure_s3_trailing_slash(&from);
+    let dataset_name = dataset.name.to_string();
+    let from = s3_storage_location(&dataset_name, table.name(), &from).map_err(|e| {
+        super::DataConnectorError::InvalidConfiguration {
+            dataconnector: PREFIX.to_string(),
+            connector_component: (&dataset).into(),
+            message: e.to_string(),
+            source: Box::new(e),
+        }
+    })?;
 
     match input_format {
         InputFormat::Csv => {
@@ -660,6 +663,23 @@ async fn create_s3_provider(
     dataset.from = from;
 
     s3.read_provider(context, &dataset).await
+}
+
+/// `s3://` location Glue may hand to the S3 listing connector.
+///
+/// Anything else (`http://`, `https://`, `file://`, a bare path) is refused
+/// before the object-store registry, which selects a store from the scheme
+/// alone. A trailing slash is added for directory-style `s3://` locations.
+fn s3_storage_location(dataset: &str, table: &str, location: &str) -> Result<String, Error> {
+    let location = ensure_s3_trailing_slash(location);
+    if location.starts_with("s3://") {
+        return Ok(location);
+    }
+    Err(Error::UnsupportedStorageLocation {
+        dataset: dataset.to_string(),
+        table: table.to_string(),
+        location,
+    })
 }
 
 fn ensure_s3_trailing_slash(s3_location: &str) -> String {
@@ -720,6 +740,34 @@ mod tests {
         );
         assert_eq!(ensure_s3_trailing_slash(""), "");
         assert_eq!(ensure_s3_trailing_slash("/local/path"), "/local/path");
+    }
+
+    #[test]
+    fn glue_storage_location_must_be_s3() {
+        assert_eq!(
+            s3_storage_location("orders", "t", "s3://bucket/orders")
+                .expect("an s3 location is accepted"),
+            "s3://bucket/orders/"
+        );
+        for location in [
+            "http://127.0.0.1:8099/data/",
+            "https://example.com/data/",
+            "http://169.254.169.254/latest/meta-data/",
+            "file:///tmp/secret",
+            "s3a://bucket/orders",
+            "/local/path",
+            "",
+        ] {
+            let err = s3_storage_location("orders", "t", location)
+                .expect_err("a non-s3 location is refused");
+            assert_eq!(
+                err.to_string(),
+                format!(
+                    "Dataset 'orders' cannot read Glue table 't' from location {location:?}, which is not an s3:// URL, so no request is sent and the table cannot be read. Set the table location in AWS Glue to an s3:// URL. For help, visit: https://docs.spiceai.org/components/data-connectors/glue"
+                ),
+                "{location}"
+            );
+        }
     }
 
     fn orc_glue_table(name: &str, transactional: Option<&str>) -> Table {

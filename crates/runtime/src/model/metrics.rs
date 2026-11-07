@@ -147,6 +147,26 @@ pub(crate) fn request_labels_responses(req: &CreateResponse) -> Vec<KeyValue> {
     labels
 }
 
+/// The labels of a request a model serves natively on `/v1/messages`.
+pub(crate) fn request_labels_messages(
+    model: &str,
+    body: &serde_json::Map<String, serde_json::Value>,
+    stream: bool,
+) -> Vec<KeyValue> {
+    let tools = body
+        .get("tools")
+        .and_then(serde_json::Value::as_array)
+        .map_or(0, Vec::len);
+    #[expect(clippy::cast_possible_wrap)]
+    let labels = vec![
+        KeyValue::new(Key::new("stream"), Value::Bool(stream)),
+        KeyValue::new(Key::new("request_level_tools"), Value::I64(tools as i64)),
+        KeyValue::new(Key::new("model"), Value::String(model.to_string().into())),
+        KeyValue::new(Key::new("messages_api"), Value::Bool(true)),
+    ];
+    labels
+}
+
 pub(crate) fn handle_metrics(duration: Duration, is_failure: bool, labels: &[KeyValue]) {
     LLM_REQUESTS.add(1, labels);
     LLM_INTERNAL_DURATION_MS.record(duration.as_secs_f64() * 1000.0, labels);

@@ -448,6 +448,7 @@ pub(crate) async fn teardown_local_run(local_state: &mut LocalRunState) -> anyho
             }
             stop_child_process(scheduler_child, "scheduler").await?;
         }
+        LocalProcesses::Ec2Cluster(cluster) => cluster.terminate().await?,
     }
 
     cleanup_local_artifacts(&local_state.working_dir).await
@@ -894,7 +895,7 @@ async fn all_local_executor_http_ready(
     true
 }
 
-fn scheduler_active_executor_count(metrics_body: &str) -> Option<usize> {
+pub(super) fn scheduler_active_executor_count(metrics_body: &str) -> Option<usize> {
     metrics_body
         .lines()
         .filter(|line| line.starts_with("scheduler_active_executors_count"))

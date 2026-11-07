@@ -18,6 +18,10 @@ limitations under the License.
 //! of them would order them, whatever shape of order its partitions arrive in
 //! and however many of them it sorts at once.
 #![cfg(feature = "datafusion")]
+#![expect(
+    clippy::expect_used,
+    reason = "set-up and helpers outside `#[test]` functions fail fast with `expect`"
+)]
 
 use std::sync::Arc;
 

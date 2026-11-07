@@ -22,7 +22,6 @@ use crate::cluster::partition::{
 };
 use crate::config::{ClusterConfig, ClusterRole};
 use crate::jobs::JobExecutor;
-use crate::status::ComponentStatus;
 use crate::{
     CLUSTER_INTERNAL_SERVER, CLUSTER_PARTITION_ASSIGNMENT_TASK, CLUSTER_SCHEDULER_REGISTRY,
     FailedToRegisterSchedulerSnafu, FailedToStartClusterExecutorSnafu,
@@ -65,6 +64,7 @@ use runtime_proto::{
     GetAppDefinitionRequest, GetDdlCatchupRequest, GetSchedulersRequest, TaskCancelInfo,
 };
 use runtime_secrets::Secrets;
+use runtime_status::ComponentStatus;
 use snafu::ResultExt;
 use std::collections::{HashMap, HashSet};
 use std::env;
@@ -177,6 +177,30 @@ impl ClusterGrpcClientConfig {
             ),
         }
     }
+}
+
+/// Function registry a cluster executor decodes task plans against.
+///
+/// Ballista resolves each function in a serialized plan by name in this
+/// registry before it asks the codec. The scheduler plans `sum` as checked
+/// integer `SUM` (partial state `Decimal128(38, 0)`); the default registry
+/// would decode it as the built-in (partial state `Int64`), and the stage
+/// would fail its own output schema. The checked scalar kernels are added too
+/// so they resolve here rather than through the codec fallback.
+fn executor_function_registry() -> BallistaFunctionRegistry {
+    let mut registry = BallistaFunctionRegistry::default();
+    for udf in runtime_datafusion::checked_arithmetic::checked_scalar_udfs() {
+        registry
+            .scalar_functions
+            .insert(udf.name().to_string(), udf);
+    }
+    let sum = runtime_datafusion::checked_arithmetic::checked_sum_udaf();
+    for name in std::iter::once(sum.name()).chain(sum.aliases().iter().map(String::as_str)) {
+        registry
+            .aggregate_functions
+            .insert(name.to_string(), Arc::clone(&sum));
+    }
+    registry
 }
 
 fn parse_cluster_grpc_param(params: &HashMap<String, String>, key: &str, default: u64) -> u64 {
@@ -601,32 +625,29 @@ fn update_scheduler_pollers(
 pub(crate) mod accelerated_partition_provider;
 pub(crate) use runtime_cluster::cluster_state;
 mod composite_flight_service;
-mod control_stream_client;
 pub mod datafusion;
 mod heartbeat;
-pub mod metrics_collector;
 pub mod partition;
-pub mod pki;
 mod reaper;
 pub(crate) mod scheduler_registry;
 mod servers;
 mod service;
-pub(crate) mod shared_job_state;
 
 use crate::cluster::partition::service::PartitionService;
 pub use accelerated_partition_provider::AcceleratedPartitionProvider;
 pub use cluster_state::{ClusterStateStore, SchedulerEntry};
-pub use control_stream_client::ControlStreamManager;
 pub use heartbeat::{SchedulerHeartbeat, SchedulerHeartbeatStore};
 pub use partition::{PartitionMetadata, PartitionStore, TablePartitionMetadata};
 pub use reaper::{Reaper, ReaperOutcome};
+pub use runtime_cluster::ControlStreamManager;
 pub use runtime_cluster::ExecutorOutboundBroadcaster;
 use runtime_cluster::store::{AccelerationsPartitions, CatalogPartitions};
 pub use runtime_cluster::{ExecutorRegistry, FederatedPartitionProvider, TablePartitions};
+// Moved to `runtime-cluster`; re-exported so `runtime::cluster::{metrics_collector, pki}` still resolve.
+pub use runtime_cluster::{metrics_collector, pki};
 pub use scheduler_registry::start_scheduler_registry;
 pub use scheduler_registry::{SchedulerPeers, remote_scheduler_addresses};
 pub use servers::{start_executor_flight_server, start_internal_cluster_server};
-#[cfg(not(windows))]
 pub(crate) use service::discover_cayenne_tables;
 pub use service::{ClusterServiceImpl, ExecutorControlStreamRegistry};
 
@@ -641,7 +662,7 @@ pub use service::{ClusterServiceImpl, ExecutorControlStreamRegistry};
 ///
 /// * All three pieces (server cert, client verifier, outbound
 ///   `ClientTlsConfig`) live in a single
-///   [`crate::cluster::pki::ClusterPkiBundle`] backed by one
+///   [`pki::ClusterPkiBundle`] backed by one
 ///   `ArcSwap<ClusterPkiSnapshot>`. When any of CA / cert / key change
 ///   on disk we re-parse and validate the **whole** bundle; if anything
 ///   is invalid the previous snapshot is kept (last-known-good).
@@ -677,7 +698,7 @@ struct ClusterTlsConfigInner {
     /// Atomic bundle of (server cert+key, client verifier, outbound
     /// `ClientTlsConfig`). All three rotate together via a single
     /// `ArcSwap` swap inside the bundle.
-    bundle: Arc<crate::cluster::pki::ClusterPkiBundle>,
+    bundle: Arc<pki::ClusterPkiBundle>,
     /// Drop-guard for the watcher. In the centralized path the binary
     /// owns the [`runtime_tls::TlsControl`] for the whole process; this
     /// `Arc` is purely a safety net so the watcher dispatcher outlives
@@ -712,8 +733,8 @@ impl ClusterTlsConfig {
         // Build + register the atomic bundle. `try_new` performs the
         // initial parse + chain validation before returning, so any
         // bad starting state surfaces here as an `io::Error`.
-        let bundle = crate::cluster::pki::ClusterPkiBundle::try_new(
-            &crate::cluster::pki::ClusterPkiPaths {
+        let bundle = pki::ClusterPkiBundle::try_new(
+            &pki::ClusterPkiPaths {
                 ca: ca_path_buf.clone(),
                 cert: cert_path_buf.clone(),
                 key: key_path_buf.clone(),
@@ -774,13 +795,13 @@ impl ClusterTlsConfig {
     /// tests that introspect the bundle (e.g. fingerprint comparisons).
     #[must_use]
     #[doc(hidden)]
-    pub fn bundle_for_tests(&self) -> Arc<crate::cluster::pki::ClusterPkiBundle> {
+    pub fn bundle_for_tests(&self) -> Arc<pki::ClusterPkiBundle> {
         Arc::clone(&self.inner.bundle)
     }
 }
 
 /// Logged when a cluster node is started with `--allow-insecure-connections`.
-const INSECURE_CONNECTIONS_DEPRECATION_WARNING: &str = "`--allow-insecure-connections` is deprecated and no longer allows insecure cluster connections: without cluster mTLS, cluster RPCs are refused, so executors cannot join a scheduler. Set `--node-mtls-ca-certificate-file`, `--node-mtls-certificate-file` and `--node-mtls-key-file`; create certificates with `spice cluster tls init` and `spice cluster tls add <node-name>`. The flag will be removed in a future release.";
+const INSECURE_CONNECTIONS_WARNING: &str = "Cluster connections are not authenticated or encrypted because `--allow-insecure-connections` is set. Use only on a trusted network for local development and testing. For secure clusters, create certificates with `spice cluster tls init` and `spice cluster tls add <node-name>` and set the `--node-mtls-*` flags.";
 
 fn io_other<E: std::fmt::Display>(err: E) -> io::Error {
     io::Error::other(err.to_string())
@@ -881,7 +902,7 @@ impl ResolvedClusterConfig {
 
             if !missing_flags.is_empty() {
                 let certificate_hint = if tls_config.is_none() {
-                    " Create cluster certificates with `spice cluster tls init` and `spice cluster tls add <node-name>`."
+                    " Create cluster certificates with `spice cluster tls init` and `spice cluster tls add <node-name>`, or use `--allow-insecure-connections` for local development and testing."
                 } else {
                     ""
                 };
@@ -894,8 +915,8 @@ impl ResolvedClusterConfig {
                 ));
             }
 
-            if config.allow_insecure_connections {
-                tracing::warn!("{INSECURE_CONNECTIONS_DEPRECATION_WARNING}");
+            if tls_config.is_none() && config.allow_insecure_connections {
+                tracing::warn!("{INSECURE_CONNECTIONS_WARNING}");
             }
         }
 
@@ -999,9 +1020,9 @@ impl ResolvedClusterConfig {
         self.config.role.as_ref()
     }
 
-    /// Returns the fully qualified URL that this node advertises to other cluster nodes.
-    fn node_advertise_url(&self) -> String {
-        let port = self.config.node_bind_address.port();
+    /// Returns the fully qualified URL that this node advertises to other
+    /// cluster nodes for its Flight service, which listens on `port`.
+    fn node_advertise_url(&self, port: u16) -> String {
         let protocol = if self.tls_enabled() { "https" } else { "http" };
         format!(
             "{}://{}:{}",
@@ -1360,6 +1381,9 @@ pub async fn initialize_cluster_executor(
             (hostname, bind_addr.port())
         };
 
+    // Where schedulers reach this executor's Flight service.
+    let flight_url = rt.df.cluster_config.node_advertise_url(advertise_port);
+
     let executor_id = rt.df.cluster_config.instance_id().to_string();
     // Tells the scheduler this process apart from an earlier run under the same
     // id. A UUIDv7 sorts by creation time, so a later run's id compares greater.
@@ -1588,7 +1612,7 @@ pub async fn initialize_cluster_executor(
         &work_dir,
         runtime_producer,
         config_producer,
-        Arc::new(BallistaFunctionRegistry::default()),
+        Arc::new(executor_function_registry()),
         Arc::new(metrics_collector),
         concurrent_tasks as usize,
         None,
@@ -1642,7 +1666,7 @@ pub async fn initialize_cluster_executor(
 
     let partition_update_handler_rt = Arc::clone(&rt);
     let partition_update_handler: Option<
-        crate::cluster::control_stream_client::PartitionUpdateHandler,
+        runtime_cluster::control_stream_client::PartitionUpdateHandler,
     > = Some(Arc::new(move |new_partitions, removed_partitions| {
         let rt = Arc::clone(&partition_update_handler_rt);
         Box::pin(async move {
@@ -1654,7 +1678,7 @@ pub async fn initialize_cluster_executor(
 
     let refresh_dataset_handler_rt = Arc::clone(&rt);
     let refresh_dataset_handler: Option<
-        crate::cluster::control_stream_client::RefreshDatasetHandler,
+        runtime_cluster::control_stream_client::RefreshDatasetHandler,
     > = Some(Arc::new(move |dataset_name, overrides_json| {
         let rt = Arc::clone(&refresh_dataset_handler_rt);
         Box::pin(async move {
@@ -1826,7 +1850,7 @@ pub async fn initialize_cluster_executor(
             loop {
                 match executor_request_initial_partitions(
                     cluster_client.clone(),
-                    rt.datafusion().cluster_config.node_advertise_url(),
+                    flight_url.clone(),
                     rt.datafusion().cluster_config.instance_id().to_string(),
                     process_id.clone(),
                     task_ctx.as_ref(),
@@ -1865,7 +1889,7 @@ pub async fn initialize_cluster_executor(
         };
         tracing::debug!(
             "For executor={:?}, initial accelerated table partitions={:?}",
-            rt.datafusion().cluster_config.node_advertise_url(),
+            flight_url,
             initial_partitions.clone()
         );
 
@@ -1874,7 +1898,7 @@ pub async fn initialize_cluster_executor(
         // its control stream reconnects, gets it over the control stream.
         if let Some(broadcaster) = rt.executor_outbound_broadcaster() {
             broadcaster
-                .announce_flight_endpoint(rt.datafusion().cluster_config.node_advertise_url())
+                .announce_flight_endpoint(flight_url.clone())
                 .await;
         }
         rt.set_partition_assignments(initial_partitions).await;
@@ -1974,6 +1998,7 @@ async fn create_scheduler_server(
         };
 
     let client_tls_config = rt.df.cluster_config.client_tls_config();
+    let use_tls = client_tls_config.is_some();
     let override_create_grpc_client_endpoint: Option<SchedulerEndpointOverride> =
         client_tls_config.clone().map(|tls_config| {
             Arc::new(move |ep: Endpoint| {
@@ -2128,6 +2153,10 @@ async fn create_scheduler_server(
                 .with_target_partitions(target_partitions)
                 .with_option_extension(SpiceClusterConfig::default())
                 .with_option_extension(incoming_request_context)
+                // Task props carry this config to executors and replace their own
+                // `use_tls`, so it decides whether shuffle fetches between executors
+                // use cluster mTLS.
+                .with_ballista_use_tls(use_tls)
                 .with_ballista_shuffle_format(ballista_shuffle_format)
                 .with_ballista_shuffle_memory_mode(shuffle_memory_mode);
 
@@ -2186,6 +2215,7 @@ async fn create_scheduler_server(
             .with_target_partitions(target_partitions)
             .with_option_extension(SpiceClusterConfig::default())
             .with_option_extension(SpiceRequestContextConfig::default())
+            .with_ballista_use_tls(use_tls)
             .with_ballista_shuffle_format(ballista_shuffle_format)
             .with_ballista_shuffle_memory_mode(shuffle_memory_mode)
     });
@@ -2252,7 +2282,7 @@ async fn create_scheduler_server(
                 .boxed()
                 .context(FailedToStartClusterSchedulerSnafu)?,
         );
-        Arc::new(shared_job_state::SharedJobState::new(
+        Arc::new(runtime_cluster::shared_job_state::SharedJobState::new(
             metrics_node_id,
             store,
             base_prefix,
@@ -2402,11 +2432,13 @@ impl runtime_secrets::ClusterSecretExpander for ClusterSecretExpanderImpl {
     async fn expand_secret(
         &self,
         executor_id: &str,
+        store: &str,
         key: &str,
     ) -> Result<Option<secrecy::SecretString>, String> {
         let request = runtime_proto::ExpandSecretRequest {
             executor_id: executor_id.to_string(),
             key: key.to_string(),
+            store: store.to_string(),
         };
 
         match self.client.clone().expand_secret(request).await {
@@ -2449,7 +2481,9 @@ async fn executor_bind_app(
             .as_ref()
             .map(|state| state.location.clone()),
     );
+    let secret_store_names: Vec<String> = app_def.secrets.iter().map(|s| s.name.clone()).collect();
     *rt.app.write().await = Some(app_def);
+    rt.search_primary_keys.update(Arc::clone(&rt.app)).await;
 
     // Create a cluster client for secrets. This channel outlives every secret
     // resolution on the executor, so it is the one that most needs the keepalive
@@ -2458,7 +2492,8 @@ async fn executor_bind_app(
         create_cluster_service_client(scheduler_url, client_tls_config, &grpc_client).await?;
 
     let expander = Box::new(ClusterSecretExpanderImpl::new(secrets_cluster_client));
-    *rt.secrets.write().await = Secrets::new_for_cluster_executor(expander, executor_id);
+    *rt.secrets.write().await =
+        Secrets::new_for_cluster_executor(expander, executor_id, secret_store_names);
 
     // Published once the scheduler's secrets are bound, which the log exporter
     // resolves its header templates through, and before the components below
@@ -2504,7 +2539,6 @@ async fn executor_bind_app(
     rt.load_embeddings().await;
     rt.load_rerankers().await;
     Arc::clone(rt).load_models().await;
-    Arc::clone(rt).load_tools().await;
     Arc::clone(rt).load_datasets().await;
 
     Ok(())
@@ -2641,6 +2675,9 @@ fn apply_distributed_execution_config(cfg: SessionConfig) -> SessionConfig {
 }
 
 #[cfg(test)]
+mod eager_merge_tests;
+
+#[cfg(test)]
 mod tests {
     use super::ClusterTlsConfig;
     use bcder::{Mode, encode::Values, string::BitString};
@@ -2654,6 +2691,48 @@ mod tests {
         CapturedX509Certificate, EcdsaCurve, InMemorySigningKeyPair, KeyAlgorithm, Sign, Signer,
         X509Certificate,
     };
+
+    /// An executor decodes `sum` from its own registry. It must get the
+    /// scheduler's checked `SUM` (wide `Decimal128(38, 0)` partial state), not
+    /// the built-in (`Int64` state), or the stage fails its output schema.
+    #[test]
+    fn executor_registry_decodes_sum_with_the_schedulers_partial_state() {
+        use std::sync::Arc;
+
+        use arrow::datatypes::{DataType, Field, FieldRef};
+        use datafusion::execution::FunctionRegistry;
+        use datafusion::logical_expr::function::StateFieldsArgs;
+
+        let registry = super::executor_function_registry();
+        let input: FieldRef = Arc::new(Field::new("v", DataType::Int64, true));
+        let output: FieldRef = Arc::new(Field::new("sum(v)", DataType::Int64, true));
+        let state_types = |udaf: &datafusion::logical_expr::AggregateUDF| {
+            udaf.state_fields(StateFieldsArgs {
+                name: "sum",
+                input_fields: std::slice::from_ref(&input),
+                return_field: Arc::clone(&output),
+                ordering_fields: &[],
+                is_distinct: false,
+            })
+            .expect("state fields")
+            .iter()
+            .map(|f| f.data_type().clone())
+            .collect::<Vec<_>>()
+        };
+
+        let sum = registry.udaf("sum").expect("executor registry has sum");
+        let expected = runtime_datafusion::checked_arithmetic::checked_sum_udaf();
+        assert_eq!(state_types(&sum), state_types(&expected));
+        assert_eq!(state_types(&sum), vec![DataType::Decimal128(38, 0)]);
+
+        for udf in runtime_datafusion::checked_arithmetic::checked_scalar_udfs() {
+            assert!(
+                registry.udf(udf.name()).is_ok(),
+                "executor registry must resolve {}",
+                udf.name()
+            );
+        }
+    }
 
     #[test]
     fn cluster_roles_require_cluster_mtls_files() {
@@ -2682,16 +2761,16 @@ mod tests {
                 err.to_string(),
                 "Cluster mode requires the following flags: --node-mtls-ca-certificate-file, \
                  --node-mtls-certificate-file, --node-mtls-key-file. Create cluster certificates \
-                 with `spice cluster tls init` and `spice cluster tls add <node-name>`.",
+                 with `spice cluster tls init` and `spice cluster tls add <node-name>`, or use \
+                 `--allow-insecure-connections` for local development and testing.",
                 "{node}"
             );
         }
     }
 
-    /// The deprecated flag still parses and still lets a node start without cluster mTLS
-    /// files; the node then refuses every cluster RPC.
+    /// Local development nodes can explicitly opt out of cluster mTLS.
     #[test]
-    fn deprecated_insecure_connections_flag_still_starts_a_node() {
+    fn insecure_connections_flag_starts_a_node_without_mtls() {
         use super::ResolvedClusterConfig;
         use crate::config::{ClusterConfig, ClusterRole};
         use clap::Parser;
@@ -2704,12 +2783,12 @@ mod tests {
             "127.0.0.1",
             "--allow-insecure-connections",
         ])
-        .expect("--allow-insecure-connections should still parse");
+        .expect("--allow-insecure-connections should parse");
         assert!(config.allow_insecure_connections);
         assert_eq!(config.role, Some(ClusterRole::Scheduler));
 
         let resolved = ResolvedClusterConfig::try_new(config)
-            .expect("a node started with the deprecated flag should still start");
+            .expect("a node started with the insecure flag should start");
         assert!(!resolved.tls_enabled());
     }
 

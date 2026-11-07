@@ -1,0 +1,144 @@
+name: postgres-catalog-cdc
+description: >
+  A PostgreSQL catalog accelerated by change capture accelerates every table it
+  can key (a primary key, a replica identity index, or FULL) on one shared
+  replication slot, leaves out the tables it cannot (REPLICA IDENTITY NOTHING,
+  keyless), views and excluded tables, and follows inserts, updates and deletes
+  as PostgreSQL applies them, across a restart with changes made while Spice was
+  down. A memory acceleration releases its slot at shutdown and a file one keeps
+  it; a file acceleration whose slot is gone is rebuilt from the source.
+
+sources:
+  src: { kind: postgres }
+
+variants:
+  memory: {}
+  file: { catalogs: { '*': { acceleration: { mode: file } } } }
+
+spicepod:
+  version: v1
+  kind: Spicepod
+  name: postgres-catalog-cdc
+  catalogs:
+    - from: pg:postgres
+      # Per variant: a catalog's replication slot is named after the catalog
+      # alone, server-wide (known-failing/cdc-postgres/postgres-catalog-slot-per-database.yaml).
+      name: pg_${variant.name}
+      exclude: ['public.secret']
+      params: ${sources.src.params}
+      acceleration: { engine: cayenne, refresh_mode: changes, mode: memory }
+
+defaults:
+  expect: { oracle: src }
+  # Each variant ends with its own slot state.
+  compare-variants: false
+
+steps:
+  - source-exec:
+      src: |
+        CREATE TABLE orders (id int PRIMARY KEY, item_id int, qty int, note text);
+        INSERT INTO orders SELECT i, 1 + i % 20, i % 7, CASE WHEN i % 4 = 0 THEN NULL ELSE 'n' || i END FROM generate_series(1, 300) i;
+        CREATE TABLE items (id int PRIMARY KEY, name text NOT NULL);
+        INSERT INTO items SELECT i, 'item ' || i FROM generate_series(1, 20) i;
+        CREATE TABLE ri_using_index (uid int NOT NULL, name text NOT NULL);
+        CREATE UNIQUE INDEX ri_using_index_uid_key ON ri_using_index (uid);
+        ALTER TABLE ri_using_index REPLICA IDENTITY USING INDEX ri_using_index_uid_key;
+        INSERT INTO ri_using_index VALUES (10, 'x'), (20, 'y');
+        CREATE TABLE ri_full (id int PRIMARY KEY, name text);
+        ALTER TABLE ri_full REPLICA IDENTITY FULL;
+        INSERT INTO ri_full VALUES (1, 'a'), (2, NULL);
+        CREATE TABLE ri_nothing (id int PRIMARY KEY, name text);
+        ALTER TABLE ri_nothing REPLICA IDENTITY NOTHING;
+        CREATE TABLE ri_keyless (name text);
+        CREATE TABLE secret (id int PRIMARY KEY);
+        CREATE VIEW v_orders AS SELECT * FROM orders WHERE qty > 3;
+  - start: {}
+
+  - query: >
+      SELECT table_name FROM information_schema.tables
+      WHERE table_catalog = 'pg_${variant.name}' AND table_schema = 'public' ORDER BY 1
+    expect: { rows: [[items], [orders], [ri_full], [ri_using_index]] }
+    eventually: 60s
+  - query: SELECT * FROM pg_${variant.name}.public.orders
+    oracle-sql: SELECT * FROM orders
+    eventually: 60s
+  - query: SELECT * FROM pg_${variant.name}.public.items
+    oracle-sql: SELECT * FROM items
+  - query: SELECT * FROM pg_${variant.name}.public.ri_using_index
+    oracle-sql: SELECT * FROM ri_using_index
+  - query: SELECT * FROM pg_${variant.name}.public.ri_full
+    oracle-sql: SELECT * FROM ri_full
+  - source-query: { src: "SELECT count(*) FROM pg_replication_slots WHERE database = current_database()" }
+    expect: { rows: [["1"]] }
+
+  # Changes reach every accelerated table, keyed as each is keyed.
+  - source-exec:
+      src: |
+        INSERT INTO orders VALUES (301, 3, 1, 'late'), (302, 4, 2, NULL);
+        UPDATE orders SET qty = qty + 10, note = 'bumped' WHERE id % 50 = 0;
+        DELETE FROM orders WHERE id BETWEEN 100 AND 110;
+        UPDATE ri_using_index SET name = 'x2' WHERE uid = 10;
+        DELETE FROM ri_using_index WHERE uid = 20;
+        INSERT INTO ri_using_index VALUES (30, 'z');
+        UPDATE ri_full SET name = 'b' WHERE id = 2;
+        DELETE FROM items WHERE id = 20;
+  - query: SELECT * FROM pg_${variant.name}.public.orders
+    oracle-sql: SELECT * FROM orders
+    eventually: 30s
+  - query: SELECT * FROM pg_${variant.name}.public.ri_using_index
+    oracle-sql: SELECT * FROM ri_using_index
+    eventually: 30s
+  - query: SELECT * FROM pg_${variant.name}.public.ri_full
+    oracle-sql: SELECT * FROM ri_full
+    eventually: 30s
+  - query: SELECT * FROM pg_${variant.name}.public.items
+    oracle-sql: SELECT * FROM items
+    eventually: 30s
+  - query: >
+      SELECT i.name, count(*), sum(o.qty) FROM pg_${variant.name}.public.orders o
+      JOIN pg_${variant.name}.public.items i ON o.item_id = i.id GROUP BY i.name
+    oracle-sql: >
+      SELECT i.name, count(*), sum(o.qty) FROM orders o
+      JOIN items i ON o.item_id = i.id GROUP BY i.name
+
+  # Shut down: a memory acceleration has nothing to resume, so it releases its
+  # slot; a file acceleration keeps it to resume from.
+  - stop: {}
+  - source-query: { src: "SELECT count(*) FROM pg_replication_slots WHERE database = current_database()" }
+    expect: { rows: [["0"]] }
+    eventually: 10s
+    only: memory
+  - source-query: { src: "SELECT count(*) FROM pg_replication_slots WHERE database = current_database()" }
+    expect: { rows: [["1"]] }
+    only: file
+  - source-exec:
+      src: |
+        INSERT INTO orders VALUES (400, 1, 1, 'while down');
+        UPDATE orders SET note = 'changed while down' WHERE id = 1;
+        DELETE FROM orders WHERE id = 2;
+  - start: {}
+  - query: SELECT * FROM pg_${variant.name}.public.orders
+    oracle-sql: SELECT * FROM orders
+    eventually: 60s
+  - source-query: { src: "SELECT count(*) FROM pg_replication_slots WHERE database = current_database()" }
+    expect: { rows: [["1"]] }
+
+  # The slot of a file acceleration disappears while Spice is down: the next
+  # start rebuilds from the source and serves its rows, not the stale ones.
+  - stop: {}
+    only: file
+  - source-exec:
+      src: >
+        SELECT pg_drop_replication_slot(slot_name) FROM pg_replication_slots
+        WHERE database = current_database();
+        UPDATE orders SET qty = 99 WHERE id <= 10;
+        DELETE FROM orders WHERE id BETWEEN 200 AND 210
+    only: file
+  - start: {}
+    only: file
+  - query: SELECT * FROM pg_${variant.name}.public.orders
+    oracle-sql: SELECT * FROM orders
+    eventually: 60s
+  - query: SELECT * FROM pg_${variant.name}.public.ri_using_index
+    oracle-sql: SELECT * FROM ri_using_index
+    eventually: 60s

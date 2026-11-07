@@ -41,7 +41,7 @@ use runtime_query_engine::query_engine::UpdateType;
 use spicepod::drasi::{RuntimeDrasi, RuntimeDrasiTable};
 
 use crate::datafusion::SPICE_RUNTIME_SCHEMA;
-use crate::drasi::queue::{DEFAULT_QUEUE_DEPTH, DeliveryQueue, QueuedBatch};
+use runtime_drasi::queue::{DEFAULT_QUEUE_DEPTH, DeliveryQueue, QueuedBatch};
 
 /// The forwarders configured by `runtime.drasi`, keyed by table.
 #[derive(Debug)]
@@ -235,9 +235,9 @@ fn declared_primary_key(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::drasi::dead_letter::DeadLetterStore;
     use arrow::datatypes::{DataType, Field, Schema};
     use datafusion::common::Constraint;
+    use runtime_drasi::dead_letter::DeadLetterStore;
     use std::sync::Arc;
 
     fn schema() -> SchemaRef {
@@ -568,7 +568,7 @@ mod tests {
             DeadLetterStore::open(
                 dir.path().join("task_history"),
                 table_ref("task_history").to_string(),
-                crate::drasi::dead_letter::DEFAULT_MAX_BATCHES,
+                runtime_drasi::dead_letter::DEFAULT_MAX_BATCHES,
             )
             .await
             .expect("opens the dead-letter store"),

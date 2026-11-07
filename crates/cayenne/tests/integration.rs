@@ -28,6 +28,11 @@ limitations under the License.
 //! first; under plain `cargo test` that call fails the test before it changes
 //! anything its neighbours would see.
 
+#![expect(
+    clippy::expect_used,
+    reason = "set-up and helpers outside `#[test]` functions fail fast with `expect`"
+)]
+
 #[macro_use]
 mod common;
 #[path = "correctness/support/mod.rs"]
@@ -112,6 +117,7 @@ mod partition_chunking_test;
 mod partition_pruning_test;
 mod partitioned_overlay_test;
 mod position_based_deletion_test;
+mod position_delete_inline_test;
 mod position_mode_reclaim_test;
 mod position_mode_upsert_test;
 mod predicate_delete_ram_tier_rows;
@@ -139,8 +145,6 @@ mod staged_append_test;
 mod stats_edge_cases_test;
 mod string_bounds_statistics_test;
 mod timestamp_unit_roundtrip_test;
-#[cfg(feature = "turso")]
-mod turso_0_7_2_open_compat_test;
 mod update_test;
 mod upsert_with_pending_deletions_test;
 mod vortex_compressible_test;

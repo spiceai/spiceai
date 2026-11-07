@@ -31,7 +31,7 @@ use runtime_acceleration::change_sink::{
 };
 use runtime_metrics::acceleration as metrics;
 use runtime_status as status;
-use tokio::sync::RwLock;
+use tokio::sync::{RwLock, mpsc};
 
 use super::{
     ApplyContext, CdcConfig, RefreshTask, SourceDurabilityObserver, StreamErrorType,
@@ -39,7 +39,7 @@ use super::{
     join_pending_commit,
 };
 use crate::accelerated::refresh::Refresh;
-use crate::accelerated::refresh_completion::RefreshCompletion;
+use crate::accelerated::refresh_completion::{RefreshCompletion, RefreshRequestId};
 
 type Committer = Box<dyn cdc::CommitChange + Send + Sync>;
 
@@ -144,6 +144,17 @@ struct SourceGroup {
     source_timestamp: Option<i64>,
 }
 
+/// The next request to reload the served partitions, or `None` once every
+/// trigger is dropped. Never resolves for a stream that takes no requests.
+async fn next_reload(
+    requests: &mut Option<mpsc::Receiver<RefreshRequestId>>,
+) -> Option<RefreshRequestId> {
+    match requests {
+        Some(requests) => requests.recv().await,
+        None => std::future::pending().await,
+    }
+}
+
 async fn await_front(pending: &mut VecDeque<PendingSource>) -> Result<()> {
     match pending.front_mut() {
         Some(front) => front.published().await,
@@ -157,6 +168,8 @@ enum Event {
     Built(ChangeStreamItem),
     Admission,
     Published(Result<()>),
+    /// A request to reload the served partitions; `None` once no trigger remains.
+    Reload(Option<RefreshRequestId>),
 }
 
 impl RefreshTask {
@@ -226,6 +239,8 @@ impl RefreshTask {
         let mut source_ended = false;
         let mut received_timestamp = None;
         let mut metadata_flush_count = 0_u64;
+        let mut reload_requests = self.reload_requests.lock().take();
+        let mut reloads: Vec<RefreshRequestId> = Vec::new();
         // Bound source metadata as well as storage admission. Unaccepted
         // envelopes are one held envelope, or one group built ahead while the
         // sink applies, which takes no more than this limit leaves room for.
@@ -313,7 +328,27 @@ impl RefreshTask {
                 continue;
             }
             let mut admission = None;
-            let event = if let Some(envelope) = held.as_ref() {
+            // A reload replaces the acceleration, so it waits for every accepted
+            // write to publish; changes received meanwhile apply after it.
+            let event = if !reloads.is_empty() && held.is_none() {
+                if pending.is_empty() {
+                    let Some(reloaded) = self.reload_served_partitions(&mut context).await else {
+                        break;
+                    };
+                    if let Some(completion) = context.refresh_completion {
+                        for id in reloads.drain(..) {
+                            if reloaded {
+                                completion.record(id);
+                            } else {
+                                completion.record_terminal_failure(id);
+                            }
+                        }
+                    }
+                    reloads.clear();
+                    continue;
+                }
+                Event::Published(await_front(&mut pending).await)
+            } else if let Some(envelope) = held.as_ref() {
                 if envelope.history_unavailable() {
                     if pending.is_empty() {
                         let Some(envelope) = held.take() else {
@@ -348,6 +383,7 @@ impl RefreshTask {
                 tokio::select! {
                     biased;
                     result = await_front(&mut pending) => Event::Published(result),
+                    request = next_reload(&mut reload_requests) => Event::Reload(request),
                     item = source.next() => {
                         ingress.record_receive_wait(receive_start);
                         Event::Source(item)
@@ -426,6 +462,14 @@ impl RefreshTask {
                         .await
                 }
                 Event::Published(Err(error)) => Err(error),
+                Event::Reload(Some(id)) => {
+                    reloads.push(id);
+                    Ok(true)
+                }
+                Event::Reload(None) => {
+                    reload_requests = None;
+                    Ok(true)
+                }
                 Event::Source(None) => {
                     source_ended = true;
                     Ok(true)
@@ -477,6 +521,19 @@ impl RefreshTask {
                     self.source_error(&context, &error).await;
                     break;
                 }
+            }
+        }
+        // A reload that will not run is answered as failed, so its caller does not
+        // wait on a stream that has stopped.
+        if let Some(requests) = reload_requests.as_mut() {
+            requests.close();
+            while let Ok(id) = requests.try_recv() {
+                reloads.push(id);
+            }
+        }
+        if let Some(completion) = context.refresh_completion {
+            for id in reloads {
+                completion.record_terminal_failure(id);
             }
         }
         // Dropped metadata is never acknowledged. Accepted storage work still

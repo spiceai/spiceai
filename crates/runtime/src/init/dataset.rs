@@ -52,7 +52,8 @@ use crate::{
         builder::DatasetBuilder,
     },
     component::{
-        AcceleratedComponent, deprecated_ready_state_warning, disabled_acceleration_warning,
+        AcceleratedComponent, component_accelerations, deprecated_acceleration_engines_warning,
+        deprecated_ready_state_warning, disabled_acceleration_warning,
     },
     dataaccelerator::{AccelerationSource, validate_snapshot_paths},
     dataconnector::{
@@ -69,6 +70,7 @@ use crate::{
     tracing_util::dataset_registered_trace,
 };
 use app::App;
+use data_components::incremental_append::incremental_append_source;
 use datafusion::common::{ResolvedTableReference, TableReference};
 use futures::StreamExt;
 use futures::future::join_all;
@@ -297,6 +299,14 @@ impl Runtime {
                     &app.runtime,
                 )
             {
+                tracing::warn!("{warning}");
+            }
+            // Once for the whole Spicepod, not per component. A hot reload warns about
+            // the components it adds or changes (`Runtime::apply_app_diff`).
+            if let Some(warning) = deprecated_acceleration_engines_warning(component_accelerations(
+                &app.datasets,
+                &app.views,
+            )) {
                 tracing::warn!("{warning}");
             }
             if let Some(section) = app.snapshots.as_deref() {
@@ -1318,10 +1328,15 @@ impl Runtime {
             &checkpoint_schema,
             resolved_refresh_mode,
         );
-        let federated_table = FederatedTable::new_deferred(
-            Arc::new(ds.spec.clone()),
+        let refresh_source =
+            ConnectorRefreshSource::new_arc(Arc::clone(data_connector), Arc::clone(&ds));
+        // Snapshot refreshes report snapshot-store failures. The original source
+        // remains available for federation without changing the reader's status.
+        let refresh_source = if resolved_refresh_mode == RefreshMode::Snapshot {
+            refresh_source
+        } else {
             crate::dataconnector::refresh_source::ReportingRefreshSource::new_arc(
-                ConnectorRefreshSource::new_arc(Arc::clone(data_connector), Arc::clone(&ds)),
+                refresh_source,
                 Arc::clone(&ds),
                 Arc::clone(&self.status),
                 match reason {
@@ -1331,11 +1346,17 @@ impl Runtime {
                     } => Some(*configuration_error),
                     SourceUnavailable::NotContacted => None,
                 },
-            ),
+            )
+        };
+        let federated_table = FederatedTable::new_deferred(
+            Arc::new(ds.spec.clone()),
+            refresh_source,
             checkpoint_schema,
             self.status.shutdown_token(),
         );
-        reason.log_serving_from_acceleration(&ds.name);
+        if resolved_refresh_mode != RefreshMode::Snapshot {
+            reason.log_serving_from_acceleration(&ds.name);
+        }
         (ds, federated_table)
     }
 
@@ -1585,6 +1606,7 @@ impl Runtime {
             return Err(err);
         }
 
+        let mut overlap_warning = None;
         if let Some(acceleration) = ds.acceleration.as_ref().filter(|a| a.enabled) {
             let refresh_mode = data_connector.resolve_refresh_mode(acceleration.refresh_mode);
             let dataset_name = ds.name.to_string();
@@ -1604,10 +1626,10 @@ impl Runtime {
                 && refresh_mode == RefreshMode::Append
                 && acceleration.refresh_append_overlap.is_none()
             {
-                tracing::warn!(
-                    "{}",
-                    newest_by_time_without_overlap_warning(&dataset_name, time_column)
-                );
+                overlap_warning = Some(newest_by_time_without_overlap_warning(
+                    &dataset_name,
+                    time_column,
+                ));
             }
         }
 
@@ -1708,6 +1730,28 @@ impl Runtime {
             )
             .await?;
         ds = resolved_ds;
+
+        let records_commits = federated_table
+            .try_table_provider_sync_ref()
+            .is_some_and(|provider| incremental_append_source(provider.as_ref()).is_some());
+        if records_commits {
+            // A source that records its commits (Iceberg) needs no overlap, unless read by time.
+            if let Some(acceleration) = ds.acceleration.as_ref().filter(|a| a.enabled)
+                && acceleration.refresh_append_overlap.is_none()
+                && reads_by_time_despite_commits(
+                    acceleration,
+                    ds.time_column.as_deref(),
+                    resolved_refresh_mode,
+                )
+            {
+                tracing::warn!(
+                    "{}",
+                    last_arrival_without_overlap_warning(&ds.name.to_string(), acceleration.engine)
+                );
+            }
+        } else if let Some(warning) = overlap_warning {
+            tracing::warn!("{warning}");
+        }
 
         tracing::debug!(dataset = %ds.name, duration_ms = schema_start.elapsed().as_millis(), "Dataset schema inference complete");
 
@@ -1907,16 +1951,20 @@ impl Runtime {
     }
 
     #[cfg(test)]
-    async fn update_dataset(self: Arc<Self>, ds: Arc<Dataset>) {
+    async fn update_dataset(self: Arc<Self>, ds: Arc<Dataset>) -> Option<AcceleratorBootstrap> {
         self.update_dataset_with_bootstrap(ds, BootstrapStatus::None.into())
-            .await;
+            .await
     }
 
+    /// Returns the bootstrap to load the dataset with, retrying, when the full
+    /// reload unregistered the dataset and then failed to load its new
+    /// configuration. An acceleration that cannot be initialized is not retried,
+    /// as for an added dataset.
     async fn update_dataset_with_bootstrap(
         self: Arc<Self>,
         ds: Arc<Dataset>,
         bootstrap: AcceleratorBootstrap,
-    ) {
+    ) -> Option<AcceleratorBootstrap> {
         // Defense in depth. Today the only caller is `apply_dataset_diff`, which
         // preflights through `initialize_datasets_accelerators` and skips a
         // refused dataset before it gets here. But both branches below mutate
@@ -1927,7 +1975,7 @@ impl Runtime {
         // and the running dataset is left as it was.
         if preflight_dataset(&ds, &self.status, &self.spaced_tracer).is_err() {
             // `preflight_dataset` reported it.
-            return;
+            return None;
         }
 
         self.status
@@ -1967,11 +2015,13 @@ impl Runtime {
                             // but a query that started after it and read the
                             // previous registration finishes with a `read_started_at`
                             // the clock would accept, so its result must be rejected by
-                            // a mark at the replacement itself.
+                            // a mark at the replacement itself. A plan built in between
+                            // holds the previous table, so the plans are cleared again too.
+                            self.df.clear_cached_plans().await;
                             self.invalidate_cached_results_for(&ds.name).await;
                             self.status
                                 .update_dataset(&ds.name, status::ComponentStatus::Ready);
-                            return;
+                            return None;
                         }
                         // The reason is the only thing that distinguishes a swap
                         // that could not be built from one whose acceleration
@@ -1994,14 +2044,14 @@ impl Runtime {
                         )
                         .await
                     {
-                        return;
+                        return None;
                     }
                     let Some(Ok(bootstrap)) = self
                         .initialize_datasets_accelerators(std::slice::from_ref(&ds))
                         .await
                         .remove(&ds.name)
                     else {
-                        return;
+                        return None;
                     };
                     bootstrap
                 } else {
@@ -2016,14 +2066,14 @@ impl Runtime {
                     )
                     .await
                 {
-                    return;
+                    return None;
                 }
 
                 let initialized = DatasetInitialization::plan_eager(
                     Arc::clone(&ds),
                     Arc::clone(&self),
                     Arc::clone(&connector),
-                    bootstrap,
+                    bootstrap.clone(),
                     None,
                     None,
                 )
@@ -2038,17 +2088,22 @@ impl Runtime {
                 // accepts as fresh.
                 self.invalidate_cached_results_for(&ds.name).await;
 
+                // The serving table is gone, so the new configuration loads
+                // like an added dataset's, retrying until its source answers.
                 if let Err(e) = initialized {
                     self.status.update_dataset(
                         &ds.name,
                         status::ComponentStatus::error_with_message(e.to_string()),
                     );
+                    return Some(bootstrap);
                 }
+                None
             }
             Err(e) => {
                 // `load_dataset_connector` set the error status for this failure.
                 // Only the hot-reload context it cannot know is added here (#12365).
                 tracing::error!("Unable to update dataset {}: {e}", ds.name);
+                None
             }
         }
     }
@@ -2532,13 +2587,6 @@ impl Runtime {
                 name: accelerator_engine.to_string(),
             })?;
 
-        // Warn if Turso engine is being used
-        if accelerator_engine == crate::component::dataset::acceleration::Engine::Turso {
-            tracing::warn!(
-                "Turso data accelerator (Alpha) is in preview and should not be used in production."
-            );
-        }
-
         // The accelerated refresh task will set the dataset status to `Ready` once it finishes loading.
         self.status
             .update_dataset(&ds.name, status::ComponentStatus::Refreshing);
@@ -2562,7 +2610,7 @@ impl Runtime {
             })?;
 
         if notifier.is_some() {
-            // spawn a background task to wait for the accelerated table to be ready before creating schedules
+            // spawn a background task to wait for the accelerated table to be ready before acking its partitions
             let runtime = ds.runtime();
             let runtime_status = Arc::clone(&self.status);
             let ds = Arc::clone(&ds);
@@ -2583,7 +2631,7 @@ impl Runtime {
                 if runtime_status
                     .wait_for_dataset_ready(&dataset_table_ref)
                     .await
-                    == crate::status::WaitOutcome::ShuttingDown
+                    == runtime_status::WaitOutcome::ShuttingDown
                 {
                     return;
                 }
@@ -2643,6 +2691,21 @@ impl Runtime {
                         "Failed to load the partitions of {dataset_name} assigned during its initial load: {e}"
                     );
                 }
+            });
+
+            // The schedule waits only for the initial load to end, so a scheduled refresh
+            // can still recover a dataset whose initial load failed.
+            let runtime = ds.runtime();
+            let runtime_status = Arc::clone(&self.status);
+            tokio::task::spawn(async move {
+                if runtime_status
+                    .wait_for_dataset_loaded_or_failed(&ds.name)
+                    .await
+                    == runtime_status::WaitOutcome::ShuttingDown
+                {
+                    return;
+                }
+                let dataset_name = ds.name.to_string();
                 if let Err(e) = runtime.create_dataset_or_view_schedule(ds).await {
                     tracing::error!("Failed to create dataset schedule for '{dataset_name}': {e}");
                 }
@@ -2652,11 +2715,13 @@ impl Runtime {
         Ok(())
     }
 
+    /// Returns the datasets this diff loads, reloads or removes: the views that read
+    /// them hold the tables they planned against, or failed to find one.
     pub(crate) async fn apply_dataset_diff(
         self: Arc<Self>,
         current_app: &Arc<App>,
         new_app: &Arc<App>,
-    ) {
+    ) -> HashSet<ResolvedTableReference> {
         let valid_datasets = Arc::clone(&self).get_valid_datasets(new_app, LogErrors(true));
 
         let existing_datasets = Arc::clone(&self).get_valid_datasets(current_app, LogErrors(false));
@@ -2695,7 +2760,14 @@ impl Runtime {
             .datasets
             .iter()
             .filter(|ds| !new_app.datasets.iter().any(|d| d.name == ds.name))
-            .filter_map(|ds| Dataset::parse_table_reference(&ds.name).ok());
+            .filter_map(|ds| Dataset::parse_table_reference(&ds.name).ok())
+            .collect::<Vec<_>>();
+        let reloaded: HashSet<ResolvedTableReference> = datasets_to_apply
+            .iter()
+            .map(|ds| ds.name.clone())
+            .chain(removed_datasets.iter().cloned())
+            .map(resolve_table_reference)
+            .collect();
         let mut still_loading = HashSet::new();
         for name in datasets_to_apply
             .iter()
@@ -2829,9 +2901,23 @@ impl Runtime {
                 }
 
                 if !bootstrap_status.is_pending() {
-                    Arc::clone(&self)
+                    if let Some(bootstrap_status) = Arc::clone(&self)
                         .update_dataset_with_bootstrap(Arc::clone(ds), bootstrap_status)
-                        .await;
+                        .await
+                    {
+                        let runtime = Arc::clone(&self);
+                        let ds_clone = Arc::clone(ds);
+                        let load_semaphore = Arc::clone(&self.dataset_load_semaphore);
+                        let load = self.dataset_loads.begin(&ds.name);
+                        added_futures.insert(
+                            resolve_table_reference(ds.name.clone()),
+                            Box::pin(async move {
+                                runtime
+                                    .load_dataset(ds_clone, bootstrap_status, load_semaphore, load)
+                                    .await;
+                            }),
+                        );
+                    }
                     continue;
                 }
                 // Keep the serving table until the replacement snapshot has been
@@ -2976,6 +3062,8 @@ impl Runtime {
                     .await;
             }
         }
+
+        reloaded
     }
 
     /// The load of a queued `localpod` dataset, followed by the loads of the `localpod` datasets
@@ -3388,10 +3476,34 @@ fn deprecated_on_conflict_warning(
 }
 
 /// Warning for an append that keeps the newest version of each key by `time_column`
-/// but has no `refresh_append_overlap`, so it never re-reads a late row.
+/// but has no `refresh_append_overlap` and reads by time, so it never re-reads a late row.
 fn newest_by_time_without_overlap_warning(dataset_name: &str, time_column: &str) -> String {
     format!(
         "Dataset '{dataset_name}' keeps the newest version of each key by '{time_column}', but without `refresh_append_overlap` an append never re-reads late rows, so a late update is not loaded. Set `refresh_append_overlap` to how late rows can arrive. See: https://spiceai.org/docs/features/data-acceleration/constraints"
+    )
+}
+
+/// Whether a keyed append refresh reads by time instead of following its source's
+/// commits, because the engine keeps the last arrival of a key (#15273). Must match
+/// `RefreshTask::commit_cursor_store`.
+fn reads_by_time_despite_commits(
+    acceleration: &Acceleration,
+    time_column: Option<&str>,
+    refresh_mode: RefreshMode,
+) -> bool {
+    let (Some(time_column), Some(key)) = (time_column, acceleration.primary_key.as_ref()) else {
+        return false;
+    };
+    refresh_mode == RefreshMode::Append
+        && !acceleration.orders_versions_by_time(Some(time_column), refresh_mode)
+        && !key.iter().any(|column| column == time_column)
+}
+
+/// Warning for a keyed append that reads by time ([`reads_by_time_despite_commits`])
+/// without `refresh_append_overlap`, so it never loads a late row.
+fn last_arrival_without_overlap_warning(dataset_name: &str, engine: Engine) -> String {
+    format!(
+        "Dataset '{dataset_name}' (`engine: {engine}`) has no `refresh_append_overlap`, so a row that arrives after a newer one is never loaded. Use `engine: cayenne` to load every new row, or set `refresh_append_overlap` to how late rows can arrive. See: https://spiceai.org/docs/features/data-acceleration/data-refresh"
     )
 }
 
@@ -4105,6 +4217,45 @@ mod tests {
             newest_by_time_without_overlap_warning("events", "updated_at"),
             "Dataset 'events' keeps the newest version of each key by 'updated_at', but without `refresh_append_overlap` an append never re-reads late rows, so a late update is not loaded. Set `refresh_append_overlap` to how late rows can arrive. See: https://spiceai.org/docs/features/data-acceleration/constraints"
         );
+    }
+
+    #[test]
+    fn the_last_arrival_warning_says_which_rows_are_missed_and_how_to_load_them() {
+        assert_eq!(
+            last_arrival_without_overlap_warning("acc", Engine::DuckDB),
+            "Dataset 'acc' (`engine: duckdb`) has no `refresh_append_overlap`, so a row that arrives after a newer one is never loaded. Use `engine: cayenne` to load every new row, or set `refresh_append_overlap` to how late rows can arrive. See: https://spiceai.org/docs/features/data-acceleration/data-refresh"
+        );
+    }
+
+    /// Only a keyed append that keeps the last arrival reads by time (#15273).
+    #[test]
+    fn only_a_keyed_last_arrival_append_reads_by_time() {
+        use datafusion_table_providers::util::column_reference::ColumnReference;
+        let key = ColumnReference::new(vec!["list_id".to_string(), "row_id".to_string()]);
+        let acceleration = |engine, primary_key: Option<&ColumnReference>| Acceleration {
+            engine,
+            primary_key: primary_key.cloned(),
+            ..Acceleration::default()
+        };
+        let with_time =
+            ColumnReference::new(vec!["row_id".to_string(), "update_timestamp".to_string()]);
+        let ts = Some("update_timestamp");
+        let (keyed, time_keyed) = (Some(&key), Some(&with_time));
+        let (append, full) = (RefreshMode::Append, RefreshMode::Full);
+        for (engine, key, mode, expected, what) in [
+            (Engine::DuckDB, keyed, append, true, "keyed"),
+            (Engine::Sqlite, keyed, append, true, "keyed"),
+            (Engine::DuckDB, None, append, false, "unkeyed"),
+            (Engine::DuckDB, keyed, full, false, "full"),
+            (Engine::Cayenne, keyed, append, false, "keeps newest"),
+            (Engine::DuckDB, time_keyed, append, false, "key holds time"),
+        ] {
+            assert_eq!(
+                reads_by_time_despite_commits(&acceleration(engine, key), ts, mode),
+                expected,
+                "{engine} {what}"
+            );
+        }
     }
 
     /// Every retention setting has to be recognised, whichever one the dataset
@@ -6163,7 +6314,6 @@ use the Enterprise distribution of Spice.ai. Learn more at https://docs.spice.ai
         async fn sidecar(
             &self,
             _source: &dyn AccelerationSource,
-            _registry: Arc<data_accelerator_api::AcceleratorEngineRegistry>,
             _open_option: runtime_acceleration::sidecar::OpenOption,
         ) -> std::result::Result<
             Arc<dyn runtime_acceleration::sidecar::AcceleratorSidecar>,
@@ -6274,7 +6424,7 @@ use the Enterprise distribution of Spice.ai. Learn more at https://docs.spice.ai
             .status
             .get_dataset_status(&ds.name)
             .expect("the refused reload reports a status");
-        let crate::status::ComponentStatus::Error(Some(message)) = status else {
+        let runtime_status::ComponentStatus::Error(Some(message)) = status else {
             panic!("a refused reload must report an error status, got {status:?}");
         };
         assert!(
@@ -6947,6 +7097,7 @@ use the Enterprise distribution of Spice.ai. Learn more at https://docs.spice.ai
     }
 }
 
-#[cfg(all(test, feature = "snapshots", feature = "duckdb"))]
+#[cfg(test)]
+#[cfg(all(feature = "snapshots", feature = "duckdb"))]
 #[path = "dataset_snapshot_bootstrap_tests.rs"]
 mod snapshot_bootstrap_tests;

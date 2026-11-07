@@ -164,7 +164,7 @@ impl ODBCProfile {
 fn function_support_for_engine(engine: Option<&str>) -> FunctionSupport {
     let support = deny_spice_specific_functions().as_ref().clone();
     match engine.and_then(expression_support_for_engine) {
-        Some(gate) => support.with_expression_support(gate),
+        Some(gate) => runtime_udfs_api::and_expression_support(support, gate),
         None => support,
     }
 }

@@ -1,0 +1,233 @@
+name: dynamodb-writes
+description: >
+  DynamoDB through Spice: INSERT (several types) and DELETE (by key, by a
+  composite key tuple) write to the table, as a scan of it shows; and tables
+  whose schema is not known at startup — missing, empty, declared, or
+  without streams until later — register and load once they can, federated
+  and through DynamoDB Streams into Cayenne. (Declared columns over a table
+  created or streamed after startup can miss its rows:
+  known-failing/streaming-sources/dynamodb-declared-streams-race.yaml.)
+
+sources:
+  ddb:
+    kind: docker
+    image: docker.io/localstack/localstack:4.9
+    ports: [4566]
+    env: { SERVICES: dynamodb, AWS_DEFAULT_REGION: us-east-1 }
+    ready: awslocal dynamodb list-tables
+
+spicepod:
+  version: v1
+  kind: Spicepod
+  name: dynamodb-writes
+  datasets:
+    - from: dynamodb:items_${sources.ddb.namespace}
+      name: items
+      params:
+        dynamodb_aws_region: us-east-1
+        dynamodb_aws_auth: key
+        dynamodb_aws_access_key_id: test
+        dynamodb_aws_secret_access_key: test
+        endpoint_url: http://127.0.0.1:${sources.ddb.port.4566}
+      access: read_write
+    - from: dynamodb:pairs_${sources.ddb.namespace}
+      name: pairs
+      params:
+        dynamodb_aws_region: us-east-1
+        dynamodb_aws_auth: key
+        dynamodb_aws_access_key_id: test
+        dynamodb_aws_secret_access_key: test
+        endpoint_url: http://127.0.0.1:${sources.ddb.port.4566}
+      access: read_write
+    - from: dynamodb:missing_${sources.ddb.namespace}
+      name: missing
+      params:
+        dynamodb_aws_region: us-east-1
+        dynamodb_aws_auth: key
+        dynamodb_aws_access_key_id: test
+        dynamodb_aws_secret_access_key: test
+        endpoint_url: http://127.0.0.1:${sources.ddb.port.4566}
+    - from: dynamodb:emptyt_${sources.ddb.namespace}
+      name: empty_fed
+      params:
+        dynamodb_aws_region: us-east-1
+        dynamodb_aws_auth: key
+        dynamodb_aws_access_key_id: test
+        dynamodb_aws_secret_access_key: test
+        endpoint_url: http://127.0.0.1:${sources.ddb.port.4566}
+    - from: dynamodb:declared_${sources.ddb.namespace}
+      name: declared
+      params:
+        dynamodb_aws_region: us-east-1
+        dynamodb_aws_auth: key
+        dynamodb_aws_access_key_id: test
+        dynamodb_aws_secret_access_key: test
+        endpoint_url: http://127.0.0.1:${sources.ddb.port.4566}
+      columns:
+        - { name: id, type: text }
+        - { name: name, type: text }
+    - from: dynamodb:declempty_${sources.ddb.namespace}
+      name: declared_empty
+      params:
+        dynamodb_aws_region: us-east-1
+        dynamodb_aws_auth: key
+        dynamodb_aws_access_key_id: test
+        dynamodb_aws_secret_access_key: test
+        endpoint_url: http://127.0.0.1:${sources.ddb.port.4566}
+      columns:
+        - { name: id, type: text }
+        - { name: name, type: text }
+    - from: dynamodb:missing2_${sources.ddb.namespace}
+      name: missing_streams
+      params:
+        dynamodb_aws_region: us-east-1
+        dynamodb_aws_auth: key
+        dynamodb_aws_access_key_id: test
+        dynamodb_aws_secret_access_key: test
+        endpoint_url: http://127.0.0.1:${sources.ddb.port.4566}
+      acceleration: { enabled: true, engine: cayenne, mode: file, refresh_mode: changes }
+    - from: dynamodb:nostream_${sources.ddb.namespace}
+      name: no_stream_yet
+      params:
+        dynamodb_aws_region: us-east-1
+        dynamodb_aws_auth: key
+        dynamodb_aws_access_key_id: test
+        dynamodb_aws_secret_access_key: test
+        endpoint_url: http://127.0.0.1:${sources.ddb.port.4566}
+      acceleration: { enabled: true, engine: cayenne, mode: file, refresh_mode: changes }
+
+    - from: dynamodb:sempty_${sources.ddb.namespace}
+      name: streams_empty
+      params:
+        dynamodb_aws_region: us-east-1
+        dynamodb_aws_auth: key
+        dynamodb_aws_access_key_id: test
+        dynamodb_aws_secret_access_key: test
+        endpoint_url: http://127.0.0.1:${sources.ddb.port.4566}
+      acceleration: { enabled: true, engine: cayenne, mode: file, refresh_mode: changes }
+    - from: dynamodb:sdempty_${sources.ddb.namespace}
+      name: streams_declared_empty
+      params:
+        dynamodb_aws_region: us-east-1
+        dynamodb_aws_auth: key
+        dynamodb_aws_access_key_id: test
+        dynamodb_aws_secret_access_key: test
+        endpoint_url: http://127.0.0.1:${sources.ddb.port.4566}
+      columns:
+        - { name: id, type: text }
+        - { name: name, type: text }
+      acceleration: { enabled: true, engine: cayenne, mode: file, refresh_mode: changes }
+
+steps:
+  - source-exec:
+      ddb: |
+        python3 - <<'PY'
+        import boto3, json
+        from decimal import Decimal
+        d = boto3.resource('dynamodb', endpoint_url='http://localhost:4566', region_name='us-east-1', aws_access_key_id='test', aws_secret_access_key='test')
+        c = boto3.client('dynamodb', endpoint_url='http://localhost:4566', region_name='us-east-1', aws_access_key_id='test', aws_secret_access_key='test')
+        N = '${sources.ddb.namespace}'
+        def make(name, keys, stream=False):
+            spec = dict(TableName=name + '_' + N, KeySchema=[{'AttributeName': k, 'KeyType': t} for k, t in keys],
+                AttributeDefinitions=[{'AttributeName': k, 'AttributeType': 'S'} for k, _ in keys], BillingMode='PAY_PER_REQUEST')
+            if stream:
+                spec['StreamSpecification'] = {'StreamEnabled': True, 'StreamViewType': 'NEW_AND_OLD_IMAGES'}
+            d.create_table(**spec).wait_until_exists()
+        make('items', [('id', 'HASH')])
+        d.Table('items_' + N).put_item(Item={'id': 'seed', 'int_val': 100, 'float_val': Decimal('1.5'), 'bool_val': False, 'name': 'Seed Row'})
+        make('pairs', [('pk', 'HASH'), ('sk', 'RANGE')])
+        for pk, sk, v in [('a', '1', 'alpha-one'), ('a', '2', 'alpha-two'), ('b', '1', 'beta-one'), ('b', '2', 'beta-two')]:
+            d.Table('pairs_' + N).put_item(Item={'pk': pk, 'sk': sk, 'v': v})
+        make('emptyt', [('id', 'HASH')])
+        make('nostream', [('id', 'HASH')])
+        make('declempty', [('id', 'HASH')])
+        make('sempty', [('id', 'HASH')], stream=True)
+        make('sdempty', [('id', 'HASH')], stream=True)
+        PY
+  - start: { ready: false }
+
+  # Writes reach the table.
+  - query: SELECT id, int_val, float_val, bool_val, name FROM items
+    expect: { rows: [[seed, '100', '1.5', 'false', Seed Row]] }
+    eventually: 30s
+  - spice-exec: INSERT INTO items (id, int_val, float_val, bool_val, name) VALUES ('new', 42, 3.14, true, 'Test Row'), ('gone', 1, 1.0, false, 'Gone')
+  - spice-exec: DELETE FROM items WHERE id IN ('gone')
+  - source-query:
+      ddb: |
+        python3 - <<'PY'
+        import boto3, json
+        from decimal import Decimal
+        d = boto3.resource('dynamodb', endpoint_url='http://localhost:4566', region_name='us-east-1', aws_access_key_id='test', aws_secret_access_key='test')
+        c = boto3.client('dynamodb', endpoint_url='http://localhost:4566', region_name='us-east-1', aws_access_key_id='test', aws_secret_access_key='test')
+        N = '${sources.ddb.namespace}'
+        def make(name, keys, stream=False):
+            spec = dict(TableName=name + '_' + N, KeySchema=[{'AttributeName': k, 'KeyType': t} for k, t in keys],
+                AttributeDefinitions=[{'AttributeName': k, 'AttributeType': 'S'} for k, _ in keys], BillingMode='PAY_PER_REQUEST')
+            if stream:
+                spec['StreamSpecification'] = {'StreamEnabled': True, 'StreamViewType': 'NEW_AND_OLD_IMAGES'}
+            d.create_table(**spec).wait_until_exists()
+        rows = sorted(d.Table('items_' + N).scan()['Items'], key=lambda r: r['id'])
+        for r in rows: print(r['id'], r['int_val'], r['float_val'], r['bool_val'], r['name'])
+        PY
+    expect: { rows: [[new 42 3.14 True Test Row], [seed 100 1.5 False Seed Row]] }
+  - query: SELECT id, int_val, float_val, bool_val, name FROM items
+    expect: { rows: [[new, '42', '3.14', 'true', Test Row], [seed, '100', '1.5', 'false', Seed Row]] }
+  - spice-exec: DELETE FROM pairs WHERE (pk, sk) IN (('a', '1'), ('b', '2'))
+  - query: SELECT pk, sk, v FROM pairs
+    expect: { rows: [[a, '2', alpha-two], [b, '1', beta-one]] }
+
+  # Tables whose schema arrives later.
+  # Declared columns over an existing empty table register at once (a missing
+  # table waits for it to exist).
+  - query: SELECT count(*) AS n FROM declared_empty
+    expect: { rows: [['0']] }
+    eventually: 30s
+  - query: SELECT count(*) AS n FROM streams_declared_empty
+    expect: { rows: [['0']] }
+    eventually: 30s
+  - source-exec:
+      ddb: |
+        python3 - <<'PY'
+        import boto3, json
+        from decimal import Decimal
+        d = boto3.resource('dynamodb', endpoint_url='http://localhost:4566', region_name='us-east-1', aws_access_key_id='test', aws_secret_access_key='test')
+        c = boto3.client('dynamodb', endpoint_url='http://localhost:4566', region_name='us-east-1', aws_access_key_id='test', aws_secret_access_key='test')
+        N = '${sources.ddb.namespace}'
+        def make(name, keys, stream=False):
+            spec = dict(TableName=name + '_' + N, KeySchema=[{'AttributeName': k, 'KeyType': t} for k, t in keys],
+                AttributeDefinitions=[{'AttributeName': k, 'AttributeType': 'S'} for k, _ in keys], BillingMode='PAY_PER_REQUEST')
+            if stream:
+                spec['StreamSpecification'] = {'StreamEnabled': True, 'StreamViewType': 'NEW_AND_OLD_IMAGES'}
+            d.create_table(**spec).wait_until_exists()
+        make('missing', [('id', 'HASH')])
+        make('declared', [('id', 'HASH')])
+        make('missing2', [('id', 'HASH')], stream=True)
+        c.update_table(TableName='nostream_' + N, StreamSpecification={'StreamEnabled': True, 'StreamViewType': 'NEW_AND_OLD_IMAGES'})
+        for t in ['missing', 'emptyt', 'declared', 'missing2', 'nostream', 'declempty', 'sempty', 'sdempty']:
+            for i in range(3):
+                d.Table(t + '_' + N).put_item(Item={'id': str(i), 'name': 'Item ' + str(i)})
+        PY
+  - query: SELECT id, name FROM missing
+    expect: { rows: [['0', Item 0], ['1', Item 1], ['2', Item 2]] }
+    eventually: 90s
+  - query: SELECT id, name FROM empty_fed
+    expect: { rows: [['0', Item 0], ['1', Item 1], ['2', Item 2]] }
+    eventually: 90s
+  - query: SELECT id, name FROM declared
+    expect: { rows: [['0', Item 0], ['1', Item 1], ['2', Item 2]] }
+    eventually: 90s
+  - query: SELECT id, name FROM missing_streams
+    expect: { rows: [['0', Item 0], ['1', Item 1], ['2', Item 2]] }
+    eventually: 90s
+  - query: SELECT id, name FROM declared_empty
+    expect: { rows: [['0', Item 0], ['1', Item 1], ['2', Item 2]] }
+    eventually: 90s
+  - query: SELECT id, name FROM no_stream_yet
+    expect: { rows: [['0', Item 0], ['1', Item 1], ['2', Item 2]] }
+    eventually: 90s
+  - query: SELECT id, name FROM streams_empty
+    expect: { rows: [['0', Item 0], ['1', Item 1], ['2', Item 2]] }
+    eventually: 90s
+  - query: SELECT id, name FROM streams_declared_empty
+    expect: { rows: [['0', Item 0], ['1', Item 1], ['2', Item 2]] }
+    eventually: 90s

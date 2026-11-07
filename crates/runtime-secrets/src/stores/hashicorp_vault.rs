@@ -287,7 +287,7 @@ impl std::str::FromStr for KvVersion {
         match raw {
             "v1" => Ok(Self::V1),
             "v2" => Ok(Self::V2),
-            other => Err(format!("must be one of: v1, v2. Found {other}.")),
+            _ => Err("must be one of: v1, v2.".to_string()),
         }
     }
 }
@@ -319,9 +319,7 @@ impl std::str::FromStr for AuthMethod {
             "approle" => Ok(Self::AppRole),
             "kubernetes" => Ok(Self::Kubernetes),
             "jwt" => Ok(Self::Jwt),
-            other => Err(format!(
-                "must be one of: token, approle, kubernetes, jwt. Found {other}."
-            )),
+            _ => Err("must be one of: token, approle, kubernetes, jwt.".to_string()),
         }
     }
 }

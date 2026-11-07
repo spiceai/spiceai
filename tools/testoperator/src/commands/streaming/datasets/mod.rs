@@ -19,6 +19,8 @@ limitations under the License.
 //! Each dataset type represents a specific table that can be loaded
 //! into a streaming source. Query sets determine which datasets to load.
 
+use test_framework::anyhow;
+
 mod customer;
 mod lineitem;
 mod nation;
@@ -94,4 +96,44 @@ impl std::fmt::Display for DatasetType {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "{}", self.table_name())
     }
+}
+
+/// Match the streaming fixtures' declared schema using Arrow casts rather than row decoding.
+fn with_dataset_schema(
+    batches: Vec<arrow::record_batch::RecordBatch>,
+    schema: arrow::datatypes::Schema,
+) -> anyhow::Result<Vec<arrow::record_batch::RecordBatch>> {
+    let schema = std::sync::Arc::new(schema);
+    batches
+        .into_iter()
+        .map(|batch| {
+            anyhow::ensure!(
+                batch.num_columns() == schema.fields().len(),
+                "Unexpected TPCH column count"
+            );
+            let columns = batch
+                .columns()
+                .iter()
+                .zip(schema.fields())
+                .map(|(column, field)| {
+                    anyhow::ensure!(
+                        column.null_count() == 0,
+                        "Unexpected NULL in TPCH column {}",
+                        field.name()
+                    );
+                    let column = arrow::compute::cast(column, field.data_type())?;
+                    anyhow::ensure!(
+                        column.null_count() == 0,
+                        "TPCH column {} could not be converted without NULLs",
+                        field.name()
+                    );
+                    Ok(column)
+                })
+                .collect::<anyhow::Result<Vec<_>>>()?;
+            Ok(arrow::record_batch::RecordBatch::try_new(
+                std::sync::Arc::clone(&schema),
+                columns,
+            )?)
+        })
+        .collect()
 }

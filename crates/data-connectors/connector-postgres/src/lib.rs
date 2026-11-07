@@ -45,6 +45,7 @@ use datafusion_table_providers::sql::sql_provider_datafusion::{SqlTable, expr::E
 use datafusion_table_providers::util::column_reference::ColumnReference;
 use datafusion_table_providers::util::on_conflict::OnConflict;
 use runtime_component::dataset::DatasetSpec;
+use runtime_datafusion::checked_arithmetic::with_plain_arithmetic_writes;
 use runtime_datafusion::function_support::deny_spice_functions_for_postgres_table_providers;
 use runtime_metrics::component::MetricsProvider;
 use runtime_parameters::{ParameterSpec, Parameters};
@@ -1299,7 +1300,11 @@ impl DataConnector for Postgres {
         {
             Ok(provider) => {
                 let provider = enrich_with_postgres_metadata(&self.pool, dataset, provider).await;
-                Some(ensure_changes_primary_key(dataset, &provider).map(|()| provider))
+                // PostgreSQL evaluates the `UPDATE` and `DELETE` this provider renders.
+                Some(
+                    ensure_changes_primary_key(dataset, &provider)
+                        .map(|()| with_plain_arithmetic_writes(provider)),
+                )
             }
             Err(e) => {
                 if let Some(err_source) = e.source() {
@@ -1388,6 +1393,10 @@ impl DataConnector for Postgres {
     }
 
     fn supports_changes_stream(&self) -> bool {
+        true
+    }
+
+    fn supports_partitioned_changes(&self) -> bool {
         true
     }
 

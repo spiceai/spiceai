@@ -46,7 +46,7 @@ use tokio::time::{Instant, sleep};
 
 use crate::{
     configure_test_datafusion, init_tracing,
-    utils::{runtime_ready_check, test_request_context},
+    utils::{free_ports, runtime_ready_check, test_request_context},
 };
 
 /// A scheduler or executor running in this process.
@@ -55,15 +55,6 @@ struct Node {
     handle: JoinHandle<RuntimeResult<()>>,
     /// `host:port` of the node's cluster endpoint, which is also its task history `node_id`.
     cluster_addr: String,
-}
-
-/// `N` distinct free ports. Every listener stays bound until all `N` are picked, so the
-/// operating system cannot return the same port twice.
-fn free_ports<const N: usize>() -> [u16; N] {
-    let listeners: [std::net::TcpListener; N] = std::array::from_fn(|_| {
-        std::net::TcpListener::bind("127.0.0.1:0").expect("bind ephemeral port")
-    });
-    listeners.map(|listener| listener.local_addr().expect("local addr").port())
 }
 
 async fn start_node(
@@ -359,7 +350,6 @@ async fn run_executor_task_history_on_peer_scheduler() -> Result<(), anyhow::Err
 }
 
 #[tokio::test(flavor = "multi_thread")]
-#[cfg(not(target_os = "windows"))]
 async fn task_history_on_each_scheduler_includes_its_peer() -> Result<(), anyhow::Error> {
     let _tracing = init_tracing(Some("integration=debug,info"));
     test_request_context()
@@ -368,7 +358,6 @@ async fn task_history_on_each_scheduler_includes_its_peer() -> Result<(), anyhow
 }
 
 #[tokio::test(flavor = "multi_thread")]
-#[cfg(not(target_os = "windows"))]
 async fn task_history_on_a_peer_scheduler_includes_the_executor() -> Result<(), anyhow::Error> {
     let _tracing = init_tracing(Some("integration=debug,info"));
     test_request_context()

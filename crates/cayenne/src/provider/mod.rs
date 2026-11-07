@@ -75,6 +75,7 @@ pub(crate) mod append_commit;
 pub(crate) mod append_stage;
 pub(crate) mod clustering;
 pub(crate) mod cold_partition;
+pub(crate) mod cold_pk_prune;
 pub(crate) mod column_stats;
 pub(crate) mod compaction;
 pub(crate) mod compaction_writer;
@@ -83,6 +84,7 @@ pub(crate) mod context;
 pub(crate) mod delete;
 pub mod deletion_index;
 pub(crate) mod deletion_strategy;
+pub(crate) mod deletion_yield;
 pub(crate) mod delta_encoding;
 pub(crate) mod fadvise_tier;
 pub(crate) mod file_digest;
@@ -125,11 +127,13 @@ pub(crate) mod transaction;
 pub(crate) mod tuning;
 #[cfg(test)]
 mod tuning_sim;
+pub(crate) mod update_exec;
 pub(crate) mod update_keys;
 pub(crate) mod utils;
 pub(crate) mod vortex_format;
 pub(crate) mod wal_checksum;
 pub(crate) mod write_budget;
+pub(crate) mod write_lock_held;
 pub(crate) mod write_recovery;
 
 pub use write_recovery::RebuildableWrite;
@@ -276,10 +280,18 @@ pub enum Error {
     #[snafu(display("Internal error in table '{table}': {message}"))]
     Internal { table: String, message: String },
 
+    /// The process reached its open file limit. Client connections and every other
+    /// open file count against the same limit, so the message names it and keeps
+    /// the operating system's error rather than blaming acceleration files alone.
     #[snafu(display(
-        "Unable to open Cayenne acceleration file ({file_path}). Too many Cayenne acceleration files are open. Try increasing your system's maximum open file count, or increase the size of generated Cayenne files with the parameter \"cayenne_target_file_size_mb\". For more details, visit: https://spiceai.org/docs/components/data-accelerators/cayenne#params"
+        "Failed to open Cayenne acceleration file '{file_path}' because the process reached its open file limit{}, which client connections and all other open files also count against. Raise the limit where spiced is started (`ulimit -n`, or the container's `nofile` limit), or write fewer, larger acceleration files with `cayenne_target_file_size_mb`. See: https://spiceai.org/docs/components/data-accelerators/cayenne#params. Cause: {message}",
+        open_file_limit.map_or_else(String::new, |limit| format!(" of {limit}"))
     ))]
-    TooManyOpenFiles { file_path: String },
+    TooManyOpenFiles {
+        file_path: String,
+        open_file_limit: Option<u64>,
+        message: String,
+    },
 
     /// A previous write was interrupted, leaving the table in a potentially
     /// inconsistent state. The staging WAL file must be resolved before the
@@ -467,16 +479,6 @@ mod tests {
         test_concurrent_reads_impl(&connection_string).await;
     }
 
-    #[cfg(feature = "turso")]
-    #[tokio::test]
-    async fn test_concurrent_reads_turso() {
-        let temp_dir = TempDir::new()
-            .expect("Failed to create temporary directory for concurrent reads test (Turso)");
-        let db_path = temp_dir.path().join("cayenne_concurrent_test.db");
-        let connection_string = format!("libsql://{}", db_path.to_string_lossy());
-        test_concurrent_reads_impl(&connection_string).await;
-    }
-
     /// Core concurrent read test implementation
     async fn test_concurrent_reads_impl(connection_string: &str) {
         let ctx = SessionContext::new();
@@ -563,16 +565,6 @@ mod tests {
         test_concurrent_reads_with_filters_impl(&connection_string).await;
     }
 
-    #[cfg(feature = "turso")]
-    #[tokio::test]
-    async fn test_concurrent_reads_with_filters_turso() {
-        let temp_dir =
-            TempDir::new().expect("Failed to create temporary directory for filter test (Turso)");
-        let db_path = temp_dir.path().join("cayenne_filter_test.db");
-        let connection_string = format!("libsql://{}", db_path.to_string_lossy());
-        test_concurrent_reads_with_filters_impl(&connection_string).await;
-    }
-
     /// Test concurrent reads with various filter conditions
     async fn test_concurrent_reads_with_filters_impl(connection_string: &str) {
         let ctx = SessionContext::new();
@@ -655,16 +647,6 @@ mod tests {
         test_concurrent_reads_with_projections_impl(&connection_string).await;
     }
 
-    #[cfg(feature = "turso")]
-    #[tokio::test]
-    async fn test_concurrent_reads_with_projections_turso() {
-        let temp_dir = TempDir::new()
-            .expect("Failed to create temporary directory for projection test (Turso)");
-        let db_path = temp_dir.path().join("cayenne_projection_test.db");
-        let connection_string = format!("libsql://{}", db_path.to_string_lossy());
-        test_concurrent_reads_with_projections_impl(&connection_string).await;
-    }
-
     /// Test concurrent reads with different column projections
     async fn test_concurrent_reads_with_projections_impl(connection_string: &str) {
         let ctx = SessionContext::new();
@@ -738,17 +720,6 @@ mod tests {
             .expect("Failed to create temporary directory for high concurrency stress test");
         let db_path = temp_dir.path().join("cayenne_stress_test.db");
         let connection_string = format!("sqlite://{}", db_path.to_string_lossy());
-        test_high_concurrency_stress_impl(&connection_string).await;
-    }
-
-    #[cfg(feature = "turso")]
-    #[tokio::test]
-    async fn test_high_concurrency_stress_turso() {
-        let temp_dir = TempDir::new().expect(
-            "Failed to create temporary directory for high concurrency stress test (Turso)",
-        );
-        let db_path = temp_dir.path().join("cayenne_stress_test.db");
-        let connection_string = format!("libsql://{}", db_path.to_string_lossy());
         test_high_concurrency_stress_impl(&connection_string).await;
     }
 

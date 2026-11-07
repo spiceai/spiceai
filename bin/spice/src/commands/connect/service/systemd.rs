@@ -365,10 +365,24 @@ fn normalize_systemd_state(reported: &str) -> ServiceState {
 /// anyone in. Detected here so the refusal comes before anything is written
 /// rather than as a `systemctl --user` failure halfway through an install.
 fn preflight(scope: ServiceScope) -> std::result::Result<(), PreflightFailure> {
-    if !Path::new(SYSTEMD_RUNTIME_MARKER).is_dir() {
+    preflight_at(
+        scope,
+        Path::new(SYSTEMD_RUNTIME_MARKER),
+        &user_runtime_dir(),
+    )
+}
+
+/// [`preflight`] against explicit directories, so tests do not depend on the
+/// host running systemd.
+fn preflight_at(
+    scope: ServiceScope,
+    systemd_marker: &Path,
+    user_runtime: &Path,
+) -> std::result::Result<(), PreflightFailure> {
+    if !systemd_marker.is_dir() {
         return Err(PreflightFailure::SystemdUnavailable);
     }
-    if scope == ServiceScope::User && !user_runtime_dir().is_dir() {
+    if scope == ServiceScope::User && !user_runtime.is_dir() {
         return Err(PreflightFailure::SystemdUserManagerUnavailable);
     }
     Ok(())
@@ -3389,11 +3403,11 @@ mod tests {
     fn a_user_install_needs_the_accounts_own_manager() {
         // Asking for a user service on a host with no user manager has to fail
         // before anything is written, naming the path that does work.
-        let failure = preflight(ServiceScope::User);
-        if let Err(failure) = failure {
-            let message = Error::from(failure).to_string();
-            assert!(message.contains("spice cloud service install"), "{message}");
-        }
+        let dir = tempfile::tempdir().expect("create tempdir");
+        let failure = preflight_at(ServiceScope::User, dir.path(), &dir.path().join("user"))
+            .expect_err("a user install with no user manager must be refused");
+        let message = Error::from(failure).to_string();
+        assert!(message.contains("spice cloud service install"), "{message}");
     }
 
     #[test]

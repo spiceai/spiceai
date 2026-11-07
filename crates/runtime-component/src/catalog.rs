@@ -23,6 +23,10 @@ use crate::access::AccessMode;
 use crate::dataset::acceleration::Mode;
 use crate::find_first_delimiter;
 
+/// Provider prefix of the `PostgreSQL` catalog connector -- the only provider
+/// that supports catalog-level acceleration.
+pub const POSTGRES_PROVIDER_PREFIX: &str = "pg";
+
 /// Acceleration configuration for an entire catalog. See
 /// [`spicepod_catalog::CatalogAcceleration`] for the user-facing schema this
 /// mirrors.

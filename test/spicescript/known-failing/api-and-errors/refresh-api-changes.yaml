@@ -1,0 +1,32 @@
+name: refresh-api-changes
+description: >
+  Known failing (#15546). A manual refresh of a `refresh_mode: changes` dataset is
+  refused, as documented, but with 500 and "Manual refresh is not supported
+  for `append` mode. Only `full` refresh mode supports manual refreshes." —
+  the dataset is in changes mode, and append datasets do accept manual
+  refreshes (refresh-api-sql.yaml). Expected 400 naming the dataset's own
+  mode. An unaccelerated or unknown dataset is refused correctly.
+
+sources:
+  src: { kind: postgres }
+
+spicepod:
+  version: v1
+  kind: Spicepod
+  name: refresh-api-changes
+  datasets:
+    - { from: postgres:public.t, name: c, params: '${sources.src.params}', acceleration: { enabled: true, engine: cayenne, mode: file, refresh_mode: changes, primary_key: id, on_conflict: { id: upsert } } }
+    - { from: postgres:public.t, name: f, params: '${sources.src.params}' }
+
+defaults:
+  cluster-partition-by: { '*': id }
+
+steps:
+  - source-exec: { src: "CREATE TABLE t (id int PRIMARY KEY); INSERT INTO t SELECT generate_series(1, 10)" }
+  - start: {}
+  - http: { method: POST, path: /v1/datasets/c/acceleration/refresh }
+    expect: { status: 400, body-matches: ['changes'], body-lacks: ['`append` mode'] }
+  - http: { method: POST, path: /v1/datasets/f/acceleration/refresh }
+    expect: { status: 400, body-matches: ['Dataset f does not have acceleration enabled'] }
+  - http: { method: POST, path: /v1/datasets/nope/acceleration/refresh }
+    expect: { status: 404, body-matches: ['Dataset nope not found'] }
