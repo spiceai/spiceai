@@ -89,6 +89,7 @@ use llms::chat::{
 use llms::streaming_utils::generate_stream_id;
 use runtime_request_context::{AsyncMarker, CacheNamespace, RequestContext};
 
+mod batching;
 mod distributed;
 mod harmony;
 
@@ -405,6 +406,7 @@ impl LlamaCpp {
         let (freed_tx, freed_rx) = std_mpsc::channel::<()>();
         let name = options.reasoning.model_name.to_string();
         let file = file_name(&first);
+        let concurrent = options.concurrent_requests.map_or(1, NonZeroU32::get);
         thread::Builder::new()
             .name("llama-cpp".to_string())
             .spawn(move || {
@@ -413,7 +415,7 @@ impl LlamaCpp {
                     &first,
                     draft.as_deref(),
                     &devices,
-                    n_ctx,
+                    (n_ctx, concurrent),
                     ready_tx,
                     &jobs_rx,
                 );
@@ -963,13 +965,14 @@ fn render(
     .map_err(|e| e.to_string())
 }
 
-/// The decode thread: loads the model, reports readiness, then runs jobs in order.
+/// The decode thread: loads the model, reports readiness, then runs jobs: one at a time, in
+/// order, or up to `concurrent` together, each in its own sequence of one shared cache.
 fn serve(
     name: &str,
     path: &Path,
     draft: Option<&Path>,
     devices: &[llama_cpp::rpc::Device],
-    n_ctx: Option<NonZeroU32>,
+    (n_ctx, concurrent): (Option<NonZeroU32>, u32),
     ready: oneshot::Sender<std::result::Result<Loaded, ChatError>>,
     jobs: &std_mpsc::Receiver<Job>,
 ) {
@@ -1045,10 +1048,13 @@ fn serve(
     let snapshots = head.map_or(0, |(_, kind)| {
         u32::try_from(draft_len(kind, mtp_len)).unwrap_or(0)
     });
-    let context_params = ContextParams::default()
-        .with_n_ctx(n_ctx)
-        .with_n_batch(u32::try_from(PROMPT_BATCH).unwrap_or(u32::MAX))
-        .with_n_rs_seq(snapshots);
+    let context_params = shared_cache(
+        ContextParams::default()
+            .with_n_ctx(n_ctx)
+            .with_n_batch(u32::try_from(PROMPT_BATCH).unwrap_or(u32::MAX))
+            .with_n_rs_seq(snapshots),
+        concurrent,
+    );
     let context = match model.new_context(backend, &context_params) {
         Ok(context) => context,
         Err(e) => {
@@ -1061,7 +1067,7 @@ fn serve(
     let context_window = context.n_ctx();
     let mut decoder = match head {
         None => Decoder::Plain(context),
-        Some((head, kind)) => match mtp(head, kind, context, mtp_len) {
+        Some((head, kind)) => match mtp(head, kind, context, (mtp_len, concurrent)) {
             Ok(spec) => Decoder::Mtp(Box::new(spec)),
             Err(message) => {
                 let _ = ready.send(Err(failed(message)));
@@ -1091,6 +1097,16 @@ fn serve(
     // Ruled out while a required tool call is outstanding.
     let eog = vocab.eog_tokens();
     if ready.send(Ok(loaded)).is_err() {
+        return;
+    }
+    if concurrent > 1 {
+        let mut caches = vec![cache];
+        while caches.len() < usize::try_from(concurrent).unwrap_or(usize::MAX) {
+            let mut more = PromptCache::new(name, truncation);
+            more.reused = Arc::clone(&caches[0].reused);
+            caches.push(more);
+        }
+        batching::serve(&model, &mut decoder, split, caches, jobs, &eog);
         return;
     }
     while let Ok(job) = jobs.recv() {
@@ -1323,11 +1339,14 @@ fn mtp<'m>(
     draft_model: &'m Model,
     kind: DraftKind,
     context: Context<'m>,
-    mtp_len: i32,
+    (mtp_len, concurrent): (i32, u32),
 ) -> std::result::Result<Mtp<'m>, String> {
-    let params = ContextParams::default()
-        .with_n_ctx(NonZeroU32::new(context.n_ctx()))
-        .with_n_batch(u32::try_from(PROMPT_BATCH).unwrap_or(u32::MAX));
+    let params = shared_cache(
+        ContextParams::default()
+            .with_n_ctx(NonZeroU32::new(context.n_ctx()))
+            .with_n_batch(u32::try_from(PROMPT_BATCH).unwrap_or(u32::MAX)),
+        concurrent,
+    );
     Mtp::new(
         context,
         draft_model,
@@ -1340,6 +1359,16 @@ fn mtp<'m>(
         },
     )
     .map_err(|e| format!("llama.cpp could not start drafting: {e}"))
+}
+
+/// `params` for a context that holds `concurrent` sequences on one cache of `n_ctx` cells, so any
+/// one of them can still use the whole context; one sequence, as `params` stands, for one.
+fn shared_cache(params: ContextParams, concurrent: u32) -> ContextParams {
+    if concurrent > 1 {
+        params.with_n_seq_max(concurrent).with_kv_unified(true)
+    } else {
+        params
+    }
 }
 
 /// What prompt reading needs from either engine.
@@ -1362,6 +1391,12 @@ trait Target<'m> {
     fn head_state(&mut self) -> Option<Vec<u8>>;
     /// Restores what `head_state` returned; false when the head does not take it.
     fn restore_head_state(&mut self, state: &[u8]) -> bool;
+    /// The sequence of the shared cache this target reads prompts into and generates in.
+    fn seq(&self) -> i32;
+    /// The sequence's state that a truncation cannot restore (`Context::partial_state_seq`).
+    fn partial_state(&self) -> Option<Vec<u8>>;
+    /// Restores what `partial_state` returned; false when llama.cpp does not read all of it.
+    fn restore_partial_state(&mut self, state: &[u8]) -> bool;
 }
 
 impl<'m> Target<'m> for Context<'m> {
@@ -1388,6 +1423,15 @@ impl<'m> Target<'m> for Context<'m> {
     }
     fn restore_head_state(&mut self, _: &[u8]) -> bool {
         false
+    }
+    fn seq(&self) -> i32 {
+        0
+    }
+    fn partial_state(&self) -> Option<Vec<u8>> {
+        Context::partial_state(self)
+    }
+    fn restore_partial_state(&mut self, state: &[u8]) -> bool {
+        Context::restore_partial_state(self, state)
     }
 }
 
@@ -1419,6 +1463,15 @@ impl<'m> Target<'m> for Mtp<'m> {
     }
     fn restore_head_state(&mut self, state: &[u8]) -> bool {
         self.restore_state(0, state).is_ok()
+    }
+    fn seq(&self) -> i32 {
+        0
+    }
+    fn partial_state(&self) -> Option<Vec<u8>> {
+        self.target().partial_state()
+    }
+    fn restore_partial_state(&mut self, state: &[u8]) -> bool {
+        self.target_mut().restore_partial_state(state)
     }
 }
 
@@ -1593,6 +1646,16 @@ impl PromptCache {
         self.cost.read(tokens, took);
     }
 
+    /// Forgets everything the cache held, for a sequence whose cells were emptied: by a request
+    /// that failed, or to make room for another request's sequence.
+    fn forget(&mut self) {
+        self.tokens.clear();
+        self.head_stash = None;
+        if let Some(checkpoints) = &mut self.checkpoints {
+            checkpoints.clear();
+        }
+    }
+
     /// Records `tokens` as what the caches hold for the next request, after truncating them to
     /// `tokens`, which drops any drafts verified after them. A cache that cannot roll back that
     /// far leaves nothing to reuse.
@@ -1621,7 +1684,7 @@ impl Checkpoints {
     /// Saves `context`'s state after its first `n_tokens` tokens, which follow every earlier
     /// checkpoint's, and returns its size in bytes; `None` when llama.cpp saves nothing.
     fn save<'m>(&mut self, target: &mut impl Target<'m>, n_tokens: usize) -> Option<usize> {
-        let state = target.context().partial_state()?;
+        let state = target.partial_state()?;
         let head = target.head_state();
         if self.0.len() == MAX_CHECKPOINTS {
             self.0.remove(0);
@@ -1645,7 +1708,7 @@ impl Checkpoints {
     /// cache empty.
     fn restore<'m>(&self, target: &mut impl Target<'m>) -> Option<usize> {
         let latest = self.0.last()?;
-        let restored = target.context_mut().restore_partial_state(&latest.state)
+        let restored = target.restore_partial_state(&latest.state)
             && latest
                 .head
                 .as_ref()
@@ -1768,7 +1831,9 @@ fn decode_span<'m>(
         for (pos, &token) in (from..to).zip(&tokens[from..to]) {
             let last = pos + 1 == tokens.len();
             let pos = i32::try_from(pos).map_err(|e| e.to_string())?;
-            batch.add(token, pos, last).map_err(|e| e.to_string())?;
+            batch
+                .add_seq(token, pos, target.seq(), last)
+                .map_err(|e| e.to_string())?;
         }
         target
             .context_mut()
