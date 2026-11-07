@@ -115,7 +115,7 @@ own section below — a count here would be one more thing to keep true by hand.
 | [candle-layer-norm](#candle-and-its-kernel-crates) | `dfdbfbb953ceeb0366e5e3b69f2933204309d3dd` | `main` |
 | [candle-rotary](#candle-and-its-kernel-crates) | `e12f91a6c8beec5373ccec91a5ccad80619cf065` | `main` |
 | [clickhouse-rs](#clickhouse-rs) | `d93e350575d4be2f56f37d513bfbfc672d128528` | `async-await` |
-| [datafusion](#datafusion) | `66e6f7f4a734608f5d612d1869e636b155e7862d` | `spiceai-55` |
+| [datafusion](#datafusion) | `b924e29279eb0e1d3377b7dbef72bbc727e45f33` | `lukim/get-field-map-in-struct-pushdown` (TEMPORARY: spiceai/datafusion#288) |
 | [datafusion-ballista](#datafusion-ballista) | `6e7a8775a6deb99c2ebf924f1ff5b3111d38e615` | `spiceai-55` |
 | [datafusion-federation](#datafusion-federation-and-datafusion-table-providers) | `300acfcfb51abfa9c477f57bff3e0529ec4f5f1a` | `spiceai-55` |
 | [datafusion-table-providers](#datafusion-federation-and-datafusion-table-providers) | `d323656c3bebc04fdce2ebc1cec31081f53b100d` | `spiceai-55` |
@@ -229,10 +229,10 @@ negation, and conservative aggregate functional dependencies from
 the nesting depth of a SQL data type, on top of #275, #277 carries the end-of-input part
 of upstream apache/datafusion#25312 and #25984 ahead of any release, and #279 and #280 make
 every join's output cooperative. On top of #280, #281 reads a sort key over a
-`SELECT DISTINCT` that the list does not show from a `SELECT` above it, #282 refuses a
-derived table whose outputs PostgreSQL shortens to one name, #276 keeps an ungrouped
-`COUNT` that eager aggregation pushes below a join at 0 when the join emits no rows, and #285
-keeps that count's field non-nullable. The pin is the merge commit of #285. These commits descend
+`SELECT DISTINCT` that the list does not show from a `SELECT` above it. On top of #281,
+#288 keeps a struct column in a Parquet scan's projection and row filter when `get_field`
+keys into a map inside it. The pin is #288's head until it merges, then its merge commit.
+These commits descend
 from #268's merge commit, so the existing patches remain in the commit ancestry. None changes a
 manifest except the `IoWaitHook` patch, which adds `pin-project-lite` to `common-runtime`'s. #240 threads its metadata filters through the listing calls in
 `catalog-listing`'s `table.rs` and `helpers.rs`, next to the metadata-column rows'
@@ -287,6 +287,7 @@ is the same shape as the loss these guards exist to catch ([#13625](https://gith
 | CASE type inference reads every result branch (fork PR #272) | Pre-analysis schemas can report Int32 while execution produces the common wider type | query failure | `test/spicescript/case-mixed-widths.yaml`; fork `issue_15538_case_schema_includes_all_result_branches` |
 | Unsigned negation returns a checked signed result; UInt64 returns Int64, accepting -2^63 and rejecting overflow (fork PR #272). Ranking results remain UInt64 | Negating ranking functions is rejected, or unsigned negation returns decimal instead of signed BIGINT | result type mismatch; query failure | `test/spicescript/unsigned-negation.yaml`, `test/spicescript/mysql-unsigned-negation.yaml`; fork signed-result schema and execution regressions |
 | Aggregate dependencies retain only proven group dependencies (fork PR #272) | DISTINCT over a join can make later grouping discard keys and merge groups | wrong data | `test/spicescript/groupby-join-key-dependency.yaml`; fork `issue_15538_aggregate_dependencies_do_not_invent_join_dependencies` |
+| Parquet struct-field pruning stops at the first step that is not a struct, so `get_field(s, 'm', 'k')` over a map `m` inside struct `s` reads all of `s.m` and looks the key up on the decoded batch; when a file's `s` lacks a field the table's has, the schema adapter narrows `get_field(CAST(s), 'm', 'k')` to `get_field(s, 'm', 'k')` while the map type is unchanged, so the row filter still applies to that file (spiceai/datafusion#288) | The scan treats the map key as a nested Parquet field, matches no leaf, and drops `s` from its read schema. `SELECT s['m']['k']` on a federated Parquet dataset fails with `Internal error: PhysicalExpr Column references column 's' …`, and the same lookup in `WHERE` fails in the row filter | query failure | `test/spicescript/parquet-struct-map-key.yaml` (federated against Arrow and Cayenne, with an `explain` check that the lookup is pushed into the scan, and a dataset whose files' structs differ). In the fork, `projection_read_plan.rs::build_projection_read_plan_keeps_map_under_struct_for_key_lookup`, `row_filter.rs::get_field_map_key_under_struct_filters_rows` and `get_field_map_key_under_evolved_struct_filters_rows`, `schema_rewriter.rs::test_narrow_struct_cast_map_key_under_evolved_struct`, and `parquet_nested_schema_pruning.slt` |
 | Unparser: a projection reading no aggregate outputs keeps the aggregation in a derived table (#15538) | A pruned global aggregate returns its input's rows instead of one row, and a pruned grouped aggregate loses its groups | silent (wrong data) | `test/spicescript/unparse-pruned-aggregate.yaml`, including empty inputs, nested aggregates, `HAVING`, and `QUALIFY`; in the fork, `test_unparser_preserves_pruned_aggregate_rows` |
 | Unparser: aggregate scopes retain correlated subquery bindings and require uniquely addressable grouping outputs (fork PR #270) | Correlated projections lose their FROM binding; grouping sets hit internal grouping-id errors; qualified duplicate grouping names collide | query failure | `test/spicescript/unparse-aggregate-scopes.yaml`; fork `test_unparser_preserves_aggregate_projection_scope_guards` |
 | Unparser: scan filters apply before scan projection (#15538) | The SQL for a filtered INTERSECT or EXCEPT reads `right.id` outside a derived table that projects only the compared columns | silent (query failure) | `test/spicescript/unparse-set-operations.yaml`; in the fork, `test_unparser_preserves_filtered_set_operation_scope` |
