@@ -26,6 +26,7 @@ limitations under the License.
 use bytes::Bytes;
 use memchr::memmem;
 use snafu::ResultExt;
+use std::borrow::Cow;
 use std::io::{Cursor, Read, Write};
 use zip::{CompressionMethod, ZipArchive, ZipWriter, write::SimpleFileOptions};
 
@@ -482,7 +483,7 @@ fn object_body(raw: &[u8], dict_start: usize, work: &mut usize) -> ObjectBody {
     let dict_end = dict_start + dict.consumed;
     let keyword = dict_end + ws_len(&raw[dict_end..]);
     *work = work.saturating_add(keyword - dict_start);
-    if !(raw[keyword..].starts_with(b"stream") && token_ends(raw, keyword + b"stream".len())) {
+    if !(raw[keyword..].starts_with(b"stream") && is_stream_keyword(raw, keyword)) {
         return ObjectBody::NotAStream;
     }
     let data_start = stream_data_start(raw, keyword + b"stream".len());
@@ -580,7 +581,7 @@ fn parse_dictionary(data: &[u8], depth: usize) -> Option<ParsedDict> {
         let (name, name_len) = read_name(&data[i + 1..]);
         i += 1 + name_len;
         i += ws_len(&data[i..]);
-        match name.as_slice() {
+        match name.as_ref() {
             b"Filter" => {
                 let (value, value_len) = parse_filter_value(&data[i..], depth)?;
                 i += value_len;
@@ -722,7 +723,7 @@ fn decode_parms_entry_predicts(data: &[u8]) -> Option<bool> {
         let (name, name_len) = read_name(&data[i + 1..]);
         i += 1 + name_len;
         i += ws_len(&data[i..]);
-        if name.as_slice() == b"Predictor" || name.as_slice() == b"P" {
+        if matches!(name.as_ref(), b"Predictor" | b"P") {
             predicts = true;
         } else if decode_parms_has_predictor_at(&data[i..], 1) {
             return None;
@@ -752,7 +753,7 @@ fn decode_parms_has_predictor_at(data: &[u8], depth: usize) -> bool {
                 let (name, name_len) = read_name(&data[i + 1..]);
                 i += 1 + name_len;
                 i += ws_len(&data[i..]);
-                if name.as_slice() == b"Predictor" || name.as_slice() == b"P" {
+                if matches!(name.as_ref(), b"Predictor" | b"P") {
                     return true;
                 }
                 // Nested DecodeParms arrays/dicts can still hold a predictor.
@@ -1010,37 +1011,33 @@ fn ws_len(data: &[u8]) -> usize {
     i
 }
 
-/// Test helper: the filter chain of the dictionary that opens `raw` and ends,
-/// after PDF whitespace and comments, at the `stream` keyword at `keyword_pos`.
-#[cfg(test)]
-fn filters_before(raw: &[u8], keyword_pos: usize) -> Option<Vec<PdfFilter>> {
-    let dict = parse_dictionary(raw, 0)?;
-    (dict.consumed + ws_len(&raw[dict.consumed..]) == keyword_pos).then_some(dict.filters)
-}
-
 /// A PDF name token (without its leading `/`), with `#XX` hex escapes decoded,
 /// and the number of raw bytes consumed. Decoding escapes is what makes an
 /// obfuscated `/Fl#61teDecode` classify as `FlateDecode`.
-fn read_name(data: &[u8]) -> (Vec<u8>, usize) {
-    let mut name = Vec::new();
+fn read_name(data: &[u8]) -> (Cow<'_, [u8]>, usize) {
+    let len = data
+        .iter()
+        .position(|&b| is_pdf_whitespace(b) || is_pdf_delimiter(b))
+        .unwrap_or(data.len());
+    let token = &data[..len];
+    if !token.contains(&b'#') {
+        return (Cow::Borrowed(token), len);
+    }
+    let mut name = Vec::with_capacity(len);
     let mut i = 0;
-    while i < data.len() {
-        let b = data[i];
-        if is_pdf_whitespace(b) || is_pdf_delimiter(b) {
-            break;
-        }
-        if b == b'#'
-            && i + 2 < data.len()
-            && let (Some(hi), Some(lo)) = (hex_value(data[i + 1]), hex_value(data[i + 2]))
+    while i < len {
+        if token[i] == b'#'
+            && i + 2 < len
+            && let (Some(hi), Some(lo)) = (hex_value(token[i + 1]), hex_value(token[i + 2]))
         {
             name.push((hi << 4) | lo);
             i += 3;
             continue;
         }
-        name.push(b);
+        name.push(token[i]);
         i += 1;
     }
-    (name, i)
+    (Cow::Owned(name), len)
 }
 
 fn hex_value(b: u8) -> Option<u8> {
@@ -1485,23 +1482,23 @@ mod tests {
     }
 
     #[test]
-    fn filters_before_reads_a_name_and_an_array() {
-        let single = b"<< /Length 3 /Filter /FlateDecode >>stream";
+    fn reads_a_filter_name_and_a_filter_array() {
+        let filters_of = |raw: &[u8]| -> Vec<Vec<PdfFilter>> {
+            pdf_streams(raw).into_iter().map(|s| s.filters).collect()
+        };
         assert_eq!(
-            filters_before(single, single.len() - b"stream".len()),
-            Some(vec![PdfFilter::Flate])
+            filters_of(b"1 0 obj << /Length 3 /Filter /FlateDecode >>stream\n"),
+            vec![vec![PdfFilter::Flate]]
         );
-
-        let chain = b"<< /Filter [/ASCII85Decode /FlateDecode] /DecodeParms << /x 1 >> >>stream";
         assert_eq!(
-            filters_before(chain, chain.len() - b"stream".len()),
-            Some(vec![PdfFilter::Ascii85, PdfFilter::Flate])
+            filters_of(
+                b"1 0 obj << /Filter [/ASCII85Decode /FlateDecode] /DecodeParms << /x 1 >> >>stream\n"
+            ),
+            vec![vec![PdfFilter::Ascii85, PdfFilter::Flate]]
         );
-
-        let stored = b"<< /Length 3 >>stream";
         assert_eq!(
-            filters_before(stored, stored.len() - b"stream".len()),
-            Some(vec![])
+            filters_of(b"1 0 obj << /Length 3 >>stream\n"),
+            vec![Vec::<PdfFilter>::new()]
         );
     }
 
@@ -1609,13 +1606,12 @@ mod tests {
         );
     }
 
-    /// Each byte is lexed once, so a document packed with what would cost a
-    /// rescan per occurrence if each check restarted at the last payload —
-    /// `stream` in comment lines or as a bare word, comment lines between a
-    /// dictionary and its `stream`, `<<` in a comment inside the dictionary —
-    /// is scanned in linear time, and the stream behind it is still found with
-    /// its filter. A per-occurrence rescan takes minutes at these sizes, which
-    /// trips the test timeout.
+    /// A document packed with `stream` in comment lines or as a bare word,
+    /// comment lines between a dictionary and its `stream`, or `<<` in a
+    /// comment inside the dictionary is scanned in linear time, and the stream
+    /// behind it is still found with its filter. A scan that re-read the
+    /// document per occurrence would take minutes at these sizes and trip the
+    /// test timeout.
     #[test]
     fn finds_a_stream_behind_megabytes_of_comments_and_stream_words() {
         let pdf = |before_dict: &[u8], in_dict: &[u8], gap: &[u8]| {
@@ -1929,9 +1925,9 @@ mod tests {
             .expect("ordinary text that mentions stream must not be rejected");
     }
 
-    /// A direct `/Length 999999999` on an empty stream must not skip to EOF
-    /// and hide a later Flate bomb: the claimed length has no matching
-    /// `endstream`, so discovery falls back to the real terminator.
+    /// A direct `/Length 999999999` on an empty stream must not hide a later
+    /// Flate bomb, as it would if the scan trusted the length and skipped to
+    /// the end of the document.
     #[test]
     fn still_budgets_after_a_direct_length_decoy() {
         let bomb = flate_bomb();
@@ -1956,9 +1952,10 @@ mod tests {
         );
     }
 
-    /// Object headers may use a tab between numbers (`6\t0 obj`). That form
-    /// must still resolve so a Catalog-string decoy spelled with spaces is
-    /// not the unique match.
+    /// Object headers may use a tab between numbers (`6\t0 obj`). A Catalog
+    /// string holding a fake object 6 with a huge value must not hide the later
+    /// Flate bomb, as it would if the scan took that value for the empty
+    /// stream's indirect `/Length`.
     #[test]
     fn still_budgets_when_the_real_length_object_uses_a_tab() {
         let bomb = flate_bomb();
@@ -2154,9 +2151,10 @@ mod tests {
         assert_eq!(pdf_too_large_reason(&pdf), UNVERIFIABLE_REASON);
     }
 
-    /// A Catalog string that contains the bytes of a fake `N 0 obj` /Length
-    /// must not make discovery skip past a later Flate stream. The empty
-    /// stream's real length is 0; trusting the decoy would advance to EOF.
+    /// A Catalog string that contains the bytes of a fake `N 0 obj` holding a
+    /// huge `/Length` value must not hide a later Flate stream, as it would if
+    /// the scan trusted the decoy and skipped to the end of the document. The
+    /// empty stream's real length is 0.
     #[test]
     fn still_budgets_a_stream_after_an_indirect_length_decoy() {
         let bomb = flate_bomb();
@@ -2228,10 +2226,9 @@ mod tests {
         assert_chain_budgeted(&dict, &data);
     }
 
-    /// A `/Length` that correctly covers a payload containing the bytes
-    /// `endstream` must still skip the whole payload. Stopping at the embedded
-    /// keyword would resume inside the image and hide the following Flate bomb.
-    /// Covers both a direct length and a uniquely resolved indirect length.
+    /// A payload containing the bytes `endstream` must not hide the following
+    /// Flate bomb, as it would if the scan stopped at the embedded keyword and
+    /// resumed inside the image. Covers both a direct and an indirect length.
     #[test]
     fn still_budgets_after_a_payload_with_embedded_endstream_bytes() {
         let bomb = flate_bomb();
@@ -2273,8 +2270,8 @@ mod tests {
         }
     }
 
-    /// A legal `/Length +N` (optional leading plus) must still be read as a
-    /// direct length so the stream is budgeted, not rejected as unboundable.
+    /// A legal `/Length +N` (optional leading plus) must still parse, so the
+    /// stream is budgeted, not rejected as unboundable.
     #[test]
     fn budgets_a_stream_whose_length_has_a_leading_plus() {
         let data = single_flate();
@@ -2285,7 +2282,7 @@ mod tests {
     }
 
     /// An earlier unfiltered stream whose payload contains a `(` byte must not
-    /// make the following Flate stream look like it sits inside a string.
+    /// hide the following Flate stream.
     #[test]
     fn still_budgets_a_flate_stream_after_a_payload_with_a_paren_byte() {
         let bomb = flate_bomb();
@@ -2341,9 +2338,8 @@ mod tests {
     }
 
     /// A literal string that contains dictionary-like text and the word
-    /// `stream` must not invent a phantom stream whose huge `/Length` hides
-    /// the real Flate page stream. Covers both a `/Length` decoy and a bare
-    /// `<< >>stream` with no length.
+    /// `stream` must not hide the real Flate page stream behind it. Covers both
+    /// a huge `/Length` decoy and a bare `<< >>stream` with no length.
     #[test]
     fn still_budgets_when_a_string_contains_a_fake_stream() {
         for note in [
@@ -2396,6 +2392,7 @@ mod tests {
         };
         assert_eq!(pdf_too_large_reason(&pdf), UNVERIFIABLE_REASON);
     }
+
     /// A loadable single-page PDF whose `/Contents` is object 5, with `decoy`
     /// written in front of it. The cross-reference table points at each
     /// object's header, so `PDFium` reads object 5 at its offset whatever the
@@ -2420,10 +2417,7 @@ mod tests {
         out.extend_from_slice(decoy);
         out.extend_from_slice(contents);
         let contents_at = offsets[3]
-            + out[offsets[3]..]
-                .windows(b"5 0 obj".len())
-                .position(|w| w == b"5 0 obj")
-                .expect("object 5 has a header");
+            + memmem::find(&out[offsets[3]..], b"5 0 obj").expect("object 5 has a header");
         offsets.push(contents_at);
         let xref_pos = out.len();
         out.extend_from_slice(b"xref\n0 6\n0000000000 65535 f \n");
@@ -2528,10 +2522,7 @@ mod tests {
         let data = deflate(content);
         for (shape, decoy, contents) in decoys_before_contents(&data) {
             let pdf = pdf_with_decoy_before_contents(&decoy, &contents);
-            let data_start = pdf
-                .windows(data.len())
-                .position(|w| w == data.as_slice())
-                .expect("the stream data is in the document");
+            let data_start = memmem::find(&pdf, &data).expect("the stream data is in the document");
             let scanned: Vec<(usize, Vec<PdfFilter>)> = pdf_streams(&pdf)
                 .into_iter()
                 .map(|stream| (stream.data_start, stream.filters))
