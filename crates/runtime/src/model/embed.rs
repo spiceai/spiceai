@@ -16,7 +16,10 @@ limitations under the License.
 #![allow(clippy::implicit_hasher)]
 
 use crate::embeddings::params as embedding_params;
-use crate::token_providers::databricks::{DatabricksM2MTokenProvider, DatabricksU2MTokenProvider};
+use crate::token_providers::databricks::{
+    DatabricksM2MTokenProvider, DatabricksU2MTokenProvider, get_workload_identity_token_provider,
+    model_error,
+};
 use bytes::Bytes;
 use cache::CacheProvider;
 use cache::result::embeddings::CachedEmbeddingResult;
@@ -102,6 +105,12 @@ pub async fn try_to_embedding(
 
     match prefix {
         EmbeddingPrefix::Azure => {
+            // Read before `params` moves into the typed params: federation params win over a key
+            // autoloaded from a secret store, but not over one the Spicepod writes.
+            let key_in_spicepod = llms::workload_identity::key_in_spicepod(
+                &params,
+                &["azure_api_key", "azure_entra_token"],
+            );
             let typed =
                 embedding_params::azure::AzureEmbeddingParams::try_from_params_with_secret_sources(
                     &component_name,
@@ -115,8 +124,10 @@ pub async fn try_to_embedding(
                 model_id,
                 component.name.as_str(),
                 &typed,
+                key_in_spicepod,
                 embeddings_cache.clone(),
             )
+            .await
         }
         EmbeddingPrefix::OpenAi => {
             // Read before `params` moves into the typed params: federation params win over an
@@ -200,6 +211,12 @@ pub async fn try_to_embedding(
             google(model_id, &typed, embeddings_cache.clone()).await
         }
         EmbeddingPrefix::Databricks => {
+            // Read before `params` moves into the typed params: federation params win over a key
+            // autoloaded from a secret store, but not over one the Spicepod writes.
+            let key_in_spicepod = llms::workload_identity::key_in_spicepod(
+                &params,
+                &["databricks_token", "databricks_client_secret"],
+            );
             let typed = embedding_params::databricks::DatabricksEmbeddingParams::try_from_params_with_secret_sources(
                 &component_name,
                 params,
@@ -209,8 +226,10 @@ pub async fn try_to_embedding(
             .await
             .map_err(params_err)?;
             databricks(
+                &component.name,
                 model_id,
                 &typed,
+                key_in_spicepod,
                 Arc::clone(&token_provider_registry),
                 embeddings_cache.clone(),
             )
@@ -493,8 +512,10 @@ async fn huggingface(
 }
 
 async fn databricks(
+    embedding_name: &str,
     model_id: Option<String>,
     params: &embedding_params::databricks::DatabricksEmbeddingParams,
+    key_in_spicepod: Option<&str>,
     token_provider_registry: Arc<TokenProviderRegistry>,
     embeddings_cache: Option<Arc<dyn CacheProvider<CachedEmbeddingResult> + Send + Sync>>,
 ) -> Result<Arc<dyn Embed>, EmbedError> {
@@ -516,6 +537,34 @@ async fn databricks(
     let user_agent = Some(data_components::databricks::user_agent());
     #[cfg(not(feature = "databricks"))]
     let user_agent: Option<&'static str> = None;
+
+    let embedding_error = |error| EmbedError::FailedToInstantiateEmbeddingModel {
+        source: Box::new(model_error(error)),
+    };
+    if let Some(identity) = params
+        .federation()
+        .workload_identity(key_in_spicepod)
+        .map_err(embedding_error)?
+    {
+        let token_provider = get_workload_identity_token_provider(
+            &format!("embedding '{embedding_name}' (databricks)"),
+            endpoint,
+            identity,
+            &token_provider_registry,
+        )
+        .await
+        .map_err(embedding_error)?;
+        return Ok(Arc::new(
+            llms::databricks::from_token_provider(
+                endpoint,
+                model_id.as_str(),
+                token_provider,
+                user_agent,
+                HealthCheck::Required,
+            )
+            .set_cache(embeddings_cache),
+        ) as Arc<dyn Embed>);
+    }
 
     match (token_opt, client_id, client_secret) {
         (Some(_), Some(_) | None, Some(_)) => {
@@ -638,15 +687,16 @@ async fn file(
     ))
 }
 
-fn azure(
+async fn azure(
     model_id: Option<String>,
-    model_name: &str,
+    component_name: &str,
     params: &embedding_params::azure::AzureEmbeddingParams,
+    key_in_spicepod: Option<&'static str>,
     embeddings_cache: Option<Arc<dyn CacheProvider<CachedEmbeddingResult> + Send + Sync>>,
 ) -> Result<Arc<dyn Embed>, EmbedError> {
     let Some(model_name) = model_id else {
         return Err(EmbedError::FailedToInstantiateEmbeddingModel {
-            source: format!("For embedding model '{model_name}', model id must be specified in `from:azure:<model_id>`.").into(),
+            source: format!("For embedding model '{component_name}', model id must be specified in `from:azure:<model_id>`.").into(),
         });
     };
     let api_key = params.api_key.as_ref().map(ExposeSecret::expose_secret);
@@ -660,10 +710,27 @@ fn azure(
         });
     }
 
+    if let Some(client) = llms::workload_identity::azure_federated_client(
+        &format!("embedding '{component_name}' (azure)"),
+        &model_name,
+        &params.federation(),
+        key_in_spicepod,
+        api_key.is_some() || entra_token.is_some(),
+        &llms::workload_identity::AzureEnvironment::from_process(),
+        llms::openai::ChatBackend::ChatCompletions,
+    )
+    .await
+    .map_err(llms::workload_identity::FederationError::into_embed_error)?
+    {
+        return Ok(Arc::new(
+            OpenaiEmbed::new(client, None).set_cache(embeddings_cache),
+        ));
+    }
+
     if api_key.is_none() && entra_token.is_none() {
         return Err(EmbedError::FailedToInstantiateEmbeddingModel {
             source: format!(
-                "Azure embedding model '{model_name}' requires 'azure_api_key' or 'azure_entra_token'."
+                "Azure embedding model '{component_name}' requires `azure_api_key`, `azure_entra_token`, or a Microsoft Entra workload identity: `azure_tenant_id` and `azure_client_id`, or on AKS a pod labeled `azure.workload.identity/use: \"true\"`. See https://spiceai.org/docs/components/embeddings/azure for details."
             )
             .into(),
         });

@@ -24,6 +24,7 @@ use tokio::sync::watch;
 
 pub mod gcp_service_account_token;
 pub mod github_app_token;
+pub mod jwt_signer;
 pub mod registry;
 pub mod workload_identity;
 

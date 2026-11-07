@@ -37,7 +37,9 @@ fn make_dataset(path: &str, name: &str) -> Dataset {
 #[expect(clippy::expect_used)]
 fn get_params() -> Params {
     let _ = std::env::var("NEW_DATABRICKS_HOST").expect("NEW_DATABRICKS_HOST is not set");
-    let _ = std::env::var("NEW_DATABRICKS_TOKEN").expect("NEW_DATABRICKS_TOKEN is not set");
+    let _ =
+        std::env::var("DATABRICKS_OIDC_CLIENT_ID").expect("DATABRICKS_OIDC_CLIENT_ID is not set");
+    let _ = std::env::var("DATABRICKS_OIDC_AUDIENCE").expect("DATABRICKS_OIDC_AUDIENCE is not set");
     let _ = std::env::var("NEW_DATABRICKS_SQL_WAREHOUSE_ID")
         .expect("NEW_DATABRICKS_SQL_WAREHOUSE_ID is not set");
 
@@ -48,8 +50,12 @@ fn get_params() -> Params {
                 "${ env:NEW_DATABRICKS_HOST }".to_string(),
             ),
             (
-                "databricks_token".to_string(),
-                "${ env:NEW_DATABRICKS_TOKEN }".to_string(),
+                "databricks_client_id".to_string(),
+                "${ env:DATABRICKS_OIDC_CLIENT_ID }".to_string(),
+            ),
+            (
+                "databricks_token_audience".to_string(),
+                "${ env:DATABRICKS_OIDC_AUDIENCE }".to_string(),
             ),
             (
                 "databricks_sql_warehouse_id".to_string(),

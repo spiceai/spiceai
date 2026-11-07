@@ -49,6 +49,7 @@ permissions: {}
 
 jobs:
   reclaim:
+    environment: secret-free
     name: Reclaim (${{ matrix.pool }} slot ${{ matrix.slot }})
     strategy:
       fail-fast: false
