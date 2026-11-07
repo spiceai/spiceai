@@ -200,7 +200,7 @@ mod tests {
         // 2026-11-07T10:00:00Z
         assert_eq!(
             checkpoint.updated_at,
-            Some(UNIX_EPOCH + Duration::from_secs(1_794_045_600))
+            Some(UNIX_EPOCH + Duration::from_hours(498_346))
         );
     }
 }
