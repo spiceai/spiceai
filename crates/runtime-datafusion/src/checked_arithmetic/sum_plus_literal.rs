@@ -25,8 +25,8 @@ limitations under the License.
 //! `SUM(x + k)` does not, and `k * COUNT(x)` can too.
 //!
 //! So an integer `x` is summed as `Decimal128(38, 0)`, which holds any total of
-//! `Int64` values (fewer than 2^63 of them, each under 2^63 in magnitude, sum
-//! to under 2^126 < 10^38), and [`CheckedSumPlusCount`] adds `k * COUNT(x)` in
+//! `Int64` values (fewer than 2^63 of them, each at most 2^63 in magnitude,
+//! sum to under 2^126 < 10^38), and [`CheckedSumPlusCount`] adds `k * COUNT(x)` in
 //! `i128` and narrows once, with the error checked `SUM` gives. `SUM(x + k)` is
 //! the sum of `x + k` over the rows where `x` is not NULL, which is
 //! `SUM(x) + k * COUNT(x)`, and NULL where `SUM(x)` is.
@@ -45,9 +45,10 @@ use datafusion::common::{Result, ScalarValue, exec_err, plan_err};
 use datafusion::functions_aggregate::count::count;
 use datafusion::logical_expr::expr::AggregateFunction;
 use datafusion::logical_expr::{
-    ColumnarValue, Expr, Operator, ReturnFieldArgs, ScalarFunctionArgs, ScalarUDF, ScalarUDFImpl,
-    Signature, Volatility, lit,
+    ColumnarValue, Expr, ReturnFieldArgs, ScalarFunctionArgs, ScalarUDF, ScalarUDFImpl, Signature,
+    Volatility, lit,
 };
+use itertools::Itertools;
 
 use super::is_integer_arith_type;
 use super::sum::{checked_sum_state_type, int64_overflow};
@@ -86,26 +87,17 @@ pub(crate) fn checked_sum_widen_udf() -> Arc<ScalarUDF> {
 /// `SUM(arg + k)` as `sum + k * count` over a wide `SUM(arg)` and `COUNT(arg)`,
 /// for the checked `SUM` call `sum_of_arg_plus_k` and a signed integer `k`.
 ///
-/// `None` for any operator but `+`, as the built-in rewrite. `k` is the
-/// literal's value: after type coercion `arg` has the literal's type, so it is
-/// a signed integer too.
-pub(crate) fn sum_plus_literal(
-    sum_of_arg_plus_k: &AggregateFunction,
-    arg: &Expr,
-    op: Operator,
-    k: i64,
-) -> Option<Expr> {
-    if op != Operator::Plus {
-        return None;
-    }
+/// `k` is the literal's value: after type coercion `arg` has the literal's
+/// type, so it is a signed integer too.
+pub(crate) fn sum_plus_literal(sum_of_arg_plus_k: &AggregateFunction, arg: &Expr, k: i64) -> Expr {
     let widened = checked_sum_widen_udf().call(vec![arg.clone()]);
     let mut wide_sum = sum_of_arg_plus_k.clone();
     wide_sum.params.args = vec![widened.clone()];
-    Some(checked_sum_plus_count_udf().call(vec![
+    checked_sum_plus_count_udf().call(vec![
         Expr::AggregateFunction(wide_sum),
         count(widened),
         lit(k),
-    ]))
+    ])
 }
 
 /// An integer as `Decimal128(38, 0)`, which holds every integer value exactly,
@@ -141,12 +133,7 @@ impl ScalarUDFImpl for CheckedSumWiden {
     /// out, so `SUM(x + 1)` and `SUM(CAST(x AS INT) + 1)` over a SMALLINT `x`
     /// would name their wide `SUM`s alike.
     fn schema_name(&self, args: &[Expr]) -> Result<String> {
-        let args = args
-            .iter()
-            .map(ToString::to_string)
-            .collect::<Vec<_>>()
-            .join(", ");
-        Ok(format!("{}({args})", self.name()))
+        Ok(format!("{}({})", self.name(), args.iter().join(", ")))
     }
 
     fn return_field_from_args(&self, args: ReturnFieldArgs) -> Result<FieldRef> {
@@ -236,10 +223,8 @@ impl ScalarUDFImpl for CheckedSumPlusCount {
         let ColumnarValue::Scalar(ScalarValue::Int64(Some(k))) = k else {
             return exec_err!("{} expects a non-null BIGINT literal k", self.name());
         };
-        let arrays = ColumnarValue::values_to_arrays(&[sum.clone(), count.clone()])?;
-        let [sums, counts] = arrays.as_slice() else {
-            return exec_err!("{} expects a sum and a count", self.name());
-        };
+        let sums = sum.to_array(args.number_rows)?;
+        let counts = count.to_array(args.number_rows)?;
         let (Some(sums), Some(counts)) = (
             sums.as_primitive_opt::<Decimal128Type>(),
             counts.as_primitive_opt::<Int64Type>(),

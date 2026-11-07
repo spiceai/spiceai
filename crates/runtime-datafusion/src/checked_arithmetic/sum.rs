@@ -224,6 +224,10 @@ impl AggregateUDFImpl for CheckedSum {
         lit: &Expr,
         _arg_is_left: bool,
     ) -> Result<Option<Expr>> {
+        // `+` only, as the built-in, so the operand order does not matter.
+        if op != Operator::Plus {
+            return Ok(None);
+        }
         let Expr::Literal(value, _) = lit else {
             return Ok(None);
         };
@@ -234,7 +238,7 @@ impl AggregateUDFImpl for CheckedSum {
             ScalarValue::Int64(k) => *k,
             _ => None,
         };
-        Ok(k.and_then(|k| sum_plus_literal(agg_function, arg, op, k)))
+        Ok(k.map(|k| sum_plus_literal(agg_function, arg, k)))
     }
 
     fn coerce_types(&self, arg_types: &[DataType]) -> Result<Vec<DataType>> {

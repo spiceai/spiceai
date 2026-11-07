@@ -55,8 +55,8 @@ use crate::checked_arithmetic::sum_plus_literal::{
     checked_sum_plus_count_udf, checked_sum_widen_udf,
 };
 
-/// Register checked integer `SUM` and the scalar kernels the analyzer rewrites
-/// `+` / `-` / `*` into.
+/// Register checked integer `SUM` and the scalar functions of
+/// [`checked_scalar_udfs`].
 ///
 /// # Errors
 ///

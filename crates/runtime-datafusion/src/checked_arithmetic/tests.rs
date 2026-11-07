@@ -17,7 +17,8 @@ limitations under the License.
 use std::sync::Arc;
 
 use arrow::array::{
-    ArrayRef, Decimal128Array, Int32Array, Int64Array, RecordBatch, StringArray, UInt64Array,
+    ArrayRef, Decimal128Array, Int16Array, Int32Array, Int64Array, RecordBatch, StringArray,
+    UInt64Array,
 };
 use arrow::datatypes::{DataType, Field, Schema};
 use arrow::util::display::array_value_to_string;
@@ -1803,7 +1804,7 @@ async fn sums_over_two_casts_of_one_column_plus_literals_plan() {
     let ctx = checked_session();
     let smallints = RecordBatch::try_new(
         Arc::new(Schema::new(vec![Field::new("s", DataType::Int16, true)])),
-        vec![Arc::new(arrow::array::Int16Array::from(vec![Some(1), Some(2), None])) as ArrayRef],
+        vec![Arc::new(Int16Array::from(vec![Some(1), Some(2), None])) as ArrayRef],
     )
     .expect("smallint batch");
     register_table(&ctx, "s16", smallints);
@@ -1882,16 +1883,17 @@ async fn sums_of_a_decimal_column_plus_literals_keep_their_type() {
     assert_eq!(render_rows(&batches), vec!["5.75 7.75 9.75"]);
 }
 
-/// An integer `+` or `-` gets the checked kernel only where its operands'
-/// values can take the result out of its type, counting the range a plain
-/// operator below it already widened. A `*` always does.
+/// An integer `+` or `-` stays plain only over columns, literals and casts of
+/// them that cannot fail and whose values keep the result inside its type;
+/// every other one, and every `*`, gets the checked kernel.
 #[tokio::test]
 async fn only_an_operator_that_can_overflow_gets_the_checked_kernel() {
     let ctx = checked_session();
     for (sql, checked_kernels) in [
         // INT widened to BIGINT, plus or minus a literal, cannot leave BIGINT.
         ("SELECT i + 1, i - 1, 1 - i FROM t", 0),
-        // The inner sum ends exactly at i64::MAX; one more can pass it.
+        // The inner sum ends exactly at i64::MAX and stays plain; an operand
+        // that is itself an operator keeps the outer one checked.
         ("SELECT i + 9223372034707292160 + 1 FROM t", 1),
         // A BIGINT column has no room for a literal.
         ("SELECT big + 1 FROM t", 1),

@@ -90,7 +90,8 @@ SELECT i + 1, i - 1, i * 2, CAST(i AS BIGINT) * CAST(i AS BIGINT) FROM t WHERE i
 ----
 2147483648 2147483646 4294967294 4611686014132420609
 
-# The inner sum ends exactly at i64::MAX, so the outer `+ 1` stays checked.
+# The inner sum ends exactly at i64::MAX; the outer `+ 1`, over an operator,
+# stays checked.
 statement error overflow
 SELECT i + 9223372034707292160 + 1 FROM t WHERE id = 1;
 

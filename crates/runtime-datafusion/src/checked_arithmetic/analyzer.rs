@@ -26,6 +26,12 @@ limitations under the License.
 //! `DataFusion` simplifies some plain operators by dropping an operand
 //! (`A + NULL` to `NULL`, `A * 0` to `0`), which may only drop one that has no
 //! error to raise. `CAST(smallint_column AS BIGINT) + 1` is the common case.
+//!
+//! Only columns, literals and casts of them are looked into, at most
+//! [`MAX_CAST_DEPTH`] casts deep, so the check costs the same at every
+//! operator however deep the expression; an operand that is itself an
+//! operator keeps the outer one checked.
+//!
 //! Left a plain `+`, it is still the `SUM(x + 1), SUM(x + 2), ...` shape that
 //! `DataFusion` rewrites to one `SUM(x)` and one `COUNT(x)` (see
 //! [`CheckedSum`](super::CheckedSum)). A `*` is always checked.
@@ -109,9 +115,14 @@ fn rewrite_integer_arith(expr: Expr, schema: &DFSchema) -> Transformed<Expr> {
     Transformed::yes(udf.call(vec![*left, *right]))
 }
 
-/// Whether `left op right` can stay the plain operator: it cannot leave
-/// `data_type` and neither operand can raise an error (see the module
-/// documentation).
+/// How many casts (and aliases) the operand checks look through. Two reach
+/// `CAST(CAST(int_column AS INT) AS BIGINT)`; past the cap an operand is
+/// unknown and the operator stays checked.
+const MAX_CAST_DEPTH: usize = 4;
+
+/// Whether `left op right` can stay the plain operator: it is a `+` or `-`,
+/// neither operand can raise an error, and it cannot leave `data_type` (see
+/// the module documentation).
 fn stays_plain(
     op: Operator,
     left: &Expr,
@@ -119,34 +130,29 @@ fn stays_plain(
     data_type: &DataType,
     schema: &DFSchema,
 ) -> bool {
-    cannot_overflow(op, left, right, data_type, schema)
-        && raises_no_error(left, schema)
-        && raises_no_error(right, schema)
+    matches!(op, Operator::Plus | Operator::Minus)
+        && raises_no_error(left, schema, MAX_CAST_DEPTH)
+        && raises_no_error(right, schema, MAX_CAST_DEPTH)
+        && cannot_overflow(op, left, right, data_type, schema)
 }
 
-/// Whether evaluating `expr` cannot fail: a column, a literal, a `TRY_CAST`,
-/// a cast that every value of its operand fits, or a `+` / `-` that cannot
-/// overflow, over expressions that cannot fail either.
-fn raises_no_error(expr: &Expr, schema: &DFSchema) -> bool {
+/// Whether evaluating `expr` cannot fail: a column, a literal, or, within
+/// `depth` casts, a `TRY_CAST` of one or a `CAST` of one whose every value
+/// fits the target type.
+fn raises_no_error(expr: &Expr, schema: &DFSchema, depth: usize) -> bool {
     match expr {
         Expr::Column(_) | Expr::Literal(..) => true,
-        Expr::Alias(alias) => raises_no_error(&alias.expr, schema),
-        Expr::TryCast(TryCast { expr: operand, .. }) => raises_no_error(operand, schema),
+        _ if depth == 0 => false,
+        Expr::Alias(alias) => raises_no_error(&alias.expr, schema, depth - 1),
+        Expr::TryCast(TryCast { expr: operand, .. }) => raises_no_error(operand, schema, depth - 1),
         Expr::Cast(Cast {
             expr: operand,
             field,
         }) => {
-            raises_no_error(operand, schema)
+            raises_no_error(operand, schema, depth - 1)
                 && type_range(field.data_type())
-                    .zip(value_range(operand, schema))
+                    .zip(value_range(operand, schema, depth - 1))
                     .is_some_and(|(bounds, range)| bounds.contains(range))
-        }
-        Expr::BinaryExpr(BinaryExpr { left, op, right }) => {
-            raises_no_error(left, schema)
-                && raises_no_error(right, schema)
-                && expr
-                    .get_type(schema)
-                    .is_ok_and(|data_type| cannot_overflow(*op, left, right, &data_type, schema))
         }
         _ => false,
     }
@@ -163,8 +169,8 @@ fn cannot_overflow(
     schema: &DFSchema,
 ) -> bool {
     let (Some(left), Some(right), Some(bounds)) = (
-        value_range(left, schema),
-        value_range(right, schema),
+        value_range(left, schema, MAX_CAST_DEPTH),
+        value_range(right, schema, MAX_CAST_DEPTH),
         type_range(data_type),
     ) else {
         return false;
@@ -223,21 +229,18 @@ fn integer_literal(value: &ScalarValue) -> Option<i128> {
     }
 }
 
-/// The values `expr` can take when it is an integer: its type's range,
-/// narrowed through literals, widening casts, and the operators this rule
-/// leaves in place. `None` when `expr` is not an integer or cannot be typed
-/// against `schema`.
-///
-/// Every answer holds for any value the expression can produce, because an
-/// expression this does not look into answers with the whole range of its
-/// type.
-fn value_range(expr: &Expr, schema: &DFSchema) -> Option<ValueRange> {
+/// The values an integer `expr` can take: a literal's value, a column's type
+/// range, or a cast's target range, narrowed to its operand's when every
+/// operand value fits, within `depth` casts. `None` for anything else, which
+/// keeps the operator over it checked.
+fn value_range(expr: &Expr, schema: &DFSchema, depth: usize) -> Option<ValueRange> {
     match expr {
-        Expr::Alias(alias) => value_range(&alias.expr, schema),
         Expr::Literal(value, _) => integer_literal(value).map(ValueRange::point),
+        Expr::Column(_) => type_range(&expr.get_type(schema).ok()?),
+        _ if depth == 0 => None,
+        Expr::Alias(alias) => value_range(&alias.expr, schema, depth - 1),
         // A cast that returns a value returns one of its target type (CAST
-        // errors and TRY_CAST yields NULL on a value that does not fit). Only
-        // a cast every operand value fits keeps the operand's narrower range.
+        // errors and TRY_CAST yields NULL on a value that does not fit).
         Expr::Cast(Cast {
             expr: operand,
             field,
@@ -248,25 +251,12 @@ fn value_range(expr: &Expr, schema: &DFSchema) -> Option<ValueRange> {
         }) => {
             let bounds = type_range(field.data_type())?;
             Some(
-                value_range(operand, schema)
+                value_range(operand, schema, depth - 1)
                     .filter(|range| bounds.contains(*range))
                     .unwrap_or(bounds),
             )
         }
-        // An operator left in place either cannot leave its type or is not
-        // one this rule checks; either way its result is a value of its type.
-        Expr::BinaryExpr(BinaryExpr { left, op, right }) => {
-            let bounds = type_range(&expr.get_type(schema).ok()?)?;
-            let range = value_range(left, schema)
-                .zip(value_range(right, schema))
-                .and_then(|(left, right)| op_range(*op, left, right));
-            Some(
-                range
-                    .filter(|range| bounds.contains(*range))
-                    .unwrap_or(bounds),
-            )
-        }
-        _ => type_range(&expr.get_type(schema).ok()?),
+        _ => None,
     }
 }
 
