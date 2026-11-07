@@ -1353,6 +1353,15 @@ trait Target<'m> {
     fn clear(&mut self);
     /// Called after every target decode; the MTP head reads the batch's hidden states.
     fn decoded(&mut self, batch: &Batch) -> std::result::Result<(), String>;
+    /// Whether a draft head reads the target's hidden states, pairing each token with the state
+    /// at the position before it: a cut cache then needs the head's state for the position before
+    /// the cut (`head_state`), or the next read's first token pairs with none.
+    fn has_head(&self) -> bool;
+    /// The draft head's state that cutting the caches back does not restore, for the position
+    /// after the last one it read; `None` without a head.
+    fn head_state(&mut self) -> Option<Vec<u8>>;
+    /// Restores what `head_state` returned; false when the head does not take it.
+    fn restore_head_state(&mut self, state: &[u8]) -> bool;
 }
 
 impl<'m> Target<'m> for Context<'m> {
@@ -1370,6 +1379,15 @@ impl<'m> Target<'m> for Context<'m> {
     }
     fn decoded(&mut self, _: &Batch) -> std::result::Result<(), String> {
         Ok(())
+    }
+    fn has_head(&self) -> bool {
+        false
+    }
+    fn head_state(&mut self) -> Option<Vec<u8>> {
+        None
+    }
+    fn restore_head_state(&mut self, _: &[u8]) -> bool {
+        false
     }
 }
 
@@ -1390,6 +1408,18 @@ impl<'m> Target<'m> for Mtp<'m> {
     fn decoded(&mut self, batch: &Batch) -> std::result::Result<(), String> {
         self.process(batch).map_err(|e| e.to_string())
     }
+    fn has_head(&self) -> bool {
+        // Only an MTP head pairs a token with the hidden state before it and carries that state
+        // from one read to the next. A DFlash or DSpark drafter reads its features from the batch
+        // in hand, and keeps no state to save, so its prompt cache reuses what it shares.
+        self.kind() == DraftKind::Mtp
+    }
+    fn head_state(&mut self) -> Option<Vec<u8>> {
+        self.state().ok().flatten()
+    }
+    fn restore_head_state(&mut self, state: &[u8]) -> bool {
+        self.restore_state(state).is_ok()
+    }
 }
 
 /// What the KV cache holds from the last request, so the next one decodes only the part of its
@@ -1407,6 +1437,11 @@ struct PromptCache {
     /// For a cache that cannot be cut back to any position, as a recurrent state or a
     /// compressed cache cannot.
     checkpoints: Option<Checkpoints>,
+    /// For a cache that can be cut back to any position, with a draft head: the head's state
+    /// after the last prompt's first tokens, saved where a checkpoint would be, the position after
+    /// it first. The next prompt reuses the cache up to there, or up to all of it (where the head's
+    /// live state is), so its read pairs its first token with the right hidden state.
+    head_stash: Option<(usize, Vec<u8>)>,
     /// How many prompt tokens the last request read from the cache.
     reused: Arc<AtomicUsize>,
     /// What saving a checkpoint costs against reading prompt tokens again.
@@ -1420,6 +1455,7 @@ impl PromptCache {
             tokens: Vec::new(),
             namespace: None,
             checkpoints: (truncation != Truncation::Anywhere).then(Checkpoints::default),
+            head_stash: None,
             reused: Arc::default(),
             cost: CheckpointCost::default(),
         }
@@ -1441,8 +1477,10 @@ impl PromptCache {
         namespace: &CacheNamespace,
     ) -> usize {
         let mut cached = std::mem::take(&mut self.tokens);
+        let mut stash = self.head_stash.take();
         if self.namespace.as_ref() != Some(namespace) {
             cached.clear();
+            stash = None;
             if let Some(checkpoints) = &mut self.checkpoints {
                 checkpoints.clear();
             }
@@ -1463,12 +1501,29 @@ impl PromptCache {
         // as many of them as it has tokens, so after a shorter decode a rollback can restore a
         // snapshot that predates it.
         let truncates = self.checkpoints.is_none() || shared == cached.len();
-        let reused = if shared > 0 && truncates && truncate_to(target, shared) {
-            shared
+        // A draft head pairs a read's first token with the target's hidden state at the position
+        // before it. It holds that state for the end of the cache, so a cut there is exact; a cut
+        // anywhere else stops where the head's state was stashed, or reads the prompt from 0.
+        let (cut, head) = if truncates && target.has_head() && shared < cached.len() {
+            match stash {
+                Some((at, state)) if at <= shared => (at, Some(state)),
+                _ => (0, None),
+            }
+        } else {
+            (shared, None)
+        };
+        let reused = if cut > 0
+            && truncates
+            && truncate_to(target, cut)
+            && head
+                .as_ref()
+                .is_none_or(|state| target.restore_head_state(state))
+        {
+            cut
         } else if let Some(at) = self
             .checkpoints
             .as_ref()
-            .and_then(|checkpoints| checkpoints.restore(target.context_mut()))
+            .and_then(|checkpoints| checkpoints.restore(target))
             && truncate_to(target, at)
         {
             at
@@ -1480,9 +1535,15 @@ impl PromptCache {
             0
         };
         tracing::debug!(
-            "Model '{}' reused {reused} of its {} prompt tokens from the previous request's cache.",
+            "Model '{}' reused {reused} of its {} prompt tokens from the previous request's cache, which shared {shared} of them; {} read again{}.",
             self.model,
-            tokens.len()
+            tokens.len(),
+            shared - reused.min(shared),
+            if target.has_head() && reused > 0 && reused < shared {
+                ", where the draft head holds its state"
+            } else {
+                ""
+            }
         );
         self.reused.store(reused, Ordering::Relaxed);
         reused
@@ -1496,10 +1557,26 @@ impl PromptCache {
         (self.checkpoints.is_some() && at > start && self.cost.pays(at - start)).then_some(at)
     }
 
-    fn save_checkpoint(&mut self, context: &Context<'_>, n_tokens: usize) {
+    /// Where reading a prompt of `len` tokens from `start` on stashes the draft head's state, for
+    /// a cache that can be cut anywhere and so keeps no checkpoints: where a checkpoint would be,
+    /// before the generation prompt the next turn's prompt does not repeat.
+    fn head_stash_at<'m>(
+        &self,
+        target: &impl Target<'m>,
+        start: usize,
+        len: usize,
+    ) -> Option<usize> {
+        if self.checkpoints.is_some() || !target.has_head() {
+            return None;
+        }
+        let at = len.checked_sub(CHECKPOINT_BEFORE_END)?;
+        (at > start).then_some(at)
+    }
+
+    fn save_checkpoint<'m>(&mut self, target: &mut impl Target<'m>, n_tokens: usize) {
         if let Some(checkpoints) = &mut self.checkpoints {
             let started = Instant::now();
-            if let Some(bytes) = checkpoints.save(context, n_tokens) {
+            if let Some(bytes) = checkpoints.save(target, n_tokens) {
                 let took = started.elapsed();
                 self.cost.saved(took);
                 tracing::debug!(
@@ -1536,18 +1613,25 @@ struct Checkpoint {
     /// How many tokens the state follows.
     n_tokens: usize,
     state: Vec<u8>,
+    /// The draft head's state at the same point, if there is a head.
+    head: Option<Vec<u8>>,
 }
 
 impl Checkpoints {
     /// Saves `context`'s state after its first `n_tokens` tokens, which follow every earlier
     /// checkpoint's, and returns its size in bytes; `None` when llama.cpp saves nothing.
-    fn save(&mut self, context: &Context<'_>, n_tokens: usize) -> Option<usize> {
-        let state = context.partial_state()?;
+    fn save<'m>(&mut self, target: &mut impl Target<'m>, n_tokens: usize) -> Option<usize> {
+        let state = target.context().partial_state()?;
+        let head = target.head_state();
         if self.0.len() == MAX_CHECKPOINTS {
             self.0.remove(0);
         }
-        let bytes = state.len();
-        self.0.push(Checkpoint { n_tokens, state });
+        let bytes = state.len() + head.as_ref().map_or(0, Vec::len);
+        self.0.push(Checkpoint {
+            n_tokens,
+            state,
+            head,
+        });
         Some(bytes)
     }
 
@@ -1559,11 +1643,14 @@ impl Checkpoints {
     /// Restores the latest checkpoint into `context`, and returns how many tokens it follows.
     /// `None` when there is none, or llama.cpp could not restore it, which leaves `context`'s
     /// cache empty.
-    fn restore(&self, context: &mut Context<'_>) -> Option<usize> {
+    fn restore<'m>(&self, target: &mut impl Target<'m>) -> Option<usize> {
         let latest = self.0.last()?;
-        context
-            .restore_partial_state(&latest.state)
-            .then_some(latest.n_tokens)
+        let restored = target.context_mut().restore_partial_state(&latest.state)
+            && latest
+                .head
+                .as_ref()
+                .is_none_or(|head| target.restore_head_state(head));
+        restored.then_some(latest.n_tokens)
     }
 
     fn clear(&mut self) {
@@ -1642,7 +1729,8 @@ fn read_prompt<'m>(
     // The prompt is read in two spans split at the checkpoint, so the state saved there
     // follows exactly the tokens before it; without one, the first span is empty.
     let checkpoint = cache.checkpoint_at(start, tokens.len());
-    let split = checkpoint.unwrap_or(start);
+    let stash_at = cache.head_stash_at(&*target, start, tokens.len());
+    let split = checkpoint.or(stash_at).unwrap_or(start);
     // Each span is timed to its computation's end, so the reading's cost and the save's stay
     // apart; sampling, and the save itself, wait for that computation anyway.
     let started = Instant::now();
@@ -1650,7 +1738,9 @@ fn read_prompt<'m>(
     target.context_mut().synchronize();
     let mut read = started.elapsed();
     if let Some(at) = checkpoint {
-        cache.save_checkpoint(target.context(), at);
+        cache.save_checkpoint(&mut *target, at);
+    } else if let Some(at) = stash_at {
+        cache.head_stash = target.head_state().map(|state| (at, state));
     }
     let resumed = Instant::now();
     decode_span(target, &mut batch, &tokens, split..tokens.len(), stopping)?;
