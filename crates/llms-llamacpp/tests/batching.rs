@@ -25,13 +25,16 @@ use std::time::Instant;
 
 use futures::StreamExt;
 use llms::chat::{Chat, LocalModelOptions, ReasoningDefault};
+use llms_llamacpp::LlamaCpp;
 use serde_json::{Value, json};
 
 use crate::mtp::qwen35_gguf;
 use crate::{qwen3_gguf, request};
 
-/// Prompts whose replies a small model gives with wide margins at every token, so serving them
-/// in a batch of another shape cannot flip a near tie: a difference is the scheduler's.
+/// Prompts whose replies Qwen3-0.6B gives with wide margins at every token, so serving them in a
+/// batch of another shape cannot flip a near tie: a difference is the scheduler's. The smallest
+/// gap between the top two logits over each greedy reply, read alone, is 4.207, 2.727, 3.488 and
+/// 3.024.
 const PROMPTS: [&str; 4] = [
     "Count from 1 to 40, separated by commas. Reply with only the numbers.",
     "List the letters of the English alphabet in order, separated by spaces. Reply with only the letters.",
@@ -40,26 +43,31 @@ const PROMPTS: [&str; 4] = [
 ];
 
 async fn load(gguf: &Path, name: &'static str, concurrent: u32, context: usize) -> Arc<dyn Chat> {
-    let path = gguf.to_str().expect("a UTF-8 path").to_string();
-    llms::chat::create_local_model(
-        &[path],
-        None,
-        None,
-        None,
-        None,
-        None,
-        LocalModelOptions {
-            reasoning: ReasoningDefault {
-                model_name: name,
-                effort: None,
+    load_engine(gguf, name, concurrent, context).await
+}
+
+async fn load_engine(
+    gguf: &Path,
+    name: &'static str,
+    concurrent: u32,
+    context: usize,
+) -> Arc<LlamaCpp> {
+    Arc::new(
+        LlamaCpp::from(
+            &[gguf.to_path_buf()],
+            LocalModelOptions {
+                reasoning: ReasoningDefault {
+                    model_name: name,
+                    effort: None,
+                },
+                context_length: Some(context),
+                concurrent_requests: NonZeroU32::new(concurrent),
+                ..LocalModelOptions::default()
             },
-            context_length: Some(context),
-            concurrent_requests: NonZeroU32::new(concurrent),
-            ..LocalModelOptions::default()
-        },
+        )
+        .await
+        .expect("the model loads"),
     )
-    .await
-    .expect("the model loads")
 }
 
 fn body(name: &str, prompt: &str, max_tokens: u32) -> Value {
@@ -76,6 +84,15 @@ async fn reply(model: &Arc<dyn Chat>, body: Value) -> String {
     let reply = model.chat_request(request(body)).await.expect("a reply");
     reply.choices[0].message.content.clone().expect("content")
 }
+
+/// The same for Qwen3.5-0.8B, whose smallest gaps are 1.707, 1.525, 1.749 and 2.144. The
+/// alphabet is not among them: its first token is a near tie there, "abc" against "A" by 0.002.
+const PROMPTS_MTP: [&str; 4] = [
+    "List the even numbers from 2 to 60, separated by commas. Reply with only the numbers.",
+    "Write the multiples of 5 from 5 to 100, separated by commas. Reply with only the numbers.",
+    "List the days of the week starting from Monday, one per line. Reply with only the days.",
+    "List the months of the year starting from January, one per line. Reply with only the months.",
+];
 
 /// Each prompt's reply, served one at a time on a model that holds one sequence, then all at
 /// once on one that holds as many as there are prompts.
@@ -122,7 +139,7 @@ async fn requests_served_together_reply_as_each_does_alone() {
 #[tokio::test]
 async fn requests_drafted_for_together_reply_as_each_does_alone() {
     let gguf = qwen35_gguf().await;
-    let (alone, together) = alone_and_together(&gguf, "qwen3.5", &PROMPTS, 96, 4096).await;
+    let (alone, together) = alone_and_together(&gguf, "qwen3.5", &PROMPTS_MTP, 96, 4096).await;
     assert!(
         alone.iter().all(|reply| reply.len() > 20),
         "every reply has content: {alone:?}"
@@ -178,6 +195,68 @@ async fn idle_caches_give_up_their_room_to_a_request_that_needs_it() {
         .map(|reply| reply.choices[0].message.content.clone().unwrap_or_default())
         .map_err(|e| e.to_string());
     assert_eq!(after, Ok(alone), "the third reply, against alone");
+}
+
+/// A conversation's next turn reuses its own prefix beside another request and replies as it does
+/// alone. On Qwen3.5-0.8B, a hybrid model, reusing the prefix restores the recurrent-state
+/// checkpoint turn 1 saved while its prompt was read in steps shared with the other request; a
+/// checkpoint saved for the wrong sequence, or after the wrong tokens, changes turn 2's reply.
+/// Turn 2 lists turn 1's days in reverse, so its reply depends on what the restored state holds.
+/// The smallest top-two logit gaps over the replies, read alone, are 1.749 (turn 1), 2.191
+/// (turn 2) and 1.707 (the other request).
+#[tokio::test]
+async fn a_next_turn_reuses_its_prefix_beside_another_request_and_replies_as_alone() {
+    let gguf = qwen35_gguf().await;
+    let name = "qwen3.5";
+    let question = PROMPTS_MTP[2];
+    let turn = |answer: Option<&str>| -> Value {
+        let mut messages = vec![json!({ "role": "user", "content": question })];
+        if let Some(answer) = answer {
+            messages.push(json!({ "role": "assistant", "content": answer }));
+            messages.push(
+                json!({ "role": "user", "content": "Now list those days in reverse order, one per line. Reply with only the days." }),
+            );
+        }
+        json!({
+            "model": name,
+            "messages": messages,
+            "temperature": 0,
+            "reasoning_effort": "none",
+            "max_tokens": 96,
+        })
+    };
+    let answer = "Monday\nTuesday\nWednesday\nThursday\nFriday\nSaturday\nSunday";
+    let other = body(name, PROMPTS_MTP[0], 300);
+    let (alone, reused_alone) = {
+        let engine = load_engine(&gguf, name, 1, 4096).await;
+        let model: Arc<dyn Chat> = Arc::clone(&engine) as Arc<dyn Chat>;
+        let first = reply(&model, turn(None)).await;
+        let second = reply(&model, turn(Some(answer))).await;
+        let reused = engine.reused_prompt_tokens();
+        let other = reply(&model, other.clone()).await;
+        ((first, second, other), reused)
+    };
+    let engine = load_engine(&gguf, name, 2, 4096).await;
+    let model: Arc<dyn Chat> = Arc::clone(&engine) as Arc<dyn Chat>;
+    let beside = {
+        let model = Arc::clone(&model);
+        tokio::spawn(async move { reply(&model, other).await })
+    };
+    let first = reply(&model, turn(None)).await;
+    let second = reply(&model, turn(Some(answer))).await;
+    // turn 2 was the last request to start, so the count is its own
+    let reused = engine.reused_prompt_tokens();
+    let other = beside.await.expect("the other request runs");
+    assert!(reused_alone > 0, "turn 2 reuses turn 1's prefix alone");
+    assert_eq!(
+        reused, reused_alone,
+        "the prompt tokens turn 2 reused beside another request, against alone"
+    );
+    assert_eq!(
+        (first, second, other),
+        alone,
+        "turn 1, turn 2 and the request beside them, against alone"
+    );
 }
 
 /// A request that arrives while another is answering streams its first token before the other

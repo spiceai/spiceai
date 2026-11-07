@@ -17,8 +17,9 @@ limitations under the License.
 //! Continuous batching: several requests decoded together, each in its own sequence of one
 //! shared cache. Every step decodes one batch that holds each running request's next token, and
 //! with a draft head its draft, so the weights are read once for all of them. A request that
-//! arrives while others run reads its prompt into a free sequence between steps, and decodes in
-//! the next step.
+//! arrives while others run reads its prompt in the same steps, a chunk at a time beside their
+//! tokens, so they keep decoding while it reads, and it decodes with them once its prompt is
+//! read.
 //!
 //! A request is admitted with room for its whole possible reply, its prompt plus `max_tokens`
 //! or the rest of the context, so a running request never runs out of cache. The caches of idle
@@ -38,8 +39,8 @@ use llama_cpp::{Batch, Context, DraftKind, DraftRequest, Model, Mtp, Token};
 use tokio::sync::mpsc;
 
 use super::{
-    DECODE_STOPPED, Decoder, Event, Job, Output, PROMPT_BATCH, Picker, PromptCache, Target,
-    read_prompt, send_unless_stopping,
+    DECODE_STOPPED, Decoder, Event, Job, Output, PROMPT_BATCH, Picker, PromptCache, PromptPlan,
+    Target, plan_prompt, send_unless_stopping,
 };
 
 /// How long the decode thread waits when every running request waits on its client.
@@ -220,15 +221,18 @@ impl<'m, S: Shared<'m>> Target<'m> for InSeq<'_, S> {
     }
 }
 
-/// A request decoding in one sequence.
+/// A request in one sequence: reading its prompt, then decoding its reply.
 struct Running<'v> {
     out: Output,
     picker: Picker<'v>,
-    /// Every token the sequence holds: the prompt, then the reply's.
+    /// Every token the sequence holds: the prompt, then the reply's. Empty while it reads.
     history: Vec<Token>,
     prompt_tokens: usize,
-    /// The token sampled last and already sent, which the next step decodes at `history.len()`.
+    /// The token sampled last and already sent, which the next step decodes at `history.len()`;
+    /// none is sampled while the prompt is read.
     id: Token,
+    /// The prompt still being read, if it is.
+    reading: Option<Reading>,
     /// The cells it was admitted with: its prompt and its whole possible reply.
     reserved: usize,
     events: mpsc::Sender<Event>,
@@ -244,7 +248,34 @@ struct Slot<'v> {
     last_used: u64,
 }
 
-/// One running request's part of a step's batch.
+/// A prompt being read in steps: the plan, and the next position to decode.
+struct Reading {
+    plan: PromptPlan,
+    next: usize,
+}
+
+impl Reading {
+    /// Where this step's chunk of the prompt ends: at the split, where a checkpoint or the draft
+    /// head's state is saved after exactly the tokens before it, then at the prompt's end.
+    fn stop(&self) -> usize {
+        let split = self.plan.split();
+        if self.next < split {
+            split
+        } else {
+            self.plan.tokens.len()
+        }
+    }
+}
+
+/// A reading request's chunk of a step's batch: prompt positions `from..to`.
+struct ReadRow {
+    slot: usize,
+    offset: i32,
+    from: usize,
+    to: usize,
+}
+
+/// One decoding request's part of a step's batch.
 struct Row {
     slot: usize,
     /// Where its tokens start in the batch.
@@ -307,7 +338,7 @@ fn run<'m, S: Shared<'m>>(
                 }
             }
         }
-        admit(model, shared, &mut slots, &mut waiting, eog, &mut tick);
+        admit(model, shared, &mut slots, &mut waiting, eog);
         if !step(model, shared, split, &mut slots, &mut tick) {
             std::thread::sleep(PAUSED_POLL);
         }
@@ -321,7 +352,6 @@ fn admit<'m, S: Shared<'m>>(
     slots: &mut [Slot<'m>],
     waiting: &mut VecDeque<Job>,
     eog: &[Token],
-    tick: &mut u64,
 ) {
     let n_ctx = usize::try_from(shared.context().n_ctx()).unwrap_or(usize::MAX);
     while let Some(job) = waiting.front() {
@@ -352,7 +382,7 @@ fn admit<'m, S: Shared<'m>>(
         let Some(job) = waiting.pop_front() else {
             return;
         };
-        start(model, shared, &mut slots[free], job, eog, reserve, tick);
+        start(model, shared, &mut slots[free], job, eog, reserve);
     }
 }
 
@@ -432,8 +462,8 @@ fn make_room<'m, S: Shared<'m>>(
     true
 }
 
-/// Reads `job`'s prompt into `slot`'s sequence and samples its first token, which it sends;
-/// the request then decodes with the others from the next step, unless that token ended it.
+/// Readies `job`'s prompt to be read into `slot`'s sequence, from the longest prefix its cache
+/// holds; the steps that follow read it, beside the other requests' tokens.
 fn start<'m, S: Shared<'m>>(
     model: &'m Model,
     shared: &mut S,
@@ -441,7 +471,6 @@ fn start<'m, S: Shared<'m>>(
     job: Job,
     eog: &[Token],
     reserved: usize,
-    tick: &mut u64,
 ) {
     let namespace = job.namespace.clone();
     let events = job.events.clone();
@@ -455,7 +484,7 @@ fn start<'m, S: Shared<'m>>(
         n_ctx,
         out.pending(),
     );
-    let mut picker = match picker {
+    let picker = match picker {
         Ok(picker) => picker,
         Err(message) => {
             send_unless_stopping(&events, &stopping, Event::Failed(message));
@@ -467,15 +496,8 @@ fn start<'m, S: Shared<'m>>(
         shared: &mut *shared,
         seq: slot.seq,
     };
-    let read = read_prompt(
-        model,
-        &mut target,
-        &mut slot.cache,
-        (&prompt, &namespace),
-        &out.stopping,
-    );
-    let (history, batch) = match read {
-        Ok(read) => read,
+    let plan = match plan_prompt(model, &mut target, &mut slot.cache, (&prompt, &namespace)) {
+        Ok(plan) => plan,
         Err(message) => {
             target.clear();
             slot.cache.forget();
@@ -483,22 +505,20 @@ fn start<'m, S: Shared<'m>>(
             return;
         }
     };
-    if let Err(message) = shared.begin(slot.seq, &history) {
-        fail(shared, slot, &events, &stopping, message);
-        return;
-    }
-    let id = picker.sample(shared.context(), batch.n_tokens() - 1, out.in_content());
-    let running = Running {
+    slot.running = Some(Running {
         out,
         picker,
-        prompt_tokens: history.len(),
-        history,
-        id,
+        history: Vec::new(),
+        prompt_tokens: plan.tokens.len(),
+        id: Token(0),
+        reading: Some(Reading {
+            next: plan.start,
+            plan,
+        }),
         reserved,
         events,
         stopping,
-    };
-    sent(model, shared, slot, running, tick);
+    });
 }
 
 /// Sends a running request's sampled token, then keeps it running, or finishes it when the
@@ -570,8 +590,10 @@ fn fail<'m, S: Shared<'m>>(
     send_unless_stopping(events, stopping, Event::Failed(message));
 }
 
-/// One step: drafts for every running request whose client has room, verifies all their
-/// drafts in one batch, and sends what each accepted. Returns false when no request could step.
+/// One step: drafts for every decoding request whose client has room, verifies all their drafts
+/// in one batch beside the next chunk of each reading request's prompt, and sends what each
+/// accepted, and each prompt read to its end its first token. Returns false when no request
+/// could step.
 fn step<'m, S: Shared<'m>>(
     model: &'m Model,
     shared: &mut S,
@@ -619,8 +641,14 @@ fn step<'m, S: Shared<'m>>(
     if stepping.is_empty() {
         return slots.iter().all(|slot| slot.running.is_none());
     }
+    let (decoding, reading): (Vec<usize>, Vec<usize>) = stepping.iter().partition(|&&index| {
+        slots[index]
+            .running
+            .as_ref()
+            .is_some_and(|running| running.reading.is_none())
+    });
     let drafts = {
-        let requests: Vec<DraftRequest<'_>> = stepping
+        let requests: Vec<DraftRequest<'_>> = decoding
             .iter()
             .filter_map(|&index| {
                 let slot = &slots[index];
@@ -642,9 +670,9 @@ fn step<'m, S: Shared<'m>>(
             return true;
         }
     };
-    let mut batch = Batch::new(PROMPT_BATCH.max(stepping.len() * (shared.n_draft() + 1)));
-    let mut rows = Vec::with_capacity(stepping.len());
-    for (&index, mut draft) in stepping.iter().zip(drafts) {
+    let mut batch = Batch::new(PROMPT_BATCH.max(decoding.len() * (shared.n_draft() + 1)));
+    let mut rows = Vec::with_capacity(decoding.len());
+    for (&index, mut draft) in decoding.iter().zip(drafts) {
         let slot = &slots[index];
         let Some(running) = &slot.running else {
             continue;
@@ -697,6 +725,37 @@ fn step<'m, S: Shared<'m>>(
             draft,
             real,
             drafted,
+        });
+    }
+    // The reading requests' prompts fill the rest of the batch, oldest request first, each chunk
+    // ending at its split or its prompt's end; only a prompt's last token outputs logits.
+    let mut read_rows = Vec::with_capacity(reading.len());
+    for &index in &reading {
+        let budget = PROMPT_BATCH.saturating_sub(usize::try_from(batch.n_tokens()).unwrap_or(0));
+        if budget == 0 {
+            break;
+        }
+        let slot = &slots[index];
+        let Some(read) = slot.running.as_ref().and_then(|r| r.reading.as_ref()) else {
+            continue;
+        };
+        let from = read.next;
+        let to = read.stop().min(from + budget);
+        let offset = batch.n_tokens();
+        let len = read.plan.tokens.len();
+        let added = (from..to).try_for_each(|pos| {
+            let at = i32::try_from(pos).unwrap_or(i32::MAX);
+            batch.add_seq(read.plan.tokens[pos], at, slot.seq, pos + 1 == len)
+        });
+        if let Err(e) = added {
+            fail_all(shared, slots, &stepping, &e.to_string());
+            return true;
+        }
+        read_rows.push(ReadRow {
+            slot: index,
+            offset,
+            from,
+            to,
         });
     }
     let decoded = shared
@@ -753,6 +812,41 @@ fn step<'m, S: Shared<'m>>(
             continue;
         }
         running.id = next;
+        sent(model, shared, slot, running, tick);
+    }
+    for row in read_rows {
+        let slot = &mut slots[row.slot];
+        let Some(mut running) = slot.running.take() else {
+            continue;
+        };
+        let Some(mut read) = running.reading.take() else {
+            slot.running = Some(running);
+            continue;
+        };
+        read.next = row.to;
+        let mut target = InSeq {
+            shared: &mut *shared,
+            seq: slot.seq,
+        };
+        if read.plan.checkpoint == Some(read.next) {
+            slot.cache.save_checkpoint(&mut target, read.next);
+        } else if read.plan.stash_at == Some(read.next) {
+            slot.cache.head_stash = target.head_state().map(|state| (read.next, state));
+        }
+        if read.next < read.plan.tokens.len() {
+            running.reading = Some(read);
+            slot.running = Some(running);
+            continue;
+        }
+        // The whole prompt is read: drafting begins, and its last row predicts the first token.
+        running.history = read.plan.tokens;
+        if let Err(message) = shared.begin(slot.seq, &running.history) {
+            fail(shared, slot, &running.events, &running.stopping, message);
+            continue;
+        }
+        let last = row.offset + i32::try_from(row.to - row.from).unwrap_or(i32::MAX) - 1;
+        let in_content = running.out.in_content();
+        running.id = running.picker.sample(shared.context(), last, in_content);
         sent(model, shared, slot, running, tick);
     }
     true

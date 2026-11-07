@@ -1771,15 +1771,31 @@ fn count(tokens: usize) -> f64 {
     f64::from(u32::try_from(tokens).unwrap_or(u32::MAX))
 }
 
-/// Tokenizes the prompt and decodes the part of it the cache does not already hold, returning
-/// the tokens and the batch whose last logits predict the first generated token.
-fn read_prompt<'m>(
+/// A prompt ready to be read: its tokens, how many of them the cache already holds, and where
+/// reading it saves a checkpoint, or stashes the draft head's state, if anywhere.
+struct PromptPlan {
+    tokens: Vec<Token>,
+    start: usize,
+    checkpoint: Option<usize>,
+    stash_at: Option<usize>,
+}
+
+impl PromptPlan {
+    /// Where the prompt is split into two spans, so the state saved there follows exactly the
+    /// tokens before it; `start` without a save.
+    fn split(&self) -> usize {
+        self.checkpoint.or(self.stash_at).unwrap_or(self.start)
+    }
+}
+
+/// Tokenizes the prompt, refuses one that is empty or does not fit the context, and readies the
+/// cache to read it from the longest prefix it already holds.
+fn plan_prompt<'m>(
     model: &Model,
     target: &mut impl Target<'m>,
     cache: &mut PromptCache,
     (prompt, namespace): (&str, &CacheNamespace),
-    stopping: &AtomicBool,
-) -> std::result::Result<(Vec<Token>, Batch), String> {
+) -> std::result::Result<PromptPlan, String> {
     let tokens = model
         .vocab()
         .tokenize(prompt, false, true)
@@ -1795,12 +1811,34 @@ fn read_prompt<'m>(
         ));
     }
     let start = cache.reuse(target, &tokens, namespace);
-    let mut batch = Batch::new(PROMPT_BATCH);
-    // The prompt is read in two spans split at the checkpoint, so the state saved there
-    // follows exactly the tokens before it; without one, the first span is empty.
     let checkpoint = cache.checkpoint_at(start, tokens.len());
     let stash_at = cache.head_stash_at(&*target, start, tokens.len());
-    let split = checkpoint.or(stash_at).unwrap_or(start);
+    Ok(PromptPlan {
+        tokens,
+        start,
+        checkpoint,
+        stash_at,
+    })
+}
+
+/// Tokenizes the prompt and decodes the part of it the cache does not already hold, returning
+/// the tokens and the batch whose last logits predict the first generated token.
+fn read_prompt<'m>(
+    model: &Model,
+    target: &mut impl Target<'m>,
+    cache: &mut PromptCache,
+    prompt: (&str, &CacheNamespace),
+    stopping: &AtomicBool,
+) -> std::result::Result<(Vec<Token>, Batch), String> {
+    let plan = plan_prompt(model, target, cache, prompt)?;
+    let split = plan.split();
+    let PromptPlan {
+        tokens,
+        start,
+        checkpoint,
+        stash_at,
+    } = plan;
+    let mut batch = Batch::new(PROMPT_BATCH);
     // Each span is timed to its computation's end, so the reading's cost and the save's stay
     // apart; sampling, and the save itself, wait for that computation anyway.
     let started = Instant::now();
