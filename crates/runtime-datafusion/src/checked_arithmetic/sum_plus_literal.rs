@@ -30,6 +30,12 @@ limitations under the License.
 //! `i128` and narrows once, with the error checked `SUM` gives. `SUM(x + k)` is
 //! the sum of `x + k` over the rows where `x` is not NULL, which is
 //! `SUM(x) + k * COUNT(x)`, and NULL where `SUM(x)` is.
+//!
+//! [`CheckedSumWiden`] does the widening rather than a `CAST`: a column name
+//! leaves out casts, so `SUM(CAST(x AS ...))` and `COUNT(CAST(x AS ...))` would
+//! take the names of the query's own `SUM(x)` and `COUNT(x)` (`ClickBench` Q29
+//! starts with `SUM(x)`), and an aggregate with two outputs of one name does
+//! not plan.
 
 use std::sync::{Arc, LazyLock};
 
@@ -40,9 +46,10 @@ use datafusion::functions_aggregate::count::count;
 use datafusion::logical_expr::expr::AggregateFunction;
 use datafusion::logical_expr::{
     ColumnarValue, Expr, Operator, ReturnFieldArgs, ScalarFunctionArgs, ScalarUDF, ScalarUDFImpl,
-    Signature, Volatility, cast, lit,
+    Signature, Volatility, lit,
 };
 
+use super::is_integer_arith_type;
 use super::sum::{checked_sum_state_type, int64_overflow};
 
 /// Rewrite target for `SUM(x + k)`. Not a documented SQL API; the `__spice_`
@@ -54,10 +61,25 @@ runtime_udfs_api::register_spice_function!(
     CHECKED_SUM_PLUS_COUNT_UDF_NAME
 );
 
+/// Rewrite helper that widens the `x` of `SUM(x + k)`. Not a documented SQL API.
+pub const CHECKED_SUM_WIDEN_UDF_NAME: &str = "__spice_checked_sum_widen";
+
+runtime_udfs_api::register_spice_function!(
+    CHECKED_SUM_WIDEN_SPICE_FUNCTION,
+    CHECKED_SUM_WIDEN_UDF_NAME
+);
+
 #[must_use]
 pub(crate) fn checked_sum_plus_count_udf() -> Arc<ScalarUDF> {
     static UDF: LazyLock<Arc<ScalarUDF>> =
         LazyLock::new(|| Arc::new(ScalarUDF::from(CheckedSumPlusCount::new())));
+    Arc::clone(&UDF)
+}
+
+#[must_use]
+pub(crate) fn checked_sum_widen_udf() -> Arc<ScalarUDF> {
+    static UDF: LazyLock<Arc<ScalarUDF>> =
+        LazyLock::new(|| Arc::new(ScalarUDF::from(CheckedSumWiden::new())));
     Arc::clone(&UDF)
 }
 
@@ -76,13 +98,79 @@ pub(crate) fn sum_plus_literal(
     if op != Operator::Plus {
         return None;
     }
+    let widened = checked_sum_widen_udf().call(vec![arg.clone()]);
     let mut wide_sum = sum_of_arg_plus_k.clone();
-    wide_sum.params.args = vec![cast(arg.clone(), checked_sum_state_type())];
+    wide_sum.params.args = vec![widened.clone()];
     Some(checked_sum_plus_count_udf().call(vec![
         Expr::AggregateFunction(wide_sum),
-        count(arg.clone()),
+        count(widened),
         lit(k),
     ]))
+}
+
+/// An integer as `Decimal128(38, 0)`, which holds every integer value exactly,
+/// NULL where the integer is. See the module documentation for why this is a
+/// function and not a `CAST`.
+#[derive(Debug, PartialEq, Eq, Hash)]
+pub(crate) struct CheckedSumWiden {
+    signature: Signature,
+}
+
+impl CheckedSumWiden {
+    fn new() -> Self {
+        Self {
+            signature: Signature::user_defined(Volatility::Immutable),
+        }
+    }
+}
+
+impl ScalarUDFImpl for CheckedSumWiden {
+    fn name(&self) -> &'static str {
+        CHECKED_SUM_WIDEN_UDF_NAME
+    }
+
+    fn signature(&self) -> &Signature {
+        &self.signature
+    }
+
+    fn return_type(&self, _arg_types: &[DataType]) -> Result<DataType> {
+        Ok(checked_sum_state_type())
+    }
+
+    fn return_field_from_args(&self, args: ReturnFieldArgs) -> Result<FieldRef> {
+        let [value] = args.arg_fields else {
+            return plan_err!("{} expects one argument", self.name());
+        };
+        Ok(Arc::new(Field::new(
+            self.name(),
+            checked_sum_state_type(),
+            value.is_nullable(),
+        )))
+    }
+
+    fn coerce_types(&self, arg_types: &[DataType]) -> Result<Vec<DataType>> {
+        match arg_types {
+            [value] if is_integer_arith_type(value) => Ok(vec![value.clone()]),
+            _ => plan_err!(
+                "{} expects one integer argument, got {arg_types:?}",
+                self.name()
+            ),
+        }
+    }
+
+    fn invoke_with_args(&self, args: ScalarFunctionArgs) -> Result<ColumnarValue> {
+        let [value] = args.args.as_slice() else {
+            return exec_err!("{} expects one argument", self.name());
+        };
+        if !is_integer_arith_type(&value.data_type()) {
+            return exec_err!(
+                "{} expects an integer, got {}",
+                self.name(),
+                value.data_type()
+            );
+        }
+        value.cast_to(&checked_sum_state_type(), None)
+    }
 }
 
 /// `sum + k * count` for a `Decimal128(38, 0)` `sum`, an `Int64` `count` and an

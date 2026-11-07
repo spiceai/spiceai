@@ -20,12 +20,14 @@ limitations under the License.
 //! still see the original operators. The leftover local expressions cannot be
 //! folded by `SimplifyExpressions` with wrapping kernels.
 //!
-//! An operator whose operands' values keep every result inside its type stays
+//! A `+` or `-` whose operands' values keep every result inside its type stays
 //! as written: the wrapping kernel cannot wrap there, so it returns what the
 //! checked one would. `CAST(smallint_column AS BIGINT) + 1` is the common case.
 //! Left a plain `+`, it is still the `SUM(x + 1), SUM(x + 2), ...` shape that
 //! `DataFusion` rewrites to one `SUM(x)` and one `COUNT(x)` (see
-//! [`CheckedSum`](super::CheckedSum)).
+//! [`CheckedSum`](super::CheckedSum)). A `*` is always checked, even where it
+//! cannot overflow: `DataFusion` simplifies a plain `A * 0` to `0`, which drops
+//! any error `A` raises (an overflow, a failed cast).
 
 use std::sync::Arc;
 
@@ -106,9 +108,9 @@ fn rewrite_integer_arith(expr: Expr, schema: &DFSchema) -> Transformed<Expr> {
     Transformed::yes(udf.call(vec![*left, *right]))
 }
 
-/// Whether `left op right` stays inside `data_type` for every value its
-/// operands can take, so the wrapping operator returns what the checked kernel
-/// would.
+/// Whether `left op right` is a `+` or `-` that stays inside `data_type` for
+/// every value its operands can take, so the wrapping operator returns what
+/// the checked kernel would.
 fn cannot_overflow(
     op: Operator,
     left: &Expr,
@@ -225,7 +227,7 @@ fn value_range(expr: &Expr, schema: &DFSchema) -> Option<ValueRange> {
 }
 
 /// The range of `left op right` over every pair of operand values; `None` when
-/// `op` is not `+` / `-` / `*` or a bound does not fit in `i128`.
+/// `op` is not `+` or `-` (see the module documentation for `*`).
 fn op_range(op: Operator, left: ValueRange, right: ValueRange) -> Option<ValueRange> {
     match op {
         Operator::Plus => Some(ValueRange {
@@ -236,19 +238,6 @@ fn op_range(op: Operator, left: ValueRange, right: ValueRange) -> Option<ValueRa
             min: left.min.checked_sub(right.max)?,
             max: left.max.checked_sub(right.min)?,
         }),
-        Operator::Multiply => {
-            // A product of two intervals takes its extremes at their corners.
-            let corners = [
-                left.min.checked_mul(right.min)?,
-                left.min.checked_mul(right.max)?,
-                left.max.checked_mul(right.min)?,
-                left.max.checked_mul(right.max)?,
-            ];
-            Some(ValueRange {
-                min: corners.into_iter().min()?,
-                max: corners.into_iter().max()?,
-            })
-        }
         _ => None,
     }
 }

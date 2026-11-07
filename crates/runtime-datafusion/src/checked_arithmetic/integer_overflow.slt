@@ -83,23 +83,32 @@ SELECT big * 2, i * CAST(2 AS INT) FROM t WHERE id = 3;
 ----
 2 2
 
-# An INT widened to BIGINT has room for these, so they run as plain operators.
-query III
-SELECT i + 1, i * 2, CAST(i AS BIGINT) * CAST(i AS BIGINT) FROM t WHERE id = 1;
+# An INT widened to BIGINT has room for these, so the `+` and `-` run as plain
+# operators; a `*` is always checked.
+query IIII
+SELECT i + 1, i - 1, i * 2, CAST(i AS BIGINT) * CAST(i AS BIGINT) FROM t WHERE id = 1;
 ----
-2147483648 4294967294 4611686014132420609
+2147483648 2147483646 4294967294 4611686014132420609
 
-# The square of an INT doubled can reach 2^63, so the doubling stays checked.
-query I
-SELECT CAST(i AS BIGINT) * CAST(i AS BIGINT) * 2 FROM t WHERE id = 1;
-----
-9223372028264841218
+# The inner sum ends exactly at i64::MAX, so the outer `+ 1` stays checked.
+statement error overflow
+SELECT i + 9223372034707292160 + 1 FROM t WHERE id = 1;
 
-# SUM(x + k) for several k is one SUM(x) and one COUNT(x); the totals are exact.
+# A plain `A * 0` would fold to 0 and drop the overflow in `A`.
+statement error overflow
+SELECT (CAST(9223372036854775807 AS BIGINT) + 1) * 0;
+
+# SUM(x + k) for several k is one wide SUM and one COUNT of x; the totals are
+# exact, beside the query's own SUM(x) and COUNT(x) too.
 query III
 SELECT SUM(i + 1), SUM(i + 2), SUM(i - -3) FROM t;
 ----
 4294967300 4294967304 4294967308
+
+query IIII
+SELECT SUM(i), COUNT(i), SUM(i + 1), SUM(i + 2) FROM t;
+----
+4294967296 4 4294967300 4294967304
 
 query II
 SELECT SUM(i + 1), SUM(i + 2) FROM t WHERE id = 0;

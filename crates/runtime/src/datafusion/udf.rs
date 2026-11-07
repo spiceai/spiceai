@@ -760,6 +760,7 @@ mod deny_list_registration_tests {
             runtime_datafusion::checked_arithmetic::CHECKED_SUB_UDF_NAME,
             runtime_datafusion::checked_arithmetic::CHECKED_MUL_UDF_NAME,
             runtime_datafusion::checked_arithmetic::CHECKED_SUM_PLUS_COUNT_UDF_NAME,
+            runtime_datafusion::checked_arithmetic::CHECKED_SUM_WIDEN_UDF_NAME,
         ]
         .iter()
         .map(ToString::to_string)
@@ -1045,6 +1046,7 @@ mod tests {
             runtime_datafusion::checked_arithmetic::CHECKED_SUB_UDF_NAME,
             runtime_datafusion::checked_arithmetic::CHECKED_MUL_UDF_NAME,
             runtime_datafusion::checked_arithmetic::CHECKED_SUM_PLUS_COUNT_UDF_NAME,
+            runtime_datafusion::checked_arithmetic::CHECKED_SUM_WIDEN_UDF_NAME,
         ] {
             assert!(
                 !support.supports(&make_named_expr(name), None),

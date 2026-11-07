@@ -41,7 +41,7 @@ pub use op::{CHECKED_ADD_UDF_NAME, CHECKED_MUL_UDF_NAME, CHECKED_SUB_UDF_NAME};
 pub use plain_writes::{PlainArithmeticWrites, plain_arithmetic, with_plain_arithmetic_writes};
 pub use single_distinct::{CheckedSingleDistinctToGroupBy, install_checked_single_distinct};
 pub use sum::CheckedSum;
-pub use sum_plus_literal::CHECKED_SUM_PLUS_COUNT_UDF_NAME;
+pub use sum_plus_literal::{CHECKED_SUM_PLUS_COUNT_UDF_NAME, CHECKED_SUM_WIDEN_UDF_NAME};
 
 use std::sync::Arc;
 
@@ -51,7 +51,9 @@ use datafusion::execution::{FunctionRegistry, SessionState};
 use datafusion::logical_expr::{AggregateUDF, ScalarUDF};
 
 use crate::checked_arithmetic::op::{checked_add_udf, checked_mul_udf, checked_sub_udf};
-use crate::checked_arithmetic::sum_plus_literal::checked_sum_plus_count_udf;
+use crate::checked_arithmetic::sum_plus_literal::{
+    checked_sum_plus_count_udf, checked_sum_widen_udf,
+};
 
 /// Register checked integer `SUM` and the scalar kernels the analyzer rewrites
 /// `+` / `-` / `*` into.
@@ -67,17 +69,18 @@ pub fn register_checked_arithmetic(state: &mut SessionState) -> Result<()> {
 }
 
 /// The scalar kernels the analyzer rewrites integer `+` / `-` / `*` into, and
-/// the one checked `SUM(x + k)` is rewritten into.
+/// the two checked `SUM(x + k)` is rewritten into.
 ///
 /// A registry that is not a [`SessionState`] (a cluster executor decodes task
 /// plans against its own) must hold these and [`checked_sum_udaf`] too, or a
 /// plan built on the scheduler decodes to different functions.
 #[must_use]
-pub fn checked_scalar_udfs() -> [Arc<ScalarUDF>; 4] {
+pub fn checked_scalar_udfs() -> [Arc<ScalarUDF>; 5] {
     [
         checked_add_udf(),
         checked_sub_udf(),
         checked_mul_udf(),
+        checked_sum_widen_udf(),
         checked_sum_plus_count_udf(),
     ]
 }

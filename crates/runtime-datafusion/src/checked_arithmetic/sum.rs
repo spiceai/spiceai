@@ -209,37 +209,32 @@ impl AggregateUDFImpl for CheckedSum {
     }
 
     /// `DataFusion` offers `SUM(arg + literal)` here when several `SUM`s share
-    /// `arg`, to rewrite to `SUM(arg) + literal * COUNT(arg)`. The built-in's
-    /// rewrite adds and multiplies with wrapping kernels, so an integer `arg`
-    /// gets the exact one in `sum_plus_literal` (signed) or none (unsigned,
-    /// left as written); any other type keeps the built-in's.
+    /// `arg`, to rewrite to `SUM(arg) + literal * COUNT(arg)`. A signed
+    /// integer `arg` gets the exact rewrite in `sum_plus_literal`.
+    ///
+    /// Every other type is left as written rather than handed to the
+    /// built-in's rewrite: that one adds and multiplies with wrapping kernels,
+    /// widens a decimal `SUM`'s result type to precision 38, and does not plan
+    /// for an interval (it multiplies two intervals).
     fn simplify_expr_op_literal(
         &self,
         agg_function: &AggregateFunction,
         arg: &Expr,
         op: Operator,
         lit: &Expr,
-        arg_is_left: bool,
+        _arg_is_left: bool,
     ) -> Result<Option<Expr>> {
         let Expr::Literal(value, _) = lit else {
             return Ok(None);
         };
-        let data_type = value.data_type();
-        if data_type.is_signed_integer() {
-            let k = match value {
-                ScalarValue::Int8(k) => k.map(i64::from),
-                ScalarValue::Int16(k) => k.map(i64::from),
-                ScalarValue::Int32(k) => k.map(i64::from),
-                ScalarValue::Int64(k) => *k,
-                _ => None,
-            };
-            return Ok(k.and_then(|k| sum_plus_literal(agg_function, arg, op, k)));
-        }
-        if data_type.is_unsigned_integer() {
-            return Ok(None);
-        }
-        self.inner
-            .simplify_expr_op_literal(agg_function, arg, op, lit, arg_is_left)
+        let k = match value {
+            ScalarValue::Int8(k) => k.map(i64::from),
+            ScalarValue::Int16(k) => k.map(i64::from),
+            ScalarValue::Int32(k) => k.map(i64::from),
+            ScalarValue::Int64(k) => *k,
+            _ => None,
+        };
+        Ok(k.and_then(|k| sum_plus_literal(agg_function, arg, op, k)))
     }
 
     fn coerce_types(&self, arg_types: &[DataType]) -> Result<Vec<DataType>> {
