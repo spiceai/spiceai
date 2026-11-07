@@ -2,5 +2,17 @@
 source: crates/test-framework/src/spicetest/datasets/worker.rs
 description: "Query: tpcds_q19"
 ---
-++
-++
++----------+--------------------+---------------+----------------+-----------+
+| brand_id | brand              | i_manufact_id | i_manufact     | ext_price |
++----------+--------------------+---------------+----------------+-----------+
+| 9002011  | importomaxi #11    | 606           | callybarcally  | 7904.74   |
+| 9005009  | scholarmaxi #9     | 255           | antiantiable   | 7423.94   |
+| 1002002  | importoamalg #2    | 50            | baranti        | 7230.29   |
+| 5003002  | exportischolar #2  | 162           | ablecallyought | 5891.88   |
+| 3002002  | importoexporti #2  | 597           | ationn stanti  | 5120.06   |
+| 3004001  | edu packexporti #1 | 119           | n stoughtought | 5024.07   |
+| 8014007  | edu packmaxi #7    | 350           | barantipri     | 4994.97   |
+| 6011004  | amalgbrand #4      | 9             | n st           | 4858.62   |
+| 8003007  | exportinameless #7 | 85            | antieing       | 3843.56   |
+| 10009003 | maxiunivamalg #3   | 389           | n steingpri    | 3035.03   |
++----------+--------------------+---------------+----------------+-----------+

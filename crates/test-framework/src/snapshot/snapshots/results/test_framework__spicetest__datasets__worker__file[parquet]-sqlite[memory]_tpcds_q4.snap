@@ -2,5 +2,14 @@
 source: crates/test-framework/src/spicetest/datasets/worker.rs
 description: "Query: tpcds_q4"
 ---
-++
-++
++------------------+---------------------+--------------------+----------------------------------------+
+| customer_id      | customer_first_name | customer_last_name | customer_email_address                 |
++------------------+---------------------+--------------------+----------------------------------------+
+| AAAAAAAADOCAAAAA | Joy                 | Baker              | Joy.Baker@St8l0a0YtrZKD.edu            |
+| AAAAAAAAHMBAAAAA | Eunice              | Shaw               | Eunice.Shaw@e2zrneFyn.com              |
+| AAAAAAAAIICAAAAA | Sherri              | Tyler              | Sherri.Tyler@HySjUktGPnSz3.com         |
+| AAAAAAAAJCAAAAAA | Maxine              | Carlson            | Maxine.Carlson@StyP5lAokmQ29QHYMLa.edu |
+| AAAAAAAAJGBAAAAA | Bonnie              | Harrison           | Bonnie.Harrison@AKYSOPlHEYkd.com       |
+| AAAAAAAALJBAAAAA | Cleo                | Spangler           | Cleo.Spangler@dfn.org                  |
+| AAAAAAAAMOAAAAAA | Becky               | Downey             | Becky.Downey@LfVPF.org                 |
++------------------+---------------------+--------------------+----------------------------------------+

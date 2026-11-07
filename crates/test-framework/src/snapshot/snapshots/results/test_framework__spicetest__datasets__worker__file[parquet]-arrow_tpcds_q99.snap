@@ -5,14 +5,14 @@ description: "Query: tpcds_q99"
 +-------------------------------------------------------+-----------+---------------+---------+------------+------------+-------------+-----------+
 | substr(warehouse.w_warehouse_name,Int64(1),Int64(20)) | sm_type   | cc_name       | 30 days | 31-60 days | 61-90 days | 91-120 days | >120 days |
 +-------------------------------------------------------+-----------+---------------+---------+------------+------------+-------------+-----------+
-| Conventional childr                                   | EXPRESS   | Mid Atlantic  | 1267    | 1327       | 1250       | 0           | 0         |
-| Conventional childr                                   | EXPRESS   | NY Metro      | 1269    | 1263       | 1266       | 0           | 0         |
-| Conventional childr                                   | EXPRESS   | North Midwest | 1173    | 1253       | 1342       | 0           | 0         |
-| Conventional childr                                   | LIBRARY   | Mid Atlantic  | 940     | 952        | 950        | 0           | 0         |
-| Conventional childr                                   | LIBRARY   | NY Metro      | 944     | 958        | 951        | 0           | 0         |
-| Conventional childr                                   | LIBRARY   | North Midwest | 930     | 910        | 958        | 0           | 0         |
-| Conventional childr                                   | NEXT DAY  | Mid Atlantic  | 1231    | 1246       | 1335       | 0           | 0         |
-| Conventional childr                                   | NEXT DAY  | NY Metro      | 1239    | 1236       | 1268       | 0           | 0         |
-| Conventional childr                                   | NEXT DAY  | North Midwest | 1245    | 1268       | 1364       | 0           | 0         |
-| Conventional childr                                   | OVERNIGHT | Mid Atlantic  | 878     | 961        | 934        | 0           | 0         |
+| Bad cards must make.                                  | EXPRESS   | Mid Atlantic  | 1225    | 1210       | 1221       | 0           | 0         |
+| Bad cards must make.                                  | EXPRESS   | NY Metro      | 1213    | 1244       | 1297       | 0           | 0         |
+| Bad cards must make.                                  | EXPRESS   | North Midwest | 1243    | 1310       | 1248       | 0           | 0         |
+| Bad cards must make.                                  | LIBRARY   | Mid Atlantic  | 891     | 990        | 985        | 0           | 0         |
+| Bad cards must make.                                  | LIBRARY   | NY Metro      | 913     | 983        | 1038       | 0           | 0         |
+| Bad cards must make.                                  | LIBRARY   | North Midwest | 975     | 992        | 935        | 0           | 0         |
+| Bad cards must make.                                  | NEXT DAY  | Mid Atlantic  | 1248    | 1234       | 1300       | 0           | 0         |
+| Bad cards must make.                                  | NEXT DAY  | NY Metro      | 1252    | 1251       | 1315       | 0           | 0         |
+| Bad cards must make.                                  | NEXT DAY  | North Midwest | 1296    | 1287       | 1278       | 0           | 0         |
+| Bad cards must make.                                  | OVERNIGHT | Mid Atlantic  | 920     | 915        | 964        | 0           | 0         |
 +-------------------------------------------------------+-----------+---------------+---------+------------+------------+-------------+-----------+
