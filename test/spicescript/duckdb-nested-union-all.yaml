@@ -43,5 +43,7 @@ steps:
       SELECT id FROM u WHERE id <= 3
       UNION ALL SELECT id FROM (SELECT id FROM u WHERE id BETWEEN 4 AND 7 UNION ALL SELECT id FROM u WHERE id BETWEEN 8 AND 15) b
   - explain: SELECT id FROM u WHERE id <= 3 UNION ALL SELECT id FROM (SELECT id FROM u WHERE id BETWEEN 4 AND 7 UNION ALL SELECT id FROM u WHERE id BETWEEN 8 AND 15) b
-    contains: [UnionExec, VirtualExecutionPlan]
+    # The whole nested UNION ALL is sent to DuckDB, which is the SQL under test.
+    contains: VirtualExecutionPlan
+    omits: [UnionExec]
     only: duckdb
