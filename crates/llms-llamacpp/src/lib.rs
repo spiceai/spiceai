@@ -1415,10 +1415,10 @@ impl<'m> Target<'m> for Mtp<'m> {
         self.kind() == DraftKind::Mtp
     }
     fn head_state(&mut self) -> Option<Vec<u8>> {
-        self.state().ok().flatten()
+        self.state(0).ok().flatten()
     }
     fn restore_head_state(&mut self, state: &[u8]) -> bool {
-        self.restore_state(state).is_ok()
+        self.restore_state(0, state).is_ok()
     }
 }
 
@@ -2368,7 +2368,7 @@ fn generate_mtp(
     // target's reuses.
     let (mut history, mut batch) =
         read_prompt(model, spec, cache, (&prompt, &namespace), &out.stopping)?;
-    spec.begin(&history).map_err(|e| e.to_string())?;
+    spec.begin(0, &history).map_err(|e| e.to_string())?;
     let n_ctx = usize::try_from(spec.target().n_ctx()).unwrap_or(usize::MAX);
     let prompt_tokens = history.len();
     let mut n_past = i32::try_from(prompt_tokens).map_err(|e| e.to_string())?;
@@ -2383,7 +2383,7 @@ fn generate_mtp(
             break FinishReason::Length;
         }
         let mut draft = spec
-            .draft(n_past, id, &history)
+            .draft(0, n_past, id, &history)
             .map_err(|e| e.to_string())?;
         // `accept` is owed exactly when the head drafted something.
         let drafted = !draft.is_empty();
@@ -2436,7 +2436,7 @@ fn generate_mtp(
         };
         n_past += 1 + i32::try_from(accepted).map_err(|e| e.to_string())?;
         if drafted {
-            spec.accept(u16::try_from(accepted).unwrap_or(u16::MAX))
+            spec.accept(0, u16::try_from(accepted).unwrap_or(u16::MAX))
                 .map_err(|e| e.to_string())?;
         }
         // The rejected drafts leave both caches.

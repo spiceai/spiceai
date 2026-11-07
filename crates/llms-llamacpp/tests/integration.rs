@@ -39,6 +39,7 @@ mod load_errors;
 mod model;
 mod mtp;
 mod prefix_reuse;
+mod sequences;
 mod unsupported;
 
 use std::path::PathBuf;
