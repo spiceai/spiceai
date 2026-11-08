@@ -531,6 +531,27 @@ async fn a_redefined_dataset_never_serves_the_data_its_name_held_before() {
         .await;
 }
 
+/// Waits until no connection has `file` open. The connection a stopped runtime
+/// opened can still be closing, and its last checkpoint writes the file, so a
+/// change made to the file before then can be overwritten. `SQLite` deletes the
+/// file's write-ahead log and shared-memory file when its last connection
+/// closes.
+async fn sqlite_released(file: &Path) {
+    let open: Vec<PathBuf> = ["-wal", "-shm"]
+        .iter()
+        .map(|suffix| PathBuf::from(format!("{}{suffix}", file.display())))
+        .collect();
+    let until = tokio::time::Instant::now() + Duration::from_secs(30);
+    while let Some(still) = open.iter().find(|path| path.exists()) {
+        assert!(
+            tokio::time::Instant::now() < until,
+            "{} still exists 30 seconds after the runtime stopped",
+            still.display()
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+}
+
 /// A dataset whose earlier acceleration data cannot be deleted is not served,
 /// whoever declares its name, until a retry deletes that data: the Spicepod
 /// that declares the name once the instance restarts does not bring it back on
@@ -570,6 +591,7 @@ async fn a_withheld_dataset_stays_unserved_until_its_data_is_deleted() {
             // The file the definition kept its data in is no SQLite database
             // any more, so that data cannot be deleted, and the Spicepod now
             // declares s1 over the other source.
+            sqlite_released(&sqlite_file).await;
             std::fs::write(&sqlite_file, b"not a SQLite database")
                 .expect("overwrite the SQLite file");
             let app = AppBuilder::new("sql_ddl")
