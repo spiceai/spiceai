@@ -7926,6 +7926,7 @@ dependencies = [
  "flate2",
  "liteparse",
  "liteparse-pdfium-sys",
+ "memchr",
  "quick-xml 0.38.4",
  "sha2 0.10.9",
  "snafu",
