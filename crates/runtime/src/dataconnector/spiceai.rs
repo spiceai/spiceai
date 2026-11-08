@@ -16,6 +16,7 @@ limitations under the License.
 
 use crate::dataconnector::ConnectorContext;
 use app::App;
+use app::spicepod::component::runtime::RuntimeMode;
 use std::any::Any;
 use std::borrow::Borrow;
 use std::future::Future;
@@ -459,9 +460,9 @@ impl DataConnectorFactory for SpiceAIFactory {
                 "spice.ai",
                 flight_client,
                 Arc::new(SpiceCloudPlatformDialect {}),
-            );
-            let spiceai = SpiceAI { flight_factory };
-            Ok(Arc::new(spiceai) as Arc<dyn DataConnector>)
+            )
+            .with_substrait(context.runtime_mode() == RuntimeMode::Sidecar);
+            Ok(Arc::new(SpiceAI { flight_factory }) as Arc<dyn DataConnector>)
         })
     }
 

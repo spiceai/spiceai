@@ -272,7 +272,7 @@ fn expand(input: &DeriveInput) -> syn::Result<proc_macro2::TokenStream> {
         quote! {
             async fn try_from_params<__R: ::runtime_parameters_typed::SecretAutoload>(
                 component_name: &str,
-                #params_binding: ::runtime_parameters_typed::__private::HashMap<
+                params: ::runtime_parameters_typed::__private::HashMap<
                     ::std::string::String,
                     ::runtime_parameters_typed::__private::SecretString,
                 >,
@@ -280,6 +280,31 @@ fn expand(input: &DeriveInput) -> syn::Result<proc_macro2::TokenStream> {
                     ::runtime_parameters_typed::__private::RwLock<__R>,
                 >,
             ) -> ::std::result::Result<Self, ::runtime_parameters_typed::ParamsError> {
+                let __empty_sources = ::runtime_parameters_typed::__private::HashMap::new();
+                Self::try_from_params_with_secret_sources(
+                    component_name,
+                    params,
+                    secrets,
+                    &__empty_sources,
+                )
+                .await
+            }
+
+            async fn try_from_params_with_secret_sources<__R: ::runtime_parameters_typed::SecretAutoload>(
+                component_name: &str,
+                #params_binding: ::runtime_parameters_typed::__private::HashMap<
+                    ::std::string::String,
+                    ::runtime_parameters_typed::__private::SecretString,
+                >,
+                secrets: &::runtime_parameters_typed::__private::Arc<
+                    ::runtime_parameters_typed::__private::RwLock<__R>,
+                >,
+                secret_sources: &::runtime_parameters_typed::__private::HashMap<
+                    ::std::string::String,
+                    ::std::string::String,
+                >,
+            ) -> ::std::result::Result<Self, ::runtime_parameters_typed::ParamsError> {
+                let _ = secret_sources;
                 #(#field_stmts)*
                 #leftover
                 ::std::result::Result::Ok(Self { #(#field_idents),* })
@@ -287,7 +312,27 @@ fn expand(input: &DeriveInput) -> syn::Result<proc_macro2::TokenStream> {
         }
     } else {
         quote! {
-            fn try_from_params<__R: ::runtime_parameters_typed::SecretAutoload>(
+            async fn try_from_params<__R: ::runtime_parameters_typed::SecretAutoload>(
+                component_name: &str,
+                params: ::runtime_parameters_typed::__private::HashMap<
+                    ::std::string::String,
+                    ::runtime_parameters_typed::__private::SecretString,
+                >,
+                secrets: &::runtime_parameters_typed::__private::Arc<
+                    ::runtime_parameters_typed::__private::RwLock<__R>,
+                >,
+            ) -> ::std::result::Result<Self, ::runtime_parameters_typed::ParamsError> {
+                let __empty_sources = ::runtime_parameters_typed::__private::HashMap::new();
+                Self::try_from_params_with_secret_sources(
+                    component_name,
+                    params,
+                    secrets,
+                    &__empty_sources,
+                )
+                .await
+            }
+
+            fn try_from_params_with_secret_sources<__R: ::runtime_parameters_typed::SecretAutoload>(
                 component_name: &str,
                 #params_binding: ::runtime_parameters_typed::__private::HashMap<
                     ::std::string::String,
@@ -296,10 +341,16 @@ fn expand(input: &DeriveInput) -> syn::Result<proc_macro2::TokenStream> {
                 _secrets: &::runtime_parameters_typed::__private::Arc<
                     ::runtime_parameters_typed::__private::RwLock<__R>,
                 >,
+                secret_sources: &::runtime_parameters_typed::__private::HashMap<
+                    ::std::string::String,
+                    ::std::string::String,
+                >,
             ) -> impl ::std::future::Future<
                 Output = ::std::result::Result<Self, ::runtime_parameters_typed::ParamsError>,
             > + ::std::marker::Send {
+                let secret_sources = secret_sources.clone();
                 ::std::future::ready((|| {
+                    let _ = &secret_sources;
                     #(#field_stmts)*
                     #leftover
                     ::std::result::Result::Ok(Self { #(#field_idents),* })
@@ -435,15 +486,32 @@ fn expand_field(
     }
 
     // Typing: `SecretString` passes through unexposed; everything else parses.
+    // Provenance is looked up on the user-facing key and then aliases so a
+    // spicepod that writes the alias still masks partial interpolations.
+    let secret_source = quote! {
+        ::runtime_parameters_typed::secret_source_for_keys(
+            &secret_sources,
+            &[#user_key, #(#alias_keys),*],
+        )
+    };
     let parse_value = if is_secret_string {
         quote! { __v }
     } else if let Some(parse_with) = &spec.parse_with {
         quote! {
-            ::runtime_parameters_typed::parse_param_with(#user_key, &__v, #parse_with)?
+            ::runtime_parameters_typed::parse_param_with(
+                #user_key,
+                &__v,
+                #parse_with,
+                #secret_source,
+            )?
         }
     } else {
         quote! {
-            ::runtime_parameters_typed::parse_param::<#inner_ty>(#user_key, &__v)?
+            ::runtime_parameters_typed::parse_param::<#inner_ty>(
+                #user_key,
+                &__v,
+                #secret_source,
+            )?
         }
     };
 
@@ -898,7 +966,10 @@ mod tests {
         };
         let out = expand_str(&input).expect("valid struct should expand");
         assert!(out.contains("future :: ready"), "expansion: {out}");
-        assert!(!out.contains("async fn"), "expansion: {out}");
+        assert!(
+            !out.contains("async fn try_from_params_with_secret_sources"),
+            "the provenance method must stay a ready future: {out}"
+        );
     }
 
     #[test]

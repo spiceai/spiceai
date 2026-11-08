@@ -29,11 +29,14 @@ limitations under the License.
 //! family, so the surface needs only two runtimes between them.
 
 #![recursion_limit = "256"]
+#![expect(
+    clippy::expect_used,
+    reason = "set-up and helpers outside `#[test]` functions fail fast with `expect`"
+)]
 
 // Accelerator engines are their own crates and self-register through a linkme slice. Each
 // integration test is a separate binary that links independently, and the linker drops an
 // unreferenced slice static, so a binary exercising Cayenne must name the crate itself.
-#[cfg(not(windows))]
 use accelerator_cayenne as _;
 
 // Accelerator engines are their own crates and self-register through a linkme slice. A
@@ -47,8 +50,6 @@ use accelerator_duckdb as _;
 use accelerator_postgres as _;
 #[cfg(feature = "sqlite")]
 use accelerator_sqlite as _;
-#[cfg(feature = "turso")]
-use accelerator_turso as _;
 
 use std::{
     collections::{HashMap, HashSet},
@@ -70,6 +71,7 @@ use futures::{StreamExt, TryStreamExt};
 use opentelemetry::global;
 use opentelemetry_sdk::{Resource, metrics::SdkMeterProvider};
 use runtime::{Runtime, auth::EndpointAuth, config::Config, datafusion::query::QueryBuilder};
+use runtime_auth::{HttpAuth, api_key::ApiKeyAuth};
 use spicepod::param::Params;
 use spicepod::{
     acceleration::{Acceleration, Mode, RefreshMode},
@@ -352,11 +354,6 @@ fn csv_backed_dataset(dir: &std::path::Path, name: &str) -> Dataset {
 /// The footprint sample runs on that tick, so the interval has to be short; its
 /// own 30-second floor does not suppress the FIRST sample, which is the one this
 /// test reads.
-///
-/// Not built on Windows: the engine crate is a `cfg(not(windows))`
-/// dev-dependency, so the `cayenne` accelerator is unregistered there and a
-/// dataset naming it could never load.
-#[cfg(not(windows))]
 fn cayenne_backed_dataset(dir: &std::path::Path, name: &str) -> Dataset {
     let csv = fixture_csv(dir, name);
     write_fixture_csv(&csv, FIXTURE_EPOCH_SECONDS);
@@ -397,7 +394,6 @@ fn cayenne_backed_dataset(dir: &std::path::Path, name: &str) -> Dataset {
 /// families; the ones that need a specific event are in
 /// [`EVENT_GATED_CAYENNE_MAINTENANCE_METRICS`], and the test asserts they are
 /// *absent* so neither list can silently go stale.
-#[cfg(not(windows))]
 const EXPECTED_CAYENNE_MAINTENANCE_METRICS: &[&str] = &[
     "cayenne_compaction_outcome_total",
     "cayenne_maintenance_outcome_total",
@@ -448,7 +444,6 @@ const EXPECTED_CAYENNE_MAINTENANCE_METRICS: &[&str] = &[
 /// Kept as a list rather than a comment because the test asserts they are absent:
 /// if one starts arriving without a workload it has become always-sampled, and
 /// leaving it here would mean nothing ever checks that its call site survives.
-#[cfg(not(windows))]
 const EVENT_GATED_CAYENNE_MAINTENANCE_METRICS: &[&str] = &[
     // Recorded when a threshold actually fires. This fixture holds one inline
     // file, so every pass declines before any trigger is evaluated.
@@ -721,7 +716,6 @@ async fn an_accelerated_dataset_reports_the_query_and_refresh_families() {
 /// The dataset sets a 250 ms compaction interval because the footprint sample
 /// rides that tick. Its own 30-second floor does not suppress the first sample,
 /// which is the one read here.
-#[cfg(not(windows))]
 #[tokio::test]
 async fn a_cayenne_dataset_reports_its_maintenance_and_footprint_families() {
     let registry = &*PROMETHEUS;
@@ -819,7 +813,6 @@ async fn a_cayenne_dataset_reports_its_maintenance_and_footprint_families() {
 /// The table label is part of the key because the registry is shared across the
 /// tests in this file, so a sibling fixture's series must not satisfy an
 /// assertion about this one.
-#[cfg(not(windows))]
 fn compaction_outcomes(registry: &prometheus::Registry) -> HashMap<(String, String, String), f64> {
     registry
         .gather()
@@ -907,20 +900,21 @@ async fn a_mid_stream_pool_refusal_is_counted_as_resources_exhausted() {
     );
 }
 
-/// Whether a series was recorded for a request whose user agent carries `token`.
+/// Whether a series was recorded for a request with user agent `token`.
 ///
-/// Each test that counts a delta on this binary's shared registry sends its own
-/// user agent and reads only its own series, so a sibling running in the same
-/// process cannot move its count.
+/// Each test that counts a delta on this binary's shared registry sends a user
+/// agent of a different known Spice client and reads only that `client` label's
+/// series, so a sibling running in the same process cannot move its count.
 fn sent_by(metric: &prometheus::proto::Metric, token: &str) -> bool {
+    let client = token.split('/').next().unwrap_or(token);
     metric
         .get_label()
         .iter()
-        .any(|label| label.name() == "user_agent" && label.value().contains(token))
+        .any(|label| label.name() == "client" && label.value() == client)
 }
 
 /// The user agent `each_flight_rpc_records_exactly_one_request` sends.
-const FLIGHT_RPC_COUNT_USER_AGENT: &str = "flight-rpc-count-test/1.0";
+const FLIGHT_RPC_COUNT_USER_AGENT: &str = "spice-rs/1.0";
 
 /// Every `flight_requests` increment the client with user agent `token` caused,
 /// summed across label sets.
@@ -964,6 +958,14 @@ async fn start_flight_server() -> Result<Channel, anyhow::Error> {
 /// Starts a runtime with no datasets and returns its HTTP port and a channel to
 /// its Flight server that sends `user_agent`.
 async fn start_servers(user_agent: &str) -> Result<(u16, Channel), anyhow::Error> {
+    start_servers_with_auth(user_agent, EndpointAuth::default()).await
+}
+
+/// [`start_servers`], with the HTTP and Flight endpoints guarded by `auth`.
+async fn start_servers_with_auth(
+    user_agent: &str,
+    auth: EndpointAuth,
+) -> Result<(u16, Channel), anyhow::Error> {
     // Both listeners are bound before either is dropped, so the two ports are
     // guaranteed to differ — freeing the first before binding the second would let
     // the OS hand back the same ephemeral port.
@@ -982,9 +984,7 @@ async fn start_servers(user_agent: &str) -> Result<(u16, Channel), anyhow::Error
         .with_http_bind_address(SocketAddr::new(LOCALHOST, http_port))
         .with_flight_bind_address(SocketAddr::new(LOCALHOST, flight_port));
 
-    tokio::spawn(async move {
-        Box::pin(rt.start_servers(api_config, None, EndpointAuth::default())).await
-    });
+    tokio::spawn(async move { Box::pin(rt.start_servers(api_config, None, auth)).await });
 
     // Poll for the bind rather than sleeping: the server binds asynchronously and a
     // connection refused before it does is not a failure.
@@ -1634,7 +1634,6 @@ async fn a_cache_hit_is_recorded_when_the_stream_is_consumed() {
 /// `rows_written` counts every row received. A dataset with a primary key
 /// publishes `arrival` at zero at load, before its first repeated key; one
 /// without a primary key publishes no series.
-#[cfg(not(windows))]
 #[tokio::test(flavor = "multi_thread")]
 async fn a_cayenne_refresh_reports_the_rows_it_supersedes_by_reason() {
     let registry = &*PROMETHEUS;
@@ -1713,7 +1712,6 @@ async fn a_cayenne_refresh_reports_the_rows_it_supersedes_by_reason() {
 
 /// A user's statement reports the rows it received but did not keep: an `INSERT`
 /// repeating a key counts the copy that arrived first as `arrival`.
-#[cfg(not(windows))]
 #[tokio::test(flavor = "multi_thread")]
 async fn a_cayenne_statement_reports_the_rows_it_supersedes() {
     use runtime_request_context::{Protocol, RequestContext};
@@ -1844,9 +1842,9 @@ const SERVER_TIMING_ROUNDING_MS: f64 = 0.0005 + 1e-9;
 /// siblings on this binary's shared registry cannot move the counts.
 #[tokio::test]
 async fn server_timing_reports_the_recorded_duration_samples() -> Result<(), anyhow::Error> {
-    const BUFFERED: &str = "server-timing-buffered/1.0";
-    const STREAMED: &str = "server-timing-streamed/1.0";
-    const FLIGHT: &str = "server-timing-flight/1.0";
+    const BUFFERED: &str = "spicepy/1.0";
+    const STREAMED: &str = "gospice/1.0";
+    const FLIGHT: &str = "spice-java/1.0";
 
     let registry = &*PROMETHEUS;
     let (http_port, channel) = start_servers(FLIGHT).await?;
@@ -1856,7 +1854,7 @@ async fn server_timing_reports_the_recorded_duration_samples() -> Result<(), any
     let response = reqwest::Client::new()
         .post(format!("http://127.0.0.1:{http_port}/v1/sql"))
         .header("user-agent", BUFFERED)
-        .header("accept", "text/csv")
+        .header("accept", "text/plain")
         .body(sql)
         .send()
         .await?;
@@ -1964,6 +1962,217 @@ async fn server_timing_reports_the_recorded_duration_samples() -> Result<(), any
     assert!(
         reported > do_get,
         "the trailer must include the GetFlightInfo time, not only DoGet's {do_get} ms"
+    );
+
+    Ok(())
+}
+
+/// Requests that differ only in their `User-Agent` and `baggage` headers share
+/// one series: header values a caller chooses never become metric labels, so
+/// the series count cannot grow with them.
+#[tokio::test]
+async fn request_header_values_do_not_add_metric_series() -> Result<(), anyhow::Error> {
+    const REQUESTS: u32 = 20;
+
+    let registry = &*PROMETHEUS;
+    let (http_port, _channel) = start_servers("spice-dotnet/1.0").await?;
+    let client = reqwest::Client::new();
+    for i in 0..REQUESTS {
+        client
+            .get(format!("http://127.0.0.1:{http_port}/health"))
+            .header("user-agent", format!("probe-{i}/{i} (system-{i})"))
+            .header("baggage", format!("request-{i}={i}"))
+            .send()
+            .await?
+            .error_for_status()?;
+    }
+
+    let series: Vec<_> = registry
+        .gather()
+        .iter()
+        .filter(|family| family.name() == "http_requests")
+        .flat_map(prometheus::proto::MetricFamily::get_metric)
+        .filter(|metric| {
+            metric
+                .get_label()
+                .iter()
+                .any(|label| label.name() == "path" && label.value() == "/health")
+        })
+        .cloned()
+        .collect();
+    assert_eq!(
+        series.len(),
+        1,
+        "{REQUESTS} requests with distinct header values must share one series, got {series:?}"
+    );
+    let labels: HashMap<&str, &str> = series[0]
+        .get_label()
+        .iter()
+        .map(|label| (label.name(), label.value()))
+        .collect();
+    assert_eq!(labels.get("client"), Some(&"other"));
+    assert!(
+        (series[0].get_counter().value() - f64::from(REQUESTS)).abs() < f64::EPSILON,
+        "every request must still be counted"
+    );
+
+    Ok(())
+}
+
+/// The API key [`unauthenticated_requests_carry_no_client_dimension`] accepts.
+const METRICS_401_API_KEY: &str = "metrics-401-key";
+
+/// The labels of every `http_requests` series recorded for `path`, keyed by `status`.
+fn http_requests_series_for(
+    registry: &prometheus::Registry,
+    path: &str,
+) -> Vec<(HashMap<String, String>, f64)> {
+    registry
+        .gather()
+        .iter()
+        .filter(|family| family.name() == "http_requests")
+        .flat_map(prometheus::proto::MetricFamily::get_metric)
+        .filter(|metric| {
+            metric
+                .get_label()
+                .iter()
+                .any(|label| label.name() == "path" && label.value() == path)
+        })
+        .map(|metric| {
+            let labels = metric
+                .get_label()
+                .iter()
+                .map(|label| (label.name().to_string(), label.value().to_string()))
+                .collect();
+            (labels, metric.get_counter().value())
+        })
+        .collect()
+}
+
+/// A request that fails authentication is recorded with only the labels the
+/// runtime defines: no `client` (or `runtime*`) dimension derived from headers
+/// the caller chose before proving who it is.
+///
+/// Sends 5,000 requests to an authenticated route, each with a unique
+/// `User-Agent` and `baggage`, half without an API key. The `401`s must share one
+/// series with no `client` label, the authenticated half one series, no series
+/// may overflow the SDK's cardinality limit, and a later authenticated request
+/// must still be recorded under its own `path` and `status`.
+#[tokio::test]
+async fn unauthenticated_requests_carry_no_client_dimension() -> Result<(), anyhow::Error> {
+    const REQUESTS: u32 = 5_000;
+    const CONCURRENCY: usize = 64;
+    // Only this test hits this route, so its series are this test's alone.
+    const PATH: &str = "/v1/datasets";
+
+    let registry = &*PROMETHEUS;
+    let api_key_auth = Arc::new(ApiKeyAuth::new(vec![
+        spicepod::component::runtime::ApiKey::parse_str(METRICS_401_API_KEY),
+    ])) as Arc<dyn HttpAuth + Send + Sync>;
+    let (http_port, _channel) = start_servers_with_auth(
+        "spice-dotnet/1.0",
+        EndpointAuth::default().with_http_auth(api_key_auth),
+    )
+    .await?;
+    let client = reqwest::Client::new();
+    let url = format!("http://127.0.0.1:{http_port}{PATH}");
+
+    let statuses: Vec<u16> = futures::stream::iter(0..REQUESTS)
+        .map(|i| {
+            let mut request = client
+                .get(&url)
+                .header("user-agent", format!("probe-{i}/{i} (system-{i})"))
+                .header("baggage", format!("request-{i}={i}"));
+            if i % 2 == 1 {
+                request = request.header("X-API-Key", METRICS_401_API_KEY);
+            }
+            async move {
+                request
+                    .send()
+                    .await
+                    .map(|response| response.status().as_u16())
+            }
+        })
+        .buffer_unordered(CONCURRENCY)
+        .try_collect()
+        .await?;
+    let unauthenticated = REQUESTS / 2;
+    assert_eq!(
+        statuses.iter().filter(|&&status| status == 401).count(),
+        usize::try_from(unauthenticated)?,
+        "every request without the API key must be rejected"
+    );
+
+    let series = http_requests_series_for(registry, PATH);
+    let rejected: Vec<_> = series
+        .iter()
+        .filter(|(labels, _)| labels.get("status").map(String::as_str) == Some("401"))
+        .collect();
+    assert_eq!(
+        rejected.len(),
+        1,
+        "{unauthenticated} rejected requests with unique headers must share one series, got {rejected:?}"
+    );
+    let (labels, count) = rejected[0];
+    for header_derived in ["client", "runtime", "runtime_version", "runtime_system"] {
+        assert!(
+            !labels.contains_key(header_derived),
+            "a 401 must not carry the `{header_derived}` label: {labels:?}"
+        );
+    }
+    assert!(
+        (count - f64::from(unauthenticated)).abs() < f64::EPSILON,
+        "every rejected request must still be counted, got {count}"
+    );
+
+    let accepted: Vec<_> = series
+        .iter()
+        .filter(|(labels, _)| labels.get("status").map(String::as_str) != Some("401"))
+        .collect();
+    assert_eq!(
+        accepted.len(),
+        1,
+        "authenticated requests with unique headers must share one series, got {accepted:?}"
+    );
+    assert_eq!(
+        accepted[0].0.get("client").map(String::as_str),
+        Some("other")
+    );
+
+    let overflowed: Vec<_> = registry
+        .gather()
+        .iter()
+        .filter(|family| family.name().starts_with("http_"))
+        .flat_map(prometheus::proto::MetricFamily::get_metric)
+        .filter(|metric| {
+            metric
+                .get_label()
+                .iter()
+                .any(|label| label.name() == "otel_metric_overflow")
+        })
+        .cloned()
+        .collect();
+    assert!(
+        overflowed.is_empty(),
+        "no http_* series may overflow the cardinality limit: {overflowed:?}"
+    );
+
+    let before = accepted[0].1;
+    client
+        .get(&url)
+        .header("user-agent", "spice-dotnet/1.0")
+        .header("X-API-Key", METRICS_401_API_KEY)
+        .send()
+        .await?
+        .error_for_status()?;
+    let after: f64 = http_requests_series_for(registry, PATH)
+        .iter()
+        .filter(|(labels, _)| labels.get("status").map(String::as_str) != Some("401"))
+        .map(|(_, count)| count)
+        .sum();
+    assert!(
+        (after - before - 1.0).abs() < f64::EPSILON,
+        "a later authenticated request must be recorded under path {PATH}"
     );
 
     Ok(())
@@ -2146,7 +2355,7 @@ async fn model_request_durations_are_recorded_in_milliseconds() {
 /// Built only with `snapshots`: without it every snapshot behavior resolves to
 /// `Disabled` and nothing is created. Cayenne is the engine because its crate needs
 /// no feature, so the gate's build runs these.
-#[cfg(all(feature = "snapshots", not(windows)))]
+#[cfg(feature = "snapshots")]
 mod snapshot_metrics {
     use std::{
         path::{Path, PathBuf},

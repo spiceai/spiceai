@@ -100,6 +100,7 @@ impl Iceberg {
             ports: vec![9000],
             healthcheck: Some(healthcheck("curl -fs http://127.0.0.1:9000/health")),
             network: Some(network.clone()),
+            alias: None,
         })
         .await?;
         create_bucket(&format!("http://127.0.0.1:{}", store.host_port(9000)?)).await?;
@@ -125,6 +126,7 @@ impl Iceberg {
             ports: vec![8181],
             healthcheck: None,
             network: Some(network),
+            alias: None,
         })
         .await?;
         let this = Self {
@@ -187,6 +189,10 @@ impl Iceberg {
 impl Source for Iceberg {
     fn container(&self) -> Option<&Container> {
         Some(&self.catalog)
+    }
+
+    fn containers(&self) -> Vec<&Container> {
+        vec![&self.catalog, &self.store]
     }
 
     async fn remove(&self) -> Result<()> {

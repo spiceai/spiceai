@@ -1,0 +1,5 @@
+---
+source: crates/runtime/src/component/mod.rs
+expression: warning
+---
+Acceleration engines other than `cayenne` are deprecated and will be removed in v2.5, so these accelerations must move to `cayenne` before upgrading: `duckdb` (dataset 'orders', view 'daily_totals'), `postgres` (dataset 'ledger'), `sqlite` (dataset 'customers'). Set `acceleration.engine: cayenne`, or remove `engine` to use the default, which is `cayenne`, then delete the old engine's acceleration files and snapshots. See: https://spiceai.org/docs/components/data-accelerators/cayenne/migration

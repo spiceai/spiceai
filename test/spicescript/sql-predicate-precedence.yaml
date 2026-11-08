@@ -1,0 +1,46 @@
+name: sql-predicate-precedence
+description: >
+  Nested NOT and IS predicates preserve their operands when sent to a SQL
+  source. PostgreSQL, MySQL and ClickHouse return the same identifiers as
+  PostgreSQL over the same nullable strings, integers and timestamps.
+
+sources:
+  backend: { kind: '${matrix.backend}' }
+  ref: { kind: postgres }
+
+matrix:
+  backend: [postgres, mysql, clickhouse]
+
+spicepod:
+  version: v1
+  kind: Spicepod
+  name: sql-predicate-precedence
+  datasets:
+    - from: '${matrix.backend}:e'
+      name: e
+      params: ${sources.backend.params}
+
+defaults:
+  expect: { oracle: ref }
+
+steps:
+  - generate:
+      backend:
+        table: e
+        rows: 20
+        seed: 31
+        columns:
+          - { name: id, sequence: 1 }
+          - { name: i, int: [-5, 5], nulls: 0.3 }
+          - { name: s, choice: [a, b, ''], nulls: 0.3 }
+          - { name: ts, timestamp: ['2024-01-01', '2024-12-31'], nulls: 0.3 }
+    mirror: ref
+  - start: {}
+  - query: SELECT id FROM e WHERE NOT ((ts IS NOT NULL) IS NULL) ORDER BY id
+  - query: SELECT id FROM e WHERE NOT ((i IS NULL) IS NULL) ORDER BY id
+  - query: SELECT id FROM e WHERE NOT ((s IS NULL) IS NULL) ORDER BY id
+  - query: SELECT id FROM e WHERE (NOT (i IS NULL)) IS NULL ORDER BY id
+    expect-empty: true
+  - query: SELECT id FROM e WHERE (NOT (s IS NULL)) IS NOT NULL ORDER BY id
+  - explain: SELECT id FROM e WHERE NOT ((s IS NULL) IS NULL)
+    contains: [VirtualExecutionPlan, 'WHERE NOT ((']

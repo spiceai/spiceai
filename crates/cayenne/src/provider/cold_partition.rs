@@ -51,7 +51,7 @@ use arrow_schema::Schema;
 use datafusion_common::ScalarValue;
 use datafusion_common::stats::Precision;
 
-use super::pk_index::PkBloom;
+use super::pk_index::{PkBloom, PkByteRange};
 use crate::metadata::ColdTierFile;
 use crate::row_converter::{Row, RowConverter};
 use crate::stats::statistics_from_persisted_blob;
@@ -315,6 +315,39 @@ fn pk_bounds_from_manifest(
         bounds.push((min.clone(), max.clone()));
     }
     Some(bounds)
+}
+
+/// A cold file's single-column integer PK range in the row-converter byte
+/// encoding (see [`PkByteRange`]). `None` when the file has no usable
+/// statistics, the key is composite or not an integer, or a bound cannot be
+/// encoded, so the caller treats the file as always a candidate.
+pub(crate) fn pk_byte_range_from_manifest(
+    file: &ColdTierFile,
+    schema: &Arc<Schema>,
+    pk_indices: &[usize],
+    converter: &RowConverter,
+) -> Option<PkByteRange> {
+    let [idx] = pk_indices else {
+        return None;
+    };
+    if !schema.field(*idx).data_type().is_integer() {
+        return None;
+    }
+    let bounds = pk_bounds_from_manifest(file, schema, pk_indices)?;
+    let (min, max) = bounds.first()?;
+    if min.data_type() != *schema.field(*idx).data_type()
+        || max.data_type() != *schema.field(*idx).data_type()
+        || min.partial_cmp(max)?.is_gt()
+    {
+        return None;
+    }
+    let columns: Vec<ArrayRef> = vec![min.to_array().ok()?, max.to_array().ok()?];
+    let merged = arrow::compute::concat(&[columns[0].as_ref(), columns[1].as_ref()]).ok()?;
+    let rows = converter.convert_columns(&[merged]).ok()?;
+    Some(PkByteRange {
+        min: rows.row(0).data().to_vec().into_boxed_slice(),
+        max: rows.row(1).data().to_vec().into_boxed_slice(),
+    })
 }
 
 /// Whether a key tuple falls inside every per-column bound (point-in-

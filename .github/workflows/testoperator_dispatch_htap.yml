@@ -4,13 +4,9 @@ on:
   schedule:
     # htap-sf1000-adaptive, every 8 hours (0000, 0800, 1600) — the high-value SF1000 adaptive
     # configs (mysql + postgres, which also run the Cayenne datalake tier) for frequent adaptive
-    # trend data (spiceai-dev-xlarge-runners). With the daily batch below that is 8 runs/day on
-    # the serialized SF1000 xlarge queue at a 30-minute HTAP window, leaving slack for slow arms.
+    # trend data (spiceai-dev-xlarge-runners). That is 6 runs/day on the serialized SF1000
+    # xlarge queue at a 30-minute HTAP window, leaving slack for slow arms.
     - cron: '0 */8 * * *'
-    # htap-sf1000 (the turso-metastore adaptive configs), once daily (0400) on the xlarge pool.
-    # 0400 sits after the 0000 adaptive batch so it usually starts on an idle slot rather than
-    # queueing immediately.
-    - cron: '0 4 * * *'
     # htap-sf1, twice daily (0600, 1800) — HTAP CH-benCHmark SF1 (spiceai-dev-large-runners).
     # SF1 uses a different runner pool and a unique concurrency group, so it does not serialize
     # with the SF1000 xlarge queue.
@@ -37,15 +33,19 @@ on:
           - 'sf1'
           - 'sf10'
           - 'sf100'
-          - 'sf1000'
           - 'sf1000-adaptive'
           - 'sf1-source-versions'
           - 'sf1-layouts'
 
 jobs:
   dispatch-htap:
+    environment: ci
     name: Dispatch HTAP - ${{ github.event.inputs.scale_factor || github.event.schedule }}
     runs-on: spiceai-dev-runners
+    permissions:
+      contents: read
+      actions: write  # dispatches the HTAP workflow
+      id-token: write  # RustFS credentials
     # The dispatcher only fires the workflow_dispatch events (spaced ~80s apart) and exits; the runs
     # themselves serialize via the htap workflow's queue: max concurrency group, not here. So this
     # only needs to cover the build + dispatch loop (≤~10 min for the largest batch), not the sum of
@@ -61,12 +61,21 @@ jobs:
         with:
           persist-credentials: false
 
+      - name: Get RustFS credentials
+        id: rustfs
+        uses: ./.github/actions/rustfs-credentials
+        with:
+          endpoint: ${{ vars.TEST_MINIO_ENDPOINT }}
+          duration-seconds: '7200'
+          export-env: 'false'
+
       - name: Install MinIO
         uses: ./.github/actions/setup-minio
         with:
-          minio_endpoint: ${{ secrets.TEST_MINIO_ENDPOINT }}
-          minio_access_key: ${{ secrets.TEST_MINIO_ACCESS_KEY }}
-          minio_secret_key: ${{ secrets.TEST_MINIO_SECRET_KEY }}
+          minio_endpoint: ${{ vars.TEST_MINIO_ENDPOINT }}
+          minio_access_key: ${{ steps.rustfs.outputs.access-key-id }}
+          minio_secret_key: ${{ steps.rustfs.outputs.secret-access-key }}
+          minio_session_token: ${{ steps.rustfs.outputs.session-token }}
 
       - name: Setup spiced
         uses: ./.github/actions/setup-spiced
@@ -82,17 +91,19 @@ jobs:
       - name: Build Testoperator
         uses: ./.github/actions/build-testoperator
         with:
-          minio_endpoint: ${{ secrets.TEST_MINIO_ENDPOINT }}
-          minio_access_key: ${{ secrets.TEST_MINIO_ACCESS_KEY }}
-          minio_secret_key: ${{ secrets.TEST_MINIO_SECRET_KEY }}
+          minio_endpoint: ${{ vars.TEST_MINIO_ENDPOINT }}
+          minio_access_key: ${{ steps.rustfs.outputs.access-key-id }}
+          minio_secret_key: ${{ steps.rustfs.outputs.secret-access-key }}
+          minio_session_token: ${{ steps.rustfs.outputs.session-token }}
 
       - name: Build spicepod validator
         id: build-spicepod-validator
         uses: ./.github/actions/build-spicepod-validator
         with:
-          minio_endpoint: ${{ secrets.TEST_MINIO_ENDPOINT }}
-          minio_access_key: ${{ secrets.TEST_MINIO_ACCESS_KEY }}
-          minio_secret_key: ${{ secrets.TEST_MINIO_SECRET_KEY }}
+          minio_endpoint: ${{ vars.TEST_MINIO_ENDPOINT }}
+          minio_access_key: ${{ steps.rustfs.outputs.access-key-id }}
+          minio_secret_key: ${{ steps.rustfs.outputs.secret-access-key }}
+          minio_session_token: ${{ steps.rustfs.outputs.session-token }}
 
       - name: Set spicepod validator path
         run: echo "SPICEPOD_VALIDATOR=${{ steps.build-spicepod-validator.outputs.validator-path }}" >> $GITHUB_ENV
@@ -116,7 +127,6 @@ jobs:
           if [ -z "$SF" ]; then
             case "${{ github.event.schedule }}" in
               '0 */8 * * *')                  SF=sf1000-adaptive ;;
-              '0 4 * * *')                    SF=sf1000 ;;
               '0 6,18 * * *')                 SF=sf1 ;;
               '0 2 * * 0')                    SF=sf1-source-versions ;;
               '0 3 * * 0')                    SF=sf1-layouts ;;

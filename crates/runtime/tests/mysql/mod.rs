@@ -26,14 +26,15 @@ use util::{RetryError, fibonacci_backoff::FibonacciBackoffBuilder, retry};
 use crate::init_tracing;
 use crate::utils::{register_test_connectors, runtime_ready_check, test_request_context};
 
-#[cfg(feature = "duckdb")]
 mod comments;
 pub mod common;
 mod federation;
+mod pool;
 pub mod replication;
-#[cfg(feature = "duckdb")]
 pub mod replication_e2e;
 pub mod replication_shared;
+pub mod replication_type_change;
+mod retype_domain;
 mod schema_inference;
 
 use super::*;
@@ -294,10 +295,7 @@ async fn mysql_integration_test() -> Result<(), String> {
                 .await?;
             }
 
-            running_container.remove().await.map_err(|e| {
-                tracing::error!("running_container.remove: {e}");
-                e.to_string()
-            })?;
+            running_container.cleanup().await;
 
             Ok(())
         })
@@ -385,10 +383,7 @@ async fn mysql_character_set_results_test() -> Result<(), String> {
                 .await?;
             }
 
-            running_container.remove().await.map_err(|e| {
-                tracing::error!("running_container.remove: {e}");
-                e.to_string()
-            })?;
+            running_container.cleanup().await;
 
             Ok(())
         })
@@ -480,10 +475,7 @@ async fn mysql_timezone_test() -> Result<(), String> {
             )
             .await?;
 
-            running_container.remove().await.map_err(|e| {
-                tracing::error!("running_container.remove: {e}");
-                e.to_string()
-            })?;
+            running_container.cleanup().await;
 
             Ok(())
         })
@@ -800,10 +792,7 @@ async fn mysql_zero_date_test() -> Result<(), String> {
             )
             .await?;
 
-            running_container.remove().await.map_err(|e| {
-                tracing::error!("running_container.remove: {e}");
-                e.to_string()
-            })?;
+            running_container.cleanup().await;
 
             Ok(())
         })

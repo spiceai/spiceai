@@ -41,6 +41,12 @@ impl From<Error> for crate::Error {
             }
             Error::NeedToSpecifySQLView { name } => crate::Error::NeedToSpecifySQLView { name },
             Error::InvalidAccelerationConfiguration { source } => source.into(),
+            Error::VectorEngineRemoved { view_name } => {
+                crate::Error::ViewVectorEngineRemoved { view_name }
+            }
+            Error::AccelerationEngineRemoved { view_name, engine } => {
+                crate::Error::AcceleratedViewEngineRemoved { view_name, engine }
+            }
             Error::AcceleratedViewInvalidConfiguration { view_name, reason } => {
                 crate::Error::AcceleratedViewInvalidConfiguration { view_name, reason }
             }
@@ -116,6 +122,33 @@ impl View {
         }
 
         false
+    }
+
+    /// The schema this view's acceleration was checkpointed with, when the view can
+    /// be served from that acceleration before the tables it reads have loaded, as an
+    /// accelerated dataset is served before its source answers.
+    ///
+    /// Only `mode: file` qualifies (`file_create` starts empty by design), and not a
+    /// view with embedding or full-text search columns, whose indexes wrap the view's
+    /// own plan. A checkpoint that does not record the acceleration's primary key
+    /// (written by an earlier version) does not count either.
+    pub(crate) async fn existing_acceleration_schema(&self) -> Option<arrow_schema::SchemaRef> {
+        let acceleration = self.acceleration.as_ref().filter(|a| a.enabled)?;
+        if !matches!(acceleration.mode, acceleration::Mode::File)
+            || self.has_embeddings()
+            || self.has_full_text_column()
+        {
+            return None;
+        }
+        let schema = crate::dataconnector::sink::recorded_acceleration_checkpoint_schema(
+            self,
+            self.runtime.accelerator_engine_registry(),
+        )
+        .await?;
+        runtime_table::accelerated::checkpoint_primary_key::records_acceleration_primary_key(
+            &schema,
+        )
+        .then_some(schema)
     }
 }
 
@@ -241,6 +274,26 @@ mod tests {
     use super::ViewBuilder;
     use crate::component::{AcceleratedComponent, deprecated_ready_state_warning};
     use spicepod::component::view as spicepod_view;
+
+    /// A view that still selects the removed `duckdb` vector engine fails to load with the
+    /// line the runtime logs for it, naming the view and the Cayenne fix.
+    #[test]
+    fn a_view_selecting_the_duckdb_vector_engine_fails_to_load() {
+        let view: spicepod_view::View = yaml::from_str(
+            "name: daily_docs\nsql: SELECT 1\nvectors:\n  enabled: true\n  engine: duckdb\n",
+        )
+        .expect("yaml parses");
+
+        let Err(err) = ViewBuilder::try_from(view) else {
+            panic!("a view selecting the duckdb vector engine must fail to load");
+        };
+        let err = crate::Error::from(err);
+        assert!(
+            matches!(err, crate::Error::ViewVectorEngineRemoved { .. }),
+            "unexpected error: {err}"
+        );
+        insta::assert_snapshot!("view_duckdb_vector_engine_removed", err.to_string());
+    }
 
     /// The wording itself is asserted beside the shared builder in `component::tests`. What is
     /// specific to the view — and what makes that escaping load-bearing rather than decorative — is

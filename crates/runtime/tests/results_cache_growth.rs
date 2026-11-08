@@ -36,7 +36,6 @@ limitations under the License.
 //! any price; what `max_size` needs is a figure *proportional* to what an entry
 //! holds, and that is what a ratio checks.
 
-#![cfg(not(windows))]
 #![allow(clippy::expect_used)]
 
 use std::alloc::{GlobalAlloc, Layout, System};

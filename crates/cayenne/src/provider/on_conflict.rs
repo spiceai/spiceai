@@ -394,10 +394,13 @@ impl InlinedDataRewrite {
 /// frozen at build time. How far that freeze can drift from the delete depends on
 /// who builds the sink and when.
 pub(crate) enum DeletionSinkSource {
-    /// Built by the caller immediately before it drives the sink itself
-    /// (`delete_from_cdc_fast`, the CDC apply loop's own delete path). Its window
-    /// is whatever separates those two statements; this is its pre-existing shape,
-    /// neither widened nor narrowed here.
+    /// Built by the caller immediately before it drives the sink itself.
+    /// Prefer [`Self::BuildAtExecution`] for any path that can interleave a
+    /// writer between construction and `delete_from`.
+    #[expect(
+        dead_code,
+        reason = "kept so a caller that already holds a built sink can still drive it; user DELETE and CDC fast now use BuildAtExecution"
+    )]
     Prebuilt(Box<CayenneDeletionSink>),
     /// Built inside the execution-time `write_lock` hold, after the in-memory CDC
     /// tier is checkpointed in that same hold.
@@ -520,13 +523,17 @@ impl DeletionSink for PkKeysetInvalidatingDeletionSink {
         // (`pk_deletion_strategy` is `PositionBased` exactly then), so without this
         // a `mode: memory` table could neither be emptied nor filtered.
         //
-        // `apply_mem_tier_delete` needs the table `write_lock`, which the inner
-        // sink takes and releases internally, so acquire it here rather than
-        // nesting. Before the `deleted > 0` bookkeeping below: on a table whose
-        // rows are ONLY in the mem-tier the inner count is 0, and the cached scan
-        // statistics still need invalidating once this changes the visible count.
+        // `apply_mem_tier_delete` needs the table `write_lock`. The inner sink
+        // takes and releases it internally, so this is a new acquire — unless
+        // autocommit UPDATE already holds the same non-reentrant mutex across
+        // rematerialize + delete + insert (`write_lock_held`). Nesting then
+        // deadlocks after the files are already unlinked.
         {
-            let _guard = self.table.write_lock.lock().await;
+            let _guard = if super::write_lock_held::is_held() {
+                None
+            } else {
+                Some(self.table.write_lock.lock().await)
+            };
             deleted = deleted.saturating_add(
                 apply_mem_tier_delete(&self.table, &self.filters)
                     .await
@@ -630,9 +637,19 @@ impl DeletionSink for InlineAwareDeletionSink {
         &self,
         _context: Arc<TaskContext>,
     ) -> std::result::Result<u64, Box<dyn std::error::Error + Send + Sync>> {
-        let _write_guard = self.table.write_lock.lock().await;
+        let _write_guard = if super::write_lock_held::is_held() {
+            None
+        } else {
+            Some(self.table.write_lock.lock().await)
+        };
         self.table.ensure_publication_outcome_known()?;
         self.table.mark_maintained_aggregates_stale();
+        let position_based = self.table.pk_deletion_strategy.is_position_based();
+        if position_based {
+            // As `PkKeysetInvalidatingDeletionSink` does before a delete it cannot
+            // enumerate by key: a filter delete leaves no per-key stamps to trust.
+            self.table.mark_pk_keyset_occ_degraded();
+        }
 
         // Make the in-memory CDC tier durable and capture the scan sources inside
         // THIS hold, so no apply lands between the capture and the delete it is
@@ -663,6 +680,16 @@ impl DeletionSink for InlineAwareDeletionSink {
         let file_deleted = prepared_file_delete
             .as_ref()
             .map_or(0, super::delete::PreparedDeletionPublish::deleted_count);
+        // A table with no primary key writes each touched file's whole deletion
+        // vector, which replaces the file's earlier ones in the same commit.
+        let replaced_vectors = match &prepared_file_delete {
+            Some(prepared) if prepared.replaces_earlier_deletion_vectors() => {
+                file_sink
+                    .position_deletion_vectors_replaced_by(prepared.delete_files())
+                    .await?
+            }
+            _ => Vec::new(),
+        };
 
         if !inline_rewrite.is_empty() || prepared_file_delete.is_some() {
             let delete_files = prepared_file_delete
@@ -676,6 +703,10 @@ impl DeletionSink for InlineAwareDeletionSink {
                     self.table.table_id(),
                     inline_rewrite.updated_data.clone(),
                     inline_rewrite.deleted_inlined_ids.clone(),
+                    replaced_vectors
+                        .iter()
+                        .map(|row| row.delete_file_id.clone())
+                        .collect(),
                 )
                 .await
             {
@@ -690,6 +721,7 @@ impl DeletionSink for InlineAwareDeletionSink {
             if !inline_rewrite.is_empty() {
                 self.table.publish_inlined_rewrite(&inline_rewrite);
             }
+            file_sink.remove_replaced_deletion_vector_files(replaced_vectors);
         }
 
         let mut deleted = inlined_deleted.checked_add(file_deleted).ok_or_else(|| {
@@ -727,7 +759,11 @@ impl DeletionSink for InlineAwareDeletionSink {
             } else {
                 self.table.clear_cached_pk_keyset();
             }
-            if file_deleted > 0 && self.table.pk_deletion_strategy.is_position_based() {
+            // A table with no primary key answers counts from per-file statistics
+            // that a position delete changes; drop them on any delete, as
+            // `PkKeysetInvalidatingDeletionSink` does, since inline and mem-tier rows
+            // count toward the visible total too.
+            if position_based {
                 self.table.clear_scan_file_statistics_cache();
             }
         }

@@ -83,7 +83,9 @@ impl EmptyResultReview {
 /// that outlived its fixture would pass an empty answer where rows belong.
 pub mod fixture {
     /// TPC-DS at SF1 as DuckDB's `dsdgen` writes it: the DuckDB lane's default.
-    pub const TPCDS_DSDGEN_SF1: &str = "TPC-DS dsdgen SF1";
+    /// The lane loads an installed DuckDB of 1.5 or later, whose `dsdgen`
+    /// follows the TPC-DS v4 tools and writes different rows than 1.4's did.
+    pub const TPCDS_DSDGEN_SF1: &str = "TPC-DS dsdgen (DuckDB 1.5+) SF1";
     /// TPC-DS at SF1 as `tpcdsgen` writes it: the chDB lane's default.
     pub const TPCDS_TPCDSGEN_SF1: &str = "TPC-DS tpcdsgen SF1";
     /// TPC-DS at SF 0.1 as `tpcdsgen` writes it: the SQLite lane's default.
@@ -96,7 +98,7 @@ pub mod fixture {
     /// TPC-DS as DuckDB's `dsdgen` writes it at `sf`.
     #[must_use]
     pub fn tpcds_dsdgen(sf: f64) -> String {
-        format!("TPC-DS dsdgen SF{sf}")
+        format!("TPC-DS dsdgen (DuckDB 1.5+) SF{sf}")
     }
 
     /// TPC-DS as `tpcdsgen` writes it at `sf`.
@@ -170,13 +172,18 @@ fn empty_result_review(suite: &str, name: &str) -> Option<EmptyResultReview> {
             &[TPCDS_DSDGEN_SF1, TPCDS_TPCDSGEN_SF1],
             "no rows on either generator's SF1 data: the query's parameters select none",
         ),
+        // The suite's parameters for these three are not the TPC-DS v4
+        // qualification values. DuckDB 1.4's `dsdgen` happened to answer them;
+        // from 1.5 it follows the v4 tools and no generator a lane loads does.
+        // With the qualification values (q17 '2001Q1', q25 2001, q85 2000) the
+        // v4 rows answer all three; moving the suite to them is #15909.
         ("tpcds", "tpcds_q17") => (
-            &[TPCDS_TPCDSGEN_SF1],
-            "no rows on tpcdsgen's SF1 data; the dsdgen rows the DuckDB lane loads answer it",
+            &[TPCDS_DSDGEN_SF1, TPCDS_TPCDSGEN_SF1],
+            "no rows on either generator's SF1 data with the suite's 1999 quarters",
         ),
         ("tpcds", "tpcds_q25" | "tpcds_q85") => (
-            &[TPCDS_TPCDSGEN_SF1, TPCDS_TPCDSGEN_SF0_1],
-            "no rows on tpcdsgen's data; the dsdgen rows the DuckDB lane loads answer it",
+            EVERY_TPCDS,
+            "no rows on either generator's data at either scale with the suite's years",
         ),
         (
             "tpcds",

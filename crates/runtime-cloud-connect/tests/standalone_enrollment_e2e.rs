@@ -1722,6 +1722,13 @@ impl Harness {
     /// `not_after` the cloud reports on enroll (short values trigger the
     /// renewal loop quickly).
     async fn new(leaf_validity_secs: i64) -> Self {
+        // Each enrollment builds an HTTP client that reads the system proxy settings.
+        // On macOS the first read in a process lists the test binary's directory,
+        // which can take minutes when many test processes start at once. Pay that
+        // here, before any test step runs under a timeout.
+        reqwest::Client::builder()
+            .build()
+            .expect("read the system proxy settings");
         let ca = Arc::new(TestCa::new());
         let gateway = GatewayServer::new();
         let gateway_addr = spawn_gateway(gateway.clone(), &ca).await;
@@ -2603,6 +2610,11 @@ async fn an_existing_identity_with_an_unsafe_control_plane_endpoint_fails_closed
 /// while the owner is between its identity check and durable promotion.
 #[tokio::test]
 async fn concurrent_enrollment_is_serialized_through_identity_promotion() {
+    // Hang guards, not latency bounds: each step takes under a second even on an
+    // oversubscribed machine. 30s matches how long the contender waits for the
+    // enrollment lock before it gives up.
+    const STEP_BUDGET: Duration = Duration::from_secs(30);
+
     let harness = Harness::new(24 * 60 * 60).await;
     let dir = tempfile::tempdir().expect("create shared enrollment directory");
     let config = harness.config(
@@ -2624,12 +2636,9 @@ async fn concurrent_enrollment_is_serialized_through_identity_promotion() {
         )
         .await
     });
-    tokio::time::timeout(
-        Duration::from_secs(5),
-        harness.cloud.enroll_paused.notified(),
-    )
-    .await
-    .expect("the first request reaches the deterministic cloud gate");
+    tokio::time::timeout(STEP_BUDGET, harness.cloud.enroll_paused.notified())
+        .await
+        .expect("the first request reaches the deterministic cloud gate");
 
     let second_config = config.clone();
     let mut second = tokio::spawn(async move {
@@ -2654,12 +2663,12 @@ async fn concurrent_enrollment_is_serialized_through_identity_promotion() {
     );
 
     harness.cloud.resume_enroll.notify_one();
-    let first_outcome = tokio::time::timeout(Duration::from_secs(5), first)
+    let first_outcome = tokio::time::timeout(STEP_BUDGET, first)
         .await
         .expect("the transaction owner finishes")
         .expect("the transaction owner task joins")
         .expect("the transaction owner enrolls");
-    let second_outcome = tokio::time::timeout(Duration::from_secs(5), second)
+    let second_outcome = tokio::time::timeout(STEP_BUDGET, second)
         .await
         .expect("the contender finishes after promotion")
         .expect("the contender task joins")

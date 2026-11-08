@@ -51,8 +51,7 @@ use data_components::elasticsearch::search_table::{
 };
 
 /// Default kNN candidate-pool size used when a `LIMIT` cannot be pushed down to the
-/// Elasticsearch index scan. Matches the DuckDB vector backend's default
-/// (`DEFAULT_DUCKDB_VECTOR_SEARCH_LIMIT`).
+/// Elasticsearch index scan.
 const DEFAULT_ELASTICSEARCH_VECTOR_SEARCH_LIMIT: usize = 1000;
 
 /// Adapter that implements [`QueryEmbedder`] using an [`Embed`] model.

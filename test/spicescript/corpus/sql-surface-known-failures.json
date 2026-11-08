@@ -1,0 +1,191 @@
+{
+  "scalar.list_min.literal": {
+    "reason": "The documented list_min alias is not registered.",
+    "observed_head": "814e639e8eb55eacbe3f3fadaad2ec0aaf712c05",
+    "observed_date": "2026-10-27",
+    "runtime_sha256": "44d997b1e0c2f3dbd4fe95f0aaa127cfeef31535b9640df39b9f1232a6e448b6",
+    "documentation_revision": "31f71082804b7a5f711d2370e413881ef68319c9",
+    "reproduce": "target/debug/spicescript --spiced target/release/spiced test/spicescript/known-failing/sql-protocols/sql-surface.yaml",
+    "artifact": "target/sql-surface-current-corrected.log"
+  },
+  "scalar.list_min.column": {
+    "reason": "The documented list_min alias is not registered.",
+    "observed_head": "814e639e8eb55eacbe3f3fadaad2ec0aaf712c05",
+    "observed_date": "2026-10-27",
+    "runtime_sha256": "44d997b1e0c2f3dbd4fe95f0aaa127cfeef31535b9640df39b9f1232a6e448b6",
+    "documentation_revision": "31f71082804b7a5f711d2370e413881ef68319c9",
+    "reproduce": "target/debug/spicescript --spiced target/release/spiced test/spicescript/known-failing/sql-protocols/sql-surface.yaml",
+    "artifact": "target/sql-surface-current-corrected.log"
+  },
+  "scalar.list_min.empty": {
+    "reason": "The documented list_min alias is not registered.",
+    "observed_head": "814e639e8eb55eacbe3f3fadaad2ec0aaf712c05",
+    "observed_date": "2026-10-27",
+    "runtime_sha256": "44d997b1e0c2f3dbd4fe95f0aaa127cfeef31535b9640df39b9f1232a6e448b6",
+    "documentation_revision": "31f71082804b7a5f711d2370e413881ef68319c9",
+    "reproduce": "target/debug/spicescript --spiced target/release/spiced test/spicescript/known-failing/sql-protocols/sql-surface.yaml",
+    "artifact": "target/sql-surface-current-corrected.log"
+  },
+  "schema.round.CAST(2 AS BIGINT)": {
+    "reason": "Explicit casts and constant expressions for decimal precision advertise Decimal128(11,3) and stream Decimal128(10,2).",
+    "observed_head": "814e639e8eb55eacbe3f3fadaad2ec0aaf712c05",
+    "observed_date": "2026-10-27",
+    "runtime_sha256": "44d997b1e0c2f3dbd4fe95f0aaa127cfeef31535b9640df39b9f1232a6e448b6",
+    "documentation_revision": "31f71082804b7a5f711d2370e413881ef68319c9",
+    "reproduce": "target/debug/spicescript --spiced target/release/spiced test/spicescript/known-failing/sql-protocols/sql-surface.yaml",
+    "artifact": "target/sql-surface-current-corrected.log"
+  },
+  "schema.round.1 + 1": {
+    "reason": "Explicit casts and constant expressions for decimal precision advertise Decimal128(11,3) and stream Decimal128(10,2).",
+    "observed_head": "814e639e8eb55eacbe3f3fadaad2ec0aaf712c05",
+    "observed_date": "2026-10-27",
+    "runtime_sha256": "44d997b1e0c2f3dbd4fe95f0aaa127cfeef31535b9640df39b9f1232a6e448b6",
+    "documentation_revision": "31f71082804b7a5f711d2370e413881ef68319c9",
+    "reproduce": "target/debug/spicescript --spiced target/release/spiced test/spicescript/known-failing/sql-protocols/sql-surface.yaml",
+    "artifact": "target/sql-surface-current-corrected.log"
+  },
+  "aggregate.grouping.column": {
+    "reason": "GROUPING advertises a non-nullable output and streams a nullable output.",
+    "observed_head": "814e639e8eb55eacbe3f3fadaad2ec0aaf712c05",
+    "observed_date": "2026-10-27",
+    "runtime_sha256": "44d997b1e0c2f3dbd4fe95f0aaa127cfeef31535b9640df39b9f1232a6e448b6",
+    "documentation_revision": "31f71082804b7a5f711d2370e413881ef68319c9",
+    "reproduce": "target/debug/spicescript --spiced target/release/spiced test/spicescript/known-failing/sql-protocols/sql-surface.yaml",
+    "artifact": "target/sql-surface-current-corrected.log"
+  },
+  "aggregate.grouping.empty": {
+    "reason": "GROUPING advertises a non-nullable output and streams a nullable output.",
+    "observed_head": "814e639e8eb55eacbe3f3fadaad2ec0aaf712c05",
+    "observed_date": "2026-10-27",
+    "runtime_sha256": "44d997b1e0c2f3dbd4fe95f0aaa127cfeef31535b9640df39b9f1232a6e448b6",
+    "documentation_revision": "31f71082804b7a5f711d2370e413881ef68319c9",
+    "reproduce": "target/debug/spicescript --spiced target/release/spiced test/spicescript/known-failing/sql-protocols/sql-surface.yaml",
+    "artifact": "target/sql-surface-current-corrected.log"
+  },
+  "syntax.select.exclude": {
+    "reason": "The documented wildcard modifier is rejected during parsing.",
+    "observed_head": "814e639e8eb55eacbe3f3fadaad2ec0aaf712c05",
+    "observed_date": "2026-10-27",
+    "runtime_sha256": "44d997b1e0c2f3dbd4fe95f0aaa127cfeef31535b9640df39b9f1232a6e448b6",
+    "documentation_revision": "31f71082804b7a5f711d2370e413881ef68319c9",
+    "reproduce": "target/debug/spicescript --spiced target/release/spiced test/spicescript/known-failing/sql-protocols/sql-surface.yaml",
+    "artifact": "target/sql-surface-current-corrected.log"
+  },
+  "syntax.select.except": {
+    "reason": "The documented wildcard modifier is rejected during parsing.",
+    "observed_head": "814e639e8eb55eacbe3f3fadaad2ec0aaf712c05",
+    "observed_date": "2026-10-27",
+    "runtime_sha256": "44d997b1e0c2f3dbd4fe95f0aaa127cfeef31535b9640df39b9f1232a6e448b6",
+    "documentation_revision": "31f71082804b7a5f711d2370e413881ef68319c9",
+    "reproduce": "target/debug/spicescript --spiced target/release/spiced test/spicescript/known-failing/sql-protocols/sql-surface.yaml",
+    "artifact": "target/sql-surface-current-corrected.log"
+  },
+  "syntax.select.replace": {
+    "reason": "The documented wildcard modifier is rejected during parsing.",
+    "observed_head": "814e639e8eb55eacbe3f3fadaad2ec0aaf712c05",
+    "observed_date": "2026-10-27",
+    "runtime_sha256": "44d997b1e0c2f3dbd4fe95f0aaa127cfeef31535b9640df39b9f1232a6e448b6",
+    "documentation_revision": "31f71082804b7a5f711d2370e413881ef68319c9",
+    "reproduce": "target/debug/spicescript --spiced target/release/spiced test/spicescript/known-failing/sql-protocols/sql-surface.yaml",
+    "artifact": "target/sql-surface-current-corrected.log"
+  },
+  "syntax.select.ilike": {
+    "reason": "The documented wildcard modifier is rejected during parsing.",
+    "observed_head": "814e639e8eb55eacbe3f3fadaad2ec0aaf712c05",
+    "observed_date": "2026-10-27",
+    "runtime_sha256": "44d997b1e0c2f3dbd4fe95f0aaa127cfeef31535b9640df39b9f1232a6e448b6",
+    "documentation_revision": "31f71082804b7a5f711d2370e413881ef68319c9",
+    "reproduce": "target/debug/spicescript --spiced target/release/spiced test/spicescript/known-failing/sql-protocols/sql-surface.yaml",
+    "artifact": "target/sql-surface-current-corrected.log"
+  },
+  "syntax.order.all": {
+    "reason": "ORDER BY ALL is resolved as an identifier named ALL.",
+    "observed_head": "814e639e8eb55eacbe3f3fadaad2ec0aaf712c05",
+    "observed_date": "2026-10-27",
+    "runtime_sha256": "44d997b1e0c2f3dbd4fe95f0aaa127cfeef31535b9640df39b9f1232a6e448b6",
+    "documentation_revision": "31f71082804b7a5f711d2370e413881ef68319c9",
+    "reproduce": "target/debug/spicescript --spiced target/release/spiced test/spicescript/known-failing/sql-protocols/sql-surface.yaml",
+    "artifact": "target/sql-surface-current-corrected.log"
+  },
+  "syntax.group.sets": {
+    "reason": "GROUPING advertises a non-nullable output and streams a nullable output.",
+    "observed_head": "814e639e8eb55eacbe3f3fadaad2ec0aaf712c05",
+    "observed_date": "2026-10-27",
+    "runtime_sha256": "44d997b1e0c2f3dbd4fe95f0aaa127cfeef31535b9640df39b9f1232a6e448b6",
+    "documentation_revision": "31f71082804b7a5f711d2370e413881ef68319c9",
+    "reproduce": "target/debug/spicescript --spiced target/release/spiced test/spicescript/known-failing/sql-protocols/sql-surface.yaml",
+    "artifact": "target/sql-surface-current-corrected.log"
+  },
+  "syntax.subquery.correlated_range": {
+    "reason": "The range-correlated scalar subquery reaches physical planning as an unsupported ScalarSubquery.",
+    "observed_head": "814e639e8eb55eacbe3f3fadaad2ec0aaf712c05",
+    "observed_date": "2026-10-27",
+    "runtime_sha256": "44d997b1e0c2f3dbd4fe95f0aaa127cfeef31535b9640df39b9f1232a6e448b6",
+    "documentation_revision": "31f71082804b7a5f711d2370e413881ef68319c9",
+    "reproduce": "target/debug/spicescript --spiced target/release/spiced test/spicescript/known-failing/sql-protocols/sql-surface.yaml",
+    "artifact": "target/sql-surface-current-corrected.log"
+  },
+  "syntax.subquery.any": {
+    "reason": "The quantified subquery reaches physical planning as an unsupported Exists expression.",
+    "observed_head": "814e639e8eb55eacbe3f3fadaad2ec0aaf712c05",
+    "observed_date": "2026-10-27",
+    "runtime_sha256": "44d997b1e0c2f3dbd4fe95f0aaa127cfeef31535b9640df39b9f1232a6e448b6",
+    "documentation_revision": "31f71082804b7a5f711d2370e413881ef68319c9",
+    "reproduce": "target/debug/spicescript --spiced target/release/spiced test/spicescript/known-failing/sql-protocols/sql-surface.yaml",
+    "artifact": "target/sql-surface-current-corrected.log"
+  },
+  "syntax.subquery.all": {
+    "reason": "The quantified subquery reaches physical planning as an unsupported Exists expression.",
+    "observed_head": "814e639e8eb55eacbe3f3fadaad2ec0aaf712c05",
+    "observed_date": "2026-10-27",
+    "runtime_sha256": "44d997b1e0c2f3dbd4fe95f0aaa127cfeef31535b9640df39b9f1232a6e448b6",
+    "documentation_revision": "31f71082804b7a5f711d2370e413881ef68319c9",
+    "reproduce": "target/debug/spicescript --spiced target/release/spiced test/spicescript/known-failing/sql-protocols/sql-surface.yaml",
+    "artifact": "target/sql-surface-current-corrected.log"
+  },
+  "operator.IS TRUE": {
+    "reason": "The Boolean IS predicate advertises a non-nullable output and streams a nullable output.",
+    "observed_head": "814e639e8eb55eacbe3f3fadaad2ec0aaf712c05",
+    "observed_date": "2026-10-27",
+    "runtime_sha256": "44d997b1e0c2f3dbd4fe95f0aaa127cfeef31535b9640df39b9f1232a6e448b6",
+    "documentation_revision": "31f71082804b7a5f711d2370e413881ef68319c9",
+    "reproduce": "target/debug/spicescript --spiced target/release/spiced test/spicescript/known-failing/sql-protocols/sql-surface.yaml",
+    "artifact": "target/sql-surface-current-corrected.log"
+  },
+  "operator.IS NOT TRUE": {
+    "reason": "The Boolean IS predicate advertises a non-nullable output and streams a nullable output.",
+    "observed_head": "814e639e8eb55eacbe3f3fadaad2ec0aaf712c05",
+    "observed_date": "2026-10-27",
+    "runtime_sha256": "44d997b1e0c2f3dbd4fe95f0aaa127cfeef31535b9640df39b9f1232a6e448b6",
+    "documentation_revision": "31f71082804b7a5f711d2370e413881ef68319c9",
+    "reproduce": "target/debug/spicescript --spiced target/release/spiced test/spicescript/known-failing/sql-protocols/sql-surface.yaml",
+    "artifact": "target/sql-surface-current-corrected.log"
+  },
+  "operator.IS FALSE": {
+    "reason": "The Boolean IS predicate advertises a non-nullable output and streams a nullable output.",
+    "observed_head": "814e639e8eb55eacbe3f3fadaad2ec0aaf712c05",
+    "observed_date": "2026-10-27",
+    "runtime_sha256": "44d997b1e0c2f3dbd4fe95f0aaa127cfeef31535b9640df39b9f1232a6e448b6",
+    "documentation_revision": "31f71082804b7a5f711d2370e413881ef68319c9",
+    "reproduce": "target/debug/spicescript --spiced target/release/spiced test/spicescript/known-failing/sql-protocols/sql-surface.yaml",
+    "artifact": "target/sql-surface-current-corrected.log"
+  },
+  "operator.IS UNKNOWN": {
+    "reason": "The Boolean IS predicate advertises a non-nullable output and streams a nullable output.",
+    "observed_head": "814e639e8eb55eacbe3f3fadaad2ec0aaf712c05",
+    "observed_date": "2026-10-27",
+    "runtime_sha256": "44d997b1e0c2f3dbd4fe95f0aaa127cfeef31535b9640df39b9f1232a6e448b6",
+    "documentation_revision": "31f71082804b7a5f711d2370e413881ef68319c9",
+    "reproduce": "target/debug/spicescript --spiced target/release/spiced test/spicescript/known-failing/sql-protocols/sql-surface.yaml",
+    "artifact": "target/sql-surface-current-corrected.log"
+  },
+  "literal.float_special": {
+    "reason": "Non-finite Float64 values cannot be reconstructed from the HTTP JSON response under the Flight schema.",
+    "observed_head": "814e639e8eb55eacbe3f3fadaad2ec0aaf712c05",
+    "observed_date": "2026-10-27",
+    "runtime_sha256": "44d997b1e0c2f3dbd4fe95f0aaa127cfeef31535b9640df39b9f1232a6e448b6",
+    "documentation_revision": "31f71082804b7a5f711d2370e413881ef68319c9",
+    "reproduce": "target/debug/spicescript --spiced target/release/spiced test/spicescript/known-failing/sql-protocols/sql-surface.yaml",
+    "artifact": "target/sql-surface-current-corrected.log"
+  }
+}

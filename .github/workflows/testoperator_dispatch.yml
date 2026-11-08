@@ -57,8 +57,11 @@ jobs:
   # Resolves which schedule this run dispatches (the cron that fired, or the manual `schedule`
   # input) and for which branches. trunk dispatches the configs on that schedule. A release
   # branch changes only when a fix is cherry-picked onto it, so the daily schedule also plans it,
-  # and its job dispatches the whole suite, weekly configs included, once per spiced build.
+  # and its job dispatches the whole suite, weekly configs included, once per spiced build. The
+  # release branch is the newest `release/<major>.<minor>`; `release/<version>-rc.<n>` branches are
+  # not planned.
   plan-scheduled:
+    environment: secret-free
     name: Plan scheduled dispatch
     runs-on: ubuntu-24.04
     if: ${{ github.event_name == 'schedule' || github.event.inputs.schedule == 'daily' || github.event.inputs.schedule == 'weekly' }}
@@ -71,7 +74,6 @@ jobs:
         env:
           CRON: ${{ github.event.schedule }}
           INPUT_SCHEDULE: ${{ github.event.inputs.schedule }}
-          RELEASE_BRANCH: 'release/2.3'
         run: |
           set -euo pipefail
           case "$CRON" in
@@ -89,16 +91,28 @@ jobs:
             matrix=$(jq -cn --arg schedule "$schedule" '[{branch: "trunk", schedule: $schedule}]')
           fi
           if [ "$schedule" = daily ]; then
-            matrix=$(jq -c --arg branch "$RELEASE_BRANCH" '. + [{branch: $branch, schedule: ""}]' <<< "$matrix")
+            release_branch=$(git ls-remote --heads "${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}" 'refs/heads/release/*' \
+              | cut -f 2 | sed -n 's#^refs/heads/\(release/[0-9][0-9]*\.[0-9][0-9]*\)$#\1#p' | sort -V | tail -n 1)
+            if [ -z "$release_branch" ]; then
+              echo "::error::Found no release/<major>.<minor> branch to dispatch."
+              exit 1
+            fi
+            echo "Release branch: $release_branch"
+            matrix=$(jq -c --arg branch "$release_branch" '. + [{branch: $branch, schedule: ""}]' <<< "$matrix")
           fi
           echo "Dispatching for: $matrix"
           echo "matrix=$matrix" >> "$GITHUB_OUTPUT"
 
   dispatch-scheduled:
+    environment: ci
     name: Dispatch tests - Scheduled (${{ matrix.branch }})
     needs: plan-scheduled
     if: ${{ needs.plan-scheduled.outputs.matrix != '[]' }}
     runs-on: spiceai-dev-runners
+    permissions:
+      contents: read
+      actions: write  # dispatches the benchmark workflows and re-runs failed ones
+      id-token: write  # RustFS credentials
     # dispatches the bench suite (including the chbench bench run) and returns once all child workflows are dispatched
     timeout-minutes: 720
     strategy:
@@ -115,12 +129,21 @@ jobs:
           persist-credentials: false
           ref: ${{ matrix.branch }}
 
+      - name: Get RustFS credentials
+        id: rustfs
+        uses: ./.github/actions/rustfs-credentials
+        with:
+          endpoint: ${{ vars.TEST_MINIO_ENDPOINT }}
+          duration-seconds: '43200'
+          export-env: 'false'
+
       - name: Install MinIO
         uses: ./.github/actions/setup-minio
         with:
-          minio_endpoint: ${{ secrets.TEST_MINIO_ENDPOINT }}
-          minio_access_key: ${{ secrets.TEST_MINIO_ACCESS_KEY }}
-          minio_secret_key: ${{ secrets.TEST_MINIO_SECRET_KEY }}
+          minio_endpoint: ${{ vars.TEST_MINIO_ENDPOINT }}
+          minio_access_key: ${{ steps.rustfs.outputs.access-key-id }}
+          minio_secret_key: ${{ steps.rustfs.outputs.secret-access-key }}
+          minio_session_token: ${{ steps.rustfs.outputs.session-token }}
 
       - name: Setup spiced
         uses: ./.github/actions/setup-spiced
@@ -295,18 +318,20 @@ jobs:
         if: ${{ steps.benchmarked.outputs.skip != 'true' }}
         uses: ./.github/actions/build-testoperator
         with:
-          minio_endpoint: ${{ secrets.TEST_MINIO_ENDPOINT }}
-          minio_access_key: ${{ secrets.TEST_MINIO_ACCESS_KEY }}
-          minio_secret_key: ${{ secrets.TEST_MINIO_SECRET_KEY }}
+          minio_endpoint: ${{ vars.TEST_MINIO_ENDPOINT }}
+          minio_access_key: ${{ steps.rustfs.outputs.access-key-id }}
+          minio_secret_key: ${{ steps.rustfs.outputs.secret-access-key }}
+          minio_session_token: ${{ steps.rustfs.outputs.session-token }}
 
       - name: Build spicepod validator
         if: ${{ steps.benchmarked.outputs.skip != 'true' }}
         id: build-spicepod-validator
         uses: ./.github/actions/build-spicepod-validator
         with:
-          minio_endpoint: ${{ secrets.TEST_MINIO_ENDPOINT }}
-          minio_access_key: ${{ secrets.TEST_MINIO_ACCESS_KEY }}
-          minio_secret_key: ${{ secrets.TEST_MINIO_SECRET_KEY }}
+          minio_endpoint: ${{ vars.TEST_MINIO_ENDPOINT }}
+          minio_access_key: ${{ steps.rustfs.outputs.access-key-id }}
+          minio_secret_key: ${{ steps.rustfs.outputs.secret-access-key }}
+          minio_session_token: ${{ steps.rustfs.outputs.session-token }}
 
       - name: Set spicepod validator path
         if: ${{ steps.benchmarked.outputs.skip != 'true' }}
@@ -500,8 +525,13 @@ jobs:
           retention-days: 60
 
   dispatch-input:
+    environment: ci
     name: Dispatch tests - Input
     runs-on: spiceai-dev-runners
+    permissions:
+      contents: read
+      actions: write  # dispatches the benchmark workflows
+      id-token: write  # RustFS credentials
     if: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.schedule != 'daily' && github.event.inputs.schedule != 'weekly' }}
     concurrency:
       group: testoperator-dispatch-${{ github.event.ref }}
@@ -511,12 +541,21 @@ jobs:
         with:
           persist-credentials: false
 
+      - name: Get RustFS credentials
+        id: rustfs
+        uses: ./.github/actions/rustfs-credentials
+        with:
+          endpoint: ${{ vars.TEST_MINIO_ENDPOINT }}
+          duration-seconds: '21600'
+          export-env: 'false'
+
       - name: Install MinIO
         uses: ./.github/actions/setup-minio
         with:
-          minio_endpoint: ${{ secrets.TEST_MINIO_ENDPOINT }}
-          minio_access_key: ${{ secrets.TEST_MINIO_ACCESS_KEY }}
-          minio_secret_key: ${{ secrets.TEST_MINIO_SECRET_KEY }}
+          minio_endpoint: ${{ vars.TEST_MINIO_ENDPOINT }}
+          minio_access_key: ${{ steps.rustfs.outputs.access-key-id }}
+          minio_secret_key: ${{ steps.rustfs.outputs.secret-access-key }}
+          minio_session_token: ${{ steps.rustfs.outputs.session-token }}
 
       - name: Setup spiced
         uses: ./.github/actions/setup-spiced
@@ -531,17 +570,19 @@ jobs:
       - name: Build Testoperator
         uses: ./.github/actions/build-testoperator
         with:
-          minio_endpoint: ${{ secrets.TEST_MINIO_ENDPOINT }}
-          minio_access_key: ${{ secrets.TEST_MINIO_ACCESS_KEY }}
-          minio_secret_key: ${{ secrets.TEST_MINIO_SECRET_KEY }}
+          minio_endpoint: ${{ vars.TEST_MINIO_ENDPOINT }}
+          minio_access_key: ${{ steps.rustfs.outputs.access-key-id }}
+          minio_secret_key: ${{ steps.rustfs.outputs.secret-access-key }}
+          minio_session_token: ${{ steps.rustfs.outputs.session-token }}
 
       - name: Build spicepod validator
         id: build-spicepod-validator
         uses: ./.github/actions/build-spicepod-validator
         with:
-          minio_endpoint: ${{ secrets.TEST_MINIO_ENDPOINT }}
-          minio_access_key: ${{ secrets.TEST_MINIO_ACCESS_KEY }}
-          minio_secret_key: ${{ secrets.TEST_MINIO_SECRET_KEY }}
+          minio_endpoint: ${{ vars.TEST_MINIO_ENDPOINT }}
+          minio_access_key: ${{ steps.rustfs.outputs.access-key-id }}
+          minio_secret_key: ${{ steps.rustfs.outputs.secret-access-key }}
+          minio_session_token: ${{ steps.rustfs.outputs.session-token }}
 
       - name: Set spicepod validator path
         run: echo "SPICEPOD_VALIDATOR=${{ steps.build-spicepod-validator.outputs.validator-path }}" >> $GITHUB_ENV

@@ -1,0 +1,116 @@
+name: http-caching
+description: >
+  A Cayenne `refresh_mode: caching` acceleration over an HTTP API caches each
+  request's response by its filters: a repeated query is answered without a
+  request and another key is fetched once; an entry past caching_ttl is
+  fetched again; inside caching_stale_while_revalidate_ttl the stale entry
+  is served at once and refreshed behind it; inside caching_stale_if_error a
+  failing origin is answered from the stale entry and past it the failure
+  reaches the client; and caching_max_items evicts whole entries.
+
+sources:
+  api: { kind: mock-http }
+
+spicepod:
+  version: v1
+  kind: Spicepod
+  name: http-caching
+  datasets:
+    - from: ${sources.api.url}/v1
+      name: plain
+      params: &api { file_format: json, allowed_request_paths: '/*', request_query_filters: enabled, max_retries: '0', response_cache_max_size_bytes: '0' }
+      acceleration: { enabled: true, engine: cayenne, refresh_mode: caching, params: { caching_ttl: 1h } }
+    - from: ${sources.api.url}/v1
+      name: short
+      params: *api
+      acceleration: { enabled: true, engine: cayenne, refresh_mode: caching, params: { caching_ttl: 2s } }
+    - from: ${sources.api.url}/v1
+      name: swr
+      params: *api
+      acceleration: { enabled: true, engine: cayenne, refresh_mode: caching, params: { caching_ttl: 2s, caching_stale_while_revalidate_ttl: 1h } }
+    - from: ${sources.api.url}/v1
+      name: sie
+      params: *api
+      acceleration: { enabled: true, engine: cayenne, refresh_mode: caching, params: { caching_ttl: 2s, caching_stale_if_error: 8s } }
+    - from: ${sources.api.url}/v1
+      name: budget
+      params: *api
+      acceleration: { enabled: true, engine: cayenne, refresh_mode: caching, params: { caching_ttl: 30s, caching_stale_while_revalidate_ttl: 1h, caching_max_items: '2' } }
+
+steps:
+  - source-exec:
+      api:
+        - "{ path: /v1/a, headers: { content-type: application/json }, body: '[{\"k\": \"a\", \"v\": 1}]' }"
+        - "{ path: /v1/b, headers: { content-type: application/json }, body: '[{\"k\": \"b\", \"v\": 1}]' }"
+        - "{ path: /v1/c, headers: { content-type: application/json }, body: '[{\"k\": \"c\", \"v\": 1}]' }"
+        - "{ path: /v1/d, headers: { content-type: application/json }, body: '[{\"k\": \"d\", \"v\": 1}]' }"
+  - start: {}
+
+  # Miss, then hit; another key is its own entry.
+  - query: SELECT content FROM plain WHERE request_path = '/a'
+    expect: { rows: [['{"k":"a","v":1}']] }
+  - query: SELECT content FROM plain WHERE request_path = '/a'
+    expect: { rows: [['{"k":"a","v":1}']] }
+  - query: SELECT content FROM plain WHERE request_path = '/b'
+    expect: { rows: [['{"k":"b","v":1}']] }
+  - query: SELECT content FROM plain WHERE request_path = '/a'
+    expect: { rows: [['{"k":"a","v":1}']] }
+  - source-query: { api: count /v1/a }
+    expect: { rows: [['1']] }
+  - source-query: { api: count /v1/b }
+    expect: { rows: [['1']] }
+  # (A filter on the response that leaves a cached entry no rows does not
+  # ask the origin: known-failing/caching-http/http-caching-known.yaml.)
+
+  # Past the TTL the entry is fetched again, and the new answer served.
+  - query: SELECT content FROM short WHERE request_path = '/c'
+    expect: { rows: [['{"k":"c","v":1}']] }
+  - source-exec: { api: "{ path: /v1/c, headers: { content-type: application/json }, body: '[{\"k\": \"c\", \"v\": 2}]' }" }
+  - query: SELECT content FROM short WHERE request_path = '/c'
+    expect: { rows: [['{"k":"c","v":1}']] }
+  - sleep: 3s
+  - query: SELECT content FROM short WHERE request_path = '/c'
+    expect: { rows: [['{"k":"c","v":2}']] }
+
+  # Stale-while-revalidate: the stale entry at once, the new one after.
+  - source-exec: { api: reset }
+  - source-exec: { api: "{ path: /v1/d, headers: { content-type: application/json }, body: '[{\"k\": \"d\", \"v\": 1}]' }" }
+  - query: SELECT content FROM swr WHERE request_path = '/d'
+    expect: { rows: [['{"k":"d","v":1}']] }
+  - source-exec: { api: "{ path: /v1/d, headers: { content-type: application/json }, body: '[{\"k\": \"d\", \"v\": 2}]' }" }
+  - sleep: 3s
+  - query: SELECT content FROM swr WHERE request_path = '/d'
+    expect: { rows: [['{"k":"d","v":1}']] }
+  - query: SELECT content FROM swr WHERE request_path = '/d'
+    expect: { rows: [['{"k":"d","v":2}']] }
+    eventually: 20s
+
+  # Stale-if-error: a failing origin inside the window is answered from the
+  # stale entry; past it, the failure reaches the client.
+  - source-exec: { api: "{ path: /v1/e, headers: { content-type: application/json }, body: '[{\"k\": \"e\", \"v\": 1}]' }" }
+  - query: SELECT content FROM sie WHERE request_path = '/e'
+    expect: { rows: [['{"k":"e","v":1}']] }
+  - source-exec: { api: "{ path: /v1/e, status: 503, body: down }" }
+  - sleep: 3s
+  - query: SELECT content FROM sie WHERE request_path = '/e'
+    expect: { rows: [['{"k":"e","v":1}']] }
+  - sleep: 9s
+  - query: SELECT content FROM sie WHERE request_path = '/e'
+    expect-error: true
+
+  # A budget of two entries holds two. (Which two — the oldest is meant to go,
+  # the newest does: known-failing/caching-http/http-caching-known.yaml.)
+  - source-exec:
+      api:
+        - "{ path: /v1/f, headers: { content-type: application/json }, body: '[{\"k\": \"f\"}]' }"
+        - "{ path: /v1/g, headers: { content-type: application/json }, body: '[{\"k\": \"g\"}]' }"
+        - "{ path: /v1/h, headers: { content-type: application/json }, body: '[{\"k\": \"h\"}]' }"
+  - query: SELECT content FROM budget WHERE request_path = '/f'
+    expect: { rows: [['{"k":"f"}']] }
+  - query: SELECT content FROM budget WHERE request_path = '/g'
+    expect: { rows: [['{"k":"g"}']] }
+  - query: SELECT content FROM budget WHERE request_path = '/h'
+    expect: { rows: [['{"k":"h"}']] }
+  - query: SELECT count(*) AS entries FROM budget
+    expect: { rows: [['2']] }
+    eventually: 60s

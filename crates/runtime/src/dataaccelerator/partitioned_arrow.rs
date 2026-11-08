@@ -41,7 +41,7 @@ use crate::{
     parameters::ParameterSpec,
 };
 
-use super::{AccelerationSource, AcceleratorEngineRegistry, DataAccelerator};
+use super::{AccelerationSource, DataAccelerator};
 use runtime_acceleration::sidecar::{AcceleratorSidecar, OpenOption, unsupported_sidecar};
 use runtime_checkpoint_api::CheckpointError;
 
@@ -191,7 +191,6 @@ impl DataAccelerator for PartitionedArrowAccelerator {
     async fn sidecar(
         &self,
         _source: &dyn AccelerationSource,
-        _registry: Arc<AcceleratorEngineRegistry>,
         _open_option: OpenOption,
     ) -> Result<Arc<dyn AcceleratorSidecar>, CheckpointError> {
         // In-memory: there is no database to keep sidecar tables in, and nothing would

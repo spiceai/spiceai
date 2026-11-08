@@ -1,0 +1,28 @@
+name: cayenne-catalog-standalone
+description: >
+  A Cayenne catalog outside a cluster is refused: the catalog reports Error
+  naming distributed mode, and its tables cannot be created or read.
+
+spicepod:
+  version: v1
+  kind: Spicepod
+  name: cayenne-catalog-standalone
+  catalogs:
+    - from: cayenne
+      name: cat
+      access: read_write_create
+      params:
+        cayenne_data_dir: ${instance.dir}/cayenne/data
+        cayenne_metadata_dir: ${instance.dir}/cayenne/metadata
+
+steps:
+  - start: { ready: false }
+  # No API reports a catalog's status (`/v1/catalogs` lists this one, without
+  # one), so the refusal is read from the log.
+  - assert-log:
+      contains: 'Cannot setup the catalog cat \(cayenne\) with an invalid configuration\. Cayenne catalog is only supported in distributed Spice mode\. Start Spice with `--role scheduler` or `--role executor`'
+    eventually: 30s
+  - spice-exec: 'CREATE SCHEMA cat.s'
+    expect-error: true
+  - query: SELECT count(*) AS n FROM information_schema.schemata WHERE catalog_name = 'cat'
+    expect: { rows: [['0']] }

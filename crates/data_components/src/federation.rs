@@ -2562,8 +2562,8 @@ mod tests {
             .err()
             .unwrap_or_else(|| {
                 panic!(
-                    "{context}: a filter on a volatile output read through a derived table \
-                     the engine does not fix must be refused"
+                    "{context}: a volatile output read through a derived table the engine does \
+                     not fix must be refused"
                 )
             });
         assert!(
@@ -2721,6 +2721,331 @@ mod tests {
             ),
         ] {
             assert_volatile_scope_refused(&format!("sqlite, {route}"), &SqliteDialect {}, &plan);
+        }
+    }
+
+    /// Asserts the `ORDER BY` is the enclosing query's, after the derived table that
+    /// `derived` opens, where the derived table's output names bind.
+    fn assert_order_by_reads_the_derived_table(arm: &str, sql: &str, derived: &str) {
+        let derived_at = first_offset_of(sql, derived);
+        let order_at = last_offset_of(sql, "ORDER BY ");
+        assert!(
+            order_at > derived_at && paren_depth_at(sql, order_at) == 0,
+            "{arm}: the ORDER BY has to read the outputs from the SELECT above the derived \
+             table, where their names bind: {sql}"
+        );
+    }
+
+    /// [`volatile_projection`] sorted by `r + 1.0`, directly or through a `DISTINCT`.
+    /// A key that is not the bare output name is what the unparser has to resolve
+    /// against the `SELECT` list; each shape is one way it resolved it wrongly.
+    fn volatile_sort_key_shapes() -> Vec<(&'static str, LogicalPlan)> {
+        let key = || vec![(col("r") + lit(1.0)).sort(true, true)];
+        let sorted = volatile_projection()
+            .sort_with_limit(key(), Some(10))
+            .expect("sort")
+            .build()
+            .expect("build");
+        let distinct = volatile_projection()
+            .distinct()
+            .expect("distinct")
+            .sort_with_limit(key(), Some(10))
+            .expect("sort")
+            .build()
+            .expect("build");
+        vec![("projection", sorted), ("distinct", distinct)]
+    }
+
+    /// Regression test for #14109, fixed by fork PR #247 for a sort directly over
+    /// the projection and by fork PR #281 for one over a `DISTINCT`.
+    /// `SELECT a, random() AS r FROM t ORDER BY r + 1.0 LIMIT 10` was pushed down
+    /// as `ORDER BY (random() + 1.0)`, a second draw, so the rows came back ordered
+    /// by a value the `SELECT` list never showed; through `SELECT DISTINCT` the key was not
+    /// resolved at all, and `ORDER BY ("r" + 1.0)` made `PostgreSQL` refuse the
+    /// whole query (`column "r" does not exist`).
+    ///
+    /// The repair reads the output by name from a `SELECT` above the one computing
+    /// it, so the volatile call is evaluated once and the `ORDER BY` sits outside
+    /// the derived table. A dialect whose engine flattens that table evaluates the
+    /// call again for the key, so the scope is refused there instead.
+    #[test]
+    fn a_sort_key_reading_a_volatile_output_orders_by_the_value_the_select_list_shows() {
+        for (shape, plan) in volatile_sort_key_shapes() {
+            for (dialect_name, dialect) in federation_dialects() {
+                let arm = format!("{dialect_name}/{shape}");
+                if !dialect.derived_table_evaluates_volatile_outputs_once() {
+                    assert_volatile_scope_refused(&arm, dialect.as_ref(), &plan);
+                    continue;
+                }
+                let sql = unparse_with(dialect_name, dialect.as_ref(), &plan);
+                // The output is named `r`, so every `random()` in the SQL is a call.
+                let evaluations = sql.matches("random()").count();
+                assert_eq!(
+                    evaluations, 1,
+                    "{arm}: the volatile call is evaluated {evaluations} times, so the rows are \
+                     ordered by a value the SELECT list never showed: {sql}"
+                );
+                assert_order_by_reads_the_derived_table(&arm, &sql, "FROM (SELECT ");
+            }
+        }
+    }
+
+    /// `PostgreSQL` keeps the first 63 bytes of an identifier and drops the rest
+    /// without an error, so two outputs of a derived table whose names agree in
+    /// those bytes become one column, and the `SELECT` that reads the table by
+    /// name fails with `column reference "ooo…o" is ambiguous`. For `PostgreSQL`
+    /// the unparser refuses both derived tables it reads by name, the scope a sort
+    /// key over a volatile output builds and a projected `EXISTS` input, rather
+    /// than send that SQL. Names that still differ once shortened are built as
+    /// before, and so is every name for a dialect that compares names whole
+    /// (spiceai/datafusion#282).
+    #[test]
+    fn outputs_postgresql_shortens_to_one_name_are_refused_in_a_derived_table() {
+        fn sort_scope(one: &str, two: &str) -> LogicalPlan {
+            LogicalPlanBuilder::scan("t", two_column_source(), None)
+                .expect("scan t")
+                .project(vec![
+                    col("t.a").alias(one),
+                    (col("t.a") + lit(1)).alias(two),
+                    random_call().alias("r"),
+                ])
+                .expect("project")
+                .sort(vec![(col("r") + lit(1.0)).sort(true, true)])
+                .expect("sort")
+                .build()
+                .expect("build")
+        }
+        fn exists_input(one: &str, two: &str) -> LogicalPlan {
+            let probe = LogicalPlanBuilder::scan("p", two_column_source(), Some(vec![0]))
+                .expect("scan p")
+                .build()
+                .expect("build the probe");
+            let build = LogicalPlanBuilder::scan("person", two_column_source(), Some(vec![0]))
+                .expect("scan person")
+                .project(vec![
+                    col("person.a").alias(one),
+                    (col("person.a") + lit(1)).alias(two),
+                ])
+                .expect("project")
+                .alias("b")
+                .expect("alias")
+                .build()
+                .expect("build the build side");
+            LogicalPlanBuilder::from(probe)
+                .join(
+                    build,
+                    JoinType::LeftSemi,
+                    (
+                        vec![Column::new(Some("p"), "a")],
+                        vec![Column::new(Some("b"), one)],
+                    ),
+                    None,
+                )
+                .expect("semi join")
+                .build()
+                .expect("build")
+        }
+
+        // Past 63 ASCII bytes, and past a two-byte character that straddles byte
+        // 63, which `PostgreSQL` drops whole, keeping 62.
+        let ascii = "o".repeat(63);
+        let straddling = "o".repeat(62);
+        for (one, two) in [
+            (format!("{ascii}_one"), format!("{ascii}_two")),
+            (format!("{straddling}é_one"), format!("{straddling}è_two")),
+        ] {
+            for (shape, plan, refusal) in [
+                (
+                    "sort scope",
+                    sort_scope(&one, &two),
+                    format!(
+                        "This feature is not implemented: Unparsing a sort key reading a \
+                         projection output that cannot be repeated is not supported when two \
+                         outputs the derived table exposes, {one} and {two}, become one name \
+                         once the dialect shortens each to at most 63 bytes"
+                    ),
+                ),
+                (
+                    "projected EXISTS input",
+                    exists_input(&one, &two),
+                    "This feature is not implemented: A projected EXISTS input requires unique \
+                     output names"
+                        .to_string(),
+                ),
+            ] {
+                match Unparser::new(&PostgreSqlDialect {}).plan_to_sql(&plan) {
+                    Ok(sql) => panic!(
+                        "{shape}: PostgreSQL reads {one} and {two} as one name, so the derived \
+                         table has to be refused rather than sent: {sql}"
+                    ),
+                    Err(error) => assert_eq!(
+                        error.strip_backtrace(),
+                        refusal,
+                        "{shape}: refused for another reason"
+                    ),
+                }
+                let sql = unparse_with("default", &DefaultDialect {}, &plan);
+                assert!(
+                    sql.contains(one.as_str()) && sql.contains(two.as_str()),
+                    "{shape}: a dialect that compares names whole keeps both outputs: {sql}"
+                );
+            }
+        }
+
+        // Long names that differ within the first 63 bytes stay distinct once
+        // `PostgreSQL` shortens them, so it is the shared prefix that is refused.
+        let (one, two) = (format!("one_{ascii}"), format!("two_{ascii}"));
+        for (shape, plan) in [
+            ("sort scope", sort_scope(&one, &two)),
+            ("projected EXISTS input", exists_input(&one, &two)),
+        ] {
+            let sql = unparse_with("postgres", &PostgreSqlDialect {}, &plan);
+            assert!(
+                sql.contains(one.as_str()) && sql.contains(two.as_str()),
+                "{shape}: names PostgreSQL keeps apart are emitted: {sql}"
+            );
+        }
+    }
+
+    /// The same unresolved key over a `DISTINCT` whose outputs can be repeated.
+    /// The `ORDER BY` of a `SELECT DISTINCT` may name only what its list shows, so
+    /// inlining the output does not help there: `PostgreSQL` refuses
+    /// `ORDER BY ((a + 1) + 1)` ("for SELECT DISTINCT, ORDER BY expressions must
+    /// appear in select list"), and `ORDER BY ("b" + 1)` binds `b` to nothing. Every
+    /// dialect reads the key from a `SELECT` above the `DISTINCT` one instead,
+    /// including when a filter above the sort is lowered between it and the
+    /// `DISTINCT` (spiceai/datafusion#281).
+    #[test]
+    fn a_computed_sort_key_over_distinct_is_ordered_above_it() {
+        let sorted = || {
+            LogicalPlanBuilder::scan("t", two_column_source(), None)
+                .expect("scan t")
+                .project(vec![col("t.a"), (col("t.a") + lit(1)).alias("b")])
+                .expect("project")
+                .distinct()
+                .expect("distinct")
+        };
+        let key = || vec![(col("b") + lit(1)).sort(true, true)];
+        let bounded = sorted()
+            .sort_with_limit(key(), Some(3))
+            .expect("sort")
+            .build()
+            .expect("build");
+        let filtered = sorted()
+            .sort(key())
+            .expect("sort")
+            .filter(col("b").gt(lit(0)).and(col("t.a").gt(lit(0))))
+            .expect("filter")
+            .build()
+            .expect("build");
+        for (shape, plan) in [("bounded", bounded), ("filtered", filtered)] {
+            for (dialect_name, dialect) in federation_dialects() {
+                let arm = format!("{dialect_name}/{shape}");
+                let sql = unparse_with(dialect_name, dialect.as_ref(), &plan);
+                assert_order_by_reads_the_derived_table(&arm, &sql, "FROM (SELECT DISTINCT ");
+                let order_at = last_offset_of(&sql, "ORDER BY ");
+                if shape == "filtered" {
+                    // The filter is emitted above the derived table, which hides `t`.
+                    let predicate = &sql[last_offset_of(&sql, "WHERE ")..order_at];
+                    assert!(
+                        !["t.a", "\"t\".", "`t`."]
+                            .iter()
+                            .any(|qualified| predicate.contains(qualified)),
+                        "{arm}: the filter names `t`, which the derived table hides: {sql}"
+                    );
+                }
+                let order_by = &sql[order_at..];
+                assert!(
+                    [
+                        "ORDER BY (b + 1)",
+                        "ORDER BY (\"b\" + 1)",
+                        "ORDER BY (`b` + 1)"
+                    ]
+                    .iter()
+                    .any(|key| order_by.starts_with(key)),
+                    "{arm}: the key has to read the output `b` by name, not inline the \
+                     expression it computes: {sql}"
+                );
+            }
+        }
+    }
+
+    /// An unaliased aggregate output under the `DISTINCT` is a column the unparser
+    /// renders as the call itself, so the derived table has to name it, or the
+    /// `SELECT` above reads `sum(t.b)` from a table that exposes `sum` (spiceai/datafusion#281).
+    #[test]
+    fn a_scoped_distinct_names_its_aggregate_output() {
+        use datafusion::functions_aggregate::expr_fn::sum;
+        let plan = LogicalPlanBuilder::scan("t", two_column_source(), None)
+            .expect("scan t")
+            .aggregate(vec![col("t.a")], vec![sum(col("t.b"))])
+            .expect("aggregate")
+            .project(vec![col("t.a"), col("sum(t.b)")])
+            .expect("project")
+            .distinct()
+            .expect("distinct")
+            .sort_with_limit(vec![(col("t.a") + lit(1)).sort(true, true)], Some(3))
+            .expect("sort")
+            .build()
+            .expect("build");
+        for (dialect_name, dialect) in federation_dialects() {
+            let sql = unparse_with(dialect_name, dialect.as_ref(), &plan);
+            assert_order_by_reads_the_derived_table(dialect_name, &sql, "FROM (SELECT DISTINCT ");
+            // The outer list reads the aggregate by the identifier the dialect
+            // spells for it; the derived table has to bind exactly that one.
+            let outer_list =
+                &sql["SELECT ".len()..first_offset_of(&sql, " FROM (SELECT DISTINCT ")];
+            let Some((_, reference)) = outer_list.split_once(", ") else {
+                panic!("{dialect_name}: expected two outputs in the outer list: {sql}");
+            };
+            assert!(
+                sql.contains(&format!("AS {reference} FROM ")),
+                "{dialect_name}: the derived table leaves the aggregate output for the engine \
+                 to name, so the SELECT above reads {reference}, which it does not expose: {sql}"
+            );
+        }
+    }
+
+    /// The sort over a scoped `DISTINCT` inside an unbounded `EXISTS` body orders
+    /// nothing the `EXISTS` can observe, so it is left out, as a sort directly over
+    /// the projection is (spiceai/datafusion#281). Under the `SELECT 1` the body
+    /// takes, the sort is derived apart from the body and loses that context, and a
+    /// dialect that cannot take the scope refused the whole statement.
+    #[test]
+    fn a_sort_over_a_scoped_distinct_is_left_out_of_an_unbounded_exists_body() {
+        let body = LogicalPlanBuilder::scan("u", two_column_source(), None)
+            .expect("scan u")
+            .project(vec![col("u.a"), random_call().alias("r")])
+            .expect("project")
+            .distinct()
+            .expect("distinct")
+            .sort(vec![(col("r") + lit(1.0)).sort(true, true)])
+            .expect("sort")
+            .project(vec![lit(1)])
+            .expect("exists projection")
+            .build()
+            .expect("build body");
+        let plan = LogicalPlanBuilder::scan("t", two_column_source(), Some(vec![0]))
+            .expect("scan t")
+            .filter(exists(Arc::new(body)))
+            .expect("filter")
+            .build()
+            .expect("build");
+        for (dialect_name, dialect) in federation_dialects() {
+            let sql = unparse_with(dialect_name, dialect.as_ref(), &plan);
+            assert!(
+                sql.contains("WHERE EXISTS (SELECT 1 FROM (SELECT DISTINCT "),
+                "{dialect_name}: expected the body to read the DISTINCT as a derived table: {sql}"
+            );
+            assert!(
+                !sql.contains("ORDER BY"),
+                "{dialect_name}: the EXISTS body keeps a sort whose order nothing observes: {sql}"
+            );
+            assert_eq!(
+                sql.matches("random()").count(),
+                1,
+                "{dialect_name}: the volatile output has to be computed once: {sql}"
+            );
         }
     }
 
@@ -3861,6 +4186,59 @@ mod tests {
         }
     }
 
+    /// Regression guard for #15538: postfix predicates must keep the value
+    /// produced by their operand, including prefix NOT and another predicate.
+    #[tokio::test]
+    async fn is_predicate_unparsing_preserves_boolean_partitions() {
+        let ctx = SessionContext::new();
+        ctx.sql("CREATE TABLE flags AS VALUES (1, true), (2, false), (3, NULL::BOOLEAN)")
+            .await
+            .expect("create boolean values")
+            .collect()
+            .await
+            .expect("populate boolean values");
+        let flag = col("column2");
+        for expr in [
+            Expr::IsNull(Box::new(!flag.clone())),
+            Expr::IsNotNull(Box::new(!flag.clone())),
+            Expr::IsTrue(Box::new(!flag.clone())),
+            Expr::IsNotTrue(Box::new(!flag.clone())),
+            Expr::IsFalse(Box::new(!flag.clone())),
+            Expr::IsNotFalse(Box::new(!flag.clone())),
+            Expr::IsUnknown(Box::new(!flag.clone())),
+            Expr::IsNotUnknown(Box::new(!flag.clone())),
+            Expr::IsNull(Box::new(Expr::IsTrue(Box::new(flag.clone())))),
+            !Expr::IsNull(Box::new(Expr::IsNotNull(Box::new(flag.clone())))),
+            !Expr::IsNull(Box::new(Expr::IsNull(Box::new(flag)))),
+        ] {
+            let original = ctx
+                .table("flags")
+                .await
+                .expect("read flags")
+                .filter(expr.clone())
+                .expect("filter original expression")
+                .select_columns(&["column1"])
+                .expect("select identifier")
+                .sort(vec![col("column1").sort(true, false)])
+                .expect("order original rows")
+                .collect()
+                .await
+                .expect("evaluate original expression");
+            let emitted = Unparser::new(&PostgreSqlDialect {})
+                .expr_to_sql(&expr)
+                .expect("unparse predicate");
+            let sql = format!("SELECT column1 FROM flags WHERE {emitted} ORDER BY column1");
+            let reparsed = ctx
+                .sql(&sql)
+                .await
+                .unwrap_or_else(|error| panic!("reparse {sql}: {error}"))
+                .collect()
+                .await
+                .unwrap_or_else(|error| panic!("execute {sql}: {error}"));
+            assert_eq!(original, reparsed, "predicate changed meaning: {sql}");
+        }
+    }
+
     /// Regression test for #14941: `INTERSECT` and `EXCEPT` are planned as semi
     /// and anti joins whose keys match NULLs, because a set operation treats two
     /// NULLs as the same value. `=` is never true on NULL, so the federated
@@ -4217,7 +4595,7 @@ mod tests {
         /// `SQLExecutor::supports_sort_pushdown`. Accepting a sort declares the
         /// remote's order exact and removes `DataFusion`'s own sort, so an
         /// executor that has not said its engine orders rows as `DataFusion` would
-        /// (Flight, Flight SQL, Spark Connect and Turso here) must keep the sort
+        /// (Flight, Flight SQL and Spark Connect here) must keep the sort
         /// local. The statement is the one the `SqlTable` above sends sorted.
         #[tokio::test]
         async fn an_executor_that_does_not_opt_in_keeps_the_sort_local() {

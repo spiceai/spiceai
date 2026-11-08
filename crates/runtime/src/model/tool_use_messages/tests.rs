@@ -761,3 +761,50 @@ async fn a_zero_recursion_limit_calls_the_model_without_spice_tools() {
         assert_eq!(sent.get("tools"), None, "{sent:?}");
     }
 }
+
+/// A round of 65 calls runs 64, streamed or not, and `tools_used` counts the 64 that ran.
+#[tokio::test]
+async fn tools_used_counts_only_the_calls_that_ran() {
+    let calls = MAX_SPICE_TOOL_CALLS_PER_RESPONSE + 1;
+    for stream in [false, true] {
+        let sql_calls: Vec<Value> = (0..calls)
+            .map(|i| sql_call(&format!("toolu_{i}")))
+            .collect();
+        let scripted = Scripted::new(vec![
+            round("msg_1", &Value::Array(sql_calls), "tool_use", 100, 10),
+            round(
+                "msg_2",
+                &json!([{"type": "text", "text": "Done."}]),
+                "end_turn",
+                1,
+                1,
+            ),
+        ]);
+        let sql = Arc::new(Sql(AtomicUsize::new(0)));
+        let messages = using(&scripted, &sql, 10);
+        let extension = crate::model::ModelContextExtension::new();
+        let context =
+            Arc::new(RequestContext::builder(runtime_request_context::Protocol::Http).build());
+        context.insert_extension(extension.clone());
+        context
+            .scope(async {
+                if stream {
+                    streamed(&messages, request()).await;
+                } else {
+                    messages.create(request()).await.expect("a message");
+                }
+            })
+            .await;
+
+        assert_eq!(
+            sql.0.load(Ordering::SeqCst),
+            MAX_SPICE_TOOL_CALLS_PER_RESPONSE,
+            "stream: {stream}"
+        );
+        assert_eq!(
+            extension.tools_used(),
+            MAX_SPICE_TOOL_CALLS_PER_RESPONSE,
+            "stream: {stream}"
+        );
+    }
+}

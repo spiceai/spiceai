@@ -12,8 +12,8 @@ Spice provides SQL, search, and AI infrastructure whose routine operation does n
 require customers to manage metadata databases, data placement, compaction, or
 routine recovery. Cayenne is the only acceleration engine, operating in memory or
 with persistent files/objects. On-prem deployments must work without object
-storage. An embedded Turso metastore may remain an internal implementation of
-Cayenne's file-backed path, without a separately operated metadata service.
+storage. Cayenne's embedded SQLite metastore is the internal implementation of
+its file-backed path, without a separately operated metadata service.
 
 Where object storage is available, use conditional writes for shared durable
 state and make compute replaceable without transferring local disks. Support
@@ -87,7 +87,7 @@ public metastore selection, and active-active multi-region scope from this effor
 
 Keep data-source connectors. Retiring an accelerator does not retire that database
 as a source, Arrow as the data representation, or a differential-test oracle.
-Turso may remain embedded under Cayenne even as the Turso accelerator retires.
+SQLite remains embedded under Cayenne as its metastore even as the SQLite accelerator retires.
 Retain model APIs, retrieval, embeddings, and reranking; optional GPU execution
 should not become a required
 database deployment dependency.
@@ -130,12 +130,12 @@ requirement, not merely a development fallback.
 | Cayenne storage | Authoritative state | Required operating contract |
 | --- | --- | --- |
 | Memory | Process memory | Explicitly volatile; bounded use and rebuild/replay after restart; no durable acknowledgement promise |
-| Persistent files | Durable files and an embedded metastore, potentially Turso | No object store or separate metadata service; specify restart, backup/restore, supported filesystems, and exclusive writer ownership |
+| Persistent files | Durable files and the embedded SQLite metastore | No object store or separate metadata service; specify restart, backup/restore, supported filesystems, and exclusive writer ownership |
 | Persistent objects | Object data plus the conditional WAL and checkpoints | Replaceable compute; qualified conditional writes, pinned snapshots, and recovery independent of local caches |
 
 Replication and failover for file-backed on-prem deployments require a separate,
 explicit storage/ownership design. Do not infer them from a shared path, embedded
-Turso, or the object-backed protocol. The final experience should keep the same
+SQLite, or the object-backed protocol. The final experience should keep the same
 Cayenne SQL and transaction semantics wherever promised. A volatile mode must not
 advance a durable source acknowledgement past recoverable state unless the
 reviewed source contract provides lossless replay or rebuild.
@@ -255,7 +255,7 @@ and in-flight or uncertain attempts. Lease expiration alone must not let a delay
 writer publish references that GC has deleted; publication must validate/fence
 the ownership and retention generation. Qualify this protocol before enabling GC.
 
-For an embedded Turso backend, reuse native transactions behind the same domain
+For the embedded SQLite backend, reuse native transactions behind the same domain
 operations and qualify the isolation and snapshot lifetime that Cayenne requires.
 Do not simulate object APIs or duplicate a database WAL merely for symmetry.
 Memory mode preserves the logical operations with explicit volatile semantics.
@@ -301,8 +301,8 @@ reopening the old store is not
 rollback; returning requires a lossless migration of those writes.
 
 Consolidate redundant metastore implementations only after choosing and qualifying
-the embedded on-prem path. Retain Turso if it supplies that path; its removal is
-not an acceptance criterion. Keep migration readers where required. A deployment
+the embedded on-prem path. The embedded SQLite metastore supplies that path; the
+experimental Turso metastore is removed. Keep migration readers where required. A deployment
 must not need object storage merely to leave a legacy metastore behind.
 
 Retire every non-Cayenne accelerator: DuckDB, Arrow/partitioned Arrow, SQLite,
@@ -313,8 +313,8 @@ before removal; source reload is allowed only where replayability is established
 Make Cayenne's memory path a prerequisite for retiring Arrow acceleration and its
 file path a prerequisite for object-free on-prem migration. Keep connectors,
 Arrow buffers/kernels, and test oracles. Delete dependencies only when no retained
-capability uses them. Turso as an internal Cayenne metastore is separate from the
-standalone Turso accelerator being retired.
+capability uses them. SQLite as Cayenne's internal metastore is separate from the
+standalone SQLite accelerator being retired.
 
 Consolidate scheduler, shared job, rate-control, cache-warming, and snapshot
 coordination storage one consumer at a time, with explicit format migration.

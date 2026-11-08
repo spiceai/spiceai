@@ -22,8 +22,6 @@ limitations under the License.
 //! hand-rolled `ParameterSpec` lists and per-key string parsing with typed
 //! fields, real enums for `one_of` values, and typo-suggestion warnings.
 
-#[cfg(feature = "duckdb")]
-pub mod duckdb;
 #[cfg(feature = "elasticsearch")]
 pub mod elasticsearch;
 #[cfg(feature = "s3_vectors")]
@@ -40,6 +38,6 @@ pub fn parse_bool(raw: &str) -> Result<bool, String> {
     match raw.trim().to_ascii_lowercase().as_str() {
         "true" | "1" | "yes" => Ok(true),
         "false" | "0" | "no" => Ok(false),
-        _ => Err(format!("Expected true or false. Found {raw}.")),
+        _ => Err("Expected true or false.".to_string()),
     }
 }

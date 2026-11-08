@@ -478,6 +478,127 @@ async fn a_cancelled_append_publishes_before_releasing_its_locks() {
     }
 }
 
+/// An autocommit `UPDATE` holds the write lock across its delete and insert.
+/// Cancelling it after the insert's commit began does not release that lock
+/// early: the next writer waits until the updated row is published, and it
+/// survives reopening.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_cancelled_update_publishes_before_releasing_the_write_lock() {
+    use crate::provider::append_commit::test_seams;
+
+    for mode in [DeletionMode::Key, DeletionMode::Position] {
+        let (provider, catalog, runtime_env, _dir) = seeded_streaming_table(mode).await;
+        let (reached_tx, reached) = tokio::sync::oneshot::channel::<()>();
+        let release = Arc::new(tokio::sync::Notify::new());
+        let release_in_commit = Arc::clone(&release);
+        test_seams::pause_before_commit(
+            provider.table_id(),
+            Box::new(move || {
+                Box::pin(async move {
+                    let _ = reached_tx.send(());
+                    release_in_commit.notified().await;
+                })
+            }),
+        );
+        let writer = provider.clone_for_write();
+        let caller = tokio::spawn(async move {
+            let ctx = SessionContext::new();
+            let plan = writer
+                .update(
+                    &ctx.state(),
+                    vec![("value".to_string(), datafusion_expr::lit("new"))],
+                    vec![datafusion_expr::col("id").eq(datafusion_expr::lit(9_i64))],
+                )
+                .await?;
+            datafusion::physical_plan::collect(plan, ctx.task_ctx()).await
+        });
+        tokio::time::timeout(std::time::Duration::from_secs(30), reached)
+            .await
+            .expect("the insert's commit starts")
+            .expect("the commit signals");
+        caller.abort();
+        assert!(
+            caller
+                .await
+                .expect_err("the caller is cancelled")
+                .is_cancelled(),
+            "{mode:?}"
+        );
+        assert!(
+            provider.write_lock_arc().try_lock_owned().is_err(),
+            "{mode:?}: the UPDATE still holds the write lock while its insert commits"
+        );
+        release.notify_one();
+        let next_writer = tokio::time::timeout(
+            std::time::Duration::from_secs(30),
+            provider.write_lock_arc().lock_owned(),
+        )
+        .await
+        .expect("the UPDATE releases the write lock");
+        let expected = (owned(&[(9, "new")]), 1);
+        assert_eq!(visible(&provider).await, expected, "{mode:?}: published");
+        drop(next_writer);
+        let reopened = reopen(&catalog, &runtime_env).await;
+        assert_eq!(visible(&reopened).await, expected, "{mode:?}: reopened");
+    }
+}
+
+/// An autocommit `UPDATE` reads the rows it rewrites inside the write lock, and
+/// that read changes nothing: cancelling it there releases the lock and leaves
+/// the table as it was.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_cancelled_update_read_releases_the_write_lock_and_changes_nothing() {
+    for mode in [DeletionMode::Key, DeletionMode::Position] {
+        let (provider, catalog, runtime_env, _dir) = seeded_streaming_table(mode).await;
+        let (reached_tx, reached) = tokio::sync::oneshot::channel::<()>();
+        *provider.test_post_scan_input_capture_hook.lock() = Some(Box::new(move || {
+            Box::pin(async move {
+                let _ = reached_tx.send(());
+                std::future::pending::<()>().await;
+            })
+        }));
+        let writer = provider.clone_for_write();
+        let caller = tokio::spawn(async move {
+            let ctx = SessionContext::new();
+            let plan = writer
+                .update(
+                    &ctx.state(),
+                    vec![("value".to_string(), datafusion_expr::lit("new"))],
+                    vec![datafusion_expr::col("id").eq(datafusion_expr::lit(9_i64))],
+                )
+                .await?;
+            datafusion::physical_plan::collect(plan, ctx.task_ctx()).await
+        });
+        tokio::time::timeout(std::time::Duration::from_secs(30), reached)
+            .await
+            .expect("the UPDATE's read starts")
+            .expect("the read signals");
+        assert!(
+            provider.write_lock_arc().try_lock_owned().is_err(),
+            "{mode:?}: the UPDATE reads inside the write lock"
+        );
+        caller.abort();
+        assert!(
+            caller
+                .await
+                .expect_err("the caller is cancelled")
+                .is_cancelled(),
+            "{mode:?}"
+        );
+        let next_writer = tokio::time::timeout(
+            std::time::Duration::from_secs(30),
+            provider.write_lock_arc().lock_owned(),
+        )
+        .await
+        .expect("a cancelled read releases the write lock");
+        drop(next_writer);
+        let expected = (owned(&[(9, "old")]), 1);
+        assert_eq!(visible(&provider).await, expected, "{mode:?}: unchanged");
+        let reopened = reopen(&catalog, &runtime_env).await;
+        assert_eq!(visible(&reopened).await, expected, "{mode:?}: reopened");
+    }
+}
+
 /// Strict `upsert` names how many keys hold different versions in the whole
 /// statement, whatever its batch boundaries and write path: versions within one
 /// batch, across batches, or both, each count once.

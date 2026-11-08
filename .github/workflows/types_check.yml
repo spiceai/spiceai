@@ -5,6 +5,7 @@ on:
 
 jobs:
   build:
+    environment: secret-free
     name: Build ${{ matrix.name }} binaries
     runs-on: ${{ matrix.runner }}
     strategy:
@@ -24,7 +25,7 @@ jobs:
       - name: Set up Rust
         uses: ./.github/actions/setup-rust
 
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
         with:
           save-if: ${{ github.ref == 'refs/heads/trunk' }}
 
@@ -59,14 +60,8 @@ jobs:
             rsync -av "${{ steps.build-spiced.outputs.target_dir_relative }}/" /home/spiceai/build/target/
           fi
 
-      - name: Update build cache (Windows)
-        if: matrix.target_os == 'windows'
-        run: |
-          if (Test-Path C:/spiceai/build/target) {
-            Copy-Item -Recurse -Force "${{ steps.build-spiced.outputs.target_dir_relative }}/*" C:/spiceai/build/target
-          }
-
   test_acceleration:
+    environment: secret-free
     name: '${{ matrix.acceleration.engine }} acceleration on ${{ matrix.target.name }}'
     runs-on: ${{ matrix.target.runner }}
     needs:
@@ -78,7 +73,7 @@ jobs:
         acceleration:
           [
             { engine: arrow, mode: memory },
-            { engine: duckdb, mode: memory },
+            { engine: cayenne, mode: memory },
             { engine: sqlite, mode: memory },
             { engine: postgres },
           ]
@@ -91,7 +86,7 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Set up Python
-        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
         with:
           python-version: 3.x
 

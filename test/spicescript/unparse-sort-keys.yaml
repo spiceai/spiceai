@@ -1,0 +1,54 @@
+name: unparse-sort-keys
+description: >
+  A federated ORDER BY orders the rows by the values the SELECT list returns. A
+  key reading an output that cannot be repeated reads the one value the list
+  shows, and a computed key over SELECT DISTINCT is sent as SQL PostgreSQL
+  accepts (#14109).
+
+sources:
+  src: { kind: postgres }
+
+variants:
+  federated: {}
+
+spicepod:
+  version: v1
+  kind: Spicepod
+  name: unparse-sort-keys
+  datasets:
+    - { from: 'postgres:public.t', name: t, params: '${sources.src.params}' }
+
+defaults:
+  expect: { oracle: src }
+  compare-variants: false
+
+steps:
+  - source-exec:
+      src: CREATE TABLE t (a int PRIMARY KEY); INSERT INTO t SELECT generate_series(1, 50);
+  - start: {}
+  # Controls: a bare output name, or a key the list shows as an output's
+  # expression, binds in the SELECT that computes it, two outputs named a
+  # included.
+  - query: SELECT DISTINCT a, a + 1 AS b FROM t ORDER BY b LIMIT 3
+  - query: SELECT DISTINCT a, a + 1 AS b FROM t ORDER BY a + 1 LIMIT 3
+  - query: SELECT DISTINCT x.a, y.a, x.a + y.a AS k FROM t x CROSS JOIN t y ORDER BY x.a + y.a, x.a LIMIT 3
+  # The ORDER BY of a SELECT DISTINCT may name only what its list shows, so
+  # PostgreSQL answers a computed key only from a SELECT above the DISTINCT one.
+  - query: SELECT DISTINCT a, a + 1 AS b FROM t ORDER BY b + 1 LIMIT 3
+    oracle-sql: SELECT a, b FROM (SELECT DISTINCT a, a + 1 AS b FROM t) d ORDER BY b + 1 LIMIT 3
+  - query: SELECT DISTINCT a FROM t ORDER BY a + 1 DESC LIMIT 3
+    oracle-sql: SELECT a FROM (SELECT DISTINCT a FROM t) d ORDER BY a + 1 DESC LIMIT 3
+  # An unaliased aggregate output has to be named inside the derived table.
+  - query: SELECT DISTINCT a, sum(a) FROM t GROUP BY a ORDER BY a + 1 LIMIT 3
+    oracle-sql: SELECT a, s FROM (SELECT DISTINCT a, sum(a) AS s FROM t GROUP BY a) d ORDER BY a + 1 LIMIT 3
+  # A volatile output answers differently on every run, so these check what
+  # does not change: the query runs, and random() is evaluated once, so the
+  # rows are ordered by the r they return rather than by a second draw.
+  - query: SELECT count(*) AS n FROM (SELECT DISTINCT a, random() AS r FROM t ORDER BY r + 1.0 LIMIT 10) q
+    expect: { rows: [['10']] }
+  - explain: SELECT a, random() AS r FROM t ORDER BY r + 1.0 LIMIT 10
+    contains: VirtualExecutionPlan
+    omits: ['(random() + 1.0)']
+  - explain: SELECT DISTINCT a, random() AS r FROM t ORDER BY r + 1.0 LIMIT 10
+    contains: VirtualExecutionPlan
+    omits: ['(random() + 1.0)', 'random() AS "r" FROM "public"."t" ORDER BY']

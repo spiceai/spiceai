@@ -36,12 +36,14 @@ pub const METRIC_REFRESH_WORKER_PANICS: &str = "dataset_acceleration_refresh_wor
 /// Parquet corruption (`parquet_decode`) or other refresh failures (`other`).
 /// A snapshot reader (`refresh_mode: snapshot`) reports why it could not advance:
 /// `snapshot_not_found` when none is published, `snapshot_older_than_loaded` when
-/// loading the published one would regress the dataset.
+/// loading the published one would regress the dataset, and `snapshot_download_failed`
+/// when a newer one could not be loaded.
 pub const REFRESH_ERROR_REASON: &str = "reason";
 pub const REFRESH_ERROR_REASON_OBJECT_GENERATION_CHANGED: &str = "object_generation_changed";
 pub const REFRESH_ERROR_REASON_PARQUET_DECODE: &str = "parquet_decode";
 pub const REFRESH_ERROR_REASON_SNAPSHOT_NOT_FOUND: &str = "snapshot_not_found";
 pub const REFRESH_ERROR_REASON_SNAPSHOT_OLDER_THAN_LOADED: &str = "snapshot_older_than_loaded";
+pub const REFRESH_ERROR_REASON_SNAPSHOT_DOWNLOAD_FAILED: &str = "snapshot_download_failed";
 pub const REFRESH_ERROR_REASON_OTHER: &str = "other";
 
 static METER: LazyLock<Meter> = LazyLock::new(|| global::meter("dataset_acceleration"));

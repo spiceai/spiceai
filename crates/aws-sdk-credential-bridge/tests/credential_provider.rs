@@ -14,88 +14,15 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use aws_config::BehaviorVersion;
+// The credential tests need `AWS_ROLE_ARN` and `AWS_WEB_IDENTITY_TOKEN_FILE`.
 
-use aws_sdk_cognitoidentity as cognito_identity;
-use aws_sdk_cognitoidentityprovider as cognito_idp;
-use aws_sdk_cognitoidentityprovider::types::AuthFlowType;
 use aws_sdk_credential_bridge::{S3CredentialProvider, get_or_init_sdk_config};
 use object_store::CredentialProvider;
 use reqsign_core::{Context, ProvideCredential};
-use std::io::Write;
-use tempfile::{NamedTempFile, TempDir};
-
-#[expect(clippy::expect_used)]
-async fn setup(file: &mut NamedTempFile) -> std::result::Result<(), Box<dyn std::error::Error>> {
-    let client_id = std::env::var("AWS_S3_CLIENT_ID").expect("AWS_S3_CLIENT_ID must be set");
-    let identity_pool_id =
-        std::env::var("AWS_S3_IDENTITY_POOL_ID").expect("AWS_S3_IDENTITY_POOL_ID must be set");
-    let username = std::env::var("AWS_S3_USERNAME").expect("AWS_S3_USERNAME must be set");
-    let password = std::env::var("AWS_S3_PASSWORD").expect("AWS_S3_PASSWORD must be set");
-    let cognito_idp_uri =
-        std::env::var("AWS_COGNITO_IDP_URI").expect("AWS_COGNITO_IDP_URI must be set");
-
-    let config = aws_config::defaults(BehaviorVersion::latest()).load().await;
-
-    let cognito_idp_client = cognito_idp::Client::new(&config);
-    let cognito_identity_client = cognito_identity::Client::new(&config);
-
-    let auth_response = cognito_idp_client
-        .initiate_auth()
-        .auth_flow(AuthFlowType::UserPasswordAuth)
-        .client_id(client_id)
-        .auth_parameters("USERNAME", username)
-        .auth_parameters("PASSWORD", password)
-        .send()
-        .await?;
-
-    let id_token = auth_response
-        .authentication_result()
-        .as_ref()
-        .and_then(|result| result.id_token())
-        .ok_or("Failed to get ID token")?;
-
-    let identity_id_response = cognito_identity_client
-        .get_id()
-        .identity_pool_id(identity_pool_id)
-        .logins(&cognito_idp_uri, id_token)
-        .send()
-        .await?;
-
-    let identity_id = identity_id_response
-        .identity_id()
-        .ok_or("Failed to get identity ID")?;
-
-    let open_id_token_response = cognito_identity_client
-        .get_open_id_token()
-        .identity_id(identity_id)
-        .logins(cognito_idp_uri, id_token)
-        .send()
-        .await?;
-
-    let token = open_id_token_response
-        .token()
-        .ok_or("Failed to get OpenID token")?;
-
-    writeln!(file, "{token}")?;
-
-    unsafe {
-        std::env::set_var(
-            "AWS_WEB_IDENTITY_TOKEN_FILE",
-            file.path()
-                .to_str()
-                .ok_or("Failed to convert path to string")?,
-        );
-    }
-
-    Ok(())
-}
+use tempfile::TempDir;
 
 #[tokio::test]
 async fn s3_credential_provider_caches_calls_for_iceberg() {
-    let mut file = NamedTempFile::new().expect("To create temp file");
-    setup(&mut file).await.expect("To setup properly");
-
     let (credential_provider, _) = S3CredentialProvider::from_env()
         .await
         .expect("To Create S3CredentialProvider");
@@ -128,10 +55,6 @@ async fn s3_credential_provider_caches_calls_for_iceberg() {
 
 #[tokio::test]
 async fn s3_credential_provider_caches_calls_for_object_store() {
-    let mut tempfile = NamedTempFile::new().expect("To create temp file");
-
-    setup(&mut tempfile).await.expect("To setup properly");
-
     let (credential_provider, _) = S3CredentialProvider::from_env()
         .await
         .expect("To Create S3CredentialProvider");

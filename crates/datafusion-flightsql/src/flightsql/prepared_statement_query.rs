@@ -199,11 +199,16 @@ impl VisitorMut for ConvertJdbcPlaceholdersVisitor {
 // ── Prepared statement handle ─────────────────────────────────────────────────
 
 /// Serialised prepared statement stored inside the opaque handle bytes.
+///
+/// `serde_bytes` lets postcard copy each byte field in one pass rather than one serde call per
+/// byte; the encoded bytes are the same as for a plain `Vec<u8>`.
 #[derive(Serialize, Deserialize)]
 pub(crate) struct PreparedStatement {
     pub(super) query: String,
+    #[serde(with = "serde_bytes")]
     pub(super) parameters: Vec<u8>,
     /// Arrow IPC bytes of the bound parameter schema (set during `DoPut`).
+    #[serde(with = "serde_bytes")]
     pub(super) parameter_schema: Option<Vec<u8>>,
 }
 
@@ -495,7 +500,48 @@ pub(super) fn param_error_to_status<E: std::fmt::Display>(err: E) -> Status {
 
 #[cfg(test)]
 mod tests {
-    use super::decode_param_values;
+    use super::{PreparedStatement, decode_param_values};
+
+    /// The handle with its byte fields as plain serde sequences.
+    #[derive(serde::Serialize, serde::Deserialize)]
+    struct SequenceEncodedStatement {
+        query: String,
+        parameters: Vec<u8>,
+        parameter_schema: Option<Vec<u8>>,
+    }
+
+    #[test]
+    fn handle_bytes_match_the_sequence_encoding() {
+        let cases = [
+            ("SELECT 1", Vec::new(), None),
+            (
+                "SELECT $1",
+                (0..=255_u8).cycle().take(300).collect(),
+                Some(vec![1, 2, 3]),
+            ),
+        ];
+        for (query, parameters, parameter_schema) in cases {
+            let sequence = postcard::to_stdvec(&SequenceEncodedStatement {
+                query: query.to_string(),
+                parameters: parameters.clone(),
+                parameter_schema: parameter_schema.clone(),
+            })
+            .expect("encode the sequence handle");
+            let handle = postcard::to_stdvec(&PreparedStatement {
+                query: query.to_string(),
+                parameters: parameters.clone(),
+                parameter_schema: parameter_schema.clone(),
+            })
+            .expect("encode the handle");
+            assert_eq!(handle, sequence, "handle bytes for {query}");
+
+            let decoded: PreparedStatement =
+                postcard::from_bytes(&sequence).expect("decode the sequence handle");
+            assert_eq!(decoded.query, query);
+            assert_eq!(decoded.parameters, parameters);
+            assert_eq!(decoded.parameter_schema, parameter_schema);
+        }
+    }
 
     /// Builds a `MapArray` the way an Arrow IPC reader does — straight from `ArrayData`, so
     /// neither of `MapArray::try_new`'s `entries` checks runs and a producer's non-conforming

@@ -1,0 +1,71 @@
+name: mysql-cdc-kill-during-compaction
+description: >
+  spiced killed while Cayenne compacts a table fed by MySQL binlog CDC loses and
+  duplicates nothing: after a restart the table equals the source. Each run
+  kills at the first moment a compaction holds a permit; waits for compaction
+  keep writing new data rather than waiting for time.
+sources: { src: { kind: mysql } }
+matrix:
+  run: [1, 2, 3]
+spicepod:
+  version: v1
+  kind: Spicepod
+  name: mysql-cdc-kill-during-compaction
+  datasets:
+    - from: mysql:orders
+      name: orders
+      params: ${sources.src.params}
+      acceleration:
+        enabled: true
+        engine: cayenne
+        mode: file
+        refresh_mode: changes
+        primary_key: o_id
+        params:
+          cayenne_cdc_mem_tier_max_age_ms: '200'
+          cayenne_compaction_trigger_files: '2'
+          cayenne_compaction_background_interval_ms: '200'
+defaults:
+  expect: { oracle: src }
+steps:
+  - generate:
+      src:
+        table: orders
+        rows: 1000000
+        seed: 5
+        primary-key: o_id
+        columns:
+          - { name: o_id, sequence: 1 }
+          - { name: v, int: [0, 999] }
+          - { name: grp, int: [0, 96] }
+          - { name: note, text: [5, 12], nulls: 0.05 }
+  - start: {}
+  - query: SELECT count(*), sum(v), sum(grp) FROM orders
+    eventually: 180s
+  - source-exec:
+      src:
+        - UPDATE orders SET v = v + ${matrix.run} WHERE o_id % 7 = ${matrix.run}
+        - DELETE FROM orders WHERE o_id % 101 = ${matrix.run}
+        - UPDATE orders SET note = NULL WHERE o_id % 13 = ${matrix.run}
+  - generate:
+      src:
+        table: orders
+        rows: 20000
+        seed: 6
+        mode: append
+        columns:
+          - { name: o_id, sequence: 2000000 }
+          - { name: v, int: [1, 1] }
+          - { name: grp, int: [1, 1] }
+          - { name: note, text: [0, 0], nulls: 1.0 }
+  - wait-metric:
+      name: cayenne_compaction_permits_available
+      below: { metric: cayenne_compaction_permits_total }
+      drive: { src: "UPDATE orders SET v = v + 1 WHERE o_id % 50 = ${round} % 50", every: 1s, rounds: 60 }
+  - kill-spiced: { signal: STOP-then-KILL }
+  - source-exec: { src: UPDATE orders SET grp = grp + 1 WHERE o_id % 11 = 0 }
+  - start: {}
+  - query: SELECT count(*), count(DISTINCT o_id), sum(v), sum(grp), count(note) FROM orders
+    eventually: 180s
+  - query: SELECT * FROM orders WHERE o_id % 997 = 0
+    eventually: 30s

@@ -1,0 +1,195 @@
+name: newest-by-time
+description: >
+  A Cayenne acceleration with a primary key and a time_column keeps, per key,
+  the row with the greatest time, whatever order the versions arrive in (a
+  newer version first, the older one hundreds of thousands of rows later), a
+  NULL time being the oldest: under full and append refresh (a late, older
+  row does not replace a stored newer one; a newer one does), with
+  retention_sql, with `cayenne_pk_conflict_detection: none`, after every row
+  is deleted, and in a localpod child; in memory and file mode.
+
+sources:
+  src: { kind: postgres }
+
+matrix:
+  mode: [memory, file]
+
+spicepod:
+  version: v1
+  kind: Spicepod
+  name: newest-by-time
+  datasets:
+    - from: postgres:public.full_src
+      name: e_full
+      params: ${sources.src.params}
+      time_column: occurred_at
+      acceleration:
+        enabled: true
+        engine: cayenne
+        mode: '${matrix.mode}'
+        refresh_mode: full
+        refresh_append_overlap: 7d
+        primary_key: id
+    - from: postgres:public.app_src
+      name: e_app
+      params: ${sources.src.params}
+      time_column: occurred_at
+      acceleration:
+        enabled: true
+        engine: cayenne
+        mode: '${matrix.mode}'
+        refresh_mode: append
+        refresh_append_overlap: 7d
+        primary_key: id
+    - from: postgres:public.ret_src
+      name: e_ret
+      params: ${sources.src.params}
+      time_column: occurred_at
+      acceleration:
+        enabled: true
+        engine: cayenne
+        mode: '${matrix.mode}'
+        refresh_mode: append
+        refresh_append_overlap: 7d
+        primary_key: id
+        retention_sql: DELETE FROM e_ret WHERE v = 'expired'
+        retention_check_enabled: true
+        retention_check_interval: 1s
+    - from: postgres:public.nodet_src
+      name: e_nodet
+      params: ${sources.src.params}
+      time_column: occurred_at
+      acceleration:
+        enabled: true
+        engine: cayenne
+        mode: '${matrix.mode}'
+        refresh_mode: append
+        refresh_append_overlap: 7d
+        primary_key: id
+        params: { cayenne_pk_conflict_detection: none }
+    - from: postgres:public.del_src
+      name: e_del
+      params: ${sources.src.params}
+      time_column: occurred_at
+      access: read_write
+      acceleration:
+        enabled: true
+        engine: cayenne
+        mode: '${matrix.mode}'
+        refresh_mode: append
+        refresh_append_overlap: 7d
+        primary_key: id
+        write_mode: acceleration
+    - from: postgres:public.null_src
+      name: e_null
+      params: ${sources.src.params}
+      time_column: occurred_at
+      acceleration:
+        enabled: true
+        engine: cayenne
+        mode: '${matrix.mode}'
+        refresh_mode: full
+        refresh_append_overlap: 7d
+        primary_key: id
+    - from: postgres:public.lp_src
+      name: e_lp
+      params: ${sources.src.params}
+      time_column: occurred_at
+      acceleration:
+        enabled: true
+        engine: cayenne
+        mode: '${matrix.mode}'
+        refresh_mode: full
+        refresh_append_overlap: 7d
+        primary_key: id
+    - from: localpod:e_lp
+      name: e_child
+      acceleration: { enabled: true, engine: cayenne, mode: '${matrix.mode}', refresh_mode: full }
+
+defaults:
+  # A cluster buckets each acceleration on this column (--cluster).
+  cluster-partition-by: { '*': id }
+  expect: { oracle: src }
+
+steps:
+  - source-exec:
+      src: { file: seed/newest-by-time.sql }
+  - start: { ready-timeout: 300s }
+
+  # Full refresh: one row per key, the newest; a tie on time keeps one row.
+  - query: SELECT id, occurred_at, v FROM e_full WHERE id < 1000 AND id <> 5
+    oracle-sql: SELECT DISTINCT ON (id) id, occurred_at, v FROM full_src WHERE id < 1000 AND id <> 5 ORDER BY id, occurred_at DESC NULLS LAST
+  - query: SELECT count(*) AS n, count(DISTINCT id) AS k FROM e_full
+    oracle-sql: SELECT count(DISTINCT id), count(DISTINCT id) FROM full_src
+  - query: SELECT count(*) AS n FROM e_full WHERE id = 5
+    expect: { rows: [['1']] }
+
+  # Append: a late row older than the stored version does not replace it; a
+  # newer one does; a new key arrives.
+  - source-exec: { src: "INSERT INTO app_src VALUES (1, '2026-01-08', 'late-jan8'), (10, '2026-01-09', 'new-key')" }
+  - refresh: e_app
+  - query: SELECT id, v FROM e_app
+    expect: { rows: [['1', 'stored-jan10'], ['9', 'other-key'], ['10', 'new-key']] }
+    eventually: 30s
+  - source-exec: { src: "INSERT INTO app_src VALUES (1, '2026-01-12', 'newer-jan12')" }
+  - refresh: e_app
+  - query: SELECT id, v FROM e_app
+    expect: { rows: [['1', 'newer-jan12'], ['9', 'other-key'], ['10', 'new-key']] }
+    eventually: 30s
+
+  # Append with retention_sql: a key whose newest version matches goes, in the
+  # first load and in a later append.
+  - query: SELECT id, v FROM e_ret WHERE id < 1000
+    expect: { rows: [['1', 'id1-newest'], ['2', 'id2-newest']] }
+    eventually: 30s
+  - source-exec: { src: "INSERT INTO ret_src VALUES (2, '2026-01-12', 'expired'), (8, '2026-01-11', 'new-key')" }
+  - refresh: e_ret
+  - query: SELECT id, v FROM e_ret WHERE id < 1000
+    expect: { rows: [['1', 'id1-newest'], ['8', 'new-key']] }
+    eventually: 30s
+  - query: SELECT count(*) AS n FROM e_ret
+    expect: { rows: [['300002']] }
+    eventually: 30s
+
+  # With conflict detection off, an append still loads and keeps one row per key.
+  - query: SELECT id, v FROM e_nodet
+    expect: { rows: [['1', 'id1'], ['2', 'id2'], ['3', 'id3']] }
+  - source-exec: { src: "INSERT INTO nodet_src VALUES (4, '2026-01-11', 'id4')" }
+  - refresh: e_nodet
+  - query: SELECT id, v FROM e_nodet
+    expect: { rows: [['1', 'id1'], ['2', 'id2'], ['3', 'id3'], ['4', 'id4']] }
+    eventually: 30s
+
+  # Every row deleted; the next append reloads the source's rows.
+  - spice-exec: DELETE FROM e_del WHERE id % 2 IN (0, 1)
+  - query: SELECT count(*) AS n FROM e_del
+    expect: { rows: [['0']] }
+  - source-exec: { src: "INSERT INTO del_src VALUES (2, '2026-01-12', 'id2')" }
+  - refresh: e_del
+  - query: SELECT id, v FROM e_del WHERE id < 1000
+    expect: { rows: [['1', 'id1'], ['2', 'id2']] }
+    eventually: 30s
+  - query: SELECT count(*) AS n FROM e_del
+    expect: { rows: [['300002']] }
+    eventually: 30s
+
+  # A NULL time is older than any time.
+  - query: SELECT id, v FROM e_null WHERE id < 1000
+    expect: { rows: [['1', 'only-null'], ['2', 'timed'], ['3', 'timed']] }
+  - query: SELECT count(*) AS n FROM e_null
+    expect: { rows: [['300003']] }
+
+  # A localpod child keeps the versions its parent keeps.
+  - query: SELECT id, v FROM e_child
+    expect: { rows: [['1', 'newer'], ['2', 'two']] }
+    eventually: 30s
+  - source-exec: { src: "INSERT INTO lp_src VALUES (1, '2026-01-02 12:00:00', 'older')" }
+  - refresh: e_lp
+  - query: SELECT id, v FROM e_child
+    expect: { rows: [['1', 'newer'], ['2', 'two']] }
+    eventually: 30s
+  - source-exec: { src: "TRUNCATE lp_src; INSERT INTO lp_src VALUES (1, '2026-01-01', 'timed'), (1, NULL, 'null-time')" }
+  - refresh: e_lp
+  - query: SELECT id, v FROM e_child
+    expect: { rows: [['1', 'timed']] }
+    eventually: 30s

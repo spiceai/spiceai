@@ -239,7 +239,6 @@ async fn duckdb_order_by_special_cases() -> Result<(), String> {
         .await
 }
 
-#[cfg(not(windows))]
 #[tokio::test]
 async fn duckdb_regexp() -> Result<(), String> {
     let _tracing = init_tracing(Some("integration=debug,info"));
@@ -603,11 +602,11 @@ async fn duckdb_connector_does_not_push_down_spice_functions() -> Result<(), Str
                 .expect("Should format batches");
             let plan = pretty.to_string();
 
-            // With federation working the scan appears as VirtualExecutionPlan name=duckdb;
-            // on the scan fallback path it appears as DuckSqlExec. Either indicates that
-            // the DuckDB connector is being used for the table scan.
+            // The DuckDB connector reads through ADBC: with federation working the
+            // scan appears as `VirtualExecutionPlan name=adbc`, carrying the SQL
+            // DuckDB receives.
             assert!(
-                plan.contains("name=duckdb") || plan.contains("DuckSqlExec"),
+                plan.contains("VirtualExecutionPlan name=adbc"),
                 "expected the connector plan to push a scan down to DuckDB; plan was:\n{plan}"
             );
             // json_get_str must not appear in any SQL sent to DuckDB.

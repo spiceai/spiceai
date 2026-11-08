@@ -26,14 +26,19 @@ use cache::result::CacheStatus;
 use futures::TryStreamExt;
 
 use runtime::{Runtime, datafusion::query::QueryBuilder};
+use runtime_request_context::{CacheControl, Protocol, RequestContext};
 use spicepod::{
-    component::{caching::SQLResultsCacheConfig, dataset::Dataset},
+    component::{
+        caching::{CacheKeyType, SQLResultsCacheConfig},
+        dataset::Dataset,
+        view::View,
+    },
     param::Params,
 };
 
 use crate::{
     configure_test_datafusion, init_tracing,
-    utils::{register_test_connectors, test_request_context},
+    utils::{register_test_connectors, test_request_context, wait_until_true},
 };
 
 fn make_s3_tpch_dataset(name: &str) -> Dataset {
@@ -178,4 +183,107 @@ async fn execute_query_and_check_cache_status(
     assert_eq!(query_result.cache_status, expected_cache_status);
 
     Ok(records)
+}
+
+async fn count_of(rt: &Runtime, query: &str) -> Result<i64, String> {
+    let batches = QueryBuilder::new(query, rt.datafusion())
+        .build()
+        .run()
+        .await
+        .map_err(|e| e.to_string())?
+        .data
+        .try_collect::<Vec<RecordBatch>>()
+        .await
+        .map_err(|e| e.to_string())?;
+    batches
+        .first()
+        .and_then(|batch| {
+            batch
+                .column(0)
+                .as_any()
+                .downcast_ref::<arrow::array::Int64Array>()
+        })
+        .map(|counts| counts.value(0))
+        .ok_or_else(|| format!("no count in {batches:?}"))
+}
+
+/// A cached result keyed on the SQL text records the tables a view reads, not the
+/// view, so editing or removing the view must still stop that result from being served.
+#[tokio::test]
+async fn results_cache_follows_a_redefined_or_removed_view() -> Result<(), String> {
+    let _tracing = init_tracing(None);
+    register_test_connectors().await;
+
+    // An HTTP request to a runtime with `cache_key_type: sql` keys results on the SQL text.
+    Arc::new(
+        RequestContext::builder(Protocol::Http)
+            .with_cache_control(CacheControl::Cache(
+                runtime_request_context::CacheKeyType::Raw,
+            ))
+            .build(),
+    )
+    .scope(async {
+        let dir = tempfile::tempdir().map_err(|e| e.to_string())?;
+        let csv = dir.path().join("values.csv");
+        std::fs::write(&csv, "value\n5\n15\n25\n50\n75\n").map_err(|e| e.to_string())?;
+
+        let app = |view_sql: Option<&str>| {
+            let mut builder = AppBuilder::new("results_cache_view")
+                .with_sql_cache(SQLResultsCacheConfig {
+                    item_ttl: Some("10m".to_string()),
+                    cache_key_type: CacheKeyType::Sql,
+                    ..Default::default()
+                })
+                .with_dataset(Dataset::new(format!("file:{}", csv.display()), "t"));
+            if let Some(sql) = view_sql {
+                let mut view = View::new("v".to_string());
+                view.sql = Some(sql.to_string());
+                builder = builder.with_view(view);
+            }
+            builder.build()
+        };
+
+        configure_test_datafusion();
+        let rt = Arc::new(
+            Runtime::builder()
+                .with_app(app(Some("SELECT * FROM t WHERE value > 10")))
+                .build()
+                .await,
+        );
+        Arc::clone(&rt).load_components().await;
+
+        let query = "SELECT COUNT(*) FROM v";
+        assert_eq!(count_of(&rt, query).await?, 4);
+        execute_query_and_check_cache_status(&rt, query, CacheStatus::CacheHit).await?;
+
+        assert!(
+            Arc::clone(&rt)
+                .apply_app(Arc::new(app(Some("SELECT * FROM t WHERE value > 50"))))
+                .await
+        );
+        // The redefined view registers in the background after `apply_app` returns.
+        assert!(
+            wait_until_true(std::time::Duration::from_secs(30), || async {
+                count_of(&rt, query).await.is_ok()
+            })
+            .await,
+            "the redefined view must register"
+        );
+        assert_eq!(
+            count_of(&rt, query).await?,
+            1,
+            "the redefined view must not be answered from the old definition's result"
+        );
+
+        assert!(Arc::clone(&rt).apply_app(Arc::new(app(None))).await);
+        let removed = count_of(&rt, query).await;
+        assert!(
+            removed.is_err(),
+            "a removed view must not be answered from the cache: {removed:?}"
+        );
+
+        rt.shutdown().await;
+        Ok(())
+    })
+    .await
 }

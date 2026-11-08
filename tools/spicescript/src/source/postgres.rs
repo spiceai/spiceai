@@ -53,6 +53,7 @@ impl Postgres {
             ports: vec![5432],
             healthcheck: Some(healthcheck("pg_isready -U postgres -h 127.0.0.1")),
             network: None,
+            alias: None,
         })
         .await?;
         Ok(Self { container })
@@ -140,6 +141,24 @@ impl Source for Postgres {
             .collect();
         let rows = records.map(|row| row.into_iter().collect()).collect();
         Ok(TextResult { columns, rows })
+    }
+
+    async fn apply(
+        &self,
+        namespace: &str,
+        table: &str,
+        key: &str,
+        changes: &[super::write::RowChange],
+    ) -> Result<()> {
+        let sql = super::write::sql_changes(table, key, changes, self.dialect())?;
+        if sql.is_empty() {
+            return Ok(());
+        }
+        let mut input = std::iter::once(Ok(sql.into_bytes()));
+        self.container
+            .exec_with_input(&psql_command(namespace, &[]), &mut input)
+            .await?;
+        Ok(())
     }
 
     fn dialect(&self) -> crate::generate::Dialect {

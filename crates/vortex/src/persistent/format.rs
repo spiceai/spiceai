@@ -84,7 +84,8 @@ use super::write_observer::VortexWriteObserver;
 use crate::PrecisionExt as _;
 use crate::convert::TryToDataFusion;
 
-const DEFAULT_FOOTER_INITIAL_READ_SIZE_BYTES: usize = MAX_POSTSCRIPT_SIZE as usize + EOF_SIZE;
+pub(super) const DEFAULT_FOOTER_INITIAL_READ_SIZE_BYTES: usize =
+    MAX_POSTSCRIPT_SIZE as usize + EOF_SIZE;
 const DEFAULT_TARGET_FILE_SIZE_MB: usize = 128;
 
 /// Controls projection-expression pushdown into Vortex scans.

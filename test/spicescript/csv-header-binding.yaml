@@ -1,0 +1,141 @@
+name: csv-header-binding
+description: >
+  A headered CSV file binds its columns by header name, not by position:
+  after the file is rewritten with the same rows and its columns in an order
+  that differs from the registered schema, federated reads and a full Arrow
+  refresh return each value under its own name, both over HTTP and from a
+  local `file://` directory. When a registered column is renamed in the
+  header, a federated read returns NULL for it with one WARN, and a refresh
+  fails so the accelerated copy keeps the last good rows; restoring the
+  header clears the error.
+
+sources:
+  api: { kind: mock-http }
+  lake: { kind: files }
+
+spicepod:
+  version: v1
+  kind: Spicepod
+  name: csv-header-binding
+  runtime:
+    caching: { sql_results: { enabled: false } }
+  datasets:
+    - from: ${sources.api.url}/events.csv
+      name: csv_fed
+      params: &http { file_format: csv, response_cache_max_size_bytes: '0' }
+    - from: ${sources.api.url}/events.csv
+      name: csv_acc
+      params: *http
+      acceleration: { enabled: true, engine: arrow, refresh_mode: full, refresh_retry_max_attempts: 1 }
+    - from: 'file://${sources.lake.path}/t/'
+      name: file_fed
+      params: { file_format: csv }
+    - from: 'file://${sources.lake.path}/t/'
+      name: file_acc
+      params: { file_format: csv }
+      acceleration: { enabled: true, engine: arrow, refresh_mode: full, refresh_retry_max_attempts: 1 }
+
+steps:
+  # Registered schema: id, user_id, region, amount_cents.
+  - source-exec:
+      api: |
+        path: /events.csv
+        headers: { content-type: text/csv }
+        body: "id,user_id,region,amount_cents\n1,10,us,100\n2,20,eu,200\n"
+  # Generated values are seeded per column name, so a later `generate` that
+  # lists the same columns in another order writes the same values under the
+  # same names, with the CSV header in the new order.
+  - generate:
+      lake:
+        table: t
+        rows: 200
+        seed: 41
+        format: csv
+        files: 2
+        columns:
+          - { name: id, sequence: 1 }
+          - { name: small, int: [1, 9] }
+          - { name: label, choice: [red, green, blue] }
+          - { name: large, int: [1000, 9999] }
+  - start: {}
+
+  - query: SELECT sum(amount_cents) AS amount_cents, sum(user_id) AS user_id FROM csv_fed
+    expect: { rows: [['300', '30']] }
+  - query: SELECT sum(amount_cents) AS amount_cents, sum(user_id) AS user_id FROM csv_acc
+    expect: { rows: [['300', '30']] }
+    eventually: 30s
+  - query: SELECT id, small, label, large FROM file_fed ORDER BY id
+    id: file-baseline
+    expect: {}
+  - query: SELECT id, small, label, large FROM file_acc ORDER BY id
+    expect: { same-as: file-baseline }
+    eventually: 30s
+
+  # The same rows with the two integer columns swapped in the header. A
+  # positional reader returns 30 / 300 here, with no error.
+  - source-exec:
+      api: |
+        path: /events.csv
+        headers: { content-type: text/csv }
+        body: "id,amount_cents,region,user_id\n1,100,us,10\n2,200,eu,20\n"
+  - query: SELECT sum(amount_cents) AS amount_cents, sum(user_id) AS user_id FROM csv_fed
+    expect: { rows: [['300', '30']] }
+  - query: SELECT id, user_id, region, amount_cents FROM csv_fed ORDER BY id
+    expect: { rows: [['1', '10', us, '100'], ['2', '20', eu, '200']] }
+  - refresh: csv_acc
+  - query: SELECT sum(amount_cents) AS amount_cents, sum(user_id) AS user_id FROM csv_acc
+    expect: { rows: [['300', '30']] }
+  - assert-status: { dataset: csv_acc, status: Ready }
+
+  # The local files, rewritten with the two integer columns swapped in the
+  # header. A positional reader serves `large` as `small`, with no error.
+  - generate:
+      lake:
+        table: t
+        rows: 200
+        seed: 41
+        format: csv
+        files: 2
+        columns:
+          - { name: id, sequence: 1 }
+          - { name: large, int: [1000, 9999] }
+          - { name: label, choice: [red, green, blue] }
+          - { name: small, int: [1, 9] }
+  - query: SELECT id, small, label, large FROM file_fed ORDER BY id
+    expect: { same-as: file-baseline }
+  - refresh: file_acc
+  - query: SELECT id, small, label, large FROM file_acc ORDER BY id
+    expect: { same-as: file-baseline }
+
+  # A registered column renamed in the header: NULL on a federated read, and
+  # a refresh that fails rather than overwrite the accelerated rows.
+  - source-exec:
+      api: |
+        path: /events.csv
+        headers: { content-type: text/csv }
+        body: "id,user_id,region,amt\n1,10,us,100\n2,20,eu,200\n"
+  - query: SELECT sum(amount_cents) AS amount_cents, sum(user_id) AS user_id FROM csv_fed
+    expect: { rows: [[null, '30']] }
+  - assert-log:
+      contains: ["Dataset 'csv_fed': registered column 'amount_cents' missing"]
+  - refresh: { dataset: csv_acc, expect-error: true }
+  - assert-status: { dataset: csv_acc, status: Error }
+    eventually: 30s
+  - assert-log:
+      contains: ["Dataset 'csv_acc': registered column 'amount_cents' missing from every source file scanned"]
+  - query: SELECT sum(amount_cents) AS amount_cents, sum(user_id) AS user_id FROM csv_acc
+    expect: { rows: [['300', '30']] }
+
+  # The header restored: federated sums return and a refresh succeeds.
+  - source-exec:
+      api: |
+        path: /events.csv
+        headers: { content-type: text/csv }
+        body: "id,user_id,region,amount_cents\n1,10,us,100\n2,20,eu,200\n"
+  - query: SELECT sum(amount_cents) AS amount_cents, sum(user_id) AS user_id FROM csv_fed
+    expect: { rows: [['300', '30']] }
+  - refresh: csv_acc
+  - assert-status: { dataset: csv_acc, status: Ready }
+    eventually: 30s
+  - query: SELECT sum(amount_cents) AS amount_cents, sum(user_id) AS user_id FROM csv_acc
+    expect: { rows: [['300', '30']] }

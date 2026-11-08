@@ -522,6 +522,38 @@ pub fn array_value_to_string(array: &dyn Array, index: usize) -> Result<Option<S
             array, index,
         )?)),
 
+        DataType::Struct(fields) => {
+            let values = array.as_struct();
+            let fields = fields
+                .iter()
+                .zip(values.columns())
+                .map(|(field, column)| {
+                    Ok(format!(
+                        "{:?}: {:?}",
+                        field.name(),
+                        array_value_to_string(column.as_ref(), index)?
+                    ))
+                })
+                .collect::<Result<Vec<_>>>()?;
+            Ok(Some(format!("{{{}}}", fields.join(", "))))
+        }
+
+        DataType::Map(_, _) => {
+            let entries = array.as_map().value(index);
+            let mut values = (0..entries.len())
+                .map(|row| {
+                    Ok(format!(
+                        "{:?}: {:?}",
+                        array_value_to_string(entries.column(0).as_ref(), row)?,
+                        array_value_to_string(entries.column(1).as_ref(), row)?
+                    ))
+                })
+                .collect::<Result<Vec<_>>>()?;
+            // SQL maps compare by their entries, independently of insertion order.
+            values.sort_unstable();
+            Ok(Some(format!("{{{}}}", values.join(", "))))
+        }
+
         DataType::List(_) | DataType::LargeList(_) | DataType::FixedSizeList(_, _) => {
             let values = match array.data_type() {
                 DataType::List(_) => array.as_list::<i32>().value(index),
@@ -1967,6 +1999,43 @@ mod test {
     use super::*;
     use arrow::datatypes::{Field, Schema, TimeUnit};
     use std::sync::Arc;
+
+    #[test]
+    fn nested_values_keep_nulls_and_delimiters_distinct() {
+        use arrow::array::{ArrayRef, StructArray};
+        let field = Arc::new(Field::new("text", DataType::Utf8, true));
+        let values: ArrayRef =
+            Arc::new(StringArray::from(vec![None, Some("None"), Some("a, b: c")]));
+        let array = StructArray::from(vec![(field, values)]);
+        let rendered = (0..3)
+            .map(|row| array_value_to_string(&array, row).expect("struct value"))
+            .collect::<Vec<_>>();
+        assert_ne!(rendered[0], rendered[1]);
+        assert_ne!(rendered[1], rendered[2]);
+    }
+
+    #[test]
+    fn maps_compare_entries_without_losing_values_or_multiplicity() {
+        use arrow::array::{MapBuilder, StringBuilder};
+        let mut builder = MapBuilder::new(None, StringBuilder::new(), StringBuilder::new());
+        for entries in [
+            [("a", Some("one")), ("b", None)],
+            [("b", None), ("a", Some("one"))],
+            [("b", Some("None")), ("a", Some("one"))],
+        ] {
+            for (key, value) in entries {
+                builder.keys().append_value(key);
+                builder.values().append_option(value);
+            }
+            builder.append(true).expect("map row");
+        }
+        let array = builder.finish();
+        let rendered = (0..3)
+            .map(|row| array_value_to_string(&array, row).expect("map value"))
+            .collect::<Vec<_>>();
+        assert_eq!(rendered[0], rendered[1]);
+        assert_ne!(rendered[0], rendered[2]);
+    }
 
     /// `GROUP BY f` over -inf, -0, 0: `PostgreSQL` names the -0/0 group `-0`,
     /// `DataFusion` `0`, and SQL holds them equal; rendered apart they sorted to

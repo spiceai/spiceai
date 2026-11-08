@@ -46,6 +46,7 @@ use std::time::{Duration, Instant};
 
 use app::AppBuilder;
 use axum::{Router, routing::get};
+#[cfg(feature = "duckdb")]
 use datafusion::common::TableReference;
 use datafusion::prelude::*;
 use runtime::Runtime;
@@ -292,6 +293,7 @@ async fn wait_for_rows_driving_lookups(
 /// This is the completion signal for a refused write. Waiting a fixed time
 /// instead would let an assertion that nothing was cached pass simply because no
 /// write had been attempted yet.
+#[cfg(feature = "duckdb")]
 async fn wait_for_dataset_error(
     rt: &Runtime,
     dataset: &str,
@@ -313,6 +315,24 @@ async fn wait_for_dataset_error(
     ))
 }
 
+fn cayenne_params(dir: &std::path::Path, extra: Vec<(&str, &str)>) -> Vec<(String, String)> {
+    let mut params = vec![(
+        "cayenne_file_path".to_string(),
+        dir.join("cache.duckdb").to_string_lossy().to_string(),
+    )];
+    params.extend(
+        extra
+            .into_iter()
+            .map(|(k, v)| (k.to_string(), v.to_string())),
+    );
+    params
+}
+
+/// Cayenne caches one row of a multi-row response under a request-derived key
+/// instead of refusing the write (#15548, guarded on Cayenne by
+/// `test/spicescript/known-failing/caching-http/http-caching-request-key.yaml`).
+/// Only the `DuckDB` case of that contract uses this, and it goes with the engine.
+#[cfg(feature = "duckdb")]
 fn duckdb_params(dir: &std::path::Path, extra: Vec<(&str, &str)>) -> Vec<(String, String)> {
     let mut params = vec![(
         "duckdb_file".to_string(),
@@ -333,12 +353,8 @@ fn duckdb_params(dir: &std::path::Path, extra: Vec<(&str, &str)>) -> Vec<(String
 /// widened to the whole stored row -- including the `Map` the HTTP connector
 /// stores response headers in -- so it failed on every pass and the acceleration
 /// grew without bound.
-///
-/// Cayenne rather than `DuckDB` because the defect is above both engines and
-/// Cayenne had no coverage of the budgets at all.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-// Cayenne is not built on Windows, so neither is a test that loads it.
-#[cfg(all(feature = "sqlite", not(target_os = "windows")))]
+#[cfg(feature = "sqlite")]
 async fn the_item_budget_is_enforced_on_cayenne_with_a_primary_key() -> Result<(), anyhow::Error> {
     let _tracing = init_tracing(None);
     register_test_connectors().await;
@@ -388,8 +404,7 @@ async fn the_item_budget_is_enforced_on_cayenne_with_a_primary_key() -> Result<(
 ///
 /// `indexes: unique` becomes a `Constraint::Unique` on the accelerator, which
 /// widens the sweep's group key exactly as a primary key does, so it is an
-/// independently reachable trigger for the same defect. `DuckDB` rather than
-/// Cayenne so this case also runs where Cayenne is not built.
+/// independently reachable trigger for the same defect.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn the_item_budget_is_enforced_with_a_unique_index() -> Result<(), anyhow::Error> {
     let _tracing = init_tracing(None);
@@ -399,10 +414,10 @@ async fn the_item_budget_is_enforced_with_a_unique_index() -> Result<(), anyhow:
     let temp = tempfile::tempdir()?;
     let mut dataset = caching_dataset(
         addr,
-        "duckdb",
+        "cayenne",
         // Deliberately no primary key: the unique index alone must be enough.
         None,
-        duckdb_params(
+        cayenne_params(
             temp.path(),
             vec![
                 ("caching_ttl", "30s"),
@@ -452,9 +467,9 @@ async fn a_multi_row_response_is_cached_without_a_primary_key() -> Result<(), an
     let temp = tempfile::tempdir()?;
     let dataset = caching_dataset(
         addr,
-        "duckdb",
+        "cayenne",
         None,
-        duckdb_params(temp.path(), vec![("caching_ttl", "1h")]),
+        cayenne_params(temp.path(), vec![("caching_ttl", "1h")]),
     );
     let rt = build_runtime(dataset, "caching_multi_row_unkeyed").await;
 
@@ -491,10 +506,10 @@ async fn a_multi_row_response_is_cached_with_a_body_derived_primary_key()
     let temp = tempfile::tempdir()?;
     let dataset = caching_dataset(
         addr,
-        "duckdb",
+        "cayenne",
         // `content` holds the element's JSON, so it is distinct per row.
         Some("(request_path,content)"),
-        duckdb_params(temp.path(), vec![("caching_ttl", "1h")]),
+        cayenne_params(temp.path(), vec![("caching_ttl", "1h")]),
     );
     let rt = build_runtime(dataset, "caching_multi_row_body_key").await;
 
@@ -523,6 +538,7 @@ async fn a_multi_row_response_is_cached_with_a_body_derived_primary_key()
 /// keeping the last row, which would silently discard the rest of a search
 /// result. Caching nothing is recoverable and visible in the logs; caching one
 /// row of three is neither.
+#[cfg(feature = "duckdb")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_request_derived_primary_key_refuses_a_multi_row_response() -> Result<(), anyhow::Error> {
     let _tracing = init_tracing(None);
@@ -588,9 +604,9 @@ async fn a_primary_key_with_on_conflict_upsert_still_caches() -> Result<(), anyh
     let temp = tempfile::tempdir()?;
     let dataset = caching_dataset_with(
         addr,
-        "duckdb",
+        "cayenne",
         Some("(request_query,request_path)"),
-        duckdb_params(temp.path(), vec![("caching_ttl", "1h")]),
+        cayenne_params(temp.path(), vec![("caching_ttl", "1h")]),
         true,
         true,
     );
@@ -634,9 +650,9 @@ async fn a_refreshed_entry_sheds_rows_the_response_no_longer_returns() -> Result
     let temp = tempfile::tempdir()?;
     let dataset = caching_dataset(
         addr,
-        "duckdb",
+        "cayenne",
         Some("(request_path,content)"),
-        duckdb_params(
+        cayenne_params(
             temp.path(),
             vec![
                 ("caching_ttl", "1s"),
@@ -676,8 +692,7 @@ async fn a_refreshed_entry_sheds_rows_the_response_no_longer_returns() -> Result
 /// still read all of them as one: every lookup returns its row, and keys cached
 /// earlier are served without another fetch.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-// Cayenne is not built on Windows, so neither is a test that loads it.
-#[cfg(all(feature = "sqlite", not(target_os = "windows")))]
+#[cfg(feature = "sqlite")]
 async fn a_point_lookup_reads_every_cayenne_scan_partition() -> Result<(), anyhow::Error> {
     use arrow::util::display::array_value_to_string;
     use futures::TryStreamExt;

@@ -19,7 +19,12 @@ limitations under the License.
 //! and replication slots again.
 
 use secrecy::SecretString;
-use std::{collections::BTreeMap, path::PathBuf, sync::Arc, time::Duration};
+use std::{
+    collections::BTreeMap,
+    path::{Path, PathBuf},
+    sync::Arc,
+    time::Duration,
+};
 
 use anyhow::{Context, Result, bail, ensure};
 use arrow::array::RecordBatch;
@@ -31,6 +36,10 @@ use tokio::process::{Child, Command};
 use crate::docker::free_port;
 
 const ERROR_GRACE: Duration = Duration::from_secs(20);
+
+/// How long to wait, once `/v1/ready` has answered 200, for datasets still
+/// reported as loading.
+const SETTLE_AFTER_READY: Duration = Duration::from_secs(30);
 
 pub struct Spiced {
     pub binary: PathBuf,
@@ -52,11 +61,29 @@ pub struct Spiced {
     tls_ca: Option<PathBuf>,
     /// Arguments passed to `spiced` after the endpoint flags.
     extra_args: Vec<String>,
+    /// The datasets the spicepod of the latest start declares.
+    declared_datasets: Vec<String>,
     /// Flight SQL clients kept by session name, for statements that share one.
     sessions: std::collections::HashMap<
         String,
         arrow_flight::sql::client::FlightSqlServiceClient<tonic::transport::Channel>,
     >,
+    /// Runs `spiced` in a container rather than as a local process.
+    container: Option<ContainerRun>,
+    /// The `binary` last copied into `dir` for a container to run.
+    staged_from: Option<PathBuf>,
+}
+
+/// A container `spiced` runs in: on the host's network, so it serves on the
+/// same local ports a process would, with the binary and `volumes` mounted
+/// and its working directory at the same path as on the host. Everything
+/// else, the temporary directory included, is its own.
+#[derive(Debug, Clone)]
+pub struct ContainerRun {
+    pub image: String,
+    pub name: String,
+    /// `docker run -v` specifications.
+    pub volumes: Vec<String>,
 }
 
 /// Which API key a request presents.
@@ -81,6 +108,7 @@ impl Spiced {
             otel: free_port()?,
             child: None,
             flight_client: None,
+            declared_datasets: Vec::new(),
             http_client: reqwest::Client::builder()
                 .timeout(Duration::from_secs(60))
                 .build()?,
@@ -91,7 +119,14 @@ impl Spiced {
             tls_ca: None,
             extra_args: Vec::new(),
             sessions: std::collections::HashMap::new(),
+            container: None,
+            staged_from: None,
         })
+    }
+
+    /// Runs `spiced` in this container on every start.
+    pub fn set_container(&mut self, run: ContainerRun) {
+        self.container = Some(run);
     }
 
     /// Serves HTTP on `port`, one a script was told in advance
@@ -197,19 +232,29 @@ impl Spiced {
             bail!("spiced is already running");
         }
         std::fs::write(self.dir.join("spicepod.yaml"), spicepod_yaml)?;
+        self.declared_datasets = declared_datasets(spicepod_yaml);
         let log = std::fs::OpenOptions::new()
             .create(true)
             .append(true)
             .open(self.log_path())?;
-        let child = Command::new(&self.binary)
-            .current_dir(&self.dir)
+        let mut command = match self.container.clone() {
+            None => {
+                let mut command = Command::new(&self.binary);
+                command.current_dir(&self.dir).envs(&self.env);
+                command
+            }
+            Some(run) => {
+                let binary = self.stage_binary()?;
+                self.container_command(&run, &binary)?
+            }
+        };
+        let child = command
             .arg("--telemetry-enabled=false")
             .args(["--http", &format!("127.0.0.1:{}", self.http)])
             .args(["--flight", &format!("127.0.0.1:{}", self.flight)])
             .args(["--metrics", &format!("127.0.0.1:{}", self.metrics)])
             .args(["--open_telemetry", &format!("127.0.0.1:{}", self.otel)])
             .args(&self.extra_args)
-            .envs(&self.env)
             .stdout(log.try_clone()?)
             .stderr(log)
             .kill_on_drop(true)
@@ -223,9 +268,88 @@ impl Spiced {
             )?;
             crate::cleanup::track_process(pid, self.http);
         }
+        if let Some(run) = &self.container {
+            crate::cleanup::track_container(&run.name, &run.name, None);
+        }
         self.child = Some(child);
         self.flight_client = None;
         Ok(())
+    }
+
+    /// The binary a container runs: a copy of `binary` in this instance's
+    /// directory, made again only when `binary` changes.
+    ///
+    /// A `docker run -v` source is a path on the Docker daemon's filesystem,
+    /// which need not be this process's: under Docker-in-Docker the daemon
+    /// shares only the runner's work volume, and for a source it cannot see
+    /// it mounts an empty directory, so the container fails with
+    /// `exec /usr/local/bin/spiced failed: Permission denied`. The instance
+    /// directory is mounted into the container already, so the daemon sees
+    /// the copy wherever it sees the rest of the run.
+    fn stage_binary(&mut self) -> Result<PathBuf> {
+        let copy = std::path::absolute(self.dir.join("spiced.bin"))?;
+        if self.staged_from.as_ref() != Some(&self.binary) {
+            std::fs::copy(&self.binary, &copy).with_context(|| {
+                format!(
+                    "Failed to copy {} to {} for its container",
+                    self.binary.display(),
+                    copy.display()
+                )
+            })?;
+            self.staged_from = Some(self.binary.clone());
+        }
+        Ok(copy)
+    }
+
+    /// `docker run` for `run`, in the foreground so that its output is the log
+    /// and the signals `stop` sends reach `spiced`.
+    fn container_command(&self, run: &ContainerRun, binary: &Path) -> Result<Command> {
+        use std::os::unix::fs::MetadataExt;
+        // A container left behind by an interrupted run would hold the name.
+        let _ = std::process::Command::new("docker")
+            .args(["rm", "-f", &run.name])
+            .output();
+        let dir = std::path::absolute(&self.dir)?;
+        let owner = std::fs::metadata(&dir)?;
+        let mut command = Command::new("docker");
+        command
+            .args(["run", "--rm", "--init", "--network", "host"])
+            .args(["--name", &run.name])
+            .arg("--label")
+            .arg(format!(
+                "{}={}",
+                crate::docker::RUNNER_LABEL,
+                std::process::id()
+            ))
+            // Files it writes in the shared directories stay the runner's.
+            .args(["--user", &format!("{}:{}", owner.uid(), owner.gid())])
+            .arg("-v")
+            .arg(format!("{}:/usr/local/bin/spiced:ro", binary.display()))
+            .arg("-v")
+            .arg(format!("{0}:{0}", dir.display()))
+            .arg("-w")
+            .arg(&dir)
+            .arg("-e")
+            .arg(format!("HOME={}", dir.display()));
+        for volume in &run.volumes {
+            command.args(["-v", volume]);
+        }
+        for (key, value) in &self.env {
+            command.arg("-e").arg(format!("{key}={value}"));
+        }
+        command.arg(&run.image).arg("/usr/local/bin/spiced");
+        Ok(command)
+    }
+
+    /// Stops this instance's container at once, if it runs in one.
+    async fn kill_container(&self) {
+        if let Some(run) = &self.container {
+            let _ = Command::new("docker")
+                .args(["kill", &run.name])
+                .output()
+                .await;
+            crate::cleanup::untrack_container(&run.name);
+        }
     }
 
     /// Waits until a scheduler has at least `count` executors ready to take work
@@ -293,6 +417,7 @@ impl Spiced {
             if let Ok(r) = self.http_client.get(&url).send().await
                 && r.status().is_success()
             {
+                self.wait_loaded_after_ready().await;
                 return self.wait_flight(deadline, timeout).await;
             }
             // A dataset can report `Error` while it retries a transient
@@ -402,6 +527,36 @@ impl Spiced {
         matches!(self.http_client.get(url).send().await, Ok(r) if r.status().is_success())
     }
 
+    /// On loaded CI runners, `/v1/ready` has answered 200 before the
+    /// spicepod's datasets were registered (the runtime's own components were
+    /// ready, and the datasets not yet known), so a query found its table
+    /// missing. So once ready, wait up to [`SETTLE_AFTER_READY`] for every
+    /// declared dataset to be listed and loaded, and say so in the script's
+    /// output: that line is the evidence of readiness reported early.
+    async fn wait_loaded_after_ready(&self) {
+        let loading = not_yet_loaded(
+            &self.dataset_status().await.unwrap_or_default(),
+            &self.declared_datasets,
+        );
+        if loading.is_empty() {
+            return;
+        }
+        crate::runner::emit(&format!(
+            "   /v1/ready answered 200 while datasets were still loading: {}; waiting up to {SETTLE_AFTER_READY:?} for them",
+            loading.join(", ")
+        ));
+        let deadline = tokio::time::Instant::now() + SETTLE_AFTER_READY;
+        while tokio::time::Instant::now() < deadline
+            && !not_yet_loaded(
+                &self.dataset_status().await.unwrap_or_default(),
+                &self.declared_datasets,
+            )
+            .is_empty()
+        {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    }
+
     async fn dataset_status(&self) -> Result<String> {
         let url = format!(
             "{}://127.0.0.1:{}/v1/datasets?status=true",
@@ -443,13 +598,14 @@ impl Spiced {
         };
         self.child = None;
         self.flight_client = None;
+        self.kill_container().await;
         outcome
     }
 
     /// Kills `spiced` without letting it shut down. With `freeze_first` it is
     /// sent SIGSTOP first, so it is frozen at one point before it dies.
     pub async fn kill(&mut self, freeze_first: bool) -> Result<()> {
-        let Some(child) = self.child.as_mut() else {
+        let Some(mut child) = self.child.take() else {
             bail!("spiced is not running");
         };
         if let Some(pid) = child.id() {
@@ -458,8 +614,8 @@ impl Spiced {
                 nix::sys::signal::kill(Pid::from_raw(pid.cast_signed()), Signal::SIGSTOP)?;
             }
         }
+        self.kill_container().await;
         child.kill().await?;
-        self.child = None;
         self.flight_client = None;
         Ok(())
     }
@@ -478,6 +634,79 @@ impl Spiced {
         let client = self.flight().await?;
         let stream = client.query(sql).await?;
         Ok(stream.try_collect().await?)
+    }
+
+    /// Retains the Flight stream's schema when a query returns no batches.
+    pub async fn query_with_schema(&mut self, sql: &str, key: &Key) -> Result<Vec<RecordBatch>> {
+        let client = match key {
+            Key::Default => self.flight().await?.clone(),
+            Key::None => self.connect_flight(None).await?,
+            Key::Given(key) => self.connect_flight(Some(key)).await?,
+        };
+        let mut stream = client.query(sql).await?;
+        let mut batches = Vec::new();
+        while let Some(batch) = stream.try_next().await? {
+            batches.push(batch);
+        }
+        if batches.is_empty() {
+            let schema = stream.schema().context("Flight returned no schema")?;
+            batches.push(RecordBatch::new_empty(Arc::clone(schema)));
+        }
+        Ok(batches)
+    }
+
+    /// Runs an unprepared Flight SQL statement and consumes every endpoint.
+    pub async fn query_flightsql(&self, sql: &str, key: &Key) -> Result<Vec<RecordBatch>> {
+        use arrow_flight::sql::client::FlightSqlServiceClient;
+        let channel = flight_client::tls::new_tls_flight_channel(
+            &self.flight_endpoint(),
+            self.tls_ca.as_deref(),
+        )
+        .await?;
+        let mut client = FlightSqlServiceClient::new(channel);
+        let key = match key {
+            Key::Default => self.api_key.as_deref(),
+            Key::None => None,
+            Key::Given(key) => Some(key.as_str()),
+        };
+        if let Some(key) = key {
+            client.handshake("spicescript", key).await?;
+        }
+        let info = client.execute(sql.to_string(), None).await?;
+        Self::read_flightsql(&mut client, info).await
+    }
+
+    async fn read_flightsql(
+        client: &mut arrow_flight::sql::client::FlightSqlServiceClient<tonic::transport::Channel>,
+        info: arrow_flight::FlightInfo,
+    ) -> Result<Vec<RecordBatch>> {
+        let schema = Arc::new(info.clone().try_decode_schema()?);
+        let mut batches = Vec::new();
+        for endpoint in info.endpoint {
+            let ticket = endpoint
+                .ticket
+                .context("Flight SQL endpoint has no ticket")?;
+            let mut stream = client.do_get(ticket).await?;
+            while let Some(batch) = stream.try_next().await? {
+                ensure!(
+                    schema.as_ref() == batch.schema().as_ref(),
+                    "Flight SQL advertised schema {schema:?}, streamed {:?}",
+                    batch.schema()
+                );
+                batches.push(batch);
+            }
+            let streamed = stream
+                .schema()
+                .context("Flight SQL endpoint returned no schema")?;
+            ensure!(
+                schema.as_ref() == streamed.as_ref(),
+                "Flight SQL advertised schema {schema:?}, streamed {streamed:?}"
+            );
+        }
+        if batches.is_empty() {
+            batches.push(RecordBatch::new_empty(schema));
+        }
+        Ok(batches)
     }
 
     /// Runs a query presenting `key` on a connection of its own.
@@ -555,6 +784,7 @@ impl Spiced {
         parameters: &[serde_json::Value],
         session: Option<&str>,
         key: &Key,
+        verify_schema: bool,
     ) -> Result<Vec<RecordBatch>> {
         use arrow::array::{ArrayRef, StringArray};
         use arrow_flight::sql::client::FlightSqlServiceClient;
@@ -626,14 +856,19 @@ impl Spiced {
             statement.set_parameters(batch)?;
         }
         let info = statement.execute().await?;
-        let mut batches = Vec::new();
-        for endpoint in info.endpoint {
-            let Some(ticket) = endpoint.ticket else {
-                continue;
-            };
-            let stream = client.do_get(ticket).await?;
-            batches.extend(stream.try_collect::<Vec<_>>().await?);
-        }
+        let batches = if verify_schema {
+            Self::read_flightsql(&mut client, info).await?
+        } else {
+            let mut batches = Vec::new();
+            for endpoint in info.endpoint {
+                let Some(ticket) = endpoint.ticket else {
+                    continue;
+                };
+                let stream = client.do_get(ticket).await?;
+                batches.extend(stream.try_collect::<Vec<_>>().await?);
+            }
+            batches
+        };
         let _ = statement.close().await;
         Ok(batches)
     }
@@ -736,5 +971,85 @@ impl Spiced {
             bail!("refresh of '{dataset}' returned {status}: {body}");
         }
         Ok(())
+    }
+}
+
+impl Drop for Spiced {
+    /// Dropping the `docker run` process leaves its container running, so a
+    /// container instance dropped without being stopped is removed here,
+    /// unless `--keep`.
+    fn drop(&mut self) {
+        if let Some(run) = &self.container {
+            crate::cleanup::remove_if_tracked(&run.name);
+        }
+    }
+}
+
+/// The names of the datasets a spicepod declares.
+fn declared_datasets(spicepod_yaml: &str) -> Vec<String> {
+    let Ok(spicepod) = yaml::from_str::<serde_json::Value>(spicepod_yaml) else {
+        return Vec::new();
+    };
+    spicepod
+        .get("datasets")
+        .and_then(serde_json::Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|d| d.get("name").and_then(serde_json::Value::as_str))
+        .map(str::to_string)
+        .collect()
+}
+
+/// The datasets of `declared` that `/v1/datasets?status=true` (its body,
+/// `text`) does not list yet, then those it reports as not loaded:
+/// `Initializing` or `NotLoaded`.
+fn not_yet_loaded(text: &str, declared: &[String]) -> Vec<String> {
+    let list = match serde_json::from_str::<serde_json::Value>(text) {
+        Ok(serde_json::Value::Array(list)) => list,
+        _ => Vec::new(),
+    };
+    let listed: std::collections::BTreeSet<&str> = list
+        .iter()
+        .filter_map(|d| d.get("name").and_then(serde_json::Value::as_str))
+        .collect();
+    let missing = declared
+        .iter()
+        .filter(|name| !listed.contains(name.as_str()))
+        .cloned();
+    let loading = list
+        .iter()
+        .filter(|d| {
+            matches!(
+                d.get("status").and_then(serde_json::Value::as_str),
+                Some("Initializing" | "NotLoaded")
+            )
+        })
+        .filter_map(|d| d.get("name").and_then(serde_json::Value::as_str))
+        .map(str::to_string);
+    missing.chain(loading).collect()
+}
+
+#[cfg(test)]
+mod not_yet_loaded_tests {
+    use super::{declared_datasets, not_yet_loaded};
+
+    #[test]
+    fn names_the_declared_datasets_not_listed_or_loaded_yet() {
+        let declared = declared_datasets(
+            "version: v1\nkind: Spicepod\nname: p\ndatasets:\n  - from: postgres:a\n    name: a\n  - from: postgres:u\n    name: u\n  - { from: 'postgres:b', name: b }\n",
+        );
+        assert_eq!(declared, ["a", "u", "b"]);
+        let text = r#"[
+            {"name": "a", "status": "Ready"},
+            {"name": "b", "status": "Initializing"},
+            {"name": "c", "status": "Error", "error_message": "x"},
+            {"name": "d", "status": "NotLoaded"},
+            {"name": "e", "status": "Refreshing"}
+        ]"#;
+        assert_eq!(not_yet_loaded(text, &declared), ["u", "b", "d"]);
+        // Nothing listed yet: every declared dataset is missing.
+        assert_eq!(not_yet_loaded("[]", &declared), ["a", "u", "b"]);
+        assert!(not_yet_loaded("[]", &[]).is_empty());
+        assert!(declared_datasets("not: [yaml").is_empty());
     }
 }

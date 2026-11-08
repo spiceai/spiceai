@@ -74,8 +74,12 @@ pub mod caching_eviction;
 mod caching_scan_tests;
 pub mod checkpoint_primary_key;
 pub mod fallback_retention;
-pub use fallback_retention::{Error as FallbackRetentionKeepError, FallbackRetentionKeep};
+pub use fallback_retention::{
+    Error as FallbackRetentionKeepError, FallbackRetentionKeep, ensure_no_fallible_implicit_cast,
+};
+pub(crate) mod exact_string_time;
 pub mod federation;
+pub(crate) mod index_rebuild;
 pub mod partition_scope;
 pub mod refresh;
 pub mod refresh_completion;
@@ -84,6 +88,7 @@ pub mod refresh_task_runner;
 pub mod retention;
 pub(crate) mod sink;
 pub mod snapshots;
+pub(crate) mod source_stall;
 pub(crate) mod superseded;
 pub mod synchronized_table;
 pub mod timestamp_metrics_utils;
@@ -98,6 +103,10 @@ pub use refresh_completion::{
 };
 pub use refresh_task_runner::RefreshTaskRunner;
 pub use snapshots::SnapshotCreationConfig;
+
+/// The `federated_source` of an accelerated view, whose status is reported as a
+/// view's even before its plan is built.
+pub const VIEW_FEDERATED_SOURCE: &str = "view";
 
 #[derive(Debug, Snafu)]
 pub enum Error {
@@ -136,6 +145,16 @@ pub enum Error {
         loaded_id: u64,
     },
 
+    /// `refresh_mode: snapshot`: a newer snapshot is published but could not be loaded.
+    #[snafu(display(
+        "The snapshot published at '{location}' (id {published_id}) could not be loaded, so it is tried again at the next poll. Cause: {cause}. See: https://spiceai.org/docs/features/data-acceleration/snapshots"
+    ))]
+    SnapshotDownloadFailed {
+        location: String,
+        published_id: u64,
+        cause: String,
+    },
+
     #[snafu(display(
         "Failed to scan the dataset from the data connector: {}. Ensure the dataset configuration is valid, and try again.",
         format_datafusion_error(source)
@@ -167,6 +186,19 @@ pub enum Error {
         "Manual refresh is not supported for `append` mode. Only `full` refresh mode supports manual refreshes."
     ))]
     ManualRefreshIsNotSupported {},
+
+    #[snafu(display(
+        "Failed to refresh dataset {dataset_name}: a refresh cannot run in refresh_mode '{mode}'. Valid modes are 'full' or 'append'."
+    ))]
+    RefreshModeCannotRun {
+        dataset_name: String,
+        mode: &'static str,
+    },
+
+    #[snafu(display("{source}"))]
+    InvalidRefreshOverrides {
+        source: refresh::InvalidRefreshOverrides,
+    },
 
     #[snafu(display(
         "Failed to reload the partitions this executor serves: the dataset's change stream has stopped."
@@ -254,6 +286,15 @@ pub enum Error {
 
     #[snafu(display("No primary keys defined for dataset {dataset_name}"))]
     NoPrimaryKeysDefined { dataset_name: String },
+
+    #[snafu(display(
+        "Failed to rebuild the search index of dataset '{dataset_name}' from its acceleration, so the dataset is not loaded rather than answering searches from an incomplete index. Fix the cause below and restart; for details, visit: https://spiceai.org/docs/features/search/full-text-search. Cause: {}",
+        format_datafusion_error(source)
+    ))]
+    FailedToRebuildIndex {
+        dataset_name: String,
+        source: DataFusionError,
+    },
 
     #[snafu(transparent)]
     PkFilterExpr {
@@ -503,6 +544,8 @@ pub struct Builder {
     checkpointer: Option<Arc<dyn DatasetCheckpointer>>,
     synchronize_with: Option<SynchronizedTable>,
     initial_load_complete: bool,
+    /// See [`Builder::initial_status`].
+    initial_status: Option<status::ComponentStatus>,
     snapshot_creation_config: Option<SnapshotCreationConfig>,
     /// Per-dataset state for `RefreshMode::Snapshot`. Required when the
     /// refresh mode is Snapshot; ignored otherwise.
@@ -574,6 +617,7 @@ impl Builder {
             write_back: false,
             write_back_deliverer: None,
             initial_load_complete: false,
+            initial_status: None,
             refresh_semaphore: None,
             snapshot_creation_config: None,
             snapshot_refresh_state: None,
@@ -864,6 +908,14 @@ impl Builder {
         self
     }
 
+    /// The status the dataset reports once its existing acceleration can serve it. It is
+    /// applied when the refresher starts, after the dataset's search indexes are rebuilt from
+    /// that acceleration, so the dataset is never reported ready while the rebuild runs.
+    pub fn initial_status(&mut self, initial_status: status::ComponentStatus) -> &mut Self {
+        self.initial_status = Some(initial_status);
+        self
+    }
+
     /// Configure whether snapshots are taken of the accelerated table after refreshes.
     pub fn snapshot_creation_config(
         &mut self,
@@ -1145,7 +1197,9 @@ impl Builder {
                 .or(self.cpu_runtime.as_ref())
                 .cloned()
                 .unwrap_or_else(Handle::current);
-            let capacity = refresh_task::changes::cdc_config().prefetch_buffer;
+            let capacity =
+                refresh_task::changes::dataset_cdc_config(self.cdc_param_overrides.as_deref())
+                    .prefetch_buffer;
             let native = if let Some(engine) = &self.change_sink_engine {
                 engine
                     .change_sink(context.clone(), &runtime, capacity)
@@ -1211,6 +1265,7 @@ impl Builder {
         refresher.with_snapshot_refresh_state(self.snapshot_refresh_state);
         refresher.with_append_cursor_store(self.append_cursor_store);
         refresher.set_bootstrap_status(self.bootstrap_status);
+        refresher.set_initial_status(self.initial_status.clone());
 
         if let Some(ref resource_monitor) = self.resource_monitor {
             refresher.with_resource_monitor(resource_monitor.clone());
@@ -1682,6 +1737,8 @@ impl AcceleratedTable {
         self.begin_changes_drain().wait().await
     }
 
+    /// `federated_source` names where the rows come from: the connector, or
+    /// [`VIEW_FEDERATED_SOURCE`] for an accelerated view.
     pub fn builder(
         runtime_status: Arc<status::RuntimeStatus>,
         dataset_name: TableReference,
@@ -1735,12 +1792,31 @@ impl AcceleratedTable {
         }
     }
 
+    /// Checks one-off refresh overrides against this dataset: the mode must be one an
+    /// on-demand refresh can run, and a `refresh_sql` must parse and select the
+    /// dataset's `time_column`, as the spicepod's `refresh_sql` must at startup.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::InvalidRefreshOverrides`] describing the first problem found.
+    pub async fn validate_refresh_overrides(&self, overrides: &RefreshOverrides) -> Result<()> {
+        let refresh = self.refresh_params.read().await.clone();
+        overrides
+            .validate_for(&self.dataset_name, &refresh, self.federated.schema())
+            .context(InvalidRefreshOverridesSnafu)
+    }
+
     /// # Errors
     ///
     /// Returns an error if the table has no refresh trigger (it is not configured
     /// for refreshes) or the refresh task has already stopped.
     pub async fn trigger_refresh(&self, overrides: Option<RefreshOverrides>) -> Result<()> {
         if let Some(refresh_trigger) = self.refresh_trigger() {
+            // Rejected here, before anything is queued, so the caller learns of it: the
+            // worker would otherwise fail the refresh after the request was accepted.
+            if let Some(overrides) = &overrides {
+                self.validate_refresh_overrides(overrides).await?;
+            }
             refresh_trigger
                 .send(overrides)
                 .await
@@ -1841,6 +1917,13 @@ impl AcceleratedTable {
     #[must_use]
     pub fn is_accelerator_only(&self) -> bool {
         matches!(self.write_mode, WriteMode::AcceleratorOnly)
+    }
+
+    /// Whether writes go to the federated source, from which the refresh
+    /// propagates them to the accelerator.
+    #[must_use]
+    pub fn is_write_through(&self) -> bool {
+        matches!(self.write_mode, WriteMode::WriteThrough)
     }
 
     /// Why `operation` is refused on this node, if it is: on a scheduler, a table whose
@@ -3219,6 +3302,93 @@ mod tests {
             .refresher()
             .refresh_completion()
             .expect("the table carries a refresh-completion signal")
+    }
+
+    /// The on-demand refresh endpoint, and the CLI's `--refresh-sql` and
+    /// `--refresh-mode`, which post to it, queue a refresh through `trigger_refresh`.
+    /// Overrides it cannot honor are refused there, so the caller gets an error
+    /// instead of a refresh that panics, fails later, or writes rows without a time.
+    #[tokio::test]
+    async fn trigger_refresh_refuses_overrides_it_cannot_honor() {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("ts", DataType::Int64, true),
+        ]));
+        let source = Arc::new(
+            data_components::arrow::write::MemTable::try_new(Arc::clone(&schema), vec![vec![]])
+                .expect("source table builds"),
+        );
+        let accelerator = Arc::new(
+            data_components::arrow::write::MemTable::try_new(schema, vec![vec![]])
+                .expect("accelerator table builds"),
+        ) as Arc<dyn TableProvider>;
+        let table = Builder::new(
+            status::RuntimeStatus::new(),
+            TableReference::bare("events"),
+            Arc::new(FederatedTable::new_unchecked(source)),
+            "mem_table".to_string(),
+            accelerator,
+            refresh::Refresh::new(RefreshMode::Append)
+                .time_column("ts".to_string())
+                .time_format(TimeFormat::UnixSeconds),
+            Handle::current(),
+        )
+        .build()
+        .await
+        .expect("accelerated table builds");
+
+        let refused = |overrides: RefreshOverrides| {
+            let table = &table;
+            async move {
+                match table.trigger_refresh(Some(overrides)).await {
+                    Err(Error::InvalidRefreshOverrides { source }) => source.to_string(),
+                    other => panic!("expected the overrides to be refused, got {other:?}"),
+                }
+            }
+        };
+        for mode in [
+            RefreshMode::Changes,
+            RefreshMode::Disabled,
+            RefreshMode::Caching,
+            RefreshMode::Snapshot,
+        ] {
+            let message = refused(RefreshOverrides {
+                sql: None,
+                mode: Some(mode),
+                max_jitter: None,
+            })
+            .await;
+            assert!(
+                message.contains("Valid modes are 'full' or 'append'"),
+                "{message}"
+            );
+        }
+        let message = refused(RefreshOverrides {
+            sql: Some("SELECT id FROM events".to_string()),
+            mode: None,
+            max_jitter: None,
+        })
+        .await;
+        assert!(
+            message.contains("time_column 'ts' was not found"),
+            "{message}"
+        );
+        let message = refused(RefreshOverrides {
+            sql: Some("SELEC nonsense".to_string()),
+            mode: None,
+            max_jitter: None,
+        })
+        .await;
+        assert!(message.starts_with("Invalid refresh_sql"), "{message}");
+
+        table
+            .trigger_refresh(Some(RefreshOverrides {
+                sql: Some("SELECT id, ts FROM events".to_string()),
+                mode: Some(RefreshMode::Append),
+                max_jitter: None,
+            }))
+            .await
+            .expect("overrides that select the time column queue a refresh");
     }
 
     /// Regression test for #13086. A cluster scheduler runs no refresh locally,

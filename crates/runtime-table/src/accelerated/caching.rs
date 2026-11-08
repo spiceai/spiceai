@@ -2041,7 +2041,7 @@ impl CacheRefreshHelper {
     /// `DELETE` against the accelerator and appending, instead of reading the
     /// whole table back, filtering it in memory and overwriting it.
     ///
-    /// `DuckDB` and Cayenne — and `SQLite`, Turso and the in-memory accelerator —
+    /// `DuckDB` and Cayenne — and `SQLite` and the in-memory accelerator —
     /// implement `TableProvider::delete_from`, so the engine removes the
     /// superseded rows itself and the cost of replacing one cache entry is
     /// proportional to that entry rather than to everything cached.

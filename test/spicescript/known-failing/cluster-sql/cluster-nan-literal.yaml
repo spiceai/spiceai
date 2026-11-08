@@ -1,0 +1,27 @@
+name: cluster-nan-literal
+description: >
+  Known failing (#15538), on a cluster only. A filter comparing a float column with
+  `CAST('NaN' AS DOUBLE PRECISION)` is refused: "No field named \"NaN\"" —
+  the SQL sent to the executors writes the NaN literal as a quoted
+  identifier. On one spiced the query answers (edge-values.yaml).
+
+sources:
+  src: { kind: postgres }
+
+spicepod:
+  version: v1
+  kind: Spicepod
+  name: cluster-nan-literal
+  datasets:
+    - { from: postgres:public.e, name: e, params: '${sources.src.params}', acceleration: { enabled: true, engine: cayenne, mode: file } }
+
+defaults:
+  cluster: { executors: 1 }
+  cluster-partition-by: { '*': id }
+  expect: { oracle: src }
+
+steps:
+  - source-exec: { src: "CREATE TABLE e (id int PRIMARY KEY, f double precision); INSERT INTO e VALUES (1, 1.5), (2, 'NaN'), (3, NULL)" }
+  - start: {}
+  - query: SELECT id FROM e WHERE f = CAST('NaN' AS DOUBLE PRECISION)
+  - query: SELECT id FROM e WHERE f <> CAST('NaN' AS DOUBLE PRECISION)

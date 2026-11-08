@@ -958,6 +958,44 @@ pub(crate) async fn cleanup_uncommitted_delete_paths(paths: &[PathBuf]) {
     }
 }
 
+/// Remove the files of deletion-vector rows that a committed catalog change
+/// dropped: rows a newer vector for the same data file superseded, or rows a
+/// rewrite cleared after folding their deletes into its output. No row names
+/// these files once that change commits, so nothing else would ever remove them.
+///
+/// Runs in the background. It first takes `file_deletion_fence` exclusively,
+/// which an acceleration-snapshot archive holds shared while it copies the
+/// table's files, and a caller holding the table's write lock must not wait for
+/// that. Object-store keys (`path_is_relative`) are left in place, as the
+/// orphaned-vector sweep leaves them.
+pub(crate) fn remove_dropped_deletion_vector_files(
+    files: Vec<DeleteFile>,
+    file_deletion_fence: Arc<tokio::sync::RwLock<()>>,
+) {
+    let paths: Vec<PathBuf> = files
+        .into_iter()
+        .filter(|file| !file.path_is_relative)
+        .map(|file| PathBuf::from(file.path))
+        .collect();
+    if paths.is_empty() {
+        return;
+    }
+    crate::provider::compaction::spawn_compaction(async move {
+        let _deleting = file_deletion_fence.write().await;
+        for path in paths {
+            if let Err(error) = tokio::fs::remove_file(&path).await
+                && error.kind() != std::io::ErrorKind::NotFound
+            {
+                tracing::debug!(
+                    path = %path.display(),
+                    %error,
+                    "Failed to remove a deletion-vector file no catalog row references"
+                );
+            }
+        }
+    });
+}
+
 fn build_delete_file(
     table: &TableMetadata,
     file_path: &Path,

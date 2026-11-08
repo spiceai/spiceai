@@ -498,6 +498,10 @@ mod delta {
     #[async_trait::async_trait]
     impl UCTableProviderFactory for VendedDeltaTableFactory {
         fn table_reference(&self, table: &UCTable) -> Option<TableReference> {
+            if table.is_catalog_managed() {
+                tracing::warn!("{}", table.catalog_managed_skip_warning());
+                return None;
+            }
             let storage_location = table.storage_location.as_deref()?;
             // Don't append a trailing slash here — `DeltaTable::from` calls
             // `ensure_folder_location` which already adds one when needed.

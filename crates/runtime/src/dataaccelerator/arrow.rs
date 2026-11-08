@@ -14,6 +14,11 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
+//! The `arrow` data accelerator.
+//!
+//! Deprecated in v2.4 and scheduled for removal in v2.5: migrate accelerations to
+//! Cayenne (`engine: cayenne`, `mode: memory` for an in-memory acceleration).
+
 use async_trait::async_trait;
 use data_components::arrow::ArrowFactory;
 use datafusion::execution::runtime_env::RuntimeEnv;
@@ -30,7 +35,7 @@ use std::{any::Any, sync::Arc};
 use crate::component::dataset::acceleration::{Engine, IndexType, RefreshMode};
 use crate::parameters::ParameterSpec;
 
-use super::{AccelerationSource, AcceleratorEngineRegistry, DataAccelerator};
+use super::{AccelerationSource, DataAccelerator};
 use runtime_acceleration::sidecar::{AcceleratorSidecar, OpenOption, unsupported_sidecar};
 use runtime_checkpoint_api::CheckpointError;
 
@@ -155,7 +160,6 @@ impl DataAccelerator for ArrowAccelerator {
     async fn sidecar(
         &self,
         _source: &dyn AccelerationSource,
-        _registry: Arc<AcceleratorEngineRegistry>,
         _open_option: OpenOption,
     ) -> Result<Arc<dyn AcceleratorSidecar>, CheckpointError> {
         // In-memory: there is no database to keep sidecar tables in, and nothing would

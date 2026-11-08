@@ -31,16 +31,20 @@ use tokio_util::sync::CancellationToken;
 
 use crate::{Runtime, config};
 use runtime_search::search_engine::SearchEngine;
-use runtime_search::search_engine::parse_explicit_primary_keys;
 use runtime_tls::TlsConfig;
 
 #[cfg(feature = "openapi")]
 pub use routes::get_api_doc;
+#[cfg(test)]
+#[cfg(feature = "models")]
+mod gemini_tests;
 #[cfg(feature = "mcp")]
 mod mcp_transport;
-#[cfg(all(test, feature = "models"))]
+#[cfg(test)]
+#[cfg(feature = "models")]
 mod messages_tests;
-#[cfg(all(test, feature = "models"))]
+#[cfg(test)]
+#[cfg(feature = "models")]
 mod model_capability_tests;
 mod mtls;
 mod response_outcome;
@@ -135,7 +139,7 @@ where
     let vsearch = Arc::new(
         SearchEngine::new(
             Arc::clone(&rt.df) as Arc<dyn runtime_query_engine::query_engine::QueryEngine>,
-            parse_explicit_primary_keys(Arc::clone(&rt.app)).await,
+            rt.search_primary_keys.clone(),
             crate::search::util::RuntimeTableProviderExplorer,
         )
         .with_search_cache(rt.df.search_cache_provider()),

@@ -36,6 +36,7 @@ release coordination channel. Secondary DRI should positively acknowledge the ha
 - [ ] Communicate the feature freeze date to contributors.
 - [ ] **Patch Release (vX.Y.Z)**: Verify no backward-incompatible changes and cherry-pick relevant commits.
 - [ ] **Minor Release (vX.Y)**: Plan to merge `trunk` into the release branch.
+- [ ] **Minor Release (vX.Y)**: Review and update [threat model](https://github.com/spiceai/spiceai/tree/trunk/docs/threat_models).
 
 ## Release Branch Creation
 
@@ -249,12 +250,20 @@ Testing focus DRIs are responsible for:
 
 ## Release Publication Steps
 
-- [ ] Cherry-pick release notes onto the release branch.
-- [ ] Create a **pre-release** [GitHub Release](https://github.com/spiceai/spiceai/releases/new) with a tag (e.g. `v1.0.0-rc.1`). Leave the body empty so automation can populate it from the checked-in notes.
-- [ ] Tag and release docs (e.g. `v1.0.0`) **after** the [build_and_release workflow](https://github.com/spiceai/spiceai/actions/workflows/build_and_release.yml) completes.
-  - [ ] (Docs DRI) Tag the merged `trunk` commit `vX.Y.Z`.
-- [ ] When binaries are built for the release, edit the GitHub release and select **“Set as latest release”** to trigger the [spiced_docker workflow](https://github.com/spiceai/spiceai/actions/workflows/spiced_docker.yml) so Docker images are built from the published artifacts.
-  - [ ] Monitor the spiced_docker workflow (and re-run with **workflow_dispatch** using `release_tag` and optional `target` overrides if a rebuild or partial rebuild is required).
+For release lines 2.4 and earlier, follow the release steps in that branch's copy of this template instead.
+
+In these steps, `{version}` is the version in `version.txt` on the release branch, without a leading `v` (for example `1.0.0-rc.1`).
+
+- [ ] Cherry-pick the release notes (`docs/release_notes/v{version}.md`) onto the release branch. Without them, `publish_release` publishes a stable version as a pre-release.
+- [ ] Run [build_release](https://github.com/spiceai/spiceai/actions/workflows/build_release.yml) on the release branch with `release_version` set to `{version}`. Don't create or push the release tag: `publish_release` creates it.
+  - [ ] Wait for the [build_release run](https://github.com/spiceai/spiceai/actions/workflows/build_release.yml) to finish successfully.
+- [ ] Create a [draft GitHub Release](https://github.com/spiceai/spiceai/releases/new) with the new tag `v{version}`, targeting the release branch. Leave the description empty to use the checked-in release notes, or paste the notes. Don't set the pre-release or latest options: `publish_release` sets them when it publishes.
+- [ ] Run [publish_release](https://github.com/spiceai/spiceai/actions/workflows/publish_release.yml) on the release branch with `release_version` set to `{version}`. If commits that don't change the release were merged to the release branch after the build, set `commit` to the full SHA that `build_release` built.
+  - [ ] Have a release approver other than the person who started the run approve the `publish` job. It publishes the release and marks it automatically: an RC as a pre-release, and a stable version as the latest release when it's the highest stable version released.
+  - [ ] Check the [GitHub Release](https://github.com/spiceai/spiceai/releases) has its binaries and is marked as described above. There is nothing to mark by hand.
+  - [ ] Monitor the [publish_release run](https://github.com/spiceai/spiceai/actions/workflows/publish_release.yml) for the Docker image builds. When they finish, approve the two Docker image publish jobs. They push the `{version}` and `{version}-cuda` image tags, and move `latest` and `latest-cuda` automatically when the release is the latest release.
+  - [ ] Check the [Docker Hub](https://hub.docker.com/r/spiceai/spiceai/tags) and [GHCR](https://github.com/spiceai/spiceai/pkgs/container/spiceai) image tags.
+  - If a job fails, re-run the failed jobs of the same run.
 - [ ] Ensure all newly released SDKs (mentioned in release notes) are published
 - [ ] Publish [spiceai/skills](https://github.com/spiceai/skills) GitHub Release for this runtime version (bump `.claude-plugin/plugin.json` + `marketplace.json` version to match runtime; tag `vX.Y.Z`; confirm [Release Plugin](https://github.com/spiceai/skills/actions/workflows/release.yml) uploaded the zip asset)
 - [ ] Update the [Helm chart](https://github.com/spiceai/spiceai/blob/trunk/deploy/chart) (chart version e.g. `1.8.3` & image.tag e.g. `1.8.3-models`) in the release branch (not in trunk).
@@ -277,7 +286,7 @@ Testing focus DRIs are responsible for:
 - [ ] If this is a **minor** release, update the scheduled benchmark job `dispatch-scheduled` in [`testoperator_dispatch.yml`](https://github.com/spiceai/spiceai/blob/trunk/.github/workflows/testoperator_dispatch.yml) to use the new release branch.
 - [ ] Update [brew taps](https://github.com/spiceai/homebrew-spiceai/actions/workflows/update-formula.yml) after the final build completes.
 - [ ] Remove or mark the released version in the [ROADMAP](https://github.com/spiceai/spiceai/blob/trunk/docs/ROADMAP.md).
-- [ ] Update the supported version in `SECURITY.md` if necessary.
+- [ ] Update `SECURITY.md`: the latest open-source release, and the versions Spice.ai Enterprise currently supports (pre-release, latest, previous minor release line, LTS).
 - [ ] Confirm docs/install refs for Skills point at the matching release (or trunk if intentional).
 
 ## Announcement Checklist

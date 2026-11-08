@@ -22,12 +22,9 @@ proc perform_search {search_term expected_term} {
             sleep 2
             send_user "Search returned expected result\n"
         }
-        # if there is ERROR message before the expected term, then search failed
-        " ERROR " {
-            # allow stream to complete
-            sleep 2
-            send_user "Error detected\n"
-            exit 1
+        -ex $::repl_error_marker {
+            # The search failed and the REPL went back to its prompt.
+            repl_errored "Searching for \"$search_term\""
         }
         -re {[^\n]*\n} {
             # A line the REPL printed before the result — the echoed query, a

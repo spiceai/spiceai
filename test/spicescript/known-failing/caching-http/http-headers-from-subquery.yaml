@@ -1,0 +1,60 @@
+# Known failing (#15548; possibly the cause behind #10861): HTTP
+# request headers chosen by a subquery over another source fail with
+# "Internal error: Schema metadata mismatch", and an accelerated view built on
+# that never loads.
+name: http-headers-from-subquery
+description: >
+  The HTTP connector's request_headers can come from an IN subquery over a
+  PostgreSQL table, in a query and in an accelerated view.
+
+sources:
+  api: { kind: mock-http }
+  src: { kind: postgres }
+
+spicepod:
+  version: v1
+  kind: Spicepod
+  name: http-headers-from-subquery
+  views:
+    # Headers chosen by a subquery over another source, accelerated.
+    - name: tenant_people
+      sql: >-
+        WITH hdrs AS (SELECT '{"x-tenant": "' || name || '"}' AS hdr FROM tenants)
+        SELECT request_headers, content FROM api
+        WHERE request_path = '/people/ada' AND request_headers IN (SELECT hdr FROM hdrs)
+      acceleration: { enabled: true, engine: cayenne }
+  datasets:
+    - from: ${sources.api.url}/api
+      name: api
+      params:
+        file_format: json
+        allowed_request_paths: /people/*
+        request_header_filters: enabled
+        request_header_allowlist: x-tenant
+        response_cache_max_size_bytes: '0'
+    - from: postgres:public.tenants
+      name: tenants
+      params: ${sources.src.params}
+
+steps:
+  - source-exec:
+      api:
+        - "{ path: /api/people/ada, headers-match: { x-tenant: blue }, headers: { content-type: application/json }, body: '{\"name\": \"Ada (blue tenant)\"}' }"
+        - "{ path: /api/people/ada, headers-match: { x-tenant: red }, headers: { content-type: application/json }, body: '{\"name\": \"Ada (red tenant)\"}' }"
+  - source-exec:
+      src: CREATE TABLE tenants (name text PRIMARY KEY); INSERT INTO tenants VALUES ('blue'), ('red');
+  - start: { ready: false }
+  # The view never loads, so the start does not wait for readiness: wait
+  # here until the tenants table is registered.
+  - query: SELECT count(*) AS n FROM tenants
+    expect: { rows: [['2']] }
+    eventually: 30s
+  # Headers from a subquery over another source, directly and in an
+  # accelerated view.
+  - query: >-
+      SELECT content FROM api WHERE request_path = '/people/ada'
+      AND request_headers IN (SELECT '{"x-tenant": "' || name || '"}' FROM tenants)
+    expect: { rows: [['{"name":"Ada (blue tenant)"}'], ['{"name":"Ada (red tenant)"}']] }
+  - query: SELECT content FROM tenant_people
+    expect: { rows: [['{"name":"Ada (blue tenant)"}'], ['{"name":"Ada (red tenant)"}']] }
+    eventually: 30s

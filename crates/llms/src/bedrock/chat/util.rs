@@ -75,19 +75,32 @@ pub(super) fn to_api_error(err: impl Into<String>) -> OpenAIError {
     })
 }
 
-/// Extract the content and tool calls from a `ContentBlock`.
-pub(super) fn extract_from_content_block(
-    blck: &ContentBlock,
-) -> Result<(Option<String>, Option<ChatCompletionMessageToolCall>), OpenAIError> {
+/// The part of an `OpenAI` chat message that one Converse response [`ContentBlock`] fills.
+#[derive(Debug, PartialEq)]
+enum ResponseBlock {
+    /// Answer text, for `message.content`.
+    Text(String),
+    /// Reasoning text of a reasoning model, for `message.reasoning_content`. It must not go into
+    /// `content`: callers that parse the answer (e.g. JSON for `ai_*` functions) would also read
+    /// the reasoning, which often holds drafts of the answer.
+    Reasoning(String),
+    ToolCall(ChatCompletionMessageToolCall),
+    /// A block with nothing to show, such as a tool result or encrypted (redacted) reasoning.
+    Empty,
+}
+
+/// Sort a Converse response `ContentBlock` into the message part it fills.
+fn extract_from_content_block(blck: &ContentBlock) -> Result<ResponseBlock, OpenAIError> {
     match blck {
         ContentBlock::GuardContent(GuardrailConverseContentBlock::Text(
             GuardrailConverseTextBlock { text, .. },
         ))
-        | ContentBlock::ReasoningContent(ReasoningContentBlock::ReasoningText(
+        | ContentBlock::Text(text) => Ok(ResponseBlock::Text(text.clone())),
+        ContentBlock::ReasoningContent(ReasoningContentBlock::ReasoningText(
             ReasoningTextBlock { text, .. },
-        ))
-        | ContentBlock::Text(text) => Ok((Some(text.clone()), None)),
-        ContentBlock::ToolResult(ToolResultBlock { .. }) => Ok((None, None)),
+        )) => Ok(ResponseBlock::Reasoning(text.clone())),
+        ContentBlock::ReasoningContent(ReasoningContentBlock::RedactedContent(_))
+        | ContentBlock::ToolResult(ToolResultBlock { .. }) => Ok(ResponseBlock::Empty),
         ContentBlock::ToolUse(ToolUseBlock {
             tool_use_id,
             name,
@@ -96,19 +109,39 @@ pub(super) fn extract_from_content_block(
         }) => {
             let input: &Document = input;
 
-            Ok((
-                None,
-                Some(ChatCompletionMessageToolCall {
-                    id: tool_use_id.clone(),
-                    function: FunctionCall {
-                        name: name.clone(),
-                        arguments: serde_json::to_string(&document_to_value(input.clone()))
-                            .unwrap_or_default(),
-                    },
-                }),
-            ))
+            Ok(ResponseBlock::ToolCall(ChatCompletionMessageToolCall {
+                id: tool_use_id.clone(),
+                function: FunctionCall {
+                    name: name.clone(),
+                    arguments: serde_json::to_string(&document_to_value(input.clone()))
+                        .unwrap_or_default(),
+                },
+            }))
         }
         unsupported_block => Err(to_api_error(format!("{unsupported_block:?}"))),
+    }
+}
+
+/// The parts of an `OpenAI` chat message built from all content blocks of one Converse reply.
+#[derive(Debug, Default, PartialEq)]
+pub(super) struct ResponseParts {
+    pub content: Vec<String>,
+    pub reasoning: Vec<String>,
+    pub tool_calls: Vec<ChatCompletionMessageToolCall>,
+}
+
+impl ResponseParts {
+    pub(super) fn try_from_blocks(blocks: &[ContentBlock]) -> Result<Self, OpenAIError> {
+        let mut parts = Self::default();
+        for block in blocks {
+            match extract_from_content_block(block)? {
+                ResponseBlock::Text(text) => parts.content.push(text),
+                ResponseBlock::Reasoning(text) => parts.reasoning.push(text),
+                ResponseBlock::ToolCall(call) => parts.tool_calls.push(call),
+                ResponseBlock::Empty => {}
+            }
+        }
+        Ok(parts)
     }
 }
 

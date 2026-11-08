@@ -23,6 +23,13 @@ limitations under the License.
 //! task that forwards frames until the body ends never stops: it fills the channel with errors
 //! as fast as it can allocate them until the reader drops the body, which `object_store` does
 //! only after its retry backoff and the retry request complete.
+//!
+//! [`SpawnedReqwestConnector::with_destination_guard`] additionally refuses redirects to, and
+//! connections to, the destinations a [`DestinationGuard`] blocks.
+
+mod guard;
+
+pub use guard::{DestinationGuard, DestinationRefused};
 
 use std::{
     future::poll_fn,
@@ -51,18 +58,32 @@ use tokio::{
 #[derive(Debug)]
 pub struct SpawnedReqwestConnector {
     runtime: Handle,
+    guard: Option<DestinationGuard>,
 }
 
 impl SpawnedReqwestConnector {
     #[must_use]
     pub fn new(runtime: Handle) -> Self {
-        Self { runtime }
+        Self {
+            runtime,
+            guard: None,
+        }
+    }
+
+    /// Refuses every redirect hop and resolved address that `guard` blocks.
+    #[must_use]
+    pub fn with_destination_guard(mut self, guard: DestinationGuard) -> Self {
+        self.guard = Some(guard);
+        self
     }
 }
 
 impl HttpConnector for SpawnedReqwestConnector {
     fn connect(&self, options: &ClientOptions) -> object_store::Result<HttpClient> {
-        let client = ReqwestConnector::default().connect(options)?;
+        let client = match &self.guard {
+            Some(guard) => HttpClient::new(guard::build_client(options, guard)?),
+            None => ReqwestConnector::default().connect(options)?,
+        };
         Ok(HttpClient::new(SpawnService {
             client,
             runtime: self.runtime.clone(),
@@ -92,7 +113,7 @@ impl HttpService for SpawnService {
             let response = match client.execute(req).await {
                 Ok(response) => response,
                 Err(e) => {
-                    let _ = parts_tx.send(Err(e));
+                    let _ = parts_tx.send(Err(guard::refusal(&e).unwrap_or(e)));
                     return;
                 }
             };

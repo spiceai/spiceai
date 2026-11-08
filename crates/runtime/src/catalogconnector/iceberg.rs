@@ -71,17 +71,15 @@ use ns_lookup::verify_ns_lookup_and_tcp_connect;
 use opendal::Operator;
 use runtime_datafusion::url_table;
 
-#[path = "vended_redirect.rs"]
-mod vended_redirect;
+#[path = "vended_transport.rs"]
+mod vended_transport;
 use secrecy::ExposeSecret;
 use serde::{Deserialize, Serialize};
 use snafu::prelude::*;
 use std::fmt::Write;
-use std::net::{IpAddr, ToSocketAddrs};
-use std::path::{Component, Path, PathBuf};
-use std::time::Duration;
 use std::{any::Any, collections::HashMap, sync::Arc};
 use url::Url;
+use vended_transport::VendedHosts;
 
 #[derive(Debug, Snafu)]
 pub enum Error {
@@ -717,36 +715,20 @@ const S3_REGION_PROPS: [&str; 2] = ["client.region", "s3.region"];
 const S3_GLOBAL_ENDPOINT: &str = "https://s3.amazonaws.com";
 
 /// A `StorageFactory` that refuses storage endpoints a REST catalog supplies in
-/// its responses when they target a private, loopback, or link-local host
-/// (including a hostname that resolves to one, an `s3.endpoint` that the S3
-/// client rewrites onto such a host using the location's bucket, and an
-/// `s3.region` or `client.region` that the client substitutes into the global
-/// AWS endpoint), and refuses `file://` table and metadata locations the
-/// catalog supplies.
+/// its responses when they target a private, loopback, or link-local host.
 ///
 /// A REST catalog's `LoadTableResult.config` (and `/v1/config` defaults and
 /// overrides) is merged into the table's `FileIO` properties, and supplies any
-/// key the Spicepod does not set. Endpoint properties the operator configured
-/// are trusted as-is; any other endpoint value reaching [`StorageFactory::build`]
-/// came from the catalog. The catalog also chooses every location the `FileIO`
-/// reads (metadata, manifests, data files). A `file://` location reads the local
-/// filesystem, so it is refused unless it is inside the `warehouse` the operator
-/// configured. A redirect from a catalog-vended endpoint, or from a host a
-/// catalog region actually rewrites, is checked again before it is followed
-/// and refused when the `Location` is internal. An operator endpoint whose
-/// host that region does not change keeps its own redirect behavior. Vended
-/// credentials are passed through unchanged.
+/// key the Spicepod does not set. Endpoint and region values the operator
+/// configured are trusted as-is; any other value reaching
+/// [`StorageFactory::build`] came from the catalog. Vended credentials are
+/// passed through unchanged.
 #[derive(Debug, Serialize, Deserialize)]
 struct VendedEndpointGuard {
     inner: Arc<dyn StorageFactory>,
     operator_endpoints: HashMap<String, String>,
-    /// Operator `client.region` and `s3.region`, when set. A catalog value for
-    /// the key the S3 backend actually uses is checked; the operator's own
-    /// value is not.
-    #[serde(default)]
+    /// Operator `client.region` and `s3.region`, when set.
     operator_regions: HashMap<String, String>,
-    /// Operator-configured `warehouse`, when it is a `file://` URL.
-    operator_file_root: Option<String>,
     component: String,
 }
 
@@ -756,33 +738,19 @@ impl VendedEndpointGuard {
         operator_props: &HashMap<String, String>,
         component: String,
     ) -> Self {
-        let operator_endpoints = STORAGE_ENDPOINT_PROPS
-            .iter()
-            .filter_map(|key| {
-                operator_props
-                    .get(*key)
-                    .map(|value| ((*key).to_string(), value.clone()))
-            })
-            .collect();
-        let operator_regions = S3_REGION_PROPS
-            .iter()
-            .filter_map(|key| {
-                operator_props
-                    .get(*key)
-                    .map(|value| ((*key).to_string(), value.clone()))
-            })
-            .collect();
-        let operator_file_root = operator_props.get("warehouse").and_then(|warehouse| {
-            Url::parse(warehouse)
-                .ok()
-                .filter(|url| url.scheme() == "file")
-                .map(|_| warehouse.clone())
-        });
+        let operator_values = |keys: &[&str]| {
+            keys.iter()
+                .filter_map(|key| {
+                    operator_props
+                        .get(*key)
+                        .map(|value| ((*key).to_string(), value.clone()))
+                })
+                .collect()
+        };
         Self {
             inner,
-            operator_endpoints,
-            operator_regions,
-            operator_file_root,
+            operator_endpoints: operator_values(&STORAGE_ENDPOINT_PROPS),
+            operator_regions: operator_values(&S3_REGION_PROPS),
             component,
         }
     }
@@ -791,90 +759,41 @@ impl VendedEndpointGuard {
 #[typetag::serde(name = "SpiceVendedEndpointGuard")]
 impl StorageFactory for VendedEndpointGuard {
     fn build(&self, config: &StorageConfig) -> iceberg::Result<Arc<dyn Storage>> {
-        let allow_private_hosts = url_table::allow_private_hosts();
-        check_vended_endpoints(
-            config.props(),
-            &self.operator_endpoints,
-            &self.component,
-            allow_private_hosts,
-        )?;
-        // Literal addresses and blocked names are refused above. The host the
-        // storage client actually dials can still differ: `OpenDAL`'s S3 builder
-        // rewrites the endpoint with the bucket from the location, and a domain
-        // still has to be resolved. Both happen on the async path, where the
-        // location is known, before the inner client is used.
-        let vended_endpoints = vended_endpoints(
-            config.props(),
-            &self.operator_endpoints,
-            allow_private_hosts,
-        );
-        // A catalog region is substituted into the global AWS endpoint even
-        // when `s3.endpoint` is absent. That host is classified on the async
-        // path, once the location's bucket is known. An explicit catalog
-        // endpoint is already in `vended_endpoints`.
-        let vended_s3_region = if allow_private_hosts {
-            None
-        } else {
-            catalog_controlled_s3_region(
-                config.props(),
-                &self.operator_regions,
-                &self.operator_endpoints,
-            )
-        };
+        let props = config.props();
         let inner = self.inner.build(config)?;
         Ok(Arc::new(GuardedStorage {
             inner,
-            operator_file_root: self.operator_file_root.clone(),
             component: self.component.clone(),
-            vended_endpoints,
-            vended_s3_region,
-            s3_virtual_host_style: s3_virtual_host_style(config.props()),
-            s3_region: s3_region(config.props()),
-            effective_decisions: Arc::new(parking_lot::Mutex::new(HashMap::new())),
+            vended_endpoints: vended_endpoints(props, &self.operator_endpoints),
+            vended_s3_region: catalog_controlled_s3_region(
+                props,
+                &self.operator_regions,
+                &self.operator_endpoints,
+            ),
+            s3_virtual_host_style: s3_virtual_host_style(props),
+            s3_region: s3_region(props),
         }))
     }
 }
 
-/// `Storage` that refuses `file://` locations a catalog vended.
+/// `Storage` that checks the host each call reaches for a catalog value.
 ///
 /// `InputFile` keeps the `Storage` it was built with and calls it on read, so
-/// the check has to live here rather than only in [`Storage::new_input`].
+/// the check has to live here rather than only in [`StorageFactory::build`].
 #[derive(Clone, Debug, Serialize, Deserialize)]
 struct GuardedStorage {
     inner: Arc<dyn Storage>,
-    operator_file_root: Option<String>,
     component: String,
-    /// Endpoint values the catalog supplied. The operator's own values are
-    /// absent. Checked again on each storage call against the host the client
-    /// will dial, which can differ from `value` after the S3 bucket rewrite.
-    vended_endpoints: Vec<VendedEndpoint>,
-    /// Catalog `client.region` or `s3.region` that the S3 backend substitutes
-    /// into the global AWS endpoint. Absent when the region is the operator's,
-    /// comes from the process environment, or an explicit catalog endpoint is
-    /// already classified.
-    #[serde(default)]
+    /// `(key, value)` for each endpoint the catalog supplied.
+    vended_endpoints: Vec<(String, String)>,
+    /// Catalog `client.region` or `s3.region` that the S3 backend can
+    /// substitute into the global AWS endpoint.
     vended_s3_region: Option<VendedS3Region>,
     /// `s3.path-style-access` is truthy → false. Matches the Iceberg S3
     /// backend, whose default is virtual-host style.
     s3_virtual_host_style: bool,
-    /// Region the S3 backend will sign with: `client.region`, then `s3.region`,
-    /// then `AWS_REGION`, then `AWS_DEFAULT_REGION`.
+    /// Region the S3 backend will sign with.
     s3_region: String,
-    /// Refusal for an effective endpoint, keyed by that endpoint. `Some` is
-    /// the error text; `None` means the effective host was public.
-    #[serde(skip, default = "empty_effective_decisions")]
-    effective_decisions: Arc<parking_lot::Mutex<HashMap<String, Option<String>>>>,
-}
-
-fn empty_effective_decisions() -> Arc<parking_lot::Mutex<HashMap<String, Option<String>>>> {
-    Arc::new(parking_lot::Mutex::new(HashMap::new()))
-}
-
-/// A catalog-supplied endpoint that passed the synchronous literal check.
-#[derive(Clone, Debug, Serialize, Deserialize)]
-struct VendedEndpoint {
-    key: String,
-    value: String,
 }
 
 /// A catalog region the S3 backend inserts into the global AWS endpoint.
@@ -883,163 +802,80 @@ struct VendedS3Region {
     /// `client.region` or `s3.region`.
     key: String,
     value: String,
-    /// Endpoint string the backend substitutes `value` into. It normalizes to
-    /// `https://s3.amazonaws.com`.
+    /// Endpoint string the backend substitutes `value` into.
     endpoint: String,
 }
 
 impl GuardedStorage {
-    fn refuse_local(&self, location: &str) -> iceberg::Result<()> {
-        check_vended_file_location(
-            location,
-            self.operator_file_root.as_deref(),
-            &self.component,
-            url_table::allow_private_hosts(),
-        )
-    }
-
-    async fn before_io(&self, location: &str) -> iceberg::Result<()> {
-        self.refuse_local(location)?;
-        self.refuse_effective_endpoints(location).await
-    }
-
-    /// Catalog component when a redirect from this storage must be refused.
+    /// Hosts a catalog value makes the storage client dial for `location`.
     ///
-    /// A catalog endpoint always qualifies. A catalog region qualifies only for
-    /// a location where bucket removal leaves the global AWS endpoint, which is
-    /// when the client substitutes that region into the host. An operator
-    /// endpoint such as a private S3-compatible URL stays outside the guard
-    /// when the region does not change it. Absent when
-    /// `SPICE_URL_TABLE_ALLOW_PRIVATE_HOSTS` is set. Read on each call so the
-    /// override applies without rebuilding the catalog.
-    fn redirect_component(&self, location: &str) -> Option<String> {
-        if url_table::allow_private_hosts() || !self.redirect_guard_applies(location) {
-            None
-        } else {
-            Some(self.component.clone())
+    /// Refuses `location` when a catalog value, or the host the client
+    /// rewrites it to, is a literal internal address or a blocked name. A
+    /// domain is resolved and checked by the storage transport
+    /// when it connects. Empty when `SPICE_URL_TABLE_ALLOW_PRIVATE_HOSTS` is
+    /// set; it is read on each call so the override applies without
+    /// rebuilding the catalog.
+    fn checked_hosts(&self, location: &str) -> iceberg::Result<Vec<String>> {
+        if url_table::allow_private_hosts() {
+            return Ok(Vec::new());
         }
-    }
-
-    fn redirect_guard_applies(&self, location: &str) -> bool {
-        if !self.vended_endpoints.is_empty() {
-            return true;
-        }
-        let Some(region) = &self.vended_s3_region else {
-            return false;
-        };
-        let Some(bucket) = s3_location_bucket(location) else {
-            return false;
-        };
-        s3_region_is_substituted(&region.endpoint, &bucket)
-    }
-
-    /// Refuses a catalog endpoint whose effective host is internal.
-    ///
-    /// For `s3.endpoint`, the effective host is the one `OpenDAL`'s S3 builder
-    /// dials after it rewrites the endpoint with the location's bucket. Other
-    /// endpoints are classified as configured. A domain is resolved here; the
-    /// storage client resolves it again when it connects, so this does not pin
-    /// the socket to the address checked here.
-    async fn refuse_effective_endpoints(&self, location: &str) -> iceberg::Result<()> {
-        if url_table::allow_private_hosts()
-            || (self.vended_endpoints.is_empty() && self.vended_s3_region.is_none())
-        {
-            return Ok(());
-        }
-        for endpoint in &self.vended_endpoints {
+        let mut hosts = Vec::new();
+        for (key, value) in &self.vended_endpoints {
+            if endpoint_targets_internal_host(value) {
+                return Err(iceberg::Error::new(
+                    iceberg::ErrorKind::DataInvalid,
+                    vended_endpoint_refused_message(&self.component, key, value),
+                ));
+            }
             let effective = effective_storage_endpoint(
-                &endpoint.key,
-                &endpoint.value,
+                key,
+                value,
                 location,
                 self.s3_virtual_host_style,
                 &self.s3_region,
             );
-            let cache_key = format!("{}|{effective}", endpoint.key);
-            let cached = {
-                let decisions = self.effective_decisions.lock();
-                decisions.get(&cache_key).cloned()
-            };
-            let decision = if let Some(decision) = cached {
-                decision
-            } else {
-                let decision = refusal_for_effective_endpoint(
-                    &self.component,
-                    &endpoint.key,
-                    &endpoint.value,
-                    &effective,
-                )
-                .await;
-                self.effective_decisions
-                    .lock()
-                    .insert(cache_key, decision.clone());
-                decision
-            };
-            if let Some(message) = decision {
+            if endpoint_targets_internal_host(&effective) {
                 return Err(iceberg::Error::new(
                     iceberg::ErrorKind::DataInvalid,
-                    message,
+                    vended_endpoint_rewritten_message(&self.component, key, value, &effective),
                 ));
             }
+            hosts.extend(endpoint_host_label(&effective));
         }
-        self.refuse_vended_s3_region(location).await
+        // Until bucket removal leaves the global AWS endpoint, the region does
+        // not change the host, and an operator endpoint such as a private
+        // MinIO URL stays trusted.
+        if let Some(region) = &self.vended_s3_region
+            && let Some(bucket) = s3_location_bucket(location)
+            && s3_region_is_substituted(&region.endpoint, &bucket)
+        {
+            let effective = s3_effective_endpoint(
+                &region.endpoint,
+                &bucket,
+                self.s3_virtual_host_style,
+                &region.value,
+            );
+            if endpoint_targets_internal_host(&effective) {
+                return Err(iceberg::Error::new(
+                    iceberg::ErrorKind::DataInvalid,
+                    vended_endpoint_rewritten_message(
+                        &self.component,
+                        &region.key,
+                        &region.value,
+                        &effective,
+                    ),
+                ));
+            }
+            hosts.extend(endpoint_host_label(&effective));
+        }
+        Ok(hosts)
     }
 
-    /// Refuses a catalog region that the S3 client substitutes into the global
-    /// AWS endpoint, producing an internal host.
-    ///
-    /// `OpenDAL` uses `https://s3.amazonaws.com` when `s3.endpoint` is unset, then
-    /// replaces that with `https://s3.{region}.amazonaws.com`. A region of
-    /// `x@127.0.0.1:port/` makes the URL authority `s3.x@127.0.0.1:port`, so
-    /// the client dials loopback. The operator's region, and a region that
-    /// only comes from `AWS_REGION` or `AWS_DEFAULT_REGION`, is not checked
-    /// here.
-    async fn refuse_vended_s3_region(&self, location: &str) -> iceberg::Result<()> {
-        let Some(region) = &self.vended_s3_region else {
-            return Ok(());
-        };
-        let Some(bucket) = s3_location_bucket(location) else {
-            return Ok(());
-        };
-        // Bucket removal can turn `https://{bucket}.s3.amazonaws.com` into the
-        // global template. Until that happens the region does not change the
-        // host, and an operator endpoint such as a private MinIO URL stays
-        // trusted.
-        if !s3_region_is_substituted(&region.endpoint, &bucket) {
-            return Ok(());
-        }
-        let effective = s3_effective_endpoint(
-            &region.endpoint,
-            &bucket,
-            self.s3_virtual_host_style,
-            &region.value,
-        );
-        let cache_key = format!("{}|{effective}", region.key);
-        let cached = {
-            let decisions = self.effective_decisions.lock();
-            decisions.get(&cache_key).cloned()
-        };
-        let decision = if let Some(decision) = cached {
-            decision
-        } else {
-            let decision = refusal_for_vended_s3_region(
-                &self.component,
-                &region.key,
-                &region.value,
-                &effective,
-            )
-            .await;
-            self.effective_decisions
-                .lock()
-                .insert(cache_key, decision.clone());
-            decision
-        };
-        if let Some(message) = decision {
-            return Err(iceberg::Error::new(
-                iceberg::ErrorKind::DataInvalid,
-                message,
-            ));
-        }
-        Ok(())
+    fn vended_hosts(&self, location: &str) -> iceberg::Result<Option<VendedHosts>> {
+        Ok(VendedHosts::new(
+            &self.component,
+            self.checked_hosts(location)?,
+        ))
     }
 }
 
@@ -1047,71 +883,54 @@ impl GuardedStorage {
 #[async_trait]
 impl Storage for GuardedStorage {
     async fn exists(&self, path: &str) -> iceberg::Result<bool> {
-        self.before_io(path).await?;
-        vended_redirect::scope(self.redirect_component(path), self.inner.exists(path)).await
+        vended_transport::scope(self.vended_hosts(path)?, self.inner.exists(path)).await
     }
 
     async fn metadata(&self, path: &str) -> iceberg::Result<iceberg::io::FileMetadata> {
-        self.before_io(path).await?;
-        vended_redirect::scope(self.redirect_component(path), self.inner.metadata(path)).await
+        vended_transport::scope(self.vended_hosts(path)?, self.inner.metadata(path)).await
     }
 
     async fn read(&self, path: &str) -> iceberg::Result<bytes::Bytes> {
-        self.before_io(path).await?;
-        vended_redirect::scope(self.redirect_component(path), self.inner.read(path)).await
+        vended_transport::scope(self.vended_hosts(path)?, self.inner.read(path)).await
     }
 
     async fn reader(&self, path: &str) -> iceberg::Result<Box<dyn FileRead>> {
-        self.before_io(path).await?;
-        let component = self.redirect_component(path);
-        let inner = vended_redirect::scope(component.clone(), self.inner.reader(path)).await?;
-        Ok(Box::new(vended_redirect::ScopedFileRead {
-            inner,
-            component,
-        }))
+        let hosts = self.vended_hosts(path)?;
+        let inner = vended_transport::scope(hosts.clone(), self.inner.reader(path)).await?;
+        Ok(Box::new(vended_transport::ScopedFileRead { inner, hosts }))
     }
 
     async fn write(&self, path: &str, bs: bytes::Bytes) -> iceberg::Result<()> {
-        self.before_io(path).await?;
-        vended_redirect::scope(self.redirect_component(path), self.inner.write(path, bs)).await
+        vended_transport::scope(self.vended_hosts(path)?, self.inner.write(path, bs)).await
     }
 
     async fn writer(&self, path: &str) -> iceberg::Result<Box<dyn FileWrite>> {
-        self.before_io(path).await?;
-        let component = self.redirect_component(path);
-        let inner = vended_redirect::scope(component.clone(), self.inner.writer(path)).await?;
-        Ok(Box::new(vended_redirect::ScopedFileWrite {
-            inner,
-            component,
-        }))
+        let hosts = self.vended_hosts(path)?;
+        let inner = vended_transport::scope(hosts.clone(), self.inner.writer(path)).await?;
+        Ok(Box::new(vended_transport::ScopedFileWrite { inner, hosts }))
     }
 
     async fn delete(&self, path: &str) -> iceberg::Result<()> {
-        self.before_io(path).await?;
-        vended_redirect::scope(self.redirect_component(path), self.inner.delete(path)).await
+        vended_transport::scope(self.vended_hosts(path)?, self.inner.delete(path)).await
     }
 
     async fn delete_prefix(&self, path: &str) -> iceberg::Result<()> {
-        self.before_io(path).await?;
-        vended_redirect::scope(
-            self.redirect_component(path),
-            self.inner.delete_prefix(path),
-        )
-        .await
+        vended_transport::scope(self.vended_hosts(path)?, self.inner.delete_prefix(path)).await
     }
 
     async fn delete_stream(&self, mut paths: BoxStream<'static, String>) -> iceberg::Result<()> {
         let mut collected = Vec::new();
-        let mut component = None;
+        let mut hosts = Vec::new();
         while let Some(path) = paths.next().await {
-            self.before_io(&path).await?;
-            if component.is_none() {
-                component = self.redirect_component(&path);
+            for host in self.checked_hosts(&path)? {
+                if !hosts.contains(&host) {
+                    hosts.push(host);
+                }
             }
             collected.push(path);
         }
-        vended_redirect::scope(
-            component,
+        vended_transport::scope(
+            VendedHosts::new(&self.component, hosts),
             self.inner
                 .delete_stream(futures::stream::iter(collected).boxed()),
         )
@@ -1119,7 +938,6 @@ impl Storage for GuardedStorage {
     }
 
     fn new_input(&self, path: &str) -> iceberg::Result<iceberg::io::InputFile> {
-        self.refuse_local(path)?;
         Ok(iceberg::io::InputFile::new(
             Arc::new(self.clone()),
             path.to_string(),
@@ -1127,7 +945,6 @@ impl Storage for GuardedStorage {
     }
 
     fn new_output(&self, path: &str) -> iceberg::Result<iceberg::io::OutputFile> {
-        self.refuse_local(path)?;
         Ok(iceberg::io::OutputFile::new(
             Arc::new(self.clone()),
             path.to_string(),
@@ -1135,68 +952,9 @@ impl Storage for GuardedStorage {
     }
 }
 
-/// Returns an error for the first storage endpoint in `props` that was not set
-/// by the operator and targets a private, loopback, or link-local host.
-fn check_vended_endpoints(
-    props: &HashMap<String, String>,
-    operator_endpoints: &HashMap<String, String>,
-    component: &str,
-    allow_private_hosts: bool,
-) -> iceberg::Result<()> {
-    if allow_private_hosts {
-        return Ok(());
-    }
-    for key in STORAGE_ENDPOINT_PROPS {
-        let Some(value) = props.get(key) else {
-            continue;
-        };
-        if operator_endpoints.get(key) == Some(value) {
-            continue;
-        }
-        if endpoint_targets_internal_host(value) {
-            return Err(iceberg::Error::new(
-                iceberg::ErrorKind::DataInvalid,
-                vended_endpoint_refused_message(component, key, value),
-            ));
-        }
-    }
-    Ok(())
-}
-
-/// How long a vended-endpoint lookup may block the caller. The lookup itself
-/// runs on the blocking pool. This matches the bound the URL-table guard uses.
-const VENDED_ENDPOINT_DNS_TIMEOUT: Duration = Duration::from_secs(5);
-
-/// Test stand-in for [`resolve_host_blocking`]. Production builds always use
-/// the system resolver.
-#[cfg(test)]
-type VendedResolverOverride = HashMap<String, Result<Vec<IpAddr>, String>>;
-#[cfg(test)]
-static VENDED_ENDPOINT_RESOLVER_OVERRIDE: parking_lot::Mutex<Option<VendedResolverOverride>> =
-    parking_lot::Mutex::new(None);
-
-#[cfg(test)]
-fn set_vended_endpoint_resolver_override(host: &str, result: Result<Vec<IpAddr>, String>) {
-    VENDED_ENDPOINT_RESOLVER_OVERRIDE
-        .lock()
-        .get_or_insert_with(HashMap::new)
-        .insert(host.to_ascii_lowercase(), result);
-}
-
-#[cfg(test)]
-fn clear_vended_endpoint_resolver_override(host: &str) {
-    let mut overrides = VENDED_ENDPOINT_RESOLVER_OVERRIDE.lock();
-    if let Some(map) = overrides.as_mut() {
-        map.remove(&host.to_ascii_lowercase());
-    }
-}
-
 /// Whether `endpoint` (a URL, or a bare `host[:port]` that the storage backends
 /// treat as `https://host[:port]`) has a literal internal IP, a well-known
 /// internal hostname, or no host that can be classified.
-///
-/// A domain that is not a blocked name is classified later, after DNS, by
-/// [`refusal_message_for_resolution`].
 fn endpoint_targets_internal_host(endpoint: &str) -> bool {
     let parsed = Url::parse(endpoint)
         .ok()
@@ -1213,31 +971,19 @@ fn endpoint_targets_internal_host(endpoint: &str) -> bool {
     }
 }
 
-/// Catalog endpoint values that are not the operator's. The synchronous check
-/// has already refused literal internal addresses; these still have to be
-/// judged by the host the storage client will dial.
+/// Endpoint values in `props` that are not the operator's.
 fn vended_endpoints(
     props: &HashMap<String, String>,
     operator_endpoints: &HashMap<String, String>,
-    allow_private_hosts: bool,
-) -> Vec<VendedEndpoint> {
-    if allow_private_hosts {
-        return Vec::new();
-    }
-    let mut endpoints = Vec::new();
-    for key in STORAGE_ENDPOINT_PROPS {
-        let Some(value) = props.get(key) else {
-            continue;
-        };
-        if operator_endpoints.get(key) == Some(value) {
-            continue;
-        }
-        endpoints.push(VendedEndpoint {
-            key: key.to_string(),
-            value: value.clone(),
-        });
-    }
-    endpoints
+) -> Vec<(String, String)> {
+    STORAGE_ENDPOINT_PROPS
+        .iter()
+        .filter_map(|key| {
+            let value = props.get(*key)?;
+            (operator_endpoints.get(*key) != Some(value))
+                .then(|| ((*key).to_string(), value.clone()))
+        })
+        .collect()
 }
 
 /// `true` when the S3 backend will use virtual-host style. The Iceberg parser
@@ -1255,23 +1001,12 @@ fn s3_virtual_host_style(props: &HashMap<String, String>) -> bool {
 /// including an empty one, and otherwise `AWS_REGION` then
 /// `AWS_DEFAULT_REGION`. An empty `AWS_REGION` does not fall through.
 fn s3_region(props: &HashMap<String, String>) -> String {
-    let aws_region = std::env::var("AWS_REGION").ok();
-    let aws_default_region = match aws_region {
-        Some(_) => None,
-        None => std::env::var("AWS_DEFAULT_REGION").ok(),
-    };
-    s3_region_with_fallback(props, aws_region.as_deref(), aws_default_region.as_deref())
-}
-
-fn s3_region_with_fallback(
-    props: &HashMap<String, String>,
-    aws_region: Option<&str>,
-    aws_default_region: Option<&str>,
-) -> String {
     if let Some((_, region)) = winning_s3_region(props) {
         return region.to_string();
     }
-    aws_region.or(aws_default_region).unwrap_or("").to_string()
+    std::env::var("AWS_REGION")
+        .or_else(|_| std::env::var("AWS_DEFAULT_REGION"))
+        .unwrap_or_default()
 }
 
 /// `client.region` when set, otherwise `s3.region`.
@@ -1290,29 +1025,19 @@ fn winning_s3_region(props: &HashMap<String, String>) -> Option<(&str, &str)> {
 /// `AWS_ENDPOINT_URL`, `AWS_ENDPOINT`, or `AWS_S3_ENDPOINT`. The default is
 /// the global AWS endpoint.
 fn s3_backend_endpoint(props: &HashMap<String, String>) -> String {
-    let env_endpoint = if props
-        .get("s3.disable-config-load")
-        .is_some_and(|value| endpoint_flag_is_truthy(value))
-    {
-        None
-    } else {
-        std::env::var("AWS_ENDPOINT_URL")
-            .or_else(|_| std::env::var("AWS_ENDPOINT"))
-            .or_else(|_| std::env::var("AWS_S3_ENDPOINT"))
-            .ok()
-    };
-    s3_backend_endpoint_with(props, env_endpoint.as_deref())
-}
-
-fn s3_backend_endpoint_with(props: &HashMap<String, String>, env_endpoint: Option<&str>) -> String {
     if let Some(endpoint) = props.get(S3_ENDPOINT) {
         return endpoint.clone();
     }
-    if let Some(endpoint) = env_endpoint
-        .map(|endpoint| endpoint.trim_end_matches('/'))
-        .filter(|endpoint| !endpoint.is_empty())
+    let config_load_disabled = props
+        .get("s3.disable-config-load")
+        .is_some_and(|value| endpoint_flag_is_truthy(value));
+    if !config_load_disabled
+        && let Some(endpoint) = ["AWS_ENDPOINT_URL", "AWS_ENDPOINT", "AWS_S3_ENDPOINT"]
+            .iter()
+            .find_map(|var| std::env::var(var).ok())
+        && !endpoint.trim_end_matches('/').is_empty()
     {
-        return endpoint.to_string();
+        return endpoint.trim_end_matches('/').to_string();
     }
     S3_GLOBAL_ENDPOINT.to_string()
 }
@@ -1431,74 +1156,7 @@ fn s3_effective_endpoint(
     }
 }
 
-/// The domain of `endpoint`, lowercased and without a trailing dot.
-///
-/// `None` when `endpoint` is not a URL with a domain host (a literal address,
-/// or a value the synchronous check refuses as unclassifiable).
-fn endpoint_domain(endpoint: &str) -> Option<String> {
-    let parsed = Url::parse(endpoint)
-        .ok()
-        .filter(Url::has_host)
-        .or_else(|| Url::parse(&format!("https://{endpoint}")).ok());
-    match parsed.as_ref().and_then(Url::host) {
-        Some(url::Host::Domain(domain)) => {
-            let domain = domain.trim_end_matches('.').to_ascii_lowercase();
-            (!domain.is_empty()).then_some(domain)
-        }
-        _ => None,
-    }
-}
-
-fn refusal_message_for_resolution(
-    component: &str,
-    key: &str,
-    value: &str,
-    resolved: Result<Vec<IpAddr>, String>,
-) -> Option<String> {
-    match resolved {
-        Ok(addrs) if addrs.iter().any(|ip| url_table::is_internal_ip(*ip)) => {
-            Some(vended_endpoint_refused_message(component, key, value))
-        }
-        Ok(addrs) if !addrs.is_empty() => None,
-        Ok(_) | Err(_) => Some(vended_endpoint_unresolved_message(component, key, value)),
-    }
-}
-
-/// Classifies the endpoint the storage client will dial.
-///
-/// `configured` is the catalog value. `effective` is that value after the S3
-/// bucket rewrite. When those hosts differ, the error names both.
-async fn refusal_for_effective_endpoint(
-    component: &str,
-    key: &str,
-    configured: &str,
-    effective: &str,
-) -> Option<String> {
-    let rewritten = endpoint_host_label(configured) != endpoint_host_label(effective);
-    if endpoint_targets_internal_host(effective) {
-        return Some(if rewritten {
-            vended_endpoint_rewritten_message(component, key, configured, effective)
-        } else {
-            vended_endpoint_refused_message(component, key, configured)
-        });
-    }
-    let domain = endpoint_domain(effective)?;
-    let resolved = resolve_vended_host(domain).await;
-    let internal = match &resolved {
-        Ok(addrs) if addrs.iter().any(|ip| url_table::is_internal_ip(*ip)) => true,
-        Ok(addrs) if !addrs.is_empty() => return None,
-        Ok(_) | Err(_) => false,
-    };
-    if !rewritten {
-        return refusal_message_for_resolution(component, key, configured, resolved);
-    }
-    Some(if internal {
-        vended_endpoint_rewritten_message(component, key, configured, effective)
-    } else {
-        vended_endpoint_rewritten_unresolved_message(component, key, configured, effective)
-    })
-}
-
+/// The host of `endpoint`, normalized as the storage transport compares it.
 fn endpoint_host_label(endpoint: &str) -> Option<String> {
     let parsed = Url::parse(endpoint)
         .ok()
@@ -1507,124 +1165,7 @@ fn endpoint_host_label(endpoint: &str) -> Option<String> {
     parsed
         .as_ref()
         .and_then(Url::host_str)
-        .map(|host| host.trim_end_matches('.').to_ascii_lowercase())
-}
-
-async fn resolve_vended_host(host: String) -> Result<Vec<IpAddr>, String> {
-    let lookup = tokio::task::spawn_blocking(move || resolve_host_blocking(&host));
-    match tokio::time::timeout(VENDED_ENDPOINT_DNS_TIMEOUT, lookup).await {
-        Err(_) => Err(format!(
-            "timed out after {}s",
-            VENDED_ENDPOINT_DNS_TIMEOUT.as_secs()
-        )),
-        Ok(Ok(result)) => result,
-        Ok(Err(err)) => Err(err.to_string()),
-    }
-}
-
-fn resolve_host_blocking(host: &str) -> Result<Vec<IpAddr>, String> {
-    #[cfg(test)]
-    {
-        let overrides = VENDED_ENDPOINT_RESOLVER_OVERRIDE.lock();
-        if let Some(result) = overrides
-            .as_ref()
-            .and_then(|map| map.get(&host.to_ascii_lowercase()))
-        {
-            return result.clone();
-        }
-    }
-    (host, 0_u16)
-        .to_socket_addrs()
-        .map(|iter| iter.map(|addr| addr.ip()).collect())
-        .map_err(|err| err.to_string())
-}
-
-/// Returns an error when `location` is a `file://` URL the catalog supplied.
-///
-/// A location inside the operator's `file://` warehouse is trusted. `..`
-/// segments are collapsed before that comparison, so a location cannot escape
-/// the warehouse by traversal. `allow_private_hosts` is the same override the
-/// endpoint check uses.
-fn check_vended_file_location(
-    location: &str,
-    operator_file_root: Option<&str>,
-    component: &str,
-    allow_private_hosts: bool,
-) -> iceberg::Result<()> {
-    if allow_private_hosts {
-        return Ok(());
-    }
-    match local_file_path(location) {
-        LocalFilePath::NotFile => Ok(()),
-        LocalFilePath::OutsideLocalhost => Err(iceberg::Error::new(
-            iceberg::ErrorKind::DataInvalid,
-            vended_file_location_refused_message(component, location),
-        )),
-        LocalFilePath::Path(path) => {
-            let inside_operator_warehouse = operator_file_root
-                .and_then(local_file_path_buf)
-                .is_some_and(|root| path.starts_with(root));
-            if inside_operator_warehouse {
-                Ok(())
-            } else {
-                Err(iceberg::Error::new(
-                    iceberg::ErrorKind::DataInvalid,
-                    vended_file_location_refused_message(component, location),
-                ))
-            }
-        }
-    }
-}
-
-/// A `file://` location reduced to a local path, or a reason it is not one.
-enum LocalFilePath {
-    /// `location` is not a `file://` URL.
-    NotFile,
-    /// A `file://` URL that does not name a path on this machine.
-    OutsideLocalhost,
-    /// A local path with `.` and `..` collapsed, without reading the filesystem.
-    Path(PathBuf),
-}
-
-fn local_file_path(location: &str) -> LocalFilePath {
-    let Ok(url) = Url::parse(location) else {
-        return LocalFilePath::NotFile;
-    };
-    if url.scheme() != "file" {
-        return LocalFilePath::NotFile;
-    }
-    url.to_file_path()
-        .map_or(LocalFilePath::OutsideLocalhost, |path| {
-            LocalFilePath::Path(normalized_lexical_path(&path))
-        })
-}
-
-fn local_file_path_buf(location: &str) -> Option<PathBuf> {
-    match local_file_path(location) {
-        LocalFilePath::Path(path) => Some(path),
-        LocalFilePath::NotFile | LocalFilePath::OutsideLocalhost => None,
-    }
-}
-
-fn normalized_lexical_path(path: &Path) -> PathBuf {
-    let mut normalized = PathBuf::new();
-    for component in path.components() {
-        match component {
-            Component::ParentDir => {
-                normalized.pop();
-            }
-            Component::CurDir => {}
-            other => normalized.push(other.as_os_str()),
-        }
-    }
-    normalized
-}
-
-fn vended_file_location_refused_message(component: &str, location: &str) -> String {
-    format!(
-        "The Iceberg catalog for {component} set a table location to {location:?}, which reads the local filesystem, so the file is not opened and the table cannot be read. If this location is trusted, set the `warehouse` parameter to the directory that contains it, or set `{}=true`. See: https://spiceai.org/docs/components/data-connectors/iceberg",
-        url_table::ALLOW_PRIVATE_HOSTS_ENV
-    )
+        .map(vended_transport::normalized_host)
 }
 
 fn endpoint_param_hint(key: &str) -> &'static str {
@@ -1635,46 +1176,10 @@ fn endpoint_param_hint(key: &str) -> &'static str {
     }
 }
 
-/// Classifies the endpoint produced by substituting a catalog region into the
-/// global AWS endpoint. The message always names the effective URL, because
-/// the region string itself is not the host the client dials.
-async fn refusal_for_vended_s3_region(
-    component: &str,
-    key: &str,
-    region: &str,
-    effective: &str,
-) -> Option<String> {
-    if endpoint_targets_internal_host(effective) {
-        return Some(vended_endpoint_rewritten_message(
-            component, key, region, effective,
-        ));
-    }
-    let domain = endpoint_domain(effective)?;
-    let resolved = resolve_vended_host(domain).await;
-    let internal = match &resolved {
-        Ok(addrs) if addrs.iter().any(|ip| url_table::is_internal_ip(*ip)) => true,
-        Ok(addrs) if !addrs.is_empty() => return None,
-        Ok(_) | Err(_) => false,
-    };
-    Some(if internal {
-        vended_endpoint_rewritten_message(component, key, region, effective)
-    } else {
-        vended_endpoint_rewritten_unresolved_message(component, key, region, effective)
-    })
-}
-
 fn vended_endpoint_refused_message(component: &str, key: &str, value: &str) -> String {
     let param_hint = endpoint_param_hint(key);
     format!(
         "The Iceberg catalog for {component} set `{key}` to {value:?}, a private, loopback, or link-local address, so no storage request is sent to it and the table cannot be read. If this endpoint is trusted, {param_hint}, or set `{}=true`. See: https://spiceai.org/docs/components/data-connectors/iceberg",
-        url_table::ALLOW_PRIVATE_HOSTS_ENV
-    )
-}
-
-fn vended_endpoint_unresolved_message(component: &str, key: &str, value: &str) -> String {
-    let param_hint = endpoint_param_hint(key);
-    format!(
-        "The Iceberg catalog for {component} set `{key}` to {value:?}, and its host could not be resolved to a public address, so no storage request is sent to it and the table cannot be read. If this endpoint is trusted, {param_hint}, or set `{}=true`. See: https://spiceai.org/docs/components/data-connectors/iceberg",
         url_table::ALLOW_PRIVATE_HOSTS_ENV
     )
 }
@@ -1688,19 +1193,6 @@ fn vended_endpoint_rewritten_message(
     let param_hint = endpoint_param_hint(key);
     format!(
         "The Iceberg catalog for {component} set `{key}` to {value:?}. The storage client rewrites that to {effective:?}, a private, loopback, or link-local address, so no storage request is sent to it and the table cannot be read. If this endpoint is trusted, {param_hint}, or set `{}=true`. See: https://spiceai.org/docs/components/data-connectors/iceberg",
-        url_table::ALLOW_PRIVATE_HOSTS_ENV
-    )
-}
-
-fn vended_endpoint_rewritten_unresolved_message(
-    component: &str,
-    key: &str,
-    value: &str,
-    effective: &str,
-) -> String {
-    let param_hint = endpoint_param_hint(key);
-    format!(
-        "The Iceberg catalog for {component} set `{key}` to {value:?}. The storage client rewrites that to {effective:?}, and that host could not be resolved to a public address, so no storage request is sent to it and the table cannot be read. If this endpoint is trusted, {param_hint}, or set `{}=true`. See: https://spiceai.org/docs/components/data-connectors/iceberg",
         url_table::ALLOW_PRIVATE_HOSTS_ENV
     )
 }
@@ -2182,20 +1674,14 @@ mod tests {
 
     mod vended_storage_endpoint {
         use super::super::{
-            GCS_SERVICE_HOST, S3_ENDPOINT, STORAGE_ENDPOINT_PROPS, catalog_controlled_s3_region,
-            check_vended_endpoints, check_vended_file_location,
-            clear_vended_endpoint_resolver_override, effective_storage_endpoint,
-            endpoint_targets_internal_host, get_rest_catalog, refusal_message_for_resolution,
-            s3_effective_endpoint, s3_region_is_substituted, s3_region_with_fallback,
-            set_vended_endpoint_resolver_override, vended_endpoint_refused_message,
-            vended_endpoint_rewritten_message, vended_endpoint_unresolved_message,
-            vended_file_location_refused_message,
-            vended_redirect::{
-                clear_vended_redirect_connect_override, set_vended_redirect_connect_override,
-                vended_redirect_refused_message,
+            S3_ENDPOINT, STORAGE_ENDPOINT_PROPS, get_rest_catalog, vended_endpoint_refused_message,
+            vended_endpoint_rewritten_message, vended_endpoints,
+            vended_transport::{
+                clear_resolver_override, set_resolver_answers, set_resolver_override,
             },
         };
         use std::collections::HashMap;
+        use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
         use std::sync::Arc;
 
         use axum::{Json, Router, routing::get};
@@ -2203,7 +1689,6 @@ mod tests {
         use parking_lot::Mutex;
         use serde_json::{Value, json};
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
-        use url::Url;
 
         const MANIFEST_LIST: &str = "s3://testbucket/warehouse/db/t/metadata/snap-1.avro";
 
@@ -2257,81 +1742,6 @@ mod tests {
             .await
         }
 
-        /// An object store stand-in on a loopback address that records the
-        /// request line of every connection it accepts and answers `404`.
-        struct Sentinel {
-            endpoint: String,
-            requests: Arc<Mutex<Vec<String>>>,
-        }
-
-        async fn start_sentinel() -> Sentinel {
-            let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
-                .await
-                .expect("bind the sentinel listener");
-            let endpoint = format!(
-                "http://{}",
-                listener.local_addr().expect("read the sentinel address")
-            );
-            let requests = Arc::new(Mutex::new(Vec::new()));
-            let recorded = Arc::clone(&requests);
-            tokio::spawn(async move {
-                while let Ok((mut stream, _)) = listener.accept().await {
-                    let recorded = Arc::clone(&recorded);
-                    tokio::spawn(async move {
-                        let mut buf = vec![0_u8; 8192];
-                        let n = stream.read(&mut buf).await.unwrap_or(0);
-                        let head = String::from_utf8_lossy(&buf[..n]);
-                        recorded
-                            .lock()
-                            .push(head.lines().next().unwrap_or_default().to_string());
-                        let _ = stream
-                            .write_all(
-                                b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
-                            )
-                            .await;
-                    });
-                }
-            });
-            Sentinel { endpoint, requests }
-        }
-
-        /// Loads `db.t` through `get_rest_catalog`, as the Iceberg connectors
-        /// do, and reads the table's manifest list through its `FileIO`.
-        async fn read_manifest_list(
-            catalog_uri: String,
-            operator_props: HashMap<String, String>,
-        ) -> iceberg::Result<usize> {
-            let catalog =
-                get_rest_catalog(catalog_uri, operator_props, None, "dataset 't'".to_string())
-                    .await
-                    .expect("build the REST catalog");
-            let table = catalog
-                .load_table(&TableIdent::from_strs(["db", "t"]).expect("valid table identifier"))
-                .await
-                .expect("load the table from the REST catalog");
-            let bytes = table.file_io().new_input(MANIFEST_LIST)?.read().await?;
-            Ok(bytes.len())
-        }
-
-        /// Like [`read_manifest_list`], reading `location` instead of the
-        /// default manifest list.
-        async fn read_location(
-            catalog_uri: String,
-            operator_props: HashMap<String, String>,
-            location: &str,
-        ) -> iceberg::Result<usize> {
-            let catalog =
-                get_rest_catalog(catalog_uri, operator_props, None, "dataset 't'".to_string())
-                    .await
-                    .expect("build the REST catalog");
-            let table = catalog
-                .load_table(&TableIdent::from_strs(["db", "t"]).expect("valid table identifier"))
-                .await
-                .expect("load the table from the REST catalog");
-            let bytes = table.file_io().new_input(location)?.read().await?;
-            Ok(bytes.len())
-        }
-
         async fn start_rest_catalog_at(
             config: &Value,
             metadata_location: &str,
@@ -2360,6 +1770,88 @@ mod tests {
             format!("http://{addr}")
         }
 
+        /// An object store stand-in on a loopback address that records the
+        /// request line of every connection it accepts. It answers `404`, or
+        /// `302` to `redirect_to` when that is set.
+        struct Sentinel {
+            endpoint: String,
+            port: u16,
+            requests: Arc<Mutex<Vec<String>>>,
+        }
+
+        async fn start_sentinel() -> Sentinel {
+            start_listener(None).await
+        }
+
+        async fn start_redirector(location: &str) -> Sentinel {
+            start_listener(Some(location.to_string())).await
+        }
+
+        async fn start_listener(redirect_to: Option<String>) -> Sentinel {
+            start_listener_on(SocketAddr::new(LOOPBACK, 0), redirect_to).await
+        }
+
+        async fn start_listener_on(bind: SocketAddr, redirect_to: Option<String>) -> Sentinel {
+            let listener = tokio::net::TcpListener::bind(bind)
+                .await
+                .expect("bind the sentinel listener");
+            let addr = listener.local_addr().expect("read the sentinel address");
+            let requests = Arc::new(Mutex::new(Vec::new()));
+            let recorded = Arc::clone(&requests);
+            tokio::spawn(async move {
+                while let Ok((mut stream, _)) = listener.accept().await {
+                    let recorded = Arc::clone(&recorded);
+                    let response = match &redirect_to {
+                        Some(location) => format!(
+                            "HTTP/1.1 302 Found\r\nLocation: {location}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                        ),
+                        None => "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                            .to_string(),
+                    };
+                    tokio::spawn(async move {
+                        let mut buf = vec![0_u8; 8192];
+                        let n = stream.read(&mut buf).await.unwrap_or(0);
+                        let head = String::from_utf8_lossy(&buf[..n]);
+                        recorded
+                            .lock()
+                            .push(head.lines().next().unwrap_or_default().to_string());
+                        let _ = stream.write_all(response.as_bytes()).await;
+                    });
+                }
+            });
+            Sentinel {
+                endpoint: format!("http://{addr}"),
+                port: addr.port(),
+                requests,
+            }
+        }
+
+        /// Loads `db.t` through `get_rest_catalog`, as the Iceberg connectors
+        /// do, and reads `location` through the table's `FileIO`.
+        async fn read_location(
+            catalog_uri: String,
+            operator_props: HashMap<String, String>,
+            location: &str,
+        ) -> iceberg::Result<usize> {
+            let catalog =
+                get_rest_catalog(catalog_uri, operator_props, None, "dataset 't'".to_string())
+                    .await
+                    .expect("build the REST catalog");
+            let table = catalog
+                .load_table(&TableIdent::from_strs(["db", "t"]).expect("valid table identifier"))
+                .await
+                .expect("load the table from the REST catalog");
+            let bytes = table.file_io().new_input(location)?.read().await?;
+            Ok(bytes.len())
+        }
+
+        async fn read_manifest_list(
+            catalog_uri: String,
+            operator_props: HashMap<String, String>,
+        ) -> iceberg::Result<usize> {
+            read_location(catalog_uri, operator_props, MANIFEST_LIST).await
+        }
+
         fn vended_config(endpoint: &str) -> Value {
             json!({
                 "s3.endpoint": endpoint,
@@ -2370,18 +1862,59 @@ mod tests {
             })
         }
 
+        fn operator_props(endpoint: &str) -> HashMap<String, String> {
+            HashMap::from([
+                (S3_ENDPOINT.to_string(), endpoint.to_string()),
+                ("s3.access-key-id".to_string(), "minio".to_string()),
+                ("s3.secret-access-key".to_string(), "minio123".to_string()),
+                ("s3.region".to_string(), "us-east-1".to_string()),
+                ("s3.path-style-access".to_string(), "true".to_string()),
+            ])
+        }
+
+        /// The error the storage transport returns for `reason`.
+        fn transport_refusal(reason: &str) -> String {
+            format!(
+                "The Iceberg catalog for dataset 't' directs storage requests to a host that is not allowed: {reason}, so the request is not sent and the table cannot be read. If this endpoint is trusted, set the `s3_endpoint` parameter to it, or set `SPICE_URL_TABLE_ALLOW_PRIVATE_HOSTS=true`. See: https://spiceai.org/docs/components/data-connectors/iceberg"
+            )
+        }
+
+        /// Answers lookups of `host` with `addrs` until the test ends.
+        /// `treat_as_public` lets a public name reach a local fixture.
+        struct ResolverOverride {
+            host: String,
+        }
+
+        impl ResolverOverride {
+            fn set(host: &str, addrs: Vec<IpAddr>, treat_as_public: bool) -> Self {
+                set_resolver_override(host, addrs, treat_as_public);
+                Self {
+                    host: host.to_string(),
+                }
+            }
+
+            fn answers(host: &str, answers: Vec<(Vec<IpAddr>, bool)>) -> Self {
+                set_resolver_answers(host, answers);
+                Self {
+                    host: host.to_string(),
+                }
+            }
+        }
+
+        impl Drop for ResolverOverride {
+            fn drop(&mut self) {
+                clear_resolver_override(&self.host);
+            }
+        }
+
+        const LOOPBACK: IpAddr = IpAddr::V4(Ipv4Addr::LOCALHOST);
+
         #[tokio::test]
         async fn catalog_vended_internal_endpoint_is_refused_without_connecting() {
             let sentinel = start_sentinel().await;
-            let port = sentinel
-                .endpoint
-                .rsplit(':')
-                .next()
-                .expect("sentinel endpoint has a port")
-                .to_string();
             let endpoints = [
                 sentinel.endpoint.clone(),
-                format!("localhost:{port}"),
+                format!("localhost:{}", sentinel.port),
                 "http://169.254.169.254".to_string(),
                 "http://172.30.0.2:18077".to_string(),
                 "http://[::ffff:169.254.169.254]".to_string(),
@@ -2404,154 +1937,102 @@ mod tests {
             assert_eq!(*sentinel.requests.lock(), Vec::<String>::new());
         }
 
-        /// Removes this test's resolver override when the test ends.
-        struct ResolverOverride {
-            host: String,
-        }
-
-        impl ResolverOverride {
-            fn set(host: &str, result: Result<Vec<std::net::IpAddr>, String>) -> Self {
-                set_vended_endpoint_resolver_override(host, result);
-                Self {
-                    host: host.to_ascii_lowercase(),
-                }
-            }
-        }
-
-        impl Drop for ResolverOverride {
-            fn drop(&mut self) {
-                clear_vended_endpoint_resolver_override(&self.host);
-            }
-        }
-
         #[tokio::test]
-        async fn catalog_vended_hostname_resolving_to_loopback_is_refused_without_connecting() {
+        async fn catalog_vended_hostname_resolving_to_an_internal_address_is_refused_without_connecting()
+         {
             let sentinel = start_sentinel().await;
-            let _override = ResolverOverride::set(
-                "loopback.vended.test",
-                Ok(vec![std::net::Ipv6Addr::LOCALHOST.into()]),
-            );
-            let endpoint = "http://loopback.vended.test:9000";
-            let catalog_uri = start_rest_catalog(&vended_config(endpoint)).await;
-            let err = read_manifest_list(catalog_uri, HashMap::new())
-                .await
-                .expect_err("a hostname that resolves to loopback must not be read");
-            assert_eq!(err.kind(), iceberg::ErrorKind::DataInvalid);
-            assert_eq!(
-                err.message(),
-                vended_endpoint_refused_message("dataset 't'", S3_ENDPOINT, endpoint)
-            );
+            let cases = [
+                (
+                    "loopback.vended.test",
+                    vec![LOOPBACK],
+                    "\"loopback.vended.test\" is or resolves to a private, loopback, or link-local address",
+                ),
+                (
+                    "mixed.vended.test",
+                    vec![LOOPBACK, IpAddr::V4(Ipv4Addr::new(1, 1, 1, 1))],
+                    "\"mixed.vended.test\" is or resolves to a private, loopback, or link-local address",
+                ),
+                (
+                    "unresolved.vended.test",
+                    Vec::new(),
+                    "\"unresolved.vended.test\" could not be resolved to a public address",
+                ),
+            ];
+            for (host, addrs, reason) in cases {
+                let _dns = ResolverOverride::set(host, addrs, false);
+                let endpoint = format!("http://{host}:{}", sentinel.port);
+                let catalog_uri = start_rest_catalog(&vended_config(&endpoint)).await;
+                let err = read_manifest_list(catalog_uri, HashMap::new())
+                    .await
+                    .expect_err("a hostname that resolves to an internal address must not be read");
+                assert!(
+                    err.to_string().contains(&transport_refusal(reason)),
+                    "expected the refusal for {host} in: {err}"
+                );
+            }
             assert_eq!(*sentinel.requests.lock(), Vec::<String>::new());
         }
 
-        #[test]
-        fn s3_endpoint_bucket_prefix_is_removed() {
+        #[tokio::test]
+        async fn catalog_vended_public_hostname_is_read() {
+            let sentinel = start_sentinel().await;
+            let _dns = ResolverOverride::set("public.vended.test", vec![LOOPBACK], true);
+            let endpoint = format!("http://public.vended.test:{}", sentinel.port);
+            let catalog_uri = start_rest_catalog(&vended_config(&endpoint)).await;
+            let err = read_manifest_list(catalog_uri, HashMap::new())
+                .await
+                .expect_err("the sentinel answers 404");
+            assert_eq!(err.kind(), iceberg::ErrorKind::Unexpected, "{err}");
             assert_eq!(
-                s3_effective_endpoint("http://8.127.0.1:18075", "8", false, "us-east-1"),
-                "http://127.0.0.1:18075/8",
-                "path style strips the bucket prefix and URL parsing collapses 127.0.1"
+                *sentinel.requests.lock(),
+                vec!["GET /testbucket/warehouse/db/t/metadata/snap-1.avro HTTP/1.1".to_string()]
             );
-            assert_eq!(
-                s3_effective_endpoint("http://8.127.0.0.1:18075", "8", false, "us-east-1"),
-                "http://127.0.0.1:18075/8"
+        }
+
+        /// The first answer stands in for a public address; every later answer
+        /// is internal. A second lookup before the connection would reach the
+        /// internal listener on the same port.
+        #[tokio::test]
+        async fn catalog_vended_hostname_is_dialed_at_the_address_that_was_checked() {
+            let checked = start_sentinel().await;
+            let rebound = start_listener_on(
+                SocketAddr::new(IpAddr::V6(Ipv6Addr::LOCALHOST), checked.port),
+                None,
+            )
+            .await;
+            let _dns = ResolverOverride::answers(
+                "rebind.vended.test",
+                vec![
+                    (vec![LOOPBACK], true),
+                    (vec![IpAddr::V6(Ipv6Addr::LOCALHOST)], false),
+                ],
             );
+            let endpoint = format!("http://rebind.vended.test:{}", checked.port);
+            let catalog_uri = start_rest_catalog(&vended_config(&endpoint)).await;
+            let err = read_manifest_list(catalog_uri, HashMap::new())
+                .await
+                .expect_err("the sentinel answers 404");
+            assert_eq!(*rebound.requests.lock(), Vec::<String>::new(), "{err}");
             assert_eq!(
-                s3_effective_endpoint("http://public.example.test:9000", "loop", true, "us-east-1"),
-                "http://loop.public.example.test:9000",
-                "virtual-host style puts the bucket in front of the host"
-            );
-            assert_eq!(
-                s3_effective_endpoint("https://s3.amazonaws.com", "warehouse", false, "eu-west-1"),
-                "https://s3.eu-west-1.amazonaws.com/warehouse"
-            );
-            assert_eq!(
-                s3_effective_endpoint(
-                    "https://s3.amazonaws.com",
-                    "testbucket",
-                    false,
-                    "x@127.0.0.1:18074/",
-                ),
-                "https://s3.x@127.0.0.1:18074/.amazonaws.com/testbucket",
-                "a region is substituted into the global endpoint before path-style"
-            );
-            assert!(endpoint_targets_internal_host(
-                "https://s3.x@127.0.0.1:18074/.amazonaws.com/testbucket"
-            ));
-            assert_eq!(
-                s3_effective_endpoint(
-                    "https://s3.amazonaws.com",
-                    "testbucket",
-                    true,
-                    "x@127.0.0.1:18074/",
-                ),
-                "https://testbucket.s3.x@127.0.0.1:18074/.amazonaws.com"
-            );
-            let endpoint = "http://8.127.0.1:18075";
-            let effective = "http://127.0.0.1:18075/8";
-            for scheme in ["s3", "s3a", "s3n", "minio"] {
-                assert_eq!(
-                    effective_storage_endpoint(
-                        S3_ENDPOINT,
-                        endpoint,
-                        &format!("{scheme}://8/metadata/snap-1.avro"),
-                        false,
-                        "us-east-1",
-                    ),
-                    effective,
-                    "{scheme}"
-                );
-            }
-            assert_eq!(
-                effective_storage_endpoint(
-                    S3_ENDPOINT,
-                    endpoint,
-                    "file:///tmp/x",
-                    false,
-                    "us-east-1",
-                ),
-                endpoint,
-                "a file URL with no host is not an S3 bucket"
+                *checked.requests.lock(),
+                vec!["GET /testbucket/warehouse/db/t/metadata/snap-1.avro HTTP/1.1".to_string()]
             );
         }
 
         #[tokio::test]
         async fn catalog_vended_endpoint_rewritten_onto_loopback_is_refused_without_connecting() {
             let sentinel = start_sentinel().await;
-            let port = sentinel
-                .endpoint
-                .rsplit(':')
-                .next()
-                .expect("sentinel endpoint has a port");
+            let port = sentinel.port;
             let effective = format!("http://127.0.0.1:{port}/8");
             let cases = [
-                format!("http://8.127.0.1:{port}"),
-                format!("http://8.127.0.0.1:{port}"),
+                ("s3", format!("http://8.127.0.1:{port}")),
+                ("s3", format!("http://8.127.0.0.1:{port}")),
+                ("s3a", format!("http://8.127.0.1:{port}")),
+                ("s3n", format!("http://8.127.0.1:{port}")),
+                ("minio", format!("http://8.127.0.1:{port}")),
             ];
-            for endpoint in cases {
-                let catalog_uri = start_rest_catalog_at(
-                    &vended_config(&endpoint),
-                    "s3://8/metadata/v1.metadata.json",
-                    "s3://8/metadata/snap-1.avro",
-                )
-                .await;
-                let err = read_location(catalog_uri, HashMap::new(), "s3://8/metadata/snap-1.avro")
-                    .await
-                    .expect_err("a rewritten loopback endpoint must not be read");
-                assert_eq!(err.kind(), iceberg::ErrorKind::DataInvalid, "{endpoint}");
-                assert_eq!(
-                    err.message(),
-                    vended_endpoint_rewritten_message(
-                        "dataset 't'",
-                        S3_ENDPOINT,
-                        &endpoint,
-                        &effective
-                    ),
-                    "{endpoint}"
-                );
-            }
-            for scheme in ["s3a", "s3n", "minio"] {
+            for (scheme, endpoint) in cases {
                 let location = format!("{scheme}://8/metadata/snap-1.avro");
-                let endpoint = format!("http://8.127.0.1:{port}");
                 let catalog_uri = start_rest_catalog_at(
                     &vended_config(&endpoint),
                     &format!("{scheme}://8/metadata/v1.metadata.json"),
@@ -2561,7 +2042,7 @@ mod tests {
                 let err = read_location(catalog_uri, HashMap::new(), &location)
                     .await
                     .expect_err("a rewritten loopback endpoint must not be read");
-                assert_eq!(err.kind(), iceberg::ErrorKind::DataInvalid, "{scheme}");
+                assert_eq!(err.kind(), iceberg::ErrorKind::DataInvalid, "{location}");
                 assert_eq!(
                     err.message(),
                     vended_endpoint_rewritten_message(
@@ -2570,112 +2051,20 @@ mod tests {
                         &endpoint,
                         &effective
                     ),
-                    "{scheme}"
+                    "{location}"
                 );
             }
             assert_eq!(*sentinel.requests.lock(), Vec::<String>::new());
         }
 
-        #[test]
-        fn s3_region_prefers_client_then_property_then_environment() {
-            let both = HashMap::from([
-                ("s3.region".to_string(), "from-s3".to_string()),
-                ("client.region".to_string(), "from-client".to_string()),
-            ]);
-            assert_eq!(
-                s3_region_with_fallback(&both, Some("from-env"), Some("from-default")),
-                "from-client"
-            );
-            let property = HashMap::from([("s3.region".to_string(), "from-s3".to_string())]);
-            assert_eq!(
-                s3_region_with_fallback(&property, Some("from-env"), Some("from-default")),
-                "from-s3"
-            );
-            let absent = HashMap::new();
-            assert_eq!(
-                s3_region_with_fallback(&absent, Some("from-env"), Some("from-default")),
-                "from-env"
-            );
-            assert_eq!(
-                s3_region_with_fallback(&absent, Some(""), Some("from-default")),
-                "",
-                "an empty AWS_REGION does not fall through"
-            );
-            assert_eq!(
-                s3_region_with_fallback(&absent, None, Some("from-default")),
-                "from-default"
-            );
-            assert_eq!(s3_region_with_fallback(&absent, None, None), "");
-        }
-
-        #[test]
-        fn catalog_region_is_checked_only_when_it_changes_the_host() {
-            let region = "x@127.0.0.1:18074/";
-            let props = HashMap::from([("s3.region".to_string(), region.to_string())]);
-            let vended = catalog_controlled_s3_region(&props, &HashMap::new(), &HashMap::new())
-                .expect(
-                    "a catalog region with no endpoint is substituted into the global endpoint",
-                );
-            assert_eq!(vended.key, "s3.region");
-            assert_eq!(vended.value, region);
-            assert_eq!(vended.endpoint, "https://s3.amazonaws.com");
-
-            let operator_region = HashMap::from([("s3.region".to_string(), region.to_string())]);
-            assert!(
-                catalog_controlled_s3_region(&props, &operator_region, &HashMap::new()).is_none(),
-                "the operator's own region is trusted"
-            );
-
-            let private_endpoint = HashMap::from([(
-                S3_ENDPOINT.to_string(),
-                "http://172.30.0.3:9000".to_string(),
-            )]);
-            let mut with_endpoint = props;
-            with_endpoint.insert(
-                S3_ENDPOINT.to_string(),
-                "http://172.30.0.3:9000".to_string(),
-            );
-            let recorded =
-                catalog_controlled_s3_region(&with_endpoint, &HashMap::new(), &private_endpoint)
-                    .expect("a catalog region is recorded with the operator endpoint");
-            assert_eq!(recorded.endpoint, "http://172.30.0.3:9000");
-            assert!(
-                !s3_region_is_substituted(&recorded.endpoint, "warehouse"),
-                "a private operator endpoint is not the global template after bucket removal"
-            );
-            assert!(s3_region_is_substituted(
-                "https://testbucket.s3.amazonaws.com",
-                "testbucket"
-            ));
-            assert_eq!(
-                s3_effective_endpoint(
-                    "https://testbucket.s3.amazonaws.com",
-                    "testbucket",
-                    false,
-                    region,
-                ),
-                "https://s3.x@127.0.0.1:18074/.amazonaws.com/testbucket"
-            );
-
-            let client = HashMap::from([
-                ("s3.region".to_string(), "us-east-1".to_string()),
-                ("client.region".to_string(), region.to_string()),
-            ]);
-            let vended = catalog_controlled_s3_region(&client, &operator_region, &HashMap::new())
-                .expect("client.region wins over the operator's s3.region");
-            assert_eq!(vended.key, "client.region");
-        }
-
         #[tokio::test]
         async fn catalog_vended_region_rewritten_onto_loopback_is_refused_without_connecting() {
             let sentinel = start_sentinel().await;
-            let port = sentinel
-                .endpoint
-                .rsplit(':')
-                .next()
-                .expect("sentinel endpoint has a port");
-            let region = format!("x@127.0.0.1:{port}/");
-            let effective = format!("https://s3.x@127.0.0.1:{port}/.amazonaws.com/testbucket");
+            let region = format!("x@127.0.0.1:{}/", sentinel.port);
+            let effective = format!(
+                "https://s3.x@127.0.0.1:{}/.amazonaws.com/testbucket",
+                sentinel.port
+            );
             let config = json!({
                 "s3.access-key-id": "AKIATEST",
                 "s3.secret-access-key": "testsecret",
@@ -2697,14 +2086,11 @@ mod tests {
         #[tokio::test]
         async fn catalog_region_rewrites_a_bucket_qualified_operator_endpoint() {
             let sentinel = start_sentinel().await;
-            let port = sentinel
-                .endpoint
-                .rsplit(':')
-                .next()
-                .expect("sentinel endpoint has a port");
-            let region = format!("x@127.0.0.1:{port}/");
-            let endpoint = "https://testbucket.s3.amazonaws.com";
-            let effective = format!("https://s3.x@127.0.0.1:{port}/.amazonaws.com/testbucket");
+            let region = format!("x@127.0.0.1:{}/", sentinel.port);
+            let effective = format!(
+                "https://s3.x@127.0.0.1:{}/.amazonaws.com/testbucket",
+                sentinel.port
+            );
             let config = json!({
                 "client.region": region,
                 "s3.access-key-id": "AKIATEST",
@@ -2712,13 +2098,9 @@ mod tests {
                 "s3.path-style-access": "true",
             });
             let catalog_uri = start_rest_catalog(&config).await;
-            let operator_props = HashMap::from([
-                (S3_ENDPOINT.to_string(), endpoint.to_string()),
-                ("s3.access-key-id".to_string(), "AKIATEST".to_string()),
-                ("s3.secret-access-key".to_string(), "testsecret".to_string()),
-                ("s3.path-style-access".to_string(), "true".to_string()),
-            ]);
-            let err = read_manifest_list(catalog_uri, operator_props)
+            let mut operator = operator_props("https://testbucket.s3.amazonaws.com");
+            operator.remove("s3.region");
+            let err = read_manifest_list(catalog_uri, operator)
                 .await
                 .expect_err("a bucket-qualified global endpoint must not be read");
             assert_eq!(err.kind(), iceberg::ErrorKind::DataInvalid, "{err}");
@@ -2745,97 +2127,15 @@ mod tests {
                 "s3.path-style-access": "true",
             });
             let catalog_uri = start_rest_catalog(&config).await;
-            let operator_props = HashMap::from([
-                (S3_ENDPOINT.to_string(), sentinel.endpoint.clone()),
-                ("s3.access-key-id".to_string(), "minio".to_string()),
-                ("s3.secret-access-key".to_string(), "minio123".to_string()),
-                ("s3.path-style-access".to_string(), "true".to_string()),
-            ]);
-            let err = read_manifest_list(catalog_uri, operator_props)
+            let mut operator = operator_props(&sentinel.endpoint);
+            operator.remove("s3.region");
+            let err = read_manifest_list(catalog_uri, operator)
                 .await
                 .expect_err("the sentinel answers 404");
             assert_eq!(err.kind(), iceberg::ErrorKind::Unexpected, "{err}");
             assert_eq!(
                 *sentinel.requests.lock(),
                 vec!["GET /testbucket/warehouse/db/t/metadata/snap-1.avro HTTP/1.1".to_string()]
-            );
-        }
-
-        #[tokio::test]
-        async fn operator_endpoint_rewritten_by_the_bucket_is_still_used() {
-            let sentinel = start_sentinel().await;
-            let port = sentinel
-                .endpoint
-                .rsplit(':')
-                .next()
-                .expect("sentinel endpoint has a port");
-            let endpoint = format!("http://8.127.0.0.1:{port}");
-            let catalog_uri = start_rest_catalog_at(
-                &vended_config(&endpoint),
-                "s3://8/metadata/v1.metadata.json",
-                "s3://8/metadata/snap-1.avro",
-            )
-            .await;
-            let operator_props = HashMap::from([
-                (S3_ENDPOINT.to_string(), endpoint),
-                ("s3.access-key-id".to_string(), "minio".to_string()),
-                ("s3.secret-access-key".to_string(), "minio123".to_string()),
-                ("s3.region".to_string(), "us-east-1".to_string()),
-                ("s3.path-style-access".to_string(), "true".to_string()),
-            ]);
-            let err = read_location(catalog_uri, operator_props, "s3://8/metadata/snap-1.avro")
-                .await
-                .expect_err("the sentinel answers 404");
-            assert_eq!(err.kind(), iceberg::ErrorKind::Unexpected, "{err}");
-            assert_eq!(
-                *sentinel.requests.lock(),
-                vec!["GET /8/metadata/snap-1.avro HTTP/1.1".to_string()]
-            );
-        }
-
-        #[test]
-        fn resolved_endpoint_classification() {
-            let value = "http://minio.example.com:9000";
-            assert!(
-                refusal_message_for_resolution(
-                    "dataset 't'",
-                    S3_ENDPOINT,
-                    value,
-                    Ok(vec![std::net::IpAddr::from([1, 1, 1, 1])]),
-                )
-                .is_none(),
-                "a public address is not a refusal"
-            );
-            assert_eq!(
-                refusal_message_for_resolution(
-                    "dataset 't'",
-                    S3_ENDPOINT,
-                    value,
-                    Ok(vec![
-                        std::net::IpAddr::from([1, 1, 1, 1]),
-                        std::net::IpAddr::from([10, 1, 2, 3]),
-                    ]),
-                )
-                .as_deref(),
-                Some(vended_endpoint_refused_message("dataset 't'", S3_ENDPOINT, value).as_str()),
-                "one internal address among public ones is refused"
-            );
-            assert_eq!(
-                refusal_message_for_resolution(
-                    "dataset 't'",
-                    S3_ENDPOINT,
-                    "http://loopback.vended.test:9000",
-                    Err("no such host".to_string()),
-                )
-                .as_deref(),
-                Some(
-                    vended_endpoint_unresolved_message(
-                        "dataset 't'",
-                        S3_ENDPOINT,
-                        "http://loopback.vended.test:9000",
-                    )
-                    .as_str()
-                )
             );
         }
 
@@ -2843,14 +2143,7 @@ mod tests {
         async fn operator_configured_private_endpoint_is_used() {
             let sentinel = start_sentinel().await;
             let catalog_uri = start_rest_catalog(&vended_config("http://169.254.169.254")).await;
-            let operator_props = HashMap::from([
-                ("s3.endpoint".to_string(), sentinel.endpoint.clone()),
-                ("s3.access-key-id".to_string(), "minio".to_string()),
-                ("s3.secret-access-key".to_string(), "minio123".to_string()),
-                ("s3.region".to_string(), "us-east-1".to_string()),
-                ("s3.path-style-access".to_string(), "true".to_string()),
-            ]);
-            let err = read_manifest_list(catalog_uri, operator_props)
+            let err = read_manifest_list(catalog_uri, operator_props(&sentinel.endpoint))
                 .await
                 .expect_err("the sentinel answers 404");
             assert_eq!(err.kind(), iceberg::ErrorKind::Unexpected, "{err}");
@@ -2860,44 +2153,29 @@ mod tests {
             );
         }
 
-        #[test]
-        fn public_or_absent_vended_endpoint_passes() {
-            let operator = HashMap::new();
-            for endpoint in [
-                "https://s3.us-west-2.amazonaws.com",
-                "https://storage.googleapis.com",
-                "s3.eu-central-1.amazonaws.com",
-                "http://8.8.8.8:9000",
-                "https://minio.example.com:9000",
-            ] {
-                let props = HashMap::from([(S3_ENDPOINT.to_string(), endpoint.to_string())]);
-                check_vended_endpoints(&props, &operator, "dataset 't'", false)
-                    .unwrap_or_else(|e| panic!("{endpoint} must pass: {e}"));
-            }
-            let credentials_only = HashMap::from([
-                ("s3.access-key-id".to_string(), "AKIATEST".to_string()),
-                ("s3.secret-access-key".to_string(), "testsecret".to_string()),
-                ("s3.session-token".to_string(), "token".to_string()),
-            ]);
-            check_vended_endpoints(&credentials_only, &operator, "dataset 't'", false)
-                .expect("vended credentials without an endpoint pass");
-        }
-
-        #[test]
-        fn every_endpoint_property_is_checked() {
+        #[tokio::test]
+        async fn every_endpoint_property_is_checked() {
             for key in STORAGE_ENDPOINT_PROPS {
-                let props = HashMap::from([(key.to_string(), "http://10.0.0.5".to_string())]);
-                let err = check_vended_endpoints(&props, &HashMap::new(), "catalog 'ice'", false)
+                let config = json!({
+                    key: "http://10.0.0.5",
+                    "s3.access-key-id": "AKIATEST",
+                    "s3.secret-access-key": "testsecret",
+                    "s3.region": "us-east-1",
+                });
+                let catalog_uri = start_rest_catalog(&config).await;
+                let err = read_manifest_list(catalog_uri, HashMap::new())
+                    .await
                     .expect_err("a vended private endpoint is refused");
                 assert_eq!(
                     err.message(),
-                    vended_endpoint_refused_message("catalog 'ice'", key, "http://10.0.0.5"),
+                    vended_endpoint_refused_message("dataset 't'", key, "http://10.0.0.5"),
+                    "{key}"
                 );
             }
             assert_eq!(
                 vended_endpoint_refused_message(
                     "catalog 'ice'",
-                    GCS_SERVICE_HOST,
+                    "gcs.service.host",
                     "http://10.0.0.5"
                 ),
                 "The Iceberg catalog for catalog 'ice' set `gcs.service.host` to \"http://10.0.0.5\", a private, loopback, or link-local address, so no storage request is sent to it and the table cannot be read. If this endpoint is trusted, configure it in the Spicepod, or set `SPICE_URL_TABLE_ALLOW_PRIVATE_HOSTS=true`. See: https://spiceai.org/docs/components/data-connectors/iceberg"
@@ -2908,220 +2186,41 @@ mod tests {
         fn operator_value_is_trusted_only_when_unchanged() {
             let operator =
                 HashMap::from([(S3_ENDPOINT.to_string(), "http://10.0.0.5:9000".to_string())]);
-            let same = operator.clone();
-            check_vended_endpoints(&same, &operator, "dataset 't'", false)
-                .expect("the operator's own endpoint passes");
+            assert_eq!(vended_endpoints(&operator, &operator), Vec::new());
             let replaced = HashMap::from([(
                 S3_ENDPOINT.to_string(),
                 "http://169.254.169.254".to_string(),
             )]);
-            let err = check_vended_endpoints(&replaced, &operator, "dataset 't'", false)
-                .expect_err("a catalog value replacing the operator's is checked");
             assert_eq!(
-                err.message(),
-                vended_endpoint_refused_message(
-                    "dataset 't'",
-                    S3_ENDPOINT,
-                    "http://169.254.169.254"
-                )
+                vended_endpoints(&replaced, &operator),
+                vec![(
+                    S3_ENDPOINT.to_string(),
+                    "http://169.254.169.254".to_string()
+                )]
             );
-        }
-
-        #[test]
-        fn allow_private_hosts_override_admits_internal_endpoints() {
-            let props = HashMap::from([(
-                S3_ENDPOINT.to_string(),
-                "http://169.254.169.254".to_string(),
-            )]);
-            check_vended_endpoints(&props, &HashMap::new(), "dataset 't'", true)
-                .expect("the override admits internal endpoints");
-        }
-
-        #[tokio::test]
-        async fn catalog_vended_file_location_is_refused_without_opening() {
-            let dir = tempfile::tempdir().expect("create a temporary directory");
-            let secret = dir.path().join("secret.txt");
-            std::fs::write(&secret, b"secret-bytes").expect("write the secret file");
-            let secret_url = Url::from_file_path(&secret)
-                .expect("secret file has a file url")
-                .to_string();
-            let missing = "file:///no/such/iceberg-vended-location";
-            let credentials = json!({
-                "s3.access-key-id": "AKIATEST",
-                "s3.secret-access-key": "testsecret",
-                "s3.region": "us-east-1",
-            });
-            for location in [secret_url.as_str(), missing] {
-                let catalog_uri = start_rest_catalog_at(&credentials, location, location).await;
-                let err = read_location(catalog_uri, HashMap::new(), location)
-                    .await
-                    .expect_err("a vended file location must not be opened");
-                assert_eq!(err.kind(), iceberg::ErrorKind::DataInvalid, "{location}");
-                assert_eq!(
-                    err.message(),
-                    vended_file_location_refused_message("dataset 't'", location),
-                    "{location}"
-                );
-            }
-            assert_eq!(
-                std::fs::read(&secret).expect("the secret file is still on disk"),
-                b"secret-bytes"
-            );
-        }
-
-        #[tokio::test]
-        async fn operator_file_warehouse_location_is_not_refused() {
-            let dir = tempfile::tempdir().expect("create a temporary directory");
-            let inside = dir.path().join("snap.avro");
-            std::fs::write(&inside, b"not-avro").expect("write a file inside the warehouse");
-            let inside_url = Url::from_file_path(&inside)
-                .expect("warehouse file has a file url")
-                .to_string();
-            let root = Url::from_file_path(dir.path())
-                .expect("warehouse directory has a file url")
-                .to_string();
-            let catalog_uri =
-                start_rest_catalog_at(&json!({}), inside_url.as_str(), inside_url.as_str()).await;
-            let err = read_location(
-                catalog_uri,
-                HashMap::from([("warehouse".to_string(), root.clone())]),
-                &inside_url,
-            )
-            .await
-            .expect_err("the s3 storage backend does not read file urls");
-            assert!(
-                err.message().contains("Invalid s3 url"),
-                "the guard must let an operator warehouse file through to the storage backend, got: {err}"
-            );
-            let outside = "file:///etc/passwd";
-            let catalog_uri = start_rest_catalog_at(&json!({}), outside, outside).await;
-            let err = read_location(
-                catalog_uri,
-                HashMap::from([("warehouse".to_string(), root)]),
-                outside,
-            )
-            .await
-            .expect_err("a file outside the operator warehouse is refused");
-            assert_eq!(
-                err.message(),
-                vended_file_location_refused_message("dataset 't'", outside)
-            );
-        }
-
-        #[test]
-        fn file_location_traversal_cannot_escape_the_operator_warehouse() {
-            let root = "file:///var/warehouse";
-            let inside = "file:///var/warehouse/db/t/metadata/snap.avro";
-            check_vended_file_location(inside, Some(root), "dataset 't'", false)
-                .expect("a location inside the operator warehouse passes");
-            for location in [
-                "file:///etc/passwd",
-                "file:///var/warehouse/../../etc/passwd",
-                "file:///var/warehouse/%2e%2e/%2e%2e/etc/passwd",
-                "file://localhost/etc/passwd",
-                "file:///var/warehouse-evil/secret",
-            ] {
-                let err = check_vended_file_location(location, Some(root), "dataset 't'", false)
-                    .expect_err("a location outside the warehouse is refused");
-                assert_eq!(
-                    err.message(),
-                    vended_file_location_refused_message("dataset 't'", location),
-                    "{location}"
-                );
-            }
-            check_vended_file_location(inside, None, "dataset 't'", false)
-                .expect_err("without an operator warehouse every file location is refused");
-            check_vended_file_location("file:///etc/passwd", None, "dataset 't'", true)
-                .expect("the private-host override admits file locations");
-            check_vended_file_location("s3://bucket/key", None, "dataset 't'", false)
-                .expect("an object-store location is not a local file");
-        }
-
-        /// Removes this test's connect override when the test ends.
-        struct ConnectOverride {
-            host: String,
-        }
-
-        impl ConnectOverride {
-            fn set(host: &str, authority: &str) -> Self {
-                set_vended_redirect_connect_override(host, authority);
-                Self {
-                    host: host.to_ascii_lowercase(),
-                }
-            }
-        }
-
-        impl Drop for ConnectOverride {
-            fn drop(&mut self) {
-                clear_vended_redirect_connect_override(&self.host);
-            }
-        }
-
-        /// Answers `302` to `location` and records the request line.
-        async fn start_redirector(location: &str) -> Sentinel {
-            let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
-                .await
-                .expect("bind the redirector");
-            let endpoint = format!(
-                "http://{}",
-                listener.local_addr().expect("read the redirector address")
-            );
-            let requests = Arc::new(Mutex::new(Vec::new()));
-            let recorded = Arc::clone(&requests);
-            let location = location.to_string();
-            tokio::spawn(async move {
-                while let Ok((mut stream, _)) = listener.accept().await {
-                    let recorded = Arc::clone(&recorded);
-                    let location = location.clone();
-                    tokio::spawn(async move {
-                        let mut buf = vec![0_u8; 8192];
-                        let n = stream.read(&mut buf).await.unwrap_or(0);
-                        let head = String::from_utf8_lossy(&buf[..n]);
-                        recorded
-                            .lock()
-                            .push(head.lines().next().unwrap_or_default().to_string());
-                        let response = format!(
-                            "HTTP/1.1 302 Found\r\nLocation: {location}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
-                        );
-                        let _ = stream.write_all(response.as_bytes()).await;
-                    });
-                }
-            });
-            Sentinel { endpoint, requests }
         }
 
         #[tokio::test]
         async fn catalog_vended_endpoint_redirect_to_loopback_is_refused_without_connecting() {
             let sentinel = start_sentinel().await;
-            let redirector = start_redirector(&format!("{}/secret", sentinel.endpoint)).await;
-            let authority = redirector
-                .endpoint
-                .trim_start_matches("http://")
-                .to_string();
-            let _connect = ConnectOverride::set("redirect.vended.test", &authority);
-            let _dns = ResolverOverride::set(
-                "redirect.vended.test",
-                Ok(vec![std::net::Ipv4Addr::new(8, 8, 8, 8).into()]),
-            );
-            let endpoint = format!(
-                "http://redirect.vended.test:{}",
-                authority.rsplit(':').next().expect("port")
-            );
+            let target = format!("{}/secret", sentinel.endpoint);
+            let redirector = start_redirector(&target).await;
+            let _dns = ResolverOverride::set("redirect.vended.test", vec![LOOPBACK], true);
+            let endpoint = format!("http://redirect.vended.test:{}", redirector.port);
             let catalog_uri = start_rest_catalog(&vended_config(&endpoint)).await;
             let err = read_manifest_list(catalog_uri, HashMap::new())
                 .await
                 .expect_err("a redirect to loopback must not be followed");
-            let expected = vended_redirect_refused_message(
-                "dataset 't'",
-                &format!("{}/secret", sentinel.endpoint),
-            );
+            let reason =
+                format!("{target:?} is or resolves to a private, loopback, or link-local address");
             assert!(
-                err.to_string().contains(&expected),
+                err.to_string().contains(&transport_refusal(&reason)),
                 "expected the redirect refusal in {err}"
             );
-            assert!(
-                !redirector.requests.lock().is_empty(),
-                "the public endpoint was never contacted, so the redirect was not exercised"
+            assert_eq!(
+                redirector.requests.lock().len(),
+                1,
+                "the refusal must reach the vended endpoint once and not be retried"
             );
             assert_eq!(*sentinel.requests.lock(), Vec::<String>::new());
         }
@@ -3129,42 +2228,27 @@ mod tests {
         #[tokio::test]
         async fn catalog_vended_redirect_to_hostname_resolving_to_loopback_is_refused() {
             let sentinel = start_sentinel().await;
-            let location = "http://redirect-target.vended.test:9/secret";
-            let redirector = start_redirector(location).await;
-            let redirector_authority = redirector
-                .endpoint
-                .trim_start_matches("http://")
-                .to_string();
-            let sentinel_authority = sentinel.endpoint.trim_start_matches("http://").to_string();
-            let _connect_redirector =
-                ConnectOverride::set("redirect-host.vended.test", &redirector_authority);
-            let _connect_target =
-                ConnectOverride::set("redirect-target.vended.test", &sentinel_authority);
-            let _dns_redirector = ResolverOverride::set(
-                "redirect-host.vended.test",
-                Ok(vec![std::net::Ipv4Addr::new(8, 8, 8, 8).into()]),
+            let target = format!(
+                "http://redirect-target.vended.test:{}/secret",
+                sentinel.port
             );
-            let _dns_target = ResolverOverride::set(
-                "redirect-target.vended.test",
-                Ok(vec![std::net::Ipv6Addr::LOCALHOST.into()]),
-            );
-            let endpoint = format!(
-                "http://redirect-host.vended.test:{}",
-                redirector_authority.rsplit(':').next().expect("port")
-            );
+            let redirector = start_redirector(&target).await;
+            let _dns_redirector =
+                ResolverOverride::set("redirect-host.vended.test", vec![LOOPBACK], true);
+            let _dns_target =
+                ResolverOverride::set("redirect-target.vended.test", vec![LOOPBACK], false);
+            let endpoint = format!("http://redirect-host.vended.test:{}", redirector.port);
             let catalog_uri = start_rest_catalog(&vended_config(&endpoint)).await;
             let err = read_manifest_list(catalog_uri, HashMap::new())
                 .await
                 .expect_err("a redirect to a loopback hostname must not be followed");
-            let expected = vended_redirect_refused_message("dataset 't'", location);
             assert!(
-                err.to_string().contains(&expected),
+                err.to_string().contains(&transport_refusal(
+                    "\"redirect-target.vended.test\" is or resolves to a private, loopback, or link-local address"
+                )),
                 "expected the redirect refusal in {err}"
             );
-            assert!(
-                !redirector.requests.lock().is_empty(),
-                "the public endpoint was never contacted, so the redirect was not exercised"
-            );
+            assert_eq!(redirector.requests.lock().len(), 1);
             assert_eq!(
                 *sentinel.requests.lock(),
                 Vec::<String>::new(),
@@ -3173,127 +2257,23 @@ mod tests {
         }
 
         #[tokio::test]
-        async fn catalog_vended_redirect_to_another_port_drops_credentials() {
-            let host = "redirect-port.vended.test";
-            let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
-                .await
-                .expect("bind the redirector");
-            let addr = listener.local_addr().expect("read the redirector address");
-            let other_port = addr.port().wrapping_add(1).max(1);
-            let location = format!("http://{host}:{other_port}/secret");
-            let requests = Arc::new(Mutex::new(Vec::new()));
-            let recorded = Arc::clone(&requests);
-            let redirect_to = location.clone();
-            tokio::spawn(async move {
-                while let Ok((mut stream, _)) = listener.accept().await {
-                    let recorded = Arc::clone(&recorded);
-                    let redirect_to = redirect_to.clone();
-                    tokio::spawn(async move {
-                        let mut buf = vec![0_u8; 8192];
-                        let n = stream.read(&mut buf).await.unwrap_or(0);
-                        let head = String::from_utf8_lossy(&buf[..n]).to_string();
-                        let path = head
-                            .lines()
-                            .next()
-                            .unwrap_or_default()
-                            .split_whitespace()
-                            .nth(1)
-                            .unwrap_or_default()
-                            .to_string();
-                        recorded.lock().push(head);
-                        let response = if path == "/secret" || path.starts_with("/secret?") {
-                            "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
-                                .to_string()
-                        } else {
-                            format!(
-                                "HTTP/1.1 302 Found\r\nLocation: {redirect_to}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
-                            )
-                        };
-                        let _ = stream.write_all(response.as_bytes()).await;
-                    });
-                }
-            });
-            let _connect = ConnectOverride::set(host, &addr.to_string());
-            let _dns =
-                ResolverOverride::set(host, Ok(vec![std::net::Ipv4Addr::new(8, 8, 8, 8).into()]));
-            let endpoint = format!("http://{host}:{}", addr.port());
-            let catalog_uri = start_rest_catalog(&vended_config(&endpoint)).await;
-            let err = read_manifest_list(catalog_uri, HashMap::new())
-                .await
-                .expect_err("the other port answers 404");
-            let recorded = requests.lock().clone();
-            let secret: Vec<_> = recorded
-                .iter()
-                .filter(|raw| request_path(raw) == "/secret")
-                .collect();
-            assert!(
-                !secret.is_empty(),
-                "the other port was not requested: {recorded:?} {err}"
-            );
-            assert!(
-                recorded.iter().any(|raw| {
-                    request_path(raw) != "/secret" && header_present(raw, "authorization")
-                }),
-                "the first hop sent no Authorization, so dropping it was not exercised: {recorded:?}"
-            );
-            for raw in secret {
-                assert!(
-                    !header_present(raw, "authorization")
-                        && !header_present(raw, "cookie")
-                        && !header_present(raw, "proxy-authorization"),
-                    "credentials crossed to port {other_port}: {raw}"
-                );
-            }
-        }
-
-        fn request_path(raw: &str) -> &str {
-            let path = raw
-                .lines()
-                .next()
-                .unwrap_or_default()
-                .split_whitespace()
-                .nth(1)
-                .unwrap_or_default();
-            path.split('?').next().unwrap_or(path)
-        }
-
-        fn header_present(raw: &str, name: &str) -> bool {
-            raw.lines().any(|line| {
-                line.split(':')
-                    .next()
-                    .is_some_and(|header| header.trim().eq_ignore_ascii_case(name))
-            })
-        }
-
-        #[tokio::test]
         async fn operator_endpoint_redirect_to_loopback_is_followed() {
             let sentinel = start_sentinel().await;
             let redirector = start_redirector(&format!("{}/secret", sentinel.endpoint)).await;
-            let mut operator = vended_config(&redirector.endpoint);
-            operator
+            let mut config = vended_config(&redirector.endpoint);
+            config
                 .as_object_mut()
                 .expect("config object")
                 .remove("s3.endpoint");
-            let catalog_uri = start_rest_catalog(&operator).await;
-            let mut props = HashMap::new();
-            props.insert("s3.endpoint".to_string(), redirector.endpoint.clone());
-            props.insert("s3.path-style-access".to_string(), "true".to_string());
-            props.insert("s3.region".to_string(), "us-east-1".to_string());
-            props.insert("s3.access-key-id".to_string(), "AKIATEST".to_string());
-            props.insert("s3.secret-access-key".to_string(), "testsecret".to_string());
-            let err = read_manifest_list(catalog_uri, props)
+            let catalog_uri = start_rest_catalog(&config).await;
+            let err = read_manifest_list(catalog_uri, operator_props(&redirector.endpoint))
                 .await
                 .expect_err("the sentinel answers 404");
-            assert!(
-                !err.to_string().contains("redirected storage"),
-                "an operator endpoint redirect must be followed, got: {err}"
-            );
-            assert!(
-                !redirector.requests.lock().is_empty(),
-                "the operator endpoint was not contacted"
-            );
-            assert!(
-                !sentinel.requests.lock().is_empty(),
+            assert_eq!(err.kind(), iceberg::ErrorKind::Unexpected, "{err}");
+            assert_eq!(redirector.requests.lock().len(), 1);
+            assert_eq!(
+                *sentinel.requests.lock(),
+                vec!["GET /secret HTTP/1.1".to_string()],
                 "the operator redirect was not followed: {err}"
             );
         }
@@ -3303,29 +2283,21 @@ mod tests {
          {
             let sentinel = start_sentinel().await;
             let redirector = start_redirector(&format!("{}/secret", sentinel.endpoint)).await;
-            let mut catalog_config = vended_config("http://127.0.0.1:9");
-            let config = catalog_config.as_object_mut().expect("config object");
-            config.remove("s3.endpoint");
-            config.insert("s3.region".to_string(), json!("us-west-2"));
-            let catalog_uri = start_rest_catalog(&catalog_config).await;
-            let mut props = HashMap::new();
-            props.insert("s3.endpoint".to_string(), redirector.endpoint.clone());
-            props.insert("s3.path-style-access".to_string(), "true".to_string());
-            props.insert("s3.access-key-id".to_string(), "AKIATEST".to_string());
-            props.insert("s3.secret-access-key".to_string(), "testsecret".to_string());
-            let err = read_manifest_list(catalog_uri, props)
+            let mut config = vended_config("http://127.0.0.1:9");
+            let object = config.as_object_mut().expect("config object");
+            object.remove("s3.endpoint");
+            object.insert("s3.region".to_string(), json!("us-west-2"));
+            let catalog_uri = start_rest_catalog(&config).await;
+            let mut operator = operator_props(&redirector.endpoint);
+            operator.remove("s3.region");
+            let err = read_manifest_list(catalog_uri, operator)
                 .await
                 .expect_err("the sentinel answers 404");
-            assert!(
-                !err.to_string().contains("redirected storage"),
-                "a catalog region that does not change the operator endpoint must not refuse its redirect, got: {err}"
-            );
-            assert!(
-                !redirector.requests.lock().is_empty(),
-                "the operator endpoint was not contacted"
-            );
-            assert!(
-                !sentinel.requests.lock().is_empty(),
+            assert_eq!(err.kind(), iceberg::ErrorKind::Unexpected, "{err}");
+            assert_eq!(redirector.requests.lock().len(), 1);
+            assert_eq!(
+                *sentinel.requests.lock(),
+                vec!["GET /secret HTTP/1.1".to_string()],
                 "the operator redirect was not followed: {err}"
             );
         }

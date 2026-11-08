@@ -189,8 +189,7 @@ files the gate itself reads**:
   as the `test/tls/` PEM files, one of which a `runtime-tls` unit test pins by
   SHA-256
 - `Cargo.toml`, `Cargo.lock`, `rust-toolchain[.toml]`, `.cargo/`, and `version.txt`
-- `.ci/clippy.toml` (the config `make lint-rust` uses via `CLIPPY_CONF_DIR`) and
-  the root `clippy.toml`; `[.]rustfmt.toml`
+- `clippy.toml` (the config `make lint-rust` reads); `[.]rustfmt.toml`
 - `.config/nextest.toml` — retries, slow-test timeouts, test groups
 - `layers.toml`, `scripts/check_crate_layers.py`,
   `scripts/check_rust_gate_paths.py`, and

@@ -87,14 +87,14 @@ fn allocate_ports(n: usize) -> Vec<u16> {
 
 /// The three ports each cluster node needs.
 #[derive(Debug, Clone, Copy)]
-struct NodePorts {
+pub(crate) struct NodePorts {
     http: u16,
     flight: u16,
     cluster: u16,
 }
 
 impl NodePorts {
-    fn allocate() -> Self {
+    pub(crate) fn allocate() -> Self {
         let ports = allocate_ports(3);
         Self {
             http: ports[0],
@@ -103,19 +103,19 @@ impl NodePorts {
         }
     }
 
-    fn http_addr(self) -> SocketAddr {
+    pub(crate) fn http_addr(self) -> SocketAddr {
         SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, self.http))
     }
 
-    fn flight_addr(self) -> SocketAddr {
+    pub(crate) fn flight_addr(self) -> SocketAddr {
         SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, self.flight))
     }
 
-    fn cluster_addr(self) -> SocketAddr {
+    pub(crate) fn cluster_addr(self) -> SocketAddr {
         SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, self.cluster))
     }
 
-    fn cluster_advertise(self) -> String {
+    pub(crate) fn cluster_advertise(self) -> String {
         format!("127.0.0.1:{}", self.cluster)
     }
 }
@@ -251,6 +251,19 @@ impl ClusterHarness {
         Ok(executors)
     }
 
+    /// The `host:port` the scheduler reaches each executor's Flight service at,
+    /// sorted.
+    #[must_use]
+    pub fn executor_flight_endpoints(&self) -> Vec<String> {
+        let mut endpoints = self
+            .executor_registry
+            .as_ref()
+            .map(|registry| registry.ready_executor_addresses_sync())
+            .unwrap_or_default();
+        endpoints.sort();
+        endpoints
+    }
+
     /// Run a SQL query through the scheduler and collect all result batches.
     pub async fn query(&self, sql: &str) -> Result<Vec<RecordBatch>, anyhow::Error> {
         QueryBuilder::new(sql, self.scheduler.datafusion())
@@ -295,6 +308,23 @@ impl ClusterHarness {
     /// This is used to test late-join scenarios (e.g. DDL replay on join).
     /// The executor is added to `self.executors` and its server handle to `self.handles`.
     pub async fn add_executor(&mut self, app: Option<App>) -> Result<(), anyhow::Error> {
+        self.add_executor_on(app, None).await
+    }
+
+    /// Start and register a new executor configured with `cluster_port` as its
+    /// cluster port, which may already be taken.
+    pub async fn add_executor_with_cluster_port(
+        &mut self,
+        cluster_port: u16,
+    ) -> Result<(), anyhow::Error> {
+        self.add_executor_on(None, Some(cluster_port)).await
+    }
+
+    async fn add_executor_on(
+        &mut self,
+        app: Option<App>,
+        cluster_port: Option<u16>,
+    ) -> Result<(), anyhow::Error> {
         let i = self.next_executor_index;
         self.next_executor_index += 1;
         let label = format!("executor{i}");
@@ -306,6 +336,7 @@ impl ClusterHarness {
             executor_app,
             self.pki.as_ref(),
             &self.scheduler_cluster_addr,
+            cluster_port,
         )
         .await?;
 
@@ -470,8 +501,14 @@ impl ClusterHarnessBuilder {
             let executor_app =
                 maybe_app.unwrap_or_else(|| AppBuilder::new(format!("test_{label}")).build());
 
-            let (executor_rt, executor_handle) =
-                start_executor(&label, executor_app, pki.as_ref(), &scheduler_cluster_addr).await?;
+            let (executor_rt, executor_handle) = start_executor(
+                &label,
+                executor_app,
+                pki.as_ref(),
+                &scheduler_cluster_addr,
+                None,
+            )
+            .await?;
 
             executor_rts.push(executor_rt);
             handles.push(executor_handle);
@@ -537,8 +574,12 @@ async fn start_executor(
     app: App,
     pki: Option<&test_framework::pki::PkiConfig>,
     scheduler_cluster_addr: &str,
+    cluster_port: Option<u16>,
 ) -> Result<(Arc<Runtime>, JoinHandle<RuntimeResult<()>>), anyhow::Error> {
-    let executor_ports = NodePorts::allocate();
+    let mut executor_ports = NodePorts::allocate();
+    if let Some(cluster_port) = cluster_port {
+        executor_ports.cluster = cluster_port;
+    }
 
     tracing::warn!("{label}: Ports: {executor_ports:?}. Scheduler: {scheduler_cluster_addr}");
     let executor_config = Config {

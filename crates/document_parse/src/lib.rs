@@ -98,17 +98,28 @@ pub async fn register_all() {
     register_parser_factory("xlsx", Arc::new(xlsx::XlsxParserFactory {})).await;
 }
 
+/// Registry key for a format name or path suffix. A leading `.` is ignored and
+/// the lookup is case-insensitive, so `pdf`, `PDF`, and `.PDF` all match.
+fn parser_registry_key(name: &str) -> String {
+    name.strip_prefix('.').unwrap_or(name).to_ascii_lowercase()
+}
+
+/// Look up a document parser by format name or file extension. The lookup is
+/// case-insensitive and a leading `.` is ignored, so `pdf`, `PDF`, and `.PDF`
+/// all resolve to the PDF parser.
 pub async fn get_parser_factory(ext: &str) -> Option<Arc<dyn DocumentParserFactory>> {
+    let key = parser_registry_key(ext);
     let registry = DOCUMENT_PARSER_FACTORY_REGISTRY.lock().await;
-    registry.get(ext.strip_prefix('.').unwrap_or(ext)).cloned()
+    registry.get(&key).cloned()
 }
 
 pub async fn register_parser_factory(
     name: &str,
     connector_factory: Arc<dyn DocumentParserFactory>,
 ) {
+    let key = parser_registry_key(name);
     let mut registry = DOCUMENT_PARSER_FACTORY_REGISTRY.lock().await;
-    registry.insert(name.to_string(), connector_factory);
+    registry.insert(key, connector_factory);
 }
 
 pub trait DocumentParserFactory: Send + Sync {
@@ -148,5 +159,45 @@ impl Display for DocumentType {
             DocumentType::Pptx => write!(f, "PPTX"),
             DocumentType::Xlsx => write!(f, "XLSX"),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn get_parser_factory_is_case_insensitive() {
+        register_all().await;
+        for key in ["pdf", "PDF", "Pdf", ".pdf", ".PDF"] {
+            assert!(
+                get_parser_factory(key).await.is_some(),
+                "parser lookup must find pdf for {key}"
+            );
+        }
+        assert!(
+            get_parser_factory("bin").await.is_none(),
+            "unknown extensions still have no parser"
+        );
+    }
+
+    #[tokio::test]
+    async fn uppercase_pdf_extension_parses_sample() {
+        register_all().await;
+        let factory = get_parser_factory(".PDF")
+            .await
+            .expect("uppercase .PDF must resolve to the pdf parser");
+        let doc = factory
+            .default()
+            .parse(&Bytes::from_static(include_bytes!(
+                "../tests/fixtures/hello.pdf"
+            )))
+            .await
+            .expect("sample PDF should parse");
+        let text = doc.as_flat_utf8().expect("flat utf8 text");
+        assert!(
+            text.contains("Spice"),
+            "expected extracted text to contain 'Spice', got: {text:?}"
+        );
     }
 }

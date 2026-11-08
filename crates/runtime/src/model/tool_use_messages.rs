@@ -44,7 +44,10 @@ use tracing::{Instrument, Span};
 
 use crate::model::messages_tool_history::{mcp_tool_result, mcp_tool_use, tool_result};
 use crate::model::responses_tool_history::ToolOutcome;
-use crate::model::tool_use::encode_tool_name;
+use crate::model::tool_use::{
+    MAX_SPICE_TOOL_CALLS_PER_RESPONSE, encode_tool_name, tool_call_not_run_message,
+    warn_if_over_tool_call_limit,
+};
 
 pub struct ToolUsingMessages {
     inner: Arc<dyn Messages>,
@@ -291,17 +294,37 @@ fn message(role: &str, content: Vec<Value>) -> Value {
 /// What one round's calls to Spice's tools produced, by call ID, in call order.
 type Outcomes = Vec<(String, ToolOutcome)>;
 
-async fn run_calls(tools: &SpiceTools, calls: &[Value]) -> Outcomes {
+/// Runs a round's calls to Spice's tools, the first [`MAX_SPICE_TOOL_CALLS_PER_RESPONSE`] in the
+/// order the model made them, and answers each later one with [`tool_call_not_run_message`].
+/// `model` is the model the request names, for the warning when the round made more.
+async fn run_calls(tools: &SpiceTools, model: &str, calls: &[Value]) -> Outcomes {
+    warn_if_over_tool_call_limit(model, calls.len());
     let mut outcomes = Vec::with_capacity(calls.len());
-    for call in calls {
+    for (position, call) in calls.iter().enumerate() {
         let id = call
             .get("id")
             .and_then(Value::as_str)
             .unwrap_or_default()
             .to_string();
-        outcomes.push((id, tools.run(call).await));
+        let outcome = if position < MAX_SPICE_TOOL_CALLS_PER_RESPONSE {
+            tools.run(call).await
+        } else {
+            ToolOutcome::Failed(tool_call_not_run_message(calls.len()))
+        };
+        outcomes.push((id, outcome));
     }
     outcomes
+}
+
+/// How many of a round's `calls` [`run_calls`] runs.
+fn calls_run(calls: &[Value]) -> usize {
+    calls.len().min(MAX_SPICE_TOOL_CALLS_PER_RESPONSE)
+}
+
+fn model_name(body: &Map<String, Value>) -> &str {
+    body.get("model")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
 }
 
 /// Adds a round that called Spice's tools, and their results, to the request for the next
@@ -404,8 +427,8 @@ impl Messages for ToolUsingMessages {
             } else if stop_reason != Some("tool_use") {
                 (not_run(&content, &spice, stop_reason), None)
             } else {
-                let outcomes = run_calls(&self.tools, &calls).await;
-                crate::model::add_tools_used(&request_context, outcomes.len());
+                let outcomes = run_calls(&self.tools, model_name(&body), &calls).await;
+                crate::model::add_tools_used(&request_context, calls_run(&calls));
                 let called_client_tools = content.iter().any(|block| {
                     is_tool_use(block) && !tool_name(block).is_some_and(|name| spice.contains(name))
                 });
@@ -744,10 +767,10 @@ impl StreamLoop {
                     .push_back(Ok(json!({"type": "content_block_stop", "index": index})));
             }
         } else if !calls.is_empty() {
-            let outcomes = run_calls(&self.tools, &calls)
+            let outcomes = run_calls(&self.tools, model_name(&self.body), &calls)
                 .instrument(self.span.clone())
                 .await;
-            crate::model::add_tools_used(&self.context, outcomes.len());
+            crate::model::add_tools_used(&self.context, calls_run(&calls));
             for (id, outcome) in &outcomes {
                 let index = self.next_index;
                 self.next_index += 1;

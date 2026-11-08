@@ -50,6 +50,7 @@ arrow.workspace = true
 axum.workspace = true
 parquet.workspace = true
 percent-encoding.workspace = true
+runtime-secrets = { path = "../../runtime-secrets" }
 serde_json.workspace = true
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
 

@@ -1,0 +1,64 @@
+name: results-cache-swr
+description: >
+  Past item_ttl and inside stale_while_revalidate_ttl, the SQL results cache
+  serves a parameterized query's entry STALE at once and revalidates it in
+  the background with the request's own bound values, so it is then a HIT
+  holding the row that value selects: keyed by the SQL, and by a client key,
+  over HTTP and through a Flight SQL prepared statement.
+
+variants:
+  sql-key: { spicepod: { runtime: { caching: { sql_results: { cache_key_type: sql } } } } }
+  client-key: {}
+
+spicepod:
+  version: v1
+  kind: Spicepod
+  name: results-cache-swr
+  runtime:
+    caching:
+      sql_results:
+        enabled: true
+        item_ttl: 1s
+        stale_while_revalidate_ttl: 5m
+  views:
+    - name: swr_values
+      sql: SELECT * FROM (VALUES (1, 100), (2, 120), (3, 155)) AS t(id, val)
+
+steps:
+  - start: {}
+  - http: { method: POST, path: /v1/sql, headers: { content-type: application/json }, body: '{"sql": "SELECT val FROM swr_values WHERE id = $1", "parameters": [3]}' }
+    only: sql-key
+    expect: { status: 200, headers: { results-cache-status: MISS }, body-contains: '"val":155' }
+  - http: { method: POST, path: /v1/sql, headers: { content-type: application/json, spice-cache-key: swr-client-key }, body: '{"sql": "SELECT val FROM swr_values WHERE id = $1", "parameters": [3]}' }
+    only: client-key
+    expect: { status: 200, headers: { results-cache-status: MISS }, body-contains: '"val":155' }
+  - sleep: 1500ms
+  - http: { method: POST, path: /v1/sql, headers: { content-type: application/json }, body: '{"sql": "SELECT val FROM swr_values WHERE id = $1", "parameters": [3]}' }
+    only: sql-key
+    expect: { status: 200, headers: { results-cache-status: STALE }, body-contains: '"val":155' }
+  - http: { method: POST, path: /v1/sql, headers: { content-type: application/json, spice-cache-key: swr-client-key }, body: '{"sql": "SELECT val FROM swr_values WHERE id = $1", "parameters": [3]}' }
+    only: client-key
+    expect: { status: 200, headers: { results-cache-status: STALE }, body-contains: '"val":155' }
+  - http: { method: POST, path: /v1/sql, headers: { content-type: application/json }, body: '{"sql": "SELECT val FROM swr_values WHERE id = $1", "parameters": [3]}' }
+    only: sql-key
+    expect: { status: 200, headers: { results-cache-status: HIT }, body-contains: '"val":155' }
+    eventually: 20s
+  - http: { method: POST, path: /v1/sql, headers: { content-type: application/json, spice-cache-key: swr-client-key }, body: '{"sql": "SELECT val FROM swr_values WHERE id = $1", "parameters": [3]}' }
+    only: client-key
+    expect: { status: 200, headers: { results-cache-status: HIT }, body-contains: '"val":155' }
+    eventually: 20s
+
+  # The same through a Flight SQL prepared statement: served stale past
+  # item_ttl and revalidated with its own bound value, it always holds the row
+  # that value selects.
+  - query: SELECT val FROM swr_values WHERE id = $1
+    parameters: [2]
+    expect: { rows: [['120']] }
+  - sleep: 1500ms
+  - query: SELECT val FROM swr_values WHERE id = $1
+    parameters: [2]
+    expect: { rows: [['120']] }
+  - query: SELECT val FROM swr_values WHERE id = $1
+    parameters: [2]
+    expect: { rows: [['120']] }
+    consistently: 3s

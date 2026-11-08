@@ -117,7 +117,7 @@ fn integer_equality_is_exact_and_ranges_are_not() {
     assert_eq!(expression, "#n0 = :v0");
     assert!(exact);
     assert_eq!(value(&out, ":v0"), n("5"));
-    // A number that is not an integer reads as NULL, and `> 5` still selects it.
+    // Only equality is exact; DataFusion checks a range again.
     assert!(!translate(&col("n").gt(lit(5_i64))).expect("translatable").1);
     assert!(
         translate(&col("n").in_list(vec![lit(1_i64), lit(2_i64)], false))
@@ -340,41 +340,22 @@ fn filters_pushed_together_fit_one_expression() {
 }
 
 #[test]
-fn an_integer_sort_key_reads_a_fraction_as_null() {
-    // An Int64 column reads 9007199254740992.1 as NULL, which meets no
-    // predicate, even one it would round into.
-    let fraction = n("9007199254740992.1");
-    let member = SortPredicate::OneOf(vec![n("9007199254740992")]);
+fn a_number_sort_key_is_compared_by_value() {
+    // A key that does not fit an Int64 column is still compared by value, so
+    // an item that matches reaches the conversion, which reports it.
+    let fraction = n("12.5");
     assert_eq!(
-        satisfies(&fraction, &member, KeyReading::Integer),
+        satisfies(&fraction, &SortPredicate::OneOf(vec![n("12")])),
         Some(false)
     );
     assert_eq!(
-        satisfies(
-            &fraction,
-            &SortPredicate::Except(vec![n("1")]),
-            KeyReading::Integer
-        ),
-        Some(false)
-    );
-    assert_eq!(
-        satisfies(
-            &n("9223372036854775808"),
-            &SortPredicate::Lower(n("0"), false),
-            KeyReading::Integer
-        ),
-        Some(false)
-    );
-    assert_eq!(
-        satisfies(&n("9007199254740992"), &member, KeyReading::Integer),
+        satisfies(&fraction, &SortPredicate::Except(vec![n("12")])),
         Some(true)
     );
-    // Stored, the key is the number itself.
     assert_eq!(
         satisfies(
             &n("9223372036854775808"),
-            &SortPredicate::Lower(n("0"), false),
-            KeyReading::Stored
+            &SortPredicate::Lower(n("0"), false)
         ),
         Some(true)
     );
@@ -416,8 +397,7 @@ fn null_tests() {
         "(NOT (attribute_type(#n0, :v0) OR attribute_type(#n0, :v1)))"
     );
     assert!(exact);
-    // A number that is not an integer reads as NULL, which `attribute_type`
-    // cannot tell apart.
+    // A null test on an Int64 column is left to DataFusion.
     assert!(translate(&col("n").is_null()).is_none());
     let (expression, exact, _) = translate(&col("n").is_not_null()).expect("translatable");
     assert_eq!(expression, "attribute_type(#n0, :v0)");

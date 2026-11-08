@@ -19,12 +19,21 @@ limitations under the License.
 //! [`test_refresh_append_for_engine`] and [`test_refresh_full_for_engine`] compare the rows
 //! Spice returns with the same SQL executed by `PostgreSQL`: the table projection, one
 //! aggregation, and one self-join. `created_at` is compared as UTC epoch milliseconds.
-//! The other tests in this file still assert a row count.
+//!
+//! [`upsert_history_matches_postgres_source`] drives append refresh with `on_conflict: upsert`
+//! through inserts and primary-key updates, including NULL transitions, and compares the
+//! rows after each refresh with the same SQL executed by `PostgreSQL`.
+//!
+//! [`append_time_format_matches_postgres_source`] drives append refresh with each
+//! `time_format` (`timestamp`, `unix_seconds`, `iso8601`) through an insert of two rows that
+//! share one `created_at` and a refresh that finds nothing new, and compares the rows after
+//! each refresh with the same SQL executed by `PostgreSQL`.
 
 use crate::acceleration::refresh::common::{
-    execute_rt_sql, get_acceleration_config_append, get_acceleration_config_full,
-    initialize_postgres_labeled, refresh_table, start_test_runtime, test_append_iso8601_for_engine,
-    test_append_unix_seconds_for_engine,
+    execute_ps_sql, execute_rt_sql, get_acceleration_config_append, get_acceleration_config_full,
+    get_dataset, initialize_postgres_labeled, initialize_postgres_time_format,
+    initialize_postgres_with_value_column, refresh_table, start_test_runtime,
+    start_test_runtime_with_dataset,
 };
 use crate::postgres::common;
 use crate::{init_tracing, utils::test_request_context};
@@ -36,6 +45,7 @@ use arrow::datatypes::{DataType, TimeUnit};
 use datafusion_table_providers::sql::db_connection_pool::dbconnection::postgresconn::PostgresConnection;
 use runtime::Runtime;
 use spicepod::acceleration::Acceleration;
+use spicepod::component::dataset::TimeFormat;
 use spicepod::param::Params;
 use std::sync::Arc;
 use tokio_postgres::types::Type;
@@ -45,6 +55,21 @@ use tokio_postgres::types::Type;
 const PROJECTION_SQL: &str = "SELECT * FROM test_table";
 const AGG_SQL: &str = "SELECT COUNT(*) AS row_count, SUM(n) AS sum_n, MIN(n) AS min_n, MAX(n) AS max_n FROM test_table";
 const JOIN_SQL: &str = "SELECT a.id AS id, a.n AS left_n, b.label AS right_label FROM test_table AS a INNER JOIN test_table AS b ON a.id = b.id";
+
+/// The upsert history's statements, over `initialize_postgres_with_value_column`'s table.
+/// The same rules hold: no `ORDER BY`, no integer division. `GROUP BY value` puts the NULL
+/// values in one group on both engines.
+const UPSERT_PROJECTION_SQL: &str = "SELECT id, created_at, value FROM test_table";
+const UPSERT_AGG_SQL: &str = "SELECT COUNT(*) AS row_count, COUNT(DISTINCT id) AS distinct_ids, COUNT(value) AS non_null_values, MIN(id) AS min_id, MAX(id) AS max_id FROM test_table";
+const UPSERT_GROUP_SQL: &str = "SELECT value, COUNT(*) AS row_count FROM test_table GROUP BY value";
+
+/// The `time_format` histories' statements, over `initialize_postgres_time_format`'s table.
+/// The same rules hold. `MIN`/`MAX` of an ISO8601 `created_at` compare fixed-width strings
+/// that differ only in digits, so no collation can order them differently.
+const TIME_FORMAT_PROJECTION_SQL: &str = "SELECT id, created_at, n, label FROM test_table";
+const TIME_FORMAT_AGG_SQL: &str = "SELECT COUNT(*) AS row_count, COUNT(DISTINCT id) AS distinct_ids, COUNT(label) AS non_null_labels, SUM(n) AS sum_n, MIN(created_at) AS min_created_at, MAX(created_at) AS max_created_at FROM test_table";
+const TIME_FORMAT_GROUP_SQL: &str =
+    "SELECT label, COUNT(*) AS row_count FROM test_table GROUP BY label";
 
 #[derive(Clone, Copy)]
 pub(crate) enum RefreshCase {
@@ -116,6 +141,25 @@ async fn test_refresh_matches_source(engine: &str, mode: RefreshCase) -> Result<
     .await
 }
 
+async fn test_upsert_history_for_engine(engine: &str) -> Result<(), anyhow::Error> {
+    upsert_history_matches_postgres_source(engine, |port| {
+        let acceleration_params =
+            (engine == "postgres").then(|| get_postgres_acceleration_params(port));
+        get_acceleration_config_append(engine, acceleration_params)
+    })
+    .await
+}
+
+async fn test_time_format_for_engine(
+    engine: &str,
+    format: TimeFormatCase,
+) -> Result<(), anyhow::Error> {
+    append_time_format_matches_postgres_source(engine, format, |_port| {
+        get_acceleration_config_append(engine, None)
+    })
+    .await
+}
+
 /// Append or full refresh of `engine` against the labeled `PostgreSQL` source.
 ///
 /// `configure` builds the acceleration after the container port is known. The
@@ -174,12 +218,431 @@ pub(crate) async fn refresh_matches_postgres_source(
             // The source moves again and Spice is not refreshed. A scan of the acceleration
             // still returns `snapshot`. A scan of the federated source returns the probe row.
             insert_labeled(&db_conn, instants.probe, -1, "not-refreshed").await?;
-            assert_acceleration_held(engine, mode_name, &db_conn, &rt, &snapshot).await?;
+            assert_acceleration_held(
+                engine,
+                mode_name,
+                PROJECTION_SQL,
+                &db_conn,
+                &rt,
+                &snapshot,
+                |answer| column_has_int(answer, "n", -1),
+            )
+            .await?;
 
-            running_container.remove().await?;
+            running_container.cleanup().await;
             Ok(())
         })
         .await
+}
+
+/// Append refresh with `on_conflict: upsert` on `id`, against the `PostgreSQL` source.
+///
+/// The source history is the initial row, then two inserts (one with a NULL `value`), then
+/// three updates that reuse primary keys: text replaced by text, text replaced by NULL, and
+/// NULL replaced by text. Each change moves `created_at` past every earlier one, so the append
+/// refresh fetches it. After the load and after each refresh, the projection, one
+/// aggregation, and one grouped count must match `PostgreSQL` as a schema and a row multiset.
+/// A probe row inserted after the last refresh must stay out of the acceleration.
+pub(crate) async fn upsert_history_matches_postgres_source(
+    engine: &str,
+    configure: impl FnOnce(usize) -> Acceleration,
+) -> Result<(), anyhow::Error> {
+    test_request_context()
+        .scope(async move {
+            let running_container = common::start_postgres_docker_container().await?;
+            let port = usize::from(running_container.host_port(5432)?);
+            let db_conn = initialize_postgres_with_value_column(port).await?;
+
+            let rt = start_test_runtime(port, configure(port)).await?;
+            let stage = |name| Stage {
+                engine,
+                mode: "append-upsert",
+                name,
+            };
+
+            compare_upsert_stage(
+                &stage("initial"),
+                &db_conn,
+                &rt,
+                &[(1, Some("initial_value"))],
+            )
+            .await?;
+
+            execute_ps_sql(
+                &db_conn,
+                "INSERT INTO test_table (created_at, value) VALUES \
+                 (date_trunc('milliseconds', now()) + interval '1 second', 'second_value'), \
+                 (date_trunc('milliseconds', now()) + interval '2 seconds', NULL)",
+            )
+            .await?;
+            refresh_table(Arc::clone(&rt), "test_table").await?;
+            compare_upsert_stage(
+                &stage("inserted"),
+                &db_conn,
+                &rt,
+                &[
+                    (1, Some("initial_value")),
+                    (2, Some("second_value")),
+                    (3, None),
+                ],
+            )
+            .await?;
+
+            execute_ps_sql(
+                &db_conn,
+                "UPDATE test_table SET \
+                 created_at = date_trunc('milliseconds', now()) + interval '3 seconds' + id * interval '1 second', \
+                 value = CASE id WHEN 1 THEN 'updated_value' WHEN 2 THEN NULL ELSE 'third_value' END",
+            )
+            .await?;
+            refresh_table(Arc::clone(&rt), "test_table").await?;
+            let snapshot = compare_upsert_stage(
+                &stage("upserted"),
+                &db_conn,
+                &rt,
+                &[
+                    (1, Some("updated_value")),
+                    (2, None),
+                    (3, Some("third_value")),
+                ],
+            )
+            .await?;
+
+            execute_ps_sql(
+                &db_conn,
+                "INSERT INTO test_table (created_at, value) VALUES \
+                 (date_trunc('milliseconds', now()) + interval '10 seconds', 'not-refreshed')",
+            )
+            .await?;
+            assert_acceleration_held(
+                engine,
+                "append-upsert",
+                UPSERT_PROJECTION_SQL,
+                &db_conn,
+                &rt,
+                &snapshot,
+                |answer| {
+                    Ok(int_text_pairs(answer, "id", "value")?
+                        .contains(&(4, Some("not-refreshed".to_string()))))
+                },
+            )
+            .await?;
+
+            running_container.cleanup().await;
+            Ok(())
+        })
+        .await
+}
+
+async fn compare_upsert_stage(
+    stage: &Stage<'_>,
+    db_conn: &PostgresConnection,
+    rt: &Arc<Runtime>,
+    expected_pairs: &[(i64, Option<&str>)],
+) -> Result<Answer, anyhow::Error> {
+    compare_history_stage(
+        stage,
+        db_conn,
+        rt,
+        [UPSERT_PROJECTION_SQL, UPSERT_AGG_SQL, UPSERT_GROUP_SQL],
+        |postgres_projection| {
+            assert_inserted_pairs(stage, postgres_projection, ("id", "value"), expected_pairs)
+        },
+    )
+    .await
+}
+
+/// Compares the projection, aggregation and group statements in `sqls`, in that order, after
+/// `pin_oracle` checks `PostgreSQL`'s projection holds what the history wrote. Returns Spice's
+/// projection.
+async fn compare_history_stage(
+    stage: &Stage<'_>,
+    db_conn: &PostgresConnection,
+    rt: &Arc<Runtime>,
+    [projection_sql, agg_sql, group_sql]: [&str; 3],
+    pin_oracle: impl FnOnce(&Answer) -> Result<(), anyhow::Error>,
+) -> Result<Answer, anyhow::Error> {
+    let postgres_projection = answer_from_postgres(db_conn, projection_sql).await?;
+    let spice_projection = answer_from_spice(rt, projection_sql).await?;
+    pin_oracle(&postgres_projection)?;
+    assert_same_multiset(
+        stage.engine,
+        stage.mode,
+        stage.name,
+        "projection",
+        projection_sql,
+        &spice_projection,
+        &postgres_projection,
+    );
+
+    for (query_name, sql) in [("aggregation", agg_sql), ("group", group_sql)] {
+        let postgres = answer_from_postgres(db_conn, sql).await?;
+        let spice = answer_from_spice(rt, sql).await?;
+        assert_same_multiset(
+            stage.engine,
+            stage.mode,
+            stage.name,
+            query_name,
+            sql,
+            &spice,
+            &postgres,
+        );
+    }
+
+    Ok(spice_projection)
+}
+
+/// A `(created_at, n, label)` row a time-format history wrote to `PostgreSQL`.
+type WrittenRow<'a> = (chrono::DateTime<chrono::Utc>, i64, Option<&'a str>);
+
+/// How an append history's `created_at` is stored in `PostgreSQL` and declared to Spice.
+#[derive(Clone, Copy)]
+pub(crate) enum TimeFormatCase {
+    /// `TIMESTAMP(3) WITH TIME ZONE`, `time_format: timestamp`, compared as UTC epoch
+    /// milliseconds. Keeps the append config's `primary_key` and `on_conflict: upsert`.
+    Timestamp,
+    /// `BIGINT` seconds since the epoch, `time_format: unix_seconds`. No primary key.
+    UnixSeconds,
+    /// `TEXT` such as `2026-11-01T01:00:00.000000`, `time_format: iso8601`, compared as the
+    /// string. No primary key.
+    Iso8601,
+}
+
+impl TimeFormatCase {
+    fn label(self) -> &'static str {
+        match self {
+            TimeFormatCase::Timestamp => "append-timestamp",
+            TimeFormatCase::UnixSeconds => "append-unix-seconds",
+            TimeFormatCase::Iso8601 => "append-iso8601",
+        }
+    }
+
+    fn column_type(self) -> &'static str {
+        match self {
+            TimeFormatCase::Timestamp => "TIMESTAMP(3) WITH TIME ZONE",
+            TimeFormatCase::UnixSeconds => "BIGINT",
+            TimeFormatCase::Iso8601 => "TEXT",
+        }
+    }
+
+    /// Fits `acceleration` to the column type: a `refresh_sql` window in the column's own
+    /// encoding, and no primary key for the integer and string formats.
+    fn configure(self, acceleration: &mut Acceleration) {
+        let refresh_sql = match self {
+            TimeFormatCase::Timestamp => return,
+            TimeFormatCase::UnixSeconds => {
+                "select * from test_table where created_at > extract(epoch from now() - INTERVAL '10 years')::bigint"
+            }
+            TimeFormatCase::Iso8601 => {
+                "select * from test_table where created_at > to_char(now() - INTERVAL '10 years', 'YYYY-MM-DD\"T\"HH24:MI:SS.US')"
+            }
+        };
+        acceleration.refresh_sql = Some(refresh_sql.to_string());
+        acceleration.primary_key = None;
+        acceleration.on_conflict = std::collections::HashMap::new();
+        acceleration.indexes = std::collections::HashMap::new();
+    }
+
+    fn time_format(self) -> TimeFormat {
+        match self {
+            TimeFormatCase::Timestamp => TimeFormat::Timestamp,
+            TimeFormatCase::UnixSeconds => TimeFormat::UnixSeconds,
+            TimeFormatCase::Iso8601 => TimeFormat::ISO8601,
+        }
+    }
+
+    fn iso8601(at: chrono::DateTime<chrono::Utc>) -> String {
+        at.format("%Y-%m-%dT%H:%M:%S%.6f").to_string()
+    }
+
+    /// The cell `answer_from_postgres` reads back for `at`.
+    fn cell(self, at: chrono::DateTime<chrono::Utc>) -> Cell {
+        match self {
+            TimeFormatCase::Timestamp => Cell::Int(at.timestamp_millis()),
+            TimeFormatCase::UnixSeconds => Cell::Int(at.timestamp()),
+            TimeFormatCase::Iso8601 => Cell::Text(Self::iso8601(at)),
+        }
+    }
+
+    async fn insert(
+        self,
+        db_conn: &PostgresConnection,
+        at: chrono::DateTime<chrono::Utc>,
+        n: i32,
+        label: Option<&str>,
+    ) -> Result<(), anyhow::Error> {
+        let created_at: Box<dyn tokio_postgres::types::ToSql + Sync> = match self {
+            TimeFormatCase::Timestamp => Box::new(at),
+            TimeFormatCase::UnixSeconds => Box::new(at.timestamp()),
+            TimeFormatCase::Iso8601 => Box::new(Self::iso8601(at)),
+        };
+        let inserted = db_conn
+            .conn
+            .execute(
+                "INSERT INTO test_table (created_at, n, label) VALUES ($1, $2, $3)",
+                &[created_at.as_ref(), &n, &label],
+            )
+            .await
+            .map_err(|e| anyhow::anyhow!("Error inserting into test_table: {e}"))?;
+        anyhow::ensure!(
+            inserted == 1,
+            "expected to insert 1 row into test_table, inserted {inserted}"
+        );
+        Ok(())
+    }
+}
+
+/// Append refresh with `format`'s `time_column` against the `PostgreSQL` source.
+///
+/// The history is one row, then two rows that share a later `created_at` (one with a NULL
+/// `label`), then a refresh with nothing new. After the load and after each refresh, the
+/// projection, one aggregation over every column including `created_at`, and one grouped
+/// count must match `PostgreSQL` as a schema and a row multiset. A row the source gained
+/// twice, lost, or held with another value fails. A probe row inserted after the last
+/// refresh must stay out of the acceleration.
+///
+/// `configure` builds the engine's acceleration after the container port is known.
+/// `format` then sets `refresh_sql` and drops the primary key where it requires.
+pub(crate) async fn append_time_format_matches_postgres_source(
+    engine: &str,
+    format: TimeFormatCase,
+    configure: impl FnOnce(usize) -> Acceleration,
+) -> Result<(), anyhow::Error> {
+    test_request_context()
+        .scope(async move {
+            let running_container = common::start_postgres_docker_container().await?;
+            let port = usize::from(running_container.host_port(5432)?);
+            let db_conn = initialize_postgres_time_format(port, format.column_type()).await?;
+
+            // Whole hours inside the `refresh_sql` window, so every encoding is exact.
+            let first = (chrono::Utc::now().date_naive() - chrono::Days::new(2))
+                .and_time(chrono::NaiveTime::MIN)
+                .and_utc();
+            let later = first + chrono::TimeDelta::hours(1);
+            let probe = first + chrono::TimeDelta::hours(2);
+
+            format.insert(&db_conn, first, 10, Some("alpha")).await?;
+
+            let mut acceleration = configure(port);
+            format.configure(&mut acceleration);
+            let mut dataset = get_dataset(port);
+            dataset.time_format = Some(format.time_format());
+            let rt = start_test_runtime_with_dataset(port, acceleration, dataset).await?;
+            let stage = |name| Stage {
+                engine,
+                mode: format.label(),
+                name,
+            };
+
+            compare_time_format_stage(
+                &stage("initial"),
+                format,
+                &db_conn,
+                &rt,
+                &[(first, 10, Some("alpha"))],
+            )
+            .await?;
+
+            format.insert(&db_conn, later, 20, Some("beta")).await?;
+            format.insert(&db_conn, later, 30, None).await?;
+            refresh_table(Arc::clone(&rt), "test_table").await?;
+            let appended = [
+                (first, 10, Some("alpha")),
+                (later, 20, Some("beta")),
+                (later, 30, None),
+            ];
+            compare_time_format_stage(&stage("appended"), format, &db_conn, &rt, &appended).await?;
+
+            refresh_table(Arc::clone(&rt), "test_table").await?;
+            let snapshot = compare_time_format_stage(
+                &stage("refreshed-unchanged"),
+                format,
+                &db_conn,
+                &rt,
+                &appended,
+            )
+            .await?;
+
+            format
+                .insert(&db_conn, probe, -1, Some("not-refreshed"))
+                .await?;
+            assert_acceleration_held(
+                engine,
+                format.label(),
+                TIME_FORMAT_PROJECTION_SQL,
+                &db_conn,
+                &rt,
+                &snapshot,
+                |answer| column_has_int(answer, "n", -1),
+            )
+            .await?;
+
+            running_container.cleanup().await;
+            Ok(())
+        })
+        .await
+}
+
+async fn compare_time_format_stage(
+    stage: &Stage<'_>,
+    format: TimeFormatCase,
+    db_conn: &PostgresConnection,
+    rt: &Arc<Runtime>,
+    written: &[WrittenRow<'_>],
+) -> Result<Answer, anyhow::Error> {
+    compare_history_stage(
+        stage,
+        db_conn,
+        rt,
+        [
+            TIME_FORMAT_PROJECTION_SQL,
+            TIME_FORMAT_AGG_SQL,
+            TIME_FORMAT_GROUP_SQL,
+        ],
+        |postgres_projection| {
+            assert_written_time_format_rows(stage, format, postgres_projection, written)
+        },
+    )
+    .await
+}
+
+/// Pins the oracle: `PostgreSQL` holds exactly the `(created_at, n, label)` rows written.
+fn assert_written_time_format_rows(
+    stage: &Stage<'_>,
+    format: TimeFormatCase,
+    postgres: &Answer,
+    written: &[WrittenRow<'_>],
+) -> Result<(), anyhow::Error> {
+    let indexes = [
+        column_index(postgres, "created_at")?,
+        column_index(postgres, "n")?,
+        column_index(postgres, "label")?,
+    ];
+    let mut held: Vec<Vec<Cell>> = postgres
+        .rows
+        .iter()
+        .map(|row| indexes.iter().map(|&idx| row[idx].clone()).collect())
+        .collect();
+    held.sort();
+    let mut expected: Vec<Vec<Cell>> = written
+        .iter()
+        .map(|(at, n, label)| {
+            vec![
+                format.cell(*at),
+                Cell::Int(*n),
+                label.map_or(Cell::Null, |label| Cell::Text(label.to_string())),
+            ]
+        })
+        .collect();
+    expected.sort();
+    anyhow::ensure!(
+        held == expected,
+        "{} {} {}: PostgreSQL does not hold the written (created_at, n, label) rows\n  postgres: {held:?}\n  written: {expected:?}",
+        stage.engine,
+        stage.mode,
+        stage.name
+    );
+    Ok(())
 }
 
 fn acceleration_for(
@@ -230,13 +693,11 @@ async fn compare_stage(
 ) -> Result<Answer, anyhow::Error> {
     let postgres_projection = answer_from_postgres(db_conn, PROJECTION_SQL).await?;
     let spice_projection = answer_from_spice(rt, PROJECTION_SQL).await?;
-    assert_inserted_pairs(
-        stage.engine,
-        stage.mode,
-        stage.name,
-        &postgres_projection,
-        expected_pairs,
-    )?;
+    let expected_pairs: Vec<(i64, Option<&str>)> = expected_pairs
+        .iter()
+        .map(|(n, label)| (*n, Some(*label)))
+        .collect();
+    assert_inserted_pairs(stage, &postgres_projection, ("n", "label"), &expected_pairs)?;
     assert_epochs(
         stage.engine,
         stage.mode,
@@ -289,22 +750,26 @@ async fn compare_stage(
     Ok(spice_projection)
 }
 
+/// `has_probe` recognizes the probe row inserted into `PostgreSQL` after the last refresh.
+/// `sql` must be the statement that produced `snapshot`.
 async fn assert_acceleration_held(
     engine: &str,
     mode: &str,
+    sql: &str,
     db_conn: &PostgresConnection,
     rt: &Arc<Runtime>,
     snapshot: &Answer,
+    has_probe: impl Fn(&Answer) -> Result<bool, anyhow::Error>,
 ) -> Result<(), anyhow::Error> {
-    let postgres = answer_from_postgres(db_conn, PROJECTION_SQL).await?;
-    let spice = answer_from_spice(rt, PROJECTION_SQL).await?;
+    let postgres = answer_from_postgres(db_conn, sql).await?;
+    let spice = answer_from_spice(rt, sql).await?;
     anyhow::ensure!(
-        column_has_int(&postgres, "n", -1)?,
+        has_probe(&postgres)?,
         "{engine} {mode}: the probe row did not land in PostgreSQL\n  postgres: {postgres:?}"
     );
     anyhow::ensure!(
-        !column_has_int(snapshot, "n", -1)?,
-        "{engine} {mode}: the pre-probe snapshot already contained n = -1\n  snapshot: {snapshot:?}"
+        !has_probe(snapshot)?,
+        "{engine} {mode}: the pre-probe snapshot already contained the probe row\n  snapshot: {snapshot:?}"
     );
     assert!(
         !spice.rows.is_empty(),
@@ -331,7 +796,11 @@ fn assert_same_multiset(
     spice: &Answer,
     postgres: &Answer,
 ) {
-    let note = if query_name == "projection" {
+    // A `timestamp` `created_at` is read as UTC epoch milliseconds; Unix seconds and
+    // ISO8601 strings are compared as stored.
+    let note = if query_name == "projection"
+        && !matches!(mode, "append-unix-seconds" | "append-iso8601")
+    {
         " (created_at cells are UTC epoch milliseconds)"
     } else {
         ""
@@ -366,21 +835,23 @@ fn assert_same_multiset(
 }
 
 fn assert_inserted_pairs(
-    engine: &str,
-    mode: &str,
-    stage: &str,
+    stage: &Stage<'_>,
     postgres: &Answer,
-    expected_pairs: &[(i64, &str)],
+    (int_column, text_column): (&str, &str),
+    expected_pairs: &[(i64, Option<&str>)],
 ) -> Result<(), anyhow::Error> {
-    let pairs = int_text_pairs(postgres, "n", "label")?;
-    let mut expected: Vec<(i64, String)> = expected_pairs
+    let pairs = int_text_pairs(postgres, int_column, text_column)?;
+    let mut expected: Vec<(i64, Option<String>)> = expected_pairs
         .iter()
-        .map(|(n, label)| (*n, (*label).to_string()))
+        .map(|(n, text)| (*n, text.map(str::to_string)))
         .collect();
     expected.sort();
     anyhow::ensure!(
         pairs == expected,
-        "{engine} {mode} {stage}: PostgreSQL does not hold the inserted (n, label) rows\n  postgres: {pairs:?}\n  inserted: {expected:?}"
+        "{} {} {}: PostgreSQL does not hold the written ({int_column}, {text_column}) rows\n  postgres: {pairs:?}\n  written: {expected:?}",
+        stage.engine,
+        stage.mode,
+        stage.name
     );
     Ok(())
 }
@@ -489,11 +960,12 @@ fn int_at(answer: &Answer, row: &[Cell], name: &str) -> Result<i64, anyhow::Erro
     }
 }
 
+/// `(int, text)` pairs sorted by value. A NULL text cell is `None`.
 fn int_text_pairs(
     answer: &Answer,
     int_column: &str,
     text_column: &str,
-) -> Result<Vec<(i64, String)>, anyhow::Error> {
+) -> Result<Vec<(i64, Option<String>)>, anyhow::Error> {
     let int_idx = column_index(answer, int_column)?;
     let text_idx = column_index(answer, text_column)?;
     let mut pairs = Vec::with_capacity(answer.rows.len());
@@ -501,10 +973,12 @@ fn int_text_pairs(
         let Cell::Int(n) = row[int_idx] else {
             anyhow::bail!("column '{int_column}' is not an integer: {row:?}");
         };
-        let Cell::Text(label) = &row[text_idx] else {
-            anyhow::bail!("column '{text_column}' is not text: {row:?}");
+        let text = match &row[text_idx] {
+            Cell::Text(text) => Some(text.clone()),
+            Cell::Null => None,
+            Cell::Int(_) => anyhow::bail!("column '{text_column}' is not text: {row:?}"),
         };
-        pairs.push((n, label.clone()));
+        pairs.push((n, text));
     }
     pairs.sort();
     Ok(pairs)
@@ -825,15 +1299,27 @@ async fn test_acceleration_refresh_arrow_append_variant() -> Result<(), anyhow::
 }
 
 #[tokio::test]
+async fn test_acceleration_refresh_arrow_append_timestamp() -> Result<(), anyhow::Error> {
+    let _tracing = init_tracing(Some("integration=debug,info"));
+    test_time_format_for_engine("arrow", TimeFormatCase::Timestamp).await
+}
+
+#[tokio::test]
 async fn test_acceleration_refresh_arrow_append_unix_seconds() -> Result<(), anyhow::Error> {
     let _tracing = init_tracing(Some("integration=debug,info"));
-    test_append_unix_seconds_for_engine("arrow", None, None).await
+    test_time_format_for_engine("arrow", TimeFormatCase::UnixSeconds).await
 }
 
 #[tokio::test]
 async fn test_acceleration_refresh_arrow_append_iso8601() -> Result<(), anyhow::Error> {
     let _tracing = init_tracing(Some("integration=debug,info"));
-    test_append_iso8601_for_engine("arrow", None, None).await
+    test_time_format_for_engine("arrow", TimeFormatCase::Iso8601).await
+}
+
+#[tokio::test]
+async fn test_acceleration_refresh_arrow_append_upsert_history() -> Result<(), anyhow::Error> {
+    let _tracing = init_tracing(Some("integration=debug,info"));
+    test_upsert_history_for_engine("arrow").await
 }
 
 #[tokio::test]
@@ -842,19 +1328,43 @@ async fn test_acceleration_refresh_arrow_full_variant() -> Result<(), anyhow::Er
     test_refresh_full_for_engine("arrow").await
 }
 
-// DuckDB (feature-gated)
-#[cfg(feature = "duckdb")]
+// Cayenne memory-mode refreshes
 #[tokio::test]
-async fn test_acceleration_refresh_duckdb_append_variant() -> Result<(), anyhow::Error> {
+async fn test_acceleration_refresh_cayenne_memory_append_variant() -> Result<(), anyhow::Error> {
     let _tracing = init_tracing(Some("integration=debug,info"));
-    test_refresh_append_for_engine("duckdb").await
+    test_refresh_append_for_engine("cayenne").await
 }
 
-#[cfg(feature = "duckdb")]
 #[tokio::test]
-async fn test_acceleration_refresh_duckdb_full_variant() -> Result<(), anyhow::Error> {
+async fn test_acceleration_refresh_cayenne_memory_append_upsert_history()
+-> Result<(), anyhow::Error> {
     let _tracing = init_tracing(Some("integration=debug,info"));
-    test_refresh_full_for_engine("duckdb").await
+    test_upsert_history_for_engine("cayenne").await
+}
+
+#[tokio::test]
+async fn test_acceleration_refresh_cayenne_memory_full_variant() -> Result<(), anyhow::Error> {
+    let _tracing = init_tracing(Some("integration=debug,info"));
+    test_refresh_full_for_engine("cayenne").await
+}
+
+#[tokio::test]
+async fn test_acceleration_refresh_cayenne_memory_append_timestamp() -> Result<(), anyhow::Error> {
+    let _tracing = init_tracing(Some("integration=debug,info"));
+    test_time_format_for_engine("cayenne", TimeFormatCase::Timestamp).await
+}
+
+#[tokio::test]
+async fn test_acceleration_refresh_cayenne_memory_append_unix_seconds() -> Result<(), anyhow::Error>
+{
+    let _tracing = init_tracing(Some("integration=debug,info"));
+    test_time_format_for_engine("cayenne", TimeFormatCase::UnixSeconds).await
+}
+
+#[tokio::test]
+async fn test_acceleration_refresh_cayenne_memory_append_iso8601() -> Result<(), anyhow::Error> {
+    let _tracing = init_tracing(Some("integration=debug,info"));
+    test_time_format_for_engine("cayenne", TimeFormatCase::Iso8601).await
 }
 
 // SQLite (feature-gated)
@@ -863,6 +1373,34 @@ async fn test_acceleration_refresh_duckdb_full_variant() -> Result<(), anyhow::E
 async fn test_acceleration_refresh_sqlite_append_variant() -> Result<(), anyhow::Error> {
     let _tracing = init_tracing(Some("integration=debug,info"));
     test_refresh_append_for_engine("sqlite").await
+}
+
+#[cfg(feature = "sqlite")]
+#[tokio::test]
+async fn test_acceleration_refresh_sqlite_append_upsert_history() -> Result<(), anyhow::Error> {
+    let _tracing = init_tracing(Some("integration=debug,info"));
+    test_upsert_history_for_engine("sqlite").await
+}
+
+#[cfg(feature = "sqlite")]
+#[tokio::test]
+async fn test_acceleration_refresh_sqlite_append_timestamp() -> Result<(), anyhow::Error> {
+    let _tracing = init_tracing(Some("integration=debug,info"));
+    test_time_format_for_engine("sqlite", TimeFormatCase::Timestamp).await
+}
+
+#[cfg(feature = "sqlite")]
+#[tokio::test]
+async fn test_acceleration_refresh_sqlite_append_unix_seconds() -> Result<(), anyhow::Error> {
+    let _tracing = init_tracing(Some("integration=debug,info"));
+    test_time_format_for_engine("sqlite", TimeFormatCase::UnixSeconds).await
+}
+
+#[cfg(feature = "sqlite")]
+#[tokio::test]
+async fn test_acceleration_refresh_sqlite_append_iso8601() -> Result<(), anyhow::Error> {
+    let _tracing = init_tracing(Some("integration=debug,info"));
+    test_time_format_for_engine("sqlite", TimeFormatCase::Iso8601).await
 }
 
 #[cfg(feature = "sqlite")]
@@ -882,15 +1420,21 @@ async fn test_acceleration_refresh_postgres_append_variant() -> Result<(), anyho
 
 #[cfg(feature = "postgres-accel")]
 #[tokio::test]
+async fn test_acceleration_refresh_postgres_append_upsert_history() -> Result<(), anyhow::Error> {
+    let _tracing = init_tracing(Some("integration=debug,info"));
+    test_upsert_history_for_engine("postgres").await
+}
+
+#[cfg(feature = "postgres-accel")]
+#[tokio::test]
 async fn test_acceleration_refresh_postgres_full_variant() -> Result<(), anyhow::Error> {
     let _tracing = init_tracing(Some("integration=debug,info"));
     test_refresh_full_for_engine("postgres").await
 }
 
-// Cayenne (not available on Windows)
+// Cayenne
 // Note: Cayenne requires mode: file in addition to refresh_mode: append/full.
 // These tests need custom helpers that set both mode and refresh_mode.
-#[cfg(not(windows))]
 #[tokio::test]
 #[ignore = "Cayenne requires mode: file which is not set by the generic test helpers"]
 async fn test_acceleration_refresh_cayenne_append_variant() {
@@ -900,7 +1444,6 @@ async fn test_acceleration_refresh_cayenne_append_variant() {
         .expect("Test should pass when mode: file is properly configured");
 }
 
-#[cfg(not(windows))]
 #[tokio::test]
 #[ignore = "Cayenne requires mode: file which is not set by the generic test helpers"]
 async fn test_acceleration_refresh_cayenne_full_variant() {

@@ -1354,10 +1354,6 @@ mod tests {
         }
     }
 
-    #[expect(
-        clippy::too_many_lines,
-        reason = "one operation per match arm keeps the history readable"
-    )]
     fn run_expiry_history(seed: u64, policy: EvictionPolicy) {
         use std::collections::BTreeMap;
 

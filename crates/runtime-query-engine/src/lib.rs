@@ -17,3 +17,4 @@ limitations under the License.
 pub mod allowlist;
 pub mod query_engine;
 pub mod session;
+pub mod sql_depth_guard;

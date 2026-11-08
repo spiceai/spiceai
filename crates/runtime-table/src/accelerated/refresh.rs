@@ -76,6 +76,38 @@ pub enum Error {
     },
 }
 
+/// Why the overrides of an on-demand refresh were rejected before the refresh was queued.
+#[derive(Debug, Snafu)]
+pub enum InvalidRefreshOverrides {
+    #[snafu(display(
+        "refresh_mode '{mode}' is not supported for an on-demand refresh. Valid modes are 'full' or 'append'."
+    ))]
+    UnsupportedMode { mode: &'static str },
+
+    #[snafu(display("Invalid refresh_sql: {source}"))]
+    InvalidSql {
+        source: runtime_datafusion::refresh_sql::Error,
+    },
+
+    /// The `refresh_sql` leaves out the dataset's `time_column`, or selects it with a
+    /// type its `time_format` cannot read.
+    #[snafu(display("Invalid refresh_sql: {source}"))]
+    TimeColumnInvalid { source: Error },
+}
+
+/// The name a refresh mode is written with in a spicepod or a refresh request.
+#[must_use]
+pub const fn refresh_mode_name(mode: RefreshMode) -> &'static str {
+    match mode {
+        RefreshMode::Disabled => "disabled",
+        RefreshMode::Full => "full",
+        RefreshMode::Append => "append",
+        RefreshMode::Changes => "changes",
+        RefreshMode::Caching => "caching",
+        RefreshMode::Snapshot => "snapshot",
+    }
+}
+
 /// How a refresh that keeps each key's newest version by `time_column` resolves it.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct VersionsByTime {
@@ -103,6 +135,11 @@ pub struct Refresh {
     pub(crate) reload_generation: u64,
     pub(crate) mode: RefreshMode,
     pub(crate) period: Option<Duration>,
+    /// `period` stands in for `retention_period` (no `refresh_data_window` is set), so
+    /// the load window also keeps rows whose `time_column` is NULL: retention never
+    /// deletes them (`NULL < cutoff` is not true), and dropping them at load would make
+    /// the loaded set disagree with what retention keeps.
+    pub(crate) period_keeps_null_time: bool,
     pub(crate) append_overlap: Option<Duration>,
     /// Keep each key's newest version by `time_column`: only rows newer than the
     /// version of their key already kept (see `refresh_task::latest_by_time`), resolved as the
@@ -126,8 +163,13 @@ pub struct RefreshOverrides {
     #[serde(default, rename = "refresh_sql")]
     pub sql: Option<String>,
 
-    /// The refresh mode to use for this refresh. Defaults to the `refresh_mode` specified in the spicepod, or `full`.
-    #[serde(default, rename = "refresh_mode")]
+    /// The refresh mode to use for this refresh: `full` or `append`. Defaults to the `refresh_mode` specified in the spicepod, or `full`.
+    #[serde(
+        default,
+        rename = "refresh_mode",
+        deserialize_with = "parse_override_mode"
+    )]
+    #[cfg_attr(feature = "openapi", schema(value_type = Option<OnDemandRefreshMode>))]
     pub mode: Option<RefreshMode>,
 
     /// The maximum amount of jitter to add to the refresh. Defaults to the `refresh_jitter_max` specified in the spicepod, or 10% of the `refresh_check_interval`.
@@ -138,6 +180,87 @@ pub struct RefreshOverrides {
     )]
     #[cfg_attr(feature = "openapi", schema(value_type = Option<String>, example = "10s"))]
     pub max_jitter: Option<Duration>,
+}
+
+/// The `refresh_mode` values an on-demand refresh accepts, as documented in the API
+/// schema. Requests are read as a [`RefreshMode`] and checked by
+/// [`RefreshOverrides::validate_mode`].
+#[cfg(feature = "openapi")]
+#[derive(utoipa::ToSchema)]
+#[schema(rename_all = "lowercase")]
+#[expect(dead_code, reason = "only describes the API schema")]
+enum OnDemandRefreshMode {
+    Full,
+    Append,
+}
+
+/// Reads `refresh_mode`. An unknown value is rejected naming only the modes an
+/// on-demand refresh supports; a known but unsupported one is read, and rejected by
+/// [`RefreshOverrides::validate_mode`] with its own message.
+fn parse_override_mode<'de, D>(deserializer: D) -> Result<Option<RefreshMode>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let Some(value) = Option::<String>::deserialize(deserializer)? else {
+        return Ok(None);
+    };
+    serde_json::from_value(serde_json::Value::String(value.clone()))
+        .map(Some)
+        .map_err(|_| {
+            serde::de::Error::custom(format!(
+                "unknown refresh_mode '{value}'. Valid modes are 'full' or 'append'."
+            ))
+        })
+}
+
+impl RefreshOverrides {
+    /// Checks that the requested `refresh_mode`, if any, is one an on-demand refresh can
+    /// run: `full` or `append`. The others are driven by their own workers (`changes`,
+    /// `caching`, `snapshot`) or never refresh (`disabled`).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`InvalidRefreshOverrides::UnsupportedMode`] for any other mode.
+    pub fn validate_mode(&self) -> Result<(), InvalidRefreshOverrides> {
+        match self.mode {
+            None | Some(RefreshMode::Full | RefreshMode::Append) => Ok(()),
+            Some(mode) => UnsupportedModeSnafu {
+                mode: refresh_mode_name(mode),
+            }
+            .fail(),
+        }
+    }
+
+    /// Checks the overrides against the dataset they refresh, before the refresh is
+    /// queued: the mode (see [`Self::validate_mode`]), that the `refresh_sql` parses
+    /// against `source_schema`, and that the columns it selects carry the dataset's
+    /// `time_column` (and `time_partition_column`) with a compatible format, as a
+    /// spicepod `refresh_sql` must at startup. Without the time column, an append
+    /// writes rows with a NULL time that the next append reads again.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`InvalidRefreshOverrides`] naming the first check that fails.
+    pub fn validate_for(
+        &self,
+        dataset_name: &TableReference,
+        refresh: &Refresh,
+        source_schema: Arc<Schema>,
+    ) -> Result<(), InvalidRefreshOverrides> {
+        self.validate_mode()?;
+        let Some(sql) = self.sql.as_deref() else {
+            return Ok(());
+        };
+        let (_, refresh_schema) = runtime_datafusion::refresh_sql::parse_refresh_sql(
+            dataset_name.clone(),
+            sql,
+            source_schema,
+        )
+        .context(InvalidSqlSnafu)?;
+        refresh
+            .validate_time_format_inner(&dataset_name.to_string(), &refresh_schema, false)
+            .context(TimeColumnInvalidSnafu)
+    }
 }
 
 fn parse_max_jitter<'de, D>(deserializer: D) -> Result<Option<Duration>, D::Error>
@@ -219,6 +342,14 @@ impl Refresh {
     #[must_use]
     pub fn period(mut self, period: Duration) -> Self {
         self.period = Some(period);
+        self
+    }
+
+    /// Mark `period` as derived from `retention_period`, so the load window also keeps
+    /// rows whose `time_column` is NULL (retention never deletes them).
+    #[must_use]
+    pub fn period_keeps_null_time(mut self, keeps_null_time: bool) -> Self {
+        self.period_keeps_null_time = keeps_null_time;
         self
     }
 
@@ -719,6 +850,7 @@ impl Default for Refresh {
             reload_generation: 0,
             mode: RefreshMode::Full,
             period: None,
+            period_keeps_null_time: false,
             append_overlap: None,
             versions_by_time: None,
             retry_enabled: false,
@@ -799,6 +931,9 @@ pub struct Refresher {
     engine_type_rewrites: arrow_tools::type_rewrite::TypeRewriteRules,
     /// Per-dataset `cdc_*` parameter overrides drawn from `dataset.acceleration.params`.
     cdc_param_overrides: Option<Arc<HashMap<String, String>>>,
+    /// The status an existing acceleration starts with, applied by [`Self::start`] once the
+    /// dataset's indexes have been rebuilt from it, and before any refresh can report its own.
+    initial_status: Option<status::ComponentStatus>,
     /// Where an append refresh keeps the source snapshot it last loaded.
     append_cursor_store: Option<AppendCursorStore>,
 }
@@ -864,6 +999,7 @@ impl Refresher {
             is_s3_express_acceleration: false,
             engine_type_rewrites: &[],
             cdc_param_overrides: None,
+            initial_status: None,
             append_cursor_store: None,
         }
     }
@@ -981,6 +1117,15 @@ impl Refresher {
         self
     }
 
+    /// Sets the status [`Self::start`] reports for the dataset once its indexes are rebuilt.
+    pub fn set_initial_status(
+        &mut self,
+        initial_status: Option<status::ComponentStatus>,
+    ) -> &mut Self {
+        self.initial_status = initial_status;
+        self
+    }
+
     /// The refresh-completion signal for this table, or `None` when no refresh
     /// runs here. Callers pick the question they are asking:
     /// [`RefreshCompletion::any`] for the initial load, or
@@ -1061,6 +1206,76 @@ impl Refresher {
         }
     }
 
+    /// Replays the rows the accelerator holds through every index of this dataset that
+    /// reports [`spice_table::Index::requires_rebuild`].
+    ///
+    /// Holds the accelerator write lock, so no write lands in the accelerator between the
+    /// scan and the indexes it feeds.
+    ///
+    /// A caching-mode dataset is left alone: its accelerator holds every principal's cached
+    /// rows in one table, scoped only by the hidden `__spice_cache_namespace` column, and no
+    /// index carries that scope, so a replay would let a search answer one principal with the
+    /// row ids and match counts of rows another principal cached. Cached rows never reach these
+    /// indexes through the caching write path either.
+    async fn rebuild_indexes_from_accelerator(&self) -> super::Result<()> {
+        if self.refresh_mode().await == RefreshMode::Caching {
+            return Ok(());
+        }
+
+        let indexes = crate::accelerated::refresh_task::collect_all_indexes(
+            &self.accelerator,
+            &self.federated,
+        );
+        if !indexes.iter().any(|index| index.requires_rebuild()) {
+            return Ok(());
+        }
+
+        let _write_guard = self.accelerator_write_mutex.lock().await;
+        let start = std::time::Instant::now();
+        let dataset_name = self.dataset_name.clone();
+        let accelerator = Arc::clone(&self.accelerator);
+        // The runtime's query environment carries the object-store registrations an
+        // object-store-backed acceleration is read through, and the memory pool that bounds it.
+        let runtime_env = self.query_runtime_env.clone().unwrap_or_else(|| {
+            runtime_object_store::registry::default_runtime_env(self.io_runtime.clone())
+        });
+        let rebuild = async move {
+            super::index_rebuild::rebuild_indexes_from_accelerator(
+                &dataset_name,
+                &accelerator,
+                &indexes,
+                runtime_env,
+            )
+            .await
+        };
+        let result = match &self.cpu_runtime {
+            Some(cpu_runtime) => cpu_runtime
+                .spawn(tracing::Instrument::instrument(
+                    rebuild,
+                    tracing::Span::current(),
+                ))
+                .await
+                .unwrap_or_else(|e| Err(datafusion::error::DataFusionError::External(Box::new(e)))),
+            None => rebuild.await,
+        };
+
+        match result {
+            Ok(Some(rows)) => {
+                tracing::debug!(
+                    "Rebuilt the search index of dataset '{}' from {rows} accelerated row(s) in {}ms.",
+                    self.dataset_name,
+                    start.elapsed().as_millis()
+                );
+                Ok(())
+            }
+            Ok(None) => Ok(()),
+            Err(source) => Err(super::Error::FailedToRebuildIndex {
+                dataset_name: self.dataset_name.to_string(),
+                source,
+            }),
+        }
+    }
+
     /// Starts the refresh loop for `acceleration_refresh_mode`, returning the
     /// spawned task handle when the mode runs one.
     ///
@@ -1074,6 +1289,22 @@ impl Refresher {
         acceleration_refresh_mode: AccelerationRefreshMode,
     ) -> super::Result<Option<tokio::task::JoinHandle<()>>> {
         let dataset_name = self.dataset_name.clone();
+
+        // Before any refresh or change stream writes to it, give every index that holds none
+        // of the accelerator's rows the ones it already has. The refresh that follows a
+        // restart loads only what the accelerator is missing, or nothing at all, so an index
+        // that starts empty would otherwise never catch up (#14618).
+        self.rebuild_indexes_from_accelerator().await?;
+
+        // An existing acceleration is servable from here on, but not before: reporting it ready
+        // earlier would let `/v1/ready` answer while the dataset is still unregistered and its
+        // rebuild still running. Reported before the refresh starts, so a refresh that runs
+        // reports `Refreshing` over it rather than being overwritten by it.
+        if let Some(initial_status) = self.initial_status.take() {
+            self.runtime_status
+                .update_dataset(&self.dataset_name, initial_status);
+        }
+
         let time_column = self.refresh.read().await.time_column.clone();
         let initial_refresh_delay = {
             let refresh = self.refresh.read().await;
@@ -1846,6 +2077,126 @@ mod tests {
         let mut out = vec![];
         sql.extend_effective_partition_filters(&mut out);
         out
+    }
+
+    #[test]
+    fn an_on_demand_refresh_accepts_only_full_or_append() {
+        let with_mode = |mode| RefreshOverrides {
+            sql: None,
+            mode,
+            max_jitter: None,
+        };
+        for mode in [None, Some(RefreshMode::Full), Some(RefreshMode::Append)] {
+            with_mode(mode)
+                .validate_mode()
+                .expect("the mode is accepted");
+        }
+        for mode in [
+            RefreshMode::Disabled,
+            RefreshMode::Changes,
+            RefreshMode::Caching,
+            RefreshMode::Snapshot,
+        ] {
+            let err = with_mode(Some(mode))
+                .validate_mode()
+                .expect_err("the mode is rejected");
+            let message = err.to_string();
+            assert!(
+                message.contains(&format!("'{}'", refresh_mode_name(mode)))
+                    && message.contains("Valid modes are 'full' or 'append'"),
+                "{message}"
+            );
+        }
+    }
+
+    #[test]
+    fn an_unknown_override_refresh_mode_names_only_the_supported_modes() {
+        let err = serde_json::from_str::<RefreshOverrides>(r#"{"refresh_mode":"bogus"}"#)
+            .expect_err("an unknown mode does not parse");
+        let message = err.to_string();
+        assert!(
+            message.contains("unknown refresh_mode 'bogus'")
+                && message.contains("Valid modes are 'full' or 'append'")
+                && !message.contains("changes"),
+            "{message}"
+        );
+
+        let parsed = serde_json::from_str::<RefreshOverrides>(r#"{"refresh_mode":"changes"}"#)
+            .expect("a known mode parses, to be rejected by validate_mode");
+        assert_eq!(parsed.mode, Some(RefreshMode::Changes));
+        let parsed = serde_json::from_str::<RefreshOverrides>(r#"{"refresh_mode":null}"#)
+            .expect("a null mode parses");
+        assert_eq!(parsed.mode, None);
+        let parsed = serde_json::from_str::<RefreshOverrides>("{}").expect("no mode parses");
+        assert_eq!(parsed.mode, None);
+
+        let round_trip = serde_json::to_string(&RefreshOverrides {
+            sql: None,
+            mode: Some(RefreshMode::Append),
+            max_jitter: None,
+        })
+        .expect("serializes");
+        let parsed = serde_json::from_str::<RefreshOverrides>(&round_trip)
+            .expect("a forwarded request parses");
+        assert_eq!(parsed.mode, Some(RefreshMode::Append));
+    }
+
+    #[test]
+    fn an_override_refresh_sql_must_select_the_time_column() {
+        let schema = Arc::new(Schema::new(vec![
+            arrow::datatypes::Field::new("id", arrow::datatypes::DataType::Int64, false),
+            arrow::datatypes::Field::new("payload", arrow::datatypes::DataType::Utf8, true),
+            arrow::datatypes::Field::new("ts", arrow::datatypes::DataType::Int64, true),
+        ]));
+        let dataset = TableReference::bare("events");
+        let refresh = Refresh::new(RefreshMode::Append)
+            .time_column("ts".to_string())
+            .time_format(TimeFormat::UnixSeconds);
+        let with_sql = |sql: &str| RefreshOverrides {
+            sql: Some(sql.to_string()),
+            mode: None,
+            max_jitter: None,
+        };
+
+        let err = with_sql("SELECT id, payload FROM events")
+            .validate_for(&dataset, &refresh, Arc::clone(&schema))
+            .expect_err("a refresh_sql without the time column is rejected");
+        assert!(
+            matches!(err, InvalidRefreshOverrides::TimeColumnInvalid { .. })
+                && err.to_string().contains("time_column 'ts' was not found"),
+            "{err}"
+        );
+        // A full refresh writes its rows with the same NULL time, as the spicepod
+        // check at startup rejects whatever the mode.
+        let full = Refresh::new(RefreshMode::Full).time_column("ts".to_string());
+        with_sql("SELECT id FROM events")
+            .validate_for(&dataset, &full, Arc::clone(&schema))
+            .expect_err("rejected in full mode too");
+
+        for sql in [
+            "SELECT * FROM events",
+            "SELECT id, ts FROM events WHERE id > 50",
+        ] {
+            with_sql(sql)
+                .validate_for(&dataset, &refresh, Arc::clone(&schema))
+                .unwrap_or_else(|e| panic!("{sql}: {e}"));
+        }
+        // A dataset without a time column accepts any projection.
+        with_sql("SELECT id FROM events")
+            .validate_for(
+                &dataset,
+                &Refresh::new(RefreshMode::Full),
+                Arc::clone(&schema),
+            )
+            .expect("no time column to select");
+
+        let err = with_sql("SELECT * FROM other_table")
+            .validate_for(&dataset, &refresh, Arc::clone(&schema))
+            .expect_err("a refresh_sql over another table is rejected");
+        assert!(
+            matches!(err, InvalidRefreshOverrides::InvalidSql { .. }),
+            "{err}"
+        );
     }
 
     #[test]
@@ -2874,6 +3225,110 @@ mod tests {
         );
 
         drop(refresh_handle);
+    }
+
+    /// Records the dataset's status each time the startup rebuild writes through it.
+    #[derive(Debug)]
+    struct StatusProbeIndex {
+        status: Arc<status::RuntimeStatus>,
+        dataset: TableReference,
+        seen: parking_lot::Mutex<Vec<Option<status::ComponentStatus>>>,
+    }
+
+    #[async_trait]
+    impl spice_table::Index for StatusProbeIndex {
+        fn name(&self) -> &'static str {
+            "status_probe"
+        }
+
+        fn required_columns(&self) -> Vec<String> {
+            vec!["time_in_string".to_string()]
+        }
+
+        async fn compute_index(
+            &self,
+            batches: Vec<RecordBatch>,
+        ) -> Result<Vec<RecordBatch>, datafusion::error::DataFusionError> {
+            self.seen
+                .lock()
+                .push(self.status.get_dataset_status(&self.dataset));
+            Ok(batches)
+        }
+
+        fn requires_rebuild(&self) -> bool {
+            true
+        }
+
+        fn as_any(&self) -> &dyn std::any::Any {
+            self
+        }
+    }
+
+    /// An existing acceleration's initial status is reported only once its search indexes are
+    /// rebuilt: reported earlier, `/v1/ready` answers while the rebuild still runs and before
+    /// the dataset is registered, so every query against it fails (#14618).
+    #[tokio::test]
+    async fn the_initial_status_is_reported_only_after_the_index_rebuild() {
+        let status = status::RuntimeStatus::new();
+        let dataset = TableReference::bare("docs");
+        status.update_dataset(&dataset, status::ComponentStatus::Refreshing);
+
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "time_in_string",
+            DataType::Utf8,
+            false,
+        )]));
+        let batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![Arc::new(StringArray::from(vec!["1970-01-01"]))],
+        )
+        .expect("data should be created");
+        let probe = Arc::new(StatusProbeIndex {
+            status: Arc::clone(&status),
+            dataset: dataset.clone(),
+            seen: parking_lot::Mutex::new(Vec::new()),
+        });
+        let accelerator = spice_table::SpiceTable::over(
+            Arc::new(spice_table::IndexLayer::with_indexes(vec![
+                Arc::clone(&probe) as Arc<dyn spice_table::Index + Send + Sync>,
+            ])),
+            Arc::new(
+                MemTable::try_new(Arc::clone(&schema), vec![vec![batch]])
+                    .expect("mem table should be created"),
+            ),
+        );
+        let federated = Arc::new(FederatedTable::new_unchecked(Arc::new(
+            MemTable::try_new(schema, vec![]).expect("mem table should be created"),
+        )));
+
+        let mut refresher = Refresher::new(
+            Arc::clone(&status),
+            dataset.clone(),
+            federated,
+            Some("mem_table".to_string()),
+            Arc::new(RwLock::new(Refresh::new(RefreshMode::Full))),
+            accelerator,
+            None,
+            None,
+            Handle::current(),
+            Arc::new(Mutex::new(())),
+        );
+        refresher.set_initial_status(Some(status::ComponentStatus::Ready));
+        refresher
+            .start(AccelerationRefreshMode::Disabled)
+            .await
+            .expect("the refresher starts");
+
+        assert_eq!(
+            *probe.seen.lock(),
+            vec![Some(status::ComponentStatus::Refreshing)],
+            "the dataset must not be reported ready while its index is still being rebuilt"
+        );
+        assert_eq!(
+            status.get_dataset_status(&dataset),
+            Some(status::ComponentStatus::Ready),
+            "once rebuilt, the existing acceleration reports its initial status"
+        );
     }
 
     async fn setup_and_test(

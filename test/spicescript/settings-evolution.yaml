@@ -1,0 +1,139 @@
+name: settings-evolution
+description: >
+  Changing a Cayenne acceleration's settings between restarts never changes
+  its answers: after each change (sort order, clustering, compression, delta
+  encoding, partitioning, primary key) the acceleration serves exactly the
+  source's rows, keeps up with later changes, and answers range filters over
+  files written under earlier layouts. A partitioning change that cannot be
+  applied fails the dataset with a message naming the fix, and following it
+  serves the source's rows again.
+
+sources:
+  src: { kind: postgres }
+
+matrix:
+  refresh_mode: [full, changes]
+
+spicepod:
+  version: v1
+  kind: Spicepod
+  name: settings-evolution
+  datasets:
+    - from: postgres:public.trips
+      name: trips
+      params: ${sources.src.params}
+      acceleration:
+        enabled: true
+        engine: cayenne
+        mode: file
+        refresh_mode: '${matrix.refresh_mode}'
+        primary_key: id
+
+defaults:
+  expect: { oracle: src }
+
+steps:
+  - source-exec:
+      src: |
+        CREATE TABLE trips (id integer PRIMARY KEY, city text NOT NULL, fare numeric(10, 2) NOT NULL, note text);
+        INSERT INTO trips
+          SELECT i, 'city ' || (i % 17), (i % 500) * 1.25, CASE WHEN i % 7 = 0 THEN NULL ELSE 'n' || i END
+          FROM generate_series(1, 5000) AS i;
+        -- Every column is in the replica identity, so a change capture key
+        -- over (id, city) is as valid as one over id.
+        ALTER TABLE trips REPLICA IDENTITY FULL;
+  - start: {}
+  - query: SELECT * FROM trips
+    eventually: 60s
+
+  # Layout settings, applied to the existing acceleration in place.
+  - restart:
+      patch: { datasets: { trips: { acceleration: { params: { cayenne_sort_columns: city } } } } }
+  - query: SELECT * FROM trips
+    eventually: 60s
+  - source-exec: { src: "UPDATE trips SET fare = fare + 1 WHERE id % 97 = 1; INSERT INTO trips VALUES (10001, 'city 1', 9.99, 'sorted'); DELETE FROM trips WHERE id = 10" }
+  - refresh: trips
+    when: { refresh_mode: full }
+  - query: SELECT * FROM trips
+    eventually: 60s
+  - query: SELECT count(*), sum(fare) FROM trips WHERE id BETWEEN 100 AND 1200 AND city >= 'city 3'
+    eventually: 30s
+
+  - restart:
+      patch: { datasets: { trips: { acceleration: { params: { cayenne_sort_columns: null, cayenne_cluster_by: city } } } } }
+  - query: SELECT * FROM trips
+    eventually: 60s
+  - source-exec: { src: "UPDATE trips SET note = 'clustered' WHERE id % 97 = 2; INSERT INTO trips VALUES (10002, 'city 2', 19.99, NULL); DELETE FROM trips WHERE id = 20" }
+  - refresh: trips
+    when: { refresh_mode: full }
+  - query: SELECT * FROM trips
+    eventually: 60s
+  - query: SELECT city, count(*), sum(fare) FROM trips WHERE city IN ('city 2', 'city 9') GROUP BY city
+    eventually: 30s
+
+  - restart:
+      patch: { datasets: { trips: { acceleration: { params: { cayenne_compression_strategy: zstd, cayenne_delta_encoding: auto } } } } }
+  - query: SELECT * FROM trips
+    eventually: 60s
+  - source-exec: { src: "UPDATE trips SET city = 'renamed' WHERE id % 97 = 3; INSERT INTO trips VALUES (10003, 'city 3', 29.99, 'zstd'); DELETE FROM trips WHERE id = 30" }
+  - refresh: trips
+    when: { refresh_mode: full }
+  - query: SELECT * FROM trips
+    eventually: 60s
+
+  # Settings that define the stored rows: rebuilt from the source under full
+  # refresh. Under change capture a rebuild would lose the changes recorded
+  # outside the table, so a new partitioning is refused with a message naming
+  # the fix, and reverting it serves the existing rows again.
+  - restart:
+      ready: false
+      patch: { datasets: { trips: { acceleration: { partition_by: ['bucket(4, id)'] } } } }
+  - assert-status: { dataset: trips, status: Error, message-contains: "remove 'partition_by'" }
+    eventually: 60s
+    when: { refresh_mode: changes }
+  - restart:
+      patch: { datasets: { trips: { acceleration: { partition_by: null } } } }
+    when: { refresh_mode: changes }
+  - query: SELECT * FROM trips
+    eventually: 60s
+  - source-exec: { src: "UPDATE trips SET fare = 0 WHERE id % 97 = 4; INSERT INTO trips VALUES (10004, 'city 4', 39.99, 'partitioned'); DELETE FROM trips WHERE id = 40" }
+  - refresh: trips
+    when: { refresh_mode: full }
+  - query: SELECT * FROM trips
+    eventually: 60s
+  - query: SELECT count(*), sum(fare) FROM trips WHERE id BETWEEN 2000 AND 2100
+    eventually: 30s
+
+  - restart:
+      patch: { datasets: { trips: { acceleration: { primary_key: '(id, city)' } } } }
+  - query: SELECT * FROM trips
+    eventually: 60s
+  - source-exec: { src: "UPDATE trips SET note = 'rekeyed' WHERE id % 97 = 5; INSERT INTO trips VALUES (10005, 'city 5', 49.99, NULL); DELETE FROM trips WHERE id = 50" }
+  - refresh: trips
+    when: { refresh_mode: full }
+  - query: SELECT * FROM trips
+    eventually: 60s
+    id: before-outage
+
+  # Under full refresh, a partitioning change while the source is down cannot
+  # be rebuilt, and the stored rows cannot be served under it: the dataset says
+  # why, and a restart once the source is back rebuilds it.
+  - stop-source: src
+    when: { refresh_mode: full }
+  - restart:
+      ready: false
+      patch: { datasets: { trips: { acceleration: { partition_by: null } } } }
+    when: { refresh_mode: full }
+  - assert-status: { dataset: trips, status: Error, message-contains: partition_by }
+    eventually: 60s
+    when: { refresh_mode: full }
+  - start-source: src
+    when: { refresh_mode: full }
+  - restart: {}
+  - query: SELECT * FROM trips
+    eventually: 60s
+  - source-exec: { src: "UPDATE trips SET fare = fare * 2 WHERE id % 97 = 6; INSERT INTO trips VALUES (10006, 'city 6', 59.99, 'after'); DELETE FROM trips WHERE id = 60" }
+  - refresh: trips
+    when: { refresh_mode: full }
+  - query: SELECT * FROM trips
+    eventually: 60s
