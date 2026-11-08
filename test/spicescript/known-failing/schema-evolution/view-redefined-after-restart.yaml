@@ -1,0 +1,48 @@
+name: view-redefined-after-restart
+description: >
+  An accelerated view whose SQL changes between restarts answers from its new
+  definition: a column the new SQL adds is served, by the view and by a view
+  that reads it, and the rows match the source. A Cayenne file acceleration
+  keeps the schema it was built with instead.
+
+sources:
+  src: { kind: postgres }
+
+variants:
+  cayenne: {}
+
+spicepod:
+  version: v1
+  kind: Spicepod
+  name: view-redefined-after-restart
+  datasets:
+    - { from: 'postgres:public.orders', name: orders, params: '${sources.src.params}' }
+  views:
+    - name: orders_view
+      sql: SELECT id, v FROM orders
+      acceleration: { enabled: true, engine: cayenne, mode: file, refresh_check_interval: 1s }
+    - { name: reader, sql: SELECT * FROM orders_view }
+
+defaults:
+  expect: { oracle: src }
+  compare-variants: false
+
+steps:
+  - source-exec: { src: "CREATE TABLE orders (id integer PRIMARY KEY, v integer); INSERT INTO orders VALUES (1, 1), (2, 1), (3, 1)" }
+  - start: {}
+  - query: SELECT id, v FROM orders_view ORDER BY id
+    oracle-sql: SELECT id, v FROM orders ORDER BY id
+    eventually: 30s
+  - restart:
+      patch:
+        spicepod:
+          views:
+            - name: orders_view
+              sql: SELECT id, v, v * 10 AS w FROM orders
+              acceleration: { enabled: true, engine: cayenne, mode: file, refresh_check_interval: 1s }
+            - { name: reader, sql: SELECT * FROM orders_view }
+  - query: SELECT id, v, w FROM orders_view ORDER BY id
+    oracle-sql: SELECT id, v, v * 10 AS w FROM orders ORDER BY id
+    eventually: 30s
+  - query: SELECT id, w FROM reader ORDER BY id
+    oracle-sql: SELECT id, v * 10 AS w FROM orders ORDER BY id
