@@ -1,0 +1,67 @@
+name: duckdb-timestamp-deletes
+description: >
+  A DELETE through Spice on a DuckDB acceleration (`access: read_write`,
+  `write_mode: acceleration`) removes the rows PostgreSQL removes for the same
+  predicate when a naive `timestamp` column is compared with a literal inside
+  one millisecond, with `<`, `=`, `BETWEEN` and `>=`, in memory and file mode:
+  the column is compared at the literal's precision, not truncated to the
+  millisecond (#13146).
+
+sources:
+  src: { kind: postgres }
+
+variants:
+  memory: duckdb-memory
+  file: duckdb-file
+
+spicepod:
+  version: v1
+  kind: Spicepod
+  name: duckdb-timestamp-deletes
+  datasets:
+    - from: postgres:public.ev
+      name: ev
+      params: ${sources.src.params}
+      access: read_write
+      acceleration: { enabled: true, engine: duckdb, refresh_mode: full, write_mode: acceleration }
+
+defaults:
+  expect: { oracle: src }
+
+steps:
+  # Rows 1, 4, 5 and 8 fall inside a millisecond that a millisecond truncation
+  # would read as its start; 6 is NULL, and 7 is the last microsecond before it.
+  - source-exec:
+      src: |
+        CREATE TABLE ev (id integer, ts timestamp);
+        INSERT INTO ev VALUES (1, '2026-01-01 00:00:00.000999'), (2, '2026-01-01 00:00:00'), (3, '2026-01-01 00:00:00.002'),
+          (4, '2026-01-01 00:00:00.0005'), (5, '2026-01-01 00:00:00.000001'), (6, NULL), (7, '2025-12-31 23:59:59.999999'),
+          (8, '2026-01-01 00:00:00.0015');
+        CREATE TABLE model AS SELECT * FROM ev;
+  - start: {}
+  - query: SELECT id, ts FROM ev
+    oracle-sql: SELECT id, ts FROM model
+
+  # Truncated, rows 1 and 4 would read as midnight and be deleted too.
+  - spice-exec: DELETE FROM ev WHERE ts < TIMESTAMP '2026-01-01 00:00:00.0005'
+  - source-exec: { src: "DELETE FROM model WHERE ts < TIMESTAMP '2026-01-01 00:00:00.0005'" }
+  - query: SELECT id, ts FROM ev
+    oracle-sql: SELECT id, ts FROM model
+
+  # Truncated, row 1 would read as midnight and match nothing.
+  - spice-exec: DELETE FROM ev WHERE ts = TIMESTAMP '2026-01-01 00:00:00.000999'
+  - source-exec: { src: "DELETE FROM model WHERE ts = TIMESTAMP '2026-01-01 00:00:00.000999'" }
+  - query: SELECT id, ts FROM ev
+    oracle-sql: SELECT id, ts FROM model
+
+  # Truncated, row 8 would read as .001 and fall below the range.
+  - spice-exec: DELETE FROM ev WHERE ts BETWEEN TIMESTAMP '2026-01-01 00:00:00.001499' AND TIMESTAMP '2026-01-01 00:00:00.002'
+  - source-exec: { src: "DELETE FROM model WHERE ts BETWEEN TIMESTAMP '2026-01-01 00:00:00.001499' AND TIMESTAMP '2026-01-01 00:00:00.002'" }
+  - query: SELECT id, ts FROM ev
+    oracle-sql: SELECT id, ts FROM model
+
+  # Truncated, row 4 would read as midnight and stay; only the NULL row is left.
+  - spice-exec: DELETE FROM ev WHERE ts >= TIMESTAMP '2026-01-01 00:00:00.0005'
+  - source-exec: { src: "DELETE FROM model WHERE ts >= TIMESTAMP '2026-01-01 00:00:00.0005'" }
+  - query: SELECT id, ts FROM ev
+    oracle-sql: SELECT id, ts FROM model

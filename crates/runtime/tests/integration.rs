@@ -58,17 +58,11 @@ fn accelerator_crates_register_their_engines() {
         engines.iter().any(|engine| engine == "sqlite"),
         "the sqlite accelerator is not registered in this test binary; linked engines: {engines:?}"
     );
-    #[cfg(feature = "turso")]
-    assert!(
-        engines.iter().any(|engine| engine == "turso"),
-        "the turso accelerator is not registered in this test binary; linked engines: {engines:?}"
-    );
     #[cfg(feature = "duckdb")]
     assert!(
         engines.iter().any(|engine| engine == "duckdb"),
         "the duckdb accelerator is not registered in this test binary; linked engines: {engines:?}"
     );
-    #[cfg(not(windows))]
     assert!(
         engines.iter().any(|engine| engine == "cayenne"),
         "the cayenne accelerator is not registered in this test binary; linked engines: {engines:?}"
@@ -82,11 +76,8 @@ mod acceleration;
 mod adbc;
 mod cache;
 mod catalog;
-#[cfg(not(windows))]
 mod cayenne;
-#[cfg(not(windows))]
 mod cayenne_catalog_ddl;
-#[cfg(feature = "duckdb")]
 mod clickbench;
 mod clickhouse;
 mod cluster;
@@ -97,24 +88,12 @@ mod cosmosdb;
 mod databricks_delta;
 #[cfg(all(feature = "delta_lake", feature = "databricks"))]
 mod databricks_delta_catalog;
-#[cfg(all(feature = "delta_lake", feature = "databricks"))]
-mod databricks_delta_catalog_m2m;
-#[cfg(all(feature = "delta_lake", feature = "databricks"))]
-mod databricks_delta_m2m;
 #[cfg(all(feature = "spark", feature = "databricks"))]
 mod databricks_spark;
 #[cfg(all(feature = "spark", feature = "databricks"))]
 mod databricks_spark_catalog;
-#[cfg(all(feature = "spark", feature = "databricks"))]
-mod databricks_spark_catalog_m2m;
-#[cfg(all(feature = "spark", feature = "databricks"))]
-mod databricks_spark_m2m;
 #[cfg(feature = "databricks")]
 mod databricks_sql_warehouse;
-#[cfg(feature = "databricks")]
-mod databricks_sql_warehouse_m2m;
-#[cfg(feature = "databricks")]
-mod databricks_sql_warehouse_permissions;
 mod dataset_availability;
 mod datasets_api;
 #[cfg(feature = "delta_lake")]
@@ -141,9 +120,7 @@ mod iceberg;
 mod iceberg_api;
 mod json;
 
-#[cfg(not(windows))]
 mod cayenne_catalog_tuning;
-#[cfg(not(windows))]
 mod cdc_cayenne;
 #[cfg(feature = "debezium")]
 mod cdc_ingest;
@@ -164,11 +141,8 @@ mod mysql;
 mod odbc;
 #[cfg(feature = "oracle")]
 mod oracle;
-#[cfg(not(windows))]
 mod otel_ingest_races;
-#[cfg(not(windows))]
 mod otel_logs;
-#[cfg(not(windows))]
 mod otel_restart;
 mod plan_capture;
 #[cfg(feature = "postgres")]
@@ -189,23 +163,18 @@ mod results_cache;
 mod results_cache_warmup;
 #[cfg(all(unix, feature = "duckdb", feature = "postgres"))]
 mod retention;
+mod rustfs;
 mod s3;
 mod s3_folder_marker;
 mod s3_location_pruning;
 mod s3_parquet_overwrite;
-#[cfg(any(
-    feature = "postgres",
-    feature = "duckdb",
-    feature = "sqlite",
-    feature = "turso"
-))]
+#[cfg(any(feature = "postgres", feature = "duckdb", feature = "sqlite"))]
 mod schema_evolution;
 #[cfg(feature = "sharepoint")]
 mod sharepoint;
 #[cfg(feature = "snapshots")]
 mod snapshot_integration;
-// Cayenne does not build on Windows.
-#[cfg(all(feature = "snapshots", feature = "duckdb", not(windows)))]
+#[cfg(all(feature = "snapshots", feature = "duckdb"))]
 mod snapshot_source;
 #[cfg(feature = "snowflake")]
 mod snowflake;

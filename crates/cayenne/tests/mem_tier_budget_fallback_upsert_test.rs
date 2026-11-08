@@ -60,11 +60,6 @@ fn budget_fallback_upsert_supersedes_mem_tier_rows() -> Result<(), String> {
         common::BackendType::Sqlite,
         budget_fallback_upsert_supersedes_mem_tier_rows_impl,
     )?;
-    #[cfg(feature = "turso")]
-    common::run_with_backend_blocking(
-        common::BackendType::Turso,
-        budget_fallback_upsert_supersedes_mem_tier_rows_impl,
-    )?;
     Ok(())
 }
 

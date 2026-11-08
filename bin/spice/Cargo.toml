@@ -40,6 +40,8 @@ serde.workspace = true
 serde_json.workspace = true
 secrecy.workspace = true
 zeroize = "1.8"
+# Reading a coding agent's own config for settings that outrank spice's
+toml = "1"
 
 # Environment files
 dotenv.workspace = true

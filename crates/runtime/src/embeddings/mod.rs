@@ -34,6 +34,7 @@ pub use runtime_search::embeddings::{EmbeddingModelStore, construct_chunker};
 #[cfg(test)]
 #[cfg(feature = "models")]
 mod rrf_vector_search_tests {
+    use runtime_search::search_engine::ExplicitPrimaryKeys;
     use std::collections::HashMap;
     use std::process::ExitCode;
     use std::sync::{Arc, LazyLock, Weak};
@@ -147,10 +148,16 @@ mod rrf_vector_search_tests {
 
         // vector_search UDF + UDTF — requires the valid `Weak<DataFusion>`
         let weak_df = Arc::downgrade(&df);
-        ctx.register_udf(VectorSearchTableFunc::new(Weak::clone(&weak_df), HashMap::new()).into());
+        ctx.register_udf(
+            VectorSearchTableFunc::new(Weak::clone(&weak_df), ExplicitPrimaryKeys::default())
+                .into(),
+        );
         ctx.register_udtf(
             VECTOR_SEARCH_UDTF_NAME,
-            Arc::new(VectorSearchTableFunc::new(weak_df, HashMap::new())),
+            Arc::new(VectorSearchTableFunc::new(
+                weak_df,
+                ExplicitPrimaryKeys::default(),
+            )),
         );
 
         // RRF UDF + UDTF

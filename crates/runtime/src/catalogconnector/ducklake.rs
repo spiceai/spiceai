@@ -28,14 +28,8 @@ use crate::{
 };
 use async_trait::async_trait;
 use data_components::RefreshableCatalogProvider;
-use data_components::duckdb::{install_and_load_extension, with_utc_session_timezone};
 use data_components::ducklake::provider::{DuckLakeCatalogProvider, DuckLakeFederation};
-use data_components::ducklake::{
-    DuckLakeS3Params, build_ducklake_attach_sql, configure_duckdb_httpfs,
-};
-use datafusion_table_providers::sql::db_connection_pool::dbconnection::duckdbconn::DuckDbConnection;
-use datafusion_table_providers::sql::db_connection_pool::duckdbpool::DuckDbConnectionPool;
-use duckdb::AccessMode;
+use data_components::ducklake::{DuckLakeS3Params, create_ducklake_pool};
 use runtime_datafusion::dialect::new_duckdb_dialect;
 use runtime_datafusion::function_support::deny_spice_functions_for_duckdb_dialect_without_carve_out;
 use snafu::prelude::*;
@@ -52,7 +46,9 @@ pub enum Error {
     MissingParameter { parameter: String },
 
     #[snafu(display("Failed to initialize DuckLake: {source}"))]
-    UnableToInitializeDuckLake { source: duckdb::Error },
+    UnableToInitializeDuckLake {
+        source: Box<dyn std::error::Error + Send + Sync>,
+    },
 }
 
 pub const PARAMETERS: &[ParameterSpec] = &[
@@ -169,13 +165,6 @@ impl CatalogConnector for DuckLakeCatalog {
         let writable = catalog.access.allows_write();
         let ddl_enabled = catalog.access.allows_ddl();
 
-        // Use the appropriate `DuckDB` access mode based on catalog permissions
-        let duckdb_access_mode = if writable {
-            AccessMode::ReadWrite
-        } else {
-            AccessMode::ReadOnly
-        };
-
         let s3_params = DuckLakeS3Params {
             region: self
                 .params
@@ -221,101 +210,41 @@ impl CatalogConnector for DuckLakeCatalog {
                 .is_some_and(|v| v == "true"),
         };
 
-        let connection_string_for_pool = connection_string;
         let catalog_name_for_pool = catalog_name.clone();
-        let connector_component_for_pool = connector_component.clone();
-
-        // Blocking DuckDB setup is isolated from the async runtime thread.
-        let pool =
-            tokio::task::spawn_blocking(move || -> super::Result<Arc<DuckDbConnectionPool>> {
-                let pool = if let Some(path) = open_path.as_deref() {
-                    Arc::new(with_utc_session_timezone(
-                        DuckDbConnectionPool::new_file(path, &duckdb_access_mode).map_err(|e| {
-                            super::Error::UnableToGetCatalogProvider {
-                                connector: PREFIX.to_string(),
-                                connector_component: connector_component_for_pool.clone(),
-                                source: e,
-                            }
-                        })?,
-                    ))
-                } else {
-                    Arc::new(with_utc_session_timezone(
-                        DuckDbConnectionPool::new_memory().map_err(|e| {
-                            super::Error::UnableToGetCatalogProvider {
-                                connector: PREFIX.to_string(),
-                                connector_component: connector_component_for_pool.clone(),
-                                source: e,
-                            }
-                        })?,
-                    ))
-                };
-
-                let conn = Arc::clone(&pool).connect_sync().map_err(|e| {
-                    super::Error::UnableToGetCatalogProvider {
-                        connector: PREFIX.to_string(),
-                        connector_component: connector_component_for_pool.clone(),
-                        source: e,
-                    }
-                })?;
-
-                let duckdb_wrapper = conn
-                    .as_any()
-                    .downcast_ref::<DuckDbConnection>()
-                    .ok_or_else(|| super::Error::InvalidConfigurationNoSource {
-                        connector: PREFIX.to_string(),
-                        connector_component: connector_component_for_pool.clone(),
-                        message: "Failed to get underlying DuckDB connection".to_string(),
-                    })?;
-
-                install_and_load_extension(&duckdb_wrapper.conn, "ducklake")
-                    .map_err(|e| Error::UnableToInitializeDuckLake { source: e })
-                    .map_err(|e| super::Error::UnableToGetCatalogProvider {
-                        connector: PREFIX.to_string(),
-                        connector_component: connector_component_for_pool.clone(),
-                        source: Box::new(e),
-                    })?;
-
-                configure_duckdb_httpfs(&duckdb_wrapper.conn, &s3_params)
-                    .map_err(|e| Error::UnableToInitializeDuckLake { source: e })
-                    .map_err(|e| super::Error::UnableToGetCatalogProvider {
-                        connector: PREFIX.to_string(),
-                        connector_component: connector_component_for_pool.clone(),
-                        source: Box::new(e),
-                    })?;
-
-                let attach_sql = build_ducklake_attach_sql(
-                    &connection_string_for_pool,
-                    &catalog_name_for_pool,
-                    automatic_migration,
-                );
-                duckdb_wrapper
-                    .conn
-                    .execute(&attach_sql, [])
-                    .map_err(|e| Error::UnableToInitializeDuckLake { source: e })
-                    .map_err(|e| super::Error::UnableToGetCatalogProvider {
-                        connector: PREFIX.to_string(),
-                        connector_component: connector_component_for_pool,
-                        source: Box::new(e),
-                    })?;
-
-                Ok(pool)
-            })
+        let init = tokio::task::spawn_blocking(move || {
+            create_ducklake_pool(
+                open_path.as_deref(),
+                !writable,
+                &connection_string,
+                &catalog_name_for_pool,
+                automatic_migration,
+                &s3_params,
+            )
+        });
+        let pool = data_components::adbc_helpers::await_adbc_initialization(init)
             .await
-            .map_err(|e| super::Error::UnableToGetCatalogProvider {
-                connector: PREFIX.to_string(),
+            .map_err(|source| super::Error::UnableToGetCatalogProvider {
+                connector: PREFIX.into(),
                 connector_component: connector_component.clone(),
-                source: Box::new(e),
-            })??;
+                source: Box::new(source),
+            })?;
 
         // Create the catalog provider with the pool (which has ducklake extension and catalog attached)
-        let catalog_provider = Arc::new(DuckLakeCatalogProvider::new(
-            pool,
-            catalog_name,
-            writable,
-            ddl_enabled,
-            table_selector(catalog),
-            ducklake_federation(),
-        ));
+        let catalog_provider = Arc::new(
+            DuckLakeCatalogProvider::new(
+                pool,
+                catalog_name,
+                writable,
+                ddl_enabled,
+                table_selector(catalog),
+                ducklake_federation(),
+            )
+            .map_err(|source| super::Error::UnableToGetCatalogProvider {
+                connector: PREFIX.into(),
+                connector_component: connector_component.clone(),
+                source: Box::new(source),
+            })?,
+        );
 
         // Initial refresh to populate schemas and tables
         catalog_provider

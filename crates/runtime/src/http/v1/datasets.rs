@@ -39,7 +39,10 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use tokio::sync::RwLock;
 
-use super::{Format, convert_entry_to_csv, dataset_status};
+use super::{
+    Format, convert_entry_to_csv, dataset_status, redact_message_credentials,
+    redact_source_credentials,
+};
 
 #[derive(Debug, Deserialize)]
 #[cfg_attr(feature = "openapi", derive(utoipa::IntoParams, utoipa::ToSchema))]
@@ -295,14 +298,14 @@ fn dataset_infos(
             });
             let error_message = status
                 .as_ref()
-                .and_then(|s| s.error_message().map(String::from));
+                .and_then(|s| s.error_message().map(redact_message_credentials));
             let (last_refresh, next_refresh) = if include_status {
                 dataset_freshness(df, d, &datasets_by_name)
             } else {
                 (None, None)
             };
             DatasetResponseItem {
-                from: d.from.clone(),
+                from: redact_source_credentials(&d.from),
                 name: d.name.to_quoted_string(),
                 replication_enabled: d.replication.as_ref().is_some_and(|f| f.enabled),
                 acceleration_enabled: d.acceleration.as_ref().is_some_and(|f| f.enabled),
@@ -415,7 +418,7 @@ pub struct AccelerationRequest {
                 "message": "Dataset taxi_trips not found"
             })
         ))),
-        (status = 400, description = "Dataset is not accelerated; nothing to refresh", content((
+        (status = 400, description = "Dataset is not accelerated, or the overrides are invalid: a `refresh_mode` other than `full` or `append`, or a `refresh_sql` that does not parse or omits the dataset's `time_column`", content((
             MessageResponse = "application/json",
             example = json!({
                 "message": "Dataset taxi_trips does not have acceleration enabled"
@@ -433,9 +436,9 @@ pub(crate) async fn refresh(
     Extension(app): Extension<Arc<RwLock<Option<Arc<App>>>>>,
     Path(dataset_name): Path<String>,
     overrides_opt: Option<Json<RefreshOverrides>>,
-    // When this is an Option<Json>, Json rejections are silenced
-    // This means malformed Json, etc, will simply return None
-    // To get around this, we would need to implement a custom extractor
+    // No body, or one without a JSON `Content-Type`, is `None`. A JSON body that does
+    // not deserialize is rejected before the handler runs: 400 for malformed JSON, 422
+    // for an unknown field value such as an unknown `refresh_mode`.
 ) -> Response {
     let app_lock = tokio::select! {
         lock = app.read() => lock,
@@ -512,6 +515,18 @@ pub(crate) async fn refresh(
             status::StatusCode::CREATED,
             Json(MessageResponse {
                 message: format!("Dataset refresh triggered for {dataset_name}."),
+            }),
+        )
+            .into_response(),
+        Err(
+            err @ crate::datafusion::Error::UnableToTriggerRefresh {
+                source: crate::accelerated::Error::InvalidRefreshOverrides { .. },
+                ..
+            },
+        ) => (
+            status::StatusCode::BAD_REQUEST,
+            Json(MessageResponse {
+                message: format!("{err}"),
             }),
         )
             .into_response(),

@@ -315,6 +315,136 @@ pub enum Error {
     /// Atomic Cloud Connect project creation/attachment failed.
     #[snafu(display("{message}"))]
     CloudConnectProject { message: String },
+
+    #[snafu(display(
+        "Failed to start {agent}: it is not installed (no `{binary}` on PATH). {instructions} Then rerun `spice {command}`. See: {docs}"
+    ))]
+    CodingAgentNotInstalled {
+        agent: &'static str,
+        binary: String,
+        instructions: &'static str,
+        command: &'static str,
+        docs: &'static str,
+    },
+
+    #[snafu(display("Failed to start {agent} with the Spice runtime: {explanation}"))]
+    CodingAgentUnsupportedBuild {
+        agent: &'static str,
+        explanation: &'static str,
+    },
+
+    #[snafu(display(
+        "`spice {command}` runs a coding agent against a Spice runtime on this machine, and --cloud is not supported. Remove --cloud to use the runtime at --http-endpoint, or the one started for the Spicepod in this directory."
+    ))]
+    CodingAgentCloudUnsupported { command: &'static str },
+
+    #[snafu(display("Failed to start {agent} ('{}'): {source}", program.display()))]
+    CodingAgentLaunch {
+        agent: String,
+        program: PathBuf,
+        source: std::io::Error,
+    },
+
+    #[snafu(display("Failed to prepare {agent}: `{command}` exited with {status}: {detail}."))]
+    CodingAgentPrepare {
+        agent: String,
+        command: String,
+        status: String,
+        detail: String,
+    },
+
+    #[snafu(display(
+        "Failed to start {agent}: '{}' sets `{key}` to '{value}', which {agent} applies over the endpoint spice gives it, so its requests and the runtime key would go there instead of to Spice. Remove `{key}` from that file to run {agent} on Spice. See: https://spiceai.org/docs/cli",
+        file.display()
+    ))]
+    CodingAgentConfigConflict {
+        agent: &'static str,
+        file: PathBuf,
+        key: String,
+        value: String,
+    },
+
+    #[snafu(display("Failed to write '{}' for the coding agent: {source}", path.display()))]
+    CodingAgentFile {
+        path: PathBuf,
+        source: std::io::Error,
+    },
+
+    #[snafu(display(
+        "Failed to start the Spice runtime at {endpoint}, so the coding agent was not started: {detail}. The full log is at '{}'. See: https://spiceai.org/docs/cli",
+        log.display()
+    ))]
+    CodingAgentRuntimeStart {
+        endpoint: String,
+        log: PathBuf,
+        detail: String,
+    },
+
+    #[snafu(display(
+        "Failed to start the Spice runtime for {agent}: there is no spicepod.yaml in '{}', and no Spice runtime answers at {endpoint}. Run `spice {command}` in your Spicepod's directory, start a runtime there with `spice run`, or create a Spicepod here with `spice init` and add a model with `spice model add my-model --from openai:gpt-4o-mini`. See: https://spiceai.org/docs/cli",
+        dir.display()
+    ))]
+    CodingAgentNoSpicepod {
+        agent: &'static str,
+        command: &'static str,
+        dir: PathBuf,
+        endpoint: String,
+    },
+
+    #[snafu(display(
+        "Failed to start {agent}: the Spice runtime at {endpoint} serves the Spicepod '{served}', not '{local}' in this directory. Stop that runtime, or start one for this Spicepod on another port with `spice --http-endpoint {} {command}`. To use the running one anyway, pass `--http-endpoint {endpoint}`. See: https://spiceai.org/docs/cli",
+        next_port(endpoint)
+    ))]
+    CodingAgentOtherSpicepod {
+        agent: &'static str,
+        command: &'static str,
+        endpoint: String,
+        served: String,
+        local: String,
+    },
+
+    #[snafu(display(
+        "Failed to use the Spice runtime at {endpoint}, so the coding agent was not started: another `spice` session is using the runtime it started at {started_at}, which does not answer at {endpoint}. Rerun with `--http-endpoint {started_at}`, or use another port. See: https://spiceai.org/docs/cli"
+    ))]
+    CodingAgentRuntimeElsewhere {
+        endpoint: String,
+        started_at: String,
+    },
+
+    #[snafu(display(
+        "Failed to coordinate the Spice runtime with other `spice` sessions through '{}': {source}",
+        path.display()
+    ))]
+    CodingAgentRuntimeLock {
+        path: PathBuf,
+        source: std::io::Error,
+    },
+
+    #[snafu(display("Failed to record the Spice runtime in '{}': {source}", path.display()))]
+    CodingAgentRuntimeState {
+        path: PathBuf,
+        source: std::io::Error,
+    },
+
+    #[snafu(display(
+        "Failed to start the coding agent: the Spice runtime has no model '{model}'. Available models: {available}. Pass one of them with --model, or add the model to the Spicepod the runtime serves. See: https://spiceai.org/docs/components/models"
+    ))]
+    CodingAgentModelNotFound { model: String, available: String },
+
+    #[snafu(display(
+        "Failed to load model '{model}', so the coding agent has no model to use. Cause: {message}. Check the model's configuration in spicepod.yaml and the runtime log. See: https://spiceai.org/docs/components/models"
+    ))]
+    CodingAgentModelFailed { model: String, message: String },
+
+    #[snafu(display(
+        "The Spice runtime serves no models, so the coding agent has nothing to use. Add one to spicepod.yaml, for example `spice model add llm --from openai:gpt-4o-mini`, and rerun. See: https://spiceai.org/docs/components/models"
+    ))]
+    CodingAgentNoModels,
+
+    #[snafu(display(
+        "Failed to start the coding agent: the Spice runtime did not finish loading {models} within {minutes} minutes. Check the runtime log, then rerun."
+    ))]
+    CodingAgentModelTimeout { models: String, minutes: u64 },
 }
 
 impl Error {
@@ -403,7 +533,9 @@ impl Error {
             // behavior on the generic failure code because that variant is
             // also used for operational validation failures throughout the
             // existing command surface.
-            Self::InvalidUsage { .. } | Self::ServiceNotInstalled { .. } => Self::USAGE_EXIT_CODE,
+            Self::InvalidUsage { .. }
+            | Self::ServiceNotInstalled { .. }
+            | Self::CodingAgentCloudUnsupported { .. } => Self::USAGE_EXIT_CODE,
             Self::Interrupted => Self::INTERRUPTED_EXIT_CODE,
             _ => Self::FAILURE_EXIT_CODE,
         }
@@ -561,6 +693,19 @@ pub async fn read_response(
             source,
         }),
     }
+}
+
+/// `endpoint` on the next port, for a second runtime beside the one there.
+#[must_use]
+pub fn next_port(endpoint: &str) -> String {
+    reqwest::Url::parse(endpoint)
+        .ok()
+        .and_then(|mut url| {
+            let port = url.port_or_known_default()?.checked_add(1)?;
+            url.set_port(Some(port)).ok()?;
+            Some(url.as_str().trim_end_matches('/').to_string())
+        })
+        .unwrap_or_else(|| "http://127.0.0.1:8091".to_string())
 }
 
 #[cfg(test)]

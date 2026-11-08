@@ -14,7 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-//! Interval arithmetic on a `SQLite` or Turso acceleration answers what local
+//! Interval arithmetic on a `SQLite` acceleration answers what local
 //! evaluation answers (#14714). A projected shift reaches the engine through
 //! `datetime()` for a timestamp, which keeps its time of day, and `date()` for
 //! a date. Each case is diffed against the unaccelerated source, and three are
@@ -161,10 +161,4 @@ async fn interval_arithmetic_matches_local_evaluation(engine: &str) -> Result<()
 #[tokio::test]
 async fn sqlite_interval_arithmetic_keeps_the_time_of_day() -> Result<(), anyhow::Error> {
     interval_arithmetic_matches_local_evaluation("sqlite").await
-}
-
-#[cfg(feature = "turso")]
-#[tokio::test]
-async fn turso_interval_arithmetic_keeps_the_time_of_day() -> Result<(), anyhow::Error> {
-    interval_arithmetic_matches_local_evaluation("turso").await
 }

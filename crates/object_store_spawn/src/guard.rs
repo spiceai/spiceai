@@ -24,7 +24,9 @@ limitations under the License.
 //!   hostname cannot be used to reach an address the redirect check would have refused.
 //!
 //! Hosts given as IP literals are not resolved, so callers check the first URL themselves;
-//! redirect targets are checked by the policy.
+//! redirect targets are checked by the policy. A guard made with
+//! [`DestinationGuard::redirects_only`] leaves the request's own host unchecked and checks only
+//! redirects to other hosts and the addresses those hosts resolve to.
 //!
 //! The client applies only `allow_http`, `timeout`, `connect_timeout`, `http1_only`,
 //! `user_agent`, and default headers. Building fails if any other client option differs from
@@ -37,7 +39,14 @@ limitations under the License.
 //! blocked address is refused with the guard's reason. The guard cannot see the address a proxy
 //! resolves the destination to; the caller's first-URL check and the redirect policy still apply.
 
-use std::{error::Error as StdError, fmt, net::IpAddr, net::SocketAddr, sync::Arc};
+use std::{
+    collections::HashSet,
+    error::Error as StdError,
+    fmt,
+    net::IpAddr,
+    net::SocketAddr,
+    sync::{Arc, Mutex, PoisonError},
+};
 
 use object_store::{
     ClientConfigKey, ClientOptions,
@@ -72,12 +81,20 @@ const UNAPPLIED: &[ClientConfigKey] = &[
 type AddressCheck = Arc<dyn Fn(IpAddr) -> bool + Send + Sync>;
 type UrlCheck = Arc<dyn Fn(&Url) -> bool + Send + Sync>;
 
+/// Which hosts a [`DestinationGuard`] checks.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ResolvedHosts {
+    All,
+    RedirectTargets,
+}
+
 /// Which destinations a guarded connector refuses to reach.
 #[derive(Clone)]
 pub struct DestinationGuard {
     blocks_address: AddressCheck,
     blocks_redirect: UrlCheck,
     reason: Arc<str>,
+    checked_hosts: ResolvedHosts,
 }
 
 impl DestinationGuard {
@@ -94,7 +111,17 @@ impl DestinationGuard {
             blocks_address: Arc::new(blocks_address),
             blocks_redirect: Arc::new(blocks_redirect),
             reason: reason.into(),
+            checked_hosts: ResolvedHosts::All,
         }
+    }
+
+    /// Checks only redirects to a host other than the request's own, and the addresses of the
+    /// hosts those redirects name. The request's own host is allowed whatever it resolves to,
+    /// including a redirect to another path or port on it.
+    #[must_use]
+    pub fn redirects_only(mut self) -> Self {
+        self.checked_hosts = ResolvedHosts::RedirectTargets;
+        self
     }
 
     /// Resolves `host` with the system resolver and refuses it if any address it resolves to is
@@ -177,6 +204,8 @@ pub(crate) fn build_client(
     }
 
     let redirect_guard = guard.clone();
+    let redirect_hosts = Arc::new(Mutex::new(HashSet::new()));
+    let new_redirect_hosts = Arc::clone(&redirect_hosts);
     let mut builder = reqwest::Client::builder()
         // Compression changes `Content-Length`, which `object_store` reads as the object size.
         .no_gzip()
@@ -187,14 +216,34 @@ pub(crate) fn build_client(
             if attempt.previous().len() >= MAX_REDIRECTS {
                 return attempt.error("too many redirects");
             }
+            // The chain's first URL names the request's own host.
+            let own_host = attempt
+                .previous()
+                .first()
+                .and_then(Url::host_str)
+                .map(host_key);
+            let target_host = attempt.url().host_str().map(host_key);
+            if redirect_guard.checked_hosts == ResolvedHosts::RedirectTargets
+                && target_host.is_some()
+                && own_host == target_host
+            {
+                return attempt.follow();
+            }
             if (redirect_guard.blocks_redirect)(attempt.url()) {
                 let refused = redirect_guard.refused(attempt.url().as_str());
                 return attempt.error(refused);
+            }
+            if let (Some(url::Host::Domain(_)), Some(host)) = (attempt.url().host(), target_host) {
+                new_redirect_hosts
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .insert(host);
             }
             attempt.follow()
         }))
         .dns_resolver(Arc::new(GuardedResolver {
             guard: guard.clone(),
+            redirect_hosts,
         }))
         .https_only(!flag(value(ClientConfigKey::AllowHttp))?);
 
@@ -216,16 +265,35 @@ pub(crate) fn build_client(
     builder.build().map_err(generic)
 }
 
-/// Resolves every host through [`DestinationGuard::resolve`].
+/// `host` as the redirect host set keys it: `example.com.` and `example.com` name the same host.
+fn host_key(host: &str) -> String {
+    host.trim_end_matches('.').to_ascii_lowercase()
+}
+
+/// Resolves the hosts `guard` checks through [`DestinationGuard::resolve`], and other hosts
+/// with the system resolver.
 struct GuardedResolver {
     guard: DestinationGuard,
+    /// Hosts named by redirects that leave the request's own host; in
+    /// [`ResolvedHosts::RedirectTargets`] mode only these are checked.
+    redirect_hosts: Arc<Mutex<HashSet<String>>>,
 }
 
 impl Resolve for GuardedResolver {
     fn resolve(&self, name: Name) -> Resolving {
         let guard = self.guard.clone();
+        let checked = guard.checked_hosts == ResolvedHosts::All
+            || self
+                .redirect_hosts
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .contains(&host_key(name.as_str()));
         Box::pin(async move {
-            let addresses = guard.resolve(name.as_str()).await?;
+            let addresses: Vec<SocketAddr> = if checked {
+                guard.resolve(name.as_str()).await?
+            } else {
+                tokio::net::lookup_host((name.as_str(), 0)).await?.collect()
+            };
             Ok(Box::new(addresses.into_iter()) as Addrs)
         })
     }

@@ -600,4 +600,133 @@ mod tests {
         assert_eq!(ids, (1..=12).collect::<Vec<_>>());
         assert!(!refresh.read().await.reload, "the reload is settled");
     }
+
+    fn id_ts_schema() -> Arc<Schema> {
+        Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("ts", DataType::Int64, true),
+        ]))
+    }
+
+    fn id_ts_rows(schema: &Arc<Schema>, ids: std::ops::RangeInclusive<i64>) -> RecordBatch {
+        RecordBatch::try_new(
+            Arc::clone(schema),
+            vec![
+                Arc::new(Int64Array::from(ids.clone().collect::<Vec<_>>())),
+                Arc::new(Int64Array::from(ids.collect::<Vec<_>>())),
+            ],
+        )
+        .expect("batch builds")
+    }
+
+    async fn acceleration_ids(accelerator: &Arc<dyn TableProvider>) -> Vec<i64> {
+        let ctx = SessionContext::new();
+        let plan = accelerator
+            .scan(&ctx.state(), None, &[], None)
+            .await
+            .expect("the acceleration scans");
+        let mut ids: Vec<i64> = collect(plan, ctx.task_ctx())
+            .await
+            .expect("the acceleration reads")
+            .iter()
+            .flat_map(|batch| {
+                let ids = batch
+                    .column(0)
+                    .as_any()
+                    .downcast_ref::<Int64Array>()
+                    .expect("id is Int64");
+                (0..ids.len()).map(|i| ids.value(i)).collect::<Vec<_>>()
+            })
+            .collect();
+        ids.sort_unstable();
+        ids
+    }
+
+    /// Runs one refresh of an append dataset `events` (time column `ts`) holding ids 1 to
+    /// 6, whose source holds ids 1 to 12, with `overrides` sent straight to the worker,
+    /// past the checks made before a refresh is queued.
+    async fn run_append_refresh_with(
+        overrides: RefreshOverrides,
+    ) -> (super::super::Result<RefreshOutcome>, Vec<i64>) {
+        let schema = id_ts_schema();
+        let accelerator = Arc::new(
+            MemTable::try_new(Arc::clone(&schema), vec![vec![id_ts_rows(&schema, 1..=6)]])
+                .expect("accelerator builds"),
+        ) as Arc<dyn TableProvider>;
+        let source = Arc::new(
+            MemTable::try_new(Arc::clone(&schema), vec![vec![id_ts_rows(&schema, 1..=12)]])
+                .expect("source builds"),
+        ) as Arc<dyn TableProvider>;
+        let refresh = Refresh::new(RefreshMode::Append)
+            .time_column("ts".to_string())
+            .time_format(TimeFormat::UnixSeconds);
+        let mut runner = RefreshTaskRunner::builder(
+            status::RuntimeStatus::new(),
+            TableReference::bare("events"),
+            Arc::new(FederatedTable::new_unchecked(source)),
+            None,
+            Arc::new(RwLock::new(refresh)),
+            Arc::clone(&accelerator),
+            Handle::current(),
+            Arc::new(Mutex::new(())),
+        )
+        .build();
+        let (start, mut completed) = runner.start().expect("the runner starts");
+        start
+            .send((1, Some(overrides)))
+            .await
+            .expect("the request is sent");
+        let (id, outcome) = completed.recv().await.expect("the refresh completes");
+        assert_eq!(id, 1);
+        (outcome, acceleration_ids(&accelerator).await)
+    }
+
+    /// A refresh in a mode only another worker drives, or none, fails the refresh with
+    /// an error naming the mode, instead of panicking the worker.
+    #[tokio::test]
+    async fn a_refresh_in_a_mode_the_worker_cannot_run_fails_without_panicking() {
+        for mode in [RefreshMode::Changes, RefreshMode::Disabled] {
+            let (outcome, ids) = run_append_refresh_with(RefreshOverrides {
+                sql: None,
+                mode: Some(mode),
+                max_jitter: None,
+            })
+            .await;
+            let err = outcome.expect_err("the refresh fails");
+            assert!(
+                matches!(err, super::super::Error::RefreshModeCannotRun { .. }),
+                "{mode:?}: {err}"
+            );
+            assert_eq!(
+                ids,
+                (1..=6).collect::<Vec<_>>(),
+                "{mode:?}: nothing is written"
+            );
+        }
+    }
+
+    /// A one-off `refresh_sql` that leaves out the time column fails an append refresh
+    /// before anything is written: its rows would carry a NULL time, and the next
+    /// append would read them again.
+    #[tokio::test]
+    async fn an_override_refresh_sql_without_the_time_column_writes_nothing() {
+        let (outcome, ids) = run_append_refresh_with(RefreshOverrides {
+            sql: Some("SELECT id FROM events".to_string()),
+            mode: None,
+            max_jitter: None,
+        })
+        .await;
+        let err = outcome.expect_err("the refresh fails");
+        assert!(err.to_string().contains("time_column 'ts'"), "{err}");
+        assert_eq!(ids, (1..=6).collect::<Vec<_>>());
+
+        let (outcome, ids) = run_append_refresh_with(RefreshOverrides {
+            sql: Some("SELECT id, ts FROM events".to_string()),
+            mode: None,
+            max_jitter: None,
+        })
+        .await;
+        outcome.expect("a refresh_sql that selects the time column refreshes");
+        assert_eq!(ids, (1..=12).collect::<Vec<_>>());
+    }
 }

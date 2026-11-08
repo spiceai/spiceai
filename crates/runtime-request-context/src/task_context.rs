@@ -40,6 +40,11 @@ use crate::{Protocol, RequestContext, RequestContextBuilder};
 use datafusion::execution::TaskContext;
 use std::sync::Arc;
 
+/// Absolute deadline of one query, carried on its local session rather than on
+/// a shared request context. Remote fragments inherit the remaining lifetime.
+#[derive(Debug)]
+pub struct QueryDeadline(pub std::time::Instant);
+
 /// Resolve an `Arc<RequestContext>` for executor-side telemetry.
 ///
 /// Returns `None` if no context is available and `fallback_to_internal`

@@ -38,6 +38,7 @@ jobs:
   # merge_group can't path-filter, so gate the (container-spinning) test job on a
   # changed-files check instead of running Elasticsearch for every merge entry.
   changes:
+    environment: secret-free
     runs-on: ubuntu-latest
     # A full-history checkout (`fetch-depth: 0`) and a path diff. Sized for a
     # cold runner having to clone from scratch, not the ~1 min a warm
@@ -65,6 +66,7 @@ jobs:
               - 'crates/runtime/src/embeddings/index/elasticsearch/**'
 
   test-elasticsearch:
+    environment: secret-free
     name: Elasticsearch Integration Tests
     needs: changes
     # Slowest observed success in the 2026-07-25..08-08 window: 15 min.

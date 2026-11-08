@@ -40,6 +40,8 @@ use async_openai::types::chat::{
 #[cfg(feature = "local_llm")]
 pub mod engine;
 #[cfg(feature = "local_llm")]
+pub mod gguf_files;
+#[cfg(feature = "local_llm")]
 mod gguf_header;
 #[cfg(feature = "local_llm")]
 pub mod hf_files;
@@ -47,9 +49,13 @@ pub mod hf_files;
 pub mod mistral;
 pub mod nsql;
 #[cfg(feature = "local_llm")]
+mod template_content;
+#[cfg(feature = "local_llm")]
 pub use crate::chat::distributed::{DistributedBackend, DistributedConfig};
 #[cfg(feature = "local_llm")]
 use crate::chat::distributed::{configure_ring_distributed, ensure_distributed_build};
+#[cfg(feature = "local_llm")]
+pub use crate::chat::template_content::ContentSupport;
 #[cfg(feature = "local_llm")]
 use indexmap::IndexMap;
 #[cfg(feature = "local_llm")]
@@ -131,149 +137,145 @@ pub fn try_map_boxed_error_to_box(
     try_map_boxed_error(&*e).map_or_else(|| e, std::convert::Into::into)
 }
 
-/// Convert a structured [`ChatCompletionRequestMessage`] to the mistral.rs compatible [`RequestMessage`] type.
+/// A part of a user message's content that a local model cannot read: the engines give its
+/// chat template only text.
 #[cfg(feature = "local_llm")]
-#[must_use]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct UnsupportedContentPart {
+    /// The part's `type`, as the request names it.
+    pub part: &'static str,
+    /// The input the part carries, as a model that accepts it would name it.
+    pub input: &'static str,
+}
+
+#[cfg(feature = "local_llm")]
+impl UnsupportedContentPart {
+    /// Why a request to `model` that carries this part is refused.
+    #[must_use]
+    pub fn refusal(&self, model: &str) -> String {
+        format!(
+            "Model '{model}' reads only text, so it cannot take the `{}` part of a user message. Send the message's content as text, or use a model that accepts {} input.",
+            self.part, self.input
+        )
+    }
+}
+
+/// Converts a [`ChatCompletionRequestMessage`] to the message a chat template renders, as the
+/// local engines render it. Content sent as an array becomes text parts,
+/// `[{"type": "text", "text": …}]`, which [`ContentSupport::rewrite`] then fits to the
+/// template; an empty array is empty text, as llama-server takes it.
+///
+/// # Errors
+///
+/// A user message's part other than text: an image, audio or a file, which no local engine
+/// passes to its model.
+#[cfg(feature = "local_llm")]
 pub fn message_to_mistral(
     message: &ChatCompletionRequestMessage,
-) -> IndexMap<String, MessageContent> {
+) -> std::result::Result<IndexMap<String, MessageContent>, UnsupportedContentPart> {
     use async_openai::types::chat::{
-        ChatCompletionMessageToolCalls, ChatCompletionRequestSystemMessageContent,
-        ChatCompletionRequestToolMessageContent,
+        ChatCompletionMessageToolCalls, ChatCompletionRequestAssistantMessageContentPart,
+        ChatCompletionRequestSystemMessageContent, ChatCompletionRequestSystemMessageContentPart,
+        ChatCompletionRequestToolMessageContent, ChatCompletionRequestToolMessageContentPart,
+        ChatCompletionRequestUserMessageContentPart,
     };
     use either::Either;
-    use serde_json::{Value, json};
+    use serde_json::Value;
 
-    match message {
+    let role = |role: &str| (String::from("role"), Either::Left(role.to_string()));
+    let text = |text: &str| Either::Left(text.to_string());
+
+    Ok(match message {
         ChatCompletionRequestMessage::User(ChatCompletionRequestUserMessage {
             content, ..
         }) => {
-            let body: MessageContent = match content {
-                ChatCompletionRequestUserMessageContent::Text(text) => {
-                    either::Either::Left(text.clone())
-                }
-                ChatCompletionRequestUserMessageContent::Array(array) => {
-                    let index_map = array.iter().map(|p| {
-                        match p {
-                            async_openai::types::chat::ChatCompletionRequestUserMessageContentPart::Text(t) => {
-                                ("content".to_string(), Value::String(t.text.clone()))
+            let content = match content {
+                ChatCompletionRequestUserMessageContent::Text(t) => text(t),
+                ChatCompletionRequestUserMessageContent::Array(parts) => {
+                    let texts = parts
+                        .iter()
+                        .map(|part| match part {
+                            ChatCompletionRequestUserMessageContentPart::Text(t) => {
+                                Ok(t.text.as_str())
                             }
-                            async_openai::types::chat::ChatCompletionRequestUserMessageContentPart::ImageUrl(i) => {
-                                ("image_url".to_string(), Value::String(i.image_url.url.clone()))
+                            ChatCompletionRequestUserMessageContentPart::ImageUrl(_) => {
+                                Err(UnsupportedContentPart {
+                                    part: "image_url",
+                                    input: "image",
+                                })
                             }
-                            async_openai::types::chat::ChatCompletionRequestUserMessageContentPart::InputAudio(a) => {
-                                ("input_audio".to_string(), Value::String(a.input_audio.data.clone()))
+                            ChatCompletionRequestUserMessageContentPart::InputAudio(_) => {
+                                Err(UnsupportedContentPart {
+                                    part: "input_audio",
+                                    input: "audio",
+                                })
                             }
-                            async_openai::types::chat::ChatCompletionRequestUserMessageContentPart::File(f) => {
-                                ("file".to_string(), serde_json::to_value(&f.file).unwrap_or_default())
+                            ChatCompletionRequestUserMessageContentPart::File(_) => {
+                                Err(UnsupportedContentPart {
+                                    part: "file",
+                                    input: "file",
+                                })
                             }
-                        }
-
-                    }).collect();
-                    either::Either::Right(vec![index_map])
+                        })
+                        .collect::<std::result::Result<Vec<_>, _>>()?;
+                    parts_content(&texts)
                 }
             };
-            IndexMap::from([
-                (String::from("role"), Either::Left(String::from("user"))),
-                (String::from("content"), body),
-            ])
+            IndexMap::from([role("user"), (String::from("content"), content)])
         }
         ChatCompletionRequestMessage::Developer(ChatCompletionRequestDeveloperMessage {
-            content: ChatCompletionRequestDeveloperMessageContent::Text(text),
-            ..
-        }) => IndexMap::from([
-            (
-                String::from("role"),
-                Either::Left(String::from("developer")),
-            ),
-            (String::from("content"), Either::Left(text.clone())),
-        ]),
-        ChatCompletionRequestMessage::Developer(ChatCompletionRequestDeveloperMessage {
-            content: ChatCompletionRequestDeveloperMessageContent::Array(parts),
+            content,
             ..
         }) => {
-            // TODO: This will cause issue for some chat_templates. Tracking: https://github.com/EricLBuehler/mistral.rs/issues/793
-            let content_json = parts
-                .iter()
-                .map(|p| {
-                    let ChatCompletionRequestDeveloperMessageContentPart::Text(t) = p;
-                    t.text.clone()
-                })
-                .collect::<Vec<_>>();
-            IndexMap::from([
-                (
-                    String::from("role"),
-                    Either::Left(String::from("developer")),
+            let content = match content {
+                ChatCompletionRequestDeveloperMessageContent::Text(t) => text(t),
+                ChatCompletionRequestDeveloperMessageContent::Array(parts) => parts_content(
+                    &parts
+                        .iter()
+                        .map(
+                            |ChatCompletionRequestDeveloperMessageContentPart::Text(t)| {
+                                t.text.as_str()
+                            },
+                        )
+                        .collect::<Vec<_>>(),
                 ),
-                (
-                    String::from("content"),
-                    Either::Left(json!(content_json).to_string()),
-                ),
-            ])
+            };
+            IndexMap::from([role("developer"), (String::from("content"), content)])
         }
         ChatCompletionRequestMessage::System(ChatCompletionRequestSystemMessage {
-            content: ChatCompletionRequestSystemMessageContent::Text(text),
-            ..
-        }) => IndexMap::from([
-            (String::from("role"), Either::Left(String::from("system"))),
-            (String::from("content"), Either::Left(text.clone())),
-        ]),
-        ChatCompletionRequestMessage::System(ChatCompletionRequestSystemMessage {
-            content: ChatCompletionRequestSystemMessageContent::Array(parts),
+            content,
             ..
         }) => {
-            // TODO: This will cause issue for some chat_templates. Tracking: https://github.com/EricLBuehler/mistral.rs/issues/793
-            let content_json = parts
-                .iter()
-                .map(|p| match p {
-                    async_openai::types::chat::ChatCompletionRequestSystemMessageContentPart::Text(t) => {
-                        ("text".to_string(), t.text.clone())
-                    }
-                })
-                .collect::<Vec<_>>();
-            IndexMap::from([
-                (String::from("role"), Either::Left(String::from("system"))),
-                (
-                    String::from("content"),
-                    Either::Left(json!(content_json).to_string()),
+            let content = match content {
+                ChatCompletionRequestSystemMessageContent::Text(t) => text(t),
+                ChatCompletionRequestSystemMessageContent::Array(parts) => parts_content(
+                    &parts
+                        .iter()
+                        .map(|ChatCompletionRequestSystemMessageContentPart::Text(t)| {
+                            t.text.as_str()
+                        })
+                        .collect::<Vec<_>>(),
                 ),
-            ])
+            };
+            IndexMap::from([role("system"), (String::from("content"), content)])
         }
         ChatCompletionRequestMessage::Tool(ChatCompletionRequestToolMessage {
-            content: ChatCompletionRequestToolMessageContent::Text(text),
-            tool_call_id,
-        }) => IndexMap::from([
-            (String::from("role"), Either::Left(String::from("tool"))),
-            (String::from("content"), Either::Left(text.clone())),
-            (
-                String::from("tool_call_id"),
-                Either::Left(tool_call_id.clone()),
-            ),
-        ]),
-        ChatCompletionRequestMessage::Tool(ChatCompletionRequestToolMessage {
-            content: ChatCompletionRequestToolMessageContent::Array(parts),
+            content,
             tool_call_id,
         }) => {
-            // TODO: This will cause issue for some chat_templates. Tracking: https://github.com/EricLBuehler/mistral.rs/issues/793
-            let content_json = parts
-                .iter()
-                .map(|p| match p {
-                    async_openai::types::chat::ChatCompletionRequestToolMessageContentPart::Text(t) => {
-                        ("text".to_string(), t.text.clone())
-                    }
-                })
-                .collect::<Vec<_>>();
-
+            let content = match content {
+                ChatCompletionRequestToolMessageContent::Text(t) => text(t),
+                ChatCompletionRequestToolMessageContent::Array(parts) => parts_content(
+                    &parts
+                        .iter()
+                        .map(|ChatCompletionRequestToolMessageContentPart::Text(t)| t.text.as_str())
+                        .collect::<Vec<_>>(),
+                ),
+            };
             IndexMap::from([
-                (String::from("role"), Either::Left(String::from("tool"))),
-                (
-                    String::from("content"),
-                    Either::Left(json!(content_json).to_string()),
-                ),
-                (
-                    String::from("tool_call_id"),
-                    Either::Left(tool_call_id.clone()),
-                ),
+                role("tool"),
+                (String::from("content"), content),
+                (String::from("tool_call_id"), text(tool_call_id)),
             ])
         }
         ChatCompletionRequestMessage::Assistant(ChatCompletionRequestAssistantMessage {
@@ -282,36 +284,28 @@ pub fn message_to_mistral(
             tool_calls,
             ..
         }) => {
-            let mut map: IndexMap<String, MessageContent> = IndexMap::from([(
-                String::from("role"),
-                Either::Left(String::from("assistant")),
-            )]);
-            match content {
-                Some(ChatCompletionRequestAssistantMessageContent::Text(s)) => {
-                    map.insert("content".to_string(), Either::Left(s.clone()));
-                }
-                Some(ChatCompletionRequestAssistantMessageContent::Array(parts)) => {
-                    // TODO: This will cause issue for some chat_templates. Tracking: https://github.com/EricLBuehler/mistral.rs/issues/793
-                    let content_json= parts.iter().map(|p| match p {
-                        async_openai::types::chat::ChatCompletionRequestAssistantMessageContentPart::Text(t) => {
-                            ("text".to_string(), t.text.clone())
-                        }
-                        async_openai::types::chat::ChatCompletionRequestAssistantMessageContentPart::Refusal(i) => {
-                            ("refusal".to_string(), i.refusal.clone())
-                        }
-                    }).collect::<Vec<_>>();
-                    map.insert(
-                        String::from("content"),
-                        Either::Left(json!(content_json).to_string()),
-                    );
-                }
-                None => {
-                    // Use Some(""), not None as it is more compatible with many open source `chat_template`s.
-                    map.insert("content".to_string(), Either::Left(String::new()));
-                }
-            }
+            let content = match content {
+                Some(ChatCompletionRequestAssistantMessageContent::Text(t)) => text(t),
+                // A refusal is what the assistant said, so the template reads it as its text.
+                Some(ChatCompletionRequestAssistantMessageContent::Array(parts)) => parts_content(
+                    &parts
+                        .iter()
+                        .map(|part| match part {
+                            ChatCompletionRequestAssistantMessageContentPart::Text(t) => {
+                                t.text.as_str()
+                            }
+                            ChatCompletionRequestAssistantMessageContentPart::Refusal(r) => {
+                                r.refusal.as_str()
+                            }
+                        })
+                        .collect::<Vec<_>>(),
+                ),
+                // Empty text, not none, which more open-source chat templates accept.
+                None => text(""),
+            };
+            let mut map = IndexMap::from([role("assistant"), (String::from("content"), content)]);
             if let Some(name) = name {
-                map.insert("name".to_string(), Either::Left(name.clone()));
+                map.insert("name".to_string(), text(name));
             }
             if let Some(tool_calls) = tool_calls {
                 let tool_call_results: Vec<IndexMap<String, Value>> = tool_calls
@@ -342,13 +336,24 @@ pub fn message_to_mistral(
             content,
             name,
         }) => IndexMap::from([
-            (String::from("role"), Either::Left(String::from("function"))),
+            role("function"),
             (
                 "content".to_string(),
-                Either::Left(content.clone().unwrap_or_default()),
+                text(content.as_deref().unwrap_or_default()),
             ),
-            ("name".to_string(), Either::Left(name.clone())),
+            ("name".to_string(), text(name)),
         ]),
+    })
+}
+
+/// A message's content sent as an array of text parts: the parts, or empty text when there are
+/// none, as llama-server takes an empty array.
+#[cfg(feature = "local_llm")]
+fn parts_content(texts: &[&str]) -> MessageContent {
+    if texts.is_empty() {
+        either::Either::Left(String::new())
+    } else {
+        template_content::text_parts(texts.iter().copied())
     }
 }
 
@@ -362,9 +367,11 @@ use crate::hf::HubParams;
 /// the cache's snapshot directory: it never downloads anything itself.
 /// `model_type` is the type of model, if needed to be explicit. Often this can
 ///    be inferred from the `.model_type` key in a HF's `config.json`, or from the GGUF metadata.
-/// `gguf_files` are the GGUF files within the huggingface model repo to load the model from,
-///    in the order the model lists them: every shard, and any MTP draft head. A registered
-///    engine that serves them gets them all; mistral.rs loads the first.
+/// `files` are the model's `files`, as the Spicepod lists them: GGUF files within the repo,
+///    or a quantization by name (`UD-Q4_K_XL`), resolved against the repo
+///    ([`gguf_files::resolve`]); with none, a GGUF repo's largest quantization that fits the
+///    memory the engine reports. A registered engine that serves the GGUF files gets them all,
+///    every shard and any draft head; mistral.rs loads the first.
 /// `hub` is the model's `hf_token` and `hf_endpoint`.
 /// `distributed` optionally runs the model tensor-parallel across multiple nodes.
 /// `reasoning` names the model and its `reasoning_effort` default for the load-time check.
@@ -372,50 +379,55 @@ use crate::hf::HubParams;
 pub async fn create_hf_model(
     model_id: &str,
     model_type: Option<&str>,
-    gguf_files: &[PathBuf],
+    files: &[&str],
     hub: HubParams<'_>,
     chat_template_literal: Option<&str>,
     distributed: Option<DistributedConfig>,
     reasoning: ReasoningDefault<'_>,
 ) -> Result<Arc<dyn Chat>> {
-    let gguf = gguf_files
-        .iter()
-        .map(|file| {
-            file.to_str().ok_or_else(|| Error::FailedToLoadModel {
-                source: format!("the GGUF path '{}' is not valid UTF-8", file.display()).into(),
-            })
-        })
-        .collect::<Result<Vec<&str>>>()?;
     let download_error = |error: huggingface_hub::DownloadError| Error::FailedToDownloadModel {
         configuration: error.is_configuration_error(),
         source: Box::new(error),
     };
+    // Every node of a split model resolves the files itself, and each would choose by its own
+    // memory, so a split model takes only a repository's one quantization: every node must name
+    // the same files.
+    let budget = if distributed.is_some() {
+        hf_files::Budget::Split
+    } else {
+        engine::free_memory().map_or(hf_files::Budget::Unmeasured, hf_files::Budget::Free)
+    };
     // A rank other than 0 of a model an engine splits across nodes never reads the weights (the
-    // head sends each rank its share), so it doesn't download them. It reads the first shard's
-    // header from the Hub instead, to decide as the head does.
+    // head sends each rank its share), so it doesn't download them. It resolves the files from
+    // the Hub's listing and reads the first shard's header instead, to decide as the head does.
     if let Some(cfg) = distributed.as_ref()
         && cfg.node_rank > 0
-        && let Some(engine) = engine::engine_for(gguf_files)
-        && engine.distributed.is_some()
     {
-        let architecture = hf_files::model_architecture(model_id, &gguf, hub, reasoning.model_name)
-            .await
-            .map_err(download_error)?;
-        if engine.splits(architecture.as_deref()) {
+        let resolved =
+            hf_files::model_architecture(model_id, files, budget, hub, reasoning.model_name)
+                .await
+                .map_err(download_error)?;
+        let gguf_files: Vec<PathBuf> = resolved.gguf.iter().map(PathBuf::from).collect();
+        if let Some(engine) = engine::engine_for(&gguf_files)
+            && engine.distributed.is_some()
+            && engine.splits(resolved.architecture.as_deref())
+        {
             ensure_distributed_build()?;
             let options = LocalModelOptions {
                 reasoning,
                 distributed: Some(cfg),
                 ..LocalModelOptions::default()
             };
-            return (engine.load)(gguf_files, options).await;
+            return (engine.load)(&gguf_files, options).await;
         }
     }
-    let dir = hf_files::download_model(model_id, &gguf, hub, reasoning.model_name)
-        .await
-        .map_err(download_error)?;
+    let hf_files::Downloaded { dir, gguf } =
+        hf_files::download_model(model_id, files, budget, hub, reasoning.model_name)
+            .await
+            .map_err(download_error)?;
+    let gguf_files: Vec<PathBuf> = gguf.iter().map(PathBuf::from).collect();
     let weights: Vec<PathBuf> = gguf_files.iter().map(|file| dir.join(file)).collect();
-    if let Some(engine) = engine::engine_for(gguf_files)
+    if let Some(engine) = engine::engine_for(&gguf_files)
         && (distributed.is_none() || engine.splits_weights(&weights).await)
     {
         if distributed.is_some() {
@@ -447,7 +459,7 @@ pub async fn create_hf_model(
     mistral::MistralLlama::from_snapshot(
         &dir,
         model_type,
-        gguf.first().copied(),
+        gguf.first().map(String::as_str),
         chat_template_literal,
         ring_config,
         reasoning,

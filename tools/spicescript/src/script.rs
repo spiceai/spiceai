@@ -41,6 +41,9 @@ pub struct Script {
     /// templates as `${matrix.<key>}`.
     #[serde(default)]
     pub matrix: IndexMap<String, Vec<Value>>,
+    /// The OSS release each combination starts on before an `upgrade`.
+    #[serde(default)]
+    pub from: Option<String>,
     /// Named spicepod patches. Every variant of a run must return identical
     /// rows for every query.
     #[serde(default)]
@@ -656,6 +659,8 @@ impl BackgroundWork {
 pub struct HttpStep {
     pub method: String,
     pub path: String,
+    /// URL query parameters, encoded and appended to `path`.
+    pub query: Vec<(String, String)>,
     pub headers: Vec<(String, String)>,
     pub body: Option<String>,
     pub status: Option<u16>,
@@ -669,6 +674,8 @@ pub struct HttpStep {
     /// Patterns the body must match, and must not match.
     pub body_matches: Vec<regex::Regex>,
     pub body_lacks: Vec<regex::Regex>,
+    /// Predicates over the body parsed as JSON.
+    pub json: Vec<crate::json_assert::JsonAssertion>,
     pub timing: Timing,
     /// The API key the request presents (`api-key: none` for none).
     pub key: crate::spiced::Key,
@@ -707,7 +714,7 @@ impl LineCount {
         }
     }
 
-    fn parse(value: &Value) -> Result<Self> {
+    pub(crate) fn parse(value: &Value) -> Result<Self> {
         let text = match value {
             Value::Number(n) => n.to_string(),
             Value::String(s) => s.trim().to_string(),
@@ -914,6 +921,15 @@ impl Script {
         }
     }
 
+    pub fn render_from(&self, combo: &Map<String, Value>) -> Result<Option<String>> {
+        self.from
+            .as_deref()
+            .map(|from| {
+                crate::template::substitute_text(from, &serde_json::json!({ "matrix": combo }))
+            })
+            .transpose()
+    }
+
     #[cfg(test)]
     pub fn parse(text: &str) -> Result<Self> {
         Self::parse_in(text, Path::new("."), &SharedVariants::default())
@@ -963,6 +979,30 @@ impl Script {
             }
         }
         script.steps = expanded;
+        if script.from.is_some() {
+            ensure!(
+                script
+                    .steps
+                    .iter()
+                    .any(|s| matches!(s.action, Action::Restart { upgrade: true, .. })),
+                "`from:` names a release to upgrade from, but the script has no `upgrade` step, so it would run entirely on that release"
+            );
+            // Check placeholders even when a matrix dimension is empty.
+            if let Some(from) = &script.from {
+                for tail in from.split("${matrix.").skip(1) {
+                    let key = tail.split('}').next().unwrap_or(tail);
+                    ensure!(
+                        script.matrix.contains_key(key),
+                        "`from:` placeholder '${{matrix.{key}}}' names unknown matrix key '{key}'"
+                    );
+                }
+            }
+            for combo in matrix_combinations(&script.matrix) {
+                if let Some(from) = script.render_from(&combo)? {
+                    crate::release::validate(&from)?;
+                }
+            }
+        }
         let mut ids = std::collections::BTreeSet::new();
         for step in &script.steps {
             if let Action::Query(q) = &step.action {
@@ -1857,9 +1897,22 @@ fn parse_step(index: usize, step: Value) -> Result<Step> {
                     .collect())
             };
             let headers = pairs(inner.take("headers"), "headers")?;
+            let query: Vec<(String, String)> = match inner.take("query") {
+                None => Vec::new(),
+                Some(Value::Object(m)) => m
+                    .into_iter()
+                    .map(|(k, v)| match v {
+                        Value::String(s) => Ok((k, s)),
+                        Value::Number(_) | Value::Bool(_) => Ok((k, v.to_string())),
+                        _ => bail!("`query` values must be strings, numbers or booleans"),
+                    })
+                    .collect::<Result<_>>()?,
+                Some(_) => bail!("`query` must map parameter names to values"),
+            };
             let key = api_key_choice(inner.string("api-key")?);
             let mut body_matches = Vec::new();
             let mut body_lacks = Vec::new();
+            let mut json = Vec::new();
             let (status, expect_headers, lacks_headers, body_contains) = match opts.take("expect") {
                 None => (None, Vec::new(), Vec::new(), None),
                 Some(Value::Object(e)) => {
@@ -1880,6 +1933,15 @@ fn parse_step(index: usize, step: Value) -> Result<Step> {
                         let list = one_or_many(e.take(key), key, "a pattern or a list")?;
                         *into = compile_patterns(key, &list)?;
                     }
+                    json = match e.take("json") {
+                        None => Vec::new(),
+                        Some(Value::Array(list)) => list,
+                        Some(one) => vec![one],
+                    }
+                    .into_iter()
+                    .map(crate::json_assert::JsonAssertion::parse)
+                    .collect::<Result<_>>()
+                    .context("`json`")?;
                     e.finish()?;
                     (
                         status,
@@ -1898,6 +1960,7 @@ fn parse_step(index: usize, step: Value) -> Result<Step> {
             Action::Http(HttpStep {
                 method,
                 path,
+                query,
                 headers,
                 body,
                 status,
@@ -1906,6 +1969,7 @@ fn parse_step(index: usize, step: Value) -> Result<Step> {
                 body_contains,
                 body_matches,
                 body_lacks,
+                json,
                 timing,
                 key,
             })
@@ -2333,6 +2397,34 @@ mod tests {
             step_key("tlp", &arg),
             r#"tlp: {"options":{"a":1,"z":2},"queries":200,"seed":1,"table":"t"}"#,
         );
+    }
+
+    #[test]
+    fn from_validation_names_the_problem() {
+        for (from, steps, expected) in [
+            (
+                "v2.4.0",
+                "upgrade: {}",
+                "invalid `from:` release 'v2.4.0'; expected MAJOR.MINOR.PATCH or MAJOR.MINOR.x (digits only, no leading v or pre-release)",
+            ),
+            (
+                "${matrix.missing}",
+                "upgrade: {}",
+                "`from:` placeholder '${matrix.missing}' names unknown matrix key 'missing'",
+            ),
+            (
+                "2.4.0",
+                "start: {}",
+                "`from:` names a release to upgrade from, but the script has no `upgrade` step, so it would run entirely on that release",
+            ),
+        ] {
+            let text =
+                format!("name: upgrade\nfrom: '{from}'\nspicepod: {{}}\nsteps: [{{ {steps} }}]");
+            assert_eq!(
+                Script::parse(&text).expect_err("invalid from").to_string(),
+                expected
+            );
+        }
     }
 
     #[test]

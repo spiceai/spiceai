@@ -16,18 +16,18 @@ limitations under the License.
 
 #![deny(missing_docs)]
 
-//! Cayenne: a lakehouse format using `SQLite` (or Turso) for transactional metadata
+//! Cayenne: a lakehouse format using `SQLite` for transactional metadata
 //! and Vortex files as the data lake.
 //!
 //! This module provides a lakehouse format that combines:
-//! - `SQLite` or Turso for transactional metadata management (schemas, tables, files,
+//! - `SQLite` for transactional metadata management (schemas, tables, files,
 //!   inline-data memtable, deletion vectors, snapshot sequences)
 //! - Vortex files for efficient columnar data storage
 //!
 //! # Architecture
 //!
 //! Cayenne has three key components:
-//! - **Metadata catalog**: `SQLite`/Turso database storing table metadata, file
+//! - **Metadata catalog**: `SQLite` database storing table metadata, file
 //!   references, deletion vectors, and the inline-data level-0 memtable.
 //! - **Data lake**: directory of Vortex files containing the persistent data.
 //! - **Staging WAL**: crash-safe write-ahead log for in-progress appends.

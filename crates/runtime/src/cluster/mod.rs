@@ -648,7 +648,6 @@ pub use runtime_cluster::{metrics_collector, pki};
 pub use scheduler_registry::start_scheduler_registry;
 pub use scheduler_registry::{SchedulerPeers, remote_scheduler_addresses};
 pub use servers::{start_executor_flight_server, start_internal_cluster_server};
-#[cfg(not(windows))]
 pub(crate) use service::discover_cayenne_tables;
 pub use service::{ClusterServiceImpl, ExecutorControlStreamRegistry};
 
@@ -2433,11 +2432,13 @@ impl runtime_secrets::ClusterSecretExpander for ClusterSecretExpanderImpl {
     async fn expand_secret(
         &self,
         executor_id: &str,
+        store: &str,
         key: &str,
     ) -> Result<Option<secrecy::SecretString>, String> {
         let request = runtime_proto::ExpandSecretRequest {
             executor_id: executor_id.to_string(),
             key: key.to_string(),
+            store: store.to_string(),
         };
 
         match self.client.clone().expand_secret(request).await {
@@ -2480,7 +2481,9 @@ async fn executor_bind_app(
             .as_ref()
             .map(|state| state.location.clone()),
     );
+    let secret_store_names: Vec<String> = app_def.secrets.iter().map(|s| s.name.clone()).collect();
     *rt.app.write().await = Some(app_def);
+    rt.search_primary_keys.update(Arc::clone(&rt.app)).await;
 
     // Create a cluster client for secrets. This channel outlives every secret
     // resolution on the executor, so it is the one that most needs the keepalive
@@ -2489,7 +2492,8 @@ async fn executor_bind_app(
         create_cluster_service_client(scheduler_url, client_tls_config, &grpc_client).await?;
 
     let expander = Box::new(ClusterSecretExpanderImpl::new(secrets_cluster_client));
-    *rt.secrets.write().await = Secrets::new_for_cluster_executor(expander, executor_id);
+    *rt.secrets.write().await =
+        Secrets::new_for_cluster_executor(expander, executor_id, secret_store_names);
 
     // Published once the scheduler's secrets are bound, which the log exporter
     // resolves its header templates through, and before the components below
@@ -2535,7 +2539,6 @@ async fn executor_bind_app(
     rt.load_embeddings().await;
     rt.load_rerankers().await;
     Arc::clone(rt).load_models().await;
-    Arc::clone(rt).load_tools().await;
     Arc::clone(rt).load_datasets().await;
 
     Ok(())
@@ -2671,7 +2674,7 @@ fn apply_distributed_execution_config(cfg: SessionConfig) -> SessionConfig {
     cfg
 }
 
-#[cfg(all(test, not(windows)))]
+#[cfg(test)]
 mod eager_merge_tests;
 
 #[cfg(test)]

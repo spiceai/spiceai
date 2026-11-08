@@ -14,7 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use std::sync::Arc;
+use std::{collections::HashSet, sync::Arc};
 
 use app::{App, AppBuilder};
 use spicepod::component::{
@@ -79,6 +79,7 @@ fn start_time_only_changes(
         source_rate_control,
         drasi,
         functions: _,
+        mode: _,
     } = new;
 
     [
@@ -285,8 +286,8 @@ impl Runtime {
     }
 
     /// Hot-apply a new [`App`] to the running runtime, reconciling catalogs,
-    /// datasets, views, models, functions, and (without the `models` feature)
-    /// workers against the currently-loaded app.
+    /// datasets, views, tools, functions, models, and (with the `models`
+    /// feature) workers against the currently-loaded app.
     ///
     /// This is the diff-based reconcile the pods watcher performs when a
     /// spicepod file changes on disk, and the one a Spice Cloud deployment takes
@@ -314,6 +315,15 @@ impl Runtime {
         // mutates the app during the diff phase, so a write lock is not needed
         // until the final swap.
         let current_app = self.read_app().await;
+        let mut new_app = new_app;
+        if new_app.runtime.mode != self.mode {
+            tracing::warn!(
+                "runtime.mode changed from '{}' to '{}'. Restart spiced to apply the new mode.",
+                self.mode,
+                new_app.runtime.mode
+            );
+            Arc::make_mut(&mut new_app).runtime.mode = self.mode;
+        }
         Arc::clone(&self)
             .apply_app_diff(current_app.as_ref(), new_app)
             .await
@@ -329,6 +339,7 @@ impl Runtime {
         current_app: Option<&Arc<App>>,
         new_app: Arc<App>,
     ) -> bool {
+        let mut models_to_reload = None;
         if let Some(current_app) = current_app {
             if *current_app == new_app {
                 return false;
@@ -359,20 +370,54 @@ impl Runtime {
             Arc::clone(&self)
                 .apply_view_diff(current_app, &new_app, &reloaded_datasets)
                 .await;
-            self.apply_model_diff(current_app, &new_app).await;
+            // Tools and functions first: a model gets its tools when it loads.
+            let changed_tools = self.apply_tool_diff(current_app, &new_app).await;
             crate::datafusion::udf::apply_function_diff(&self, current_app, &new_app).await;
+            let changed_function_tools = changed_function_tools(current_app, &new_app);
+            let loaded_models = self.apply_model_diff(current_app, &new_app).await;
+            models_to_reload = Some((changed_tools, changed_function_tools, loaded_models));
 
-            if !cfg!(feature = "models") {
+            if cfg!(feature = "models") {
                 Arc::clone(&self)
                     .apply_worker_diff(current_app, &new_app)
                     .await;
             }
         }
 
-        *self.app.write().await = Some(new_app);
+        *self.app.write().await = Some(Arc::clone(&new_app));
+        self.search_primary_keys.update(Arc::clone(&self.app)).await;
+
+        // After the swap: `auto` and `all` resolve against the installed app's `tools:`.
+        if let Some((changed_tools, changed_function_tools, loaded_models)) = models_to_reload {
+            self.reload_models_using_tools(
+                &new_app,
+                &changed_tools,
+                &changed_function_tools,
+                &loaded_models,
+            )
+            .await;
+        }
 
         true
     }
+}
+
+/// Names of the functions exposed as tools that `new_app` adds, removes or changes.
+fn changed_function_tools(current_app: &App, new_app: &App) -> HashSet<String> {
+    let enabled_changed =
+        current_app.runtime.functions.enabled != new_app.runtime.functions.enabled;
+    current_app
+        .functions
+        .iter()
+        .chain(&new_app.functions)
+        .filter(|f| f.as_tool)
+        .filter(|f| {
+            enabled_changed
+                || current_app.functions.iter().find(|c| c.name == f.name)
+                    != new_app.functions.iter().find(|n| n.name == f.name)
+        })
+        .map(|f| f.name.clone())
+        .collect()
 }
 
 #[cfg(test)]
@@ -1001,5 +1046,38 @@ mod tests {
             .with_dataset(accelerated_dataset("events", "cayenne"))
             .build();
         assert_eq!(reload_deprecated_engines_warning(&current, &migrated), None);
+    }
+
+    /// `/v1/search` and `vector_search` read the `row_id` keys of the installed app.
+    #[tokio::test]
+    async fn a_reload_updates_the_search_primary_keys() {
+        let docs: spicepod::component::dataset::Dataset = serde_json::from_value(serde_json::json!({
+            "from": "file:data.csv",
+            "name": "docs",
+            "columns": [{"name": "body", "full_text_search": {"enabled": true, "row_id": "id"}}],
+        }))
+        .expect("a valid dataset");
+        let rt = Arc::new(crate::Runtime::builder().build().await);
+        let docs_ref = datafusion::common::TableReference::parse_str("docs")
+            .resolve(
+                crate::datafusion::SPICE_DEFAULT_CATALOG,
+                crate::datafusion::SPICE_DEFAULT_SCHEMA,
+            )
+            .into();
+
+        assert!(
+            Arc::clone(&rt)
+                .apply_app(Arc::new(
+                    app::AppBuilder::new("search_keys")
+                        .with_dataset(docs)
+                        .build()
+                ))
+                .await
+        );
+
+        assert_eq!(
+            rt.search_primary_keys.get(&docs_ref),
+            Some(vec!["id".to_string()])
+        );
     }
 }

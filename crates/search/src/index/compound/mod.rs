@@ -235,8 +235,8 @@ async fn compound_write(
             arrays.push(Arc::clone(secondary_out.column(i)));
         }
     }
-    // Preserve the primary output's schema-level metadata — some indexes rely on it
-    // (e.g. `DuckDBVectorIndex` forwards its source schema metadata).
+    // Preserve the primary output's schema-level metadata, which an index may
+    // forward from its source schema.
     RecordBatch::try_new(
         Arc::new(Schema::new_with_metadata(fields, schema.metadata().clone())),
         arrays,

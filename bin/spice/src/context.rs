@@ -122,7 +122,10 @@ fn build_http_client_trusting(
     deadline: Deadline,
     root_certificates: Vec<reqwest::Certificate>,
 ) -> Result<reqwest::Client> {
+    // Certificate errors are recognized as rustls errors. Another workspace crate enables
+    // reqwest's native-tls, which would otherwise become the default backend.
     let mut builder = reqwest::Client::builder()
+        .tls_backend_rustls()
         .user_agent(user_agent)
         .connect_timeout(CONNECT_TIMEOUT)
         .redirect(same_origin_redirect_policy());

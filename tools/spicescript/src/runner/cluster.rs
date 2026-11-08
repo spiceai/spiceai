@@ -131,8 +131,7 @@ pub(super) fn cluster_args(
 
 /// The engine an acceleration block runs, or `None` when it is disabled,
 /// with the Spicepod's defaults applied: omitted `enabled` is true, and an
-/// omitted `engine` is Cayenne (Arrow only on Windows, where the harness
-/// does not run).
+/// omitted `engine` is Cayenne.
 fn accelerated_engine(acceleration: &Value) -> Option<&str> {
     if acceleration.get("enabled").and_then(Value::as_bool) == Some(false) {
         return None;

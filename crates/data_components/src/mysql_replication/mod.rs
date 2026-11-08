@@ -267,6 +267,16 @@ pub enum Error {
          See: https://spiceai.org/docs/components/data-connectors/mysql"
     ))]
     AnonymousTransactionUnderGtid { dataset: String },
+
+    #[snafu(display(
+        "MySQL replication for {dataset}: this dataset is positioning by GTID, but the source \
+         committed a transaction under the tagged GTID '{gtid}'. Spice records the transactions \
+         it applied as untagged GTIDs, so it cannot record this one or resume after it, and \
+         replication stopped rather than skip or repeat transactions. Commit transactions on \
+         the source without a GTID tag. \
+         See: https://spiceai.org/docs/components/data-connectors/mysql"
+    ))]
+    TaggedTransactionUnderGtid { dataset: String, gtid: String },
 }
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
@@ -472,11 +482,18 @@ pub fn check_resume_compatibility(
     Ok(())
 }
 
-/// Compare two Arrow schema JSON strings for equivalence.
+/// Compare the columns of two Arrow schema JSON strings.
 ///
-/// Exact string match is preferred (fast path). Otherwise both sides are
-/// parsed as [`serde_json::Value`] so map key order differences in field
-/// metadata do not false-positive into [`ResumeDrift::DatasetSchemaChanged`].
+/// Only the `fields` array is compared: the column names, types, nullability
+/// and per-column metadata that binlog row images are decoded into.
+/// Schema-level metadata is ignored. Schema inference stamps it with source
+/// catalog estimates (`spice.inferred_row_count`, `spice.inferred_table_bytes`)
+/// and other descriptions of the table that change without any change to its
+/// columns, for example when `ANALYZE TABLE` refreshes `TABLE_ROWS`. The source
+/// side of the decode is guarded separately by the layout fingerprint.
+///
+/// Both sides are parsed as [`serde_json::Value`], so map key order
+/// differences in field metadata do not count as a change.
 fn dataset_schemas_equivalent(a: &str, b: &str) -> bool {
     if a == b {
         return true;
@@ -485,7 +502,10 @@ fn dataset_schemas_equivalent(a: &str, b: &str) -> bool {
         serde_json::from_str::<serde_json::Value>(a),
         serde_json::from_str::<serde_json::Value>(b),
     ) {
-        (Ok(left), Ok(right)) => left == right,
+        (Ok(left), Ok(right)) => match (left.get("fields"), right.get("fields")) {
+            (Some(left), Some(right)) => left == right,
+            _ => false,
+        },
         _ => false,
     }
 }
@@ -771,5 +791,29 @@ mod tests {
             .expect("serialize");
         check_resume_compatibility(Some(&meta), Some(current), &layout.fingerprint())
             .expect("equivalent schema JSON must resume despite metadata key order");
+    }
+
+    #[test]
+    fn resume_ignores_schema_level_metadata() {
+        let layout = layout(&[("id", "int")]);
+        let field = r#"{"name":"id","data_type":"Int32","nullable":false,"dict_id":0,"dict_is_ordered":false,"metadata":{}}"#;
+        let stored = format!(
+            r#"{{"fields":[{field}],"metadata":{{"spice.inferred_row_count":"100","spice.inferred_table_bytes":"16384"}}}}"#
+        );
+        let current = format!(
+            r#"{{"fields":[{field}],"metadata":{{"spice.inferred_row_count":"1000","spice.inferred_table_bytes":"65536"}}}}"#
+        );
+        let meta = CheckpointMeta::new(stored, layout.fingerprint())
+            .to_schema_json()
+            .expect("serialize");
+        check_resume_compatibility(Some(&meta), Some(&current), &layout.fingerprint())
+            .expect("changed source estimates must not count as schema drift");
+
+        let retyped = r#"{"fields":[{"name":"id","data_type":"Int64","nullable":false,"dict_id":0,"dict_is_ordered":false,"metadata":{}}],"metadata":{"spice.inferred_row_count":"100","spice.inferred_table_bytes":"16384"}}"#;
+        assert_eq!(
+            check_resume_compatibility(Some(&meta), Some(retyped), &layout.fingerprint()),
+            Err(ResumeDrift::DatasetSchemaChanged),
+            "a column type change must still count as drift"
+        );
     }
 }

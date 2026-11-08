@@ -19,6 +19,9 @@ bytes.workspace = true
 futures.workspace = true
 http.workspace = true
 parking_lot.workspace = true
+prost.workspace = true
+rand.workspace = true
+sha2.workspace = true
 rustls-native-certs = "0.8.2"
 secrecy.workspace = true
 snafu.workspace = true
@@ -32,6 +35,8 @@ tower.workspace = true
 url.workspace = true
 
 [dev-dependencies]
+# The compressed-message guard test encodes a zstd-compressed batch.
+arrow-ipc = { workspace = true, features = ["zstd"] }
 tokio = { workspace = true, features = ["macros", "net", "rt", "sync"] }
 tokio-stream = { workspace = true, features = ["net"] }
 

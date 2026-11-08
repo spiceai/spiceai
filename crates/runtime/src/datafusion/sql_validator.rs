@@ -1231,7 +1231,6 @@ mod tests {
     /// planner — must still be rejected. This covers the statement-level
     /// rewrites (`plan_distributed_dml`, `plan_create_table`, etc.) that can
     /// emit `LogicalPlan::Extension` instead of `LogicalPlan::{Ddl,Dml}`.
-    #[cfg(not(windows))]
     #[tokio::test]
     async fn test_read_only_validator_rejects_dml_via_spice_planner() {
         let df = create_test_datafusion();

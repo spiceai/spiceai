@@ -1265,7 +1265,6 @@ mod tests {
     }
 
     #[test]
-    #[cfg(not(windows))]
     fn cayenne_rejects_conflicts_for_datasets_that_name_no_engine() {
         let mut datasets = vec![
             cayenne_dataset("orders", Some("/mnt/a/cayenne"), None),

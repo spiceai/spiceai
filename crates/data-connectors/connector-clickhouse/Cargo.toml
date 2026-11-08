@@ -27,7 +27,6 @@ description = "ClickHouse data connector for Spice.ai runtime"
 arrow.workspace = true
 async-stream.workspace = true
 async-trait.workspace = true
-bigdecimal.workspace = true
 chrono.workspace = true
 chrono-tz = "0.8.6"
 clickhouse-rs.workspace = true

@@ -1,10 +1,14 @@
 name: mysql-cdc-upgrade
 description: >
-  MySQL change capture resumes across an upgrade in place (`--from <older
-  spiced>`; without it, a restart): datasets following the binlog apply every
+  MySQL change capture resumes across an upgrade in place from each of the last
+  two releases: datasets following the binlog apply every
   change made while the runtime was down, each once, and keep following the
   source afterwards — resuming from the recorded GTID position rather than
   re-reading their tables.
+
+matrix:
+  from: [2.3.x, 2.4.x]
+from: '${matrix.from}'
 
 sources:
   my: { kind: mysql }

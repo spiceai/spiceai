@@ -42,7 +42,6 @@ limitations under the License.
 // Accelerator engines are their own crates and self-register through a linkme slice, and the
 // linker drops an unreferenced slice static, so a test exercising Cayenne names the crate
 // itself rather than relying on another module to.
-#[cfg(not(windows))]
 use accelerator_cayenne as _;
 
 use std::collections::HashMap;

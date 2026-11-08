@@ -36,7 +36,7 @@ limitations under the License.
 //!
 //! Every concurrent scan acquiring `listing_fence.read().await` blocked for
 //! the full duration of those two round trips. On a remote metastore
-//! (Turso wire RTT ~10 ms, managed PostgreSQL ~10-30 ms) two sequential
+//! (a network RTT of ~10-30 ms) two sequential
 //! round trips meant every reader stalled 20-60 ms per checkpoint —
 //! recurring at the inline-flush cadence.
 //!
@@ -77,8 +77,7 @@ limitations under the License.
 //! deployments:
 //!
 //! - `rtt_1ms` — local SQLite with `fsync` (best case).
-//! - `rtt_10ms` — same-zone network metastore (typical Turso / managed
-//!   Postgres).
+//! - `rtt_10ms` — same-zone network metastore.
 //! - `rtt_30ms` — cross-region network metastore.
 
 #![allow(clippy::expect_used)]

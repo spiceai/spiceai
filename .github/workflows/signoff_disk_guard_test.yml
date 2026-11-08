@@ -43,6 +43,7 @@ concurrency:
 
 jobs:
   test-signoff-disk-guard:
+    environment: secret-free
     name: Unit tests for the sign-off disk guard
     # GitHub-hosted on purpose: the assertions themselves are sub-second and must
     # not queue behind the saturated self-hosted pool — the same pool whose full

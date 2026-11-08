@@ -54,7 +54,7 @@ async fn test_models_http_endpoint() -> Result<(), Error> {
 
     test_request_context()
         .scope(async {
-            verify_env_secret_exists("SPICE_OPENAI_API_KEY")
+            verify_env_secret_exists(crate::utils::openai_credential_secret())
                 .await
                 .map_err(anyhow::Error::msg)?;
 

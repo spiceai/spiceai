@@ -1,0 +1,21 @@
+{
+  "description": "The DuckDB releases Spice is tested with. duckdb: and ducklake: datasets, and the tests that use DuckDB as an oracle, load the DuckDB library installed on the host and need 1.5.0 or later; each entry is the newest patch release of a supported line. Keep the list in ascending order: the last entry is the release the tests, CI and spicescript's duckdb and ducklake sources use by default (--duckdb-version picks another), and CI runs the DuckDB scripts again on every other entry (.github/workflows/e2e_test_ci.yml). Each entry records the SHA-256 of its shared-library archive per platform, which scripts/libduckdb.py checks before installing it; the Dockerfiles carry the same checksums for the newest entry.",
+  "versions": [
+    {
+      "version": "1.5.6",
+      "sha256": {
+        "linux-amd64": "b845005f5132a7d8180057c35e14a7626632258782f871a90861b19c1c03841b",
+        "linux-arm64": "b72ed9f05003f5e9d2015f7ceada6416b377d9dd33169cdde3c9e33897856eee",
+        "osx-universal": "e0bc007d9b0094c0970ac1847a8601d10aad07cbd2910ce586ec810f77b638d6"
+      }
+    },
+    {
+      "version": "2.0.0",
+      "sha256": {
+        "linux-amd64": "993ad89e7dfca66cd6da994c2cad090c2fc160ddf9f550498a098ab4bb13cfb1",
+        "linux-arm64": "c60eecf91143ca6bbac55c4f4d40dc22520488b0ac257c86e0fe9a2b451cf2b7",
+        "osx-universal": "14cd63180614cfd961f7959146ecd9087527ff20b67311efdc3fa1c29c18204d"
+      }
+    }
+  ]
+}

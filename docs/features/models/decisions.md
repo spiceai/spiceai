@@ -72,6 +72,15 @@ Arguments:
 
 Constants are checked when the query is planned, before any model is called.
 
+A required constant (`condition`, `instructions` of `ai_score`, `labels`, `levels`) can also be an uncorrelated scalar subquery. The query runs the subquery one time and checks its value by the same rules before any model is called. A subquery for `labels` can return one label per row, or one list:
+
+```sql
+SELECT id, ai_classify(body, (SELECT DISTINCT team_name FROM teams)) AS team
+FROM tickets;
+```
+
+A subquery for `levels` must return one list, lowest first, because a subquery does not keep the order of its rows: `(SELECT array_agg(level ORDER BY rank) FROM levels)`. A call with a subquery argument does not share its request with other calls, because its question is known only when the query runs. `questions`, `model`, `on_error` and `ai_classify`'s `instructions` must be literals.
+
 How the engine runs them:
 
 - In one `SELECT` list or `WHERE` clause, `ai_if`, `ai_probability`, `ai_classify` and `ai_score` calls on the same `input`, `model` and `on_error` share one request per row, and identical `ai_decide` calls share one request and one answer. Each distinct `ai_decide` call is its own request, asking all of its questions at once. Identical inputs are asked once within each slice of up to 1,024 rows.
@@ -123,6 +132,22 @@ curl -X POST http://localhost:8090/v1/decisions \
 - The response's `model` is the name the request used.
 - `usage` is omitted when the model did not report it.
 - Each request is recorded in `runtime.task_history` as an `ai_decision` task.
+
+## Reranking with `rerank()`
+
+`rerank(..., model => 'name')` picks how to score candidates in this order:
+
+1. A native reranker (Cohere, Voyage, Jina, TEI, HTTP) scores them itself.
+2. A model with a native decisions API (`typesafe:jev`, `openai:gpt-6-luna`) asks one `noul` question per candidate: "is this document relevant to the query?". The probability is the `rerank_score`. `strategy` defaults to `'pointwise'` (one request per candidate); `'listwise'` asks all questions in one request.
+3. Any other chat model gets an LLM-as-judge prompt and returns relative scores. `strategy` defaults to `'listwise'`.
+
+A chat model can answer decisions too (see below), but `rerank()` uses it as a judge unless asked otherwise. To pick the path yourself:
+
+- `via => 'chat'`: the LLM-as-judge prompt, also for `gpt-6-luna`.
+- `via => 'decisions'`: one relevance question per candidate, also for a chat model, which answers through the adapter below.
+- `prompt_template => '...'`: only the chat path uses a prompt template, so it implies `via => 'chat'`. With `via => 'decisions'`, or with a model that has no chat (such as `typesafe:jev`), the query fails instead of ignoring the template.
+
+`via` and `prompt_template` do not apply to native rerankers; the query fails if either is set.
 
 ## How a chat model answers
 

@@ -16,7 +16,7 @@ arrow_tools = { path = "../arrow_tools" }
 async-stream.workspace = true
 async-trait.workspace = true
 cache = { path = "../cache" }
-cayenne = { path = "../cayenne", features = ["turso", "partition-table-provider"] }
+cayenne = { path = "../cayenne", features = ["partition-table-provider"] }
 chrono.workspace = true
 data-accelerator-api = { path = "../data-accelerator-api" }
 data-connector-api = { path = "../data-connector-api" }
