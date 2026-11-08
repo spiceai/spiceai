@@ -1,0 +1,40 @@
+name: retention-sql-after-append-refresh
+description: >
+  An append refresh applies retention_sql before it completes: a source row
+  soft-deleted after the first load is gone from the acceleration as soon as
+  the next refresh returns.
+
+sources:
+  src: { kind: postgres }
+
+spicepod:
+  version: v1
+  kind: Spicepod
+  name: retention-sql-after-append-refresh
+  datasets:
+    - from: postgres:public.widgets
+      name: widgets
+      params: ${sources.src.params}
+      time_column: updated_at
+      time_format: timestamptz
+      acceleration:
+        enabled: true
+        engine: cayenne
+        mode: file
+        refresh_mode: append
+        refresh_check_interval: 1h
+        primary_key: id
+        retention_sql: DELETE FROM widgets WHERE deleted = true
+
+steps:
+  - source-exec:
+      src: |
+        CREATE TABLE widgets (id int PRIMARY KEY, name text NOT NULL, updated_at timestamptz NOT NULL DEFAULT clock_timestamp(), deleted boolean NOT NULL DEFAULT false);
+        INSERT INTO widgets (id, name) VALUES (1, 'a'), (2, 'b'), (3, 'c');
+  - start: {}
+  - query: SELECT id, deleted FROM widgets ORDER BY id
+    expect: { rows: [['1', 'false'], ['2', 'false'], ['3', 'false']] }
+  - source-exec: { src: "UPDATE widgets SET deleted = true, updated_at = clock_timestamp() WHERE id = 1" }
+  - refresh: widgets
+  - query: SELECT id, deleted FROM widgets WHERE id > 0 ORDER BY id
+    expect: { rows: [['2', 'false'], ['3', 'false']] }

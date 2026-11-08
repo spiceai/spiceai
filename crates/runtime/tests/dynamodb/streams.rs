@@ -494,85 +494,6 @@ pub fn make_dynamodb_dataset_with_file_accel(
     dataset
 }
 
-#[cfg(feature = "duckdb")]
-/// Creates a mock checkpoint with fake shard IDs from scratch.
-/// Used when no real checkpoint exists yet (e.g., testing fresh checkpoint error propagation).
-fn create_mock_checkpoint(duckdb_path: &str, dataset_name: &str, hours_ago: u64) {
-    use duckdb::Connection;
-    use std::time::{SystemTime, UNIX_EPOCH};
-
-    let conn = Connection::open(duckdb_path).expect("Failed to open DuckDB file");
-
-    // Create table if not exists
-    conn.execute(
-        "CREATE TABLE IF NOT EXISTS spice_sys_dynamodb_streams (
-            dataset_name TEXT PRIMARY KEY,
-            checkpoint_data TEXT,
-            created_at TIMESTAMP,
-            updated_at TIMESTAMP
-        )",
-        [],
-    )
-    .expect("Failed to create checkpoint table");
-
-    // Create a properly formatted checkpoint with non-existent shard ID
-    let checkpoint_updated_at_secs = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .expect("Time went backwards")
-        .as_secs();
-
-    // Build checkpoint JSON with all required fields matching the Checkpoint struct
-    let checkpoint_json = format!(
-        r#"{{"shards":{{"fake-nonexistent-shard-id":{{"sequence_number":"00000000000000000000001","parent_id":null,"updated_at":{{"secs_since_epoch":{checkpoint_updated_at_secs},"nanos_since_epoch":0}},"position":"At"}}}}}}"#
-    );
-
-    // Calculate timestamp hours_ago for the database updated_at column
-    let now = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .expect("Time went backwards");
-    let timestamp_secs = now.as_secs() - (hours_ago * 60 * 60);
-
-    conn.execute(
-        &format!(
-            "INSERT INTO spice_sys_dynamodb_streams (dataset_name, checkpoint_data, created_at, updated_at)
-             VALUES (?, ?, to_timestamp({timestamp_secs}), to_timestamp({timestamp_secs}))"
-        ),
-        [dataset_name, &checkpoint_json],
-    )
-    .expect("Failed to insert mock checkpoint");
-}
-
-/// `DuckDB` file acceleration of the same dataset. Only the fresh-checkpoint test uses it:
-/// on Cayenne a recent checkpoint that names a missing shard does not put the dataset in
-/// error (unverified outside this in-process test), and that is checked before this test
-/// goes with the engine.
-#[cfg(feature = "duckdb")]
-fn duckdb_file_dataset(
-    table_name: &str,
-    port: u16,
-    access_key: &str,
-    secret_key: &str,
-    duckdb_path: &str,
-    lag_exceeds_behavior: Option<&str>,
-) -> Dataset {
-    let mut dataset = make_dynamodb_dataset_with_file_accel(
-        table_name,
-        port,
-        access_key,
-        secret_key,
-        duckdb_path,
-        lag_exceeds_behavior,
-    );
-    if let Some(acceleration) = dataset.acceleration.as_mut() {
-        acceleration.engine = Some("duckdb".to_string());
-        acceleration.params = Some(DatasetParams::from_string_map(HashMap::from([(
-            "duckdb_file".to_string(),
-            duckdb_path.to_string(),
-        )])));
-    }
-    dataset
-}
-
 /// Corrupts the checkpoint by replacing shard IDs with fake ones and making the timestamp old.
 /// This simulates the scenario where shards have expired (>24h `DynamoDB` retention).
 fn corrupt_checkpoint_for_shard_not_found(cayenne_path: &str, dataset_name: &str, hours_ago: u64) {
@@ -806,7 +727,7 @@ async fn dynamodb_rebootstrap_removes_rows_deleted_from_source() -> anyhow::Resu
             wait_for_dynamodb_source_rows(&client, table_name, 5, 30).await?;
 
             let temp_dir = tempfile::tempdir()?;
-            let cayenne_path = temp_dir.path().join("test.duckdb");
+            let cayenne_path = temp_dir.path().join("acceleration");
             let cayenne_path_str = cayenne_path.to_str().expect("path should be valid UTF-8");
 
             // Phase 1: Bootstrap normally — acceleration and DynamoDB both have 5 rows.
@@ -891,7 +812,7 @@ async fn dynamodb_rebootstrap_removes_rows_deleted_from_source() -> anyhow::Resu
                 let has_exact_rows = wait_for_exact_row_count(&rt, table_name, 5, 30).await;
                 assert!(
                     has_exact_rows,
-                    "Rebootstrap must remove phantom rows that exist only in DuckDB. \
+                    "Rebootstrap must remove phantom rows that exist only in the acceleration. \
                      Stale phantom rows survived — InsertOp::Append was used instead of Overwrite"
                 );
 
@@ -905,7 +826,9 @@ async fn dynamodb_rebootstrap_removes_rows_deleted_from_source() -> anyhow::Resu
         .await
 }
 
-#[cfg(feature = "duckdb")]
+/// A checkpoint that names shards the stream no longer has, but was written an hour
+/// ago, is too recent for the shards to have expired, so the dataset reports an error
+/// instead of re-bootstrapping, whatever `lag_exceeds_shard_retention_behavior` says.
 #[tokio::test(flavor = "multi_thread")]
 async fn dynamodb_shard_not_found_fresh_checkpoint_propagates_error() -> anyhow::Result<()> {
     let _tracing = init_tracing(Some(
@@ -926,23 +849,54 @@ async fn dynamodb_shard_not_found_fresh_checkpoint_propagates_error() -> anyhow:
             insert_rows(&client, table_name, 0..5).await;
             wait_for_dynamodb_source_rows(&client, table_name, 5, 30).await?;
 
-            // Create temp DuckDB file and insert fake checkpoint with FRESH timestamp (1h ago)
             let temp_dir = tempfile::tempdir()?;
-            let duckdb_path = temp_dir.path().join("test.duckdb");
-            let duckdb_path_str = duckdb_path.to_str().expect("path should be valid UTF-8");
+            let cayenne_path = temp_dir.path().join("acceleration");
+            let cayenne_path_str = cayenne_path.to_str().expect("path should be valid UTF-8");
 
-            // Insert fake checkpoint that's only 1h old (< 18h threshold)
-            // This should propagate error regardless of lag_exceeds_behavior setting
-            create_mock_checkpoint(duckdb_path_str, table_name, 1);
+            // Start Spice once so the dataset writes a real checkpoint.
+            {
+                let app = AppBuilder::new("dynamodb_fresh_checkpoint_phase1")
+                    .with_dataset(make_dynamodb_dataset_with_file_accel(
+                        table_name,
+                        port,
+                        access_key,
+                        secret_key,
+                        cayenne_path_str,
+                        Some("ready_after_load"),
+                    ))
+                    .with_sql_cache(SQLResultsCacheConfig {
+                        enabled: false,
+                        ..Default::default()
+                    })
+                    .build();
 
-            let app = AppBuilder::new("dynamodb_fresh_checkpoint_test")
-                .with_dataset(duckdb_file_dataset(
+                configure_test_datafusion();
+                let rt = Runtime::builder().with_app(app).build().await;
+                let cloned_rt = Arc::new(rt.clone());
+
+                tokio::select! {
+                    () = tokio::time::sleep(Duration::from_mins(1)) => {
+                        return Err(anyhow::Error::msg("Phase 1: Timed out waiting for datasets to load"));
+                    }
+                    () = cloned_rt.load_components() => {}
+                }
+
+                runtime_ready_check(&rt).await;
+                ensure_exact_dataset_rows(&rt, table_name, 5, 30).await?;
+            }
+
+            // Point the checkpoint at shards the stream does not have, written an hour
+            // ago: well inside the stream's 24-hour retention.
+            corrupt_checkpoint_for_shard_not_found(cayenne_path_str, table_name, 1);
+
+            let app = AppBuilder::new("dynamodb_fresh_checkpoint_phase2")
+                .with_dataset(make_dynamodb_dataset_with_file_accel(
                     table_name,
                     port,
                     access_key,
                     secret_key,
-                    duckdb_path_str,
-                    Some("ready_after_load"), // Setting doesn't matter for fresh checkpoint
+                    cayenne_path_str,
+                    Some("ready_after_load"), // A fresh checkpoint fails whatever this says.
                 ))
                 .with_sql_cache(SQLResultsCacheConfig {
                     enabled: false,
@@ -959,7 +913,6 @@ async fn dynamodb_shard_not_found_fresh_checkpoint_propagates_error() -> anyhow:
                 () = cloned_rt.load_components() => {}
             }
 
-            // Fresh checkpoint + ShardNotFound should result in error
             let is_error = wait_for_dataset_error(&rt, table_name, 10).await;
             assert!(
                 is_error,
@@ -995,7 +948,7 @@ async fn dynamodb_shard_not_found_expired_checkpoint_ready_after_load() -> anyho
 
             // Create temp Cayenne file for acceleration
             let temp_dir = tempfile::tempdir()?;
-            let cayenne_path = temp_dir.path().join("test.duckdb");
+            let cayenne_path = temp_dir.path().join("acceleration");
             let cayenne_path_str = cayenne_path.to_str().expect("path should be valid UTF-8");
 
             // === PHASE 1: Start Spice normally to create real checkpoint ===
@@ -1114,7 +1067,7 @@ async fn dynamodb_shard_not_found_expired_checkpoint_ready_before_load() -> anyh
 
             // Create temp Cayenne file for acceleration
             let temp_dir = tempfile::tempdir()?;
-            let cayenne_path = temp_dir.path().join("test.duckdb");
+            let cayenne_path = temp_dir.path().join("acceleration");
             let cayenne_path_str = cayenne_path.to_str().expect("path should be valid UTF-8");
 
             // === PHASE 1: Start Spice normally to create real checkpoint ===
@@ -1303,7 +1256,7 @@ async fn dynamodb_streams_cayenne_file_acceleration() -> anyhow::Result<()> {
 
             wait_for_dynamodb_source_rows(&client, table_name, 1, 30).await?;
 
-            let app = AppBuilder::new("dynamodb_duckdb_file_accel_test")
+            let app = AppBuilder::new("dynamodb_cayenne_file_accel_test")
                 .with_dataset(make_dynamodb_dataset_with_cayenne_acceleration(
                     table_name, port, access_key, secret_key,
                 ))
