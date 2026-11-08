@@ -559,42 +559,10 @@ jobs:
           cp ./test/models/spicepod_hf.yml ./spicepod.yaml
           cat ./spicepod.yaml
 
-      # The Hub credential lives where hf-hub looks for it, rather than being threaded
-      # through the spicepod as an `hf_token` param. Two reasons: it authenticates the
-      # chat model and the embedding model with one mechanism, and an unset secret
-      # leaves no file behind instead of setting an empty token, which the Hub answers
-      # with 401 — worse than no token at all.
       - name: Authenticate the Hugging Face cache
-        env:
-          SPICE_HF_TOKEN: ${{ secrets.SPICE_SECRET_HF_TOKEN }}
-        run: |
-          set -uo pipefail
-          umask 077
-
-          # hf-hub caches artifacts under $HOME/.cache/huggingface/hub and reads its
-          # credential from the sibling `token` file. $HOME persists between jobs on
-          # these self-hosted runners while the _work tree does not, so once the ~3B
-          # chat model and the embedding model are on disk, later runs need no Hub
-          # round-trip at all.
-          mkdir -p "${HOME}/.cache/huggingface/hub"
-          token_file="${HOME}/.cache/huggingface/token"
-
-          # $HOME is shared by every job that lands on this host, and it outlives this
-          # one. So a token we write here must not be left behind for an unrelated job
-          # to read, and a token the host already owns must not be clobbered:
-          #   - file already present -> use it, touch nothing.
-          #   - absent + secret set  -> write it, and mark it for removal in cleanup.
-          #   - absent + no secret   -> warn; downloads are anonymous.
-          if [ -s "${token_file}" ]; then
-            echo "Using the Hugging Face token already present on this runner."
-          elif [ -n "${SPICE_HF_TOKEN:-}" ]; then
-            printf '%s' "${SPICE_HF_TOKEN}" > "${token_file}"
-            chmod 600 "${token_file}"
-            echo "SPICE_REMOVE_HF_TOKEN=${token_file}" >> "$GITHUB_ENV"
-            echo "Wrote a job-scoped Hugging Face token for hf-hub to pick up."
-          else
-            echo "::warning::No Hugging Face token available. Downloads will be anonymous, and anonymous requests share a per-IP quota across this whole runner pool — exhausting it surfaces as HTTP 401 on model config files."
-          fi
+        uses: ./.github/actions/hf-cache-auth
+        with:
+          token: ${{ secrets.SPICE_SECRET_HF_TOKEN }}
 
       # Fail here, in seconds and by name, rather than as an unexplained five-minute
       # readiness timeout. The retries ride out the transient per-IP 401/429 responses
@@ -3089,6 +3057,14 @@ jobs:
           unzip -o "$RUNNER_TEMP/duckdb.zip" -d "$RUNNER_TEMP/duckdb"
           echo "$RUNNER_TEMP/duckdb" >> "$GITHUB_PATH"
 
+      # The search and embedding scripts download a Hub model at startup. Without
+      # a token they share the pool's anonymous per-IP quota, and a rate limit fails
+      # every one of them at once as "model 'potion' … failed to load".
+      - name: Authenticate the Hugging Face cache
+        uses: ./.github/actions/hf-cache-auth
+        with:
+          token: ${{ secrets.SPICE_SECRET_HF_TOKEN }}
+
       - name: Check harness rejects incorrect answers
         if: ${{ matrix.partition == '1/4' }}
         run: |
@@ -3193,6 +3169,12 @@ jobs:
             done
           done
           exit $status
+
+      # Only when the step above wrote the token itself; a credential the runner
+      # already owned is left alone.
+      - name: Remove the job-scoped Hugging Face token
+        if: always() && env.SPICE_REMOVE_HF_TOKEN != ''
+        run: rm -f "${SPICE_REMOVE_HF_TOKEN}"
 
       # Every script's outcome, passes included, from every run: a script's
       # failure rate across runs is read off these rather than off job logs.

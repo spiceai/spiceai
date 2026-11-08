@@ -1,0 +1,55 @@
+name: Authenticate the Hugging Face cache
+description: 'Puts a Hugging Face token where hf-hub reads it, for a job whose spiced downloads Hub models'
+
+# The Hub credential lives where hf-hub looks for it, rather than being threaded
+# through a spicepod as an `hf_token` param: it authenticates chat and embedding
+# models with one mechanism, and an unset secret leaves no file behind instead of
+# setting an empty token, which the Hub answers with 401 — worse than no token.
+#
+# A job that uses this must also run, as its own step:
+#
+#   - name: Remove the job-scoped Hugging Face token
+#     if: always() && env.SPICE_REMOVE_HF_TOKEN != ''
+#     run: rm -f "${SPICE_REMOVE_HF_TOKEN}"
+#
+# (a composite action has no post step to do it).
+inputs:
+  token:
+    description: 'The Hugging Face token, normally secrets.SPICE_SECRET_HF_TOKEN; may be empty'
+    required: false
+    default: ''
+
+runs:
+  using: composite
+  steps:
+    - name: Write the token for hf-hub
+      shell: bash
+      env:
+        SPICE_HF_TOKEN: ${{ inputs.token }}
+      run: |
+        set -uo pipefail
+        umask 077
+
+        # hf-hub caches artifacts under $HOME/.cache/huggingface/hub and reads its
+        # credential from the sibling `token` file. $HOME persists between jobs on
+        # the self-hosted runners while the _work tree does not, so once a model is
+        # on disk, later runs need no Hub round-trip at all.
+        mkdir -p "${HOME}/.cache/huggingface/hub"
+        token_file="${HOME}/.cache/huggingface/token"
+
+        # $HOME is shared by every job that lands on this host, and it outlives this
+        # one. So a token written here must not be left behind for an unrelated job
+        # to read, and a token the host already owns must not be clobbered:
+        #   - file already present -> use it, touch nothing.
+        #   - absent + secret set  -> write it, and mark it for removal in cleanup.
+        #   - absent + no secret   -> warn; downloads are anonymous.
+        if [ -s "${token_file}" ]; then
+          echo "Using the Hugging Face token already present on this runner."
+        elif [ -n "${SPICE_HF_TOKEN:-}" ]; then
+          printf '%s' "${SPICE_HF_TOKEN}" > "${token_file}"
+          chmod 600 "${token_file}"
+          echo "SPICE_REMOVE_HF_TOKEN=${token_file}" >> "$GITHUB_ENV"
+          echo "Wrote a job-scoped Hugging Face token for hf-hub to pick up."
+        else
+          echo "::warning::No Hugging Face token available. Downloads will be anonymous, and anonymous requests share a per-IP quota across this whole runner pool — exhausting it surfaces as HTTP 401 or 429 on model files."
+        fi
