@@ -2168,6 +2168,29 @@ mod tests {
         }
     }
 
+    /// `PDFium` decodes a `#` escape whatever its two digits are, reading a
+    /// digit that is not hex as 0, so `/Decode#5zarms` is `/DecodeParms` and
+    /// `/#5zredictor` is `/Predictor` to it. A predictor on the first of two
+    /// Flate stages, hidden behind either spelling, must still fail closed.
+    #[test]
+    fn rejects_a_predictor_behind_a_non_hex_name_escape() {
+        let data = deflate(&deflate(&png_predicted(b"hello world", 1)));
+        for decl in [
+            b"[/FlateDecode /FlateDecode] /Decode#5zarms [<< /Predictor 12 /Columns 1 >> null]"
+                .as_slice(),
+            b"[/FlateDecode /FlateDecode] /DecodeParms [<< /#5zredictor 12 /Columns 1 >> null]"
+                .as_slice(),
+        ] {
+            let pdf = loadable_pdf_with_content_stream(decl, &data);
+            assert_eq!(
+                pdf_too_large_reason(&pdf),
+                UNVERIFIABLE_REASON,
+                "/Filter {}",
+                String::from_utf8_lossy(decl)
+            );
+        }
+    }
+
     /// A predictor with no `/Filter` applies to nothing a reader decodes, but
     /// it is not a shape writers produce, so it fails closed.
     #[test]
