@@ -31,6 +31,8 @@ limitations under the License.
 //! revokes `N` serial numbers, none of them the client's, so every
 //! handshake succeeds after a full revocation lookup.
 
+#![expect(clippy::expect_used)]
+
 use std::{
     sync::Arc,
     time::{Duration, Instant},
