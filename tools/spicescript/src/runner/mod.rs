@@ -727,6 +727,15 @@ async fn run_combination(
             }
         }
         one_duckdb_release(&duckdb_releases)?;
+        // Under a rootless Docker daemon each running container holds a key of
+        // a quota shared with every other job on the host, so a combination
+        // starts its sources only once there is room for all of them, instead
+        // of failing part way through (see `crate::keyquota`).
+        crate::keyquota::wait_for_room(
+            u64::try_from(resolved.len()).unwrap_or(u64::MAX),
+            &format!("the sources of {run_label}"),
+        )
+        .await?;
         for (name, spec, kind, version) in resolved {
             let src = source::start(
                 name,

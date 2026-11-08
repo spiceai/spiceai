@@ -68,6 +68,17 @@ Docker must be running. The `aws` CLI is needed for object-store sources, and
 fetch the DuckDB release they use into `~/.cache/spicescript/` (see
 **DuckDB releases** below).
 
+Under a rootless Docker daemon, every running container holds one kernel key
+charged to the daemon's uid. That uid's quota (`kernel.keys.maxkeys` and
+`kernel.keys.maxbytes`, 200 keys and 20000 bytes by default) is shared with
+everything else running as it on the host, and when it is full runc refuses
+to start a container ("unable to join session keyring … disk quota
+exceeded"). On Linux the runner reads the quota from `/proc/key-users`: a
+matrix combination starts its sources only once there is room for all of
+them, every container start waits for room, and a start refused for the quota
+is retried. A wait is reported in the script's output. After 15 minutes
+without room the script fails, naming the quota and the fix.
+
 | Option | Meaning |
 | --- | --- |
 | `<SCRIPTS>…` | Script files, or directories of `*.yaml` scripts (not their subdirectories, except that `known-failing/` includes its group directories). |
@@ -803,6 +814,7 @@ fails anywhere.
 | `source/document.rs` | Kafka, MongoDB and DynamoDB containers and batched row application. |
 | `source/` | One module per source kind; `mod.rs` holds the `Source` trait. |
 | `docker.rs` | Containers on fixed host ports, so a restarted container keeps its address. |
+| `keyquota.rs` | The kernel key quota a rootless Docker daemon's containers share: waiting for room before starting them. |
 | `ledger.rs` | Expected failures: recording, signatures, judging a run against them. |
 | `compare.rs`, `template.rs` | Answer comparison glue, placeholders and merge patches. |
 | `generate.rs`, `tpch.rs` | Seeded generated tables, TPC-H loading. |

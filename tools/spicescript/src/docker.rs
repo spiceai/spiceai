@@ -37,6 +37,7 @@ use bollard::{
 };
 use futures::StreamExt;
 
+#[derive(Clone)]
 pub struct ContainerSpec {
     pub name: String,
     pub image: String,
@@ -70,7 +71,30 @@ impl Container {
 
     /// Starts a container publishing each port in `host_ports` on the host
     /// port given there, and every other port of `spec` on a free one.
+    ///
+    /// Waits for room in the kernel key quota first, and retries a start that
+    /// runc refused because the quota filled meanwhile (see [`crate::keyquota`]).
     pub async fn start_on(spec: ContainerSpec, host_ports: HashMap<u16, u16>) -> Result<Self> {
+        let mut attempt = 1;
+        loop {
+            crate::keyquota::wait_for_room(1, &format!("container {}", spec.name)).await?;
+            match Self::start_once(spec.clone(), host_ports.clone()).await {
+                Err(e)
+                    if attempt < QUOTA_ATTEMPTS
+                        && crate::keyquota::is_quota_error(&format!("{e:#}")) =>
+                {
+                    crate::runner::emit(&format!(
+                        "   the kernel key quota was full starting {}; waiting for room and trying again ({attempt} of {QUOTA_ATTEMPTS} attempts made)",
+                        spec.name
+                    ));
+                    attempt += 1;
+                }
+                result => return result,
+            }
+        }
+    }
+
+    async fn start_once(spec: ContainerSpec, host_ports: HashMap<u16, u16>) -> Result<Self> {
         anyhow::ensure!(
             !crate::cleanup::shutting_down(),
             "not starting container {}: the run is shutting down",
@@ -710,6 +734,10 @@ fn pull_error_text(err: &bollard::errors::Error) -> String {
 /// host) can take longer than the client's request timeout, and creating the
 /// container again usually succeeds.
 const CREATE_ATTEMPTS: u32 = 5;
+/// Starts of one container refused for a full kernel key quota before the
+/// failure is reported. Each waits for room first, so the quota filling again
+/// between that check and runc is what this rides out.
+const QUOTA_ATTEMPTS: u32 = 5;
 
 /// How long to wait before trying again after Docker did not answer in time,
 /// and between lookups of a container a timed-out attempt created.
