@@ -35,10 +35,13 @@ use rcgen::{
 };
 use runtime_tls::{ClientAuthEnforcement, ClientTrustPaths, ClientTrustPem, TlsConfig, TlsControl};
 use rustls::{
-    CertificateError, ClientConfig, RootCertStore, ServerConfig,
+    CertificateError, ClientConfig, HandshakeKind, RootCertStore, ServerConfig,
     pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer, ServerName, pem::PemObject},
 };
-use tokio::net::{TcpListener, TcpStream};
+use tokio::{
+    io::{AsyncReadExt, AsyncWriteExt},
+    net::{TcpListener, TcpStream},
+};
 use tokio_rustls::{TlsAcceptor, TlsConnector};
 
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
@@ -53,14 +56,18 @@ fn install_crypto_provider() {
     );
 }
 
-/// A certificate authority that issues client certificates and signs CRLs.
+/// A certificate authority that issues client certificates and signs CRLs:
+/// a self-signed root, or an intermediate that a root issued.
 struct Ca {
     issuer: Issuer<'static, KeyPair>,
     cert_pem: String,
+    /// The certificates between this CA and its root (this CA first), which
+    /// a client presents after its own certificate. Empty for a root.
+    intermediates: Vec<CertificateDer<'static>>,
 }
 
 impl Ca {
-    fn new(name: &str) -> Self {
+    fn ca_params(name: &str) -> CertificateParams {
         let mut params = CertificateParams::default();
         params.distinguished_name = DistinguishedName::new();
         params.distinguished_name.push(DnType::CommonName, name);
@@ -70,11 +77,34 @@ impl Ca {
             KeyUsagePurpose::KeyCertSign,
             KeyUsagePurpose::CrlSign,
         ];
+        params
+    }
+
+    fn new(name: &str) -> Self {
+        let params = Self::ca_params(name);
         let key = KeyPair::generate().expect("generate CA key");
         let cert = params.self_signed(&key).expect("self-sign CA");
         Self {
             issuer: Issuer::new(params, key),
             cert_pem: cert.pem(),
+            intermediates: Vec::new(),
+        }
+    }
+
+    /// An intermediate CA that this CA issues with serial number `serial`.
+    fn intermediate(&self, name: &str, serial: u64) -> Self {
+        let mut params = Self::ca_params(name);
+        params.serial_number = Some(SerialNumber::from(serial));
+        let key = KeyPair::generate().expect("generate intermediate key");
+        let cert = params
+            .signed_by(&key, &self.issuer)
+            .expect("CA signs the intermediate");
+        let mut intermediates = vec![cert.der().clone()];
+        intermediates.extend(self.intermediates.iter().cloned());
+        Self {
+            issuer: Issuer::new(params, key),
+            cert_pem: cert.pem(),
+            intermediates,
         }
     }
 
@@ -95,6 +125,7 @@ impl Ca {
         Leaf {
             cert_der: cert.der().clone(),
             cert_pem: cert.pem(),
+            intermediates: self.intermediates.clone(),
             key_der: key.serialize_der(),
             key_pem: key.serialize_pem(),
         }
@@ -146,6 +177,8 @@ impl Ca {
 struct Leaf {
     cert_der: CertificateDer<'static>,
     cert_pem: String,
+    /// The intermediate CA certificates the client presents after its own.
+    intermediates: Vec<CertificateDer<'static>>,
     key_der: Vec<u8>,
     key_pem: String,
 }
@@ -155,9 +188,36 @@ struct Leaf {
 /// rustls error it rejected the client with.
 type Verdict = Result<Option<CertificateDer<'static>>, rustls::Error>;
 
-/// Handshake `client` (or a client presenting no certificate) against
-/// `server_config` over loopback, and return the server's verdict.
-async fn handshake(server_config: &Arc<ServerConfig>, ca: &Ca, client: Option<&Leaf>) -> Verdict {
+/// A client that trusts `ca`'s root and presents `client` (or no
+/// certificate). It keeps the session tickets it receives, so a second
+/// connection with the same config offers to resume the first one's session.
+fn client_config(ca: &Ca, client: Option<&Leaf>) -> Arc<ClientConfig> {
+    let mut roots = RootCertStore::empty();
+    roots
+        .add(CertificateDer::from_pem_slice(ca.cert_pem.as_bytes()).expect("CA certificate PEM"))
+        .expect("trust the CA");
+    let builder = ClientConfig::builder().with_root_certificates(roots);
+    Arc::new(match client {
+        Some(leaf) => builder
+            .with_client_auth_cert(
+                std::iter::once(leaf.cert_der.clone())
+                    .chain(leaf.intermediates.iter().cloned())
+                    .collect(),
+                PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(leaf.key_der.clone())),
+            )
+            .expect("client identity"),
+        None => builder.with_no_client_auth(),
+    })
+}
+
+/// Connect with `client_config` to `server_config` over loopback and return
+/// the server's verdict and whether it resumed a session. On success the
+/// server sends one byte and the client reads it, so the client has also
+/// read the session tickets the server sends right after the handshake.
+async fn exchange(
+    server_config: &Arc<ServerConfig>,
+    client_config: &Arc<ClientConfig>,
+) -> (Verdict, Option<HandshakeKind>) {
     let listener = TcpListener::bind("127.0.0.1:0")
         .await
         .expect("bind loopback");
@@ -166,49 +226,55 @@ async fn handshake(server_config: &Arc<ServerConfig>, ca: &Ca, client: Option<&L
     let acceptor = TlsAcceptor::from(Arc::clone(server_config));
     let server = async move {
         let (tcp, _) = listener.accept().await.expect("accept TCP");
-        acceptor.accept(tcp).await
+        match acceptor.accept(tcp).await {
+            Ok(mut stream) => {
+                let (_, conn) = stream.get_ref();
+                let kind = conn.handshake_kind();
+                let peer = conn
+                    .peer_certificates()
+                    .and_then(|certs| certs.first())
+                    .map(|cert| cert.clone().into_owned());
+                stream.write_all(b"x").await.expect("server writes");
+                stream.flush().await.expect("server flushes");
+                (Ok(peer), kind)
+            }
+            Err(err) => (
+                Err(err
+                    .get_ref()
+                    .and_then(|inner| inner.downcast_ref::<rustls::Error>())
+                    .cloned()
+                    .unwrap_or_else(|| {
+                        panic!("server handshake failed without a rustls error: {err}")
+                    })),
+                None,
+            ),
+        }
     };
 
-    let mut roots = RootCertStore::empty();
-    roots
-        .add(CertificateDer::from_pem_slice(ca.cert_pem.as_bytes()).expect("CA certificate PEM"))
-        .expect("trust the CA");
-    let builder = ClientConfig::builder().with_root_certificates(roots);
-    let client_config = match client {
-        Some(leaf) => builder
-            .with_client_auth_cert(
-                vec![leaf.cert_der.clone()],
-                PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(leaf.key_der.clone())),
-            )
-            .expect("client identity"),
-        None => builder.with_no_client_auth(),
-    };
-    let connector = TlsConnector::from(Arc::new(client_config));
+    let connector = TlsConnector::from(Arc::clone(client_config));
     let client = async move {
         let tcp = TcpStream::connect(addr).await.expect("connect TCP");
         let server_name = ServerName::try_from("localhost").expect("server name");
-        // Hold the client side open until the server has decided.
-        connector.connect(server_name, tcp).await
+        // A rejected client sees its handshake or this read fail; only the
+        // server's verdict is asserted.
+        if let Ok(mut stream) = connector.connect(server_name, tcp).await {
+            let mut byte = [0u8; 1];
+            let _ = stream.read_exact(&mut byte).await;
+        }
     };
 
-    let (server_result, _client_result) =
+    let (server_result, ()) =
         tokio::time::timeout(HANDSHAKE_TIMEOUT, async { tokio::join!(server, client) })
             .await
             .expect("handshake finishes within the timeout");
+    server_result
+}
 
-    match server_result {
-        Ok(stream) => Ok(stream
-            .get_ref()
-            .1
-            .peer_certificates()
-            .and_then(|certs| certs.first())
-            .map(|cert| cert.clone().into_owned())),
-        Err(err) => Err(err
-            .get_ref()
-            .and_then(|inner| inner.downcast_ref::<rustls::Error>())
-            .cloned()
-            .unwrap_or_else(|| panic!("server handshake failed without a rustls error: {err}"))),
-    }
+/// Handshake `client` (or a client presenting no certificate) against
+/// `server_config` over loopback with a fresh client, which has no session
+/// to resume, and return the server's verdict.
+async fn handshake(server_config: &Arc<ServerConfig>, ca: &Ca, client: Option<&Leaf>) -> Verdict {
+    exchange(server_config, &client_config(ca, client)).await.0
 }
 
 fn revoked() -> Verdict {
@@ -487,17 +553,7 @@ async fn rotated_crl_file_revokes_without_a_restart() {
     let f = fixture();
     let files = files(&f, &f.ca.crl_pem(&[]));
     let control = TlsControl::new().expect("TLS control");
-    let tls = TlsConfig::try_new_from_paths_with_client_auth_mode(
-        files.cert.clone(),
-        files.key.clone(),
-        Some(ClientTrustPaths {
-            ca: files.ca.clone(),
-            crl: Some(files.crl.clone()),
-        }),
-        ClientAuthEnforcement::Required,
-        &control,
-    )
-    .expect("file-backed TLS config with client CRLs");
+    let tls = file_backed_config(&files, &control);
 
     let flight = &tls.flight_server_config;
     assert_eq!(
@@ -523,17 +579,7 @@ async fn unusable_crl_rotation_keeps_the_previous_crls() {
     let f = fixture();
     let files = files(&f, &f.ca.crl_pem(&[BOB_SERIAL]));
     let control = TlsControl::new().expect("TLS control");
-    let tls = TlsConfig::try_new_from_paths_with_client_auth_mode(
-        files.cert.clone(),
-        files.key.clone(),
-        Some(ClientTrustPaths {
-            ca: files.ca.clone(),
-            crl: Some(files.crl.clone()),
-        }),
-        ClientAuthEnforcement::Required,
-        &control,
-    )
-    .expect("file-backed TLS config with client CRLs");
+    let tls = file_backed_config(&files, &control);
     let flight = &tls.flight_server_config;
 
     // Each of these would disable revocation checking if it were taken to
@@ -580,4 +626,124 @@ fn missing_crl_file_fails_construction() {
         )),
         "unexpected error: {err}"
     );
+}
+
+#[tokio::test]
+async fn every_certificate_in_an_intermediate_chain_is_checked() {
+    let f = fixture();
+    let intermediate = f.ca.intermediate("Spice CRL test intermediate CA", 500);
+    let erin = intermediate.issue("erin", 3001, false);
+    let frank = intermediate.issue("frank", 3002, false);
+    let verdict = async |crls: String, client: &Leaf| {
+        let tls = inline_config(&f, &f.ca.cert_pem, Some(crls.as_bytes()));
+        handshake(&tls.flight_server_config, &f.ca, Some(client)).await
+    };
+
+    // The intermediate revokes frank.
+    let crls = format!("{}{}", f.ca.crl_pem(&[]), intermediate.crl_pem(&[3002]));
+    assert_eq!(verdict(crls.clone(), &erin).await, admitted(&erin));
+    assert_eq!(verdict(crls, &frank).await, revoked());
+
+    // The root revokes the intermediate itself, so everything it issued is
+    // rejected even though its own CRL revokes nothing.
+    let crls = format!("{}{}", f.ca.crl_pem(&[500]), intermediate.crl_pem(&[]));
+    assert_eq!(verdict(crls, &erin).await, revoked());
+
+    // No CRL from the root: the intermediate's revocation status is unknown,
+    // so its clients are rejected.
+    assert_eq!(
+        verdict(intermediate.crl_pem(&[]), &erin).await,
+        unknown_revocation_status()
+    );
+}
+
+fn file_backed_config(files: &Files, control: &TlsControl) -> TlsConfig {
+    TlsConfig::try_new_from_paths_with_client_auth_mode(
+        files.cert.clone(),
+        files.key.clone(),
+        Some(ClientTrustPaths {
+            ca: files.ca.clone(),
+            crl: Some(files.crl.clone()),
+        }),
+        ClientAuthEnforcement::Required,
+        control,
+    )
+    .expect("file-backed TLS config with client CRLs")
+}
+
+#[tokio::test]
+async fn without_crls_a_client_resumes_its_session() {
+    // The control for the two tests below: the harness really resumes a
+    // session, on every listener, when no CRLs are configured.
+    let f = fixture();
+    let files = files(&f, &f.ca.crl_pem(&[]));
+    let control = TlsControl::new().expect("TLS control");
+    let tls = TlsConfig::try_new_from_paths_with_client_auth_mode(
+        files.cert.clone(),
+        files.key.clone(),
+        Some(ClientTrustPaths::ca_only(files.ca.clone())),
+        ClientAuthEnforcement::Required,
+        &control,
+    )
+    .expect("file-backed TLS config without client CRLs");
+    for listener in [&tls.flight_server_config, &tls.http_server_config] {
+        let bob = client_config(&f.ca, Some(&f.bob));
+        assert_eq!(
+            exchange(listener, &bob).await,
+            (admitted(&f.bob), Some(HandshakeKind::Full))
+        );
+        assert_eq!(
+            exchange(listener, &bob).await,
+            (admitted(&f.bob), Some(HandshakeKind::Resumed))
+        );
+    }
+}
+
+#[tokio::test]
+async fn with_crls_every_connection_verifies_the_client_certificate() {
+    // A resumed session restores the certificate it was established with
+    // instead of verifying it again, so with CRLs no session is resumed.
+    let f = fixture();
+    let files = files(&f, &f.ca.crl_pem(&[]));
+    let control = TlsControl::new().expect("TLS control");
+    let tls = file_backed_config(&files, &control);
+    for listener in [&tls.flight_server_config, &tls.http_server_config] {
+        let bob = client_config(&f.ca, Some(&f.bob));
+        for _ in 0..2 {
+            assert_eq!(
+                exchange(listener, &bob).await,
+                (admitted(&f.bob), Some(HandshakeKind::Full))
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn revoked_certificate_cannot_resume_a_session_from_before_the_revocation() {
+    // A resumed session skips client certificate verification, so a session
+    // established before a revocation must not survive the CRL reload.
+    let f = fixture();
+    let files = files(&f, &f.ca.crl_pem(&[]));
+    let control = TlsControl::new().expect("TLS control");
+    let tls = file_backed_config(&files, &control);
+    let listeners = [
+        (
+            &tls.flight_server_config,
+            client_config(&f.ca, Some(&f.bob)),
+        ),
+        (&tls.http_server_config, client_config(&f.ca, Some(&f.bob))),
+    ];
+    for (listener, bob) in &listeners {
+        assert_eq!(
+            exchange(listener, bob).await,
+            (admitted(&f.bob), Some(HandshakeKind::Full))
+        );
+    }
+
+    write(&files.crl, f.ca.crl_pem(&[BOB_SERIAL]));
+    tls.force_reload_for_tests();
+
+    for (listener, bob) in &listeners {
+        assert_eq!(exchange(listener, bob).await, (revoked(), None));
+    }
 }

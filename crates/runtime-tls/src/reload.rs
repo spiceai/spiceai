@@ -179,6 +179,8 @@ pub struct ReloadableServerCerts {
     /// enabled. `None` when the verifier was built from inline bytes (or
     /// when no client auth is configured).
     client_trust_paths: Option<ClientTrustPaths>,
+    /// Whether the client verifiers check certificate revocation lists.
+    checks_revocation: bool,
 }
 
 impl ReloadableServerCerts {
@@ -216,6 +218,7 @@ impl ReloadableServerCerts {
         scope: ReloadScope,
     ) -> Result<Arc<Self>, ReloadError> {
         let certified = build_certified_key(cert_pem, key_pem)?;
+        let checks_revocation = client_trust.is_some_and(|trust| trust.crl.is_some());
         let (verifier_swap, verifier_swap_lax) = match client_trust {
             Some(trust) => {
                 let verifiers = ClientVerifiers::build(trust.ca, trust.crl)?;
@@ -235,6 +238,7 @@ impl ReloadableServerCerts {
             cert_path: None,
             key_path: None,
             client_trust_paths: None,
+            checks_revocation,
         }))
     }
 
@@ -307,6 +311,9 @@ impl ReloadableServerCerts {
             cert_path: Some(cert_path.clone()),
             key_path: Some(key_path.clone()),
             client_trust_paths: client_trust.clone(),
+            checks_revocation: client_trust
+                .as_ref()
+                .is_some_and(|trust| trust.crl.is_some()),
         });
 
         let weak = Arc::downgrade(&this);
@@ -524,6 +531,15 @@ impl ReloadableServerCerts {
     #[must_use]
     pub fn client_verifier_lax(&self) -> Option<Arc<dyn ClientCertVerifier>> {
         Some(shim_for(self.verifier_swap_lax.as_ref()?))
+    }
+
+    /// Whether the client verifiers check certificate revocation lists.
+    /// When they do, the listeners must not resume TLS sessions: a resumed
+    /// session restores the client certificate it was established with
+    /// instead of verifying it again, so it would outlive a revocation.
+    #[must_use]
+    pub fn checks_revocation(&self) -> bool {
+        self.checks_revocation
     }
 }
 

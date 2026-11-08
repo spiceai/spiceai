@@ -113,6 +113,11 @@ impl TlsControl {
 ///
 /// When `client_auth_mode` is unset, both fields point at an identical
 /// `with_no_client_auth()` config.
+///
+/// When certificate revocation lists accompany the client CA bundle, both
+/// listeners reject revoked client certificates and resume no TLS sessions:
+/// a resumed session restores its client certificate without verifying it
+/// again, so it would outlive a revocation.
 pub struct TlsConfig {
     /// rustls config used by the Flight listener. Under
     /// `client_auth_mode: required` this enforces client-cert
@@ -384,7 +389,21 @@ fn build_server_configs(
     let mut http = http;
     configure_alpn(&mut flight);
     configure_alpn(&mut http);
+    if enforcement != ClientAuthEnforcement::Disabled && resolver.checks_revocation() {
+        disable_resumption(&mut flight);
+        disable_resumption(&mut http);
+    }
     (flight, http)
+}
+
+/// Turn off TLS session resumption. A resumed session restores the client
+/// certificate it was established with instead of verifying it again, so a
+/// client whose certificate was revoked after its first handshake could keep
+/// resuming with it. Every connection then verifies the client certificate
+/// against the current CRLs.
+fn disable_resumption(config: &mut ServerConfig) {
+    config.session_storage = Arc::new(rustls::server::NoServerSessionStorage {});
+    config.send_tls13_tickets = 0;
 }
 
 fn enforcement_from(has_client_auth: bool) -> ClientAuthEnforcement {
