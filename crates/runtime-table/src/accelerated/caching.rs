@@ -17,6 +17,7 @@ limitations under the License.
 use std::fmt;
 use std::sync::Arc;
 use std::sync::LazyLock;
+use std::sync::OnceLock;
 use std::sync::atomic::AtomicI64;
 use std::time::{Duration, SystemTime};
 
@@ -96,6 +97,8 @@ pub struct InFlightFetch {
     limit: Option<usize>,
     /// The leader's published [`FetchState`].
     state: watch::Receiver<FetchState>,
+    /// When the leader published its result; unset while it is still fetching.
+    published_at: Arc<OnceLock<tokio::time::Instant>>,
 }
 
 impl InFlightFetch {
@@ -114,6 +117,28 @@ impl InFlightFetch {
             (Some(_), None) => false,
             (Some(fetched), Some(wanted)) => wanted <= fetched,
         }
+    }
+
+    /// Whether a lookup that started at `lookup_started_at`, under a
+    /// `caching_ttl` of `max_age`, may replay this fetch rather than ask the
+    /// origin itself: only if the fetch's result was published no earlier than
+    /// `max_age` before the lookup started.
+    ///
+    /// A fetch still in flight, or one that published while the lookup was
+    /// already under way, is shared at any TTL: its answer is no older than the
+    /// lookup, and lookups made together ask the origin once. A result published
+    /// before the lookup started is a stored answer by then, and is replayed
+    /// only while it is within the TTL, as a cached entry would be. The map keeps
+    /// a published result until the leader's write lands, which cache-write
+    /// batching can defer for hundreds of milliseconds; without this, a
+    /// `caching_ttl: 0s` lookup in that window would serve an answer fetched
+    /// before it was made, which the origin may have changed since (#16148).
+    fn replayable_for(&self, lookup_started_at: tokio::time::Instant, max_age: Duration) -> bool {
+        self.published_at.get().is_none_or(|published_at| {
+            published_at
+                .checked_add(max_age)
+                .is_none_or(|fresh_until| fresh_until >= lookup_started_at)
+        })
     }
 }
 
@@ -184,6 +209,8 @@ pub struct CacheKeyClaim {
     queued: bool,
     input_charge: Option<Arc<RetainedBufferCharge>>,
     proven_fresh: bool,
+    /// The map entry's publish time, set when a result is published.
+    published_at: Arc<OnceLock<tokio::time::Instant>>,
 }
 
 impl CacheKeyClaim {
@@ -208,7 +235,15 @@ impl CacheKeyClaim {
             return ClaimOutcome::Follower(fetch);
         }
         let (sender, state) = watch::channel(FetchState::Pending);
-        guard.insert(key.clone(), InFlightFetch { limit, state });
+        let published_at = Arc::new(OnceLock::new());
+        guard.insert(
+            key.clone(),
+            InFlightFetch {
+                limit,
+                state,
+                published_at: Arc::clone(&published_at),
+            },
+        );
         drop(guard);
         ClaimOutcome::Leader(Self {
             key,
@@ -218,6 +253,7 @@ impl CacheKeyClaim {
             queued: false,
             input_charge: None,
             proven_fresh: false,
+            published_at,
         })
     }
 
@@ -241,6 +277,8 @@ impl CacheKeyClaim {
         charge: Option<Arc<RetainedBufferCharge>>,
     ) {
         self.input_charge.clone_from(&charge);
+        // Before the result, so a follower that sees it also sees when it came.
+        let _ = self.published_at.set(tokio::time::Instant::now());
         self.sender.send_replace(FetchState::Ready(batches, charge));
         self.published = true;
     }
@@ -2651,6 +2689,9 @@ impl CacheRefreshHelper {
     ///   the write lands, so a reader whose observation of the cache is made
     ///   stale by a concurrent replacement cannot append beside it. See
     ///   [`CacheKeyClaim`].
+    /// * `lookup_started_at` - When the lookup this miss serves began. With
+    ///   `max_age`, it bounds which already-published fetch the miss may replay
+    ///   ([`InFlightFetch::replayable_for`]).
     #[expect(clippy::too_many_arguments)]
     async fn handle_cache_miss(
         federated: Arc<dyn TableProvider>,
@@ -2669,6 +2710,7 @@ impl CacheRefreshHelper {
         batch_write_tx: CacheWriteSender,
         namespace: CacheNamespace,
         in_flight_revalidations: InFlightRevalidations,
+        lookup_started_at: tokio::time::Instant,
     ) -> SendableRecordBatchStream {
         // Claimed before the origin is asked, not after: see [`CacheKeyClaim`]
         // for why the window this covers has to include the fetch. A caller that
@@ -2696,6 +2738,13 @@ impl CacheRefreshHelper {
                     max_age,
                     expired_batches,
                 };
+                if !in_flight.replayable_for(lookup_started_at, max_age) {
+                    tracing::debug!(
+                        "Cache miss for dataset {dataset_name} found a finished fetch for the same key older than its `caching_ttl` ({max_age:?}); fetching for itself"
+                    );
+                    drop(in_flight);
+                    return own_fetch.run().await;
+                }
                 if in_flight.serves(limit) {
                     return Self::follow_cache_miss(in_flight.state, own_fetch).await;
                 }
@@ -3441,6 +3490,9 @@ impl ExecutionPlan for CachingAccelerationScanExec {
         partition: usize,
         context: Arc<TaskContext>,
     ) -> DataFusionResult<SendableRecordBatchStream> {
+        // The lookup begins here, before any read: a fetch that published its
+        // result after this point answered this lookup at any TTL.
+        let lookup_started_at = tokio::time::Instant::now();
         tracing::debug!(
             "CachingAccelerationScanExec::execute called for dataset={} partition={partition}",
             self.dataset_name
@@ -3523,6 +3575,7 @@ impl ExecutionPlan for CachingAccelerationScanExec {
                     batch_write_tx,
                     namespace,
                     in_flight_revalidations,
+                    lookup_started_at,
                 )
                 .await
             })
@@ -3649,6 +3702,7 @@ impl ExecutionPlan for CachingAccelerationScanExec {
                             batch_write_tx.clone(),
                             namespace,
                             Arc::clone(&in_flight_revalidations),
+                            lookup_started_at,
                         )
                         .await;
                     }
@@ -3710,13 +3764,16 @@ impl ExecutionPlan for CachingAccelerationScanExec {
                     false,                  // is_expired = false, will insert (append)
                     response_filtered,
                     StaleIfError::Disabled, // no cached entry to fall back to
-                    max_age.unwrap_or_default(), // unused: no expired batches
+                    // No expired batches to measure; bounds which in-flight
+                    // fetch this miss may replay.
+                    effective_max_age(max_age),
                     None,                   // no expired batches
                     &io_runtime,
                     synchronized_children,
                     batch_write_tx,
                     namespace,
                     Arc::clone(&in_flight_revalidations),
+                    lookup_started_at,
                 )
                 .await
             }
@@ -5399,6 +5456,7 @@ mod tests {
         let fetch = |limit| InFlightFetch {
             limit,
             state: watch::channel(FetchState::Pending).1,
+            published_at: Arc::new(OnceLock::new()),
         };
 
         assert!(fetch(None).serves(None));
@@ -6399,6 +6457,7 @@ mod tests {
             batch_write_tx.clone(),
             CacheNamespace::Public,
             Arc::clone(&in_flight),
+            tokio::time::Instant::now(),
         )
         .await;
 
@@ -6441,6 +6500,7 @@ mod tests {
             batch_write_tx,
             CacheNamespace::Public,
             Arc::clone(&in_flight),
+            tokio::time::Instant::now(),
         )
         .await;
 
@@ -6535,6 +6595,7 @@ mod tests {
             batch_write_tx,
             CacheNamespace::Public,
             Arc::clone(&in_flight),
+            tokio::time::Instant::now(),
         )
         .await;
 
@@ -6584,6 +6645,7 @@ mod tests {
             batch_write_tx,
             CacheNamespace::Public,
             Arc::clone(&in_flight),
+            tokio::time::Instant::now(),
         )
         .await;
 
@@ -6697,6 +6759,7 @@ mod tests {
             batch_write_tx,
             CacheNamespace::Public,
             Arc::clone(&in_flight),
+            tokio::time::Instant::now(),
         )
         .await;
 
@@ -6868,6 +6931,7 @@ mod tests {
             batch_write_tx,
             CacheNamespace::Public,
             Arc::clone(&in_flight),
+            tokio::time::Instant::now(),
         )
         .await;
 
@@ -7042,9 +7106,100 @@ mod tests {
 
     /// A reader that coalesces onto a fetch already in flight (a follower)
     /// replays the leader's published batches and never writes — so a key can
-    /// never hold two copies of the same response.
+    /// never hold two copies of the same response. The result is published, so
+    /// it is replayed only within the dataset's `caching_ttl` (here an hour).
     #[tokio::test]
     async fn a_follower_replays_the_leaders_batches_and_does_not_write() {
+        use futures::StreamExt;
+
+        let http_source = Arc::new(MockHttpTableProvider::with_status(200, "body"));
+        let schema = http_source.schema();
+        let accelerator = Arc::new(MockAcceleratorTableProvider::new(
+            Arc::clone(&schema),
+            vec![],
+        ));
+        let in_flight: InFlightRevalidations =
+            Arc::new(parking_lot::Mutex::new(std::collections::HashMap::new()));
+        let (batch_write_tx, handle) = spawn_test_cache_write_consumer(&accelerator, &in_flight);
+
+        // Stand in for the leader: it holds the claim for this key and has
+        // already published its fetched batches, exactly as the miss path does
+        // before it enqueues the write.
+        let filters = vec![col("content").eq(lit("test"))];
+        let key = compute_cache_key_from_filters_and_namespace(
+            &filters,
+            CacheNamespace::Public.storage_id(),
+        );
+        let mut leader = leader_claim(&in_flight, &key);
+        let published = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![
+                Arc::new(StringArray::from(vec!["/leader"])) as ArrayRef,
+                Arc::new(StringArray::from(vec![""])) as ArrayRef,
+                Arc::new(StringArray::from(vec!["leader-body"])) as ArrayRef,
+                Arc::new(UInt16Array::from(vec![200_u16])) as ArrayRef,
+                Arc::new(TimestampNanosecondArray::from(vec![Some(0_i64)])) as ArrayRef,
+            ],
+        )
+        .expect("leader batch");
+        leader.publish_ready(Arc::new(vec![published]));
+
+        let mut stream = CacheRefreshHelper::handle_cache_miss(
+            Arc::clone(&http_source) as Arc<dyn TableProvider>,
+            &test_session_state(),
+            "test_dataset",
+            &filters,
+            None,
+            Arc::clone(&schema),
+            false,
+            false,
+            StaleIfError::Disabled,
+            Duration::from_secs(3600),
+            None,
+            &tokio::runtime::Handle::current(),
+            Arc::new(vec![].into()),
+            batch_write_tx,
+            CacheNamespace::Public,
+            Arc::clone(&in_flight),
+            tokio::time::Instant::now(),
+        )
+        .await;
+
+        // The follower is served the leader's published row, not the origin's.
+        let mut served = Vec::new();
+        while let Some(batch) = stream.next().await {
+            served.push(batch.expect("stream"));
+        }
+        let rows: usize = served.iter().map(RecordBatch::num_rows).sum();
+        assert_eq!(rows, 1, "the follower replays the leader's one row");
+        let content = served[0]
+            .column_by_name("content")
+            .and_then(|c| c.as_any().downcast_ref::<StringArray>())
+            .expect("content column");
+        assert_eq!(
+            content.value(0),
+            "leader-body",
+            "the follower must replay the leader's batches, not fetch its own"
+        );
+
+        drop(stream);
+        drop(leader);
+        // The follower's sender went with the miss, so the writer flushes
+        // anything ever enqueued and exits.
+        await_writer_exit(handle).await;
+
+        assert!(
+            accelerator.get_data().is_empty(),
+            "the follower must not write a second copy of the response"
+        );
+    }
+
+    /// Under `caching_ttl: 0s` a miss that finds a fetch whose result is already
+    /// published (its write not yet landed) asks the origin itself: replaying
+    /// it would serve an answer fetched before the lookup (#16148). Holding no
+    /// claim, it still never writes.
+    #[tokio::test]
+    async fn a_zero_ttl_miss_does_not_replay_a_published_fetch() {
         use futures::StreamExt;
 
         let http_source = Arc::new(MockHttpTableProvider::with_status(200, "body"));
@@ -7096,24 +7251,25 @@ mod tests {
             batch_write_tx,
             CacheNamespace::Public,
             Arc::clone(&in_flight),
+            tokio::time::Instant::now(),
         )
         .await;
 
-        // The follower is served the leader's published row, not the origin's.
+        // The miss is served the origin's row, not the leader's published one.
         let mut served = Vec::new();
         while let Some(batch) = stream.next().await {
             served.push(batch.expect("stream"));
         }
         let rows: usize = served.iter().map(RecordBatch::num_rows).sum();
-        assert_eq!(rows, 1, "the follower replays the leader's one row");
+        assert_eq!(rows, 1, "the miss serves the origin's one row");
         let content = served[0]
             .column_by_name("content")
             .and_then(|c| c.as_any().downcast_ref::<StringArray>())
             .expect("content column");
         assert_eq!(
             content.value(0),
-            "leader-body",
-            "the follower must replay the leader's batches, not fetch its own"
+            "body",
+            "a zero-TTL miss must ask the origin, not replay a finished fetch"
         );
 
         drop(stream);
@@ -7124,7 +7280,7 @@ mod tests {
 
         assert!(
             accelerator.get_data().is_empty(),
-            "the follower must not write a second copy of the response"
+            "a miss without the claim must not write"
         );
     }
 
@@ -7175,6 +7331,7 @@ mod tests {
                 batch_write_tx.clone(),
                 CacheNamespace::Public,
                 Arc::clone(&in_flight),
+                tokio::time::Instant::now(),
             )
         };
 
@@ -7260,6 +7417,7 @@ mod tests {
                 batch_write_tx.clone(),
                 CacheNamespace::Public,
                 Arc::clone(&in_flight),
+                tokio::time::Instant::now(),
             )
         };
 
@@ -7334,6 +7492,7 @@ mod tests {
                 batch_write_tx.clone(),
                 CacheNamespace::Public,
                 Arc::clone(&in_flight),
+                tokio::time::Instant::now(),
             )
         };
 
@@ -7434,6 +7593,7 @@ mod tests {
                 batch_write_tx.clone(),
                 CacheNamespace::Public,
                 Arc::clone(&in_flight),
+                tokio::time::Instant::now(),
             )
             .await,
         )
@@ -7557,6 +7717,7 @@ mod tests {
                 batch_write_tx,
                 CacheNamespace::Public,
                 Arc::clone(&in_flight),
+                tokio::time::Instant::now(),
             )
             .await,
         )
@@ -7797,6 +7958,7 @@ mod tests {
             batch_write_tx,
             CacheNamespace::Public,
             Arc::clone(&in_flight),
+            tokio::time::Instant::now(),
         )
         .await;
 
@@ -7934,6 +8096,7 @@ mod tests {
             batch_write_tx,
             CacheNamespace::Public,
             Arc::clone(&in_flight),
+            tokio::time::Instant::now(),
         )
         .await;
 
