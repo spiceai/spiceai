@@ -272,9 +272,11 @@ fn audience_beside_file(
     }
 }
 
-/// The workload's cloud identity as a source of identity tokens for `audience`, trying AWS (when
-/// the AWS credential chain finds credentials), then the Google Cloud metadata server, then the
-/// workload's Microsoft Entra identity. `component` names what the tokens authenticate.
+/// The workload's cloud identity as a source of identity tokens for `audience`, trying AWS, then
+/// the Google Cloud metadata server, then the workload's Microsoft Entra identity. Each is chosen
+/// only once it issues a token for `audience`, so credentials that cannot get one, such as AWS
+/// credentials without `sts:GetWebIdentityToken`, pass to the next. `component` names what the
+/// tokens authenticate.
 ///
 /// # Errors
 ///

@@ -20,8 +20,8 @@ limitations under the License.
 //! identity federation once, and the role needs `sts:GetWebIdentityToken`.
 
 use async_trait::async_trait;
-use aws_config::Region;
 use aws_config::meta::region::RegionProviderChain;
+use aws_config::{Region, SdkConfig};
 use aws_sdk_sts::error::ProvideErrorMetadata;
 use aws_sdk_sts::operation::get_web_identity_token::GetWebIdentityTokenError;
 use aws_smithy_runtime_api::client::result::SdkError;
@@ -44,26 +44,38 @@ pub struct AwsWebIdentityToken {
 
 impl AwsWebIdentityToken {
     /// The workload's AWS identity for tokens of `audience`, when the AWS credential chain finds
-    /// credentials. The region is the configured one (`AWS_REGION`, the profile), or
-    /// `us-east-1`.
+    /// credentials and STS issues them a token for it. The region is the configured one
+    /// (`AWS_REGION`, the profile), or `us-east-1`.
     ///
     /// # Errors
     ///
-    /// When the chain finds no credentials, with each link tried and what it said.
+    /// When the chain finds no credentials, with each link tried and what it said, or when STS
+    /// refuses them a token, with why and what to grant.
     pub async fn detect(audience: &str) -> Result<Self, String> {
         let config = default_aws_config()
             .region(RegionProviderChain::default_provider().or_else(Region::new(DEFAULT_REGION)))
             .load()
             .await;
+        Self::from_config(&config, audience).await
+    }
+
+    /// The identity of `config`'s credentials, when STS issues them a token for `audience`.
+    /// Credentials alone do not say it will: the account may not have enabled outbound web
+    /// identity federation, or the role may lack `sts:GetWebIdentityToken`. So one token is
+    /// requested here, and the workload's next cloud identity is tried when it is refused, as the
+    /// Google Cloud and Azure identities are tried only once they issue one.
+    async fn from_config(config: &SdkConfig, audience: &str) -> Result<Self, String> {
         let Some(chain) = config.credentials_provider() else {
             return Err("found no AWS credentials".to_string());
         };
         let credentials_from = credential_source(&chain, "configured AWS credentials").await?;
-        Ok(Self {
-            sts: aws_sdk_sts::Client::new(&config),
+        let source = Self {
+            sts: aws_sdk_sts::Client::new(config),
             audience: audience.to_string(),
             credentials_from,
-        })
+        };
+        source.fetch().await?;
+        Ok(source)
     }
 }
 
@@ -116,5 +128,69 @@ fn refusal<R: std::fmt::Debug>(error: &SdkError<GetWebIdentityTokenError, R>) ->
         format!("AWS refused ({reason}). Grant the workload's role `sts:GetWebIdentityToken`")
     } else {
         format!("AWS refused ({reason})")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::{Arc, Mutex};
+
+    use aws_credential_types::Credentials;
+    use axum::{Router, extract::State, http::StatusCode, routing::post};
+
+    use super::*;
+
+    type Requests = Arc<Mutex<Vec<String>>>;
+
+    /// An STS endpoint that refuses every request as STS refuses `GetWebIdentityToken` to a role
+    /// without the grant, recording each request's body.
+    async fn refusing_sts() -> (String, Requests) {
+        async fn refuse(
+            State(requests): State<Requests>,
+            body: String,
+        ) -> (StatusCode, [(&'static str, &'static str); 1], &'static str) {
+            requests.lock().expect("lock").push(body);
+            (
+                StatusCode::FORBIDDEN,
+                [("content-type", "text/xml")],
+                r#"<ErrorResponse xmlns="https://sts.amazonaws.com/doc/2011-06-15/"><Error><Type>Sender</Type><Code>AccessDenied</Code><Message>User: arn:aws:sts::111122223333:assumed-role/spice/i-0 is not authorized to perform: sts:GetWebIdentityToken</Message></Error><RequestId>r-1</RequestId></ErrorResponse>"#,
+            )
+        }
+        let requests = Requests::default();
+        let app = Router::new()
+            .route("/", post(refuse))
+            .with_state(Arc::clone(&requests));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind the mock STS");
+        let address = listener.local_addr().expect("its address");
+        tokio::spawn(async move { axum::serve(listener, app).await });
+        (format!("http://{address}"), requests)
+    }
+
+    /// Credentials alone do not make the AWS identity a source: STS must issue them a token, so
+    /// the next cloud identity is tried when it does not.
+    #[tokio::test]
+    async fn credentials_sts_issues_no_token_are_not_an_identity_token_source() {
+        let (sts, requests) = refusing_sts().await;
+        let config = default_aws_config()
+            .region(Region::new("us-east-1"))
+            .endpoint_url(sts)
+            .credentials_provider(Credentials::new("AKID", "secret", None, None, "static"))
+            .load()
+            .await;
+        assert_eq!(
+            AwsWebIdentityToken::from_config(&config, "https://api.anthropic.com")
+                .await
+                .map(|source| source.describe()),
+            Err("AWS refused (AccessDenied: User: arn:aws:sts::111122223333:assumed-role/spice/i-0 is not authorized to perform: sts:GetWebIdentityToken). Grant the workload's role `sts:GetWebIdentityToken`".to_string())
+        );
+        let requests = requests.lock().expect("lock");
+        assert!(
+            requests.len() == 1
+                && requests[0].contains("Action=GetWebIdentityToken")
+                && requests[0].contains("api.anthropic.com"),
+            "{requests:?}"
+        );
     }
 }

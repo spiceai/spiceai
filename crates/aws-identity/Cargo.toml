@@ -20,6 +20,7 @@ token_provider = { path = "../token_provider" }
 util = { workspace = true, default-features = false, features = [] }
 
 [dev-dependencies]
+axum.workspace = true
 base64.workspace = true
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
 
