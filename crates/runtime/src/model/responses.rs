@@ -17,6 +17,7 @@ limitations under the License.
 use crate::Runtime;
 use crate::model::ToolUsingResponses;
 use crate::model::params::azure::AzureModelParams;
+use crate::model::params::darkbloom::DarkbloomModelParams;
 use crate::model::params::openai::OpenAiModelParams;
 use crate::model::params::xai::XaiModelParams;
 use crate::model::tool_use_responses::OpenAIResponsesTools;
@@ -156,6 +157,13 @@ async fn construct_model(
             let p =
                 typed_params::<XaiModelParams>(component, params, source.clone(), secrets).await?;
             xai(model_id.as_deref(), &p)
+        }
+        ModelSource::Darkbloom => {
+            let p =
+                typed_params::<DarkbloomModelParams>(component, params, source.clone(), secrets)
+                    .await?;
+            super::chat::darkbloom_client(component, model_id, params, &p)
+                .map(|client| Arc::new(client) as Arc<dyn Responses>)
         }
         _ => Err(LlmError::ResponsesNotSupported {
             from: source.clone(),

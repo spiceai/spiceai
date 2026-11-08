@@ -773,16 +773,27 @@ fn spiceai(
     )) as Arc<dyn Chat>)
 }
 
-/// Builds a chat model served by the Darkbloom inference network. Its requests take permits
-/// from a controller built from the model's own rate limits (`max_concurrency`,
-/// `requests_per_minute_limit`, or Darkbloom's defaults), so those limits apply to every
-/// request, not only to the SQL functions that call the model.
+/// Builds a chat model served by the Darkbloom inference network.
 fn darkbloom(
     component: &Model,
     model_id: Option<String>,
     raw_params: &HashMap<String, SecretString>,
     params: &DarkbloomModelParams,
 ) -> Result<Arc<dyn Chat>, LlmError> {
+    Ok(Arc::new(darkbloom_client(component, model_id, raw_params, params)?) as Arc<dyn Chat>)
+}
+
+/// The Darkbloom client of a `from: darkbloom` model, which serves its chat completions and,
+/// natively, the Responses API. Its requests take permits from a controller built from the
+/// model's own rate limits (`max_concurrency`, `requests_per_minute_limit`, or Darkbloom's
+/// defaults), so those limits apply to every request, not only to the SQL functions that call
+/// the model.
+pub(crate) fn darkbloom_client(
+    component: &Model,
+    model_id: Option<String>,
+    raw_params: &HashMap<String, SecretString>,
+    params: &DarkbloomModelParams,
+) -> Result<llms::darkbloom::Darkbloom, LlmError> {
     let Some(model_id) = model_id else {
         return Err(LlmError::ModelNotProvided {
             model_source: ModelSource::Darkbloom.to_string(),
@@ -799,10 +810,10 @@ fn darkbloom(
     // the model: an `ai_*` SQL call holds a permit from that one while it calls the model, so
     // sharing it would take two permits per request from one pool and deadlock under load.
     let rate_controller = super::rate_limit::build_model_rate_controller(component, raw_params);
-    Ok(Arc::new(
+    Ok(
         llms::darkbloom::Darkbloom::new(model_id, api_key, Some(params.endpoint.as_str()))
             .with_rate_controller(rate_controller),
-    ) as Arc<dyn Chat>)
+    )
 }
 
 /// The reason a Darkbloom model without an API key does not load.

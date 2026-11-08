@@ -1,9 +1,11 @@
 name: darkbloom-model
 description: >
   A Darkbloom model (`from: darkbloom:<model_id>`) calls Darkbloom's
-  OpenAI-compatible API with its `darkbloom_api_key` as a bearer token, and
-  serves chat completions and the Responses API with the answer and token usage
-  Darkbloom returned. A stream that fails after its first chunk ends with
+  OpenAI-compatible API with its `darkbloom_api_key` as a bearer token: chat
+  completions go to Darkbloom's `/v1/chat/completions` and the Responses API to
+  its own `/v1/responses`, each with the answer and token usage Darkbloom
+  returned, and `/v1/models` reports the context window and output cap
+  Darkbloom's model listing gives. A stream that fails after its first chunk ends with
   Darkbloom's own error message, not a parse error, and without `[DONE]`. A
   model Darkbloom does not serve fails to load, and the log lists the models
   Darkbloom does serve. A model with no API key or no model id fails to load
@@ -59,13 +61,35 @@ steps:
           headers: { content-type: application/json }
           body: '{"id": "chatcmpl-1", "object": "chat.completion", "created": 1778000000, "model": "gpt-oss-20b", "choices": [{"index": 0, "message": {"role": "assistant", "content": "pong", "reasoning_content": "The user said ping."}, "finish_reason": "stop"}], "usage": {"prompt_tokens": 9, "completion_tokens": 12, "total_tokens": 21, "prompt_tokens_details": {"cached_tokens": 0}, "completion_tokens_details": {"reasoning_tokens": 11}}, "se_signature": "MEUCIQ", "response_hash": "9f86d081", "metadata": {"provider_chip": "M4 Max"}}'
         - |
+          path: /v1/responses
+          method: POST
+          headers-match: { authorization: Bearer eigeninference-spicescript }
+          headers: { content-type: application/json }
+          body: '{"id": "resp_1", "object": "response", "created_at": 1778000000, "model": "gpt-oss-20b", "status": "completed", "output": [{"type": "message", "id": "msg_1", "role": "assistant", "status": "completed", "content": [{"type": "output_text", "annotations": [], "text": "pong"}]}], "usage": {"input_tokens": 9, "input_tokens_details": {"cached_tokens": 0}, "output_tokens": 12, "output_tokens_details": {"reasoning_tokens": 11}, "total_tokens": 21}}'
+        # The model object as Darkbloom's OpenAPI document describes it.
+        - |
           path: /v1/models
           method: GET
           headers-match: { authorization: Bearer eigeninference-spicescript }
           headers: { content-type: application/json }
-          body: '{"object": "list", "data": [{"id": "gpt-oss-20b", "object": "model", "created": 0, "owned_by": "darkbloom"}]}'
+          body: '{"object": "list", "data": [{"id": "gpt-oss-20b", "object": "model", "created": 0, "owned_by": "darkbloom", "context_length": 131072, "max_output_length": 32768, "metadata": {"model_type": "chat", "quantization": "mxfp4", "provider_count": 3, "attested_providers": 3, "trust_level": "hardware", "routable_providers": 3, "warm_providers": 2, "can_accept": true}}]}'
   - source-exec:
+      # The mock answers with the newest matching route first, so the one-shot health-check
+      # answer is added after the stream it gives way to.
       flaky:
+        # Every request after the health check: the first chunk, then Darkbloom's terminal
+        # error event, with no `[DONE]`.
+        - |
+          path: /v1/chat/completions
+          method: POST
+          headers: { content-type: text/event-stream }
+          body: "data: {\"id\":\"chatcmpl-1\",\"object\":\"chat.completion.chunk\",\"created\":1778000000,\"model\":\"gpt-oss-20b\",\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\",\"content\":\"po\"},\"finish_reason\":null}]}\n\ndata: {\"error\":{\"message\":\"provider disconnected mid-stream\",\"type\":\"server_error\",\"code\":\"provider_error\"}}\n\n"
+        # The model's Responses API check when it loads.
+        - |
+          path: /v1/responses
+          method: POST
+          headers: { content-type: application/json }
+          body: '{"id": "resp_0", "object": "response", "created_at": 1778000000, "model": "gpt-oss-20b", "status": "completed", "output": [], "usage": {"input_tokens": 1, "input_tokens_details": {"cached_tokens": 0}, "output_tokens": 0, "output_tokens_details": {"reasoning_tokens": 0}, "total_tokens": 1}}'
         # The model's health check when it loads.
         - |
           path: /v1/chat/completions
@@ -73,13 +97,6 @@ steps:
           times: 1
           headers: { content-type: application/json }
           body: '{"id": "chatcmpl-0", "object": "chat.completion", "created": 1778000000, "model": "gpt-oss-20b", "choices": [{"index": 0, "message": {"role": "assistant", "content": "ok"}, "finish_reason": "stop"}]}'
-        # Every request after it: the first chunk, then Darkbloom's terminal error event, with no
-        # `[DONE]`.
-        - |
-          path: /v1/chat/completions
-          method: POST
-          headers: { content-type: text/event-stream }
-          body: "data: {\"id\":\"chatcmpl-1\",\"object\":\"chat.completion.chunk\",\"created\":1778000000,\"model\":\"gpt-oss-20b\",\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\",\"content\":\"po\"},\"finish_reason\":null}]}\n\ndata: {\"error\":{\"message\":\"provider disconnected mid-stream\",\"type\":\"server_error\",\"code\":\"provider_error\"}}\n\n"
   - source-exec:
       missing:
         - |
@@ -111,7 +128,10 @@ steps:
         - { pointer: /usage/completion_tokens_details/reasoning_tokens, equals: 11 }
     eventually: 60s
 
-  # The Responses API, served by translating the request into a chat completion.
+  # The Responses API, from Darkbloom's own `/v1/responses`: the model's check when it loaded
+  # was the first request there, and this one is the second.
+  - source-query: { api: count /v1/responses }
+    expect: { rows: [['1']] }
   - http:
       method: POST
       path: /v1/responses
@@ -122,6 +142,23 @@ steps:
       json:
         - { pointer: /output/*/content/*/text, equals: pong }
         - { pointer: /usage/output_tokens_details/reasoning_tokens, equals: 11 }
+  - source-query: { api: count /v1/responses }
+    expect: { rows: [['2']] }
+  - source-query: { api: count /v1/chat/completions }
+    expect: { rows: [['2']] }
+
+  # The limits Darkbloom's model listing reports. The listing is read in the background, so
+  # the first answer may not carry them yet.
+  - http:
+      method: GET
+      path: /v1/models
+    expect:
+      status: 200
+      json:
+        - { pointer: /data/0/id, equals: chat }
+        - { pointer: /data/0/context_window, equals: 131072 }
+        - { pointer: /data/0/max_output_tokens, equals: 32768 }
+    eventually: 30s
 
   - http:
       method: POST

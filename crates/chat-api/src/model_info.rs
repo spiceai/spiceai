@@ -57,14 +57,16 @@ pub fn context_window_of(model: &Value) -> Option<u64> {
 ///
 /// - `max_output_tokens`: a common gateway spelling;
 /// - `max_completion_tokens`: `OpenRouter`'s `top_provider`, and gateways modeled on it;
-/// - `outputTokenLimit`: the Gemini API.
+/// - `outputTokenLimit`: the Gemini API;
+/// - `max_output_length`: Darkbloom.
 ///
 /// Anthropic's `max_tokens` is read by its provider alone: elsewhere the name can mean a
 /// request default rather than a cap.
-const MAX_OUTPUT_FIELDS: [&str; 3] = [
+const MAX_OUTPUT_FIELDS: [&str; 4] = [
     "max_output_tokens",
     "max_completion_tokens",
     "outputTokenLimit",
+    "max_output_length",
 ];
 
 /// The output cap `model`, one model object of a provider's model listing, reports: the
@@ -189,6 +191,11 @@ mod tests {
             (
                 json!({"name": "models/m", "inputTokenLimit": 1_048_576, "outputTokenLimit": 65_536}),
                 Some(65_536),
+            ),
+            // Darkbloom, whose window is `context_length`.
+            (
+                json!({"id": "gpt-oss-20b", "object": "model", "context_length": 131_072, "max_output_length": 32_768}),
+                Some(32_768),
             ),
             // A request default some servers list under `max_tokens` is not a cap.
             (json!({"id": "m", "max_tokens": 4_096}), None),

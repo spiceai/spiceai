@@ -128,13 +128,15 @@ impl ModelCapabilities {
 /// provider does not compile until it states its capabilities.
 fn provider_default(provider: ModelSource) -> ModelCapabilities {
     match provider {
-        ModelSource::OpenAi | ModelSource::Azure | ModelSource::Xai => ModelCapabilities {
-            provider,
-            chat: true,
-            responses: true,
-            native_decisions: false,
-            messages: Some(MessagesBackend::ViaChat),
-        },
+        ModelSource::OpenAi | ModelSource::Azure | ModelSource::Xai | ModelSource::Darkbloom => {
+            ModelCapabilities {
+                provider,
+                chat: true,
+                responses: true,
+                native_decisions: false,
+                messages: Some(MessagesBackend::ViaChat),
+            }
+        }
         ModelSource::Anthropic => ModelCapabilities {
             provider,
             chat: true,
@@ -147,8 +149,7 @@ fn provider_default(provider: ModelSource) -> ModelCapabilities {
         | ModelSource::File
         | ModelSource::Google
         | ModelSource::HuggingFace
-        | ModelSource::SpiceAI
-        | ModelSource::Darkbloom => ModelCapabilities {
+        | ModelSource::SpiceAI => ModelCapabilities {
             provider,
             chat: true,
             responses: false,

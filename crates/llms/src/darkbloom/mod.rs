@@ -18,10 +18,11 @@ limitations under the License.
 //! (<https://darkbloom.ai>), which routes each request to an Apple Silicon machine that serves
 //! the model.
 //!
-//! Darkbloom serves an `OpenAI`-compatible API, so models are driven through the shared
-//! [`crate::openai::Openai`] client. What differs is handled here: Darkbloom authenticates with
-//! `Authorization: Bearer`, names a missing model with the error code `model_not_found`, and ends
-//! a stream that fails after its first chunk with an error event rather than an HTTP status.
+//! Darkbloom serves an `OpenAI`-compatible API — chat completions, the Responses API and a model
+//! listing — so models are driven through the shared [`crate::openai::Openai`] client. What
+//! differs is handled here: Darkbloom authenticates with `Authorization: Bearer`, names a missing
+//! model with the error code `model_not_found`, and ends a stream that fails after its first
+//! chunk with an error event rather than an HTTP status.
 
 #![allow(clippy::missing_errors_doc)]
 
@@ -33,6 +34,7 @@ use async_openai::error::{ApiError, OpenAIError, WrappedError};
 use async_openai::types::chat::{
     ChatCompletionResponseStream, CreateChatCompletionRequest, CreateChatCompletionResponse,
 };
+use async_openai::types::responses::{CreateResponse, Response, ResponseStream};
 use async_trait::async_trait;
 use futures::TryStreamExt;
 use runtime_rate_control::RateController;
@@ -42,6 +44,7 @@ use crate::chat::nsql::SqlGeneration;
 use crate::chat::{ApiErrorKind, Chat, Error, TokenLimits};
 use crate::config::HostedModelConfig;
 use crate::openai::{Openai, new_openai_client_with_config};
+use crate::responses::Responses;
 
 /// The base URL of Darkbloom's `OpenAI`-compatible API.
 pub const DEFAULT_ENDPOINT: &str = "https://api.darkbloom.dev/v1";
@@ -62,7 +65,7 @@ pub fn api_base(endpoint: Option<&str>) -> String {
         .to_string()
 }
 
-/// A chat model served by Darkbloom.
+/// A model served by Darkbloom, for chat completions and the Responses API.
 pub struct Darkbloom {
     model: String,
     chat: Openai<HostedModelConfig>,
@@ -119,15 +122,15 @@ fn darkbloom_stream_error(error: OpenAIError) -> OpenAIError {
 #[async_trait]
 impl Chat for Darkbloom {
     fn as_sql(&self) -> Option<&dyn SqlGeneration> {
-        self.chat.as_sql()
+        Chat::as_sql(&self.chat)
     }
 
     async fn run(&self, prompt: String) -> crate::chat::Result<Option<String>> {
-        self.chat.run(prompt).await
+        Chat::run(&self.chat, prompt).await
     }
 
     async fn health(&self) -> crate::chat::Result<()> {
-        match self.chat.health().await {
+        match Chat::health(&self.chat).await {
             Err(Error::HealthCheckError { source })
                 if source.downcast_ref::<OpenAIError>().is_some_and(
                     |e| matches!(e, OpenAIError::ApiError(api) if is_model_not_found(api)),
@@ -148,7 +151,7 @@ impl Chat for Darkbloom {
     ) -> crate::chat::Result<
         std::pin::Pin<Box<dyn futures::Stream<Item = crate::chat::Result<Option<String>>> + Send>>,
     > {
-        self.chat.stream(prompt).await
+        Chat::stream(&self.chat, prompt).await
     }
 
     async fn chat_stream(
@@ -168,6 +171,31 @@ impl Chat for Darkbloom {
 
     async fn token_limits(&self) -> TokenLimits {
         self.chat.token_limits().await
+    }
+}
+
+/// Darkbloom's own Responses API, `POST /v1/responses`.
+#[async_trait]
+impl Responses for Darkbloom {
+    fn as_sql(&self) -> Option<&dyn SqlGeneration> {
+        Responses::as_sql(&self.chat)
+    }
+
+    async fn run(&self, prompt: String) -> crate::responses::Result<Option<String>> {
+        Responses::run(&self.chat, prompt).await
+    }
+
+    async fn health(&self) -> crate::responses::Result<()> {
+        Responses::health(&self.chat).await
+    }
+
+    async fn responses_stream(&self, req: CreateResponse) -> Result<ResponseStream, OpenAIError> {
+        let stream = Responses::responses_stream(&self.chat, req).await?;
+        Ok(Box::pin(stream.map_err(darkbloom_stream_error)))
+    }
+
+    async fn responses_request(&self, req: CreateResponse) -> Result<Response, OpenAIError> {
+        Responses::responses_request(&self.chat, req).await
     }
 }
 
@@ -362,6 +390,108 @@ mod tests {
         assert_eq!(response.choices[0].message.content.as_deref(), Some("pong"));
     }
 
+    /// A Responses API answer as the `OpenAI` Responses API reference shapes it.
+    fn response(text: &str) -> serde_json::Value {
+        json!({
+            "id": "resp_1",
+            "object": "response",
+            "created_at": 1_778_000_000,
+            "model": "gpt-oss-20b",
+            "status": "completed",
+            "output": [{
+                "type": "message",
+                "id": "msg_1",
+                "role": "assistant",
+                "status": "completed",
+                "content": [{"type": "output_text", "annotations": [], "text": text}]
+            }],
+            "usage": {
+                "input_tokens": 9,
+                "input_tokens_details": {"cached_tokens": 0},
+                "output_tokens": 12,
+                "output_tokens_details": {"reasoning_tokens": 11},
+                "total_tokens": 21
+            }
+        })
+    }
+
+    fn create_response(model: &str) -> CreateResponse {
+        async_openai::types::responses::CreateResponseArgs::default()
+            .model(model)
+            .input("ping")
+            .build()
+            .expect("a Responses API request")
+    }
+
+    /// A Responses API request reaches Darkbloom's own `/v1/responses`, with the key as a bearer
+    /// token and the Darkbloom model id.
+    #[tokio::test]
+    async fn a_responses_request_reaches_darkbloom_responses_api() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/responses"))
+            .and(header("authorization", format!("Bearer {KEY}").as_str()))
+            .and(body_partial_json(
+                json!({"model": "gpt-oss-20b", "input": "ping"}),
+            ))
+            .respond_with(ResponseTemplate::new(200).set_body_json(response("pong")))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let endpoint = format!("{}/v1", server.uri());
+        let model = Darkbloom::new("gpt-oss-20b", KEY, Some(&endpoint));
+        let answer = Responses::responses_request(&model, create_response("my_spicepod_model"))
+            .await
+            .expect("the mock answers with a response");
+        assert_eq!(answer.output_text().as_deref(), Some("pong"));
+        let usage = answer.usage.expect("usage is reported");
+        assert_eq!(usage.output_tokens_details.reasoning_tokens, 11);
+    }
+
+    /// A Responses API stream that fails after it starts ends with Darkbloom's error, as for chat.
+    #[tokio::test]
+    async fn a_responses_stream_error_event_is_reported_as_darkbloom_said_it() {
+        let server = MockServer::start().await;
+        let created =
+            json!({"type": "response.created", "sequence_number": 0, "response": response("")});
+        let body = format!(
+            "data: {created}\n\ndata: {{\"error\":{{\"message\":\"provider disconnected mid-stream\",\"type\":\"server_error\",\"code\":\"provider_error\"}}}}\n\n"
+        );
+        Mock::given(method("POST"))
+            .and(path("/v1/responses"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "text/event-stream")
+                    .set_body_string(body),
+            )
+            .mount(&server)
+            .await;
+
+        let endpoint = format!("{}/v1", server.uri());
+        let model = Darkbloom::new("gpt-oss-20b", KEY, Some(&endpoint));
+        let items: Vec<_> = Responses::responses_stream(&model, create_response("m"))
+            .await
+            .expect("the stream opens")
+            .collect()
+            .await;
+
+        assert_eq!(items.len(), 2, "one event, then the error: {items:?}");
+        assert!(
+            items[0].is_ok(),
+            "the first event is response.created: {:?}",
+            items[0]
+        );
+        let Err(OpenAIError::ApiError(error)) = &items[1] else {
+            panic!(
+                "the error event must surface as Darkbloom's error, got {:?}",
+                items[1]
+            );
+        };
+        assert_eq!(error.message, "provider disconnected mid-stream");
+        assert_eq!(error.code.as_deref(), Some("provider_error"));
+    }
+
     #[test]
     fn a_malformed_chunk_that_is_not_an_error_event_is_left_as_it_was() {
         let body = r#"{"id": 1}"#.to_string();
@@ -388,8 +518,7 @@ mod tests {
             .await;
 
         let endpoint = format!("{}/v1", server.uri());
-        let error = Darkbloom::new("no-such-model", KEY, Some(&endpoint))
-            .health()
+        let error = Chat::health(&Darkbloom::new("no-such-model", KEY, Some(&endpoint)))
             .await
             .expect_err("the model does not exist");
         assert_eq!(
@@ -413,8 +542,7 @@ mod tests {
             .await;
 
         let endpoint = format!("{}/v1", server.uri());
-        let error = Darkbloom::new("gpt-oss-20b", KEY, Some(&endpoint))
-            .health()
+        let error = Chat::health(&Darkbloom::new("gpt-oss-20b", KEY, Some(&endpoint)))
             .await
             .expect_err("the key is refused");
         let Error::HealthCheckError { source } = &error else {

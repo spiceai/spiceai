@@ -23,12 +23,14 @@ The parameters all model providers accept also apply, prefixed with `darkbloom_`
 
 ## What Spice serves
 
-- `POST /v1/chat/completions`, streamed and not streamed, and Spice tools.
-- `POST /v1/responses` and `POST /v1/messages`, which Spice translates into chat completions.
+- `POST /v1/chat/completions`, streamed and not streamed, and Spice tools, through Darkbloom's chat completions.
+- `POST /v1/responses`, streamed and not streamed, through Darkbloom's own Responses API.
+- `POST /v1/messages`, which Spice translates into chat completions.
+- `GET /v1/models`, with the context window and output cap that Darkbloom's model listing reports (`context_length`, `max_output_length`).
 - Decisions (`POST /v1/decisions`, `ai_if`, `ai_classify`, and the other decision functions) through chat.
 - The SQL `ai` functions.
 
-When the model loads, Spice sends one short chat completion to check the key and the model. A model id Darkbloom does not serve fails to load, and the log lists the models Darkbloom does serve.
+When the model loads, Spice sends one short chat completion and one short Responses API request to check the key and the model. A model id Darkbloom does not serve fails to load, and the log lists the models Darkbloom does serve. If only the Responses API check fails, the model still serves chat completions, and the log says it is not available on `/v1/responses`.
 
 ## Limitations
 
