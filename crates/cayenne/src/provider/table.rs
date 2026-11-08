@@ -2564,6 +2564,11 @@ pub struct CayenneTableProvider {
     /// a checkpoint in that window. Consumed on first fire.
     #[cfg(test)]
     test_post_prepare_hook: Arc<ParkingMutex<Option<TestPostCaptureHook>>>,
+    /// Test-only seam fired by a mem-tier seal after it captured the active pieces
+    /// and released the capture locks, before it writes the durable shadow, so a
+    /// test can land an apply in that window. Consumed on first fire.
+    #[cfg(test)]
+    test_post_seal_capture_hook: Arc<ParkingMutex<Option<TestPostCaptureHook>>>,
     /// Test-only seam fired by a write that fell back from inline to a new snapshot,
     /// after it wrote the snapshot and before it publishes it with its deletions, so
     /// a test can land a checkpoint in that window. Consumed on first fire.
@@ -10461,6 +10466,8 @@ impl CayenneTableProvider {
             #[cfg(test)]
             test_post_prepare_hook: Arc::new(ParkingMutex::new(None)),
             #[cfg(test)]
+            test_post_seal_capture_hook: Arc::new(ParkingMutex::new(None)),
+            #[cfg(test)]
             test_pre_staged_publish_hook: Arc::new(ParkingMutex::new(None)),
             #[cfg(test)]
             test_post_maintained_aggregate_scan_hook: Arc::new(ParkingMutex::new(None)),
@@ -12919,6 +12926,8 @@ impl CayenneTableProvider {
             test_pre_inline_publish_hook: Arc::clone(&self.test_pre_inline_publish_hook),
             #[cfg(test)]
             test_post_prepare_hook: Arc::clone(&self.test_post_prepare_hook),
+            #[cfg(test)]
+            test_post_seal_capture_hook: Arc::clone(&self.test_post_seal_capture_hook),
             #[cfg(test)]
             test_pre_staged_publish_hook: Arc::clone(&self.test_pre_staged_publish_hook),
             #[cfg(test)]
@@ -31608,6 +31617,16 @@ impl CayenneTableProvider {
         }
     }
 
+    /// Fire (and consume) the test-only post-seal-capture hook, if one is
+    /// installed. See [`Self::test_post_seal_capture_hook`].
+    #[cfg(test)]
+    async fn run_test_post_seal_capture_hook(&self) {
+        let hook = self.test_post_seal_capture_hook.lock().take();
+        if let Some(hook) = hook {
+            hook().await;
+        }
+    }
+
     /// Fire (and consume) the test-only pre-staged-publish hook, if one is
     /// installed. See [`Self::test_pre_staged_publish_hook`].
     #[cfg(test)]
@@ -37095,7 +37114,7 @@ impl CayenneTableProvider {
         // so concurrent applies keep flowing.
         // At N==1 no `write_lock` is taken (a single `ArcSwap` load is already atomic)
         // — byte-identical to the pre-sharding seal.
-        let (shard_snapshots, sealed_through, seal_epoch) = {
+        let (shard_snapshots, sealed_through, seal_epoch, seal_sequence) = {
             let mut guards = Vec::with_capacity(n);
             for lock in self.mem_tier_publish_locks.iter() {
                 guards.push(lock.lock().await);
@@ -37127,13 +37146,26 @@ impl CayenneTableProvider {
                 .filter_map(|s| s.max_source_position_in_prefix(s.segments.len()))
                 .max()
                 .unwrap_or_else(|| shard_snapshots[0].epoch);
+            // ONE seal sequence stamps the inline BLOB rows AND the reinsert stamp.
+            // Reserved under the capture locks, like the checkpoint's snapshot
+            // sequence: every captured segment's sequences are below it and every
+            // later apply's are above it, so a later tombstone still hides the
+            // shadowed row on restart. The allocator's block refill already bumped the
+            // durable `current_sequence_number` past it, so on restart the inline
+            // watermark reseeds above it and the shadow is visible.
+            let seal_sequence = self
+                .reserve_sequences_local(1)
+                .await
+                .map_err(|source| Error::Catalog { source })?;
             drop(guards);
-            (shard_snapshots, sealed_through, seal_epoch)
+            (shard_snapshots, sealed_through, seal_epoch, seal_sequence)
         };
         // Release `write_lock` BEFORE the durable encode/commit so concurrent applies
         // run in parallel with the shadow write (the off-lock seal); everything below
         // reads only the captured immutable snapshots + the reserved seal sequence.
         drop(owned_capture_write_lock.take());
+        #[cfg(test)]
+        self.run_test_post_seal_capture_hook().await;
 
         // === BUILD the union delta from the captured snapshots (off-lock) ===
         // Each shard's active piece as a delta view (tombstone/byte aggregates
@@ -37170,18 +37202,6 @@ impl CayenneTableProvider {
         // PK membership of the (cross-shard) visible rows drives the reinserted-vs-
         // pure tombstone split, same as the checkpoint.
         let corpus_keys = self.checkpoint_corpus_pk_keys(&union_visible)?;
-
-        // ONE seal sequence stamps the inline BLOB rows AND the reinsert stamp.
-        // Reserved AFTER every delta segment's append, so it is strictly above their
-        // `data_sequence`/`delete_sequence` — a re-inserted key's shadow copy (at
-        // `seal_sequence`) survives its own tombstone. The allocator's block refill
-        // already bumped the durable `current_sequence_number` to at least this
-        // value, so on restart the inline watermark reseeds above it and the shadow
-        // is visible (R1: no acked-but-invisible row).
-        let seal_sequence = self
-            .reserve_sequences_local(1)
-            .await
-            .map_err(|source| Error::Catalog { source })?;
 
         // (a) Durable INSERTS → ONE unpublished inline-corpus BLOB over the
         // concatenated cross-shard visible rows. Durable commit only — NO
@@ -53422,6 +53442,79 @@ mod tests {
             vec![(1, 10), (2, 25), (3, 30)],
             "upsert supersession survives seal + restart — new value wins, no resurrection"
         );
+    }
+
+    /// Regression test for #16141: an apply that lands after a seal captured its
+    /// active piece, while the seal writes the durable shadow, must still win over the
+    /// shadow after a crash. Key 2 is deleted and key 3 updated in that window; a
+    /// second seal makes both durable. On restart key 2 must stay deleted and key 3
+    /// must appear once, with its new value — at one shard and across four.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn mem_tier_seal_keeps_applies_that_land_during_the_seal_after_crash() {
+        for shards in [1, 4] {
+            let ctx = SessionContext::new();
+            let runtime_env = ctx.runtime_env();
+            let table = format!("seal_apply_race_{shards}");
+            let (provider, catalog, _tmp) =
+                create_sharded_cdc_upsert_table(&table, Arc::clone(&runtime_env), shards).await;
+            provider.install_slot_advancer(Arc::new(EpochRecorder(Arc::new(
+                std::sync::atomic::AtomicU64::new(0),
+            ))));
+            let schema = Arc::clone(&provider.table_metadata.schema);
+            apply_upsert_burst(
+                &ctx,
+                &provider,
+                Arc::clone(&schema),
+                &[(1, 10), (2, 20), (3, 30)],
+            )
+            .await;
+
+            {
+                let provider_in_hook = provider.clone_for_write();
+                let ctx_in_hook = ctx.clone();
+                let schema_in_hook = Arc::clone(&schema);
+                *provider.test_post_seal_capture_hook.lock() = Some(Box::new(move || {
+                    Box::pin(async move {
+                        absorb_delete_key(&provider_in_hook, 2).await;
+                        apply_upsert_burst(
+                            &ctx_in_hook,
+                            &provider_in_hook,
+                            schema_in_hook,
+                            &[(3, 31)],
+                        )
+                        .await;
+                    })
+                }));
+            }
+            provider
+                .seal_mem_tier_durable()
+                .await
+                .expect("seal the first apply");
+            assert!(
+                provider.test_post_seal_capture_hook.lock().is_none(),
+                "the delete and update landed inside the seal"
+            );
+            provider
+                .seal_mem_tier_durable()
+                .await
+                .expect("seal the delete and update");
+            assert_eq!(
+                collect_id_value_pairs(&ctx, &provider, &table).await,
+                vec![(1, 10), (3, 31)],
+                "shards={shards}: live view"
+            );
+
+            drop(provider);
+            let reopened = CayenneTableProviderBuilder::new(catalog, runtime_env)
+                .open(&table)
+                .await
+                .expect("reopen");
+            assert_eq!(
+                collect_id_value_pairs(&ctx, &reopened, &table).await,
+                vec![(1, 10), (3, 31)],
+                "shards={shards}: after a crash, key 2 stays deleted and key 3 appears once with its new value"
+            );
+        }
     }
 
     /// N>1 cross-shard file-hiding tombstones: supersede several DURABLE keys that
