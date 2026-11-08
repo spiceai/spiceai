@@ -468,15 +468,15 @@ async fn a_withheld_dataset_stays_unserved_until_its_data_is_deleted() {
         .scope(async {
             let fixture = Fixture::new();
             let rt = start(&fixture).await;
-            let duckdb_file = fixture.instance_dir.with_file_name("s1.duckdb");
+            let sqlite_file = fixture.instance_dir.with_file_name("s1.db");
             message(
                 &rt,
                 &format!(
                     "CREATE TABLE s1 WITH (from = 'file:{}', file_format = 'csv', \
-                     \"acceleration.engine\" = 'duckdb', \"acceleration.mode\" = 'file', \
-                     \"acceleration.params.duckdb_file\" = '{}')",
+                     \"acceleration.engine\" = 'sqlite', \"acceleration.mode\" = 'file', \
+                     \"acceleration.params.sqlite_file\" = '{}')",
                     fixture.orders_csv.display(),
-                    duckdb_file.display()
+                    sqlite_file.display()
                 ),
             )
             .await;
@@ -491,11 +491,11 @@ async fn a_withheld_dataset_stays_unserved_until_its_data_is_deleted() {
             rt.shutdown().await;
             drop(rt);
 
-            // The file the definition kept its data in is no DuckDB database
+            // The file the definition kept its data in is no SQLite database
             // any more, so that data cannot be deleted, and the Spicepod now
             // declares s1 over the other source.
-            std::fs::write(&duckdb_file, b"not a DuckDB database")
-                .expect("overwrite the DuckDB file");
+            std::fs::write(&sqlite_file, b"not a SQLite database")
+                .expect("overwrite the SQLite file");
             let app = AppBuilder::new("sql_ddl")
                 .with_dataset(csv_dataset(&fixture.orders_csv, "pod_orders"))
                 .with_dataset(csv_dataset(&fixture.other_csv, "s1"))
@@ -516,7 +516,7 @@ async fn a_withheld_dataset_stays_unserved_until_its_data_is_deleted() {
 
             // Once the fault is gone, the next retry deletes the data, and the
             // Spicepod's s1 is served.
-            std::fs::remove_file(&duckdb_file).expect("remove the file");
+            std::fs::remove_file(&sqlite_file).expect("remove the file");
             eventually(&rt, select, "+----+\n| id |\n+----+\n| 7  |\n+----+")
                 .await
                 .unwrap_or_else(|last| {
@@ -540,7 +540,7 @@ async fn a_statement_refused_for_its_new_store_leaves_the_dataset_served() {
                 &rt,
                 &format!(
                     "CREATE TABLE m1 WITH (from = 'file:{}', file_format = 'csv', \
-                     \"acceleration.engine\" = 'duckdb', \"acceleration.mode\" = 'memory')",
+                     \"acceleration.engine\" = 'sqlite', \"acceleration.mode\" = 'memory')",
                     fixture.orders_csv.display()
                 ),
             )
@@ -551,14 +551,14 @@ async fn a_statement_refused_for_its_new_store_leaves_the_dataset_served() {
                 .await
                 .unwrap_or_else(|last| panic!("m1 loads its source; served:\n{last}"));
 
-            // The file the new definition names is no DuckDB database, so what
+            // The file the new definition names is no SQLite database, so what
             // it holds under the name cannot be deleted.
-            let duckdb_file = fixture.instance_dir.with_file_name("m1.duckdb");
-            std::fs::write(&duckdb_file, b"not a DuckDB database").expect("write the file");
+            let sqlite_file = fixture.instance_dir.with_file_name("m1.db");
+            std::fs::write(&sqlite_file, b"not a SQLite database").expect("write the file");
             let alter = format!(
                 "ALTER TABLE m1 SET (\"acceleration.mode\" = 'file', \
-                 \"acceleration.params.duckdb_file\" = '{}')",
-                duckdb_file.display()
+                 \"acceleration.params.sqlite_file\" = '{}')",
+                sqlite_file.display()
             );
             let refused_at = std::sync::Mutex::new(None::<tokio::time::Instant>);
             let (refusal, missed) = tokio::join!(
