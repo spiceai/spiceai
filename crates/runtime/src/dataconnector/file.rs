@@ -24,12 +24,12 @@ use data_connector_api::accelerated::RegisteredAcceleratedTable;
 use notify::{RecommendedWatcher, RecursiveMode, Watcher};
 use snafu::prelude::*;
 use std::future::Future;
+use std::ffi::{OsStr, OsString};
 use std::path::Path;
 use std::path::PathBuf;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::time::Duration;
-use std::time::Instant;
 use std::{any::Any, env};
 use tokio::runtime::Handle;
 use tokio::sync::mpsc;
@@ -176,20 +176,40 @@ impl ListingTableConnector for File {
         }
 
         let path = get_path(dataset);
+        let watch_path = watch_root(&path);
+        let watched_name: Option<OsString> = if path.is_dir() {
+            None
+        } else {
+            path.file_name().map(ToOwned::to_owned)
+        };
+        let mode = if path.is_dir() {
+            RecursiveMode::Recursive
+        } else {
+            RecursiveMode::NonRecursive
+        };
         let (tx, mut rx) = mpsc::channel(100);
         let Some(refresh_requester) = accelerated_table.refresh_requester() else {
             return Ok(());
         };
 
-        tracing::info!("Watching changes to {}", path.display());
+        tracing::info!(
+            "Watching changes to {} (via {})",
+            path.display(),
+            watch_path.display()
+        );
 
         let watcher_task = tokio::spawn(async move {
             let mut watcher: RecommendedWatcher = match notify::recommended_watcher(
                 move |res: Result<notify::Event, notify::Error>| match res {
-                    Ok(event) if event.kind.is_modify() => {
+                    Ok(event)
+                        if file_watch_event_is_relevant(&event, watched_name.as_deref()) =>
+                    {
                         let _ = tx.blocking_send(());
                     }
-                    _ => {}
+                    Ok(_) => {}
+                    Err(e) => {
+                        tracing::debug!("File watcher event error: {e}");
+                    }
                 },
             ) {
                 Ok(watcher) => watcher,
@@ -199,14 +219,7 @@ impl ListingTableConnector for File {
                 }
             };
 
-            let watch_path = Path::new(&path);
-            let mode = if watch_path.is_dir() {
-                RecursiveMode::Recursive
-            } else {
-                RecursiveMode::NonRecursive
-            };
-
-            match watcher.watch(watch_path, mode) {
+            match watcher.watch(&watch_path, mode) {
                 Ok(()) => (),
                 Err(e) => {
                     tracing::error!("Failed to watch file: {e}");
@@ -214,19 +227,30 @@ impl ListingTableConnector for File {
                 }
             }
 
-            let mut last_refresh = Instant::now();
+            // Trailing-edge debounce: wait until events stop arriving, then
+            // refresh. Events that land while a refresh is in flight keep a
+            // dirty flag so another refresh runs after it.
+            let mut pending = false;
+            let mut refresh_in_flight = false;
             loop {
                 tokio::select! {
-                    Some(()) = rx.recv() => {
-                        if last_refresh.elapsed() < Duration::from_millis(100) {
-                            tracing::debug!("Skipping refresh for file {}, last refresh was too recent", path.display());
-                            continue;
+                    msg = rx.recv() => {
+                        match msg {
+                            Some(()) => pending = true,
+                            None => break,
                         }
-                        tracing::debug!("Triggering refresh for file {}", path.display());
-                        if let Err(e) = refresh_requester.request_refresh().await {
+                    }
+                    () = tokio::time::sleep(FILE_WATCHER_DEBOUNCE), if pending && !refresh_in_flight => {
+                        pending = false;
+                        refresh_in_flight = true;
+                    }
+                    result = refresh_requester.request_refresh(), if refresh_in_flight => {
+                        if let Err(e) = result {
                             tracing::error!("Failed to trigger refresh: {e}");
+                        } else {
+                            tracing::debug!("Triggered refresh for file {}", path.display());
                         }
-                        last_refresh = Instant::now();
+                        refresh_in_flight = false;
                     }
                     else => break,
                 }
@@ -240,6 +264,31 @@ impl ListingTableConnector for File {
 }
 
 data_connector_api::register_data_connector!("file", FileFactory);
+
+/// How long to wait after the last relevant filesystem event before refreshing.
+/// Long enough that a truncate-then-write or a burst of appends is seen as one
+/// change, short enough that an interactive edit still lands promptly.
+const FILE_WATCHER_DEBOUNCE: Duration = Duration::from_millis(400);
+
+fn watch_root(path: &Path) -> PathBuf {
+    if path.is_dir() {
+        return path.to_path_buf();
+    }
+    path.parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .map(Path::to_path_buf)
+        .unwrap_or_else(|| PathBuf::from("."))
+}
+
+fn file_watch_event_is_relevant(event: &notify::Event, watched_name: Option<&OsStr>) -> bool {
+    if !(event.kind.is_create() || event.kind.is_modify() || event.kind.is_remove()) {
+        return false;
+    }
+    match watched_name {
+        None => true,
+        Some(name) => event.paths.iter().any(|path| path.file_name() == Some(name)),
+    }
+}
 
 fn get_path(dataset: &DatasetSpec) -> PathBuf {
     PathBuf::from(dataset.path())
@@ -314,5 +363,35 @@ mod tests {
             .get_object_store_url(&dataset, Some("/tmp/2/"))
             .expect("should get a valid URL");
         assert_eq!(url.as_str(), "file:///tmp/2/");
+    }
+
+    #[test]
+    fn watch_root_uses_parent_for_a_file() {
+        assert_eq!(
+            watch_root(Path::new("/data/events.csv")),
+            PathBuf::from("/data")
+        );
+        assert_eq!(watch_root(Path::new("events.csv")), PathBuf::from("."));
+    }
+
+    #[test]
+    fn file_watch_event_filters_unrelated_names_and_accesses() {
+        let target = OsStr::new("events.csv");
+        let create = notify::Event::new(notify::EventKind::Create(
+            notify::event::CreateKind::File,
+        ))
+        .add_path(PathBuf::from("/data/events.csv"));
+        let other = notify::Event::new(notify::EventKind::Create(
+            notify::event::CreateKind::File,
+        ))
+        .add_path(PathBuf::from("/data/events.csv.tmp"));
+        let access = notify::Event::new(notify::EventKind::Access(
+            notify::event::AccessKind::Any,
+        ))
+        .add_path(PathBuf::from("/data/events.csv"));
+        assert!(file_watch_event_is_relevant(&create, Some(target)));
+        assert!(!file_watch_event_is_relevant(&other, Some(target)));
+        assert!(!file_watch_event_is_relevant(&access, Some(target)));
+        assert!(file_watch_event_is_relevant(&other, None));
     }
 }

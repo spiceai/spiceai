@@ -25,6 +25,7 @@ use spicepod::{
     param::Params,
 };
 use std::io::Write;
+use std::path::Path;
 use std::sync::Arc;
 
 use crate::{
@@ -154,6 +155,178 @@ async fn test_file_watcher() -> Result<(), anyhow::Error> {
             let _ = std::fs::remove_file("./test_file_watcher.db-wal");
             std::fs::remove_file("./test_file_watcher.csv").expect("remove file");
 
+            Ok(())
+        })
+        .await
+}
+
+
+
+fn watcher_dataset(csv_path: &Path, db_path: &Path) -> Dataset {
+    let mut dataset = Dataset::new(format!("file://{}", csv_path.display()), "names");
+    let params = get_params(&Mode::File, Some(db_path.display().to_string()), "sqlite").map(
+        |params| {
+            let mut map = params.as_string_map();
+            map.insert("file_watcher".to_string(), "enabled".to_string());
+            Params::from_string_map(map)
+        },
+    );
+    dataset.acceleration = Some(Acceleration {
+        params,
+        enabled: true,
+        engine: Some("sqlite".to_string()),
+        mode: Mode::File,
+        refresh_mode: Some(RefreshMode::Full),
+        refresh_sql: None,
+        ..Acceleration::default()
+    });
+    dataset
+}
+
+async fn start_watcher_runtime(
+    csv_path: &Path,
+    db_path: &Path,
+) -> Result<Arc<Runtime>, anyhow::Error> {
+    std::fs::write(csv_path, NAMES_CSV).expect("write file");
+    let app = AppBuilder::new("test_file_watcher")
+        .with_dataset(watcher_dataset(csv_path, db_path))
+        .build();
+    configure_test_datafusion();
+    let rt = Arc::new(Runtime::builder().with_app(app).build().await);
+    tokio::select! {
+        () = tokio::time::sleep(std::time::Duration::from_mins(1)) => {
+            return Err(anyhow::Error::msg("Timed out waiting for datasets to load"));
+        }
+        () = Arc::clone(&rt).load_components() => {}
+    }
+    runtime_ready_check(&rt).await;
+    Ok(rt)
+}
+
+async fn names_row_count(rt: &Runtime) -> usize {
+    let batches: Vec<RecordBatch> = rt
+        .datafusion()
+        .query_builder("SELECT * FROM names ORDER BY id")
+        .build()
+        .run()
+        .await
+        .expect("query is successful")
+        .data
+        .try_collect()
+        .await
+        .expect("collects results");
+    batches.iter().map(RecordBatch::num_rows).sum()
+}
+
+async fn wait_for_row_count(rt: &Runtime, expected: usize) -> Result<(), anyhow::Error> {
+    let start = std::time::Instant::now();
+    loop {
+        let row_count = names_row_count(rt).await;
+        if row_count == expected {
+            return Ok(());
+        }
+        if start.elapsed() > std::time::Duration::from_secs(30) {
+            return Err(anyhow::Error::msg(format!(
+                "Timed out waiting for file watcher refresh (got {row_count} rows, expected {expected})"
+            )));
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+    }
+}
+
+fn csv_with_rows(n: usize) -> String {
+    let mut out = String::from("id,name,age,city,score\n");
+    for i in 1..=n {
+        out.push_str(&format!("{i},name{i},20,City,1\n"));
+    }
+    out
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_file_watcher_atomic_replace_then_append() -> Result<(), anyhow::Error> {
+    let _tracing = init_tracing(Some("integration=debug,info"));
+    test_request_context()
+        .scope(async {
+            let dir = tempfile::tempdir().expect("tempdir");
+            let csv_path = dir.path().join("names.csv");
+            let db_path = dir.path().join("names.db");
+            let rt = start_watcher_runtime(&csv_path, &db_path).await?;
+            wait_for_row_count(&rt, 10).await?;
+
+            let tmp = dir.path().join("names.csv.tmp");
+            std::fs::write(&tmp, csv_with_rows(11)).expect("write tmp");
+            std::fs::rename(&tmp, &csv_path).expect("atomic replace");
+            wait_for_row_count(&rt, 11).await?;
+
+            std::fs::OpenOptions::new()
+                .append(true)
+                .open(&csv_path)
+                .expect("open file")
+                .write_all(b"12,name12,20,City,1\n")
+                .expect("append after replace");
+            wait_for_row_count(&rt, 12).await?;
+
+            drop(rt);
+            Ok(())
+        })
+        .await
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_file_watcher_trailing_debounce_keeps_burst_appends() -> Result<(), anyhow::Error> {
+    let _tracing = init_tracing(Some("integration=debug,info"));
+    test_request_context()
+        .scope(async {
+            let dir = tempfile::tempdir().expect("tempdir");
+            let csv_path = dir.path().join("names.csv");
+            let db_path = dir.path().join("names.db");
+            let rt = start_watcher_runtime(&csv_path, &db_path).await?;
+            wait_for_row_count(&rt, 10).await?;
+
+            let mut expected = 10usize;
+            for i in 0..5 {
+                let first = 11 + i * 2;
+                let second = first + 1;
+                std::fs::OpenOptions::new()
+                    .append(true)
+                    .open(&csv_path)
+                    .expect("open file")
+                    .write_all(format!("{first},name{first},20,City,1\n").as_bytes())
+                    .expect("append first");
+                tokio::time::sleep(std::time::Duration::from_millis(30)).await;
+                std::fs::OpenOptions::new()
+                    .append(true)
+                    .open(&csv_path)
+                    .expect("open file")
+                    .write_all(format!("{second},name{second},20,City,1\n").as_bytes())
+                    .expect("append second");
+                expected += 2;
+                wait_for_row_count(&rt, expected).await?;
+            }
+
+            drop(rt);
+            Ok(())
+        })
+        .await
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_file_watcher_large_inplace_rewrite() -> Result<(), anyhow::Error> {
+    let _tracing = init_tracing(Some("integration=debug,info"));
+    test_request_context()
+        .scope(async {
+            let dir = tempfile::tempdir().expect("tempdir");
+            let csv_path = dir.path().join("names.csv");
+            let db_path = dir.path().join("names.db");
+            let rt = start_watcher_runtime(&csv_path, &db_path).await?;
+            wait_for_row_count(&rt, 10).await?;
+
+            for n in [3usize, 20, 7] {
+                std::fs::write(&csv_path, csv_with_rows(n)).expect("rewrite file");
+                wait_for_row_count(&rt, n).await?;
+            }
+
+            drop(rt);
             Ok(())
         })
         .await
