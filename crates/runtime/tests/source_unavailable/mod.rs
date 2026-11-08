@@ -1167,7 +1167,8 @@ mod served_from_acceleration {
 
     // A view whose SQL changes between restarts, and the views reading it, should answer
     // from the new definition. A Cayenne file acceleration keeps the schema it was built
-    // with instead; `test/spicescript/known-failing/schema-evolution/view-redefined-after-restart.yaml`
+    // with instead (#16111);
+    // `test/spicescript/known-failing/schema-evolution/view-redefined-after-restart.yaml`
     // guards that until it is fixed.
 
     /// A view removed by a Spicepod change while it was served, redefined, from its

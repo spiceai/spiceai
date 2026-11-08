@@ -1,3 +1,7 @@
+# Known failing (#16111): a Cayenne file acceleration of a view keeps the schema it was
+# built with when the view's SQL changes between restarts, so the new column is never
+# served, by the view or by a view reading it.
+# Move this script to test/spicescript/ once it passes.
 name: view-redefined-after-restart
 description: >
   An accelerated view whose SQL changes between restarts answers from its new
