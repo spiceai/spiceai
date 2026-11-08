@@ -1764,6 +1764,53 @@ mod tests {
         );
     }
 
+    /// `data` with its zlib checksum (the last four bytes) inverted, so a zlib
+    /// decoder produces every byte of the stream and then reports an error.
+    fn with_bad_checksum(mut data: Vec<u8>) -> Vec<u8> {
+        let len = data.len();
+        for byte in &mut data[len - 4..] {
+            *byte ^= 0xFF;
+        }
+        data
+    }
+
+    /// `PDFium` keeps the bytes a Flate stream produced before its checksum
+    /// fails, so the budget counts them too. Two streams of 200 MiB each, both
+    /// with a bad checksum, add up past the limit.
+    #[test]
+    fn counts_flate_output_before_a_bad_checksum() {
+        let data = with_bad_checksum(deflate_spaces(200 * 1024 * 1024));
+        let mut pdf = b"%PDF-1.7\n".to_vec();
+        for object in [4, 5] {
+            pdf.extend_from_slice(
+                format!(
+                    "{object} 0 obj\n<< /Length {} /Filter /FlateDecode >>\nstream\n",
+                    data.len()
+                )
+                .as_bytes(),
+            );
+            pdf.extend_from_slice(&data);
+            pdf.extend_from_slice(b"\nendstream\nendobj\n");
+        }
+        assert_eq!(
+            pdf_too_large_reason(&Bytes::from(pdf)),
+            "its compressed streams decompress to more than 256 MiB, the per-document limit"
+        );
+    }
+
+    /// The first stage of a Flate chain keeps its output when its checksum
+    /// fails, as `PDFium` does, so the bomb in the stage after it is budgeted.
+    #[test]
+    fn decodes_a_flate_chain_whose_first_stage_has_a_bad_checksum() {
+        let over = usize::try_from(MAX_PACKAGE_BYTES).expect("fits usize") + 1024 * 1024;
+        let data = with_bad_checksum(deflate(&deflate_spaces(over)));
+        let pdf = loadable_pdf_with_content_stream(b"[/FlateDecode /FlateDecode]", &data);
+        assert_eq!(
+            pdf_too_large_reason(&pdf),
+            "its compressed streams decompress to more than 256 MiB, the per-document limit"
+        );
+    }
+
     /// An ASCII85 wrapper makes the inner Flate data unreadable to a scan that
     /// only tries to inflate the raw stream bytes; decoding the chain in order
     /// still reaches the bomb. Same loadable single-page shape as the nested
