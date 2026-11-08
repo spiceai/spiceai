@@ -282,7 +282,9 @@ fn compound_required_columns(
 /// `on_write_failed` restores state set up by a *successful* start, so calling it could "restore"
 /// settings that were never overridden. That ownership is also what lets `on_write_failed` and
 /// `on_write_complete` keep fanning out to both halves after a best-effort start failure — the
-/// half that failed has already closed its own cycle, so its cleanup short-circuits.
+/// half that failed has already closed its own cycle, so restoring its settings short-circuits.
+/// (An Elasticsearch full-refresh snapshot outlives a failed `refresh_interval` override, and
+/// those calls still reconcile or close it, because the write went ahead.)
 async fn compound_on_write_start(
     primary: &dyn SearchIndex,
     secondary: &dyn SearchIndex,

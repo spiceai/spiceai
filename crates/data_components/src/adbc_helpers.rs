@@ -42,6 +42,10 @@ pub const DUCKDB_ADBC_ENTRYPOINT: &[u8] = b"duckdb_adbc_init";
 
 /// Builds raw database settings for a Spice-managed `DuckDB` source.
 ///
+/// `order_by_non_integer_literal` lets a statement Spice sends sort by a constant,
+/// such as `ORDER BY NULL`, which SQL reads as no ordering. `DuckDB` 1.5 and later
+/// reject that statement unless the setting is on.
+///
 /// Direct `adbc:` connections use [`build_db_options`] instead, preserving the
 /// driver's access mode and host time zone defaults.
 #[must_use]
@@ -57,6 +61,10 @@ pub fn managed_duckdb_options(
         ));
     }
     options.push((OptionDatabase::Other("TimeZone".into()), "UTC".into()));
+    options.push((
+        OptionDatabase::Other("order_by_non_integer_literal".into()),
+        "true".into(),
+    ));
     options
 }
 
@@ -802,6 +810,10 @@ mod tests {
                 (OptionDatabase::Other("path".into()), "test.db"),
                 (OptionDatabase::Other("access_mode".into()), "read_only"),
                 (OptionDatabase::Other("TimeZone".into()), "UTC"),
+                (
+                    OptionDatabase::Other("order_by_non_integer_literal".into()),
+                    "true",
+                ),
             ],
         );
     }
@@ -813,6 +825,10 @@ mod tests {
             vec![
                 (OptionDatabase::Other("path".into()), ":memory:"),
                 (OptionDatabase::Other("TimeZone".into()), "UTC"),
+                (
+                    OptionDatabase::Other("order_by_non_integer_literal".into()),
+                    "true",
+                ),
             ],
         );
     }

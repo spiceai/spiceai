@@ -1,16 +1,18 @@
 name: unparse-nullable-having
 description: >
   A HAVING predicate on a nullable computed grouping key returns the same
-  count through every execution engine as PostgreSQL over the source rows.
+  count as PostgreSQL over the source rows: federated to PostgreSQL, MySQL and
+  DuckDB, and accelerated into Cayenne.
 
 sources:
   pg: { kind: postgres }
   my: { kind: mysql }
+  duck: { kind: duckdb }
 
 variants:
   postgres: {}
   mysql: { datasets: { e: { from: 'mysql:e', params: '${sources.my.params}' } } }
-  duckdb: { datasets: { e: { acceleration: { enabled: true, engine: duckdb, mode: file } } } }
+  duckdb: { datasets: { e: { from: 'duckdb:e', params: '${sources.duck.params}' } } }
   cayenne: { datasets: { e: { acceleration: { enabled: true, engine: cayenne, mode: file } } } }
 
 spicepod:
@@ -31,6 +33,8 @@ steps:
       pg: CREATE TABLE e (id int PRIMARY KEY, v int); INSERT INTO e SELECT i, i % 3 FROM generate_series(1, 11) i;
   - source-exec:
       my: CREATE TABLE e (id int PRIMARY KEY, v int); INSERT INTO e VALUES (1,1),(2,2),(3,0),(4,1),(5,2),(6,0),(7,1),(8,2),(9,0),(10,1),(11,2);
+  - source-exec:
+      duck: CREATE TABLE e (id int PRIMARY KEY, v int); INSERT INTO e VALUES (1,1),(2,2),(3,0),(4,1),(5,2),(6,0),(7,1),(8,2),(9,0),(10,1),(11,2);
   - start: {}
   - query: SELECT count(*) AS n FROM (SELECT CASE WHEN v = 0 THEN NULL ELSE v END AS k, max(id) AS m FROM e GROUP BY CASE WHEN v = 0 THEN NULL ELSE v END HAVING CASE WHEN v = 0 THEN NULL ELSE v END IS NULL) x
   - explain: SELECT count(*) AS n FROM (SELECT CASE WHEN v = 0 THEN NULL ELSE v END AS k, max(id) AS m FROM e GROUP BY CASE WHEN v = 0 THEN NULL ELSE v END HAVING CASE WHEN v = 0 THEN NULL ELSE v END IS NULL) x

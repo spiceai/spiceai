@@ -136,7 +136,7 @@ impl MySqlBinlogStore for SqliteMySqlBinlogStore {
                 // table created before they were added (ignored otherwise).
                 migrate_columns(conn);
                 let query = format!(
-                    "SELECT binlog_file, binlog_pos, schema_json, gtid_executed, cursor_type, strftime('%s', updated_at) FROM {MYSQL_BINLOG_TABLE_NAME} WHERE dataset_name = ?"
+                    "SELECT binlog_file, binlog_pos, schema_json, gtid_executed, cursor_type, CAST(strftime('%s', updated_at) AS INTEGER) FROM {MYSQL_BINLOG_TABLE_NAME} WHERE dataset_name = ?"
                 );
                 let mut stmt = conn.prepare(&query)?;
                 let mut rows = stmt.query([dataset_name])?;
