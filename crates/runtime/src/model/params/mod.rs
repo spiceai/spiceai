@@ -29,6 +29,7 @@ pub mod anthropic;
 pub mod azure;
 pub mod bedrock;
 pub mod common;
+pub mod darkbloom;
 pub mod databricks;
 pub mod file;
 pub mod google;
@@ -60,6 +61,7 @@ source_specs!(BEDROCK_SPEC, bedrock::BedrockModelParams);
 source_specs!(SPICEAI_SPEC, spiceai::SpiceAiModelParams);
 source_specs!(GOOGLE_SPEC, google::GoogleModelParams);
 source_specs!(TYPESAFE_SPEC, typesafe::TypeSafeModelParams);
+source_specs!(DARKBLOOM_SPEC, darkbloom::DarkbloomModelParams);
 
 /// Returns the parameter specifications for a given model source, generated
 /// from that source's `#[derive(TypedParams)]` struct (the single source of
@@ -79,6 +81,7 @@ pub fn get_params_spec(source: &ModelSource) -> &'static [ParameterSpec] {
         ModelSource::SpiceAI => &SPICEAI_SPEC,
         ModelSource::Google => &GOOGLE_SPEC,
         ModelSource::TypeSafe => &TYPESAFE_SPEC,
+        ModelSource::Darkbloom => &DARKBLOOM_SPEC,
     }
 }
 
@@ -310,6 +313,10 @@ mod tests {
             (ModelSource::SpiceAI, spiceai::SpiceAiModelParams::PREFIX),
             (ModelSource::Google, google::GoogleModelParams::PREFIX),
             (ModelSource::TypeSafe, typesafe::TypeSafeModelParams::PREFIX),
+            (
+                ModelSource::Darkbloom,
+                darkbloom::DarkbloomModelParams::PREFIX,
+            ),
         ] {
             assert_eq!(
                 prefix,

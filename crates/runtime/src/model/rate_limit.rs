@@ -105,6 +105,9 @@ fn provider_default_config(
         Some(ModelSource::Xai) => xai_config(model_id, params),
         Some(ModelSource::Bedrock) => config(20, 800),
         Some(ModelSource::Databricks | ModelSource::SpiceAI) => config(10, 500),
+        // Darkbloom publishes no rate limits; it answers a throttled request with 429 and
+        // `Retry-After`.
+        Some(ModelSource::Darkbloom) => config(10, 500),
         Some(ModelSource::TypeSafe) => config(20, 1200),
         // Local models: conservative concurrency (typically 1 GPU), no RPM limit.
         // Users with multi-GPU setups should override via max_concurrency.
@@ -259,6 +262,28 @@ mod tests {
     fn resolve(from: &str, name: &str, params: &[(&str, &str)]) -> RateLimitConfig {
         let model = Model::new(from, name);
         resolve_rate_limit_config(&model, &make_params(params))
+    }
+
+    #[test]
+    fn darkbloom_defaults_and_overrides() {
+        let cfg = resolve("darkbloom:gpt-oss-20b", "m", &[]);
+        assert_eq!(
+            (cfg.max_concurrency, cfg.requests_per_minute),
+            (Some(10), Some(500))
+        );
+
+        let cfg = resolve(
+            "darkbloom:gpt-oss-20b",
+            "m",
+            &[
+                ("max_concurrency", "32"),
+                ("requests_per_minute_limit", "120"),
+            ],
+        );
+        assert_eq!(
+            (cfg.max_concurrency, cfg.requests_per_minute),
+            (Some(32), Some(120))
+        );
     }
 
     // -- User override tests --

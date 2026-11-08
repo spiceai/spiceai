@@ -320,6 +320,7 @@ Every accelerator other than `cayenne` is deprecated in v2.4 and will be removed
 | `xai`         | Models hosted on xAI                         | Alpha             | -            | OpenAI-compatible HTTP endpoint |
 | `google`      | Google Vertex AI (Gemini)                    |                   | -            | Vertex AI HTTP endpoint         |
 | `databricks`  | Models deployed to Databricks Mosaic AI      |                   | -            | OpenAI-compatible HTTP endpoint |
+| `darkbloom`   | Models served by the Darkbloom inference network |               | -            | OpenAI-compatible HTTP endpoint |
 
 ## Supported Embeddings Providers
 

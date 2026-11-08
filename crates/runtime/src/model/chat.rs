@@ -45,6 +45,7 @@ use super::params::anthropic::AnthropicModelParams;
 use super::params::azure::AzureModelParams;
 #[cfg(feature = "bedrock")]
 use super::params::bedrock::{BedrockModelParams, GuardrailTraceMode};
+use super::params::darkbloom::DarkbloomModelParams;
 use super::params::databricks::DatabricksModelParams;
 #[cfg(feature = "models")]
 use super::params::file::FileModelParams;
@@ -311,6 +312,12 @@ pub async fn construct_model(
             let p = typed_params::<SpiceAiModelParams>(component, params, source.clone(), secrets)
                 .await?;
             spiceai(model_id, &p)
+        }
+        ModelSource::Darkbloom => {
+            let p =
+                typed_params::<DarkbloomModelParams>(component, params, source.clone(), secrets)
+                    .await?;
+            darkbloom(component, model_id, params, &p)
         }
     }?;
 
@@ -766,6 +773,45 @@ fn spiceai(
     )) as Arc<dyn Chat>)
 }
 
+/// Builds a chat model served by the Darkbloom inference network. Its requests take permits
+/// from a controller built from the model's own rate limits (`max_concurrency`,
+/// `requests_per_minute_limit`, or Darkbloom's defaults), so those limits apply to every
+/// request, not only to the SQL functions that call the model.
+fn darkbloom(
+    component: &Model,
+    model_id: Option<String>,
+    raw_params: &HashMap<String, SecretString>,
+    params: &DarkbloomModelParams,
+) -> Result<Arc<dyn Chat>, LlmError> {
+    let Some(model_id) = model_id else {
+        return Err(LlmError::ModelNotProvided {
+            model_source: ModelSource::Darkbloom.to_string(),
+        });
+    };
+    let Some(api_key) = params.api_key.as_ref().map(ExposeSecret::expose_secret) else {
+        // Not `FailedToLoadModel`, which presents the cause as a bug to report: this is a
+        // credential the configuration does not give.
+        return Err(LlmError::FailedToAuthenticate {
+            source: darkbloom_missing_key_message(&component.name).into(),
+        });
+    };
+    // A controller of its own, built from the same limits as the one the runtime registers for
+    // the model: an `ai_*` SQL call holds a permit from that one while it calls the model, so
+    // sharing it would take two permits per request from one pool and deadlock under load.
+    let rate_controller = super::rate_limit::build_model_rate_controller(component, raw_params);
+    Ok(Arc::new(
+        llms::darkbloom::Darkbloom::new(model_id, api_key, Some(params.endpoint.as_str()))
+            .with_rate_controller(rate_controller),
+    ) as Arc<dyn Chat>)
+}
+
+/// The reason a Darkbloom model without an API key does not load.
+fn darkbloom_missing_key_message(model_name: &str) -> String {
+    format!(
+        "Darkbloom model '{model_name}' requires an API key. Set `darkbloom_api_key`, for example to `${{secrets:DARKBLOOM_API_KEY}}`, with a key from https://console.darkbloom.dev. See: https://spiceai.org/docs/components/models/darkbloom"
+    )
+}
+
 async fn openai(
     model_name: &str,
     model_id: Option<String>,
@@ -1037,6 +1083,14 @@ mod test {
     use llms::chat::PagedAttentionMode;
     use serde_json::Number;
     use spicepod::component::model::Model;
+
+    #[test]
+    fn a_darkbloom_model_without_a_key_names_the_param_and_where_to_get_one() {
+        assert_eq!(
+            darkbloom_missing_key_message("assistant"),
+            "Darkbloom model 'assistant' requires an API key. Set `darkbloom_api_key`, for example to `${secrets:DARKBLOOM_API_KEY}`, with a key from https://console.darkbloom.dev. See: https://spiceai.org/docs/components/models/darkbloom"
+        );
+    }
 
     /// Builds a [`FileModelParams`] from key/value pairs for testing the local-model
     /// parsers in isolation from spicepod deserialization.

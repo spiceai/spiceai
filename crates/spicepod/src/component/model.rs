@@ -93,7 +93,12 @@ pub enum ModelSource {
     Databricks,
     Bedrock,
     TypeSafe,
+    Darkbloom,
 }
+
+/// The prefix that selects [`ModelSource::Darkbloom`], the Darkbloom inference network
+/// (<https://darkbloom.ai>).
+pub const DARKBLOOM_PREFIX: &str = "darkbloom";
 
 /// The prefixes that select [`ModelSource::SpiceAI`]. `spice.ai` matches how the Spice.ai Cloud
 /// Platform is spelled elsewhere in a Spicepod (`from: spice.ai/...` for datasets); `spiceai`
@@ -117,6 +122,9 @@ impl ModelSource {
                 .map(str::trim)
                 .filter(|id| !id.is_empty())
                 .map(std::string::ToString::to_string),
+            // As for Spice.ai: a bare `darkbloom:` names no model, so report it as absent rather
+            // than sending Darkbloom an empty model id.
+            ModelSource::Darkbloom => darkbloom_model_id(from),
             p => {
                 if let Some(stripped) = from.strip_prefix(&format!("{p}:")) {
                     Some(stripped.to_string())
@@ -202,6 +210,24 @@ pub fn split_hf_model_id(model_id: &str) -> (&str, Option<&str>) {
     }
 }
 
+/// The Darkbloom model id a `from` names: what follows `darkbloom:` or `darkbloom/`, which
+/// may itself contain a `/` (`darkbloom:EigenLabs/Qwen3.8-27B-4bit-mtp`). `None` for a bare
+/// `darkbloom` or a prefix with nothing after it.
+fn darkbloom_model_id(from: &str) -> Option<String> {
+    from.strip_prefix(DARKBLOOM_PREFIX)
+        .and_then(|rest| rest.strip_prefix(':').or_else(|| rest.strip_prefix('/')))
+        .map(str::trim)
+        .filter(|id| !id.is_empty())
+        .map(ToString::to_string)
+}
+
+/// Whether `from` selects [`ModelSource::Darkbloom`]: exactly `darkbloom`, or `darkbloom`
+/// followed by `:` or `/`. A lookalike such as `darkbloomer:…` does not.
+fn is_darkbloom_source(from: &str) -> bool {
+    from.strip_prefix(DARKBLOOM_PREFIX)
+        .is_some_and(|rest| rest.is_empty() || rest.starts_with(':') || rest.starts_with('/'))
+}
+
 /// Implement the [`TryFrom<&str>`] trait for [`ModelSource`]. Should be the inverse of [`ModelSource`]'s [`Display`].
 impl TryFrom<&str> for ModelSource {
     type Error = &'static str;
@@ -227,6 +253,8 @@ impl TryFrom<&str> for ModelSource {
             Ok(ModelSource::Databricks)
         } else if value.starts_with("bedrock") {
             Ok(ModelSource::Bedrock)
+        } else if is_darkbloom_source(value) {
+            Ok(ModelSource::Darkbloom)
         } else if value == "typesafe"
             || value
                 .strip_prefix("typesafe:")
@@ -259,6 +287,7 @@ impl Display for ModelSource {
             ModelSource::Databricks => write!(f, "databricks"),
             ModelSource::Bedrock => write!(f, "bedrock"),
             ModelSource::TypeSafe => write!(f, "typesafe"),
+            ModelSource::Darkbloom => write!(f, "{DARKBLOOM_PREFIX}"),
         }
     }
 }
@@ -278,6 +307,7 @@ impl ModelSource {
             ModelSource::Databricks => "databricks",
             ModelSource::Bedrock => "bedrock",
             ModelSource::TypeSafe => "typesafe",
+            ModelSource::Darkbloom => DARKBLOOM_PREFIX,
         }
     }
 }
@@ -576,6 +606,50 @@ mod tests {
         let lookalike = Model::new("typesafely:jev", "jev");
         assert_eq!(lookalike.get_source(), None);
         assert_eq!(lookalike.get_model_id(), None);
+    }
+
+    #[test]
+    fn darkbloom_from_parses_the_model_id() {
+        for (from, id) in [
+            ("darkbloom:gpt-oss-20b", Some("gpt-oss-20b")),
+            ("darkbloom/gpt-oss-20b", Some("gpt-oss-20b")),
+            // Darkbloom model ids may contain a `/`: the whole remainder is the id.
+            (
+                "darkbloom:EigenLabs/Qwen3.8-27B-4bit-mtp",
+                Some("EigenLabs/Qwen3.8-27B-4bit-mtp"),
+            ),
+            (
+                "darkbloom/EigenLabs/Qwen3.8-27B-4bit-mtp",
+                Some("EigenLabs/Qwen3.8-27B-4bit-mtp"),
+            ),
+            ("darkbloom: gpt-oss-20b ", Some("gpt-oss-20b")),
+            // The source, with no model: the loader reports the missing model id.
+            ("darkbloom", None),
+            ("darkbloom:", None),
+            ("darkbloom/", None),
+            ("darkbloom:   ", None),
+        ] {
+            let model = Model::new(from, "m");
+            assert_eq!(
+                model.get_source(),
+                Some(ModelSource::Darkbloom),
+                "expected Darkbloom for {from:?}"
+            );
+            assert_eq!(model.get_model_id().as_deref(), id, "model id of {from:?}");
+        }
+
+        // Only the complete prefix selects Darkbloom.
+        for from in ["darkbloomer:gpt-oss-20b", "darkbloom.ai:gpt-oss-20b"] {
+            assert_eq!(Model::new(from, "m").get_source(), None, "{from:?}");
+        }
+
+        // `Display` and `short_name` are the prefix `TryFrom` parses.
+        assert_eq!(ModelSource::Darkbloom.to_string(), "darkbloom");
+        assert_eq!(ModelSource::Darkbloom.short_name(), "darkbloom");
+        assert_eq!(
+            ModelSource::try_from(ModelSource::Darkbloom.to_string().as_str()),
+            Ok(ModelSource::Darkbloom)
+        );
     }
 
     use super::*;

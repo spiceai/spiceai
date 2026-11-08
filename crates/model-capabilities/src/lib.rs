@@ -147,7 +147,8 @@ fn provider_default(provider: ModelSource) -> ModelCapabilities {
         | ModelSource::File
         | ModelSource::Google
         | ModelSource::HuggingFace
-        | ModelSource::SpiceAI => ModelCapabilities {
+        | ModelSource::SpiceAI
+        | ModelSource::Darkbloom => ModelCapabilities {
             provider,
             chat: true,
             responses: false,

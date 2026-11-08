@@ -266,6 +266,11 @@ pub fn collect_model_sources() -> Vec<ModelSourceSchema> {
             prefix: ModelSource::TypeSafe.short_name(),
             parameters: get_params_spec(&ModelSource::TypeSafe),
         },
+        ModelSourceSchema {
+            name: "darkbloom",
+            prefix: ModelSource::Darkbloom.short_name(),
+            parameters: get_params_spec(&ModelSource::Darkbloom),
+        },
     ]
 }
 

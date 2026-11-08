@@ -383,6 +383,14 @@ pub fn new_openai_client_with_config<C: async_openai::config::Config + Clone>(
 }
 
 impl<C: Config + Clone> Openai<C> {
+    /// Takes a permit from `rate_controller` for each request, in place of the controller the
+    /// client was built with.
+    #[must_use]
+    pub fn with_rate_controller(mut self, rate_controller: Arc<RateController>) -> Self {
+        self.rate_controller = rate_controller;
+        self
+    }
+
     /// Returns true if the `OpenAI` compatible model supports [structured outputs](https://platform.openai.com/docs/guides/structured-outputs/).
     /// This is only supported for GPT-4o models from `OpenAI` (i.e not any other compatible servers).
     fn supports_structured_output(&self) -> bool {

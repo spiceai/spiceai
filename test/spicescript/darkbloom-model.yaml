@@ -1,0 +1,148 @@
+name: darkbloom-model
+description: >
+  A Darkbloom model (`from: darkbloom:<model_id>`) calls Darkbloom's
+  OpenAI-compatible API with its `darkbloom_api_key` as a bearer token, and
+  serves chat completions and the Responses API with the answer and token usage
+  Darkbloom returned. A stream that fails after its first chunk ends with
+  Darkbloom's own error message, not a parse error, and without `[DONE]`. A
+  model Darkbloom does not serve fails to load, and the log lists the models
+  Darkbloom does serve. A model with no API key or no model id fails to load
+  with a message naming the fix. The API key never reaches the log. Mock
+  servers stand in for Darkbloom: `api` serves the model, `flaky` fails its
+  stream after the first chunk, and `missing` does not serve the model.
+
+sources:
+  api: { kind: mock-http }
+  flaky: { kind: mock-http }
+  missing: { kind: mock-http }
+
+spicepod:
+  version: v1
+  kind: Spicepod
+  name: darkbloom-model
+  models:
+    - from: darkbloom:gpt-oss-20b
+      name: chat
+      params:
+        darkbloom_endpoint: ${sources.api.url}/v1
+        darkbloom_api_key: eigeninference-spicescript
+    - from: darkbloom:gpt-oss-20b
+      name: flaky
+      params:
+        darkbloom_endpoint: ${sources.flaky.url}/v1
+        darkbloom_api_key: eigeninference-spicescript
+    - from: darkbloom:no-such-model
+      name: missing_model
+      params:
+        darkbloom_endpoint: ${sources.missing.url}/v1
+        darkbloom_api_key: eigeninference-spicescript
+    # Configuration mistakes: neither reaches a network.
+    - from: darkbloom:gpt-oss-20b
+      name: no_key
+      params:
+        darkbloom_endpoint: ${sources.api.url}/v1
+    - from: darkbloom
+      name: no_model
+      params:
+        darkbloom_endpoint: ${sources.api.url}/v1
+        darkbloom_api_key: eigeninference-spicescript
+
+steps:
+  - source-exec:
+      # Answers only a request that carries the key as a bearer token: one without it gets the
+      # mock's 404 and the model would not load.
+      api:
+        - |
+          path: /v1/chat/completions
+          method: POST
+          headers-match: { authorization: Bearer eigeninference-spicescript }
+          headers: { content-type: application/json }
+          body: '{"id": "chatcmpl-1", "object": "chat.completion", "created": 1778000000, "model": "gpt-oss-20b", "choices": [{"index": 0, "message": {"role": "assistant", "content": "pong", "reasoning_content": "The user said ping."}, "finish_reason": "stop"}], "usage": {"prompt_tokens": 9, "completion_tokens": 12, "total_tokens": 21, "prompt_tokens_details": {"cached_tokens": 0}, "completion_tokens_details": {"reasoning_tokens": 11}}, "se_signature": "MEUCIQ", "response_hash": "9f86d081", "metadata": {"provider_chip": "M4 Max"}}'
+        - |
+          path: /v1/models
+          method: GET
+          headers-match: { authorization: Bearer eigeninference-spicescript }
+          headers: { content-type: application/json }
+          body: '{"object": "list", "data": [{"id": "gpt-oss-20b", "object": "model", "created": 0, "owned_by": "darkbloom"}]}'
+  - source-exec:
+      flaky:
+        # The model's health check when it loads.
+        - |
+          path: /v1/chat/completions
+          method: POST
+          times: 1
+          headers: { content-type: application/json }
+          body: '{"id": "chatcmpl-0", "object": "chat.completion", "created": 1778000000, "model": "gpt-oss-20b", "choices": [{"index": 0, "message": {"role": "assistant", "content": "ok"}, "finish_reason": "stop"}]}'
+        # Every request after it: the first chunk, then Darkbloom's terminal error event, with no
+        # `[DONE]`.
+        - |
+          path: /v1/chat/completions
+          method: POST
+          headers: { content-type: text/event-stream }
+          body: "data: {\"id\":\"chatcmpl-1\",\"object\":\"chat.completion.chunk\",\"created\":1778000000,\"model\":\"gpt-oss-20b\",\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\",\"content\":\"po\"},\"finish_reason\":null}]}\n\ndata: {\"error\":{\"message\":\"provider disconnected mid-stream\",\"type\":\"server_error\",\"code\":\"provider_error\"}}\n\n"
+  - source-exec:
+      missing:
+        - |
+          path: /v1/chat/completions
+          method: POST
+          status: 404
+          headers: { content-type: application/json }
+          body: '{"error": {"message": "model no-such-model is not available", "type": "invalid_request_error", "code": "model_not_found", "param": "model"}}'
+        - |
+          path: /v1/models
+          method: GET
+          headers: { content-type: application/json }
+          body: '{"object": "list", "data": [{"id": "gpt-oss-20b", "object": "model", "created": 0, "owned_by": "darkbloom"}, {"id": "EigenLabs/Qwen3.8-27B-4bit-mtp", "object": "model", "created": 0, "owned_by": "darkbloom"}]}'
+
+  - start: { ready: false }
+
+  - http:
+      method: POST
+      path: /v1/chat/completions
+      headers: { content-type: application/json }
+      body: '{"model": "chat", "messages": [{"role": "user", "content": "ping"}]}'
+    expect:
+      status: 200
+      json:
+        - { pointer: /model, equals: chat }
+        - { pointer: /choices/0/message/content, equals: pong }
+        - { pointer: /usage/prompt_tokens, equals: 9 }
+        - { pointer: /usage/completion_tokens, equals: 12 }
+        - { pointer: /usage/completion_tokens_details/reasoning_tokens, equals: 11 }
+    eventually: 60s
+
+  # The Responses API, served by translating the request into a chat completion.
+  - http:
+      method: POST
+      path: /v1/responses
+      headers: { content-type: application/json }
+      body: '{"model": "chat", "input": "ping"}'
+    expect:
+      status: 200
+      json:
+        - { pointer: /output/*/content/*/text, equals: pong }
+        - { pointer: /usage/output_tokens_details/reasoning_tokens, equals: 11 }
+
+  - http:
+      method: POST
+      path: /v1/chat/completions
+      headers: { content-type: application/json }
+      body: '{"model": "flaky", "stream": true, "messages": [{"role": "user", "content": "ping"}]}'
+    expect:
+      status: 200
+      body-matches:
+        - '"content":"po"'
+        - 'event: error'
+        - '"error":\{"message":"server_error: provider disconnected mid-stream \(code: provider_error\)"\}'
+      body-lacks: ['failed to deserialize', '\[DONE\]']
+    eventually: 60s
+
+  - assert-log:
+      count:
+        "WARN .*Failed to load LLM: missing_model\\. .*The specified model identifier 'no-such-model' is not valid for the source 'darkbloom'\\. Verify the model exists, and try again\\.": '>=1'
+        "Available Darkbloom models include: gpt-oss-20b, EigenLabs/Qwen3\\.8-27B-4bit-mtp": '>=1'
+        "WARN .*Failed to load LLM: no_key\\. .*Darkbloom model 'no_key' requires an API key\\. Set `darkbloom_api_key`, for example to `\\$\\{secrets:DARKBLOOM_API_KEY\\}`, with a key from https://console\\.darkbloom\\.dev\\. See: https://spiceai\\.org/docs/components/models/darkbloom": '>=1'
+        # A configuration mistake: reported once, not retried.
+        "WARN .*Failed to load LLM: no_model\\. .*A model identifier must be provided for source 'darkbloom' via `from: darkbloom:<model_id>`": 1
+      lacks: ['eigeninference-spicescript']
+    eventually: 60s

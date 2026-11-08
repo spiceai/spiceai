@@ -366,10 +366,13 @@ fn create_catalog_specific_schema(
 ///
 /// Most providers match `name:…`. `TypeSafe` also accepts bare `typesafe` and a
 /// colon or slash form with a non-empty model id (not `typesafe:` / `typesafe/`,
-/// and not typos like `typesafely:…`).
+/// and not typos like `typesafely:…`). Darkbloom takes a colon or slash form with a model id,
+/// which may itself contain a `/`.
 fn model_source_from_pattern(name: &str) -> String {
     if name == "typesafe" {
         format!("^{}($|:.+|/.+)", regex::escape(name))
+    } else if name == "darkbloom" {
+        format!("^{}[:/].+", regex::escape(name))
     } else {
         format!("^{}:", regex::escape(name))
     }
@@ -378,6 +381,8 @@ fn model_source_from_pattern(name: &str) -> String {
 fn model_source_from_description(name: &str) -> String {
     if name == "typesafe" {
         "Model source for TypeSafe System One evaluation (Jev). Accepts `typesafe`, `typesafe:<model_id>`, or `typesafe/<model_id>`. Chat completions are not supported; use POST /v1/decisions or the SQL decision functions.".to_string()
+    } else if name == "darkbloom" {
+        "Model source for the Darkbloom inference network. Format: darkbloom:<model_id>, for example darkbloom:gpt-oss-20b.".to_string()
     } else {
         format!("Model source for {name} provider. Format: {name}:<model_id>")
     }
@@ -1423,5 +1428,26 @@ mod tests {
 
         let openai = model_source_from_pattern("openai");
         assert_eq!(openai, "^openai:");
+    }
+
+    #[test]
+    fn darkbloom_from_pattern_requires_a_model_id() {
+        let pattern = model_source_from_pattern("darkbloom");
+        let re = regex::Regex::new(&pattern).expect("pattern compiles");
+        for from in [
+            "darkbloom:gpt-oss-20b",
+            "darkbloom/gpt-oss-20b",
+            "darkbloom:EigenLabs/Qwen3.8-27B-4bit-mtp",
+        ] {
+            assert!(re.is_match(from), "{from}");
+        }
+        for from in [
+            "darkbloom",
+            "darkbloom:",
+            "darkbloom/",
+            "darkbloomer:gpt-oss-20b",
+        ] {
+            assert!(!re.is_match(from), "{from}");
+        }
     }
 }
