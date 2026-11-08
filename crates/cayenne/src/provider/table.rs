@@ -3686,8 +3686,11 @@ impl CayenneTableProviderBuilder {
     /// while metadata remains on local disk.
     #[must_use]
     pub fn with_object_store(mut self, config: crate::metadata::ObjectStoreConfig) -> Self {
-        crate::register_object_store(&config.url, Arc::clone(&config.store));
-        self.object_store_config = Some(config);
+        let router = crate::register_object_store(&config.url, Arc::clone(&config.store));
+        self.object_store_config = Some(crate::metadata::ObjectStoreConfig {
+            url: config.url,
+            store: router,
+        });
         self
     }
 
@@ -8595,16 +8598,24 @@ impl CayenneTableProvider {
         runtime_env: &Arc<RuntimeEnv>,
         config: &crate::metadata::ObjectStoreConfig,
     ) {
-        // Use the object store registry to check if already registered
-        let already_registered = runtime_env
-            .object_store_registry
-            .get_store(&config.url)
-            .is_ok_and(|existing| Arc::ptr_eq(&existing, &config.store));
-
-        if !already_registered {
-            runtime_env.register_object_store(&config.url, Arc::clone(&config.store));
-            tracing::debug!("Registered object store for {}", config.url.as_str());
+        // `config.store` is the routing store for the URL's scheme and host (see
+        // `crate::store_routing`), shared by every dataset there. A store something
+        // else registered for that bucket keeps serving the paths no dataset owns.
+        let existing = runtime_env.object_store_registry.get_store(&config.url).ok();
+        if existing
+            .as_ref()
+            .is_some_and(|existing| Arc::ptr_eq(existing, &config.store))
+        {
+            return;
         }
+        if let (Some(existing), Some(router)) =
+            (existing, crate::store_routing::router_for(&config.url))
+            && !Arc::ptr_eq(&existing, &(Arc::clone(&router) as Arc<dyn object_store::ObjectStore>))
+        {
+            router.keep_fallback(existing);
+        }
+        runtime_env.register_object_store(&config.url, Arc::clone(&config.store));
+        tracing::debug!("Registered object store for {}", config.url.as_str());
     }
 
     fn runtime_env_cache_key(runtime_env: &Arc<RuntimeEnv>) -> usize {
@@ -8629,6 +8640,58 @@ impl CayenneTableProvider {
         self.object_store_registered_runtime_envs
             .lock()
             .insert(runtime_env_key);
+    }
+
+    /// Whether this table's data is in the object-native location, so the files
+    /// its manifest names are its data files: scans read them from the committed
+    /// state and never list, and every write records its files before returning.
+    /// The table path the metastore recorded at creation is the placement record
+    /// (see [`crate::metastore_layout::is_object_native_data_path`]).
+    pub(crate) fn data_in_object_native_location(&self) -> bool {
+        crate::metastore_layout::is_object_native_data_path(&self.table_metadata.path)
+    }
+
+    /// Whether scans resolve this table's files from the manifest instead of
+    /// listing its snapshot directory.
+    pub(crate) fn scans_from_manifest(&self) -> bool {
+        self.context.scan_from_manifest() || self.data_in_object_native_location()
+    }
+
+    /// Records `files` (`(file name, size)` in `snapshot_id`'s directory) in the
+    /// snapshot's manifest in one commit. A file new to the current snapshot gets
+    /// the range `[0, current sequence]`, as the listing-based rebuild gives it.
+    pub(crate) async fn record_files_in_manifest(
+        &self,
+        snapshot_id: &str,
+        files: &[(String, u64)],
+    ) -> Result<()> {
+        if files.is_empty() {
+            return Ok(());
+        }
+        let table_id = self.table_metadata.table_id.clone();
+        let max_sequence = self
+            .catalog
+            .get_snapshot_sequence(&table_id, snapshot_id)
+            .await
+            .map_err(|source| Error::Catalog { source })?
+            .unwrap_or(0);
+        let rows: Vec<SnapshotFile> = files
+            .iter()
+            .map(|(file_path, size)| SnapshotFile {
+                table_id: table_id.clone(),
+                snapshot_id: snapshot_id.to_string(),
+                file_path: file_path.clone(),
+                row_count: 0,
+                file_size_bytes: i64::try_from(*size).unwrap_or(i64::MAX),
+                min_sequence: 0,
+                max_sequence,
+                digest: None,
+            })
+            .collect();
+        self.catalog
+            .upsert_snapshot_files(&rows)
+            .await
+            .map_err(|source| Error::Catalog { source })
     }
 
     pub(super) fn require_object_store(&self) -> Result<&crate::metadata::ObjectStoreConfig> {
@@ -9612,6 +9675,9 @@ impl CayenneTableProvider {
         // is preserved by the copy; e_tag/version are dropped (a fresh path → the
         // footer cache re-reads once, never serves stale metadata).
         let mut moved_metas: Vec<ObjectMeta> = Vec::with_capacity(objects.len());
+        // `(file name, size)` of each moved data file, for the manifest of a table
+        // whose scans read only the manifest.
+        let mut moved_files: Vec<(String, u64)> = Vec::with_capacity(objects.len());
         for meta in &objects {
             let relative = crate::object_relative(&staging_prefix, &meta.location)
                 .ok_or_else(|| Error::Internal {
@@ -9631,6 +9697,7 @@ impl CayenneTableProvider {
                 continue;
             }
             let target_path = crate::object_child(&target_prefix, relative);
+            moved_files.push((relative.to_string(), meta.size));
             if let Some(prefix) = &cache_prefix {
                 moved_metas.push(ObjectMeta {
                     location: prefix.clone().join(relative),
@@ -9667,6 +9734,16 @@ impl CayenneTableProvider {
             }
             })
             .await?;
+
+        // A table whose data is in the object-native location scans only the
+        // files its manifest names, so the moved files are recorded before the
+        // staging originals go: a crash after this leaves the staging WAL, whose
+        // recovery repeats the copy and this upsert, and a crash before it leaves
+        // files no scan reads.
+        if self.scans_from_manifest() {
+            self.record_files_in_manifest(current_snapshot, &moved_files)
+                .await?;
+        }
 
         // Phase 2: delete staging originals.
         let store = Arc::clone(&config.store);
@@ -10423,16 +10500,11 @@ impl CayenneTableProvider {
         // construction. Every code path that creates a SessionContext from
         // `self.context.runtime_env()` (e.g. `create_session_context`, keyset
         // loading, deletion sinks) will automatically inherit the store.
+        // A table at a plain local path reads through the runtime's own `file:///`
+        // store, as it always has; a `file://` table (local data through the durable
+        // store, under `cayenne_vnext`) is given that store in its config.
         if let Some(ref config) = object_store_config {
             Self::register_object_store_if_needed(context.runtime_env(), config);
-        } else if !crate::is_object_store_path(&table_metadata.path) {
-            // Prototype: a local table's files go through one durable object store.
-            if let Ok(url) = url::Url::parse("file:///") {
-                Self::register_object_store_if_needed(
-                    context.runtime_env(),
-                    &crate::metadata::ObjectStoreConfig { url, store: crate::durable_local_object_store() },
-                );
-            }
         }
 
         let mut object_store_registered_runtime_envs = HashSet::new();
@@ -34639,7 +34711,7 @@ impl CayenneTableProvider {
     /// skipped: an append's files reach the manifest only with the post-write
     /// maintenance pass, so a listing built now could miss them.
     pub async fn prepare_scan_view_for_reads(&self) {
-        if self.context.scan_from_manifest() {
+        if self.scans_from_manifest() {
             return;
         }
         if let Err(error) = self.build_current_scan_view_with_statistics().await {
@@ -40759,7 +40831,7 @@ impl CayenneTableProvider {
         store: &'a Arc<dyn ObjectStore>,
     ) -> datafusion_common::Result<futures::stream::BoxStream<'a, DataFusionResult<PartitionedFile>>>
     {
-        if self.context.scan_from_manifest()
+        if self.scans_from_manifest()
             && let Some(files) = self.manifest_partitioned_files(request).await
         {
             return Ok(stream::iter(files.into_iter().map(Ok)).boxed());

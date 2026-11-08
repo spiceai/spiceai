@@ -34,6 +34,7 @@ fn main() -> Result<(), String> {
                 "unknown-action-refusal",
                 "naming",
                 "object-names",
+                "data-files",
                 "reads-linearizable",
                 "reads-bounded",
                 "table-seq",

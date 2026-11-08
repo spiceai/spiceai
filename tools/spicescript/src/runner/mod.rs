@@ -1338,6 +1338,7 @@ async fn note_broken(instance: &mut Instance, step: &Step, outcome: &mut Result<
             | Action::Kill { .. }
             | Action::Restart { .. }
             | Action::WaitReady { .. }
+            | Action::WipeInstanceDir { .. }
     );
     if outcome.is_ok() && matches!(step.action, Action::Start { .. } | Action::Restart { .. }) {
         if let Err(error) = check_base_release_features(instance).await {

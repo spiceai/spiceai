@@ -3,10 +3,16 @@ description: >
   Append refresh into Cayenne on a short interval, which holds new rows in
   memory by default before they reach files: rows appended just before
   spiced is killed are there after it restarts, exactly once, with the
-  default in-memory durability and with `cayenne_cdc_durability: file`.
+  default in-memory durability and with `cayenne_cdc_durability: file`. With
+  object-native data, the appended rows are in the state location, and an
+  instance that loses its directory serves them while the source is down, then
+  appends again once it is back.
 
 sources:
   src: { kind: postgres }
+  # The state locations of the object-native-data variants.
+  lake: { kind: rustfs }
+  slow-lake: { kind: rustfs, latency: 20ms }
 
 variants:
   memory-durability: {}
@@ -18,6 +24,11 @@ variants:
   object-native-file-durability:
     spicepod: { runtime: { params: { cayenne_vnext: enabled } } }
     datasets: { events: { acceleration: { params: { cayenne_cdc_durability: file } } } }
+  # Object-native data (#16131): data files in the state location, which an
+  # instance that loses its directory serves again without the source.
+  object-native-data-local: object-native-data-local
+  object-native-data-rustfs: object-native-data-rustfs
+  object-native-data-rustfs-latency: object-native-data-rustfs-latency
 
 spicepod:
   version: v1
@@ -72,3 +83,45 @@ steps:
   - query: SELECT * FROM events
     eventually: 30s
   - query: SELECT count(*) AS n, count(DISTINCT id) AS ids FROM events
+
+  # Object-native data (#16131): the dataset's folder is in the state location,
+  # and nothing is at a local `s3:` path. Appended rows sit in the memory tier
+  # and its seals, which are in the dataset's log there, until a checkpoint
+  # writes data files; the wipe below shows they are served from the location.
+  - assert-files: { contains: '^state/cayenne/v1/datasets/events-[^/]+/data/' }
+    only: object-native-data-local
+  - assert-objects: { source: lake, prefix: state/cayenne/v1/datasets/events-, contains: /head, min: 1 }
+    only: object-native-data-rustfs
+  - assert-objects: { source: slow-lake, prefix: state/cayenne/v1/datasets/events-, contains: /head, min: 1 }
+    only: object-native-data-rustfs-latency
+  - assert-files: { lacks: '(^|/)s3:' }
+    only: &object-native-data [object-native-data-local, object-native-data-rustfs, object-native-data-rustfs-latency]
+
+  # Killed, and its directory lost: the rows come back from the location
+  # alone, since the source is down and cannot supply them again.
+  - query: SELECT * FROM events
+    id: before-wipe
+    only: *object-native-data
+  - kill-spiced: {}
+    only: *object-native-data
+  - wipe-instance-dir: { keep: [state] }
+    only: *object-native-data
+  - assert-files: { lacks: '^\.spice/' }
+    only: *object-native-data
+  - stop-source: src
+  - start: { ready: false }
+    only: *object-native-data
+  - query: SELECT * FROM events
+    expect: { same-as: before-wipe }
+    eventually: 60s
+    only: *object-native-data
+  - assert-files: { lacks: '(^|/)s3:' }
+    only: *object-native-data
+  - start-source: src
+  - source-exec: { src: "INSERT INTO events SELECT i, TIMESTAMPTZ '2100-01-01 00:00Z' + i * INTERVAL '1 second', i FROM generate_series(1701, 1800) i" }
+    only: *object-native-data
+  - query: SELECT * FROM events
+    eventually: 60s
+    only: *object-native-data
+  - query: SELECT count(*) AS n, count(DISTINCT id) AS ids FROM events
+    only: *object-native-data

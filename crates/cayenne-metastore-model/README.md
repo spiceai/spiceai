@@ -36,6 +36,26 @@ A sampled run reports `NOT_FOUND`, which does not establish exhaustive safety.
 New exhaustive safe graphs require their essential reachability witnesses; missing
 one fails the run.
 
+## Traces for replay
+
+`TRACE_JSON=<file>` appends one JSON line per witness or counterexample a run
+reports (run, family, mode, property, status and the minimized actions);
+`WALK=<seed>:<count>:<max_steps>` replaces the check with seeded random walks,
+one JSON line each with the safety properties that failed along it. A replay
+harness maps a trace's actions to real operations through `transaction_steps`
+(`transactions` runs) or `data_file_steps` (`data-files` runs), which return
+`None` for an action the run does not enable where it occurs. The `data-files`
+traces in `crates/cayenne/tests/traces/` were generated serially from the
+repository root:
+
+```sh
+cargo build --release -p cayenne-metastore-model
+TRACE_JSON=crates/cayenne/tests/traces/data-files.jsonl target/release/cayenne-metastore-model run data-files
+WALK=42:20:40 TRACE_JSON=crates/cayenne/tests/traces/data-files-walk.jsonl target/release/cayenne-metastore-model run data-files
+```
+
+Delete both files first: `TRACE_JSON` appends.
+
 ## Compositions and bounds
 
 The shared core provides exact conditional-head identity and immutable byte-window
@@ -68,6 +88,7 @@ transaction and byte-storage compositions use the same variable-size `Store`.
 | `standby` / `standby-three` | Two or three instances of one Spicepod on one location: a lease object with an expiry on a discrete clock, renewal by the holder, crash, restart, pause and resume, acquisition only after expiry, and takeover by a head commit that raises the generation; only the generation in the head fences writers; the ingester commits source changes by exact-head CAS and then acknowledges them; standbys serve head reads. No change applied twice or acknowledged without commit, no stale-generation commit accepted, one committing instance per head generation, lease exclusivity, no lease loss by a healthy holder, and an ingester again within the lease duration of a holder failure | Exhaustive: lease duration 3 ticks, 2 source changes, 1 crash, 1 pause, at most 4 lease epochs; a running holder renews and a running standby acquires or takes over before the next tick |
 | `standby-early-safety` | The standby graph with acquisition allowed before expiry; checks only the safety properties, which do not depend on lease timing | Same bounds |
 | `object-names` | Immutable object names when several leased units create objects: the writer `w0` and maintenance units, each with its own lease generation raised by a head commit when a node takes it; create-if-absent under `<kind><unit>.<generation>-<counter>`, identical retries of a lost upload, references committed under a guard on the unit's generation, and maintenance units retired and created with ids never reused. No name created with different bytes, and every referenced object reads back with its digest; witnesses include two units at one generation, successive holders of one unit, a unit created after another retired, and a fenced holder | Exhaustive: 2 nodes, 3 lease takeovers, 2 objects per holding, 1 unit created, 1 retry |
+| `data-files` / `data-files-3` | Data files uploaded to fresh final keys `<generation>-<id>` under the dataset prefix before the commit that names them: a commit is an exact-base conditional head publication guarded by the lease generation and names only files whose upload returned; readers read the head's committed file set and fetch each file, never listing; a lost response leaves an unknown outcome, resent identically and resolved from the head alone (committed when the head names the files, aborted once the head moved past the request's base); a takeover is a head commit that fences the previous holder, whose uploads still land; a crash forgets the writer's state while its sends still land; an unnamed file of a fenced generation is swept. Committed files exist, a reader sees only files committed at its head version, an aborted or abandoned upload is never visible, and an unknown outcome resolves all-or-nothing; witnesses include an accepted commit, an orphan after an aborted commit, a fenced commit refused, a fenced writer's upload landing after a takeover, unknown outcomes resolved both ways, a reader fetch and an orphan reclaimed | Exhaustive: 2 writers, 2 uploads (`-3`: 3), 3 commit attempts, 2 takeovers, 1 crash, 1 identical resend, 2 head reads |
 | `reads-linearizable` / `reads-bounded` | Read freshness against real time: a writer completes commits on a discrete clock; a reader caches the head with the time its GET was sent, answers queries from it while it is fresh for the staleness bound S and otherwise waits for a newer GET; queries share GETs, a GET observes the head when sent, and responses arrive late and out of order. With S = 0, events within a tick are ordered, so a commit that completes earlier in a query's tick counts as before it; with S > 0, times compare by tick. A query includes every commit completed more than S before it started; with S = 0 that is linearizability for one dataset's committed state, and a query also includes the client's own acknowledged write. Witnesses: a query waits for a GET, two queries share one, a late response is ignored, a commit completes while a GET is in flight, a query is served while a newer commit exists, and (S > 0) a query is answered from the cache | Exhaustive: 2 commits, 3 GETs, 2 queries, 4 clock ticks; S = 0 and S = 1 |
 | `commits-etag` | Explicit store-version CAS and delayed retry across head changes; I1–I3, I5 | Exhaustive/control 1; one writer, one original/retry pair |
 | `commits-storage` | Checkpoint parts/root before head publication, delayed GC, a query kept by retention, lagging reopen, late seal; I4, I7, I8 | Bound 2; samples 4 |
@@ -248,6 +269,9 @@ as a separate maintenance process does.
 | `object-names-generation-only` | Name objects by generation and counter only: two units at one generation create one name with different bytes |
 | `object-names-no-generation` | Name objects by unit and counter only: successive holders of one unit create one name with different bytes |
 | `object-names-reuse-unit-id` | Give a retired unit's id to a new unit, whose generation restarts: the new unit creates a name the retired one already holds |
+| `data-files-no-upload-before-commit` | A commit names files whose upload has not returned: the head names a file the store does not hold; committed files exist |
+| `data-files-no-committed-read` | The reader lists the store instead of reading the head: it fetches an uploaded, uncommitted file; reader sees only committed files |
+| `data-files-no-resolve-by-head` | An unknown outcome resolves as aborted when the head lacks its files, without waiting for the head to move past the request's base: the request lands afterwards; unknown outcome resolves all-or-nothing |
 | `reads-token-wait` | Answer a query from any cached head at or past the client's commit number: read-your-writes holds, but a commit that completed before the query started is missing |
 | `reads-response-time` | Count freshness from the GET response's arrival: a late response to an old GET looks fresh and misses a completed commit |
 | `reads-tick-only` | Compare freshness by tick alone with S = 0: a head fetched earlier in the query's tick answers it and misses a commit that completed before the query started |

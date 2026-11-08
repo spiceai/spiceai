@@ -140,6 +140,87 @@ pub struct TestFixture {
     pub catalog: Arc<FixtureCatalog>,
     pub data_path: std::path::PathBuf,
     pub backend_type: BackendType,
+    /// Where this fixture's tables keep their data files; see [`FixtureDataStore`].
+    pub data_store: FixtureDataStore,
+}
+
+/// Where a fixture's tables keep their data files, chosen by `CAYENNE_TEST_DATA_STORE`:
+///
+/// - unset or `local`: the fixture's local data directory, as before;
+/// - `memory`: an in-memory object store under `s3://cayenne-test/<fixture>/data`;
+/// - `fault`: the same, wrapped in `object_store_occ`'s `FaultStore` with no faults
+///   armed, so every operation goes through the fault store's wrapper.
+///
+/// Each fixture gets its own prefix in the one `s3://cayenne-test` bucket, so the
+/// per-dataset store routing in `cayenne::store_routing` keeps their files apart.
+#[derive(Clone)]
+pub struct FixtureDataStore {
+    /// The `base_path` for `CreateTableOptions`.
+    pub base_path: String,
+    /// The store to give `CayenneTableProviderBuilder::with_object_store`, when not local.
+    pub config: Option<cayenne::metadata::ObjectStoreConfig>,
+}
+
+impl FixtureDataStore {
+    fn from_env(data_path: &std::path::Path) -> Result<Self, Box<dyn std::error::Error>> {
+        let kind = std::env::var("CAYENNE_TEST_DATA_STORE").unwrap_or_default();
+        let local = || Self {
+            base_path: data_path.to_string_lossy().to_string(),
+            config: None,
+        };
+        let url = || {
+            url::Url::parse(&format!(
+                "s3://cayenne-test/{}/data",
+                uuid::Uuid::now_v7().simple()
+            ))
+        };
+        Ok(match kind.as_str() {
+            "" | "local" => local(),
+            "memory" => {
+                let url = url()?;
+                Self {
+                    base_path: url.to_string(),
+                    config: Some(cayenne::metadata::ObjectStoreConfig {
+                        url,
+                        store: Arc::new(object_store::memory::InMemory::new()),
+                    }),
+                }
+            }
+            "fault" => {
+                let url = url()?;
+                let fault: Arc<dyn object_store::ObjectStore> =
+                    Arc::new(object_store_occ::sim::fault::FaultStore::new(Arc::new(
+                        object_store::memory::InMemory::new(),
+                    )));
+                Self {
+                    base_path: url.to_string(),
+                    config: Some(cayenne::metadata::ObjectStoreConfig {
+                        url,
+                        store: fault,
+                    }),
+                }
+            }
+            other => {
+                return Err(format!(
+                    "CAYENNE_TEST_DATA_STORE is '{other}'; use 'local', 'memory' or 'fault'"
+                )
+                .into());
+            }
+        })
+    }
+
+    /// A table builder over `catalog` that reads and writes through this data store.
+    pub fn builder(
+        &self,
+        catalog: Arc<dyn MetadataCatalog>,
+        runtime_env: Arc<datafusion::execution::runtime_env::RuntimeEnv>,
+    ) -> cayenne::CayenneTableProviderBuilder {
+        let builder = cayenne::CayenneTableProviderBuilder::new(catalog, runtime_env);
+        match &self.config {
+            Some(config) => builder.with_object_store(config.clone()),
+            None => builder,
+        }
+    }
 }
 
 impl TestFixture {
@@ -158,12 +239,14 @@ impl TestFixture {
 
         let catalog = fixture_catalog(connection_string).await?;
         catalog.init().await?;
+        let data_store = FixtureDataStore::from_env(&data_path)?;
 
         Ok(Self {
             temp_dir,
             catalog,
             data_path,
             backend_type: backend,
+            data_store,
         })
     }
 

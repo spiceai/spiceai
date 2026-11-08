@@ -33,9 +33,9 @@ limitations under the License.
 mod capabilities;
 pub mod cleanup;
 mod conditional;
+pub mod durable_local;
 pub mod headlog;
 pub mod lease;
-pub mod durable_local;
 pub mod local_conditional_put;
 mod retry;
 pub mod sim;

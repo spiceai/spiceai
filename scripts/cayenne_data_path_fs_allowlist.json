@@ -1,0 +1,16 @@
+{
+  "crates/cayenne/src/provider/compaction_writer.rs": 29,
+  "crates/cayenne/src/provider/delete/sink.rs": 1,
+  "crates/cayenne/src/provider/delete/sink/file_based.rs": 1,
+  "crates/cayenne/src/provider/delete/vector_io.rs": 10,
+  "crates/cayenne/src/provider/fadvise_tier.rs": 2,
+  "crates/cayenne/src/provider/fsync_tier.rs": 4,
+  "crates/cayenne/src/provider/mutation_writer.rs": 1,
+  "crates/cayenne/src/provider/on_conflict.rs": 1,
+  "crates/cayenne/src/provider/overwrite.rs": 1,
+  "crates/cayenne/src/provider/partitioned_wal.rs": 10,
+  "crates/cayenne/src/provider/staged_upsert.rs": 1,
+  "crates/cayenne/src/provider/staging_wal.rs": 12,
+  "crates/cayenne/src/provider/table.rs": 34,
+  "crates/cayenne/src/provider/tuning.rs": 9
+}

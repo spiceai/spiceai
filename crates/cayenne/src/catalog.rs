@@ -931,6 +931,18 @@ pub trait MetadataCatalog: Send + Sync {
     /// (`cayenne_snapshot_file`) — the complete file set for a snapshot.
     async fn upsert_snapshot_file(&self, file: &SnapshotFile) -> CatalogResult<()>;
 
+    /// Upsert several rows of one snapshot's manifest, in one commit where the
+    /// metastore can make it one. A table whose scans read only the manifest (its
+    /// data is in the object-native location) records each write's files here
+    /// before the write returns. Wrappers must forward this, not inherit the
+    /// row-at-a-time default.
+    async fn upsert_snapshot_files(&self, files: &[SnapshotFile]) -> CatalogResult<()> {
+        for file in files {
+            self.upsert_snapshot_file(file).await?;
+        }
+        Ok(())
+    }
+
     /// Atomically replace the complete manifest for one snapshot. Readers see
     /// either the old complete set or the new complete set, never a partial
     /// prefix if an insert fails.

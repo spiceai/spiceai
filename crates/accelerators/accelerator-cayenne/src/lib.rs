@@ -1743,7 +1743,8 @@ impl CayenneAccelerator {
         let dataset_name = source.name().to_string().replace(['.', '/'], "_");
 
         if let Some(custom_path) = acceleration_params.get("cayenne_file_path") {
-            return Self::resolve_custom_data_path(&dataset_name, custom_path);
+            let allow_standard_s3 = Self::vnext_enabled(source)?;
+            return Self::resolve_custom_data_path(&dataset_name, custom_path, allow_standard_s3);
         }
 
         if let Some(zone_ids) = acceleration_params.get("cayenne_s3_zone_ids") {
@@ -1806,8 +1807,12 @@ impl CayenneAccelerator {
         paths
     }
 
-    fn resolve_custom_data_path(dataset_name: &str, custom_path: &str) -> Result<String> {
-        s3::validate_file_path(custom_path).context(S3Snafu)?;
+    fn resolve_custom_data_path(
+        dataset_name: &str,
+        custom_path: &str,
+        allow_standard_s3: bool,
+    ) -> Result<String> {
+        s3::validate_file_path(custom_path, allow_standard_s3).context(S3Snafu)?;
         let base = custom_path.trim_end_matches('/');
         Ok(format!("{base}/{dataset_name}/"))
     }
@@ -1920,6 +1925,40 @@ impl CayenneAccelerator {
     /// - [`metastore_file_under`] answers for a metastore that is on disk under the
     ///   directory whoever configured it — another dataset, or a configuration nothing
     ///   names any more. Nothing on the params path can see those.
+    /// Deletes every object under the object-store data path `data_dir` through
+    /// the dataset's store, for `mode: file_create`, and returns how many it deleted.
+    async fn remove_object_store_data(
+        source: &dyn AccelerationSource,
+        data_dir: &str,
+    ) -> Result<usize> {
+        use futures::{StreamExt, TryStreamExt};
+        let Some(config) = s3::build_s3_object_store(source, data_dir.to_string())
+            .await
+            .context(S3Snafu)?
+        else {
+            return Ok(0);
+        };
+        let prefix = object_store::path::Path::from(config.url.path().trim_matches('/'));
+        let table_name = source.name().to_string();
+        let removal_failed = |error: object_store::Error| Error::AccelerationDataDirRemovalFailed {
+            table_name: table_name.clone(),
+            data_dir: data_dir.to_string(),
+            source: std::io::Error::other(error),
+        };
+        let locations = config
+            .store
+            .list(Some(&prefix))
+            .map_ok(|meta| meta.location)
+            .boxed();
+        let deleted: Vec<object_store::path::Path> = config
+            .store
+            .delete_stream(locations)
+            .try_collect()
+            .await
+            .map_err(removal_failed)?;
+        Ok(deleted.len())
+    }
+
     async fn remove_acceleration_data_dir(
         source: &dyn AccelerationSource,
         data_dir: &str,
@@ -2105,7 +2144,11 @@ impl CayenneAccelerator {
             // Unknown — correct, since the storage-aware file-size override below
             // is skipped for object stores. `*_dir` may be a `file://` URI, so
             // strip the scheme before probing the real filesystem path.
-            let data_dir = CayenneAccelerator::new().cayenne_data_dir(source).ok();
+            // An object-store data path has no local volume to probe.
+            let data_dir = CayenneAccelerator::new()
+                .cayenne_data_dir(source)
+                .ok()
+                .filter(|dir| !cayenne::is_object_store_path(dir));
             let metadata_dir = CayenneAccelerator::resolve_metadata_dir(Some(acceleration));
             let hw = autotune::HardwareProfile::detect(
                 acceleration.storage_profile,
@@ -3243,6 +3286,84 @@ impl CayenneAccelerator {
         Ok(())
     }
 
+    /// Where `table_name`'s data files live when its metastore is the object-native
+    /// one in an object-store `runtime.state.location`: in its dataset folder there,
+    /// `…/cayenne/v1/datasets/<name>-<id>/data`, the table path the metastore records.
+    ///
+    /// Placement is decided once, when the dataset is created, and the recorded table
+    /// path keeps it: a dataset created elsewhere stays there, and one created in the
+    /// location stays in it. A dataset whose configuration needs something data in
+    /// the location does not support yet is created at its data path as before; one
+    /// already in the location that now needs it fails to load rather than move.
+    async fn object_native_data_placement(
+        source: &dyn AccelerationSource,
+        catalog: &Arc<dyn cayenne::MetadataCatalog>,
+        table_name: &str,
+    ) -> Result<Option<ObjectNativeDataPlacement>> {
+        let Some(native) = catalog
+            .as_any()
+            .downcast_ref::<cayenne::metastore::object_native::ObjectNativeCatalog>()
+        else {
+            return Ok(None);
+        };
+        let app = source.app();
+        let Some(state) = app.runtime.state.as_ref() else {
+            return Ok(None);
+        };
+        let Ok(location) = url::Url::parse(&state.location) else {
+            return Ok(None);
+        };
+        // Local directories keep today's data path until they move onto the store.
+        let (true, Some(bucket)) = (location.scheme() == "s3", location.host_str()) else {
+            return Ok(None);
+        };
+        let datasets_url = format!("s3://{bucket}/{}", native.datasets_prefix());
+        let store = cayenne::metadata::ObjectStoreConfig {
+            url: url::Url::parse(&datasets_url)
+                .boxed()
+                .context(AccelerationCreationFailedSnafu)?,
+            store: native.store(),
+        };
+        let unsupported = object_native_data_unsupported(source);
+        match catalog.get_table(table_name).await {
+            Ok(stored) => {
+                if !cayenne::metastore_layout::is_object_native_data_path(&stored.path) {
+                    return Ok(None);
+                }
+                if let Some(reason) = unsupported {
+                    return InvalidConfigurationSnafu {
+                        detail: Arc::from(format!(
+                            "Dataset '{table_name}' (cayenne) keeps its data in '{}', which does not support {reason} yet. Remove {reason}, or set `mode: file_create` to reload the dataset from its source.",
+                            state.location
+                        )),
+                    }
+                    .fail();
+                }
+                return Ok(Some(ObjectNativeDataPlacement {
+                    base_path: stored.path,
+                    store,
+                }));
+            }
+            Err(cayenne::CatalogError::TableNotFound { .. }) => {}
+            Err(error) => return Err(error).boxed().context(AccelerationCreationFailedSnafu),
+        }
+        if let Some(reason) = unsupported {
+            tracing::info!(
+                target: "spiced::acceleration::cayenne",
+                "Dataset '{table_name}' (cayenne) keeps its data files at its data path rather than in '{}', because data in the state location does not support {reason} yet.",
+                state.location
+            );
+            return Ok(None);
+        }
+        let folder = cayenne::metastore::object_native::new_dataset_folder(table_name);
+        let base_path = format!("{datasets_url}/{folder}/data");
+        tracing::info!(
+            target: "spiced::acceleration::cayenne",
+            "Dataset '{table_name}' (cayenne) keeps its data files in '{base_path}', beside its metadata in the state location."
+        );
+        Ok(Some(ObjectNativeDataPlacement { base_path, store }))
+    }
+
     /// Get or create the object-native catalog, with no SQL metastore. With
     /// `runtime.state.location` set, its head log is kept in the location's
     /// `cayenne/v1/` folder; otherwise in `{metadata_dir}/object_native`.
@@ -3520,7 +3641,14 @@ impl CayenneAccelerator {
         // Build S3 object store if using S3 Express One Zone storage. Memory mode
         // has no data directory or object store (and `cayenne_data_dir` errors for
         // it), so skip this entirely — memory-mode data lives only in RAM.
-        let object_store = if memory_mode {
+        // With the object-native metastore in an object-store `runtime.state.location`,
+        // a dataset created there keeps its data files in its dataset folder too.
+        let placement = if memory_mode {
+            None
+        } else {
+            Self::object_native_data_placement(source, &catalog, table_name).await?
+        };
+        let object_store = if memory_mode || placement.is_some() {
             None
         } else {
             s3::build_s3_object_store(source, self.cayenne_data_dir(source)?)
@@ -3528,10 +3656,13 @@ impl CayenneAccelerator {
                 .context(S3Snafu)?
         };
 
-        // Prototype: a local file-mode table is addressed as `file://` and goes through
-        // the durable local object store, so local and S3 run one code path.
-        let (dir_path, object_store) =
-            if !memory_mode && object_store.is_none() && !dir_path.starts_with("s3://") {
+        // Under `cayenne_vnext`, a local file-mode table is addressed as `file://` and
+        // goes through the durable local object store, so local and S3 run one code
+        // path. With the flag off, local tables keep today's file I/O.
+        let local_through_store = !memory_mode && Self::vnext_enabled(source)?;
+        let (dir_path, object_store) = if let Some(placement) = placement {
+            (placement.base_path, Some(placement.store))
+        } else if local_through_store && object_store.is_none() && !dir_path.starts_with("s3://") {
                 let abs = tokio::fs::canonicalize(dir_path)
                     .await
                     .boxed()
@@ -3762,6 +3893,44 @@ impl CayenneAccelerator {
         }
         Ok(provider)
     }
+}
+
+/// A dataset's data files in its dataset folder in the object-native location.
+struct ObjectNativeDataPlacement {
+    /// The table path: `…/cayenne/v1/datasets/<name>-<id>/data`.
+    base_path: String,
+    /// The location's store, routed for every dataset folder.
+    store: cayenne::metadata::ObjectStoreConfig,
+}
+
+/// What `source` needs that data in the object-native location does not support yet,
+/// as the setting to name in a message; `None` when its data can go there. Covered
+/// so far: `refresh_mode: full` and `append`, with or without a primary key (whose
+/// upserts write deletion vectors through the dataset's store); change streams are
+/// not.
+fn object_native_data_unsupported(source: &dyn AccelerationSource) -> Option<&'static str> {
+    let acceleration = source.acceleration()?;
+    match resolved_refresh_mode(source, acceleration) {
+        RefreshMode::Full | RefreshMode::Append => {}
+        RefreshMode::Changes => return Some("`refresh_mode: changes`"),
+        RefreshMode::Caching => return Some("`refresh_mode: caching`"),
+        RefreshMode::Snapshot => return Some("`refresh_mode: snapshot`"),
+        RefreshMode::Disabled => return Some("`refresh_mode: disabled`"),
+    }
+    for param in [
+        "cayenne_file_path",
+        "cayenne_s3_zone_ids",
+        "cayenne_datalake_location",
+    ] {
+        if acceleration.params.get(param).is_some_and(|value| !value.trim().is_empty()) {
+            return Some(match param {
+                "cayenne_file_path" => "`cayenne_file_path`",
+                "cayenne_s3_zone_ids" => "`cayenne_s3_zone_ids`",
+                _ => "`cayenne_datalake_location`",
+            });
+        }
+    }
+    None
 }
 
 /// Registration-time validation for datalake (cold) tier table options: the
@@ -4659,12 +4828,21 @@ impl DataAccelerator for CayenneAccelerator {
                     "Deleted the acceleration data directory '{dir_path}' of dataset '{dataset}' (cayenne), so everything it had accelerated is gone and the dataset reloads empty. `mode: file_create` recreates the acceleration from the source on every load; set `mode: file_update` to keep the existing data across loads. See: https://spiceai.org/docs/components/data-accelerators/cayenne",
                     dataset = source.name(),
                 );
+            } else if cayenne::is_object_store_path(&dir_path) {
+                let deleted = Self::remove_object_store_data(source, &dir_path).await?;
+                if deleted > 0 {
+                    tracing::warn!(
+                        "Deleted the {deleted} acceleration data object(s) under '{dir_path}' of dataset '{dataset}' (cayenne), so everything it had accelerated is gone and the dataset reloads empty. `mode: file_create` recreates the acceleration from the source on every load; set `mode: file_update` to keep the existing data across loads. See: https://spiceai.org/docs/components/data-accelerators/cayenne",
+                        dataset = source.name(),
+                    );
+                }
             }
         }
 
-        // Create the vortex data directory if it doesn't exist
+        // Create the vortex data directory if it doesn't exist. An object-store
+        // location has no directories: nothing local is created for it.
         let path_buf = PathBuf::from(&dir_path);
-        if !path_exists(&path_buf).await {
+        if !cayenne::is_object_store_path(&dir_path) && !path_exists(&path_buf).await {
             tokio::fs::create_dir_all(&path_buf)
                 .await
                 .boxed()

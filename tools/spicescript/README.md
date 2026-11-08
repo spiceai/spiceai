@@ -156,7 +156,7 @@ steps:
 | `kafka` | Redpanda (`v26.1.6`), with a topic prefix per instance. Tables are `<namespace>_<table>`, created with three partitions on first write. Connector params include bootstrap servers and PLAINTEXT security. |
 | `mongodb` | MongoDB (`8.0`) single-node replica set, with a database per instance. Connector params include its connection string. |
 | `dynamodb` | LocalStack (`4.9`), with a table-name prefix per instance. Tables are `<namespace>_<table>`, created on first write with a numeric or string HASH key and `NEW_AND_OLD_IMAGES` streams. Connector params include endpoint, region and test credentials. |
-| `rustfs` | An S3-compatible store with conditional writes, with a bucket per instance, managed with the `aws` CLI. `${sources.<name>.params}` holds the `s3_*` parameters. `.bucket`, `.endpoint`, `.key` and `.secret` serve other uses, such as a Cayenne data tier or a state location. `.shared_bucket` is one bucket every instance shares, for two variants that act as replicas over one state location. |
+| `rustfs` | An S3-compatible store with conditional writes, with a bucket per instance, managed with the `aws` CLI. `${sources.<name>.params}` holds the `s3_*` parameters. `.bucket`, `.endpoint`, `.key` and `.secret` serve other uses, such as a Cayenne data tier or a state location. `.shared_bucket` is one bucket every instance shares, for two variants that act as replicas over one state location. `latency: 20ms` puts a toxiproxy in front of the store that delays every response by that long; `.endpoint` and `.params` then go through it, while the harness's own requests (`assert-objects`) go to the store directly. |
 | `files` | A directory per instance (`${sources.<name>.path}`) holding generated Parquet or CSV part files. |
 | `iceberg` | An Iceberg REST catalog over rustfs. `source-exec` and oracle queries run through the `duckdb` CLI attached to the catalog, so a script writes Iceberg with plain SQL and checks Spice against DuckDB reading the same tables. |
 | `duckdb` | A DuckDB file per instance, written before `start` or while Spice is stopped. `${sources.<name>.params}` holds `duckdb_open`; `.path` is the file path and `.adbc_params` holds the DuckDB ADBC parameters. CLI and library are one DuckDB release (see **DuckDB releases**). |
@@ -264,7 +264,8 @@ Spice's own `${secrets:…}` and `${env:…}` pass through to `spiced`.
 | `explain: <sql>` | `EXPLAIN` (`analyze: true`), requiring `contains:` fragments or the absence of `omits:` ones. |
 | `assert-status: { dataset, status, message-contains, ready, has, lacks }` | Check a dataset's status from `/v1/datasets`. |
 | `assert-log: { contains, lacks, count, clean, allow }` | Check the instance's `spiced.log` with regular expressions; `count: { <pattern>: N \| '>=N' }`. |
-| `assert-files: { contains, lacks }` | Check files under the instance's directory. |
+| `assert-files: { contains, lacks }` | Check files under the instance's directory, by path relative to it (files only, not empty directories). |
+| `wipe-instance-dir: { keep }` | Delete everything `spiced` wrote in the instance's directory (`.spice/`, data and metastore files), as if the instance had lost its disk, keeping the spicepod, `spiced.log` and the `keep` paths (relative to the directory, such as a local state location). Refused while `spiced` or an executor runs; put `stop` or `kill-spiced` before it. |
 | `assert-objects: { source, prefix, contains, min, max }` | Require objects under a prefix of an object store or files source; `contains` counts only keys containing that text. `min` defaults to 1, or to 0 when `max` is given (`max: 0` requires none). |
 | `mark-metrics: <id>` | Keep a `/metrics` scrape for a later `wait-metric … since:`. |
 | `wait-metric: { name, labels, above \| below \| increases \| increased-by, since, timeout, drive }` | Wait for a series to meet a condition. `drive` writes new data each round while waiting, for conditions (such as a compaction) that need new data rather than time. |
@@ -279,7 +280,7 @@ Spice's own `${secrets:…}` and `${env:…}` pass through to `spiced`.
 
 Any step takes `only: <variant>` or `except: <variant>` (or a list), and
 `when: { <matrix key>: <value> }`. A failed lifecycle step (`start`, `stop`,
-`restart`, `upgrade`, `kill-spiced`, `wait-ready`) skips the rest of that
+`restart`, `upgrade`, `kill-spiced`, `wait-ready`, `wipe-instance-dir`) skips the rest of that
 instance; any other failure is a failed check and the script goes on.
 
 `protocols` on `query`, `corpus`, and inside `random-queries` selects the

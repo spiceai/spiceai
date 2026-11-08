@@ -147,6 +147,12 @@ pub struct SourceSpec {
     /// either way.
     #[serde(default)]
     pub host_network: bool,
+    /// `rustfs` sources: put a toxiproxy in front of the store that delays
+    /// every response by this long, so `spiced` (`${sources.<name>.endpoint}`
+    /// and `.params`) sees a remote store's round trip. The harness's own
+    /// requests (buckets, `assert-objects`) go to the store directly.
+    #[serde(default, with = "opt_duration")]
+    pub latency: Option<Duration>,
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -458,6 +464,14 @@ pub enum Action {
         sql: String,
         rows: Vec<Vec<Value>>,
         timing: Timing,
+    },
+    /// Deletes what `spiced` wrote in the instance's directory (its data,
+    /// `.spice/`, metastore files), as if the instance had lost its disk,
+    /// keeping the harness's own files (the spicepod, `spiced.log`) and the
+    /// paths in `keep`, relative to the directory. Refused while `spiced` or
+    /// an executor runs.
+    WipeInstanceDir {
+        keep: Vec<String>,
     },
     /// Checks the files under the instance's directory, by path relative to it.
     AssertFiles {
@@ -1369,6 +1383,7 @@ const ACTIONS: &[&str] = &[
     "dbgen",
     "source-query",
     "assert-files",
+    "wipe-instance-dir",
     "stop-background",
     "spice",
     "slt-setup",
@@ -1712,6 +1727,25 @@ fn parse_step(index: usize, step: Value) -> Result<Step> {
                 "`assert-files` needs `contains` or `lacks`"
             );
             Action::AssertFiles { contains, lacks }
+        }
+        "wipe-instance-dir" => {
+            let mut inner = Opts::of_mapping(
+                arg,
+                "`wipe-instance-dir` takes a mapping: `{}` or `{ keep: [<path>…] }`",
+            )?;
+            let keep = inner.list("keep")?;
+            inner.finish()?;
+            for path in &keep {
+                let relative = Path::new(path);
+                ensure!(
+                    !path.is_empty()
+                        && relative
+                            .components()
+                            .all(|c| matches!(c, std::path::Component::Normal(_))),
+                    "`wipe-instance-dir` keeps paths inside the instance's directory, such as `state`; '{path}' is not one"
+                );
+            }
+            Action::WipeInstanceDir { keep }
         }
         "source-query" => {
             let Value::Object(m) = arg else {
@@ -2514,6 +2548,52 @@ steps:
                 signal: KillSignal::StopThenKill
             }
         ));
+    }
+
+    #[test]
+    fn wipe_instance_dir_keeps_only_relative_paths() {
+        let script = |arg: &str| {
+            Script::parse(&format!(
+                "name: w\nspicepod: {{}}\nsteps:\n  - stop: {{}}\n  - wipe-instance-dir: {arg}\n"
+            ))
+        };
+        let parsed = script("{}").expect("no paths kept");
+        assert!(matches!(
+            &parsed.steps[1].action,
+            Action::WipeInstanceDir { keep } if keep.is_empty()
+        ));
+        let parsed = script("{ keep: [state, 'meta/x'] }").expect("relative paths");
+        assert!(matches!(
+            &parsed.steps[1].action,
+            Action::WipeInstanceDir { keep } if keep == &["state".to_string(), "meta/x".to_string()]
+        ));
+        for (arg, error) in [
+            ("{ keep: ['/tmp'] }", "'/tmp' is not one"),
+            ("{ keep: ['../x'] }", "'../x' is not one"),
+            ("{ keep: [''] }", "'' is not one"),
+            ("{ keep: state }", "`keep` must be a list"),
+            ("{ remove: [x] }", "unknown option `remove`"),
+            ("[]", "takes a mapping"),
+        ] {
+            let message = format!("{:#}", script(arg).expect_err(arg));
+            assert!(message.contains(error), "{arg}: {message}");
+        }
+    }
+
+    #[test]
+    fn a_rustfs_source_takes_a_latency() {
+        let script = Script::parse(
+            "name: l\nsources: { slow: { kind: rustfs, latency: 20ms } }\nspicepod: {}\nsteps: [{ start: {} }]\n",
+        )
+        .expect("latency parses");
+        assert_eq!(
+            script.sources["slow"].latency,
+            Some(Duration::from_millis(20))
+        );
+        Script::parse(
+            "name: l\nsources: { slow: { kind: rustfs, latency: soon } }\nspicepod: {}\nsteps: [{ start: {} }]\n",
+        )
+        .expect_err("not a duration");
     }
 
     #[test]

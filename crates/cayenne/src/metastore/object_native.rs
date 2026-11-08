@@ -35,7 +35,7 @@ use std::{collections::HashMap, sync::Arc};
 use tokio::sync::Notify;
 
 mod catalog;
-pub use catalog::{ObjectNativeCatalog, dataset_log_at};
+pub use catalog::{ObjectNativeCatalog, dataset_log_at, new_dataset_folder};
 
 /// One head log: a serial writer and its last acknowledged state. The catalog
 /// keeps one for its name registry and one per dataset. No database is used.
@@ -1610,6 +1610,31 @@ impl MetadataCatalog for Domain {
             )])
             .await
     }
+    async fn upsert_snapshot_files(&self, files: &[SnapshotFile]) -> CatalogResult<()> {
+        if files.is_empty() {
+            return Ok(());
+        }
+        let mut groups: Vec<(&str, &str, Vec<SnapshotFile>)> = Vec::new();
+        for file in files {
+            match groups
+                .iter_mut()
+                .find(|(table, snapshot, _)| *table == file.table_id && *snapshot == file.snapshot_id)
+            {
+                Some((_, _, rows)) => rows.push(file.clone()),
+                None => groups.push((&file.table_id, &file.snapshot_id, vec![file.clone()])),
+            }
+        }
+        self.inner
+            .take()
+            .await
+            .commit(
+                groups
+                    .iter()
+                    .map(|(table, snapshot, rows)| actions::add_files(table, snapshot, rows, true))
+                    .collect(),
+            )
+            .await
+    }
     async fn replace_snapshot_files(
         &self,
         table_id: &str,
@@ -2175,7 +2200,7 @@ impl Domain {
         {
             return inner.reopen_table(&options).await;
         }
-        if !options.base_path.starts_with("s3://") && !options.vortex_config.memory_mode {
+        if !crate::is_object_store_path(&options.base_path) && !options.vortex_config.memory_mode {
             let table_root = std::path::PathBuf::from(&options.base_path).join(&id);
             tokio::fs::create_dir_all(table_root.join(&snapshot)).await?;
             tokio::task::spawn_blocking(move || {

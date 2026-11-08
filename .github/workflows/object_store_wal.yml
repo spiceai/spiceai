@@ -4,6 +4,8 @@ on:
   pull_request:
     paths:
       - 'crates/object_store_occ/**'
+      # headlog_replay links the model crate.
+      - 'crates/cayenne-metastore-model/**'
       - 'test/object_store_occ/**'
       - '.github/workflows/object_store_wal.yml'
       - 'Cargo.toml'
@@ -53,6 +55,7 @@ jobs:
           filters: |
             code_changes:
               - 'crates/object_store_occ/**'
+              - 'crates/cayenne-metastore-model/**'
               - 'test/object_store_occ/**'
               - '.github/workflows/object_store_wal.yml'
               - 'Cargo.toml'
@@ -192,9 +195,15 @@ jobs:
           "$python" -m venv "$RUNNER_TEMP/wal-oracle"
           "$RUNNER_TEMP/wal-oracle/bin/python" -m pip install --only-binary=:all: -r test/object_store_occ/requirements.txt
           echo "$RUNNER_TEMP/wal-oracle/bin" >> "$GITHUB_PATH"
-      - name: Test state protocol and cancellation
+      # Every store-independent test binary; s3_integration runs on the service legs.
+      - name: Test state protocol, cancellation, faults and model replays
         if: matrix.store == 'disk'
-        run: cargo test --locked --profile dev -p object_store_occ --lib --test state_store --test transactional_wal --test local_cancellation -- --nocapture
+        run: >-
+          cargo test --locked --profile dev -p object_store_occ --lib
+          --test state_store --test transactional_wal --test local_cancellation
+          --test fault --test headlog --test headlog_replay --test data_file_replay
+          --test prefix_listing --test local_root_overlap
+          -- --nocapture
       - name: Build the process worker
         run: cargo build --locked --profile dev -p object_store_occ --example wal_test_driver
 

@@ -62,7 +62,9 @@ pub fn record_cleanup_deleted(feature: StateFeature, objects: usize) {
 
 /// Wraps `store` so that every request `feature` makes through it is measured.
 /// Returns `store` itself for a feature without a metric label.
-pub(crate) fn metered(store: Arc<dyn ObjectStore>, feature: StateFeature) -> Arc<dyn ObjectStore> {
+/// `store` with its requests counted in the `state_store_*` metrics under `feature`.
+#[must_use]
+pub fn metered(store: Arc<dyn ObjectStore>, feature: StateFeature) -> Arc<dyn ObjectStore> {
     match feature.metric_label() {
         Some(feature) => Arc::new(MeteredStore {
             inner: store,

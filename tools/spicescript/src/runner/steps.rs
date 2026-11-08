@@ -17,12 +17,15 @@ limitations under the License.
 //! Running one step: the dispatcher for every action, and how a step is
 //! described in reports.
 
+use std::path::{Path, PathBuf};
 use std::time::Instant;
 
 use anyhow::{Context, Result, anyhow, bail, ensure};
 use serde_json::Value;
 
+use crate::reap::PID_FILE;
 use crate::script::{Action, KillSignal, Script, Step};
+use crate::spiced::Spiced;
 use crate::{compare, template};
 
 use super::{
@@ -74,6 +77,10 @@ pub(super) fn describe(action: &Action) -> String {
         }
         Action::StopBackground { id, .. } => format!("stop-background {id}"),
         Action::AssertFiles { .. } => "assert-files".into(),
+        Action::WipeInstanceDir { keep } if keep.is_empty() => "wipe-instance-dir".into(),
+        Action::WipeInstanceDir { keep } => {
+            format!("wipe-instance-dir (keep {})", keep.join(", "))
+        }
         Action::Tlp(t) => format!(
             "tlp {}: {} predicates (seed {})",
             t.table, t.queries, t.seed
@@ -133,6 +140,50 @@ pub(super) fn describe(action: &Action) -> String {
         Action::Slt(s) => format!("slt {} over {}", s.file, s.source),
         Action::Sleep(d) => format!("sleep {d:?}"),
     }
+}
+
+/// Files the harness itself keeps in an instance's directory, rather than
+/// `spiced`: what a lost disk would not take with it.
+const HARNESS_FILES: &[&str] = &["spicepod.yaml", "spiced.log", PID_FILE, "spiced.bin"];
+
+/// Deletes everything under `directories[0]` (the instance's directory)
+/// except each of `directories`' [`HARNESS_FILES`] (executors keep theirs in
+/// directories below it) and the `keep` paths, relative to the instance's
+/// directory. Returns how many entries it removed.
+fn wipe_instance_dir(directories: &[&Path], keep: &[String]) -> Result<usize> {
+    let Some(root) = directories.first() else {
+        return Ok(0);
+    };
+    let kept: Vec<PathBuf> = directories
+        .iter()
+        .flat_map(|dir| HARNESS_FILES.iter().map(|f| dir.join(f)))
+        .chain(keep.iter().map(|k| root.join(k)))
+        .collect();
+    let mut removed = 0;
+    let mut pending = vec![root.to_path_buf()];
+    while let Some(dir) = pending.pop() {
+        for entry in
+            std::fs::read_dir(&dir).with_context(|| format!("Failed to list {}", dir.display()))?
+        {
+            let path = entry?.path();
+            if kept.contains(&path) {
+                continue;
+            }
+            // A directory holding something kept is emptied rather than removed.
+            if kept.iter().any(|k| k.starts_with(&path)) {
+                pending.push(path);
+                continue;
+            }
+            let outcome = if path.is_dir() && !path.is_symlink() {
+                std::fs::remove_dir_all(&path)
+            } else {
+                std::fs::remove_file(&path)
+            };
+            outcome.with_context(|| format!("Failed to remove {}", path.display()))?;
+            removed += 1;
+        }
+    }
+    Ok(removed)
 }
 
 pub(super) fn one_line(s: &str, max: usize) -> String {
@@ -617,6 +668,21 @@ pub(super) async fn run_instance_step(
                 started.elapsed().as_secs_f64()
             ));
         }
+        Action::WipeInstanceDir { keep } => {
+            ensure!(
+                !instance.spiced.is_running()
+                    && !instance.executors.iter_mut().any(Spiced::is_running),
+                "`wipe-instance-dir` deletes the files of a stopped instance, but spiced is running; put `stop: {{}}` or `kill-spiced: {{}}` before it"
+            );
+            let directories: Vec<&Path> = std::iter::once(instance.spiced.dir.as_path())
+                .chain(instance.executors.iter().map(|e| e.dir.as_path()))
+                .collect();
+            let removed = wipe_instance_dir(&directories, keep)?;
+            return Ok(format!(
+                " ({:.1}s) removed {removed} entries",
+                started.elapsed().as_secs_f64()
+            ));
+        }
         Action::StopBackground { id, allow } => {
             let shown = stop_background(instance, id, allow).await?;
             return Ok(format!(
@@ -638,4 +704,63 @@ pub(super) async fn run_instance_step(
         | Action::Sleep(_) => unreachable!("source steps run once, not per instance"),
     }
     Ok(format!(" ({:.1}s)", started.elapsed().as_secs_f64()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::wipe_instance_dir;
+
+    #[test]
+    fn wiping_keeps_the_harness_files_and_the_kept_paths() {
+        let root = std::env::temp_dir().join(format!("spicescript-wipe-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let executor = root.join("executor-0");
+        for file in [
+            "spicepod.yaml",
+            "spiced.log",
+            "spiced.pid",
+            ".spice/data/t/part-0.vortex",
+            "meta/cayenne.db",
+            "s3:/bucket/state/x",
+            "state/cayenne/v1/catalog/head",
+            "executor-0/spiced.log",
+            "executor-0/.spice/data/t/part-1.vortex",
+        ] {
+            let path = root.join(file);
+            std::fs::create_dir_all(path.parent().expect("parent")).expect("mkdir");
+            std::fs::write(&path, "x").expect("write");
+        }
+        let removed = wipe_instance_dir(&[&root, &executor], &["state".to_string()]).expect("wipe");
+        let mut left = Vec::new();
+        let mut pending = vec![root.clone()];
+        while let Some(dir) = pending.pop() {
+            for entry in std::fs::read_dir(&dir).expect("list") {
+                let path = entry.expect("entry").path();
+                if path.is_dir() {
+                    pending.push(path);
+                } else {
+                    left.push(
+                        path.strip_prefix(&root)
+                            .expect("under root")
+                            .to_string_lossy()
+                            .into_owned(),
+                    );
+                }
+            }
+        }
+        left.sort();
+        assert_eq!(
+            left,
+            [
+                "executor-0/spiced.log",
+                "spiced.log",
+                "spiced.pid",
+                "spicepod.yaml",
+                "state/cayenne/v1/catalog/head"
+            ]
+        );
+        // `.spice`, `meta`, `s3:` and the executor's `.spice`.
+        assert_eq!(removed, 4);
+        std::fs::remove_dir_all(&root).expect("clean up");
+    }
 }

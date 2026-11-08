@@ -412,3 +412,50 @@ mod tests {
         );
     }
 }
+
+/// Whether `path` (a table's data path) is a dataset folder's `data` prefix in an
+/// object-native location: `<scheme>://<bucket>/…/v1/datasets/<folder>/data`.
+///
+/// This is where Cayenne puts a dataset's data files when the dataset is created
+/// with its data in `runtime.state.location`, and the table path the metastore
+/// records for it is the record of that placement. Such a table's data files are
+/// the ones its commits name: scans read them from the committed state and never
+/// list the location, and each write records its files before it returns.
+#[must_use]
+pub fn is_object_native_data_path(path: &str) -> bool {
+    if !crate::is_object_store_path(path) || path.starts_with("file://") {
+        return false;
+    }
+    let Ok(url) = url::Url::parse(path) else {
+        return false;
+    };
+    let segments: Vec<&str> = url.path().trim_matches('/').split('/').collect();
+    matches!(
+        segments.as_slice(),
+        [.., "v1", "datasets", folder, "data"] if !folder.is_empty()
+    )
+}
+
+#[cfg(test)]
+mod object_native_data_path_tests {
+    use super::is_object_native_data_path;
+
+    #[test]
+    fn recognizes_only_a_dataset_folder_data_prefix() {
+        assert!(is_object_native_data_path(
+            "s3://bucket/state/cayenne/v1/datasets/orders-0190c2c4-0000-7000-8000-000000000000/data"
+        ));
+        assert!(is_object_native_data_path(
+            "s3://bucket/cayenne/v1/datasets/orders-x/data/"
+        ));
+        assert!(!is_object_native_data_path("s3://bucket/cayenne/orders/"));
+        assert!(!is_object_native_data_path(
+            "s3://bucket/cayenne/v1/datasets/orders-x/head"
+        ));
+        assert!(!is_object_native_data_path("/var/spice/data/orders"));
+        assert!(!is_object_native_data_path(
+            "file:///tmp/cayenne/v1/datasets/orders-x/data"
+        ));
+    }
+}
+

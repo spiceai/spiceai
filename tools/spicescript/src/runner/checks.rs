@@ -59,11 +59,13 @@ pub(super) fn assert_files(
             problems.push(format!("/{pattern}/ matches {file}"));
         }
     }
+    // The directory goes after ` --- `, which an expected failure's signature
+    // leaves out, since it differs between runs and machines.
     ensure!(
         problems.is_empty(),
-        "under {}: {}",
-        dir.display(),
-        problems.join("; ")
+        "{} --- under {}",
+        problems.join("; "),
+        dir.display()
     );
     Ok(format!("{} files", files.len()))
 }

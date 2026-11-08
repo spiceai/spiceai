@@ -327,6 +327,11 @@ impl Drop for UncommittedDeleteFilesGuard {
                     std::thread::yield_now();
                 }
                 for path in paths {
+                    // Object-store files are removed through the store, never as
+                    // a local path; without a runtime they are left for the sweep.
+                    if crate::is_object_store_path(&path.to_string_lossy()) {
+                        continue;
+                    }
                     match std::fs::remove_file(path) {
                         Ok(()) => {}
                         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}

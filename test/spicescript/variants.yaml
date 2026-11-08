@@ -40,3 +40,44 @@ turso-file:
   datasets: { '*': { acceleration: { enabled: true, engine: turso, mode: file } } }
 turso-memory:
   datasets: { '*': { acceleration: { enabled: true, engine: turso, mode: memory } } }
+
+# Object-native Cayenne data (#16131): with the prototype metastore on, a file
+# acceleration keeps its data files in `runtime.state.location`, named in the
+# metastore's commits, so an instance that loses its directory
+# (`wipe-instance-dir`) serves the dataset again from the location alone.
+# Locally the location is a directory in the instance's own, which stands for
+# storage the instance does not lose: `wipe-instance-dir: { keep: [state] }`.
+object-native-data-local:
+  spicepod:
+    runtime:
+      params: { cayenne_vnext: enabled }
+      state: { location: 'file://${instance.dir}/state/' }
+# In an S3-compatible store; the script declares a `rustfs` source named `lake`.
+object-native-data-rustfs:
+  spicepod:
+    runtime:
+      params: { cayenne_vnext: enabled }
+      state:
+        location: s3://${sources.lake.bucket}/state/
+        params:
+          s3_endpoint: ${sources.lake.endpoint}
+          s3_region: us-east-1
+          s3_auth: key
+          s3_key: ${sources.lake.key}
+          s3_secret: ${sources.lake.secret}
+          allow_http: 'true'
+# The same with every response of the store 20 ms late, as from a remote
+# region; the script declares `slow-lake: { kind: rustfs, latency: 20ms }`.
+object-native-data-rustfs-latency:
+  spicepod:
+    runtime:
+      params: { cayenne_vnext: enabled }
+      state:
+        location: s3://${sources.slow-lake.bucket}/state/
+        params:
+          s3_endpoint: ${sources.slow-lake.endpoint}
+          s3_region: us-east-1
+          s3_auth: key
+          s3_key: ${sources.slow-lake.key}
+          s3_secret: ${sources.slow-lake.secret}
+          allow_http: 'true'

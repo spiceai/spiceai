@@ -16,7 +16,7 @@ limitations under the License.
 
 //! A [`LocalFileSystem`] whose writes are durable before they return.
 //!
-//! [`LocalFileSystem`] (object_store 0.13) never syncs: a put or a multipart
+//! [`LocalFileSystem`] (`object_store` 0.13) never syncs: a put or a multipart
 //! completion survives a process crash but not a power loss. This wrapper syncs
 //! the written file and then its parent directory, both with
 //! [`std::fs::File::sync_all`] (`F_FULLFSYNC` on macOS), after every put,
@@ -43,8 +43,8 @@ use object_store::local::LocalFileSystem;
 use object_store::path::Path;
 use object_store::{
     CopyOptions, Error as ObjectStoreError, GetOptions, GetResult, ListResult, MultipartUpload,
-    ObjectMeta, ObjectStore, PutMultipartOptions, PutOptions, PutPayload, PutResult,
-    RenameOptions, UploadPart,
+    ObjectMeta, ObjectStore, PutMultipartOptions, PutOptions, PutPayload, PutResult, RenameOptions,
+    UploadPart,
 };
 
 /// A [`LocalFileSystem`] rooted at `/` whose writes are durable when they return.
@@ -92,7 +92,10 @@ static SYNCED_WRITES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU6
 /// The nearest ancestor of `path` that exists now; directories below it will be
 /// created by the write and must be synced afterwards.
 fn existing_ancestor(path: &std::path::Path) -> Option<PathBuf> {
-    path.ancestors().skip(1).find(|p| p.is_dir()).map(std::path::Path::to_path_buf)
+    path.ancestors()
+        .skip(1)
+        .find(|p| p.is_dir())
+        .map(std::path::Path::to_path_buf)
 }
 
 /// Sync every directory from `path`'s parent up to and including `stop`.
@@ -123,8 +126,11 @@ async fn sync_parent_dir(path: PathBuf) -> Result<(), ObjectStoreError> {
 /// nearest ancestor that existed before it (`stop`).
 async fn sync_new_file(path: PathBuf, stop: Option<PathBuf>) -> Result<(), ObjectStoreError> {
     let n = SYNCED_WRITES.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
-    if n == 1 || n % 100 == 0 {
-        tracing::info!(synced_writes = n, "DurableLocalFileSystem synced {n} writes");
+    if n == 1 || n.is_multiple_of(100) {
+        tracing::info!(
+            synced_writes = n,
+            "DurableLocalFileSystem synced {n} writes"
+        );
     }
     tokio::task::spawn_blocking(move || -> io::Result<()> {
         std::fs::File::open(&path)?.sync_all()?;

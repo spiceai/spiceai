@@ -71,6 +71,7 @@ pub mod maintained_aggregate;
 pub mod metadata;
 pub mod metastore;
 pub mod metastore_layout;
+pub mod store_routing;
 
 /// Cold-tier clustering kernel, re-exported for benchmarks only. Not a stable API.
 #[doc(hidden)]
@@ -197,23 +198,19 @@ pub(crate) fn object_relative<'a>(
     location.as_ref().strip_prefix(prefix)?.strip_prefix('/')
 }
 
-/// Prototype: object stores by `scheme://host`, so code that holds only a file's
-/// URL (deletion vectors) reaches the store its table was given.
-static OBJECT_STORES: std::sync::LazyLock<
-    parking_lot::RwLock<std::collections::HashMap<String, std::sync::Arc<dyn object_store::ObjectStore>>>,
-> = std::sync::LazyLock::new(Default::default);
-
-fn object_store_key(url: &url::Url) -> String {
-    format!("{}://{}", url.scheme(), url.host_str().unwrap_or_default())
-}
-
-/// Prototype: record the store a table's files live in, keyed by its URL's scheme and host.
-pub fn register_object_store(url: &url::Url, store: std::sync::Arc<dyn object_store::ObjectStore>) {
-    OBJECT_STORES.write().insert(object_store_key(url), store);
+/// Records `store` as the store for every object under `url`'s path (a dataset's
+/// data path), so code that holds only a file's URL (deletion vectors, sweeps)
+/// reaches that dataset's store, and returns the routing store to register for
+/// `url`'s scheme and host in a `DataFusion` runtime. See [`store_routing`].
+pub fn register_object_store(
+    url: &url::Url,
+    store: std::sync::Arc<dyn object_store::ObjectStore>,
+) -> std::sync::Arc<store_routing::PrefixRoutingStore> {
+    store_routing::register(url, store)
 }
 
 /// The store and object path of a file addressed by URL (`s3://…`, `file://…`);
-/// `None` for a plain local path.
+/// `None` for a plain local path or a URL no dataset registered a store for.
 #[must_use]
 pub(crate) fn resolve_object_url(
     location: &str,
@@ -222,12 +219,12 @@ pub(crate) fn resolve_object_url(
         return None;
     }
     let url = url::Url::parse(location).ok()?;
-    let store = OBJECT_STORES
-        .read()
-        .get(&object_store_key(&url))
-        .cloned()
-        .or_else(|| (url.scheme() == "file").then(durable_local_object_store))?;
     let path = object_store::path::Path::from_url_path(url.path()).ok()?;
+    let store: std::sync::Arc<dyn object_store::ObjectStore> = match store_routing::router_for(&url) {
+        Some(router) => router,
+        None if url.scheme() == "file" => durable_local_object_store(),
+        None => return None,
+    };
     Some((store, path))
 }
 

@@ -26,8 +26,17 @@ limitations under the License.
 //! `${sources.<name>.shared_bucket}` is one bucket every instance of the run
 //! sees, for state that instances share, such as one `runtime.state.location`
 //! for two replicas.
+//!
+//! With `latency:`, a toxiproxy sharing the store's network namespace delays
+//! every response by that long, and `.endpoint` and `.params` reach the store
+//! through it, so `spiced` sees a remote store's round trip. Sharing the
+//! namespace takes no network from Docker's address pools, which concurrent
+//! runs exhaust. The image has no shell, so it is configured through its HTTP
+//! API, not `source-exec`. The harness's own requests go to the store
+//! directly.
 
 use std::path::PathBuf;
+use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
 use async_trait::async_trait;
@@ -57,24 +66,81 @@ fn spec(name: String) -> ContainerSpec {
     }
 }
 
+/// The proxy that delays the store's responses, for `latency:`.
+const TOXIPROXY_IMAGE: &str = "ghcr.io/shopify/toxiproxy:2.12.0";
+/// The proxy's API port.
+const TOXIPROXY_API: u16 = 8474;
+/// The port the proxy listens on for the store, beside the store's own 9000.
+const TOXIPROXY_LISTEN: u16 = 9100;
+
 pub struct ObjectStore {
     container: Container,
+    /// The toxiproxy `spiced` reaches the store through, with `latency:`.
+    proxy: Option<Container>,
     /// Where part files are written before they are uploaded.
     staging: PathBuf,
 }
 
 impl ObjectStore {
-    pub async fn start(name: &str, run_id: &str, staging: PathBuf) -> Result<Self> {
-        let container = Container::start(spec(format!("spicescript-{run_id}-{name}"))).await?;
+    pub async fn start(
+        name: &str,
+        run_id: &str,
+        staging: PathBuf,
+        latency: Option<Duration>,
+    ) -> Result<Self> {
         std::fs::create_dir_all(&staging)?;
-        Ok(Self { container, staging })
+        let Some(latency) = latency else {
+            let container = Container::start(spec(format!("spicescript-{run_id}-{name}"))).await?;
+            return Ok(Self {
+                container,
+                proxy: None,
+                staging,
+            });
+        };
+        // The store publishes the proxy's ports too: the proxy runs in its
+        // network namespace and reaches it on the loopback.
+        let mut store = spec(format!("spicescript-{run_id}-{name}"));
+        store.ports.extend([TOXIPROXY_API, TOXIPROXY_LISTEN]);
+        let container = Container::start(store).await?;
+        let proxy = Container::start(ContainerSpec {
+            name: format!("spicescript-{run_id}-{name}-proxy"),
+            image: TOXIPROXY_IMAGE.into(),
+            env: Vec::new(),
+            command: None,
+            ports: Vec::new(),
+            healthcheck: None,
+            network: Some(format!("container:{}", container.name)),
+        })
+        .await?;
+        configure_proxy(container.host_port(TOXIPROXY_API)?, latency)
+            .await
+            .with_context(|| {
+                format!("Failed to put {latency:?} of latency in front of '{name}'")
+            })?;
+        Ok(Self {
+            container,
+            proxy: Some(proxy),
+            staging,
+        })
     }
 
+    /// The store itself, for the harness's own requests.
     fn endpoint(&self) -> Result<String> {
         Ok(format!(
             "http://127.0.0.1:{}",
             self.container.host_port(9000)?
         ))
+    }
+
+    /// Where `spiced` reaches the store: through the proxy, when there is one.
+    fn spiced_endpoint(&self) -> Result<String> {
+        match &self.proxy {
+            Some(_) => Ok(format!(
+                "http://127.0.0.1:{}",
+                self.container.host_port(TOXIPROXY_LISTEN)?
+            )),
+            None => self.endpoint(),
+        }
     }
 
     /// Runs the `aws` CLI against the store; returns what it printed.
@@ -123,6 +189,63 @@ impl ObjectStore {
     }
 }
 
+/// Creates the proxy to the store on its loopback and delays every response
+/// it relays by `latency`, through the toxiproxy API on `api_port`.
+async fn configure_proxy(api_port: u16, latency: Duration) -> Result<()> {
+    let api = format!("http://127.0.0.1:{api_port}");
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(10))
+        .build()?;
+    // The API answers a moment after the container starts.
+    let mut last = None;
+    for _ in 0..80 {
+        match client.get(format!("{api}/version")).send().await {
+            Ok(response) if response.status().is_success() => {
+                last = None;
+                break;
+            }
+            Ok(response) => last = Some(anyhow::anyhow!("status {}", response.status())),
+            Err(e) => last = Some(e.into()),
+        }
+        tokio::time::sleep(Duration::from_millis(250)).await;
+    }
+    if let Some(e) = last {
+        return Err(e).context("the toxiproxy API did not answer");
+    }
+    let post = |path: String, body: serde_json::Value| {
+        let client = client.clone();
+        async move {
+            let response = client.post(&path).json(&body).send().await?;
+            let status = response.status();
+            if !status.is_success() {
+                bail!("POST {path}: {status}: {}", response.text().await?);
+            }
+            Ok(())
+        }
+    };
+    post(
+        format!("{api}/proxies"),
+        json!({
+            "name": "store",
+            "listen": format!("0.0.0.0:{TOXIPROXY_LISTEN}"),
+            "upstream": "127.0.0.1:9000",
+            "enabled": true,
+        }),
+    )
+    .await?;
+    post(
+        format!("{api}/proxies/store/toxics"),
+        json!({
+            "name": "latency",
+            "type": "latency",
+            "stream": "downstream",
+            "toxicity": 1.0,
+            "attributes": { "latency": u64::try_from(latency.as_millis())?, "jitter": 0 },
+        }),
+    )
+    .await
+}
+
 /// The bucket shared by every instance; no namespace bucket has this name,
 /// since those begin with the instance's index.
 const SHARED_BUCKET: &str = "shared";
@@ -136,6 +259,23 @@ fn bucket(namespace: &str) -> String {
 impl Source for ObjectStore {
     fn container(&self) -> Option<&Container> {
         Some(&self.container)
+    }
+
+    fn containers(&self) -> Vec<&Container> {
+        std::iter::once(&self.container)
+            .chain(self.proxy.as_ref())
+            .collect()
+    }
+
+    async fn remove(&self) -> Result<()> {
+        let Some(proxy) = &self.proxy else {
+            return self.container.remove().await;
+        };
+        // The proxy first: it lives in the store's network namespace.
+        let proxy_removed = proxy.remove().await;
+        let store_removed = self.container.remove().await;
+        proxy_removed?;
+        store_removed
     }
 
     async fn create_namespace(&self, namespace: &str) -> Result<super::Namespace> {
@@ -169,7 +309,7 @@ impl Source for ObjectStore {
                 .await
                 .with_context(|| format!("Failed to create bucket '{SHARED_BUCKET}'"))?;
         }
-        let endpoint = self.endpoint()?;
+        let endpoint = self.spiced_endpoint()?;
         let mut extra = serde_json::Map::new();
         extra.insert("bucket".into(), json!(bucket));
         extra.insert("shared_bucket".into(), json!(SHARED_BUCKET));

@@ -112,6 +112,14 @@ fn sibling(prefix: &Path, name: &str) -> Path {
     Path::from_iter(parts).join(name)
 }
 
+/// A new folder for dataset `name`: its slug and a fresh `UUIDv7`. A caller that
+/// puts the dataset's data files in the location mints the folder first, so the
+/// table path it creates the dataset with (`<datasets>/<folder>/data`) names it.
+#[must_use]
+pub fn new_dataset_folder(name: &str) -> String {
+    format!("{}-{}", slug(name), uuid::Uuid::now_v7())
+}
+
 /// A folder name a person browsing the bucket can match to its dataset.
 fn slug(name: &str) -> String {
     let slug: String = name
@@ -723,6 +731,33 @@ impl ObjectNativeCatalog {
         (routes.datasets.len(), routes.by_table.len(), replayed)
     }
 
+    /// The store the catalog's logs are in. A dataset whose data files are in the
+    /// location keeps them under [`Self::datasets_prefix`] in this store.
+    #[must_use]
+    pub fn store(&self) -> Arc<dyn ObjectStore> {
+        Arc::clone(&self.store)
+    }
+
+    /// The prefix of the dataset folders (`…/cayenne/v1/datasets`) in [`Self::store`].
+    #[must_use]
+    pub fn datasets_prefix(&self) -> &Path {
+        &self.datasets
+    }
+
+    /// The folder `base_path` names for a new dataset `name`, when it is a data path
+    /// `…/<datasets>/<folder>/data` in this catalog's location whose folder is one
+    /// [`new_dataset_folder`] makes for `name`.
+    fn folder_named_by(&self, name: &str, base_path: &str) -> Option<String> {
+        let url = url::Url::parse(base_path).ok()?;
+        let path = url.path().trim_matches('/');
+        let rest = path
+            .strip_prefix(self.datasets.as_ref())?
+            .strip_prefix('/')?;
+        let folder = rest.strip_suffix("/data")?;
+        let uuid = folder.strip_prefix(&format!("{}-", slug(name)))?;
+        (!folder.contains('/') && uuid::Uuid::parse_str(uuid).is_ok()).then(|| folder.to_string())
+    }
+
     /// The prefix of the log that holds `dataset`, for tools and tests that read
     /// a dataset's log directly.
     #[must_use]
@@ -799,7 +834,12 @@ impl ObjectNativeCatalog {
             self.routes.write().refresh(&domain, tables);
             return Ok(id);
         }
-        let folder = format!("{}-{}", slug(&name), uuid::Uuid::now_v7());
+        // A dataset whose data files go in the location names its folder in its
+        // table path (`<datasets>/<folder>/data`, see [`new_dataset_folder`]), so the
+        // files and the log share one folder and a drop reclaims both.
+        let folder = self
+            .folder_named_by(&name, &options.base_path)
+            .unwrap_or_else(|| new_dataset_folder(&name));
         let mut domain = Domain::create_with_config(
             Arc::clone(&self.store),
             self.datasets.clone().join(folder.as_str()),
@@ -1734,6 +1774,22 @@ impl MetadataCatalog for ObjectNativeCatalog {
         self.for_table(&file.table_id)
             .upsert_snapshot_file(file)
             .await
+    }
+    async fn upsert_snapshot_files(&self, files: &[SnapshotFile]) -> CatalogResult<()> {
+        let Some(first) = files.first() else {
+            return Ok(());
+        };
+        // One table's files go to one log: route by the first and check the rest.
+        let domain = self.for_table(&first.table_id);
+        if files.iter().all(|file| file.table_id == first.table_id) {
+            return domain.upsert_snapshot_files(files).await;
+        }
+        for file in files {
+            self.for_table(&file.table_id)
+                .upsert_snapshot_file(file)
+                .await?;
+        }
+        Ok(())
     }
     async fn replace_snapshot_files(
         &self,

@@ -58,7 +58,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use arrow::array::{Int64Array, RecordBatch};
 use arrow::datatypes::{DataType, Field, Schema};
 use cayenne::metadata::{CdcDurability, CreateTableOptions, DeletionMode, VortexConfig};
-use cayenne::{CayenneTableProvider, CayenneTableProviderBuilder, MetadataCatalog, SlotAdvancer};
+use cayenne::{CayenneTableProvider, MetadataCatalog, SlotAdvancer};
 use common::{BackendType, TestFixture};
 use datafusion::datasource::TableProvider;
 use datafusion::datasource::memory::MemorySourceConfig;
@@ -314,15 +314,20 @@ async fn create_table(
         on_conflict: Some(OnConflict::Upsert(ColumnReference::new(vec![
             "id".to_string(),
         ]))),
-        base_path: fixture.data_path.to_string_lossy().to_string(),
+        base_path: fixture.data_store.base_path.clone(),
         partition_column: None,
         vortex_config: config(mode, durability, pk_keyset_cache_mb, cold_url),
     };
     let catalog: Arc<dyn MetadataCatalog> =
         Arc::clone(&fixture.catalog) as Arc<dyn MetadataCatalog>;
     let ctx = SessionContext::new();
-    let table =
-        Arc::new(CayenneTableProvider::create_table(catalog, opts, ctx.runtime_env()).await?);
+    let table = Arc::new(
+        fixture
+            .data_store
+            .builder(catalog, ctx.runtime_env())
+            .create(opts)
+            .await?,
+    );
     if durability == Durability::Memory {
         // Arm mem-mode deferral (the runtime does this on the first replayable
         // committer); without it mem-mode CDC writes take the durable path.
@@ -345,7 +350,9 @@ async fn reopen_table(
         Arc::clone(&fixture.catalog) as Arc<dyn MetadataCatalog>;
     let ctx = SessionContext::new();
     let provider = Arc::new(
-        CayenneTableProviderBuilder::new(catalog, ctx.runtime_env())
+        fixture
+            .data_store
+            .builder(catalog, ctx.runtime_env())
             .open(name)
             .await?,
     );

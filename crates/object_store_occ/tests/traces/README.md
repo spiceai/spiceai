@@ -199,3 +199,16 @@ Each walk run printed `WALKS <run> seed=42 count=20 max_steps=40 good=true`.
     cargo nextest run -p object_store_occ --test headlog_replay --no-capture --retries 0
 
 Each test prints its replay and control lines with `--no-capture`.
+
+## Data-file traces
+
+`data-files.jsonl` (8 witnesses) and `data-files-walk.jsonl` (20 walks) are
+copies of `crates/cayenne/tests/traces/` (generation commands in that
+directory's README); keep both copies identical. `../data_file_replay.rs`
+replays each through the real head log (records carry the committed file set)
+and data PUTs under `dataset/data/`, on InMemory and
+LocalConditionalPut::new_durable, and compares the head and stored files with
+`cayenne_metastore_model::data_file_steps` after every action. A fenced
+writer's commit is refused by `Writer::prepare` before any request; the replay
+checks that as the model's store-side refusal. Controls: a commit naming files
+whose PUT has not returned, and a reader that lists the prefix.

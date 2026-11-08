@@ -785,10 +785,12 @@ pub use runtime_object_store::is_s3_express_path;
 /// Standard S3 paths are not supported.
 /// # Errors
 ///
-/// Returns [`Error::StandardS3NotSupported`] for a standard `s3://` path: only S3 Express
-/// One Zone buckets and local paths are supported.
-pub fn validate_file_path(path: &str) -> Result<()> {
-    if path.starts_with("s3://") && !is_s3_express_path(path) && false {
+/// Returns [`Error::StandardS3NotSupported`] for a standard `s3://` path unless
+/// `allow_standard_s3` (set by `runtime.params.cayenne_vnext`, so the object-store
+/// data path can be tested on S3-compatible stores): otherwise only S3 Express One
+/// Zone buckets and local paths are supported.
+pub fn validate_file_path(path: &str, allow_standard_s3: bool) -> Result<()> {
+    if path.starts_with("s3://") && !is_s3_express_path(path) && !allow_standard_s3 {
         return Err(Error::StandardS3NotSupported {
             path: path.to_string(),
         });
@@ -1805,23 +1807,20 @@ pub async fn build_s3_object_store(
     source: &dyn AccelerationSource,
     data_path: String,
 ) -> Result<Option<cayenne::metadata::ObjectStoreConfig>> {
-    // Prototype: a standard S3-compatible data path gets a plain AmazonS3 store.
+    // A standard S3 or S3-compatible data path (accepted only under
+    // `runtime.params.cayenne_vnext`, see `validate_file_path`) gets the shared S3
+    // store builder, with every sign-in mode the `cayenne_s3_*` params describe.
     if data_path.starts_with("s3://") && !is_s3_express_path(&data_path) {
         let resolved = resolve_s3_params(source).await;
-        let url = Url::parse(&data_path).boxed().context(InvalidS3UrlSnafu { url: data_path.clone() })?;
-        let bucket = get_bucket_name(&url).boxed().context(InvalidS3UrlSnafu { url: data_path.clone() })?;
-        let mut b = AmazonS3Builder::new()
-            .with_bucket_name(bucket)
-            .with_region(resolved.region.clone().unwrap_or_else(|| "us-east-1".to_string()));
-        if let Some(ep) = &resolved.endpoint {
-            b = b.with_endpoint(ep).with_allow_http(ep.starts_with("http://"));
-        }
-        if let (Some(k), Some(s)) = (&resolved.key, &resolved.secret) {
-            b = b.with_access_key_id(k).with_secret_access_key(s);
-        }
-        let store = b.build().boxed().context(ObjectStoreCreationSnafu)?;
-        tracing::info!("Prototype: standard S3 object store for data path {data_path}");
-        return Ok(Some(cayenne::metadata::ObjectStoreConfig { url, store: Arc::new(store) }));
+        let url = Url::parse(&data_path)
+            .boxed()
+            .context(InvalidS3UrlSnafu { url: data_path.clone() })?;
+        let store = build_standard_s3_store(&url, &resolved).await?;
+        tracing::debug!("Standard S3 object store configured for data path {data_path}");
+        return Ok(Some(cayenne::metadata::ObjectStoreConfig {
+            url,
+            store: metered_data_store(store),
+        }));
     }
     // Check if this is S3 Express One Zone storage
     if !is_s3_express_data_path(source) {
@@ -1874,7 +1873,7 @@ pub async fn build_s3_object_store(
 
         return Ok(Some(cayenne::metadata::ObjectStoreConfig {
             url: primary_url,
-            store: Arc::new(MultiZoneS3ExpressStore::new(zone_stores)),
+            store: metered_data_store(Arc::new(MultiZoneS3ExpressStore::new(zone_stores))),
         }));
     }
 
@@ -1885,7 +1884,65 @@ pub async fn build_s3_object_store(
         data_path
     );
 
-    Ok(Some(cayenne::metadata::ObjectStoreConfig { url, store }))
+    Ok(Some(cayenne::metadata::ObjectStoreConfig {
+        url,
+        store: metered_data_store(store),
+    }))
+}
+
+/// A data-path store whose requests count in the `state_store_*` metrics with
+/// `feature="cayenne"`, as the metastore's do.
+fn metered_data_store(store: Arc<dyn object_store::ObjectStore>) -> Arc<dyn object_store::ObjectStore> {
+    runtime_state_location::metrics::metered(
+        store,
+        runtime_state_location::StateFeature::CayenneMetastore,
+    )
+}
+
+/// A standard S3 (or S3-compatible) store for `url` through the shared
+/// [`aws_sdk_credential_bridge::object_store_builder::S3ObjectStoreBuilder`], so
+/// keys, session tokens, IAM roles and the environment's credential chain all work,
+/// with the client timeout the params set.
+async fn build_standard_s3_store(
+    url: &Url,
+    resolved: &ResolvedS3Params,
+) -> Result<Arc<dyn object_store::ObjectStore>> {
+    use secrecy::SecretString;
+    let mut params: std::collections::HashMap<String, SecretString> = std::collections::HashMap::new();
+    for (name, value) in [
+        ("region", &resolved.region),
+        ("endpoint", &resolved.endpoint),
+        ("key", &resolved.key),
+        ("secret", &resolved.secret),
+        ("session_token", &resolved.session_token),
+        ("client_timeout", &resolved.client_timeout),
+    ] {
+        if let Some(value) = value {
+            params.insert(name.to_string(), SecretString::from(value.clone()));
+        }
+    }
+    params.insert("auth".to_string(), SecretString::from(resolved.auth.clone()));
+    let allow_http = resolved.allow_http
+        || resolved
+            .endpoint
+            .as_deref()
+            .is_some_and(|endpoint| endpoint.starts_with("http://"));
+    if allow_http {
+        params.insert("allow_http".to_string(), SecretString::from("true".to_string()));
+    }
+    aws_sdk_credential_bridge::object_store_builder::S3ObjectStoreBuilder::from_url(
+        url,
+        tokio::runtime::Handle::current(),
+    )
+    .boxed()
+    .context(ObjectStoreCreationSnafu)?
+    .with_secret_params(&params)
+    .boxed()
+    .context(ObjectStoreCreationSnafu)?
+    .build()
+    .await
+    .boxed()
+    .context(ObjectStoreCreationSnafu)
 }
 
 /// Returns true if the provided error or any of its sources indicates an authentication failure.
@@ -2014,23 +2071,29 @@ mod tests {
 
     #[test]
     fn test_validate_file_path_accepts_local_paths() {
-        validate_file_path("/local/path/data/").expect("local absolute path should be valid");
-        validate_file_path("./relative/path/").expect("relative path should be valid");
-        validate_file_path("/var/spice/data/").expect("another local path should be valid");
+        validate_file_path("/local/path/data/", false).expect("local absolute path should be valid");
+        validate_file_path("./relative/path/", false).expect("relative path should be valid");
+        validate_file_path("/var/spice/data/", false).expect("another local path should be valid");
     }
 
     #[test]
     fn test_validate_file_path_accepts_s3_express() {
-        validate_file_path("s3://mybucket--usw2-az1--x-s3/prefix/")
+        validate_file_path("s3://mybucket--usw2-az1--x-s3/prefix/", false)
             .expect("S3 Express One Zone path should be valid");
-        validate_file_path("s3://data--use1-az4--x-s3/cayenne/")
+        validate_file_path("s3://data--use1-az4--x-s3/cayenne/", false)
             .expect("another S3 Express One Zone path should be valid");
+    }
+
+    #[test]
+    fn test_validate_file_path_accepts_standard_s3_under_the_flag() {
+        validate_file_path("s3://mybucket/prefix/", true)
+            .expect("a standard S3 path is accepted when `cayenne_vnext` is enabled");
     }
 
     #[test]
     fn test_validate_file_path_rejects_standard_s3() {
         // Standard S3 paths should be rejected
-        let result = validate_file_path("s3://mybucket/prefix/");
+        let result = validate_file_path("s3://mybucket/prefix/", false);
         assert!(result.is_err());
         let err = result.expect_err("expected error");
         assert!(
@@ -2038,13 +2101,13 @@ mod tests {
             "Expected StandardS3NotSupported error, got: {err:?}"
         );
 
-        let result = validate_file_path("s3://my-data-bucket/cayenne/data/");
+        let result = validate_file_path("s3://my-data-bucket/cayenne/data/", false);
         assert!(result.is_err());
     }
 
     #[test]
     fn test_validate_file_path_error_message() {
-        let result = validate_file_path("s3://regular-bucket/data/");
+        let result = validate_file_path("s3://regular-bucket/data/", false);
         let err = result.expect_err("expected error");
         let error_message = err.to_string();
 

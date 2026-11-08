@@ -551,11 +551,17 @@ impl FileBasedDeletionSink {
                 Arc::new(new_map)
             });
 
-            // 4. Delete the empty snapshot directory
+            // 4. Delete the empty snapshot directory. An object-store table has
+            // no directories, and its files were removed above.
             let snapshot_dir = std::path::PathBuf::from(&self.table_path)
                 .join(&self.table_id)
                 .join(snapshot_id);
-            match tokio::fs::remove_dir_all(&snapshot_dir).await {
+            let removed = if crate::is_object_store_path(&self.table_path) {
+                Ok(())
+            } else {
+                tokio::fs::remove_dir_all(&snapshot_dir).await
+            };
+            match removed {
                 Ok(()) => {}
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
                 Err(e) => {

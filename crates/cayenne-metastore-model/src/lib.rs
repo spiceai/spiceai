@@ -8,6 +8,7 @@ mod action_compatibility;
 mod commits;
 mod concurrent;
 mod core;
+mod data_files;
 mod dataset_lifecycle;
 mod floors;
 mod intent_partitioned;
@@ -2339,6 +2340,38 @@ fn additional_runs() -> Vec<Run> {
             failure: "",
         });
     }
+    // Data files uploaded before the commit that names them.
+    for (name, mode, bound, failure) in [
+        ("data-files", "data-files", 2, ""),
+        ("data-files-3", "data-files", 3, ""),
+        (
+            "data-files-no-upload-before-commit",
+            "data-files-no-upload-before-commit",
+            2,
+            "committed files exist",
+        ),
+        (
+            "data-files-no-committed-read",
+            "data-files-no-committed-read",
+            2,
+            "reader sees only committed files",
+        ),
+        (
+            "data-files-no-resolve-by-head",
+            "data-files-no-resolve-by-head",
+            2,
+            "unknown outcome resolves all-or-nothing",
+        ),
+    ] {
+        runs.push(Run {
+            name,
+            family: "data-files",
+            mode,
+            bound,
+            seed: None,
+            failure,
+        });
+    }
     runs
 }
 
@@ -2724,8 +2757,10 @@ fn required_witness(run: &Run, name: &str, expectation: &Expectation) -> bool {
         && run.failure.is_empty()
         && (run.mode.contains("remote-gc") || run.mode.contains("checkpoint"))
         && *expectation == Expectation::Sometimes;
-    let standby_required = matches!(run.family, "standby" | "object-names" | "reads")
-        && run.failure.is_empty()
+    let standby_required = matches!(
+        run.family,
+        "standby" | "object-names" | "reads" | "data-files"
+    ) && run.failure.is_empty()
         && *expectation == Expectation::Sometimes;
     let promotion_required = run.family == "cold-promotion"
         && run.failure.is_empty()
@@ -2940,6 +2975,7 @@ where
                 || run.family == "standby"
                 || run.family == "object-names"
                 || run.family == "reads"
+                || run.family == "data-files"
                 || run.family == "intent-roll-forward"
                 || run.family == "replicas"
                 || run.mode.contains("restart")
@@ -2997,6 +3033,7 @@ pub fn run(name: &str) -> Result<(), String> {
         "standby" => check(standby::Protocol::new(r.mode), r),
         "object-names" => check(object_names::Protocol::new(r.mode, r.bound), r),
         "reads" => check(reads::Protocol::new(r.mode, r.bound), r),
+        "data-files" => check(data_files::Protocol::new(r.mode, r.bound), r),
         "action-compatibility" => check(action_compatibility::Protocol::new(r.mode), r),
         "retention" => check(retention::Protocol::new(r.mode), r),
         "replicas" => check(replicas::Protocol::new(r.mode), r),
@@ -3065,6 +3102,39 @@ pub fn transaction_steps(run: &str, actions: &[String]) -> Option<Vec<Transactio
         .into_iter()
         .find(|r| r.name == run && r.family == "transactions")?;
     transactions::steps(run.mode, run.bound, actions)
+}
+
+pub use data_files::{
+    File as DataFile, Key as DataFileKey, Op as DataFileOp, Step as DataFileStep,
+};
+
+/// What each action of a `data-files` trace from `run` does in the model, for a
+/// replay through real storage. `None` for an unknown run, a run of another
+/// family, or an action the run does not enable at that point.
+///
+/// Each action maps to one real operation (see [`DataFileOp`]):
+/// `StartUpload(w)` sends writer `w`'s PUT of a fresh data file to its final
+/// key under the dataset prefix, and `FinishUpload(i)` lands the `i`-th PUT in
+/// flight (acknowledged to the writer only if it still knows the upload).
+/// `Commit(w)` sends the conditional head publication, on the head version the
+/// writer read and its lease generation, naming every file whose upload has
+/// returned; `Deliver(i)` has the store evaluate the `i`-th commit request in
+/// flight, and `Drop(i)` loses it. `Timeout(w)` loses the response, leaving an
+/// unknown outcome; `Retry(w)` resends the identical request; `Resolve(w)`
+/// reads the head and resolves the outcome (committed when the head names the
+/// files, aborted once the head moved past the request's base). `Takeover(w)`
+/// is the head commit that raises the lease generation; `Crash(w)` restarts the
+/// writer process. `Read` reads the head's committed file set; `Fetch` GETs the
+/// next file of it. `Sweep(i)` deletes the `i`-th stored file, which no
+/// committed head names and whose generation is fenced. Each step also carries
+/// the head (version, lease, files) and the store's files after the action, the
+/// state a replay checks after every operation.
+#[must_use]
+pub fn data_file_steps(run: &str, actions: &[String]) -> Option<Vec<DataFileStep>> {
+    let run = runs()
+        .into_iter()
+        .find(|r| r.name == run && r.family == "data-files")?;
+    data_files::steps(run.mode, run.bound, actions)
 }
 
 /// Problems with the model citations in design documents: a cited run that does

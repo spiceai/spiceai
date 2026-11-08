@@ -46,7 +46,7 @@ use std::sync::Arc;
 use arrow::array::{Int64Array, RecordBatch, StringArray};
 use arrow::datatypes::{DataType, Field, Schema};
 use cayenne::{
-    CayenneTableProvider, CayenneTableProviderBuilder, MetadataCatalog,
+    CayenneTableProvider, MetadataCatalog,
     metadata::CreateTableOptions,
 };
 use common::TestFixture;
@@ -118,7 +118,7 @@ async fn setup_int64_upsert_table(
         on_conflict: Some(OnConflict::Upsert(ColumnReference::new(vec![
             "id".to_string(),
         ]))),
-        base_path: fixture.data_path.to_string_lossy().to_string(),
+        base_path: fixture.data_store.base_path.clone(),
         partition_column: None,
         vortex_config: cayenne::metadata::VortexConfig::default(),
     };
@@ -127,7 +127,11 @@ async fn setup_int64_upsert_table(
         Arc::clone(&fixture.catalog) as Arc<dyn MetadataCatalog>;
     let ctx = SessionContext::new();
     let table = Arc::new(
-        CayenneTableProvider::create_table(catalog, table_options, ctx.runtime_env()).await?,
+        fixture
+            .data_store
+            .builder(catalog, ctx.runtime_env())
+            .create(table_options)
+            .await?,
     );
     ctx.register_table(table_name, Arc::clone(&table) as Arc<dyn TableProvider>)?;
 
@@ -147,7 +151,7 @@ async fn setup_composite_upsert_table(
             "region".to_string(),
             "id".to_string(),
         ]))),
-        base_path: fixture.data_path.to_string_lossy().to_string(),
+        base_path: fixture.data_store.base_path.clone(),
         partition_column: None,
         vortex_config: cayenne::metadata::VortexConfig::default(),
     };
@@ -156,7 +160,11 @@ async fn setup_composite_upsert_table(
         Arc::clone(&fixture.catalog) as Arc<dyn MetadataCatalog>;
     let ctx = SessionContext::new();
     let table = Arc::new(
-        CayenneTableProvider::create_table(catalog, table_options, ctx.runtime_env()).await?,
+        fixture
+            .data_store
+            .builder(catalog, ctx.runtime_env())
+            .create(table_options)
+            .await?,
     );
     ctx.register_table(table_name, Arc::clone(&table) as Arc<dyn TableProvider>)?;
 
@@ -260,7 +268,7 @@ async fn reopen_and_read_int64_rows(
     let catalog: Arc<dyn MetadataCatalog> =
         Arc::clone(&fixture.catalog) as Arc<dyn MetadataCatalog>;
     let ctx = SessionContext::new();
-    let provider = CayenneTableProviderBuilder::new(catalog, ctx.runtime_env())
+    let provider = fixture.data_store.builder(catalog, ctx.runtime_env())
         .open(table_name)
         .await?;
     ctx.register_table(table_name, Arc::new(provider) as Arc<dyn TableProvider>)?;
@@ -274,7 +282,7 @@ async fn reopen_and_read_composite_rows(
     let catalog: Arc<dyn MetadataCatalog> =
         Arc::clone(&fixture.catalog) as Arc<dyn MetadataCatalog>;
     let ctx = SessionContext::new();
-    let provider = CayenneTableProviderBuilder::new(catalog, ctx.runtime_env())
+    let provider = fixture.data_store.builder(catalog, ctx.runtime_env())
         .open(table_name)
         .await?;
     ctx.register_table(table_name, Arc::new(provider) as Arc<dyn TableProvider>)?;
