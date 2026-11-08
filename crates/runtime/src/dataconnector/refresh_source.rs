@@ -112,8 +112,10 @@ struct SourceFailureReport {
 /// (rejected credentials, TLS), which no retry clears, and a warning otherwise.
 /// Queries keep being served from the acceleration either way.
 ///
-/// The status is set on every failure, not only when a report is due, so a status
-/// written over it (such as registration's) is restored by the next attempt.
+/// The status is set on every failure while the dataset is registered, not only
+/// when a report is due, so a status written over it (such as registration's) is
+/// restored by the next attempt. Before the dataset is registered it is not served
+/// from anything, so the status is left to the loader.
 pub(crate) struct ReportingRefreshSource {
     inner: Arc<dyn RefreshSource>,
     dataset: Arc<Dataset>,
@@ -157,12 +159,25 @@ impl ReportingRefreshSource {
         } else {
             super::reconnecting::unreachable_source_warning(&self.dataset.name, &err.to_string())
         };
-        self.status.update_dataset(
-            &self.dataset.name,
-            crate::status::ComponentStatus::error_with_message(message.clone()),
-        );
-        self.status_is_error
-            .store(true, std::sync::atomic::Ordering::Release);
+        // The message says the dataset is served from its acceleration, which is
+        // true only once the dataset is registered. Until then the loader owns
+        // its status, and when the load fails (an acceleration that cannot be
+        // opened without the source, say) the dataset is never registered: its
+        // status must keep the load error that names the fix, not flip back to
+        // this every time the source is retried (#16149).
+        if self
+            .dataset
+            .runtime()
+            .datafusion()
+            .table_exists(&self.dataset.name)
+        {
+            self.status.update_dataset(
+                &self.dataset.name,
+                crate::status::ComponentStatus::error_with_message(message.clone()),
+            );
+            self.status_is_error
+                .store(true, std::sync::atomic::Ordering::Release);
+        }
         if self.due(configuration_error) {
             if configuration_error {
                 tracing::error!("{message}");
