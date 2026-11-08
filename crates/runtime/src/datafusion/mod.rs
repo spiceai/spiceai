@@ -4943,8 +4943,10 @@ impl DataFusion {
             return Ok(None);
         };
 
-        let needs_dict_normalization =
-            matches!(acceleration_settings.engine.to_unpartitioned(), Engine::Sqlite);
+        let needs_dict_normalization = matches!(
+            acceleration_settings.engine.to_unpartitioned(),
+            Engine::Sqlite
+        );
         let normalized_refresh_schema = if needs_dict_normalization
             && arrow_tools::schema::has_dictionary_types(refresh_schema)
         {

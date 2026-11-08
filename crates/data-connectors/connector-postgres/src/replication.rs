@@ -1615,9 +1615,15 @@ TXTE85+Or9IUwDI9543jsyCvuQ8=
         assert!(!ephemeral(Engine::Cayenne, Mode::FileUpdate));
 
         assert!(ephemeral(Engine::Sqlite, Mode::Memory), "sqlite memory");
-        assert!(ephemeral(Engine::Sqlite, Mode::FileCreate), "sqlite file_create");
+        assert!(
+            ephemeral(Engine::Sqlite, Mode::FileCreate),
+            "sqlite file_create"
+        );
         assert!(!ephemeral(Engine::Sqlite, Mode::File), "sqlite file");
-        assert!(!ephemeral(Engine::Sqlite, Mode::FileUpdate), "sqlite file_update");
+        assert!(
+            !ephemeral(Engine::Sqlite, Mode::FileUpdate),
+            "sqlite file_update"
+        );
 
         // Arrow is in-memory whatever `mode` says; Postgres is external storage.
         for mode in [Mode::Memory, Mode::File, Mode::FileCreate, Mode::FileUpdate] {

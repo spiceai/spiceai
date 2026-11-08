@@ -28,8 +28,7 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use datafusion_table_providers::sql::db_connection_pool::postgrespool::PostgresConnectionPool;
 use runtime_acceleration::{
-    dataset_checkpoint::DatasetCheckpointer,
-    sidecar::AcceleratorSidecar,
+    dataset_checkpoint::DatasetCheckpointer, sidecar::AcceleratorSidecar,
     snapshot::SnapshotBehavior,
 };
 use runtime_checkpoint_api::{

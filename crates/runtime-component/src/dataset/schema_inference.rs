@@ -82,15 +82,11 @@ pub fn apply_inferred_schema(
     //   key, and the physical base table is created with it up front (no versioned
     //   rebuild), matching what an explicit `primary_key` would do.
     // The remaining modes (`disabled`, `caching`, `snapshot`) follow the `full`
-    // rule via the `_` arm: their loads replace whole tables rather than
-    // incrementally appending, so the append hazard does not apply.
+    // rule: their loads replace whole tables rather than incrementally
+    // appending, so the append hazard does not apply.
     // The inferred *sort* is not a physical constraint (it is a refresh-time ORDER
     // BY / compaction order) and is gated separately in `apply_inferred_sort`.
-    let constraints_applicable = match resolved_refresh_mode {
-        RefreshMode::Append => false,
-        RefreshMode::Changes => true,
-        _ => true,
-    };
+    let constraints_applicable = resolved_refresh_mode != RefreshMode::Append;
     if !constraints_applicable
         && ((acceleration.primary_key.is_none() && !inferred.primary_key.is_empty())
             || (acceleration.indexes.is_empty() && !inferred.indexes.is_empty()))
@@ -913,9 +909,7 @@ mod tests {
             RefreshMode::Full,
         );
         assert_eq!(
-            acc.params
-                .get("arrow_sort_columns")
-                .map(String::as_str),
+            acc.params.get("arrow_sort_columns").map(String::as_str),
             Some("custom")
         );
     }
@@ -952,9 +946,7 @@ mod tests {
             RefreshMode::Full,
         );
         assert_eq!(
-            acc.params
-                .get("arrow_sort_columns")
-                .map(String::as_str),
+            acc.params.get("arrow_sort_columns").map(String::as_str),
             Some("created_at DESC")
         );
     }
@@ -1119,9 +1111,7 @@ mod tests {
             RefreshMode::Full,
         );
         assert_eq!(
-            acc.params
-                .get("arrow_sort_columns")
-                .map(String::as_str),
+            acc.params.get("arrow_sort_columns").map(String::as_str),
             Some("created_at DESC NULLS FIRST, id ASC NULLS LAST")
         );
     }

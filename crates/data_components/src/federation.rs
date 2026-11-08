@@ -4343,7 +4343,6 @@ mod tests {
                     );
                 }
             }
-
         }
 
         let over_a_volatile_output = products_left_join_categories()

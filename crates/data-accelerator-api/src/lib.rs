@@ -435,8 +435,7 @@ impl AcceleratorEngineRegistry {
         // encoding (SQLite).  Other engines (Arrow, Cayenne,
         // PostgreSQL) handle Dictionary types natively and benefit from the
         // compact encoding.
-        let needs_dictionary_normalization =
-            matches!(engine.to_unpartitioned(), Engine::Sqlite);
+        let needs_dictionary_normalization = matches!(engine.to_unpartitioned(), Engine::Sqlite);
         let schema = if needs_dictionary_normalization
             && arrow_tools::schema::has_dictionary_types(&schema)
         {
