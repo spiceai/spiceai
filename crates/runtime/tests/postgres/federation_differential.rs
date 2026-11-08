@@ -326,14 +326,11 @@ fn pushed_down_sql(plan: &[Row]) -> String {
     plan.iter()
         .flatten()
         .flatten()
-        .filter_map(|cell| {
-            cell.lines()
-                .filter_map(|line| {
-                    line.split_once("base_sql=")
-                        .or_else(|| line.split_once("SqlExec sql="))
-                        .map(|(_, sql)| sql.trim().to_string())
-                })
-                .reduce(|a, b| format!("{a}\n{b}"))
+        .flat_map(|cell| cell.lines())
+        .filter_map(|line| {
+            line.split_once("base_sql=")
+                .or_else(|| line.split_once("SqlExec sql="))
+                .map(|(_, sql)| sql.trim())
         })
         .collect::<Vec<_>>()
         .join("\n")
@@ -350,6 +347,30 @@ fn agreement(subject: &[Row], oracle: &[Row], ordered: bool) -> Result<(), &'sta
     oracle.sort();
     (subject == oracle).then_some(()).ok_or("rows differ")
 }
+
+/// One Spice side of the comparison: the datasets it reads, and whether its
+/// plan must send SQL to `PostgreSQL`.
+struct Subject {
+    name: &'static str,
+    items: &'static str,
+    regions: &'static str,
+    federated: bool,
+}
+
+const SUBJECTS: [Subject; 2] = [
+    Subject {
+        name: "federated",
+        items: "fed_items",
+        regions: "fed_regions",
+        federated: true,
+    },
+    Subject {
+        name: "accelerated",
+        items: "acc_items",
+        regions: "acc_regions",
+        federated: false,
+    },
+];
 
 async fn compare_case(
     rt: &Arc<Runtime>,
@@ -373,25 +394,23 @@ async fn compare_case(
     }
 
     let mut pushed_filter = false;
-    for (subject, items, regions) in [
-        ("federated", "fed_items", "fed_regions"),
-        ("accelerated", "acc_items", "acc_regions"),
-    ] {
+    for subject in &SUBJECTS {
+        let name = subject.name;
         let sql = case
             .sql
-            .replace("{items}", items)
-            .replace("{regions}", regions);
+            .replace("{items}", subject.items)
+            .replace("{regions}", subject.regions);
         match spice_rows(rt, &sql).await {
             Ok(spice) => {
                 if let Err(reason) = agreement(&spice, &oracle, case.ordered) {
                     failures.push(format!(
-                        "{subject}: {sql}\n    {reason}\n    spice:      {spice:?}\n    postgres:   {oracle:?}"
+                        "{name}: {sql}\n    {reason}\n    spice:      {spice:?}\n    postgres:   {oracle:?}"
                     ));
                 }
             }
-            Err(e) => failures.push(format!("{subject}: {sql}\n    failed: {e}")),
+            Err(e) => failures.push(format!("{name}: {sql}\n    failed: {e}")),
         }
-        if subject == "federated" {
+        if subject.federated {
             // The federated side must reach PostgreSQL, or it is DataFusion
             // over a full scan and compares nothing the accelerated side does not.
             let plan = spice_rows(rt, &format!("EXPLAIN {sql}"))
@@ -400,7 +419,7 @@ async fn compare_case(
             let remote = pushed_down_sql(&plan);
             if remote.is_empty() {
                 failures.push(format!(
-                    "{subject}: {sql}\n    the plan sends no SQL to PostgreSQL:\n{plan:?}"
+                    "{name}: {sql}\n    the plan sends no SQL to PostgreSQL:\n{plan:?}"
                 ));
             }
             pushed_filter = remote.contains("WHERE");
