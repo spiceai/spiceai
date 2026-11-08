@@ -45,6 +45,8 @@ pub struct Spiced {
     pub binary: PathBuf,
     pub dir: PathBuf,
     env: BTreeMap<String, String>,
+    /// Variables of the runner's own environment the process does not inherit.
+    env_removed: Vec<String>,
     http: u16,
     flight: u16,
     metrics: u16,
@@ -102,6 +104,7 @@ impl Spiced {
             binary,
             dir,
             env,
+            env_removed: Vec::new(),
             http: free_port()?,
             flight: free_port()?,
             metrics: free_port()?,
@@ -133,6 +136,26 @@ impl Spiced {
     /// (`${instance.http_port}`) so that a container can reach it.
     pub fn set_http_port(&mut self, port: u16) {
         self.http = port;
+    }
+
+    /// Serves Flight on `port`, one a script was told in advance
+    /// (`${instance.flight_port}`) so that a sidecar can read from it.
+    pub fn set_flight_port(&mut self, port: u16) {
+        self.flight = port;
+    }
+
+    /// Starts the process without `key` from the runner's environment.
+    pub fn remove_env(&mut self, key: &str) {
+        self.env_removed.push(key.to_string());
+    }
+
+    /// What a client of its own needs to reach this `spiced` over Flight.
+    pub fn flight_target(&self) -> FlightTarget {
+        FlightTarget {
+            endpoint: Arc::from(self.flight_endpoint()),
+            api_key: self.api_key.clone(),
+            tls_ca: self.tls_ca.clone(),
+        }
     }
 
     fn scheme(&self) -> &'static str {
@@ -183,18 +206,13 @@ impl Spiced {
     }
 
     async fn connect_flight(&self, key: Option<&str>) -> Result<FlightClient> {
-        let credentials = match key {
-            Some(key) => Credentials::new("spicescript", SecretString::from(key.to_string())),
-            None => Credentials::anonymous(),
-        };
-        FlightClient::try_new(
-            Arc::from(format!("{}://127.0.0.1:{}", self.scheme(), self.flight)),
-            credentials,
-            None,
-            self.tls_ca.as_deref(),
-        )
+        FlightTarget {
+            endpoint: Arc::from(self.flight_endpoint()),
+            api_key: key.map(str::to_string),
+            tls_ca: self.tls_ca.clone(),
+        }
+        .connect()
         .await
-        .context("Failed to connect to spiced over Flight")
     }
 
     /// The runtime's HTTP endpoint, as the `spice` CLI takes it.
@@ -240,6 +258,12 @@ impl Spiced {
         let mut command = match self.container.clone() {
             None => {
                 let mut command = Command::new(&self.binary);
+                for key in &self.env_removed {
+                    command.env_remove(key);
+                }
+                if !self.env_removed.is_empty() {
+                    shadow_dotenv_files(&self.dir)?;
+                }
                 command.current_dir(&self.dir).envs(&self.env);
                 command
             }
@@ -643,16 +667,7 @@ impl Spiced {
             Key::None => self.connect_flight(None).await?,
             Key::Given(key) => self.connect_flight(Some(key)).await?,
         };
-        let mut stream = client.query(sql).await?;
-        let mut batches = Vec::new();
-        while let Some(batch) = stream.try_next().await? {
-            batches.push(batch);
-        }
-        if batches.is_empty() {
-            let schema = stream.schema().context("Flight returned no schema")?;
-            batches.push(RecordBatch::new_empty(Arc::clone(schema)));
-        }
-        Ok(batches)
+        answer_with_schema(&client, sql).await
     }
 
     /// Runs an unprepared Flight SQL statement and consumes every endpoint.
@@ -974,6 +989,48 @@ impl Spiced {
     }
 }
 
+/// A `spiced`'s Flight endpoint and the credentials its clients present,
+/// for clients that each open a connection of their own (a `load`).
+#[derive(Debug, Clone)]
+pub struct FlightTarget {
+    endpoint: Arc<str>,
+    api_key: Option<String>,
+    tls_ca: Option<PathBuf>,
+}
+
+impl FlightTarget {
+    /// Opens a connection of its own.
+    pub async fn connect(&self) -> Result<FlightClient> {
+        let credentials = match &self.api_key {
+            Some(key) => Credentials::new("spicescript", SecretString::from(key.clone())),
+            None => Credentials::anonymous(),
+        };
+        FlightClient::try_new(
+            Arc::clone(&self.endpoint),
+            credentials,
+            None,
+            self.tls_ca.as_deref(),
+        )
+        .await
+        .context("Failed to connect to spiced over Flight")
+    }
+}
+
+/// The answer to `sql`, keeping the stream's schema in an empty batch when
+/// Flight sends no batch at all.
+pub async fn answer_with_schema(client: &FlightClient, sql: &str) -> Result<Vec<RecordBatch>> {
+    let mut stream = client.query(sql).await?;
+    let mut batches = Vec::new();
+    while let Some(batch) = stream.try_next().await? {
+        batches.push(batch);
+    }
+    if batches.is_empty() {
+        let schema = stream.schema().context("Flight returned no schema")?;
+        batches.push(RecordBatch::new_empty(Arc::clone(schema)));
+    }
+    Ok(batches)
+}
+
 impl Drop for Spiced {
     /// Dropping the `docker run` process leaves its container running, so a
     /// container instance dropped without being stopped is removed here,
@@ -983,6 +1040,22 @@ impl Drop for Spiced {
             crate::cleanup::remove_if_tracked(&run.name);
         }
     }
+}
+
+/// Writes an empty `.env` and `.env.local` into `dir` unless it has them.
+/// `spiced` reads each name from its working directory or the nearest ancestor
+/// that has it, so a variable kept out of its environment would come back from
+/// a file above the run directory, such as a checkout's `.env`. Variables a
+/// script sets reach it through its environment, as before.
+fn shadow_dotenv_files(dir: &Path) -> Result<()> {
+    for name in [".env", ".env.local"] {
+        let path = dir.join(name);
+        if !path.exists() {
+            std::fs::write(&path, "")
+                .with_context(|| format!("Failed to write {}", path.display()))?;
+        }
+    }
+    Ok(())
 }
 
 /// The names of the datasets a spicepod declares.
