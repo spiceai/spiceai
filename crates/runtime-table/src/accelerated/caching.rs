@@ -140,6 +140,19 @@ impl InFlightFetch {
                 .is_none_or(|fresh_until| fresh_until >= lookup_started_at)
         })
     }
+
+    /// Waits until the leader's claim on this key is released, which drops its
+    /// sender, or until `deadline`. A queued write releases the claim once it
+    /// has landed and removed the key from the map; a short pause after the
+    /// sender goes keeps a caller that acquires again from spinning in the
+    /// moment before the key is removed.
+    async fn released(mut self, deadline: tokio::time::Instant) {
+        let _ = tokio::time::timeout_at(deadline, async {
+            while self.state.changed().await.is_ok() {}
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        })
+        .await;
+    }
 }
 
 /// The outcome of a leader's fetch, published to followers over a [`watch`]
@@ -2719,41 +2732,56 @@ impl CacheRefreshHelper {
         // unless that fetch asked the origin for fewer rows than this caller
         // needs, in which case it fetches for itself and, holding no claim,
         // does not write.
-        let mut claim = match CacheKeyClaim::acquire(
-            &in_flight_revalidations,
-            compute_cache_key_from_filters_and_namespace(filters, namespace.storage_id()),
-            limit,
-        ) {
-            ClaimOutcome::Leader(claim) => claim,
-            ClaimOutcome::Follower(in_flight) => {
-                let own_fetch = UncoalescedFetch {
-                    federated,
-                    session_state,
-                    dataset_name,
-                    filters,
-                    limit,
-                    task_context: batch_write_tx.task_context(session_state),
-                    schema: fallback_schema,
-                    stale_if_error,
-                    max_age,
-                    expired_batches,
-                };
-                if !in_flight.replayable_for(lookup_started_at, max_age) {
+        let key = compute_cache_key_from_filters_and_namespace(filters, namespace.storage_id());
+        let wait_until = tokio::time::Instant::now() + FOLLOWER_WAIT_TIMEOUT;
+        let mut claim = loop {
+            match CacheKeyClaim::acquire(&in_flight_revalidations, key.clone(), limit) {
+                ClaimOutcome::Leader(claim) => break claim,
+                // An earlier lookup's fetch finished before this one began and
+                // is older than the TTL; its write has not landed yet. Replaying
+                // it would serve an answer older than this lookup (#16148), and
+                // fetching without the claim would leave the cache holding that
+                // older answer once its write lands. So wait for the write to
+                // release the key, then fetch and store as the leader.
+                ClaimOutcome::Follower(in_flight)
+                    if !in_flight.replayable_for(lookup_started_at, max_age)
+                        && tokio::time::Instant::now() < wait_until =>
+                {
                     tracing::debug!(
-                        "Cache miss for dataset {dataset_name} found a finished fetch for the same key older than its `caching_ttl` ({max_age:?}); fetching for itself"
+                        "Cache miss for dataset {dataset_name} found a finished fetch for the same key older than its `caching_ttl` ({max_age:?}); waiting for its write to land before fetching"
+                    );
+                    in_flight.released(wait_until).await;
+                }
+                ClaimOutcome::Follower(in_flight) => {
+                    let own_fetch = UncoalescedFetch {
+                        federated,
+                        session_state,
+                        dataset_name,
+                        filters,
+                        limit,
+                        task_context: batch_write_tx.task_context(session_state),
+                        schema: fallback_schema,
+                        stale_if_error,
+                        max_age,
+                        expired_batches,
+                    };
+                    if !in_flight.replayable_for(lookup_started_at, max_age) {
+                        tracing::debug!(
+                            "Cache miss for dataset {dataset_name} waited {FOLLOWER_WAIT_TIMEOUT:?} for an earlier write of the same key to land; fetching for itself"
+                        );
+                        drop(in_flight);
+                        return own_fetch.run().await;
+                    }
+                    if in_flight.serves(limit) {
+                        return Self::follow_cache_miss(in_flight.state, own_fetch).await;
+                    }
+                    tracing::debug!(
+                        "Cache miss for dataset {dataset_name} found an in-flight fetch for the same key bounded at {fetched:?} rows, below this request's limit {limit:?}; fetching for itself",
+                        fetched = in_flight.limit
                     );
                     drop(in_flight);
                     return own_fetch.run().await;
                 }
-                if in_flight.serves(limit) {
-                    return Self::follow_cache_miss(in_flight.state, own_fetch).await;
-                }
-                tracing::debug!(
-                    "Cache miss for dataset {dataset_name} found an in-flight fetch for the same key bounded at {fetched:?} rows, below this request's limit {limit:?}; fetching for itself",
-                    fetched = in_flight.limit
-                );
-                drop(in_flight);
-                return own_fetch.run().await;
             }
         };
 
@@ -7194,10 +7222,12 @@ mod tests {
         );
     }
 
-    /// Under `caching_ttl: 0s` a miss that finds a fetch whose result is already
-    /// published (its write not yet landed) asks the origin itself: replaying
-    /// it would serve an answer fetched before the lookup (#16148). Holding no
-    /// claim, it still never writes.
+    /// Under `caching_ttl: 0s` a miss that finds a fetch whose result was
+    /// published before the lookup began (its write not yet landed) does not
+    /// replay it, which would serve an answer older than the lookup (#16148).
+    /// It waits for that write to release the key, then fetches the origin and
+    /// stores the answer as the leader, so the cache does not end up holding
+    /// the older one.
     #[tokio::test]
     async fn a_zero_ttl_miss_does_not_replay_a_published_fetch() {
         use futures::StreamExt;
@@ -7233,10 +7263,14 @@ mod tests {
         )
         .expect("leader batch");
         leader.publish_ready(Arc::new(vec![published]));
+        let lookup_started_at = tokio::time::Instant::now();
+        let session_state = test_session_state();
+        let io = tokio::runtime::Handle::current();
 
-        let mut stream = CacheRefreshHelper::handle_cache_miss(
+        // The leader's write lands (releasing the key) while the miss waits.
+        let miss = CacheRefreshHelper::handle_cache_miss(
             Arc::clone(&http_source) as Arc<dyn TableProvider>,
-            &test_session_state(),
+            &session_state,
             "test_dataset",
             &filters,
             None,
@@ -7246,14 +7280,21 @@ mod tests {
             StaleIfError::Disabled,
             Duration::ZERO,
             None,
-            &tokio::runtime::Handle::current(),
+            &io,
             Arc::new(vec![].into()),
             batch_write_tx,
             CacheNamespace::Public,
             Arc::clone(&in_flight),
-            tokio::time::Instant::now(),
-        )
-        .await;
+            lookup_started_at,
+        );
+        let land = async {
+            tokio::task::yield_now().await;
+            drop(leader);
+        };
+        let (mut stream, ()) =
+            tokio::time::timeout(Duration::from_secs(5), async { tokio::join!(miss, land) })
+                .await
+                .expect("the miss proceeds once the leader's write releases the key");
 
         // The miss is served the origin's row, not the leader's published one.
         let mut served = Vec::new();
@@ -7273,14 +7314,27 @@ mod tests {
         );
 
         drop(stream);
-        drop(leader);
-        // The follower's sender went with the miss, so the writer flushes
-        // anything ever enqueued and exits.
+        // The miss's sender went with it, so the writer flushes what it was
+        // given and exits.
         await_writer_exit(handle).await;
 
-        assert!(
-            accelerator.get_data().is_empty(),
-            "a miss without the claim must not write"
+        let stored: Vec<String> = accelerator
+            .get_data()
+            .iter()
+            .flat_map(|batch| {
+                batch
+                    .column_by_name("content")
+                    .and_then(|c| c.as_any().downcast_ref::<StringArray>())
+                    .expect("content column")
+                    .iter()
+                    .map(|v| v.unwrap_or_default().to_string())
+                    .collect::<Vec<_>>()
+            })
+            .collect();
+        assert_eq!(
+            stored,
+            ["body"],
+            "the miss stores the origin's answer as the leader, not the earlier one"
         );
     }
 
