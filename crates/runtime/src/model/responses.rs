@@ -340,7 +340,6 @@ mod tests {
     async fn darkbloom_chat_and_responses_take_permits_from_one_controller() {
         use async_openai::types::chat::CreateChatCompletionRequest;
         use async_openai::types::responses::CreateResponseArgs;
-        use llms::chat::Chat;
         use std::time::Duration;
 
         let runtime = Arc::new(Runtime::builder().build().await);
