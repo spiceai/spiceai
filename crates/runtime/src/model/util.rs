@@ -116,7 +116,7 @@ pub(super) async fn create_bedrock_client(
     // Use common credential initialization from aws-sdk-credential-bridge
     let mut config_builder = aws_sdk_credential_bridge::initiate_config_with_credentials(
         credential_provider_name,
-        region.clone(),
+        region,
         access_key_id,
         secret_access_key,
         session_token,
@@ -124,21 +124,10 @@ pub(super) async fn create_bedrock_client(
     )
     .await;
 
-    // Set profile if provided (additional config not handled by initiate_config_with_credentials)
+    // Set profile if provided (additional config not handled by initiate_config_with_credentials).
+    // The credential chain, when it is the one used, reads it too.
     if let Some(profile) = extract_secret!(params, "aws_profile") {
         config_builder = config_builder.profile_name(profile);
-        if !static_keys && matches!(iam_role_source, None | Some("auto")) {
-            // The credential chain reads the profile it was built with.
-            let region = aws_config::Region::new(region.clone());
-            config_builder = config_builder.credentials_provider(
-                aws_sdk_credential_bridge::named_chain::default_named_chain(
-                    &aws_config::provider_config::ProviderConfig::default()
-                        .with_region(Some(region.clone())),
-                    Some(region),
-                    Some(profile),
-                ),
-            );
-        }
     }
 
     let mut rate_limit_builder = RateControllerBuilder::default();

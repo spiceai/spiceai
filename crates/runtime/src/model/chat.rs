@@ -826,8 +826,9 @@ async fn openai(
     validate_temperature(raw_params, "openai")?;
 
     let model = model_id.unwrap_or(DEFAULT_LLM_MODEL.to_string());
+    let label = format!("model '{model_name}' (openai)");
     if let Some(client) = workload_identity::openai_federated_client(
-        &format!("model '{model_name}' (openai)"),
+        &label,
         &model,
         &params.federation(),
         workload_identity::openai_api_key_in_spicepod(raw_params),
@@ -838,14 +839,11 @@ async fn openai(
     {
         return Ok(Arc::new(client) as Arc<dyn Chat>);
     }
-    if api_key.is_none() && workload_identity::is_openai_api(params.endpoint.as_str()) {
-        // OpenAI's own API refuses every request without a credential: say so now, rather than
-        // after a request.
+    if let Some(message) =
+        workload_identity::openai_missing_credential(&label, api_key, params.endpoint.as_str())
+    {
         return Err(LlmError::FailedToAuthenticate {
-            source: workload_identity::openai_no_credential_message(&format!(
-                "model '{model_name}' (openai)"
-            ))
-            .into(),
+            source: message.into(),
         });
     }
 

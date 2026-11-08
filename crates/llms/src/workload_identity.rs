@@ -689,19 +689,28 @@ fn azure_exchange(
 /// Whether `endpoint` is `OpenAI`'s own API, which a request without a credential cannot reach,
 /// as opposed to a compatible server that may need none.
 #[must_use]
-pub fn is_openai_api(endpoint: &str) -> bool {
+fn is_openai_api(endpoint: &str) -> bool {
     reqwest::Url::parse(endpoint)
         .ok()
         .and_then(|url| url.host_str().map(str::to_ascii_lowercase))
         .is_some_and(|host| host == "api.openai.com")
 }
 
-/// The message for an `OpenAI` model or embedding with no key and no federation params.
+/// The error for an `OpenAI` model or embedding `component` that calls `OpenAI`'s own API with no
+/// key (or a blank one, such as an empty `OPENAI_API_KEY`) and no federation params. `OpenAI`
+/// refuses every such request, so Spice says so before the first. `None` for any other endpoint,
+/// which may accept requests without a key.
 #[must_use]
-pub fn openai_no_credential_message(component: &str) -> String {
-    format!(
-        "Found no credential for {component}: set `openai_api_key`, or workload identity federation with `openai_identity_provider_id` and `openai_service_account_id`. See: {OPENAI_DOCS}"
-    )
+pub fn openai_missing_credential(
+    component: &str,
+    api_key: Option<&str>,
+    endpoint: &str,
+) -> Option<String> {
+    (api_key.is_none_or(|key| key.trim().is_empty()) && is_openai_api(endpoint)).then(|| {
+        format!(
+            "Found no credential for {component}: set `openai_api_key`, or workload identity federation with `openai_identity_provider_id` and `openai_service_account_id`. See: {OPENAI_DOCS}"
+        )
+    })
 }
 
 /// The message for an Anthropic model with no key, auth token or federation settings.

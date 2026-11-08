@@ -17,6 +17,12 @@ variants:
       ANTHROPIC_ORGANIZATION_ID: 00000000-0000-0000-0000-000000000000
       ANTHROPIC_SERVICE_ACCOUNT_ID: svac_test
       ANTHROPIC_IDENTITY_TOKEN_FILE: '${instance.dir}/missing-anthropic-token'
+      # A key the machine running the script has, under any name the environment store reads,
+      # would give `gpt_no_credential` a credential. A blank key counts as none.
+      OPENAI_API_KEY: ''
+      SPICE_OPENAI_API_KEY: ''
+      openai_api_key: ''
+      SPICE_openai_api_key: ''
 
 spicepod:
   version: v1

@@ -22,24 +22,18 @@ limitations under the License.
 use async_trait::async_trait;
 use aws_config::Region;
 use aws_config::meta::region::RegionProviderChain;
-use aws_config::provider_config::ProviderConfig;
-use aws_credential_types::provider::SharedCredentialsProvider;
 use aws_sdk_sts::error::ProvideErrorMetadata;
 use aws_sdk_sts::operation::get_web_identity_token::GetWebIdentityTokenError;
 use aws_smithy_runtime_api::client::result::SdkError;
 use secrecy::SecretString;
 use token_provider::workload_identity::IdentityTokenSource;
 
-use crate::default_aws_config;
-use crate::named_chain::{credential_source, default_named_chain};
+use crate::named_chain::credential_source;
+use crate::{DEFAULT_REGION, default_aws_config};
 
 /// How long a requested token lives. The exchange happens right away, so a short life costs
 /// nothing and limits the use of a token that leaks.
 const TOKEN_LIFETIME_SECS: i32 = 900;
-
-/// The region STS is called in when none is configured: `GetWebIdentityToken` is served only by
-/// regional endpoints.
-const DEFAULT_REGION: &str = "us-east-1";
 
 /// The workload's AWS IAM role, whose identity tokens AWS STS signs for an audience.
 pub struct AwsWebIdentityToken {
@@ -57,23 +51,14 @@ impl AwsWebIdentityToken {
     ///
     /// When the chain finds no credentials, with each link tried and what it said.
     pub async fn detect(audience: &str) -> Result<Self, String> {
-        let region = RegionProviderChain::default_provider()
-            .or_else(Region::new(DEFAULT_REGION))
-            .region()
-            .await
-            .unwrap_or_else(|| Region::new(DEFAULT_REGION));
-        let provider_config = ProviderConfig::default().with_region(Some(region.clone()));
-        let chain = SharedCredentialsProvider::new(default_named_chain(
-            &provider_config,
-            Some(region.clone()),
-            None,
-        ));
-        let credentials_from = credential_source(&chain, "configured AWS credentials").await?;
         let config = default_aws_config()
-            .region(region)
-            .credentials_provider(chain)
+            .region(RegionProviderChain::default_provider().or_else(Region::new(DEFAULT_REGION)))
             .load()
             .await;
+        let Some(chain) = config.credentials_provider() else {
+            return Err("found no AWS credentials".to_string());
+        };
+        let credentials_from = credential_source(&chain, "configured AWS credentials").await?;
         Ok(Self {
             sts: aws_sdk_sts::Client::new(&config),
             audience: audience.to_string(),

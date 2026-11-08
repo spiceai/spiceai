@@ -17,7 +17,9 @@ limitations under the License.
 mod credential_provider;
 pub mod object_store_builder;
 
-pub use aws_identity::{apn_app_name, default_aws_config, identity_token, named_chain};
+pub use aws_identity::{
+    AwsConfigLoader, apn_app_name, default_aws_config, identity_token, named_chain,
+};
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -76,23 +78,11 @@ pub enum LoadError {
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
 
-/// The default configuration for `region`, with the credential chain every AWS component uses:
-/// the AWS SDKs' default order, named link by link, with the identity of a GitHub Actions job
-/// after web identity (see [`named_chain::default_named_chain`]). Without a region the SDK's own
-/// default chain resolves one along with the credentials.
-fn default_aws_config_for_region(region: Option<&str>) -> aws_config::ConfigLoader {
+/// The default configuration in `region`, or the region the environment or the AWS profile
+/// names, with the credential chain every AWS component uses ([`AwsConfigLoader`]).
+fn default_aws_config_for_region(region: Option<&str>) -> AwsConfigLoader {
     match region {
-        Some(region) => {
-            let region = Region::new(region.to_string());
-            let provider_config = ProviderConfig::default().with_region(Some(region.clone()));
-            default_aws_config()
-                .region(region.clone())
-                .credentials_provider(named_chain::default_named_chain(
-                    &provider_config,
-                    Some(region),
-                    None,
-                ))
-        }
+        Some(region) => default_aws_config().region(Region::new(region.to_string())),
         None => default_aws_config(),
     }
 }
@@ -506,7 +496,7 @@ fn non_empty_session_token(session_token: Option<String>) -> Option<String> {
 /// - `session_token`: Optional session token
 ///
 /// # Returns
-/// A `ConfigLoader` that can be further customized before loading.
+/// An [`AwsConfigLoader`] that can be further customized before loading.
 ///
 /// When `iam_role_source` is provided:
 /// - `"auto"` or `None`: Uses the default AWS credential chain (env vars, shared config, web identity, ECS, IMDS).
@@ -519,7 +509,7 @@ pub async fn initiate_config_with_credentials(
     secret_access_key: Option<String>,
     session_token: Option<String>,
     iam_role_source: Option<&str>,
-) -> aws_config::ConfigLoader {
+) -> AwsConfigLoader {
     use aws_config::Region;
     use aws_credential_types::Credentials;
 
@@ -565,9 +555,8 @@ pub async fn initiate_config_with_credentials(
 /// - `region`: AWS region
 ///
 /// # Returns
-/// A [`ConfigLoader`] that can be further customized before loading.
-#[must_use]
-pub async fn initiate_config_default_auth(region: String) -> aws_config::ConfigLoader {
+/// An [`AwsConfigLoader`] that can be further customized before loading.
+pub async fn initiate_config_default_auth(region: String) -> AwsConfigLoader {
     if let Err(err) = get_or_init_sdk_config_with_region(Some(region.as_str())).await {
         tracing::warn!("Unable to initialize AWS credentials: {err}");
     }
@@ -586,9 +575,8 @@ pub async fn initiate_config_default_auth(region: String) -> aws_config::ConfigL
 /// - `region`: AWS region
 ///
 /// # Returns
-/// A [`ConfigLoader`] that can be further customized before loading.
-#[must_use]
-pub fn initiate_config_auth_iam_metadata(region: String) -> aws_config::ConfigLoader {
+/// An [`AwsConfigLoader`] that can be further customized before loading.
+pub fn initiate_config_auth_iam_metadata(region: String) -> AwsConfigLoader {
     let provider_config = ProviderConfig::default().with_region(Some(Region::new(region.clone())));
 
     let web_identity_provider = WebIdentityTokenCredentialsProvider::builder()
@@ -622,9 +610,8 @@ pub fn initiate_config_auth_iam_metadata(region: String) -> aws_config::ConfigLo
 /// - `region`: AWS region
 ///
 /// # Returns
-/// A [`ConfigLoader`] that can be further customized before loading.
-#[must_use]
-pub fn initiate_config_auth_iam_env(region: String) -> aws_config::ConfigLoader {
+/// An [`AwsConfigLoader`] that can be further customized before loading.
+pub fn initiate_config_auth_iam_env(region: String) -> AwsConfigLoader {
     let env_provider = EnvironmentVariableCredentialsProvider::new();
 
     default_aws_config()
@@ -644,15 +631,14 @@ pub fn initiate_config_auth_iam_env(region: String) -> aws_config::ConfigLoader 
 /// - `session_token`: Optional AWS session token (for temporary credentials)
 ///
 /// # Returns
-/// A [`ConfigLoader`] that can be further customized before loading.
-#[must_use]
+/// An [`AwsConfigLoader`] that can be further customized before loading.
 pub fn initiate_config_auth_key(
     provider_name: &'static str,
     region: String,
     access_key_id: String,
     secret_access_key: String,
     session_token: Option<String>,
-) -> aws_config::ConfigLoader {
+) -> AwsConfigLoader {
     use aws_credential_types::Credentials;
 
     let credentials = Credentials::new(

@@ -790,8 +790,9 @@ async fn openai(
     let usage_tier = params.usage_tier;
     let model = model_id.unwrap_or(DEFAULT_EMBEDDING_MODEL.to_string());
 
+    let label = format!("embedding '{}' (openai)", component.name);
     if let Some(client) = llms::workload_identity::openai_federated_client(
-        &format!("embedding '{}' (openai)", component.name),
+        &label,
         &model,
         &params.federation(),
         api_key_in_spicepod,
@@ -803,14 +804,13 @@ async fn openai(
         let embed = OpenaiEmbed::new(client, Some(usage_tier.into())).set_cache(embeddings_cache);
         return with_tokenizer_file(embed, component, secrets).await;
     }
-    if params.api_key.is_none() && llms::workload_identity::is_openai_api(params.endpoint.as_str())
-    {
+    if let Some(message) = llms::workload_identity::openai_missing_credential(
+        &label,
+        params.api_key.as_ref().map(ExposeSecret::expose_secret),
+        params.endpoint.as_str(),
+    ) {
         return Err(EmbedError::FailedToInstantiateEmbeddingModel {
-            source: llms::workload_identity::openai_no_credential_message(&format!(
-                "embedding '{}' (openai)",
-                component.name
-            ))
-            .into(),
+            source: message.into(),
         });
     }
 

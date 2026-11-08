@@ -28,7 +28,7 @@ use aws_config::imds::credentials::ImdsCredentialsProvider;
 use aws_config::profile::ProfileFileCredentialsProvider;
 use aws_config::provider_config::ProviderConfig;
 use aws_config::web_identity_token::WebIdentityTokenCredentialsProvider;
-use aws_config::{BehaviorVersion, Region};
+use aws_config::{Region, SdkConfig};
 use aws_credential_types::Credentials;
 use aws_credential_types::provider::error::CredentialsError;
 use aws_credential_types::provider::{self, ProvideCredentials, SharedCredentialsProvider, future};
@@ -71,6 +71,19 @@ impl fmt::Display for NoCredentials {
 
 impl std::error::Error for NoCredentials {}
 
+/// AWS STS refusing to assume a role, as [`assume_role_refusal`] words it. The message bounds its
+/// own parts, so [`credential_source`] passes it on whole, where it bounds any other failure.
+#[derive(Clone, Debug)]
+struct AssumeRoleRefused(String);
+
+impl fmt::Display for AssumeRoleRefused {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for AssumeRoleRefused {}
+
 /// `text` as a clause of a longer message: on one line, without a trailing period, and bounded.
 fn clause(text: &str) -> String {
     let text = util::single_line(text);
@@ -81,13 +94,17 @@ fn clause(text: &str) -> String {
     }
 }
 
-/// The innermost reason of `error`, which names the cause rather than the wrapper.
+/// `error` and each error it wraps, from the outermost to the cause.
+fn causes<'a>(
+    error: &'a (dyn std::error::Error + 'static),
+) -> impl Iterator<Item = &'a (dyn std::error::Error + 'static)> {
+    std::iter::successors(Some(error), |&error| error.source())
+}
+
+/// The innermost reason of `error` as a bounded clause, which names the cause rather than the
+/// wrapper.
 fn innermost(error: &(dyn std::error::Error + 'static)) -> String {
-    let mut current = error;
-    while let Some(source) = current.source() {
-        current = source;
-    }
-    clause(&current.to_string())
+    clause(&causes(error).last().unwrap_or(error).to_string())
 }
 
 /// Credential providers tried in order, each under its name. The first that gives credentials
@@ -147,14 +164,36 @@ impl ProvideCredentials for NamedChain {
 /// The chain of the AWS SDKs' default credential provider, in its order, with the identity of a
 /// GitHub Actions job after web identity: environment keys, the AWS profile (`profile` or
 /// `AWS_PROFILE`), web identity, this GitHub Actions job, container credentials, then the
-/// instance's IAM role. `provider_config` carries `region`, where STS is called.
-#[must_use]
-pub fn default_named_chain(
-    provider_config: &ProviderConfig,
-    region: Option<Region>,
-    profile: Option<&str>,
-) -> NamedChain {
-    let mut profile_provider = ProfileFileCredentialsProvider::builder().configure(provider_config);
+/// instance's IAM role. Each link calls AWS as a client of `config` does: in its region (STS in
+/// `us-east-1` when it has none, which assumes a role of any region), with its FIPS and dual-stack
+/// endpoints, HTTP client and time source. [`crate::AwsConfigLoader`] builds it.
+pub(crate) fn default_named_chain(config: &SdkConfig, profile: Option<&str>) -> NamedChain {
+    let region = config
+        .region()
+        .cloned()
+        .unwrap_or_else(|| Region::new(crate::DEFAULT_REGION));
+    let mut provider_config = ProviderConfig::default()
+        .with_region(Some(region.clone()))
+        .with_use_fips(config.use_fips())
+        .with_use_dual_stack(config.use_dual_stack())
+        .with_behavior_version(config.behavior_version());
+    if let Some(http_client) = config.http_client() {
+        provider_config = provider_config.with_http_client(http_client);
+    }
+    if let Some(sleep_impl) = config.sleep_impl() {
+        provider_config = provider_config.with_sleep_impl(sleep_impl);
+    }
+    if let Some(time_source) = config.time_source() {
+        provider_config = provider_config.with_time_source(time_source);
+    }
+    // The component's endpoint is its own service's: STS keeps its own (`AWS_ENDPOINT_URL_STS`),
+    // as it does for the SDK's providers above.
+    let mut sts_config = config.to_builder();
+    sts_config.set_endpoint_url(None);
+    let sts_config = sts_config.region(region).build();
+
+    let mut profile_provider =
+        ProfileFileCredentialsProvider::builder().configure(&provider_config);
     if let Some(profile) = profile {
         profile_provider = profile_provider.profile_name(profile);
     }
@@ -164,20 +203,20 @@ pub fn default_named_chain(
         .with(
             WEB_IDENTITY,
             WebIdentityTokenCredentialsProvider::builder()
-                .configure(provider_config)
+                .configure(&provider_config)
                 .build(),
         )
-        .with(GITHUB_ACTIONS, GitHubActionsRole::from_env(region))
+        .with(GITHUB_ACTIONS, GitHubActionsRole::from_env(sts_config))
         .with(
             CONTAINER,
             EcsCredentialsProvider::builder()
-                .configure(provider_config)
+                .configure(&provider_config)
                 .build(),
         )
         .with(
             INSTANCE,
             ImdsCredentialsProvider::builder()
-                .configure(provider_config)
+                .configure(&provider_config)
                 .build(),
         )
 }
@@ -198,18 +237,17 @@ pub async fn credential_source(
             .get_property::<CredentialSource>()
             .map_or(static_source, |source| source.0)),
         Err(error) => {
-            use std::error::Error as _;
-            let mut current: Option<&(dyn std::error::Error + 'static)> = error.source();
-            while let Some(source) = current {
-                if let Some(none) = source.downcast_ref::<NoCredentials>() {
-                    return Err(none.to_string());
-                }
-                current = source.source();
+            if let Some(none) =
+                causes(&error).find_map(|cause| cause.downcast_ref::<NoCredentials>())
+            {
+                return Err(none.to_string());
             }
-            Err(format!(
-                "failed to get AWS credentials: {}",
-                innermost(&error)
-            ))
+            let reason =
+                match causes(&error).find_map(|cause| cause.downcast_ref::<AssumeRoleRefused>()) {
+                    Some(refused) => refused.to_string(),
+                    None => innermost(&error),
+                };
+            Err(format!("failed to get AWS credentials: {reason}"))
         }
     }
 }
@@ -219,20 +257,34 @@ pub async fn credential_source(
 /// only in a job with `permissions: id-token: write`, with `AWS_ROLE_ARN` set and no
 /// `AWS_WEB_IDENTITY_TOKEN_FILE`, which web identity reads instead. Each time the SDK refreshes
 /// the credentials, a new identity token is requested.
-#[derive(Debug)]
-pub struct GitHubActionsRole {
+pub(crate) struct GitHubActionsRole {
     role_arn: Option<String>,
     token_file_set: bool,
-    request_url: Option<String>,
-    request_token: Option<String>,
-    region: Option<Region>,
+    /// The job's OIDC token endpoint, which never formats `ACTIONS_ID_TOKEN_REQUEST_TOKEN`, the
+    /// credential that obtains the job's identity tokens.
+    job: Option<SubjectTokenSource>,
+    /// The configuration of the STS client, without credentials: `AssumeRoleWithWebIdentity` is
+    /// not signed, and this link must not ask the chain it is part of.
+    sts_config: SdkConfig,
+}
+
+impl fmt::Debug for GitHubActionsRole {
+    /// Not the STS configuration itself, whose `Debug` prints the parsed AWS profiles,
+    /// `aws_secret_access_key` among them.
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("GitHubActionsRole")
+            .field("role_arn", &self.role_arn)
+            .field("token_file_set", &self.token_file_set)
+            .field("job", &self.job)
+            .field("sts_region", &self.sts_config.region())
+            .field("sts_endpoint_url", &self.sts_config.endpoint_url())
+            .finish()
+    }
 }
 
 impl GitHubActionsRole {
-    /// The job and role of this process's environment, with STS in `region`, or the global
-    /// endpoint when it is `None`.
-    #[must_use]
-    pub fn from_env(region: Option<Region>) -> Self {
+    /// The job and role of this process's environment, with STS called as `sts_config` says.
+    fn from_env(sts_config: SdkConfig) -> Self {
         let var = |name: &str| {
             std::env::var(name)
                 .ok()
@@ -241,27 +293,29 @@ impl GitHubActionsRole {
         Self {
             role_arn: var("AWS_ROLE_ARN"),
             token_file_set: var("AWS_WEB_IDENTITY_TOKEN_FILE").is_some(),
-            request_url: var("ACTIONS_ID_TOKEN_REQUEST_URL"),
-            request_token: var("ACTIONS_ID_TOKEN_REQUEST_TOKEN"),
-            region,
+            job: SubjectTokenSource::github_actions(
+                var("ACTIONS_ID_TOKEN_REQUEST_URL"),
+                var("ACTIONS_ID_TOKEN_REQUEST_TOKEN"),
+                STS_AUDIENCE,
+            )
+            .ok(),
+            sts_config,
         }
     }
 
     /// The identity token source, or why this link does not apply, as a clause.
-    fn source(&self) -> Result<(&str, SubjectTokenSource), &'static str> {
+    fn source(&self) -> Result<(&str, &SubjectTokenSource), &'static str> {
         let Some(role_arn) = self.role_arn.as_deref() else {
             return Err("`AWS_ROLE_ARN` is not set");
         };
         if self.token_file_set {
             return Err("`AWS_WEB_IDENTITY_TOKEN_FILE` is set, which web identity reads");
         }
-        let source = SubjectTokenSource::github_actions(
-            self.request_url.clone(),
-            self.request_token.clone(),
-            STS_AUDIENCE,
-        )
-        .map_err(|_| "this is not a GitHub Actions job with `permissions: id-token: write`")?;
-        Ok((role_arn, source))
+        let job = self
+            .job
+            .as_ref()
+            .ok_or("this is not a GitHub Actions job with `permissions: id-token: write`")?;
+        Ok((role_arn, job))
     }
 
     async fn credentials(&self) -> provider::Result {
@@ -270,16 +324,7 @@ impl GitHubActionsRole {
             .fetch_identity_token()
             .await
             .map_err(CredentialsError::provider_error)?;
-        let sts = aws_sdk_sts::Client::from_conf(
-            aws_sdk_sts::Config::builder()
-                .behavior_version(BehaviorVersion::latest())
-                .region(
-                    self.region
-                        .clone()
-                        .unwrap_or_else(|| Region::new("us-east-1")),
-                )
-                .build(),
-        );
+        let sts = aws_sdk_sts::Client::new(&self.sts_config);
         let session = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .map(|elapsed| elapsed.as_secs())
@@ -325,7 +370,11 @@ impl ProvideCredentials for GitHubActionsRole {
 /// The message for STS refusing to assume `role_arn` with a GitHub Actions identity token: STS's
 /// reason, the token's claims for the user to compare with the role's trust policy, and what to
 /// check. Never the token.
-fn assume_role_refusal<E, R>(role_arn: &str, error: &SdkError<E, R>, token: &str) -> String
+fn assume_role_refusal<E, R>(
+    role_arn: &str,
+    error: &SdkError<E, R>,
+    token: &str,
+) -> AssumeRoleRefused
 where
     E: ProvideErrorMetadata + std::error::Error + 'static,
     R: fmt::Debug + 'static,
@@ -342,9 +391,9 @@ where
     let claims = IdentityTokenClaims::read(token)
         .map(|claims| claims.sentence("GitHub Actions"))
         .unwrap_or_default();
-    format!(
+    AssumeRoleRefused(format!(
         "AWS STS refused to assume the role '{role_arn}' with the GitHub Actions identity token: {reason}.{claims} Verify that the role's trust policy trusts `token.actions.githubusercontent.com` for this job's subject with the audience `{STS_AUDIENCE}`."
-    )
+    ))
 }
 
 #[cfg(test)]
@@ -383,18 +432,16 @@ mod tests {
         }
     }
 
-    /// A link that fails with an error other than not being configured.
+    /// A link that fails with `reason`, an error other than not being configured.
     #[derive(Debug)]
-    struct Failing;
+    struct Failing(String);
 
     impl ProvideCredentials for Failing {
         fn provide_credentials<'a>(&'a self) -> future::ProvideCredentials<'a>
         where
             Self: 'a,
         {
-            future::ProvideCredentials::ready(Err(CredentialsError::provider_error(
-                "the role's trust policy refused",
-            )))
+            future::ProvideCredentials::ready(Err(CredentialsError::provider_error(self.0.clone())))
         }
     }
 
@@ -449,12 +496,104 @@ mod tests {
         );
     }
 
+    /// A link that STS refuses, as the GitHub Actions link reports it.
+    #[derive(Debug)]
+    struct Refusing(AssumeRoleRefused);
+
+    impl ProvideCredentials for Refusing {
+        fn provide_credentials<'a>(&'a self) -> future::ProvideCredentials<'a>
+        where
+            Self: 'a,
+        {
+            future::ProvideCredentials::ready(Err(CredentialsError::provider_error(self.0.clone())))
+        }
+    }
+
+    #[tokio::test]
+    async fn a_refusal_reaches_the_component_whole() {
+        use base64::Engine as _;
+        use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+
+        let token = format!(
+            "eyJhbGciOiJSUzI1NiJ9.{}.c2ln",
+            URL_SAFE_NO_PAD.encode(
+                r#"{"iss":"https://token.actions.githubusercontent.com","sub":"repo:acme/widgets:environment:ci","aud":"sts.amazonaws.com","exp":1794060300}"#
+            )
+        );
+        let refusal = assume_role_refusal::<
+            aws_sdk_sts::operation::assume_role_with_web_identity::AssumeRoleWithWebIdentityError,
+            (),
+        >(
+            "arn:aws:iam::111122223333:role/spice-ci",
+            &SdkError::construction_failure(
+                "Not authorized to perform sts:AssumeRoleWithWebIdentity",
+            ),
+            &token,
+        );
+        let message = refusal.to_string();
+        assert!(
+            message.contains("has issuer 'https://token.actions.githubusercontent.com', subject 'repo:acme/widgets:environment:ci', audience 'sts.amazonaws.com' and expiry 2026-11-07T14:05:00Z")
+                && message.ends_with("Verify that the role's trust policy trusts `token.actions.githubusercontent.com` for this job's subject with the audience `sts.amazonaws.com`."),
+            "{message}"
+        );
+        let chain = SharedCredentialsProvider::new(
+            NamedChain::new().with(GITHUB_ACTIONS, Refusing(refusal)),
+        );
+        assert_eq!(
+            credential_source(&chain, "the static keys").await,
+            Err(format!("failed to get AWS credentials: {message}"))
+        );
+
+        // The same words from any other provider are bounded to one clause.
+        let other = SharedCredentialsProvider::new(
+            NamedChain::new().with(WEB_IDENTITY, Failing(message.clone())),
+        );
+        let bounded: String = message.chars().take(MAX_REASON_LEN).collect();
+        assert_eq!(
+            credential_source(&other, "the static keys").await,
+            Err(format!("failed to get AWS credentials: {bounded}…"))
+        );
+    }
+
+    #[test]
+    fn the_github_actions_link_never_formats_its_request_token() {
+        let role = GitHubActionsRole {
+            role_arn: Some("arn:aws:iam::111122223333:role/spice-ci".to_string()),
+            token_file_set: false,
+            job: SubjectTokenSource::github_actions(
+                Some("https://actions.example/token?secret-url-part".to_string()),
+                Some("OIDC_REQUEST_TOKEN_CANARY".to_string()),
+                STS_AUDIENCE,
+            )
+            .ok(),
+            // Its `Debug` would print it, as it would the parsed AWS profiles.
+            sts_config: SdkConfig::builder()
+                .app_name(aws_config::AppName::new("sts-config-canary").expect("an app name"))
+                .build(),
+        };
+        let formatted = format!("{:?}", NamedChain::new().with(GITHUB_ACTIONS, role));
+        assert!(
+            !formatted.contains("OIDC_REQUEST_TOKEN_CANARY")
+                && !formatted.contains("secret-url-part")
+                && !formatted.contains("sts-config-canary"),
+            "{formatted}"
+        );
+        assert!(
+            formatted.contains("arn:aws:iam::111122223333:role/spice-ci")
+                && formatted.contains(r#"GitHubActions { audience: "sts.amazonaws.com", .. }"#),
+            "{formatted}"
+        );
+    }
+
     #[tokio::test]
     async fn a_link_that_fails_otherwise_stops_the_chain() {
         let later = Arc::new(AtomicUsize::new(0));
         let chain = SharedCredentialsProvider::new(
             NamedChain::new()
-                .with(WEB_IDENTITY, Failing)
+                .with(
+                    WEB_IDENTITY,
+                    Failing("the role's trust policy refused".to_string()),
+                )
                 .with(INSTANCE, Giving(Arc::clone(&later))),
         );
         assert_eq!(
@@ -469,9 +608,13 @@ mod tests {
         let role = |role_arn: Option<&str>, token_file_set: bool, job: bool| GitHubActionsRole {
             role_arn: role_arn.map(str::to_string),
             token_file_set,
-            request_url: job.then(|| "https://actions.example/token".to_string()),
-            request_token: job.then(|| "request-token".to_string()),
-            region: None,
+            job: SubjectTokenSource::github_actions(
+                job.then(|| "https://actions.example/token".to_string()),
+                job.then(|| "request-token".to_string()),
+                STS_AUDIENCE,
+            )
+            .ok(),
+            sts_config: SdkConfig::builder().build(),
         };
         let arn = Some("arn:aws:iam::111122223333:role/spice-ci");
         assert_eq!(
@@ -496,7 +639,8 @@ mod tests {
                 Ok("arn:aws:iam::111122223333:role/spice-ci".to_string()),
             ]
         );
-        let Ok((_, source)) = role(arn, false, true).source() else {
+        let github = role(arn, false, true);
+        let Ok((_, source)) = github.source() else {
             panic!("a GitHub Actions source");
         };
         assert_eq!(
