@@ -1603,6 +1603,7 @@ dependencies = [
  "aws-credential-types",
  "aws-sdk-sts",
  "aws-smithy-runtime-api",
+ "axum",
  "base64 0.22.1",
  "secrecy",
  "token_provider",
