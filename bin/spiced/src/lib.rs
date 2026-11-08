@@ -58,7 +58,7 @@ use connector_databricks as _;
 use connector_delta_lake as _;
 #[cfg(feature = "dremio")]
 use connector_dremio as _;
-#[cfg(feature = "duckdb")]
+#[cfg(feature = "adbc")]
 use connector_duckdb as _;
 use connector_ducklake as _;
 #[cfg(feature = "dynamodb")]
@@ -109,8 +109,6 @@ use connector_spark as _;
 // Same force-linkage for accelerator engines, which self-register via
 // `register_data_accelerator!` into a linkme slice of their own.
 use accelerator_cayenne as _;
-#[cfg(feature = "duckdb")]
-use accelerator_duckdb as _;
 #[cfg(feature = "postgres-accel")]
 use accelerator_postgres as _;
 #[cfg(feature = "sqlite")]

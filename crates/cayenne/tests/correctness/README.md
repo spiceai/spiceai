@@ -8,7 +8,7 @@ query's `ORDER BY`** (see [Row order](#row-order)) between:
 
 1. **Standalone engines outside Spice** — raw embedded crates used as oracles  
    (`duckdb-oracle` via ADBC, `rusqlite`, `chdb-rust`)
-2. **Spice accelerators** — Cayenne, DuckDB accelerator, SQLite accelerator
+2. **Spice accelerators** — Cayenne, SQLite accelerator
 
 They measure correctness only. Numeric compare uses existing float tolerance.
 
@@ -20,7 +20,6 @@ They measure correctness only. Numeric compare uses existing float tolerance.
 | `standalone-sqlite` | SQLite **outside** Spice | `rusqlite` (not Spice SQLite accel) |
 | `standalone-chdb` | chDB **outside** Spice | `chdb-rust` |
 | `spice-cayenne` | Cayenne accelerator | `CayenneTableProvider` |
-| `spice-duckdb-accel` | Spice DuckDB accelerator | `accelerator_duckdb` |
 | `spice-sqlite-accel` | Spice SQLite accelerator | `accelerator_sqlite` |
 
 **DuckDB and chDB cannot both run** in one process; the chDB lane is a separate
@@ -33,7 +32,6 @@ test binary from the `integration` binary that holds the DuckDB lanes.
 standalone-duckdb          —            ✅ cayenne suite          —
 standalone-sqlite          ✅                 —                   —
 spice-cayenne              ✅                 ✅                   ✅
-spice-duckdb-accel         ✅ (runtime)       —                   —
 spice-sqlite-accel         —                  ✅ (runtime)        —
 ```
 
@@ -129,8 +127,7 @@ Dedicated binary (not the full `integration` suite):
 
 | Test | Features | Engines | Suites |
 |------|----------|---------|--------|
-| `spice_duckdb_accel_vs_standalone_duckdb_micro` | `duckdb,sqlite` | Spice DuckDB accel ↔ standalone DuckDB | micro shapes |
-| `spice_sqlite_accel_vs_standalone_sqlite_micro` | `duckdb,sqlite` | Spice SQLite accel ↔ standalone SQLite | micro shapes |
+| `spice_sqlite_accel_vs_standalone_sqlite_micro` | `sqlite` | Spice SQLite accel ↔ standalone SQLite | micro shapes |
 
 ### CH-benCHmark load-mode matrix (Cayenne only)
 

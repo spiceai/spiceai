@@ -154,7 +154,7 @@ if [ "$bench" = "tpch" ]; then
       echo "        pg_db: $pg_db" >> spicepod.yaml
     done
   fi
-  if [ "$engine" = "duckdb" ]; then
+  if [ "$engine" = "cayenne" ]; then
     for i in customer lineitem nation orders part partsupp region supplier; do
       echo "  - from: duckdb:$i" >> spicepod.yaml
       echo "    name: $i" >> spicepod.yaml
@@ -162,10 +162,8 @@ if [ "$bench" = "tpch" ]; then
       echo "      duckdb_open: $dbname" >> spicepod.yaml
       echo "    acceleration:" >> spicepod.yaml
       echo "      enabled: true" >> spicepod.yaml
-      echo "      engine: duckdb" >> spicepod.yaml
+      echo "      engine: cayenne" >> spicepod.yaml
       echo "      mode: file" >> spicepod.yaml
-      echo "      params:" >> spicepod.yaml
-      echo "        duckdb_file: $dbname_accelerated_prefix$i.db" >> spicepod.yaml
     done
   fi
   if [ "$engine" = "sqlite" ]; then
@@ -214,7 +212,7 @@ if [ "$bench" = "tpcds" ]; then
       echo "        pg_db: $pg_db" >> spicepod.yaml
     done
   fi
-  if [ "$engine" = "duckdb" ]; then
+  if [ "$engine" = "cayenne" ]; then
     for i in call_center catalog_page catalog_returns catalog_sales customer customer_address customer_demographics date_dim household_demographics income_band inventory item promotion reason ship_mode store store_returns store_sales time_dim warehouse web_page web_returns web_sales web_site; do
       echo "  - from: duckdb:$i" >> spicepod.yaml
       echo "    name: $i" >> spicepod.yaml
@@ -222,10 +220,8 @@ if [ "$bench" = "tpcds" ]; then
       echo "      duckdb_open: $dbname" >> spicepod.yaml
       echo "    acceleration:" >> spicepod.yaml
       echo "      enabled: true" >> spicepod.yaml
-      echo "      engine: duckdb" >> spicepod.yaml
+      echo "      engine: cayenne" >> spicepod.yaml
       echo "      mode: file" >> spicepod.yaml
-      echo "      params:" >> spicepod.yaml
-      echo "        duckdb_file: $dbname_accelerated_prefix$i.db" >> spicepod.yaml
     done
   fi
   if [ "$engine" = "sqlite" ]; then

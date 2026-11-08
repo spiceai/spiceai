@@ -691,7 +691,7 @@ mod served_from_acceleration {
 
     /// A `Cayenne` file acceleration that refreshes every second, so a refresh is due
     /// as soon as the runtime restarts.
-    fn dataset(prefix: &str, duckdb_file: &Path, ready_state: ReadyState) -> SpicepodDataset {
+    fn dataset(prefix: &str, cayenne_path: &Path, ready_state: ReadyState) -> SpicepodDataset {
         let mut dataset = SpicepodDataset::new(format!("{prefix}://orders"), "orders");
         dataset.ready_state = ready_state;
         dataset.acceleration = Some(Acceleration {
@@ -702,7 +702,7 @@ mod served_from_acceleration {
             refresh_check_interval: Some("1s".to_string()),
             params: Some(Params::from_string_map(HashMap::from([(
                 "cayenne_file_path".to_string(),
-                duckdb_file.to_string_lossy().to_string(),
+                cayenne_path.to_string_lossy().to_string(),
             )]))),
             ..Default::default()
         });
@@ -1026,8 +1026,8 @@ mod served_from_acceleration {
     }
 
     /// `orders_view` reading `orders` with `sql`, accelerated in the `Cayenne` file
-    /// `duckdb_file` and refreshed every second.
-    fn accelerated_orders_view(duckdb_file: &Path, sql: &str) -> View {
+    /// `cayenne_path` and refreshed every second.
+    fn accelerated_orders_view(cayenne_path: &Path, sql: &str) -> View {
         let mut view = View::new("orders_view".to_string());
         view.sql = Some(sql.to_string());
         view.acceleration = Some(Acceleration {
@@ -1037,7 +1037,7 @@ mod served_from_acceleration {
             refresh_check_interval: Some("1s".to_string()),
             params: Some(Params::from_string_map(HashMap::from([(
                 "cayenne_file_path".to_string(),
-                duckdb_file.to_string_lossy().to_string(),
+                cayenne_path.to_string_lossy().to_string(),
             )]))),
             ..Default::default()
         });
@@ -1047,12 +1047,12 @@ mod served_from_acceleration {
     /// `orders` federated from `prefix`, and [`accelerated_orders_view`].
     fn federated_orders_and_accelerated_view(
         prefix: &str,
-        duckdb_file: &Path,
+        cayenne_path: &Path,
         sql: &str,
     ) -> app::App {
         AppBuilder::new("source_unavailable")
             .with_dataset(SpicepodDataset::new(format!("{prefix}://orders"), "orders"))
-            .with_view(accelerated_orders_view(duckdb_file, sql))
+            .with_view(accelerated_orders_view(cayenne_path, sql))
             .build()
     }
 

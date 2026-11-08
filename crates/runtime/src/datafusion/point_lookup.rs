@@ -58,9 +58,9 @@ use datafusion::physical_plan::ExecutionPlan;
 /// that holds only while `LIMIT` stays excluded (a global limit needs a single input partition,
 /// which `EnsureRequirements` would provide). An operator a table scan returns must therefore meet
 /// its own input requirements, such as coalescing a multi-partition input. Rules that act on a scan
-/// of a particular connector (`HttpParamsPushdown`, the `DuckDB` rules) and
-/// `propagate_empty_relation` (which shapes the plan of a contradictory predicate) are not here:
-/// they cost well under a microsecond and are not worth reasoning about per connector.
+/// of a particular connector (`HttpParamsPushdown`) and `propagate_empty_relation` (which shapes
+/// the plan of a contradictory predicate) are not here: they cost well under a microsecond and are
+/// not worth reasoning about per connector.
 pub(crate) const SKIPPABLE_RULES: &[&str] = &[
     // analyzer
     "resolve_grouping_function",
@@ -86,7 +86,6 @@ pub(crate) const SKIPPABLE_RULES: &[&str] = &[
     "single_distinct_aggregation_to_group_by",
     "eliminate_group_by_constant",
     "common_sub_expression_eliminate",
-    "DuckDBAggregatePushdownOptimizerRule",
     "cache_invalidation_optimizer_rule",
     "cayenne_cte_materialization",
     // physical

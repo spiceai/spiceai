@@ -145,7 +145,7 @@ Notes:
 
 Once loaded, the static columns behave like normal columns and the
 catch-all is queryable with JSON functions from your accelerator (shown
-here with DuckDB):
+here with Cayenne):
 
 ```sql
 -- Top English-language shows by TVmaze rating
@@ -187,7 +187,7 @@ datasets:
       pagination_page_size: 250
     acceleration:
       enabled: true
-      engine: duckdb
+      engine: cayenne
       mode: file
       refresh_mode: full
       refresh_check_interval: 24h
@@ -280,7 +280,7 @@ full-text / lineage tracking, use your accelerator's JSON functions
 (`json_extract`, `UNNEST`, recursive CTEs) over the `details` column —
 no custom UDF required.
 
-If you accelerate the decomposed dataset (e.g. with DuckDB), embeddings
+If you accelerate the decomposed dataset (e.g. with Cayenne), embeddings
 declared on the accelerated view work as usual — both the raw catch-all
 JSON and any derived attributes view can participate in vector or
 full-text search.

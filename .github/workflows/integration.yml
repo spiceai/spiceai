@@ -286,14 +286,15 @@ jobs:
           # Widening the set preserves each target's test selection because this set is a
           # superset of what that target was already built with -- not because the targets
           # are ungated. They are gated: `integration_aws_sdk` gates on
-          # `all(databricks, delta_lake)`, and `snapshot_refresh` gates each backend on
-          # `duckdb`/`sqlite`. Every one of those features is in this set, so every gate
-          # that was satisfied before is still satisfied.
-          # `postgres`/`mysql`/`delta_lake`/`duckdb`/`sqlite` is the combination
-          # `make test-integration` runs.
+          # `all(databricks, delta_lake)`, and `snapshot_refresh` gates its backend on
+          # `sqlite`. Every one of those features is in this set, so every gate that was
+          # satisfied before is still satisfied.
+          # `postgres`/`mysql`/`delta_lake`/`adbc`/`sqlite` is the combination
+          # `make test-integration` runs; `adbc` compiles the `duckdb:` and DuckLake
+          # source tests, which read the installed DuckDB library.
           # `debezium` compiles the `cdc_ingest` and `cdc_cayenne` Debezium tests, which
           # are gated on it and run nowhere else.
-          FEATURES="postgres,mysql,delta_lake,duckdb,sqlite,spark,databricks,dynamodb,oracle,kafka,debezium,iceberg-write,snapshots,mongodb"
+          FEATURES="postgres,mysql,delta_lake,adbc,sqlite,spark,databricks,dynamodb,oracle,kafka,debezium,iceberg-write,snapshots,mongodb"
           if [[ "${{ github.event.inputs.run_all_tests }}" == "true" ]]; then
             FEATURES="${FEATURES},extended_tests"
             echo "Including extended_tests"

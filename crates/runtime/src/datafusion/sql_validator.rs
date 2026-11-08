@@ -1214,8 +1214,8 @@ mod tests {
         }
 
         // A benign (non-write) extension name must still be allowed so
-        // read-only optimizer extensions such as `IndexTableScanNode` and
-        // `DuckDBAggregatePushdownNode` are not blocked.
+        // read-only optimizer extensions such as `IndexTableScanNode` are not
+        // blocked.
         let plan = LogicalPlan::Extension(Extension {
             node: Arc::new(StubWriteExtension {
                 schema,

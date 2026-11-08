@@ -4084,19 +4084,6 @@ mod tests {
         referenced && !declared
     }
 
-    /// Prepares `sql` against an in-memory `DuckDB` holding the two tables the
-    /// plans below read, which binds every reference without running anything.
-    #[cfg(feature = "duckdb")]
-    fn duckdb_binds(sql: &str) -> Result<(), duckdb::Error> {
-        let conn = duckdb::Connection::open_in_memory()?;
-        conn.execute_batch(
-            "CREATE TABLE products (category_id INTEGER NOT NULL, name VARCHAR NOT NULL, \
-             price INTEGER NOT NULL); \
-             CREATE TABLE categories (category_id INTEGER NOT NULL, name VARCHAR NOT NULL);",
-        )?;
-        conn.prepare(sql).map(|_| ())
-    }
-
     /// Regression test for the `spiceai/datafusion` fork's Date32 literal fix
     /// (spiceai/datafusion#237, refs spiceai/spiceai#14491): the unparser spelled
     /// every date literal `CAST('…' AS DATE)`, which `SQLite` reads as the number
@@ -4357,15 +4344,6 @@ mod tests {
                 }
             }
 
-            #[cfg(feature = "duckdb")]
-            {
-                let sql = unparse_with("duckdb", &DuckDBDialect::new(), plan);
-                if let Err(error) = duckdb_binds(&sql) {
-                    panic!(
-                        "duckdb/{shape}: DuckDB refused the federated statement: {error}: {sql}"
-                    );
-                }
-            }
         }
 
         let over_a_volatile_output = products_left_join_categories()

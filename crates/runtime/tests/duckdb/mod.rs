@@ -633,14 +633,14 @@ async fn duckdb_federated_inner_product_nulls_a_non_finite_result() -> Result<()
 
     test_request_context()
         .scope(async {
-            // A TempDir rather than a NamedTempFile: `duckdb::Connection::open`
+            // A TempDir rather than a NamedTempFile: `duckdb_oracle::Connection::open`
             // wants to create the database itself, and the directory guard is
             // what removes it (and DuckDB's `.wal` sidecar) when the test ends.
             let db_dir = tempfile::tempdir().expect("should create temp dir");
             let db_path = db_dir.path().join("vecs.db");
 
             {
-                let conn = duckdb::Connection::open(&db_path)
+                let conn = duckdb_oracle::Connection::open(&db_path)
                     .map_err(|e| format!("failed to open duckdb file: {e}"))?;
                 conn.execute_batch(
                     "CREATE TABLE vecs (id INTEGER, emb FLOAT[3], q FLOAT[3]);
@@ -874,7 +874,7 @@ async fn duckdb_binary_literal_filters_agree_with_local_evaluation() -> Result<(
             let db_dir = tempfile::tempdir().expect("should create temp dir");
             let db_path = db_dir.path().join("blobs.db");
             {
-                let conn = duckdb::Connection::open(&db_path)
+                let conn = duckdb_oracle::Connection::open(&db_path)
                     .map_err(|e| format!("failed to open duckdb file: {e}"))?;
                 conn.execute_batch(
                     "CREATE TABLE blobs (id INTEGER, b BLOB);
@@ -1044,7 +1044,7 @@ async fn duckdb_federated_union_keeps_each_inputs_own_bound() -> Result<(), Stri
         .scope(async {
             let db_dir = tempfile::tempdir().expect("should create temp dir");
             let db_path = db_dir.path().join("union_bounds.db");
-            let oracle = duckdb::Connection::open(&db_path)
+            let oracle = duckdb_oracle::Connection::open(&db_path)
                 .map_err(|e| format!("failed to open duckdb file: {e}"))?;
             oracle
                 .execute_batch(
@@ -1094,13 +1094,19 @@ async fn duckdb_federated_union_keeps_each_inputs_own_bound() -> Result<(), Stri
             ];
             for (sql, expected) in cases {
                 let mut from_duckdb: Vec<i64> = oracle
-                    .prepare(sql)
-                    .and_then(|mut statement| {
-                        statement
-                            .query_map([], |row| row.get::<_, i64>(0))?
-                            .collect::<Result<Vec<_>, _>>()
+                    .query(sql)
+                    .map_err(|e| format!("`{sql}` failed in DuckDB: {e}"))?
+                    .iter()
+                    .flat_map(|batch| {
+                        batch
+                            .column(0)
+                            .as_any()
+                            .downcast_ref::<arrow::array::Int64Array>()
+                            .expect("`a` is BIGINT")
+                            .values()
+                            .to_vec()
                     })
-                    .map_err(|e| format!("`{sql}` failed in DuckDB: {e}"))?;
+                    .collect();
                 from_duckdb.sort_unstable();
                 assert_eq!(
                     from_duckdb, expected,

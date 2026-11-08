@@ -31,7 +31,7 @@ on:
         type: string
         default: ''
       additional_features:
-        description: 'Optional comma-separated cargo features appended to the variant defaults (e.g. postgres,duckdb). Leave empty for defaults only.'
+        description: 'Optional comma-separated cargo features appended to the variant defaults (e.g. postgres,oracle). Leave empty for defaults only.'
         required: false
         type: string
         default: ''
@@ -57,7 +57,7 @@ on:
         type: string
         default: ''
       additional_features:
-        description: 'Optional comma-separated cargo features appended to the variant defaults (e.g. postgres,duckdb). Leave empty for defaults only.'
+        description: 'Optional comma-separated cargo features appended to the variant defaults (e.g. postgres,oracle). Leave empty for defaults only.'
         required: false
         type: string
         default: ''

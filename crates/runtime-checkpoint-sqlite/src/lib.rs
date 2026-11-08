@@ -30,7 +30,7 @@ use async_trait::async_trait;
 use datafusion_table_providers::sql::db_connection_pool::sqlitepool::SqliteConnectionPool;
 use runtime_acceleration::{
     dataset_checkpoint::DatasetCheckpointer,
-    sidecar::{AcceleratorSidecar, unsupported_sidecar},
+    sidecar::AcceleratorSidecar,
     snapshot::SnapshotBehavior,
 };
 use runtime_checkpoint_api::{
@@ -139,9 +139,5 @@ impl AcceleratorSidecar for SqliteSidecar {
             SqliteDatasetCheckpointer::try_new(Arc::clone(&self.pool), self.dataset_name.clone())
                 .await?,
         ))
-    }
-
-    async fn update_caching_engine_fetched_at(&self) -> Result<(), CheckpointError> {
-        Err(unsupported_sidecar("sqlite", "caching-engine"))
     }
 }
