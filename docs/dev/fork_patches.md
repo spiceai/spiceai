@@ -118,7 +118,7 @@ own section below — a count here would be one more thing to keep true by hand.
 | [datafusion](#datafusion) | `c766690ae1a0a7dab5a223a6ac57b98ad9d725e7` | `spiceai-55` |
 | [datafusion-ballista](#datafusion-ballista) | `6e7a8775a6deb99c2ebf924f1ff5b3111d38e615` | `spiceai-55` |
 | [datafusion-federation](#datafusion-federation-and-datafusion-table-providers) | `300acfcfb51abfa9c477f57bff3e0529ec4f5f1a` | `spiceai-55` |
-| [datafusion-table-providers](#datafusion-federation-and-datafusion-table-providers) | `2effcc9fca21158eb64802c3e5dbdc68bbabb49d` | `spiceai-55` (TEMPORARY: spiceai/datafusion-table-providers#114) |
+| [datafusion-table-providers](#datafusion-federation-and-datafusion-table-providers) | `9e19d3c807c5c046b88a0d756afd7eff81d45314` | `spiceai-55` (TEMPORARY: spiceai/datafusion-table-providers#114) |
 | [delta-kernel-rs](#delta-kernel-rs) | `16ac28606464d742b6837de4a51f41011c3f6dc0` | `spiceai-0.27` |
 | [docx-rs](#docx-rs) | `81faaf2187185b097710b9ee589bf039efdd74de` | `jeadie/render-zip-upgrade` |
 | [duckdb-rs](#duckdb-rs) | `40a0ad2a7de6a8ba06d242ce7e04ffcd7a664df9` | `spiceai-1.4.4` (datafusion-table-providers pins this exact revision; the two move together) |
@@ -505,7 +505,7 @@ primary-key row below, `core/src/duckdb/creator.rs`), moves `mysql_async` to 0.3
 version this workspace pins, rewrites the new-connection observer row below and adds the
 test-connection row after it, with their tests (`mysqlpool.rs`, `core/tests/mysql/`,
 `core/tests/docker/`).
-Between `d323656` and `2effcc9` (spiceai/datafusion-table-providers#114), it adds only
+Between `d323656` and `9e19d3c` (spiceai/datafusion-table-providers#114), it adds only
 the decimal-precision row below and its tests (`core/src/util/decimal.rs`, the
 `query_arrow` of `adbcconn.rs` and `duckdbconn.rs`), and leaves its own dependency pins
 unchanged.
