@@ -580,7 +580,7 @@ impl Sources {
             (a, b) if a == b => {}
             (SourceState::Running, SourceState::Stopped) => container.stop().await?,
             (SourceState::Running, SourceState::Paused) => container.pause().await?,
-            (SourceState::Stopped, SourceState::Running) => container.resume().await?,
+            (SourceState::Stopped, SourceState::Running) => container.start_stopped().await?,
             (SourceState::Paused, SourceState::Running) => container.unpause().await?,
             (SourceState::Paused, SourceState::Stopped) => {
                 container.unpause().await?;
@@ -732,7 +732,10 @@ async fn run_combination(
         // starts its sources only once there is room for all of them, instead
         // of failing part way through (see `crate::keyquota`).
         crate::keyquota::wait_for_room(
-            u64::try_from(resolved.len()).unwrap_or(u64::MAX),
+            resolved
+                .iter()
+                .map(|(_, _, kind, _)| source::containers(kind))
+                .sum(),
             &format!("the sources of {run_label}"),
         )
         .await?;

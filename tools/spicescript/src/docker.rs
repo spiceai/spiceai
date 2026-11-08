@@ -94,6 +94,29 @@ impl Container {
         }
     }
 
+    /// Starts this container again after [`Self::stop`], keeping its data and
+    /// ports. Like [`Self::start_on`], it waits for room in the kernel key
+    /// quota and retries a start refused for it: a restart takes a new key.
+    pub async fn start_stopped(&self) -> Result<()> {
+        let mut attempt = 1;
+        loop {
+            crate::keyquota::wait_for_room(1, &format!("container {}", self.name)).await?;
+            match self.resume().await {
+                Err(e)
+                    if attempt < QUOTA_ATTEMPTS
+                        && crate::keyquota::is_quota_error(&format!("{e:#}")) =>
+                {
+                    crate::runner::emit(&format!(
+                        "   the kernel key quota was full restarting {}; waiting for room and trying again ({attempt} of {QUOTA_ATTEMPTS} attempts made)",
+                        self.name
+                    ));
+                    attempt += 1;
+                }
+                result => return result,
+            }
+        }
+    }
+
     async fn start_once(spec: ContainerSpec, host_ports: HashMap<u16, u16>) -> Result<Self> {
         anyhow::ensure!(
             !crate::cleanup::shutting_down(),

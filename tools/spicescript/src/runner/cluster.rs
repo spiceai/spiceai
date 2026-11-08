@@ -42,6 +42,9 @@ pub(super) async fn start_executors(
     let active = instance.active_executors;
     for executor in instance.executors.iter_mut().take(active) {
         if !executor.is_running() {
+            if let Some(name) = executor.container_name() {
+                crate::keyquota::wait_for_room(1, &format!("executor container {name}")).await?;
+            }
             executor.start(&instance.spicepod_yaml)?;
             executor.wait_health(timeout).await?;
         }
