@@ -1290,22 +1290,13 @@ fn find(haystack: &[u8], needle: &[u8]) -> Option<usize> {
 /// deflate as `PDFium` does, returning the bytes produced but reading no more
 /// than `limit` of them.
 fn inflate_bounded(data: &[u8], limit: u64) -> Vec<u8> {
-    use flate2::read::{DeflateDecoder, ZlibDecoder};
-    use std::io::Read;
-
     let mut out = Vec::new();
-    if ZlibDecoder::new(data)
-        .take(limit)
-        .read_to_end(&mut out)
-        .is_ok()
-        && !out.is_empty()
-    {
+    if inflate_into(data, true, limit, |block| out.extend_from_slice(block)) > 0 {
         return out;
     }
     // A non-conformant producer may omit the zlib header; PDFium accepts the
     // raw deflate, so the budget must see it too.
-    out.clear();
-    let _ = DeflateDecoder::new(data).take(limit).read_to_end(&mut out);
+    inflate_into(data, false, limit, |block| out.extend_from_slice(block));
     out
 }
 
@@ -1314,14 +1305,51 @@ fn inflate_bounded(data: &[u8], limit: u64) -> Vec<u8> {
 /// output. Holds no more than one decoder block, so counting an 8 GiB bomb
 /// costs the CPU to inflate `limit` bytes and essentially no memory.
 fn inflate_counting(data: &[u8], limit: u64) -> u64 {
-    use flate2::read::{DeflateDecoder, ZlibDecoder};
-    use std::io::{Read, copy, sink};
-
-    let zlib = copy(&mut ZlibDecoder::new(data).take(limit), &mut sink()).unwrap_or(0);
+    let zlib = inflate_into(data, true, limit, |_| {});
     if zlib > 0 {
         return zlib;
     }
-    copy(&mut DeflateDecoder::new(data).take(limit), &mut sink()).unwrap_or(0)
+    inflate_into(data, false, limit, |_| {})
+}
+
+/// Runs a Flate decoder over `data`, as zlib when `zlib_header` is set and as
+/// raw deflate otherwise, handing each block of output to `sink` until the
+/// stream ends, the decoder fails, or `limit` bytes have come out. Returns the
+/// number of bytes produced.
+///
+/// Output produced before a failure, such as a bad checksum or truncated data,
+/// is kept and counted, because `PDFium` keeps it. Decoding through
+/// `std::io::Read` would lose it: the read that meets the failure returns the
+/// error, not the bytes it produced.
+fn inflate_into(data: &[u8], zlib_header: bool, limit: u64, mut sink: impl FnMut(&[u8])) -> u64 {
+    use flate2::{Decompress, FlushDecompress, Status};
+
+    const BLOCK: usize = 64 * 1024;
+    let mut decoder = Decompress::new(zlib_header);
+    let mut block = vec![0u8; BLOCK];
+    let mut produced: u64 = 0;
+    while produced < limit {
+        let consumed =
+            usize::try_from(decoder.total_in()).map_or(data.len(), |n| n.min(data.len()));
+        let room = usize::try_from(limit - produced).map_or(BLOCK, |n| n.min(BLOCK));
+        let out_before = decoder.total_out();
+        let status =
+            decoder.decompress(&data[consumed..], &mut block[..room], FlushDecompress::None);
+        let written =
+            usize::try_from(decoder.total_out() - out_before).map_or(room, |n| n.min(room));
+        sink(&block[..written]);
+        produced = produced.saturating_add(written as u64);
+        match status {
+            Ok(Status::StreamEnd) | Err(_) => break,
+            // No output and no input taken means the data ran out mid-stream.
+            Ok(Status::Ok | Status::BufError) => {
+                if written == 0 && decoder.total_in() == consumed as u64 {
+                    break;
+                }
+            }
+        }
+    }
+    produced
 }
 
 /// Decodes a PDF `/ASCII85Decode` stream up to `limit` output bytes. The output
