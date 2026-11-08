@@ -177,7 +177,7 @@ pub fn validate_sql_query_operations(
 /// The error for DDL sent to a sidecar. A sidecar's catalog is its
 /// application's view of data the cluster owns, so tables and schemas are
 /// created and dropped on the cluster instead.
-fn sidecar_ddl_error() -> DataFusionError {
+pub(crate) fn sidecar_ddl_error() -> DataFusionError {
     DataFusionError::Plan(
         "DDL is not allowed on a sidecar. Run CREATE and DROP statements on the Spice runtime \
          the sidecar reads from, or start Spice without `--role sidecar`."

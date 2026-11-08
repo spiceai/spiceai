@@ -254,6 +254,13 @@ impl RuntimeComponentDdl {
 #[async_trait]
 impl ComponentDdlHandler for RuntimeComponentDdl {
     async fn check_access(&self, op: &ComponentDdlOp) -> DFResult<()> {
+        // A sidecar refuses all DDL, whatever key the caller holds, so it says
+        // that first rather than asking for a key that would not help.
+        if let Some(runtime) = self.runtime.upgrade()
+            && runtime.role() == crate::config::Role::Sidecar
+        {
+            return Err(crate::datafusion::sql_validator::sidecar_ddl_error());
+        }
         let context = RequestContext::current(AsyncMarker::new().await);
         let noun = op.kind().noun();
         if let Some(principal) = context.auth_principal() {

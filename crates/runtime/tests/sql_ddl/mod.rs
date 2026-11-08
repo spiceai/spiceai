@@ -32,6 +32,8 @@ use arrow::array::{RecordBatch, StringArray};
 use futures::TryStreamExt;
 use runtime::Runtime;
 use runtime::config::{ClusterConfig, Config, Role};
+use runtime_auth::{AuthPrincipal, AuthRequestContext};
+use runtime_request_context::{Protocol, RequestContext};
 use spicepod::component::dataset::Dataset;
 use spicepod::param::Params;
 
@@ -302,10 +304,33 @@ async fn sql_does_not_change_a_spicepod_dataset() {
         .await;
 }
 
+/// A caller whose API key can only read or write data, not define datasets.
+struct Reader;
+
+impl AuthPrincipal for Reader {
+    fn username(&self) -> &'static str {
+        "reader"
+    }
+
+    fn groups(&self) -> &[&str] {
+        &[]
+    }
+}
+
+/// Runs `sql` on `rt` as [`Reader`] and returns its error.
+async fn error_as_reader(rt: &Runtime, sql: &str) -> String {
+    let context = Arc::new(RequestContext::builder(Protocol::Internal).build());
+    context
+        .set_auth_principal(Arc::new(Reader))
+        .expect("a new context has no principal yet");
+    context.scope(error(rt, sql)).await
+}
+
 /// A sidecar (`--role sidecar`) refuses the statements that define, change,
 /// and remove datasets and catalogs, as it refuses all DDL: its catalog is its
-/// application's view of data the cluster owns. Nothing it refused is served,
-/// or kept across a restart.
+/// application's view of data the cluster owns. It says so before it asks for
+/// an `:admin` key, which would not help. It still shows a dataset's statement,
+/// and nothing it refused is served, or kept across a restart.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_sidecar_refuses_sql_definitions() {
     test_request_context()
@@ -338,14 +363,30 @@ async fn a_sidecar_refuses_sql_definitions() {
                     fixture.other_csv.display()
                 ),
                 "ALTER TABLE pod_orders SET (description = 'All orders')".to_string(),
+                "ALTER TABLE pod_orders RESET (description)".to_string(),
                 "DROP TABLE IF EXISTS orders".to_string(),
                 "CREATE CATALOG lake WITH (from = 'ducklake', ducklake_connection_string = 'metadata.ducklake')"
                     .to_string(),
+                "ALTER CATALOG lake SET (include = ARRAY['sales.*'])".to_string(),
                 "DROP CATALOG IF EXISTS lake".to_string(),
             ] {
                 let err = error(&rt, &sql).await;
                 assert!(err.contains(refusal), "{sql}: {err}");
             }
+            let create = format!(
+                "CREATE TABLE orders WITH (from = 'file:{}', file_format = 'csv')",
+                fixture.orders_csv.display()
+            );
+            let err = error_as_reader(&rt, &create).await;
+            assert!(err.contains(refusal), "a reader on a sidecar: {err}");
+
+            assert_eq!(
+                message(&rt, "SHOW CREATE TABLE pod_orders").await,
+                format!(
+                    "CREATE TABLE pod_orders WITH (\n  from = 'file:{}',\n  file_format = 'csv'\n)",
+                    fixture.orders_csv.display()
+                )
+            );
 
             // The Spicepod's dataset is served as it was, and SQL defined nothing.
             let pod_orders = table(&rt, "SELECT * FROM pod_orders ORDER BY id").await;
@@ -367,6 +408,17 @@ async fn a_sidecar_refuses_sql_definitions() {
             assert_eq!(table(&rt, "SELECT * FROM pod_orders ORDER BY id").await, pod_orders);
             let missing = error(&rt, "SELECT * FROM orders").await;
             assert!(missing.contains("table 'spice.public.orders' not found"), "{missing}");
+
+            // The same caller on a server is asked for an `:admin` key instead.
+            drop(rt);
+            let rt = start(&fixture).await;
+            let err = error_as_reader(&rt, &create).await;
+            assert!(
+                err.contains(
+                    "Defining a dataset with SQL requires an API key ending in ':admin'; the key used can only read or write data."
+                ),
+                "a reader on a server: {err}"
+            );
         })
         .await;
 }
