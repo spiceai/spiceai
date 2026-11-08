@@ -927,7 +927,7 @@ fn predictor_keys_in_dictionary(data: &[u8], depth: usize) -> Option<(bool, bool
         let (name, name_len) = read_name(&data[i + 1..]);
         i += 1 + name_len;
         i += ws_len(&data[i..]);
-        let is_predictor = matches!(name.as_slice(), b"Predictor" | b"P");
+        let is_predictor = matches!(&*name, b"Predictor" | b"P");
         own |= is_predictor;
         let (inner, value_len) = predictor_in_value(&data[i..], depth + 1)?;
         nested |= inner && !is_predictor;
