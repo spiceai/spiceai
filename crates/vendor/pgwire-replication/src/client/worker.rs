@@ -236,6 +236,7 @@ impl WorkerState {
 
         let mut last_status_sent = Instant::now() - self.cfg.status_interval;
         let mut last_applied = self.progress.load_applied();
+        let mut status_sent_once = false;
         // Incremental, zero-copy, cancellation-safe reader.
         let mut reader = FrameReader::new(self.cfg.max_message_size);
 
@@ -246,9 +247,17 @@ impl WorkerState {
                 last_applied = current_applied;
             }
 
-            // Send periodic status feedback
+            // Send periodic status feedback. The first update of a connection
+            // goes out at once and asks the server to reply: a walsender with no
+            // new WAL to send otherwise sends no keepalive at all (its own ping
+            // waits `wal_sender_timeout / 2` without a reply, and these updates
+            // are replies), so a consumer that learns the server's clock and WAL
+            // end only from keepalives would wait for unrelated writes on the
+            // server before it could tell it is caught up.
             if last_status_sent.elapsed() >= self.cfg.status_interval {
-                self.send_feedback(stream, last_applied, false).await?;
+                self.send_feedback(stream, last_applied, !status_sent_once)
+                    .await?;
+                status_sent_once = true;
                 last_status_sent = Instant::now();
             }
 

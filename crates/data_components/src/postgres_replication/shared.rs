@@ -3546,6 +3546,12 @@ async fn run_pump(source: Arc<SharedSource>, shutdown_drain: crate::cdc::Shutdow
                 // member), so it covers every snapshot-complete member's gap:
                 // promote them to routable + creditable.
                 source.ack.promote_ready_members();
+                // The client asks the server for a keepalive as soon as it
+                // connects. On an idle source it is the only one that comes, and
+                // it is what tells a just-promoted member it is caught up, so it
+                // must not be throttled by a heartbeat sent on the previous
+                // connection (#15038).
+                last_heartbeat_at = None;
                 c
             }
             Err(e) if resilience::is_transient_pgwire(&e) => {
