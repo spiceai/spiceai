@@ -211,7 +211,7 @@ fn cases() -> Vec<Case> {
         rows("SELECT count(*) FROM {items} WHERE name IS NULL"),
         rows("SELECT min(qty), max(qty), min(d), max(d) FROM {items}"),
         rows("SELECT count(*) FROM {items} WHERE grp > 100"),
-        rows("SELECT grp, count(*) FROM {items} WHERE grp > 100 GROUP BY grp").expect_empty(),
+        empty("SELECT grp, count(*) FROM {items} WHERE grp > 100 GROUP BY grp"),
         // Sorts and limits, with NULL placement stated and a unique tie-breaker.
         ordered("SELECT id FROM {items} ORDER BY qty DESC NULLS LAST, id"),
         ordered("SELECT id FROM {items} ORDER BY qty ASC NULLS FIRST, id"),
@@ -249,15 +249,6 @@ fn cases() -> Vec<Case> {
         ),
         rows("SELECT id, count(*) OVER (PARTITION BY grp) FROM {items}"),
     ]
-}
-
-impl Case {
-    const fn expect_empty(self) -> Self {
-        Self {
-            empty: true,
-            ..self
-        }
-    }
 }
 
 /// A row as its cells, each rendered, or `None` for NULL.
