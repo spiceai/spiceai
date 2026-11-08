@@ -109,6 +109,7 @@ pub struct ListingTableTemplate {
     object_store: Arc<dyn ObjectStore>,
     /// Listing extension from [`ListingTableConnector::get_file_format_and_extension`].
     extension: String,
+    dataset_name: String,
 }
 
 impl ListingTableTemplate {
@@ -163,17 +164,193 @@ impl ListingTableTemplate {
         table: Arc<ListingTable>,
         table_path: ListingTableUrl,
     ) -> Arc<dyn TableProvider> {
-        if has_location_metadata(table.options()) {
+        let inner: Arc<dyn TableProvider> = if has_location_metadata(table.options()) {
             Arc::new(LocationPruningListingTable::new(
                 table,
                 Arc::clone(&self.object_store),
-                table_path,
+                table_path.clone(),
                 Arc::clone(&self.schema),
                 self.extension.as_str(),
             ))
         } else {
             table
+        };
+        // A missing or emptied source lists as success with zero rows today, so a
+        // full refresh can persist an empty acceleration. Reject that listing
+        // (dataset and path named in the error and a warn log). An existing
+        // header-only or zero-row file still matches and scans as zero rows.
+        Arc::new(RejectEmptyListingTable {
+            inner,
+            table_path,
+            dataset_name: self.dataset_name.clone(),
+            extension: self.extension.clone(),
+        })
+    }
+}
+
+/// Fails a scan whose listing has no data file, so a full refresh cannot persist
+/// an empty result over a deleted or emptied source.
+struct RejectEmptyListingTable {
+    inner: Arc<dyn TableProvider>,
+    table_path: ListingTableUrl,
+    dataset_name: String,
+    extension: String,
+}
+
+impl RejectEmptyListingTable {
+    fn forget_listing(&self, state: &dyn Session) {
+        let Some(cache) = state.runtime_env().cache_manager.get_list_files_cache() else {
+            return;
+        };
+        // `ListingTable` caches under the path prefix; drop it so a later restore
+        // is visible to the inner scan (not only to this emptiness check).
+        let _ = cache.remove(&TableScopedPath {
+            table: None,
+            path: self.table_path.prefix().clone(),
+        });
+    }
+
+    async fn ensure_data_files(&self, state: &dyn Session) -> DFResult<()> {
+        self.forget_listing(state);
+        let store = state
+            .runtime_env()
+            .object_store(self.table_path.object_store())?;
+        let files = list_matching_listing_files(
+            state,
+            &self.table_path,
+            store.as_ref(),
+            &self.extension,
+            1,
+        )
+        .await?;
+        if !files.is_empty() {
+            return Ok(());
         }
+        tracing::warn!(
+            dataset = %self.dataset_name,
+            path = %self.table_path,
+            "No data files are yet available for dataset {} at {}. The source path is missing or has no matching files.",
+            self.dataset_name,
+            self.table_path
+        );
+        Err(DataFusionError::External(Box::new(std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            format!(
+                "No data files are yet available for dataset {} at {}. The source path is missing or has no matching files.",
+                self.dataset_name,
+                self.table_path
+            ),
+        ))))
+    }
+}
+
+#[async_trait]
+impl TableProvider for RejectEmptyListingTable {
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+
+    fn schema(&self) -> SchemaRef {
+        self.inner.schema()
+    }
+
+    fn table_type(&self) -> datafusion::datasource::TableType {
+        self.inner.table_type()
+    }
+
+    fn get_table_definition(&self) -> Option<&str> {
+        self.inner.get_table_definition()
+    }
+
+    fn supports_filters_pushdown(
+        &self,
+        filters: &[&datafusion_expr::Expr],
+    ) -> DFResult<Vec<datafusion_expr::TableProviderFilterPushDown>> {
+        self.inner.supports_filters_pushdown(filters)
+    }
+
+    fn constraints(&self) -> Option<&Constraints> {
+        self.inner.constraints()
+    }
+
+    async fn scan(
+        &self,
+        state: &dyn Session,
+        projection: Option<&Vec<usize>>,
+        filters: &[datafusion_expr::Expr],
+        limit: Option<usize>,
+    ) -> DFResult<Arc<dyn datafusion::physical_plan::ExecutionPlan>> {
+        self.ensure_data_files(state).await?;
+        self.inner.scan(state, projection, filters, limit).await
+    }
+
+    fn get_logical_plan(
+        &self,
+    ) -> Option<std::borrow::Cow<'_, datafusion::logical_expr::LogicalPlan>> {
+        self.inner.get_logical_plan()
+    }
+
+    fn get_column_default(&self, column: &str) -> Option<&datafusion_expr::Expr> {
+        self.inner.get_column_default(column)
+    }
+
+    async fn scan_with_args<'a>(
+        &self,
+        state: &dyn datafusion::catalog::Session,
+        args: datafusion::catalog::ScanArgs<'a>,
+    ) -> datafusion::error::Result<datafusion::catalog::ScanResult> {
+        self.ensure_data_files(state).await?;
+        self.inner.scan_with_args(state, args).await
+    }
+
+    fn statistics(&self) -> Option<datafusion::common::Statistics> {
+        self.inner.statistics()
+    }
+
+    async fn insert_into(
+        &self,
+        state: &dyn datafusion::catalog::Session,
+        input: Arc<dyn datafusion::physical_plan::ExecutionPlan>,
+        insert_op: datafusion::logical_expr::dml::InsertOp,
+    ) -> datafusion::error::Result<Arc<dyn datafusion::physical_plan::ExecutionPlan>> {
+        self.inner.insert_into(state, input, insert_op).await
+    }
+
+    async fn delete_from(
+        &self,
+        state: &dyn datafusion::catalog::Session,
+        filters: Vec<datafusion_expr::Expr>,
+    ) -> datafusion::error::Result<Arc<dyn datafusion::physical_plan::ExecutionPlan>> {
+        self.inner.delete_from(state, filters).await
+    }
+
+    async fn update(
+        &self,
+        state: &dyn datafusion::catalog::Session,
+        assignments: Vec<(String, datafusion_expr::Expr)>,
+        filters: Vec<datafusion_expr::Expr>,
+    ) -> datafusion::error::Result<Arc<dyn datafusion::physical_plan::ExecutionPlan>> {
+        self.inner.update(state, assignments, filters).await
+    }
+
+    async fn truncate(
+        &self,
+        state: &dyn datafusion::catalog::Session,
+    ) -> datafusion::error::Result<Arc<dyn datafusion::physical_plan::ExecutionPlan>> {
+        self.inner.truncate(state).await
+    }
+
+    async fn merge_into(
+        &self,
+        state: &dyn datafusion::catalog::Session,
+        source: Arc<dyn datafusion::physical_plan::ExecutionPlan>,
+        merge_schema: datafusion::common::DFSchemaRef,
+        on: datafusion_expr::Expr,
+        clauses: Vec<datafusion::logical_expr::dml::MergeIntoClause>,
+    ) -> datafusion::error::Result<Arc<dyn datafusion::physical_plan::ExecutionPlan>> {
+        self.inner
+            .merge_into(state, source, merge_schema, on, clauses)
+            .await
     }
 }
 
@@ -1788,6 +1965,7 @@ pub trait ListingTableConnector: DataConnector {
             schema: final_schema,
             object_store,
             extension: extension.to_string(),
+            dataset_name: dataset.name.to_string(),
         })
     }
 
