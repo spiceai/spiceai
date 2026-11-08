@@ -190,6 +190,7 @@ impl ListingTableTemplate {
 
 /// Fails a scan whose listing has no data file, so a full refresh cannot persist
 /// an empty result over a deleted or emptied source.
+#[derive(Debug)]
 struct RejectEmptyListingTable {
     inner: Arc<dyn TableProvider>,
     table_path: ListingTableUrl,
@@ -212,9 +213,7 @@ impl RejectEmptyListingTable {
 
     async fn ensure_data_files(&self, state: &dyn Session) -> DFResult<()> {
         self.forget_listing(state);
-        let store = state
-            .runtime_env()
-            .object_store(self.table_path.object_store())?;
+        let store = state.runtime_env().object_store(&self.table_path)?;
         let files = list_matching_listing_files(
             state,
             &self.table_path,
@@ -237,8 +236,7 @@ impl RejectEmptyListingTable {
             std::io::ErrorKind::NotFound,
             format!(
                 "No data files are yet available for dataset {} at {}. The source path is missing or has no matching files.",
-                self.dataset_name,
-                self.table_path
+                self.dataset_name, self.table_path
             ),
         ))))
     }
@@ -246,10 +244,6 @@ impl RejectEmptyListingTable {
 
 #[async_trait]
 impl TableProvider for RejectEmptyListingTable {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
     fn schema(&self) -> SchemaRef {
         self.inner.schema()
     }
