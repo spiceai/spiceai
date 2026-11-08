@@ -325,11 +325,12 @@ impl Spiced {
     /// `docker run` for `run`, in the foreground so that its output is the log
     /// and the signals `stop` sends reach `spiced`.
     fn container_command(&self, run: &ContainerRun, binary: &Path) -> Result<Command> {
+        use std::os::unix::fs::MetadataExt;
+
         // A container left behind by an interrupted run would hold the name.
         let _ = std::process::Command::new("docker")
             .args(["rm", "-f", &run.name])
             .output();
-        use std::os::unix::fs::MetadataExt;
         let dir = std::path::absolute(&self.dir)?;
         let owner = std::fs::metadata(&dir)?;
         let mut command = Command::new("docker");
