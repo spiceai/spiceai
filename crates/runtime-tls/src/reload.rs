@@ -1325,7 +1325,12 @@ mod tests {
         assert_eq!(hits_b.load(Ordering::SeqCst), 1, "callback b not fired");
     }
 
-    fn test_ca(name: &str) -> (CertificateDer<'static>, rcgen::Issuer<'static, rcgen::KeyPair>) {
+    fn test_ca(
+        name: &str,
+    ) -> (
+        CertificateDer<'static>,
+        rcgen::Issuer<'static, rcgen::KeyPair>,
+    ) {
         let mut params = rcgen::CertificateParams::default();
         params.distinguished_name = rcgen::DistinguishedName::new();
         params

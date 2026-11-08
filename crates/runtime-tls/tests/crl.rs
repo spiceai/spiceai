@@ -36,9 +36,7 @@ use rcgen::{
 use runtime_tls::{ClientAuthEnforcement, ClientTrustPaths, ClientTrustPem, TlsConfig, TlsControl};
 use rustls::{
     CertificateError, ClientConfig, RootCertStore, ServerConfig,
-    pki_types::{
-        CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer, ServerName, pem::PemObject,
-    },
+    pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer, ServerName, pem::PemObject},
 };
 use tokio::net::{TcpListener, TcpStream};
 use tokio_rustls::{TlsAcceptor, TlsConnector};
@@ -104,10 +102,17 @@ impl Ca {
 
     /// A CRL from this CA revoking `revoked` serial numbers, valid until
     /// `next_update` from now (negative: already expired).
-    fn crl(&self, revoked: &[u64], next_update: time::Duration) -> rcgen::CertificateRevocationList {
+    fn crl(
+        &self,
+        revoked: &[u64],
+        next_update: time::Duration,
+    ) -> rcgen::CertificateRevocationList {
         let now = time::OffsetDateTime::now_utc();
         let (this_update, next_update) = if next_update.is_negative() {
-            (now + next_update - time::Duration::days(1), now + next_update)
+            (
+                now + next_update - time::Duration::days(1),
+                now + next_update,
+            )
         } else {
             (now - time::Duration::minutes(5), now + next_update)
         };
@@ -216,6 +221,10 @@ fn unknown_revocation_status() -> Verdict {
     ))
 }
 
+#[expect(
+    clippy::unnecessary_wraps,
+    reason = "compared against the `Verdict` a handshake returns"
+)]
 fn admitted(leaf: &Leaf) -> Verdict {
     Ok(Some(leaf.cert_der.clone()))
 }
@@ -265,7 +274,10 @@ async fn revoked_client_certificate_is_rejected_by_every_listener() {
 
     // Flight: strict verifier.
     let flight = &tls.flight_server_config;
-    assert_eq!(handshake(flight, &f.ca, Some(&f.alice)).await, admitted(&f.alice));
+    assert_eq!(
+        handshake(flight, &f.ca, Some(&f.alice)).await,
+        admitted(&f.alice)
+    );
     assert_eq!(handshake(flight, &f.ca, Some(&f.bob)).await, revoked());
     assert_eq!(
         handshake(flight, &f.ca, None).await,
@@ -276,7 +288,10 @@ async fn revoked_client_certificate_is_rejected_by_every_listener() {
     // admitted (for probes), but a revoked certificate is never downgraded
     // to an anonymous client.
     let http = &tls.http_server_config;
-    assert_eq!(handshake(http, &f.ca, Some(&f.alice)).await, admitted(&f.alice));
+    assert_eq!(
+        handshake(http, &f.ca, Some(&f.alice)).await,
+        admitted(&f.alice)
+    );
     assert_eq!(handshake(http, &f.ca, Some(&f.bob)).await, revoked());
     assert_eq!(handshake(http, &f.ca, None).await, Ok(None));
 }
@@ -300,7 +315,10 @@ async fn der_encoded_crl_is_enforced() {
     let crl = f.ca.crl(&[BOB_SERIAL], time::Duration::days(7));
     let tls = inline_config(&f, &f.ca.cert_pem, Some(crl.der().as_ref()));
     let flight = &tls.flight_server_config;
-    assert_eq!(handshake(flight, &f.ca, Some(&f.alice)).await, admitted(&f.alice));
+    assert_eq!(
+        handshake(flight, &f.ca, Some(&f.alice)).await,
+        admitted(&f.alice)
+    );
     assert_eq!(handshake(flight, &f.ca, Some(&f.bob)).await, revoked());
 }
 
@@ -316,7 +334,10 @@ async fn certificate_from_a_ca_without_a_crl_is_rejected() {
     let crl = f.ca.crl_pem(&[]);
     let tls = inline_config(&f, &bundle, Some(crl.as_bytes()));
     let flight = &tls.flight_server_config;
-    assert_eq!(handshake(flight, &f.ca, Some(&f.alice)).await, admitted(&f.alice));
+    assert_eq!(
+        handshake(flight, &f.ca, Some(&f.alice)).await,
+        admitted(&f.alice)
+    );
     assert_eq!(
         handshake(flight, &f.ca, Some(&carol)).await,
         unknown_revocation_status()
@@ -334,26 +355,38 @@ async fn crls_from_several_cas_in_one_bundle_are_each_enforced() {
     let carol = other_ca.issue("carol", 2001, false);
     let dave = other_ca.issue("dave", 2002, false);
     let bundle = format!("{}{}", f.ca.cert_pem, other_ca.cert_pem);
-    let crls = format!("{}{}", f.ca.crl_pem(&[BOB_SERIAL]), other_ca.crl_pem(&[2002]));
+    let crls = format!(
+        "{}{}",
+        f.ca.crl_pem(&[BOB_SERIAL]),
+        other_ca.crl_pem(&[2002])
+    );
     let tls = inline_config(&f, &bundle, Some(crls.as_bytes()));
     let flight = &tls.flight_server_config;
-    assert_eq!(handshake(flight, &f.ca, Some(&f.alice)).await, admitted(&f.alice));
+    assert_eq!(
+        handshake(flight, &f.ca, Some(&f.alice)).await,
+        admitted(&f.alice)
+    );
     assert_eq!(handshake(flight, &f.ca, Some(&f.bob)).await, revoked());
-    assert_eq!(handshake(flight, &f.ca, Some(&carol)).await, admitted(&carol));
+    assert_eq!(
+        handshake(flight, &f.ca, Some(&carol)).await,
+        admitted(&carol)
+    );
     assert_eq!(handshake(flight, &f.ca, Some(&dave)).await, revoked());
 }
 
 #[tokio::test]
 async fn expired_crl_still_enforces_its_revocations() {
     let f = fixture();
-    let crl = f
-        .ca
-        .crl(&[BOB_SERIAL], -time::Duration::hours(1))
-        .pem()
-        .expect("CRL PEM");
+    let crl =
+        f.ca.crl(&[BOB_SERIAL], -time::Duration::hours(1))
+            .pem()
+            .expect("CRL PEM");
     let tls = inline_config(&f, &f.ca.cert_pem, Some(crl.as_bytes()));
     let flight = &tls.flight_server_config;
-    assert_eq!(handshake(flight, &f.ca, Some(&f.alice)).await, admitted(&f.alice));
+    assert_eq!(
+        handshake(flight, &f.ca, Some(&f.alice)).await,
+        admitted(&f.alice)
+    );
     assert_eq!(handshake(flight, &f.ca, Some(&f.bob)).await, revoked());
 }
 
@@ -467,12 +500,18 @@ async fn rotated_crl_file_revokes_without_a_restart() {
     .expect("file-backed TLS config with client CRLs");
 
     let flight = &tls.flight_server_config;
-    assert_eq!(handshake(flight, &f.ca, Some(&f.bob)).await, admitted(&f.bob));
+    assert_eq!(
+        handshake(flight, &f.ca, Some(&f.bob)).await,
+        admitted(&f.bob)
+    );
 
     // The CA revokes bob and republishes its CRL; the watcher picks it up.
     write(&files.crl, f.ca.crl_pem(&[BOB_SERIAL]));
     await_verdict(&tls, &f.ca, &f.bob, &revoked()).await;
-    assert_eq!(handshake(flight, &f.ca, Some(&f.alice)).await, admitted(&f.alice));
+    assert_eq!(
+        handshake(flight, &f.ca, Some(&f.alice)).await,
+        admitted(&f.alice)
+    );
     assert_eq!(
         handshake(&tls.http_server_config, &f.ca, Some(&f.bob)).await,
         revoked()
@@ -503,7 +542,10 @@ async fn unusable_crl_rotation_keeps_the_previous_crls() {
         write(&files.crl, unusable);
         tls.force_reload_for_tests();
         assert_eq!(handshake(flight, &f.ca, Some(&f.bob)).await, revoked());
-        assert_eq!(handshake(flight, &f.ca, Some(&f.alice)).await, admitted(&f.alice));
+        assert_eq!(
+            handshake(flight, &f.ca, Some(&f.alice)).await,
+            admitted(&f.alice)
+        );
     }
 
     // A missing CRL file (the publisher deleted it mid-rotation) likewise.
