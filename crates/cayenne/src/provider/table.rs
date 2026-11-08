@@ -37151,8 +37151,8 @@ impl CayenneTableProvider {
             // sequence: every captured segment's sequences are below it and every
             // later apply's are above it, so a later tombstone still hides the
             // shadowed row on restart. The allocator's block refill already bumped the
-            // durable `current_sequence_number` past it, so on restart the inline
-            // watermark reseeds above it and the shadow is visible.
+            // durable `current_sequence_number` to at least this value, so on restart
+            // the inline watermark reseeds at or above it and the shadow is visible.
             let seal_sequence = self
                 .reserve_sequences_local(1)
                 .await
@@ -53451,6 +53451,7 @@ mod tests {
     /// must appear once, with its new value — at one shard and across four.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn mem_tier_seal_keeps_applies_that_land_during_the_seal_after_crash() {
+        let mut recovered = Vec::new();
         for shards in [1, 4] {
             let ctx = SessionContext::new();
             let runtime_env = ctx.runtime_env();
@@ -53509,12 +53510,17 @@ mod tests {
                 .open(&table)
                 .await
                 .expect("reopen");
-            assert_eq!(
+            recovered.push((
+                shards,
                 collect_id_value_pairs(&ctx, &reopened, &table).await,
-                vec![(1, 10), (3, 31)],
-                "shards={shards}: after a crash, key 2 stays deleted and key 3 appears once with its new value"
-            );
+            ));
         }
+        // Compared once, so a failure reports every shard count.
+        assert_eq!(
+            recovered,
+            vec![(1, vec![(1, 10), (3, 31)]), (4, vec![(1, 10), (3, 31)])],
+            "after a crash, key 2 stays deleted and key 3 appears once with its new value"
+        );
     }
 
     /// N>1 cross-shard file-hiding tombstones: supersede several DURABLE keys that

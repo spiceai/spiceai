@@ -35,7 +35,8 @@ defaults:
   expect: { oracle: src }
 
 steps:
-  # Keep the source's WAL small: a slot retains WAL until spiced acknowledges it.
+  # Checkpoint the source often, so the WAL the load writes is recycled once
+  # spiced acknowledges it.
   - source-exec:
       src:
         - ALTER SYSTEM SET max_wal_size = '96MB'
