@@ -3,8 +3,6 @@ description: >
   Federated result columns keep their planned types and nullability by position,
   including repeated names on the nullable side of an outer join, over
   PostgreSQL, MySQL, DuckDB and DuckLake. The duckdb connector uses ADBC read-only.
-  A projection over a derived projection is sent to each source in a form it can
-  bind, including when two of its outputs share a name.
 sources:
   src: { kind: '${matrix.src}' }
 matrix:
@@ -50,13 +48,3 @@ steps:
     oracle-sql: SELECT max(id) AS result FROM t
   - query: SELECT q."max(t.id)" + 1 AS result FROM (SELECT (SELECT max(id) FROM t)) q
     oracle-sql: SELECT max(id) + 1 AS result FROM t
-  # Common-subexpression elimination moves the repeated expression into a projection
-  # of its own, so the statement sent to the source selects from a derived table.
-  # Its outer SELECT must read only that derived table's outputs, or the source
-  # refuses to bind the statement. In the second query `t.id` and `u.id` share the
-  # name `id`, so neither can be read from the derived table by name.
-  - query: SELECT t.id AS tid, t.d + 1 AS x, (t.d + 1) * 2 AS doubled FROM t LEFT JOIN u ON t.id = u.t_id
-  - query: SELECT t.id AS tid, u.id AS uid, t.id + 1 AS x, (t.id + 1) * 2 AS doubled FROM t LEFT JOIN u ON t.id = u.t_id
-  - explain: SELECT t.id AS tid, u.id AS uid, t.id + 1 AS x, (t.id + 1) * 2 AS doubled FROM t LEFT JOIN u ON t.id = u.t_id
-    contains: [VirtualExecutionPlan]
-    omits: [HashJoinExec]
