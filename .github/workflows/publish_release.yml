@@ -1,0 +1,164 @@
+name: publish_release
+
+# Publishes a release from its build_release run, and creates the release tag.
+# Start it on the release branch with the version, once the branch head's
+# build_release release build of that version is green. Set `commit` to
+# publish an earlier commit of the branch instead, when the branch has moved
+# since its build with no change to the released code. Every job that
+# publishes runs in `github-publish` and needs its own approval:
+#   1. `publish` attaches the binaries of that run to the tag's draft release,
+#      or a new one, checking each against the run's SHA256SUMS, and publishes
+#      the release at the built commit, which creates the tag there;
+#   2. `images` builds the Docker images from the published binaries, and its
+#      two push jobs (the multi-arch image and the CUDA image) push them.
+# Only publishing creates a release tag. Nothing already published is
+# replaced. To retry a failed step, re-run the failed jobs of the same run.
+on:
+  workflow_dispatch:
+    inputs:
+      release_version:
+        description: 'Version to release, without the leading v (e.g. 2.4.2). Must match version.txt at the branch head.'
+        required: true
+        type: string
+      commit:
+        description: 'Full SHA of the release branch commit to publish, when the branch has moved since its build with no change to the released code. Empty publishes the branch head.'
+        required: false
+        type: string
+        default: ''
+
+# One publish at a time across all versions, never cancelled halfway. Each run
+# decides whether its release is the latest from the releases already
+# published, and moves the `latest` image tags in a later job, so two versions
+# publishing at once could leave `latest` on the lower one. GitHub keeps one
+# waiting run per group: a third run started while one waits replaces it.
+concurrency:
+  group: publish-release
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+env:
+  # Checked against version.txt by get_release_version.py.
+  RELEASE_VERSION: ${{ inputs.release_version }}
+  RELEASE_TAG: v${{ inputs.release_version }}
+
+jobs:
+  resolve:
+    environment: secret-free
+    name: Find the build of v${{ inputs.release_version }}
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      actions: read
+    outputs:
+      build_run_id: ${{ steps.find.outputs.build_run_id }}
+      commit: ${{ steps.find.outputs.commit }}
+    steps:
+      # Forks and downstream repositories that merge this one have their own
+      # release workflows.
+      - name: Require spiceai/spiceai
+        if: github.repository != 'spiceai/spiceai'
+        run: |
+          echo "::error::publish_release publishes spiceai/spiceai releases only, not ${GITHUB_REPOSITORY} releases."
+          exit 1
+
+      - name: Require a branch and a version
+        run: |
+          if [ "$GITHUB_REF_TYPE" != branch ]; then
+            echo "::error::publish_release runs on the release branch, not on '${GITHUB_REF}'. It creates the release tag itself."
+            exit 1
+          fi
+          if ! [[ "$RELEASE_VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$ ]]; then
+            echo "::error::release_version '${RELEASE_VERSION}' is not a version such as 2.4.2 or 2.5.0-rc.1."
+            exit 1
+          fi
+
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      # Fails when version.txt at the branch head is not release_version.
+      - name: Check version.txt matches the version
+        run: python3 ./.github/scripts/get_release_version.py
+
+      - name: Find the release build of the commit
+        id: find
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          COMMIT: ${{ inputs.commit }}
+        run: |
+          python3 ./.github/scripts/publish_release.py --repo "$GITHUB_REPOSITORY" --tag "$RELEASE_TAG" \
+            find-build --workflow build_release.yml --branch "$GITHUB_REF_NAME" --head "$GITHUB_SHA" --commit "$COMMIT"
+
+  publish:
+    name: Publish GitHub release v${{ inputs.release_version }}
+    needs: resolve
+    runs-on: ubuntu-24.04
+    # One required reviewer, who cannot be the person who started this run.
+    environment: github-publish
+    permissions:
+      contents: write
+      actions: read
+    outputs:
+      make_latest: ${{ steps.publish.outputs.make_latest }}
+      spiced_sha256_amd64: ${{ steps.sha256.outputs.amd64 }}
+      spiced_sha256_arm64: ${{ steps.sha256.outputs.arm64 }}
+      spiced_sha256_cuda: ${{ steps.sha256.outputs.cuda }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Set REL_VERSION from version.txt
+        run: python3 ./.github/scripts/get_release_version.py
+
+      - name: Download the artifacts of run ${{ needs.resolve.outputs.build_run_id }}
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
+        with:
+          path: release
+          merge-multiple: true
+          github-token: ${{ github.token }}
+          run-id: ${{ needs.resolve.outputs.build_run_id }}
+
+      # Publishing the draft creates the tag at the built commit, with the job
+      # token's `contents: write`.
+      - name: Publish the release
+        id: publish
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          COMMIT: ${{ needs.resolve.outputs.commit }}
+        run: |
+          python3 ./.github/scripts/publish_release.py --repo "$GITHUB_REPOSITORY" --tag "$RELEASE_TAG" \
+            publish --dir release --sums release/SHA256SUMS \
+            --notes-file "docs/release_notes/${RELEASE_TAG}.md" \
+            --prerelease "${PRE_RELEASE:-false}" --sha "$COMMIT"
+
+      # The image builds download these binaries from the published release
+      # and check them against the sha256 recorded here.
+      - name: Record the sha256 of the binaries the images use
+        id: sha256
+        working-directory: release
+        run: |
+          set -euo pipefail
+          sum() { awk -v f="$1" '$2 == f || $2 == "*" f { print $1 }' SHA256SUMS; }
+          {
+            echo "amd64=$(sum spiced_linux_x86_64.tar.gz)"
+            echo "arm64=$(sum spiced_linux_aarch64.tar.gz)"
+            echo "cuda=$(sum spiced_cuda_80_linux_x86_64.tar.gz)"
+          } | tee -a "$GITHUB_OUTPUT"
+
+  images:
+    name: Docker images
+    needs: publish
+    permissions:
+      contents: read
+      packages: write
+      id-token: write
+    uses: ./.github/workflows/spiced_docker.yml
+    with:
+      release_tag: v${{ inputs.release_version }}
+      tag_latest: ${{ needs.publish.outputs.make_latest == 'true' }}
+      spiced_sha256_amd64: ${{ needs.publish.outputs.spiced_sha256_amd64 }}
+      spiced_sha256_arm64: ${{ needs.publish.outputs.spiced_sha256_arm64 }}
+      spiced_sha256_cuda: ${{ needs.publish.outputs.spiced_sha256_cuda }}

@@ -189,9 +189,10 @@ fn load_filename_into_map(filename: &str, values: &mut HashMap<String, String>) 
 
 /// Iterates parsed entries from a [`dotenv`] iterator into `values`.
 /// Keys already present are preserved, so earlier-loaded files win.
-/// Malformed lines are logged with their line number and content so users
-/// can fix them. I/O-level errors (e.g. missing file) are reported at debug
-/// level because the file is optional.
+/// Malformed lines are logged by line number only: any part of the line,
+/// including text that looks like a key, can be secret. I/O-level errors
+/// (e.g. missing file) are reported at debug level because the file is
+/// optional.
 fn collect_iter<I>(iter: I, label: &str, values: &mut HashMap<String, String>)
 where
     I: Iterator<Item = Result<(String, String), dotenv::Error>>,
@@ -201,10 +202,8 @@ where
             Ok((key, val)) => {
                 values.entry(key).or_insert(val);
             }
-            Err(dotenv::Error::LineParse(line_num, content)) => {
-                tracing::warn!(
-                    "{label}: line {line_num} is malformed and was skipped: `{content}`"
-                );
+            Err(dotenv::Error::LineParse(line_num, _)) => {
+                tracing::warn!("{label}: line {line_num} is malformed and was skipped");
             }
             Err(err) => {
                 tracing::debug!("{label}: {err}");
@@ -242,8 +241,8 @@ fn export_without_overwrite(values: &HashMap<String, String>) {
 /// Iterates parsed entries from a [`dotenv`] iterator, setting each valid
 /// key-value pair into the environment. Variables already present in the
 /// environment are preserved, so earlier-loaded files take priority over later
-/// ones. Malformed lines are logged with their line number and content so users
-/// can fix them. I/O-level errors (e.g. missing file) are reported at debug
+/// ones. Malformed lines are logged with their line number so users can fix
+/// them. I/O-level errors (e.g. missing file) are reported at debug
 /// level because the file is optional.
 ///
 /// # Safety

@@ -426,6 +426,15 @@ impl PartitionCreator for CayennePartitionCreator {
                 }
             };
 
+            // `open` does not go through `create_table`, so the child's stored
+            // data files are checked here, as a table that is not rebuilt.
+            self.catalog
+                .verify_existing_stored_data_files(cayenne_table.table_name())
+                .await
+                .map_err(|error| creator::Error::InferringPartitions {
+                    source: Box::new(error),
+                })?;
+
             let table_provider = Arc::new(cayenne_table);
             self.init_partition_provider(&table_provider);
             result.push(Partition {

@@ -402,12 +402,6 @@ async fn check_engine(engine: &str, modes: &[Mode]) -> anyhow::Result<()> {
         .await
 }
 
-#[cfg(feature = "duckdb")]
-#[tokio::test]
-async fn duckdb_on_zero_results_subqueries() -> anyhow::Result<()> {
-    check_engine("duckdb", &[Mode::Memory, Mode::File]).await
-}
-
 #[cfg(feature = "sqlite")]
 #[tokio::test]
 async fn sqlite_on_zero_results_subqueries() -> anyhow::Result<()> {
@@ -416,5 +410,5 @@ async fn sqlite_on_zero_results_subqueries() -> anyhow::Result<()> {
 
 #[tokio::test]
 async fn cayenne_on_zero_results_subqueries() -> anyhow::Result<()> {
-    check_engine("cayenne", &[Mode::File]).await
+    check_engine("cayenne", &[Mode::Memory, Mode::File]).await
 }

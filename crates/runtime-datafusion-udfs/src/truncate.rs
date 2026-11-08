@@ -14,6 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
+use std::fmt::Display;
 use std::num::TryFromIntError;
 use std::ops::{Add, Rem, Sub};
 use std::sync::Arc;
@@ -22,9 +23,10 @@ use arrow::array::{
     ArrayRef, Decimal128Array, Decimal256Array, Int8Array, Int16Array, Int32Array, Int64Array,
     StringArray, UInt8Array, UInt16Array, UInt32Array, UInt64Array,
 };
-use arrow::compute::binary;
 use arrow::compute::kernels::substring::{substring, substring_by_char};
-use arrow::datatypes::{DataType, i256};
+use arrow::compute::try_unary;
+use arrow::datatypes::{DataType, Decimal128Type, Decimal256Type, DecimalType, i256};
+use arrow::error::ArrowError;
 use datafusion::common::DataFusionError;
 use datafusion::logical_expr::{
     ColumnarValue, ScalarFunctionArgs, ScalarUDFImpl, Signature, Volatility,
@@ -55,6 +57,25 @@ pub enum TruncateError {
 
     #[snafu(display("Failed to cast the width argument: {source}"))]
     WidthCastingFailed { source: TryFromIntError },
+
+    #[snafu(display(
+        "truncate({width}, {value}) is {result}, which does not fit the value's type"
+    ))]
+    ResultOutOfRange {
+        value: i128,
+        width: i64,
+        result: i128,
+    },
+
+    #[snafu(display(
+        "truncate({width}, {value}) is {result} (unscaled), which does not fit precision {precision}"
+    ))]
+    DecimalResultOutOfRange {
+        value: String,
+        width: i64,
+        result: String,
+        precision: u8,
+    },
 }
 
 impl From<TruncateError> for DataFusionError {
@@ -179,10 +200,9 @@ macro_rules! truncate_numeric_array {
                     stringify!($ARRAY_TYPE)
                 ))
             })?;
-        let width: $SCALAR_TYPE = $WIDTH.try_into().context(WidthCastingFailedSnafu)?;
-        let width_array = <$ARRAY_TYPE>::from_value(width, $ARRAY.len());
-        let result: $ARRAY_TYPE =
-            binary(casted_array, &width_array, |v, w| v - (((v % w) + w) % w))?;
+        let result: $ARRAY_TYPE = try_unary(casted_array, |v: $SCALAR_TYPE| {
+            truncate_numeric(v, $WIDTH).map_err(|e| ArrowError::ComputeError(e.to_string()))
+        })?;
         Ok(Arc::new(result) as ArrayRef)
     }};
 }
@@ -199,28 +219,23 @@ fn compute_truncate_scalar(
         ScalarValue::Int8(Some(v)) => Ok(ScalarValue::Int8(Some(truncate_numeric(v, width)?))),
         ScalarValue::Int16(Some(v)) => Ok(ScalarValue::Int16(Some(truncate_numeric(v, width)?))),
         ScalarValue::Int32(Some(v)) => Ok(ScalarValue::Int32(Some(truncate_numeric(v, width)?))),
-        ScalarValue::Int64(Some(v)) => {
-            let result = v - (((v % width) + width) % width);
-            Ok(ScalarValue::Int64(Some(result)))
-        }
+        ScalarValue::Int64(Some(v)) => Ok(ScalarValue::Int64(Some(truncate_numeric(v, width)?))),
         ScalarValue::UInt8(Some(v)) => Ok(ScalarValue::UInt8(Some(truncate_numeric(v, width)?))),
         ScalarValue::UInt16(Some(v)) => Ok(ScalarValue::UInt16(Some(truncate_numeric(v, width)?))),
         ScalarValue::UInt32(Some(v)) => Ok(ScalarValue::UInt32(Some(truncate_numeric(v, width)?))),
         ScalarValue::UInt64(Some(v)) => Ok(ScalarValue::UInt64(Some(truncate_numeric(v, width)?))),
         ScalarValue::Decimal128(Some(v), p, s) => {
-            let width = i128::from(width);
-            let result = v - (((v % width) + width) % width);
+            let result = truncate_decimal::<Decimal128Type>(v, width, i128::from(width), p)?;
             Ok(ScalarValue::Decimal128(Some(result), p, s))
         }
         ScalarValue::Decimal256(Some(v), p, s) => {
-            let width = i256::from_i128(i128::from(width));
-            let result = v - (((v % width) + width) % width);
+            let w = i256::from_i128(i128::from(width));
+            let result = truncate_decimal::<Decimal256Type>(v, width, w, p)?;
             Ok(ScalarValue::Decimal256(Some(result), p, s))
         }
-        ScalarValue::Utf8(Some(mut v)) => {
+        ScalarValue::Utf8(Some(v)) => {
             let new_len = usize::try_from(width).context(WidthCastingFailedSnafu)?;
-            v.truncate(new_len);
-            Ok(ScalarValue::Utf8(Some(v)))
+            Ok(ScalarValue::Utf8(Some(v.chars().take(new_len).collect())))
         }
         ScalarValue::Binary(Some(v)) => {
             let n = usize::try_from(width).context(WidthCastingFailedSnafu)?;
@@ -234,16 +249,47 @@ fn compute_truncate_scalar(
     }
 }
 
-fn truncate_numeric<V, W>(v: V, w: W) -> Result<V, TruncateError>
+/// Rounds the unscaled decimal `v` down to a multiple of `width`; a result
+/// outside `precision` is an error. `width` is `w` in `T`'s native type.
+fn truncate_decimal<T>(
+    v: T::Native,
+    w: i64,
+    width: T::Native,
+    precision: u8,
+) -> Result<T::Native, TruncateError>
 where
-    V: Rem<Output = V>
-        + Add<Output = V>
-        + Sub<Output = V>
-        + Copy
-        + TryFrom<W, Error = TryFromIntError>,
+    T: DecimalType,
+    T::Native:
+        Rem<Output = T::Native> + Add<Output = T::Native> + Sub<Output = T::Native> + Display,
 {
-    let w = V::try_from(w).context(WidthCastingFailedSnafu)?;
-    Ok(v - (((v % w) + w) % w))
+    let result = v - (((v % width) + width) % width);
+    if T::is_valid_decimal_precision(result, precision) {
+        Ok(result)
+    } else {
+        Err(TruncateError::DecimalResultOutOfRange {
+            value: v.to_string(),
+            width: w,
+            result: result.to_string(),
+            precision,
+        })
+    }
+}
+
+/// Rounds `v` down to a multiple of `w`. Computed in `i128` so no
+/// intermediate step overflows; a result outside `V` is an error.
+fn truncate_numeric<V>(v: V, w: i64) -> Result<V, TruncateError>
+where
+    V: Copy + Into<i128> + TryFrom<i128, Error = TryFromIntError>,
+{
+    let width = i128::from(w);
+    V::try_from(width).context(WidthCastingFailedSnafu)?;
+    let value: i128 = v.into();
+    let result = value - value.rem_euclid(width);
+    V::try_from(result).map_err(|_| TruncateError::ResultOutOfRange {
+        value,
+        width: w,
+        result,
+    })
 }
 
 fn compute_truncate_array(array: &ArrayRef, width: i64) -> Result<ArrayRef, DataFusionError> {
@@ -251,44 +297,38 @@ fn compute_truncate_array(array: &ArrayRef, width: i64) -> Result<ArrayRef, Data
         DataType::Int8 => truncate_numeric_array!(array, width, Int8Array, i8),
         DataType::Int16 => truncate_numeric_array!(array, width, Int16Array, i16),
         DataType::Int32 => truncate_numeric_array!(array, width, Int32Array, i32),
-        DataType::Int64 => {
-            let casted_array = array.as_any().downcast_ref::<Int64Array>().ok_or_else(|| {
-                DataFusionError::Internal("Failed to downcast to Int64Array".into())
-            })?;
-            let width_array = Int64Array::from_value(width, array.len());
-            let result: Int64Array =
-                binary(casted_array, &width_array, |v, w| v - (((v % w) + w) % w))?;
-            Ok(Arc::new(result) as ArrayRef)
-        }
+        DataType::Int64 => truncate_numeric_array!(array, width, Int64Array, i64),
         DataType::UInt8 => truncate_numeric_array!(array, width, UInt8Array, u8),
         DataType::UInt16 => truncate_numeric_array!(array, width, UInt16Array, u16),
         DataType::UInt32 => truncate_numeric_array!(array, width, UInt32Array, u32),
         DataType::UInt64 => truncate_numeric_array!(array, width, UInt64Array, u64),
-        DataType::Decimal128(_, _) => {
+        DataType::Decimal128(p, s) => {
             let casted_array = array
                 .as_any()
                 .downcast_ref::<Decimal128Array>()
                 .ok_or_else(|| {
                     DataFusionError::Internal("Failed to downcast to Decimal128Array".into())
                 })?;
-            let width = i128::from(width);
-            let width_array = Decimal128Array::from_value(width, array.len());
-            let result: Decimal128Array =
-                binary(casted_array, &width_array, |v, w| v - (((v % w) + w) % w))?;
-            Ok(Arc::new(result))
+            let w = i128::from(width);
+            let result: Decimal128Array = try_unary(casted_array, |v| {
+                truncate_decimal::<Decimal128Type>(v, width, w, *p)
+                    .map_err(|e| ArrowError::ComputeError(e.to_string()))
+            })?;
+            Ok(Arc::new(result.with_precision_and_scale(*p, *s)?))
         }
-        DataType::Decimal256(_, _) => {
+        DataType::Decimal256(p, s) => {
             let casted_array = array
                 .as_any()
                 .downcast_ref::<Decimal256Array>()
                 .ok_or_else(|| {
                     DataFusionError::Internal("Failed to downcast to Decimal256Array".into())
                 })?;
-            let width = i256::from_i128(i128::from(width));
-            let width_array = Decimal256Array::from_value(width, array.len());
-            let result: Decimal256Array =
-                binary(casted_array, &width_array, |v, w| v - (((v % w) + w) % w))?;
-            Ok(Arc::new(result))
+            let w = i256::from_i128(i128::from(width));
+            let result: Decimal256Array = try_unary(casted_array, |v| {
+                truncate_decimal::<Decimal256Type>(v, width, w, *p)
+                    .map_err(|e| ArrowError::ComputeError(e.to_string()))
+            })?;
+            Ok(Arc::new(result.with_precision_and_scale(*p, *s)?))
         }
         DataType::Binary => {
             let length = u64::try_from(width).context(WidthCastingFailedSnafu)?;
@@ -745,5 +785,103 @@ mod tests {
             result.is_err(),
             "Expected error for invalid second argument type"
         );
+    }
+
+    fn invoke(width: i64, arg: ColumnarValue) -> Result<ColumnarValue, DataFusionError> {
+        let data_type = arg.data_type();
+        Truncate::new().invoke_with_args(ScalarFunctionArgs {
+            args: vec![ColumnarValue::Scalar(ScalarValue::Int64(Some(width))), arg],
+            number_rows: 1,
+            arg_fields: vec![],
+            return_field: Arc::new(Field::new("ignored_name", data_type, true)),
+            config_options: Arc::new(ConfigOptions::new()),
+        })
+    }
+
+    fn scalar(width: i64, value: ScalarValue) -> Result<ScalarValue, DataFusionError> {
+        match invoke(width, ColumnarValue::Scalar(value))? {
+            ColumnarValue::Scalar(s) => Ok(s),
+            ColumnarValue::Array(_) => panic!("expected a scalar"),
+        }
+    }
+
+    #[test]
+    fn utf8_scalar_truncates_by_character_like_the_array_path() {
+        assert_eq!(
+            scalar(1, ScalarValue::Utf8(Some("é".to_owned()))).expect("truncate"),
+            ScalarValue::Utf8(Some("é".to_owned()))
+        );
+        assert_eq!(
+            scalar(2, ScalarValue::Utf8(Some("éa".to_owned()))).expect("truncate"),
+            ScalarValue::Utf8(Some("éa".to_owned()))
+        );
+        let ColumnarValue::Array(array) = invoke(
+            2,
+            ColumnarValue::Array(Arc::new(StringArray::from(vec!["éa"]))),
+        )
+        .expect("truncate") else {
+            panic!("expected an array");
+        };
+        let strings = array
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .expect("downcast to StringArray");
+        assert_eq!(strings.value(0), "éa");
+    }
+
+    #[test]
+    fn integer_truncation_does_not_overflow_intermediate_values() {
+        assert_eq!(
+            scalar(100, ScalarValue::Int8(Some(50))).expect("truncate"),
+            ScalarValue::Int8(Some(0))
+        );
+        assert_eq!(
+            scalar(200, ScalarValue::UInt8(Some(199))).expect("truncate"),
+            ScalarValue::UInt8(Some(0))
+        );
+        assert_eq!(
+            scalar(200, ScalarValue::UInt8(Some(250))).expect("truncate"),
+            ScalarValue::UInt8(Some(200))
+        );
+        let ColumnarValue::Array(array) = invoke(
+            100,
+            ColumnarValue::Array(Arc::new(Int8Array::from(vec![50, 127, -1]))),
+        )
+        .expect("truncate") else {
+            panic!("expected an array");
+        };
+        let ints = array
+            .as_any()
+            .downcast_ref::<Int8Array>()
+            .expect("downcast to Int8Array");
+        assert_eq!(ints.values().to_vec(), vec![0, 100, -100]);
+    }
+
+    #[test]
+    fn integer_truncation_that_does_not_fit_the_type_is_an_error() {
+        let err = scalar(10, ScalarValue::Int8(Some(-128))).expect_err("-130 does not fit Int8");
+        assert!(err.to_string().contains("does not fit"), "{err}");
+        scalar(3, ScalarValue::Int64(Some(i64::MIN))).expect_err("i64::MIN - 2 does not fit Int64");
+        invoke(
+            3,
+            ColumnarValue::Array(Arc::new(Int64Array::from(vec![i64::MIN]))),
+        )
+        .expect_err("i64::MIN - 2 does not fit Int64");
+    }
+
+    #[test]
+    fn decimal_truncation_outside_the_precision_is_an_error() {
+        let err = scalar(10, ScalarValue::Decimal128(Some(-999), 3, 0))
+            .expect_err("-1000 does not fit DECIMAL(3,0)");
+        assert!(err.to_string().contains("precision 3"), "{err}");
+        assert_eq!(
+            scalar(10, ScalarValue::Decimal128(Some(995), 3, 0)).expect("truncate"),
+            ScalarValue::Decimal128(Some(990), 3, 0)
+        );
+        let array = Decimal128Array::from_iter_values(vec![-999_i128])
+            .with_precision_and_scale(3, 0)
+            .expect("valid precision");
+        invoke(10, ColumnarValue::Array(Arc::new(array)))
+            .expect_err("-1000 does not fit DECIMAL(3,0)");
     }
 }

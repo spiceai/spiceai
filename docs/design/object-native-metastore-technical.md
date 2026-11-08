@@ -25,8 +25,8 @@ against RustFS behind a proxy that injects a 20 ms median request latency (P99
 five times the median), arms interleaved. These numbers compare designs on one
 rig. They are not S3 performance, which roadmap step 1 measures.
 
-**How model runs are cited.** A section ends with one line, "Model: `run`,
-`run`", naming the runs that check it. A run named for a removed safeguard, such
+**How model runs are cited.** A section ends with a line that starts with
+"Model:" and names, in backticks, the runs that check it. A run named for a removed safeguard, such
 as `retention-list-date`, is a negative control and must fail. The model README
 gives each run's bounds and limits. `dataset-lifecycle` composes Milestone 1's
 mechanisms for one dataset, and its siblings add a transaction, query expiry and
@@ -315,7 +315,7 @@ attempt, while a **new attempt** has a fresh id and may carry re-planned bytes.
   writer's upload, present at its fresh name with the expected digest, counts as
   uploaded; its age counts from the first attempt.
 
-Model: `commits-retry`, `commits-no-resolve-before-retry`, `commits-restart-turnover`, `commits-restart-no-persist-before-send`, `commit-no-identical`; evidence expiring at the horizon: `commits-retry-expiry` (reading missing evidence as rejection applies a write twice: `commits-retry-expiry-no-horizon`).
+Model: `commits-retry`, `commits-no-resolve-before-retry`, `commits-restart-turnover`, `commits-restart-no-persist-before-send`, `commit-no-identical`, `commits-failed-resend-rejects` (a failed resend read as rejection applies a write twice); evidence expiring at the horizon: `commits-retry-expiry` (reading missing evidence as rejection applies a write twice: `commits-retry-expiry-no-horizon`).
 
 ### Ownership and fencing
 
@@ -364,7 +364,10 @@ Model: `commit-no-lease`, `commits-commit*`; standbys: `standby`, `standby-three
   (2026-10-28): the current ETag gave `NotModified` and a stale one the body. A node further behind fetches
   the listed batches it needs, in parallel.
 - **Freshness counts from when the GET was sent,** not when the response arrived,
-  so a stalled response cannot make an old head look fresh.
+  so a stalled response cannot make an old head look fresh (model:
+  `reads-bounded`, `reads-linearizable`; counting from the response fails:
+  `reads-response-time`, and with S = 0 so does serving a GET sent before the
+  query started: `reads-tick-only`).
 - **Datasets in use refresh in the background** if queried within the last one
   or two intervals. Refreshing early is always safe. A dataset nobody queries
   costs nothing, and a writer never polls its own datasets.
@@ -869,7 +872,9 @@ Model: `window-storage*`.
   their names apart. A node gets no id of its own: taking a unit's lease raises
   that unit's generation, so successive holders write different names. Names
   never contain instance, host, disk or source identifiers, so they reveal
-  nothing the head does not already hold. Not yet checked in the model. The head
+  nothing the head does not already hold (model: `object-names`, and controls
+  `object-names-generation-only`, `object-names-no-generation`,
+  `object-names-reuse-unit-id`). The head
   or a record names each object.
   References carry the object's BLAKE3 digest, which checks its bytes; the
   digest is not the name.
@@ -1374,7 +1379,8 @@ import, and the remaining sources' positions are step 5.
     SQS redelivers undeleted messages, so the new holder skips files the log
     already records.
 - **Prerequisites:** data placement (step 6). Until then data files are on the
-  writer's local disk, so a standby could neither read them nor take over.
+  writer's local disk, so a standby could neither read them nor take over
+  (model: `standby-local-files`).
 - **Code:** the `crates/cayenne` provider (`provider/table.rs`, `pk_index.rs`,
   `deletion_index.rs`), replacing the slice import (`metastore/snapshot.rs`) for
   these readers; `runtime`; lease gating in `connector-postgres`

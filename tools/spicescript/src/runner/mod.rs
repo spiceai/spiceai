@@ -1026,7 +1026,12 @@ async fn create_instances(
             let context_for_steps = context.clone();
             let spicepod_yaml = yaml::to_string(&spicepod)?;
             let spicepod = spicepod.clone();
-            let mut env = variant.env.clone();
+            // Placeholders in a variant's environment name the run's sources, as in the spicepod.
+            let mut env = variant
+                .env
+                .iter()
+                .map(|(key, value)| Ok((key.clone(), template::substitute_text(value, &context)?)))
+                .collect::<Result<BTreeMap<_, _>>>()?;
             // DuckDB sources install the library matching the CLI. Make it
             // discoverable by name without changing the harness environment.
             for entry in context["sources"]

@@ -78,7 +78,6 @@ async fn accelerator_ids(rt: &Arc<Runtime>, table: &str) -> Vec<i64> {
     ids(&batches)
 }
 
-#[cfg(feature = "duckdb")]
 fn events_dataset(dir: &Path, name: &str, refresh_sql: Option<&str>) -> Dataset {
     let mut dataset = Dataset::new(format!("file://{}", dir.join("events.csv").display()), name);
     dataset.params = Some(Params::from_string_map(
@@ -86,7 +85,7 @@ fn events_dataset(dir: &Path, name: &str, refresh_sql: Option<&str>) -> Dataset 
     ));
     dataset.acceleration = Some(Acceleration {
         enabled: true,
-        engine: Some("duckdb".to_string()),
+        engine: Some("cayenne".to_string()),
         on_zero_results: ZeroResultsAction::UseSource,
         refresh_sql: refresh_sql.map(ToString::to_string),
         retention_sql: Some(format!("DELETE FROM {name} WHERE deleted = true")),
@@ -97,34 +96,8 @@ fn events_dataset(dir: &Path, name: &str, refresh_sql: Option<&str>) -> Dataset 
     dataset
 }
 
-#[cfg(feature = "duckdb")]
-fn timed_events_dataset(dir: &Path, name: &str) -> Dataset {
-    let mut dataset = Dataset::new(format!("file://{}", dir.join("timed.csv").display()), name);
-    dataset.params = Some(Params::from_string_map(
-        [("file_format".to_string(), "csv".to_string())].into(),
-    ));
-    dataset.time_column = Some("ts".to_string());
-    dataset.time_format = Some(TimeFormat::UnixSeconds);
-    dataset.acceleration = Some(Acceleration {
-        enabled: true,
-        engine: Some("duckdb".to_string()),
-        on_zero_results: ZeroResultsAction::UseSource,
-        refresh_sql: Some(format!("SELECT * FROM {name} WHERE id != 3")),
-        // Wider than the 2001 fixture timestamp so refresh loads id=2; the 1h
-        // retention period is what then evicts it. `d` is a fundu unit; `y` is not.
-        refresh_data_window: Some("10000d".to_string()),
-        retention_check_enabled: true,
-        // Longer than dataset load so the expired row is still visible after ready.
-        retention_check_interval: Some("15s".to_string()),
-        retention_period: Some("1h".to_string()),
-        ..Acceleration::default()
-    });
-    dataset
-}
-
 /// Both retention policies at once: `retention_sql` deletes soft-deleted rows
 /// and `retention_period` deletes rows older than an hour.
-#[cfg(feature = "duckdb")]
 fn combined_retention_dataset(dir: &Path, name: &str) -> Dataset {
     let mut dataset = Dataset::new(
         format!("file://{}", dir.join("retained.csv").display()),
@@ -134,10 +107,14 @@ fn combined_retention_dataset(dir: &Path, name: &str) -> Dataset {
         [("file_format".to_string(), "csv".to_string())].into(),
     ));
     dataset.time_column = Some("ts".to_string());
-    dataset.time_format = Some(TimeFormat::UnixSeconds);
+    // ISO-8601 values, read as Timestamp: Cayenne's scan-time retention needs a
+    // timestamp column, not unix seconds.
+    dataset.time_format = Some(TimeFormat::Timestamp);
     dataset.acceleration = Some(Acceleration {
         enabled: true,
-        engine: Some("duckdb".to_string()),
+        engine: Some("cayenne".to_string()),
+        mode: spicepod::acceleration::Mode::Memory,
+        refresh_mode: Some(spicepod::acceleration::RefreshMode::Full),
         on_zero_results: ZeroResultsAction::UseSource,
         refresh_sql: Some(format!("SELECT * FROM {name} WHERE id <= 4")),
         refresh_data_window: Some("10000d".to_string()),
@@ -159,7 +136,7 @@ fn cayenne_time_dataset(source: &Path, name: &str, scheduled_ticker: bool) -> Da
     // than Int64. Cayenne's scan-time keep builder rejects numeric columns
     // without a unix scale (`data_type_to_timestamp_format(..., None)`).
     // `time_format` is Timestamp because that is the inferred Arrow type;
-    // ISO8601 is only valid while the column stays Utf8. The DuckDB fixture
+    // ISO8601 is only valid while the column stays Utf8. The Cayenne fixture
     // can stay numeric.
     dataset.time_column = Some("ts".to_string());
     dataset.time_format = Some(TimeFormat::Timestamp);
@@ -199,9 +176,8 @@ fn arrow_write_time_events_dataset(dir: &Path, name: &str) -> Dataset {
     dataset
 }
 
-#[cfg(feature = "duckdb")]
 #[tokio::test]
-async fn duckdb_retention_sql_does_not_resurrect_via_fallback() -> anyhow::Result<()> {
+async fn cayenne_retention_sql_does_not_resurrect_via_fallback() -> anyhow::Result<()> {
     register_test_connectors().await;
     test_request_context()
         .scope(async {
@@ -270,92 +246,30 @@ async fn duckdb_retention_sql_does_not_resurrect_via_fallback() -> anyhow::Resul
         .await
 }
 
-#[cfg(feature = "duckdb")]
-#[tokio::test]
-async fn duckdb_time_retention_does_not_resurrect_via_fallback() -> anyhow::Result<()> {
-    register_test_connectors().await;
-    test_request_context()
-        .scope(async {
-            let dir = tempfile::tempdir()?;
-            // 1_000_000_000 is 2001-09-09; 4_102_444_800 is 2100-01-01.
-            std::fs::write(
-                dir.path().join("timed.csv"),
-                "id,ts\n1,4102444800\n2,1000000000\n3,4102444800\n",
-            )?;
-
-            let app = AppBuilder::new("time_retention_fallback")
-                .with_dataset(timed_events_dataset(dir.path(), "timed"))
-                .build();
-            configure_test_datafusion();
-            let rt = Arc::new(Runtime::builder().with_app(app).build().await);
-            load_runtime_datasets(&rt, Duration::from_mins(1)).await?;
-
-            let loaded = accelerator_ids(&rt, "timed").await;
-            assert!(
-                loaded.contains(&2),
-                "refresh_data_window must load id=2 before retention evicts it, leftover {loaded:?}"
-            );
-
-            let evicted = wait_until_true(Duration::from_secs(30), || {
-                let rt = Arc::clone(&rt);
-                async move {
-                    let ids = accelerator_ids(&rt, "timed").await;
-                    ids.contains(&1) && !ids.contains(&2)
-                }
-            })
-            .await;
-            assert!(
-                evicted,
-                "time retention must remove id=2 after it was loaded, leftover {:?}",
-                accelerator_ids(&rt, "timed").await
-            );
-
-            let evicted_row = run_query(&rt, "SELECT id FROM timed WHERE id = 2").await?;
-            assert_eq!(
-                ids(&evicted_row),
-                Vec::<i64>::new(),
-                "a time-expired row must not come back from the source"
-            );
-
-            let fallback = run_query(&rt, "SELECT id FROM timed WHERE id = 3").await?;
-            assert_eq!(
-                ids(&fallback),
-                vec![3],
-                "a recent row never loaded must still fall back"
-            );
-
-            rt.shutdown().await;
-            Ok(())
-        })
-        .await
-}
-
 /// With `retention_sql` and `retention_period` both set, fallback returns only
 /// the rows neither policy deletes. A NULL `deleted` or `ts` matches neither
 /// delete, so the accelerator would keep that row, and so must fallback.
-#[cfg(feature = "duckdb")]
 #[tokio::test]
-async fn duckdb_combined_retention_does_not_resurrect_via_fallback() -> anyhow::Result<()> {
+async fn cayenne_combined_retention_does_not_resurrect_via_fallback() -> anyhow::Result<()> {
     register_test_connectors().await;
     test_request_context()
         .scope(async {
             let dir = tempfile::tempdir()?;
-            // 4_102_444_800 is 2100-01-01; 1_000_000_000 is 2001-09-09. Refresh
-            // loads ids 1-4: 1 is kept, 2 is soft-deleted, 3 has expired, and 4
+            // Refresh loads ids 1-4: 1 is kept, 2 is soft-deleted, 3 has expired, and 4
             // is both. Ids 5-9 are never loaded: 5 is kept, 6 has a NULL
             // `deleted`, 7 has a NULL `ts`, 8 is soft-deleted, and 9 has expired.
             std::fs::write(
                 dir.path().join("retained.csv"),
                 "id,ts,deleted\n\
-                 1,4102444800,false\n\
-                 2,4102444800,true\n\
-                 3,1000000000,false\n\
-                 4,1000000000,true\n\
-                 5,4102444800,false\n\
-                 6,4102444800,\n\
+                 1,2100-01-01T00:00:00Z,false\n\
+                 2,2100-01-01T00:00:00Z,true\n\
+                 3,2001-09-09T01:46:40Z,false\n\
+                 4,2001-09-09T01:46:40Z,true\n\
+                 5,2100-01-01T00:00:00Z,false\n\
+                 6,2100-01-01T00:00:00Z,\n\
                  7,,false\n\
-                 8,4102444800,true\n\
-                 9,1000000000,false\n",
+                 8,2100-01-01T00:00:00Z,true\n\
+                 9,2001-09-09T01:46:40Z,false\n",
             )?;
 
             let app = AppBuilder::new("combined_retention_fallback")

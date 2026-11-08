@@ -31,7 +31,6 @@ use tokio_util::sync::CancellationToken;
 
 use crate::{Runtime, config};
 use runtime_search::search_engine::SearchEngine;
-use runtime_search::search_engine::parse_explicit_primary_keys;
 use runtime_tls::TlsConfig;
 
 #[cfg(feature = "openapi")]
@@ -140,7 +139,7 @@ where
     let vsearch = Arc::new(
         SearchEngine::new(
             Arc::clone(&rt.df) as Arc<dyn runtime_query_engine::query_engine::QueryEngine>,
-            parse_explicit_primary_keys(Arc::clone(&rt.app)).await,
+            rt.search_primary_keys.clone(),
             crate::search::util::RuntimeTableProviderExplorer,
         )
         .with_search_cache(rt.df.search_cache_provider()),

@@ -1,13 +1,15 @@
-# Known failing (#15550) from 2.3.x only: v2.3.3 acknowledges the
+# Known failing (#15550) from 2.3.x only: v2.3.3 can acknowledge the
 # replication slot past what it recorded as applied, so the upgraded runtime
 # rebuilds the write-back acceleration from the source, and a rebuild loses the
 # write-back write still pending at the upgrade. From 2.4.x it passes.
 name: postgres-upgrade
 description: >
-  A runtime upgraded in place from each of the last two releases keeps serving what it held: file accelerations on Cayenne, DuckDB
+  A runtime upgraded in place from each of the last two releases keeps serving what it held: file accelerations on Cayenne
   and SQLite answer as before and as the source does, a CDC acceleration
   applies the changes made while it was down, and a write-back write still
-  pending at the upgrade is delivered once afterwards.
+  pending at the upgrade is delivered once afterwards. The DuckDB file
+  acceleration, whose engine the upgrade removes, fails to load with one error
+  naming the fix, and is never rebuilt on Cayenne.
 
 matrix:
   from: [2.3.x, 2.4.x]
@@ -122,14 +124,30 @@ steps:
         UPDATE events SET kind = 'while down' WHERE id BETWEEN 100 AND 150;
         DELETE FROM events WHERE id BETWEEN 200 AND 210;
         INSERT INTO events VALUES (5000, 'while down', 1.00, TIMESTAMPTZ '2026-06-01 00:00:00+00');
-  - upgrade: {}
+  # Whether 2.3.x acknowledges the write-back dataset's slot past what it
+  # recorded before it stops is a race inside that release. Leave the slot as
+  # that release can, so the upgrade from 2.3.x always meets that state, and
+  # the upgrade from 2.4.x the slot as recorded.
+  - source-query:
+      src: >-
+        SELECT count(pg_replication_slot_advance(slot_name, pg_current_wal_lsn())) AS advanced
+        FROM pg_replication_slots
+          WHERE database = current_database() AND slot_name LIKE 'spice\_accounts\_%' AND NOT active
+    expect: { rows: [['1']] }
+    when: { from: 2.3.x }
+  # The dataset on the removed `duckdb` engine stays in Error, so the upgraded
+  # runtime never reports ready.
+  - upgrade: { ready: false }
 
   - query: SELECT * FROM on_cayenne
     oracle-sql: SELECT * FROM items
     expect: { same-as: cayenne-before }
+    eventually: 60s
   - query: SELECT * FROM on_duckdb
-    oracle-sql: SELECT * FROM items
-    expect: { same-as: duckdb-before }
+    expect-error: on_duckdb
+  - assert-log:
+      count:
+        "ERROR .*Failed to load dataset 'on_duckdb': the acceleration engine `duckdb` is no longer supported as of v2\\.5 and cannot be used\\.": 1
   - query: SELECT * FROM on_sqlite
     oracle-sql: SELECT * FROM items
     expect: { same-as: sqlite-before }

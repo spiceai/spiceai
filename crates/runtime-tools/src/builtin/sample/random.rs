@@ -20,9 +20,9 @@ use std::{
 };
 
 use super::SampleFrom;
+use crate::utils::{MAX_TOOL_RESULT_BYTES, collect_batches_bounded};
 use arrow::{array::RecordBatch, compute::concat_batches};
 use datafusion::common::TableReference;
-use futures::TryStreamExt;
 use runtime_query_engine::query_engine::{QueryEngine, QueryRequest};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
@@ -66,10 +66,7 @@ impl SampleFrom for RandomSampleParams {
                     tbl = tbl_quoted,
                 )))
                 .await?;
-            stream
-                .try_collect::<Vec<RecordBatch>>()
-                .await
-                .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> { Box::new(e) })
+            collect_batches_bounded(stream, MAX_TOOL_RESULT_BYTES).await
         }
         .instrument(current_span)
         .await?;

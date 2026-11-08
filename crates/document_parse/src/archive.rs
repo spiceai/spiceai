@@ -228,7 +228,9 @@ pub(crate) fn rebuild_package(raw: &Bytes, format: DocumentType, limits: Limits)
 /// stops at a terminal one. A general-purpose `LZWDecode`, the `Crypt` filter,
 /// an unrecognised filter, or a `/Filter` we cannot resolve (an indirect
 /// reference) is not decoded and cannot be bounded, so the document is rejected
-/// rather than forwarded to `PDFium` with an unchecked expansion.
+/// rather than forwarded to `PDFium` with an unchecked expansion. A
+/// `/DecodeParms` predictor is accepted only on the final stage of a chain that
+/// ends in Flate (see [`apply_decode_parms`]).
 ///
 /// The dictionary in front of each `stream` keyword is tokenised, not scanned
 /// for byte patterns. PDF whitespace (including NUL) and `%` comments between
@@ -739,6 +741,7 @@ fn parse_dictionary(data: &[u8], depth: usize) -> Option<ParsedDict> {
     }
     let mut i = 2;
     let mut filters: Option<Vec<PdfFilter>> = None;
+    let mut decode_parms: Option<DecodeParms> = None;
     let mut length: Option<u64> = None;
     let mut length_ref: Option<(u32, u32)> = None;
     loop {
@@ -746,7 +749,10 @@ fn parse_dictionary(data: &[u8], depth: usize) -> Option<ParsedDict> {
         if data.get(i..i + 2) == Some(b">>") {
             return Some(ParsedDict {
                 consumed: i + 2,
-                filters: filters.unwrap_or_default(),
+                filters: apply_decode_parms(
+                    filters.unwrap_or_default(),
+                    decode_parms.unwrap_or(DecodeParms::NoPredictor),
+                ),
                 length,
                 length_ref,
             });
@@ -783,17 +789,17 @@ fn parse_dictionary(data: &[u8], depth: usize) -> Option<ParsedDict> {
                     }
                 }
             }
-            // A `/Predictor` (or `/P`) in DecodeParms inserts PNG-style row
-            // tags between Flate stages that we do not reverse, so a nested
-            // Flate chain can under-count. Fail closed when a predictor is
-            // declared or cannot be ruled out; other DecodeParms values are
-            // skipped as usual.
+            // Resolved against the filter chain once the dictionary closes, so
+            // the order of `/Filter` and `/DecodeParms` does not matter.
             b"DecodeParms" | b"DP" => {
                 let value_start = i;
                 let value_len = skip_value(&data[i..], depth + 1)?;
-                if decode_parms_may_predict(&data[value_start..value_start + value_len]) {
-                    filters = Some(vec![PdfFilter::Unbounded]);
-                }
+                // A duplicate key is undefined in PDF, as for `/Filter`.
+                decode_parms = Some(if decode_parms.is_some() {
+                    DecodeParms::Unverifiable
+                } else {
+                    parse_decode_parms(&data[value_start..value_start + value_len])
+                });
                 i += value_len;
             }
             _ => {
@@ -803,98 +809,162 @@ fn parse_dictionary(data: &[u8], depth: usize) -> Option<ParsedDict> {
     }
 }
 
-/// True unless a `/DecodeParms` value is provably predictor-free: a direct
-/// dictionary, `null`, or an array of those, with no `/Predictor` or `/P`.
-/// Those keys insert PNG-style row tags that this scanner does not reverse.
-/// An indirect reference (`5 0 R`) is not resolved, so it fails closed, as
-/// does anything that does not parse.
-fn decode_parms_may_predict(data: &[u8]) -> bool {
+/// What a stream's `/DecodeParms` says about predictors (`/Predictor` or `/P`).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum DecodeParms {
+    /// No entry declares a predictor.
+    NoPredictor,
+    /// Exactly one entry declares a predictor among its own keys.
+    Predictor(PredictorEntry),
+    /// A predictor cannot be ruled out or placed: an indirect reference, a
+    /// predictor nested inside another value, more than one predicting entry,
+    /// a duplicate key, or anything that does not parse.
+    Unverifiable,
+}
+
+/// Where a predictor sits in `/DecodeParms`, which decides the filter stage it
+/// applies to.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum PredictorEntry {
+    /// A single dictionary, which applies to a single `/Filter`.
+    Dictionary,
+    /// Entry `n` of an array, which applies to filter `n` of the chain.
+    ArrayIndex(usize),
+}
+
+/// The chain to budget once `/DecodeParms` is known.
+///
+/// A predictor on the final stage of a chain that ends in Flate is budgeted
+/// as that stage's Flate output: `PDFium` (`chromium/7897`, see
+/// `crate::pdfium`) emits fewer bytes from a PNG predictor than it reads and
+/// the same number from a TIFF predictor, so the count already bounds it.
+/// Cross-reference streams and PNG-predicted images use this shape. A predictor
+/// on any earlier stage changes the bytes the next stage decodes, which this
+/// scanner does not reproduce, so the chain fails closed.
+fn apply_decode_parms(filters: Vec<PdfFilter>, decode_parms: DecodeParms) -> Vec<PdfFilter> {
+    match decode_parms {
+        DecodeParms::NoPredictor => filters,
+        DecodeParms::Predictor(entry) if predicts_final_flate(&filters, entry) => filters,
+        DecodeParms::Predictor(_) | DecodeParms::Unverifiable => vec![PdfFilter::Unbounded],
+    }
+}
+
+fn predicts_final_flate(filters: &[PdfFilter], entry: PredictorEntry) -> bool {
+    let applies_to_last = match entry {
+        PredictorEntry::Dictionary => filters.len() == 1,
+        PredictorEntry::ArrayIndex(n) => n + 1 == filters.len(),
+    };
+    applies_to_last && filters.last() == Some(&PdfFilter::Flate)
+}
+
+/// Classifies a `/DecodeParms` value: a direct dictionary, `null`, or an array
+/// of those. An indirect reference (`5 0 R`) is not resolved.
+fn parse_decode_parms(data: &[u8]) -> DecodeParms {
     if data.first() != Some(&b'[') {
-        return decode_parms_entry_may_predict(data);
+        return match decode_parms_entry_predicts(data) {
+            Some((false, _)) => DecodeParms::NoPredictor,
+            Some((true, _)) => DecodeParms::Predictor(PredictorEntry::Dictionary),
+            None => DecodeParms::Unverifiable,
+        };
     }
     let mut i = 1;
+    let mut index = 0;
+    let mut predictor = None;
     loop {
         i += ws_len(&data[i..]);
         match data.get(i) {
-            Some(b']') => return false,
-            None => return true,
+            Some(b']') => {
+                return predictor.map_or(DecodeParms::NoPredictor, |n| {
+                    DecodeParms::Predictor(PredictorEntry::ArrayIndex(n))
+                });
+            }
+            None => return DecodeParms::Unverifiable,
             Some(_) => {
-                if decode_parms_entry_may_predict(&data[i..]) {
-                    return true;
+                let Some((predicts, len)) = decode_parms_entry_predicts(&data[i..]) else {
+                    return DecodeParms::Unverifiable;
+                };
+                if predicts && predictor.replace(index).is_some() {
+                    return DecodeParms::Unverifiable;
                 }
-                match skip_value(&data[i..], 1) {
-                    Some(len) => i += len,
-                    None => return true,
-                }
+                i += len;
+                index += 1;
             }
         }
     }
 }
 
-fn decode_parms_entry_may_predict(data: &[u8]) -> bool {
-    if data.starts_with(b"null") && token_ends(data, 4) {
-        return false;
+/// Whether one `/DecodeParms` entry declares a predictor among its own keys,
+/// and how many bytes the entry takes: `Some((false, _))` for `null` or a
+/// dictionary without one, `Some((true, _))` for a dictionary with one, and
+/// `None` when that cannot be decided (an indirect reference, a predictor
+/// nested inside another value, or a parse failure).
+fn decode_parms_entry_predicts(data: &[u8]) -> Option<(bool, usize)> {
+    if let Some(len) = skip_keyword(data, b"null") {
+        return Some((false, len));
     }
-    if !data.starts_with(b"<<") {
-        return true;
-    }
-    decode_parms_has_predictor_at(data, 0)
+    let (own, nested, len) = predictor_keys_in_dictionary(data, 0)?;
+    (!nested).then_some((own, len))
 }
 
-/// True when `data` holds a `/Predictor` or `/P` key, searching nested
-/// dictionaries and arrays. Parse failures and excessive nesting count as a
-/// predictor so the caller fails closed.
-fn decode_parms_has_predictor_at(data: &[u8], depth: usize) -> bool {
+/// Walks the dictionary at `data[0]` once and reports whether it has a
+/// `/Predictor` or `/P` key of its own, whether a dictionary or array nested in
+/// one of its other values has one, and how many bytes it takes. `None` when it
+/// cannot be parsed or nests past [`MAX_VALUE_DEPTH`].
+fn predictor_keys_in_dictionary(data: &[u8], depth: usize) -> Option<(bool, bool, usize)> {
+    if depth > MAX_VALUE_DEPTH || !data.starts_with(b"<<") {
+        return None;
+    }
+    let (mut own, mut nested) = (false, false);
+    let mut i = 2;
+    loop {
+        i += ws_len(&data[i..]);
+        if data.get(i..i + 2) == Some(b">>") {
+            return Some((own, nested, i + 2));
+        }
+        if data.get(i) != Some(&b'/') {
+            return None;
+        }
+        let (name, name_len) = read_name(&data[i + 1..]);
+        i += 1 + name_len;
+        i += ws_len(&data[i..]);
+        let is_predictor = matches!(&*name, b"Predictor" | b"P");
+        own |= is_predictor;
+        let (inner, value_len) = predictor_in_value(&data[i..], depth + 1)?;
+        nested |= inner && !is_predictor;
+        i += value_len;
+    }
+}
+
+/// Whether the value at `data[0]` holds a `/Predictor` or `/P` key, in it or in
+/// any dictionary or array nested in it, and how many bytes the value takes.
+/// The value is read once, nesting included. `None` when it cannot be parsed
+/// or nests past [`MAX_VALUE_DEPTH`]; callers treat that as a predictor, so the
+/// document fails closed.
+fn predictor_in_value(data: &[u8], depth: usize) -> Option<(bool, usize)> {
     if depth > MAX_VALUE_DEPTH {
-        return true;
+        return None;
     }
     match data.first() {
         Some(b'<') if data.get(1) == Some(&b'<') => {
-            let mut i = 2;
-            loop {
-                i += ws_len(&data[i..]);
-                if data.get(i..i + 2) == Some(b">>") {
-                    return false;
-                }
-                if data.get(i) != Some(&b'/') {
-                    return true;
-                }
-                let (name, name_len) = read_name(&data[i + 1..]);
-                i += 1 + name_len;
-                i += ws_len(&data[i..]);
-                if name.as_slice() == b"Predictor" || name.as_slice() == b"P" {
-                    return true;
-                }
-                // Nested DecodeParms arrays/dicts can still hold a predictor.
-                if decode_parms_has_predictor_at(&data[i..], depth + 1) {
-                    return true;
-                }
-                match skip_value(&data[i..], depth + 1) {
-                    Some(len) => i += len,
-                    None => return true,
-                }
-            }
+            predictor_keys_in_dictionary(data, depth).map(|(own, nested, len)| (own || nested, len))
         }
         Some(b'[') => {
+            let mut found = false;
             let mut i = 1;
             loop {
                 i += ws_len(&data[i..]);
                 match data.get(i) {
-                    Some(b']') => return false,
-                    None => return true,
+                    Some(b']') => return Some((found, i + 1)),
+                    None => return None,
                     Some(_) => {
-                        if decode_parms_has_predictor_at(&data[i..], depth + 1) {
-                            return true;
-                        }
-                        match skip_value(&data[i..], depth + 1) {
-                            Some(len) => i += len,
-                            None => return true,
-                        }
+                        let (nested, value_len) = predictor_in_value(&data[i..], depth + 1)?;
+                        found |= nested;
+                        i += value_len;
                     }
                 }
             }
         }
-        _ => false,
+        _ => skip_value(data, depth).map(|len| (false, len)),
     }
 }
 
@@ -982,7 +1052,7 @@ fn skip_value(data: &[u8], depth: usize) -> Option<usize> {
         Some(b'(') => skip_literal_string(data),
         Some(b'<') => {
             if data.get(1) == Some(&b'<') {
-                parse_dictionary(data, depth + 1).map(|parsed| parsed.consumed)
+                skip_dictionary(data, depth + 1)
             } else {
                 skip_hex_string(data)
             }
@@ -993,6 +1063,30 @@ fn skip_value(data: &[u8], depth: usize) -> Option<usize> {
         Some(b'n') => skip_keyword(data, b"null"),
         Some(b'+' | b'-' | b'.' | b'0'..=b'9') => skip_number_or_reference(data),
         _ => None,
+    }
+}
+
+/// Skips the `<< … >>` dictionary at `data[0]` as a value, reading each byte
+/// once. Only a stream's own dictionary declares its filters and parameters
+/// ([`parse_dictionary`]); a nested one is skipped whole, so nesting never
+/// multiplies the work.
+fn skip_dictionary(data: &[u8], depth: usize) -> Option<usize> {
+    if depth > MAX_VALUE_DEPTH || !data.starts_with(b"<<") {
+        return None;
+    }
+    let mut i = 2;
+    loop {
+        i += ws_len(&data[i..]);
+        if data.get(i..i + 2) == Some(b">>") {
+            return Some(i + 2);
+        }
+        if data.get(i) != Some(&b'/') {
+            return None;
+        }
+        let (_, name_len) = read_name(&data[i + 1..]);
+        i += 1 + name_len;
+        i += ws_len(&data[i..]);
+        i += skip_value(&data[i..], depth + 1)?;
     }
 }
 
@@ -1756,6 +1850,30 @@ mod tests {
         );
     }
 
+    /// Each `/DecodeParms` value is read once per nesting level, so a stream
+    /// dictionary nested sixteen deep in `/DecodeParms` costs linear time.
+    /// Reading every level twice doubles the work per level; two thousand such
+    /// streams then take minutes and trip the test timeout.
+    #[test]
+    fn scans_deeply_nested_decode_parms_in_linear_time() {
+        let mut value = format!("({})", "x".repeat(64)).into_bytes();
+        for _ in 0..16 {
+            let mut outer = b"<< /DecodeParms ".to_vec();
+            outer.extend_from_slice(&value);
+            outer.extend_from_slice(b" >>");
+            value = outer;
+        }
+        let mut pdf = b"%PDF-1.7\n".to_vec();
+        for object in 1..=2000 {
+            pdf.extend_from_slice(format!("{object} 0 obj\n").as_bytes());
+            pdf.extend_from_slice(&value);
+            pdf.extend_from_slice(b"\nstream\n\nendstream\nendobj\n");
+        }
+        assert_eq!(pdf_streams(&pdf).len(), 2000);
+        ensure_pdf_within_budget(&Bytes::from(pdf))
+            .expect("stored streams with nested parameters are within the budget");
+    }
+
     /// Each byte is lexed once, so a document packed with what would cost a
     /// rescan per occurrence if each check restarted at the last payload —
     /// `stream` in comment lines or as a bare word, comment lines between a
@@ -2131,9 +2249,10 @@ mod tests {
         );
     }
 
-    /// `/DecodeParms` with a predictor changes what Flate emits between
-    /// stages. We do not reverse predictors, so such a stream is rejected
-    /// rather than under-counted.
+    /// A predictor on a stage that feeds another stage changes the bytes the
+    /// next stage decodes. We do not reverse predictors, so such a stream is
+    /// rejected rather than under-counted. A single `/DecodeParms` dictionary
+    /// with a two-stage chain is that case.
     #[test]
     fn rejects_a_stream_with_decode_parms() {
         let data = deflate(&flate_bomb());
@@ -2177,6 +2296,124 @@ mod tests {
             pdf_too_large_reason(&pdf),
             "its compressed streams decompress to more than 256 MiB, the per-document limit"
         );
+    }
+
+    /// PNG predictor rows with tag 0 (None): `columns` bytes per row, each row
+    /// prefixed by its tag, as a PDF writer emits for `/Predictor 12`.
+    fn png_predicted(data: &[u8], columns: usize) -> Vec<u8> {
+        data.chunks(columns)
+            .flat_map(|row| std::iter::once(0).chain(row.iter().copied()))
+            .collect()
+    }
+
+    /// A predictor on a single Flate stage is how PDF 1.5 cross-reference
+    /// streams and PNG-predicted images are written, so it is accepted, in
+    /// either key order and with abbreviated keys.
+    #[test]
+    fn accepts_a_predictor_on_a_single_flate_stage() {
+        let data = deflate(&png_predicted(b"hello world, predicted", 4));
+        for decl in [
+            b"/FlateDecode /DecodeParms << /Predictor 12 /Columns 4 >>".as_slice(),
+            b"/FlateDecode /DecodeParms << /Predictor 15 /Colors 3 /BitsPerComponent 8 /Columns 4 >>"
+                .as_slice(),
+            b"/Fl /DP << /Predictor 12 /Columns 4 >>".as_slice(),
+            b"[/FlateDecode] /DecodeParms [<< /Predictor 12 /Columns 4 >>]".as_slice(),
+        ] {
+            let pdf = loadable_pdf_with_content_stream(decl, &data);
+            ensure_pdf_within_budget(&pdf).unwrap_or_else(|e| {
+                panic!(
+                    "/Filter {} should be accepted: {e}",
+                    String::from_utf8_lossy(decl)
+                )
+            });
+        }
+        // `/DecodeParms` before `/Filter`.
+        let pdf = pdf_with_dict(
+            "/DecodeParms << /Predictor 12 /Columns 4 >> /Filter /FlateDecode",
+            &data,
+        );
+        ensure_pdf_within_budget(&pdf).expect("key order does not matter");
+    }
+
+    /// A predictor on the final Flate stage of a longer chain is accepted when
+    /// the earlier stages have no predictor.
+    #[test]
+    fn accepts_a_predictor_on_the_final_flate_stage_of_a_chain() {
+        let data = ascii85_encode(&deflate(&png_predicted(b"hello world", 4)));
+        let pdf = loadable_pdf_with_content_stream(
+            b"[/ASCII85Decode /FlateDecode] /DecodeParms [null << /Predictor 12 /Columns 4 >>]",
+            &data,
+        );
+        ensure_pdf_within_budget(&pdf).expect("a final-stage predictor is within the budget");
+    }
+
+    /// Accepting a final-stage predictor must not skip the budget: the Flate
+    /// output in front of the predictor is still counted.
+    #[test]
+    fn still_budgets_a_flate_bomb_with_a_final_stage_predictor() {
+        let bomb = flate_bomb();
+        for (decl, data) in [
+            (
+                b"/FlateDecode /DecodeParms << /Predictor 15 /Columns 100 >>".as_slice(),
+                bomb.clone(),
+            ),
+            (
+                b"[/ASCII85Decode /FlateDecode] /DecodeParms [null << /Predictor 12 /Columns 1 >>]"
+                    .as_slice(),
+                ascii85_encode(&bomb),
+            ),
+        ] {
+            let pdf = loadable_pdf_with_content_stream(decl, &data);
+            assert_eq!(
+                pdf_too_large_reason(&pdf),
+                "its compressed streams decompress to more than 256 MiB, the per-document limit",
+                "/Filter {}",
+                String::from_utf8_lossy(decl)
+            );
+        }
+    }
+
+    /// Predictors that are not on the final Flate stage, or that cannot be
+    /// placed, still fail closed.
+    #[test]
+    fn rejects_a_predictor_that_is_not_on_the_final_flate_stage() {
+        let data = deflate(&deflate(&png_predicted(b"hello world", 1)));
+        for decl in [
+            // Predictor on the first of two Flate stages.
+            b"[/FlateDecode /FlateDecode] /DecodeParms [<< /Predictor 12 /Columns 1 >> null]"
+                .as_slice(),
+            // Two predicting entries.
+            b"[/FlateDecode /FlateDecode] /DecodeParms [<< /Predictor 12 >> << /Predictor 12 >>]"
+                .as_slice(),
+            // A predictor nested inside another value.
+            b"/FlateDecode /DecodeParms << /X << /Predictor 12 >> >>".as_slice(),
+            // An entry that is not a dictionary or `null`.
+            b"[/FlateDecode /FlateDecode] /DecodeParms [/Predictor null]".as_slice(),
+            // A predictor whose index is past the end of the chain.
+            b"/FlateDecode /DecodeParms [null << /Predictor 12 >>]".as_slice(),
+            // A predictor on a filter this scanner does not decode.
+            b"/LZWDecode /DecodeParms << /Predictor 2 >>".as_slice(),
+            // A predictor on an image codec.
+            b"/DCTDecode /DecodeParms << /Predictor 12 >>".as_slice(),
+            // A duplicate `/DecodeParms` key.
+            b"/FlateDecode /DecodeParms << /Predictor 12 >> /DecodeParms null".as_slice(),
+        ] {
+            let pdf = loadable_pdf_with_content_stream(decl, &data);
+            assert_eq!(
+                pdf_too_large_reason(&pdf),
+                UNVERIFIABLE_REASON,
+                "/Filter {}",
+                String::from_utf8_lossy(decl)
+            );
+        }
+    }
+
+    /// A predictor with no `/Filter` applies to nothing a reader decodes, but
+    /// it is not a shape writers produce, so it fails closed.
+    #[test]
+    fn rejects_a_predictor_without_a_filter() {
+        let pdf = pdf_with_dict("/DecodeParms << /Predictor 12 >>", b"hello");
+        assert_eq!(pdf_too_large_reason(&pdf), UNVERIFIABLE_REASON);
     }
 
     /// A Catalog string that contains the bytes of a fake `N 0 obj` /Length
