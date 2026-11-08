@@ -502,12 +502,33 @@ fn unverifiable_stream() -> PdfStream {
     }
 }
 
-/// `obj` at `pos` is the keyword of an object header (`N G obj`): whitespace
-/// separates it from the generation number (a comment before it ends in an
-/// end-of-line), and a token boundary follows it. `endobj` is a different
-/// keyword, so it does not match.
+/// `obj` at `pos` may be the keyword of an object header (`N G obj`) that
+/// `PDFium` parses: whitespace separates it from the generation number before
+/// it, and a token boundary follows it. `PDFium` reads only `0-9`, `+`, `-`, and
+/// `.` as number characters, so the token before `obj` ends in one of them,
+/// unless a `%` comment could sit between that number and `obj`: the
+/// whitespace before `obj` crosses an end-of-line, and the line before it holds
+/// a `%`. That case is taken as a header, so no header `PDFium` accepts is
+/// missed. `endobj`, and `obj` after a word, as in page text such as
+/// `(prefix obj << … >>stream)`, do not match.
 fn is_obj_keyword(raw: &[u8], pos: usize) -> bool {
-    pos > 0 && is_pdf_whitespace(raw[pos - 1]) && token_ends(raw, pos + b"obj".len())
+    if pos == 0 || !is_pdf_whitespace(raw[pos - 1]) || !token_ends(raw, pos + b"obj".len()) {
+        return false;
+    }
+    let Some(last) = raw[..pos].iter().rposition(|&b| !is_pdf_whitespace(b)) else {
+        return false;
+    };
+    if matches!(raw[last], b'0'..=b'9' | b'+' | b'-' | b'.') {
+        return true;
+    }
+    // Only a header whose last token sits on an earlier line looks back along
+    // that line, so each line is searched at most once and the scan stays
+    // linear however many `obj` words one line holds.
+    if memchr::memchr2(b'\n', b'\r', &raw[last + 1..pos]).is_none() {
+        return false;
+    }
+    let line_start = memchr::memrchr2(b'\n', b'\r', &raw[..last]).map_or(0, |eol| eol + 1);
+    memchr::memchr(b'%', &raw[line_start..=last]).is_some()
 }
 
 /// `stream` at `pos` is a keyword when it is a whole token: a token boundary
@@ -975,15 +996,19 @@ fn token_ends(data: &[u8], at: usize) -> bool {
         .is_none_or(|&b| is_pdf_whitespace(b) || is_pdf_delimiter(b))
 }
 
-/// PDF whitespace is NUL, tab, LF, form feed, CR, and space (ISO 32000-1
-/// §7.2.2). Rust's `is_ascii_whitespace` leaves NUL out, which would split a
-/// `/Filter` key from its value.
 fn is_octal(b: u8) -> bool {
     matches!(b, b'0'..=b'7')
 }
 
+/// Whitespace as `PDFium` tokenises it: NUL, tab, LF, form feed, CR, and space
+/// (ISO 32000-1 §7.2.2), plus the bytes 0x80 and 0xFF, which `PDFium`'s
+/// character table also treats as whitespace. A byte `PDFium` splits tokens on
+/// must split them here too, or an object, a dictionary, or a `stream` keyword
+/// written with it is a stream `PDFium` decodes and this scan never budgets.
+/// Rust's `is_ascii_whitespace` leaves NUL out, which would split a `/Filter`
+/// key from its value.
 fn is_pdf_whitespace(b: u8) -> bool {
-    matches!(b, 0x00 | 0x09 | 0x0A | 0x0C | 0x0D | 0x20)
+    matches!(b, 0x00 | 0x09 | 0x0A | 0x0C | 0x0D | 0x20 | 0x80 | 0xFF)
 }
 
 fn is_pdf_delimiter(b: u8) -> bool {
@@ -2581,6 +2606,24 @@ mod tests {
                 read.contains("obj <<"),
                 "{shown}: PDFium should read the page text, got {read:?}"
             );
+        }
+    }
+
+    /// A single line holding a million `obj` words after other words is
+    /// scanned in linear time, and the bomb after it is still budgeted. Looking
+    /// back to the start of the line for every one of them would take minutes
+    /// and trip the test timeout.
+    #[test]
+    fn budgets_a_bomb_after_a_line_of_obj_words() {
+        let decoy = b"a obj ".repeat(1_000_000);
+        let contents = flate_contents_object(b"\n", b"\n", &flate_bomb());
+        let pdf = pdf_with_decoy_before_contents(&decoy, &contents);
+        match ensure_pdf_within_budget(&pdf) {
+            Err(Error::DocumentTooLarge { reason, .. }) => assert_eq!(
+                reason,
+                "its compressed streams decompress to more than 256 MiB, the per-document limit"
+            ),
+            other => panic!("expected the budget to reject the bomb, got {other:?}"),
         }
     }
 
