@@ -35,7 +35,7 @@
   "debezium-kafka": 62,
   "debezium-offset-recovery": 34,
   "distinct-on-scopes": 5,
-  "duckdb-hugeint": 14,
+  "duckdb-hugeint": 1,
   "duckdb-nested-union-all": 4,
   "duckdb-timestamp-deletes": 4,
   "duckdb-types-acceleration": 2,

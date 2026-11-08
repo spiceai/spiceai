@@ -5,7 +5,8 @@ description: >
   through `adbc:` with the DuckDB driver, every HUGEINT that fits 38 digits
   answers exactly as the DuckDB CLI prints it, and a query that reads one
   past 38 digits fails with an error naming the value instead of answering
-  with its last digit missing (#15869). Each route reads its own DuckDB file,
+  with its last digit missing (#15869); an acceleration over such a row fails
+  its refresh rather than serving it. Each route reads its own DuckDB file,
   because direct ADBC opens its file read-write and holds the lock.
 
 sources:
@@ -26,6 +27,12 @@ spicepod:
     - from: duckdb:main.nested
       name: nested
       params: ${sources.ddb.params}
+    # Accelerated, so its first refresh reads every row of `wide`.
+    - from: duckdb:main.wide
+      name: wide_accel
+      params: ${sources.ddb.params}
+      acceleration:
+        enabled: true
 
 steps:
   # HUGEINT's largest and smallest values have 39 digits; the rest fit 38.
@@ -60,10 +67,19 @@ steps:
         - [4, '-170141183460469231731687303715884105728']
         - [5, '-99999999999999999999999999999999999999']
         - [6, null]
-  - start: {}
+  # `wide_accel` cannot load, so readiness is not awaited.
+  - start: { ready: false }
+  # The acceleration refuses the 39-digit row rather than storing and serving
+  # it with a digit missing.
+  - assert-status:
+      dataset: wide_accel
+      status: Error
+      message-contains: column 'h' holds the value 170141183460469231731687303715884105727, which has more digits than its type Decimal128(38, 0) allows
+    eventually: 60s
 
   # The filter reaches DuckDB, so only rows that fit 38 digits come back.
   - query: SELECT id, h FROM wide WHERE id IN (2, 3, 5, 6) ORDER BY id
+    eventually: 60s
     expect:
       rows: &in_range
         - [2, '99999999999999999999999999999999999999']
