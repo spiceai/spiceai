@@ -134,8 +134,7 @@ async fn databricks_odbc_with_acceleration() -> Result<(), String> {
         .scope(async {
             for engine in [
                 "arrow",
-                #[cfg(feature = "duckdb")]
-                "duckdb",
+                "cayenne",
                 #[cfg(feature = "sqlite")]
                 "sqlite",
             ] {

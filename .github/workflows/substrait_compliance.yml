@@ -194,14 +194,6 @@ jobs:
             layouts: >-
               primary_key,indexes sort,time_column primary_key,cluster
               primary_key,indexes,sort,time_column
-          - engine: duckdb
-            mode: file
-            layouts: >-
-              primary_key indexes sort primary_key,indexes primary_key,sort
-              primary_key,indexes,sort,time_column
-          - engine: duckdb
-            mode: memory
-            layouts: primary_key,indexes primary_key,indexes,sort,time_column
           - engine: arrow
             mode: memory
             layouts: >-

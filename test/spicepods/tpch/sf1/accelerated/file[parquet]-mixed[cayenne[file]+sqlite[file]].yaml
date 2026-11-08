@@ -1,0 +1,34 @@
+version: v1
+kind: Spicepod
+name: file[parquet]-mixed[cayenne[file]+sqlite[file]]
+datasets:
+  - from: file:data/customer.parquet
+    name: customer
+    acceleration: &acceleration_cayenne
+      enabled: true
+      engine: cayenne
+      mode: file
+  - from: file:data/lineitem.parquet
+    name: lineitem
+    acceleration: &acceleration_sqlite
+      enabled: true
+      engine: sqlite
+      mode: file
+  - from: file:data/nation.parquet
+    name: nation
+    acceleration: *acceleration_cayenne
+  - from: file:data/orders.parquet
+    name: orders
+    acceleration: *acceleration_cayenne
+  - from: file:data/part.parquet
+    name: part
+    acceleration: *acceleration_cayenne
+  - from: file:data/partsupp.parquet
+    name: partsupp
+    acceleration: *acceleration_sqlite
+  - from: file:data/region.parquet
+    name: region
+    acceleration: *acceleration_sqlite
+  - from: file:data/supplier.parquet
+    name: supplier
+    acceleration: *acceleration_sqlite

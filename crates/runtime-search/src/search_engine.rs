@@ -74,7 +74,7 @@ use crate::types::VectorSearchResult;
 pub struct SearchEngine<E: TableProviderExplorer> {
     pub df: Arc<dyn QueryEngine>,
 
-    explicit_primary_keys: HashMap<TableReference, Vec<String>>,
+    explicit_primary_keys: ExplicitPrimaryKeys,
 
     search_cache: Option<Arc<dyn TabledCacheProvider<CachedSearchResult> + Send + Sync>>,
 
@@ -84,7 +84,7 @@ pub struct SearchEngine<E: TableProviderExplorer> {
 impl<E: TableProviderExplorer> SearchEngine<E> {
     pub fn new(
         df: Arc<dyn QueryEngine>,
-        explicit_primary_keys: HashMap<TableReference, Vec<String>>,
+        explicit_primary_keys: ExplicitPrimaryKeys,
         explorer: E,
     ) -> Self {
         SearchEngine {
@@ -590,7 +590,7 @@ impl<E: TableProviderExplorer> SearchEngine<E> {
 
         let search_result = async {
             tracing::info!(target: "task_history", tables = tables.iter().join(","), limit = %limit, "labels");
-            let table_primary_keys = get_primary_keys_with_overrides(&self.df, &tables, &self.explicit_primary_keys)
+            let table_primary_keys = get_primary_keys_with_overrides(&self.df, &tables, &self.explicit_primary_keys.snapshot())
                 .await?;
 
             // Stringify the WHERE filter once; per-table work only rebinds it to each schema.
@@ -922,6 +922,49 @@ async fn get_primary_keys_with_overrides(
         }
     }
     Ok(tbl_to_pks)
+}
+
+/// The primary keys that the installed app declares for its datasets and views (`row_id`).
+/// Clones share one set, which [`Self::update`] replaces when the app changes.
+#[derive(Clone, Debug, Default)]
+pub struct ExplicitPrimaryKeys(Arc<std::sync::RwLock<HashMap<TableReference, Vec<String>>>>);
+
+impl ExplicitPrimaryKeys {
+    /// Replaces the keys with those of the app in `app`.
+    pub async fn update(&self, app: Arc<tokio::sync::RwLock<Option<Arc<app::App>>>>) {
+        let keys = parse_explicit_primary_keys(app).await;
+        *self
+            .0
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = keys;
+    }
+
+    #[must_use]
+    pub fn get(&self, table: &TableReference) -> Option<Vec<String>> {
+        self.read().get(table).cloned()
+    }
+
+    #[must_use]
+    pub fn snapshot(&self) -> HashMap<TableReference, Vec<String>> {
+        self.read().clone()
+    }
+
+    #[must_use]
+    pub fn ptr_eq(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.0, &other.0)
+    }
+
+    fn read(&self) -> std::sync::RwLockReadGuard<'_, HashMap<TableReference, Vec<String>>> {
+        self.0
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+}
+
+impl From<HashMap<TableReference, Vec<String>>> for ExplicitPrimaryKeys {
+    fn from(keys: HashMap<TableReference, Vec<String>>) -> Self {
+        Self(Arc::new(std::sync::RwLock::new(keys)))
+    }
 }
 
 /// Compute the primary keys for each table in the app.

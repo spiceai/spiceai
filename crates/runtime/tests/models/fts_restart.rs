@@ -63,11 +63,11 @@ fn duckdb_docs_dataset(source: &str, db_path: &str) -> Dataset {
     dataset.columns = docs_columns();
     dataset.acceleration = Some(Acceleration {
         enabled: true,
-        engine: Some("duckdb".to_string()),
+        engine: Some("cayenne".to_string()),
         mode: Mode::File,
         refresh_mode: Some(RefreshMode::Full),
         params: Some(Params::from_string_map(HashMap::from([(
-            "duckdb_file".to_string(),
+            "cayenne_file_path".to_string(),
             db_path.to_string(),
         )]))),
         ..Acceleration::default()

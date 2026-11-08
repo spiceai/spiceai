@@ -78,7 +78,6 @@ mod cache;
 mod catalog;
 mod cayenne;
 mod cayenne_catalog_ddl;
-#[cfg(feature = "duckdb")]
 mod clickbench;
 mod clickhouse;
 mod cluster;
@@ -164,6 +163,7 @@ mod results_cache;
 mod results_cache_warmup;
 #[cfg(all(unix, feature = "duckdb", feature = "postgres"))]
 mod retention;
+mod rustfs;
 mod s3;
 mod s3_folder_marker;
 mod s3_location_pruning;
@@ -174,7 +174,7 @@ mod schema_evolution;
 mod sharepoint;
 #[cfg(feature = "snapshots")]
 mod snapshot_integration;
-#[cfg(all(feature = "snapshots", feature = "duckdb"))]
+#[cfg(feature = "snapshots")]
 mod snapshot_source;
 #[cfg(feature = "snowflake")]
 mod snowflake;
@@ -194,10 +194,10 @@ mod utils;
 mod view;
 
 mod management;
-// MySQL is required for the rehydration tests (source container); the
-// local-db verification covers whichever persistent engines are enabled.
 mod podswatcher;
-#[cfg(all(feature = "mysql", any(feature = "duckdb", feature = "sqlite")))]
+// MySQL is required for the rehydration tests (source container); they cover Cayenne,
+// and SQLite when that feature is enabled.
+#[cfg(feature = "mysql")]
 mod rehydration;
 mod shutdown;
 
