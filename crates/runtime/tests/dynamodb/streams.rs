@@ -628,6 +628,27 @@ fn corrupt_checkpoint_for_shard_not_found(cayenne_path: &str, dataset_name: &str
     .expect("Failed to update checkpoint");
 }
 
+/// Fails when the checkpoint no longer holds the shard IDs that
+/// [`corrupt_checkpoint_for_shard_not_found`] wrote, because something rewrote it before the
+/// next phase started. Every later assertion in these tests depends on that corruption: a
+/// rewritten, valid checkpoint resumes the stream instead of forcing a rebootstrap.
+fn assert_checkpoint_still_corrupted(cayenne_path: &str, dataset_name: &str) {
+    let conn =
+        rusqlite::Connection::open(std::path::Path::new(cayenne_path).join("metadata/cayenne.db"))
+            .expect("Failed to open Cayenne metastore");
+    let (checkpoint_data, updated_at): (String, String) = conn
+        .query_row(
+            "SELECT checkpoint_data, CAST(updated_at AS TEXT) FROM spice_sys_dynamodb_streams WHERE dataset_name = ?",
+            [dataset_name],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .expect("Failed to read checkpoint");
+    assert!(
+        checkpoint_data.contains("fake-nonexistent-shard-"),
+        "The checkpoint was rewritten after the test corrupted it (updated_at {updated_at}), so a runtime from an earlier phase is still streaming: {checkpoint_data}"
+    );
+}
+
 /// Deletes rows from the accelerated table to verify rebootstrap restores them.
 async fn delete_rows_from_acceleration(
     cayenne_path: &str,
@@ -858,6 +879,11 @@ async fn dynamodb_rebootstrap_removes_rows_deleted_from_source() -> anyhow::Resu
             // Corrupt checkpoint (20 h ago) to trigger rebootstrap on next startup.
             corrupt_checkpoint_for_shard_not_found(cayenne_path_str, table_name, 20);
 
+            // Give anything still running from Phase 1 time to write, then check that the
+            // corrupted checkpoint survived.
+            sleep(Duration::from_secs(5)).await;
+            assert_checkpoint_still_corrupted(cayenne_path_str, table_name);
+
             // Phase 3: Restart Spice — rebootstrap must replace the table, not append to it.
             // DynamoDB still has 5 rows; after Overwrite rebootstrap, the 3 phantoms are gone.
             {
@@ -1050,6 +1076,11 @@ async fn dynamodb_shard_not_found_expired_checkpoint_ready_after_load() -> anyho
             insert_rows(&client, table_name, 5..8).await;
             wait_for_dynamodb_source_rows(&client, table_name, 8, 30).await?;
 
+            // Give anything still running from Phase 1 time to write, then check that the
+            // corrupted checkpoint survived.
+            sleep(Duration::from_secs(5)).await;
+            assert_checkpoint_still_corrupted(cayenne_path_str, table_name);
+
             // === PHASE 3: Start Spice again - should detect ShardNotFound and rebootstrap ===
             {
                 let app = AppBuilder::new("dynamodb_ready_after_load_phase3")
@@ -1168,6 +1199,11 @@ async fn dynamodb_shard_not_found_expired_checkpoint_ready_before_load() -> anyh
             // Add new records to DynamoDB while Spice is down
             insert_rows(&client, table_name, 5..8).await;
             wait_for_dynamodb_source_rows(&client, table_name, 8, 30).await?;
+
+            // Give anything still running from Phase 1 time to write, then check that the
+            // corrupted checkpoint survived.
+            sleep(Duration::from_secs(5)).await;
+            assert_checkpoint_still_corrupted(cayenne_path_str, table_name);
 
             // === PHASE 3: Start Spice again - should detect ShardNotFound and rebootstrap ===
             {
