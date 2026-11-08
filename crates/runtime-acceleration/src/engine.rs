@@ -17,7 +17,7 @@ use std::fmt::Display;
 /// that sets one fails with [`removed_engine_message`], which names the fix, rather than
 /// with the unknown-engine error. Spice never switches such an acceleration to Cayenne on
 /// its own: rebuilding it would discard data its source may not have.
-const REMOVED_ENGINES: &[&str] = &["turso"];
+const REMOVED_ENGINES: &[&str] = &["duckdb", "turso"];
 
 /// Where the migration from a removed engine to Cayenne is documented.
 pub const CAYENNE_MIGRATION_DOCS: &str =
@@ -98,7 +98,6 @@ impl TryFrom<&str> for Engine {
         }
         match name.as_str() {
             "arrow" => Ok(Engine::Arrow),
-            "duckdb" => Ok(Engine::DuckDB),
             "sqlite" => Ok(Engine::Sqlite),
             "postgres" | "postgresql" => Ok(Engine::PostgreSQL),
             "cayenne" | "vortex" => Ok(Engine::Cayenne),
@@ -124,11 +123,20 @@ mod tests {
 
     #[test]
     fn a_removed_engine_fails_with_the_removal_message() {
-        for spelling in ["turso", "Turso", "TURSO"] {
-            let err = Engine::try_from(spelling).expect_err("turso is removed");
+        for (spelling, engine) in [
+            ("turso", "turso"),
+            ("Turso", "turso"),
+            ("TURSO", "turso"),
+            ("duckdb", "duckdb"),
+            ("DuckDB", "duckdb"),
+            ("DUCKDB", "duckdb"),
+        ] {
+            let err = Engine::try_from(spelling).expect_err("the engine is removed");
             assert_eq!(
                 err.to_string(),
-                "the acceleration engine `turso` is no longer supported as of v2.5 and cannot be used. Set `acceleration.engine: cayenne`, or remove `engine` to use the default, which is `cayenne`, then delete the old engine's acceleration files and snapshots. See: https://spiceai.org/docs/components/data-accelerators/cayenne/migration",
+                format!(
+                    "the acceleration engine `{engine}` is no longer supported as of v2.5 and cannot be used. Set `acceleration.engine: cayenne`, or remove `engine` to use the default, which is `cayenne`, then delete the old engine's acceleration files and snapshots. See: https://spiceai.org/docs/components/data-accelerators/cayenne/migration"
+                ),
                 "{spelling}"
             );
         }
@@ -139,7 +147,7 @@ mod tests {
         let err = Engine::try_from("nosuchengine").expect_err("unknown engine");
         assert_eq!(
             err.to_string(),
-            "Unknown acceleration engine 'nosuchengine'. Valid engines are: arrow, duckdb, sqlite, postgres/postgresql, cayenne/vortex. Docs: https://spiceai.org/docs/components/data-accelerators"
+            "Unknown acceleration engine 'nosuchengine'. Valid engines are: arrow, sqlite, postgres/postgresql, cayenne/vortex. Docs: https://spiceai.org/docs/components/data-accelerators"
         );
     }
 }

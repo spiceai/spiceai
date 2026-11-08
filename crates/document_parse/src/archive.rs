@@ -862,8 +862,8 @@ fn predicts_final_flate(filters: &[PdfFilter], entry: PredictorEntry) -> bool {
 fn parse_decode_parms(data: &[u8]) -> DecodeParms {
     if data.first() != Some(&b'[') {
         return match decode_parms_entry_predicts(data) {
-            Some(false) => DecodeParms::NoPredictor,
-            Some(true) => DecodeParms::Predictor(PredictorEntry::Dictionary),
+            Some((false, _)) => DecodeParms::NoPredictor,
+            Some((true, _)) => DecodeParms::Predictor(PredictorEntry::Dictionary),
             None => DecodeParms::Unverifiable,
         };
     }
@@ -880,38 +880,46 @@ fn parse_decode_parms(data: &[u8]) -> DecodeParms {
             }
             None => return DecodeParms::Unverifiable,
             Some(_) => {
-                match decode_parms_entry_predicts(&data[i..]) {
-                    Some(false) => {}
-                    Some(true) if predictor.is_none() => predictor = Some(index),
-                    Some(true) | None => return DecodeParms::Unverifiable,
+                let Some((predicts, len)) = decode_parms_entry_predicts(&data[i..]) else {
+                    return DecodeParms::Unverifiable;
+                };
+                if predicts && predictor.replace(index).is_some() {
+                    return DecodeParms::Unverifiable;
                 }
-                match skip_value(&data[i..], 1) {
-                    Some(len) => i += len,
-                    None => return DecodeParms::Unverifiable,
-                }
+                i += len;
                 index += 1;
             }
         }
     }
 }
 
-/// Whether one `/DecodeParms` entry declares a predictor among its own keys:
-/// `Some(false)` for `null` or a dictionary without one, `Some(true)` for a
-/// dictionary with one, and `None` when that cannot be decided (an indirect
-/// reference, a predictor nested inside another value, or a parse failure).
-fn decode_parms_entry_predicts(data: &[u8]) -> Option<bool> {
-    if data.starts_with(b"null") && token_ends(data, 4) {
-        return Some(false);
+/// Whether one `/DecodeParms` entry declares a predictor among its own keys,
+/// and how many bytes the entry takes: `Some((false, _))` for `null` or a
+/// dictionary without one, `Some((true, _))` for a dictionary with one, and
+/// `None` when that cannot be decided (an indirect reference, a predictor
+/// nested inside another value, or a parse failure).
+fn decode_parms_entry_predicts(data: &[u8]) -> Option<(bool, usize)> {
+    if let Some(len) = skip_keyword(data, b"null") {
+        return Some((false, len));
     }
-    if !data.starts_with(b"<<") {
+    let (own, nested, len) = predictor_keys_in_dictionary(data, 0)?;
+    (!nested).then_some((own, len))
+}
+
+/// Walks the dictionary at `data[0]` once and reports whether it has a
+/// `/Predictor` or `/P` key of its own, whether a dictionary or array nested in
+/// one of its other values has one, and how many bytes it takes. `None` when it
+/// cannot be parsed or nests past [`MAX_VALUE_DEPTH`].
+fn predictor_keys_in_dictionary(data: &[u8], depth: usize) -> Option<(bool, bool, usize)> {
+    if depth > MAX_VALUE_DEPTH || !data.starts_with(b"<<") {
         return None;
     }
+    let (mut own, mut nested) = (false, false);
     let mut i = 2;
-    let mut predicts = false;
     loop {
         i += ws_len(&data[i..]);
         if data.get(i..i + 2) == Some(b">>") {
-            return Some(predicts);
+            return Some((own, nested, i + 2));
         }
         if data.get(i) != Some(&b'/') {
             return None;
@@ -919,69 +927,44 @@ fn decode_parms_entry_predicts(data: &[u8]) -> Option<bool> {
         let (name, name_len) = read_name(&data[i + 1..]);
         i += 1 + name_len;
         i += ws_len(&data[i..]);
-        if name.as_slice() == b"Predictor" || name.as_slice() == b"P" {
-            predicts = true;
-        } else if decode_parms_has_predictor_at(&data[i..], 1) {
-            return None;
-        }
-        i += skip_value(&data[i..], 1)?;
+        let is_predictor = matches!(&*name, b"Predictor" | b"P");
+        own |= is_predictor;
+        let (inner, value_len) = predictor_in_value(&data[i..], depth + 1)?;
+        nested |= inner && !is_predictor;
+        i += value_len;
     }
 }
 
-/// True when `data` holds a `/Predictor` or `/P` key, searching nested
-/// dictionaries and arrays. Parse failures and excessive nesting count as a
-/// predictor so the caller fails closed.
-fn decode_parms_has_predictor_at(data: &[u8], depth: usize) -> bool {
+/// Whether the value at `data[0]` holds a `/Predictor` or `/P` key, in it or in
+/// any dictionary or array nested in it, and how many bytes the value takes.
+/// The value is read once, nesting included. `None` when it cannot be parsed
+/// or nests past [`MAX_VALUE_DEPTH`]; callers treat that as a predictor, so the
+/// document fails closed.
+fn predictor_in_value(data: &[u8], depth: usize) -> Option<(bool, usize)> {
     if depth > MAX_VALUE_DEPTH {
-        return true;
+        return None;
     }
     match data.first() {
         Some(b'<') if data.get(1) == Some(&b'<') => {
-            let mut i = 2;
-            loop {
-                i += ws_len(&data[i..]);
-                if data.get(i..i + 2) == Some(b">>") {
-                    return false;
-                }
-                if data.get(i) != Some(&b'/') {
-                    return true;
-                }
-                let (name, name_len) = read_name(&data[i + 1..]);
-                i += 1 + name_len;
-                i += ws_len(&data[i..]);
-                if name.as_slice() == b"Predictor" || name.as_slice() == b"P" {
-                    return true;
-                }
-                // Nested DecodeParms arrays/dicts can still hold a predictor.
-                if decode_parms_has_predictor_at(&data[i..], depth + 1) {
-                    return true;
-                }
-                match skip_value(&data[i..], depth + 1) {
-                    Some(len) => i += len,
-                    None => return true,
-                }
-            }
+            predictor_keys_in_dictionary(data, depth).map(|(own, nested, len)| (own || nested, len))
         }
         Some(b'[') => {
+            let mut found = false;
             let mut i = 1;
             loop {
                 i += ws_len(&data[i..]);
                 match data.get(i) {
-                    Some(b']') => return false,
-                    None => return true,
+                    Some(b']') => return Some((found, i + 1)),
+                    None => return None,
                     Some(_) => {
-                        if decode_parms_has_predictor_at(&data[i..], depth + 1) {
-                            return true;
-                        }
-                        match skip_value(&data[i..], depth + 1) {
-                            Some(len) => i += len,
-                            None => return true,
-                        }
+                        let (nested, value_len) = predictor_in_value(&data[i..], depth + 1)?;
+                        found |= nested;
+                        i += value_len;
                     }
                 }
             }
         }
-        _ => false,
+        _ => skip_value(data, depth).map(|len| (false, len)),
     }
 }
 
@@ -1069,7 +1052,7 @@ fn skip_value(data: &[u8], depth: usize) -> Option<usize> {
         Some(b'(') => skip_literal_string(data),
         Some(b'<') => {
             if data.get(1) == Some(&b'<') {
-                parse_dictionary(data, depth + 1).map(|parsed| parsed.consumed)
+                skip_dictionary(data, depth + 1)
             } else {
                 skip_hex_string(data)
             }
@@ -1080,6 +1063,30 @@ fn skip_value(data: &[u8], depth: usize) -> Option<usize> {
         Some(b'n') => skip_keyword(data, b"null"),
         Some(b'+' | b'-' | b'.' | b'0'..=b'9') => skip_number_or_reference(data),
         _ => None,
+    }
+}
+
+/// Skips the `<< … >>` dictionary at `data[0]` as a value, reading each byte
+/// once. Only a stream's own dictionary declares its filters and parameters
+/// ([`parse_dictionary`]); a nested one is skipped whole, so nesting never
+/// multiplies the work.
+fn skip_dictionary(data: &[u8], depth: usize) -> Option<usize> {
+    if depth > MAX_VALUE_DEPTH || !data.starts_with(b"<<") {
+        return None;
+    }
+    let mut i = 2;
+    loop {
+        i += ws_len(&data[i..]);
+        if data.get(i..i + 2) == Some(b">>") {
+            return Some(i + 2);
+        }
+        if data.get(i) != Some(&b'/') {
+            return None;
+        }
+        let (_, name_len) = read_name(&data[i + 1..]);
+        i += 1 + name_len;
+        i += ws_len(&data[i..]);
+        i += skip_value(&data[i..], depth + 1)?;
     }
 }
 
@@ -1841,6 +1848,30 @@ mod tests {
             pdf_too_large_reason(&pdf),
             "its compressed streams decompress to more than 256 MiB, the per-document limit"
         );
+    }
+
+    /// Each `/DecodeParms` value is read once per nesting level, so a stream
+    /// dictionary nested sixteen deep in `/DecodeParms` costs linear time.
+    /// Reading every level twice doubles the work per level; two thousand such
+    /// streams then take minutes and trip the test timeout.
+    #[test]
+    fn scans_deeply_nested_decode_parms_in_linear_time() {
+        let mut value = format!("({})", "x".repeat(64)).into_bytes();
+        for _ in 0..16 {
+            let mut outer = b"<< /DecodeParms ".to_vec();
+            outer.extend_from_slice(&value);
+            outer.extend_from_slice(b" >>");
+            value = outer;
+        }
+        let mut pdf = b"%PDF-1.7\n".to_vec();
+        for object in 1..=2000 {
+            pdf.extend_from_slice(format!("{object} 0 obj\n").as_bytes());
+            pdf.extend_from_slice(&value);
+            pdf.extend_from_slice(b"\nstream\n\nendstream\nendobj\n");
+        }
+        assert_eq!(pdf_streams(&pdf).len(), 2000);
+        ensure_pdf_within_budget(&Bytes::from(pdf))
+            .expect("stored streams with nested parameters are within the budget");
     }
 
     /// Each byte is lexed once, so a document packed with what would cost a

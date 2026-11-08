@@ -1468,6 +1468,12 @@ mod tests {
         ) -> EsResult<Value> {
             Err(unexpected("bulk_index"))
         }
+        async fn bulk_delete_if_unchanged(
+            &self,
+            _docs: &[elasticsearch::DocumentVersion],
+        ) -> EsResult<Value> {
+            Err(unexpected("bulk_delete_if_unchanged"))
+        }
     }
 
     /// A `GET /<index>/_mapping` body naming `fields` under `index`.

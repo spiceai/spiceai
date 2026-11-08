@@ -6466,6 +6466,7 @@ dependencies = [
  "oracle",
  "parking_lot",
  "parquet",
+ "pbjson-types",
  "percent-encoding",
  "pgwire-replication",
  "postgres-native-tls",
@@ -18582,6 +18583,7 @@ dependencies = [
  "llms",
  "model-capabilities",
  "moka",
+ "prost 0.14.3",
  "rayon",
  "runtime-acceleration",
  "runtime-datafusion-index",
@@ -19499,6 +19501,7 @@ dependencies = [
  "itertools 0.14.0",
  "llms",
  "parking_lot",
+ "reqwest 0.13.4",
  "runtime-datafusion-index",
  "runtime-datafusion-udfs",
  "runtime-query-engine",
@@ -20881,8 +20884,6 @@ dependencies = [
 [[package]]
 name = "sqlparser"
 version = "0.62.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "13c6d1b651dc4edf07eead2a0c6c78016ce971bc2c10da5266861b13f25e7cec"
 dependencies = [
  "log",
  "recursive",
