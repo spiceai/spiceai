@@ -1843,6 +1843,30 @@ mod tests {
         );
     }
 
+    /// Each `/DecodeParms` value is read once per nesting level, so a stream
+    /// dictionary nested sixteen deep in `/DecodeParms` costs linear time.
+    /// Reading every level twice doubles the work per level; two thousand such
+    /// streams then take minutes and trip the test timeout.
+    #[test]
+    fn scans_deeply_nested_decode_parms_in_linear_time() {
+        let mut value = format!("({})", "x".repeat(64)).into_bytes();
+        for _ in 0..16 {
+            let mut outer = b"<< /DecodeParms ".to_vec();
+            outer.extend_from_slice(&value);
+            outer.extend_from_slice(b" >>");
+            value = outer;
+        }
+        let mut pdf = b"%PDF-1.7\n".to_vec();
+        for object in 1..=2000 {
+            pdf.extend_from_slice(format!("{object} 0 obj\n").as_bytes());
+            pdf.extend_from_slice(&value);
+            pdf.extend_from_slice(b"\nstream\n\nendstream\nendobj\n");
+        }
+        assert_eq!(pdf_streams(&pdf).len(), 2000);
+        ensure_pdf_within_budget(&Bytes::from(pdf))
+            .expect("stored streams with nested parameters are within the budget");
+    }
+
     /// Each byte is lexed once, so a document packed with what would cost a
     /// rescan per occurrence if each check restarted at the last payload —
     /// `stream` in comment lines or as a bare word, comment lines between a
