@@ -2395,9 +2395,9 @@ mod tests {
 
     /// A loadable single-page PDF whose `/Contents` is object 5, with `decoy`
     /// written in front of it. The cross-reference table points at each
-    /// object's header, so `PDFium` reads object 5 at its offset whatever the
-    /// decoy bytes before it are. `contents` is object 5 from its header on, or
-    /// empty when `decoy` already holds it.
+    /// object's header (its first `5 0`), so `PDFium` reads object 5 at its
+    /// offset whatever the decoy bytes before it are. `contents` is object 5
+    /// from its header on, or empty when `decoy` already holds it.
     fn pdf_with_decoy_before_contents(decoy: &[u8], contents: &[u8]) -> Bytes {
         let objs: [&[u8]; 3] = [
             b"<< /Type /Catalog /Pages 2 0 R >>",
@@ -2416,8 +2416,8 @@ mod tests {
         offsets.push(out.len());
         out.extend_from_slice(decoy);
         out.extend_from_slice(contents);
-        let contents_at = offsets[3]
-            + memmem::find(&out[offsets[3]..], b"5 0 obj").expect("object 5 has a header");
+        let contents_at =
+            offsets[3] + memmem::find(&out[offsets[3]..], b"5 0").expect("object 5 has a header");
         offsets.push(contents_at);
         let xref_pos = out.len();
         out.extend_from_slice(b"xref\n0 6\n0000000000 65535 f \n");
@@ -2434,9 +2434,30 @@ mod tests {
     /// and dictionary, the `stream` keyword, `after_keyword`, then `data`.
     fn flate_contents_object(prefix: &[u8], after_keyword: &[u8], data: &[u8]) -> Vec<u8> {
         let mut obj = prefix.to_vec();
-        obj.extend_from_slice(b"5 0 obj << /Length ");
+        obj.extend_from_slice(&contents_object_spelled(
+            b"5 0 obj ",
+            b" ",
+            after_keyword,
+            data,
+        ));
+        obj
+    }
+
+    /// Object 5, a Flate stream holding `data`, written as `header` (`5 0 obj`
+    /// and what follows it), the dictionary, `before_keyword`, the `stream`
+    /// keyword, `after_keyword`, then `data`.
+    fn contents_object_spelled(
+        header: &[u8],
+        before_keyword: &[u8],
+        after_keyword: &[u8],
+        data: &[u8],
+    ) -> Vec<u8> {
+        let mut obj = header.to_vec();
+        obj.extend_from_slice(b"<< /Length ");
         obj.extend_from_slice(data.len().to_string().as_bytes());
-        obj.extend_from_slice(b" /Filter /FlateDecode >> stream");
+        obj.extend_from_slice(b" /Filter /FlateDecode >>");
+        obj.extend_from_slice(before_keyword);
+        obj.extend_from_slice(b"stream");
         obj.extend_from_slice(after_keyword);
         obj.extend_from_slice(data);
         obj.extend_from_slice(b"\nendstream\nendobj\n");
@@ -2491,7 +2512,76 @@ mod tests {
                 Vec::new(),
                 flate_contents_object(b"", b"   \n", data),
             ),
+            // `PDFium` reads bytes 0x80 and 0xFF as whitespace between tokens.
+            (
+                "byte 0x80 between the generation number and `obj`",
+                Vec::new(),
+                contents_object_spelled(b"5 0\x80obj ", b" ", b"\n", data),
+            ),
+            (
+                "byte 0xFF between `obj` and the dictionary",
+                Vec::new(),
+                contents_object_spelled(b"5 0 obj\xff", b" ", b"\n", data),
+            ),
+            (
+                "byte 0x80 between the dictionary and `stream`",
+                Vec::new(),
+                contents_object_spelled(b"5 0 obj ", b"\x80", b"\n", data),
+            ),
+            (
+                "byte 0xFF between the dictionary and `stream`",
+                Vec::new(),
+                contents_object_spelled(b"5 0 obj ", b"\xff", b"\n", data),
+            ),
+            (
+                "byte 0x80 between `stream` and its end-of-line",
+                Vec::new(),
+                contents_object_spelled(b"5 0 obj ", b" ", b"\x80\n", data),
+            ),
+            (
+                "a comment between the generation number and `obj`",
+                Vec::new(),
+                contents_object_spelled(b"5 0 %c\nobj ", b" ", b"\n", data),
+            ),
         ]
+    }
+
+    /// Page text that spells object syntax after a word that is not a number
+    /// (`prefix obj << /Filter /LZWDecode >>stream`) is not an object header,
+    /// so it neither adds a stream that cannot be budgeted nor hides one. The
+    /// page stream is stored, so the text sits in the document as written, and
+    /// `PDFium` must load it and read it back.
+    #[tokio::test]
+    async fn accepts_page_text_that_spells_object_syntax() {
+        use crate::DocumentParser as _;
+        for text in [
+            b"(prefix obj << /Filter /LZWDecode >>stream) Tj".as_slice(),
+            b"(see obj << /Unfinished) Tj".as_slice(),
+        ] {
+            let mut content = b"BT /F1 24 Tf 72 700 Td ".to_vec();
+            content.extend_from_slice(text);
+            content.extend_from_slice(b" ET");
+            let mut object = b"5 0 obj << /Length ".to_vec();
+            object.extend_from_slice(content.len().to_string().as_bytes());
+            object.extend_from_slice(b" >> stream\n");
+            object.extend_from_slice(&content);
+            object.extend_from_slice(b"\nendstream\nendobj\n");
+            let pdf = pdf_with_decoy_before_contents(b"", &object);
+            let shown = String::from_utf8_lossy(text);
+            ensure_pdf_within_budget(&pdf).unwrap_or_else(|e| {
+                panic!("{shown}: page text must not be read as an object: {e}")
+            });
+            let read = crate::PdfParser::default()
+                .parse(&pdf)
+                .await
+                .unwrap_or_else(|e| panic!("{shown}: PDFium should load the document: {e}"))
+                .as_flat_utf8()
+                .expect("flat utf8 text");
+            assert!(
+                read.contains("obj <<"),
+                "{shown}: PDFium should read the page text, got {read:?}"
+            );
+        }
     }
 
     /// No bytes in front of an object can keep its stream out of the budget,
