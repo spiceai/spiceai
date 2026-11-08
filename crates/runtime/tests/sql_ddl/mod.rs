@@ -31,6 +31,7 @@ use app::{App, AppBuilder};
 use arrow::array::{RecordBatch, StringArray};
 use futures::TryStreamExt;
 use runtime::Runtime;
+use runtime::config::{ClusterConfig, Config, Role};
 use spicepod::component::dataset::Dataset;
 use spicepod::param::Params;
 
@@ -82,11 +83,17 @@ async fn start(fixture: &Fixture) -> Arc<Runtime> {
 
 /// A runtime over `fixture` whose Spicepod is `app`.
 async fn start_with(fixture: &Fixture, app: App) -> Arc<Runtime> {
+    start_configured(fixture, app, Config::default()).await
+}
+
+/// A runtime over `fixture` whose Spicepod is `app`, started with `config`.
+async fn start_configured(fixture: &Fixture, app: App, config: Config) -> Arc<Runtime> {
     register_test_connectors().await;
     let rt = Arc::new(
         Runtime::builder()
             .with_app(app)
             .with_instance_dir(&fixture.instance_dir)
+            .with_runtime_config(config)
             .build()
             .await,
     );
@@ -291,6 +298,75 @@ async fn sql_does_not_change_a_spicepod_dataset() {
                 table(&rt, "SELECT count(*) AS n FROM pod_orders").await,
                 "+---+\n| n |\n+---+\n| 3 |\n+---+"
             );
+        })
+        .await;
+}
+
+/// A sidecar (`--role sidecar`) refuses the statements that define, change,
+/// and remove datasets and catalogs, as it refuses all DDL: its catalog is its
+/// application's view of data the cluster owns. Nothing it refused is served,
+/// or kept across a restart.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_sidecar_refuses_sql_definitions() {
+    test_request_context()
+        .scope(async {
+            let fixture = Fixture::new();
+            let sidecar = || {
+                start_configured(
+                    &fixture,
+                    AppBuilder::new("sql_ddl")
+                        .with_dataset(csv_dataset(&fixture.orders_csv, "pod_orders"))
+                        .build(),
+                    Config {
+                        cluster: ClusterConfig::default().with_role(Role::Sidecar),
+                        ..Config::default()
+                    },
+                )
+            };
+            let rt = sidecar().await;
+            assert_eq!(rt.role(), Role::Sidecar);
+
+            let refusal = "DDL is not allowed on a sidecar. Run CREATE and DROP statements on \
+                 the Spice runtime the sidecar reads from, or start Spice without `--role sidecar`.";
+            for sql in [
+                format!(
+                    "CREATE TABLE orders WITH (from = 'file:{}', file_format = 'csv')",
+                    fixture.orders_csv.display()
+                ),
+                format!(
+                    "CREATE OR REPLACE TABLE pod_orders WITH (from = 'file:{}', file_format = 'csv')",
+                    fixture.other_csv.display()
+                ),
+                "ALTER TABLE pod_orders SET (description = 'All orders')".to_string(),
+                "DROP TABLE IF EXISTS orders".to_string(),
+                "CREATE CATALOG lake WITH (from = 'ducklake', ducklake_connection_string = 'metadata.ducklake')"
+                    .to_string(),
+                "DROP CATALOG IF EXISTS lake".to_string(),
+            ] {
+                let err = error(&rt, &sql).await;
+                assert!(err.contains(refusal), "{sql}: {err}");
+            }
+
+            // The Spicepod's dataset is served as it was, and SQL defined nothing.
+            let pod_orders = table(&rt, "SELECT * FROM pod_orders ORDER BY id").await;
+            assert_eq!(
+                pod_orders,
+                "+----+-------+--------+\n\
+                 | id | name  | amount |\n\
+                 +----+-------+--------+\n\
+                 | 1  | alpha | 10.5   |\n\
+                 | 2  | beta  | 20.25  |\n\
+                 | 3  | gamma |        |\n\
+                 +----+-------+--------+"
+            );
+            let missing = error(&rt, "SELECT * FROM orders").await;
+            assert!(missing.contains("table 'spice.public.orders' not found"), "{missing}");
+
+            drop(rt);
+            let rt = sidecar().await;
+            assert_eq!(table(&rt, "SELECT * FROM pod_orders ORDER BY id").await, pod_orders);
+            let missing = error(&rt, "SELECT * FROM orders").await;
+            assert!(missing.contains("table 'spice.public.orders' not found"), "{missing}");
         })
         .await;
 }
