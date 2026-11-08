@@ -873,7 +873,22 @@ pub fn routable_address() -> Result<std::net::IpAddr> {
     Ok(ip)
 }
 
+/// A port no listener on this machine's loopback holds; see [`free_port_on`].
 pub fn free_port() -> Result<u16> {
+    free_port_on(std::net::Ipv4Addr::LOCALHOST.into())
+}
+
+/// Whether a listener could bind `ip:port` now. Probing the wildcard address
+/// also finds a listener on any single address, such as `127.0.0.2`, that a
+/// loopback probe misses.
+fn port_is_free(ip: std::net::IpAddr, port: u16) -> bool {
+    std::net::TcpListener::bind((ip, port)).is_ok()
+}
+
+/// A port this run has not given out and that a listener could bind on `ip`.
+/// Pass the address the port will be served on: a port for a server that
+/// listens on every interface must be probed on `0.0.0.0`.
+pub fn free_port_on(ip: std::net::IpAddr) -> Result<u16> {
     const LOW: u16 = 20000;
     const HIGH: u16 = 32768;
     static GIVEN: std::sync::LazyLock<parking_lot::Mutex<std::collections::HashSet<u16>>> =
@@ -888,8 +903,7 @@ pub fn free_port() -> Result<u16> {
         let offset =
             NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed) % u32::from(HIGH - LOW);
         let port = LOW + u16::try_from(offset).unwrap_or(0);
-        if GIVEN.lock().contains(&port) || std::net::TcpListener::bind(("127.0.0.1", port)).is_err()
-        {
+        if GIVEN.lock().contains(&port) || !port_is_free(ip, port) {
             continue;
         }
         if GIVEN.lock().insert(port) {
@@ -983,6 +997,23 @@ mod port_tests {
             );
             assert!(seen.insert(port), "port {port} was given out twice");
         }
+    }
+
+    /// Linux routes all of 127.0.0.0/8 to loopback, so a listener on
+    /// 127.0.0.2 leaves 127.0.0.1 bindable while it blocks the wildcard.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_wildcard_probe_sees_a_listener_on_another_local_address() {
+        let held = std::net::TcpListener::bind(("127.0.0.2", 0)).expect("listen on 127.0.0.2");
+        let port = held.local_addr().expect("local addr").port();
+        assert!(super::port_is_free(
+            std::net::Ipv4Addr::LOCALHOST.into(),
+            port
+        ));
+        assert!(!super::port_is_free(
+            std::net::Ipv4Addr::UNSPECIFIED.into(),
+            port
+        ));
     }
 }
 

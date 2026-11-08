@@ -1040,12 +1040,19 @@ async fn create_instances(
                 source_ctx.insert(name.clone(), Value::Object(entry));
                 namespaces.insert(name.clone(), namespace);
             }
+            // `spiced` serves HTTP on every interface when `rootless_reach`
+            // is set, so its port must be free on the wildcard address too.
+            let http_port = crate::docker::free_port_on(if rootless_reach {
+                std::net::Ipv4Addr::UNSPECIFIED.into()
+            } else {
+                std::net::Ipv4Addr::LOCALHOST.into()
+            })?;
             let context = json!({
                 "sources": source_ctx,
                 "matrix": combo,
                 "variant": { "name": variant_name },
                 "instance": { "name": label, "dir": dir.display().to_string(), "port": crate::docker::free_port()?,
-                    "executor_port": crate::docker::free_port()?, "http_port": crate::docker::free_port()?,
+                    "executor_port": crate::docker::free_port()?, "http_port": http_port,
                     "flight_port": crate::docker::free_port()?,
                     "host_from_container": host_from_container },
                 "script": { "dir": std::path::absolute(&script.dir)?.display().to_string() },
