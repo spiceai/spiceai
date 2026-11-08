@@ -47,11 +47,20 @@ impl Runtime {
         params: HashMap<String, SecretString>,
         capabilities: &ModelCapabilities,
     ) -> Result<LoadedLlm> {
-        let completions_model = try_to_chat_model(&m, &params, Arc::new(self.clone()))
-            .await
-            .boxed()
-            .map_err(try_map_boxed_error_to_box)
-            .context(UnableToInitializeLlmSnafu)?;
+        // One controller for the requests the model's provider client sends, given to its chat
+        // and its Responses client alike, so they share the model's rate limits.
+        let provider_rate_controller =
+            crate::model::rate_limit::build_model_rate_controller(&m, &params);
+        let completions_model = try_to_chat_model(
+            &m,
+            &params,
+            Arc::new(self.clone()),
+            Some(&provider_rate_controller),
+        )
+        .await
+        .boxed()
+        .map_err(try_map_boxed_error_to_box)
+        .context(UnableToInitializeLlmSnafu)?;
 
         completions_model
             .chat
@@ -90,8 +99,13 @@ impl Runtime {
             });
         }
 
-        let mut responses_model = match try_to_responses_model(&m, &params, Arc::new(self.clone()))
-            .await
+        let mut responses_model = match try_to_responses_model(
+            &m,
+            &params,
+            Arc::new(self.clone()),
+            Some(&provider_rate_controller),
+        )
+        .await
         {
             Ok(model) => Some(model),
             Err(e) => {

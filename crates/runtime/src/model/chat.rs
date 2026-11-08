@@ -126,10 +126,16 @@ macro_rules! extract_secret {
 }
 
 /// Attempt to derive a runnable Chat model from a given component from the Spicepod definition.
+///
+/// `provider_rate_controller` limits the requests a provider client that takes the model's own
+/// rate limits sends (Darkbloom's). A model load passes the one controller it also gives the
+/// model's Responses client, so chat and Responses share the model's `max_concurrency` and
+/// `requests_per_minute_limit`; `None` builds one for this client alone.
 pub async fn try_to_chat_model(
     component: &Model,
     params: &HashMap<String, SecretString>,
     rt: Arc<Runtime>,
+    provider_rate_controller: Option<&Arc<RateController>>,
 ) -> Result<LoadedChatModel, LlmError> {
     let secrets = rt.secrets();
     let model = construct_model(
@@ -138,6 +144,7 @@ pub async fn try_to_chat_model(
         &secrets,
         rt.token_provider_registry(),
         rt.df.cluster_config.allow_insecure_connections(),
+        provider_rate_controller,
     )
     .await?;
 
@@ -224,6 +231,7 @@ pub async fn construct_model(
     secrets: &Arc<RwLock<Secrets>>,
     token_registry: Arc<TokenProviderRegistry>,
     allow_insecure_connections: bool,
+    provider_rate_controller: Option<&Arc<RateController>>,
 ) -> Result<Arc<dyn Chat>, LlmError> {
     let model_id = component.get_model_id();
     let source = component.get_source().ok_or(LlmError::UnknownModelSource {
@@ -317,7 +325,7 @@ pub async fn construct_model(
             let p =
                 typed_params::<DarkbloomModelParams>(component, params, source.clone(), secrets)
                     .await?;
-            darkbloom(component, model_id, params, &p)
+            darkbloom(component, model_id, params, &p, provider_rate_controller)
         }
     }?;
 
@@ -779,20 +787,30 @@ fn darkbloom(
     model_id: Option<String>,
     raw_params: &HashMap<String, SecretString>,
     params: &DarkbloomModelParams,
+    provider_rate_controller: Option<&Arc<RateController>>,
 ) -> Result<Arc<dyn Chat>, LlmError> {
-    Ok(Arc::new(darkbloom_client(component, model_id, raw_params, params)?) as Arc<dyn Chat>)
+    Ok(Arc::new(darkbloom_client(
+        component,
+        model_id,
+        raw_params,
+        params,
+        provider_rate_controller,
+    )?) as Arc<dyn Chat>)
 }
 
 /// The Darkbloom client of a `from: darkbloom` model, which serves its chat completions and,
-/// natively, the Responses API. Its requests take permits from a controller built from the
-/// model's own rate limits (`max_concurrency`, `requests_per_minute_limit`, or Darkbloom's
-/// defaults), so those limits apply to every request, not only to the SQL functions that call
-/// the model.
+/// natively, the Responses API. Its requests take permits from `provider_rate_controller`, the
+/// controller a model load builds once from the model's own rate limits (`max_concurrency`,
+/// `requests_per_minute_limit`, or Darkbloom's defaults) and gives both its chat and its
+/// Responses client, so those limits apply to every request the model sends, whichever API it
+/// serves, and not only to the SQL functions that call the model. `None` builds one from the
+/// same limits for this client alone.
 pub(crate) fn darkbloom_client(
     component: &Model,
     model_id: Option<String>,
     raw_params: &HashMap<String, SecretString>,
     params: &DarkbloomModelParams,
+    provider_rate_controller: Option<&Arc<RateController>>,
 ) -> Result<llms::darkbloom::Darkbloom, LlmError> {
     let Some(model_id) = model_id else {
         return Err(LlmError::ModelNotProvided {
@@ -806,10 +824,13 @@ pub(crate) fn darkbloom_client(
             source: darkbloom_missing_key_message(&component.name).into(),
         });
     };
-    // A controller of its own, built from the same limits as the one the runtime registers for
-    // the model: an `ai_*` SQL call holds a permit from that one while it calls the model, so
-    // sharing it would take two permits per request from one pool and deadlock under load.
-    let rate_controller = super::rate_limit::build_model_rate_controller(component, raw_params);
+    // Not the controller the runtime registers for the model's SQL functions, though built from
+    // the same limits: an `ai_*` SQL call holds a permit from that one while it calls the model,
+    // so sharing it would take two permits per request from one pool and deadlock under load.
+    let rate_controller = provider_rate_controller.map_or_else(
+        || super::rate_limit::build_model_rate_controller(component, raw_params),
+        Arc::clone,
+    );
     Ok(
         llms::darkbloom::Darkbloom::new(model_id, api_key, Some(params.endpoint.as_str()))
             .with_rate_controller(rate_controller),
