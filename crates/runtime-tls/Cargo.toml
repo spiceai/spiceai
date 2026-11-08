@@ -34,5 +34,9 @@ time = { version = "0.3", features = ["macros"] }
 name = "integration"
 path = "tests/integration.rs"
 
+[[bench]]
+harness = false
+name = "client_auth_handshake"
+
 [lints]
 workspace = true
