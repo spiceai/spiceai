@@ -26,6 +26,7 @@ pub mod google;
 pub mod huggingface;
 pub mod model2vec;
 pub mod openai;
+pub mod spiceai;
 
 use std::str::FromStr;
 
