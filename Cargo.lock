@@ -18728,15 +18728,18 @@ dependencies = [
  "futures",
  "notify",
  "opentelemetry 0.32.0",
+ "rcgen",
  "rustls",
  "sha2 0.10.9",
  "snafu",
  "tempfile",
+ "time",
  "tokio",
  "tokio-rustls",
  "tokio-stream",
  "tracing",
  "x509-certificate",
+ "x509-parser 0.18.1",
 ]
 
 [[package]]

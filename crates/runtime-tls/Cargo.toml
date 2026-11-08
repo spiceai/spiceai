@@ -1,4 +1,5 @@
 [package]
+autotests = false
 description = "Public-endpoint TLS for the Spice runtime: server config with hot-reloadable certificates and a Flight mTLS acceptor"
 edition.workspace = true
 homepage.workspace = true
@@ -16,14 +17,22 @@ opentelemetry.workspace = true
 rustls.workspace = true
 sha2.workspace = true
 snafu.workspace = true
+time = { version = "0.3", features = ["formatting"] }
 tokio = { workspace = true, features = ["net", "sync"] }
 tokio-rustls = "0.26.0"
 tokio-stream = { workspace = true, features = ["net"] }
 tracing.workspace = true
 x509-certificate.workspace = true
+x509-parser = "0.18"
 
 [dev-dependencies]
+rcgen = { version = "0.14", default-features = false, features = ["pem", "aws_lc_rs"] }
 tempfile.workspace = true
+time = { version = "0.3", features = ["macros"] }
+
+[[test]]
+name = "integration"
+path = "tests/integration.rs"
 
 [lints]
 workspace = true
