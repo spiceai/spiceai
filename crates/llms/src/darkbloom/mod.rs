@@ -206,6 +206,7 @@ mod tests {
         ChatCompletionRequestMessage, ChatCompletionRequestUserMessage,
         ChatCompletionRequestUserMessageContent,
     };
+    use async_openai::types::responses::ResponseStreamEvent;
     use futures::StreamExt;
     use serde_json::json;
     use wiremock::matchers::{body_partial_json, header, method, path};
@@ -372,10 +373,7 @@ mod tests {
             model.chat_request(request("m", false)),
         )
         .await;
-        assert!(
-            waited.is_err(),
-            "the request must wait for the permit the test holds"
-        );
+        waited.expect_err("the request must wait for the permit the test holds");
         let received = server.received_requests().await.unwrap_or_default();
         assert!(
             received.is_empty(),
@@ -477,10 +475,12 @@ mod tests {
             .await;
 
         assert_eq!(items.len(), 2, "one event, then the error: {items:?}");
+        let first = items[0]
+            .as_ref()
+            .expect("the first event is response.created");
         assert!(
-            items[0].is_ok(),
-            "the first event is response.created: {:?}",
-            items[0]
+            matches!(first, ResponseStreamEvent::ResponseCreated(_)),
+            "the first event is response.created: {first:?}"
         );
         let Err(OpenAIError::ApiError(error)) = &items[1] else {
             panic!(
