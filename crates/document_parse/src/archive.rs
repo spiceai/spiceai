@@ -1036,9 +1036,12 @@ fn ws_len(data: &[u8]) -> usize {
     i
 }
 
-/// A PDF name token (without its leading `/`), with `#XX` hex escapes decoded,
+/// A PDF name token (without its leading `/`), with `#XX` escapes decoded,
 /// and the number of raw bytes consumed. Decoding escapes is what makes an
-/// obfuscated `/Fl#61teDecode` classify as `FlateDecode`.
+/// obfuscated `/Fl#61teDecode` classify as `FlateDecode`. Escapes decode as
+/// `PDFium` decodes them: `#` and the two bytes after it, wherever it is not
+/// among the last two bytes of the name, with a digit that is not hex read as
+/// 0, so `/Decode#5zarms` is `/DecodeParms`.
 fn read_name(data: &[u8]) -> (Cow<'_, [u8]>, usize) {
     let len = data
         .iter()
@@ -1051,10 +1054,9 @@ fn read_name(data: &[u8]) -> (Cow<'_, [u8]>, usize) {
     let mut name = Vec::with_capacity(len);
     let mut i = 0;
     while i < len {
-        if token[i] == b'#'
-            && i + 2 < len
-            && let (Some(hi), Some(lo)) = (hex_value(token[i + 1]), hex_value(token[i + 2]))
-        {
+        if token[i] == b'#' && i + 2 < len {
+            let hi = hex_value(token[i + 1]).unwrap_or(0);
+            let lo = hex_value(token[i + 2]).unwrap_or(0);
             name.push((hi << 4) | lo);
             i += 3;
             continue;
