@@ -1456,7 +1456,7 @@ jobs:
       # and table counts. Concurrent runs write identical bytes, so they cannot disturb
       # each other.
       - name: Restore the Hadoop warehouse fixture in MinIO
-        if: env.HAS_TEST_MINIO_SECRET == 'true'
+        if: env.HAS_RUSTFS_ACCESS == 'true'
         run: |
           set -euo pipefail
           fixture=crates/data_components/tests/hadoop_data/warehouse
