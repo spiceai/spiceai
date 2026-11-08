@@ -1,0 +1,129 @@
+name: duckdb-hugeint
+description: >
+  A DuckDB HUGEINT holds up to 39 digits, but DuckDB exports it to Arrow as
+  Decimal128(38, 0), whose values have at most 38. Through `duckdb:` and
+  through `adbc:` with the DuckDB driver, every HUGEINT that fits 38 digits
+  answers exactly as the DuckDB CLI prints it, and a query that reads one
+  past 38 digits fails with an error naming the value instead of answering
+  with its last digit missing (#15869). Each route reads its own DuckDB file,
+  because direct ADBC opens its file read-write and holds the lock.
+
+sources:
+  ddb: { kind: duckdb }
+  adb: { kind: duckdb }
+
+spicepod:
+  version: v1
+  kind: Spicepod
+  name: duckdb-hugeint
+  datasets:
+    - from: duckdb:main.wide
+      name: wide
+      params: ${sources.ddb.params}
+    - from: adbc:wide
+      name: wide_adbc
+      params: ${sources.adb.adbc_params}
+    - from: duckdb:main.nested
+      name: nested
+      params: ${sources.ddb.params}
+
+steps:
+  # HUGEINT's largest and smallest values have 39 digits; the rest fit 38.
+  - source-exec:
+      ddb: &seed |
+        CREATE TABLE wide (id INTEGER, h HUGEINT);
+        INSERT INTO wide VALUES
+          (1, 170141183460469231731687303715884105727),
+          (2, 99999999999999999999999999999999999999),
+          (3, 12345),
+          (4, -170141183460469231731687303715884105728),
+          (5, -99999999999999999999999999999999999999),
+          (6, NULL);
+  - source-exec:
+      adb: *seed
+  # The same values inside a STRUCT, a LIST and a UNION, which DuckDB exports
+  # as an Arrow struct, list and sparse union of Decimal128(38, 0).
+  - source-exec:
+      ddb: |
+        CREATE TABLE nested (id INTEGER, s STRUCT(h HUGEINT), l HUGEINT[], u UNION(h HUGEINT, t VARCHAR));
+        INSERT INTO nested VALUES
+          (1, {'h': 170141183460469231731687303715884105727}, [1, 170141183460469231731687303715884105727], union_value(h := 170141183460469231731687303715884105727::HUGEINT)),
+          (2, {'h': 7}, [7, NULL], union_value(t := 'x')),
+          (3, NULL, NULL, union_value(h := 5::HUGEINT));
+  - source-query:
+      ddb: SELECT id, h FROM wide ORDER BY id
+    expect:
+      rows:
+        - [1, '170141183460469231731687303715884105727']
+        - [2, '99999999999999999999999999999999999999']
+        - [3, '12345']
+        - [4, '-170141183460469231731687303715884105728']
+        - [5, '-99999999999999999999999999999999999999']
+        - [6, null]
+  - start: {}
+
+  # The filter reaches DuckDB, so only rows that fit 38 digits come back.
+  - query: SELECT id, h FROM wide WHERE id IN (2, 3, 5, 6) ORDER BY id
+    expect:
+      rows: &in_range
+        - [2, '99999999999999999999999999999999999999']
+        - [3, '12345']
+        - [5, '-99999999999999999999999999999999999999']
+        - [6, null]
+  - query: SELECT id, h FROM wide_adbc WHERE id IN (2, 3, 5, 6) ORDER BY id
+    expect: { rows: *in_range }
+
+  # A 39-digit value is refused, never answered with a digit missing.
+  - query: SELECT id, h FROM wide WHERE id = 1
+    expect-error: holds the value 170141183460469231731687303715884105727, which has more digits than its type Decimal128(38, 0) allows
+  - query: SELECT id, h FROM wide WHERE id = 4
+    expect-error: holds the value -170141183460469231731687303715884105728, which has more digits than its type Decimal128(38, 0) allows
+  - query: SELECT id, h FROM wide_adbc WHERE id = 1
+    expect-error: holds the value 170141183460469231731687303715884105727, which has more digits than its type Decimal128(38, 0) allows
+  - query: SELECT id, h FROM wide_adbc WHERE id = 4
+    expect-error: holds the value -170141183460469231731687303715884105728, which has more digits than its type Decimal128(38, 0) allows
+  - query: SELECT id, h FROM wide ORDER BY id
+    expect-error: more digits than its type Decimal128(38, 0) allows
+  # DuckDB computes this SUM as a HUGEINT: rows 2 and 3 each fit 38 digits,
+  # but their sum, 100000000000000000000000000000000012344, has 39.
+  - query: SELECT sum(h) AS s FROM wide WHERE id IN (2, 3)
+    expect-error: holds the value 100000000000000000000000000000000012344, which has more digits than its type Decimal128(38, 0) allows
+  - query: SELECT sum(h) AS s FROM wide_adbc WHERE id IN (2, 3)
+    expect-error: holds the value 100000000000000000000000000000000012344, which has more digits than its type Decimal128(38, 0) allows
+
+  # The cast the error suggests reaches DuckDB with the query, so the value
+  # comes back whole.
+  - query: SELECT id, CAST(h AS VARCHAR) AS hs FROM wide WHERE id IN (1, 4) ORDER BY id
+    expect:
+      rows: &as_text
+        - [1, '170141183460469231731687303715884105727']
+        - [4, '-170141183460469231731687303715884105728']
+  - query: SELECT id, CAST(h AS VARCHAR) AS hs FROM wide_adbc WHERE id IN (1, 4) ORDER BY id
+    expect: { rows: *as_text }
+
+  # Inside a STRUCT, a LIST or a UNION, a 39-digit value is refused the same way,
+  # and the message names the field that holds it.
+  - query: SELECT s FROM nested WHERE id = 1
+    expect-error: column 's.h' holds the value 170141183460469231731687303715884105727, which has more digits than its type Decimal128(38, 0) allows
+  - query: SELECT l FROM nested WHERE id = 1
+    expect-error: column 'l' holds the value 170141183460469231731687303715884105727, which has more digits than its type Decimal128(38, 0) allows
+  - query: SELECT u FROM nested WHERE id = 1
+    expect-error: column 'u.h' holds the value 170141183460469231731687303715884105727, which has more digits than its type Decimal128(38, 0) allows
+  # Rows whose nested values fit 38 digits answer, including a NULL struct and
+  # a union row whose HUGEINT member is not the active one.
+  - http:
+      path: /v1/sql
+      headers: { content-type: text/plain }
+      body: SELECT id, s, l, u FROM nested WHERE id IN (2, 3) ORDER BY id
+    expect:
+      status: 200
+      json:
+        - { pointer: '', type: array, length: 2 }
+        - { pointer: /0/id, equals: 2 }
+        - { pointer: /0/s/h, equals: 7 }
+        - { pointer: /0/l, equals: [7, null] }
+        - { pointer: /0/u, equals: x }
+        - { pointer: /1/id, equals: 3 }
+        - { pointer: /1/s, equals: null }
+        - { pointer: /1/l, equals: null }
+        - { pointer: /1/u, equals: '5' }
