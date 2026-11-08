@@ -3180,7 +3180,7 @@ jobs:
               "--matrix backend=ducklake test/spicescript" \
               "--matrix src=ducklake test/spicescript" \
               "--matrix source=ducklake test/spicescript" \
-              "test/spicescript/adbc-duckdb-catalog.yaml test/spicescript/ducklake-coverage.yaml test/spicescript/ducklake-refresh.yaml"; do
+              "test/spicescript/adbc-duckdb-catalog.yaml test/spicescript/duckdb-hugeint.yaml test/spicescript/ducklake-coverage.yaml test/spicescript/ducklake-refresh.yaml"; do
               # shellcheck disable=SC2086 # args holds several words
               "${{ steps.spicescript.outputs.path }}" --jobs 4 \
                 --duckdb-version "$version" \
