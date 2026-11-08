@@ -15,7 +15,7 @@ engine=arrow
 # Function to display flag usage
 usage() {
     echo "Usage: ./setup-tpc-spicepod.bash <tpch or tpcds> <scale factor> [-engine acceleration_engine] [-pg_host pg_host] [-pg_port pg_port] [-pg_user pg_user] [-pg_pass pg_pass] [-pg_sslmode pg_sslmode]"
-    echo "  --engine Acceleration Engine (default: arrow)"
+    echo "  --engine Acceleration Engine: arrow, cayenne, postgres or sqlite (default: arrow)"
     echo "  --pg_host Acceleration parameter: pg_host (default: localhost)"
     echo "  --pg_port Acceleration parameter: pg_port (default: 5432)"
     echo "  --pg_user Acceleration parameter: pg_user (default: postgres)"
@@ -89,6 +89,16 @@ while [[ "$#" -gt 0 ]]; do
             ;;
     esac
 done
+
+# Each engine below writes its own datasets; any other value would write a Spicepod with none.
+case "$engine" in
+    arrow | cayenne | postgres | sqlite ) ;;
+    * )
+        echo "error: Unsupported engine: $engine (expected arrow, cayenne, postgres or sqlite)" 1>&2
+        usage
+        exit 1
+        ;;
+esac
 
 # test if duckdb command exists
 if ! type "duckdb" 1> /dev/null 2>&1; then
