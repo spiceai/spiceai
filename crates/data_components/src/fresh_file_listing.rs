@@ -28,23 +28,47 @@ use async_trait::async_trait;
 use datafusion::{
     catalog::{ScanArgs, ScanResult, Session},
     datasource::{TableProvider, listing::ListingTableUrl},
-    error::Result as DFResult,
+    error::{DataFusionError, Result as DFResult},
     execution::cache::TableScopedPath,
 };
+use futures::TryStreamExt;
+use object_store::ObjectMeta;
 use spice_table::{LayerWalk, SpiceTable, TableLayer};
+
+/// Whether a listed object should count as a data file for this dataset.
+pub type IsListedDataFile = Arc<dyn Fn(&ObjectMeta) -> bool + Send + Sync>;
 
 /// The [`TableLayer`] that drops a file dataset's cached file list before each scan, so the
 /// `ListingTable` beneath lists its paths again. Per-file caches keyed on the listed
 /// `ObjectMeta` (Parquet footers, file statistics) stay valid for unchanged files.
-#[derive(Debug)]
+///
+/// When constructed with [`Self::over_rejecting_empty`], a scan whose listing has no data
+/// file is an error instead of an empty table. A file that exists and matches the
+/// listing (header-only CSV, zero-row Parquet) still scans as zero rows.
 pub struct FreshFileListingLayer {
     table_paths: Vec<ListingTableUrl>,
+    dataset_name: String,
+    is_data_file: Option<IsListedDataFile>,
+}
+
+impl std::fmt::Debug for FreshFileListingLayer {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("FreshFileListingLayer")
+            .field("table_paths", &self.table_paths)
+            .field("dataset_name", &self.dataset_name)
+            .field("reject_empty_listing", &self.is_data_file.is_some())
+            .finish()
+    }
 }
 
 impl FreshFileListingLayer {
     #[must_use]
     pub fn new(table_paths: Vec<ListingTableUrl>) -> Self {
-        Self { table_paths }
+        Self {
+            table_paths,
+            dataset_name: String::new(),
+            is_data_file: None,
+        }
     }
 
     /// `table`, listing `table_paths` again on every scan.
@@ -54,6 +78,25 @@ impl FreshFileListingLayer {
         table_paths: Vec<ListingTableUrl>,
     ) -> Arc<dyn TableProvider> {
         SpiceTable::over(Arc::new(Self::new(table_paths)), table)
+    }
+
+    /// Like [`Self::over`], and a listing with no object `is_data_file` accepts is an
+    /// error rather than an empty result.
+    #[must_use]
+    pub fn over_rejecting_empty(
+        table: Arc<dyn TableProvider>,
+        table_paths: Vec<ListingTableUrl>,
+        dataset_name: impl Into<String>,
+        is_data_file: impl Fn(&ObjectMeta) -> bool + Send + Sync + 'static,
+    ) -> Arc<dyn TableProvider> {
+        SpiceTable::over(
+            Arc::new(Self {
+                table_paths,
+                dataset_name: dataset_name.into(),
+                is_data_file: Some(Arc::new(is_data_file)),
+            }),
+            table,
+        )
     }
 
     fn forget_listing(&self, state: &dyn Session) {
@@ -67,6 +110,47 @@ impl FreshFileListingLayer {
                 path: path.prefix().clone(),
             });
         }
+    }
+
+    async fn ensure_data_files(&self, state: &dyn Session) -> DFResult<()> {
+        let Some(is_data_file) = &self.is_data_file else {
+            return Ok(());
+        };
+        for path in &self.table_paths {
+            if self.path_has_data_file(state, path, is_data_file).await? {
+                continue;
+            }
+            tracing::warn!(
+                dataset = %self.dataset_name,
+                path = %path,
+                "No data files are yet available for dataset {} at {path}. The source path is missing or has no matching files.",
+                self.dataset_name
+            );
+            return Err(DataFusionError::External(Box::new(std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                format!(
+                    "No data files are yet available for dataset {} at {path}. The source path is missing or has no matching files.",
+                    self.dataset_name
+                ),
+            ))));
+        }
+        Ok(())
+    }
+
+    async fn path_has_data_file(
+        &self,
+        state: &dyn Session,
+        path: &ListingTableUrl,
+        is_data_file: &IsListedDataFile,
+    ) -> DFResult<bool> {
+        let store = state.runtime_env().object_store(path.object_store())?;
+        let mut listing = path.list_all_files(state, store.as_ref(), "").await?;
+        while let Some(meta) = listing.try_next().await? {
+            if is_data_file(&meta) {
+                return Ok(true);
+            }
+        }
+        Ok(false)
     }
 }
 
@@ -99,6 +183,7 @@ impl TableLayer for FreshFileListingLayer {
         args: ScanArgs<'a>,
     ) -> DFResult<ScanResult> {
         self.forget_listing(state);
+        self.ensure_data_files(state).await?;
         below.scan_with_args(state, args).await
     }
 }
@@ -173,5 +258,63 @@ mod tests {
         write_ids(&dir.path().join("part-1.parquet"), 1001..=3000);
 
         assert_eq!(count_and_max(&ctx).await, (3000, 3000));
+    }
+
+    fn parquet_is_data_file(meta: &object_store::ObjectMeta) -> bool {
+        meta.size > 0 && meta.location.as_ref().ends_with(".parquet")
+    }
+
+    async fn register_rejecting(ctx: &SessionContext, dir: &Path) {
+        let url = ListingTableUrl::parse(format!("file://{}/", dir.display())).expect("url");
+        let options =
+            ListingOptions::new(Arc::new(ParquetFormat::default())).with_file_extension(".parquet");
+        let config = ListingTableConfig::new(url.clone())
+            .with_listing_options(options)
+            .infer_schema(&ctx.state())
+            .await
+            .expect("infer schema");
+        let table: Arc<dyn TableProvider> =
+            Arc::new(ListingTable::try_new(config).expect("listing table"));
+        ctx.register_table(
+            "t",
+            FreshFileListingLayer::over_rejecting_empty(table, vec![url], "t", parquet_is_data_file),
+        )
+        .expect("register");
+    }
+
+    async fn query_err(ctx: &SessionContext) -> String {
+        match ctx.sql("SELECT count(*) FROM t").await {
+            Err(e) => e.to_string(),
+            Ok(df) => match df.collect().await {
+                Err(e) => e.to_string(),
+                Ok(_) => String::new(),
+            },
+        }
+    }
+
+    /// Removing every listed file is an error, not an empty table. A file that
+    /// still exists and holds no rows still answers zero.
+    #[tokio::test]
+    async fn scans_error_when_listed_files_are_gone() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let part0 = dir.path().join("part-0.parquet");
+        write_ids(&part0, 1..=100);
+
+        let ctx = SessionContext::new();
+        register_rejecting(&ctx, dir.path()).await;
+        assert_eq!(count_and_max(&ctx).await, (100, 100));
+
+        std::fs::remove_file(&part0).expect("remove listed file");
+        let err = query_err(&ctx).await;
+        assert!(
+            err.contains("No data files are yet available"),
+            "expected missing-source error, got {err}"
+        );
+
+        write_ids(&part0, 1..=0);
+        assert_eq!(count_and_max(&ctx).await, (0, 0));
+
+        write_ids(&part0, 1..=50);
+        assert_eq!(count_and_max(&ctx).await, (50, 50));
     }
 }

@@ -126,7 +126,12 @@ impl Source for Files {
 }
 
 pub(crate) fn write_parts(dir: &Path, first: usize, spec: &TableSpec) -> Result<u64> {
-    let files = u64::from(spec.files.max(1));
+    // `files: 0` writes no part files. After `mode: replace` this leaves an
+    // empty table directory, which is how a script removes the source files.
+    if spec.files == 0 {
+        return Ok(0);
+    }
+    let files = u64::from(spec.files);
     let per_file = spec.rows.div_ceil(files);
     let mut rows = crate::generate::rows(spec)?;
     let mut written = 0;

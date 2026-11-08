@@ -274,8 +274,17 @@ impl ListingTableTemplate {
             table
         };
         // A file dataset is read as its files are at query time, not as they were
-        // listed at its first scan.
-        let table = FreshFileListingLayer::over(table, vec![table_path]);
+        // listed at its first scan. A listing with no matching data file is an
+        // error (the path is missing, or every matching file was removed) rather
+        // than an empty table, so a full refresh cannot persist a wipe. A file
+        // that still exists and holds no rows still scans as zero rows.
+        let extension = self.extension.clone();
+        let table = FreshFileListingLayer::over_rejecting_empty(
+            table,
+            vec![table_path],
+            self.dataset_name.clone(),
+            move |meta| listed_object_is_data_file(meta, &extension),
+        );
         match self.schema_drift_guard() {
             Some(guard) => FileSchemaDriftLayer::over(table, guard),
             None => table,
