@@ -90,7 +90,7 @@ pub struct ContainerRun {
 }
 
 /// The `docker run --user` a container runs as, so that it may write in, and
-/// leave files the runner owns in, the instance directory `owner` describes.
+/// leave files the runner owns in, the instance directory owned by `uid:gid`.
 ///
 /// A rootful daemon maps container IDs to the host's one for one, so the
 /// directory's own owner is the answer. A rootless daemon maps its own user to
@@ -99,12 +99,11 @@ pub struct ContainerRun {
 /// there: `spiced` then fails to take its instance lock with "Permission
 /// denied". Root in that namespace is the daemon's user, the one the runner
 /// shares the directory with.
-fn container_user(rootless: bool, owner: &std::fs::Metadata) -> String {
-    use std::os::unix::fs::MetadataExt;
+fn container_user(rootless: bool, uid: u32, gid: u32) -> String {
     if rootless {
         "0:0".to_string()
     } else {
-        format!("{}:{}", owner.uid(), owner.gid())
+        format!("{uid}:{gid}")
     }
 }
 
@@ -330,6 +329,7 @@ impl Spiced {
         let _ = std::process::Command::new("docker")
             .args(["rm", "-f", &run.name])
             .output();
+        use std::os::unix::fs::MetadataExt;
         let dir = std::path::absolute(&self.dir)?;
         let owner = std::fs::metadata(&dir)?;
         let mut command = Command::new("docker");
@@ -343,7 +343,10 @@ impl Spiced {
                 std::process::id()
             ))
             // Files it writes in the shared directories stay the runner's.
-            .args(["--user", &container_user(run.rootless, &owner)])
+            .args([
+                "--user",
+                &container_user(run.rootless, owner.uid(), owner.gid()),
+            ])
             .arg("-v")
             .arg(format!("{}:/usr/local/bin/spiced:ro", binary.display()))
             .arg("-v")
@@ -1078,15 +1081,19 @@ mod not_yet_loaded_tests {
 #[cfg(test)]
 mod container_user_tests {
     use super::container_user;
-    use std::os::unix::fs::MetadataExt;
+
+    // A non-root owner, so the two answers differ: with a root-owned
+    // directory both would be `0:0` and a lost rootless branch would pass.
+    const UID: u32 = 1001;
+    const GID: u32 = 121;
 
     #[test]
-    fn rootful_runs_as_the_directory_owner_and_rootless_as_the_daemon_user() {
-        let owner = std::fs::metadata(std::env::temp_dir()).expect("stat the temp directory");
-        assert_eq!(
-            container_user(false, &owner),
-            format!("{}:{}", owner.uid(), owner.gid())
-        );
-        assert_eq!(container_user(true, &owner), "0:0");
+    fn rootful_runs_as_the_directory_owner() {
+        assert_eq!(container_user(false, UID, GID), "1001:121");
+    }
+
+    #[test]
+    fn rootless_runs_as_the_daemon_user_not_the_directory_owner() {
+        assert_eq!(container_user(true, UID, GID), "0:0");
     }
 }
