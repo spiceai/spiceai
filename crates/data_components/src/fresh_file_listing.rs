@@ -120,16 +120,17 @@ impl FreshFileListingLayer {
             if self.path_has_data_file(state, path, is_data_file).await? {
                 continue;
             }
+            let display_path = redacted_listing_url(path);
             tracing::warn!(
                 dataset = %self.dataset_name,
-                path = %path,
-                "No data files are yet available for dataset {} at {path}. The source path is missing or has no matching files.",
+                path = %display_path,
+                "No data files are yet available for dataset {} at {display_path}. The source path is missing or has no matching files.",
                 self.dataset_name
             );
             return Err(DataFusionError::External(Box::new(std::io::Error::new(
                 std::io::ErrorKind::NotFound,
                 format!(
-                    "No data files are yet available for dataset {} at {path}. The source path is missing or has no matching files.",
+                    "No data files are yet available for dataset {} at {display_path}. The source path is missing or has no matching files.",
                     self.dataset_name
                 ),
             ))));
@@ -143,7 +144,7 @@ impl FreshFileListingLayer {
         path: &ListingTableUrl,
         is_data_file: &IsListedDataFile,
     ) -> DFResult<bool> {
-        let store = state.runtime_env().object_store(path.object_store())?;
+        let store = state.runtime_env().object_store(path)?;
         let mut listing = path.list_all_files(state, store.as_ref(), "").await?;
         while let Some(meta) = listing.try_next().await? {
             if is_data_file(&meta) {
@@ -152,6 +153,12 @@ impl FreshFileListingLayer {
         }
         Ok(false)
     }
+}
+
+fn redacted_listing_url(path: &ListingTableUrl) -> url::Url {
+    let mut redacted = <ListingTableUrl as AsRef<url::Url>>::as_ref(path).clone();
+    redacted.set_fragment(None);
+    redacted
 }
 
 #[async_trait]
@@ -316,5 +323,30 @@ mod tests {
 
         write_ids(&part0, 1..=50);
         assert_eq!(count_and_max(&ctx).await, (50, 50));
+    }
+
+    #[test]
+    fn listing_diagnostics_omit_url_fragments() {
+        let path = ListingTableUrl::parse(
+            "s3://bucket/facts/#key=fixture&secret=fixture-secret&session_token=fixture-token",
+        )
+        .expect("url");
+        let display = redacted_listing_url(&path).to_string();
+        assert!(
+            !display.contains("fixture-secret"),
+            "secret leaked in {display}"
+        );
+        assert!(
+            !display.contains("session_token"),
+            "session token leaked in {display}"
+        );
+        assert!(!display.contains('#'), "fragment remained in {display}");
+        assert!(display.contains("s3://bucket/facts"), "{display}");
+        assert!(
+            <ListingTableUrl as AsRef<url::Url>>::as_ref(&path)
+                .fragment()
+                .is_some(),
+            "storage URL must keep its fragment"
+        );
     }
 }
