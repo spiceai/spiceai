@@ -5,10 +5,14 @@ description: >
   variables the Anthropic SDKs read (`ANTHROPIC_FEDERATION_RULE_ID`,
   `ANTHROPIC_ORGANIZATION_ID`, `ANTHROPIC_SERVICE_ACCOUNT_ID`,
   `ANTHROPIC_IDENTITY_TOKEN_FILE`), so it reads that token file, while an API
-  key the Spicepod sets wins over those variables. An audience beside a token
-  file, which carries its own, is a configuration error for both providers, and
-  an OpenAI model with no credential says how to give it one instead of sending
+  key the Spicepod sets wins over those variables: it is the key the mock
+  server, standing in for Anthropic, receives. An audience beside a token file,
+  which carries its own, is a configuration error for both providers, and an
+  OpenAI model with no credential says how to give it one instead of sending
   OpenAI a request without one. None of them reaches a network.
+
+sources:
+  api: { kind: mock-http }
 
 variants:
   sdk-env:
@@ -35,6 +39,7 @@ spicepod:
       name: claude_key_wins
       params:
         anthropic_api_key: not-a-key
+        endpoint: ${sources.api.url}/v1
     - from: anthropic:claude-sonnet-5-5
       name: claude_audience_and_file
       params:
@@ -53,12 +58,23 @@ spicepod:
     - from: openai:gpt-5-mini
       name: gpt_no_credential
 steps:
+  - source-exec:
+      api:
+        # Answers only the Spicepod's key, so this reason reaches the log only when that key was sent.
+        - |
+          path: /v1/messages
+          method: POST
+          headers-match: { x-api-key: not-a-key }
+          status: 401
+          headers: { content-type: application/json }
+          body: '{"type": "error", "error": {"type": "authentication_error", "message": "the mock received the Spicepod key"}}'
   - start: { ready: false }
   - assert-log:
       count:
         "WARN .*claude_from_env.*Failed to read the workload identity token file '.*/missing-anthropic-token'": '>=1'
         "WARN .*Invalid value for parameter anthropic_identity_token_audience\\. `anthropic_identity_token_audience` applies only to an identity token Spice requests, from GitHub Actions or the workload's cloud identity, but the identity token comes from `anthropic_identity_token_file`, whose audience is set where it is issued\\. Remove one of them\\. See: https://spiceai\\.org/docs/components/models/anthropic": 1
         "WARN .*Invalid value for parameter openai_identity_token_audience\\. `openai_identity_token_audience` applies only to an identity token Spice requests, from GitHub Actions or the workload's cloud identity, but the identity token comes from `openai_identity_token_file`, whose audience is set where it is issued\\. Remove one of them\\. See: https://spiceai\\.org/docs/components/models/openai": 1
+        "WARN .*claude_key_wins.*authentication_error: the mock received the Spicepod key": '>=1'
         "WARN .*Found no credential for model 'gpt_no_credential' \\(openai\\): set `openai_api_key`, or workload identity federation with `openai_identity_provider_id` and `openai_service_account_id`\\. See: https://spiceai\\.org/docs/components/models/openai": '>=1'
       lacks:
         - "claude_key_wins.*identity token"
