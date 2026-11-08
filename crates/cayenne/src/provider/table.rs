@@ -2564,9 +2564,8 @@ pub struct CayenneTableProvider {
     /// a checkpoint in that window. Consumed on first fire.
     #[cfg(test)]
     test_post_prepare_hook: Arc<ParkingMutex<Option<TestPostCaptureHook>>>,
-    /// Test-only seam fired by a mem-tier seal after it captured the active pieces
-    /// and released the capture locks, before it writes the durable shadow, so a
-    /// test can land an apply in that window. Consumed on first fire.
+    /// Test-only seam fired by a seal after it releases the capture locks and
+    /// before it writes the durable shadow. Consumed on first fire.
     #[cfg(test)]
     test_post_seal_capture_hook: Arc<ParkingMutex<Option<TestPostCaptureHook>>>,
     /// Test-only seam fired by a write that fell back from inline to a new snapshot,
@@ -37146,13 +37145,11 @@ impl CayenneTableProvider {
                 .filter_map(|s| s.max_source_position_in_prefix(s.segments.len()))
                 .max()
                 .unwrap_or_else(|| shard_snapshots[0].epoch);
-            // ONE seal sequence stamps the inline BLOB rows AND the reinsert stamp.
-            // Reserved under the capture locks, like the checkpoint's snapshot
-            // sequence: every captured segment's sequences are below it and every
-            // later apply's are above it, so a later tombstone still hides the
-            // shadowed row on restart. The allocator's block refill already bumped the
-            // durable `current_sequence_number` to at least this value, so on restart
-            // the inline watermark reseeds at or above it and the shadow is visible.
+            // One sequence stamps the shadow rows and the reinsert stamp. Reserve it
+            // before the capture locks drop, as the checkpoint does, so an apply that
+            // lands after the capture gets a higher sequence and still hides the
+            // shadowed row on restart. The block refill has already persisted
+            // `current_sequence_number` at or above it, so the shadow is visible then.
             let seal_sequence = self
                 .reserve_sequences_local(1)
                 .await
@@ -53444,11 +53441,8 @@ mod tests {
         );
     }
 
-    /// Regression test for #16141: an apply that lands after a seal captured its
-    /// active piece, while the seal writes the durable shadow, must still win over the
-    /// shadow after a crash. Key 2 is deleted and key 3 updated in that window; a
-    /// second seal makes both durable. On restart key 2 must stay deleted and key 3
-    /// must appear once, with its new value — at one shard and across four.
+    /// Regression test for #16141: a delete and an update applied while a seal
+    /// writes its shadow must still win over that shadow after a crash.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn mem_tier_seal_keeps_applies_that_land_during_the_seal_after_crash() {
         let mut recovered = Vec::new();
@@ -53515,7 +53509,6 @@ mod tests {
                 collect_id_value_pairs(&ctx, &reopened, &table).await,
             ));
         }
-        // Compared once, so a failure reports every shard count.
         assert_eq!(
             recovered,
             vec![(1, vec![(1, 10), (3, 31)]), (4, vec![(1, 10), (3, 31)])],

@@ -1,11 +1,8 @@
 name: postgres-cdc-kill-under-load
 description: >
-  spiced killed (SIGKILL) again and again while PostgreSQL keeps committing
-  inserts, updates and deletes loses and duplicates nothing: once the writes
-  stop, a file-mode Cayenne acceleration fed by logical replication
-  (refresh_mode: changes, default in-memory CDC tier and its periodic seal)
-  holds exactly the rows the source holds, one per key (#16141). Each matrix
-  run uses a different id permutation for its updates and deletes.
+  Repeated SIGKILLs of spiced during PostgreSQL CDC load leave a file-mode
+  Cayenne acceleration (refresh_mode: changes) with exactly the source's rows,
+  one per key (#16141).
 
 sources:
   src: { kind: postgres }
@@ -35,8 +32,7 @@ defaults:
   expect: { oracle: src }
 
 steps:
-  # Checkpoint the source often, so the WAL the load writes is recycled once
-  # spiced acknowledges it.
+  # Checkpoint often so acknowledged WAL is recycled.
   - source-exec:
       src:
         - ALTER SYSTEM SET max_wal_size = '96MB'
@@ -49,10 +45,8 @@ steps:
   - query: SELECT count(*), sum(v), sum(seq) FROM cdc_t
     eventually: 120s
 
-  # Each round is one transaction of 100 row changes: 60 inserts of new keys,
-  # 25 updates and 15 deletes, spread over the preloaded keys and the keys
-  # inserted by the last few dozen rounds. Rounds may deadlock each other on
-  # overlapping keys; PostgreSQL rolls such a round back whole.
+  # Each round: one transaction of 60 inserts, 25 updates and 15 deletes.
+  # Overlapping rounds may deadlock; PostgreSQL rolls the loser back.
   - background:
       id: writes
       concurrency: 4
@@ -66,7 +60,7 @@ steps:
           DELETE FROM cdc_t WHERE id IN (SELECT 1000000 + (${round}::bigint - 2 - g * 3) * 100 + (g * 11 + ${round} * 3) % 60 FROM generate_series(0, 4) g);
           COMMIT;
 
-  # Kill at uneven points of the load and start again on the same data.
+  # Kill at uneven intervals during the load.
   - sleep: 6s
   - restart: { kill: KILL }
   - sleep: 3s
@@ -94,7 +88,7 @@ steps:
   - sleep: 5s
   - stop-background: { id: writes, allow: deadlock detected }
 
-  # Once the writes stop, every row equals the source's, once per key.
+  # Every row matches the source, once per key.
   - query: SELECT id, k, v, seq FROM cdc_t
     oracle-sql: SELECT id, k, v, seq FROM cdc_t
     eventually: 120s
