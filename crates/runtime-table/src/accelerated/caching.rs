@@ -32,7 +32,7 @@ use datafusion::execution::TaskContext;
 use datafusion::execution::context::SessionState;
 use datafusion::execution::memory_pool::{MemoryConsumer, MemoryPool, MemoryReservation};
 use datafusion::execution::session_state::SessionStateBuilder;
-use datafusion::logical_expr::{Expr, dml::InsertOp, not};
+use datafusion::logical_expr::{Expr, Operator, dml::InsertOp, not};
 use datafusion::logical_expr::{col, lit};
 use datafusion::physical_expr::EquivalenceProperties;
 use datafusion::physical_plan::execution_plan::{Boundedness, EmissionType};
@@ -649,6 +649,232 @@ fn is_empty_request_body_predicate(filter: &Expr) -> bool {
                 _,
             ) if value.is_empty()
         )
+}
+
+/// A discrete `(request_path, request_query, request_body)` combination named
+/// by a query. `None` on a field means that field was not constrained.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct RequestedCacheKey {
+    path: Option<String>,
+    query: Option<String>,
+    body: Option<String>,
+}
+
+impl RequestedCacheKey {
+    fn matches(&self, cached: &Self) -> bool {
+        dim_matches(&self.path, &cached.path)
+            && dim_matches(&self.query, &cached.query)
+            && dim_matches(&self.body, &cached.body)
+    }
+
+    fn to_filter_expr(&self) -> Option<Expr> {
+        let mut parts = Vec::new();
+        if let Some(path) = &self.path {
+            parts.push(col("request_path").eq(lit(path.as_str())));
+        }
+        if let Some(query) = &self.query {
+            parts.push(col("request_query").eq(lit(query.as_str())));
+        }
+        if let Some(body) = &self.body {
+            parts.push(col("request_body").eq(lit(body.as_str())));
+        }
+        combine_exprs_balanced(parts, Expr::and)
+    }
+}
+
+fn dim_matches(requested: &Option<String>, cached: &Option<String>) -> bool {
+    match requested {
+        None => true,
+        Some(value) => cached.as_deref() == Some(value.as_str()),
+    }
+}
+
+fn collect_request_key_column_names(expr: &Expr, names: &mut HashSet<&str>) {
+    for column in expr.column_refs() {
+        if let Some(name) = REQUEST_KEY_COLUMNS
+            .iter()
+            .copied()
+            .find(|candidate| *candidate == column.name)
+        {
+            names.insert(name);
+        }
+    }
+}
+
+fn has_cross_column_request_or(expr: &Expr) -> bool {
+    match expr {
+        Expr::BinaryExpr(binary) if binary.op == Operator::Or => {
+            let mut left = HashSet::new();
+            let mut right = HashSet::new();
+            collect_request_key_column_names(binary.left.as_ref(), &mut left);
+            collect_request_key_column_names(binary.right.as_ref(), &mut right);
+            if !left.is_empty() && !right.is_empty() && left != right {
+                return true;
+            }
+            has_cross_column_request_or(binary.left.as_ref())
+                || has_cross_column_request_or(binary.right.as_ref())
+        }
+        Expr::BinaryExpr(binary) if binary.op == Operator::And => {
+            has_cross_column_request_or(binary.left.as_ref())
+                || has_cross_column_request_or(binary.right.as_ref())
+        }
+        _ => false,
+    }
+}
+
+fn has_negated_request_key_in_list(expr: &Expr) -> bool {
+    match expr {
+        Expr::InList(in_list) if in_list.negated => matches!(
+            in_list.expr.as_ref(),
+            Expr::Column(column)
+                if REQUEST_KEY_COLUMNS
+                    .iter()
+                    .any(|name| *name == column.name)
+        ),
+        Expr::BinaryExpr(binary) => {
+            has_negated_request_key_in_list(binary.left.as_ref())
+                || has_negated_request_key_in_list(binary.right.as_ref())
+        }
+        Expr::Not(inner) => has_negated_request_key_in_list(inner),
+        _ => false,
+    }
+}
+
+fn owned_request_filter_values(filters: &[Expr], column: &str) -> Vec<String> {
+    HttpTableProvider::request_filter_values(filters, column)
+        .into_iter()
+        .map(ToOwned::to_owned)
+        .collect()
+}
+
+/// Discrete request-key combinations named by `filters`.
+///
+/// `None` when the filters do not name a complete-able set: no request-key
+/// predicates, a negated `IN`, or an `OR` across different request-key
+/// columns (which the HTTP connector also rejects).
+fn requested_cache_keys(filters: &[Expr]) -> Option<Vec<RequestedCacheKey>> {
+    if filters.iter().any(|filter| {
+        has_cross_column_request_or(filter) || has_negated_request_key_in_list(filter)
+    }) {
+        return None;
+    }
+
+    let paths = owned_request_filter_values(filters, "request_path");
+    let queries = owned_request_filter_values(filters, "request_query");
+    let bodies = owned_request_filter_values(filters, "request_body");
+    if paths.is_empty() && queries.is_empty() && bodies.is_empty() {
+        return None;
+    }
+
+    let paths: Vec<Option<String>> = if paths.is_empty() {
+        vec![None]
+    } else {
+        paths.into_iter().map(Some).collect()
+    };
+    let queries: Vec<Option<String>> = if queries.is_empty() {
+        vec![None]
+    } else {
+        queries.into_iter().map(Some).collect()
+    };
+    let bodies: Vec<Option<String>> = if bodies.is_empty() {
+        vec![None]
+    } else {
+        bodies.into_iter().map(Some).collect()
+    };
+
+    let mut keys = Vec::new();
+    let mut seen = HashSet::new();
+    for path in &paths {
+        for query in &queries {
+            for body in &bodies {
+                let key = RequestedCacheKey {
+                    path: path.clone(),
+                    query: query.clone(),
+                    body: body.clone(),
+                };
+                if seen.insert(key.clone()) {
+                    keys.push(key);
+                }
+            }
+        }
+    }
+    Some(keys)
+}
+
+fn cached_request_key(batch: &RecordBatch, row_idx: usize) -> RequestedCacheKey {
+    RequestedCacheKey {
+        path: utf8_cell(batch, "request_path", row_idx),
+        query: utf8_cell(batch, "request_query", row_idx),
+        body: utf8_cell(batch, "request_body", row_idx),
+    }
+}
+
+fn utf8_cell(batch: &RecordBatch, column: &str, row_idx: usize) -> Option<String> {
+    let (idx, _) = batch.schema().column_with_name(column)?;
+    match ScalarValue::try_from_array(batch.column(idx), row_idx).ok()? {
+        ScalarValue::Utf8(Some(value))
+        | ScalarValue::LargeUtf8(Some(value))
+        | ScalarValue::Utf8View(Some(value)) => Some(value),
+        _ => None,
+    }
+}
+
+fn cached_request_keys(batches: &[RecordBatch]) -> Vec<RequestedCacheKey> {
+    let mut keys = Vec::new();
+    let mut seen = HashSet::new();
+    for batch in batches {
+        for row_idx in 0..batch.num_rows() {
+            let key = cached_request_key(batch, row_idx);
+            if seen.insert(key.clone()) {
+                keys.push(key);
+            }
+        }
+    }
+    keys
+}
+
+fn missing_requested_cache_keys(
+    filters: &[Expr],
+    cached_batches: &[RecordBatch],
+) -> Option<Vec<RequestedCacheKey>> {
+    let requested = requested_cache_keys(filters)?;
+    let cached = cached_request_keys(cached_batches);
+    let missing: Vec<RequestedCacheKey> = requested
+        .into_iter()
+        .filter(|requested_key| {
+            !cached
+                .iter()
+                .any(|cached_key| requested_key.matches(cached_key))
+        })
+        .collect();
+    (!missing.is_empty()).then_some(missing)
+}
+
+/// Filters that fetch the request keys named by `filters` but absent from
+/// `cached_batches`. `None` when every named key is present, or when the
+/// filters do not name a discrete request-key set.
+fn missing_request_key_filters(
+    filters: &[Expr],
+    cached_batches: &[RecordBatch],
+) -> Option<Vec<Expr>> {
+    let missing = missing_requested_cache_keys(filters, cached_batches)?;
+    let key_preds: Vec<Expr> = missing
+        .iter()
+        .filter_map(RequestedCacheKey::to_filter_expr)
+        .collect();
+    let key_expr = combine_exprs_balanced(key_preds, Expr::or)?;
+    let mut result: Vec<Expr> = filters
+        .iter()
+        .filter(|filter| {
+            !filter
+                .column_refs()
+                .iter()
+                .any(|column| REQUEST_KEY_COLUMNS.iter().any(|name| *name == column.name))
+        })
+        .cloned()
+        .collect();
+    result.push(key_expr);
+    Some(result)
 }
 
 /// Maximum number of concurrent refresh requests
@@ -3654,7 +3880,56 @@ impl ExecutionPlan for CachingAccelerationScanExec {
                     }
                 }
 
-                // Data is fresh or stale - serve from cache (stale triggers background refresh)
+                // Data is fresh or stale. A hit that returned some rows is not
+                // enough when the query named several request keys: missing
+                // keys must still be fetched from the origin.
+                if let Some(missing_filters) =
+                    missing_request_key_filters(&fill_filters, &cached_batches)
+                {
+                    tracing::debug!(
+                        dataset = %dataset_name,
+                        "Partial cache hit: fetching request keys absent from the accelerator"
+                    );
+                    let hit_stream = CacheRefreshHelper::handle_cache_hit(
+                        cached_batches,
+                        &federated,
+                        &session_state,
+                        &dataset_name,
+                        max_age,
+                        stale_while_revalidate,
+                        &io_runtime,
+                        Arc::clone(&schema_clone),
+                        &fill_filters,
+                        &in_flight_revalidations,
+                        &batch_write_tx,
+                        namespace.clone(),
+                    );
+                    let miss_stream = CacheRefreshHelper::handle_cache_miss(
+                        Arc::clone(&federated),
+                        &session_state,
+                        &dataset_name,
+                        &missing_filters,
+                        limit,
+                        Arc::clone(&schema_clone),
+                        false,
+                        response_filtered,
+                        StaleIfError::Disabled,
+                        max_age.unwrap_or_default(),
+                        None,
+                        &io_runtime,
+                        Arc::clone(&synchronized_children),
+                        batch_write_tx,
+                        namespace,
+                        Arc::clone(&in_flight_revalidations),
+                    )
+                    .await;
+                    let chained = hit_stream.chain(miss_stream);
+                    return Box::pin(RecordBatchStreamAdapter::new(
+                        Arc::clone(&schema_clone),
+                        chained,
+                    )) as SendableRecordBatchStream;
+                }
+
                 CacheRefreshHelper::handle_cache_hit(
                     cached_batches,
                     &federated,
@@ -4796,6 +5071,89 @@ mod tests {
         assert_eq!(
             source_replay_filters(&[path.clone(), query.clone(), body.clone()]),
             vec![path, query, body]
+        );
+    }
+
+    #[test]
+    fn requested_cache_keys_expand_in_list_and_same_column_or() {
+        let path = col("request_path").eq(lit("/v1/items"));
+        let in_list = col("request_query").in_list(vec![lit("cat=p"), lit("cat=q")], false);
+        let keys = requested_cache_keys(&[path.clone(), in_list]).expect("enumerable");
+        assert_eq!(
+            keys,
+            vec![
+                RequestedCacheKey {
+                    path: Some("/v1/items".into()),
+                    query: Some("cat=p".into()),
+                    body: None,
+                },
+                RequestedCacheKey {
+                    path: Some("/v1/items".into()),
+                    query: Some("cat=q".into()),
+                    body: None,
+                },
+            ]
+        );
+
+        let or_query = col("request_query")
+            .eq(lit("cat=p"))
+            .or(col("request_query").eq(lit("cat=r")));
+        let keys = requested_cache_keys(&[path, or_query]).expect("enumerable");
+        assert_eq!(
+            keys.iter().map(|k| k.query.clone()).collect::<Vec<_>>(),
+            vec![Some("cat=p".into()), Some("cat=r".into())]
+        );
+    }
+
+    #[test]
+    fn requested_cache_keys_none_without_request_predicates() {
+        assert!(requested_cache_keys(&[col("content").eq(lit("x"))]).is_none());
+        assert!(requested_cache_keys(&[]).is_none());
+    }
+
+    #[test]
+    fn missing_request_key_filters_only_names_absent_keys() {
+        let schema = Schema::new(vec![
+            Field::new("request_path", DataType::Utf8, true),
+            Field::new("request_query", DataType::Utf8, true),
+        ]);
+        let cached = RecordBatch::try_new(
+            Arc::new(schema),
+            vec![
+                Arc::new(StringArray::from(vec!["/v1/items"])),
+                Arc::new(StringArray::from(vec!["cat=p"])),
+            ],
+        )
+        .expect("cached row");
+        let filters = vec![
+            col("request_path").eq(lit("/v1/items")),
+            col("request_query").in_list(vec![lit("cat=p"), lit("cat=q")], false),
+        ];
+        let missing = missing_request_key_filters(&filters, &[cached]).expect("q is absent");
+        let rendered: Vec<String> = missing.iter().map(ToString::to_string).collect();
+        assert!(
+            rendered.iter().any(|expr| expr.contains("cat=q")),
+            "missing filters should name cat=q: {rendered:?}"
+        );
+        assert!(
+            rendered.iter().all(|expr| !expr.contains("cat=p")),
+            "missing filters should not re-fetch cat=p: {rendered:?}"
+        );
+
+        let both = RecordBatch::try_new(
+            Arc::new(Schema::new(vec![
+                Field::new("request_path", DataType::Utf8, true),
+                Field::new("request_query", DataType::Utf8, true),
+            ])),
+            vec![
+                Arc::new(StringArray::from(vec!["/v1/items", "/v1/items"])),
+                Arc::new(StringArray::from(vec!["cat=p", "cat=q"])),
+            ],
+        )
+        .expect("both keys");
+        assert!(
+            missing_request_key_filters(&filters, &[both]).is_none(),
+            "complete hit should not produce a fetch"
         );
     }
 
@@ -8072,6 +8430,185 @@ mod tests {
             ],
         )
         .expect("http response row")
+    }
+
+    fn http_row_with_key(
+        schema: &SchemaRef,
+        path: &str,
+        query: &str,
+        content: &str,
+        refreshed_at: i64,
+    ) -> RecordBatch {
+        RecordBatch::try_new(
+            Arc::clone(schema),
+            vec![
+                Arc::new(StringArray::from(vec![path])),
+                Arc::new(StringArray::from(vec![query])),
+                Arc::new(StringArray::from(vec![content])),
+                Arc::new(UInt16Array::from(vec![200_u16])),
+                Arc::new(TimestampNanosecondArray::from(vec![Some(refreshed_at)])),
+            ],
+        )
+        .expect("http response row")
+    }
+
+    async fn execute_partial_hit(
+        filters: Vec<Expr>,
+        cached: RecordBatch,
+        origin: RecordBatch,
+    ) -> (Vec<RecordBatch>, Vec<Vec<String>>) {
+        let schema = cached.schema();
+        let federated = Arc::new(FilterTrackingTableProvider::new(
+            Arc::clone(&schema),
+            vec![origin],
+        ));
+        let recorded = Arc::clone(&federated.recorded_filters);
+        let accelerator = Arc::new(MockAcceleratorTableProvider::new(
+            Arc::clone(&schema),
+            vec![cached.clone()],
+        ));
+        let input: Arc<dyn ExecutionPlan> = Arc::new(DataSourceExec::new(Arc::new(
+            MemorySourceConfig::try_new(&[vec![cached]], Arc::clone(&schema), None)
+                .expect("cache input"),
+        )));
+        let in_flight: InFlightRevalidations = Arc::new(parking_lot::Mutex::new(HashMap::new()));
+        let (tx, _consumer) = spawn_test_cache_write_consumer(&accelerator, &in_flight);
+        let exec = CachingAccelerationScanExec::new(
+            input,
+            Some(Duration::from_mins(10)),
+            None,
+            StaleIfError::Disabled,
+            federated,
+            accelerator,
+            "items".to_string(),
+            Handle::current(),
+            filters,
+            None,
+            None,
+            Arc::new(Mutex::new(())),
+            in_flight,
+            Arc::new(tokio::sync::RwLock::new(Vec::new())),
+            tx,
+        );
+        let batches: Vec<RecordBatch> = exec
+            .execute(0, Arc::new(TaskContext::default()))
+            .expect("execute")
+            .try_collect()
+            .await
+            .expect("collect");
+        (batches, recorded.read().clone())
+    }
+
+    fn contents_of(batches: &[RecordBatch]) -> Vec<String> {
+        let mut values = Vec::new();
+        for batch in batches {
+            let content = batch
+                .column_by_name("content")
+                .expect("content")
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .expect("string content");
+            for i in 0..content.len() {
+                if !content.is_null(i) {
+                    values.push(content.value(i).to_string());
+                }
+            }
+        }
+        values.sort();
+        values
+    }
+
+    #[tokio::test]
+    async fn partial_hit_in_list_fetches_the_uncached_query_key() {
+        let schema = http_cache_schema();
+        let now = i64::try_from(
+            SystemTime::now()
+                .duration_since(SystemTime::UNIX_EPOCH)
+                .expect("time went backwards")
+                .as_nanos(),
+        )
+        .expect("now fits in i64 nanoseconds");
+        let cached = http_row_with_key(&schema, "/v1/items", "cat=p", "cached-p", now);
+        let origin = http_row_with_key(&schema, "/v1/items", "cat=q", "origin-q", now);
+        let filters = vec![
+            col("request_path").eq(lit("/v1/items")),
+            col("request_query").in_list(vec![lit("cat=p"), lit("cat=q")], false),
+        ];
+        let (batches, recorded) = execute_partial_hit(filters, cached, origin).await;
+        assert_eq!(
+            contents_of(&batches),
+            vec!["cached-p".to_string(), "origin-q".to_string()]
+        );
+        assert_eq!(
+            recorded.len(),
+            1,
+            "origin should be asked once for the missing key: {recorded:?}"
+        );
+        let joined = recorded[0].join(" AND ");
+        assert!(
+            joined.contains("cat=q"),
+            "origin filters should name cat=q: {recorded:?}"
+        );
+        assert!(
+            !joined.contains("cat=p"),
+            "origin should not be re-asked for cached cat=p: {recorded:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn partial_hit_or_fetches_the_uncached_query_key() {
+        let schema = http_cache_schema();
+        let now = i64::try_from(
+            SystemTime::now()
+                .duration_since(SystemTime::UNIX_EPOCH)
+                .expect("time went backwards")
+                .as_nanos(),
+        )
+        .expect("now fits in i64 nanoseconds");
+        let cached = http_row_with_key(&schema, "/v1/items", "cat=p", "cached-p", now);
+        let origin = http_row_with_key(&schema, "/v1/items", "cat=r", "origin-r", now);
+        let filters = vec![
+            col("request_path").eq(lit("/v1/items")),
+            col("request_query")
+                .eq(lit("cat=p"))
+                .or(col("request_query").eq(lit("cat=r"))),
+        ];
+        let (batches, recorded) = execute_partial_hit(filters, cached, origin).await;
+        assert_eq!(
+            contents_of(&batches),
+            vec!["cached-p".to_string(), "origin-r".to_string()]
+        );
+        assert_eq!(recorded.len(), 1, "{recorded:?}");
+        let joined = recorded[0].join(" AND ");
+        assert!(joined.contains("cat=r"), "{recorded:?}");
+        assert!(!joined.contains("cat=p"), "{recorded:?}");
+    }
+
+    #[tokio::test]
+    async fn partial_hit_path_in_list_fetches_the_uncached_path() {
+        let schema = http_cache_schema();
+        let now = i64::try_from(
+            SystemTime::now()
+                .duration_since(SystemTime::UNIX_EPOCH)
+                .expect("time went backwards")
+                .as_nanos(),
+        )
+        .expect("now fits in i64 nanoseconds");
+        let cached = http_row_with_key(&schema, "/v1/items", "cat=p", "cached-items", now);
+        let origin = http_row_with_key(&schema, "/v1/other", "cat=p", "origin-other", now);
+        let filters = vec![
+            col("request_path").in_list(vec![lit("/v1/items"), lit("/v1/other")], false),
+            col("request_query").eq(lit("cat=p")),
+        ];
+        let (batches, recorded) = execute_partial_hit(filters, cached, origin).await;
+        assert_eq!(
+            contents_of(&batches),
+            vec!["cached-items".to_string(), "origin-other".to_string()]
+        );
+        assert_eq!(recorded.len(), 1, "{recorded:?}");
+        let joined = recorded[0].join(" AND ");
+        assert!(joined.contains("/v1/other"), "{recorded:?}");
+        assert!(!joined.contains("/v1/items"), "{recorded:?}");
     }
 
     /// Unix nanoseconds for `ago` before `now_nanos`.
