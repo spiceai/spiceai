@@ -338,11 +338,13 @@ fn postgres_uri(s: &str) -> Result<Vec<(String, String)>, &'static str> {
             port_list.push(percent_decoded(port)?);
         }
     }
-    if host_list.iter().any(|host| !host.is_empty()) {
-        pairs.push(("host".to_string(), host_list.join(",")));
-    }
-    if port_list.iter().any(|port| !port.is_empty()) {
-        pairs.push(("port".to_string(), port_list.join(",")));
+    // As libpq keeps them: whenever the list is not empty, which a comma
+    // between empty hosts or ports is enough for.
+    for (key, list) in [("host", host_list), ("port", port_list)] {
+        let list = list.join(",");
+        if !list.is_empty() {
+            pairs.push((key.to_string(), list));
+        }
     }
     if !dbname.is_empty() {
         pairs.push(("dbname".to_string(), percent_decoded(dbname)?));
@@ -629,6 +631,26 @@ mod tests {
                 "postgres:user='u' host='localhost' port='5432' dbname='db2' sslmode='disable'"
                     .to_string(),
                 Some("a?password=X".to_string())
+            )
+        );
+    }
+
+    /// libpq keeps a URI's host list whenever it holds a comma, even if every
+    /// host in it is empty, so each port still has a host to go with.
+    #[test]
+    fn a_uri_keeps_a_list_of_empty_hosts() {
+        assert_eq!(
+            split("postgres:postgresql://u:hunter2@:5432,:5433/x"),
+            (
+                "postgres:user='u' host=',' port='5432,5433' dbname='x'".to_string(),
+                Some("hunter2".to_string())
+            )
+        );
+        assert_eq!(
+            split("postgresql://u:hunter2@:5432/x"),
+            (
+                "postgres:user='u' port='5432' dbname='x'".to_string(),
+                Some("hunter2".to_string())
             )
         );
     }
