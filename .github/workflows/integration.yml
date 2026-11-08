@@ -599,10 +599,13 @@ jobs:
           AWS_S3_VECTORS_SECRET: ${{ steps.aws-s3-vectors.outputs.aws-secret-access-key }}
           AWS_S3_VECTORS_SESSION_TOKEN: ${{ steps.aws-s3-vectors.outputs.aws-session-token }}
         run: |
+          # `adbc::` runs in `ADBC Integration Tests` (integration_adbc.yml), the one job that
+          # installs the SQLite ADBC driver those tests load; the `adbc` feature in this
+          # archive is here for the `duckdb:` and DuckLake source tests.
           if [ -n "$SPICE_SECRET_SPICEAI_KEY" ]; then
-            INSTA_WORKSPACE_ROOT="${PWD}" CARGO_MANIFEST_DIR="${PWD}" cargo nextest run --workspace-remap "${PWD}" --partition '${{ matrix.partition }}' --archive-file ./integration_tests/integration_tests.tar.zst -E 'binary_id(=runtime::integration) - test(/^github::/)'
+            INSTA_WORKSPACE_ROOT="${PWD}" CARGO_MANIFEST_DIR="${PWD}" cargo nextest run --workspace-remap "${PWD}" --partition '${{ matrix.partition }}' --archive-file ./integration_tests/integration_tests.tar.zst -E 'binary_id(=runtime::integration) - test(/^github::/) - test(/^adbc::/)'
           else
-            INSTA_WORKSPACE_ROOT="${PWD}" CARGO_MANIFEST_DIR="${PWD}" cargo nextest run --workspace-remap "${PWD}" --partition '${{ matrix.partition }}' --archive-file ./integration_tests/integration_tests.tar.zst -E 'binary_id(=runtime::integration) - test(spiceai_integration_test) - test(/^github::/)'
+            INSTA_WORKSPACE_ROOT="${PWD}" CARGO_MANIFEST_DIR="${PWD}" cargo nextest run --workspace-remap "${PWD}" --partition '${{ matrix.partition }}' --archive-file ./integration_tests/integration_tests.tar.zst -E 'binary_id(=runtime::integration) - test(spiceai_integration_test) - test(/^github::/) - test(/^adbc::/)'
           fi
 
       - name: Configure apt mirrors for the retention OOM test
