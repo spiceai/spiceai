@@ -65,6 +65,10 @@ pub enum FederationError {
     /// The environment's workload identity cannot be used: it lacks a part, or names an
     /// authority the identity token must not be sent to.
     IncompleteIdentity(String),
+    /// No source answered with an identity token: no file, no GitHub Actions job, and no cloud
+    /// identity that issues one. Not a configuration error: a cloud identity can answer later, as
+    /// when a metadata server is not ready at startup, so the model is loaded again.
+    NoIdentityToken(String),
 }
 
 impl FederationError {
@@ -82,9 +86,11 @@ impl FederationError {
             Self::Client(source) => crate::chat::Error::FailedToLoadModel {
                 source: Box::new(source),
             },
-            Self::IncompleteIdentity(message) => crate::chat::Error::FailedToAuthenticate {
-                source: message.into(),
-            },
+            Self::IncompleteIdentity(message) | Self::NoIdentityToken(message) => {
+                crate::chat::Error::FailedToAuthenticate {
+                    source: message.into(),
+                }
+            }
         }
     }
 
@@ -194,28 +200,43 @@ fn non_empty(value: Option<&str>) -> Option<&str> {
     value.filter(|value| !value.is_empty())
 }
 
-/// Checks a provider's federation params. `None` when none of `required` or `optional` is set;
-/// the `required` values when all are set; otherwise the param to fix. `key_param` names an API
-/// key or auth token the model also sets, which federation cannot be combined with.
+/// Checks a provider's federation params, each `(name, value)`. A `required` param or the token
+/// file selects federation; the audience never does, since it applies only to a token Spice
+/// requests. `None` when nothing selects federation and no audience is set; the `required` values
+/// when all are set; otherwise the param to fix. `key_param` names an API key or auth token the
+/// model also sets, which federation cannot be combined with and an audience does not apply to.
 fn validate<'a, const N: usize>(
     required: [(&'static str, Option<&'a str>); N],
-    optional: &[Option<&str>],
+    token_file: (&'static str, Option<&str>),
+    audience: (&'static str, Option<&str>),
     key_param: Option<&'static str>,
     docs: &str,
 ) -> Result<Option<[&'a str; N]>, FederationError> {
-    let configured =
-        required.iter().any(|(_, value)| value.is_some()) || optional.iter().any(Option::is_some);
-    if !configured {
-        return Ok(None);
-    }
-    let federation_param = required.first().map_or("", |(name, _)| *name);
-    if let Some(key_param) = key_param {
-        return Err(FederationError::Config {
-            param: key_param,
-            message: format!(
-                "A model authenticates with either `{key_param}` or workload identity federation (`{federation_param}`), and both are set. Remove one of them. See: {docs}"
-            ),
-        });
+    let selected_by = required
+        .iter()
+        .find(|(_, value)| value.is_some())
+        .map(|(name, _)| *name)
+        .or_else(|| token_file.1.is_some().then_some(token_file.0));
+    let (audience_param, audience) = audience;
+    match (selected_by, key_param) {
+        (None, _) if audience.is_none() => return Ok(None),
+        (None, Some(key_param)) => {
+            return Err(FederationError::Config {
+                param: audience_param,
+                message: format!(
+                    "`{audience_param}` applies only to workload identity federation, which this model does not use: it authenticates with `{key_param}`. Remove `{audience_param}`. See: {docs}"
+                ),
+            });
+        }
+        (Some(federation_param), Some(key_param)) => {
+            return Err(FederationError::Config {
+                param: key_param,
+                message: format!(
+                    "A model authenticates with either `{key_param}` or workload identity federation (`{federation_param}`), and both are set. Remove one of them. See: {docs}"
+                ),
+            });
+        }
+        _ => {}
     }
     let mut values = [""; N];
     for (slot, (name, value)) in values.iter_mut().zip(required) {
@@ -327,15 +348,12 @@ async fn subject_token_source(
     if let Ok(source) = SubjectTokenSource::github_actions_from_env(audience) {
         return Ok(source);
     }
-    cloud_identity(component, audience)
-        .await
-        .map_err(|tried| FederationError::Config {
-            param: file_param,
-            message: format!(
-                "{}. See: {docs}",
-                no_identity_token_message(file_param, &tried)
-            ),
-        })
+    cloud_identity(component, audience).await.map_err(|tried| {
+        FederationError::NoIdentityToken(format!(
+            "{}. See: {docs}",
+            no_identity_token_message(file_param, &tried)
+        ))
+    })
 }
 
 /// The info line logged when an `OpenAI` or Anthropic model has authenticated with workload
@@ -379,10 +397,11 @@ async fn openai_token_provider(
             ),
             ("openai_service_account_id", federation.service_account_id),
         ],
-        &[
+        ("openai_identity_token_file", federation.identity_token_file),
+        (
+            "openai_identity_token_audience",
             federation.identity_token_audience,
-            federation.identity_token_file,
-        ],
+        ),
         key_param,
         OPENAI_DOCS,
     )?
@@ -478,10 +497,14 @@ pub async fn anthropic_token_provider(
                 federation.service_account_id,
             ),
         ],
-        &[
-            federation.identity_token_audience,
+        (
+            "anthropic_identity_token_file",
             federation.identity_token_file,
-        ],
+        ),
+        (
+            "anthropic_identity_token_audience",
+            federation.identity_token_audience,
+        ),
         key_param,
         ANTHROPIC_DOCS,
     )?
@@ -646,10 +669,14 @@ fn azure_exchange(
     }
     let Some([tenant, client]) = validate(
         [("azure_tenant_id", tenant), ("azure_client_id", client)],
-        &[
-            federation.federated_token_audience,
+        (
+            "azure_federated_token_file",
             federation.federated_token_file,
-        ],
+        ),
+        (
+            "azure_federated_token_audience",
+            federation.federated_token_audience,
+        ),
         key_param,
         AZURE_DOCS,
     )?
@@ -895,6 +922,50 @@ mod tests {
         assert_eq!(
             message(error),
             "Invalid value for parameter openai_api_key. A model authenticates with either `openai_api_key` or workload identity federation (`openai_identity_provider_id`), and both are set. Remove one of them. See: https://spiceai.org/docs/components/models/openai"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_audience_alone_does_not_select_federation() {
+        // Beside a key, it applies to nothing, so it is the param to remove.
+        let error = openai_token_provider(
+            "model 'gpt' (openai)",
+            &openai(None, None, Some("https://api.openai.com/v1")),
+            Some("openai_api_key"),
+        )
+        .await
+        .expect_err("a stray audience");
+        assert_eq!(
+            message(error),
+            "Invalid value for parameter openai_identity_token_audience. `openai_identity_token_audience` applies only to workload identity federation, which this model does not use: it authenticates with `openai_api_key`. Remove `openai_identity_token_audience`. See: https://spiceai.org/docs/components/models/openai"
+        );
+
+        // A token file does select it, and is what the conflict names.
+        let mut with_file = openai(None, None, None);
+        with_file.identity_token_file = Some("/var/run/secrets/tokens/openai");
+        let error =
+            openai_token_provider("model 'gpt' (openai)", &with_file, Some("openai_api_key"))
+                .await
+                .expect_err("a conflict");
+        assert_eq!(
+            message(error),
+            "Invalid value for parameter openai_api_key. A model authenticates with either `openai_api_key` or workload identity federation (`openai_identity_token_file`), and both are set. Remove one of them. See: https://spiceai.org/docs/components/models/openai"
+        );
+    }
+
+    #[test]
+    fn no_identity_token_is_not_a_configuration_error() {
+        // A cloud identity can answer later, so the model is loaded again.
+        let error = FederationError::NoIdentityToken(
+            "Workload identity federation has no identity token".to_string(),
+        )
+        .into_llm_error();
+        assert_eq!(
+            (error.is_configuration_error(), error.to_string()),
+            (
+                false,
+                "Workload identity federation has no identity token".to_string()
+            )
         );
     }
 

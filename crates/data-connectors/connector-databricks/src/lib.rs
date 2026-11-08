@@ -752,7 +752,9 @@ impl Databricks {
         )
         .await
         .map_err(|error| match error {
-            DatabricksAuthError::InvalidWorkloadIdentity { message, .. } => {
+            // Both read as what to set, and a dataset load is retried after either.
+            DatabricksAuthError::InvalidWorkloadIdentity { message, .. }
+            | DatabricksAuthError::NoIdentityToken { message } => {
                 InvalidConfigurationSnafu { message }.build()
             }
             other => Error::UnableToGetToken {

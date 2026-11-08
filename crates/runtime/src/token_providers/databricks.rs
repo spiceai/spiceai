@@ -58,6 +58,12 @@ pub enum Error {
 
     #[snafu(display("{source}"))]
     WorkloadIdentityExchange { source: WorkloadIdentityError },
+
+    /// No source answered with an identity token: no file, no GitHub Actions job, and no cloud
+    /// identity that issues one. Not a mistake in the parameters: a cloud identity can answer
+    /// later, as when a metadata server is not ready at startup.
+    #[snafu(display("{message}"))]
+    NoIdentityToken { message: String },
 }
 
 #[derive(Clone)]
@@ -516,6 +522,9 @@ pub fn model_error(error: Error) -> llms::chat::Error {
                 message: format!("{message}. See: {MODEL_DOCS}"),
             }
         }
+        Error::NoIdentityToken { message } => llms::chat::Error::FailedToAuthenticate {
+            source: format!("{message}. See: {MODEL_DOCS}").into(),
+        },
         other => llms::chat::Error::FailedToAuthenticate {
             source: Box::new(other),
         },
@@ -569,8 +578,7 @@ pub async fn get_workload_identity_token_provider(
         IdentityToken::Cloud { audience } => (
             llms::workload_identity::cloud_identity(component, audience)
                 .await
-                .map_err(|tried| Error::InvalidWorkloadIdentity {
-                    parameter: "databricks_oidc_token_filepath",
+                .map_err(|tried| Error::NoIdentityToken {
                     message: llms::workload_identity::no_identity_token_message(
                         "databricks_oidc_token_filepath",
                         &tried,
@@ -1628,6 +1636,21 @@ mod tests {
         assert_eq!(
             model_error(error).to_string(),
             "Invalid value for parameter databricks_oidc_token_filepath. A Databricks component authenticates with either `databricks_token` or workload identity federation (`databricks_oidc_token_filepath`), and both are set. Remove one of them. See: https://spiceai.org/docs/components/models/databricks"
+        );
+    }
+
+    #[test]
+    fn no_identity_token_is_not_a_configuration_error() {
+        // A cloud identity can answer later, so the model is loaded again.
+        let error = model_error(Error::NoIdentityToken {
+            message: "Workload identity federation has no identity token".to_string(),
+        });
+        assert_eq!(
+            (error.is_configuration_error(), error.to_string()),
+            (
+                false,
+                "Workload identity federation has no identity token. See: https://spiceai.org/docs/components/models/databricks".to_string()
+            )
         );
     }
 

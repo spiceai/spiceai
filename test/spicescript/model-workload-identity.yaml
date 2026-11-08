@@ -9,10 +9,12 @@ description: >
   server, standing in for Anthropic, receives. An audience beside a token file,
   which carries its own, is a configuration error for both providers, and an
   OpenAI model with no credential says how to give it one instead of sending
-  OpenAI a request without one. A cloud identity is chosen only once it issues
+  OpenAI a request without one. An audience never selects federation: beside a
+  key it is the param to remove. A cloud identity is chosen only once it issues
   an identity token: AWS credentials whose STS refuses `GetWebIdentityToken`
   pass to the Google Cloud and Azure identities, and the error names what each
-  said. None of them reaches a network.
+  said. With none, the model is loaded again, since a cloud identity can answer
+  later. None of them reaches a network.
 
 sources:
   api: { kind: mock-http }
@@ -80,6 +82,11 @@ spicepod:
     - from: openai:gpt-5-mini
       name: gpt_no_credential
     - from: openai:gpt-5-mini
+      name: gpt_key_and_audience
+      params:
+        openai_api_key: not-a-key
+        openai_identity_token_audience: https://api.openai.com/v1
+    - from: openai:gpt-5-mini
       name: gpt_cloud
       params:
         openai_identity_provider_id: idp_test
@@ -109,7 +116,9 @@ steps:
         "WARN .*Invalid value for parameter anthropic_identity_token_audience\\. `anthropic_identity_token_audience` applies only to an identity token Spice requests, from GitHub Actions or the workload's cloud identity, but the identity token comes from `anthropic_identity_token_file`, whose audience is set where it is issued\\. Remove one of them\\. See: https://spiceai\\.org/docs/components/models/anthropic": 1
         "WARN .*Invalid value for parameter openai_identity_token_audience\\. `openai_identity_token_audience` applies only to an identity token Spice requests, from GitHub Actions or the workload's cloud identity, but the identity token comes from `openai_identity_token_file`, whose audience is set where it is issued\\. Remove one of them\\. See: https://spiceai\\.org/docs/components/models/openai": 1
         "WARN .*claude_key_wins.*authentication_error: the mock received the Spicepod key": '>=1'
-        "WARN .*no cloud identity answered: AWS \\(AWS refused \\(AccessDenied: not authorized to perform: sts:GetWebIdentityToken\\)\\. Grant the workload's role `sts:GetWebIdentityToken`\\), Google Cloud \\(no metadata server answered within 1s\\) and Azure \\(": '>=1'
+        "WARN .*Invalid value for parameter openai_identity_token_audience\\. `openai_identity_token_audience` applies only to workload identity federation, which this model does not use: it authenticates with `openai_api_key`\\. Remove `openai_identity_token_audience`\\. See: https://spiceai\\.org/docs/components/models/openai": 1
+        # Loaded again: a cloud identity can answer later.
+        "WARN .*gpt_cloud.*no cloud identity answered: AWS \\(AWS refused \\(AccessDenied: not authorized to perform: sts:GetWebIdentityToken\\)\\. Grant the workload's role `sts:GetWebIdentityToken`\\), Google Cloud \\(no metadata server answered within 1s\\) and Azure \\(": '>=2'
         "WARN .*Found no credential for model 'gpt_no_credential' \\(openai\\): set `openai_api_key`, or workload identity federation with `openai_identity_provider_id` and `openai_service_account_id`\\. See: https://spiceai\\.org/docs/components/models/openai": '>=1'
       lacks:
         - "claude_key_wins.*identity token"
