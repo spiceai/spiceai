@@ -1,18 +1,13 @@
 name: Authenticate the Hugging Face cache
 description: 'Puts a Hugging Face token where hf-hub reads it, for a job whose spiced downloads Hub models'
 
-# The Hub credential lives where hf-hub looks for it, rather than being threaded
-# through a spicepod as an `hf_token` param: it authenticates chat and embedding
-# models with one mechanism, and an unset secret leaves no file behind instead of
-# setting an empty token, which the Hub answers with 401 — worse than no token.
-#
-# A job that uses this must also run, as its own step:
-#
-#   - name: Remove the job-scoped Hugging Face token
-#     if: always() && env.SPICE_REMOVE_HF_TOKEN != ''
-#     run: rm -f "${SPICE_REMOVE_HF_TOKEN}"
-#
-# (a composite action has no post step to do it).
+# The token is exported to the rest of the job as `HF_TOKEN`, which spiced's
+# Hugging Face client reads before any token file (`crates/huggingface-hub`), for
+# chat and embedding models alike. An environment variable is private to this
+# job: a token file in the shared $HOME would be read by every overlapping job on
+# the host and could be removed by one of them while another still relies on it.
+# An unset secret exports nothing, rather than an empty token, which the Hub
+# answers with 401 — worse than no token at all.
 inputs:
   token:
     description: 'The Hugging Face token, normally secrets.SPICE_SECRET_HF_TOKEN; may be empty'
@@ -22,34 +17,24 @@ inputs:
 runs:
   using: composite
   steps:
-    - name: Write the token for hf-hub
+    - name: Export the token for hf-hub
       shell: bash
       env:
         SPICE_HF_TOKEN: ${{ inputs.token }}
       run: |
         set -uo pipefail
-        umask 077
 
-        # hf-hub caches artifacts under $HOME/.cache/huggingface/hub and reads its
-        # credential from the sibling `token` file. $HOME persists between jobs on
-        # the self-hosted runners while the _work tree does not, so once a model is
-        # on disk, later runs need no Hub round-trip at all.
+        # hf-hub caches artifacts under $HOME/.cache/huggingface/hub. $HOME persists
+        # between jobs on the self-hosted runners while the _work tree does not, so
+        # once a model is on disk, later runs need no Hub round-trip at all.
         mkdir -p "${HOME}/.cache/huggingface/hub"
-        token_file="${HOME}/.cache/huggingface/token"
 
-        # $HOME is shared by every job that lands on this host, and it outlives this
-        # one. So a token written here must not be left behind for an unrelated job
-        # to read, and a token the host already owns must not be clobbered:
-        #   - file already present -> use it, touch nothing.
-        #   - absent + secret set  -> write it, and mark it for removal in cleanup.
-        #   - absent + no secret   -> warn; downloads are anonymous.
-        if [ -s "${token_file}" ]; then
+        if [ -n "${SPICE_HF_TOKEN:-}" ]; then
+          echo "::add-mask::${SPICE_HF_TOKEN}"
+          echo "HF_TOKEN=${SPICE_HF_TOKEN}" >> "$GITHUB_ENV"
+          echo "Exported the Hugging Face token to this job as HF_TOKEN."
+        elif [ -s "${HOME}/.cache/huggingface/token" ]; then
           echo "Using the Hugging Face token already present on this runner."
-        elif [ -n "${SPICE_HF_TOKEN:-}" ]; then
-          printf '%s' "${SPICE_HF_TOKEN}" > "${token_file}"
-          chmod 600 "${token_file}"
-          echo "SPICE_REMOVE_HF_TOKEN=${token_file}" >> "$GITHUB_ENV"
-          echo "Wrote a job-scoped Hugging Face token for hf-hub to pick up."
         else
           echo "::warning::No Hugging Face token available. Downloads will be anonymous, and anonymous requests share a per-IP quota across this whole runner pool — exhausting it surfaces as HTTP 401 or 429 on model files."
         fi
