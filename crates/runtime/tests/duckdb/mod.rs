@@ -374,10 +374,7 @@ async fn duckdb_regexp() -> Result<(), String> {
                     .try_collect::<Vec<RecordBatch>>()
                     .await
                     .map_err(|e| format!("explain plan for `{query}` execution failed: {e}"))?;
-                let pretty = arrow::util::pretty::pretty_format_batches(&explain_plan)
-                    .map_err(|e| anyhow::Error::msg(e.to_string()))
-                    .expect("Should format batches");
-                insta::assert_snapshot!(format!("{name}_explain"), pretty);
+                insta::assert_snapshot!(format!("{name}_explain"), stable_plan(&explain_plan));
             }
 
             Ok(())
@@ -483,10 +480,7 @@ async fn duckdb_json_functions() -> Result<(), String> {
                     .try_collect::<Vec<RecordBatch>>()
                     .await
                     .map_err(|e| format!("explain plan for `{query}` execution failed: {e}"))?;
-                let pretty = arrow::util::pretty::pretty_format_batches(&explain_plan)
-                    .map_err(|e| anyhow::Error::msg(e.to_string()))
-                    .expect("Should format batches");
-                insta::assert_snapshot!(format!("{name}_explain"), pretty);
+                insta::assert_snapshot!(format!("{name}_explain"), stable_plan(&explain_plan));
             }
 
             Ok(())
@@ -771,6 +765,36 @@ async fn duckdb_federated_inner_product_nulls_a_non_finite_result() -> Result<()
             Ok(())
         })
         .await
+}
+
+/// The rows of an `EXPLAIN` as `plan_type: line`, one plan line each, with the
+/// tokens that change from run to run replaced: the view a `duckdb:` table function
+/// is read through is named after the file path it reads, and the compute context
+/// is a fresh identifier per database.
+fn stable_plan(batches: &[RecordBatch]) -> String {
+    let view = regex::Regex::new(r"spice_duckdb_[0-9a-f]+__view").expect("a valid pattern");
+    let context = regex::Regex::new(r"compute_context=\S+").expect("a valid pattern");
+    let mut lines = Vec::new();
+    for batch in batches {
+        let column = |index: usize| {
+            batch
+                .column(index)
+                .as_any()
+                .downcast_ref::<arrow::array::StringArray>()
+                .expect("EXPLAIN returns string columns")
+        };
+        let (plan_types, plans) = (column(0), column(1));
+        for row in 0..batch.num_rows() {
+            for line in plans.value(row).lines() {
+                lines.push(format!("{}: {}", plan_types.value(row), line.trim_end()));
+            }
+        }
+    }
+    let plan = lines.join("\n");
+    let plan = view.replace_all(&plan, "<duckdb_view>");
+    context
+        .replace_all(&plan, "compute_context=<id>")
+        .into_owned()
 }
 
 /// `EXPLAIN` a statement and return the formatted plan.
