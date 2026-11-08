@@ -662,9 +662,9 @@ struct RequestedCacheKey {
 
 impl RequestedCacheKey {
     fn matches(&self, cached: &Self) -> bool {
-        dim_matches(&self.path, &cached.path)
-            && dim_matches(&self.query, &cached.query)
-            && dim_matches(&self.body, &cached.body)
+        dim_matches(self.path.as_deref(), cached.path.as_deref())
+            && dim_matches(self.query.as_deref(), cached.query.as_deref())
+            && dim_matches(self.body.as_deref(), cached.body.as_deref())
     }
 
     fn to_filter_expr(&self) -> Option<Expr> {
@@ -682,10 +682,10 @@ impl RequestedCacheKey {
     }
 }
 
-fn dim_matches(requested: &Option<String>, cached: &Option<String>) -> bool {
+fn dim_matches(requested: Option<&str>, cached: Option<&str>) -> bool {
     match requested {
         None => true,
-        Some(value) => cached.as_deref() == Some(value.as_str()),
+        Some(value) => cached == Some(value),
     }
 }
 
@@ -850,20 +850,170 @@ fn missing_requested_cache_keys(
     (!missing.is_empty()).then_some(missing)
 }
 
-/// Filters that fetch the request keys named by `filters` but absent from
-/// `cached_batches`. `None` when every named key is present, or when the
-/// filters do not name a discrete request-key set.
-fn missing_request_key_filters(
+fn dim_unique_values(values: &[Option<String>]) -> Vec<Option<String>> {
+    let mut unique = Vec::new();
+    let mut seen = HashSet::new();
+    for value in values {
+        if seen.insert(value.clone()) {
+            unique.push(value.clone());
+        }
+    }
+    unique
+}
+
+fn dim_has_mixed_none(values: &[Option<String>]) -> bool {
+    let unique = dim_unique_values(values);
+    unique.iter().any(Option::is_none) && unique.iter().any(Option::is_some)
+}
+
+/// Equality or `IN` for one request-key column. `None` means every key left
+/// the column unconstrained.
+fn equality_or_in(column: &str, values: &[Option<String>]) -> Option<Expr> {
+    let mut present: Vec<String> = dim_unique_values(values).into_iter().flatten().collect();
+    present.sort();
+    match present.as_slice() {
+        [] => None,
+        [one] => Some(col(column).eq(lit(one.as_str()))),
+        many => Some(col(column).in_list(
+            many.iter().map(|value| lit(value.as_str())).collect(),
+            false,
+        )),
+    }
+}
+
+/// Factor `keys` into one HTTP-connector-safe predicate: shared dimensions
+/// become equalities and at most one varying dimension becomes an `IN` list.
+/// `None` when two or more dimensions vary (a cross-product or a cross-column
+/// `OR`) or when a varying dimension mixes constrained and unconstrained
+/// values.
+fn try_factor_keys(keys: &[RequestedCacheKey]) -> Option<Expr> {
+    if keys.is_empty() {
+        return None;
+    }
+    if keys.len() == 1 {
+        return keys[0].to_filter_expr();
+    }
+
+    let paths: Vec<Option<String>> = keys.iter().map(|key| key.path.clone()).collect();
+    let queries: Vec<Option<String>> = keys.iter().map(|key| key.query.clone()).collect();
+    let bodies: Vec<Option<String>> = keys.iter().map(|key| key.body.clone()).collect();
+
+    let path_varies = dim_unique_values(&paths).len() > 1;
+    let query_varies = dim_unique_values(&queries).len() > 1;
+    let body_varies = dim_unique_values(&bodies).len() > 1;
+    let varying = usize::from(path_varies) + usize::from(query_varies) + usize::from(body_varies);
+    if varying > 1
+        || (path_varies && dim_has_mixed_none(&paths))
+        || (query_varies && dim_has_mixed_none(&queries))
+        || (body_varies && dim_has_mixed_none(&bodies))
+    {
+        return None;
+    }
+
+    let mut parts = Vec::new();
+    if let Some(expr) = equality_or_in("request_path", &paths) {
+        parts.push(expr);
+    }
+    if let Some(expr) = equality_or_in("request_query", &queries) {
+        parts.push(expr);
+    }
+    if let Some(expr) = equality_or_in("request_body", &bodies) {
+        parts.push(expr);
+    }
+    combine_exprs_balanced(parts, Expr::and)
+}
+
+fn connector_safe_missing_key_exprs(keys: &[RequestedCacheKey]) -> Vec<Expr> {
+    if let Some(expr) = try_factor_keys(keys) {
+        return vec![expr];
+    }
+
+    let mut by_path_body: HashMap<(Option<String>, Option<String>), Vec<RequestedCacheKey>> =
+        HashMap::new();
+    for key in keys {
+        by_path_body
+            .entry((key.path.clone(), key.body.clone()))
+            .or_default()
+            .push(key.clone());
+    }
+
+    let mut result = Vec::new();
+    let mut leftover = Vec::new();
+    let mut group_ids: Vec<(Option<String>, Option<String>)> =
+        by_path_body.keys().cloned().collect();
+    group_ids.sort();
+    for group_id in group_ids {
+        let group = by_path_body.remove(&group_id).unwrap_or_default();
+        match try_factor_keys(&group) {
+            Some(expr) => result.push(expr),
+            None => leftover.extend(group),
+        }
+    }
+    if leftover.is_empty() {
+        return result;
+    }
+
+    leftover.sort_by(|left, right| {
+        (&left.path, &left.query, &left.body).cmp(&(&right.path, &right.query, &right.body))
+    });
+    for key in leftover {
+        if let Some(expr) = key.to_filter_expr() {
+            result.push(expr);
+        }
+    }
+    result
+}
+
+fn collect_http_request_columns(expr: &Expr, columns: &mut HashSet<&'static str>) {
+    for column in expr.column_refs() {
+        if let Some(name) = REQUEST_KEY_COLUMNS
+            .iter()
+            .copied()
+            .chain(std::iter::once("request_headers"))
+            .find(|candidate| *candidate == column.name)
+        {
+            columns.insert(name);
+        }
+    }
+}
+
+/// `true` when `expr` contains an `OR` that names more than one HTTP request
+/// column — the same case [`HttpTableProvider`] rejects.
+fn rejects_http_cross_column_or(expr: &Expr) -> bool {
+    match expr {
+        Expr::BinaryExpr(binary) if binary.op == Operator::Or => {
+            let mut columns = HashSet::new();
+            collect_http_request_columns(binary.left.as_ref(), &mut columns);
+            collect_http_request_columns(binary.right.as_ref(), &mut columns);
+            if columns.len() > 1 {
+                return true;
+            }
+            rejects_http_cross_column_or(binary.left.as_ref())
+                || rejects_http_cross_column_or(binary.right.as_ref())
+        }
+        Expr::BinaryExpr(binary) => {
+            rejects_http_cross_column_or(binary.left.as_ref())
+                || rejects_http_cross_column_or(binary.right.as_ref())
+        }
+        _ => false,
+    }
+}
+
+/// Connector-safe filter sets that fetch the request keys named by `filters`
+/// but absent from `cached_batches`. Each inner `Vec<Expr>` is one origin
+/// scan. The HTTP connector rejects an `OR` whose subtrees mention more than
+/// one request-key column, so multiple missing keys that share a path become
+/// `path = X AND query IN (...)` rather than
+/// `(path = X AND query = q) OR (path = X AND query = r)`. Keys that cannot
+/// be factored without extra combinations become separate scans.
+/// `None` when every named key is present, or when the filters do not name a
+/// discrete request-key set.
+fn missing_request_key_filter_groups(
     filters: &[Expr],
     cached_batches: &[RecordBatch],
-) -> Option<Vec<Expr>> {
+) -> Option<Vec<Vec<Expr>>> {
     let missing = missing_requested_cache_keys(filters, cached_batches)?;
-    let key_preds: Vec<Expr> = missing
-        .iter()
-        .filter_map(RequestedCacheKey::to_filter_expr)
-        .collect();
-    let key_expr = combine_exprs_balanced(key_preds, Expr::or)?;
-    let mut result: Vec<Expr> = filters
+    let non_key: Vec<Expr> = filters
         .iter()
         .filter(|filter| {
             !filter
@@ -873,8 +1023,20 @@ fn missing_request_key_filters(
         })
         .cloned()
         .collect();
-    result.push(key_expr);
-    Some(result)
+    let key_exprs = connector_safe_missing_key_exprs(&missing);
+    if key_exprs.is_empty() {
+        return None;
+    }
+    Some(
+        key_exprs
+            .into_iter()
+            .map(|key_expr| {
+                let mut group = non_key.clone();
+                group.push(key_expr);
+                group
+            })
+            .collect(),
+    )
 }
 
 /// Maximum number of concurrent refresh requests
@@ -3883,8 +4045,8 @@ impl ExecutionPlan for CachingAccelerationScanExec {
                 // Data is fresh or stale. A hit that returned some rows is not
                 // enough when the query named several request keys: missing
                 // keys must still be fetched from the origin.
-                if let Some(missing_filters) =
-                    missing_request_key_filters(&fill_filters, &cached_batches)
+                if let Some(missing_groups) =
+                    missing_request_key_filter_groups(&fill_filters, &cached_batches)
                 {
                     tracing::debug!(
                         dataset = %dataset_name,
@@ -3904,30 +4066,37 @@ impl ExecutionPlan for CachingAccelerationScanExec {
                         &batch_write_tx,
                         namespace.clone(),
                     );
-                    let miss_stream = CacheRefreshHelper::handle_cache_miss(
-                        Arc::clone(&federated),
-                        &session_state,
-                        &dataset_name,
-                        &missing_filters,
-                        limit,
-                        Arc::clone(&schema_clone),
-                        false,
-                        response_filtered,
-                        StaleIfError::Disabled,
-                        max_age.unwrap_or_default(),
-                        None,
-                        &io_runtime,
-                        Arc::clone(&synchronized_children),
-                        batch_write_tx,
-                        namespace,
-                        Arc::clone(&in_flight_revalidations),
-                    )
-                    .await;
-                    let chained = hit_stream.chain(miss_stream);
-                    return Box::pin(RecordBatchStreamAdapter::new(
-                        Arc::clone(&schema_clone),
-                        chained,
-                    )) as SendableRecordBatchStream;
+                    let mut combined: SendableRecordBatchStream =
+                        Box::pin(RecordBatchStreamAdapter::new(
+                            Arc::clone(&schema_clone),
+                            hit_stream,
+                        ));
+                    for missing_filters in &missing_groups {
+                        let miss_stream = CacheRefreshHelper::handle_cache_miss(
+                            Arc::clone(&federated),
+                            &session_state,
+                            &dataset_name,
+                            missing_filters,
+                            limit,
+                            Arc::clone(&schema_clone),
+                            false,
+                            response_filtered,
+                            StaleIfError::Disabled,
+                            max_age.unwrap_or_default(),
+                            None,
+                            &io_runtime,
+                            Arc::clone(&synchronized_children),
+                            batch_write_tx.clone(),
+                            namespace.clone(),
+                            Arc::clone(&in_flight_revalidations),
+                        )
+                        .await;
+                        combined = Box::pin(RecordBatchStreamAdapter::new(
+                            Arc::clone(&schema_clone),
+                            combined.chain(miss_stream),
+                        ));
+                    }
+                    return combined;
                 }
 
                 CacheRefreshHelper::handle_cache_hit(
@@ -5111,6 +5280,17 @@ mod tests {
         assert!(requested_cache_keys(&[]).is_none());
     }
 
+    fn missing_filters_are_connector_safe(groups: &[Vec<Expr>]) {
+        for group in groups {
+            for expr in group {
+                assert!(
+                    !rejects_http_cross_column_or(expr),
+                    "generated filter would be rejected by the HTTP connector: {expr}"
+                );
+            }
+        }
+    }
+
     #[test]
     fn missing_request_key_filters_only_names_absent_keys() {
         let schema = Schema::new(vec![
@@ -5129,8 +5309,14 @@ mod tests {
             col("request_path").eq(lit("/v1/items")),
             col("request_query").in_list(vec![lit("cat=p"), lit("cat=q")], false),
         ];
-        let missing = missing_request_key_filters(&filters, &[cached]).expect("q is absent");
-        let rendered: Vec<String> = missing.iter().map(ToString::to_string).collect();
+        let groups = missing_request_key_filter_groups(&filters, &[cached]).expect("q is absent");
+        missing_filters_are_connector_safe(&groups);
+        assert_eq!(
+            groups.len(),
+            1,
+            "one missing key should be one scan: {groups:?}"
+        );
+        let rendered: Vec<String> = groups[0].iter().map(ToString::to_string).collect();
         assert!(
             rendered.iter().any(|expr| expr.contains("cat=q")),
             "missing filters should name cat=q: {rendered:?}"
@@ -5152,8 +5338,84 @@ mod tests {
         )
         .expect("both keys");
         assert!(
-            missing_request_key_filters(&filters, &[both]).is_none(),
+            missing_request_key_filter_groups(&filters, &[both]).is_none(),
             "complete hit should not produce a fetch"
+        );
+    }
+
+    #[test]
+    fn missing_request_key_filters_factor_two_missing_queries_into_in_list() {
+        let schema = Schema::new(vec![
+            Field::new("request_path", DataType::Utf8, true),
+            Field::new("request_query", DataType::Utf8, true),
+        ]);
+        let cached = RecordBatch::try_new(
+            Arc::new(schema),
+            vec![
+                Arc::new(StringArray::from(vec!["/v1/items"])),
+                Arc::new(StringArray::from(vec!["cat=p"])),
+            ],
+        )
+        .expect("cached row");
+        let filters = vec![
+            col("request_path").eq(lit("/v1/items")),
+            col("request_query").in_list(vec![lit("cat=p"), lit("cat=q"), lit("cat=r")], false),
+        ];
+        let groups =
+            missing_request_key_filter_groups(&filters, &[cached]).expect("q and r are absent");
+        missing_filters_are_connector_safe(&groups);
+        assert_eq!(
+            groups.len(),
+            1,
+            "shared path should stay one connector-safe scan: {groups:?}"
+        );
+        let rendered: Vec<String> = groups[0].iter().map(ToString::to_string).collect();
+        let joined = rendered.join(" AND ");
+        assert!(joined.contains("cat=q"), "{rendered:?}");
+        assert!(joined.contains("cat=r"), "{rendered:?}");
+        assert!(
+            rendered.iter().all(|expr| !expr.contains("cat=p")),
+            "should not re-fetch cat=p: {rendered:?}"
+        );
+        assert!(
+            joined.contains("IN") || joined.contains("in"),
+            "two missing queries on one path should be an IN list: {rendered:?}"
+        );
+    }
+
+    #[test]
+    fn missing_request_key_filters_split_keys_that_cannot_factor() {
+        let schema = Schema::new(vec![
+            Field::new("request_path", DataType::Utf8, true),
+            Field::new("request_query", DataType::Utf8, true),
+        ]);
+        let cached = RecordBatch::try_new(
+            Arc::new(schema),
+            vec![
+                Arc::new(StringArray::from(vec!["/v1/items"])),
+                Arc::new(StringArray::from(vec!["cat=p"])),
+            ],
+        )
+        .expect("cached row");
+        let filters = vec![
+            col("request_path").in_list(vec![lit("/v1/items"), lit("/v1/other")], false),
+            col("request_query").in_list(vec![lit("cat=p"), lit("cat=q")], false),
+        ];
+        let groups = missing_request_key_filter_groups(&filters, &[cached])
+            .expect("three combinations are absent");
+        missing_filters_are_connector_safe(&groups);
+        assert!(
+            groups.len() >= 2,
+            "unfactorable combinations should split into connector-safe scans: {groups:?}"
+        );
+        let rendered: Vec<String> = groups.iter().flatten().map(ToString::to_string).collect();
+        assert!(
+            rendered.iter().any(|expr| expr.contains("/v1/other")),
+            "{rendered:?}"
+        );
+        assert!(
+            rendered.iter().any(|expr| expr.contains("cat=q")),
+            "{rendered:?}"
         );
     }
 
@@ -5203,6 +5465,12 @@ mod tests {
             filters: &[Expr],
             _limit: Option<usize>,
         ) -> DataFusionResult<Arc<dyn ExecutionPlan>> {
+            if filters.iter().any(rejects_http_cross_column_or) {
+                return Err(DataFusionError::Execution(
+                    "OR across different HTTP filter columns is not supported".to_string(),
+                ));
+            }
+
             // Record the filters for later verification
             let filter_strings: Vec<String> = filters
                 .iter()
@@ -8680,6 +8948,49 @@ mod tests {
     /// A backend-first success must not execute its child, whereas an origin
     /// failure reads it once, and the disabled and nonzero-TTL paths retain
     /// their normal cache-first scan.
+    #[tokio::test]
+    async fn partial_hit_in_list_fetches_two_uncached_query_keys() {
+        let schema = http_cache_schema();
+        let now = i64::try_from(
+            SystemTime::now()
+                .duration_since(SystemTime::UNIX_EPOCH)
+                .expect("time went backwards")
+                .as_nanos(),
+        )
+        .expect("now fits in i64 nanoseconds");
+        let cached = http_row_with_key(&schema, "/v1/items", "cat=p", "cached-p", now);
+        let origin_q = http_row_with_key(&schema, "/v1/items", "cat=q", "origin-q", now);
+        let origin_r = http_row_with_key(&schema, "/v1/items", "cat=r", "origin-r", now);
+        let origin = arrow::compute::concat_batches(&schema, &[origin_q, origin_r])
+            .expect("concat origin rows");
+        let filters = vec![
+            col("request_path").eq(lit("/v1/items")),
+            col("request_query").in_list(vec![lit("cat=p"), lit("cat=q"), lit("cat=r")], false),
+        ];
+        let (batches, recorded) = execute_partial_hit(filters, cached, origin).await;
+        assert_eq!(
+            contents_of(&batches),
+            vec![
+                "cached-p".to_string(),
+                "origin-q".to_string(),
+                "origin-r".to_string()
+            ]
+        );
+        assert_eq!(
+            recorded.len(),
+            1,
+            "shared path should be one origin scan: {recorded:?}"
+        );
+        let joined = recorded[0].join(" AND ");
+        assert!(joined.contains("cat=q"), "{recorded:?}");
+        assert!(joined.contains("cat=r"), "{recorded:?}");
+        assert!(!joined.contains("cat=p"), "{recorded:?}");
+        assert!(
+            joined.contains("IN") || joined.contains("in") || joined.contains("In"),
+            "two missing keys should be fetched as an IN list: {recorded:?}"
+        );
+    }
+
     #[tokio::test]
     async fn zero_ttl_backend_first_only_scans_on_failure() {
         let schema = http_cache_schema();
