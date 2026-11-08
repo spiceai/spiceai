@@ -144,8 +144,9 @@ Notes:
 #### Querying the decomposed dataset
 
 Once loaded, the static columns behave like normal columns and the
-catch-all is queryable with JSON functions from your accelerator (shown
-here with Cayenne):
+catch-all is queryable with Spice's JSON functions (`json_get_float`,
+`json_get_str`, `json_get_array`, `json_as_text`), whichever engine
+accelerates the dataset:
 
 ```sql
 -- Top English-language shows by TVmaze rating
@@ -153,8 +154,8 @@ SELECT
   id,
   name,
   premiered,
-  CAST(json_extract(details, '$.rating.average') AS DOUBLE) AS rating,
-  json_extract_string(details, '$.network.name')             AS network
+  json_get_float(details, 'rating', 'average') AS rating,
+  json_get_str(details, 'network', 'name')     AS network
 FROM tvmaze_shows
 WHERE language = 'English'
   AND status = 'Running'
@@ -165,11 +166,12 @@ LIMIT 10;
 SELECT
   s.id,
   s.name,
-  genre.value AS genre
-FROM tvmaze_shows s,
-     LATERAL UNNEST(
-       CAST(json_extract(s.details, '$.genres') AS VARCHAR[])
-     ) AS genre;
+  json_as_text(g.genre) AS genre
+FROM tvmaze_shows s
+JOIN (
+  SELECT id, UNNEST(json_get_array(details, 'genres')) AS genre
+  FROM tvmaze_shows
+) g ON g.id = s.id;
 ```
 
 #### Accelerating with embeddings
@@ -226,7 +228,7 @@ datasets:
 
 ```sql
 SELECT id, name, premiered,
-       json_extract_string(details, '$.network.name') AS network
+       json_get_str(details, 'network', 'name') AS network
 FROM tvmaze_show
 WHERE request_path = '/shows/1';
 ```
@@ -276,9 +278,9 @@ WHERE request_path = '/shows/1';
 Once the source is decomposed into `(id, …, catch_all_json)`, you can
 normalize it into a flattened attribute list with a view. For example,
 to expose every `(show_id, json_path, value)` triple from TVmaze for
-full-text / lineage tracking, use your accelerator's JSON functions
-(`json_extract`, `UNNEST`, recursive CTEs) over the `details` column —
-no custom UDF required.
+full-text / lineage tracking, use Spice's JSON functions
+(`json_get_array`, `json_as_text`, `UNNEST`, recursive CTEs) over the
+`details` column — no custom UDF required.
 
 If you accelerate the decomposed dataset (e.g. with Cayenne), embeddings
 declared on the accelerated view work as usual — both the raw catch-all
