@@ -1291,65 +1291,59 @@ fn find(haystack: &[u8], needle: &[u8]) -> Option<usize> {
 /// than `limit` of them.
 fn inflate_bounded(data: &[u8], limit: u64) -> Vec<u8> {
     let mut out = Vec::new();
-    if inflate_into(data, true, limit, |block| out.extend_from_slice(block)) > 0 {
-        return out;
-    }
-    // A non-conformant producer may omit the zlib header; PDFium accepts the
-    // raw deflate, so the budget must see it too.
-    inflate_into(data, false, limit, |block| out.extend_from_slice(block));
+    inflate(data, limit, |block| out.extend_from_slice(block));
     out
 }
 
-/// Inflates `data` as Flate (zlib, then raw deflate) and returns the number of
-/// bytes produced, reading no more than `limit` of them and discarding the
-/// output. Holds no more than one decoder block, so counting an 8 GiB bomb
-/// costs the CPU to inflate `limit` bytes and essentially no memory.
+/// Inflates `data` as Flate and returns the number of bytes produced, reading
+/// no more than `limit` of them and discarding the output. Holds no more than
+/// one decoder block, so counting an 8 GiB bomb costs the CPU to inflate
+/// `limit` bytes and essentially no memory.
 fn inflate_counting(data: &[u8], limit: u64) -> u64 {
-    let zlib = inflate_into(data, true, limit, |_| {});
-    if zlib > 0 {
-        return zlib;
-    }
-    inflate_into(data, false, limit, |_| {})
+    inflate(data, limit, |_| {})
 }
 
-/// Runs a Flate decoder over `data`, as zlib when `zlib_header` is set and as
-/// raw deflate otherwise, handing each block of output to `sink` until the
-/// stream ends, the decoder fails, or `limit` bytes have come out. Returns the
-/// number of bytes produced.
+/// Inflates `data` as zlib or, when that produces nothing, as raw deflate,
+/// handing each block of output to `sink` until the stream ends, the decoder
+/// fails, or `limit` bytes have come out. Returns the number of bytes produced.
+/// A non-conformant producer may omit the zlib header; `PDFium` accepts the raw
+/// deflate, so the budget must see it too.
 ///
 /// Output produced before a failure, such as a bad checksum or truncated data,
 /// is kept and counted, because `PDFium` keeps it. Decoding through
 /// `std::io::Read` would lose it: the read that meets the failure returns the
 /// error, not the bytes it produced.
-fn inflate_into(data: &[u8], zlib_header: bool, limit: u64, mut sink: impl FnMut(&[u8])) -> u64 {
+fn inflate(data: &[u8], limit: u64, mut sink: impl FnMut(&[u8])) -> u64 {
     use flate2::{Decompress, FlushDecompress, Status};
 
     const BLOCK: usize = 64 * 1024;
-    let mut decoder = Decompress::new(zlib_header);
     let mut block = vec![0u8; BLOCK];
-    let mut produced: u64 = 0;
-    while produced < limit {
-        let consumed =
-            usize::try_from(decoder.total_in()).map_or(data.len(), |n| n.min(data.len()));
-        let room = usize::try_from(limit - produced).map_or(BLOCK, |n| n.min(BLOCK));
-        let out_before = decoder.total_out();
-        let status =
-            decoder.decompress(&data[consumed..], &mut block[..room], FlushDecompress::None);
-        let written =
-            usize::try_from(decoder.total_out() - out_before).map_or(room, |n| n.min(room));
-        sink(&block[..written]);
-        produced = produced.saturating_add(written as u64);
-        match status {
-            Ok(Status::StreamEnd) | Err(_) => break,
-            // No output and no input taken means the data ran out mid-stream.
-            Ok(Status::Ok | Status::BufError) => {
-                if written == 0 && decoder.total_in() == consumed as u64 {
-                    break;
+    let mut decoder = Decompress::new(true);
+    for zlib_header in [true, false] {
+        decoder.reset(zlib_header);
+        while decoder.total_out() < limit {
+            let (in_before, out_before) = (decoder.total_in(), decoder.total_out());
+            let room = usize::try_from(limit - out_before).map_or(BLOCK, |n| n.min(BLOCK));
+            let rest = usize::try_from(in_before).map_or(data.len(), |n| n.min(data.len()));
+            let status =
+                decoder.decompress(&data[rest..], &mut block[..room], FlushDecompress::None);
+            let written = usize::try_from(decoder.total_out() - out_before).unwrap_or(room);
+            sink(&block[..written]);
+            match status {
+                Ok(Status::StreamEnd) | Err(_) => break,
+                // No output and no input taken means the data ran out mid-stream.
+                Ok(Status::Ok | Status::BufError) => {
+                    if written == 0 && decoder.total_in() == in_before {
+                        break;
+                    }
                 }
             }
         }
+        if decoder.total_out() > 0 {
+            return decoder.total_out();
+        }
     }
-    produced
+    0
 }
 
 /// Decodes a PDF `/ASCII85Decode` stream up to `limit` output bytes. The output
@@ -1830,8 +1824,7 @@ mod tests {
     /// fails, as `PDFium` does, so the bomb in the stage after it is budgeted.
     #[test]
     fn decodes_a_flate_chain_whose_first_stage_has_a_bad_checksum() {
-        let over = usize::try_from(MAX_PACKAGE_BYTES).expect("fits usize") + 1024 * 1024;
-        let data = with_bad_checksum(deflate(&deflate_spaces(over)));
+        let data = with_bad_checksum(deflate(&flate_bomb()));
         let pdf = loadable_pdf_with_content_stream(b"[/FlateDecode /FlateDecode]", &data);
         assert_eq!(
             pdf_too_large_reason(&pdf),
