@@ -764,7 +764,10 @@ fn parse_dictionary(data: &[u8], depth: usize) -> Option<ParsedDict> {
         i += 1 + name_len;
         i += ws_len(&data[i..]);
         match name.as_slice() {
-            b"Filter" => {
+            // Only the stream's own dictionary (depth 0) declares its filters,
+            // length and parameters. A nested dictionary is a value: it is
+            // skipped in one pass, so nesting never multiplies the work.
+            b"Filter" if depth == 0 => {
                 let (value, value_len) = parse_filter_value(&data[i..], depth)?;
                 i += value_len;
                 // A duplicate key is undefined in PDF. Fail closed rather than
@@ -775,7 +778,7 @@ fn parse_dictionary(data: &[u8], depth: usize) -> Option<ParsedDict> {
                     value
                 });
             }
-            b"Length" => {
+            b"Length" if depth == 0 => {
                 let (value, value_len) = parse_length_value(&data[i..])?;
                 i += value_len;
                 match value {
@@ -791,7 +794,7 @@ fn parse_dictionary(data: &[u8], depth: usize) -> Option<ParsedDict> {
             }
             // Resolved against the filter chain once the dictionary closes, so
             // the order of `/Filter` and `/DecodeParms` does not matter.
-            b"DecodeParms" | b"DP" => {
+            b"DecodeParms" | b"DP" if depth == 0 => {
                 let value_start = i;
                 let value_len = skip_value(&data[i..], depth + 1)?;
                 // A duplicate key is undefined in PDF, as for `/Filter`.
@@ -862,8 +865,8 @@ fn predicts_final_flate(filters: &[PdfFilter], entry: PredictorEntry) -> bool {
 fn parse_decode_parms(data: &[u8]) -> DecodeParms {
     if data.first() != Some(&b'[') {
         return match decode_parms_entry_predicts(data) {
-            Some(false) => DecodeParms::NoPredictor,
-            Some(true) => DecodeParms::Predictor(PredictorEntry::Dictionary),
+            Some((false, _)) => DecodeParms::NoPredictor,
+            Some((true, _)) => DecodeParms::Predictor(PredictorEntry::Dictionary),
             None => DecodeParms::Unverifiable,
         };
     }
@@ -881,13 +884,12 @@ fn parse_decode_parms(data: &[u8]) -> DecodeParms {
             None => return DecodeParms::Unverifiable,
             Some(_) => {
                 match decode_parms_entry_predicts(&data[i..]) {
-                    Some(false) => {}
-                    Some(true) if predictor.is_none() => predictor = Some(index),
-                    Some(true) | None => return DecodeParms::Unverifiable,
-                }
-                match skip_value(&data[i..], 1) {
-                    Some(len) => i += len,
-                    None => return DecodeParms::Unverifiable,
+                    Some((false, len)) => i += len,
+                    Some((true, len)) if predictor.is_none() => {
+                        predictor = Some(index);
+                        i += len;
+                    }
+                    Some((true, _)) | None => return DecodeParms::Unverifiable,
                 }
                 index += 1;
             }
@@ -895,13 +897,14 @@ fn parse_decode_parms(data: &[u8]) -> DecodeParms {
     }
 }
 
-/// Whether one `/DecodeParms` entry declares a predictor among its own keys:
-/// `Some(false)` for `null` or a dictionary without one, `Some(true)` for a
-/// dictionary with one, and `None` when that cannot be decided (an indirect
-/// reference, a predictor nested inside another value, or a parse failure).
-fn decode_parms_entry_predicts(data: &[u8]) -> Option<bool> {
+/// Whether one `/DecodeParms` entry declares a predictor among its own keys,
+/// and how many bytes the entry takes: `Some((false, _))` for `null` or a
+/// dictionary without one, `Some((true, _))` for a dictionary with one, and
+/// `None` when that cannot be decided (an indirect reference, a predictor
+/// nested inside another value, or a parse failure).
+fn decode_parms_entry_predicts(data: &[u8]) -> Option<(bool, usize)> {
     if data.starts_with(b"null") && token_ends(data, 4) {
-        return Some(false);
+        return Some((false, 4));
     }
     if !data.starts_with(b"<<") {
         return None;
@@ -911,7 +914,7 @@ fn decode_parms_entry_predicts(data: &[u8]) -> Option<bool> {
     loop {
         i += ws_len(&data[i..]);
         if data.get(i..i + 2) == Some(b">>") {
-            return Some(predicts);
+            return Some((predicts, i + 2));
         }
         if data.get(i) != Some(&b'/') {
             return None;
@@ -919,47 +922,44 @@ fn decode_parms_entry_predicts(data: &[u8]) -> Option<bool> {
         let (name, name_len) = read_name(&data[i + 1..]);
         i += 1 + name_len;
         i += ws_len(&data[i..]);
+        let (nested, value_len) = predictor_in_value(&data[i..], 1)?;
         if name.as_slice() == b"Predictor" || name.as_slice() == b"P" {
             predicts = true;
-        } else if decode_parms_has_predictor_at(&data[i..], 1) {
+        } else if nested {
             return None;
         }
-        i += skip_value(&data[i..], 1)?;
+        i += value_len;
     }
 }
 
-/// True when `data` holds a `/Predictor` or `/P` key, searching nested
-/// dictionaries and arrays. Parse failures and excessive nesting count as a
-/// predictor so the caller fails closed.
-fn decode_parms_has_predictor_at(data: &[u8], depth: usize) -> bool {
+/// Whether the value at `data[0]` holds a `/Predictor` or `/P` key, in it or in
+/// any dictionary or array nested in it, and how many bytes the value takes.
+/// The value is read once, nesting included. `None` when it cannot be parsed
+/// or nests past [`MAX_VALUE_DEPTH`]; callers treat that as a predictor, so the
+/// document fails closed.
+fn predictor_in_value(data: &[u8], depth: usize) -> Option<(bool, usize)> {
     if depth > MAX_VALUE_DEPTH {
-        return true;
+        return None;
     }
+    let mut found = false;
     match data.first() {
         Some(b'<') if data.get(1) == Some(&b'<') => {
             let mut i = 2;
             loop {
                 i += ws_len(&data[i..]);
                 if data.get(i..i + 2) == Some(b">>") {
-                    return false;
+                    return Some((found, i + 2));
                 }
                 if data.get(i) != Some(&b'/') {
-                    return true;
+                    return None;
                 }
                 let (name, name_len) = read_name(&data[i + 1..]);
                 i += 1 + name_len;
                 i += ws_len(&data[i..]);
-                if name.as_slice() == b"Predictor" || name.as_slice() == b"P" {
-                    return true;
-                }
-                // Nested DecodeParms arrays/dicts can still hold a predictor.
-                if decode_parms_has_predictor_at(&data[i..], depth + 1) {
-                    return true;
-                }
-                match skip_value(&data[i..], depth + 1) {
-                    Some(len) => i += len,
-                    None => return true,
-                }
+                found |= name.as_slice() == b"Predictor" || name.as_slice() == b"P";
+                let (nested, value_len) = predictor_in_value(&data[i..], depth + 1)?;
+                found |= nested;
+                i += value_len;
             }
         }
         Some(b'[') => {
@@ -967,21 +967,17 @@ fn decode_parms_has_predictor_at(data: &[u8], depth: usize) -> bool {
             loop {
                 i += ws_len(&data[i..]);
                 match data.get(i) {
-                    Some(b']') => return false,
-                    None => return true,
+                    Some(b']') => return Some((found, i + 1)),
+                    None => return None,
                     Some(_) => {
-                        if decode_parms_has_predictor_at(&data[i..], depth + 1) {
-                            return true;
-                        }
-                        match skip_value(&data[i..], depth + 1) {
-                            Some(len) => i += len,
-                            None => return true,
-                        }
+                        let (nested, value_len) = predictor_in_value(&data[i..], depth + 1)?;
+                        found |= nested;
+                        i += value_len;
                     }
                 }
             }
         }
-        _ => false,
+        _ => skip_value(data, depth).map(|len| (false, len)),
     }
 }
 
