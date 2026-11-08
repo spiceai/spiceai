@@ -120,114 +120,47 @@ const fn empty(sql: &'static str) -> Case {
     }
 }
 
-/// A part of a query that the federated plan must send to `PostgreSQL`.
-struct Clause {
-    /// How the case's SQL names it.
-    in_query: &'static str,
-    /// How the SQL Spice sends to `PostgreSQL` may name it. Any one will do.
-    remote: &'static [&'static str],
-}
-
-/// The clauses a federated plan must keep. Both tables come from one
-/// `PostgreSQL` database, so federation sends the whole query there: a clause
-/// the query names and the SQL sent to `PostgreSQL` does not means Spice
-/// evaluated that part itself, over a wider scan. The answer can still match,
-/// but then it compares `DataFusion` with `PostgreSQL`, which the accelerated
-/// side already does, and not the translation this test exists to check.
-const CLAUSES: &[Clause] = &[
-    Clause {
-        in_query: "WHERE",
-        remote: &["WHERE"],
-    },
-    Clause {
-        in_query: "GROUP BY",
-        remote: &["GROUP BY"],
-    },
-    Clause {
-        in_query: "HAVING",
-        remote: &["HAVING"],
-    },
-    Clause {
-        in_query: "SELECT DISTINCT",
-        remote: &["DISTINCT", "GROUP BY"],
-    },
-    Clause {
-        in_query: "count(",
-        remote: &["count("],
-    },
-    Clause {
-        in_query: "sum(",
-        remote: &["sum("],
-    },
-    Clause {
-        in_query: "min(",
-        remote: &["min("],
-    },
-    Clause {
-        in_query: "max(",
-        remote: &["max("],
-    },
-    Clause {
-        in_query: "JOIN",
-        remote: &["JOIN"],
-    },
-    Clause {
-        in_query: "ORDER BY",
-        remote: &["ORDER BY"],
-    },
-    Clause {
-        in_query: "LIMIT",
-        remote: &["LIMIT"],
-    },
-    Clause {
-        in_query: "OFFSET",
-        remote: &["OFFSET"],
-    },
-    Clause {
-        in_query: "UNION",
-        remote: &["UNION"],
-    },
-    // The unparser sends a set operation as the semi or anti join DataFusion
-    // plans it as: `SELECT DISTINCT … WHERE [NOT] EXISTS (…)`.
-    Clause {
-        in_query: "INTERSECT",
-        remote: &["INTERSECT", "WHERE EXISTS"],
-    },
-    Clause {
-        in_query: "EXCEPT",
-        remote: &["EXCEPT", "WHERE NOT EXISTS"],
-    },
-    Clause {
-        in_query: "OVER",
-        remote: &["OVER"],
-    },
+/// The operators a federated plan may run in Spice: wrappers that pass rows
+/// through, and the scan that sends SQL to `PostgreSQL`. Both tables come from
+/// one `PostgreSQL` database, so federation sends the whole query there. Any
+/// other operator means Spice evaluated part of the query itself, over a wider
+/// scan: a filter, an aggregate, a join, a sort, a window, or a computed
+/// column. The answer can still match, but then it compares `DataFusion` with
+/// `PostgreSQL`, which the accelerated side already does, and not the
+/// translation this test exists to check.
+const PASS_THROUGH: [&str; 3] = [
+    "SchemaCastScanExec",
+    "CooperativeExec",
+    "BytesProcessedExec",
 ];
+const REMOTE_SCANS: [&str; 2] = ["VirtualExecutionPlan", "SqlExec"];
 
-impl Clause {
-    fn sent_in(&self, remote: &str) -> bool {
-        self.remote.iter().any(|spelling| remote.contains(spelling))
-    }
-}
-
-/// Checks that the SQL `remote` the federated plan sends to `PostgreSQL` names
-/// every clause `case` names, and returns how many that is.
-fn check_remote_clauses(case: &Case, remote: &str) -> Result<usize, String> {
-    let named: Vec<&Clause> = CLAUSES
+/// Checks that the physical plan in `plan`, an `EXPLAIN` answer, runs nothing
+/// in Spice but [`PASS_THROUGH`] operators over one of [`REMOTE_SCANS`].
+fn check_nothing_local(plan: &[Row]) -> Result<(), String> {
+    let physical = plan
         .iter()
-        .filter(|clause| case.sql.contains(clause.in_query))
+        .find(|row| row.first().and_then(Option::as_deref) == Some("physical_plan"))
+        .and_then(|row| row.get(1).cloned().flatten())
+        .ok_or_else(|| format!("the plan has no physical plan: {plan:?}"))?;
+    let operators: Vec<&str> = physical
+        .lines()
+        .filter_map(|line| line.split([':', ' ']).find(|token| !token.is_empty()))
         .collect();
-    let missing: Vec<&str> = named
+    let local: Vec<&str> = operators
         .iter()
-        .filter(|clause| !clause.sent_in(remote))
-        .map(|clause| clause.in_query)
+        .copied()
+        .filter(|op| !PASS_THROUGH.contains(op) && !REMOTE_SCANS.contains(op))
         .collect();
-    if missing.is_empty() {
-        Ok(named.len())
-    } else {
-        Err(format!(
-            "Spice evaluates {missing:?} itself instead of sending it to PostgreSQL:\n    {remote}"
-        ))
+    if !local.is_empty() {
+        return Err(format!(
+            "Spice evaluates {local:?} itself instead of sending it to PostgreSQL:\n{physical}"
+        ));
     }
+    if !operators.iter().any(|op| REMOTE_SCANS.contains(op)) {
+        return Err(format!("the plan sends no SQL to PostgreSQL:\n{physical}"));
+    }
+    Ok(())
 }
 
 fn cases() -> Vec<Case> {
@@ -431,21 +364,6 @@ async fn postgres_rows(client: &tokio_postgres::Client, sql: &str) -> Result<Vec
         .collect())
 }
 
-/// The SQL a federated plan sends to `PostgreSQL`, one statement per line.
-fn pushed_down_sql(plan: &[Row]) -> String {
-    plan.iter()
-        .flatten()
-        .flatten()
-        .flat_map(|cell| cell.lines())
-        .filter_map(|line| {
-            line.split_once("base_sql=")
-                .or_else(|| line.split_once("SqlExec sql="))
-                .map(|(_, sql)| sql.trim())
-        })
-        .collect::<Vec<_>>()
-        .join("\n")
-}
-
 fn agreement(subject: &[Row], oracle: &[Row], ordered: bool) -> Result<(), &'static str> {
     if ordered {
         return (subject == oracle)
@@ -459,7 +377,7 @@ fn agreement(subject: &[Row], oracle: &[Row], ordered: bool) -> Result<(), &'sta
 }
 
 /// One Spice side of the comparison: the datasets it reads, and whether its
-/// plan must send SQL to `PostgreSQL`.
+/// plan must send the whole query to `PostgreSQL`.
 struct Subject {
     name: &'static str,
     items: &'static str,
@@ -487,7 +405,7 @@ async fn compare_case(
     client: &tokio_postgres::Client,
     case: &Case,
     failures: &mut Vec<String>,
-) -> Result<usize, anyhow::Error> {
+) -> Result<bool, anyhow::Error> {
     let oracle_sql = case
         .sql
         .replace("{items}", "diff_items")
@@ -503,7 +421,7 @@ async fn compare_case(
         ));
     }
 
-    let mut remote_clauses = 0;
+    let mut all_remote = true;
     for subject in &SUBJECTS {
         let name = subject.name;
         let sql = case
@@ -521,26 +439,19 @@ async fn compare_case(
             Err(e) => failures.push(format!("{name}: {sql}\n    failed: {e}")),
         }
         if subject.federated {
-            // The federated side must send the query's clauses to PostgreSQL, or
+            // The federated side must send the whole query to PostgreSQL, or
             // it is DataFusion over a wider scan and compares nothing the
             // accelerated side does not.
             let plan = spice_rows(rt, &format!("EXPLAIN {sql}"))
                 .await
                 .map_err(|e| anyhow::anyhow!("EXPLAIN {sql}: {e}"))?;
-            let remote = pushed_down_sql(&plan);
-            if remote.is_empty() {
-                failures.push(format!(
-                    "{name}: {sql}\n    the plan sends no SQL to PostgreSQL:\n{plan:?}"
-                ));
-                continue;
-            }
-            match check_remote_clauses(case, &remote) {
-                Ok(sent) => remote_clauses += sent,
-                Err(reason) => failures.push(format!("{name}: {sql}\n    {reason}")),
+            if let Err(reason) = check_nothing_local(&plan) {
+                failures.push(format!("{name}: {sql}\n    {reason}"));
+                all_remote = false;
             }
         }
     }
-    Ok(remote_clauses)
+    Ok(all_remote)
 }
 
 #[tokio::test]
@@ -592,14 +503,16 @@ async fn federated_and_accelerated_postgres_answers_match_postgres() -> Result<(
 
             let cases = cases();
             let mut failures = Vec::new();
-            let mut remote_clauses = 0;
+            let mut all_remote = 0_usize;
             for case in &cases {
-                remote_clauses += compare_case(&rt, &client, case, &mut failures).await?;
+                if compare_case(&rt, &client, case, &mut failures).await? {
+                    all_remote += 1;
+                }
             }
             eprintln!(
-                "postgres federation differential: {} cases, {} query clauses sent to PostgreSQL, {} failures",
+                "postgres federation differential: {} cases, {} federated plans sent the whole query to PostgreSQL, {} failures",
                 cases.len(),
-                remote_clauses,
+                all_remote,
                 failures.len()
             );
 
