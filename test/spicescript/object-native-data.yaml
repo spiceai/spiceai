@@ -180,27 +180,34 @@ steps:
 
   # A data file truncated, then deleted: each query fails with its error and
   # returns no rows, rather than fewer. `mode: file_create` reloads the dataset
-  # from its source.
+  # from its source. Each change is followed by a restart, so the queries read
+  # the file from the store rather than the segments this process already
+  # holds, and each query reads rows, since `count(*)` and `sum` are answered
+  # from maintained aggregates without the data files.
   - source-exec: { lake: 'truncate-first moved/cayenne/v1/datasets/facts- .vortex' }
+    only: *in-location
+  - restart: {}
     only: *in-location
   - query: SELECT * FROM facts
     expect-error: "Failed to query dataset 'facts' (cayenne): data file '"
     only: *in-location
-  - query: SELECT count(*) AS n, sum(v) AS s FROM facts
+  - query: SELECT id, v FROM facts WHERE id % 7 = 0
     expect-error: "is unreadable (it has "
     only: *in-location
-  - query: SELECT max(id) AS m FROM facts
+  - query: SELECT id, ts FROM facts WHERE v > 0
     expect-error: "so the query fails rather than return partial results. To reload the dataset from its source, start it once with `acceleration.mode: file_create`. See: https://spiceai.org/docs/components/data-accelerators/cayenne"
     only: *in-location
   - source-exec: { lake: 'delete-first moved/cayenne/v1/datasets/facts- .vortex' }
     only: *in-location
+  - restart: {}
+    only: *in-location
   - query: SELECT * FROM facts
     expect-error: "Failed to query dataset 'facts' (cayenne): data file '"
     only: *in-location
-  - query: SELECT count(*) AS n, sum(v) AS s FROM facts
+  - query: SELECT id, v FROM facts WHERE id % 7 = 0
     expect-error: "' is missing from 's3://"
     only: *in-location
-  - query: SELECT max(id) AS m FROM facts
+  - query: SELECT id, ts FROM facts WHERE v > 0
     expect-error: "so the query fails rather than return partial results. To reload the dataset from its source, start it once with `acceleration.mode: file_create`. See: https://spiceai.org/docs/components/data-accelerators/cayenne"
     only: *in-location
   - restart:

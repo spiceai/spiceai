@@ -1660,14 +1660,6 @@
     {
       "run": "mysql-cdc-parity",
       "who": "object-native-data-local",
-      "key": "query: SELECT * FROM orders #8",
-      "kind": "error",
-      "signature": "still failing after <n> attempts over <duration>: Spice rejected the query: Query execution failed. table 'spice.public.orders' not found: table 'spice.public.orders' not found",
-      "group": "cayenne"
-    },
-    {
-      "run": "mysql-cdc-parity",
-      "who": "object-native-data-local",
       "key": "query: SELECT * FROM customers #8",
       "kind": "error",
       "signature": "still failing after <n> attempts over <duration>: Spice rejected the query: Query execution failed. table 'spice.public.customers' not found: table 'spice.public.customers' not found",
@@ -2355,14 +2347,6 @@
       "key": "assert-files: {\"contains\":\"^state/cayenne/v1/datasets/orders-[^/]+/data/\"}",
       "kind": "other",
       "signature": "no file matches /^state/cayenne/v1/datasets/orders-[^/]+/data//",
-      "group": "cayenne"
-    },
-    {
-      "run": "postgres-cdc-parity",
-      "who": "object-native-data-local",
-      "key": "query: SELECT * FROM orders #8",
-      "kind": "error",
-      "signature": "still failing after <n> attempts over <duration>: Spice rejected the query: Query execution failed. table 'spice.public.orders' not found: table 'spice.public.orders' not found",
       "group": "cayenne"
     },
     {
