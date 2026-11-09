@@ -1,15 +1,19 @@
 name: snapshots-reader-removed-engine
 description: >
   A `file_format: snapshot` dataset whose snapshots a release published with
-  the `turso` engine fails to load on a build that no longer has it, with the
-  fix and the migration guide in its status and one error line, while the rest
-  of the Spicepod serves. Spice never rebuilds those snapshots into another
-  engine on its own.
+  a removed engine, `turso` or `duckdb`, fails to load on a build that no
+  longer has it, with the fix and the migration guide in its status and one
+  error line, while the rest of the Spicepod serves. Spice never rebuilds
+  those snapshots into another engine on its own.
 
 # No OSS release can publish snapshots (it has only the `release` and `models`
-# features), so run this with `--from` a build from before Turso's removal that
-# has `postgres`, `snapshots` and `turso`, as this directory's README shows.
+# features), so run this with `--from` a build from before the engine's removal
+# that has `postgres`, `snapshots` and the engine, as this directory's README
+# shows.
 from: 2.4.x
+
+matrix:
+  engine: [turso, duckdb]
 
 sources:
   src: { kind: postgres }
@@ -36,7 +40,7 @@ spicepod:
       params: ${sources.src.params}
       acceleration:
         enabled: true
-        engine: turso
+        engine: '${matrix.engine}'
         mode: file
         refresh_mode: full
         refresh_check_interval: 1h
@@ -49,7 +53,7 @@ steps:
         CREATE TABLE t (id int PRIMARY KEY, v text);
         INSERT INTO t SELECT i, 'v' || i FROM generate_series(1, 1000) i;
 
-  # The release accelerates `t` with Turso and publishes its snapshot.
+  # The release accelerates `t` with the engine and publishes its snapshot.
   - start: {}
   - query: SELECT * FROM t
     expect: { oracle: src }
@@ -93,6 +97,13 @@ steps:
       status: Error
       message-contains: "/state/snapshots/' were created with the 'turso' engine, and the acceleration engine `turso` is no longer supported as of v2.5 and cannot be used. Set `acceleration.engine: cayenne`, or remove `engine` to use the default, which is `cayenne`, then delete the old engine's acceleration files and snapshots. See: https://spiceai.org/docs/components/data-accelerators/cayenne/migration"
     eventually: 30s
+    when: { engine: turso }
+  - assert-status:
+      dataset: t
+      status: Error
+      message-contains: "/state/snapshots/' were created with the 'duckdb' engine, and the acceleration engine `duckdb` is no longer supported as of v2.5 and cannot be used. Set `acceleration.engine: cayenne`, or remove `engine` to use the default, which is `cayenne`, then delete the old engine's acceleration files and snapshots. See: https://spiceai.org/docs/components/data-accelerators/cayenne/migration"
+    eventually: 30s
+    when: { engine: duckdb }
   - query: SELECT * FROM t
     expect-error: "table 'spice.public.t' not found"
   # The refusal is permanent: one error line, not a retry loop, and not the
@@ -101,3 +112,9 @@ steps:
       count:
         "ERROR .*Failed to load dataset 't' from its snapshots, so it cannot be queried: the snapshots at 's3://[^/']+/state/snapshots/' were created with the 'turso' engine, and the acceleration engine `turso` is no longer supported as of v2.5 .*cayenne/migration$": 1
       lacks: ["a build that includes 'turso'", "loads the turso snapshots"]
+    when: { engine: turso }
+  - assert-log:
+      count:
+        "ERROR .*Failed to load dataset 't' from its snapshots, so it cannot be queried: the snapshots at 's3://[^/']+/state/snapshots/' were created with the 'duckdb' engine, and the acceleration engine `duckdb` is no longer supported as of v2.5 .*cayenne/migration$": 1
+      lacks: ["a build that includes 'duckdb'", "loads the duckdb snapshots"]
+    when: { engine: duckdb }
