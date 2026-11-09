@@ -3882,15 +3882,15 @@ struct ObjectNativeDataPlacement {
 }
 
 /// What `source` needs that data in the object-native location does not support yet,
-/// as the setting to name in a message; `None` when its data can go there. Covered
-/// so far: `refresh_mode: full` and `append`, with or without a primary key (whose
-/// upserts write deletion vectors through the dataset's store); change streams are
-/// not.
+/// as the setting to name in a message; `None` when its data can go there. Covered:
+/// `refresh_mode: full`, `append` and `changes`, with or without a primary key.
+/// Upserts and deletes write deletion vectors through the dataset's store, and a
+/// change stream's acknowledged position commits with the data it covers, so a
+/// dataset reopened from the location alone resumes from it.
 fn object_native_data_unsupported(source: &dyn AccelerationSource) -> Option<&'static str> {
     let acceleration = source.acceleration()?;
     match resolved_refresh_mode(source, acceleration) {
-        RefreshMode::Full | RefreshMode::Append => {}
-        RefreshMode::Changes => return Some("`refresh_mode: changes`"),
+        RefreshMode::Full | RefreshMode::Append | RefreshMode::Changes => {}
         RefreshMode::Caching => return Some("`refresh_mode: caching`"),
         RefreshMode::Snapshot => return Some("`refresh_mode: snapshot`"),
         RefreshMode::Disabled => return Some("`refresh_mode: disabled`"),

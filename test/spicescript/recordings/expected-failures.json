@@ -1659,39 +1659,7 @@
     },
     {
       "run": "mysql-cdc-parity",
-      "who": "object-native-data-rustfs",
-      "key": "assert-objects: {\"contains\":\"/data/\",\"min\":1,\"prefix\":\"state/cayenne/v1/datasets/customers-\",\"source\":\"lake\"}",
-      "kind": "other",
-      "signature": "expected at least 1 objects under 'state/cayenne/v1/datasets/customers-' containing '/data/' in 'lake', found 0: []",
-      "group": "cayenne"
-    },
-    {
-      "run": "mysql-cdc-parity",
-      "who": "object-native-data-rustfs-latency",
-      "key": "assert-objects: {\"contains\":\"/data/\",\"min\":1,\"prefix\":\"state/cayenne/v1/datasets/customers-\",\"source\":\"slow-lake\"}",
-      "kind": "other",
-      "signature": "expected at least 1 objects under 'state/cayenne/v1/datasets/customers-' containing '/data/' in 'slow-lake', found 0: []",
-      "group": "cayenne"
-    },
-    {
-      "run": "mysql-cdc-parity",
       "who": "object-native-data-local",
-      "key": "query: SELECT * FROM orders #8",
-      "kind": "error",
-      "signature": "still failing after <n> attempts over <duration>: Spice rejected the query: Query execution failed. table 'spice.public.orders' not found: table 'spice.public.orders' not found",
-      "group": "cayenne"
-    },
-    {
-      "run": "mysql-cdc-parity",
-      "who": "object-native-data-rustfs",
-      "key": "query: SELECT * FROM orders #8",
-      "kind": "error",
-      "signature": "still failing after <n> attempts over <duration>: Spice rejected the query: Query execution failed. table 'spice.public.orders' not found: table 'spice.public.orders' not found",
-      "group": "cayenne"
-    },
-    {
-      "run": "mysql-cdc-parity",
-      "who": "object-native-data-rustfs-latency",
       "key": "query: SELECT * FROM orders #8",
       "kind": "error",
       "signature": "still failing after <n> attempts over <duration>: Spice rejected the query: Query execution failed. table 'spice.public.orders' not found: table 'spice.public.orders' not found",
@@ -1707,22 +1675,6 @@
     },
     {
       "run": "mysql-cdc-parity",
-      "who": "object-native-data-rustfs",
-      "key": "query: SELECT * FROM customers #8",
-      "kind": "error",
-      "signature": "still failing after <n> attempts over <duration>: Spice rejected the query: Query execution failed. table 'spice.public.customers' not found: table 'spice.public.customers' not found",
-      "group": "cayenne"
-    },
-    {
-      "run": "mysql-cdc-parity",
-      "who": "object-native-data-rustfs-latency",
-      "key": "query: SELECT * FROM customers #8",
-      "kind": "error",
-      "signature": "still failing after <n> attempts over <duration>: Spice rejected the query: Query execution failed. table 'spice.public.customers' not found: table 'spice.public.customers' not found",
-      "group": "cayenne"
-    },
-    {
-      "run": "mysql-cdc-parity",
       "who": "object-native-data-local",
       "key": "query: SELECT * FROM orders #9",
       "kind": "error",
@@ -1731,41 +1683,7 @@
     },
     {
       "run": "mysql-cdc-parity",
-      "who": "object-native-data-rustfs",
-      "key": "query: SELECT * FROM orders #9",
-      "kind": "error",
-      "signature": "still failing after <n> attempts over <duration>: Spice rejected the query: Query execution failed. table 'spice.public.orders' not found: table 'spice.public.orders' not found",
-      "group": "cayenne"
-    },
-    {
-      "run": "mysql-cdc-parity",
-      "who": "object-native-data-rustfs-latency",
-      "key": "query: SELECT * FROM orders #9",
-      "kind": "error",
-      "signature": "still failing after <n> attempts over <duration>: Spice rejected the query: Query execution failed. table 'spice.public.orders' not found: table 'spice.public.orders' not found",
-      "group": "cayenne"
-    },
-    {
-      "run": "mysql-cdc-parity",
       "who": "object-native-data-local",
-      "key": "query: SELECT * FROM customers #9",
-      "kind": "error",
-      "signature": "still failing after <n> attempts over <duration>: Spice rejected the query: Query execution failed. table 'spice.public.customers' not found: table 'spice.public.customers' not found",
-      "group": "cayenne",
-      "may-pass": true
-    },
-    {
-      "run": "mysql-cdc-parity",
-      "who": "object-native-data-rustfs",
-      "key": "query: SELECT * FROM customers #9",
-      "kind": "error",
-      "signature": "still failing after <n> attempts over <duration>: Spice rejected the query: Query execution failed. table 'spice.public.customers' not found: table 'spice.public.customers' not found",
-      "group": "cayenne",
-      "may-pass": true
-    },
-    {
-      "run": "mysql-cdc-parity",
-      "who": "object-native-data-rustfs-latency",
       "key": "query: SELECT * FROM customers #9",
       "kind": "error",
       "signature": "still failing after <n> attempts over <duration>: Spice rejected the query: Query execution failed. table 'spice.public.customers' not found: table 'spice.public.customers' not found",
@@ -2441,39 +2359,7 @@
     },
     {
       "run": "postgres-cdc-parity",
-      "who": "object-native-data-rustfs",
-      "key": "assert-objects: {\"contains\":\"/data/\",\"min\":1,\"prefix\":\"state/cayenne/v1/datasets/orders-\",\"source\":\"lake\"}",
-      "kind": "other",
-      "signature": "expected at least 1 objects under 'state/cayenne/v1/datasets/orders-' containing '/data/' in 'lake', found 0: []",
-      "group": "cayenne"
-    },
-    {
-      "run": "postgres-cdc-parity",
-      "who": "object-native-data-rustfs-latency",
-      "key": "assert-objects: {\"contains\":\"/data/\",\"min\":1,\"prefix\":\"state/cayenne/v1/datasets/orders-\",\"source\":\"slow-lake\"}",
-      "kind": "other",
-      "signature": "expected at least 1 objects under 'state/cayenne/v1/datasets/orders-' containing '/data/' in 'slow-lake', found 0: []",
-      "group": "cayenne"
-    },
-    {
-      "run": "postgres-cdc-parity",
       "who": "object-native-data-local",
-      "key": "query: SELECT * FROM orders #8",
-      "kind": "error",
-      "signature": "still failing after <n> attempts over <duration>: Spice rejected the query: Query execution failed. table 'spice.public.orders' not found: table 'spice.public.orders' not found",
-      "group": "cayenne"
-    },
-    {
-      "run": "postgres-cdc-parity",
-      "who": "object-native-data-rustfs",
-      "key": "query: SELECT * FROM orders #8",
-      "kind": "error",
-      "signature": "still failing after <n> attempts over <duration>: Spice rejected the query: Query execution failed. table 'spice.public.orders' not found: table 'spice.public.orders' not found",
-      "group": "cayenne"
-    },
-    {
-      "run": "postgres-cdc-parity",
-      "who": "object-native-data-rustfs-latency",
       "key": "query: SELECT * FROM orders #8",
       "kind": "error",
       "signature": "still failing after <n> attempts over <duration>: Spice rejected the query: Query execution failed. table 'spice.public.orders' not found: table 'spice.public.orders' not found",
@@ -2489,22 +2375,6 @@
     },
     {
       "run": "postgres-cdc-parity",
-      "who": "object-native-data-rustfs",
-      "key": "query: SELECT * FROM customers #7",
-      "kind": "error",
-      "signature": "still failing after <n> attempts over <duration>: Spice rejected the query: Query execution failed. table 'spice.public.customers' not found: table 'spice.public.customers' not found",
-      "group": "cayenne"
-    },
-    {
-      "run": "postgres-cdc-parity",
-      "who": "object-native-data-rustfs-latency",
-      "key": "query: SELECT * FROM customers #7",
-      "kind": "error",
-      "signature": "still failing after <n> attempts over <duration>: Spice rejected the query: Query execution failed. table 'spice.public.customers' not found: table 'spice.public.customers' not found",
-      "group": "cayenne"
-    },
-    {
-      "run": "postgres-cdc-parity",
       "who": "object-native-data-local",
       "key": "query: SELECT * FROM orders #9",
       "kind": "error",
@@ -2513,41 +2383,7 @@
     },
     {
       "run": "postgres-cdc-parity",
-      "who": "object-native-data-rustfs",
-      "key": "query: SELECT * FROM orders #9",
-      "kind": "error",
-      "signature": "still failing after <n> attempts over <duration>: Spice rejected the query: Query execution failed. table 'spice.public.orders' not found: table 'spice.public.orders' not found",
-      "group": "cayenne"
-    },
-    {
-      "run": "postgres-cdc-parity",
-      "who": "object-native-data-rustfs-latency",
-      "key": "query: SELECT * FROM orders #9",
-      "kind": "error",
-      "signature": "still failing after <n> attempts over <duration>: Spice rejected the query: Query execution failed. table 'spice.public.orders' not found: table 'spice.public.orders' not found",
-      "group": "cayenne"
-    },
-    {
-      "run": "postgres-cdc-parity",
-      "who": "object-native-data-rustfs-latency",
-      "key": "query: SELECT * FROM customers #8",
-      "kind": "error",
-      "signature": "still failing after <n> attempts over <duration>: Spice rejected the query: Query execution failed. table 'spice.public.customers' not found: table 'spice.public.customers' not found",
-      "group": "cayenne",
-      "may-pass": true
-    },
-    {
-      "run": "postgres-cdc-parity",
       "who": "object-native-data-local",
-      "key": "query: SELECT * FROM customers #8",
-      "kind": "error",
-      "signature": "still failing after <n> attempts over <duration>: Spice rejected the query: Query execution failed. table 'spice.public.customers' not found: table 'spice.public.customers' not found",
-      "group": "cayenne",
-      "may-pass": true
-    },
-    {
-      "run": "postgres-cdc-parity",
-      "who": "object-native-data-rustfs",
       "key": "query: SELECT * FROM customers #8",
       "kind": "error",
       "signature": "still failing after <n> attempts over <duration>: Spice rejected the query: Query execution failed. table 'spice.public.customers' not found: table 'spice.public.customers' not found",
