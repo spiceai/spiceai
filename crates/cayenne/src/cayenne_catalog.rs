@@ -1485,71 +1485,7 @@ impl CayenneCatalog {
         memory_mode: bool,
         settings_change: SettingsChangeAction,
     ) -> CatalogResult<()> {
-        if table.path.starts_with("s3://") || memory_mode {
-            return Ok(());
-        }
-        // Scans read the current snapshot and every protected one (rows staged
-        // by CDC upserts and checkpoints live in their own snapshots), so every
-        // live snapshot is checked before deciding: a tolerated mismatch in one
-        // must not hide unreadable rows in another.
-        let mut protected: Vec<String> = self
-            .get_all_snapshot_sequences(&table.table_id)
-            .await?
-            .into_keys()
-            .filter(|snapshot_id| *snapshot_id != table.current_snapshot_id)
-            .collect();
-        protected.sort();
-        let mut damages = Vec::new();
-        for snapshot_id in std::iter::once(table.current_snapshot_id.clone()).chain(protected) {
-            let manifest = self
-                .get_snapshot_files(&table.table_id, &snapshot_id)
-                .await?;
-            if let Some(damage) = inspect_stored_data_files(table, &snapshot_id, manifest).await? {
-                damages.push(damage);
-            }
-        }
-        if damages.is_empty() {
-            return Ok(());
-        }
-        let leaves_rows_unreadable = damages.iter().any(StoredFileDamage::leaves_rows_unreadable);
-        let damage = damages
-            .iter()
-            .map(ToString::to_string)
-            .collect::<Vec<_>>()
-            .join("; ");
-        let table_name = table.table_name.as_str();
-        match settings_change {
-            SettingsChangeAction::Rebuild => {
-                tracing::warn!(
-                    "Dataset '{table_name}': the acceleration's data files do not match the Cayenne metastore ({damage}). Dropping it and reloading it from the source."
-                );
-                Err(CatalogError::StoredDataFilesRequireRebuild {
-                    table_name: table_name.to_string(),
-                    damage,
-                })
-            }
-            SettingsChangeAction::HoldUntilSourceReadable => {
-                Err(CatalogError::StoredDataFilesDamaged {
-                    table_name: table_name.to_string(),
-                    damage,
-                    remedy: "It is reloaded from the source once the source can be read."
-                        .to_string(),
-                })
-            }
-            SettingsChangeAction::KeepStored if leaves_rows_unreadable => {
-                Err(CatalogError::StoredDataFilesDamaged {
-                    table_name: table_name.to_string(),
-                    damage,
-                    remedy: "It is not reloaded automatically, because its settings can keep rows a reload from the source would not bring back. Restore the files, or reload it from the source by restarting once with `mode: file_create` and then setting the mode back; rows that exist only in the acceleration are not kept. See: https://spiceai.org/docs/components/data-accelerators/cayenne".to_string(),
-                })
-            }
-            SettingsChangeAction::KeepStored => {
-                tracing::warn!(
-                    "Dataset '{table_name}': the acceleration's data files do not match the Cayenne metastore ({damage}). It is not reloaded automatically, because its settings can keep rows a reload from the source would not bring back, so queries do not return the rows those files held. To reload it from the source, restart once with `mode: file_create`, then set the mode back. See: https://spiceai.org/docs/components/data-accelerators/cayenne"
-                );
-                Ok(())
-            }
-        }
+        verify_stored_data_files_in(self, table, memory_mode, settings_change).await
     }
 
     async fn validate_existing_table_configuration(
@@ -6168,6 +6104,83 @@ fn stored_snapshot_dir(table_path: &str, table_id: &str, snapshot_id: &str) -> s
     std::path::PathBuf::from(crate::metastore_layout::fs_probe_path(table_path))
         .join(table_id)
         .join(snapshot_id)
+}
+
+/// Check a table's live snapshots against the data files on disk, through any
+/// catalog's reads, and decide by `settings_change` whether a mismatch rebuilds
+/// the table, holds it, refuses it, or is served with a warning. See
+/// [`CayenneCatalog::verify_stored_data_files`] for the rules.
+pub(crate) async fn verify_stored_data_files_in<C: MetadataCatalog + ?Sized>(
+    catalog: &C,
+    table: &TableMetadata,
+    memory_mode: bool,
+    settings_change: SettingsChangeAction,
+) -> CatalogResult<()> {
+    if table.path.starts_with("s3://") || memory_mode {
+        return Ok(());
+    }
+    // Scans read the current snapshot and every protected one (rows staged
+    // by CDC upserts and checkpoints live in their own snapshots), so every
+    // live snapshot is checked before deciding: a tolerated mismatch in one
+    // must not hide unreadable rows in another.
+    let mut protected: Vec<String> = catalog
+        .get_all_snapshot_sequences(&table.table_id)
+        .await?
+        .into_keys()
+        .filter(|snapshot_id| *snapshot_id != table.current_snapshot_id)
+        .collect();
+    protected.sort();
+    let mut damages = Vec::new();
+    for snapshot_id in std::iter::once(table.current_snapshot_id.clone()).chain(protected) {
+        let manifest = catalog
+            .get_snapshot_files(&table.table_id, &snapshot_id)
+            .await?;
+        if let Some(damage) = inspect_stored_data_files(table, &snapshot_id, manifest).await? {
+            damages.push(damage);
+        }
+    }
+    if damages.is_empty() {
+        return Ok(());
+    }
+    let leaves_rows_unreadable = damages.iter().any(StoredFileDamage::leaves_rows_unreadable);
+    let damage = damages
+        .iter()
+        .map(ToString::to_string)
+        .collect::<Vec<_>>()
+        .join("; ");
+    let table_name = table.table_name.as_str();
+    match settings_change {
+        SettingsChangeAction::Rebuild => {
+            tracing::warn!(
+                "Dataset '{table_name}': the acceleration's data files do not match the Cayenne metastore ({damage}). Dropping it and reloading it from the source."
+            );
+            Err(CatalogError::StoredDataFilesRequireRebuild {
+                table_name: table_name.to_string(),
+                damage,
+            })
+        }
+        SettingsChangeAction::HoldUntilSourceReadable => {
+            Err(CatalogError::StoredDataFilesDamaged {
+                table_name: table_name.to_string(),
+                damage,
+                remedy: "It is reloaded from the source once the source can be read."
+                    .to_string(),
+            })
+        }
+        SettingsChangeAction::KeepStored if leaves_rows_unreadable => {
+            Err(CatalogError::StoredDataFilesDamaged {
+                table_name: table_name.to_string(),
+                damage,
+                remedy: "It is not reloaded automatically, because its settings can keep rows a reload from the source would not bring back. Restore the files, or reload it from the source by restarting once with `mode: file_create` and then setting the mode back; rows that exist only in the acceleration are not kept. See: https://spiceai.org/docs/components/data-accelerators/cayenne".to_string(),
+            })
+        }
+        SettingsChangeAction::KeepStored => {
+            tracing::warn!(
+                "Dataset '{table_name}': the acceleration's data files do not match the Cayenne metastore ({damage}). It is not reloaded automatically, because its settings can keep rows a reload from the source would not bring back, so queries do not return the rows those files held. To reload it from the source, restart once with `mode: file_create`, then set the mode back. See: https://spiceai.org/docs/components/data-accelerators/cayenne"
+            );
+            Ok(())
+        }
+    }
 }
 
 async fn inspect_stored_data_files(

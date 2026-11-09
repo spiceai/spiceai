@@ -739,6 +739,24 @@ impl MetadataCatalog for DatasetStateReader {
     ) -> CatalogResult<()> {
         Err(invalid("the dataset state reader is read-only"))
     }
+    async fn remove_snapshot_files(
+        &self,
+        _table_id: &str,
+        _snapshot_id: &str,
+        _file_names: &[String],
+    ) -> CatalogResult<()> {
+        Err(invalid("the dataset state reader is read-only"))
+    }
+    async fn verify_existing_stored_data_files(&self, table_name: &str) -> CatalogResult<()> {
+        let table = self.get_table(table_name).await?;
+        crate::cayenne_catalog::verify_stored_data_files_in(
+            self,
+            &table,
+            table.vortex_config.memory_mode,
+            crate::metadata::SettingsChangeAction::KeepStored,
+        )
+        .await
+    }
     async fn clear_snapshot_files(&self, _table_id: &str) -> CatalogResult<()> {
         Err(invalid("the dataset state reader is read-only"))
     }

@@ -1664,6 +1664,51 @@ impl MetadataCatalog for Domain {
             )])
             .await
     }
+    async fn remove_snapshot_files(
+        &self,
+        table_id: &str,
+        snapshot_id: &str,
+        file_names: &[String],
+    ) -> CatalogResult<()> {
+        if file_names.is_empty() {
+            return Ok(());
+        }
+        // The log removes a snapshot's files by snapshot, so one record removes
+        // the snapshot's manifest and adds back the files it still holds.
+        let mut inner = self.inner.take().await;
+        let kept: Vec<proto::FileEntry> = inner
+            .table(table_id)?
+            .files
+            .iter()
+            .filter(|((snapshot, path), _)| snapshot == snapshot_id && !file_names.contains(path))
+            .map(|(_, file)| file.clone())
+            .collect();
+        let mut batch = vec![actions::remove_files(
+            table_id,
+            proto::Select::Listed,
+            &[snapshot_id.to_string()],
+        )];
+        if !kept.is_empty() {
+            batch.push(Action::new(Kind::AddFiles(proto::AddFiles {
+                table_id: table_id.to_string(),
+                snapshot_id: snapshot_id.to_string(),
+                files: kept,
+                upsert: false,
+            })));
+        }
+        inner.commit(batch).await
+    }
+    async fn verify_existing_stored_data_files(&self, table_name: &str) -> CatalogResult<()> {
+        let inner = self.read().await?;
+        let table = inner.reader.get_table(table_name).await?;
+        crate::cayenne_catalog::verify_stored_data_files_in(
+            &inner.reader,
+            &table,
+            table.vortex_config.memory_mode,
+            crate::metadata::SettingsChangeAction::KeepStored,
+        )
+        .await
+    }
     async fn clear_snapshot_files(&self, table_id: &str) -> CatalogResult<()> {
         self.inner
             .take()
@@ -2334,7 +2379,25 @@ fn validate_uuid(name: &str, value: &str) -> CatalogResult<()> {
 }
 
 impl Inner {
+    /// Reopen an existing table under `options`, then check its live snapshots'
+    /// data files on disk, as the SQLite catalog does.
     async fn reopen_table(&mut self, options: &CreateTableOptions) -> CatalogResult<String> {
+        let table_id = self.reopen_table_settings(options).await?;
+        let table = self.reader.get_table(&options.table_name).await?;
+        crate::cayenne_catalog::verify_stored_data_files_in(
+            &self.reader,
+            &table,
+            options.vortex_config.memory_mode,
+            options.vortex_config.settings_change,
+        )
+        .await?;
+        Ok(table_id)
+    }
+
+    async fn reopen_table_settings(
+        &mut self,
+        options: &CreateTableOptions,
+    ) -> CatalogResult<String> {
         use crate::cayenne_catalog::{
             describe_setting_changes, enables_pk_conflict_detection, identity_setting_changes,
         };

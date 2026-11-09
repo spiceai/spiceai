@@ -1763,6 +1763,21 @@ impl MetadataCatalog for ObjectNativeCatalog {
             .clear_snapshot_files_except(table_id, snapshot_id)
             .await
     }
+    async fn remove_snapshot_files(
+        &self,
+        table_id: &str,
+        snapshot_id: &str,
+        file_names: &[String],
+    ) -> CatalogResult<()> {
+        self.for_table(table_id)
+            .remove_snapshot_files(table_id, snapshot_id, file_names)
+            .await
+    }
+    async fn verify_existing_stored_data_files(&self, table_name: &str) -> CatalogResult<()> {
+        self.for_name(table_name)
+            .verify_existing_stored_data_files(table_name)
+            .await
+    }
     async fn clear_snapshot_files(&self, table_id: &str) -> CatalogResult<()> {
         self.for_table(table_id)
             .clear_snapshot_files(table_id)
