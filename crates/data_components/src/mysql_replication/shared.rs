@@ -4236,6 +4236,7 @@ mod tests {
             dataset: "t".into(),
             source_commit_ts_ms: None,
             gtids: vec![new_txn],
+            recorder: None,
         }
         .commit()
         .await
@@ -4306,6 +4307,7 @@ mod tests {
                 dataset: "t".into(),
                 source_commit_ts_ms: None,
                 gtids: vec![gtid],
+                recorder: None,
             };
 
         // Transactions 2..=2001, for `a` and `b` in an uneven interleaving;
