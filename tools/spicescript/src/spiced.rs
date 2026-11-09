@@ -89,6 +89,27 @@ pub struct ContainerRun {
     pub name: String,
     /// `docker run -v` specifications.
     pub volumes: Vec<String>,
+    /// Whether the daemon runs rootless, so its containers live in a user
+    /// namespace where the daemon's own user is root.
+    pub rootless: bool,
+}
+
+/// The `docker run --user` a container runs as, so that it may write in, and
+/// leave files the runner owns in, the instance directory owned by `uid:gid`.
+///
+/// A rootful daemon maps container IDs to the host's one for one, so the
+/// directory's own owner is the answer. A rootless daemon maps its own user to
+/// root and every other container ID to a subordinate ID the host never gave
+/// the directory, so a container under the owner's ID cannot create anything
+/// there: `spiced` then fails to take its instance lock with "Permission
+/// denied". Root in that namespace is the daemon's user, the one the runner
+/// shares the directory with.
+fn container_user(rootless: bool, uid: u32, gid: u32) -> String {
+    if rootless {
+        "0:0".to_string()
+    } else {
+        format!("{uid}:{gid}")
+    }
 }
 
 /// Which API key a request presents.
@@ -364,6 +385,7 @@ impl Spiced {
     /// and the signals `stop` sends reach `spiced`.
     fn container_command(&self, run: &ContainerRun, binary: &Path) -> Result<Command> {
         use std::os::unix::fs::MetadataExt;
+
         // A container left behind by an interrupted run would hold the name.
         let _ = std::process::Command::new("docker")
             .args(["rm", "-f", &run.name])
@@ -381,7 +403,10 @@ impl Spiced {
                 std::process::id()
             ))
             // Files it writes in the shared directories stay the runner's.
-            .args(["--user", &format!("{}:{}", owner.uid(), owner.gid())])
+            .args([
+                "--user",
+                &container_user(run.rootless, owner.uid(), owner.gid()),
+            ])
             .arg("-v")
             .arg(format!("{}:/usr/local/bin/spiced:ro", binary.display()))
             .arg("-v")
@@ -1159,6 +1184,26 @@ mod not_yet_loaded_tests {
         assert_eq!(not_yet_loaded("[]", &declared), ["a", "u", "b"]);
         assert!(not_yet_loaded("[]", &[]).is_empty());
         assert!(declared_datasets("not: [yaml").is_empty());
+    }
+}
+
+#[cfg(test)]
+mod container_user_tests {
+    use super::container_user;
+
+    // A non-root owner, so the two answers differ: with a root-owned
+    // directory both would be `0:0` and a lost rootless branch would pass.
+    const UID: u32 = 1001;
+    const GID: u32 = 121;
+
+    #[test]
+    fn rootful_runs_as_the_directory_owner() {
+        assert_eq!(container_user(false, UID, GID), "1001:121");
+    }
+
+    #[test]
+    fn rootless_runs_as_the_daemon_user_not_the_directory_owner() {
+        assert_eq!(container_user(true, UID, GID), "0:0");
     }
 }
 
