@@ -459,7 +459,12 @@ fn configure_comm(cfg: &DistributedConfig) {
 
 #[cfg(test)]
 mod tests {
-    use super::{head_gpu_address, host, served_by_head};
+    use std::io::{Read, Write};
+    use std::net::TcpStream;
+    use std::thread;
+    use std::time::Duration;
+
+    use super::{head_gpu_address, host, listening, served_by_head};
     use llms::chat::{DistributedBackend, DistributedConfig};
 
     #[test]
@@ -493,5 +498,68 @@ mod tests {
         assert_eq!(host("spark-a:8090"), "spark-a");
         // an IPv6 literal is not split at its colons
         assert_eq!(host("fe80::1"), "fe80::1");
+    }
+
+    /// How long the server below stays with its first client before it takes another.
+    const BUSY: Duration = Duration::from_millis(200);
+
+    /// A server shaped like llama.cpp's RPC server: a backlog of one, one client at a time, and
+    /// a close for a client that sends no request. It stays with its first client for [`BUSY`],
+    /// answers the first client that sends a byte, and then stops.
+    fn one_client_at_a_time() -> (String, thread::JoinHandle<()>) {
+        let socket = tokio::net::TcpSocket::new_v4().expect("a socket");
+        socket
+            .bind("127.0.0.1:0".parse().expect("an address"))
+            .expect("a port");
+        let listener = socket
+            .listen(1)
+            .expect("the socket listens")
+            .into_std()
+            .expect("a std listener");
+        listener
+            .set_nonblocking(false)
+            .expect("a blocking listener");
+        let endpoint = listener.local_addr().expect("its address").to_string();
+        let server = thread::spawn(move || {
+            for (index, client) in listener.incoming().enumerate() {
+                let Ok(mut client) = client else { return };
+                if index == 0 {
+                    thread::sleep(BUSY);
+                    continue;
+                }
+                let mut byte = [0_u8; 1];
+                if matches!(client.read(&mut byte), Ok(1)) {
+                    client.write_all(&byte).expect("the reply");
+                    return;
+                }
+            }
+        });
+        (endpoint, server)
+    }
+
+    /// The connection a head makes right after its probe reaches a rank whose server is busy
+    /// with another client. On macOS, a second connection waiting for `accept` beside one
+    /// already queued is reset, so a probe that only connects and closes leaves itself queued
+    /// and the connection after it is reset, which llama.cpp's client aborts the process on.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn the_connection_after_a_probe_reaches_a_busy_server() {
+        let (endpoint, server) = one_client_at_a_time();
+        let other = TcpStream::connect(&endpoint).expect("the server's first client");
+        // the server takes it and stays with it
+        thread::sleep(Duration::from_millis(20));
+        assert!(
+            listening(&endpoint),
+            "the probe is served once the server is free"
+        );
+        let mut head =
+            TcpStream::connect(&endpoint).expect("the connection after the probe is not refused");
+        head.write_all(b"h")
+            .expect("the connection after the probe is not reset");
+        let mut reply = [0_u8; 1];
+        head.read_exact(&mut reply)
+            .expect("the server answers the connection after the probe");
+        assert_eq!(&reply, b"h");
+        drop(other);
+        server.join().expect("the server ends");
     }
 }
