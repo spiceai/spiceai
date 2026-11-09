@@ -255,7 +255,13 @@ impl PhysicalExtensionCodec for SpicePhysicalCodec {
                     ctx,
                     codec.as_ref(),
                 )?;
-                Ok(Arc::new(FederatedQueryExec::new(plan, runtime)))
+                let schema = datafusion_common::Schema::decode(&*node.schema)
+                    .map_err(|e| DataFusionError::External(Box::new(e)))?;
+                Ok(Arc::new(FederatedQueryExec::try_new(
+                    plan,
+                    Arc::new(Schema::try_from(&schema)?),
+                    runtime,
+                )?))
             }
             Some(spice_physical_plan_node::Node::IcebergTableScan(node)) => {
                 let runtime = self.runtime()?;
@@ -521,10 +527,23 @@ impl PhysicalExtensionCodec for SpicePhysicalCodec {
         } else if let Some(query) = node.downcast_ref::<VirtualExecutionPlan>() {
             // Holds the connection to its source, which cannot be serialized;
             // the executor plans the query again (see `FederatedQueryExec`).
-            federated_query_node(query.plan())?
+            // Filters pushed into the scan are applied only by this node, and
+            // the plan sent does not carry them, so a scan with any is refused.
+            let mut has_filters = false;
+            query.apply_expressions(&mut |_| {
+                has_filters = true;
+                Ok(TreeNodeRecursion::Stop)
+            })?;
+            if has_filters {
+                return Err(DataFusionError::NotImplemented(format!(
+                    "Failed to send the federated query over {} to a cluster executor: its scan applies filters that cannot be sent with it. Run the query with /v1/sql or Flight SQL instead.",
+                    scanned_tables(query.plan())
+                )));
+            }
+            federated_query_node(query.plan(), &query.schema())?
         } else if let Some(query) = node.downcast_ref::<FederatedQueryExec>() {
             // A scheduler that decoded the job from shared state encodes it again.
-            federated_query_node(query.plan())?
+            federated_query_node(query.plan(), &query.schema())?
         } else if node.is::<CayenneAccelerationExec>() {
             SpicePhysicalPlanNode {
                 node: Some(spice_physical_plan_node::Node::CayenneAcceleration(
@@ -549,7 +568,7 @@ impl PhysicalExtensionCodec for SpicePhysicalCodec {
 
 /// The node a federated query is sent to an executor as: its logical plan,
 /// with tables by reference.
-fn federated_query_node(plan: &LogicalPlan) -> Result<SpicePhysicalPlanNode> {
+fn federated_query_node(plan: &LogicalPlan, schema: &Schema) -> Result<SpicePhysicalPlanNode> {
     let logical_plan =
         logical_plan_to_bytes_with_extension_codec(plan, SpiceLogicalCodec::new_codec().as_ref())
             .map_err(|source| {
@@ -558,10 +577,15 @@ fn federated_query_node(plan: &LogicalPlan) -> Result<SpicePhysicalPlanNode> {
                     scanned_tables(plan)
                 ))
             })?;
+    let mut schema_buf = vec![];
+    datafusion_common::Schema::try_from(schema)?
+        .encode(&mut schema_buf)
+        .map_err(|e| DataFusionError::External(Box::new(e)))?;
     Ok(SpicePhysicalPlanNode {
         node: Some(spice_physical_plan_node::Node::FederatedQuery(
             FederatedQueryExecNode {
                 logical_plan: logical_plan.to_vec(),
+                schema: schema_buf,
             },
         )),
     })

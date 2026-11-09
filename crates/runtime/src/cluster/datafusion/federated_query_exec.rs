@@ -26,13 +26,16 @@ limitations under the License.
 //!
 //! Planning runs the federation analyzer over a plan it has already rewritten
 //! once on the scheduler, so a connector's logical rewrite of a pushed-down
-//! plan (`SQLExecutor::logical_optimizer`) must be idempotent, as `SQLite`'s
-//! date-operand marking is.
+//! plan (`SQLExecutor::logical_optimizer`) must be idempotent.
+//!
+//! The executor's plan must return the columns the scheduler planned for, in
+//! the same order: the scheduler casts them by position. A dataset whose
+//! columns differ between the two processes fails the query instead.
 
 use std::fmt;
 use std::sync::Arc;
 
-use arrow_schema::SchemaRef;
+use arrow_schema::{Schema, SchemaRef};
 use datafusion::common::tree_node::TreeNodeRecursion;
 use datafusion::common::{DataFusionError, Result, internal_err};
 use datafusion::execution::{SendableRecordBatchStream, TaskContext};
@@ -57,10 +60,13 @@ pub struct FederatedQueryExec {
 
 impl FederatedQueryExec {
     /// `plan` is the query the scheduler pushed down, decoded against this
-    /// executor's tables.
-    #[must_use]
-    pub fn new(plan: LogicalPlan, runtime: Arc<Runtime>) -> Self {
-        let schema: SchemaRef = Arc::new(plan.schema().as_arrow().clone());
+    /// executor's tables, and `schema` the columns the scheduler planned it
+    /// to return.
+    ///
+    /// # Errors
+    /// The plan, as this executor's datasets resolve it, returns other columns.
+    pub fn try_new(plan: LogicalPlan, schema: SchemaRef, runtime: Arc<Runtime>) -> Result<Self> {
+        check_schema(&schema, plan.schema().as_arrow())?;
         // As `VirtualExecutionPlan` reports it: one stream from the source.
         let properties = Arc::new(PlanProperties::new(
             EquivalenceProperties::new(Arc::clone(&schema)),
@@ -68,12 +74,12 @@ impl FederatedQueryExec {
             EmissionType::Incremental,
             Boundedness::Bounded,
         ));
-        Self {
+        Ok(Self {
             plan,
             runtime,
             schema,
             properties,
-        }
+        })
     }
 
     /// The pushed-down query.
@@ -144,7 +150,7 @@ impl ExecutionPlan for FederatedQueryExec {
         let expected = Arc::clone(&self.schema);
         let stream = async move {
             let physical = runtime.df.ctx.state().create_physical_plan(&plan).await?;
-            check_schema(&expected, &physical.schema())?;
+            check_schema(&expected, physical.schema().as_ref())?;
             execute_stream(physical, context)
         };
         Ok(Box::pin(RecordBatchStreamAdapter::new(
@@ -156,7 +162,7 @@ impl ExecutionPlan for FederatedQueryExec {
 
 /// The plan the executor built must return the columns the scheduler planned
 /// for: the same names and types, in the same order.
-fn check_schema(expected: &SchemaRef, actual: &SchemaRef) -> Result<()> {
+fn check_schema(expected: &Schema, actual: &Schema) -> Result<()> {
     let same = expected.fields().len() == actual.fields().len()
         && expected
             .fields()
@@ -167,7 +173,67 @@ fn check_schema(expected: &SchemaRef, actual: &SchemaRef) -> Result<()> {
         Ok(())
     } else {
         Err(DataFusionError::Execution(format!(
-            "The federated query planned on this executor returns {actual:?}, but the scheduler planned it to return {expected:?}. Check that the scheduler and every executor load the same Spicepod."
+            "Failed to run a federated query on this cluster executor: it returns the columns {}, but the scheduler planned for {}. Check that the scheduler and every executor load the same Spicepod and reach the same source tables.",
+            column_list(actual),
+            column_list(expected)
         )))
+    }
+}
+
+/// `schema`'s columns as `'name' type`, comma-separated.
+fn column_list(schema: &Schema) -> String {
+    schema
+        .fields()
+        .iter()
+        .map(|field| format!("'{}' {}", field.name(), field.data_type()))
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::check_schema;
+    use arrow_schema::{DataType, Field, Schema};
+
+    fn schema(columns: &[(&str, DataType)]) -> Schema {
+        Schema::new(
+            columns
+                .iter()
+                .map(|(name, data_type)| Field::new(*name, data_type.clone(), true))
+                .collect::<Vec<_>>(),
+        )
+    }
+
+    #[test]
+    fn the_same_columns_in_the_same_order_pass() {
+        let columns = schema(&[("id", DataType::Int32), ("v", DataType::Utf8)]);
+        check_schema(&columns, &columns).expect("the same columns pass");
+    }
+
+    #[test]
+    fn columns_in_another_order_fail_with_both_lists() {
+        // The scheduler casts the executor's columns by position, so a
+        // reordering would put one column's values under another's name.
+        let error = check_schema(
+            &schema(&[("id", DataType::Int32), ("v", DataType::Utf8)]),
+            &schema(&[("v", DataType::Utf8), ("id", DataType::Int32)]),
+        )
+        .expect_err("reordered columns fail");
+        assert_eq!(
+            error.to_string(),
+            "Execution error: Failed to run a federated query on this cluster executor: it returns the columns 'v' Utf8, 'id' Int32, but the scheduler planned for 'id' Int32, 'v' Utf8. Check that the scheduler and every executor load the same Spicepod and reach the same source tables."
+        );
+    }
+
+    #[test]
+    fn a_column_of_another_type_or_a_missing_column_fails() {
+        let expected = schema(&[("id", DataType::Int32), ("v", DataType::Utf8)]);
+        check_schema(
+            &expected,
+            &schema(&[("id", DataType::Int64), ("v", DataType::Utf8)]),
+        )
+        .expect_err("a column of another type fails");
+        check_schema(&expected, &schema(&[("id", DataType::Int32)]))
+            .expect_err("a missing column fails");
     }
 }

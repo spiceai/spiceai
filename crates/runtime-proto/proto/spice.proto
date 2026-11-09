@@ -316,8 +316,10 @@ message SpicePhysicalPlanNode {
         IcebergTableScanExecNode iceberg_table_scan = 5;
         HttpExecNode http_exec = 6;
         HeaderProjectedCsvScanExecNode header_projected_csv_scan = 7;
-        FederatedSchemaCastScanExecNode federated_schema_cast_scan = 8;
-        FederatedQueryExecNode federated_query = 9;
+        // Tags past Ballista's own: its codec decodes a node first, and rejects
+        // one whose only field is a tag it does not define.
+        FederatedSchemaCastScanExecNode federated_schema_cast_scan = 1001;
+        FederatedQueryExecNode federated_query = 1002;
     }
 }
 
@@ -333,6 +335,9 @@ message FederatedSchemaCastScanExecNode {
 message FederatedQueryExecNode {
     // Prost-encoded `datafusion.LogicalPlanNode`; tables are encoded by reference.
     bytes logical_plan = 1;
+    // Prost-encoded `datafusion_common.Schema`: the columns the scheduler
+    // planned the query to return, which the executor's plan must return.
+    bytes schema = 2;
 }
 
 // Headered CSV/TSV scan that binds columns by header name.
