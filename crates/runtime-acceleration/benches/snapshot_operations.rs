@@ -180,9 +180,6 @@ fn create_metadata_json(
 fn available_engines() -> Vec<(&'static str, AccelerationEngine)> {
     let mut engines = vec![("cayenne", AccelerationEngine::Cayenne)];
 
-    #[cfg(feature = "duckdb")]
-    engines.push(("duckdb", AccelerationEngine::DuckDB));
-
     #[cfg(feature = "sqlite")]
     engines.push(("sqlite", AccelerationEngine::Sqlite));
 

@@ -47,7 +47,7 @@ Spice is a single binary written in Rust on Apache DataFusion, Apache Arrow, and
 - 🦀 **Built in Rust** on industry-leading open foundations: [Apache DataFusion](https://datafusion.apache.org), [Apache Ballista](https://datafusion.apache.org/ballista/), [Apache Arrow](https://arrow.apache.org), [Apache Iceberg](https://iceberg.apache.org), [Vortex](https://github.com/vortex-data/vortex), [DuckDB](https://duckdb.org), and [SQLite](https://www.sqlite.org).
 - ⚡ **Distributed query without the operational tax** — Apache Ballista with multi-active schedulers coordinated through object storage. **2.9x faster than single-node DataFusion** on TPC-H SF100, **8x less RAM than Spark**.
 - 💎 **Spice Cayenne**, the acceleration engine that powers Spice (GA) — high-rate CDC ingestion and low-latency queries on the same table, built on Vortex. It runs in memory or on disk, with secondary indexes and, on disk, multi-column clustering. **1.5x faster than DuckDB with 3x less memory** on TPC-H SF100, **26x faster than Spice 1.x on TPC-DS SF100**, **100x faster random access vs. Parquet**.
-- 🔍 **Petabyte-scale hybrid search** — Native Amazon S3 Vectors, Tantivy BM25, DuckDB HNSW, and Elasticsearch kNN, with reciprocal rank fusion (RRF) and reranker UDTFs — all in a single SQL query.
+- 🔍 **Petabyte-scale hybrid search** — Native Amazon S3 Vectors, Tantivy BM25, and Elasticsearch kNN, with reciprocal rank fusion (RRF) and reranker UDTFs — all in a single SQL query.
 - 🤖 **AI-native runtime** — OpenAI-compatible APIs, MCP server + gateway, LLM memory, NSQL text-to-SQL, multi-vector ColBERT-style embeddings, provider-aware prompt caching.
 - 🔗 **30+ data connectors** with advanced query push-down — federate Postgres, MySQL, Snowflake, Databricks, Iceberg, Delta Lake, S3, Spark, MSSQL, DynamoDB, MongoDB, GitHub, SharePoint, Kafka, and more.
 - 📝 **Open table formats, first-class** — Query, **accelerate, and write** to Apache Iceberg with ACID guarantees via standard SQL `INSERT INTO`. No Spark required.
@@ -96,7 +96,7 @@ Add a sandboxed, analytics-ready replica alongside **PostgreSQL, MySQL, and Mong
 
 ### Cluster-Sidecar Architecture: localhost latency, cluster scale
 
-Each application gets a complete data plane on `localhost`. A lightweight Spice sidecar runs in the application pod, serves SQL/search/LLM-inference from a scoped working set, and transparently delegates the long tail to a central Spice cluster (Ballista distributed query, Cayenne acceleration, hybrid search indexing) over Arrow Flight. Three latency tiers: results cache (microseconds) → local working set (single-digit milliseconds) → cluster delegation. The application **never holds credentials** to Postgres, S3, Snowflake, or Iceberg — only a token to its sidecar. [Read the architecture deep dive →](https://spice.ai/blog/cluster-sidecar-architecture)
+Each application gets a complete data plane on `localhost`. A lightweight Spice sidecar runs in the application pod, serves SQL/search/LLM-inference from a scoped working set, and transparently delegates the long tail to a central Spice cluster (Ballista distributed query, Cayenne acceleration, hybrid search indexing) over Arrow Flight. Three latency tiers: results cache (microseconds) → local working set (single-digit milliseconds) → cluster delegation. The application **never holds credentials** to Postgres, S3, Snowflake, or Iceberg — only a token to its sidecar. Start one with `spiced --role sidecar`: it plans each query next to the application and sends remote Spice reads to the cluster as Substrait plans ([docs](docs/features/cluster-sidecar.md)). [Read the architecture deep dive →](https://spice.ai/blog/cluster-sidecar-architecture)
 
 ### Apache Ballista distributed query
 
@@ -153,7 +153,7 @@ In Claude Code:
 
 ### Acceleration Snapshots
 
-Bootstrap accelerated datasets from S3 in **seconds, not minutes**. Cold-start ephemeral pods with pre-built Vortex/DuckDB/SQLite files. Recover from federated source outages by serving from the last known good snapshot. Critical for sidecar deployments and serverless environments.
+Bootstrap accelerated datasets from S3 in **seconds, not minutes**. Cold-start ephemeral pods with pre-built Vortex/SQLite files. Recover from federated source outages by serving from the last known good snapshot. Critical for sidecar deployments and serverless environments.
 
 ### Enterprise hardening (latest)
 
@@ -172,7 +172,7 @@ Bootstrap accelerated datasets from S3 in **seconds, not minutes**. Cold-start e
 2. **Structural data sandboxing** — Datasets a sidecar doesn't declare in its `spicepod.yaml` are *physically absent from the catalog*, not filtered at query time. The application never holds credentials to Postgres, S3, Snowflake, or Iceberg — only a token to its sidecar. A compromised pod gets a loopback scoped to that tenant's working set, not database credentials.
 3. **Ingest once, serve everywhere** — The cluster ingests each source dataset once and produces one authoritative materialization that every sidecar pulls. Source systems see one stable connection pool, not one per pod. Pull-based refresh + acceleration snapshots in S3 mean cold starts in seconds and graceful degradation when the cluster is unreachable.
 4. **AI-Native Runtime** — Data query and AI inference live in one engine, so retrieval, ranking, and generation happen in one query plan, in one process — `vector_search`, `text_search`, `rrf`, `rerank`, NSQL, and tool calls are all SQL primitives.
-5. **Dual-engine acceleration** — Per-dataset choice of OLAP (Cayenne/Vortex, Arrow, DuckDB) and OLTP (SQLite, or PostgreSQL in Spice.ai Enterprise) engines, so you can match workload to engine instead of forcing everything into one shape.
+5. **Dual-engine acceleration** — Per-dataset choice of OLAP (Cayenne/Vortex, Arrow) and OLTP (SQLite, or PostgreSQL in Spice.ai Enterprise) engines, so you can match workload to engine instead of forcing everything into one shape.
 6. **Edge to cloud, single binary** — Runs on a laptop, as a Kubernetes sidecar, as a microservice, or as a multi-node Ballista cluster across edge, on-prem, and public clouds. Self-hosted OSS, Spice Cloud (managed cluster), and Spice.ai Enterprise (on-prem full stack) all use identical `spicepod.yaml` manifests — no app changes to migrate.
 
 If you build with **DataFusion**, **DuckDB**, **Vortex**, **Iceberg**, or **Ballista**, Spice gives you a flexible, production-ready engine you can just use — instead of stitching them together yourself.
@@ -194,7 +194,7 @@ If you build with **DataFusion**, **DuckDB**, **Vortex**, **Iceberg**, or **Ball
 
 ### Database CDN and Query Mesh
 
-- **Co-located acceleration**: Materialize working sets as Cayenne (Vortex), Arrow, DuckDB, or SQLite alongside your app for sub-second query, with secondary indexes for point lookups. Bootstrap from S3 snapshots. [DuckDB Accelerator Recipe](https://github.com/spiceai/cookbook/blob/trunk/duckdb/accelerator/README.md)
+- **Co-located acceleration**: Materialize working sets as Cayenne (Vortex), Arrow, or SQLite alongside your app for sub-second query, with secondary indexes for point lookups. Bootstrap from S3 snapshots. [Spice Cayenne](https://spiceai.org/docs/components/data-accelerators/cayenne)
 - **Resiliency**: Maintain availability with local replicas of critical datasets; recover from source outages from snapshots. [Local Dataset Replication Recipe](https://github.com/spiceai/cookbook/blob/trunk/localpod/README.md)
 - **Responsive dashboards**: Sub-second BI with configurable refresh and CDC. [Sales BI Demo](https://github.com/spiceai/cookbook/blob/trunk/sales-bi/README.md)
 - **Legacy modernization**: One endpoint that federates legacy systems with modern infrastructure. [Federation Recipe](https://github.com/spiceai/cookbook/blob/trunk/federation/README.md)
@@ -233,7 +233,7 @@ See more demos on [YouTube](https://www.youtube.com/playlist?list=PLesJrUXEx3U9a
 | `databricks (mode: sql_warehouse)` | [Databricks][databricks]              | Stable            | SQL Statement Execution API  |
 | `delta_lake`                       | Delta Lake                            | Stable            | Delta Lake                   |
 | `dremio`                           | [Dremio][dremio]                      | Stable            | Arrow Flight                 |
-| `duckdb`                           | DuckDB                                | Stable            | Embedded                     |
+| `duckdb`                           | DuckDB (installed library)            | Stable            | ADBC                         |
 | `file`                             | File                                  | Stable            | Parquet, CSV                 |
 | `github`                           | GitHub                                | Stable            | GitHub API                   |
 | `http`, `https`                    | HTTP(s) (dynamic headers, pagination) | Stable            | Parquet, CSV, JSON           |
@@ -292,17 +292,15 @@ See more demos on [YouTube](https://www.youtube.com/playlist?list=PLesJrUXEx3U9a
 | ---------- | --------------------------------- | ----------------- | ---------------- |
 | `cayenne`  | [Spice Cayenne (Vortex)][cayenne] | Stable            | `memory`, `file` |
 | `arrow`    | [In-Memory Arrow Records][arrow]  | Deprecated        | `memory`         |
-| `duckdb`   | Embedded [DuckDB][duckdb]         | Deprecated        | `memory`, `file` |
 | `postgres` | Attached [PostgreSQL][postgres] (Spice.ai Enterprise) | Deprecated | N/A |
 | `sqlite`   | Embedded [SQLite][sqlite]         | Deprecated        | `memory`, `file` |
 
 An acceleration with no `engine` uses `cayenne`.
 
-Every accelerator other than `cayenne` is deprecated in v2.4 and will be removed in v2.5. Spice logs a warning naming the datasets and views still using one; set `engine: cayenne` (or remove `engine`) on each to migrate, then delete the old engine's acceleration files and snapshots. Accelerations that hold data their source does not, such as `write_mode: acceleration`, should stay on v2.4 until that data is moved. See the [migration guide](https://spiceai.org/docs/components/data-accelerators/cayenne/migration).
+The `duckdb` and `turso` accelerators were removed in v2.5, and a dataset or view that sets one fails to load. Every other accelerator except `cayenne` is deprecated and will be removed. Spice logs a warning naming the datasets and views still using one; set `engine: cayenne` (or remove `engine`) on each to migrate, then delete the old engine's acceleration files and snapshots. Accelerations that hold data their source does not, such as `write_mode: acceleration`, should stay on v2.4 until that data is moved. See the [migration guide](https://spiceai.org/docs/components/data-accelerators/cayenne/migration).
 
 [arrow]: https://spiceai.org/docs/components/data-accelerators/arrow
 [cayenne]: https://spiceai.org/docs/components/data-accelerators/cayenne
-[duckdb]: https://spiceai.org/docs/components/data-accelerators/duckdb
 [postgres]: https://spiceai.org/docs/components/data-accelerators/postgres
 [sqlite]: https://spiceai.org/docs/components/data-accelerators/sqlite
 

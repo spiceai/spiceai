@@ -81,6 +81,85 @@ app.kubernetes.io/instance: {{ .Release.Name }}
 {{- end }}
 
 {{/*
+The validated `role` value: server (the default), sidecar, scheduler, or executor.
+*/}}
+{{- define "spiceai.role" -}}
+{{- $role := .Values.role | default "server" -}}
+{{- if not (has $role (list "server" "sidecar" "scheduler" "executor")) -}}
+{{- fail (printf "role '%s' is not a Spice role. Use server (the default), sidecar, scheduler, or executor." $role) -}}
+{{- end -}}
+{{- $role -}}
+{{- end -}}
+
+{{/*
+Whether the role joins a cluster: a scheduler or an executor.
+*/}}
+{{- define "spiceai.clusterNode" -}}
+{{- if has (include "spiceai.role" .) (list "scheduler" "executor") -}}true{{- end -}}
+{{- end -}}
+
+{{/*
+The `spiced` arguments that select the role, after the command. A server takes
+none, so its pods start exactly as before the chart had a role.
+*/}}
+{{- define "spiceai.roleArgs" -}}
+{{- $role := include "spiceai.role" . -}}
+{{- if ne $role "server" }}
+- --role
+- {{ $role }}
+{{- end }}
+{{- if include "spiceai.clusterNode" . }}
+{{- $cluster := .Values.cluster }}
+{{- if eq $role "scheduler" }}
+{{- $runtime := .Values.spicepod.runtime | default dict }}
+{{- if not (or (dig "state" "location" "" $runtime) (dig "scheduler" "state_location" "" $runtime)) }}
+{{- fail "role: scheduler requires `runtime.state.location` in `spicepod`, where schedulers keep shared cluster state. See: https://spiceai.org/docs/features/distributed-query" }}
+{{- end }}
+{{- end }}
+- --node-bind-address
+- {{ printf "0.0.0.0:%v" $cluster.port | quote }}
+- --node-advertise-address
+- {{ $cluster.advertiseAddress | default "$(SPICE_POD_IP)" | quote }}
+{{- if eq $role "executor" }}
+- --scheduler-address
+- {{ required "role: executor requires `cluster.schedulerAddress`, the scheduler's cluster address, e.g. https://spice-scheduler-spiceai:50052" $cluster.schedulerAddress | quote }}
+{{- end }}
+{{- if $cluster.tls.secretName }}
+- --node-mtls-ca-certificate-file
+- /etc/spice/cluster-tls/ca.crt
+- --node-mtls-certificate-file
+- /etc/spice/cluster-tls/tls.crt
+- --node-mtls-key-file
+- /etc/spice/cluster-tls/tls.key
+{{- else if $cluster.allowInsecureConnections }}
+- --allow-insecure-connections
+{{- else }}
+{{- fail (printf "role: %s requires cluster mTLS: set `cluster.tls.secretName` to a Secret holding ca.crt, tls.crt and tls.key, or set `cluster.allowInsecureConnections: true` for development and testing." $role) }}
+{{- end }}
+{{- end }}
+{{- end -}}
+
+{{/*
+The readiness path a role serves. An executor serves only `/health`: it has no
+`/v1/ready`, so probing that path would keep it from ever becoming ready.
+*/}}
+{{- define "spiceai.readinessPath" -}}
+{{- if eq (include "spiceai.role" .) "executor" -}}/health{{- else -}}/v1/ready{{- end -}}
+{{- end -}}
+
+{{/*
+`readinessProbe` with the default `/v1/ready` path moved to the role's own
+readiness path. Any other path is the user's choice and stays as written.
+*/}}
+{{- define "spiceai.readinessProbe" -}}
+{{- $probe := deepCopy (.Values.readinessProbe | default dict) -}}
+{{- if and $probe.httpGet (eq ($probe.httpGet.path | default "") "/v1/ready") -}}
+{{- $_ := set $probe.httpGet "path" (include "spiceai.readinessPath" .) -}}
+{{- end -}}
+{{- if $probe }}{{ toYaml $probe }}{{ end -}}
+{{- end -}}
+
+{{/*
 Render a Kubernetes probe with built-in HTTP defaults.
 */}}
 {{- define "spiceai.probe" -}}

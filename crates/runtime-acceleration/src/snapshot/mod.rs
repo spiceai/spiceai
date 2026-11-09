@@ -386,7 +386,7 @@ pub struct CurrentSnapshot {
     /// The id `current-snapshot-id` names.
     pub snapshot_id: u64,
     /// The acceleration engine that created the snapshot, lowercase as recorded
-    /// (`cayenne`, `duckdb`, `sqlite`).
+    /// (`cayenne`, `sqlite`, or a removed engine such as `duckdb`).
     pub engine: String,
     /// The dataset schema recorded for the snapshot.
     pub schema: SchemaRef,
@@ -947,8 +947,6 @@ impl<'a> SnapshotPathLayout<'a> {
 #[derive(Clone, PartialEq, Debug)]
 pub enum AccelerationEngine {
     Cayenne,
-    #[cfg(feature = "duckdb")]
-    DuckDB,
     #[cfg(feature = "sqlite")]
     Sqlite,
 }
@@ -959,8 +957,6 @@ impl AccelerationEngine {
     pub fn snapshot_extension(&self) -> &'static str {
         match self {
             Self::Cayenne => ".cayenne",
-            #[cfg(feature = "duckdb")]
-            Self::DuckDB => ".duckdb",
             #[cfg(feature = "sqlite")]
             Self::Sqlite => ".sqlite",
         }
@@ -970,8 +966,6 @@ impl std::fmt::Display for AccelerationEngine {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Cayenne => write!(f, "cayenne"),
-            #[cfg(feature = "duckdb")]
-            Self::DuckDB => write!(f, "duckdb"),
             #[cfg(feature = "sqlite")]
             Self::Sqlite => write!(f, "sqlite"),
         }
@@ -996,7 +990,7 @@ pub struct SnapshotManager {
     snapshot_location_uri: String,
     /// The acceleration layout defining the storage paths for this accelerator.
     layout: AccelerationLayout,
-    /// The acceleration engine type (duckdb, sqlite, cayenne, etc.).
+    /// The acceleration engine type (`cayenne` or `sqlite`).
     engine: AccelerationEngine,
     snapshot_engine: Arc<dyn SnapshotEngine>,
     object_store: Arc<dyn ObjectStore>,
@@ -1456,7 +1450,7 @@ impl SnapshotManager {
         )
         .await?;
 
-        let snapshot_engine = create_snapshot_engine(&engine, compaction_enabled);
+        let snapshot_engine = create_snapshot_engine(&engine);
 
         if compaction_enabled {
             if snapshot_engine.supports_compaction() {
@@ -1545,7 +1539,7 @@ impl SnapshotManager {
         .await?;
 
         // Use a no-op layout and engine for metadata-only queries
-        let snapshot_engine = create_snapshot_engine(&AccelerationEngine::Cayenne, false);
+        let snapshot_engine = create_snapshot_engine(&AccelerationEngine::Cayenne);
 
         let network_retry_strategy = RetryBackoffBuilder::new()
             .max_retries(Some(NETWORK_RETRY_MAX))
@@ -1971,7 +1965,7 @@ impl SnapshotManager {
 
     /// Creates a new snapshot by streaming the local acceleration file to object storage.
     ///
-    /// For file-based accelerators (`DuckDB`, `SQLite`), this copies and uploads the database file.
+    /// For file-based accelerators (`SQLite`), this copies and uploads the database file.
     /// For directory-based accelerators (Cayenne), this archives the directories into a tar file
     /// before uploading.
     ///
@@ -2410,7 +2404,7 @@ impl SnapshotManager {
         );
 
         // Step 0: Engine-specific live checkpoint while the lock is held.
-        // For DuckDB/SQLite this drains the write-ahead log into the main
+        // For SQLite this drains the write-ahead log into the main
         // file so that the subsequent `fs::copy` produces a self-contained
         // snapshot. Engines with nothing to flush return `Ok(())`.
         self.snapshot_engine
@@ -2899,7 +2893,7 @@ impl SnapshotManager {
                 .snapshot_read_uri(&snapshot.snapshot, Some(&metadata_handle.metadata.location));
             // Early engine filtering: skip snapshots created by a different engine before
             // attempting any download. This avoids wasting bandwidth on incompatible files
-            // (e.g. DuckDB snapshots when the current engine is Cayenne).
+            // (e.g. SQLite snapshots when the current engine is Cayenne).
             if let Some(ref snap_engine) = snapshot.snapshot_engine
                 && !snap_engine.eq_ignore_ascii_case(&current_engine)
             {
@@ -3283,7 +3277,7 @@ impl SnapshotManager {
             // to bring the local DB in line with the snapshot.
             //
             // For engines whose snapshot *does* normally include the
-            // checkpoint row (DuckDB / SQLite), this branch is
+            // checkpoint row (SQLite), this branch is
             // unreachable in practice; if a corrupted snapshot reaches
             // it the self-heal is harmless because we trust the metadata
             // schema (it's the same one we just validated above for
@@ -4566,7 +4560,7 @@ async fn build_s3_parameters(
 mod tests {
     use super::*;
     use crate::dataset_checkpoint::{DatasetCheckpointer, Result as DatasetCheckpointResult};
-    use crate::snapshot::engine::{DefaultSnapshotEngine, create_snapshot_engine};
+    use crate::snapshot::engine::create_snapshot_engine;
     use async_trait::async_trait;
     use bytes::Bytes;
     use chrono::{TimeZone, Utc};
@@ -4639,18 +4633,11 @@ mod tests {
     }
 
     /// Writes a sample local accelerator file appropriate for the engine.
-    /// For `DuckDB`/`SQLite`, creates a real (empty) database so that the
+    /// For `SQLite`, creates a real (empty) database so that the
     /// engine's `checkpoint_live` hook can open it. For other engines, writes opaque
     /// test bytes since no engine-side validation runs against the file pre-snapshot.
     fn write_sample_local_db(path: &std::path::Path, engine: &AccelerationEngine) {
         match engine {
-            #[cfg(feature = "duckdb")]
-            AccelerationEngine::DuckDB => {
-                let conn = duckdb::Connection::open(path).expect("open sample duckdb db");
-                conn.execute_batch("CREATE TABLE sample(id INTEGER)")
-                    .expect("create sample table");
-                drop(conn);
-            }
             #[cfg(feature = "sqlite")]
             AccelerationEngine::Sqlite => {
                 let conn = rusqlite::Connection::open(path).expect("open sample sqlite db");
@@ -4674,7 +4661,6 @@ mod tests {
         behavior: BootstrapOnFailureBehavior,
         schema: &SchemaRef,
         engine: &AccelerationEngine,
-        compaction_enabled: bool,
     ) -> SnapshotManager {
         let schema_for_factory = Arc::clone(schema);
         let factory: DatasetCheckpointerFactory = Arc::new(move || {
@@ -4685,7 +4671,7 @@ mod tests {
         });
 
         let object_store: Arc<dyn ObjectStore> = store;
-        let snapshot_engine = create_snapshot_engine(engine, compaction_enabled);
+        let snapshot_engine = create_snapshot_engine(engine);
 
         SnapshotManager {
             dataset_name: DATASET_NAME.to_string(),
@@ -4709,31 +4695,23 @@ mod tests {
         }
     }
 
-    /// A `DuckDB` manager whose engine hook does nothing, for the tests about the
-    /// manager's own file path. Those hand it a local file of arbitrary bytes and assert
-    /// the uploaded object matches, which `DuckDBSnapshotEngine` cannot do because it
-    /// opens that file as a database. Only the hook is swapped: the manager keeps the
-    /// `DuckDB` identity that names the snapshot file, is published in the metadata, and
-    /// is matched at restore. Tests about engine *behaviour* use
-    /// [`build_manager_for_engine`].
-    #[cfg(feature = "duckdb")]
+    /// A manager for the tests about the manager's own file path. Those hand it a local
+    /// file of arbitrary bytes and assert the uploaded object matches, so it uses the
+    /// Cayenne identity, whose engine hook does nothing to the file. Tests about engine
+    /// *behaviour* use [`build_manager_for_engine`].
     fn build_manager(
         store: Arc<InMemory>,
         local_path: PathBuf,
         behavior: BootstrapOnFailureBehavior,
         schema: &SchemaRef,
-        compaction_enabled: bool,
     ) -> SnapshotManager {
-        let mut manager = build_manager_for_engine(
+        build_manager_for_engine(
             store,
             local_path,
             behavior,
             schema,
-            &AccelerationEngine::DuckDB,
-            compaction_enabled,
-        );
-        manager.snapshot_engine = Arc::new(DefaultSnapshotEngine);
-        manager
+            &AccelerationEngine::Cayenne,
+        )
     }
 
     async fn write_metadata(store: &InMemory, metadata_path: &Path, metadata: &SnapshotMetadata) {
@@ -4796,7 +4774,6 @@ mod tests {
             local_path.clone(),
             BootstrapOnFailureBehavior::Warn,
             &schema,
-            false,
         );
 
         let result = manager
@@ -4812,7 +4789,7 @@ mod tests {
     async fn download_latest_snapshot_downloads_current_snapshot() {
         let store = Arc::new(InMemory::new());
         let base = Path::from(SNAPSHOT_BASE_PATH);
-        let layout = SnapshotPathLayout::new(DATASET_NAME, &AccelerationEngine::DuckDB);
+        let layout = SnapshotPathLayout::new(DATASET_NAME, &AccelerationEngine::Cayenne);
         let instant = Utc
             .with_ymd_and_hms(2025, 1, 2, 3, 4, 5)
             .single()
@@ -4860,7 +4837,6 @@ mod tests {
             local_path.clone(),
             BootstrapOnFailureBehavior::Warn,
             &schema,
-            false,
         );
 
         let info = manager
@@ -4899,7 +4875,6 @@ mod tests {
                     local_path.clone(),
                     behavior,
                     &schema,
-                    false,
                 ));
                 let (announcer, subscription) = TestAnnouncer::subscribe(DATASET_NAME);
                 let pending = BootstrapStatus::Pending {
@@ -4919,7 +4894,7 @@ mod tests {
                 assert!(!local_path.exists());
 
                 let base = Path::from(SNAPSHOT_BASE_PATH);
-                let location = base.clone().join("orders.duckdb");
+                let location = base.clone().join("orders.cayenne");
                 let contents = b"snapshot published after reader startup";
                 store
                     .put(&location, contents.to_vec().into())
@@ -5055,7 +5030,6 @@ mod tests {
             BootstrapOnFailureBehavior::Warn,
             &schema,
             &AccelerationEngine::Sqlite,
-            false,
         );
         manager
             .download_latest_snapshot()
@@ -5089,11 +5063,10 @@ mod tests {
     }
 
     #[tokio::test]
-    #[cfg(feature = "duckdb")]
     async fn download_if_newer_returns_none_when_local_id_matches() {
         let store = Arc::new(InMemory::new());
         let base = Path::from(SNAPSHOT_BASE_PATH);
-        let layout = SnapshotPathLayout::new(DATASET_NAME, &AccelerationEngine::DuckDB);
+        let layout = SnapshotPathLayout::new(DATASET_NAME, &AccelerationEngine::Cayenne);
         let instant = Utc
             .with_ymd_and_hms(2025, 1, 2, 3, 4, 5)
             .single()
@@ -5135,7 +5108,6 @@ mod tests {
             local_path.clone(),
             BootstrapOnFailureBehavior::Warn,
             &schema,
-            false,
         );
 
         let result = manager
@@ -5408,7 +5380,6 @@ mod tests {
             BootstrapOnFailureBehavior::Warn,
             schema,
             &AccelerationEngine::Cayenne,
-            false,
         );
         manager.layout = AccelerationLayout::cayenne(root.join("metadata"), root.join("data"));
         manager
@@ -5731,7 +5702,6 @@ mod tests {
     }
 
     #[tokio::test]
-    #[cfg(feature = "duckdb")]
     async fn download_if_newer_returns_none_when_no_metadata() {
         let store = Arc::new(InMemory::new());
         let temp_dir = TempDir::new().expect("create temp dir");
@@ -5742,7 +5712,6 @@ mod tests {
             local_path.clone(),
             BootstrapOnFailureBehavior::Warn,
             &schema,
-            false,
         );
         let result = manager
             .download_if_newer(None, None, None)
@@ -5774,7 +5743,7 @@ mod tests {
         snapshot_id: u64,
     ) -> Bytes {
         let base = Path::from(SNAPSHOT_BASE_PATH);
-        let layout = SnapshotPathLayout::new(DATASET_NAME, &AccelerationEngine::DuckDB);
+        let layout = SnapshotPathLayout::new(DATASET_NAME, &AccelerationEngine::Cayenne);
         let instant = Utc
             .with_ymd_and_hms(2025, 1, 2, 3, 4, 5)
             .single()
@@ -5812,7 +5781,6 @@ mod tests {
 
     // regression test for #14425
     #[tokio::test]
-    #[cfg(feature = "duckdb")]
     async fn download_latest_snapshot_resolves_entries_against_metadata_location() {
         let store = Arc::new(InMemory::new());
         let schema = sample_schema();
@@ -5825,7 +5793,6 @@ mod tests {
             local_path.clone(),
             BootstrapOnFailureBehavior::Warn,
             &schema,
-            false,
         );
 
         let info = manager
@@ -5843,7 +5810,6 @@ mod tests {
 
     // regression test for #14425
     #[tokio::test]
-    #[cfg(feature = "duckdb")]
     async fn download_if_newer_resolves_entries_against_metadata_location() {
         let store = Arc::new(InMemory::new());
         let schema = sample_schema();
@@ -5856,7 +5822,6 @@ mod tests {
             local_path.clone(),
             BootstrapOnFailureBehavior::Warn,
             &schema,
-            false,
         );
 
         let poll = manager
@@ -5875,7 +5840,6 @@ mod tests {
 
     // regression test for #14425
     #[tokio::test]
-    #[cfg(feature = "duckdb")]
     async fn snapshot_api_reports_entries_under_metadata_location() {
         let store = Arc::new(InMemory::new());
         let schema = sample_schema();
@@ -5886,7 +5850,6 @@ mod tests {
             PathBuf::from("/tmp/unused"),
             BootstrapOnFailureBehavior::Warn,
             &schema,
-            false,
         );
 
         let summary = manager
@@ -5903,7 +5866,7 @@ mod tests {
     async fn download_with_fallback_uses_next_snapshot_on_integrity_failure() {
         let store = Arc::new(InMemory::new());
         let base = Path::from(SNAPSHOT_BASE_PATH);
-        let layout = SnapshotPathLayout::new(DATASET_NAME, &AccelerationEngine::DuckDB);
+        let layout = SnapshotPathLayout::new(DATASET_NAME, &AccelerationEngine::Cayenne);
 
         let first_instant = Utc
             .with_ymd_and_hms(2025, 2, 1, 0, 0, 0)
@@ -5974,7 +5937,6 @@ mod tests {
             local_path.clone(),
             BootstrapOnFailureBehavior::Fallback,
             &schema,
-            false,
         );
 
         let info = manager
@@ -6160,7 +6122,6 @@ mod tests {
             BootstrapOnFailureBehavior::Warn,
             schema,
             &AccelerationEngine::Cayenne,
-            false,
         );
         manager.object_store = store;
         manager
@@ -6729,7 +6690,6 @@ mod tests {
             local_path.clone(),
             BootstrapOnFailureBehavior::Fallback,
             &schema,
-            false,
         );
 
         let mutex = Arc::new(Mutex::new(()));
@@ -6804,7 +6764,6 @@ mod tests {
             .clone()
     }
 
-    #[cfg(feature = "duckdb")]
     #[tokio::test]
     async fn create_snapshot_appends_schema_version_on_widening() {
         let store = Arc::new(InMemory::new());
@@ -6821,7 +6780,6 @@ mod tests {
             local_path.clone(),
             BootstrapOnFailureBehavior::Fallback,
             &schema,
-            false,
         );
 
         let mutex = Arc::new(Mutex::new(()));
@@ -6875,7 +6833,6 @@ mod tests {
         assert_eq!(original.as_ref(), schema.as_ref());
     }
 
-    #[cfg(feature = "duckdb")]
     #[tokio::test]
     async fn create_snapshot_rejects_non_widening_schema_change() {
         let store = Arc::new(InMemory::new());
@@ -6892,7 +6849,6 @@ mod tests {
             local_path.clone(),
             BootstrapOnFailureBehavior::Fallback,
             &schema,
-            false,
         );
 
         let mutex = Arc::new(Mutex::new(()));
@@ -6952,7 +6908,6 @@ mod tests {
             local_path.clone(),
             BootstrapOnFailureBehavior::Fallback,
             &schema,
-            false,
         );
 
         let mutex = Arc::new(Mutex::new(()));
@@ -7014,7 +6969,6 @@ mod tests {
             local_path.clone(),
             BootstrapOnFailureBehavior::Fallback,
             &schema,
-            false,
         );
 
         let mutex = Arc::new(Mutex::new(()));
@@ -7052,7 +7006,7 @@ mod tests {
     async fn download_snapshot_entry_rejects_checksum_mismatch() {
         let store = Arc::new(InMemory::new());
         let base = Path::from(SNAPSHOT_BASE_PATH);
-        let layout = SnapshotPathLayout::new(DATASET_NAME, &AccelerationEngine::DuckDB);
+        let layout = SnapshotPathLayout::new(DATASET_NAME, &AccelerationEngine::Cayenne);
         let instant = Utc
             .with_ymd_and_hms(2025, 3, 1, 12, 0, 0)
             .single()
@@ -7096,7 +7050,6 @@ mod tests {
             local_path.clone(),
             BootstrapOnFailureBehavior::Warn,
             &schema,
-            false,
         );
         let factory = Arc::clone(
             manager
@@ -7120,7 +7073,7 @@ mod tests {
     async fn download_snapshot_entry_rejects_size_mismatch() {
         let store = Arc::new(InMemory::new());
         let base = Path::from(SNAPSHOT_BASE_PATH);
-        let layout = SnapshotPathLayout::new(DATASET_NAME, &AccelerationEngine::DuckDB);
+        let layout = SnapshotPathLayout::new(DATASET_NAME, &AccelerationEngine::Cayenne);
         let instant = Utc
             .with_ymd_and_hms(2025, 4, 1, 12, 0, 0)
             .single()
@@ -7164,7 +7117,6 @@ mod tests {
             local_path.clone(),
             BootstrapOnFailureBehavior::Warn,
             &schema,
-            false,
         );
         let factory = Arc::clone(
             manager
@@ -7188,7 +7140,7 @@ mod tests {
     async fn download_snapshot_entry_rejects_unsupported_checksum_algorithm() {
         let store = Arc::new(InMemory::new());
         let base = Path::from(SNAPSHOT_BASE_PATH);
-        let layout = SnapshotPathLayout::new(DATASET_NAME, &AccelerationEngine::DuckDB);
+        let layout = SnapshotPathLayout::new(DATASET_NAME, &AccelerationEngine::Cayenne);
         let instant = Utc
             .with_ymd_and_hms(2025, 5, 1, 12, 0, 0)
             .single()
@@ -7232,7 +7184,6 @@ mod tests {
             local_path.clone(),
             BootstrapOnFailureBehavior::Warn,
             &schema,
-            false,
         );
         let factory = Arc::clone(
             manager
@@ -7256,7 +7207,7 @@ mod tests {
     async fn download_snapshot_entry_rejects_schema_mismatch() {
         let store = Arc::new(InMemory::new());
         let base = Path::from(SNAPSHOT_BASE_PATH);
-        let layout = SnapshotPathLayout::new(DATASET_NAME, &AccelerationEngine::DuckDB);
+        let layout = SnapshotPathLayout::new(DATASET_NAME, &AccelerationEngine::Cayenne);
         let instant = Utc
             .with_ymd_and_hms(2025, 6, 1, 12, 0, 0)
             .single()
@@ -7307,7 +7258,6 @@ mod tests {
             local_path.clone(),
             BootstrapOnFailureBehavior::Warn,
             &runtime_schema,
-            false,
         );
         let factory = Arc::clone(
             manager
@@ -7329,12 +7279,11 @@ mod tests {
     /// A restored snapshot whose checkpoint schema predates a widening schema
     /// change (the metadata-recorded current schema is wider) is accepted:
     /// startup re-classification evolves the restored acceleration afterwards.
-    #[cfg(feature = "duckdb")]
     #[tokio::test]
     async fn download_snapshot_entry_accepts_pre_evolution_snapshot() {
         let store = Arc::new(InMemory::new());
         let base = Path::from(SNAPSHOT_BASE_PATH);
-        let layout = SnapshotPathLayout::new(DATASET_NAME, &AccelerationEngine::DuckDB);
+        let layout = SnapshotPathLayout::new(DATASET_NAME, &AccelerationEngine::Cayenne);
         let instant = Utc
             .with_ymd_and_hms(2025, 6, 1, 12, 0, 0)
             .single()
@@ -7387,7 +7336,6 @@ mod tests {
             local_path.clone(),
             BootstrapOnFailureBehavior::Warn,
             &restored_schema,
-            false,
         );
         let factory = Arc::clone(
             manager
@@ -7410,7 +7358,6 @@ mod tests {
         assert!(local_path.exists(), "snapshot file restored locally");
     }
 
-    #[cfg(feature = "duckdb")]
     #[tokio::test]
     async fn download_snapshot_entry_rejects_engine_mismatch() {
         let store = Arc::new(InMemory::new());
@@ -7430,7 +7377,7 @@ mod tests {
 
         let schema = sample_schema();
         let checksum = compute_sha256_hex(contents.as_ref());
-        // Snapshot was created with SQLite engine, but we're trying to load with DuckDB
+        // Snapshot was created with SQLite engine, but we're trying to load with Cayenne
         let entry = SnapshotEntry {
             snapshot_id: 4,
             timestamp_ms: instant.timestamp_millis(),
@@ -7455,13 +7402,12 @@ mod tests {
         let temp_dir = TempDir::new().expect("create temp dir");
         let local_path = temp_dir.path().join("snapshot.db");
 
-        // Build manager with DuckDB engine (mismatches SQLite snapshot)
+        // Build manager with the Cayenne engine (mismatches SQLite snapshot)
         let manager = build_manager(
             Arc::clone(&store),
             local_path.clone(),
             BootstrapOnFailureBehavior::Warn,
             &schema,
-            false,
         );
         let factory = Arc::clone(
             manager
@@ -7475,7 +7421,7 @@ mod tests {
             .await;
 
         assert!(
-            matches!(result, Err(SnapshotDownloadError::EngineMismatch { ref dataset, ref snapshot_engine, ref current_engine }) if dataset == DATASET_NAME && snapshot_engine == "sqlite" && current_engine == "duckdb"),
+            matches!(result, Err(SnapshotDownloadError::EngineMismatch { ref dataset, ref snapshot_engine, ref current_engine }) if dataset == DATASET_NAME && snapshot_engine == "sqlite" && current_engine == "cayenne"),
             "expected EngineMismatch error, got: {result:?}"
         );
 
@@ -7486,14 +7432,13 @@ mod tests {
     /// When fallback mode is active and the current (newest) snapshot was created by
     /// a different engine, the fallback loop should skip it via early engine filtering
     /// and successfully download the next compatible snapshot.
-    #[cfg(feature = "duckdb")]
     #[tokio::test]
     async fn download_with_fallback_skips_engine_mismatched_snapshots() {
         let store = Arc::new(InMemory::new());
         let base = Path::from(SNAPSHOT_BASE_PATH);
-        let layout = SnapshotPathLayout::new(DATASET_NAME, &AccelerationEngine::DuckDB);
+        let layout = SnapshotPathLayout::new(DATASET_NAME, &AccelerationEngine::Cayenne);
 
-        // Snapshot 1: created with sqlite engine (incompatible with duckdb manager)
+        // Snapshot 1: created with sqlite engine (incompatible with the cayenne manager)
         let first_instant = Utc
             .with_ymd_and_hms(2025, 2, 1, 0, 0, 0)
             .single()
@@ -7505,13 +7450,13 @@ mod tests {
             .await
             .expect("write snapshot");
 
-        // Snapshot 0: created with duckdb engine (compatible)
+        // Snapshot 0: created with the cayenne engine (compatible)
         let second_instant = Utc
             .with_ymd_and_hms(2025, 1, 20, 0, 0, 0)
             .single()
             .expect("valid time");
         let second_location = layout.build_location(&base, second_instant);
-        let second_contents = Bytes::from_static(b"duckdb-snapshot-bytes");
+        let second_contents = Bytes::from_static(b"cayenne-snapshot-bytes");
         store
             .put(&second_location, second_contents.clone().into())
             .await
@@ -7538,7 +7483,7 @@ mod tests {
             snapshot_checksum: valid_checksum.clone(),
             snapshot_checksum_algorithm: SNAPSHOT_CHECKSUM_ALGORITHM.to_string(),
             snapshot_size: second_contents.len() as u64,
-            snapshot_engine: Some("duckdb".to_string()),
+            snapshot_engine: Some("cayenne".to_string()),
             snapshot_row_count: Some(100),
             snapshot_last_updated_at_ms: None,
         };
@@ -7569,7 +7514,6 @@ mod tests {
             local_path.clone(),
             BootstrapOnFailureBehavior::Fallback,
             &schema,
-            false,
         );
 
         let info = manager
@@ -7589,12 +7533,11 @@ mod tests {
 
     /// When all snapshots have incompatible engines, the fallback loop should
     /// skip them all and return `None` instead of failing with an error.
-    #[cfg(feature = "duckdb")]
     #[tokio::test]
     async fn download_with_fallback_returns_none_when_all_snapshots_have_wrong_engine() {
         let store = Arc::new(InMemory::new());
         let base = Path::from(SNAPSHOT_BASE_PATH);
-        let layout = SnapshotPathLayout::new(DATASET_NAME, &AccelerationEngine::DuckDB);
+        let layout = SnapshotPathLayout::new(DATASET_NAME, &AccelerationEngine::Cayenne);
 
         let instant = Utc
             .with_ymd_and_hms(2025, 3, 1, 0, 0, 0)
@@ -7615,7 +7558,7 @@ mod tests {
             snapshot_checksum: checksum,
             snapshot_checksum_algorithm: SNAPSHOT_CHECKSUM_ALGORITHM.to_string(),
             snapshot_size: contents.len() as u64,
-            snapshot_engine: Some("cayenne".to_string()),
+            snapshot_engine: Some("sqlite".to_string()),
             snapshot_row_count: Some(10),
             snapshot_last_updated_at_ms: None,
         };
@@ -7642,7 +7585,6 @@ mod tests {
             local_path.clone(),
             BootstrapOnFailureBehavior::Fallback,
             &schema,
-            false,
         );
 
         let result = manager
@@ -7660,12 +7602,11 @@ mod tests {
     /// When the `EngineMismatch` error occurs inside `download_snapshot_entry` (e.g.
     /// because `snapshot_engine` was set but the early filter didn't catch it), the
     /// fallback loop should treat it as recoverable and continue to the next snapshot.
-    #[cfg(feature = "duckdb")]
     #[tokio::test]
     async fn download_with_fallback_recovers_from_engine_mismatch_error() {
         let store = Arc::new(InMemory::new());
         let base = Path::from(SNAPSHOT_BASE_PATH);
-        let layout = SnapshotPathLayout::new(DATASET_NAME, &AccelerationEngine::DuckDB);
+        let layout = SnapshotPathLayout::new(DATASET_NAME, &AccelerationEngine::Cayenne);
 
         // Snapshot 1: no engine metadata (bypass early filter) but mismatched content
         // that won't cause an EngineMismatch since snapshot_engine is None.
@@ -7681,13 +7622,13 @@ mod tests {
             .await
             .expect("write snapshot");
 
-        // Snapshot 0: compatible duckdb snapshot
+        // Snapshot 0: compatible cayenne snapshot
         let good_instant = Utc
             .with_ymd_and_hms(2025, 3, 15, 0, 0, 0)
             .single()
             .expect("valid time");
         let good_location = layout.build_location(&base, good_instant);
-        let good_contents = Bytes::from_static(b"good-duckdb-snapshot");
+        let good_contents = Bytes::from_static(b"good-cayenne-snapshot");
         store
             .put(&good_location, good_contents.clone().into())
             .await
@@ -7718,7 +7659,7 @@ mod tests {
             snapshot_checksum: good_checksum.clone(),
             snapshot_checksum_algorithm: SNAPSHOT_CHECKSUM_ALGORITHM.to_string(),
             snapshot_size: good_contents.len() as u64,
-            snapshot_engine: Some("duckdb".to_string()),
+            snapshot_engine: Some("cayenne".to_string()),
             snapshot_row_count: Some(100),
             snapshot_last_updated_at_ms: None,
         };
@@ -7748,7 +7689,6 @@ mod tests {
             local_path.clone(),
             BootstrapOnFailureBehavior::Fallback,
             &schema,
-            false,
         );
 
         let info = manager
@@ -7920,7 +7860,6 @@ mod tests {
             PathBuf::from("/tmp/unused"),
             BootstrapOnFailureBehavior::Warn,
             &schema,
-            false,
         );
 
         let uri = format!("{SNAPSHOT_URI_PREFIX}/month=2025-01/day=01/dataset=dataset/file.db");
@@ -7943,7 +7882,6 @@ mod tests {
             PathBuf::from("/tmp/unused"),
             BootstrapOnFailureBehavior::Warn,
             &schema,
-            false,
         );
 
         let uri = "memory://other-prefix/path/to/file.db";
@@ -7956,7 +7894,6 @@ mod tests {
 
     // regression test for #14425
     #[test]
-    #[cfg(feature = "duckdb")]
     fn snapshot_uri_to_object_path_resolves_against_metadata_location() {
         let store = Arc::new(InMemory::new());
         let schema = sample_schema();
@@ -7965,7 +7902,6 @@ mod tests {
             PathBuf::from("/tmp/unused"),
             BootstrapOnFailureBehavior::Warn,
             &schema,
-            false,
         );
         let uri = "s3://bucket-a/snapshots/month=2025-01/day=01/dataset=dataset/file.db";
         let expected = "snapshots/month=2025-01/day=01/dataset=dataset/file.db";
@@ -7995,7 +7931,6 @@ mod tests {
     }
 
     #[test]
-    #[cfg(feature = "duckdb")]
     fn snapshot_uri_to_object_path_matches_metadata_location_on_path_boundary() {
         let store = Arc::new(InMemory::new());
         let schema = sample_schema();
@@ -8004,7 +7939,6 @@ mod tests {
             PathBuf::from("/tmp/unused"),
             BootstrapOnFailureBehavior::Warn,
             &schema,
-            false,
         );
 
         // `s3://bucket-a/snap` is a string prefix of the URI but not a path prefix, so it
@@ -8029,7 +7963,6 @@ mod tests {
 
     // regression test for #14425: logs name the location read, not the writer's bucket
     #[test]
-    #[cfg(feature = "duckdb")]
     fn snapshot_read_uri_names_the_location_read() {
         let store = Arc::new(InMemory::new());
         let schema = sample_schema();
@@ -8038,7 +7971,6 @@ mod tests {
             PathBuf::from("/tmp/unused"),
             BootstrapOnFailureBehavior::Warn,
             &schema,
-            false,
         );
 
         // An entry recorded under the writer's bucket reads from this manager's location.
@@ -8061,122 +7993,6 @@ mod tests {
         );
     }
 
-    #[cfg(feature = "duckdb")]
-    #[tokio::test]
-    async fn create_snapshot_with_compaction() {
-        use duckdb::Connection;
-
-        let store = Arc::new(InMemory::new());
-        let temp_dir = TempDir::new().expect("create temp dir");
-        let local_path = temp_dir.path().join("snapshot.duckdb");
-
-        // Create a fragmented DuckDB database
-        {
-            let conn = Connection::open(&local_path).expect("open duckdb");
-
-            conn.execute("CREATE TABLE test_data (id INTEGER, padding VARCHAR)", [])
-                .expect("create table");
-
-            // Insert data with padding to make file size significant
-            conn.execute(
-                "INSERT INTO test_data
-                 SELECT i, REPEAT('x', 500)
-                 FROM generate_series(1, 2000000) AS t(i)",
-                [],
-            )
-            .expect("insert data");
-
-            // Delete most rows to create dead tuples (fragmentation)
-            conn.execute("DELETE FROM test_data WHERE id > 50", [])
-                .expect("delete data");
-
-            conn.execute("CHECKPOINT", []).expect("checkpoint");
-        }
-
-        let fragmented_size = std::fs::metadata(&local_path)
-            .expect("get fragmented size")
-            .len();
-
-        let schema = sample_schema();
-        let manager = build_manager_for_engine(
-            Arc::clone(&store),
-            local_path.clone(),
-            BootstrapOnFailureBehavior::Warn,
-            &schema,
-            &AccelerationEngine::DuckDB,
-            true,
-        );
-
-        let mutex = Arc::new(Mutex::new(()));
-        let lock_guard = mutex.lock_owned().await;
-
-        let uploaded_path = manager
-            .create_snapshot(&schema, lock_guard, None, None, ForceCreate(true))
-            .await
-            .expect("create snapshot")
-            .expect("snapshot should be created");
-
-        // Verify snapshot was uploaded to object store
-        let stored = store
-            .get(&uploaded_path)
-            .await
-            .expect("snapshot stored")
-            .bytes()
-            .await
-            .expect("read stored snapshot");
-
-        let uploaded_size = stored.len() as u64;
-
-        // Compacted snapshot should be smaller than fragmented source
-        assert!(
-            uploaded_size < fragmented_size,
-            "compacted snapshot ({uploaded_size} bytes) should be smaller than \
-             fragmented source ({fragmented_size} bytes)"
-        );
-
-        // Verify metadata was updated correctly
-        let metadata_path = Path::from(SNAPSHOT_BASE_PATH).join(METADATA_FILE_NAME);
-        let metadata_bytes = store
-            .get(&metadata_path)
-            .await
-            .expect("metadata stored")
-            .bytes()
-            .await
-            .expect("read metadata");
-        let metadata: SnapshotMetadata =
-            serde_json::from_slice(&metadata_bytes).expect("parse metadata");
-
-        let dataset = metadata
-            .datasets
-            .get(DATASET_NAME)
-            .expect("dataset metadata present");
-        assert_eq!(dataset.snapshots.len(), 1);
-        assert_eq!(dataset.current_snapshot_id, Some(0));
-
-        let entry = dataset.snapshots.first().expect("snapshot entry");
-        assert_eq!(entry.snapshot_size, uploaded_size);
-        assert_eq!(entry.snapshot_checksum, compute_sha256_hex(&stored));
-        assert_eq!(
-            entry.snapshot_checksum_algorithm,
-            SNAPSHOT_CHECKSUM_ALGORITHM
-        );
-        assert_eq!(entry.snapshot, snapshot_uri(&uploaded_path));
-
-        // Verify uploaded snapshot contains valid data
-        let verify_path = temp_dir.path().join("verify.duckdb");
-        std::fs::write(&verify_path, &stored).expect("write verify file");
-
-        {
-            let conn = Connection::open(&verify_path).expect("open verify db");
-
-            let count: i64 = conn
-                .query_row("SELECT COUNT(*) FROM test_data", [], |row| row.get(0))
-                .expect("count rows");
-
-            assert_eq!(count, 50, "compacted snapshot should have 50 rows");
-        }
-    }
-
     // ==================== Generic Engine Tests ====================
     // These tests verify snapshot functionality works across all accelerator backends.
 
@@ -8193,7 +8009,6 @@ mod tests {
             BootstrapOnFailureBehavior::Warn,
             &schema,
             engine,
-            false,
         );
 
         let result = manager
@@ -8219,7 +8034,6 @@ mod tests {
             BootstrapOnFailureBehavior::Warn,
             &schema,
             engine,
-            false, // no compaction for generic test
         );
 
         let mutex = Arc::new(Mutex::new(()));
@@ -8277,7 +8091,7 @@ mod tests {
     async fn download_and_verify_snapshot(engine: &AccelerationEngine, contents: Bytes) {
         let store = Arc::new(InMemory::new());
         let base = Path::from(SNAPSHOT_BASE_PATH);
-        let layout = SnapshotPathLayout::new(DATASET_NAME, &AccelerationEngine::DuckDB);
+        let layout = SnapshotPathLayout::new(DATASET_NAME, &AccelerationEngine::Cayenne);
         let instant = Utc
             .with_ymd_and_hms(2025, 3, 15, 10, 30, 0)
             .single()
@@ -8325,7 +8139,6 @@ mod tests {
             BootstrapOnFailureBehavior::Warn,
             &schema,
             engine,
-            false,
         );
 
         let info = manager
@@ -8348,7 +8161,7 @@ mod tests {
 
     /// Generic test: `SnapshotEngine` reports correct compaction support.
     fn generic_engine_compaction_support(engine: &AccelerationEngine, expected_support: bool) {
-        let snapshot_engine = create_snapshot_engine(engine, true);
+        let snapshot_engine = create_snapshot_engine(engine);
         assert_eq!(
             snapshot_engine.supports_compaction(),
             expected_support,
@@ -8388,7 +8201,6 @@ mod tests {
                 BootstrapOnFailureBehavior::Warn,
                 &schema,
                 &AccelerationEngine::Cayenne,
-                false,
             );
             manager.writer_lease = WriterLease::for_instance(identity, Duration::from_mins(1));
             manager
@@ -8455,7 +8267,6 @@ mod tests {
             BootstrapOnFailureBehavior::Warn,
             &schema,
             &AccelerationEngine::Cayenne,
-            false,
         );
         let mutex = Arc::new(Mutex::new(()));
 
@@ -8512,7 +8323,6 @@ mod tests {
                 BootstrapOnFailureBehavior::Warn,
                 &schema,
                 &AccelerationEngine::Cayenne,
-                false,
             );
             manager.writer_lease = WriterLease::for_instance(identity, Duration::from_mins(1));
             manager
@@ -8585,83 +8395,6 @@ mod tests {
         generic_engine_compaction_support(&AccelerationEngine::Sqlite, false);
     }
 
-    // ==================== DuckDB Engine Tests ====================
-
-    #[cfg(feature = "duckdb")]
-    #[tokio::test]
-    async fn duckdb_download_returns_none_without_metadata() {
-        generic_download_returns_none_without_metadata(&AccelerationEngine::DuckDB).await;
-    }
-
-    #[cfg(feature = "duckdb")]
-    #[tokio::test]
-    async fn duckdb_create_snapshot_updates_metadata() {
-        generic_create_snapshot_updates_metadata(&AccelerationEngine::DuckDB).await;
-    }
-
-    /// The whole upload path, not just the engine hook: a `DuckDB` write that is still
-    /// in the write-ahead log when the snapshot is taken must reach the uploaded object.
-    /// Before the `checkpoint_live` override, `create_file_snapshot` copied the database
-    /// file while the write sat in `<db>.wal`, and the snapshot was published without it
-    /// (#13912). The accelerator's connection stays open throughout, as it does in
-    /// production.
-    #[cfg(feature = "duckdb")]
-    #[tokio::test]
-    async fn duckdb_snapshot_carries_a_write_still_in_the_write_ahead_log() {
-        let store = Arc::new(InMemory::new());
-        let temp_dir = TempDir::new().expect("create temp dir");
-        let local_path = temp_dir.path().join("snapshot.db");
-
-        let live = duckdb::Connection::open(&local_path).expect("open live database");
-        live.execute_batch("CREATE TABLE t(id INTEGER); INSERT INTO t VALUES (1); CHECKPOINT;")
-            .expect("seed a checkpointed baseline");
-        live.execute_batch("INSERT INTO t VALUES (2);")
-            .expect("write without checkpointing");
-
-        let wal = PathBuf::from(format!("{}.wal", local_path.display()));
-        assert!(
-            std::fs::metadata(&wal).is_ok_and(|m| m.len() > 0),
-            "the second write must still be in the write-ahead log for this test to mean anything"
-        );
-
-        let schema = sample_schema();
-        let manager = build_manager_for_engine(
-            Arc::clone(&store),
-            local_path.clone(),
-            BootstrapOnFailureBehavior::Warn,
-            &schema,
-            &AccelerationEngine::DuckDB,
-            false,
-        );
-
-        let mutex = Arc::new(Mutex::new(()));
-        let lock_guard = mutex.lock_owned().await;
-        let uploaded_path = manager
-            .create_snapshot(&schema, lock_guard, None, None, ForceCreate(true))
-            .await
-            .expect("create snapshot")
-            .expect("snapshot should be created");
-
-        let uploaded = store
-            .get(&uploaded_path)
-            .await
-            .expect("snapshot stored")
-            .bytes()
-            .await
-            .expect("read stored snapshot");
-
-        let restored = temp_dir.path().join("restored.db");
-        std::fs::write(&restored, &uploaded).expect("materialize the uploaded snapshot");
-        let verify = duckdb::Connection::open(&restored).expect("open the uploaded snapshot");
-        let rows: i64 = verify
-            .query_row("SELECT COUNT(*) FROM t", [], |row| row.get(0))
-            .expect("count rows in the uploaded snapshot");
-        assert_eq!(
-            rows, 2,
-            "the uploaded snapshot must carry the write that was still in the log"
-        );
-    }
-
     /// An absent accelerator file must fail the snapshot, not become one. Every engine
     /// hook opens that file as a database, and each driver's open creates one at a path
     /// that has none — so without the guard in `create_file_snapshot` the hook would
@@ -8685,7 +8418,6 @@ mod tests {
             BootstrapOnFailureBehavior::Warn,
             &schema,
             engine,
-            false,
         );
 
         let mutex = Arc::new(Mutex::new(()));
@@ -8718,33 +8450,14 @@ mod tests {
         );
     }
 
-    #[cfg(feature = "duckdb")]
-    #[tokio::test]
-    async fn duckdb_an_absent_accelerator_file_fails_the_snapshot() {
-        generic_an_absent_accelerator_file_fails_the_snapshot(&AccelerationEngine::DuckDB).await;
-    }
-
     #[cfg(feature = "sqlite")]
     #[tokio::test]
     async fn sqlite_an_absent_accelerator_file_fails_the_snapshot() {
         generic_an_absent_accelerator_file_fails_the_snapshot(&AccelerationEngine::Sqlite).await;
     }
 
-    #[cfg(feature = "duckdb")]
-    #[tokio::test]
-    async fn duckdb_download_snapshot_with_valid_metadata() {
-        generic_download_snapshot_with_valid_metadata(&AccelerationEngine::DuckDB).await;
-    }
-
-    #[cfg(feature = "duckdb")]
-    #[test]
-    fn duckdb_engine_supports_compaction() {
-        generic_engine_compaction_support(&AccelerationEngine::DuckDB, true);
-    }
-
     // ==================== OnChange Policy Tests ====================
 
-    #[cfg(feature = "duckdb")]
     fn build_manager_with_on_change_policy(
         store: &Arc<InMemory>,
         local_path: PathBuf,
@@ -8755,12 +8468,10 @@ mod tests {
             local_path,
             BootstrapOnFailureBehavior::Fallback,
             schema,
-            false,
         )
         .with_snapshots_creation_policy(SnapshotsCreationPolicy::OnChange)
     }
 
-    #[cfg(feature = "duckdb")]
     #[tokio::test]
     async fn on_change_policy_skips_when_no_writes_occurred() {
         let store = Arc::new(InMemory::new());
@@ -8804,7 +8515,6 @@ mod tests {
         );
     }
 
-    #[cfg(feature = "duckdb")]
     #[tokio::test]
     async fn on_change_policy_skips_when_timestamp_matches_previous() {
         let store = Arc::new(InMemory::new());
@@ -8823,7 +8533,6 @@ mod tests {
             local_path.clone(),
             BootstrapOnFailureBehavior::Fallback,
             &schema,
-            false,
         );
 
         let mutex = Arc::new(Mutex::new(()));
@@ -8863,7 +8572,6 @@ mod tests {
         );
     }
 
-    #[cfg(feature = "duckdb")]
     #[tokio::test]
     async fn on_change_policy_creates_first_snapshot_with_valid_timestamp() {
         let store = Arc::new(InMemory::new());
@@ -8901,7 +8609,6 @@ mod tests {
         );
     }
 
-    #[cfg(feature = "duckdb")]
     #[tokio::test]
     async fn on_change_policy_creates_snapshot_when_timestamp_differs() {
         let store = Arc::new(InMemory::new());
@@ -8920,7 +8627,6 @@ mod tests {
             local_path.clone(),
             BootstrapOnFailureBehavior::Fallback,
             &schema,
-            false,
         );
 
         let mutex = Arc::new(Mutex::new(()));
@@ -8962,7 +8668,6 @@ mod tests {
         );
     }
 
-    #[cfg(feature = "duckdb")]
     #[tokio::test]
     async fn always_policy_creates_snapshot_even_when_no_writes() {
         let store = Arc::new(InMemory::new());
@@ -8979,7 +8684,6 @@ mod tests {
             local_path,
             BootstrapOnFailureBehavior::Fallback,
             &schema,
-            false,
         );
 
         let mutex = Arc::new(Mutex::new(()));
@@ -8998,7 +8702,6 @@ mod tests {
         );
     }
 
-    #[cfg(feature = "duckdb")]
     #[tokio::test]
     async fn force_creates_snapshot_when_no_metadata_exists() {
         let store = Arc::new(InMemory::new());
@@ -9029,7 +8732,6 @@ mod tests {
         );
     }
 
-    #[cfg(feature = "duckdb")]
     #[tokio::test]
     async fn force_creates_snapshot_when_metadata_exists_but_no_snapshots_for_dataset() {
         let store = Arc::new(InMemory::new());
@@ -9071,7 +8773,6 @@ mod tests {
         );
     }
 
-    #[cfg(feature = "duckdb")]
     #[tokio::test]
     async fn force_creates_snapshot_when_metadata_has_snapshots_but_no_files_exist() {
         let store = Arc::new(InMemory::new());
@@ -9137,7 +8838,7 @@ mod tests {
     /// Uses `AccelerationLayout::None` since API tests only read/write metadata.
     pub(super) fn build_manager_for_api_tests(store: Arc<InMemory>) -> SnapshotManager {
         let object_store: Arc<dyn ObjectStore> = store;
-        let snapshot_engine = create_snapshot_engine(&AccelerationEngine::Cayenne, false);
+        let snapshot_engine = create_snapshot_engine(&AccelerationEngine::Cayenne);
 
         SnapshotManager {
             dataset_name: DATASET_NAME.to_string(),
@@ -9787,7 +9488,7 @@ mod tests {
         dataset_name: &str,
     ) -> SnapshotManager {
         let object_store: Arc<dyn ObjectStore> = store;
-        let snapshot_engine = create_snapshot_engine(&AccelerationEngine::Cayenne, false);
+        let snapshot_engine = create_snapshot_engine(&AccelerationEngine::Cayenne);
 
         SnapshotManager {
             dataset_name: dataset_name.to_string(),
@@ -10381,14 +10082,13 @@ mod tests {
 
     /// Restores a snapshot whose recorded schema is `recorded` against a checkpoint holding
     /// `checkpoint_schema`, and returns `(what checkpoint() was handed, the restore's schema)`.
-    #[cfg(feature = "duckdb")]
     async fn restore_snapshot_recording_schema(
         snapshot_schema: SchemaMetadata,
         checkpoint_schema: Option<SchemaRef>,
     ) -> (Option<SchemaRef>, SchemaRef) {
         let store = Arc::new(InMemory::new());
         let base = Path::from(SNAPSHOT_BASE_PATH);
-        let layout = SnapshotPathLayout::new(DATASET_NAME, &AccelerationEngine::DuckDB);
+        let layout = SnapshotPathLayout::new(DATASET_NAME, &AccelerationEngine::Cayenne);
         let instant = Utc
             .with_ymd_and_hms(2025, 6, 1, 12, 0, 0)
             .single()
@@ -10437,7 +10137,6 @@ mod tests {
             temp_dir.path().join("snapshot.db"),
             BootstrapOnFailureBehavior::Warn,
             &sample_schema(),
-            false,
         );
         manager.checkpointer_factory = Some(Arc::clone(&factory));
 
@@ -10453,7 +10152,6 @@ mod tests {
     /// The acceptance case: a snapshot written before recorded schemas were conformed
     /// bootstraps the checkpoint, and what the checkpoint ends up holding must be a
     /// declaration an accelerator can hold.
-    #[cfg(feature = "duckdb")]
     #[tokio::test]
     async fn restoring_a_legacy_snapshot_bootstraps_a_conforming_checkpoint() {
         let forbidden = nullable_map_entries_schema();
@@ -10473,7 +10171,6 @@ mod tests {
 
     /// The checkpoint is a third store of a schema. One written by an older build carries the
     /// same declaration, and it is what the restore returns on this branch.
-    #[cfg(feature = "duckdb")]
     #[tokio::test]
     async fn restoring_over_a_legacy_checkpoint_conforms_the_schema_it_returns() {
         let forbidden = nullable_map_entries_schema();
@@ -10493,13 +10190,12 @@ mod tests {
     /// in its *published* JSON. Reading repairs what this process sees, but the next upload
     /// finds the conformed form equal to the live schema and writes no new schema version — so
     /// nothing ever rewrites what the next reader downloads.
-    #[cfg(feature = "duckdb")]
     #[tokio::test]
     async fn uploading_over_legacy_metadata_repairs_the_published_schema() {
         let store = Arc::new(InMemory::new());
         let temp_dir = TempDir::new().expect("create temp dir");
         let local_path = temp_dir.path().join("snapshot.db");
-        write_sample_local_db(&local_path, &AccelerationEngine::DuckDB);
+        write_sample_local_db(&local_path, &AccelerationEngine::Cayenne);
 
         // The accelerator's own schema conforms — it is the only form it can hold.
         let forbidden = nullable_map_entries_schema();
@@ -10512,7 +10208,7 @@ mod tests {
             DATASET_NAME.to_string(),
             DatasetMetadata {
                 name: DATASET_NAME.to_string(),
-                engine: Some(AccelerationEngine::DuckDB.to_string()),
+                engine: Some(AccelerationEngine::Cayenne.to_string()),
                 schemas: vec![legacy_recorded_schema(0, &forbidden)],
                 current_schema_id: 0,
                 ..Default::default()
@@ -10525,7 +10221,6 @@ mod tests {
             local_path,
             BootstrapOnFailureBehavior::Warn,
             &live_schema,
-            false,
         );
         let mutex = Arc::new(Mutex::new(()));
         manager
@@ -10609,7 +10304,6 @@ mod tests {
             BootstrapOnFailureBehavior::Warn,
             &sample_schema(),
             &AccelerationEngine::Cayenne,
-            false,
         )
     }
 
@@ -10910,7 +10604,6 @@ mod tests {
             BootstrapOnFailureBehavior::Warn,
             &schema,
             &AccelerationEngine::Cayenne,
-            false,
         );
         let read_before_drop = reader
             .load_metadata()

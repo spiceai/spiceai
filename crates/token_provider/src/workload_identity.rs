@@ -30,17 +30,22 @@ limitations under the License.
 use std::{
     fmt,
     hash::{DefaultHasher, Hash, Hasher},
-    path::PathBuf,
+    path::{Path, PathBuf},
     sync::Arc,
     time::Duration,
 };
 
+use async_trait::async_trait;
+use base64::Engine as _;
+use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+use chrono::{DateTime, SecondsFormat, Utc};
 use secrecy::{ExposeSecret, SecretString};
 use serde::Deserialize;
 use serde_json::{Value, json};
+use sha2::{Digest, Sha256};
 use snafu::prelude::*;
 use tokio::sync::watch;
-use tokio::time::sleep;
+use tokio::time::{Instant, sleep};
 use util::fibonacci_backoff::{Backoff as _, FibonacciBackoffBuilder};
 
 use crate::TokenProvider;
@@ -51,6 +56,10 @@ const ANTHROPIC_TOKEN_URL: &str = "https://api.anthropic.com/v1/oauth/token";
 /// The audience GitHub Actions is asked to issue an identity token for when exchanging it with
 /// Anthropic.
 pub const ANTHROPIC_AUDIENCE: &str = "https://api.anthropic.com";
+
+/// The audience `OpenAI`'s Kubernetes guide recommends for a workload's identity token, which
+/// GitHub Actions or a cloud identity service is asked to issue a token for.
+pub const OPENAI_AUDIENCE: &str = "https://api.openai.com/v1";
 
 /// `OpenAI`'s token endpoint.
 const OPENAI_TOKEN_URL: &str = "https://auth.openai.com/oauth/token";
@@ -73,8 +82,10 @@ const ANTHROPIC_AUTHENTICATION_HISTORY: &str =
 const OPENAI_WORKLOAD_IDENTITY_SETTINGS: &str =
     "https://platform.openai.com/settings/organization/security/workload-identity-provider";
 
-/// A token is exchanged again this long before it expires, or after three quarters of its life
-/// when that is shorter.
+/// A token exchanged for a token file is exchanged again at the latest this long before it
+/// expires, or after three quarters of its life when that is shorter, when the file has not
+/// changed by then. A token exchanged for an identity token Spice requests is exchanged again
+/// halfway through its life, leaving the other half for retries.
 const MAX_REFRESH_LEAD: Duration = Duration::from_mins(1);
 
 /// The longest wait between retries of a failed exchange. It is short because a token exchanged
@@ -85,6 +96,11 @@ const MAX_RETRY_WAIT: Duration = Duration::from_secs(15);
 /// The shortest wait before exchanging again, so a token reported as already expiring cannot make
 /// the refresh loop exchange back to back.
 const MIN_REFRESH_WAIT: Duration = Duration::from_secs(1);
+
+/// How often a token file is checked for a new token: an eighth of the access token's life,
+/// within these bounds, so a token the platform rotates is exchanged soon after it is written.
+const MAX_FILE_POLL: Duration = Duration::from_secs(10);
+const MIN_FILE_POLL: Duration = Duration::from_millis(100);
 
 /// Bounds the reason quoted from a provider's error response.
 const MAX_REASON_LEN: usize = 300;
@@ -132,6 +148,9 @@ pub enum WorkloadIdentityError {
     #[snafu(display("The workload identity token from {origin} is empty."))]
     EmptySubjectToken { origin: String },
 
+    #[snafu(display("Failed to get a workload identity token from {origin}: {reason}"))]
+    SubjectTokenRequested { origin: String, reason: String },
+
     #[snafu(display("Failed to create the HTTP client for workload identity: {source}"))]
     HttpClient { source: reqwest::Error },
 
@@ -145,12 +164,14 @@ pub enum WorkloadIdentityError {
     },
 
     #[snafu(display(
-        "{provider} refused to exchange the workload identity token for an access token (HTTP {status}): {reason}. {hint}"
+        "{provider} refused to exchange the workload identity token for an access token (HTTP {status}): {reason}.{claims} {hint}"
     ))]
     ExchangeRefused {
         provider: &'static str,
         status: reqwest::StatusCode,
         reason: String,
+        /// The sentence naming the identity token's claims, with a leading space, or empty.
+        claims: String,
         hint: String,
     },
 
@@ -187,6 +208,22 @@ pub enum WorkloadIdentityError {
 
 pub type Result<T, E = WorkloadIdentityError> = std::result::Result<T, E>;
 
+/// A source Spice requests a fresh identity token from for every exchange, such as a cloud's
+/// identity service: the AWS STS `GetWebIdentityToken` API, the Google Cloud metadata server, or
+/// a Microsoft Entra managed identity.
+#[async_trait]
+pub trait IdentityTokenSource: Send + Sync {
+    /// A fresh identity token, or why there is none, worded as the cause clause of a message.
+    async fn fetch(&self) -> std::result::Result<SecretString, String>;
+
+    /// Where the token comes from, as a message names it, such as `the AWS IAM role (STS
+    /// GetWebIdentityToken)`.
+    fn describe(&self) -> String;
+
+    /// Identifiers that tell sources apart, never a token, for [`TokenProvider::dyn_hash`].
+    fn hash_key(&self) -> String;
+}
+
 /// Where the identity token that is exchanged comes from. A source is read again for every
 /// exchange: identity tokens are short-lived, and one that carries a `jti` claim can be exchanged
 /// only once.
@@ -201,6 +238,9 @@ pub enum SubjectTokenSource {
     },
     /// A file that holds the token, such as one Kubernetes projects into a pod and rotates.
     File(PathBuf),
+    /// A source Spice requests a token from for every exchange, such as a cloud's identity
+    /// service.
+    Requested(Arc<dyn IdentityTokenSource>),
 }
 
 impl fmt::Debug for SubjectTokenSource {
@@ -211,6 +251,10 @@ impl fmt::Debug for SubjectTokenSource {
                 .field("audience", audience)
                 .finish_non_exhaustive(),
             Self::File(path) => f.debug_tuple("File").field(path).finish(),
+            Self::Requested(source) => f
+                .debug_tuple("Requested")
+                .field(&source.describe())
+                .finish(),
         }
     }
 }
@@ -257,11 +301,23 @@ impl SubjectTokenSource {
         }
     }
 
-    fn describe(&self) -> String {
+    /// Where the token comes from, as a message names it, such as `the file '/var/run/token'`.
+    #[must_use]
+    pub fn describe(&self) -> String {
         match self {
             Self::GitHubActions { .. } => "GitHub Actions".to_string(),
             Self::File(path) => format!("the file '{}'", path.display()),
+            Self::Requested(source) => source.describe(),
         }
+    }
+
+    /// A fresh identity token from this source, for a caller that exchanges it itself.
+    ///
+    /// # Errors
+    ///
+    /// When the token cannot be read or requested, or is empty.
+    pub async fn fetch_identity_token(&self) -> Result<SecretString> {
+        self.fetch(&exchange_client()?).await
     }
 
     async fn fetch(&self, http: &reqwest::Client) -> Result<SecretString> {
@@ -302,6 +358,12 @@ impl SubjectTokenSource {
                     .context(SubjectTokenFileSnafu { path: path.clone() })?;
                 SecretString::from(contents.trim().to_string())
             }
+            Self::Requested(source) => source.fetch().await.map_err(|reason| {
+                WorkloadIdentityError::SubjectTokenRequested {
+                    origin: source.describe(),
+                    reason,
+                }
+            })?,
         };
         ensure!(
             !token.expose_secret().is_empty(),
@@ -565,10 +627,191 @@ struct TokenResponse {
     expires_in: Option<u64>,
 }
 
-/// How long to keep a token that expires in `expires_in` before exchanging again.
+/// How long to keep a token exchanged for a token file that expires in `expires_in` before
+/// exchanging again when the file has not changed by then.
 fn refresh_after(expires_in: Duration) -> Duration {
     let lead = MAX_REFRESH_LEAD.min(expires_in / 4);
     expires_in.saturating_sub(lead).max(MIN_REFRESH_WAIT)
+}
+
+/// How long to keep a token exchanged for an identity token Spice requests (from GitHub Actions
+/// or a cloud identity service) before exchanging again: half its life, so a provider or identity
+/// service that is briefly unreachable has the other half to come back before requests fail.
+fn refresh_after_requested(expires_in: Duration) -> Duration {
+    (expires_in / 2).max(MIN_REFRESH_WAIT)
+}
+
+/// When to exchange again after a token that expires in `expires_in`: a requested identity token
+/// is new every time, while a token file is exchanged as soon as it changes (see
+/// [`wait_for_rotation`]) and at the latest by [`refresh_after`].
+fn next_refresh(source: &SubjectTokenSource, expires_in: Duration) -> Duration {
+    match source {
+        SubjectTokenSource::File(_) => refresh_after(expires_in),
+        SubjectTokenSource::GitHubActions { .. } | SubjectTokenSource::Requested(_) => {
+            refresh_after_requested(expires_in)
+        }
+    }
+}
+
+/// How often a token file is checked for a new token while its access token lives `life`.
+fn file_poll(life: Duration) -> Duration {
+    (life / 8).clamp(MIN_FILE_POLL, MAX_FILE_POLL)
+}
+
+/// The digest of an identity token, to tell whether a token file still holds the token last
+/// exchanged.
+fn token_digest(token: &str) -> [u8; 32] {
+    Sha256::digest(token.trim().as_bytes()).into()
+}
+
+/// How a wait for a token file to change ended.
+#[derive(Debug, PartialEq, Eq)]
+enum Rotation {
+    /// The file holds a token other than the one last exchanged.
+    Rotated,
+    /// `max_wait` passed with the file unchanged.
+    Unchanged,
+    /// The provider was dropped.
+    Closed,
+}
+
+/// Waits up to `max_wait` for the token file `path` to hold a token whose digest is not
+/// `exchanged`, checking every `poll`. Exchanging a token as soon as the platform rotates it gives
+/// the new access token the most time before it expires, and never sends a provider a token it
+/// has already exchanged, which one that accepts each `jti` once refuses.
+async fn wait_for_rotation<T>(
+    path: &Path,
+    exchanged: &[u8; 32],
+    max_wait: Duration,
+    poll: Duration,
+    tx: &watch::Sender<T>,
+) -> Rotation {
+    let deadline = Instant::now() + max_wait;
+    loop {
+        let now = Instant::now();
+        if now >= deadline {
+            return Rotation::Unchanged;
+        }
+        tokio::select! {
+            () = sleep(poll.min(deadline - now)) => {}
+            () = tx.closed() => return Rotation::Closed,
+        }
+        if let Ok(contents) = tokio::fs::read_to_string(path).await
+            && !contents.trim().is_empty()
+            && token_digest(&contents) != *exchanged
+        {
+            return Rotation::Rotated;
+        }
+    }
+}
+
+/// The claims of an identity token that a provider's federation rule matches: its issuer,
+/// subject, audience and expiry, read from the payload without verifying it. They identify the
+/// workload but grant nothing, unlike the token, which is never shown.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct IdentityTokenClaims {
+    pub issuer: Option<String>,
+    pub subject: Option<String>,
+    pub audience: Vec<String>,
+    pub expires_at: Option<DateTime<Utc>>,
+}
+
+impl IdentityTokenClaims {
+    /// The claims of `token`, or `None` when it is not a JWT whose payload is a JSON object.
+    #[must_use]
+    pub fn read(token: &str) -> Option<Self> {
+        let mut parts = token.trim().split('.');
+        let (_header, payload, _signature) = (parts.next()?, parts.next()?, parts.next()?);
+        if parts.next().is_some() {
+            return None;
+        }
+        let payload = URL_SAFE_NO_PAD.decode(payload.trim_end_matches('=')).ok()?;
+        let Value::Object(claims) = serde_json::from_slice::<Value>(&payload).ok()? else {
+            return None;
+        };
+        let text = |name: &str| claims.get(name).and_then(Value::as_str).map(claim_value);
+        let audience = match claims.get("aud") {
+            Some(Value::String(audience)) => vec![claim_value(audience)],
+            Some(Value::Array(audiences)) => audiences
+                .iter()
+                .filter_map(Value::as_str)
+                .map(claim_value)
+                .collect(),
+            _ => Vec::new(),
+        };
+        let expires_at = claims
+            .get("exp")
+            .and_then(Value::as_i64)
+            .and_then(|exp| DateTime::from_timestamp(exp, 0));
+        Some(Self {
+            issuer: text("iss"),
+            subject: text("sub"),
+            audience,
+            expires_at,
+        })
+    }
+
+    /// The sentence a refusal adds so the user can compare the token with the provider's rule,
+    /// with a leading space, such as ` The identity token from the file '/t' has issuer
+    /// 'https://issuer', subject 'system:serviceaccount:spice:spiced', audience
+    /// 'https://api.anthropic.com' and expiry 2026-11-07T14:05:00Z.` Empty when the token
+    /// carries none of these claims.
+    #[must_use]
+    pub fn sentence(&self, origin: &str) -> String {
+        let mut parts = Vec::new();
+        if let Some(issuer) = &self.issuer {
+            parts.push(format!("issuer '{issuer}'"));
+        }
+        if let Some(subject) = &self.subject {
+            parts.push(format!("subject '{subject}'"));
+        }
+        match self.audience.as_slice() {
+            [] => {}
+            [audience] => parts.push(format!("audience '{audience}'")),
+            audiences => parts.push(format!(
+                "audiences {}",
+                audiences
+                    .iter()
+                    .map(|audience| format!("'{audience}'"))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            )),
+        }
+        if let Some(expires_at) = self.expires_at {
+            parts.push(format!(
+                "expiry {}",
+                expires_at.to_rfc3339_opts(SecondsFormat::Secs, true)
+            ));
+        }
+        let list = match parts.as_slice() {
+            [] => return String::new(),
+            [only] => only.clone(),
+            [rest @ .., last] => format!("{} and {last}", rest.join(", ")),
+        };
+        format!(" The identity token from {origin} has {list}.")
+    }
+}
+
+/// A claim's value as a message quotes it: on one line and bounded.
+fn claim_value(text: &str) -> String {
+    let text = util::single_line(text);
+    match text.char_indices().nth(MAX_REASON_LEN) {
+        Some((end, _)) => format!("{}…", &text[..end]),
+        None => text.into_owned(),
+    }
+}
+
+/// The HTTP client exchanges use. It follows no redirects: an exchange never needs one, and
+/// following a 307 or 308 would send the identity token in the request body to wherever it
+/// points.
+fn exchange_client() -> Result<reqwest::Client> {
+    reqwest::Client::builder()
+        .user_agent(util::spiceai_user_agent())
+        .connect_timeout(Duration::from_secs(10))
+        .timeout(Duration::from_secs(30))
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+        .context(HttpClientSnafu)
 }
 
 /// `text` as a clause of a longer message: trimmed, without a trailing period, and bounded.
@@ -607,12 +850,15 @@ fn refusal_reason(body: &str) -> String {
     }
 }
 
+/// Exchanges an identity token from `source`, returning the access token and the digest of the
+/// identity token it was exchanged for.
 async fn exchange(
     http: &reqwest::Client,
     source: &SubjectTokenSource,
     exchange: &Exchange,
-) -> Result<AccessToken> {
+) -> Result<(AccessToken, [u8; 32])> {
     let subject_token = source.fetch(http).await?;
+    let digest = token_digest(subject_token.expose_secret());
     let provider = exchange.provider();
     let response = exchange
         .request(http, &subject_token)
@@ -629,6 +875,9 @@ async fn exchange(
             provider,
             status,
             reason: refusal_reason(&String::from_utf8_lossy(&body)),
+            claims: IdentityTokenClaims::read(subject_token.expose_secret())
+                .map(|claims| claims.sentence(&source.describe()))
+                .unwrap_or_default(),
             hint: exchange.refusal_hint(),
         }
         .fail();
@@ -649,12 +898,15 @@ async fn exchange(
         }
         .fail();
     }
-    Ok(AccessToken {
-        token: token.access_token,
-        // Every provider reports the lifetime. A response without one is treated as the shortest
-        // lifetime any of them issues, so the token is exchanged again in good time.
-        expires_in: Duration::from_secs(token.expires_in.unwrap_or(300)),
-    })
+    Ok((
+        AccessToken {
+            token: token.access_token,
+            // Every provider reports the lifetime. A response without one is treated as the
+            // shortest lifetime any of them issues, so the token is exchanged again in good time.
+            expires_in: Duration::from_secs(token.expires_in.unwrap_or(300)),
+        },
+        digest,
+    ))
 }
 
 /// A [`TokenProvider`] backed by workload identity federation. Construction performs the first
@@ -667,17 +919,42 @@ pub struct WorkloadIdentityTokenProvider {
     rx: watch::Receiver<SecretString>,
 }
 
-/// The warning logged when a refresh of `component`'s access token fails: it names the
-/// component, because several models can authenticate with the same provider.
-fn refresh_failure_message(
+/// The warning logged when a refresh of `component`'s access token fails. It names the
+/// component, because several models can authenticate with the same provider, and says until
+/// when requests still work (`expires_at`, compared with `now`). `unchanged_file` names a token
+/// file that still holds the token last exchanged, which is exchanged again as soon as the
+/// platform rotates it.
+#[must_use]
+pub fn refresh_failure_message(
     component: &str,
+    expires_at: DateTime<Utc>,
+    now: DateTime<Utc>,
     retry_in: Duration,
-    error: &WorkloadIdentityError,
+    error: &dyn fmt::Display,
+    unchanged_file: Option<&Path>,
 ) -> String {
-    format!(
-        "Failed to refresh the access token of {component}, so requests keep the current one until it expires. Retrying in {}s. Cause: {error}",
-        retry_in.as_secs()
-    )
+    let expiry = expires_at.to_rfc3339_opts(SecondsFormat::Secs, true);
+    let impact = if now < expires_at {
+        format!("so requests keep the current one until it expires at {expiry}")
+    } else {
+        format!(
+            "and the current one expired at {expiry}, so requests fail until a refresh succeeds"
+        )
+    };
+    let retry = match unchanged_file {
+        Some(path) => format!(
+            "Retrying in {}s, or as soon as the platform rotates the identity token in '{}', which has not changed since the last exchange",
+            retry_in.as_secs(),
+            path.display()
+        ),
+        None => format!("Retrying in {}s", retry_in.as_secs()),
+    };
+    format!("Failed to refresh the access token of {component}, {impact}. {retry}. Cause: {error}")
+}
+
+/// When a token that expires `expires_in` from now expires.
+fn expiry_after(expires_in: Duration) -> DateTime<Utc> {
+    Utc::now() + chrono::Duration::from_std(expires_in).unwrap_or(chrono::Duration::days(365))
 }
 
 impl fmt::Debug for WorkloadIdentityTokenProvider {
@@ -707,6 +984,10 @@ impl TokenProvider for WorkloadIdentityTokenProvider {
             SubjectTokenSource::File(path) => {
                 "file".hash(&mut hasher);
                 path.hash(&mut hasher);
+            }
+            SubjectTokenSource::Requested(source) => {
+                "requested".hash(&mut hasher);
+                source.hash_key().hash(&mut hasher);
             }
         }
         hasher.finish().to_string()
@@ -750,19 +1031,11 @@ impl WorkloadIdentityTokenProvider {
         exchange: Exchange,
     ) -> Result<Self> {
         let component: Arc<str> = component.into();
-        let http = reqwest::Client::builder()
-            .user_agent(util::spiceai_user_agent())
-            .connect_timeout(Duration::from_secs(10))
-            .timeout(Duration::from_secs(30))
-            // An exchange never needs a redirect, and following a 307 or 308 would send the
-            // identity token in the request body to wherever it points.
-            .redirect(reqwest::redirect::Policy::none())
-            .build()
-            .context(HttpClientSnafu)?;
+        let http = exchange_client()?;
         let source = Arc::new(source);
         let exchange = Arc::new(exchange);
 
-        let first = self::exchange(&http, &source, &exchange).await?;
+        let (first, first_digest) = self::exchange(&http, &source, &exchange).await?;
         tracing::debug!(
             "Exchanged a workload identity token from {} for the {} access token of {component}; it expires in {}s",
             source.describe(),
@@ -779,31 +1052,62 @@ impl WorkloadIdentityTokenProvider {
             let mut backoff = FibonacciBackoffBuilder::new()
                 .max_duration(Some(MAX_RETRY_WAIT))
                 .build();
-            let mut next_wait = refresh_after(first_expires_in);
+            let mut life = first_expires_in;
+            let mut expires_at = expiry_after(first_expires_in);
+            let mut exchanged = first_digest;
+            let mut next_wait = next_refresh(&task_source, first_expires_in);
             loop {
                 // A dropped provider closes the channel: stop exchanging tokens nothing reads.
-                tokio::select! {
-                    () = sleep(next_wait) => {}
-                    () = tx.closed() => break,
-                }
+                let rotated = match task_source.as_ref() {
+                    SubjectTokenSource::File(path) => {
+                        match wait_for_rotation(path, &exchanged, next_wait, file_poll(life), &tx)
+                            .await
+                        {
+                            Rotation::Rotated => true,
+                            Rotation::Unchanged => false,
+                            Rotation::Closed => break,
+                        }
+                    }
+                    SubjectTokenSource::GitHubActions { .. } | SubjectTokenSource::Requested(_) => {
+                        tokio::select! {
+                            () = sleep(next_wait) => {}
+                            () = tx.closed() => break,
+                        }
+                        true
+                    }
+                };
                 match self::exchange(&http, &task_source, &task_exchange).await {
-                    Ok(token) => {
+                    Ok((token, digest)) => {
                         backoff.reset();
                         tracing::debug!(
                             "Refreshed the {} access token of {task_component}; it expires in {}s",
                             task_exchange.provider(),
                             token.expires_in.as_secs()
                         );
-                        next_wait = refresh_after(token.expires_in);
+                        life = token.expires_in;
+                        expires_at = expiry_after(token.expires_in);
+                        exchanged = digest;
+                        next_wait = next_refresh(&task_source, token.expires_in);
                         if tx.send(token.token).is_err() {
                             break;
                         }
                     }
                     Err(error) => {
                         next_wait = backoff.next_duration().unwrap_or(MAX_RETRY_WAIT);
+                        let unchanged_file = match task_source.as_ref() {
+                            SubjectTokenSource::File(path) if !rotated => Some(path.as_path()),
+                            _ => None,
+                        };
                         tracing::warn!(
                             "{}",
-                            refresh_failure_message(&task_component, next_wait, &error)
+                            refresh_failure_message(
+                                &task_component,
+                                expires_at,
+                                Utc::now(),
+                                next_wait,
+                                &error,
+                                unchanged_file,
+                            )
                         );
                     }
                 }
@@ -1406,21 +1710,241 @@ mod tests {
         );
     }
 
+    fn at(rfc3339: &str) -> DateTime<Utc> {
+        DateTime::parse_from_rfc3339(rfc3339)
+            .expect("an RFC 3339 time")
+            .with_timezone(&Utc)
+    }
+
     #[test]
-    fn a_refresh_failure_names_the_component_whose_token_it_is() {
+    fn a_refresh_failure_names_the_component_and_until_when_its_token_works() {
         let error = WorkloadIdentityError::EmptySubjectToken {
             origin: "GitHub Actions".to_string(),
         };
+        let expires_at = at("2026-11-07T14:05:00Z");
+        let before = at("2026-11-07T14:00:00Z");
+        let after = at("2026-11-07T14:06:00Z");
+        let two_seconds = Duration::from_secs(2);
         assert_eq!(
             [
-                refresh_failure_message("model 'gpt-a' (openai)", Duration::from_secs(2), &error),
-                refresh_failure_message("embedding 'embed' (openai)", Duration::from_secs(2), &error),
+                refresh_failure_message("model 'gpt-a' (openai)", expires_at, before, two_seconds, &error, None),
+                refresh_failure_message("embedding 'embed' (openai)", expires_at, after, two_seconds, &error, None),
+                refresh_failure_message(
+                    "model 'claude' (anthropic)",
+                    expires_at,
+                    before,
+                    two_seconds,
+                    &error,
+                    Some(Path::new("/var/run/secrets/tokens/anthropic")),
+                ),
             ],
             [
-                "Failed to refresh the access token of model 'gpt-a' (openai), so requests keep the current one until it expires. Retrying in 2s. Cause: The workload identity token from GitHub Actions is empty.".to_string(),
-                "Failed to refresh the access token of embedding 'embed' (openai), so requests keep the current one until it expires. Retrying in 2s. Cause: The workload identity token from GitHub Actions is empty.".to_string(),
+                "Failed to refresh the access token of model 'gpt-a' (openai), so requests keep the current one until it expires at 2026-11-07T14:05:00Z. Retrying in 2s. Cause: The workload identity token from GitHub Actions is empty.".to_string(),
+                "Failed to refresh the access token of embedding 'embed' (openai), and the current one expired at 2026-11-07T14:05:00Z, so requests fail until a refresh succeeds. Retrying in 2s. Cause: The workload identity token from GitHub Actions is empty.".to_string(),
+                "Failed to refresh the access token of model 'claude' (anthropic), so requests keep the current one until it expires at 2026-11-07T14:05:00Z. Retrying in 2s, or as soon as the platform rotates the identity token in '/var/run/secrets/tokens/anthropic', which has not changed since the last exchange. Cause: The workload identity token from GitHub Actions is empty.".to_string(),
             ]
         );
+    }
+
+    /// A JWT whose payload is `claims`, with a header and signature no exchange here checks.
+    fn jwt(claims: &Value) -> String {
+        format!(
+            "{}.{}.c2lnbmF0dXJl",
+            URL_SAFE_NO_PAD.encode(br#"{"alg":"RS256"}"#),
+            URL_SAFE_NO_PAD.encode(claims.to_string())
+        )
+    }
+
+    #[test]
+    fn an_identity_tokens_claims_are_named_for_the_user_to_compare_with_the_rule() {
+        let claims = IdentityTokenClaims::read(&jwt(&json!({
+            "iss": "https://oidc.eks.us-east-1.amazonaws.com/id/EXAMPLE",
+            "sub": "system:serviceaccount:spice:spiced",
+            "aud": "https://api.anthropic.com",
+            "exp": 1_794_060_300,
+            "kubernetes.io": {"namespace": "spice"},
+        })))
+        .expect("the claims of a JWT");
+        assert_eq!(
+            claims.sentence("the file '/var/run/secrets/tokens/anthropic'"),
+            " The identity token from the file '/var/run/secrets/tokens/anthropic' has issuer 'https://oidc.eks.us-east-1.amazonaws.com/id/EXAMPLE', subject 'system:serviceaccount:spice:spiced', audience 'https://api.anthropic.com' and expiry 2026-11-07T14:05:00Z."
+        );
+
+        let audiences = IdentityTokenClaims::read(&jwt(&json!({"aud": ["a", "b"]})))
+            .expect("the claims of a JWT");
+        assert_eq!(
+            audiences.sentence("GitHub Actions"),
+            " The identity token from GitHub Actions has audiences 'a', 'b'."
+        );
+        let none = IdentityTokenClaims::read(&jwt(&json!({"name": "x"}))).expect("a JWT");
+        assert_eq!(none.sentence("GitHub Actions"), "");
+
+        for not_a_jwt in [
+            "jwt-1",
+            "a.b",
+            "a.b.c.d",
+            "a.!!!.c",
+            &jwt(&json!(["array"])),
+        ] {
+            assert_eq!(IdentityTokenClaims::read(not_a_jwt), None, "{not_a_jwt}");
+        }
+    }
+
+    #[tokio::test]
+    async fn a_refused_exchange_names_the_identity_tokens_claims() {
+        let (base, _mock) = start(3600).await;
+        let dir = tempfile::tempdir().expect("a temporary directory");
+        let path = dir.path().join("token");
+        let token = jwt(&json!({
+            "iss": "https://token.actions.githubusercontent.com",
+            "sub": "repo:org/repo:environment:prod",
+            "aud": "https://api.anthropic.com",
+            "exp": 1_794_060_300,
+        }));
+        tokio::fs::write(&path, &token)
+            .await
+            .expect("write the token file");
+        let error = WorkloadIdentityTokenProvider::try_new(
+            "model 'claude' (anthropic)",
+            SubjectTokenSource::File(path.clone()),
+            anthropic_at(format!("{base}/refuse/anthropic"), None),
+        )
+        .await
+        .expect_err("Anthropic refuses the exchange");
+        assert_eq!(
+            error.to_string(),
+            format!(
+                "Anthropic refused to exchange the workload identity token for an access token (HTTP 401 Unauthorized): Authentication failed. The identity token from the file '{}' has issuer 'https://token.actions.githubusercontent.com', subject 'repo:org/repo:environment:prod', audience 'https://api.anthropic.com' and expiry 2026-11-07T14:05:00Z. Anthropic records why it refused an exchange only in its authentication history: https://platform.claude.com/settings/workload-identity-federation?tab=history",
+                path.display()
+            )
+        );
+        assert!(
+            !error.to_string().contains(&token),
+            "a refusal must never quote the token itself"
+        );
+    }
+
+    /// A requested identity token source that issues `requested-n` and counts its requests.
+    struct Counting(AtomicUsize);
+
+    #[async_trait]
+    impl IdentityTokenSource for Counting {
+        async fn fetch(&self) -> std::result::Result<SecretString, String> {
+            let n = self.0.fetch_add(1, Ordering::SeqCst) + 1;
+            Ok(SecretString::from(format!("requested-{n}")))
+        }
+
+        fn describe(&self) -> String {
+            "the test identity service".to_string()
+        }
+
+        fn hash_key(&self) -> String {
+            "counting".to_string()
+        }
+    }
+
+    /// A requested identity token source that cannot issue one.
+    struct Unavailable;
+
+    #[async_trait]
+    impl IdentityTokenSource for Unavailable {
+        async fn fetch(&self) -> std::result::Result<SecretString, String> {
+            Err("no metadata server answered within 1s".to_string())
+        }
+
+        fn describe(&self) -> String {
+            "the Google Cloud service account (metadata server)".to_string()
+        }
+
+        fn hash_key(&self) -> String {
+            "unavailable".to_string()
+        }
+    }
+
+    #[tokio::test]
+    async fn a_requested_identity_token_is_new_for_every_exchange() {
+        let (base, mock) = start(4).await;
+        let source = Arc::new(Counting(AtomicUsize::new(0)));
+        let provider = WorkloadIdentityTokenProvider::try_new(
+            "model 'test' (openai)",
+            SubjectTokenSource::Requested(Arc::clone(&source) as Arc<dyn IdentityTokenSource>),
+            openai_at(format!("{base}/token")),
+        )
+        .await
+        .expect("the first exchange");
+        // Refreshed halfway through the token's four-second life.
+        wait_for_token(&provider, "tok-2").await;
+        let subject_tokens: Vec<Value> = mock
+            .exchanges
+            .lock()
+            .expect("lock")
+            .iter()
+            .map(|body| body["subject_token"].clone())
+            .collect();
+        assert_eq!(
+            subject_tokens[..2],
+            [json!("requested-1"), json!("requested-2")]
+        );
+    }
+
+    #[tokio::test]
+    async fn a_requested_identity_token_that_is_unavailable_names_its_source() {
+        let (base, _mock) = start(3600).await;
+        let error = WorkloadIdentityTokenProvider::try_new(
+            "model 'test' (anthropic)",
+            SubjectTokenSource::Requested(Arc::new(Unavailable)),
+            anthropic_at(format!("{base}/token"), None),
+        )
+        .await
+        .expect_err("no identity token");
+        assert_eq!(
+            error.to_string(),
+            "Failed to get a workload identity token from the Google Cloud service account (metadata server): no metadata server answered within 1s"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_token_file_is_exchanged_again_when_it_changes_and_not_before() {
+        let dir = tempfile::tempdir().expect("a temporary directory");
+        let path = dir.path().join("token");
+        tokio::fs::write(&path, "jwt-1\n")
+            .await
+            .expect("write the token file");
+        let exchanged = token_digest("jwt-1");
+        let (tx, _rx) = watch::channel(());
+
+        assert_eq!(
+            wait_for_rotation(
+                &path,
+                &exchanged,
+                Duration::from_millis(300),
+                MIN_FILE_POLL,
+                &tx
+            )
+            .await,
+            Rotation::Unchanged
+        );
+        let writer = {
+            let path = path.clone();
+            tokio::spawn(async move {
+                sleep(Duration::from_millis(200)).await;
+                tokio::fs::write(&path, "jwt-2")
+                    .await
+                    .expect("rotate the token file");
+            })
+        };
+        assert_eq!(
+            wait_for_rotation(
+                &path,
+                &exchanged,
+                Duration::from_secs(10),
+                MIN_FILE_POLL,
+                &tx
+            )
+            .await,
+            Rotation::Rotated
+        );
+        writer.await.expect("the writer");
     }
 
     #[test]
@@ -1445,9 +1969,11 @@ mod tests {
     }
 
     #[test]
-    fn a_token_is_refreshed_a_minute_early_or_after_three_quarters_of_its_life_and_never_at_once() {
+    fn a_token_file_is_exchanged_at_the_latest_a_minute_early_and_a_requested_token_halfway() {
+        let file = SubjectTokenSource::File(PathBuf::from("/token"));
+        let requested = SubjectTokenSource::Requested(Arc::new(Unavailable));
         assert_eq!(
-            [3600, 600, 299, 4, 0].map(|secs| refresh_after(Duration::from_secs(secs))),
+            [3600, 600, 299, 4, 0].map(|secs| next_refresh(&file, Duration::from_secs(secs))),
             [
                 Duration::from_mins(59),
                 Duration::from_mins(9),
@@ -1455,6 +1981,20 @@ mod tests {
                 Duration::from_secs(3),
                 MIN_REFRESH_WAIT,
             ]
+        );
+        assert_eq!(
+            [3600, 600, 299, 4, 0].map(|secs| next_refresh(&requested, Duration::from_secs(secs))),
+            [
+                Duration::from_mins(30),
+                Duration::from_mins(5),
+                Duration::from_millis(149_500),
+                Duration::from_secs(2),
+                MIN_REFRESH_WAIT,
+            ]
+        );
+        assert_eq!(
+            [3600, 40, 0].map(|secs| file_poll(Duration::from_secs(secs))),
+            [MAX_FILE_POLL, Duration::from_secs(5), MIN_FILE_POLL]
         );
     }
 }
