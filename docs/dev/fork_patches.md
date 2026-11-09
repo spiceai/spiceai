@@ -125,7 +125,7 @@ own section below — a count here would be one more thing to keep true by hand.
 | [graph-rs-sdk](#graph-rs-sdk) | `25bc483efc3200df7a4f5426c176cddb18a84ad9` | `spiceai` |
 | [iceberg-rust](#iceberg-rust) | `1f0744b900e69e1b3fafa721aa4283bd4b048a61` | `spiceai-0.11.0-df-55` |
 | [llama.cpp](#llamacpp) | `b20c7a2bee3203728ec0fbb7b3e616a60fe86d8c` | `spiceai-b11999` |
-| [mistral.rs](#mistralrs-and-text-embeddings-inference) | `d7ddf3bb84ad753e6da385c02e9f8e16bc9a39ec` | `spiceai` |
+| [mistral.rs](#mistralrs-and-text-embeddings-inference) | `a1e88fc573ec2278c91ba737fbe6d2b09b942b07` | `spiceai` |
 | [model2vec-rs](#model2vec-rs) | `55fef28a3556895b20204634b788f7c836b610bc` | `spiceai` |
 | [orc-rust](#orc-rust) | `d9632e7ae973456c81c660c04e5f55cc86489bcb` | `spiceai-0.9` |
 | [reqwest-eventsource](#dependency-only-forks) | `eb11e695128ce264bf05e4220ce2311c25992c73` | `spiceai` |
@@ -757,7 +757,8 @@ as `aa8e8d43`, the tool-call parser, spiceai/mistral.rs#53, squash-merged as `fc
 ring collectives over RDMA, spiceai/mistral.rs#54, squash-merged as `2f58f444`, the
 DeepSeek-V4 DSML tool-call parser, spiceai/mistral.rs#55, squash-merged as
 `e40436e4`, the candle pin at `zip` 9.1, and spiceai/mistral.rs#58, squash-merged as
-`d7ddf3bb`, Mistral's `[THINK]` reasoning, so `git diff v0.9.4 d7ddf3bb`
+`d7ddf3bb`, Mistral's `[THINK]` reasoning, and spiceai/mistral.rs#59, `a1e88fc5`, Gemma and
+Gemma 2 tying `lm_head` to the embeddings, so `git diff v0.9.4 a1e88fc5`
 is the whole fork delta. #47 built it in 32 commits. The first replays the Spice patches from the
 `v0.9.0` line: `glm-dsa`
 GGUF loading, the i-quant MoE fallback, ring tensor parallelism past two ranks,
@@ -796,6 +797,7 @@ rather than by taking them. A re-cut cannot lose what the fork does not carry.
 | `mistral.rs`: Mistral's `[THINK]…[/THINK]` reasoning tokens are a reasoning format: `TagReasoningContext::new_mistral_think` and `new_in_mistral_think_block`, `is_mistral_think_template`, and the mistral.rs engine's parser choice (spiceai/mistral.rs#58) | Magistral's and Mistral Large 4's reasoning comes back as content, `[THINK]` tags included, with `reasoning_content` empty; losing the constructors fails the build | silent (wrong text) | `mistral_reasoning_is_split_at_its_think_tokens` (`crates/llms-llamacpp/src/lib.rs`) for the llama.cpp engine; the mistral.rs engine's branch is guarded in the fork by `mistral_think_block_splits_reasoning_from_content` and `mistral_think_block_opened_by_the_prompt` |
 | `mistral.rs`: GGUF `eot_token_id` and `eom_token_id` stop generation, as `eos_token_id` does | GLM-5.3-Flash's reply runs past `<|user|>` into an invented next turn until `max_tokens` | silent (wrong text) | **GAP** |
 | `mistral.rs`: a `distributed` build serves a single-node model, and a ring head keeps a second request queued while one runs | A model without `distributed_backend` never finishes loading in a `distributed` build, and a second request to a ring deadlocks every rank at the next all-reduce | load failure / hang | **GAP** |
+| `mistral.rs`: Gemma and Gemma 2 configs without `tie_word_embeddings` tie `lm_head` to the token embeddings, as Hugging Face's `GemmaConfig` and `Gemma2Config` default it (spiceai/mistral.rs#59) | `google/gemma-2-2b-it` and `google/gemma-2b-it`, whose `config.json` omits the key and which ship no `lm_head.weight`, fail to load with ``Missing required tensor(s) for replicated_linear at prefix `lm_head` `` | load failure | guarded in the fork, not here: `a_config_without_tie_word_embeddings_ties_lm_head_to_the_embeddings` in `models/gemma.rs` and `models/gemma2.rs`; here, `models::hf::huggingface_test_gemma_chat_completion` in the nightly `integration tests (models)` |
 | `text-embeddings-inference`: Spice integration + candle re-pointing | Local embedding models fail to load | build | compile-guarded |
 | `text-embeddings-inference`: pooling/model-loading fixes | Embeddings differ from the reference implementation | silent (wrong vectors) | **GAP** |
 
