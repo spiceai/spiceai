@@ -124,7 +124,7 @@ own section below — a count here would be one more thing to keep true by hand.
 | [duckdb-rs](#duckdb-rs) | `40a0ad2a7de6a8ba06d242ce7e04ffcd7a664df9` | `spiceai-1.4.4` (datafusion-table-providers pins this exact revision; the two move together) |
 | [graph-rs-sdk](#graph-rs-sdk) | `25bc483efc3200df7a4f5426c176cddb18a84ad9` | `spiceai` |
 | [iceberg-rust](#iceberg-rust) | `1f0744b900e69e1b3fafa721aa4283bd4b048a61` | `spiceai-0.11.0-df-55` |
-| [llama.cpp](#llamacpp) | `b20c7a2bee3203728ec0fbb7b3e616a60fe86d8c` | `spiceai-b11999` |
+| [llama.cpp](#llamacpp) | `250bdf93dd85f11ddf82cce60bc41ad5329b0aec` | `spiceai-b11999` |
 | [mistral.rs](#mistralrs-and-text-embeddings-inference) | `d7ddf3bb84ad753e6da385c02e9f8e16bc9a39ec` | `spiceai` |
 | [model2vec-rs](#model2vec-rs) | `55fef28a3556895b20204634b788f7c836b610bc` | `spiceai` |
 | [orc-rust](#orc-rust) | `d9632e7ae973456c81c660c04e5f55cc86489bcb` | `spiceai-0.9` |
@@ -805,8 +805,8 @@ Upstream [ggml-org/llama.cpp](https://github.com/ggml-org/llama.cpp). The fork c
 upstream releases with the Spice patches below: each `spiceai-<release>` branch is the previous
 Spice branch with the upstream release tag merged in, and the pin is its tagged tip,
 `<release>-spiceai.<n>`, or a commit on it that no tag names yet: today the squash of
-spiceai/llama.cpp#33, twelve commits past `b11999-spiceai.1` (#21, #20, #23, #25, then #22, which
-carried #18 and #19 over from `spiceai-b11803`, then #24, #26, #27, #29, #30, #31, #33), which is upstream
+spiceai/llama.cpp#35, fourteen commits past `b11999-spiceai.1` (#21, #20, #23, #25, then #22, which
+carried #18 and #19 over from `spiceai-b11803`, then #24, #26, #27, #29, #30, #31, #33, #34, #35), which is upstream
 `b11984` and then `b11999` merged into `spiceai-b11803`, with `spiceai-b11803` merged in again at
 spiceai/llama.cpp#16. Since `b11984` the DeepSeek-V4.1 model (`deepseek41`) is upstream's, and the fork keeps only
 its fixes on top; of those, the ones without a row below (a LoRA adapter on `output.weight`,
@@ -833,6 +833,8 @@ release, follow `spiceai/README.md` in the fork.
 | `llama_get_unsampled_logits_ith` returns the ith output's full logits row after one synchronize, or NULL when a backend sampler sampled the row, and the DSpark drafter's pick reads its row through it (spiceai/llama.cpp#25) | `crates/llama-cpp` fails to build, since `Context::logits` calls it. Reading the row through the public getters instead synchronizes every RPC dispatcher four times per pick on a tensor-split model, which cost about 2.4% of DeepSeek-V4.1's decode rate across three DGX Sparks (23 synchronize calls per step instead of 8) | build | compile-guarded by `crates/llama-cpp` (`Context::logits`) |
 | An RPC connection whose two ends are this host, at an address no port carries (a `/32` on the loopback interface, `127.0.0.1`), takes the NIC's RoCE loopback instead of staying on TCP, both ends choosing the same port (spiceai/llama.cpp#18, carried into `spiceai-b11999` by #22) | A head GPU served at such an address is reached over TCP again, a little slower: 34.14 against 34.67 tok/s in that PR's three-node measurement. Spice serves the head's GPU at the head's own address from `nodes`, which a port carries, so it does not reach this by default | silent (perf) | **GAP** — RDMA hardware only; a perf-only row; see [Open gaps](#open-gaps) |
 | On a mesh of more than two ranks whose links are all RDMA, an all-reduce partial over 1 MiB goes as pieces of at most 1 MiB, each sent to every peer before any is received, so that every link carries one at once; the ranks agree on it when the mesh forms, and `GGML_RPC_COMM_CHUNKED=0` turns it off (spiceai/llama.cpp#24) | Such partials, which a prompt's chunks make and a decode step's never do, go pair by pair again, one link at a time: a cold 3,754-token Qwen3.8 prompt split across three DGX Sparks took 6.07 and 5.98 s instead of 5.15 and 5.21 s | silent (perf) | **GAP** — a perf-only row; see [Open gaps](#open-gaps) |
+| An RDMA connection keeps several sends in flight: four 256 KiB send buffers and up to eight posted sends, each buffer reused once its send completes, and a send longer than one chunk posts chunk by chunk instead of waiting for each (spiceai/llama.cpp#34) | Every RDMA chunk waits for the one before it again: on three DGX Sparks a 5 MiB mesh all-reduce took 2,738 and 2,762 µs instead of 1,717 and 1,721, and in that PR's `llama-server` run a cold Qwen3.8 prompt read at 1.36–1.38 ms per prompt token instead of 1.22–1.24. Decode-sized all-reduces do not change | silent (perf) | **GAP** — RDMA hardware only; a perf-only row; see [Open gaps](#open-gaps) |
+| On a mesh of more than two ranks whose links are all RDMA, an all-reduce partial over 1 MiB is reduced by a reduce-scatter and then an all-gather: each rank sums one share of every partial, in rank order, and sends that sum to every peer, so every rank ends with the bits it had when it summed whole partials. The ranks agree on it when the mesh forms, a mesh of mixed builds refuses to form, and `GGML_RPC_COMM_SCATTER=0` on any rank keeps partials whole (spiceai/llama.cpp#35) | Every rank receives and sums every peer's whole partial again: on three DGX Sparks a 5 MiB mesh all-reduce took 1,717 and 1,721 µs instead of 1,099 and 1,073, and without this and #34 a cold Qwen3.8 prompt read through `spiced` took 1.316–1.344 ms per prompt token instead of 1.030–1.031. Decode-sized partials (1 MiB or less) do not take this path | silent (perf) | **GAP** — RDMA hardware only; a perf-only row; the fork's `test-rpc-comm-mesh` checks that every rank's sum equals the rank-order sum of the whole partials, bit for bit; see [Open gaps](#open-gaps) |
 | The CUDA all-reduces (the internal one, NCCL's, and the BF16 NCCL wire) keep a meta-backend gather in F32 instead of rounding it through BF16, as the RPC path already does (spiceai/llama.cpp#26) | A model tensor-split across GPUs in one machine gets its gathered logits and token ids rounded to BF16, so greedy picks come back with wrong token ids. Spice splits a model across nodes over RPC, which keeps gathers in F32, and builds llama.cpp without NCCL; the fork PR found no path of Spice's that reaches it | silent (wrong data, CUDA multi-GPU only) | **GAP** — needs two CUDA devices in one machine; the fork's `test-meta-gather-exact` covers it; see [Open gaps](#open-gaps) |
 | The DSpark drafter's output head and Markov transition split by vocabulary rows under a tensor split: each device multiplies its share of the rows, and each draft pick merges one (value, index) pair per device (`ARGMAX_PART`, a gather, `ARGMAX_MERGE`) (spiceai/llama.cpp#27) | Every device computes all 129280 rows of both again: DeepSeek-V4.1 with its DSpark drafter split across three DGX Sparks decoded at 44.96–45.27 tok/s without it against 46.97–47.38 with it, with the same drafts and replies | silent (perf) | **GAP** — a perf-only row; the fork's `test-argmax-split` and `test-argmax-malformed` check the split picks against the whole head's; see [Open gaps](#open-gaps) |
 | A quantized rows view on a meta backend, flattened to one dimension, offsets each device's part by whole blocks rather than elements (spiceai/llama.cpp#29) | Every device after the first reads past the matrix. The DSpark drafter multiplies its rows view without flattening it, so nothing Spice serves builds such a view today | crash (out-of-bounds read) | **GAP** — the fork's `test-argmax-split` (`test_meta_flat_quantized_rows`) covers it; see [Open gaps](#open-gaps) |
@@ -910,7 +912,7 @@ patch is a build failure, so no behaviour guard applies.
 
 ## Open gaps
 
-**60 rows above are marked GAP** — they have no repo-side guard. Every one of them
+**62 rows above are marked GAP** — they have no repo-side guard. Every one of them
 is accounted for below; `scripts/check_fork_patches.py` fails if that count and this
 sentence disagree, so the list cannot quietly fall behind the tables.
 
@@ -1057,9 +1059,10 @@ without becoming a flaky timing test:
     its RPC graph serialization without per-tensor allocation (spiceai/llama.cpp#14), its
     asynchronous state reads (spiceai/llama.cpp#16), its DSpark draft tokens read as the
     row's largest logit (spiceai/llama.cpp#23), its RoCE loopback for a connection to its own
-    host (spiceai/llama.cpp#18), its mesh partials exchanged in pieces (spiceai/llama.cpp#24)
-    and its DSpark drafter head split by vocabulary rows (spiceai/llama.cpp#27), measured on
-    the same cluster;
+    host (spiceai/llama.cpp#18), its mesh partials exchanged in pieces (spiceai/llama.cpp#24),
+    its DSpark drafter head split by vocabulary rows (spiceai/llama.cpp#27), its RDMA sends kept
+    in flight (spiceai/llama.cpp#34) and its large mesh partials reduced by a reduce-scatter and
+    an all-gather (spiceai/llama.cpp#35), measured on the same cluster;
     `snowflake-rs` streaming batches (memory, not latency — but see the
     `snowflake-rs` note above: it is blocked with the rest of that fork);
     `async-openai` retry-after handling; `datafusion`'s `IoWaitHook` carry through
