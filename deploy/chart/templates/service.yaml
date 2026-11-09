@@ -28,6 +28,10 @@ spec:
       name: metrics
     - port: 50051
       name: flight
+    {{- if include "spiceai.clusterNode" . }}
+    - port: {{ .Values.cluster.port }}
+      name: cluster
+    {{- end }}
     {{- end }}
   selector:
     {{- if .Values.service.selector }}
