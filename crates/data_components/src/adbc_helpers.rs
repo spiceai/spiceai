@@ -123,14 +123,16 @@ pub enum ManagedDuckDbError {
         source: AdbcInitError,
     },
     #[snafu(display(
-        "Failed to load the installed DuckDB library: version {found} is older than the minimum supported version 1.5.0. Install DuckDB 1.5.0 or later. For details, visit: https://spiceai.org/docs/components/data-connectors/{connector}"
+        "Failed to load the installed DuckDB library: version {found} is older than the minimum supported version {min}. Install DuckDB {min} or later. For details, visit: https://spiceai.org/docs/components/data-connectors/{connector}",
+        min = MINIMUM_DUCKDB_VERSION
     ))]
     UnsupportedVersion {
         found: String,
         connector: &'static str,
     },
     #[snafu(display(
-        "Failed to determine the installed DuckDB version '{found}'. Install DuckDB 1.5.0 or later. For details, visit: https://spiceai.org/docs/components/data-connectors/{connector}"
+        "Failed to determine the installed DuckDB version '{found}'. Install DuckDB {min} or later. For details, visit: https://spiceai.org/docs/components/data-connectors/{connector}",
+        min = MINIMUM_DUCKDB_VERSION
     ))]
     InvalidVersion {
         found: String,
@@ -142,7 +144,12 @@ pub enum ManagedDuckDbError {
     },
 }
 
-/// Compares a `DuckDB` version with the minimum supported version, 1.5.0.
+/// The oldest `DuckDB` release `duckdb:` and `ducklake:` accept: the newest
+/// patch of the oldest supported line in `test/duckdb_versions.json`.
+pub const MINIMUM_DUCKDB_VERSION: &str = "1.5.6";
+const MINIMUM_DUCKDB_RELEASE: (u64, u64, u64) = (1, 5, 6);
+
+/// Compares a `DuckDB` version with [`MINIMUM_DUCKDB_VERSION`].
 /// Returns `None` when the version cannot be parsed.
 #[must_use]
 pub fn duckdb_version_is_supported(version: &str) -> Option<bool> {
@@ -154,7 +161,7 @@ pub fn duckdb_version_is_supported(version: &str) -> Option<bool> {
     if parts.next().is_some() {
         return None;
     }
-    Some((major, minor, patch) >= (1, 5, 0))
+    Some((major, minor, patch) >= MINIMUM_DUCKDB_RELEASE)
 }
 
 /// Checks the installed version once. Call on a blocking thread after opening
@@ -717,9 +724,12 @@ mod tests {
     fn managed_duckdb_version_floor() {
         for (version, expected) in [
             ("v1.4.4", Some(false)),
-            ("v1.5.0", Some(true)),
+            ("v1.5.0", Some(false)),
+            ("v1.5.5", Some(false)),
+            ("v1.5.6", Some(true)),
+            ("v1.6.0", Some(true)),
             ("v2.0.0", Some(true)),
-            ("v1.5.6-dev123", Some(true)),
+            ("v2.0.1-dev123", Some(true)),
             ("unknown", None),
         ] {
             assert_eq!(
@@ -735,12 +745,12 @@ mod tests {
         for connector in ["duckdb", "ducklake"] {
             assert_eq!(
                 super::ManagedDuckDbError::UnsupportedVersion {
-                    found: "v1.4.4".into(),
+                    found: "v1.5.5".into(),
                     connector
                 }
                 .to_string(),
                 format!(
-                    "Failed to load the installed DuckDB library: version v1.4.4 is older than the minimum supported version 1.5.0. Install DuckDB 1.5.0 or later. For details, visit: https://spiceai.org/docs/components/data-connectors/{connector}"
+                    "Failed to load the installed DuckDB library: version v1.5.5 is older than the minimum supported version 1.5.6. Install DuckDB 1.5.6 or later. For details, visit: https://spiceai.org/docs/components/data-connectors/{connector}"
                 )
             );
         }
