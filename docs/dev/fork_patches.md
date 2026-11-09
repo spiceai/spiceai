@@ -121,7 +121,6 @@ own section below — a count here would be one more thing to keep true by hand.
 | [datafusion-table-providers](#datafusion-federation-and-datafusion-table-providers) | `d323656c3bebc04fdce2ebc1cec31081f53b100d` | `spiceai-55` |
 | [delta-kernel-rs](#delta-kernel-rs) | `16ac28606464d742b6837de4a51f41011c3f6dc0` | `spiceai-0.27` |
 | [docx-rs](#docx-rs) | `81faaf2187185b097710b9ee589bf039efdd74de` | `jeadie/render-zip-upgrade` |
-| [duckdb-rs](#duckdb-rs) | `40a0ad2a7de6a8ba06d242ce7e04ffcd7a664df9` | `spiceai-1.4.4` (datafusion-table-providers pins this exact revision; the two move together) |
 | [graph-rs-sdk](#graph-rs-sdk) | `25bc483efc3200df7a4f5426c176cddb18a84ad9` | `spiceai` |
 | [iceberg-rust](#iceberg-rust) | `1f0744b900e69e1b3fafa721aa4283bd4b048a61` | `spiceai-0.11.0-df-55` |
 | [llama.cpp](#llamacpp) | `b20c7a2bee3203728ec0fbb7b3e616a60fe86d8c` | `spiceai-b11999` |
@@ -503,8 +502,8 @@ it adds only the two MySQL connection-pool rows below and their tests
 (`core/src/sql/db_connection_pool/mysqlpool.rs`, `core/tests/mysql/`), and leaves its own
 dependency pins unchanged.
 Between `0894768` and `d323656` (spiceai/datafusion-table-providers#103 and #113,
-squash-merged), it quotes primary-key column names in `DuckDB` `CREATE TABLE` (the `DuckDB`
-primary-key row below, `core/src/duckdb/creator.rs`), moves `mysql_async` to 0.37.1, the
+squash-merged), it quotes primary-key column names in `DuckDB` `CREATE TABLE`
+(`core/src/duckdb/creator.rs`, which no Spice build compiles), moves `mysql_async` to 0.37.1, the
 version this workspace pins, rewrites the new-connection observer row below and adds the
 test-connection row after it, with their tests (`mysqlpool.rs`, `core/tests/mysql/`,
 `core/tests/docker/`).
@@ -513,31 +512,17 @@ The federation pin adds [#95](https://github.com/spiceai/datafusion-federation/p
 
 The provider pin descends from `f103fe8`. Since `4a29207` ([#15580](https://github.com/spiceai/spiceai/pull/15580), which moved it for the `duckdb-rs` Brotli fix) it also carries table-providers #89, #90 and #93, described below. On top of those it adds [#101](https://github.com/spiceai/datafusion-table-providers/pull/101) for full source schemas in scan capability callbacks, [#102](https://github.com/spiceai/datafusion-table-providers/pull/102) for positional result nullability, and capability boundaries for nested DuckDB unions, unsupported MySQL FULL JOIN, computed MySQL HAVING predicates, and explicit NULL ordering that MySQL cannot preserve. Guards include `crates/data_components/src/function_support.rs::scan_filter_capability_uses_full_source_schema`, `test/spicescript/federated-result-columns.yaml`, and `test/spicescript/mysql-null-ordering.yaml`.
 
-Two of them have a known problem at this pin:
+One of them has a known problem at this pin:
 
-- spiceai/datafusion-table-providers#89 cuts a `DuckDB` upsert into several
-  `INSERT … ON CONFLICT DO UPDATE` statements in one transaction, so a later statement
-  updates rows an earlier one inserted. `DuckDB` 1.4.4 then fails with `INTERNAL Error:
-  Unaligned fetch in validity and main column data for update` and invalidates the
-  database until a restart (duckdb/duckdb#19688). The 2026-10-29 nightly build of this
-  workspace failed this way on the 149th of 1,000 full refreshes of a dataset whose
-  refresh repeats a key across record batches, and every refresh and query after it
-  failed. `DuckDB` v1.4.5 removes that assertion (duckdb/duckdb#20804); the `spiceai-1.4.4`
-  `DuckDB` line this workspace builds does not have it
-  ([#14643](https://github.com/spiceai/spiceai/issues/14643)).
 - spiceai/datafusion-table-providers#90 lets a `SQLite` acceleration store a list of
   structs, which only spiceai/datafusion-federation#92 (still open) can read back. On the
-  same nightly such a dataset loads, and a query that selects the column fails with
+  2026-10-29 nightly build of this workspace such a dataset loads, and a query that selects the column fails with
   `Unsupported list item type: Struct(…)`; before #90 the dataset failed to load.
 
 | Patch | What breaks if it is lost | Loss | Guard |
 |---|---|---|---|
 | Federation pushes filters into scans it does not own, so a scan must decline what it cannot evaluate (repo-side guard against `datafusion-federation` `contains_federated_table`, which arms the analyzer's whole-plan filter pushdown as soon as *any* table in the statement is federated) | The analyzer runs before decorrelation, so a subquery accepted by a non-federated scan is written into its filters and then fails physical planning with "Physical plan does not support logical expression". Verified: with one federated table present, `EXISTS`/`IN`/`ANY` are offered to an unrelated non-federated scan | silent (query failure) | `crates/runtime/tests/acceleration/on_zero_results_subqueries.rs`: `duckdb_on_zero_results_subqueries` and `sqlite_on_zero_results_subqueries` execute correlated scalar, `IN`, and `EXISTS` queries with populated and empty acceleration, explicit `return_empty` controls, and mixed federation. `cayenne_on_zero_results_subqueries` is the local-accelerator control. The guard reads storage directly before querying through the runtime. Requires runtime features `duckdb,sqlite`. This is a repo-side guard rather than a patch carried on the fork: it is listed here so a pin move re-checks whether the fork still needs it |
-| DuckDB timestamp literal rendered through microseconds, not a `DOUBLE`, with DuckDB's two infinity sentinels declined (fork PR #57) | `TO_TIMESTAMP` takes a `DOUBLE`, so a timestamp count past 2^53 µs (≈ year 2255, and symmetrically before ≈ 1684) could not be represented exactly: a pushed-down filter names a neighbouring microsecond and keeps or drops the wrong row. Separately, a `TimestampMicrosecond` holding ±`i64::MAX` rendered fine, was reported pushdown-capable, and then failed the statement built from it | silent (wrong rows) | `crates/search/src/index/duckdb/sql.rs::a_timezone_aware_timestamp_filter_is_rendered_without_the_millisecond_truncation` and `::a_microsecond_count_past_the_double_bound_is_rendered_exactly`, `query_exec.rs::scan_renders_filters_against_the_whole_table_schema`, and `sql.rs::a_timestamp_duckdb_cannot_hold_is_declined_by_both_the_probe_and_the_statement`. The first and third pin the rendered microsecond count, so a revert to the `DOUBLE` form fails them; the second names a count above 2^53, which is the precision the patch exists for; the fourth names the two sentinel counts, so a revert that renders them instead of declining them fails there rather than inside a generated statement |
 | Cancel an abandoned ADBC query and release its pooled connection (fork PR #65) | Dropping the record-batch stream only detaches the `spawn_blocking` task; it stays inside `Statement::execute` until the remote query finishes on its own, and owns the pooled connection for that whole time. Repeated cancellations then exhaust the pool ([#13781](https://github.com/spiceai/spiceai/issues/13781)) | silent | `crates/data-connectors/connector-adbc/tests/adbc_cancellation.rs::dropping_the_stream_cancels_the_query_and_frees_the_pool_connection`, which fails if either this patch or the `arrow-adbc` one is missing |
-| Date literal rendered in the unit and width the type calls for (fork PR #60) | `Date32` literals overflow `i32` past 2038 and `Date64` literals render as if milliseconds were days, so a federated filter or join on a date column matches the wrong rows ([#13476](https://github.com/spiceai/spiceai/issues/13476)) | silent | `crates/search/src/index/duckdb/sql.rs::a_date32_literal_outside_the_i32_second_range_names_the_day_it_holds` and `::a_date64_literal_is_read_as_milliseconds_not_as_days`, with `::a_date32_literal_inside_the_i32_second_range_renders_unchanged` as the control against a renderer that declines or shifts every date. The scaling the patch fixes is shared by every engine arm — only the call it is formatted into differs — so a revert fails those three whichever engine renders; `::the_sqlite_arm_renders_a_date_from_the_same_count` pins the sibling arm directly, because this repository renders through that function for DuckDB alone |
-| `DuckDBTable` carries its index list onto the `DuckSqlExec` it builds (fork PR #69) | `DuckDBIntermediateIndexMaterialization` reads that list off the exec node and returns the plan untouched when it is empty, so a DuckDB accelerator declaring `indexes` stops materializing the indexed filters into a CTE and every such query goes back to scanning the whole table. The field has twice survived a refactor that defaulted it to empty, which is why it has a row | silent (perf) | `crates/datafusion-optimizer-rules/src/physical_plan/duckdb/intermediate_index_cte.rs::tests::a_tables_indexes_reach_the_rule_through_the_exec_node`, which plans a filtered scan off a `DuckDBTable` built with an index and asserts the rule rewrites it. Needs `--features duckdb`. The neighbouring `test_rewrite_statement` passes either way — it hands `rewrite_statement` its indexes directly and never crosses the table/exec boundary the patch restores |
-| `DuckDB` `CREATE TABLE` quotes primary-key column names (table-providers PR #103) | A `primary_key` on a column whose name is not a bare identifier, such as `service.instance.id`, `sentry-environment` or `2xx_count`, is written unquoted in the key clause, so `CREATE TABLE` fails with `syntax error at or near "."` and the accelerated dataset does not load | load failure | `crates/accelerators/accelerator-duckdb/src/lib.rs` `primary_key_on_column_names_that_are_not_bare_identifiers` |
 | `FunctionSupport` per-call check (fork PR #61) | A function a backend carves out of the deny-list because its dialect rewrites it federates in *every* call shape, including the ones the dialect cannot render. The unparser then emits the function verbatim into the remote SQL — the unknown-function failure of [#10703](https://github.com/spiceai/spiceai/issues/10703) | build, then silent | `crates/data-connectors/connector-adbc/src/lib.rs::function_support_tests::bigquery_refuses_the_json_call_shapes_its_dialect_cannot_translate` and `::an_untranslatable_predicate_is_left_above_the_federated_scan`. Losing the API fails `cargo check`; a re-cut that keeps `with_scalar_call_support` and drops its use in `contains_unsupported_functions` fails these instead |
 | `FunctionSupport::with_aggregate_call_support` and `with_window_call_support`, and the aggregate/window arms of the walk that consult them (table-providers PR #70; re-confirmed at the pinned revision) | The name-based `FunctionRestriction` cannot refuse a *shape*, and the aggregate and window slots were unused entirely — so every aggregate and window call federated unconditionally. The BigQuery dialect declines the filtered-aggregate shapes it cannot rewrite exactly, and a declined rendering is a **failed query** unless federation refuses the same shape, because a federated statement has no local-execution fallback. Losing this patch therefore does not lose a pushdown, it breaks the query: `array_agg(v) FILTER (…)` reaches BigQuery as `FILTER` it cannot parse, and `COUNT(x) FILTER (…) OVER (…)` does the same through the window arm (measured: `Syntax error: Expected ")" but got "("`) | silent (query failure) | `crates/data-connectors/connector-adbc/src/lib.rs::bigquery_refuses_only_the_filtered_aggregate_shapes_it_cannot_rewrite`, which tests the allowlist *boundary* rather than a fixed set because the two sides live in different repositories, and `::bigquery_refuses_a_filtered_window_call` |
 | `FunctionSupport` expression policy gates logical federation, scan filter admission, and convertible physical-filter pushdown ([table-providers PR #75](https://github.com/spiceai/datafusion-table-providers/pull/75)) | BigQuery has no `ILIKE` operator. Losing any gate either emits invalid GoogleSQL or lets a remote `LIMIT` run before the residual local predicate, which can return the wrong row or no row | silent (query failure / wrong rows) | `crates/runtime-datafusion/src/function_support.rs::tests::bigquery_refuses_only_case_insensitive_like_expressions`; `crates/data-connectors/connector-adbc/src/lib.rs::function_support_tests::{bigquery_refuses_case_insensitive_like_but_keeps_like,bigquery_catalog_refuses_case_insensitive_like_but_keeps_like,bigquery_ilike_stays_local_before_limit_on_every_registration_path,bigquery_ilike_residuals_preserve_boolean_and_projection_boundaries,bigquery_supported_like_and_comparison_still_push_down}`; the fork's `supported_functions`, `federation`, scan-filter, and physical-filter policy tests |
@@ -562,9 +547,7 @@ Two of them have a known problem at this pin:
 | `MySQLConnectionPool::new_with_pool_opts` hands the caller the pool options read from the connection parameters, on the `connection_string` path as well as the individual-parameter one, and builds the pool with what it returns ([table-providers PR #107](https://github.com/spiceai/datafusion-table-providers/pull/107), merged as `a48894d` on `spiceai-55`) | The MySQL dataset connector and catalog set the pool size and connection lifetime through it. If the signature is kept and the options are dropped on the URL path, a dataset given `mysql_connection_string` goes back to `mysql_async`'s 10/100 pool and to keeping its connections for the life of the process, so it stays on the server its hostname first resolved to. If the function is removed, the build fails | build; silent if the signature survives | `test/spicescript/mysql-connection-pool.yaml` (pool maximum and minimum with a connection string, connections replaced under a 2s lifetime, and kept under `0s` and the default), against MySQL's own process list and per-user connection totals. In the fork, `test_mysql_pool_opts_apply_to_connection_string`, which fails with "a second connection opened while the pool's only one was held" when `configure_pool` is ignored |
 | `MySQLConnectionPool::new_with_pool_opts_and_observer` asks each connection the pool opens which server it reached (`@@hostname`, `@@port`, and `@@aurora_server_id` where the server has it), from `mysql_async`'s `after_connect` callback, and reports it once per connection, the pool's own test connection included. A connection `mysql_async` replaces with one over the server's Unix socket, on which the callback runs twice, is reported once ([table-providers PR #108](https://github.com/spiceai/datafusion-table-providers/pull/108), merged as `0894768` on `spiceai-55`, and [PR #113](https://github.com/spiceai/datafusion-table-providers/pull/113)) | The MySQL connector and catalog log, at INFO once per server per 10 minutes and at DEBUG otherwise, the server each new connection reached. If the reports stop, the line that names which server behind a load-balanced hostname a dataset is on disappears without an error. If connections are again told apart by their id on the server, a connection to a second server behind the same hostname that takes an id the first server gave an earlier connection is never logged. If the function is removed, the build fails | build; silent if the signature survives | `crates/runtime/tests/mysql/pool.rs::each_connection_is_logged_once_across_servers` (two servers behind one switching proxy; each server's own count of the dataset user's connections against the log lines naming it) and `test/spicescript/mysql-connection-pool.yaml` (the INFO line for a dataset's connections, with the server MySQL itself reports). In the fork, `test_mysql_new_connection_observer`, `test_mysql_new_connection_observer_across_servers`, `test_mysql_socket_replacement_reported_once` and `test_mysql_socket_replacements_through_one_socket_to_two_servers` |
 | A new `MySQLConnectionPool` hands the connection it opened to check the server to its first checkout: the connection returns to the pool without a reset, since it ran only `SELECT 1` sent as text, and pool creation waits until the pool has taken it back ([table-providers PR #113](https://github.com/spiceai/datafusion-table-providers/pull/113)) | Every MySQL dataset and catalog pool opens a second connection at startup, because the first checkout starts while the test connection is still being reset on the pool's background task | silent (an extra connection per pool) | `crates/runtime/tests/mysql/pool.rs::a_new_pool_opens_one_connection_for_its_first_statement` (the server's count of the user's connections after one statement). In the fork, `test_mysql_first_checkout_reuses_the_test_connection` and `test_mysql_test_connection_is_reset_after_its_first_use` |
-| A `DuckDB` upsert is written as one `INSERT … ON CONFLICT DO UPDATE` statement per run of rows that repeats no key, so a key repeated within one write keeps its last copy ([table-providers PR #89](https://github.com/spiceai/datafusion-table-providers/pull/89)) | A refresh that repeats a key across record batches keeps whichever copy `DuckDB`'s parallel scan writes last ([#14643](https://github.com/spiceai/spiceai/issues/14643)). On the 2026-10-26 nightly, whose pin `f103fe8` predates the patch, 1,000 of 1,000 refreshes of such a dataset kept an earlier copy | silent (wrong rows) | **GAP** — see [Open gaps](#open-gaps) |
 | `SQLite` stores every nested column as the JSON text Arrow's encoder writes, and accepts a list or struct whose items it accepts, except `Duration` ([table-providers PR #90](https://github.com/spiceai/datafusion-table-providers/pull/90)) | A `SQLite` acceleration of a dataset with a list of structs fails to load with `The field '…' has an unsupported data type: List(Struct(…))`, as it did on the 2026-10-26 nightly | silent (load failure) | **GAP** — see [Open gaps](#open-gaps) |
-| A `DuckDB` filter compares a naive microsecond or nanosecond timestamp column with a timestamp or date literal as an integer at the literal's precision (`epoch_us`, `epoch_ns`), not through `TO_TIMESTAMP(EPOCH_MS(…) / 1000)` ([table-providers PR #93](https://github.com/spiceai/datafusion-table-providers/pull/93)) | The millisecond rewrite reads `00:00:00.000999` as `00:00:00`, so a `DELETE` on a `DuckDB` acceleration with a literal inside a millisecond removes rows the predicate does not select ([#13146](https://github.com/spiceai/spiceai/issues/13146)). `DELETE … WHERE ts < '2026-01-01 00:00:00.0005'` removed the `.000999` row too | silent (wrong data) | `crates/search/src/index/duckdb/sql.rs::a_naive_timestamp_filter_keeps_the_utc_normalization` pins the rendered `(epoch_us("ts")::HUGEINT * 1000) > …` form, and the absence of `EPOCH_MS`, for a naive microsecond column. `test/spicescript/duckdb-timestamp-deletes.yaml` covers the `DELETE` path end to end: it deletes from a `DuckDB` acceleration with `<`, `=`, `BETWEEN` and `>=` against literals inside a millisecond, in memory and file mode, and compares the rows left with what `PostgreSQL` holds after the same deletes. Neither covers a nanosecond column or a date literal: the unit test builds a microsecond column against a timestamp literal, and the scenario's `PostgreSQL` oracle has no nanosecond timestamp |
 
 ## arrow-adbc
 
@@ -579,26 +562,6 @@ below. Both were re-confirmed at the pinned revision. All three crates are repla
 |---|---|---|---|
 | `AdbcStatementCancel` issued without the statement lock, and statement release moved from the clonable handle to the shared inner (fork PR #4) | `cancel` is serialized behind the `execute` it exists to interrupt, so it returns only once the query has finished on its own and cancels nothing. A Flight client that goes away then leaves the remote query running — billing, on BigQuery — and holds its pooled connection for the rest of that query's life, which exhausts a small pool ([#13781](https://github.com/spiceai/spiceai/issues/13781)) | silent | `crates/data-connectors/connector-adbc/tests/adbc_cancellation.rs::dropping_the_stream_cancels_the_query_and_frees_the_pool_connection` |
 | Arrow requirement narrowed to the one major the workspace builds against, now `>=59.0.0, <60` (fork PR #4 set it to 58; moved to 59 in the merge of ADBC 24, where upstream's own range is `>=58, <60`) | A range spanning two majors lets a workspace that also carries an older arrow subtree — a geospatial stack on an older `DataFusion`, say — resolve the ADBC crates onto it while the rest of the workspace runs on 59. Two copies of `arrow-schema` then exist and a `Schema` does not match across the ADBC boundary; the enterprise runtime does not compile | build | `cargo check -p connector-adbc` in the enterprise runtime, which fails with `expected arrow_schema::Schema, found arrow_schema::schema::Schema` when the requirement is widened |
-
-## duckdb-rs
-
-Upstream [duckdb/duckdb-rs](https://github.com/duckdb/duckdb-rs), branch
-`spiceai-1.4.4`: includes the Arrow 59 bump (fork PR #49), the chrono write
-backport (fork PR #50), the Rust 1.98.1 toolchain (fork PR #51), and the merged
-Brotli source backport at `b4360d03` (duckdb-rs commits `d7f1bcc` and `40a0ad2`).
-The pin matches the table-provider fork. The Arrow 59 transition also uses
-`RecordBatch::try_from_iter(columns)` in `vtab/arrow.rs`.
-
-| Patch | What breaks if it is lost | Loss | Guard |
-|---|---|---|---|
-| `duckdb_arrow_scan` support — `register_arrow_scan_view` for Arrow-stream ingestion (fork PR #18) | DuckLake writes and Arrow-stream ingestion have no path in | build | `crates/data_components/src/ducklake/writer.rs` calls it |
-| ICU extension statically linked into bundled DuckDB (fork PR #23) | Any query using a named timezone (`AT TIME ZONE 'America/New_York'`) fails at runtime, and DuckDB tries to download the extension from the network | silent (query failure) | `crates/accelerators/accelerator-duckdb/src/lib.rs::bundled_duckdb_resolves_a_named_time_zone_without_installing_icu` |
-| VSS (HNSW) extension statically linked (fork PR #37) | Vector search over a DuckDB accelerator fails, or silently falls back to a full scan | silent (query failure) | `crates/accelerators/accelerator-duckdb/src/lib.rs::bundled_duckdb_builds_an_hnsw_index_without_installing_vss` |
-| Bundled DuckDB version pinned to the release (fork PR #38) | Extension downloads resolve against a mismatched DuckDB version and fail | silent | covered by the two extension guards above |
-| Thrift `TEnumIterator::operator==` backport for macOS 27 / libc++ (fork PR #47; upstream [duckdb/duckdb@fccde6aa](https://github.com/duckdb/duckdb/commit/fccde6aa1932f48dfa6282a916ea2477b57aa44d)) | Bundled DuckDB with Parquet fails to compile against the macOS 27 SDK: newer libc++ constructs Thrift enum maps with `iterator == end`, and the vendored Thrift header only defined `operator!=` | build (macOS 27) | `scripts/check_fork_patches.py::duckdb_thrift_iterator_equality` — reads `operator==(const TEnumIterator` out of the pinned revision's `duckdb.tar.gz`. The fork's own `crates/libduckdb-sys/tests/test_bundled_thrift.py` covers the same property inside the fork and does not survive a re-cut of this pin |
-| Arrow bumped to 59 (fork PR #49, squash-merged into `spiceai-1.4.4`), with the fork's `test_fixed_array_roundtrip` rebuilt from a whole number of lists — arrow 58 silently dropped a trailing value that arrow 59 rejects | Upstream duckdb-rs is on arrow 58 on every line. Without the bump the workspace resolves two arrow majors, and every Arrow value that crosses into or out of DuckDB — the accelerator's appender and its query results, `register_arrow_scan_view` — is a type from the other copy, so the crates that call it stop compiling. The test fix is fork-internal and changes no behaviour here | build | compile-guarded by `crates/accelerators/accelerator-duckdb` and `crates/data_components/src/ducklake/writer.rs`, which pass arrow types across that boundary |
-| Brotli decoder rejects an invalid block switch with `BROTLI_DECODER_ERROR_FORMAT_BLOCK_SWITCH` instead of decoding on with stale block-type state (fork PR #53, from spiceai/duckdb#20; upstream [duckdb/duckdb#27791](https://github.com/duckdb/duckdb/pull/27791), a port of [google/brotli@0ed4268a](https://github.com/google/brotli/commit/0ed4268a4401abcb4472096340477cf4af7d1a2b)) | A malformed Brotli-compressed page in a Parquet file that DuckDB reads can write out of bounds in the decoder (CVE-2026-111497) | silent (memory corruption) | `scripts/check_fork_patches.py::duckdb_brotli_block_switch` — reads the `BLOCK_SWITCH, -17` error code and the decoder path that returns it out of the pinned revision's `duckdb.tar.gz` |
-| `ToSql for DateTime<Tz>` writes the UTC instant instead of the local wall-clock fields with a `+00:00` suffix (fork PR #50, backport of upstream duckdb-rs `2bf67df`) | A non-UTC `chrono::DateTime` bound as a parameter is stored shifted by its UTC offset | none in this workspace | Not reachable here: the impl is behind duckdb-rs's `chrono` feature, which no crate in this workspace enables (`cargo metadata` resolves `duckdb` without it), so nothing binds a `chrono::DateTime` through `ToSql`. A change that enables `chrono` turns this into a silent wrong-data row and needs a guard with it |
 
 ## iceberg-rust
 
@@ -913,7 +876,7 @@ patch is a build failure, so no behaviour guard applies.
 
 ## Open gaps
 
-**60 rows above are marked GAP** — they have no repo-side guard. Every one of them
+**59 rows above are marked GAP** — they have no repo-side guard. Every one of them
 is accounted for below; `scripts/check_fork_patches.py` fails if that count and this
 sentence disagree, so the list cannot quietly fall behind the tables.
 
@@ -1018,19 +981,13 @@ writing a test; each says what would unblock it:
    rather than guard it.
 13. `graph-rs-sdk` tower middleware — nothing here configures Graph middleware, so
    there is no behaviour of ours to assert on.
-14. `datafusion-table-providers` upsert split per run of unrepeated keys (table-providers
-   PR #89) — the write path it adds can invalidate `DuckDB` 1.4.4, so a guard that runs it
-   in CI could fail on that crash rather than on the patch until `DuckDB` carries
-   duckdb/duckdb#20804
-   ([#14643](https://github.com/spiceai/spiceai/issues/14643)). Once it does, a load of a
-   dataset that repeats a key across record batches, checking the last copy, closes it.
-15. `datafusion-table-providers` nested `SQLite` columns stored as JSON (table-providers
+14. `datafusion-table-providers` nested `SQLite` columns stored as JSON (table-providers
    PR #90) — the read side is spiceai/datafusion-federation#92, still open. The federation
    pin that takes it should add a `SQLite` round trip of a list of structs.
 
 **Reported late rather than wrongly.** The right answer, after an avoidable wait:
 
-16. `async-openai` a 404 ends the retry loop instead of being retried — a mistyped
+15. `async-openai` a 404 ends the retry loop instead of being retried — a mistyped
    `endpoint` is retried through the whole backoff budget before reporting, so a
    configuration error looks like a slow provider. What changes is *when* the
    error arrives, and asserting that is a timing test.
@@ -1038,7 +995,7 @@ writing a test; each says what would unblock it:
 **Diagnostics only.** The query is unaffected; what is lost is the ability to see
 how it ran:
 
-17. `datafusion-ballista` distributed `EXPLAIN ANALYZE` (fork PR #34, now
+16. `datafusion-ballista` distributed `EXPLAIN ANALYZE` (fork PR #34, now
    upstream's; `EXPLAIN FORMAT TREE` is not carried) — plain `EXPLAIN` is guarded
    through the cluster harness, and `ANALYZE` is not issued through it by anything. Closing this needs the
    harness to submit the statement rather than build its text as a label.
@@ -1049,7 +1006,7 @@ the scheduled TPC-H/TPC-DS jobs), which already trend these numbers over time an
 will show the regression as a step change. A unit test cannot assert a speedup
 without becoming a flaky timing test:
 
-18. `vortex` intra-file decode parallelism; `iceberg-rust` parallel file scanning;
+17. `vortex` intra-file decode parallelism; `iceberg-rust` parallel file scanning;
     `mistral.rs`/`candle` i-quant MoE kernels; `candle-index-select-cu` fallback shim; `model2vec-rs` fast WordPiece;
     `mistral.rs` `deepseek41` and `glm5-next` decode kernels (spiceai/mistral.rs#49), which
     no suite here trends yet — their evidence is the DGX Spark decode A/B in that PR;
@@ -1072,7 +1029,7 @@ without becoming a flaky timing test:
 **Unoptimised builds only.** No query answers anything differently; what is lost
 is stack headroom in a debug build (release builds were not measured):
 
-19. `datafusion` join-arm helper refactor (`cbda233a6`, spiceai/datafusion#249) —
+18. `datafusion` join-arm helper refactor (`cbda233a6`, spiceai/datafusion#249) —
     it keeps the unparser's opt-level-0 frame from growing with #233 and #234, which
     without it push the fork's `roundtrip_statement` past the 2 MiB default test
     thread (it needs 2,112 KiB without the refactor, 1,984 KiB with it). This repo's
