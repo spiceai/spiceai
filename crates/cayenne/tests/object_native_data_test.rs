@@ -434,6 +434,19 @@ async fn add_dataset_with_config(
     primary_key: &[&str],
     config: VortexConfig,
 ) -> (String, String, Arc<CayenneTableProvider>, SessionContext) {
+    add_dataset_with_retention(setup, catalog, name, primary_key, config, Vec::new()).await
+}
+
+/// [`add_dataset_with_config`] with the retention predicates its maintenance
+/// deletes by.
+async fn add_dataset_with_retention(
+    setup: &Setup,
+    catalog: &Arc<dyn MetadataCatalog>,
+    name: &str,
+    primary_key: &[&str],
+    config: VortexConfig,
+    retention: Vec<datafusion::logical_expr::Expr>,
+) -> (String, String, Arc<CayenneTableProvider>, SessionContext) {
     let datasets = catalog_datasets_prefix(&setup.data_prefix);
     let data_prefix = format!("{datasets}/{}/data", new_dataset_folder(name));
     let data_url = format!("s3://bucket/{data_prefix}");
@@ -445,6 +458,7 @@ async fn add_dataset_with_config(
                 url: url::Url::parse(&data_url).expect("data url"),
                 store: Arc::clone(&setup.store),
             })
+            .with_retention_filters(retention)
             .create(CreateTableOptions {
                 table_name: name.to_string(),
                 schema: schema(),
@@ -2778,14 +2792,14 @@ fn lists_of(setup: &Setup, watched: &[&str], phase: &str) -> (String, usize, Vec
 
 /// The writes and the maintenance of a dataset whose data is in the location
 /// list nothing: its committed state names every file it keeps and every
-/// snapshot it retired, so the cleanup that follows a commit deletes by name.
-/// Covers appends, a full refresh, compaction, a `DELETE`, change-stream upserts
-/// and deletes, memory-tier checkpoints and the follow-up passes after the
-/// cleanup grace. The listings left are a filtered `DELETE`'s scan of each live
-/// snapshot's directory, asserted exactly so removing them updates this test.
-/// The orphan sweep, the only listing such a dataset's maintenance makes, never
-/// runs in its first interval after the table opened, so every LIST counted here
-/// comes from somewhere else.
+/// snapshot it retired, so the cleanup that follows a commit deletes by name,
+/// and a filtered `DELETE` finds its rows in the files each live snapshot's
+/// committed state names. Covers appends, a full refresh, compaction, a
+/// position `DELETE`, change-stream upserts and deletes, memory-tier
+/// checkpoints, a key `DELETE` over the current and protected snapshots, and
+/// the follow-up passes after the cleanup grace. The orphan sweep, the only
+/// listing such a dataset's maintenance makes, never runs in its first interval
+/// after the table opened, so every LIST counted here comes from somewhere else.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn writes_and_maintenance_of_a_placed_dataset_list_nothing() {
     // Longer than the snapshot cleanup grace (5 s), so a pass a commit deferred
@@ -2887,11 +2901,9 @@ async fn writes_and_maintenance_of_a_placed_dataset_list_nothing() {
     let compacted = current().await != before_compaction;
     phases.push(lists_of(&setup, &watched, "compaction"));
 
-    // A position delete writes a deletion vector. Its scan finds the rows to
-    // delete through a listing of each live snapshot's directory (here only the
-    // current one): the LIST a filtered `DELETE` still makes. The maintenance
-    // after it lists nothing.
-    let deleted_in = live_snapshot_dirs(&catalog, "events", &setup.data_prefix).await;
+    // A position delete writes a deletion vector. Its scan reads the files the
+    // current snapshot's committed state names, and the maintenance after it
+    // lists nothing.
     run(&ctx, "DELETE FROM events WHERE id >= 1001 AND id <= 1500").await;
     settle(&tables).await;
     phases.push(lists_of(&setup, &watched, "delete"));
@@ -2943,8 +2955,12 @@ async fn writes_and_maintenance_of_a_placed_dataset_list_nothing() {
     phases.push(lists_of(&setup, &watched, "change stream"));
 
     // A SQL `DELETE` on the keyed table by a filter that is not a key list scans
-    // its current and protected snapshots the same way, one listing each.
+    // its current and protected snapshots, each from its committed state.
     let keyed_deleted_in = live_snapshot_dirs(&catalog, "changes", &changes_prefix).await;
+    assert!(
+        keyed_deleted_in.len() > 1,
+        "the key delete scans a protected snapshot besides the current one: {keyed_deleted_in:?}"
+    );
     run(
         &changes_ctx,
         "DELETE FROM changes WHERE id >= 100 AND id <= 110",
@@ -2997,19 +3013,7 @@ async fn writes_and_maintenance_of_a_placed_dataset_list_nothing() {
 
     let expected_lists: Vec<(String, usize, Vec<String>)> = phases
         .iter()
-        .map(|(phase, _, _)| {
-            if phase == "delete" {
-                (phase.clone(), deleted_in.len(), deleted_in.clone())
-            } else if phase == "keyed delete" {
-                (
-                    phase.clone(),
-                    keyed_deleted_in.len(),
-                    keyed_deleted_in.clone(),
-                )
-            } else {
-                (phase.clone(), 0, Vec::new())
-            }
-        })
+        .map(|(phase, _, _)| (phase.clone(), 0, Vec::new()))
         .collect();
     assert_eq!(
         phases, expected_lists,
@@ -3038,5 +3042,201 @@ async fn writes_and_maintenance_of_a_placed_dataset_list_nothing() {
             Vec::<String>::new(),
         ),
         "rows, a retired snapshot after the refresh, compaction and merge committed, every retired snapshot forgotten, no data file left that the manifest does not name"
+    );
+}
+
+/// The rows a `DELETE` statement reports and removes.
+async fn deleted_by(ctx: &SessionContext, sql: &str) -> u64 {
+    let batches = ctx
+        .sql(sql)
+        .await
+        .expect("plan")
+        .collect()
+        .await
+        .expect("execute");
+    batches[0]
+        .column(0)
+        .as_any()
+        .downcast_ref::<arrow::array::UInt64Array>()
+        .expect("count")
+        .value(0)
+}
+
+/// The keys of the `.vortex` objects in the current snapshot of `name` that no
+/// commit names.
+async fn unnamed_current_files(
+    setup: &Setup,
+    catalog: &Arc<dyn MetadataCatalog>,
+    name: &str,
+) -> Vec<String> {
+    let stored = catalog.get_table(name).await.expect("stored table");
+    let named: std::collections::HashSet<String> = catalog
+        .get_all_snapshot_files(&stored.table_id)
+        .await
+        .expect("manifest")
+        .into_iter()
+        .map(|file| {
+            format!(
+                "{}/{}/{}/{}",
+                setup.data_prefix, stored.table_id, file.snapshot_id, file.file_path
+            )
+        })
+        .collect();
+    let current = format!(
+        "{}/{}/{}/",
+        setup.data_prefix, stored.table_id, stored.current_snapshot_id
+    );
+    objects_under(setup, &current, ".vortex")
+        .await
+        .into_iter()
+        .filter(|key| !named.contains(key))
+        .collect()
+}
+
+/// The last `/`-separated segment of `path`.
+fn file_name(path: &str) -> &str {
+    path.rsplit('/').next().unwrap_or(path)
+}
+
+/// A filtered `DELETE` that runs while an append has uploaded its files into the
+/// current snapshot and not committed them acts on the committed rows alone: it
+/// reports and removes only those, writes no deletion vector for a file no
+/// commit names, and the append then commits every one of its rows (or, when it
+/// is abandoned, leaves no row behind). Same outcome as the `DELETE` running
+/// first and the append after it, which is the order of their commits.
+async fn a_filtered_delete_acts_only_on_committed_rows(append_commits: bool) {
+    let (setup, catalog, table, ctx) = create("events").await;
+    run(
+        &ctx,
+        "INSERT INTO events SELECT value AS id, value * 10 AS v FROM generate_series(1, 1000)",
+    )
+    .await;
+    table.drain_in_flight_maintenance().await.expect("drain");
+    let table_id = table.metadata().table_id.clone();
+
+    // A change-stream append: its files are uploaded into the current snapshot
+    // when this returns, and it commits them only in `finish`.
+    let appended: Vec<(i64, i64)> = (1001..=2000).map(|id| (id, id * 10)).collect();
+    let batch = rows_batch(&appended);
+    let stream: datafusion::execution::SendableRecordBatchStream = Box::pin(
+        datafusion::physical_plan::stream::RecordBatchStreamAdapter::new(
+            batch.schema(),
+            futures::stream::iter([Ok(batch)]),
+        ),
+    );
+    let write = table
+        .write_cdc_append_stream(stream, &SessionContext::new().task_ctx())
+        .await
+        .expect("stage the append");
+    let uncommitted = unnamed_current_files(&setup, &catalog, "events").await;
+    assert!(
+        write.has_pending_finalize() && !uncommitted.is_empty(),
+        "the append has files in the current snapshot that no commit names: pending {}, files {uncommitted:?}",
+        write.has_pending_finalize()
+    );
+
+    // Matches ids 501..=1000 committed, and every appended row.
+    let deleted = deleted_by(&ctx, "DELETE FROM events WHERE v > 5000").await;
+    let vectors_on_uncommitted: Vec<String> = catalog
+        .get_table_delete_files(&table_id)
+        .await
+        .expect("deletion vectors")
+        .into_iter()
+        .filter_map(|vector| vector.source_data_file_path)
+        .filter(|data_file| {
+            uncommitted
+                .iter()
+                .any(|key| file_name(key) == file_name(data_file))
+        })
+        .collect();
+
+    let expected = if append_commits {
+        write.finish().await.expect("the append commits");
+        (1500, expected_sum(1, 500) + expected_sum(1001, 2000))
+    } else {
+        drop(write);
+        (500, expected_sum(1, 500))
+    };
+    table.drain_in_flight_maintenance().await.expect("drain");
+    let live = count_and_sum(&ctx, "events").await;
+    drop((table, ctx, catalog));
+    let (_catalog, _table, reopened_ctx) = reopen_in(&setup.store, &setup.data_url, "events").await;
+    let reopened = count_and_sum(&reopened_ctx, "events").await;
+    assert_eq!(
+        (deleted, vectors_on_uncommitted, live, reopened),
+        (500, Vec::<String>::new(), expected, expected),
+        "rows the DELETE reported, deletion vectors naming the append's uncommitted files, rows live and after a reopen (append commits: {append_commits})"
+    );
+}
+
+#[tokio::test]
+async fn a_filtered_delete_during_an_append_leaves_the_appended_rows() {
+    a_filtered_delete_acts_only_on_committed_rows(true).await;
+}
+
+#[tokio::test]
+async fn a_filtered_delete_during_an_abandoned_append_names_none_of_its_files() {
+    a_filtered_delete_acts_only_on_committed_rows(false).await;
+}
+
+/// Retention of a dataset whose data is in the location lists nothing: it finds
+/// the expired rows in the files each live snapshot's committed state names, on
+/// a table without a key (position deletes) and on a keyed one (key deletes).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn retention_of_a_placed_dataset_lists_nothing() {
+    let (setup, catalog, _anchor, _anchor_ctx) = create("anchor").await;
+    let mut seen = Vec::new();
+    for (name, primary_key) in [("plain", &[][..]), ("keyed", &["id"][..])] {
+        let config = if primary_key.is_empty() {
+            vortex_config()
+        } else {
+            VortexConfig {
+                deletion_mode: DeletionMode::Key,
+                compaction_trigger_files: 1_000_000,
+                compaction_trigger_protected_snapshots: 1_000_000,
+                compaction_trigger_snapshot_age_ms: 0,
+                compaction_background_interval_ms: 0,
+                ..vortex_config()
+            }
+        };
+        let (_data_url, data_prefix, table, ctx) = add_dataset_with_retention(
+            &setup,
+            &catalog,
+            name,
+            primary_key,
+            config,
+            vec![col("v").lt(lit(3000_i64))],
+        )
+        .await;
+        setup.counting.watch(&data_prefix);
+        for first in [1, 1001] {
+            run(
+                &ctx,
+                &format!(
+                    "INSERT INTO {name} SELECT value AS id, value * 10 AS v FROM generate_series({first}, {})",
+                    first + 999
+                ),
+            )
+            .await;
+            table.flush_pending_maintenance().await.expect("retention");
+        }
+        table.drain_in_flight_maintenance().await.expect("drain");
+        let lists = setup.counting.listed();
+        let table_id = table.metadata().table_id.clone();
+        let vectors = catalog
+            .get_table_delete_files(&table_id)
+            .await
+            .expect("deletion vectors")
+            .len();
+        seen.push((name, lists, vectors > 0, count_and_sum(&ctx, name).await));
+    }
+    let kept = (1701, expected_sum(300, 2000));
+    assert_eq!(
+        seen,
+        vec![
+            ("plain", Vec::<String>::new(), true, kept),
+            ("keyed", Vec::<String>::new(), true, kept),
+        ],
+        "per dataset: LIST prefixes during its writes and retention, a deletion vector written, rows"
     );
 }

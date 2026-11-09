@@ -74,8 +74,12 @@ use std::collections::HashMap;
 use crate::row_converter::RowConverter;
 use async_trait::async_trait;
 use data_components::delete::DeletionSink;
-use datafusion::datasource::listing::ListingTable;
+use datafusion::catalog::Session;
+use datafusion::datasource::listing::{ListingTable, ListingTableUrl};
 use datafusion::execution::TaskContext;
+use datafusion::execution::object_store::ObjectStoreUrl;
+use datafusion::physical_plan::ExecutionPlan;
+use datafusion::physical_plan::empty::EmptyExec;
 use datafusion::execution::context::SessionContext;
 use datafusion::execution::runtime_env::RuntimeEnv;
 use datafusion::optimizer::analyzer::type_coercion::TypeCoercionRewriter;
@@ -83,6 +87,10 @@ use datafusion::physical_plan::execute_stream;
 use datafusion_catalog::TableProvider;
 use datafusion_common::DFSchema;
 use datafusion_common::tree_node::TreeNode;
+use datafusion_common::utils::project_schema;
+use datafusion_datasource::file_groups::FileGroup;
+use datafusion_datasource::file_scan_config::FileScanConfigBuilder;
+use datafusion_datasource::{PartitionedFile, TableSchema};
 use datafusion_expr::Expr;
 use datafusion_expr::execution_props::ExecutionProps;
 use datafusion_physical_expr::{PhysicalExpr, create_physical_expr};
@@ -355,7 +363,7 @@ pub(crate) struct DeleteScanSource {
     pub(crate) min_delete_seq: Option<i64>,
     /// Whether a key re-inserted after its delete reads as live again.
     pub(crate) insert_records: InsertRecordHandling,
-    pub(crate) table: Arc<ListingTable>,
+    pub(crate) table: DeleteScanTable,
     /// The deletion index as it stood when `table` was captured, taken under the same
     /// `listing_fence` read. `None` for a source captured without one (the cold tier).
     ///
@@ -369,6 +377,150 @@ pub(crate) struct DeleteScanSource {
     /// is still consulted as well, because a tombstone added after the capture — an
     /// upsert that superseded the version in between — must hide it too.
     pub(crate) tombstones_at_capture: Option<PkDeletionSnapshot>,
+}
+
+/// The data files of one snapshot a delete reads.
+///
+/// A table whose committed state is the only record of its files (its data is in
+/// the object-native location) reads the files that state names for the
+/// snapshot, captured with the rest of the delete's view of the table. Its
+/// snapshot directory can also hold files an append has uploaded and not
+/// committed, and files no commit will ever name, so a listing of it would let
+/// the delete act on rows that are not in the table: report them, write
+/// deletion vectors for them, and hide them once the append commits. Scans of
+/// such a table read the same committed files. Every other table lists the
+/// snapshot directory, as its scans do.
+#[derive(Clone)]
+pub(crate) struct DeleteScanTable {
+    listing: Arc<ListingTable>,
+    /// The snapshot's committed files; `None` lists the directory.
+    committed_files: Option<Arc<[PartitionedFile]>>,
+}
+
+impl DeleteScanTable {
+    /// Read `listing`'s snapshot directory by listing it.
+    pub(crate) fn listed(listing: Arc<ListingTable>) -> Self {
+        Self {
+            listing,
+            committed_files: None,
+        }
+    }
+
+    /// Read the files `catalog` names for the snapshot `listing` reads, a
+    /// snapshot of table `table_id` whose committed state is the only record of
+    /// its files.
+    ///
+    /// A partitioned table keeps the listing, as its scans do: the committed
+    /// state does not record partition values, which the listing derives from
+    /// each path.
+    pub(crate) async fn committed(
+        listing: Arc<ListingTable>,
+        catalog: &dyn MetadataCatalog,
+        table_id: &str,
+    ) -> datafusion_common::Result<Self> {
+        if !listing.options().table_partition_cols.is_empty() {
+            return Ok(Self::listed(listing));
+        }
+        let Some(url) = listing.table_paths().first() else {
+            return Err(datafusion_common::DataFusionError::Internal(format!(
+                "the snapshot of table {table_id} a delete reads has no path"
+            )));
+        };
+        let prefix = url.prefix();
+        let mut parts = prefix.parts();
+        let snapshot_id = parts.next_back();
+        let owner = parts.next_back();
+        let (Some(snapshot_id), Some(owner)) = (snapshot_id, owner) else {
+            return Err(datafusion_common::DataFusionError::Internal(format!(
+                "the snapshot directory '{prefix}' a delete of table {table_id} reads names no snapshot"
+            )));
+        };
+        if owner.as_ref() != table_id {
+            return Err(datafusion_common::DataFusionError::Internal(format!(
+                "the snapshot directory '{prefix}' a delete of table {table_id} reads belongs to another table"
+            )));
+        }
+        let manifest = catalog
+            .get_snapshot_files(table_id, snapshot_id.as_ref())
+            .await
+            .map_err(|error| datafusion_common::DataFusionError::External(Box::new(error)))?;
+        let files =
+            super::super::table::CayenneTableProvider::manifest_files_as_partitioned_files(
+                prefix, manifest,
+            );
+        Ok(Self {
+            listing,
+            committed_files: Some(files.into()),
+        })
+    }
+
+    /// The snapshot directory, for logs.
+    pub(crate) fn path(&self) -> &str {
+        self.listing
+            .table_paths()
+            .first()
+            .map_or("unknown", ListingTableUrl::as_str)
+    }
+
+    /// The store the snapshot's files are in.
+    pub(crate) fn object_store_url(&self) -> Option<ObjectStoreUrl> {
+        self.listing
+            .table_paths()
+            .first()
+            .map(ListingTableUrl::object_store)
+    }
+
+    /// The snapshot's data files.
+    pub(crate) async fn files(
+        &self,
+        state: &dyn Session,
+    ) -> datafusion_common::Result<Vec<PartitionedFile>> {
+        if let Some(files) = &self.committed_files {
+            return Ok(files.to_vec());
+        }
+        Ok(self
+            .listing
+            .list_files_for_scan(state, &[], None)
+            .await?
+            .file_groups
+            .into_iter()
+            .flat_map(FileGroup::into_inner)
+            .collect())
+    }
+
+    /// A plan reading `projection` of every row of the snapshot's files, with
+    /// the position deletes its file format applies. `filters` may prune what
+    /// is read; the caller re-applies them exactly.
+    pub(crate) async fn scan(
+        &self,
+        state: &dyn Session,
+        projection: Option<&Vec<usize>>,
+        filters: &[Expr],
+    ) -> datafusion_common::Result<Arc<dyn ExecutionPlan>> {
+        let Some(files) = &self.committed_files else {
+            return self.listing.scan(state, projection, filters, None).await;
+        };
+        let schema = self.listing.schema();
+        if files.is_empty() {
+            return Ok(Arc::new(EmptyExec::new(project_schema(
+                &schema, projection,
+            )?)));
+        }
+        let Some(object_store_url) = self.object_store_url() else {
+            return Err(datafusion_common::DataFusionError::Internal(
+                "a snapshot a delete reads has no path".to_string(),
+            ));
+        };
+        let format = &self.listing.options().format;
+        let file_source = format.file_source(TableSchema::builder(schema).build());
+        let file_groups =
+            FileGroup::new(files.to_vec()).split_files(state.config().target_partitions());
+        let config = FileScanConfigBuilder::new(object_store_url, file_source)
+            .with_file_groups(file_groups)
+            .with_projection_indices(projection.cloned())?
+            .build();
+        format.create_physical_plan(state, config).await
+    }
 }
 
 impl StagedPkDelete {
@@ -581,6 +733,9 @@ pub struct CayenneDeletionSink {
     /// The owning table's storage when its data path is an object-store URL;
     /// deletion vectors are written, read and removed through its store.
     dataset_storage: Option<Arc<DatasetStorage>>,
+    /// Whether the main source reads the current snapshot's committed files
+    /// instead of listing its directory (see [`DeleteScanTable`]).
+    reads_committed_files: bool,
 }
 
 /// The locks a coherent (listing, deletion index) capture holds, outer first.
@@ -648,7 +803,16 @@ impl CayenneDeletionSink {
             capture_locks: None,
             file_deletion_fence: None,
             dataset_storage,
+            reads_committed_files: false,
         }
+    }
+
+    /// Read the main source from the current snapshot's committed files, for a
+    /// table whose committed state is the only record of its files.
+    #[must_use]
+    pub(crate) fn with_committed_files(mut self, committed: bool) -> Self {
+        self.reads_committed_files = committed;
+        self
     }
 
     /// Wire the owning table's `file_deletion_fence`, so a position delete removes
@@ -732,20 +896,31 @@ impl CayenneDeletionSink {
     }
 
     /// The main listing as a scan source, captured together with the deletion index
-    /// under the same read guards `scan` captures the same rows under.
-    async fn capture_main_scan_source(&self) -> DeleteScanSource {
+    /// under the same read guards `scan` captures the same rows under. Its
+    /// committed files, when it reads them, are read under the same guards.
+    async fn capture_main_scan_source(&self) -> datafusion_common::Result<DeleteScanSource> {
         let _guards = match &self.capture_locks {
             Some(locks) => Some(locks.read().await),
             None => None,
         };
-        let table = self.listing_table.load_full();
+        let listing = self.listing_table.load_full();
         let tombstones_at_capture = pk_deletion_snapshot_for_strategy(&self.pk_deletion_strategy);
-        DeleteScanSource {
+        let table = if self.reads_committed_files {
+            DeleteScanTable::committed(
+                listing,
+                self.catalog.as_ref(),
+                &self.table_metadata.table_id,
+            )
+            .await?
+        } else {
+            DeleteScanTable::listed(listing)
+        };
+        Ok(DeleteScanSource {
             min_delete_seq: None,
             insert_records: self.live_main_insert_records(),
             table,
             tombstones_at_capture: Some(tombstones_at_capture),
-        }
+        })
     }
 
     /// Wire the owning table's scan-input version so a published delete
@@ -782,7 +957,7 @@ impl CayenneDeletionSink {
     async fn prepare_delete_all_rows_from_tables(
         &self,
         ctx: &SessionContext,
-        tables: &[Arc<ListingTable>],
+        tables: &[DeleteScanTable],
     ) -> super::super::Result<Option<PreparedDeletionPublish>> {
         let table_name = &self.table_metadata.table_name;
         // For position-based deletions, we need per-file row tracking
@@ -798,7 +973,7 @@ impl CayenneDeletionSink {
                 )?;
                 for table in tables {
                     let scan_plan = table
-                        .scan(&ctx.state(), Some(&self.pk_column_indices), &[], None)
+                        .scan(&ctx.state(), Some(&self.pk_column_indices), &[])
                         .await?;
                     let mut stream = execute_stream(scan_plan, ctx.task_ctx())?;
                     while let Some(batch) = stream.next().await {
@@ -853,7 +1028,7 @@ impl CayenneDeletionSink {
                 )?;
                 for table in tables {
                     let scan_plan = table
-                        .scan(&ctx.state(), Some(&self.pk_column_indices), &[], None)
+                        .scan(&ctx.state(), Some(&self.pk_column_indices), &[])
                         .await?;
                     let mut stream = execute_stream(scan_plan, ctx.task_ctx())?;
                     let projected_indices: Vec<usize> = (0..self.pk_column_indices.len()).collect();
@@ -1193,7 +1368,7 @@ impl CayenneDeletionSink {
                 for source in tables {
                     let scan_plan = source
                         .table
-                        .scan(&ctx.state(), Some(&scan_projection), &coerced_filters, None)
+                        .scan(&ctx.state(), Some(&scan_projection), &coerced_filters)
                         .await?;
                     let mut stream = execute_stream(scan_plan, ctx.task_ctx())?;
 
@@ -1272,7 +1447,7 @@ impl CayenneDeletionSink {
                 for source in tables {
                     let scan_plan = source
                         .table
-                        .scan(&ctx.state(), Some(&scan_projection), &coerced_filters, None)
+                        .scan(&ctx.state(), Some(&scan_projection), &coerced_filters)
                         .await?;
                     let mut stream = execute_stream(scan_plan, ctx.task_ctx())?;
 
@@ -1342,22 +1517,22 @@ impl CayenneDeletionSink {
             util::session_state::session_config(),
             Arc::clone(&self.runtime_env),
         );
-        let mut all_tables = vec![self.capture_main_scan_source().await];
+        let mut all_tables = vec![self.capture_main_scan_source().await?];
         all_tables.extend(self.additional_scan_tables.iter().cloned());
         if self.filters.is_empty() {
             // Delete-all removes every row, so no version is preferred over another and
             // the thresholds carry no information.
-            let plain: Vec<Arc<ListingTable>> = all_tables
+            let plain: Vec<DeleteScanTable> = all_tables
                 .iter()
-                .map(|source| Arc::clone(&source.table))
+                .map(|source| source.table.clone())
                 .collect();
             self.prepare_delete_all_rows_from_tables(&ctx, &plain).await
         } else if self.pk_deletion_strategy.is_position_based() {
             // As in `delete_from`: a position tombstone can only hide the version it
             // matched, so the per-snapshot visibility rules carry nothing for it.
-            let position_tables: Vec<Arc<ListingTable>> = all_tables
+            let position_tables: Vec<DeleteScanTable> = all_tables
                 .iter()
-                .map(|source| Arc::clone(&source.table))
+                .map(|source| source.table.clone())
                 .collect();
             self.prepare_delete_filtered_rows_position_based(&ctx, &position_tables)
                 .await
@@ -1616,23 +1791,23 @@ impl DeletionSink for CayenneDeletionSink {
 
         // Collect all tables to scan: main listing table + the extra tables
         // (protected snapshots and, for cold-tier tables, the cold-tier files).
-        let mut all_tables = vec![self.capture_main_scan_source().await];
+        let mut all_tables = vec![self.capture_main_scan_source().await?];
         all_tables.extend(self.additional_scan_tables.iter().cloned());
 
         let prepared = if self.filters.is_empty() {
             // See above: delete-all needs no per-snapshot visibility.
-            let plain: Vec<Arc<ListingTable>> = all_tables
+            let plain: Vec<DeleteScanTable> = all_tables
                 .iter()
-                .map(|source| Arc::clone(&source.table))
+                .map(|source| source.table.clone())
                 .collect();
             self.prepare_delete_all_rows_from_tables(&ctx, &plain).await
         } else if self.pk_deletion_strategy.is_position_based() {
             // A position tombstone names a file and row position, so it can only ever
             // hide the version it matched — the per-snapshot thresholds that keep a key
             // tombstone off a live row carry nothing for it.
-            let position_tables: Vec<Arc<ListingTable>> = all_tables
+            let position_tables: Vec<DeleteScanTable> = all_tables
                 .iter()
-                .map(|source| Arc::clone(&source.table))
+                .map(|source| source.table.clone())
                 .collect();
             return self
                 .delete_filtered_rows_position_based(&ctx, &position_tables)

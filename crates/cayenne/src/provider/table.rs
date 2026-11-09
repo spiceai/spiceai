@@ -36,7 +36,7 @@ use super::constants::{
     LOOKUP_INDEX_DIR_NAME, STAGING_DIR_NAME, STAGING_WAL_FILENAME, STAGING_WAL_TMP_FILENAME,
 };
 use super::delete::{
-    CaptureLocks, CayenneDeletionSink, DeleteScanSource, DeletionIdentifier,
+    CaptureLocks, CayenneDeletionSink, DeleteScanSource, DeleteScanTable, DeletionIdentifier,
     DeletionVectorWriteResult, DeletionVectorWriteSpec, DeletionVectorWriter,
     FileBasedDeletionSink, InsertRecordHandling, Int64PkDeletionFilterExec,
     KeyBasedDeletionFilterExec,
@@ -42535,15 +42535,26 @@ impl CayenneTableProvider {
             return Ok(None);
         }
 
-        // `prefix` is the parsed snapshot-directory path; joining the manifest's
-        // bare file name onto it reproduces the listing's `ObjectMeta.location`
-        // byte-for-byte (the same derivation `stat_moved_files_as_object_metas`
-        // uses for the list-files-cache delta-apply).
-        let prefix = request.table_url.prefix();
-        let files = manifest
+        Ok(Some(Self::manifest_files_as_partitioned_files(
+            request.table_url.prefix(),
+            manifest,
+        )))
+    }
+
+    /// The files a snapshot's manifest rows name, as the scan of the snapshot
+    /// directory at `prefix` (its parsed path) reads them.
+    ///
+    /// Joining a row's bare file name onto `prefix` reproduces the listing's
+    /// `ObjectMeta.location` byte-for-byte (the same derivation
+    /// `stat_moved_files_as_object_metas` uses for the list-files-cache
+    /// delta-apply), and rows of size 0 are left out as the listing leaves out
+    /// empty files.
+    pub(crate) fn manifest_files_as_partitioned_files(
+        prefix: &object_store::path::Path,
+        manifest: Vec<SnapshotFile>,
+    ) -> Vec<PartitionedFile> {
+        manifest
             .into_iter()
-            // Mirror the listing's `size > 0` filter so empty placeholder files
-            // (if any) are excluded identically.
             .filter(|file| file.file_size_bytes > 0)
             .map(|file| {
                 // `synthetic_object_meta` stamps the epoch mtime the Vortex
@@ -42558,9 +42569,7 @@ impl CayenneTableProvider {
                 // unpartitioned case (`object_meta.into()`).
                 PartitionedFile::from(object_meta)
             })
-            .collect::<Vec<_>>();
-
-        Ok(Some(files))
+            .collect()
     }
 
     async fn list_files_for_snapshot_scan(
@@ -45752,22 +45761,26 @@ impl CayenneTableProvider {
             listing_fence: Arc::clone(&self.listing_fence),
             scan_state_lock: Arc::clone(&self.scan_state_lock),
         };
-        let (protected_tables, tombstones_at_capture) = {
+        //
+        // A table whose committed state is the only record of its files reads each
+        // snapshot's committed files, under the same guards (see [`DeleteScanTable`]).
+        let committed_files = self.data_in_object_native_location();
+        let mut snapshot_tables: Vec<DeleteScanSource> = {
             let _guards = capture_locks.read().await;
-            (
-                self.build_protected_snapshot_listing_tables()?,
-                self.pk_deletion_snapshot(),
-            )
+            let tombstones_at_capture = self.pk_deletion_snapshot();
+            let mut tables = Vec::new();
+            for (_, max_delete_seq_at_creation, listing) in
+                self.build_protected_snapshot_listing_tables()?
+            {
+                tables.push(DeleteScanSource {
+                    min_delete_seq: Some(max_delete_seq_at_creation),
+                    insert_records: InsertRecordHandling::Ignore,
+                    table: self.delete_scan_table(listing, committed_files).await?,
+                    tombstones_at_capture: Some(tombstones_at_capture.clone()),
+                });
+            }
+            tables
         };
-        let mut snapshot_tables: Vec<DeleteScanSource> = protected_tables
-            .into_iter()
-            .map(|(_, max_delete_seq_at_creation, table)| DeleteScanSource {
-                min_delete_seq: Some(max_delete_seq_at_creation),
-                insert_records: InsertRecordHandling::Ignore,
-                table,
-                tombstones_at_capture: Some(tombstones_at_capture.clone()),
-            })
-            .collect();
         // Main's own re-insert handling is decided HERE, on the same condition `scan`
         // uses (`protected_snapshot_plans.is_empty()`), and read before the cold tier is
         // appended below — cold files are a separate union branch there and do not enter
@@ -45799,7 +45812,7 @@ impl CayenneTableProvider {
                 .map(|table| DeleteScanSource {
                     min_delete_seq: None,
                     insert_records: InsertRecordHandling::Ignore,
-                    table,
+                    table: DeleteScanTable::listed(table),
                     tombstones_at_capture: None,
                 }),
         );
@@ -45826,9 +45839,29 @@ impl CayenneTableProvider {
         .with_scan_input_version(Arc::clone(&self.scan_input_version))
         .with_capture_locks(capture_locks)
         .with_file_deletion_fence(Arc::clone(&self.file_deletion_fence))
-        .with_exact_count(source.requires_exact_count());
+        .with_exact_count(source.requires_exact_count())
+        .with_committed_files(committed_files);
 
         Ok(sink)
+    }
+
+    /// How a delete reads the snapshot `listing` reads: from the files its
+    /// committed state names when `committed_files`, else by listing it.
+    async fn delete_scan_table(
+        &self,
+        listing: Arc<ListingTable>,
+        committed_files: bool,
+    ) -> datafusion_common::Result<DeleteScanTable> {
+        if committed_files {
+            DeleteScanTable::committed(
+                listing,
+                self.catalog.as_ref(),
+                &self.table_metadata.table_id,
+            )
+            .await
+        } else {
+            Ok(DeleteScanTable::listed(listing))
+        }
     }
 
     /// Durable CDC key-delete path that avoids exact row-count work when possible.
@@ -45910,7 +45943,10 @@ impl CayenneTableProvider {
         let listing_table = self.listing_table.load_full();
 
         // PositionBased tables have no protected snapshots, so we only scan the main listing table.
-        let all_tables = vec![listing_table];
+        let all_tables = vec![
+            self.delete_scan_table(listing_table, self.data_in_object_native_location())
+                .await?,
+        ];
 
         // Build the deletion sink with write_lock=None (we already hold it).
         let sink = CayenneDeletionSink::new(
