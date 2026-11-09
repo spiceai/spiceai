@@ -23,12 +23,12 @@ use data_connector_api::accelerated::RegisteredAcceleratedTable;
 
 use notify::{RecommendedWatcher, RecursiveMode, Watcher};
 use snafu::prelude::*;
+use std::ffi::OsString;
 use std::future::Future;
-use std::ffi::{OsStr, OsString};
 use std::path::Path;
 use std::path::PathBuf;
 use std::pin::Pin;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use std::{any::Any, env};
 use tokio::runtime::Handle;
@@ -177,16 +177,17 @@ impl ListingTableConnector for File {
 
         let path = get_path(dataset);
         let watch_path = watch_root(&path);
-        let watched_name: Option<OsString> = if path.is_dir() {
-            None
-        } else {
-            path.file_name().map(ToOwned::to_owned)
-        };
-        let mode = if path.is_dir() {
+        let directory_dataset = path.is_dir();
+        let mode = if directory_dataset {
             RecursiveMode::Recursive
         } else {
             RecursiveMode::NonRecursive
         };
+        let watched_names = Arc::new(Mutex::new(if directory_dataset {
+            Vec::new()
+        } else {
+            watched_file_names(&path)
+        }));
         let (tx, mut rx) = mpsc::channel(100);
         let Some(refresh_requester) = accelerated_table.refresh_requester() else {
             return Ok(());
@@ -198,15 +199,23 @@ impl ListingTableConnector for File {
             watch_path.display()
         );
 
+        let names_for_callback = Arc::clone(&watched_names);
         let watcher_task = tokio::spawn(async move {
             let mut watcher: RecommendedWatcher = match notify::recommended_watcher(
                 move |res: Result<notify::Event, notify::Error>| match res {
-                    Ok(event)
-                        if file_watch_event_is_relevant(&event, watched_name.as_deref()) =>
-                    {
-                        let _ = tx.blocking_send(());
+                    Ok(event) => {
+                        let relevant = if directory_dataset {
+                            file_watch_event_is_relevant(&event, None)
+                        } else {
+                            let names = names_for_callback
+                                .lock()
+                                .unwrap_or_else(std::sync::PoisonError::into_inner);
+                            file_watch_event_is_relevant(&event, Some(names.as_slice()))
+                        };
+                        if relevant {
+                            let _ = tx.blocking_send(());
+                        }
                     }
-                    Ok(_) => {}
                     Err(e) => {
                         tracing::debug!("File watcher event error: {e}");
                     }
@@ -227,6 +236,15 @@ impl ListingTableConnector for File {
                 }
             }
 
+            let mut extra_roots = Vec::new();
+            refresh_resolved_file_watch(
+                &mut watcher,
+                &path,
+                &watch_path,
+                &mut extra_roots,
+                &watched_names,
+            );
+
             // Trailing-edge debounce: wait until events stop arriving, then
             // refresh. Events that land while a refresh is in flight keep a
             // dirty flag so another refresh runs after it.
@@ -236,7 +254,16 @@ impl ListingTableConnector for File {
                 tokio::select! {
                     msg = rx.recv() => {
                         match msg {
-                            Some(()) => pending = true,
+                            Some(()) => {
+                                refresh_resolved_file_watch(
+                                    &mut watcher,
+                                    &path,
+                                    &watch_path,
+                                    &mut extra_roots,
+                                    &watched_names,
+                                );
+                                pending = true;
+                            }
                             None => break,
                         }
                     }
@@ -280,13 +307,72 @@ fn watch_root(path: &Path) -> PathBuf {
         .unwrap_or_else(|| PathBuf::from("."))
 }
 
-fn file_watch_event_is_relevant(event: &notify::Event, watched_name: Option<&OsStr>) -> bool {
+fn watched_file_names(path: &Path) -> Vec<OsString> {
+    let mut names = Vec::new();
+    if let Some(name) = path.file_name() {
+        names.push(name.to_owned());
+    }
+    if let Ok(resolved) = path.canonicalize()
+        && let Some(name) = resolved.file_name()
+        && !names.iter().any(|existing| existing.as_os_str() == name)
+    {
+        names.push(name.to_owned());
+    }
+    names
+}
+
+fn refresh_resolved_file_watch(
+    watcher: &mut RecommendedWatcher,
+    path: &Path,
+    configured_root: &Path,
+    extra_roots: &mut Vec<PathBuf>,
+    names: &Mutex<Vec<OsString>>,
+) {
+    if path.is_dir() {
+        return;
+    }
+    let mut guard = names
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    *guard = watched_file_names(path);
+    drop(guard);
+
+    let desired: Vec<PathBuf> = path
+        .canonicalize()
+        .ok()
+        .map(|resolved| watch_root(&resolved))
+        .into_iter()
+        .filter(|root| root != configured_root)
+        .collect();
+
+    for old in extra_roots.iter() {
+        if !desired.contains(old) {
+            let _ = watcher.unwatch(old);
+        }
+    }
+    for new_root in &desired {
+        if !extra_roots.contains(new_root)
+            && let Err(e) = watcher.watch(new_root, RecursiveMode::NonRecursive)
+        {
+            tracing::debug!(
+                "Failed to watch resolved file parent {}: {e}",
+                new_root.display()
+            );
+        }
+    }
+    *extra_roots = desired;
+}
+
+fn file_watch_event_is_relevant(event: &notify::Event, watched_names: Option<&[OsString]>) -> bool {
     if !(event.kind.is_create() || event.kind.is_modify() || event.kind.is_remove()) {
         return false;
     }
-    match watched_name {
+    match watched_names {
         None => true,
-        Some(name) => event.paths.iter().any(|path| path.file_name() == Some(name)),
+        Some(names) => event.paths.iter().any(|path| {
+            path.file_name()
+                .is_some_and(|name| names.iter().any(|watched| watched.as_os_str() == name))
+        }),
     }
 }
 
@@ -376,22 +462,53 @@ mod tests {
 
     #[test]
     fn file_watch_event_filters_unrelated_names_and_accesses() {
-        let target = OsStr::new("events.csv");
-        let create = notify::Event::new(notify::EventKind::Create(
-            notify::event::CreateKind::File,
-        ))
-        .add_path(PathBuf::from("/data/events.csv"));
-        let other = notify::Event::new(notify::EventKind::Create(
-            notify::event::CreateKind::File,
-        ))
-        .add_path(PathBuf::from("/data/events.csv.tmp"));
-        let access = notify::Event::new(notify::EventKind::Access(
-            notify::event::AccessKind::Any,
-        ))
-        .add_path(PathBuf::from("/data/events.csv"));
-        assert!(file_watch_event_is_relevant(&create, Some(target)));
-        assert!(!file_watch_event_is_relevant(&other, Some(target)));
-        assert!(!file_watch_event_is_relevant(&access, Some(target)));
+        let target = [OsString::from("events.csv")];
+        let create = notify::Event::new(notify::EventKind::Create(notify::event::CreateKind::File))
+            .add_path(PathBuf::from("/data/events.csv"));
+        let other = notify::Event::new(notify::EventKind::Create(notify::event::CreateKind::File))
+            .add_path(PathBuf::from("/data/events.csv.tmp"));
+        let access = notify::Event::new(notify::EventKind::Access(notify::event::AccessKind::Any))
+            .add_path(PathBuf::from("/data/events.csv"));
+        assert!(file_watch_event_is_relevant(
+            &create,
+            Some(target.as_slice())
+        ));
+        assert!(!file_watch_event_is_relevant(
+            &other,
+            Some(target.as_slice())
+        ));
+        assert!(!file_watch_event_is_relevant(
+            &access,
+            Some(target.as_slice())
+        ));
         assert!(file_watch_event_is_relevant(&other, None));
+    }
+
+    #[test]
+    fn file_watch_event_accepts_resolved_target_name() {
+        let names = [OsString::from("names.csv"), OsString::from("actual.csv")];
+        let target = notify::Event::new(notify::EventKind::Modify(notify::event::ModifyKind::Any))
+            .add_path(PathBuf::from("/other/actual.csv"));
+        assert!(file_watch_event_is_relevant(
+            &target,
+            Some(names.as_slice())
+        ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn watched_file_names_includes_symlink_target() {
+        let root =
+            std::env::temp_dir().join(format!("spice-file-watch-names-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join("real")).expect("create real dir");
+        let real = root.join("real").join("actual.csv");
+        std::fs::write(&real, b"x").expect("write target");
+        let alias = root.join("names.csv");
+        std::os::unix::fs::symlink(&real, &alias).expect("symlink");
+        let names = watched_file_names(&alias);
+        let _ = std::fs::remove_dir_all(&root);
+        assert!(names.iter().any(|name| name.as_os_str() == "names.csv"));
+        assert!(names.iter().any(|name| name.as_os_str() == "actual.csv"));
     }
 }

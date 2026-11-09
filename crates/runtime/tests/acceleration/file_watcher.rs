@@ -160,17 +160,14 @@ async fn test_file_watcher() -> Result<(), anyhow::Error> {
         .await
 }
 
-
-
 fn watcher_dataset(csv_path: &Path, db_path: &Path) -> Dataset {
     let mut dataset = Dataset::new(format!("file://{}", csv_path.display()), "names");
-    let params = get_params(&Mode::File, Some(db_path.display().to_string()), "sqlite").map(
-        |params| {
+    let params =
+        get_params(&Mode::File, Some(db_path.display().to_string()), "sqlite").map(|params| {
             let mut map = params.as_string_map();
             map.insert("file_watcher".to_string(), "enabled".to_string());
             Params::from_string_map(map)
-        },
-    );
+        });
     dataset.acceleration = Some(Acceleration {
         params,
         enabled: true,
@@ -325,6 +322,46 @@ async fn test_file_watcher_large_inplace_rewrite() -> Result<(), anyhow::Error> 
                 std::fs::write(&csv_path, csv_with_rows(n)).expect("rewrite file");
                 wait_for_row_count(&rt, n).await?;
             }
+
+            drop(rt);
+            Ok(())
+        })
+        .await
+}
+
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_file_watcher_symlink_to_another_directory() -> Result<(), anyhow::Error> {
+    let _tracing = init_tracing(Some("integration=debug,info"));
+    test_request_context()
+        .scope(async {
+            let dir = tempfile::tempdir().expect("tempdir");
+            let other = dir.path().join("other");
+            std::fs::create_dir(&other).expect("create other dir");
+            let real = other.join("actual.csv");
+            std::fs::write(&real, NAMES_CSV).expect("write target");
+            let csv_path = dir.path().join("names.csv");
+            std::os::unix::fs::symlink(&real, &csv_path).expect("symlink dataset path");
+            let db_path = dir.path().join("names.db");
+            // `start_watcher_runtime` writes through the symlink onto the target.
+            let rt = start_watcher_runtime(&csv_path, &db_path).await?;
+            wait_for_row_count(&rt, 10).await?;
+
+            std::fs::OpenOptions::new()
+                .append(true)
+                .open(&csv_path)
+                .expect("open symlink")
+                .write_all(b"11,name11,20,City,1\n")
+                .expect("append via symlink");
+            wait_for_row_count(&rt, 11).await?;
+
+            std::fs::OpenOptions::new()
+                .append(true)
+                .open(&real)
+                .expect("open target")
+                .write_all(b"12,name12,20,City,1\n")
+                .expect("append via target");
+            wait_for_row_count(&rt, 12).await?;
 
             drop(rt);
             Ok(())
