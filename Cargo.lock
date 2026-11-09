@@ -1545,6 +1545,23 @@ dependencies = [
 ]
 
 [[package]]
+name = "aws-identity"
+version = "2.5.0-unstable"
+dependencies = [
+ "async-trait",
+ "aws-config",
+ "aws-credential-types",
+ "aws-sdk-sts",
+ "aws-smithy-runtime-api",
+ "axum",
+ "base64 0.22.1",
+ "secrecy",
+ "token_provider",
+ "tokio",
+ "util",
+]
+
+[[package]]
 name = "aws-kms-signer"
 version = "2.5.0-unstable"
 dependencies = [
@@ -1644,6 +1661,7 @@ dependencies = [
  "async-trait",
  "aws-config",
  "aws-credential-types",
+ "aws-identity",
  "aws-runtime",
  "aws-sdk-s3",
  "aws-smithy-runtime",
@@ -2367,14 +2385,30 @@ dependencies = [
 ]
 
 [[package]]
+name = "azure-credential"
+version = "2.5.0-unstable"
+dependencies = [
+ "async-trait",
+ "azure_core 1.1.0",
+ "azure_identity",
+ "chrono",
+ "secrecy",
+ "snafu",
+ "token_provider",
+ "tokio",
+ "tracing",
+ "util",
+]
+
+[[package]]
 name = "azure-key-vault-signer"
 version = "2.5.0-unstable"
 dependencies = [
  "async-trait",
  "aws-lc-rs",
  "axum",
+ "azure-credential",
  "azure_core 1.1.0",
- "azure_identity",
  "base64 0.22.1",
  "http-body-limit",
  "reqwest 0.13.4",
@@ -6247,7 +6281,6 @@ dependencies = [
  "arrow-schema",
  "arrow_tools",
  "async-trait",
- "aws-config",
  "aws-sdk-credential-bridge",
  "bytes",
  "chrono",
@@ -7840,6 +7873,7 @@ dependencies = [
  "flate2",
  "liteparse",
  "liteparse-pdfium-sys",
+ "memchr",
  "quick-xml 0.38.4",
  "sha2 0.10.9",
  "snafu",
@@ -11833,9 +11867,11 @@ dependencies = [
  "async-trait",
  "aws-config",
  "aws-credential-types",
+ "aws-identity",
  "aws-sdk-bedrockruntime",
  "aws-sdk-credential-bridge",
  "aws-smithy-types",
+ "azure-credential",
  "bytes",
  "cache",
  "chat-api",
@@ -18620,15 +18656,18 @@ dependencies = [
  "futures",
  "notify",
  "opentelemetry 0.32.0",
+ "rcgen",
  "rustls",
  "sha2 0.10.9",
  "snafu",
  "tempfile",
+ "time",
  "tokio",
  "tokio-rustls",
  "tokio-stream",
  "tracing",
  "x509-certificate",
+ "x509-parser 0.18.1",
 ]
 
 [[package]]
