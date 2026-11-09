@@ -19663,12 +19663,19 @@ impl CayenneTableProvider {
     /// (`target_snapshot_id`, `None` for a tombstones-only flush with no data
     /// files). A crash between the two leaves the slot un-advanced, so the
     /// replayed tail re-commits idempotently (per-side max merge).
+    ///
+    /// With `clear_inlined`, the second commit also deletes every inline row and
+    /// inline tombstone of the table in the same transaction: the checkpoint
+    /// whose snapshot holds those rows passes it, because their source position
+    /// was acknowledged when they were written and a crash that left both copies
+    /// would not be repaired by any replay.
     async fn commit_mem_tier_checkpoint_metadata(
         &self,
         snapshot: &crate::provider::mem_tier::MemTier,
         target_snapshot_id: Option<&str>,
         snapshot_sequence: i64,
         corpus_keys: &CheckpointCorpusKeys,
+        clear_inlined: bool,
     ) -> CatalogResult<OnConflictUpdate> {
         let mut pure_delete_files: Vec<crate::metadata::DeleteFile> = Vec::new();
         let mut reinsert_delete_files: Vec<crate::metadata::DeleteFile> = Vec::new();
@@ -19798,22 +19805,36 @@ impl CayenneTableProvider {
         if !reinsert_delete_files.is_empty()
             || !insert_pk_bytes.is_empty()
             || snapshot_commit.is_some()
+            || clear_inlined
         {
-            self.catalog
-                .commit_on_conflict_deletions(
-                    reinsert_delete_files,
-                    &self.table_metadata.table_id,
-                    insert_pk_bytes,
-                    snapshot_sequence,
-                    snapshot_commit,
-                )
-                .await
-                .map_err(|err| CatalogError::InvalidOperationNoSource {
-                    message: format!(
-                        "Failed to commit in-memory CDC checkpoint metadata for table {}: {err}",
-                        self.table_metadata.table_name
-                    ),
-                })?;
+            let table_id = &self.table_metadata.table_id;
+            let committed = if clear_inlined {
+                self.catalog
+                    .commit_on_conflict_deletions_and_clear_inlined(
+                        reinsert_delete_files,
+                        table_id,
+                        insert_pk_bytes,
+                        snapshot_sequence,
+                        snapshot_commit,
+                    )
+                    .await
+            } else {
+                self.catalog
+                    .commit_on_conflict_deletions(
+                        reinsert_delete_files,
+                        table_id,
+                        insert_pk_bytes,
+                        snapshot_sequence,
+                        snapshot_commit,
+                    )
+                    .await
+            };
+            committed.map_err(|err| CatalogError::InvalidOperationNoSource {
+                message: format!(
+                    "Failed to commit in-memory CDC checkpoint metadata for table {}: {err}",
+                    self.table_metadata.table_name
+                ),
+            })?;
         }
 
         Ok(OnConflictUpdate::from_deletion_update(deletion_update))
@@ -38432,6 +38453,7 @@ impl CayenneTableProvider {
                         None,
                         sequence_number,
                         &corpus_keys,
+                        false,
                     )
                     .await?;
                 // The deletion-cache publish and the tier clear must be
@@ -38653,6 +38675,23 @@ impl CayenneTableProvider {
             self.record_new_protected_snapshot_files(&new_snapshot_id, sequence_number)
                 .await?;
 
+            // The snapshot holds every row of the inline corpus and of a seal
+            // shadow, both of which the source was acknowledged for when they
+            // were written, so no replay would remove a second copy: the commit
+            // that records the snapshot also clears them. Scans read a published
+            // inline corpus from the catalog, so while one exists the listing
+            // fence is held from that commit until the snapshot is published,
+            // and a scan reads the rows from the corpus or from the snapshot,
+            // never from neither. A seal shadow alone is read by no scan.
+            let clear_inlined = !inlined_view.is_empty()
+                || self
+                    .mem_tier_shadow_present
+                    .load(std::sync::atomic::Ordering::Acquire);
+            let fence_from_commit = if inlined_view.is_empty() {
+                None
+            } else {
+                Some(self.listing_fence.write().await)
+            };
             let OnConflictUpdate {
                 deletion_update,
                 inlined_tombstone_written,
@@ -38662,6 +38701,7 @@ impl CayenneTableProvider {
                     Some(&new_snapshot_id),
                     sequence_number,
                     &corpus_keys,
+                    clear_inlined,
                 )
                 .await?;
             // Folding every key the corpus supersedes into the deletion index is
@@ -38702,7 +38742,10 @@ impl CayenneTableProvider {
             // clear, and any un-swapped shard replays from the (already-durable)
             // union file on restart.
             {
-                let _fence = self.listing_fence.write().await;
+                let _fence = match fence_from_commit {
+                    Some(fence) => fence,
+                    None => self.listing_fence.write().await,
+                };
                 self.commit_on_conflict_publish_prepared(
                     inlined_tombstone_written,
                     prepared_deletion,
@@ -39103,7 +39146,13 @@ impl CayenneTableProvider {
                 )
             };
             let _unpublished = self
-                .commit_mem_tier_checkpoint_metadata(&union_view, None, seal_sequence, &corpus_keys)
+                .commit_mem_tier_checkpoint_metadata(
+                    &union_view,
+                    None,
+                    seal_sequence,
+                    &corpus_keys,
+                    false,
+                )
                 .await
                 .map_err(|source| Error::Catalog { source })?;
         }
@@ -55103,6 +55152,124 @@ mod tests {
             vec![1, 2, 3, 4, 5],
             "no double count after restart — the bake deleted the durable shadow"
         );
+    }
+
+    /// Installs a hook that, at the point a mem-tier checkpoint has committed its
+    /// snapshot and not yet published it, opens the table again from the catalog
+    /// (what a process killed at that point restarts into) and records what it
+    /// scans.
+    fn reopen_at_checkpoint_commit(
+        provider: &CayenneTableProvider,
+        catalog: &Arc<dyn MetadataCatalog>,
+        runtime_env: &Arc<RuntimeEnv>,
+        table_name: &'static str,
+    ) -> Arc<ParkingMutex<Option<Vec<i64>>>> {
+        let seen: Arc<ParkingMutex<Option<Vec<i64>>>> = Arc::default();
+        let catalog = Arc::clone(catalog);
+        let runtime_env = Arc::clone(runtime_env);
+        let seen_in_hook = Arc::clone(&seen);
+        *provider.test_pre_checkpoint_deletion_publish_hook.lock() = Some(Box::new(move || {
+            Box::pin(async move {
+                let restarted = CayenneTableProviderBuilder::new(catalog, runtime_env)
+                    .open(table_name)
+                    .await
+                    .expect("open the table as a restart at the checkpoint's commit would");
+                *seen_in_hook.lock() = Some(scan_sorted_ids(&restarted).await);
+            })
+        }));
+        seen
+    }
+
+    /// A seal acknowledges the source for the rows it shadows, so after it no
+    /// replay can repair them. A checkpoint that re-flushes those rows from RAM
+    /// must therefore drop the shadow in the same commit that records its
+    /// snapshot: a process killed between the two would otherwise restart with
+    /// every sealed row twice, once in the shadow and once in the snapshot.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_kill_after_a_checkpoint_commit_keeps_sealed_rows_once() {
+        const TABLE: &str = "seal_ckpt_kill";
+        let runtime_env = SessionContext::new().runtime_env();
+        let (provider, catalog, _tmp) =
+            create_memory_mode_upsert_table(TABLE, Arc::clone(&runtime_env)).await;
+        let durable = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        provider.install_slot_advancer(Arc::new(EpochRecorder(Arc::clone(&durable))));
+
+        let no_deletions = OnConflictDeletions::default();
+        let b1 = int64_id_batch(&[1, 2, 3]);
+        let bytes1 = b1.get_array_memory_size() as u64;
+        provider
+            .append_to_mem_tier(vec![b1], &no_deletions, bytes1, 0)
+            .await
+            .expect("append 1");
+        assert_eq!(provider.seal_mem_tier_durable().await.expect("seal"), 3);
+        let b2 = int64_id_batch(&[4, 5]);
+        let bytes2 = b2.get_array_memory_size() as u64;
+        provider
+            .append_to_mem_tier(vec![b2], &no_deletions, bytes2, 0)
+            .await
+            .expect("append 2");
+
+        let seen = reopen_at_checkpoint_commit(&provider, &catalog, &runtime_env, TABLE);
+        provider.checkpoint_mem_tier().await.expect("checkpoint");
+        assert_eq!(
+            seen.lock().take(),
+            Some(vec![1, 2, 3, 4, 5]),
+            "a restart after the checkpoint's commit reads each sealed row once"
+        );
+        assert_eq!(scan_sorted_ids(&provider).await, vec![1, 2, 3, 4, 5]);
+    }
+
+    /// After a restart the seal shadow is the table's inline corpus, which scans
+    /// read, and the first checkpoint folds it into its snapshot. That checkpoint
+    /// must drop the corpus in the commit that records its snapshot, as above,
+    /// and scans of the running process must read each row once throughout.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_kill_after_a_checkpoint_commit_keeps_a_recovered_shadow_once() {
+        const TABLE: &str = "seal_ckpt_kill_recovered";
+        let runtime_env = SessionContext::new().runtime_env();
+        let (provider, catalog, _tmp) =
+            create_memory_mode_upsert_table(TABLE, Arc::clone(&runtime_env)).await;
+        provider.install_slot_advancer(Arc::new(EpochRecorder(Arc::new(
+            std::sync::atomic::AtomicU64::new(0),
+        ))));
+        let no_deletions = OnConflictDeletions::default();
+        let b1 = int64_id_batch(&[1, 2, 3]);
+        let bytes1 = b1.get_array_memory_size() as u64;
+        provider
+            .append_to_mem_tier(vec![b1], &no_deletions, bytes1, 0)
+            .await
+            .expect("append 1");
+        assert_eq!(provider.seal_mem_tier_durable().await.expect("seal"), 3);
+        drop(provider);
+
+        let provider =
+            CayenneTableProviderBuilder::new(Arc::clone(&catalog), Arc::clone(&runtime_env))
+                .open(TABLE)
+                .await
+                .expect("restart after the seal");
+        provider.install_slot_advancer(Arc::new(EpochRecorder(Arc::new(
+            std::sync::atomic::AtomicU64::new(0),
+        ))));
+        assert_eq!(
+            scan_sorted_ids(&provider).await,
+            vec![1, 2, 3],
+            "precondition: the restart recovered the sealed rows"
+        );
+        let b2 = int64_id_batch(&[4, 5]);
+        let bytes2 = b2.get_array_memory_size() as u64;
+        provider
+            .append_to_mem_tier(vec![b2], &no_deletions, bytes2, 0)
+            .await
+            .expect("append 2");
+
+        let seen = reopen_at_checkpoint_commit(&provider, &catalog, &runtime_env, TABLE);
+        provider.checkpoint_mem_tier().await.expect("checkpoint");
+        assert_eq!(
+            seen.lock().take(),
+            Some(vec![1, 2, 3, 4, 5]),
+            "a restart after the checkpoint's commit reads each recovered row once"
+        );
+        assert_eq!(scan_sorted_ids(&provider).await, vec![1, 2, 3, 4, 5]);
     }
 
     /// NO LOSS: once a seal has advanced the slot, the sealed rows MUST survive a
