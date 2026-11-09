@@ -57,8 +57,10 @@ const CATALOG: &str = "state/cayenne/v1/catalog";
 #[derive(Debug)]
 struct CountingStore {
     inner: InMemory,
-    watched: parking_lot::RwLock<String>,
+    watched: parking_lot::RwLock<Vec<String>>,
     lists: AtomicUsize,
+    /// The prefix of every counted LIST, in order.
+    listed: parking_lot::Mutex<Vec<String>>,
     /// Requests of any kind under this prefix are counted in `forbidden_hits`.
     forbidden: parking_lot::RwLock<String>,
     forbidden_hits: AtomicUsize,
@@ -68,8 +70,9 @@ impl CountingStore {
     fn new() -> Self {
         Self {
             inner: InMemory::new(),
-            watched: parking_lot::RwLock::new(String::new()),
+            watched: parking_lot::RwLock::new(Vec::new()),
             lists: AtomicUsize::new(0),
+            listed: parking_lot::Mutex::new(Vec::new()),
             forbidden: parking_lot::RwLock::new(String::new()),
             forbidden_hits: AtomicUsize::new(0),
         }
@@ -98,22 +101,36 @@ impl CountingStore {
         }
     }
 
+    /// Count LIST requests under `prefix` (or above it) from now on, and only those.
     fn watch(&self, prefix: &str) {
-        *self.watched.write() = prefix.to_string();
+        *self.watched.write() = vec![prefix.to_string()];
         self.lists.store(0, Ordering::SeqCst);
+        self.listed.lock().clear();
+    }
+
+    /// Also count LIST requests under `prefix`, keeping the counts so far.
+    fn watch_also(&self, prefix: &str) {
+        self.watched.write().push(prefix.to_string());
     }
 
     fn lists(&self) -> usize {
         self.lists.load(Ordering::SeqCst)
     }
 
+    /// The prefixes of the LIST requests counted since the last [`Self::watch`].
+    fn listed(&self) -> Vec<String> {
+        self.listed.lock().clone()
+    }
+
     fn note_list(&self, prefix: Option<&Path>) {
         let watched = self.watched.read();
         let prefix = prefix.map_or("", Path::as_ref);
-        if !watched.is_empty()
-            && (prefix.starts_with(watched.as_str()) || watched.starts_with(prefix))
-        {
+        if watched.iter().any(|watched| {
+            !watched.is_empty()
+                && (prefix.starts_with(watched.as_str()) || watched.starts_with(prefix))
+        }) {
             self.lists.fetch_add(1, Ordering::SeqCst);
+            self.listed.lock().push(prefix.to_string());
         }
     }
 }
@@ -273,6 +290,19 @@ async fn create(
     Arc<CayenneTableProvider>,
     SessionContext,
 ) {
+    create_with_config(name, vortex_config()).await
+}
+
+/// [`create`] with its table settings.
+async fn create_with_config(
+    name: &str,
+    vortex_config: VortexConfig,
+) -> (
+    Setup,
+    Arc<dyn MetadataCatalog>,
+    Arc<CayenneTableProvider>,
+    SessionContext,
+) {
     let counting = Arc::new(CountingStore::new());
     let faults = Arc::new(FaultStore::new(
         Arc::clone(&counting) as Arc<dyn ObjectStore>
@@ -299,7 +329,7 @@ async fn create(
                 on_conflict: None,
                 base_path: setup.data_url.clone(),
                 partition_column: None,
-                vortex_config: vortex_config(),
+                vortex_config,
             })
             .await
             .expect("create the table"),
@@ -381,10 +411,6 @@ async fn add_dataset(
     name: &str,
     primary_key: &[&str],
 ) -> (String, String, Arc<CayenneTableProvider>, SessionContext) {
-    let datasets = catalog_datasets_prefix(&setup.data_prefix);
-    let data_prefix = format!("{datasets}/{}/data", new_dataset_folder(name));
-    let data_url = format!("s3://bucket/{data_prefix}");
-    let ctx = SessionContext::new();
     let config = if primary_key.is_empty() {
         vortex_config()
     } else {
@@ -397,6 +423,21 @@ async fn add_dataset(
             ..vortex_config()
         }
     };
+    add_dataset_with_config(setup, catalog, name, primary_key, config).await
+}
+
+/// [`add_dataset`] with its table settings.
+async fn add_dataset_with_config(
+    setup: &Setup,
+    catalog: &Arc<dyn MetadataCatalog>,
+    name: &str,
+    primary_key: &[&str],
+    config: VortexConfig,
+) -> (String, String, Arc<CayenneTableProvider>, SessionContext) {
+    let datasets = catalog_datasets_prefix(&setup.data_prefix);
+    let data_prefix = format!("{datasets}/{}/data", new_dataset_folder(name));
+    let data_url = format!("s3://bucket/{data_prefix}");
+    let ctx = SessionContext::new();
     let keys: Vec<String> = primary_key.iter().map(ToString::to_string).collect();
     let table = Arc::new(
         CayenneTableProviderBuilder::new(Arc::clone(catalog), ctx.runtime_env())
@@ -2691,5 +2732,311 @@ async fn retiring_a_snapshot_with_no_committed_files_lists_nothing() {
         ),
         (1, 0, 0, (2500, expected_sum(1, 2500))),
         "the replaced snapshot is retired, then forgotten without a listing"
+    );
+}
+
+/// The directories of `name`'s current and protected snapshots under its data
+/// prefix `data_prefix`, sorted.
+async fn live_snapshot_dirs(
+    catalog: &Arc<dyn MetadataCatalog>,
+    name: &str,
+    data_prefix: &str,
+) -> Vec<String> {
+    let stored = catalog.get_table(name).await.expect("stored table");
+    let mut dirs: Vec<String> = catalog
+        .get_all_snapshot_sequences(&stored.table_id)
+        .await
+        .expect("protected snapshots")
+        .into_keys()
+        .chain(std::iter::once(stored.current_snapshot_id))
+        .map(|id| format!("{data_prefix}/{}/{id}", stored.table_id))
+        .collect();
+    dirs.sort();
+    dirs.dedup();
+    dirs
+}
+
+/// Wait until neither table has maintenance scheduled or running.
+async fn settle(tables: &[&Arc<CayenneTableProvider>]) {
+    for table in tables {
+        table.drain_in_flight_maintenance().await.expect("drain");
+    }
+}
+
+/// The LIST requests on the watched prefixes since the last call, as
+/// `(phase, count, prefixes)`, and the counter reset.
+fn lists_of(setup: &Setup, watched: &[&str], phase: &str) -> (String, usize, Vec<String>) {
+    let mut listed = setup.counting.listed();
+    listed.sort();
+    let seen = (phase.to_string(), setup.counting.lists(), listed);
+    setup.counting.watch(watched[0]);
+    for prefix in &watched[1..] {
+        setup.counting.watch_also(prefix);
+    }
+    seen
+}
+
+/// The writes and the maintenance of a dataset whose data is in the location
+/// list nothing: its committed state names every file it keeps and every
+/// snapshot it retired, so the cleanup that follows a commit deletes by name.
+/// Covers appends, a full refresh, compaction, a `DELETE`, change-stream upserts
+/// and deletes, memory-tier checkpoints and the follow-up passes after the
+/// cleanup grace. The listings left are a filtered `DELETE`'s scan of each live
+/// snapshot's directory, asserted exactly so removing them updates this test.
+/// The orphan sweep, the only listing such a dataset's maintenance makes, never
+/// runs in its first interval after the table opened, so every LIST counted here
+/// comes from somewhere else.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn writes_and_maintenance_of_a_placed_dataset_list_nothing() {
+    // Longer than the snapshot cleanup grace (5 s), so a pass a commit deferred
+    // for a young or recently listed snapshot comes back inside the test.
+    const PAST_THE_GRACE: Duration = Duration::from_secs(7);
+    let (setup, catalog, events, ctx) = create_with_config(
+        "events",
+        // The small-files compaction suite's settings: every write is a small
+        // file, and three of them qualify the small tier.
+        VortexConfig {
+            compaction_trigger_files: 3,
+            target_vortex_file_size_mb: 1,
+            compaction_max_levels: 3,
+            compaction_max_files_per_pick: 3,
+            compaction_background_interval_ms: 0,
+            ..vortex_config()
+        },
+    )
+    .await;
+    let cdc = VortexConfig {
+        compaction_trigger_files: 2,
+        compaction_trigger_protected_snapshots: 2,
+        ..cdc_config(CdcDurability::Memory)
+    };
+    let events_id = events.metadata().table_id.clone();
+    let (_, changes_prefix, changes, changes_ctx) =
+        add_dataset_with_config(&setup, &catalog, "changes", &["id"], cdc).await;
+    changes.install_slot_advancer(Arc::new(NoopSlotAdvancer));
+    let watched = [setup.data_prefix.as_str(), changes_prefix.as_str()];
+    let tables = [&events, &changes];
+    let mut phases = Vec::new();
+    lists_of(&setup, &watched, "start");
+
+    // Appends, each committed and followed by its post-write maintenance.
+    for first in (1..=5000).step_by(1000) {
+        run(
+            &ctx,
+            &format!(
+                "INSERT INTO events SELECT value AS id, value * 10 AS v FROM generate_series({first}, {})",
+                first + 999
+            ),
+        )
+        .await;
+        // A restore point taken after the commit, as a dataset with snapshots
+        // takes one after each refresh: releasing it runs the cleanup.
+        drop(events.hold_file_deletions().await);
+        settle(&tables).await;
+    }
+    phases.push(lists_of(&setup, &watched, "appends"));
+
+    // A full refresh retires the snapshot the appends went into.
+    run(
+        &ctx,
+        "INSERT OVERWRITE events SELECT value AS id, value * 10 AS v FROM generate_series(1, 3000)",
+    )
+    .await;
+    settle(&tables).await;
+    let retired_after_refresh = catalog
+        .retired_snapshots(&events_id)
+        .await
+        .expect("read the retirement record")
+        .unwrap_or_default()
+        .len();
+    phases.push(lists_of(&setup, &watched, "full refresh"));
+
+    // More appends into the current snapshot, then compaction of its small files
+    // (inline after a write, or the pass below), which rewrites it under a new id.
+    let current = || async {
+        catalog
+            .get_table("events")
+            .await
+            .expect("stored table")
+            .current_snapshot_id
+    };
+    let before_compaction = current().await;
+    for first in (3001..=6000).step_by(1000) {
+        run(
+            &ctx,
+            &format!(
+                "INSERT INTO events SELECT value AS id, value * 10 AS v FROM generate_series({first}, {})",
+                first + 999
+            ),
+        )
+        .await;
+    }
+    settle(&tables).await;
+    for _ in 0..40 {
+        if current().await != before_compaction
+            || events
+                .compact_current_snapshot_small_files()
+                .await
+                .expect("compact")
+        {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    settle(&tables).await;
+    let compacted = current().await != before_compaction;
+    phases.push(lists_of(&setup, &watched, "compaction"));
+
+    // A position delete writes a deletion vector. Its scan finds the rows to
+    // delete through a listing of each live snapshot's directory (here only the
+    // current one): the LIST a filtered `DELETE` still makes. The maintenance
+    // after it lists nothing.
+    let deleted_in = live_snapshot_dirs(&catalog, "events", &setup.data_prefix).await;
+    run(&ctx, "DELETE FROM events WHERE id >= 1001 AND id <= 1500").await;
+    settle(&tables).await;
+    phases.push(lists_of(&setup, &watched, "delete"));
+
+    // A keyed change stream: a load, upserts and deletes into the memory tier,
+    // checkpoints that publish protected snapshots and deletion vectors, and a
+    // merge of those snapshots.
+    let mut model: std::collections::BTreeMap<i64, i64> =
+        (1..=2000).map(|id| (id, id * 10)).collect();
+    let seed: Vec<(i64, i64)> = model.iter().map(|(id, v)| (*id, *v)).collect();
+    let input = datafusion::datasource::memory::MemorySourceConfig::try_new_exec(
+        &[vec![rows_batch(&seed)]],
+        schema(),
+        None,
+    )
+    .expect("seed input");
+    let plan = changes
+        .insert_into(
+            &changes_ctx.state(),
+            input,
+            datafusion::logical_expr::dml::InsertOp::Overwrite,
+        )
+        .await
+        .expect("plan the load");
+    datafusion::physical_plan::collect(plan, changes_ctx.task_ctx())
+        .await
+        .expect("load");
+    settle(&tables).await;
+    for round in 0..4_i64 {
+        let updates: Vec<(i64, i64)> = (1..=2000)
+            .filter(|id| id % 5 == round)
+            .map(|id| (id, id * 10 + round + 1))
+            .collect();
+        cdc_upsert(&changes, &updates).await;
+        model.extend(updates);
+        let deletes: Vec<i64> = (1..=2000).filter(|id| id % 97 == round).collect();
+        cdc_delete(&changes, &deletes).await;
+        for id in &deletes {
+            model.remove(id);
+        }
+        changes.checkpoint_mem_tier().await.expect("checkpoint");
+        settle(&tables).await;
+    }
+    let merged = changes
+        .compact_protected_snapshots_subset(usize::MAX)
+        .await
+        .expect("merge protected snapshots");
+    settle(&tables).await;
+    phases.push(lists_of(&setup, &watched, "change stream"));
+
+    // A SQL `DELETE` on the keyed table by a filter that is not a key list scans
+    // its current and protected snapshots the same way, one listing each.
+    let keyed_deleted_in = live_snapshot_dirs(&catalog, "changes", &changes_prefix).await;
+    run(
+        &changes_ctx,
+        "DELETE FROM changes WHERE id >= 100 AND id <= 110",
+    )
+    .await;
+    model.retain(|id, _| !(100..=110).contains(id));
+    settle(&tables).await;
+    phases.push(lists_of(&setup, &watched, "keyed delete"));
+
+    // The passes a commit defers for a young snapshot come back after the grace.
+    tokio::time::sleep(PAST_THE_GRACE).await;
+    settle(&tables).await;
+    phases.push(lists_of(&setup, &watched, "after the grace"));
+
+    // The retired snapshots' files are deleted by name, and the record forgets them.
+    for table in tables {
+        table.reclaim_retired_snapshots_now().await;
+    }
+    settle(&tables).await;
+    phases.push(lists_of(&setup, &watched, "retired sweep"));
+
+    let events_expected: Vec<i64> = (1..=6000)
+        .filter(|id| !(1001..=1500).contains(id))
+        .collect();
+    let events_rows = count_and_sum(&ctx, "events").await;
+    let changes_rows = sorted_rows(&changes_ctx, "changes").await;
+    let retired_at_end = catalog
+        .retired_snapshots(&events_id)
+        .await
+        .expect("read the retirement record")
+        .unwrap_or_default()
+        .len();
+    let named: std::collections::HashSet<String> = catalog
+        .get_all_snapshot_files(&events_id)
+        .await
+        .expect("manifest")
+        .into_iter()
+        .map(|file| {
+            format!(
+                "{}/{events_id}/{}/{}",
+                setup.data_prefix, file.snapshot_id, file.file_path
+            )
+        })
+        .collect();
+    let unnamed: Vec<String> = objects_under(&setup, &setup.data_prefix, ".vortex")
+        .await
+        .into_iter()
+        .filter(|key| !named.contains(key))
+        .collect();
+
+    let expected_lists: Vec<(String, usize, Vec<String>)> = phases
+        .iter()
+        .map(|(phase, _, _)| {
+            if phase == "delete" {
+                (phase.clone(), deleted_in.len(), deleted_in.clone())
+            } else if phase == "keyed delete" {
+                (
+                    phase.clone(),
+                    keyed_deleted_in.len(),
+                    keyed_deleted_in.clone(),
+                )
+            } else {
+                (phase.clone(), 0, Vec::new())
+            }
+        })
+        .collect();
+    assert_eq!(
+        phases, expected_lists,
+        "LIST requests on the data prefixes, by phase"
+    );
+    assert_eq!(
+        (
+            events_rows,
+            changes_rows,
+            retired_after_refresh > 0,
+            compacted,
+            merged,
+            retired_at_end,
+            unnamed,
+        ),
+        (
+            (
+                i64::try_from(events_expected.len()).expect("small"),
+                events_expected.iter().map(|id| id * 10).sum::<i64>()
+            ),
+            model.into_iter().collect::<Vec<_>>(),
+            true,
+            true,
+            true,
+            0,
+            Vec::<String>::new(),
+        ),
+        "rows, a retired snapshot after the refresh, compaction and merge committed, every retired snapshot forgotten, no data file left that the manifest does not name"
     );
 }
