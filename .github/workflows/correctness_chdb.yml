@@ -44,7 +44,9 @@ jobs:
 
       - name: Loop the reclaim tests under contention
         run: |
-          set -uo pipefail
+          # The step shell runs with -e; a failing iteration or an empty log
+          # directory must not end the loop before the summary prints.
+          set +e -uo pipefail
           cpus=$(nproc)
           echo "cpus=${cpus} sha=$(git rev-parse HEAD)"
           mkdir -p logs
@@ -70,7 +72,7 @@ jobs:
               res=$(seq 300 | xargs -P "$par" -I{} bash -c 'run_one "$0" "$1"' "$t" {} | sort | uniq -c | tr '\n' ' ')
               echo "RESULT test=${t##*::} parallel=${par} iterations=300 -> ${res}"
             done
-            f=$(ls logs/"${t##*::}".*.log 2>/dev/null | wc -l)
+            f=$(find logs -name "${t##*::}.*.log" | wc -l)
             total_fail=$((total_fail + f))
           done
           pkill yes || true
