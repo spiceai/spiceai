@@ -25,7 +25,6 @@ limitations under the License.
 use std::sync::Arc;
 
 use app::App;
-use app::spicepod::component::runtime::RuntimeMode;
 use arrow_schema::SchemaRef;
 use async_trait::async_trait;
 use data_http_rate_control::HttpRateControlRegistry;
@@ -35,7 +34,7 @@ use runtime_checkpoint_api::{
     BlobCheckpointStore, CheckpointError, debezium::DebeziumCheckpointStore,
     kafka::KafkaCheckpointStore, mongodb::MongoCheckpointStore, mysql_binlog::MySqlBinlogStore,
 };
-use runtime_component::dataset::DatasetSpec;
+use runtime_component::{Role, dataset::DatasetSpec};
 use runtime_parameters::Parameters;
 use token_provider::registry::TokenProviderRegistry;
 use tokio::runtime::Handle;
@@ -80,9 +79,8 @@ pub trait ConnectorContext: Send + Sync {
     /// (e.g. `runtime.params`, `runtime.flight`).
     fn app(&self) -> Arc<App>;
 
-    /// The deployment profile the runtime started with. A reload cannot change
-    /// it, so it can differ from the loaded app's `runtime.mode`.
-    fn runtime_mode(&self) -> RuntimeMode;
+    /// The `--role` the runtime started with. A Spicepod reload cannot change it.
+    fn role(&self) -> Role;
 
     /// The process-wide per-origin HTTP rate-control registry, so connectors
     /// sharing an origin share one limiter.
