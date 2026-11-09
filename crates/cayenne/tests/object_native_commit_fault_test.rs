@@ -430,6 +430,45 @@ mod data_path {
         data_url: Option<String>,
         keyed: bool,
     ) -> Placed {
+        place_with_config(
+            store,
+            catalog,
+            name,
+            create,
+            data_url,
+            keyed,
+            VortexConfig {
+                inline_max_rows: 0,
+                inline_max_bytes: 0,
+                ..VortexConfig::default()
+            },
+        )
+        .await
+    }
+
+    /// Small files and a pick of 3, so an explicit compaction pass runs.
+    fn compactable() -> VortexConfig {
+        VortexConfig {
+            inline_max_rows: 0,
+            inline_max_bytes: 0,
+            compaction_trigger_files: 3,
+            target_vortex_file_size_mb: 1,
+            compaction_max_levels: 3,
+            compaction_max_files_per_pick: 3,
+            compaction_background_interval_ms: 0,
+            ..VortexConfig::default()
+        }
+    }
+
+    async fn place_with_config(
+        store: &Arc<dyn ObjectStore>,
+        catalog: &Arc<dyn MetadataCatalog>,
+        name: &str,
+        create: bool,
+        data_url: Option<String>,
+        keyed: bool,
+        vortex_config: VortexConfig,
+    ) -> Placed {
         let data_url = data_url.unwrap_or_else(|| {
             format!(
                 "s3://bucket/state/cayenne/v1/datasets/{}/data",
@@ -457,11 +496,7 @@ mod data_path {
                     }),
                     base_path: data_url.clone(),
                     partition_column: None,
-                    vortex_config: VortexConfig {
-                        inline_max_rows: 0,
-                        inline_max_bytes: 0,
-                        ..VortexConfig::default()
-                    },
+                    vortex_config,
                 })
                 .await
                 .expect("create the table")
@@ -653,7 +688,7 @@ mod data_path {
         let failed = failed.to_string();
         assert!(
             failed.contains(
-                "Dataset 'orders' (cayenne) could not confirm whether its last change was saved, so it accepts no change, and acknowledges none to its source, until it has read its state back"
+                "The outcome of this change to dataset 'orders' (cayenne) is unknown: Spice could not confirm whether it was saved"
             ) || failed.contains(
                 "Dataset 'orders' (cayenne) is reading its state back after a change whose outcome is unknown, so it accepts no change until that finishes; retry shortly."
             ),
@@ -674,10 +709,14 @@ mod data_path {
             insert(&placed.ctx, "orders", 3001, 3100).await.is_ok()
         })
         .await;
-        assert_eq!(
-            count(&placed.ctx, "orders").await.expect("count"),
-            3100,
-            "the commit that landed with its response lost is there, whole, after the resume"
+        // The write was not acknowledged: after the resume its rows are all
+        // there (its commit landed) or none are (it did not), never part, and
+        // a staged write that never committed is not rolled forward.
+        let resumed = keyed_totals(&placed.ctx, "orders").await;
+        assert!(
+            resumed == vec![3100, 3100, sum_v(1, 3100, 0)]
+                || resumed == vec![1100, 1100, sum_v(1, 1000, 0) + sum_v(3001, 3100, 0)],
+            "the write whose outcome was unknown is whole or absent after the resume: {resumed:?}"
         );
 
         // A restart from the store alone sees the same rows.
@@ -685,7 +724,8 @@ mod data_path {
         drop((placed, shared, catalog_handle));
         let reopened: Arc<dyn MetadataCatalog> = Arc::new(catalog(&store).await);
         let placed = place(&store, &reopened, "orders", false, Some(data_url)).await;
-        assert_eq!(count(&placed.ctx, "orders").await.expect("count"), 3100);
+        assert_eq!(keyed_totals(&placed.ctx, "orders").await, resumed);
+        eprintln!("RESULT unknown-outcome append after the resume: {resumed:?}");
     }
 
     /// A change the dataset's state refuses (a bug in the catalog's own checks)
@@ -752,5 +792,349 @@ mod data_path {
             .await
             .expect("the new writer writes");
         assert_eq!(count(&successor.ctx, "orders").await.expect("count"), 1500);
+    }
+
+    /// Arms the dataset's head so the next commit lands with its response lost
+    /// and every read of the head fails, leaving the outcome unknown.
+    fn lose_the_next_commit_response(faults: &FaultStore, head: &Path) {
+        let cas_head = head.clone();
+        faults.arm(Op::Cas, move |path: &Path| path == &cas_head, Fault::DropResponse);
+        let get_head = head.clone();
+        faults.fail_while(Op::Get, move |path: &Path| path == &get_head);
+    }
+
+    /// Whether the catalog refuses to read `name` because the dataset is reading
+    /// its state back after a commit whose outcome is unknown. Asked of the
+    /// catalog, not through the table, whose write in flight holds its scans.
+    async fn reading_back(catalog: &dyn MetadataCatalog, name: &str) -> bool {
+        catalog
+            .get_table(name)
+            .await
+            .is_err_and(|error| error.to_string().contains("is reading its state back"))
+    }
+
+    async fn scalars(ctx: &SessionContext, sql: &str) -> datafusion::error::Result<Vec<i64>> {
+        let batches = ctx.sql(sql).await?.collect().await?;
+        let batch = &batches[0];
+        Ok((0..batch.num_columns())
+            .map(|column| {
+                batch
+                    .column(column)
+                    .as_any()
+                    .downcast_ref::<Int64Array>()
+                    .expect("an Int64 column")
+                    .value(0)
+            })
+            .collect())
+    }
+
+    async fn upsert(ctx: &SessionContext, name: &str, first: i64, last: i64, offset: i64) -> datafusion::error::Result<()> {
+        ctx.sql(&format!(
+            "INSERT INTO {name} SELECT value AS id, value * 10 + {offset} AS v FROM generate_series({first}, {last})"
+        ))
+        .await?
+        .collect()
+        .await
+        .map(|_| ())
+    }
+
+    /// `SELECT count(*), count(DISTINCT id), sum(v)` once the dataset reads.
+    async fn keyed_totals(ctx: &SessionContext, name: &str) -> Vec<i64> {
+        let sql = format!("SELECT count(*), count(DISTINCT id), sum(v) FROM {name}");
+        let mut last = None;
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+        while std::time::Instant::now() < deadline {
+            match scalars(ctx, &sql).await {
+                Ok(values) => return values,
+                Err(error) => last = Some(error.to_string()),
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        panic!("the dataset reads within 15 s: {last:?}");
+    }
+
+    fn sum_v(first: i64, last: i64, offset: i64) -> i64 {
+        (first..=last).map(|id| id * 10 + offset).sum()
+    }
+
+    /// The writer whose commit response is lost is told the outcome is unknown
+    /// and to check before retrying, not that the change failed.
+    #[tokio::test]
+    async fn a_write_whose_commit_outcome_is_unknown_says_so() {
+        let faults = Arc::new(FaultStore::new(Arc::new(InMemory::new())));
+        let store: Arc<dyn ObjectStore> = Arc::clone(&faults) as Arc<dyn ObjectStore>;
+        let native = Arc::new(catalog(&store).await);
+        let shared: Arc<dyn MetadataCatalog> = Arc::clone(&native) as Arc<dyn MetadataCatalog>;
+        let placed = place(&store, &shared, "orders", true, None).await;
+        insert(&placed.ctx, "orders", 1, 100).await.expect("first write");
+        lose_the_next_commit_response(&faults, &dataset_head(&native, "orders"));
+        let failed = insert(&placed.ctx, "orders", 101, 200)
+            .await
+            .expect_err("the write is not acknowledged")
+            .to_string();
+        assert!(
+            failed.contains(
+                "The outcome of this change to dataset 'orders' (cayenne) is unknown: Spice could not confirm whether it was saved, so check whether its rows are visible before retrying it. The dataset accepts no change until it has read its state back, which it retries in the background."
+            ),
+            "unexpected error: {failed}"
+        );
+        faults.clear_rules();
+    }
+
+    /// A refresh that appends after the largest `id` it holds: an append whose
+    /// commit landed with its response lost is not appended again after the
+    /// resume, because the cursor is read back from the committed rows.
+    #[tokio::test]
+    async fn a_refresh_append_whose_commit_response_is_lost_does_not_duplicate_rows_after_the_resume() {
+        let faults = Arc::new(FaultStore::new(Arc::new(InMemory::new())));
+        let store: Arc<dyn ObjectStore> = Arc::clone(&faults) as Arc<dyn ObjectStore>;
+        let native = Arc::new(catalog(&store).await);
+        let shared: Arc<dyn MetadataCatalog> = Arc::clone(&native) as Arc<dyn MetadataCatalog>;
+        let placed = place(&store, &shared, "events", true, None).await;
+        insert(&placed.ctx, "events", 1, 1000).await.expect("first refresh");
+        lose_the_next_commit_response(&faults, &dataset_head(&native, "events"));
+        insert(&placed.ctx, "events", 1001, 2000)
+            .await
+            .expect_err("the second refresh is not acknowledged");
+        faults.clear_rules();
+        // The next refresh: its cursor is the committed state's largest id.
+        let cursor = keyed_totals_max(&placed.ctx, "events").await;
+        assert_eq!(cursor, 2000, "the append whose response was lost committed");
+        eventually("the refresh appends after the cursor", || async {
+            insert(&placed.ctx, "events", cursor + 1, 3000).await.is_ok()
+        })
+        .await;
+        assert_eq!(
+            keyed_totals(&placed.ctx, "events").await,
+            vec![3000, 3000, sum_v(1, 3000, 0)],
+            "every source row once"
+        );
+    }
+
+    async fn keyed_totals_max(ctx: &SessionContext, name: &str) -> i64 {
+        let sql = format!("SELECT max(id) FROM {name}");
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+        loop {
+            if let Ok(values) = scalars(ctx, &sql).await {
+                return values[0];
+            }
+            assert!(std::time::Instant::now() < deadline, "the dataset reads within 15 s");
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+    }
+
+    /// Arms the `nth` commit on `head` from now (1-based) to land with its
+    /// response lost (`landed`) or to fail before it lands, with every read of
+    /// the head failing meanwhile; returns whether it fired.
+    fn lose_the_nth_commit(
+        faults: &FaultStore,
+        head: &Path,
+        nth: usize,
+        landed: bool,
+    ) -> Arc<std::sync::atomic::AtomicBool> {
+        let fired = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let seen = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let cas_head = head.clone();
+        let get_head = head.clone();
+        let fired_flag = Arc::clone(&fired);
+        let fault = if landed { Fault::DropResponse } else { Fault::Fail };
+        faults.arm(
+            Op::Cas,
+            move |path: &Path| {
+                if path != &cas_head {
+                    return false;
+                }
+                let n = seen.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
+                if n == nth {
+                    fired_flag.store(true, std::sync::atomic::Ordering::SeqCst);
+                    true
+                } else {
+                    false
+                }
+            },
+            fault,
+        );
+        let gate = Arc::clone(&fired);
+        faults.fail_while(Op::Get, move |path: &Path| {
+            path == &get_head && gate.load(std::sync::atomic::Ordering::SeqCst)
+        });
+        fired
+    }
+
+    /// A keyed upsert one of whose commits has an unknown outcome (the `nth`
+    /// commit of the write, landed or not): once the dataset reads its state back
+    /// in the background it serves one row per key, with the upsert's values
+    /// for every key or for none, keeps upserting and compacting, and serves
+    /// exactly what a restart from the store serves. Returns whether the fault
+    /// fired.
+    async fn keyed_upsert_after_a_background_reopen(nth: usize, landed: bool) -> bool {
+        let faults = Arc::new(FaultStore::new(Arc::new(InMemory::new())));
+        let store: Arc<dyn ObjectStore> = Arc::clone(&faults) as Arc<dyn ObjectStore>;
+        let native = Arc::new(catalog(&store).await);
+        let shared: Arc<dyn MetadataCatalog> = Arc::clone(&native) as Arc<dyn MetadataCatalog>;
+        let placed = place_with_key(&store, &shared, "accounts", true, None, true).await;
+        upsert(&placed.ctx, "accounts", 1, 100, 0).await.expect("first upsert");
+        let armed = lose_the_nth_commit(&faults, &dataset_head(&native, "accounts"), nth, landed);
+        // The upsert may wait for the dataset to read its state back, which it
+        // can do once the store answers again: restore the store as soon as the
+        // fault has fired, or the upsert has returned without it.
+        let writer = {
+            let ctx = placed.ctx.clone();
+            tokio::spawn(async move { upsert(&ctx, "accounts", 1, 100, 1).await })
+        };
+        let fired = Arc::clone(&armed);
+        eventually("the fault fires or the upsert returns", || async {
+            fired.load(std::sync::atomic::Ordering::SeqCst) || writer.is_finished()
+        })
+        .await;
+        // Keep the store failing until the dataset has given up on the commit
+        // and reads its state back in the background.
+        if fired.load(std::sync::atomic::Ordering::SeqCst) {
+            eventually("the dataset reads its state back", || async {
+                reading_back(native.as_ref(), "accounts").await || writer.is_finished()
+            })
+            .await;
+        }
+        faults.clear_rules();
+        let outcome = writer.await.expect("join the upsert");
+        let fired = armed.load(std::sync::atomic::Ordering::SeqCst);
+        eventually("the dataset accepts upserts again", || async {
+            upsert(&placed.ctx, "accounts", 101, 101, 0).await.is_ok()
+        })
+        .await;
+        let totals = keyed_totals(&placed.ctx, "accounts").await;
+        let (old, new) = (sum_v(1, 100, 0) + 1010, sum_v(1, 100, 1) + 1010);
+        assert!(
+            totals == vec![101, 101, old] || totals == vec![101, 101, new],
+            "nth={nth} landed={landed}: one row per key, all of the upsert or none of it: {totals:?}"
+        );
+        if outcome.is_ok() {
+            assert_eq!(totals, vec![101, 101, new], "nth={nth} landed={landed}: an acknowledged upsert is visible");
+        }
+
+        upsert(&placed.ctx, "accounts", 1, 50, 2).await.expect("an upsert after the resume");
+        let after = keyed_totals(&placed.ctx, "accounts").await;
+        let _ = placed.table.compact_current_snapshot_small_files().await.expect("compaction");
+        placed.table.drain_in_flight_maintenance().await.expect("drain");
+        assert_eq!(keyed_totals(&placed.ctx, "accounts").await, after, "nth={nth} landed={landed}: after compaction");
+        let data_url = placed.data_url.clone();
+        drop((placed, shared, native));
+        let reopened: Arc<dyn MetadataCatalog> = Arc::new(catalog(&store).await);
+        let placed = place(&store, &reopened, "accounts", false, Some(data_url)).await;
+        assert_eq!(
+            keyed_totals(&placed.ctx, "accounts").await,
+            after,
+            "nth={nth} landed={landed}: a restart from the store serves what the resumed instance served"
+        );
+        fired
+    }
+
+    #[tokio::test]
+    async fn a_keyed_upsert_whose_commit_landed_unconfirmed_serves_what_the_store_holds_after_a_background_reopen() {
+        let mut fired = 0;
+        for nth in 1..=4 {
+            fired += usize::from(keyed_upsert_after_a_background_reopen(nth, true).await);
+        }
+        assert!(fired >= 2, "the upsert's commits lost their responses ({fired} fired)");
+    }
+
+    #[tokio::test]
+    async fn a_keyed_upsert_whose_commit_did_not_land_serves_what_the_store_holds_after_a_background_reopen() {
+        let mut fired = 0;
+        for nth in 1..=4 {
+            fired += usize::from(keyed_upsert_after_a_background_reopen(nth, false).await);
+        }
+        assert!(fired >= 2, "the upsert's commits failed unconfirmed ({fired} fired)");
+    }
+
+    /// A whole-table rewrite one of whose commits has an unknown outcome (the
+    /// `nth` of the pass, landed or not): after the background reopen, appends land in
+    /// the snapshot the state points at, every row is there once, and a restart
+    /// from the store serves the same rows.
+    #[tokio::test]
+    async fn appends_after_a_compaction_with_an_unknown_outcome_keep_every_row() {
+        let mut fired = 0;
+        for landed in [true, false] {
+            for nth in 1..=3 {
+                let faults = Arc::new(FaultStore::new(Arc::new(InMemory::new())));
+                let store: Arc<dyn ObjectStore> = Arc::clone(&faults) as Arc<dyn ObjectStore>;
+                let native = Arc::new(catalog(&store).await);
+                let shared: Arc<dyn MetadataCatalog> = Arc::clone(&native) as Arc<dyn MetadataCatalog>;
+                let placed =
+                    place_with_config(&store, &shared, "facts", true, None, false, compactable()).await;
+                for i in 0..5 {
+                    insert(&placed.ctx, "facts", i * 1000 + 1, (i + 1) * 1000).await.expect("append");
+                }
+                placed.table.drain_in_flight_maintenance().await.expect("drain");
+                let armed = lose_the_nth_commit(&faults, &dataset_head(&native, "facts"), nth, landed);
+                // A whole-table rewrite: its commits are the ones that lose.
+                let _ = placed.table.sort_and_rewrite_data(64 * 1024 * 1024).await;
+                fired += usize::from(armed.load(std::sync::atomic::Ordering::SeqCst));
+                faults.clear_rules();
+                eventually("the dataset accepts appends again", || async {
+                    insert(&placed.ctx, "facts", 5001, 6000).await.is_ok()
+                })
+                .await;
+                insert(&placed.ctx, "facts", 6001, 7000).await.expect("another append");
+                placed.table.drain_in_flight_maintenance().await.expect("drain");
+                let expected = vec![7000, 7000, sum_v(1, 7000, 0)];
+                assert_eq!(
+                    keyed_totals(&placed.ctx, "facts").await,
+                    expected,
+                    "nth={nth} landed={landed}: after the resume"
+                );
+                let data_url = placed.data_url.clone();
+                drop((placed, shared, native));
+                let reopened: Arc<dyn MetadataCatalog> = Arc::new(catalog(&store).await);
+                let placed = place(&store, &reopened, "facts", false, Some(data_url)).await;
+                assert_eq!(
+                    keyed_totals(&placed.ctx, "facts").await,
+                    expected,
+                    "nth={nth} landed={landed}: after a restart"
+                );
+            }
+        }
+        assert!(fired >= 2, "the compaction's commits lost their outcome ({fired} fired)");
+    }
+
+    /// A transaction across datasets whose `Resolve` on one dataset fails with
+    /// its outcome unknown: the dataset reopens its log in the background and
+    /// resolves the transaction there from its decision, as an open does, so it
+    /// shows the transaction's rows and accepts upserts again.
+    #[tokio::test]
+    async fn a_transaction_left_prepared_in_a_log_reopened_in_the_background_is_resolved() {
+        let faults = Arc::new(FaultStore::new(Arc::new(InMemory::new())));
+        let store: Arc<dyn ObjectStore> = Arc::clone(&faults) as Arc<dyn ObjectStore>;
+        let (catalog, accounts, ledger) = two_datasets(&store).await;
+        let native = catalog
+            .as_any()
+            .downcast_ref::<ObjectNativeCatalog>()
+            .expect("an object-native catalog");
+        let accounts_head = dataset_head(native, "accounts");
+        faults.arm(Op::Create, is_decision, Fault::Hold);
+        let tables = [Arc::clone(&accounts.table), Arc::clone(&ledger.table)];
+        let coordinator = tokio::spawn(async move { commit_across(&tables, 101, 150).await.map(|_| ()) });
+        let held = faults.wait_held(None).await;
+        // Both are prepared; the decision is about to land. The `Resolve` on
+        // `accounts` then fails before it lands, and its outcome stays unknown.
+        let fired = lose_the_nth_commit(&faults, &accounts_head, 1, false);
+        faults.deliver(held).await.expect("the decision lands");
+        faults.respond(held).expect("the coordinator hears it");
+        eventually("the `Resolve` on accounts fails unconfirmed", || async {
+            fired.load(std::sync::atomic::Ordering::SeqCst)
+        })
+        .await;
+        eventually("accounts reads its state back", || async {
+            reading_back(native, "accounts").await
+        })
+        .await;
+        faults.clear_rules();
+        let _ = coordinator.await.expect("the coordinator finishes");
+        eventually("accounts accepts upserts again", || async {
+            upsert(&accounts.ctx, "accounts", 1000, 1000, 0).await.is_ok()
+        })
+        .await;
+        assert_eq!(count(&accounts.ctx, "accounts").await.expect("count"), 151);
+        assert_eq!(count(&ledger.ctx, "ledger").await.expect("count"), 150);
     }
 }

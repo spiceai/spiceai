@@ -323,6 +323,11 @@ impl PreparedTxnCommit {
         self.table.table_id()
     }
 
+    /// Whether the written table's data is in the object-native location.
+    pub(crate) fn data_in_object_native_location(&self) -> bool {
+        self.table.data_in_object_native_location()
+    }
+
     /// The written table's provider — the multi-table orchestrator holds its
     /// visibility + listing-fence locks and reads its catalog for the shared txn.
     pub(crate) fn provider(&self) -> &CayenneTableProvider {

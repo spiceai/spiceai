@@ -1122,3 +1122,66 @@ async fn an_unplaced_dataset_reclaims_orphaned_deletion_vectors_objects_first() 
     );
     assert_eq!(outcome.objects_after, outcome.objects_before);
 }
+
+/// A placed dataset that holds its rows inline in the metastore flushes them to
+/// a data file it records in its committed file set, so the rows stay visible,
+/// with or without a primary key, and after a restart.
+#[tokio::test]
+async fn an_inline_flush_of_a_placed_dataset_keeps_its_rows() {
+    for keyed in [false, true] {
+        let (setup, catalog, _table, _ctx) = create("anchor").await;
+        let name = if keyed { "inline_keyed" } else { "inline_plain" };
+        let datasets = catalog_datasets_prefix(&setup.data_prefix);
+        let data_url = format!("s3://bucket/{datasets}/{}/data", new_dataset_folder(name));
+        let ctx = SessionContext::new();
+        let keys: Vec<String> = if keyed { vec!["id".to_string()] } else { Vec::new() };
+        let table = Arc::new(
+            CayenneTableProviderBuilder::new(Arc::clone(&catalog), ctx.runtime_env())
+                .with_object_store(ObjectStoreConfig {
+                    url: url::Url::parse(&data_url).expect("data url"),
+                    store: Arc::clone(&setup.store),
+                })
+                .create(CreateTableOptions {
+                    table_name: name.to_string(),
+                    schema: schema(),
+                    primary_key: keys.clone(),
+                    on_conflict: keyed.then(|| {
+                        datafusion_table_providers::util::on_conflict::OnConflict::Upsert(
+                            datafusion_table_providers::util::column_reference::ColumnReference::new(
+                                keys.clone(),
+                            ),
+                        )
+                    }),
+                    base_path: data_url.clone(),
+                    partition_column: None,
+                    // Small writes stay inline in the metastore until a flush.
+                    vortex_config: VortexConfig::default(),
+                })
+                .await
+                .expect("create the table"),
+        );
+        ctx.register_table(name, Arc::clone(&table) as Arc<dyn TableProvider>)
+            .expect("register");
+        run(
+            &ctx,
+            &format!("INSERT INTO {name} SELECT value AS id, value * 10 AS v FROM generate_series(1, 100)"),
+        )
+        .await;
+        assert_eq!(count_and_sum(&ctx, name).await, (100, expected_sum(1, 100)), "keyed={keyed}: before the flush");
+        let flushed = table.checkpoint_inlined_data().await.expect("flush the inline rows");
+        assert_eq!(flushed, 100, "keyed={keyed}: the flush wrote every inline row to a file");
+        assert_eq!(
+            count_and_sum(&ctx, name).await,
+            (100, expected_sum(1, 100)),
+            "keyed={keyed}: the flushed rows are visible"
+        );
+        table.drain_in_flight_maintenance().await.expect("drain");
+        drop((table, ctx, catalog));
+        let (_catalog, _table, ctx) = reopen_in(&setup.store, &data_url, name).await;
+        assert_eq!(
+            count_and_sum(&ctx, name).await,
+            (100, expected_sum(1, 100)),
+            "keyed={keyed}: the flushed rows are visible after a restart"
+        );
+    }
+}

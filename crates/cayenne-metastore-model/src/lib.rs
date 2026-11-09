@@ -2362,6 +2362,19 @@ fn additional_runs() -> Vec<Run> {
             2,
             "unknown outcome resolves all-or-nothing",
         ),
+        ("data-files-intent", "data-files-intent", 2, ""),
+        (
+            "data-files-intent-sweep-ignores-intent",
+            "data-files-intent-sweep-ignores-intent",
+            2,
+            "committed files exist",
+        ),
+        (
+            "data-files-intent-adopt-by-listing",
+            "data-files-intent-adopt-by-listing",
+            2,
+            "aborted or abandoned upload never visible to a reader",
+        ),
     ] {
         runs.push(Run {
             name,

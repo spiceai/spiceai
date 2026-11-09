@@ -3121,6 +3121,18 @@ pub struct CayenneTableProvider {
     /// committed. Its files are kept, and every later write fails until the
     /// table is reopened from the catalog.
     publication_outcome_unknown: Arc<AtomicBool>,
+    /// For a table in the object-native location: the files its writers have put
+    /// in snapshot directories and no commit names yet (see
+    /// [`super::uncommitted_files`]). Shared by every clone.
+    uncommitted_files: Arc<super::uncommitted_files::UncommittedFiles>,
+    /// Lists and aborts the store's unfinished multipart uploads, for the orphan
+    /// sweep; `None` when the store cannot.
+    unfinished_uploads: Option<Arc<dyn super::orphan_sweep::UnfinishedUploads>>,
+    /// The orphan sweep's age floor, in milliseconds
+    /// ([`super::orphan_sweep::ORPHAN_AGE_FLOOR`] unless a test sets it).
+    orphan_age_floor_ms: Arc<AtomicU64>,
+    /// When the orphan sweep last ran, or the table opened.
+    last_orphan_sweep: Arc<ParkingMutex<Instant>>,
     /// Staging snapshot IDs whose WALs belong to prepared appends in this
     /// process. `ensure_no_incomplete_write` ignores these WALs so CDC Stage A
     /// can continue while a previous Stage B is pending; after restart the set
@@ -3434,6 +3446,7 @@ pub struct CayenneTableProviderBuilder {
     dataset_name: Option<Arc<str>>,
     snapshot_dir_pins: Option<SnapshotDirPins>,
     partitioned_table_conflict_detection: Option<PkConflictDetection>,
+    unfinished_uploads: Option<Arc<dyn super::orphan_sweep::UnfinishedUploads>>,
 }
 
 /// Whether a table's secondary index runs persist as run files, so a
@@ -3588,6 +3601,7 @@ struct CayenneTableProviderOpenOptions {
     index_word_bits: Option<u32>,
     dataset_name: Option<Arc<str>>,
     snapshot_dir_pins: Option<SnapshotDirPins>,
+    unfinished_uploads: Option<Arc<dyn super::orphan_sweep::UnfinishedUploads>>,
     /// The conflict detection recorded for the partitioned table this table is a
     /// partition of, if it is one. A partition follows that table turning the check
     /// off, with the conflict action it records cleared to match, as the table's own is:
@@ -3641,6 +3655,7 @@ impl CayenneTableProviderBuilder {
             dataset_name: None,
             snapshot_dir_pins: None,
             partitioned_table_conflict_detection: None,
+            unfinished_uploads: None,
         }
     }
 
@@ -3662,6 +3677,18 @@ impl CayenneTableProviderBuilder {
     #[must_use]
     pub fn with_snapshot_dir_pins(mut self, pins: SnapshotDirPins) -> Self {
         self.snapshot_dir_pins = Some(pins);
+        self
+    }
+
+    /// List and abort the multipart uploads the table's store started and never
+    /// finished, which the orphan sweep aborts once they are older than its
+    /// floor. Without it the sweep leaves them to the store.
+    #[must_use]
+    pub fn with_unfinished_uploads(
+        mut self,
+        uploads: Arc<dyn super::orphan_sweep::UnfinishedUploads>,
+    ) -> Self {
+        self.unfinished_uploads = Some(uploads);
         self
     }
 
@@ -3807,6 +3834,7 @@ impl CayenneTableProviderBuilder {
             index_word_bits: self.index_word_bits,
             dataset_name: self.dataset_name,
             snapshot_dir_pins: self.snapshot_dir_pins,
+            unfinished_uploads: self.unfinished_uploads,
             partitioned_table_conflict_detection: self.partitioned_table_conflict_detection,
         };
 
@@ -3844,6 +3872,7 @@ impl CayenneTableProviderBuilder {
             index_word_bits: self.index_word_bits,
             dataset_name: self.dataset_name,
             snapshot_dir_pins: self.snapshot_dir_pins,
+            unfinished_uploads: self.unfinished_uploads,
             partitioned_table_conflict_detection: self.partitioned_table_conflict_detection,
         };
 
@@ -6823,6 +6852,21 @@ impl CayenneTableProvider {
             }
             RewriteScope::Fenced { .. } => Vec::new(),
         };
+        // A table in the object-native location scans only its manifest: a
+        // rewrite whose writer has not recorded its output yet records it now,
+        // with the conservative `[0, current sequence]` range.
+        if self.data_in_object_native_location()
+            && self.uncommitted_files.holds_snapshot(new_snapshot_id)
+        {
+            self.upsert_snapshot_manifest_from_files(
+                new_snapshot_id,
+                ManifestSequenceTag::Uniform {
+                    min: 0,
+                    max: self.table_metadata.current_sequence_number,
+                },
+            )
+            .await?;
+        }
         let committed = self
             .commit_snapshot_rewrite_catalog(replaced_snapshot_id, new_snapshot_id, scope)
             .await;
@@ -7585,6 +7629,7 @@ impl CayenneTableProvider {
             in_use_snapshot_ids,
             grace: Self::SNAPSHOT_CLEANUP_GRACE,
         };
+        self.maybe_schedule_orphan_sweep();
         let Some(_deleting) = self.claim_file_deletions() else {
             return;
         };
@@ -8725,8 +8770,9 @@ impl CayenneTableProvider {
     /// manifest, for a table in the object-native location: its scans read only
     /// the manifest, so the files must be there before the snapshot is visible.
     /// The range is `[sequence, sequence]`, as the post-write rebuild tags a
-    /// protected snapshot. The directory is new to this write, so its listing is
-    /// this write's files. Other tables are left to the post-write rebuild.
+    /// protected snapshot. The files are the ones this write put there (see
+    /// [`super::uncommitted_files`]), never a listing of the directory. Other
+    /// tables are left to the post-write rebuild.
     pub(crate) async fn record_new_protected_snapshot_files(
         &self,
         snapshot_id: &str,
@@ -8735,7 +8781,7 @@ impl CayenneTableProvider {
         if !self.data_in_object_native_location() {
             return Ok(());
         }
-        self.upsert_snapshot_manifest_from_listing(
+        self.upsert_snapshot_manifest_from_files(
             snapshot_id,
             ManifestSequenceTag::Uniform {
                 min: sequence,
@@ -9481,7 +9527,21 @@ impl CayenneTableProvider {
     /// burst can write its staged files without deleting a prior burst that is
     /// still waiting for Stage B. The legacy `_staging/` path keeps the old
     /// whole-directory cleanup semantics through [`Self::clear_staging_dir`].
+    /// Clears a staging snapshot id the caller just minted. Nothing can be under
+    /// a fresh id, so a table in the object-native location skips the listing
+    /// the clear costs.
+    pub(crate) async fn clear_new_staging_snapshot_dir(
+        &self,
+        staging_snapshot_id: &str,
+    ) -> Result<()> {
+        if self.data_in_object_native_location() {
+            return Ok(());
+        }
+        self.clear_staging_snapshot_dir(staging_snapshot_id).await
+    }
+
     pub(crate) async fn clear_staging_snapshot_dir(&self, staging_snapshot_id: &str) -> Result<()> {
+        self.uncommitted_files.forget(staging_snapshot_id);
         if self.data_in_store() {
             if let Some(prefix) = self.snapshot_object_store_prefix(staging_snapshot_id)? {
                 self.delete_prefix_with_object_store(&prefix).await?;
@@ -9782,17 +9842,36 @@ impl CayenneTableProvider {
             });
         };
 
-        // List all objects in staging
-        let objects: Vec<_> = config
-            .store
-            .list(Some(&staging_prefix))
-            .try_collect()
-            .await
-            .map_err(|e| Error::ObjectStore {
-                operation: "list staging objects for move",
-                table: self.table_metadata.table_name.clone(),
-                source: e,
-            })?;
+        // The staged files: the ones this write put there, for a table in the
+        // object-native location whose writer is still in this process; else a
+        // listing of the write's own staging prefix (crash recovery, or a table
+        // whose manifest is not its live file set).
+        let objects: Vec<ObjectMeta> = if self.data_in_object_native_location()
+            && self.uncommitted_files.holds_snapshot(staging_snapshot_id)
+        {
+            self.uncommitted_files
+                .files(staging_snapshot_id)
+                .into_iter()
+                .map(|(name, size)| ObjectMeta {
+                    location: crate::object_child(&staging_prefix, &name),
+                    last_modified: chrono::DateTime::UNIX_EPOCH,
+                    size,
+                    e_tag: None,
+                    version: None,
+                })
+                .collect()
+        } else {
+            config
+                .store
+                .list(Some(&staging_prefix))
+                .try_collect()
+                .await
+                .map_err(|e| Error::ObjectStore {
+                    operation: "list staging objects for move",
+                    table: self.table_metadata.table_name.clone(),
+                    source: e,
+                })?
+        };
 
         if objects.is_empty() {
             return Ok(());
@@ -9879,13 +9958,15 @@ impl CayenneTableProvider {
 
         // A table whose data is in the object-native location scans only the
         // files its manifest names, so the moved files are recorded before the
-        // staging originals go: a crash after this leaves the staging WAL, whose
-        // recovery repeats the copy and this upsert, and a crash before it leaves
-        // files no scan reads.
+        // staging originals go: recording them commits the append. A crash after
+        // this leaves the staging WAL, whose recovery clears the staging, and a
+        // crash before it leaves copies no scan reads, which recovery does not
+        // adopt and the orphan sweep reclaims.
         if self.scans_from_manifest() {
             self.record_files_in_manifest(current_snapshot, &moved_files)
                 .await?;
         }
+        self.uncommitted_files.forget(staging_snapshot_id);
 
         // Phase 2: delete staging originals.
         let store = Arc::clone(&config.store);
@@ -10024,6 +10105,32 @@ impl CayenneTableProvider {
                 })?;
             let store = Arc::clone(&config.store);
             let table_name = self.table_name().to_string();
+            // A table in the object-native location clones the files its state
+            // names, never what a listing of the source finds.
+            if self.data_in_object_native_location() {
+                let files = self.snapshot_files_from_state(source_snapshot_id).await?;
+                stream::iter(files.into_iter().map(Ok::<_, Error>))
+                    .try_for_each_concurrent(OBJECT_STORE_MOVE_CONCURRENCY, |(name, size)| {
+                        let store = Arc::clone(&store);
+                        let table_name = table_name.clone();
+                        let source = crate::object_child(&source_prefix, &name);
+                        let target = crate::object_child(&target_prefix, &name);
+                        async move {
+                            store.copy(&source, &target).await.map_err(|source| {
+                                Error::ObjectStore {
+                                    operation: "clone snapshot object",
+                                    table: table_name,
+                                    source,
+                                }
+                            })?;
+                            self.uncommitted_files.note(target_snapshot_id, &name, size);
+                            Ok(())
+                        }
+                    })
+                    .await?;
+                cleanup.armed = false;
+                return Ok(());
+            }
             config
                 .store
                 .list(Some(&source_prefix))
@@ -10099,6 +10206,7 @@ impl CayenneTableProvider {
     }
 
     pub(crate) async fn clear_snapshot_dir(&self, snapshot_id: &str) -> Result<()> {
+        self.uncommitted_files.forget(snapshot_id);
         if self.data_in_store() {
             if let Some(prefix) = self.snapshot_object_store_prefix(snapshot_id)? {
                 self.delete_prefix_with_object_store(&prefix).await?;
@@ -10464,6 +10572,7 @@ impl CayenneTableProvider {
             index_word_bits,
             dataset_name,
             snapshot_dir_pins,
+            unfinished_uploads,
             partitioned_table_conflict_detection,
         } = options;
 
@@ -10950,6 +11059,13 @@ impl CayenneTableProvider {
             staging_wal_present: Arc::new(AtomicBool::new(force_staging_probe_on_startup)),
             staging_may_have_files: Arc::new(AtomicBool::new(force_staging_probe_on_startup)),
             publication_outcome_unknown: Arc::new(AtomicBool::new(false)),
+            uncommitted_files: Arc::default(),
+            unfinished_uploads,
+            orphan_age_floor_ms: Arc::new(AtomicU64::new(
+                u64::try_from(super::orphan_sweep::ORPHAN_AGE_FLOOR.as_millis())
+                    .unwrap_or(u64::MAX),
+            )),
+            last_orphan_sweep: Arc::new(ParkingMutex::new(Instant::now())),
             inflight_staging_appends: Arc::new(ParkingMutex::new(HashMap::new())),
             retired_snapshot_dirs: snapshot_dir_pins.retired,
             snapshot_last_listed: snapshot_dir_pins.last_listed,
@@ -11631,12 +11747,11 @@ impl CayenneTableProvider {
         use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
         use std::time::Instant;
 
-        /// Feeds each written batch to the secondary index and to the caller.
+        /// Feeds each written batch and each closed file to every observer of
+        /// the write: the secondary index, the caller, and the record of files
+        /// no commit names yet.
         #[derive(Debug)]
-        struct WriteObservers {
-            index: Arc<dyn VortexWriteObserver>,
-            caller: Arc<dyn VortexWriteObserver>,
-        }
+        struct WriteObservers(Vec<Arc<dyn VortexWriteObserver>>);
 
         impl VortexWriteObserver for WriteObservers {
             fn batch_written(
@@ -11645,10 +11760,15 @@ impl CayenneTableProvider {
                 first_row_position: u64,
                 batch: &RecordBatch,
             ) {
-                self.index
-                    .batch_written(file_path, first_row_position, batch);
-                self.caller
-                    .batch_written(file_path, first_row_position, batch);
+                for observer in &self.0 {
+                    observer.batch_written(file_path, first_row_position, batch);
+                }
+            }
+
+            fn file_written(&self, file_path: &object_store::path::Path, size: u64) {
+                for observer in &self.0 {
+                    observer.file_written(file_path, size);
+                }
             }
         }
 
@@ -11802,14 +11922,25 @@ impl CayenneTableProvider {
             let replaces = matches!(write_class, super::delta_encoding::WriteClass::Maintenance);
             (Arc::clone(state), state.write_observer(replaces))
         });
-        let observer = match (&index_observer, write_observer) {
-            (Some((_, index)), Some(caller)) => Some(Arc::new(WriteObservers {
-                index: Arc::clone(index) as Arc<dyn VortexWriteObserver>,
-                caller,
-            })
-                as Arc<dyn VortexWriteObserver>),
-            (Some((_, index)), None) => Some(Arc::clone(index) as Arc<dyn VortexWriteObserver>),
-            (None, caller) => caller,
+        let mut observers: Vec<Arc<dyn VortexWriteObserver>> = Vec::new();
+        if let Some((_, index)) = &index_observer {
+            observers.push(Arc::clone(index) as Arc<dyn VortexWriteObserver>);
+        }
+        observers.extend(write_observer);
+        // A table in the object-native location names a snapshot's files from
+        // what its writers wrote, never from a listing.
+        if self.data_in_object_native_location() {
+            observers.push(Arc::new(
+                super::uncommitted_files::UncommittedFilesObserver {
+                    files: Arc::clone(&self.uncommitted_files),
+                    snapshot_id: snapshot_id.to_string(),
+                },
+            ));
+        }
+        let observer = match observers.len() {
+            0 => None,
+            1 => observers.pop(),
+            _ => Some(Arc::new(WriteObservers(observers)) as Arc<dyn VortexWriteObserver>),
         };
         let write_format = match observer {
             Some(observer) => Arc::new(write_format.with_write_observer(observer)),
@@ -11959,9 +12090,46 @@ impl CayenneTableProvider {
         let writer_input_plan: Arc<dyn ExecutionPlan> =
             Arc::new(StreamingExec::new(tracked_schema, Box::pin(tracked_stream)));
 
-        let insert_plan = snapshot_listing_table
-            .insert_into(session_state.as_ref(), writer_input_plan, InsertOp::Append)
-            .await?;
+        let insert_plan = if self.data_in_object_native_location()
+            && snapshot_listing_table.options().file_sort_order.is_empty()
+            && snapshot_listing_table
+                .options()
+                .table_partition_cols
+                .is_empty()
+        {
+            // A table in the object-native location names its files from what its
+            // writers write, so a write does not list the directory it writes
+            // into, as `ListingTable::insert_into` does for the sink's file group.
+            let table_path = snapshot_listing_table.table_paths()[0].clone();
+            let config = datafusion_datasource::file_sink_config::FileSinkConfig {
+                original_url: String::default(),
+                object_store_url: table_path.object_store(),
+                table_paths: vec![table_path],
+                file_group: FileGroup::default(),
+                output_schema: snapshot_listing_table.schema(),
+                table_partition_cols: Vec::new(),
+                insert_op: InsertOp::Append,
+                keep_partition_by_columns: session_state
+                    .config_options()
+                    .execution
+                    .keep_partition_by_columns,
+                file_extension: snapshot_listing_table.options().format.get_ext(),
+                file_output_mode:
+                    datafusion_datasource::file_sink_config::FileOutputMode::Automatic,
+            };
+            write_format
+                .create_writer_physical_plan(
+                    writer_input_plan,
+                    session_state.as_ref(),
+                    config,
+                    None,
+                )
+                .await?
+        } else {
+            snapshot_listing_table
+                .insert_into(session_state.as_ref(), writer_input_plan, InsertOp::Append)
+                .await?
+        };
 
         collect(insert_plan, session_state.task_ctx()).await?;
 
@@ -13331,6 +13499,10 @@ impl CayenneTableProvider {
             staging_wal_present: Arc::clone(&self.staging_wal_present),
             staging_may_have_files: Arc::clone(&self.staging_may_have_files),
             publication_outcome_unknown: Arc::clone(&self.publication_outcome_unknown),
+            uncommitted_files: Arc::clone(&self.uncommitted_files),
+            unfinished_uploads: self.unfinished_uploads.clone(),
+            orphan_age_floor_ms: Arc::clone(&self.orphan_age_floor_ms),
+            last_orphan_sweep: Arc::clone(&self.last_orphan_sweep),
             inflight_staging_appends: Arc::clone(&self.inflight_staging_appends),
             retired_snapshot_dirs: Arc::clone(&self.retired_snapshot_dirs),
             snapshot_last_listed: Arc::clone(&self.snapshot_last_listed),
@@ -22609,7 +22781,7 @@ impl CayenneTableProvider {
         // The number of files the new snapshot holds, when the manifest listed them.
         let mut new_snapshot_files = None;
         let manifest_authored = match self
-            .upsert_snapshot_manifest_from_listing(
+            .upsert_snapshot_manifest_from_files(
                 &new_snapshot_id,
                 ManifestSequenceTag::Uniform {
                     min: merged_min,
@@ -22909,6 +23081,26 @@ impl CayenneTableProvider {
         if basenames.is_empty() {
             return Ok(());
         }
+        // A table in the object-native location carries only files its state
+        // names, and records each copy as the target snapshot's own file.
+        let carried_sizes: Option<HashMap<String, u64>> = if self.data_in_object_native_location() {
+            let sizes: HashMap<String, u64> = self
+                .snapshot_files_from_state(source_snapshot_id)
+                .await?
+                .into_iter()
+                .collect();
+            if let Some(unknown) = basenames.iter().find(|name| !sizes.contains_key(**name)) {
+                return Err(Error::Internal {
+                    table: self.table_name().to_string(),
+                    message: format!(
+                        "refusing to carry data file '{unknown}' from snapshot '{source_snapshot_id}': no commit names it"
+                    ),
+                });
+            }
+            Some(sizes)
+        } else {
+            None
+        };
         if self.data_in_store() {
             let config = self.require_object_store()?;
             let source_prefix = self
@@ -22936,6 +23128,13 @@ impl CayenneTableProvider {
                         table: table_name.clone(),
                         source,
                     })?;
+                if let Some(size) = carried_sizes
+                    .as_ref()
+                    .and_then(|sizes| sizes.get(*basename))
+                {
+                    self.uncommitted_files
+                        .note(target_snapshot_id, basename, *size);
+                }
             }
             return Ok(());
         }
@@ -23175,6 +23374,277 @@ impl CayenneTableProvider {
         self.elapse_snapshot_cleanup_grace();
         self.sweep_retired_snapshot_dirs();
         drop(Arc::clone(&self.file_deletion_fence).read_owned().await);
+    }
+
+    /// Set the orphan sweep's age floor (tests use a short one).
+    #[doc(hidden)]
+    pub fn set_orphan_age_floor(&self, floor: std::time::Duration) {
+        self.orphan_age_floor_ms.store(
+            u64::try_from(floor.as_millis()).unwrap_or(u64::MAX),
+            Ordering::Release,
+        );
+    }
+
+    /// Run the orphan sweep now ([`super::orphan_sweep`]): delete what a listing
+    /// of the table finds that no snapshot names, no write of this process holds,
+    /// and the store dates older than the floor, and abort unfinished multipart
+    /// uploads older than it. Nothing listed is ever adopted.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the table's state or its store cannot be read; the
+    /// sweep then deletes nothing.
+    #[doc(hidden)]
+    pub async fn sweep_orphan_files_now(&self) -> Result<super::orphan_sweep::OrphanSweep> {
+        use super::orphan_sweep::{
+            OrphanSweep, Placement, STORE_CLOCK_OBJECT, older_than_floor, placement,
+        };
+
+        let mut report = OrphanSweep::default();
+        if !self.data_in_object_native_location() {
+            report.skipped = Some("the table's data is not in the object-native location");
+            return Ok(report);
+        }
+        if self.publication_outcome_unknown.load(Ordering::Acquire) {
+            report.skipped = Some("an earlier write could not learn whether it committed");
+            return Ok(report);
+        }
+        let table_id = self.table_metadata.table_id.clone();
+        let prepared = match self
+            .catalog
+            .as_any()
+            .downcast_ref::<crate::metastore::object_native::ObjectNativeCatalog>()
+        {
+            Some(catalog) => catalog.has_prepared_transaction(&table_id).await,
+            // A catalog that cannot say is treated as one that has one.
+            None => true,
+        };
+        if prepared {
+            report.skipped = Some("a transaction across datasets is prepared on the table");
+            return Ok(report);
+        }
+        let Some(_deleting) = self.claim_file_deletions() else {
+            report.skipped = Some("another sweep is deleting the table's files");
+            return Ok(report);
+        };
+        *self.last_orphan_sweep.lock() = Instant::now();
+        let config = self.require_object_store()?;
+        let store = Arc::clone(&config.store);
+        let clock = self
+            .snapshot_object_store_prefix(STORE_CLOCK_OBJECT)?
+            .ok_or_else(|| Error::Internal {
+                table: self.table_name().to_string(),
+                message: "Missing the table's object-store prefix".to_string(),
+            })?;
+        let table_prefix: ObjectStorePath = {
+            let mut parts: Vec<_> = clock.parts().collect();
+            parts.pop();
+            parts.into_iter().collect()
+        };
+        let store_error = |operation: &'static str| {
+            let table = self.table_name().to_string();
+            move |source| Error::ObjectStore {
+                operation,
+                table,
+                source,
+            }
+        };
+
+        // The store's clock: the time it stamps on an object written now.
+        store
+            .put(&clock, object_store::PutPayload::from_static(b""))
+            .await
+            .map_err(store_error("write the orphan sweep's clock object"))?;
+        let store_now = store
+            .head(&clock)
+            .await
+            .map_err(store_error("read the orphan sweep's clock object"))?
+            .last_modified;
+        let floor =
+            std::time::Duration::from_millis(self.orphan_age_floor_ms.load(Ordering::Acquire));
+
+        let live = self.live_snapshot_ids_for_sweep().await?;
+        // Directories other sweeps own or readers hold, skipped whole: retired
+        // ones, and ones a scan holds or listed within the cleanup grace.
+        let untouchable: HashSet<String> = {
+            let (_, in_use) = self.snapshot_cleanup_pins();
+            let mut untouchable = in_use;
+            untouchable.extend(self.retired_snapshot_dirs.lock().keys().cloned());
+            untouchable
+        };
+        let objects: Vec<ObjectMeta> = store
+            .list(Some(&table_prefix))
+            .try_collect()
+            .await
+            .map_err(store_error("list the table's objects for the orphan sweep"))?;
+        // A staging directory with a staging WAL belongs to recovery.
+        let staged_with_wal: HashSet<String> = objects
+            .iter()
+            .filter_map(|meta| {
+                let relative = crate::object_relative(&table_prefix, &meta.location)?;
+                let (dir, file) = relative.rsplit_once('/')?;
+                (file == STAGING_WAL_FILENAME || file == STAGING_WAL_TMP_FILENAME)
+                    .then(|| dir.to_string())
+            })
+            .collect();
+        let mut candidates = Vec::new();
+        for meta in &objects {
+            let Some(relative) = crate::object_relative(&table_prefix, &meta.location) else {
+                continue;
+            };
+            let (snapshot, file, live_dir) = match placement(relative, &live) {
+                Placement::Live { snapshot, file } => (snapshot.to_string(), file, true),
+                Placement::Scratch { snapshot, file } => (snapshot.to_string(), file, false),
+                Placement::NotLive { snapshot, file } if !untouchable.contains(snapshot) => {
+                    (snapshot.to_string(), file, false)
+                }
+                Placement::Staging { snapshot, file }
+                    if !staged_with_wal.contains(&snapshot)
+                        && file != STAGING_WAL_FILENAME
+                        && file != STAGING_WAL_TMP_FILENAME =>
+                {
+                    (snapshot, file, false)
+                }
+                Placement::NotLive { .. } | Placement::Staging { .. } | Placement::Other => {
+                    continue;
+                }
+            };
+            candidates.push((snapshot, file.to_string(), live_dir, meta));
+        }
+
+        // What this process still writes, then what the state names: a write
+        // records its files in the state before it stops holding them, so a file
+        // held at the first read is named by the second if it committed since.
+        let held = self.uncommitted_files.held();
+        let held_snapshots = self.uncommitted_files.snapshots();
+        let named: HashSet<(String, String)> = self
+            .catalog
+            .get_all_snapshot_files(&table_id)
+            .await?
+            .into_iter()
+            .map(|file| (file.snapshot_id, file.file_path))
+            .collect();
+        // A directory that left the live set since the listing (a compaction
+        // retired it) belongs to the retired-directory sweep now.
+        let live_now = self.live_snapshot_ids_for_sweep().await?;
+        let untouchable_now: HashSet<String> = {
+            let (_, in_use) = self.snapshot_cleanup_pins();
+            let mut untouchable = in_use;
+            untouchable.extend(self.retired_snapshot_dirs.lock().keys().cloned());
+            untouchable
+        };
+        let mut doomed = Vec::new();
+        for (snapshot, file, live_dir, meta) in candidates {
+            if named.contains(&(snapshot.clone(), file.clone())) {
+                continue;
+            }
+            if (live_dir && !live_now.contains(&snapshot))
+                || (!live_dir && live_now.contains(&snapshot))
+                || untouchable_now.contains(&snapshot)
+            {
+                continue;
+            }
+            if held_snapshots.contains(&snapshot) || held.contains(&(snapshot, file)) {
+                report.kept_in_flight += 1;
+                continue;
+            }
+            if !older_than_floor(meta.last_modified, store_now, floor) {
+                report.kept_young += 1;
+                continue;
+            }
+            doomed.push(meta.location.clone());
+        }
+        for location in doomed {
+            match store.delete(&location).await {
+                Ok(()) | Err(object_store::Error::NotFound { .. }) => {
+                    report.deleted.push(
+                        crate::object_relative(&table_prefix, &location)
+                            .unwrap_or(location.as_ref())
+                            .to_string(),
+                    );
+                }
+                Err(error) => tracing::debug!(
+                    table = self.table_name(),
+                    object = %location,
+                    %error,
+                    "The orphan sweep could not delete an unreferenced object; the next sweep retries it"
+                ),
+            }
+        }
+
+        if let Some(uploads) = &self.unfinished_uploads {
+            let unfinished = uploads
+                .list(&table_prefix)
+                .await
+                .map_err(store_error("list the table's unfinished multipart uploads"))?;
+            for upload in unfinished {
+                if !older_than_floor(upload.initiated, store_now, floor) {
+                    continue;
+                }
+                let relative = crate::object_relative(&table_prefix, &upload.location)
+                    .unwrap_or(upload.location.as_ref())
+                    .to_string();
+                if relative.rsplit_once('/').is_some_and(|(snapshot, file)| {
+                    held_snapshots.contains(snapshot)
+                        || held.contains(&(snapshot.to_string(), file.to_string()))
+                }) {
+                    continue;
+                }
+                uploads
+                    .abort(&upload)
+                    .await
+                    .map_err(store_error("abort an unfinished multipart upload"))?;
+                report.aborted_uploads.push(relative);
+            }
+        }
+        if !report.deleted.is_empty() || !report.aborted_uploads.is_empty() {
+            tracing::debug!(
+                table = self.table_name(),
+                deleted = report.deleted.len(),
+                aborted_uploads = report.aborted_uploads.len(),
+                "The orphan sweep reclaimed objects no snapshot of the table names"
+            );
+        }
+        Ok(report)
+    }
+
+    /// The table's current and protected snapshot ids, from this instance's
+    /// memory and its state, for the orphan sweep.
+    async fn live_snapshot_ids_for_sweep(&self) -> Result<HashSet<String>> {
+        let mut live: HashSet<String> = self.protected_snapshots.load().keys().cloned().collect();
+        live.insert(self.get_current_snapshot_id());
+        let stored = self
+            .catalog
+            .get_table(&self.table_metadata.table_name)
+            .await?;
+        live.insert(stored.current_snapshot_id);
+        Ok(live)
+    }
+
+    /// Run the orphan sweep in the background when it is due, at most once per
+    /// [`super::orphan_sweep::ORPHAN_SWEEP_INTERVAL`] and never in the first
+    /// interval after the table opened.
+    fn maybe_schedule_orphan_sweep(&self) {
+        if !self.data_in_object_native_location() || self.is_maintenance_closed() {
+            return;
+        }
+        {
+            let mut last = self.last_orphan_sweep.lock();
+            if last.elapsed() < super::orphan_sweep::ORPHAN_SWEEP_INTERVAL {
+                return;
+            }
+            *last = Instant::now();
+        }
+        let table = self.clone_for_write();
+        tokio::spawn(async move {
+            if let Err(error) = table.sweep_orphan_files_now().await {
+                tracing::debug!(
+                    table = table.table_name(),
+                    %error,
+                    "The orphan sweep did not run; the next one retries"
+                );
+            }
+        });
     }
 
     /// Whether [`Self::quiesce`] has closed this instance's maintenance.
@@ -24748,8 +25218,27 @@ impl CayenneTableProvider {
     /// Exposed as `#[doc(hidden)] pub` so the crate's integration tests can
     /// assert on file counts after compaction without forcing this internal
     /// diagnostic helper into the documented public surface area.
+    ///
+    /// For a table in the object-native location the files are never listed:
+    /// they are the snapshot's committed manifest plus the files this process's
+    /// writers put there that no commit names yet
+    /// ([`Self::snapshot_files_from_state`]), so no path that sizes, picks or
+    /// carries files adopts one a crashed or fenced writer left behind.
     #[doc(hidden)]
     pub async fn list_snapshot_files_with_sizes(
+        &self,
+        snapshot_id: &str,
+    ) -> Result<Vec<(String, u64)>> {
+        if self.data_in_object_native_location() {
+            return self.snapshot_files_from_state(snapshot_id).await;
+        }
+        self.list_snapshot_dir_files_with_sizes(snapshot_id).await
+    }
+
+    /// Lists `snapshot_id`'s directory: only to find garbage, or for a table
+    /// whose manifest is not its live file set (see
+    /// [`Self::list_snapshot_files_with_sizes`]).
+    pub(crate) async fn list_snapshot_dir_files_with_sizes(
         &self,
         snapshot_id: &str,
     ) -> Result<Vec<(String, u64)>> {
@@ -24758,6 +25247,36 @@ impl CayenneTableProvider {
         } else {
             self.list_snapshot_files_with_sizes_local(snapshot_id).await
         }
+    }
+
+    /// `snapshot_id`'s files from the table's state: the files its manifest
+    /// names, plus the files this process's writers put there that no commit
+    /// names yet, sorted by name. Never a listing.
+    pub(crate) async fn snapshot_files_from_state(
+        &self,
+        snapshot_id: &str,
+    ) -> Result<Vec<(String, u64)>> {
+        let mut files: std::collections::BTreeMap<String, u64> = self
+            .catalog
+            .get_snapshot_files(&self.table_metadata.table_id, snapshot_id)
+            .await
+            .map_err(|source| Error::Catalog { source })?
+            .into_iter()
+            .map(|file| {
+                (
+                    file.file_path,
+                    u64::try_from(file.file_size_bytes).unwrap_or(0),
+                )
+            })
+            .collect();
+        files.extend(self.uncommitted_files.files(snapshot_id));
+        Ok(files.into_iter().collect())
+    }
+
+    /// The record of files this table's writers put in snapshot directories
+    /// that no commit names yet.
+    pub(crate) fn uncommitted_files(&self) -> &super::uncommitted_files::UncommittedFiles {
+        &self.uncommitted_files
     }
 
     async fn list_compaction_candidate_files_with_sizes(
@@ -25220,7 +25739,12 @@ impl CayenneTableProvider {
     /// fail the operation; the manifest is not yet the scan's file source
     /// (directory listing still is), so a transiently incomplete manifest cannot
     /// make a scan miss a live file or read one outside its snapshot.
-    async fn upsert_snapshot_manifest_from_listing(
+    ///
+    /// The files are [`Self::list_snapshot_files_with_sizes`]'s: a listing of
+    /// the directory, or, for a table in the object-native location, the
+    /// snapshot's manifest plus the files this process's writers put there,
+    /// which the upsert then stops tracking as uncommitted.
+    async fn upsert_snapshot_manifest_from_files(
         &self,
         snapshot_id: &str,
         tag: ManifestSequenceTag,
@@ -25335,6 +25859,7 @@ impl CayenneTableProvider {
         self.catalog
             .replace_snapshot_files(&table_id, snapshot_id, &replacement)
             .await?;
+        self.uncommitted_files.forget(snapshot_id);
 
         Ok(files)
     }
@@ -25367,7 +25892,7 @@ impl CayenneTableProvider {
         min_sequence: i64,
         max_sequence: i64,
     ) -> CatalogResult<Vec<(String, u64)>> {
-        self.upsert_snapshot_manifest_from_listing(
+        self.upsert_snapshot_manifest_from_files(
             snapshot_id,
             ManifestSequenceTag::Uniform {
                 min: min_sequence,
@@ -25560,7 +26085,7 @@ impl CayenneTableProvider {
 
         for (snapshot_id, tag) in &live {
             match self
-                .upsert_snapshot_manifest_from_listing(snapshot_id, *tag)
+                .upsert_snapshot_manifest_from_files(snapshot_id, *tag)
                 .await
             {
                 Ok(files) => {
@@ -25654,7 +26179,7 @@ impl CayenneTableProvider {
     ///
     /// The per-snapshot `cayenne_snapshot_file` manifest is a BEST-EFFORT
     /// auxiliary structure built *from* the directory listing
-    /// ([`Self::upsert_snapshot_manifest_from_listing`]). Scans resolve a
+    /// ([`Self::upsert_snapshot_manifest_from_files`]). Scans resolve a
     /// snapshot's files from the directory listing by default
     /// ([`Self::list_files_for_snapshot_scan`]); only the opt-in
     /// `scan_from_manifest` mode reads file paths from the manifest, and that
@@ -26536,7 +27061,7 @@ impl CayenneTableProvider {
         }
 
         let manifest_listed = match self
-            .upsert_snapshot_manifest_from_listing(
+            .upsert_snapshot_manifest_from_files(
                 &new_snapshot_id,
                 ManifestSequenceTag::Uniform {
                     min: merged_min,
@@ -28880,7 +29405,7 @@ impl CayenneTableProvider {
             .await
             .unwrap_or((0, fence_max_delete_seq));
         if let Err(error) = self
-            .upsert_snapshot_manifest_from_listing(
+            .upsert_snapshot_manifest_from_files(
                 &new_snapshot_id,
                 ManifestSequenceTag::Uniform {
                     min: merged_min,
@@ -29655,7 +30180,7 @@ impl CayenneTableProvider {
             .await
             .unwrap_or((0, fence_max_delete_seq));
         if let Err(error) = self
-            .upsert_snapshot_manifest_from_listing(
+            .upsert_snapshot_manifest_from_files(
                 &new_snapshot_id,
                 ManifestSequenceTag::Uniform {
                     min: merged_min,
@@ -29880,6 +30405,7 @@ impl CayenneTableProvider {
     }
 
     async fn cleanup_failed_compaction_snapshot(&self, new_snapshot_id: &str, is_s3: bool) {
+        self.uncommitted_files.forget(new_snapshot_id);
         if is_s3 {
             match self.snapshot_object_store_prefix(new_snapshot_id) {
                 Ok(Some(prefix)) => {
@@ -38851,6 +39377,10 @@ impl CayenneTableProvider {
             chunk_count
         );
 
+        // A table in the object-native location scans only its manifest: the
+        // snapshot's files are recorded before the commit that publishes it.
+        self.record_new_protected_snapshot_files(&new_snapshot_id, sequence_number)
+            .await?;
         // Record the snapshot's sequence number in the catalog
         self.catalog
             .set_snapshot_sequence(
@@ -39048,7 +39578,29 @@ impl CayenneTableProvider {
                 stats
             };
 
-            self.clear_inlined_metadata_after_checkpoint().await?;
+            // A table in the object-native location scans only its manifest, so
+            // the files the flush wrote into the current snapshot are recorded in
+            // the same record that clears the inline rows they hold.
+            let current_snapshot_id = self.get_current_snapshot_id();
+            let flushed_into_current = if self.data_in_object_native_location() {
+                self.uncommitted_files.files(&current_snapshot_id)
+            } else {
+                Vec::new()
+            };
+            if flushed_into_current.is_empty() {
+                self.clear_inlined_metadata_after_checkpoint().await?;
+            } else {
+                crate::catalog::with_same_record_commits(async {
+                    self.record_files_in_manifest(&current_snapshot_id, &flushed_into_current)
+                        .await?;
+                    self.clear_inlined_metadata_after_checkpoint().await
+                })
+                .await?;
+                self.catalog
+                    .commit_pending_for(&self.table_metadata.table_id)
+                    .await?;
+                self.uncommitted_files.forget(&current_snapshot_id);
+            }
             self.refresh_listing_table_under_held_fence().await?;
             // The flush moved every inline row to a file, but the keyset still tags
             // those rows `Inlined`. Without this flip a later upsert will lead to duplicate record.
@@ -41006,6 +41558,36 @@ impl CayenneTableProvider {
             .get_snapshot_files(&self.table_metadata.table_id, request.snapshot_id)
             .await
         {
+            // A snapshot this process is still building (a compaction's input or
+            // output, never the current or a protected one) is read by its own
+            // writer, from the files that writer put there.
+            Ok(mut rows)
+                if committed_only
+                    && self.uncommitted_files.holds_snapshot(request.snapshot_id)
+                    && request.snapshot_id != self.get_current_snapshot_id()
+                    && !self
+                        .protected_snapshots
+                        .load()
+                        .contains_key(request.snapshot_id) =>
+            {
+                let named: HashSet<String> =
+                    rows.iter().map(|file| file.file_path.clone()).collect();
+                for (file_path, size) in self.uncommitted_files.files(request.snapshot_id) {
+                    if !named.contains(&file_path) {
+                        rows.push(SnapshotFile {
+                            table_id: self.table_metadata.table_id.clone(),
+                            snapshot_id: request.snapshot_id.to_string(),
+                            file_path,
+                            row_count: 0,
+                            file_size_bytes: i64::try_from(size).unwrap_or(i64::MAX),
+                            min_sequence: 0,
+                            max_sequence: 0,
+                            digest: None,
+                        });
+                    }
+                }
+                rows
+            }
             Ok(rows) => rows,
             Err(error) if committed_only => {
                 return Err(DataFusionError::External(Box::new(error)));
@@ -43702,6 +44284,14 @@ impl TableProvider for CayenneTableProvider {
         filters: &[Expr],
         limit: Option<usize>,
     ) -> datafusion_common::Result<Arc<dyn ExecutionPlan>> {
+        // A table in the object-native location whose write could not learn
+        // whether it committed may hold in memory a view its state no longer
+        // has, so it answers no query until it is reloaded rather than return
+        // rows that may be wrong.
+        if self.data_in_object_native_location() {
+            self.ensure_publication_outcome_known()
+                .map_err(|error| DataFusionError::External(Box::new(error)))?;
+        }
         let reuse = self.prepare_scan(state, filters).await?;
         // Obtain the scan-view bundle from the demand cache. See
         // [`Self::scan_view_at_current_input`]. The KDI merge + visible mem-tier
@@ -61563,7 +62153,7 @@ mod tests {
     /// independent directory-built file set. The provider under test has the flag
     /// ON, so its `list_files_for_snapshot_scan` routes through the manifest. The
     /// manifest is populated deterministically via the production primitive
-    /// (`upsert_snapshot_manifest_from_listing`) before the comparison. Equal
+    /// (`upsert_snapshot_manifest_from_files`) before the comparison. Equal
     /// file-group paths AND per-file row-count statistics prove the manifest-built
     /// listing equals the directory-built listing.
     ///
@@ -61651,7 +62241,7 @@ mod tests {
             .flatten()
             .unwrap_or(0);
         let listed = provider
-            .upsert_snapshot_manifest_from_listing(
+            .upsert_snapshot_manifest_from_files(
                 &snapshot_id,
                 ManifestSequenceTag::PreserveOrUniform {
                     min: 0,

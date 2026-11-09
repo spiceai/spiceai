@@ -637,7 +637,7 @@ impl<'a> AppendMutationWriter<'a> {
                 };
                 let target_size_bytes = self.context.target_file_size_bytes();
                 self.table
-                    .clear_staging_snapshot_dir(&staging_snapshot_id)
+                    .clear_new_staging_snapshot_dir(&staging_snapshot_id)
                     .await?;
 
                 // Hold `write_lock` only through Stage A (staging the WAL and
@@ -1818,7 +1818,7 @@ impl<'a> AppendMutationWriter<'a> {
     ) -> Result<(u64, usize, Arc<ColumnStatsAccumulator>, Option<i64>)> {
         let staging_snapshot_id = CayenneTableProvider::new_staging_snapshot_id();
         self.table
-            .clear_staging_snapshot_dir(&staging_snapshot_id)
+            .clear_new_staging_snapshot_dir(&staging_snapshot_id)
             .await?;
 
         // We are about to (or have started to) write Vortex files into the

@@ -1171,6 +1171,8 @@ impl FileStatsObserver {
 }
 
 impl vortex_datafusion::VortexWriteObserver for FileStatsObserver {
+    fn file_written(&self, _file_path: &object_store::path::Path, _size: u64) {}
+
     fn batch_written(
         &self,
         file_path: &object_store::path::Path,

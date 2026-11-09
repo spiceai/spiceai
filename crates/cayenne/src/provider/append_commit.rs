@@ -233,13 +233,26 @@ async fn resolve_failed_commit(
     error: Error,
 ) -> std::result::Result<(), Failure> {
     let table = prepared.table.table_name().to_string();
-    match snapshot_sequence(
-        catalog,
-        prepared.table.table_id(),
-        &prepared.target_snapshot_id,
-    )
-    .await
-    {
+    // A table in the object-native location reads its state back in the
+    // background after a commit whose outcome is unknown, so its read-back
+    // waits for that, rather than leaving the table unable to take writes until
+    // a restart: the answer then says whether the publication stands.
+    let read_back = if prepared.table.data_in_object_native_location() {
+        snapshot_sequence_once_readable(
+            catalog,
+            prepared.table.table_id(),
+            &prepared.target_snapshot_id,
+        )
+        .await
+    } else {
+        snapshot_sequence(
+            catalog,
+            prepared.table.table_id(),
+            &prepared.target_snapshot_id,
+        )
+        .await
+    };
+    match read_back {
         Ok(Some(sequence)) if sequence == prepared.snapshot_sequence => {
             tracing::warn!(
                 "Dataset '{table}': the metastore reported that a write failed to commit, but it did commit, so it is published. Cause: {error}"
@@ -282,6 +295,32 @@ pub(super) async fn snapshot_sequence(
     snapshot_id: &str,
 ) -> CatalogResult<Option<i64>> {
     catalog.get_snapshot_sequence(table_id, snapshot_id).await
+}
+
+/// How long a write whose commit's outcome is unknown waits for its dataset to
+/// read its state back before it gives up and reports the outcome as unknown.
+const UNKNOWN_OUTCOME_READ_BACK_WAIT: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// [`snapshot_sequence`], retried with a doubling wait while the dataset's state
+/// cannot be read (it is reading its state back after a commit whose outcome is
+/// unknown), for up to [`UNKNOWN_OUTCOME_READ_BACK_WAIT`].
+pub(super) async fn snapshot_sequence_once_readable(
+    catalog: &dyn MetadataCatalog,
+    table_id: &str,
+    snapshot_id: &str,
+) -> CatalogResult<Option<i64>> {
+    let deadline = tokio::time::Instant::now() + UNKNOWN_OUTCOME_READ_BACK_WAIT;
+    let mut wait = std::time::Duration::from_millis(20);
+    loop {
+        match snapshot_sequence(catalog, table_id, snapshot_id).await {
+            Ok(sequence) => return Ok(sequence),
+            Err(error) if tokio::time::Instant::now() + wait >= deadline => return Err(error),
+            Err(_) => {
+                tokio::time::sleep(wait).await;
+                wait = (wait * 2).min(std::time::Duration::from_secs(2));
+            }
+        }
+    }
 }
 
 #[cfg(test)]

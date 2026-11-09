@@ -20,11 +20,24 @@
 //! commit naming it can pass the lease condition. (The `retention` runs model
 //! age-based collection; this graph uses the generation alone.)
 //!
+//! In the `intent` runs the sweep is the lease holder's, and it uses no
+//! generation in the key: it deletes an unnamed file unless the holder's own
+//! intent protects it. A writer records the key it is about to upload before
+//! it sends the upload, and keeps it through the upload and its commit until
+//! the outcome resolves; the record lives in the writer's process, so a crash
+//! or a takeover loses it, and then the lease condition is what keeps the file
+//! out of every commit. (Cayenne's orphan sweep adds an age floor on the store's
+//! clock as a backstop; the `retention` runs model age.)
+//!
 //! Controls: `no-upload-before-commit` lets a commit name a file whose upload
 //! has not returned; `no-committed-read` makes the reader list the store
 //! instead of reading the head; `no-resolve-by-head` resolves an unknown
 //! outcome as aborted when the head lacks its files, without waiting for the
-//! head to move past the request's base.
+//! head to move past the request's base; `sweep-ignores-intent` lets the
+//! holder's sweep delete a file its own write in flight still holds (reclaiming
+//! too early); `adopt-by-listing` lets a commit name every unnamed file the
+//! store lists, as a maintenance pass that derives its file set from a listing
+//! would.
 use stateright::{Model, Property};
 
 /// Writer processes.
@@ -157,6 +170,28 @@ impl Protocol {
     fn has(&self, t: &str) -> bool {
         self.mode.contains(t)
     }
+    /// The store's files the committed head does not name, sorted.
+    fn unnamed(s: &State) -> Vec<File> {
+        s.store
+            .iter()
+            .filter(|f| !s.head.contains(f))
+            .copied()
+            .collect()
+    }
+    /// The writer holding the current lease, if one runs.
+    fn holder(s: &State) -> Option<&Writer> {
+        s.writers.iter().find(|w| w.generation == Some(s.lease))
+    }
+    /// Whether `writer` recorded `file` before uploading it and has not seen the
+    /// outcome of the commit that names it yet.
+    fn intends(writer: &Writer, file: File) -> bool {
+        writer.started.contains(&file)
+            || writer.finished.contains(&file)
+            || writer
+                .pending
+                .as_ref()
+                .is_some_and(|(request, _)| request.files.contains(&file))
+    }
     /// How many files of `files` the committed head names.
     fn named(s: &State, files: &[File]) -> usize {
         files.iter().filter(|f| s.head.contains(f)).count()
@@ -178,7 +213,8 @@ impl Protocol {
                     && writer(w).pending.is_none()
                     && s.attempts < ATTEMPTS
                     && (!writer(w).finished.is_empty()
-                        || self.has("no-upload-before-commit") && !writer(w).started.is_empty())
+                        || self.has("no-upload-before-commit") && !writer(w).started.is_empty()
+                        || self.has("adopt-by-listing") && !Self::unnamed(s).is_empty())
             }
             Action::Deliver(i) | Action::Drop(i) => i < s.net.len(),
             Action::Timeout(w) => matches!(writer(w).pending, Some((_, false))),
@@ -206,11 +242,18 @@ impl Protocol {
                 .as_ref()
                 .is_some_and(|(_, listed)| s.fetched < listed.len()),
             // An unnamed file of a fenced generation: no commit naming it can
-            // pass the lease condition.
-            Action::Sweep(i) => s
-                .store
-                .get(i)
-                .is_some_and(|f| f.0.generation < s.lease && !s.head.contains(f)),
+            // pass the lease condition. In the `intent` runs: an unnamed file
+            // the holder's own intent does not protect.
+            Action::Sweep(i) => s.store.get(i).is_some_and(|f| {
+                !s.head.contains(f)
+                    && if self.has("intent") {
+                        Self::holder(s).is_some_and(|holder| {
+                            self.has("sweep-ignores-intent") || !Self::intends(holder, *f)
+                        })
+                    } else {
+                        f.0.generation < s.lease
+                    }
+            }),
         }
     }
 }
@@ -309,6 +352,13 @@ impl Model for Protocol {
                 let mut files = writer.finished.clone();
                 if self.has("no-upload-before-commit") {
                     files.extend(writer.started.iter().copied());
+                }
+                if self.has("adopt-by-listing") {
+                    let adopted: Vec<File> = Self::unnamed(s)
+                        .into_iter()
+                        .filter(|f| !files.contains(f))
+                        .collect();
+                    files.extend(adopted);
                 }
                 files.sort_unstable();
                 let request = Request {

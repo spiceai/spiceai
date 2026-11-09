@@ -1254,7 +1254,7 @@ impl CayenneTableProvider {
         }
 
         let staging_snapshot_id = Self::new_staging_snapshot_id();
-        self.clear_staging_snapshot_dir(&staging_snapshot_id)
+        self.clear_new_staging_snapshot_dir(&staging_snapshot_id)
             .await?;
 
         self.staging_may_have_files().store(true, Ordering::Release);
@@ -1661,30 +1661,39 @@ impl CayenneTableProvider {
             return Ok(());
         };
 
-        // List staged data files (exclude WAL bookkeeping objects).
-        let objects: Vec<_> = config
-            .store
-            .list(Some(&staging_prefix))
-            .try_collect()
-            .await
-            .map_err(|e| Error::ObjectStore {
-                operation: "list staging objects for WAL",
-                table: self.table_name().to_string(),
-                source: e,
-            })?;
-
-        let staged_files: Vec<String> = objects
-            .iter()
-            .filter_map(|meta| {
-                let name = crate::object_relative(&staging_prefix, &meta.location)
-                    .unwrap_or(meta.location.as_ref());
-                if name == STAGING_WAL_FILENAME || name == STAGING_WAL_TMP_FILENAME {
-                    None
-                } else {
-                    Some(name.to_string())
-                }
-            })
-            .collect();
+        // The staged data files: the ones this write put there, for a table in
+        // the object-native location, or a listing of the write's own staging
+        // prefix (excluding WAL bookkeeping objects).
+        let staged_files: Vec<String> = if self.data_in_object_native_location() {
+            self.uncommitted_files()
+                .files(staging_snapshot_id)
+                .into_iter()
+                .map(|(name, _)| name)
+                .collect()
+        } else {
+            let objects: Vec<_> = config
+                .store
+                .list(Some(&staging_prefix))
+                .try_collect()
+                .await
+                .map_err(|e| Error::ObjectStore {
+                    operation: "list staging objects for WAL",
+                    table: self.table_name().to_string(),
+                    source: e,
+                })?;
+            objects
+                .iter()
+                .filter_map(|meta| {
+                    let name = crate::object_relative(&staging_prefix, &meta.location)
+                        .unwrap_or(meta.location.as_ref());
+                    if name == STAGING_WAL_FILENAME || name == STAGING_WAL_TMP_FILENAME {
+                        None
+                    } else {
+                        Some(name.to_string())
+                    }
+                })
+                .collect()
+        };
 
         let wal = StagingWal {
             table_name: self.table_name().to_string(),
@@ -1965,6 +1974,37 @@ impl CayenneTableProvider {
                         break;
                     }
                 }
+            }
+
+            // A table in the object-native location commits an append when its
+            // moved files are recorded in the target's manifest, so recovery never
+            // moves anything: a committed append only leaves its staging behind,
+            // and one whose files are not all recorded never committed and was
+            // never acknowledged, so recovery discards it rather than adopt it; this is
+            // also what keeps a write fenced by another instance's takeover out
+            // of the dataset. Copies it left in the target are orphans, which the
+            // orphan sweep reclaims.
+            if self.data_in_object_native_location()
+                && wal.target_kind == StagingWalTargetKind::CurrentSnapshot
+            {
+                let named: std::collections::HashSet<String> = self
+                    .metadata_catalog()
+                    .get_snapshot_files(self.table_id(), &wal.target_snapshot)
+                    .await?
+                    .into_iter()
+                    .map(|file| file.file_path)
+                    .collect();
+                let committed = wal.staged_files.iter().all(|file| named.contains(file));
+                tracing::debug!(
+                    table = table_name.as_str(),
+                    target_snapshot = wal.target_snapshot.as_str(),
+                    staged_files = wal.staged_files.len(),
+                    committed,
+                    "Clearing a staged append: committed ones are already named, the others never committed"
+                );
+                self.clear_staging_snapshot_dir(&staging_snapshot_id)
+                    .await?;
+                continue;
             }
 
             // The provider-local pointer can be stale if cancellation happens

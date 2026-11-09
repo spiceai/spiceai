@@ -233,7 +233,7 @@ async fn read_intent(
 }
 
 /// The recorded outcome of `txn`: `Some(true)` to commit.
-async fn read_decision(
+pub(super) async fn read_decision(
     store: &Arc<dyn ObjectStore>,
     transactions: &Path,
     txn: &str,
@@ -1315,6 +1315,17 @@ impl ObjectNativeCatalog {
             );
         }
         Ok(())
+    }
+
+    /// Whether a transaction across datasets is prepared, and not yet resolved,
+    /// with `table_id` in its footprint: its commit would add the files its
+    /// `Prepare` names, so nothing may reclaim them meanwhile.
+    pub async fn has_prepared_transaction(&self, table_id: &str) -> bool {
+        self.for_table(table_id)
+            .unresolved()
+            .await
+            .iter()
+            .any(|(_, footprint)| footprint.iter().any(|table| table == table_id))
     }
 
     /// The runtime's bookkeeping value under `key` (a CDC position, a dataset

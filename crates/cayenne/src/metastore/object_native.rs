@@ -297,6 +297,9 @@ async fn recover_in_background(slot: std::sync::Weak<StateSlot>) {
             return;
         };
         let (delay, done) = {
+            // Past a transaction's reservation: only the reservation's holder
+            // commits while it is held, so a stopped log is its holder's, and the
+            // holder may be waiting for this very recovery to learn its outcome.
             let mut lease = strong.take().await;
             let delay = lease.config.retry_delay;
             match lease.recover().await {
@@ -323,6 +326,17 @@ async fn recover_in_background(slot: std::sync::Weak<StateSlot>) {
     }
 }
 
+/// The `transactions/` folder beside the catalog a log at `prefix` belongs to:
+/// the registry's log is `<root>/catalog`, a dataset's `<root>/datasets/<folder>`.
+fn transactions_beside(prefix: &Path, registry: bool) -> Path {
+    let mut parts: Vec<_> = prefix.parts().collect();
+    parts.pop();
+    if !registry {
+        parts.pop();
+    }
+    Path::from_iter(parts).join("transactions")
+}
+
 /// How a log's owner is named in what it reports.
 fn subject(dataset: &str) -> String {
     if dataset.is_empty() {
@@ -337,6 +351,22 @@ pub(crate) fn unresolved_commit_message(dataset: &str, cause: &str) -> String {
     format!(
         "{} could not confirm whether its last change was saved, so it accepts no change, and acknowledges none to its source, until it has read its state back; it retries in the background and resumes on its own once the state location is reachable. Cause: {cause}",
         subject(dataset)
+    )
+}
+
+/// What the writer whose commit's outcome is unknown is told: not that the
+/// change failed, but that it may have been saved.
+pub(crate) fn unknown_outcome_message(dataset: &str, cause: &str) -> String {
+    let (target, owner) = if dataset.is_empty() {
+        (
+            "the Cayenne object-native metastore".to_string(),
+            "metastore",
+        )
+    } else {
+        (format!("dataset '{dataset}' (cayenne)"), "dataset")
+    };
+    format!(
+        "The outcome of this change to {target} is unknown: Spice could not confirm whether it was saved, so check whether its rows are visible before retrying it. The {owner} accepts no change until it has read its state back, which it retries in the background. Cause: {cause}"
     )
 }
 
@@ -640,6 +670,7 @@ impl Inner {
                         // Changes buffered but never committed were never
                         // acknowledged; the reopened state is what committed.
                         *self = reopened;
+                        self.resolve_decided_transactions().await?;
                         tracing::info!(
                             "{} read its state back after an unconfirmed change and accepts changes again.",
                             subject(&self.dataset)
@@ -659,6 +690,44 @@ impl Inner {
             Some(Stop::Fenced { reloaded: false }) => self.reload_committed().await,
             _ => Ok(()),
         }
+    }
+
+    /// Apply the recorded outcome of every transaction across datasets the
+    /// reopened log holds prepared, as opening the catalog does: a `Resolve`
+    /// that did not land (its commit's outcome was unknown) would otherwise keep
+    /// the transaction's tables reserved until a restart. A transaction with no
+    /// recorded outcome is left to its coordinator.
+    async fn resolve_decided_transactions(&mut self) -> CatalogResult<()> {
+        let prepared: Vec<(String, Vec<String>)> = self
+            .reader
+            .state
+            .prepared
+            .iter()
+            .map(|(txn, prepared)| (txn.clone(), prepared.footprint.iter().cloned().collect()))
+            .collect();
+        if prepared.is_empty() {
+            return Ok(());
+        }
+        let transactions = transactions_beside(&self.reader.prefix, self.dataset.is_empty());
+        for (txn, footprint) in prepared {
+            let Some(commit) =
+                catalog::read_decision(&self.reader.store, &transactions, &txn).await?
+            else {
+                continue;
+            };
+            self.commit_now(Action::new(Kind::Resolve(proto::Resolve {
+                txn: txn.clone(),
+                footprint,
+                commit,
+            })))
+            .await?;
+            tracing::info!(
+                "{} applied transaction {txn} across datasets ({}) after reading its state back.",
+                subject(&self.dataset),
+                if commit { "committed" } else { "aborted" }
+            );
+        }
+        Ok(())
     }
 
     /// Replace the state with the log's committed state, without taking the log
@@ -1013,9 +1082,10 @@ impl Inner {
     /// caller gets. The lease's drop starts the background reopen.
     fn unresolved(&mut self, cause: &str) -> CatalogError {
         self.stop = Some(Stop::Unresolved);
-        let message = unresolved_commit_message(&self.dataset, cause);
-        tracing::warn!("{message}");
-        CatalogError::InvalidOperationNoSource { message }
+        tracing::warn!("{}", unresolved_commit_message(&self.dataset, cause));
+        CatalogError::InvalidOperationNoSource {
+            message: unknown_outcome_message(&self.dataset, cause),
+        }
     }
 
     /// Commit a transaction's `Prepare` or `Resolve` now, as its own record,
@@ -2769,7 +2839,9 @@ impl Inner {
 
 #[cfg(test)]
 mod commit_outcome_message_tests {
-    use super::{fenced_message, refused_change_message, unresolved_commit_message};
+    use super::{
+        fenced_message, refused_change_message, unknown_outcome_message, unresolved_commit_message,
+    };
 
     #[test]
     fn each_stop_names_the_dataset_what_happens_and_the_fix() {
@@ -2786,5 +2858,9 @@ mod commit_outcome_message_tests {
             "Dataset 'orders' (cayenne) stopped writing, because another Spice instance now writes its state; this instance keeps answering queries from the state saved so far. Restart this instance to make it the writer again."
         );
         assert!(fenced_message("").starts_with("The Cayenne object-native metastore stopped writing"));
+        assert_eq!(
+            unknown_outcome_message("orders", "connection reset"),
+            "The outcome of this change to dataset 'orders' (cayenne) is unknown: Spice could not confirm whether it was saved, so check whether its rows are visible before retrying it. The dataset accepts no change until it has read its state back, which it retries in the background. Cause: connection reset"
+        );
     }
 }
