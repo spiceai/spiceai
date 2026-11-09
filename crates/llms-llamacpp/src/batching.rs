@@ -307,7 +307,7 @@ fn run<'m, S: Shared<'m>>(
                 }
             }
         }
-        admit(model, shared, &mut slots, &mut waiting, eog, &mut tick);
+        admit(model, shared, split, &mut slots, &mut waiting, eog, &mut tick);
         if !step(model, shared, split, &mut slots, &mut tick) {
             std::thread::sleep(PAUSED_POLL);
         }
@@ -318,6 +318,7 @@ fn run<'m, S: Shared<'m>>(
 fn admit<'m, S: Shared<'m>>(
     model: &'m Model,
     shared: &mut S,
+    split: bool,
     slots: &mut [Slot<'m>],
     waiting: &mut VecDeque<Job>,
     eog: &[Token],
@@ -352,7 +353,8 @@ fn admit<'m, S: Shared<'m>>(
         let Some(job) = waiting.pop_front() else {
             return;
         };
-        start(model, shared, &mut slots[free], job, eog, reserve, tick);
+        let argmax = split && greedy_alone(slots);
+        start(model, shared, argmax, &mut slots[free], job, eog, reserve, tick);
     }
 }
 
@@ -432,11 +434,27 @@ fn make_room<'m, S: Shared<'m>>(
     true
 }
 
+/// Whether every running request picks greedily alone, so that a split model may take its
+/// picks from the argmax output ([`Context::set_argmax_output`]).
+fn greedy_alone(slots: &[Slot<'_>]) -> bool {
+    slots
+        .iter()
+        .filter_map(|slot| slot.running.as_ref())
+        .all(|running| running.picker.picks_greedily())
+}
+
 /// Reads `job`'s prompt into `slot`'s sequence and samples its first token, which it sends;
 /// the request then decodes with the others from the next step, unless that token ended it.
+/// With `argmax`, every running request picks greedily alone on a split model, and the prompt
+/// is read with the argmax output on when this request does too.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the request's slot, its job and the scheduler's state it reads and updates"
+)]
 fn start<'m, S: Shared<'m>>(
     model: &'m Model,
     shared: &mut S,
+    argmax: bool,
     slot: &mut Slot<'m>,
     job: Job,
     eog: &[Token],
@@ -463,6 +481,9 @@ fn start<'m, S: Shared<'m>>(
         }
     };
     out.begin(picker.goes_on());
+    shared
+        .context_mut()
+        .set_argmax_output(argmax && picker.picks_greedily());
     let mut target = InSeq {
         shared: &mut *shared,
         seq: slot.seq,
@@ -699,8 +720,13 @@ fn step<'m, S: Shared<'m>>(
             drafted,
         });
     }
-    let decoded = shared
-        .context_mut()
+    // The decode outputs a row for every request in it, and the argmax output (which has no
+    // logits) serves only requests that pick greedily alone, so it is on when every running
+    // request does. It changes, and rebuilds the graph, only when that set changes.
+    let argmax = split && greedy_alone(slots);
+    let context = shared.context_mut();
+    context.set_argmax_output(argmax);
+    let decoded = context
         .decode(&batch)
         .map_err(|e| e.to_string())
         .and_then(|()| shared.decoded(&batch));
