@@ -41,7 +41,6 @@ pub fn removed_engine_message(engine: &str) -> String {
 pub enum Engine {
     Arrow,
     PartitionedArrow,
-    DuckDB,
     Sqlite,
     PostgreSQL,
     #[default]
@@ -60,19 +59,18 @@ impl Engine {
 
     /// Whether the engine keeps every memory-mode dataset in one in-process
     /// instance, whose tables outlive the dataset that loaded them until Spice
-    /// stops: `DuckDB` and `SQLite` share one connection pool in memory mode,
-    /// while Arrow and Cayenne end a memory table with its dataset.
+    /// stops: `SQLite` shares one connection pool in memory mode, while Arrow
+    /// and Cayenne end a memory table with its dataset.
     #[must_use]
     pub fn shares_memory_instance(&self) -> bool {
-        matches!(self, Engine::DuckDB | Engine::Sqlite)
+        matches!(self, Engine::Sqlite)
     }
 
     /// Whether the engine reads table names that differ only in case as one
-    /// table in a store: `SQLite` then keeps two such datasets in one table,
-    /// and `DuckDB` refuses to create the second.
+    /// table in a store: `SQLite` then keeps two such datasets in one table.
     #[must_use]
     pub fn reads_case_variant_names_as_one_table(&self) -> bool {
-        matches!(self, Engine::DuckDB | Engine::Sqlite)
+        matches!(self, Engine::Sqlite)
     }
 }
 
@@ -80,7 +78,6 @@ impl Display for Engine {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Engine::Arrow | Engine::PartitionedArrow => write!(f, "arrow"),
-            Engine::DuckDB => write!(f, "duckdb"),
             Engine::Sqlite => write!(f, "sqlite"),
             Engine::PostgreSQL => write!(f, "postgres"),
             Engine::Cayenne => write!(f, "cayenne"),

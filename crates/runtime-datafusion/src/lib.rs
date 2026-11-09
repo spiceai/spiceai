@@ -76,14 +76,10 @@ pub const CATALOG_ACCELERATION_DATASET_PREFIX: &str = "__catalog_accel_";
 /// The starts of the names Spice gives tables of its own, each with the tables
 /// that take such names. No dataset may take one: it would take that table's
 /// data.
-const RESERVED_TABLE_NAME_PREFIXES: [(&str, &str); 3] = [
+const RESERVED_TABLE_NAME_PREFIXES: [(&str, &str); 2] = [
     (
         CATALOG_ACCELERATION_DATASET_PREFIX,
         "the tables Spice keeps for accelerated catalogs",
-    ),
-    (
-        "__data_",
-        "the tables a DuckDB acceleration keeps its data in",
     ),
     (
         "spice_sys_",

@@ -2015,8 +2015,7 @@ impl Runtime {
     /// the name the component prints as, so two names that print alike, such
     /// as `"s1.t1"` and `s1.t1`, share one table in a store of any engine, and
     /// Cayenne finds a table by that name in a metastore other datasets may
-    /// share; `DuckDB` and `SQLite` also read names that differ only in case as
-    /// one table.
+    /// share; `SQLite` also reads names that differ only in case as one table.
     async fn component_sharing_table(
         self: &Arc<Self>,
         dataset: &Dataset,
@@ -2075,8 +2074,8 @@ impl Runtime {
 
     /// Delete the acceleration data of `dataset`, a definition `app` served and
     /// that no longer serves. A failure is its whole chain on one line: its
-    /// innermost error can be a bare code, such as `DuckDB`'s, whose layer
-    /// above holds the text that names the file.
+    /// innermost error can be a bare code, whose layer above holds the text
+    /// that names the file.
     async fn delete_acceleration_data(
         self: Arc<Self>,
         dataset: &Dataset,
@@ -2253,7 +2252,6 @@ fn shares_table_with(shared: &SharedTable) -> String {
     let shown = display_dataset_name(name);
     let engine = store.engine();
     let engine_name = match engine {
-        Engine::DuckDB => "DuckDB".to_string(),
         Engine::Sqlite => "SQLite".to_string(),
         Engine::Cayenne => "Cayenne".to_string(),
         other => format!("`{other}`"),
@@ -2844,9 +2842,9 @@ mod tests {
                 "view",
                 "\"Orders\"",
                 None,
-                Store::SharedMemory(Engine::DuckDB)
+                Store::SharedMemory(Engine::Sqlite)
             )),
-            "view 'Orders' keeps its acceleration data in the same DuckDB memory instance, and DuckDB reads table names that differ only in case as one table, so the two cannot keep their data apart there. Give this dataset a name that differs from 'Orders' by more than case, or keep its data apart: accelerate it in a file (`acceleration.mode = 'file'`), or use the `cayenne` engine."
+            "view 'Orders' keeps its acceleration data in the same SQLite memory instance, and SQLite reads table names that differ only in case as one table, so the two cannot keep their data apart there. Give this dataset a name that differs from 'Orders' by more than case, or keep its data apart: accelerate it in a file (`acceleration.mode = 'file'`), or use the `cayenne` engine."
         );
         // Two names that print alike: `s1.t1`, a table in schema `s1`, and
         // `"s1.t1"`, one name, which prints quoted.
@@ -2856,11 +2854,11 @@ mod tests {
                 "s1.t1",
                 Some("s1.t1"),
                 Store::Located {
-                    engine: Engine::DuckDB,
-                    location: "/data/accelerated_duckdb.db".to_string(),
+                    engine: Engine::Sqlite,
+                    location: "/data/accelerated_sqlite.db".to_string(),
                 }
             )),
-            "dataset 's1.t1' keeps its acceleration data in the same DuckDB file, in the table `s1.t1`, which this dataset would use too. Give this dataset another name, or keep its data apart: set its own `acceleration.params.duckdb_file`, or use the `cayenne` engine."
+            "dataset 's1.t1' keeps its acceleration data in the same SQLite file, in the table `s1.t1`, which this dataset would use too. Give this dataset another name, or keep its data apart: set its own `acceleration.params.sqlite_file`, or use the `cayenne` engine."
         );
         assert_eq!(
             shares_table_with(&shared(
