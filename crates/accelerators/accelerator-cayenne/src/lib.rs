@@ -3392,7 +3392,10 @@ impl CayenneAccelerator {
     /// new dataset that goes there) or at its data path. Decided as
     /// [`Self::object_native_data_placement`] decides it, without logging or
     /// refusing anything, for the steps of a load that run before the table opens.
-    async fn location_placement(&self, source: &dyn AccelerationSource) -> Result<LocationPlacement> {
+    async fn location_placement(
+        &self,
+        source: &dyn AccelerationSource,
+    ) -> Result<LocationPlacement> {
         if !source.is_file_accelerated() || !Self::vnext_enabled(source)? {
             return Ok(LocationPlacement::Elsewhere);
         }

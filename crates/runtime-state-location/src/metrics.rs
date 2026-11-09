@@ -530,7 +530,10 @@ mod tests {
         recorded.metrics.publish_counters_at_zero();
         let store = recorded.store(StateFeature::CayenneData);
         store
-            .put(&Path::from("d/data/t/s/f.vortex"), PutPayload::from_static(b"x"))
+            .put(
+                &Path::from("d/data/t/s/f.vortex"),
+                PutPayload::from_static(b"x"),
+            )
             .await
             .expect("put a data file");
 
@@ -542,7 +545,10 @@ mod tests {
             "snapshots",
             "cayenne_metastore",
         ] {
-            expected.insert(format!("state_store_conflicts_total{{feature={feature}}}"), 0);
+            expected.insert(
+                format!("state_store_conflicts_total{{feature={feature}}}"),
+                0,
+            );
             expected.insert(
                 format!("state_store_cleanup_deleted_total{{feature={feature}}}"),
                 0,

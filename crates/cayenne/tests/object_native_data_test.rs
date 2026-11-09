@@ -43,13 +43,13 @@ use futures::TryStreamExt;
 use futures::stream::BoxStream;
 use object_store::memory::InMemory;
 use object_store::path::Path;
-use object_store_occ::sim::Op;
-use object_store_occ::sim::fault::{Fault, FaultStore};
-use object_store_occ::sim::latency::{Delay, LatencyProfile, LatencyStore};
 use object_store::{
     CopyOptions, GetOptions, GetResult, ListResult, MultipartUpload, ObjectMeta, ObjectStore,
     ObjectStoreExt, PutMultipartOptions, PutOptions, PutPayload, PutResult, RenameOptions,
 };
+use object_store_occ::sim::Op;
+use object_store_occ::sim::fault::{Fault, FaultStore};
+use object_store_occ::sim::latency::{Delay, LatencyProfile, LatencyStore};
 
 const CATALOG: &str = "state/cayenne/v1/catalog";
 
@@ -88,7 +88,9 @@ impl CountingStore {
     fn note(&self, location: Option<&Path>) {
         let forbidden = self.forbidden.read();
         let location = location.map_or("", Path::as_ref);
-        if !forbidden.is_empty() && (location.starts_with(forbidden.as_str()) || forbidden.starts_with(location)) {
+        if !forbidden.is_empty()
+            && (location.starts_with(forbidden.as_str()) || forbidden.starts_with(location))
+        {
             if std::env::var("C3_DEBUG").is_ok() {
                 eprintln!("DEBUG forbidden request: '{location}'");
             }
@@ -108,7 +110,9 @@ impl CountingStore {
     fn note_list(&self, prefix: Option<&Path>) {
         let watched = self.watched.read();
         let prefix = prefix.map_or("", Path::as_ref);
-        if !watched.is_empty() && (prefix.starts_with(watched.as_str()) || watched.starts_with(prefix)) {
+        if !watched.is_empty()
+            && (prefix.starts_with(watched.as_str()) || watched.starts_with(prefix))
+        {
             self.lists.fetch_add(1, Ordering::SeqCst);
         }
     }
@@ -141,12 +145,20 @@ impl ObjectStore for CountingStore {
         self.inner.put_multipart_opts(location, opts).await
     }
 
-    async fn get_opts(&self, location: &Path, options: GetOptions) -> object_store::Result<GetResult> {
+    async fn get_opts(
+        &self,
+        location: &Path,
+        options: GetOptions,
+    ) -> object_store::Result<GetResult> {
         self.note(Some(location));
         self.inner.get_opts(location, options).await
     }
 
-    async fn get_ranges(&self, location: &Path, ranges: &[Range<u64>]) -> object_store::Result<Vec<Bytes>> {
+    async fn get_ranges(
+        &self,
+        location: &Path,
+        ranges: &[Range<u64>],
+    ) -> object_store::Result<Vec<Bytes>> {
         self.note(Some(location));
         self.inner.get_ranges(location, ranges).await
     }
@@ -180,13 +192,23 @@ impl ObjectStore for CountingStore {
         self.inner.list_with_delimiter(prefix).await
     }
 
-    async fn copy_opts(&self, from: &Path, to: &Path, options: CopyOptions) -> object_store::Result<()> {
+    async fn copy_opts(
+        &self,
+        from: &Path,
+        to: &Path,
+        options: CopyOptions,
+    ) -> object_store::Result<()> {
         self.note(Some(from));
         self.note(Some(to));
         self.inner.copy_opts(from, to, options).await
     }
 
-    async fn rename_opts(&self, from: &Path, to: &Path, options: RenameOptions) -> object_store::Result<()> {
+    async fn rename_opts(
+        &self,
+        from: &Path,
+        to: &Path,
+        options: RenameOptions,
+    ) -> object_store::Result<()> {
         self.inner.rename_opts(from, to, options).await
     }
 }
@@ -218,9 +240,13 @@ fn vortex_config() -> VortexConfig {
 }
 
 async fn open_catalog(store: &Arc<dyn ObjectStore>) -> ObjectNativeCatalog {
-    let catalog = ObjectNativeCatalog::open_or_create_at(Arc::clone(store), Path::from(CATALOG), "s3://bucket/state/cayenne/v1")
-        .await
-        .expect("open the object-native catalog");
+    let catalog = ObjectNativeCatalog::open_or_create_at(
+        Arc::clone(store),
+        Path::from(CATALOG),
+        "s3://bucket/state/cayenne/v1",
+    )
+    .await
+    .expect("open the object-native catalog");
     catalog.init().await.expect("init");
     catalog
 }
@@ -231,15 +257,26 @@ fn builder(
     ctx: &SessionContext,
 ) -> CayenneTableProviderBuilder {
     let url = url::Url::parse(&setup.data_url).expect("data url");
-    CayenneTableProviderBuilder::new(catalog, ctx.runtime_env()).with_object_store(ObjectStoreConfig {
-        url,
-        store: Arc::clone(&setup.store),
-    })
+    CayenneTableProviderBuilder::new(catalog, ctx.runtime_env()).with_object_store(
+        ObjectStoreConfig {
+            url,
+            store: Arc::clone(&setup.store),
+        },
+    )
 }
 
-async fn create(name: &str) -> (Setup, Arc<dyn MetadataCatalog>, Arc<CayenneTableProvider>, SessionContext) {
+async fn create(
+    name: &str,
+) -> (
+    Setup,
+    Arc<dyn MetadataCatalog>,
+    Arc<CayenneTableProvider>,
+    SessionContext,
+) {
     let counting = Arc::new(CountingStore::new());
-    let faults = Arc::new(FaultStore::new(Arc::clone(&counting) as Arc<dyn ObjectStore>));
+    let faults = Arc::new(FaultStore::new(
+        Arc::clone(&counting) as Arc<dyn ObjectStore>
+    ));
     let store: Arc<dyn ObjectStore> = Arc::clone(&faults) as Arc<dyn ObjectStore>;
     let catalog = open_catalog(&store).await;
     let folder = new_dataset_folder(name);
@@ -281,13 +318,28 @@ async fn count_and_sum(ctx: &SessionContext, name: &str) -> (i64, i64) {
         .await
         .expect("execute");
     let batch = &batches[0];
-    let count = batch.column(0).as_any().downcast_ref::<Int64Array>().expect("count").value(0);
-    let sum = batch.column(1).as_any().downcast_ref::<Int64Array>().expect("sum").value(0);
+    let count = batch
+        .column(0)
+        .as_any()
+        .downcast_ref::<Int64Array>()
+        .expect("count")
+        .value(0);
+    let sum = batch
+        .column(1)
+        .as_any()
+        .downcast_ref::<Int64Array>()
+        .expect("sum")
+        .value(0);
     (count, sum)
 }
 
 async fn run(ctx: &SessionContext, sql: &str) {
-    ctx.sql(sql).await.expect("plan").collect().await.expect("execute");
+    ctx.sql(sql)
+        .await
+        .expect("plan")
+        .collect()
+        .await
+        .expect("execute");
 }
 
 /// Sum of `v = id * 10` for `id` in `first..=last`.
@@ -389,7 +441,11 @@ async fn reopen_in(
     store: &Arc<dyn ObjectStore>,
     data_url: &str,
     name: &str,
-) -> (Arc<dyn MetadataCatalog>, Arc<CayenneTableProvider>, SessionContext) {
+) -> (
+    Arc<dyn MetadataCatalog>,
+    Arc<CayenneTableProvider>,
+    SessionContext,
+) {
     let catalog: Arc<dyn MetadataCatalog> = Arc::new(open_catalog(store).await);
     let ctx = SessionContext::new();
     let table = Arc::new(
@@ -408,7 +464,13 @@ async fn reopen_in(
 }
 
 /// The exact text of a query over a committed file the store lost.
-fn missing_text(dataset: &str, kind: &str, object: &str, location: &str, consequence: &str) -> String {
+fn missing_text(
+    dataset: &str,
+    kind: &str,
+    object: &str,
+    location: &str,
+    consequence: &str,
+) -> String {
     format!(
         "Failed to query dataset '{dataset}' (cayenne): {kind} '{object}' is missing from '{location}', so {consequence}. To reload the dataset from its source, start it once with `acceleration.mode: file_create`. See: https://spiceai.org/docs/components/data-accelerators/cayenne"
     )
@@ -423,7 +485,11 @@ const PARTIAL: &str = "the query fails rather than return partial results";
 async fn writes_scan_their_committed_files_and_reopen_from_the_store() {
     let (setup, catalog, _table, ctx) = create("orders").await;
     assert_eq!(
-        catalog.get_table("orders").await.expect("stored table").path,
+        catalog
+            .get_table("orders")
+            .await
+            .expect("stored table")
+            .path,
         setup.data_url,
         "the table path the metastore records is the placement"
     );
@@ -443,7 +509,11 @@ async fn writes_scan_their_committed_files_and_reopen_from_the_store() {
             (last, expected_sum(1, last)),
             "rows after append {batch}"
         );
-        assert_eq!(setup.counting.lists(), 0, "a scan after append {batch} listed the data prefix");
+        assert_eq!(
+            setup.counting.lists(),
+            0,
+            "a scan after append {batch} listed the data prefix"
+        );
     }
 
     run(
@@ -452,8 +522,15 @@ async fn writes_scan_their_committed_files_and_reopen_from_the_store() {
     )
     .await;
     setup.counting.watch(&setup.data_prefix);
-    assert_eq!(count_and_sum(&ctx, "orders").await, (500, expected_sum(1, 500)));
-    assert_eq!(setup.counting.lists(), 0, "a scan after the full refresh listed the data prefix");
+    assert_eq!(
+        count_and_sum(&ctx, "orders").await,
+        (500, expected_sum(1, 500))
+    );
+    assert_eq!(
+        setup.counting.lists(),
+        0,
+        "a scan after the full refresh listed the data prefix"
+    );
 
     let objects = data_objects(&setup).await;
     assert!(
@@ -472,7 +549,10 @@ async fn writes_scan_their_committed_files_and_reopen_from_the_store() {
         .iter()
         .filter(|key| key.ends_with(".vortex") && !key.starts_with(&setup.data_prefix))
         .collect();
-    assert!(outside.is_empty(), "data files outside the dataset folder: {outside:?}");
+    assert!(
+        outside.is_empty(),
+        "data files outside the dataset folder: {outside:?}"
+    );
 
     // Reopen from the store alone: a new catalog and a new table over the same objects.
     drop(ctx);
@@ -488,8 +568,15 @@ async fn writes_scan_their_committed_files_and_reopen_from_the_store() {
     ctx.register_table("orders", Arc::clone(&table) as Arc<dyn TableProvider>)
         .expect("register");
     setup.counting.watch(&setup.data_prefix);
-    assert_eq!(count_and_sum(&ctx, "orders").await, (500, expected_sum(1, 500)));
-    assert_eq!(setup.counting.lists(), 0, "a scan after reopening listed the data prefix");
+    assert_eq!(
+        count_and_sum(&ctx, "orders").await,
+        (500, expected_sum(1, 500))
+    );
+    assert_eq!(
+        setup.counting.lists(),
+        0,
+        "a scan after reopening listed the data prefix"
+    );
 }
 
 /// A data file the committed state names but the store lost is an error, never
@@ -536,7 +623,10 @@ async fn a_missing_data_file_is_an_error_not_fewer_rows() {
     let error = match result {
         Ok(batches) => panic!(
             "a scan over a lost data file returned {} rows instead of failing",
-            batches.iter().map(arrow::array::RecordBatch::num_rows).sum::<usize>()
+            batches
+                .iter()
+                .map(arrow::array::RecordBatch::num_rows)
+                .sum::<usize>()
         ),
         Err(error) => error,
     };
@@ -595,7 +685,10 @@ async fn a_truncated_data_file_is_an_error_not_fewer_rows() {
     let error = match result {
         Ok(batches) => panic!(
             "a scan over a truncated data file returned {} rows instead of failing",
-            batches.iter().map(arrow::array::RecordBatch::num_rows).sum::<usize>()
+            batches
+                .iter()
+                .map(arrow::array::RecordBatch::num_rows)
+                .sum::<usize>()
         ),
         Err(error) => error,
     };
@@ -610,12 +703,16 @@ async fn a_truncated_data_file_is_an_error_not_fewer_rows() {
     let tail = format!(
         " the read needs, so it was truncated), so {PARTIAL}. To reload the dataset from its source, start it once with `acceleration.mode: file_create`. See: https://spiceai.org/docs/components/data-accelerators/cayenne"
     );
-    let at = message
-        .find(&head)
-        .unwrap_or_else(|| panic!("the error is the unreadable-data-file text\n expected: {head}…{tail}\n got: {message}"));
+    let at = message.find(&head).unwrap_or_else(|| {
+        panic!(
+            "the error is the unreadable-data-file text\n expected: {head}…{tail}\n got: {message}"
+        )
+    });
     let rest = &message[at + head.len()..];
     let needed_end = rest.find(&tail).unwrap_or_else(|| {
-        panic!("the error is the unreadable-data-file text\n expected: {head}…{tail}\n got: {message}")
+        panic!(
+            "the error is the unreadable-data-file text\n expected: {head}…{tail}\n got: {message}"
+        )
     });
     let needed: u64 = rest[..needed_end]
         .parse()
@@ -632,20 +729,44 @@ async fn a_truncated_data_file_is_an_error_not_fewer_rows() {
 #[tokio::test]
 async fn a_missing_deletion_vector_of_a_placed_dataset_is_an_error() {
     let (setup, catalog, _table, _ctx) = create("unused").await;
-    let (data_url, data_prefix, table, ctx) =
-        add_dataset(&setup, &catalog, "keyed", &["id"]).await;
+    let (data_url, data_prefix, table, ctx) = add_dataset(&setup, &catalog, "keyed", &["id"]).await;
     run(&ctx, "INSERT INTO keyed VALUES (1, 10), (2, 20)").await;
     run(&ctx, "INSERT INTO keyed VALUES (1, 11)").await;
     if std::env::var("C3_DEBUG").is_ok() {
         let stored = catalog.get_table("keyed").await.expect("t");
-        eprintln!("DEBUG current={} manifest={:?}", stored.current_snapshot_id, catalog.get_all_snapshot_files(&stored.table_id).await.expect("m").iter().map(|f| format!("{}/{}", f.snapshot_id, f.file_path)).collect::<Vec<_>>());
-        eprintln!("DEBUG protected={:?}", catalog.get_all_snapshot_sequences(&stored.table_id).await.expect("s"));
-        eprintln!("DEBUG objects={:?}", objects_under(&setup, &data_prefix, "").await);
-        eprintln!("DEBUG inline={:?}", catalog.get_inlined_data_count(&stored.table_id).await);
+        eprintln!(
+            "DEBUG current={} manifest={:?}",
+            stored.current_snapshot_id,
+            catalog
+                .get_all_snapshot_files(&stored.table_id)
+                .await
+                .expect("m")
+                .iter()
+                .map(|f| format!("{}/{}", f.snapshot_id, f.file_path))
+                .collect::<Vec<_>>()
+        );
+        eprintln!(
+            "DEBUG protected={:?}",
+            catalog
+                .get_all_snapshot_sequences(&stored.table_id)
+                .await
+                .expect("s")
+        );
+        eprintln!(
+            "DEBUG objects={:?}",
+            objects_under(&setup, &data_prefix, "").await
+        );
+        eprintln!(
+            "DEBUG inline={:?}",
+            catalog.get_inlined_data_count(&stored.table_id).await
+        );
     }
     assert_eq!(count_and_sum(&ctx, "keyed").await, (2, 31));
     let vectors = objects_under(&setup, &data_prefix, ".arrow").await;
-    let victim = vectors.first().expect("the upsert wrote a deletion vector").clone();
+    let victim = vectors
+        .first()
+        .expect("the upsert wrote a deletion vector")
+        .clone();
     setup
         .counting
         .inner
@@ -668,10 +789,19 @@ async fn a_missing_deletion_vector_of_a_placed_dataset_is_an_error() {
         Ok(table) => {
             ctx.register_table("keyed", Arc::new(table) as Arc<dyn TableProvider>)
                 .expect("register");
-            match ctx.sql("SELECT id, v FROM keyed").await.expect("plan").collect().await {
+            match ctx
+                .sql("SELECT id, v FROM keyed")
+                .await
+                .expect("plan")
+                .collect()
+                .await
+            {
                 Ok(batches) => panic!(
                     "a dataset that lost a deletion vector served {} rows",
-                    batches.iter().map(arrow::array::RecordBatch::num_rows).sum::<usize>()
+                    batches
+                        .iter()
+                        .map(arrow::array::RecordBatch::num_rows)
+                        .sum::<usize>()
                 ),
                 Err(error) => error.to_string(),
             }
@@ -709,7 +839,10 @@ async fn a_copied_location_serves_the_same_rows_from_its_own_objects() {
     let expected = count_and_sum(&ctx, "orders").await;
     assert_eq!(expected, (5000, expected_sum(1, 5000)));
     // The first instance stops before the copy, as a copied location's would.
-    table.flush_pending_maintenance().await.expect("maintenance");
+    table
+        .flush_pending_maintenance()
+        .await
+        .expect("maintenance");
     table.drain_in_flight_maintenance().await.expect("drain");
     drop((table, ctx, catalog));
 
@@ -770,7 +903,10 @@ async fn a_copied_location_serves_the_same_rows_from_its_own_objects() {
         "INSERT INTO orders SELECT value AS id, value * 10 AS v FROM generate_series(5001, 6000)",
     )
     .await;
-    assert_eq!(count_and_sum(&ctx, "orders").await, (6000, expected_sum(1, 6000)));
+    assert_eq!(
+        count_and_sum(&ctx, "orders").await,
+        (6000, expected_sum(1, 6000))
+    );
     assert_eq!(
         setup.counting.forbidden_hits(),
         0,
@@ -818,7 +954,9 @@ async fn a_planted_file_is_never_adopted_by_a_placed_dataset() {
         .expect("plant a file");
     let orphan_rows = |ctx: SessionContext| async move {
         let batches = ctx
-            .sql(&format!("SELECT count(*) FROM victim WHERE id >= {ORPHAN_FIRST}"))
+            .sql(&format!(
+                "SELECT count(*) FROM victim WHERE id >= {ORPHAN_FIRST}"
+            ))
             .await
             .expect("plan")
             .collect()
@@ -843,8 +981,16 @@ async fn a_planted_file_is_never_adopted_by_a_placed_dataset() {
 
     // An empty committed file set scans as empty, without listing.
     setup.counting.watch(&setup.data_prefix);
-    assert_eq!(count_and_sum(&ctx, "victim").await, (0, 0), "empty committed file set");
-    assert_eq!(setup.counting.lists(), 0, "the scan of an empty committed file set listed");
+    assert_eq!(
+        count_and_sum(&ctx, "victim").await,
+        (0, 0),
+        "empty committed file set"
+    );
+    assert_eq!(
+        setup.counting.lists(),
+        0,
+        "the scan of an empty committed file set listed"
+    );
 
     // A write, then its post-write maintenance: the manifest names only the write's files.
     run(
@@ -852,12 +998,20 @@ async fn a_planted_file_is_never_adopted_by_a_placed_dataset() {
         "INSERT INTO victim SELECT value AS id, value * 10 AS v FROM generate_series(1, 1000)",
     )
     .await;
-    table.flush_pending_maintenance().await.expect("maintenance");
+    table
+        .flush_pending_maintenance()
+        .await
+        .expect("maintenance");
     table.drain_in_flight_maintenance().await.expect("drain");
-    assert_eq!(count_and_sum(&ctx, "victim").await, (1000, expected_sum(1, 1000)));
+    assert_eq!(
+        count_and_sum(&ctx, "victim").await,
+        (1000, expected_sum(1, 1000))
+    );
     assert_eq!(orphan_rows(ctx.clone()).await, 0, "after a write");
     assert!(
-        !manifest_names(Arc::clone(&catalog), stored.table_id.clone()).await.contains(&orphan),
+        !manifest_names(Arc::clone(&catalog), stored.table_id.clone())
+            .await
+            .contains(&orphan),
         "the post-write maintenance adopted the planted file"
     );
 
@@ -865,8 +1019,15 @@ async fn a_planted_file_is_never_adopted_by_a_placed_dataset() {
     // the empty set scans as empty rather than falling back to the directory.
     drop((table, ctx, catalog));
     let (catalog, table, ctx) = reopen_in(&setup.store, &setup.data_url, "victim").await;
-    assert_eq!(count_and_sum(&ctx, "victim").await, (1000, expected_sum(1, 1000)));
-    assert!(!manifest_names(Arc::clone(&catalog), stored.table_id.clone()).await.contains(&orphan));
+    assert_eq!(
+        count_and_sum(&ctx, "victim").await,
+        (1000, expected_sum(1, 1000))
+    );
+    assert!(
+        !manifest_names(Arc::clone(&catalog), stored.table_id.clone())
+            .await
+            .contains(&orphan)
+    );
     catalog
         .clear_snapshot_files_except(&stored.table_id, "no-such-snapshot")
         .await
@@ -881,11 +1042,12 @@ async fn a_planted_file_is_never_adopted_by_a_placed_dataset() {
     );
     assert_eq!(setup.counting.lists(), 0, "the scan listed the data prefix");
     assert!(
-        manifest_names(catalog, stored.table_id.clone()).await.is_empty(),
+        manifest_names(catalog, stored.table_id.clone())
+            .await
+            .is_empty(),
         "the reopen backfilled the manifest from a listing"
     );
 }
-
 
 /// A write whose files fail to reach their snapshot is not visible, and after a
 /// reopen it is all there or not there at all, never part of it.
@@ -897,7 +1059,10 @@ async fn a_failed_move_is_invisible_and_resolves_all_or_nothing() {
         "INSERT INTO ledger SELECT value AS id, value * 10 AS v FROM generate_series(1, 1000)",
     )
     .await;
-    assert_eq!(count_and_sum(&ctx, "ledger").await, (1000, expected_sum(1, 1000)));
+    assert_eq!(
+        count_and_sum(&ctx, "ledger").await,
+        (1000, expected_sum(1, 1000))
+    );
 
     // The next write's copy from staging into the snapshot fails before I/O.
     let data_prefix = setup.data_prefix.clone();
@@ -912,7 +1077,10 @@ async fn a_failed_move_is_invisible_and_resolves_all_or_nothing() {
         .expect("plan")
         .collect()
         .await;
-    assert!(failed.is_err(), "the write whose move failed reports an error");
+    assert!(
+        failed.is_err(),
+        "the write whose move failed reports an error"
+    );
     assert_eq!(
         count_and_sum(&ctx, "ledger").await,
         (1000, expected_sum(1, 1000)),
@@ -937,7 +1105,6 @@ async fn a_failed_move_is_invisible_and_resolves_all_or_nothing() {
     );
     eprintln!("a_failed_move: after reopen {after:?}");
 }
-
 
 /// Whether `key` is a deletion vector (`….arrow`).
 fn is_deletion_vector(key: &str) -> bool {
@@ -988,11 +1155,13 @@ async fn sweep_with_failing_deletes(
             table_name: name.to_string(),
             schema: schema(),
             primary_key: vec!["id".to_string()],
-            on_conflict: Some(datafusion_table_providers::util::on_conflict::OnConflict::Upsert(
-                datafusion_table_providers::util::column_reference::ColumnReference::new(vec![
-                    "id".to_string(),
-                ]),
-            )),
+            on_conflict: Some(
+                datafusion_table_providers::util::on_conflict::OnConflict::Upsert(
+                    datafusion_table_providers::util::column_reference::ColumnReference::new(vec![
+                        "id".to_string(),
+                    ]),
+                ),
+            ),
             base_path: base_path.to_string(),
             partition_column: None,
             vortex_config: parked.clone(),
@@ -1005,7 +1174,10 @@ async fn sweep_with_failing_deletes(
     for value in 0..26 {
         run(&ctx, &format!("INSERT INTO {name} VALUES (1, {value})")).await;
     }
-    table.flush_pending_maintenance().await.expect("maintenance");
+    table
+        .flush_pending_maintenance()
+        .await
+        .expect("maintenance");
     table.drain_in_flight_maintenance().await.expect("drain");
     let table_id = table.table_id().to_string();
     drop((table, ctx));
@@ -1061,7 +1233,11 @@ async fn sweep_with_failing_deletes(
         .len();
     let objects_after = arrow_objects(Arc::clone(&store)).await;
     faults.clear_rules();
-    assert_eq!(count_and_sum(&ctx, name).await, (1, 25), "rows after the reclaim");
+    assert_eq!(
+        count_and_sum(&ctx, name).await,
+        (1, 25),
+        "rows after the reclaim"
+    );
     SweepOutcome {
         rows_before,
         rows_after,
@@ -1077,7 +1253,10 @@ async fn sweep_with_failing_deletes(
 async fn a_placed_dataset_reclaims_orphaned_deletion_vectors_rows_first() {
     let (setup, catalog, _table, _ctx) = create("unused").await;
     let datasets = catalog_datasets_prefix(&setup.data_prefix);
-    let data_url = format!("s3://bucket/{datasets}/{}/data", new_dataset_folder("swept"));
+    let data_url = format!(
+        "s3://bucket/{datasets}/{}/data",
+        new_dataset_folder("swept")
+    );
     let outcome = sweep_with_failing_deletes(
         Arc::clone(&catalog),
         &setup.faults,
@@ -1086,7 +1265,11 @@ async fn a_placed_dataset_reclaims_orphaned_deletion_vectors_rows_first() {
         "swept",
     )
     .await;
-    assert!(outcome.rows_before >= 25, "the upserts wrote deletion vectors: {}", outcome.rows_before);
+    assert!(
+        outcome.rows_before >= 25,
+        "the upserts wrote deletion vectors: {}",
+        outcome.rows_before
+    );
     assert_eq!(outcome.objects_before, outcome.rows_before);
     assert_eq!(
         outcome.rows_after, 0,
@@ -1098,7 +1281,11 @@ async fn a_placed_dataset_reclaims_orphaned_deletion_vectors_rows_first() {
     );
     drop(catalog);
     let (_catalog, _table, ctx) = reopen_in(&setup.store, &data_url, "swept").await;
-    assert_eq!(count_and_sum(&ctx, "swept").await, (1, 25), "rows after a reopen");
+    assert_eq!(
+        count_and_sum(&ctx, "swept").await,
+        (1, 25),
+        "rows after a reopen"
+    );
 }
 
 /// A dataset outside the location keeps today's order, object first: when the
@@ -1113,7 +1300,8 @@ async fn an_unplaced_dataset_reclaims_orphaned_deletion_vectors_objects_first() 
     )
     .await
     .expect("fixture");
-    let catalog: Arc<dyn MetadataCatalog> = Arc::clone(&fixture.catalog) as Arc<dyn MetadataCatalog>;
+    let catalog: Arc<dyn MetadataCatalog> =
+        Arc::clone(&fixture.catalog) as Arc<dyn MetadataCatalog>;
     let outcome = sweep_with_failing_deletes(
         catalog,
         &faults,
@@ -1122,7 +1310,11 @@ async fn an_unplaced_dataset_reclaims_orphaned_deletion_vectors_objects_first() 
         "swept",
     )
     .await;
-    assert!(outcome.rows_before >= 25, "the upserts wrote deletion vectors: {}", outcome.rows_before);
+    assert!(
+        outcome.rows_before >= 25,
+        "the upserts wrote deletion vectors: {}",
+        outcome.rows_before
+    );
     assert_eq!(
         outcome.rows_after, outcome.rows_before,
         "a failed object delete keeps its row"
@@ -1137,11 +1329,19 @@ async fn an_unplaced_dataset_reclaims_orphaned_deletion_vectors_objects_first() 
 async fn an_inline_flush_of_a_placed_dataset_keeps_its_rows() {
     for keyed in [false, true] {
         let (setup, catalog, _table, _ctx) = create("anchor").await;
-        let name = if keyed { "inline_keyed" } else { "inline_plain" };
+        let name = if keyed {
+            "inline_keyed"
+        } else {
+            "inline_plain"
+        };
         let datasets = catalog_datasets_prefix(&setup.data_prefix);
         let data_url = format!("s3://bucket/{datasets}/{}/data", new_dataset_folder(name));
         let ctx = SessionContext::new();
-        let keys: Vec<String> = if keyed { vec!["id".to_string()] } else { Vec::new() };
+        let keys: Vec<String> = if keyed {
+            vec!["id".to_string()]
+        } else {
+            Vec::new()
+        };
         let table = Arc::new(
             CayenneTableProviderBuilder::new(Arc::clone(&catalog), ctx.runtime_env())
                 .with_object_store(ObjectStoreConfig {
@@ -1174,9 +1374,19 @@ async fn an_inline_flush_of_a_placed_dataset_keeps_its_rows() {
             &format!("INSERT INTO {name} SELECT value AS id, value * 10 AS v FROM generate_series(1, 100)"),
         )
         .await;
-        assert_eq!(count_and_sum(&ctx, name).await, (100, expected_sum(1, 100)), "keyed={keyed}: before the flush");
-        let flushed = table.checkpoint_inlined_data().await.expect("flush the inline rows");
-        assert_eq!(flushed, 100, "keyed={keyed}: the flush wrote every inline row to a file");
+        assert_eq!(
+            count_and_sum(&ctx, name).await,
+            (100, expected_sum(1, 100)),
+            "keyed={keyed}: before the flush"
+        );
+        let flushed = table
+            .checkpoint_inlined_data()
+            .await
+            .expect("flush the inline rows");
+        assert_eq!(
+            flushed, 100,
+            "keyed={keyed}: the flush wrote every inline row to a file"
+        );
         assert_eq!(
             count_and_sum(&ctx, name).await,
             (100, expected_sum(1, 100)),

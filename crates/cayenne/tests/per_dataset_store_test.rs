@@ -27,14 +27,9 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use crate::common;
+use arrow::array::{Array, Int64Array};
 use async_trait::async_trait;
 use bytes::Bytes;
-use futures::stream::BoxStream;
-use object_store::{
-    CopyOptions, GetOptions, GetResult, ListResult, MultipartUpload, ObjectMeta,
-    PutMultipartOptions, PutOptions, PutResult, RenameOptions,
-};
-use arrow::array::{Array, Int64Array};
 use cayenne::metadata::{CreateTableOptions, ObjectStoreConfig, VortexConfig};
 use cayenne::{CayenneTableProvider, CayenneTableProviderBuilder, MetadataCatalog};
 use datafusion::arrow::datatypes::{DataType, Field, Schema};
@@ -45,8 +40,13 @@ use datafusion::datasource::listing::{
 use datafusion::execution::object_store::ObjectStoreUrl;
 use datafusion::prelude::SessionContext;
 use futures::TryStreamExt;
+use futures::stream::BoxStream;
 use object_store::memory::InMemory;
 use object_store::path::Path;
+use object_store::{
+    CopyOptions, GetOptions, GetResult, ListResult, MultipartUpload, ObjectMeta,
+    PutMultipartOptions, PutOptions, PutResult, RenameOptions,
+};
 use object_store::{ObjectStore, ObjectStoreExt, PutPayload};
 use vortex::VortexSessionDefault;
 
@@ -621,7 +621,10 @@ async fn a_scan_reads_its_data_files_through_the_dataset_store() -> TestResult {
         .downcast_ref::<Int64Array>()
         .ok_or("sum is not Int64")?
         .value(0);
-    let expected: Vec<i64> = (1..=2500).map(|id| id * 10).filter(|v| v % 7 == 0).collect();
+    let expected: Vec<i64> = (1..=2500)
+        .map(|id| id * 10)
+        .filter(|v| v % 7 == 0)
+        .collect();
     assert_eq!(
         (count, sum),
         (i64::try_from(expected.len())?, expected.iter().sum::<i64>())

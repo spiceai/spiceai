@@ -458,4 +458,3 @@ mod object_native_data_path_tests {
         ));
     }
 }
-

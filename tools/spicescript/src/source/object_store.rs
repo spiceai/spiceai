@@ -409,7 +409,11 @@ impl Source for ObjectStore {
     /// [`ObjectCommand`]); an object store runs no SQL.
     async fn exec(&self, namespace: &str, commands: &str) -> Result<()> {
         let bucket = bucket(namespace);
-        for line in commands.lines().map(str::trim).filter(|line| !line.is_empty()) {
+        for line in commands
+            .lines()
+            .map(str::trim)
+            .filter(|line| !line.is_empty())
+        {
             match ObjectCommand::parse(line)? {
                 ObjectCommand::DeleteFirst { prefix, contains } => {
                     let key = self.first_key(&bucket, &prefix, &contains).await?;

@@ -785,7 +785,10 @@ impl ObjectNativeCatalog {
     ) -> CatalogResult<Self> {
         let anchor = location_anchor(location, &prefix);
         let (catalog, verb) = match store.head(&prefix.clone().join("head")).await {
-            Ok(_) => (Self::open_at(store, prefix, config, anchor).await?, "Opened"),
+            Ok(_) => (
+                Self::open_at(store, prefix, config, anchor).await?,
+                "Opened",
+            ),
             Err(object_store::Error::NotFound { .. }) => (
                 Self::create_at(store, prefix, config, anchor).await?,
                 "Created",

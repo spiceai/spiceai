@@ -40,8 +40,8 @@ use bytes::Bytes;
 use datafusion::execution::runtime_env::RuntimeEnv;
 use futures::StreamExt;
 use futures::stream::{self, BoxStream};
-use object_store::path::Path;
 use object_store::ObjectStoreExt as _;
+use object_store::path::Path;
 use object_store::{
     CopyOptions, Error as ObjectStoreError, GetOptions, GetResult, ListResult, MultipartUpload,
     ObjectMeta, ObjectStore, PutMultipartOptions, PutOptions, PutPayload, PutResult, RenameOptions,
@@ -634,10 +634,16 @@ impl ObjectStore for DatasetScopedStore {
                         .zip(ranges)
                         .any(|(got, range)| (got.len() as u64) < range.end - range.start) =>
             {
-                let needed = ranges.iter().map(|range| range.end).max().unwrap_or_default();
+                let needed = ranges
+                    .iter()
+                    .map(|range| range.end)
+                    .max()
+                    .unwrap_or_default();
                 let size = match self.inner.head(location).await {
                     Ok(meta) => meta.size,
-                    Err(error) => return Err(self.read_failed(location, Some(needed), error).await),
+                    Err(error) => {
+                        return Err(self.read_failed(location, Some(needed), error).await);
+                    }
                 };
                 Err(self.truncated(location, size, needed))
             }
@@ -804,7 +810,12 @@ mod tests {
         };
         assert_eq!(
             source.to_string(),
-            missing_file_message("orders", DataFileKind::Data, "t/s/x.vortex", "s3://bucket/p/a")
+            missing_file_message(
+                "orders",
+                DataFileKind::Data,
+                "t/s/x.vortex",
+                "s3://bucket/p/a"
+            )
         );
         let staged = storage
             .store()

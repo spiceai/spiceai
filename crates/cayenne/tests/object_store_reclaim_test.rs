@@ -357,7 +357,10 @@ async fn compaction_leftovers_are_reclaimed(storage: Storage) -> TestResult {
     let reclaimed_files = loop {
         let files = reclaimable(&storage.files().await?);
         let named = named_by_catalog(&catalog, &table, &storage).await?;
-        let missing: Vec<_> = named.iter().filter(|path| !files.contains_key(*path)).collect();
+        let missing: Vec<_> = named
+            .iter()
+            .filter(|path| !files.contains_key(*path))
+            .collect();
         assert!(
             missing.is_empty(),
             "files the catalog names were deleted: {missing:?}"
@@ -388,7 +391,10 @@ async fn compaction_leftovers_are_reclaimed(storage: Storage) -> TestResult {
             .extension()
             .is_some_and(|extension| extension == wanted)
     };
-    let removed_dvs = removed.keys().filter(|path| has_extension(path, "arrow")).count();
+    let removed_dvs = removed
+        .keys()
+        .filter(|path| has_extension(path, "arrow"))
+        .count();
     let removed_data: Vec<_> = removed
         .iter()
         .filter(|(path, _)| has_extension(path, "vortex"))

@@ -553,8 +553,16 @@ impl Domain {
         anchor: Option<Arc<str>>,
         dataset: &str,
     ) -> CatalogResult<Self> {
-        let (inner, opened) =
-            Inner::open(store, prefix, config, immediate, anchor, Arc::from(dataset), None).await?;
+        let (inner, opened) = Inner::open(
+            store,
+            prefix,
+            config,
+            immediate,
+            anchor,
+            Arc::from(dataset),
+            None,
+        )
+        .await?;
         Ok(Self {
             opened,
             folder: String::new(),
@@ -2925,7 +2933,9 @@ mod commit_outcome_message_tests {
             fenced_message("orders"),
             "Dataset 'orders' (cayenne) stopped writing, because another Spice instance now writes its state; this instance keeps answering queries from the state saved so far. Restart this instance to make it the writer again."
         );
-        assert!(fenced_message("").starts_with("The Cayenne object-native metastore stopped writing"));
+        assert!(
+            fenced_message("").starts_with("The Cayenne object-native metastore stopped writing")
+        );
         assert_eq!(
             unknown_outcome_message("orders", "connection reset"),
             "The outcome of this change to dataset 'orders' (cayenne) is unknown: Spice could not confirm whether it was saved, so check whether its rows are visible before retrying it. The dataset accepts no change until it has read its state back, which it retries in the background. Cause: connection reset"

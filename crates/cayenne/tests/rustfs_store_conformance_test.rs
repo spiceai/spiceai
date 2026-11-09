@@ -24,7 +24,10 @@ use std::sync::Arc;
 
 use bytes::Bytes;
 use object_store::path::Path;
-use object_store::{GetOptions, GetRange, ObjectStore, ObjectStoreExt, PutMode, PutOptions, PutPayload, UpdateVersion};
+use object_store::{
+    GetOptions, GetRange, ObjectStore, ObjectStoreExt, PutMode, PutOptions, PutPayload,
+    UpdateVersion,
+};
 
 use crate::common::{BackendType, TestFixture};
 
@@ -48,7 +51,9 @@ async fn rustfs() -> Option<(Arc<dyn ObjectStore>, String)> {
 
 /// Deterministic bytes, distinct at every offset that a range reads.
 fn pattern(len: usize) -> Vec<u8> {
-    (0..len).map(|i| u8::try_from(i % 251).expect("byte")).collect()
+    (0..len)
+        .map(|i| u8::try_from(i % 251).expect("byte"))
+        .collect()
 }
 
 #[tokio::test]
@@ -64,7 +69,10 @@ async fn ranged_reads_return_exactly_the_bytes_asked_for() {
         .expect("put");
     let len = u64::try_from(bytes.len()).expect("len");
     for range in [0..10, 500_000..500_100, len - 7..len] {
-        let got = store.get_range(&location, range.clone()).await.expect("ranged get");
+        let got = store
+            .get_range(&location, range.clone())
+            .await
+            .expect("ranged get");
         let (start, end) = (
             usize::try_from(range.start).expect("start"),
             usize::try_from(range.end).expect("end"),
@@ -72,7 +80,10 @@ async fn ranged_reads_return_exactly_the_bytes_asked_for() {
         assert_eq!(got.as_ref(), &bytes[start..end], "range {range:?}");
     }
     let ranges = [3..4, 1000..2000, len - 1..len];
-    let got = store.get_ranges(&location, &ranges).await.expect("get_ranges");
+    let got = store
+        .get_ranges(&location, &ranges)
+        .await
+        .expect("get_ranges");
     for (range, got) in ranges.iter().zip(&got) {
         let (start, end) = (
             usize::try_from(range.start).expect("start"),
@@ -138,7 +149,10 @@ async fn a_multipart_upload_completes_whole_and_an_aborted_one_leaves_nothing() 
         .await
         .expect("bytes");
     assert_eq!(read.len(), bytes.len());
-    assert!(read.as_ref() == bytes.as_slice(), "the completed object holds every part, in order");
+    assert!(
+        read.as_ref() == bytes.as_slice(),
+        "the completed object holds every part, in order"
+    );
 
     let aborted = Path::from(format!("{prefix}/multipart/aborted.vortex"));
     let mut upload = store.put_multipart(&aborted).await.expect("start");
@@ -148,7 +162,10 @@ async fn a_multipart_upload_completes_whole_and_an_aborted_one_leaves_nothing() 
         .expect("part");
     upload.abort().await.expect("abort");
     assert!(
-        matches!(store.head(&aborted).await, Err(object_store::Error::NotFound { .. })),
+        matches!(
+            store.head(&aborted).await,
+            Err(object_store::Error::NotFound { .. })
+        ),
         "an aborted upload leaves no object"
     );
 }
@@ -170,7 +187,11 @@ async fn conditional_writes_refuse_a_lost_race() {
     assert!(
         matches!(
             store
-                .put_opts(&location, PutPayload::from_static(b"x"), PutOptions::from(PutMode::Create))
+                .put_opts(
+                    &location,
+                    PutPayload::from_static(b"x"),
+                    PutOptions::from(PutMode::Create)
+                )
                 .await,
             Err(object_store::Error::AlreadyExists { .. })
         ),
@@ -191,12 +212,22 @@ async fn conditional_writes_refuse_a_lost_race() {
     assert!(
         matches!(
             store
-                .put_opts(&location, PutPayload::from_static(b"3"), PutOptions::from(PutMode::Update(version)))
+                .put_opts(
+                    &location,
+                    PutPayload::from_static(b"3"),
+                    PutOptions::from(PutMode::Update(version))
+                )
                 .await,
             Err(object_store::Error::Precondition { .. })
         ),
         "an update on a replaced version is refused"
     );
-    let read = store.get(&location).await.expect("get").bytes().await.expect("bytes");
+    let read = store
+        .get(&location)
+        .await
+        .expect("get")
+        .bytes()
+        .await
+        .expect("bytes");
     assert_eq!(read.as_ref(), b"2");
 }

@@ -205,13 +205,13 @@ async fn a_table_keeps_answering_across_session_credential_replacements() -> Tes
                 .ok_or("not an Int64 column")?
                 .value(0))
         };
-        let expected: Vec<i64> = (1..=written).map(|id| id * 10).filter(|v| v % 3 == 0).collect();
+        let expected: Vec<i64> = (1..=written)
+            .map(|id| id * 10)
+            .filter(|v| v % 3 == 0)
+            .collect();
         assert_eq!(
             (column(0)?, column(1)?),
-            (
-                i64::try_from(expected.len())?,
-                expected.iter().sum::<i64>()
-            ),
+            (i64::try_from(expected.len())?, expected.iter().sum::<i64>()),
             "after {written} rows"
         );
         let distinct: BTreeSet<String> = issued.lock().iter().cloned().collect();

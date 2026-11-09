@@ -199,10 +199,7 @@ impl FixtureDataStore {
                     )));
                 Self {
                     base_path: url.to_string(),
-                    config: Some(cayenne::metadata::ObjectStoreConfig {
-                        url,
-                        store: fault,
-                    }),
+                    config: Some(cayenne::metadata::ObjectStoreConfig { url, store: fault }),
                 }
             }
             "rustfs" => Self::rustfs()?,
@@ -245,8 +242,12 @@ impl FixtureDataStore {
             .filter(|(_, value)| value.is_none())
             .map(|(name, _)| *name)
             .collect();
-        let [Some(endpoint), Some(bucket), Some(access_key), Some(secret_key)] =
-            <[Option<String>; 4]>::try_from(values).map_err(|_| "four variables")?
+        let [
+            Some(endpoint),
+            Some(bucket),
+            Some(access_key),
+            Some(secret_key),
+        ] = <[Option<String>; 4]>::try_from(values).map_err(|_| "four variables")?
         else {
             return Err(format!(
                 "CAYENNE_TEST_DATA_STORE is 'rustfs', but {} {} not set. Start RustFS, create a bucket, and set them; \

@@ -184,7 +184,10 @@ pub fn is_object_store_path(path: &str) -> bool {
 /// prefix with `name`; `Path::from` drops empty segments, so a leading `/` on
 /// `name` or an empty prefix is harmless here.
 #[must_use]
-pub(crate) fn object_child(prefix: &object_store::path::Path, name: &str) -> object_store::path::Path {
+pub(crate) fn object_child(
+    prefix: &object_store::path::Path,
+    name: &str,
+) -> object_store::path::Path {
     object_store::path::Path::from(format!("{}/{name}", prefix.as_ref()))
 }
 
@@ -221,7 +224,10 @@ mod object_key_tests {
             object_child(&prefix, "sub/part.vortex").as_ref(),
             "data/orders/01a1/_staging/sub/part.vortex"
         );
-        assert_eq!(object_child(&Path::from(""), "wal.json").as_ref(), "wal.json");
+        assert_eq!(
+            object_child(&Path::from(""), "wal.json").as_ref(),
+            "wal.json"
+        );
     }
 
     /// The inverse: relative to a prefix only on a segment boundary, without the
@@ -241,7 +247,10 @@ mod object_key_tests {
             Some("data/orders/01a1/snap/part_0.vortex")
         );
         for name in ["part_0.vortex", "deletions/d.arrow"] {
-            assert_eq!(object_relative(&prefix, &object_child(&prefix, name)), Some(name));
+            assert_eq!(
+                object_relative(&prefix, &object_child(&prefix, name)),
+                Some(name)
+            );
         }
     }
 }

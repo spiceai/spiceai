@@ -214,10 +214,16 @@ impl Replay {
         let mut participants = Vec::with_capacity(count);
         for i in 0..count {
             let prefix = Path::from(format!("datasets/p{i}"));
-            let domain =
-                Domain::create_with_config(Arc::clone(&store), prefix.clone(), config(), false, None, "")
-                    .await
-                    .expect("create a participant's log");
+            let domain = Domain::create_with_config(
+                Arc::clone(&store),
+                prefix.clone(),
+                config(),
+                false,
+                None,
+                "",
+            )
+            .await
+            .expect("create a participant's log");
             let table =
                 domain
                     .create_table(CreateTableOptions {

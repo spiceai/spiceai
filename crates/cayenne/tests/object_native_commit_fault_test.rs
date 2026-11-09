@@ -165,7 +165,10 @@ async fn a_fenced_catalog_stops_and_its_change_is_absent() {
         Some(b"1".to_vec())
     );
     assert_eq!(
-        catalog.sidecar_value("position").await.expect("a fenced catalog still reads"),
+        catalog
+            .sidecar_value("position")
+            .await
+            .expect("a fenced catalog still reads"),
         Some(b"1".to_vec()),
         "the fenced catalog reads the committed value, not its refused change"
     );
@@ -506,7 +509,11 @@ mod data_path {
         let table = Arc::new(table);
         ctx.register_table(name, Arc::clone(&table) as Arc<dyn TableProvider>)
             .expect("register");
-        Placed { data_url, ctx, table }
+        Placed {
+            data_url,
+            ctx,
+            table,
+        }
     }
 
     /// Upsert ids `first..=last` into each of `tables` in one transaction.
@@ -518,12 +525,19 @@ mod data_path {
         let txn = cayenne::CayenneTransaction::new();
         for table in tables {
             let token = table.transaction_write_token().await;
-            txn.register(table.table_id().to_string(), token, table.clone_for_write_operations());
+            txn.register(
+                table.table_id().to_string(),
+                token,
+                table.clone_for_write_operations(),
+            );
             let ids: Vec<i64> = (first..=last).collect();
             let values: Vec<i64> = ids.iter().map(|id| id * 10).collect();
             let batch = arrow::array::RecordBatch::try_new(
                 schema(),
-                vec![Arc::new(Int64Array::from(ids)), Arc::new(Int64Array::from(values))],
+                vec![
+                    Arc::new(Int64Array::from(ids)),
+                    Arc::new(Int64Array::from(values)),
+                ],
             )
             .expect("batch");
             let staged = table
@@ -562,8 +576,22 @@ mod data_path {
         ledger: &Placed,
     ) -> (i64, i64) {
         let reopened: Arc<dyn MetadataCatalog> = Arc::new(catalog(store).await);
-        let a = place(store, &reopened, "accounts", false, Some(accounts.data_url.clone())).await;
-        let l = place(store, &reopened, "ledger", false, Some(ledger.data_url.clone())).await;
+        let a = place(
+            store,
+            &reopened,
+            "accounts",
+            false,
+            Some(accounts.data_url.clone()),
+        )
+        .await;
+        let l = place(
+            store,
+            &reopened,
+            "ledger",
+            false,
+            Some(ledger.data_url.clone()),
+        )
+        .await;
         (
             count(&a.ctx, "accounts").await.expect("count"),
             count(&l.ctx, "ledger").await.expect("count"),
@@ -579,12 +607,19 @@ mod data_path {
         let store: Arc<dyn ObjectStore> = Arc::clone(&faults) as Arc<dyn ObjectStore>;
         let (_catalog, accounts, ledger) = two_datasets(&store).await;
         faults.arm(Op::Create, is_decision, Fault::DropResponse);
-        commit_across(&[Arc::clone(&accounts.table), Arc::clone(&ledger.table)], 101, 150)
-            .await
-            .expect("the commit is read back and reported");
+        commit_across(
+            &[Arc::clone(&accounts.table), Arc::clone(&ledger.table)],
+            101,
+            150,
+        )
+        .await
+        .expect("the commit is read back and reported");
         assert_eq!(count(&accounts.ctx, "accounts").await.expect("count"), 150);
         assert_eq!(count(&ledger.ctx, "ledger").await.expect("count"), 150);
-        assert_eq!(counts_after_restart(&store, &accounts, &ledger).await, (150, 150));
+        assert_eq!(
+            counts_after_restart(&store, &accounts, &ledger).await,
+            (150, 150)
+        );
     }
 
     /// The coordinator is cancelled while its decision is in flight. When the
@@ -598,7 +633,8 @@ mod data_path {
             let (catalog, accounts, ledger) = two_datasets(&store).await;
             faults.arm(Op::Create, is_decision, Fault::Hold);
             let tables = [Arc::clone(&accounts.table), Arc::clone(&ledger.table)];
-            let coordinator = tokio::spawn(async move { commit_across(&tables, 101, 150).await.map(|_| ()) });
+            let coordinator =
+                tokio::spawn(async move { commit_across(&tables, 101, 150).await.map(|_| ()) });
             let held = faults.wait_held(None).await;
             coordinator.abort();
             assert!(coordinator.await.is_err(), "the coordinator was cancelled");
@@ -615,7 +651,12 @@ mod data_path {
         }
     }
 
-    async fn insert(ctx: &SessionContext, name: &str, first: i64, last: i64) -> datafusion::error::Result<()> {
+    async fn insert(
+        ctx: &SessionContext,
+        name: &str,
+        first: i64,
+        last: i64,
+    ) -> datafusion::error::Result<()> {
         ctx.sql(&format!(
             "INSERT INTO {name} SELECT value AS id, value * 10 AS v FROM generate_series({first}, {last})"
         ))
@@ -640,7 +681,10 @@ mod data_path {
     }
 
     fn dataset_head(catalog: &ObjectNativeCatalog, dataset: &str) -> Path {
-        catalog.dataset_log(dataset).expect("a dataset log").join("head")
+        catalog
+            .dataset_log(dataset)
+            .expect("a dataset log")
+            .join("head")
     }
 
     /// Polls `condition` every 20 ms for up to 15 s.
@@ -670,14 +714,21 @@ mod data_path {
         let store: Arc<dyn ObjectStore> = Arc::clone(&faults) as Arc<dyn ObjectStore>;
         let native = catalog(&store).await;
         let catalog_handle = Arc::new(native);
-        let shared: Arc<dyn MetadataCatalog> = Arc::clone(&catalog_handle) as Arc<dyn MetadataCatalog>;
+        let shared: Arc<dyn MetadataCatalog> =
+            Arc::clone(&catalog_handle) as Arc<dyn MetadataCatalog>;
         let placed = place(&store, &shared, "orders", true, None).await;
-        insert(&placed.ctx, "orders", 1, 1000).await.expect("first write");
+        insert(&placed.ctx, "orders", 1, 1000)
+            .await
+            .expect("first write");
         assert_eq!(count(&placed.ctx, "orders").await.expect("count"), 1000);
 
         let head = dataset_head(&catalog_handle, "orders");
         let cas_head = head.clone();
-        faults.arm(Op::Cas, move |path: &Path| path == &cas_head, Fault::DropResponse);
+        faults.arm(
+            Op::Cas,
+            move |path: &Path| path == &cas_head,
+            Fault::DropResponse,
+        );
         let get_head = head.clone();
         faults.fail_while(Op::Get, move |path: &Path| path == &get_head);
         let failed = insert(&placed.ctx, "orders", 1001, 3000)
@@ -746,12 +797,17 @@ mod data_path {
             .await
             .expect_err("the state refuses the change");
         let text = "Dataset 'orders' (cayenne) stopped accepting changes until Spice restarts, because its state refused a change, which is a bug; queries return an error until then. Restart Spice to reload the dataset from its saved state, and report the issue at https://github.com/spiceai/spiceai/issues. Cause: ";
-        assert!(refused.to_string().contains(text), "unexpected error: {refused}");
+        assert!(
+            refused.to_string().contains(text),
+            "unexpected error: {refused}"
+        );
         let later = insert(&orders.ctx, "orders", 101, 200)
             .await
             .expect_err("the stopped dataset accepts no change");
         assert!(
-            later.to_string().contains("Dataset 'orders' (cayenne) stopped accepting changes until Spice restarts"),
+            later.to_string().contains(
+                "Dataset 'orders' (cayenne) stopped accepting changes until Spice restarts"
+            ),
             "unexpected error: {later}"
         );
         insert(&audit.ctx, "audit", 101, 200)
@@ -768,11 +824,20 @@ mod data_path {
         let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
         let first: Arc<dyn MetadataCatalog> = Arc::new(catalog(&store).await);
         let placed = place(&store, &first, "orders", true, None).await;
-        insert(&placed.ctx, "orders", 1, 1000).await.expect("first write");
+        insert(&placed.ctx, "orders", 1, 1000)
+            .await
+            .expect("first write");
 
         // A second instance opens the same location and takes every log over.
         let second: Arc<dyn MetadataCatalog> = Arc::new(catalog(&store).await);
-        let successor = place(&store, &second, "orders", false, Some(placed.data_url.clone())).await;
+        let successor = place(
+            &store,
+            &second,
+            "orders",
+            false,
+            Some(placed.data_url.clone()),
+        )
+        .await;
 
         let fenced = insert(&placed.ctx, "orders", 1001, 2000)
             .await
@@ -784,7 +849,9 @@ mod data_path {
             "unexpected error: {fenced}"
         );
         assert_eq!(
-            count(&placed.ctx, "orders").await.expect("the fenced instance still reads"),
+            count(&placed.ctx, "orders")
+                .await
+                .expect("the fenced instance still reads"),
             1000,
             "the fenced instance reads the committed rows, not its refused write"
         );
@@ -798,7 +865,11 @@ mod data_path {
     /// and every read of the head fails, leaving the outcome unknown.
     fn lose_the_next_commit_response(faults: &FaultStore, head: &Path) {
         let cas_head = head.clone();
-        faults.arm(Op::Cas, move |path: &Path| path == &cas_head, Fault::DropResponse);
+        faults.arm(
+            Op::Cas,
+            move |path: &Path| path == &cas_head,
+            Fault::DropResponse,
+        );
         let get_head = head.clone();
         faults.fail_while(Op::Get, move |path: &Path| path == &get_head);
     }
@@ -828,7 +899,13 @@ mod data_path {
             .collect())
     }
 
-    async fn upsert(ctx: &SessionContext, name: &str, first: i64, last: i64, offset: i64) -> datafusion::error::Result<()> {
+    async fn upsert(
+        ctx: &SessionContext,
+        name: &str,
+        first: i64,
+        last: i64,
+        offset: i64,
+    ) -> datafusion::error::Result<()> {
         ctx.sql(&format!(
             "INSERT INTO {name} SELECT value AS id, value * 10 + {offset} AS v FROM generate_series({first}, {last})"
         ))
@@ -866,7 +943,9 @@ mod data_path {
         let native = Arc::new(catalog(&store).await);
         let shared: Arc<dyn MetadataCatalog> = Arc::clone(&native) as Arc<dyn MetadataCatalog>;
         let placed = place(&store, &shared, "orders", true, None).await;
-        insert(&placed.ctx, "orders", 1, 100).await.expect("first write");
+        insert(&placed.ctx, "orders", 1, 100)
+            .await
+            .expect("first write");
         lose_the_next_commit_response(&faults, &dataset_head(&native, "orders"));
         let failed = insert(&placed.ctx, "orders", 101, 200)
             .await
@@ -885,13 +964,16 @@ mod data_path {
     /// commit landed with its response lost is not appended again after the
     /// resume, because the cursor is read back from the committed rows.
     #[tokio::test]
-    async fn a_refresh_append_whose_commit_response_is_lost_does_not_duplicate_rows_after_the_resume() {
+    async fn a_refresh_append_whose_commit_response_is_lost_does_not_duplicate_rows_after_the_resume()
+     {
         let faults = Arc::new(FaultStore::new(Arc::new(InMemory::new())));
         let store: Arc<dyn ObjectStore> = Arc::clone(&faults) as Arc<dyn ObjectStore>;
         let native = Arc::new(catalog(&store).await);
         let shared: Arc<dyn MetadataCatalog> = Arc::clone(&native) as Arc<dyn MetadataCatalog>;
         let placed = place(&store, &shared, "events", true, None).await;
-        insert(&placed.ctx, "events", 1, 1000).await.expect("first refresh");
+        insert(&placed.ctx, "events", 1, 1000)
+            .await
+            .expect("first refresh");
         lose_the_next_commit_response(&faults, &dataset_head(&native, "events"));
         insert(&placed.ctx, "events", 1001, 2000)
             .await
@@ -901,7 +983,9 @@ mod data_path {
         let cursor = keyed_totals_max(&placed.ctx, "events").await;
         assert_eq!(cursor, 2000, "the append whose response was lost committed");
         eventually("the refresh appends after the cursor", || async {
-            insert(&placed.ctx, "events", cursor + 1, 3000).await.is_ok()
+            insert(&placed.ctx, "events", cursor + 1, 3000)
+                .await
+                .is_ok()
         })
         .await;
         assert_eq!(
@@ -918,7 +1002,10 @@ mod data_path {
             if let Ok(values) = scalars(ctx, &sql).await {
                 return values[0];
             }
-            assert!(std::time::Instant::now() < deadline, "the dataset reads within 15 s");
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the dataset reads within 15 s"
+            );
             tokio::time::sleep(std::time::Duration::from_millis(20)).await;
         }
     }
@@ -937,7 +1024,11 @@ mod data_path {
         let cas_head = head.clone();
         let get_head = head.clone();
         let fired_flag = Arc::clone(&fired);
-        let fault = if landed { Fault::DropResponse } else { Fault::Fail };
+        let fault = if landed {
+            Fault::DropResponse
+        } else {
+            Fault::Fail
+        };
         faults.arm(
             Op::Cas,
             move |path: &Path| {
@@ -973,7 +1064,9 @@ mod data_path {
         let native = Arc::new(catalog(&store).await);
         let shared: Arc<dyn MetadataCatalog> = Arc::clone(&native) as Arc<dyn MetadataCatalog>;
         let placed = place_with_key(&store, &shared, "accounts", true, None, true).await;
-        upsert(&placed.ctx, "accounts", 1, 100, 0).await.expect("first upsert");
+        upsert(&placed.ctx, "accounts", 1, 100, 0)
+            .await
+            .expect("first upsert");
         let armed = lose_the_nth_commit(&faults, &dataset_head(&native, "accounts"), nth, landed);
         // The upsert may wait for the dataset to read its state back, which it
         // can do once the store answers again: restore the store as soon as the
@@ -1009,14 +1102,32 @@ mod data_path {
             "nth={nth} landed={landed}: one row per key, all of the upsert or none of it: {totals:?}"
         );
         if outcome.is_ok() {
-            assert_eq!(totals, vec![101, 101, new], "nth={nth} landed={landed}: an acknowledged upsert is visible");
+            assert_eq!(
+                totals,
+                vec![101, 101, new],
+                "nth={nth} landed={landed}: an acknowledged upsert is visible"
+            );
         }
 
-        upsert(&placed.ctx, "accounts", 1, 50, 2).await.expect("an upsert after the resume");
+        upsert(&placed.ctx, "accounts", 1, 50, 2)
+            .await
+            .expect("an upsert after the resume");
         let after = keyed_totals(&placed.ctx, "accounts").await;
-        let _ = placed.table.compact_current_snapshot_small_files().await.expect("compaction");
-        placed.table.drain_in_flight_maintenance().await.expect("drain");
-        assert_eq!(keyed_totals(&placed.ctx, "accounts").await, after, "nth={nth} landed={landed}: after compaction");
+        let _ = placed
+            .table
+            .compact_current_snapshot_small_files()
+            .await
+            .expect("compaction");
+        placed
+            .table
+            .drain_in_flight_maintenance()
+            .await
+            .expect("drain");
+        assert_eq!(
+            keyed_totals(&placed.ctx, "accounts").await,
+            after,
+            "nth={nth} landed={landed}: after compaction"
+        );
         let data_url = placed.data_url.clone();
         drop((placed, shared, native));
         let reopened: Arc<dyn MetadataCatalog> = Arc::new(catalog(&store).await);
@@ -1030,21 +1141,29 @@ mod data_path {
     }
 
     #[tokio::test]
-    async fn a_keyed_upsert_whose_commit_landed_unconfirmed_serves_what_the_store_holds_after_a_background_reopen() {
+    async fn a_keyed_upsert_whose_commit_landed_unconfirmed_serves_what_the_store_holds_after_a_background_reopen()
+     {
         let mut fired = 0;
         for nth in 1..=4 {
             fired += usize::from(keyed_upsert_after_a_background_reopen(nth, true).await);
         }
-        assert!(fired >= 2, "the upsert's commits lost their responses ({fired} fired)");
+        assert!(
+            fired >= 2,
+            "the upsert's commits lost their responses ({fired} fired)"
+        );
     }
 
     #[tokio::test]
-    async fn a_keyed_upsert_whose_commit_did_not_land_serves_what_the_store_holds_after_a_background_reopen() {
+    async fn a_keyed_upsert_whose_commit_did_not_land_serves_what_the_store_holds_after_a_background_reopen()
+     {
         let mut fired = 0;
         for nth in 1..=4 {
             fired += usize::from(keyed_upsert_after_a_background_reopen(nth, false).await);
         }
-        assert!(fired >= 2, "the upsert's commits failed unconfirmed ({fired} fired)");
+        assert!(
+            fired >= 2,
+            "the upsert's commits failed unconfirmed ({fired} fired)"
+        );
     }
 
     /// A whole-table rewrite one of whose commits has an unknown outcome (the
@@ -1059,14 +1178,23 @@ mod data_path {
                 let faults = Arc::new(FaultStore::new(Arc::new(InMemory::new())));
                 let store: Arc<dyn ObjectStore> = Arc::clone(&faults) as Arc<dyn ObjectStore>;
                 let native = Arc::new(catalog(&store).await);
-                let shared: Arc<dyn MetadataCatalog> = Arc::clone(&native) as Arc<dyn MetadataCatalog>;
+                let shared: Arc<dyn MetadataCatalog> =
+                    Arc::clone(&native) as Arc<dyn MetadataCatalog>;
                 let placed =
-                    place_with_config(&store, &shared, "facts", true, None, false, compactable()).await;
+                    place_with_config(&store, &shared, "facts", true, None, false, compactable())
+                        .await;
                 for i in 0..5 {
-                    insert(&placed.ctx, "facts", i * 1000 + 1, (i + 1) * 1000).await.expect("append");
+                    insert(&placed.ctx, "facts", i * 1000 + 1, (i + 1) * 1000)
+                        .await
+                        .expect("append");
                 }
-                placed.table.drain_in_flight_maintenance().await.expect("drain");
-                let armed = lose_the_nth_commit(&faults, &dataset_head(&native, "facts"), nth, landed);
+                placed
+                    .table
+                    .drain_in_flight_maintenance()
+                    .await
+                    .expect("drain");
+                let armed =
+                    lose_the_nth_commit(&faults, &dataset_head(&native, "facts"), nth, landed);
                 // A whole-table rewrite: its commits are the ones that lose.
                 let _ = placed.table.sort_and_rewrite_data(64 * 1024 * 1024).await;
                 fired += usize::from(armed.load(std::sync::atomic::Ordering::SeqCst));
@@ -1075,8 +1203,14 @@ mod data_path {
                     insert(&placed.ctx, "facts", 5001, 6000).await.is_ok()
                 })
                 .await;
-                insert(&placed.ctx, "facts", 6001, 7000).await.expect("another append");
-                placed.table.drain_in_flight_maintenance().await.expect("drain");
+                insert(&placed.ctx, "facts", 6001, 7000)
+                    .await
+                    .expect("another append");
+                placed
+                    .table
+                    .drain_in_flight_maintenance()
+                    .await
+                    .expect("drain");
                 let expected = vec![7000, 7000, sum_v(1, 7000, 0)];
                 assert_eq!(
                     keyed_totals(&placed.ctx, "facts").await,
@@ -1094,7 +1228,10 @@ mod data_path {
                 );
             }
         }
-        assert!(fired >= 2, "the compaction's commits lost their outcome ({fired} fired)");
+        assert!(
+            fired >= 2,
+            "the compaction's commits lost their outcome ({fired} fired)"
+        );
     }
 
     /// A transaction across datasets whose `Resolve` on one dataset fails with
@@ -1113,7 +1250,8 @@ mod data_path {
         let accounts_head = dataset_head(native, "accounts");
         faults.arm(Op::Create, is_decision, Fault::Hold);
         let tables = [Arc::clone(&accounts.table), Arc::clone(&ledger.table)];
-        let coordinator = tokio::spawn(async move { commit_across(&tables, 101, 150).await.map(|_| ()) });
+        let coordinator =
+            tokio::spawn(async move { commit_across(&tables, 101, 150).await.map(|_| ()) });
         let held = faults.wait_held(None).await;
         // Both are prepared; the decision is about to land. The `Resolve` on
         // `accounts` then fails before it lands, and its outcome stays unknown.
@@ -1131,7 +1269,9 @@ mod data_path {
         faults.clear_rules();
         let _ = coordinator.await.expect("the coordinator finishes");
         eventually("accounts accepts upserts again", || async {
-            upsert(&accounts.ctx, "accounts", 1000, 1000, 0).await.is_ok()
+            upsert(&accounts.ctx, "accounts", 1000, 1000, 0)
+                .await
+                .is_ok()
         })
         .await;
         assert_eq!(count(&accounts.ctx, "accounts").await.expect("count"), 151);

@@ -45,10 +45,7 @@ use std::sync::Arc;
 
 use arrow::array::{Int64Array, RecordBatch, StringArray};
 use arrow::datatypes::{DataType, Field, Schema};
-use cayenne::{
-    CayenneTableProvider, MetadataCatalog,
-    metadata::CreateTableOptions,
-};
+use cayenne::{CayenneTableProvider, MetadataCatalog, metadata::CreateTableOptions};
 use common::TestFixture;
 use datafusion::datasource::TableProvider;
 use datafusion::execution::context::SessionContext;
@@ -268,7 +265,9 @@ async fn reopen_and_read_int64_rows(
     let catalog: Arc<dyn MetadataCatalog> =
         Arc::clone(&fixture.catalog) as Arc<dyn MetadataCatalog>;
     let ctx = SessionContext::new();
-    let provider = fixture.data_store.builder(catalog, ctx.runtime_env())
+    let provider = fixture
+        .data_store
+        .builder(catalog, ctx.runtime_env())
         .open(table_name)
         .await?;
     ctx.register_table(table_name, Arc::new(provider) as Arc<dyn TableProvider>)?;
@@ -282,7 +281,9 @@ async fn reopen_and_read_composite_rows(
     let catalog: Arc<dyn MetadataCatalog> =
         Arc::clone(&fixture.catalog) as Arc<dyn MetadataCatalog>;
     let ctx = SessionContext::new();
-    let provider = fixture.data_store.builder(catalog, ctx.runtime_env())
+    let provider = fixture
+        .data_store
+        .builder(catalog, ctx.runtime_env())
         .open(table_name)
         .await?;
     ctx.register_table(table_name, Arc::new(provider) as Arc<dyn TableProvider>)?;

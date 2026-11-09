@@ -2139,9 +2139,9 @@ fn a_dropped_data_file_put_turns_the_fuzz_walk_red() {
                     ..sequential(Mode::Key)
                 };
                 // A divergence panics; a failed operation or read is an error.
-                match futures::FutureExt::catch_unwind(std::panic::AssertUnwindSafe(
-                    run_workload(fixture, walk),
-                ))
+                match futures::FutureExt::catch_unwind(std::panic::AssertUnwindSafe(run_workload(
+                    fixture, walk,
+                )))
                 .await
                 {
                     Ok(Ok(())) => None,
