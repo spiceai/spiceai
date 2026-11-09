@@ -23,10 +23,9 @@ limitations under the License.
 //! the wrapped `FullTextConnector` index the accelerated table discovers, before the dataset is
 //! registered.
 //!
-//! Covers both `DuckDB` (the original #14618 engine) and Cayenne. Cayenne was still empty after a
-//! restart on v2.4.1 because #14954 had not been backported; the rebuild path is engine-agnostic
-//! once present, and this test keeps Cayenne on the matrix so a future regression cannot hide
-//! behind `DuckDB`-only coverage.
+//! Runs on Cayenne, the engine that was still empty after a restart on v2.4.1 because #14954 had
+//! not been backported. `DuckDB` is no longer an acceleration engine on this branch, so there is
+//! no `DuckDB` arm; the rebuild path is engine-agnostic.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -51,28 +50,6 @@ fn docs_columns() -> Vec<Column> {
         Column::new("text")
             .with_full_text_search(FullTextSearchConfig::enabled().with_row_id("id")),
     ]
-}
-
-#[cfg(feature = "duckdb")]
-fn duckdb_docs_dataset(source: &str, db_path: &str) -> Dataset {
-    let mut dataset = Dataset::new(source, "docs");
-    dataset.params = Some(Params::from_string_map(HashMap::from([(
-        "file_format".to_string(),
-        "csv".to_string(),
-    )])));
-    dataset.columns = docs_columns();
-    dataset.acceleration = Some(Acceleration {
-        enabled: true,
-        engine: Some("cayenne".to_string()),
-        mode: Mode::File,
-        refresh_mode: Some(RefreshMode::Full),
-        params: Some(Params::from_string_map(HashMap::from([(
-            "cayenne_file_path".to_string(),
-            db_path.to_string(),
-        )]))),
-        ..Acceleration::default()
-    });
-    dataset
 }
 
 fn cayenne_docs_dataset(source: &str, data_dir: &str, metadata_dir: &str) -> Dataset {
@@ -171,22 +148,6 @@ async fn assert_persisted_rows_survive_restart(
     );
     restarted.shutdown().await;
     Ok(())
-}
-
-#[cfg(feature = "duckdb")]
-#[tokio::test]
-async fn full_text_search_finds_persisted_rows_after_a_restart() -> anyhow::Result<()> {
-    let _tracing = init_tracing(None);
-    configure_test_datafusion();
-    register_test_connectors().await;
-
-    let dir = tempfile::tempdir()?;
-    let source = write_fixture(&dir)?;
-    let db_path = dir.path().join("docs.db").to_string_lossy().to_string();
-
-    let first = start_with(duckdb_docs_dataset(&source, &db_path)).await?;
-    assert_persisted_rows_survive_restart(first, start_with(duckdb_docs_dataset(&source, &db_path)))
-        .await
 }
 
 #[tokio::test]

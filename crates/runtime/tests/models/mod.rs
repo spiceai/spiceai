@@ -41,8 +41,6 @@ mod bedrock;
 mod embedding;
 mod embedding_filter_limit;
 mod fts_caching_restart;
-// Cayenne FTS restart coverage does not need the duckdb feature; the DuckDB arm
-// inside the module stays behind `cfg(feature = "duckdb")`.
 mod fts_restart;
 pub(crate) mod hf;
 mod local;
