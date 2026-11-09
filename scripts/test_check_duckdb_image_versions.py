@@ -152,7 +152,28 @@ class CheckTest(unittest.TestCase):
     def test_download_without_copy_fails(self):
         self.assertEqual(
             self.run_check({"Dockerfile": dockerfile(copy=False)}),
-            ["Dockerfile downloads libduckdb but never copies it to /usr/lib/libduckdb.so"],
+            [
+                "Dockerfile downloads libduckdb but never copies it to /usr/lib/libduckdb.so "
+                "(or /spice_sandbox/usr/lib/libduckdb.so in a sandboxed image)"
+            ],
+        )
+
+    def test_copy_outside_the_library_path_fails(self):
+        self.assertEqual(
+            self.run_check({"Dockerfile": dockerfile().replace(" /usr/lib/", " /opt/usr/lib/")}),
+            [
+                "Dockerfile downloads libduckdb but never copies it to /usr/lib/libduckdb.so "
+                "(or /spice_sandbox/usr/lib/libduckdb.so in a sandboxed image)"
+            ],
+        )
+
+    def test_commented_out_verification_fails(self):
+        # Docker drops the commented line from the continued RUN, so nothing
+        # verifies the archive.
+        steps = [("#" + line) if "sha256sum" in line else line for line in download()]
+        self.assertEqual(
+            self.run_check({"Dockerfile": dockerfile(steps=steps)}),
+            ["Dockerfile never verifies the DuckDB archive with sha256sum -c"],
         )
 
     def test_download_of_another_release_fails(self):

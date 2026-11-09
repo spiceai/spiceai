@@ -37,7 +37,14 @@ ARGS = {
     "DUCKDB_SHA256_AMD64": "linux-amd64",
     "DUCKDB_SHA256_ARM64": "linux-arm64",
 }
-COPY_RE = re.compile(r"^COPY\s+--from=\S+\s+/root/libduckdb\.so\s+\S*/usr/lib/libduckdb\.so\s*$", re.M)
+# The library must land on the default library path of the image, or of the
+# sandbox root a scratch-based image is assembled from.
+COPY_RE = re.compile(
+    r"^COPY\s+--from=\S+\s+/root/libduckdb\.so\s+(?:/spice_sandbox)?/usr/lib/libduckdb\.so\s*$", re.M
+)
+# Docker drops a line whose first non-blank character is `#`, even inside a
+# continued RUN, so a commented-out step must not count.
+COMMENT_RE = re.compile(r"^\s*#.*\n?", re.M)
 # The ARGs only pin the image if the download consumes them: every DuckDB
 # release URL must name `v${DUCKDB_VERSION}`, and every checksum the archive is
 # verified against must come from a checksum ARG, never a literal.
@@ -94,7 +101,7 @@ def check(root: Path) -> list[str]:
     if not files:
         errors.append(f"no Dockerfile* found in {root}")
     for path in files:
-        text = path.read_text()
+        text = COMMENT_RE.sub("", path.read_text())
         values = {
             arg: re.findall(rf"^ARG\s+{arg}=(\S*)\s*$", text, re.M) for arg in ARGS
         }
@@ -124,7 +131,8 @@ def check(root: Path) -> list[str]:
         errors.extend(download_errors(path.name, text))
         if not COPY_RE.search(text):
             errors.append(
-                f"{path.name} downloads libduckdb but never copies it to /usr/lib/libduckdb.so"
+                f"{path.name} downloads libduckdb but never copies it to /usr/lib/libduckdb.so "
+                "(or /spice_sandbox/usr/lib/libduckdb.so in a sandboxed image)"
             )
     return errors
 
