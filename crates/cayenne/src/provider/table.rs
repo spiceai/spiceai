@@ -8720,6 +8720,32 @@ impl CayenneTableProvider {
         self.context.scan_from_manifest() || self.data_in_object_native_location()
     }
 
+    /// Records the files of `snapshot_id`, a protected snapshot this write has
+    /// just written under a new id and is about to publish at `sequence`, in its
+    /// manifest, for a table in the object-native location: its scans read only
+    /// the manifest, so the files must be there before the snapshot is visible.
+    /// The range is `[sequence, sequence]`, as the post-write rebuild tags a
+    /// protected snapshot. The directory is new to this write, so its listing is
+    /// this write's files. Other tables are left to the post-write rebuild.
+    pub(crate) async fn record_new_protected_snapshot_files(
+        &self,
+        snapshot_id: &str,
+        sequence: i64,
+    ) -> CatalogResult<()> {
+        if !self.data_in_object_native_location() {
+            return Ok(());
+        }
+        self.upsert_snapshot_manifest_from_listing(
+            snapshot_id,
+            ManifestSequenceTag::Uniform {
+                min: sequence,
+                max: sequence,
+            },
+        )
+        .await
+        .map(|_| ())
+    }
+
     /// Records `files` (`(file name, size)` in `snapshot_id`'s directory) in the
     /// snapshot's manifest in one commit. A file new to the current snapshot gets
     /// the range `[0, current sequence]`, as the listing-based rebuild gives it.
@@ -10472,6 +10498,7 @@ impl CayenneTableProvider {
                     .into());
                 };
                 let storage = crate::dataset_storage::DatasetStorage::new(
+                    table_name,
                     &table_metadata.path,
                     &table_metadata.table_id,
                     config.store,
@@ -11447,6 +11474,8 @@ impl CayenneTableProvider {
         sequence_number: i64,
     ) -> CatalogResult<()> {
         self.sync_local_snapshot_dir(snapshot_id).await?;
+        self.record_new_protected_snapshot_files(snapshot_id, sequence_number)
+            .await?;
 
         self.catalog
             .set_snapshot_sequence(&self.table_metadata.table_id, snapshot_id, sequence_number)
@@ -22593,6 +22622,13 @@ impl CayenneTableProvider {
                 new_snapshot_files = Some(listed.len());
                 true
             }
+            // A table in the object-native location scans only its manifest, so
+            // its compaction does not commit a snapshot the manifest lacks.
+            Err(error) if self.data_in_object_native_location() => {
+                self.cleanup_failed_compaction_snapshot(&new_snapshot_id, is_s3)
+                    .await;
+                return Err(Error::Catalog { source: error });
+            }
             Err(error) => {
                 tracing::warn!(
                     target: "cayenne::compaction",
@@ -23486,6 +23522,12 @@ impl CayenneTableProvider {
         // neither.
         let _reclaim = self.file_deletion_fence.write().await;
 
+        if self.data_in_object_native_location() {
+            return self
+                .reclaim_orphaned_deletion_vectors_record_first(&orphaned, max_batch, floor)
+                .await;
+        }
+
         // Unlink the `.arrow` file FIRST, then remove its catalog row. A crash in
         // the non-atomic window leaves a DISCOVERABLE dangling row (file gone, row
         // present) that the tolerant loader self-heals and the next sweep retries —
@@ -23654,6 +23696,111 @@ impl CayenneTableProvider {
         // measurable progress, so the repeat in `drain_orphan_dv_backlog`
         // terminates. A pass that fetched a full batch but could not remove all of
         // it (a failed unlink) would re-fetch the same rows forever.
+        if removed_ids.len() == max_batch {
+            OrphanDvSweepPass::BatchSaturated
+        } else {
+            OrphanDvSweepPass::Complete
+        }
+    }
+
+    /// The orphaned-deletion-vector reclaim of a dataset in the object-native
+    /// location: the rows are removed first, in one commit, and the objects
+    /// deleted after. Its committed state is the only record of its files, so a
+    /// deletion vector it still names must exist (a missing one fails the load,
+    /// see `detect_deletion_type_and_read`); a crash after the commit leaves only
+    /// objects nothing names. The caller holds `file_deletion_fence`.
+    async fn reclaim_orphaned_deletion_vectors_record_first(
+        &self,
+        orphaned: &[crate::metadata::DeleteFile],
+        max_batch: usize,
+        floor: i64,
+    ) -> OrphanDvSweepPass {
+        let table_name = self.table_metadata.table_name.as_str();
+        let removed_ids: Vec<String> = orphaned
+            .iter()
+            .map(|df| df.delete_file_id.clone())
+            .collect();
+        if let Err(e) = self
+            .catalog
+            .remove_delete_files(&self.table_metadata.table_id, &removed_ids)
+            .await
+        {
+            maintenance_metrics::track_maintenance(
+                table_name,
+                MaintenanceOp::OrphanDvSweep,
+                MaintenanceOutcome::Failed,
+            );
+            tracing::warn!(
+                table = table_name,
+                "Failed to drop {} reclaimable deletion vector(s) of table '{table_name}', so they \
+                 keep using storage until a later sweep retries; no data is lost. Cause: {e}",
+                removed_ids.len(),
+            );
+            return OrphanDvSweepPass::Complete;
+        }
+        let reclaimed_tombstones = orphaned.iter().fold(0_u64, |total, df| {
+            total.saturating_add(u64::try_from(df.delete_count).unwrap_or(0))
+        });
+        let mut unlinked_files = 0_u64;
+        let mut unlinked_bytes = 0_u64;
+        let mut failed_unlinks = 0_usize;
+        for df in orphaned {
+            let deleted = match self.dataset_storage.as_ref() {
+                Some(storage) => match storage.resolve(&df.path) {
+                    Ok(Some(location)) => storage.store().delete(&location).await,
+                    Ok(None) => Ok(()),
+                    Err(error) => Err(error),
+                },
+                None => Ok(()),
+            };
+            match deleted {
+                Ok(()) => {
+                    unlinked_files = unlinked_files.saturating_add(1);
+                    unlinked_bytes = unlinked_bytes
+                        .saturating_add(u64::try_from(df.file_size_bytes).unwrap_or(0));
+                }
+                // Removed by an earlier pass that stopped before counting it.
+                Err(object_store::Error::NotFound { .. }) => {}
+                Err(e) => {
+                    failed_unlinks += 1;
+                    tracing::warn!(
+                        table = table_name,
+                        path = %df.path,
+                        "Failed to delete the deletion vector '{}' of table '{table_name}', which \
+                         the table no longer uses, so it keeps using storage; it is safe to delete. \
+                         Cause: {e}",
+                        df.path,
+                    );
+                }
+            }
+        }
+        maintenance_metrics::track_reclaimed(
+            table_name,
+            MaintenanceOp::OrphanDvSweep,
+            unlinked_files,
+            unlinked_bytes,
+            reclaimed_tombstones,
+        );
+        maintenance_metrics::track_maintenance(
+            table_name,
+            MaintenanceOp::OrphanDvSweep,
+            if failed_unlinks > 0 {
+                MaintenanceOutcome::Failed
+            } else {
+                MaintenanceOutcome::Reclaimed
+            },
+        );
+        tracing::debug!(
+            table = table_name,
+            floor,
+            catalog_rows_removed = removed_ids.len(),
+            unlinked_files,
+            unlinked_bytes,
+            reclaimed_tombstones,
+            failed_unlinks,
+            "Reclaimed {} orphaned deletion vector(s) of table '{table_name}', rows first",
+            removed_ids.len(),
+        );
         if removed_ids.len() == max_batch {
             OrphanDvSweepPass::BatchSaturated
         } else {
@@ -24256,8 +24403,11 @@ impl CayenneTableProvider {
         if state.refresh_listing || had_stats || retention_deleted > 0 {
             if let Ok(_compaction_guard) = self.compaction_lock.try_write() {
                 // A quiesced instance's view of the live set may already be
-                // behind its replacement's, so it writes no manifest rows.
-                if self.maintenance_still_admitted() {
+                // behind its replacement's, so it writes no manifest rows. A
+                // table in the object-native location records each write's files
+                // when it commits, so a listing can only add files nothing
+                // committed.
+                if self.maintenance_still_admitted() && !self.data_in_object_native_location() {
                     self.rebuild_live_snapshot_manifests().await;
                 }
             } else {
@@ -25453,6 +25603,12 @@ impl CayenneTableProvider {
     /// — the dual-source read path then lists the directory, so a backfill error
     /// can never make a scan miss a live file or read one outside its snapshot.
     async fn backfill_snapshot_manifest_if_empty(&self) {
+        // A table in the object-native location records every file it commits,
+        // so an empty manifest is an empty table: a listing could only adopt
+        // files no commit named.
+        if self.data_in_object_native_location() {
+            return;
+        }
         match self
             .catalog
             .get_all_snapshot_files(&self.table_metadata.table_id)
@@ -26390,6 +26546,13 @@ impl CayenneTableProvider {
             .await
         {
             Ok(files) => Some(files),
+            // A table in the object-native location scans only its manifest, so
+            // its compaction does not commit a snapshot the manifest lacks.
+            Err(error) if self.data_in_object_native_location() => {
+                self.cleanup_failed_compaction_snapshot(&new_snapshot_id, is_s3)
+                    .await;
+                return Err(Error::Catalog { source: error });
+            }
             Err(error) => {
                 tracing::warn!(
                     target: "cayenne::compaction",
@@ -28726,6 +28889,13 @@ impl CayenneTableProvider {
             )
             .await
         {
+            // A table in the object-native location scans only its manifest, so
+            // its compaction does not commit a snapshot the manifest lacks.
+            if self.data_in_object_native_location() {
+                self.cleanup_failed_compaction_snapshot(&new_snapshot_id, is_s3)
+                    .await;
+                return Err(Error::Catalog { source: error });
+            }
             tracing::warn!(
                 target: "cayenne::compaction",
                 table = self.table_metadata.table_name.as_str(),
@@ -29494,6 +29664,13 @@ impl CayenneTableProvider {
             )
             .await
         {
+            // A table in the object-native location scans only its manifest, so
+            // its compaction does not commit a snapshot the manifest lacks.
+            if self.data_in_object_native_location() {
+                self.cleanup_failed_compaction_snapshot(&new_snapshot_id, is_s3)
+                    .await;
+                return Err(Error::Catalog { source: error });
+            }
             tracing::warn!(
                 target: "cayenne::compaction",
                 table = self.table_metadata.table_name.as_str(),
@@ -40809,15 +40986,20 @@ impl CayenneTableProvider {
     /// This `None`-on-empty fallback is what keeps the flag from ever making a
     /// scan miss a live file: an incomplete manifest degrades to listing, never
     /// to a short read.
+    ///
+    /// A table in the object-native location never falls back: its committed
+    /// file set is the only record of its files, so an empty one scans as empty
+    /// and a failed read fails the scan.
     async fn manifest_partitioned_files(
         &self,
         request: &SnapshotScanListingRequest<'_>,
-    ) -> Option<Vec<PartitionedFile>> {
+    ) -> DataFusionResult<Option<Vec<PartitionedFile>>> {
         // The manifest carries no partition values; let directory listing own
         // partitioned tables (it derives the values from the object path).
         if !request.options.listing.table_partition_cols.is_empty() {
-            return None;
+            return Ok(None);
         }
+        let committed_only = self.data_in_object_native_location();
 
         let manifest = match self
             .catalog
@@ -40825,6 +41007,9 @@ impl CayenneTableProvider {
             .await
         {
             Ok(rows) => rows,
+            Err(error) if committed_only => {
+                return Err(DataFusionError::External(Box::new(error)));
+            }
             Err(error) => {
                 tracing::debug!(
                     table = %self.table_metadata.table_name,
@@ -40832,14 +41017,14 @@ impl CayenneTableProvider {
                     %error,
                     "Manifest read failed; scan falls back to directory listing"
                 );
-                return None;
+                return Ok(None);
             }
         };
 
-        if manifest.is_empty() {
+        if manifest.is_empty() && !committed_only {
             // Snapshot predates manifest population, or a post-write rebuild has
             // not run yet: directory listing is still the authoritative source.
-            return None;
+            return Ok(None);
         }
 
         // `prefix` is the parsed snapshot-directory path; joining the manifest's
@@ -40867,7 +41052,7 @@ impl CayenneTableProvider {
             })
             .collect::<Vec<_>>();
 
-        Some(files)
+        Ok(Some(files))
     }
 
     async fn list_files_for_snapshot_scan(
@@ -41007,7 +41192,7 @@ impl CayenneTableProvider {
     ) -> datafusion_common::Result<futures::stream::BoxStream<'a, DataFusionResult<PartitionedFile>>>
     {
         if self.scans_from_manifest()
-            && let Some(files) = self.manifest_partitioned_files(request).await
+            && let Some(files) = self.manifest_partitioned_files(request).await?
         {
             return Ok(stream::iter(files.into_iter().map(Ok)).boxed());
         }
@@ -61498,6 +61683,7 @@ mod tests {
         let manifest_only = provider
             .manifest_partitioned_files(&request)
             .await
+            .expect("manifest read")
             .expect("manifest resolver returns Some when the manifest is populated");
         assert_eq!(
             manifest_only.len(),
@@ -61558,6 +61744,7 @@ mod tests {
             provider
                 .manifest_partitioned_files(&request)
                 .await
+                .expect("manifest read")
                 .is_none(),
             "an empty manifest must fall back to directory listing (Some -> None)"
         );

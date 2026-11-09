@@ -331,6 +331,18 @@ impl TestFixture {
         })
     }
 
+    /// This fixture with its tables' data files in its local data directory,
+    /// whatever `CAYENNE_TEST_DATA_STORE` says: for a test of behavior only a
+    /// local table has.
+    #[must_use]
+    pub fn on_local_store(mut self) -> Self {
+        self.data_store = FixtureDataStore {
+            base_path: self.data_path.to_string_lossy().to_string(),
+            config: None,
+        };
+        self
+    }
+
     /// Get the database path for SQLite-specific verification
     pub fn db_path(&self) -> std::path::PathBuf {
         self.temp_dir.path().join("test.db")

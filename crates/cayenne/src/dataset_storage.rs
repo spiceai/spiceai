@@ -41,6 +41,7 @@ use datafusion::execution::runtime_env::RuntimeEnv;
 use futures::StreamExt;
 use futures::stream::{self, BoxStream};
 use object_store::path::Path;
+use object_store::ObjectStoreExt as _;
 use object_store::{
     CopyOptions, Error as ObjectStoreError, GetOptions, GetResult, ListResult, MultipartUpload,
     ObjectMeta, ObjectStore, PutMultipartOptions, PutOptions, PutPayload, PutResult, RenameOptions,
@@ -53,6 +54,145 @@ const STORE_NAME: &str = "cayenne";
 
 /// Deletes are passed to the inner store in batches of at most this many paths.
 const DELETE_BATCH: usize = 1_000;
+
+const CAYENNE_DOCS: &str = "https://spiceai.org/docs/components/data-accelerators/cayenne";
+
+/// Which of a dataset's files a [`DataFileError`] is about.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DataFileKind {
+    /// A Vortex data file a snapshot's committed file set names.
+    Data,
+    /// A deletion vector (`.arrow`) the dataset's committed deletes name.
+    Deletion,
+}
+
+impl DataFileKind {
+    /// The kind of the file at `location`, an object path of a dataset, when it is
+    /// one its committed state names: a `.vortex` data file outside a staging
+    /// directory, or a deletion vector under a `deletions` directory.
+    #[must_use]
+    pub fn of(location: &str) -> Option<Self> {
+        let staged = location
+            .split('/')
+            .any(|segment| segment.starts_with("_staging"));
+        if staged {
+            return None;
+        }
+        // Cayenne names its files in lower case, so the extensions compare exactly.
+        let extension = std::path::Path::new(location).extension();
+        if extension.is_some_and(|extension| extension == "vortex") {
+            Some(Self::Data)
+        } else if extension.is_some_and(|extension| extension == "arrow")
+            && location.split('/').any(|segment| segment == "deletions")
+        {
+            Some(Self::Deletion)
+        } else {
+            None
+        }
+    }
+
+    fn noun(self) -> &'static str {
+        match self {
+            Self::Data => "data file",
+            Self::Deletion => "deletion file",
+        }
+    }
+
+    /// What fails, and what the user is spared, when a file of this kind cannot be read.
+    fn consequence(self) -> &'static str {
+        match self {
+            Self::Data => "the query fails rather than return partial results",
+            Self::Deletion => "the query fails rather than return rows the dataset deleted",
+        }
+    }
+}
+
+/// The message for a file `dataset`'s committed state names that is missing from
+/// its storage: `object` is its path under `location`, the dataset's data path.
+#[must_use]
+pub fn missing_file_message(
+    dataset: &str,
+    kind: DataFileKind,
+    object: &str,
+    location: &str,
+) -> String {
+    format!(
+        "Failed to query dataset '{dataset}' (cayenne): {} '{object}' is missing from '{location}', so {}. To reload the dataset from its source, start it once with `acceleration.mode: file_create`. See: {CAYENNE_DOCS}",
+        kind.noun(),
+        kind.consequence(),
+    )
+}
+
+/// The message for a file `dataset`'s committed state names that exists but cannot
+/// be read, for `cause`.
+#[must_use]
+pub fn unreadable_file_message(
+    dataset: &str,
+    kind: DataFileKind,
+    object: &str,
+    location: &str,
+    cause: &str,
+) -> String {
+    format!(
+        "Failed to query dataset '{dataset}' (cayenne): {} '{object}' in '{location}' is unreadable ({cause}), so {}. To reload the dataset from its source, start it once with `acceleration.mode: file_create`. See: {CAYENNE_DOCS}",
+        kind.noun(),
+        kind.consequence(),
+    )
+}
+
+/// A file a dataset's committed state names that its storage cannot serve. Never
+/// answered with fewer rows: the read that needs it fails with this error.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DataFileError {
+    /// The object is not in the store.
+    Missing {
+        /// The dataset whose committed state names the file.
+        dataset: String,
+        /// What the file holds.
+        kind: DataFileKind,
+        /// The file's path under `location`.
+        object: String,
+        /// The dataset's data path.
+        location: String,
+    },
+    /// The object is in the store but cannot be read as committed.
+    Unreadable {
+        /// The dataset whose committed state names the file.
+        dataset: String,
+        /// What the file holds.
+        kind: DataFileKind,
+        /// The file's path under `location`.
+        object: String,
+        /// The dataset's data path.
+        location: String,
+        /// Why it cannot be read.
+        cause: String,
+    },
+}
+
+impl Display for DataFileError {
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Missing {
+                dataset,
+                kind,
+                object,
+                location,
+            } => f.write_str(&missing_file_message(dataset, *kind, object, location)),
+            Self::Unreadable {
+                dataset,
+                kind,
+                object,
+                location,
+                cause,
+            } => f.write_str(&unreadable_file_message(
+                dataset, *kind, object, location, cause,
+            )),
+        }
+    }
+}
+
+impl std::error::Error for DataFileError {}
 
 /// A store for a dataset whose data is in a local directory addressed as
 /// `file:///…`: object paths are absolute paths without the leading `/`, and
@@ -80,18 +220,27 @@ pub struct DatasetStorage {
     data_root: String,
     /// `scheme://host` of the recorded table path (`s3://bucket`, `file://`).
     recorded_authority: String,
+    /// The dataset's name and its data path as recorded, for the errors that name
+    /// a file it cannot read.
+    dataset: Arc<str>,
+    table_path: Arc<str>,
+    /// Whether the dataset's data is in the object-native location
+    /// ([`crate::metastore_layout::is_object_native_data_path`]).
+    in_location: bool,
 }
 
 impl DatasetStorage {
-    /// The storage of the table whose recorded data path is `table_path`, an
-    /// object-store URL, reached through `store` (rooted where `table_path`'s
-    /// object paths are), and registered under `cayenne://<dataset_id>/`.
+    /// The storage of dataset `dataset`'s table whose recorded data path is
+    /// `table_path`, an object-store URL, reached through `store` (rooted where
+    /// `table_path`'s object paths are), and registered under
+    /// `cayenne://<dataset_id>/`.
     ///
     /// # Errors
     ///
     /// Returns an error if `table_path` is not a URL with an object path, or
     /// `dataset_id` cannot be a URL host.
     pub fn new(
+        dataset: &str,
         table_path: &str,
         dataset_id: &str,
         store: Arc<dyn ObjectStore>,
@@ -115,19 +264,46 @@ impl DatasetStorage {
         } else {
             format!("{DATASET_STORE_SCHEME}://{dataset_id}/{prefix}")
         };
+        let dataset: Arc<str> = Arc::from(dataset);
+        let table_path: Arc<str> = Arc::from(table_path.trim_end_matches('/'));
         let scoped: Arc<dyn ObjectStore> = Arc::new(DatasetScopedStore {
             inner: store,
             prefix: prefix.clone(),
             authority: recorded_authority.clone(),
+            dataset: Arc::clone(&dataset),
+            table_path: Arc::clone(&table_path),
         });
         Ok(Self {
             store: scoped,
+            in_location: crate::metastore_layout::is_object_native_data_path(&table_path),
             prefix,
             local_root,
             url,
             data_root,
             recorded_authority,
+            dataset,
+            table_path,
         })
+    }
+
+    /// Whether the dataset's data is in the object-native location: its committed
+    /// file sets are the only record of its files, so nothing it names may be
+    /// tolerated as missing.
+    #[must_use]
+    pub fn in_location(&self) -> bool {
+        self.in_location
+    }
+
+    /// The error for a file of this dataset at object path `location` that is
+    /// missing from the store.
+    #[must_use]
+    pub fn missing(&self, kind: DataFileKind, location: &Path) -> DataFileError {
+        DataFileError::Missing {
+            dataset: self.dataset.to_string(),
+            kind,
+            object: relative_object(&self.prefix, location),
+            location: self.table_path.to_string(),
+        }
     }
 
     /// The dataset's store. It refuses any path outside [`Self::prefix`].
@@ -215,6 +391,21 @@ impl DatasetStorage {
     }
 }
 
+/// `location` relative to the dataset's `prefix`, as a user finds it under the
+/// dataset's data path.
+fn relative_object(prefix: &Path, location: &Path) -> String {
+    let location = location.as_ref();
+    let prefix = prefix.as_ref();
+    if prefix.is_empty() {
+        return location.to_string();
+    }
+    location
+        .strip_prefix(prefix)
+        .and_then(|rest| rest.strip_prefix('/'))
+        .unwrap_or(location)
+        .to_string()
+}
+
 fn outside(authority: &str, location: &str) -> ObjectStoreError {
     let shown = if location.contains("://") {
         location.to_string()
@@ -237,9 +428,70 @@ struct DatasetScopedStore {
     prefix: Path,
     /// `scheme://host` of the recorded table path, for error messages.
     authority: String,
+    /// The dataset's name and recorded data path, for the error that names a
+    /// committed file the store cannot serve.
+    dataset: Arc<str>,
+    table_path: Arc<str>,
 }
 
 impl DatasetScopedStore {
+    /// A failed read of `location` as the dataset sees it: a committed file that is
+    /// not in the store keeps its `NotFound` kind, so callers that probe for a file
+    /// still recognize it, and carries [`DataFileError::Missing`] as its source; a
+    /// committed file shorter than the read needs is [`DataFileError::Unreadable`].
+    /// Anything else, including every other file, is returned as it was.
+    async fn read_failed(
+        &self,
+        location: &Path,
+        needed_until: Option<u64>,
+        error: ObjectStoreError,
+    ) -> ObjectStoreError {
+        let Some(kind) = DataFileKind::of(location.as_ref()) else {
+            return error;
+        };
+        let object = relative_object(&self.prefix, location);
+        match error {
+            ObjectStoreError::NotFound { path, .. } => ObjectStoreError::NotFound {
+                path,
+                source: Box::new(DataFileError::Missing {
+                    dataset: self.dataset.to_string(),
+                    kind,
+                    object,
+                    location: self.table_path.to_string(),
+                }),
+            },
+            error => {
+                // A read past the end of the object: it is shorter than the file
+                // its commit recorded, so no retry can read it.
+                let Some(needed) = needed_until else {
+                    return error;
+                };
+                match self.inner.head(location).await {
+                    Ok(meta) if meta.size < needed => self.truncated(location, meta.size, needed),
+                    _ => error,
+                }
+            }
+        }
+    }
+
+    /// The error for committed file `location`, of `size` bytes, read up to
+    /// byte `needed`.
+    fn truncated(&self, location: &Path, size: u64, needed: u64) -> ObjectStoreError {
+        let kind = DataFileKind::of(location.as_ref()).unwrap_or(DataFileKind::Data);
+        ObjectStoreError::Generic {
+            store: STORE_NAME,
+            source: Box::new(DataFileError::Unreadable {
+                dataset: self.dataset.to_string(),
+                kind,
+                object: relative_object(&self.prefix, location),
+                location: self.table_path.to_string(),
+                cause: format!(
+                    "it has {size} bytes, fewer than the {needed} the read needs, so it was truncated"
+                ),
+            }),
+        }
+    }
+
     fn under(prefix: &str, location: &str) -> bool {
         prefix.is_empty()
             || location == prefix
@@ -299,7 +551,23 @@ impl ObjectStore for DatasetScopedStore {
         options: GetOptions,
     ) -> Result<GetResult, ObjectStoreError> {
         self.check(location)?;
-        self.inner.get_opts(location, options).await
+        let needed_until = match &options.range {
+            Some(object_store::GetRange::Bounded(range)) => Some(range.end),
+            Some(object_store::GetRange::Offset(start)) => Some(start.saturating_add(1)),
+            _ => None,
+        };
+        let result = match self.inner.get_opts(location, options).await {
+            Ok(result) => result,
+            Err(error) => return Err(self.read_failed(location, needed_until, error).await),
+        };
+        // A committed file shorter than the range read from it: some stores
+        // answer such a read with what the object has.
+        if let Some(needed) = needed_until.filter(|needed| result.range.end < *needed)
+            && DataFileKind::of(location.as_ref()).is_some()
+        {
+            return Err(self.truncated(location, result.meta.size, needed));
+        }
+        Ok(result)
     }
 
     async fn get_ranges(
@@ -308,7 +576,27 @@ impl ObjectStore for DatasetScopedStore {
         ranges: &[Range<u64>],
     ) -> Result<Vec<Bytes>, ObjectStoreError> {
         self.check(location)?;
-        self.inner.get_ranges(location, ranges).await
+        match self.inner.get_ranges(location, ranges).await {
+            Ok(bytes)
+                if DataFileKind::of(location.as_ref()).is_some()
+                    && bytes
+                        .iter()
+                        .zip(ranges)
+                        .any(|(got, range)| (got.len() as u64) < range.end - range.start) =>
+            {
+                let needed = ranges.iter().map(|range| range.end).max().unwrap_or_default();
+                let size = match self.inner.head(location).await {
+                    Ok(meta) => meta.size,
+                    Err(error) => return Err(self.read_failed(location, Some(needed), error).await),
+                };
+                Err(self.truncated(location, size, needed))
+            }
+            Ok(bytes) => Ok(bytes),
+            Err(error) => {
+                let needed_until = ranges.iter().map(|range| range.end).max();
+                Err(self.read_failed(location, needed_until, error).await)
+            }
+        }
     }
 
     fn delete_stream(
@@ -404,11 +692,79 @@ mod tests {
 
     fn storage(table_path: &str, store: &Arc<dyn ObjectStore>) -> DatasetStorage {
         DatasetStorage::new(
+            "orders",
             table_path,
             "0193aaaa-bbbb-7ccc-8ddd-eeeeffff0000",
             Arc::clone(store),
         )
         .expect("storage")
+    }
+
+    #[test]
+    fn the_missing_and_unreadable_texts_name_the_file_the_location_and_the_fix() {
+        let location = "s3://bucket/state/cayenne/v1/datasets/orders-0190c2c4-0000-7000-8000-000000000000/data";
+        assert_eq!(
+            missing_file_message("orders", DataFileKind::Data, "t/s/a.vortex", location),
+            "Failed to query dataset 'orders' (cayenne): data file 't/s/a.vortex' is missing from 's3://bucket/state/cayenne/v1/datasets/orders-0190c2c4-0000-7000-8000-000000000000/data', so the query fails rather than return partial results. To reload the dataset from its source, start it once with `acceleration.mode: file_create`. See: https://spiceai.org/docs/components/data-accelerators/cayenne"
+        );
+        assert_eq!(
+            unreadable_file_message(
+                "orders",
+                DataFileKind::Data,
+                "t/s/a.vortex",
+                location,
+                "it has 10 bytes, fewer than the 20 the read needs, so it was truncated"
+            ),
+            "Failed to query dataset 'orders' (cayenne): data file 't/s/a.vortex' in 's3://bucket/state/cayenne/v1/datasets/orders-0190c2c4-0000-7000-8000-000000000000/data' is unreadable (it has 10 bytes, fewer than the 20 the read needs, so it was truncated), so the query fails rather than return partial results. To reload the dataset from its source, start it once with `acceleration.mode: file_create`. See: https://spiceai.org/docs/components/data-accelerators/cayenne"
+        );
+        assert_eq!(
+            missing_file_message(
+                "orders",
+                DataFileKind::Deletion,
+                "t/s/deletions/delete_1.arrow",
+                location
+            ),
+            "Failed to query dataset 'orders' (cayenne): deletion file 't/s/deletions/delete_1.arrow' is missing from 's3://bucket/state/cayenne/v1/datasets/orders-0190c2c4-0000-7000-8000-000000000000/data', so the query fails rather than return rows the dataset deleted. To reload the dataset from its source, start it once with `acceleration.mode: file_create`. See: https://spiceai.org/docs/components/data-accelerators/cayenne"
+        );
+    }
+
+    #[test]
+    fn only_committed_files_are_named_in_a_read_error() {
+        assert_eq!(DataFileKind::of("p/t/s/a.vortex"), Some(DataFileKind::Data));
+        assert_eq!(
+            DataFileKind::of("p/t/s/deletions/delete_1.arrow"),
+            Some(DataFileKind::Deletion)
+        );
+        assert_eq!(DataFileKind::of("p/t/_staging_s/a.vortex"), None);
+        assert_eq!(DataFileKind::of("p/t/_staging_s/_wal.json"), None);
+        assert_eq!(DataFileKind::of("p/t/s/other.arrow"), None);
+    }
+
+    #[tokio::test]
+    async fn a_missing_committed_file_keeps_not_found_and_names_itself() {
+        let inner: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let storage = storage("s3://bucket/p/a", &inner);
+        let error = storage
+            .store()
+            .get(&Path::from("p/a/t/s/x.vortex"))
+            .await
+            .expect_err("missing");
+        let ObjectStoreError::NotFound { source, .. } = &error else {
+            panic!("a missing data file is still NotFound: {error}");
+        };
+        assert_eq!(
+            source.to_string(),
+            missing_file_message("orders", DataFileKind::Data, "t/s/x.vortex", "s3://bucket/p/a")
+        );
+        let staged = storage
+            .store()
+            .get(&Path::from("p/a/t/_staging_s/_wal.json"))
+            .await
+            .expect_err("missing");
+        assert!(
+            !staged.to_string().contains("Failed to query dataset"),
+            "a staging file keeps the store's own error: {staged}"
+        );
     }
 
     #[tokio::test]

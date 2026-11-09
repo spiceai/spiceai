@@ -33,8 +33,11 @@ pub(super) fn assert_files(
     dir: &std::path::Path,
     contains: &[regex::Regex],
     lacks: &[regex::Regex],
+    lacks_dirs: &[regex::Regex],
 ) -> Result<String> {
     let mut files = Vec::new();
+    // Directories, empty ones included, as `<relative path>/`.
+    let mut dirs = Vec::new();
     let mut pending = vec![dir.to_path_buf()];
     while let Some(next) = pending.pop() {
         for entry in std::fs::read_dir(&next)
@@ -42,6 +45,9 @@ pub(super) fn assert_files(
         {
             let path = entry?.path();
             if path.is_dir() {
+                if let Ok(relative) = path.strip_prefix(dir) {
+                    dirs.push(format!("{}/", relative.to_string_lossy()));
+                }
                 pending.push(path);
             } else if let Ok(relative) = path.strip_prefix(dir) {
                 files.push(relative.to_string_lossy().into_owned());
@@ -57,6 +63,11 @@ pub(super) fn assert_files(
     for pattern in lacks {
         for file in files.iter().filter(|f| pattern.is_match(f)) {
             problems.push(format!("/{pattern}/ matches {file}"));
+        }
+    }
+    for pattern in lacks_dirs {
+        for found in dirs.iter().filter(|d| pattern.is_match(d)) {
+            problems.push(format!("/{pattern}/ matches directory {found}"));
         }
     }
     // The directory goes after ` --- `, which an expected failure's signature

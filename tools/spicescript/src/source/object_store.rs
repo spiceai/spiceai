@@ -189,6 +189,61 @@ impl ObjectStore {
     }
 }
 
+impl ObjectStore {
+    /// The first key, in key order, under `prefix` that contains `contains`.
+    async fn first_key(&self, bucket: &str, prefix: &str, contains: &str) -> Result<String> {
+        let mut keys = self.keys(bucket, prefix).await?;
+        keys.sort();
+        keys.into_iter()
+            .find(|key| key.contains(contains))
+            .with_context(|| format!("No object under '{prefix}' contains '{contains}'"))
+    }
+}
+
+/// What `source-exec` does to an object store, one command per line, in the
+/// instance's bucket:
+///
+/// - `delete-first <prefix> <contains>` deletes the first key, in key order,
+///   under `<prefix>` that contains `<contains>`;
+/// - `truncate-first <prefix> <contains>` rewrites that object with its first
+///   half;
+/// - `copy <from-prefix> <to-prefix>` copies every object under one prefix to
+///   the same relative key under the other;
+/// - `delete-prefix <prefix>` deletes every object under a prefix.
+#[derive(Debug, PartialEq, Eq)]
+enum ObjectCommand {
+    DeleteFirst { prefix: String, contains: String },
+    TruncateFirst { prefix: String, contains: String },
+    Copy { from: String, to: String },
+    DeletePrefix { prefix: String },
+}
+
+impl ObjectCommand {
+    fn parse(line: &str) -> Result<Self> {
+        let words: Vec<&str> = line.split_whitespace().collect();
+        Ok(match words.as_slice() {
+            ["delete-first", prefix, contains] => Self::DeleteFirst {
+                prefix: (*prefix).to_string(),
+                contains: (*contains).to_string(),
+            },
+            ["truncate-first", prefix, contains] => Self::TruncateFirst {
+                prefix: (*prefix).to_string(),
+                contains: (*contains).to_string(),
+            },
+            ["copy", from, to] => Self::Copy {
+                from: (*from).to_string(),
+                to: (*to).to_string(),
+            },
+            ["delete-prefix", prefix] => Self::DeletePrefix {
+                prefix: (*prefix).to_string(),
+            },
+            _ => bail!(
+                "an object store runs `delete-first <prefix> <contains>`, `truncate-first <prefix> <contains>`, `copy <from-prefix> <to-prefix>` or `delete-prefix <prefix>`, not `{line}`"
+            ),
+        })
+    }
+}
+
 /// Creates the proxy to the store on its loopback and delays every response
 /// it relays by `latency`, through the toxiproxy API on `api_port`.
 async fn configure_proxy(api_port: u16, latency: Duration) -> Result<()> {
@@ -330,8 +385,64 @@ impl Source for ObjectStore {
         })
     }
 
-    async fn exec(&self, _namespace: &str, sql: &str) -> Result<()> {
-        bail!("an object store runs no SQL (`{sql}`); generate objects instead")
+    /// Runs object commands, one per line, in this instance's bucket (see
+    /// [`ObjectCommand`]); an object store runs no SQL.
+    async fn exec(&self, namespace: &str, commands: &str) -> Result<()> {
+        let bucket = bucket(namespace);
+        for line in commands.lines().map(str::trim).filter(|line| !line.is_empty()) {
+            match ObjectCommand::parse(line)? {
+                ObjectCommand::DeleteFirst { prefix, contains } => {
+                    let key = self.first_key(&bucket, &prefix, &contains).await?;
+                    self.aws(&["s3", "rm", "--quiet", &format!("s3://{bucket}/{key}")])
+                        .await
+                        .with_context(|| format!("Failed to delete '{key}'"))?;
+                }
+                ObjectCommand::TruncateFirst { prefix, contains } => {
+                    let key = self.first_key(&bucket, &prefix, &contains).await?;
+                    let local = self.staging.join(namespace).join("truncated.object");
+                    if let Some(parent) = local.parent() {
+                        std::fs::create_dir_all(parent)?;
+                    }
+                    let local_text = local.display().to_string();
+                    let remote = format!("s3://{bucket}/{key}");
+                    self.aws(&["s3", "cp", "--quiet", &remote, &local_text])
+                        .await
+                        .with_context(|| format!("Failed to download '{key}'"))?;
+                    let len = std::fs::metadata(&local)?.len();
+                    std::fs::OpenOptions::new()
+                        .write(true)
+                        .open(&local)?
+                        .set_len(len / 2)?;
+                    self.aws(&["s3", "cp", "--quiet", &local_text, &remote])
+                        .await
+                        .with_context(|| format!("Failed to upload the truncated '{key}'"))?;
+                }
+                ObjectCommand::DeletePrefix { prefix } => {
+                    self.aws(&[
+                        "s3",
+                        "rm",
+                        "--recursive",
+                        "--quiet",
+                        &format!("s3://{bucket}/{prefix}"),
+                    ])
+                    .await
+                    .with_context(|| format!("Failed to delete '{prefix}'"))?;
+                }
+                ObjectCommand::Copy { from, to } => {
+                    self.aws(&[
+                        "s3",
+                        "cp",
+                        "--recursive",
+                        "--quiet",
+                        &format!("s3://{bucket}/{from}"),
+                        &format!("s3://{bucket}/{to}"),
+                    ])
+                    .await
+                    .with_context(|| format!("Failed to copy '{from}' to '{to}'"))?;
+                }
+            }
+        }
+        Ok(())
     }
 
     async fn query(&self, _namespace: &str, sql: &str) -> Result<TextResult> {
@@ -402,5 +513,43 @@ impl Source for ObjectStore {
         .await
         .with_context(|| format!("Failed to upload the parts of {}", spec.table))?;
         Ok(written)
+    }
+}
+
+#[cfg(test)]
+mod object_command_tests {
+    use super::ObjectCommand;
+
+    #[test]
+    fn parses_each_command_and_refuses_anything_else() {
+        assert_eq!(
+            ObjectCommand::parse("delete-first state/cayenne/v1/datasets/ .vortex").expect("parse"),
+            ObjectCommand::DeleteFirst {
+                prefix: "state/cayenne/v1/datasets/".into(),
+                contains: ".vortex".into()
+            }
+        );
+        assert_eq!(
+            ObjectCommand::parse("truncate-first state/ _p000").expect("parse"),
+            ObjectCommand::TruncateFirst {
+                prefix: "state/".into(),
+                contains: "_p000".into()
+            }
+        );
+        assert_eq!(
+            ObjectCommand::parse("copy state/ moved/").expect("parse"),
+            ObjectCommand::Copy {
+                from: "state/".into(),
+                to: "moved/".into()
+            }
+        );
+        assert_eq!(
+            ObjectCommand::parse("delete-prefix state/").expect("parse"),
+            ObjectCommand::DeletePrefix {
+                prefix: "state/".into()
+            }
+        );
+        let error = ObjectCommand::parse("SELECT 1").expect_err("not a command");
+        assert!(error.to_string().contains("not `SELECT 1`"), "{error}");
     }
 }

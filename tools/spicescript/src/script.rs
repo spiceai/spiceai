@@ -473,10 +473,12 @@ pub enum Action {
     WipeInstanceDir {
         keep: Vec<String>,
     },
-    /// Checks the files under the instance's directory, by path relative to it.
+    /// Checks the files under the instance's directory, by path relative to it,
+    /// and that no directory matches `lacks_dirs` (paths end in `/`).
     AssertFiles {
         contains: Vec<regex::Regex>,
         lacks: Vec<regex::Regex>,
+        lacks_dirs: Vec<regex::Regex>,
     },
     StopBackground {
         id: String,
@@ -1717,16 +1719,21 @@ fn parse_step(index: usize, step: Value) -> Result<Step> {
         "assert-files" => {
             let mut inner = Opts::of_mapping(
                 arg,
-                "`assert-files` takes a mapping with `contains` or `lacks`",
+                "`assert-files` takes a mapping with `contains`, `lacks` or `lacks-dirs`",
             )?;
             let contains = inner.patterns("contains")?;
             let lacks = inner.patterns("lacks")?;
+            let lacks_dirs = inner.patterns("lacks-dirs")?;
             inner.finish()?;
             ensure!(
-                !contains.is_empty() || !lacks.is_empty(),
-                "`assert-files` needs `contains` or `lacks`"
+                !contains.is_empty() || !lacks.is_empty() || !lacks_dirs.is_empty(),
+                "`assert-files` needs `contains`, `lacks` or `lacks-dirs`"
             );
-            Action::AssertFiles { contains, lacks }
+            Action::AssertFiles {
+                contains,
+                lacks,
+                lacks_dirs,
+            }
         }
         "wipe-instance-dir" => {
             let mut inner = Opts::of_mapping(

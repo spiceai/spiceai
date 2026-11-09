@@ -661,8 +661,12 @@ pub(super) async fn run_instance_step(
                 started.elapsed().as_secs_f64()
             ));
         }
-        Action::AssertFiles { contains, lacks } => {
-            let shown = assert_files(&instance.spiced.dir, contains, lacks)?;
+        Action::AssertFiles {
+            contains,
+            lacks,
+            lacks_dirs,
+        } => {
+            let shown = assert_files(&instance.spiced.dir, contains, lacks, lacks_dirs)?;
             return Ok(format!(
                 " ({:.1}s) {shown}",
                 started.elapsed().as_secs_f64()

@@ -35,8 +35,8 @@ start on the machine that recorded them.
 | Feature | Covered by | Object-native data variant | Issue |
 | --- | --- | --- | --- |
 | `refresh_mode: full` | `full-refresh-chaos.yaml`, `cayenne-transactions.yaml`, `served-while-source-down.yaml` | added (`full-refresh-chaos`, `cayenne-transactions`); data path on RustFS: `full-refresh-chaos` | #16131, #16130 |
-| `refresh_mode: append` | `append-kill.yaml`, `append-time-column.yaml` | added (`append-kill`); data path on RustFS: `append-kill` | #16131, #16130 |
-| `refresh_mode: changes` (PostgreSQL, MySQL CDC) | `postgres-cdc-parity.yaml`, `mysql-cdc-parity.yaml`, `postgres-cdc-atomicity.yaml`, `cdc-chaos.yaml` | added (`postgres-cdc-parity`, `mysql-cdc-parity`); TODO `postgres-cdc-atomicity`, `cdc-chaos` | #16132 |
+| `refresh_mode: append` | `append-kill.yaml`, `append-time-column.yaml`, `object-native-data.yaml` | added (`append-kill`, `object-native-data`: exact count after each append, no LIST on scans, kill during an append, three directory losses, a copied location, a truncated and a deleted data file); data path on RustFS: `append-kill` | #16131, #16130 |
+| `refresh_mode: changes` (PostgreSQL, MySQL CDC) | `postgres-cdc-parity.yaml`, `mysql-cdc-parity.yaml`, `postgres-cdc-atomicity.yaml`, `cdc-chaos.yaml` | added (`postgres-cdc-parity`, `mysql-cdc-parity`); data path on RustFS: `postgres-cdc-parity`, `mysql-cdc-parity`; TODO `postgres-cdc-atomicity`, `cdc-chaos` | #16132 |
 | `primary_key` | `postgres-cdc-parity.yaml`, `duplicate-keys.yaml`, `cayenne-writes.yaml` | added (`postgres-cdc-parity`, `mysql-cdc-parity`, `append-kill`) | #16132 |
 | `on_conflict` (upsert, drop) | `cayenne-writes.yaml`, `conflict-batches.yaml`, `append-kill.yaml` | added (`append-kill`, upsert); TODO `cayenne-writes`, `conflict-batches` | #16132 |
 | `refresh_sql` | `partitioning.yaml`, `cdc-chaos.yaml` | TODO | #16131 |
@@ -46,7 +46,7 @@ start on the machine that recorded them.
 | SQL writes (`write_mode: acceleration`) and transactions | `cayenne-transactions.yaml`, `cayenne-writes.yaml` | added (`cayenne-transactions`); TODO `cayenne-writes` | #16132 |
 | `partition_by` | `partitioning.yaml`, `layout-coverage.yaml`, `cayenne-writes.yaml` | TODO | #16137 |
 | `indexes` | `index-equivalence.yaml`, `layout-coverage.yaml` | TODO | #16137 |
-| `mode: file_create` | `cayenne-vnext.yaml`, `cayenne-vnext-recreate.yaml`, `settings-evolution.yaml` | TODO | #16133 |
+| `mode: file_create` | `cayenne-vnext.yaml`, `cayenne-vnext-recreate.yaml`, `settings-evolution.yaml`, `object-native-data.yaml` | added (`object-native-data`: reload after a lost data file, the previous folder kept); TODO deletion of that folder with reader pins | #16133 |
 | Snapshot bootstrap (`snapshots:`) | `snapshots/snapshots-object-store.yaml`, `snapshots/snapshots-append-restore.yaml` | TODO | #16133 |
 | `mode: memory` | `cayenne-writes.yaml`, `mysql-cdc-parity.yaml` (DuckDB), `postgres-cdc-edge-values.yaml` | TODO (no data files; the variants should leave nothing in the location) | #16137 |
 | A state location 20 ms away (a remote store's round trips) | the `object-native-data-rustfs-latency` variant of every script marked added | added | #16139 |

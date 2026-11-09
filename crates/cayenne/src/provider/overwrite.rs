@@ -856,6 +856,13 @@ impl CayenneTableProvider {
                     )
                     .await
                 {
+                    // A table in the object-native location scans only its
+                    // manifest, so an overwrite does not commit a snapshot the
+                    // manifest lacks.
+                    if self.data_in_object_native_location() {
+                        self.abandon_overwrite_snapshot(&new_snapshot_id).await;
+                        return Err(super::Error::Catalog { source: error });
+                    }
                     tracing::warn!(
                         table = self.table_name(),
                         %error,
@@ -864,6 +871,10 @@ impl CayenneTableProvider {
                          scan falls back to directory listing"
                     );
                 }
+            }
+            Err(error) if self.data_in_object_native_location() => {
+                self.abandon_overwrite_snapshot(&new_snapshot_id).await;
+                return Err(super::Error::Catalog { source: error });
             }
             Err(error) => {
                 tracing::warn!(

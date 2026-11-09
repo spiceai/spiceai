@@ -9,7 +9,8 @@ description: >
 
 sources:
   src: { kind: mysql }
-  # The state locations of the object-native-data variants.
+  # The state locations of the object-native-data variants, and the data path
+  # of object-store-data-path-rustfs.
   lake: { kind: rustfs }
   slow-lake: { kind: rustfs, latency: 20ms }
 
@@ -35,6 +36,8 @@ variants:
   object-native-data-local: object-native-data-local
   object-native-data-rustfs: object-native-data-rustfs
   object-native-data-rustfs-latency: object-native-data-rustfs-latency
+  # Data at the datasets' own `cayenne_file_path` on RustFS (#16130).
+  object-store-data-path-rustfs: object-store-data-path-rustfs
 
 spicepod:
   version: v1
@@ -183,6 +186,22 @@ steps:
     eventually: 30s
   - query: SELECT * FROM customers
     oracle-sql: SELECT c_id, c_name, c_segment, c_balance, c_active, c_since FROM customers
+
+  # Data at the datasets' own path on RustFS (#16130): the data files and
+  # deletion vectors are objects in the bucket, and none is on local disk or
+  # at a local `s3:` path.
+  - source-exec:
+      src: "INSERT INTO orders (o_id, o_custkey, o_status, o_total) VALUES (1, 7, 'N', 10.50), (2, 7, 'F', NULL), (3, 9, NULL, 0.01)"
+    only: object-store-data-path-rustfs
+  - source-exec: { src: "UPDATE orders SET o_status = 'U' WHERE o_id = 1" }
+    only: object-store-data-path-rustfs
+  - query: SELECT * FROM orders
+    eventually: 30s
+    only: object-store-data-path-rustfs
+  - assert-objects: { source: lake, prefix: data/customers/, contains: .vortex, min: 1 }
+    only: object-store-data-path-rustfs
+  - assert-files: { lacks: ['(^|/)s3:', '\.vortex$', '\.arrow$'] }
+    only: object-store-data-path-rustfs
 
   # Object-native data (#16131): orders again after the TRUNCATE, then each
   # dataset's files are in the state location, under its log's data/ folder,

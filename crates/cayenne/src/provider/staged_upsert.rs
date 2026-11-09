@@ -189,6 +189,9 @@ impl CayenneStagedUpsert {
         // `apply_prepared_on_conflict_in_txn` — so re-enable just the in-memory
         // promotion, which `finish` performs via `publish_prepared_on_conflict_deletions`.
         publish.publish_as_protected_snapshot = true;
+        self.table
+            .record_new_protected_snapshot_files(&self.new_snapshot_id, publish.snapshot_sequence)
+            .await?;
         Ok(PreparedTxnCommit {
             table: self.table,
             new_snapshot_id: self.new_snapshot_id,

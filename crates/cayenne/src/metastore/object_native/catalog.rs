@@ -76,6 +76,11 @@ pub struct ObjectNativeCatalog {
     routes: RwLock<Routes>,
     /// Serializes creating and dropping datasets.
     ddl: tokio::sync::Mutex<()>,
+    /// The URL of the folder `datasets/` is in, when the catalog was opened at a
+    /// location URL: a dataset's data path under it is recorded relative to it
+    /// and resolved against it on every read, so a copy of the location opened
+    /// at another URL reads its own data.
+    anchor: Option<Arc<str>>,
 }
 
 /// Which log holds each table.
@@ -106,6 +111,20 @@ impl Routes {
             self.by_name.insert(name, Arc::clone(domain));
         }
     }
+}
+
+/// The URL of the folder holding the registry at `prefix` and `datasets/`, when
+/// `location` is that folder's URL (`s3://bucket/state/cayenne/v1` for the
+/// registry `state/cayenne/v1/catalog`).
+fn location_anchor(location: &str, prefix: &Path) -> Option<Arc<str>> {
+    let url = url::Url::parse(location).ok()?;
+    if url.scheme() == "file" {
+        return None;
+    }
+    let folder: Vec<_> = prefix.parts().collect();
+    let folder = Path::from_iter(folder[..folder.len().checked_sub(1)?].iter().cloned());
+    (url.path().trim_matches('/') == folder.as_ref())
+        .then(|| Arc::from(location.trim_end_matches('/')))
 }
 
 /// `prefix`'s siblings: the folders beside the registry.
@@ -595,9 +614,25 @@ impl ObjectNativeCatalog {
         prefix: Path,
         config: NativeCatalogConfig,
     ) -> CatalogResult<Self> {
-        let registry =
-            Domain::create_with_config(Arc::clone(&store), prefix.clone(), config, true).await?;
-        Self::assemble(store, prefix, config, registry).await
+        Self::create_at(store, prefix, config, None).await
+    }
+
+    async fn create_at(
+        store: Arc<dyn ObjectStore>,
+        prefix: Path,
+        config: NativeCatalogConfig,
+        anchor: Option<Arc<str>>,
+    ) -> CatalogResult<Self> {
+        let registry = Domain::create_with_config(
+            Arc::clone(&store),
+            prefix.clone(),
+            config,
+            true,
+            anchor.clone(),
+            "",
+        )
+        .await?;
+        Self::assemble(store, prefix, config, registry, anchor).await
     }
 
     /// Open the catalog kept in a local directory, creating it on first use. The
@@ -620,7 +655,11 @@ impl ObjectNativeCatalog {
     }
 
     /// Open the catalog at `prefix` in `store`, creating it on first use.
-    /// `location` names where it is, for the startup log.
+    /// `location` names where it is, for the startup log. When `location` is the
+    /// URL of the folder `prefix` is in (`s3://bucket/state/cayenne/v1` for
+    /// `state/cayenne/v1/catalog`), a dataset's data path under it is recorded
+    /// relative to it, so a copy of the location opened at another URL serves
+    /// the same rows from its own objects.
     /// # Errors
     /// Returns an error when the store cannot be used or the history is invalid.
     pub async fn open_or_create_at(
@@ -628,11 +667,26 @@ impl ObjectNativeCatalog {
         prefix: Path,
         location: &str,
     ) -> CatalogResult<Self> {
+        Self::open_or_create_at_with_config(store, prefix, location, NativeCatalogConfig::default())
+            .await
+    }
+
+    /// [`Self::open_or_create_at`] with explicit head-log tuning.
+    /// # Errors
+    /// Returns an error when the store cannot be used or the history is invalid.
+    pub async fn open_or_create_at_with_config(
+        store: Arc<dyn ObjectStore>,
+        prefix: Path,
+        location: &str,
+        config: NativeCatalogConfig,
+    ) -> CatalogResult<Self> {
+        let anchor = location_anchor(location, &prefix);
         let (catalog, verb) = match store.head(&prefix.clone().join("head")).await {
-            Ok(_) => (Self::open(store, prefix).await?, "Opened"),
-            Err(object_store::Error::NotFound { .. }) => {
-                (Self::create(store, prefix).await?, "Created")
-            }
+            Ok(_) => (Self::open_at(store, prefix, config, anchor).await?, "Opened"),
+            Err(object_store::Error::NotFound { .. }) => (
+                Self::create_at(store, prefix, config, anchor).await?,
+                "Created",
+            ),
             Err(error) => return Err(invalid(error)),
         };
         let (datasets, tables, replayed) = catalog.summary();
@@ -658,9 +712,25 @@ impl ObjectNativeCatalog {
         prefix: Path,
         config: NativeCatalogConfig,
     ) -> CatalogResult<Self> {
-        let registry =
-            Domain::open_with_config(Arc::clone(&store), prefix.clone(), config, true).await?;
-        Self::assemble(store, prefix, config, registry).await
+        Self::open_at(store, prefix, config, None).await
+    }
+
+    async fn open_at(
+        store: Arc<dyn ObjectStore>,
+        prefix: Path,
+        config: NativeCatalogConfig,
+        anchor: Option<Arc<str>>,
+    ) -> CatalogResult<Self> {
+        let registry = Domain::open_with_config(
+            Arc::clone(&store),
+            prefix.clone(),
+            config,
+            true,
+            anchor.clone(),
+            "",
+        )
+        .await?;
+        Self::assemble(store, prefix, config, registry, anchor).await
     }
 
     /// Open the log of every dataset the registry names, route each table to its
@@ -670,6 +740,7 @@ impl ObjectNativeCatalog {
         prefix: Path,
         config: NativeCatalogConfig,
         registry: Domain,
+        anchor: Option<Arc<str>>,
     ) -> CatalogResult<Self> {
         let datasets = sibling(&prefix, "datasets");
         let transactions = sibling(&prefix, "transactions");
@@ -680,6 +751,7 @@ impl ObjectNativeCatalog {
         let opened = futures::future::try_join_all(entries.into_iter().map(|(name, folder)| {
             let store = Arc::clone(&store);
             let datasets = datasets.clone();
+            let anchor = anchor.clone();
             async move {
                 let folder = String::from_utf8(folder).map_err(invalid)?;
                 let prefix = datasets.join(folder.as_str());
@@ -689,7 +761,8 @@ impl ObjectNativeCatalog {
                     Err(object_store::Error::NotFound { .. }) => return Ok((name, None)),
                     Err(error) => return Err(invalid(error)),
                 }
-                let mut domain = Domain::open_with_config(store, prefix, config, false).await?;
+                let mut domain =
+                    Domain::open_with_config(store, prefix, config, false, anchor, &name).await?;
                 domain.folder = folder;
                 Ok::<_, CatalogError>((name, Some(domain)))
             }
@@ -716,6 +789,7 @@ impl ObjectNativeCatalog {
             transactions,
             routes: RwLock::new(routes),
             ddl: tokio::sync::Mutex::new(()),
+            anchor,
         };
         catalog.recover().await?;
         catalog.reclaim().await?;
@@ -775,6 +849,33 @@ impl ObjectNativeCatalog {
         let folder = rest.strip_suffix("/data")?;
         let uuid = folder.strip_prefix(&format!("{}-", slug(name)))?;
         (!folder.contains('/') && uuid::Uuid::parse_str(uuid).is_ok()).then(|| folder.to_string())
+    }
+
+    /// Commit, on `dataset`'s log, a change its state refuses: the path a bug in
+    /// this catalog's own checks would take. For tests of what a refused change
+    /// does to the dataset.
+    /// # Errors
+    /// Returns the refusal.
+    #[doc(hidden)]
+    pub async fn commit_change_the_state_refuses(&self, dataset: &str) -> CatalogResult<()> {
+        let domain = self.for_name(dataset);
+        let table_id = domain
+            .tables()
+            .await
+            .into_iter()
+            .find(|(_, name, _)| name == dataset)
+            .map(|(id, _, _)| id)
+            .ok_or_else(|| CatalogError::TableNotFound {
+                table_name: dataset.to_string(),
+            })?;
+        domain
+            .commit_actions(vec![crate::metastore::actions::remove_groups(
+                &table_id,
+                proto::Select::Listed,
+                &["not-a-registered-snapshot".to_string()],
+                true,
+            )])
+            .await
     }
 
     /// The prefix of the log that holds `dataset`, for tools and tests that read
@@ -864,6 +965,8 @@ impl ObjectNativeCatalog {
             self.datasets.clone().join(folder.as_str()),
             self.config,
             false,
+            self.anchor.clone(),
+            &name,
         )
         .await?;
         domain.folder.clone_from(&folder);

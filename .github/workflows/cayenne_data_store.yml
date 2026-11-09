@@ -37,7 +37,8 @@ env:
     test(/^mutation_property_test::/) | test(/^mutation_model_test::/) |
     test(/^deletion_vector/) | test(/^orphan_dv_compaction_test::/) |
     test(/^object_store_reclaim_test::/) | test(/^per_dataset_store_test::/) |
-    test(/^object_native_data_test::/) | test(/^snapshot_cleanup_convergence_test::/)
+    test(/^object_native_data_test::/) | test(/^snapshot_cleanup_convergence_test::/) |
+    test(/^rustfs_store_conformance_test::/)
 
 jobs:
   lanes:

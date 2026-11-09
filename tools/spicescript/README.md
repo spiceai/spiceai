@@ -249,7 +249,7 @@ Spice's own `${secrets:…}` and `${env:…}` pass through to `spiced`.
 | `wait-ready: { timeout }` | Wait for `/v1/ready`. |
 | `edit-spicepod: <patch>` | Rewrite the running instance's spicepod (for `--pods-watcher-enabled`). |
 | `start-source`, `stop-source`, `pause-source`, `unpause-source: <name>` | Control a source container; it keeps its host port across a stop. |
-| `source-exec: { <name>: <sql, list, or { file }> }` | Run statements on a source, in this instance's database. |
+| `source-exec: { <name>: <sql, list, or { file }> }` | Run statements on a source, in this instance's database. On an object store (`rustfs`), one command per line in the instance's bucket: `delete-first <prefix> <contains>` and `truncate-first <prefix> <contains>` delete, or keep the first half of, the first key in key order under the prefix that contains the text; `copy <from-prefix> <to-prefix>` copies every object under a prefix, and `delete-prefix <prefix>` deletes them. |
 | `write: { <source>: <sql or list> }` | Execute PostgreSQL DML on the required `mirror: <postgres source>` and apply its row images to the target. `key: <column>` defaults to `id`. |
 | `source-query: { <name>: <sql> }` | Ask a source directly and check `expect: { rows }`. |
 | `generate: { <source>: <table spec> }` | Create a table of seeded generated rows (see below); `mirror: <source>` loads the same rows into a database. |
@@ -264,7 +264,7 @@ Spice's own `${secrets:…}` and `${env:…}` pass through to `spiced`.
 | `explain: <sql>` | `EXPLAIN` (`analyze: true`), requiring `contains:` fragments or the absence of `omits:` ones. |
 | `assert-status: { dataset, status, message-contains, ready, has, lacks }` | Check a dataset's status from `/v1/datasets`. |
 | `assert-log: { contains, lacks, count, clean, allow }` | Check the instance's `spiced.log` with regular expressions; `count: { <pattern>: N \| '>=N' }`. |
-| `assert-files: { contains, lacks }` | Check files under the instance's directory, by path relative to it (files only, not empty directories). |
+| `assert-files: { contains, lacks, lacks-dirs }` | Check files under the instance's directory, by path relative to it (files only, not empty directories); `lacks-dirs` checks directories, empty ones included, as `<path>/`. |
 | `wipe-instance-dir: { keep }` | Delete everything `spiced` wrote in the instance's directory (`.spice/`, data and metastore files), as if the instance had lost its disk, keeping the spicepod, `spiced.log` and the `keep` paths (relative to the directory, such as a local state location). Refused while `spiced` or an executor runs; put `stop` or `kill-spiced` before it. |
 | `assert-objects: { source, prefix, contains, min, max }` | Require objects under a prefix of an object store or files source; `contains` counts only keys containing that text. `min` defaults to 1, or to 0 when `max` is given (`max: 0` requires none). |
 | `mark-metrics: <id>` | Keep a `/metrics` scrape for a later `wait-metric … since:`. |

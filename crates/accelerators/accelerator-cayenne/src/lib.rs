@@ -1416,6 +1416,41 @@ async fn object_store_table_prefixes(
     Ok(prefixes)
 }
 
+/// What an operator reads when the acceleration of a dataset whose data is in the
+/// state location is dropped: the folder it was in is kept, and the object-native
+/// catalog deletes it at a later start. `recreated` is a `mode: file_create` load,
+/// which reloads the dataset into a new folder.
+fn placed_acceleration_dropped_message(dataset: &str, folder: &str, recreated: bool) -> String {
+    let what = if recreated {
+        "dropped its acceleration for `mode: file_create` and reloads from its source into a new folder in the state location"
+    } else {
+        "dropped its acceleration"
+    };
+    format!(
+        "Dataset '{dataset}' (cayenne) {what}. Its previous folder '{folder}' is kept, so its files keep using storage until Spice deletes the folder at a start at least an hour after this drop. See: https://spiceai.org/docs/components/data-accelerators/cayenne"
+    )
+}
+
+/// The dataset folder of a data path in the state location
+/// (`…/datasets/<folder>/data` → `…/datasets/<folder>`).
+fn placed_dataset_folder(data_path: &str) -> &str {
+    data_path
+        .trim_end_matches('/')
+        .strip_suffix("/data")
+        .unwrap_or(data_path)
+}
+
+/// Whether a dataset's data files are in the state location.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum LocationPlacement {
+    /// Its stored table is there, at this data path.
+    Stored(String),
+    /// It has no stored table, and a new one goes there.
+    New,
+    /// Its data is at its data path.
+    Elsewhere,
+}
+
 /// The warning an operator reads when a dataset's acceleration was recreated, and the
 /// files of the previous one, in an object store, are left in place under `prefixes`.
 fn previous_acceleration_left_in_place_warning(table_name: &str, prefixes: &[String]) -> String {
@@ -3151,7 +3186,7 @@ impl CayenneAccelerator {
             // One already in it is refused rather than moved to a new, empty
             // SQLite table that would strand its rows.
             let in_native = self
-                .catalog_holds(metadata_dir, "object_native", source, &table_name)
+                .existing_native_catalog_holds(metadata_dir, source, &table_name)
                 .await?;
             ensure!(
                 !in_native,
@@ -3340,6 +3375,106 @@ impl CayenneAccelerator {
             "Dataset '{table_name}' (cayenne) keeps its data files in '{base_path}', beside its metadata in the state location."
         );
         Ok(Some(ObjectNativeDataPlacement { base_path, store }))
+    }
+
+    /// Where `source`'s data files are: in the state location (stored there, or a
+    /// new dataset that goes there) or at its data path. Decided as
+    /// [`Self::object_native_data_placement`] decides it, without logging or
+    /// refusing anything, for the steps of a load that run before the table opens.
+    async fn location_placement(&self, source: &dyn AccelerationSource) -> Result<LocationPlacement> {
+        if !source.is_file_accelerated() || !Self::vnext_enabled(source)? {
+            return Ok(LocationPlacement::Elsewhere);
+        }
+        let catalog = self.catalog_for_source(source).await?;
+        if catalog
+            .as_any()
+            .downcast_ref::<cayenne::metastore::object_native::ObjectNativeCatalog>()
+            .is_none()
+        {
+            return Ok(LocationPlacement::Elsewhere);
+        }
+        let in_object_store = source
+            .app()
+            .runtime
+            .state
+            .as_ref()
+            .and_then(|state| url::Url::parse(&state.location).ok())
+            .is_some_and(|location| location.scheme() == "s3" && location.host_str().is_some());
+        if !in_object_store {
+            return Ok(LocationPlacement::Elsewhere);
+        }
+        match catalog.get_table(&source.name().to_string()).await {
+            Ok(stored) if cayenne::metastore_layout::is_object_native_data_path(&stored.path) => {
+                Ok(LocationPlacement::Stored(stored.path))
+            }
+            Ok(_) => Ok(LocationPlacement::Elsewhere),
+            Err(cayenne::CatalogError::TableNotFound { .. }) => {
+                Ok(if object_native_data_unsupported(source).is_none() {
+                    LocationPlacement::New
+                } else {
+                    LocationPlacement::Elsewhere
+                })
+            }
+            Err(error) => Err(error).boxed().context(AccelerationCreationFailedSnafu),
+        }
+    }
+
+    /// Whether an object-native catalog already exists for `source` and holds
+    /// `table_name`. It is opened only when it exists: deciding this never
+    /// creates one.
+    async fn existing_native_catalog_holds(
+        &self,
+        metadata_dir: &str,
+        source: &dyn AccelerationSource,
+        table_name: &str,
+    ) -> Result<bool> {
+        if self.native_catalog.get().is_none() {
+            let exists = match source.app().runtime.state.clone() {
+                Some(state) => {
+                    let location = spicepod::component::runtime::StateLocation {
+                        location: state.location.clone(),
+                        params: state.params.clone(),
+                        source: spicepod::component::runtime::StateSource::RuntimeState,
+                    };
+                    let (store, prefix) = runtime_state_location::build_unmetered_object_store(
+                        source.secrets(),
+                        tokio::runtime::Handle::current(),
+                        &location,
+                        runtime_state_location::StateFeature::CayenneMetastore,
+                    )
+                    .await
+                    .boxed()
+                    .context(AccelerationInitializationFailedSnafu)?;
+                    let head = object_store::path::Path::from(prefix)
+                        .join("v1")
+                        .join("catalog")
+                        .join("head");
+                    match object_store::ObjectStoreExt::head(store.as_ref(), &head).await {
+                        Ok(_) => true,
+                        Err(object_store::Error::NotFound { .. }) => false,
+                        Err(error) => {
+                            return Err(error)
+                                .boxed()
+                                .context(AccelerationInitializationFailedSnafu);
+                        }
+                    }
+                }
+                None => {
+                    path_exists(
+                        PathBuf::from(metadata_dir)
+                            .join("object_native")
+                            .join("catalog")
+                            .join("head"),
+                    )
+                    .await
+                }
+            };
+            if !exists {
+                return Ok(false);
+            }
+        }
+        self.catalog_holds(metadata_dir, "object_native", source, table_name)
+            .await
     }
 
     /// Get or create the object-native catalog, with no SQL metastore. With
@@ -3636,6 +3771,12 @@ impl CayenneAccelerator {
         let (dir_path, object_store) = if let Some(placement) = placement {
             (placement.base_path, Some(placement.store))
         } else if local_through_store && object_store.is_none() && !dir_path.starts_with("s3://") {
+            // A dataset that left the state location (a rebuild that now needs
+            // something it does not support) may have no local directory yet.
+            tokio::fs::create_dir_all(dir_path)
+                .await
+                .boxed()
+                .context(AccelerationCreationFailedSnafu)?;
             let abs = tokio::fs::canonicalize(dir_path)
                 .await
                 .boxed()
@@ -4744,6 +4885,10 @@ impl DataAccelerator for CayenneAccelerator {
             return Ok(BootstrapStatus::none());
         }
 
+        // A dataset whose data files are in the state location has no local data
+        // directory: nothing is created or deleted under `dir_path` for it.
+        let placement = self.location_placement(source).await?;
+
         // If mode is FileCreate, snapshot existing data (if enabled) then delete the directory and metadata to start fresh
         if let Some(acceleration) = source.acceleration()
             && acceleration.mode == Mode::FileCreate
@@ -4801,7 +4946,18 @@ impl DataAccelerator for CayenneAccelerator {
                 );
             }
 
-            if path_exists(&path_buf).await {
+            if let LocationPlacement::Stored(data_path) = &placement {
+                tracing::warn!(
+                    "{}",
+                    placed_acceleration_dropped_message(
+                        &table_name,
+                        placed_dataset_folder(data_path),
+                        true
+                    )
+                );
+            } else if placement == LocationPlacement::New {
+                // Nothing of it is stored, here or in the state location.
+            } else if path_exists(&path_buf).await {
                 // The proofs run here rather than earlier because
                 // `snapshot_before_recreate` creates both directories, so an overlap
                 // only a symlink reveals is resolvable now even though the open-time
@@ -4823,9 +4979,13 @@ impl DataAccelerator for CayenneAccelerator {
         }
 
         // Create the vortex data directory if it doesn't exist. An object-store
-        // location has no directories: nothing local is created for it.
+        // location has no directories: nothing local is created for it, nor for a
+        // dataset whose data files are in the state location.
         let path_buf = PathBuf::from(&dir_path);
-        if !cayenne::is_object_store_path(&dir_path) && !path_exists(&path_buf).await {
+        if placement == LocationPlacement::Elsewhere
+            && !cayenne::is_object_store_path(&dir_path)
+            && !path_exists(&path_buf).await
+        {
             tokio::fs::create_dir_all(&path_buf)
                 .await
                 .boxed()
@@ -5436,12 +5596,21 @@ impl DataAccelerator for CayenneAccelerator {
         let mut removed_dirs = vec![dir_path.clone()];
         let mut left_in_place = None;
         let mut stored_elsewhere = false;
+        let mut placed_folder = None;
         if source.acceleration().is_some() {
             let catalog = self.catalog_for_source(source).await?;
             // A failed lookup must not fall back to the configured directory: that is
             // where the dataset now puts its data, which may already hold files. Only a
             // table that is not there leaves the configured directory to clear.
             match catalog.get_table(table_name).await {
+                // In the state location: the catalog's drop marks the dataset's
+                // folder, and a later start deletes it.
+                Ok(stored)
+                    if cayenne::metastore_layout::is_object_native_data_path(&stored.path) =>
+                {
+                    removed_dirs.clear();
+                    placed_folder = Some(placed_dataset_folder(&stored.path).to_string());
+                }
                 Ok(stored) if stored.path.starts_with("s3://") => {
                     removed_dirs.clear();
                     left_in_place = Some(
@@ -5488,6 +5657,15 @@ impl DataAccelerator for CayenneAccelerator {
                 "{}",
                 previous_acceleration_left_in_place_warning(table_name, &prefixes)
             );
+        }
+        if let Some(folder) = &placed_folder {
+            tracing::info!(
+                "{}",
+                placed_acceleration_dropped_message(table_name, folder, false)
+            );
+            // Its next table goes in the state location too, or creates its
+            // local directory when it opens.
+            return Ok(());
         }
 
         // Recreate the local data directory so the next create_external_table works.
@@ -5797,6 +5975,24 @@ data_accelerator_api::register_data_accelerator!(configured: Engine::Cayenne, Ca
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_dropped_placed_acceleration_says_its_folder_is_kept_and_when_it_goes() {
+        let data_path = "s3://bucket/state/cayenne/v1/datasets/orders-0190c2c4-0000-7000-8000-000000000000/data";
+        let folder = super::placed_dataset_folder(data_path);
+        assert_eq!(
+            folder,
+            "s3://bucket/state/cayenne/v1/datasets/orders-0190c2c4-0000-7000-8000-000000000000"
+        );
+        assert_eq!(
+            super::placed_acceleration_dropped_message("orders", folder, true),
+            "Dataset 'orders' (cayenne) dropped its acceleration for `mode: file_create` and reloads from its source into a new folder in the state location. Its previous folder 's3://bucket/state/cayenne/v1/datasets/orders-0190c2c4-0000-7000-8000-000000000000' is kept, so its files keep using storage until Spice deletes the folder at a start at least an hour after this drop. See: https://spiceai.org/docs/components/data-accelerators/cayenne"
+        );
+        assert_eq!(
+            super::placed_acceleration_dropped_message("orders", folder, false),
+            "Dataset 'orders' (cayenne) dropped its acceleration. Its previous folder 's3://bucket/state/cayenne/v1/datasets/orders-0190c2c4-0000-7000-8000-000000000000' is kept, so its files keep using storage until Spice deletes the folder at a start at least an hour after this drop. See: https://spiceai.org/docs/components/data-accelerators/cayenne"
+        );
+    }
+
     use super::*;
     use runtime_acceleration::OnSchemaChange;
     use runtime_acceleration::testing::TestAccelerationSource;

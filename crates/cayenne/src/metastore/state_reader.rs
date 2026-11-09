@@ -45,6 +45,31 @@ pub(crate) struct DatasetStateReader {
     empty: TableState,
     pub(crate) store: Arc<dyn ObjectStore>,
     pub(crate) prefix: Path,
+    /// The URL of the folder the catalog's `datasets/` folder is in: a data path
+    /// under it is recorded relative to it, so a copied location keeps working.
+    pub(crate) anchor: Option<Arc<str>>,
+}
+
+/// `path` as the state records it: relative to `anchor` when it is a dataset
+/// folder's data under it (`datasets/<folder>/…`), as given otherwise.
+pub(crate) fn stored_path(anchor: Option<&str>, path: &str) -> (String, bool) {
+    anchor
+        .and_then(|anchor| path.strip_prefix(anchor))
+        .and_then(|rest| rest.strip_prefix('/'))
+        .filter(|rest| rest.starts_with("datasets/"))
+        .map_or_else(
+            || (path.to_string(), false),
+            |rest| (rest.to_string(), true),
+        )
+}
+
+/// A path the state records, as its readers use it: a relative one resolved
+/// against `anchor`. Without an anchor a relative path is returned as recorded.
+pub(crate) fn resolved_path(anchor: Option<&str>, path: &str, relative: bool) -> (String, bool) {
+    match anchor {
+        Some(anchor) if relative => (format!("{anchor}/{path}"), false),
+        _ => (path.to_string(), relative),
+    }
 }
 
 fn invalid(error: impl std::fmt::Display) -> CatalogError {
@@ -65,7 +90,14 @@ impl DatasetStateReader {
             empty: TableState::default(),
             store,
             prefix,
+            anchor: None,
         }
+    }
+
+    /// This reader with relative data paths resolved against `anchor`.
+    pub(crate) fn with_anchor(mut self, anchor: Option<Arc<str>>) -> Self {
+        self.anchor = anchor;
+        self
     }
 
     fn table(&self, id: &str) -> CatalogResult<&TableState> {
@@ -188,11 +220,13 @@ impl MetadataCatalog for DatasetStateReader {
                     .ok_or_else(|| invalid("the stored table has no schema"))?,
             )
             .await?;
+        let (path, path_is_relative) =
+            resolved_path(self.anchor.as_deref(), &t.path, t.path_is_relative);
         Ok(TableMetadata {
             table_id: id.clone(),
             table_name: t.name.clone(),
-            path: t.path.clone(),
-            path_is_relative: t.path_is_relative,
+            path,
+            path_is_relative,
             schema: arrow_tools::map_entries::conforming_schema(Arc::new(
                 crate::cayenne_catalog::deserialize_schema_ipc_base64(
                     std::str::from_utf8(&schema).map_err(invalid)?,
@@ -231,12 +265,17 @@ impl MetadataCatalog for DatasetStateReader {
             .rows(table_id)
             .delete_files
             .values()
-            .map(|d| DeleteFile {
+            .map(|d| {
+                let (path, path_is_relative) =
+                    resolved_path(self.anchor.as_deref(), &d.path, d.relative);
+                (d, path, path_is_relative)
+            })
+            .map(|(d, path, path_is_relative)| DeleteFile {
                 delete_file_id: d.id.clone(),
                 table_id: table_id.to_string(),
                 source_data_file_path: d.source.clone(),
-                path: d.path.clone(),
-                path_is_relative: d.relative,
+                path,
+                path_is_relative,
                 format: d.format.clone(),
                 delete_count: d.count,
                 file_size_bytes: d.size,

@@ -142,6 +142,10 @@ impl PreparedResolvedAppend {
             tombstone.published = true;
         }
         let sequence = prepared.snapshot_sequence;
+        self.table
+            .record_new_protected_snapshot_files(&self.snapshot_id, sequence)
+            .await
+            .map_err(Failure::discard)?;
         let reserved_delta = self.table.reserve_live_rows_delta();
         commit_metadata(catalog, &mut prepared).await?;
 

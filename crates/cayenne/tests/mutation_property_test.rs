@@ -1118,6 +1118,14 @@ async fn run_concurrent(
 }
 
 async fn run_workload(fixture: TestFixture, w: Workload) -> TestResult<()> {
+    let fixture = if matches!(w.mode, Mode::AutoCrossing) {
+        // A table in an object store starts on key deletes (its storage class
+        // tunes it so), so the crossing from position deletes exists only for a
+        // table on a local directory.
+        fixture.on_local_store()
+    } else {
+        fixture
+    };
     let mut seeds_that_left_positions = 0usize;
     for seed in 0..w.seeds {
         let mut history = Vec::new();
@@ -1469,6 +1477,8 @@ async fn prop_auto_crossing_observes_position_then_key_switch_impl(
 ) -> TestResult<()> {
     // `AutoCrossing`'s bound: its 1 MiB target file size / 32.
     const BOUND: u64 = 32 * 1024;
+    // Only a table on a local directory starts on position deletes; see `run_workload`.
+    let f = f.on_local_store();
     let name = "auto_crossing_mode_switch";
     let (table, _ctx) =
         create_table(&f, name, Mode::AutoCrossing, Durability::File, None, false).await?;

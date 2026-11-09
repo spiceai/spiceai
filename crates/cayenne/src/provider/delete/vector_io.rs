@@ -739,7 +739,20 @@ pub fn detect_deletion_type_and_read(
                     .block_on(async { store.get(&location).await?.bytes().await })
                 {
                     Ok(bytes) => Ok(Box::new(std::io::Cursor::new(bytes))),
+                    // A dataset in the object-native location records a deletion
+                    // vector's removal before it deletes the object, so one its
+                    // committed state still names is never an interrupted sweep:
+                    // it is lost, and reading on without it would bring back rows
+                    // the dataset deleted.
                     Err(object_store::Error::NotFound { .. }) => {
+                        if let Some(storage) = storage.filter(|s| s.in_location()) {
+                            return Err(datafusion_common::DataFusionError::External(Box::new(
+                                storage.missing(
+                                    crate::dataset_storage::DataFileKind::Deletion,
+                                    &location,
+                                ),
+                            )));
+                        }
                         Err(std::io::Error::from(std::io::ErrorKind::NotFound))
                     }
                     Err(error) => Err(std::io::Error::other(error)),
@@ -750,7 +763,8 @@ pub fn detect_deletion_type_and_read(
         let file = match opened {
             Ok(file) => file,
             // A missing KEY-based DV file is tolerated and reported: the file-first
-            // orphaned-DV sweep unlinks the file before removing its catalog row, so
+            // orphaned-DV sweep of a dataset outside the object-native location
+            // unlinks the file before removing its catalog row, so
             // a crash in that window leaves a discoverable dangling row. The async
             // loader decides self-heal vs error against the floor. Position-based DVs
             // (source_data_file_path = Some) are tied to a live data file, so a
