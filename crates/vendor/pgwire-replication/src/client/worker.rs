@@ -235,6 +235,12 @@ impl WorkerState {
         const DRAIN_BATCH: usize = 256;
 
         let mut last_status_sent = Instant::now() - self.cfg.status_interval;
+        // When a status update last asked the server to reply. Tracked apart
+        // from `last_status_sent` because the idle wakeup below resets that on
+        // every wakeup, whatever `idle_wakeup_interval` is, so on a silent
+        // connection the periodic request at the top of the loop would
+        // otherwise never come due again after the first.
+        let mut last_reply_requested = last_status_sent;
         let mut last_applied = self.progress.load_applied();
         // Incremental, zero-copy, cancellation-safe reader.
         let mut reader = FrameReader::new(self.cfg.max_message_size);
@@ -256,6 +262,7 @@ impl WorkerState {
             if last_status_sent.elapsed() >= self.cfg.status_interval {
                 self.send_feedback(stream, last_applied, true).await?;
                 last_status_sent = Instant::now();
+                last_reply_requested = last_status_sent;
             }
 
             // ── Drain phase: tight loop while whole frames are already buffered ──
@@ -318,8 +325,15 @@ impl WorkerState {
                     if let Ok(res) = msg_result { res? } else {
                         let applied = self.progress.load_applied();
                         last_applied = applied;
-                        self.send_feedback(stream, applied, false).await?;
+                        // Keep asking for a reply once per `status_interval`
+                        // while the connection is silent (see above).
+                        let request_reply =
+                            last_reply_requested.elapsed() >= self.cfg.status_interval;
+                        self.send_feedback(stream, applied, request_reply).await?;
                         last_status_sent = Instant::now();
+                        if request_reply {
+                            last_reply_requested = last_status_sent;
+                        }
                         continue;
                     }
                 }
@@ -988,5 +1002,61 @@ mod tests {
             "send_event should still be parked on the full channel"
         );
         send.abort();
+    }
+
+    /// A silent replication connection keeps asking the server to reply once
+    /// per `status_interval`. Once the consumer has confirmed everything it was
+    /// sent, the walsender sends a keepalive only when asked (or after
+    /// `wal_sender_timeout / 2` without a reply, which the idle feedback below
+    /// keeps from elapsing), and a consumer learns that it is caught up only
+    /// from those keepalives. Here the idle wakeup fires more often than
+    /// `status_interval`, so every fifth update must ask.
+    #[tokio::test(start_paused = true)]
+    async fn idle_connection_requests_a_reply_every_status_interval() {
+        use tokio::io::{duplex, AsyncReadExt};
+
+        let (out_tx, _out_rx) =
+            mpsc::channel::<std::result::Result<ReplicationEvent, PgWireError>>(16);
+        let (_stop_tx, stop_rx) = watch::channel(false);
+        // The intervals `spiced` configures for its PostgreSQL CDC client.
+        let cfg = ReplicationConfig {
+            status_interval: std::time::Duration::from_secs(5),
+            idle_wakeup_interval: std::time::Duration::from_secs(1),
+            ..Default::default()
+        };
+        let progress = Arc::new(SharedProgress::new(Lsn(42)));
+        let mut worker = WorkerState::new(cfg, progress, stop_rx, out_tx);
+
+        // The server side never writes: the source has no WAL to send.
+        let (mut client_io, mut server_io) = duplex(64 * 1024);
+        let stream = tokio::spawn(async move { worker.stream_loop(&mut client_io).await });
+
+        // Twenty-one standby status updates: one at start, then one per idle
+        // wakeup, covering twenty seconds of a silent connection.
+        let mut reply_requested = Vec::new();
+        for _ in 0..21 {
+            let mut header = [0u8; 5];
+            server_io
+                .read_exact(&mut header)
+                .await
+                .expect("read frame header");
+            assert_eq!(header[0], b'd', "expected a CopyData frame");
+            let payload_len =
+                u32::from_be_bytes([header[1], header[2], header[3], header[4]]) as usize - 4;
+            let mut payload = vec![0u8; payload_len];
+            server_io
+                .read_exact(&mut payload)
+                .await
+                .expect("read frame payload");
+            assert_eq!(payload[0], b'r', "expected a standby status update");
+            reply_requested.push(payload[payload_len - 1] == 1);
+        }
+        stream.abort();
+
+        let expected: Vec<bool> = (0..21).map(|i| i % 5 == 0).collect();
+        assert_eq!(
+            reply_requested, expected,
+            "a reply should be requested at 0s, 5s, 10s, 15s and 20s of silence"
+        );
     }
 }
