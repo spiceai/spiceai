@@ -108,6 +108,9 @@ pub enum CpuSource {
     RequestBurst,
     /// `sched_getaffinity` — the cores the process may run on.
     Affinity,
+    /// An application sidecar's maximum of [`SIDECAR_MAX_CORES`], below what was
+    /// detected or configured.
+    SidecarCap,
     /// Nothing could be determined; one core.
     Fallback,
 }
@@ -122,6 +125,7 @@ impl CpuSource {
             Self::AllCores => "all_cores",
             Self::RequestBurst => "request_burst",
             Self::Affinity => "affinity",
+            Self::SidecarCap => "sidecar_cap",
             Self::Fallback => "fallback",
         }
     }
@@ -143,7 +147,17 @@ pub struct CpuConfig {
     /// rather than just the winner, because `all` defers to a quantity named
     /// below it — see [`CpuBudget::resolve`].
     surfaces: Vec<(String, &'static str)>,
+    /// Whether the runtime is an application sidecar, whose detected
+    /// entitlement is capped at [`SIDECAR_MAX_CORES`].
+    sidecar: bool,
 }
+
+/// The most cores an application sidecar sizes itself for. A sidecar shares
+/// its pod or host with the application it serves, so this is a hard cap: a
+/// detected entitlement above it is capped, and so is a configured one, with a
+/// warning (see [`CpuBudget::sidecar_cap_warning`]).
+pub const SIDECAR_MAX_CORES: usize = 4;
+const SIDECAR_MAX_MILLICORES: u64 = SIDECAR_MAX_CORES as u64 * 1000;
 
 impl CpuConfig {
     pub const CLI_SETTING: &str = "--cpu-cores";
@@ -161,7 +175,18 @@ impl CpuConfig {
         .into_iter()
         .filter_map(|(value, setting)| value.map(|value| (value.to_string(), setting)))
         .collect();
-        Self { surfaces }
+        Self {
+            surfaces,
+            sidecar: false,
+        }
+    }
+
+    /// Size for an application sidecar: the entitlement, detected or configured,
+    /// is capped at [`SIDECAR_MAX_CORES`].
+    #[must_use]
+    pub fn for_sidecar(mut self) -> Self {
+        self.sidecar = true;
+        self
     }
 
     /// Read `SPICE_CPU_CORES` from the process environment.
@@ -573,6 +598,16 @@ pub fn detect_cpu_share() -> Option<CpuShare> {
 /// is shared between a countable number of plans.
 const QUERIES_PER_CORE: usize = 4;
 
+/// Query plans an application sidecar admits concurrently per core when
+/// `runtime.query.max_concurrent_queries` is unset. A sidecar plan runs on one
+/// target partition ([`CpuBudget::sidecar_target_partitions`]) and spends most
+/// of its time waiting on the upstream it reads from, so it holds a fraction of
+/// a server plan's memory-pool reservations and CPU; admitted at
+/// [`QUERIES_PER_CORE`], a sidecar's cores idle while its queries wait. Four
+/// times that rate admits, at [`SIDECAR_MAX_CORES`], the 64 plans a 16-core
+/// server admits, each reserving one partition rather than sixteen.
+const SIDECAR_QUERIES_PER_CORE: usize = 4 * QUERIES_PER_CORE;
+
 /// How far above its CPU request a burstable pod sizes itself.
 ///
 /// A request is a scheduling floor, not a ceiling, so sizing *at* the request
@@ -628,6 +663,24 @@ pub struct CpuBudget {
     declared_request_millicores: Option<u64>,
     /// The host's SMT layout, which scales [`Self::physical_cores`].
     smt: Option<SmtLayout>,
+    /// Sized for an application sidecar, whose queries default to
+    /// [`Self::sidecar_target_partitions`].
+    sidecar: bool,
+    /// A configured value the sidecar cap lowered, reported by
+    /// [`Self::sidecar_cap_warning`].
+    sidecar_clamp: Option<SidecarClamp>,
+}
+
+/// A configured entitlement above [`SIDECAR_MAX_CORES`] that a sidecar was
+/// capped from.
+#[derive(Debug, Clone)]
+struct SidecarClamp {
+    /// The surface that set it, such as `runtime.cpu.cores`.
+    setting: &'static str,
+    /// The value as written there, such as `8` or `all`.
+    value: String,
+    /// What the value resolved to before the cap.
+    requested_millicores: u64,
 }
 
 /// The physical cores Cayenne's `deletion_mode: auto` needs before it keeps a
@@ -644,6 +697,11 @@ impl CpuBudget {
     /// 2. a cgroup CPU quota (`limits.cpu`) -> [`CpuSource::CgroupQuota`]
     /// 3. `sched_getaffinity` -> [`CpuSource::Affinity`]
     /// 4. one core -> [`CpuSource::Fallback`]
+    ///
+    /// A sidecar ([`CpuConfig::for_sidecar`]) then caps the result, whichever rung
+    /// produced it, at [`SIDECAR_MAX_CORES`] -> [`CpuSource::SidecarCap`]. A
+    /// configured quantity or `all` above the cap is recorded for
+    /// [`Self::sidecar_cap_warning`].
     ///
     /// With nothing configured this resolves to exactly what
     /// `available_parallelism` already returned — quota capped by affinity — so
@@ -708,7 +766,11 @@ impl CpuBudget {
         // available CPUs. Expressing it as "skip one rung" rather than as its own
         // `min(quota, affinity)` keeps one place that knows how to weigh a quota
         // against affinity, and needs no update when a rung is added.
-        let all_cores = matches!(configured, Some((CpuSetting::All, _)));
+        let all_setting = match configured {
+            Some((CpuSetting::All, setting)) => Some(setting),
+            _ => None,
+        };
+        let all_cores = all_setting.is_some();
         let explicit = match configured {
             Some((CpuSetting::Cores(millicores), setting)) => Some((millicores, setting)),
             _ => None,
@@ -752,6 +814,23 @@ impl CpuBudget {
         } else {
             (1000, CpuSource::Fallback, None)
         };
+        // A sidecar never sizes above its cap, whatever was detected or configured.
+        // A configured value that asked for more is kept for the warning.
+        let (millicores, source, setting, sidecar_clamp) =
+            if cfg.sidecar && millicores > SIDECAR_MAX_MILLICORES {
+                let clamp = setting.or(all_setting).map(|setting| SidecarClamp {
+                    setting,
+                    value: cfg
+                        .surfaces
+                        .iter()
+                        .find(|(_, surface)| *surface == setting)
+                        .map_or_else(String::new, |(value, _)| value.trim().to_string()),
+                    requested_millicores: millicores,
+                });
+                (SIDECAR_MAX_MILLICORES, CpuSource::SidecarCap, None, clamp)
+            } else {
+                (millicores, source, setting, None)
+            };
 
         Ok(Self {
             millicores,
@@ -764,6 +843,8 @@ impl CpuBudget {
             kubernetes: host.kubernetes,
             declared_request_millicores: host.declared_request_millicores,
             smt: host.smt,
+            sidecar: cfg.sidecar,
+            sidecar_clamp,
         })
     }
 
@@ -821,6 +902,29 @@ impl CpuBudget {
         if let Some(warning) = self.configured_above_ceiling_warning() {
             tracing::warn!("{warning}");
         }
+        if let Some(warning) = self.sidecar_cap_warning() {
+            tracing::warn!("{warning}");
+        }
+    }
+
+    /// The warning for a sidecar configured above [`SIDECAR_MAX_CORES`], naming
+    /// the setting as written, what it asked for, and the cores the sidecar
+    /// runs on instead. `None` when nothing configured asked for more.
+    #[must_use]
+    pub fn sidecar_cap_warning(&self) -> Option<String> {
+        let clamp = self.sidecar_clamp.as_ref()?;
+        let assignment = match clamp.setting {
+            CpuConfig::CLI_SETTING => format!("{} {}", clamp.setting, clamp.value),
+            CpuConfig::ENV_SETTING => format!("{}={}", clamp.setting, clamp.value),
+            _ => format!("{}: {}", clamp.setting, clamp.value),
+        };
+        Some(format!(
+            "`{assignment}` asks for {requested}, more than the {max} a sidecar may use, so this \
+             sidecar runs on {max}. A sidecar shares its host with the application it serves; to \
+             use more cores, start Spice without `--role sidecar`. See: {DOCS_URL}",
+            requested = format_millicores(clamp.requested_millicores),
+            max = format_millicores(SIDECAR_MAX_MILLICORES),
+        ))
     }
 
     /// Every quantity this budget derives, paired with the consumer it sizes.
@@ -842,7 +946,7 @@ impl CpuBudget {
                 "interactive_query_worker_threads",
                 self.interactive_query_worker_threads(),
             ),
-            ("target_partitions", self.target_partitions()),
+            ("target_partitions", self.default_target_partitions()),
             ("scan_split_concurrency", self.scan_split_concurrency()),
             ("vortex_parallelism", self.vortex_parallelism()),
             ("max_concurrent_queries", self.max_concurrent_queries()),
@@ -911,6 +1015,15 @@ impl CpuBudget {
                 "the declared CPU request (x2)"
             }
             CpuSource::Affinity => "the CPUs available to this process",
+            CpuSource::SidecarCap => {
+                const {
+                    assert!(
+                        SIDECAR_MAX_CORES == 4,
+                        "the origin string below names the cap"
+                    );
+                }
+                "the sidecar maximum of 4 cores"
+            }
             CpuSource::Fallback => "fallback",
         }
     }
@@ -942,8 +1055,18 @@ impl CpuBudget {
             limit = self.limit_millicores.map_or(unset, format_millicores),
             main = self.main_runtime_worker_threads(),
             dedicated = self.dedicated_runtime_worker_threads(),
-            partitions = self.target_partitions(),
+            partitions = self.default_target_partitions(),
         )
+    }
+
+    /// The target partitions a query gets when `runtime.query.target_partitions`
+    /// is unset, as the startup log reports them: one for a sidecar.
+    const fn default_target_partitions(&self) -> usize {
+        if self.sidecar {
+            self.sidecar_target_partitions()
+        } else {
+            self.target_partitions()
+        }
     }
 
     /// A warning when the declared CPU request looks like whole cores that lost
@@ -1340,10 +1463,17 @@ impl CpuBudget {
     /// [`Self::target_partitions`] operator reservations against a fixed memory
     /// pool, so unbounded concurrency lets queries starve each other and, past a
     /// point, take the process down. A small multiple of the core count keeps
-    /// enough in flight to hide I/O stalls without that.
+    /// enough in flight to hide I/O stalls without that. A sidecar, whose plans
+    /// run on one partition and mostly wait on its upstream, admits
+    /// [`SIDECAR_QUERIES_PER_CORE`].
     #[must_use]
     pub const fn max_concurrent_queries(&self) -> usize {
-        self.cores.saturating_mul(QUERIES_PER_CORE)
+        let per_core = if self.sidecar {
+            SIDECAR_QUERIES_PER_CORE
+        } else {
+            QUERIES_PER_CORE
+        };
+        self.cores.saturating_mul(per_core)
     }
 
     // ---- Cayenne ----
@@ -1504,6 +1634,8 @@ pub fn cpu_budget() -> &'static CpuBudget {
             kubernetes: false,
             declared_request_millicores: None,
             smt: None,
+            sidecar: false,
+            sidecar_clamp: None,
         })
     })
 }
@@ -1874,6 +2006,167 @@ mod tests {
             declared_request_millicores: Some(declared_request_millicores),
             smt: None,
         }
+    }
+
+    /// A sidecar runs on at most four cores. Whatever detection found is capped
+    /// on every rung, and so is a configured value: a quantity above four, or
+    /// `all` on a host with more, is capped with a warning that quotes the setting
+    /// as written. An entitlement at or below four is left alone, and `auto` asks
+    /// for detection, so it is capped without a warning.
+    #[test]
+    fn a_sidecar_runs_on_at_most_four_cores() {
+        let resolve = |config: &CpuConfig, host: &HostReadings| {
+            let budget = CpuBudget::resolve(config, host).expect("valid configuration");
+            (
+                budget.cores(),
+                budget.source(),
+                budget.sidecar_cap_warning(),
+            )
+        };
+        let detected = CpuConfig::default();
+        let sidecar = CpuConfig::default().for_sidecar();
+        for (name, host, server, capped) in [
+            (
+                "affinity",
+                host(16),
+                (16, CpuSource::Affinity),
+                (4, CpuSource::SidecarCap),
+            ),
+            (
+                "small host",
+                host(2),
+                (2, CpuSource::Affinity),
+                (2, CpuSource::Affinity),
+            ),
+            (
+                "four cores",
+                host(4),
+                (4, CpuSource::Affinity),
+                (4, CpuSource::Affinity),
+            ),
+            (
+                "cgroup limit",
+                quota(16, 8_000),
+                (8, CpuSource::CgroupQuota),
+                (4, CpuSource::SidecarCap),
+            ),
+            (
+                "small cgroup limit",
+                quota(16, 3_000),
+                (3, CpuSource::CgroupQuota),
+                (3, CpuSource::CgroupQuota),
+            ),
+            (
+                "declared request",
+                request_only(16, 4_000),
+                (8, CpuSource::RequestBurst),
+                (4, CpuSource::SidecarCap),
+            ),
+            (
+                "no detection",
+                host(0),
+                (1, CpuSource::Fallback),
+                (1, CpuSource::Fallback),
+            ),
+        ] {
+            assert_eq!(
+                resolve(&detected, &host),
+                (server.0, server.1, None),
+                "server, {name}"
+            );
+            assert_eq!(
+                resolve(&sidecar, &host),
+                (capped.0, capped.1, None),
+                "sidecar, {name}"
+            );
+        }
+
+        let warning = |assignment: &str, requested: &str| {
+            Some(format!(
+                "`{assignment}` asks for {requested}, more than the 4 cores a sidecar may use, so \
+                 this sidecar runs on 4 cores. A sidecar shares its host with the application it \
+                 serves; to use more cores, start Spice without `--role sidecar`. See: \
+                 https://spiceai.org/docs/reference/spicepod#runtimecpu"
+            ))
+        };
+        for (config, expected) in [
+            (
+                CpuConfig::from_sources(Some("8"), None, None),
+                (
+                    4,
+                    CpuSource::SidecarCap,
+                    warning("--cpu-cores 8", "8 cores"),
+                ),
+            ),
+            (
+                CpuConfig::from_sources(None, Some("4.5"), None),
+                (
+                    4,
+                    CpuSource::SidecarCap,
+                    warning("SPICE_CPU_CORES=4.5", "4.5 cores"),
+                ),
+            ),
+            (
+                CpuConfig::from_sources(None, None, Some("12")),
+                (
+                    4,
+                    CpuSource::SidecarCap,
+                    warning("runtime.cpu.cores: 12", "12 cores"),
+                ),
+            ),
+            (
+                CpuConfig::from_sources(None, None, Some("all")),
+                (
+                    4,
+                    CpuSource::SidecarCap,
+                    warning("runtime.cpu.cores: all", "16 cores"),
+                ),
+            ),
+            (
+                // `all` defers to a quantity named below it; that quantity is capped.
+                CpuConfig::from_sources(None, Some("all"), Some("6")),
+                (
+                    4,
+                    CpuSource::SidecarCap,
+                    warning("runtime.cpu.cores: 6", "6 cores"),
+                ),
+            ),
+            (
+                CpuConfig::from_sources(None, None, Some("4")),
+                (4, CpuSource::Configured, None),
+            ),
+            (
+                CpuConfig::from_sources(Some("2"), None, None),
+                (2, CpuSource::Configured, None),
+            ),
+            (
+                CpuConfig::from_sources(None, None, Some("auto")),
+                (4, CpuSource::SidecarCap, None),
+            ),
+        ] {
+            let name = format!("{config:?}");
+            assert_eq!(
+                resolve(&config.for_sidecar(), &host(16)),
+                expected,
+                "{name}"
+            );
+        }
+        // A server is never capped and never warned about it.
+        assert_eq!(
+            resolve(&CpuConfig::from_sources(None, None, Some("12")), &host(16)),
+            (12, CpuSource::Configured, None)
+        );
+
+        let summary = CpuBudget::resolve(&sidecar, &host(16))
+            .expect("detection cannot fail")
+            .summary_line();
+        assert!(
+            summary.starts_with(
+                "CPU budget: 4 cores (source: the sidecar maximum of 4 cores; host reports 16"
+            ),
+            "{summary}"
+        );
+        assert!(summary.ends_with(", 1 target partitions"), "{summary}");
     }
 
     #[test]
@@ -2688,6 +2981,30 @@ mod tests {
     fn max_concurrent_queries_scales_with_the_budget() {
         assert_eq!(budget(1).max_concurrent_queries(), 4);
         assert_eq!(budget(16).max_concurrent_queries(), 64);
+    }
+
+    /// A sidecar's plans run on one partition and mostly wait on its upstream,
+    /// so it admits sixteen per core: at its 4-core maximum, the 64 a 16-core
+    /// server admits, rather than the 16 a 4-core server does.
+    #[test]
+    fn a_sidecar_admits_sixteen_queries_per_core() {
+        let sidecar = |host: &HostReadings| {
+            CpuBudget::resolve(&CpuConfig::default().for_sidecar(), host)
+                .expect("detection cannot fail")
+        };
+        for (cores, server, capped) in [(1, 4, 16), (2, 8, 32), (4, 16, 64), (16, 64, 64)] {
+            assert_eq!(
+                budget(cores).max_concurrent_queries(),
+                server,
+                "server, {cores} cores"
+            );
+            assert_eq!(
+                sidecar(&host(cores)).max_concurrent_queries(),
+                capped,
+                "sidecar, {cores} cores"
+            );
+        }
+        assert_eq!(sidecar(&host(16)).sidecar_target_partitions(), 1);
     }
 
     #[test]

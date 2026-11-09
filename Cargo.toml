@@ -643,6 +643,14 @@ mysql-common-derive = { path = "vendor/mysql-common-derive" }
 # with such a query failed with a 500. See vendor/tantivy-query-grammar/README.md.
 tantivy-query-grammar = { path = "vendor/tantivy-query-grammar" }
 
+# Local vendored fork of `sqlparser` 0.62.0 (path: vendor/sqlparser) with
+# apache/datafusion-sqlparser-rs#2436 backported: the right operand of
+# `IS [NOT] DISTINCT FROM` swallowed a following `AND`/`OR`, so
+# `a IS DISTINCT FROM b OR c` parsed as `a IS DISTINCT FROM (b OR c)` and
+# returned wrong rows. Drop this when DataFusion moves to sqlparser >= 0.63.
+# See vendor/sqlparser/README.md.
+sqlparser = { path = "vendor/sqlparser" }
+
 # Dependencies on crates.io `backoff` 0.4 resolve to the workspace crate.
 backoff = { path = "crates/backoff" }
 
