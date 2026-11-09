@@ -40,6 +40,8 @@ pub mod common;
 #[cfg(feature = "postgres")]
 pub mod dml;
 #[cfg(feature = "postgres")]
+pub mod federation_differential;
+#[cfg(feature = "postgres")]
 pub mod numeric_scale;
 #[cfg(feature = "postgres")]
 pub mod replication;
@@ -47,7 +49,7 @@ pub mod replication;
 pub mod replication_shared;
 #[cfg(feature = "postgres")]
 pub mod replication_tpch;
-#[cfg(all(feature = "postgres", feature = "duckdb"))]
+#[cfg(feature = "postgres")]
 pub mod replication_type_change;
 #[cfg(feature = "postgres")]
 pub mod schema_inference;

@@ -133,10 +133,10 @@ pub const PARAMETERS: &[ParameterSpec] = &[
         .default("auto"),
 
     // Databricks M2M Service Principal credentials
-    ParameterSpec::component("client_id").description("The client ID of the Databricks service principal."),
+    ParameterSpec::component("client_id").secret().description("The client ID of the Databricks service principal. Defaults to `DATABRICKS_CLIENT_ID` for workload identity federation or beside a client secret."),
     ParameterSpec::component("client_secret").secret().description("The client secret of the Databricks service principal."),
-    ParameterSpec::component("oidc_token_filepath").description("A file that holds the workload's identity token, read again for every exchange, such as a Kubernetes projected service account token. With `databricks_client_id`, it authenticates with workload identity federation."),
-    ParameterSpec::component("token_audience").description("The audience of the identity token Spice requests from a GitHub Actions job, such as the Databricks account ID. With `databricks_client_id`, it authenticates with workload identity federation."),
+    ParameterSpec::component("oidc_token_filepath").secret().description("A file that holds the workload's identity token, read again for every exchange, such as a Kubernetes projected service account token. With `databricks_client_id`, it authenticates with workload identity federation. Defaults to `DATABRICKS_OIDC_TOKEN_FILEPATH`."),
+    ParameterSpec::component("token_audience").secret().description("The audience of the identity token Spice requests from a GitHub Actions job or the workload's cloud identity, such as the Databricks account ID. With `databricks_client_id`, it authenticates with workload identity federation. Defaults to `DATABRICKS_TOKEN_AUDIENCE`."),
 
     // S3 storage options
     ParameterSpec::component("aws_region")

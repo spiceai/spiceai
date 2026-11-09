@@ -2,17 +2,17 @@
 
 Stream every `INSERT`, `UPDATE`, and `DELETE` from a PostgreSQL table directly into a Spice-accelerated dataset over Postgres' native logical replication protocol — no Debezium, no Kafka, no external services.
 
-This is the recommended way to keep a Spice accelerator (DuckDB, SQLite, Postgres, Cayenne, Arrow) continuously in sync with a Postgres source.
+This is the recommended way to keep a Spice accelerator (Cayenne, SQLite, Postgres, Arrow) continuously in sync with a Postgres source.
 
 ## How it works
 
 ```
 ┌────────────────┐   WAL (pgoutput)   ┌───────────────────┐   ChangeBatch   ┌───────────────┐
 │   PostgreSQL   │──────────────────▶│    Spice runtime  │────────────────▶│  Accelerator  │
-│  wal_level=    │   replication     │  (postgres        │    (INSERT/     │  DuckDB /     │
+│  wal_level=    │   replication     │  (postgres        │    (INSERT/     │  Cayenne /    │
 │  logical       │   slot            │   connector)      │     UPDATE /    │  SQLite /     │
-│                │                   │                   │     DELETE)     │  Postgres /   │
-└────────────────┘                   └───────────────────┘                 │  Cayenne      │
+│                │                   │                   │     DELETE)     │  Postgres     │
+└────────────────┘                   └───────────────────┘                 │               │
                                                                            └───────────────┘
 ```
 
@@ -98,7 +98,7 @@ datasets:
       #   pg_sslrootcert: ${secrets:pg_ca_pem}
     acceleration:
       enabled: true
-      engine: duckdb           # or: sqlite | postgres | cayenne | arrow
+      engine: cayenne          # or: sqlite | postgres | arrow
       refresh_mode: changes    # <-- triggers WAL streaming
       primary_key: id
       on_conflict:
@@ -109,7 +109,7 @@ Start the runtime. Spice will:
 
 - Auto-create publication `spice_users_<dataset-hash>_pub`.
 - Auto-create replication slot `spice_users_<dataset-hash>_<instance-hash>`.
-- Snapshot `public.users` into the DuckDB accelerator.
+- Snapshot `public.users` into the Cayenne accelerator.
 - Stream every subsequent change as it commits on Postgres.
 
 ## Full configuration reference
@@ -174,13 +174,12 @@ Note: `prefer` behaves as plaintext here because the replication transport does 
 
 | Engine     | `INSERT` |          `UPDATE`           | `DELETE` | Notes                                                                                                                                                                                                 |
 | ---------- | :------: | :-------------------------: | :------: | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `duckdb`   |    ✅     |         ✅ (upsert)          |    ✅     | Recommended for most workloads.                                                                                                                                                                       |
 | `sqlite`   |    ✅     |         ✅ (upsert)          |    ✅     | Great for small/medium datasets.                                                                                                                                                                      |
 | `postgres` |    ✅     |         ✅ (upsert)          |    ✅     | Use when the accelerator is another Postgres.                                                                                                                                                         |
-| `cayenne`  |    ✅     |         ✅ (upsert)          |    ✅     | S3-backed Vortex format, good for read-heavy analytics.                                                                                                                                               |
+| `cayenne`  |    ✅     |         ✅ (upsert)          |    ✅     | The default. Recommended for most workloads.                                                                                                                                                          |
 | `arrow`    |    ✅     | ✅ (upsert with primary key) |    ✅     | Arrow's in-memory engine uses a hash index for primary-key upserts. Without a primary key, updates are appended as new rows. `DELETE` and `TRUNCATE` are applied via Arrow's `DeletionTableProvider`. |
 
-For Arrow workloads that need true upsert semantics (so `UPDATE`s replace existing rows instead of duplicating them), configure a primary key. DuckDB, SQLite, Postgres, and Cayenne also support upsert behavior.
+For Arrow workloads that need true upsert semantics (so `UPDATE`s replace existing rows instead of duplicating them), configure a primary key. Cayenne, SQLite, and Postgres also support upsert behavior.
 
 ## Sharing one slot across multiple datasets
 
@@ -200,7 +199,7 @@ datasets:
       pg_replication_slot: spice_app_cdc
     acceleration:
       enabled: true
-      engine: duckdb
+      engine: cayenne
       refresh_mode: changes
       primary_key: id
       on_conflict:
@@ -211,7 +210,7 @@ datasets:
     params: *repl
     acceleration:
       enabled: true
-      engine: duckdb
+      engine: cayenne
       refresh_mode: changes
       primary_key: id
       on_conflict:
@@ -445,7 +444,7 @@ The replication stream is designed to survive transient failures without operato
 
 ### Rebuilding an accelerator from scratch
 
-Delete the accelerator's local storage (DuckDB file, SQLite file, etc.) and drop the replication slot:
+Delete the accelerator's local storage (Cayenne data and metadata directories, SQLite file, etc.) and drop the replication slot:
 
 ```sql
 SELECT pg_drop_replication_slot('spice_users_<instance-hash>');

@@ -158,7 +158,7 @@ datasets:
     params:
       connection_string: s3://my-bucket/warehouse/metadata.ducklake
       enabled: true
-      engine: duckdb
+      engine: cayenne
       mode: file
       refresh_check_interval: 10m
 ```

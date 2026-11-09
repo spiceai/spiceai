@@ -193,6 +193,13 @@ async fn a_second_request_drafts_as_on_a_fresh_context() {
                 after_another.0[step].clone(),
                 fresh.0[step].clone(),
             ));
+        } else {
+            // the same drafts at every step make the same steps, so the whole replies match,
+            // including the drafts the final step accepted, which no later step's token follows
+            assert_eq!(
+                after_another.1, fresh.1,
+                "the reply to {text:?}, whose drafts match at every step"
+            );
         }
     }
     assert!(
@@ -242,7 +249,7 @@ fn generate(spec: &mut Mtp<'_>, prompt: &[Token], steps: usize) -> (Vec<Vec<Toke
         .decode(&batch)
         .expect("the prompt decodes");
     spec.process(&batch).expect("the head reads the prompt");
-    spec.begin(prompt).expect("drafting begins");
+    spec.begin(0, prompt).expect("drafting begins");
     let mut sampler = Sampler::greedy();
     let mut history = prompt.to_vec();
     let mut id = sampler.sample(spec.target(), batch.n_tokens() - 1);
@@ -250,7 +257,7 @@ fn generate(spec: &mut Mtp<'_>, prompt: &[Token], steps: usize) -> (Vec<Vec<Toke
     let mut reply = Vec::new();
     for _ in 0..steps {
         let n_past = position(history.len());
-        let draft = spec.draft(n_past, id, &history).expect("a draft");
+        let draft = spec.draft(0, n_past, id, &history).expect("a draft");
         // drafting wrote its positions into the head's cache, and the verify batch writes them again
         assert!(
             spec.draft_mut().truncate(n_past),
@@ -282,7 +289,7 @@ fn generate(spec: &mut Mtp<'_>, prompt: &[Token], steps: usize) -> (Vec<Vec<Toke
             }
         };
         if !draft.is_empty() {
-            spec.accept(u16::try_from(accepted).expect("a draft length"))
+            spec.accept(0, u16::try_from(accepted).expect("a draft length"))
                 .expect("the draft is accepted");
         }
         let kept = position(history.len());
@@ -344,7 +351,7 @@ async fn a_reused_prefix_drafts_as_on_a_fresh_context() {
             .target()
             .partial_state()
             .expect("the recurrent state saves");
-        let head = spec.state().expect("the head's state");
+        let head = spec.state(0).expect("the head's state");
         read(&mut spec, &turn1, at..turn1.len());
         let _ = generate_after_read(&mut spec, &turn1, 24);
         // turn 2: restore the states saved at the split, then cut both caches back to it
@@ -353,7 +360,8 @@ async fn a_reused_prefix_drafts_as_on_a_fresh_context() {
             "the checkpoint restores"
         );
         if let Some(head) = &head {
-            spec.restore_state(head).expect("the head's state restores");
+            spec.restore_state(0, head)
+                .expect("the head's state restores");
         }
         assert!(
             spec.target_mut().truncate(position(at)) && spec.draft_mut().truncate(position(at)),
@@ -384,6 +392,12 @@ async fn a_reused_prefix_drafts_as_on_a_fresh_context() {
         "turn 2's drafts after turn 1 {:?}\nread whole on a fresh context {:?}",
         reused.0, fresh.0
     );
+    // the same drafts at every step make the same steps, so the whole replies match, including
+    // the drafts the final step accepted, which no later step's token follows
+    assert_eq!(
+        reused.1, fresh.1,
+        "turn 2's reply, whose drafts match at every step"
+    );
 }
 
 fn position(n: usize) -> i32 {
@@ -409,7 +423,7 @@ fn generate_after_read(
     prompt: &[Token],
     steps: usize,
 ) -> (Vec<Vec<Token>>, Vec<Token>) {
-    spec.begin(prompt).expect("drafting begins");
+    spec.begin(0, prompt).expect("drafting begins");
     let mut sampler = Sampler::greedy();
     let mut history = prompt.to_vec();
     // the last read batch's last row is the prompt's last token
@@ -419,7 +433,7 @@ fn generate_after_read(
     let mut reply = Vec::new();
     for _ in 0..steps {
         let n_past = position(history.len());
-        let draft = spec.draft(n_past, id, &history).expect("a draft");
+        let draft = spec.draft(0, n_past, id, &history).expect("a draft");
         assert!(
             spec.draft_mut().truncate(n_past),
             "the head's cache rolls back"
@@ -450,7 +464,7 @@ fn generate_after_read(
             }
         };
         if !draft.is_empty() {
-            spec.accept(u16::try_from(accepted).expect("a draft length"))
+            spec.accept(0, u16::try_from(accepted).expect("a draft length"))
                 .expect("the draft is accepted");
         }
         let kept = position(history.len());

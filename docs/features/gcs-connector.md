@@ -195,7 +195,7 @@ datasets:
       gcs_service_account_path: /path/to/service-account.json
     acceleration:
       enabled: true
-      engine: duckdb
+      engine: cayenne
       mode: file
       refresh_interval: 1h
 ```

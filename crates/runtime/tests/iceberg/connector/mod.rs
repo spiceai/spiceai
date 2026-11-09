@@ -85,9 +85,9 @@ async fn iceberg_integration_test_cayenne_acceleration() -> Result<(), anyhow::E
             let _ = run_iceberg_test(
                 "iceberg_dataset_test",
                 dataset,
-                "SELECT * FROM customer LIMIT 10",
+                "SELECT * FROM customer ORDER BY c_custkey LIMIT 10",
                 true,
-                Some("iceberg_integration_test_duckdb_acceleration"),
+                Some("iceberg_integration_test_cayenne_acceleration"),
             )
             .await?;
 
@@ -122,7 +122,7 @@ async fn iceberg_integration_test_cayenne_acceleration_restart() -> Result<(), a
             let rt = run_iceberg_test(
                 "iceberg_dataset_test",
                 dataset.clone(),
-                "SELECT * FROM customer LIMIT 10",
+                "SELECT * FROM customer ORDER BY c_custkey LIMIT 10",
                 false,
                 None,
             )
@@ -134,9 +134,9 @@ async fn iceberg_integration_test_cayenne_acceleration_restart() -> Result<(), a
             let _ = run_iceberg_test(
                 "iceberg_dataset_test",
                 dataset,
-                "SELECT * FROM customer LIMIT 10",
+                "SELECT * FROM customer ORDER BY c_custkey LIMIT 10",
                 true,
-                Some("iceberg_integration_test_duckdb_acceleration_restart"),
+                Some("iceberg_integration_test_cayenne_acceleration_restart"),
             )
             .await?;
 
