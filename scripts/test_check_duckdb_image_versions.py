@@ -30,8 +30,9 @@ AMD64 = "a" * 64
 ARM64 = "b" * 64
 
 
-def dockerfile(version="2.0.0", amd64=AMD64, arm64=ARM64, copy=True) -> str:
+def dockerfile(version="2.0.0", amd64=AMD64, arm64=ARM64, copy=True, platforms=("linux-amd64", "linux-arm64")) -> str:
     lines = ["FROM ubuntu:26.04 AS libduckdb"]
+    lines += [f"# downloads duckdb-shared-libs-{platform}.tar.gz" for platform in platforms]
     if version is not None:
         lines.append(f"ARG DUCKDB_VERSION={version}")
     if amd64 is not None:
@@ -70,7 +71,7 @@ class CheckTest(unittest.TestCase):
                     "Dockerfile": dockerfile(),
                     # An amd64-only image needs no arm64 checksum, and may copy
                     # outside a sandbox.
-                    "Dockerfile-cuda-release": dockerfile(arm64=None).replace(
+                    "Dockerfile-cuda-release": dockerfile(arm64=None, platforms=("linux-amd64",)).replace(
                         "/usr/lib/", "/spice_sandbox/usr/lib/"
                     ),
                 }
@@ -111,6 +112,12 @@ class CheckTest(unittest.TestCase):
         self.assertEqual(
             self.run_check({"Dockerfile": dockerfile(amd64=None)}),
             ["Dockerfile has no ARG DUCKDB_SHA256_AMD64"],
+        )
+
+    def test_missing_arm64_checksum_fails_for_a_multi_arch_image(self):
+        self.assertEqual(
+            self.run_check({"Dockerfile.local": dockerfile(arm64=None)}),
+            ["Dockerfile.local has no ARG DUCKDB_SHA256_ARM64"],
         )
 
     def test_download_without_copy_fails(self):

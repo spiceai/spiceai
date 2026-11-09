@@ -73,10 +73,11 @@ def check(root: Path) -> list[str]:
             if len(found) > 1:
                 errors.append(f"{path.name} declares ARG {arg} {len(found)} times")
                 continue
-            # Every image needs the version and the amd64 checksum; an image
-            # built only for amd64 (Dockerfile-cuda-release) has no arm64 one.
+            # Every image needs the version and the amd64 checksum. Only an
+            # image that never downloads the arm64 archive (Dockerfile-cuda-release
+            # is built for amd64 alone) may leave out the arm64 checksum.
             if not found:
-                if arg != "DUCKDB_SHA256_ARM64":
+                if arg != "DUCKDB_SHA256_ARM64" or "linux-arm64" in text:
                     errors.append(f"{path.name} has no ARG {arg}")
                 continue
             if found[0] != expected[arg]:
