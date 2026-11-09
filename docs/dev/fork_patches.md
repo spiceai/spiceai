@@ -136,7 +136,7 @@ own section below — a count here would be one more thing to keep true by hand.
 | [text-splitter](#text-splitter) | `58f9c21006e01e5e968c5de80a0398b3f5ec439a` | `spiceai` |
 | [tiberius](#dependency-only-forks) | `9ae93c65222b51b0579945ffce5cba053cb23cca` | `spiceai` |
 | [tokio-rusqlite](#rusqlite-and-tokio-rusqlite) | `b10df82e3bbc4f4700562a14a3a00714cbc2f0c7` | `spiceai` |
-| [vortex](#vortex) | `0087ce1c491202b17d420552fdceaa6ce47ba5a5` | `lukim/timestamp-full-i64-range` (TEMPORARY: spiceai/vortex#108) |
+| [vortex](#vortex) | `4539a2fa604c9cfe72f6977fdf3cff98323b00c0` | `spiceai-55` |
 
 `spiceai/spice-rs` and `spiceai/spicebench` are also pinned as git dependencies but
 are not forks — they are Spice repositories with no upstream, so nothing can drop a
