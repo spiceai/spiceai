@@ -870,7 +870,10 @@ pub fn build_auth_credentials_in(
 }
 
 /// No credential is set.
-#[cfg(feature = "databricks")]
+///
+/// Not gated on the `databricks` feature: the Databricks model and embedding loaders in
+/// `model/chat.rs` and `model/embed.rs` use it too, and they build under `models` without
+/// `databricks` (as `tools/spiceschema` does).
 pub const NO_CREDENTIAL_MESSAGE: &str = "Missing credentials: set `databricks_token`, `databricks_client_id` with `databricks_client_secret`, or workload identity federation (`databricks_client_id` with `databricks_oidc_token_filepath`, or `databricks_client_id` alone in a GitHub Actions job with `permissions: id-token: write`)";
 
 /// Both a token and service-principal credentials are set. Parameters absent from the Spicepod are

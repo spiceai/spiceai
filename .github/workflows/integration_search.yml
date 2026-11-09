@@ -88,7 +88,7 @@ jobs:
             echo "Error: OPENAI_IDENTITY_PROVIDER_ID is not defined."
             exit 1
           fi
-          cargo test --test integration_models -p runtime --features models,metal,s3_vectors,kafka,duckdb,extended_tests -- search
+          cargo test --test integration_models -p runtime --features models,metal,s3_vectors,kafka,extended_tests -- search
 
       - name: Push snapshots to branch
         # `cargo test` will fail if snapshot changes are needed. Always attempt
