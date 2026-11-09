@@ -33,7 +33,7 @@ use async_trait::async_trait;
 use cayenne::{MetadataCatalog, metastore::object_native::ObjectNativeCatalog};
 use runtime_acceleration::{
     dataset_checkpoint::{DatasetCheckpointer, deserialize_schema, serialize_schema},
-    sidecar::{AcceleratorSidecar, unsupported_sidecar},
+    sidecar::AcceleratorSidecar,
     snapshot::SnapshotBehavior,
 };
 use runtime_checkpoint_api::{
@@ -45,7 +45,6 @@ use runtime_checkpoint_api::{
 };
 use serde_json::{Value, json};
 
-const ENGINE: &str = "cayenne object_native";
 const DATASET_CHECKPOINT: &str = "spice_sys_dataset_checkpoint";
 
 fn store_error(source: impl Into<Box<dyn std::error::Error + Send + Sync>>) -> CheckpointError {
@@ -217,10 +216,6 @@ impl AcceleratorSidecar for NativeSidecar {
         Ok(Arc::new(NativeDatasetCheckpointer(
             self.values(DATASET_CHECKPOINT),
         )))
-    }
-
-    async fn update_caching_engine_fetched_at(&self) -> Result<(), CheckpointError> {
-        Err(unsupported_sidecar(ENGINE, "caching-engine"))
     }
 }
 
