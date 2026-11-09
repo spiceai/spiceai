@@ -17,12 +17,8 @@ sources:
   src: { kind: postgres }
   my: { kind: mysql }
 
-# The spicepod as written, and the same with the prototype object-native
-# Cayenne metastore (`runtime.params.cayenne_vnext`) in place of SQLite.
-variants:
-  as-written: federated
-  object-native: object-native
-
+# No `object-native` variant yet: a release writes the SQLite Cayenne
+# metastore, which the object-native metastore does not import (#16187).
 spicepod:
   version: v1
   kind: Spicepod
