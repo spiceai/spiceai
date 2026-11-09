@@ -42,10 +42,17 @@ pub(super) async fn start_executors(
     let active = instance.active_executors;
     for executor in instance.executors.iter_mut().take(active) {
         if !executor.is_running() {
+            let in_container = executor.container_name().is_some();
             if let Some(name) = executor.container_name() {
+                // The combination reserved this room before it took its
+                // `--jobs` slots; this waits only if something outside the
+                // run took it meanwhile, or for a restart.
                 crate::keyquota::wait_for_room(1, &format!("executor container {name}")).await?;
             }
             executor.start(&instance.spicepod_yaml)?;
+            if in_container && let Some(key_room) = &instance.key_room {
+                key_room.release(1);
+            }
             executor.wait_health(timeout).await?;
         }
     }

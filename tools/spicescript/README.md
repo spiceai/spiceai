@@ -73,11 +73,14 @@ charged to the daemon's uid. That uid's quota (`kernel.keys.maxkeys` and
 `kernel.keys.maxbytes`, 200 keys and 20000 bytes by default) is shared with
 everything else running as it on the host, and when it is full runc refuses
 to start a container ("unable to join session keyring … disk quota
-exceeded"). On Linux the runner reads the quota from `/proc/key-users`: a
-matrix combination starts its sources only once there is room for all of
-them, every container start waits for room, and a start refused for the quota
-is retried. A wait is reported in the script's output. After 15 minutes
-without room the script fails, naming the quota and the fix.
+exceeded"). On Linux the runner reads the quota from `/proc/key-users`. Before
+a matrix combination takes its `--jobs` slots, it reserves room for every
+container it starts (its sources, and its executors when they run in
+containers), so it never holds slots while it waits for room. Every container
+start also waits for room, and a start refused for the quota is retried. A
+wait is reported in the script's output. After 15 minutes without room the
+script fails, naming the quota and the fix; time spent waiting on room that
+this run's other combinations have reserved does not count toward that.
 
 | Option | Meaning |
 | --- | --- |

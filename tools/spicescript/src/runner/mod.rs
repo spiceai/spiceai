@@ -253,6 +253,52 @@ fn runs_executors(script: &Script, options: &Options) -> bool {
     options.cluster || script.defaults.cluster.is_some() || script.defaults.executor_args.is_some()
 }
 
+/// Whether the instances run as a cluster: a scheduler with the executors of
+/// `defaults.cluster` (or `--cluster`), rather than `executor-args`.
+fn runs_cluster(script: &Script, options: &Options) -> bool {
+    (options.cluster || script.defaults.cluster.is_some())
+        && script.defaults.executor_args.is_none()
+}
+
+/// Whether the cluster's executors run in containers of their own.
+fn executors_in_containers(script: &Script, options: &Options) -> bool {
+    runs_cluster(script, options)
+        && script
+            .defaults
+            .cluster
+            .as_ref()
+            .is_some_and(|c| c.containers)
+}
+
+/// The most executor containers a combination's instances start: every
+/// executor and spare of every instance, where executors run in containers.
+/// Instances skipped when they are created start none, so the combination
+/// gives their share back then.
+fn executor_containers_bound(
+    script: &Script,
+    options: &Options,
+    combo: &Map<String, Value>,
+) -> u64 {
+    if !cfg!(target_os = "linux") || !executors_in_containers(script, options) {
+        return 0;
+    }
+    let per_instance = script
+        .defaults
+        .cluster
+        .as_ref()
+        .map_or(1, |c| c.executors + c.spare);
+    let variants = if script.variants.is_empty() {
+        1
+    } else {
+        script
+            .variants
+            .values()
+            .filter(|v| when_matches(&v.when, combo))
+            .count()
+    };
+    u64::try_from(per_instance * variants * options.targets.len()).unwrap_or(u64::MAX)
+}
+
 /// How a combination's instances run.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Schedule {
@@ -457,6 +503,9 @@ struct Instance {
     answers: BTreeMap<usize, Vec<RecordBatch>>,
     /// Answers of queries that carry an `id`.
     named: BTreeMap<String, Vec<RecordBatch>>,
+    /// Kernel key quota room the combination reserved for its executor
+    /// containers, which each gives back as it starts (see `crate::keyquota`).
+    key_room: Option<Arc<crate::keyquota::Reservation<'static>>>,
     /// What `${…}` placeholders resolve to, in the spicepod and in step SQL.
     context: Value,
     /// The `spice` CLI that `spice` steps run.
@@ -693,6 +742,46 @@ async fn run_combination(
     let weight = instance_weight(script, options);
     let instance_count =
         u32::try_from(options.targets.len() * script.variants.len().max(1)).unwrap_or(u32::MAX);
+    let matrix_ctx = json!({ "matrix": combo });
+    let mut resolved = Vec::new();
+    for (name, spec) in &script.sources {
+        let kind = template::substitute_text(&spec.kind, &matrix_ctx)?;
+        let version = spec
+            .version
+            .as_deref()
+            .map(|v| template::substitute_text(v, &matrix_ctx))
+            .transpose()?;
+        resolved.push((name, spec, kind, version));
+    }
+    let mut duckdb_releases = Vec::new();
+    for (name, _, kind, version) in &resolved {
+        if matches!(kind.as_str(), "duckdb" | "ducklake") {
+            let release = source::duckdb_cli::version(version.as_deref())?;
+            duckdb_releases.push(((*name).clone(), kind.clone(), release));
+        }
+    }
+    one_duckdb_release(&duckdb_releases)?;
+    // Under a rootless Docker daemon each running container holds a key of a
+    // quota shared with every other job on the host, so a combination starts
+    // only once there is room for every container it starts: its sources and
+    // its executors (see `crate::keyquota`). Reserved, not only checked, so
+    // two combinations admitted together cannot each start part of their
+    // containers and then wait on each other's room; and reserved before the
+    // `--jobs` slots, so no combination waits for room while holding slots
+    // another needs to start the containers that hold that room. Each
+    // container gives back its share as it starts and holds a key of its own.
+    let source_containers: u64 = resolved
+        .iter()
+        .map(|(_, _, kind, _)| source::containers(kind))
+        .sum();
+    let executor_containers = executor_containers_bound(script, options, combo);
+    let key_room = Arc::new(
+        crate::keyquota::reserve_room(
+            source_containers + executor_containers,
+            &format!("the containers of {run_label}"),
+        )
+        .await?,
+    );
     // Sources start only once the first instance has its slots, so waiting
     // combinations hold no containers.
     let first_permit = slots
@@ -708,40 +797,6 @@ async fn run_combination(
         kinds: BTreeMap::new(),
     };
     let result = async {
-        let matrix_ctx = json!({ "matrix": combo });
-        let mut resolved = Vec::new();
-        for (name, spec) in &script.sources {
-            let kind = template::substitute_text(&spec.kind, &matrix_ctx)?;
-            let version = spec
-                .version
-                .as_deref()
-                .map(|v| template::substitute_text(v, &matrix_ctx))
-                .transpose()?;
-            resolved.push((name, spec, kind, version));
-        }
-        let mut duckdb_releases = Vec::new();
-        for (name, _, kind, version) in &resolved {
-            if matches!(kind.as_str(), "duckdb" | "ducklake") {
-                let release = source::duckdb_cli::version(version.as_deref())?;
-                duckdb_releases.push(((*name).clone(), kind.clone(), release));
-            }
-        }
-        one_duckdb_release(&duckdb_releases)?;
-        // Under a rootless Docker daemon each running container holds a key of
-        // a quota shared with every other job on the host, so a combination
-        // starts its sources only once there is room for all of them, instead
-        // of failing part way through (see `crate::keyquota`).
-        // Reserved, not only checked: two combinations admitted together must
-        // not each start part of their sources and then wait on each other's
-        // room. Released once these sources are up and hold their own keys.
-        let reservation = crate::keyquota::reserve_room(
-            resolved
-                .iter()
-                .map(|(_, _, kind, _)| source::containers(kind))
-                .sum(),
-            &format!("the sources of {run_label}"),
-        )
-        .await?;
         for (name, spec, kind, version) in resolved {
             let src = source::start(
                 name,
@@ -755,10 +810,23 @@ async fn run_combination(
             .with_context(|| format!("Failed to start source '{name}' ({kind})"))?;
             sources.by_name.insert(name.clone(), Arc::from(src));
             sources.state.insert(name.clone(), SourceState::Running);
+            key_room.release(source::containers(&kind));
             sources.kinds.insert(name.clone(), kind);
         }
-        drop(reservation);
         let mut instances = create_instances(script, options, combo, run_id, &sources).await?;
+        // Instances that were skipped start no executors: give their share
+        // back, and let each remaining executor give back its own as it starts.
+        let created: u64 = instances
+            .iter()
+            .flat_map(|instance| &instance.executors)
+            .filter(|executor| executor.container_name().is_some())
+            .count()
+            .try_into()
+            .unwrap_or(u64::MAX);
+        key_room.release(executor_containers.saturating_sub(created));
+        for instance in &mut instances {
+            instance.key_room = Some(Arc::clone(&key_room));
+        }
         match schedule {
             Schedule::Lockstep => {
                 run_lockstep(
@@ -1063,14 +1131,8 @@ async fn create_instances(
             disable_results_cache_unless_configured(&mut spicepod);
             let spiced_args = template::substitute(&json!(script.defaults.spiced_args), &context)?;
             let mut spiced_args: Vec<String> = serde_json::from_value(spiced_args)?;
-            let cluster = (options.cluster || script.defaults.cluster.is_some())
-                && script.defaults.executor_args.is_none();
-            let containers = cluster
-                && script
-                    .defaults
-                    .cluster
-                    .as_ref()
-                    .is_some_and(|c| c.containers);
+            let cluster = runs_cluster(script, options);
+            let containers = executors_in_containers(script, options);
             if cluster {
                 // The cluster run gives the instance its scheduler role, which
                 // replaces the default `--role server` but no other role.
@@ -1259,6 +1321,7 @@ async fn create_instances(
                 cache_dir: options.work_dir.join("cache"),
                 corpus_started: BTreeMap::new(),
                 sidecar,
+                key_room: None,
             });
         }
     }
