@@ -1056,7 +1056,8 @@ fn present_request_key_filter_groups(
 }
 
 /// One filter set per origin scan for `keys`: the non-key conjuncts of
-/// `filters` (headers included) plus one connector-safe key predicate.
+/// `filters` (headers included) plus the conjuncts of one connector-safe key
+/// predicate.
 fn request_key_filter_groups(
     filters: &[Expr],
     keys: &[RequestedCacheKey],
@@ -1074,8 +1075,11 @@ fn request_key_filter_groups(
     key_exprs
         .into_iter()
         .map(|key_expr| {
+            // Top-level conjuncts, the shape a point lookup's filters arrive in,
+            // so a generated scan and that lookup compute the same claim key and
+            // coalesce.
             let mut group = non_key.clone();
-            group.push(key_expr);
+            group.extend(flatten_and_conjuncts(&key_expr));
             group
         })
         .collect()
@@ -5529,6 +5533,54 @@ mod tests {
         );
     }
 
+    /// A generated missing-key scan carries its key predicate as top-level
+    /// conjuncts, so it computes the claim key a point lookup for the same key
+    /// computes, and the two coalesce instead of fetching twice.
+    #[test]
+    fn missing_key_scan_shares_a_point_lookups_claim_key() {
+        let schema = Schema::new(vec![
+            Field::new("request_path", DataType::Utf8, true),
+            Field::new("request_query", DataType::Utf8, true),
+        ]);
+        let cached = RecordBatch::try_new(
+            Arc::new(schema),
+            vec![
+                Arc::new(StringArray::from(vec!["/v1/items"])),
+                Arc::new(StringArray::from(vec!["cat=p"])),
+            ],
+        )
+        .expect("cached row");
+        let filters = vec![
+            col("request_path").eq(lit("/v1/items")),
+            col("request_query").in_list(vec![lit("cat=p"), lit("cat=q")], false),
+        ];
+        let point_lookup = vec![
+            col("request_path").eq(lit("/v1/items")),
+            col("request_query").eq(lit("cat=q")),
+        ];
+        let missing =
+            missing_request_key_filter_groups(&filters, std::slice::from_ref(&cached), true)
+                .expect("q is absent");
+        assert_eq!(missing.len(), 1, "{missing:?}");
+        assert_eq!(
+            compute_cache_key_from_filters_and_namespace(&missing[0], "ns"),
+            compute_cache_key_from_filters_and_namespace(&point_lookup, "ns"),
+            "{missing:?}"
+        );
+
+        let present = present_request_key_filter_groups(&filters, &[cached], true);
+        let point_lookup_p = vec![
+            col("request_path").eq(lit("/v1/items")),
+            col("request_query").eq(lit("cat=p")),
+        ];
+        assert_eq!(present.len(), 1, "{present:?}");
+        assert_eq!(
+            compute_cache_key_from_filters_and_namespace(&present[0], "ns"),
+            compute_cache_key_from_filters_and_namespace(&point_lookup_p, "ns"),
+            "{present:?}"
+        );
+    }
+
     #[test]
     fn missing_request_key_filters_split_equality_scans_for_complete_fetch() {
         let schema = Schema::new(vec![
@@ -5590,6 +5642,9 @@ mod tests {
         data: Vec<RecordBatch>,
         /// Record of all filter sets passed to `scan()` calls
         recorded_filters: Arc<RwLock<Vec<Vec<String>>>>,
+        /// Answer only the rows whose request key the scan's filters name, as
+        /// an HTTP origin does.
+        honor_request_keys: bool,
     }
 
     impl FilterTrackingTableProvider {
@@ -5598,6 +5653,14 @@ mod tests {
                 schema,
                 data,
                 recorded_filters: Arc::new(RwLock::new(Vec::new())),
+                honor_request_keys: false,
+            }
+        }
+
+        fn honoring_request_keys(schema: SchemaRef, data: Vec<RecordBatch>) -> Self {
+            Self {
+                honor_request_keys: true,
+                ..Self::new(schema, data)
             }
         }
 
@@ -5636,13 +5699,26 @@ mod tests {
                 .collect();
             self.recorded_filters.write().push(filter_strings);
 
+            let data = match (self.honor_request_keys, requested_cache_keys(filters)) {
+                (true, Some(requested)) => self
+                    .data
+                    .iter()
+                    .map(|batch| {
+                        let keep: arrow::array::BooleanArray = (0..batch.num_rows())
+                            .map(|row| {
+                                let key = cached_request_key(batch, row);
+                                Some(requested.iter().any(|wanted| wanted.matches(&key)))
+                            })
+                            .collect();
+                        arrow::compute::filter_record_batch(batch, &keep)
+                    })
+                    .collect::<Result<Vec<_>, _>>()?,
+                _ => self.data.clone(),
+            };
+
             // Return the configured data
             Ok(Arc::new(DataSourceExec::new(Arc::new(
-                MemorySourceConfig::try_new(
-                    std::slice::from_ref(&self.data),
-                    Arc::clone(&self.schema),
-                    None,
-                )?,
+                MemorySourceConfig::try_new(&[data], Arc::clone(&self.schema), None)?,
             ))))
         }
     }
@@ -8898,7 +8974,7 @@ mod tests {
         stale_while_revalidate: Option<Duration>,
     ) -> (Vec<RecordBatch>, Arc<RwLock<Vec<Vec<String>>>>) {
         let schema = cached.schema();
-        let federated = Arc::new(FilterTrackingTableProvider::new(
+        let federated = Arc::new(FilterTrackingTableProvider::honoring_request_keys(
             Arc::clone(&schema),
             vec![origin],
         ));
@@ -9022,10 +9098,10 @@ mod tests {
         let (batches, recorded) =
             execute_partial_hit_with_swr(filters, cached, origin, Some(Duration::from_hours(1)))
                 .await;
-        assert!(
-            contents_of(&batches).contains(&"cached-p".to_string()),
-            "the stale cat=p entry is served: {:?}",
-            contents_of(&batches)
+        assert_eq!(
+            contents_of(&batches),
+            vec!["cached-p".to_string(), "origin-q".to_string()],
+            "the stale cat=p entry is served and only cat=q is fetched"
         );
 
         // The miss scan ran inline; the revalidation runs in the background.
