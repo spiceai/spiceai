@@ -18,11 +18,6 @@ limitations under the License.
 //! metastore is not opened as if nothing happened. Opening one used to serve
 //! the rows of whatever files were left, or none, with nothing logged.
 
-#![expect(
-    clippy::expect_used,
-    reason = "set-up and helpers outside `#[test]` functions fail fast with `expect`"
-)]
-
 use std::{
     path::{Path, PathBuf},
     sync::Arc,
@@ -35,7 +30,9 @@ use arrow::{
 };
 use data_accelerator_api::{AccelerationSource, AcceleratorEngineRegistry};
 use datafusion::{
-    common::TableReference, datasource::TableProvider, execution::context::SessionContext,
+    common::TableReference,
+    datasource::TableProvider,
+    execution::context::{SessionConfig, SessionContext},
 };
 use runtime_acceleration::{
     Engine,
@@ -94,9 +91,21 @@ async fn table(
         .map_err(|error| error.to_string())
 }
 
+/// A session configured like `spiced`'s for the check that matters here. Cayenne tags
+/// its table schema with `spice.accelerator`, which `DataFusion`'s physical aggregate
+/// schema check rejects (apache/datafusion#12733), so `spiced` skips that check.
+fn session() -> SessionContext {
+    let mut config = SessionConfig::new();
+    config
+        .options_mut()
+        .execution
+        .skip_physical_aggregate_schema_check = true;
+    SessionContext::new_with_config(config)
+}
+
 /// Loads [`ROWS`] rows into `t` the way a full refresh does, then closes it.
 async fn store(dir: &Path) {
-    let ctx = SessionContext::new();
+    let ctx = session();
     let table = table(&ctx, dir, RefreshMode::Full)
         .await
         .expect("create the acceleration");
@@ -156,7 +165,7 @@ async fn a_healthy_acceleration_reopens_with_every_row() {
     for refresh_mode in [RefreshMode::Full, RefreshMode::Append] {
         let dir = tempfile::tempdir().expect("dir");
         store(dir.path()).await;
-        let ctx = SessionContext::new();
+        let ctx = session();
         let table = table(&ctx, dir.path(), refresh_mode).await.expect("reopen");
         ctx.register_table("t", table).expect("register");
         assert_eq!(count(&ctx).await, ROWS, "{refresh_mode:?}");
@@ -172,7 +181,7 @@ async fn a_missing_data_file_rebuilds_a_full_refresh_acceleration() {
     let lost = data_files(dir.path()).remove(0);
     std::fs::remove_file(&lost).expect("delete a data file");
 
-    let error = table(&SessionContext::new(), dir.path(), RefreshMode::Full)
+    let error = table(&session(), dir.path(), RefreshMode::Full)
         .await
         .expect_err("an acceleration missing a data file must not open as it is");
     let lost_name = lost
@@ -197,7 +206,7 @@ async fn a_missing_data_directory_is_not_served() {
     store(dir.path()).await;
     std::fs::remove_dir_all(dir.path().join("data")).expect("delete the data directory");
 
-    let error = table(&SessionContext::new(), dir.path(), RefreshMode::Full)
+    let error = table(&session(), dir.path(), RefreshMode::Full)
         .await
         .expect_err("an acceleration without its data must not open as it is");
     assert!(
@@ -206,7 +215,7 @@ async fn a_missing_data_directory_is_not_served() {
     );
 
     // An acceleration that is not rebuilt from the source fails to load instead.
-    let error = table(&SessionContext::new(), dir.path(), RefreshMode::Append)
+    let error = table(&session(), dir.path(), RefreshMode::Append)
         .await
         .expect_err("an acceleration without its data must not open as it is");
     assert!(
@@ -229,7 +238,7 @@ async fn a_truncated_data_file_is_not_served() {
         .set_len(100)
         .expect("truncate it");
 
-    let error = table(&SessionContext::new(), dir.path(), RefreshMode::Full)
+    let error = table(&session(), dir.path(), RefreshMode::Full)
         .await
         .expect_err("an acceleration with a truncated file must not open as it is");
     assert!(
@@ -238,7 +247,7 @@ async fn a_truncated_data_file_is_not_served() {
         "{error}"
     );
 
-    let error = table(&SessionContext::new(), dir.path(), RefreshMode::Append)
+    let error = table(&session(), dir.path(), RefreshMode::Append)
         .await
         .expect_err("an acceleration with a truncated file must not open as it is");
     assert!(error.contains("Failed to load table 't'"), "{error}");

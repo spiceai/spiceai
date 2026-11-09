@@ -21,6 +21,7 @@ version.workspace = true
 rust-version.workspace = true
 license-file.workspace = true
 repository.workspace = true
+autotests = false
 description = "Cayenne data accelerator: implements data-accelerator-api::DataAccelerator over the native Cayenne engine."
 
 [dependencies]
@@ -89,6 +90,10 @@ tempfile.workspace = true
 runtime-acceleration = { path = "../../runtime-acceleration", features = ["sqlite", "test-support"] }
 datafusion-table-providers = { workspace = true, features = ["sqlite"] }
 tokio = { workspace = true, features = ["macros", "net", "rt-multi-thread"] }
+
+[[test]]
+name = "integration"
+path = "tests/integration.rs"
 
 [lints]
 workspace = true
