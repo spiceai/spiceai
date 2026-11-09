@@ -54,7 +54,9 @@ TRACE_JSON=crates/cayenne/tests/traces/data-files.jsonl target/release/cayenne-m
 WALK=42:20:40 TRACE_JSON=crates/cayenne/tests/traces/data-files-walk.jsonl target/release/cayenne-metastore-model run data-files
 ```
 
-Delete both files first: `TRACE_JSON` appends.
+Delete both files first: `TRACE_JSON` appends. The retirement traces in
+`crates/object_store_occ/tests/traces/` are generated the same way; see that
+directory's README.
 
 ## Compositions and bounds
 
@@ -90,6 +92,9 @@ transaction and byte-storage compositions use the same variable-size `Store`.
 | `object-names` | Immutable object names when several leased units create objects: the writer `w0` and maintenance units, each with its own lease generation raised by a head commit when a node takes it; create-if-absent under `<kind><unit>.<generation>-<counter>`, identical retries of a lost upload, references committed under a guard on the unit's generation, and maintenance units retired and created with ids never reused. No name created with different bytes, and every referenced object reads back with its digest; witnesses include two units at one generation, successive holders of one unit, a unit created after another retired, and a fenced holder | Exhaustive: 2 nodes, 3 lease takeovers, 2 objects per holding, 1 unit created, 1 retry |
 | `data-files` / `data-files-3` | Data files uploaded to fresh final keys `<generation>-<id>` under the dataset prefix before the commit that names them: a commit is an exact-base conditional head publication guarded by the lease generation and names only files whose upload returned; readers read the head's committed file set and fetch each file, never listing; a lost response leaves an unknown outcome, resent identically and resolved from the head alone (committed when the head names the files, aborted once the head moved past the request's base); a takeover is a head commit that fences the previous holder, whose uploads still land; a crash forgets the writer's state while its sends still land; an unnamed file of a fenced generation is swept. Committed files exist, a reader sees only files committed at its head version, an aborted or abandoned upload is never visible, and an unknown outcome resolves all-or-nothing; witnesses include an accepted commit, an orphan after an aborted commit, a fenced commit refused, a fenced writer's upload landing after a takeover, unknown outcomes resolved both ways, a reader fetch and an orphan reclaimed | Exhaustive: 2 writers, 2 uploads (`-3`: 3), 3 commit attempts, 2 takeovers, 1 crash, 1 identical resend, 2 head reads |
 | `data-files-intent` | The `data-files` graph with the sweep run by the lease holder and no generation in its rule: a writer records each key before it uploads it and holds it until its commit's outcome resolves, in its own process (a crash or takeover loses the record); the sweep deletes an unnamed file only when the holder's record does not hold it. Same properties and witnesses as `data-files` | As `data-files` |
+| `data-files-retire` / `data-files-retire-3` | The `data-files-intent` graph with snapshots and their reclamation (see [Data-file retirement and reader protection](#data-file-retirement-and-reader-protection)): commits add snapshots; a compaction retires every snapshot live at its base in the same record and may keep one of their files in place; the lease holder's sweep reads the committed retired set, skips pinned snapshots and files a live or pinned snapshot references, sends deletes that can land late or fail, and forgets the snapshots in one record after its deletes return; a scan pins the snapshots it reads; a restore point holds deletions while it copies. Adds: a pinned scan finds every file, a restore point copies every file, a forgotten snapshot leaves no file, and no retired snapshot is left at quiescence; witnesses include a retirement, a forget after deletes, a sweep waiting on a pin, a scan reading a file of its retired snapshot, a file kept in place, a delete landing after a takeover, an interrupted sweep finished by a later one, and a restore point copying a file retired after it started | Exhaustive: as `data-files` with 1 takeover, 1 scan, 1 restore point and 1 failed delete; 2 uploads (`-3`: 3) |
+| `data-files-retire-prepared` / `data-files-retire-prepared-lean-3` | The `data-files-retire` graph where a commit can record a prepared transaction (a new snapshot that retires the live snapshots when a later resolve commits it, or is discarded); while it is unresolved the table refuses other changes and both sweeps decline. Witnesses add a transaction committed and aborted. `lean` has no scans or restore points | Exhaustive: 2 uploads; `lean-3`: 3 uploads |
+| `data-files-retire-prepared-lean-3-retire-ignores-reservation` | Not a control: the `lean-3` graph with the retirement sweep running while a transaction is prepared (reached); every property still holds, so in this graph the retirement sweep's reservation check is not what keeps data safe (the orphan sweep's is, and the reserved table's refusal of the forget record) | As `lean-3` |
 | `reads-linearizable` / `reads-bounded` | Read freshness against real time: a writer completes commits on a discrete clock; a reader caches the head with the time its GET was sent, answers queries from it while it is fresh for the staleness bound S and otherwise waits for a newer GET; queries share GETs, a GET observes the head when sent, and responses arrive late and out of order. With S = 0, events within a tick are ordered, so a commit that completes earlier in a query's tick counts as before it; with S > 0, times compare by tick. A query includes every commit completed more than S before it started; with S = 0 that is linearizability for one dataset's committed state, and a query also includes the client's own acknowledged write. Witnesses: a query waits for a GET, two queries share one, a late response is ignored, a commit completes while a GET is in flight, a query is served while a newer commit exists, and (S > 0) a query is answered from the cache | Exhaustive: 2 commits, 3 GETs, 2 queries, 4 clock ticks; S = 0 and S = 1 |
 | `commits-etag` | Explicit store-version CAS and delayed retry across head changes; I1–I3, I5 | Exhaustive/control 1; one writer, one original/retry pair |
 | `commits-storage` | Checkpoint parts/root before head publication, delayed GC, a query kept by retention, lagging reopen, late seal; I4, I7, I8 | Bound 2; samples 4 |
@@ -275,6 +280,13 @@ as a separate maintenance process does.
 | `data-files-no-resolve-by-head` | An unknown outcome resolves as aborted when the head lacks its files, without waiting for the head to move past the request's base: the request lands afterwards; unknown outcome resolves all-or-nothing |
 | `data-files-intent-sweep-ignores-intent` | The lease holder's sweep deletes an unnamed file its own write still holds: the write's commit then names a file the store no longer holds; committed files exist |
 | `data-files-intent-adopt-by-listing` | A commit names every unnamed file the store lists, as a maintenance pass that derives its file set from a listing would: it publishes an upload a crashed writer abandoned, and the reader fetches it; aborted or abandoned upload never visible to a reader |
+| `data-files-retire-sweep-uncommitted` | The sweep plans from its process's view with its own compaction in flight applied, as if the record had committed: the compaction has not landed, and the deleted file belongs to a snapshot the head still names live; committed files exist |
+| `data-files-retire-ignores-pins` | The sweep deletes a retired snapshot a scan still pins: the scan's next fetch finds its file gone; pinned reader finds every file |
+| `data-files-retire-forget-early` | The sweep forgets the snapshots before their deletes return: the forget commits while a delete is in flight, leaving a file nothing names; forgotten snapshot leaves no file |
+| `data-files-retire-ignores-live-references` | The sweep deletes every file of a retired snapshot, including one a live snapshot keeps in place; committed files exist |
+| `data-files-retire-3-ignores-pinned-references` | The sweep keeps only files live snapshots reference: a scan pins a snapshot whose file a later, now retired, snapshot also names, and that snapshot's sweep deletes it; pinned reader finds every file |
+| `data-files-retire-ignores-restore-hold` | The sweep runs while a restore point copies: it deletes a file the restore point has yet to copy; restore point copies every file |
+| `data-files-retire-prepared-orphan-ignores-reservation` | The orphan sweep runs while a prepared transaction reserves the table: after the Prepare's response clears the writer's intent, the transaction's upload is named only by the prepared record, and the sweep deletes it; committed files exist |
 | `reads-token-wait` | Answer a query from any cached head at or past the client's commit number: read-your-writes holds, but a commit that completed before the query started is missing |
 | `reads-response-time` | Count freshness from the GET response's arrival: a late response to an old GET looks fresh and misses a completed commit |
 | `reads-tick-only` | Compare freshness by tick alone with S = 0: a head fetched earlier in the query's tick answers it and misses a commit that completed before the query started |
@@ -428,6 +440,51 @@ and so is not checked. The head is already superseded at the source, so it can n
 be confirmed and no query reads it: the checked guarantee is that a head confirmed
 current references only replica objects. HEADing every referenced object at adoption
 would restore the stronger property at one request per object.
+
+## Data-file retirement and reader protection
+
+The `data-files-retire*` runs check the retirement contract for committed data
+files. A commit that takes a snapshot out of the live set retires it in the
+same record. Only the lease holder sweeps, and only from committed state: it
+declines while its own commit is outstanding (its view would include a change
+that may not land), while a prepared transaction reserves the table, and while
+a restore point holds deletions. It skips retired snapshots a scan pins and
+keeps every file a live or pinned snapshot references; it forgets the
+snapshots in one record only after every delete it sent has returned. Deletes
+of a sweep that crashed, was taken over or had a delete fail can land later;
+the snapshots stay retired, and a later sweep deletes again (a missing key is a
+no-op) and forgets them. A scan reads the head and pins its snapshots in one
+step. The orphan sweep (the `data-files-intent` rule) treats a retired
+snapshot's files as named until its forget, and declines while a transaction
+is prepared.
+
+"Retired snapshots reclaimed at quiescence" is a bounded check, not a liveness
+proof under fairness: when a lease holder runs with no commit outstanding, no
+pin, restore point or prepared transaction, and only new work or faults remain
+enabled, no snapshot is retired. It assumes an unknown commit outcome is
+eventually resolved; a holder whose outcome stays unknown never sweeps.
+
+Findings and limits:
+
+- At three uploads the graph found that keeping only the files live snapshots
+  reference is not enough when a compaction keeps a file in place: a scan pins
+  snapshot A, a compaction keeps A's file in place in B, a later compaction
+  retires B, and B's sweep deletes the file A's scan still reads
+  (`data-files-retire-3-ignores-pinned-references`). The sweep here keeps
+  files of pinned snapshots too. Whether the engine can share one key between
+  snapshots on an object store is not established by this model.
+- With the retirement sweep running while a transaction is prepared
+  (`data-files-retire-prepared-lean-3-retire-ignores-reservation`), every
+  property still holds: a prepared record applies nothing to the retired set
+  until its resolve, and no prepared action makes a retired snapshot live
+  again. The reservation matters for the orphan sweep and for the forget
+  record, which a reserved table refuses.
+- One process sweeps at a time, and pins, restore points and the sweep share a
+  process; pins and holds of another instance (a standby or a fenced former
+  holder) are not modeled. Snapshots are never made live again once retired.
+  Read and pin are one step; the engine's grace for the window between a plan
+  resolving a listing and opening its files is not modeled. The orphan sweep
+  has no age floor here.
 
 ## Composition boundaries and liveness
 
@@ -796,6 +853,12 @@ declarations.
 | `read-transaction-widened-stamp-at-commit-2` | 2 | 24,753,751 / 18,566,591 | 29.009 |
 | `position-delete` | 1 | 62 / 53 | 0.000 |
 | `remote-maintenance-clear-retry` | 4 | 3,492 / 2,637 | 0.012 |
+
+On 2026-11-09, the 20 `data-files*` declarations matched under `EXHAUST=1`
+in 8 minutes of wall time; `data-files-retire-3` explored 353,613,399 unique
+states in 402 s with a 6.1 GB peak footprint, and `data-files-retire` and
+`data-files-retire-prepared` (in `quick`) 1,040,961 and 4,766,357 in 1 s and
+5 s.
 
 The longest completed checker on 2026-10-31 was
 `dataset-prepare-query-expiry-byte-window` at 268.241 s. All exhaustive declarations completed below the 540-second watchdog.
