@@ -4,13 +4,9 @@ name: spicescript dispatch
 # Runs this ref's spicescript and scripts against another run's Linux spiced, such as a
 # release branch's build_and_release. Scripts for features that build predates fail; triage by hand.
 
-run-name: spicescript dispatch - spiced from run ${{ inputs.run_id || '42439213511' }}
+run-name: spicescript dispatch - spiced from run ${{ inputs.run_id }}
 
 on:
-  # TEMPORARY: exercises this workflow on its PR against a release/2.4 build; removed before merge.
-  pull_request:
-    paths:
-      - '.github/workflows/spicescript_dispatch.yml'
   workflow_dispatch:
     inputs:
       run_id:
@@ -44,7 +40,7 @@ jobs:
         id: find
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          RUN_ID: ${{ inputs.run_id || '42439213511' }}
+          RUN_ID: ${{ inputs.run_id }}
         run: |
           set -euo pipefail
           [[ "$RUN_ID" =~ ^[0-9]+$ ]] || { echo "::error::run_id must be a numeric run ID, got '$RUN_ID'"; exit 1; }
@@ -133,7 +129,7 @@ jobs:
       - name: Download spiced and spice
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          RUN_ID: ${{ inputs.run_id || '42439213511' }}
+          RUN_ID: ${{ inputs.run_id }}
           SPICED_ARTIFACT: ${{ needs.resolve.outputs.spiced_artifact }}
           SPICE_ARTIFACT: ${{ needs.resolve.outputs.spice_artifact }}
         run: |
@@ -213,7 +209,7 @@ jobs:
       - name: Run scenario scripts
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          SCRIPTS: ${{ inputs.scripts || 'test/spicescript' }}
+          SCRIPTS: ${{ inputs.scripts }}
         run: |
           # shellcheck disable=SC2086 # SCRIPTS is a space-separated list
           "${{ steps.spicescript.outputs.path }}" --jobs 4 \
@@ -260,7 +256,7 @@ jobs:
       - name: Write the summary
         env:
           RESULTS: ${{ runner.temp }}/results
-          RUN_ID: ${{ inputs.run_id || '42439213511' }}
+          RUN_ID: ${{ inputs.run_id }}
           SHA: ${{ needs.resolve.outputs.sha }}
           BRANCH: ${{ needs.resolve.outputs.branch }}
           WORKFLOW: ${{ needs.resolve.outputs.workflow }}
