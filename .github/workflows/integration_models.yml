@@ -93,7 +93,7 @@ jobs:
           MISTRALRS_METAL_PRECOMPILE: 0
           RUSTC_WRAPPER: ${{ env.RUSTC_WRAPPER }}
         run: |
-          FEATURES="flightsql,models,metal,s3_vectors,kafka,duckdb"
+          FEATURES="flightsql,models,metal,s3_vectors,kafka"
           if [[ "${{ github.event.inputs.run_all_tests }}" == "true" ]] || [[ "${{ github.event_name }}" == "schedule" ]]; then
             FEATURES="${FEATURES},bedrock,extended_tests"
             echo "Including extended_tests"
@@ -691,7 +691,7 @@ jobs:
         env:
           RUSTC_WRAPPER: ${{ env.RUSTC_WRAPPER }}
         run: |
-          FEATURES="flightsql,models,s3_vectors,kafka,duckdb"
+          FEATURES="flightsql,models,s3_vectors,kafka"
           if [[ "${{ github.event.inputs.run_all_tests }}" == "true" ]] || [[ "${{ github.event_name }}" == "schedule" ]]; then
             FEATURES="${FEATURES},bedrock,extended_tests"
             echo "Including extended_tests"
