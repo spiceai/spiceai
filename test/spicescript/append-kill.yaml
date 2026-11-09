@@ -32,7 +32,10 @@ variants:
   object-native-data-rustfs-latency: object-native-data-rustfs-latency
   # Data at the dataset's own `cayenne_file_path` on RustFS (#16130), with
   # appends staged in files (and their staging WAL) and compacted every 2 s
-  # once 4 files are waiting.
+  # once 4 files are waiting. Inline storage is off: by default a small append
+  # is held in the metastore until 64 of them (or 10,000 rows, or 8 MiB) are
+  # waiting, which this script never reaches, so no append would reach a data
+  # file in the bucket and there would be nothing to compact.
   object-store-data-path-rustfs:
     spicepod: { runtime: { params: { cayenne_vnext: enabled } } }
     datasets:
@@ -42,6 +45,7 @@ variants:
             cayenne_cdc_durability: file
             cayenne_compaction_background_interval_ms: '2000'
             cayenne_compaction_trigger_files: '4'
+            cayenne_inline_max_rows: '0'
             cayenne_file_path: 's3://${sources.lake.bucket}/data'
             cayenne_s3_endpoint: '${sources.lake.endpoint}'
             cayenne_s3_region: us-east-1

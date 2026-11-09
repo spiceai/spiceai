@@ -1877,11 +1877,13 @@ impl MetadataCatalog for Domain {
         {
             return Ok(false);
         }
+        // The inputs leave the live set and are retired, but keep their manifest
+        // rows: a scan that captured them as live before the in-memory swap
+        // still reads their files from those rows. The retired-snapshot sweep
+        // forgets the rows together with the files, once no scan holds them.
         inner
             .commit(vec![
                 actions::remove_groups(table_id, proto::Select::Listed, old_snapshot_ids, true),
-                actions::remove_files(table_id, proto::Select::Listed, old_snapshot_ids),
-                actions::remove_file_stats(table_id, proto::Select::Listed, old_snapshot_ids),
                 actions::set_group(table_id, new_snapshot_id, new_sequence_number),
             ])
             .await?;

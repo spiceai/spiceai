@@ -63,15 +63,17 @@ pub fn record_cleanup_deleted(feature: StateFeature, objects: usize) {
 /// Wraps `store` so that every request `feature` makes through it is measured.
 /// Returns `store` itself for a feature without a metric label.
 /// `store` with its requests counted in the `state_store_*` metrics under `feature`.
+///
+/// A feature whose conflict and cleanup counters wait until it is used
+/// ([`StateFeature::publishes_counters_when_used`]) publishes them at zero here.
 #[must_use]
 pub fn metered(store: Arc<dyn ObjectStore>, feature: StateFeature) -> Arc<dyn ObjectStore> {
-    match feature.metric_label() {
-        Some(feature) => Arc::new(MeteredStore {
-            inner: store,
-            feature,
-            metrics: Metrics::Global,
-        }),
-        None => store,
+    if feature.metric_label().is_none() {
+        return store;
+    }
+    match MeteredStore::new(store, feature, Metrics::Global) {
+        Ok(metered) => Arc::new(metered),
+        Err(store) => store,
     }
 }
 
@@ -137,13 +139,23 @@ impl StateStoreMetrics {
         }
     }
 
+    /// Publishes both counters at zero for every feature that has them, except one
+    /// that publishes them only once it is used.
     fn publish_counters_at_zero(&self) {
         for feature in StateFeature::ALL
             .into_iter()
-            .filter(|feature| feature.has_conflict_and_cleanup_counters())
-            .filter_map(StateFeature::metric_label)
+            .filter(|feature| !feature.publishes_counters_when_used())
         {
-            let labels = feature_labels(feature);
+            self.publish_feature_counters_at_zero(feature);
+        }
+    }
+
+    fn publish_feature_counters_at_zero(&self, feature: StateFeature) {
+        if !feature.has_conflict_and_cleanup_counters() {
+            return;
+        }
+        if let Some(label) = feature.metric_label() {
+            let labels = feature_labels(label);
             self.conflicts.add(0, &labels);
             self.cleanup_deleted.add(0, &labels);
         }
@@ -224,6 +236,28 @@ struct MeteredStore {
 }
 
 impl MeteredStore {
+    /// `inner` measured under `feature`, or `inner` back when the feature has no
+    /// metric label.
+    fn new(
+        inner: Arc<dyn ObjectStore>,
+        feature: StateFeature,
+        metrics: Metrics,
+    ) -> Result<Self, Arc<dyn ObjectStore>> {
+        let Some(label) = feature.metric_label() else {
+            return Err(inner);
+        };
+        if feature.publishes_counters_when_used()
+            && let Some(metrics) = metrics.get()
+        {
+            metrics.publish_feature_counters_at_zero(feature);
+        }
+        Ok(Self {
+            inner,
+            feature: label,
+            metrics,
+        })
+    }
+
     fn start(&self, operation: Operation) -> Request {
         Request {
             feature: self.feature,
@@ -475,11 +509,12 @@ mod tests {
         }
 
         fn store(&self, feature: StateFeature) -> MeteredStore {
-            MeteredStore {
-                inner: Arc::new(InMemory::new()),
-                feature: feature.metric_label().expect("a metered feature"),
-                metrics: Metrics::Fixed(self.metrics),
-            }
+            MeteredStore::new(
+                Arc::new(InMemory::new()),
+                feature,
+                Metrics::Fixed(self.metrics),
+            )
+            .unwrap_or_else(|_| panic!("{feature:?} is a metered feature"))
         }
 
         /// Every series as `name{label=value,...}` to its value: a counter's sum,
@@ -543,7 +578,6 @@ mod tests {
             "rate_control",
             "results_cache_warmup",
             "snapshots",
-            "cayenne_metastore",
         ] {
             expected.insert(
                 format!("state_store_conflicts_total{{feature={feature}}}"),
@@ -647,7 +681,6 @@ mod tests {
             "rate_control",
             "results_cache_warmup",
             "snapshots",
-            "cayenne_metastore",
         ] {
             for counter in [
                 "state_store_conflicts_total",
@@ -660,7 +693,34 @@ mod tests {
                 );
             }
         }
-        assert_eq!(series.len(), 10, "no series for an unmetered feature");
+        assert_eq!(
+            series.len(),
+            8,
+            "no series for an unmetered feature, nor for the Cayenne metastore before it is opened"
+        );
+    }
+
+    /// The Cayenne metastore is in the state location only when the object-native
+    /// metastore is opened there (`runtime.params.cayenne_vnext`): until then its
+    /// counters are not applicable and have no series, and opening it publishes them
+    /// at zero.
+    #[test]
+    fn the_cayenne_metastore_counters_appear_when_its_store_is_opened() {
+        let counters = |series: &BTreeMap<String, u64>| {
+            [
+                "state_store_conflicts_total{feature=cayenne_metastore}",
+                "state_store_cleanup_deleted_total{feature=cayenne_metastore}",
+            ]
+            .map(|name| series.get(name).copied())
+        };
+        let recorded = Recorded::new();
+        recorded.metrics.publish_counters_at_zero();
+        let before = counters(&recorded.series());
+
+        let _store = recorded.store(StateFeature::CayenneMetastore);
+        let after = counters(&recorded.series());
+
+        assert_eq!((before, after), ([None, None], [Some(0), Some(0)]));
     }
 
     #[test]

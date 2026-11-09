@@ -635,3 +635,109 @@ async fn a_scan_reads_its_data_files_through_the_dataset_store() -> TestResult {
     );
     Ok(())
 }
+
+/// The appends of the `append-kill` script's object-store data path variant: an
+/// initial load, then appends of 500, 100, 100, 4 × 50 and 30 × 10 rows.
+fn append_kill_batches() -> Vec<i64> {
+    let mut batches = vec![1000, 500, 100, 100, 50, 50, 50, 50];
+    batches.extend(std::iter::repeat_n(10, 30));
+    batches
+}
+
+/// Append refresh into a keyed dataset whose data path is an object store outside
+/// the state location (`cayenne_file_path: s3://…` under `runtime.params.cayenne_vnext`,
+/// its metastore in a local object-native catalog), as the `append-kill` script
+/// drives it: file durability, compaction every interval once four files wait.
+///
+/// A small append is held inline in the metastore until the inline corpus reaches
+/// a flush threshold (64 appends, 10,000 rows or 8 MiB by default), so with the
+/// default inline settings the script's 38 appends never reach a data file and
+/// leave nothing to compact. With inline storage off, as the script now sets it,
+/// every append is a data file in the store and compaction commits there.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn appends_to_an_object_store_data_path_reach_data_files_and_compact() -> TestResult {
+    let directory = tempfile::tempdir()?;
+    let catalog: Arc<dyn MetadataCatalog> = Arc::new(
+        cayenne::metastore::object_native::ObjectNativeCatalog::open_or_create_local(
+            directory.path(),
+        )
+        .await?,
+    );
+    catalog.init().await?;
+    let ctx = SessionContext::new();
+    let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let data_url = "s3://lake/data/events".to_string();
+    // `cayenne_inline_max_rows: '0'`, as the script sets it.
+    let vortex_config = VortexConfig {
+        cdc_durability: cayenne::metadata::CdcDurability::File,
+        compaction_background_interval_ms: 100,
+        compaction_trigger_files: 4,
+        inline_max_rows: 0,
+        ..VortexConfig::default()
+    };
+    let table = Arc::new(
+        CayenneTableProviderBuilder::new(Arc::clone(&catalog), ctx.runtime_env())
+            .with_object_store(ObjectStoreConfig {
+                url: url::Url::parse(&data_url)?,
+                store: Arc::clone(&store),
+            })
+            .create(CreateTableOptions {
+                table_name: "events".to_string(),
+                schema: schema(),
+                primary_key: vec!["id".to_string()],
+                on_conflict: Some(
+                    datafusion_table_providers::util::on_conflict::OnConflict::Upsert(
+                        datafusion_table_providers::util::column_reference::ColumnReference::new(
+                            vec!["id".to_string()],
+                        ),
+                    ),
+                ),
+                base_path: data_url,
+                partition_column: None,
+                vortex_config,
+            })
+            .await?,
+    );
+    ctx.register_table("events", Arc::clone(&table) as Arc<dyn TableProvider>)?;
+    assert!(
+        table.spawn_background_compaction(Arc::new(tokio::sync::Semaphore::new(1))),
+        "background compaction"
+    );
+
+    let mut last = 0_i64;
+    for rows in append_kill_batches() {
+        ctx.sql(&format!(
+            "INSERT INTO events SELECT value AS id, value * 10 AS v FROM generate_series({}, {})",
+            last + 1,
+            last + rows
+        ))
+        .await?
+        .collect()
+        .await?;
+        last += rows;
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    table.drain_in_flight_maintenance().await?;
+    let data_files = keys(&store)
+        .await?
+        .iter()
+        .filter(|key| key.ends_with(".vortex"))
+        .count();
+    // Each keyed append publishes a protected snapshot; compaction merges them once
+    // eight wait, so without it the 38 appends would leave 38.
+    let protected = catalog
+        .get_all_snapshot_sequences(&table.metadata().table_id)
+        .await?
+        .len();
+    assert_eq!(
+        (
+            count_and_sum(&ctx, "events").await?,
+            data_files > 0,
+            protected < 16,
+        ),
+        ((last, expected_sum(1, last)), true, true),
+        "every row once, in data files in the store ({data_files}), and compaction committed ({protected} protected snapshots left of {} appends)",
+        append_kill_batches().len()
+    );
+    Ok(())
+}

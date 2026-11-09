@@ -229,6 +229,15 @@ impl StateFeature {
         !matches!(self, Self::CayenneData | Self::StartupCheck)
     }
 
+    /// Whether the feature's conflict and cleanup counters are published at zero only
+    /// once its store is opened, rather than at startup. The Cayenne metastore is in
+    /// the location only when a dataset opens the object-native metastore there; until
+    /// then the counters do not apply to it and it has no series.
+    #[must_use]
+    pub fn publishes_counters_when_used(self) -> bool {
+        matches!(self, Self::CayenneMetastore)
+    }
+
     /// The folder the feature writes under in a `runtime.state` location.
     fn folder(self) -> &'static str {
         match self {
