@@ -152,5 +152,23 @@
       "group": "schema-evolution",
       "may-pass": true
     }
+  ],
+  "view-redefined-after-restart": [
+    {
+      "run": "view-redefined-after-restart",
+      "who": "cayenne",
+      "key": "query: SELECT id, v, w FROM orders_view ORDER BY id",
+      "kind": "error",
+      "signature": "still failing after <n> attempts over <duration>: Spice rejected the query: Query execution failed. No field named w.",
+      "group": "schema-evolution"
+    },
+    {
+      "run": "view-redefined-after-restart",
+      "who": "cayenne",
+      "key": "query: SELECT id, w FROM reader ORDER BY id",
+      "kind": "error",
+      "signature": "Spice rejected the query: Query execution failed. No field named w.",
+      "group": "schema-evolution"
+    }
   ]
 }

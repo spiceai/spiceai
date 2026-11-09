@@ -72,6 +72,8 @@ indexmap.workspace = true
 linkme.workspace = true
 tempfile.workspace = true
 token_provider = { path = "../token_provider" }
+aws-identity = { path = "../aws-identity" }
+azure-credential = { path = "../azure-credential" }
 
 model2vec-rs = { git = "https://github.com/spiceai/model2vec-rs.git", rev = "55fef28a3556895b20204634b788f7c836b610bc", optional = true } # branch: spiceai
 

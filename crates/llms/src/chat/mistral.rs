@@ -116,6 +116,8 @@ impl MistralLlama {
             reasoning,
             // mistral.rs reads its ring from `RING_CONFIG`, which the caller wrote.
             distributed: _,
+            // mistral.rs schedules its own requests.
+            concurrent_requests: _,
         } = options;
         for weight in model_weights {
             if !weight.exists() {
