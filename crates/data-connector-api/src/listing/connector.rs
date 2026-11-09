@@ -165,28 +165,25 @@ impl ListingTableTemplate {
         table: Arc<ListingTable>,
         table_path: ListingTableUrl,
     ) -> Arc<dyn TableProvider> {
-        let inner: Arc<dyn TableProvider> = if has_location_metadata(table.options()) {
+        let pruning = has_location_metadata(table.options()).then(|| {
             Arc::new(LocationPruningListingTable::new(
-                table,
+                Arc::clone(&table),
                 Arc::clone(&self.object_store),
                 table_path.clone(),
                 Arc::clone(&self.schema),
                 self.extension.as_str(),
             ))
-        } else {
-            table
-        };
+        });
         // A missing or emptied source lists as success with zero rows today, so a
         // full refresh can persist an empty acceleration. Reject that listing
         // (dataset and path named in the error and a warn log). An existing
         // header-only or zero-row file still matches and scans as zero rows.
-        SpiceTable::over(
-            Arc::new(RejectEmptyListingLayer {
-                table_path,
-                dataset_name: self.dataset_name.clone(),
-                extension: self.extension.clone(),
-            }),
-            inner,
+        reject_empty_listing(
+            table,
+            pruning,
+            table_path,
+            self.dataset_name.clone(),
+            self.extension.clone(),
         )
     }
 }
@@ -198,6 +195,34 @@ struct RejectEmptyListingLayer {
     table_path: ListingTableUrl,
     dataset_name: String,
     extension: String,
+    /// The `_location` pruning table beneath, when there is one. A scan it answers by
+    /// `head()`ing the named objects skips the listing here, so it needs no list call
+    /// (or list permission) it did not need before.
+    pruning: Option<Arc<LocationPruningListingTable>>,
+}
+
+/// Stacks the empty-listing guard over `table`, or over `pruning` when the dataset
+/// has `_location` metadata.
+fn reject_empty_listing(
+    table: Arc<ListingTable>,
+    pruning: Option<Arc<LocationPruningListingTable>>,
+    table_path: ListingTableUrl,
+    dataset_name: String,
+    extension: String,
+) -> Arc<dyn TableProvider> {
+    let below: Arc<dyn TableProvider> = match &pruning {
+        Some(pruning) => Arc::clone(pruning) as Arc<dyn TableProvider>,
+        None => table,
+    };
+    SpiceTable::over(
+        Arc::new(RejectEmptyListingLayer {
+            table_path,
+            dataset_name,
+            extension,
+            pruning,
+        }),
+        below,
+    )
 }
 
 impl RejectEmptyListingLayer {
@@ -274,7 +299,12 @@ impl TableLayer for RejectEmptyListingLayer {
         state: &dyn Session,
         args: datafusion::catalog::ScanArgs<'a>,
     ) -> DFResult<datafusion::catalog::ScanResult> {
-        self.ensure_data_files(state).await?;
+        let skips_listing = self.pruning.as_ref().is_some_and(|pruning| {
+            pruning.answers_without_listing(args.filters().unwrap_or_default())
+        });
+        if !skips_listing {
+            self.ensure_data_files(state).await?;
+        }
         below.scan_with_args(state, args).await
     }
 }
@@ -324,6 +354,17 @@ impl LocationPruningListingTable {
     /// through to `inner`.
     fn has_location_column(&self) -> bool {
         self.inner.schema().field_with_name("_location").is_ok()
+    }
+
+    /// Whether [`TableProvider::scan`] answers `filters` without listing the prefix:
+    /// an unsatisfiable pushed-down filter, or `_location` predicates it `head()`s.
+    fn answers_without_listing(&self, filters: &[datafusion_expr::Expr]) -> bool {
+        filters.iter().any(|filter| {
+            matches!(
+                filter,
+                datafusion_expr::Expr::Literal(ScalarValue::Boolean(None | Some(false)), _)
+            )
+        }) || (self.has_location_column() && extract_location_predicates(filters).is_some())
     }
 
     fn partition_column_types(&self) -> &[(String, datafusion::arrow::datatypes::DataType)] {
@@ -4562,17 +4603,27 @@ mod tests {
         )
         .expect("create listing table");
 
-        let provider = LocationPruningListingTable::new(
-            Arc::new(listing),
+        let listing = Arc::new(listing);
+        let pruning = Arc::new(LocationPruningListingTable::new(
+            Arc::clone(&listing),
             ctx.runtime_env()
                 .object_store(&table_path)
                 .expect("object store"),
             table_path.clone(),
             file_schema,
             ".parquet",
+        ));
+        // The stack `wrap` registers: the empty-listing guard over the pruning table
+        // must not list for a `_location`-pruned scan either.
+        let provider = reject_empty_listing(
+            listing,
+            Some(pruning),
+            table_path.clone(),
+            "test_table".to_string(),
+            ".parquet".to_string(),
         );
 
-        ctx.register_table("test_table", Arc::new(provider))
+        ctx.register_table("test_table", provider)
             .expect("register table");
 
         let df = ctx
