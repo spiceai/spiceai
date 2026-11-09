@@ -59,7 +59,7 @@ steps:
         rows: 0
         files: 0
   - query: SELECT count(*) AS n FROM facts_src
-    expect-error: true
+    expect-error: 'No data files are yet available for dataset facts_src'
   - refresh: { dataset: facts, expect-error: true }
   - query: SELECT count(*) AS n FROM facts
     expect: { rows: [['1000']] }

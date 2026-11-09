@@ -19,7 +19,7 @@ use crate::parameters::ConnectorContext;
 use data_components::cdc::{AccelerationContents, ChangesStream};
 use data_components::csv_header_projection::HeaderProjectedCsvFormat;
 use data_components::file_schema_drift::{FileSchemaDriftGuard, FileSchemaDriftLayer};
-use data_components::fresh_file_listing::FreshFileListingLayer;
+use data_components::fresh_file_listing::{FreshFileListingLayer, ScanSkipsListing};
 use std::any::Any;
 use std::collections::{HashMap, HashSet};
 use std::fmt::Display;
@@ -262,28 +262,26 @@ impl ListingTableTemplate {
         table: Arc<ListingTable>,
         table_path: ListingTableUrl,
     ) -> Arc<dyn TableProvider> {
-        let table: Arc<dyn TableProvider> = if has_location_metadata(table.options()) {
+        let pruning = has_location_metadata(table.options()).then(|| {
             Arc::new(LocationPruningListingTable::new(
-                table,
+                Arc::clone(&table),
                 Arc::clone(&self.object_store),
                 table_path.clone(),
                 Arc::clone(&self.schema),
                 self.extension.as_str(),
             ))
-        } else {
-            table
-        };
+        });
         // A file dataset is read as its files are at query time, not as they were
         // listed at its first scan. A listing with no matching data file is an
         // error (the path is missing, or every matching file was removed) rather
         // than an empty table, so a full refresh cannot persist a wipe. A file
         // that still exists and holds no rows still scans as zero rows.
-        let extension = self.extension.clone();
-        let table = FreshFileListingLayer::over_rejecting_empty(
+        let table = reject_empty_listing(
             table,
-            vec![table_path],
+            pruning,
+            table_path,
             self.dataset_name.clone(),
-            move |meta| listed_object_is_data_file(meta, &extension),
+            self.extension.clone(),
         );
         match self.schema_drift_guard() {
             Some(guard) => FileSchemaDriftLayer::over(table, guard),
@@ -303,6 +301,43 @@ impl ListingTableTemplate {
                 Arc::clone(&self.options.format),
             )
         })
+    }
+}
+
+/// Stacks the empty-listing guard over `table`, or over `pruning` when the dataset
+/// has `_location` metadata. A scan the pruning table answers by `head()`ing the
+/// named objects skips the guard's listing, so it needs no list call (or list
+/// permission) it did not need before.
+fn reject_empty_listing(
+    table: Arc<ListingTable>,
+    pruning: Option<Arc<LocationPruningListingTable>>,
+    table_path: ListingTableUrl,
+    dataset_name: String,
+    extension: String,
+) -> Arc<dyn TableProvider> {
+    let is_data_file = move |meta: &ObjectMeta| listed_object_is_data_file(meta, &extension);
+    match pruning {
+        Some(pruning) => {
+            let skips: ScanSkipsListing = {
+                let pruning = Arc::clone(&pruning);
+                Arc::new(move |filters: &[datafusion_expr::Expr]| {
+                    pruning.answers_without_listing(filters)
+                })
+            };
+            FreshFileListingLayer::over_rejecting_empty_unless(
+                pruning,
+                vec![table_path],
+                dataset_name,
+                is_data_file,
+                Some(skips),
+            )
+        }
+        None => FreshFileListingLayer::over_rejecting_empty(
+            table,
+            vec![table_path],
+            dataset_name,
+            is_data_file,
+        ),
     }
 }
 
@@ -351,6 +386,17 @@ impl LocationPruningListingTable {
     /// through to `inner`.
     fn has_location_column(&self) -> bool {
         self.inner.schema().field_with_name("_location").is_ok()
+    }
+
+    /// Whether [`TableProvider::scan`] answers `filters` without listing the prefix:
+    /// an unsatisfiable pushed-down filter, or `_location` predicates it `head()`s.
+    fn answers_without_listing(&self, filters: &[datafusion_expr::Expr]) -> bool {
+        filters.iter().any(|filter| {
+            matches!(
+                filter,
+                datafusion_expr::Expr::Literal(ScalarValue::Boolean(None | Some(false)), _)
+            )
+        }) || (self.has_location_column() && extract_location_predicates(filters).is_some())
     }
 
     fn partition_column_types(&self) -> &[(String, datafusion::arrow::datatypes::DataType)] {
@@ -7195,17 +7241,27 @@ mod tests {
         )
         .expect("create listing table");
 
-        let provider = LocationPruningListingTable::new(
-            Arc::new(listing),
+        let listing = Arc::new(listing);
+        let pruning = Arc::new(LocationPruningListingTable::new(
+            Arc::clone(&listing),
             ctx.runtime_env()
                 .object_store(&table_path)
                 .expect("object store"),
             table_path.clone(),
             file_schema,
             ".parquet",
+        ));
+        // The stack `ListingTableTemplate::wrap` registers: the empty-listing guard
+        // over the pruning table must not list for a `_location`-pruned scan either.
+        let provider = reject_empty_listing(
+            listing,
+            Some(pruning),
+            table_path.clone(),
+            "test_table".to_string(),
+            ".parquet".to_string(),
         );
 
-        ctx.register_table("test_table", Arc::new(provider))
+        ctx.register_table("test_table", provider)
             .expect("register table");
 
         let df = ctx

@@ -25,6 +25,7 @@ limitations under the License.
 use std::sync::Arc;
 
 use async_trait::async_trait;
+use datafusion::logical_expr::Expr;
 use datafusion::{
     catalog::{ScanArgs, ScanResult, Session},
     datasource::{TableProvider, listing::ListingTableUrl},
@@ -38,6 +39,11 @@ use spice_table::{LayerWalk, SpiceTable, TableLayer};
 /// Whether a listed object should count as a data file for this dataset.
 pub type IsListedDataFile = Arc<dyn Fn(&ObjectMeta) -> bool + Send + Sync>;
 
+/// Whether the table beneath answers a scan with these filters without listing its
+/// paths (for example a `_location` predicate served by `head()`), so the empty-listing
+/// check must not list either.
+pub type ScanSkipsListing = Arc<dyn Fn(&[Expr]) -> bool + Send + Sync>;
+
 /// The [`TableLayer`] that drops a file dataset's cached file list before each scan, so the
 /// `ListingTable` beneath lists its paths again. Per-file caches keyed on the listed
 /// `ObjectMeta` (Parquet footers, file statistics) stay valid for unchanged files.
@@ -49,6 +55,7 @@ pub struct FreshFileListingLayer {
     table_paths: Vec<ListingTableUrl>,
     dataset_name: String,
     is_data_file: Option<IsListedDataFile>,
+    scan_skips_listing: Option<ScanSkipsListing>,
 }
 
 impl std::fmt::Debug for FreshFileListingLayer {
@@ -68,6 +75,7 @@ impl FreshFileListingLayer {
             table_paths,
             dataset_name: String::new(),
             is_data_file: None,
+            scan_skips_listing: None,
         }
     }
 
@@ -89,11 +97,26 @@ impl FreshFileListingLayer {
         dataset_name: impl Into<String>,
         is_data_file: impl Fn(&ObjectMeta) -> bool + Send + Sync + 'static,
     ) -> Arc<dyn TableProvider> {
+        Self::over_rejecting_empty_unless(table, table_paths, dataset_name, is_data_file, None)
+    }
+
+    /// Like [`Self::over_rejecting_empty`], except a scan `scan_skips_listing` accepts is
+    /// not checked: the table beneath answers it without listing, so listing here would
+    /// add a list call (and a list permission) the scan does not otherwise need.
+    #[must_use]
+    pub fn over_rejecting_empty_unless(
+        table: Arc<dyn TableProvider>,
+        table_paths: Vec<ListingTableUrl>,
+        dataset_name: impl Into<String>,
+        is_data_file: impl Fn(&ObjectMeta) -> bool + Send + Sync + 'static,
+        scan_skips_listing: Option<ScanSkipsListing>,
+    ) -> Arc<dyn TableProvider> {
         SpiceTable::over(
             Arc::new(Self {
                 table_paths,
                 dataset_name: dataset_name.into(),
                 is_data_file: Some(Arc::new(is_data_file)),
+                scan_skips_listing,
             }),
             table,
         )
@@ -190,7 +213,13 @@ impl TableLayer for FreshFileListingLayer {
         args: ScanArgs<'a>,
     ) -> DFResult<ScanResult> {
         self.forget_listing(state);
-        self.ensure_data_files(state).await?;
+        let skips_listing = self
+            .scan_skips_listing
+            .as_ref()
+            .is_some_and(|skips| skips(args.filters().unwrap_or_default()));
+        if !skips_listing {
+            self.ensure_data_files(state).await?;
+        }
         below.scan_with_args(state, args).await
     }
 }
@@ -284,7 +313,12 @@ mod tests {
             Arc::new(ListingTable::try_new(config).expect("listing table"));
         ctx.register_table(
             "t",
-            FreshFileListingLayer::over_rejecting_empty(table, vec![url], "t", parquet_is_data_file),
+            FreshFileListingLayer::over_rejecting_empty(
+                table,
+                vec![url],
+                "t",
+                parquet_is_data_file,
+            ),
         )
         .expect("register");
     }
