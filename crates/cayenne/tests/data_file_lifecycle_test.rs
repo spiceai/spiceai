@@ -41,7 +41,9 @@ use arrow::array::{Int64Array, RecordBatch};
 use arrow::datatypes::{DataType, Field, Schema};
 use async_trait::async_trait;
 use bytes::Bytes;
-use cayenne::metadata::{CreateTableOptions, DeletionMode, ObjectStoreConfig, VortexConfig};
+use cayenne::metadata::{
+    CdcDurability, CreateTableOptions, DeletionMode, ObjectStoreConfig, VortexConfig,
+};
 use cayenne::metastore::object_native::{ObjectNativeCatalog, new_dataset_folder};
 use cayenne::{CayenneContext, CayenneTableProvider, CayenneTableProviderBuilder, MetadataCatalog};
 use datafusion::datasource::TableProvider;
@@ -1397,11 +1399,14 @@ enum Step {
     Append,
     /// Upsert every key of a keyed table: a new snapshot and a key deletion vector.
     Upsert,
+    /// [`Self::Upsert`] as a change stream applies it, durable on its own: the
+    /// write publishes a new protected snapshot when it finishes.
+    ChangeStreamUpsert,
 }
 
 impl Step {
     fn keyed(self) -> bool {
-        matches!(self, Self::Merge | Self::Upsert)
+        matches!(self, Self::Merge | Self::Upsert | Self::ChangeStreamUpsert)
     }
 
     /// The settings a process runs the step with: a merge and an overwrite with
@@ -1411,6 +1416,10 @@ impl Step {
         match self {
             Self::Merge | Self::Overwrite => armed(),
             Self::Append | Self::Upsert => parked(),
+            Self::ChangeStreamUpsert => VortexConfig {
+                cdc_durability: CdcDurability::File,
+                ..parked()
+            },
         }
     }
 
@@ -1464,7 +1473,7 @@ impl Step {
                 rows.extend((5_000..5_500).map(|id| (id, id)));
                 rows
             }
-            Self::Upsert => upserted(5),
+            Self::Upsert | Self::ChangeStreamUpsert => upserted(5),
         }
     }
 
@@ -1492,6 +1501,24 @@ impl Step {
                 .await
                 .map(|_| true)
                 .map_err(|error| error.to_string()),
+            Self::ChangeStreamUpsert => {
+                let rows = batch(0..KEYS, |id| id * 1000 + 4);
+                let input: datafusion::execution::SendableRecordBatchStream = Box::pin(
+                    datafusion::physical_plan::stream::RecordBatchStreamAdapter::new(
+                        rows.schema(),
+                        stream::iter([Ok(rows)]),
+                    ),
+                );
+                let ctx = SessionContext::new();
+                match table.write_cdc_append_stream(input, &ctx.task_ctx()).await {
+                    Ok(write) => write
+                        .finish()
+                        .await
+                        .map(|_| true)
+                        .map_err(|error| error.to_string()),
+                    Err(error) => Err(error.to_string()),
+                }
+            }
         }?;
         table.reclaim_retired_snapshots_now().await;
         Ok(committed)
@@ -1653,6 +1680,11 @@ async fn kill_at_every_request(step: Step) {
         "{step:?}: {} kill points: {killed} killed mid-step, {acknowledged} acknowledged before the kill, {unnamed_total} data files no commit names left in all",
         steps.len()
     );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_kill_at_any_storage_request_of_a_change_stream_upsert_is_all_or_nothing() {
+    kill_at_every_request(Step::ChangeStreamUpsert).await;
 }
 
 #[tokio::test(flavor = "multi_thread")]

@@ -637,9 +637,12 @@ impl<'a> AppendMutationWriter<'a> {
                 };
                 let target_size_bytes = self.context.target_file_size_bytes();
                 // An append into the current snapshot writes at its final keys on
-                // an object store. A new protected snapshot keeps the staged write
-                // for now: written at final keys, scans racing automatic compaction
-                // were seen to miss committed rows, a cause not yet found.
+                // an object store. A new protected snapshot keeps the staged write:
+                // its Stage A commit already registers the snapshot and the deletes
+                // that hide the rows it supersedes, and recovery completes the write
+                // from the staged files and their WAL. At final keys nothing names
+                // the files until Stage B commits, so a crash in between would leave
+                // those deletes with no replacement rows.
                 if !(target_kind == StagingWalTargetKind::CurrentSnapshot
                     && self
                         .table
