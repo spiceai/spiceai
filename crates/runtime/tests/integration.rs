@@ -58,11 +58,6 @@ fn accelerator_crates_register_their_engines() {
         engines.iter().any(|engine| engine == "sqlite"),
         "the sqlite accelerator is not registered in this test binary; linked engines: {engines:?}"
     );
-    #[cfg(feature = "duckdb")]
-    assert!(
-        engines.iter().any(|engine| engine == "duckdb"),
-        "the duckdb accelerator is not registered in this test binary; linked engines: {engines:?}"
-    );
     assert!(
         engines.iter().any(|engine| engine == "cayenne"),
         "the cayenne accelerator is not registered in this test binary; linked engines: {engines:?}"
@@ -99,9 +94,9 @@ mod datasets_api;
 #[cfg(feature = "delta_lake")]
 mod delta_lake;
 mod docker;
-#[cfg(feature = "duckdb")]
+#[cfg(feature = "adbc")]
 mod duckdb;
-#[cfg(feature = "duckdb")]
+#[cfg(feature = "adbc")]
 mod ducklake;
 #[cfg(feature = "dynamodb")]
 pub mod dynamodb;
@@ -157,18 +152,18 @@ mod refresh_retry;
 mod refresh_sql;
 mod refresh_worker_panic;
 mod reload_start_time_only;
-#[cfg(all(feature = "duckdb", feature = "sqlite"))]
+#[cfg(feature = "sqlite")]
 mod result_correctness;
 mod results_cache;
 mod results_cache_warmup;
-#[cfg(all(unix, feature = "duckdb", feature = "postgres"))]
+#[cfg(all(unix, feature = "postgres"))]
 mod retention;
 mod rustfs;
 mod s3;
 mod s3_folder_marker;
 mod s3_location_pruning;
 mod s3_parquet_overwrite;
-#[cfg(any(feature = "postgres", feature = "duckdb", feature = "sqlite"))]
+#[cfg(any(feature = "postgres", feature = "sqlite"))]
 mod schema_evolution;
 #[cfg(feature = "sharepoint")]
 mod sharepoint;

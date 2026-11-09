@@ -30,7 +30,9 @@ use std::{path::PathBuf, sync::Arc};
 use rustls::ServerConfig;
 use x509_certificate::X509Certificate;
 
-pub use reload::{CertWatcher, ReloadError, ReloadScope, ReloadableServerCerts};
+pub use reload::{
+    CertWatcher, ClientTrustPaths, ClientTrustPem, ReloadError, ReloadScope, ReloadableServerCerts,
+};
 /// Process-wide TLS reload control plane.
 ///
 /// `TlsControl` is the single owner of the underlying [`CertWatcher`] for
@@ -111,6 +113,11 @@ impl TlsControl {
 ///
 /// When `client_auth_mode` is unset, both fields point at an identical
 /// `with_no_client_auth()` config.
+///
+/// When certificate revocation lists accompany the client CA bundle, both
+/// listeners reject revoked client certificates and resume no TLS sessions:
+/// a resumed session restores its client certificate without verifying it
+/// again, so it would outlive a revocation.
 pub struct TlsConfig {
     /// rustls config used by the Flight listener. Under
     /// `client_auth_mode: required` this enforces client-cert
@@ -199,7 +206,12 @@ impl TlsConfig {
         client_ca_pem: Option<&[u8]>,
     ) -> std::result::Result<Self, Box<dyn std::error::Error>> {
         let enforcement = enforcement_from(client_ca_pem.is_some());
-        Self::try_new_with_client_auth_mode(cert_bytes, key_bytes, client_ca_pem, enforcement)
+        Self::try_new_with_client_auth_mode(
+            cert_bytes,
+            key_bytes,
+            client_ca_pem.map(ClientTrustPem::ca_only),
+            enforcement,
+        )
     }
 
     /// Like [`Self::try_new_with_client_auth`] but accepts an explicit
@@ -207,24 +219,25 @@ impl TlsConfig {
     /// entrypoint) can distinguish [`ClientAuthEnforcement::Requested`]
     /// from [`ClientAuthEnforcement::Required`] — both pass a CA
     /// bundle, only the per-listener verifier strictness and HTTP
-    /// route gate differ.
+    /// route gate differ — and can supply CRLs alongside the CA so
+    /// revoked client certificates are rejected at the handshake.
     ///
     /// # Errors
     ///
-    /// Returns an error if `client_ca_pem`'s presence does not match
+    /// Returns an error if `client_trust`'s presence does not match
     /// what `enforcement` requires, or if `cert_bytes`/`key_bytes`
-    /// (or `client_ca_pem`, when supplied) cannot be parsed.
+    /// (or `client_trust`, when supplied) cannot be parsed.
     pub fn try_new_with_client_auth_mode(
         cert_bytes: &[u8],
         key_bytes: &[u8],
-        client_ca_pem: Option<&[u8]>,
+        client_trust: Option<ClientTrustPem<'_>>,
         enforcement: ClientAuthEnforcement,
     ) -> std::result::Result<Self, Box<dyn std::error::Error>> {
-        check_client_auth_invariant(client_ca_pem.is_some(), enforcement)?;
+        check_client_auth_invariant(client_trust.is_some(), enforcement)?;
         let resolver = ReloadableServerCerts::from_pem_with_client_auth(
             cert_bytes,
             key_bytes,
-            client_ca_pem,
+            client_trust,
             ReloadScope::Public,
         )
         .map_err(|e| Box::new(e) as Box<dyn std::error::Error>)?;
@@ -277,7 +290,7 @@ impl TlsConfig {
         Self::try_new_from_paths_with_client_auth_mode(
             cert_path,
             key_path,
-            client_ca_path,
+            client_ca_path.map(ClientTrustPaths::ca_only),
             enforcement,
             control,
         )
@@ -286,26 +299,27 @@ impl TlsConfig {
     /// Like [`Self::try_new_from_paths_with_client_auth`] but accepts
     /// an explicit [`ClientAuthEnforcement`] so callers can
     /// distinguish [`ClientAuthEnforcement::Requested`] from
-    /// [`ClientAuthEnforcement::Required`].
+    /// [`ClientAuthEnforcement::Required`], and can supply a CRL file
+    /// that hot-reloads with the CA, cert, and key.
     ///
     /// # Errors
     ///
-    /// Returns an error if `client_ca_path`'s presence does not match
-    /// what `enforcement` requires, if the cert/key (or client CA) files
-    /// cannot be read or parsed, or if registering the watch with
-    /// `control` fails.
+    /// Returns an error if `client_trust`'s presence does not match
+    /// what `enforcement` requires, if the cert/key (or client CA and
+    /// CRL) files cannot be read or parsed, or if registering the watch
+    /// with `control` fails.
     pub fn try_new_from_paths_with_client_auth_mode(
         cert_path: PathBuf,
         key_path: PathBuf,
-        client_ca_path: Option<PathBuf>,
+        client_trust: Option<ClientTrustPaths>,
         enforcement: ClientAuthEnforcement,
         control: &TlsControl,
     ) -> std::result::Result<Self, Box<dyn std::error::Error>> {
-        check_client_auth_invariant(client_ca_path.is_some(), enforcement)?;
+        check_client_auth_invariant(client_trust.is_some(), enforcement)?;
         let resolver = ReloadableServerCerts::from_paths_with_client_auth(
             cert_path,
             key_path,
-            client_ca_path,
+            client_trust,
             ReloadScope::Public,
             control.watcher(),
         )
@@ -375,7 +389,21 @@ fn build_server_configs(
     let mut http = http;
     configure_alpn(&mut flight);
     configure_alpn(&mut http);
+    if enforcement != ClientAuthEnforcement::Disabled && resolver.checks_revocation() {
+        disable_resumption(&mut flight);
+        disable_resumption(&mut http);
+    }
     (flight, http)
+}
+
+/// Turn off TLS session resumption. A resumed session restores the client
+/// certificate it was established with instead of verifying it again, so a
+/// client whose certificate was revoked after its first handshake could keep
+/// resuming with it. Every connection then verifies the client certificate
+/// against the current CRLs.
+fn disable_resumption(config: &mut ServerConfig) {
+    config.session_storage = Arc::new(rustls::server::NoServerSessionStorage {});
+    config.send_tls13_tickets = 0;
 }
 
 fn enforcement_from(has_client_auth: bool) -> ClientAuthEnforcement {

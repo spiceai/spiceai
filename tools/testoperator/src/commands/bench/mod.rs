@@ -53,7 +53,7 @@ pub(crate) fn emit_acceleration_size_if_applicable(
         ds.acceleration.as_ref().is_some_and(|accel| {
             matches!(accel.mode, Mode::File | Mode::FileCreate | Mode::FileUpdate)
                 && accel.enabled
-                && matches!(accel.engine_name(), "sqlite" | "duckdb" | "cayenne")
+                && matches!(accel.engine_name(), "sqlite" | "cayenne")
         })
     }) {
         return Ok(());

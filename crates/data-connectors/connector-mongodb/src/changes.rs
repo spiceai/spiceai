@@ -806,7 +806,7 @@ mod tests {
         );
         let acceleration = Acceleration {
             enabled: true,
-            engine: Engine::DuckDB,
+            engine: Engine::Sqlite,
             refresh_mode: Some(RefreshMode::Changes),
             primary_key: Some(primary_key),
             on_conflict,
@@ -859,7 +859,7 @@ mod tests {
     fn rejects_missing_primary_key() {
         let acceleration = Acceleration {
             enabled: true,
-            engine: Engine::DuckDB,
+            engine: Engine::Sqlite,
             refresh_mode: Some(RefreshMode::Changes),
             ..Default::default()
         };
@@ -875,7 +875,7 @@ mod tests {
     fn rejects_missing_upsert() {
         let acceleration = Acceleration {
             enabled: true,
-            engine: Engine::DuckDB,
+            engine: Engine::Sqlite,
             refresh_mode: Some(RefreshMode::Changes),
             primary_key: Some(ColumnReference::new(vec!["_id".to_string()])),
             ..Default::default()
@@ -913,7 +913,7 @@ mod tests {
         );
         let acceleration = Acceleration {
             enabled: true,
-            engine: Engine::DuckDB,
+            engine: Engine::Sqlite,
             refresh_mode: Some(RefreshMode::Changes),
             primary_key: Some(primary_key),
             on_conflict,
@@ -930,7 +930,7 @@ mod tests {
     fn rejects_composite_primary_key_before_missing_upsert() {
         let acceleration = Acceleration {
             enabled: true,
-            engine: Engine::DuckDB,
+            engine: Engine::Sqlite,
             refresh_mode: Some(RefreshMode::Changes),
             primary_key: Some(ColumnReference::new(vec![
                 "_id".to_string(),
@@ -956,7 +956,7 @@ mod tests {
         );
         let acceleration = Acceleration {
             enabled: true,
-            engine: Engine::DuckDB,
+            engine: Engine::Sqlite,
             refresh_mode: Some(RefreshMode::Changes),
             primary_key: Some(primary_key),
             on_conflict,

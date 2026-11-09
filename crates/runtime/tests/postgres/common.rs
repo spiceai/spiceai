@@ -160,6 +160,17 @@ pub async fn get_postgres_connection_pool(
     Ok(pool)
 }
 
+/// Use an explicitly supplied disposable database on `POSTGRES_TEST_PORT`, or
+/// start a container. The external database must accept the test credentials.
+pub async fn test_database() -> Result<(usize, Option<RunningContainer>), anyhow::Error> {
+    if let Ok(port) = std::env::var("POSTGRES_TEST_PORT") {
+        return Ok((usize::from(port.parse::<u16>()?), None));
+    }
+    let container = start_postgres_docker_container().await?;
+    let port = usize::from(container.host_port(5432)?);
+    Ok((port, Some(container)))
+}
+
 /// Use an explicitly supplied disposable replication database, or start a container.
 /// The external fixture must use the test credentials and enable logical WAL.
 pub async fn replication_test_database() -> Result<(usize, Option<RunningContainer>), anyhow::Error>
