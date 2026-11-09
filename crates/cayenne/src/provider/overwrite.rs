@@ -436,8 +436,12 @@ impl PreparedOverwrite {
         self.table
             .remove_unpublished_snapshot_dir(&self.new_snapshot_id)
             .await;
-        if !crate::is_object_store_path(&self.table.table_path()) {
-            remove_deletion_vectors(&self.delete_files).await;
+        if !self.table.data_in_store() {
+            remove_deletion_vectors(
+                &self.delete_files,
+                self.table.dataset_storage().map(AsRef::as_ref),
+            )
+            .await;
         }
         Ok(())
     }
@@ -624,7 +628,7 @@ impl CayenneTableProvider {
         let checkpoint_guard = self.mem_checkpoint_lock_for_writer().lock_owned().await;
 
         let new_snapshot_id = uuid::Uuid::now_v7().to_string();
-        let is_s3 = crate::is_object_store_path(&self.table_path());
+        let is_s3 = self.data_in_store();
 
         if !is_s3 {
             let snapshot_dir = self.snapshot_dir_path_for(&new_snapshot_id);
@@ -925,19 +929,21 @@ impl CayenneTableProvider {
                 )
             })
             .collect();
-        Ok(super::delete::DeletionVectorWriter::new(&metadata)
-            .write(specs)
-            .await?
-            .into_iter()
-            .map(|written| written.delete_file)
-            .collect())
+        Ok(
+            super::delete::DeletionVectorWriter::new(&metadata, self.dataset_storage())
+                .write(specs)
+                .await?
+                .into_iter()
+                .map(|written| written.delete_file)
+                .collect(),
+        )
     }
 
     /// Remove an unpublished snapshot's local directory, best-effort: a
     /// directory left behind is pruned by the next snapshot cleanup, and object
     /// stores are left to it entirely.
     async fn remove_unpublished_snapshot_dir(&self, snapshot_id: &str) {
-        if crate::is_object_store_path(&self.table_path()) {
+        if self.data_in_store() {
             return;
         }
         let snapshot_dir = self.snapshot_dir_path_for(snapshot_id);
@@ -1185,12 +1191,13 @@ impl vortex_datafusion::VortexWriteObserver for FileStatsObserver {
 /// file left behind is swept as an orphan.
 async fn remove_deletion_vectors<'a>(
     files: impl IntoIterator<Item = &'a crate::metadata::DeleteFile>,
+    storage: Option<&crate::dataset_storage::DatasetStorage>,
 ) {
     let paths: Vec<std::path::PathBuf> = files
         .into_iter()
         .map(|file| std::path::PathBuf::from(&file.path))
         .collect();
-    super::delete::cleanup_uncommitted_delete_paths(&paths).await;
+    super::delete::cleanup_uncommitted_delete_paths(&paths, storage).await;
 }
 
 #[cfg(test)]

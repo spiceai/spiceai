@@ -2447,9 +2447,19 @@ pub struct CayenneTableProvider {
     /// loads plus a cache-hit inlined read); writers take **write** around the
     /// matching publish.
     scan_state_lock: Arc<tokio::sync::RwLock<()>>,
-    /// Optional object store configuration for remote storage (e.g., S3 Express One Zone).
-    /// When set, this object store is registered with `SessionContext` for data file operations.
+    /// The dataset's store, for a table whose data path is an object-store URL:
+    /// `url` is `cayenne://<table id>/` and `store` is [`Self::dataset_storage`]'s
+    /// store, registered under that URL in each `RuntimeEnv` the table uses.
     object_store_config: Option<crate::metadata::ObjectStoreConfig>,
+    /// The dataset's storage handle, resolved once at open, for a table whose data
+    /// path is an object-store URL; `None` for a table at a plain local path, which
+    /// reads and writes through the runtime's own `file://` store and the local
+    /// filesystem.
+    dataset_storage: Option<Arc<crate::dataset_storage::DatasetStorage>>,
+    /// The URL a scan of this table reads, and the URL of each data file this table
+    /// writes, start with this: `cayenne://<table id>/<object path>` for a table with
+    /// [`Self::dataset_storage`], the recorded table path otherwise.
+    data_root: Arc<str>,
     /// Optional object store for the COLD tier (storage-cascade bottom tier).
     /// When set, the cross-tier scan reads promoted Vortex files from here and
     /// the promotion stage writes them here. May target a different
@@ -3151,6 +3161,11 @@ pub struct CayenneTableProvider {
     /// consulted by `sweep_retired_snapshot_dirs` so a long-running query
     /// (executing past the grace period) keeps its input dirs alive.
     snapshot_last_listed: Arc<ParkingMutex<HashMap<String, Instant>>>,
+    /// Bumped by every retirement into `retired_snapshot_dirs`, so the follow-up
+    /// sweep knows to keep going for directories retired while it runs.
+    retired_snapshot_generation: Arc<AtomicU64>,
+    /// Guards the single in-flight follow-up of `sweep_retired_snapshot_dirs`.
+    retired_snapshot_follow_up: Arc<AtomicBool>,
     /// Per-snapshot IN-FLIGHT-SCAN ref-count: `snapshot_id -> live scan count`.
     /// A scan increments the ids it reads (under `listing_fence.read()`, via
     /// [`crate::provider::scan::SnapshotScanRef`]) and decrements when its
@@ -3680,17 +3695,15 @@ impl CayenneTableProviderBuilder {
         self
     }
 
-    /// Set the object store configuration for remote storage.
-    ///
-    /// Used for S3 Express One Zone storage where data files are stored remotely
-    /// while metadata remains on local disk.
+    /// Set the store the table's data files are read and written through, for a
+    /// table whose data path is an object-store URL (`s3://…`, or a local directory
+    /// addressed as `file://…`). The store addresses the same object paths as the
+    /// data path. When the table opens it becomes the dataset's own store,
+    /// registered in each `RuntimeEnv` the table uses under `cayenne://<table id>/`
+    /// (see [`crate::dataset_storage`]); nothing is registered for `config.url`.
     #[must_use]
     pub fn with_object_store(mut self, config: crate::metadata::ObjectStoreConfig) -> Self {
-        let router = crate::register_object_store(&config.url, Arc::clone(&config.store));
-        self.object_store_config = Some(crate::metadata::ObjectStoreConfig {
-            url: config.url,
-            store: router,
-        });
+        self.object_store_config = Some(config);
         self
     }
 
@@ -6457,6 +6470,28 @@ impl CayenneTableProvider {
         &self.table_metadata.path
     }
 
+    /// The root every data URL of this table is built on: `cayenne://<table
+    /// id>/<object path>` for a table with its own store (see
+    /// [`crate::dataset_storage`]), the recorded table path otherwise. URLs built
+    /// on it resolve to the dataset's store in a `RuntimeEnv`; the recorded table
+    /// path stays what the metastore keeps.
+    pub(crate) fn data_root(&self) -> &str {
+        &self.data_root
+    }
+
+    /// Whether this table's data files are read and written through its own store
+    /// (its data path is an object-store URL and it was given a store). Decided once
+    /// when the table opens; every local-versus-store branch of the data path asks
+    /// this rather than reading the path.
+    pub(crate) fn data_in_store(&self) -> bool {
+        self.dataset_storage.is_some()
+    }
+
+    /// The dataset's storage handle; `None` for a table at a plain local path.
+    pub(crate) fn dataset_storage(&self) -> Option<&Arc<crate::dataset_storage::DatasetStorage>> {
+        self.dataset_storage.as_ref()
+    }
+
     /// Returns the table ID from the catalog.
     #[must_use]
     pub fn table_id(&self) -> &str {
@@ -6795,6 +6830,7 @@ impl CayenneTableProvider {
             super::delete::remove_dropped_deletion_vector_files(
                 cleared_delete_files,
                 Arc::clone(&self.file_deletion_fence),
+                self.dataset_storage.clone(),
             );
         }
         committed
@@ -7057,7 +7093,7 @@ impl CayenneTableProvider {
     /// promotion's metastore commit) can fail before taking the fence.
     fn build_overwrite_listing_table(&self, new_snapshot_id: &str) -> Result<Arc<ListingTable>> {
         let snapshot_dir_url = Self::snapshot_dir_url(
-            &self.table_metadata.path,
+            self.data_root(),
             &self.table_metadata.table_id,
             new_snapshot_id,
         );
@@ -7130,7 +7166,7 @@ impl CayenneTableProvider {
         new_snapshot_id: &str,
     ) -> Result<PreparedAppendSnapshotPublish> {
         let snapshot_dir_url = Self::snapshot_dir_url(
-            &self.table_metadata.path,
+            self.data_root(),
             &self.table_metadata.table_id,
             new_snapshot_id,
         );
@@ -7553,7 +7589,7 @@ impl CayenneTableProvider {
             return;
         };
 
-        let swept = if crate::is_object_store_path(&self.table_metadata.path) {
+        let swept = if self.data_in_store() {
             self.cleanup_old_snapshots_s3(&pins).await
         } else {
             Self::cleanup_old_snapshots_local(
@@ -7801,11 +7837,26 @@ impl CayenneTableProvider {
     /// Record that the catalog no longer references these snapshot dirs (their
     /// contents were merged into a successor snapshot). Physical deletion
     /// happens in [`Self::sweep_retired_snapshot_dirs`] once the grace elapses.
+    ///
+    /// The sweep a retirement is followed by runs inside the grace, so it cannot
+    /// delete what was just retired; every retirement therefore also arms the
+    /// follow-up sweep ([`Self::follow_up_retired_snapshot_dirs`]), which comes
+    /// back after the grace. Without it a table that takes no further write after
+    /// a compaction would keep the merged-away directories until its next commit.
     pub(crate) fn retire_snapshot_dirs<'a>(&self, ids: impl IntoIterator<Item = &'a str>) {
         let now = Instant::now();
-        let mut ledger = self.retired_snapshot_dirs.lock();
-        for id in ids {
-            ledger.entry(id.to_string()).or_insert(now);
+        let retired = {
+            let mut ledger = self.retired_snapshot_dirs.lock();
+            let before = ledger.len();
+            for id in ids {
+                ledger.entry(id.to_string()).or_insert(now);
+            }
+            ledger.len() > before
+        };
+        if retired {
+            self.retired_snapshot_generation
+                .fetch_add(1, Ordering::AcqRel);
+            self.follow_up_retired_snapshot_dirs();
         }
     }
 
@@ -7841,9 +7892,7 @@ impl CayenneTableProvider {
     ///
     /// The table root cannot be listed, or the deletion files cannot be read.
     pub async fn retire_unreferenced_snapshot_dirs(&self) -> CatalogResult<Vec<String>> {
-        if self.table_metadata.partition_column.is_some()
-            || crate::is_object_store_path(&self.table_metadata.path)
-        {
+        if self.table_metadata.partition_column.is_some() || self.data_in_store() {
             return Ok(Vec::new());
         }
         let table_dir =
@@ -7886,7 +7935,6 @@ impl CayenneTableProvider {
             "Retired the snapshot directories the table's snapshot no longer references; each is deleted once no query reads it"
         );
         self.retire_snapshot_dirs(unreferenced.iter().map(String::as_str));
-        self.follow_up_retired_snapshot_dirs();
         Ok(unreferenced)
     }
 
@@ -7911,21 +7959,44 @@ impl CayenneTableProvider {
             .map(|component| component.as_os_str().to_string_lossy().into_owned())
     }
 
-    /// Re-sweep after each grace, up to the follow-up budget. A reader never
-    /// commits, so nothing else re-sweeps a directory a query held past the first
-    /// pass.
+    /// Re-sweep after each grace until the retired ledger is empty, up to the
+    /// follow-up budget, which every new retirement refills. Nothing else
+    /// re-sweeps a directory retired by a table's last commit (a compaction with
+    /// no write after it, or a reader, which never commits), nor one a query held
+    /// past the first pass. At most one follow-up runs per table, so a high
+    /// retirement rate cannot multiply them; a retirement it may have missed while
+    /// finishing starts another.
     fn follow_up_retired_snapshot_dirs(&self) {
-        if !self.maintenance_still_admitted() {
+        if !self.maintenance_still_admitted()
+            || self
+                .retired_snapshot_follow_up
+                .swap(true, Ordering::AcqRel)
+        {
             return;
         }
         let table = self.clone_for_write();
         tokio::spawn(async move {
-            for _ in 0..Self::SNAPSHOT_CLEANUP_REARMS {
+            let mut seen = table.retired_snapshot_generation.load(Ordering::Acquire);
+            let mut left = Self::SNAPSHOT_CLEANUP_REARMS;
+            while left > 0 {
                 tokio::time::sleep(Self::SNAPSHOT_CLEANUP_GRACE).await;
                 if table.is_maintenance_closed() || table.retired_snapshot_dirs.lock().is_empty() {
-                    return;
+                    break;
                 }
                 table.sweep_retired_snapshot_dirs();
+                let now = table.retired_snapshot_generation.load(Ordering::Acquire);
+                if now == seen {
+                    left -= 1;
+                } else {
+                    seen = now;
+                    left = Self::SNAPSHOT_CLEANUP_REARMS;
+                }
+            }
+            table
+                .retired_snapshot_follow_up
+                .store(false, Ordering::Release);
+            if table.retired_snapshot_generation.load(Ordering::Acquire) != seen {
+                table.follow_up_retired_snapshot_dirs();
             }
         });
     }
@@ -8361,7 +8432,7 @@ impl CayenneTableProvider {
         // spawned task ref-counts against a coherent set.
         let mut live_snapshot_ids: HashSet<String> = protected.keys().cloned().collect();
         live_snapshot_ids.insert(current);
-        if crate::is_object_store_path(&self.table_metadata.path) {
+        if self.data_in_store() {
             let table = self.clone_for_write();
             tokio::spawn(async move {
                 let _deleting = deleting;
@@ -8572,7 +8643,7 @@ impl CayenneTableProvider {
         snapshot_id: &str,
     ) -> datafusion_common::Result<ListingTableUrl> {
         let dir = Self::snapshot_dir_path(table_path, table_id, snapshot_id);
-        if !crate::is_object_store_path(&table_path)
+        if !crate::is_object_store_path(table_path)
             && dir.is_absolute()
             && !dir.to_string_lossy().contains(['*', '?', '['])
             && let Ok(url) = url::Url::from_directory_path(&dir)
@@ -8598,24 +8669,16 @@ impl CayenneTableProvider {
         runtime_env: &Arc<RuntimeEnv>,
         config: &crate::metadata::ObjectStoreConfig,
     ) {
-        // `config.store` is the routing store for the URL's scheme and host (see
-        // `crate::store_routing`), shared by every dataset there. A store something
-        // else registered for that bucket keeps serving the paths no dataset owns.
-        let existing = runtime_env.object_store_registry.get_store(&config.url).ok();
-        if existing
-            .as_ref()
-            .is_some_and(|existing| Arc::ptr_eq(existing, &config.store))
-        {
-            return;
+        // Use the object store registry to check if already registered
+        let already_registered = runtime_env
+            .object_store_registry
+            .get_store(&config.url)
+            .is_ok_and(|existing| Arc::ptr_eq(&existing, &config.store));
+
+        if !already_registered {
+            runtime_env.register_object_store(&config.url, Arc::clone(&config.store));
+            tracing::debug!("Registered object store for {}", config.url.as_str());
         }
-        if let (Some(existing), Some(router)) =
-            (existing, crate::store_routing::router_for(&config.url))
-            && !Arc::ptr_eq(&existing, &(Arc::clone(&router) as Arc<dyn object_store::ObjectStore>))
-        {
-            router.keep_fallback(existing);
-        }
-        runtime_env.register_object_store(&config.url, Arc::clone(&config.store));
-        tracing::debug!("Registered object store for {}", config.url.as_str());
     }
 
     fn runtime_env_cache_key(runtime_env: &Arc<RuntimeEnv>) -> usize {
@@ -8707,15 +8770,12 @@ impl CayenneTableProvider {
         &self,
         snapshot_id: &str,
     ) -> Result<Option<ObjectStorePath>> {
-        if !crate::is_object_store_path(&self.table_metadata.path) {
+        if !self.data_in_store() {
             return Ok(None);
         }
 
-        let snapshot_url = Self::snapshot_dir_url(
-            &self.table_metadata.path,
-            &self.table_metadata.table_id,
-            snapshot_id,
-        );
+        let snapshot_url =
+            Self::snapshot_dir_url(self.data_root(), &self.table_metadata.table_id, snapshot_id);
 
         let url = url::Url::parse(&snapshot_url).map_err(|source| Error::UrlParse {
             url: snapshot_url.clone(),
@@ -8766,7 +8826,23 @@ impl CayenneTableProvider {
         objects: Vec<ObjectMeta>,
         operation: &'static str,
     ) -> Result<()> {
-        let store = Arc::clone(&self.require_object_store()?.store);
+        self.delete_objects_counted(objects, operation).await.1
+    }
+
+    /// Delete `objects` and evict them from the file caches, returning what this
+    /// call deleted (an object already gone counts as nothing reclaimed) along
+    /// with the first error. Every object is attempted; the totals cover the
+    /// deletes that succeeded even when another failed.
+    async fn delete_objects_counted(
+        &self,
+        objects: Vec<ObjectMeta>,
+        operation: &'static str,
+    ) -> (RetiredDirReclaim, Result<()>) {
+        let mut reclaimed = RetiredDirReclaim::default();
+        let store = match self.require_object_store() {
+            Ok(config) => Arc::clone(&config.store),
+            Err(error) => return (reclaimed, Err(error)),
+        };
         let table_name = self.table_metadata.table_name.clone();
         let deletes = stream::iter(objects).map(|meta| {
             let store = Arc::clone(&store);
@@ -8774,7 +8850,8 @@ impl CayenneTableProvider {
             async move {
                 let location = meta.location;
                 match store.delete(&location).await {
-                    Ok(()) | Err(object_store::Error::NotFound { .. }) => Ok(location),
+                    Ok(()) => Ok((location, Some(meta.size))),
+                    Err(object_store::Error::NotFound { .. }) => Ok((location, None)),
                     Err(source) => Err(Error::ObjectStore {
                         operation,
                         table: table_name,
@@ -8788,7 +8865,11 @@ impl CayenneTableProvider {
         let mut first_error = None;
         while let Some(result) = deletes.next().await {
             match result {
-                Ok(path) => {
+                Ok((path, freed)) => {
+                    if let Some(size) = freed {
+                        reclaimed.files = reclaimed.files.saturating_add(1);
+                        reclaimed.bytes = reclaimed.bytes.saturating_add(size);
+                    }
                     retired_cache_paths.insert(path);
                 }
                 Err(error) if first_error.is_none() => first_error = Some(error),
@@ -8796,10 +8877,7 @@ impl CayenneTableProvider {
             }
         }
         self.invalidate_retired_paths(retired_cache_paths).await;
-        if let Some(error) = first_error {
-            return Err(error);
-        }
-        Ok(())
+        (reclaimed, first_error.map_or(Ok(()), Err))
     }
 
     async fn delete_prefix_with_object_store(&self, prefix: &ObjectStorePath) -> Result<()> {
@@ -8970,13 +9048,37 @@ impl CayenneTableProvider {
             }
         };
         let (mut reclaimed_dirs, mut failed_dirs) = (0_u64, 0_u64);
+        let mut reclaimed = RetiredDirReclaim::default();
         for id in due {
             let prefix = ObjectStorePath::from(format!("{root}{id}/"));
-            let deleted = match &live_referenced {
-                Some(live) => self.delete_prefix_refcounted(&prefix, &id, live).await,
-                None => self.delete_prefix_with_object_store(&prefix).await,
+            let listed: Vec<ObjectMeta> = match store.list(Some(&prefix)).try_collect().await {
+                Ok(listed) => listed,
+                Err(error) => {
+                    failed_dirs = failed_dirs.saturating_add(1);
+                    tracing::warn!(target: "cayenne::compaction", table = table_name, snapshot_id = %id, %error, "Failed to list retired snapshot prefix (will retry)");
+                    continue;
+                }
             };
-            if let Err(error) = deleted {
+            // With a manifest, keep every file a live snapshot references in place;
+            // without one, no cross-snapshot reference can exist.
+            let doomed: Vec<ObjectMeta> = match &live_referenced {
+                Some(live) => listed
+                    .into_iter()
+                    .filter(|meta| {
+                        meta.location.filename().is_some_and(|name| {
+                            Self::is_compactable_data_file(name)
+                                && !live.contains(&Self::manifest_file_relative_path(&id, name))
+                        })
+                    })
+                    .collect(),
+                None => listed,
+            };
+            let (deleted, outcome) = self
+                .delete_objects_counted(doomed, "delete object from snapshot cleanup")
+                .await;
+            reclaimed.files = reclaimed.files.saturating_add(deleted.files);
+            reclaimed.bytes = reclaimed.bytes.saturating_add(deleted.bytes);
+            if let Err(error) = outcome {
                 failed_dirs = failed_dirs.saturating_add(1);
                 tracing::warn!(target: "cayenne::compaction", table = table_name, snapshot_id = %id, %error, "Failed to delete retired snapshot prefix (will retry)");
                 continue;
@@ -8994,8 +9096,20 @@ impl CayenneTableProvider {
         maintenance_metrics::track_maintenance(
             table_name,
             MaintenanceOp::RetiredDirSweep,
-            retired_dir_sweep_outcome(reclaimed_dirs, reclaimed_dirs, failed_dirs),
+            retired_dir_sweep_outcome(reclaimed.files, reclaimed_dirs, failed_dirs),
         );
+        // In the units the family declares, files and bytes, as the local sweep
+        // publishes them; a pass that failed on one prefix still counts what the
+        // others gave back.
+        if reclaimed.files > 0 || reclaimed_dirs > 0 {
+            maintenance_metrics::track_reclaimed(
+                table_name,
+                MaintenanceOp::RetiredDirSweep,
+                reclaimed.files,
+                reclaimed.bytes,
+                0,
+            );
+        }
     }
 
     async fn delete_prefix_refcounted(
@@ -9151,7 +9265,7 @@ impl CayenneTableProvider {
     /// * `table_id` - The unique identifier for the table
     /// * `snapshot_id` - The snapshot identifier
     fn snapshot_dir_url(table_path: &str, table_id: &str, snapshot_id: &str) -> String {
-        if crate::is_object_store_path(&table_path) {
+        if crate::is_object_store_path(table_path) {
             // S3 URL: join path components with /
             let base = table_path.trim_end_matches('/');
             format!("{base}/{table_id}/{snapshot_id}/")
@@ -9222,7 +9336,7 @@ impl CayenneTableProvider {
         // removes a significant per-write cost for the common small-append
         // (inline) ingestion path, especially on S3.
         if !self.staging_may_have_files().load(Ordering::Acquire) {
-            if crate::is_object_store_path(&self.table_metadata.path) {
+            if self.data_in_store() {
                 return Ok(());
             }
 
@@ -9241,7 +9355,7 @@ impl CayenneTableProvider {
             }
         }
 
-        if crate::is_object_store_path(&self.table_metadata.path) {
+        if self.data_in_store() {
             // S3: delete all objects under the staging prefix
             if let Some(prefix) = self.snapshot_object_store_prefix(STAGING_DIR_NAME)? {
                 self.delete_prefix_with_object_store(&prefix).await?;
@@ -9284,7 +9398,7 @@ impl CayenneTableProvider {
     /// On S3 the staging prefix is cleared as a whole (no per-entry listing) —
     /// the lock exclusion in `ensure_no_incomplete_write` is the guard there.
     pub(crate) async fn clear_orphan_staging_dirs(&self) -> Result<()> {
-        if crate::is_object_store_path(&self.table_metadata.path) {
+        if self.data_in_store() {
             if let Some(prefix) = self.snapshot_object_store_prefix(STAGING_DIR_NAME)? {
                 self.delete_prefix_with_object_store(&prefix).await?;
             }
@@ -9342,7 +9456,7 @@ impl CayenneTableProvider {
     /// still waiting for Stage B. The legacy `_staging/` path keeps the old
     /// whole-directory cleanup semantics through [`Self::clear_staging_dir`].
     pub(crate) async fn clear_staging_snapshot_dir(&self, staging_snapshot_id: &str) -> Result<()> {
-        if crate::is_object_store_path(&self.table_metadata.path) {
+        if self.data_in_store() {
             if let Some(prefix) = self.snapshot_object_store_prefix(staging_snapshot_id)? {
                 self.delete_prefix_with_object_store(&prefix).await?;
             }
@@ -9389,7 +9503,7 @@ impl CayenneTableProvider {
         staging_snapshot_id: &str,
         target_snapshot_id: &str,
     ) -> Result<()> {
-        if crate::is_object_store_path(&self.table_metadata.path) {
+        if self.data_in_store() {
             self.move_staging_files_s3(staging_snapshot_id, target_snapshot_id)
                 .await
         } else {
@@ -9534,7 +9648,7 @@ impl CayenneTableProvider {
             // current-snapshot publish apply the WRONG snapshot's additions.
             let delta_metas = if self.get_current_snapshot_id() == current_snapshot {
                 let snapshot_dir_url = Self::snapshot_dir_url(
-                    &self.table_metadata.path,
+                    self.data_root(),
                     &self.table_metadata.table_id,
                     current_snapshot,
                 );
@@ -9552,7 +9666,7 @@ impl CayenneTableProvider {
             // (see `rekey_moved_footer_cache_entries`). `delta_metas` is
             // index-aligned with `moved_file_names` when present.
             let staging_prefix = ListingTableUrl::parse(Self::snapshot_dir_url(
-                &self.table_metadata.path,
+                self.data_root(),
                 &self.table_metadata.table_id,
                 staging_snapshot_id,
             ))
@@ -9663,7 +9777,7 @@ impl CayenneTableProvider {
         // scan's LIST would — `prefix.clone().join(relative)` — rather than from the
         // object-store move prefix, which may not be byte-identical.
         let cache_prefix = ListingTableUrl::parse(Self::snapshot_dir_url(
-            &self.table_metadata.path,
+            self.data_root(),
             &self.table_metadata.table_id,
             current_snapshot,
         ))
@@ -9679,14 +9793,16 @@ impl CayenneTableProvider {
         // whose scans read only the manifest.
         let mut moved_files: Vec<(String, u64)> = Vec::with_capacity(objects.len());
         for meta in &objects {
-            let relative = crate::object_relative(&staging_prefix, &meta.location)
-                .ok_or_else(|| Error::Internal {
-                    table: self.table_metadata.table_name.clone(),
-                    message: format!(
-                        "Staging object '{}' does not have expected prefix '{}'",
-                        meta.location,
-                        staging_prefix.as_ref(),
-                    ),
+            let relative =
+                crate::object_relative(&staging_prefix, &meta.location).ok_or_else(|| {
+                    Error::Internal {
+                        table: self.table_metadata.table_name.clone(),
+                        message: format!(
+                            "Staging object '{}' does not have expected prefix '{}'",
+                            meta.location,
+                            staging_prefix.as_ref(),
+                        ),
+                    }
                 })?;
 
             // Skip the WAL bookkeeping files — they are managed separately
@@ -9866,7 +9982,7 @@ impl CayenneTableProvider {
             snapshot_id: target_snapshot_id.to_string(),
             armed: true,
         };
-        if crate::is_object_store_path(&self.table_metadata.path) {
+        if self.data_in_store() {
             let config = self.require_object_store()?;
             let source_prefix = self
                 .snapshot_object_store_prefix(source_snapshot_id)?
@@ -9957,7 +10073,7 @@ impl CayenneTableProvider {
     }
 
     pub(crate) async fn clear_snapshot_dir(&self, snapshot_id: &str) -> Result<()> {
-        if crate::is_object_store_path(&self.table_metadata.path) {
+        if self.data_in_store() {
             if let Some(prefix) = self.snapshot_object_store_prefix(snapshot_id)? {
                 self.delete_prefix_with_object_store(&prefix).await?;
             }
@@ -10339,20 +10455,51 @@ impl CayenneTableProvider {
             CayenneContext::new(&table_metadata.vortex_config, runtime_env, table_name)
         });
 
-        if crate::is_object_store_path(&table_metadata.path) && object_store_config.is_none() {
-            return Err(Error::Internal {
-                table: table_name.to_string(),
-                message: "Table uses S3 storage but no object_store_config was provided"
-                    .to_string(),
-            }
-            .into());
-        }
+        // A table whose data path is an object-store URL reads and writes through
+        // its own store, under a URL of its own (see `crate::dataset_storage`).
+        // A `file://` table given no store (the `cayenne_vnext` flag off) keeps the
+        // local data path, as it always has.
+        let (object_store_config, dataset_storage) =
+            if crate::is_object_store_path(&table_metadata.path)
+                && (object_store_config.is_some() || !table_metadata.path.starts_with("file://"))
+            {
+                let Some(config) = object_store_config else {
+                    return Err(Error::Internal {
+                        table: table_name.to_string(),
+                        message: "Table uses S3 storage but no object_store_config was provided"
+                            .to_string(),
+                    }
+                    .into());
+                };
+                let storage = crate::dataset_storage::DatasetStorage::new(
+                    &table_metadata.path,
+                    &table_metadata.table_id,
+                    config.store,
+                )
+                .map_err(|message| Error::Internal {
+                    table: table_name.to_string(),
+                    message,
+                })?;
+                (
+                    Some(crate::metadata::ObjectStoreConfig {
+                        url: storage.url().clone(),
+                        store: Arc::clone(storage.store()),
+                    }),
+                    Some(Arc::new(storage)),
+                )
+            } else {
+                (None, None)
+            };
+        let data_root: Arc<str> = dataset_storage.as_ref().map_or_else(
+            || Arc::from(table_metadata.path.as_str()),
+            |storage| Arc::from(storage.data_root()),
+        );
 
         // Construct URL to current snapshot
         // Directory structure: [table_path]/[table_id]/[snapshot_id]/
         // All tables have a snapshot ID (created on table initialization)
         let snapshot_dir_url = Self::snapshot_dir_url(
-            &table_metadata.path,
+            &data_root,
             &table_metadata.table_id,
             &table_metadata.current_snapshot_id,
         );
@@ -10416,9 +10563,11 @@ impl CayenneTableProvider {
             catalog_for_load,
             pk_deletion_strategy_kind,
             table_metadata.vortex_config.cold_tier_enabled(),
+            dataset_storage.as_ref(),
         )
         .await?;
-        let pk_deletion_mode = Self::resolve_pk_deletion_mode(&table_metadata, &context);
+        let pk_deletion_mode =
+            Self::resolve_pk_deletion_mode(&table_metadata, &context, dataset_storage.is_some());
 
         let listing_table = Self::create_listing_table(
             &snapshot_dir_url,
@@ -10491,18 +10640,17 @@ impl CayenneTableProvider {
             persisted_hi,
         }));
 
-        let force_staging_probe_on_startup = crate::is_object_store_path(&table_metadata.path);
+        let force_staging_probe_on_startup = dataset_storage.is_some();
         // A replacement inherits the replaced instance's pins; any other
         // instance starts with none.
         let snapshot_dir_pins = snapshot_dir_pins.unwrap_or_default();
 
-        // Register the S3 object store in the shared RuntimeEnv once during
-        // construction. Every code path that creates a SessionContext from
-        // `self.context.runtime_env()` (e.g. `create_session_context`, keyset
-        // loading, deletion sinks) will automatically inherit the store.
-        // A table at a plain local path reads through the runtime's own `file:///`
-        // store, as it always has; a `file://` table (local data through the durable
-        // store, under `cayenne_vnext`) is given that store in its config.
+        // Register the dataset's store in the shared RuntimeEnv once during
+        // construction, under the dataset's own URL. Every code path that creates a
+        // SessionContext from `self.context.runtime_env()` (e.g.
+        // `create_session_context`, keyset loading, deletion sinks) will
+        // automatically inherit the store. A table at a plain local path reads
+        // through the runtime's own `file:///` store, as it always has.
         if let Some(ref config) = object_store_config {
             Self::register_object_store_if_needed(context.runtime_env(), config);
         }
@@ -10685,6 +10833,8 @@ impl CayenneTableProvider {
             visibility_lock: Arc::new(tokio::sync::Mutex::new(())),
             scan_state_lock: Arc::new(tokio::sync::RwLock::new(())),
             object_store_config,
+            dataset_storage,
+            data_root,
             cold_object_store_config,
             object_store_registered_runtime_envs: Arc::new(ParkingMutex::new(
                 object_store_registered_runtime_envs,
@@ -10801,6 +10951,8 @@ impl CayenneTableProvider {
             snapshot_cleanup_pending: Arc::new(AtomicBool::new(false)),
             snapshot_cleanup_rearmed: Arc::new(AtomicBool::new(false)),
             snapshot_cleanup_rearms_left: Arc::new(AtomicU8::new(0)),
+            retired_snapshot_generation: Arc::new(AtomicU64::new(0)),
+            retired_snapshot_follow_up: Arc::new(AtomicBool::new(false)),
             maintained_aggregates,
             filter_column_observations: Arc::new(
                 super::predicate_stats::FilterColumnObservations::new(),
@@ -10922,7 +11074,7 @@ impl CayenneTableProvider {
         if index_persistence == IndexPersistence::Enabled {
             provider.open_persisted_lookup_index().await;
         } else if let Ok(url) = ListingTableUrl::parse(Self::snapshot_dir_url(
-            &provider.table_metadata.path,
+            provider.data_root(),
             &provider.table_metadata.table_id,
             LOOKUP_INDEX_DIR_NAME,
         )) {
@@ -10937,7 +11089,7 @@ impl CayenneTableProvider {
     /// are indexed as usual.
     async fn open_persisted_lookup_index(&self) {
         let Ok(url) = ListingTableUrl::parse(Self::snapshot_dir_url(
-            &self.table_metadata.path,
+            self.data_root(),
             &self.table_metadata.table_id,
             LOOKUP_INDEX_DIR_NAME,
         )) else {
@@ -11317,7 +11469,7 @@ impl CayenneTableProvider {
     ///
     /// Returns an error if the directory cannot be created.
     pub(crate) async fn ensure_local_snapshot_dir(&self, snapshot_id: &str) -> Result<()> {
-        if crate::is_object_store_path(&self.table_metadata.path) {
+        if self.data_in_store() {
             return Ok(());
         }
         Self::ensure_snapshot_dir_exists(&self.snapshot_dir_path_for(snapshot_id)).await?;
@@ -11335,7 +11487,7 @@ impl CayenneTableProvider {
     ///
     /// Returns an error if the directory cannot be synced.
     pub(crate) async fn sync_local_snapshot_dir(&self, snapshot_id: &str) -> CatalogResult<()> {
-        if crate::is_object_store_path(&self.table_metadata.path) {
+        if self.data_in_store() {
             return Ok(());
         }
         Self::sync_snapshot_dir(&self.snapshot_dir_path_for(snapshot_id)).await
@@ -11557,11 +11709,8 @@ impl CayenneTableProvider {
         );
 
         // Construct snapshot directory URL
-        let snapshot_dir_url = Self::snapshot_dir_url(
-            &self.table_metadata.path,
-            &self.table_metadata.table_id,
-            snapshot_id,
-        );
+        let snapshot_dir_url =
+            Self::snapshot_dir_url(self.data_root(), &self.table_metadata.table_id, snapshot_id);
 
         // Build the write-path Vortex format for this snapshot. Unsorted writes
         // are sharded across `target_partitions` concurrent encoders (PK-hashed
@@ -11682,7 +11831,7 @@ impl CayenneTableProvider {
         };
 
         // Progress tracking for S3 Express uploads
-        let is_s3_storage = crate::is_object_store_path(&self.table_metadata.path);
+        let is_s3_storage = self.data_in_store();
         let start_time = Instant::now();
         let last_progress_ms = Arc::new(AtomicU64::new(0));
         let total_bytes_written = Arc::new(AtomicUsize::new(0));
@@ -12499,7 +12648,7 @@ impl CayenneTableProvider {
     /// approximated, so a missing series is never mistaken for an empty
     /// directory.
     async fn sample_data_dir_metrics(&self) -> bool {
-        if crate::is_object_store_path(&self.table_metadata.path) {
+        if self.data_in_store() {
             // Not a failure: there is nothing to publish here on object storage,
             // and the gate should hold the full interval rather than retrying a
             // walk that will never run.
@@ -13019,6 +13168,8 @@ impl CayenneTableProvider {
             visibility_lock: Arc::clone(&self.visibility_lock),
             scan_state_lock: Arc::clone(&self.scan_state_lock),
             object_store_config: self.object_store_config.clone(),
+            dataset_storage: self.dataset_storage.clone(),
+            data_root: Arc::clone(&self.data_root),
             cold_object_store_config: self.cold_object_store_config.clone(),
             object_store_registered_runtime_envs: Arc::clone(
                 &self.object_store_registered_runtime_envs,
@@ -13179,6 +13330,8 @@ impl CayenneTableProvider {
             snapshot_cleanup_pending: Arc::clone(&self.snapshot_cleanup_pending),
             snapshot_cleanup_rearmed: Arc::clone(&self.snapshot_cleanup_rearmed),
             snapshot_cleanup_rearms_left: Arc::clone(&self.snapshot_cleanup_rearms_left),
+            retired_snapshot_generation: Arc::clone(&self.retired_snapshot_generation),
+            retired_snapshot_follow_up: Arc::clone(&self.retired_snapshot_follow_up),
             maintained_aggregates: Arc::clone(&self.maintained_aggregates),
             filter_column_observations: Arc::clone(&self.filter_column_observations),
             maintained_aggregate_epoch: Arc::clone(&self.maintained_aggregate_epoch),
@@ -14656,6 +14809,7 @@ impl CayenneTableProvider {
     fn resolve_pk_deletion_mode(
         table_metadata: &TableMetadata,
         context: &CayenneContext,
+        data_in_store: bool,
     ) -> PkDeletionMode {
         let has_primary_key = !table_metadata.primary_key.is_empty();
         // `auto` rewrites a table whole only where that was measured to pay (see
@@ -14663,7 +14817,7 @@ impl CayenneTableProvider {
         // auto-tuned config line.
         let storage = if table_metadata.vortex_config.memory_mode {
             TableStorage::Memory
-        } else if crate::is_object_store_path(&table_metadata.path) {
+        } else if data_in_store {
             TableStorage::ObjectStorage
         } else {
             TableStorage::LocalDisk
@@ -14936,7 +15090,7 @@ impl CayenneTableProvider {
         let state = ctx.state();
         let snapshot_id = self.get_current_snapshot_id();
         let snapshot_dir_url = Self::snapshot_dir_url(
-            &self.table_metadata.path,
+            self.data_root(),
             &self.table_metadata.table_id,
             &snapshot_id,
         );
@@ -15030,6 +15184,7 @@ impl CayenneTableProvider {
             Arc::clone(self.context.runtime_env()),
             None,
             Arc::clone(&self.seq_allocator),
+            self.dataset_storage.clone(),
         )
         .with_publication_outcome_fence(Arc::clone(&self.publication_outcome_unknown));
 
@@ -15119,11 +15274,8 @@ impl CayenneTableProvider {
             table: self.table_metadata.table_name.clone(),
             message,
         };
-        let snapshot_dir_url = Self::snapshot_dir_url(
-            &self.table_metadata.path,
-            &self.table_metadata.table_id,
-            snapshot_id,
-        );
+        let snapshot_dir_url =
+            Self::snapshot_dir_url(self.data_root(), &self.table_metadata.table_id, snapshot_id);
         let mut urls = Vec::with_capacity(excluded.len());
         let mut deletions = PositionBitmap::with_capacity(excluded.len());
         for (location, positions) in excluded {
@@ -15173,11 +15325,8 @@ impl CayenneTableProvider {
         locations: Vec<ObjectStorePath>,
     ) -> Result<()> {
         let table_name = self.table_metadata.table_name.clone();
-        let snapshot_dir_url = Self::snapshot_dir_url(
-            &self.table_metadata.path,
-            &self.table_metadata.table_id,
-            snapshot_id,
-        );
+        let snapshot_dir_url =
+            Self::snapshot_dir_url(self.data_root(), &self.table_metadata.table_id, snapshot_id);
         let table_url =
             ListingTableUrl::parse(&snapshot_dir_url).map_err(|err| Error::Internal {
                 table: table_name.clone(),
@@ -18716,7 +18865,7 @@ impl CayenneTableProvider {
 
         let mut temp_metadata = self.table_metadata.clone();
         temp_metadata.current_sequence_number = delete_sequence;
-        let writer = DeletionVectorWriter::new(&temp_metadata);
+        let writer = DeletionVectorWriter::new(&temp_metadata, self.dataset_storage.as_ref());
 
         let specs = vec![DeletionVectorWriteSpec::new_key_based(row_keys)];
         let results = writer.write(specs).await?;
@@ -18751,9 +18900,10 @@ impl CayenneTableProvider {
         if specs.is_empty() {
             return Ok(Vec::new());
         }
-        let results = DeletionVectorWriter::new(&self.table_metadata)
-            .write(specs)
-            .await?;
+        let results =
+            DeletionVectorWriter::new(&self.table_metadata, self.dataset_storage.as_ref())
+                .write(specs)
+                .await?;
         Ok(results
             .into_iter()
             .map(|result| result.delete_file)
@@ -19280,7 +19430,7 @@ impl CayenneTableProvider {
 
         let mut temp_metadata = self.table_metadata.clone();
         temp_metadata.current_sequence_number = sequence_number;
-        let writer = DeletionVectorWriter::new(&temp_metadata);
+        let writer = DeletionVectorWriter::new(&temp_metadata, self.dataset_storage.as_ref());
 
         let mut specs = Vec::with_capacity(delete_specs.len());
         let mut position_deletions = HashMap::with_capacity(delete_specs.len());
@@ -19766,6 +19916,7 @@ impl CayenneTableProvider {
                 Arc::clone(self.context.runtime_env()),
                 None,
                 Arc::clone(&self.seq_allocator),
+                self.dataset_storage.clone(),
             )
             .with_publication_outcome_fence(Arc::clone(&self.publication_outcome_unknown))
             .with_scan_input_version(Arc::clone(&self.scan_input_version));
@@ -21282,12 +21433,12 @@ impl CayenneTableProvider {
         //  - delete old files first (which would break the lazy read), or
         //  - collect all sorted data into memory before writing
         let new_snapshot_id = uuid::Uuid::now_v7().to_string();
-        let is_s3 = crate::is_object_store_path(&self.table_metadata.path);
+        let is_s3 = self.data_in_store();
 
         let cleanup_failed_snapshot = async {
             if is_s3 {
                 let snapshot_url = Self::snapshot_dir_url(
-                    &self.table_metadata.path,
+                    self.data_root(),
                     &self.table_metadata.table_id,
                     &new_snapshot_id,
                 );
@@ -21392,7 +21543,7 @@ impl CayenneTableProvider {
         // This ensures that if listing table creation fails, we haven't committed
         // the catalog yet, avoiding an inconsistent state.
         let snapshot_dir_url = Self::snapshot_dir_url(
-            &self.table_metadata.path,
+            self.data_root(),
             &self.table_metadata.table_id,
             &new_snapshot_id,
         );
@@ -22245,7 +22396,7 @@ impl CayenneTableProvider {
         // Staging snapshot holding ONLY the candidate files so a normal snapshot
         // scan reads just those bytes (no full-table re-read).
         let staging_snapshot_id = format!("subset-src-{new_snapshot_id}");
-        let is_s3 = crate::is_object_store_path(&self.table_metadata.path);
+        let is_s3 = self.data_in_store();
 
         // Cleanup both dirs on any failure after creation.
         let cleanup_all = async {
@@ -22398,7 +22549,7 @@ impl CayenneTableProvider {
         // Built after the guards, so a schema change that landed during the encode is in it.
         let new_listing_table = {
             let snapshot_dir_url = Self::snapshot_dir_url(
-                &self.table_metadata.path,
+                self.data_root(),
                 &self.table_metadata.table_id,
                 &new_snapshot_id,
             );
@@ -22722,7 +22873,7 @@ impl CayenneTableProvider {
         if basenames.is_empty() {
             return Ok(());
         }
-        if crate::is_object_store_path(&self.table_metadata.path) {
+        if self.data_in_store() {
             let config = self.require_object_store()?;
             let source_prefix = self
                 .snapshot_object_store_prefix(source_snapshot_id)?
@@ -23374,15 +23525,22 @@ impl CayenneTableProvider {
                 record_row_removed(df);
                 continue;
             }
-            let unlinked = match crate::resolve_object_url(&df.path) {
-                Some((store, location)) => match store.delete(&location).await {
+            let location = match self.dataset_storage.as_ref() {
+                Some(storage) => storage.resolve(&df.path).map(|location| {
+                    location.map(|location| (Arc::clone(storage.store()), location))
+                }),
+                None => Ok(None),
+            };
+            let unlinked = match location {
+                Ok(Some((store, location))) => match store.delete(&location).await {
                     Ok(()) => Ok(()),
                     Err(object_store::Error::NotFound { .. }) => {
                         Err(std::io::Error::from(std::io::ErrorKind::NotFound))
                     }
                     Err(error) => Err(std::io::Error::other(error)),
                 },
-                None => tokio::fs::remove_file(&df.path).await,
+                Ok(None) => tokio::fs::remove_file(&df.path).await,
+                Err(error) => Err(std::io::Error::other(error)),
             };
             match unlinked {
                 Ok(()) => {
@@ -24445,7 +24603,7 @@ impl CayenneTableProvider {
         &self,
         snapshot_id: &str,
     ) -> Result<Vec<(String, u64)>> {
-        if crate::is_object_store_path(&self.table_metadata.path) {
+        if self.data_in_store() {
             self.list_snapshot_files_with_sizes_s3(snapshot_id).await
         } else {
             self.list_snapshot_files_with_sizes_local(snapshot_id).await
@@ -24741,7 +24899,7 @@ impl CayenneTableProvider {
     /// [`Self::list_snapshot_files_with_sizes`]. This is a whole-file read, so
     /// it runs only when `integrity_checksums` is enabled.
     async fn read_data_file_bytes(&self, snapshot_id: &str, file_name: &str) -> Result<Vec<u8>> {
-        if crate::is_object_store_path(&self.table_metadata.path) {
+        if self.data_in_store() {
             let Some(prefix) = self.snapshot_object_store_prefix(snapshot_id)? else {
                 return Err(Error::Internal {
                     table: self.table_metadata.table_name.clone(),
@@ -26073,7 +26231,7 @@ impl CayenneTableProvider {
         let target_partitions = 1;
 
         let new_snapshot_id = uuid::Uuid::now_v7().to_string();
-        let is_s3 = crate::is_object_store_path(&self.table_metadata.path);
+        let is_s3 = self.data_in_store();
 
         if !is_s3 {
             let snapshot_dir = self.snapshot_dir_path_for(&new_snapshot_id);
@@ -26146,7 +26304,7 @@ impl CayenneTableProvider {
         }
 
         let snapshot_dir_url = Self::snapshot_dir_url(
-            &self.table_metadata.path,
+            self.data_root(),
             &self.table_metadata.table_id,
             &new_snapshot_id,
         );
@@ -26928,7 +27086,7 @@ impl CayenneTableProvider {
         // the object-store write. Reuse the warm helper so cold dir creation gets
         // the same fsync-the-parent crash-safety (and error propagation) instead
         // of a bare create_dir_all. S3/object stores need no mkdir.
-        if !crate::is_object_store_path(&cold_base) {
+        if !crate::is_object_store_path(cold_base) {
             let local = cold_dir_url
                 .strip_prefix("file://")
                 .unwrap_or(cold_dir_url.as_str());
@@ -27342,8 +27500,9 @@ impl CayenneTableProvider {
                 cleared_by_bloom: 0,
             });
         }
+        let storage = self.dataset_storage.clone();
         let (_, deleted_row_keys, _, _) = tokio::task::spawn_blocking(move || {
-            super::delete::detect_deletion_type_and_read(delete_files)
+            super::delete::detect_deletion_type_and_read(delete_files, storage.as_deref())
         })
         .await
         .map_err(|join_error| {
@@ -27663,7 +27822,7 @@ impl CayenneTableProvider {
         let mut cold_files = cold_files;
         cold_files.extend(clean_cold);
         let new_snapshot_id = uuid::Uuid::now_v7().to_string();
-        if !crate::is_object_store_path(&self.table_metadata.path) {
+        if !self.data_in_store() {
             let dir = self.snapshot_dir_path_for(&new_snapshot_id);
             Self::ensure_snapshot_dir_exists(&dir).await?;
         }
@@ -28443,7 +28602,7 @@ impl CayenneTableProvider {
         let plan_build_ms = phase2_start.elapsed().as_millis();
 
         let new_snapshot_id = uuid::Uuid::now_v7().to_string();
-        let is_s3 = crate::is_object_store_path(&self.table_metadata.path);
+        let is_s3 = self.data_in_store();
 
         if !is_s3 {
             let snapshot_dir = self.snapshot_dir_path_for(&new_snapshot_id);
@@ -29244,7 +29403,7 @@ impl CayenneTableProvider {
         let stream = datafusion_physical_plan::execute_stream(merged_plan, state.task_ctx())?;
 
         let new_snapshot_id = uuid::Uuid::now_v7().to_string();
-        let is_s3 = crate::is_object_store_path(&self.table_metadata.path);
+        let is_s3 = self.data_in_store();
         if !is_s3 {
             let snapshot_dir = self.snapshot_dir_path_for(&new_snapshot_id);
             Self::ensure_snapshot_dir_exists(&snapshot_dir).await?;
@@ -30310,6 +30469,11 @@ impl CayenneTableProvider {
     ) -> SessionContext {
         let runtime_env = super::compaction::compaction_runtime_env()
             .unwrap_or_else(|| Arc::clone(self.context.runtime_env()));
+        // A maintenance session may run on a `RuntimeEnv` of its own; the
+        // dataset's store must be registered there under the dataset's URL too.
+        if let Some(store_config) = self.object_store_config.as_ref() {
+            self.register_object_store_for_runtime(&runtime_env, store_config);
+        }
         SessionContext::new_with_config_rt(config, runtime_env)
     }
 
@@ -30715,6 +30879,7 @@ impl CayenneTableProvider {
             Arc::clone(&self.catalog),
             self.pk_deletion_strategy.strategy(),
             self.table_metadata.vortex_config.cold_tier_enabled(),
+            self.dataset_storage.as_ref(),
         )
         .await?;
 
@@ -31763,6 +31928,7 @@ impl CayenneTableProvider {
             Arc::clone(&self.catalog),
             self.pk_deletion_strategy.strategy(),
             self.table_metadata.vortex_config.cold_tier_enabled(),
+            self.dataset_storage.as_ref(),
         )
         .await
         .map_err(|e| Error::Internal {
@@ -31908,7 +32074,7 @@ impl CayenneTableProvider {
         // (which may differ from table_metadata after compaction)
         let current_snapshot = self.get_current_snapshot_id();
         let snapshot_dir_url = Self::snapshot_dir_url(
-            &self.table_metadata.path,
+            self.data_root(),
             &self.table_metadata.table_id,
             &current_snapshot,
         );
@@ -32000,7 +32166,7 @@ impl CayenneTableProvider {
         self.current_sorted_snapshot.store(Arc::new(None));
         let current_snapshot = self.get_current_snapshot_id();
         let snapshot_dir_url = Self::snapshot_dir_url(
-            &self.table_metadata.path,
+            self.data_root(),
             &self.table_metadata.table_id,
             &current_snapshot,
         );
@@ -32139,6 +32305,7 @@ impl CayenneTableProvider {
             Arc::clone(&self.catalog),
             self.pk_deletion_strategy.strategy(),
             self.table_metadata.vortex_config.cold_tier_enabled(),
+            self.dataset_storage.as_ref(),
         )
         .await
         .map_err(|source| Error::Catalog { source })?;
@@ -34167,7 +34334,7 @@ impl CayenneTableProvider {
         snapshot_id: &str,
     ) -> datafusion_common::Result<Arc<Vec<PartitionedFile>>> {
         let table_url = ListingTableUrl::parse(Self::snapshot_dir_url(
-            &self.table_metadata.path,
+            self.data_root(),
             &self.table_metadata.table_id,
             snapshot_id,
         ))?;
@@ -36844,7 +37011,7 @@ impl CayenneTableProvider {
                 .await?
             };
 
-            let is_s3 = crate::is_object_store_path(&self.table_metadata.path);
+            let is_s3 = self.data_in_store();
             if !is_s3 {
                 let snapshot_dir = self.snapshot_dir_path_for(&new_snapshot_id);
                 Self::sync_snapshot_dir(&snapshot_dir).await?;
@@ -38494,7 +38661,7 @@ impl CayenneTableProvider {
         // as in the sort-rewrite and normal append paths: the Vortex files must
         // be durably present before the catalog metadata that makes them
         // visible (via sequence number / protected snapshot) is committed.
-        let is_s3 = crate::is_object_store_path(&self.table_metadata.path);
+        let is_s3 = self.data_in_store();
         if !is_s3 {
             let snapshot_dir = self.snapshot_dir_path_for(&new_snapshot_id);
             Self::sync_snapshot_dir(&snapshot_dir).await?;
@@ -39301,6 +39468,7 @@ impl CayenneTableProvider {
         catalog: &dyn MetadataCatalog,
         table_id: &str,
         mut delete_files: Vec<crate::metadata::DeleteFile>,
+        storage: Option<&Arc<crate::dataset_storage::DatasetStorage>>,
     ) -> CatalogResult<DeletionVectorRead> {
         const MAX_READS: usize = 8;
         let mut reads = 1;
@@ -39309,8 +39477,9 @@ impl CayenneTableProvider {
                 .iter()
                 .map(|file| file.delete_file_id.clone())
                 .collect();
+            let storage = storage.map(Arc::clone);
             let result = task::spawn_blocking(move || {
-                super::delete::detect_deletion_type_and_read(delete_files)
+                super::delete::detect_deletion_type_and_read(delete_files, storage.as_deref())
             })
             .await
             .map_err(|err| CatalogError::InvalidOperation {
@@ -39361,6 +39530,7 @@ impl CayenneTableProvider {
         catalog: Arc<dyn MetadataCatalog>,
         strategy: PkDeletionStrategy,
         cold_tier_enabled: bool,
+        storage: Option<&Arc<crate::dataset_storage::DatasetStorage>>,
     ) -> CatalogResult<PkDeletionStrategyWithCache> {
         // Query catalog for delete files
         let delete_files = catalog
@@ -39451,8 +39621,13 @@ impl CayenneTableProvider {
         // - per_file_row_ids: file path -> bitmap of deleted row positions
         // - deleted_row_keys: PK bytes -> max delete sequence
         let (per_file_row_ids, deleted_row_keys, derived_reinserted, missing_key_dvs) =
-            Self::read_deletion_vectors_of_current_rows(catalog.as_ref(), table_id, delete_files)
-                .await?;
+            Self::read_deletion_vectors_of_current_rows(
+                catalog.as_ref(),
+                table_id,
+                delete_files,
+                storage,
+            )
+            .await?;
 
         // Self-heal any key-based DV whose `.arrow` file is missing. The file-first
         // orphaned-DV sweep unlinks the file before removing its catalog row, so a
@@ -40058,7 +40233,7 @@ impl CayenneTableProvider {
         let base_schema =
             read_schema_override.unwrap_or_else(|| Arc::clone(&file_statistics_schema));
         let table_url = Self::snapshot_listing_url(
-            &self.table_metadata.path,
+            self.data_root(),
             &self.table_metadata.table_id,
             snapshot_id,
         )?;
@@ -42118,11 +42293,8 @@ impl CayenneTableProvider {
         snapshot_id: &str,
         read_schema: &SchemaRef,
     ) -> Option<(Arc<dyn ObjectStore>, Vec<ObjectMeta>)> {
-        let snapshot_dir_url = Self::snapshot_dir_url(
-            &self.table_metadata.path,
-            &self.table_metadata.table_id,
-            snapshot_id,
-        );
+        let snapshot_dir_url =
+            Self::snapshot_dir_url(self.data_root(), &self.table_metadata.table_id, snapshot_id);
         let table_url = ListingTableUrl::parse(&snapshot_dir_url).ok()?;
         // Footer statistics are read separately when needed. Listing requires
         // only object metadata, not a scan of each file's footer.
@@ -43486,7 +43658,7 @@ impl TableProvider for CayenneTableProvider {
         input: Arc<dyn ExecutionPlan>,
         overwrite: InsertOp,
     ) -> datafusion_common::Result<Arc<dyn ExecutionPlan>> {
-        let is_s3 = crate::is_object_store_path(&self.table_metadata.path);
+        let is_s3 = self.data_in_store();
 
         if is_s3 {
             tracing::debug!(
@@ -43947,6 +44119,7 @@ impl CayenneTableProvider {
             Arc::clone(self.context.runtime_env()),
             write_lock,
             Arc::clone(&self.seq_allocator),
+            self.dataset_storage.clone(),
         )
         .with_publication_outcome_fence(Arc::clone(&self.publication_outcome_unknown))
         .with_scan_input_version(Arc::clone(&self.scan_input_version))
@@ -44058,6 +44231,7 @@ impl CayenneTableProvider {
             Arc::clone(self.context.runtime_env()),
             None, // write lock already held above
             Arc::clone(&self.seq_allocator),
+            self.dataset_storage.clone(),
         )
         .with_publication_outcome_fence(Arc::clone(&self.publication_outcome_unknown))
         .with_scan_input_version(Arc::clone(&self.scan_input_version))
@@ -44100,7 +44274,7 @@ impl CayenneTableProvider {
         let mut result = Vec::with_capacity(protected_snapshots.len());
         for (snapshot_id, max_delete_seq_at_creation) in protected_snapshots.iter() {
             let snapshot_url = Self::snapshot_dir_url(
-                &self.table_metadata.path,
+                self.data_root(),
                 &self.table_metadata.table_id,
                 snapshot_id,
             );
@@ -44139,7 +44313,7 @@ impl CayenneTableProvider {
             return false;
         };
 
-        if crate::is_object_store_path(&self.table_metadata.path) {
+        if self.data_in_store() {
             return false;
         }
 
@@ -59324,7 +59498,7 @@ mod tests {
 
         let snapshot_id = provider.get_current_snapshot_id();
         let snapshot_dir_url = CayenneTableProvider::snapshot_dir_url(
-            &provider.table_metadata.path,
+            provider.data_root(),
             &provider.table_metadata.table_id,
             &snapshot_id,
         );
@@ -59892,7 +60066,7 @@ mod tests {
 
         let snapshot_id = provider.get_current_snapshot_id();
         let snapshot_dir_url = CayenneTableProvider::snapshot_dir_url(
-            &provider.table_metadata.path,
+            provider.data_root(),
             &provider.table_metadata.table_id,
             &snapshot_id,
         );
@@ -60281,7 +60455,7 @@ mod tests {
                 let snapshot_id = snapshot_id.clone();
                 tokio::spawn(async move {
                     let url = ListingTableUrl::parse(CayenneTableProvider::snapshot_dir_url(
-                        &provider.table_metadata.path,
+                        provider.data_root(),
                         &provider.table_metadata.table_id,
                         &snapshot_id,
                     ))
@@ -61264,7 +61438,7 @@ mod tests {
 
         let snapshot_id = provider.get_current_snapshot_id();
         let snapshot_dir_url = CayenneTableProvider::snapshot_dir_url(
-            &provider.table_metadata.path,
+            provider.data_root(),
             &provider.table_metadata.table_id,
             &snapshot_id,
         );
@@ -65921,7 +66095,7 @@ mod tests {
                 .expect("object-store config should be retained"),
         );
         let snapshot_url = CayenneTableProvider::snapshot_dir_url(
-            provider.table_path(),
+            provider.data_root(),
             provider.table_id(),
             &snapshot_id,
         );
@@ -79784,6 +79958,7 @@ mod tests {
             catalog.as_ref(),
             &table_id,
             read_before_replacement,
+            None,
         )
         .await
         .expect("the load reads the replacing vector");

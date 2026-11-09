@@ -861,7 +861,7 @@ impl CayenneDeletionSink {
         // deleted-position bitmap/access-plan data itself.
         let existing_deletions = cached_deleted_row_ids.load_full();
 
-        let writer = DeletionVectorWriter::new(&self.table_metadata);
+        let writer = DeletionVectorWriter::new(&self.table_metadata, self.dataset_storage.as_ref());
 
         // Build write specs and precompute cache updates while counting TRUE new deletions
         // (set difference between incoming row_ids and existing cache per file).
@@ -961,6 +961,7 @@ impl CayenneDeletionSink {
             )?,
             cleanup_armed: true,
             scan_input_version: self.scan_input_version.as_ref().map(Arc::clone),
+            storage: self.dataset_storage.clone(),
         };
         if results
             .iter()

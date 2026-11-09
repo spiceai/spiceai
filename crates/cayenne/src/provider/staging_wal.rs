@@ -1171,10 +1171,16 @@ impl CayenneTableProvider {
     /// Returns an error if object-store configuration or the canonical table
     /// prefix cannot be resolved.
     pub fn partitioned_wal_object_store(&self) -> Result<Option<PartitionedWalObjectStore>> {
-        if !crate::is_object_store_path(&self.table_path()) {
+        if !self.data_in_store() {
             return Ok(None);
         }
         let config = self.require_object_store()?;
+        // Partitions are compared by the storage service their data lives in, not by
+        // their own store's URL, which is per table.
+        let backend = self.dataset_storage().map_or_else(
+            || config.url.to_string(),
+            |storage| storage.recorded_authority().to_string(),
+        );
         let snapshot_id = self.get_current_snapshot_id();
         let partition_prefix = self
             .snapshot_object_store_prefix(&snapshot_id)?
@@ -1195,7 +1201,7 @@ impl CayenneTableProvider {
         Ok(Some((
             Arc::clone(&config.store),
             ObjectStorePath::from(prefix),
-            config.url.to_string(),
+            backend,
         )))
     }
 
@@ -1527,7 +1533,7 @@ impl CayenneTableProvider {
         target_snapshot: &str,
         target_kind: StagingWalTargetKind,
     ) -> Result<()> {
-        if crate::is_object_store_path(&self.table_path()) {
+        if self.data_in_store() {
             self.write_staging_wal_s3(staging_snapshot_id, target_snapshot, target_kind)
                 .await?;
         } else {
@@ -1729,7 +1735,7 @@ impl CayenneTableProvider {
     /// removal fails, the commit is not reported as complete: callers must retain
     /// the recovery intent and surface the failure.
     pub(crate) async fn remove_staging_wal_for(&self, staging_snapshot_id: &str) -> Result<()> {
-        if crate::is_object_store_path(&self.table_path()) {
+        if self.data_in_store() {
             let config = self.require_object_store()?;
             if let Some(staging_prefix) = self.snapshot_object_store_prefix(staging_snapshot_id)? {
                 let wal_key = crate::object_child(&staging_prefix, STAGING_WAL_FILENAME);
@@ -1850,7 +1856,7 @@ impl CayenneTableProvider {
         if !self.staging_wal_present().load(Ordering::Acquire)
             && !self.staging_may_have_files().load(Ordering::Acquire)
         {
-            if crate::is_object_store_path(&self.table_path()) {
+            if self.data_in_store() {
                 return Ok(());
             }
 
@@ -2068,7 +2074,7 @@ impl CayenneTableProvider {
             // empty, recovery is just a WAL unlink) from "filesystem-level
             // corruption that lost staged files" (file in neither location).
             // Only the former should self-heal.
-            if !crate::is_object_store_path(&self.table_path()) && !wal.staged_files.is_empty() {
+            if !self.data_in_store() && !wal.staged_files.is_empty() {
                 let staging_dir = Self::snapshot_dir_path(
                     self.table_path(),
                     self.table_id(),
@@ -2114,7 +2120,7 @@ impl CayenneTableProvider {
                         ),
                     });
                 }
-            } else if crate::is_object_store_path(&self.table_path()) && !wal.staged_files.is_empty() {
+            } else if self.data_in_store() && !wal.staged_files.is_empty() {
                 // Pre-recovery audit (S3): symmetric to the local-FS audit.
                 // List the staging prefix and the target snapshot prefix. Every
                 // WAL-listed file must appear in at least one of those prefixes.
@@ -2354,7 +2360,7 @@ impl CayenneTableProvider {
     }
 
     async fn read_staging_wals(&self) -> Result<Vec<LocatedStagingWal>> {
-        if crate::is_object_store_path(&self.table_path()) {
+        if self.data_in_store() {
             self.read_staging_wals_s3().await
         } else {
             self.read_staging_wals_local().await

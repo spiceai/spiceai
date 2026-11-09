@@ -119,6 +119,12 @@ result-correctness-duckdb = []
 result-correctness-chdb = ["dep:chdb-rust"]
 
 [dev-dependencies]
+# The session-credential test rotates STS credentials from RustFS through the
+# credential provider the S3 data path uses.
+aws-config = { workspace = true }
+aws-credential-types = { workspace = true }
+aws-sdk-credential-bridge = { path = "../aws-sdk-credential-bridge" }
+aws-sdk-sts = { workspace = true }
 # Steps the model's transactions traces for the object-native catalog's replay.
 cayenne-metastore-model = { path = "../cayenne-metastore-model" }
 duckdb-oracle = { path = "../duckdb-oracle" }

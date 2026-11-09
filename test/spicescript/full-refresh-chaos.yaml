@@ -13,7 +13,8 @@ description: >
 sources:
   src: { kind: '${matrix.src}' }
   ref: { kind: postgres }
-  # The state locations of the object-native-data variants.
+  # The state locations of the object-native-data variants, and the data path
+  # of object-store-data-path-rustfs.
   lake: { kind: rustfs }
   slow-lake: { kind: rustfs, latency: 20ms }
 
@@ -30,6 +31,8 @@ variants:
   object-native-data-local: object-native-data-local
   object-native-data-rustfs: object-native-data-rustfs
   object-native-data-rustfs-latency: object-native-data-rustfs-latency
+  # Data at the dataset's own `cayenne_file_path` on RustFS (#16130).
+  object-store-data-path-rustfs: object-store-data-path-rustfs
 
 spicepod:
   version: v1
@@ -104,6 +107,29 @@ steps:
   - query: SELECT * FROM facts WHERE grp = 17 ORDER BY id
 
   - stop-background: { id: whole-table, allow: ['^[45][0-9][0-9] ', 'error sending request', 'connection', 'not ready'] }
+
+  # Data at its own path on RustFS (#16130): the files are in the bucket and
+  # none on local disk. A `mode: file_create` restart reloads the table and
+  # deletes the previous acceleration's objects, so the bucket holds about one
+  # generation of the table (50,000 rows: a handful of files), not every
+  # generation the refreshes above wrote.
+  - assert-objects: { source: lake, prefix: data/facts/, contains: .vortex, min: 1 }
+    only: object-store-data-path-rustfs
+  - assert-files: { lacks: ['(^|/)s3:', '\.vortex$'] }
+    only: object-store-data-path-rustfs
+  - restart:
+      patch: { datasets: { facts: { acceleration: { mode: file_create } } } }
+    only: object-store-data-path-rustfs
+  - query: SELECT count(*) AS n, sum(amount) AS total, count(note) AS notes FROM facts
+    eventually: 60s
+    only: object-store-data-path-rustfs
+  - assert-objects: { source: lake, prefix: data/facts/, contains: .vortex, min: 1, max: 32 }
+    only: object-store-data-path-rustfs
+  - assert-files: { lacks: ['(^|/)s3:', '\.vortex$'] }
+    only: object-store-data-path-rustfs
+  - restart:
+      patch: { datasets: { facts: { acceleration: { mode: file } } } }
+    only: object-store-data-path-rustfs
 
   # Object-native data (#16131): the table's files are in the state
   # location, under its log's data/ folder, and none at a local `s3:` path.

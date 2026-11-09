@@ -48,6 +48,7 @@ use chrono::Utc;
 use roaring::RoaringBitmap;
 use uuid::Uuid;
 
+use crate::dataset_storage::DatasetStorage;
 use crate::metadata::{DeleteFile, DeletionType, TableMetadata};
 use crate::provider::utils::bytes_key;
 use crate::provider::{Error, Result};
@@ -254,10 +255,35 @@ type WrittenDeletionFile = (
     Option<i64>,
 );
 
+/// A store and an object path in it.
+type StoreLocation = (Arc<dyn object_store::ObjectStore>, object_store::path::Path);
+
+/// The dataset store and object path of a deletion-vector file addressed by
+/// `path`; `None` for a table with no store of its own (its data path is a local
+/// directory), whose vectors are read and written as files.
+///
+/// # Errors
+///
+/// A URL outside `storage` is an error: no store of this dataset holds it.
+fn deletion_vector_location(
+    storage: Option<&DatasetStorage>,
+    path: &str,
+) -> std::result::Result<Option<StoreLocation>, object_store::Error> {
+    match storage {
+        Some(storage) => Ok(storage
+            .resolve(path)?
+            .map(|location| (Arc::clone(storage.store()), location))),
+        None => Ok(None),
+    }
+}
+
 /// Writes deletion-vector files for a specific Cayenne table snapshot.
 #[derive(Debug)]
 pub struct DeletionVectorWriter<'a> {
     table: &'a TableMetadata,
+    /// The table's storage when its data path is an object-store URL; the
+    /// vectors are then written through its store.
+    storage: Option<Arc<DatasetStorage>>,
     #[cfg(test)]
     test_hook: Option<Arc<TestWriterHook>>,
 }
@@ -279,13 +305,15 @@ impl Drop for PendingWriteCompletion {
 
 struct UncommittedDeleteFilesGuard {
     paths: Vec<PathBuf>,
+    storage: Option<Arc<DatasetStorage>>,
     pending: Arc<PendingBatchWrites>,
     armed: bool,
 }
 
 impl UncommittedDeleteFilesGuard {
-    fn new(paths: Vec<PathBuf>) -> Self {
+    fn new(paths: Vec<PathBuf>, storage: Option<Arc<DatasetStorage>>) -> Self {
         Self {
+            storage,
             pending: Arc::new(PendingBatchWrites {
                 remaining: AtomicUsize::new(paths.len()),
                 completed: tokio::sync::Notify::new(),
@@ -310,6 +338,7 @@ impl Drop for UncommittedDeleteFilesGuard {
             return;
         }
         let paths = std::mem::take(&mut self.paths);
+        let storage = self.storage.take();
         let pending = Arc::clone(&self.pending);
         if let Ok(runtime) = tokio::runtime::Handle::try_current() {
             runtime.spawn(async move {
@@ -319,7 +348,7 @@ impl Drop for UncommittedDeleteFilesGuard {
                         notified.await;
                     }
                 }
-                cleanup_uncommitted_delete_paths(&paths).await;
+                cleanup_uncommitted_delete_paths(&paths, storage.as_deref()).await;
             });
         } else {
             std::thread::spawn(move || {
@@ -347,11 +376,13 @@ impl Drop for UncommittedDeleteFilesGuard {
 }
 
 impl<'a> DeletionVectorWriter<'a> {
-    /// Create a new writer bound to the provided table metadata.
+    /// Create a new writer bound to the provided table metadata, writing through
+    /// `storage` when the table's data path is an object-store URL.
     #[must_use]
-    pub fn new(table: &'a TableMetadata) -> Self {
+    pub fn new(table: &'a TableMetadata, storage: Option<&Arc<DatasetStorage>>) -> Self {
         Self {
             table,
+            storage: storage.map(Arc::clone),
             #[cfg(test)]
             test_hook: None,
         }
@@ -361,6 +392,7 @@ impl<'a> DeletionVectorWriter<'a> {
     fn new_with_test_hook(table: &'a TableMetadata, test_hook: Arc<TestWriterHook>) -> Self {
         Self {
             table,
+            storage: None,
             test_hook: Some(test_hook),
         }
     }
@@ -412,18 +444,18 @@ impl<'a> DeletionVectorWriter<'a> {
         //
         // The sync is one-time per snapshot (first deletion vector
         // written to it). Subsequent deletions reuse the directory.
-        let object_store_table = crate::is_object_store_path(&self.table.path);
+        let object_store_table = self.storage.is_some();
         let sync_snapshot_parent = if object_store_table {
             false
         } else {
             match tokio::fs::create_dir(&deletion_dir).await {
-            Ok(()) => true,
-            Err(source) if source.kind() == std::io::ErrorKind::AlreadyExists => false,
-            Err(source) if source.kind() == std::io::ErrorKind::NotFound => {
-                tokio::fs::create_dir_all(&deletion_dir).await?;
-                true
-            }
-            Err(source) => return Err(Error::IoError { source }),
+                Ok(()) => true,
+                Err(source) if source.kind() == std::io::ErrorKind::AlreadyExists => false,
+                Err(source) if source.kind() == std::io::ErrorKind::NotFound => {
+                    tokio::fs::create_dir_all(&deletion_dir).await?;
+                    true
+                }
+                Err(source) => return Err(Error::IoError { source }),
             }
         };
         if sync_snapshot_parent {
@@ -454,7 +486,8 @@ impl<'a> DeletionVectorWriter<'a> {
         let batch_paths = (0..specs.len())
             .map(|_| Self::deletion_file_path(&deletion_dir))
             .collect::<Vec<_>>();
-        let mut cleanup_guard = UncommittedDeleteFilesGuard::new(batch_paths.clone());
+        let mut cleanup_guard =
+            UncommittedDeleteFilesGuard::new(batch_paths.clone(), self.storage.clone());
         let write_futures = specs
             .into_iter()
             .zip(batch_paths.iter().cloned())
@@ -462,6 +495,7 @@ impl<'a> DeletionVectorWriter<'a> {
                 let mut completion = Some(cleanup_guard.completion());
                 let sequence_number = spec.sequence_number;
                 let table_name = self.table.table_name.clone();
+                let storage = self.storage.clone();
                 #[cfg(test)]
                 let test_hook = self.test_hook.as_ref().map(Arc::clone);
                 async move {
@@ -521,6 +555,7 @@ impl<'a> DeletionVectorWriter<'a> {
                     #[cfg(test)]
                     let file_size_bytes = write_deletion_file(
                         &file_path,
+                        storage.as_deref(),
                         Arc::clone(&schema),
                         batch,
                         &table_name,
@@ -531,6 +566,7 @@ impl<'a> DeletionVectorWriter<'a> {
                     #[cfg(not(test))]
                     let file_size_bytes = write_deletion_file(
                         &file_path,
+                        storage.as_deref(),
                         Arc::clone(&schema),
                         batch,
                         &table_name,
@@ -566,7 +602,7 @@ impl<'a> DeletionVectorWriter<'a> {
                     // from the failed logical batch before returning; otherwise a
                     // later failure or task cancellation at a caller could leak
                     // unreferenced deletion vectors indefinitely.
-                    cleanup_uncommitted_delete_paths(&batch_paths).await;
+                    cleanup_uncommitted_delete_paths(&batch_paths, self.storage.as_deref()).await;
                     cleanup_guard.disarm();
                     return Err(error);
                 }
@@ -670,6 +706,7 @@ impl<T: std::io::Read + std::io::Seek + Send> ReadSeek for T {}
 #[expect(clippy::type_complexity)]
 pub fn detect_deletion_type_and_read(
     delete_files: Vec<DeleteFile>,
+    storage: Option<&DatasetStorage>,
 ) -> datafusion_common::Result<(
     HashMap<String, RoaringBitmap>,
     HashMap<Box<[u8]>, i64>,
@@ -697,8 +734,8 @@ pub fn detect_deletion_type_and_read(
         tracing::debug!("detect_deletion_type_and_read: reading file {:?}", path);
 
         let opened: std::io::Result<Box<dyn ReadSeek>> =
-            if let Some((store, location)) = crate::resolve_object_url(&delete_file.path) {
-                match tokio::runtime::Handle::current()
+            match deletion_vector_location(storage, &delete_file.path) {
+                Ok(Some((store, location))) => match tokio::runtime::Handle::current()
                     .block_on(async { store.get(&location).await?.bytes().await })
                 {
                     Ok(bytes) => Ok(Box::new(std::io::Cursor::new(bytes))),
@@ -706,9 +743,9 @@ pub fn detect_deletion_type_and_read(
                         Err(std::io::Error::from(std::io::ErrorKind::NotFound))
                     }
                     Err(error) => Err(std::io::Error::other(error)),
-                }
-            } else {
-                std::fs::File::open(path).map(|f| Box::new(f) as Box<dyn ReadSeek>)
+                },
+                Ok(None) => std::fs::File::open(path).map(|f| Box::new(f) as Box<dyn ReadSeek>),
+                Err(error) => Err(std::io::Error::other(error)),
             };
         let file = match opened {
             Ok(file) => file,
@@ -900,6 +937,7 @@ fn build_key_based_batch(schema: &SchemaRef, row_keys: &[Box<[u8]>]) -> Result<R
 
 async fn write_deletion_file(
     file_path: &Path,
+    storage: Option<&DatasetStorage>,
     schema: SchemaRef,
     batch: RecordBatch,
     table_name: &str,
@@ -909,7 +947,13 @@ async fn write_deletion_file(
     let output_path = file_path.to_path_buf();
     let table_name = table_name.to_string();
 
-    if let Some((store, location)) = output_path.to_str().and_then(crate::resolve_object_url) {
+    let location =
+        deletion_vector_location(storage, &output_path.to_string_lossy()).map_err(|source| {
+            Error::IoError {
+                source: std::io::Error::other(source),
+            }
+        })?;
+    if let Some((store, location)) = location {
         let _completion = completion;
         let mut writer = FileWriter::try_new(Vec::new(), &schema)?;
         writer.write(&batch)?;
@@ -919,7 +963,9 @@ async fn write_deletion_file(
         store
             .put(&location, bytes.into())
             .await
-            .map_err(|source| Error::IoError { source: std::io::Error::other(source) })?;
+            .map_err(|source| Error::IoError {
+                source: std::io::Error::other(source),
+            })?;
         return Ok(len);
     }
 
@@ -986,14 +1032,26 @@ async fn write_deletion_file(
 
 /// Best-effort removal of physical deletion-vector files that were written but
 /// never committed to the catalog.
-pub(crate) async fn cleanup_uncommitted_delete_paths(paths: &[PathBuf]) {
+pub(crate) async fn cleanup_uncommitted_delete_paths(
+    paths: &[PathBuf],
+    storage: Option<&DatasetStorage>,
+) {
     for path in paths {
-        if let Some((store, location)) = path.to_str().and_then(crate::resolve_object_url) {
-            match store.delete(&location).await {
-                Ok(()) | Err(object_store::Error::NotFound { .. }) => {}
-                Err(error) => tracing::warn!(path = %path.display(), %error, "Failed to remove an uncommitted deletion-vector object"),
+        match deletion_vector_location(storage, &path.to_string_lossy()) {
+            Ok(Some((store, location))) => {
+                match store.delete(&location).await {
+                    Ok(()) | Err(object_store::Error::NotFound { .. }) => {}
+                    Err(error) => {
+                        tracing::warn!(path = %path.display(), %error, "Failed to remove an uncommitted deletion-vector object");
+                    }
+                }
+                continue;
             }
-            continue;
+            Ok(None) => {}
+            Err(error) => {
+                tracing::warn!(path = %path.display(), %error, "Failed to remove an uncommitted deletion-vector object");
+                continue;
+            }
         }
         if let Err(error) = tokio::fs::remove_file(path).await
             && error.kind() != std::io::ErrorKind::NotFound
@@ -1020,6 +1078,7 @@ pub(crate) async fn cleanup_uncommitted_delete_paths(paths: &[PathBuf]) {
 pub(crate) fn remove_dropped_deletion_vector_files(
     files: Vec<DeleteFile>,
     file_deletion_fence: Arc<tokio::sync::RwLock<()>>,
+    storage: Option<Arc<DatasetStorage>>,
 ) {
     let paths: Vec<PathBuf> = files
         .into_iter()
@@ -1032,13 +1091,20 @@ pub(crate) fn remove_dropped_deletion_vector_files(
     crate::provider::compaction::spawn_compaction(async move {
         let _deleting = file_deletion_fence.write().await;
         for path in paths {
-            if let Some((store, location)) = path.to_str().and_then(crate::resolve_object_url) {
-                if let Err(error) = store.delete(&location).await
-                    && !matches!(error, object_store::Error::NotFound { .. })
-                {
-                    tracing::debug!(path = %path.display(), %error, "Failed to remove a deletion-vector object no catalog row references");
+            match deletion_vector_location(storage.as_deref(), &path.to_string_lossy()) {
+                Ok(Some((store, location))) => {
+                    if let Err(error) = store.delete(&location).await
+                        && !matches!(error, object_store::Error::NotFound { .. })
+                    {
+                        tracing::debug!(path = %path.display(), %error, "Failed to remove a deletion-vector object no catalog row references");
+                    }
+                    continue;
                 }
-                continue;
+                Ok(None) => {}
+                Err(error) => {
+                    tracing::debug!(path = %path.display(), %error, "Failed to remove a deletion-vector object no catalog row references");
+                    continue;
+                }
             }
             if let Err(error) = tokio::fs::remove_file(&path).await
                 && error.kind() != std::io::ErrorKind::NotFound
@@ -1150,7 +1216,7 @@ mod tests {
     async fn writes_deletion_vector_and_returns_metadata() {
         let temp_dir = TempDir::new().expect("temp dir");
         let table_metadata = build_table_metadata(&temp_dir);
-        let writer = DeletionVectorWriter::new(&table_metadata);
+        let writer = DeletionVectorWriter::new(&table_metadata, None);
 
         let specs = vec![DeletionVectorWriteSpec::new_position_based(
             "test_file.vortex".to_string(),
@@ -1200,7 +1266,7 @@ mod tests {
     async fn skips_empty_specs() {
         let temp_dir = TempDir::new().expect("temp dir");
         let table_metadata = build_table_metadata(&temp_dir);
-        let writer = DeletionVectorWriter::new(&table_metadata);
+        let writer = DeletionVectorWriter::new(&table_metadata, None);
 
         let results = writer
             .write(vec![
@@ -1217,7 +1283,7 @@ mod tests {
     async fn rejects_position_ids_above_bitmap_range() {
         let temp_dir = TempDir::new().expect("temp dir");
         let table_metadata = build_table_metadata(&temp_dir);
-        let writer = DeletionVectorWriter::new(&table_metadata);
+        let writer = DeletionVectorWriter::new(&table_metadata, None);
         let results = writer
             .write(vec![DeletionVectorWriteSpec::new_position_based(
                 "large.vortex".to_string(),
@@ -1230,7 +1296,7 @@ mod tests {
             .into_iter()
             .map(|result| result.delete_file)
             .collect();
-        let error = detect_deletion_type_and_read(delete_files)
+        let error = detect_deletion_type_and_read(delete_files, None)
             .expect_err("oversized position must not be silently skipped");
 
         assert!(
@@ -1259,7 +1325,7 @@ mod tests {
         specs.push(DeletionVectorWriteSpec::new_key_based(vec![
             key(3 * groups),
         ]));
-        let results = DeletionVectorWriter::new(&table_metadata)
+        let results = DeletionVectorWriter::new(&table_metadata, None)
             .write(specs)
             .await
             .expect("write deletion vectors");
@@ -1277,6 +1343,7 @@ mod tests {
                 .into_iter()
                 .map(|result| result.delete_file)
                 .collect(),
+            None,
         )
         .expect("read the written deletion vectors back");
         assert!(positions.is_empty() && reinserted.is_empty() && missing.is_empty());

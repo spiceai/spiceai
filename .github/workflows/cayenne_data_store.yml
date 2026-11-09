@@ -1,0 +1,145 @@
+---
+name: Cayenne data store
+
+# Cayenne's data-path suites with every table's data files in an object store
+# rather than a local directory. Pull requests and the merge queue run them on
+# the in-memory store with bounded seeds; the nightly run adds RustFS, through
+# the S3 client, at full seed depth.
+on:
+  pull_request:
+    paths:
+      - 'crates/cayenne/**'
+      - 'crates/object_store_occ/**'
+      - '.github/workflows/cayenne_data_store.yml'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+      - 'rust-toolchain.toml'
+  merge_group:
+  schedule:
+    - cron: '0 8 * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: cayenne-data-store-${{ github.ref }}-${{ github.event_name }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: 0
+  RUSTC_WRAPPER: ''
+  RUSTC_WORKSPACE_WRAPPER: ''
+  # The suites that read and write data files: the property and model fuzz
+  # lanes, deletion vectors, reclamation, per-dataset stores and object-native data.
+  SUITES: >-
+    test(/^mutation_property_test::/) | test(/^mutation_model_test::/) |
+    test(/^deletion_vector/) | test(/^orphan_dv_compaction_test::/) |
+    test(/^object_store_reclaim_test::/) | test(/^per_dataset_store_test::/) |
+    test(/^object_native_data_test::/) | test(/^snapshot_cleanup_convergence_test::/)
+
+jobs:
+  lanes:
+    name: Data store (${{ matrix.store }})
+    # Runs the change's code on persistent self-hosted runners, so fork and
+    # Dependabot pull requests run it only from the merge queue.
+    if: >-
+      github.event_name != 'pull_request' ||
+      (github.event.pull_request.head.repo.full_name == github.repository &&
+      github.event.pull_request.user.login != 'dependabot[bot]')
+    strategy:
+      fail-fast: false
+      matrix:
+        store: ${{ github.event_name == 'schedule' && fromJson('["memory","rustfs"]') || fromJson('["memory"]') }}
+    runs-on: spiceai-dev-runners
+    timeout-minutes: 120
+    env:
+      CAYENNE_TEST_DATA_STORE: ${{ matrix.store }}
+      # Bounded seeds on pull requests and the queue; full depth nightly.
+      CAYENNE_PROPTEST_SCALE: ${{ github.event_name == 'schedule' && '1.0' || '0.25' }}
+      CAYENNE_PROPTEST_OPS_SCALE: ${{ github.event_name == 'schedule' && '1.0' || '0.25' }}
+      RUSTFS_CONTAINER: cayenne-data-${{ github.run_id }}-${{ github.run_attempt }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          fetch-depth: ${{ github.event_name == 'merge_group' && 0 || 1 }}
+      # A merge group cannot be filtered by path. Keep this list equal to the
+      # pull_request paths above.
+      - name: Check the merge group for data-path changes
+        id: changes
+        if: github.event_name == 'merge_group'
+        uses: ./.github/actions/check-code-changes
+        with:
+          filters: |
+            code_changes:
+              - 'crates/cayenne/**'
+              - 'crates/object_store_occ/**'
+              - '.github/workflows/cayenne_data_store.yml'
+              - 'Cargo.toml'
+              - 'Cargo.lock'
+              - 'rust-toolchain.toml'
+      - name: Decide whether to run
+        id: run
+        run: echo "run=${{ github.event_name != 'merge_group' || steps.changes.outputs.relevant_changes == 'true' }}" >> "$GITHUB_OUTPUT"
+      - uses: ./.github/actions/setup-rust
+        if: steps.run.outputs.run == 'true'
+      # The dev runner image has no C toolchain, and rustc links through cc.
+      - uses: ./.github/actions/setup-cc
+        if: steps.run.outputs.run == 'true'
+      - uses: ./.github/actions/install-protoc
+        if: steps.run.outputs.run == 'true'
+      - uses: ./.github/actions/setup-nextest
+        if: steps.run.outputs.run == 'true'
+
+      - name: Start RustFS
+        if: steps.run.outputs.run == 'true' && matrix.store == 'rustfs'
+        env:
+          ACCESS_KEY: cayenne-data
+          SECRET_KEY: cayenne-data-secret
+          BUCKET: cayenne-data
+        run: |
+          set -euo pipefail
+          image=rustfs/rustfs:1.0.1@sha256:1803faef57627e2d9c2e7d89d655d712ddded5389040054987163043fecb6a3c
+          docker run -d --name "$RUSTFS_CONTAINER" --publish 127.0.0.1::9000 \
+            -e RUSTFS_ACCESS_KEY="$ACCESS_KEY" -e RUSTFS_SECRET_KEY="$SECRET_KEY" "$image" /data
+          port=$(docker port "$RUSTFS_CONTAINER" 9000/tcp | head -n 1 | sed 's/.*://')
+          endpoint="http://127.0.0.1:${port:?no published port for the RustFS container}"
+          # The first signed request that succeeds is also the readiness check.
+          code=000
+          for _ in $(seq 1 60); do
+            code=$(curl -sS -o /dev/null -w '%{http_code}' -X PUT \
+              --aws-sigv4 "aws:amz:us-east-1:s3" --user "$ACCESS_KEY:$SECRET_KEY" \
+              -H 'x-amz-content-sha256: e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855' \
+              "$endpoint/$BUCKET") || true
+            [ "$code" = 200 ] && break
+            sleep 1
+          done
+          if [ "$code" != 200 ]; then
+            echo "::error::RustFS did not create bucket '$BUCKET' at $endpoint within 60 seconds; the last answer was HTTP $code."
+            docker logs "$RUSTFS_CONTAINER" | tail -n 100
+            exit 1
+          fi
+          {
+            echo "CAYENNE_TEST_RUSTFS_ENDPOINT=$endpoint"
+            echo "CAYENNE_TEST_RUSTFS_BUCKET=$BUCKET"
+            echo "CAYENNE_TEST_RUSTFS_ACCESS_KEY=$ACCESS_KEY"
+            echo "CAYENNE_TEST_RUSTFS_SECRET_KEY=$SECRET_KEY"
+          } >> "$GITHUB_ENV"
+
+      # retries = 0: a seeded walk that fails prints its seed and history, and a
+      # retry could only hide it.
+      - name: Run the data-path suites on the ${{ matrix.store }} store
+        if: steps.run.outputs.run == 'true'
+        run: cargo nextest run --locked -p cayenne --test integration --retries 0 --no-fail-fast -E "$SUITES"
+      # Session credentials that expire mid-run need RustFS's STS.
+      - name: Run the session-credential test against RustFS
+        if: steps.run.outputs.run == 'true' && matrix.store == 'rustfs'
+        run: cargo nextest run --locked -p cayenne --test integration --retries 0 --run-ignored only -E 'test(/^session_credentials_test::/)'
+
+      - name: Stop RustFS
+        if: always() && matrix.store == 'rustfs'
+        run: |
+          docker logs "$RUSTFS_CONTAINER" 2>&1 | tail -n 200 || true
+          docker rm -f "$RUSTFS_CONTAINER" > /dev/null 2>&1 || true

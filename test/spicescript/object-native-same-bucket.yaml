@@ -1,0 +1,104 @@
+name: object-native-same-bucket
+description: >
+  An S3 source whose files share a bucket with the state location: one dataset
+  accelerated with Cayenne, whose data files are in the state location, and one
+  federated dataset over the same files. Each reaches its own storage whichever
+  registered a store for the bucket last, so both match the source at start,
+  after the files change and the acceleration refreshes, and after a restart.
+  Also with the state location in a bucket of the same name on another store,
+  and with no state location.
+
+sources:
+  src: { kind: rustfs }
+  ref: { kind: postgres }
+  # Another store, for the state location of the other-store variant. Its
+  # bucket has the same name as the source's (one name per instance), so the
+  # two share a `s3://<bucket>` URL while living on different endpoints.
+  lake: { kind: rustfs }
+
+variants:
+  # The state location in the source's own bucket.
+  same-bucket:
+    spicepod:
+      runtime:
+        params: { cayenne_vnext: enabled }
+        state:
+          location: s3://${sources.src.bucket}/state/
+          params:
+            s3_endpoint: ${sources.src.endpoint}
+            s3_region: us-east-1
+            s3_auth: key
+            s3_key: ${sources.src.key}
+            s3_secret: ${sources.src.secret}
+            allow_http: 'true'
+  other-store: object-native-data-rustfs
+  no-state-location: {}
+
+spicepod:
+  version: v1
+  kind: Spicepod
+  name: object-native-same-bucket
+  datasets:
+    - from: '${sources.src.from_prefix}facts${sources.src.from_suffix}'
+      name: facts_acc
+      params: ${sources.src.table_params}
+      acceleration: { enabled: true, engine: cayenne, mode: file, refresh_mode: full, refresh_check_interval: 1h }
+    - from: '${sources.src.from_prefix}facts${sources.src.from_suffix}'
+      name: facts_fed
+      params: ${sources.src.table_params}
+
+defaults:
+  expect: { oracle: ref }
+  query-timeout: 30s
+
+steps:
+  - generate:
+      src: &facts
+        table: facts
+        rows: 20000
+        seed: 41
+        files: 3
+        columns:
+          - { name: id, sequence: 1 }
+          - { name: grp, int: [1, 200] }
+          - { name: amount, decimal: { range: [0, 1000], scale: 2 } }
+          - { name: label, choice: [alpha, beta, gamma, delta] }
+    mirror: ref
+  - start: {}
+  - query: SELECT count(*) AS n, sum(amount) AS total FROM facts_acc
+    oracle-sql: SELECT count(*) AS n, sum(amount) AS total FROM facts
+  - query: SELECT count(*) AS n, sum(amount) AS total FROM facts_fed
+    oracle-sql: SELECT count(*) AS n, sum(amount) AS total FROM facts
+  - query: SELECT * FROM facts_fed WHERE grp = 17 ORDER BY id
+    oracle-sql: SELECT * FROM facts WHERE grp = 17 ORDER BY id
+  # The accelerated dataset's files are in the state location, in the
+  # source's bucket.
+  - assert-objects: { source: src, prefix: state/cayenne/v1/datasets/facts_acc-, contains: /data/, min: 1 }
+    only: same-bucket
+
+  # Every row replaced; the acceleration picks them up on refresh, and the
+  # federated dataset reads them directly.
+  - generate:
+      src:
+        <<: *facts
+        seed: 42
+        files: 2
+    mirror: ref
+  - refresh: facts_acc
+  - query: SELECT count(*) AS n, sum(amount) AS total FROM facts_acc
+    oracle-sql: SELECT count(*) AS n, sum(amount) AS total FROM facts
+    eventually: 60s
+  - query: SELECT count(*) AS n, sum(amount) AS total FROM facts_fed
+    oracle-sql: SELECT count(*) AS n, sum(amount) AS total FROM facts
+    eventually: 30s
+
+  - restart: {}
+  - query: SELECT count(*) AS n, sum(amount) AS total FROM facts_acc
+    oracle-sql: SELECT count(*) AS n, sum(amount) AS total FROM facts
+    eventually: 60s
+  - query: SELECT label, count(*) AS n, sum(amount) AS total FROM facts_acc GROUP BY label ORDER BY label
+    oracle-sql: SELECT label, count(*) AS n, sum(amount) AS total FROM facts GROUP BY label ORDER BY label
+  - query: SELECT count(*) AS n, sum(amount) AS total FROM facts_fed
+    oracle-sql: SELECT count(*) AS n, sum(amount) AS total FROM facts
+  - query: SELECT * FROM facts_fed WHERE grp = 17 ORDER BY id
+    oracle-sql: SELECT * FROM facts WHERE grp = 17 ORDER BY id

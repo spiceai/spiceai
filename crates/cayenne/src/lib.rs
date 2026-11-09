@@ -66,12 +66,12 @@ pub mod hll;
 pub use ddl::CayenneDdlHandler;
 pub(crate) mod bounded_fifo;
 pub mod cte_materialization;
+pub mod dataset_storage;
 pub mod logical_optimizer;
 pub mod maintained_aggregate;
 pub mod metadata;
 pub mod metastore;
 pub mod metastore_layout;
-pub mod store_routing;
 
 /// Cold-tier clustering kernel, re-exported for benchmarks only. Not a stable API.
 #[doc(hidden)]
@@ -166,13 +166,17 @@ pub use provider::{
 };
 pub use schema::{CAYENNE_TYPE_REWRITE_RULES, transform_schema_for_vortex};
 
-/// Whether a table path names an object-store location (`s3://`, or a local
-/// directory addressed as `file://`), so every data operation goes through the
-/// table's `ObjectStore` rather than the local filesystem. Prototype: a local
-/// table in file mode is given a `file://` path.
+/// Whether a table path names an object-store location (`s3://`, a local
+/// directory addressed as `file://`, or a dataset's run-time URL `cayenne://`;
+/// see [`dataset_storage`]), so every data operation goes through the table's
+/// `ObjectStore` rather than the local filesystem.
 #[must_use]
 pub fn is_object_store_path(path: &str) -> bool {
-    path.starts_with("s3://") || path.starts_with("file://")
+    path.starts_with("s3://")
+        || path.starts_with("file://")
+        || path
+            .strip_prefix(dataset_storage::DATASET_STORE_SCHEME)
+            .is_some_and(|rest| rest.starts_with("://"))
 }
 
 /// `prefix/name` as an object path. [`object_store::path::Path`] keeps no trailing
@@ -198,41 +202,46 @@ pub(crate) fn object_relative<'a>(
     location.as_ref().strip_prefix(prefix)?.strip_prefix('/')
 }
 
-/// Records `store` as the store for every object under `url`'s path (a dataset's
-/// data path), so code that holds only a file's URL (deletion vectors, sweeps)
-/// reaches that dataset's store, and returns the routing store to register for
-/// `url`'s scheme and host in a `DataFusion` runtime. See [`store_routing`].
-pub fn register_object_store(
-    url: &url::Url,
-    store: std::sync::Arc<dyn object_store::ObjectStore>,
-) -> std::sync::Arc<store_routing::PrefixRoutingStore> {
-    store_routing::register(url, store)
-}
+#[cfg(test)]
+mod object_key_tests {
+    use super::{object_child, object_relative};
+    use object_store::path::Path;
 
-/// The store and object path of a file addressed by URL (`s3://…`, `file://…`);
-/// `None` for a plain local path or a URL no dataset registered a store for.
-#[must_use]
-pub(crate) fn resolve_object_url(
-    location: &str,
-) -> Option<(std::sync::Arc<dyn object_store::ObjectStore>, object_store::path::Path)> {
-    if !is_object_store_path(location) {
-        return None;
+    /// The joins every former `format!("{prefix}{name}")` site now uses: an object
+    /// path keeps no trailing `/`, so string concatenation fused the prefix's last
+    /// segment with the name (`t/stagingwal.json` rather than `t/staging/wal.json`).
+    #[test]
+    fn a_child_key_has_exactly_one_separator() {
+        let prefix = Path::from("data/orders/01a1/_staging");
+        assert_eq!(
+            object_child(&prefix, "wal.json").as_ref(),
+            "data/orders/01a1/_staging/wal.json"
+        );
+        assert_eq!(
+            object_child(&prefix, "sub/part.vortex").as_ref(),
+            "data/orders/01a1/_staging/sub/part.vortex"
+        );
+        assert_eq!(object_child(&Path::from(""), "wal.json").as_ref(), "wal.json");
     }
-    let url = url::Url::parse(location).ok()?;
-    let path = object_store::path::Path::from_url_path(url.path()).ok()?;
-    let store: std::sync::Arc<dyn object_store::ObjectStore> = match store_routing::router_for(&url) {
-        Some(router) => router,
-        None if url.scheme() == "file" => durable_local_object_store(),
-        None => return None,
-    };
-    Some((store, path))
-}
 
-/// Prototype: the durable local-directory store that every local file-mode table
-/// writes and reads through, registered for `file:///` in the table's `RuntimeEnv`.
-#[must_use]
-pub fn durable_local_object_store() -> std::sync::Arc<dyn object_store::ObjectStore> {
-    static STORE: std::sync::LazyLock<std::sync::Arc<dyn object_store::ObjectStore>> =
-        std::sync::LazyLock::new(|| std::sync::Arc::new(object_store_occ::DurableLocalFileSystem::new()));
-    std::sync::Arc::clone(&STORE)
+    /// The inverse: relative to a prefix only on a segment boundary, without the
+    /// separating `/`.
+    #[test]
+    fn a_relative_key_strips_the_prefix_on_a_segment_boundary() {
+        let prefix = Path::from("data/orders/01a1/snap");
+        let inside = Path::from("data/orders/01a1/snap/part_0.vortex");
+        let nested = Path::from("data/orders/01a1/snap/deletions/d.arrow");
+        let sibling = Path::from("data/orders/01a1/snapshot/part_0.vortex");
+        assert_eq!(object_relative(&prefix, &inside), Some("part_0.vortex"));
+        assert_eq!(object_relative(&prefix, &nested), Some("deletions/d.arrow"));
+        assert_eq!(object_relative(&prefix, &sibling), None);
+        assert_eq!(object_relative(&prefix, &prefix), None);
+        assert_eq!(
+            object_relative(&Path::from(""), &inside),
+            Some("data/orders/01a1/snap/part_0.vortex")
+        );
+        for name in ["part_0.vortex", "deletions/d.arrow"] {
+            assert_eq!(object_relative(&prefix, &object_child(&prefix, name)), Some(name));
+        }
+    }
 }

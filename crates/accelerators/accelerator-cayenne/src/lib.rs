@@ -291,6 +291,15 @@ pub enum Error {
         metadata_dir: String,
     },
 
+    /// An object-store data path (an `s3://` `cayenne_file_path`, or
+    /// `cayenne_s3_zone_ids`) with `runtime.params.cayenne_vnext` off.
+    #[snafu(display("{}", object_store_data_path_refusal(dataset, path.as_deref())))]
+    ObjectStoreDataPathRefused {
+        dataset: Arc<str>,
+        /// The `cayenne_file_path` value; `None` when only `cayenne_s3_zone_ids` is set.
+        path: Option<String>,
+    },
+
     #[snafu(display(
         "Unsupported data type(s) in schema: {details}. By default, unsupported types cause an error. To convert unsupported types to strings, set 'unsupported_type_action: string'; otherwise, remove the unsupported columns."
     ))]
@@ -508,9 +517,6 @@ pub struct CayenneAccelerator {
     /// Datasets already told that they stay on SQLite under `cayenne_vnext`, so
     /// the line is logged once per dataset, not on every metastore lookup.
     vnext_notices: parking_lot::Mutex<HashSet<String>>,
-    /// Whether `runtime.state.location` held an object-native catalog when first
-    /// asked, so a dataset load asks the store once, not on every lookup.
-    native_presence: tokio::sync::OnceCell<bool>,
     /// Separate catalog for `mode: memory` (in-RAM) tables, backed by an in-memory
     /// `SQLite` `memdb` metastore. File-mode and memory-mode tables cannot share one
     /// metastore (memory-mode data must never touch disk), so memory tables use this.
@@ -1431,6 +1437,21 @@ fn rebuild_held(acceleration: Option<&Acceleration>) -> bool {
     })
 }
 
+/// The text of [`Error::ObjectStoreDataPathRefused`]: with `runtime.params.cayenne_vnext`
+/// off, a dataset's own data cannot be in an object store. `path` is the
+/// `cayenne_file_path` value, or `None` when only `cayenne_s3_zone_ids` places it there.
+fn object_store_data_path_refusal(dataset: &str, path: Option<&str>) -> String {
+    let what = match path {
+        Some(path) => format!("`cayenne_file_path` '{path}' is an object-store path"),
+        None => "`cayenne_s3_zone_ids` puts its data in an object store".to_string(),
+    };
+    format!(
+        "Failed to load dataset '{dataset}' (cayenne): {what}, which Cayenne does not support for a dataset's own data. \
+        Remove `cayenne_file_path` (and `cayenne_s3_zone_ids`) to keep the data on local disk; Cayenne data in a bucket comes with `runtime.state.location`. \
+        See: https://spiceai.org/docs/components/data-accelerators/cayenne"
+    )
+}
+
 /// The `SQLite` database a Cayenne metastore lives in, inside its metadata
 /// directory. Every metastore connection string in this file ends in this name.
 const METASTORE_DB_FILE: &str = "cayenne.db";
@@ -1489,10 +1510,12 @@ async fn is_turso_metastore(db_path: &Path) -> bool {
 ///
 /// The suffix must start with `-`, so a dataset directory that happens to be named
 /// `cayenne.db.backup` is not mistaken for one.
-fn is_metastore_file(file_name: &std::ffi::OsStr) -> bool {
-    // The object-native metastore keeps its log in a conditional-write store,
-    // whose root holds this lock from its first write.
-    if file_name == OBJECT_STORE_ROOT_LOCK {
+///
+/// With `object_native` (`runtime.params.cayenne_vnext` enabled), the lock at the root
+/// of a local conditional-write store marks one too: the object-native metastore keeps
+/// its log there. With the flag off nothing reads that log, so it is not a metastore.
+fn is_metastore_file(file_name: &std::ffi::OsStr, object_native: bool) -> bool {
+    if object_native && file_name == OBJECT_STORE_ROOT_LOCK {
         return true;
     }
     match file_name.to_string_lossy().strip_prefix(METASTORE_DB_FILE) {
@@ -1531,7 +1554,10 @@ fn is_metastore_file(file_name: &std::ffi::OsStr) -> bool {
 /// The walk is linear in the entries under `data_dir` — the work the `remove_dir_all`
 /// immediately after it was going to do regardless. A missing `data_dir` is not an error
 /// here, so the removal is left to report it.
-async fn metastore_file_under(data_dir: &Path) -> std::io::Result<Option<PathBuf>> {
+async fn metastore_file_under(
+    data_dir: &Path,
+    object_native: bool,
+) -> std::io::Result<Option<PathBuf>> {
     let root = match tokio::fs::symlink_metadata(data_dir).await {
         // A `data_dir` that is itself a link is dereferenced once and then walked. The
         // teardown unlinks the link and the caller recreates a real, empty directory in
@@ -1576,7 +1602,7 @@ async fn metastore_file_under(data_dir: &Path) -> std::io::Result<Option<PathBuf
 
             if file_type.is_dir() {
                 pending.push(entry.path());
-            } else if is_metastore_file(&entry.file_name()) {
+            } else if is_metastore_file(&entry.file_name(), object_native) {
                 // Classified by name before the link check, because the name is what a
                 // `cayenne_metadata_dir` points at: SQLite opens the database through a
                 // link occupying it just as it does a file, and the teardown unlinks the
@@ -1585,7 +1611,7 @@ async fn metastore_file_under(data_dir: &Path) -> std::io::Result<Option<PathBuf
                 // helper's subject being a link to a metadata *directory*.
                 return Ok(Some(entry.path()));
             } else if file_type.is_symlink()
-                && let Some(aliased) = catalog_directly_inside(&entry.path()).await?
+                && let Some(aliased) = catalog_directly_inside(&entry.path(), object_native).await?
             {
                 return Ok(Some(aliased));
             }
@@ -1602,7 +1628,10 @@ async fn metastore_file_under(data_dir: &Path) -> std::io::Result<Option<PathBuf
 /// [`metastore_file_under`]: this answers only "is this link an alias for a metadata
 /// directory", the shape that costs a catalog its name when the link is unlinked. A link
 /// resolving to a file, to nothing, or to a directory with no catalog in it is not one.
-async fn catalog_directly_inside(link: &Path) -> std::io::Result<Option<PathBuf>> {
+async fn catalog_directly_inside(
+    link: &Path,
+    object_native: bool,
+) -> std::io::Result<Option<PathBuf>> {
     match tokio::fs::metadata(link).await {
         Ok(metadata) if metadata.is_dir() => {}
         // A dangling link, or one naming a file, aliases no metadata directory.
@@ -1617,7 +1646,7 @@ async fn catalog_directly_inside(link: &Path) -> std::io::Result<Option<PathBuf>
         Err(error) => return Err(error),
     };
     while let Some(entry) = entries.next_entry().await? {
-        if !is_metastore_file(&entry.file_name()) {
+        if !is_metastore_file(&entry.file_name(), object_native) {
             continue;
         }
         // Reports on the entry itself, as the main walk's does; an entry that vanished
@@ -1696,7 +1725,6 @@ impl CayenneAccelerator {
             catalog: Arc::new(OnceCell::new()),
             native_catalog: Arc::new(OnceCell::new()),
             vnext_notices: parking_lot::Mutex::new(HashSet::new()),
-            native_presence: tokio::sync::OnceCell::new(),
             memory_catalog: Arc::new(OnceCell::new()),
             instance_id: CAYENNE_ACCELERATOR_INSTANCE_COUNTER
                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed),
@@ -1739,12 +1767,12 @@ impl CayenneAccelerator {
             });
         };
 
+        Self::ensure_data_path_supported(source)?;
         let acceleration_params = acceleration.params.clone();
         let dataset_name = source.name().to_string().replace(['.', '/'], "_");
 
         if let Some(custom_path) = acceleration_params.get("cayenne_file_path") {
-            let allow_standard_s3 = Self::vnext_enabled(source)?;
-            return Self::resolve_custom_data_path(&dataset_name, custom_path, allow_standard_s3);
+            return Ok(Self::resolve_custom_data_path(&dataset_name, custom_path));
         }
 
         if let Some(zone_ids) = acceleration_params.get("cayenne_s3_zone_ids") {
@@ -1772,6 +1800,7 @@ impl CayenneAccelerator {
     /// Returns a vector of S3 paths, one for each zone. The first zone is the primary zone
     /// used for reads; all zones are used for writes (ACID replication).
     fn cayenne_data_dirs_multi_zone(&self, source: &dyn AccelerationSource) -> Result<Vec<String>> {
+        Self::ensure_data_path_supported(source)?;
         let zone_ids = s3::get_s3_zone_ids(source).context(S3Snafu)?;
         if zone_ids.is_empty() {
             // No multi-zone config, return single path
@@ -1807,14 +1836,35 @@ impl CayenneAccelerator {
         paths
     }
 
-    fn resolve_custom_data_path(
-        dataset_name: &str,
-        custom_path: &str,
-        allow_standard_s3: bool,
-    ) -> Result<String> {
-        s3::validate_file_path(custom_path, allow_standard_s3).context(S3Snafu)?;
+    fn resolve_custom_data_path(dataset_name: &str, custom_path: &str) -> String {
         let base = custom_path.trim_end_matches('/');
-        Ok(format!("{base}/{dataset_name}/"))
+        format!("{base}/{dataset_name}/")
+    }
+
+    /// Refuses a file-mode dataset whose own data would be in an object store (an
+    /// `s3://` `cayenne_file_path`, S3 Express included, or `cayenne_s3_zone_ids`)
+    /// unless `runtime.params.cayenne_vnext` is enabled, where that path stays
+    /// available for testing. Local data paths are unaffected.
+    fn ensure_data_path_supported(source: &dyn AccelerationSource) -> Result<()> {
+        let Some(acceleration) = source.acceleration() else {
+            return Ok(());
+        };
+        if !source.is_file_accelerated() || Self::vnext_enabled(source)? {
+            return Ok(());
+        }
+        let refused = match acceleration.params.get("cayenne_file_path") {
+            Some(path) if path.starts_with("s3://") => Some(Some(path.clone())),
+            _ if acceleration.params.contains_key("cayenne_s3_zone_ids") => Some(None),
+            _ => None,
+        };
+        match refused {
+            Some(path) => ObjectStoreDataPathRefusedSnafu {
+                dataset: Arc::from(source.name().to_string()),
+                path,
+            }
+            .fail(),
+            None => Ok(()),
+        }
     }
 
     fn resolve_auto_s3_data_path(
@@ -1867,9 +1917,8 @@ impl CayenneAccelerator {
     ) -> Result<()> {
         // With `cayenne_vnext` enabled, the object-native metastore lives under a local
         // `runtime.state.location` rather than the metadata directory when one is set.
-        // Disabled, the state location holds no metastore of this instance's making;
-        // one left there by an earlier enabled run is found on disk before a delete by
-        // `ensure_no_catalog_under_data_dir`.
+        // Disabled, Cayenne reads no metastore there, so the state location is not
+        // checked.
         let app = source.app();
         let state_dir = Self::vnext_enabled(source)?
             .then_some(app.runtime.state.as_ref())
@@ -1912,19 +1961,6 @@ impl CayenneAccelerator {
         Ok(())
     }
 
-    /// Delete an acceleration's data directory, having first proved it holds no Cayenne
-    /// metastore.
-    ///
-    /// Every teardown goes through here rather than calling `remove_dir_all` beside its
-    /// own copy of the proof, so a teardown path added later cannot forget one half of
-    /// it. Both halves are needed and neither implies the other:
-    ///
-    /// - [`Self::ensure_metastore_outside_data_dir`] answers for the metastore this
-    ///   dataset's params name, including one that only exists once Cayenne creates it,
-    ///   and including one reached through a symlink it would recreate.
-    /// - [`metastore_file_under`] answers for a metastore that is on disk under the
-    ///   directory whoever configured it — another dataset, or a configuration nothing
-    ///   names any more. Nothing on the params path can see those.
     /// Deletes every object under the object-store data path `data_dir` through
     /// the dataset's store, for `mode: file_create`, and returns how many it deleted.
     async fn remove_object_store_data(
@@ -1959,6 +1995,19 @@ impl CayenneAccelerator {
         Ok(deleted.len())
     }
 
+    /// Delete an acceleration's data directory, having first proved it holds no Cayenne
+    /// metastore.
+    ///
+    /// Every teardown goes through here rather than calling `remove_dir_all` beside its
+    /// own copy of the proof, so a teardown path added later cannot forget one half of
+    /// it. Both halves are needed and neither implies the other:
+    ///
+    /// - [`Self::ensure_metastore_outside_data_dir`] answers for the metastore this
+    ///   dataset's params name, including one that only exists once Cayenne creates it,
+    ///   and including one reached through a symlink it would recreate.
+    /// - [`metastore_file_under`] answers for a metastore that is on disk under the
+    ///   directory whoever configured it — another dataset, or a configuration nothing
+    ///   names any more. Nothing on the params path can see those.
     async fn remove_acceleration_data_dir(
         source: &dyn AccelerationSource,
         data_dir: &str,
@@ -2023,7 +2072,7 @@ impl CayenneAccelerator {
         source: &dyn AccelerationSource,
         data_dir: &str,
     ) -> Result<()> {
-        let found = metastore_file_under(Path::new(data_dir))
+        let found = metastore_file_under(Path::new(data_dir), Self::vnext_enabled(source)?)
             .await
             .map_err(|source_error| Error::MetastoreScanFailed {
                 table_name: source.name().to_string(),
@@ -3054,46 +3103,36 @@ impl CayenneAccelerator {
         }
     }
 
-    /// The metastore holding `source`'s file-mode acceleration. A new dataset goes to the metastore
-    /// `cayenne_vnext` names: object-native when enabled, SQLite otherwise. An
-    /// existing dataset is never moved: one whose metastore differs from the flag
-    /// is an error naming the dataset and the fix, except under `mode: file_create`,
-    /// which recreates it from its source in the metastore the flag names. With the
-    /// flag disabled, an instance that never used the object-native metastore checks
-    /// only its local metadata directory.
+    /// The metastore holding `source`'s file-mode acceleration. With
+    /// `runtime.params.cayenne_vnext` off it is SQLite, with no other lookup: a
+    /// dataset created under the flag reloads from its source, and its copy in the
+    /// object-native metastore is left as it is. With the flag on, a new dataset goes
+    /// to the object-native metastore and one already on SQLite is an error naming
+    /// the dataset and the fix, except under `mode: file_create`, which recreates it
+    /// from its source in the object-native metastore.
     async fn metastore_type_for(
         &self,
         source: &dyn AccelerationSource,
         metadata_dir: &str,
     ) -> Result<&'static str> {
         // A `mode: memory` table keeps its metastore in RAM.
-        if !source.is_file_accelerated() {
+        if !source.is_file_accelerated() || !Self::vnext_enabled(source)? {
             return Ok("sqlite");
         }
-        let vnext = Self::vnext_enabled(source)?;
         let recreated = source
             .acceleration()
             .is_some_and(|acceleration| acceleration.mode == Mode::FileCreate);
         let table_name = source.name().to_string();
-        // The local `object_native` directory holds the catalog, or records that this
-        // instance uses one in `runtime.state.location`.
-        let in_native = (vnext || path_exists(format!("{metadata_dir}/object_native")).await)
-            && self.native_catalog_exists(metadata_dir, source).await?
-            && self
-                .catalog_holds(metadata_dir, "object_native", source, &table_name)
-                .await?;
-        // Without the flag, an instance that never used the object-native metastore
-        // keeps SQLite after one local check.
-        if !vnext && !in_native {
-            return Ok("sqlite");
-        }
         let in_sqlite = path_exists(format!("{metadata_dir}/cayenne.db")).await
             && self
                 .catalog_holds(metadata_dir, "sqlite", source, &table_name)
                 .await?;
         if in_sqlite {
+            // Kept so turning the flag off and on again cannot serve a stale copy
+            // from the object-native metastore, which missed every change made while
+            // the dataset was on SQLite.
             ensure!(
-                !vnext || recreated,
+                recreated,
                 InvalidConfigurationSnafu {
                     detail: Arc::from(format!(
                         "Dataset '{table_name}' is accelerated in the SQLite Cayenne metastore, but `runtime.params.{CAYENNE_VNEXT_PARAM}` is enabled, and an existing acceleration is not moved to the object-native metastore. Set `runtime.params.{CAYENNE_VNEXT_PARAM}: disabled` to keep serving it, or start it once with `acceleration.mode: file_create` to reload it from its source into the object-native metastore."
@@ -3104,16 +3143,6 @@ impl CayenneAccelerator {
             // lands in the object-native metastore.
             return Ok("sqlite");
         }
-        if in_native {
-            ensure!(
-                vnext || recreated,
-                InvalidConfigurationSnafu {
-                    detail: Arc::from(format!(
-                        "Dataset '{table_name}' is accelerated in the object-native Cayenne metastore, but `runtime.params.{CAYENNE_VNEXT_PARAM}` is not enabled, and an existing acceleration is not moved to the SQLite metastore. Set `runtime.params.{CAYENNE_VNEXT_PARAM}: enabled` to keep serving it, or start it once with `acceleration.mode: file_create` to reload it from its source into the SQLite metastore."
-                    )),
-                }
-            );
-        }
         if source
             .acceleration()
             .is_some_and(|acceleration| !acceleration.partition_by.is_empty())
@@ -3121,6 +3150,9 @@ impl CayenneAccelerator {
             // The object-native metastore does not hold partitioned tables yet.
             // One already in it is refused rather than moved to a new, empty
             // SQLite table that would strand its rows.
+            let in_native = self
+                .catalog_holds(metadata_dir, "object_native", source, &table_name)
+                .await?;
             ensure!(
                 !in_native,
                 InvalidConfigurationSnafu {
@@ -3132,8 +3164,6 @@ impl CayenneAccelerator {
             self.vnext_notice(&table_name, "uses the SQLite Cayenne metastore although `runtime.params.cayenne_vnext` is enabled, because the new metastore does not support `partition_by` yet.");
             return Ok("sqlite");
         }
-        // `mode: file_create` with the flag disabled drops the object-native copy
-        // and recreates the table, which then lands in SQLite.
         Ok("object_native")
     }
 
@@ -3162,58 +3192,6 @@ impl CayenneAccelerator {
             .context(AccelerationInitializationFailedSnafu)?
             .iter()
             .any(|name| name == table_name))
-    }
-
-    /// Whether an object-native catalog was created for this metadata directory
-    /// (or `runtime.state.location`), read without creating one.
-    async fn native_catalog_exists(
-        &self,
-        metadata_dir: &str,
-        source: &dyn AccelerationSource,
-    ) -> Result<bool> {
-        if self.native_catalog.get().is_some() {
-            return Ok(true);
-        }
-        let Some(state) = source.app().runtime.state.clone() else {
-            return Ok(path_exists(format!("{metadata_dir}/object_native/catalog/head")).await);
-        };
-        // One request per process: only this accelerator creates the catalog,
-        // and a created one answers from the cell above. An error is not kept.
-        self.native_presence
-            .get_or_try_init(|| Self::state_location_has_native_catalog(source, state))
-            .await
-            .copied()
-    }
-
-    async fn state_location_has_native_catalog(
-        source: &dyn AccelerationSource,
-        state: spicepod::component::runtime::RuntimeState,
-    ) -> Result<bool> {
-        let location = spicepod::component::runtime::StateLocation {
-            location: state.location.clone(),
-            params: state.params.clone(),
-            source: spicepod::component::runtime::StateSource::RuntimeState,
-        };
-        let (store, prefix) = runtime_state_location::build_object_store(
-            source.secrets(),
-            tokio::runtime::Handle::current(),
-            &location,
-            runtime_state_location::StateFeature::CayenneMetastore,
-        )
-        .await
-        .boxed()
-        .context(AccelerationInitializationFailedSnafu)?;
-        let head = object_store::path::Path::from(prefix)
-            .join("v1")
-            .join("catalog")
-            .join("head");
-        match object_store::ObjectStoreExt::head(store.as_ref(), &head).await {
-            Ok(_) => Ok(true),
-            Err(object_store::Error::NotFound { .. }) => Ok(false),
-            Err(error) => Err(error)
-                .boxed()
-                .context(AccelerationInitializationFailedSnafu),
-        }
     }
 
     async fn get_or_create_catalog(
@@ -3398,8 +3376,7 @@ impl CayenneAccelerator {
                         Arc::clone(&store),
                         runtime_state_location::StateFeature::CayenneData,
                     );
-                    let native =
-                        cayenne::metastore::object_native::ObjectNativeCatalog::open_or_create_at(
+                    cayenne::metastore::object_native::ObjectNativeCatalog::open_or_create_at(
                             runtime_state_location::metrics::metered(
                                 store,
                                 runtime_state_location::StateFeature::CayenneMetastore,
@@ -3410,21 +3387,7 @@ impl CayenneAccelerator {
                             &format!("{}/cayenne/v1", state.location.trim_end_matches('/')),
                         )
                         .await
-                        .map(|native| native.with_data_store(data_store));
-                    if native.is_ok() {
-                        // A local record that this instance uses the catalog in the state
-                        // location, so a start with `cayenne_vnext` disabled finds it on
-                        // local disk and asks the state location only then.
-                        tokio::fs::create_dir_all(&directory)
-                            .await
-                            .boxed()
-                            .context(AccelerationInitializationFailedSnafu)?;
-                        tokio::fs::write(directory.join("state_location"), &state.location)
-                            .await
-                            .boxed()
-                            .context(AccelerationInitializationFailedSnafu)?;
-                    }
-                    native
+                        .map(|native| native.with_data_store(data_store))
                 }
                 None => {
                     cayenne::metastore::object_native::ObjectNativeCatalog::open_or_create_local(
@@ -3673,29 +3636,30 @@ impl CayenneAccelerator {
         let (dir_path, object_store) = if let Some(placement) = placement {
             (placement.base_path, Some(placement.store))
         } else if local_through_store && object_store.is_none() && !dir_path.starts_with("s3://") {
-                let abs = tokio::fs::canonicalize(dir_path)
-                    .await
-                    .boxed()
-                    .context(AccelerationCreationFailedSnafu)?;
-                let dir_url = url::Url::from_directory_path(&abs).map_err(|()| {
-                    Error::InvalidConfiguration {
-                        detail: Arc::from(format!(
-                            "Cannot address data directory '{}' as a file:// URL",
-                            abs.display()
-                        )),
-                    }
+            let abs = tokio::fs::canonicalize(dir_path)
+                .await
+                .boxed()
+                .context(AccelerationCreationFailedSnafu)?;
+            let dir_url =
+                url::Url::from_directory_path(&abs).map_err(|()| Error::InvalidConfiguration {
+                    detail: Arc::from(format!(
+                        "Cannot address data directory '{}' as a file:// URL",
+                        abs.display()
+                    )),
                 })?;
-                let root = url::Url::parse("file:///").boxed().context(AccelerationCreationFailedSnafu)?;
-                (
-                    dir_url.to_string(),
-                    Some(cayenne::metadata::ObjectStoreConfig {
-                        url: root,
-                        store: cayenne::durable_local_object_store(),
-                    }),
-                )
-            } else {
-                (dir_path.to_string(), object_store)
-            };
+            let root = url::Url::parse("file:///")
+                .boxed()
+                .context(AccelerationCreationFailedSnafu)?;
+            (
+                dir_url.to_string(),
+                Some(cayenne::metadata::ObjectStoreConfig {
+                    url: root,
+                    store: cayenne::dataset_storage::local_directory_store(),
+                }),
+            )
+        } else {
+            (dir_path.to_string(), object_store)
+        };
 
         // Log S3 Express configuration
         if is_s3_express {
@@ -3826,11 +3790,15 @@ impl CayenneAccelerator {
                 .context(S3Snafu)?;
         }
         if let Some(object_store) = object_store {
-            tracing::info!(
-                "Using S3 Express One Zone storage for {} acceleration: {}",
-                table_name,
-                object_store.url.as_str()
-            );
+            // Every object-store data path and, under `cayenne_vnext`, every local one
+            // has a store here; only an S3 Express data path is S3 Express storage.
+            if is_s3_express {
+                tracing::info!(
+                    "Using S3 Express One Zone storage for {} acceleration: {}",
+                    table_name,
+                    object_store.url.as_str()
+                );
+            }
             builder = builder.with_object_store(object_store);
         } else if is_s3_express {
             return Err(Error::AccelerationCreationFailed {
@@ -3932,7 +3900,11 @@ fn object_native_data_unsupported(source: &dyn AccelerationSource) -> Option<&'s
         "cayenne_s3_zone_ids",
         "cayenne_datalake_location",
     ] {
-        if acceleration.params.get(param).is_some_and(|value| !value.trim().is_empty()) {
+        if acceleration
+            .params
+            .get(param)
+            .is_some_and(|value| !value.trim().is_empty())
+        {
             return Some(match param {
                 "cayenne_file_path" => "`cayenne_file_path`",
                 "cayenne_s3_zone_ids" => "`cayenne_s3_zone_ids`",
@@ -4612,6 +4584,7 @@ impl DataAccelerator for CayenneAccelerator {
             return Ok(());
         }
 
+        Self::ensure_data_path_supported(source)?;
         if let Some(acceleration) = source.acceleration() {
             // Validate S3 Express One Zone configuration - only one method allowed
             let has_s3_zone_ids = acceleration.params.contains_key("cayenne_s3_zone_ids");
@@ -6853,9 +6826,95 @@ mod tests {
         assert!(dir_path.ends_with('/'));
     }
 
+    /// A file-mode dataset with `params`, under `runtime.params.cayenne_vnext: {flag}`.
+    fn data_path_source(flag: &str, params: &[(&str, &str)]) -> TestAccelerationSource {
+        let app = AppBuilder::new("test-app")
+            .with_runtime_params(
+                [(CAYENNE_VNEXT_PARAM.to_string(), flag.to_string())]
+                    .into_iter()
+                    .collect(),
+            )
+            .build();
+        let mut dataset = TestAccelerationSource::new("orders").with_app(Arc::new(app));
+        dataset.set_acceleration(Acceleration {
+            engine: Engine::Cayenne,
+            mode: Mode::File,
+            params: params
+                .iter()
+                .map(|(k, v)| ((*k).to_string(), (*v).to_string()))
+                .collect(),
+            ..Default::default()
+        });
+        dataset
+    }
+
+    /// With `runtime.params.cayenne_vnext` off, an object-store data path fails to
+    /// load, S3 Express included, while a local `cayenne_file_path` keeps working.
+    #[test]
+    fn an_object_store_data_path_is_refused_without_the_flag() {
+        let accelerator = CayenneAccelerator::new();
+        for (params, path) in [
+            (
+                vec![("cayenne_file_path", "s3://bucket/prefix")],
+                Some("s3://bucket/prefix"),
+            ),
+            (
+                vec![("cayenne_file_path", "s3://data--usw2-az1--x-s3/cayenne")],
+                Some("s3://data--usw2-az1--x-s3/cayenne"),
+            ),
+            (vec![("cayenne_s3_zone_ids", "usw2-az1")], None),
+            (
+                vec![
+                    ("cayenne_file_path", "/var/spice/data"),
+                    ("cayenne_s3_zone_ids", "usw2-az1"),
+                ],
+                None,
+            ),
+        ] {
+            let error = accelerator
+                .cayenne_data_dir(&data_path_source("disabled", &params))
+                .expect_err("an object-store data path is refused with the flag off");
+            assert_eq!(
+                error.to_string(),
+                object_store_data_path_refusal("orders", path),
+                "params {params:?}"
+            );
+        }
+        assert_eq!(
+            accelerator
+                .cayenne_data_dir(&data_path_source(
+                    "disabled",
+                    &[("cayenne_file_path", "/var/spice/data/")]
+                ))
+                .expect("a local data path loads with the flag off"),
+            "/var/spice/data/orders/"
+        );
+    }
+
+    /// Under `runtime.params.cayenne_vnext`, a standard S3 data path is accepted so
+    /// the object-store path can be tested on S3-compatible stores.
+    #[test]
+    fn a_standard_s3_data_path_is_accepted_under_the_flag() {
+        assert_eq!(
+            CayenneAccelerator::new()
+                .cayenne_data_dir(&data_path_source(
+                    "enabled",
+                    &[("cayenne_file_path", "s3://bucket/prefix/")]
+                ))
+                .expect("a standard S3 data path loads under the flag"),
+            "s3://bucket/prefix/orders/"
+        );
+    }
+
     #[tokio::test]
     async fn test_cayenne_multi_zone_primary_path_generation() {
-        let app = AppBuilder::new("test-app").build();
+        let app = AppBuilder::new("test-app")
+            .with_runtime_params(
+                [(CAYENNE_VNEXT_PARAM.to_string(), "enabled".to_string())]
+                    .into_iter()
+                    .collect(),
+            )
+            .build();
 
         let mut dataset = TestAccelerationSource::new("orders.dataset").with_app(app);
 
@@ -8333,7 +8392,7 @@ mod tests {
             "cayenne.db-journal",
         ] {
             assert!(
-                is_metastore_file(std::ffi::OsStr::new(name)),
+                is_metastore_file(std::ffi::OsStr::new(name), true),
                 "'{name}' is part of a metastore"
             );
         }
@@ -8345,10 +8404,34 @@ mod tests {
             "db",
         ] {
             assert!(
-                !is_metastore_file(std::ffi::OsStr::new(name)),
+                !is_metastore_file(std::ffi::OsStr::new(name), true),
                 "'{name}' is not part of a metastore"
             );
         }
+    }
+
+    /// The object-native metastore's log lock marks a metastore only with
+    /// `runtime.params.cayenne_vnext` enabled; with the flag off, the `SQLite` names do.
+    #[test]
+    fn the_object_store_lock_marks_a_metastore_only_with_the_flag() {
+        let lock = std::ffi::OsStr::new(".spice-object-store-occ.lock");
+        assert!(is_metastore_file(lock, true));
+        assert!(!is_metastore_file(lock, false));
+        assert!(is_metastore_file(std::ffi::OsStr::new("cayenne.db"), false));
+    }
+
+    /// With `runtime.params.cayenne_vnext` off, an object-store data path is refused
+    /// with this text, naming the dataset, the path and the fix.
+    #[test]
+    fn an_object_store_data_path_is_refused_with_the_flag_off() {
+        assert_eq!(
+            object_store_data_path_refusal("orders", Some("s3://bucket/prefix")),
+            "Failed to load dataset 'orders' (cayenne): `cayenne_file_path` 's3://bucket/prefix' is an object-store path, which Cayenne does not support for a dataset's own data. Remove `cayenne_file_path` (and `cayenne_s3_zone_ids`) to keep the data on local disk; Cayenne data in a bucket comes with `runtime.state.location`. See: https://spiceai.org/docs/components/data-accelerators/cayenne"
+        );
+        assert_eq!(
+            object_store_data_path_refusal("orders", None),
+            "Failed to load dataset 'orders' (cayenne): `cayenne_s3_zone_ids` puts its data in an object store, which Cayenne does not support for a dataset's own data. Remove `cayenne_file_path` (and `cayenne_s3_zone_ids`) to keep the data on local disk; Cayenne data in a bucket comes with `runtime.state.location`. See: https://spiceai.org/docs/components/data-accelerators/cayenne"
+        );
     }
 
     /// The shape #13436 describes: dataset `q`'s data directory holds a metastore that

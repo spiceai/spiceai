@@ -10,7 +10,8 @@ description: >
 
 sources:
   src: { kind: postgres }
-  # The state location of the object-native-rustfs variants.
+  # The state location of the object-native-rustfs variants, and the data path
+  # of object-store-data-path-rustfs.
   lake: { kind: rustfs }
   # The same, 20 ms away (object-native-data-rustfs-latency).
   slow-lake: { kind: rustfs, latency: 20ms }
@@ -66,6 +67,8 @@ variants:
   object-native-data-local: object-native-data-local
   object-native-data-rustfs: object-native-data-rustfs
   object-native-data-rustfs-latency: object-native-data-rustfs-latency
+  # Data at the datasets' own `cayenne_file_path` on RustFS (#16130).
+  object-store-data-path-rustfs: object-store-data-path-rustfs
 
 spicepod:
   version: v1
@@ -228,6 +231,57 @@ steps:
   # Both tables replicated to the same point.
   - query: SELECT c.c_segment, count(*), sum(o.o_total) FROM orders o JOIN customers c ON o.o_custkey = c.c_id GROUP BY c.c_segment
     eventually: 30s
+
+  # Data in an object store (#16130), at the dataset's own path or in the
+  # location: deletion vectors are objects in the bucket, none is on local
+  # disk, and nothing is at a local `s3:` path.
+  - assert-objects: { source: lake, prefix: data/orders/, contains: .arrow, min: 1 }
+    only: object-store-data-path-rustfs
+  - assert-objects: { source: lake, prefix: state/cayenne/v1/datasets/orders-, contains: .arrow, min: 1 }
+    only: object-native-data-rustfs
+  - assert-files: { lacks: ['(^|/)s3:', '\.arrow$'] }
+    only: &object-store-data [object-store-data-path-rustfs, object-native-data-rustfs]
+
+  # 180 s of CDC updates and deletes: the data files and deletion vectors in
+  # the bucket stay within the same bound halfway through and at the end, and
+  # the table still matches the source. The bounds are a few compactions' worth
+  # of the table (about 20,000 rows), far below what 180 s of unreclaimed
+  # snapshots would leave.
+  - background:
+      id: churn
+      source-exec: { src: "UPDATE orders SET o_qty = (o_qty + 1) % 50 WHERE o_id % 97 = ${round} % 97; DELETE FROM orders WHERE o_id % 991 = ${round} % 991" }
+      every: 1s
+    only: *object-store-data
+  - sleep: 90s
+    only: *object-store-data
+  - assert-objects: { source: lake, prefix: data/orders/, contains: .vortex, max: 400 }
+    only: object-store-data-path-rustfs
+  - assert-objects: { source: lake, prefix: data/orders/, contains: .arrow, max: 200 }
+    only: object-store-data-path-rustfs
+  - assert-objects: { source: lake, prefix: state/cayenne/v1/datasets/orders-, contains: .vortex, max: 400 }
+    only: object-native-data-rustfs
+  - assert-objects: { source: lake, prefix: state/cayenne/v1/datasets/orders-, contains: .arrow, max: 200 }
+    only: object-native-data-rustfs
+  - sleep: 90s
+    only: *object-store-data
+  - stop-background: { id: churn }
+    only: *object-store-data
+  - query: SELECT * FROM orders
+    eventually: 90s
+    only: *object-store-data
+  # After the retention grace, with no further change.
+  - sleep: 20s
+    only: *object-store-data
+  - assert-objects: { source: lake, prefix: data/orders/, contains: .vortex, max: 400 }
+    only: object-store-data-path-rustfs
+  - assert-objects: { source: lake, prefix: data/orders/, contains: .arrow, max: 200 }
+    only: object-store-data-path-rustfs
+  - assert-objects: { source: lake, prefix: state/cayenne/v1/datasets/orders-, contains: .vortex, max: 400 }
+    only: object-native-data-rustfs
+  - assert-objects: { source: lake, prefix: state/cayenne/v1/datasets/orders-, contains: .arrow, max: 200 }
+    only: object-native-data-rustfs
+  - assert-log: { lacks: ['falling back to full snapshot rewrite'] }
+    only: *object-store-data
 
   # Object-native data (#16131): each dataset's files are in the state
   # location, under its log's data/ folder, and none at a local `s3:` path.

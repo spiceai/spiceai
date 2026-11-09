@@ -149,10 +149,15 @@ pub struct TestFixture {
 /// - unset or `local`: the fixture's local data directory, as before;
 /// - `memory`: an in-memory object store under `s3://cayenne-test/<fixture>/data`;
 /// - `fault`: the same, wrapped in `object_store_occ`'s `FaultStore` with no faults
-///   armed, so every operation goes through the fault store's wrapper.
+///   armed, so every operation goes through the fault store's wrapper;
+/// - `rustfs`: an S3-compatible server (`RustFS`) named by
+///   `CAYENNE_TEST_RUSTFS_ENDPOINT`, `CAYENNE_TEST_RUSTFS_BUCKET`,
+///   `CAYENNE_TEST_RUSTFS_ACCESS_KEY` and `CAYENNE_TEST_RUSTFS_SECRET_KEY`, under
+///   `s3://<bucket>/<fixture>/data`. A fixture fails with a message naming the
+///   unset variables rather than run on another store.
 ///
-/// Each fixture gets its own prefix in the one `s3://cayenne-test` bucket, so the
-/// per-dataset store routing in `cayenne::store_routing` keeps their files apart.
+/// Each fixture gets its own prefix in the bucket, and each table's own store
+/// (`cayenne::dataset_storage`) keeps their files apart.
 #[derive(Clone)]
 pub struct FixtureDataStore {
     /// The `base_path` for `CreateTableOptions`.
@@ -200,12 +205,76 @@ impl FixtureDataStore {
                     }),
                 }
             }
+            "rustfs" => Self::rustfs()?,
             other => {
                 return Err(format!(
-                    "CAYENNE_TEST_DATA_STORE is '{other}'; use 'local', 'memory' or 'fault'"
+                    "CAYENNE_TEST_DATA_STORE is '{other}'; use 'local', 'memory', 'fault' or 'rustfs'"
                 )
                 .into());
             }
+        })
+    }
+
+    /// Tables in `store`, under a prefix of their own in `s3://cayenne-test`.
+    pub fn in_store(store: Arc<dyn object_store::ObjectStore>) -> Result<Self, url::ParseError> {
+        let url = url::Url::parse(&format!(
+            "s3://cayenne-test/{}/data",
+            uuid::Uuid::now_v7().simple()
+        ))?;
+        Ok(Self {
+            base_path: url.to_string(),
+            config: Some(cayenne::metadata::ObjectStoreConfig { url, store }),
+        })
+    }
+
+    /// The `RustFS` server the `CAYENNE_TEST_RUSTFS_*` variables name.
+    fn rustfs() -> Result<Self, Box<dyn std::error::Error>> {
+        const VARIABLES: [&str; 4] = [
+            "CAYENNE_TEST_RUSTFS_ENDPOINT",
+            "CAYENNE_TEST_RUSTFS_BUCKET",
+            "CAYENNE_TEST_RUSTFS_ACCESS_KEY",
+            "CAYENNE_TEST_RUSTFS_SECRET_KEY",
+        ];
+        let values: Vec<Option<String>> = VARIABLES
+            .iter()
+            .map(|name| std::env::var(name).ok().filter(|value| !value.is_empty()))
+            .collect();
+        let unset: Vec<&str> = VARIABLES
+            .iter()
+            .zip(&values)
+            .filter(|(_, value)| value.is_none())
+            .map(|(name, _)| *name)
+            .collect();
+        let [Some(endpoint), Some(bucket), Some(access_key), Some(secret_key)] =
+            <[Option<String>; 4]>::try_from(values).map_err(|_| "four variables")?
+        else {
+            return Err(format!(
+                "CAYENNE_TEST_DATA_STORE is 'rustfs', but {} {} not set. Start RustFS, create a bucket, and set them; \
+                 .github/workflows/cayenne_data_store.yml shows how",
+                unset.join(", "),
+                if unset.len() == 1 { "is" } else { "are" }
+            )
+            .into());
+        };
+        let store = object_store::aws::AmazonS3Builder::new()
+            .with_endpoint(&endpoint)
+            .with_bucket_name(&bucket)
+            .with_access_key_id(access_key)
+            .with_secret_access_key(secret_key)
+            .with_region("us-east-1")
+            .with_allow_http(endpoint.starts_with("http://"))
+            .with_virtual_hosted_style_request(false)
+            .build()?;
+        let url = url::Url::parse(&format!(
+            "s3://{bucket}/cayenne-test/{}/data",
+            uuid::Uuid::now_v7().simple()
+        ))?;
+        Ok(Self {
+            base_path: url.to_string(),
+            config: Some(cayenne::metadata::ObjectStoreConfig {
+                url,
+                store: Arc::new(store),
+            }),
         })
     }
 
@@ -226,6 +295,15 @@ impl FixtureDataStore {
 impl TestFixture {
     /// Create a new test fixture with the specified backend
     pub async fn new(backend: BackendType) -> Result<Self, Box<dyn std::error::Error>> {
+        Self::with_data_store(backend, None).await
+    }
+
+    /// A fixture whose tables keep their data files in `store`; with `None`, where
+    /// `CAYENNE_TEST_DATA_STORE` says ([`FixtureDataStore`]).
+    pub async fn with_data_store(
+        backend: BackendType,
+        store: Option<Arc<dyn object_store::ObjectStore>>,
+    ) -> Result<Self, Box<dyn std::error::Error>> {
         let temp_dir = Arc::new(TempDir::new()?);
         let data_path = temp_dir.path().join("data");
         std::fs::create_dir_all(&data_path)?;
@@ -239,7 +317,10 @@ impl TestFixture {
 
         let catalog = fixture_catalog(connection_string).await?;
         catalog.init().await?;
-        let data_store = FixtureDataStore::from_env(&data_path)?;
+        let data_store = match store {
+            Some(store) => FixtureDataStore::in_store(store)?,
+            None => FixtureDataStore::from_env(&data_path)?,
+        };
 
         Ok(Self {
             temp_dir,

@@ -64,19 +64,40 @@ class CompareTest(unittest.TestCase):
         self.assertEqual(guard.compare({"a.rs": 2}, {"a.rs": 2}), [])
 
 
+class FunctionTest(unittest.TestCase):
+    def test_attributes_each_call_to_its_function(self):
+        text = "fn probe() {\n    std::fs::read(p);\n}\nasync fn write() {\n    tokio::fs::write(p, b).await;\n    tokio::fs::rename(a, b).await;\n}\n"
+        self.assertEqual(guard.calls_by_function(text), {"probe": 1, "write": 2})
+
+
 class ScanTest(unittest.TestCase):
-    def test_skips_files_under_tests(self):
+    def scan(self, files, host_keys=frozenset()):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
-            (root / "tests").mkdir()
-            (root / "tests" / "a.rs").write_text("std::fs::read(p);\n")
-            (root / "b.rs").write_text("tokio::fs::read(p).await;\n")
+            for name, text in files.items():
+                (root / name).parent.mkdir(parents=True, exist_ok=True)
+                (root / name).write_text(text)
             original_root = guard.ROOT
             guard.ROOT = root
             try:
-                self.assertEqual(guard.scan(root), {"b.rs": 1})
+                return guard.scan(root, host_keys)
             finally:
                 guard.ROOT = original_root
+
+    def test_skips_files_under_tests(self):
+        found = self.scan({"tests/a.rs": "std::fs::read(p);\n", "b.rs": "tokio::fs::read(p).await;\n"})
+        self.assertEqual(found, {"host_features": {}, "local_data_path": {"b.rs": 1}})
+
+    def test_a_host_feature_file_is_counted_apart(self):
+        found = self.scan({"probe.rs": "fn a() { std::fs::read(p); }\n"}, {"probe.rs"})
+        self.assertEqual(found, {"host_features": {"probe.rs": 1}, "local_data_path": {}})
+
+    def test_a_host_feature_function_leaves_the_rest_of_its_file_data_path(self):
+        text = "fn measure() {\n    std::fs::read_dir(p);\n}\nfn write() {\n    std::fs::write(p, b);\n}\n"
+        found = self.scan({"table.rs": text}, {"table.rs::measure"})
+        self.assertEqual(
+            found, {"host_features": {"table.rs::measure": 1}, "local_data_path": {"table.rs": 1}}
+        )
 
 
 if __name__ == "__main__":

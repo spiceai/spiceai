@@ -50,13 +50,6 @@ pub enum Error {
         source: Box<dyn std::error::Error + Send + Sync>,
     },
 
-    #[snafu(display(
-        "Standard S3 paths are not supported for Cayenne acceleration. Only S3 Express One Zone is supported. \
-        S3 Express One Zone buckets use the naming convention: 's3://{{bucket-name}}--{{zone-id}}--x-s3/'. \
-        Received: '{path}'"
-    ))]
-    StandardS3NotSupported { path: String },
-
     #[snafu(display("Failed to create S3 Express One Zone directory bucket '{bucket}': {source}"))]
     DirectoryBucketCreation {
         bucket: String,
@@ -780,23 +773,6 @@ pub(crate) const S3_PARAMETERS: [ParameterSpec; S3_PARAMS_LEN] = [
 ];
 
 pub use runtime_object_store::is_s3_express_path;
-
-/// Validates that the path is either a local path or an S3 Express One Zone path.
-/// Standard S3 paths are not supported.
-/// # Errors
-///
-/// Returns [`Error::StandardS3NotSupported`] for a standard `s3://` path unless
-/// `allow_standard_s3` (set by `runtime.params.cayenne_vnext`, so the object-store
-/// data path can be tested on S3-compatible stores): otherwise only S3 Express One
-/// Zone buckets and local paths are supported.
-pub fn validate_file_path(path: &str, allow_standard_s3: bool) -> Result<()> {
-    if path.starts_with("s3://") && !is_s3_express_path(path) && !allow_standard_s3 {
-        return Err(Error::StandardS3NotSupported {
-            path: path.to_string(),
-        });
-    }
-    Ok(())
-}
 
 /// Returns true if the data path for this source is an S3 Express One Zone path.
 ///
@@ -1808,19 +1784,16 @@ pub async fn build_s3_object_store(
     data_path: String,
 ) -> Result<Option<cayenne::metadata::ObjectStoreConfig>> {
     // A standard S3 or S3-compatible data path (accepted only under
-    // `runtime.params.cayenne_vnext`, see `validate_file_path`) gets the shared S3
+    // `runtime.params.cayenne_vnext`) gets the shared S3
     // store builder, with every sign-in mode the `cayenne_s3_*` params describe.
     if data_path.starts_with("s3://") && !is_s3_express_path(&data_path) {
         let resolved = resolve_s3_params(source).await;
-        let url = Url::parse(&data_path)
-            .boxed()
-            .context(InvalidS3UrlSnafu { url: data_path.clone() })?;
+        let url = Url::parse(&data_path).boxed().context(InvalidS3UrlSnafu {
+            url: data_path.clone(),
+        })?;
         let store = build_standard_s3_store(&url, &resolved).await?;
         tracing::debug!("Standard S3 object store configured for data path {data_path}");
-        return Ok(Some(cayenne::metadata::ObjectStoreConfig {
-            url,
-            store,
-        }));
+        return Ok(Some(cayenne::metadata::ObjectStoreConfig { url, store }));
     }
     // Check if this is S3 Express One Zone storage
     if !is_s3_express_data_path(source) {
@@ -1884,10 +1857,7 @@ pub async fn build_s3_object_store(
         data_path
     );
 
-    Ok(Some(cayenne::metadata::ObjectStoreConfig {
-        url,
-        store,
-    }))
+    Ok(Some(cayenne::metadata::ObjectStoreConfig { url, store }))
 }
 
 /// A standard S3 (or S3-compatible) store for `url` through the shared
@@ -1899,7 +1869,8 @@ async fn build_standard_s3_store(
     resolved: &ResolvedS3Params,
 ) -> Result<Arc<dyn object_store::ObjectStore>> {
     use secrecy::SecretString;
-    let mut params: std::collections::HashMap<String, SecretString> = std::collections::HashMap::new();
+    let mut params: std::collections::HashMap<String, SecretString> =
+        std::collections::HashMap::new();
     for (name, value) in [
         ("region", &resolved.region),
         ("endpoint", &resolved.endpoint),
@@ -1912,14 +1883,20 @@ async fn build_standard_s3_store(
             params.insert(name.to_string(), SecretString::from(value.clone()));
         }
     }
-    params.insert("auth".to_string(), SecretString::from(resolved.auth.clone()));
+    params.insert(
+        "auth".to_string(),
+        SecretString::from(resolved.auth.clone()),
+    );
     let allow_http = resolved.allow_http
         || resolved
             .endpoint
             .as_deref()
             .is_some_and(|endpoint| endpoint.starts_with("http://"));
     if allow_http {
-        params.insert("allow_http".to_string(), SecretString::from("true".to_string()));
+        params.insert(
+            "allow_http".to_string(),
+            SecretString::from("true".to_string()),
+        );
     }
     aws_sdk_credential_bridge::object_store_builder::S3ObjectStoreBuilder::from_url(
         url,
@@ -2058,66 +2035,6 @@ mod tests {
         ) -> object_store::Result<()> {
             self.inner.copy_opts(from, to, options).await
         }
-    }
-
-    #[test]
-    fn test_validate_file_path_accepts_local_paths() {
-        validate_file_path("/local/path/data/", false).expect("local absolute path should be valid");
-        validate_file_path("./relative/path/", false).expect("relative path should be valid");
-        validate_file_path("/var/spice/data/", false).expect("another local path should be valid");
-    }
-
-    #[test]
-    fn test_validate_file_path_accepts_s3_express() {
-        validate_file_path("s3://mybucket--usw2-az1--x-s3/prefix/", false)
-            .expect("S3 Express One Zone path should be valid");
-        validate_file_path("s3://data--use1-az4--x-s3/cayenne/", false)
-            .expect("another S3 Express One Zone path should be valid");
-    }
-
-    #[test]
-    fn test_validate_file_path_accepts_standard_s3_under_the_flag() {
-        validate_file_path("s3://mybucket/prefix/", true)
-            .expect("a standard S3 path is accepted when `cayenne_vnext` is enabled");
-    }
-
-    #[test]
-    fn test_validate_file_path_rejects_standard_s3() {
-        // Standard S3 paths should be rejected
-        let result = validate_file_path("s3://mybucket/prefix/", false);
-        assert!(result.is_err());
-        let err = result.expect_err("expected error");
-        assert!(
-            matches!(err, Error::StandardS3NotSupported { .. }),
-            "Expected StandardS3NotSupported error, got: {err:?}"
-        );
-
-        let result = validate_file_path("s3://my-data-bucket/cayenne/data/", false);
-        assert!(result.is_err());
-    }
-
-    #[test]
-    fn test_validate_file_path_error_message() {
-        let result = validate_file_path("s3://regular-bucket/data/", false);
-        let err = result.expect_err("expected error");
-        let error_message = err.to_string();
-
-        assert!(
-            error_message.contains("Standard S3 paths are not supported"),
-            "Error message should mention standard S3 not supported: {error_message}"
-        );
-        assert!(
-            error_message.contains("S3 Express One Zone"),
-            "Error message should mention S3 Express One Zone: {error_message}"
-        );
-        assert!(
-            error_message.contains("--x-s3"),
-            "Error message should show the bucket naming convention: {error_message}"
-        );
-        assert!(
-            error_message.contains("s3://regular-bucket/data/"),
-            "Error message should include the invalid path: {error_message}"
-        );
     }
 
     #[test]

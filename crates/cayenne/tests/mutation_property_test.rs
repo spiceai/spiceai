@@ -836,7 +836,12 @@ fn apply_model(model: &mut Model, op: &Op) {
 
 /// Returns whether the table was seen on key deletes after it opened on position
 /// deletes (see [`Mode::Auto`]).
-async fn run_sequential(fixture: &TestFixture, w: &Workload, seed: u64) -> TestResult<bool> {
+async fn run_sequential(
+    fixture: &TestFixture,
+    w: &Workload,
+    seed: u64,
+    history: &mut Vec<Op>,
+) -> TestResult<bool> {
     let name = format!("seq_{:?}_{:?}_{seed}", w.mode, w.durability);
     let (mut table, mut ctx) = create_table(
         fixture,
@@ -857,7 +862,7 @@ async fn run_sequential(fixture: &TestFixture, w: &Workload, seed: u64) -> TestR
     let mut left_positions = false;
     let mut rng = Rng::new(seed);
     let mut model = Model::new();
-    let mut history: Vec<Op> = Vec::with_capacity(w.ops);
+    history.reserve(w.ops);
     for step in 0..w.ops {
         let live_value = sample_live_value(&model, &mut rng);
         let op = gen_op(&mut rng, &w.weights, w.population, w.batch_size, live_value);
@@ -946,7 +951,12 @@ async fn run_sequential(fixture: &TestFixture, w: &Workload, seed: u64) -> TestR
 
 /// Returns whether the table was seen on key deletes after it opened on position
 /// deletes (see [`Mode::Auto`]).
-async fn run_concurrent(fixture: &TestFixture, w: &Workload, seed: u64) -> TestResult<bool> {
+async fn run_concurrent(
+    fixture: &TestFixture,
+    w: &Workload,
+    seed: u64,
+    history: &mut Vec<Op>,
+) -> TestResult<bool> {
     let name = format!("conc_{:?}_{:?}_{seed}", w.mode, w.durability);
     let (table0, ctx0) = create_table(
         fixture,
@@ -1017,7 +1027,7 @@ async fn run_concurrent(fixture: &TestFixture, w: &Workload, seed: u64) -> TestR
 
     // Foreground stream. `compact` is driven by the background loop (a foreground
     // Compact op is a no-op here); `restart` reopens under the write lock.
-    let mut history: Vec<Op> = Vec::with_capacity(w.ops);
+    history.reserve(w.ops);
     for _ in 0..w.ops {
         let live_value = sample_live_value(&model, &mut rng);
         let op = gen_op(&mut rng, &w.weights, w.population, w.batch_size, live_value);
@@ -1110,10 +1120,24 @@ async fn run_concurrent(fixture: &TestFixture, w: &Workload, seed: u64) -> TestR
 async fn run_workload(fixture: TestFixture, w: Workload) -> TestResult<()> {
     let mut seeds_that_left_positions = 0usize;
     for seed in 0..w.seeds {
-        let left_positions = match w.concurrency {
-            Concurrency::Sequential => run_sequential(&fixture, &w, seed).await?,
-            Concurrency::ConcurrentWithCompaction => run_concurrent(&fixture, &w, seed).await?,
+        let mut history = Vec::new();
+        let outcome = match w.concurrency {
+            Concurrency::Sequential => run_sequential(&fixture, &w, seed, &mut history).await,
+            Concurrency::ConcurrentWithCompaction => {
+                run_concurrent(&fixture, &w, seed, &mut history).await
+            }
         };
+        // A divergence panics with the seed and history; an error from an
+        // operation or a read carries them here, so either replays from the seed.
+        let left_positions = outcome.map_err(|error| {
+            format!(
+                "walk failed mode={:?} durability={:?} concurrency={:?} seed={seed} after {} op(s): {error}\nhistory={history:?}",
+                w.mode,
+                w.durability,
+                w.concurrency,
+                history.len(),
+            )
+        })?;
         seeds_that_left_positions += usize::from(left_positions);
     }
     match w.mode {
@@ -1928,4 +1952,206 @@ async fn prop_concurrent_reads_observe_consistent_snapshot_auto_sqlite() -> Test
     })
     .await
     .map_err(|e| -> Box<dyn std::error::Error> { e })
+}
+
+// --- Negative control: the walk notices a lost write ---
+
+/// An in-memory store that answers one data-file (`.vortex`) write as done and
+/// keeps nothing: the `nth` such write, counting from 0, single-part or multipart.
+#[derive(Debug)]
+struct DropsOneDataPut {
+    inner: object_store::memory::InMemory,
+    /// Data-file writes still to pass through before the dropped one.
+    remaining: std::sync::atomic::AtomicI64,
+    dropped: AtomicBool,
+}
+
+impl DropsOneDataPut {
+    fn new(nth: i64) -> Self {
+        Self {
+            inner: object_store::memory::InMemory::new(),
+            remaining: std::sync::atomic::AtomicI64::new(nth),
+            dropped: AtomicBool::new(false),
+        }
+    }
+
+    /// Whether this write to `location` is the one to drop.
+    fn drop_this(&self, location: &object_store::path::Path) -> bool {
+        location.as_ref().ends_with(".vortex")
+            && self.remaining.fetch_sub(1, Ordering::SeqCst) == 0
+            && !self.dropped.swap(true, Ordering::SeqCst)
+    }
+}
+
+impl std::fmt::Display for DropsOneDataPut {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "DropsOneDataPut")
+    }
+}
+
+/// A multipart upload whose parts and completion succeed and store nothing.
+#[derive(Debug)]
+struct DiscardedUpload;
+
+#[async_trait::async_trait]
+impl object_store::MultipartUpload for DiscardedUpload {
+    fn put_part(&mut self, _data: object_store::PutPayload) -> object_store::UploadPart {
+        Box::pin(async { Ok(()) })
+    }
+
+    async fn complete(&mut self) -> object_store::Result<object_store::PutResult> {
+        Ok(object_store::PutResult {
+            e_tag: None,
+            version: None,
+        })
+    }
+
+    async fn abort(&mut self) -> object_store::Result<()> {
+        Ok(())
+    }
+}
+
+#[async_trait::async_trait]
+impl object_store::ObjectStore for DropsOneDataPut {
+    async fn put_opts(
+        &self,
+        location: &object_store::path::Path,
+        payload: object_store::PutPayload,
+        opts: object_store::PutOptions,
+    ) -> object_store::Result<object_store::PutResult> {
+        if self.drop_this(location) {
+            return Ok(object_store::PutResult {
+                e_tag: None,
+                version: None,
+            });
+        }
+        self.inner.put_opts(location, payload, opts).await
+    }
+
+    async fn put_multipart_opts(
+        &self,
+        location: &object_store::path::Path,
+        opts: object_store::PutMultipartOptions,
+    ) -> object_store::Result<Box<dyn object_store::MultipartUpload>> {
+        if self.drop_this(location) {
+            return Ok(Box::new(DiscardedUpload));
+        }
+        self.inner.put_multipart_opts(location, opts).await
+    }
+
+    async fn get_opts(
+        &self,
+        location: &object_store::path::Path,
+        options: object_store::GetOptions,
+    ) -> object_store::Result<object_store::GetResult> {
+        self.inner.get_opts(location, options).await
+    }
+
+    async fn get_ranges(
+        &self,
+        location: &object_store::path::Path,
+        ranges: &[std::ops::Range<u64>],
+    ) -> object_store::Result<Vec<bytes::Bytes>> {
+        self.inner.get_ranges(location, ranges).await
+    }
+
+    fn delete_stream(
+        &self,
+        locations: futures::stream::BoxStream<
+            'static,
+            object_store::Result<object_store::path::Path>,
+        >,
+    ) -> futures::stream::BoxStream<'static, object_store::Result<object_store::path::Path>> {
+        self.inner.delete_stream(locations)
+    }
+
+    fn list(
+        &self,
+        prefix: Option<&object_store::path::Path>,
+    ) -> futures::stream::BoxStream<'static, object_store::Result<object_store::ObjectMeta>> {
+        self.inner.list(prefix)
+    }
+
+    fn list_with_offset(
+        &self,
+        prefix: Option<&object_store::path::Path>,
+        offset: &object_store::path::Path,
+    ) -> futures::stream::BoxStream<'static, object_store::Result<object_store::ObjectMeta>> {
+        self.inner.list_with_offset(prefix, offset)
+    }
+
+    async fn list_with_delimiter(
+        &self,
+        prefix: Option<&object_store::path::Path>,
+    ) -> object_store::Result<object_store::ListResult> {
+        self.inner.list_with_delimiter(prefix).await
+    }
+
+    async fn copy_opts(
+        &self,
+        from: &object_store::path::Path,
+        to: &object_store::path::Path,
+        options: object_store::CopyOptions,
+    ) -> object_store::Result<()> {
+        self.inner.copy_opts(from, to, options).await
+    }
+
+    async fn rename_opts(
+        &self,
+        from: &object_store::path::Path,
+        to: &object_store::path::Path,
+        options: object_store::RenameOptions,
+    ) -> object_store::Result<()> {
+        self.inner.rename_opts(from, to, options).await
+    }
+}
+
+/// The fuzz lane turns red when the store loses one acknowledged data-file write,
+/// and its failure names the seed and the history to replay. A lane that stays
+/// green here would also stay green over a store that drops writes.
+#[test]
+fn a_dropped_data_file_put_turns_the_fuzz_walk_red() {
+    let outcome = std::thread::Builder::new()
+        .stack_size(common::TEST_STACK_SIZE)
+        .spawn(|| {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .thread_stack_size(common::TEST_STACK_SIZE)
+                .enable_all()
+                .build()
+                .expect("build the test runtime");
+            runtime.block_on(async {
+                let store: Arc<dyn object_store::ObjectStore> = Arc::new(DropsOneDataPut::new(2));
+                let fixture = TestFixture::with_data_store(BackendType::Sqlite, Some(store))
+                    .await
+                    .expect("fixture");
+                let walk = Workload {
+                    seeds: 1,
+                    ..sequential(Mode::Key)
+                };
+                // A divergence panics; a failed operation or read is an error.
+                match futures::FutureExt::catch_unwind(std::panic::AssertUnwindSafe(
+                    run_workload(fixture, walk),
+                ))
+                .await
+                {
+                    Ok(Ok(())) => None,
+                    Ok(Err(error)) => Some(error.to_string()),
+                    Err(panic) => Some(
+                        panic
+                            .downcast_ref::<String>()
+                            .cloned()
+                            .or_else(|| panic.downcast_ref::<&str>().map(ToString::to_string))
+                            .unwrap_or_default(),
+                    ),
+                }
+            })
+        })
+        .expect("spawn the test thread")
+        .join()
+        .expect("join the test thread");
+    let failure = outcome.expect("the walk must fail when the store drops a data-file write");
+    assert!(
+        failure.contains("seed=0") && failure.contains("history=["),
+        "the failure names the seed and the history: {failure}"
+    );
 }

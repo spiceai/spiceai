@@ -81,3 +81,10 @@ object-native-data-rustfs-latency:
           s3_key: ${sources.slow-lake.key}
           s3_secret: ${sources.slow-lake.secret}
           allow_http: 'true'
+# Data at the dataset's own `cayenne_file_path` in an S3-compatible store, with
+# the prototype metastore on (#16130); the metastore stays in a local
+# directory. The script declares a `rustfs` source named `lake`, and the data
+# is under `data/<dataset>/` in its bucket.
+object-store-data-path-rustfs:
+  spicepod: { runtime: { params: { cayenne_vnext: enabled } } }
+  datasets: { '*': { acceleration: { params: { cayenne_file_path: 's3://${sources.lake.bucket}/data', cayenne_s3_endpoint: '${sources.lake.endpoint}', cayenne_s3_region: us-east-1, cayenne_s3_auth: key, cayenne_s3_key: '${sources.lake.key}', cayenne_s3_secret: '${sources.lake.secret}' } } } }

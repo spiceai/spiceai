@@ -10,7 +10,8 @@ description: >
 
 sources:
   src: { kind: postgres }
-  # The state locations of the object-native-data variants.
+  # The state locations of the object-native-data variants, and the data path
+  # of object-store-data-path-rustfs.
   lake: { kind: rustfs }
   slow-lake: { kind: rustfs, latency: 20ms }
 
@@ -29,6 +30,24 @@ variants:
   object-native-data-local: object-native-data-local
   object-native-data-rustfs: object-native-data-rustfs
   object-native-data-rustfs-latency: object-native-data-rustfs-latency
+  # Data at the dataset's own `cayenne_file_path` on RustFS (#16130), with
+  # appends staged in files (and their staging WAL) and compacted every 2 s
+  # once 4 files are waiting.
+  object-store-data-path-rustfs:
+    spicepod: { runtime: { params: { cayenne_vnext: enabled } } }
+    datasets:
+      events:
+        acceleration:
+          params:
+            cayenne_cdc_durability: file
+            cayenne_compaction_background_interval_ms: '2000'
+            cayenne_compaction_trigger_files: '4'
+            cayenne_file_path: 's3://${sources.lake.bucket}/data'
+            cayenne_s3_endpoint: '${sources.lake.endpoint}'
+            cayenne_s3_region: us-east-1
+            cayenne_s3_auth: key
+            cayenne_s3_key: '${sources.lake.key}'
+            cayenne_s3_secret: '${sources.lake.secret}'
 
 spicepod:
   version: v1
@@ -83,6 +102,64 @@ steps:
   - query: SELECT * FROM events
     eventually: 30s
   - query: SELECT count(*) AS n, count(DISTINCT id) AS ids FROM events
+
+  # Data at its own path on RustFS (#16130): killed four times while appends
+  # are staged, each time the staging WAL is found and replayed, so every row
+  # is there exactly once; compaction commits on the object store and never
+  # falls back to rewriting the whole snapshot.
+  - source-exec: { src: "INSERT INTO events SELECT i, TIMESTAMPTZ '2100-01-01 00:00Z' + i * INTERVAL '1 second', i FROM generate_series(1701, 1750) i" }
+    only: object-store-data-path-rustfs
+  - kill-spiced: {}
+    only: object-store-data-path-rustfs
+  - start: {}
+    only: object-store-data-path-rustfs
+  - query: SELECT count(*) AS n, count(DISTINCT id) AS ids, max(id) AS m FROM events
+    eventually: 30s
+    only: object-store-data-path-rustfs
+  - source-exec: { src: "INSERT INTO events SELECT i, TIMESTAMPTZ '2100-01-01 00:00Z' + i * INTERVAL '1 second', i FROM generate_series(1751, 1800) i" }
+    only: object-store-data-path-rustfs
+  - kill-spiced: {}
+    only: object-store-data-path-rustfs
+  - start: {}
+    only: object-store-data-path-rustfs
+  - query: SELECT count(*) AS n, count(DISTINCT id) AS ids, max(id) AS m FROM events
+    eventually: 30s
+    only: object-store-data-path-rustfs
+  - source-exec: { src: "INSERT INTO events SELECT i, TIMESTAMPTZ '2100-01-01 00:00Z' + i * INTERVAL '1 second', i FROM generate_series(1801, 1850) i" }
+    only: object-store-data-path-rustfs
+  - kill-spiced: {}
+    only: object-store-data-path-rustfs
+  - start: {}
+    only: object-store-data-path-rustfs
+  - query: SELECT count(*) AS n, count(DISTINCT id) AS ids, max(id) AS m FROM events
+    eventually: 30s
+    only: object-store-data-path-rustfs
+  - source-exec: { src: "INSERT INTO events SELECT i, TIMESTAMPTZ '2100-01-01 00:00Z' + i * INTERVAL '1 second', i FROM generate_series(1851, 1900) i" }
+    only: object-store-data-path-rustfs
+  - kill-spiced: {}
+    only: object-store-data-path-rustfs
+  - start: {}
+    only: object-store-data-path-rustfs
+  - query: SELECT * FROM events
+    eventually: 30s
+    only: object-store-data-path-rustfs
+  - query: SELECT count(*) AS n, count(DISTINCT id) AS ids, max(id) AS m FROM events
+    only: object-store-data-path-rustfs
+  - wait-metric:
+      name: cayenne_compaction_outcome_total
+      labels: { table: events, outcome: committed }
+      above: 0
+      drive: { src: "INSERT INTO events SELECT i, TIMESTAMPTZ '2100-01-01 00:00Z' + i * INTERVAL '1 second', i FROM generate_series(10000 + ${round} * 10, 10009 + ${round} * 10) i", every: 2s, rounds: 30 }
+    only: object-store-data-path-rustfs
+  - assert-log: { lacks: ['falling back to full snapshot rewrite'] }
+    only: object-store-data-path-rustfs
+  - assert-objects: { source: lake, prefix: data/events/, contains: .vortex, min: 1 }
+    only: object-store-data-path-rustfs
+  - assert-files: { lacks: ['(^|/)s3:', '\.vortex$', '\.arrow$'] }
+    only: object-store-data-path-rustfs
+  - query: SELECT * FROM events
+    eventually: 30s
+    only: object-store-data-path-rustfs
 
   # Object-native data (#16131): the dataset's folder is in the state location,
   # and nothing is at a local `s3:` path. Appended rows sit in the memory tier

@@ -193,7 +193,7 @@ pub(crate) fn use_direct_writer_for(
 ) -> bool {
     matches!(storage_class, StorageClass::Ebs)
         && matches!(write_class, WriteClass::Maintenance)
-        && !crate::is_object_store_path(&table_path)
+        && !crate::is_object_store_path(table_path)
 }
 
 /// A [`object_store::ObjectStore`] that delegates everything to `inner` (the real

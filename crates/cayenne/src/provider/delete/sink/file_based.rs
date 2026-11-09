@@ -556,7 +556,7 @@ impl FileBasedDeletionSink {
             let snapshot_dir = std::path::PathBuf::from(&self.table_path)
                 .join(&self.table_id)
                 .join(snapshot_id);
-            let removed = if crate::is_object_store_path(&self.table_path) {
+            let removed = if self.provider.data_in_store() {
                 Ok(())
             } else {
                 tokio::fs::remove_dir_all(&snapshot_dir).await

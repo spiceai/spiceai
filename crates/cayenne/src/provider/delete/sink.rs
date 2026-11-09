@@ -64,6 +64,7 @@ use super::vector_io::{
     cleanup_uncommitted_delete_paths,
 };
 use crate::catalog::MetadataCatalog;
+use crate::dataset_storage::DatasetStorage;
 use crate::metadata::{DeleteFile, TableMetadata};
 use arc_swap::ArcSwap;
 use arrow::array::{Array, ArrayRef};
@@ -114,21 +115,31 @@ enum StagedPkDelete {
         new_pks: HashSet<i64>,
         /// The single delete sequence shared by every chunk of this delete.
         delete_sequence: Option<i64>,
+        /// The table's storage, which uncommitted vector files are removed through.
+        storage: Option<Arc<DatasetStorage>>,
     },
     RowKeys {
         delete_files: Vec<DeleteFile>,
         initial: Arc<RowConverterDeletionSnapshot>,
         new_keys: HashSet<Box<[u8]>>,
         delete_sequence: Option<i64>,
+        storage: Option<Arc<DatasetStorage>>,
     },
 }
 
 impl Drop for StagedPkDelete {
     fn drop(&mut self) {
-        let delete_files = match self {
-            Self::Int64 { delete_files, .. } | Self::RowKeys { delete_files, .. } => {
-                std::mem::take(delete_files)
+        let (delete_files, storage) = match self {
+            Self::Int64 {
+                delete_files,
+                storage,
+                ..
             }
+            | Self::RowKeys {
+                delete_files,
+                storage,
+                ..
+            } => (std::mem::take(delete_files), storage.take()),
         };
         if delete_files.is_empty() {
             return;
@@ -139,7 +150,7 @@ impl Drop for StagedPkDelete {
             .collect::<Vec<_>>();
         if let Ok(runtime) = tokio::runtime::Handle::try_current() {
             runtime.spawn(async move {
-                cleanup_uncommitted_delete_paths(&paths).await;
+                cleanup_uncommitted_delete_paths(&paths, storage.as_deref()).await;
             });
         } else {
             cleanup_uncommitted_delete_paths_blocking(paths);
@@ -162,6 +173,8 @@ pub(crate) struct PreparedDeletionPublish {
     deleted_count: u64,
     cleanup_armed: bool,
     scan_input_version: Option<Arc<AtomicU64>>,
+    /// The table's storage, which uncommitted vector files are removed through.
+    storage: Option<Arc<DatasetStorage>>,
 }
 
 enum PreparedDeletionCache {
@@ -294,9 +307,10 @@ impl Drop for PreparedDeletionPublish {
             return;
         }
         let paths = self.cleanup_paths();
+        let storage = self.storage.take();
         if let Ok(runtime) = tokio::runtime::Handle::try_current() {
             runtime.spawn(async move {
-                cleanup_uncommitted_delete_paths(&paths).await;
+                cleanup_uncommitted_delete_paths(&paths, storage.as_deref()).await;
             });
         } else {
             cleanup_uncommitted_delete_paths_blocking(paths);
@@ -358,7 +372,11 @@ pub(crate) struct DeleteScanSource {
 }
 
 impl StagedPkDelete {
-    fn new(strategy: &PkDeletionStrategyWithCache, table_name: &str) -> super::super::Result<Self> {
+    fn new(
+        strategy: &PkDeletionStrategyWithCache,
+        table_name: &str,
+        storage: Option<&Arc<DatasetStorage>>,
+    ) -> super::super::Result<Self> {
         match strategy {
             PkDeletionStrategyWithCache::Int64Pk {
                 deletion_snapshot, ..
@@ -367,6 +385,7 @@ impl StagedPkDelete {
                 initial: deletion_snapshot.load_full(),
                 new_pks: HashSet::new(),
                 delete_sequence: None,
+                storage: storage.map(Arc::clone),
             }),
             PkDeletionStrategyWithCache::RowConverterBased {
                 deletion_snapshot, ..
@@ -375,6 +394,7 @@ impl StagedPkDelete {
                 initial: deletion_snapshot.load_full(),
                 new_keys: HashSet::new(),
                 delete_sequence: None,
+                storage: storage.map(Arc::clone),
             }),
             PkDeletionStrategyWithCache::PositionBased { .. } => Err(Error::Internal {
                 table: table_name.to_string(),
@@ -558,6 +578,9 @@ pub struct CayenneDeletionSink {
     /// superseded position deletion vectors waits for. `None` leaves those files
     /// on disk.
     file_deletion_fence: Option<Arc<tokio::sync::RwLock<()>>>,
+    /// The owning table's storage when its data path is an object-store URL;
+    /// deletion vectors are written, read and removed through its store.
+    dataset_storage: Option<Arc<DatasetStorage>>,
 }
 
 /// The locks a coherent (listing, deletion index) capture holds, outer first.
@@ -601,6 +624,7 @@ impl CayenneDeletionSink {
         runtime_env: Arc<RuntimeEnv>,
         write_lock: Option<Arc<TokioMutex<()>>>,
         seq_allocator: Arc<TokioMutex<super::super::table::SeqAllocator>>,
+        dataset_storage: Option<Arc<DatasetStorage>>,
     ) -> Self {
         Self {
             table_metadata,
@@ -623,6 +647,7 @@ impl CayenneDeletionSink {
             scan_input_version: None,
             capture_locks: None,
             file_deletion_fence: None,
+            dataset_storage,
         }
     }
 
@@ -679,7 +704,11 @@ impl CayenneDeletionSink {
     /// has succeeded. See [`super::vector_io::remove_dropped_deletion_vector_files`].
     pub(crate) fn remove_replaced_deletion_vector_files(&self, replaced: Vec<DeleteFile>) {
         if let Some(fence) = &self.file_deletion_fence {
-            super::vector_io::remove_dropped_deletion_vector_files(replaced, Arc::clone(fence));
+            super::vector_io::remove_dropped_deletion_vector_files(
+                replaced,
+                Arc::clone(fence),
+                self.dataset_storage.clone(),
+            );
         }
     }
 
@@ -762,7 +791,11 @@ impl CayenneDeletionSink {
             PkDeletionStrategyWithCache::Int64Pk { .. } => {
                 let mut pending_pk_values = HashSet::with_capacity(PK_DELETE_FLUSH_BATCH_SIZE);
                 let mut delete_sequence = None;
-                let mut staged = StagedPkDelete::new(&self.pk_deletion_strategy, table_name)?;
+                let mut staged = StagedPkDelete::new(
+                    &self.pk_deletion_strategy,
+                    table_name,
+                    self.dataset_storage.as_ref(),
+                )?;
                 for table in tables {
                     let scan_plan = table
                         .scan(&ctx.state(), Some(&self.pk_column_indices), &[], None)
@@ -813,7 +846,11 @@ impl CayenneDeletionSink {
                 };
                 let mut pending_row_keys = HashSet::with_capacity(PK_DELETE_FLUSH_BATCH_SIZE);
                 let mut delete_sequence = None;
-                let mut staged = StagedPkDelete::new(&self.pk_deletion_strategy, table_name)?;
+                let mut staged = StagedPkDelete::new(
+                    &self.pk_deletion_strategy,
+                    table_name,
+                    self.dataset_storage.as_ref(),
+                )?;
                 for table in tables {
                     let scan_plan = table
                         .scan(&ctx.state(), Some(&self.pk_column_indices), &[], None)
@@ -1086,7 +1123,11 @@ impl CayenneDeletionSink {
                         return Ok(None);
                     }
                     let mut delete_sequence = None;
-                    let mut staged = StagedPkDelete::new(&self.pk_deletion_strategy, table_name)?;
+                    let mut staged = StagedPkDelete::new(
+                        &self.pk_deletion_strategy,
+                        table_name,
+                        self.dataset_storage.as_ref(),
+                    )?;
                     let row_keys = pk_values.into_iter().map(i64_key).collect();
                     let results = self
                         .write_key_based_chunk_with_shared_sequence(row_keys, &mut delete_sequence)
@@ -1110,7 +1151,11 @@ impl CayenneDeletionSink {
                         return Ok(None);
                     }
                     let mut delete_sequence = None;
-                    let mut staged = StagedPkDelete::new(&self.pk_deletion_strategy, table_name)?;
+                    let mut staged = StagedPkDelete::new(
+                        &self.pk_deletion_strategy,
+                        table_name,
+                        self.dataset_storage.as_ref(),
+                    )?;
                     let results = self
                         .write_key_based_chunk_with_shared_sequence(row_keys, &mut delete_sequence)
                         .await?;
@@ -1139,7 +1184,11 @@ impl CayenneDeletionSink {
                 let mut pending_pk_values: Vec<i64> =
                     Vec::with_capacity(PK_DELETE_FLUSH_BATCH_SIZE);
                 let mut delete_sequence: Option<i64> = None;
-                let mut staged = StagedPkDelete::new(&self.pk_deletion_strategy, table_name)?;
+                let mut staged = StagedPkDelete::new(
+                    &self.pk_deletion_strategy,
+                    table_name,
+                    self.dataset_storage.as_ref(),
+                )?;
 
                 for source in tables {
                     let scan_plan = source
@@ -1214,7 +1263,11 @@ impl CayenneDeletionSink {
                 let mut pending_row_keys: Vec<Box<[u8]>> =
                     Vec::with_capacity(PK_DELETE_FLUSH_BATCH_SIZE);
                 let mut delete_sequence: Option<i64> = None;
-                let mut staged = StagedPkDelete::new(&self.pk_deletion_strategy, table_name)?;
+                let mut staged = StagedPkDelete::new(
+                    &self.pk_deletion_strategy,
+                    table_name,
+                    self.dataset_storage.as_ref(),
+                )?;
 
                 for source in tables {
                     let scan_plan = source
@@ -1480,7 +1533,7 @@ impl CayenneDeletionSink {
         };
         let mut metadata = self.table_metadata.clone();
         metadata.current_sequence_number = sequence;
-        DeletionVectorWriter::new(&metadata)
+        DeletionVectorWriter::new(&metadata, self.dataset_storage.as_ref())
             .write(vec![DeletionVectorWriteSpec::new_key_based(row_keys)])
             .await
     }
@@ -1530,6 +1583,7 @@ impl CayenneDeletionSink {
             deleted_count,
             cleanup_armed: true,
             scan_input_version: self.scan_input_version.as_ref().map(Arc::clone),
+            storage: self.dataset_storage.clone(),
         })
     }
 }

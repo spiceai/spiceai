@@ -10,6 +10,19 @@ three things: the files are under the location's
 `s3:` path (#16134), and after `wipe-instance-dir` the instance serves the
 same rows with its source stopped, so nothing can be reloaded from it.
 
+`object-store-data-path-rustfs` (also in `variants.yaml`) keeps the data at
+the dataset's own `cayenne_file_path` in a RustFS bucket with
+`runtime.params.cayenne_vnext` on (#16130). Its checks: no local `s3:` entry,
+deletion vectors in the bucket and none on local disk, data files and
+deletion vectors bounded over 180 s of CDC (`postgres-cdc-parity`), a
+`file_create` restart leaving about one generation of objects
+(`full-refresh-chaos`), and the staging WAL replayed after four kills during
+appends with compaction never falling back to a full rewrite (`append-kill`).
+That the catalog matches the objects after retention is checked by
+`crates/cayenne/tests/object_store_reclaim_test.rs`, which no script can
+reach. With the flag off, an object-store data path fails to load
+(`cayenne-vnext`).
+
 Until the data path lands, these variants fail as recorded in
 `recordings/expected-failures.json` (group `cayenne`). When a recorded
 failure starts passing, re-record it and drop the entry. On the prototype
@@ -21,8 +34,8 @@ start on the machine that recorded them.
 
 | Feature | Covered by | Object-native data variant | Issue |
 | --- | --- | --- | --- |
-| `refresh_mode: full` | `full-refresh-chaos.yaml`, `cayenne-transactions.yaml`, `served-while-source-down.yaml` | added (`full-refresh-chaos`, `cayenne-transactions`) | #16131 |
-| `refresh_mode: append` | `append-kill.yaml`, `append-time-column.yaml` | added (`append-kill`) | #16131 |
+| `refresh_mode: full` | `full-refresh-chaos.yaml`, `cayenne-transactions.yaml`, `served-while-source-down.yaml` | added (`full-refresh-chaos`, `cayenne-transactions`); data path on RustFS: `full-refresh-chaos` | #16131, #16130 |
+| `refresh_mode: append` | `append-kill.yaml`, `append-time-column.yaml` | added (`append-kill`); data path on RustFS: `append-kill` | #16131, #16130 |
 | `refresh_mode: changes` (PostgreSQL, MySQL CDC) | `postgres-cdc-parity.yaml`, `mysql-cdc-parity.yaml`, `postgres-cdc-atomicity.yaml`, `cdc-chaos.yaml` | added (`postgres-cdc-parity`, `mysql-cdc-parity`); TODO `postgres-cdc-atomicity`, `cdc-chaos` | #16132 |
 | `primary_key` | `postgres-cdc-parity.yaml`, `duplicate-keys.yaml`, `cayenne-writes.yaml` | added (`postgres-cdc-parity`, `mysql-cdc-parity`, `append-kill`) | #16132 |
 | `on_conflict` (upsert, drop) | `cayenne-writes.yaml`, `conflict-batches.yaml`, `append-kill.yaml` | added (`append-kill`, upsert); TODO `cayenne-writes`, `conflict-batches` | #16132 |

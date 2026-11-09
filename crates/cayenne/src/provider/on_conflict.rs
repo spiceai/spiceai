@@ -221,9 +221,10 @@ impl Drop for PreparedOnConflictDeletionPublish {
         if paths.is_empty() {
             return;
         }
+        let storage = self.table.dataset_storage().cloned();
         if let Ok(runtime) = tokio::runtime::Handle::try_current() {
             runtime.spawn(async move {
-                super::delete::cleanup_uncommitted_delete_paths(&paths).await;
+                super::delete::cleanup_uncommitted_delete_paths(&paths, storage.as_deref()).await;
             });
         } else {
             std::thread::spawn(move || {
