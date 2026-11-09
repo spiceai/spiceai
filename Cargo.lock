@@ -4998,6 +4998,7 @@ dependencies = [
  "arrow-odbc",
  "async-stream",
  "async-trait",
+ "data-accelerator-api",
  "data-connector-api",
  "data_components",
  "datafusion",
