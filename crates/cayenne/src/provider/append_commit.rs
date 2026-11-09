@@ -271,7 +271,10 @@ async fn resolve_failed_commit(
                 error: Error::IncompleteWrite {
                     table,
                     message: format!(
-                        "a write's commit failed ({error}), and reading back whether it committed failed too ({read_error}). Its files are kept, and writes are refused until the table is reloaded from its catalog. Restart Spice to reload it"
+                        "a write's commit failed ({error}), and reading back whether it committed failed too ({read_error}). Its files are kept, and {} until the table is reloaded from its catalog. Restart Spice to reload it",
+                        super::table::refused_until_reload(
+                            prepared.table.data_in_object_native_location()
+                        )
                     ),
                 },
                 keep_files: true,

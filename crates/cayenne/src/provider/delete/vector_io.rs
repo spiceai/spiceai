@@ -378,6 +378,11 @@ impl Drop for UncommittedDeleteFilesGuard {
                 while pending.remaining.load(Ordering::Acquire) != 0 {
                     std::thread::yield_now();
                 }
+                if let Some(record) = storage.as_deref().and_then(DatasetStorage::writer_record) {
+                    record.release_deletion_files(
+                        paths.iter().filter_map(|path| deletion_file_name(path)),
+                    );
+                }
                 for path in paths {
                     // Object-store files are removed through the store, never as
                     // a local path; without a runtime they are left for the sweep.
@@ -509,6 +514,20 @@ impl<'a> DeletionVectorWriter<'a> {
         let batch_paths = (0..specs.len())
             .map(|_| Self::deletion_file_path(&deletion_dir))
             .collect::<Vec<_>>();
+        // A dataset in the object-native location holds the files in its writer
+        // record before any is uploaded, so the orphan sweep never takes one
+        // whose write or commit is still in flight.
+        if let Some(record) = self
+            .storage
+            .as_deref()
+            .and_then(DatasetStorage::writer_record)
+        {
+            record.hold_deletion_files(
+                batch_paths
+                    .iter()
+                    .filter_map(|path| deletion_file_name(path)),
+            );
+        }
         let mut cleanup_guard =
             UncommittedDeleteFilesGuard::new(batch_paths.clone(), self.storage.clone());
         let write_futures = specs
@@ -1312,12 +1331,29 @@ async fn write_deletion_file(
     })?
 }
 
+/// The file name of the deletion-vector file at `path` (a local path or a URL).
+fn deletion_file_name(path: &Path) -> Option<&str> {
+    path.file_name().and_then(std::ffi::OsStr::to_str)
+}
+
+/// Stops holding the deletion-vector files at `paths` in the dataset's writer
+/// record: their writer deleted them, or no commit names them any more.
+pub(crate) fn release_deletion_files<'a>(
+    storage: Option<&DatasetStorage>,
+    paths: impl IntoIterator<Item = &'a Path>,
+) {
+    if let Some(record) = storage.and_then(DatasetStorage::writer_record) {
+        record.release_deletion_files(paths.into_iter().filter_map(deletion_file_name));
+    }
+}
+
 /// Best-effort removal of physical deletion-vector files that were written but
 /// never committed to the catalog.
 pub(crate) async fn cleanup_uncommitted_delete_paths(
     paths: &[PathBuf],
     storage: Option<&DatasetStorage>,
 ) {
+    release_deletion_files(storage, paths.iter().map(PathBuf::as_path));
     for path in paths {
         match deletion_vector_location(storage, &path.to_string_lossy()) {
             Ok(Some((store, location))) => {
@@ -1362,6 +1398,12 @@ pub(crate) fn remove_dropped_deletion_vector_files(
     file_deletion_fence: Arc<tokio::sync::RwLock<()>>,
     storage: Option<Arc<DatasetStorage>>,
 ) {
+    // No commit names these files any more: the orphan sweep takes any of them
+    // left in the store.
+    release_deletion_files(
+        storage.as_deref(),
+        files.iter().map(|file| Path::new(file.path.as_str())),
+    );
     let paths: Vec<PathBuf> = files
         .into_iter()
         .filter(|file| !file.path_is_relative)

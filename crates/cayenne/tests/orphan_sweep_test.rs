@@ -562,20 +562,23 @@ async fn an_upload_whose_commit_outcome_is_unknown_is_not_reclaimed() {
     assert_eq!(placed.count().await.expect("count"), (2100, 2100));
 }
 
-/// A write in flight whose data files are uploaded and whose commit has not
-/// happened yet: the sweep, with no floor at all, keeps every file the write
-/// holds, and the write then commits all of them.
+/// A write in flight whose data files are uploaded at their final keys and
+/// whose commit has not landed yet: a sweep with no floor at all that runs
+/// meanwhile deletes none of its files (it reads the dataset's state only once
+/// the commit is out of the way, and the write's own record holds the files
+/// until then), and the write then commits all of them.
 #[tokio::test]
 async fn a_write_in_flight_keeps_its_uploaded_files_whatever_their_age() {
     let rig = Rig::new();
     let placed = Arc::new(rig.place(rig.catalog().await, "orders", None).await);
     placed.insert(1, 1000).await.expect("first write");
     placed.table.set_orphan_age_floor(Duration::ZERO);
-    // Hold the write's staging WAL: its data files are uploaded by then, and
-    // no commit names them yet.
+    // Hold the write's commit: its data files are uploaded by then, and no
+    // commit names them yet.
+    let dataset_head = head_of(&placed.native, "orders");
     rig.faults.arm(
-        Op::Put,
-        |path: &Path| path.as_ref().ends_with("/_wal.json"),
+        Op::Cas,
+        move |path: &Path| path == &dataset_head,
         Fault::Hold,
     );
     let writer = {
@@ -583,18 +586,26 @@ async fn a_write_in_flight_keeps_its_uploaded_files_whatever_their_age() {
         tokio::spawn(async move { placed.insert(1001, 2000).await })
     };
     let held = rig.faults.wait_held(None).await;
-    let swept = placed.table.sweep_orphan_files_now().await.expect("sweep");
+    let uploaded = rig.data_files(&placed.data_prefix).await;
+    let sweeper = {
+        let placed = Arc::clone(&placed);
+        tokio::spawn(async move { placed.table.sweep_orphan_files_now().await })
+    };
+    rig.faults.deliver(held).await.expect("the commit lands");
+    rig.faults.respond(held).expect("the writer hears it");
+    writer.await.expect("join").expect("the write commits");
+    let swept = sweeper.await.expect("join the sweep").expect("sweep");
     assert!(
         swept.deleted.is_empty(),
         "the sweep deleted a write's files in flight: {swept:?}"
     );
-    assert!(
-        swept.kept_in_flight > 0,
-        "the in-flight write's files were seen and kept: {swept:?}"
-    );
-    rig.faults.deliver(held).await.expect("the commit lands");
-    rig.faults.respond(held).expect("the writer hears it");
-    writer.await.expect("join").expect("the write commits");
+    let remaining = rig.data_files(&placed.data_prefix).await;
+    for key in &uploaded {
+        assert!(
+            remaining.contains(key),
+            "the sweep deleted {key}, uploaded before the commit: {swept:?}"
+        );
+    }
     assert_eq!(placed.count().await.expect("count"), (2000, 2000));
 }
 

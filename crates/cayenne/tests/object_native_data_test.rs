@@ -1050,9 +1050,10 @@ async fn a_planted_file_is_never_adopted_by_a_placed_dataset() {
 }
 
 /// A write whose files fail to reach their snapshot is not visible, and after a
-/// reopen it is all there or not there at all, never part of it.
+/// reopen it is all there or not there at all, never part of it. Its files are
+/// written once at their final keys, so the failure is the upload's.
 #[tokio::test]
-async fn a_failed_move_is_invisible_and_resolves_all_or_nothing() {
+async fn a_failed_upload_is_invisible_and_resolves_all_or_nothing() {
     let (setup, catalog, table, ctx) = create("ledger").await;
     run(
         &ctx,
@@ -1064,13 +1065,17 @@ async fn a_failed_move_is_invisible_and_resolves_all_or_nothing() {
         (1000, expected_sum(1, 1000))
     );
 
-    // The next write's copy from staging into the snapshot fails before I/O.
-    let data_prefix = setup.data_prefix.clone();
-    setup.faults.arm(
-        Op::Copy,
-        move |path: &Path| path.as_ref().starts_with(&data_prefix),
-        Fault::Fail,
-    );
+    // The next write's data file uploads fail before I/O.
+    for op in [Op::Put, Op::MultipartComplete] {
+        let data_prefix = setup.data_prefix.clone();
+        setup.faults.arm(
+            op,
+            move |path: &Path| {
+                path.as_ref().starts_with(&data_prefix) && path.as_ref().ends_with(".vortex")
+            },
+            Fault::Fail,
+        );
+    }
     let failed = ctx
         .sql("INSERT INTO ledger SELECT value AS id, value * 10 AS v FROM generate_series(1001, 3000)")
         .await
@@ -1079,7 +1084,7 @@ async fn a_failed_move_is_invisible_and_resolves_all_or_nothing() {
         .await;
     assert!(
         failed.is_err(),
-        "the write whose move failed reports an error"
+        "the write whose upload failed reports an error"
     );
     assert_eq!(
         count_and_sum(&ctx, "ledger").await,
@@ -1103,7 +1108,7 @@ async fn a_failed_move_is_invisible_and_resolves_all_or_nothing() {
         after == (1000, expected_sum(1, 1000)) || after == (3000, expected_sum(1, 3000)),
         "after a reopen the failed write is all there or not at all: {after:?}"
     );
-    eprintln!("a_failed_move: after reopen {after:?}");
+    eprintln!("a_failed_upload: after reopen {after:?}");
 }
 
 /// Whether `key` is a deletion vector (`….arrow`).

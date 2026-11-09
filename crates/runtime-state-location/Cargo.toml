@@ -11,6 +11,7 @@ version.workspace = true
 
 [dependencies]
 async-trait.workspace = true
+aws-sdk-s3.workspace = true
 aws-sdk-credential-bridge = { path = "../aws-sdk-credential-bridge" }
 bytes.workspace = true
 datafusion.workspace = true

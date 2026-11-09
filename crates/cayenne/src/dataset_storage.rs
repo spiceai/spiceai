@@ -227,6 +227,10 @@ pub struct DatasetStorage {
     /// Whether the dataset's data is in the object-native location
     /// ([`crate::metastore_layout::is_object_native_data_path`]).
     in_location: bool,
+    /// The table's record of the files its writes have not committed yet, for a
+    /// dataset in the location: its deletion-vector writes hold their files there
+    /// until a commit names them (see [`crate::provider::uncommitted_files`]).
+    writer_record: Option<Arc<crate::provider::uncommitted_files::UncommittedFiles>>,
 }
 
 impl DatasetStorage {
@@ -283,7 +287,29 @@ impl DatasetStorage {
             recorded_authority,
             dataset,
             table_path,
+            writer_record: None,
         })
+    }
+
+    /// Gives the dataset's deletion-vector writes the table's record of
+    /// uncommitted files, for a dataset in the object-native location; other
+    /// datasets keep none.
+    #[must_use]
+    pub(crate) fn with_writer_record(
+        mut self,
+        record: Arc<crate::provider::uncommitted_files::UncommittedFiles>,
+    ) -> Self {
+        if self.in_location {
+            self.writer_record = Some(record);
+        }
+        self
+    }
+
+    /// The table's record of uncommitted files, for a dataset in the location.
+    pub(crate) fn writer_record(
+        &self,
+    ) -> Option<&crate::provider::uncommitted_files::UncommittedFiles> {
+        self.writer_record.as_deref()
     }
 
     /// Whether the dataset's data is in the object-native location: its committed

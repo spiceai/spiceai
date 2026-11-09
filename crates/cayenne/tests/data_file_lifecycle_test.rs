@@ -802,6 +802,17 @@ async fn keyed_table(
     keys: i64,
     session: SessionConfig,
 ) -> (Location, Process) {
+    keyed_table_reopened_with(name, upserts, keys, session, &armed()).await
+}
+
+/// [`keyed_table`], reopened with `config`.
+async fn keyed_table_reopened_with(
+    name: &str,
+    upserts: usize,
+    keys: i64,
+    session: SessionConfig,
+    config: &VortexConfig,
+) -> (Location, Process) {
     let (location, process) = Location::create(name, true, session.clone()).await;
     for round in 0..upserts {
         let round = i64::try_from(round).expect("round");
@@ -816,7 +827,7 @@ async fn keyed_table(
         .expect("drain");
     process.table.quiesce().await;
     drop(process);
-    let process = location.open(name, &armed(), session).await;
+    let process = location.open(name, config, session).await;
     process
         .table
         .drain_in_flight_maintenance()
@@ -1382,16 +1393,37 @@ enum Step {
     Merge,
     /// Replace an append-only table's rows.
     Overwrite,
+    /// Append rows to an append-only table.
+    Append,
+    /// Upsert every key of a keyed table: a new snapshot and a key deletion vector.
+    Upsert,
 }
 
 impl Step {
     fn keyed(self) -> bool {
-        matches!(self, Self::Merge)
+        matches!(self, Self::Merge | Self::Upsert)
+    }
+
+    /// The settings a process runs the step with: a merge and an overwrite with
+    /// the merge armed; an append and an upsert with every automatic trigger
+    /// parked, so the step's requests are its own.
+    fn config(self) -> VortexConfig {
+        match self {
+            Self::Merge | Self::Overwrite => armed(),
+            Self::Append | Self::Upsert => parked(),
+        }
     }
 
     async fn start(self) -> (Location, Process) {
         if self.keyed() {
-            return keyed_with_protected_snapshots("orders", 4).await;
+            return keyed_table_reopened_with(
+                "orders",
+                4,
+                KEYS,
+                SessionConfig::new(),
+                &self.config(),
+            )
+            .await;
         }
         let (location, process) = Location::create("orders", false, SessionConfig::new()).await;
         for append in 0..4 {
@@ -1410,7 +1442,7 @@ impl Step {
         process.table.quiesce().await;
         drop(process);
         let process = location
-            .open("orders", &armed(), SessionConfig::new())
+            .open("orders", &self.config(), SessionConfig::new())
             .await;
         (location, process)
     }
@@ -1427,6 +1459,12 @@ impl Step {
         match self {
             Self::Overwrite => (5_000..5_700).map(|id| (id, -id)).collect(),
             Self::Merge => self.before(),
+            Self::Append => {
+                let mut rows = self.before();
+                rows.extend((5_000..5_500).map(|id| (id, id)));
+                rows
+            }
+            Self::Upsert => upserted(5),
         }
     }
 
@@ -1446,6 +1484,14 @@ impl Step {
             .await
             .map(|_| true)
             .map_err(|error| error.to_string()),
+            Self::Append => common::insert_batch(&table, batch(5_000..5_500, |id| id))
+                .await
+                .map(|_| true)
+                .map_err(|error| error.to_string()),
+            Self::Upsert => common::insert_batch(&table, batch(0..KEYS, |id| id * 1000 + 4))
+                .await
+                .map(|_| true)
+                .map_err(|error| error.to_string()),
         }?;
         table.reclaim_retired_snapshots_now().await;
         Ok(committed)
@@ -1473,7 +1519,8 @@ impl Step {
 /// process killed just before it. After each kill, a new process over the same
 /// storage serves either every row from before or every row from after (after
 /// only, when the step was acknowledged), stores every file its committed state
-/// names, and keeps both true through its own sweep.
+/// names, and keeps both true through its own sweeps; its orphan sweep then
+/// leaves no data file and no deletion vector that no commit names.
 async fn kill_at_every_request(step: Step) {
     let (_location, process) = step.start().await;
     process.instance.clear_steps();
@@ -1487,6 +1534,22 @@ async fn kill_at_every_request(step: Step) {
     drop(process);
     assert!(!steps.is_empty());
     eprintln!("{step:?}: {} storage requests", steps.len());
+    if matches!(step, Step::Append | Step::Upsert) {
+        // Each data file is written once, at its final key: nothing is staged,
+        // copied, or listed on the write path.
+        let staged_or_copied: Vec<&String> = steps
+            .iter()
+            .filter(|step| {
+                step.starts_with("copy ")
+                    || step.starts_with("list ")
+                    || step.contains("/_staging/")
+            })
+            .collect();
+        assert!(
+            staged_or_copied.is_empty(),
+            "{step:?}: requests that stage, copy or list: {staged_or_copied:?}"
+        );
+    }
 
     let mut acknowledged = 0;
     let mut killed = 0;
@@ -1501,7 +1564,7 @@ async fn kill_at_every_request(step: Step) {
         drop(process);
 
         let next = location
-            .open("orders", &armed(), SessionConfig::new())
+            .open("orders", &step.config(), SessionConfig::new())
             .await;
         let mut rows = next.rows("orders").await;
         rows.sort_unstable();
@@ -1556,6 +1619,34 @@ async fn kill_at_every_request(step: Step) {
             .filter(|key| !named.contains(key))
             .count();
         unnamed_total += unnamed;
+        // The orphan sweep, with no floor, takes every one of them, data files
+        // and deletion vectors alike, and nothing a commit names.
+        next.table.set_orphan_age_floor(Duration::ZERO);
+        let report = next
+            .table
+            .sweep_orphan_files_now()
+            .await
+            .expect("the orphan sweep");
+        assert_eq!(report.skipped, None, "{what}: the orphan sweep ran");
+        let named = next.named_files(&location).await;
+        let left: Vec<String> = location
+            .probe
+            .objects(&location.data_prefix)
+            .await
+            .into_keys()
+            .filter(|key| has_extension(key, "vortex") || has_extension(key, "arrow"))
+            .filter(|key| !named.contains(key))
+            .collect();
+        assert!(
+            left.is_empty(),
+            "{what}: files no commit names are left after the orphan sweep: {left:?} (it deleted {:?})",
+            report.deleted
+        );
+        next.assert_named_files_stored(&location, &format!("{what}, after the orphan sweep"))
+            .await;
+        let mut swept = next.rows("orders").await;
+        swept.sort_unstable();
+        assert_eq!(swept, rows, "{what}: the orphan sweep changed the rows");
         next.table.quiesce().await;
     }
     eprintln!(
@@ -1572,4 +1663,14 @@ async fn a_kill_at_any_storage_request_of_a_protected_merge_loses_nothing() {
 #[tokio::test(flavor = "multi_thread")]
 async fn a_kill_at_any_storage_request_of_an_overwrite_is_all_or_nothing() {
     kill_at_every_request(Step::Overwrite).await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_kill_at_any_storage_request_of_an_append_leaves_only_orphans() {
+    kill_at_every_request(Step::Append).await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_kill_at_any_storage_request_of_an_upsert_leaves_only_orphans() {
+    kill_at_every_request(Step::Upsert).await;
 }

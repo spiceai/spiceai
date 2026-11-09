@@ -469,6 +469,45 @@ pub async fn build_unmetered_object_store(
     Ok((store, base_prefix))
 }
 
+/// An AWS SDK S3 client for an `s3://` location, built from the same `params`
+/// as [`build_object_store`]'s store for `feature`, with the location's bucket:
+/// for the requests `object_store` does not expose, such as listing and aborting
+/// unfinished multipart uploads. `None` for a location that is not `s3://`.
+///
+/// # Errors
+///
+/// Returns an error when the location is not a valid URL or its `params` are
+/// invalid.
+pub async fn build_s3_sdk_client(
+    secrets: Arc<RwLock<Secrets>>,
+    io_runtime: Handle,
+    state: &StateLocation,
+    feature: StateFeature,
+) -> Result<Option<(aws_sdk_s3::Client, String)>> {
+    let usage = feature.usage();
+    let url = Url::parse(&state.location).context(InvalidStateLocationSnafu {
+        usage,
+        location: state.location.as_str(),
+    })?;
+    if url.scheme() != "s3" {
+        return Ok(None);
+    }
+    let params = state.params.as_ref().map(Params::as_string_map);
+    let s3_params = build_s3_parameters(secrets, params.as_ref(), feature, state.source).await?;
+    let builder = S3ObjectStoreBuilder::from_url(&url, io_runtime)
+        .context(S3ObjectStoreInitSnafu {
+            usage,
+            location: url.to_string(),
+        })?
+        .with_secret_params(&s3_params.to_secret_map())
+        .context(S3ObjectStoreInitSnafu {
+            usage,
+            location: url.to_string(),
+        })?;
+    let client = builder.build_sdk_client().await;
+    Ok(Some((client, builder.bucket_name().to_string())))
+}
+
 /// Validates an `s3://` location's `params`, given by `source`, against
 /// `feature`'s S3 parameters, resolving `${ secrets:… }` references.
 ///

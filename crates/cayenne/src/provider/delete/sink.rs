@@ -1602,7 +1602,11 @@ impl DeletionSink for CayenneDeletionSink {
             None => None,
         };
         if let Some(flag) = &self.publication_outcome_unknown {
-            super::super::table::ensure_outcome_known(flag, &self.table_metadata.table_name)?;
+            super::super::table::ensure_outcome_known(
+                flag,
+                &self.table_metadata.table_name,
+                crate::metastore_layout::is_object_native_data_path(&self.table_metadata.path),
+            )?;
         }
 
         let ctx = SessionContext::new_with_config_rt(

@@ -3952,19 +3952,45 @@ fn retention_deleted_message(table_name: &str, deleted: u64) -> String {
 /// task; larger ones hash and sort their keys on the blocking pool.
 const MEM_TIER_INDEX_INLINE_ROWS: usize = 1_024;
 
+/// What a table refuses, until it is reloaded, after a write that could not
+/// learn whether it committed: writes, and queries as well when its data is in
+/// the object-native location (`refuses_queries`), whose in-memory view may then
+/// differ from its state.
+pub(crate) fn refused_until_reload(refuses_queries: bool) -> &'static str {
+    if refuses_queries {
+        "writes and queries are refused"
+    } else {
+        "writes are refused"
+    }
+}
+
+/// The message for a write or query of a table refused because an earlier write
+/// could not confirm whether it committed (see [`refused_until_reload`]).
+pub(crate) fn outcome_unknown_message(refuses_queries: bool) -> String {
+    format!(
+        "an earlier write could not confirm whether it committed, so {} until the table is reloaded from its catalog. Restart Spice to reload it",
+        refused_until_reload(refuses_queries)
+    )
+}
+
 /// Refuse a write of `table` once `outcome_unknown` is set: an earlier write
 /// could not learn whether its catalog transaction committed, so the table's
 /// in-memory view may miss rows the catalog holds, which only reloading the table
-/// from the catalog restores.
+/// from the catalog restores. `refuses_queries` says whether the table refuses
+/// its queries too ([`refused_until_reload`]).
 ///
 /// # Errors
 ///
 /// Returns [`Error::IncompleteWrite`] after such a write.
-pub(crate) fn ensure_outcome_known(outcome_unknown: &AtomicBool, table: &str) -> Result<()> {
+pub(crate) fn ensure_outcome_known(
+    outcome_unknown: &AtomicBool,
+    table: &str,
+    refuses_queries: bool,
+) -> Result<()> {
     if outcome_unknown.load(Ordering::Acquire) {
         return Err(Error::IncompleteWrite {
             table: table.to_string(),
-            message: "an earlier write could not confirm whether it committed, so writes are refused until the table is reloaded from its catalog. Restart Spice to reload it".to_string(),
+            message: outcome_unknown_message(refuses_queries),
         });
     }
     Ok(())
@@ -6509,6 +6535,45 @@ impl CayenneTableProvider {
         self.dataset_storage.is_some()
     }
 
+    /// Whether this table's appends write each data file once, at its final key
+    /// in the snapshot directory they commit to, and commit by naming the files
+    /// in the snapshot's manifest: no staging prefix, staging WAL, copy or
+    /// listing. True for a table whose data is in the object-native location on
+    /// an object store; a local directory keeps the staged write and its
+    /// rename.
+    pub(crate) fn writes_at_final_keys(&self) -> bool {
+        self.data_in_object_native_location()
+            && self
+                .dataset_storage
+                .as_ref()
+                .is_some_and(|storage| !storage.is_local())
+    }
+
+    /// Starts the staged append `staging_snapshot_id` as a write at final keys
+    /// into `target_snapshot_id`'s directory when the table writes at final
+    /// keys ([`Self::writes_at_final_keys`]); returns whether it did. Call it
+    /// before the append writes its first file.
+    pub(crate) fn begin_final_key_write(
+        &self,
+        staging_snapshot_id: &str,
+        target_snapshot_id: &str,
+    ) -> bool {
+        if !self.writes_at_final_keys() {
+            return false;
+        }
+        self.uncommitted_files
+            .begin_final_key_write(staging_snapshot_id, target_snapshot_id);
+        true
+    }
+
+    /// Whether the staged append `staging_snapshot_id` writes at final keys and
+    /// has not ended yet.
+    pub(crate) fn is_final_key_write(&self, staging_snapshot_id: &str) -> bool {
+        self.uncommitted_files
+            .final_key_directory(staging_snapshot_id)
+            .is_some()
+    }
+
     /// The dataset's storage handle; `None` for a table at a plain local path.
     pub(crate) fn dataset_storage(&self) -> Option<&Arc<crate::dataset_storage::DatasetStorage>> {
         self.dataset_storage.as_ref()
@@ -6695,7 +6760,11 @@ impl CayenneTableProvider {
     ///
     /// Returns [`Error::IncompleteWrite`] after such a write.
     pub(crate) fn ensure_publication_outcome_known(&self) -> Result<()> {
-        ensure_outcome_known(&self.publication_outcome_unknown, self.table_name())
+        ensure_outcome_known(
+            &self.publication_outcome_unknown,
+            self.table_name(),
+            self.data_in_object_native_location(),
+        )
     }
 
     #[must_use]
@@ -9746,6 +9815,19 @@ impl CayenneTableProvider {
     }
 
     pub(crate) async fn clear_staging_snapshot_dir(&self, staging_snapshot_id: &str) -> Result<()> {
+        match self
+            .uncommitted_files
+            .discard_final_key_write(staging_snapshot_id)
+        {
+            super::uncommitted_files::DiscardedFinalKeyWrite::Unknown => {}
+            // Its commit was accepted: its files are the table's now.
+            super::uncommitted_files::DiscardedFinalKeyWrite::Committed => return Ok(()),
+            super::uncommitted_files::DiscardedFinalKeyWrite::Uncommitted { directory, files } => {
+                return self
+                    .delete_uncommitted_final_key_files(&directory, &files)
+                    .await;
+            }
+        }
         self.uncommitted_files.forget(staging_snapshot_id);
         if self.data_in_store() {
             if let Some(prefix) = self.snapshot_object_store_prefix(staging_snapshot_id)? {
@@ -9794,6 +9876,14 @@ impl CayenneTableProvider {
         staging_snapshot_id: &str,
         target_snapshot_id: &str,
     ) -> Result<()> {
+        if let Some(directory) = self
+            .uncommitted_files
+            .final_key_directory(staging_snapshot_id)
+        {
+            return self
+                .commit_final_key_write(staging_snapshot_id, &directory, target_snapshot_id)
+                .await;
+        }
         if self.data_in_store() {
             self.move_staging_files_s3(staging_snapshot_id, target_snapshot_id)
                 .await
@@ -9801,6 +9891,83 @@ impl CayenneTableProvider {
             self.move_staging_files_local(staging_snapshot_id, target_snapshot_id)
                 .await
         }
+    }
+
+    /// Commits the append `write_key`, which wrote its files once at their final
+    /// keys in `directory`, to `target_snapshot_id`: one commit records the files
+    /// in that snapshot's manifest, which is what makes them part of the table.
+    /// Nothing is copied, moved, listed or deleted.
+    ///
+    /// When the commit fails, its outcome may still be that it landed, so the
+    /// files are neither deleted nor held any longer: from then on the table's
+    /// state decides. A commit that names them keeps them; otherwise they are
+    /// orphans the orphan sweep reclaims after its age floor, and it does not
+    /// run while the outcome is unknown.
+    async fn commit_final_key_write(
+        &self,
+        write_key: &str,
+        directory: &str,
+        target_snapshot_id: &str,
+    ) -> Result<()> {
+        ensure!(
+            directory == target_snapshot_id,
+            InternalSnafu {
+                table: self.table_metadata.table_name.clone(),
+                message: format!(
+                    "An append wrote its data files into snapshot '{directory}' but was asked to commit them to snapshot '{target_snapshot_id}'"
+                ),
+            }
+        );
+        let files = self.uncommitted_files.files(write_key);
+        if let Err(error) = self
+            .record_files_in_manifest(target_snapshot_id, &files)
+            .await
+        {
+            self.uncommitted_files.end_final_key_write(write_key);
+            return Err(error);
+        }
+        self.uncommitted_files
+            .mark_final_key_write_committed(write_key);
+        tracing::debug!(
+            "Committed {} file(s) written at their final keys to snapshot {target_snapshot_id} for table {}",
+            files.len(),
+            self.table_metadata.table_name,
+        );
+        self.record_current_snapshot_files_added(files.len());
+        Ok(())
+    }
+
+    /// Deletes `files` of `directory`, written at their final keys by an append
+    /// that never committed and was discarded. A file left behind is an orphan
+    /// the orphan sweep reclaims.
+    async fn delete_uncommitted_final_key_files(
+        &self,
+        directory: &str,
+        files: &[String],
+    ) -> Result<()> {
+        if files.is_empty() {
+            return Ok(());
+        }
+        let config = self.require_object_store()?;
+        let Some(prefix) = self.snapshot_object_store_prefix(directory)? else {
+            return Ok(());
+        };
+        let outcome = crate::dataset_storage::delete_in_batches(
+            &config.store,
+            files
+                .iter()
+                .map(|name| crate::object_child(&prefix, name))
+                .collect(),
+        )
+        .await;
+        if let Some(source) = outcome.first_error {
+            return Err(Error::ObjectStore {
+                operation: "delete the data files of an append that did not commit",
+                table: self.table_metadata.table_name.clone(),
+                source,
+            });
+        }
+        Ok(())
     }
 
     /// Move write-time footer-cache entries along with staged files.
@@ -10790,6 +10957,18 @@ impl CayenneTableProvider {
         let mut table_metadata = catalog.get_table(table_name).await?;
         table_metadata.on_conflict =
             upsert_on_primary_key(&table_metadata.primary_key, table_metadata.on_conflict);
+        // A table in the object-native location takes the location's lister of
+        // unfinished multipart uploads unless it was given its own.
+        let unfinished_uploads = unfinished_uploads.or_else(|| {
+            crate::metastore_layout::is_object_native_data_path(&table_metadata.path)
+                .then(|| {
+                    catalog
+                        .as_any()
+                        .downcast_ref::<crate::metastore::object_native::ObjectNativeCatalog>()
+                        .and_then(crate::metastore::object_native::ObjectNativeCatalog::unfinished_uploads)
+                })
+                .flatten()
+        });
         if partitioned_table_conflict_detection == Some(PkConflictDetection::None) {
             table_metadata.vortex_config.pk_conflict_detection = PkConflictDetection::None;
             table_metadata.on_conflict = None;
@@ -10801,6 +10980,10 @@ impl CayenneTableProvider {
             CayenneContext::new(&table_metadata.vortex_config, runtime_env, table_name)
         });
 
+        // The files this table's writers put in its storage and no commit names
+        // yet (see `super::uncommitted_files`), shared with its storage for the
+        // deletion vectors written through it.
+        let uncommitted_files: Arc<super::uncommitted_files::UncommittedFiles> = Arc::default();
         // A table whose data path is an object-store URL reads and writes through
         // its own store, under a URL of its own (see `crate::dataset_storage`).
         // A `file://` table given no store (the `cayenne_vnext` flag off) keeps the
@@ -10826,7 +11009,8 @@ impl CayenneTableProvider {
                 .map_err(|message| Error::Internal {
                     table: table_name.to_string(),
                     message,
-                })?;
+                })?
+                .with_writer_record(Arc::clone(&uncommitted_files));
                 (
                     Some(crate::metadata::ObjectStoreConfig {
                         url: storage.url().clone(),
@@ -11270,7 +11454,7 @@ impl CayenneTableProvider {
             staging_wal_present: Arc::new(AtomicBool::new(force_staging_probe_on_startup)),
             staging_may_have_files: Arc::new(AtomicBool::new(force_staging_probe_on_startup)),
             publication_outcome_unknown: Arc::new(AtomicBool::new(false)),
-            uncommitted_files: Arc::default(),
+            uncommitted_files,
             unfinished_uploads,
             orphan_age_floor_ms: Arc::new(AtomicU64::new(
                 u64::try_from(super::orphan_sweep::ORPHAN_AGE_FLOOR.as_millis())
@@ -12089,9 +12273,14 @@ impl CayenneTableProvider {
             encode_permit_wait_start,
         );
 
-        // Construct snapshot directory URL
-        let snapshot_dir_url =
-            Self::snapshot_dir_url(self.data_root(), &self.table_metadata.table_id, snapshot_id);
+        // Construct snapshot directory URL. An append writing at its final keys
+        // writes into the snapshot directory it commits to.
+        let final_key_directory = self.uncommitted_files.final_key_directory(snapshot_id);
+        let snapshot_dir_url = Self::snapshot_dir_url(
+            self.data_root(),
+            &self.table_metadata.table_id,
+            final_key_directory.as_deref().unwrap_or(snapshot_id),
+        );
 
         // Build the write-path Vortex format for this snapshot. Unsorted writes
         // are sharded across `target_partitions` concurrent encoders (PK-hashed
@@ -23692,6 +23881,13 @@ impl CayenneTableProvider {
             parts.pop();
             parts.into_iter().collect()
         };
+        // The dataset's data path: the table's prefix, and the deletion vectors
+        // beside it (`<snapshot>/deletions/<file>.arrow`).
+        let data_prefix: ObjectStorePath = {
+            let mut parts: Vec<_> = table_prefix.parts().collect();
+            parts.pop();
+            parts.into_iter().collect()
+        };
         let store_error = |operation: &'static str| {
             let table = self.table_name().to_string();
             move |source| Error::ObjectStore {
@@ -23733,10 +23929,18 @@ impl CayenneTableProvider {
             untouchable
         };
         let objects: Vec<ObjectMeta> = store
-            .list(Some(&table_prefix))
+            .list(Some(&data_prefix))
             .try_collect()
             .await
             .map_err(store_error("list the table's objects for the orphan sweep"))?;
+        // Deletion vectors no commit names: `(name, object)`.
+        let deletion_candidates: Vec<(&str, &ObjectMeta)> = objects
+            .iter()
+            .filter_map(|meta| {
+                let relative = crate::object_relative(&data_prefix, &meta.location)?;
+                super::orphan_sweep::deletion_vector_name(relative).map(|name| (name, meta))
+            })
+            .collect();
         // A staging directory with a staging WAL belongs to recovery.
         let staged_with_wal: HashSet<String> = objects
             .iter()
@@ -23777,6 +23981,7 @@ impl CayenneTableProvider {
         // held at the first read is named by the second if it committed since.
         let held = self.uncommitted_files.held();
         let held_snapshots = self.uncommitted_files.snapshots();
+        let held_deletion_files = self.uncommitted_files.held_deletion_files();
         let named: HashSet<(String, String)> = self
             .catalog
             .get_all_snapshot_files(&table_id)
@@ -23784,6 +23989,26 @@ impl CayenneTableProvider {
             .into_iter()
             .map(|file| (file.snapshot_id, file.file_path))
             .collect();
+        let named_deletion_files: HashSet<String> = self
+            .catalog
+            .get_table_delete_files(&table_id)
+            .await?
+            .into_iter()
+            .filter_map(|file| {
+                std::path::Path::new(&file.path)
+                    .file_name()
+                    .and_then(std::ffi::OsStr::to_str)
+                    .map(str::to_string)
+            })
+            .collect();
+        // A held deletion vector a commit now names needs no holding: from here
+        // on only a commit that drops it makes it garbage.
+        self.uncommitted_files.release_deletion_files(
+            held_deletion_files
+                .iter()
+                .filter(|name| named_deletion_files.contains(*name))
+                .map(String::as_str),
+        );
         // A directory that left the live set since the listing (a compaction
         // retired it) belongs to the retired-directory sweep now.
         let live_now = self.live_snapshot_ids_for_sweep().await?;
@@ -23791,25 +24016,47 @@ impl CayenneTableProvider {
             report.skipped = Some("the table's retired snapshots are not settled");
             return Ok(report);
         };
-        let untouchable_now: HashSet<String> = {
-            let (_, in_use) = self.snapshot_cleanup_pins();
-            let mut untouchable = in_use;
-            untouchable.extend(self.retired_snapshot_dirs.lock().keys().cloned());
-            untouchable.extend(durably_retired_now);
-            untouchable
+        let (_, in_use_now) = self.snapshot_cleanup_pins();
+        let retired_now: HashSet<String> = {
+            let mut retired: HashSet<String> =
+                self.retired_snapshot_dirs.lock().keys().cloned().collect();
+            retired.extend(durably_retired_now);
+            retired
         };
         let mut doomed = Vec::new();
         for (snapshot, file, live_dir, meta) in candidates {
             if named.contains(&(snapshot.clone(), file.clone())) {
                 continue;
             }
+            // A scan reads a live snapshot's files from its committed manifest
+            // (or, while a write builds it, from that write's record, which
+            // holds them), so an unnamed file of a live directory is read by no
+            // scan however long scans keep the directory in use: the current
+            // directory, where an append that never committed leaves its files,
+            // is in use for as long as queries run. A directory that is not live
+            // may still be read by a scan that pinned it, so one in use is kept.
             if (live_dir && !live_now.contains(&snapshot))
                 || (!live_dir && live_now.contains(&snapshot))
-                || untouchable_now.contains(&snapshot)
+                || retired_now.contains(&snapshot)
+                || (!live_dir && in_use_now.contains(&snapshot))
             {
                 continue;
             }
             if held_snapshots.contains(&snapshot) || held.contains(&(snapshot, file)) {
+                report.kept_in_flight += 1;
+                continue;
+            }
+            if !older_than_floor(meta.last_modified, store_now, floor) {
+                report.kept_young += 1;
+                continue;
+            }
+            doomed.push(meta.location.clone());
+        }
+        for (name, meta) in deletion_candidates {
+            if named_deletion_files.contains(name) {
+                continue;
+            }
+            if held_deletion_files.contains(name) {
                 report.kept_in_flight += 1;
                 continue;
             }
@@ -23824,6 +24071,7 @@ impl CayenneTableProvider {
                 Ok(()) | Err(object_store::Error::NotFound { .. }) => {
                     report.deleted.push(
                         crate::object_relative(&table_prefix, &location)
+                            .or_else(|| crate::object_relative(&data_prefix, &location))
                             .unwrap_or(location.as_ref())
                             .to_string(),
                     );
@@ -24585,6 +24833,14 @@ impl CayenneTableProvider {
         let Some(storage) = self.dataset_storage.as_ref() else {
             return HashMap::new();
         };
+        // No commit names these files any more: the orphan sweep takes any of
+        // them a delete below leaves behind.
+        super::delete::vector_io::release_deletion_files(
+            Some(storage),
+            files
+                .iter()
+                .map(|file| std::path::Path::new(file.path.as_str())),
+        );
         let mut by_location: HashMap<ObjectStorePath, String> = HashMap::new();
         for file in files.iter().filter(|file| !file.path_is_relative) {
             if let Ok(Some(location)) = storage.resolve(&file.path) {
@@ -71099,6 +71355,21 @@ mod tests {
     /// rows went because of `retention_sql`, and how many. Pinned here because the text
     /// is the surface specified in #14337, and a `tracing` field is not a substitute for
     /// the dataset appearing in the text a `grep` returns.
+    /// A table in the object-native location answers no query either after a
+    /// write whose outcome is unknown, so its message must not say only writes
+    /// are refused; a table elsewhere keeps answering queries.
+    #[test]
+    fn an_unknown_outcome_says_what_the_table_refuses() {
+        assert_eq!(
+            outcome_unknown_message(true),
+            "an earlier write could not confirm whether it committed, so writes and queries are refused until the table is reloaded from its catalog. Restart Spice to reload it"
+        );
+        assert_eq!(
+            outcome_unknown_message(false),
+            "an earlier write could not confirm whether it committed, so writes are refused until the table is reloaded from its catalog. Restart Spice to reload it"
+        );
+    }
+
     #[test]
     fn retention_deleted_message_names_the_dataset_predicate_and_count() {
         let message = retention_deleted_message("events", 7);

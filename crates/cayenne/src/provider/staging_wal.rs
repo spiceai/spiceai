@@ -163,7 +163,11 @@ impl CayenneStagedAppend {
         staging_snapshot_id: String,
         row_count: u64,
     ) -> Self {
-        let target_snapshot_id = table.get_current_snapshot_id();
+        // An append at its final keys commits to the snapshot it wrote into.
+        let target_snapshot_id = table
+            .uncommitted_files()
+            .final_key_directory(&staging_snapshot_id)
+            .unwrap_or_else(|| table.get_current_snapshot_id());
         Self {
             table,
             write_guard,
@@ -489,6 +493,12 @@ impl Drop for PreparedStagedAppend {
     fn drop(&mut self) {
         self.table
             .unregister_inflight_staging_append(&self.staging_snapshot_id);
+        // An append at its final keys that ends here without being discarded
+        // keeps its files: committed, they are the table's; otherwise they are
+        // orphans for the orphan sweep.
+        self.table
+            .uncommitted_files()
+            .end_final_key_write(&self.staging_snapshot_id);
     }
 }
 
@@ -803,6 +813,13 @@ impl PreparedStagedAppend {
         let current_snapshot_id = self.table.get_current_snapshot_id();
         if current_snapshot_id == self.target_snapshot_id {
             return Ok(());
+        }
+        // An append at its final keys has no staging WAL to resolve: it is not
+        // committed, its files are orphans, and it can be retried.
+        if self.table.is_final_key_write(&self.staging_snapshot_id) {
+            return Err(Error::WriteConflict {
+                table: self.table.table_name().to_string(),
+            });
         }
 
         Err(Error::IncompleteWrite {
@@ -1254,10 +1271,11 @@ impl CayenneTableProvider {
         }
 
         let staging_snapshot_id = Self::new_staging_snapshot_id();
-        self.clear_new_staging_snapshot_dir(&staging_snapshot_id)
-            .await?;
-
-        self.staging_may_have_files().store(true, Ordering::Release);
+        if !self.begin_final_key_write(&staging_snapshot_id, &self.get_current_snapshot_id()) {
+            self.clear_new_staging_snapshot_dir(&staging_snapshot_id)
+                .await?;
+            self.staging_may_have_files().store(true, Ordering::Release);
+        }
 
         let (row_count, _writer_ops, _stats_acc) = match self
             .write_to_snapshot(
@@ -1533,6 +1551,11 @@ impl CayenneTableProvider {
         target_snapshot: &str,
         target_kind: StagingWalTargetKind,
     ) -> Result<()> {
+        // An append at its final keys commits by naming its files in one
+        // record, so there is no move for a staging WAL to make recoverable.
+        if self.is_final_key_write(staging_snapshot_id) {
+            return Ok(());
+        }
         if self.data_in_store() {
             self.write_staging_wal_s3(staging_snapshot_id, target_snapshot, target_kind)
                 .await?;
@@ -1744,6 +1767,13 @@ impl CayenneTableProvider {
     /// removal fails, the commit is not reported as complete: callers must retain
     /// the recovery intent and surface the failure.
     pub(crate) async fn remove_staging_wal_for(&self, staging_snapshot_id: &str) -> Result<()> {
+        // An append at its final keys wrote no staging WAL; this is where its
+        // write ends.
+        if self.is_final_key_write(staging_snapshot_id) {
+            self.uncommitted_files()
+                .end_final_key_write(staging_snapshot_id);
+            return Ok(());
+        }
         if self.data_in_store() {
             let config = self.require_object_store()?;
             if let Some(staging_prefix) = self.snapshot_object_store_prefix(staging_snapshot_id)? {

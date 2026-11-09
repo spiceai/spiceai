@@ -58,12 +58,15 @@ const LOCATION: &str = "s3://bucket/state/cayenne/v1";
 const ORPHAN_FIRST: i64 = 1_000_001;
 const ORPHAN_LAST: i64 = 1_001_000;
 
-/// Counts LIST requests whose prefix overlaps one watched prefix.
+/// Counts LIST requests whose prefix overlaps one watched prefix, and COPY
+/// requests and writes into a staging directory under it.
 #[derive(Debug)]
 struct CountingStore {
     inner: Arc<dyn ObjectStore>,
     watched: parking_lot::RwLock<String>,
     lists: AtomicUsize,
+    copies: AtomicUsize,
+    staged_writes: AtomicUsize,
 }
 
 impl CountingStore {
@@ -72,16 +75,39 @@ impl CountingStore {
             inner,
             watched: parking_lot::RwLock::new(String::new()),
             lists: AtomicUsize::new(0),
+            copies: AtomicUsize::new(0),
+            staged_writes: AtomicUsize::new(0),
         }
     }
 
     fn watch(&self, prefix: &str) {
         *self.watched.write() = prefix.to_string();
         self.lists.store(0, Ordering::SeqCst);
+        self.copies.store(0, Ordering::SeqCst);
+        self.staged_writes.store(0, Ordering::SeqCst);
     }
 
     fn lists(&self) -> usize {
         self.lists.load(Ordering::SeqCst)
+    }
+
+    fn copies(&self) -> usize {
+        self.copies.load(Ordering::SeqCst)
+    }
+
+    fn staged_writes(&self) -> usize {
+        self.staged_writes.load(Ordering::SeqCst)
+    }
+
+    fn watched(&self, location: &Path) -> bool {
+        let watched = self.watched.read();
+        !watched.is_empty() && location.as_ref().starts_with(watched.as_str())
+    }
+
+    fn note_write(&self, location: &Path) {
+        if self.watched(location) && location.as_ref().contains("/_staging/") {
+            self.staged_writes.fetch_add(1, Ordering::SeqCst);
+        }
     }
 
     fn note_list(&self, prefix: Option<&Path>) {
@@ -109,6 +135,7 @@ impl ObjectStore for CountingStore {
         payload: PutPayload,
         opts: PutOptions,
     ) -> object_store::Result<PutResult> {
+        self.note_write(location);
         self.inner.put_opts(location, payload, opts).await
     }
     async fn put_multipart_opts(
@@ -116,6 +143,7 @@ impl ObjectStore for CountingStore {
         location: &Path,
         opts: PutMultipartOptions,
     ) -> object_store::Result<Box<dyn MultipartUpload>> {
+        self.note_write(location);
         self.inner.put_multipart_opts(location, opts).await
     }
     async fn get_opts(
@@ -160,6 +188,9 @@ impl ObjectStore for CountingStore {
         to: &Path,
         options: CopyOptions,
     ) -> object_store::Result<()> {
+        if self.watched(to) {
+            self.copies.fetch_add(1, Ordering::SeqCst);
+        }
         self.inner.copy_opts(from, to, options).await
     }
     async fn rename_opts(
@@ -579,6 +610,19 @@ async fn after_a_write(rig: &Rig) {
         rig.counting.lists(),
         0,
         "{}: an append and its maintenance listed the data prefix",
+        rig.label
+    );
+    // Each data file is written once, at its final key, and committed by name.
+    assert_eq!(
+        rig.counting.copies(),
+        0,
+        "{}: an append and its maintenance copied a data file",
+        rig.label
+    );
+    assert_eq!(
+        rig.counting.staged_writes(),
+        0,
+        "{}: an append wrote into a staging directory",
         rig.label
     );
     rig.assert_not_adopted(&table, &orphan, "write and its maintenance")

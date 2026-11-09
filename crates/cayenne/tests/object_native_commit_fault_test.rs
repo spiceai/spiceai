@@ -995,6 +995,174 @@ mod data_path {
         );
     }
 
+    /// An append writes each data file once, at its final key, and commits it
+    /// by naming it, whatever happens to its commit (the `nth` commit of the
+    /// write lost after landing, or failed before): it is whole or absent once
+    /// the dataset reads its state back, the caller's retry of what is missing
+    /// writes new keys, no key is written twice, nothing is staged or copied, and
+    /// the orphan sweep then leaves no data file that no commit names. Returns
+    /// whether the fault fired.
+    async fn append_with_a_lost_commit_writes_each_key_once(nth: usize, landed: bool) -> bool {
+        let faults = Arc::new(FaultStore::new(Arc::new(InMemory::new())));
+        let store: Arc<dyn ObjectStore> = Arc::clone(&faults) as Arc<dyn ObjectStore>;
+        let native = Arc::new(catalog(&store).await);
+        let shared: Arc<dyn MetadataCatalog> = Arc::clone(&native) as Arc<dyn MetadataCatalog>;
+        let placed = place(&store, &shared, "events", true, None).await;
+        insert(&placed.ctx, "events", 1, 1000)
+            .await
+            .expect("first append");
+        let armed = lose_the_nth_commit(&faults, &dataset_head(&native, "events"), nth, landed);
+        let writer = {
+            let ctx = placed.ctx.clone();
+            tokio::spawn(async move { insert(&ctx, "events", 1001, 2000).await })
+        };
+        let fired = Arc::clone(&armed);
+        eventually("the fault fires or the append returns", || async {
+            fired.load(std::sync::atomic::Ordering::SeqCst) || writer.is_finished()
+        })
+        .await;
+        if fired.load(std::sync::atomic::Ordering::SeqCst) {
+            eventually("the dataset reads its state back", || async {
+                reading_back(native.as_ref(), "events").await || writer.is_finished()
+            })
+            .await;
+        }
+        faults.clear_rules();
+        let outcome = writer.await.expect("join the append");
+        let fired = armed.load(std::sync::atomic::Ordering::SeqCst);
+
+        // The caller retries what it cannot see committed.
+        let committed = keyed_totals_max(&placed.ctx, "events").await;
+        assert!(
+            committed == 1000 || committed == 2000,
+            "nth={nth} landed={landed}: the append is whole or absent: max id {committed}"
+        );
+        if outcome.is_ok() {
+            assert_eq!(
+                committed, 2000,
+                "nth={nth} landed={landed}: an acknowledged append is visible"
+            );
+        }
+        eventually("the dataset accepts the retry", || async {
+            insert(&placed.ctx, "events", committed + 1, 3000)
+                .await
+                .is_ok()
+        })
+        .await;
+        assert_eq!(
+            keyed_totals(&placed.ctx, "events").await,
+            vec![3000, 3000, sum_v(1, 3000, 0)],
+            "nth={nth} landed={landed}: every row once"
+        );
+
+        let log = faults.log();
+        let copies = log.iter().filter(|applied| applied.op == Op::Copy).count();
+        assert_eq!(
+            copies, 0,
+            "nth={nth} landed={landed}: data files were copied"
+        );
+        let staged: Vec<String> = log
+            .iter()
+            .filter(|applied| applied.path.as_ref().contains("/_staging/"))
+            .map(|applied| format!("{:?} {}", applied.op, applied.path))
+            .collect();
+        assert!(
+            staged.is_empty(),
+            "nth={nth} landed={landed}: requests into a staging directory: {staged:?}"
+        );
+        let mut written: std::collections::BTreeMap<String, usize> =
+            std::collections::BTreeMap::new();
+        for applied in log.iter().filter(|applied| {
+            applied.result.is_ok()
+                && matches!(applied.op, Op::Put | Op::Create | Op::MultipartComplete)
+                && applied.path.as_ref().ends_with(".vortex")
+        }) {
+            *written.entry(applied.path.to_string()).or_default() += 1;
+        }
+        let twice: Vec<&String> = written
+            .iter()
+            .filter(|(_, writes)| **writes > 1)
+            .map(|(key, _)| key)
+            .collect();
+        assert!(
+            twice.is_empty(),
+            "nth={nth} landed={landed}: data keys written more than once: {twice:?}"
+        );
+        assert!(
+            written.len() >= 3,
+            "nth={nth} landed={landed}: each append wrote its files: {written:?}"
+        );
+
+        // The orphan sweep takes what the lost append left if it never
+        // committed, and nothing a commit names.
+        placed.table.set_orphan_age_floor(std::time::Duration::ZERO);
+        let mut swept = None;
+        for _ in 0..100 {
+            let report = placed
+                .table
+                .sweep_orphan_files_now()
+                .await
+                .expect("the orphan sweep");
+            if report.skipped.is_none() {
+                swept = Some(report);
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        let swept = swept.expect("the orphan sweep runs once the outcome is resolved");
+        let table_id = placed.table.table_id().to_string();
+        let data_prefix = placed
+            .data_url
+            .strip_prefix("s3://bucket/")
+            .expect("a data url in the bucket")
+            .to_string();
+        let named: std::collections::BTreeSet<String> = shared
+            .get_all_snapshot_files(&table_id)
+            .await
+            .expect("the manifest")
+            .into_iter()
+            .map(|file| {
+                format!(
+                    "{data_prefix}/{table_id}/{}/{}",
+                    file.snapshot_id, file.file_path
+                )
+            })
+            .collect();
+        let stored: std::collections::BTreeSet<String> =
+            futures::TryStreamExt::try_collect::<Vec<_>>(
+                store.list(Some(&Path::from(data_prefix.as_str()))),
+            )
+            .await
+            .expect("list the dataset")
+            .into_iter()
+            .map(|meta| meta.location.to_string())
+            .filter(|key| key.ends_with(".vortex"))
+            .collect();
+        assert_eq!(
+            stored, named,
+            "nth={nth} landed={landed}: after the orphan sweep the stored data files are the named ones (it deleted {:?})",
+            swept.deleted
+        );
+        assert_eq!(
+            keyed_totals(&placed.ctx, "events").await,
+            vec![3000, 3000, sum_v(1, 3000, 0)],
+            "nth={nth} landed={landed}: the orphan sweep changed no row"
+        );
+        fired
+    }
+
+    #[tokio::test]
+    async fn an_append_whose_commit_is_lost_and_retried_writes_each_key_once() {
+        let mut fired = 0;
+        for nth in 1..=3 {
+            for landed in [true, false] {
+                fired +=
+                    usize::from(append_with_a_lost_commit_writes_each_key_once(nth, landed).await);
+            }
+        }
+        assert!(fired > 0, "at least one commit of the append was lost");
+    }
+
     async fn keyed_totals_max(ctx: &SessionContext, name: &str) -> i64 {
         let sql = format!("SELECT max(id) FROM {name}");
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);

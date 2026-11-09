@@ -61,6 +61,7 @@ url.workspace = true
 util = { path = "../../util", features = ["datafusion", "http"] }
 aws-sdk-credential-bridge = { path = "../../aws-sdk-credential-bridge" }
 aws-sdk-s3.workspace = true
+chrono.workspace = true
 datafusion-datasource.workspace = true
 datafusion-expr.workspace = true
 fundu.workspace = true

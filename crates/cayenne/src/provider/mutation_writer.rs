@@ -636,9 +636,19 @@ impl<'a> AppendMutationWriter<'a> {
                     )
                 };
                 let target_size_bytes = self.context.target_file_size_bytes();
-                self.table
-                    .clear_new_staging_snapshot_dir(&staging_snapshot_id)
-                    .await?;
+                // An append into the current snapshot writes at its final keys on
+                // an object store. A new protected snapshot keeps the staged write
+                // for now: written at final keys, scans racing automatic compaction
+                // were seen to miss committed rows, a cause not yet found.
+                if !(target_kind == StagingWalTargetKind::CurrentSnapshot
+                    && self
+                        .table
+                        .begin_final_key_write(&staging_snapshot_id, &target_snapshot_id))
+                {
+                    self.table
+                        .clear_new_staging_snapshot_dir(&staging_snapshot_id)
+                        .await?;
+                }
 
                 // Hold `write_lock` only through Stage A (staging the WAL and
                 // registering the in-flight append), then release it at the
@@ -1817,17 +1827,22 @@ impl<'a> AppendMutationWriter<'a> {
         estimated_bytes: Option<u64>,
     ) -> Result<(u64, usize, Arc<ColumnStatsAccumulator>, Option<i64>)> {
         let staging_snapshot_id = CayenneTableProvider::new_staging_snapshot_id();
-        self.table
-            .clear_new_staging_snapshot_dir(&staging_snapshot_id)
-            .await?;
+        if !self
+            .table
+            .begin_final_key_write(&staging_snapshot_id, &self.table.get_current_snapshot_id())
+        {
+            self.table
+                .clear_new_staging_snapshot_dir(&staging_snapshot_id)
+                .await?;
 
-        // We are about to (or have started to) write Vortex files into the
-        // staging directory. Mark it "dirty" so recovery/root cleanup
-        // (on this or a future writer, or on recovery after a crash) will
-        // actually perform the cleanup instead of taking the fast path.
-        self.table
-            .staging_may_have_files()
-            .store(true, Ordering::Release);
+            // We are about to (or have started to) write Vortex files into the
+            // staging directory. Mark it "dirty" so recovery/root cleanup
+            // (on this or a future writer, or on recovery after a crash) will
+            // actually perform the cleanup instead of taking the fast path.
+            self.table
+                .staging_may_have_files()
+                .store(true, Ordering::Release);
+        }
 
         let write_start = Instant::now();
         let (rows, writer_ops, stats_acc) = match self
@@ -1915,9 +1930,11 @@ impl<'a> AppendMutationWriter<'a> {
         Arc<ColumnStatsAccumulator>,
         PreparedStagedAppend,
     )> {
-        self.table
-            .staging_may_have_files()
-            .store(true, Ordering::Release);
+        if !self.table.is_final_key_write(&target.staging_snapshot_id) {
+            self.table
+                .staging_may_have_files()
+                .store(true, Ordering::Release);
+        }
 
         // IVM staged capture (Edit B): when the table has a retraction-capable
         // maintained aggregate, buffer the insert batches and re-stream them into

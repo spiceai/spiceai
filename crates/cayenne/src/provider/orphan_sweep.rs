@@ -20,14 +20,20 @@ limitations under the License.
 //! A listed object is deleted only when all of these hold:
 //!
 //! - no snapshot the table's state names it (every manifest row of the table),
-//!   and it sits in a live (current or protected) snapshot directory, a staging
+//!   or, for a deletion vector (`<snapshot>/deletions/<file>.arrow` beside the
+//!   table's prefix), no committed deletion names it,
+//!   and a data file sits in a live (current or protected) snapshot directory, a staging
 //!   directory without a staging WAL, a compaction's scratch directory, or a
 //!   snapshot directory nothing refers to. A retired directory (the
 //!   retired-directory sweep's: one this process retired, or one the committed
-//!   retirement record names until that sweep forgets it) and a directory an
-//!   open reader holds or listed recently are skipped whole;
+//!   retirement record names until that sweep forgets it) and a directory that
+//!   is not live and an open reader holds or listed recently are skipped whole.
+//!   A live directory is not skipped for its readers: a scan reads a live
+//!   snapshot's files from its committed manifest, never an unnamed file;
 //! - no write of this process still holds it ([`super::uncommitted_files`]),
-//!   whatever its age, so an upload or a commit still in flight keeps its files;
+//!   whatever its age, so an upload or a commit still in flight keeps its files
+//!   (a deletion vector is held from before its upload until a commit names it,
+//!   its writer deletes it, or a commit drops it);
 //! - it is older than the age floor, measured on the store's clock: its
 //!   `last_modified` against the time the store stamps on an object this sweep
 //!   writes, never the writer's clock or the time in its name.
@@ -152,6 +158,23 @@ pub(crate) fn placement<'a>(relative: &'a str, live: &HashSet<String>) -> Placem
     }
 }
 
+/// The file name of a deletion vector at `relative` (a key under the dataset's
+/// data path): `<snapshot>/deletions/<file>.arrow`.
+pub(crate) fn deletion_vector_name(relative: &str) -> Option<&str> {
+    let mut parts = relative.split('/');
+    match (parts.next(), parts.next(), parts.next(), parts.next()) {
+        (Some(_), Some(dir), Some(file), None)
+            if dir == super::delete::vector_io::DELETION_DIR_NAME
+                && std::path::Path::new(file)
+                    .extension()
+                    .is_some_and(|extension| extension == "arrow") =>
+        {
+            Some(file)
+        }
+        _ => None,
+    }
+}
+
 /// Whether an unnamed object last modified at `last_modified` is old enough to
 /// delete when the store's clock reads `store_now`. An object stamped after
 /// `store_now` (clock steps, a later write) is young.
@@ -214,6 +237,21 @@ mod tests {
         assert_eq!(placement("deletions/e.arrow", &live), Placement::Other);
         assert_eq!(placement("cur/sub/f.vortex", &live), Placement::Other);
         assert_eq!(placement(STORE_CLOCK_OBJECT, &live), Placement::Other);
+    }
+
+    #[test]
+    fn deletion_vectors_are_recognized_beside_the_table_prefix() {
+        assert_eq!(
+            deletion_vector_name("01a1bf18/deletions/delete_01a1.arrow"),
+            Some("delete_01a1.arrow")
+        );
+        // A data file, a deeper key, another directory and another extension
+        // are not deletion vectors.
+        assert_eq!(deletion_vector_name("table/snap/a.vortex"), None);
+        assert_eq!(deletion_vector_name("snap/deletions/sub/d.arrow"), None);
+        assert_eq!(deletion_vector_name("snap/other/d.arrow"), None);
+        assert_eq!(deletion_vector_name("snap/deletions/d.vortex"), None);
+        assert_eq!(deletion_vector_name(STORE_CLOCK_OBJECT), None);
     }
 
     #[test]
