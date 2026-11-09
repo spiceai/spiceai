@@ -98,11 +98,12 @@ class CheckTest(unittest.TestCase):
             self.run_check(
                 {
                     "Dockerfile": dockerfile(),
-                    # An amd64-only image needs no arm64 checksum, and may copy
-                    # outside a sandbox.
+                    # An amd64-only image needs no arm64 checksum, and a sandboxed
+                    # image may copy into the sandbox root it copies onto /.
                     "Dockerfile-cuda-release": dockerfile(arm64=None, platforms=("linux-amd64",)).replace(
                         "/usr/lib/", "/spice_sandbox/usr/lib/"
-                    ),
+                    )
+                    + "FROM scratch\nCOPY --from=sandbox-setup /spice_sandbox/ /\n",
                 }
             ),
             [],
@@ -165,6 +166,20 @@ class CheckTest(unittest.TestCase):
                 "Dockerfile downloads libduckdb but never copies it to /usr/lib/libduckdb.so "
                 "(or /spice_sandbox/usr/lib/libduckdb.so in a sandboxed image)"
             ],
+        )
+
+    def test_sandbox_destination_needs_the_sandbox_root_copied_onto_root(self):
+        sandboxed = dockerfile().replace(" /usr/lib/", " /spice_sandbox/usr/lib/")
+        self.assertEqual(
+            self.run_check({"Dockerfile": sandboxed}),
+            [
+                "Dockerfile copies libduckdb to /spice_sandbox/usr/lib/libduckdb.so but never copies "
+                "/spice_sandbox/ onto / in the final image, so spiced cannot find the library"
+            ],
+        )
+        self.assertEqual(
+            self.run_check({"Dockerfile": sandboxed + "FROM scratch\nCOPY --from=sandbox-setup /spice_sandbox/ /\n"}),
+            [],
         )
 
     def test_commented_out_verification_fails(self):

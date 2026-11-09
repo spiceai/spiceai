@@ -40,8 +40,11 @@ ARGS = {
 # The library must land on the default library path of the image, or of the
 # sandbox root a scratch-based image is assembled from.
 COPY_RE = re.compile(
-    r"^COPY\s+--from=\S+\s+/root/libduckdb\.so\s+(?:/spice_sandbox)?/usr/lib/libduckdb\.so\s*$", re.M
+    r"^COPY\s+--from=\S+\s+/root/libduckdb\.so\s+(/spice_sandbox)?/usr/lib/libduckdb\.so\s*$", re.M
 )
+# A sandbox destination reaches the library path only when the final image
+# copies the whole sandbox root onto `/`.
+SANDBOX_ROOT_RE = re.compile(r"^COPY\s+--from=\S+\s+/spice_sandbox/?\s+/\s*$", re.M)
 # Docker drops a line whose first non-blank character is `#`, even inside a
 # continued RUN, so a commented-out step must not count.
 COMMENT_RE = re.compile(r"^\s*#.*\n?", re.M)
@@ -129,10 +132,16 @@ def check(root: Path) -> list[str]:
                     f"{arg}={expected[arg]}"
                 )
         errors.extend(download_errors(path.name, text))
-        if not COPY_RE.search(text):
+        copies = COPY_RE.findall(text)
+        if not copies:
             errors.append(
                 f"{path.name} downloads libduckdb but never copies it to /usr/lib/libduckdb.so "
                 "(or /spice_sandbox/usr/lib/libduckdb.so in a sandboxed image)"
+            )
+        elif all(copies) and not SANDBOX_ROOT_RE.search(text):
+            errors.append(
+                f"{path.name} copies libduckdb to /spice_sandbox/usr/lib/libduckdb.so but never copies "
+                "/spice_sandbox/ onto / in the final image, so spiced cannot find the library"
             )
     return errors
 
