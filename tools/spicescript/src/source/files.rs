@@ -108,6 +108,15 @@ impl Source for Files {
         Ok(found)
     }
 
+    async fn sizes(&self, namespace: &str, prefix: &str) -> Result<Vec<(String, u64)>> {
+        let mut sized = Vec::new();
+        for path in self.list(namespace, prefix).await? {
+            let len = std::fs::metadata(&path).map_or(0, |meta| meta.len());
+            sized.push((path, len));
+        }
+        Ok(sized)
+    }
+
     /// Writes the rows as `files` part files, numbered after any already
     /// there when appending.
     async fn generate(&self, namespace: &str, spec: &TableSpec) -> Result<u64> {

@@ -19,8 +19,11 @@ deletion vectors bounded over 180 s of CDC (`postgres-cdc-parity`), a
 (`full-refresh-chaos`), and the staging WAL replayed after four kills during
 appends with compaction never falling back to a full rewrite (`append-kill`).
 That the catalog matches the objects after retention is checked by
-`crates/cayenne/tests/object_store_reclaim_test.rs`, which no script can
-reach. With the flag off, an object-store data path fails to load
+`crates/cayenne/tests/object_store_reclaim_test.rs` and, for object-native
+data with its retirement record, restarts, takeovers and kills at every
+storage request of a merge and an overwrite, by
+`crates/cayenne/tests/data_file_lifecycle_test.rs`; no script can reach
+those states. With the flag off, an object-store data path fails to load
 (`cayenne-vnext`).
 
 Until the data path lands, these variants fail as recorded in
@@ -46,10 +49,12 @@ start on the machine that recorded them.
 | SQL writes (`write_mode: acceleration`) and transactions | `cayenne-transactions.yaml`, `cayenne-writes.yaml` | added (`cayenne-transactions`); TODO `cayenne-writes` | #16132 |
 | `partition_by` | `partitioning.yaml`, `layout-coverage.yaml`, `cayenne-writes.yaml` | TODO | #16137 |
 | `indexes` | `index-equivalence.yaml`, `layout-coverage.yaml` | TODO | #16137 |
-| `mode: file_create` | `cayenne-vnext.yaml`, `cayenne-vnext-recreate.yaml`, `settings-evolution.yaml`, `object-native-data.yaml` | added (`object-native-data`: reload after a lost data file, the previous folder kept); TODO deletion of that folder with reader pins | #16133 |
+| `mode: file_create` | `cayenne-vnext.yaml`, `cayenne-vnext-recreate.yaml`, `settings-evolution.yaml`, `object-native-data.yaml`, `known-failing/cayenne/cayenne-file-create-reload.yaml` | added (`object-native-data`: reload after a lost data file, the drop message names the previous folder; `cayenne-file-create-reload`: no folder marked dropped and one folder left after a reload and after a restart, a query during the reload answers whole or fails); TODO the other three | #16133 |
 | Snapshot bootstrap (`snapshots:`) | `snapshots/snapshots-object-store.yaml`, `snapshots/snapshots-append-restore.yaml` | TODO | #16133 |
 | `mode: memory` | `cayenne-writes.yaml`, `mysql-cdc-parity.yaml` (DuckDB), `postgres-cdc-edge-values.yaml` | TODO (no data files; the variants should leave nothing in the location) | #16137 |
 | A state location 20 ms away (a remote store's round trips) | the `object-native-data-rustfs-latency` variant of every script marked added | added | #16139 |
 | An S3 Express state location | none (RustFS has no Express buckets) | TODO | #16135 |
 | Several instances over one location | `cayenne-vnext.yaml` (metastore only) | TODO | #16136 |
 | CDC kill under load | `known-failing/cayenne/postgres-cdc-kill-under-load.yaml` | TODO (the script has no state location yet) | #16141 |
+| Kill during compaction, and during a full refresh's overwrite | `known-failing/cayenne/postgres-cdc-kill-during-compaction.yaml` | added (CDC kill during compaction; a kill during a full refresh leaves one whole batch; no folder marked dropped and about one generation of the overwritten table's files after the grace) | #16133 |
+| Data files bounded under sustained CDC | `postgres-cdc-parity.yaml` | added (`object-native-data-rustfs`: the dataset's objects sampled every 10 s for 180 s, bounded and not trending upward, with `sample-objects`) | #16133 |

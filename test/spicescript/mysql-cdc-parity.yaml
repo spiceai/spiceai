@@ -261,3 +261,40 @@ steps:
     oracle-sql: SELECT c_id, c_name, c_segment, c_balance, c_active, c_since FROM customers
     eventually: 30s
     only: *object-native-data
+
+  # Readers while the change stream writes (#16132): with the data in an
+  # object-store location, with or without 20 ms of latency, no query fails,
+  # and the table still matches the source afterwards. (A local location does
+  # not hold data files yet, so it is not run there.)
+  - background:
+      id: cdc-writes
+      source-exec: { src: "UPDATE orders SET o_total = o_total + 1 WHERE o_id % 13 = ${round} % 13" }
+      every: 200ms
+    only: &object-native-data-in-store [object-native-data-rustfs, object-native-data-rustfs-latency]
+  - background:
+      id: readers
+      query: SELECT count(*), sum(o_total) FROM orders
+      concurrency: 4
+    only: *object-native-data-in-store
+  - sleep: 30s
+    only: *object-native-data-in-store
+  - stop-background: { id: cdc-writes }
+    only: *object-native-data-in-store
+  - stop-background: { id: readers }
+    only: *object-native-data-in-store
+  - query: SELECT * FROM orders
+    eventually: 60s
+    only: *object-native-data-in-store
+
+  # Losing the directory again, now with the source up and the deletion
+  # vectors of the writes above in the location: the datasets open from the
+  # location and are ready within 60 s, with or without 20 ms of store latency.
+  - stop: {}
+    only: *object-native-data-in-store
+  - wipe-instance-dir: { keep: [state] }
+    only: *object-native-data-in-store
+  - start: { ready-timeout: 60s }
+    only: *object-native-data-in-store
+  - query: SELECT * FROM orders
+    eventually: 30s
+    only: *object-native-data-in-store

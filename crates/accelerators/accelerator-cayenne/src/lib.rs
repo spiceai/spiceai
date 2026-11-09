@@ -1416,18 +1416,20 @@ async fn object_store_table_prefixes(
     Ok(prefixes)
 }
 
-/// What an operator reads when the acceleration of a dataset whose data is in the
-/// state location is dropped: the folder it was in is kept, and the object-native
-/// catalog deletes it at a later start. `recreated` is a `mode: file_create` load,
-/// which reloads the dataset into a new folder.
-fn placed_acceleration_dropped_message(dataset: &str, folder: &str, recreated: bool) -> String {
-    let what = if recreated {
+/// What an operator reads when a dataset whose data is in the state location
+/// drops its acceleration: for `mode: file_create` (`recreate`), or when the
+/// acceleration is rebuilt or removed. The object-native catalog deletes the
+/// dataset's previous folder once no query on this instance reads it, or, when
+/// Spice stops first, at a start at least an hour after the drop, so nothing is
+/// left for the operator to do.
+fn placed_acceleration_dropped_message(dataset: &str, folder: &str, recreate: bool) -> String {
+    let what = if recreate {
         "dropped its acceleration for `mode: file_create` and reloads from its source into a new folder in the state location"
     } else {
         "dropped its acceleration"
     };
     format!(
-        "Dataset '{dataset}' (cayenne) {what}. Its previous folder '{folder}' is kept, so its files keep using storage until Spice deletes the folder at a start at least an hour after this drop. See: https://spiceai.org/docs/components/data-accelerators/cayenne"
+        "Dataset '{dataset}' (cayenne) {what}. Its previous folder '{folder}' is deleted once no query reads it, or at a start at least an hour after this drop if Spice stops first. See: https://spiceai.org/docs/components/data-accelerators/cayenne"
     )
 }
 
@@ -1438,6 +1440,15 @@ fn placed_dataset_folder(data_path: &str) -> &str {
         .trim_end_matches('/')
         .strip_suffix("/data")
         .unwrap_or(data_path)
+}
+
+/// Whether the stored table `stored_path` keeps its data in a dataset folder of the
+/// object-native catalog's location, which deletes the folder when the dataset drops.
+fn data_in_state_location(catalog: &dyn cayenne::MetadataCatalog, stored_path: &str) -> bool {
+    catalog
+        .as_any()
+        .downcast_ref::<cayenne::metastore::object_native::ObjectNativeCatalog>()
+        .is_some_and(|native| native.holds_data_at(stored_path))
 }
 
 /// Whether a dataset's data files are in the state location.
@@ -3512,17 +3523,17 @@ impl CayenneAccelerator {
                         runtime_state_location::StateFeature::CayenneData,
                     );
                     cayenne::metastore::object_native::ObjectNativeCatalog::open_or_create_at(
-                            runtime_state_location::metrics::metered(
-                                store,
-                                runtime_state_location::StateFeature::CayenneMetastore,
-                            ),
-                            object_store::path::Path::from(prefix)
-                                .join("v1")
-                                .join("catalog"),
-                            &format!("{}/cayenne/v1", state.location.trim_end_matches('/')),
-                        )
-                        .await
-                        .map(|native| native.with_data_store(data_store))
+                        runtime_state_location::metrics::metered(
+                            store,
+                            runtime_state_location::StateFeature::CayenneMetastore,
+                        ),
+                        object_store::path::Path::from(prefix)
+                            .join("v1")
+                            .join("catalog"),
+                        &format!("{}/cayenne/v1", state.location.trim_end_matches('/')),
+                    )
+                    .await
+                    .map(|native| native.with_data_store(data_store))
                 }
                 None => {
                     cayenne::metastore::object_native::ObjectNativeCatalog::open_or_create_local(
@@ -4023,15 +4034,15 @@ struct ObjectNativeDataPlacement {
 }
 
 /// What `source` needs that data in the object-native location does not support yet,
-/// as the setting to name in a message; `None` when its data can go there. Covered
-/// so far: `refresh_mode: full` and `append`, with or without a primary key (whose
-/// upserts write deletion vectors through the dataset's store); change streams are
-/// not.
+/// as the setting to name in a message; `None` when its data can go there. Covered:
+/// `refresh_mode: full`, `append` and `changes`, with or without a primary key.
+/// Upserts and deletes write deletion vectors through the dataset's store, and a
+/// change stream's acknowledged position commits with the data it covers, so a
+/// dataset reopened from the location alone resumes from it.
 fn object_native_data_unsupported(source: &dyn AccelerationSource) -> Option<&'static str> {
     let acceleration = source.acceleration()?;
     match resolved_refresh_mode(source, acceleration) {
-        RefreshMode::Full | RefreshMode::Append => {}
-        RefreshMode::Changes => return Some("`refresh_mode: changes`"),
+        RefreshMode::Full | RefreshMode::Append | RefreshMode::Changes => {}
         RefreshMode::Caching => return Some("`refresh_mode: caching`"),
         RefreshMode::Snapshot => return Some("`refresh_mode: snapshot`"),
         RefreshMode::Disabled => return Some("`refresh_mode: disabled`"),
@@ -4935,6 +4946,12 @@ impl DataAccelerator for CayenneAccelerator {
                 .await
                 .boxed()
                 .context(AccelerationInitializationFailedSnafu)?;
+            let placed = match catalog.get_table(&table_name).await {
+                Ok(stored) if data_in_state_location(catalog.as_ref(), &stored.path) => {
+                    Some(stored.path)
+                }
+                Ok(_) | Err(_) => None,
+            };
             if catalog
                 .drop_table(&table_name)
                 .await
@@ -4946,8 +4963,10 @@ impl DataAccelerator for CayenneAccelerator {
                 );
             }
 
-            if let LocationPlacement::Stored(data_path) = &placement {
-                tracing::warn!(
+            if let Some(data_path) = placed.as_deref() {
+                // Its data is in the state location, not in the local directory,
+                // which holds nothing of it; the catalog deletes its folder.
+                tracing::info!(
                     "{}",
                     placed_acceleration_dropped_message(
                         &table_name,
@@ -5603,11 +5622,9 @@ impl DataAccelerator for CayenneAccelerator {
             // where the dataset now puts its data, which may already hold files. Only a
             // table that is not there leaves the configured directory to clear.
             match catalog.get_table(table_name).await {
-                // In the state location: the catalog's drop marks the dataset's
-                // folder, and a later start deletes it.
-                Ok(stored)
-                    if cayenne::metastore_layout::is_object_native_data_path(&stored.path) =>
-                {
+                // In the state location: the catalog deletes the dataset's folder
+                // once no query reads it.
+                Ok(stored) if data_in_state_location(catalog.as_ref(), &stored.path) => {
                     removed_dirs.clear();
                     placed_folder = Some(placed_dataset_folder(&stored.path).to_string());
                 }
@@ -5975,24 +5992,6 @@ data_accelerator_api::register_data_accelerator!(configured: Engine::Cayenne, Ca
 
 #[cfg(test)]
 mod tests {
-    #[test]
-    fn a_dropped_placed_acceleration_says_its_folder_is_kept_and_when_it_goes() {
-        let data_path = "s3://bucket/state/cayenne/v1/datasets/orders-0190c2c4-0000-7000-8000-000000000000/data";
-        let folder = super::placed_dataset_folder(data_path);
-        assert_eq!(
-            folder,
-            "s3://bucket/state/cayenne/v1/datasets/orders-0190c2c4-0000-7000-8000-000000000000"
-        );
-        assert_eq!(
-            super::placed_acceleration_dropped_message("orders", folder, true),
-            "Dataset 'orders' (cayenne) dropped its acceleration for `mode: file_create` and reloads from its source into a new folder in the state location. Its previous folder 's3://bucket/state/cayenne/v1/datasets/orders-0190c2c4-0000-7000-8000-000000000000' is kept, so its files keep using storage until Spice deletes the folder at a start at least an hour after this drop. See: https://spiceai.org/docs/components/data-accelerators/cayenne"
-        );
-        assert_eq!(
-            super::placed_acceleration_dropped_message("orders", folder, false),
-            "Dataset 'orders' (cayenne) dropped its acceleration. Its previous folder 's3://bucket/state/cayenne/v1/datasets/orders-0190c2c4-0000-7000-8000-000000000000' is kept, so its files keep using storage until Spice deletes the folder at a start at least an hour after this drop. See: https://spiceai.org/docs/components/data-accelerators/cayenne"
-        );
-    }
-
     use super::*;
     use runtime_acceleration::OnSchemaChange;
     use runtime_acceleration::testing::TestAccelerationSource;
@@ -7803,6 +7802,24 @@ mod tests {
         assert!(
             message.contains("metadata"),
             "the error must name the dataset and both resolved paths; got: {message}"
+        );
+    }
+
+    #[test]
+    fn the_dropped_placed_acceleration_message_says_what_happens_to_its_files() {
+        let data_path = "s3://bucket/state/cayenne/v1/datasets/orders-0190c2c4-0000-7000-8000-000000000000/data";
+        let folder = placed_dataset_folder(data_path);
+        assert_eq!(
+            folder,
+            "s3://bucket/state/cayenne/v1/datasets/orders-0190c2c4-0000-7000-8000-000000000000"
+        );
+        assert_eq!(
+            placed_acceleration_dropped_message("orders", folder, true),
+            "Dataset 'orders' (cayenne) dropped its acceleration for `mode: file_create` and reloads from its source into a new folder in the state location. Its previous folder 's3://bucket/state/cayenne/v1/datasets/orders-0190c2c4-0000-7000-8000-000000000000' is deleted once no query reads it, or at a start at least an hour after this drop if Spice stops first. See: https://spiceai.org/docs/components/data-accelerators/cayenne"
+        );
+        assert_eq!(
+            placed_acceleration_dropped_message("orders", folder, false),
+            "Dataset 'orders' (cayenne) dropped its acceleration. Its previous folder 's3://bucket/state/cayenne/v1/datasets/orders-0190c2c4-0000-7000-8000-000000000000' is deleted once no query reads it, or at a start at least an hour after this drop if Spice stops first. See: https://spiceai.org/docs/components/data-accelerators/cayenne"
         );
     }
 

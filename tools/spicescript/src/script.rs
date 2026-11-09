@@ -513,6 +513,9 @@ pub enum Action {
         max: Option<usize>,
         within: Option<Duration>,
     },
+    /// Sample the objects under a prefix as a series over time, and require each
+    /// sample within its bounds and the series not to trend upward.
+    SampleObjects(ObjectSampling),
     /// Wait until a `/metrics` series meets a condition.
     WaitMetric(MetricWait),
     /// Keep a `/metrics` scrape to measure later changes from.
@@ -528,6 +531,22 @@ pub struct ExplainStep {
     pub contains: Vec<String>,
     /// Substrings the plan must not contain.
     pub omits: Vec<String>,
+}
+
+/// `sample-objects`: the object count and bytes under a prefix of a files or
+/// object store source, every `every` for `duration`.
+#[derive(Debug, Clone)]
+pub struct ObjectSampling {
+    pub source: String,
+    pub prefix: String,
+    /// Count only keys containing this text.
+    pub contains: Option<String>,
+    pub every: Duration,
+    pub duration: Duration,
+    /// Every sample holds at most this many objects.
+    pub max_objects: Option<usize>,
+    /// Every sample holds at most this many bytes.
+    pub max_bytes: Option<u64>,
 }
 
 #[derive(Debug, Clone)]
@@ -1391,6 +1410,7 @@ const ACTIONS: &[&str] = &[
     "slt-setup",
     "slt",
     "assert-objects",
+    "sample-objects",
     "wait-metric",
     "mark-metrics",
     "generate",
@@ -2089,6 +2109,49 @@ fn parse_step(index: usize, step: Value) -> Result<Step> {
                 within: opts.duration("eventually")?,
             }
         }
+        "sample-objects" => {
+            let mut inner = Opts::of_mapping(
+                arg,
+                "`sample-objects` takes `source`, `prefix`, `contains`, `every`, `for`, `max-objects` and `max-bytes`",
+            )?;
+            let source = inner
+                .string("source")?
+                .context("`sample-objects` needs a `source`")?;
+            let prefix = inner.string("prefix")?.unwrap_or_default();
+            let contains = inner.string("contains")?;
+            let every = inner
+                .duration("every")?
+                .context("`sample-objects` needs `every`")?;
+            let duration = inner
+                .duration("for")?
+                .context("`sample-objects` needs `for`")?;
+            ensure!(
+                !every.is_zero() && duration >= every * 6,
+                "`sample-objects` needs at least six samples: `for` must be at least six times `every`"
+            );
+            let count = |v: Value, key: &str| {
+                v.as_u64()
+                    .with_context(|| format!("`{key}` must be a count"))
+            };
+            let max_objects = inner
+                .take("max-objects")
+                .map(|v| count(v, "max-objects").and_then(|n| Ok(usize::try_from(n)?)))
+                .transpose()?;
+            let max_bytes = inner
+                .take("max-bytes")
+                .map(|v| count(v, "max-bytes"))
+                .transpose()?;
+            inner.finish()?;
+            Action::SampleObjects(ObjectSampling {
+                source,
+                prefix,
+                contains,
+                every,
+                duration,
+                max_objects,
+                max_bytes,
+            })
+        }
         "generate" => {
             let Value::Object(m) = arg else {
                 bail!("`generate` takes a mapping of source name to table spec");
@@ -2421,6 +2484,49 @@ fn read_durations(dir: &Path) -> Result<std::collections::BTreeMap<String, u64>>
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn sample_objects_takes_its_bounds_and_needs_six_samples() {
+        let script = |step: &str| {
+            Script::parse(&format!(
+                "name: s\nsources: {{ lake: {{ kind: rustfs }} }}\nspicepod: {{}}\nsteps:\n  - sample-objects: {step}"
+            ))
+        };
+        let parsed = script(
+            "{ source: lake, prefix: state/, contains: /data/, every: 10s, for: 60s, max-objects: 400, max-bytes: 1000 }",
+        )
+        .expect("a sample-objects step");
+        let Action::SampleObjects(sampling) = &parsed.steps[0].action else {
+            panic!("expected sample-objects");
+        };
+        assert_eq!(
+            (
+                sampling.source.as_str(),
+                sampling.prefix.as_str(),
+                sampling.contains.as_deref(),
+                sampling.every,
+                sampling.duration,
+                sampling.max_objects,
+                sampling.max_bytes,
+            ),
+            (
+                "lake",
+                "state/",
+                Some("/data/"),
+                Duration::from_secs(10),
+                Duration::from_secs(60),
+                Some(400),
+                Some(1000),
+            )
+        );
+        assert_eq!(
+            format!(
+                "{:#}",
+                script("{ source: lake, every: 10s, for: 50s }").expect_err("five samples")
+            ),
+            "step 1: `sample-objects` needs at least six samples: `for` must be at least six times `every`"
+        );
+    }
 
     #[test]
     fn ledger_keys_sort_nested_objects() {

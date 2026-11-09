@@ -380,6 +380,20 @@ impl MetadataCatalog for DatasetStateReader {
                 .await?,
         }))
     }
+    fn keeps_retirement_record(&self) -> bool {
+        false
+    }
+    async fn retired_snapshots(&self, _table_id: &str) -> CatalogResult<Option<Vec<String>>> {
+        // A replayed copy licenses no delete: the log it came from may move on.
+        Ok(None)
+    }
+    async fn forget_retired_snapshots(
+        &self,
+        _table_id: &str,
+        _snapshot_ids: &[String],
+    ) -> CatalogResult<bool> {
+        Err(invalid("the dataset state reader is read-only"))
+    }
     async fn get_all_snapshot_files(&self, table_id: &str) -> CatalogResult<Vec<SnapshotFile>> {
         Ok(self
             .rows(table_id)

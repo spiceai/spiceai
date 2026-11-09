@@ -69,7 +69,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use datafusion::execution::SendableRecordBatchStream;
-use futures::StreamExt;
+use futures::{StreamExt, TryStreamExt};
 use tokio::sync::{OwnedMutexGuard, OwnedSemaphorePermit};
 
 use super::Result;
@@ -428,21 +428,18 @@ impl PreparedOverwrite {
         let _write_guard = self.write_guard;
         let _checkpoint_guard = self.checkpoint_guard;
 
-        // Best-effort cleanup of the new snapshot directory. Object stores
-        // (S3) don't have a single "remove dir" call; we leave object-store
-        // cleanup to `trigger_old_snapshot_cleanup` on a subsequent
-        // successful overwrite, which prunes any snapshot dir not referenced
-        // by the catalog.
+        // Best-effort cleanup of the new snapshot's files and the deletion
+        // vectors written for it, on a local directory as in an object store:
+        // nothing committed names them, and nothing else would ever remove the
+        // deletion vectors.
         self.table
             .remove_unpublished_snapshot_dir(&self.new_snapshot_id)
             .await;
-        if !self.table.data_in_store() {
-            remove_deletion_vectors(
-                &self.delete_files,
-                self.table.dataset_storage().map(AsRef::as_ref),
-            )
-            .await;
-        }
+        remove_deletion_vectors(
+            &self.delete_files,
+            self.table.dataset_storage().map(AsRef::as_ref),
+        )
+        .await;
         Ok(())
     }
 }
@@ -950,11 +947,14 @@ impl CayenneTableProvider {
         )
     }
 
-    /// Remove an unpublished snapshot's local directory, best-effort: a
-    /// directory left behind is pruned by the next snapshot cleanup, and object
-    /// stores are left to it entirely.
+    /// Remove an unpublished snapshot's files, best-effort: a file left behind
+    /// is an object no commit names. In an object store, the snapshot's own
+    /// prefix is listed and deleted in batched requests, and the manifest rows
+    /// recorded for it before the commit are dropped; the caller guarantees
+    /// that no commit made the snapshot live.
     async fn remove_unpublished_snapshot_dir(&self, snapshot_id: &str) {
         if self.data_in_store() {
+            self.remove_unpublished_snapshot_objects(snapshot_id).await;
             return;
         }
         let snapshot_dir = self.snapshot_dir_path_for(snapshot_id);
@@ -968,6 +968,48 @@ impl CayenneTableProvider {
                     self.table_name()
                 );
             }
+        }
+    }
+
+    /// The object-store half of [`Self::remove_unpublished_snapshot_dir`].
+    async fn remove_unpublished_snapshot_objects(&self, snapshot_id: &str) {
+        let table_name = self.table_name().to_string();
+        let removed: Result<()> = async {
+            let Some(prefix) = self.snapshot_object_store_prefix(snapshot_id)? else {
+                return Ok(());
+            };
+            let store = Arc::clone(&self.require_object_store()?.store);
+            let listed: Vec<object_store::ObjectMeta> = store
+                .list(Some(&prefix))
+                .try_collect()
+                .await
+                .map_err(|source| super::Error::ObjectStore {
+                    operation: "list an unpublished snapshot's files",
+                    table: table_name.clone(),
+                    source,
+                })?;
+            let outcome = crate::dataset_storage::delete_in_batches(
+                &store,
+                listed.into_iter().map(|meta| meta.location).collect(),
+            )
+            .await;
+            if let Some(source) = outcome.first_error {
+                return Err(super::Error::ObjectStore {
+                    operation: "delete an unpublished snapshot's files",
+                    table: table_name.clone(),
+                    source,
+                });
+            }
+            self.catalog()
+                .clear_snapshot_cached_metadata(self.table_id(), snapshot_id)
+                .await
+                .map_err(|source| super::Error::Catalog { source })
+        }
+        .await;
+        if let Err(error) = removed {
+            tracing::warn!(
+                "Failed to delete the files of a write to table '{table_name}' that was not committed, so they keep using storage; no data is lost. Cause: {error}"
+            );
         }
     }
 

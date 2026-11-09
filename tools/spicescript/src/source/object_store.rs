@@ -244,6 +244,26 @@ impl ObjectCommand {
     }
 }
 
+/// `list-objects-v2 --query "Contents[].[Key,Size]" --output text`: one
+/// `key<TAB>size` line per object, or `None` when there are none.
+fn parse_key_sizes(out: &str) -> Result<Vec<(String, u64)>> {
+    out.lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty() && *line != "None")
+        .map(|line| {
+            let (key, size) = line
+                .rsplit_once('\t')
+                .with_context(|| format!("unexpected listing line '{line}'"))?;
+            Ok((
+                key.to_string(),
+                size.trim()
+                    .parse()
+                    .with_context(|| format!("unexpected size in '{line}'"))?,
+            ))
+        })
+        .collect()
+}
+
 /// Creates the proxy to the store on its loopback and delays every response
 /// it relays by `latency`, through the toxiproxy API on `api_port`.
 async fn configure_proxy(api_port: u16, latency: Duration) -> Result<()> {
@@ -467,6 +487,24 @@ impl Source for ObjectStore {
         self.keys(&bucket(namespace), prefix).await
     }
 
+    async fn sizes(&self, namespace: &str, prefix: &str) -> Result<Vec<(String, u64)>> {
+        let out = self
+            .aws(&[
+                "s3api",
+                "list-objects-v2",
+                "--bucket",
+                &bucket(namespace),
+                "--prefix",
+                prefix,
+                "--query",
+                "Contents[].[Key,Size]",
+                "--output",
+                "text",
+            ])
+            .await?;
+        parse_key_sizes(&out)
+    }
+
     /// Writes the part files locally, then uploads them under `<table>/`,
     /// after removing what is there unless appending.
     async fn generate(&self, namespace: &str, spec: &TableSpec) -> Result<u64> {
@@ -551,5 +589,22 @@ mod object_command_tests {
         );
         let error = ObjectCommand::parse("SELECT 1").expect_err("not a command");
         assert!(error.to_string().contains("not `SELECT 1`"), "{error}");
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::parse_key_sizes;
+
+    #[test]
+    fn a_listing_with_sizes_parses_and_an_empty_one_is_empty() {
+        assert_eq!(
+            parse_key_sizes("state/a.vortex\t120\nstate/b/head\t7\n").expect("parse"),
+            vec![
+                ("state/a.vortex".to_string(), 120),
+                ("state/b/head".to_string(), 7)
+            ]
+        );
+        assert_eq!(parse_key_sizes("None\n").expect("parse"), Vec::new());
     }
 }

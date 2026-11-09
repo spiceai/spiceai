@@ -209,7 +209,7 @@ steps:
   - query: SELECT * FROM facts
     eventually: 60s
   - assert-log:
-      contains: ["Dataset 'facts' \\(cayenne\\) dropped its acceleration for `mode: file_create` and reloads from its source into a new folder in the state location\\. Its previous folder 's3://[^']+/moved/cayenne/v1/datasets/facts-[^']+' is kept"]
+      contains: ["Dataset 'facts' \\(cayenne\\) dropped its acceleration for `mode: file_create` and reloads from its source into a new folder in the state location\\. Its previous folder 's3://[^']+/moved/cayenne/v1/datasets/facts-[^']+' is deleted once no query reads it"]
       lacks: ['Deleted the acceleration data directory', 'were not removed from the object store']
     only: *in-location
   - restart:

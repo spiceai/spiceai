@@ -242,28 +242,35 @@ steps:
   - assert-files: { lacks: ['(^|/)s3:', '\.arrow$'] }
     only: &object-store-data [object-store-data-path-rustfs, object-native-data-rustfs]
 
-  # 180 s of CDC updates and deletes: the data files and deletion vectors in
-  # the bucket stay within the same bound halfway through and at the end, and
-  # the table still matches the source. The bounds are a few compactions' worth
-  # of the table (about 20,000 rows), far below what 180 s of unreclaimed
-  # snapshots would leave.
+  # 180 s of CDC updates and deletes at a fixed rate: the data files and
+  # deletion vectors in the bucket stay within the same bound halfway through
+  # and at the end, and the table still matches the source. The bounds are a
+  # few compactions' worth of the table (about 20,000 rows), far below what
+  # 180 s of unreclaimed snapshots would leave. In the state location the
+  # dataset's objects are sampled every 10 s across several reclamation cycles
+  # (a retired snapshot is deleted about 5 s after its retirement), as a series
+  # that must stay under the bound and not trend upward (#16133).
   - background:
       id: churn
       source-exec: { src: "UPDATE orders SET o_qty = (o_qty + 1) % 50 WHERE o_id % 97 = ${round} % 97; DELETE FROM orders WHERE o_id % 991 = ${round} % 991" }
       every: 1s
     only: *object-store-data
   - sleep: 90s
-    only: *object-store-data
+    only: object-store-data-path-rustfs
   - assert-objects: { source: lake, prefix: data/orders/, contains: .vortex, max: 400 }
     only: object-store-data-path-rustfs
   - assert-objects: { source: lake, prefix: data/orders/, contains: .arrow, max: 200 }
     only: object-store-data-path-rustfs
-  - assert-objects: { source: lake, prefix: state/cayenne/v1/datasets/orders-, contains: .vortex, max: 400 }
-    only: object-native-data-rustfs
-  - assert-objects: { source: lake, prefix: state/cayenne/v1/datasets/orders-, contains: .arrow, max: 200 }
-    only: object-native-data-rustfs
   - sleep: 90s
-    only: *object-store-data
+    only: object-store-data-path-rustfs
+  - sample-objects:
+      source: lake
+      prefix: state/cayenne/v1/datasets/orders-
+      contains: /data/
+      every: 10s
+      for: 180s
+      max-objects: 600
+    only: object-native-data-rustfs
   - stop-background: { id: churn }
     only: *object-store-data
   - query: SELECT * FROM orders
@@ -333,3 +340,40 @@ steps:
   - query: SELECT * FROM customers
     eventually: 30s
     only: *object-native-data
+
+  # Readers while the change stream writes (#16132): with the data in an
+  # object-store location, with or without 20 ms of latency, no query fails,
+  # and the table still matches the source afterwards. (A local location does
+  # not hold data files yet, so it is not run there.)
+  - background:
+      id: cdc-writes
+      source-exec: { src: "UPDATE orders SET o_total = o_total + 1 WHERE o_id % 13 = ${round} % 13" }
+      every: 200ms
+    only: &object-native-data-in-store [object-native-data-rustfs, object-native-data-rustfs-latency]
+  - background:
+      id: readers
+      query: SELECT count(*), sum(o_total) FROM orders
+      concurrency: 4
+    only: *object-native-data-in-store
+  - sleep: 30s
+    only: *object-native-data-in-store
+  - stop-background: { id: cdc-writes }
+    only: *object-native-data-in-store
+  - stop-background: { id: readers }
+    only: *object-native-data-in-store
+  - query: SELECT * FROM orders
+    eventually: 60s
+    only: *object-native-data-in-store
+
+  # Losing the directory again, now with the source up and the deletion
+  # vectors of the writes above in the location: the datasets open from the
+  # location and are ready within 60 s, with or without 20 ms of store latency.
+  - stop: {}
+    only: *object-native-data-in-store
+  - wipe-instance-dir: { keep: [state] }
+    only: *object-native-data-in-store
+  - start: { ready-timeout: 60s }
+    only: *object-native-data-in-store
+  - query: SELECT * FROM orders
+    eventually: 30s
+    only: *object-native-data-in-store
