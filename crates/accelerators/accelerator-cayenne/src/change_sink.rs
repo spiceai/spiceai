@@ -17,6 +17,8 @@ limitations under the License.
 //! Native CDC execution and storage durability fences for the table owner.
 
 #[cfg(test)]
+mod crash_tests;
+#[cfg(test)]
 mod tests;
 
 use std::sync::Arc;
