@@ -31,6 +31,7 @@ jobs:
   resolve:
     name: Find the build
     runs-on: spiceai-dev-runners
+    environment: secret-free
     timeout-minutes: 10
     outputs:
       spiced_artifact: ${{ steps.find.outputs.spiced_artifact }}
@@ -247,6 +248,7 @@ jobs:
     needs: [resolve, test]
     if: ${{ !cancelled() && needs.resolve.result == 'success' }}
     runs-on: spiceai-dev-runners
+    environment: secret-free
     timeout-minutes: 10
     steps:
       - name: Download script results
@@ -264,20 +266,26 @@ jobs:
           WORKFLOW: ${{ needs.resolve.outputs.workflow }}
         run: |
           python3 - <<'EOF' >> "$GITHUB_STEP_SUMMARY"
-          import glob, json, os
-          scripts, incomplete = [], 0
-          for path in sorted(glob.glob(os.path.join(os.environ["RESULTS"], "*", "spicescript-results.json"))):
+          import json, os
+          # A shard that failed before writing its report has no file; count it unfinished.
+          scripts, unfinished = [], []
+          for shard in range(1, 5):
+              path = os.path.join(os.environ["RESULTS"], f"spicescript-results-{shard}", "spicescript-results.json")
+              if not os.path.exists(path):
+                  unfinished.append(shard)
+                  continue
               with open(path) as f:
                   data = json.load(f)
-              incomplete += not data["complete"]
+              if not data["complete"]:
+                  unfinished.append(shard)
               scripts += data["scripts"]
           failed = sorted((s for s in scripts if s["outcome"] == "failed"), key=lambda s: s["name"])
           run = f"{os.environ['GITHUB_SERVER_URL']}/{os.environ['GITHUB_REPOSITORY']}/actions/runs/{os.environ['RUN_ID']}"
           print(f"### spicescript against [{os.environ['WORKFLOW']} run {os.environ['RUN_ID']}]({run})")
           print(f"`{os.environ['BRANCH']}` @ `{os.environ['SHA'][:10]}`\n")
           print(f"{len(scripts) - len(failed)} of {len(scripts)} scripts passed, {len(failed)} failed.")
-          if incomplete:
-              print(f"\n**{incomplete} of 4 shards did not finish**, so scripts are missing from this count.")
+          if unfinished:
+              print(f"\n**{len(unfinished)} of 4 shards did not finish** (shard {', '.join(map(str, unfinished))}), so scripts are missing from this count.")
           if failed:
               print("\n| Script | Checks passed | First problem |\n|---|---|---|")
               for s in failed:
