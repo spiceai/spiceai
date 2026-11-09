@@ -1025,25 +1025,60 @@ fn missing_request_key_filter_groups(
     complete_fetch: bool,
 ) -> Option<Vec<Vec<Expr>>> {
     let missing = missing_requested_cache_keys(filters, cached_batches)?;
+    let groups = request_key_filter_groups(filters, &missing, complete_fetch);
+    (!groups.is_empty()).then_some(groups)
+}
+
+/// Connector-safe filter sets that revalidate only the request keys named by
+/// `filters` that `cached_batches` holds, built the way
+/// [`missing_request_key_filter_groups`] builds the fetch of the absent ones.
+/// On a partial hit, revalidating the full `filters` would ask the origin for
+/// the missing keys a second time, under a claim key that does not coalesce
+/// with the miss path's fetch.
+fn present_request_key_filter_groups(
+    filters: &[Expr],
+    cached_batches: &[RecordBatch],
+    complete_fetch: bool,
+) -> Vec<Vec<Expr>> {
+    let Some(requested) = requested_cache_keys(filters) else {
+        return Vec::new();
+    };
+    let cached = cached_request_keys(cached_batches);
+    let present: Vec<RequestedCacheKey> = requested
+        .into_iter()
+        .filter(|requested_key| {
+            cached
+                .iter()
+                .any(|cached_key| requested_key.matches(cached_key))
+        })
+        .collect();
+    request_key_filter_groups(filters, &present, complete_fetch)
+}
+
+/// One filter set per origin scan for `keys`: the non-key conjuncts of
+/// `filters` (headers included) plus one connector-safe key predicate.
+fn request_key_filter_groups(
+    filters: &[Expr],
+    keys: &[RequestedCacheKey],
+    complete_fetch: bool,
+) -> Vec<Vec<Expr>> {
+    if keys.is_empty() {
+        return Vec::new();
+    }
     let non_key = non_request_key_filters(filters);
     let key_exprs = if complete_fetch {
-        per_key_equality_exprs(&missing)
+        per_key_equality_exprs(keys)
     } else {
-        connector_safe_missing_key_exprs(&missing)
+        connector_safe_missing_key_exprs(keys)
     };
-    if key_exprs.is_empty() {
-        return None;
-    }
-    Some(
-        key_exprs
-            .into_iter()
-            .map(|key_expr| {
-                let mut group = non_key.clone();
-                group.push(key_expr);
-                group
-            })
-            .collect(),
-    )
+    key_exprs
+        .into_iter()
+        .map(|key_expr| {
+            let mut group = non_key.clone();
+            group.push(key_expr);
+            group
+        })
+        .collect()
 }
 
 /// Maximum number of concurrent refresh requests
@@ -3427,10 +3462,10 @@ impl CacheRefreshHelper {
         stale_while_revalidate: Option<Duration>,
         io_runtime: &Handle,
         schema: SchemaRef,
-        filters: &[Expr],
+        revalidation_filters: &[Vec<Expr>],
         in_flight_revalidations: &InFlightRevalidations,
         batch_write_tx: &CacheWriteSender,
-        namespace: CacheNamespace,
+        namespace: &CacheNamespace,
     ) -> SendableRecordBatchStream {
         let total_cached_rows: usize = cached_batches.iter().map(RecordBatch::num_rows).sum();
 
@@ -3459,36 +3494,37 @@ impl CacheRefreshHelper {
                     // whole refresh and released by the write that lands it. A
                     // follower here means another caller already owns the
                     // revalidation, so this path simply skips.
-                    match CacheKeyClaim::acquire(
-                        in_flight_revalidations,
-                        compute_cache_key_from_filters_and_namespace(
-                            filters,
-                            namespace.storage_id(),
-                        ),
-                        None,
-                    ) {
-                        ClaimOutcome::Leader(claim) => {
-                            tracing::debug!(
-                                "Data is stale for dataset={dataset_name}, triggering background refresh"
-                            );
-
-                            // Log current fetched_at for debugging
-                            if let Some(timestamp) =
-                                get_first_fetched_at_timestamp(&cached_batches[0])
-                            {
+                    for filters in revalidation_filters {
+                        match CacheKeyClaim::acquire(
+                            in_flight_revalidations,
+                            compute_cache_key_from_filters_and_namespace(
+                                filters,
+                                namespace.storage_id(),
+                            ),
+                            None,
+                        ) {
+                            ClaimOutcome::Leader(claim) => {
                                 tracing::debug!(
-                                    "Current stale data has {CACHE_REFRESHED_AT_COLUMN} timestamp={timestamp}"
+                                    "Data is stale for dataset={dataset_name}, triggering background refresh"
                                 );
-                            }
 
-                            let federated_clone = Arc::clone(federated);
-                            let session_state_clone = Arc::clone(session_state);
-                            let dataset_name_clone = dataset_name.to_string();
-                            let filters_for_refresh: Vec<Expr> = filters.to_vec();
-                            let batch_write_tx_clone = batch_write_tx.clone();
-                            let namespace_clone = namespace;
+                                // Log current fetched_at for debugging
+                                if let Some(timestamp) =
+                                    get_first_fetched_at_timestamp(&cached_batches[0])
+                                {
+                                    tracing::debug!(
+                                        "Current stale data has {CACHE_REFRESHED_AT_COLUMN} timestamp={timestamp}"
+                                    );
+                                }
 
-                            if let Err(error) = batch_write_tx.spawn_owned(io_runtime, async move {
+                                let federated_clone = Arc::clone(federated);
+                                let session_state_clone = Arc::clone(session_state);
+                                let dataset_name_clone = dataset_name.to_string();
+                                let filters_for_refresh: Vec<Expr> = filters.clone();
+                                let batch_write_tx_clone = batch_write_tx.clone();
+                                let namespace_clone = namespace.clone();
+
+                                if let Err(error) = batch_write_tx.spawn_owned(io_runtime, async move {
                             tracing::debug!(
                                 "SWR: Background refresh for single entry started for dataset={dataset_name_clone}"
                             );
@@ -3531,11 +3567,12 @@ impl CacheRefreshHelper {
                         }) {
                                 tracing::debug!("Declining cache revalidation for dataset '{dataset_name}': {error}");
                             }
-                        }
-                        ClaimOutcome::Follower(_) => {
-                            tracing::debug!(
-                                "Skipping background refresh for dataset={dataset_name} because should_revalidate=false (revalidation already in progress for this cache key)"
-                            );
+                            }
+                            ClaimOutcome::Follower(_) => {
+                                tracing::debug!(
+                                    "Skipping background refresh for dataset={dataset_name} because should_revalidate=false (revalidation already in progress for this cache key)"
+                                );
+                            }
                         }
                     }
                 }
@@ -4061,6 +4098,13 @@ impl ExecutionPlan for CachingAccelerationScanExec {
                         dataset = %dataset_name,
                         "Partial cache hit: fetching request keys absent from the accelerator"
                     );
+                    // Revalidate only the keys the hit served: the miss
+                    // scans below fetch (and store) the absent ones.
+                    let present_groups = present_request_key_filter_groups(
+                        &fill_filters,
+                        &cached_batches,
+                        batch_write_tx.requires_complete_fetch(),
+                    );
                     let hit_stream = CacheRefreshHelper::handle_cache_hit(
                         cached_batches,
                         &federated,
@@ -4070,10 +4114,10 @@ impl ExecutionPlan for CachingAccelerationScanExec {
                         stale_while_revalidate,
                         &io_runtime,
                         Arc::clone(&schema_clone),
-                        &fill_filters,
+                        &present_groups,
                         &in_flight_revalidations,
                         &batch_write_tx,
-                        namespace.clone(),
+                        &namespace,
                     );
                     let mut combined: SendableRecordBatchStream =
                         Box::pin(RecordBatchStreamAdapter::new(
@@ -4117,10 +4161,10 @@ impl ExecutionPlan for CachingAccelerationScanExec {
                     stale_while_revalidate,
                     &io_runtime,
                     Arc::clone(&schema_clone),
-                    &fill_filters,
+                    std::slice::from_ref(&fill_filters),
                     &in_flight_revalidations,
                     &batch_write_tx,
-                    namespace,
+                    &namespace,
                 )
             } else {
                 // Cache miss - no data in accelerator - retrieve from source and store in accelerator
@@ -6939,10 +6983,10 @@ mod tests {
             stale_while_revalidate,
             &io_runtime,
             Arc::clone(&schema),
-            &access_filters,
+            std::slice::from_ref(&access_filters),
             &in_flight_revalidations,
             &batch_write_tx,
-            CacheNamespace::Public,
+            &CacheNamespace::Public,
         );
         // `handle_cache_hit` clones the sender it is lent, so dropping this one
         // leaves the background refresh holding the only sender: once it has queued
@@ -8839,6 +8883,20 @@ mod tests {
         cached: RecordBatch,
         origin: RecordBatch,
     ) -> (Vec<RecordBatch>, Vec<Vec<String>>) {
+        let (batches, recorded) = execute_partial_hit_with_swr(filters, cached, origin, None).await;
+        let recorded = recorded.read().clone();
+        (batches, recorded)
+    }
+
+    /// Like [`execute_partial_hit`] with a stale-while-revalidate window, and
+    /// hands back the live record of origin scans so a test can wait for the
+    /// background revalidation.
+    async fn execute_partial_hit_with_swr(
+        filters: Vec<Expr>,
+        cached: RecordBatch,
+        origin: RecordBatch,
+        stale_while_revalidate: Option<Duration>,
+    ) -> (Vec<RecordBatch>, Arc<RwLock<Vec<Vec<String>>>>) {
         let schema = cached.schema();
         let federated = Arc::new(FilterTrackingTableProvider::new(
             Arc::clone(&schema),
@@ -8858,7 +8916,7 @@ mod tests {
         let exec = CachingAccelerationScanExec::new(
             input,
             Some(Duration::from_mins(10)),
-            None,
+            stale_while_revalidate,
             StaleIfError::Disabled,
             federated,
             accelerator,
@@ -8878,7 +8936,7 @@ mod tests {
             .try_collect()
             .await
             .expect("collect");
-        (batches, recorded.read().clone())
+        (batches, recorded)
     }
 
     fn contents_of(batches: &[RecordBatch]) -> Vec<String> {
@@ -8934,6 +8992,70 @@ mod tests {
         assert!(
             !joined.contains("cat=p"),
             "origin should not be re-asked for cached cat=p: {recorded:?}"
+        );
+    }
+
+    /// A stale hit on `cat=p` with `cat=q` missing revalidates `cat=p` alone:
+    /// the miss path fetches `cat=q`, so a revalidation of the whole filter set
+    /// would ask the origin for `cat=q` twice, under claim keys that never
+    /// coalesce.
+    #[tokio::test]
+    async fn stale_partial_hit_revalidates_only_the_cached_key() {
+        let schema = http_cache_schema();
+        let now = i64::try_from(
+            SystemTime::now()
+                .duration_since(SystemTime::UNIX_EPOCH)
+                .expect("time went backwards")
+                .as_nanos(),
+        )
+        .expect("now fits in i64 nanoseconds");
+        let stale_at = nanos_ago(now, Duration::from_mins(15));
+        let cached = http_row_with_key(&schema, "/v1/items", "cat=p", "cached-p", stale_at);
+        let origin_p = http_row_with_key(&schema, "/v1/items", "cat=p", "origin-p", now);
+        let origin_q = http_row_with_key(&schema, "/v1/items", "cat=q", "origin-q", now);
+        let origin = arrow::compute::concat_batches(&schema, &[origin_p, origin_q])
+            .expect("concat origin rows");
+        let filters = vec![
+            col("request_path").eq(lit("/v1/items")),
+            col("request_query").in_list(vec![lit("cat=p"), lit("cat=q")], false),
+        ];
+        let (batches, recorded) =
+            execute_partial_hit_with_swr(filters, cached, origin, Some(Duration::from_hours(1)))
+                .await;
+        assert!(
+            contents_of(&batches).contains(&"cached-p".to_string()),
+            "the stale cat=p entry is served: {:?}",
+            contents_of(&batches)
+        );
+
+        // The miss scan ran inline; the revalidation runs in the background.
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        while recorded.read().len() < 2 && tokio::time::Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        let recorded = recorded.read().clone();
+        assert_eq!(
+            recorded.len(),
+            2,
+            "one miss scan for cat=q and one revalidation of cat=p: {recorded:?}"
+        );
+        let naming_q = recorded
+            .iter()
+            .filter(|scan| scan.join(" AND ").contains("cat=q"))
+            .count();
+        let naming_p = recorded
+            .iter()
+            .filter(|scan| scan.join(" AND ").contains("cat=p"))
+            .count();
+        assert_eq!(naming_q, 1, "cat=q is fetched once: {recorded:?}");
+        assert_eq!(naming_p, 1, "cat=p is revalidated once: {recorded:?}");
+        assert!(
+            recorded.iter().all(|scan| {
+                let joined = scan.join(" AND ");
+                !(joined.contains("cat=p") && joined.contains("cat=q"))
+            }),
+            "no scan names both keys: {recorded:?}"
         );
     }
 
