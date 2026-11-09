@@ -418,6 +418,20 @@ impl Rig {
         names
     }
 
+    /// The files the committed manifest of `snapshot_id` names.
+    async fn snapshot_manifest_names(&self, table_id: &str, snapshot_id: &str) -> Vec<String> {
+        let mut names: Vec<String> = self
+            .catalog()
+            .get_snapshot_files(table_id, snapshot_id)
+            .await
+            .expect("manifest")
+            .into_iter()
+            .map(|f| f.file_path)
+            .collect();
+        names.sort();
+        names
+    }
+
     /// `.vortex` names directly under one snapshot directory of `table`.
     async fn listed(&self, table: &Table, table_id: &str, snapshot_id: &str) -> Vec<String> {
         let dir = format!("{}/{table_id}/{snapshot_id}", table.data_prefix);
@@ -671,7 +685,14 @@ async fn subset_compaction(rig: &Rig) {
         "{}: subset compaction kept exactly the committed rows",
         rig.label
     );
-    let mut committed = rig.manifest_names(&table_id).await;
+    // The snapshot the compaction published; the one it retired keeps its rows
+    // until the retirement sweep deletes its files.
+    let mut committed = rig.snapshot_manifest_names(&table_id, &new_snapshot).await;
+    assert!(
+        !committed.is_empty(),
+        "{}: the published snapshot names its files",
+        rig.label
+    );
     committed.retain(|name| !name.starts_with("orphan-"));
     let listed = rig.listed(&table, &table_id, &new_snapshot).await;
     for name in &committed {

@@ -26465,10 +26465,21 @@ impl CayenneTableProvider {
     /// it runs AFTER the commit that makes `keep_snapshot_id` current — a commit
     /// that fails then leaves the previously-current snapshot's rows intact
     /// (publish-before-clear).
+    ///
+    /// A no-op for a table whose data is in its own store on a catalog that keeps
+    /// the retirement record: every commit that takes a snapshot out of the live
+    /// set retires it there, and the retired-snapshot sweep forgets its rows
+    /// together with its files once no scan holds it. Clearing every other
+    /// snapshot's rows would also clear those of a protected snapshot published
+    /// after the commit that calls this, whose rows are in no other snapshot, and
+    /// those a scan that captured the earlier snapshot set still reads.
     pub(crate) async fn prune_snapshot_manifest_to(
         &self,
         keep_snapshot_id: &str,
     ) -> CatalogResult<()> {
+        if self.catalog.keeps_retirement_record() && self.data_in_store() {
+            return Ok(());
+        }
         self.catalog
             .clear_snapshot_files_except(&self.table_metadata.table_id, keep_snapshot_id)
             .await
@@ -84928,5 +84939,6 @@ mod tests {
     }
 
     mod layered_upsert_state;
+    mod object_native_scan_consistency;
     mod repeated_keys;
 }
