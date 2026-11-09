@@ -21556,7 +21556,7 @@ impl CayenneTableProvider {
                 CompactionKind::SubsetCurrent,
                 CompactionOutcome::DeclinedStagingInflight,
             );
-            return Ok(false);
+            { eprintln!("PROBE decline at table.rs:{}", line!()); return Ok(false); }
         }
 
         // Two entry reasons. Small-file accumulation in the current dir is the
@@ -21572,7 +21572,7 @@ impl CayenneTableProvider {
                 CompactionKind::SubsetCurrent,
                 reclaim.declined_outcome(),
             );
-            return Ok(false);
+            { eprintln!("PROBE decline at table.rs:{}", line!()); return Ok(false); }
         }
         // Recorded HERE, at the gate that fired — not after candidate selection.
         // Selection can still decline (`declined_no_candidates`,
@@ -21609,7 +21609,7 @@ impl CayenneTableProvider {
                             declined,
                         );
                     }
-                    return Ok(false);
+                    { eprintln!("PROBE decline at table.rs:{}", line!()); return Ok(false); }
                 }
             },
             None => None,
@@ -21626,10 +21626,10 @@ impl CayenneTableProvider {
                 table = self.table_metadata.table_name.as_str(),
                 "Skipping current-snapshot small-file compaction: another pass already running",
             );
-            return Ok(false);
+            { eprintln!("PROBE decline at table.rs:{}", line!()); return Ok(false); }
         };
         if !self.maintenance_still_admitted() {
-            return Ok(false);
+            { eprintln!("PROBE decline at table.rs:{}", line!()); return Ok(false); }
         }
 
         // An `auto` table rewrites itself whole — the only rewrite this pass runs on
@@ -21649,7 +21649,7 @@ impl CayenneTableProvider {
                     CompactionKind::SubsetCurrent,
                     reclaim.declined_outcome(),
                 );
-                return Ok(false);
+                { eprintln!("PROBE decline at table.rs:{}", line!()); return Ok(false); }
             }
             reclaim.trigger()
         } else {
@@ -21678,7 +21678,7 @@ impl CayenneTableProvider {
                             CompactionKind::SubsetCurrent,
                             CompactionOutcome::DeclinedSizingFailed,
                         );
-                        return Ok(false);
+                        { eprintln!("PROBE decline at table.rs:{}", line!()); return Ok(false); }
                     }
                 }
             };
@@ -21713,7 +21713,7 @@ impl CayenneTableProvider {
                     CompactionKind::SubsetCurrent,
                     declined,
                 );
-                return Ok(false);
+                { eprintln!("PROBE decline at table.rs:{}", line!()); return Ok(false); }
             }
         }
 
@@ -21757,7 +21757,7 @@ impl CayenneTableProvider {
             if committed {
                 self.record_small_file_compact_path(LastSmallFileCompactPath::Full);
             }
-            return Ok(committed);
+            { if !committed { eprintln!("PROBE reclaim rewrite did not commit at table.rs:{}", line!()); } return Ok(committed); }
         }
 
         let cfg = self.context.compaction_picker_config();
@@ -21802,7 +21802,7 @@ impl CayenneTableProvider {
                 CompactionKind::SubsetCurrent,
                 CompactionOutcome::DeclinedNoCandidates,
             );
-            return Ok(false);
+            { eprintln!("PROBE decline at table.rs:{}", line!()); return Ok(false); }
         }
         let Some(candidate) = self.pick_small_file_candidates(&files, &cfg) else {
             maintenance_metrics::track_compaction(
@@ -21820,7 +21820,7 @@ impl CayenneTableProvider {
                 )
                 .await;
             }
-            return Ok(false);
+            { eprintln!("PROBE decline at table.rs:{}", line!()); return Ok(false); }
         };
 
         self.log_snapshot_maintenance_trigger(SnapshotMaintenanceTrigger::SmallFileCount {
@@ -21879,7 +21879,7 @@ impl CayenneTableProvider {
                         table = self.table_metadata.table_name.as_str(),
                         "Subset small-file rewrite no-op; will retry on next trigger"
                     );
-                    return Ok(false);
+                    { eprintln!("PROBE decline at table.rs:{}", line!()); return Ok(false); }
                 }
                 Err(e) => {
                     maintenance_metrics::track_compaction(
