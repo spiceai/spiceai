@@ -65,7 +65,14 @@ jobs:
           total_fail=0
           for t in \
             provider::table::tests::a_whole_table_reclaim_counts_the_rows_of_files_its_tombstones_hide_whole \
-            provider::table::tests::a_whole_table_reclaim_of_real_upserts_keeps_its_trigger \n            provider::table::tests::a_whole_table_reclaim_counts_each_removed_row_once \n            provider::table::tests::a_reclaim_over_position_deletes_keeps_the_yield_it_had \n            provider::table::tests::a_whole_table_reclaim_that_removes_no_rows_backs_its_trigger_off; do
+            provider::table::tests::a_whole_table_reclaim_of_real_upserts_keeps_its_trigger \
+            provider::table::tests::a_whole_table_reclaim_counts_each_removed_row_once \
+            provider::table::tests::a_reclaim_over_position_deletes_keeps_the_yield_it_had \
+            provider::table::tests::a_whole_table_reclaim_that_removes_no_rows_backs_its_trigger_off; do
+            # A name that matches no test would "pass" every iteration.
+            if [ "$("$BIN" --exact "$t" --list 2>/dev/null | grep -c ': test$')" != 1 ]; then
+              echo "::error::${t} does not name exactly one test"; exit 1
+            fi
             for par in "$cpus" "$((cpus * 4))"; do
               res=$(seq 300 | xargs -P "$par" -I{} bash -c 'run_one "$0" "$1"' "$t" {} | sort | uniq -c | tr '\n' ' ')
               echo "RESULT test=${t##*::} parallel=${par} iterations=300 -> ${res}"
