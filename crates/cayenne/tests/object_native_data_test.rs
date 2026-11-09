@@ -1955,6 +1955,66 @@ async fn a_failed_deletion_vector_read_at_open_is_an_error_not_more_rows() {
     );
 }
 
+/// Every query session reads the table's data files, whatever sessions came
+/// before it. A session dropped after a query frees its `RuntimeEnv`, and the
+/// next session's `RuntimeEnv` can be allocated at the same address; the
+/// dataset's store must be registered in that new one too.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn every_new_query_session_reads_the_datasets_files() {
+    const SESSIONS: usize = 200;
+    let name = "sessions";
+    let (setup, catalog) = KeyedSetup::new(name).await;
+    let store = setup.store(None);
+    let catalog: Arc<dyn MetadataCatalog> = Arc::new(catalog);
+    let (table, ctx) = setup
+        .create(name, &store, catalog, cdc_config(CdcDurability::File))
+        .await;
+    let rows: Vec<(i64, i64)> = (1..=20).map(|id| (id, id * 10)).collect();
+    cdc_upsert(&table, &rows).await;
+    table.quiesce().await;
+    drop(ctx);
+
+    let mut addresses = std::collections::HashSet::new();
+    let mut reused = 0_usize;
+    let mut failures = Vec::new();
+    for _ in 0..SESSIONS {
+        let ctx = SessionContext::new();
+        if !addresses.insert(Arc::as_ptr(&ctx.runtime_env()) as usize) {
+            reused += 1;
+        }
+        ctx.register_table(name, Arc::clone(&table) as Arc<dyn TableProvider>)
+            .expect("register");
+        let answer = async {
+            ctx.sql(&format!("SELECT id, v FROM {name} ORDER BY id"))
+                .await?
+                .collect()
+                .await
+        }
+        .await;
+        match answer {
+            Ok(batches) => {
+                let read: usize = batches
+                    .iter()
+                    .map(arrow::array::RecordBatch::num_rows)
+                    .sum();
+                if read != rows.len() {
+                    failures.push(format!("read {read} rows, expected {}", rows.len()));
+                }
+            }
+            Err(error) => failures.push(error.to_string()),
+        }
+    }
+    // No precondition on `reused`: whether an address comes back is the
+    // allocator's choice, and a table that holds its registrations weakly keeps
+    // every address it registered from being reused.
+    assert!(
+        failures.is_empty(),
+        "{} of {SESSIONS} sessions failed ({reused} reused a dropped runtime's address); first: {}",
+        failures.len(),
+        failures[0]
+    );
+}
+
 /// How [`scans_under_store_latency_are_stable`] runs the change stream.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum ChangeStream {

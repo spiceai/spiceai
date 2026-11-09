@@ -2466,10 +2466,12 @@ pub struct CayenneTableProvider {
     /// bucket/endpoint than `object_store_config` (the warm tier). Registered
     /// with the query `RuntimeEnv` at scan time via `register_object_store_if_needed`.
     cold_object_store_config: Option<crate::metadata::ObjectStoreConfig>,
-    /// `RuntimeEnv` identities where `object_store_config` has already been
-    /// verified/registered. This avoids probing the registry on every scan in
-    /// the common case while still handling distinct query runtimes correctly.
-    object_store_registered_runtime_envs: Arc<ParkingMutex<HashSet<usize>>>,
+    /// The `RuntimeEnv`s where `object_store_config` has already been
+    /// verified/registered, held weakly (see
+    /// [`Self::register_object_store_for_runtime`]). This avoids probing the
+    /// registry on every scan in the common case while still handling distinct
+    /// query runtimes correctly.
+    object_store_registered_runtime_envs: Arc<ParkingMutex<Vec<std::sync::Weak<RuntimeEnv>>>>,
     /// Current snapshot ID, updated after compaction operations.
     ///
     /// This is separate from `table_metadata.current_snapshot_id` because compaction
@@ -8845,28 +8847,34 @@ impl CayenneTableProvider {
         }
     }
 
-    fn runtime_env_cache_key(runtime_env: &Arc<RuntimeEnv>) -> usize {
-        Arc::as_ptr(runtime_env) as usize
-    }
-
+    /// Registers `config`'s store in `runtime_env` unless this table already did.
+    ///
+    /// The record of where it did holds each `RuntimeEnv` weakly, not by address:
+    /// a weak handle keeps the allocation, so no other `RuntimeEnv` can take the
+    /// address of one it holds, even after that one is dropped. An address alone
+    /// would be reused by the next `RuntimeEnv` allocated there, which would then
+    /// be taken for registered and fail every read of the table's files.
     fn register_object_store_for_runtime(
         &self,
         runtime_env: &Arc<RuntimeEnv>,
         config: &crate::metadata::ObjectStoreConfig,
     ) {
-        let runtime_env_key = Self::runtime_env_cache_key(runtime_env);
-        if self
-            .object_store_registered_runtime_envs
-            .lock()
-            .contains(&runtime_env_key)
         {
-            return;
+            let mut registered = self.object_store_registered_runtime_envs.lock();
+            if registered
+                .iter()
+                .any(|env| std::ptr::eq(env.as_ptr(), Arc::as_ptr(runtime_env)))
+            {
+                return;
+            }
+            // Dropped runtimes release their allocation once forgotten here.
+            registered.retain(|env| env.strong_count() > 0);
         }
 
         Self::register_object_store_if_needed(runtime_env, config);
         self.object_store_registered_runtime_envs
             .lock()
-            .insert(runtime_env_key);
+            .push(Arc::downgrade(runtime_env));
     }
 
     /// Whether this table's data is in the object-native location, so the files
@@ -11186,10 +11194,9 @@ impl CayenneTableProvider {
             Self::register_object_store_if_needed(context.runtime_env(), config);
         }
 
-        let mut object_store_registered_runtime_envs = HashSet::new();
+        let mut object_store_registered_runtime_envs = Vec::new();
         if object_store_config.is_some() {
-            object_store_registered_runtime_envs
-                .insert(Self::runtime_env_cache_key(context.runtime_env()));
+            object_store_registered_runtime_envs.push(Arc::downgrade(context.runtime_env()));
         }
 
         let table_memory = Arc::new(CayenneMemoryAccount::new(
