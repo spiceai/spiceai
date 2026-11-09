@@ -62707,6 +62707,18 @@ mod tests {
         store_int64_tombstones(provider, index);
     }
 
+    /// Wait out the post-write maintenance the test's writes scheduled. After its
+    /// debounce that pass rebuilds the snapshot manifests under `compaction_lock`,
+    /// and a whole-table reclaim that finds the lock held declines as
+    /// `DeclinedLockBusy`. A test slowed by a loaded runner reaches its reclaim
+    /// inside that window (#16128), so drain the pass first.
+    async fn drain_post_write_maintenance(provider: &CayenneTableProvider) {
+        provider
+            .drain_in_flight_maintenance()
+            .await
+            .expect("drain the writes' post-write maintenance");
+    }
+
     /// The deletion-index reclaim trigger is scoped to the one table shape with no
     /// other reclaimer: a primary-key table on an explicit `deletion_mode:
     /// position`. A key-delete table must stay on the seq-prefix bake, which
@@ -62885,6 +62897,7 @@ mod tests {
             .await
             .expect("position capture should not error");
         insert_batch(&provider, id_value_batch(schema, &[1, 2, 3], &[11, 21, 31])).await;
+        drain_post_write_maintenance(&provider).await;
         assert!(
             provider.deletion_index_reclaim_trigger().is_some(),
             "precondition: the upserts' tombstones are over the trigger of two"
@@ -62927,6 +62940,7 @@ mod tests {
         .await;
         let schema = Arc::clone(&provider.table_metadata.schema);
         insert_batch(&provider, id_value_batch(schema, &[1, 2, 3], &[10, 20, 30])).await;
+        drain_post_write_maintenance(&provider).await;
         install_int64_deletes(&provider, &[(1, i64::MAX - 1), (1_000, i64::MAX - 1)]);
         assert!(
             provider
@@ -62969,6 +62983,7 @@ mod tests {
         insert_batch(&provider, id_value_batch(Arc::clone(&schema), &[1], &[10])).await;
         insert_batch(&provider, id_value_batch(Arc::clone(&schema), &[2], &[20])).await;
         insert_batch(&provider, id_value_batch(schema, &[3, 4], &[30, 40])).await;
+        drain_post_write_maintenance(&provider).await;
         install_int64_deletes(&provider, &[(1, i64::MAX - 1), (2, i64::MAX - 1)]);
         assert!(
             provider
@@ -63018,6 +63033,7 @@ mod tests {
                     roaring::RoaringBitmap::from_iter([0u32]),
                 )),
             )])));
+        drain_post_write_maintenance(&provider).await;
         install_int64_deletes(&provider, &[(1_000, 10), (1_001, 11), (1_002, 12)]);
         assert!(
             provider
@@ -63053,6 +63069,7 @@ mod tests {
         let schema = Arc::clone(&provider.table_metadata.schema);
         insert_batch(&provider, id_value_batch(schema, &[1, 2, 3], &[10, 20, 30])).await;
 
+        drain_post_write_maintenance(&provider).await;
         install_int64_deletes(&provider, &[(1_000, 10), (1_001, 11), (1_002, 12)]);
         assert!(
             provider.deletion_index_reclaim_trigger().is_some(),
