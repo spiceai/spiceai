@@ -31,6 +31,12 @@ spicepod:
         primary_key: id
         on_conflict: { id: upsert }
         retention_sql: DELETE FROM appended WHERE deleted = true
+
+defaults:
+  # Rows carry `now()` from each variant's own source, so variants hold
+  # different values by design; each is checked against its own source.
+  compare-variants: false
+
 steps:
   - source-exec:
       src: |

@@ -71,12 +71,36 @@
       "kind": "wrong-answer",
       "signature": "answer differs from the expected one: RowCountMismatch { expected: 6, actual: 2 }",
       "group": "append-and-retention"
+    },
+    {
+      "run": "append-iso-day",
+      "who": "object-native",
+      "key": "query: SELECT * FROM events #2",
+      "kind": "wrong-answer",
+      "signature": "answer differs from the expected one: RowCountMismatch { expected: 4, actual: 3 }",
+      "group": "append-and-retention"
+    },
+    {
+      "run": "append-iso-day",
+      "who": "object-native",
+      "key": "query: SELECT * FROM events #3",
+      "kind": "wrong-answer",
+      "signature": "answer differs from the expected one: RowCountMismatch { expected: 5, actual: 3 }",
+      "group": "append-and-retention"
+    },
+    {
+      "run": "append-iso-day",
+      "who": "object-native",
+      "key": "query: SELECT * FROM events #4",
+      "kind": "wrong-answer",
+      "signature": "answer differs from the expected one: RowCountMismatch { expected: 6, actual: 4 }",
+      "group": "append-and-retention"
     }
   ],
   "append-negative-epoch": [
     {
       "run": "append-negative-epoch",
-      "who": "default",
+      "who": "as-written",
       "key": "refresh: old",
       "kind": "other",
       "signature": "refresh of 'old' failed: Integer time column value -133200000 is negative and cannot be used as a timestamp.",
@@ -84,7 +108,23 @@
     },
     {
       "run": "append-negative-epoch",
-      "who": "default",
+      "who": "as-written",
+      "key": "query: SELECT * FROM old #2",
+      "kind": "wrong-answer",
+      "signature": "answer differs from the expected one: RowCountMismatch { expected: 4, actual: 2 }",
+      "group": "append-and-retention"
+    },
+    {
+      "run": "append-negative-epoch",
+      "who": "object-native",
+      "key": "refresh: old",
+      "kind": "other",
+      "signature": "refresh of 'old' failed: Integer time column value -133200000 is negative and cannot be used as a timestamp.",
+      "group": "append-and-retention"
+    },
+    {
+      "run": "append-negative-epoch",
+      "who": "object-native",
       "key": "query: SELECT * FROM old #2",
       "kind": "wrong-answer",
       "signature": "answer differs from the expected one: RowCountMismatch { expected: 4, actual: 2 }",
@@ -94,7 +134,15 @@
   "append-null-time": [
     {
       "run": "append-null-time",
-      "who": "default",
+      "who": "as-written",
+      "key": "query: SELECT * FROM events #2",
+      "kind": "wrong-answer",
+      "signature": "answer differs from the expected one: RowCountMismatch { expected: 4, actual: 3 }",
+      "group": "append-and-retention"
+    },
+    {
+      "run": "append-null-time",
+      "who": "object-native",
       "key": "query: SELECT * FROM events #2",
       "kind": "wrong-answer",
       "signature": "answer differs from the expected one: RowCountMismatch { expected: 4, actual: 3 }",
@@ -117,6 +165,14 @@
       "kind": "wrong-answer",
       "signature": "answer differs from the expected one: RowCountMismatch { expected: 4, actual: 3 }",
       "group": "append-and-retention"
+    },
+    {
+      "run": "append-same-time",
+      "who": "object-native",
+      "key": "query: SELECT * FROM events #2",
+      "kind": "wrong-answer",
+      "signature": "answer differs from the expected one: RowCountMismatch { expected: 4, actual: 3 }",
+      "group": "append-and-retention"
     }
   ],
   "append-upsert-same-time": [
@@ -132,7 +188,7 @@
   "retention-epoch-formats": [
     {
       "run": "retention-epoch-formats[format=unix_seconds]",
-      "who": "default",
+      "who": "as-written",
       "key": "start: {}",
       "kind": "error",
       "signature": "spiced not ready: a dataset is in Error: [{\"acceleration_enabled\":true,\"error\":{\"category\":\"dataset\",\"code\":\"dataset.validation\",\"type\":\"validation\"},\"error_message\":\"Failed to setup the dataset ret (postgres). Unable to create dataset acceleration: Acceleration creation failed: Acceleration creatio",
@@ -140,7 +196,7 @@
     },
     {
       "run": "retention-epoch-formats[format=unix_millis]",
-      "who": "default",
+      "who": "as-written",
       "key": "start: {}",
       "kind": "error",
       "signature": "spiced not ready: a dataset is in Error: [{\"acceleration_enabled\":true,\"error\":{\"category\":\"dataset\",\"code\":\"dataset.validation\",\"type\":\"validation\"},\"error_message\":\"Failed to setup the dataset ret (postgres). Unable to create dataset acceleration: Acceleration creation failed: Acceleration creatio",
@@ -148,7 +204,31 @@
     },
     {
       "run": "retention-epoch-formats[format=unix_nanos]",
-      "who": "default",
+      "who": "as-written",
+      "key": "start: {}",
+      "kind": "error",
+      "signature": "spiced not ready: a dataset is in Error: [{\"acceleration_enabled\":true,\"error\":{\"category\":\"dataset\",\"code\":\"dataset.validation\",\"type\":\"validation\"},\"error_message\":\"Failed to setup the dataset ret (postgres). Unable to create dataset acceleration: Acceleration creation failed: Acceleration creatio",
+      "group": "append-and-retention"
+    },
+    {
+      "run": "retention-epoch-formats[format=unix_seconds]",
+      "who": "object-native",
+      "key": "start: {}",
+      "kind": "error",
+      "signature": "spiced not ready: a dataset is in Error: [{\"acceleration_enabled\":true,\"error\":{\"category\":\"dataset\",\"code\":\"dataset.validation\",\"type\":\"validation\"},\"error_message\":\"Failed to setup the dataset ret (postgres). Unable to create dataset acceleration: Acceleration creation failed: Acceleration creatio",
+      "group": "append-and-retention"
+    },
+    {
+      "run": "retention-epoch-formats[format=unix_millis]",
+      "who": "object-native",
+      "key": "start: {}",
+      "kind": "error",
+      "signature": "spiced not ready: a dataset is in Error: [{\"acceleration_enabled\":true,\"error\":{\"category\":\"dataset\",\"code\":\"dataset.validation\",\"type\":\"validation\"},\"error_message\":\"Failed to setup the dataset ret (postgres). Unable to create dataset acceleration: Acceleration creation failed: Acceleration creatio",
+      "group": "append-and-retention"
+    },
+    {
+      "run": "retention-epoch-formats[format=unix_nanos]",
+      "who": "object-native",
       "key": "start: {}",
       "kind": "error",
       "signature": "spiced not ready: a dataset is in Error: [{\"acceleration_enabled\":true,\"error\":{\"category\":\"dataset\",\"code\":\"dataset.validation\",\"type\":\"validation\"},\"error_message\":\"Failed to setup the dataset ret (postgres). Unable to create dataset acceleration: Acceleration creation failed: Acceleration creatio",
@@ -158,7 +238,7 @@
   "retention-sql-after-append-refresh": [
     {
       "run": "retention-sql-after-append-refresh",
-      "who": "default",
+      "who": "as-written",
       "key": "query: SELECT id, deleted FROM widgets WHERE id > 0 ORDER BY id",
       "kind": "wrong-answer",
       "signature": "answer differs from the expected one: RowCountMismatch { expected: 2, actual: 3 }",

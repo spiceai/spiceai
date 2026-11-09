@@ -24,7 +24,7 @@
   "postgres-cdc-numeric-38-digits": [
     {
       "run": "postgres-cdc-numeric-38-digits[scale=10]",
-      "who": "default",
+      "who": "as-written",
       "key": "query: SELECT id, v FROM e #2",
       "kind": "wrong-answer",
       "signature": "still failing after <n> attempts over <duration>: answer differs from the expected one: RowCountMismatch { expected: 5, actual: 1 }",
@@ -32,7 +32,23 @@
     },
     {
       "run": "postgres-cdc-numeric-38-digits[scale=10]",
-      "who": "default",
+      "who": "as-written",
+      "key": "assert-status: {\"dataset\":\"e\",\"status\":\"Ready\"}",
+      "kind": "error",
+      "signature": "expected status Ready, saw status=Error ready=true message=External error: Failed to build deferred change batch: pgoutput decode error: column 'v': postgres_replication: numeric magnitude exceeds Decimal128 range",
+      "group": "cdc-postgres"
+    },
+    {
+      "run": "postgres-cdc-numeric-38-digits[scale=10]",
+      "who": "object-native",
+      "key": "query: SELECT id, v FROM e #2",
+      "kind": "wrong-answer",
+      "signature": "still failing after <n> attempts over <duration>: answer differs from the expected one: RowCountMismatch { expected: 5, actual: 1 }",
+      "group": "cdc-postgres"
+    },
+    {
+      "run": "postgres-cdc-numeric-38-digits[scale=10]",
+      "who": "object-native",
       "key": "assert-status: {\"dataset\":\"e\",\"status\":\"Ready\"}",
       "kind": "error",
       "signature": "expected status Ready, saw status=Error ready=true message=External error: Failed to build deferred change batch: pgoutput decode error: column 'v': postgres_replication: numeric magnitude exceeds Decimal128 range",
@@ -239,12 +255,172 @@
       "pattern": "spiced not ready: a dataset is in Error",
       "group": "cdc-postgres",
       "may-pass": true
+    },
+    {
+      "run": "postgres-cdc-partial-row-images[replica_identity=default]",
+      "who": "key-object-native",
+      "key": "query: SELECT * FROM docs #2",
+      "kind": "wrong-answer",
+      "signature": "still failing after <n> attempts over <duration>: answer differs from the expected one: DataMismatch { column: \"version\", row_number: 1, expected: \"\\\"2\\\"\", actual: \"\\\"1\\\"\" }",
+      "group": "cdc-postgres",
+      "pattern": "answer differs from the expected one: (DataMismatch|RowCountMismatch) \\{|Spice returned no rows",
+      "may-pass": true
+    },
+    {
+      "run": "postgres-cdc-partial-row-images[replica_identity=default]",
+      "who": "key-object-native",
+      "key": "query: SELECT * FROM docs #3",
+      "kind": "wrong-answer",
+      "signature": "still failing after <n> attempts over <duration>: answer differs from the expected one: DataMismatch { column: \"version\", row_number: 1, expected: \"\\\"2\\\"\", actual: \"\\\"1\\\"\" }",
+      "group": "cdc-postgres",
+      "pattern": "answer differs from the expected one: (DataMismatch|RowCountMismatch) \\{|Spice returned no rows",
+      "may-pass": true
+    },
+    {
+      "run": "postgres-cdc-partial-row-images[replica_identity=default]",
+      "who": "key-object-native",
+      "key": "query: SELECT * FROM docs #4",
+      "kind": "wrong-answer",
+      "signature": "still failing after <n> attempts over <duration>: answer differs from the expected one: DataMismatch { column: \"id\", row_number: 1, expected: \"\\\"100\\\"\", actual: \"\\\"1\\\"\" }",
+      "group": "cdc-postgres",
+      "pattern": "answer differs from the expected one: (DataMismatch|RowCountMismatch) \\{|Spice returned no rows",
+      "may-pass": true
+    },
+    {
+      "run": "postgres-cdc-partial-row-images[replica_identity=default]",
+      "who": "key-object-native",
+      "key": "query: SELECT * FROM docs WHERE id > 1000 ORDER BY id NULLS LAST",
+      "kind": "empty",
+      "signature": "still failing after <n> attempts over <duration>: Spice returned no rows, expected 20",
+      "group": "cdc-postgres",
+      "pattern": "answer differs from the expected one: (DataMismatch|RowCountMismatch) \\{|Spice returned no rows",
+      "may-pass": true
+    },
+    {
+      "run": "postgres-cdc-partial-row-images[replica_identity=default]",
+      "who": "key-object-native",
+      "key": "query: SELECT * FROM docs #5",
+      "kind": "wrong-answer",
+      "signature": "still failing after <n> attempts over <duration>: answer differs from the expected one: DataMismatch { column: \"id\", row_number: 1, expected: \"\\\"100\\\"\", actual: \"\\\"1\\\"\" }",
+      "group": "cdc-postgres",
+      "pattern": "answer differs from the expected one: (DataMismatch|RowCountMismatch) \\{|Spice returned no rows",
+      "may-pass": true
+    },
+    {
+      "run": "postgres-cdc-partial-row-images[replica_identity=default]",
+      "who": "key-object-native",
+      "key": "query: SELECT * FROM docs #6",
+      "kind": "wrong-answer",
+      "signature": "still failing after <n> attempts over <duration>: answer differs from the expected one: DataMismatch { column: \"id\", row_number: 1, expected: \"\\\"100\\\"\", actual: \"\\\"1\\\"\" }",
+      "group": "cdc-postgres",
+      "pattern": "answer differs from the expected one: (DataMismatch|RowCountMismatch) \\{|Spice returned no rows",
+      "may-pass": true
+    },
+    {
+      "run": "postgres-cdc-partial-row-images[replica_identity=default]",
+      "who": "key-object-native",
+      "key": "query: SELECT * FROM docs #7",
+      "kind": "wrong-answer",
+      "signature": "still failing after <n> attempts over <duration>: answer differs from the expected one: DataMismatch { column: \"id\", row_number: 1, expected: \"\\\"100\\\"\", actual: \"\\\"1\\\"\" }",
+      "group": "cdc-postgres",
+      "pattern": "answer differs from the expected one: (DataMismatch|RowCountMismatch) \\{|Spice returned no rows",
+      "may-pass": true
+    },
+    {
+      "run": "postgres-cdc-partial-row-images[replica_identity=default]",
+      "who": "key-object-native",
+      "key": "query: SELECT count(*), count(body), count(blob), sum(length(body)), sum(version) FROM docs",
+      "kind": "wrong-answer",
+      "signature": "still failing after <n> attempts over <duration>: answer differs from the expected one: DataMismatch { column: \"count(docs.body)\", row_number: 1, expected: \"\\\"295\\\"\", actual: \"\\\"300\\\"\" }",
+      "group": "cdc-postgres",
+      "pattern": "answer differs from the expected one: (DataMismatch|RowCountMismatch) \\{|Spice returned no rows",
+      "may-pass": true
+    },
+    {
+      "run": "postgres-cdc-partial-row-images[replica_identity=default]",
+      "who": "position-object-native",
+      "key": "query: SELECT * FROM docs #2",
+      "kind": "wrong-answer",
+      "signature": "still failing after <n> attempts over <duration>: answer differs from the expected one: DataMismatch { column: \"version\", row_number: 1, expected: \"\\\"2\\\"\", actual: \"\\\"1\\\"\" }",
+      "group": "cdc-postgres",
+      "pattern": "answer differs from the expected one: (DataMismatch|RowCountMismatch) \\{|Spice returned no rows",
+      "may-pass": true
+    },
+    {
+      "run": "postgres-cdc-partial-row-images[replica_identity=default]",
+      "who": "position-object-native",
+      "key": "query: SELECT * FROM docs #3",
+      "kind": "wrong-answer",
+      "signature": "still failing after <n> attempts over <duration>: answer differs from the expected one: DataMismatch { column: \"version\", row_number: 1, expected: \"\\\"2\\\"\", actual: \"\\\"1\\\"\" }",
+      "group": "cdc-postgres",
+      "pattern": "answer differs from the expected one: (DataMismatch|RowCountMismatch) \\{|Spice returned no rows",
+      "may-pass": true
+    },
+    {
+      "run": "postgres-cdc-partial-row-images[replica_identity=default]",
+      "who": "position-object-native",
+      "key": "query: SELECT * FROM docs #4",
+      "kind": "wrong-answer",
+      "signature": "still failing after <n> attempts over <duration>: answer differs from the expected one: DataMismatch { column: \"id\", row_number: 1, expected: \"\\\"100\\\"\", actual: \"\\\"1\\\"\" }",
+      "group": "cdc-postgres",
+      "pattern": "answer differs from the expected one: (DataMismatch|RowCountMismatch) \\{|Spice returned no rows",
+      "may-pass": true
+    },
+    {
+      "run": "postgres-cdc-partial-row-images[replica_identity=default]",
+      "who": "position-object-native",
+      "key": "query: SELECT * FROM docs WHERE id > 1000 ORDER BY id NULLS LAST",
+      "kind": "empty",
+      "signature": "still failing after <n> attempts over <duration>: Spice returned no rows, expected 20",
+      "group": "cdc-postgres",
+      "pattern": "answer differs from the expected one: (DataMismatch|RowCountMismatch) \\{|Spice returned no rows",
+      "may-pass": true
+    },
+    {
+      "run": "postgres-cdc-partial-row-images[replica_identity=default]",
+      "who": "position-object-native",
+      "key": "query: SELECT * FROM docs #5",
+      "kind": "wrong-answer",
+      "signature": "still failing after <n> attempts over <duration>: answer differs from the expected one: DataMismatch { column: \"id\", row_number: 1, expected: \"\\\"100\\\"\", actual: \"\\\"1\\\"\" }",
+      "group": "cdc-postgres",
+      "pattern": "answer differs from the expected one: (DataMismatch|RowCountMismatch) \\{|Spice returned no rows",
+      "may-pass": true
+    },
+    {
+      "run": "postgres-cdc-partial-row-images[replica_identity=default]",
+      "who": "position-object-native",
+      "key": "query: SELECT * FROM docs #6",
+      "kind": "wrong-answer",
+      "signature": "still failing after <n> attempts over <duration>: answer differs from the expected one: DataMismatch { column: \"id\", row_number: 1, expected: \"\\\"100\\\"\", actual: \"\\\"1\\\"\" }",
+      "group": "cdc-postgres",
+      "pattern": "answer differs from the expected one: (DataMismatch|RowCountMismatch) \\{|Spice returned no rows",
+      "may-pass": true
+    },
+    {
+      "run": "postgres-cdc-partial-row-images[replica_identity=default]",
+      "who": "position-object-native",
+      "key": "query: SELECT * FROM docs #7",
+      "kind": "wrong-answer",
+      "signature": "still failing after <n> attempts over <duration>: answer differs from the expected one: DataMismatch { column: \"id\", row_number: 1, expected: \"\\\"100\\\"\", actual: \"\\\"1\\\"\" }",
+      "group": "cdc-postgres",
+      "pattern": "answer differs from the expected one: (DataMismatch|RowCountMismatch) \\{|Spice returned no rows",
+      "may-pass": true
+    },
+    {
+      "run": "postgres-cdc-partial-row-images[replica_identity=default]",
+      "who": "position-object-native",
+      "key": "query: SELECT count(*), count(body), count(blob), sum(length(body)), sum(version) FROM docs",
+      "kind": "wrong-answer",
+      "signature": "still failing after <n> attempts over <duration>: answer differs from the expected one: DataMismatch { column: \"count(docs.body)\", row_number: 1, expected: \"\\\"295\\\"\", actual: \"\\\"300\\\"\" }",
+      "group": "cdc-postgres",
+      "pattern": "answer differs from the expected one: (DataMismatch|RowCountMismatch) \\{|Spice returned no rows",
+      "may-pass": true
     }
   ],
   "postgres-cdc-unchanged-toast": [
     {
       "run": "postgres-cdc-unchanged-toast",
-      "who": "default",
+      "who": "as-written",
       "key": "query: SELECT id, version, length(body) FROM docs #2",
       "kind": "wrong-answer",
       "signature": "still failing after <n> attempts over <duration>: answer differs from the expected one: DataMismatch { column: \"version\", row_number: 1, expected: \"\\\"2\\\"\", actual: \"\\\"1\\\"\" }",
@@ -254,7 +430,7 @@
     },
     {
       "run": "postgres-cdc-unchanged-toast",
-      "who": "default",
+      "who": "as-written",
       "key": "query: SELECT id, version, length(body) FROM docs WHERE id = 3",
       "kind": "empty",
       "signature": "still failing after <n> attempts over <duration>: Spice returned no rows, expected 1",
@@ -264,7 +440,7 @@
     },
     {
       "run": "postgres-cdc-unchanged-toast",
-      "who": "default",
+      "who": "as-written",
       "key": "query: SELECT id, version, length(body) FROM docs #3",
       "kind": "wrong-answer",
       "signature": "still failing after <n> attempts over <duration>: answer differs from the expected one: RowCountMismatch { expected: 3, actual: 2 }",
@@ -274,13 +450,43 @@
     },
     {
       "run": "postgres-cdc-unchanged-toast",
-      "who": "default",
+      "who": "as-written",
       "key": "restart: {}",
       "kind": "status",
       "signature": "spiced not ready: a dataset is in Error: .*received Value::Unchang",
       "pattern": "spiced not ready: a dataset is in Error: .*received Value::Unchang",
       "group": "cdc-postgres",
       "may-pass": true
+    },
+    {
+      "run": "postgres-cdc-unchanged-toast",
+      "who": "object-native",
+      "key": "query: SELECT id, version, length(body) FROM docs #2",
+      "kind": "wrong-answer",
+      "signature": "still failing after <n> attempts over <duration>: answer differs from the expected one: DataMismatch { column: \"version\", row_number: 1, expected: \"\\\"2\\\"\", actual: \"\\\"1\\\"\" }",
+      "varies": true,
+      "group": "cdc-postgres",
+      "may-pass": true
+    },
+    {
+      "run": "postgres-cdc-unchanged-toast",
+      "who": "object-native",
+      "key": "query: SELECT id, version, length(body) FROM docs WHERE id = 3",
+      "kind": "empty",
+      "signature": "still failing after <n> attempts over <duration>: Spice returned no rows, expected 1",
+      "varies": true,
+      "group": "cdc-postgres",
+      "may-pass": true
+    },
+    {
+      "run": "postgres-cdc-unchanged-toast",
+      "who": "object-native",
+      "key": "query: SELECT id, version, length(body) FROM docs #3",
+      "kind": "wrong-answer",
+      "signature": "still failing after <n> attempts over <duration>: answer differs from the expected one: RowCountMismatch { expected: 3, actual: 2 }",
+      "group": "cdc-postgres",
+      "may-pass": true,
+      "varies": true
     }
   ],
   "postgres-cdc-upgrade": [

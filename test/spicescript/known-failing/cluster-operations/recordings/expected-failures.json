@@ -2,7 +2,15 @@
   "cluster-cdc-ready": [
     {
       "run": "cluster-cdc-ready",
-      "who": "default",
+      "who": "as-written",
+      "key": "assert-status: {\"dataset\":\"t\",\"ready\":true,\"status\":\"Ready\"}",
+      "kind": "status",
+      "signature": "expected status Ready, saw status=Refreshing ready=false message=",
+      "group": "cluster-operations"
+    },
+    {
+      "run": "cluster-cdc-ready",
+      "who": "object-native",
       "key": "assert-status: {\"dataset\":\"t\",\"ready\":true,\"status\":\"Ready\"}",
       "kind": "status",
       "signature": "expected status Ready, saw status=Refreshing ready=false message=",
@@ -17,6 +25,14 @@
       "kind": "status",
       "signature": "spiced not ready after <duration>; dataset status: [{\"acceleration_enabled\":true,\"from\":\"postgres:public.src\",\"name\":\"ev\",\"properties\":{\"search\":\"unsupported\",\"vector_search\":\"unsupported\"},\"replication_enabled\":false,\"status\":\"Refreshing\"}]; see <path>",
       "group": "cluster-operations"
+    },
+    {
+      "run": "cluster-dataset-writes[layout=plain,mode=file,policy=upsert]",
+      "who": "upsert-object-native",
+      "key": "start: {}",
+      "kind": "status",
+      "signature": "spiced not ready after <duration>; dataset status: [{\"acceleration_enabled\":true,\"from\":\"postgres:public.src\",\"name\":\"ev\",\"properties\":{\"search\":\"unsupported\",\"vector_search\":\"unsupported\"},\"replication_enabled\":false,\"status\":\"Refreshing\"}]; see <path>",
+      "group": "cluster-operations"
     }
   ],
   "cluster-executor-loss-cayenne": [
@@ -27,12 +43,20 @@
       "kind": "status",
       "signature": "spiced not ready after <duration>; dataset status: [{\"acceleration_enabled\":true,\"from\":\"postgres:t\",\"name\":\"t\",\"properties\":{\"search\":\"unsupported\",\"vector_search\":\"unsupported\"},\"replication_enabled\":false,\"status\":\"Refreshing\"},{\"acceleration_enabled\":true,\"from\":\"postgres:u\",\"name\":\"u\",\"properti",
       "group": "cluster-operations"
+    },
+    {
+      "run": "cluster-executor-loss-cayenne",
+      "who": "cayenne-object-native",
+      "key": "start: {}",
+      "kind": "status",
+      "signature": "spiced not ready after <duration>; dataset status: [{\"acceleration_enabled\":true,\"from\":\"postgres:t\",\"name\":\"t\",\"properties\":{\"search\":\"unsupported\",\"vector_search\":\"unsupported\"},\"replication_enabled\":false,\"status\":\"Refreshing\"},{\"acceleration_enabled\":true,\"from\":\"postgres:u\",\"name\":\"u\",\"properti",
+      "group": "cluster-operations"
     }
   ],
   "cluster-failed-dataset-empties-others": [
     {
       "run": "cluster-failed-dataset-empties-others",
-      "who": "default",
+      "who": "as-written",
       "key": "query: SELECT count(*) AS n FROM t",
       "kind": "error",
       "signature": "still failing after <n> attempts over <duration>: Spice rejected the query: Query execution failed. Cannot query t: its partitions have not been discovered yet; retry the query: Cannot query t: its partitions have not been discovered yet; retry the query",
@@ -41,7 +65,25 @@
     },
     {
       "run": "cluster-failed-dataset-empties-others",
-      "who": "default",
+      "who": "as-written",
+      "key": "query: SELECT * FROM t",
+      "kind": "error",
+      "signature": "Spice rejected the query: Query execution failed. Cannot query t: its partitions have not been discovered yet; retry the query: Cannot query t: its partitions have not been discovered yet; retry the query",
+      "group": "cluster-operations",
+      "pattern": "Cannot query t: (its partitions have not been discovered yet|no ready executor serves (\\d+|<n>) of its (\\d+|<n>) partitions)"
+    },
+    {
+      "run": "cluster-failed-dataset-empties-others",
+      "who": "object-native",
+      "key": "query: SELECT count(*) AS n FROM t",
+      "kind": "error",
+      "signature": "still failing after <n> attempts over <duration>: Spice rejected the query: Query execution failed. Cannot query t: its partitions have not been discovered yet; retry the query: Cannot query t: its partitions have not been discovered yet; retry the query",
+      "group": "cluster-operations",
+      "pattern": "Cannot query t: (its partitions have not been discovered yet|no ready executor serves (\\d+|<n>) of its (\\d+|<n>) partitions)"
+    },
+    {
+      "run": "cluster-failed-dataset-empties-others",
+      "who": "object-native",
       "key": "query: SELECT * FROM t",
       "kind": "error",
       "signature": "Spice rejected the query: Query execution failed. Cannot query t: its partitions have not been discovered yet; retry the query: Cannot query t: its partitions have not been discovered yet; retry the query",
@@ -52,7 +94,7 @@
   "cluster-http-caching": [
     {
       "run": "cluster-http-caching",
-      "who": "default",
+      "who": "as-written",
       "key": "query: SELECT content FROM q WHERE request_path = '/who' #2",
       "kind": "wrong-answer",
       "signature": "answer differs from the expected one: DataMismatch { column: \"content\", row_number: 1, expected: \"\\\"{\\\\\\\"served\\\\\\\":2}\\\"\", actual: \"\\\"{\\\\\\\"served\\\\\\\":1}\\\"\" }",
@@ -60,7 +102,7 @@
     },
     {
       "run": "cluster-http-caching",
-      "who": "default",
+      "who": "as-written",
       "key": "source-query: {\"api\":\"count /v1/who\"}",
       "kind": "other",
       "signature": "the source answered [[Some(\"1\")]], expected [[Some(\"2\")]]",
@@ -68,7 +110,31 @@
     },
     {
       "run": "cluster-http-caching",
-      "who": "default",
+      "who": "as-written",
+      "key": "query: SELECT content FROM zero WHERE request_path = '/z' #2",
+      "kind": "wrong-answer",
+      "signature": "answer differs from the expected one: DataMismatch { column: \"content\", row_number: 1, expected: \"\\\"{\\\\\\\"z\\\\\\\":2}\\\"\", actual: \"\\\"{\\\\\\\"z\\\\\\\":1}\\\"\" }",
+      "group": "cluster-operations"
+    },
+    {
+      "run": "cluster-http-caching",
+      "who": "object-native",
+      "key": "query: SELECT content FROM q WHERE request_path = '/who' #2",
+      "kind": "wrong-answer",
+      "signature": "answer differs from the expected one: DataMismatch { column: \"content\", row_number: 1, expected: \"\\\"{\\\\\\\"served\\\\\\\":2}\\\"\", actual: \"\\\"{\\\\\\\"served\\\\\\\":1}\\\"\" }",
+      "group": "cluster-operations"
+    },
+    {
+      "run": "cluster-http-caching",
+      "who": "object-native",
+      "key": "source-query: {\"api\":\"count /v1/who\"}",
+      "kind": "other",
+      "signature": "the source answered [[Some(\"1\")]], expected [[Some(\"2\")]]",
+      "group": "cluster-operations"
+    },
+    {
+      "run": "cluster-http-caching",
+      "who": "object-native",
       "key": "query: SELECT content FROM zero WHERE request_path = '/z' #2",
       "kind": "wrong-answer",
       "signature": "answer differs from the expected one: DataMismatch { column: \"content\", row_number: 1, expected: \"\\\"{\\\\\\\"z\\\\\\\":2}\\\"\", actual: \"\\\"{\\\\\\\"z\\\\\\\":1}\\\"\" }",
@@ -78,7 +144,15 @@
   "cluster-refresh-status": [
     {
       "run": "cluster-refresh-status",
-      "who": "default",
+      "who": "as-written",
+      "key": "start: {}",
+      "kind": "status",
+      "signature": "spiced not ready after <duration>; dataset status: [{\"acceleration_enabled\":true,\"from\":\"postgres:public.t\",\"name\":\"t\",\"properties\":{\"search\":\"unsupported\",\"vector_search\":\"unsupported\"},\"replication_enabled\":false,\"status\":\"Refreshing\"}]; see <path>",
+      "group": "cluster-operations"
+    },
+    {
+      "run": "cluster-refresh-status",
+      "who": "object-native",
       "key": "start: {}",
       "kind": "status",
       "signature": "spiced not ready after <duration>; dataset status: [{\"acceleration_enabled\":true,\"from\":\"postgres:public.t\",\"name\":\"t\",\"properties\":{\"search\":\"unsupported\",\"vector_search\":\"unsupported\"},\"replication_enabled\":false,\"status\":\"Refreshing\"}]; see <path>",
