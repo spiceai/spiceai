@@ -33,6 +33,9 @@ spicepod:
           cayenne_compaction_background_interval_ms: '200'
 defaults:
   expect: { oracle: src }
+  # Each variant runs its own source and its own timed writer, so their row
+  # counts differ by design; each is checked against its own source instead.
+  compare-variants: false
 steps:
   - generate:
       src:

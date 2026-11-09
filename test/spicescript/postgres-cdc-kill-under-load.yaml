@@ -36,6 +36,9 @@ spicepod:
 
 defaults:
   expect: { oracle: src }
+  # Each variant runs its own source and its own timed writer, so their row
+  # counts differ by design; each is checked against its own source instead.
+  compare-variants: false
 
 steps:
   # Checkpoint often so acknowledged WAL is recycled.
