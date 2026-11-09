@@ -36,6 +36,9 @@ env:
   CARGO_REGISTRIES_CRATES_IO_PROTOCOL: sparse
   CARGO_NET_RETRY: 10
   CARGO_HTTP_TIMEOUT: 60
+  # Keeps the `integration_models` test binary loadable on Apple Silicon; see
+  # `CARGO_PROFILE_DEV_STRIP` in `integration_models.yml`.
+  CARGO_PROFILE_DEV_STRIP: debuginfo
 
 jobs:
   test-search:

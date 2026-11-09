@@ -34,6 +34,13 @@ env:
   CARGO_REGISTRIES_CRATES_IO_PROTOCOL: sparse
   CARGO_NET_RETRY: 10
   CARGO_HTTP_TIMEOUT: 60
+  # Keeps the `integration_models` test binary loadable on Apple Silicon. Its
+  # image is mapped from 0x100000000 and dyld maps the system shared cache at
+  # 0x180000000. With the dev profile's debug map (stabs) in `__LINKEDIT`, the
+  # image reaches past that address, so the binary aborts before `main` with
+  # `syscall to map cache into shared region failed`. Stripping the debug map
+  # keeps function names in backtraces; panic messages keep their file and line.
+  CARGO_PROFILE_DEV_STRIP: debuginfo
   AI_INTEGRATION_TEST_ARCHIVE_S3_URI: s3://build/test_binaries/${{ github.run_id }}/ai-integration-test-archive/integration.tar.zst
   AI_INTEGRATION_EXTENDED_TEST_ARCHIVE_S3_URI: s3://build/test_binaries/${{ github.run_id }}/ai-integration-test-archive-extended/integration-extended.tar.zst
 
@@ -166,14 +173,7 @@ jobs:
   test-models:
     name: Test Models & AI
     needs: build
-    # `spiceai-macos-large`, like every other job that runs this archive: the
-    # Mac minis behind `spiceai-macos` cannot reliably start the debug
-    # `integration_models` binary. dyld fails to map the shared cache into it
-    # (`dyld cache '(null)' not loaded: syscall to map cache into shared region
-    # failed`, then `Library not loaded: /usr/lib/libiconv.2.dylib`), so
-    # `nextest --list` and every test process abort with SIGABRT before any
-    # test code runs, while the same archive starts cleanly on the MacBook Pros.
-    runs-on: spiceai-macos-large
+    runs-on: spiceai-macos
     # Holds the OpenAI and Anthropic workload identity federation IDs (`OPENAI_*` and
     # `ANTHROPIC_*` secrets).
     environment: ci
@@ -546,9 +546,7 @@ jobs:
     name: Test Bedrock Models
     needs: [build]
     if: ${{ github.event.inputs.run_all_tests == 'true' || github.event_name == 'schedule' }}
-    # The large pool for the same reason as `test-models`: a Mac mini cannot
-    # reliably start this archive's test binary.
-    runs-on: spiceai-macos-large
+    runs-on: spiceai-macos
     # Holds the ARN of the IAM role the tests call Bedrock as (`AWS_BEDROCK_ROLE_ARN`).
     environment: ci
     permissions:
