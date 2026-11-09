@@ -27,6 +27,8 @@ limitations under the License.
 #![allow(clippy::missing_errors_doc)]
 
 mod list_models;
+#[cfg(test)]
+mod stream_permit_tests;
 
 pub use list_models::DarkbloomModelLister;
 
@@ -87,7 +89,8 @@ impl Darkbloom {
 
     /// Takes a permit from `rate_controller` for each request, in place of the client's
     /// default, so the model's `max_concurrency` and `requests_per_minute_limit` govern every
-    /// request it sends.
+    /// request it sends. A streamed response holds its permit until Darkbloom has finished
+    /// generating it.
     #[must_use]
     pub fn with_rate_controller(mut self, rate_controller: Arc<RateController>) -> Self {
         self.chat = self.chat.with_rate_controller(rate_controller);

@@ -37,6 +37,6 @@ When the model loads, Spice sends one short chat completion and one short Respon
 - Darkbloom describes its network as an experimental research prototype. Check its terms before you send production data.
 - Darkbloom decrypts each request inside its coordinator, and the machine that serves the model reads the prompt in plaintext. It is not end-to-end encrypted.
 - Darkbloom serves no embeddings, so there is no `darkbloom` embeddings provider.
-- Darkbloom publishes no rate limits. Spice allows 10 concurrent requests and 500 requests per minute for each model by default; set `max_concurrency` and `requests_per_minute_limit` to change them.
+- Darkbloom publishes no rate limits. Spice allows 10 concurrent requests and 500 requests per minute for each model by default; set `max_concurrency` and `requests_per_minute_limit` to change them. A streamed response counts against `max_concurrency` until Darkbloom finishes generating it.
 - Darkbloom accepts `n: 1` only.
 - Darkbloom's provider attestation (the `x-provider-*` response headers and the `se_signature` field) is not checked or returned by Spice.
