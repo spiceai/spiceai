@@ -230,12 +230,13 @@ steps:
         - [3, '[]', '[]']
         - [4, null, null]
 
-  # The far table, which Cayenne's file mode holds in a Vortex file. SQLite
+  # The far table, which Cayenne's file mode holds in a Vortex file: under the
+  # instance's directory, or under `executor/` in a cluster. SQLite
   # returns its 9999-12-31 values as 1816-03-29T05:56:09.066277, a count of
   # nanoseconds that wrapped, so its variant skips these queries. The filter
   # names a microsecond instant with arrow_cast, because a `TIMESTAMP` literal
   # is nanoseconds in Spice, which cannot reach 9999.
-  - assert-files: { contains: '^\.spice/data/far/.*\.vortex$' }
+  - assert-files: { contains: '(^|/)\.spice/data/far/.*\.vortex$' }
     only: cayenne
   - query: SELECT id, ts, ts_ms, ts_s, tz, dt FROM far
     protocols: [flight, flightsql, http]
