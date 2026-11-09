@@ -26,9 +26,7 @@ limitations under the License.
 #![expect(deprecated)]
 
 use super::super::vector_io::{DeletionIdentifier, DeletionVectorWriteSpec, DeletionVectorWriter};
-use super::{
-    CayenneDeletionSink, DeleteScanTable, PreparedDeletionCache, PreparedDeletionPublish,
-};
+use super::{CayenneDeletionSink, DeleteScanTable, PreparedDeletionCache, PreparedDeletionPublish};
 use crate::provider::Error;
 use crate::provider::deletion_strategy::PositionDeletionVector;
 use crate::provider::utils::convert_to_u64_box;
@@ -133,12 +131,10 @@ impl CayenneDeletionSink {
             let files = table.files(&ctx.state()).await?;
 
             // Get the object store URL for this table
-            let object_store_url = table
-                .object_store_url()
-                .ok_or_else(|| Error::Internal {
-                    table: table_name.clone(),
-                    message: "Table has no paths".to_string(),
-                })?;
+            let object_store_url = table.object_store_url().ok_or_else(|| Error::Internal {
+                table: table_name.clone(),
+                message: "Table has no paths".to_string(),
+            })?;
 
             // Get the object store from the runtime env
             let object_store = ctx
@@ -252,12 +248,10 @@ impl CayenneDeletionSink {
 
             let files = table.files(&ctx.state()).await?;
 
-            let object_store_url = table
-                .object_store_url()
-                .ok_or_else(|| Error::Internal {
-                    table: table_name.clone(),
-                    message: "Table has no paths".to_string(),
-                })?;
+            let object_store_url = table.object_store_url().ok_or_else(|| Error::Internal {
+                table: table_name.clone(),
+                message: "Table has no paths".to_string(),
+            })?;
 
             let object_store = ctx
                 .runtime_env()

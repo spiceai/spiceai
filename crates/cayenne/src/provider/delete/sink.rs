@@ -77,12 +77,12 @@ use data_components::delete::DeletionSink;
 use datafusion::catalog::Session;
 use datafusion::datasource::listing::{ListingTable, ListingTableUrl};
 use datafusion::execution::TaskContext;
-use datafusion::execution::object_store::ObjectStoreUrl;
-use datafusion::physical_plan::ExecutionPlan;
-use datafusion::physical_plan::empty::EmptyExec;
 use datafusion::execution::context::SessionContext;
+use datafusion::execution::object_store::ObjectStoreUrl;
 use datafusion::execution::runtime_env::RuntimeEnv;
 use datafusion::optimizer::analyzer::type_coercion::TypeCoercionRewriter;
+use datafusion::physical_plan::ExecutionPlan;
+use datafusion::physical_plan::empty::EmptyExec;
 use datafusion::physical_plan::execute_stream;
 use datafusion_catalog::TableProvider;
 use datafusion_common::DFSchema;
@@ -444,10 +444,9 @@ impl DeleteScanTable {
             .get_snapshot_files(table_id, snapshot_id.as_ref())
             .await
             .map_err(|error| datafusion_common::DataFusionError::External(Box::new(error)))?;
-        let files =
-            super::super::table::CayenneTableProvider::manifest_files_as_partitioned_files(
-                prefix, manifest,
-            );
+        let files = super::super::table::CayenneTableProvider::manifest_files_as_partitioned_files(
+            prefix, manifest,
+        );
         Ok(Self {
             listing,
             committed_files: Some(files.into()),
