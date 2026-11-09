@@ -616,11 +616,15 @@ mod tests {
         assert_eq!(watch.roots, vec![real_dir]);
     }
 
-    /// The next event on `rx` within two seconds that the watch accepts.
+    /// Whether an event on `rx` within two seconds is both accepted by the
+    /// watch and of a kind matching `kind`. Draining with `try_recv` is not a
+    /// barrier, so a delayed event from an earlier step (e.g. the `IN_ATTRIB`
+    /// a `link()` raises) can still arrive; `kind` keeps it from passing.
     #[cfg(target_os = "linux")]
     fn accepts_an_event(
         rx: &std::sync::mpsc::Receiver<notify::Event>,
         names: &Mutex<Vec<OsString>>,
+        kind: fn(&notify::EventKind) -> bool,
     ) -> bool {
         let deadline = std::time::Instant::now() + Duration::from_secs(2);
         while let Some(left) = deadline.checked_duration_since(std::time::Instant::now()) {
@@ -630,11 +634,29 @@ mod tests {
             let names = names
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
-            if file_watch_event_is_relevant(&event, Some(names.as_slice())) {
+            if kind(&event.kind) && file_watch_event_is_relevant(&event, Some(names.as_slice())) {
                 return true;
             }
         }
         false
+    }
+
+    /// A write to file contents.
+    #[cfg(target_os = "linux")]
+    fn is_data_modify(kind: &notify::EventKind) -> bool {
+        matches!(
+            kind,
+            notify::EventKind::Modify(notify::event::ModifyKind::Data(_))
+        )
+    }
+
+    /// A rename onto or away from a watched name.
+    #[cfg(target_os = "linux")]
+    fn is_rename(kind: &notify::EventKind) -> bool {
+        matches!(
+            kind,
+            notify::EventKind::Modify(notify::event::ModifyKind::Name(_))
+        )
     }
 
     /// A write through a hard link reaches only the dataset's inode: from
@@ -691,15 +713,15 @@ mod tests {
         std::fs::hard_link(&path, data.join("writer.csv")).expect("link in the same dir");
         while rx.try_recv().is_ok() {}
         append(&other.join("alias.csv"));
-        let from_other_dir = accepts_an_event(&rx, &names);
+        let from_other_dir = accepts_an_event(&rx, &names, is_data_modify);
         while rx.try_recv().is_ok() {}
         append(&data.join("writer.csv"));
-        let from_same_dir = accepts_an_event(&rx, &names);
+        let from_same_dir = accepts_an_event(&rx, &names, is_data_modify);
 
         let tmp = data.join("names.csv.tmp");
         std::fs::write(&tmp, b"id\n1\n2\n3\n").expect("write replacement");
         std::fs::rename(&tmp, &path).expect("atomic replace");
-        let replace_seen = accepts_an_event(&rx, &names);
+        let replace_seen = accepts_an_event(&rx, &names, is_rename);
         refresh_resolved_file_watch(
             &mut watcher,
             &path,
@@ -711,7 +733,7 @@ mod tests {
         std::fs::hard_link(&path, other.join("alias-2.csv")).expect("link the new inode");
         while rx.try_recv().is_ok() {}
         append(&other.join("alias-2.csv"));
-        let after_replace = accepts_an_event(&rx, &names);
+        let after_replace = accepts_an_event(&rx, &names, is_data_modify);
 
         drop(watcher);
         let _ = std::fs::remove_dir_all(&root);
