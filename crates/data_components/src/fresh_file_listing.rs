@@ -64,6 +64,7 @@ impl std::fmt::Debug for FreshFileListingLayer {
             .field("table_paths", &self.table_paths)
             .field("dataset_name", &self.dataset_name)
             .field("reject_empty_listing", &self.is_data_file.is_some())
+            .field("scan_skips_listing", &self.scan_skips_listing.is_some())
             .finish()
     }
 }
@@ -235,7 +236,7 @@ mod tests {
     use parquet::arrow::ArrowWriter;
     use std::path::Path;
 
-    fn write_ids(path: &Path, ids: std::ops::RangeInclusive<i64>) {
+    fn write_ids(path: &Path, ids: impl IntoIterator<Item = i64>) {
         let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)]));
         let batch = RecordBatch::try_new(
             Arc::clone(&schema),
@@ -352,7 +353,7 @@ mod tests {
             "expected missing-source error, got {err}"
         );
 
-        write_ids(&part0, 1..=0);
+        write_ids(&part0, std::iter::empty());
         assert_eq!(count_and_max(&ctx).await, (0, 0));
 
         write_ids(&part0, 1..=50);

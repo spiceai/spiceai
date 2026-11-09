@@ -2,12 +2,14 @@ name: file-source-removed-keeps-acceleration
 description: >
   When every source file of a file-connector dataset is removed, a federated
   query errors instead of returning zero rows, and a full refresh into Cayenne
-  fails and keeps the last loaded rows. A file that still exists but holds no
+  fails and keeps the last loaded rows, each one unchanged. A file that still exists but holds no
   rows still refreshes to zero rows. Restoring files lets the next refresh
   load them again.
 
 sources:
   lake: { kind: files }
+  # The generated rows, kept to check every retained row after a failed refresh.
+  ref: { kind: postgres }
 
 matrix:
   format: [parquet, csv]
@@ -46,6 +48,7 @@ steps:
         columns:
           - { name: id, sequence: 1 }
           - { name: label, choice: [a, b, c] }
+    mirror: ref
   - start: {}
   - query: SELECT count(*) AS n FROM facts
     expect: { rows: [['1000']] }
@@ -63,6 +66,9 @@ steps:
   - refresh: { dataset: facts, expect-error: true }
   - query: SELECT count(*) AS n FROM facts
     expect: { rows: [['1000']] }
+  # Every retained row, not just the count, is the one loaded before the removal.
+  - query: SELECT id, label FROM facts ORDER BY id
+    expect: { oracle: ref }
   - assert-log: { contains: 'No data files are yet available' }
 
   # Restored files load again.
