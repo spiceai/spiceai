@@ -40,7 +40,14 @@ limitations under the License.
 //! [`BinlogPosition`] into its own `spice_sys_mysql_binlog` sidecar row, and the
 //! shared dump's resume position is the **minimum** committed position across
 //! all members ([`AckTable::flush_position`]). On (re)start the pump resumes
-//! from that min; members ahead of it replay idempotently.
+//! from that min and routes each member only the commits past what it was
+//! already delivered ([`AckSlot::routes`]). A member that stays attached across
+//! a reconnect still holds its delivered commits in its channel, so sending
+//! them again would not be idempotent. Checking the *committed* floor instead
+//! re-sends an earlier in-flight commit after a later one is acknowledged
+//! mid-replay, and the member applies the older commit last. A consumer that
+//! drops a delivered window without acknowledging it must stop the stream so
+//! re-registration resets `delivered` with `committed`.
 //!
 //! A member takes an initial snapshot when it has no usable persisted position
 //! (cold, or an incompatible/purged checkpoint resolved by
@@ -50,7 +57,7 @@ limitations under the License.
 //! clean snapshot completion the pump reconnects from the held min and
 //! *promotes* every snapshot-complete member; a connection that provably starts
 //! at/below a member's floor makes it routable, and members already ahead
-//! suppress the replay via [`AckSlot::already_committed`].
+//! skip the replay via [`AckSlot::routes`].
 //!
 //! # WAL-retention caveat (differs from Postgres)
 //!
@@ -106,17 +113,18 @@ use tokio_stream::wrappers::ReceiverStream;
 
 use super::binlog::{
     AdoptedLayout, MIN_VALID_EVENT_POS, QueryKind, StatementKind, adopt_current_layout,
-    classify_query, classify_statement, commit_ts_ms, compute_pk_source_indexes,
+    classify_query, classify_statement, compute_pk_source_indexes, immediate_commit_ts_ms,
     layout_event_mismatch, log_transient_reconnect, open_binlog_stream, purged_position_error,
-    readiness_heartbeat, record_watermark,
+    readiness_heartbeat, record_watermark, transaction_commit_ts_ms,
 };
 use super::changes::{MemberLayout, MysqlChangeRows};
 use super::config::{BinlogPosition, ReplicationParams};
 use super::metrics::MetricsCollector;
-use super::rows::{build_change_batch, truncate_change};
+use super::rows::{ChangeBatchSchemas, build_change_batch, truncate_change};
 use super::{
-    CursorType, Error, GtidSet, PersistedPosition, PositionStore, ReplicationStreamInput, Result,
-    check_resume_compatibility, encode_checkpoint_schema_json, stream_error,
+    ColumnTypeChanges, CursorType, Error, GtidSet, PersistedPosition, PositionStore,
+    ReplicationStreamInput, Result, RetypeRefusal, check_resume_compatibility,
+    encode_checkpoint_schema_json, stream_error,
 };
 use crate::cdc::{ChangeEnvelope, ChangesStream, CommitChange, CommitError, StreamError};
 use crate::cdc::{InitialSnapshotMode, InvalidCheckpointBehavior};
@@ -140,6 +148,9 @@ const MEMBER_SEND_STALL_WARN: Duration = Duration::from_secs(5);
 
 /// `(database, table)` of a member's source table — the routing key.
 type MemberKey = (String, String);
+
+/// A transaction's GTID: the source UUID and its sequence number.
+type Gtid = (uuid::Uuid, u64);
 
 /// Identity of a shared dump: the connection a dataset streams the binlog over.
 /// Every `refresh_mode: changes` dataset that connects the same way coalesces
@@ -251,12 +262,26 @@ const STREAMING: u8 = 0b100;
 struct AckSlot {
     committed: Mutex<BinlogPosition>,
     delivered: Mutex<BinlogPosition>,
-    /// Executed GTID set for this member, advanced in lockstep with `committed`
-    /// (folded on commit and on idle-credit), so it describes exactly the
-    /// transactions at or below the member's committed position. Empty when the
-    /// source is not GTID-positioning. The shared dump's GTID resume set is the
-    /// intersection of these across members (see [`AckTable::resume_gtid`]).
+    /// Executed GTID set for this member: every transaction it has applied or
+    /// needs nothing from. Folded on commit, on idle-credit, and, under GTID
+    /// positioning, on [`AckSlot::credit_gtid`] for transactions passing while
+    /// the member is busy. It never holds a transaction delivered to the member
+    /// and not yet committed, so resuming from it re-reads exactly those. Empty
+    /// when the source is not GTID-positioning. The shared dump's GTID resume
+    /// set is the intersection of these across members (see
+    /// [`AckTable::resume_gtid`]).
     gtid: Mutex<GtidSet>,
+    /// GTIDs of the transactions delivered into this member's channel, on top
+    /// of the executed set it was registered with: the GTID analog of
+    /// `delivered`, and always a superset of `gtid`. Under GTID positioning it
+    /// is what decides routing, because binlog coordinates are local to one
+    /// server and a failover leaves `delivered` and `committed` holding the
+    /// previous server's.
+    delivered_gtid: Mutex<GtidSet>,
+    /// GTID of the last transaction delivered into this member's channel,
+    /// `None` until one is. The consumer commits in delivery order, so the
+    /// member is idle exactly when its executed set holds this one.
+    last_delivered_gtid: Mutex<Option<Gtid>>,
     state: AtomicU8,
 }
 
@@ -265,6 +290,8 @@ impl AckSlot {
         Self {
             committed: Mutex::new(at.clone()),
             delivered: Mutex::new(at),
+            delivered_gtid: Mutex::new(gtid_seed.clone()),
+            last_delivered_gtid: Mutex::new(None),
             gtid: Mutex::new(gtid_seed),
             state: AtomicU8::new(LIVE | if snapshotting { SNAPSHOTTING } else { 0 }),
         }
@@ -291,15 +318,88 @@ impl AckSlot {
     fn commit(&self, to: &BinlogPosition) {
         advance_position(&self.committed, to);
     }
-    /// Record an envelope delivered into this member's channel (monotonic-max).
-    fn deliver(&self, to: &BinlogPosition) {
+    /// Record an envelope delivered into this member's channel (monotonic-max),
+    /// and the GTID of the transaction it carries, if any.
+    fn deliver(&self, to: &BinlogPosition, gtid: Option<Gtid>) {
         advance_position(&self.delivered, to);
+        if let Some((uuid, gno)) = gtid {
+            lock(&self.delivered_gtid).add(uuid, gno);
+            *lock(&self.last_delivered_gtid) = Some((uuid, gno));
+        }
     }
 
-    /// Whether the member has already durably applied this commit — used to
-    /// suppress re-delivery during a reconnect replay from the shared min.
-    fn already_committed(&self, at: &BinlogPosition) -> bool {
-        *lock(&self.committed) >= *at
+    /// Credit a transaction the member needs nothing from, or already holds:
+    /// it counts as delivered and committed, without being in flight.
+    fn credit(&self, upto: &BinlogPosition, gtid: Option<Gtid>) {
+        self.commit(upto);
+        advance_position(&self.delivered, upto);
+        if let Some((uuid, gno)) = gtid {
+            lock(&self.delivered_gtid).add(uuid, gno);
+            self.fold_gtid(uuid, gno);
+        }
+    }
+
+    /// Credit a transaction to a member with envelopes still in flight, by GTID
+    /// only: when the transaction was not delivered to the member, the member
+    /// needs nothing from it, so its executed set may hold it although earlier
+    /// transactions of its own are not yet committed. A GTID set is not a
+    /// watermark: resuming from it re-reads every transaction it lacks, so the
+    /// in-flight ones stay out of it and are re-read, while everything that
+    /// passed meanwhile coalesces with them once they commit. Without this,
+    /// each transaction for other tables that passes while the member is busy
+    /// leaves a range in its set that never closes. The committed position
+    /// stays put, because a position cannot skip past an uncommitted
+    /// transaction.
+    fn credit_gtid(&self, (uuid, gno): Gtid) {
+        let mut delivered = lock(&self.delivered_gtid);
+        if delivered.contains(uuid, gno) {
+            return;
+        }
+        delivered.add(uuid, gno);
+        drop(delivered);
+        self.fold_gtid(uuid, gno);
+    }
+
+    /// Whether every envelope delivered to this member has been committed.
+    ///
+    /// Under GTID positioning, positions cannot tell: after a failover the
+    /// `delivered` and `committed` recorded on the previous server stay above
+    /// every new one, and compare equal while an envelope is in flight.
+    fn is_idle(&self, gtid_positioned: bool) -> bool {
+        if gtid_positioned {
+            let last = *lock(&self.last_delivered_gtid);
+            last.is_none_or(|(uuid, gno)| lock(&self.gtid).contains(uuid, gno))
+        } else {
+            self.delivered() == self.committed()
+        }
+    }
+
+    /// Whether the pump routes the commit at `at` to this member: streaming,
+    /// and not yet delivered. `gtid` is the transaction's GTID when the dump is
+    /// GTID-positioned, and `None` otherwise.
+    ///
+    /// Under file+offset positioning, "delivered" is `delivered < at`. Under
+    /// GTID positioning it is membership of the transaction's GTID in
+    /// `delivered_gtid`: after a failover the dump reads another server's
+    /// binlog, whose coordinates do not order against the ones recorded from
+    /// the previous server, so comparing them would skip transactions the
+    /// member never received.
+    ///
+    /// Invariants for every caller that gets `true`:
+    /// - call [`Self::deliver`] with `at` before the next `routes` check
+    ///   (row commits and `TRUNCATE` both do)
+    /// - a discarded unacked window must stop the stream so (re)registration
+    ///   resets `delivered` with `committed`
+    ///
+    /// Why `delivered` and not `committed` is the module-level consistency note.
+    fn routes(&self, at: &BinlogPosition, gtid: Option<Gtid>) -> bool {
+        if !self.has(STREAMING) {
+            return false;
+        }
+        match gtid {
+            Some((uuid, gno)) => !lock(&self.delivered_gtid).contains(uuid, gno),
+            None => *lock(&self.delivered) < *at,
+        }
     }
 
     fn has(&self, flag: u8) -> bool {
@@ -313,6 +413,10 @@ impl AckSlot {
 #[derive(Default)]
 struct AckTable {
     members: RwLock<HashMap<MemberKey, Arc<AckSlot>>>,
+    /// Whether the shared dump is GTID-positioned, decided once when the pump
+    /// starts. Selects how [`AckSlot::routes`] and [`Self::credit_idle`] tell
+    /// what a member was already delivered.
+    gtid_positioned: AtomicBool,
 }
 
 impl AckTable {
@@ -346,6 +450,8 @@ impl AckTable {
             Some(slot) => {
                 *lock(&slot.committed) = at.clone();
                 *lock(&slot.delivered) = at;
+                *lock(&slot.delivered_gtid) = gtid_seed.clone();
+                *lock(&slot.last_delivered_gtid) = None;
                 *lock(&slot.gtid) = gtid_seed;
                 slot.state.store(held, Ordering::Release);
             }
@@ -396,20 +502,26 @@ impl AckTable {
 
     /// Credit streaming members with no in-flight envelopes up to `upto` — the
     /// connection's in-order replay guarantees their routed changes below `upto`
-    /// were already delivered. Held/detached members are never credited.
-    fn credit_idle(&self, upto: &BinlogPosition, gtid: Option<(uuid::Uuid, u64)>) {
+    /// were already delivered. Under GTID positioning, members with envelopes
+    /// in flight are credited the transaction's GTID when it was not delivered
+    /// to them ([`AckSlot::credit_gtid`]). Called after the transaction was
+    /// routed, so a member it was delivered to holds its GTID in
+    /// `delivered_gtid` and is not credited it. Held/detached members are
+    /// never credited.
+    fn credit_idle(&self, upto: &BinlogPosition, gtid: Option<Gtid>) {
+        let gtid_positioned = self.gtid_positioned();
         for slot in read_lock(&self.members).values() {
             let s = slot.state.load(Ordering::Acquire);
-            if s & (LIVE | STREAMING) == (LIVE | STREAMING) && slot.delivered() == slot.committed()
-            {
-                slot.commit(upto);
-                slot.deliver(upto);
+            if s & (LIVE | STREAMING) != (LIVE | STREAMING) {
+                continue;
+            }
+            if slot.is_idle(gtid_positioned) {
                 // An idle member's committed advances past this transaction, so
                 // its executed set gains the transaction's GTID too (idempotent
                 // — re-folding an already-present GTID is a no-op).
-                if let Some((uuid, gno)) = gtid {
-                    slot.fold_gtid(uuid, gno);
-                }
+                slot.credit(upto, gtid);
+            } else if let Some(gtid) = gtid.filter(|_| gtid_positioned) {
+                slot.credit_gtid(gtid);
             }
         }
     }
@@ -424,6 +536,21 @@ impl AckTable {
             }
             None => false,
         }
+    }
+
+    fn set_gtid_positioned(&self, gtid_positioned: bool) {
+        self.gtid_positioned
+            .store(gtid_positioned, Ordering::Release);
+    }
+
+    fn gtid_positioned(&self) -> bool {
+        self.gtid_positioned.load(Ordering::Acquire)
+    }
+
+    /// The GTID [`AckSlot::routes`] decides by: the transaction's own under
+    /// GTID positioning, `None` (route by position) otherwise.
+    fn routing_gtid(&self, gtid: Option<Gtid>) -> Option<Gtid> {
+        gtid.filter(|_| self.gtid_positioned())
     }
 
     /// The shared resume position: the minimum `committed` over all members
@@ -595,8 +722,9 @@ fn snapshot_boundary_envelope(
 
 struct MemberHandle {
     dataset_name: String,
-    schema: SchemaRef,
     primary_keys: Vec<String>,
+    /// What an adopted `ALTER` does to a column whose source type widened.
+    column_type_changes: ColumnTypeChanges,
     /// Immutable decode layout behind an `Arc` swapped on a compatible ALTER
     /// (see [`adopt_current_layout`]). The pump clones the current `Arc` into a
     /// route at `TableMapEvent` time, so a snapshot handed downstream to
@@ -614,6 +742,10 @@ struct MemberHandle {
     /// GTID-positioning, else `File`), decided at attach. Written into every
     /// checkpoint so a resume reloads the correct positioning mode.
     cursor_type: CursorType,
+    /// The dataset's own `mysql_replication_initial_snapshot`, which decides
+    /// whether a re-load reads the table's existing rows. The shared source's
+    /// params are the first subscriber's, so they do not say it.
+    snapshot_mode: InitialSnapshotMode,
 }
 
 /// One shared dump source: registry entry + pump state.
@@ -635,6 +767,25 @@ struct SharedSource {
     /// Tables whose member detached during this pump's lifetime; a rejoin is
     /// resumed from the held floor instead of a fresh snapshot.
     detached: Mutex<HashSet<MemberKey>>,
+}
+
+impl MemberHandle {
+    /// The schema this member's change batches are built with now.
+    fn schema(&self) -> SchemaRef {
+        Arc::clone(lock(&self.layout).change_schemas.dataset())
+    }
+}
+
+/// The change-batch schemas for a widened schema, or `current` when the ALTER
+/// widened nothing.
+fn changed_schemas(
+    current: &Arc<ChangeBatchSchemas>,
+    widened: Option<&SchemaRef>,
+) -> Arc<ChangeBatchSchemas> {
+    widened.map_or_else(
+        || Arc::clone(current),
+        |schema| Arc::new(ChangeBatchSchemas::new(schema)),
+    )
 }
 
 impl SharedSource {
@@ -781,6 +932,7 @@ async fn attach_member(
         position_store,
         schema_json,
         metrics,
+        column_type_changes,
     } = input;
     let member_key: MemberKey = (database.clone(), table.clone());
     let connection = source.key.label();
@@ -891,12 +1043,13 @@ async fn attach_member(
         member_key.clone(),
         Arc::new(MemberHandle {
             dataset_name: dataset_name.clone(),
-            schema: Arc::clone(&schema),
             primary_keys: primary_keys.clone(),
+            column_type_changes,
             layout: Mutex::new(Arc::new(MemberLayout {
                 layout: layout.clone(),
                 column_map: column_map.clone(),
                 pk_source_indexes,
+                change_schemas: Arc::new(ChangeBatchSchemas::new(&schema)),
             })),
             sender,
             metrics: Arc::clone(&metrics),
@@ -904,6 +1057,7 @@ async fn attach_member(
             position_store: Arc::clone(&position_store),
             checkpoint_schema_json: checkpoint_schema_json.clone(),
             cursor_type,
+            snapshot_mode: params.snapshot_mode,
         }),
     );
     metrics.mark_member_attached();
@@ -918,8 +1072,7 @@ async fn attach_member(
     );
 
     if !source.pump_started.swap(true, Ordering::AcqRel) {
-        let pump_source = Arc::clone(source);
-        tokio::spawn(run_pump(pump_source));
+        spawn_pump(Arc::clone(source));
     } else if !snapshotting {
         // A resuming/rejoining member needs the pump to reconnect so it
         // repositions to the (possibly lower) new min and re-runs promotion. A
@@ -1080,6 +1233,75 @@ impl MemberStart {
     const fn is_loading(self) -> bool {
         matches!(self, Self::Snapshot | Self::Rebuild)
     }
+
+    /// Whether a start resolved *without* a usable position must persist the
+    /// head it just captured, before any rows land.
+    ///
+    /// Only [`Self::Stream`] does. The two loading starts carry a boundary
+    /// committer that persists the head after their rows are durably applied,
+    /// so recording it up front would let a crash mid-load resume past base
+    /// rows that never arrived. A member that loads nothing has no such
+    /// committer, and its head has to be recorded for the next start.
+    ///
+    /// That makes it the complement of [`Self::is_loading`] over today's three
+    /// starts, and it is still stated separately: the two answer different
+    /// questions — whether the ack floor is held, and who owns the checkpoint
+    /// write — so a start added later has to answer both rather than inherit
+    /// one from the other.
+    const fn persists_head_before_loading(self) -> bool {
+        // Exhaustive over the closed enum rather than a `matches!`: a start
+        // added later has to state which side it is on here, instead of
+        // inheriting "does not persist" from a wildcard.
+        match self {
+            Self::Stream => true,
+            Self::Snapshot | Self::Rebuild => false,
+        }
+    }
+}
+
+/// Which start a member takes when it holds no position it can resume from.
+///
+/// `has_recorded_position` is asked first, because it — not `snapshot_mode` —
+/// answers whether the acceleration is already holding rows. Two routes arrive
+/// here with one recorded, and a rebuild answers both:
+///
+/// * **The checkpoint was found unusable** and `invalid_checkpoint_behavior` is
+///   `restart` (`error` fails the member's stream before reaching here). The
+///   source's binary log no longer explains the rows already there: a row
+///   deleted at the source inside the unreachable window has no change event
+///   left to carry the deletion, so streaming from the current head would serve
+///   that row in every later query, and persisting the head would make it
+///   permanent.
+/// * **`initial_snapshot: always`**, which discards a still-resumable position
+///   by request. Nothing is wrong with the source on this route and
+///   `invalid_checkpoint_behavior` is never consulted — but the acceleration is
+///   holding rows just the same, so it is replaced rather than emptied and
+///   refilled.
+///
+/// `initial_snapshot: disabled` does not suppress the first of those. It says a
+/// *first* load must not read the table — a statement about rows the stream has
+/// not been asked to deliver — and cannot say that an acceleration whose
+/// history the source dropped may keep serving rows the source no longer has.
+/// `mysql_replication_invalid_checkpoint_behavior` decides that, and `restart`
+/// asks for exactly this recovery. `disabled` and `always` are values of one
+/// parameter, so an acceleration reaching a rebuild under `disabled` reached it
+/// by the unusable-checkpoint route and no other.
+///
+/// Neither route uses the snapshot path: a rebuild is a single zero-row signal
+/// the consumer answers with an atomic replacement ([`MemberStart::Rebuild`]).
+///
+/// Pure so the ordering is unit-testable without a live `MySQL`.
+fn start_without_usable_position(
+    snapshot_mode: InitialSnapshotMode,
+    has_recorded_position: bool,
+) -> MemberStart {
+    if has_recorded_position {
+        MemberStart::Rebuild
+    } else if snapshot_mode == InitialSnapshotMode::Disabled {
+        MemberStart::Stream
+    } else {
+        MemberStart::Snapshot
+    }
 }
 
 /// Resolve a fresh (non-rejoin) member's start position, applying
@@ -1221,9 +1443,9 @@ async fn resolve_start_position(
     }
 
     // No usable position: capture the head (and its executed GTID set, when
-    // GTID-positioning) first so the snapshot overlap replays idempotently, then
-    // either snapshot from it or (snapshot disabled) stream from it after
-    // persisting it up front.
+    // GTID-positioning) first so the load's overlap replays idempotently, then
+    // load from it — by snapshot or by rebuild — or, for a member with nothing
+    // to load, stream from it after persisting it up front.
     let (head, head_gtid) = if use_gtid {
         super::setup::fetch_head_and_gtid(conn).await?
     } else {
@@ -1232,7 +1454,8 @@ async fn resolve_start_position(
             GtidSet::new(),
         )
     };
-    if params.snapshot_mode == InitialSnapshotMode::Disabled {
+    let start = start_without_usable_position(params.snapshot_mode, has_recorded_position);
+    if start.persists_head_before_loading() {
         let initial = PersistedPosition {
             position: head.clone(),
             schema_json: checkpoint_schema_json.map(ToString::to_string),
@@ -1246,16 +1469,13 @@ async fn resolve_start_position(
         if let Err(e) = position_store.save(&initial).await {
             tracing::warn!(dataset = %dataset_name, error = %e, "failed to persist initial binlog head");
         }
-        Ok((head, head_gtid, MemberStart::Stream))
-    } else if has_recorded_position {
-        Ok((head, head_gtid, MemberStart::Rebuild))
-    } else {
-        Ok((head, head_gtid, MemberStart::Snapshot))
     }
+    Ok((head, head_gtid, start))
 }
 
 /// Apply `invalid_checkpoint_behavior` for one member: `Error` fails the
-/// member's stream; `Restart` clears its saved position so it re-snapshots.
+/// member's stream; `Restart` accepts the rebuild, leaving the unusable position
+/// in place for [`rebootstrap_member`]'s boundary committer to replace.
 fn apply_invalid_checkpoint(
     params: &ReplicationParams,
     dataset_name: &str,
@@ -1283,6 +1503,73 @@ fn apply_invalid_checkpoint(
             Ok(())
         }
     }
+}
+
+/// Start the shared pump on a thread of its own, driven by its own current-thread runtime.
+///
+/// The pump reads the dump socket for every member of the group, so every moment it waits
+/// to be polled is a moment the socket goes undrained: the source then stalls in TCP flow
+/// control and the whole group falls behind together. Spawned onto the CDC apply runtime,
+/// the pump's yields queued behind the members' own apply work, and under a sustained
+/// stream that capped how fast the group could replicate. On its own thread a yield
+/// returns to the pump at once.
+///
+/// If the thread cannot be started, or its runtime cannot be built, the pump runs on the
+/// current runtime instead.
+fn spawn_pump(source: Arc<SharedSource>) {
+    spawn_pump_with(source, |pump| {
+        std::thread::Builder::new()
+            .name("mysql-binlog-pump".to_string())
+            .spawn(pump)
+            .map(drop)
+    });
+}
+
+/// [`spawn_pump`], with the thread started by `start_thread` so that a test can make the
+/// start fail.
+///
+/// A start that fails drops the closure it was given, as [`std::thread::Builder::spawn`]
+/// does, and so drops it on the subscribing task. Tokio panics when a runtime is dropped
+/// from an async context, so the closure builds the pump's runtime on the new thread
+/// rather than carrying one in.
+fn spawn_pump_with(
+    source: Arc<SharedSource>,
+    start_thread: impl FnOnce(Box<dyn FnOnce() + Send>) -> std::io::Result<()>,
+) {
+    let current = tokio::runtime::Handle::current();
+    let thread_current = current.clone();
+    let thread_source = Arc::clone(&source);
+    // Both guards are taken before the start, so the drain counts the pump wherever it
+    // ends up running: a start that fails drops the thread's guard with the closure, and
+    // the fallback runs on the guard it already holds.
+    let thread_guard = crate::cdc::ShutdownDrainGuard::hold();
+    let guard = crate::cdc::ShutdownDrainGuard::hold();
+    let pump = move || match tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+    {
+        Ok(runtime) => runtime.block_on(run_pump(thread_source, thread_guard)),
+        Err(e) => {
+            warn_pump_on_current_runtime(&thread_source, &e);
+            thread_current.spawn(run_pump(thread_source, thread_guard));
+        }
+    };
+    match start_thread(Box::new(pump)) {
+        Ok(()) => drop(guard),
+        Err(e) => {
+            warn_pump_on_current_runtime(&source, &e);
+            current.spawn(run_pump(source, guard));
+        }
+    }
+}
+
+fn warn_pump_on_current_runtime(source: &SharedSource, error: &std::io::Error) {
+    tracing::warn!(
+        connection = %source.key.label(),
+        error = %error,
+        "Failed to start a dedicated thread to read the MySQL binlog for connection '{}', so the binlog is read on the shared CDC apply runtime and replication may fall behind under a heavy write load. Cause: {error}",
+        source.key.label()
+    );
 }
 
 /// Mark the source dead and drop it from the registry (only if the registry
@@ -1370,13 +1657,12 @@ async fn detect_source_gtid(params: &ReplicationParams) -> bool {
 }
 
 /// The shared pump: one binlog dump driving every member.
-#[expect(
-    clippy::too_many_lines,
-    reason = "single state machine over the multiplexed binlog event loop; mirrors the \
-              per-dataset binlog_change_stream and postgres run_pump"
-)]
-async fn run_pump(source: Arc<SharedSource>) {
-    let shutdown_epoch = crate::cdc::shutdown_epoch();
+async fn run_pump(source: Arc<SharedSource>, shutdown_drain: crate::cdc::ShutdownDrainGuard) {
+    // Captured when the pump was spawned. The guard is held until this returns
+    // — on a runtime shutdown, after the final `persist_all` below — and the
+    // runtime waits for it before closing the accelerations those positions
+    // are written into.
+    let shutdown_epoch = shutdown_drain.epoch();
     let params = source.params.clone();
     let connection = source.key.label();
     let mut backoff = super::resilience::StreamBackoff::default_for_stream();
@@ -1391,6 +1677,7 @@ async fn run_pump(source: Arc<SharedSource>) {
     // file+offset. When on, the dump is opened with `COM_BINLOG_DUMP_GTID` from
     // the intersection of members' executed sets, giving failover-safe resume.
     let use_gtid = detect_source_gtid(&params).await;
+    source.ack.set_gtid_positioned(use_gtid);
     let mut last_persist_at = Instant::now();
     // Throttles the head-poll + readiness heartbeat. Emitted on BOTH the idle
     // branch and the event path: the server streams its own binlog heartbeats
@@ -1479,7 +1766,7 @@ async fn run_pump(source: Arc<SharedSource>) {
                     &e.to_string(),
                     backoff.next_delay().as_millis(),
                 );
-                backoff.wait().await;
+                crate::cdc::until_shutdown(shutdown_epoch, backoff.wait()).await;
                 continue 'reconnect;
             }
             Err(e) => {
@@ -1502,6 +1789,9 @@ async fn run_pump(source: Arc<SharedSource>) {
         // `GtidEvent`, folded into members' executed sets at commit/idle-credit).
         // `None` between transactions or when not GTID-positioning.
         let mut current_txn_gtid: Option<(uuid::Uuid, u64)> = None;
+        // Commit time of the transaction currently being read, in milliseconds, from
+        // its GTID event; taken by the commit or statement that closes it.
+        let mut current_txn_commit_ts_ms: Option<i64> = None;
 
         'recv: loop {
             if crate::cdc::shutdown_epoch() != shutdown_epoch {
@@ -1523,7 +1813,14 @@ async fn run_pump(source: Arc<SharedSource>) {
                 return;
             }
 
-            let next_event = match tokio::time::timeout(idle_tick, stream.next()).await {
+            let polled = tokio::select! {
+                polled = tokio::time::timeout(idle_tick, stream.next()) => polled,
+                // Wake for a shutdown as it is signalled: the check at the head of
+                // the loop persists the positions, and the runtime is waiting for
+                // that before it closes the accelerations they go into.
+                () = crate::cdc::shutdown_signalled(shutdown_epoch) => continue 'recv,
+            };
+            let next_event = match polled {
                 Ok(item) => item,
                 Err(_idle) => {
                     if last_persist_at.elapsed() >= params.checkpoint_interval {
@@ -1607,6 +1904,12 @@ async fn run_pump(source: Arc<SharedSource>) {
                     if let Some(target) = rotate_target(&rotate) {
                         current_file = target.file;
                         event_end_pos = target.pos;
+                    } else {
+                        // The fake rotate at the head of a dump names the file
+                        // the server reads from, which under GTID positioning
+                        // is the server's own choice (another server's, after
+                        // a failover), not the file of the shared floor.
+                        current_file = rotate.name().to_string();
                     }
                 }
                 Some(EventData::TableMapEvent(tme)) => {
@@ -1641,15 +1944,15 @@ async fn run_pump(source: Arc<SharedSource>) {
                         tme.columns_count() != g.layout.columns.len() as u64
                     };
                     if needs_adopt {
-                        let old_layout = { lock(&member.layout).layout.clone() };
+                        let old = Arc::clone(&lock(&member.layout));
                         match adopt_current_layout(
                             &params,
                             &mkey.0,
                             &mkey.1,
-                            &member.schema,
-                            &old_layout,
+                            &old,
                             &member.primary_keys,
                             &member.dataset_name,
+                            member.column_type_changes,
                         )
                         .await
                         {
@@ -1657,24 +1960,44 @@ async fn run_pump(source: Arc<SharedSource>) {
                                 layout,
                                 column_map,
                                 pk_source_indexes,
+                                widened_schema,
                             }) if layout.columns.len() as u64 == tme.columns_count() => {
                                 *lock(&member.layout) = Arc::new(MemberLayout {
                                     layout,
                                     column_map,
                                     pk_source_indexes,
+                                    change_schemas: changed_schemas(
+                                        &old.change_schemas,
+                                        widened_schema.as_ref(),
+                                    ),
                                 });
                             }
                             outcome => {
                                 member.metrics.inc_schema_mismatch_error();
                                 routes.remove(&table_id);
-                                let detail = match outcome {
-                                    Ok(_) => "the current source layout column count still disagrees with the event".to_string(),
-                                    Err(e) => e.to_string(),
+                                let message = match outcome {
+                                    Err(Error::RetypeNotFollowed { refusal }) => {
+                                        retype_stop_message(
+                                            &member.dataset_name,
+                                            &mkey.0,
+                                            &mkey.1,
+                                            None,
+                                            &refusal,
+                                            member.snapshot_mode,
+                                        )
+                                    }
+                                    outcome => {
+                                        let detail = match outcome {
+                                            Ok(_) => "the current source layout column count still disagrees with the event".to_string(),
+                                            Err(e) => e.to_string(),
+                                        };
+                                        format!(
+                                            "source table {}.{} changed shape and the new layout cannot be adopted: {detail}. Re-bootstrap by setting `mysql_replication_invalid_checkpoint_behavior: restart`.",
+                                            mkey.0, mkey.1
+                                        )
+                                    }
                                 };
-                                member_fatal(&source, &mkey, format!(
-                                    "source table {}.{} changed shape and the new layout cannot be adopted: {detail}. Re-bootstrap by setting `mysql_replication_invalid_checkpoint_behavior: restart`.",
-                                    mkey.0, mkey.1
-                                )).await;
+                                member_fatal(&source, &mkey, message).await;
                                 continue 'recv;
                             }
                         }
@@ -1738,7 +2061,7 @@ async fn run_pump(source: Arc<SharedSource>) {
                         &routes,
                         std::mem::take(&mut txn),
                         &commit_pos,
-                        event_timestamp,
+                        transaction_commit_ts_ms(current_txn_commit_ts_ms.take(), event_timestamp),
                         shutdown_epoch,
                         current_txn_gtid,
                     )
@@ -1761,7 +2084,10 @@ async fn run_pump(source: Arc<SharedSource>) {
                                 &routes,
                                 std::mem::take(&mut txn),
                                 &commit_pos,
-                                event_timestamp,
+                                transaction_commit_ts_ms(
+                                    current_txn_commit_ts_ms.take(),
+                                    event_timestamp,
+                                ),
                                 shutdown_epoch,
                                 current_txn_gtid,
                             )
@@ -1777,7 +2103,10 @@ async fn run_pump(source: Arc<SharedSource>) {
                                 &default_db,
                                 &current_file,
                                 event_end_pos,
-                                event_timestamp,
+                                transaction_commit_ts_ms(
+                                    current_txn_commit_ts_ms.take(),
+                                    event_timestamp,
+                                ),
                                 shutdown_epoch,
                                 current_txn_gtid,
                             )
@@ -1799,10 +2128,39 @@ async fn run_pump(source: Arc<SharedSource>) {
                     // idle-credit of members with no change) folds it into their
                     // executed sets for failover-safe resume.
                     txn_open = true;
-                    current_txn_gtid =
-                        Some((uuid::Uuid::from_bytes(gtid_event.sid()), gtid_event.gno()));
+                    current_txn_commit_ts_ms =
+                        immediate_commit_ts_ms(gtid_event.immediate_commit_timestamp());
+                    let source_uuid = uuid::Uuid::from_bytes(gtid_event.sid());
+                    if let Some(tag) = gtid_event.tag() {
+                        // A tagged GTID (`uuid:tag:gno`, MySQL 8.3+) numbers its
+                        // transactions apart from the source's untagged ones, and
+                        // the executed set records no tags. Folding it in as
+                        // `uuid:gno` would claim an untagged transaction this group
+                        // never applied, which a reconnect from that set then skips.
+                        // Under GTID positioning that set is the resume point, so
+                        // fail the whole group loudly, as for an anonymous one.
+                        if use_gtid {
+                            fatal_broadcast(
+                                &source,
+                                Error::TaggedTransactionUnderGtid {
+                                    dataset: connection.clone(),
+                                    gtid: format!(
+                                        "{source_uuid}:{}:{}",
+                                        tag.as_str(),
+                                        gtid_event.gno()
+                                    ),
+                                }
+                                .to_string(),
+                            )
+                            .await;
+                            break 'reconnect;
+                        }
+                        current_txn_gtid = None;
+                    } else {
+                        current_txn_gtid = Some((source_uuid, gtid_event.gno()));
+                    }
                 }
-                Some(EventData::AnonymousGtidEvent(_)) => {
+                Some(EventData::AnonymousGtidEvent(anonymous)) => {
                     // An anonymous transaction carries no GTID. Under GTID
                     // positioning it must not happen (source not fully
                     // `gtid_mode = ON`): the executed set could not describe it,
@@ -1822,6 +2180,8 @@ async fn run_pump(source: Arc<SharedSource>) {
                     }
                     txn_open = true;
                     current_txn_gtid = None;
+                    current_txn_commit_ts_ms =
+                        immediate_commit_ts_ms(anonymous.0.immediate_commit_timestamp());
                 }
                 Some(_) | None => {}
             }
@@ -1851,7 +2211,7 @@ async fn run_pump(source: Arc<SharedSource>) {
         } // 'recv
 
         persist_all(&source, &mut last_persisted).await;
-        backoff.wait().await;
+        crate::cdc::until_shutdown(shutdown_epoch, backoff.wait()).await;
     } // 'reconnect
 
     // Fatal exit: error any member still attached and finalize.
@@ -1880,7 +2240,7 @@ fn current_file_pos(file: &str) -> BinlogPosition {
 /// (normally 4, just past the magic number). Pairing the new name with the
 /// closing file's offset yields a coordinate far beyond anything the new file
 /// holds — an idle member credited there has every later commit in that file
-/// suppressed by [`AckSlot::already_committed`], silently and for as long as the
+/// skipped by [`AckSlot::routes`], silently and for as long as the
 /// new file stays smaller than the old one (#12042).
 fn rotate_target(rotate: &RotateEvent<'_>) -> Option<BinlogPosition> {
     (!rotate.is_fake()).then(|| BinlogPosition::new(rotate.name(), rotate.position()))
@@ -1896,38 +2256,51 @@ async fn deliver_commit(
     routes: &FxHashMap<u64, Route>,
     txn: FxHashMap<u64, Vec<RowsEventData<'static>>>,
     commit_pos: &BinlogPosition,
-    event_timestamp: u32,
+    commit_ts: Option<i64>,
     shutdown_epoch: u64,
     gtid: Option<(uuid::Uuid, u64)>,
 ) {
-    let commit_ts = commit_ts_ms(event_timestamp);
+    // Every member the transaction routes to is marked delivered before any is
+    // handed it. A shutdown can abandon the sends part way, and the pump goes
+    // on to credit the transaction: a member not yet marked would count as
+    // needing nothing from it, be credited it as applied, and skip it after
+    // the restart. Marked, it stays in flight, so it is never credited and its
+    // saved position re-reads it.
+    let routing_gtid = source.ack.routing_gtid(gtid);
+    let mut recipients = Vec::with_capacity(txn.len());
     for (table_id, events) in txn {
         if events.is_empty() {
             continue;
         }
-        let Some(Route {
+        let Some(route) = routes.get(&table_id) else {
+            continue;
+        };
+        if !route.slot.routes(commit_pos, routing_gtid) {
+            continue;
+        }
+        route.slot.deliver(commit_pos, gtid);
+        recipients.push((route, events));
+    }
+    for (
+        Route {
             key,
             member,
             slot,
             tme,
             layout,
-        }) = routes.get(&table_id)
-        else {
-            continue;
-        };
-        if !slot.has(STREAMING) || slot.already_committed(commit_pos) {
-            continue;
-        }
+        },
+        events,
+    ) in recipients
+    {
         // O(1), no decode: freshness watermark + transaction count. The per-row
         // op counters are recorded off-pump in `MysqlChangeRows::build`.
-        record_watermark(&member.metrics, event_timestamp);
+        record_watermark(&member.metrics, commit_ts);
         member.metrics.inc_transaction();
         let is_ready = crate::cdc::source_commit_within_ready_lag(commit_ts, member.ready_lag);
         // Hand the OWNED payload + immutable layout/columns snapshots downstream;
         // the decode + build runs on the consumer, and a decode failure surfaces
         // as a `StreamError` on this one dataset's stream.
         let rows = MysqlChangeRows::new(
-            Arc::clone(&member.schema),
             member.primary_keys.clone(),
             Arc::clone(layout),
             Arc::clone(tme),
@@ -1946,7 +2319,6 @@ async fn deliver_commit(
             Box::new(rows),
             is_ready,
         );
-        slot.deliver(commit_pos);
         match deliver_to_member(
             &member.metrics,
             &member.sender,
@@ -1979,11 +2351,17 @@ async fn handle_statement(
     default_db: &str,
     current_file: &str,
     event_end_pos: u64,
-    event_timestamp: u32,
+    commit_ts: Option<i64>,
     shutdown_epoch: u64,
     gtid: Option<(uuid::Uuid, u64)>,
 ) {
-    // A statement can target any subscribed table; scan the live members.
+    let commit_pos = BinlogPosition::new(current_file.to_string(), event_end_pos);
+    let routing_gtid = source.ack.routing_gtid(gtid);
+    // A statement can target any subscribed table; scan the live members. As
+    // in `deliver_commit`, a `TRUNCATE` is marked delivered to every member it
+    // routes to before any is handed it, so one abandoned on shutdown cannot
+    // leave a later member credited with it.
+    let mut affected = Vec::new();
     for (mkey, member) in source.live_members() {
         let Some(kind) = classify_statement(statement, default_db, &mkey.0, &mkey.1) else {
             continue;
@@ -1994,20 +2372,24 @@ async fn handle_statement(
         if !slot.has(STREAMING) {
             continue;
         }
+        if matches!(kind, StatementKind::Truncate) {
+            if !slot.routes(&commit_pos, routing_gtid) {
+                continue;
+            }
+            slot.deliver(&commit_pos, gtid);
+        }
+        affected.push((mkey, member, kind, slot));
+    }
+    for (mkey, member, kind, slot) in affected {
         match kind {
             StatementKind::Truncate => {
-                let commit_pos = BinlogPosition::new(current_file.to_string(), event_end_pos);
-                if slot.already_committed(&commit_pos) {
-                    continue;
-                }
                 member.metrics.inc_truncate();
                 member.metrics.inc_transaction();
-                record_watermark(&member.metrics, event_timestamp);
-                let commit_ts = commit_ts_ms(event_timestamp);
+                record_watermark(&member.metrics, commit_ts);
                 let batch = {
                     let g = lock(&member.layout);
                     build_change_batch(
-                        &member.schema,
+                        g.change_schemas.dataset(),
                         &member.primary_keys,
                         &g.column_map,
                         &[truncate_change()],
@@ -2038,7 +2420,6 @@ async fn handle_statement(
                     batch,
                     is_ready,
                 );
-                slot.deliver(&commit_pos);
                 match deliver_to_member(
                     &member.metrics,
                     &member.sender,
@@ -2060,19 +2441,22 @@ async fn handle_statement(
                 // re-fetching the source layout and reconciling it against the
                 // dataset schema — the same behavior as the per-dataset path.
                 // Columns the source gained but the dataset does not declare are
-                // ignored; an ALTER that drops or retypes a *dataset* column
-                // cannot be adopted and is member-fatal. Adopting on the
-                // statement (not only on the next TableMap's column-count change)
-                // also catches type-only ALTERs that keep the column count.
-                let old_layout = { lock(&member.layout).layout.clone() };
+                // ignored; an ALTER that drops a *dataset* column cannot be
+                // adopted and is member-fatal. A column whose type widens
+                // losslessly is retyped in the member's schema, so its later
+                // values decode as the new type and reach `on_schema_change`; any
+                // other retype keeps the column's type. Adopting on the statement
+                // (not only on the next TableMap's column-count change) also
+                // catches type-only ALTERs that keep the column count.
+                let old = Arc::clone(&lock(&member.layout));
                 match adopt_current_layout(
                     &source.params,
                     &mkey.0,
                     &mkey.1,
-                    &member.schema,
-                    &old_layout,
+                    &old,
                     &member.primary_keys,
                     &member.dataset_name,
+                    member.column_type_changes,
                 )
                 .await
                 {
@@ -2080,19 +2464,35 @@ async fn handle_statement(
                         layout,
                         column_map,
                         pk_source_indexes,
+                        widened_schema,
                     }) => {
                         *lock(&member.layout) = Arc::new(MemberLayout {
                             layout,
                             column_map,
                             pk_source_indexes,
+                            change_schemas: changed_schemas(
+                                &old.change_schemas,
+                                widened_schema.as_ref(),
+                            ),
                         });
                     }
                     Err(e) => {
                         member.metrics.inc_schema_mismatch_error();
-                        member_fatal(source, &mkey, format!(
-                            "ALTER TABLE on source table {}.{} (statement: {statement}) cannot be adopted mid-stream: {e}. Update the dataset schema to match the new table definition, or re-bootstrap by setting `mysql_replication_invalid_checkpoint_behavior: restart`.",
-                            mkey.0, mkey.1
-                        )).await;
+                        let message = match &e {
+                            Error::RetypeNotFollowed { refusal } => retype_stop_message(
+                                &member.dataset_name,
+                                &mkey.0,
+                                &mkey.1,
+                                Some(statement),
+                                refusal,
+                                member.snapshot_mode,
+                            ),
+                            _ => format!(
+                                "ALTER TABLE on source table {}.{} (statement: {statement}) cannot be adopted mid-stream: {e}. Update the dataset schema to match the new table definition, or re-bootstrap by setting `mysql_replication_invalid_checkpoint_behavior: restart`.",
+                                mkey.0, mkey.1
+                            ),
+                        };
+                        member_fatal(source, &mkey, message).await;
                     }
                 }
             }
@@ -2149,6 +2549,42 @@ async fn deliver_to_member(
             }
         }
     }
+}
+
+/// The error a dataset's stream stops with when the source `ALTER` it ran
+/// (`statement`, when the binlog carried it) retyped a replicated column in a
+/// way the stream does not follow. Re-loading without the acceleration data is the one fix: the
+/// dataset then registers the column's new type and snapshots the table into
+/// it. Re-loading into the existing acceleration keeps its old column type.
+fn retype_stop_message(
+    dataset: &str,
+    database: &str,
+    table: &str,
+    statement: Option<&str>,
+    refusal: &RetypeRefusal,
+    snapshot_mode: InitialSnapshotMode,
+) -> String {
+    let before = match statement {
+        Some(statement) => format!(
+            "the source ran '{}'",
+            statement.split_whitespace().collect::<Vec<_>>().join(" ")
+        ),
+        None => "the source table's columns changed".to_string(),
+    };
+    // With no saved position left, `disabled` streams changes only, and the
+    // re-load would skip the table's existing rows.
+    let snapshot = if snapshot_mode == InitialSnapshotMode::Disabled {
+        " with `mysql_replication_initial_snapshot: auto`, so the re-load reads the table's \
+         existing rows"
+    } else {
+        ""
+    };
+    format!(
+        "Dataset '{dataset}' stopped applying changes from MySQL table '{database}.{table}', so \
+         it keeps serving the rows it held before {before}. Cause: {refusal}. To re-load the \
+         dataset with the new column type, remove the dataset's acceleration data and restart \
+         Spice{snapshot}. See: https://spiceai.org/docs/components/data-connectors/mysql"
+    )
 }
 
 /// Build a member's [`PersistedPosition`] from its ack slot — capturing the
@@ -2305,7 +2741,7 @@ async fn rebootstrap_member(
     let signal = snapshot_boundary_envelope(
         source,
         key,
-        &member.schema,
+        &member.schema(),
         member.dataset_name.clone(),
         true,
     )?;
@@ -2404,7 +2840,7 @@ async fn poll_head_and_heartbeat(
             continue;
         }
         match readiness_heartbeat(
-            &member.schema,
+            &member.schema(),
             source_now_ms,
             member.ready_lag,
             &member.dataset_name,
@@ -2439,6 +2875,93 @@ mod tests {
 
     fn gtids(raw: &str) -> GtidSet {
         GtidSet::parse(raw).expect("parse gtid set")
+    }
+
+    /// The error names the dataset, the `ALTER` and what it did to the column,
+    /// and the one fix, on one line.
+    #[test]
+    fn a_retype_stop_message_names_the_dataset_the_cause_and_the_fix() {
+        use crate::mysql_replication::RetypeRefusalReason;
+
+        let refusal = |from: &str, to: &str, reason| RetypeRefusal::new("k", from, to, reason);
+        let message = |statement: Option<&str>, refusal: &RetypeRefusal| {
+            retype_stop_message(
+                "orders",
+                "shop",
+                "orders",
+                statement,
+                refusal,
+                InitialSnapshotMode::Auto,
+            )
+        };
+        let rewrote = refusal("bigint", "double", RetypeRefusalReason::SourceRewroteValues);
+        assert_eq!(
+            message(Some("ALTER TABLE orders\n  MODIFY k DOUBLE"), &rewrote),
+            "Dataset 'orders' stopped applying changes from MySQL table 'shop.orders', so it \
+             keeps serving the rows it held before the source ran 'ALTER TABLE orders MODIFY k \
+             DOUBLE'. Cause: column 'k' changed from `bigint` to `double`, which does not hold \
+             every `bigint` value, and MySQL rewrites such values in place without sending row \
+             changes, so the dataset may hold values the source no longer has. To re-load the \
+             dataset with the new column type, remove the dataset's acceleration data and \
+             restart Spice. See: https://spiceai.org/docs/components/data-connectors/mysql"
+        );
+        // A layout change the binlog carried no statement for.
+        assert_eq!(
+            message(None, &rewrote),
+            "Dataset 'orders' stopped applying changes from MySQL table 'shop.orders', so it \
+             keeps serving the rows it held before the source table's columns changed. Cause: \
+             column 'k' changed from `bigint` to `double`, which does not hold every `bigint` \
+             value, and MySQL rewrites such values in place without sending row changes, so the \
+             dataset may hold values the source no longer has. To re-load the dataset with the \
+             new column type, remove the dataset's acceleration data and restart Spice. See: \
+             https://spiceai.org/docs/components/data-connectors/mysql"
+        );
+        assert_eq!(
+            refusal(
+                "int",
+                "decimal(12,2)",
+                RetypeRefusalReason::FractionIntoInteger
+            )
+            .to_string(),
+            "column 'k' changed from `int` to `decimal(12,2)`, and the dataset keeps the \
+             column's integer type, which cannot store a fractional value"
+        );
+        assert_eq!(
+            refusal("float", "double", RetypeRefusalReason::StaysFloat32).to_string(),
+            "column 'k' changed from `float` to `double`, and the dataset keeps the column's \
+             `Float32` type, which would round the new values"
+        );
+        assert_eq!(
+            refusal(
+                "int unsigned",
+                "decimal(10,0)",
+                RetypeRefusalReason::DecimalIntoUnsignedInteger
+            )
+            .to_string(),
+            "column 'k' changed from `int unsigned` to `decimal(10,0)`, and the dataset keeps \
+             the column's unsigned integer type, which the change stream cannot read a decimal \
+             value into"
+        );
+        // With no saved position, `disabled` would stream changes only.
+        assert_eq!(
+            retype_stop_message(
+                "orders",
+                "shop",
+                "orders",
+                Some("ALTER TABLE orders MODIFY k DOUBLE"),
+                &rewrote,
+                InitialSnapshotMode::Disabled,
+            ),
+            "Dataset 'orders' stopped applying changes from MySQL table 'shop.orders', so it \
+             keeps serving the rows it held before the source ran 'ALTER TABLE orders MODIFY k \
+             DOUBLE'. Cause: column 'k' changed from `bigint` to `double`, which does not hold \
+             every `bigint` value, and MySQL rewrites such values in place without sending row \
+             changes, so the dataset may hold values the source no longer has. To re-load the \
+             dataset with the new column type, remove the dataset's acceleration data and \
+             restart Spice with `mysql_replication_initial_snapshot: auto`, so the re-load reads \
+             the table's existing rows. See: \
+             https://spiceai.org/docs/components/data-connectors/mysql"
+        );
     }
 
     fn test_params() -> ReplicationParams {
@@ -2498,9 +3021,9 @@ mod tests {
         receiver: mpsc::Receiver<std::result::Result<ChangeEnvelope, StreamError>>,
     }
 
-    fn source_with_member(member_key: &MemberKey) -> TestMember {
+    fn test_source() -> Arc<SharedSource> {
         let params = test_params();
-        let source = Arc::new(SharedSource {
+        Arc::new(SharedSource {
             key: SourceKey {
                 host: "localhost".to_string(),
                 port: 3306,
@@ -2509,7 +3032,7 @@ mod tests {
                 ssl: None,
                 server_id: params.server_id,
             },
-            params: params.clone(),
+            params,
             setup_lock: tokio::sync::Mutex::new(()),
             members: Mutex::new(HashMap::new()),
             ack: Arc::new(AckTable::default()),
@@ -2517,13 +3040,19 @@ mod tests {
             restart_requested: AtomicBool::new(false),
             dead: AtomicBool::new(false),
             detached: Mutex::new(HashSet::new()),
-        });
-        let (sender, receiver) = mpsc::channel(8);
-        let position_store: Arc<MemoryPositionStore> = Arc::new(MemoryPositionStore::default());
-        let member = Arc::new(MemberHandle {
-            dataset_name: "orders".to_string(),
-            schema: test_schema(),
+        })
+    }
+
+    fn test_member(
+        dataset_name: &str,
+        sender: mpsc::Sender<std::result::Result<ChangeEnvelope, StreamError>>,
+        position_store: &Arc<MemoryPositionStore>,
+    ) -> Arc<MemberHandle> {
+        let params = test_params();
+        Arc::new(MemberHandle {
+            dataset_name: dataset_name.to_string(),
             primary_keys: vec!["id".to_string()],
+            column_type_changes: ColumnTypeChanges::Keep,
             layout: Mutex::new(Arc::new(MemberLayout {
                 // Covers every column of `test_schema`, so anything the member
                 // builds from the layout (a truncate row included) is buildable
@@ -2549,14 +3078,23 @@ mod tests {
                 },
                 column_map: vec![0, 1],
                 pk_source_indexes: vec![0],
+                change_schemas: Arc::new(ChangeBatchSchemas::new(&test_schema())),
             })),
             sender,
             metrics: MetricsCollector::new(),
             ready_lag: params.ready_lag,
-            position_store: Arc::clone(&position_store) as Arc<dyn PositionStore>,
+            position_store: Arc::clone(position_store) as Arc<dyn PositionStore>,
             checkpoint_schema_json: None,
             cursor_type: CursorType::File,
-        });
+            snapshot_mode: params.snapshot_mode,
+        })
+    }
+
+    fn source_with_member(member_key: &MemberKey) -> TestMember {
+        let source = test_source();
+        let (sender, receiver) = mpsc::channel(8);
+        let position_store: Arc<MemoryPositionStore> = Arc::new(MemoryPositionStore::default());
+        let member = test_member("orders", sender, &position_store);
         lock(&source.members).insert(member_key.clone(), Arc::clone(&member));
         // A streaming member: the rebuild is what puts it back into SNAPSHOTTING.
         source
@@ -2660,7 +3198,7 @@ mod tests {
             let envelope = snapshot_boundary_envelope(
                 &source,
                 &member_key,
-                &member.schema,
+                &member.schema(),
                 member.dataset_name.clone(),
                 history_unavailable,
             )
@@ -2671,6 +3209,76 @@ mod tests {
             assert!(!envelope.is_no_op_heartbeat());
             assert!(!envelope.is_dataset_ready());
         }
+    }
+
+    #[test]
+    fn an_unusable_position_rebuilds_even_when_the_initial_snapshot_is_disabled() {
+        // Regression test for #13024. Asking `initial_snapshot` before "is this
+        // acceleration already holding rows" lets a durable acceleration whose
+        // binlog position the source purged stream on from the current head:
+        // every row deleted at the source inside the purged window survives in
+        // the acceleration and is served by every later query, with nothing
+        // logged.
+        //
+        // A recorded position is the evidence that rows are there, so it
+        // decides, whatever the snapshot mode says. `always` is included
+        // because it reaches the same helper by the other route — it discards a
+        // still-resumable position by request — and must reload the rows it is
+        // holding by replacement rather than by emptying and refilling.
+        for mode in [
+            InitialSnapshotMode::Auto,
+            InitialSnapshotMode::Always,
+            InitialSnapshotMode::Disabled,
+        ] {
+            assert_eq!(
+                start_without_usable_position(mode, true),
+                MemberStart::Rebuild,
+                "a recorded position that will not be resumed from must be rebuilt under \
+                 initial_snapshot: {mode:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_first_load_still_honours_the_initial_snapshot_mode() {
+        // The other half of the ordering: with nothing recorded there are no
+        // rows to preserve, so the mode is the only instruction and it is
+        // followed. `disabled` must not be turned into a re-read of the whole
+        // table on every cold start.
+        assert_eq!(
+            start_without_usable_position(InitialSnapshotMode::Disabled, false),
+            MemberStart::Stream
+        );
+        assert_eq!(
+            start_without_usable_position(InitialSnapshotMode::Auto, false),
+            MemberStart::Snapshot
+        );
+        assert_eq!(
+            start_without_usable_position(InitialSnapshotMode::Always, false),
+            MemberStart::Snapshot
+        );
+    }
+
+    #[test]
+    fn only_a_start_that_loads_nothing_persists_the_head_up_front() {
+        // A loading start's head is persisted by its boundary committer, once
+        // its rows are durably applied. Recording it before they land would let
+        // a crash mid-load resume past base rows that never arrived — so a
+        // rebuild reached with the snapshot disabled must not pick up the
+        // streaming member's up-front save.
+        assert!(
+            !MemberStart::Rebuild.persists_head_before_loading(),
+            "a rebuild's head is persisted by its boundary committer, not before its rows land"
+        );
+        assert!(
+            !MemberStart::Snapshot.persists_head_before_loading(),
+            "a snapshot's head is persisted by its boundary committer, not before its rows land"
+        );
+        assert!(
+            MemberStart::Stream.persists_head_before_loading(),
+            "a member that loads nothing has no committer, so its head must be recorded here or \
+             the next start resumes from an older position"
+        );
     }
 
     #[test]
@@ -2761,7 +3369,7 @@ mod tests {
     /// advances the stream to. When a `ROTATE` contributed the *closing* file's
     /// end offset under the *opening* file's name, an idle member's committed
     /// floor jumped ~1 GiB past the new file's real offsets and `deliver_commit`
-    /// then dropped every following transaction as `already_committed` — with no
+    /// then skipped every following transaction as already delivered — with no
     /// error, no detach, and no backpressure warning, for the rest of the run.
     #[test]
     fn a_rotate_credit_does_not_suppress_the_new_files_commits() {
@@ -2785,7 +3393,7 @@ mod tests {
         let next_commit = pos("binlog.000042", 1_182);
         let slot = ack.slot(&member).expect("registered member has a slot");
         assert!(
-            !slot.already_committed(&next_commit),
+            slot.routes(&next_commit, None),
             "commit at {next_commit} was suppressed as already-applied, so its rows are lost"
         );
     }
@@ -2869,7 +3477,7 @@ mod tests {
         ack.promote_ready_members();
         let slot = ack.slot(&key("db", "a")).expect("slot");
         slot.commit(&pos("binlog.000001", 700));
-        slot.deliver(&pos("binlog.000001", 900));
+        slot.deliver(&pos("binlog.000001", 900), None);
         ack.detach(&key("db", "a"));
         // Rejoin re-resolves the start position from the member's sidecar
         // (layout-checked) and RESETS the slot to it — here a resume at 650,
@@ -2903,7 +3511,7 @@ mod tests {
         // `a` has an in-flight envelope: delivered past committed.
         ack.slot(&key("db", "a"))
             .expect("slot")
-            .deliver(&pos("binlog.000001", 300));
+            .deliver(&pos("binlog.000001", 300), None);
         ack.credit_idle(&pos("binlog.000001", 500), None);
 
         // `b` (idle) was credited to 500; `a` holds the floor at its committed
@@ -2934,13 +3542,14 @@ mod tests {
     fn replayed_older_commits_never_regress() {
         // On a reconnect from the shared min, a member ahead of the min re-sees
         // commits it already applied. `AckSlot::commit` is a monotonic-max, so an
-        // older replayed commit is a no-op, and `already_committed` reports it as
-        // applied so the pump suppresses the re-delivery.
+        // older replayed commit is a no-op, and `routes` skips anything the member
+        // was already delivered.
         let ack = AckTable::default();
         ack.register(&key("db", "a"), pos("binlog.000001", 500), false);
         ack.promote_ready_members();
         let slot = ack.slot(&key("db", "a")).expect("slot");
 
+        slot.deliver(&pos("binlog.000010", 900), None);
         slot.commit(&pos("binlog.000010", 900));
         assert_eq!(slot.committed(), pos("binlog.000010", 900));
 
@@ -2952,11 +3561,142 @@ mod tests {
             "an older replayed commit must not regress the floor"
         );
 
-        // The replay is reported already-applied (suppressed), only a strictly
-        // newer position is not.
-        assert!(slot.already_committed(&pos("binlog.000005", 100)));
-        assert!(slot.already_committed(&pos("binlog.000010", 900)));
-        assert!(!slot.already_committed(&pos("binlog.000010", 901)));
+        // The replay is skipped, and only a strictly newer position is routed.
+        assert!(!slot.routes(&pos("binlog.000005", 100), None));
+        assert!(!slot.routes(&pos("binlog.000010", 900), None));
+        assert!(slot.routes(&pos("binlog.000010", 901), None));
+    }
+
+    /// A reconnect replay must not leave a row at an older version.
+    ///
+    /// Before the connection drops, the member is delivered `t1` and `t2` (both
+    /// changing one row) and has applied neither. The pump reconnects at the
+    /// shared min and replays both. The member's consumer acknowledges `t2` while
+    /// the replay is running. Every commit the member then applies must leave the
+    /// row at its newest version: a replayed `t1` after `t2`, with the replayed
+    /// `t2` dropped, leaves it at `t1`.
+    #[tokio::test]
+    async fn a_reconnect_replay_never_leaves_a_member_on_an_older_commit() {
+        let ack = AckTable::default();
+        let member = key("tpcc", "stock");
+        ack.register(&member, pos("binlog.000001", 100), false);
+        ack.promote_ready_members();
+        let slot = ack.slot(&member).expect("slot");
+        let t1 = pos("binlog.000001", 200);
+        let t2 = pos("binlog.000001", 300);
+
+        // The pump's routing in `deliver_commit`: what the member's channel
+        // receives, in order.
+        let mut channel = Vec::new();
+        let route = |at: &BinlogPosition, channel: &mut Vec<BinlogPosition>| {
+            if slot.routes(at, None) {
+                slot.deliver(at, None);
+                channel.push(at.clone());
+            }
+        };
+
+        route(&t1, &mut channel);
+        route(&t2, &mut channel);
+
+        // The connection drops and the pump reconnects at the shared min.
+        assert_eq!(ack.flush_position(), Some(pos("binlog.000001", 100)));
+        route(&t1, &mut channel);
+        SharedPositionCommitter {
+            slot: Arc::clone(&slot),
+            flush_to: t2.clone(),
+            dataset: "stock".into(),
+            source_commit_ts_ms: None,
+            gtids: Vec::new(),
+        }
+        .commit()
+        .await
+        .expect("the consumer acknowledges t2");
+        route(&t2, &mut channel);
+
+        assert_eq!(
+            channel.last(),
+            Some(&t2),
+            "the member applies {channel:?} in that order, so the row ends at an older commit"
+        );
+        assert_eq!(
+            channel,
+            vec![t1, t2],
+            "a member that stayed attached must not be sent what it already holds"
+        );
+    }
+
+    /// A delivered window dropped without ack is lost unless the member
+    /// re-registers and resets `delivered`.
+    ///
+    /// `routes` assumes every delivered-but-uncommitted envelope is still in
+    /// the member's channel. If the consumer drops `[200, 300]` unacked while
+    /// staying attached (`committed=100`, `delivered=300`), reconnect replay
+    /// from the committed floor routes nothing. Stopping the stream drops the
+    /// receiver, detaches the member, and re-registration resets `delivered`
+    /// with `committed` so the window is sent again.
+    #[test]
+    fn a_discarded_unacked_window_is_replayed_after_reregistration() {
+        let ack = AckTable::default();
+        let member = key("tpcc", "stock");
+        ack.register(&member, pos("binlog.000001", 100), false);
+        ack.promote_ready_members();
+        let slot = ack.slot(&member).expect("slot");
+        let t1 = pos("binlog.000001", 200);
+        let t2 = pos("binlog.000001", 300);
+
+        let mut channel = Vec::new();
+        let route = |at: &BinlogPosition, slot: &AckSlot, channel: &mut Vec<BinlogPosition>| {
+            if slot.routes(at, None) {
+                slot.deliver(at, None);
+                channel.push(at.clone());
+            }
+        };
+
+        route(&t1, &slot, &mut channel);
+        route(&t2, &slot, &mut channel);
+        assert_eq!(channel, vec![t1.clone(), t2.clone()]);
+        assert_eq!(slot.committed(), pos("binlog.000001", 100));
+        assert_eq!(slot.delivered(), t2);
+
+        // Still attached: reconnect replay from the committed floor skips both.
+        channel.clear();
+        route(&t1, &slot, &mut channel);
+        route(&t2, &slot, &mut channel);
+        assert_eq!(
+            channel,
+            Vec::<BinlogPosition>::new(),
+            "an attached member with delivered=300 must not be re-sent [200, 300]"
+        );
+
+        // Stop → receiver dropped → detach holds committed and clears STREAMING.
+        ack.detach(&member);
+        channel.clear();
+        route(&t1, &slot, &mut channel);
+        route(&t2, &slot, &mut channel);
+        assert_eq!(
+            channel,
+            Vec::<BinlogPosition>::new(),
+            "a detached member is not routed"
+        );
+        assert_eq!(
+            ack.committed(&member),
+            Some(pos("binlog.000001", 100)),
+            "detach holds the committed floor"
+        );
+
+        // Re-subscribe resets delivered with committed (sidecar floor).
+        ack.register(&member, pos("binlog.000001", 100), false);
+        ack.promote_ready_members();
+        let slot = ack.slot(&member).expect("revived slot");
+        assert_eq!(slot.delivered(), pos("binlog.000001", 100));
+        channel.clear();
+        route(&t1, &slot, &mut channel);
+        route(&t2, &slot, &mut channel);
+        assert_eq!(
+            channel,
+            vec![t1, t2],
+            "after re-registration the discarded window must be replayed"
+        );
     }
 
     #[tokio::test]
@@ -3081,6 +3821,46 @@ mod tests {
         );
     }
 
+    /// A pump whose thread cannot start runs on the current runtime instead. The failed
+    /// start drops the closure it was given here, on the subscribing task, where dropping a
+    /// runtime panics, so the closure must not carry one.
+    #[tokio::test]
+    async fn a_pump_whose_thread_cannot_start_runs_on_the_current_runtime() {
+        // Nothing listens on a port just released, so the pump's first connection fails at
+        // once instead of reaching a server that happens to run on this machine.
+        let port = std::net::TcpListener::bind("127.0.0.1:0")
+            .and_then(|listener| listener.local_addr())
+            .expect("bind an ephemeral port")
+            .port();
+        let mut params = test_params();
+        params.opts =
+            mysql_async::Opts::from_url(&format!("mysql://user:pass@127.0.0.1:{port}/db"))
+                .expect("parse test connection url");
+        let key = SourceKey {
+            host: "127.0.0.1".to_string(),
+            port,
+            user: "user".to_string(),
+            pass: None,
+            ssl: None,
+            server_id: params.server_id,
+        };
+        let source = Arc::new(SharedSource::new(key, params));
+
+        spawn_pump_with(Arc::clone(&source), |pump| {
+            drop(pump);
+            Err(std::io::Error::other("the test refuses to start a thread"))
+        });
+
+        // With no members, the pump finishes, and marks its source dead, as soon as it runs.
+        tokio::time::timeout(Duration::from_secs(30), async {
+            while !source.dead.load(Ordering::Acquire) {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("the pump should run on the current runtime and finish");
+    }
+
     #[tokio::test]
     async fn deliver_to_member_reports_receiver_gone() {
         // A dropped receiver (dataset stream torn down) must surface as
@@ -3121,7 +3901,7 @@ mod tests {
                 let done = Arc::clone(&done);
                 s.spawn(move || {
                     for p in 2..=N {
-                        slot.deliver(&pos("binlog.000001", p));
+                        slot.deliver(&pos("binlog.000001", p), None);
                         slot.commit(&pos("binlog.000001", p));
                     }
                     done.store(true, Ordering::Release);
@@ -3179,5 +3959,320 @@ mod tests {
             Some(final_committed),
             "floor converged to the member's committed"
         );
+    }
+
+    fn gtid_of(src: &str, gno: u64) -> Gtid {
+        (uuid::Uuid::parse_str(src).expect("uuid"), gno)
+    }
+
+    /// After a failover, the new primary's binlog coordinates do not order
+    /// against the old primary's. A member resumed by GTID still holds the old
+    /// primary's position, so every new-primary commit that sorts below it
+    /// was skipped, and the idle credit then folded its GTID into the executed
+    /// set: the transaction was recorded as applied and never redelivered.
+    #[tokio::test]
+    async fn a_failover_resume_routes_by_gtid_not_by_the_old_servers_position() {
+        let ack = AckTable::default();
+        ack.set_gtid_positioned(true);
+        let member = key("db", "t");
+        // Persisted on the old primary, which had rotated to a later file.
+        ack.register_with_gtid(
+            &member,
+            pos("binlog.000005", 2113),
+            gtids(&format!("{SRC_A}:1-11")),
+            false,
+        );
+        ack.promote_ready_members();
+        let slot = ack.slot(&member).expect("slot");
+
+        // The new primary's first transaction, in its own (lower) file.
+        let at = pos("binlog.000002", 500);
+        let new_txn = gtid_of(SRC_B, 1);
+        assert!(
+            slot.routes(&at, ack.routing_gtid(Some(new_txn))),
+            "a transaction the member never received must be routed"
+        );
+        slot.deliver(&at, Some(new_txn));
+        ack.credit_idle(&at, Some(new_txn));
+        assert!(
+            !slot.gtid_snapshot().contains(new_txn.0, new_txn.1),
+            "an in-flight transaction must not be credited as applied"
+        );
+
+        // A later transaction for another table is credited by GTID while the
+        // member's own envelope is in flight, without the in-flight one.
+        ack.credit_idle(&pos("binlog.000002", 900), Some(gtid_of(SRC_B, 2)));
+        assert_eq!(
+            slot.gtid_snapshot(),
+            gtids(&format!("{SRC_A}:1-11,{SRC_B}:2"))
+        );
+
+        SharedPositionCommitter {
+            slot: Arc::clone(&slot),
+            flush_to: at.clone(),
+            dataset: "t".into(),
+            source_commit_ts_ms: None,
+            gtids: vec![new_txn],
+        }
+        .commit()
+        .await
+        .expect("the consumer acknowledges the transaction");
+        ack.credit_idle(&pos("binlog.000002", 1200), Some(gtid_of(SRC_B, 3)));
+        assert_eq!(
+            slot.gtid_snapshot(),
+            gtids(&format!("{SRC_A}:1-11,{SRC_B}:1-3")),
+            "once idle again, the member is credited"
+        );
+    }
+
+    /// Under GTID positioning the shared dump starts from the intersection of
+    /// the members' executed sets, so a member ahead of it is sent transactions
+    /// it already applied; those are skipped by GTID, whatever their position.
+    #[test]
+    fn a_gtid_positioned_member_skips_what_it_already_holds() {
+        let ack = AckTable::default();
+        ack.set_gtid_positioned(true);
+        let member = key("db", "t");
+        ack.register_with_gtid(
+            &member,
+            pos("binlog.000001", 100),
+            gtids(&format!("{SRC_A}:1-11")),
+            false,
+        );
+        ack.promote_ready_members();
+        let slot = ack.slot(&member).expect("slot");
+
+        let later = pos("binlog.000001", 9000);
+        assert!(!slot.routes(&later, ack.routing_gtid(Some(gtid_of(SRC_A, 5)))));
+        assert!(!slot.routes(&later, ack.routing_gtid(Some(gtid_of(SRC_A, 11)))));
+        assert!(slot.routes(&later, ack.routing_gtid(Some(gtid_of(SRC_A, 12)))));
+
+        // Delivered once, not again on a reconnect replay.
+        slot.deliver(&later, Some(gtid_of(SRC_A, 12)));
+        assert!(!slot.routes(&later, ack.routing_gtid(Some(gtid_of(SRC_A, 12)))));
+    }
+
+    /// Number of ranges in a single-source GTID set's text (`uuid:1-5:7` is 2).
+    fn range_count(set: &GtidSet) -> usize {
+        set.to_string().split(':').count() - 1
+    }
+
+    /// Under GTID positioning, transactions for other tables that pass while a
+    /// member has its own in flight are credited to it by GTID, so its executed
+    /// set has at most one gap per in-flight transaction instead of one per
+    /// passing transaction, and never holds an in-flight one.
+    #[tokio::test]
+    async fn a_busy_member_has_a_gap_only_per_in_flight_transaction() {
+        let ack = AckTable::default();
+        ack.set_gtid_positioned(true);
+        let (ka, kb) = (key("db", "a"), key("db", "b"));
+        let seed = gtids(&format!("{SRC_A}:1"));
+        ack.register_with_gtid(&ka, pos("binlog.000001", 100), seed.clone(), false);
+        ack.register_with_gtid(&kb, pos("binlog.000001", 100), seed, false);
+        ack.promote_ready_members();
+        let slots = [
+            ack.slot(&ka).expect("slot a"),
+            ack.slot(&kb).expect("slot b"),
+        ];
+        let mut in_flight: [std::collections::VecDeque<(BinlogPosition, Gtid)>; 2] =
+            Default::default();
+        let commit =
+            |slot: &Arc<AckSlot>, (at, gtid): (BinlogPosition, Gtid)| SharedPositionCommitter {
+                slot: Arc::clone(slot),
+                flush_to: at,
+                dataset: "t".into(),
+                source_commit_ts_ms: None,
+                gtids: vec![gtid],
+            };
+
+        // Transactions 2..=2001, for `a` and `b` in an uneven interleaving;
+        // each member's consumer keeps up to two transactions in flight.
+        let last = 2001;
+        for gno in 2..=last {
+            let at = pos("binlog.000001", 100 + gno * 100);
+            let gtid = gtid_of(SRC_A, gno);
+            let target = usize::from(gno % 3 == 0);
+            assert!(slots[target].routes(&at, ack.routing_gtid(Some(gtid))));
+            slots[target].deliver(&at, Some(gtid));
+            in_flight[target].push_back((at.clone(), gtid));
+            ack.credit_idle(&at, Some(gtid));
+            for (slot, queue) in slots.iter().zip(&mut in_flight) {
+                if queue.len() > 2 {
+                    let oldest = queue.pop_front().expect("in flight");
+                    commit(slot, oldest).commit().await.expect("commit");
+                }
+                let set = slot.gtid_snapshot();
+                for &(_, (uuid, gno)) in queue.iter() {
+                    assert!(!set.contains(uuid, gno), "in-flight {gno} credited: {set}");
+                }
+                assert!(
+                    range_count(&set) <= queue.len() + 1,
+                    "{} ranges with {} in flight: {set}",
+                    range_count(&set),
+                    queue.len()
+                );
+            }
+        }
+
+        for (slot, queue) in slots.iter().zip(&mut in_flight) {
+            while let Some(oldest) = queue.pop_front() {
+                commit(slot, oldest).commit().await.expect("commit");
+            }
+            assert_eq!(slot.gtid_snapshot(), gtids(&format!("{SRC_A}:1-{last}")));
+        }
+    }
+
+    /// File+offset positioning keeps a busy member's executed set as it is:
+    /// only idle members are credited.
+    #[test]
+    fn a_file_positioned_busy_member_is_not_credited() {
+        let ack = AckTable::default();
+        let member = key("db", "t");
+        ack.register_with_gtid(
+            &member,
+            pos("binlog.000001", 500),
+            gtids(&format!("{SRC_A}:1")),
+            false,
+        );
+        ack.promote_ready_members();
+        let slot = ack.slot(&member).expect("slot");
+        let at = pos("binlog.000001", 600);
+        slot.deliver(&at, Some(gtid_of(SRC_A, 2)));
+        ack.credit_idle(&pos("binlog.000001", 700), Some(gtid_of(SRC_A, 3)));
+        assert_eq!(slot.gtid_snapshot(), gtids(&format!("{SRC_A}:1")));
+    }
+
+    /// File+offset positioning keeps routing by position even when the
+    /// source's events carry GTIDs (`gtid_mode = ON_PERMISSIVE`).
+    #[test]
+    fn a_file_positioned_member_routes_by_position() {
+        let ack = AckTable::default();
+        let member = key("db", "t");
+        ack.register(&member, pos("binlog.000001", 500), false);
+        ack.promote_ready_members();
+        let slot = ack.slot(&member).expect("slot");
+        let gtid = Some(gtid_of(SRC_A, 1));
+        assert!(!slot.routes(&pos("binlog.000001", 400), ack.routing_gtid(gtid)));
+        assert!(slot.routes(&pos("binlog.000001", 600), ack.routing_gtid(gtid)));
+    }
+
+    /// A table map for `db.t` (`BIGINT`, `VARCHAR(64)`) and a rows event, both
+    /// for `table_id`, parsed from their wire bytes. `deliver_commit` hands the
+    /// rows on without decoding them, so the rows event carries none.
+    fn table_events(table_id: u8) -> (Arc<TableMapEvent<'static>>, RowsEventData<'static>) {
+        use mysql_common::binlog::BinlogCtx;
+        use mysql_common::binlog::consts::{BinlogVersion, EventType};
+        use mysql_common::binlog::events::{FormatDescriptionEvent, WriteRowsEvent};
+        use mysql_common::io::ParseBuf;
+        use mysql_common::proto::MyDeserialize;
+
+        let fde = FormatDescriptionEvent::new(BinlogVersion::Version4);
+        // Table id (6 bytes), flags (2), `db` and `t` each NUL-terminated, two
+        // columns typed LONGLONG (8) and VARCHAR (15), the VARCHAR's maximum
+        // length as metadata, and the null bitmap.
+        let table_map = [
+            table_id, 0, 0, 0, 0, 0, 0, 0, 2, b'd', b'b', 0, 1, b't', 0, 2, 8, 15, 2, 64, 0, 0b10,
+        ];
+        let tme = TableMapEvent::deserialize(
+            BinlogCtx::new(table_map.len(), &fde, EventType::TABLE_MAP_EVENT as u8),
+            &mut ParseBuf(&table_map),
+        )
+        .expect("parse the table map")
+        .into_owned();
+        // Table id (6 bytes), flags (2), the extra-data length (2, so none),
+        // two columns, both present.
+        let rows = [table_id, 0, 0, 0, 0, 0, 0, 0, 2, 0, 2, 0b11];
+        let rows = WriteRowsEvent::deserialize(
+            BinlogCtx::new(rows.len(), &fde, EventType::WRITE_ROWS_EVENT as u8),
+            &mut ParseBuf(&rows),
+        )
+        .expect("parse the rows event")
+        .into_owned();
+        (Arc::new(tme), RowsEventData::WriteRowsEvent(rows))
+    }
+
+    /// A shutdown abandons a transaction's delivery at a member whose channel
+    /// stays full, so the members after it are never handed the transaction.
+    /// The pump then still credits the transaction (the idle safe-advance after
+    /// a commit) before it saves every member's position. A member that was
+    /// never handed the transaction must not be credited it, or the restart
+    /// resumes it past changes it never applied.
+    #[tokio::test(start_paused = true)]
+    async fn a_delivery_abandoned_on_shutdown_credits_no_member_the_transaction() {
+        for gtid_positioned in [true, false] {
+            let source = test_source();
+            source.ack.set_gtid_positioned(gtid_positioned);
+            let floor = pos("binlog.000001", 100);
+            let seed = gtids(&format!("{SRC_A}:1"));
+            let position_store = Arc::new(MemoryPositionStore::default());
+            let mut routes = FxHashMap::default();
+            let mut txn = FxHashMap::default();
+            let mut receivers = Vec::new();
+            for (table_id, name) in [(1_u8, "a"), (2, "b")] {
+                let member_key = key("db", name);
+                // Both channels are full, so whichever member the delivery
+                // reaches first stalls until the shutdown abandons it, and the
+                // other is never reached.
+                let (sender, receiver) = mpsc::channel(1);
+                sender
+                    .try_send(Err(StreamError::External("occupies the channel".into())))
+                    .expect("the channel starts empty");
+                receivers.push(receiver);
+                let member = test_member(name, sender, &position_store);
+                lock(&source.members).insert(member_key.clone(), Arc::clone(&member));
+                source
+                    .ack
+                    .register_with_gtid(&member_key, floor.clone(), seed.clone(), false);
+                let (tme, rows) = table_events(table_id);
+                let layout = Arc::clone(&lock(&member.layout));
+                let slot = source.ack.slot(&member_key).expect("slot");
+                routes.insert(
+                    u64::from(table_id),
+                    Route {
+                        key: member_key,
+                        member,
+                        slot,
+                        tme,
+                        layout,
+                    },
+                );
+                txn.insert(u64::from(table_id), vec![rows]);
+            }
+            source.ack.promote_ready_members();
+
+            let commit_pos = pos("binlog.000001", 500);
+            let gtid = gtid_of(SRC_A, 2);
+            // The epoch the pump captured at its start is no longer current:
+            // shutdown has been signalled.
+            let shutdown_epoch = crate::cdc::shutdown_epoch().wrapping_add(1);
+            deliver_commit(
+                &source,
+                &routes,
+                txn,
+                &commit_pos,
+                None,
+                shutdown_epoch,
+                Some(gtid),
+            )
+            .await;
+            // The idle safe-advance the event loop runs after the commit.
+            source.ack.credit_idle(&commit_pos, Some(gtid));
+
+            for route in routes.values() {
+                let name = &route.member.dataset_name;
+                // What `persisted_for` saves.
+                assert_eq!(
+                    route.slot.committed(),
+                    floor,
+                    "{name} (GTID-positioned: {gtid_positioned}) must resume before the transaction"
+                );
+                assert_eq!(
+                    route.slot.gtid_snapshot(),
+                    seed,
+                    "{name} (GTID-positioned: {gtid_positioned}) must not hold the transaction"
+                );
+            }
+            drop(receivers);
+        }
     }
 }

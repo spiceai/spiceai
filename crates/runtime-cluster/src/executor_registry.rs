@@ -20,25 +20,35 @@ limitations under the License.
 //! control streams between schedulers and executors. Schedulers use this
 //! registry to request metrics from executors on-demand.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use arrow::datatypes::SchemaRef;
+use bytes::Bytes;
 use data_components::flightsql::{FlightSQLTable, FlightSqlClient};
 use datafusion::{
     catalog::TableProvider,
+    common::TableReference,
     common::{Statistics, stats::Precision},
-    sql::TableReference,
+    error::{DataFusionError, Result as DataFusionResult},
 };
 use datafusion_expr::{Expr, TableScan};
 use flight_client::cookie::CookieStore;
-use runtime_datafusion::analyzer_rule::TablePartitionProvider;
-use runtime_proto::{Ack, MetricsRequest, MetricsResponse, SchedulerControlMessage};
+use runtime_datafusion::analyzer_rule::{PartitionProviders, TablePartitionProvider};
+use runtime_datafusion::error::SpiceExternalError;
+use runtime_proto::{
+    Ack, BytesArray, MetricsRequest, MetricsResponse, SchedulerControlMessage, UpdatePartitions,
+};
 use snafu::prelude::*;
 use tokio::sync::{RwLock, mpsc};
+use tokio::time::Instant;
 
+use crate::cluster_state::now_ms;
 use crate::correlated::{CorrelatedResponses, CorrelationError, send_correlated};
-use crate::metadata::normalized_table_name;
+use crate::executor_liveness::{ExecutorLiveness, VIEW_RETENTION};
+use crate::executor_processes::{Admission, ExecutorProcessOrder};
+use crate::metadata::{PartitionKey, normalized_table_name, partition_key};
 use crate::{PartitionStore, PartitionValue, executor_selection, metrics};
 
 /// Error type for executor registry operations.
@@ -89,6 +99,10 @@ pub struct ExecutorConnection {
     /// Used by commands (e.g. `UpdatePartitions`) that need delivery
     /// confirmation rather than fire-and-forget.
     pending_acks: CorrelatedResponses<Ack>,
+    /// Per table, the partition expression bytes this connection has acked as
+    /// added by an `UpdatePartitions`, and when. A new connection starts with
+    /// none.
+    delivered: Arc<parking_lot::Mutex<HashMap<String, HashMap<Bytes, Instant>>>>,
 }
 
 impl ExecutorConnection {
@@ -99,6 +113,7 @@ impl ExecutorConnection {
             request_tx,
             pending_metrics: CorrelatedResponses::new(),
             pending_acks: CorrelatedResponses::new(),
+            delivered: Arc::default(),
         }
     }
 
@@ -150,6 +165,24 @@ impl ExecutorConnection {
 
 pub type TablePartitions = HashMap<TableReference, Vec<Expr>>;
 
+/// The partitions of a table one executor process has reported loaded.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct LoadedPartitions {
+    /// The process that loaded them; empty for executors that send no process id.
+    pub process_id: String,
+    pub partitions: HashSet<PartitionKey>,
+}
+
+/// What a scheduler knows of the data executors hold for one accelerated table.
+#[derive(Debug, Default)]
+struct TableCoverage {
+    /// Per executor, the partitions it has reported loaded.
+    loaded: HashMap<String, LoadedPartitions>,
+    /// The partitions of the table when a query last found every partition
+    /// loaded on a ready executor.
+    last_complete: Option<HashSet<PartitionKey>>,
+}
+
 /// Cheap-to-clone handles returned to the control-stream inbound dispatcher
 /// at registration time. Routes correlated executor→scheduler messages
 /// (metrics responses, command acks) to whoever is awaiting them.
@@ -157,6 +190,177 @@ pub type TablePartitions = HashMap<TableReference, Vec<Expr>>;
 pub struct RegisteredHandles {
     pub pending_metrics: CorrelatedResponses<MetricsResponse>,
     pub pending_acks: CorrelatedResponses<Ack>,
+}
+
+/// How a control-stream registration relates to the earlier ones under the same
+/// executor id. Executors name themselves by their instance identity, which is
+/// stable across restarts, and send a per-process id with it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ExecutorRegistration {
+    /// No earlier process is known under this id.
+    New,
+    /// The process that registered last connected again.
+    Reconnected,
+    /// Another process registered under this id: the earlier run is gone, and
+    /// nothing it held — running tasks, shuffle output, loaded partitions — can
+    /// be counted on. Partition assignments follow the id and stay.
+    Restarted,
+    /// A process older than the one registered last connected, so two running
+    /// processes share the id. The connection is not registered.
+    Duplicate,
+}
+
+/// What [`ExecutorRegistry::register`] returns: the handles for the connection
+/// and how it relates to earlier registrations.
+#[derive(Debug, Clone)]
+pub struct Registered {
+    pub handles: RegisteredHandles,
+    pub registration: ExecutorRegistration,
+    /// Identifies this connection to [`ExecutorRegistry::is_current`] and
+    /// [`ExecutorRegistry::unregister`].
+    pub connection: u64,
+}
+
+/// Replaced processes remembered per executor id, so a replaced process that is
+/// still running is recognized when it connects again.
+const REPLACED_PROCESSES_KEPT: usize = 8;
+
+/// The processes seen under one executor id.
+#[derive(Debug, Default)]
+struct ExecutorProcesses {
+    /// The connection registered last, if it is still registered.
+    connection: Option<u64>,
+    /// The process that registered last. Executors that send no process id
+    /// leave this unset.
+    current: Option<String>,
+    /// Processes a later registration replaced, oldest first.
+    replaced: VecDeque<String>,
+    /// The generation each of `current` and `replaced` has in the cluster's
+    /// [`ExecutorProcessOrder`]. A process the order could not be read for has none.
+    generations: HashMap<String, u64>,
+}
+
+impl ExecutorProcesses {
+    /// Whether process `process_id`, at `generation`, started before the known
+    /// process `other`.
+    fn precedes(&self, process_id: &str, generation: Option<u64>, other: &str) -> bool {
+        process_precedes(
+            (process_id, generation),
+            (other, self.generations.get(other).copied()),
+        )
+    }
+
+    /// Whether process `process_id`, at `generation`, started before the
+    /// process that registered `endpoint`.
+    fn precedes_endpoint(
+        &self,
+        process_id: &str,
+        generation: Option<u64>,
+        endpoint: &FlightEndpoint,
+    ) -> bool {
+        process_precedes((process_id, generation), self.endpoint_process(endpoint))
+    }
+
+    /// Whether the process that registered `endpoint` started before the known
+    /// process `process_id`.
+    fn endpoint_precedes(&self, endpoint: &FlightEndpoint, process_id: &str) -> bool {
+        process_precedes(
+            self.endpoint_process(endpoint),
+            (process_id, self.generations.get(process_id).copied()),
+        )
+    }
+
+    fn endpoint_process<'a>(&self, endpoint: &'a FlightEndpoint) -> (&'a str, Option<u64>) {
+        (
+            &endpoint.process_id,
+            endpoint
+                .generation
+                .or_else(|| self.generations.get(&endpoint.process_id).copied()),
+        )
+    }
+
+    fn push_replaced(&mut self, process_id: String) {
+        if self.replaced.len() == REPLACED_PROCESSES_KEPT
+            && let Some(forgotten) = self.replaced.pop_front()
+        {
+            self.generations.remove(&forgotten);
+        }
+        self.replaced.push_back(process_id);
+    }
+
+    fn is_known(&self, process_id: &str) -> bool {
+        self.current.as_deref() == Some(process_id)
+            || self.replaced.iter().any(|replaced| replaced == process_id)
+    }
+}
+
+/// An executor's `FlightSQL` endpoint.
+#[derive(Debug, Clone)]
+struct FlightEndpoint {
+    /// `host:port`, without a scheme.
+    address: String,
+    /// The process that registered the endpoint; empty for executors that send
+    /// no process id.
+    process_id: String,
+    /// The process's generation in the cluster's [`ExecutorProcessOrder`], if
+    /// known, so the endpoint is ordered before its process registers.
+    generation: Option<u64>,
+}
+
+/// Whether process `earlier` started before process `later`, each given by its
+/// id and its generation in the cluster's order: by the generations when both
+/// have one, else by id, as process ids sort by the creation time their host's
+/// clock read.
+fn process_precedes(earlier: (&str, Option<u64>), later: (&str, Option<u64>)) -> bool {
+    match (earlier.1, later.1) {
+        (Some(earlier), Some(later)) => earlier < later,
+        _ => earlier.0 < later.0,
+    }
+}
+
+/// Classifies a registration by the process it comes from and updates `seen`.
+/// `admission` is where a process `seen` does not know stands in the cluster's
+/// order. `was_connected` says whether a connection is registered under the id.
+fn classify_registration(
+    seen: &mut ExecutorProcesses,
+    process_id: &str,
+    admission: Option<Admission>,
+    was_connected: bool,
+) -> ExecutorRegistration {
+    if process_id.is_empty() {
+        return if was_connected {
+            ExecutorRegistration::Reconnected
+        } else {
+            ExecutorRegistration::New
+        };
+    }
+    // A process older than the one registered last is still running alongside
+    // it, whatever order they connect in.
+    if seen.replaced.iter().any(|replaced| replaced == process_id) {
+        return ExecutorRegistration::Duplicate;
+    }
+    let generation = admission.map(|admission| admission.generation);
+    let superseded = admission.is_some_and(|admission| admission.superseded)
+        || seen
+            .current
+            .as_deref()
+            .is_some_and(|current| seen.precedes(process_id, generation, current));
+    if let Some(generation) = generation {
+        seen.generations.insert(process_id.to_string(), generation);
+    }
+    // A duplicate is remembered as replaced, so its endpoint is refused too.
+    if superseded {
+        seen.push_replaced(process_id.to_string());
+        return ExecutorRegistration::Duplicate;
+    }
+    match seen.current.replace(process_id.to_string()) {
+        None => ExecutorRegistration::New,
+        Some(previous) if previous == process_id => ExecutorRegistration::Reconnected,
+        Some(previous) => {
+            seen.push_replaced(previous);
+            ExecutorRegistration::Restarted
+        }
+    }
 }
 
 /// Append-only log of DDL SQL statements applied to the cluster.
@@ -262,10 +466,22 @@ pub struct ExecutorRegistry {
     /// Map of `executor_id` -> connection
     connections: Arc<RwLock<HashMap<String, ExecutorConnection>>>,
 
+    /// Map of `executor_id` -> the processes seen under it. Locked only while
+    /// `connections` is write-locked, or on its own for reads.
+    processes: Arc<parking_lot::Mutex<HashMap<String, ExecutorProcesses>>>,
+
+    /// Source of the ids in [`Registered::connection`].
+    next_connection: Arc<AtomicU64>,
+
     /// Map of `executor_id` -> `FlightSqlClient`
     /// An executor may be in `connections` and not in `flight_sql_clients` (e.g. during initial connection).
     /// An executor with a `FlightSqlClient` is considered "ready" — the scheduler can route queries to it.
     flight_sql_clients: Arc<RwLock<HashMap<String, FlightSqlClient>>>,
+
+    /// Map of `executor_id` -> where its `FlightSqlClient` connects and which
+    /// process registered it. Changed only while `flight_sql_clients` is
+    /// write-locked.
+    flight_sql_endpoints: Arc<parking_lot::RwLock<HashMap<String, FlightEndpoint>>>,
 
     /// Map of `executor_id` -> table partitions for that executor
     partitions: Arc<RwLock<HashMap<String, TablePartitions>>>,
@@ -295,8 +511,15 @@ pub struct ExecutorRegistry {
     executor_statistics:
         Arc<parking_lot::RwLock<HashMap<String, HashMap<String, ExecutorTableStatistics>>>>,
 
+    /// Per accelerated table (by [`normalized_table_name`]), the partitions
+    /// executors have reported loaded. Queries route by it.
+    coverage: Arc<parking_lot::RwLock<HashMap<String, TableCoverage>>>,
+
     /// Append-only log of DDL SQL statements applied to the cluster.
     ddl_log: Arc<RwLock<DdlLog>>,
+
+    /// The order executor processes registered in, shared by the schedulers.
+    process_order: Arc<ExecutorProcessOrder>,
 
     /// Scheduler's `<host>:<port>` identity, used as the `node_id` attribute on
     /// cluster metrics recorded from this registry. `None` when metrics
@@ -329,14 +552,22 @@ impl ExecutorRegistry {
         federated_partition_store: Arc<PartitionStore>,
         node_id: Option<Arc<str>>,
     ) -> Self {
+        let process_order = Arc::new(ExecutorProcessOrder::new(
+            accelerations_partition_store.cluster_state(),
+        ));
         Self {
             connections: Arc::new(RwLock::new(HashMap::new())),
+            processes: Arc::new(parking_lot::Mutex::new(HashMap::new())),
+            next_connection: Arc::new(AtomicU64::new(1)),
             flight_sql_clients: Arc::new(RwLock::new(HashMap::new())),
+            flight_sql_endpoints: Arc::new(parking_lot::RwLock::new(HashMap::new())),
             partitions: Arc::new(RwLock::new(HashMap::new())),
             accelerations_partition_store,
             federated_partition_store,
             executor_statistics: Arc::new(parking_lot::RwLock::new(HashMap::new())),
+            coverage: Arc::default(),
             ddl_log: Arc::new(RwLock::new(DdlLog::default())),
+            process_order,
             node_id,
         }
     }
@@ -437,23 +668,43 @@ impl ExecutorRegistry {
             .to_vec()
     }
 
-    /// Registers an executor connection.
+    /// Registers the control-stream connection of the executor `executor_id`
+    /// whose process sent `process_id` (empty for executors that send none).
     ///
-    /// If an executor with the same ID is already registered, the old connection
-    /// is replaced (the executor reconnected).
+    /// The connection replaces any earlier one under the same id, except for a
+    /// [`ExecutorRegistration::Duplicate`], which is not registered.
     pub async fn register(
         &self,
         executor_id: String,
+        process_id: &str,
         request_tx: mpsc::Sender<SchedulerControlMessage>,
-    ) -> RegisteredHandles {
+    ) -> Registered {
         let connection = ExecutorConnection::new(request_tx);
         let handles = RegisteredHandles {
             pending_metrics: connection.pending_metrics(),
             pending_acks: connection.pending_acks(),
         };
+        let connection_id = self.next_connection.fetch_add(1, Ordering::Relaxed);
+        let admission = self.admit(&executor_id, process_id).await;
 
         let mut connections = self.connections.write().await;
         let is_reconnect = connections.contains_key(&executor_id);
+        let registration = {
+            let mut processes = self.processes.lock();
+            let seen = processes.entry(executor_id.clone()).or_default();
+            let registration = classify_registration(seen, process_id, admission, is_reconnect);
+            if registration != ExecutorRegistration::Duplicate {
+                seen.connection = Some(connection_id);
+            }
+            registration
+        };
+        if registration == ExecutorRegistration::Duplicate {
+            return Registered {
+                handles,
+                registration,
+                connection: connection_id,
+            };
+        }
         if is_reconnect {
             tracing::debug!("Executor {executor_id} reconnected, replacing existing connection");
         } else {
@@ -469,15 +720,201 @@ impl ExecutorRegistry {
             }
         }
 
-        handles
+        // The earlier run's endpoint may be gone, and the new process has not
+        // loaded its partitions yet, so it is not ready until it registers its
+        // own endpoint.
+        if registration == ExecutorRegistration::Restarted {
+            let mut clients = self.flight_sql_clients.write().await;
+            let processes = self.processes.lock();
+            let mut endpoints = self.flight_sql_endpoints.write();
+            if let Some(seen) = processes.get(&executor_id)
+                && endpoints
+                    .get(&executor_id)
+                    .is_some_and(|endpoint| seen.endpoint_precedes(endpoint, process_id))
+            {
+                clients.remove(&executor_id);
+                endpoints.remove(&executor_id);
+            }
+        }
+
+        Registered {
+            handles,
+            registration,
+            connection: connection_id,
+        }
     }
 
-    /// Unregisters an executor and removes it from all three tracking maps.
-    pub async fn unregister(&self, executor_id: &str) {
-        if self.connections.write().await.remove(executor_id).is_some() {
+    /// Where `process_id` stands in the cluster's order of the processes under
+    /// `executor_id`, recording it when it is new. `None` for an empty process
+    /// id, a process this scheduler already knows, or when the order cannot be
+    /// read or written; the process is then ordered by its id.
+    async fn admit(&self, executor_id: &str, process_id: &str) -> Option<Admission> {
+        if process_id.is_empty()
+            || self
+                .processes
+                .lock()
+                .get(executor_id)
+                .is_some_and(|seen| seen.is_known(process_id))
+        {
+            return None;
+        }
+        let now_ms = now_ms().unwrap_or_default();
+        // An executor's history is removed only when no scheduler's kept view
+        // lists it, whatever the schedulers' publishing interval; when the views
+        // cannot be read, none is.
+        let mut connected: HashSet<String> =
+            self.connections.read().await.keys().cloned().collect();
+        let others_known = match ExecutorLiveness::new(
+            self.accelerations_partition_store.cluster_state(),
+        )
+        .live_executors(now_ms, VIEW_RETENTION)
+        .await
+        {
+            Ok(live) => {
+                connected.extend(live);
+                true
+            }
+            Err(err) => {
+                tracing::debug!(
+                    "Failed to read the executors other schedulers have connected, so no executor's process history is removed: {err}"
+                );
+                false
+            }
+        };
+        let is_connected = |id: &str| !others_known || connected.contains(id);
+        // The current process has no generation when the order could not be
+        // read as it registered. If another scheduler recorded it, that
+        // generation orders it; if none did, it registered while the order was
+        // unreadable, before any process the order records, so it is the oldest.
+        let incumbent = self.processes.lock().get(executor_id).and_then(|seen| {
+            seen.current
+                .clone()
+                .filter(|current| !current.is_empty() && !seen.generations.contains_key(current))
+        });
+        if let Some(incumbent) = incumbent
+            && let Ok(recorded) = self
+                .process_order
+                .recorded_generation(executor_id, &incumbent)
+                .await
+            && let Some(seen) = self.processes.lock().get_mut(executor_id)
+            && seen.is_known(&incumbent)
+        {
+            seen.generations.insert(incumbent, recorded.unwrap_or(0));
+        }
+        // Likewise for an endpoint whose process has not registered here.
+        let endpoint_owner = self
+            .flight_sql_endpoints
+            .read()
+            .get(executor_id)
+            .filter(|endpoint| {
+                endpoint.generation.is_none()
+                    && !endpoint.process_id.is_empty()
+                    && endpoint.process_id != process_id
+            })
+            .map(|endpoint| endpoint.process_id.clone());
+        if let Some(owner) = endpoint_owner
+            && let Ok(recorded) = self
+                .process_order
+                .recorded_generation(executor_id, &owner)
+                .await
+            && let Some(endpoint) = self
+                .flight_sql_endpoints
+                .write()
+                .get_mut(executor_id)
+                .filter(|endpoint| endpoint.process_id == owner && endpoint.generation.is_none())
+        {
+            endpoint.generation = Some(recorded.unwrap_or(0));
+        }
+        match self
+            .process_order
+            .admit(executor_id, process_id, now_ms, is_connected)
+            .await
+        {
+            Ok(admission) => Some(admission),
+            Err(err) => {
+                // An endpoint the process registered first carries the
+                // generation the order gave it.
+                let endpoint_generation = self
+                    .flight_sql_endpoints
+                    .read()
+                    .get(executor_id)
+                    .filter(|endpoint| endpoint.process_id == process_id)
+                    .and_then(|endpoint| endpoint.generation);
+                if let Some(generation) = endpoint_generation {
+                    return Some(Admission {
+                        generation,
+                        superseded: false,
+                    });
+                }
+                tracing::warn!(
+                    "Failed to record the start of a process of executor {executor_id} in the cluster state, so it is ordered against the executor's other processes by its id, which depends on its host's clock: {err}"
+                );
+                None
+            }
+        }
+    }
+
+    /// Whether `connection` is the registered connection of `executor_id`. A
+    /// connection stops being current when a later one under the same id
+    /// replaces it.
+    #[must_use]
+    pub fn is_current(&self, executor_id: &str, connection: u64) -> bool {
+        self.processes
+            .lock()
+            .get(executor_id)
+            .is_some_and(|seen| seen.connection == Some(connection))
+    }
+
+    /// Unregisters `executor_id` and removes it from all three tracking maps,
+    /// if `connection` is still its registered connection. Returns whether it
+    /// was: a connection that a later one replaced leaves the executor alone.
+    ///
+    /// A later process under the same id may already have registered its Flight
+    /// endpoint before its control stream connects; that endpoint, and the
+    /// executor's other state, are then left for the later process.
+    pub async fn unregister(&self, executor_id: &str, connection: u64) -> bool {
+        let mut connections = self.connections.write().await;
+        let process_id = {
+            let mut processes = self.processes.lock();
+            match processes.get_mut(executor_id) {
+                Some(seen) if seen.connection == Some(connection) => {
+                    seen.connection = None;
+                    seen.current.clone().unwrap_or_default()
+                }
+                _ => return false,
+            }
+        };
+        if connections.remove(executor_id).is_some() {
             tracing::debug!("Executor {executor_id} disconnected");
         }
-        self.flight_sql_clients.write().await.remove(executor_id);
+        // Held while `connections` is, so no endpoint registers between the
+        // check above and its removal below.
+        let successor_registered = {
+            let mut clients = self.flight_sql_clients.write().await;
+            let processes = self.processes.lock();
+            let mut endpoints = self.flight_sql_endpoints.write();
+            let successor_registered = processes.get(executor_id).is_some_and(|seen| {
+                endpoints.get(executor_id).is_some_and(|endpoint| {
+                    seen.precedes_endpoint(
+                        &process_id,
+                        seen.generations.get(&process_id).copied(),
+                        endpoint,
+                    )
+                })
+            });
+            if !successor_registered {
+                clients.remove(executor_id);
+                endpoints.remove(executor_id);
+            }
+            successor_registered
+        };
+        drop(connections);
+        if let Some(node_id) = self.node_id.as_deref() {
+            metrics::set_scheduler_executor_active_connection(node_id, executor_id, false);
+        }
+        if successor_registered {
+            return true;
+        }
         self.partitions.write().await.remove(executor_id);
 
         // Drop the disconnected executor's reported statistics across all tables
@@ -489,10 +926,7 @@ impl ExecutorRegistry {
             }
             stats.retain(|_, table_stats| !table_stats.is_empty());
         }
-
-        if let Some(node_id) = self.node_id.as_deref() {
-            metrics::set_scheduler_executor_active_connection(node_id, executor_id, false);
-        }
+        true
     }
 
     /// Returns `true` if at least one executor has an active `FlightSqlClient`.
@@ -505,12 +939,62 @@ impl ExecutorRegistry {
         self.flight_sql_clients.read().await.clone()
     }
 
-    /// Inserts or replaces the `FlightSqlClient` for `executor_id`.
-    pub async fn insert_flight_sql_client(&self, executor_id: String, client: FlightSqlClient) {
-        self.flight_sql_clients
-            .write()
-            .await
-            .insert(executor_id, client);
+    /// Inserts or replaces the `FlightSqlClient` for `executor_id`, which
+    /// connects to `address` (`host:port`) and was registered by the executor
+    /// process `process_id` (empty for executors that send none). Returns
+    /// `false`, inserting nothing, when a later process under the same id
+    /// is newer than `process_id`, by its control stream or its endpoint: an
+    /// earlier process's endpoint must not displace its successor's, whichever
+    /// arrives first.
+    pub async fn insert_flight_sql_client(
+        &self,
+        executor_id: String,
+        address: String,
+        process_id: &str,
+        client: FlightSqlClient,
+    ) -> bool {
+        // An endpoint can arrive before its process's control stream registers.
+        let admission = self.admit(&executor_id, process_id).await;
+        let mut clients = self.flight_sql_clients.write().await;
+        // Older than the process registered last (a replaced run or a refused
+        // duplicate), or older than the process whose endpoint is registered.
+        let (superseded, generation) = if process_id.is_empty() {
+            (false, None)
+        } else {
+            let processes = self.processes.lock();
+            let unseen = ExecutorProcesses::default();
+            let seen = processes.get(&executor_id).unwrap_or(&unseen);
+            let generation = admission
+                .map(|admission| admission.generation)
+                .or_else(|| seen.generations.get(process_id).copied());
+            let superseded = admission.is_some_and(|admission| admission.superseded)
+                || seen.replaced.iter().any(|replaced| replaced == process_id)
+                || seen
+                    .current
+                    .as_deref()
+                    .is_some_and(|current| seen.precedes(process_id, generation, current))
+                || self
+                    .flight_sql_endpoints
+                    .read()
+                    .get(&executor_id)
+                    .is_some_and(|endpoint| {
+                        seen.precedes_endpoint(process_id, generation, endpoint)
+                    });
+            (superseded, generation)
+        };
+        if superseded {
+            return false;
+        }
+        self.flight_sql_endpoints.write().insert(
+            executor_id.clone(),
+            FlightEndpoint {
+                address,
+                process_id: process_id.to_string(),
+                generation,
+            },
+        );
+        clients.insert(executor_id, client);
+        true
     }
 
     /// Replaces the cached `TablePartitions` for `executor_id`.
@@ -558,16 +1042,19 @@ impl ExecutorRegistry {
         connections.keys().cloned().collect()
     }
 
-    /// Best-effort SYNCHRONOUS snapshot of ready executor IDs (`host:port`, no
-    /// scheme — the same form `executor_table` expects after prepending a
-    /// scheme). Returns empty if the lock is momentarily contended. Used by the
-    /// broadcast-join physical optimizer rule, which runs in a sync planning
-    /// context and cannot await.
+    /// Best-effort SYNCHRONOUS snapshot of ready executors' addresses
+    /// (`host:port`, no scheme — the same form `executor_table` expects after
+    /// prepending a scheme). Returns empty if the lock is momentarily contended.
+    /// Used by the broadcast-join physical optimizer rule, which runs in a sync
+    /// planning context and cannot await.
     #[must_use]
-    pub fn ready_executor_ids_sync(&self) -> Vec<String> {
-        match self.flight_sql_clients.try_read() {
-            Ok(clients) => clients.keys().cloned().collect(),
-            Err(_) => Vec::new(),
+    pub fn ready_executor_addresses_sync(&self) -> Vec<String> {
+        match self.flight_sql_endpoints.try_read() {
+            Some(endpoints) => endpoints
+                .values()
+                .map(|endpoint| endpoint.address.clone())
+                .collect(),
+            None => Vec::new(),
         }
     }
 
@@ -601,27 +1088,14 @@ impl ExecutorRegistry {
             };
             (connection.request_tx.clone(), connection.pending_acks())
         };
-
-        match send_correlated(&request_tx, &pending_acks, build_command, Some(timeout)).await {
-            Ok(ack) => match ack.error {
-                Some(error) if !error.is_empty() => Err(Error::AckFailed {
-                    executor_id: executor_id.to_string(),
-                    error,
-                }),
-                _ => Ok(()),
-            },
-            Err(CorrelationError::SendFailed) => Err(Error::SendFailed {
-                executor_id: executor_id.to_string(),
-            }),
-            Err(CorrelationError::Cancelled) => Err(Error::ReceiveFailed {
-                executor_id: executor_id.to_string(),
-                reason: "ack channel closed".to_string(),
-            }),
-            Err(CorrelationError::Timeout { duration }) => Err(Error::AckTimeout {
-                executor_id: executor_id.to_string(),
-                duration,
-            }),
-        }
+        send_ack(
+            executor_id,
+            &request_tx,
+            &pending_acks,
+            build_command,
+            timeout,
+        )
+        .await
     }
 
     /// Sends a control message to a specific executor without waiting for
@@ -685,6 +1159,7 @@ impl ExecutorRegistry {
                     request_tx,
                     pending_metrics,
                     pending_acks: CorrelatedResponses::new(),
+                    delivered: Arc::default(),
                 };
                 let result = temp_connection.request_metrics(&executor_id).await;
                 (executor_id, result)
@@ -720,35 +1195,254 @@ impl ExecutorRegistry {
         }
     }
 
+    /// Records, for an accelerated table, the partitions each executor process
+    /// has reported loaded. A query reads a partition only from an executor
+    /// whose current process reported it loaded.
+    pub fn set_loaded_partitions(
+        &self,
+        table: &TableReference,
+        loaded: HashMap<String, LoadedPartitions>,
+    ) {
+        self.coverage
+            .write()
+            .entry(normalized_table_name(table))
+            .or_default()
+            .loaded = loaded;
+    }
+
+    /// The process registered last under `executor_id`; empty when it sent none.
+    #[must_use]
+    pub fn current_process(&self, executor_id: &str) -> String {
+        self.processes
+            .lock()
+            .get(executor_id)
+            .and_then(|seen| seen.current.clone())
+            .unwrap_or_default()
+    }
+
+    /// The partition expression bytes of `table` that the registered connection
+    /// of `executor_id` has acked as added, and when it acked each.
+    pub async fn delivered_partitions(
+        &self,
+        executor_id: &str,
+        table: &str,
+    ) -> HashMap<Bytes, Instant> {
+        let connections = self.connections.read().await;
+        connections
+            .get(executor_id)
+            .and_then(|connection| connection.delivered.lock().get(table).cloned())
+            .unwrap_or_default()
+    }
+
+    /// Sends `executor_id` an `UpdatePartitions` that adds `added` and removes
+    /// `removed` partitions of `table`, and waits for its ack. Once acked, the
+    /// connection it went out on counts `added` as delivered and `removed` as
+    /// no longer delivered.
+    ///
+    /// # Errors
+    ///
+    /// See [`Self::send_command_with_ack`].
+    pub async fn send_partition_update(
+        &self,
+        executor_id: &str,
+        table: &str,
+        added: &[Bytes],
+        removed: &[Bytes],
+        timeout: std::time::Duration,
+    ) -> Result<()> {
+        let (request_tx, pending_acks, delivered) = {
+            let connections = self.connections.read().await;
+            let Some(connection) = connections.get(executor_id) else {
+                return Err(Error::ExecutorNotRegistered {
+                    executor_id: executor_id.to_string(),
+                });
+            };
+            (
+                connection.request_tx.clone(),
+                connection.pending_acks(),
+                Arc::clone(&connection.delivered),
+            )
+        };
+        let items = |partitions: &[Bytes]| {
+            if partitions.is_empty() {
+                HashMap::new()
+            } else {
+                HashMap::from([(
+                    table.to_string(),
+                    BytesArray {
+                        items: partitions.iter().map(|b| b.to_vec()).collect(),
+                    },
+                )])
+            }
+        };
+        let (new_partitions, removed_partitions) = (items(added), items(removed));
+        let build = move |request_id| SchedulerControlMessage {
+            message: Some(
+                runtime_proto::scheduler_control_message::Message::UpdatePartitions(
+                    UpdatePartitions {
+                        new_partitions,
+                        removed_partitions,
+                        request_id,
+                    },
+                ),
+            ),
+        };
+        send_ack(executor_id, &request_tx, &pending_acks, build, timeout).await?;
+        let now = Instant::now();
+        let mut delivered = delivered.lock();
+        let table_delivered = delivered.entry(table.to_string()).or_default();
+        table_delivered.extend(added.iter().map(|bytes| (bytes.clone(), now)));
+        for bytes in removed {
+            table_delivered.remove(bytes);
+        }
+        Ok(())
+    }
+
     /// Resolves a table's partitions using the accelerations partition store and returns
     /// one `FlightSQL` table provider per selected executor. The caller decides whether the
     /// table should actually be partitioned (e.g. `AcceleratedPartitionProvider` checks
     /// `AcceleratedTable` downcast in the runtime crate).
-    #[must_use]
+    ///
+    /// `discovered` says whether the table's partitions come from discovery (a
+    /// spicepod dataset or view with `partition_by`): such a table without
+    /// partition metadata has not been discovered yet, and its query fails. Any
+    /// other accelerated table without partition metadata is read from one
+    /// executor.
+    ///
+    /// # Errors
+    ///
+    /// See [`get_partitions_from_store`].
     pub fn resolve_accelerated_partitions(
         &self,
         table: &TableReference,
         schema: &SchemaRef,
-    ) -> Vec<(Arc<dyn TableProvider>, Vec<PartitionValue>)> {
-        let Ok(connections) = self.connections.try_read() else {
-            tracing::warn!("Failed to acquire read lock on connections");
-            return Vec::new();
-        };
-        let Ok(flight_sql_clients) = self.flight_sql_clients.try_read() else {
-            tracing::warn!("Failed to acquire read lock on flight_sql_clients");
-            return Vec::new();
+        discovered: bool,
+    ) -> DataFusionResult<PartitionProviders> {
+        let (Ok(connections), Ok(flight_sql_clients)) = (
+            self.connections.try_read(),
+            self.flight_sql_clients.try_read(),
+        ) else {
+            return Err(executors_changing(table));
         };
         let executors = ready_executors(&connections, &flight_sql_clients);
         let executor_statistics = self.executor_statistics_snapshot(table);
-        get_partitions_from_store(
-            &self.accelerations_partition_store,
-            &executors,
-            table,
-            schema,
-            &executor_statistics,
-            self.node_id.as_deref(),
-        )
+        let current: HashMap<String, String> = {
+            let processes = self.processes.lock();
+            executors
+                .keys()
+                .map(|id| {
+                    let process = processes
+                        .get(id)
+                        .and_then(|seen| seen.current.clone())
+                        .unwrap_or_default();
+                    (id.clone(), process)
+                })
+                .collect()
+        };
+        let key = normalized_table_name(table);
+        let routed = {
+            let coverage = self.coverage.read();
+            let gate = LoadGate {
+                coverage: coverage.get(&key),
+                current: &current,
+                discovered,
+            };
+            get_partitions_from_store(
+                &self.accelerations_partition_store,
+                &executors,
+                table,
+                schema,
+                &executor_statistics,
+                self.node_id.as_deref(),
+                Some(&gate),
+            )?
+        };
+        if let Some(complete) = routed.complete {
+            self.coverage.write().entry(key).or_default().last_complete = Some(complete);
+        }
+        Ok(routed.providers)
     }
+}
+
+/// Lets a query read a partition only from an executor whose current process
+/// reported it loaded.
+struct LoadGate<'a> {
+    coverage: Option<&'a TableCoverage>,
+    /// The current process of each ready executor.
+    current: &'a HashMap<String, String>,
+    /// Whether the table's partitions come from discovery, so a table without
+    /// partition metadata has not been discovered yet.
+    discovered: bool,
+}
+
+impl LoadGate<'_> {
+    /// The partitions the current process of `executor_id` reported loaded.
+    fn loaded(&self, executor_id: &str) -> Option<&HashSet<PartitionKey>> {
+        let loaded = self.coverage?.loaded.get(executor_id)?;
+        (self.current.get(executor_id) == Some(&loaded.process_id)).then_some(&loaded.partitions)
+    }
+
+    /// Whether every partition of the last set read whole is still `covered`,
+    /// so a query reads that complete set while the partitions added since
+    /// load. A partition of that set that was removed or is no longer loaded
+    /// means the rows it held may now be in a partition that has not loaded.
+    fn can_skip(&self, covered: &HashSet<PartitionKey>) -> bool {
+        self.coverage
+            .and_then(|coverage| coverage.last_complete.as_ref())
+            .is_some_and(|complete| complete.is_subset(covered))
+    }
+}
+
+/// Partitions resolved for one table scan.
+struct Routed {
+    providers: PartitionProviders,
+    /// With a [`LoadGate`], the table's partitions when every one of them was
+    /// loaded on a ready executor.
+    complete: Option<HashSet<PartitionKey>>,
+}
+
+/// A routing failure a later retry can overcome.
+fn partitions_unavailable(message: String) -> DataFusionError {
+    DataFusionError::External(SpiceExternalError::partitions_unavailable(message))
+}
+
+/// Sends the command `build_command` makes on `request_tx` and waits for the
+/// executor's ack on `pending_acks`.
+async fn send_ack(
+    executor_id: &str,
+    request_tx: &mpsc::Sender<SchedulerControlMessage>,
+    pending_acks: &CorrelatedResponses<Ack>,
+    build_command: impl FnOnce(String) -> SchedulerControlMessage + Send,
+    timeout: std::time::Duration,
+) -> Result<()> {
+    match send_correlated(request_tx, pending_acks, build_command, Some(timeout)).await {
+        Ok(ack) => match ack.error {
+            Some(error) if !error.is_empty() => Err(Error::AckFailed {
+                executor_id: executor_id.to_string(),
+                error,
+            }),
+            _ => Ok(()),
+        },
+        Err(CorrelationError::SendFailed) => Err(Error::SendFailed {
+            executor_id: executor_id.to_string(),
+        }),
+        Err(CorrelationError::Cancelled) => Err(Error::ReceiveFailed {
+            executor_id: executor_id.to_string(),
+            reason: "ack channel closed".to_string(),
+        }),
+        Err(CorrelationError::Timeout { duration }) => Err(Error::AckTimeout {
+            executor_id: executor_id.to_string(),
+            duration,
+        }),
+    }
+}
+
+/// The error for a query planned while an executor connects or disconnects. Planning cannot
+/// wait for the registry's locks, and a partial executor list would drop rows.
+fn executors_changing(table: &TableReference) -> DataFusionError {
+    partitions_unavailable(format!(
+        "Cannot query {table}: the scheduler's executors are changing; retry the query"
+    ))
 }
 
 /// Returns executors that have both an active connection and a `FlightSQL` client.
@@ -781,7 +1475,8 @@ pub(crate) fn flight_sql_table_provider(
             schema,
             Arc::new(CookieStore::new()),
         )
-        .with_statistics(statistics),
+        .with_statistics(statistics)
+        .with_spice_sql(true),
     ) as Arc<dyn TableProvider>
 }
 
@@ -818,16 +1513,46 @@ fn stamp_executor_statistics(
     statistics
 }
 
-pub(crate) fn get_partitions_from_store(
+/// Returns an empty list only when the table's partition metadata lists no
+/// partitions, or, with a `gate`, none that a query can read yet.
+///
+/// With a `gate`, a partition is read only from an executor whose current process
+/// reported it loaded, and only from an executor that has not loaded a partition
+/// the table assigns to another executor (its scan would return those rows too).
+/// A partition no ready executor has loaded fails the query, unless it is newer
+/// than the last time the whole table was loaded: the query then reads that
+/// complete set, as a single node reads its last refresh while the next one
+/// loads.
+///
+/// # Errors
+///
+/// Returns an error when the table has no partition metadata and `gate` says its
+/// partitions come from discovery, or when no ready executor serves the table, or
+/// one of its partitions.
+fn get_partitions_from_store(
     partition_store: &PartitionStore,
     executors: &HashMap<String, (&ExecutorConnection, &FlightSqlClient)>,
     table: &TableReference,
     schema: &SchemaRef,
     executor_statistics: &HashMap<String, ExecutorTableStatistics>,
     node_id: Option<&str>,
-) -> Vec<(Arc<dyn TableProvider>, Vec<PartitionValue>)> {
+    gate: Option<&LoadGate<'_>>,
+) -> DataFusionResult<Routed> {
     let Some(table_metadata) = partition_store.get_cached_table_metadata(table) else {
+        if gate.is_some_and(|gate| gate.discovered) {
+            if let Some(node_id) = node_id {
+                metrics::record_query_planning_failure(
+                    node_id,
+                    metrics::PlanningFailure::MissingPartitions,
+                );
+            }
+            return Err(partitions_unavailable(format!(
+                "Cannot query {table}: its partitions have not been discovered yet; retry the query"
+            )));
+        }
         // No partition metadata — route to a single live executor to avoid duplicate results.
+        // A table whose executors each hold all of it, such as an accelerated
+        // table created by DDL.
         let Some((executor_id, (_, client))) = executors.iter().min_by_key(|(id, _)| id.as_str())
         else {
             tracing::warn!(
@@ -839,7 +1564,9 @@ pub(crate) fn get_partitions_from_store(
                     metrics::PlanningFailure::NoExecutors,
                 );
             }
-            return Vec::new();
+            return Err(partitions_unavailable(format!(
+                "Cannot query {table}: no ready executor serves it"
+            )));
         };
 
         if let Some(node_id) = node_id {
@@ -849,99 +1576,164 @@ pub(crate) fn get_partitions_from_store(
         // so the coordinator can size joins even on this no-partition-metadata
         // fallback path (previously this passed `None`, silently degrading plans).
         let statistics = stamp_executor_statistics(executor_statistics, executor_id, table, schema);
-        return vec![(
-            flight_sql_table_provider(
-                executor_id,
-                (*client).clone(),
-                table,
-                Arc::clone(schema),
-                statistics,
-            ),
-            Vec::new(),
-        )];
+        return Ok(Routed {
+            providers: vec![(
+                flight_sql_table_provider(
+                    executor_id,
+                    (*client).clone(),
+                    table,
+                    Arc::clone(schema),
+                    statistics,
+                ),
+                Vec::new(),
+            )],
+            complete: None,
+        });
     };
 
-    // All required partitions (future: filter by query predicates)
-    let required_partitions: Vec<HashMap<String, Option<String>>> = table_metadata
-        .partitions
-        .iter()
-        .map(|p| p.partition_value.clone())
-        .collect();
-
-    if required_partitions.is_empty() {
+    if table_metadata.partitions.is_empty() {
         tracing::debug!("No partitions required for table {table}");
-        return Vec::new();
+        return Ok(Routed {
+            providers: Vec::new(),
+            complete: gate.map(|_| HashSet::new()),
+        });
     }
 
-    // Build executor -> partitions map, excluding dead executors. Per-executor
-    // row-count statistics (used below to size the coordinator's joins) come
-    // from `table_metadata.executor_statistics`, which each executor reports
-    // for the slice of the table it serves (see `handle_partitions_loaded`).
+    // Executors whose scans may be used: ready, and, with a gate, holding only
+    // partitions the table assigns to them.
+    let owners: HashMap<PartitionKey, &[String]> = table_metadata
+        .partitions
+        .iter()
+        .map(|p| {
+            (
+                partition_key(&p.partition_value),
+                p.assigned_executors.as_slice(),
+            )
+        })
+        .collect();
+    let usable: HashMap<&str, Option<&HashSet<PartitionKey>>> = executors
+        .keys()
+        .filter_map(|executor_id| {
+            let Some(gate) = gate else {
+                return Some((executor_id.as_str(), None));
+            };
+            let loaded = gate.loaded(executor_id)?;
+            let holds_others = loaded.iter().any(|key| {
+                owners
+                    .get(key)
+                    .is_some_and(|assigned| !assigned.iter().any(|e| e == executor_id))
+            });
+            (!holds_others).then_some((executor_id.as_str(), Some(loaded)))
+        })
+        .collect();
+
+    // Build executor -> partitions map from the executors that can serve each
+    // partition. Per-executor row-count statistics (used below to size the
+    // coordinator's joins) come from the reports each executor sends for the
+    // slice of the table it serves (see `handle_executor_statistics`).
     let mut executor_partition_map: HashMap<String, Vec<PartitionValue>> = HashMap::new();
+    let mut holders: HashMap<PartitionKey, Vec<&str>> = HashMap::new();
+    let mut covered: Vec<PartitionValue> = Vec::new();
+    let mut covered_keys: HashSet<PartitionKey> = HashSet::new();
+    let mut uncovered: Vec<PartitionKey> = Vec::new();
     for partition_meta in &table_metadata.partitions {
+        let key = partition_key(&partition_meta.partition_value);
+        let mut served = false;
         for executor_id in &partition_meta.assigned_executors {
-            if !executors.contains_key(executor_id) {
+            let Some(loaded) = usable.get(executor_id.as_str()) else {
                 tracing::debug!(
-                    "Executor '{}' has partition assignment but is no longer alive; excluding from selection",
-                    executor_id
+                    "Executor '{executor_id}' has partition assignment but is not ready or holds other executors' partitions; excluding from selection"
                 );
                 continue;
+            };
+            if loaded.is_some_and(|loaded| !loaded.contains(&key)) {
+                continue;
             }
+            served = true;
+            holders.entry(key.clone()).or_default().push(executor_id);
             executor_partition_map
                 .entry(executor_id.clone())
                 .or_default()
                 .push(partition_meta.partition_value.clone());
         }
+        if served {
+            covered.push(partition_meta.partition_value.clone());
+            covered_keys.insert(key);
+        } else {
+            uncovered.push(key);
+        }
     }
 
-    // Select minimal set of executors to cover all partitions
-    let selected_executors = match executor_selection::select_executors(
-        &required_partitions,
-        &executor_partition_map,
-    ) {
-        Ok(executors) => executors,
-        Err(executor_selection::Error::MissingPartitions(missing)) => {
-            tracing::error!(
-                "Cannot execute query on table {}: {} partition(s) not assigned to any alive executor. Missing: {:?}",
-                table,
-                missing.len(),
-                missing.iter().take(5).collect::<Vec<_>>()
+    let total = table_metadata.partitions.len();
+    let complete = uncovered.is_empty();
+    if !complete && !gate.is_some_and(|gate| gate.can_skip(&covered_keys)) {
+        tracing::error!(
+            "Cannot execute query on table {}: {} partition(s) not served by any ready executor. Missing: {:?}",
+            table,
+            uncovered.len(),
+            uncovered.iter().take(5).collect::<Vec<_>>()
+        );
+        if let Some(node_id) = node_id {
+            metrics::record_query_planning_failure(
+                node_id,
+                metrics::PlanningFailure::MissingPartitions,
             );
-            if let Some(node_id) = node_id {
-                metrics::record_query_planning_failure(
-                    node_id,
-                    metrics::PlanningFailure::MissingPartitions,
-                );
-            }
-            return Vec::new();
         }
-    };
+        return Err(partitions_unavailable(format!(
+            "Cannot query {table}: no ready executor serves {} of its {total} partitions; retry the query",
+            uncovered.len()
+        )));
+    }
+
+    // Select minimal set of executors to cover all servable partitions
+    let selected_executors =
+        executor_selection::select_executors(&covered, &executor_partition_map)
+            .map_err(|err| partitions_unavailable(format!("Cannot query {table}: {err}")))?;
 
     if let Some(node_id) = node_id {
         metrics::record_query_executor_count(node_id, selected_executors.len() as u64);
     }
 
     tracing::debug!(
-        "Selected {} executor(s) from {} available for table {} (covering {} partition(s))",
+        "Selected {} executor(s) from {} available for table {} (covering {} of {} partition(s))",
         selected_executors.len(),
         executor_partition_map.len(),
         table,
-        required_partitions.len()
+        covered.len(),
+        total
     );
 
-    selected_executors
-        .into_iter()
+    // Each partition is read from one selected executor, so a scan filtered to the
+    // partitions its executor serves returns no partition twice.
+    let mut to_read: HashMap<&str, Vec<PartitionValue>> = HashMap::new();
+    for partition_value in &covered {
+        let reader = holders
+            .get(&partition_key(partition_value))
+            .and_then(|ids| {
+                ids.iter()
+                    .find(|id| selected_executors.iter().any(|selected| selected == **id))
+            });
+        if let Some(reader) = reader {
+            to_read
+                .entry(*reader)
+                .or_default()
+                .push(partition_value.clone());
+        }
+    }
+
+    let providers = selected_executors
+        .iter()
         .filter_map(|executor_id| {
-            let (_, client) = executors.get(&executor_id)?;
-            let partition_values = executor_partition_map.remove(&executor_id)?;
+            let (_, client) = executors.get(executor_id)?;
+            let partition_values = to_read.remove(executor_id.as_str())?;
             // Stamp the executor-reported statistics onto this leaf scan so the
             // coordinator's planner can size joins. Project the reported per-column
             // stats onto the leaf's (possibly projected) schema by name, carrying
             // num_rows and per-column min/max.
             let statistics =
-                stamp_executor_statistics(executor_statistics, &executor_id, table, schema);
+                stamp_executor_statistics(executor_statistics, executor_id, table, schema);
             let provider = flight_sql_table_provider(
-                &executor_id,
+                executor_id,
                 (*client).clone(),
                 table,
                 Arc::clone(schema),
@@ -949,7 +1741,11 @@ pub(crate) fn get_partitions_from_store(
             );
             Some((provider, partition_values))
         })
-        .collect()
+        .collect();
+    Ok(Routed {
+        providers,
+        complete: (gate.is_some() && complete).then(|| owners.into_keys().collect()),
+    })
 }
 
 /// Partition provider for federated (non-accelerated) tables such as Cayenne tables.
@@ -961,6 +1757,7 @@ pub struct FederatedPartitionProvider {
     connections: Arc<RwLock<HashMap<String, ExecutorConnection>>>,
     flight_sql_clients: Arc<RwLock<HashMap<String, FlightSqlClient>>>,
     partition_store: Arc<PartitionStore>,
+    accelerations_partition_store: Arc<PartitionStore>,
     executor_statistics:
         Arc<parking_lot::RwLock<HashMap<String, HashMap<String, ExecutorTableStatistics>>>>,
     node_id: Option<Arc<str>>,
@@ -974,6 +1771,7 @@ impl FederatedPartitionProvider {
             connections: Arc::clone(&registry.connections),
             flight_sql_clients: Arc::clone(&registry.flight_sql_clients),
             partition_store: Arc::clone(&registry.federated_partition_store),
+            accelerations_partition_store: Arc::clone(&registry.accelerations_partition_store),
             executor_statistics: Arc::clone(&registry.executor_statistics),
             node_id: registry.node_id.clone(),
         }
@@ -982,23 +1780,27 @@ impl FederatedPartitionProvider {
 
 impl TablePartitionProvider for FederatedPartitionProvider {
     fn should_partition(&self, tbl: &TableScan) -> bool {
+        // The accelerated rewrite routes a table whose partitions the acceleration
+        // store holds, and its per-executor scans keep the table's name.
         self.partition_store
             .get_cached_table_metadata(&tbl.table_name)
             .is_some()
+            && self
+                .accelerations_partition_store
+                .get_cached_table_metadata(&tbl.table_name)
+                .is_none()
     }
 
     fn get_partitions(
         &self,
         table: &TableReference,
         schema: &SchemaRef,
-    ) -> Vec<(Arc<dyn TableProvider>, Vec<PartitionValue>)> {
-        let Ok(connections) = self.connections.try_read() else {
-            tracing::warn!("Failed to acquire read lock on connections");
-            return Vec::new();
-        };
-        let Ok(flight_sql_clients) = self.flight_sql_clients.try_read() else {
-            tracing::warn!("Failed to acquire read lock on flight_sql_clients");
-            return Vec::new();
+    ) -> DataFusionResult<PartitionProviders> {
+        let (Ok(connections), Ok(flight_sql_clients)) = (
+            self.connections.try_read(),
+            self.flight_sql_clients.try_read(),
+        ) else {
+            return Err(executors_changing(table));
         };
 
         let executors = ready_executors(&connections, &flight_sql_clients);
@@ -1009,32 +1811,37 @@ impl TablePartitionProvider for FederatedPartitionProvider {
             .cloned()
             .unwrap_or_default();
 
-        get_partitions_from_store(
+        // Each scan is filtered to the partitions its executor serves: an executor can
+        // hold rows of other partitions, such as a table it loaded whole.
+        Ok(get_partitions_from_store(
             &self.partition_store,
             &executors,
             table,
             schema,
             &executor_statistics,
             self.node_id.as_deref(),
-        )
-        .into_iter()
-        .map(|(provider, _)| (provider, vec![]))
-        .collect()
+            None,
+        )?
+        .providers)
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use object_store::ObjectStore;
     use object_store::memory::InMemory;
+    use object_store::{ObjectStore, ObjectStoreExt};
 
     use crate::cluster_state::ClusterStateStore;
 
     use super::*;
 
     async fn make_registry() -> ExecutorRegistry {
-        let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
-        let cs = Arc::new(ClusterStateStore::new(store, ""));
+        registry_over(&(Arc::new(InMemory::new()) as Arc<dyn ObjectStore>)).await
+    }
+
+    /// A scheduler's registry over the shared state in `store`.
+    async fn registry_over(store: &Arc<dyn ObjectStore>) -> ExecutorRegistry {
+        let cs = Arc::new(ClusterStateStore::new(Arc::clone(store), ""));
         cs.bootstrap().await.expect("bootstrap");
         ExecutorRegistry::new(
             Arc::new(PartitionStore::accelerations(Arc::clone(&cs))),
@@ -1047,12 +1854,16 @@ mod tests {
         let registry = make_registry().await;
         let (tx, _rx) = mpsc::channel(1);
 
-        registry.register("executor-1".to_string(), tx).await;
+        let registered = registry.register("executor-1".to_string(), "", tx).await;
 
         let executors = registry.connected_executors().await;
         assert_eq!(executors, vec!["executor-1"]);
 
-        registry.unregister("executor-1").await;
+        assert!(
+            registry
+                .unregister("executor-1", registered.connection)
+                .await
+        );
 
         let executors = registry.connected_executors().await;
         assert!(executors.is_empty());
@@ -1064,11 +1875,695 @@ mod tests {
         let (tx1, _rx1) = mpsc::channel(1);
         let (tx2, _rx2) = mpsc::channel(1);
 
-        registry.register("executor-1".to_string(), tx1).await;
-        registry.register("executor-1".to_string(), tx2).await;
+        registry.register("executor-1".to_string(), "", tx1).await;
+        registry.register("executor-1".to_string(), "", tx2).await;
 
         let executors = registry.connected_executors().await;
         assert_eq!(executors.len(), 1);
+    }
+
+    /// An executor that restarts under the same id sends a new process id. The
+    /// new process is a restart of the old one, and the old process's connection
+    /// closing late leaves the new one registered.
+    #[tokio::test]
+    async fn a_new_process_under_an_executor_id_is_a_restart() {
+        let registry = make_registry().await;
+        let (tx1, _rx1) = mpsc::channel(1);
+        let (tx2, _rx2) = mpsc::channel(1);
+        let (tx3, _rx3) = mpsc::channel(1);
+
+        let first = registry.register("exec-a".to_string(), "run-1", tx1).await;
+        assert_eq!(first.registration, ExecutorRegistration::New);
+        let restarted = registry.register("exec-a".to_string(), "run-2", tx2).await;
+        assert_eq!(restarted.registration, ExecutorRegistration::Restarted);
+        assert!(!registry.is_current("exec-a", first.connection));
+        assert!(registry.is_current("exec-a", restarted.connection));
+
+        assert!(
+            !registry.unregister("exec-a", first.connection).await,
+            "the replaced connection closing must not unregister its successor"
+        );
+        assert_eq!(registry.connected_executors().await, vec!["exec-a"]);
+
+        let reconnected = registry.register("exec-a".to_string(), "run-2", tx3).await;
+        assert_eq!(reconnected.registration, ExecutorRegistration::Reconnected);
+        assert!(registry.unregister("exec-a", reconnected.connection).await);
+        assert!(registry.connected_executors().await.is_empty());
+    }
+
+    /// A restart drops the endpoint the earlier run registered, so the executor
+    /// is not ready until the new process registers its own. An endpoint the new
+    /// process registered before its control stream connected is kept. Broadcast
+    /// joins reach executors at these endpoints, not at their identity.
+    #[tokio::test]
+    async fn a_restart_drops_the_endpoint_of_the_earlier_run() {
+        let registry = make_registry().await;
+        let (tx1, _rx1) = mpsc::channel(1);
+        let (tx2, _rx2) = mpsc::channel(1);
+        let (tx3, _rx3) = mpsc::channel(1);
+
+        registry.register("exec-a".to_string(), "run-1", tx1).await;
+        registry
+            .insert_flight_sql_client(
+                "exec-a".to_string(),
+                "127.0.0.1:50101".to_string(),
+                "run-1",
+                dummy_flight_sql_client(),
+            )
+            .await;
+        assert_eq!(
+            registry.ready_executor_addresses_sync(),
+            ["127.0.0.1:50101"]
+        );
+
+        registry.register("exec-a".to_string(), "run-2", tx2).await;
+        assert_eq!(registry.flight_sql_clients_count().await, 0);
+        assert!(registry.ready_executor_addresses_sync().is_empty());
+
+        registry
+            .insert_flight_sql_client(
+                "exec-a".to_string(),
+                "127.0.0.1:50102".to_string(),
+                "run-3",
+                dummy_flight_sql_client(),
+            )
+            .await;
+        registry.register("exec-a".to_string(), "run-3", tx3).await;
+        assert_eq!(registry.flight_sql_clients_count().await, 1);
+        assert_eq!(
+            registry.ready_executor_addresses_sync(),
+            ["127.0.0.1:50102"]
+        );
+
+        // A replaced process registering its endpoint late is ignored.
+        assert!(
+            !registry
+                .insert_flight_sql_client(
+                    "exec-a".to_string(),
+                    "127.0.0.1:50101".to_string(),
+                    "run-1",
+                    dummy_flight_sql_client(),
+                )
+                .await
+        );
+        assert_eq!(
+            registry.ready_executor_addresses_sync(),
+            ["127.0.0.1:50102"]
+        );
+
+        // The next run registers its endpoint, the run it replaces registers
+        // its endpoint late, and only then does the next run's control stream
+        // connect: the next run's endpoint stays.
+        let (tx4, _rx4) = mpsc::channel(1);
+        assert!(
+            registry
+                .insert_flight_sql_client(
+                    "exec-a".to_string(),
+                    "127.0.0.1:50103".to_string(),
+                    "run-4",
+                    dummy_flight_sql_client(),
+                )
+                .await
+        );
+        assert!(
+            !registry
+                .insert_flight_sql_client(
+                    "exec-a".to_string(),
+                    "127.0.0.1:50102".to_string(),
+                    "run-3",
+                    dummy_flight_sql_client(),
+                )
+                .await
+        );
+        registry.register("exec-a".to_string(), "run-4", tx4).await;
+        assert_eq!(
+            registry.ready_executor_addresses_sync(),
+            ["127.0.0.1:50103"]
+        );
+    }
+
+    /// The earlier run's connection closing after the next run registered its
+    /// endpoint, but before the next run's control stream connected, leaves
+    /// that endpoint in place.
+    #[tokio::test]
+    async fn an_earlier_connection_closing_keeps_its_successors_endpoint() {
+        let registry = make_registry().await;
+        let (tx1, _rx1) = mpsc::channel(1);
+
+        let earlier = registry.register("exec-a".to_string(), "run-1", tx1).await;
+        registry
+            .insert_flight_sql_client(
+                "exec-a".to_string(),
+                "127.0.0.1:50102".to_string(),
+                "run-2",
+                dummy_flight_sql_client(),
+            )
+            .await;
+        assert!(registry.unregister("exec-a", earlier.connection).await);
+        assert!(registry.connected_executors().await.is_empty());
+        assert_eq!(
+            registry.ready_executor_addresses_sync(),
+            ["127.0.0.1:50102"]
+        );
+    }
+
+    /// The same, when the next run's id sorts before the earlier run's, as when
+    /// its host's clock reads earlier.
+    #[tokio::test]
+    async fn an_earlier_connection_closing_keeps_a_successors_endpoint_whose_id_sorts_first() {
+        let registry = make_registry().await;
+        let (tx1, _rx1) = mpsc::channel(1);
+
+        let earlier = registry.register("exec-a".to_string(), "run-2", tx1).await;
+        assert!(
+            registry
+                .insert_flight_sql_client(
+                    "exec-a".to_string(),
+                    "127.0.0.1:50102".to_string(),
+                    "run-1",
+                    dummy_flight_sql_client(),
+                )
+                .await
+        );
+        assert!(registry.unregister("exec-a", earlier.connection).await);
+        assert!(registry.connected_executors().await.is_empty());
+        assert_eq!(
+            registry.ready_executor_addresses_sync(),
+            ["127.0.0.1:50102"]
+        );
+    }
+
+    /// A replaced process that connects again is still running, so two processes
+    /// share the id. It is refused and the later process stays registered.
+    #[tokio::test]
+    async fn a_replaced_process_that_connects_again_is_a_duplicate() {
+        let registry = make_registry().await;
+        let (tx1, _rx1) = mpsc::channel(1);
+        let (tx2, _rx2) = mpsc::channel(1);
+        let (tx3, _rx3) = mpsc::channel(1);
+
+        registry.register("exec-a".to_string(), "run-1", tx1).await;
+        let later = registry.register("exec-a".to_string(), "run-2", tx2).await;
+        let returning = registry.register("exec-a".to_string(), "run-1", tx3).await;
+
+        assert_eq!(returning.registration, ExecutorRegistration::Duplicate);
+        assert!(registry.is_current("exec-a", later.connection));
+        assert!(!registry.is_current("exec-a", returning.connection));
+        assert_eq!(registry.connected_executors().await, vec!["exec-a"]);
+    }
+
+    /// A process that started earlier but connects after a later one, for
+    /// example to a scheduler that started after both, is a duplicate, not a
+    /// restart. The schedulers share the order the processes first registered
+    /// in, which here is the reverse of their ids' order.
+    #[tokio::test]
+    async fn an_older_process_connecting_later_is_a_duplicate() {
+        let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let earlier_scheduler = registry_over(&store).await;
+        let (tx1, _rx1) = mpsc::channel(1);
+        let (tx2, _rx2) = mpsc::channel(1);
+        earlier_scheduler
+            .register("exec-a".to_string(), "run-2", tx1)
+            .await;
+        earlier_scheduler
+            .register("exec-a".to_string(), "run-1", tx2)
+            .await;
+
+        let later_scheduler = registry_over(&store).await;
+        let (tx3, _rx3) = mpsc::channel(1);
+        let (tx4, _rx4) = mpsc::channel(1);
+        let newer = later_scheduler
+            .register("exec-a".to_string(), "run-1", tx3)
+            .await;
+        let older = later_scheduler
+            .register("exec-a".to_string(), "run-2", tx4)
+            .await;
+
+        assert_eq!(newer.registration, ExecutorRegistration::New);
+        assert_eq!(older.registration, ExecutorRegistration::Duplicate);
+        assert!(later_scheduler.is_current("exec-a", newer.connection));
+
+        // Its endpoint is refused too, even before the newer process registers one.
+        assert!(
+            !later_scheduler
+                .insert_flight_sql_client(
+                    "exec-a".to_string(),
+                    "127.0.0.1:50101".to_string(),
+                    "run-2",
+                    dummy_flight_sql_client(),
+                )
+                .await
+        );
+        assert!(later_scheduler.ready_executor_addresses_sync().is_empty());
+    }
+
+    /// A scheduler that starts after a process was replaced, and sees the
+    /// replaced process first, refuses it and its endpoint from the shared
+    /// order alone, then registers the later process.
+    #[tokio::test]
+    async fn a_replaced_process_connecting_first_to_a_new_scheduler_is_a_duplicate() {
+        let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let earlier_scheduler = registry_over(&store).await;
+        let (tx1, _rx1) = mpsc::channel(1);
+        let (tx2, _rx2) = mpsc::channel(1);
+        earlier_scheduler
+            .register("exec-a".to_string(), "run-2", tx1)
+            .await;
+        earlier_scheduler
+            .register("exec-a".to_string(), "run-1", tx2)
+            .await;
+
+        let later_scheduler = registry_over(&store).await;
+        let (tx3, _rx3) = mpsc::channel(1);
+        let (tx4, _rx4) = mpsc::channel(1);
+        let replaced = later_scheduler
+            .register("exec-a".to_string(), "run-2", tx3)
+            .await;
+        assert_eq!(replaced.registration, ExecutorRegistration::Duplicate);
+        assert!(
+            !later_scheduler
+                .insert_flight_sql_client(
+                    "exec-a".to_string(),
+                    "127.0.0.1:50101".to_string(),
+                    "run-2",
+                    dummy_flight_sql_client(),
+                )
+                .await
+        );
+
+        let live = later_scheduler
+            .register("exec-a".to_string(), "run-1", tx4)
+            .await;
+        assert_eq!(live.registration, ExecutorRegistration::New);
+        assert!(later_scheduler.is_current("exec-a", live.connection));
+    }
+
+    /// After many quick restarts, a replacement whose id sorts before every
+    /// earlier process's, as when its host's clock reads earlier, is a restart.
+    #[tokio::test]
+    async fn a_restart_after_many_restarts_whose_id_sorts_first_is_a_restart() {
+        let registry = make_registry().await;
+        let mut receivers = Vec::new();
+        for run in 10..30 {
+            let (tx, rx) = mpsc::channel(1);
+            receivers.push(rx);
+            registry
+                .register("exec-a".to_string(), &format!("run-{run}"), tx)
+                .await;
+        }
+        let (tx, _rx) = mpsc::channel(1);
+        let replacement = registry.register("exec-a".to_string(), "run-05", tx).await;
+        assert_eq!(replacement.registration, ExecutorRegistration::Restarted);
+        assert!(registry.is_current("exec-a", replacement.connection));
+    }
+
+    /// An endpoint that arrives before its process registers is refused when the
+    /// cluster's order shows a later process, even when its id sorts after the
+    /// later process's.
+    #[tokio::test]
+    async fn an_early_endpoint_from_a_replaced_process_is_refused() {
+        let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let earlier_scheduler = registry_over(&store).await;
+        let (tx1, _rx1) = mpsc::channel(1);
+        let (tx2, _rx2) = mpsc::channel(1);
+        earlier_scheduler
+            .register("exec-a".to_string(), "run-2", tx1)
+            .await;
+        earlier_scheduler
+            .register("exec-a".to_string(), "run-1", tx2)
+            .await;
+
+        let later_scheduler = registry_over(&store).await;
+        let (tx3, _rx3) = mpsc::channel(1);
+        later_scheduler
+            .register("exec-a".to_string(), "run-1", tx3)
+            .await;
+        assert!(
+            later_scheduler
+                .insert_flight_sql_client(
+                    "exec-a".to_string(),
+                    "127.0.0.1:50101".to_string(),
+                    "run-1",
+                    dummy_flight_sql_client(),
+                )
+                .await
+        );
+        assert!(
+            !later_scheduler
+                .insert_flight_sql_client(
+                    "exec-a".to_string(),
+                    "127.0.0.1:50102".to_string(),
+                    "run-2",
+                    dummy_flight_sql_client(),
+                )
+                .await
+        );
+        assert_eq!(
+            later_scheduler.ready_executor_addresses_sync(),
+            ["127.0.0.1:50101"]
+        );
+    }
+
+    /// A scheduler that has an executor connected to none of its own streams
+    /// keeps that executor's process history while another scheduler has it
+    /// connected, so a replaced process connecting later is still a duplicate.
+    #[tokio::test]
+    async fn history_of_an_executor_another_scheduler_has_connected_is_kept() {
+        let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let cluster = ClusterStateStore::new(Arc::clone(&store), "");
+        let now = now_ms().expect("clock");
+        let day_ago = now - 25 * 3_600_000;
+        let order = ExecutorProcessOrder::new(&cluster);
+        for run in ["run-0", "run-1"] {
+            order
+                .admit("exec-a", run, day_ago, |_| true)
+                .await
+                .expect("admit");
+        }
+        // Published 20 minutes ago, as by a scheduler whose publishing interval
+        // is longer than that.
+        ExecutorLiveness::new(&cluster)
+            .publish("sched-b", vec!["exec-a".to_string()], now - 20 * 60_000)
+            .await
+            .expect("publish");
+
+        let new_scheduler = registry_over(&store).await;
+        let (tx1, _rx1) = mpsc::channel(1);
+        let (tx2, _rx2) = mpsc::channel(1);
+        new_scheduler
+            .register("exec-b".to_string(), "run-0", tx1)
+            .await;
+        let replaced = new_scheduler
+            .register("exec-a".to_string(), "run-0", tx2)
+            .await;
+        assert_eq!(replaced.registration, ExecutorRegistration::Duplicate);
+    }
+
+    /// A process registered while the order could not be read gets its
+    /// generation from the order before a replacement is compared with it, so a
+    /// replacement whose id sorts first is still a restart.
+    #[tokio::test]
+    async fn a_process_registered_without_the_order_is_ordered_once_it_is_readable() {
+        let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let cluster = ClusterStateStore::new(Arc::clone(&store), "");
+        ExecutorProcessOrder::new(&cluster)
+            .admit("exec-a", "run-2", now_ms().expect("clock"), |_| true)
+            .await
+            .expect("admit");
+
+        let registry = registry_over(&store).await;
+        let (tx1, _rx1) = mpsc::channel(1);
+        let (tx2, _rx2) = mpsc::channel(1);
+        {
+            let mut processes = registry.processes.lock();
+            let seen = processes.entry("exec-a".to_string()).or_default();
+            assert_eq!(
+                classify_registration(seen, "run-2", None, false),
+                ExecutorRegistration::New
+            );
+        }
+        registry
+            .connections
+            .write()
+            .await
+            .insert("exec-a".to_string(), ExecutorConnection::new(tx1));
+
+        let replacement = registry.register("exec-a".to_string(), "run-1", tx2).await;
+        assert_eq!(replacement.registration, ExecutorRegistration::Restarted);
+    }
+
+    /// A process registered while the order could not be read, and never
+    /// recorded, is older than a replacement another scheduler recorded, even
+    /// when the replacement's id sorts first; it is not added to the order.
+    #[tokio::test]
+    async fn an_unrecorded_process_is_older_than_a_recorded_replacement() {
+        let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let cluster = ClusterStateStore::new(Arc::clone(&store), "");
+        let order = ExecutorProcessOrder::new(&cluster);
+        order
+            .admit("exec-a", "run-1", now_ms().expect("clock"), |_| true)
+            .await
+            .expect("admit");
+
+        let registry = registry_over(&store).await;
+        let (tx1, _rx1) = mpsc::channel(1);
+        let (tx2, _rx2) = mpsc::channel(1);
+        {
+            let mut processes = registry.processes.lock();
+            let seen = processes.entry("exec-a".to_string()).or_default();
+            assert_eq!(
+                classify_registration(seen, "run-2", None, false),
+                ExecutorRegistration::New
+            );
+        }
+        registry
+            .connections
+            .write()
+            .await
+            .insert("exec-a".to_string(), ExecutorConnection::new(tx1));
+
+        let replacement = registry.register("exec-a".to_string(), "run-1", tx2).await;
+        assert_eq!(replacement.registration, ExecutorRegistration::Restarted);
+        assert_eq!(
+            order
+                .recorded_generation("exec-a", "run-2")
+                .await
+                .expect("read"),
+            None
+        );
+    }
+
+    /// An unrecorded process's endpoint gives way to a replacement that is the
+    /// first process the order records, whichever endpoint arrives first.
+    #[tokio::test]
+    async fn an_unrecorded_process_gives_way_to_the_first_recorded_one() {
+        for replacement_endpoint_first in [false, true] {
+            let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+            let cluster = ClusterStateStore::new(Arc::clone(&store), "");
+            ExecutorProcessOrder::new(&cluster)
+                .admit("exec-a", "run-1", now_ms().expect("clock"), |_| true)
+                .await
+                .expect("admit");
+
+            let registry = registry_over(&store).await;
+            let (tx1, _rx1) = mpsc::channel(1);
+            let (tx2, _rx2) = mpsc::channel(1);
+            let incumbent_connection = {
+                let mut processes = registry.processes.lock();
+                let seen = processes.entry("exec-a".to_string()).or_default();
+                assert_eq!(
+                    classify_registration(seen, "run-2", None, false),
+                    ExecutorRegistration::New
+                );
+                seen.connection = Some(0);
+                0
+            };
+            registry
+                .connections
+                .write()
+                .await
+                .insert("exec-a".to_string(), ExecutorConnection::new(tx1));
+            registry
+                .insert_flight_sql_client(
+                    "exec-a".to_string(),
+                    "127.0.0.1:50102".to_string(),
+                    "run-2",
+                    dummy_flight_sql_client(),
+                )
+                .await;
+
+            let insert_replacement_endpoint = || {
+                registry.insert_flight_sql_client(
+                    "exec-a".to_string(),
+                    "127.0.0.1:50101".to_string(),
+                    "run-1",
+                    dummy_flight_sql_client(),
+                )
+            };
+            if replacement_endpoint_first {
+                assert!(insert_replacement_endpoint().await);
+                assert!(registry.unregister("exec-a", incumbent_connection).await);
+            } else {
+                let replacement = registry.register("exec-a".to_string(), "run-1", tx2).await;
+                assert_eq!(replacement.registration, ExecutorRegistration::Restarted);
+                assert!(registry.ready_executor_addresses_sync().is_empty());
+                assert!(insert_replacement_endpoint().await);
+            }
+            assert_eq!(
+                registry.flight_sql_endpoints.read()["exec-a"].address,
+                "127.0.0.1:50101",
+                "replacement endpoint first: {replacement_endpoint_first}"
+            );
+        }
+    }
+
+    /// Makes the shared process order in `store` unreadable.
+    async fn break_process_order(registry: &ExecutorRegistry, store: &Arc<dyn ObjectStore>) {
+        store
+            .put(
+                &object_store::path::Path::from("executor_processes.json"),
+                "not json".into(),
+            )
+            .await
+            .expect("put");
+        registry
+            .process_order
+            .recorded_generation("exec-a", "run-0")
+            .await
+            .expect_err("the order is unreadable");
+    }
+
+    /// A replacement whose endpoint was ordered before the order became
+    /// unreadable keeps that order when its control stream registers.
+    #[tokio::test]
+    async fn a_replacement_whose_endpoint_came_first_is_a_restart_while_the_order_is_unreadable() {
+        let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let registry = registry_over(&store).await;
+        let (tx1, _rx1) = mpsc::channel(1);
+        let (tx2, _rx2) = mpsc::channel(1);
+        registry.register("exec-a".to_string(), "run-2", tx1).await;
+        assert!(
+            registry
+                .insert_flight_sql_client(
+                    "exec-a".to_string(),
+                    "127.0.0.1:50101".to_string(),
+                    "run-1",
+                    dummy_flight_sql_client(),
+                )
+                .await
+        );
+        break_process_order(&registry, &store).await;
+
+        let replacement = registry.register("exec-a".to_string(), "run-1", tx2).await;
+        assert_eq!(replacement.registration, ExecutorRegistration::Restarted);
+        assert_eq!(
+            registry.ready_executor_addresses_sync(),
+            ["127.0.0.1:50101"]
+        );
+    }
+
+    /// An endpoint registered while the order was unreadable, by a process that
+    /// never registered its control stream, gives way to a replacement recorded
+    /// once the order is readable, even when the replacement's id sorts first.
+    #[tokio::test]
+    async fn an_unrecorded_endpoint_gives_way_to_a_recorded_replacement() {
+        for replacement_endpoint_first in [false, true] {
+            let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+            let registry = registry_over(&store).await;
+            break_process_order(&registry, &store).await;
+            assert!(
+                registry
+                    .insert_flight_sql_client(
+                        "exec-a".to_string(),
+                        "127.0.0.1:50102".to_string(),
+                        "run-2",
+                        dummy_flight_sql_client(),
+                    )
+                    .await
+            );
+            store
+                .delete(&object_store::path::Path::from("executor_processes.json"))
+                .await
+                .expect("delete");
+
+            let (tx, _rx) = mpsc::channel(1);
+            let insert_replacement_endpoint = || {
+                registry.insert_flight_sql_client(
+                    "exec-a".to_string(),
+                    "127.0.0.1:50101".to_string(),
+                    "run-1",
+                    dummy_flight_sql_client(),
+                )
+            };
+            if replacement_endpoint_first {
+                assert!(insert_replacement_endpoint().await);
+                registry.register("exec-a".to_string(), "run-1", tx).await;
+            } else {
+                let replacement = registry.register("exec-a".to_string(), "run-1", tx).await;
+                assert_eq!(replacement.registration, ExecutorRegistration::New);
+                assert!(insert_replacement_endpoint().await);
+            }
+            assert_eq!(
+                registry.ready_executor_addresses_sync(),
+                ["127.0.0.1:50101"],
+                "replacement endpoint first: {replacement_endpoint_first}"
+            );
+        }
+    }
+
+    /// A process that replaces an executor is a restart even when its id sorts
+    /// before its predecessor's, as when it starts on a host whose clock reads
+    /// earlier. Its endpoint replaces the predecessor's, and the predecessor is
+    /// a duplicate if it connects again.
+    #[tokio::test]
+    async fn a_restart_whose_id_sorts_first_is_a_restart() {
+        let registry = make_registry().await;
+        let (tx1, _rx1) = mpsc::channel(1);
+        let (tx2, _rx2) = mpsc::channel(1);
+        let (tx3, _rx3) = mpsc::channel(1);
+
+        let predecessor = registry.register("exec-a".to_string(), "run-2", tx1).await;
+        assert!(
+            registry
+                .insert_flight_sql_client(
+                    "exec-a".to_string(),
+                    "127.0.0.1:50101".to_string(),
+                    "run-2",
+                    dummy_flight_sql_client(),
+                )
+                .await
+        );
+        assert!(registry.unregister("exec-a", predecessor.connection).await);
+
+        let replacement = registry.register("exec-a".to_string(), "run-1", tx2).await;
+        assert_eq!(replacement.registration, ExecutorRegistration::Restarted);
+        assert!(registry.is_current("exec-a", replacement.connection));
+        assert!(
+            registry
+                .insert_flight_sql_client(
+                    "exec-a".to_string(),
+                    "127.0.0.1:50102".to_string(),
+                    "run-1",
+                    dummy_flight_sql_client(),
+                )
+                .await
+        );
+        assert_eq!(
+            registry.ready_executor_addresses_sync(),
+            ["127.0.0.1:50102"]
+        );
+
+        let returning = registry.register("exec-a".to_string(), "run-2", tx3).await;
+        assert_eq!(returning.registration, ExecutorRegistration::Duplicate);
+        assert!(registry.is_current("exec-a", replacement.connection));
+    }
+
+    /// An executor that sends no process id is registered as before: a second
+    /// connection under its id is a reconnect, never a restart.
+    #[tokio::test]
+    async fn an_executor_without_a_process_id_reconnects() {
+        let registry = make_registry().await;
+        let (tx1, _rx1) = mpsc::channel(1);
+        let (tx2, _rx2) = mpsc::channel(1);
+
+        let first = registry
+            .register("127.0.0.1:50062".to_string(), "", tx1)
+            .await;
+        let second = registry
+            .register("127.0.0.1:50062".to_string(), "", tx2)
+            .await;
+        assert_eq!(first.registration, ExecutorRegistration::New);
+        assert_eq!(second.registration, ExecutorRegistration::Reconnected);
+        assert!(
+            !registry
+                .unregister("127.0.0.1:50062", first.connection)
+                .await
+        );
+        assert!(
+            registry
+                .unregister("127.0.0.1:50062", second.connection)
+                .await
+        );
     }
 
     #[tokio::test]
@@ -1086,9 +2581,9 @@ mod tests {
         let (tx2, _rx2) = mpsc::channel(1);
         let (tx3, _rx3) = mpsc::channel(1);
 
-        registry.register("executor-1".to_string(), tx1).await;
-        registry.register("executor-2".to_string(), tx2).await;
-        registry.register("executor-3".to_string(), tx3).await;
+        registry.register("executor-1".to_string(), "", tx1).await;
+        let executor_2 = registry.register("executor-2".to_string(), "", tx2).await;
+        registry.register("executor-3".to_string(), "", tx3).await;
 
         let mut executors = registry.connected_executors().await;
         executors.sort();
@@ -1097,7 +2592,9 @@ mod tests {
         assert_eq!(executors, vec!["executor-1", "executor-2", "executor-3"]);
 
         // Unregister one
-        registry.unregister("executor-2").await;
+        registry
+            .unregister("executor-2", executor_2.connection)
+            .await;
 
         let mut executors = registry.connected_executors().await;
         executors.sort();
@@ -1248,29 +2745,39 @@ mod tests {
         let (tx1, _rx1) = mpsc::channel(1);
         let (tx2, _rx2) = mpsc::channel(1);
         let (tx3, _rx3) = mpsc::channel(1);
-        registry.register("e1".to_string(), tx1).await;
-        registry.register("e2".to_string(), tx2).await;
-        registry.register("e3".to_string(), tx3).await;
+        registry.register("e1".to_string(), "", tx1).await;
+        let e2 = registry.register("e2".to_string(), "", tx2).await;
+        let e3 = registry.register("e3".to_string(), "", tx3).await;
         assert_eq!(registry.connected_executor_count().await, 3);
         assert_eq!(registry.flight_sql_clients_count().await, 0);
 
         // Two of them complete the handshake (AllocateInitialPartitions) → ready.
         registry
-            .insert_flight_sql_client("e1".to_string(), dummy_flight_sql_client())
+            .insert_flight_sql_client(
+                "e1".to_string(),
+                "127.0.0.1:50101".to_string(),
+                "",
+                dummy_flight_sql_client(),
+            )
             .await;
         registry
-            .insert_flight_sql_client("e2".to_string(), dummy_flight_sql_client())
+            .insert_flight_sql_client(
+                "e2".to_string(),
+                "127.0.0.1:50102".to_string(),
+                "",
+                dummy_flight_sql_client(),
+            )
             .await;
         assert_eq!(registry.connected_executor_count().await, 3);
         assert_eq!(registry.flight_sql_clients_count().await, 2);
 
         // Unregister one ready executor — both counts drop.
-        registry.unregister("e2").await;
+        registry.unregister("e2", e2.connection).await;
         assert_eq!(registry.connected_executor_count().await, 2);
         assert_eq!(registry.flight_sql_clients_count().await, 1);
 
         // Unregister the not-yet-ready executor — connected drops, ready unchanged.
-        registry.unregister("e3").await;
+        registry.unregister("e3", e3.connection).await;
         assert_eq!(registry.connected_executor_count().await, 1);
         assert_eq!(registry.flight_sql_clients_count().await, 1);
     }
@@ -1280,10 +2787,14 @@ mod tests {
         let registry = make_registry().await;
         let (tx, _rx) = mpsc::channel(1);
 
-        registry.register("executor-1".to_string(), tx).await;
+        let registered = registry.register("executor-1".to_string(), "", tx).await;
 
         // Unregistering a non-existent executor should not panic
-        registry.unregister("executor-nonexistent").await;
+        assert!(
+            !registry
+                .unregister("executor-nonexistent", registered.connection)
+                .await
+        );
 
         // Original executor should still be registered
         let executors = registry.connected_executors().await;
@@ -1345,6 +2856,394 @@ mod tests {
         assert_eq!(ready.len(), 1);
         assert!(ready.contains_key("exec-2"));
         assert!(!ready.contains_key("exec-1"));
+    }
+
+    fn id_schema() -> SchemaRef {
+        Arc::new(arrow::datatypes::Schema::new(vec![
+            arrow::datatypes::Field::new("id", arrow::datatypes::DataType::Int64, false),
+        ]))
+    }
+
+    /// A table with no partition metadata has not been discovered: reading
+    /// one executor would return only that executor's rows, or none.
+    #[tokio::test]
+    async fn a_table_without_partition_metadata_does_not_resolve() {
+        let registry = make_registry().await;
+        ready_executor(&registry, "executor-1", "").await;
+        let table = TableReference::bare("t");
+
+        let error = registry
+            .resolve_accelerated_partitions(&table, &id_schema(), true)
+            .expect_err("the table has no partition metadata");
+        assert!(
+            runtime_datafusion::error::is_partitions_unavailable(&error),
+            "unexpected error: {error}"
+        );
+        assert!(
+            error.to_string().contains("have not been discovered yet"),
+            "unexpected error: {error}"
+        );
+
+        // An accelerated table whose partitions are not discovered, such as one
+        // created by DDL, is read from one executor.
+        let partitions = registry
+            .resolve_accelerated_partitions(&table, &id_schema(), false)
+            .expect("a table that is not discovered resolves");
+        assert_eq!(partitions.len(), 1);
+    }
+
+    /// Each executor of a federated table is read for the partitions it serves,
+    /// so a scan filtered to them returns none of the rows it holds for others.
+    #[tokio::test]
+    async fn federated_scans_carry_the_partitions_their_executor_serves() {
+        let registry = make_registry().await;
+        ready_executor(&registry, "executor-1", "").await;
+        ready_executor(&registry, "executor-2", "").await;
+        let table = TableReference::full("ice", "ns", "t");
+        let store = registry.federated_partition_store();
+        store
+            .initialize_metadata(&table, vec!["region".to_string()])
+            .await
+            .expect("initialize");
+        let region = |value: &str| HashMap::from([("region".to_string(), Some(value.to_string()))]);
+        let (east, west, north) = (region("'east'"), region("'west'"), region("'north'"));
+        store
+            .add_and_assign_partitions(
+                &table,
+                &[
+                    (&east, "executor-1"),
+                    (&west, "executor-2"),
+                    (&north, "executor-1"),
+                ],
+            )
+            .await
+            .expect("assign");
+
+        let mut served: Vec<Vec<String>> = FederatedPartitionProvider::from_registry(&registry)
+            .get_partitions(&table, &id_schema())
+            .expect("resolve")
+            .into_iter()
+            .map(|(_, values)| {
+                let mut regions: Vec<String> = values
+                    .iter()
+                    .filter_map(|value| value.get("region").cloned().flatten())
+                    .collect();
+                regions.sort();
+                regions
+            })
+            .collect();
+        served.sort();
+        assert_eq!(served, [vec!["'east'", "'north'"], vec!["'west'"]]);
+    }
+
+    /// The accelerated rewrite runs first. A table whose partitions the acceleration
+    /// store holds is routed there, and the per-executor scans it leaves keep the
+    /// table's name, so the federated rewrite must not partition them again. The
+    /// single-executor scan it leaves for a table only the federated store
+    /// partitions is still expanded.
+    #[tokio::test]
+    async fn a_table_the_acceleration_store_partitions_is_not_partitioned_again() {
+        let registry = make_registry().await;
+        ready_executor(&registry, "executor-1", "").await;
+        let table = TableReference::bare("t");
+        registry
+            .federated_partition_store()
+            .initialize_metadata(&table, vec!["id".to_string()])
+            .await
+            .expect("initialize federated");
+        let provider = FederatedPartitionProvider::from_registry(&registry);
+        let client = registry
+            .flight_sql_clients_snapshot()
+            .await
+            .remove("executor-1")
+            .expect("client");
+        let executor_scan = {
+            let source = flight_sql_table_provider("executor-1", client, &table, id_schema(), None);
+            let plan = datafusion::logical_expr::LogicalPlanBuilder::scan(
+                table.clone(),
+                datafusion::datasource::provider_as_source(source),
+                None,
+            )
+            .expect("scan")
+            .build()
+            .expect("plan");
+            let datafusion::logical_expr::LogicalPlan::TableScan(scan) = plan else {
+                panic!("a table scan");
+            };
+            scan
+        };
+        assert!(
+            provider.should_partition(&executor_scan),
+            "a table only the federated store partitions is expanded"
+        );
+
+        registry
+            .accelerations_partition_store()
+            .initialize_metadata(&table, vec!["id".to_string()])
+            .await
+            .expect("initialize acceleration");
+        assert!(
+            !provider.should_partition(&executor_scan),
+            "a table the acceleration store partitions is left to the accelerated rewrite"
+        );
+    }
+
+    async fn ready_executor(registry: &ExecutorRegistry, executor_id: &str, process_id: &str) {
+        let (tx, rx) = mpsc::channel(1);
+        std::mem::forget(rx);
+        registry
+            .register(executor_id.to_string(), process_id, tx)
+            .await;
+        registry
+            .insert_flight_sql_client(
+                executor_id.to_string(),
+                "127.0.0.1:1".to_string(),
+                process_id,
+                dummy_flight_sql_client(),
+            )
+            .await;
+    }
+
+    fn bucket(value: i64) -> PartitionValue {
+        HashMap::from([("bucket(2, id)".to_string(), Some(value.to_string()))])
+    }
+
+    /// Seeds `t` with one partition per entry of `owners`, assigned to it.
+    async fn seed_assigned(registry: &ExecutorRegistry, owners: &[&str]) -> TableReference {
+        let table = TableReference::bare("t");
+        let store = registry.accelerations_partition_store();
+        let partitions: Vec<PartitionValue> = (0_i64..).take(owners.len()).map(bucket).collect();
+        store
+            .set_unassigned_partitions(
+                &table,
+                partitions.clone(),
+                vec!["bucket(2, id)".to_string()],
+            )
+            .await
+            .expect("seed partitions");
+        for (partition, owner) in partitions.iter().zip(owners) {
+            store
+                .assign_partition(&table, partition, owner)
+                .await
+                .expect("assign partition");
+        }
+        table
+    }
+
+    fn loaded(process_id: &str, buckets: &[i64]) -> LoadedPartitions {
+        LoadedPartitions {
+            process_id: process_id.to_string(),
+            partitions: buckets.iter().map(|b| partition_key(&bucket(*b))).collect(),
+        }
+    }
+
+    /// A partition assigned to a ready executor that has not reported it loaded
+    /// is not read: the executor would answer from data that lacks it.
+    #[tokio::test]
+    async fn an_assigned_partition_not_reported_loaded_does_not_resolve() {
+        let registry = make_registry().await;
+        ready_executor(&registry, "executor-1", "").await;
+        let table = seed_assigned(&registry, &["executor-1", "executor-1"]).await;
+
+        let error = registry
+            .resolve_accelerated_partitions(&table, &id_schema(), true)
+            .expect_err("no partition is loaded");
+        assert!(
+            error
+                .to_string()
+                .contains("no ready executor serves 2 of its 2 partitions"),
+            "unexpected error: {error}"
+        );
+        assert!(runtime_datafusion::error::is_partitions_unavailable(&error));
+
+        registry.set_loaded_partitions(
+            &table,
+            HashMap::from([("executor-1".to_string(), loaded("", &[0, 1]))]),
+        );
+        let partitions = registry
+            .resolve_accelerated_partitions(&table, &id_schema(), true)
+            .expect("every partition is loaded");
+        assert_eq!(partitions.len(), 1);
+    }
+
+    /// Partitions an earlier process of the executor reported loaded do not
+    /// count for the process now registered.
+    #[tokio::test]
+    async fn partitions_an_earlier_process_loaded_do_not_count() {
+        let registry = make_registry().await;
+        ready_executor(&registry, "executor-1", "p2").await;
+        let table = seed_assigned(&registry, &["executor-1"]).await;
+        registry.set_loaded_partitions(
+            &table,
+            HashMap::from([("executor-1".to_string(), loaded("p1", &[0]))]),
+        );
+
+        registry
+            .resolve_accelerated_partitions(&table, &id_schema(), true)
+            .expect_err("the loaded partition belongs to an earlier process");
+    }
+
+    /// A partition added after the whole table was last loaded is skipped
+    /// until it loads; a partition of that complete set that is no longer
+    /// loaded fails the query.
+    #[tokio::test]
+    async fn a_new_partition_is_read_once_loaded_and_a_lost_one_fails() {
+        let registry = make_registry().await;
+        ready_executor(&registry, "executor-1", "").await;
+        let table = seed_assigned(&registry, &["executor-1"]).await;
+        registry.set_loaded_partitions(
+            &table,
+            HashMap::from([("executor-1".to_string(), loaded("", &[0]))]),
+        );
+        registry
+            .resolve_accelerated_partitions(&table, &id_schema(), true)
+            .expect("the whole table is loaded");
+
+        let store = registry.accelerations_partition_store();
+        store
+            .apply_discovery(&table, &["bucket(2, id)".to_string()], &[bucket(1)], &[])
+            .await
+            .expect("discover a partition");
+        store
+            .assign_partition(&table, &bucket(1), "executor-1")
+            .await
+            .expect("assign partition");
+        let partitions = registry
+            .resolve_accelerated_partitions(&table, &id_schema(), true)
+            .expect("the new partition is skipped until it loads");
+        assert_eq!(partitions.len(), 1);
+
+        registry.set_loaded_partitions(
+            &table,
+            HashMap::from([("executor-1".to_string(), loaded("", &[1]))]),
+        );
+        let error = registry
+            .resolve_accelerated_partitions(&table, &id_schema(), true)
+            .expect_err("a partition of the complete set is no longer loaded");
+        assert!(
+            error
+                .to_string()
+                .contains("no ready executor serves 1 of its 2 partitions"),
+            "unexpected error: {error}"
+        );
+    }
+
+    /// When a partition replaces one of the last set read whole, its rows may
+    /// have moved there, so the table is not read until it loads.
+    #[tokio::test]
+    async fn a_partition_that_replaces_a_read_one_is_not_skipped() {
+        let registry = make_registry().await;
+        ready_executor(&registry, "executor-1", "").await;
+        let table = seed_assigned(&registry, &["executor-1"]).await;
+        registry.set_loaded_partitions(
+            &table,
+            HashMap::from([("executor-1".to_string(), loaded("", &[0]))]),
+        );
+        registry
+            .resolve_accelerated_partitions(&table, &id_schema(), true)
+            .expect("the whole table is loaded");
+
+        let store = registry.accelerations_partition_store();
+        store
+            .apply_discovery(
+                &table,
+                &["bucket(2, id)".to_string()],
+                &[bucket(1)],
+                &[bucket(0)],
+            )
+            .await
+            .expect("replace the partition");
+        store
+            .assign_partition(&table, &bucket(1), "executor-1")
+            .await
+            .expect("assign partition");
+        let error = registry
+            .resolve_accelerated_partitions(&table, &id_schema(), true)
+            .expect_err("the replacement has not loaded");
+        assert!(
+            error
+                .to_string()
+                .contains("no ready executor serves 1 of its 1 partitions"),
+            "unexpected error: {error}"
+        );
+    }
+
+    /// An executor that holds a partition the table assigns to another
+    /// executor is not read: its scan would return that partition's rows too.
+    #[tokio::test]
+    async fn an_executor_holding_another_executors_partition_is_not_read() {
+        let registry = make_registry().await;
+        ready_executor(&registry, "executor-1", "").await;
+        ready_executor(&registry, "executor-2", "").await;
+        let table = seed_assigned(&registry, &["executor-1", "executor-2"]).await;
+        registry.set_loaded_partitions(
+            &table,
+            HashMap::from([
+                ("executor-1".to_string(), loaded("", &[0, 1])),
+                ("executor-2".to_string(), loaded("", &[1])),
+            ]),
+        );
+
+        let error = registry
+            .resolve_accelerated_partitions(&table, &id_schema(), true)
+            .expect_err("executor-1 also holds executor-2's partition");
+        assert!(
+            error
+                .to_string()
+                .contains("no ready executor serves 1 of its 2 partitions"),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[tokio::test]
+    async fn partitions_without_a_ready_executor_do_not_resolve() {
+        let registry = make_registry().await;
+        let table = TableReference::bare("t");
+        let store = registry.accelerations_partition_store();
+        let partitions: Vec<PartitionValue> = (0..2)
+            .map(|bucket| HashMap::from([("bucket(2, id)".to_string(), Some(bucket.to_string()))]))
+            .collect();
+        store
+            .set_unassigned_partitions(
+                &table,
+                partitions.clone(),
+                vec!["bucket(2, id)".to_string()],
+            )
+            .await
+            .expect("seed partitions");
+        store
+            .assign_partition(&table, &partitions[0], "executor-1")
+            .await
+            .expect("assign partition");
+        // Connected, but without a FlightSQL client, so not ready.
+        let (tx, _rx) = mpsc::channel(1);
+        registry.register("executor-1".to_string(), "", tx).await;
+
+        let error = registry
+            .resolve_accelerated_partitions(&table, &id_schema(), true)
+            .expect_err("no partition has a ready executor");
+        assert!(
+            error
+                .to_string()
+                .contains("no ready executor serves 2 of its 2 partitions"),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_table_with_no_partitions_resolves_to_no_scans() {
+        let registry = make_registry().await;
+        let table = TableReference::bare("t");
+        registry
+            .accelerations_partition_store()
+            .set_unassigned_partitions(&table, Vec::new(), vec!["bucket(2, id)".to_string()])
+            .await
+            .expect("seed partitions");
+
+        let partitions = registry
+            .resolve_accelerated_partitions(&table, &id_schema(), true)
+            .expect("a table with no partitions resolves");
+        assert!(partitions.is_empty());
     }
 
     #[tokio::test]
@@ -1445,7 +3344,7 @@ mod tests {
     async fn send_command_with_ack_success() {
         let registry = make_registry().await;
         let (tx, rx) = mpsc::channel(8);
-        let handles = registry.register("e1".to_string(), tx).await;
+        let handles = registry.register("e1".to_string(), "", tx).await.handles;
         spawn_fake_executor_ack(rx, handles.pending_acks.clone(), None);
 
         let result = registry
@@ -1463,7 +3362,7 @@ mod tests {
     async fn send_command_with_ack_propagates_application_error() {
         let registry = make_registry().await;
         let (tx, rx) = mpsc::channel(8);
-        let handles = registry.register("e1".to_string(), tx).await;
+        let handles = registry.register("e1".to_string(), "", tx).await.handles;
         spawn_fake_executor_ack(
             rx,
             handles.pending_acks.clone(),
@@ -1492,7 +3391,7 @@ mod tests {
     async fn send_command_with_ack_times_out_when_no_response() {
         let registry = make_registry().await;
         let (tx, _rx) = mpsc::channel(8); // _rx kept alive but never read
-        let _handles = registry.register("e1".to_string(), tx).await;
+        let _handles = registry.register("e1".to_string(), "", tx).await;
 
         let err = registry
             .send_command_with_ack(

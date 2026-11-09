@@ -79,23 +79,26 @@ self-hosted runner — dispatch `signoff.yml` with `run_targeted_prechecks=true`
 to get them back.
 
 **The scoped steps build each crate the way the workspace builds it.** The
-features come from a `cargo metadata` resolve of the whole workspace,
+features come from a `cargo metadata` resolve of the whole workspace with the
+gate's feature set,
 package-qualified (`runtime/debezium,…`), rather than from the crate's own
-defaults. That matters because a crate's defaults are not what it is ever built
-with: `runtime` declares 54 features and **no `default`**, so a bare
-`cargo clippy -p runtime` compiles it with *zero* features, while the workspace
-resolve gives it 35 — `spiced`'s defaults unify them in. Linting and testing a
-configuration no real build produces is what makes a scoped pre-lint fail on code
-the full gate accepts, and it guarantees a cache miss against the gate that
-follows. The resolve is derived on every run, so there is no feature list to
-drift. If `cargo metadata` or `python3` is unavailable the steps fall back to
-package defaults rather than failing.
+defaults. A scoped crate's own defaults can omit capabilities enabled by its
+workspace consumers. `RUST_GATE_FEATURES` in the Makefile defines the features
+shared by full lint, nextest, CLI verification, and this metadata resolve. It
+includes the Cayenne DuckDB differential tests and HTTP/Wasm function features.
+If `cargo metadata` or `python3` is unavailable the targeted steps fall back to
+package defaults; the full workspace gate still runs.
 
-The CLI is built with the same profile as the lint and test passes
-(`build-cli-dev`), not a release build: a release build shares no artifacts with
-them and would recompile its whole dependency graph just to prove the binary
-links. The merge queue's required `Build (release profile)` job builds the CLI,
-`spiced`, and the release install for real.
+Nextest's test build also builds the CLI. `verify-cli` checks cargo's emitted
+artifacts and executes the CLI, using the same selection, features, and profile.
+The merge queue's required `Build (release profile)` job separately builds the
+CLI, `spiced`, and the release install.
+
+Sign-off clears inherited Make flags and nextest filters, profile, retry, and
+empty-suite overrides before invoking the gate. A focused `make nextest` remains
+available for development, but cannot silently narrow a sign-off. The default
+nextest policy retries failures **three times**; the zero-retry correctness
+overrides remain in force. A test that succeeds on a permitted retry still passes.
 
 On success it posts a `signoff` commit status on your current `HEAD`. If the
 **Attestation** check already ran and failed before the sign-off existed, the
@@ -133,7 +136,8 @@ sign-off.
 `scripts/signoff status` reports only a commit's own status; the inheritance
 check runs in the PR's **Attestation** workflow.
 
-A sign-off that **failed** on `HEAD` disqualifies that commit. **Attestation**
+A completed sign-off that **failed**, locally or remotely, posts a failure on
+`HEAD` and refreshes **Attestation**, replacing any previous success. **Attestation**
 rejects it before anything else, so an earlier sign-off cannot be inherited past
 it and the fast-track paths below cannot route around it: a merge of the base
 can be textually clean and still be semantically broken, and a sign-off run
@@ -178,13 +182,19 @@ only, like the other fast-tracks.
 Rust-affecting means Rust sources, the Cargo/toolchain config, **and the config
 files the gate itself reads**:
 
-- `*.rs`, `Cargo.toml`, `Cargo.lock`, `rust-toolchain[.toml]`, `.cargo/`
-- `.ci/clippy.toml` (the config `make lint-rust` uses via `CLIPPY_CONF_DIR`) and
-  the root `clippy.toml`; `[.]rustfmt.toml`
+- Every file under `crates/`, `bin/`, `tools/`, and `vendor/`, including test
+  fixtures and build inputs; `*.rs`, `*.snap`, and `*.proto` elsewhere
+- Files outside those trees that a Rust source names by a relative path —
+  compiled in with `include_bytes!`/`include_str!` or opened by a test — such
+  as the `test/tls/` PEM files, one of which a `runtime-tls` unit test pins by
+  SHA-256
+- `Cargo.toml`, `Cargo.lock`, `rust-toolchain[.toml]`, `.cargo/`, and `version.txt`
+- `clippy.toml` (the config `make lint-rust` reads); `[.]rustfmt.toml`
 - `.config/nextest.toml` — retries, slow-test timeouts, test groups
 - `layers.toml`, `scripts/check_crate_layers.py`,
   `scripts/check_rust_gate_paths.py`, and
-  `scripts/check_module_reachability.py` — the no-compile guards it runs
+  `scripts/check_module_reachability.py` — the no-compile guards it runs — and
+  `scripts/rust_guard_common.py`, the helpers those guards import
 - the root `Makefile` — it holds every `-Dclippy::…` flag the gate enforces
 
 The merge queue still runs the full suite on the merged result — its
@@ -197,8 +207,10 @@ paths), and the `code_changes` filter in `.github/actions/check-code-changes`
 also gates integration and E2E, and it only has to *cover* the set). A path
 missing from all three lands on trunk having never been linted, built, or
 tested, so `make lint-rust` runs `scripts/check_rust_gate_paths.py`. It derives
-what must be gated from what the `lint-rust` recipe reads, from the tracked
-config-file names, and from every tracked `.rs` file — rather than from a list
+what must be gated from what the `lint-rust` recipe reads (including the
+`scripts/` modules its guards import), from the tracked config-file names, from
+tracked sources, fixtures, and build inputs, and from the `../` path literals in
+Rust sources that reach outside the source trees — rather than from a list
 someone has to remember — and fails when the three drift. Change them together.
 
 Deriving from the tracked sources is what catches a whole source *tree* going
@@ -213,23 +225,29 @@ runs first — a clean tree exercises only the shapes it happens to contain.
 ### The unreachable-module guard
 
 `make lint-rust` also runs `scripts/check_module_reachability.py`, which fails
-when a file under a workspace crate's `src/` is not reachable from that crate's
-roots through `mod` declarations. Such a file compiles into nothing, so
+when a file under a workspace crate's `src/`, `tests/`, `benches/` or
+`examples/` is not reachable through `mod` declarations from any of that
+crate's targets. Such a file compiles into nothing, so
 `cargo build`, `cargo clippy`, `cargo fmt --all` and `cargo test` are all silent
 about it — it looks like source and ships nothing. Four stale trees had
 accumulated this way, together holding ~2,200 lines and 26 tests that had never
 run ([#12735](https://github.com/spiceai/spiceai/issues/12735),
 [#12737](https://github.com/spiceai/spiceai/issues/12737)).
 
-Roots come from `cargo metadata`, so a `path = "…"` target override in a
-`Cargo.toml` is honoured without the script parsing manifests. Only `src/` is in
-scope: cargo auto-discovers `benches/`, `tests/` and `examples/` files as their
-own targets, so they are reachable with no `mod` declaration and including them
-reports ~200 files that are all fine.
+Roots are every target `cargo metadata` lists — library, binaries, tests,
+benches and examples — so auto-discovered targets, `autotests = false`, and a
+`path = "…"` target override are all honoured without the script parsing
+manifests. That is what catches a test that silently runs nothing: a top-level
+`tests/*.rs` that a crate with `autotests = false` never declares, or a file in
+a `tests/` subdirectory no `mod` reaches (see
+[`integration_test_layout.md`](integration_test_layout.md)).
 
 The walk handles the cases a regex over `mod` alone gets wrong — `#[path = "…"]`
-redirects, declarations behind `#[cfg(…)]` (still declarations), inline
-`mod x { … }` nesting, and `mod` tokens inside comments and string literals.
+redirects (a file loaded this way owns its directory, like `mod.rs`), every
+target root owning its directory whatever it is named, a file compiled both as
+a root and as another target's module (walked in each context), declarations
+behind `#[cfg(…)]` (still declarations), inline `mod x { … }` nesting, and
+`mod` tokens inside comments and string literals.
 `scripts/test_check_module_reachability.py` covers each one.
 
 ### Dependabot bumps are fast-tracked
@@ -267,9 +285,56 @@ Options:
 ```bash
 scripts/signoff -f            # sign off even with an uncommitted/unpushed tree
 scripts/signoff --no-verify   # attest without running the checks (honor system)
+scripts/signoff --note TEXT   # add TEXT to the description (with --no-verify: where the checks ran)
+scripts/signoff verify        # run the checks on HEAD, post no status (HEAD need not be pushed)
 scripts/signoff status        # does HEAD have its own sign-off?
 scripts/signoff --help        # full usage
 ```
+
+### Sign off several PRs with one run (`scripts/signoff-batch`)
+
+A full sign-off takes hours. `scripts/signoff-batch` runs the checks once for a
+set of PRs, and then attests each PR:
+
+```
+  trunk T ──┬── #a + T ──┐
+            ├── #b + T ──┼──▶ batch = T + #a' + #b' + #c' ──▶ scripts/signoff verify
+            └── #c + T ──┘                                         │
+                                                         pass ─────┴───── fail
+                                                           │                │
+                            push each #x' (no force push), │                │ push nothing; name the
+                            then signoff -f --no-verify    ▼                ▼ PRs that change the
+                            --note "... in batch with ..."                    failing crates
+```
+
+```bash
+scripts/signoff-batch 15040 15041 '#15047'   # merged in this order
+scripts/signoff-batch --plan 15040 15041     # build and check out the batch, then stop
+```
+
+1. The script pins `trunk` to one commit, T, and merges T into each PR head. These
+   merges are local until the checks pass.
+2. It merges the updated heads onto T, in the order given. A conflict with
+   `trunk`, or between two PRs, stops the run and names the files and PRs.
+3. It runs `scripts/signoff verify` on the batch, in a worktree that later runs
+   reuse, so the build cache stays warm. The default worktree is
+   `<checkout>-signoff-batch`; set `--worktree` or `SIGNOFF_BATCH_WORKTREE` to
+   change it. The log goes to `.git/signoff-batch/<batch>.log`.
+4. If the checks pass, the script asks for confirmation (skip it with `--yes`).
+   Then it pushes each head and attests it. The description names the other PRs
+   in the batch. A head that already had `trunk` is pushed too. Each push is
+   leased on the head the batch checked, so it is rejected if the branch moved
+   or was deleted during the run, and the script does not attest that PR.
+
+If the checks fail, the script pushes and attests nothing. It reads the log for
+crates that did not compile or had failing tests, and lists the PRs that change
+each crate or one of its workspace dependencies. The batch stays checked out, so
+you can inspect it or run the batch again without a suspect PR.
+
+A passing batch does not prove that each PR passes alone, because one PR can
+depend on another PR in the batch. The engineer who chooses the batch is
+responsible for that. The merge queue still runs the full suite on each PR
+before it reaches `trunk`.
 
 ### Remote sign-off (self-hosted runner)
 
@@ -561,6 +626,57 @@ failure", which blamed the branch for the volume.
 Set `SIGNOFF_MIN_FREE_GIB` to change the floor. Locally both checks only warn and
 the output is not watched — your own disk is yours to manage.
 
+
+### "Cargo.lock does not match the manifests"
+
+Sign-off asks cargo, before it compiles anything, whether `Cargo.lock` still
+describes the workspace manifests — `cargo metadata --locked`, which is cargo's own
+resolution with permission to write the lockfile withheld. If it would have to write
+one, the branch is not evaluated and the status says so.
+
+**Run `cargo update --workspace`, commit the regenerated `Cargo.lock`, and push.**
+Not "run any cargo command": `cargo fmt` and `cargo --version` resolve nothing, and
+anything run under `--locked` is refused for this very reason.
+
+`pr.yml`'s `Build and Test` runs the same check, as
+`scripts/signoff preflight-lockfile`, immediately after the toolchain setup — one
+implementation rather than two, for the reason two copies of a guard always drift.
+It answers there in about ten seconds, against the same question that job otherwise
+asks in its *last* step, after the whole suite has run. On 2026-08-26 that cost 13
+merge-queue branches the better part of an hour each, and the report was the single
+line `Update Cargo.lock`
+([#13598](https://github.com/spiceai/spiceai/issues/13598)).
+
+The queue is also where this shape of staleness is born: one PR changes a version in
+`[workspace.package]` while another adds or renames a member, git merges both
+cleanly because they touch different regions of the lockfile, and the combination is
+stale. Neither author can see it on their own PR, where `Attestation` is the only
+job that runs — so the sign-off gate is the first place anyone can be told.
+
+A missing lockfile reports the same way. That is cargo's own reading of `--locked`,
+and it matters here because `git diff` cannot see one: a branch that deletes
+`Cargo.lock` and lets the first cargo command recreate it has an *untracked* file,
+which a diff-based check passes.
+
+Two deliberate asymmetries:
+
+- **An unrecognised cargo failure is not a verdict.** An unreachable registry or a
+  manifest cargo cannot parse warns and passes; reporting it as a stale lockfile
+  would send you to regenerate a file that was never the problem. The full gate
+  reports the real cause minutes later with better context.
+- **Because of that, the lockfile is re-checked after the gate runs.** `lint-rust`
+  and `nextest` invoke cargo *without* `--locked`, so on a failure the preflight
+  could not read, cargo brings the lockfile up to date on its way past. Without the
+  second look, the run would post `signoff=success` for a HEAD whose committed
+  lockfile does not describe it. The comparison is against a snapshot taken before
+  the checks, so `scripts/signoff -f` on a tree already carrying lockfile edits is
+  judged on what *this run* changed.
+
+The guard's own wording is checked against the pinned toolchain rather than assumed:
+`scripts/test_signoff_disk_guard.sh` builds a one-crate fixture whose lockfile
+really is stale and asserts that cargo's refusal is still recognised, so a reworded
+diagnostic after a channel bump fails a test instead of silently retiring the check.
+
 ### "Compiler cache unreachable — checks did not complete"
 
 The pool's runners compile through `sccache` (`RUSTC_WRAPPER`, configured by
@@ -587,6 +703,51 @@ cache when both appear — a volume at zero can break the cache endpoint too, an
 reclaiming space is then the remedy that fixes both. Unlike disk there is no
 after-the-fact backstop: the endpoint may well be answering again by the time the
 run ends, so the only evidence is what the build said while it was failing.
+
+### "Compiler subprocess crashed — checks did not complete"
+
+The compiler driver can lose a subprocess to a signal — a crash in `ld` itself,
+the kernel killing it for memory, or the driver's own frontend going down the
+same way — and reports it in its own words, with a crash snapshot beside them;
+cargo then stops the build at that crate:
+
+```
+clang: error: unable to execute command: Segmentation fault: 11
+clang: error: linker command failed due to signal (use -v to see invocation)
+clang: note: diagnostic msg: /var/folders/…/T/linker-crash-122a1e
+error: could not compile `cayenne` (test "result_correctness_vs_sqlite_test") due to 1 previous error
+```
+
+The driver words a crash in its own frontend the same way, so the status names
+the class rather than the tool:
+
+```
+clang: error: unable to execute command: Segmentation fault: 11
+clang: error: clang frontend command failed due to signal (use -v to see invocation)
+error: could not compile `spiced` (lib) due to 1 previous error
+```
+
+**Re-dispatch it.** The artifact being produced never appeared, so the sign-off
+stopped there: whatever passed before it stands (the run above had already cleared
+lint), and nothing after it ran. None of that is a statement about your branch.
+The hedge is the same as for an unloadable test binary: if it recurs on this
+branch alone, or names a crate whose build this branch changes — a new build
+script, a dependency whose objects the linker cannot digest — the diff is worth
+suspecting.
+
+The same watcher reads this signature, and both halves are required: the
+compiler driver reporting a signal under its own `<driver>: error:` prefix at the
+start of the line (`clang`, `cc`, `gcc`, `g++`, `collect2` and their C++ spellings;
+`collect2` says `fatal error:`),
+*and* cargo's `could not compile` line. This repo's own suites assert on error
+strings, so a test that quotes the driver's wording and then fails stays a
+verdict about the branch; a `compile_error!` or build script whose text reads
+like a crash — prefix included — lands behind rustc's own `error:` rather than at
+the start of the line, and stays one too; and cargo's line alone is every
+ordinary compile error. Disk,
+cache, and an unloadable artifact all outrank it when they appear alongside,
+because each of those names a cause with its own remedy where this one only
+names the symptom.
 
 ### External contributors (forks)
 
@@ -624,9 +785,17 @@ Required checks in the merge queue (the `trunk` ruleset):
 - `Build (release profile)`
 - `Integration Tests (part 1/2/3)`
 - `ADBC Integration Tests`
-- `Features Check`
 - `Check Rust Licenses`
 - `E2E Test CI` (a summary "gate" job over the whole E2E matrix)
+- `Verify Verus proofs` (one context for every crate that carries Verus proofs —
+  `crates/hash-index` and `crates/cache` today; a normal `cargo build` erases the
+  specifications, so no other check would notice a postcondition that stopped
+  holding. Crate-agnostic on purpose: a crate opting in changes the verify loop
+  in `verus_verify.yml`, not the required-check name)
+
+`Features Check` (features.yml) is **not** required: that workflow is disabled,
+and a required check nothing reports blocks every pull request instead of
+passing it. Re-enable the workflow before adding it back to `REQUIRED_CHECKS`.
 
 Advisory checks that also run on `merge_group` but don't block (they can be
 promoted to required with a gate job later): `integration tests (llms)`,

@@ -106,9 +106,15 @@ macro_rules! info_spaced {
     }};
 }
 
+/// Logs a warning at most once per `$tracer.interval` for each key.
+///
+/// `warn_spaced!(tracer, key = k, "...", args)` limits on `k` and formats the message from the
+/// remaining arguments, so the key never has to appear in the text.
+/// `warn_spaced!(tracer, "...{}...", k)` limits on `k` and formats `k` into the message.
 #[macro_export]
 macro_rules! warn_spaced {
-    ($tracer:expr, $msg:expr, $key:expr) => {{
+    ($tracer:expr, key = $key:expr, $($arg:tt)+) => {{
+        let key = $key;
         let mut logged_times = $tracer.logged_times.lock().unwrap_or_else(|poisoned| {
             tracing::error!("Lock poisoned while logging: {poisoned}");
             poisoned.into_inner()
@@ -116,7 +122,7 @@ macro_rules! warn_spaced {
 
         let now = std::time::Instant::now();
         let mut should_log = true;
-        if let Some(last_time) = logged_times.get($key) {
+        if let Some(last_time) = logged_times.get(&*key) {
             if now.duration_since(*last_time) < $tracer.interval {
                 // If the interval hasn't elapsed, do not log.
                 should_log = false;
@@ -125,15 +131,22 @@ macro_rules! warn_spaced {
 
         if should_log {
             // Update the last logged time and log the message.
-            logged_times.insert($key.to_string(), now);
-            tracing::warn!($msg, $key);
+            logged_times.insert(key.to_string(), now);
+            tracing::warn!($($arg)+);
         }
     }};
+    ($tracer:expr, $msg:expr, $key:expr) => {
+        $crate::warn_spaced!($tracer, key = $key, $msg, $key)
+    };
 }
 
+/// Logs an error at most once per `$tracer.interval` for each key.
+///
+/// Takes the same two forms as `warn_spaced!`.
 #[macro_export]
 macro_rules! error_spaced {
-    ($tracer:expr, $msg:expr, $key:expr) => {{
+    ($tracer:expr, key = $key:expr, $($arg:tt)+) => {{
+        let key = $key;
         let mut logged_times = $tracer.logged_times.lock().unwrap_or_else(|poisoned| {
             tracing::error!("Lock poisoned while logging: {poisoned}");
             poisoned.into_inner()
@@ -141,15 +154,18 @@ macro_rules! error_spaced {
 
         let now = std::time::Instant::now();
         let mut should_log = true;
-        if let Some(last_time) = logged_times.get($key) {
+        if let Some(last_time) = logged_times.get(&*key) {
             if now.duration_since(*last_time) < $tracer.interval {
                 should_log = false;
             }
         }
 
         if should_log {
-            logged_times.insert($key.to_string(), now);
-            tracing::error!($msg, $key);
+            logged_times.insert(key.to_string(), now);
+            tracing::error!($($arg)+);
         }
     }};
+    ($tracer:expr, $msg:expr, $key:expr) => {
+        $crate::error_spaced!($tracer, key = $key, $msg, $key)
+    };
 }

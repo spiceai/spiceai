@@ -117,6 +117,10 @@ mod tests {
             FieldMapping {
                 field_type: Some("text".to_string()),
                 properties: None,
+                fields: None,
+                ignore_above: None,
+                index: None,
+                normalizer: None,
                 dims: None,
                 similarity: None,
             },
@@ -126,6 +130,10 @@ mod tests {
             FieldMapping {
                 field_type: Some("integer".to_string()),
                 properties: None,
+                fields: None,
+                ignore_above: None,
+                index: None,
+                normalizer: None,
                 dims: None,
                 similarity: None,
             },
@@ -135,6 +143,10 @@ mod tests {
             FieldMapping {
                 field_type: Some("dense_vector".to_string()),
                 properties: None,
+                fields: None,
+                ignore_above: None,
+                index: None,
+                normalizer: None,
                 dims: Some(384),
                 similarity: Some("cosine".to_string()),
             },
@@ -163,6 +175,10 @@ mod tests {
             FieldMapping {
                 field_type: Some("unsigned_long".to_string()),
                 properties: None,
+                fields: None,
+                ignore_above: None,
+                index: None,
+                normalizer: None,
                 dims: None,
                 similarity: None,
             },

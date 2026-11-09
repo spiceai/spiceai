@@ -62,17 +62,15 @@ ci:
 	make -C bin/spiced
 
 # Local CI attestation ("developer sign-off"). Skips Rust lint/build/tests when
-# the branch has no Rust-affecting files vs trunk (.rs, Cargo.toml/lock,
-# rust-toolchain*, .cargo/*); otherwise target-lints changed crates, then full
+# the branch has no Rust-affecting files vs trunk (sources, fixtures, build
+# inputs, and gate configuration); otherwise target-lints changed crates, then full
 # lint + unit tests. Posts a `signoff` commit status on HEAD so the PR can enter
 # the merge queue. See scripts/signoff and docs/dev/ci_signoff.md.
 .PHONY: signoff
 signoff:
 	@./scripts/signoff
 
-# Remote sign-off for the current branch: probe lab SSH hosts (192.168.1.100,
-# 192.168.1.101) for a Git checkout at $HOME/dev/spice2 and run scripts/signoff
-# there when available; otherwise dispatch the self-hosted GitHub Actions
+# Remote sign-off for the current branch: dispatch the self-hosted GitHub Actions
 # signoff.yml workflow. Supports Git and JJ via scripts/signoff remote. Skips
 # Rust lint/build/tests when the branch has no Rust-affecting files vs trunk
 # (same as local signoff).
@@ -110,12 +108,14 @@ endif
 # (spiceai/spiceai#12337). One selection resolves once, and a nextest filterset
 # decides which of the built tests actually run.
 #
-# `--tests` rather than `--lib` is what brings cayenne's integration tests and
-# the `metrics` binary into that one selection. It builds every test target
-# in the workspace, including ones the filterset never runs. Naming just the
-# wanted targets with `--test <glob>` would build fewer, but a new test file that
-# didn't match the glob would silently stop being covered — cayenne already has
-# a test target that doesn't follow the `*_test` convention its other 55 do.
+# Integration-test targets are named one by one (`--test <name>`) rather than
+# with `--tests`, which builds and links every test target in the workspace,
+# including the dozens the filterset never runs. The names are not kept by hand:
+# `scripts/nextest_build_targets.py` derives them from the filterset itself, so a
+# new test file the filterset selects (any new cayenne test, for example) is
+# built without an edit here. That script builds a target whenever the filterset
+# cannot rule it out before the build, and falls back to `--tests` when it cannot
+# evaluate something, so it can widen the build but never drop a selected test.
 #
 # `metrics` is a `tests/` binary rather than a `--lib` test because it needs its
 # own process to control the OTel meter-provider install order. Every metrics
@@ -125,14 +125,12 @@ endif
 # `kind(=proc-macro)` is the other half of what `--lib` used to select: nextest
 # labels a proc-macro crate's unit tests `proc-macro`, not `lib`, so leaving it
 # out would silently drop runtime-parameters-derive's tests from the gate.
-# `--tests` also builds the 14 bin targets as unit-test harnesses; `--lib` never
-# ran those, and nothing here selects `kind(=bin)`, so it still doesn't.
-#
-# Running cayenne's integration tests under the workspace resolve rather than
-# `-p cayenne` enables its `turso` feature, which puts 304 `*_turso` variants in
-# the gate alongside their SQLite siblings. They need more stack than the 2 MiB
-# std gives a thread; `test_with_backends!` reserves it (see
-# `crates/cayenne/tests/common/mod.rs`), so no name needs excluding here.
+# `--bins` builds every bin target as a unit-test harness, and
+# `kind(=bin)` below runs them: the `spice` CLI's `main.rs` tests (argument
+# normalization, `--cloud`/`--cloud-region` validation, machine-mode output)
+# live only there, and a filterset that selects no bin target leaves them
+# built and never run. None needs excluding today; one whose tests could not
+# run in the gate would be excluded by name here, with the reason beside it.
 #
 # Shared so `nextest` and `verify-cli` cannot drift onto different selections:
 # a different selection resolves different features, which would make verify-cli
@@ -149,8 +147,101 @@ endif
 # command surface. `cloud_integration` needs live credentials and remains in
 # the nightly gate, so select the other two binaries by name rather than every
 # integration test in the `spice` package.
-NEXTEST_SELECTION := --all --exclude libnfs
-NEXTEST_FILTER := kind(=lib) + kind(=proc-macro) + (package(=cayenne) & kind(=test)) + (package(=runtime-cloud-connect) & kind(=test)) + (package(=spice) & binary(=cli_integration)) + (package(=spice) & binary(=connect_service_cli)) + binary(=metrics)
+#
+# `spiced`'s integration tests are modules of its `integration` binary.
+# `dependency_logging` uses a loopback S3 endpoint to exercise Iceberg retries
+# through the runtime's dependency logger without credentials, so the gate
+# checks the diagnostic emitted by the pinned storage dependency as well as the
+# formatter's unit tests; `build_logging` and `cpu_budget` start `spiced` or
+# build its runtime with no external service. `cloud_connect_bootstrap` is left
+# out: spiced's enrollment client does not trust the test's HTTPS mock, on Linux
+# or macOS, because nothing gives it the test's certificate authority.
+#
+# `llms`'s `anthropic_stream_errors` and `list_models_errors` modules are
+# selected for the same reason: each stands a local one-shot HTTP server up on an
+# ephemeral port and drives a provider adapter against it, so they exercise the
+# real client's error mapping with no credentials and no external service, as
+# do `model2vec_hf_cache`, `safetensors_hf_cache` and `gguf_hf_cache` against a local Hugging Face cache. They are modules
+# of `llms`'s `integration` binary; its `llms` module calls the live provider
+# APIs and needs a `.env`, so it stays in the nightly gate.
+#
+# `vortex-datafusion`'s integration tests are offline: they install the
+# process-wide segment cache and measure the footer cache's heap through a
+# counting allocator, so select every `kind(=test)` binary in the package.
+#
+# `--features` here, not a per-crate default, because the result-correctness
+# lanes are the only reason the gate links an engine at all. Cargo skips a test
+# target whose `required-features` are unmet *without saying so*, so before this
+# the filterset below selected `result_correctness_vs_duckdb_test` and cargo
+# silently never built it — selection looked complete while three lanes never
+# ran. See `crates/cayenne/tests/correctness/README.md`.
+#
+# Scoped to `cayenne` deliberately. `runtime/sqlite` would also unlock runtime's
+# accelerator-parity binary, but the feature flows through the
+# whole `--all` build: every runtime test binary the gate builds relinks with
+# them, and those link at hundreds of megabytes each. That is a
+# large, permanent cost on every sign-off and merge-queue run to gain two
+# micro-shape comparisons — the thinnest of the five lanes. It belongs in the
+# integration workflow, which already builds with `adbc,sqlite`.
+#
+# The chDB lane is deliberately not here. `chdb-rust` needs libchdb, which its
+# build script fetches over the network, so folding it into the gate would make
+# every sign-off depend on that fetch and on a machine that can link it. CI runs
+# it instead (`.github/workflows/correctness_chdb.yml`). Because cargo drops a
+# target whose required-features are unmet *without saying so* — the very way
+# three lanes once went unbuilt — the `nextest` target says out loud that this
+# one did not run.
+# Lint, test compilation, and CLI verification must enable the same capabilities.
+# The differential-test feature also belongs in lint's resolve so the two gates
+# check the same Cayenne implementation.
+RUST_GATE_FEATURES := adbc,aws-secrets-manager,keyring-secret-store,models,odbc,release,mcp,snapshots,elasticsearch,http-functions,wasm-functions,rate-control,spicebench,cayenne/result-correctness-duckdb
+NEXTEST_SELECTION := --all --exclude libnfs \
+	--features $(RUST_GATE_FEATURES)
+
+.PHONY: print-rust-gate-features
+print-rust-gate-features:
+	@printf '%s\n' '$(RUST_GATE_FEATURES)'
+
+# `kind(=bin)` selects the unit tests of every bin target: the `spice` CLI's
+# `main.rs` tests, `spice-substrait-compliance`'s fork-ledger guards
+# (docs/dev/fork_patches.md), `testoperator`'s dispatch-file oracle guard,
+# `spidapter`, `spicepodschema` and `cayenne-flightsql`. `kind(=lib)` reaches
+# none of them. `testoperator`'s oracle guard is still named on its own as
+# well: nextest's `test(=…)` is an exact match on the rustc `--test` name,
+# which is module-qualified (`commands::tests::…`), and the guard's own test
+# asserts that exact clause so a filter edit cannot drop it unnoticed.
+#
+# The last three are fork-ledger guards as well, in integration-test targets
+# `kind(=lib)` cannot reach, and they ran nowhere before being named here:
+# `json_semantics` holds the three `datafusion-functions-json` guards,
+# `adbc_cancellation` the one guard shared by the `arrow-adbc` fork PR #4 and #65
+# rows, and `spiced`'s `cpu_budget` module the guard for vortex's `set_available_parallelism` —
+# six ledger rows across the three. Each is self-contained — a fake
+# in-process ADBC driver, a spicepod written to a temp dir, arrow built in
+# memory — needing no credentials and no service. The gate then built every test
+# target whether or not it was selected, so leaving them out saved only the
+# seconds of running them and cost the coverage the ledger claimed.
+# `runtime`'s `rate_control` binary holds the HTTP rate-control tests, which are
+# self-contained and gate the parameter validation and shared-origin rules.
+# `runtime`'s `cayenne_runtime_tuning` binary loads real Spicepods from a temp dir
+# and gates `runtime.adaptive_tuning` / `target_*` resolution and the
+# warnings for the retired `cayenne_tuning` / `cayenne_goal_*` names.
+# They need `runtime/rate-control`, which `rate-control` in RUST_GATE_FEATURES
+# enables for NEXTEST_SELECTION, to be built at all —
+# the target's `required-features` drops it otherwise. They are kept out of
+# `runtime`'s `integration` binary on purpose: selecting any test there makes
+# nextest execute that binary to list it, and its debug build on macOS is too
+# large to load (dyld aborts before `main`, failing the whole run).
+# `runtime`'s `chat_tool_use` binary drives `/v1/chat/completions` through the
+# tool-use loop against an in-process mock of the Anthropic Messages API.
+# `duckdb-oracle`'s `integration` binary checks the installed-libduckdb driver
+# every DuckDB result-correctness lane compares against: Arrow types, NULLs and
+# settings round-trip through ADBC, and a database file reopens. It loads the
+# libduckdb `nextest` installs, needing no credentials and no service.
+# `runtime-datafusion`'s `is_distinct_from_precedence` binary is self-contained
+# (in-memory SessionContext, no credentials) and gates the vendored sqlparser
+# fix that binds `IS [NOT] DISTINCT FROM` tighter than `AND` / `OR`.
+NEXTEST_FILTER := kind(=lib) + kind(=proc-macro) + kind(=bin) + (package(=runtime) & binary(=rate_control)) + (package(=runtime) & binary(=cayenne_runtime_tuning)) + (package(=cayenne) & kind(=test)) + (package(=runtime-acceleration) & binary(=optional_snapshot_files)) + (package(=vortex-datafusion) & kind(=test)) + (package(=runtime-cloud-connect) & kind(=test)) + (package(=spice) & binary(=cli_integration)) + (package(=spice) & binary(=connect_service_cli)) + binary(=metrics) + (package(=testoperator) & (test(=commands::tests::benchmark_dispatches_validate_results_against_an_oracle) | test(=commands::tests::nextest_filter_selects_the_oracle_dispatch_guard_by_its_rustc_name))) + (package(=runtime-udfs-api) & binary(=json_semantics)) + (package(=connector-adbc) & binary(=adbc_cancellation)) + (binary_id(=llms::integration) & test(/^(anthropic_stream_errors|list_models_errors|model2vec_hf_cache|safetensors_hf_cache|gguf_hf_cache)::/)) + (binary_id(=llms-llamacpp::integration) & test(/^load_errors::/)) + binary_id(=llama-cpp::integration) + binary_id(=duckdb-oracle::integration) + (binary_id(=spiced::integration) - test(/^cloud_connect_bootstrap::/)) + (package(=runtime) & binary(=results_cache_growth)) + (package(=runtime) & binary(=chat_tool_use)) + (package(=runtime-datafusion) & binary(=is_distinct_from_precedence))
 # Extra narrowing for callers that can't run everything (CI lacks credentials
 # for some tests). It has to *intersect* the expression above rather than sit
 # beside it: nextest unions repeated `-E` flags, so a second `-E 'not (…)'` would
@@ -165,9 +256,28 @@ endif
 ifneq (,$(findstring -E,$(NEXTEST_FLAG))$(findstring --filterset,$(NEXTEST_FLAG)))
 $(error NEXTEST_FLAG carries a nextest filterset — pass it as NEXTEST_FILTER_EXTRA instead, which intersects the gate's own filterset rather than being unioned with it)
 endif
+# Prints the cargo target flags (`--lib --bins --test …`) for the targets the
+# filterset can select; see the `--test <name>` note above. Shared by `nextest`
+# and `verify-cli` so both build the same graph.
+_NEXTEST_TARGETS_CMD = $(PYTHON) scripts/nextest_build_targets.py --filter '$(_NEXTEST_FILTER)' -- $(NEXTEST_SELECTION) $(NEXTEST_FLAG)
 .PHONY: nextest
+# The DuckDB result-correctness lane loads an installed libduckdb through ADBC
+# rather than a DuckDB built into the test binaries. `scripts/libduckdb.py` installs the newest release
+# `test/duckdb_versions.json` lists, checked against its recorded SHA-256 and
+# cached under ~/.cache/spice/libduckdb, so only a machine's first sign-off for a
+# release downloads it. Its manifest goes first on ADBC_DRIVER_PATH, so every
+# sign-off and merge-queue run tests the same release whatever else is installed
+# (LIBDUCKDB_VERSION picks another listed one). A failed install stops the gate:
+# a lane that cannot load its oracle must not pass by not running.
+_WITH_LIBDUCKDB = libduckdb="$$($(PYTHON) scripts/libduckdb.py)" || exit $$?; \
+	export ADBC_DRIVER_PATH="$$libduckdb$${ADBC_DRIVER_PATH:+:$$ADBC_DRIVER_PATH}";
+
 nextest:
-	@cargo nextest run $(NEXTEST_SELECTION) --tests $(NEXTEST_CARGO_PROFILE) $(NEXTEST_FLAG) -E '$(_NEXTEST_FILTER)'
+	@echo 'note: the chDB result-correctness lane is not in this run (it needs libchdb; CI runs it in correctness_chdb.yml).' >&2
+	@echo '      to run it here: cargo test -p cayenne --features result-correctness-chdb --test result_correctness_vs_chdb_test' >&2
+	@$(_WITH_LIBDUCKDB) \
+	targets="$$($(_NEXTEST_TARGETS_CMD))" || exit $$?; \
+	cargo nextest run $(NEXTEST_SELECTION) $$targets $(NEXTEST_CARGO_PROFILE) $(NEXTEST_FLAG) -E '$(_NEXTEST_FILTER)'
 
 # Unit tests for named packages — the fail-fast pre-check scripts/signoff runs on
 # the crates a branch touched, before the full workspace gate. Same lib-only
@@ -178,9 +288,9 @@ nextest:
 # unit tests (29 workspace libraries have none). nextest exits 4 on "no tests to
 # run" by default, which would abort the sign-off for a branch that only touched
 # one of them; the full `nextest` run still gates the workspace.
-# The gate does not build the `spice` CLI on its own, because `nextest`'s `--tests`
-# build already emits it: cargo builds a package's bins alongside that package's
-# integration tests, and `spice` has three. A CLI link error therefore fails
+# The gate does not build the `spice` CLI on its own, because `nextest`'s build
+# already emits it: cargo builds a package's bins alongside that package's
+# integration tests, and the gate selects two of `spice`'s. A CLI link error therefore fails
 # `nextest` itself, and a separate `cargo build -p spice` only re-resolved the
 # whole graph at a selection no other phase in the gate shares.
 #
@@ -195,33 +305,35 @@ nextest:
 verify-cli:
 	@out="$(TARGET_DIR)/verify-cli-artifacts.json"; \
 	mkdir -p "$(TARGET_DIR)"; \
-	cargo test --no-run --message-format json $(CARGO_PROFILE) --tests \
+	targets="$$($(_NEXTEST_TARGETS_CMD))" || exit $$?; \
+	cargo test --no-run --message-format json $(CARGO_PROFILE) $$targets \
 	  $(NEXTEST_SELECTION) $(NEXTEST_FLAG) > "$$out" || exit $$?; \
-	python3 scripts/verify_cli_build.py "$$out" version.txt
+	$(PYTHON) scripts/verify_cli_build.py "$$out" version.txt
 
 .PHONY: nextest-packages
 nextest-packages:
 	@test -n "$(strip $(PACKAGES))" || { echo 'nextest-packages requires PACKAGES="crate1 crate2"' >&2; exit 1; }
-	@cargo nextest run --no-tests=pass $(_LINT_PKG_FLAGS) --lib $(_FEATURES_FLAGS) $(NEXTEST_CARGO_PROFILE) $(NEXTEST_FLAG)
+	@$(_WITH_LIBDUCKDB) \
+	cargo nextest run --no-tests=pass $(_LINT_PKG_FLAGS) --lib $(_FEATURES_FLAGS) $(NEXTEST_CARGO_PROFILE) $(NEXTEST_FLAG)
 
 # Also update .github/workflows/integration.yml with changes to this target
 .PHONY: test-integration
 test-integration:
 	# Test if .env file exists, and login to Spice if not
 	@test -f .env || (`spice login`)
-	@cargo test -p runtime --test integration --features postgres,mysql,delta_lake,duckdb,sqlite,turso -- --nocapture
+	@cargo nextest run -p runtime --test integration --features postgres,mysql,delta_lake,adbc,sqlite --no-capture
 
 .PHONY: test-integration-without-spiceai-dataset
 test-integration-without-spiceai-dataset:
-	@cargo test -p runtime --test integration --features postgres,mysql,delta_lake,duckdb,sqlite,turso -- --nocapture --skip spiceai_integration_test
+	@cargo nextest run -p runtime --test integration --features postgres,mysql,delta_lake,adbc,sqlite --no-capture -E 'not test(spiceai_integration_test)'
 
 .PHONY: test-integration-models
 test-integration-models:
-	@cargo test -p runtime --test integration_models --features models,duckdb -- --nocapture
+	@cargo test -p runtime --test integration_models --features models -- --nocapture
 
 .PHONY: test-integration-models-without-openai
 test-integration-models-without-openai:
-	@cargo test -p runtime --test integration_models --features models,duckdb -- --nocapture --skip openai_test
+	@cargo test -p runtime --test integration_models --features models -- --nocapture --skip openai_test
 
 .PHONY: test-bench
 test-bench:
@@ -233,7 +345,7 @@ test-bench:
 ## workspace-wide linting (unless PACKAGES is set, then uses package defaults —
 ## workspace features like `models` are not valid on every crate).
 ## Example: make lint-rust PACKAGES="runtime data_components"
-## Example: make lint-rust-fix PACKAGES="runtime data_components" FEATURES="duckdb,postgres"
+## Example: make lint-rust-fix PACKAGES="runtime data_components" FEATURES="adbc,postgres"
 PACKAGES ?=
 FEATURES ?=
 # Use strip non-empty checks (not bare ifdef): PACKAGES/FEATURES are always
@@ -243,23 +355,65 @@ ifneq ($(strip $(PACKAGES)),)
 _LINT_PKG_FLAGS := $(foreach p,$(PACKAGES),-p $(p))
 _LINT_WORKSPACE_FLAGS := $(_LINT_PKG_FLAGS)
 _FMT_FLAGS := $(_LINT_PKG_FLAGS)
-# Scoped runs rely on cargo's default target selection (the package's lib
-# and/or bins — the same set --lib --bins names): an explicit --lib is a fatal
-# `no library targets found` on bin-only packages (e.g. testoperator), which
-# breaks the targeted pre-lint that scripts/signoff derives for such branches.
-_LINT_TARGET_FLAGS :=
+# Scoped runs pass --lib only when a selected package has a library: it is a
+# fatal `no library targets found` when every selected package is bin-only
+# (e.g. testoperator alone), which would break the targeted pre-lint that
+# scripts/signoff derives for such branches. Recursive (`=`) so `cargo metadata`
+# runs only for the lint recipes, not for every target that reads PACKAGES. If
+# the metadata cannot be read, --lib is left out: --tests still lints each
+# library through its unit-test build, and the full workspace lint follows.
+_LINT_LIB_FLAG = $(shell cargo metadata --no-deps --format-version 1 2>/dev/null | $(PYTHON) -c 'import json, sys; wanted = set(sys.argv[1:]); packages = json.load(sys.stdin)["packages"]; lib_kinds = {"lib", "rlib", "dylib", "cdylib", "staticlib", "proc-macro"}; print("--lib" if any(p["name"] in wanted and lib_kinds & set(t["kind"]) for p in packages for t in p["targets"]) else "")' $(PACKAGES) 2>/dev/null)
+_LINT_TARGET_FLAGS = $(_LINT_LIB_FLAG) --bins --tests
 else
 _LINT_WORKSPACE_FLAGS := --workspace --exclude libnfs --exclude lopdf --exclude ttf-parser --exclude pdf-extract
 _FMT_FLAGS := --all
-_LINT_TARGET_FLAGS := --lib --bins
+_LINT_TARGET_FLAGS := --lib --bins --tests
 endif
+
+# One clippy pass over library, binary and test code: separate passes with
+# different flags each re-check every library, because the clippy arguments are
+# part of cargo's fingerprint. `expect_used` stays denied in test builds too;
+# `allow-expect-in-tests` (clippy.toml) exempts `#[test]` functions and
+# `#[cfg(test)]` modules, and an integration test crate whose helpers use
+# `expect` says so with a crate-level `#![expect(clippy::expect_used)]`.
+_CLIPPY_LINT_FLAGS := \
+	-Dwarnings \
+	-Dclippy::pedantic \
+	-Dclippy::unwrap_used \
+	-Dclippy::expect_used \
+	-Dclippy::clone_on_ref_ptr \
+	-Aclippy::module_name_repetitions \
+	-Aclippy::large_futures \
+	-Aclippy::too_many_lines \
+	-Dclippy::equatable_if_let \
+	-Dclippy::needless_collect \
+	-Dclippy::redundant_clone \
+	-Dclippy::todo \
+	-Dclippy::assertions_on_result_states \
+	-Dclippy::allow_attributes
 # Apply FEATURES if provided, otherwise default to hardcoded features only for workspace-wide linting
 ifneq ($(strip $(FEATURES)),)
 _FEATURES_FLAGS := --features $(FEATURES)
 else ifneq ($(strip $(PACKAGES)),)
 _FEATURES_FLAGS :=
 else
-_FEATURES_FLAGS := --features adbc,aws-secrets-manager,keyring-secret-store,models,odbc,release,mcp,snapshots,elasticsearch,http-functions,wasm-functions,rate-control,spicebench
+_FEATURES_FLAGS := --features $(RUST_GATE_FEATURES)
+endif
+
+## The guard scripts below need Python 3.11+ (stdlib `tomllib`). The sign-off
+## runners carry more than one interpreter and bare `python3` does not resolve to
+## the same one on every run: github-runner-02 passed this recipe at 03:36 and
+## failed it at 06:58 the same morning on `found 3.9`, which fails the whole
+## sign-off in ~9s with nothing wrong in the branch. Resolve an interpreter that
+## is actually new enough instead of trusting PATH order. Falls back to plain
+## `python3` so a host with nothing newer still gets check_crate_layers.py's own
+## "needs Python 3.11+" message rather than a missing-command error.
+## Override with `make lint-rust PYTHON=python3.12` to pin a specific one.
+ifeq ($(strip $(PYTHON)),)
+PYTHON := $(shell for p in python3.14 python3.13 python3.12 python3.11 python3; do \
+		command -v $$p >/dev/null 2>&1 || continue; \
+		$$p -c 'import sys; raise SystemExit(0 if sys.version_info >= (3, 11) else 1)' 2>/dev/null && { echo $$p; exit 0; }; \
+	done; echo python3)
 endif
 
 .PHONY: lint lint-rust
@@ -268,90 +422,41 @@ lint: lint-rust
 # Full workspace lint (default), or scoped via PACKAGES=… for a fast fail-first pass.
 lint-rust:
 	cargo fmt $(_FMT_FLAGS) -- --check
+	## Shared guard helpers (fast, no compile): each guard below that reads `cargo metadata` must exit 2, never 1, when cargo cannot answer — 1 would report a broken toolchain as a violation
+	$(PYTHON) scripts/test_rust_guard_common.py
 	## Crate-layering guard (fast, no compile): no crate may depend on a higher tier. See docs/dev/crate_layering.md
-	python3 scripts/check_crate_layers.py
+	$(PYTHON) scripts/check_crate_layers.py
 	## Table-layer guard (fast, no compile): a provider-wrapping TableProvider silently stops every layer walk. See docs/dev/crate_layering.md
-	python3 scripts/check_table_layers.py
+	$(PYTHON) scripts/check_table_layers.py
 	## Rust-gate path-list guard (fast, no compile): the sign-off, Attestation, and merge-queue path lists must agree. See docs/dev/ci_signoff.md
 	## Its derivation is exercised first: the live-tree scan only covers the paths today's workspace happens to contain, so a derivation that stopped working would pass unnoticed on a clean tree
-	python3 scripts/test_check_rust_gate_paths.py
-	python3 scripts/check_rust_gate_paths.py
+	$(PYTHON) scripts/test_check_rust_gate_paths.py
+	$(PYTHON) scripts/check_rust_gate_paths.py
 	## Unreachable-module guard (fast, no compile): every file under a crate's src/ must be reachable from its crate root, or nothing compiles it
 	## Its parser is exercised first: the live-tree scan only covers the shapes today's workspace happens to contain, so a parser regression for any other shape would pass unnoticed
-	python3 scripts/test_check_module_reachability.py
-	python3 scripts/check_module_reachability.py
+	$(PYTHON) scripts/test_check_module_reachability.py
+	$(PYTHON) scripts/check_module_reachability.py
+	## Fork-pin guard (fast, no compile): a moved fork pin must come with a re-audit of that fork's patches. See docs/dev/fork_patches.md
+	## Its parsers are exercised first: with both sides empty the guard would report agreement, so a regex regression would pass unnoticed
+	$(PYTHON) scripts/test_check_fork_patches.py
+	$(PYTHON) scripts/check_fork_patches.py
+	## MySQL bench-loader NULL guard (fast, no compile): a pipe-delimited bench file spells NULL as an empty field, which MySQL's LOAD DATA reads as 0 unless it is rendered as `\N` first
+	## Its parser is exercised first, together with the transform itself: nothing else in CI executes that sed program, and a guard matching no loader would report success
+	$(PYTHON) scripts/test_check_bench_mysql_load_nulls.py
+	$(PYTHON) scripts/check_bench_mysql_load_nulls.py
+	## Nextest build-target generator (fast, no compile): it decides which test binaries `nextest` builds, so a parser regression would drop selected tests from the build
+	$(PYTHON) scripts/test_nextest_build_targets.py
 	## All except metal, cuda, nfs (nfs requires system libnfs library)
-	CLIPPY_CONF_DIR=".ci" cargo clippy $(CARGO_PROFILE) --keep-going $(_LINT_TARGET_FLAGS) $(_FEATURES_FLAGS) $(_LINT_WORKSPACE_FLAGS) -- \
-		-Dwarnings \
-		-Dclippy::pedantic \
-		-Dclippy::unwrap_used \
-		-Dclippy::expect_used \
-		-Dclippy::clone_on_ref_ptr \
-		-Aclippy::module_name_repetitions \
-		-Aclippy::large_futures \
-		-Aclippy::too_many_lines \
-		-Dclippy::equatable_if_let \
-		-Dclippy::needless_collect \
-		-Dclippy::redundant_clone \
-		-Dclippy::todo \
-		-Dclippy::assertions_on_result_states \
-		-Dclippy::allow_attributes
-	cargo clippy $(CARGO_PROFILE) --keep-going --tests $(_FEATURES_FLAGS) $(_LINT_WORKSPACE_FLAGS) -- \
-		-Dwarnings \
-		-Dclippy::pedantic \
-		-Dclippy::unwrap_used \
-		-Aclippy::expect_used \
-		-Dclippy::clone_on_ref_ptr \
-		-Aclippy::module_name_repetitions \
-		-Aclippy::large_futures \
-		-Aclippy::too_many_lines \
-		-Dclippy::equatable_if_let \
-		-Dclippy::needless_collect \
-		-Dclippy::redundant_clone \
-		-Dclippy::todo \
-		-Dclippy::assertions_on_result_states \
-		-Dclippy::allow_attributes \
-		-Aunfulfilled_lint_expectations
+	cargo clippy $(CARGO_PROFILE) --keep-going $(_LINT_TARGET_FLAGS) $(_FEATURES_FLAGS) $(_LINT_WORKSPACE_FLAGS) -- $(_CLIPPY_LINT_FLAGS)
 
 lint-rust-fix:
 	cargo fmt $(_FMT_FLAGS)
 	## All except metal, cuda, nfs (nfs requires system libnfs library)
-	CLIPPY_CONF_DIR=".ci" cargo clippy $(CARGO_PROFILE) $(_LINT_TARGET_FLAGS) --fix --allow-dirty $(_FEATURES_FLAGS) $(_LINT_WORKSPACE_FLAGS) -- \
-		-Dwarnings \
-		-Dclippy::pedantic \
-		-Dclippy::unwrap_used \
-		-Dclippy::expect_used \
-		-Dclippy::clone_on_ref_ptr \
-		-Aclippy::module_name_repetitions \
-		-Aclippy::large_futures \
-		-Aclippy::too_many_lines \
-		-Dclippy::equatable_if_let \
-		-Dclippy::needless_collect \
-		-Dclippy::redundant_clone \
-		-Dclippy::todo \
-		-Dclippy::assertions_on_result_states \
-		-Dclippy::allow_attributes
-	cargo clippy $(CARGO_PROFILE) --fix --allow-dirty --tests $(_FEATURES_FLAGS) $(_LINT_WORKSPACE_FLAGS) -- \
-		-Dwarnings \
-		-Dclippy::pedantic \
-		-Dclippy::unwrap_used \
-		-Aclippy::expect_used \
-		-Dclippy::clone_on_ref_ptr \
-		-Aclippy::module_name_repetitions \
-		-Aclippy::large_futures \
-		-Aclippy::too_many_lines \
-		-Dclippy::equatable_if_let \
-		-Dclippy::needless_collect \
-		-Dclippy::redundant_clone \
-		-Dclippy::todo \
-		-Dclippy::assertions_on_result_states \
-		-Dclippy::allow_attributes \
-		-Aunfulfilled_lint_expectations
+	cargo clippy $(CARGO_PROFILE) $(_LINT_TARGET_FLAGS) --fix --allow-dirty $(_FEATURES_FLAGS) $(_LINT_WORKSPACE_FLAGS) -- $(_CLIPPY_LINT_FLAGS)
 
 check-rust-features:
 	cargo check $(CARGO_PROFILE) --no-default-features
 	cargo check $(CARGO_PROFILE) --no-default-features --features adbc
-	cargo check $(CARGO_PROFILE) --no-default-features --features duckdb
 	cargo check $(CARGO_PROFILE) --no-default-features --features postgres
 	cargo check $(CARGO_PROFILE) --no-default-features --features sqlite
 	cargo check $(CARGO_PROFILE) --no-default-features --features mysql
@@ -415,9 +520,21 @@ display-deps:
 TARGET_DIR := $(or $(CARGO_TARGET_DIR),target)
 
 # Default install includes models. Use -data suffix variants to build without models.
-# Data-only features (default features minus models)
+#
+# The feature set the -data variants build with. It is NOT derived from bin/spiced's `default`,
+# and it is not `default` minus `models`: it is an independent list maintained by hand right here,
+# so a feature added to `default` does not reach `make install-data-only` until it is added below
+# too, and no check reports the omission. The two currently differ in both directions, which is why
+# reading this list as "default, less the model bits" is wrong: -data is also a build
+# without any of the three feature-gated secret stores `default` turns on (aws-secrets-manager,
+# azure-keyvault and keyring-secret-store) — the env and Kubernetes stores are not feature-gated
+# at all, so a -data build still reads secrets from both of those — and it carries the PostgreSQL
+# accelerator and acceleration snapshots, which `default` does not. Recompute the difference
+# before relying on it rather than trusting a comment, from this list and the
+# `default = [...]` array in bin/spiced/Cargo.toml.
+#
 # Note: postgres-accel enables the PostgreSQL data accelerator (separate from postgres connector)
-SPICED_DATA_FEATURES := duckdb,postgres,postgres-accel,sqlite,mysql,flightsql,delta_lake,databricks,dremio,clickhouse,cosmosdb,sharepoint,snapshots,snowflake,spark,ftp,sftp,debezium,kafka,anonymous_telemetry,mssql,dynamodb,imap,alloc-snmalloc,oracle,runtime/s3_vectors,mongodb,iceberg-write,turso,smb,scylladb
+SPICED_DATA_FEATURES := adbc,postgres,postgres-accel,sqlite,mysql,flightsql,delta_lake,databricks,dremio,clickhouse,cosmosdb,sharepoint,snapshots,snowflake,spark,ftp,sftp,debezium,kafka,anonymous_telemetry,mssql,dynamodb,imap,alloc-snmalloc,oracle,runtime/s3_vectors,mongodb,iceberg-write,smb
 
 .PHONY: install
 install: build
@@ -475,6 +592,11 @@ install-odbc:
 .PHONY: install-nfs
 install-nfs:
 	make install SPICED_NON_DEFAULT_FEATURES="nfs"
+
+# ScyllaDB variants
+.PHONY: install-scylladb
+install-scylladb:
+	make install SPICED_NON_DEFAULT_FEATURES="scylladb"
 
 # Install from a CI build artifact (branch or commit SHA)
 # Usage:

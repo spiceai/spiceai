@@ -9,24 +9,26 @@ rust-version.workspace = true
 version.workspace = true
 
 [dependencies]
+byte-unit.workspace = true
 app = { path = "../app" }
 arrow.workspace = true
 datafusion-table-providers.workspace = true
 arrow-schema = { workspace = true, features = ["serde"] }
 arrow_tools = { path = "../arrow_tools" }
 async-trait.workspace = true
-aws-sdk-credential-bridge = { path = "../aws-sdk-credential-bridge" }
 bytes.workspace = true
 chrono.workspace = true
 datafusion.workspace = true
-duckdb = { workspace = true, features = [
-    "bundled",
-    "r2d2",
-    "extensions-full",
-], optional = true }
+data_components = { path = "../data_components" }
+runtime-metrics = { path = "../runtime-metrics" }
+runtime-table-partition = { path = "../runtime-table-partition" }
+twox-hash.workspace = true
+spice-table = { path = "../spice-table" }
 fundu.workspace = true
 futures.workspace = true
 object_store.workspace = true
+object_store_occ = { path = "../object_store_occ" }
+parking_lot.workspace = true
 opentelemetry.workspace = true
 runtime-checkpoint-api = { path = "../runtime-checkpoint-api" }
 runtime-datafusion = { path = "../runtime-datafusion" }
@@ -35,6 +37,8 @@ telemetry = { path = "../telemetry" }
 runtime-parameters = { path = "../runtime-parameters" }
 runtime-object-store = { path = "../runtime-object-store" }
 runtime-secrets = { path = "../runtime-secrets" }
+runtime-state-location = { path = "../runtime-state-location" }
+s3-event-notifications = { path = "../s3-event-notifications" }
 rusqlite = { workspace = true, optional = true }
 serde.workspace = true
 serde_json.workspace = true
@@ -45,21 +49,21 @@ tar = "0.4"
 tempfile.workspace = true
 tokio = { workspace = true, features = ["fs", "sync"] }
 tracing.workspace = true
-turso = { workspace = true, optional = true }
 url.workspace = true
 util = { path = "../util", features = ["datafusion"] }
 utoipa = { workspace = true, optional = true }
 uuid = { version = "1", features = ["v7"] }
 
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
 [features]
 default = []
-duckdb = ["dep:duckdb"]
 openapi = ["dep:utoipa"]
 snapshots = []
 sqlite = ["dep:rusqlite"]
 # An `AccelerationSource` the engine crates can build in their own tests.
 test-support = []
-turso = ["dep:turso"]
 
 [dev-dependencies]
 anyhow = { workspace = true }

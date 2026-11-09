@@ -68,6 +68,7 @@ limitations under the License.
 //! ```
 
 pub mod cgroup;
+pub mod testing;
 
 use std::sync::OnceLock;
 
@@ -107,6 +108,9 @@ pub enum CpuSource {
     RequestBurst,
     /// `sched_getaffinity` — the cores the process may run on.
     Affinity,
+    /// An application sidecar's maximum of [`SIDECAR_MAX_CORES`], below what was
+    /// detected or configured.
+    SidecarCap,
     /// Nothing could be determined; one core.
     Fallback,
 }
@@ -121,6 +125,7 @@ impl CpuSource {
             Self::AllCores => "all_cores",
             Self::RequestBurst => "request_burst",
             Self::Affinity => "affinity",
+            Self::SidecarCap => "sidecar_cap",
             Self::Fallback => "fallback",
         }
     }
@@ -142,7 +147,17 @@ pub struct CpuConfig {
     /// rather than just the winner, because `all` defers to a quantity named
     /// below it — see [`CpuBudget::resolve`].
     surfaces: Vec<(String, &'static str)>,
+    /// Whether the runtime is an application sidecar, whose detected
+    /// entitlement is capped at [`SIDECAR_MAX_CORES`].
+    sidecar: bool,
 }
+
+/// The most cores an application sidecar sizes itself for. A sidecar shares
+/// its pod or host with the application it serves, so this is a hard cap: a
+/// detected entitlement above it is capped, and so is a configured one, with a
+/// warning (see [`CpuBudget::sidecar_cap_warning`]).
+pub const SIDECAR_MAX_CORES: usize = 4;
+const SIDECAR_MAX_MILLICORES: u64 = SIDECAR_MAX_CORES as u64 * 1000;
 
 impl CpuConfig {
     pub const CLI_SETTING: &str = "--cpu-cores";
@@ -160,7 +175,18 @@ impl CpuConfig {
         .into_iter()
         .filter_map(|(value, setting)| value.map(|value| (value.to_string(), setting)))
         .collect();
-        Self { surfaces }
+        Self {
+            surfaces,
+            sidecar: false,
+        }
+    }
+
+    /// Size for an application sidecar: the entitlement, detected or configured,
+    /// is capped at [`SIDECAR_MAX_CORES`].
+    #[must_use]
+    pub fn for_sidecar(mut self) -> Self {
+        self.sidecar = true;
+        self
     }
 
     /// Read `SPICE_CPU_CORES` from the process environment.
@@ -297,6 +323,21 @@ pub struct HostReadings {
     /// could read a pod spec put it there. `None` when no request is declared,
     /// which is every bare-metal and benchmark deployment.
     pub declared_request_millicores: Option<u64>,
+    /// The simultaneous multithreading (SMT) layout of the CPUs this process may
+    /// run on: how many they are, and the physical cores they sit on. `None` when
+    /// it cannot be read, which is every platform but Linux.
+    pub smt: Option<SmtLayout>,
+}
+
+/// The logical CPUs a process may run on and the physical cores they sit on.
+/// With SMT each physical core runs two (or more) logical CPUs, which share its
+/// execution units.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SmtLayout {
+    /// Logical CPUs: the online CPUs in the process's affinity mask.
+    pub logical_cpus: usize,
+    /// Distinct physical cores among them.
+    pub physical_cores: usize,
 }
 
 impl HostReadings {
@@ -315,8 +356,104 @@ impl HostReadings {
             kubernetes: std::env::var_os("KUBERNETES_SERVICE_HOST")
                 .is_some_and(|value| !value.is_empty()),
             declared_request_millicores: detect_declared_request_millicores(),
+            smt: detect_smt_layout(),
         }
     }
+}
+
+/// The SMT layout of the CPUs this process may run on, from Linux: the online
+/// CPUs (sysfs) in its affinity mask (`Cpus_allowed_list` in `/proc/self/status`,
+/// which a cpuset or `taskset` narrows), and the distinct sets of SMT siblings
+/// they sit on, one per physical core. So a process confined to one thread of
+/// each of 8 cores counts 8 physical cores, not the host's ratio of them. `None`
+/// off Linux or when sysfs cannot be read.
+fn detect_smt_layout() -> Option<SmtLayout> {
+    const CPU_DIR: &str = "/sys/devices/system/cpu";
+    let online = parse_cpu_list(&std::fs::read_to_string(format!("{CPU_DIR}/online")).ok()?)?;
+    let allowed = std::fs::read_to_string("/proc/self/status")
+        .ok()
+        .and_then(|status| allowed_cpus(&status));
+    smt_layout_of(&usable_cpus(online, allowed), |cpu| {
+        parse_cpu_list(
+            &std::fs::read_to_string(format!("{CPU_DIR}/cpu{cpu}/topology/thread_siblings_list"))
+                .ok()?,
+        )
+    })
+}
+
+/// The online CPUs this process may run on: `online` narrowed to `allowed`, the
+/// process's affinity mask, when that is known and leaves any.
+fn usable_cpus(online: Vec<usize>, allowed: Option<Vec<usize>>) -> Vec<usize> {
+    let Some(allowed) = allowed else {
+        return online;
+    };
+    let allowed: std::collections::HashSet<usize> = allowed.into_iter().collect();
+    let usable: Vec<usize> = online
+        .iter()
+        .copied()
+        .filter(|cpu| allowed.contains(cpu))
+        .collect();
+    if usable.is_empty() { online } else { usable }
+}
+
+/// The [`SmtLayout`] of `cpus`, each CPU's SMT siblings read by `siblings_of`.
+fn smt_layout_of(
+    cpus: &[usize],
+    siblings_of: impl Fn(usize) -> Option<Vec<usize>>,
+) -> Option<SmtLayout> {
+    let mut cores = std::collections::HashSet::new();
+    for &cpu in cpus {
+        cores.insert(siblings_of(cpu)?);
+    }
+    smt_layout(cpus.len(), cores.len())
+}
+
+/// The CPUs on the `Cpus_allowed_list` line of a `/proc/<pid>/status` file: the
+/// process's affinity mask.
+fn allowed_cpus(status: &str) -> Option<Vec<usize>> {
+    status
+        .lines()
+        .find_map(|line| line.strip_prefix("Cpus_allowed_list:"))
+        .and_then(parse_cpu_list)
+}
+
+/// An [`SmtLayout`] of `logical_cpus` forming `physical_cores`, when both are
+/// known and consistent.
+const fn smt_layout(logical_cpus: usize, physical_cores: usize) -> Option<SmtLayout> {
+    if physical_cores == 0 || physical_cores > logical_cpus {
+        return None;
+    }
+    Some(SmtLayout {
+        logical_cpus,
+        physical_cores,
+    })
+}
+
+/// The CPUs of a Linux CPU list, such as `0-3,8,10-11`, the format of sysfs
+/// `online` and `thread_siblings_list` files. `None` when it does not parse.
+#[must_use]
+pub fn parse_cpu_list(list: &str) -> Option<Vec<usize>> {
+    let list = list.trim();
+    if list.is_empty() {
+        return Some(Vec::new());
+    }
+    let mut cpus = Vec::new();
+    for part in list.split(',') {
+        match part.split_once('-') {
+            Some((start, end)) => {
+                let (start, end) = (
+                    start.trim().parse::<usize>().ok()?,
+                    end.trim().parse::<usize>().ok()?,
+                );
+                if start > end {
+                    return None;
+                }
+                cpus.extend(start..=end);
+            }
+            None => cpus.push(part.trim().parse().ok()?),
+        }
+    }
+    Some(cpus)
 }
 
 /// The environment variable carrying the pod's own `requests.cpu`.
@@ -461,6 +598,16 @@ pub fn detect_cpu_share() -> Option<CpuShare> {
 /// is shared between a countable number of plans.
 const QUERIES_PER_CORE: usize = 4;
 
+/// Query plans an application sidecar admits concurrently per core when
+/// `runtime.query.max_concurrent_queries` is unset. A sidecar plan runs on one
+/// target partition ([`CpuBudget::sidecar_target_partitions`]) and spends most
+/// of its time waiting on the upstream it reads from, so it holds a fraction of
+/// a server plan's memory-pool reservations and CPU; admitted at
+/// [`QUERIES_PER_CORE`], a sidecar's cores idle while its queries wait. Four
+/// times that rate admits, at [`SIDECAR_MAX_CORES`], the 64 plans a 16-core
+/// server admits, each reserving one partition rather than sixteen.
+const SIDECAR_QUERIES_PER_CORE: usize = 4 * QUERIES_PER_CORE;
+
 /// How far above its CPU request a burstable pod sizes itself.
 ///
 /// A request is a scheduling floor, not a ceiling, so sizing *at* the request
@@ -514,7 +661,32 @@ pub struct CpuBudget {
     /// The pod's declared `requests.cpu`. Reported, and the only request the
     /// warning below is allowed to compare against.
     declared_request_millicores: Option<u64>,
+    /// The host's SMT layout, which scales [`Self::physical_cores`].
+    smt: Option<SmtLayout>,
+    /// Sized for an application sidecar, whose queries default to
+    /// [`Self::sidecar_target_partitions`].
+    sidecar: bool,
+    /// A configured value the sidecar cap lowered, reported by
+    /// [`Self::sidecar_cap_warning`].
+    sidecar_clamp: Option<SidecarClamp>,
 }
+
+/// A configured entitlement above [`SIDECAR_MAX_CORES`] that a sidecar was
+/// capped from.
+#[derive(Debug, Clone)]
+struct SidecarClamp {
+    /// The surface that set it, such as `runtime.cpu.cores`.
+    setting: &'static str,
+    /// The value as written there, such as `8` or `all`.
+    value: String,
+    /// What the value resolved to before the cap.
+    requested_millicores: u64,
+}
+
+/// The physical cores Cayenne's `deletion_mode: auto` needs before it keeps a
+/// small primary-key table compacted whole alongside its writes (see
+/// [`CpuBudget::cayenne_keeps_small_tables_compacted`]).
+pub const CAYENNE_SMALL_TABLE_COMPACTION_PHYSICAL_CORES: usize = 8;
 
 impl CpuBudget {
     /// Resolve the effective entitlement.
@@ -525,6 +697,11 @@ impl CpuBudget {
     /// 2. a cgroup CPU quota (`limits.cpu`) -> [`CpuSource::CgroupQuota`]
     /// 3. `sched_getaffinity` -> [`CpuSource::Affinity`]
     /// 4. one core -> [`CpuSource::Fallback`]
+    ///
+    /// A sidecar ([`CpuConfig::for_sidecar`]) then caps the result, whichever rung
+    /// produced it, at [`SIDECAR_MAX_CORES`] -> [`CpuSource::SidecarCap`]. A
+    /// configured quantity or `all` above the cap is recorded for
+    /// [`Self::sidecar_cap_warning`].
     ///
     /// With nothing configured this resolves to exactly what
     /// `available_parallelism` already returned — quota capped by affinity — so
@@ -545,9 +722,7 @@ impl CpuBudget {
     /// CPU quantity or `auto`.
     pub fn resolve(cfg: &CpuConfig, host: &HostReadings) -> Result<Self, Error> {
         let detected_cores = host.affinity_cores.max(1);
-        let affinity_millicores = u64::try_from(detected_cores)
-            .unwrap_or(u64::MAX)
-            .saturating_mul(1000);
+        let affinity_millicores = cores_to_millicores(detected_cores);
 
         // Precedence is CLI > env > spicepod, with one exception. `all` says the
         // surface imposes no ceiling of its own, so it defers to an explicit
@@ -591,7 +766,11 @@ impl CpuBudget {
         // available CPUs. Expressing it as "skip one rung" rather than as its own
         // `min(quota, affinity)` keeps one place that knows how to weigh a quota
         // against affinity, and needs no update when a rung is added.
-        let all_cores = matches!(configured, Some((CpuSetting::All, _)));
+        let all_setting = match configured {
+            Some((CpuSetting::All, setting)) => Some(setting),
+            _ => None,
+        };
+        let all_cores = all_setting.is_some();
         let explicit = match configured {
             Some((CpuSetting::Cores(millicores), setting)) => Some((millicores, setting)),
             _ => None,
@@ -635,12 +814,27 @@ impl CpuBudget {
         } else {
             (1000, CpuSource::Fallback, None)
         };
+        // A sidecar never sizes above its cap, whatever was detected or configured.
+        // A configured value that asked for more is kept for the warning.
+        let (millicores, source, setting, sidecar_clamp) =
+            if cfg.sidecar && millicores > SIDECAR_MAX_MILLICORES {
+                let clamp = setting.or(all_setting).map(|setting| SidecarClamp {
+                    setting,
+                    value: cfg
+                        .surfaces
+                        .iter()
+                        .find(|(_, surface)| *surface == setting)
+                        .map_or_else(String::new, |(value, _)| value.trim().to_string()),
+                    requested_millicores: millicores,
+                });
+                (SIDECAR_MAX_MILLICORES, CpuSource::SidecarCap, None, clamp)
+            } else {
+                (millicores, source, setting, None)
+            };
 
         Ok(Self {
             millicores,
-            cores: usize::try_from(millicores.div_ceil(1000))
-                .unwrap_or(usize::MAX)
-                .max(1),
+            cores: millicores_to_cores(millicores).max(1),
             source,
             setting,
             detected_cores,
@@ -648,6 +842,9 @@ impl CpuBudget {
             cpu_share: host.cpu_share,
             kubernetes: host.kubernetes,
             declared_request_millicores: host.declared_request_millicores,
+            smt: host.smt,
+            sidecar: cfg.sidecar,
+            sidecar_clamp,
         })
     }
 
@@ -702,6 +899,32 @@ impl CpuBudget {
         if let Some(warning) = self.core_shaped_request_warning() {
             tracing::warn!("{warning}");
         }
+        if let Some(warning) = self.configured_above_ceiling_warning() {
+            tracing::warn!("{warning}");
+        }
+        if let Some(warning) = self.sidecar_cap_warning() {
+            tracing::warn!("{warning}");
+        }
+    }
+
+    /// The warning for a sidecar configured above [`SIDECAR_MAX_CORES`], naming
+    /// the setting as written, what it asked for, and the cores the sidecar
+    /// runs on instead. `None` when nothing configured asked for more.
+    #[must_use]
+    pub fn sidecar_cap_warning(&self) -> Option<String> {
+        let clamp = self.sidecar_clamp.as_ref()?;
+        let assignment = match clamp.setting {
+            CpuConfig::CLI_SETTING => format!("{} {}", clamp.setting, clamp.value),
+            CpuConfig::ENV_SETTING => format!("{}={}", clamp.setting, clamp.value),
+            _ => format!("{}: {}", clamp.setting, clamp.value),
+        };
+        Some(format!(
+            "`{assignment}` asks for {requested}, more than the {max} a sidecar may use, so this \
+             sidecar runs on {max}. A sidecar shares its host with the application it serves; to \
+             use more cores, start Spice without `--role sidecar`. See: {DOCS_URL}",
+            requested = format_millicores(clamp.requested_millicores),
+            max = format_millicores(SIDECAR_MAX_MILLICORES),
+        ))
     }
 
     /// Every quantity this budget derives, paired with the consumer it sizes.
@@ -719,7 +942,11 @@ impl CpuBudget {
                 "dedicated_runtime_worker_threads",
                 self.dedicated_runtime_worker_threads(),
             ),
-            ("target_partitions", self.target_partitions()),
+            (
+                "interactive_query_worker_threads",
+                self.interactive_query_worker_threads(),
+            ),
+            ("target_partitions", self.default_target_partitions()),
             ("scan_split_concurrency", self.scan_split_concurrency()),
             ("vortex_parallelism", self.vortex_parallelism()),
             ("max_concurrent_queries", self.max_concurrent_queries()),
@@ -788,6 +1015,15 @@ impl CpuBudget {
                 "the declared CPU request (x2)"
             }
             CpuSource::Affinity => "the CPUs available to this process",
+            CpuSource::SidecarCap => {
+                const {
+                    assert!(
+                        SIDECAR_MAX_CORES == 4,
+                        "the origin string below names the cap"
+                    );
+                }
+                "the sidecar maximum of 4 cores"
+            }
             CpuSource::Fallback => "fallback",
         }
     }
@@ -819,8 +1055,18 @@ impl CpuBudget {
             limit = self.limit_millicores.map_or(unset, format_millicores),
             main = self.main_runtime_worker_threads(),
             dedicated = self.dedicated_runtime_worker_threads(),
-            partitions = self.target_partitions(),
+            partitions = self.default_target_partitions(),
         )
+    }
+
+    /// The target partitions a query gets when `runtime.query.target_partitions`
+    /// is unset, as the startup log reports them: one for a sidecar.
+    const fn default_target_partitions(&self) -> usize {
+        if self.sidecar {
+            self.sidecar_target_partitions()
+        } else {
+            self.target_partitions()
+        }
     }
 
     /// A warning when the declared CPU request looks like whole cores that lost
@@ -857,6 +1103,128 @@ impl CpuBudget {
             // request whichever rung won, and a quota or an explicit setting can
             // outrank it. The summary line above names which one did.
             entitlement = format_millicores(self.millicores),
+        ))
+    }
+
+    /// A warning when an explicit `cores` value exceeds the CPU this process will
+    /// actually be given.
+    ///
+    /// Every other rung resolves through `min(reading, affinity)`, so the explicit
+    /// override is the only one that can name a quantity the host will not honour.
+    /// It stays unclamped on purpose: an operator may be sizing for a ceiling they
+    /// are about to raise, and silently shrinking a value someone wrote is its own
+    /// surprise. Both readings are already in the summary line, though, so leaving
+    /// the gap between them unremarked means a throttled deployment whose own logs
+    /// never name the cause.
+    ///
+    /// Names the tightest ceiling, since that is the one the sizing has to clear.
+    /// Which of the two that is cannot be read off `detected_cores` alone.
+    /// `available_parallelism` already returns `min(quota, affinity)` floored to
+    /// whole cores, so under a fractional quota it under-reports the real ceiling by
+    /// up to a core — a `limits.cpu: 2500m` pod reports 2 — and treating that as an
+    /// exact affinity reading would warn an operator who configured exactly their
+    /// quota, and send them after an affinity limit that does not exist. A quota can
+    /// only be the binding constraint while it is under the next whole core, because
+    /// otherwise flooring it would not have produced this reading; above that,
+    /// affinity is provably what got floored and is exact, since a CPU mask is always
+    /// a whole number of CPUs.
+    ///
+    /// One case stays out of reach until the two readings are separated (#13283): a
+    /// reading of 2 with a 2500m quota is also what a genuine 2-CPU mask under that
+    /// quota looks like, and there the real ceiling is 2 cores rather than 2.5. This
+    /// stays silent for the 500m in between, which is the safer of the two errors —
+    /// the alternative warns every ordinary deployment that configured exactly its
+    /// fractional quota, and a warning that fires at correct configuration is one
+    /// operators learn to ignore.
+    ///
+    /// `None` unless an explicit quantity won this budget — `all` and `auto` name
+    /// no quantity of their own, and both already resolve through the clamp — and
+    /// `None` while that quantity sits at or below every ceiling.
+    #[must_use]
+    pub fn configured_above_ceiling_warning(&self) -> Option<String> {
+        if !matches!(self.source, CpuSource::Configured) {
+            return None;
+        }
+        // A one-core reading is not a ceiling this can prove: `HostReadings::detect`
+        // collapses an `available_parallelism` failure to 1, so it means either a
+        // single-CPU host or a host that could not answer — and the override exists
+        // for deployments the host cannot describe, which is exactly where claiming a
+        // one-core affinity limit would be both wrong and loudest.
+        let affinity_ceiling =
+            (self.detected_cores > 1).then(|| cores_to_millicores(self.detected_cores));
+        // Under the next whole core, the quota is the wall that is either binding or
+        // indistinguishable from it — and exact where a floored reading is not. With no
+        // usable affinity reading it is the only wall left.
+        let binding_quota = match (self.limit_millicores, affinity_ceiling) {
+            (Some(limit), Some(affinity)) if limit >= affinity.saturating_add(1000) => None,
+            (Some(limit), _) => Some(limit),
+            (None, _) => None,
+        };
+        // Nothing provable: no quota, and a core count that may just be a failed read.
+        let ceiling = binding_quota.or(affinity_ceiling)?;
+        if self.millicores <= ceiling {
+            return None;
+        }
+        // `raise_to` is the same remedy phrased to take the entitlement as its
+        // object, so the branch below can name what to raise the wall *to* without
+        // splicing a phrase that only reads correctly under a quota.
+        let (ceiling_phrase, consequence, remedy, raise_to) = match binding_quota {
+            Some(limit) => (
+                format!(
+                    "this container's cgroup CPU limit of {}",
+                    format_millicores(limit)
+                ),
+                "the container is CFS-throttled under load",
+                "raise the container's CPU limit",
+                "raise the container's CPU limit to",
+            ),
+            // Not "widen this process's CPU affinity": with no quota to compare
+            // against, `detected_cores` is whatever `available_parallelism`
+            // returned, which on a bare-metal or non-Linux host is the machine's
+            // whole logical CPU count rather than a restricted mask. There is no
+            // wider mask to apply there, so the remedy has to hold for both shapes.
+            None => (
+                format!(
+                    "the {} available to this process",
+                    format_millicores(ceiling)
+                ),
+                "its threads contend for those CPUs",
+                "give this process more CPUs (a wider CPU affinity, or a host with more)",
+                "give this process",
+            ),
+        };
+        // Every pool comes from `ceil(millicores / 1000)`, so lowering to the ceiling
+        // only shrinks one when the ceiling rounds down to a smaller whole-core
+        // count. Under a fractional ceiling both round to the same number, so
+        // promising that lowering resizes anything would over-claim. Note the
+        // claim below is about pools not *changing*, never about their values
+        // being equal to the core budget: only some are (see
+        // `not_every_pool_equals_the_core_budget`) — but lowering
+        // is still a real fix there, because `cpu_busy_fraction` divides by the
+        // exact `millicores` rather than the rounded count, and an entitlement above
+        // the wall makes a saturated process report itself as idle by the ratio
+        // between them. Both remedies stay on the table; only the pool claim is
+        // dropped.
+        if millicores_to_cores(ceiling) < self.cores {
+            return Some(format!(
+                "`{origin}` is set to {entitlement}, above {ceiling_phrase}, so every pool is \
+                 sized for {entitlement} and {consequence} instead of being given the extra \
+                 CPU. Lower it to {ceiling_value} or {remedy}. See: {DOCS_URL}",
+                origin = self.origin(),
+                entitlement = format_millicores(self.millicores),
+                ceiling_value = format_millicores(ceiling),
+            ));
+        }
+        Some(format!(
+            "`{origin}` is set to {entitlement}, above {ceiling_phrase}, so {consequence}. \
+             Lower it to {ceiling_value} or {raise_to} {entitlement}. Lowering resizes no pool — \
+             {ceiling_value} already rounds up to the same {pool_cores}-core budget — but it \
+             corrects the busy fraction this process reports against its entitlement. \
+             See: {DOCS_URL}",
+            origin = self.origin(),
+            entitlement = format_millicores(self.millicores),
+            ceiling_value = format_millicores(ceiling),
+            pool_cores = self.cores,
         ))
     }
 
@@ -967,6 +1335,50 @@ impl CpuBudget {
         self.detected_cores
     }
 
+    /// The entitlement in whole cores when an explicit quantity set it —
+    /// `--cpu-cores`, `SPICE_CPU_CORES` or `runtime.cpu.cores` — and `None` when it
+    /// was detected. `all` and `auto` name no quantity of their own, so both are
+    /// `None`.
+    #[must_use]
+    pub const fn configured_cores(&self) -> Option<usize> {
+        if matches!(self.source, CpuSource::Configured) {
+            Some(self.cores)
+        } else {
+            None
+        }
+    }
+
+    /// The physical cores behind [`Self::cores`]: the budget scaled by the
+    /// physical cores per logical CPU among the CPUs this process may run on,
+    /// rounded down and at least one. Equal to `cores` without SMT, or where the
+    /// layout is unknown. A budget of 8 logical CPUs on a host with two SMT
+    /// threads per core is 4; a process confined to one thread of each of 8 cores
+    /// has 8.
+    #[must_use]
+    pub const fn physical_cores(&self) -> usize {
+        match self.smt {
+            Some(SmtLayout {
+                logical_cpus,
+                physical_cores,
+            }) if physical_cores < logical_cpus => {
+                let scaled = self.cores * physical_cores / logical_cpus;
+                if scaled == 0 { 1 } else { scaled }
+            }
+            _ => self.cores,
+        }
+    }
+
+    /// The physical-core budget when the host reports its CPU topology.
+    /// Unlike [`Self::physical_cores`], an unreadable topology returns `None`
+    /// instead of assuming that every logical CPU is a physical core.
+    #[must_use]
+    pub const fn known_physical_cores(&self) -> Option<usize> {
+        match self.smt {
+            Some(_) => Some(self.physical_cores()),
+            None => None,
+        }
+    }
+
     // ---- tokio runtimes ----
 
     /// Worker threads for the primary runtime (HTTP, control plane, queries).
@@ -983,6 +1395,18 @@ impl CpuBudget {
         if reserved == 0 { 1 } else { reserved }
     }
 
+    /// Worker threads for the interactive query runtime, which runs queries
+    /// that read a bounded set of rows by primary key apart from the analytical
+    /// queries on the `cpu` runtime: a fifth of the cores, at least two. A key
+    /// lookup costs milliseconds of CPU, so a few threads keep up with a high
+    /// lookup rate, and they are runnable beside the `cpu` runtime's rather
+    /// than queued behind its tasks.
+    #[must_use]
+    pub const fn interactive_query_worker_threads(&self) -> usize {
+        let threads = self.cores / 5;
+        if threads < 2 { 2 } else { threads }
+    }
+
     // ---- query engine ----
 
     /// `DataFusion`'s local query fan-out when `runtime.query.target_partitions`
@@ -990,6 +1414,13 @@ impl CpuBudget {
     #[must_use]
     pub const fn target_partitions(&self) -> usize {
         self.cores
+    }
+
+    /// Local fan-out for an application sidecar. Independent queries share
+    /// the CPU entitlement instead of each reserving every core.
+    #[must_use]
+    pub const fn sidecar_target_partitions(&self) -> usize {
+        1
     }
 
     /// Ceiling on the splits ONE Vortex file scan decodes concurrently when the
@@ -1032,10 +1463,17 @@ impl CpuBudget {
     /// [`Self::target_partitions`] operator reservations against a fixed memory
     /// pool, so unbounded concurrency lets queries starve each other and, past a
     /// point, take the process down. A small multiple of the core count keeps
-    /// enough in flight to hide I/O stalls without that.
+    /// enough in flight to hide I/O stalls without that. A sidecar, whose plans
+    /// run on one partition and mostly wait on its upstream, admits
+    /// [`SIDECAR_QUERIES_PER_CORE`].
     #[must_use]
     pub const fn max_concurrent_queries(&self) -> usize {
-        self.cores.saturating_mul(QUERIES_PER_CORE)
+        let per_core = if self.sidecar {
+            SIDECAR_QUERIES_PER_CORE
+        } else {
+            QUERIES_PER_CORE
+        };
+        self.cores.saturating_mul(per_core)
     }
 
     // ---- Cayenne ----
@@ -1081,6 +1519,42 @@ impl CpuBudget {
     #[must_use]
     pub const fn cayenne_max_concurrent_file_scans(&self) -> usize {
         self.cores
+    }
+
+    /// Whether Cayenne's `deletion_mode: auto` has the cores to keep a small
+    /// primary-key table on position deletes, compacted whole alongside its writes:
+    /// [`CAYENNE_SMALL_TABLE_COMPACTION_PHYSICAL_CORES`] physical cores. Cayenne
+    /// also requires Linux (`cayenne::auto_keeps_small_tables_compacted`).
+    /// Unknown CPU topology cannot establish that minimum.
+    ///
+    /// In a Linux virtual machine held to four CPUs, a 200K-row table under 2,000
+    /// upserts every 250 ms wrote at a P99 4% above key deletes' on position
+    /// deletes, with mixed reads. On eight performance cores of a bare-metal Arm
+    /// host, without SMT, its writes were even and its P99 reads 8–27% faster. The
+    /// count is of physical cores because no host with SMT was measured: two SMT
+    /// threads share one core's execution units however their priorities are set,
+    /// so 8 logical CPUs on 4 such cores are counted as the 4 that lost.
+    #[must_use]
+    pub const fn cayenne_keeps_small_tables_compacted(&self) -> bool {
+        matches!(
+            self.known_physical_cores(),
+            Some(cores) if cores >= CAYENNE_SMALL_TABLE_COMPACTION_PHYSICAL_CORES
+        )
+    }
+
+    /// How many Cayenne `deletion_mode: auto` tables may rewrite themselves whole
+    /// at once to reclaim deletes: one per four physical cores, and at least one.
+    /// An unknown CPU topology admits only one reclaim at a time.
+    /// Tables written alike reach their reclaim triggers together: on eight cores,
+    /// with 20 tables of 200K rows, all 20 rewriting at once stalled aggregate scans
+    /// on them to 154–194 ms, against 67–74 ms on key deletes.
+    #[must_use]
+    pub const fn cayenne_whole_table_reclaim_permits(&self) -> usize {
+        let Some(physical_cores) = self.known_physical_cores() else {
+            return 1;
+        };
+        let permits = physical_cores / 4;
+        if permits == 0 { 1 } else { permits }
     }
 
     /// Connections in the Cayenne `SQLite` metastore pool. Capped at 32 because
@@ -1159,6 +1633,9 @@ pub fn cpu_budget() -> &'static CpuBudget {
             cpu_share: None,
             kubernetes: false,
             declared_request_millicores: None,
+            smt: None,
+            sidecar: false,
+            sidecar_clamp: None,
         })
     })
 }
@@ -1220,6 +1697,24 @@ pub fn parse_cpu_quantity(value: &str) -> Option<CpuSetting> {
     (millicores > 0).then_some(CpuSetting::Cores(millicores))
 }
 
+/// Whole CPUs as millicores.
+///
+/// Saturating rather than wrapping: a core count that overflows `u64` millicores
+/// is not a machine, and clamping keeps it a ceiling rather than turning it into
+/// a very low one.
+fn cores_to_millicores(cores: usize) -> u64 {
+    u64::try_from(cores)
+        .unwrap_or(u64::MAX)
+        .saturating_mul(1000)
+}
+
+/// Whole cores a millicore quantity resolves to — the same rounding every derived
+/// pool size is taken through, so a comparison against [`CpuBudget::cores`] answers
+/// whether a different quantity would size anything differently.
+fn millicores_to_cores(millicores: u64) -> usize {
+    usize::try_from(millicores.div_ceil(1000)).unwrap_or(usize::MAX)
+}
+
 /// Render millicores the way an operator writes them: `4 cores`, `3.5 cores`,
 /// `500m`.
 fn format_millicores(millicores: u64) -> String {
@@ -1255,6 +1750,215 @@ mod tests {
 
     fn budget(cores: usize) -> CpuBudget {
         CpuBudget::resolve(&CpuConfig::default(), &host(cores)).expect("detection cannot fail")
+    }
+
+    /// Cayenne's `deletion_mode: auto` keeps small tables compacted on eight
+    /// known physical cores and more, and on key deletes below.
+    #[test]
+    fn cayenne_keeps_small_tables_compacted_from_eight_cores() {
+        for (cores, keeps) in [(1, false), (4, false), (7, false), (8, true), (64, true)] {
+            assert_eq!(
+                smt_budget(cores, cores, cores).cayenne_keeps_small_tables_compacted(),
+                keeps,
+                "{cores} cores"
+            );
+        }
+    }
+
+    #[test]
+    fn cayenne_keeps_key_deletes_when_cpu_topology_is_unknown() {
+        for cores in [1, 7, 8, 16, 64] {
+            let budget = budget(cores);
+            assert_eq!(budget.known_physical_cores(), None);
+            assert!(
+                !budget.cayenne_keeps_small_tables_compacted(),
+                "{cores} logical CPUs do not establish a physical-core count"
+            );
+        }
+    }
+
+    fn smt_budget(cores: usize, logical_cpus: usize, physical_cores: usize) -> CpuBudget {
+        let host = HostReadings {
+            affinity_cores: cores,
+            smt: smt_layout(logical_cpus, physical_cores),
+            ..HostReadings::default()
+        };
+        CpuBudget::resolve(&CpuConfig::default(), &host).expect("detection cannot fail")
+    }
+
+    /// On a host with SMT the rule counts physical cores: 8 logical CPUs on a
+    /// host with two threads per core are 4 physical cores, and stay on key
+    /// deletes; 16 are 8.
+    #[test]
+    fn cayenne_keeps_small_tables_compacted_counts_physical_cores_under_smt() {
+        for (cores, logical, physical, expected_physical, keeps) in [
+            (8, 16, 8, 4, false),
+            (16, 16, 8, 8, true),
+            (12, 32, 16, 6, false),
+            (8, 8, 8, 8, true),
+            (1, 2, 1, 1, false),
+        ] {
+            let budget = smt_budget(cores, logical, physical);
+            assert_eq!(
+                (
+                    budget.physical_cores(),
+                    budget.cayenne_keeps_small_tables_compacted()
+                ),
+                (expected_physical, keeps),
+                "{cores} of {logical} logical CPUs on {physical} physical cores"
+            );
+        }
+    }
+
+    /// One whole-table reclaim per four physical cores, and at least one.
+    #[test]
+    fn cayenne_whole_table_reclaim_permits_follow_physical_cores() {
+        for (cores, logical, physical, permits) in [
+            (1, 1, 1, 1),
+            (4, 4, 4, 1),
+            (8, 8, 8, 2),
+            (8, 16, 8, 1),
+            (16, 16, 16, 4),
+            (64, 64, 64, 16),
+        ] {
+            assert_eq!(
+                smt_budget(cores, logical, physical).cayenne_whole_table_reclaim_permits(),
+                permits,
+                "{cores} of {logical} logical CPUs on {physical} physical cores"
+            );
+        }
+        for cores in [1, 4, 8, 16, 64] {
+            assert_eq!(
+                budget(cores).cayenne_whole_table_reclaim_permits(),
+                1,
+                "{cores} logical CPUs with unknown topology admit one reclaim"
+            );
+        }
+    }
+
+    /// The sysfs CPU-list format: single CPUs and inclusive ranges, comma
+    /// separated, with the trailing newline sysfs writes.
+    #[test]
+    fn parse_cpu_list_reads_sysfs_lists() {
+        assert_eq!(
+            parse_cpu_list("0-3,8,10-11\n"),
+            Some(vec![0, 1, 2, 3, 8, 10, 11])
+        );
+        assert_eq!(parse_cpu_list("5"), Some(vec![5]));
+        assert_eq!(parse_cpu_list("0,64"), Some(vec![0, 64]));
+        assert_eq!(parse_cpu_list(""), Some(vec![]));
+        assert_eq!(parse_cpu_list("3-1"), None);
+        assert_eq!(parse_cpu_list("a-b"), None);
+    }
+
+    /// A layout whose physical count is zero or exceeds its logical CPUs is not
+    /// a layout, and the budget reads as having no SMT.
+    #[test]
+    fn an_inconsistent_smt_layout_is_ignored() {
+        assert_eq!(smt_layout(8, 0), None);
+        assert_eq!(smt_layout(4, 8), None);
+        assert_eq!(smt_budget(8, 4, 8).physical_cores(), 8);
+    }
+
+    /// The SMT siblings of a host with 8 cores of two threads each, numbered as
+    /// Intel hosts number them: CPUs `i` and `i + 8` share a core.
+    #[expect(
+        clippy::unnecessary_wraps,
+        reason = "the shape `smt_layout_of` reads siblings in, which can fail"
+    )]
+    fn paired_siblings(cpu: usize) -> Option<Vec<usize>> {
+        let core = cpu % 8;
+        Some(vec![core, core + 8])
+    }
+
+    /// The layout counts the CPUs the process may run on. Confined to one thread
+    /// of each of 8 cores it has 8 physical cores, and keeps small tables
+    /// compacted, where the host's ratio would count 4; confined to both threads
+    /// of 4 cores it has 4.
+    #[test]
+    fn the_smt_layout_counts_the_cpus_this_process_may_run_on() {
+        let online: Vec<usize> = (0..16).collect();
+        let layout = |allowed: Option<Vec<usize>>| {
+            smt_layout_of(&usable_cpus(online.clone(), allowed), paired_siblings)
+        };
+        let one_thread_each: Vec<usize> = (0..8).collect();
+        let both_threads_of_four = vec![0, 1, 2, 3, 8, 9, 10, 11];
+        assert_eq!(layout(None), smt_layout(16, 8), "the whole host");
+        assert_eq!(
+            layout(Some(one_thread_each.clone())),
+            smt_layout(8, 8),
+            "one thread of each of 8 cores"
+        );
+        assert_eq!(
+            layout(Some(both_threads_of_four.clone())),
+            smt_layout(8, 4),
+            "both threads of 4 cores"
+        );
+        assert_eq!(
+            layout(Some(vec![40])),
+            smt_layout(16, 8),
+            "an affinity mask naming no online CPU is ignored"
+        );
+        for (allowed, physical, keeps) in
+            [(one_thread_each, 8, true), (both_threads_of_four, 4, false)]
+        {
+            let cores = allowed.len();
+            let host = HostReadings {
+                affinity_cores: cores,
+                smt: layout(Some(allowed)),
+                ..HostReadings::default()
+            };
+            let budget =
+                CpuBudget::resolve(&CpuConfig::default(), &host).expect("detection cannot fail");
+            assert_eq!(
+                (
+                    budget.physical_cores(),
+                    budget.cayenne_keeps_small_tables_compacted()
+                ),
+                (physical, keeps),
+                "{cores} CPUs"
+            );
+        }
+    }
+
+    #[test]
+    fn allowed_cpus_reads_the_affinity_line_of_proc_status() {
+        let status =
+            "Name:\tspiced\nCpus_allowed:\tff\nCpus_allowed_list:\t0-3,8\nMems_allowed_list:\t0\n";
+        assert_eq!(allowed_cpus(status), Some(vec![0, 1, 2, 3, 8]));
+        assert_eq!(allowed_cpus("Name:\tspiced\n"), None);
+    }
+
+    /// On Linux the detected layout counts the CPUs this process may run on: the
+    /// count `sched_getaffinity` gives, read through `available_parallelism`. A
+    /// cgroup quota lowers that count below the affinity mask, so under one the
+    /// layout counts at least as many.
+    #[cfg(target_os = "linux")]
+    #[test]
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "the test's own reading of the affinity mask, independent of /proc"
+    )]
+    fn the_detected_smt_layout_counts_the_affinity_mask() {
+        let host = HostReadings::detect();
+        let parallelism = std::thread::available_parallelism()
+            .map(std::num::NonZeroUsize::get)
+            .expect("the affinity count");
+        let logical_cpus = host
+            .smt
+            .map(|layout| layout.logical_cpus)
+            .expect("Linux sysfs gives an SMT layout");
+        if host.quota_millicores.is_none() {
+            assert_eq!(
+                logical_cpus, parallelism,
+                "the layout counts the affinity mask"
+            );
+        } else {
+            assert!(
+                logical_cpus >= parallelism,
+                "under a quota the layout still counts the whole affinity mask: {logical_cpus} < {parallelism}"
+            );
+        }
     }
 
     fn quota(affinity_cores: usize, quota_millicores: u64) -> HostReadings {
@@ -1300,7 +2004,169 @@ mod tests {
             cpu_share: None,
             kubernetes: false,
             declared_request_millicores: Some(declared_request_millicores),
+            smt: None,
         }
+    }
+
+    /// A sidecar runs on at most four cores. Whatever detection found is capped
+    /// on every rung, and so is a configured value: a quantity above four, or
+    /// `all` on a host with more, is capped with a warning that quotes the setting
+    /// as written. An entitlement at or below four is left alone, and `auto` asks
+    /// for detection, so it is capped without a warning.
+    #[test]
+    fn a_sidecar_runs_on_at_most_four_cores() {
+        let resolve = |config: &CpuConfig, host: &HostReadings| {
+            let budget = CpuBudget::resolve(config, host).expect("valid configuration");
+            (
+                budget.cores(),
+                budget.source(),
+                budget.sidecar_cap_warning(),
+            )
+        };
+        let detected = CpuConfig::default();
+        let sidecar = CpuConfig::default().for_sidecar();
+        for (name, host, server, capped) in [
+            (
+                "affinity",
+                host(16),
+                (16, CpuSource::Affinity),
+                (4, CpuSource::SidecarCap),
+            ),
+            (
+                "small host",
+                host(2),
+                (2, CpuSource::Affinity),
+                (2, CpuSource::Affinity),
+            ),
+            (
+                "four cores",
+                host(4),
+                (4, CpuSource::Affinity),
+                (4, CpuSource::Affinity),
+            ),
+            (
+                "cgroup limit",
+                quota(16, 8_000),
+                (8, CpuSource::CgroupQuota),
+                (4, CpuSource::SidecarCap),
+            ),
+            (
+                "small cgroup limit",
+                quota(16, 3_000),
+                (3, CpuSource::CgroupQuota),
+                (3, CpuSource::CgroupQuota),
+            ),
+            (
+                "declared request",
+                request_only(16, 4_000),
+                (8, CpuSource::RequestBurst),
+                (4, CpuSource::SidecarCap),
+            ),
+            (
+                "no detection",
+                host(0),
+                (1, CpuSource::Fallback),
+                (1, CpuSource::Fallback),
+            ),
+        ] {
+            assert_eq!(
+                resolve(&detected, &host),
+                (server.0, server.1, None),
+                "server, {name}"
+            );
+            assert_eq!(
+                resolve(&sidecar, &host),
+                (capped.0, capped.1, None),
+                "sidecar, {name}"
+            );
+        }
+
+        let warning = |assignment: &str, requested: &str| {
+            Some(format!(
+                "`{assignment}` asks for {requested}, more than the 4 cores a sidecar may use, so \
+                 this sidecar runs on 4 cores. A sidecar shares its host with the application it \
+                 serves; to use more cores, start Spice without `--role sidecar`. See: \
+                 https://spiceai.org/docs/reference/spicepod#runtimecpu"
+            ))
+        };
+        for (config, expected) in [
+            (
+                CpuConfig::from_sources(Some("8"), None, None),
+                (
+                    4,
+                    CpuSource::SidecarCap,
+                    warning("--cpu-cores 8", "8 cores"),
+                ),
+            ),
+            (
+                CpuConfig::from_sources(None, Some("4.5"), None),
+                (
+                    4,
+                    CpuSource::SidecarCap,
+                    warning("SPICE_CPU_CORES=4.5", "4.5 cores"),
+                ),
+            ),
+            (
+                CpuConfig::from_sources(None, None, Some("12")),
+                (
+                    4,
+                    CpuSource::SidecarCap,
+                    warning("runtime.cpu.cores: 12", "12 cores"),
+                ),
+            ),
+            (
+                CpuConfig::from_sources(None, None, Some("all")),
+                (
+                    4,
+                    CpuSource::SidecarCap,
+                    warning("runtime.cpu.cores: all", "16 cores"),
+                ),
+            ),
+            (
+                // `all` defers to a quantity named below it; that quantity is capped.
+                CpuConfig::from_sources(None, Some("all"), Some("6")),
+                (
+                    4,
+                    CpuSource::SidecarCap,
+                    warning("runtime.cpu.cores: 6", "6 cores"),
+                ),
+            ),
+            (
+                CpuConfig::from_sources(None, None, Some("4")),
+                (4, CpuSource::Configured, None),
+            ),
+            (
+                CpuConfig::from_sources(Some("2"), None, None),
+                (2, CpuSource::Configured, None),
+            ),
+            (
+                CpuConfig::from_sources(None, None, Some("auto")),
+                (4, CpuSource::SidecarCap, None),
+            ),
+        ] {
+            let name = format!("{config:?}");
+            assert_eq!(
+                resolve(&config.for_sidecar(), &host(16)),
+                expected,
+                "{name}"
+            );
+        }
+        // A server is never capped and never warned about it.
+        assert_eq!(
+            resolve(&CpuConfig::from_sources(None, None, Some("12")), &host(16)),
+            (12, CpuSource::Configured, None)
+        );
+
+        let summary = CpuBudget::resolve(&sidecar, &host(16))
+            .expect("detection cannot fail")
+            .summary_line();
+        assert!(
+            summary.starts_with(
+                "CPU budget: 4 cores (source: the sidecar maximum of 4 cores; host reports 16"
+            ),
+            "{summary}"
+        );
+        assert!(summary.ends_with(", 1 target partitions"), "{summary}");
     }
 
     #[test]
@@ -1658,6 +2524,370 @@ mod tests {
         assert!(!under_quota.contains("minimum"), "{under_quota}");
     }
 
+    /// The explicit override is the one rung that can name more CPU than a cgroup
+    /// quota will hand over, so the mismatch has to be said out loud.
+    ///
+    /// Regression test for #13275.
+    #[test]
+    fn a_configured_value_above_the_cgroup_quota_is_remarked_on() {
+        let spicepod = |cores: &str| CpuConfig::from_sources(None, None, Some(cores));
+
+        // The reported deployment: `limits.cpu: 2` with `runtime.cpu.cores: 6`. Both
+        // readings are 2 here, and the quota is named because it is the wall that
+        // throttles.
+        let throttled = CpuBudget::resolve(&spicepod("6"), &quota(2, 2000)).expect("valid");
+        let warning = throttled
+            .configured_above_ceiling_warning()
+            .expect("6 configured cores under a 2-core quota must be remarked on");
+        assert!(
+            warning.contains("`runtime.cpu.cores` is set to 6 cores"),
+            "names the setting and its value: {warning}"
+        );
+        assert!(
+            warning.contains("cgroup CPU limit of 2 cores"),
+            "names the ceiling it exceeds: {warning}"
+        );
+        assert!(
+            warning.contains("CFS-throttled"),
+            "names what the operator will observe: {warning}"
+        );
+        assert!(
+            warning.contains("Lower it to 2 cores"),
+            "gives an actionable fix: {warning}"
+        );
+        assert!(
+            warning.contains("instead of being given the extra CPU"),
+            "names what the extra configured CPU does not buy: {warning}"
+        );
+        assert!(warning.contains(DOCS_URL), "{warning}");
+
+        // Warn-only: the configured value is still honoured, so an operator sizing
+        // for a limit they are about to raise is not silently shrunk.
+        assert_eq!(throttled.cores(), 6, "the value must not be clamped");
+        assert_eq!(throttled.source(), CpuSource::Configured);
+
+        // The ordinary Kubernetes shape: the quota is narrow, affinity is the whole
+        // node, so the quota is what the sizing has to clear.
+        let on_a_big_node = CpuBudget::resolve(&spicepod("6"), &quota(64, 2000))
+            .expect("valid")
+            .configured_above_ceiling_warning()
+            .expect("a narrow quota on a wide node must still be named");
+        assert!(
+            on_a_big_node.contains("cgroup CPU limit of 2 cores"),
+            "{on_a_big_node}"
+        );
+    }
+
+    /// The second door, which no quota reading covers: more configured cores than
+    /// the process may run on at all.
+    ///
+    /// Regression test for #13275.
+    #[test]
+    fn a_configured_value_above_the_available_cpus_is_remarked_on() {
+        let spicepod = |cores: &str| CpuConfig::from_sources(None, None, Some(cores));
+
+        // A bare-metal or `taskset` deployment: no quota exists to compare against.
+        let oversubscribed = CpuBudget::resolve(&spicepod("6"), &bare_metal(2))
+            .expect("valid")
+            .configured_above_ceiling_warning()
+            .expect("6 configured cores on a 2-CPU host must be remarked on");
+        assert!(
+            oversubscribed.contains("the 2 cores available to this process"),
+            "names affinity rather than a quota nothing set: {oversubscribed}"
+        );
+        assert!(
+            oversubscribed.contains("threads contend"),
+            "names the contention, not throttling: {oversubscribed}"
+        );
+        assert!(
+            !oversubscribed.contains("cgroup"),
+            "no quota to name here: {oversubscribed}"
+        );
+        // The remedy has to hold on a host that is not restricted at all. Nothing
+        // here distinguishes a `taskset` mask from a 2-CPU machine, and on the
+        // machine there is no wider mask to apply.
+        assert!(
+            !oversubscribed.contains("widen this process's CPU affinity"),
+            "a bare-metal host has no mask to widen: {oversubscribed}"
+        );
+        assert!(
+            oversubscribed.contains("give this process more CPUs"),
+            "the remedy must hold whether or not a mask is what bounds it: {oversubscribed}"
+        );
+
+        // A quota wider than affinity cannot be used, so affinity is the tightest
+        // ceiling and the one worth naming — `docker run --cpus=100` on 16 CPUs.
+        let wide_quota = CpuBudget::resolve(&spicepod("32"), &quota(16, 100_000))
+            .expect("valid")
+            .configured_above_ceiling_warning()
+            .expect("affinity is the real ceiling when the quota exceeds it");
+        assert!(
+            wide_quota.contains("the 16 cores available to this process"),
+            "{wide_quota}"
+        );
+    }
+
+    /// Nothing to say while the sizing fits, so an ordinary deployment gains no
+    /// warning it would learn to ignore.
+    #[test]
+    fn a_configured_value_within_every_ceiling_stays_silent() {
+        let spicepod = |cores: &str| CpuConfig::from_sources(None, None, Some(cores));
+
+        for (cores, host) in [
+            ("2", quota(2, 2000)),
+            ("1", quota(2, 2000)),
+            ("2", quota(64, 2000)),
+            ("16", bare_metal(16)),
+            ("3.5", quota(64, 4000)),
+        ] {
+            assert_eq!(
+                CpuBudget::resolve(&spicepod(cores), &host)
+                    .expect("valid")
+                    .configured_above_ceiling_warning(),
+                None,
+                "{cores} within the ceiling must stay silent"
+            );
+        }
+
+        // The settings that name no quantity resolve through the clamp already, so
+        // their value is the ceiling by construction.
+        for setting in ["all", "auto"] {
+            let resolved = CpuBudget::resolve(&spicepod(setting), &quota(64, 2000)).expect("valid");
+            assert_eq!(resolved.cores(), 2, "{setting} must clamp to the quota");
+            assert_eq!(
+                resolved.configured_above_ceiling_warning(),
+                None,
+                "{setting} names no quantity to exceed a ceiling"
+            );
+        }
+
+        // And nothing to say when no override was written at all.
+        assert_eq!(budget(64).configured_above_ceiling_warning(), None);
+        assert_eq!(
+            CpuBudget::resolve(&CpuConfig::default(), &quota(64, 2000))
+                .expect("valid")
+                .configured_above_ceiling_warning(),
+            None
+        );
+    }
+
+    /// A one-core reading may be a failed detection, so it cannot be reported as an
+    /// affinity ceiling — and the override exists for exactly those hosts.
+    ///
+    /// `HostReadings::detect` maps an `available_parallelism` error to 1, which is
+    /// indistinguishable from a genuine single-CPU host. Naming it would tell an
+    /// operator in a sandbox to cut every pool to one core.
+    ///
+    /// Regression test for #13275.
+    #[test]
+    fn an_undetectable_cpu_count_is_not_reported_as_a_ceiling() {
+        let spicepod = |cores: &str| CpuConfig::from_sources(None, None, Some(cores));
+
+        // Detection failed (or a real 1-CPU host): nothing here is provable, so the
+        // override is honoured in silence rather than argued with.
+        for host in [host(0), host(1), bare_metal(1)] {
+            let resolved = CpuBudget::resolve(&spicepod("4"), &host).expect("valid");
+            assert_eq!(resolved.detected_cores(), 1, "the premise");
+            assert_eq!(resolved.cores(), 4, "the override is still honoured");
+            assert_eq!(
+                resolved.configured_above_ceiling_warning(),
+                None,
+                "an unprovable core count must not be named as a ceiling"
+            );
+        }
+
+        // A cgroup quota is read independently of the CPU count, so it stays namable
+        // even when the CPU count is not.
+        let with_quota = CpuBudget::resolve(&spicepod("4"), &quota(1, 500))
+            .expect("valid")
+            .configured_above_ceiling_warning()
+            .expect("an exact quota is still a ceiling when the CPU count is not");
+        assert!(
+            with_quota.contains("cgroup CPU limit of 500m"),
+            "{with_quota}"
+        );
+        assert!(
+            !with_quota.contains("available to this process"),
+            "must not fall back to the unprovable reading: {with_quota}"
+        );
+    }
+
+    /// A fractional quota is the reading `detected_cores` cannot express, so the
+    /// ceiling has to come from the quota itself.
+    ///
+    /// `available_parallelism` floors the quota it has already applied, so a
+    /// `limits.cpu: 2500m` pod on a wide node reports 2 available cores. Comparing
+    /// against that floored value warns an operator who configured exactly their
+    /// quota, and sends them after an affinity limit that does not exist.
+    ///
+    /// Regression test for #13275.
+    #[test]
+    fn a_fractional_quota_is_named_exactly_rather_than_floored() {
+        let spicepod = |cores: &str| CpuConfig::from_sources(None, None, Some(cores));
+        let fractional = quota(2, 2500);
+        assert_eq!(
+            CpuBudget::resolve(&CpuConfig::default(), &fractional)
+                .expect("valid")
+                .detected_cores(),
+            2,
+            "the premise: 2500m floors to a 2-core reading"
+        );
+
+        // Anything up to the real quota is within the entitlement, including the
+        // 500m the floored reading cannot see.
+        for cores in ["2", "2.1", "2.5", "2500m"] {
+            assert_eq!(
+                CpuBudget::resolve(&spicepod(cores), &fractional)
+                    .expect("valid")
+                    .configured_above_ceiling_warning(),
+                None,
+                "{cores} is within a 2500m quota and must not be warned about"
+            );
+        }
+
+        // Above it, the quota is named exactly rather than as the floored count.
+        let over = CpuBudget::resolve(&spicepod("3"), &fractional)
+            .expect("valid")
+            .configured_above_ceiling_warning()
+            .expect("3 cores above a 2500m quota must be remarked on");
+        assert!(
+            over.contains("cgroup CPU limit of 2.5 cores"),
+            "names the exact quota, not the floored core count: {over}"
+        );
+        assert!(
+            !over.contains("affinity"),
+            "a fractional quota is not an affinity problem: {over}"
+        );
+    }
+
+    /// The claim in `configured_above_ceiling_warning` is that lowering changes
+    /// no pool size — not that every pool equals the core budget, which is false
+    /// and was what the message said. Four of the sixteen derived quantities
+    /// diverge from `cores` at `cores = 3`, and a reword checked only against
+    /// `derived_sizing()` being *unchanged* cannot see that, because unchanged
+    /// and equal are different properties. This pins the divergence itself, so
+    /// the sentence cannot be rebuilt from a premise the accessors do not hold.
+    #[test]
+    fn not_every_pool_equals_the_core_budget() {
+        let over = CpuBudget::resolve(
+            &CpuConfig::from_sources(None, None, Some("3")),
+            &quota(2, 2500),
+        )
+        .expect("valid");
+        assert_eq!(over.cores, 3, "the premise");
+
+        let divergent: Vec<_> = over
+            .derived_sizing()
+            .into_iter()
+            .filter(|(_, value)| *value != over.cores)
+            .collect();
+
+        assert_eq!(
+            divergent,
+            vec![
+                ("dedicated_runtime_worker_threads", 2),
+                ("interactive_query_worker_threads", 2),
+                ("max_concurrent_queries", 12),
+                ("cayenne_encode_permits", 1),
+            ],
+            "a pool that stops tracking `cores` belongs in this list, and any message \
+             saying \"every pool at N cores\" is wrong while the list is non-empty"
+        );
+    }
+
+    /// Lowering to a fractional ceiling resizes no pool but still fixes the reported
+    /// busy fraction, so the warning must keep it as a remedy while scoping the
+    /// "unchanged" claim to pool sizes.
+    ///
+    /// Every *pool* comes from `ceil(millicores / 1000)`, so a 3-core override and
+    /// the 2.5-core quota it exceeds both resolve to three workers and three
+    /// partitions — promising that lowering resizes anything would over-claim.
+    /// `cpu_busy_fraction` divides by the exact `millicores` instead, so the same
+    /// lowering moves a saturated container from 0.83 to 1.0 and stops the Cayenne
+    /// tuner reading it as partly idle. Both remedies are therefore real, and the
+    /// message has to say which one buys what.
+    ///
+    /// Regression test for #13275.
+    #[test]
+    fn a_ceiling_that_rounds_to_the_configured_cores_keeps_both_remedies() {
+        let spicepod = |cores: &str| CpuConfig::from_sources(None, None, Some(cores));
+        let fractional = quota(2, 2500);
+
+        let over = CpuBudget::resolve(&spicepod("3"), &fractional).expect("valid");
+        let at_ceiling = CpuBudget::resolve(&spicepod("2.5"), &fractional).expect("valid");
+        assert_eq!(
+            over.derived_sizing(),
+            at_ceiling.derived_sizing(),
+            "the premise: following the advice must change no pool size"
+        );
+
+        // …but `cpu_busy_fraction` divides by the exact entitlement, not the rounded
+        // count, so lowering is still a real fix: a process saturating its 2.5-core
+        // quota reports 0.83 against a 3-core entitlement and 1.00 against a
+        // 2.5-core one, and the Cayenne tuner reads that as spare CPU.
+        let (busy, wall) = (2.5, 1.0);
+        assert!(
+            (over.cpu_busy_fraction(busy, wall) - 0.833_333_333_333_333_3).abs() < 1e-12,
+            "the premise: {}",
+            over.cpu_busy_fraction(busy, wall)
+        );
+        assert!(
+            (at_ceiling.cpu_busy_fraction(busy, wall) - 1.0).abs() < f64::EPSILON,
+            "the premise: {}",
+            at_ceiling.cpu_busy_fraction(busy, wall)
+        );
+
+        let warning = over
+            .configured_above_ceiling_warning()
+            .expect("3 cores above a 2500m quota is still worth naming");
+        assert!(
+            warning.contains("Lower it to 2.5 cores"),
+            "lowering stays on the table — it fixes the busy fraction: {warning}"
+        );
+        assert!(
+            warning.contains("raise the container's CPU limit to 3 cores"),
+            "and so does raising the wall: {warning}"
+        );
+        assert!(
+            warning.contains(
+                "Lowering resizes no pool — 2.5 cores already rounds up to the same 3-core budget"
+            ),
+            "explains why lowering preserves the pools by naming the ceiling, not restating the \
+             entitlement: {warning}"
+        );
+        assert!(
+            !warning.contains("every pool at 3 cores"),
+            "the pools are not all equal to the core budget — say they do not CHANGE, not that \
+             they are all 3: {warning}"
+        );
+        assert!(
+            warning.contains("busy fraction"),
+            "says what lowering does buy: {warning}"
+        );
+        assert!(
+            !warning.contains("every pool is sized for 3 cores and"),
+            "must not attribute the throttling to pool oversizing here: {warning}"
+        );
+        assert!(
+            warning.contains("CFS-throttled"),
+            "still names what the operator observes: {warning}"
+        );
+        assert!(warning.contains(DOCS_URL), "{warning}");
+
+        // A configured value that does round up past the ceiling keeps the original
+        // wording, because there lowering genuinely shrinks every pool.
+        let shrinks = CpuBudget::resolve(&spicepod("3.5"), &fractional).expect("valid");
+        assert_eq!(shrinks.cores(), 4, "the premise: 3.5 rounds to 4");
+        assert_eq!(at_ceiling.cores(), 3, "and the ceiling to 3");
+        let shrinking_warning = shrinks
+            .configured_above_ceiling_warning()
+            .expect("3.5 cores above a 2500m quota must be remarked on");
+        assert!(
+            shrinking_warning.contains("Lower it to 2.5 cores"),
+            "lowering does shrink the pools here: {shrinking_warning}"
+        );
+    }
+
     /// `all` is the weakest setting: it says "no ceiling of my own", so a quantity
     /// named on a lower-precedence surface wins.
     ///
@@ -1753,6 +2983,30 @@ mod tests {
         assert_eq!(budget(16).max_concurrent_queries(), 64);
     }
 
+    /// A sidecar's plans run on one partition and mostly wait on its upstream,
+    /// so it admits sixteen per core: at its 4-core maximum, the 64 a 16-core
+    /// server admits, rather than the 16 a 4-core server does.
+    #[test]
+    fn a_sidecar_admits_sixteen_queries_per_core() {
+        let sidecar = |host: &HostReadings| {
+            CpuBudget::resolve(&CpuConfig::default().for_sidecar(), host)
+                .expect("detection cannot fail")
+        };
+        for (cores, server, capped) in [(1, 4, 16), (2, 8, 32), (4, 16, 64), (16, 64, 64)] {
+            assert_eq!(
+                budget(cores).max_concurrent_queries(),
+                server,
+                "server, {cores} cores"
+            );
+            assert_eq!(
+                sidecar(&host(cores)).max_concurrent_queries(),
+                capped,
+                "sidecar, {cores} cores"
+            );
+        }
+        assert_eq!(sidecar(&host(16)).sidecar_target_partitions(), 1);
+    }
+
     #[test]
     fn quantities() {
         use CpuSetting::{All, Auto, Cores};
@@ -1824,6 +3078,32 @@ mod tests {
         .expect("valid");
         assert_eq!(auto.cores(), 18);
         assert_eq!(auto.source(), CpuSource::Affinity);
+    }
+
+    #[test]
+    fn configured_cores_reports_only_an_explicit_quantity() {
+        let configured = |cli: Option<&str>,
+                          env: Option<&str>,
+                          spicepod: Option<&str>,
+                          readings: &HostReadings| {
+            CpuBudget::resolve(&CpuConfig::from_sources(cli, env, spicepod), readings)
+                .expect("valid")
+                .configured_cores()
+        };
+
+        // Every surface that names a quantity reports it, rounded up as `cores()` is.
+        assert_eq!(configured(Some("2"), None, None, &host(16)), Some(2));
+        assert_eq!(configured(None, Some("5"), None, &host(16)), Some(5));
+        assert_eq!(configured(None, None, Some("3.5"), &host(16)), Some(4));
+        // Above the host's CPUs it is still the value the runtime sizes itself for.
+        assert_eq!(configured(None, None, Some("64"), &host(16)), Some(64));
+
+        // `auto` and `all` name no quantity, and a detected budget is not configured.
+        assert_eq!(configured(None, None, Some("auto"), &host(16)), None);
+        assert_eq!(configured(None, None, Some("all"), &quota(16, 4000)), None);
+        assert_eq!(configured(None, None, None, &quota(16, 4000)), None);
+        assert_eq!(configured(None, None, None, &request_only(16, 2000)), None);
+        assert_eq!(configured(None, None, None, &host(16)), None);
     }
 
     #[test]
@@ -2039,6 +3319,7 @@ mod tests {
             cpu_share: Some(CpuShare::Weight(174)),
             declared_request_millicores: None,
             kubernetes: true,
+            smt: None,
         };
         let warning = CpuBudget::resolve(&CpuConfig::default(), &unwired)
             .expect("valid")
@@ -2170,6 +3451,7 @@ mod tests {
         for name in [
             "main_runtime_worker_threads",
             "dedicated_runtime_worker_threads",
+            "interactive_query_worker_threads",
             "target_partitions",
             "max_concurrent_queries",
             "cayenne_encode_permits",

@@ -26,7 +26,7 @@ limitations under the License.
 //! rows (32 766 / 3, floored) would exceed the limit without the multi-chunk
 //! transaction path.
 
-mod common;
+use crate::common;
 
 use std::sync::Arc;
 

@@ -28,7 +28,6 @@ limitations under the License.
 //! passed in via below-runtime crates — so an accelerator engine (and the `AcceleratedTable`
 //! machinery) can implement or consume the contract without depending on `runtime`.
 
-use crate::snapshots::CayenneSnapshotValidationError;
 use ::arrow::datatypes::SchemaRef;
 use arrow_tools::type_rewrite::TypeRewriteRules;
 use async_trait::async_trait;
@@ -50,14 +49,18 @@ use runtime_acceleration::sidecar::{AcceleratorSidecar, OpenOption};
 use runtime_acceleration::snapshot::AccelerationLayout;
 use runtime_checkpoint_api::CheckpointError;
 use runtime_parameters::ParameterSpec;
-use runtime_parameters::Parameters;
-use runtime_secrets::{ExposeSecret, Secrets, get_params_with_secrets};
+use runtime_parameters::{Diagnostics, Parameters};
+use runtime_secrets::{
+    ExposeSecret, Secrets, get_params_with_secrets, secret_sources_from_templates,
+};
 use runtime_table_partition::expression::{PartitionedBy, partition_by_expressions};
 use snafu::prelude::*;
 use std::path::PathBuf;
 use std::{any::Any, collections::HashMap, sync::Arc};
 use tokio::sync::RwLock;
 
+pub mod keep_first;
+pub mod pk_write_guard;
 pub mod snapshots;
 pub mod storage;
 pub mod swappable;
@@ -66,17 +69,9 @@ pub mod upsert_dedup;
 
 /// Base directory Spice stores accelerator data under (`<cwd>/.spice/data`).
 ///
-/// Lives here so an engine below `runtime` can resolve it without an upward
-/// dependency; `runtime` re-exports it.
-#[must_use]
-pub fn spice_data_base_path() -> String {
-    let Ok(working_dir) = std::env::current_dir() else {
-        return ".".to_string();
-    };
-
-    let base_folder = working_dir.join(".spice/data");
-    base_folder.to_str().unwrap_or(".").to_string()
-}
+/// Defined in `util` so the Spicepod validation in `app` and every engine below
+/// `runtime` resolve the same directory; `runtime` re-exports it from here.
+pub use util::spice_paths::spice_data_base_path;
 
 /// Creates [`spice_data_base_path`] if it does not already exist, so a file-mode
 /// engine can open its database under it.
@@ -91,17 +86,115 @@ pub fn make_spice_data_directory() -> std::io::Result<()> {
 pub use runtime_acceleration::BootstrapStatus;
 pub use types::{AccelerationSource, AcceleratorEngineRegistry};
 
+/// The Cayenne engine's runtime-level settings.
+///
+/// Fields are named for the `runtime.params` key they come from.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct CayenneRuntimeConfig {
+    /// `runtime.params.cayenne_footer_cache_mb`: how much the engine may spend on its
+    /// Vortex footer-metadata cache. `None` when the operator set none, which is distinct
+    /// from `Some(0)` — no footer cache at all.
+    pub footer_cache_mb: Option<usize>,
+}
+
+/// Runtime-level (not per-dataset) settings for one engine, at construction.
+///
+/// An engine is built by its registration constructor, which the registration slice calls
+/// with no knowledge of the engine's type. Passing the resolved settings *here* is what
+/// keeps them per-`Runtime`: an engine built for one `Runtime` cannot see another's, and
+/// there is no process-global channel to publish them through — nor a window between
+/// publishing and constructing for a concurrent build to interleave in.
+///
+/// One variant per [`Engine`], carrying that engine's own settings type rather than a
+/// shared struct of engine-prefixed fields. The set is closed because [`Engine`] is
+/// already closed; a variant that carries nothing is an engine that takes no runtime-level
+/// configuration, which is all of them but Cayenne today.
+///
+/// The payload is a struct rather than inline fields so that a `&CayenneRuntimeConfig` can
+/// be passed on: the one fallible step is getting *out* of this enum, and everything after
+/// it — including each engine's own constructor — is total.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AcceleratorRuntimeConfig {
+    Arrow,
+    PartitionedArrow,
+    Sqlite,
+    PostgreSQL,
+    Cayenne(CayenneRuntimeConfig),
+}
+
+impl AcceleratorRuntimeConfig {
+    /// The engine these settings configure.
+    #[must_use]
+    pub fn engine(&self) -> Engine {
+        match self {
+            Self::Arrow => Engine::Arrow,
+            Self::PartitionedArrow => Engine::PartitionedArrow,
+            Self::Sqlite => Engine::Sqlite,
+            Self::PostgreSQL => Engine::PostgreSQL,
+            Self::Cayenne(_) => Engine::Cayenne,
+        }
+    }
+
+    /// The unconfigured settings for `engine` — what an engine gets when the operator set
+    /// nothing, and what a caller building an engine only to ask it a question passes.
+    ///
+    /// The variant always matches `engine`, which is what makes
+    /// [`AcceleratorRegistration::build_with_defaults`] unable to fail in practice.
+    #[must_use]
+    pub fn default_for(engine: Engine) -> Self {
+        match engine {
+            Engine::Arrow => Self::Arrow,
+            Engine::PartitionedArrow => Self::PartitionedArrow,
+            Engine::Sqlite => Self::Sqlite,
+            Engine::PostgreSQL => Self::PostgreSQL,
+            Engine::Cayenne => Self::Cayenne(CayenneRuntimeConfig::default()),
+        }
+    }
+}
+
 #[derive(Clone, Copy)]
 pub struct AcceleratorRegistration {
     pub engine: Engine,
-    pub constructor: fn() -> Arc<dyn DataAccelerator>,
+    /// Builds the engine from settings that must be [`Engine`]-matched to `engine`.
+    ///
+    /// Fallible because the registration slice stores one function type for every engine,
+    /// so a mismatched variant cannot be rejected at compile time. Call it through
+    /// [`AcceleratorEngineRegistry::register_all`] or
+    /// [`AcceleratorRegistration::build_with_defaults`], both of which choose the config by
+    /// engine and so cannot mismatch.
+    pub constructor: fn(&AcceleratorRuntimeConfig) -> Result<Arc<dyn DataAccelerator>>,
 }
 
 impl AcceleratorRegistration {
-    pub const fn new(engine: Engine, constructor: fn() -> Arc<dyn DataAccelerator>) -> Self {
+    pub const fn new(
+        engine: Engine,
+        constructor: fn(&AcceleratorRuntimeConfig) -> Result<Arc<dyn DataAccelerator>>,
+    ) -> Self {
         Self {
             engine,
             constructor,
+        }
+    }
+
+    /// Builds this engine with no runtime-level settings, for a caller that only wants to
+    /// ask it a question — what it makes of an acceleration, what parameters it accepts.
+    ///
+    /// Returns `None` only if the constructor rejects
+    /// [`AcceleratorRuntimeConfig::default_for`] of its own engine, which it cannot; the
+    /// case is logged rather than propagated so that asking an engine a question needs no
+    /// error handling.
+    #[must_use]
+    pub fn build_with_defaults(&self) -> Option<Arc<dyn DataAccelerator>> {
+        match (self.constructor)(&AcceleratorRuntimeConfig::default_for(self.engine)) {
+            Ok(accelerator) => Some(accelerator),
+            Err(error) => {
+                tracing::error!(
+                    "Failed to prepare the '{}' accelerator engine, so Spice cannot determine how it handles an acceleration and datasets using `engine: {}` may not load. Cause: {error}. This is an internal error, not a configuration mistake — please report it at https://github.com/spiceai/spiceai/issues",
+                    self.engine,
+                    self.engine
+                );
+                None
+            }
         }
     }
 }
@@ -158,6 +251,20 @@ fn format_engine_list(names: &[String]) -> String {
 /// register_data_accelerator!(Engine::Foo, FooAccelerator);
 /// ```
 ///
+/// # Example (configured form)
+///
+/// For an engine that takes a runtime-level setting at construction. It must implement
+/// `from_runtime_config(&AcceleratorRuntimeConfig) -> Self`; the simple forms above call
+/// `new()` and ignore the configuration.
+///
+/// ```ignore
+/// register_data_accelerator!(configured: Engine::Foo, Foo, FooAccelerator);
+/// ```
+///
+/// The middle argument is the [`AcceleratorRuntimeConfig`] variant carrying this engine's
+/// settings; the accelerator must implement
+/// `from_runtime_config(&FooRuntimeConfig) -> Self`.
+///
 /// # Example (explicit form)
 ///
 /// ```ignore
@@ -174,8 +281,33 @@ fn format_engine_list(names: &[String]) -> String {
 #[macro_export]
 macro_rules! register_data_accelerator {
     ($fn_name:ident, $static_name:ident, $engine:expr, $accelerator:path) => {
-        fn $fn_name() -> ::std::sync::Arc<dyn $crate::DataAccelerator> {
-            ::std::sync::Arc::new(<$accelerator>::new())
+        fn $fn_name(
+            _config: &$crate::AcceleratorRuntimeConfig,
+        ) -> $crate::Result<::std::sync::Arc<dyn $crate::DataAccelerator>> {
+            Ok(::std::sync::Arc::new(<$accelerator>::new()))
+        }
+
+        #[linkme::distributed_slice($crate::DATA_ACCELERATOR_REGISTRATIONS)]
+        pub static $static_name: $crate::AcceleratorRegistration =
+            $crate::AcceleratorRegistration::new($engine, $fn_name);
+    };
+
+    (configured: $fn_name:ident, $static_name:ident, $engine:expr, $variant:ident, $accelerator:path) => {
+        fn $fn_name(
+            config: &$crate::AcceleratorRuntimeConfig,
+        ) -> $crate::Result<::std::sync::Arc<dyn $crate::DataAccelerator>> {
+            // The only fallible step: once the engine's own settings are in hand, building
+            // it is total, and that `&`-reference is what gets passed on.
+            match config {
+                $crate::AcceleratorRuntimeConfig::$variant(engine_config) => Ok(
+                    ::std::sync::Arc::new(<$accelerator>::from_runtime_config(engine_config)),
+                ),
+                mismatched => $crate::MismatchedEngineConfigSnafu {
+                    expected: $engine,
+                    actual: mismatched.engine(),
+                }
+                .fail(),
+            }
         }
 
         #[linkme::distributed_slice($crate::DATA_ACCELERATOR_REGISTRATIONS)]
@@ -193,6 +325,19 @@ macro_rules! register_data_accelerator {
             );
         }
     };
+
+    (configured: $engine:expr, $variant:ident, $accelerator:ident) => {
+        ::paste::paste! {
+            $crate::register_data_accelerator!(
+                configured:
+                [<__register_data_accelerator_fn_ $accelerator:snake>],
+                [<__REGISTER_DATA_ACCELERATOR_ $accelerator:upper>],
+                $engine,
+                $variant,
+                $accelerator
+            );
+        }
+    };
 }
 
 #[derive(Debug, Snafu)]
@@ -203,7 +348,7 @@ pub enum Error {
     InvalidConfiguration { msg: String },
 
     #[snafu(display(
-        "Unknown acceleration engine '{engine}'. Valid engines are: arrow, duckdb, sqlite, turso, postgres/postgresql, cayenne/vortex. Docs: https://spiceai.org/docs/components/data-accelerators"
+        "Unknown acceleration engine '{engine}'. Valid engines are: arrow, sqlite, postgres/postgresql, cayenne/vortex. Docs: https://spiceai.org/docs/components/data-accelerators"
     ))]
     UnknownEngine { engine: Arc<str> },
 
@@ -211,6 +356,27 @@ pub enum Error {
     AccelerationCreationFailed {
         source: Box<dyn std::error::Error + Send + Sync>,
     },
+
+    /// The engine rejected the acceleration settings while creating the table.
+    #[snafu(display("Acceleration creation failed: {source}"))]
+    EngineRejectedConfiguration {
+        source: Box<dyn std::error::Error + Send + Sync>,
+    },
+
+    /// The engine's stored table was built with settings it cannot adopt in place, and
+    /// the dataset's settings let it be rebuilt from the source
+    /// ([`DataAccelerator::requires_rebuild`]): the caller drops the table and creates
+    /// it again. Displays as the engine's cause clause.
+    #[snafu(display("{source}"))]
+    RebuildRequired {
+        source: Box<dyn std::error::Error + Send + Sync>,
+    },
+
+    // Worded as the cause clause it appears as: the messages that embed it supply the
+    // impact and where to report it. Reaching this means a caller paired an engine's
+    // registration with another engine's settings, which every path here chooses by engine.
+    #[snafu(display("the {expected} engine was given {actual} configuration"))]
+    MismatchedEngineConfig { expected: Engine, actual: Engine },
 }
 
 #[derive(Debug, Snafu)]
@@ -232,6 +398,17 @@ pub enum FilePathError {
 }
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
+
+impl Error {
+    /// Whether creating the table again with the same settings could succeed.
+    #[must_use]
+    pub fn is_retriable(&self) -> bool {
+        !matches!(
+            self,
+            Self::InvalidConfiguration { .. } | Self::EngineRejectedConfiguration { .. }
+        )
+    }
+}
 
 impl AcceleratorEngineRegistry {
     /// Builds the accelerator [`TableProvider`] for a dataset from its acceleration settings.
@@ -255,13 +432,10 @@ impl AcceleratorEngineRegistry {
 
         // Normalize Dictionary-encoded types to their value types only for
         // accelerator engines that do not natively support Arrow Dictionary
-        // encoding (DuckDB, SQLite, Turso).  Other engines (Arrow, Cayenne,
+        // encoding (SQLite).  Other engines (Arrow, Cayenne,
         // PostgreSQL) handle Dictionary types natively and benefit from the
         // compact encoding.
-        let needs_dictionary_normalization = matches!(
-            engine.to_unpartitioned(),
-            Engine::DuckDB | Engine::Sqlite | Engine::Turso
-        );
+        let needs_dictionary_normalization = matches!(engine.to_unpartitioned(), Engine::Sqlite);
         let schema = if needs_dictionary_normalization
             && arrow_tools::schema::has_dictionary_types(&schema)
         {
@@ -295,19 +469,11 @@ impl AcceleratorEngineRegistry {
             .fail()?;
         }
 
-        // No lock is held over the expansion: `Parameters::try_new` below
-        // takes the same lock for its autoload pass, and tokio's `RwLock` is
-        // write-preferring, so nesting the two would deadlock as soon as a
-        // writer queued between them.
-        let params_with_secrets =
-            get_params_with_secrets(Arc::clone(&secrets), &acceleration_settings.params).await;
-
-        let params = Parameters::try_new(
-            &format!("accelerator {}", accelerator.name()),
-            params_with_secrets.into_iter().collect::<Vec<_>>(),
-            accelerator.prefix(),
+        let params = acceleration_parameters(
+            accelerator.as_ref(),
+            acceleration_settings,
             secrets,
-            accelerator.parameters(),
+            Diagnostics::Report,
         )
         .await
         .context(AccelerationCreationFailedSnafu)?;
@@ -325,6 +491,12 @@ impl AcceleratorEngineRegistry {
         .options(params)
         .indexes(acceleration_settings.indexes.clone());
         let suppress_auto_on_conflict = cayenne_pk_conflict_detection_none(acceleration_settings);
+        // Cayenne keeps the last version of each key whatever `on_conflict` says: a
+        // primary key alone makes its table upsert on that key. The setting still
+        // decides where a read-write dataset's writes go (see the accelerated
+        // table), so it stays on the acceleration and is only ignored here.
+        let honors_on_conflict =
+            acceleration_settings.engine != runtime_acceleration::Engine::Cayenne;
 
         // If there are constraints from the federated table, then add them to the accelerated table
         // For Arrow/MemTable accelerator, on_conflict will be automatically derived from primary key constraints
@@ -340,19 +512,22 @@ impl AcceleratorEngineRegistry {
             }
         }
 
-        if let Some(on_conflict) =
-            acceleration_settings
-                .on_conflict()
-                .map_err(|e| Error::InvalidConfiguration {
-                    msg: format!("on_conflict invalid: {e}"),
-                })?
+        if honors_on_conflict
+            && let Some(on_conflict) =
+                acceleration_settings
+                    .on_conflict()
+                    .map_err(|e| Error::InvalidConfiguration {
+                        msg: format!("on_conflict invalid: {e}"),
+                    })?
         {
             external_table_builder = external_table_builder.on_conflict(on_conflict);
         }
 
         // Pass UpsertOptions for constraint validation behavior
-        external_table_builder =
-            external_table_builder.upsert_options(acceleration_settings.upsert_options());
+        if honors_on_conflict {
+            external_table_builder =
+                external_table_builder.upsert_options(acceleration_settings.upsert_options());
+        }
 
         match acceleration_settings.table_constraints(Arc::clone(&schema)) {
             Ok(Some(constraints)) => {
@@ -360,8 +535,11 @@ impl AcceleratorEngineRegistry {
                     external_table_builder =
                         external_table_builder.constraints(constraints.clone());
                     // Update on_conflict to match the new constraints' primary key
-                    // if user hasn't explicitly configured on_conflict
-                    if acceleration_settings.on_conflict.is_empty() && !suppress_auto_on_conflict {
+                    // if user hasn't explicitly configured on_conflict (or the engine
+                    // ignores it)
+                    if (acceleration_settings.on_conflict.is_empty() || !honors_on_conflict)
+                        && !suppress_auto_on_conflict
+                    {
                         let primary_keys: Vec<String> =
                             get_primary_keys_from_constraints(&constraints, &schema);
                         if !primary_keys.is_empty() {
@@ -401,7 +579,15 @@ impl AcceleratorEngineRegistry {
                 Some(ctx.runtime_env()),
             )
             .await
-            .context(AccelerationCreationFailedSnafu)?;
+            .map_err(|source| {
+                if accelerator.requires_rebuild(source.as_ref()) {
+                    Error::RebuildRequired { source }
+                } else if accelerator.rejects_configuration(source.as_ref()) {
+                    Error::EngineRejectedConfiguration { source }
+                } else {
+                    Error::AccelerationCreationFailed { source }
+                }
+            })?;
 
         Ok(table_provider)
     }
@@ -412,6 +598,21 @@ impl AcceleratorEngineRegistry {
 pub trait DataAccelerator: Send + Sync {
     fn as_any(&self) -> &dyn Any;
 
+    /// Binds engine-specific change capabilities to the composed write target.
+    /// Wrappers must preserve every write transformation. The caller supplies
+    /// a default provider-backed sink when the engine provides no binding.
+    ///
+    /// # Errors
+    /// Returns an error if the engine cannot bind a writer to the supplied context.
+    async fn change_sink(
+        &self,
+        _context: runtime_acceleration::change_sink::ChangeSinkContext,
+        _runtime: &tokio::runtime::Handle,
+        _capacity: usize,
+    ) -> datafusion::error::Result<Option<runtime_acceleration::change_sink::ChangeSink>> {
+        Ok(None)
+    }
+
     /// Creates a new table in the accelerator engine, returning a `TableProvider` that supports reading and writing.
     async fn create_external_table(
         &self,
@@ -420,6 +621,33 @@ pub trait DataAccelerator: Send + Sync {
         partition_by: Vec<PartitionedBy>,
         runtime_env: Option<Arc<RuntimeEnv>>,
     ) -> Result<Arc<dyn TableProvider>, Box<dyn std::error::Error + Send + Sync>>;
+
+    /// Whether `error`, returned by [`Self::create_external_table`], rejects the
+    /// acceleration settings, so creating the table again with them cannot succeed.
+    fn rejects_configuration(
+        &self,
+        error: &(dyn std::error::Error + Send + Sync + 'static),
+    ) -> bool {
+        matches!(
+            error.downcast_ref::<Error>(),
+            Some(Error::InvalidConfiguration { .. })
+        )
+    }
+
+    /// Whether `error`, returned by [`Self::create_external_table`], reports that the
+    /// dataset's stored table was built with settings it cannot adopt in place — a
+    /// different primary key or partitioning, for example — for a dataset whose settings
+    /// let it be rebuilt from the source
+    /// ([`runtime_acceleration::acceleration_source::rebuilds_on_settings_change`]).
+    ///
+    /// The caller answers it by dropping the table with [`Self::drop_table`], clearing
+    /// the dataset checkpoint, and creating the table again, which then reloads from the
+    /// source as on a first start. An engine reports this only for a dataset that
+    /// predicate admits; for any other it opens the table with the settings it was
+    /// built with. The default reports nothing, for engines that never rebuild.
+    fn requires_rebuild(&self, _error: &(dyn std::error::Error + Send + Sync + 'static)) -> bool {
+        false
+    }
 
     /// The name of the accelerator
     fn name(&self) -> &'static str;
@@ -448,7 +676,7 @@ pub trait DataAccelerator: Send + Sync {
     /// Returns the storage layout configuration for this accelerator.
     ///
     /// Returns the appropriate `AccelerationLayout` for this engine type:
-    /// - File-based accelerators (`DuckDB`, `SQLite`) return `AccelerationLayout::file`
+    /// - File-based accelerators (`SQLite`) return `AccelerationLayout::file`
     /// - Directory-based accelerators (Cayenne) return `AccelerationLayout::cayenne`
     ///
     /// This is used for snapshots and size metrics.
@@ -459,6 +687,18 @@ pub trait DataAccelerator: Send + Sync {
         } else {
             AccelerationLayout::default()
         }
+    }
+
+    /// Validate initialization without changing storage or starting background work.
+    ///
+    /// The runtime calls this while the installed generation can still write. Engines
+    /// must also validate inside [`Self::init`] because filesystem state can change
+    /// between validation and initialization. Decorators must forward this method.
+    async fn validate_init(
+        &self,
+        _source: &dyn AccelerationSource,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        Ok(())
     }
 
     /// Initialize the accelerator for a component
@@ -479,35 +719,29 @@ pub trait DataAccelerator: Send + Sync {
     /// connection pool, which is what keeps the engine crates off `runtime`'s
     /// dependency graph.
     ///
-    /// `registry` is passed rather than captured because one engine's sidecar can live
-    /// in another engine's database: a Cayenne accelerator configured with
-    /// `cayenne_metastore: turso` must take the *`Turso`* accelerator's path-keyed pool
-    /// for `cayenne.db`, since the lock serializing sidecar DDL against concurrent
-    /// writes lives on that pool instance — a pool of its own would hold a lock no
-    /// other sidecar observes.
-    ///
     /// Deliberately has no default: an engine that hosts nothing must say so with
     /// [`runtime_acceleration::sidecar::unsupported_sidecar`], because a defaulted
     /// no-op would silently disable checkpointing for it.
     async fn sidecar(
         &self,
         source: &dyn AccelerationSource,
-        registry: Arc<AcceleratorEngineRegistry>,
         open_option: OpenOption,
     ) -> Result<Arc<dyn AcceleratorSidecar>, CheckpointError>;
 
     /// Seeds this engine's adaptive-tuning knobs for a catalog, whose tables are
     /// configured before any of them exists.
     ///
-    /// `tuning` is the operator's raw `tuning` parameter, interpreted by the engine
-    /// because it owns the vocabulary; `data_path` and `metastore_path` are the
+    /// `adaptive_tuning` is the runtime's `runtime.adaptive_tuning` switch and
+    /// `runtime_params` its `runtime.params`, from which the engine reads the `target_*`
+    /// targets because it owns that vocabulary; `data_path` and `metastore_path` are the
     /// directories to probe. A catalog has no schema inference, so the seed comes from
     /// the host alone — which is precisely why it must come from the engine, and why an
     /// engine with no adaptive controller returns the default outcome and keeps its
     /// static values.
     async fn adaptive_tuning_seeds(
         &self,
-        _tuning: Option<&str>,
+        _adaptive_tuning: spicepod::component::runtime::AdaptiveTuning,
+        _runtime_params: &std::collections::HashMap<String, String>,
         _data_path: &str,
         _metastore_path: &str,
     ) -> AdaptiveTuningOutcome {
@@ -515,7 +749,7 @@ pub trait DataAccelerator: Send + Sync {
     }
 
     /// How this engine's writes accumulate for `acceleration`, or `None` when the engine
-    /// is not the one that acceleration names.
+    /// is not the one that acceleration uses.
     ///
     /// `unset_refresh_mode` is what an absent `refresh_mode` resolves to for the source's
     /// connector, which the caller resolves because only it knows the `from:` value (see
@@ -530,69 +764,6 @@ pub trait DataAccelerator: Send + Sync {
         _unset_refresh_mode: runtime_acceleration::acceleration::RefreshMode,
     ) -> Option<SpicepodWriteProfile> {
         None
-    }
-
-    /// The identity of the store this acceleration shares with other datasets, when the
-    /// engine keeps one — Cayenne's resolved metadata directory.
-    ///
-    /// Datasets that resolve to the same key share snapshot state, so they must agree on
-    /// whether snapshots are enabled; [`validate_snapshot_consistency`] checks that
-    /// before any of them loads. The key is the engine's own resolution rule, which is
-    /// why it is asked for here rather than recomputed by the caller.
-    ///
-    /// Defaults to `None`: an engine whose datasets share no store has nothing to agree
-    /// about.
-    fn shared_store_key(&self, _acceleration: &Acceleration) -> Option<String> {
-        None
-    }
-
-    /// This engine's contribution to the coordinated memory budget, summarised from the
-    /// pod's configuration *before* initialization.
-    ///
-    /// The runtime plans that budget (see
-    /// [`runtime_acceleration::memory_budget::plan`]) and must know how many distinct
-    /// engine instances a pod declares, which only the engine can say: instance identity
-    /// follows its own path-resolution rules. Answering here keeps that rule in one
-    /// place — a second implementation in the planner could key instances differently
-    /// and mis-size every cap.
-    ///
-    /// Defaults to no contribution, which is correct for an engine whose instances do
-    /// not compete for a shared memory ceiling.
-    fn memory_budget_inputs(
-        &self,
-        _app: Option<&Arc<app::App>>,
-    ) -> runtime_acceleration::memory_budget::DuckDbBudgetInputs {
-        runtime_acceleration::memory_budget::DuckDbBudgetInputs::default()
-    }
-
-    /// A sidecar over a database this engine owns at `path`, for state that belongs to
-    /// the runtime rather than to a dataset — the Cayenne metastore's `cayenne.db`.
-    ///
-    /// Distinct from [`Self::sidecar`], which derives the path from a source. The
-    /// caller has a path and no source to derive one from, and asks the owning engine
-    /// rather than opening the file itself: the lock that serializes sidecar DDL
-    /// against a concurrent write lives on the engine's pool instance, so a second
-    /// pool over the same file would hold a lock nothing else observes.
-    ///
-    /// Asking through this method is what keeps one engine from naming another's
-    /// concrete type. Defaults to unsupported, which is the true answer for an engine
-    /// that keeps no path-keyed databases of its own.
-    ///
-    /// `dataset_name` names the dataset whose state this sidecar holds — the sidecar
-    /// stores it as such and namespaces rows by it. It is NOT a `spice_sys_*` table
-    /// name; passing one would file a dataset's checkpoints under a table.
-    async fn sidecar_for_path(
-        &self,
-        path: &str,
-        _dataset_name: &str,
-    ) -> Result<Arc<dyn AcceleratorSidecar>, CheckpointError> {
-        Err(CheckpointError::Store {
-            source: format!(
-                "the {} accelerator does not host databases of its own, so it cannot open '{path}'",
-                self.name()
-            )
-            .into(),
-        })
     }
 
     /// Drops an existing table from the acceleration engine.
@@ -721,12 +892,26 @@ pub trait DataAccelerator: Send + Sync {
         }))
     }
 
+    /// Perform the engine's maintenance after a snapshot was restored and
+    /// `provider` serves it: after the initial provider is installed, and after
+    /// each reload's replacement is swapped in — never before a swap, since the
+    /// replaced provider keeps serving if the swap is refused. An engine may record
+    /// `provider` here as the one a later restore into the same location must stop
+    /// first (see `SnapshotEngine::prepare_directory_restore`). The default does
+    /// nothing.
+    async fn maintain_after_snapshot_restore(
+        &self,
+        _source: &dyn AccelerationSource,
+        _provider: &Arc<dyn TableProvider>,
+    ) {
+    }
+
     /// Optional engine-specific [`SnapshotEngine`] used for snapshot create/extract.
     ///
     /// Engines that need to customise the on-disk archive contents (e.g.
     /// Cayenne, which ships a per-dataset metastore-slice JSON instead of
     /// the raw `cayenne.db` file) override this to return their engine.
-    /// File-based accelerators (`DuckDB` / `SQLite` / `Turso`) return `None` and
+    /// File-based accelerators (`SQLite`) return `None` and
     /// the default `SnapshotManager` engine selection applies.
     async fn snapshot_engine_for_source(
         &self,
@@ -761,7 +946,7 @@ pub type ReloadProviderFactory = Arc<
 #[snafu(display(
     "Acceleration engine '{engine}' does not support reloading from a snapshot. \
      `refresh_mode: snapshot` requires a snapshot-capable file-based engine \
-     (DuckDB, SQLite, Cayenne, or Turso)."
+     (Cayenne or SQLite)."
 ))]
 pub struct SnapshotReloadUnsupported {
     pub engine: &'static str,
@@ -921,7 +1106,7 @@ impl AcceleratorExternalTableBuilder {
                 .build()
             })?,
             name: self.table_name.clone(),
-            location: String::new(),
+            locations: vec![],
             file_type: String::new(),
             table_partition_cols: vec![],
             if_not_exists: true,
@@ -937,6 +1122,45 @@ impl AcceleratorExternalTableBuilder {
 
         Ok(external_table)
     }
+}
+
+/// Resolves an acceleration's `params` into the [`Parameters`] its engine is configured
+/// with: `${secrets:…}` and `${env:…}` references expanded, the engine prefix removed,
+/// secrets autoloaded, and defaults applied.
+///
+/// Anything an engine opens from its acceleration settings — the accelerated table and
+/// its sidecar alike — must resolve them through this, so both connect to the same
+/// place with the same credentials. Only the accelerated table's creation reports
+/// ignored or deprecated parameters; a sidecar resolves them again on every open, so it
+/// passes [`Diagnostics::Suppress`].
+///
+/// # Errors
+///
+/// Returns an error when the parameters do not satisfy the engine's [`ParameterSpec`]s.
+pub async fn acceleration_parameters(
+    accelerator: &dyn DataAccelerator,
+    acceleration: &Acceleration,
+    secrets: Arc<RwLock<Secrets>>,
+    diagnostics: Diagnostics,
+) -> Result<Parameters, Box<dyn std::error::Error + Send + Sync>> {
+    // No lock is held over the expansion: `Parameters::try_new` below
+    // takes the same lock for its autoload pass, and tokio's `RwLock` is
+    // write-preferring, so nesting the two would deadlock as soon as a
+    // writer queued between them.
+    let params_with_secrets =
+        get_params_with_secrets(Arc::clone(&secrets), &acceleration.params).await;
+    let secret_sources = secret_sources_from_templates(&acceleration.params);
+
+    Parameters::try_new_with_secret_sources(
+        &format!("accelerator {}", accelerator.name()),
+        params_with_secrets.into_iter().collect::<Vec<_>>(),
+        accelerator.prefix(),
+        secrets,
+        accelerator.parameters(),
+        diagnostics,
+        Some(secret_sources),
+    )
+    .await
 }
 
 /// Resolves the on-disk file path for a file-based acceleration source.
@@ -968,7 +1192,7 @@ pub async fn acceleration_file_path(
 /// This function retrieves the registered accelerator for the source's engine
 /// and returns the engine-specific layout. Different engines use
 /// different layout types:
-/// - File-based engines (`DuckDB`, `SQLite`): `AccelerationLayout::file`
+/// - File-based engines (`SQLite`): `AccelerationLayout::file`
 /// - Directory-based engines (Cayenne): `AccelerationLayout::cayenne`
 ///
 /// This is used for snapshots and size metrics.
@@ -1014,13 +1238,36 @@ pub fn get_primary_keys_from_constraints(
         .collect()
 }
 
+/// The parameter that turns Cayenne's primary-key conflict detection off, or
+/// `None` when detection stays on.
+///
+/// Resolves the two spellings the way the Cayenne accelerator does:
+/// `cayenne_pk_conflict_detection` takes precedence over the unprefixed
+/// `pk_conflict_detection`, and the value is matched without regard to case.
+/// Table creation and the runtime's registration refusal both read it here, so
+/// they cannot disagree about whether a dataset turned detection off.
+#[must_use]
+pub fn cayenne_pk_conflict_detection_disabled_by(
+    acceleration_settings: &Acceleration,
+) -> Option<&'static str> {
+    if !matches!(acceleration_settings.engine, Engine::Cayenne) {
+        return None;
+    }
+    ["cayenne_pk_conflict_detection", "pk_conflict_detection"]
+        .into_iter()
+        .find_map(|key| {
+            acceleration_settings
+                .params
+                .get(key)
+                .map(|value| (key, value))
+        })
+        .filter(|(_, value)| value.eq_ignore_ascii_case("none"))
+        .map(|(key, _)| key)
+}
+
 #[must_use]
 pub fn cayenne_pk_conflict_detection_none(acceleration_settings: &Acceleration) -> bool {
-    matches!(acceleration_settings.engine, Engine::Cayenne)
-        && ["cayenne_pk_conflict_detection", "pk_conflict_detection"]
-            .iter()
-            .filter_map(|key| acceleration_settings.params.get(*key))
-            .any(|value| value.eq_ignore_ascii_case("none"))
+    cayenne_pk_conflict_detection_disabled_by(acceleration_settings).is_some()
 }
 
 /// Starting values for an engine's adaptive-tuning knobs, derived from the host.
@@ -1044,12 +1291,37 @@ pub struct AdaptiveTuningSeeds {
 /// The outcome of asking an engine to seed adaptive tuning.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct AdaptiveTuningOutcome {
-    /// The operator's `tuning` value was not one the engine recognizes. Reported rather
-    /// than corrected so the caller can warn once and carry on with the default.
-    pub tuning_value_invalid: bool,
     /// `None` when the operator did not ask for adaptive tuning, in which case the engine
     /// keeps its static defaults.
     pub seeds: Option<AdaptiveTuningSeeds>,
+    /// The `target_*` targets the operator configured, resolved whether or not adaptive
+    /// tuning is on, so the caller can report targets that will have no effect.
+    pub targets: TuningTargets,
+}
+
+/// The runtime-wide `target_*` targets the adaptive controller steers toward.
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub struct TuningTargets {
+    pub replication_lag_secs: Option<f64>,
+    pub freshness_secs: Option<f64>,
+    pub query_latency_ms: Option<f64>,
+    /// Paces how fast the loop chases the targets; it is not a target itself.
+    pub convergence_window_secs: Option<f64>,
+    pub qph: Option<f64>,
+}
+
+impl TuningTargets {
+    /// Whether any `runtime.params.target_*` key is set. Every one of them, the
+    /// pacing-only convergence window included, is inert while adaptive tuning is
+    /// disabled, so this decides whether that is reported.
+    #[must_use]
+    pub fn any_set(&self) -> bool {
+        self.replication_lag_secs.is_some()
+            || self.freshness_secs.is_some()
+            || self.query_latency_ms.is_some()
+            || self.convergence_window_secs.is_some()
+            || self.qph.is_some()
+    }
 }
 
 /// How an engine's writes accumulate for one acceleration, classified from the Spicepod
@@ -1074,92 +1346,13 @@ pub struct SpicepodWriteProfile {
     pub inlines_small_writes: bool,
 }
 
-/// Rejects a pod whose datasets share an engine's store but disagree about snapshots.
-///
-/// An engine that keeps a shared store (Cayenne's `SQLite` metadata catalog) puts every
-/// dataset in one metadata directory, and enabling snapshots means that catalog joins the
-/// snapshot archive. A pod where some datasets in one directory snapshot and others do not
-/// cannot be restored consistently, so it is refused up front rather than at restore time.
-///
-/// Engine-agnostic: it groups by whatever [`DataAccelerator::shared_store_key`] returns,
-/// and an engine that returns `None` — or is simply not linked into this build — takes part
-/// in no group and so can never fail this check.
-///
-/// # Errors
-///
-/// Returns [`CayenneSnapshotValidationError::InconsistentSnapshotSettings`] naming the
-/// directory and both sides of the disagreement.
-pub fn validate_snapshot_consistency(
-    sources: &[Arc<dyn AccelerationSource>],
-) -> Result<(), CayenneSnapshotValidationError> {
-    let mut store_groups: HashMap<String, Vec<(String, bool)>> = HashMap::new();
-
-    for source in sources {
-        let Some(acceleration) = source.acceleration() else {
-            continue;
-        };
-        let Some(engine) = accelerator_for_engine(acceleration.engine) else {
-            continue;
-        };
-        let Some(store_key) = engine.shared_store_key(acceleration) else {
-            continue;
-        };
-
-        let snapshots_enabled = !matches!(
-            acceleration.snapshot_behavior,
-            runtime_acceleration::snapshot::SnapshotBehavior::Disabled
-        );
-        store_groups
-            .entry(store_key)
-            .or_default()
-            .push((source.name().to_string(), snapshots_enabled));
-    }
-
-    for (metadata_dir, datasets) in store_groups {
-        if datasets.len() <= 1 {
-            continue;
-        }
-
-        let enabled: Vec<&str> = datasets
-            .iter()
-            .filter_map(|(name, enabled)| if *enabled { Some(name.as_str()) } else { None })
-            .collect();
-        let disabled: Vec<&str> = datasets
-            .iter()
-            .filter_map(|(name, enabled)| if *enabled { None } else { Some(name.as_str()) })
-            .collect();
-
-        if !enabled.is_empty() && !disabled.is_empty() {
-            return Err(
-                CayenneSnapshotValidationError::InconsistentSnapshotSettings {
-                    metadata_dir,
-                    enabled_datasets: enabled.join(", "),
-                    disabled_datasets: disabled.join(", "),
-                },
-            );
-        }
-
-        // Several datasets sharing the store with snapshots all enabled is supported:
-        // each snapshot ships a per-dataset metastore slice, so they cannot clobber one
-        // another on extract.
-    }
-
-    Ok(())
-}
-
-/// The registered accelerator for `engine`, or `None` when this build links none.
-fn accelerator_for_engine(engine: Engine) -> Option<Arc<dyn DataAccelerator>> {
-    DATA_ACCELERATOR_REGISTRATIONS
-        .iter()
-        .find(|registration| registration.engine == engine)
-        .map(|registration| (registration.constructor)())
-}
-
 #[cfg(test)]
 mod tests {
     use super::{
-        AcceleratorExternalTableBuilder, cayenne_pk_conflict_detection_none, format_engine_list,
-        get_primary_keys_from_constraints, upsert_dedup::extract_upsert_options,
+        AcceleratorExternalTableBuilder, AcceleratorRuntimeConfig,
+        cayenne_pk_conflict_detection_disabled_by, cayenne_pk_conflict_detection_none,
+        format_engine_list, get_primary_keys_from_constraints,
+        upsert_dedup::extract_upsert_options,
     };
     use ::arrow::datatypes::{DataType, Field, Schema, SchemaRef};
     use datafusion::common::{Constraint, Constraints, TableReference};
@@ -1198,7 +1391,7 @@ mod tests {
                 .with_remove_duplicates(true)
                 .with_last_write_wins(true),
         ] {
-            let table = builder(Engine::DuckDB)
+            let table = builder(Engine::Sqlite)
                 .upsert_options(options.clone())
                 .build()
                 .expect("build succeeds");
@@ -1219,7 +1412,7 @@ mod tests {
     /// on the same "no deduplication" answer.
     #[test]
     fn no_upsert_options_means_no_keys_written_and_none_read_back() {
-        let table = builder(Engine::DuckDB).build().expect("build succeeds");
+        let table = builder(Engine::Sqlite).build().expect("build succeeds");
 
         assert!(!table.options.contains_key("upsert_remove_duplicates"));
         assert!(!table.options.contains_key("upsert_last_write_wins"));
@@ -1233,7 +1426,7 @@ mod tests {
     /// upserts on. Dropping them turns every upsert into a blind append.
     #[test]
     fn constraints_reach_the_created_table() {
-        let table = builder(Engine::DuckDB)
+        let table = builder(Engine::Sqlite)
             .constraints(pk(vec![0, 1]))
             .build()
             .expect("build succeeds");
@@ -1243,13 +1436,13 @@ mod tests {
 
     #[test]
     fn a_table_built_without_constraints_has_none_rather_than_a_stale_key() {
-        let table = builder(Engine::DuckDB).build().expect("build succeeds");
+        let table = builder(Engine::Sqlite).build().expect("build succeeds");
         assert!(table.constraints.is_empty());
     }
 
     #[test]
     fn the_on_conflict_behavior_reaches_the_created_table() {
-        let table = builder(Engine::DuckDB)
+        let table = builder(Engine::Sqlite)
             .on_conflict(OnConflict::Upsert(
                 datafusion_table_providers::util::column_reference::ColumnReference::try_from("id")
                     .expect("column reference"),
@@ -1265,7 +1458,7 @@ mod tests {
 
     #[test]
     fn the_write_mode_reaches_the_created_table() {
-        let table = builder(Engine::DuckDB)
+        let table = builder(Engine::Sqlite)
             .mode(Mode::File)
             .build()
             .expect("build succeeds");
@@ -1332,7 +1525,7 @@ mod tests {
                 );
 
                 let other_engine = Acceleration {
-                    engine: Engine::DuckDB,
+                    engine: Engine::Sqlite,
                     params: acceleration.params.clone(),
                     ..Acceleration::default()
                 };
@@ -1358,6 +1551,39 @@ mod tests {
             assert!(
                 !cayenne_pk_conflict_detection_none(&acceleration),
                 "{value:?} must leave pk conflict detection on"
+            );
+        }
+    }
+
+    /// Both spellings set: the prefixed one decides, as it does in the Cayenne
+    /// accelerator. Reading either `none` as authoritative created a table with no
+    /// key resolution while the accelerator ran with detection on.
+    #[test]
+    fn pk_conflict_detection_prefixed_spelling_takes_precedence() {
+        for (prefixed, unprefixed, expected) in [
+            ("auto", "none", None),
+            ("none", "auto", Some("cayenne_pk_conflict_detection")),
+            ("NONE", "none", Some("cayenne_pk_conflict_detection")),
+        ] {
+            let mut acceleration = Acceleration {
+                engine: Engine::Cayenne,
+                ..Acceleration::default()
+            };
+            acceleration.params.insert(
+                "cayenne_pk_conflict_detection".to_string(),
+                prefixed.to_string(),
+            );
+            acceleration
+                .params
+                .insert("pk_conflict_detection".to_string(), unprefixed.to_string());
+            assert_eq!(
+                cayenne_pk_conflict_detection_disabled_by(&acceleration),
+                expected,
+                "cayenne_pk_conflict_detection={prefixed}, pk_conflict_detection={unprefixed}"
+            );
+            assert_eq!(
+                cayenne_pk_conflict_detection_none(&acceleration),
+                expected.is_some()
             );
         }
     }
@@ -1397,5 +1623,51 @@ mod tests {
             format_engine_list(&[]),
             "none — this build links no accelerator engine"
         );
+    }
+
+    /// The property that keeps a mismatched configuration unreachable: the defaults for an
+    /// engine are that engine's own variant, so `register_all` and `build_with_defaults`
+    /// — which both select by engine — cannot hand a constructor another engine's settings.
+    ///
+    /// Listing the engines here is enough without an exhaustiveness guard: adding an
+    /// `Engine` variant fails to compile in `default_for`, and adding a config variant
+    /// fails to compile in `engine`.
+    #[test]
+    fn the_default_config_for_an_engine_is_that_engines_own_variant() {
+        for engine in [
+            Engine::Arrow,
+            Engine::PartitionedArrow,
+            Engine::Sqlite,
+            Engine::PostgreSQL,
+            Engine::Cayenne,
+        ] {
+            assert_eq!(
+                AcceleratorRuntimeConfig::default_for(engine).engine(),
+                engine,
+                "default_for({engine}) must produce the {engine} variant"
+            );
+        }
+    }
+}
+
+#[cfg(test)]
+mod tuning_targets_tests {
+    use super::TuningTargets;
+
+    #[test]
+    fn convergence_window_alone_counts_as_set() {
+        let targets = TuningTargets {
+            convergence_window_secs: Some(120.0),
+            ..TuningTargets::default()
+        };
+        assert!(
+            targets.any_set(),
+            "a lone `target_convergence_window` is inert while adaptive tuning is disabled, so it must be reported"
+        );
+    }
+
+    #[test]
+    fn nothing_set_is_not_reported() {
+        assert!(!TuningTargets::default().any_set());
     }
 }

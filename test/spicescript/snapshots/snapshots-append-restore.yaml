@@ -1,0 +1,86 @@
+name: snapshots-append-restore
+description: >
+  An append acceleration restores on empty local storage with its source
+  offline and remains queryable (#15463). Once the source returns,
+  append overlap and the primary key preserve exactly one copy of each row across an
+  overlap refresh, including updated values and NULLs. Another cold restore
+  serves the appended generation.
+
+sources:
+  src: { kind: postgres }
+
+spicepod:
+  version: v1
+  kind: Spicepod
+  name: snapshots-append-restore
+  runtime:
+    state: { location: 'file://${instance.dir}/state/' }
+  datasets:
+    - from: postgres:public.events
+      name: events
+      params: ${sources.src.params}
+      time_column: ts
+      time_format: timestamptz
+      acceleration:
+        enabled: true
+        engine: cayenne
+        mode: file
+        refresh_mode: append
+        refresh_check_interval: 1h
+        refresh_append_overlap: 1h
+        primary_key: id
+        snapshots: enabled
+        params: { cayenne_file_path: '${instance.dir}/accel-1/data', cayenne_metadata_dir: '${instance.dir}/accel-1/meta' }
+
+defaults:
+  expect: { oracle: src }
+
+steps:
+  - source-exec:
+      src: |
+        CREATE TABLE events (id bigint PRIMARY KEY, ts timestamptz NOT NULL, v text);
+        INSERT INTO events SELECT i, TIMESTAMPTZ '2100-01-01 00:00:00+00' + i * INTERVAL '1 minute', 'v' || i FROM generate_series(1, 100) i;
+  - start: {}
+  - query: SELECT * FROM events
+    id: initial
+  - assert-log: { contains: 'Snapshot created dataset=events' }
+    eventually: 30s
+  - stop: {}
+  - stop-source: src
+  - start:
+      ready: false
+      patch:
+        datasets:
+          events: { acceleration: { params: { cayenne_file_path: '${instance.dir}/accel-2/data', cayenne_metadata_dir: '${instance.dir}/accel-2/meta' } } }
+  - query: SELECT * FROM events
+    expect: { same-as: initial }
+    eventually: 60s
+  - assert-log: { contains: 'Snapshot restored' }
+  - query: SELECT * FROM events
+    expect: { same-as: initial }
+    consistently: 3s
+  - start-source: src
+  - source-exec:
+      src: |
+        UPDATE events SET v = NULL WHERE id = 99;
+        INSERT INTO events SELECT i, TIMESTAMPTZ '2100-01-01 00:00:00+00' + i * INTERVAL '1 minute', '' FROM generate_series(101, 110) i;
+  - refresh: events
+  - query: SELECT * FROM events
+    id: appended
+    eventually: 60s
+  - refresh: events
+  - query: SELECT count(*) AS n, count(DISTINCT id) AS keys, sum(id) AS ids FROM events
+    expect: { rows: [['110', '110', '6105']] }
+  - query: SELECT * FROM events
+  - assert-log: { count: { 'Snapshot created dataset=events\b': '>=2' } }
+    eventually: 30s
+  - stop: {}
+  - stop-source: src
+  - start:
+      ready: false
+      patch:
+        datasets:
+          events: { acceleration: { params: { cayenne_file_path: '${instance.dir}/accel-3/data', cayenne_metadata_dir: '${instance.dir}/accel-3/meta' } } }
+  - query: SELECT * FROM events
+    expect: { same-as: appended }
+    eventually: 60s

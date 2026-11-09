@@ -35,7 +35,9 @@ use std::sync::LazyLock;
 use tokio_stream::adapters::Peekable;
 use tonic::{Request, Response, Status, Streaming};
 
-use super::prepared_statement_query::{PreparedStatement, decode_param_values, error_to_status};
+use super::prepared_statement_query::{
+    PreparedStatement, decode_param_values, error_to_status, param_error_to_status,
+};
 use crate::{FlightSqlService, handle_datafusion_error, to_tonic_err};
 
 static AFFECTED_ROWS_SCHEMA: LazyLock<SchemaRef> = LazyLock::new(|| {
@@ -74,7 +76,7 @@ pub(crate) async fn do_get(
         ..
     } = from_bytes(&query.prepared_statement_handle).map_err(error_to_status)?;
 
-    let param_values = decode_param_values(&parameters).map_err(error_to_status)?;
+    let param_values = decode_param_values(&parameters).map_err(param_error_to_status)?;
 
     let df = ctx.sql(&sql).await.map_err(handle_datafusion_error)?;
     let df = if let Some(params) = param_values {

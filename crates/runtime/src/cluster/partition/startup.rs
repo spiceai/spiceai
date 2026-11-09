@@ -19,9 +19,9 @@ use std::{collections::HashMap, sync::Arc};
 use app::App;
 
 use datafusion::{
+    common::{ResolvedTableReference, TableReference},
     execution::TaskContext,
     logical_expr::Expr,
-    sql::{ResolvedTableReference, TableReference},
 };
 use datafusion_proto::bytes::Serializeable;
 use runtime_datafusion::{SPICE_DEFAULT_CATALOG, SPICE_DEFAULT_SCHEMA};
@@ -179,10 +179,16 @@ pub fn accelerated_tables(app: &Arc<App>) -> HashMap<TableReference, Vec<Partiti
 pub async fn executor_request_initial_partitions(
     mut client: ClusterServiceClient<Channel>,
     executor_url: String,
+    executor_id: String,
+    process_id: String,
     task_ctx: &TaskContext,
 ) -> Result<HashMap<ResolvedTableReference, Vec<Expr>>> {
     let response = client
-        .allocate_initial_partitions(AllocateInitialPartitionsRequest { executor_url })
+        .allocate_initial_partitions(AllocateInitialPartitionsRequest {
+            executor_url,
+            executor_id,
+            process_id,
+        })
         .await
         .context(PartitionAllocationRequestSnafu)?
         .into_inner();

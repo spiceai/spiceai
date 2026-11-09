@@ -1,0 +1,16 @@
+---
+source: crates/test-framework/src/snapshot/mod.rs
+description: "Query: clickbench_q20"
+---
++---------------+--------------------------------------------------------------------------------------------------+
+| plan_type     | plan                                                                                             |
++---------------+--------------------------------------------------------------------------------------------------+
+| logical_plan  | Filter: hits.UserID = Int64(435090932899640449)                                                  |
+|               |   TableScan: hits projection=[UserID], partial_filters=[hits.UserID = Int64(435090932899640449)] |
+| physical_plan | SchemaCastScanExec                                                                               |
+|               |   CayenneAccelerationExec: snapshots_scanned=<N>, files_scanned=<N>                              |
+|               |     FilterExec: UserID@0 = 435090932899640449                                                    |
+|               |       BytesProcessedExec                                                                         |
+|               |         DataSourceExec: partitions=16, partition_sizes=[<redacted>]                              |
+|               |                                                                                                  |
++---------------+--------------------------------------------------------------------------------------------------+

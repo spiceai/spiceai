@@ -1,0 +1,1895 @@
+/*
+Copyright 2024-2026 The Spice.ai OSS Authors
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+     https://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+*/
+
+//! What each coding agent needs to use a Spice runtime as its model backend.
+//!
+//! Every agent reaches its model through a different mechanism — environment
+//! variables, `-c` config overrides, an inline JSON config, an extension file —
+//! but all of them reduce to the same [`Launch`]: a program, arguments placed
+//! before the user's own, environment variables to set or clear, and files to
+//! write first. Building a [`Launch`] is pure, so what an agent is told is
+//! asserted exactly in tests rather than observed through a child process.
+//!
+//! The mechanisms chosen here change nothing in the user's own configuration:
+//! no agent's config file is edited, and anything an agent has to read from
+//! disk is written to a directory that is removed when the agent exits.
+
+use std::collections::HashMap;
+use std::ffi::OsString;
+use std::path::{Path, PathBuf};
+
+use serde_json::json;
+use snafu::ResultExt;
+
+use crate::error::{CodingAgentConfigConflictSnafu, CodingAgentFileSnafu, Result};
+
+/// The token sent to a runtime that has no API key configured.
+///
+/// Every agent here refuses to start, or prompts for a login, without some
+/// credential, and a runtime without `runtime.auth` ignores whatever it is
+/// sent. A fixed, recognizable value keeps a user's real vendor key from being
+/// the one that reaches Spice.
+pub(crate) const PLACEHOLDER_TOKEN: &str = "spice";
+
+/// The provider id the agents that take a provider table register Spice under.
+const PROVIDER_ID: &str = "spice";
+
+/// The display name of that provider.
+const PROVIDER_NAME: &str = "Spice";
+
+/// A coding agent `spice` can launch against a Spice runtime.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Agent {
+    Antigravity,
+    ClaudeCode,
+    Codex,
+    CopilotCli,
+    Cursor,
+    Grok,
+    OpenCode,
+    Pi,
+}
+
+/// How to find an agent on this machine and how to tell the user to install it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct Install {
+    /// Executable names, in the order they are searched for on `PATH`.
+    pub binaries: &'static [&'static str],
+    /// Install locations, relative to the home directory, that are searched
+    /// when `PATH` has none — installers that write to a directory a fresh
+    /// shell has not yet put on `PATH`.
+    pub home_fallbacks: &'static [&'static str],
+    /// How to install the agent, as a sentence.
+    pub instructions: &'static str,
+    /// The agent's install documentation.
+    pub docs: &'static str,
+}
+
+impl Agent {
+    /// Every agent, in the order the CLI lists them.
+    pub const ALL: [Self; 8] = [
+        Self::Antigravity,
+        Self::ClaudeCode,
+        Self::Codex,
+        Self::CopilotCli,
+        Self::Cursor,
+        Self::Grok,
+        Self::OpenCode,
+        Self::Pi,
+    ];
+
+    /// The product name, as the agent's own documentation writes it.
+    #[must_use]
+    pub const fn display_name(self) -> &'static str {
+        match self {
+            Self::Antigravity => "Antigravity CLI",
+            Self::ClaudeCode => "Claude Code",
+            Self::Codex => "Codex CLI",
+            Self::CopilotCli => "GitHub Copilot CLI",
+            Self::Cursor => "Cursor CLI",
+            Self::Grok => "Grok Build",
+            Self::OpenCode => "OpenCode",
+            Self::Pi => "pi",
+        }
+    }
+
+    /// The `spice` subcommand that launches the agent.
+    #[must_use]
+    pub const fn command(self) -> &'static str {
+        match self {
+            Self::Antigravity => "agy",
+            Self::ClaudeCode => "claude",
+            Self::Codex => "codex",
+            Self::CopilotCli => "copilot",
+            Self::Cursor => "cursor",
+            Self::Grok => "grok",
+            Self::OpenCode => "opencode",
+            Self::Pi => "pi",
+        }
+    }
+
+    pub(crate) const fn install(self) -> Install {
+        match self {
+            Self::Antigravity => Install {
+                binaries: &["agy"],
+                home_fallbacks: &[".local/bin/agy"],
+                instructions: "Install it with `curl -fsSL https://antigravity.google/cli/install.sh | bash`.",
+                docs: "https://antigravity.google/docs/install/",
+            },
+            Self::ClaudeCode => Install {
+                binaries: &["claude"],
+                home_fallbacks: &[".local/bin/claude", ".claude/local/claude"],
+                instructions: "Install it with `curl -fsSL https://claude.ai/install.sh | bash`.",
+                docs: "https://code.claude.com/docs/en/setup",
+            },
+            Self::Codex => Install {
+                binaries: &["codex"],
+                home_fallbacks: &[".local/bin/codex"],
+                instructions: "Install it with `npm install -g @openai/codex`.",
+                docs: "https://developers.openai.com/codex/cli",
+            },
+            Self::CopilotCli => Install {
+                binaries: &["copilot"],
+                home_fallbacks: &[".local/bin/copilot"],
+                instructions: "Install it with `npm install -g @github/copilot`.",
+                docs: "https://docs.github.com/en/copilot/how-tos/copilot-cli",
+            },
+            // Only Cursor's local-agent build accepts a model endpoint; the
+            // public `cursor-agent` talks to Cursor's own backend and nothing
+            // else. See [`Agent::unsupported_build`].
+            Self::Cursor => Install {
+                binaries: &["cursor-agent-local", "agent-local"],
+                home_fallbacks: &[".local/bin/cursor-agent-local", ".local/bin/agent-local"],
+                instructions: "Cursor's public CLI cannot use another model endpoint, so install its local-agent build instead: download `agent-cli-local-package.tar.gz` for your platform from Cursor's downloads, extract it, and put its `cursor-agent-local` on PATH.",
+                docs: "https://cursor.com/docs/cli/overview",
+            },
+            Self::Grok => Install {
+                binaries: &["grok"],
+                home_fallbacks: &[".grok/bin/grok"],
+                instructions: "Install it with `curl -fsSL https://x.ai/cli/install.sh | bash`.",
+                docs: "https://docs.x.ai/build/overview",
+            },
+            Self::OpenCode => Install {
+                binaries: &["opencode"],
+                home_fallbacks: &[".opencode/bin/opencode"],
+                instructions: "Install it with `curl -fsSL https://opencode.ai/install | bash`.",
+                docs: "https://opencode.ai/docs/",
+            },
+            Self::Pi => Install {
+                binaries: &["pi"],
+                home_fallbacks: &[".local/bin/pi"],
+                instructions: "Install it with `curl -fsSL https://pi.dev/install.sh | sh`.",
+                docs: "https://pi.dev",
+            },
+        }
+    }
+
+    /// A build of the agent that is installed but cannot use a custom model
+    /// endpoint, named so the user is told why instead of seeing it ignore Spice.
+    ///
+    /// Returns the binary names that identify such a build and the explanation.
+    pub(crate) const fn unsupported_build(self) -> Option<(&'static [&'static str], &'static str)> {
+        match self {
+            Self::Cursor => Some((
+                &["cursor-agent"],
+                "The public Cursor CLI (`cursor-agent`) sends every request to Cursor's own servers and cannot use another model endpoint; only Cursor's local-agent build (`cursor-agent-local`) can. Install the local-agent build, or use another agent such as `spice claude` or `spice codex`.",
+            )),
+            _ => None,
+        }
+    }
+
+    /// How the agent's own model option names a Spice model, for help text.
+    pub(crate) const fn model_example(self) -> &'static str {
+        match self {
+            Self::OpenCode => "-m spice/my-model",
+            Self::Pi => "--model spice/my-model",
+            _ => "--model my-model",
+        }
+    }
+
+    /// The agent's own command-line options that name its model. A user picks
+    /// the Spice model with these, exactly as they would without Spice.
+    const fn model_options(self) -> &'static [&'static str] {
+        match self {
+            Self::Antigravity | Self::ClaudeCode | Self::CopilotCli | Self::Cursor | Self::Pi => {
+                &["--model"]
+            }
+            Self::Codex | Self::Grok | Self::OpenCode => &["--model", "-m"],
+        }
+    }
+
+    /// The argument that starts the agent on the Spice model `model`, in the
+    /// spelling its model option takes.
+    pub(crate) fn model_argument(self, model: &str) -> String {
+        match self {
+            Self::OpenCode => format!("-m {PROVIDER_ID}/{model}"),
+            Self::Pi => format!("--model {PROVIDER_ID}/{model}"),
+            _ => format!("--model {model}"),
+        }
+    }
+
+    /// The model a `--model` value names when the user left out the provider
+    /// the agent's model option requires: `qwen` for `-m qwen`, which `OpenCode`
+    /// and pi do not read as a Spice model.
+    pub(crate) fn without_provider(self, value: &str) -> Option<&str> {
+        match self {
+            Self::OpenCode | Self::Pi if !value.contains('/') => Some(self.model_id(value)),
+            _ => None,
+        }
+    }
+
+    /// `model` without the `:<thinking>` level pi accepts after a model.
+    fn model_id(self, model: &str) -> &str {
+        match (self, model.rsplit_once(':')) {
+            (Self::Pi, Some((model, level))) if PI_THINKING_LEVELS.contains(&level) => model,
+            _ => model,
+        }
+    }
+
+    /// The Spice model a user's `--model` value names, or `None` when it names
+    /// something the agent resolves itself.
+    fn spice_model_of(self, value: &str) -> Option<String> {
+        match self {
+            // `provider/model` (pi adds an optional `:<thinking>` level).
+            Self::OpenCode | Self::Pi => {
+                let model = value.strip_prefix(&format!("{PROVIDER_ID}/"))?;
+                Some(self.model_id(model).to_string())
+            }
+            // Claude Code's aliases resolve to the Spice model through the
+            // `ANTHROPIC_DEFAULT_*_MODEL` variables, so they name no model of
+            // their own.
+            Self::ClaudeCode if is_claude_code_alias(value) => None,
+            _ => Some(value.to_string()),
+        }
+    }
+}
+
+/// pi's thinking levels, which may follow a model as `provider/id:<level>`.
+const PI_THINKING_LEVELS: &[&str] = &["off", "minimal", "low", "medium", "high", "xhigh"];
+
+/// Claude Code's model aliases, with or without the `[1m]` context suffix.
+fn is_claude_code_alias(value: &str) -> bool {
+    let value = value.to_ascii_lowercase();
+    let alias = value.strip_suffix("[1m]").unwrap_or(&value);
+    matches!(
+        alias,
+        "default" | "best" | "fable" | "opus" | "sonnet" | "haiku" | "opusplan"
+    )
+}
+
+/// What the user's arguments say about the agent's model.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum RequestedModel {
+    /// The agent's model option is absent: `spice` chooses the model.
+    Unspecified,
+    /// The option names something the agent resolves itself — an alias, or
+    /// another provider's model — so there is no Spice model to check, but no
+    /// model option may be added either. Holds the value as the user gave it.
+    AgentOwned(String),
+    /// The option names this Spice model.
+    Spice(String),
+}
+
+impl RequestedModel {
+    /// The Spice model to wait on, if one was named.
+    #[must_use]
+    pub fn spice_model(&self) -> Option<&str> {
+        match self {
+            Self::Spice(model) => Some(model),
+            Self::Unspecified | Self::AgentOwned(_) => None,
+        }
+    }
+
+    /// Whether the user named the model, so no model option is added.
+    #[must_use]
+    pub fn given(&self) -> bool {
+        !matches!(self, Self::Unspecified)
+    }
+}
+
+/// The model the user named with the agent's own option, if they did.
+///
+/// Scanning stops at `--`, after which the agent reads its arguments as
+/// positional.
+pub(crate) fn requested_model(agent: Agent, args: &[OsString]) -> RequestedModel {
+    let options = agent.model_options();
+    let mut args = args.iter();
+    while let Some(arg) = args.next() {
+        let Some(arg) = arg.to_str() else { continue };
+        if arg == "--" {
+            break;
+        }
+        for option in options {
+            let value = if arg == *option {
+                args.next()
+                    .and_then(|value| value.to_str())
+                    .map(str::to_string)
+            } else if let Some(value) = arg.strip_prefix(&format!("{option}=")) {
+                Some(value.to_string())
+            } else if option.len() == 2 && arg.len() > 2 && arg.starts_with(option) {
+                // A short option with its value attached: `-mgpt`.
+                Some(arg[2..].to_string())
+            } else {
+                continue;
+            };
+            let Some(value) = value else {
+                // The option ends the arguments, so the agent reports it.
+                return RequestedModel::AgentOwned(String::new());
+            };
+            return match agent.spice_model_of(&value) {
+                Some(model) => RequestedModel::Spice(model),
+                None => RequestedModel::AgentOwned(value),
+            };
+        }
+    }
+    RequestedModel::Unspecified
+}
+
+/// The user's arguments as the agent receives them: unchanged, except for
+/// Claude Code's `--settings`.
+///
+/// Claude Code reads one `--settings`, the last, so the user's own would
+/// replace the one that routes it to Spice. Each one the user gives is merged
+/// into the Spice settings file instead, in order, with Spice's routing
+/// variables applied last, and is not passed on.
+///
+/// # Errors
+///
+/// Returns an error when a `--settings` value is neither a JSON object nor a
+/// readable file holding one.
+pub(crate) fn user_arguments(
+    agent: Agent,
+    launch: &mut Launch,
+    args: &[OsString],
+) -> Result<Vec<OsString>> {
+    let Some(file) = (agent == Agent::ClaudeCode)
+        .then(|| {
+            launch
+                .files
+                .iter_mut()
+                .find(|file| file.path.ends_with(CLAUDE_CODE_SETTINGS))
+        })
+        .flatten()
+    else {
+        return Ok(args.to_vec());
+    };
+
+    let mut kept = Vec::with_capacity(args.len());
+    let mut given = Vec::new();
+    let mut rest = args.iter();
+    while let Some(arg) = rest.next() {
+        match arg.to_str() {
+            // After `--`, Claude Code reads every argument as the prompt.
+            Some("--") => {
+                kept.push(arg.clone());
+                kept.extend(rest.by_ref().cloned());
+            }
+            Some("--settings") => match rest.next() {
+                Some(value) => given.push(value.clone()),
+                // Claude Code reports the missing value.
+                None => kept.push(arg.clone()),
+            },
+            Some(other) if other.starts_with("--settings=") => {
+                given.push(OsString::from(&other["--settings=".len()..]));
+            }
+            _ => kept.push(arg.clone()),
+        }
+    }
+    if given.is_empty() {
+        return Ok(args.to_vec());
+    }
+
+    let mut merged = serde_json::Map::new();
+    for value in &given {
+        for (key, value) in read_claude_code_settings(value)? {
+            match (merged.get_mut(&key), value) {
+                (Some(serde_json::Value::Object(env)), serde_json::Value::Object(more))
+                    if key == "env" =>
+                {
+                    env.extend(more);
+                }
+                (_, value) => {
+                    merged.insert(key, value);
+                }
+            }
+        }
+    }
+    let mut env = match merged.remove("env") {
+        Some(serde_json::Value::Object(env)) => env,
+        _ => serde_json::Map::new(),
+    };
+    env.extend(
+        claude_code_env(&launch.env, &launch.env_remove)
+            .into_iter()
+            .map(|(key, value)| (key.to_string(), serde_json::Value::String(value))),
+    );
+    merged.insert("env".to_string(), serde_json::Value::Object(env));
+    file.contents = serde_json::to_string(&serde_json::Value::Object(merged))
+        .map_err(std::io::Error::other)
+        .context(CodingAgentFileSnafu {
+            path: file.path.clone(),
+        })?;
+    Ok(kept)
+}
+
+/// A Claude Code `--settings` value: a JSON object, or the path of a file
+/// holding one, as Claude Code itself accepts.
+fn read_claude_code_settings(
+    value: &std::ffi::OsStr,
+) -> Result<serde_json::Map<String, serde_json::Value>> {
+    let shown = value.to_string_lossy();
+    let invalid = |detail: String| crate::error::Error::InvalidUsage {
+        message: format!(
+            "Claude Code's `--settings` value '{shown}' {detail}, so spice cannot add the settings that route Claude Code to Spice. Pass a JSON object or the path of a settings file."
+        ),
+    };
+    let text = if shown.trim_start().starts_with('{') {
+        shown.to_string()
+    } else {
+        std::fs::read_to_string(value)
+            .map_err(|error| invalid(format!("is not a readable file ({error})")))?
+    };
+    match serde_json::from_str(&text) {
+        Ok(serde_json::Value::Object(settings)) => Ok(settings),
+        Ok(_) => Err(invalid("is not a JSON object".to_string())),
+        Err(error) => Err(invalid(format!("is not valid JSON ({error})"))),
+    }
+}
+
+/// A setting in an agent's own configuration that the agent applies over the
+/// endpoint `spice` gives it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ConfigConflict {
+    pub file: PathBuf,
+    pub key: String,
+    pub value: String,
+}
+
+/// Refuse to start `agent` when a setting in its own configuration would
+/// send it, and the runtime key, somewhere other than the runtime at
+/// `endpoint`, and no variable or argument `spice` can give outranks it.
+///
+/// # Errors
+///
+/// Returns an error naming the setting and the file it is in.
+pub(crate) fn check_own_config(agent: Agent, endpoint: &str) -> Result<()> {
+    let conflict = match agent {
+        Agent::Grok => {
+            let home = std::env::var_os("GROK_HOME")
+                .map(PathBuf::from)
+                .or_else(|| dirs::home_dir().map(|home| home.join(".grok")));
+            grok_config_conflict(
+                &openai_base_url(endpoint),
+                home.as_deref(),
+                Path::new("/etc/grok"),
+            )
+        }
+        Agent::Antigravity
+        | Agent::ClaudeCode
+        | Agent::Codex
+        | Agent::CopilotCli
+        | Agent::Cursor
+        | Agent::OpenCode
+        | Agent::Pi => None,
+    };
+    match conflict {
+        Some(conflict) => CodingAgentConfigConflictSnafu {
+            agent: agent.display_name(),
+            file: conflict.file,
+            key: conflict.key,
+            value: conflict.value,
+        }
+        .fail(),
+        None => Ok(()),
+    }
+}
+
+/// The first Grok Build setting that points it at another endpoint than the
+/// runtime at `openai_base_url`.
+///
+/// Grok Build reads `endpoints.models_base_url` and `endpoints.models_list_url`
+/// from its config files over `GROK_MODELS_BASE_URL`, and its `GROK_CONFIG`
+/// overlay cannot set either. The files are its user, managed and
+/// requirements configs, under `grok_home` (`GROK_HOME`, else `~/.grok`) and
+/// the system directory `system` (`/etc/grok`).
+fn grok_config_conflict(
+    openai_base_url: &str,
+    grok_home: Option<&Path>,
+    system: &Path,
+) -> Option<ConfigConflict> {
+    let user = grok_home.into_iter().flat_map(|home| {
+        ["config.toml", "managed_config.toml", "requirements.toml"].map(|name| home.join(name))
+    });
+    let system = ["managed_config.toml", "requirements.toml"].map(|name| system.join(name));
+    for file in user.chain(system) {
+        let Ok(text) = std::fs::read_to_string(&file) else {
+            continue;
+        };
+        // Grok reports a file it cannot parse itself.
+        let Ok(table) = text.parse::<toml::Table>() else {
+            continue;
+        };
+        let Some(endpoints) = table.get("endpoints").and_then(toml::Value::as_table) else {
+            continue;
+        };
+        for key in ["models_base_url", "models_list_url"] {
+            let Some(value) = endpoints
+                .get(key)
+                .and_then(toml::Value::as_str)
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+            else {
+                continue;
+            };
+            // Where this key points Grok at the runtime itself.
+            let runtime = match key {
+                "models_base_url" => openai_base_url.to_string(),
+                _ => format!("{openai_base_url}/models"),
+            };
+            if value.trim_end_matches('/') == runtime.trim_end_matches('/') {
+                continue;
+            }
+            return Some(ConfigConflict {
+                file,
+                key: format!("endpoints.{key}"),
+                value: value.to_string(),
+            });
+        }
+    }
+    None
+}
+
+/// What a Spice runtime offers an agent: where it is, how to authenticate, and
+/// which models it serves.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct Backend<'a> {
+    /// The runtime's HTTP endpoint, such as `http://127.0.0.1:8090`, without a
+    /// trailing slash.
+    pub endpoint: &'a str,
+    /// The runtime's API key, when it has one.
+    pub api_key: Option<&'a str>,
+    /// The model the agent starts on.
+    pub model: &'a str,
+    /// Every model the runtime serves, including [`Self::model`], so an agent
+    /// with a model picker can switch between them.
+    pub models: &'a [String],
+    /// Whether every one of [`Self::models`] answers the Messages API natively.
+    pub native_messages: bool,
+    /// Whether the user named the model with the agent's own option, in which
+    /// case no model option is added: the agent would refuse it twice.
+    pub model_given: bool,
+    /// The token limits of each of [`Self::models`] that the runtime reports any for.
+    pub limits: &'a HashMap<String, Limits>,
+}
+
+/// A model's token limits, as the runtime's `/v1/models` reports them.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct Limits {
+    pub context_window: Option<u64>,
+    pub max_output_tokens: Option<u64>,
+}
+
+impl Limits {
+    /// What a prompt may hold: the window, less the answer's cap when it has one.
+    fn prompt_limit(self) -> Option<u64> {
+        let window = self.context_window?;
+        Some(
+            self.max_output_tokens
+                .filter(|output| *output < window)
+                .map_or(window, |output| window - output),
+        )
+    }
+}
+
+impl Backend<'_> {
+    fn limits_of(&self, model: &str) -> Limits {
+        self.limits.get(model).copied().unwrap_or_default()
+    }
+
+    /// The token limits of the model the agent starts on.
+    fn start(&self) -> Limits {
+        self.limits_of(self.model)
+    }
+
+    fn token(&self) -> &str {
+        self.api_key.unwrap_or(PLACEHOLDER_TOKEN)
+    }
+
+    /// The OpenAI-compatible base URL, under which `/chat/completions`,
+    /// `/responses` and `/models` are resolved.
+    fn openai_base_url(&self) -> String {
+        openai_base_url(self.endpoint)
+    }
+}
+
+/// The OpenAI-compatible base URL of the runtime at `endpoint`.
+fn openai_base_url(endpoint: &str) -> String {
+    format!("{}/v1", endpoint.trim_end_matches('/'))
+}
+
+/// A file an agent reads, written before it starts.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct LaunchFile {
+    pub path: PathBuf,
+    pub contents: String,
+    /// Whether the file must be executable.
+    pub executable: bool,
+}
+
+/// Everything needed to start an agent against a [`Backend`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct Launch {
+    /// Arguments placed before the user's own.
+    pub args: Vec<OsString>,
+    /// Environment variables to set, overriding the inherited value.
+    pub env: Vec<(&'static str, OsString)>,
+    /// Inherited environment variables to clear, because they would route the
+    /// agent somewhere other than Spice or hand Spice a vendor credential.
+    pub env_remove: Vec<&'static str>,
+    /// Files to write before the agent starts.
+    pub files: Vec<LaunchFile>,
+    /// Arguments of a run of the agent that has to complete before the real one
+    /// starts, under the same environment.
+    pub prepare: Option<Vec<OsString>>,
+}
+
+/// Environment variables that would send Claude Code to another provider, or a
+/// vendor credential to Spice, if inherited.
+const CLAUDE_CODE_ENV_REMOVE: &[&str] = &[
+    "ANTHROPIC_API_KEY",
+    "CLAUDE_CODE_OAUTH_TOKEN",
+    "ANTHROPIC_SMALL_FAST_MODEL",
+    "CLAUDE_CODE_USE_BEDROCK",
+    "CLAUDE_CODE_USE_VERTEX",
+    "CLAUDE_CODE_USE_FOUNDRY",
+    "CLAUDE_CODE_USE_MANTLE",
+    "CLAUDE_CODE_USE_ANTHROPIC_AWS",
+    "CLAUDE_CODE_USE_ANTHROPIC_GOOGLE_CLOUD",
+    "CLAUDE_CODE_USE_GATEWAY",
+];
+
+/// Copilot provider settings a user may have exported for another provider,
+/// which would otherwise be applied to Spice.
+const COPILOT_ENV_REMOVE: &[&str] = &[
+    "COPILOT_PROVIDER_BEARER_TOKEN",
+    "COPILOT_PROVIDER_API_KEY_COMMAND",
+    "COPILOT_PROVIDER_MODEL_ID",
+    "COPILOT_PROVIDER_WIRE_MODEL",
+    "COPILOT_PROVIDER_TRANSPORT",
+    "COPILOT_PROVIDER_AZURE_API_VERSION",
+];
+
+/// Build the [`Launch`] that points `agent` at `backend`.
+///
+/// `scratch` is a private directory that outlives the agent's run; files the
+/// agent reads are placed in it.
+///
+/// # Errors
+///
+/// Returns an error when a file the agent reads cannot be serialized.
+pub(crate) fn launch(agent: Agent, backend: &Backend<'_>, scratch: &Path) -> Result<Launch> {
+    Ok(match agent {
+        Agent::ClaudeCode => claude_code(backend, scratch)?,
+        Agent::Codex => codex(backend),
+        Agent::CopilotCli => copilot(backend),
+        Agent::Cursor => cursor(backend),
+        Agent::Grok => grok(backend, scratch),
+        Agent::OpenCode => opencode(backend),
+        Agent::Pi => pi(backend, scratch)?,
+        Agent::Antigravity => antigravity(backend),
+    })
+}
+
+fn os(value: impl Into<OsString>) -> OsString {
+    value.into()
+}
+
+/// Where in the session's directory Claude Code's settings are written.
+const CLAUDE_CODE_SETTINGS: &str = "claude/settings.json";
+
+/// Claude Code's settings for a session, passed with `--settings`.
+#[derive(serde::Serialize)]
+struct ClaudeCodeSettings {
+    env: std::collections::BTreeMap<&'static str, String>,
+}
+
+/// The `env` of a Claude Code session's settings: each variable `env_remove`
+/// names, empty, and each `env` sets — in its settings too, since Claude
+/// Code's own settings files outrank the environment it inherits. Sorted, so
+/// the file reads the same however serde orders maps.
+fn claude_code_env(
+    env: &[(&'static str, OsString)],
+    env_remove: &[&'static str],
+) -> std::collections::BTreeMap<&'static str, String> {
+    env_remove
+        .iter()
+        .map(|key| (*key, String::new()))
+        .chain(
+            env.iter()
+                .map(|(key, value)| (*key, value.to_string_lossy().into_owned())),
+        )
+        .collect()
+}
+
+/// Claude Code speaks the Anthropic Messages API, which the runtime serves on
+/// `/v1/messages`. `ANTHROPIC_BASE_URL` takes the root; Claude Code appends
+/// `/v1/...` itself.
+///
+/// The variables are set in the environment and again in a settings file
+/// passed with `--settings`. Claude Code applies the `env` of its settings
+/// files over the environment it inherits, so an `ANTHROPIC_BASE_URL` in the
+/// user's or the project's settings would otherwise send every request, and
+/// the runtime key, elsewhere. Settings given with `--settings` take
+/// precedence over the user's, the project's and the local settings files, so
+/// the file also sets each variable cleared from the environment to empty,
+/// which keeps a vendor key or provider switch in those files from applying.
+fn claude_code(backend: &Backend<'_>, scratch: &Path) -> Result<Launch> {
+    let model = backend.model;
+    let mut env = vec![
+        ("ANTHROPIC_BASE_URL", os(backend.endpoint)),
+        // Sent as `Authorization: Bearer`, which the runtime accepts, and
+        // takes precedence over a claude.ai login.
+        ("ANTHROPIC_AUTH_TOKEN", os(backend.token())),
+        ("ANTHROPIC_MODEL", os(model)),
+        // Every alias Claude Code resolves on its own — the `/model`
+        // tiers, background work, subagents — resolves to a model Spice
+        // serves, never to a Claude model id Spice does not.
+        ("ANTHROPIC_DEFAULT_FABLE_MODEL", os(model)),
+        ("ANTHROPIC_DEFAULT_OPUS_MODEL", os(model)),
+        ("ANTHROPIC_DEFAULT_SONNET_MODEL", os(model)),
+        ("ANTHROPIC_DEFAULT_HAIKU_MODEL", os(model)),
+        ("CLAUDE_CODE_SUBAGENT_MODEL", os(model)),
+        // Lists the runtime's `/v1/models` in the `/model` picker.
+        ("CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY", os("1")),
+        // Claude Code otherwise opens every system prompt with a billing
+        // line for Anthropic's API, which no other backend reads and which
+        // differs between versions, so it would only cost a cache miss.
+        ("CLAUDE_CODE_ATTRIBUTION_HEADER", os("0")),
+    ];
+    if let Some(window) = backend.start().context_window {
+        // Claude Code otherwise assumes 200k tokens for a model id it does not recognize,
+        // and compacts — or overflows — at the wrong point.
+        env.push(("CLAUDE_CODE_MAX_CONTEXT_TOKENS", os(window.to_string())));
+    }
+    if let Some(output) = backend.start().max_output_tokens {
+        // Claude Code otherwise asks for up to 32k tokens, which a provider with a lower cap
+        // refuses.
+        env.push(("CLAUDE_CODE_MAX_OUTPUT_TOKENS", os(output.to_string())));
+    }
+    if !backend.native_messages {
+        // Tool search defers tools with `defer_loading`, which a Messages
+        // request translated into a chat completion cannot carry: the runtime
+        // rejects the request, and Claude Code retries before it falls back to
+        // loading every tool. Starting with every tool loaded skips the failures.
+        env.push(("ENABLE_TOOL_SEARCH", os("false")));
+    }
+
+    let path = scratch.join(CLAUDE_CODE_SETTINGS);
+    let settings = ClaudeCodeSettings {
+        env: claude_code_env(&env, CLAUDE_CODE_ENV_REMOVE),
+    };
+    let contents = serde_json::to_string(&settings)
+        .map_err(std::io::Error::other)
+        .context(CodingAgentFileSnafu { path: path.clone() })?;
+    Ok(Launch {
+        args: vec![os("--settings"), path.clone().into_os_string()],
+        env,
+        env_remove: CLAUDE_CODE_ENV_REMOVE.to_vec(),
+        files: vec![LaunchFile {
+            path,
+            contents,
+            executable: false,
+        }],
+        prepare: None,
+    })
+}
+
+/// Codex speaks only the Responses API (`wire_api = "chat"` was removed), so
+/// it is pointed at `/v1/responses` through a provider defined with `-c`
+/// overrides, which take precedence over `~/.codex/config.toml` without
+/// editing it.
+fn codex(backend: &Backend<'_>) -> Launch {
+    let provider = format!("model_providers.{PROVIDER_ID}");
+    let mut args = vec![
+        os("-c"),
+        os(format!("model_provider={}", toml_string(PROVIDER_ID))),
+        os("-c"),
+        os(format!("{provider}.name={}", toml_string(PROVIDER_NAME))),
+        os("-c"),
+        os(format!(
+            "{provider}.base_url={}",
+            toml_string(&backend.openai_base_url())
+        )),
+        os("-c"),
+        os(format!("{provider}.wire_api={}", toml_string("responses"))),
+    ];
+    let mut env = Vec::new();
+    if let Some(key) = backend.api_key {
+        // `env_key` names the variable Codex reads the bearer token from, so
+        // the key never appears in the process arguments.
+        args.push(os("-c"));
+        args.push(os(format!(
+            "{provider}.env_key={}",
+            toml_string(SPICE_API_KEY_ENV)
+        )));
+        env.push((SPICE_API_KEY_ENV, os(key)));
+    }
+    // The default model as config rather than `--model`, which the user's own
+    // `--model` overrides instead of colliding with.
+    args.push(os("-c"));
+    args.push(os(format!("model={}", toml_string(backend.model))));
+    if let Some(window) = backend.start().context_window {
+        // Codex sizes its auto-compaction by it, and otherwise falls back to a default for
+        // a model it has no metadata for.
+        args.push(os("-c"));
+        args.push(os(format!("model_context_window={window}")));
+    }
+    Launch {
+        args,
+        env,
+        env_remove: Vec::new(),
+        files: Vec::new(),
+        prepare: None,
+    }
+}
+
+/// The variable the CLI reads the runtime API key from, reused to hand the key
+/// to an agent that takes the name of a variable rather than its value.
+const SPICE_API_KEY_ENV: &str = "SPICE_API_KEY";
+
+/// GitHub Copilot CLI's bring-your-own-key mode, configured entirely through
+/// `COPILOT_PROVIDER_*` variables. Chat completions is the wire API every
+/// Spice model serves.
+fn copilot(backend: &Backend<'_>) -> Launch {
+    Launch {
+        args: Vec::new(),
+        env: vec![
+            ("COPILOT_PROVIDER_BASE_URL", os(backend.openai_base_url())),
+            ("COPILOT_PROVIDER_TYPE", os("openai")),
+            ("COPILOT_PROVIDER_WIRE_API", os("completions")),
+            ("COPILOT_PROVIDER_API_KEY", os(backend.token())),
+            ("COPILOT_MODEL", os(backend.model)),
+        ]
+        .into_iter()
+        // Copilot otherwise falls back to defaults for a model id it does not know.
+        .chain(
+            backend
+                .start()
+                .prompt_limit()
+                .map(|limit| ("COPILOT_PROVIDER_MAX_PROMPT_TOKENS", os(limit.to_string()))),
+        )
+        .chain(
+            backend
+                .start()
+                .max_output_tokens
+                .map(|output| ("COPILOT_PROVIDER_MAX_OUTPUT_TOKENS", os(output.to_string()))),
+        )
+        .collect(),
+        env_remove: COPILOT_ENV_REMOVE.to_vec(),
+        files: Vec::new(),
+        prepare: None,
+    }
+}
+
+/// Cursor's local-agent build: an OpenAI-compatible base URL, with the
+/// authless mode that keeps it from contacting Cursor's servers.
+fn cursor(backend: &Backend<'_>) -> Launch {
+    Launch {
+        args: model_option(backend, "--model"),
+        env: vec![
+            ("CURSOR_LOCAL_AGENT_BASE_URL", os(backend.openai_base_url())),
+            ("CURSOR_LOCAL_AGENT_API_KEY", os(backend.token())),
+            ("CURSOR_ENABLE_AUTHLESS", os("1")),
+        ],
+        env_remove: vec!["CURSOR_API_KEY"],
+        files: Vec::new(),
+        prepare: None,
+    }
+}
+
+/// Grok Build fetches its model list from `GROK_MODELS_BASE_URL` and sends
+/// chat completions there.
+///
+/// Grok authenticates those requests with its signed-in session when one
+/// exists, which would hand the user's xAI token to Spice. So the session is
+/// replaced for this run: `GROK_AUTH_PATH` moves the session file into the
+/// scratch directory, and `GROK_AUTH_PROVIDER_COMMAND` mints the Spice token
+/// into it during a `grok login` that runs before the real launch. The user's
+/// own `~/.grok/auth.json` is never read or written.
+fn grok(backend: &Backend<'_>, scratch: &Path) -> Launch {
+    let dir = scratch.join("grok");
+    let token_command = dir.join("token.sh");
+    let auth_path = dir.join("auth.json");
+    let model = backend.model;
+    Launch {
+        args: model_option(backend, "--model"),
+        env: vec![
+            ("GROK_MODELS_BASE_URL", os(backend.openai_base_url())),
+            // Authenticates the model-list request, which never uses the session.
+            ("XAI_API_KEY", os(backend.token())),
+            ("GROK_AUTH_PATH", os(auth_path)),
+            ("GROK_AUTH_PROVIDER_COMMAND", os(&token_command)),
+            ("GROK_DEFAULT_MODEL", os(model)),
+            // Helper requests — session titles and summaries — otherwise ask
+            // for an xAI model the runtime does not serve.
+            ("GROK_SESSION_SUMMARY_MODEL", os(model)),
+        ],
+        env_remove: vec!["GROK_MODELS_LIST_URL", "GROK_CLI_CHAT_PROXY_BASE_URL"],
+        files: vec![LaunchFile {
+            path: token_command,
+            contents: format!("#!/bin/sh\nprintf '%s' {}\n", shell_quote(backend.token())),
+            executable: true,
+        }],
+        prepare: Some(vec![os("login")]),
+    }
+}
+
+/// `OpenCode` reads an inline JSON config from `OPENCODE_CONFIG_CONTENT`, which
+/// is merged over the user's global and project configs.
+///
+/// A model's `limit` takes the window and the output cap together, so it is given
+/// only for a model the runtime reports both for.
+fn opencode(backend: &Backend<'_>) -> Launch {
+    let models: serde_json::Map<String, serde_json::Value> = backend
+        .models
+        .iter()
+        .map(|model| {
+            let limits = backend.limits_of(model);
+            let entry = match limits.context_window.zip(limits.max_output_tokens) {
+                Some((context, output)) => {
+                    json!({ "name": model, "limit": { "context": context, "output": output } })
+                }
+                None => json!({ "name": model }),
+            };
+            (model.clone(), entry)
+        })
+        .collect();
+    let default_model = format!("{PROVIDER_ID}/{}", backend.model);
+    let config = json!({
+        "$schema": "https://opencode.ai/config.json",
+        "provider": {
+            PROVIDER_ID: {
+                "npm": "@ai-sdk/openai-compatible",
+                "name": PROVIDER_NAME,
+                "options": {
+                    "baseURL": backend.openai_base_url(),
+                    "apiKey": backend.token(),
+                },
+                "models": models,
+            }
+        },
+        "model": default_model,
+        // Title generation and other small tasks otherwise go to a model
+        // from another provider.
+        "small_model": default_model,
+        // A user's `enabled_providers` would otherwise filter Spice out, and
+        // every other provider would remain one keystroke away from the session.
+        "enabled_providers": [PROVIDER_ID],
+    });
+    Launch {
+        args: Vec::new(),
+        env: vec![("OPENCODE_CONFIG_CONTENT", os(config.to_string()))],
+        env_remove: Vec::new(),
+        files: Vec::new(),
+        prepare: None,
+    }
+}
+
+/// pi has no base-URL flag or variable, but loads extensions given with `-e`,
+/// and an extension can register a provider before pi picks its startup model.
+fn pi(backend: &Backend<'_>, scratch: &Path) -> Result<Launch> {
+    let extension = scratch.join("pi").join("spice.ts");
+    let provider = PiProvider {
+        name: PROVIDER_NAME,
+        base_url: backend.openai_base_url(),
+        api_key: backend.token(),
+        api: "openai-completions",
+        models: backend
+            .models
+            .iter()
+            .map(|model| PiModel {
+                id: model,
+                name: model,
+                reasoning: false,
+                input: ["text"],
+                cost: PiCost::default(),
+                // The runtime's limits when it reports them; else pi's own defaults for a
+                // model it has no catalog entry for.
+                context_window: backend.limits_of(model).context_window.unwrap_or(128_000),
+                max_tokens: backend.limits_of(model).max_output_tokens.unwrap_or(16_384),
+            })
+            .collect(),
+    };
+    let provider = serde_json::to_string(&provider)
+        .map_err(std::io::Error::other)
+        .context(CodingAgentFileSnafu {
+            path: extension.clone(),
+        })?;
+    let contents = format!(
+        "// Generated by `spice pi`: registers the Spice runtime as a provider for this session.\nexport default function (pi) {{\n  pi.registerProvider({}, {provider});\n}}\n",
+        serde_json::Value::String(PROVIDER_ID.to_string()),
+    );
+    let mut args = vec![os("-e"), os(&extension)];
+    if !backend.model_given {
+        args.push(os("--model"));
+        args.push(os(format!("{PROVIDER_ID}/{}", backend.model)));
+    }
+    Ok(Launch {
+        args,
+        env: Vec::new(),
+        env_remove: Vec::new(),
+        files: vec![LaunchFile {
+            path: extension,
+            contents,
+            executable: false,
+        }],
+        prepare: None,
+    })
+}
+
+/// The provider a pi extension registers. Structs rather than a `json!` map, so
+/// the fields keep this order whether or not `serde_json` preserves insertion
+/// order in a build.
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct PiProvider<'a> {
+    name: &'a str,
+    base_url: String,
+    api_key: &'a str,
+    api: &'a str,
+    models: Vec<PiModel<'a>>,
+}
+
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct PiModel<'a> {
+    id: &'a str,
+    name: &'a str,
+    reasoning: bool,
+    input: [&'a str; 1],
+    cost: PiCost,
+    context_window: u64,
+    max_tokens: u64,
+}
+
+/// What pi bills for a model: nothing, since the runtime meters its own usage.
+#[derive(Default, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct PiCost {
+    input: u32,
+    output: u32,
+    cache_read: u32,
+    cache_write: u32,
+}
+
+/// The Antigravity CLI's LLM gateway mode: it skips Google sign-in, discovers
+/// the gateway's models from its `GET /v1beta/models` listing, and sends each
+/// request to the gateway as a Gemini API `models/{model}:streamGenerateContent`
+/// call. Unlike its Gemini API key mode, the gateway needs no `modelProvider`
+/// entry in the user's `settings.json`.
+///
+/// The models are left to that discovery. A model named in
+/// `AGY_LLM_GATEWAY_MODELS` instead is sent no tool declarations, so the agent
+/// could only chat, never read or edit a file.
+fn antigravity(backend: &Backend<'_>) -> Launch {
+    let args = if backend.model_given {
+        Vec::new()
+    } else {
+        vec![os(format!("--model={}", backend.model))]
+    };
+    Launch {
+        args,
+        env: vec![
+            // The root: the CLI appends `/v1beta/models/...` itself.
+            ("AGY_LLM_GATEWAY_URL", os(backend.endpoint)),
+            // Sent as `Authorization: Bearer`.
+            ("AGY_LLM_GATEWAY_API_KEY", os(backend.token())),
+        ],
+        // Headers for another gateway, which Spice has no use for, and a model
+        // list that would name another gateway's models and turn tools off.
+        env_remove: vec!["AGY_LLM_GATEWAY_HEADERS", "AGY_LLM_GATEWAY_MODELS"],
+        files: Vec::new(),
+        prepare: None,
+    }
+}
+
+/// `option model`, unless the user named the model themselves.
+fn model_option(backend: &Backend<'_>, option: &str) -> Vec<OsString> {
+    if backend.model_given {
+        Vec::new()
+    } else {
+        vec![os(option), os(backend.model)]
+    }
+}
+
+/// A TOML basic string, for a `-c key=value` override.
+fn toml_string(value: &str) -> String {
+    // A JSON string is a valid TOML basic string: both escape `"`, `\` and
+    // control characters the same way.
+    serde_json::Value::String(value.to_string()).to_string()
+}
+
+/// `value` as one word in `sh`, `bash`, `zsh` and `fish`: single-quoted, with
+/// each single quote closed, escaped and reopened.
+pub(super) fn shell_quote(value: &str) -> String {
+    format!("'{}'", value.replace('\'', r"'\''"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// [`super::launch`], whose plans here always serialize.
+    fn launch(agent: Agent, backend: &Backend<'_>, scratch: &Path) -> Launch {
+        super::launch(agent, backend, scratch).expect("a launch plan")
+    }
+
+    const ENDPOINT: &str = "http://127.0.0.1:8090";
+
+    fn models() -> Vec<String> {
+        vec!["qwen".to_string(), "gpt".to_string()]
+    }
+
+    static NO_LIMITS: std::sync::LazyLock<HashMap<String, Limits>> =
+        std::sync::LazyLock::new(HashMap::new);
+
+    fn limits(context_window: u64, max_output_tokens: Option<u64>) -> Limits {
+        Limits {
+            context_window: Some(context_window),
+            max_output_tokens,
+        }
+    }
+
+    fn backend<'a>(models: &'a [String], api_key: Option<&'a str>) -> Backend<'a> {
+        Backend {
+            endpoint: ENDPOINT,
+            api_key,
+            model: "qwen",
+            models,
+            native_messages: false,
+            model_given: false,
+            limits: &NO_LIMITS,
+        }
+    }
+
+    fn env_of(launch: &Launch) -> Vec<(&'static str, String)> {
+        launch
+            .env
+            .iter()
+            .map(|(key, value)| (*key, value.to_string_lossy().into_owned()))
+            .collect()
+    }
+
+    fn args_of(launch: &Launch) -> Vec<String> {
+        launch
+            .args
+            .iter()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect()
+    }
+
+    #[test]
+    fn claude_code_reaches_the_messages_api_with_every_alias_on_the_spice_model() {
+        let models = models();
+        let launch = launch(
+            Agent::ClaudeCode,
+            &backend(&models, None),
+            Path::new("/scratch"),
+        );
+        assert_eq!(
+            env_of(&launch),
+            vec![
+                ("ANTHROPIC_BASE_URL", ENDPOINT.to_string()),
+                ("ANTHROPIC_AUTH_TOKEN", "spice".to_string()),
+                ("ANTHROPIC_MODEL", "qwen".to_string()),
+                ("ANTHROPIC_DEFAULT_FABLE_MODEL", "qwen".to_string()),
+                ("ANTHROPIC_DEFAULT_OPUS_MODEL", "qwen".to_string()),
+                ("ANTHROPIC_DEFAULT_SONNET_MODEL", "qwen".to_string()),
+                ("ANTHROPIC_DEFAULT_HAIKU_MODEL", "qwen".to_string()),
+                ("CLAUDE_CODE_SUBAGENT_MODEL", "qwen".to_string()),
+                (
+                    "CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY",
+                    "1".to_string()
+                ),
+                ("CLAUDE_CODE_ATTRIBUTION_HEADER", "0".to_string()),
+                ("ENABLE_TOOL_SEARCH", "false".to_string()),
+            ]
+        );
+        // A vendor key or provider switch in the user's shell must not survive.
+        assert_eq!(launch.env_remove, CLAUDE_CODE_ENV_REMOVE);
+        assert!(launch.prepare.is_none());
+
+        // The same variables again in settings that outrank the user's and the
+        // project's settings files, with every cleared variable set to empty.
+        assert_eq!(
+            args_of(&launch),
+            vec!["--settings", "/scratch/claude/settings.json"]
+        );
+        assert_eq!(launch.files.len(), 1);
+        assert_eq!(
+            launch.files[0].path,
+            PathBuf::from("/scratch/claude/settings.json")
+        );
+        assert!(!launch.files[0].executable);
+        assert_eq!(
+            launch.files[0].contents,
+            concat!(
+                r#"{"env":{"ANTHROPIC_API_KEY":"","ANTHROPIC_AUTH_TOKEN":"spice","#,
+                r#""ANTHROPIC_BASE_URL":"http://127.0.0.1:8090","#,
+                r#""ANTHROPIC_DEFAULT_FABLE_MODEL":"qwen","ANTHROPIC_DEFAULT_HAIKU_MODEL":"qwen","#,
+                r#""ANTHROPIC_DEFAULT_OPUS_MODEL":"qwen","ANTHROPIC_DEFAULT_SONNET_MODEL":"qwen","#,
+                r#""ANTHROPIC_MODEL":"qwen","ANTHROPIC_SMALL_FAST_MODEL":"","#,
+                r#""CLAUDE_CODE_ATTRIBUTION_HEADER":"0","#,
+                r#""CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY":"1","#,
+                r#""CLAUDE_CODE_OAUTH_TOKEN":"","CLAUDE_CODE_SUBAGENT_MODEL":"qwen","#,
+                r#""CLAUDE_CODE_USE_ANTHROPIC_AWS":"","CLAUDE_CODE_USE_ANTHROPIC_GOOGLE_CLOUD":"","#,
+                r#""CLAUDE_CODE_USE_BEDROCK":"","CLAUDE_CODE_USE_FOUNDRY":"","#,
+                r#""CLAUDE_CODE_USE_GATEWAY":"","CLAUDE_CODE_USE_MANTLE":"","#,
+                r#""CLAUDE_CODE_USE_VERTEX":"","ENABLE_TOOL_SEARCH":"false"}}"#,
+            )
+        );
+    }
+
+    fn strings(args: &[OsString]) -> Vec<String> {
+        args.iter()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect()
+    }
+
+    fn os_args(args: &[&str]) -> Vec<OsString> {
+        args.iter().map(OsString::from).collect()
+    }
+
+    /// A user's own `--settings` would replace the one routing Claude Code to
+    /// Spice, so it is merged into it: the user's keys stay, Spice's routing
+    /// variables win, and the flag is not passed on.
+    #[test]
+    fn a_users_claude_code_settings_are_merged_under_the_routing() {
+        let models = models();
+        let dir = tempfile::tempdir().expect("create tempdir");
+        let file = dir.path().join("mine.json");
+        std::fs::write(&file, r#"{"model":"opus","env":{"FROM_FILE":"1"}}"#)
+            .expect("write the user's settings");
+        let mut launch = super::launch(
+            Agent::ClaudeCode,
+            &backend(&models, None),
+            Path::new("/scratch"),
+        )
+        .expect("a launch plan");
+        let args = user_arguments(
+            Agent::ClaudeCode,
+            &mut launch,
+            &os_args(&[
+                "--settings",
+                r#"{"theme":"dark","env":{"ANTHROPIC_BASE_URL":"http://elsewhere","ANTHROPIC_API_KEY":"sk-ant","MINE":"x"}}"#,
+                "-p",
+                &format!("--settings={}", file.display()),
+                "hi",
+                "--",
+                "--settings",
+                "literal",
+            ]),
+        )
+        .expect("merge the settings");
+        assert_eq!(strings(&args), ["-p", "hi", "--", "--settings", "literal"]);
+        assert_eq!(
+            args_of(&launch),
+            vec!["--settings", "/scratch/claude/settings.json"]
+        );
+        let merged: serde_json::Value =
+            serde_json::from_str(&launch.files[0].contents).expect("the merged settings are JSON");
+        assert_eq!(merged["theme"], "dark");
+        assert_eq!(merged["model"], "opus");
+        assert_eq!(merged["env"]["MINE"], "x");
+        assert_eq!(merged["env"]["FROM_FILE"], "1");
+        assert_eq!(merged["env"]["ANTHROPIC_BASE_URL"], ENDPOINT);
+        assert_eq!(merged["env"]["ANTHROPIC_AUTH_TOKEN"], "spice");
+        assert_eq!(merged["env"]["ANTHROPIC_API_KEY"], "");
+    }
+
+    #[test]
+    fn arguments_without_claude_code_settings_pass_through_untouched() {
+        let models = models();
+        let mut launch = super::launch(
+            Agent::ClaudeCode,
+            &backend(&models, None),
+            Path::new("/scratch"),
+        )
+        .expect("a launch plan");
+        let before = launch.clone();
+        let args = os_args(&["-p", "hi", "--settings"]);
+        assert_eq!(
+            user_arguments(Agent::ClaudeCode, &mut launch, &args).expect("no merge"),
+            args
+        );
+        assert_eq!(launch, before);
+
+        let mut codex = super::launch(Agent::Codex, &backend(&models, None), Path::new("/scratch"))
+            .expect("a launch plan");
+        let args = os_args(&["--settings", "{}"]);
+        assert_eq!(
+            user_arguments(Agent::Codex, &mut codex, &args).expect("not Claude Code"),
+            args
+        );
+    }
+
+    #[test]
+    fn claude_code_settings_that_are_not_a_json_object_are_refused() {
+        let models = models();
+        let mut launch = super::launch(
+            Agent::ClaudeCode,
+            &backend(&models, None),
+            Path::new("/scratch"),
+        )
+        .expect("a launch plan");
+        let error = user_arguments(
+            Agent::ClaudeCode,
+            &mut launch,
+            &os_args(&["--settings", "[1]"]),
+        )
+        .expect_err("an array is not settings");
+        assert_eq!(
+            error.to_string(),
+            "Invalid argument: Claude Code's `--settings` value '[1]' is not a readable file (No such file or directory (os error 2)), so spice cannot add the settings that route Claude Code to Spice. Pass a JSON object or the path of a settings file."
+        );
+        let error = user_arguments(
+            Agent::ClaudeCode,
+            &mut launch,
+            &os_args(&["--settings", "{nope"]),
+        )
+        .expect_err("invalid JSON");
+        assert!(
+            error.to_string().starts_with(
+                "Invalid argument: Claude Code's `--settings` value '{nope' is not valid JSON ("
+            ),
+            "{error}"
+        );
+    }
+
+    /// Grok Build applies an endpoint in its own config over the one spice
+    /// gives it, so such a setting is found before Grok starts.
+    #[test]
+    fn a_grok_endpoint_in_its_own_config_is_found() {
+        let dir = tempfile::tempdir().expect("create tempdir");
+        let home = dir.path().join("grok");
+        let system = dir.path().join("etc-grok");
+        std::fs::create_dir_all(&home).expect("create the Grok home");
+        std::fs::create_dir_all(&system).expect("create the system directory");
+        let spice = "http://127.0.0.1:8090/v1";
+        let find = || grok_config_conflict(spice, Some(&home), &system);
+
+        assert_eq!(find(), None, "no config");
+        std::fs::write(home.join("config.toml"), "[marketplace]\nx = true\n").expect("write");
+        assert_eq!(find(), None, "a config without endpoints");
+        std::fs::write(
+            home.join("config.toml"),
+            "[endpoints]\nmodels_base_url = \"http://127.0.0.1:8090/v1/\"\n",
+        )
+        .expect("write");
+        assert_eq!(find(), None, "an endpoint that is this runtime's");
+
+        std::fs::write(
+            home.join("config.toml"),
+            "endpoints.models_base_url = \"https://proxy.example/v1\"\n",
+        )
+        .expect("write");
+        assert_eq!(
+            find(),
+            Some(ConfigConflict {
+                file: home.join("config.toml"),
+                key: "endpoints.models_base_url".to_string(),
+                value: "https://proxy.example/v1".to_string(),
+            })
+        );
+
+        std::fs::write(home.join("config.toml"), "").expect("write");
+        std::fs::write(
+            system.join("requirements.toml"),
+            "endpoints = { models_list_url = \"https://list.example/models\" }\n",
+        )
+        .expect("write");
+        assert_eq!(
+            find(),
+            Some(ConfigConflict {
+                file: system.join("requirements.toml"),
+                key: "endpoints.models_list_url".to_string(),
+                value: "https://list.example/models".to_string(),
+            })
+        );
+        std::fs::write(
+            system.join("requirements.toml"),
+            "endpoints = { models_list_url = \"http://127.0.0.1:8090/v1/models\" }\n",
+        )
+        .expect("write");
+        assert_eq!(find(), None, "a listing that is this runtime's");
+    }
+
+    #[test]
+    fn claude_code_keeps_tool_search_when_every_model_is_native_anthropic() {
+        let models = models();
+        let mut native = backend(&models, None);
+        native.native_messages = true;
+        let launch = launch(Agent::ClaudeCode, &native, Path::new("/scratch"));
+        assert!(
+            !env_of(&launch)
+                .iter()
+                .any(|(key, _)| *key == "ENABLE_TOOL_SEARCH"),
+            "{:?}",
+            env_of(&launch)
+        );
+    }
+
+    #[test]
+    fn claude_code_sends_the_runtime_key_when_there_is_one() {
+        let models = models();
+        let launch = launch(
+            Agent::ClaudeCode,
+            &backend(&models, Some("sk-runtime")),
+            Path::new("/scratch"),
+        );
+        assert_eq!(
+            env_of(&launch)[1],
+            ("ANTHROPIC_AUTH_TOKEN", "sk-runtime".to_string())
+        );
+    }
+
+    #[test]
+    fn codex_gets_a_responses_provider_through_config_overrides() {
+        let models = models();
+        let launch = launch(Agent::Codex, &backend(&models, None), Path::new("/scratch"));
+        assert_eq!(
+            args_of(&launch),
+            vec![
+                "-c",
+                r#"model_provider="spice""#,
+                "-c",
+                r#"model_providers.spice.name="Spice""#,
+                "-c",
+                r#"model_providers.spice.base_url="http://127.0.0.1:8090/v1""#,
+                "-c",
+                r#"model_providers.spice.wire_api="responses""#,
+                "-c",
+                r#"model="qwen""#,
+            ]
+        );
+        // Without a runtime key Codex sends no credential at all.
+        assert!(launch.env.is_empty());
+    }
+
+    #[test]
+    fn codex_reads_the_runtime_key_from_the_environment_not_the_arguments() {
+        let models = models();
+        let launch = launch(
+            Agent::Codex,
+            &backend(&models, Some("sk-runtime")),
+            Path::new("/scratch"),
+        );
+        let args = args_of(&launch);
+        assert!(
+            args.contains(&r#"model_providers.spice.env_key="SPICE_API_KEY""#.to_string()),
+            "{args:?}"
+        );
+        assert!(
+            !args.iter().any(|arg| arg.contains("sk-runtime")),
+            "{args:?}"
+        );
+        assert_eq!(
+            env_of(&launch),
+            vec![("SPICE_API_KEY", "sk-runtime".to_string())]
+        );
+    }
+
+    #[test]
+    fn copilot_uses_its_bring_your_own_key_variables() {
+        let models = models();
+        let launch = launch(
+            Agent::CopilotCli,
+            &backend(&models, None),
+            Path::new("/scratch"),
+        );
+        assert_eq!(
+            env_of(&launch),
+            vec![
+                (
+                    "COPILOT_PROVIDER_BASE_URL",
+                    "http://127.0.0.1:8090/v1".to_string()
+                ),
+                ("COPILOT_PROVIDER_TYPE", "openai".to_string()),
+                ("COPILOT_PROVIDER_WIRE_API", "completions".to_string()),
+                ("COPILOT_PROVIDER_API_KEY", "spice".to_string()),
+                ("COPILOT_MODEL", "qwen".to_string()),
+            ]
+        );
+        assert_eq!(launch.env_remove, COPILOT_ENV_REMOVE);
+    }
+
+    #[test]
+    fn cursor_runs_authless_against_the_runtime() {
+        let models = models();
+        let launch = launch(
+            Agent::Cursor,
+            &backend(&models, None),
+            Path::new("/scratch"),
+        );
+        assert_eq!(args_of(&launch), vec!["--model", "qwen"]);
+        assert_eq!(
+            env_of(&launch),
+            vec![
+                (
+                    "CURSOR_LOCAL_AGENT_BASE_URL",
+                    "http://127.0.0.1:8090/v1".to_string()
+                ),
+                ("CURSOR_LOCAL_AGENT_API_KEY", "spice".to_string()),
+                ("CURSOR_ENABLE_AUTHLESS", "1".to_string()),
+            ]
+        );
+    }
+
+    #[test]
+    fn grok_signs_in_to_a_private_session_minted_from_the_runtime_key() {
+        let models = models();
+        let launch = launch(
+            Agent::Grok,
+            &backend(&models, Some("k'ey")),
+            Path::new("/scratch"),
+        );
+        assert_eq!(args_of(&launch), vec!["--model", "qwen"]);
+        assert_eq!(
+            env_of(&launch),
+            vec![
+                (
+                    "GROK_MODELS_BASE_URL",
+                    "http://127.0.0.1:8090/v1".to_string()
+                ),
+                ("XAI_API_KEY", "k'ey".to_string()),
+                ("GROK_AUTH_PATH", "/scratch/grok/auth.json".to_string()),
+                (
+                    "GROK_AUTH_PROVIDER_COMMAND",
+                    "/scratch/grok/token.sh".to_string()
+                ),
+                ("GROK_DEFAULT_MODEL", "qwen".to_string()),
+                ("GROK_SESSION_SUMMARY_MODEL", "qwen".to_string()),
+            ]
+        );
+        assert_eq!(
+            launch.files,
+            vec![LaunchFile {
+                path: PathBuf::from("/scratch/grok/token.sh"),
+                // The quote in the key is escaped, so the script prints it verbatim.
+                contents: "#!/bin/sh\nprintf '%s' 'k'\\''ey'\n".to_string(),
+                executable: true,
+            }]
+        );
+        assert_eq!(launch.prepare, Some(vec![OsString::from("login")]));
+    }
+
+    #[test]
+    fn opencode_gets_one_provider_with_every_spice_model() {
+        let models = models();
+        let launch = launch(
+            Agent::OpenCode,
+            &backend(&models, None),
+            Path::new("/scratch"),
+        );
+        let env = env_of(&launch);
+        assert_eq!(env.len(), 1);
+        assert_eq!(env[0].0, "OPENCODE_CONFIG_CONTENT");
+        let config: serde_json::Value =
+            serde_json::from_str(&env[0].1).expect("the inline config is JSON");
+        assert_eq!(
+            config,
+            json!({
+                "$schema": "https://opencode.ai/config.json",
+                "provider": {
+                    "spice": {
+                        "npm": "@ai-sdk/openai-compatible",
+                        "name": "Spice",
+                        "options": {
+                            "baseURL": "http://127.0.0.1:8090/v1",
+                            "apiKey": "spice",
+                        },
+                        "models": { "qwen": { "name": "qwen" }, "gpt": { "name": "gpt" } },
+                    }
+                },
+                "model": "spice/qwen",
+                "small_model": "spice/qwen",
+                "enabled_providers": ["spice"],
+            })
+        );
+    }
+
+    #[test]
+    fn pi_loads_an_extension_that_registers_the_runtime() {
+        let models = models();
+        let launch = launch(Agent::Pi, &backend(&models, None), Path::new("/scratch"));
+        assert_eq!(
+            args_of(&launch),
+            vec!["-e", "/scratch/pi/spice.ts", "--model", "spice/qwen"]
+        );
+        assert_eq!(launch.files.len(), 1);
+        let file = &launch.files[0];
+        assert_eq!(file.path, PathBuf::from("/scratch/pi/spice.ts"));
+        assert!(!file.executable);
+        insta::assert_snapshot!("pi_extension", file.contents);
+    }
+
+    #[test]
+    fn antigravity_uses_its_llm_gateway_mode_at_the_runtime_root() {
+        let models = models();
+        let launch = launch(
+            Agent::Antigravity,
+            &backend(&models, None),
+            Path::new("/scratch"),
+        );
+        assert_eq!(args_of(&launch), vec!["--model=qwen"]);
+        assert_eq!(
+            env_of(&launch),
+            vec![
+                ("AGY_LLM_GATEWAY_URL", ENDPOINT.to_string()),
+                ("AGY_LLM_GATEWAY_API_KEY", "spice".to_string()),
+            ]
+        );
+        // The CLI discovers the runtime's models itself: one it is told about
+        // is sent no tools.
+        assert_eq!(
+            launch.env_remove,
+            vec!["AGY_LLM_GATEWAY_HEADERS", "AGY_LLM_GATEWAY_MODELS"]
+        );
+    }
+
+    fn requested(agent: Agent, args: &[&str]) -> RequestedModel {
+        let args: Vec<OsString> = args.iter().map(OsString::from).collect();
+        requested_model(agent, &args)
+    }
+
+    #[test]
+    fn the_agents_own_model_option_names_the_spice_model() {
+        let named = |model: &str| RequestedModel::Spice(model.to_string());
+        assert_eq!(
+            requested(Agent::Codex, &["--yolo", "-m", "gpt"]),
+            named("gpt")
+        );
+        assert_eq!(requested(Agent::Codex, &["--model=gpt"]), named("gpt"));
+        assert_eq!(requested(Agent::Codex, &["-mgpt"]), named("gpt"));
+        assert_eq!(
+            requested(Agent::Grok, &["-p", "hi", "--model", "gpt"]),
+            named("gpt")
+        );
+        assert_eq!(
+            requested(Agent::ClaudeCode, &["--model", "gpt"]),
+            named("gpt")
+        );
+        // Claude Code has no `-m`, so it is the user's argument, not a model.
+        assert_eq!(
+            requested(Agent::ClaudeCode, &["-m", "gpt"]),
+            RequestedModel::Unspecified
+        );
+        // After `--` everything is positional for the agent.
+        assert_eq!(
+            requested(Agent::Codex, &["--", "-m", "gpt"]),
+            RequestedModel::Unspecified
+        );
+        assert_eq!(
+            requested(Agent::Codex, &["--yolo"]),
+            RequestedModel::Unspecified
+        );
+    }
+
+    #[test]
+    fn provider_qualified_models_are_read_back_to_the_spice_model() {
+        let named = |model: &str| RequestedModel::Spice(model.to_string());
+        assert_eq!(
+            requested(Agent::OpenCode, &["-m", "spice/gpt"]),
+            named("gpt")
+        );
+        assert_eq!(
+            requested(Agent::Pi, &["--model", "spice/gpt:high"]),
+            named("gpt")
+        );
+        // A colon that is not a thinking level is part of the model id.
+        assert_eq!(
+            requested(Agent::Pi, &["--model", "spice/qwen3:4b"]),
+            named("qwen3:4b")
+        );
+        // Another provider's model is the agent's business: nothing to validate.
+        assert_eq!(
+            requested(Agent::OpenCode, &["-m", "anthropic/claude"]),
+            RequestedModel::AgentOwned("anthropic/claude".to_string())
+        );
+        assert_eq!(
+            requested(Agent::ClaudeCode, &["--model", "opus[1m]"]),
+            RequestedModel::AgentOwned("opus[1m]".to_string())
+        );
+    }
+
+    #[test]
+    fn a_model_without_the_provider_its_agent_needs_is_recognized() {
+        assert_eq!(Agent::OpenCode.without_provider("qwen"), Some("qwen"));
+        assert_eq!(Agent::Pi.without_provider("qwen:high"), Some("qwen"));
+        assert_eq!(Agent::Pi.without_provider("qwen3:4b"), Some("qwen3:4b"));
+        assert_eq!(Agent::OpenCode.without_provider("spice/qwen"), None);
+        assert_eq!(Agent::OpenCode.without_provider("anthropic/claude"), None);
+        // Every other agent takes a bare model.
+        assert_eq!(Agent::Codex.without_provider("qwen"), None);
+
+        assert_eq!(Agent::OpenCode.model_argument("qwen"), "-m spice/qwen");
+        assert_eq!(Agent::Pi.model_argument("qwen"), "--model spice/qwen");
+        assert_eq!(Agent::Codex.model_argument("qwen"), "--model qwen");
+    }
+
+    #[test]
+    fn a_model_the_user_named_is_not_named_again() {
+        let models = models();
+        let mut given = backend(&models, None);
+        given.model_given = true;
+        for agent in [Agent::Cursor, Agent::Grok, Agent::Antigravity] {
+            let args = args_of(&launch(agent, &given, Path::new("/scratch")));
+            assert!(
+                !args.iter().any(|arg| arg.starts_with("--model")),
+                "{agent:?}: {args:?}"
+            );
+        }
+        assert_eq!(
+            args_of(&launch(Agent::Pi, &given, Path::new("/scratch"))),
+            vec!["-e", "/scratch/pi/spice.ts"]
+        );
+        // Codex sets its default as config, which the user's `--model` overrides.
+        assert!(
+            args_of(&launch(Agent::Codex, &given, Path::new("/scratch")))
+                .contains(&r#"model="qwen""#.to_string())
+        );
+    }
+
+    #[test]
+    fn a_reported_context_window_reaches_each_agent_that_takes_one() {
+        let models = models();
+        let windows = HashMap::from([
+            ("qwen".to_string(), limits(40_960, None)),
+            ("gpt".to_string(), limits(400_000, None)),
+        ]);
+        let mut sized = backend(&models, None);
+        sized.limits = &windows;
+        let scratch = Path::new("/scratch");
+
+        let claude = env_of(&launch(Agent::ClaudeCode, &sized, scratch));
+        assert!(
+            claude.contains(&("CLAUDE_CODE_MAX_CONTEXT_TOKENS", "40960".to_string())),
+            "{claude:?}"
+        );
+        let codex = args_of(&launch(Agent::Codex, &sized, scratch));
+        assert!(
+            codex.contains(&"model_context_window=40960".to_string()),
+            "{codex:?}"
+        );
+        let copilot = env_of(&launch(Agent::CopilotCli, &sized, scratch));
+        assert!(
+            copilot.contains(&("COPILOT_PROVIDER_MAX_PROMPT_TOKENS", "40960".to_string())),
+            "{copilot:?}"
+        );
+        // pi takes one per model.
+        let pi = launch(Agent::Pi, &sized, scratch);
+        assert!(
+            pi.files[0].contents.contains(r#""contextWindow":40960"#),
+            "{}",
+            pi.files[0].contents
+        );
+        assert!(
+            pi.files[0].contents.contains(r#""contextWindow":400000"#),
+            "{}",
+            pi.files[0].contents
+        );
+
+        // Without a reported window, nothing is said: the agents keep their own defaults.
+        let unsized_claude = env_of(&launch(Agent::ClaudeCode, &backend(&models, None), scratch));
+        assert!(
+            !unsized_claude
+                .iter()
+                .any(|(key, _)| *key == "CLAUDE_CODE_MAX_CONTEXT_TOKENS")
+        );
+        let unsized_codex = args_of(&launch(Agent::Codex, &backend(&models, None), scratch));
+        assert!(
+            !unsized_codex
+                .iter()
+                .any(|arg| arg.starts_with("model_context_window"))
+        );
+    }
+
+    /// A model's output cap reaches each agent that takes one, and narrows what Copilot
+    /// lets a prompt hold to what the cap leaves of the window.
+    #[test]
+    fn a_reported_output_cap_reaches_each_agent_that_takes_one() {
+        let models = models();
+        let windows = HashMap::from([
+            ("qwen".to_string(), limits(40_960, None)),
+            ("gpt".to_string(), limits(400_000, None)),
+        ]);
+        let capped_limits = HashMap::from([
+            ("qwen".to_string(), limits(40_960, Some(8_192))),
+            ("gpt".to_string(), limits(400_000, None)),
+        ]);
+        let mut capped = backend(&models, None);
+        capped.limits = &capped_limits;
+        let scratch = Path::new("/scratch");
+
+        let claude = env_of(&launch(Agent::ClaudeCode, &capped, scratch));
+        assert!(
+            claude.contains(&("CLAUDE_CODE_MAX_OUTPUT_TOKENS", "8192".to_string())),
+            "{claude:?}"
+        );
+        let copilot = env_of(&launch(Agent::CopilotCli, &capped, scratch));
+        assert!(
+            copilot.contains(&("COPILOT_PROVIDER_MAX_PROMPT_TOKENS", "32768".to_string()))
+                && copilot.contains(&("COPILOT_PROVIDER_MAX_OUTPUT_TOKENS", "8192".to_string())),
+            "{copilot:?}"
+        );
+        let opencode = env_of(&launch(Agent::OpenCode, &capped, scratch));
+        let config: serde_json::Value =
+            serde_json::from_str(&opencode[0].1).expect("an inline config");
+        assert_eq!(
+            config["provider"]["spice"]["models"],
+            json!({
+                "qwen": {"name": "qwen", "limit": {"context": 40_960, "output": 8_192}},
+                // A window without a cap is not enough for OpenCode's `limit`.
+                "gpt": {"name": "gpt"},
+            })
+        );
+        let pi = launch(Agent::Pi, &capped, scratch);
+        assert!(
+            pi.files[0]
+                .contents
+                .contains(r#""contextWindow":40960,"maxTokens":8192"#),
+            "{}",
+            pi.files[0].contents
+        );
+        assert!(
+            pi.files[0]
+                .contents
+                .contains(r#""contextWindow":400000,"maxTokens":16384"#),
+            "pi's own answer limit for a model without a cap: {}",
+            pi.files[0].contents
+        );
+
+        // Without a cap, Claude Code keeps its own and Copilot's prompt limit is the window.
+        let mut uncapped = backend(&models, None);
+        uncapped.limits = &windows;
+        assert!(
+            !env_of(&launch(Agent::ClaudeCode, &uncapped, scratch))
+                .iter()
+                .any(|(key, _)| *key == "CLAUDE_CODE_MAX_OUTPUT_TOKENS")
+        );
+        let copilot = env_of(&launch(Agent::CopilotCli, &uncapped, scratch));
+        assert!(
+            copilot.contains(&("COPILOT_PROVIDER_MAX_PROMPT_TOKENS", "40960".to_string()))
+                && !copilot
+                    .iter()
+                    .any(|(key, _)| *key == "COPILOT_PROVIDER_MAX_OUTPUT_TOKENS"),
+            "{copilot:?}"
+        );
+    }
+
+    #[test]
+    fn every_agent_has_a_distinct_command() {
+        let mut commands: Vec<&str> = Agent::ALL.iter().map(|agent| agent.command()).collect();
+        commands.sort_unstable();
+        commands.dedup();
+        assert_eq!(commands.len(), Agent::ALL.len());
+    }
+
+    #[test]
+    fn toml_strings_escape_quotes_and_backslashes() {
+        assert_eq!(toml_string(r#"a"b\c"#), r#""a\"b\\c""#);
+    }
+}

@@ -1,0 +1,70 @@
+name: snapshots
+description: >
+  A Cayenne acceleration with snapshots enabled writes a snapshot after each
+  refresh; started on empty local storage with its source down, it bootstraps from the newest snapshot and
+  serves that data; once the source is back a refresh catches up.
+
+sources:
+  src: { kind: postgres }
+
+spicepod:
+  version: v1
+  kind: Spicepod
+  name: snapshots
+  snapshots:
+    enabled: true
+    location: file://${instance.dir}/snapshots/
+  datasets:
+    - from: postgres:public.t
+      name: t
+      params: ${sources.src.params}
+      acceleration:
+        enabled: true
+        engine: cayenne
+        mode: file
+        refresh_mode: full
+        snapshots: enabled
+        params:
+          cayenne_file_path: ${instance.dir}/accel-1/data
+          cayenne_metadata_dir: ${instance.dir}/accel-1/meta
+
+defaults:
+  expect: { oracle: src }
+
+steps:
+  - source-exec:
+      src: |
+        CREATE TABLE t (id int PRIMARY KEY, v text, n numeric(10, 2));
+        INSERT INTO t SELECT i, 'v' || i, i * 1.25 FROM generate_series(1, 500) i;
+  - start: {}
+  - query: SELECT id, v, n FROM t
+  - assert-log: { contains: 'Snapshot created dataset=t' }
+    eventually: 30s
+  - assert-files: { contains: '^snapshots/month=.*/dataset=t/t_.*\.cayenne$' }
+
+  # Refreshes, one changing the data; the last snapshot holds the change.
+  - refresh: t
+  - source-exec: { src: "UPDATE t SET v = 'changed' WHERE id <= 50; DELETE FROM t WHERE id > 450" }
+  - refresh: t
+  - query: SELECT id, v, n FROM t
+    id: latest
+
+  # Empty local storage, source down: bootstrapped from the snapshot.
+  - stop: {}
+  - stop-source: src
+  - start:
+      ready: false
+      patch:
+        datasets:
+          t: { acceleration: { params: { cayenne_file_path: '${instance.dir}/accel-2/data', cayenne_metadata_dir: '${instance.dir}/accel-2/meta' } } }
+  - query: SELECT id, v, n FROM t
+    expect: { same-as: latest }
+    eventually: 60s
+  - assert-files: { contains: '^accel-2/' }
+
+  # The source returns: a refresh catches up with its changes.
+  - start-source: src
+  - source-exec: { src: "INSERT INTO t VALUES (1000, 'after', 1.00)" }
+  - refresh: t
+  - query: SELECT id, v, n FROM t
+    eventually: 60s

@@ -23,9 +23,12 @@ limitations under the License.
 //! [`MemoryPool`] the query executed under and applies light back-pressure when
 //! the pool is under real pressure.
 
-use std::sync::Arc;
+use std::{borrow::Borrow, sync::Arc};
 
+use arrow::array::RecordBatch;
+use datafusion::error::DataFusionError;
 use datafusion::execution::memory_pool::{MemoryConsumer, MemoryPool, MemoryReservation};
+use futures::{Stream, StreamExt};
 
 /// Cooperative yields [`EgressAccount::reserve`] makes while the pool is full
 /// before it over-commits, so it never blocks egress waiting for pool space.
@@ -77,6 +80,22 @@ impl EgressAccount {
         self.reservation.grow(bytes);
     }
 
+    /// Reserve `bytes` from `Stream::poll_next`, which cannot await.
+    ///
+    /// Tries the pool once, then over-commits with `grow` — the same last
+    /// resort [`Self::reserve`] uses after its yield loop. Used by the inline
+    /// Flight encoder, which queues schema and batch messages on the request
+    /// task as the client polls.
+    pub(crate) fn reserve_now(&self, bytes: usize) {
+        if bytes == 0 {
+            return;
+        }
+        if self.reservation.try_grow(bytes).is_ok() {
+            return;
+        }
+        self.reservation.grow(bytes);
+    }
+
     /// Release `bytes` once the chunk has been handed downstream. Never shrinks
     /// past the current reservation size (which would panic).
     pub(crate) fn release(&self, bytes: usize) {
@@ -86,4 +105,26 @@ impl EgressAccount {
         let to_free = bytes.min(self.reservation.size());
         self.reservation.shrink(to_free);
     }
+}
+
+/// Collects a result that is sent only once complete, growing `reservation` by
+/// each batch's size and failing with the pool's resources-exhausted error when
+/// the pool refuses. Hold `reservation` for as long as the batches live.
+pub(crate) async fn collect_reserved<S, B>(
+    batches: S,
+    reservation: &MemoryReservation,
+) -> Result<Vec<RecordBatch>, DataFusionError>
+where
+    S: Stream<Item = Result<B, DataFusionError>>,
+    B: Borrow<RecordBatch>,
+{
+    let mut batches = std::pin::pin!(batches);
+    let mut data = Vec::new();
+    while let Some(batch) = batches.next().await {
+        let batch = batch?;
+        let batch: &RecordBatch = batch.borrow();
+        reservation.try_grow(batch.get_array_memory_size())?;
+        data.push(batch.clone());
+    }
+    Ok(data)
 }

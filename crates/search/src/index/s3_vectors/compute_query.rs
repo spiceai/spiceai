@@ -29,13 +29,12 @@ impl ComputeQueryVector for EmbedQuery {
         &self,
         query: &str,
     ) -> Result<Vec<f32>, Box<dyn std::error::Error + Send + Sync>> {
-        let Some(vec) = self
+        let embeddings = self
             .0
             .embed(llms::embeddings::EmbeddingInput::String(query.to_string()))
             .await
-            .boxed()?
-            .pop()
-        else {
+            .boxed()?;
+        let Some(vec) = embeddings.first().cloned() else {
             return Err(Box::from(
                 "no embedding vector created for query".to_string(),
             ));

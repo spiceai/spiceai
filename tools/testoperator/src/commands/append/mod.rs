@@ -16,24 +16,49 @@ limitations under the License.
 
 use super::get_app_and_start_request;
 use crate::{args::AppendTestArgs, health::HealthMonitor};
-use std::time::Duration;
+use std::{
+    sync::Arc,
+    time::{Duration, Instant},
+};
 use test_framework::{
     TestType,
     anyhow::{self, Context},
     app::App,
-    arrow::{self, array::AsArray, util::pretty::print_batches},
+    arrow::{
+        self,
+        array::{AsArray, RecordBatch},
+        util::pretty::print_batches,
+    },
+    execution::{FlightExecutor, QueryExecutor},
     futures::TryStreamExt,
     metrics::{MetricCollector, NoExtendedMetrics, QueryMetrics},
     opentelemetry::KeyValue,
     opentelemetry_sdk::Resource,
-    queries::{QueryOverrides, QuerySet, TableWithRowCount},
+    queries::{
+        QueryOverrides, QuerySet, TableWithRowCount,
+        validation::{self, QueryValidationResult},
+    },
     spiced::SpicedInstance,
     spicepod::acceleration::RefreshMode,
-    spicetest::{SpiceTest, append::NotStarted},
+    spicetest::{
+        SpiceTest,
+        append::{NotStarted, tpch_conflict_markers},
+    },
     telemetry::Telemetry,
     tokio_util::sync::CancellationToken,
     utils::observe_memory,
 };
+
+/// How long to wait for the tables to reach their expected contents. The last
+/// load's refresh can still be in flight when the loads finish.
+const VERIFICATION_SETTLE_TIMEOUT: Duration = Duration::from_mins(3);
+
+/// How often to re-count the tables while waiting for them to settle.
+const VERIFICATION_POLL_INTERVAL: Duration = Duration::from_secs(5);
+
+/// How many rows of a failing query's result to print. A TPC-H answer can run to
+/// thousands of rows, and the failure reason names the first row that diverged.
+const MAX_PRINTED_FAILURE_ROWS: usize = 20;
 
 pub(crate) async fn run(args: &AppendTestArgs) -> anyhow::Result<()> {
     if args.test_args.common.concurrency == 0 {
@@ -141,10 +166,13 @@ pub(crate) async fn run(args: &AppendTestArgs) -> anyhow::Result<()> {
         test_metrics = test_metrics.with_memory(max_memory, median_memory);
     }
 
-    let table_count_result = check_table_counts(
+    let verification_result = verify_appended_data(
         &spiced_instance,
         &query_set,
+        query_overrides,
         args.test_args.scale_factor.unwrap_or(1.0),
+        args.test_args.validate,
+        args.with_conflict_data,
     )
     .await;
 
@@ -157,14 +185,14 @@ pub(crate) async fn run(args: &AppendTestArgs) -> anyhow::Result<()> {
 
     let health_report = health_monitor.stop().await;
 
-    // Test passes only if: (1) table row counts match expected values and (2) all queries succeeded
-    let test_status: TestStatus = (table_count_result.is_ok() && test_succeeded).into();
+    // Test passes only if the appended data verifies and every query succeeded.
+    let test_status: TestStatus = (verification_result.is_ok() && test_succeeded).into();
     test_metrics.emit(test_status).await?;
 
     spiced_instance.stop()?;
     let health_report = health_report?;
 
-    table_count_result?;
+    verification_result?;
     if let Some(message) = health_report.failure_message() {
         // Health check failures are logged as warnings but don't fail the test
         eprintln!("Warning: {message}");
@@ -324,14 +352,49 @@ fn check_app_is_appendable(app: &App) -> anyhow::Result<()> {
     Ok(())
 }
 
-async fn check_table_counts(
+/// Verifies the data the append test left behind.
+///
+/// Row counts prove only that the right *amount* of data arrived. Comparing the
+/// query results against the expected answers proves the right *data* arrived:
+/// a duplicated append, a retention policy deleting the wrong row, or a
+/// corrupted column can all land on the expected row count.
+///
+/// Under `--with-conflict-data` it also covers conflict resolution: the copy an
+/// upsert must discard carries a negated queried column, so keeping it shows up
+/// in the query results.
+async fn verify_appended_data(
     spiced: &SpicedInstance,
     query_set: &QuerySet,
+    query_overrides: Option<QueryOverrides>,
     scale_factor: f64,
+    validate_results: bool,
+    with_conflict_data: bool,
 ) -> anyhow::Result<()> {
-    let spice_client = spiced.spice_client(None, false).await?;
+    println!("Verifying appended data");
 
-    let mut any_count_mismatch = false;
+    // The same queries ran throughout the test against partially loaded data, so
+    // a cached result would report an earlier load step.
+    let spice_client = Arc::new(spiced.spice_client(None, true).await?);
+
+    wait_for_appended_data(&spice_client, query_set, scale_factor, with_conflict_data).await?;
+
+    if !validate_results {
+        println!("Skipping query result verification, pass --validate to enable it");
+        return Ok(());
+    }
+
+    check_query_results(&spice_client, query_set, query_overrides, scale_factor).await
+}
+
+/// Counts every table in the query set, describing those outside a 0.01% margin
+/// of the expected count.
+async fn table_count_mismatches(
+    spice_client: &spiceai::Client,
+    query_set: &QuerySet,
+    scale_factor: f64,
+) -> anyhow::Result<Vec<String>> {
+    let mut mismatches = Vec::new();
+
     for TableWithRowCount {
         name,
         count: expected_count,
@@ -361,16 +424,195 @@ async fn check_table_counts(
         let upper_bound = expected_count * 1.0001;
         let lower_bound = expected_count * 0.9999;
         if !(count <= upper_bound && count >= lower_bound) {
-            println!("Table {name} has {count} rows, expected {expected_count}");
-            any_count_mismatch = true;
+            mismatches.push(format!(
+                "table {name} has {count} rows, expected {expected_count}"
+            ));
         }
     }
 
-    if any_count_mismatch {
+    Ok(mismatches)
+}
+
+/// Counts the conflicting rows still present in each table that has them. Each
+/// one is a copy the last load supersedes, so a table holding any has not yet
+/// applied that load's upsert. Row counts can't show this: a superseded copy
+/// takes up the same key, so the table already holds its final row count.
+async fn conflict_row_mismatches(spice_client: &spiceai::Client) -> anyhow::Result<Vec<String>> {
+    let mut mismatches = Vec::new();
+
+    for marker in tpch_conflict_markers() {
+        let sql = format!(
+            "SELECT COUNT(*) FROM {} WHERE {}",
+            marker.table,
+            marker.predicate()
+        );
+        let batches = spice_client
+            .sql(&sql)
+            .await?
+            .try_collect::<Vec<_>>()
+            .await?;
+        let count = batches
+            .first()
+            .and_then(|batch| {
+                batch
+                    .column(0)
+                    .as_primitive_opt::<arrow::datatypes::Int64Type>()
+            })
+            .context("Failed to get count as a Int64Type")?
+            .value(0);
+        if count > 0 {
+            mismatches.push(format!(
+                "table {} still has {count} superseded conflicting rows",
+                marker.table
+            ));
+        }
+    }
+
+    Ok(mismatches)
+}
+
+/// Waits, up to [`VERIFICATION_SETTLE_TIMEOUT`], for every table to reach its
+/// expected row count and, with conflict data, to hold no superseded rows, so
+/// verification runs against the fully loaded dataset.
+async fn wait_for_appended_data(
+    spice_client: &spiceai::Client,
+    query_set: &QuerySet,
+    scale_factor: f64,
+    with_conflict_data: bool,
+) -> anyhow::Result<()> {
+    let start = Instant::now();
+    let deadline = start + VERIFICATION_SETTLE_TIMEOUT;
+    let mismatches = loop {
+        let mut mismatches = table_count_mismatches(spice_client, query_set, scale_factor).await?;
+        if with_conflict_data && matches!(query_set, QuerySet::Tpch) {
+            mismatches.extend(conflict_row_mismatches(spice_client).await?);
+        }
+        if mismatches.is_empty() || Instant::now() >= deadline {
+            break mismatches;
+        }
+
+        println!(
+            "Waiting for appended data to settle ({:?} elapsed): {}",
+            start.elapsed(),
+            mismatches.join("; ")
+        );
+        tokio::time::sleep(VERIFICATION_POLL_INTERVAL).await;
+    };
+
+    if !mismatches.is_empty() {
         return Err(anyhow::anyhow!(
-            "Table row counts do not match expected values"
+            "Appended data did not settle within {VERIFICATION_SETTLE_TIMEOUT:?}: {}",
+            mismatches.join("; ")
         ));
     }
 
+    println!("Appended data settled after {:?}", start.elapsed());
     Ok(())
+}
+
+/// Runs each query once against the appended data and compares the result
+/// against its expected answer.
+async fn check_query_results(
+    spice_client: &Arc<spiceai::Client>,
+    query_set: &QuerySet,
+    query_overrides: Option<QueryOverrides>,
+    scale_factor: f64,
+) -> anyhow::Result<()> {
+    let queries = query_set
+        .get_queries(query_overrides, None, None, Some(scale_factor))
+        .await?;
+    let executor = FlightExecutor::new(Arc::clone(spice_client));
+
+    println!(
+        "Verifying {} query results against the expected answers",
+        queries.len()
+    );
+
+    let mut skipped = Vec::new();
+    let mut failures = Vec::new();
+
+    for query in &queries {
+        // Gate before running the query, so a query that can't be validated
+        // isn't executed for a result nothing compares.
+        if !validation::should_validate_with_static_tpch_answer(query, scale_factor) {
+            skipped.push(query.name.as_ref());
+            continue;
+        }
+
+        let batches = match executor.execute(query, true).await {
+            Ok(result) => result.batches.unwrap_or_default(),
+            Err(e) => {
+                eprintln!("Query '{}' failed to run: {e}", query.name);
+                failures.push(format!("{}: failed to run: {e}", query.name));
+                continue;
+            }
+        };
+
+        if let QueryValidationResult::Fail(reason) =
+            validation::validate_tpch_query(query, &batches)?
+        {
+            eprintln!("\nQuery '{}' returned unexpected results", query.name);
+            eprintln!("Query SQL: {}", query.sql);
+            eprintln!("Validation failure reason: {reason:?}");
+            eprintln!("\nActual results:");
+            print_result_head(&batches);
+            eprintln!();
+            failures.push(format!("{}: {reason:?}", query.name));
+        }
+    }
+
+    let validated = queries.len() - skipped.len() - failures.len();
+    println!(
+        "Verified {validated}/{total} query results ({skipped_count} skipped, {failed_count} failed)",
+        total = queries.len(),
+        skipped_count = skipped.len(),
+        failed_count = failures.len(),
+    );
+
+    if !failures.is_empty() {
+        return Err(anyhow::anyhow!(
+            "Query results do not match expected values: {}",
+            failures.join("; ")
+        ));
+    }
+
+    if validated == 0 {
+        eprintln!(
+            "Warning: no {query_set} query has an expected answer at scale factor {scale_factor}, so the appended data was verified by row count only"
+        );
+    } else if !skipped.is_empty() {
+        println!(
+            "Skipped {count} queries with no expected answer at scale factor {scale_factor}: {names}",
+            count = skipped.len(),
+            names = skipped.join(", "),
+        );
+    }
+
+    Ok(())
+}
+
+/// Prints the first [`MAX_PRINTED_FAILURE_ROWS`] rows of a query result, so a
+/// large result doesn't bury the rest of the run's output.
+fn print_result_head(batches: &[RecordBatch]) {
+    let mut head = Vec::new();
+    let mut remaining = MAX_PRINTED_FAILURE_ROWS;
+    for batch in batches {
+        if remaining == 0 {
+            break;
+        }
+
+        let rows = remaining.min(batch.num_rows());
+        head.push(batch.slice(0, rows));
+        remaining -= rows;
+    }
+
+    match arrow::util::pretty::pretty_format_batches(&head) {
+        Ok(pretty) => eprintln!("{pretty}"),
+        Err(e) => eprintln!("Failed to format actual results: {e}"),
+    }
+
+    let total_rows: usize = batches.iter().map(RecordBatch::num_rows).sum();
+    if total_rows > MAX_PRINTED_FAILURE_ROWS {
+        eprintln!("... {} more rows", total_rows - MAX_PRINTED_FAILURE_ROWS);
+    }
 }

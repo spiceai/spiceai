@@ -29,7 +29,6 @@ use async_openai::types::embeddings::{
 use async_trait::async_trait;
 use cache::{CacheProvider, key::CacheKey, result::embeddings::CachedEmbeddingResult};
 use chunking::{Chunker, ChunkingConfig, RecursiveSplittingChunker};
-use hf_hub::api::tokio::ApiError as HfApiError;
 use snafu::{ResultExt, Snafu};
 use tokio::{runtime::Handle, task};
 
@@ -80,10 +79,12 @@ pub enum Error {
         source: Box<dyn std::error::Error + Send + Sync>,
     },
 
-    #[snafu(display(
-        "When preparing an embedding model, an issue occurred with the Huggingface API. {source}. Verify the model configuration, and try again."
-    ))]
-    FailedWithHFApi { source: HfApiError },
+    /// Downloading the model from the Hugging Face Hub failed. The source names the model, the
+    /// cause and the fix, so it is the whole message.
+    #[snafu(display("{source}"))]
+    FailedToDownloadModel {
+        source: Box<dyn std::error::Error + Send + Sync>,
+    },
 
     #[snafu(display(
         "An unsupported model source was specified in the 'from' parameter: '{from}'. Specify a valid source, like 'openai', and try again. For details, visit: https://spiceai.org/docs/components/embeddings"
@@ -163,7 +164,7 @@ pub fn encode_embedding(format: &EncodingFormat, array: Vec<f32>) -> EmbeddingVe
 
 #[async_trait]
 pub trait Embed: Debug + Sync + Send {
-    async fn embed(&self, input: EmbeddingInput) -> Result<Vec<Vec<f32>>>;
+    async fn embed(&self, input: EmbeddingInput) -> Result<Arc<Vec<Vec<f32>>>>;
 
     fn cache(&self) -> Option<Arc<dyn CacheProvider<CachedEmbeddingResult> + Send + Sync>> {
         None
@@ -185,12 +186,14 @@ pub trait Embed: Debug + Sync + Send {
         }
     }
 
-    async fn get_cached_embed(&self, key: CacheKey<'_>) -> Option<CachedEmbeddingResult> {
+    async fn get_cached_embed(&self, key: CacheKey<'_>) -> Option<Arc<CachedEmbeddingResult>> {
         if let Some(embeddings_cache) = self.cache()
             && let Some(cached) = embeddings_cache
                 .get_raw_key(&key.as_raw_key(embeddings_cache.hasher()).as_u64())
                 .await
         {
+            // Return the shared `Arc` so hit paths can `Arc::clone` the inner
+            // payload without deep-cloning while the cache still holds a ref.
             return Some(cached);
         }
 
@@ -211,7 +214,7 @@ pub trait Embed: Debug + Sync + Send {
     /// # Errors
     ///
     /// Returns whatever [`Self::embed`] returns.
-    fn embed_sync(&self, input: EmbeddingInput) -> Result<Vec<Vec<f32>>> {
+    fn embed_sync(&self, input: EmbeddingInput) -> Result<Arc<Vec<Vec<f32>>>> {
         task::block_in_place(move || Handle::current().block_on(self.embed(input)))
     }
 
@@ -255,14 +258,20 @@ pub trait Embed: Debug + Sync + Send {
     /// An OpenAI-compatible interface for the embedding trait. If not implemented, the default
     /// implementation will be constructed based on the trait's [`embed`] method.
     #[expect(clippy::cast_possible_truncation)]
-    async fn embed_request(&self, req: CreateEmbeddingRequest) -> Result<CreateEmbeddingResponse> {
+    async fn embed_request(
+        &self,
+        req: CreateEmbeddingRequest,
+    ) -> Result<Arc<CreateEmbeddingResponse>> {
         let format = req.encoding_format.unwrap_or_default();
         let result = self.embed(req.input).await?;
 
-        Ok(CreateEmbeddingResponse {
+        Ok(Arc::new(CreateEmbeddingResponse {
             object: "list".to_string(),
             model: req.model.clone(),
-            data: result
+            // `unwrap_or_clone` so an uncached result, which owns its `Arc`
+            // alone, moves its vectors here instead of copying every one of
+            // them; a result shared with the cache still clones.
+            data: Arc::unwrap_or_clone(result)
                 .into_iter()
                 .enumerate()
                 .map(|(i, emb)| Embedding {
@@ -275,6 +284,6 @@ pub trait Embed: Debug + Sync + Send {
                 prompt_tokens: 0,
                 total_tokens: 0,
             },
-        })
+        }))
     }
 }

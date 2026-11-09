@@ -14,7 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use std::sync::Arc;
+use std::{collections::HashSet, sync::Arc};
 
 use app::{App, AppBuilder};
 use spicepod::component::{
@@ -25,6 +25,8 @@ use spicepod::component::{
 };
 
 use crate::Runtime;
+use crate::component::{component_accelerations, deprecated_acceleration_engines_warning};
+use crate::config::ClusterRole;
 
 /// What a reload leaves behind when a start-time-only section changes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -55,6 +57,9 @@ fn start_time_only_changes(
         tracing: tracing_config,
         telemetry,
         params,
+        // Cayenne resolves the tuning mode when a dataset or catalog is loaded, so a change
+        // reaches only components that are recreated, exactly as a `params` change does.
+        adaptive_tuning,
         task_history,
         auth,
         cors,
@@ -69,6 +74,7 @@ fn start_time_only_changes(
         query,
         cpu,
         metrics,
+        state,
         scheduler,
         source_rate_control,
         drasi,
@@ -101,6 +107,11 @@ fn start_time_only_changes(
             "runtime.params",
             ProcessAndRecreatedComponents,
             *params != current.params,
+        ),
+        (
+            "runtime.adaptive_tuning",
+            ProcessAndRecreatedComponents,
+            *adaptive_tuning != current.adaptive_tuning,
         ),
         (
             "runtime.task_history",
@@ -144,11 +155,17 @@ fn start_time_only_changes(
             !same_start_time_config(cpu.as_ref(), current.cpu.as_ref()),
         ),
         ("runtime.metrics", Process, *metrics != current.metrics),
+        // Read once at startup by the scheduler, results-cache warmup, and
+        // cluster HTTP rate control. A reload rebuilds none of them, so
+        // rate-control state stays at the old location until a restart.
+        ("runtime.state", Process, *state != current.state),
         (
             "runtime.scheduler",
             Process,
             *scheduler != current.scheduler,
         ),
+        // `refresh_interval` is read once at startup; a GitHub connector the
+        // reload recreates re-reads `github_concurrent_connections_limit`.
         (
             "runtime.source_rate_control",
             ProcessAndRecreatedComponents,
@@ -215,6 +232,20 @@ fn start_time_query(query: Option<&Query>) -> Query {
     query
 }
 
+/// The deprecated-engine warning for a reload from `current` to `new`: it names only the
+/// datasets and views the reload adds or changes, since startup (or an earlier reload)
+/// already named the rest.
+fn reload_deprecated_engines_warning(current: &App, new: &App) -> Option<String> {
+    deprecated_acceleration_engines_warning(component_accelerations(
+        new.datasets
+            .iter()
+            .filter(|ds| !current.datasets.contains(ds)),
+        new.views
+            .iter()
+            .filter(|view| !current.views.contains(view)),
+    ))
+}
+
 fn warn_on_start_time_only_changes(current: &SpicepodRuntime, new: &SpicepodRuntime) {
     for (section, scope) in start_time_only_changes(current, new) {
         match scope {
@@ -254,8 +285,8 @@ impl Runtime {
     }
 
     /// Hot-apply a new [`App`] to the running runtime, reconciling catalogs,
-    /// datasets, views, models, functions, and (without the `models` feature)
-    /// workers against the currently-loaded app.
+    /// datasets, views, tools, functions, models, and (with the `models`
+    /// feature) workers against the currently-loaded app.
     ///
     /// This is the diff-based reconcile the pods watcher performs when a
     /// spicepod file changes on disk, and the one a Spice Cloud deployment takes
@@ -298,6 +329,7 @@ impl Runtime {
         current_app: Option<&Arc<App>>,
         new_app: Arc<App>,
     ) -> bool {
+        let mut models_to_reload = None;
         if let Some(current_app) = current_app {
             if *current_app == new_app {
                 return false;
@@ -310,33 +342,77 @@ impl Runtime {
             // running. Say so rather than silently ignoring the edit.
             warn_on_start_time_only_changes(&current_app.runtime, &new_app.runtime);
 
+            // Startup warned about the components already loaded, so name only the ones
+            // this reload adds or changes. An executor runs the scheduler's spicepod,
+            // whose own log carries the warning.
+            if self.df.cluster_config.effective_role() != Some(ClusterRole::Executor)
+                && let Some(warning) = reload_deprecated_engines_warning(current_app, &new_app)
+            {
+                tracing::warn!("{warning}");
+            }
+
             Arc::clone(&self)
                 .apply_catalog_diff(current_app, &new_app)
                 .await;
-            Arc::clone(&self)
+            let reloaded_datasets = Arc::clone(&self)
                 .apply_dataset_diff(current_app, &new_app)
                 .await;
             Arc::clone(&self)
-                .apply_view_diff(current_app, &new_app)
+                .apply_view_diff(current_app, &new_app, &reloaded_datasets)
                 .await;
-            self.apply_model_diff(current_app, &new_app).await;
+            // Tools and functions first: a model gets its tools when it loads.
+            let changed_tools = self.apply_tool_diff(current_app, &new_app).await;
             crate::datafusion::udf::apply_function_diff(&self, current_app, &new_app).await;
+            let changed_function_tools = changed_function_tools(current_app, &new_app);
+            let loaded_models = self.apply_model_diff(current_app, &new_app).await;
+            models_to_reload = Some((changed_tools, changed_function_tools, loaded_models));
 
-            if !cfg!(feature = "models") {
+            if cfg!(feature = "models") {
                 Arc::clone(&self)
                     .apply_worker_diff(current_app, &new_app)
                     .await;
             }
         }
 
-        *self.app.write().await = Some(new_app);
+        *self.app.write().await = Some(Arc::clone(&new_app));
+        self.search_primary_keys.update(Arc::clone(&self.app)).await;
+
+        // After the swap: `auto` and `all` resolve against the installed app's `tools:`.
+        if let Some((changed_tools, changed_function_tools, loaded_models)) = models_to_reload {
+            self.reload_models_using_tools(
+                &new_app,
+                &changed_tools,
+                &changed_function_tools,
+                &loaded_models,
+            )
+            .await;
+        }
 
         true
     }
 }
 
+/// Names of the functions exposed as tools that `new_app` adds, removes or changes.
+fn changed_function_tools(current_app: &App, new_app: &App) -> HashSet<String> {
+    let enabled_changed =
+        current_app.runtime.functions.enabled != new_app.runtime.functions.enabled;
+    current_app
+        .functions
+        .iter()
+        .chain(&new_app.functions)
+        .filter(|f| f.as_tool)
+        .filter(|f| {
+            enabled_changed
+                || current_app.functions.iter().find(|c| c.name == f.name)
+                    != new_app.functions.iter().find(|n| n.name == f.name)
+        })
+        .map(|f| f.name.clone())
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
+    use std::collections::HashMap;
     use std::io::Write;
 
     use parking_lot::Mutex;
@@ -345,20 +421,22 @@ mod tests {
             caching::{CacheConfig, SQLResultsCacheConfig},
             runtime::{
                 ApiKey, ApiKeyAuth, Auth, Cpu, CpuQuantity, Flight, McpConfig, OutputLevel,
-                RuntimeReadyState, Scheduler, SourceRateControl, TlsConfig, TracingConfig,
-                default_max_partition_assignments_per_interval,
+                RuntimeReadyState, RuntimeState, Scheduler, SourceRateControl, TlsConfig,
+                TracingConfig, default_max_partition_assignments_per_interval,
                 default_max_partitions_per_executor, default_partition_assignment_interval,
                 default_partition_discovery_timeout,
             },
         },
         drasi::{DrasiForwarding, DrasiTransport, RuntimeDrasi},
         metric::{Metric, Metrics},
+        param::Params,
     };
     use tracing_subscriber::fmt::MakeWriter;
 
     use super::{
         Arc, CacheKeyType, Query, SpicepodRuntime, StartTimeScope, UserAgentCollection,
-        start_time_only_changes, warn_on_start_time_only_changes,
+        reload_deprecated_engines_warning, start_time_only_changes,
+        warn_on_start_time_only_changes,
     };
 
     /// An edit to one setting of a spicepod `runtime:` section.
@@ -384,13 +462,20 @@ mod tests {
 
     fn scheduler(state_location: &str) -> Scheduler {
         Scheduler {
-            state_location: state_location.to_string(),
+            state_location: Some(state_location.to_string()),
             params: None,
             partition_assignment_interval: default_partition_assignment_interval(),
             max_partition_assignments_per_interval: default_max_partition_assignments_per_interval(
             ),
             max_partitions_per_executor: default_max_partitions_per_executor(),
             partition_discovery_timeout: default_partition_discovery_timeout(),
+        }
+    }
+
+    fn shared_state(location: &str) -> RuntimeState {
+        RuntimeState {
+            location: location.to_string(),
+            params: None,
         }
     }
 
@@ -445,6 +530,12 @@ mod tests {
                 Box::new(|rt: &mut SpicepodRuntime| {
                     rt.params
                         .insert("url_tables".to_string(), "enabled".to_string());
+                }),
+            ),
+            (
+                "runtime.adaptive_tuning",
+                Box::new(|rt: &mut SpicepodRuntime| {
+                    rt.adaptive_tuning = spicepod::component::runtime::AdaptiveTuning::Enabled;
                 }),
             ),
             (
@@ -522,6 +613,12 @@ mod tests {
                 }),
             ),
             (
+                "runtime.state",
+                Box::new(|rt: &mut SpicepodRuntime| {
+                    rt.state = Some(shared_state("s3://bucket/state"));
+                }),
+            ),
+            (
                 "runtime.scheduler",
                 Box::new(|rt: &mut SpicepodRuntime| {
                     rt.scheduler = Some(scheduler("s3://bucket/state"));
@@ -558,6 +655,40 @@ mod tests {
                 changed_sections(edit),
                 vec![section],
                 "editing {section} must report {section} and nothing else"
+            );
+        }
+    }
+
+    /// Cluster rate control opens its state at `runtime.state` once at
+    /// startup. Moving, re-configuring, or removing that location must ask for
+    /// a full restart, not claim a reload applied part of it.
+    #[test]
+    fn a_runtime_state_change_needs_a_full_restart() {
+        let current = SpicepodRuntime {
+            state: Some(shared_state("s3://bucket/state")),
+            ..SpicepodRuntime::default()
+        };
+        let with_params = RuntimeState {
+            params: Some(Params::from_string_map(HashMap::from([(
+                "s3_region".to_string(),
+                "us-east-1".to_string(),
+            )]))),
+            ..shared_state("s3://bucket/state")
+        };
+
+        for (case, state) in [
+            ("moved", Some(shared_state("s3://other-bucket/state"))),
+            ("given new params", Some(with_params)),
+            ("removed", None),
+        ] {
+            let new = SpicepodRuntime {
+                state,
+                ..current.clone()
+            };
+            assert_eq!(
+                start_time_only_changes(&current, &new),
+                vec![("runtime.state", StartTimeScope::Process)],
+                "runtime.state {case} must be reported as needing a restart"
             );
         }
     }
@@ -704,6 +835,12 @@ mod tests {
                 }),
             ),
             (
+                "runtime.adaptive_tuning",
+                Box::new(|rt: &mut SpicepodRuntime| {
+                    rt.adaptive_tuning = spicepod::component::runtime::AdaptiveTuning::Enabled;
+                }),
+            ),
+            (
                 "runtime.source_rate_control",
                 Box::new(|rt: &mut SpicepodRuntime| {
                     rt.source_rate_control = Some(SourceRateControl {
@@ -845,5 +982,92 @@ mod tests {
         });
         let captured = logs.0.lock().clone();
         String::from_utf8_lossy(&captured).into_owned()
+    }
+
+    fn accelerated_dataset(name: &str, engine: &str) -> spicepod::component::dataset::Dataset {
+        let mut dataset = spicepod::component::dataset::Dataset::new("file:data.csv", name);
+        dataset.acceleration = Some(spicepod::acceleration::Acceleration {
+            engine: Some(engine.to_string()),
+            ..Default::default()
+        });
+        dataset
+    }
+
+    #[test]
+    fn a_reload_warns_only_about_the_deprecated_engines_it_adds_or_changes() {
+        let current = app::AppBuilder::new("pod")
+            .with_dataset(accelerated_dataset("orders", "duckdb"))
+            .with_dataset(accelerated_dataset("events", "cayenne"))
+            .build();
+
+        let unchanged = current.clone();
+        assert_eq!(
+            reload_deprecated_engines_warning(&current, &unchanged),
+            None
+        );
+
+        let added = app::AppBuilder::new("pod")
+            .with_dataset(accelerated_dataset("orders", "duckdb"))
+            .with_dataset(accelerated_dataset("events", "cayenne"))
+            .with_dataset(accelerated_dataset("customers", "sqlite"))
+            .build();
+        let warning = reload_deprecated_engines_warning(&current, &added)
+            .expect("the reload adds a sqlite dataset");
+        assert!(
+            warning.contains("`sqlite` (dataset 'customers')"),
+            "{warning}"
+        );
+        assert!(
+            !warning.contains("orders"),
+            "startup already named the unchanged dataset: {warning}"
+        );
+
+        let switched = app::AppBuilder::new("pod")
+            .with_dataset(accelerated_dataset("orders", "duckdb"))
+            .with_dataset(accelerated_dataset("events", "arrow"))
+            .build();
+        let warning = reload_deprecated_engines_warning(&current, &switched)
+            .expect("the reload moves a dataset to arrow");
+        assert!(warning.contains("`arrow` (dataset 'events')"), "{warning}");
+        assert!(!warning.contains("orders"), "{warning}");
+
+        let migrated = app::AppBuilder::new("pod")
+            .with_dataset(accelerated_dataset("orders", "cayenne"))
+            .with_dataset(accelerated_dataset("events", "cayenne"))
+            .build();
+        assert_eq!(reload_deprecated_engines_warning(&current, &migrated), None);
+    }
+
+    /// `/v1/search` and `vector_search` read the `row_id` keys of the installed app.
+    #[tokio::test]
+    async fn a_reload_updates_the_search_primary_keys() {
+        let docs: spicepod::component::dataset::Dataset = serde_json::from_value(serde_json::json!({
+            "from": "file:data.csv",
+            "name": "docs",
+            "columns": [{"name": "body", "full_text_search": {"enabled": true, "row_id": "id"}}],
+        }))
+        .expect("a valid dataset");
+        let rt = Arc::new(crate::Runtime::builder().build().await);
+        let docs_ref = datafusion::common::TableReference::parse_str("docs")
+            .resolve(
+                crate::datafusion::SPICE_DEFAULT_CATALOG,
+                crate::datafusion::SPICE_DEFAULT_SCHEMA,
+            )
+            .into();
+
+        assert!(
+            Arc::clone(&rt)
+                .apply_app(Arc::new(
+                    app::AppBuilder::new("search_keys")
+                        .with_dataset(docs)
+                        .build()
+                ))
+                .await
+        );
+
+        assert_eq!(
+            rt.search_primary_keys.get(&docs_ref),
+            Some(vec!["id".to_string()])
+        );
     }
 }

@@ -18,6 +18,7 @@ use clap::{ArgAction, Parser, ValueEnum};
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 use test_framework::anyhow;
+use test_framework::layout::Layout;
 use test_framework::queries::{QueryOverrides, QuerySet};
 
 use super::CommonArgs;
@@ -92,6 +93,21 @@ pub struct DatasetTestArgs {
     /// Reference schema containing known good tables for validation (e.g., "arrow" to validate against arrow.customer instead of customer)
     #[arg(long)]
     pub(crate) reference_schema: Option<String>,
+
+    /// Configure this acceleration layout on every accelerated dataset before
+    /// `spiced` starts: features from `primary_key`, `indexes`, `sort`,
+    /// `cluster`, `time_column` and `partition`, joined by commas, on each
+    /// benchmark table's columns from `test_framework::layout`. The
+    /// `__test_reference.*` clones that `--validate` compares against carry no
+    /// acceleration, so the layout never reaches the oracle.
+    #[arg(long)]
+    pub(crate) layout: Option<Layout>,
+
+    /// Whether `run bench` compares query results and explain plans with their recorded
+    /// snapshots. The snapshots record this branch's answers and plans, which another
+    /// `spiced` release does not reproduce, so a benchmark of another release turns this off.
+    #[arg(long, action = ArgAction::Set, default_value_t = true, default_missing_value = "true", num_args = 0..=1, require_equals = false)]
+    pub(crate) snapshots: bool,
 
     /// Whether to disable results caching, by supplying the cache control header through flight
     #[arg(long, action = ArgAction::Set, default_value_t = false, default_missing_value = "true", num_args = 0..=1, require_equals = false)]
@@ -247,14 +263,10 @@ pub enum QueryOverridesArg {
     Postgresql,
     #[serde(rename = "mysql")]
     Mysql,
-    #[serde(rename = "dremio")]
-    Dremio,
     #[serde(rename = "spark")]
     Spark,
     #[serde(rename = "odbc-athena")]
     ODBCAthena,
-    #[serde(rename = "odbc-databricks")]
-    ODBCDatabricks,
     #[serde(rename = "duckdb")]
     Duckdb,
     #[serde(rename = "duckdb-zero-results")]
@@ -297,8 +309,6 @@ pub enum QueryOverridesArg {
     Arrow,
     #[serde(rename = "cayenne")]
     Cayenne,
-    #[serde(rename = "turso")]
-    Turso,
     #[serde(rename = "bigquery")]
     #[value(name = "bigquery")]
     BigQuery,
@@ -459,10 +469,8 @@ impl From<QueryOverridesArg> for QueryOverrides {
             QueryOverridesArg::Sqlite => QueryOverrides::SQLite,
             QueryOverridesArg::Postgresql => QueryOverrides::PostgreSQL,
             QueryOverridesArg::Mysql => QueryOverrides::MySQL,
-            QueryOverridesArg::Dremio => QueryOverrides::Dremio,
             QueryOverridesArg::Spark => QueryOverrides::Spark,
             QueryOverridesArg::ODBCAthena => QueryOverrides::ODBCAthena,
-            QueryOverridesArg::ODBCDatabricks => QueryOverrides::ODBCDatabricks,
             QueryOverridesArg::Duckdb => QueryOverrides::DuckDB,
             QueryOverridesArg::DuckdbZeroResults => QueryOverrides::DuckDBOnZeroResults,
             QueryOverridesArg::Snowflake => QueryOverrides::Snowflake,
@@ -483,7 +491,6 @@ impl From<QueryOverridesArg> for QueryOverrides {
             QueryOverridesArg::OracleCatalog => QueryOverrides::OracleCatalog,
             QueryOverridesArg::SnowflakeCatalog => QueryOverrides::SnowflakeCatalog,
             QueryOverridesArg::DucklakeCatalog => QueryOverrides::DucklakeCatalog,
-            QueryOverridesArg::Turso => QueryOverrides::Turso,
             QueryOverridesArg::BigQuery => QueryOverrides::BigQuery,
             QueryOverridesArg::ScyllaDB => QueryOverrides::ScyllaDB,
             QueryOverridesArg::ChbenchSkipSlow => QueryOverrides::ChbenchSkipSlow,

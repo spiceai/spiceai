@@ -1,0 +1,95 @@
+name: search-hybrid
+description: >
+  Search on Cayenne beyond single queries: rrf fuses text_search and
+  vector_search into exactly the documents either finds; a text_search
+  filtered on other columns returns the matching rows; /v1/search returns
+  the documents vector search ranks first; and on a dataset kept current by
+  change capture both indexes follow inserts, updates and deletes without a
+  refresh.
+
+sources:
+  src: { kind: postgres }
+
+spicepod:
+  version: v1
+  kind: Spicepod
+  name: search-hybrid
+  embeddings:
+    - from: model2vec:minishlab/potion-base-2M
+      name: potion
+  datasets:
+    - from: postgres:public.docs
+      name: docs
+      params: ${sources.src.params}
+      acceleration: { enabled: true, engine: cayenne, mode: file, refresh_mode: full }
+      columns:
+        - name: body
+          full_text_search: { enabled: true, row_id: [id] }
+          embeddings: [{ from: potion, row_id: [id] }]
+    - from: postgres:public.docs
+      name: docs_cdc
+      params: ${sources.src.params}
+      acceleration: { enabled: true, engine: cayenne, mode: file, refresh_mode: changes, primary_key: id }
+      columns:
+        - name: body
+          full_text_search: { enabled: true, row_id: [id] }
+          embeddings: [{ from: potion, row_id: [id] }]
+
+defaults:
+  # A cluster buckets each acceleration on this column (--cluster).
+  cluster-partition-by: { '*': id }
+  expect: { oracle: src }
+
+steps:
+  - source-exec:
+      src: { file: seed/search-postgres.sql }
+  - start: { ready-timeout: 300s }
+
+  # rrf finds exactly the documents either search finds.
+  - query: >-
+      SELECT id FROM rrf(text_search(docs, 'fox'), vector_search(docs, 'fox'))
+      EXCEPT SELECT id FROM (SELECT id FROM text_search(docs, 'fox') UNION SELECT id FROM vector_search(docs, 'fox')) u
+    expect-empty: true
+    expect: { rows: [] }
+  - query: >-
+      SELECT id FROM (SELECT id FROM text_search(docs, 'fox') UNION SELECT id FROM vector_search(docs, 'fox')) u
+      EXCEPT SELECT id FROM rrf(text_search(docs, 'fox'), vector_search(docs, 'fox'))
+    expect-empty: true
+    expect: { rows: [] }
+  - query: SELECT count(*) AS n FROM rrf(text_search(docs, 'fox'), vector_search(docs, 'fox'), limit => 5)
+    expect: { rows: [['5']] }
+
+  # Full-text search filtered on other columns.
+  - query: SELECT id FROM text_search(docs, 'fox') WHERE dog = 0
+    oracle-sql: SELECT id FROM docs WHERE fox > 0 AND dog = 0 AND body IS NOT NULL
+  - query: SELECT id FROM text_search(docs, 'dog') WHERE fox >= 3 AND id < 60
+    oracle-sql: SELECT id FROM docs WHERE dog > 0 AND fox >= 3 AND id < 60 AND body IS NOT NULL
+
+  # /v1/search: the documents vector search ranks first.
+  - http: { method: POST, path: /v1/search, headers: { content-type: application/json }, body: '{"datasets": ["docs"], "text": "fox fox fox fox", "limit": 3}' }
+    expect: { status: 200, body-contains: '"results"' }
+
+  # The indexes of a change-captured dataset follow the source.
+  - query: SELECT id FROM text_search(docs_cdc, 'fox')
+    oracle-sql: SELECT id FROM docs WHERE fox > 0 AND body IS NOT NULL
+  - source-exec:
+      src: |
+        INSERT INTO docs VALUES (500, 'unicorn unicorn stone stone stone stone stone stone stone stone stone stone', 0, 0);
+        UPDATE docs SET body = 'unicorn stone stone stone stone stone stone stone stone stone stone stone', fox = 0, dog = 0 WHERE id = 1;
+        DELETE FROM docs WHERE id = 4;
+  # Searched only once the changes have arrived; text-search-cdc-repeated.yaml
+  # covers the identical text asked before and after them.
+  - query: SELECT count(*) AS n FROM docs_cdc WHERE id IN (1, 500)
+    expect: { rows: [['2']] }
+    eventually: 60s
+  - query: SELECT count(*) AS n FROM docs_cdc WHERE id = 4
+    expect: { rows: [['0']] }
+    eventually: 60s
+  - query: SELECT s.id FROM text_search(docs_cdc, 'unicorn') s
+    expect: { rows: [['1'], ['500']] }
+  - query: SELECT t.id FROM text_search(docs_cdc, 'fox') t
+    oracle-sql: SELECT id FROM docs WHERE fox > 0 AND body IS NOT NULL
+  - query: SELECT count(*) AS n FROM vector_search(docs_cdc, 'unicorn') WHERE id = 4
+    expect: { rows: [['0']] }
+  - query: SELECT id FROM vector_search(docs_cdc, 'unicorn unicorn') ORDER BY _score DESC, id LIMIT 1
+    expect: { rows: [['500']] }

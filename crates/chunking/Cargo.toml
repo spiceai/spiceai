@@ -22,6 +22,7 @@ tracing.workspace = true
 
 [dev-dependencies]
 criterion = "0.7"
+tempfile.workspace = true
 
 [[bench]]
 harness = false

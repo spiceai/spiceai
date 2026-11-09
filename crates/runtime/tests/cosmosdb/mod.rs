@@ -29,12 +29,14 @@ limitations under the License.
 //! not ignored and run in CI.
 //!
 //! The Azure Cosmos emulator (`mcr.microsoft.com/cosmosdb/linux/azure-cosmos-emulator`)
-//! is intentionally NOT used here: its 3+ GB image and 3–5 minute cold-start
-//! exceeds the budgets of the shared runner and `docker/mod.rs`
-//! `CONTAINER_SEMAPHORE`. A future on-demand CI job can add it behind a
-//! `cosmosdb-emulator` feature flag.
+//! is not used by these tests: its image and cold start exceed the budgets of
+//! the shared runner and `docker/mod.rs` `CONTAINER_SEMAPHORE`. The push-down
+//! round trip in `pushdown_roundtrip.rs` does use its `vnext-preview` build, and
+//! is ignored by default for the same reason.
 
 #![allow(dead_code, clippy::allow_attributes)]
+
+mod pushdown_roundtrip;
 
 use std::collections::HashMap;
 use std::env;

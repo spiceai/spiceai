@@ -20,7 +20,7 @@ limitations under the License.
 //! planner, for two purposes:
 //!
 //! 1. **DDL extensions** — `CREATE TABLE` with `WITH (...)` options
-//!    (`acceleration.*`, `dataset.*`) and `PARTITION BY` clauses that
+//!    (`acceleration.*`, `dataset.*`), `PARTITION BY`, and `CLUSTER BY` clauses that
 //!    `DataFusion`'s `SqlToRel` does not support. Extensions are extracted from
 //!    the AST, stored in the [`DdlExtensionStore`], and stripped before
 //!    delegating to `DataFusion`.
@@ -47,21 +47,29 @@ mod update;
 use std::sync::Arc;
 
 use datafusion::catalog::TableProvider;
+use datafusion::common::TableReference;
+use datafusion::common::config::Dialect;
 use datafusion::error::{DataFusionError, Result as DFResult};
 use datafusion::execution::SessionState;
 use datafusion::logical_expr::LogicalPlan;
-use datafusion::sql::TableReference;
 use datafusion::sql::parser::Statement;
 use datafusion::sql::sqlparser::ast::CreateTableOptions;
+use datafusion::sql::sqlparser::ast::Expr as SQLExpr;
 use datafusion::sql::sqlparser::ast::Statement as SQLStatement;
+use datafusion::sql::sqlparser::ast::WrappedCollection;
+use datafusion::sql::sqlparser::dialect::GenericDialect;
+use datafusion::sql::sqlparser::keywords::Keyword;
+use datafusion::sql::sqlparser::parser::Parser;
+use datafusion::sql::sqlparser::tokenizer::{Location, Token, TokenWithSpan, Tokenizer};
 use datafusion_dml::CatalogDmlHandler;
 use datafusion_expr::WriteOp;
 use datafusion_expr::dml::InsertOp;
+use runtime_datafusion::analyzer_rule::exact_float_decimal_cast::FloatLiteralSpellings;
 use tokio::runtime::Handle;
 
 use crate::accelerated::AcceleratedTable;
 use crate::config::ClusterRole;
-use crate::datafusion::{SPICE_DEFAULT_CATALOG, SPICE_DEFAULT_SCHEMA};
+use crate::datafusion::{SPICE_DEFAULT_CATALOG, SPICE_DEFAULT_SCHEMA, sql_depth_guard};
 use datafusion_ddl::{SharedDdlExtensionStore, has_ddl_extensions};
 
 /// The type of catalog backing the planner's DML interception.
@@ -136,9 +144,125 @@ pub async fn create_logical_plan(
     session: &SessionState,
     ctx: &PlannerContext,
 ) -> DFResult<LogicalPlan> {
-    let dialect = session.config().options().sql_parser.dialect;
-    let statement = session.sql_to_statement(sql, &dialect)?;
+    let statement = parse_sql_statement(sql, session)?;
     create_logical_plan_from_statement(sql, statement, session, ctx).await
+}
+
+/// Parse SQL using the configured dialect, taking only Cayenne's
+/// `CREATE TABLE ... CLUSTER BY` clause from the generic dialect.
+///
+/// `sqlparser` recognizes the create-table `CLUSTER BY` clause under its generic
+/// and `BigQuery` dialects but not under `PostgreSqlDialect`, the runtime
+/// default. When the configured dialect rejects a statement, the generic dialect
+/// locates that clause, and the configured dialect must then accept the
+/// statement with the clause blanked out: its reading of everything else is the
+/// statement returned, with only the clause's expressions taken from the generic
+/// parse. No other syntax the configured dialect rejects, or reads differently,
+/// gets in. The clause is replaced by spaces rather than removed, so an error in
+/// the rest of the statement points at the user's own line and column.
+pub(crate) fn parse_sql_statement(sql: &str, session: &SessionState) -> DFResult<Statement> {
+    let dialect = session.config().options().sql_parser.dialect;
+    let configured_dialect_error = match sql_depth_guard::sql_to_statement(session, sql, &dialect) {
+        Ok(statement) => return Ok(statement),
+        Err(error) => error,
+    };
+    let Some((cluster_by, without_cluster_by)) = split_create_table_cluster_by(sql, session) else {
+        return Err(configured_dialect_error);
+    };
+    let mut statement = session.sql_to_statement(&without_cluster_by, &dialect)?;
+    let Statement::Statement(sql_statement) = &mut statement else {
+        return Err(configured_dialect_error);
+    };
+    let SQLStatement::CreateTable(table) = sql_statement.as_mut() else {
+        return Err(configured_dialect_error);
+    };
+    if table.cluster_by.is_some() {
+        return Err(configured_dialect_error);
+    }
+    table.cluster_by = Some(cluster_by);
+    Ok(statement)
+}
+
+/// The `CLUSTER BY` clause of a `CREATE TABLE` statement as the generic dialect
+/// parses it, and the statement text with that clause replaced by spaces.
+fn split_create_table_cluster_by(
+    sql: &str,
+    session: &SessionState,
+) -> Option<(WrappedCollection<Vec<SQLExpr>>, String)> {
+    let Ok(Statement::Statement(generic)) =
+        sql_depth_guard::sql_to_statement(session, sql, &Dialect::Generic)
+    else {
+        return None;
+    };
+    let SQLStatement::CreateTable(table) = *generic else {
+        return None;
+    };
+    let cluster_by = table.cluster_by?;
+    let (start, end) = cluster_by_clause_bytes(sql)?;
+    let mut blanked = String::with_capacity(sql.len());
+    blanked.push_str(sql.get(..start)?);
+    // Keep line breaks, so every later token keeps its line and column.
+    blanked.extend(
+        sql.get(start..end)?
+            .chars()
+            .map(|c| if c == '\n' { '\n' } else { ' ' }),
+    );
+    blanked.push_str(sql.get(end..)?);
+    Some((cluster_by, blanked))
+}
+
+/// Byte range of the first `CLUSTER BY <expression list>` outside parentheses,
+/// the create-table clause: a column default or check expression sits inside
+/// the column list, and an `AS` query follows the clause.
+fn cluster_by_clause_bytes(sql: &str) -> Option<(usize, usize)> {
+    let dialect = GenericDialect {};
+    let tokens = Tokenizer::new(&dialect, sql)
+        .tokenize_with_location()
+        .ok()?;
+    let mut depth = 0_usize;
+    let significant: Vec<(usize, &TokenWithSpan)> = tokens
+        .iter()
+        .enumerate()
+        .filter(|(_, token)| !matches!(token.token, Token::Whitespace(_)))
+        .collect();
+    for pair in significant.windows(2) {
+        let [(_, token), (by_index, by)] = pair else {
+            continue;
+        };
+        match &token.token {
+            Token::LParen => depth += 1,
+            Token::RParen => depth = depth.saturating_sub(1),
+            Token::Word(cluster)
+                if depth == 0
+                    && cluster.keyword == Keyword::CLUSTER
+                    && matches!(&by.token, Token::Word(word) if word.keyword == Keyword::BY) =>
+            {
+                let mut parser = Parser::new(&dialect)
+                    .with_tokens_with_locations(tokens.get(by_index + 1..)?.to_vec());
+                parser.parse_comma_separated(Parser::parse_expr).ok()?;
+                let end = parser.get_current_token().span.end;
+                return Some((byte_offset(sql, token.span.start)?, byte_offset(sql, end)?));
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+/// Byte offset in `sql` of a tokenizer location: a one-based line, and a
+/// one-based column counted in characters.
+fn byte_offset(sql: &str, location: Location) -> Option<usize> {
+    let line = usize::try_from(location.line).ok()?.checked_sub(1)?;
+    let column = usize::try_from(location.column).ok()?.checked_sub(1)?;
+    let line_start: usize = sql.split_inclusive('\n').take(line).map(str::len).sum();
+    let rest = sql.get(line_start..)?;
+    Some(
+        line_start
+            + rest
+                .char_indices()
+                .nth(column)
+                .map_or(rest.len(), |(offset, _)| offset),
+    )
 }
 
 pub async fn create_logical_plan_from_statement(
@@ -155,7 +279,7 @@ pub async fn create_logical_plan_from_statement(
                 let has_with = !matches!(ct.table_options, CreateTableOptions::None);
                 if has_columns || has_partition_by || has_with || has_ddl_extensions(ct) {
                     return Err(DataFusionError::Plan(
-                        "CREATE TABLE ... (LIKE ...) cannot be combined with PARTITION BY, WITH \
+                        "CREATE TABLE ... (LIKE ...) cannot be combined with PARTITION BY, CLUSTER BY, WITH \
                          options, or additional column definitions. The new table inherits all \
                          properties \
                          from the source table."
@@ -194,7 +318,18 @@ pub async fn create_logical_plan_from_statement(
         }
     }
 
-    session.statement_to_plan(statement).await
+    plan_retaining_float_spellings(statement, session).await
+}
+
+/// `session.statement_to_plan`, with the spellings of number tokens the planned
+/// `f64` literals lose recorded on them, so a float literal cast to a decimal
+/// takes the decimal the SQL spelled (#14970).
+pub(crate) async fn plan_retaining_float_spellings(
+    statement: Statement,
+    session: &SessionState,
+) -> DFResult<LogicalPlan> {
+    let spellings = FloatLiteralSpellings::collect(&statement);
+    spellings.retain(session.statement_to_plan(statement).await?)
 }
 
 async fn plan_distributed_dml(
@@ -203,7 +338,7 @@ async fn plan_distributed_dml(
     ctx: &PlannerContext,
     expected_op: WriteOp,
 ) -> DFResult<LogicalPlan> {
-    let df_plan = session.statement_to_plan(statement).await?;
+    let df_plan = plan_retaining_float_spellings(statement, session).await?;
 
     if !matches!(ctx.cluster_role, Some(ClusterRole::Scheduler)) {
         return Ok(df_plan);
@@ -228,6 +363,23 @@ async fn plan_distributed_dml(
     };
 
     if !should_rewrite {
+        // Executors hold this table's rows by partition, so a write the scheduler
+        // applies itself never reaches them, and reads filtered to the recorded
+        // partitions miss its rows.
+        if matches!(expected_op, WriteOp::Insert(_))
+            && ctx.executor_registry.as_ref().is_some_and(|registry| {
+                registry
+                    .federated_partition_store()
+                    .get_cached_table_metadata(&dml.table_name)
+                    .is_some()
+            })
+            && !is_partitioned_acceleration(session, &dml.table_name).await
+        {
+            return Err(DataFusionError::Plan(format!(
+                "Cannot write to {}: its rows are partitioned across executors, but this scheduler has not registered its acceleration. Run its CREATE TABLE IF NOT EXISTS ... WITH (acceleration ...) PARTITION BY statement again, then retry the write.",
+                dml.table_name
+            )));
+        }
         return Ok(df_plan);
     }
 
@@ -243,6 +395,11 @@ async fn plan_distributed_dml(
         WriteOp::Truncate => Err(DataFusionError::Internal(
             "TRUNCATE should not reach DML planner".to_string(),
         )),
+        // `WriteOp` is non-exhaustive (DataFusion 55 added MERGE INTO); a write the
+        // distributed Cayenne planner has no plan for is refused, not guessed at.
+        other => Err(DataFusionError::NotImplemented(format!(
+            "{other} is not supported on a distributed Cayenne table"
+        ))),
     }
 }
 
@@ -256,7 +413,10 @@ fn is_cayenne_table(session: &SessionState, table_name: &TableReference) -> bool
     }
 }
 
-async fn is_distributed_insert_table(session: &SessionState, table_name: &TableReference) -> bool {
+pub(crate) async fn is_distributed_insert_table(
+    session: &SessionState,
+    table_name: &TableReference,
+) -> bool {
     // Distributed scheduler-mode INSERT rewriting applies to both:
     // 1. Cayenne catalog tables, which must be forwarded to executors, and
     // 2. dual-write accelerated tables (Iceberg federated catalog cache), which
@@ -265,22 +425,35 @@ async fn is_distributed_insert_table(session: &SessionState, table_name: &TableR
         return true;
     }
 
+    table_provider(session, table_name)
+        .await
+        .is_some_and(|table_provider| is_dual_write_table_provider(&table_provider))
+}
+
+/// Whether `table_name` is an acceleration whose partitions the executors hold.
+async fn is_partitioned_acceleration(session: &SessionState, table_name: &TableReference) -> bool {
+    table_provider(session, table_name)
+        .await
+        .is_some_and(|table_provider| {
+            spice_table::find_layer::<AcceleratedTable>(
+                table_provider.as_ref(),
+                spice_table::LayerWalk::Read,
+            )
+            .is_some_and(|accelerated| !accelerated.is_node_local())
+        })
+}
+
+async fn table_provider(
+    session: &SessionState,
+    table_name: &TableReference,
+) -> Option<Arc<dyn TableProvider>> {
     let catalog_name = table_name.catalog().unwrap_or(SPICE_DEFAULT_CATALOG);
     let schema_name = table_name.schema().unwrap_or(SPICE_DEFAULT_SCHEMA);
-
-    let Some(catalog) = session.catalog_list().catalog(catalog_name) else {
-        return false;
-    };
-
-    let Some(schema) = catalog.schema(schema_name) else {
-        return false;
-    };
-
-    let Ok(Some(table_provider)) = schema.table(table_name.table()).await else {
-        return false;
-    };
-
-    is_dual_write_table_provider(&table_provider)
+    let schema = session
+        .catalog_list()
+        .catalog(catalog_name)?
+        .schema(schema_name)?;
+    schema.table(table_name.table()).await.ok().flatten()
 }
 
 fn is_dual_write_table_provider(table_provider: &Arc<dyn TableProvider>) -> bool {
@@ -302,9 +475,114 @@ mod tests {
 
     use datafusion::arrow::datatypes::{DataType, Field, Schema};
     use datafusion::catalog::TableProvider;
+    use datafusion::common::config::Dialect;
     use datafusion::datasource::MemTable;
+    use datafusion::execution::SessionStateBuilder;
+    use datafusion::prelude::SessionConfig;
 
     use data_components::MetadataEnrichedTableProvider;
+
+    fn postgresql_session() -> datafusion::execution::SessionState {
+        let mut config = SessionConfig::new();
+        config.options_mut().sql_parser.dialect = Dialect::PostgreSQL;
+        SessionStateBuilder::new()
+            .with_config(config)
+            .with_default_features()
+            .build()
+    }
+
+    #[test]
+    fn runtime_postgresql_dialect_accepts_create_table_cluster_by() {
+        let session = postgresql_session();
+
+        let statement = super::parse_sql_statement(
+            "CREATE TABLE events (id BIGINT, region TEXT) CLUSTER BY (region, id)",
+            &session,
+        )
+        .expect("runtime dialect should accept CLUSTER BY");
+
+        assert!(matches!(
+            statement,
+            datafusion::sql::parser::Statement::Statement(sql_statement)
+                if matches!(
+                    sql_statement.as_ref(),
+                    datafusion::sql::sqlparser::ast::Statement::CreateTable(table)
+                        if table.cluster_by.is_some()
+                )
+        ));
+    }
+
+    /// A `CLUSTER BY` spread over lines, after a column default holding
+    /// parentheses and before `WITH` options, is found and blanked exactly.
+    #[test]
+    fn cluster_by_clause_is_blanked_in_place() {
+        let session = postgresql_session();
+        let sql = "CREATE TABLE events (\n  id BIGINT DEFAULT (1 + 2),\n  region TEXT\n)\nCLUSTER BY (\n  region, id\n)";
+        let (cluster_by, blanked) =
+            super::split_create_table_cluster_by(sql, &session).expect("the clause is found");
+        assert_eq!(cluster_by.to_string(), "(region, id)");
+        assert_eq!(blanked.len(), sql.len());
+        assert_eq!(blanked.lines().count(), sql.lines().count());
+        assert_eq!(
+            blanked.trim_end(),
+            "CREATE TABLE events (\n  id BIGINT DEFAULT (1 + 2),\n  region TEXT\n)"
+        );
+    }
+
+    /// Only `CLUSTER BY` may come from the generic dialect: anything else in the
+    /// statement that the configured dialect rejects is still rejected.
+    #[test]
+    fn cluster_by_does_not_admit_other_syntax_the_configured_dialect_rejects() {
+        let session = postgresql_session();
+        for sql in [
+            // Backtick-quoted identifiers are not PostgreSQL syntax.
+            "CREATE TABLE `events` (id BIGINT, region TEXT) CLUSTER BY (region)",
+            // `OPTIONS (...)` is BigQuery syntax the generic dialect also accepts.
+            "CREATE TABLE events (id BIGINT, region TEXT) CLUSTER BY (region) OPTIONS (description = 'x')",
+        ] {
+            let error = super::parse_sql_statement(sql, &session)
+                .expect_err("the configured dialect rejects everything but the clause");
+            let message = error.to_string();
+            assert!(
+                !message.contains("CLUSTER"),
+                "the error must name the unsupported syntax, not the supported clause: {message}"
+            );
+        }
+    }
+
+    /// The rest of the statement is the configured dialect's reading of it; only
+    /// the clause's expressions come from the generic dialect.
+    #[test]
+    fn cluster_by_keeps_the_configured_dialect_reading_of_the_rest() {
+        use datafusion::sql::parser::Statement;
+        use datafusion::sql::sqlparser::ast::Statement as SQLStatement;
+
+        let session = postgresql_session();
+        let with_clause = super::parse_sql_statement(
+            r#"CREATE TABLE events (id BIGINT, region TEXT) WITH ("acceleration.engine" = 'cayenne') PARTITION BY region CLUSTER BY (region, id)"#,
+            &session,
+        )
+        .expect("CLUSTER BY after WITH options and PARTITION BY");
+        let without_clause = session
+            .sql_to_statement(
+                r#"CREATE TABLE events (id BIGINT, region TEXT) WITH ("acceleration.engine" = 'cayenne') PARTITION BY region"#,
+                &Dialect::PostgreSQL,
+            )
+            .expect("PostgreSQL parses the statement without the clause");
+
+        let Statement::Statement(parsed) = with_clause else {
+            panic!("expected a SQL statement");
+        };
+        let SQLStatement::CreateTable(mut table) = *parsed else {
+            panic!("expected CREATE TABLE");
+        };
+        let cluster_by = table.cluster_by.take().expect("the clause is kept");
+        assert_eq!(cluster_by.to_string(), "(region, id)");
+        assert_eq!(
+            Statement::Statement(Box::new(SQLStatement::CreateTable(table))),
+            without_clause
+        );
+    }
 
     fn mem_table() -> Arc<dyn TableProvider> {
         let schema = Arc::new(Schema::new(vec![Field::new("a", DataType::Int32, false)]));

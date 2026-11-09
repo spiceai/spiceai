@@ -17,7 +17,7 @@ Opening the Change Stream before the snapshot prevents gaps between the snapshot
 ## Prerequisites
 
 - MongoDB Change Streams must be supported and enabled on the source deployment. MongoDB requires a replica set or sharded cluster for Change Streams.
-- The dataset must be accelerated with an engine that supports upsert behavior. Use `duckdb`, `sqlite`, `postgres`, `turso`, or `cayenne`.
+- The dataset must be accelerated with an engine that supports upsert behavior. Use `cayenne`, `sqlite`, or `postgres`.
 - Configure `acceleration.primary_key: _id`. MongoDB delete events only include the document key, so Spice requires `_id` to route deletes correctly.
 - Configure `acceleration.on_conflict` on `_id` with `upsert` behavior so update and replacement events replace existing accelerator rows instead of appending duplicates.
 
@@ -35,7 +35,7 @@ datasets:
       mongodb_pass: ${secrets:mongodb_pass}
     acceleration:
       enabled: true
-      engine: duckdb
+      engine: cayenne
       refresh_mode: changes
       primary_key: _id
       on_conflict:
@@ -88,4 +88,4 @@ If MongoDB does not include `fullDocument` for an update or replacement event, S
 - Unit tests cover Change Stream event conversion, truncate handling, required `fullDocument`/`documentKey` validation, primary-key/upsert validation, and Change Stream parameter parsing.
 - Live runtime integration coverage is available in the MongoDB runtime tests. It starts MongoDB as a single-node replica set, loads an accelerated dataset with `refresh_mode: changes`, then verifies insert, update, and delete propagation.
 - The `mongodb_change_stream` Criterion microbenchmark measures BSON Change Stream event conversion into Spice CDC batches.
-- Testoperator TPCH benchmark, throughput, and load coverage is configured by `test/spicepods/tpch/sf1/accelerated/mongodb-duckdb[file]-changes.yaml` and `tools/testoperator/dispatch/tpch/sf1/accelerated/mongodb-duckdb[file]-changes.yaml`.
+- Testoperator TPCH benchmark, throughput, and load coverage is configured by `test/spicepods/tpch/sf1/accelerated/mongodb-cayenne[file]-changes.yaml` and `tools/testoperator/dispatch/tpch/sf1/accelerated/mongodb-cayenne[file]-changes.yaml`.

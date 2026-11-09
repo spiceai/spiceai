@@ -24,7 +24,7 @@ limitations under the License.
 //! write, so it currently captures the accumulator from the most recent
 //! write (last-write-wins) rather than an aggregate across every file.
 
-mod common;
+use crate::common;
 
 use arrow::datatypes::{DataType, Field, Schema};
 use cayenne::MetadataCatalog;

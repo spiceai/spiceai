@@ -21,8 +21,12 @@ use datafusion_datasource::sink::{DataSink, DataSinkExec};
 
 use std::{any::Any, fmt, pin::Pin, sync::Arc};
 
-use crate::component::dataset::{Dataset, DatasetSpec, acceleration::RefreshMode};
+use crate::component::dataset::{
+    Dataset, DatasetSpec,
+    acceleration::{Acceleration, Engine, RefreshMode},
+};
 use crate::dataaccelerator::spice_sys::dataset_checkpointer;
+use crate::dataaccelerator::{AccelerationSource, AcceleratorEngineRegistry};
 use datafusion::{
     catalog::Session,
     common::{Constraint, Constraints, project_schema},
@@ -38,8 +42,10 @@ use runtime_acceleration::sidecar::OpenOption;
 use runtime_acceleration::snapshot::SnapshotBehavior;
 
 use super::{
-    ConnectorComponent, ConnectorParams, DataConnector, DataConnectorFactory, ParameterSpec,
+    ConnectorComponent, ConnectorParams, DataConnector, DataConnectorError, DataConnectorFactory,
+    ParameterSpec,
 };
+use crate::opentelemetry_logs::{LOGS_STORE_SCHEMA, OTLP_LOGS_PARAM, is_otlp_logs_store_param};
 
 /// The schema a `sink` source advertises when it has no acceleration to inherit from.
 ///
@@ -66,12 +72,31 @@ fn placeholder_schema() -> SchemaRef {
 /// non-file accelerator — so the caller falls back to [`placeholder_schema`], preserving the
 /// pre-acceleration behavior.
 pub(crate) async fn accelerated_checkpoint_schema(dataset: &Dataset) -> Option<SchemaRef> {
-    if !dataset.is_file_accelerated() {
+    recorded_checkpoint_schema(dataset)
+        .await
+        .map(runtime_table::accelerated::checkpoint_primary_key::without_acceleration_primary_key)
+}
+
+/// The acceleration checkpoint's schema as stored, including the primary key it
+/// records for registering without the source (see
+/// `runtime_table::accelerated::checkpoint_primary_key`). Everything that registers
+/// a table from the checkpoint schema uses [`accelerated_checkpoint_schema`], which
+/// leaves that key out.
+pub(crate) async fn recorded_checkpoint_schema(dataset: &Dataset) -> Option<SchemaRef> {
+    recorded_acceleration_checkpoint_schema(dataset, dataset.runtime.accelerator_engine_registry())
+        .await
+}
+
+/// [`recorded_checkpoint_schema`] for any accelerated component, a view included.
+pub(crate) async fn recorded_acceleration_checkpoint_schema(
+    source: &dyn AccelerationSource,
+    registry: Arc<AcceleratorEngineRegistry>,
+) -> Option<SchemaRef> {
+    if !source.is_file_accelerated() {
         return None;
     }
-    let registry = dataset.runtime.accelerator_engine_registry();
     let checkpoint = dataset_checkpointer(
-        dataset,
+        source,
         registry,
         OpenOption::OpenExisting,
         SnapshotBehavior::Disabled,
@@ -79,6 +104,48 @@ pub(crate) async fn accelerated_checkpoint_schema(dataset: &Dataset) -> Option<S
     .await
     .ok()?;
     checkpoint.get_schema().await.ok().flatten()
+}
+
+/// Whether an accelerated `sink` dataset can be registered when the runtime loads it, rather
+/// than parked until its first write supplies a schema.
+///
+/// A `sink` produces no rows of its own, so there is normally nothing to build a table from
+/// until a write arrives. An acceleration that already holds this dataset's data is the
+/// exception: its schema checkpoint is what `source` advertises (see
+/// [`accelerated_checkpoint_schema`]), so the stored rows can be served from startup instead
+/// of only once the next write registers the dataset.
+///
+/// Scoped to Cayenne, the engine whose files and metastore *are* the dataset — every other
+/// engine keeps the wait-for-first-write behavior.
+pub(crate) fn registers_from_acceleration(
+    acceleration: Option<&Acceleration>,
+    source: &dyn DataConnector,
+) -> bool {
+    acceleration.is_some_and(|settings| settings.engine == Engine::Cayenne)
+        && source
+            .as_any()
+            .downcast_ref::<SinkConnector>()
+            .is_some_and(SinkConnector::has_known_schema)
+}
+
+/// Whether a dataset's spec routes OTLP logs to it (`otlp_logs: all`).
+fn is_otlp_logs_dataset(spec: &DatasetSpec) -> bool {
+    spec.params
+        .get(OTLP_LOGS_PARAM)
+        .is_some_and(|value| is_otlp_logs_store_param(value))
+}
+
+/// The configuration error for an `otlp_logs: all` dataset that Cayenne does not accelerate,
+/// or `None` when it does. The logs store is built for Cayenne's append path, and a sink with
+/// no acceleration would discard every record.
+fn otlp_logs_acceleration_error(spec: &DatasetSpec) -> Option<String> {
+    let cayenne = spec
+        .acceleration
+        .as_ref()
+        .is_some_and(|acceleration| acceleration.enabled && acceleration.engine == Engine::Cayenne);
+    (!cayenne).then(|| {
+        "An OpenTelemetry logs dataset (`otlp_logs: all`) is stored by Cayenne. Set `acceleration.enabled: true` and `acceleration.engine: cayenne`. See: https://spiceai.org/docs/features/observability".to_string()
+    })
 }
 
 /// Connector name for the [`SinkConnector`], as it appears in a dataset's `from: sink:...`.
@@ -91,6 +158,10 @@ pub const SINK_DATACONNECTOR: &str = "sink";
 pub struct SinkConnector {
     schema: SchemaRef,
     table_constraints: Constraints,
+    /// Whether [`Self::schema`] is known before the first write: the one the acceleration
+    /// already stores for this dataset, or a fixed schema such as the OTLP logs store's, rather
+    /// than the bare [`placeholder_schema`]. Read by [`registers_from_acceleration`].
+    schema_known: bool,
 }
 
 impl SinkConnector {
@@ -99,7 +170,26 @@ impl SinkConnector {
         Self {
             schema,
             table_constraints: Constraints::new_unverified(vec![]),
+            schema_known: false,
         }
+    }
+
+    /// A connector advertising a schema known before the first write: the one the dataset's
+    /// acceleration has checkpointed, or a fixed schema, as opposed to one whose schema came
+    /// from a write or from [`placeholder_schema`].
+    #[must_use]
+    fn with_known_schema(schema: SchemaRef) -> Self {
+        Self {
+            schema_known: true,
+            ..Self::new(schema)
+        }
+    }
+
+    /// Whether this connector's schema is known before the first write, which is what makes
+    /// the dataset registrable before its first write.
+    #[must_use]
+    pub(crate) fn has_known_schema(&self) -> bool {
+        self.schema_known
     }
 
     #[must_use]
@@ -148,15 +238,37 @@ impl DataConnectorFactory for SinkConnectorFactory {
             // Reading the checkpoint needs the accelerator engine registry and the secrets, so
             // the spec is rebound to the runtime handles from the connector context; without a
             // context (connector unit tests) there is no accelerator to inherit from.
-            let schema = match &params.component {
+            // An OTLP logs dataset has a fixed schema, so it is registered when it loads, and
+            // is queryable before its first export, instead of waiting for a write.
+            if let ConnectorComponent::Dataset(spec) = &params.component
+                && is_otlp_logs_dataset(spec)
+            {
+                if let Some(message) = otlp_logs_acceleration_error(spec) {
+                    return Err(DataConnectorError::InvalidConfigurationNoSource {
+                        dataconnector: SINK_DATACONNECTOR.to_string(),
+                        connector_component: params.component.clone(),
+                        message,
+                    }
+                    .into());
+                }
+                return Ok(Arc::new(SinkConnector::with_known_schema(Arc::clone(
+                    &LOGS_STORE_SCHEMA,
+                ))) as Arc<dyn DataConnector>);
+            }
+
+            let checkpoint_schema = match &params.component {
                 ConnectorComponent::Dataset(spec) => {
                     context.accelerated_checkpoint_schema(spec).await
                 }
                 ConnectorComponent::Catalog(_) => None,
-            }
-            .unwrap_or_else(placeholder_schema);
+            };
 
-            Ok(Arc::new(SinkConnector::new(schema)) as Arc<dyn DataConnector>)
+            let connector = match checkpoint_schema {
+                Some(schema) => SinkConnector::with_known_schema(schema),
+                None => SinkConnector::new(placeholder_schema()),
+            };
+
+            Ok(Arc::new(connector) as Arc<dyn DataConnector>)
         })
     }
 
@@ -165,9 +277,26 @@ impl DataConnectorFactory for SinkConnectorFactory {
     }
 
     fn parameters(&self) -> &'static [ParameterSpec] {
-        &[]
+        PARAMETERS
     }
 }
+
+const PARAMETERS: &[ParameterSpec] = &[
+    // Read by the OTLP metrics service from the dataset's params. Listing it here keeps
+    // parameter processing from warning that it is unsupported, and rejects any other value
+    // when the dataset is built.
+    ParameterSpec::runtime(crate::opentelemetry_store::OTLP_METRICS_PARAM)
+        .one_of_ignore_ascii_case(&[crate::opentelemetry_store::OTLP_METRICS_PARAM_ALL])
+        .description(
+            "Set to `all` to store every metric received on `/v1/metrics` in this dataset.",
+        ),
+    // Read by the OTLP logs service from the dataset's params, as `otlp_metrics` is.
+    ParameterSpec::runtime(OTLP_LOGS_PARAM)
+        .one_of_ignore_ascii_case(&[crate::opentelemetry_logs::OTLP_LOGS_PARAM_ALL])
+        .description(
+            "Set to `all` to store every log record received on `/v1/logs` in this dataset. Requires Cayenne acceleration.",
+        ),
+];
 
 #[async_trait]
 impl DataConnector for SinkConnector {
@@ -288,3 +417,75 @@ impl DisplayAs for SinkDataSink {
 }
 
 data_connector_api::register_data_connector!("sink", SinkConnectorFactory);
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn acceleration(engine: Engine) -> Acceleration {
+        Acceleration {
+            engine,
+            ..Acceleration::default()
+        }
+    }
+
+    fn stored_schema() -> SchemaRef {
+        Arc::new(Schema::new(vec![
+            Field::new("time_unix_nano", DataType::UInt64, true),
+            Field::new("value", DataType::Float64, true),
+        ]))
+    }
+
+    #[test]
+    fn cayenne_sink_carrying_its_acceleration_schema_registers_immediately() {
+        let source = SinkConnector::with_known_schema(stored_schema());
+
+        assert!(registers_from_acceleration(
+            Some(&acceleration(Engine::Cayenne)),
+            &source
+        ));
+    }
+
+    #[test]
+    fn sink_without_a_stored_schema_waits_for_its_first_write() {
+        let source = SinkConnector::new(placeholder_schema());
+
+        assert!(
+            !registers_from_acceleration(Some(&acceleration(Engine::Cayenne)), &source),
+            "a sink with nothing but the placeholder schema has no table to register yet"
+        );
+    }
+
+    #[test]
+    fn only_cayenne_registers_a_sink_from_its_acceleration() {
+        let source = SinkConnector::with_known_schema(stored_schema());
+
+        for engine in [
+            Engine::Arrow,
+            Engine::PartitionedArrow,
+            Engine::Sqlite,
+            Engine::PostgreSQL,
+        ] {
+            assert!(
+                !registers_from_acceleration(Some(&acceleration(engine)), &source),
+                "{engine} keeps the wait-for-first-write behavior"
+            );
+        }
+    }
+
+    #[test]
+    fn an_unaccelerated_sink_has_no_acceleration_to_register_from() {
+        let source = SinkConnector::with_known_schema(stored_schema());
+
+        assert!(!registers_from_acceleration(None, &source));
+    }
+
+    #[test]
+    fn a_sink_advertising_its_acceleration_schema_serves_that_schema() {
+        let source = SinkConnector::with_known_schema(stored_schema());
+
+        assert!(source.has_known_schema());
+        assert_eq!(source.schema(), stored_schema());
+        assert!(!SinkConnector::new(placeholder_schema()).has_known_schema());
+    }
+}

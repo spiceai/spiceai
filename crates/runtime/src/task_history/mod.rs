@@ -14,18 +14,17 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use crate::accelerated::refresh::Refresh;
 use crate::component::dataset::acceleration::OnConflictBehavior;
+use crate::datafusion::SPICE_RUNTIME_SCHEMA;
 use crate::dataupdate::UpdateType;
-use crate::internal_table::create_internal_accelerated_table;
+use crate::internal_table::{create_internal_accelerated_table, internal_acceleration};
 use crate::{Runtime, status};
 use crate::{component::dataset::TimeFormat, secrets::Secrets};
-use crate::{component::dataset::acceleration::Acceleration, datafusion::SPICE_RUNTIME_SCHEMA};
 use arrow::array::{ArrayBuilder, MapBuilder, RecordBatch, StringArray, StringBuilder};
 use arrow::datatypes::{DataType, Field, Schema, TimeUnit};
 use arrow_schema::ArrowError;
 use data_components::arrow::struct_builder::StructBuilder;
-use datafusion::sql::TableReference;
+use datafusion::common::TableReference;
 use datafusion_table_providers::util::column_reference::ColumnReference;
 use datafusion_table_providers::util::constraints::UpsertOptions;
 use futures::TryStreamExt;
@@ -104,18 +103,20 @@ impl TaskSpan {
             "Task history retention check interval: {retention_check_interval_secs} seconds"
         );
 
-        let retention = Retention::builder()
-            .time_column(time_column.clone())
-            .time_format(time_format)
-            .time_period(Some(Duration::from_secs(retention_period_secs)))
-            .check_interval(Some(Duration::from_secs(retention_check_interval_secs)))
-            .enabled(true)
-            .build();
+        let retention = Retention::builder(
+            TableReference::partial(SPICE_RUNTIME_SCHEMA, DEFAULT_TASK_HISTORY_TABLE).to_string(),
+        )
+        .time_column(time_column.clone())
+        .time_format(time_format)
+        .time_period(Some(Duration::from_secs(retention_period_secs)))
+        .check_interval(Some(Duration::from_secs(retention_check_interval_secs)))
+        .enabled(true)
+        .build();
 
         let tbl_reference =
             TableReference::partial(SPICE_RUNTIME_SCHEMA, DEFAULT_TASK_HISTORY_TABLE);
 
-        let acceleration_settings = Acceleration::default().with_on_conflict(
+        let acceleration_settings = internal_acceleration().with_on_conflict(
             [(
                 ColumnReference::new(vec!["span_id".to_string()]),
                 OnConflictBehavior::Upsert(UpsertOptions::default()),
@@ -129,7 +130,6 @@ impl TaskSpan {
             Arc::new(TaskSpan::table_schema(is_cluster_mode)),
             Some(vec!["span_id".to_string()]),
             acceleration_settings,
-            Refresh::default(),
             retention,
             Arc::new(RwLock::new(Secrets::default())),
             runtime,
@@ -190,6 +190,7 @@ impl TaskSpan {
             .filter_map(|s| {
                 s.trace_id_override
                     .as_ref()
+                    .filter(|new_trace| new_trace.as_ref() != s.trace_id.as_ref())
                     .map(|new_trace| (Arc::clone(&s.trace_id), Arc::clone(new_trace)))
             })
             .collect();

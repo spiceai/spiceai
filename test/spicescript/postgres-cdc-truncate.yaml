@@ -1,0 +1,61 @@
+name: postgres-cdc-truncate
+description: >
+  PostgreSQL CDC into Cayenne, file and memory, through TRUNCATE: of one
+  table, then written to again; truncated and refilled with overlapping
+  keys in one transaction; two tables in one statement, one refilled in the
+  same transaction; and across a restart.
+sources:
+  src: { kind: postgres }
+variants:
+  file: {}
+  memory: { datasets: { '*': { acceleration: { mode: memory } } } }
+spicepod:
+  version: v1
+  kind: Spicepod
+  name: postgres-cdc-truncate
+  datasets:
+    - from: postgres:public.a
+      name: a
+      params: ${sources.src.params}
+      acceleration: { enabled: true, engine: cayenne, mode: file, refresh_mode: changes, primary_key: id, on_conflict: { id: upsert } }
+    - from: postgres:public.b
+      name: b
+      params: ${sources.src.params}
+      acceleration: { enabled: true, engine: cayenne, mode: file, refresh_mode: changes, primary_key: id, on_conflict: { id: upsert } }
+defaults:
+  cluster-partition-by: { '*': id }
+  expect: { oracle: src }
+  compare-variants: false
+steps:
+  - source-exec:
+      src: |
+        CREATE TABLE a (id int PRIMARY KEY, v text);
+        CREATE TABLE b (id int PRIMARY KEY, v text);
+        INSERT INTO a SELECT i, 'a' || i FROM generate_series(1, 1000) i;
+        INSERT INTO b SELECT i, 'b' || i FROM generate_series(1, 1000) i;
+  - start: {}
+  - query: SELECT * FROM a
+  - query: SELECT * FROM b
+  # Truncate one table, then write to it again.
+  - source-exec: { src: "TRUNCATE a" }
+  - query: SELECT count(*) AS n FROM a
+    eventually: 30s
+  - source-exec: { src: "INSERT INTO a VALUES (5, 'new5'), (2000, 'new2000')" }
+  - query: SELECT * FROM a
+    eventually: 30s
+  # Truncate and refill in one transaction, keys overlapping the old ones.
+  - source-exec: { src: "BEGIN; TRUNCATE a; INSERT INTO a SELECT i, 'again' || i FROM generate_series(1, 10) i; COMMIT" }
+  - query: SELECT * FROM a
+    eventually: 30s
+  # Both tables in one statement.
+  - source-exec: { src: "TRUNCATE a, b; INSERT INTO b VALUES (1, 'b-after')" }
+  - query: SELECT * FROM a
+    expect-empty: true
+    eventually: 30s
+  - query: SELECT * FROM b
+    eventually: 30s
+  # Restart: still right.
+  - restart: {}
+  - query: SELECT * FROM a
+    expect-empty: true
+  - query: SELECT * FROM b

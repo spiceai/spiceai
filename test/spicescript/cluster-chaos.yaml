@@ -1,0 +1,77 @@
+name: cluster-chaos
+description: >
+  On a cluster of Cayenne accelerations, readers running throughout get the
+  right answer or an error, never a wrong one, while the cluster changes
+  under them, with the cluster's state on local disk and in an object store
+  (rustfs): a full refresh of an unchanged source, an executor added
+  (partitions rebalanced), the scheduler restarted, and the scheduler killed
+  and started again. Afterwards every query answers as PostgreSQL does.
+  (Losing an executor answers empty:
+  known-failing/cluster-operations/cluster-executor-loss-cayenne.yaml. CDC on
+  two executors: cluster-cdc-duplicates.yaml.)
+
+sources:
+  src: { kind: postgres }
+  lake: { kind: rustfs }
+
+variants:
+  file-state: {}
+  # Cluster state (membership, partition assignments, jobs) in rustfs.
+  object-state:
+    spicepod:
+      runtime:
+        state:
+          location: s3://${sources.lake.bucket}/state/
+          params:
+            s3_endpoint: ${sources.lake.endpoint}
+            s3_region: us-east-1
+            s3_auth: key
+            s3_key: ${sources.lake.key}
+            s3_secret: ${sources.lake.secret}
+            allow_http: 'true'
+
+spicepod:
+  version: v1
+  kind: Spicepod
+  name: cluster-chaos
+  datasets:
+    - from: postgres:public.t
+      name: t
+      params: ${sources.src.params}
+      acceleration: { enabled: true, engine: cayenne, mode: file, refresh_mode: full, refresh_check_interval: 1h }
+
+defaults:
+  cluster: { executors: 2, spare: 1 }
+  cluster-partition-by: { '*': id }
+  expect: { oracle: src }
+  compare-variants: false
+
+steps:
+  # 6,000 rows whose d sums to 297,000.
+  - source-exec:
+      src: |
+        CREATE TABLE t (id int PRIMARY KEY, d int NOT NULL, s text);
+        INSERT INTO t SELECT i, i % 100, 'row ' || i FROM generate_series(1, 6000) i;
+  - start: {}
+  - query: SELECT count(*) AS n, sum(d) AS total FROM t
+    expect: { rows: [['6000', '297000']] }
+  - assert-objects: { source: lake, prefix: state/, min: 1 }
+    only: object-state
+
+  - background:
+      id: t-reader
+      concurrency: 2
+      query: SELECT count(*) AS n, sum(d) AS total FROM t
+      expect: { n: '6000', total: '297000' }
+  - refresh: t
+  - sleep: 5s
+  - add-executor: {}
+  - sleep: 20s
+  - restart: {}
+  - sleep: 10s
+  - restart: { kill: KILL }
+  - sleep: 20s
+
+  - stop-background: { id: t-reader, allow: ['^[45][0-9][0-9] ', 'error sending request', 'connection'] }
+  - query: SELECT * FROM t
+    eventually: 60s

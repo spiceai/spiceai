@@ -31,7 +31,7 @@ use data_components::unity_catalog::credential_vending::VendedDeltaTableFactory;
 use data_components::unity_catalog::provider::{
     ReadTableProviderFactory, UCTableProviderFactory, UnityCatalogProvider,
 };
-use datafusion::sql::TableReference;
+use datafusion::common::TableReference;
 use runtime_secrets::get_params_with_secrets;
 use secrecy::SecretString;
 use snafu::ResultExt;
@@ -253,6 +253,7 @@ mod tests {
             columns: vec![],
             storage_location: storage_location.map(ToString::to_string),
             table_id: None,
+            properties: std::collections::HashMap::new(),
         }
     }
 

@@ -80,39 +80,61 @@ impl AppendWorker {
         Self { config, source }
     }
 
-    pub async fn start(self) -> Result<JoinHandle<Result<()>>> {
-        // Outside of the join handle, run some initial setup
-        // This ensures the appendable dataset is ready before the workers start
-        let end_time = Instant::now() + self.config.end_duration;
+    /// Writes the initial data, which `spiced` loads on startup, so it must run
+    /// before `spiced` starts.
+    pub async fn setup(&self) -> Result<()> {
         println!("AppendWorker - Running append data setup");
-        self.source.setup(&self.config).await?;
+        self.source.setup(&self.config).await
+    }
 
-        let mut load_index = 1;
-        Ok(tokio::spawn(async move {
+    /// Loads every step, then waits out the rest of the test duration, both
+    /// counted from this call. Call it once the query workers are running, so
+    /// every load lands while queries are running.
+    ///
+    /// Loads are paced by `load_interval`, but never cut off by the test
+    /// duration: generating the data is the harness's own work, so a slow runner
+    /// lengthens the run instead of failing it. Only a run whose loads exceed
+    /// twice the expected length fails, which catches a stuck load.
+    pub fn start_loads(self) -> JoinHandle<Result<()>> {
+        let end_time = Instant::now() + self.config.end_duration;
+        let load_steps = self.config.load_steps;
+        let load_timeout = self.load_timeout();
+        tokio::spawn(async move {
             println!("AppendWorker - Starting append data generation");
-            while Instant::now() < end_time {
-                if load_index >= self.config.load_steps {
-                    tokio::time::sleep(self.config.load_interval).await; // don't break here - we don't want teardown to run before the end time
-                    continue;
+            let mut loaded = 1;
+            let loads = async {
+                for load_index in 1..load_steps {
+                    tokio::time::sleep(self.config.load_interval).await;
+                    self.source.generate(&self.config, load_index).await?;
+                    loaded += 1;
                 }
+                Ok::<(), anyhow::Error>(())
+            };
+            let loads_result = tokio::time::timeout(load_timeout, loads).await;
 
-                tokio::time::sleep(self.config.load_interval).await;
-                self.source.generate(&self.config, load_index).await?;
-
-                load_index += 1;
+            if matches!(loads_result, Ok(Ok(()))) {
+                // Keep the query workers running for the full test duration.
+                tokio::time::sleep(end_time.saturating_duration_since(Instant::now())).await;
             }
 
             println!("AppendWorker - Running append data teardown");
             self.source.teardown(&self.config).await?;
 
-            if load_index < self.config.load_steps {
-                return Err(anyhow::anyhow!(
-                    "Failed to load all append data in time. Only loaded {load_index}/{load_steps}",
-                    load_steps = self.config.load_steps
-                ));
+            match loads_result {
+                Ok(result) => result,
+                Err(_) => Err(anyhow::anyhow!(
+                    "Append loads did not finish within {load_timeout:?}. Only loaded {loaded}/{load_steps}"
+                )),
             }
+        })
+    }
 
-            Ok(())
-        }))
+    /// Twice the longer of the test duration and the paced loads alone.
+    fn load_timeout(&self) -> Duration {
+        let paced_loads = self
+            .config
+            .load_interval
+            .saturating_mul(u32::from(self.config.load_steps.saturating_sub(1)));
+        self.config.end_duration.max(paced_loads).saturating_mul(2)
     }
 }

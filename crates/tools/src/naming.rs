@@ -69,6 +69,14 @@ pub fn encode_tool_name(catalog_name: &str, tool_name: &str) -> String {
 /// a top-level tool that was never catalog-qualified. Because an encoded
 /// component never contains a bare `__`, the first `__` in a well-formed name
 /// is always the catalog separator.
+///
+/// Decoding is deliberately lax in one direction: it accepts a component's `__`
+/// written raw as well as escaped, so `srv__tool__name` and `srv__tool_-_name`
+/// both decode to `("srv", "tool__name")`. More than one spelling therefore
+/// names the same tool, and only [`encode_tool_name`] output is canonical — a
+/// caller that uses a *requested* name as an identity (a cache key, a metric
+/// label, a `task_history` task) will split one tool across several. Re-encode
+/// the decoded pair to canonicalize.
 #[must_use]
 pub fn decode_tool_name(name: &str) -> Option<(String, String)> {
     let (catalog, tool) = name.split_once(SEPARATOR)?;
@@ -159,6 +167,28 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn decode_accepts_a_raw_separator_inside_a_component() {
+        // Decoding is lax where encoding is not: a component's `__` is accepted
+        // raw as well as escaped, so several spellings name one tool. Callers
+        // that need an identity must re-encode the decoded pair — see the note
+        // on `decode_tool_name`.
+        let canonical = encode_tool_name("srv", "tool__name");
+        assert_eq!(canonical, "srv__tool_-_name");
+        assert_eq!(
+            decode_tool_name("srv__tool__name"),
+            decode_tool_name(&canonical),
+            "the raw and escaped spellings must name the same tool"
+        );
+        assert_eq!(
+            decode_tool_name("srv__tool__name")
+                .map(|(c, t)| encode_tool_name(&c, &t))
+                .as_deref(),
+            Some(canonical.as_str()),
+            "re-encoding a decoded pair canonicalizes the spelling"
+        );
     }
 
     #[test]

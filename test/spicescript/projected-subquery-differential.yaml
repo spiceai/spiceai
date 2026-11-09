@@ -1,0 +1,135 @@
+name: projected-subquery-differential
+description: >
+  Projected subquery predicates preserve expression names, correlations and
+  three-valued logic over seeded nullable data with duplicates. PostgreSQL is
+  the oracle for PostgreSQL/MySQL/DuckDB/DuckLake sources, federated and accelerated
+  locally. DuckDB is also read through ADBC with the DuckDB driver.
+sources:
+  backend: { kind: '${matrix.backend}' }
+  ref: { kind: postgres }
+matrix:
+  backend: [postgres, mysql, duckdb, ducklake]
+  seed: [41, 73]
+variants:
+  federated: {}
+  arrow: arrow
+  cayenne: cayenne-file
+  adbc:
+    when: { backend: duckdb }
+    datasets:
+      p:
+        from: adbc:p
+        params:
+          $merge: '${sources.backend.adbc_params}'
+          duckdb_open: null
+      b:
+        from: adbc:b
+        params:
+          $merge: '${sources.backend.adbc_params}'
+          duckdb_open: null
+
+spicepod:
+  version: v1
+  kind: Spicepod
+  name: projected-subquery-differential
+  datasets:
+    - { from: '${matrix.backend}:p', name: p, params: '${sources.backend.params}' }
+    - { from: '${matrix.backend}:b', name: b, params: '${sources.backend.params}' }
+defaults:
+  expect: { oracle: ref }
+steps:
+  - generate:
+      backend:
+        table: p
+        rows: 80
+        seed: '${matrix.seed}'
+        primary-key: id
+        columns:
+          - { name: id, sequence: 1 }
+          - { name: c, int: [-4, 4], nulls: 0.2 }
+    mirror: ref
+  - generate:
+      backend:
+        table: b
+        rows: 30
+        seed: '${matrix.seed}'
+        primary-key: id
+        columns:
+          - { name: id, sequence: 1 }
+          - { name: x, int: [-3, 3], nulls: 0.2 }
+          - { name: y, int: [-3, 3], nulls: 0.2 }
+    mirror: ref
+  - start: {}
+  # Assert the premises used by the NULL and duplicate-preservation cases.
+  - query: SELECT count(*) > 0 AS has_null_build FROM b WHERE x + y IS NULL
+    expect: { rows: [[true]] }
+  - query: SELECT count(c) > count(DISTINCT c) AS has_duplicate_probes FROM p
+    expect: { rows: [[true]] }
+  # Consume the original name of an unnamed scalar-subquery output.
+  - query: SELECT (SELECT max(x) FROM b)
+    oracle-sql: SELECT max(x) AS "max(b.x)" FROM b
+  - query: SELECT q."max(b.x)" AS result FROM (SELECT (SELECT max(x) FROM b)) q
+    oracle-sql: SELECT max(x) AS result FROM b
+  - query: SELECT q."max(b.x)" + 1 AS result FROM (SELECT (SELECT max(x) FROM b)) q
+    oracle-sql: SELECT max(x) + 1 AS result FROM b
+  # Local execution cannot lower these projected/scalar subquery forms yet.
+  # Keep them federated; the filter forms below exercise every variant.
+  # Computed build output names, mark/semi/anti joins and grouped NOT.
+  - query: SELECT id, c IN (SELECT x + y FROM b) AS matched FROM p ORDER BY id
+    only: [federated, adbc]
+  - query: SELECT id FROM p WHERE c IN (SELECT x + y FROM b) ORDER BY id
+  # A NULL build value makes every unmatched NOT IN result unknown.
+  - query: SELECT id FROM p WHERE c NOT IN (SELECT x + y FROM b) ORDER BY id
+    expect-empty: true
+  - query: SELECT count(*) AS n FROM p WHERE NOT (c IN (SELECT x + y FROM b) OR c = 0)
+  # Scalar outputs read the build's original alias, including a shadowed alias.
+  - query: SELECT id, c IN (SELECT (SELECT b.x + b.y) FROM b) AS matched FROM p ORDER BY id
+    only: [federated, adbc]
+  - query: SELECT id FROM p WHERE c IN (SELECT (SELECT p.x + p.y) FROM b p) ORDER BY id
+    only: [federated, adbc]
+  # Keep bounds, filtering and DISTINCT inside the build before correlation.
+  - query: SELECT id, c IN (SELECT v FROM (SELECT x + y AS v FROM b WHERE x > 0 ORDER BY id LIMIT 3) s) AS matched FROM p ORDER BY id
+    only: [federated, adbc]
+  - query: SELECT id, c IN (SELECT DISTINCT x + y FROM b) AS matched FROM p ORDER BY id
+    only: [federated, adbc]
+  # Computed probe outputs and nested aliases must also retain their scope.
+  - query: SELECT id, v IN (SELECT x + y FROM b) AS matched FROM (SELECT id, c + 1 AS v FROM p) q ORDER BY id
+    only: [federated, adbc]
+  - query: SELECT id FROM (SELECT id, v AS c FROM (SELECT id, c + 1 AS v FROM p) q) r WHERE c IN (SELECT x + y FROM b) ORDER BY id
+  - query: SELECT id, v IN (SELECT x < y FROM b) AS matched FROM (SELECT id, c < ANY (SELECT y FROM b) AS v FROM p) q ORDER BY id
+    only: [federated, adbc]
+  # ANY/ALL and their negations must preserve NULL and empty-build semantics.
+  - query: SELECT id, c < ANY (SELECT x + y FROM b) AS matched FROM p ORDER BY id
+    only: [federated, adbc]
+  - query: SELECT id, c < ALL (SELECT x + y FROM b) AS matched FROM p ORDER BY id
+    only: [federated, adbc]
+  - query: SELECT id, NOT (c < ALL (SELECT x + y FROM b)) AS matched FROM p ORDER BY id
+    only: [federated, adbc]
+  - query: SELECT id, c < ANY (SELECT x + y FROM b WHERE id < 0) AS matched FROM p ORDER BY id
+    only: [federated, adbc]
+  - query: SELECT id, c < ALL (SELECT x + y FROM b WHERE id < 0) AS matched FROM p ORDER BY id
+    only: [federated, adbc]
+  - query: SELECT id, c IN (SELECT x + y FROM b WHERE id < 0) AS matched FROM p ORDER BY id
+    only: [federated, adbc]
+  - query: SELECT id, c NOT IN (SELECT x + y FROM b WHERE id < 0) AS matched FROM p ORDER BY id
+    only: [federated, adbc]
+  # Compound predicates exercise mark joins rather than just WHERE EXISTS.
+  - query: SELECT id FROM p WHERE c < ANY (SELECT x + y FROM b) OR c IS NULL ORDER BY id
+  - query: SELECT id FROM p WHERE NOT (c < ALL (SELECT x + y FROM b)) OR c = 0 ORDER BY id
+  # Filter forms exercise local semi/anti/mark joins over computed outputs.
+  - query: SELECT id FROM p WHERE c IN (SELECT v FROM (SELECT x + y AS v FROM b WHERE x > 0 ORDER BY id LIMIT 3) s) ORDER BY id
+  - query: SELECT id FROM p WHERE c IN (SELECT DISTINCT x + y FROM b) ORDER BY id
+  - query: SELECT id FROM (SELECT id, c + 1 AS v FROM p) q WHERE v IN (SELECT x + y FROM b) ORDER BY id
+  - query: SELECT count(*) AS n FROM p WHERE c NOT IN (SELECT x + y FROM b WHERE x IS NOT NULL AND y IS NOT NULL)
+  - query: SELECT count(*) AS n FROM p WHERE c < ANY (SELECT x + y FROM b)
+  - query: SELECT count(*) AS n FROM p WHERE c < ALL (SELECT x + y FROM b)
+  - query: SELECT count(*) AS n FROM p WHERE NOT (c < ALL (SELECT x + y FROM b))
+  - query: SELECT count(*) AS n FROM p WHERE c < ANY (SELECT x + y FROM b WHERE id < 0)
+  - query: SELECT count(*) AS n FROM p WHERE c < ALL (SELECT x + y FROM b WHERE id < 0)
+  - query: SELECT count(*) AS n FROM p WHERE c NOT IN (SELECT x + y FROM b WHERE id < 0)
+  - explain: SELECT id FROM p WHERE c IN (SELECT x + y FROM b)
+    contains: CayenneAccelerationExec
+    only: cayenne
+  # All-NULL builds differ from empty builds for both ANY and ALL.
+  - query: SELECT count(*) AS n FROM p WHERE c < ANY (SELECT x + y FROM b WHERE x IS NULL)
+  - query: SELECT count(*) AS n FROM p WHERE c < ALL (SELECT x + y FROM b WHERE x IS NULL)

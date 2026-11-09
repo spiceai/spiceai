@@ -977,20 +977,23 @@ async fn stored_user_login(
     endpoint: &str,
     org_hint: Option<&str>,
 ) -> Result<Option<LoginCredential>> {
-    // Share the preflight's candidates and policy rather than restating them:
-    // `spice cloud link` chooses a credential before this transaction runs, and
-    // a list or a rule that differed would strand a link half-done.
     let candidates = crate::commands::cloud::client::user_credential_candidates(org_hint);
     // Share the preflight's policy rather than restating it: `spice cloud link`
     // chooses a credential before this transaction runs, and a rule that
     // accepted one here but not there would strand a link half-done.
-    Ok(
-        crate::commands::cloud::client::first_user_credential(&candidates, endpoint, org_hint)
-            .await?
-            .map(|token| LoginCredential {
+    match crate::commands::cloud::client::first_user_credential(&candidates, endpoint, org_hint)
+        .await?
+    {
+        crate::commands::cloud::client::UserCredentialSearch::Found(token) => {
+            Ok(Some(LoginCredential {
                 token: SessionToken::new(token),
-            }),
-    )
+            }))
+        }
+        crate::commands::cloud::client::UserCredentialSearch::NoneStored => Ok(None),
+        crate::commands::cloud::client::UserCredentialSearch::AllRejected => Err(
+            crate::commands::cloud::rejected_user_credential_error(Some("link"), org_hint),
+        ),
+    }
 }
 
 fn org_credential_missing(org: &str) -> Error {
@@ -1046,9 +1049,12 @@ async fn enroll(attempt: EnrollAttempt<'_>) -> Result<EnrollmentResult> {
         EnrollmentAuthority::Token { .. } => OrganizationBinding::Assertion,
         EnrollmentAuthority::AuthenticatedSession { .. } => OrganizationBinding::Fixed,
     };
+    // Spice Cloud parses the version as semver, which the `(<commit>)` the CLI and
+    // runtime print after it is not.
     let runtime_version = ctx
         .runtime_version()
         .unwrap_or_else(|_| crate::commands::version::cli_version());
+    let runtime_version = crate::commands::version::without_commit(&runtime_version).to_string();
     let mut config =
         CloudConnectConfig::from_env_at(runtime_version.clone(), config_dir.to_path_buf());
     config.enroll_endpoint.clone_from(&endpoint.value);
@@ -1999,12 +2005,12 @@ mod tests {
             self.interactive
         }
 
-        async fn read_enrollment_key(
+        fn read_enrollment_key(
             &mut self,
             _portal_url: &str,
-        ) -> Result<Option<Zeroizing<String>>> {
+        ) -> impl Future<Output = Result<Option<Zeroizing<String>>>> {
             self.key_prompts += 1;
-            Ok(self.key.take().map(Zeroizing::new))
+            std::future::ready(Ok(self.key.take().map(Zeroizing::new)))
         }
     }
 
@@ -2025,10 +2031,10 @@ mod tests {
             true
         }
 
-        async fn read_enrollment_key(
+        fn read_enrollment_key(
             &mut self,
             _portal_url: &str,
-        ) -> Result<Option<Zeroizing<String>>> {
+        ) -> impl Future<Output = Result<Option<Zeroizing<String>>>> {
             // What another process does when it takes the transaction: the
             // operation this run routed on is gone, and either a different one is
             // pending in its place or nothing is.
@@ -2045,7 +2051,7 @@ mod tests {
                 )
                 .expect("publish the replacement draft");
             }
-            Ok(self.key.take().map(Zeroizing::new))
+            std::future::ready(Ok(self.key.take().map(Zeroizing::new)))
         }
     }
 

@@ -157,8 +157,10 @@ impl Embed {
             }
         }
 
-        let embeddings = if texts.is_empty() {
-            Vec::new()
+        // `embed_sync` yields the cache's shared handle; the empty case matches
+        // that shape rather than forcing the result back into an owned `Vec`.
+        let embeddings: Arc<Vec<Vec<f32>>> = if texts.is_empty() {
+            Arc::new(Vec::new())
         } else {
             model
                 .embed_sync(EmbeddingInput::StringArray(texts))
@@ -340,21 +342,22 @@ mod tests {
     fn create_fake_model_store() -> Arc<RwLock<EmbeddingModelStore>> {
         use std::collections::HashMap;
 
+        // Loading is async; these tests call the UDF synchronously, as a query does.
+        let model = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("a runtime to load the model on")
+            .block_on(Model2Vec::load(
+                "potion_2m",
+                "minishlab/potion-base-2M",
+                llms::hf::HubParams::default(),
+                llms::model2vec::Model2VecOptions::default(),
+            ))
+            .expect("Model2Vec creation should succeed");
         let mut store = HashMap::new();
         store.insert(
             "potion_2m".to_string(),
-            Arc::new(
-                Model2Vec::from_params(
-                    "minishlab/potion-base-2M",
-                    None,
-                    None,
-                    None,
-                    None,
-                    None,
-                    None,
-                )
-                .expect("Model2Vec creation should succeed"),
-            ) as Arc<dyn llms::embeddings::Embed>,
+            Arc::new(model) as Arc<dyn llms::embeddings::Embed>,
         );
         Arc::new(RwLock::new(store))
     }

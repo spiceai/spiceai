@@ -4,11 +4,11 @@ What Cayenne persists, and where. Cayenne splits storage across **two stores plu
 
 | Store | Holds | Durability |
 |-------|-------|------------|
-| **Metastore** (SQLite / Turso) | *all* metadata — table rows, snapshot pointers, file manifests, delete-file refs, statistics, sequence numbers, the inline memtable | transactional (`BEGIN…COMMIT`) |
+| **Metastore** (SQLite) | *all* metadata — table rows, snapshot pointers, file manifests, delete-file refs, statistics, sequence numbers, the inline memtable | transactional (`BEGIN…COMMIT`) |
 | **Data lake** (local FS / S3 Express One Zone) | immutable **Vortex** data files + Arrow-IPC deletion files, grouped under per-snapshot directories | atomic file rename + snapshot-pointer flip |
 | **LSM level-0** | small writes absorbed as Arrow-IPC blobs in the metastore (`cayenne_inlined_*`) and, under the CDC profile, an in-RAM mem-tier | metastore tier is durable; RAM tier is discarded on crash and re-streamed exactly-once |
 
-> **Source of truth:** the DDL in `crates/cayenne/src/metastore/sqlite.rs` (mirrored verbatim in `turso.rs`) and the column lists in `metastore::EXPECTED_TABLES`. `validate_existing_schema` checks **column names and ordering** at startup (types are not compared — SQLite/libSQL type affinity makes exact matching unreliable). This document reflects the 11 tables in `EXPECTED_TABLES`.
+> **Source of truth:** the DDL in `crates/cayenne/src/metastore/sqlite.rs` and the column lists in `metastore::EXPECTED_TABLES`. `validate_existing_schema` checks **column names and ordering** at startup (types are not compared — SQLite type affinity makes exact matching unreliable). This document reflects the 11 tables in `EXPECTED_TABLES`.
 
 ---
 
@@ -115,7 +115,7 @@ One row per deleted-then-reinserted PK of a CDC burst (20K–55K rows on hot ups
 | `pk_bytes` | BLOB NOT NULL | **PK** part — PK row key (Arrow `RowConverter` bytes) |
 | `sequence_number` | BIGINT NOT NULL | re-insertion sequence |
 
-Declared `WITHOUT ROWID` on SQLite (clustered on `(table_id, pk_bytes)`); a plain rowid table on Turso (no `WITHOUT ROWID` under its MVCC journal mode). The legacy `insert_record_id` UUID column was dropped — it was never read.
+Declared `WITHOUT ROWID` (clustered on `(table_id, pk_bytes)`). The legacy `insert_record_id` UUID column was dropped — it was never read.
 
 #### `cayenne_pk_index` — persisted PK existence checkpoint
 
@@ -284,8 +284,10 @@ The same primitives produce visibly different trees depending on whether the wor
 
 | Deletion mode | Schema | When |
 |---------------|--------|------|
-| **Position-based** | `row_id: UInt64`, `deleted_at: Int64` (µs) | PK-less tables (always), or any table in `deletion_mode: position` |
-| **Key-based** | `row_key: Binary`, `deleted_at: Int64` (µs) | PK tables in `deletion_mode: key` (`auto` ⇒ key for `changes`-mode PK tables) |
+| **Position-based** | `row_id: UInt64`, `deleted_at: Int64` (µs) | PK-less tables (always), or a PK table on position deletes (`deletion_mode: position`, or `auto` on a table it adapts while the table is within its bound, on Linux with 8 or more physical CPU cores) for a delete whose `(file path, file-local position)` is known |
+| **Key-based** | `row_key: Binary`, `deleted_at: Int64` (µs) | PK tables on key deletes (`deletion_mode: key`; `auto` once the table outgrows its bound, from the start on a runtime with fewer than 8 physical CPU cores or not on Linux, and always on a table it does not adapt: `refresh_mode: changes`, `mode: memory`, partitioned, datalake-tiered, or on object storage) — and a position-delete PK table's fallback |
+
+The schema is chosen per *delete*, not per table: a position-delete PK table records a key-based vector for every delete without a known position — an unlocated or upserted row, and every filter-based `DELETE` — so it keeps a key deletion index too.
 
 **Staging WAL (`_wal.json`)** — makes a staged file list crash-safe via tmp + fsync + rename. On the next provider open, unreconciled WAL markers self-heal (atomic rename of staged Vortex files into the current snapshot, or rollback).
 
@@ -425,7 +427,7 @@ CachedPkIndex
 
 ### J. Coordination, staging &amp; GC — *no payload*
 
-Locks (`write_lock`, `compaction_lock`, `seq_allocator` mutex), staging trackers (`staging_wal_present`, `staging_may_have_files`, `inflight_staging_appends`, `last_moved_snapshot_files`), compaction flags (`new_files_since_last_compaction`, `post_write_compaction_scheduled`, `position_compaction_skip_streak`), background tasks (`background_compactor`, `background_mem_tier_checkpointer` — `OnceLock`), and the in-flight-scan GC guards (`snapshot_scan_refs`, `snapshot_last_listed`, `retired_snapshot_dirs`) that keep a file alive until both retirement *and* the last scan that listed it have passed.
+Locks (`write_lock`, `compaction_lock`, `seq_allocator` mutex), staging trackers (`staging_wal_present`, `staging_may_have_files`, `inflight_staging_appends`, `last_moved_snapshot_files`), compaction flags (`new_files_since_last_compaction`, `post_write_compaction_state`, `position_compaction_skip_streak`), background tasks (`background_compactor`, `background_mem_tier_checkpointer` — `OnceLock`), and the in-flight-scan GC guards (`snapshot_scan_refs`, `snapshot_last_listed`, `retired_snapshot_dirs`) that keep a file alive until both retirement *and* the last scan that listed it have passed.
 
 ### K. Memory accounting
 
@@ -439,6 +441,6 @@ Locks (`write_lock`, `compaction_lock`, `seq_allocator` mutex), staging trackers
 - **Sequence numbers** — monotonically increasing, reserved from the metastore (`reserve_sequence_numbers` batches reservations to cut round-trips). Every insert, delete, and re-insertion carries one; the scan path uses them to resolve "deleted, and re-inserted after that?".
 - **Visibility** — the authoritative state is `cayenne_table.current_snapshot_id`; a write or compaction becomes visible by an atomic flip of that pointer under the listing fence, never by mutating files in place.
 - **Schema validation** — `validate_existing_schema` compares column **names and ordering** only; a mismatch returns `CatalogError::SchemaMismatch` with an actionable "clear your acceleration data" message.
-- **Backends** — SQLite uses `BEGIN IMMEDIATE`; Turso uses `BEGIN CONCURRENT` (MVCC). DDL is identical across both except `WITHOUT ROWID` (SQLite-only).
+- **Backend** — SQLite uses `BEGIN IMMEDIATE`.
 
 > The DDL source (`metastore/sqlite.rs`) is authoritative; treat this as a quick reference. See [`README.md`](../README.md) for how these structures are used.

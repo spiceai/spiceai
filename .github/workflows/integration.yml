@@ -47,60 +47,152 @@ env:
   CARGO_HTTP_TIMEOUT: 60
   CARGO_INCREMENTAL: 0
   CARGO_NET_GIT_FETCH_WITH_CLI: true
-  HAS_TEST_MINIO_SECRET: ${{ secrets.TEST_MINIO_ENDPOINT != '' && secrets.TEST_MINIO_ACCESS_KEY != '' && secrets.TEST_MINIO_SECRET_KEY != '' }}
+  # RustFS credentials come from the job's OIDC token, which pull requests from forks
+  # and Dependabot never get; those runs pass test archives as artifacts instead.
+  HAS_RUSTFS_ACCESS: ${{ github.event_name != 'pull_request' || (github.event.pull_request.head.repo.full_name == github.repository && github.actor != 'dependabot[bot]') }}
   INTEGRATION_TESTS_ARCHIVE_S3_URI: s3://build/test_binaries/${{ github.run_id }}/integration-tests-archive/integration_tests.tar.zst
 
 jobs:
-  # Required merge-queue checks must also report on the PR head before GitHub
-  # will enqueue it. On pull requests these jobs run lightweight passthrough
-  # steps on GitHub-hosted runners; the full suite runs only on non-PR events.
+  # The suite runs on `push`, `merge_group` and `workflow_dispatch`. On a pull
+  # request every job is skipped at the job level, so each required check is
+  # published under its name with conclusion `skipped` rather than a `success`
+  # nothing ran for (#13841). Queue entry is gated by the approval rules and
+  # `Attestation`; the merge-group commit is what runs the suite.
   check_changes:
-    runs-on: ${{ github.event_name == 'pull_request' && 'ubuntu-latest' || 'spiceai-dev-runners' }}
-    # A full-history checkout (`fetch-depth: 0`) and a path diff. Sized for a
-    # cold runner having to clone from scratch, not the ~1 min a warm
-    # self-hosted workspace takes.
-    timeout-minutes: 45
+    environment: secret-free
+    if: ${{ github.event_name != 'pull_request' }}
+    runs-on: spiceai-dev-runners
+    # A full-history checkout (`fetch-depth: 0`) and a path diff. Measured at
+    # 1.8 min at most across the 880 successful `push` and `merge_group` runs
+    # from 2026-08-20 to 2026-09-25 (UTC) (p99 1.1), all on warm self-hosted
+    # workspaces. The bound is sized for a cold runner cloning the ~640 MiB
+    # pack from scratch, not for that warm case, and is what keeps a wedged
+    # checkout from holding a merge-queue candidate for long: every other job
+    # waits on this one.
+    timeout-minutes: 20
     outputs:
       # Always treat a manual workflow_dispatch run as having relevant changes so the
       # tests run even when no relevant files changed.
       relevant_changes: ${{ steps.check.outputs.relevant_changes == 'true' || github.event_name == 'workflow_dispatch' }}
+      # Whether `source-versions` runs: on every manual run (integration_nightly.yml
+      # dispatches one each night), and on a push to trunk or a release branch
+      # that touches what can behave differently on another release line of a
+      # federated source database. Not in the merge queue, where it would hold a
+      # runner per release line for a check that gates nothing; the push run
+      # after the merge reports the same commit.
+      source_changes: ${{ (github.event_name == 'push' && steps.check_sources.outputs.relevant_changes == 'true') || github.event_name == 'workflow_dispatch' }}
+      source_versions_matrix: ${{ steps.source_versions.outputs.matrix }}
     steps:
-      - name: Pull request passthrough
-        if: ${{ github.event_name == 'pull_request' }}
-        run: echo "Integration tests run on the merge-group commit"
-
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        if: ${{ github.event_name != 'pull_request' }}
         with:
           persist-credentials: false
           fetch-depth: 0
 
       - name: Check for code changes
-        if: ${{ github.event_name != 'pull_request' }}
         id: check
         uses: ./.github/actions/check-code-changes
 
+      - name: Check for federated source changes
+        id: check_sources
+        if: github.event_name == 'push'
+        uses: ./.github/actions/check-code-changes
+        with:
+          # The connectors, the test helpers that start the source containers, and
+          # the version list itself. Dependency bumps (database drivers, and the
+          # DataFusion forks whose SQL unparser writes what is pushed down) are
+          # left to the nightly run: one in six trunk commits touches Cargo.lock.
+          filters: |
+            code_changes:
+              - 'test/source_versions.json'
+              - 'crates/test-framework/src/source_versions.rs'
+              - '.github/workflows/integration.yml'
+              - '.github/scripts/docker_pull.sh'
+              - 'crates/data-connectors/connector-postgres/**'
+              - 'crates/data-connectors/connector-postgres-common/**'
+              - 'crates/data-connectors/connector-mysql/**'
+              - 'crates/data-connectors/connector-mongodb/**'
+              - 'crates/data_components/src/postgres/**'
+              - 'crates/data_components/src/postgres_replication/**'
+              - 'crates/data_components/src/mysql/**'
+              - 'crates/data_components/src/mysql_replication/**'
+              - 'crates/runtime/src/catalogconnector/postgres.rs'
+              - 'crates/runtime/src/catalogconnector/postgres_accelerated.rs'
+              - 'crates/runtime/src/catalogconnector/mysql.rs'
+              - 'crates/accelerators/accelerator-postgres/**'
+              - 'crates/vendor/pgwire-replication/**'
+              - 'crates/runtime/tests/docker/**'
+              # Every test module the source-versions filters below select.
+              - 'crates/runtime/tests/postgres/**'
+              - 'crates/runtime/tests/schema_evolution/**'
+              - 'crates/runtime/tests/retention/**'
+              - 'crates/runtime/tests/tpcds_postgres/**'
+              - 'crates/runtime/tests/hashicorp_vault/**'
+              - 'crates/runtime/tests/acceleration/refresh/**'
+              - 'crates/runtime/tests/acceleration/checkpoint_postgres.rs'
+              - 'crates/runtime/tests/acceleration/on_conflict.rs'
+              - 'crates/runtime/tests/acceleration/query_push_down.rs'
+              - 'crates/runtime/tests/mysql/**'
+              - 'crates/runtime/tests/rehydration/**'
+              - 'crates/runtime/tests/refresh_retry/mysql.rs'
+              - 'crates/runtime/tests/mongo/**'
+
+      # Every listed release line except each source's newest, which the
+      # partitions below already run as the default.
+      - name: List federated source versions
+        id: source_versions
+        run: |
+          set -euo pipefail
+          matrix="$(jq -c '[to_entries[] | select(.key != "description") | .key as $source | .value.versions[:-1][] | {source: $source, version: .version, end_of_life: .end_of_life}]' test/source_versions.json)"
+          today="$(date -u +%F)"
+          jq -r --arg today "$today" 'to_entries[] | select(.key != "description") | .key as $source | .value.versions[] | select(.end_of_life <= $today) | "::warning title=Unsupported source version::\($source) \(.version) reached end of life on \(.end_of_life); remove it from test/source_versions.json"' test/source_versions.json
+          echo "matrix=${matrix}" >> "$GITHUB_OUTPUT"
+          echo "Source versions beyond each default: ${matrix}"
+
   build:
+    environment: ci
     name: Build Test Binary
     needs: check_changes
-    runs-on: ${{ github.event_name == 'pull_request' && 'ubuntu-latest' || 'spiceai-dev-runners' }}
-    # Slowest observed success in the 2026-07-25..08-08 window: 125 min.
-    timeout-minutes: 300
+    if: ${{ github.event_name != 'pull_request' }}
+    runs-on: spiceai-dev-runners
+    permissions:
+      contents: read
+      id-token: write  # RustFS and Databricks credentials
+    # Slowest successful run from 2026-08-20 to 2026-09-25 (UTC), after the archive
+    # step was consolidated to one `nextest archive` invocation: 151.4 min
+    # (run 34988348747, merge_group, 2026-09-15), p99 115 min over 880 `push`
+    # and `merge_group` runs. The bound sits above the archive step's own 180
+    # plus the 15.7 min everything else in this job (caches, toolchain setup,
+    # the MinIO upload) has taken at most in the same window, so the step bound
+    # is what fires on a wedged build and this one stays the backstop.
+    timeout-minutes: 200
     steps:
-      - name: Pull request passthrough
-        if: ${{ github.event_name == 'pull_request' }}
-        run: echo "Integration test binaries build on the merge-group commit"
-
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         if: needs.check_changes.outputs.relevant_changes == 'true'
         with:
           persist-credentials: false
           fetch-depth: 1
 
-      # Cache Cargo dependencies
-      - name: Cache Cargo registry
+      # The Spark Connect tests, which only `extended_tests` builds compile, need a Databricks
+      # cluster that takes about 7 minutes to start. Requesting the start here lets it come
+      # up while the archive builds. The test jobs wait for it, and report a cluster that
+      # cannot start, so a failure here does not stop the build.
+      - name: Start the Databricks Spark cluster
+        if: needs.check_changes.outputs.relevant_changes == 'true' && github.event.inputs.run_all_tests == 'true'
+        continue-on-error: true
+        timeout-minutes: 2
+        env:
+          DATABRICKS_HOST: ${{ vars.NEW_DATABRICKS_HOST }}
+          DATABRICKS_CLUSTER_ID: ${{ vars.NEW_DATABRICKS_CLUSTER_ID }}
+          DATABRICKS_OIDC_CLIENT_ID: ${{ vars.DATABRICKS_OIDC_CLIENT_ID }}
+          DATABRICKS_OIDC_AUDIENCE: ${{ vars.DATABRICKS_OIDC_AUDIENCE }}
+        run: bash .github/scripts/databricks_cluster.sh start
+
+      # Cache Cargo dependencies. Saved by the "Save Cargo registry" step at the
+      # end of this job, and never from the merge queue (see there).
+      - name: Restore Cargo registry
+        id: cargo-registry
         if: needs.check_changes.outputs.relevant_changes == 'true'
-        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: |
             ~/.cargo/registry/index/
@@ -126,13 +218,23 @@ jobs:
         if: needs.check_changes.outputs.relevant_changes == 'true'
         uses: ./.github/actions/install-protoc
 
+      - name: Get RustFS credentials
+        id: rustfs
+        if: needs.check_changes.outputs.relevant_changes == 'true' && env.HAS_RUSTFS_ACCESS == 'true'
+        uses: ./.github/actions/rustfs-credentials
+        with:
+          endpoint: ${{ vars.TEST_MINIO_ENDPOINT }}
+          duration-seconds: '12000'
+          export-env: 'false'
+
       - name: Set up sccache
         if: needs.check_changes.outputs.relevant_changes == 'true'
         uses: ./.github/actions/setup-sccache
         with:
-          minio_endpoint: ${{ secrets.TEST_MINIO_ENDPOINT }}
-          minio_access_key: ${{ secrets.TEST_MINIO_ACCESS_KEY }}
-          minio_secret_key: ${{ secrets.TEST_MINIO_SECRET_KEY }}
+          minio_endpoint: ${{ vars.TEST_MINIO_ENDPOINT }}
+          minio_access_key: ${{ steps.rustfs.outputs.access-key-id }}
+          minio_secret_key: ${{ steps.rustfs.outputs.secret-access-key }}
+          minio_session_token: ${{ steps.rustfs.outputs.session-token }}
 
       - name: Set up Nextest
         if: needs.check_changes.outputs.relevant_changes == 'true'
@@ -141,6 +243,23 @@ jobs:
       # Build the test binaries without running tests
       - name: Build integration test archives
         if: needs.check_changes.outputs.relevant_changes == 'true'
+        # One `cargo nextest archive` invocation, and effectively the whole job. Bounding the
+        # step rather than only the job is what names the step that hung, instead of leaving
+        # a wedge attributed to the job as a whole.
+        #
+        # Measured on the step as it stands, after the consolidation to one `nextest
+        # archive` invocation: 143.1 min at most (run 34988348747, merge_group,
+        # 2026-09-15), p99 126.4 and median 31.7 over 188 successful `push` and
+        # `merge_group` runs from 2026-08-20 to 2026-09-25 (UTC). The spread is a cold compiler
+        # cache and a contended shared runner pool, not the diff under test, which is why
+        # the bound sits clear of the slowest legitimate build rather than near it: the
+        # earlier 150 came within 7 minutes of failing that build. 180 leaves 26%
+        # over that slowest build; if a legitimate build ever passes ~165 minutes,
+        # move this and the job bound above together, since the job bound leaves
+        # this step 184 minutes once the rest of the job's 15.7 is taken out. A
+        # genuine hang is still caught, at 3 hours, and only a hang ever pays for
+        # the headroom (#13429).
+        timeout-minutes: 180
         env:
           CARGO_INCREMENTAL: 0
           RUSTC_WRAPPER: ${{ env.RUSTC_WRAPPER }}
@@ -167,14 +286,15 @@ jobs:
           # Widening the set preserves each target's test selection because this set is a
           # superset of what that target was already built with -- not because the targets
           # are ungated. They are gated: `integration_aws_sdk` gates on
-          # `all(databricks, delta_lake)`, and `snapshot_refresh` gates each backend on
-          # `duckdb`/`sqlite`/`turso`. Every one of those features is in this set, so every
-          # gate that was satisfied before is still satisfied, and `turso` is the only one
-          # this set previously lacked. `integration` itself is unaffected: its lone `turso`
-          # gate sits inside an `any(...)` that `postgres`/`duckdb`/`sqlite` already satisfy.
-          # `turso` alongside `postgres`/`mysql`/`delta_lake`/`duckdb`/`sqlite` is the
-          # combination `make test-integration` runs.
-          FEATURES="postgres,mysql,delta_lake,duckdb,sqlite,spark,databricks,dynamodb,oracle,kafka,iceberg-write,snapshots,mongodb,turso"
+          # `all(databricks, delta_lake)`, and `snapshot_refresh` gates its backend on
+          # `sqlite`. Every one of those features is in this set, so every gate that was
+          # satisfied before is still satisfied.
+          # `postgres`/`mysql`/`delta_lake`/`adbc`/`sqlite` is the combination
+          # `make test-integration` runs; `adbc` compiles the `duckdb:` and DuckLake
+          # source tests, which read the installed DuckDB library.
+          # `debezium` compiles the `cdc_ingest` and `cdc_cayenne` Debezium tests, which
+          # are gated on it and run nowhere else.
+          FEATURES="postgres,mysql,delta_lake,adbc,sqlite,spark,databricks,dynamodb,oracle,kafka,debezium,iceberg-write,snapshots,mongodb"
           if [[ "${{ github.event.inputs.run_all_tests }}" == "true" ]]; then
             FEATURES="${FEATURES},extended_tests"
             echo "Including extended_tests"
@@ -194,7 +314,7 @@ jobs:
           archive all_targets cargo nextest archive ${PKGS} \
             --test integration --test retention_oom --test integration_aws_sdk \
             --test integration_snapshot_refresh --test credential_provider \
-            --test partition_table_provider --test hadoop_catalog_test \
+            --test partition_table_provider \
             --features ${FEAT} --archive-file integration_tests.tar.zst
 
           echo "--- archive size ---"
@@ -204,40 +324,62 @@ jobs:
           if command -v sccache >/dev/null 2>&1; then sccache --show-stats || true; fi
 
       - name: Set up MinIO client
-        if: needs.check_changes.outputs.relevant_changes == 'true' && env.HAS_TEST_MINIO_SECRET == 'true'
+        if: needs.check_changes.outputs.relevant_changes == 'true' && env.HAS_RUSTFS_ACCESS == 'true'
         uses: ./.github/actions/setup-minio
         with:
-          minio_endpoint: ${{ secrets.TEST_MINIO_ENDPOINT }}
-          minio_access_key: ${{ secrets.TEST_MINIO_ACCESS_KEY }}
-          minio_secret_key: ${{ secrets.TEST_MINIO_SECRET_KEY }}
+          minio_endpoint: ${{ vars.TEST_MINIO_ENDPOINT }}
+          minio_access_key: ${{ steps.rustfs.outputs.access-key-id }}
+          minio_secret_key: ${{ steps.rustfs.outputs.secret-access-key }}
+          minio_session_token: ${{ steps.rustfs.outputs.session-token }}
 
       - name: Upload test archives to local MinIO
-        if: needs.check_changes.outputs.relevant_changes == 'true' && env.HAS_TEST_MINIO_SECRET == 'true'
+        if: needs.check_changes.outputs.relevant_changes == 'true' && env.HAS_RUSTFS_ACCESS == 'true'
         env:
-          MINIO_ENDPOINT: ${{ secrets.TEST_MINIO_ENDPOINT }}
+          MINIO_ENDPOINT: ${{ vars.TEST_MINIO_ENDPOINT }}
         run: |
           set -euo pipefail
           : "${MINIO_ENDPOINT:?TEST_MINIO_ENDPOINT is required to upload integration test archives}"
-          mc mb --ignore-existing spice-minio/build
           mc cp ./integration_tests.tar.zst "spice-minio/${INTEGRATION_TESTS_ARCHIVE_S3_URI#s3://}"
 
       - name: Upload test archive (artifact fallback)
-        if: needs.check_changes.outputs.relevant_changes == 'true' && env.HAS_TEST_MINIO_SECRET != 'true'
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        if: needs.check_changes.outputs.relevant_changes == 'true' && env.HAS_RUSTFS_ACCESS != 'true'
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
         with:
           name: integration-tests-archive
           path: ./integration_tests.tar.zst
           retention-days: 3
           compression-level: 1
 
-  test:
-    name: Integration Tests (part ${{ matrix.label }})
+      # Not from the merge queue: a cache saved there is scoped to the queue
+      # entry's temporary `gh-readonly-queue/...` ref, which later entries and
+      # trunk cannot restore from, so each save there stored ~3 GiB that was
+      # almost never read. Merge-queue runs restore the cache trunk saves.
+      - name: Save Cargo registry
+        if: needs.check_changes.outputs.relevant_changes == 'true' && github.event_name != 'merge_group' && steps.cargo-registry.outputs.cache-hit != 'true'
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            ~/.cargo/git/db/
+          key: ${{ steps.cargo-registry.outputs.cache-primary-key }}
+
+  test-partitions:
+    name: Run Integration Tests (part ${{ matrix.label }})
     needs: [build, check_changes]
+    if: ${{ github.event_name != 'pull_request' }}
     permissions:
+      id-token: write
       contents: write
-    runs-on: ${{ github.event_name == 'pull_request' && 'ubuntu-latest' || 'spiceai-dev-runners' }}
-    # Slowest observed success in the 2026-07-25..08-08 window: 19 min.
-    timeout-minutes: 180
+    runs-on: spiceai-dev-runners
+    environment: ci
+    # Slowest successful job from 2026-08-20 to 2026-09-25 (UTC): 30.7 min (run
+    # 34948795744, merge_group, 2026-09-15), p99 27.8 min. The bounded steps below
+    # sum to 84 (14 of it the Databricks wait, which runs only with run_all_tests),
+    # and everything else in the job (image pulls, the archive download, ODPI-C) has
+    # taken at most 6.0 min in the same window, so this sits above both and the step
+    # bounds are what fire first.
+    timeout-minutes: 100
     strategy:
       fail-fast: false
       matrix:
@@ -249,10 +391,6 @@ jobs:
           - label: 3
             partition: 'count:3/3'
     steps:
-      - name: Pull request passthrough
-        if: ${{ github.event_name == 'pull_request' }}
-        run: echo "Integration test part ${{ matrix.label }} runs on the merge-group commit"
-
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         if: needs.check_changes.outputs.relevant_changes == 'true'
         with:
@@ -267,18 +405,28 @@ jobs:
         if: needs.check_changes.outputs.relevant_changes == 'true'
         uses: ./.github/actions/setup-oracle-odpi
 
+      - name: Get RustFS credentials
+        id: rustfs
+        if: needs.check_changes.outputs.relevant_changes == 'true' && env.HAS_RUSTFS_ACCESS == 'true'
+        uses: ./.github/actions/rustfs-credentials
+        with:
+          endpoint: ${{ vars.TEST_MINIO_ENDPOINT }}
+          duration-seconds: '5400'
+          export-env: 'false'
+
       - name: Set up MinIO client
-        if: needs.check_changes.outputs.relevant_changes == 'true' && env.HAS_TEST_MINIO_SECRET == 'true'
+        if: needs.check_changes.outputs.relevant_changes == 'true' && env.HAS_RUSTFS_ACCESS == 'true'
         uses: ./.github/actions/setup-minio
         with:
-          minio_endpoint: ${{ secrets.TEST_MINIO_ENDPOINT }}
-          minio_access_key: ${{ secrets.TEST_MINIO_ACCESS_KEY }}
-          minio_secret_key: ${{ secrets.TEST_MINIO_SECRET_KEY }}
+          minio_endpoint: ${{ vars.TEST_MINIO_ENDPOINT }}
+          minio_access_key: ${{ steps.rustfs.outputs.access-key-id }}
+          minio_secret_key: ${{ steps.rustfs.outputs.secret-access-key }}
+          minio_session_token: ${{ steps.rustfs.outputs.session-token }}
 
       - name: Download test archive from local MinIO
-        if: needs.check_changes.outputs.relevant_changes == 'true' && env.HAS_TEST_MINIO_SECRET == 'true'
+        if: needs.check_changes.outputs.relevant_changes == 'true' && env.HAS_RUSTFS_ACCESS == 'true'
         env:
-          MINIO_ENDPOINT: ${{ secrets.TEST_MINIO_ENDPOINT }}
+          MINIO_ENDPOINT: ${{ vars.TEST_MINIO_ENDPOINT }}
         run: |
           set -euo pipefail
           : "${MINIO_ENDPOINT:?TEST_MINIO_ENDPOINT is required to download integration test archive}"
@@ -286,8 +434,8 @@ jobs:
           mc cp "spice-minio/${INTEGRATION_TESTS_ARCHIVE_S3_URI#s3://}" ./integration_tests/integration_tests.tar.zst
 
       - name: Download test archive
-        if: needs.check_changes.outputs.relevant_changes == 'true' && env.HAS_TEST_MINIO_SECRET != 'true'
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        if: needs.check_changes.outputs.relevant_changes == 'true' && env.HAS_RUSTFS_ACCESS != 'true'
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
         with:
           name: integration-tests-archive
           path: ./integration_tests
@@ -296,89 +444,198 @@ jobs:
         if: needs.check_changes.outputs.relevant_changes == 'true'
         uses: ./.github/actions/setup-nextest
 
+      # duckdb: and ducklake: datasets load the installed DuckDB through ADBC.
+      - name: Install libduckdb
+        if: needs.check_changes.outputs.relevant_changes == 'true'
+        uses: ./.github/actions/setup-libduckdb
+
+      # Tests also pull images, so the login has to last the whole job.
       - name: Login to DockerHub
         if: needs.check_changes.outputs.relevant_changes == 'true' && github.repository == 'spiceai/spiceai'
-        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
+        uses: docker/login-action@8aa5831fb8d48d8f76594c7ddde61ae58019f550 # v4.8.0
+        env:
+          DOCKERHUB_OIDC_CONNECTIONID: ${{ vars.DOCKERHUB_OIDC_CONNECTIONID }}
+          DOCKERHUB_OIDC_EXPIREIN: '21600'
         with:
-          username: ${{ secrets.DOCKERHUB_USERNAME }}
-          password: ${{ secrets.DOCKERHUB_TOKEN }}
+          username: ${{ vars.DOCKERHUB_ORGANIZATION }}
 
       - name: Pull database images
         if: needs.check_changes.outputs.relevant_changes == 'true'
+        # docker_pull.sh retries a registry 5xx or a dropped connection.
+        shell: bash
         run: |
-          docker pull docker.io/library/postgres:latest
-          docker pull docker.io/library/mysql:latest
-          docker pull docker.io/library/mongo:latest
-          docker pull docker.io/gvenzl/oracle-free:latest
+          set -euo pipefail
+          # Each source's default release line (the newest in test/source_versions.json).
+          list="$(jq -r 'to_entries[] | select(.key != "description") | "\(.value.image):\(.value.versions[-1].version)"' test/source_versions.json)"
+          mapfile -t images <<<"${list}"
+          bash .github/scripts/docker_pull.sh "${images[@]}" docker.io/gvenzl/oracle-free:latest
 
       - name: Set up Spice.ai API Key
         if: needs.check_changes.outputs.relevant_changes == 'true'
+        env:
+          SPICEAI_API_KEY: ${{ secrets.SPICE_SECRET_SPICEAI_KEY }}
         run: |
-          echo 'SPICEAI_API_KEY="${{ secrets.SPICE_SECRET_SPICEAI_KEY }}"' > .env
+          printf 'SPICEAI_API_KEY="%s"\n' "$SPICEAI_API_KEY" > .env
 
-      - name: Set up Github Token
-        if: needs.check_changes.outputs.relevant_changes == 'true'
-        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v2
-        id: github-app-token
+      # Short-lived AWS credentials, one role per test area. They are kept out of the job's
+      # environment so they do not replace the RustFS credentials, and are passed to the test step.
+      - name: Assume the Databricks Delta role
+        id: aws-databricks-delta-new
+        if: needs.check_changes.outputs.relevant_changes == 'true' && env.HAS_RUSTFS_ACCESS == 'true'
+        uses: aws-actions/configure-aws-credentials@e1253824e5c10ff9df46874f81ed3ec929e19cfd # v6.3.0
         with:
-          app-id: ${{ vars.ORG_MEMBERS_GITHUB_APP_ID }}
-          private-key: ${{ secrets.ORG_MEMBERS_GITHUB_PRIVATE_KEY }}
-          owner: spiceai
-          repositories: |
-            spiceai
+          role-to-assume: ${{ secrets.NEW_AWS_DATABRICKS_DELTA_ROLE_ARN }}
+          role-session-name: gha-databricks-delta-${{ github.run_id }}
+          role-duration-seconds: 5400
+          aws-region: us-east-1
+          output-env-credentials: false
+          output-credentials: true
+
+      - name: Assume the Iceberg role
+        id: aws-iceberg
+        if: needs.check_changes.outputs.relevant_changes == 'true' && env.HAS_RUSTFS_ACCESS == 'true'
+        uses: aws-actions/configure-aws-credentials@e1253824e5c10ff9df46874f81ed3ec929e19cfd # v6.3.0
+        with:
+          role-to-assume: ${{ secrets.AWS_ICEBERG_ROLE_ARN }}
+          role-session-name: gha-iceberg-${{ github.run_id }}
+          role-duration-seconds: 5400
+          aws-region: us-east-1
+          output-env-credentials: false
+          output-credentials: true
+
+      - name: Assume the DynamoDB role
+        id: aws-dynamodb
+        if: needs.check_changes.outputs.relevant_changes == 'true' && env.HAS_RUSTFS_ACCESS == 'true'
+        uses: aws-actions/configure-aws-credentials@e1253824e5c10ff9df46874f81ed3ec929e19cfd # v6.3.0
+        with:
+          role-to-assume: ${{ secrets.AWS_DYNAMODB_ROLE_ARN }}
+          role-session-name: gha-dynamodb-${{ github.run_id }}
+          role-duration-seconds: 5400
+          aws-region: us-east-1
+          output-env-credentials: false
+          output-credentials: true
+
+      - name: Assume the S3 Vectors role
+        id: aws-s3-vectors
+        if: needs.check_changes.outputs.relevant_changes == 'true' && env.HAS_RUSTFS_ACCESS == 'true'
+        uses: aws-actions/configure-aws-credentials@e1253824e5c10ff9df46874f81ed3ec929e19cfd # v6.3.0
+        with:
+          role-to-assume: ${{ secrets.AWS_S3_VECTORS_ROLE_ARN }}
+          role-session-name: gha-s3-vectors-${{ github.run_id }}
+          role-duration-seconds: 5400
+          aws-region: us-east-1
+          output-env-credentials: false
+          output-credentials: true
+
+      # The build job requested the cluster's start; a 7-minute start is longer than the
+      # Spark Connect tests wait. 12 minutes covers a start requested here instead.
+      - name: Wait for the Databricks Spark cluster
+        if: needs.check_changes.outputs.relevant_changes == 'true' && github.event.inputs.run_all_tests == 'true'
+        timeout-minutes: 14
+        env:
+          DATABRICKS_HOST: ${{ vars.NEW_DATABRICKS_HOST }}
+          DATABRICKS_CLUSTER_ID: ${{ vars.NEW_DATABRICKS_CLUSTER_ID }}
+          DATABRICKS_OIDC_CLIENT_ID: ${{ vars.DATABRICKS_OIDC_CLIENT_ID }}
+          DATABRICKS_OIDC_AUDIENCE: ${{ vars.DATABRICKS_OIDC_AUDIENCE }}
+          DATABRICKS_CLUSTER_WAIT_SECONDS: '720'
+        run: bash .github/scripts/databricks_cluster.sh wait
 
       - name: Run integration test
         if: needs.check_changes.outputs.relevant_changes == 'true'
+        # 13.1 minutes at most across the three partitions (run 36019894787, part 2,
+        # 2026-09-24) over 119 successful `push` and `merge_group` runs from 2026-08-20 to
+        # 2026-09-25, with a median under 4 - a spread of more than three, because these
+        # tests wait on external services (Databricks, Oracle Cloud, S3) whose latency is
+        # not ours. The bound is set well above the worst case rather than close to it for
+        # that reason, and below the job's so a wedge here is attributed to this step
+        # rather than to the job.
+        #
+        # The snapshot steps after it are deliberately not reached when this one fails: their
+        # conditions carry no status function, so GitHub applies `success()` and a partial
+        # snapshot set never reaches `upload-integration-snapshots` to become an update
+        # branch. A timeout is a failure by that measure, which is the behaviour we want.
+        timeout-minutes: 40
         env:
           AWS_EC2_METADATA_DISABLED: true
           INSTA_UPDATE: ${{ github.event.inputs.update_snapshots }}
           SPICE_SECRET_SPICEAI_KEY: ${{ secrets.SPICE_SECRET_SPICEAI_KEY }}
-          GITHUB_ORG_TOKEN: ${{ steps.github-app-token.outputs.token }}
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           # MinIO/S3-compatible storage for TPC-DS and other S3 tests
-          MINIO_ENDPOINT: ${{ secrets.TEST_MINIO_ENDPOINT }}
-          MINIO_ACCESS_KEY_ID: ${{ secrets.TEST_MINIO_ACCESS_KEY }}
-          MINIO_SECRET_ACCESS_KEY: ${{ secrets.TEST_MINIO_SECRET_KEY }}
-          # old dbc instance
-          TEST_DATABRICKS_HOST: ${{ vars.DATABRICKS_HOST }}
-          TEST_DATABRICKS_TOKEN: ${{ secrets.DATABRICKS_TOKEN }}
-          TEST_DATABRICKS_CLUSTER_ID: ${{ vars.DATABRICKS_CLUSTER_ID }}
-          TEST_DATABRICKS_SQL_WAREHOUSE_ID: ${{ vars.DATABRICKS_SQL_WAREHOUSE_ID }}
-          AWS_DATABRICKS_DELTA_ACCESS_KEY_ID: ${{ secrets.AWS_DATABRICKS_DELTA_ACCESS_KEY_ID }}
-          AWS_DATABRICKS_DELTA_SECRET_ACCESS_KEY: ${{ secrets.AWS_DATABRICKS_DELTA_SECRET_ACCESS_KEY }}
-          # new dbc instance
+          MINIO_ENDPOINT: ${{ vars.TEST_MINIO_ENDPOINT }}
+          MINIO_ACCESS_KEY_ID: ${{ steps.rustfs.outputs.access-key-id }}
+          MINIO_SECRET_ACCESS_KEY: ${{ steps.rustfs.outputs.secret-access-key }}
+          MINIO_SESSION_TOKEN: ${{ steps.rustfs.outputs.session-token }}
+          NEW_AWS_DATABRICKS_DELTA_ACCESS_KEY_ID: ${{ steps.aws-databricks-delta-new.outputs.aws-access-key-id }}
+          NEW_AWS_DATABRICKS_DELTA_SECRET_ACCESS_KEY: ${{ steps.aws-databricks-delta-new.outputs.aws-secret-access-key }}
+          NEW_AWS_DATABRICKS_DELTA_SESSION_TOKEN: ${{ steps.aws-databricks-delta-new.outputs.aws-session-token }}
+          AWS_DATABRICKS_DELTA_ACCESS_KEY_ID: ${{ steps.aws-databricks-delta-new.outputs.aws-access-key-id }}
+          AWS_DATABRICKS_DELTA_SECRET_ACCESS_KEY: ${{ steps.aws-databricks-delta-new.outputs.aws-secret-access-key }}
+          AWS_DATABRICKS_DELTA_SESSION_TOKEN: ${{ steps.aws-databricks-delta-new.outputs.aws-session-token }}
+          TEST_DATABRICKS_HOST: ${{ vars.NEW_DATABRICKS_HOST }}
           NEW_DATABRICKS_HOST: ${{ vars.NEW_DATABRICKS_HOST }}
           NEW_DATABRICKS_CLUSTER_ID: ${{ vars.NEW_DATABRICKS_CLUSTER_ID }}
-          NEW_DATABRICKS_SP_CLIENT_ID: ${{ secrets.NEW_DATABRICKS_SP_CLIENT_ID }}
-          NEW_DATABRICKS_SP_CLIENT_SECRET: ${{ secrets.NEW_DATABRICKS_SP_CLIENT_SECRET }}
-          NEW_AWS_DATABRICKS_DELTA_ACCESS_KEY_ID: ${{ secrets.NEW_AWS_DATABRICKS_DELTA_ACCESS_KEY_ID }}
-          NEW_AWS_DATABRICKS_DELTA_SECRET_ACCESS_KEY: ${{ secrets.NEW_AWS_DATABRICKS_DELTA_SECRET_ACCESS_KEY }}
+          NEW_DATABRICKS_SQL_WAREHOUSE_ID: ${{ vars.SQL_WAREHOUSE_DATABRICKS_SQL_WAREHOUSE_ID }}
+          DATABRICKS_OIDC_CLIENT_ID: ${{ vars.DATABRICKS_OIDC_CLIENT_ID }}
+          DATABRICKS_OIDC_AUDIENCE: ${{ vars.DATABRICKS_OIDC_AUDIENCE }}
           SPICEAI_API_KEY: ${{ secrets.SPICE_SECRET_SPICEAI_TPCH_BENCHMARK_KEY }}
-          AWS_ICEBERG_ACCESS_KEY_ID: ${{ secrets.AWS_ICEBERG_ACCESS_KEY_ID }}
-          AWS_ICEBERG_SECRET_ACCESS_KEY: ${{ secrets.AWS_ICEBERG_SECRET_ACCESS_KEY }}
-          AWS_ICEBERG_REGION: ${{ secrets.AWS_ICEBERG_REGION }}
-          AWS_ICEBERG_ACCOUNT_ID: ${{ secrets.AWS_ICEBERG_ACCOUNT_ID }}
-          AWS_GLUE_KEY: ${{ secrets.AWS_ICEBERG_ACCESS_KEY_ID }}
-          AWS_GLUE_SECRET: ${{ secrets.AWS_ICEBERG_SECRET_ACCESS_KEY }}
-          AWS_DYNAMODB_KEY: ${{ secrets.AWS_DYNAMODB_ACCESS_KEY_ID }}
-          AWS_DYNAMODB_SECRET: ${{ secrets.AWS_DYNAMODB_SECRET_ACCESS_KEY }}
+          AWS_ICEBERG_ACCESS_KEY_ID: ${{ steps.aws-iceberg.outputs.aws-access-key-id }}
+          AWS_ICEBERG_SECRET_ACCESS_KEY: ${{ steps.aws-iceberg.outputs.aws-secret-access-key }}
+          AWS_ICEBERG_SESSION_TOKEN: ${{ steps.aws-iceberg.outputs.aws-session-token }}
+          AWS_ICEBERG_REGION: ${{ vars.AWS_ICEBERG_REGION }}
+          AWS_ICEBERG_ACCOUNT_ID: ${{ vars.AWS_ICEBERG_ACCOUNT_ID }}
+          AWS_GLUE_KEY: ${{ steps.aws-iceberg.outputs.aws-access-key-id }}
+          AWS_GLUE_SECRET: ${{ steps.aws-iceberg.outputs.aws-secret-access-key }}
+          AWS_GLUE_SESSION_TOKEN: ${{ steps.aws-iceberg.outputs.aws-session-token }}
+          AWS_DYNAMODB_KEY: ${{ steps.aws-dynamodb.outputs.aws-access-key-id }}
+          AWS_DYNAMODB_SECRET: ${{ steps.aws-dynamodb.outputs.aws-secret-access-key }}
+          AWS_DYNAMODB_SESSION_TOKEN: ${{ steps.aws-dynamodb.outputs.aws-session-token }}
           ORACLE_CLOUD_CONNECTION_STRING: ${{ secrets.ORACLE_CLOUD_CONNECTION_STRING }}
           ORACLE_CLOUD_USERNAME: ${{ secrets.ORACLE_CLOUD_USERNAME }}
           ORACLE_CLOUD_PASSWORD: ${{ secrets.ORACLE_CLOUD_PASSWORD }}
           ORACLE_CLOUD_WALLET_SSO_CERT: ${{ secrets.ORACLE_CLOUD_WALLET_SSO_CERT }}
-          AWS_SNAPSHOT_KEY: ${{ secrets.AWS_ICEBERG_ACCESS_KEY_ID }}
-          AWS_SNAPSHOT_SECRET: ${{ secrets.AWS_ICEBERG_SECRET_ACCESS_KEY }}
-          AWS_S3_VECTORS_KEY: ${{ secrets.AWS_S3_VECTORS_KEY }}
-          AWS_S3_VECTORS_SECRET: ${{ secrets.AWS_S3_VECTORS_SECRET }}
+          AWS_SNAPSHOT_KEY: ${{ steps.aws-iceberg.outputs.aws-access-key-id }}
+          AWS_SNAPSHOT_SECRET: ${{ steps.aws-iceberg.outputs.aws-secret-access-key }}
+          AWS_SNAPSHOT_SESSION_TOKEN: ${{ steps.aws-iceberg.outputs.aws-session-token }}
+          AWS_S3_VECTORS_KEY: ${{ steps.aws-s3-vectors.outputs.aws-access-key-id }}
+          AWS_S3_VECTORS_SECRET: ${{ steps.aws-s3-vectors.outputs.aws-secret-access-key }}
+          AWS_S3_VECTORS_SESSION_TOKEN: ${{ steps.aws-s3-vectors.outputs.aws-session-token }}
         run: |
+          # `adbc::` runs in `ADBC Integration Tests` (integration_adbc.yml), the one job that
+          # installs the SQLite ADBC driver those tests load; the `adbc` feature in this
+          # archive is here for the `duckdb:` and DuckLake source tests.
           if [ -n "$SPICE_SECRET_SPICEAI_KEY" ]; then
-            INSTA_WORKSPACE_ROOT="${PWD}" CARGO_MANIFEST_DIR="${PWD}" cargo nextest run --workspace-remap "${PWD}" --partition '${{ matrix.partition }}' --archive-file ./integration_tests/integration_tests.tar.zst -E 'binary_id(=runtime::integration)'
+            INSTA_WORKSPACE_ROOT="${PWD}" CARGO_MANIFEST_DIR="${PWD}" cargo nextest run --workspace-remap "${PWD}" --partition '${{ matrix.partition }}' --archive-file ./integration_tests/integration_tests.tar.zst -E 'binary_id(=runtime::integration) - test(/^github::/) - test(/^adbc::/)'
           else
-            INSTA_WORKSPACE_ROOT="${PWD}" CARGO_MANIFEST_DIR="${PWD}" cargo nextest run --workspace-remap "${PWD}" --partition '${{ matrix.partition }}' --archive-file ./integration_tests/integration_tests.tar.zst -E 'binary_id(=runtime::integration) - test(spiceai_integration_test)'
+            INSTA_WORKSPACE_ROOT="${PWD}" CARGO_MANIFEST_DIR="${PWD}" cargo nextest run --workspace-remap "${PWD}" --partition '${{ matrix.partition }}' --archive-file ./integration_tests/integration_tests.tar.zst -E 'binary_id(=runtime::integration) - test(spiceai_integration_test) - test(/^github::/) - test(/^adbc::/)'
           fi
+
+      - name: Configure apt mirrors for the retention OOM test
+        if: needs.check_changes.outputs.relevant_changes == 'true' && matrix.partition == 'count:1/3'
+        uses: ./.github/actions/configure-apt
+
+      # The retention OOM test packages its own debug test binary as the Docker build context
+      # and runs `strip --strip-debug` on it first. This job installs no C toolchain, so without
+      # binutils the test stages the unstripped binary (several GiB), and every attempt spends
+      # its 360s ceiling transferring and exporting that context before the workload starts.
+      - name: Install binutils for the retention OOM test
+        if: needs.check_changes.outputs.relevant_changes == 'true' && matrix.partition == 'count:1/3'
+        timeout-minutes: 5
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends binutils
+          strip --version | head -1
 
       - name: Run retention OOM regression test
         if: needs.check_changes.outputs.relevant_changes == 'true' && matrix.partition == 'count:1/3'
+        # Sized to hold the test's whole retry budget, not one pass of it: nextest
+        # spends ~3.2 min extracting and listing before the first attempt, each
+        # attempt that hangs is killed at the 360s ceiling, and `.config/nextest.toml`
+        # allows three attempts, so the worst case is 22 minutes. A bound below that
+        # cannot report a verdict — the step dies mid-attempt and the failure names
+        # the action, not the test — which is what the earlier 20 did fourteen times
+        # between 2026-08-25 and 2026-09-18 (#13512). The coupling is held by
+        # `.github/scripts/check_nextest_config.py`, so neither number can drift on
+        # its own; the job bound above sits over this plus the sibling step.
+        timeout-minutes: 25
         run: |
           INSTA_WORKSPACE_ROOT="${PWD}" CARGO_MANIFEST_DIR="${PWD}" cargo nextest run --workspace-remap "${PWD}" --archive-file ./integration_tests/integration_tests.tar.zst -E 'binary_id(=runtime::retention_oom)'
 
@@ -400,22 +657,333 @@ jobs:
         shell: bash
       - name: Store integration snapshots artifact
         if: github.event.inputs.update_snapshots == 'always' && steps.create_snapshot_archive.outputs.created == 'true' && needs.check_changes.outputs.relevant_changes == 'true'
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
         with:
           name: integration-snapshots-part-${{ matrix.label }}
           path: integration-snapshots-part-${{ matrix.label }}.tar.gz
           retention-days: 1
 
+  # The tests that start a federated source database, run again on every other
+  # supported release line of that database. The partitions above run each
+  # source's newest line (test/source_versions.json); this job reuses their test
+  # archive with `SPICE_TEST_<SOURCE>_VERSION` set, so nothing is rebuilt. When it
+  # runs is `source_changes` in `check_changes`.
+  source-versions:
+    name: Integration Tests (${{ matrix.source }} ${{ matrix.version }})
+    needs: [build, check_changes]
+    if: ${{ github.event_name != 'pull_request' && needs.check_changes.outputs.relevant_changes == 'true' && needs.check_changes.outputs.source_changes == 'true' && needs.check_changes.outputs.source_versions_matrix != '[]' }}
+    runs-on: spiceai-dev-runners
+    environment: ci
+    permissions:
+      contents: read
+      id-token: write  # RustFS credentials
+    # The largest leg, PostgreSQL, ran its 85 tests in 4.3 minutes locally (six
+    # threads, PostgreSQL 14, 2026-10-08), against 13.1 minutes at most for a
+    # whole partition in CI; the bound leaves a cold runner room for the archive
+    # download and the image pull.
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        include: ${{ fromJSON(needs.check_changes.outputs.source_versions_matrix) }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          fetch-depth: 1
+
+      - name: Set up Rust
+        uses: ./.github/actions/setup-rust
+
+      # The archive links the Oracle client library, as in the partitions.
+      - name: Install Oracle ODPI-C
+        uses: ./.github/actions/setup-oracle-odpi
+
+      - name: Get RustFS credentials
+        id: rustfs
+        if: env.HAS_RUSTFS_ACCESS == 'true'
+        uses: ./.github/actions/rustfs-credentials
+        with:
+          endpoint: ${{ vars.TEST_MINIO_ENDPOINT }}
+          duration-seconds: '3600'
+          export-env: 'false'
+
+      - name: Set up MinIO client
+        if: env.HAS_RUSTFS_ACCESS == 'true'
+        uses: ./.github/actions/setup-minio
+        with:
+          minio_endpoint: ${{ vars.TEST_MINIO_ENDPOINT }}
+          minio_access_key: ${{ steps.rustfs.outputs.access-key-id }}
+          minio_secret_key: ${{ steps.rustfs.outputs.secret-access-key }}
+          minio_session_token: ${{ steps.rustfs.outputs.session-token }}
+
+      - name: Download test archive from local MinIO
+        if: env.HAS_RUSTFS_ACCESS == 'true'
+        env:
+          MINIO_ENDPOINT: ${{ vars.TEST_MINIO_ENDPOINT }}
+        run: |
+          set -euo pipefail
+          : "${MINIO_ENDPOINT:?TEST_MINIO_ENDPOINT is required to download integration test archive}"
+          mkdir -p ./integration_tests
+          mc cp "spice-minio/${INTEGRATION_TESTS_ARCHIVE_S3_URI#s3://}" ./integration_tests/integration_tests.tar.zst
+
+      - name: Download test archive
+        if: env.HAS_RUSTFS_ACCESS != 'true'
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
+        with:
+          name: integration-tests-archive
+          path: ./integration_tests
+
+      - name: Set up Nextest
+        uses: ./.github/actions/setup-nextest
+
+      # duckdb: and ducklake: datasets load the installed DuckDB through ADBC.
+      - name: Install libduckdb
+        uses: ./.github/actions/setup-libduckdb
+
+      # Tests also pull images, so the login has to last the whole job.
+      - name: Login to DockerHub
+        if: github.repository == 'spiceai/spiceai'
+        uses: docker/login-action@8aa5831fb8d48d8f76594c7ddde61ae58019f550 # v4.8.0
+        env:
+          DOCKERHUB_OIDC_CONNECTIONID: ${{ vars.DOCKERHUB_OIDC_CONNECTIONID }}
+          DOCKERHUB_OIDC_EXPIREIN: '21600'
+        with:
+          username: ${{ vars.DOCKERHUB_ORGANIZATION }}
+
+      - name: Pull ${{ matrix.source }} ${{ matrix.version }}
+        env:
+          SOURCE: ${{ matrix.source }}
+          VERSION: ${{ matrix.version }}
+        run: |
+          set -euo pipefail
+          image="$(jq -r --arg source "${SOURCE}" '.[$source].image' test/source_versions.json)"
+          bash .github/scripts/docker_pull.sh "${image}:${VERSION}"
+
+      - name: Run ${{ matrix.source }} ${{ matrix.version }} tests
+        timeout-minutes: 45
+        env:
+          AWS_EC2_METADATA_DISABLED: true
+          SOURCE: ${{ matrix.source }}
+          VERSION: ${{ matrix.version }}
+        run: |
+          set -euo pipefail
+          # The test modules that start each source's container. A new module that
+          # starts one belongs here too, or this job never runs it on older lines.
+          # `retention::test_retention_sql` reads a Spice Cloud dataset, not a
+          # source container, so it runs once, in the partitions, with their key.
+          case "${SOURCE}" in
+            postgres)
+              export SPICE_TEST_POSTGRES_VERSION="${VERSION}"
+              filter='(test(/^(postgres|schema_evolution|retention|tpcds_postgres|hashicorp_vault)::/) | test(/^acceleration::(refresh|checkpoint_postgres|on_conflict|query_push_down)::/)) - test(=retention::test_retention_sql)'
+              ;;
+            mysql)
+              export SPICE_TEST_MYSQL_VERSION="${VERSION}"
+              filter='test(/^(mysql|rehydration)::/) | test(/^refresh_retry::mysql::/)'
+              ;;
+            mongodb)
+              export SPICE_TEST_MONGODB_VERSION="${VERSION}"
+              filter='test(/^mongo::/)'
+              ;;
+            *)
+              echo "::error::No test filter for source '${SOURCE}'; add one to this step"
+              exit 1
+              ;;
+          esac
+          INSTA_WORKSPACE_ROOT="${PWD}" CARGO_MANIFEST_DIR="${PWD}" cargo nextest run --workspace-remap "${PWD}" --archive-file ./integration_tests/integration_tests.tar.zst -E "binary_id(=runtime::integration) & (${filter})"
+
+  # Preserve the required check names and make the isolated GitHub lane part
+  # of each result. A failed dependency must produce a failure, not a skipped
+  # gate, hence `always()`; on a pull request the gate is skipped instead, so
+  # the check reports `skipped` rather than a success it did not establish.
+  # Three jobs rather than a matrix: a skipped matrix job publishes one check
+  # under its unexpanded template name (`Integration Tests (part ${{ matrix.label }})`),
+  # and the ruleset requires the three expanded names on the pull request head.
+  #
+  # `needs.test-partitions.result` folds the three matrix legs into one value,
+  # so a failure in one part would turn all three checks red. When it is not a
+  # success, each gate reads its own leg's conclusion from the jobs API and
+  # reports that, so the red check names the part that actually failed. If the
+  # lookup does not yield exactly one conclusion, the gate falls back to the
+  # combined result: it can only ever be as strict as before, never laxer.
+  test-part-1:
+    environment: secret-free
+    name: Integration Tests (part 1)
+    needs: [check_changes, test-partitions, test-github]
+    if: ${{ always() && github.event_name != 'pull_request' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      actions: read
+    steps:
+      - name: Require integration and GitHub results
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PART: '1'
+          CHANGE_CHECK_RESULT: ${{ needs.check_changes.result }}
+          RELEVANT_CHANGES: ${{ needs.check_changes.outputs.relevant_changes }}
+          PARTITIONS_RESULT: ${{ needs.test-partitions.result }}
+          GITHUB_RESULT: ${{ needs.test-github.result }}
+        run: |
+          set -euo pipefail
+          if [ "$CHANGE_CHECK_RESULT" != success ]; then
+            echo "::error::check_changes concluded '$CHANGE_CHECK_RESULT', so it is unknown whether this commit needed the integration suite."
+            exit 1
+          fi
+          [ "$RELEVANT_CHANGES" = true ] || exit 0
+          ok=true
+          if [ "$GITHUB_RESULT" != success ]; then
+            echo "::error::'GitHub Connector Integration Tests' concluded '$GITHUB_RESULT'. Its log names the failing tests."
+            ok=false
+          fi
+          leg="Run Integration Tests (part $PART)"
+          result="$PARTITIONS_RESULT"
+          subject="The three 'Run Integration Tests' parts together"
+          if [ "$result" != success ]; then
+            own=$(gh api --paginate "repos/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID/attempts/$GITHUB_RUN_ATTEMPT/jobs?per_page=100" \
+              --jq ".jobs[] | select(.name == \"$leg\") | .conclusion // \"none\"") || own=""
+            if [ "$(grep -c . <<<"$own" || true)" = 1 ]; then
+              result="$own"
+              subject="'$leg'"
+            else
+              echo "::warning::Could not read the conclusion of '$leg' alone, so this check reports the combined result of all three parts."
+            fi
+          fi
+          if [ "$result" = success ]; then
+            [ "$PARTITIONS_RESULT" = success ] || echo "$subject passed. Another part failed and is reported by its own check."
+          else
+            case "$result" in
+              failure) echo "::error::$subject concluded 'failure'. The failed job's log names the failing tests." ;;
+              *) echo "::error::$subject concluded '$result', which happens when 'Build Test Binary' did not succeed or the run was cancelled." ;;
+            esac
+            ok=false
+          fi
+          [ "$ok" = true ]
+
+  test-part-2:
+    environment: secret-free
+    name: Integration Tests (part 2)
+    needs: [check_changes, test-partitions, test-github]
+    if: ${{ always() && github.event_name != 'pull_request' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      actions: read
+    steps:
+      - name: Require integration and GitHub results
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PART: '2'
+          CHANGE_CHECK_RESULT: ${{ needs.check_changes.result }}
+          RELEVANT_CHANGES: ${{ needs.check_changes.outputs.relevant_changes }}
+          PARTITIONS_RESULT: ${{ needs.test-partitions.result }}
+          GITHUB_RESULT: ${{ needs.test-github.result }}
+        run: |
+          set -euo pipefail
+          if [ "$CHANGE_CHECK_RESULT" != success ]; then
+            echo "::error::check_changes concluded '$CHANGE_CHECK_RESULT', so it is unknown whether this commit needed the integration suite."
+            exit 1
+          fi
+          [ "$RELEVANT_CHANGES" = true ] || exit 0
+          ok=true
+          if [ "$GITHUB_RESULT" != success ]; then
+            echo "::error::'GitHub Connector Integration Tests' concluded '$GITHUB_RESULT'. Its log names the failing tests."
+            ok=false
+          fi
+          leg="Run Integration Tests (part $PART)"
+          result="$PARTITIONS_RESULT"
+          subject="The three 'Run Integration Tests' parts together"
+          if [ "$result" != success ]; then
+            own=$(gh api --paginate "repos/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID/attempts/$GITHUB_RUN_ATTEMPT/jobs?per_page=100" \
+              --jq ".jobs[] | select(.name == \"$leg\") | .conclusion // \"none\"") || own=""
+            if [ "$(grep -c . <<<"$own" || true)" = 1 ]; then
+              result="$own"
+              subject="'$leg'"
+            else
+              echo "::warning::Could not read the conclusion of '$leg' alone, so this check reports the combined result of all three parts."
+            fi
+          fi
+          if [ "$result" = success ]; then
+            [ "$PARTITIONS_RESULT" = success ] || echo "$subject passed. Another part failed and is reported by its own check."
+          else
+            case "$result" in
+              failure) echo "::error::$subject concluded 'failure'. The failed job's log names the failing tests." ;;
+              *) echo "::error::$subject concluded '$result', which happens when 'Build Test Binary' did not succeed or the run was cancelled." ;;
+            esac
+            ok=false
+          fi
+          [ "$ok" = true ]
+
+  test-part-3:
+    environment: secret-free
+    name: Integration Tests (part 3)
+    needs: [check_changes, test-partitions, test-github]
+    if: ${{ always() && github.event_name != 'pull_request' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      actions: read
+    steps:
+      - name: Require integration and GitHub results
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PART: '3'
+          CHANGE_CHECK_RESULT: ${{ needs.check_changes.result }}
+          RELEVANT_CHANGES: ${{ needs.check_changes.outputs.relevant_changes }}
+          PARTITIONS_RESULT: ${{ needs.test-partitions.result }}
+          GITHUB_RESULT: ${{ needs.test-github.result }}
+        run: |
+          set -euo pipefail
+          if [ "$CHANGE_CHECK_RESULT" != success ]; then
+            echo "::error::check_changes concluded '$CHANGE_CHECK_RESULT', so it is unknown whether this commit needed the integration suite."
+            exit 1
+          fi
+          [ "$RELEVANT_CHANGES" = true ] || exit 0
+          ok=true
+          if [ "$GITHUB_RESULT" != success ]; then
+            echo "::error::'GitHub Connector Integration Tests' concluded '$GITHUB_RESULT'. Its log names the failing tests."
+            ok=false
+          fi
+          leg="Run Integration Tests (part $PART)"
+          result="$PARTITIONS_RESULT"
+          subject="The three 'Run Integration Tests' parts together"
+          if [ "$result" != success ]; then
+            own=$(gh api --paginate "repos/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID/attempts/$GITHUB_RUN_ATTEMPT/jobs?per_page=100" \
+              --jq ".jobs[] | select(.name == \"$leg\") | .conclusion // \"none\"") || own=""
+            if [ "$(grep -c . <<<"$own" || true)" = 1 ]; then
+              result="$own"
+              subject="'$leg'"
+            else
+              echo "::warning::Could not read the conclusion of '$leg' alone, so this check reports the combined result of all three parts."
+            fi
+          fi
+          if [ "$result" = success ]; then
+            [ "$PARTITIONS_RESULT" = success ] || echo "$subject passed. Another part failed and is reported by its own check."
+          else
+            case "$result" in
+              failure) echo "::error::$subject concluded 'failure'. The failed job's log names the failing tests." ;;
+              *) echo "::error::$subject concluded '$result', which happens when 'Build Test Binary' did not succeed or the run was cancelled." ;;
+            esac
+            ok=false
+          fi
+          [ "$ok" = true ]
+
   upload-integration-snapshots:
+    environment: secret-free
     name: Upload Integration Snapshots
     if: github.event.inputs.update_snapshots == 'always'
     # A checkout, a commit and a push.
     timeout-minutes: 60
     needs:
-      - test
+      - test-part-1
+      - test-part-2
+      - test-part-3
+      - test-github
     permissions:
       contents: write
       pull-requests: write
+      # Approves the snapshot PR's held pull_request runs.
+      actions: write
     runs-on: spiceai-dev-runners
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -426,7 +994,7 @@ jobs:
       - name: Download integration snapshots artifacts
         id: download_snapshots
         continue-on-error: true
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
         with:
           pattern: integration-snapshots-part-*
           merge-multiple: true
@@ -449,6 +1017,7 @@ jobs:
 
       - name: Push snapshots to branch
         if: steps.download_snapshots.outcome == 'success'
+        timeout-minutes: 10
         uses: ./.github/actions/push-snap-changes
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
@@ -457,13 +1026,159 @@ jobs:
         if: steps.download_snapshots.outcome != 'success'
         run: echo "No snapshot artifacts were uploaded; skipping snapshot update."
 
+  test-github:
+    name: GitHub Connector Integration Tests
+    needs: [build, check_changes]
+    if: needs.check_changes.outputs.relevant_changes == 'true'
+    runs-on: spiceai-dev-runners
+    # Slowest successful job from 2026-08-20 to 2026-09-25 (UTC): 12.8 min (run
+    # 34948795744). The two bounded steps below sum to 32, and everything else
+    # in the job has taken at most 4.7 min in the same window.
+    timeout-minutes: 40
+    # The Entra app that signs the organization App token trusts this environment.
+    environment: ci-integration
+    permissions:
+      id-token: write
+      # GitHub's GraphQL stargazers connection rejects contents: read, including
+      # read-all. The read query requires contents: write on GITHUB_TOKEN.
+      # Reproduction: https://github.com/spiceai/spiceai/actions/runs/34186688336
+      contents: write
+    # Shared with the live E2E smoke test: API quotas span processes and runs.
+    concurrency:
+      group: github-connector-live-api
+      queue: max
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          fetch-depth: 1
+
+      - name: Test GitHub permission diagnostics
+        run: python3 -m unittest discover -s test/github -p test_permissions.py -v
+
+      - name: Verify GitHub API permissions
+        timeout-minutes: 2
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: python3 test/github/check_permissions.py --artifacts github-api-results
+
+      - name: Set up Rust
+        uses: ./.github/actions/setup-rust
+
+      - name: Get RustFS credentials
+        id: rustfs
+        if: env.HAS_RUSTFS_ACCESS == 'true'
+        uses: ./.github/actions/rustfs-credentials
+        with:
+          endpoint: ${{ vars.TEST_MINIO_ENDPOINT }}
+          duration-seconds: '2400'
+          export-env: 'false'
+
+      - name: Set up MinIO client
+        if: env.HAS_RUSTFS_ACCESS == 'true'
+        uses: ./.github/actions/setup-minio
+        with:
+          minio_endpoint: ${{ vars.TEST_MINIO_ENDPOINT }}
+          minio_access_key: ${{ steps.rustfs.outputs.access-key-id }}
+          minio_secret_key: ${{ steps.rustfs.outputs.secret-access-key }}
+          minio_session_token: ${{ steps.rustfs.outputs.session-token }}
+
+      - name: Download GitHub test archive from local MinIO
+        if: env.HAS_RUSTFS_ACCESS == 'true'
+        env:
+          MINIO_ENDPOINT: ${{ vars.TEST_MINIO_ENDPOINT }}
+        run: |
+          set -euo pipefail
+          : "${MINIO_ENDPOINT:?TEST_MINIO_ENDPOINT is required to download GitHub test archive}"
+          mkdir -p ./integration_tests
+          mc cp "spice-minio/${INTEGRATION_TESTS_ARCHIVE_S3_URI#s3://}" ./integration_tests/integration_tests.tar.zst
+
+      - name: Download GitHub test archive
+        if: env.HAS_RUSTFS_ACCESS != 'true'
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
+        with:
+          name: integration-tests-archive
+          path: ./integration_tests
+
+      - name: Set up Nextest
+        uses: ./.github/actions/setup-nextest
+
+      - name: Set up Github Token
+        if: needs.check_changes.outputs.relevant_changes == 'true'
+        uses: ./.github/actions/key-vault-app-token
+        id: github-app-token
+        with:
+          app-id: ${{ vars.ORG_MEMBERS_GITHUB_APP_ID }}
+          installation-id: ${{ vars.ORG_MEMBERS_GITHUB_INSTALLATION_ID }}
+          key-id: ${{ vars.ORG_MEMBERS_KEY_ID }}
+          azure-client-id: ${{ vars.ORG_MEMBERS_AZURE_CLIENT_ID }}
+          azure-tenant-id: ${{ vars.ORG_MEMBERS_AZURE_TENANT_ID }}
+          repositories: spiceai
+          permissions: '{"members": "read", "metadata": "read"}'
+
+      - name: Run every GitHub connector integration test
+        timeout-minutes: 30
+        env:
+          INSTA_UPDATE: ${{ github.event.inputs.update_snapshots }}
+          SPICE_GITHUB_TEST_REQUIRED: '1'
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GITHUB_ORG_TOKEN: ${{ steps.github-app-token.outputs.token }}
+          INSTA_WORKSPACE_ROOT: ${{ github.workspace }}
+          CARGO_MANIFEST_DIR: ${{ github.workspace }}
+          # The connector signs the same App's JWT through Key Vault, as the Entra app.
+          GITHUB_APP_KMS_CLIENT_ID: ${{ vars.ORG_MEMBERS_GITHUB_APP_ID }}
+          GITHUB_APP_KMS_INSTALLATION_ID: ${{ vars.ORG_MEMBERS_GITHUB_INSTALLATION_ID }}
+          GITHUB_APP_KMS_KEY: ${{ vars.ORG_MEMBERS_KEY_ID }}
+          AZURE_TENANT_ID: ${{ vars.ORG_MEMBERS_AZURE_TENANT_ID }}
+          AZURE_CLIENT_ID: ${{ vars.ORG_MEMBERS_AZURE_CLIENT_ID }}
+        run: |
+          cargo nextest run --workspace-remap "${PWD}" \
+            --archive-file ./integration_tests/integration_tests.tar.zst \
+            --test-threads 1 -E 'binary_id(=runtime::integration) & test(/^github::/)'
+
+      # Pull request and merge-queue checks keep no diagnostic artifacts.
+      - name: Upload GitHub permission diagnostics
+        if: always() && github.event_name != 'pull_request' && github.event_name != 'merge_group'
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
+        with:
+          name: github-api-permissions
+          path: github-api-results/
+
+      - name: Upload integration snapshots artifact
+        id: create_snapshot_archive
+        if: github.event.inputs.update_snapshots == 'always' && needs.check_changes.outputs.relevant_changes == 'true'
+        run: |
+          git diff --name-only -- '*.snap' > snapshot-files
+          git ls-files -o --exclude-standard -- '*.snap' >> snapshot-files
+          if [ -s snapshot-files ]; then
+            tr '\n' '\0' < snapshot-files > snapshot-files-0
+            tar --null -czf integration-snapshots-part-github.tar.gz --files-from snapshot-files-0
+            echo "created=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "No snapshot files found"
+            echo "created=false" >> "$GITHUB_OUTPUT"
+          fi
+          rm -f snapshot-files snapshot-files-0
+        shell: bash
+      - name: Store integration snapshots artifact
+        if: github.event.inputs.update_snapshots == 'always' && steps.create_snapshot_archive.outputs.created == 'true' && needs.check_changes.outputs.relevant_changes == 'true'
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
+        with:
+          name: integration-snapshots-part-github
+          path: integration-snapshots-part-github.tar.gz
+          retention-days: 1
+
   test-aws-sdk:
     name: AWS SDK Integration Tests
     needs: [build, check_changes]
-    # Slowest observed success in the 2026-07-25..08-08 window: 2 min.
+    # Slowest successful job from 2026-08-20 to 2026-09-25 (UTC): 12.4 min (run 34213792762).
+    # 60 is kept deliberately as a stuck-runner backstop, 4.8x that.
     timeout-minutes: 60
     if: needs.check_changes.outputs.relevant_changes == 'true'
-    permissions: read-all
+    environment: ci
+    permissions:
+      contents: read
+      id-token: write  # RustFS credentials
     runs-on: spiceai-dev-runners
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -474,18 +1189,28 @@ jobs:
       - name: Set up Rust
         uses: ./.github/actions/setup-rust
 
+      - name: Get RustFS credentials
+        id: rustfs
+        if: env.HAS_RUSTFS_ACCESS == 'true'
+        uses: ./.github/actions/rustfs-credentials
+        with:
+          endpoint: ${{ vars.TEST_MINIO_ENDPOINT }}
+          duration-seconds: '3600'
+          export-env: 'false'
+
       - name: Set up MinIO client
-        if: env.HAS_TEST_MINIO_SECRET == 'true'
+        if: env.HAS_RUSTFS_ACCESS == 'true'
         uses: ./.github/actions/setup-minio
         with:
-          minio_endpoint: ${{ secrets.TEST_MINIO_ENDPOINT }}
-          minio_access_key: ${{ secrets.TEST_MINIO_ACCESS_KEY }}
-          minio_secret_key: ${{ secrets.TEST_MINIO_SECRET_KEY }}
+          minio_endpoint: ${{ vars.TEST_MINIO_ENDPOINT }}
+          minio_access_key: ${{ steps.rustfs.outputs.access-key-id }}
+          minio_secret_key: ${{ steps.rustfs.outputs.secret-access-key }}
+          minio_session_token: ${{ steps.rustfs.outputs.session-token }}
 
       - name: Download AWS SDK test archive from local MinIO
-        if: env.HAS_TEST_MINIO_SECRET == 'true'
+        if: env.HAS_RUSTFS_ACCESS == 'true'
         env:
-          MINIO_ENDPOINT: ${{ secrets.TEST_MINIO_ENDPOINT }}
+          MINIO_ENDPOINT: ${{ vars.TEST_MINIO_ENDPOINT }}
         run: |
           set -euo pipefail
           : "${MINIO_ENDPOINT:?TEST_MINIO_ENDPOINT is required to download AWS SDK test archive}"
@@ -493,8 +1218,8 @@ jobs:
           mc cp "spice-minio/${INTEGRATION_TESTS_ARCHIVE_S3_URI#s3://}" ./integration_tests/integration_tests.tar.zst
 
       - name: Download AWS SDK test archive
-        if: env.HAS_TEST_MINIO_SECRET != 'true'
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        if: env.HAS_RUSTFS_ACCESS != 'true'
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
         with:
           name: integration-tests-archive
           path: ./integration_tests
@@ -502,30 +1227,38 @@ jobs:
       - name: Set up Nextest
         uses: ./.github/actions/setup-nextest
 
-      - name: Login to ACR
-        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
-        if: github.repository == 'spiceai/spiceai'
+      - name: Assume the Databricks Delta role
+        id: aws-databricks-delta
+        uses: aws-actions/configure-aws-credentials@e1253824e5c10ff9df46874f81ed3ec929e19cfd # v6.3.0
         with:
-          registry: spiceaitestimages.azurecr.io
-          username: spiceai-repo-pull
-          password: ${{ secrets.AZCR_PASSWORD }}
+          role-to-assume: ${{ secrets.AWS_DATABRICKS_DELTA_ROLE_ARN }}
+          role-session-name: gha-databricks-delta-${{ github.run_id }}
+          aws-region: us-east-1
+          output-env-credentials: false
+          output-credentials: true
 
       - name: Run AWS SDK integration test
         env:
           AWS_EC2_METADATA_DISABLED: true
-          TEST_DATABRICKS_TOKEN: ${{ secrets.NEW_DATABRICKS_TOKEN }}
-          AWS_DATABRICKS_DELTA_ACCESS_KEY_ID: ${{ secrets.AWS_DATABRICKS_DELTA_ACCESS_KEY_ID }}
-          AWS_DATABRICKS_DELTA_SECRET_ACCESS_KEY: ${{ secrets.AWS_DATABRICKS_DELTA_SECRET_ACCESS_KEY }}
+          DATABRICKS_OIDC_CLIENT_ID: ${{ vars.DATABRICKS_OIDC_CLIENT_ID }}
+          DATABRICKS_OIDC_AUDIENCE: ${{ vars.DATABRICKS_OIDC_AUDIENCE }}
+          AWS_DATABRICKS_DELTA_ACCESS_KEY_ID: ${{ steps.aws-databricks-delta.outputs.aws-access-key-id }}
+          AWS_DATABRICKS_DELTA_SECRET_ACCESS_KEY: ${{ steps.aws-databricks-delta.outputs.aws-secret-access-key }}
+          AWS_DATABRICKS_DELTA_SESSION_TOKEN: ${{ steps.aws-databricks-delta.outputs.aws-session-token }}
         run: |
           INSTA_WORKSPACE_ROOT="${PWD}" CARGO_MANIFEST_DIR="${PWD}" cargo nextest run --workspace-remap "${PWD}" --archive-file ./integration_tests/integration_tests.tar.zst -E 'binary_id(=runtime::integration_aws_sdk)'
 
   test-aws-sdk-credential-bridge:
     name: AWS SDK Credential Bridge Integration Tests
     needs: [build, check_changes]
-    # Slowest observed success in the 2026-07-25..08-08 window: 1 min.
+    # Slowest successful job from 2026-08-20 to 2026-09-25 (UTC): 9.0 min (run 34213792762).
+    # 60 is kept deliberately as a stuck-runner backstop, 6.7x that.
     timeout-minutes: 60
     if: needs.check_changes.outputs.relevant_changes == 'true'
-    permissions: read-all
+    environment: ci
+    permissions:
+      contents: read
+      id-token: write  # RustFS credentials
     runs-on: spiceai-dev-runners
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -536,18 +1269,28 @@ jobs:
       - name: Set up Rust
         uses: ./.github/actions/setup-rust
 
+      - name: Get RustFS credentials
+        id: rustfs
+        if: env.HAS_RUSTFS_ACCESS == 'true'
+        uses: ./.github/actions/rustfs-credentials
+        with:
+          endpoint: ${{ vars.TEST_MINIO_ENDPOINT }}
+          duration-seconds: '3600'
+          export-env: 'false'
+
       - name: Set up MinIO client
-        if: env.HAS_TEST_MINIO_SECRET == 'true'
+        if: env.HAS_RUSTFS_ACCESS == 'true'
         uses: ./.github/actions/setup-minio
         with:
-          minio_endpoint: ${{ secrets.TEST_MINIO_ENDPOINT }}
-          minio_access_key: ${{ secrets.TEST_MINIO_ACCESS_KEY }}
-          minio_secret_key: ${{ secrets.TEST_MINIO_SECRET_KEY }}
+          minio_endpoint: ${{ vars.TEST_MINIO_ENDPOINT }}
+          minio_access_key: ${{ steps.rustfs.outputs.access-key-id }}
+          minio_secret_key: ${{ steps.rustfs.outputs.secret-access-key }}
+          minio_session_token: ${{ steps.rustfs.outputs.session-token }}
 
       - name: Download AWS SDK credential bridge test archive from local MinIO
-        if: env.HAS_TEST_MINIO_SECRET == 'true'
+        if: env.HAS_RUSTFS_ACCESS == 'true'
         env:
-          MINIO_ENDPOINT: ${{ secrets.TEST_MINIO_ENDPOINT }}
+          MINIO_ENDPOINT: ${{ vars.TEST_MINIO_ENDPOINT }}
         run: |
           set -euo pipefail
           : "${MINIO_ENDPOINT:?TEST_MINIO_ENDPOINT is required to download AWS SDK credential bridge test archive}"
@@ -555,8 +1298,8 @@ jobs:
           mc cp "spice-minio/${INTEGRATION_TESTS_ARCHIVE_S3_URI#s3://}" ./integration_tests/integration_tests.tar.zst
 
       - name: Download AWS SDK credential bridge test archive
-        if: env.HAS_TEST_MINIO_SECRET != 'true'
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        if: env.HAS_RUSTFS_ACCESS != 'true'
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
         with:
           name: integration-tests-archive
           path: ./integration_tests
@@ -564,34 +1307,36 @@ jobs:
       - name: Set up Nextest
         uses: ./.github/actions/setup-nextest
 
-      - name: Login to ACR
-        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
-        if: github.repository == 'spiceai/spiceai'
-        with:
-          registry: spiceaitestimages.azurecr.io
-          username: spiceai-repo-pull
-          password: ${{ secrets.AZCR_PASSWORD }}
-
       - name: Run AWS SDK credential bridge integration test
         env:
           AWS_EC2_METADATA_DISABLED: true
-          AWS_S3_CLIENT_ID: ${{ secrets.AWS_S3_CLIENT_ID }}
-          AWS_S3_IDENTITY_POOL_ID: ${{ secrets.AWS_S3_IDENTITY_POOL_ID }}
-          AWS_S3_USERNAME: ${{ secrets.AWS_S3_USERNAME }}
-          AWS_S3_PASSWORD: ${{ secrets.AWS_S3_PASSWORD }}
-          AWS_COGNITO_IDP_URI: ${{ vars.AWS_COGNITO_IDP_URI }}
           AWS_REGION: ${{ vars.AWS_REGION }}
-          AWS_ROLE_ARN: ${{ secrets.AWS_ROLE_ARN }}
+          AWS_ROLE_ARN: ${{ vars.AWS_WEB_IDENTITY_TEST_ROLE_ARN }}
+        # A GitHub OIDC token lives 5 minutes, enough for these tests' STS exchanges.
         run: |
+          set -euo pipefail
+          export AWS_WEB_IDENTITY_TOKEN_FILE="${RUNNER_TEMP}/aws-web-identity-token"
+          trap 'rm -f "$AWS_WEB_IDENTITY_TOKEN_FILE"' EXIT
+          umask 077
+          # The request token goes to curl on stdin, out of the process list.
+          printf 'header = "Authorization: bearer %s"\n' "$ACTIONS_ID_TOKEN_REQUEST_TOKEN" |
+            curl --config - --fail --silent --show-error --max-time 30 \
+              "${ACTIONS_ID_TOKEN_REQUEST_URL}&audience=sts.amazonaws.com" |
+            python3 -c 'import json, sys; sys.stdout.write(json.load(sys.stdin)["value"])' \
+              > "$AWS_WEB_IDENTITY_TOKEN_FILE"
           INSTA_WORKSPACE_ROOT="${PWD}" CARGO_MANIFEST_DIR="${PWD}" cargo nextest run --workspace-remap "${PWD}" --archive-file ./integration_tests/integration_tests.tar.zst -E 'binary_id(=aws-sdk-credential-bridge::credential_provider)'
 
   test-snapshot-refresh:
+    environment: ci
     name: Snapshot Refresh Mode Integration Tests
     needs: [build, check_changes]
-    # Slowest observed success in the 2026-07-25..08-08 window: 4 min.
+    # Slowest successful job from 2026-08-20 to 2026-09-25 (UTC): 10.9 min (run 34213792762).
+    # 60 is kept deliberately as a stuck-runner backstop, 5.5x that.
     timeout-minutes: 60
     if: needs.check_changes.outputs.relevant_changes == 'true'
-    permissions: read-all
+    permissions:
+      contents: read
+      id-token: write  # RustFS credentials
     runs-on: spiceai-dev-runners
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -601,18 +1346,28 @@ jobs:
       - name: Set up Rust
         uses: ./.github/actions/setup-rust
 
+      - name: Get RustFS credentials
+        id: rustfs
+        if: env.HAS_RUSTFS_ACCESS == 'true'
+        uses: ./.github/actions/rustfs-credentials
+        with:
+          endpoint: ${{ vars.TEST_MINIO_ENDPOINT }}
+          duration-seconds: '3600'
+          export-env: 'false'
+
       - name: Set up MinIO client
-        if: env.HAS_TEST_MINIO_SECRET == 'true'
+        if: env.HAS_RUSTFS_ACCESS == 'true'
         uses: ./.github/actions/setup-minio
         with:
-          minio_endpoint: ${{ secrets.TEST_MINIO_ENDPOINT }}
-          minio_access_key: ${{ secrets.TEST_MINIO_ACCESS_KEY }}
-          minio_secret_key: ${{ secrets.TEST_MINIO_SECRET_KEY }}
+          minio_endpoint: ${{ vars.TEST_MINIO_ENDPOINT }}
+          minio_access_key: ${{ steps.rustfs.outputs.access-key-id }}
+          minio_secret_key: ${{ steps.rustfs.outputs.secret-access-key }}
+          minio_session_token: ${{ steps.rustfs.outputs.session-token }}
 
       - name: Download snapshot refresh test archive from local MinIO
-        if: env.HAS_TEST_MINIO_SECRET == 'true'
+        if: env.HAS_RUSTFS_ACCESS == 'true'
         env:
-          MINIO_ENDPOINT: ${{ secrets.TEST_MINIO_ENDPOINT }}
+          MINIO_ENDPOINT: ${{ vars.TEST_MINIO_ENDPOINT }}
         run: |
           set -euo pipefail
           : "${MINIO_ENDPOINT:?TEST_MINIO_ENDPOINT is required to download snapshot refresh test archive}"
@@ -620,8 +1375,8 @@ jobs:
           mc cp "spice-minio/${INTEGRATION_TESTS_ARCHIVE_S3_URI#s3://}" ./integration_tests/integration_tests.tar.zst
 
       - name: Download snapshot refresh test archive
-        if: env.HAS_TEST_MINIO_SECRET != 'true'
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        if: env.HAS_RUSTFS_ACCESS != 'true'
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
         with:
           name: integration-tests-archive
           path: ./integration_tests
@@ -629,29 +1384,37 @@ jobs:
       - name: Set up Nextest
         uses: ./.github/actions/setup-nextest
 
-      - name: Login to ACR
-        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
-        if: github.repository == 'spiceai/spiceai'
+      - name: Assume the Iceberg role
+        id: aws-iceberg
+        if: env.HAS_RUSTFS_ACCESS == 'true'
+        uses: aws-actions/configure-aws-credentials@e1253824e5c10ff9df46874f81ed3ec929e19cfd # v6.3.0
         with:
-          registry: spiceaitestimages.azurecr.io
-          username: spiceai-repo-pull
-          password: ${{ secrets.AZCR_PASSWORD }}
+          role-to-assume: ${{ secrets.AWS_ICEBERG_ROLE_ARN }}
+          role-session-name: gha-iceberg-${{ github.run_id }}
+          aws-region: us-east-1
+          output-env-credentials: false
+          output-credentials: true
 
       - name: Run snapshot refresh integration tests
         env:
           AWS_EC2_METADATA_DISABLED: true
-          AWS_SNAPSHOT_KEY: ${{ secrets.AWS_ICEBERG_ACCESS_KEY_ID }}
-          AWS_SNAPSHOT_SECRET: ${{ secrets.AWS_ICEBERG_SECRET_ACCESS_KEY }}
+          AWS_SNAPSHOT_KEY: ${{ steps.aws-iceberg.outputs.aws-access-key-id }}
+          AWS_SNAPSHOT_SECRET: ${{ steps.aws-iceberg.outputs.aws-secret-access-key }}
+          AWS_SNAPSHOT_SESSION_TOKEN: ${{ steps.aws-iceberg.outputs.aws-session-token }}
         run: |
           INSTA_WORKSPACE_ROOT="${PWD}" CARGO_MANIFEST_DIR="${PWD}" cargo nextest run --workspace-remap "${PWD}" --archive-file ./integration_tests/integration_tests.tar.zst -E 'binary_id(=runtime::integration_snapshot_refresh)'
 
   test-data-components:
+    environment: ci
     name: Data Components Integration Tests
     needs: [build, check_changes]
-    # Slowest observed success in the 2026-07-25..08-08 window: 1 min.
+    # Slowest successful job from 2026-08-20 to 2026-09-25 (UTC): 7.5 min (run 33859377810).
+    # 60 is kept deliberately as a stuck-runner backstop, 8.0x that.
     timeout-minutes: 60
     if: needs.check_changes.outputs.relevant_changes == 'true'
-    permissions: read-all
+    permissions:
+      contents: read
+      id-token: write  # RustFS credentials
     runs-on: spiceai-dev-runners
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -662,18 +1425,28 @@ jobs:
       - name: Set up Rust
         uses: ./.github/actions/setup-rust
 
+      - name: Get RustFS credentials
+        id: rustfs
+        if: env.HAS_RUSTFS_ACCESS == 'true'
+        uses: ./.github/actions/rustfs-credentials
+        with:
+          endpoint: ${{ vars.TEST_MINIO_ENDPOINT }}
+          duration-seconds: '3600'
+          export-env: 'false'
+
       - name: Set up MinIO client
-        if: env.HAS_TEST_MINIO_SECRET == 'true'
+        if: env.HAS_RUSTFS_ACCESS == 'true'
         uses: ./.github/actions/setup-minio
         with:
-          minio_endpoint: ${{ secrets.TEST_MINIO_ENDPOINT }}
-          minio_access_key: ${{ secrets.TEST_MINIO_ACCESS_KEY }}
-          minio_secret_key: ${{ secrets.TEST_MINIO_SECRET_KEY }}
+          minio_endpoint: ${{ vars.TEST_MINIO_ENDPOINT }}
+          minio_access_key: ${{ steps.rustfs.outputs.access-key-id }}
+          minio_secret_key: ${{ steps.rustfs.outputs.secret-access-key }}
+          minio_session_token: ${{ steps.rustfs.outputs.session-token }}
 
       - name: Download data components test archive from local MinIO
-        if: env.HAS_TEST_MINIO_SECRET == 'true'
+        if: env.HAS_RUSTFS_ACCESS == 'true'
         env:
-          MINIO_ENDPOINT: ${{ secrets.TEST_MINIO_ENDPOINT }}
+          MINIO_ENDPOINT: ${{ vars.TEST_MINIO_ENDPOINT }}
         run: |
           set -euo pipefail
           : "${MINIO_ENDPOINT:?TEST_MINIO_ENDPOINT is required to download data components test archive}"
@@ -681,8 +1454,8 @@ jobs:
           mc cp "spice-minio/${INTEGRATION_TESTS_ARCHIVE_S3_URI#s3://}" ./integration_tests/integration_tests.tar.zst
 
       - name: Download data components test archive
-        if: env.HAS_TEST_MINIO_SECRET != 'true'
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        if: env.HAS_RUSTFS_ACCESS != 'true'
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
         with:
           name: integration-tests-archive
           path: ./integration_tests
@@ -692,19 +1465,27 @@ jobs:
 
       - name: Run data components integration test
         env:
-          MINIO_ENDPOINT: ${{ secrets.TEST_MINIO_ENDPOINT }}
-          MINIO_ACCESS_KEY_ID: ${{ secrets.TEST_MINIO_ACCESS_KEY }}
-          MINIO_SECRET_ACCESS_KEY: ${{ secrets.TEST_MINIO_SECRET_KEY }}
+          MINIO_ENDPOINT: ${{ vars.TEST_MINIO_ENDPOINT }}
+          MINIO_ACCESS_KEY_ID: ${{ steps.rustfs.outputs.access-key-id }}
+          MINIO_SECRET_ACCESS_KEY: ${{ steps.rustfs.outputs.secret-access-key }}
+          MINIO_SESSION_TOKEN: ${{ steps.rustfs.outputs.session-token }}
         run: |
-          INSTA_WORKSPACE_ROOT="${PWD}" CARGO_MANIFEST_DIR="${PWD}" cargo nextest run --workspace-remap "${PWD}" --archive-file ./integration_tests/integration_tests.tar.zst -E 'binary_id(=data_components::hadoop_catalog_test)'
+          INSTA_WORKSPACE_ROOT="${PWD}" CARGO_MANIFEST_DIR="${PWD}" cargo nextest run --workspace-remap "${PWD}" --archive-file ./integration_tests/integration_tests.tar.zst -E 'binary_id(=data_components::integration) & test(/^hadoop_catalog_test::/)'
 
   test-runtime-partition:
+    environment: ci
     name: Partition Table Integration Tests
     needs: [build, check_changes]
-    # Slowest observed success in the 2026-07-25..08-08 window: 4 min.
+    # Slowest successful job from 2026-08-20 to 2026-09-25 (UTC): 7.7 min (run 34213792762).
+    # 60 is kept deliberately as a stuck-runner backstop, 7.8x that.
     timeout-minutes: 60
     if: needs.check_changes.outputs.relevant_changes == 'true'
     runs-on: spiceai-dev-runners
+    permissions:
+      actions: write  # approves the held runs of its snapshot PR
+      contents: write  # push-snap-changes pushes a snapshot branch
+      pull-requests: write  # and opens, auto-merges or closes its PR
+      id-token: write  # RustFS credentials
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -713,18 +1494,28 @@ jobs:
       - name: Set up Rust
         uses: ./.github/actions/setup-rust
 
+      - name: Get RustFS credentials
+        id: rustfs
+        if: env.HAS_RUSTFS_ACCESS == 'true'
+        uses: ./.github/actions/rustfs-credentials
+        with:
+          endpoint: ${{ vars.TEST_MINIO_ENDPOINT }}
+          duration-seconds: '3600'
+          export-env: 'false'
+
       - name: Set up MinIO client
-        if: env.HAS_TEST_MINIO_SECRET == 'true'
+        if: env.HAS_RUSTFS_ACCESS == 'true'
         uses: ./.github/actions/setup-minio
         with:
-          minio_endpoint: ${{ secrets.TEST_MINIO_ENDPOINT }}
-          minio_access_key: ${{ secrets.TEST_MINIO_ACCESS_KEY }}
-          minio_secret_key: ${{ secrets.TEST_MINIO_SECRET_KEY }}
+          minio_endpoint: ${{ vars.TEST_MINIO_ENDPOINT }}
+          minio_access_key: ${{ steps.rustfs.outputs.access-key-id }}
+          minio_secret_key: ${{ steps.rustfs.outputs.secret-access-key }}
+          minio_session_token: ${{ steps.rustfs.outputs.session-token }}
 
       - name: Download partition table test archive from local MinIO
-        if: env.HAS_TEST_MINIO_SECRET == 'true'
+        if: env.HAS_RUSTFS_ACCESS == 'true'
         env:
-          MINIO_ENDPOINT: ${{ secrets.TEST_MINIO_ENDPOINT }}
+          MINIO_ENDPOINT: ${{ vars.TEST_MINIO_ENDPOINT }}
         run: |
           set -euo pipefail
           : "${MINIO_ENDPOINT:?TEST_MINIO_ENDPOINT is required to download partition table test archive}"
@@ -732,22 +1523,14 @@ jobs:
           mc cp "spice-minio/${INTEGRATION_TESTS_ARCHIVE_S3_URI#s3://}" ./integration_tests/integration_tests.tar.zst
 
       - name: Download partition table test archive
-        if: env.HAS_TEST_MINIO_SECRET != 'true'
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        if: env.HAS_RUSTFS_ACCESS != 'true'
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
         with:
           name: integration-tests-archive
           path: ./integration_tests
 
       - name: Set up Nextest
         uses: ./.github/actions/setup-nextest
-
-      - name: Login to ACR
-        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
-        if: github.repository == 'spiceai/spiceai'
-        with:
-          registry: spiceaitestimages.azurecr.io
-          username: spiceai-repo-pull
-          password: ${{ secrets.AZCR_PASSWORD }}
 
       - name: Run partition table integration test
         env:
@@ -763,6 +1546,7 @@ jobs:
 
       - name: Push snapshots to branch
         if: github.event.inputs.update_snapshots == 'always'
+        timeout-minutes: 10
         uses: ./.github/actions/push-snap-changes
         with:
           token: ${{ secrets.GITHUB_TOKEN }}

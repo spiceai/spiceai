@@ -16,7 +16,7 @@
 //!
 //! Proves that **out-of-Spice** DuckDB and SQLite return equivalent results for
 //! the same SQL on identical data. This is the external-oracle baseline used
-//! when comparing Spice accelerators (Cayenne, DuckDB accel, SQLite accel).
+//! when comparing Spice accelerators (Cayenne, SQLite accel).
 //!
 //! Requires `--features result-correctness-duckdb` (DuckDB side). SQLite uses
 //! always-on `rusqlite`.
@@ -31,14 +31,13 @@
 #![allow(clippy::format_push_string)]
 #![allow(clippy::map_unwrap_or)]
 
-#[path = "correctness/support/mod.rs"]
-mod support;
+use crate::support;
 
 use std::path::PathBuf;
 
 use support::inventory::build_inventory;
 use support::report::{RunResult, summary_line};
-use support::ssb_data::{SSB_TABLES, ssb_queries, write_ssb_parquet};
+use support::ssb_data::{SSB_TABLES, ensure_ssb_fixture, ssb_queries};
 use support::standalone_engines::{
     STANDALONE_DUCKDB, STANDALONE_SQLITE, duckdb_query_batches, load_duckdb_from_batches,
     load_duckdb_from_parquet, load_sqlite_from_batches, load_sqlite_from_parquet,
@@ -67,7 +66,7 @@ fn env_i64(name: &str, default: i64) -> i64 {
 
 fn compare_standalone(
     query: &Query,
-    duck: &duckdb::Connection,
+    duck: &duckdb_oracle::Connection,
     sqlite: &rusqlite::Connection,
 ) -> ParityOutcome {
     let sql = query.sql.as_ref();
@@ -152,9 +151,7 @@ async fn standalone_duckdb_vs_sqlite_ssb() {
     eprintln!("standalone SSB DuckDB vs SQLite scale={scale}");
 
     let ssb_dir = scratch.join(format!("ssb_scale{scale}"));
-    if !ssb_dir.join("lineorder.parquet").exists() {
-        write_ssb_parquet(&ssb_dir, scale);
-    }
+    ensure_ssb_fixture(&ssb_dir, scale);
 
     let (duck_temp, duck) = load_duckdb_from_parquet(&ssb_dir, SSB_TABLES);
     let (sqlite_temp, sqlite) = load_sqlite_from_parquet(&ssb_dir, SSB_TABLES).await;

@@ -316,19 +316,8 @@ mod tests {
             .await
             .expect("failed to prepare SQL");
         insta::assert_snapshot!(
-            pretty_format_batches(data.as_slice()).expect("couldn't format batches"),
-            @r"
-        +---+-----+-------+----------------------------------+----------------------------------+----------------------------------+
-        | a | b   | c     | digest_many(a, b, c)             | digest_many(c)                   | digest_many(c, 'foo')            |
-        +---+-----+-------+----------------------------------+----------------------------------+----------------------------------+
-        | 1 | 4.0 | alpha | e10f0f3f9cab7d5a48eb5dca9752b239 | f6c1e637db50c80c30606accb7877791 | 1bc36584dfdf327f00541ebcee7b10b8 |
-        | 2 |     | beta  | 13e76fda74b91ce42b64e114ce57cea6 | cfcedac45362b91523dc768e6d975abe | e52b73630a4f01834dc30a85baf0ac29 |
-        | 3 | 5.0 | gamma | f1bec90248c17cdf4b3fb996bed20178 | 9ded07502923355cf0ad19b62b6b1289 | 640dedde6c6eeb86794482fdb2d35398 |
-        | 4 | 6.0 | alpha | 81bb81945f98638c2d65e4c64c6e6a23 | f6c1e637db50c80c30606accb7877791 | 1bc36584dfdf327f00541ebcee7b10b8 |
-        | 5 | 7.0 | beta  | 4d29b6913cd5b11a36206c4ace98abaf | cfcedac45362b91523dc768e6d975abe | e52b73630a4f01834dc30a85baf0ac29 |
-        | 6 | 8.0 | gamma | e1d301c0702a902057d53b55c211015a | 9ded07502923355cf0ad19b62b6b1289 | 640dedde6c6eeb86794482fdb2d35398 |
-        +---+-----+-------+----------------------------------+----------------------------------+----------------------------------+
-        "
+            "digest_many_record_batch",
+            pretty_format_batches(data.as_slice()).expect("couldn't format batches")
         );
 
         Ok(ExitCode::SUCCESS)

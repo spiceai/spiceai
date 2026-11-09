@@ -266,7 +266,7 @@ pub(crate) async fn provision_local_spiced_cluster(
         &scheduler_dir,
         &scheduler_args,
         "scheduler",
-        &extra_envs,
+        &with_instance_id(&extra_envs, "scheduler"),
     )
     .await
     {
@@ -321,7 +321,7 @@ pub(crate) async fn provision_local_spiced_cluster(
             executor_dir,
             &exec_args,
             &label,
-            &extra_envs,
+            &with_instance_id(&extra_envs, &label),
         )
         .await
         {
@@ -448,6 +448,7 @@ pub(crate) async fn teardown_local_run(local_state: &mut LocalRunState) -> anyho
             }
             stop_child_process(scheduler_child, "scheduler").await?;
         }
+        LocalProcesses::Ec2Cluster(cluster) => cluster.terminate().await?,
     }
 
     cleanup_local_artifacts(&local_state.working_dir).await
@@ -582,6 +583,14 @@ fn executor_spiced_args(
         "--node-mtls-key-file".to_string(),
         executor_key.display().to_string(),
     ]
+}
+
+/// `envs` plus the `SPICE_INSTANCE_ID` of one cluster node: nodes on one host
+/// need distinct instance identities.
+fn with_instance_id(envs: &HashMap<String, String>, instance_id: &str) -> HashMap<String, String> {
+    let mut envs = envs.clone();
+    envs.insert("SPICE_INSTANCE_ID".to_string(), instance_id.to_string());
+    envs
 }
 
 async fn spawn_local_spiced(
@@ -886,7 +895,7 @@ async fn all_local_executor_http_ready(
     true
 }
 
-fn scheduler_active_executor_count(metrics_body: &str) -> Option<usize> {
+pub(super) fn scheduler_active_executor_count(metrics_body: &str) -> Option<usize> {
     metrics_body
         .lines()
         .filter(|line| line.starts_with("scheduler_active_executors_count"))

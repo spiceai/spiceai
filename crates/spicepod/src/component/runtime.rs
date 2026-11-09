@@ -25,7 +25,7 @@ use super::{
 use crate::metric::Metrics;
 use crate::param::Params;
 #[cfg(feature = "schemars")]
-use schemars::JsonSchema;
+use schemars::{JsonSchema, Schema, SchemaGenerator, json_schema};
 use serde::{Deserialize, Serialize};
 
 const TASK_HISTORY_RETENTION_MINIMUM: u64 = 60; // 1 minute
@@ -55,6 +55,11 @@ pub struct Runtime {
     #[serde(skip_serializing_if = "HashMap::is_empty")]
     #[serde(default)]
     pub params: HashMap<String, String>,
+
+    /// Turns adaptive tuning on or off for the whole runtime. `disabled` (default) derives
+    /// Cayenne's knobs statically; `enabled` also runs its closed-loop controller.
+    #[serde(default, skip_serializing_if = "is_default")]
+    pub adaptive_tuning: AdaptiveTuning,
 
     #[serde(default, skip_serializing_if = "is_default")]
     pub task_history: TaskHistory,
@@ -100,6 +105,16 @@ pub struct Runtime {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub metrics: Option<Metrics>,
 
+    /// Shared object-store location for runtime state (`file://`, `s3://`,
+    /// `abfs://`, `abfss://`, `gs://`). Used for SQL results-cache warmup, cluster
+    /// source rate control, distributed query state and acceleration snapshots.
+    /// Each feature writes under its own folder: `results-cache/`,
+    /// `rate-control/`, `cluster/` and `snapshots/`. A
+    /// `runtime.scheduler.state_location` overrides it for the scheduler, and a
+    /// `snapshots.location` for snapshots.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub state: Option<RuntimeState>,
+
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub scheduler: Option<Scheduler>,
 
@@ -111,6 +126,39 @@ pub struct Runtime {
 }
 
 impl Runtime {
+    /// Scheduler tuning config. When only `runtime.state` is set, the scheduler
+    /// runs with default tuning. [`Self::scheduler_state`] gives where the
+    /// scheduler keeps its state.
+    #[must_use]
+    pub fn resolved_scheduler(&self) -> Option<Scheduler> {
+        match (&self.scheduler, &self.state) {
+            (Some(scheduler), _) => Some(scheduler.clone()),
+            (None, Some(_)) => Some(Scheduler::default()),
+            (None, None) => None,
+        }
+    }
+
+    /// Where the scheduler keeps cluster state: `runtime.scheduler.state_location`
+    /// when set, else `runtime.state`. `runtime.scheduler.params`, when set,
+    /// apply to either location.
+    #[must_use]
+    pub fn scheduler_state(&self) -> Option<StateLocation> {
+        let scheduler = self.scheduler.as_ref();
+        let params = scheduler.and_then(|scheduler| scheduler.params.as_ref());
+        if let Some(location) = scheduler.and_then(|scheduler| scheduler.state_location.as_ref()) {
+            return Some(StateLocation {
+                location: location.clone(),
+                params: params.cloned(),
+                source: StateSource::FeatureSetting,
+            });
+        }
+        self.state.as_ref().map(|state| StateLocation {
+            location: state.location.clone(),
+            params: params.or(state.params.as_ref()).cloned(),
+            source: StateSource::RuntimeState,
+        })
+    }
+
     pub fn shutdown_timeout(&self) -> Result<Option<Duration>, Box<dyn Error + Send + Sync>> {
         if let Some(timeout_str) = &self.shutdown_timeout {
             let duration = duration_parse::parse_duration(timeout_str)
@@ -140,6 +188,86 @@ pub enum RuntimeReadyState {
     /// regardless of whether they are currently `Ready`, `Error`, or `Disabled`,
     /// as long as none is `ShuttingDown`.
     OnRegistration,
+}
+
+/// Turns adaptive tuning on or off for the whole runtime.
+///
+/// `disabled` (the default) derives Cayenne's knobs statically from the host and, where
+/// available, the inferred schema. `enabled` additionally runs Cayenne's closed-loop
+/// controller, which moves them within the statically derived bounds. The
+/// `runtime.params.target_*` setpoints steer the controller and never turn it on.
+///
+/// Only the exact values `enabled` and `disabled` are accepted, matching the published
+/// schema. Anything else, including a different case or surrounding whitespace, fails the
+/// Spicepod load.
+#[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq, Default)]
+#[cfg_attr(feature = "schemars", derive(JsonSchema))]
+#[serde(rename_all = "snake_case")]
+pub enum AdaptiveTuning {
+    /// Derive the knobs statically. No closed loop.
+    #[default]
+    Disabled,
+    /// Run the closed-loop controller (preview).
+    Enabled,
+}
+
+impl AdaptiveTuning {
+    /// Resolve a raw value. Only `enabled` and `disabled` are valid.
+    ///
+    /// # Errors
+    ///
+    /// Returns a user-facing error naming the invalid value as written.
+    pub fn parse(raw: &str) -> Result<Self, String> {
+        match raw {
+            "enabled" => Ok(Self::Enabled),
+            "disabled" => Ok(Self::Disabled),
+            _ => Err(invalid_tuning_message(raw)),
+        }
+    }
+
+    #[must_use]
+    pub fn is_enabled(self) -> bool {
+        self == Self::Enabled
+    }
+}
+
+// Not derived, so an invalid value reports the documented message rather than serde's
+// generic unknown-variant or type text. A scalar that is not a string (`true`, `1`) is
+// reported as written; `true`/`false` are deliberately not accepted as aliases.
+impl<'de> Deserialize<'de> for AdaptiveTuning {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        struct AdaptiveTuningVisitor;
+
+        impl serde::de::Visitor<'_> for AdaptiveTuningVisitor {
+            type Value = AdaptiveTuning;
+
+            fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                formatter.write_str("`enabled` or `disabled`")
+            }
+
+            fn visit_str<E: serde::de::Error>(self, value: &str) -> Result<Self::Value, E> {
+                AdaptiveTuning::parse(value).map_err(E::custom)
+            }
+
+            fn visit_bool<E: serde::de::Error>(self, value: bool) -> Result<Self::Value, E> {
+                self.visit_str(&value.to_string())
+            }
+
+            fn visit_i64<E: serde::de::Error>(self, value: i64) -> Result<Self::Value, E> {
+                self.visit_str(&value.to_string())
+            }
+
+            fn visit_u64<E: serde::de::Error>(self, value: u64) -> Result<Self::Value, E> {
+                self.visit_str(&value.to_string())
+            }
+
+            fn visit_f64<E: serde::de::Error>(self, value: f64) -> Result<Self::Value, E> {
+                self.visit_str(&value.to_string())
+            }
+        }
+
+        deserializer.deserialize_any(AdaptiveTuningVisitor)
+    }
 }
 
 /// Controls registration and execution surfaces for Spicepod user-defined functions.
@@ -271,6 +399,23 @@ fn default_otel_push_interval() -> String {
     "60s".to_string()
 }
 
+/// A kind of telemetry the OTEL exporter sends, in OpenTelemetry's own terms.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash)]
+#[serde(rename_all = "snake_case")]
+#[cfg_attr(feature = "schemars", derive(JsonSchema))]
+pub enum OtelSignal {
+    /// The runtime's metrics, pushed every `push_interval`.
+    Metrics,
+    /// The runtime's log records, as printed to stdout.
+    Logs,
+}
+
+/// Metrics only: what `otel_exporter` sent before it could send anything else,
+/// so an existing Spicepod keeps sending exactly that.
+fn default_otel_signals() -> Vec<OtelSignal> {
+    vec![OtelSignal::Metrics]
+}
+
 /// Aggregation temporality preference for the OTEL metrics push exporter.
 ///
 /// Controls how counter and histogram values are encoded on the wire:
@@ -282,8 +427,10 @@ fn default_otel_push_interval() -> String {
 /// - **`Cumulative`**: each export carries the running total since process
 ///   start. Use this for `OTel` collectors that downstream into Prometheus or
 ///   other pull-based / cumulative-native backends.
-/// - **`LowMemory`**: counters use cumulative, histograms use delta. Reduces
-///   the SDK's in-process state for histogram-heavy workloads.
+/// - **`LowMemory`**: synchronous counters and histograms use delta; observable
+///   counters, up-down counters, and gauges use cumulative. Delta lets the SDK
+///   drop per-series state after each export, which reduces memory for
+///   high-cardinality counters and histograms.
 ///
 /// This setting only affects the OTLP push exporter; the runtime's Prometheus
 /// scrape endpoint always exposes cumulative metrics regardless of this value.
@@ -298,15 +445,18 @@ pub enum OtelTemporality {
     /// Cumulative temporality. Use for `OTel` collectors that downstream into
     /// Prometheus or other cumulative-native backends.
     Cumulative,
-    /// Counters use cumulative, histograms use delta.
+    /// Synchronous counters and histograms use delta; observable counters,
+    /// up-down counters, and gauges use cumulative.
     LowMemory,
 }
 
-/// Configuration for pushing metrics to an OpenTelemetry collector.
+/// Configuration for pushing metrics and logs to an OpenTelemetry collector.
 ///
 /// The protocol is inferred from the endpoint:
 /// - **HTTP**: When endpoint has `http://` or `https://` scheme, or contains `/v1/metrics`
 /// - **gRPC**: When endpoint is just a hostname and optional port (defaults to 4317)
+///
+/// `signals` chooses what is sent, and defaults to metrics only.
 ///
 /// # Examples
 ///
@@ -332,6 +482,13 @@ pub enum OtelTemporality {
 /// otel_exporter:
 ///   enabled: true
 ///   endpoint: "http://localhost:4318/v1/metrics"
+/// ```
+///
+/// Metrics and logs:
+/// ```yaml
+/// otel_exporter:
+///   endpoint: "otel-collector:4317"
+///   signals: [metrics, logs]
 /// ```
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
@@ -372,6 +529,13 @@ pub struct OtelExporterConfig {
     /// details.
     #[serde(default)]
     pub temporality: OtelTemporality,
+
+    /// What the exporter sends to `endpoint`: `metrics`, `logs`, or both.
+    ///
+    /// Defaults to `[metrics]`. `endpoint` and `headers` apply to every signal;
+    /// `push_interval`, `temporality`, and `metrics` apply to metrics only.
+    #[serde(default = "default_otel_signals")]
+    pub signals: Vec<OtelSignal>,
 }
 
 impl OtelExporterConfig {
@@ -388,6 +552,46 @@ impl OtelExporterConfig {
         self.endpoint.starts_with("http://")
             || self.endpoint.starts_with("https://")
             || self.endpoint.contains("/v1/metrics")
+    }
+
+    /// Whether this exporter sends `signal`.
+    #[must_use]
+    pub fn exports(&self, signal: OtelSignal) -> bool {
+        self.signals.contains(&signal)
+    }
+
+    /// Rejects a configuration the exporter cannot act on.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error, worded for the Spicepod author, when `signals` is empty.
+    pub fn validate(&self) -> Result<(), String> {
+        if self.signals.is_empty() {
+            return Err(format!(
+                "runtime.telemetry.otel_exporter.signals is empty, so the exporter has nothing to send. List 'metrics', 'logs', or both, or remove 'otel_exporter'. See: {OTEL_EXPORTER_DOCS_URL}"
+            ));
+        }
+        Ok(())
+    }
+
+    /// The OTLP/HTTP URL that log records are sent to.
+    ///
+    /// `endpoint` is treated as the base URL the OTLP exporter specification
+    /// describes, and `/v1/logs` is appended to it. A trailing `/v1/metrics` —
+    /// the form this exporter has always accepted for metrics — is removed
+    /// first, so one endpoint serves both signals. A query string is kept.
+    #[must_use]
+    pub fn logs_http_endpoint(&self) -> String {
+        let endpoint = self.endpoint.as_str();
+        let (base, query) = endpoint
+            .find(['?', '#'])
+            .map_or((endpoint, ""), |at| endpoint.split_at(at));
+        let base = base.trim_end_matches('/');
+        let base = base
+            .strip_suffix("/v1/metrics")
+            .unwrap_or(base)
+            .trim_end_matches('/');
+        format!("{base}/v1/logs{query}")
     }
 
     /// Returns the endpoint formatted for gRPC use.
@@ -439,7 +643,8 @@ pub struct TelemetryConfig {
     /// `MeterProvider`, so they appear as dimensions on every metric exported
     /// via the Prometheus scrape endpoint, the cluster on-demand OTLP reader,
     /// and the `otel_exporter` push exporter, and as labels on anonymous
-    /// usage telemetry. Currently does not affect tracing spans or logs.
+    /// usage telemetry. The log records `otel_exporter` sends carry the same
+    /// resource. Does not affect tracing spans.
     /// Example: `{ environment: prod, region: us-west-2, team: data-platform }`.
     #[serde(default)]
     pub properties: HashMap<String, String>,
@@ -499,6 +704,128 @@ impl Default for TelemetryConfig {
     }
 }
 
+/// Docs page for the `runtime.params` keys, linked from tuning diagnostics.
+pub const RUNTIME_PARAMS_DOCS_URL: &str = "https://spiceai.org/docs/reference/spicepod/runtime";
+
+/// Docs section for `runtime.telemetry.otel_exporter`, linked from its errors.
+pub const OTEL_EXPORTER_DOCS_URL: &str =
+    "https://spiceai.org/docs/reference/spicepod/runtime#runtimetelemetryotel_exporter";
+
+/// The runtime-wide targets the adaptive controller steers toward, under `runtime.params`.
+/// They steer the closed loop and never turn it on.
+pub const TUNING_TARGET_PARAMS: &[&str] = &[
+    "target_replication_lag",
+    "target_freshness",
+    "target_query_latency",
+    "target_convergence_window",
+    "target_qph",
+];
+
+/// Whether `runtime.params` sets any of [`TUNING_TARGET_PARAMS`].
+#[must_use]
+pub fn tuning_targets_set<S: std::hash::BuildHasher>(params: &HashMap<String, String, S>) -> bool {
+    TUNING_TARGET_PARAMS
+        .iter()
+        .any(|key| params.contains_key(*key))
+}
+
+/// Dataset acceleration parameters that moved to `runtime.params` and are no longer read.
+///
+/// Each is listed in its prefixed and unprefixed spelling, since a user may write either.
+pub const RETIRED_DATASET_TUNING_PARAMS: &[&str] = &[
+    "cayenne_tuning",
+    "tuning",
+    "cayenne_goal_replication_lag",
+    "goal_replication_lag",
+    "cayenne_goal_freshness",
+    "goal_freshness",
+    "cayenne_goal_query_latency",
+    "goal_query_latency",
+    "cayenne_goal_convergence_window",
+    "goal_convergence_window",
+    "cayenne_goal_qph",
+    "goal_qph",
+];
+
+/// Catalog parameters that moved to `runtime.params` and are no longer read.
+pub const RETIRED_CATALOG_TUNING_PARAMS: &[&str] = &[
+    "cayenne_tuning",
+    "tuning",
+    "cayenne_goal_replication_lag",
+    "goal_replication_lag",
+    "cayenne_goal_freshness",
+    "goal_freshness",
+    "cayenne_goal_query_latency",
+    "goal_query_latency",
+    "cayenne_goal_convergence_window",
+    "goal_convergence_window",
+    "cayenne_goal_qph",
+    "goal_qph",
+];
+
+/// `runtime.params` keys renamed without the `cayenne_` prefix, as `(old, new)`. The old
+/// names are no longer read.
+pub const RENAMED_RUNTIME_TUNING_PARAMS: &[(&str, &str)] = &[
+    ("cayenne_goal_replication_lag", "target_replication_lag"),
+    ("cayenne_goal_freshness", "target_freshness"),
+    ("cayenne_goal_query_latency", "target_query_latency"),
+    (
+        "cayenne_goal_convergence_window",
+        "target_convergence_window",
+    ),
+    ("cayenne_goal_qph", "target_qph"),
+];
+
+/// One warning for each of `retired` that `params` still sets on a dataset or catalog.
+///
+/// `kind` is `"dataset"` or `"catalog"` and `name` the component's name. The result is
+/// ordered as `retired` is, so the log is stable.
+#[must_use]
+pub fn retired_tuning_param_warnings<S: std::hash::BuildHasher>(
+    kind: &str,
+    name: &str,
+    params: &HashMap<String, String, S>,
+    retired: &[&str],
+) -> Vec<String> {
+    retired
+        .iter()
+        .filter(|key| params.contains_key(**key))
+        .map(|key| {
+            let bare = key.strip_prefix("cayenne_").unwrap_or(key);
+            let replacement = if bare == "tuning" {
+                "runtime.adaptive_tuning".to_string()
+            } else if let Some(target) = bare.strip_prefix("goal_") {
+                format!("runtime.params.target_{target}")
+            } else {
+                format!("runtime.params.{bare}")
+            };
+            let mut subject = kind.to_string();
+            if let Some(first) = subject.get_mut(..1) {
+                first.make_ascii_uppercase();
+            }
+            format!(
+                "{subject} '{name}' sets `{key}`, which is no longer a {kind} parameter, so it has no effect. Set `{replacement}` instead. See: {RUNTIME_PARAMS_DOCS_URL}"
+            )
+        })
+        .collect()
+}
+
+/// The warning for a `runtime.params` key that was renamed to `new_name`.
+#[must_use]
+pub fn renamed_runtime_param_warning(old_name: &str, new_name: &str) -> String {
+    format!(
+        "`runtime.params.{old_name}` has been renamed, so it has no effect. Set `runtime.params.{new_name}` instead. See: {RUNTIME_PARAMS_DOCS_URL}"
+    )
+}
+
+/// The error for an unrecognized `runtime.adaptive_tuning` value.
+#[must_use]
+pub fn invalid_tuning_message(value: &str) -> String {
+    format!(
+        "Invalid `runtime.adaptive_tuning` value '{value}': expected `enabled` or `disabled`. See: {RUNTIME_PARAMS_DOCS_URL}"
+    )
+}
+
 /// Validate `runtime.telemetry.metric_prefix` against OpenTelemetry instrument
 /// name syntax so `{prefix}{instrument}` stays a valid metric name for OTLP
 /// and maps cleanly through Prometheus name sanitization.
@@ -551,7 +878,20 @@ pub fn validate_metric_prefix(prefix: &str) -> Result<(), String> {
     Ok(())
 }
 
-/// Configuration for the MCP (Model Context Protocol) HTTP endpoint.
+/// Configuration for the MCP (Model Context Protocol) HTTP endpoint (`POST /v1/mcp`).
+///
+/// Spice is dual-era: it serves the [`2026-07-28`](https://modelcontextprotocol.io/specification/2026-07-28/)
+/// revision (stateless `server/discover`, per-request `_meta`, Streamable HTTP
+/// `MCP-Protocol-Version` / `Mcp-Method` / `Mcp-Name` headers) and still
+/// answers legacy `initialize` so existing Cursor/Claude clients keep working.
+/// Unsupported versions return JSON-RPC `-32022` listing the versions this
+/// runtime supports.
+///
+/// Browser `Origin` validation is not a field here: it uses
+/// [`CorsConfig::mcp_allowed_origins`]. `"*"` (the CORS default) and an
+/// empty list expand to localhost defaults so the rmcp list is never empty
+/// (empty accepts every `Origin`). A concrete list rejects a mismatched
+/// `Origin` with `HTTP` 403. Requests with no `Origin` still pass.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
 #[serde(deny_unknown_fields)]
 #[cfg_attr(feature = "schemars", derive(JsonSchema))]
@@ -560,7 +900,7 @@ pub struct McpConfig {
     /// Used to prevent DNS-rebinding attacks. Accepts bare hostnames (`example.com`),
     /// host-port pairs (`example.com:8090`), or full origin URLs (`https://example.com`).
     /// Set to `["*"]` to disable host checking entirely.
-    /// Defaults to rmcp defaults (`["localhost", "127.0.0.1", "::1"]`).
+    /// Unset or empty uses the defaults (`["localhost", "127.0.0.1", "::1"]`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub allowed_hosts: Option<Vec<String>>,
 }
@@ -857,11 +1197,39 @@ pub struct ApiKeyAuth {
 ///
 /// All comparisons (both `ApiKey` to `ApiKey` and `ApiKey` to `&str`) use
 /// constant-time comparison via the `subtle` crate to prevent timing attacks.
+///
+/// YAML/JSON configuration accepts a string. Optional `:ro` (default) or `:rw`
+/// suffix selects capability (for example `sk_live:rw`).
 #[derive(Clone)]
-#[cfg_attr(feature = "schemars", derive(JsonSchema))]
 pub enum ApiKey {
     ReadOnly { key: String },
     ReadWrite { key: String },
+}
+
+/// Aligns the generated Spicepod JSON Schema with [`Deserialize`] / [`Serialize`],
+/// which accept and emit API keys as strings (not externally-tagged enum objects).
+#[cfg(feature = "schemars")]
+impl JsonSchema for ApiKey {
+    fn schema_name() -> std::borrow::Cow<'static, str> {
+        "ApiKey".into()
+    }
+
+    fn schema_id() -> std::borrow::Cow<'static, str> {
+        concat!(module_path!(), "::ApiKey").into()
+    }
+
+    fn json_schema(_generator: &mut SchemaGenerator) -> Schema {
+        json_schema!({
+            "type": "string",
+            "description": "API key for authentication. Keys can be read-only or read-write.
+The key value is redacted in Debug output to prevent credential leakage.
+
+Pass the key as a string. Optional `:ro` (default) or `:rw` suffix selects capability.
+
+All comparisons (both `ApiKey` to `ApiKey` and `ApiKey` to `&str`) use
+constant-time comparison via the `subtle` crate to prevent timing attacks.",
+        })
+    }
 }
 
 /// Constant-time comparison for `ApiKey` to `ApiKey`.
@@ -904,6 +1272,9 @@ impl std::fmt::Debug for ApiKey {
 pub struct CorsConfig {
     #[serde(default)]
     pub enabled: bool,
+    /// Browser origins allowed when [`Self::enabled`] is true. Also the source
+    /// for MCP Streamable HTTP `Origin` checks on `/v1/mcp` — see
+    /// [`Self::mcp_allowed_origins`].
     #[serde(default = "default_allowed_origins")]
     pub allowed_origins: Vec<String>,
 }
@@ -912,12 +1283,79 @@ fn default_allowed_origins() -> Vec<String> {
     vec!["*".to_string()]
 }
 
+/// Localhost origins used when `runtime.cors.allowed_origins` is `"*"` or
+/// empty. `"*"` is not a valid RFC 6454 origin; expanding it here keeps the
+/// rmcp allow-list non-empty so default spicepods enforce the 2026-07-28
+/// Origin check. Entries omit a port so any port on that host matches.
+const DEFAULT_MCP_ALLOWED_ORIGINS: &[&str] = &[
+    "http://localhost",
+    "http://127.0.0.1",
+    "http://[::1]",
+    "https://localhost",
+    "https://127.0.0.1",
+    "https://[::1]",
+];
+
 impl Default for CorsConfig {
     fn default() -> Self {
         Self {
             enabled: false,
             allowed_origins: default_allowed_origins(),
         }
+    }
+}
+
+/// The `Origin` allow-list for `/v1/mcp`, derived from
+/// [`CorsConfig::allowed_origins`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum McpOrigins<'a> {
+    /// `"*"` or an empty list: the localhost defaults, on any port.
+    LocalhostDefaults,
+    /// A concrete list: an `Origin` must match the scheme, host and port of
+    /// one entry. An omitted default port (80, 443) equals the explicit one.
+    Explicit(&'a [String]),
+}
+
+impl McpOrigins<'_> {
+    /// The allow-list entries. The localhost defaults carry no port.
+    #[must_use]
+    pub fn entries(self) -> Vec<String> {
+        match self {
+            Self::LocalhostDefaults => DEFAULT_MCP_ALLOWED_ORIGINS
+                .iter()
+                .map(ToString::to_string)
+                .collect(),
+            Self::Explicit(origins) => origins.to_vec(),
+        }
+    }
+}
+
+impl CorsConfig {
+    /// The `/v1/mcp` `Origin` policy.
+    ///
+    /// `"*"` is not a valid RFC 6454 origin. CORS treats it as allow-all for
+    /// browser HTTP, but MCP Streamable HTTP must validate `Origin` (DNS
+    /// rebinding). Both `"*"` (the CORS default) and an empty list expand to
+    /// localhost defaults so the allow-list is never empty — an empty rmcp
+    /// list accepts every `Origin`.
+    ///
+    /// A concrete list is the 2026-07-28 Streamable HTTP origin policy:
+    /// a mismatched `Origin` is 403. Requests with no `Origin` still pass.
+    #[must_use]
+    pub fn mcp_origins(&self) -> McpOrigins<'_> {
+        if self.allowed_origins.iter().any(|origin| origin == "*")
+            || self.allowed_origins.is_empty()
+        {
+            McpOrigins::LocalhostDefaults
+        } else {
+            McpOrigins::Explicit(&self.allowed_origins)
+        }
+    }
+
+    /// Origins to install on rmcp Streamable HTTP. See [`Self::mcp_origins`].
+    #[must_use]
+    pub fn mcp_allowed_origins(&self) -> Vec<String> {
+        self.mcp_origins().entries()
     }
 }
 
@@ -1172,6 +1610,81 @@ pub struct Query {
     /// Unset = no timeout.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub timeout: Option<String>,
+
+    /// Whether the Cayenne query path should materialize a non-recursive CTE
+    /// once and reuse the result at every reference.
+    ///
+    /// `DataFusion` inlines `WITH` bodies, so a CTE used twice is planned and
+    /// executed twice. `auto` finds those multi-reference CTEs whose body is
+    /// expensive (aggregation, join, window, distinct, sort, unnest, or union)
+    /// and that scan a Cayenne-accelerated table, computes the body once into
+    /// a memory-accounted buffer, and shares it. Simple pass-through CTEs are
+    /// left inlined so projection pushdown can still prune columns.
+    ///
+    /// Default `disabled` preserves the inlining behavior. No-op on queries
+    /// that do not scan Cayenne.
+    ///
+    /// ```yaml
+    /// runtime:
+    ///   query:
+    ///     cte_materialization: auto   # disabled (default) | auto
+    /// ```
+    #[serde(default, skip_serializing_if = "is_default")]
+    pub cte_materialization: CteMaterialization,
+
+    /// Which failed queries are logged, to stdout and — when
+    /// `runtime.telemetry.otel_exporter.signals` includes `logs` — to the OTLP
+    /// endpoint. Default `none` logs nothing beyond a query refused for memory,
+    /// because failed queries can be frequent.
+    ///
+    /// ```yaml
+    /// runtime:
+    ///   query:
+    ///     log_errors: execution   # none (default) | execution | all
+    /// ```
+    #[serde(default, skip_serializing_if = "is_default")]
+    pub log_errors: QueryErrorLogging,
+}
+
+/// Which failed queries `spiced` logs.
+///
+/// A failure is either a query rejected before it ran — a syntax error, or a
+/// planning error such as an unknown table or column — which is the client's to
+/// fix, or a valid query that failed while running — a source or object-store
+/// error, a timeout, an internal error — which may need the operator.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[cfg_attr(feature = "schemars", derive(JsonSchema))]
+#[serde(rename_all = "snake_case")]
+pub enum QueryErrorLogging {
+    /// Log a query refused for want of memory as a warning, and every other
+    /// failure at debug level only.
+    #[default]
+    None,
+    /// Also log queries that failed while running, as warnings.
+    Execution,
+    /// Also log queries rejected before running, at info level.
+    All,
+}
+
+/// How the Cayenne query path treats multi-reference `WITH` clauses.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[cfg_attr(feature = "schemars", derive(JsonSchema))]
+#[serde(rename_all = "snake_case")]
+pub enum CteMaterialization {
+    /// Inline every CTE at each reference (`DataFusion`'s default).
+    #[default]
+    Disabled,
+    /// Materialize a CTE once when it is referenced more than once, its body is
+    /// expensive, and it scans a Cayenne-accelerated table.
+    Auto,
+}
+
+impl CteMaterialization {
+    /// Returns `true` when CTE materialization should run on the Cayenne path.
+    #[must_use]
+    pub const fn is_auto(self) -> bool {
+        matches!(self, Self::Auto)
+    }
 }
 
 impl Query {
@@ -1203,15 +1716,125 @@ pub enum SpillCompression {
     Uncompressed,
 }
 
+/// Shared object-store location for runtime state.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+#[cfg_attr(feature = "schemars", derive(JsonSchema))]
+pub struct RuntimeState {
+    /// Root URI (`file://`, `s3://`, `abfs://`, `abfss://`, `gs://`).
+    pub location: String,
+
+    /// Optional object store params (for example S3 `s3_region` / `s3_auth`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub params: Option<Params>,
+}
+
+/// The folder of `runtime.state.location` that holds the scheduler's cluster state.
+pub const SCHEDULER_STATE_FOLDER: &str = "cluster";
+
+/// `<location>/<folder>/`: where a feature keeps its objects in the
+/// `runtime.state` location `location`. A location that is not a URL is joined
+/// as text, so the feature's store still reports it as invalid.
+#[must_use]
+pub fn runtime_state_folder(location: &str, folder: &str) -> String {
+    let folder = format!("{folder}/");
+    match url::Url::parse(location) {
+        Ok(mut url) => {
+            if !url.path().ends_with('/') {
+                let path = format!("{}/", url.path());
+                url.set_path(&path);
+            }
+            url.join(&folder).map_or_else(
+                |_| format!("{}/{folder}", location.trim_end_matches('/')),
+                String::from,
+            )
+        }
+        Err(_) => format!("{}/{folder}", location.trim_end_matches('/')),
+    }
+}
+
+/// The `runtime.state.location` whose `folder/` is `location`, when `location`
+/// is a URL whose last path segment is `folder`.
+#[must_use]
+pub fn runtime_state_location_holding(location: &str, folder: &str) -> Option<String> {
+    let mut url = url::Url::parse(location).ok()?;
+    let parent = url
+        .path()
+        .trim_end_matches('/')
+        .strip_suffix(folder)?
+        .to_string();
+    if !parent.ends_with('/') {
+        return None;
+    }
+    url.set_path(&parent);
+    Some(url.to_string())
+}
+
+/// Whether `a` and `b` name the same folder, however their trailing `/` is written.
+#[must_use]
+pub fn same_folder(a: &str, b: &str) -> bool {
+    fn normalized(location: &str) -> String {
+        match url::Url::parse(location) {
+            Ok(mut url) => {
+                let path = format!("{}/", url.path().trim_end_matches('/'));
+                url.set_path(&path);
+                url.to_string()
+            }
+            Err(_) => format!("{}/", location.trim_end_matches('/')),
+        }
+    }
+    normalized(a) == normalized(b)
+}
+
+/// An object-store location for one feature's shared state.
+#[derive(Debug, Clone, PartialEq)]
+pub struct StateLocation {
+    /// Root URI (`file://`, `s3://`, `abfs://`, `abfss://`, `gs://`).
+    pub location: String,
+
+    /// Object store params for the location.
+    pub params: Option<Params>,
+
+    /// The setting that gave the location.
+    pub source: StateSource,
+}
+
+impl From<&RuntimeState> for StateLocation {
+    fn from(state: &RuntimeState) -> Self {
+        Self {
+            location: state.location.clone(),
+            params: state.params.clone(),
+            source: StateSource::RuntimeState,
+        }
+    }
+}
+
+/// The setting that gave a feature its state location.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StateSource {
+    /// `runtime.state`. Each feature keeps its objects in its own folder under
+    /// the location.
+    RuntimeState,
+    /// The feature's own setting, such as `runtime.scheduler.state_location`.
+    /// The feature keeps its objects at the location root.
+    FeatureSetting,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
 #[cfg_attr(feature = "schemars", derive(JsonSchema))]
 pub struct Scheduler {
-    /// Root URI for shared cluster state.
-    pub state_location: String,
-
-    /// Optional object store params for the shared cluster state.
+    /// Deprecated: set `runtime.state.location`, which keeps cluster state in its
+    /// `cluster/` folder. Root URI for shared cluster state (see
+    /// [`Runtime::scheduler_state`]).
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "schemars", schemars(extend("deprecated" = true)))]
+    pub state_location: Option<String>,
+
+    /// Deprecated: set `runtime.state.params`. Object store params for the shared
+    /// cluster state.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "schemars", schemars(extend("deprecated" = true)))]
     pub params: Option<Params>,
 
     /// How often the scheduler assigns accelerated table partitions to executors.
@@ -1231,19 +1854,26 @@ pub struct Scheduler {
     pub partition_discovery_timeout: String,
 }
 
+impl Default for Scheduler {
+    fn default() -> Self {
+        Self {
+            state_location: None,
+            params: None,
+            partition_assignment_interval: default_partition_assignment_interval(),
+            max_partition_assignments_per_interval: default_max_partition_assignments_per_interval(
+            ),
+            max_partitions_per_executor: default_max_partitions_per_executor(),
+            partition_discovery_timeout: default_partition_discovery_timeout(),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
 #[cfg_attr(feature = "schemars", derive(JsonSchema))]
 pub struct SourceRateControl {
-    /// Root URI for globally persisted source rate-control state.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub state_location: Option<String>,
-
-    /// Optional object store params for source rate-control state.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub params: Option<Params>,
-
-    /// How often each runtime refreshes and persists per-source rate-control state in object storage.
+    /// How often each runtime refreshes and persists per-source rate-control
+    /// state at `runtime.state.location`.
     #[serde(default = "default_rate_control_refresh_interval")]
     pub refresh_interval: String,
 
@@ -1255,8 +1885,6 @@ pub struct SourceRateControl {
 impl Default for SourceRateControl {
     fn default() -> Self {
         Self {
-            state_location: None,
-            params: None,
             refresh_interval: default_rate_control_refresh_interval(),
             github_concurrent_connections_limit: None,
         }
@@ -1310,6 +1938,11 @@ pub struct RuntimeDeserializer {
     #[serde(skip_serializing_if = "HashMap::is_empty")]
     #[serde(default)]
     pub params: HashMap<String, String>,
+
+    /// Turns adaptive tuning on or off for the whole runtime. `disabled` (default) derives
+    /// Cayenne's knobs statically; `enabled` also runs its closed-loop controller.
+    #[serde(default, skip_serializing_if = "is_default")]
+    pub adaptive_tuning: AdaptiveTuning,
     #[serde(default, skip_serializing_if = "is_default")]
     pub task_history: TaskHistory,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1349,6 +1982,8 @@ pub struct RuntimeDeserializer {
     pub cpu: Option<Cpu>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub metrics: Option<Metrics>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub state: Option<RuntimeState>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub scheduler: Option<Scheduler>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1415,6 +2050,14 @@ impl TryFrom<RuntimeDeserializer> for Runtime {
             validate_metric_prefix(prefix)?;
         }
 
+        if let Some(otel_exporter) = &deserializer.telemetry.otel_exporter {
+            otel_exporter.validate()?;
+        }
+
+        if let Some(sql_results) = &caching.sql_results {
+            crate::component::caching::validate_sql_results_warmup_config(sql_results)?;
+        }
+
         Ok(Runtime {
             caching,
             dataset_load_parallelism: deserializer.dataset_load_parallelism,
@@ -1422,6 +2065,7 @@ impl TryFrom<RuntimeDeserializer> for Runtime {
             tracing: deserializer.tracing,
             telemetry: deserializer.telemetry,
             params: deserializer.params,
+            adaptive_tuning: deserializer.adaptive_tuning,
             task_history: deserializer.task_history,
             drasi: deserializer.drasi,
             auth: deserializer.auth,
@@ -1438,6 +2082,7 @@ impl TryFrom<RuntimeDeserializer> for Runtime {
             },
             cpu: deserializer.cpu,
             metrics: deserializer.metrics,
+            state: deserializer.state,
             scheduler: deserializer.scheduler,
             source_rate_control: deserializer.source_rate_control,
             functions: deserializer.functions,
@@ -1449,6 +2094,41 @@ impl TryFrom<RuntimeDeserializer> for Runtime {
 mod tests {
     use super::*;
     use yaml;
+
+    #[cfg(feature = "schemars")]
+    #[test]
+    fn test_api_key_json_schema_is_string() {
+        use schemars::schema_for;
+        let schema = schema_for!(ApiKey);
+        let value = serde_json::to_value(&schema).expect("schema serializes");
+        assert_eq!(
+            value.get("type").and_then(|v| v.as_str()),
+            Some("string"),
+            "ApiKey JSON Schema must match string Deserialize/Serialize: {value}"
+        );
+        assert!(
+            value.get("oneOf").is_none(),
+            "ApiKey must not use externally-tagged object oneOf: {value}"
+        );
+    }
+
+    #[test]
+    fn test_runtime_rejects_warmup_with_sql_cache_key_type() {
+        let yaml = r"
+            caching:
+              sql_results:
+                enabled: true
+                cache_key_type: sql
+                warmup: on_first_refresh
+        ";
+        let err = yaml::from_str::<Runtime>(yaml)
+            .expect_err("warmup + cache_key_type: sql must fail spicepod load");
+        let message = err.to_string();
+        assert!(
+            message.contains("cache_key_type: plan") || message.contains("warmup"),
+            "error must name the corrective action, got: {message}"
+        );
+    }
 
     #[test]
     fn test_deserialize_api_keys() {
@@ -1513,7 +2193,7 @@ mod tests {
         };
 
         // Test exact match
-        assert!(key == *"secret-api-key-12345");
+        assert_eq!(key, *"secret-api-key-12345");
 
         // Test mismatch at different positions
         assert!(key != *"xecret-api-key-12345"); // First char different
@@ -1529,7 +2209,7 @@ mod tests {
         let rw_key = ApiKey::ReadWrite {
             key: "rw-key".to_string(),
         };
-        assert!(rw_key == *"rw-key");
+        assert_eq!(rw_key, *"rw-key");
         assert!(rw_key != *"rw-key2");
     }
 
@@ -1605,9 +2285,12 @@ mod tests {
           unknown_field: value
         ";
         let result: Result<Runtime, _> = yaml::from_str(yaml);
-        assert!(
-            result.is_err(),
-            "unknown fields in mcp section should be rejected due to deny_unknown_fields"
+        // Rejected by the mcp section's `deny_unknown_fields`, naming the one valid key.
+        assert_eq!(
+            result
+                .expect_err("unknown fields in the mcp section must be rejected")
+                .to_string(),
+            "unknown field `unknown_field`, expected `allowed_hosts`"
         );
     }
 
@@ -1665,16 +2348,8 @@ mod tests {
         assert_eq!(
             runtime.query,
             Some(Query {
-                spill_compression: None,
-                temp_directory: None,
                 memory_limit: Some("100MiB".to_string()),
-                target_partitions: None,
-                max_concurrent_queries: None,
-                prefer_hash_join: None,
-                eager_aggregation: None,
-                eager_aggregation_min_reduction_factor: None,
-                eager_aggregation_max_pushed_groups: None,
-                timeout: None,
+                ..Query::default()
             })
         );
 
@@ -1687,16 +2362,8 @@ mod tests {
         assert_eq!(
             runtime.query,
             Some(Query {
-                spill_compression: None,
-                temp_directory: None,
                 memory_limit: Some("200MiB".to_string()),
-                target_partitions: None,
-                max_concurrent_queries: None,
-                prefer_hash_join: None,
-                eager_aggregation: None,
-                eager_aggregation_min_reduction_factor: None,
-                eager_aggregation_max_pushed_groups: None,
-                timeout: None,
+                ..Query::default()
             })
         );
 
@@ -1710,16 +2377,8 @@ mod tests {
         assert_eq!(
             runtime.query,
             Some(Query {
-                spill_compression: None,
-                temp_directory: None,
                 memory_limit: Some("200MiB".to_string()),
-                target_partitions: None,
-                max_concurrent_queries: None,
-                prefer_hash_join: None,
-                eager_aggregation: None,
-                eager_aggregation_min_reduction_factor: None,
-                eager_aggregation_max_pushed_groups: None,
-                timeout: None,
+                ..Query::default()
             })
         );
 
@@ -1740,16 +2399,8 @@ mod tests {
         assert_eq!(
             runtime.query,
             Some(Query {
-                spill_compression: None,
                 temp_directory: Some("/foo".to_string()),
-                memory_limit: None,
-                target_partitions: None,
-                max_concurrent_queries: None,
-                prefer_hash_join: None,
-                eager_aggregation: None,
-                eager_aggregation_min_reduction_factor: None,
-                eager_aggregation_max_pushed_groups: None,
-                timeout: None,
+                ..Query::default()
             })
         );
 
@@ -1762,16 +2413,8 @@ mod tests {
         assert_eq!(
             runtime.query,
             Some(Query {
-                spill_compression: None,
                 temp_directory: Some("/bar".to_string()),
-                memory_limit: None,
-                target_partitions: None,
-                max_concurrent_queries: None,
-                prefer_hash_join: None,
-                eager_aggregation: None,
-                eager_aggregation_min_reduction_factor: None,
-                eager_aggregation_max_pushed_groups: None,
-                timeout: None,
+                ..Query::default()
             })
         );
 
@@ -1785,16 +2428,8 @@ mod tests {
         assert_eq!(
             runtime.query,
             Some(Query {
-                spill_compression: None,
                 temp_directory: Some("/bar".to_string()),
-                memory_limit: None,
-                target_partitions: None,
-                max_concurrent_queries: None,
-                prefer_hash_join: None,
-                eager_aggregation: None,
-                eager_aggregation_min_reduction_factor: None,
-                eager_aggregation_max_pushed_groups: None,
-                timeout: None,
+                ..Query::default()
             })
         );
 
@@ -1895,6 +2530,81 @@ mod tests {
             .expect_err("garbage timeout should be an error");
         assert!(
             err.to_string().contains("runtime.query.timeout"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn test_query_log_errors_parses() {
+        let empty: Runtime = yaml::from_str("{}").expect("parses");
+        assert_eq!(
+            empty.query.unwrap_or_default().log_errors,
+            QueryErrorLogging::None,
+            "failed queries are not logged unless asked for"
+        );
+
+        for (raw, expected) in [
+            ("none", QueryErrorLogging::None),
+            ("execution", QueryErrorLogging::Execution),
+            ("all", QueryErrorLogging::All),
+        ] {
+            let runtime: Runtime = yaml::from_str(&format!(
+                "
+            query:
+                log_errors: {raw}
+        "
+            ))
+            .unwrap_or_else(|e| panic!("log_errors {raw} must parse: {e}"));
+            assert_eq!(
+                runtime.query.unwrap_or_default().log_errors,
+                expected,
+                "log_errors={raw}"
+            );
+        }
+
+        let err = yaml::from_str::<Runtime>(
+            r"
+            query:
+                log_errors: errors
+        ",
+        )
+        .expect_err("an unknown value must be rejected");
+        assert_eq!(
+            err.to_string(),
+            "unknown variant `errors`, expected one of `none`, `execution`, `all`"
+        );
+    }
+
+    #[test]
+    fn test_query_cte_materialization_parses() {
+        let empty: Runtime = yaml::from_str("{}").expect("parses");
+        assert_eq!(empty.query, None);
+
+        let yaml = r"
+            query:
+                cte_materialization: auto
+        ";
+        let runtime: Runtime = yaml::from_str(yaml).expect("parses");
+        let query = runtime.query.expect("query section should be present");
+        assert_eq!(query.cte_materialization, CteMaterialization::Auto);
+        assert!(query.cte_materialization.is_auto());
+
+        let yaml = r"
+            query:
+                cte_materialization: disabled
+        ";
+        let runtime: Runtime = yaml::from_str(yaml).expect("parses");
+        // `disabled` is the default, so a query section that only sets it is
+        // dropped on deserialize (same as an omitted `query:`).
+        assert_eq!(runtime.query, None);
+
+        let yaml = r"
+            query:
+                cte_materialization: always
+        ";
+        let err = yaml::from_str::<Runtime>(yaml).expect_err("unknown variant");
+        assert!(
+            err.to_string().contains("cte_materialization") || err.to_string().contains("always"),
             "unexpected error: {err}"
         );
     }
@@ -2357,9 +3067,11 @@ datasets:
                     temporality: nonsense
         ";
         let result: Result<Runtime, _> = yaml::from_str(yaml);
-        assert!(
-            result.is_err(),
-            "unknown temporality value must fail to parse"
+        assert_eq!(
+            result
+                .expect_err("unknown temporality value must fail to parse")
+                .to_string(),
+            "unknown variant `nonsense`, expected one of `delta`, `cumulative`, `low_memory`"
         );
     }
 
@@ -2372,6 +3084,183 @@ datasets:
         ";
         let runtime: Runtime = yaml::from_str(yaml).expect("Failed to parse Runtime");
         assert_eq!(runtime.telemetry.metric_prefix, None);
+    }
+
+    #[test]
+    fn test_adaptive_tuning_defaults_to_disabled() {
+        let runtime: Runtime = yaml::from_str("params: {}").expect("unset tuning must parse");
+        assert_eq!(runtime.adaptive_tuning, AdaptiveTuning::Disabled);
+        assert!(!runtime.adaptive_tuning.is_enabled());
+    }
+
+    #[test]
+    fn test_adaptive_tuning_accepts_enabled_and_disabled() {
+        for (value, expected) in [
+            ("disabled", AdaptiveTuning::Disabled),
+            ("enabled", AdaptiveTuning::Enabled),
+        ] {
+            let yaml = format!("adaptive_tuning: \"{value}\"\n");
+            let runtime: Runtime = yaml::from_str(&yaml).expect("valid tuning must parse");
+            assert_eq!(runtime.adaptive_tuning, expected, "value {value:?}");
+        }
+    }
+
+    #[test]
+    fn test_adaptive_tuning_is_matched_exactly() {
+        for value in ["ENABLED", "Disabled", " enabled", "disabled "] {
+            let error = yaml::from_str::<Runtime>(&format!("adaptive_tuning: \"{value}\"\n"))
+                .expect_err("only the exact schema values may load");
+            assert!(
+                error.to_string().contains(&invalid_tuning_message(value)),
+                "unexpected error for {value:?}: {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_adaptive_tuning_invalid_value_fails_load() {
+        let error = yaml::from_str::<Runtime>("adaptive_tuning: enablde\n")
+            .expect_err("an invalid tuning value must fail the load");
+        assert!(
+            error
+                .to_string()
+                .contains(&invalid_tuning_message("enablde")),
+            "unexpected error: {error}"
+        );
+        assert_eq!(
+            invalid_tuning_message("enablde"),
+            "Invalid `runtime.adaptive_tuning` value 'enablde': expected `enabled` or `disabled`. See: https://spiceai.org/docs/reference/spicepod/runtime"
+        );
+    }
+
+    #[test]
+    fn test_adaptive_tuning_rejects_non_string_scalars_with_the_documented_message() {
+        for (yaml_value, rendered) in [("true", "true"), ("false", "false"), ("1", "1")] {
+            let error = yaml::from_str::<Runtime>(&format!("adaptive_tuning: {yaml_value}\n"))
+                .expect_err("a non-string value must fail the load");
+            assert!(
+                error
+                    .to_string()
+                    .contains(&invalid_tuning_message(rendered)),
+                "unexpected error for {yaml_value}: {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_adaptive_tuning_rejects_non_string_json_scalars_with_the_documented_message() {
+        for (json_value, rendered) in [
+            ("true", "true"),
+            ("false", "false"),
+            ("1", "1"),
+            ("1.5", "1.5"),
+        ] {
+            let error =
+                serde_json::from_str::<Runtime>(&format!(r#"{{"adaptive_tuning": {json_value}}}"#))
+                    .expect_err("a non-string value must fail the load");
+            assert!(
+                error
+                    .to_string()
+                    .contains(&invalid_tuning_message(rendered)),
+                "unexpected error for {json_value}: {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_runtime_params_adaptive_tuning_does_not_enable_it() {
+        let runtime: Runtime = yaml::from_str("params:\n  adaptive_tuning: enabled\n")
+            .expect("an unrecognized runtime param must still parse");
+        assert_eq!(runtime.adaptive_tuning, AdaptiveTuning::Disabled);
+    }
+
+    #[test]
+    fn test_adaptive_tuning_serializes_only_when_set() {
+        let enabled = Runtime {
+            adaptive_tuning: AdaptiveTuning::Enabled,
+            ..Runtime::default()
+        };
+        let yaml = yaml::to_string(&enabled).expect("serialize");
+        assert!(yaml.contains("adaptive_tuning: enabled"), "{yaml}");
+        let yaml = yaml::to_string(&Runtime::default()).expect("serialize");
+        assert!(!yaml.contains("adaptive_tuning"), "{yaml}");
+    }
+
+    #[test]
+    fn test_retired_tuning_param_warning_text() {
+        let params = HashMap::from([("cayenne_tuning".to_string(), "enabled".to_string())]);
+        assert_eq!(
+            retired_tuning_param_warnings(
+                "dataset",
+                "orders",
+                &params,
+                RETIRED_DATASET_TUNING_PARAMS
+            ),
+            vec!["Dataset 'orders' sets `cayenne_tuning`, which is no longer a dataset parameter, so it has no effect. Set `runtime.adaptive_tuning` instead. See: https://spiceai.org/docs/reference/spicepod/runtime".to_string()]
+        );
+        let params = HashMap::from([("cayenne_goal_freshness".to_string(), "5s".to_string())]);
+        assert_eq!(
+            retired_tuning_param_warnings(
+                "dataset",
+                "orders",
+                &params,
+                RETIRED_DATASET_TUNING_PARAMS
+            ),
+            vec!["Dataset 'orders' sets `cayenne_goal_freshness`, which is no longer a dataset parameter, so it has no effect. Set `runtime.params.target_freshness` instead. See: https://spiceai.org/docs/reference/spicepod/runtime".to_string()]
+        );
+        let params = HashMap::from([
+            ("tuning".to_string(), "enabled".to_string()),
+            ("goal_freshness".to_string(), "5s".to_string()),
+            ("cayenne_goal_qph".to_string(), "100".to_string()),
+            ("goal_qph".to_string(), "100".to_string()),
+        ]);
+        assert_eq!(
+            retired_tuning_param_warnings(
+                "dataset",
+                "orders",
+                &params,
+                RETIRED_DATASET_TUNING_PARAMS
+            ),
+            vec![
+                "Dataset 'orders' sets `tuning`, which is no longer a dataset parameter, so it has no effect. Set `runtime.adaptive_tuning` instead. See: https://spiceai.org/docs/reference/spicepod/runtime".to_string(),
+                "Dataset 'orders' sets `goal_freshness`, which is no longer a dataset parameter, so it has no effect. Set `runtime.params.target_freshness` instead. See: https://spiceai.org/docs/reference/spicepod/runtime".to_string(),
+                "Dataset 'orders' sets `cayenne_goal_qph`, which is no longer a dataset parameter, so it has no effect. Set `runtime.params.target_qph` instead. See: https://spiceai.org/docs/reference/spicepod/runtime".to_string(),
+                "Dataset 'orders' sets `goal_qph`, which is no longer a dataset parameter, so it has no effect. Set `runtime.params.target_qph` instead. See: https://spiceai.org/docs/reference/spicepod/runtime".to_string(),
+            ]
+        );
+        let params = HashMap::from([("cayenne_tuning".to_string(), "disabled".to_string())]);
+        assert_eq!(
+            retired_tuning_param_warnings("catalog", "lake", &params, RETIRED_CATALOG_TUNING_PARAMS),
+            vec!["Catalog 'lake' sets `cayenne_tuning`, which is no longer a catalog parameter, so it has no effect. Set `runtime.adaptive_tuning` instead. See: https://spiceai.org/docs/reference/spicepod/runtime".to_string()]
+        );
+        let params = HashMap::from([
+            ("cayenne_goal_freshness".to_string(), "5s".to_string()),
+            ("goal_qph".to_string(), "100".to_string()),
+        ]);
+        assert_eq!(
+            retired_tuning_param_warnings("catalog", "lake", &params, RETIRED_CATALOG_TUNING_PARAMS),
+            vec![
+                "Catalog 'lake' sets `cayenne_goal_freshness`, which is no longer a catalog parameter, so it has no effect. Set `runtime.params.target_freshness` instead. See: https://spiceai.org/docs/reference/spicepod/runtime".to_string(),
+                "Catalog 'lake' sets `goal_qph`, which is no longer a catalog parameter, so it has no effect. Set `runtime.params.target_qph` instead. See: https://spiceai.org/docs/reference/spicepod/runtime".to_string(),
+            ]
+        );
+        assert!(
+            retired_tuning_param_warnings(
+                "dataset",
+                "orders",
+                &HashMap::new(),
+                RETIRED_DATASET_TUNING_PARAMS
+            )
+            .is_empty()
+        );
+    }
+
+    #[test]
+    fn test_renamed_runtime_param_warning_text() {
+        assert_eq!(
+            renamed_runtime_param_warning("cayenne_goal_freshness", "target_freshness"),
+            "`runtime.params.cayenne_goal_freshness` has been renamed, so it has no effect. Set `runtime.params.target_freshness` instead. See: https://spiceai.org/docs/reference/spicepod/runtime"
+        );
     }
 
     #[test]
@@ -2514,6 +3403,7 @@ datasets:
             metrics: vec![],
             headers: HashMap::new(),
             temporality: OtelTemporality::default(),
+            signals: default_otel_signals(),
         };
         let duration = config
             .push_interval_duration()
@@ -2527,6 +3417,7 @@ datasets:
             metrics: vec![],
             headers: HashMap::new(),
             temporality: OtelTemporality::default(),
+            signals: default_otel_signals(),
         };
         let duration = config_minutes
             .push_interval_duration()
@@ -2540,6 +3431,7 @@ datasets:
             metrics: vec![],
             headers: HashMap::new(),
             temporality: OtelTemporality::default(),
+            signals: default_otel_signals(),
         };
         let duration = config_hours
             .push_interval_duration()
@@ -2554,6 +3446,7 @@ datasets:
             metrics: vec![],
             headers: HashMap::new(),
             temporality: OtelTemporality::default(),
+            signals: default_otel_signals(),
         };
         let duration = config_ms
             .push_interval_duration()
@@ -2570,6 +3463,7 @@ datasets:
             metrics: vec![],
             headers: HashMap::new(),
             temporality: OtelTemporality::default(),
+            signals: default_otel_signals(),
         };
         let result = config.push_interval_duration();
         assert!(result.is_err());
@@ -2588,9 +3482,19 @@ datasets:
             metrics: vec![],
             headers: HashMap::new(),
             temporality: OtelTemporality::default(),
+            signals: default_otel_signals(),
         };
-        let result = config.push_interval_duration();
-        let _ = result.expect_err("Expected an error for invalid push_interval");
+        let err = config
+            .push_interval_duration()
+            .expect_err("Expected an error for invalid push_interval");
+        // The parse failure, naming the setting and its value, with the duration
+        // parser's own reason after it.
+        let parse_error = duration_parse::parse_duration("invalid")
+            .expect_err("the duration parser rejects the same value");
+        assert_eq!(
+            err.to_string(),
+            format!("Failed to parse 'push_interval' value 'invalid': {parse_error}")
+        );
     }
 
     #[test]
@@ -2613,6 +3517,7 @@ datasets:
             metrics: vec![],
             headers: HashMap::new(),
             temporality: OtelTemporality::default(),
+            signals: default_otel_signals(),
         };
         assert!(!grpc_bare.is_http());
 
@@ -2624,6 +3529,7 @@ datasets:
             metrics: vec![],
             headers: HashMap::new(),
             temporality: OtelTemporality::default(),
+            signals: default_otel_signals(),
         };
         assert!(!grpc_port.is_http());
 
@@ -2635,6 +3541,7 @@ datasets:
             metrics: vec![],
             headers: HashMap::new(),
             temporality: OtelTemporality::default(),
+            signals: default_otel_signals(),
         };
         assert!(http_scheme.is_http());
 
@@ -2646,6 +3553,7 @@ datasets:
             metrics: vec![],
             headers: HashMap::new(),
             temporality: OtelTemporality::default(),
+            signals: default_otel_signals(),
         };
         assert!(https_config.is_http());
 
@@ -2657,6 +3565,7 @@ datasets:
             metrics: vec![],
             headers: HashMap::new(),
             temporality: OtelTemporality::default(),
+            signals: default_otel_signals(),
         };
         assert!(http_path.is_http());
     }
@@ -2671,6 +3580,7 @@ datasets:
             metrics: vec![],
             headers: HashMap::new(),
             temporality: OtelTemporality::default(),
+            signals: default_otel_signals(),
         };
         assert_eq!(bare.grpc_endpoint(), "http://otel-collector:4317");
 
@@ -2682,6 +3592,7 @@ datasets:
             metrics: vec![],
             headers: HashMap::new(),
             temporality: OtelTemporality::default(),
+            signals: default_otel_signals(),
         };
         assert_eq!(with_port.grpc_endpoint(), "http://otel-collector:9090");
 
@@ -2693,8 +3604,140 @@ datasets:
             metrics: vec![],
             headers: HashMap::new(),
             temporality: OtelTemporality::default(),
+            signals: default_otel_signals(),
         };
         assert_eq!(localhost.grpc_endpoint(), "http://localhost:4317");
+    }
+
+    fn otel_exporter_from(yaml: &str) -> Result<OtelExporterConfig, String> {
+        yaml::from_str::<Runtime>(yaml)
+            .map_err(|e| e.to_string())
+            .map(|runtime| {
+                runtime
+                    .telemetry
+                    .otel_exporter
+                    .expect("otel_exporter should be present")
+            })
+    }
+
+    /// A Spicepod written before `signals` existed must keep sending metrics
+    /// and nothing else.
+    #[test]
+    fn test_otel_exporter_signals_default_to_metrics_only() {
+        let config = otel_exporter_from(
+            r"
+            telemetry:
+                otel_exporter:
+                    endpoint: otel-collector
+        ",
+        )
+        .expect("an exporter without signals must parse");
+        assert_eq!(config.signals, vec![OtelSignal::Metrics]);
+        assert!(config.exports(OtelSignal::Metrics));
+        assert!(!config.exports(OtelSignal::Logs));
+    }
+
+    #[test]
+    fn test_otel_exporter_signals_parsing() {
+        for (raw, metrics, logs) in [
+            ("[metrics, logs]", true, true),
+            ("[logs]", false, true),
+            ("[metrics]", true, false),
+        ] {
+            let config = otel_exporter_from(&format!(
+                "
+            telemetry:
+                otel_exporter:
+                    endpoint: otel-collector
+                    signals: {raw}
+        "
+            ))
+            .unwrap_or_else(|e| panic!("signals {raw} must parse: {e}"));
+            assert_eq!(
+                config.exports(OtelSignal::Metrics),
+                metrics,
+                "signals={raw}"
+            );
+            assert_eq!(config.exports(OtelSignal::Logs), logs, "signals={raw}");
+        }
+    }
+
+    #[test]
+    fn test_otel_exporter_empty_signals_rejected() {
+        let err = otel_exporter_from(
+            r"
+            telemetry:
+                otel_exporter:
+                    endpoint: otel-collector
+                    signals: []
+        ",
+        )
+        .expect_err("an exporter with nothing to send must be rejected");
+        assert_eq!(
+            err,
+            "runtime.telemetry.otel_exporter.signals is empty, so the exporter has nothing to send. List 'metrics', 'logs', or both, or remove 'otel_exporter'. See: https://spiceai.org/docs/reference/spicepod/runtime#runtimetelemetryotel_exporter"
+        );
+    }
+
+    #[test]
+    fn test_otel_exporter_unknown_signal_rejected() {
+        let err = otel_exporter_from(
+            r"
+            telemetry:
+                otel_exporter:
+                    endpoint: otel-collector
+                    signals: [metrics, traces]
+        ",
+        )
+        .expect_err("a signal the exporter cannot send must be rejected");
+        assert_eq!(
+            err,
+            "unknown variant `traces`, expected `metrics` or `logs`"
+        );
+    }
+
+    /// The logs URL follows the OTLP exporter specification's base-URL rule,
+    /// and also accepts the `/v1/metrics` URL this exporter documents for
+    /// metrics, so one endpoint serves both signals.
+    #[test]
+    fn test_otel_exporter_logs_http_endpoint() {
+        for (endpoint, expected) in [
+            (
+                "http://otel-collector:4318",
+                "http://otel-collector:4318/v1/logs",
+            ),
+            (
+                "http://otel-collector:4318/",
+                "http://otel-collector:4318/v1/logs",
+            ),
+            (
+                "http://otel-collector:4318/v1/metrics",
+                "http://otel-collector:4318/v1/logs",
+            ),
+            (
+                "http://otel-collector:4318/v1/metrics/",
+                "http://otel-collector:4318/v1/logs",
+            ),
+            (
+                "https://otlp.example.com/otlp",
+                "https://otlp.example.com/otlp/v1/logs",
+            ),
+            (
+                "https://otlp.example.com/otlp/v1/metrics?tenant=a",
+                "https://otlp.example.com/otlp/v1/logs?tenant=a",
+            ),
+        ] {
+            let config = OtelExporterConfig {
+                enabled: true,
+                endpoint: endpoint.to_string(),
+                push_interval: "60s".to_string(),
+                metrics: vec![],
+                headers: HashMap::new(),
+                temporality: OtelTemporality::default(),
+                signals: vec![OtelSignal::Logs],
+            };
+            assert_eq!(config.logs_http_endpoint(), expected, "endpoint={endpoint}");
+        }
     }
 
     #[test]
@@ -3107,9 +4150,135 @@ datasets:
               client_auth_mode: requuired
         ";
         let result: Result<Runtime, _> = yaml::from_str(yaml);
-        assert!(
-            result.is_err(),
-            "expected unknown client_auth_mode value to be rejected"
+        assert_eq!(
+            result
+                .expect_err("expected unknown client_auth_mode value to be rejected")
+                .to_string(),
+            "unknown variant `requuired`, expected one of `none`, `request`, `required`"
         );
+    }
+
+    #[test]
+    fn mcp_allowed_origins_default_wildcard_expands_to_localhost() {
+        let origins = CorsConfig::default().mcp_allowed_origins();
+        assert!(
+            origins.iter().any(|origin| origin == "http://localhost"),
+            "default CORS * must expand to localhost defaults, got {origins:?}"
+        );
+        assert!(
+            !origins.is_empty(),
+            "default CORS * must not leave the rmcp Origin list empty"
+        );
+        assert!(
+            !origins.iter().any(|origin| origin == "*"),
+            "rmcp does not treat * as a wildcard Origin, got {origins:?}"
+        );
+    }
+
+    #[test]
+    fn mcp_allowed_origins_wildcard_expands_to_localhost() {
+        let cors = CorsConfig {
+            enabled: true,
+            allowed_origins: vec!["*".to_string()],
+        };
+        let origins = cors.mcp_allowed_origins();
+        assert!(
+            origins.iter().any(|origin| origin == "http://localhost"),
+            "CORS * must expand to localhost defaults, got {origins:?}"
+        );
+        assert!(
+            !origins.is_empty(),
+            "CORS * must not leave the rmcp Origin list empty"
+        );
+    }
+
+    #[test]
+    fn mcp_allowed_origins_empty_list_expands_to_localhost() {
+        let cors = CorsConfig {
+            enabled: true,
+            allowed_origins: vec![],
+        };
+        let origins = cors.mcp_allowed_origins();
+        assert!(
+            origins.iter().any(|origin| origin == "http://localhost"),
+            "empty CORS list (no *) must expand to localhost defaults, got {origins:?}"
+        );
+        assert!(
+            !origins.iter().any(|origin| origin == "*"),
+            "rmcp does not treat * as a wildcard Origin, got {origins:?}"
+        );
+    }
+
+    #[test]
+    fn mcp_allowed_origins_concrete_list_is_used_as_is() {
+        let cors = CorsConfig {
+            enabled: true,
+            allowed_origins: vec!["https://app.example.com".to_string()],
+        };
+        assert_eq!(
+            cors.mcp_allowed_origins(),
+            vec!["https://app.example.com".to_string()]
+        );
+    }
+
+    #[test]
+    fn runtime_state_folder_joins_the_folder_to_the_location() {
+        for (location, expected) in [
+            ("s3://my-bucket/spice/", "s3://my-bucket/spice/snapshots/"),
+            ("s3://my-bucket/spice", "s3://my-bucket/spice/snapshots/"),
+            ("s3://my-bucket", "s3://my-bucket/snapshots/"),
+            ("s3://my-bucket/", "s3://my-bucket/snapshots/"),
+            ("file:///", "file:///snapshots/"),
+            (
+                "file:///var/spice/state",
+                "file:///var/spice/state/snapshots/",
+            ),
+            (
+                "abfss://container@account.dfs.core.windows.net/spice/",
+                "abfss://container@account.dfs.core.windows.net/spice/snapshots/",
+            ),
+            ("abfs://container", "abfs://container/snapshots/"),
+            ("gs://bucket/a%20b/", "gs://bucket/a%20b/snapshots/"),
+            ("not a url", "not a url/snapshots/"),
+        ] {
+            assert_eq!(
+                runtime_state_folder(location, "snapshots"),
+                expected,
+                "{location}"
+            );
+        }
+    }
+
+    #[test]
+    fn runtime_state_location_holding_is_the_parent_of_the_folder() {
+        for (location, expected) in [
+            (
+                "s3://my-bucket/spice/cluster/",
+                Some("s3://my-bucket/spice/"),
+            ),
+            (
+                "s3://my-bucket/spice/cluster",
+                Some("s3://my-bucket/spice/"),
+            ),
+            ("s3://my-bucket/cluster/", Some("s3://my-bucket/")),
+            ("file:///var/spice/cluster", Some("file:///var/spice/")),
+            ("s3://my-bucket/spice/my-cluster/", None),
+            ("s3://my-bucket/spice/", None),
+            ("not a url/cluster/", None),
+        ] {
+            assert_eq!(
+                runtime_state_location_holding(location, SCHEDULER_STATE_FOLDER).as_deref(),
+                expected,
+                "{location}"
+            );
+            if let Some(parent) = expected {
+                assert!(same_folder(
+                    &runtime_state_folder(parent, SCHEDULER_STATE_FOLDER),
+                    location
+                ));
+            }
+        }
+        assert!(same_folder("s3://b/p", "s3://b/p/"));
+        assert!(!same_folder("s3://b/p/", "s3://b/q/"));
     }
 }

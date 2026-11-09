@@ -1,0 +1,352 @@
+name: http-connector
+description: >
+  The HTTP connector against a server whose answers the script sets: static
+  JSON and CSV files; a dynamic JSON API whose request_path and
+  request_query come from the query (and only from allowed paths); static and
+  per-query request headers; OAuth2 client credentials, with the token
+  reused across queries; retries of a 503 that clears; a 4xx surfaced as an
+  error, a row or a warning per on_error_response; Link-header and cursor
+  pagination; a dataset with declared columns that does not call the server
+  until it is first queried (and fails then if they do not match); a
+  json_object catch-all column; JSON nulls, missing keys, nested documents
+  and arrays, federated and accelerated into Cayenne; the runtime's own
+  Server-Timing and trace-id headers; and its streamed vnd JSON and CSV SQL
+  answers, which keep every DECIMAL digit.
+
+sources:
+  api: { kind: mock-http }
+
+spicepod:
+  version: v1
+  kind: Spicepod
+  name: http-connector
+  datasets:
+    - from: ${sources.api.url}/files/shows.json
+      name: shows_json
+      params: { file_format: json }
+    - from: ${sources.api.url}/files/shows.csv
+      name: shows_csv
+      params: { file_format: csv }
+    - from: ${sources.api.url}/api
+      name: api
+      params:
+        file_format: json
+        allowed_request_paths: '/shows,/people/*'
+        request_query_filters: enabled
+        request_header_filters: enabled
+        request_header_allowlist: x-tenant
+        http_headers: 'X-Static: spice'
+        response_cache_max_size_bytes: '0'
+    - from: ${sources.api.url}/secure
+      name: secure
+      params:
+        file_format: json
+        allowed_request_paths: /items
+        auth_token_url: ${sources.api.url}/oauth/token
+        auth_grant_type: client_credentials
+        http_auth_client_id: demo-id
+        http_auth_client_secret: demo-secret
+        auth_client_auth: body
+        response_cache_max_size_bytes: '0'
+    - from: ${sources.api.url}/flaky
+      name: flaky
+      params: { file_format: json, allowed_request_paths: /data, max_retries: '3', retry_jitter: '0', response_cache_max_size_bytes: '0' }
+    - from: ${sources.api.url}/errs
+      name: errs_error
+      params: { file_format: json, allowed_request_paths: '/missing', response_cache_max_size_bytes: '0' }
+    - from: ${sources.api.url}/errs
+      name: errs_store
+      params: { file_format: json, allowed_request_paths: '/missing', on_error_response: store, response_cache_max_size_bytes: '0' }
+    - from: ${sources.api.url}/paged/links
+      name: paged_links
+      params: { file_format: json, pagination: enabled, pagination_link_header: enabled, response_cache_max_size_bytes: '0' }
+    - from: ${sources.api.url}/paged/cursor
+      name: paged_cursor
+      params:
+        file_format: json
+        pagination: enabled
+        pagination_next_pointer: /next
+        pagination_token_param: cursor
+        pagination_data_pointer: /data
+        response_cache_max_size_bytes: '0'
+    - from: ${sources.api.url}/people/all
+      name: people
+      columns:
+        - { name: id }
+        - { name: name }
+        - { name: data, metadata: { json_object: '*' } }
+    - from: ${sources.api.url}/edge
+      name: edges
+      params: { file_format: json, allowed_request_paths: /all, response_cache_max_size_bytes: '0' }
+    - from: ${sources.api.url}/edge
+      name: edges_cayenne
+      params: { file_format: json, allowed_request_paths: /all }
+      acceleration:
+        enabled: true
+        engine: cayenne
+        refresh_sql: SELECT request_path, content FROM edges_cayenne WHERE request_path = '/all'
+    - from: ${sources.api.url}/shop
+      name: shop
+      params:
+        file_format: json
+        allowed_request_paths: /products
+        auth_token_url: ${sources.api.url}/shop-token
+        auth_grant_type: client_credentials
+        http_auth_client_id: shop-id
+        http_auth_client_secret: shop-secret
+        auth_client_auth: body
+        auth_header_name: X-Shopify-Access-Token
+        response_cache_max_size_bytes: '0'
+    - from: ${sources.api.url}/files/priced.csv
+      name: mismatch
+      params: { file_format: csv }
+      ready_state: on_registration
+      columns:
+        - { name: id, type: bigint }
+        - { name: price, type: bigint }
+    - from: ${sources.api.url}/files/items.csv
+      name: items_deferred
+      params: { file_format: csv }
+      ready_state: on_registration
+      columns:
+        - { name: id, type: bigint }
+        - { name: name, type: text }
+
+steps:
+  - source-exec:
+      api:
+        - |
+          path: /files/shows.json
+          headers: { content-type: application/json }
+          body: '[{"id": 1, "title": "Alpha", "rating": 4.5}, {"id": 2, "title": "Beta", "rating": null}]'
+        - |
+          path: /files/shows.csv
+          headers: { content-type: text/csv }
+          body: "id,title\n1,Alpha\n2,Beta\n"
+        - |
+          path: /api/shows
+          headers: { content-type: application/json }
+          body: '[{"name": "all shows"}]'
+        - |
+          path: /api/shows
+          query: page=2
+          headers: { content-type: application/json }
+          body: '[{"name": "page two"}]'
+        - |
+          path: /api/people/ada
+          headers: { content-type: application/json }
+          body: '{"name": "Ada"}'
+        - |
+          path: /api/people/ada
+          headers-match: { x-tenant: blue }
+          headers: { content-type: application/json }
+          body: '{"name": "Ada (blue tenant)"}'
+        - |
+          path: /api/people/ada
+          headers-match: { x-tenant: red }
+          headers: { content-type: application/json }
+          body: '{"name": "Ada (red tenant)"}'
+        - |
+          path: /api/secret
+          body: should never be requested
+        - |
+          path: /oauth/token
+          method: POST
+          headers: { content-type: application/json }
+          body: '{"access_token": "t0k", "token_type": "Bearer", "expires_in": 3600}'
+        - |
+          path: /secure/items
+          status: 401
+          body: missing or wrong token
+        - |
+          path: /secure/items
+          headers-match: { authorization: Bearer t0k }
+          headers: { content-type: application/json }
+          body: '[{"sku": "a"}, {"sku": "b"}]'
+        - |
+          path: /flaky/data
+          headers: { content-type: application/json }
+          body: '[{"ok": true}]'
+        - |
+          path: /flaky/data
+          status: 503
+          times: 2
+          body: busy
+        - |
+          path: /errs/missing
+          status: 404
+          body: not here
+        - |
+          path: /paged/links
+          headers: { content-type: application/json, link: '<${sources.api.url}/paged/links?page=2>; rel="next"' }
+          body: '[{"n": 1}, {"n": 2}]'
+        - |
+          path: /paged/links
+          query: page=2
+          headers: { content-type: application/json }
+          body: '[{"n": 3}]'
+        - |
+          path: /paged/cursor
+          headers: { content-type: application/json }
+          body: '{"data": [{"n": 1}, {"n": 2}], "next": "c2"}'
+        - |
+          path: /paged/cursor
+          query: cursor=c2
+          headers: { content-type: application/json }
+          body: '{"data": [{"n": 3}], "next": null}'
+        - |
+          path: /people/all
+          headers: { content-type: application/json }
+          body: '[{"id": 1, "name": "Alice", "email": "alice@example.com", "age": 30, "address": {"city": "NYC", "zip": "10001"}}, {"id": 2, "name": "Bob", "email": "bob@example.com", "tags": ["x", "y"]}]'
+        - |
+          path: /edge/all
+          headers: { content-type: application/json }
+          body: '[{"id": 1, "name": "alpha", "active": true, "score": 4.25, "lastModifiedBy": null, "sandbox": {"enabled": true, "limits": {"cpu": 2, "memory": "4Gi"}}, "tags": ["edge", "null-string"], "metrics": {"views": 10, "ratio": 0.5}}, {"id": 2, "name": "beta", "active": false, "score": null, "lastModifiedBy": "alice", "sandbox": {"enabled": false, "limits": null}, "tags": [], "metrics": {"views": 0, "ratio": 1.25}}, {"id": 3, "name": "gamma", "active": true, "score": 7.0, "sandbox": null, "tags": ["nested", "array"], "metrics": {"views": null, "ratio": null}}]'
+        - |
+          path: /shop-token
+          method: POST
+          headers: { content-type: application/json }
+          body: '{"access_token": "shp-1", "token_type": "Bearer", "expires_in": 3600}'
+        - |
+          path: /shop/products
+          status: 401
+          body: no token
+        - |
+          path: /shop/products
+          headers-match: { x-shopify-access-token: shp-1 }
+          headers: { content-type: application/json }
+          body: '[{"p": 1}]'
+        - |
+          path: /files/priced.csv
+          headers: { content-type: text/csv }
+          body: "id,price\n1,9.99\n"
+        - |
+          path: /files/items.csv
+          headers: { content-type: text/csv }
+          body: "id,name\n1,one\n2,two\n"
+  - start: { ready: false }
+
+  # Declared columns: nothing is fetched until the dataset is queried.
+  - source-query: { api: count /files/items.csv }
+    expect: { rows: [['0']] }
+  - query: SELECT id, name FROM items_deferred
+    expect: { rows: [['1', one], ['2', two]] }
+    eventually: 30s
+
+  # Static files.
+  - query: SELECT id, title, rating FROM shows_json
+    expect: { rows: [['1', Alpha, '4.5'], ['2', Beta, null]] }
+    eventually: 30s
+  - query: SELECT id, title FROM shows_csv
+    expect: { rows: [['1', Alpha], ['2', Beta]] }
+    eventually: 30s
+
+  # A dynamic API: the path, query string and a header come from the query.
+  - query: SELECT request_path, content FROM api WHERE request_path = '/shows'
+    expect: { rows: [[/shows, '{"name":"all shows"}']] }
+  - query: SELECT content FROM api WHERE request_path = '/shows' AND request_query = 'page=2'
+    expect: { rows: [['{"name":"page two"}']] }
+  - source-query: { api: log /api/shows }
+    expect: { rows: [[GET, /api/shows, ''], [GET, /api/shows?page=2, '']] }
+  - source-query: { api: header /api/shows x-static }
+    expect: { rows: [[spice], [spice]] }
+  - query: >-
+      SELECT content FROM api WHERE request_path = '/people/ada' AND request_headers = '{"x-tenant": "blue"}'
+    expect: { rows: [['{"name":"Ada (blue tenant)"}']] }
+  # (Headers from a subquery over another source fail:
+  # known-failing/caching-http/http-headers-from-subquery.yaml.)
+  # A path outside the allowlist is refused without a request.
+  - query: SELECT content FROM api WHERE request_path = '/secret'
+    expect-error: true
+  - query: SELECT content FROM api WHERE request_path = '/shows/../secret'
+    expect-error: true
+  - source-query: { api: count /api/secret }
+    expect: { rows: [['0']] }
+
+  # OAuth2 client credentials: one token, presented on each request.
+  - query: SELECT content FROM secure WHERE request_path = '/items'
+    expect: { rows: [['{"sku":"a"}'], ['{"sku":"b"}']] }
+  - query: SELECT content FROM secure WHERE request_path = '/items'
+    expect: { rows: [['{"sku":"a"}'], ['{"sku":"b"}']] }
+  - source-query: { api: count /oauth/token }
+    expect: { rows: [['1']] }
+  - source-query: { api: log /oauth/token }
+    expect: { rows: [[POST, /oauth/token, 'grant_type=client_credentials&client_id=demo-id&client_secret=demo-secret']] }
+  - source-query: { api: header /secure/items authorization }
+    expect: { rows: [[Bearer t0k], [Bearer t0k]] }
+
+  # Two 503s, then an answer: retried, and three requests in all.
+  - query: SELECT content FROM flaky WHERE request_path = '/data'
+    expect: { rows: [['{"ok":true}']] }
+  - source-query: { api: count /flaky/data }
+    expect: { rows: [['3']] }
+
+  # A 404: an error by default, a row with `store`.
+  - query: SELECT content FROM errs_error WHERE request_path = '/missing'
+    expect-error: '404'
+  - query: SELECT content FROM errs_store WHERE request_path = '/missing'
+    expect: { rows: [[not here]] }
+
+  # Pagination.
+  - query: SELECT content FROM paged_links
+    expect: { rows: [['{"n":1}'], ['{"n":2}'], ['{"n":3}']] }
+    eventually: 30s
+  - query: SELECT content FROM paged_cursor
+    expect: { rows: [['{"n":1}'], ['{"n":2}'], ['{"n":3}']] }
+    eventually: 30s
+
+  # A json_object column folds in every field not declared.
+  - query: SELECT name, data FROM people
+    expect: { rows: [
+      [Alice, '{"address":{"city":"NYC","zip":"10001"},"age":30,"email":"alice@example.com"}'],
+      [Bob, '{"email":"bob@example.com","tags":["x","y"]}']] }
+    eventually: 30s
+
+  # JSON edge values: nulls, missing keys, nested documents and arrays, both
+  # federated and accelerated into Cayenne.
+  - query: >-
+      SELECT CAST(json_get(content, 'id') AS BIGINT) AS id, CAST(json_get(content, 'name') AS VARCHAR) AS name,
+        CAST(json_get(content, 'active') AS BOOLEAN) AS active, CAST(json_get(content, 'score') AS DOUBLE) AS score,
+        CAST(json_get(content, 'lastModifiedBy') AS VARCHAR) AS last_modified_by,
+        CAST(json_get(content, 'metrics', 'views') AS BIGINT) AS views, CAST(json_get(content, 'metrics', 'ratio') AS DOUBLE) AS ratio,
+        CAST(json_get(content, 'sandbox', 'limits', 'memory') AS VARCHAR) AS memory, json_length(json_get(content, 'tags')) AS tag_count
+      FROM edges WHERE request_path = '/all'
+    expect: { rows: [['1', alpha, 'true', '4.25', null, '10', '0.5', 4Gi, '2'], ['2', beta, 'false', null, alice, '0', '1.25', null, '0'], ['3', gamma, 'true', '7.0', null, null, null, null, '2']] }
+  - query: >-
+      SELECT CAST(json_get(content, 'id') AS BIGINT) AS id, CAST(json_get(content, 'name') AS VARCHAR) AS name,
+        CAST(json_get(content, 'active') AS BOOLEAN) AS active, CAST(json_get(content, 'score') AS DOUBLE) AS score,
+        CAST(json_get(content, 'lastModifiedBy') AS VARCHAR) AS last_modified_by,
+        CAST(json_get(content, 'metrics', 'views') AS BIGINT) AS views, CAST(json_get(content, 'metrics', 'ratio') AS DOUBLE) AS ratio,
+        CAST(json_get(content, 'sandbox', 'limits', 'memory') AS VARCHAR) AS memory, json_length(json_get(content, 'tags')) AS tag_count
+      FROM edges_cayenne WHERE request_path = '/all'
+    expect: { rows: [['1', alpha, 'true', '4.25', null, '10', '0.5', 4Gi, '2'], ['2', beta, 'false', null, alice, '0', '1.25', null, '0'], ['3', gamma, 'true', '7.0', null, null, null, null, '2']] }
+    eventually: 30s
+
+  # OAuth with a custom header: the bare token, not a Bearer.
+  - query: SELECT content FROM shop WHERE request_path = '/products'
+    expect: { rows: [['{"p":1}']] }
+  - source-query: { api: header /shop/products x-shopify-access-token }
+    expect: { rows: [[shp-1]] }
+  - source-query: { api: header /shop/products authorization }
+    expect: { rows: [[null]] }
+
+  # Declared columns that do not match the file fail on the first query.
+  - query: SELECT id, price FROM mismatch
+    expect-error: Declared schema does not match source schema
+
+  # Runtime HTTP: Server-Timing on a buffered answer and an error, the vnd
+  # JSON and CSV answers streamed with every DECIMAL digit, the CSV error for a
+  # nested column, and the trace id
+  # echoed back when the request pins one.
+  - http: { method: POST, path: /v1/sql, headers: { content-type: text/plain, accept: text/plain }, body: SELECT 1 }
+    expect: { status: 200, headers: { server-timing: 'total;dur=' } }
+  - http: { method: POST, path: /v1/sql, headers: { content-type: text/plain, accept: application/vnd.spiceai.sql.v1+json }, body: "SELECT CAST('99999999999999999999999999999999999999' AS DECIMAL(38, 0)) AS d" }
+    expect: { status: 200, body-contains: '"data":[{"d":99999999999999999999999999999999999999}],"row_count":1', lacks-headers: [content-length, server-timing] }
+  - http: { method: POST, path: /v1/sql, headers: { content-type: text/plain, accept: text/csv }, body: "SELECT CAST('99999999999999999999999999999999999999' AS DECIMAL(38, 0)) AS d" }
+    expect: { status: 200, body-contains: "d\n99999999999999999999999999999999999999\n", lacks-headers: [content-length, server-timing] }
+  - http: { method: POST, path: /v1/sql, headers: { content-type: text/plain, accept: text/csv }, body: "SELECT [1, 2] AS l" }
+    expect: { status: 500, body-contains: not supported in CSV }
+  - http: { method: POST, path: /v1/sql, headers: { content-type: text/plain }, body: SELECT * FROM no_such_table }
+    expect: { status: 400, headers: { server-timing: 'total;dur=' } }
+  - http: { method: POST, path: /v1/sql, headers: { content-type: text/plain, spice-trace-id: 4bf92f3577b34da6a3ce929d0e0e4736 }, body: SELECT 1 }
+    expect: { status: 200, headers: { spice-trace-id: 4bf92f3577b34da6a3ce929d0e0e4736 } }

@@ -486,6 +486,18 @@ impl BenchFileSource {
 }
 
 impl FileSource for BenchFileSource {
+    fn apply_expressions(
+        &self,
+        f: &mut dyn FnMut(
+            &Arc<dyn datafusion::physical_expr::PhysicalExpr>,
+        ) -> DFResult<datafusion::common::tree_node::TreeNodeRecursion>,
+    ) -> DFResult<datafusion::common::tree_node::TreeNodeRecursion> {
+        match &self.filter {
+            Some(filter) => f(filter),
+            None => Ok(datafusion::common::tree_node::TreeNodeRecursion::Continue),
+        }
+    }
+
     fn create_file_opener(
         &self,
         _object_store: Arc<dyn ObjectStore>,

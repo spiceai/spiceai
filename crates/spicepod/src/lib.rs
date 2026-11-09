@@ -129,6 +129,11 @@ pub enum Error {
         "The name '{keyword}' is reserved and cannot be used as a name for a dataset. Change the name in the Spicepod and try again."
     ))]
     UseOfReservedKeyword { keyword: String },
+
+    #[snafu(display(
+        "Tool '{name}' has `from: {from}`, which needs a command or URL: `mcp:<command>` or `mcp:https://<host>/<path>`."
+    ))]
+    MissingMcpTarget { name: String, from: String },
 }
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
@@ -234,6 +239,23 @@ fn check_for_reserved_keywords(components: &[Dataset]) -> Result<()> {
         if keywords::is_reserved_keyword(component.name()) {
             return Err(Error::UseOfReservedKeyword {
                 keyword: component.name().to_string(),
+            });
+        }
+    }
+    Ok(())
+}
+
+/// A bare `from: mcp` (or `mcp:` with nothing after it) names no server to connect to.
+fn check_mcp_tools_have_target(tools: &[Tool]) -> Result<()> {
+    for tool in tools {
+        let target = tool
+            .from
+            .strip_prefix("mcp")
+            .map(|rest| rest.strip_prefix(':').unwrap_or(rest));
+        if target.is_some_and(|t| t.trim().is_empty()) {
+            return Err(Error::MissingMcpTarget {
+                name: tool.name.clone(),
+                from: tool.from.clone(),
             });
         }
     }
@@ -383,6 +405,7 @@ impl Spicepod {
         detect_duplicate_component_names("function", &resolved_functions[..])?;
 
         check_for_reserved_keywords(&resolved_datasets[..])?;
+        check_mcp_tools_have_target(&resolved_tools[..])?;
 
         Ok(from_definition(
             spicepod_definition,
@@ -644,16 +667,16 @@ mod tests {
 ///   v2 uses `runtime.query.memory_limit`/`runtime.query.temp_directory`
 /// - v2 adds `runtime.ready_state`, `runtime.flight.do_put_rate_limit_enabled`,
 ///   `runtime.flight.ipc_compression`, `runtime.flight.batch_size`,
-///   `runtime.scheduler` partition assignment fields
+///   `runtime.scheduler` partition assignment fields, `runtime.state`
 /// - v2 adds `read_write_create` access mode
-/// - v2 adds `stale_while_revalidate_ttl` and `encoding` to `SQLResultsCacheConfig`
+/// - v2 adds `stale_while_revalidate_ttl`, `encoding`, and `warmup` to `SQLResultsCacheConfig`
 #[cfg(test)]
 mod version_tests {
     use super::*;
     use crate::component::{
         access::AccessMode,
         caching::{CacheEngine, CacheKeyType, CachingPolicy, Encoding, HashingAlgorithm},
-        runtime::{FlightBatchSize, FlightIpcCompression, RuntimeReadyState},
+        runtime::{FlightBatchSize, FlightIpcCompression, RuntimeReadyState, StateSource},
     };
 
     // ========================================================================
@@ -668,13 +691,6 @@ mod version_tests {
 
         let v2: SpicepodVersion = yaml::from_str("v2").expect("Should parse v2");
         assert_eq!(v2, SpicepodVersion::V2);
-    }
-
-    /// v1beta1 is no longer a valid version.
-    #[test]
-    fn test_v1beta1_rejected() {
-        let result: Result<SpicepodVersion, _> = yaml::from_str("v1beta1");
-        assert!(result.is_err(), "v1beta1 should no longer be accepted");
     }
 
     /// Version strings serialize to the expected lowercase YAML values.
@@ -710,9 +726,12 @@ mod version_tests {
             name: invalid
         ";
         let result: Result<SpicepodDefinition, _> = yaml::from_str(yaml);
-        assert!(
-            result.is_err(),
-            "Malformed version 'not-a-version' should be rejected"
+        // Rejected through the `version` field, naming the value and the accepted forms.
+        assert_eq!(
+            result
+                .expect_err("Malformed version 'not-a-version' should be rejected")
+                .to_string(),
+            "invalid spicepod version 'not-a-version': expected a version string like 'v1', 'v2', 'v2.0', 'v2.0.0', or 'v2.0.0-rc.1'"
         );
     }
 
@@ -1133,7 +1152,10 @@ mod version_tests {
             .scheduler
             .as_ref()
             .expect("scheduler should be present");
-        assert_eq!(scheduler.state_location, "s3://my-bucket/scheduler-state");
+        assert_eq!(
+            scheduler.state_location.as_deref(),
+            Some("s3://my-bucket/scheduler-state")
+        );
         assert_eq!(scheduler.partition_assignment_interval, "15s");
         assert_eq!(scheduler.max_partition_assignments_per_interval, 50);
         assert_eq!(scheduler.max_partitions_per_executor, 500);
@@ -1236,26 +1258,115 @@ mod version_tests {
     fn test_runtime_source_rate_control_deserializes() {
         let yaml = r"
             source_rate_control:
-              state_location: file:///tmp/spice-source-rate-control
               refresh_interval: 15s
               github_concurrent_connections_limit: 5
-              params:
-                allow_http: true
         ";
         let runtime: Runtime = yaml::from_str(yaml).expect("Should parse Runtime");
         let source_rate_control = runtime
             .source_rate_control
             .expect("source_rate_control section should exist");
-        assert_eq!(
-            source_rate_control.state_location.as_deref(),
-            Some("file:///tmp/spice-source-rate-control")
-        );
         assert_eq!(source_rate_control.refresh_interval, "15s");
         assert_eq!(
             source_rate_control.github_concurrent_connections_limit,
             Some(5)
         );
-        assert!(source_rate_control.params.is_some());
+    }
+
+    /// Cluster rate control stores its state at `runtime.state.location`, so
+    /// `source_rate_control` has no location or object store params of its own.
+    #[test]
+    fn test_runtime_source_rate_control_rejects_its_own_state_location() {
+        for field in [
+            "state_location: file:///tmp/spice-source-rate-control",
+            "params:\n                allow_http: true",
+        ] {
+            let yaml = format!(
+                "
+            source_rate_control:
+              {field}
+        "
+            );
+            assert!(
+                yaml::from_str::<Runtime>(&yaml).is_err(),
+                "source_rate_control must reject `{field}`"
+            );
+        }
+    }
+
+    #[test]
+    fn test_runtime_state_deserializes() {
+        let yaml = r"
+            state:
+              location: s3://my-bucket/spice-state
+              params:
+                s3_region: us-east-1
+                s3_auth: iam_role
+        ";
+        let runtime: Runtime = yaml::from_str(yaml).expect("Should parse Runtime");
+        let state = runtime.state.as_ref().expect("state section should exist");
+        assert_eq!(state.location, "s3://my-bucket/spice-state");
+        assert!(state.params.is_some());
+        assert!(
+            runtime.resolved_scheduler().is_some(),
+            "runtime.state alone configures a scheduler"
+        );
+        let scheduler_state = runtime
+            .scheduler_state()
+            .expect("runtime.state should give the scheduler a state location");
+        assert_eq!(scheduler_state.location, "s3://my-bucket/spice-state");
+        assert_eq!(scheduler_state.params, state.params);
+        assert_eq!(scheduler_state.source, StateSource::RuntimeState);
+    }
+
+    #[test]
+    fn test_runtime_scheduler_state_location_overrides_shared_state() {
+        let yaml = r"
+            state:
+              location: s3://shared/spice-state
+            scheduler:
+              state_location: s3://cluster/scheduler-state
+        ";
+        let runtime: Runtime = yaml::from_str(yaml).expect("Should parse Runtime");
+        let scheduler_state = runtime
+            .scheduler_state()
+            .expect("scheduler section should exist");
+        assert_eq!(scheduler_state.location, "s3://cluster/scheduler-state");
+        assert_eq!(scheduler_state.source, StateSource::FeatureSetting);
+    }
+
+    #[test]
+    fn test_runtime_scheduler_inherits_state_location_field_level() {
+        let yaml = r"
+            state:
+              location: s3://shared/spice-state
+              params:
+                s3_region: us-east-1
+            scheduler:
+              partition_assignment_interval: 15s
+              max_partitions_per_executor: 42
+        ";
+        let runtime: Runtime = yaml::from_str(yaml).expect("Should parse Runtime");
+        let scheduler = runtime
+            .resolved_scheduler()
+            .expect("scheduler section should exist");
+        assert_eq!(scheduler.partition_assignment_interval, "15s");
+        assert_eq!(scheduler.max_partitions_per_executor, 42);
+        let scheduler_state = runtime
+            .scheduler_state()
+            .expect("runtime.state should give the scheduler a state location");
+        assert_eq!(
+            scheduler_state.location, "s3://shared/spice-state",
+            "omitted scheduler.state_location must fall back to runtime.state.location"
+        );
+        assert_eq!(
+            scheduler_state.params,
+            runtime
+                .state
+                .as_ref()
+                .and_then(|state| state.params.clone()),
+            "omitted scheduler.params must fall back to runtime.state.params"
+        );
+        assert_eq!(scheduler_state.source, StateSource::RuntimeState);
     }
 
     /// `read_write_create` access mode deserializes.
@@ -1299,6 +1410,24 @@ mod version_tests {
         assert_eq!(config.item_ttl, Some("30s".to_string()));
         assert_eq!(config.stale_while_revalidate_ttl, Some("60s".to_string()));
         assert_eq!(config.encoding, Encoding::Zstd);
+        assert_eq!(
+            config.warmup,
+            component::caching::ResultsCacheWarmup::Disabled
+        );
+    }
+
+    #[test]
+    fn test_sql_results_cache_warmup_on_first_refresh() {
+        let yaml = r"
+            enabled: true
+            warmup: on_first_refresh
+        ";
+        let config: component::caching::SQLResultsCacheConfig =
+            yaml::from_str(yaml).expect("Should parse SQLResultsCacheConfig");
+        assert_eq!(
+            config.warmup,
+            component::caching::ResultsCacheWarmup::OnFirstRefresh
+        );
     }
 
     /// `Query` struct with `spill_compression`.
@@ -1799,7 +1928,10 @@ mod version_tests {
         ";
         let scheduler: component::runtime::Scheduler =
             yaml::from_str(yaml).expect("Should parse Scheduler");
-        assert_eq!(scheduler.state_location, "s3://bucket/state");
+        assert_eq!(
+            scheduler.state_location.as_deref(),
+            Some("s3://bucket/state")
+        );
         assert_eq!(
             scheduler.max_partitions_per_executor, 1000,
             "partition assignment fields should default when not specified"

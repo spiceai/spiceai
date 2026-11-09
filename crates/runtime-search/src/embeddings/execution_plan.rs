@@ -30,11 +30,12 @@ use async_stream::stream;
 use chunking::Chunker;
 use datafusion::error::{DataFusionError, Result as DataFusionResult};
 use datafusion::execution::{SendableRecordBatchStream, TaskContext};
-use datafusion::logical_expr::Expr;
-use datafusion::physical_expr::EquivalenceProperties;
+use datafusion::physical_expr::{EquivalenceProperties, PhysicalExpr};
+use datafusion::physical_plan::filter::batch_filter;
 use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use datafusion::physical_plan::{
     DisplayAs, DisplayFormatType, ExecutionPlan, ExecutionPlanProperties, PlanProperties,
+    apply_expression_roots,
 };
 use futures::stream::{Stream, StreamExt};
 use itertools::Itertools;
@@ -56,7 +57,9 @@ use util::convert_string_arrow_to_iterator;
 
 pub struct EmbeddingTableExec {
     projected_schema: SchemaRef,
-    filters: Vec<Expr>,
+    /// Rows `base_plan` returns that must not be embedded: those `predicate`
+    /// rejects, and those beyond `limit` in each partition.
+    predicate: Option<Arc<dyn PhysicalExpr>>,
     limit: Option<usize>,
     properties: Arc<PlanProperties>,
 
@@ -79,7 +82,14 @@ impl std::fmt::Debug for EmbeddingTableExec {
 
 impl DisplayAs for EmbeddingTableExec {
     fn fmt_as(&self, _t: DisplayFormatType, f: &mut fmt::Formatter) -> std::fmt::Result {
-        write!(f, "EmbeddingTable: inner={:?}", self.base_plan)
+        write!(f, "EmbeddingTable: ")?;
+        if let Some(predicate) = &self.predicate {
+            write!(f, "predicate={predicate}, ")?;
+        }
+        if let Some(limit) = self.limit {
+            write!(f, "limit={limit}, ")?;
+        }
+        write!(f, "inner={:?}", self.base_plan)
     }
 }
 
@@ -96,8 +106,28 @@ impl ExecutionPlan for EmbeddingTableExec {
         &self.properties
     }
 
+    fn apply_expressions(
+        &self,
+        f: &mut dyn FnMut(
+            &Arc<dyn datafusion::physical_plan::PhysicalExpr>,
+        ) -> datafusion::error::Result<
+            datafusion::common::tree_node::TreeNodeRecursion,
+        >,
+    ) -> datafusion::error::Result<datafusion::common::tree_node::TreeNodeRecursion> {
+        self.base_plan
+            .apply_expressions(f)?
+            .visit_sibling(|| apply_expression_roots(&self.predicate, f))
+    }
+
     fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> {
         self.base_plan.children()
+    }
+
+    /// `limit` bounds each partition, so under a limit every extra partition
+    /// embeds up to `limit` rows the query discards, and a repartition beneath
+    /// this plan would read the whole source before the limit stops it.
+    fn benefits_from_input_partitioning(&self) -> Vec<bool> {
+        vec![self.limit.is_none(); self.children().len()]
     }
 
     fn with_new_children(
@@ -106,9 +136,14 @@ impl ExecutionPlan for EmbeddingTableExec {
     ) -> DataFusionResult<Arc<dyn ExecutionPlan>> {
         Ok(Arc::new(Self::new(
             &Arc::clone(&self.projected_schema),
-            &self.filters,
+            self.predicate.clone(),
             self.limit,
-            Arc::clone(&self.base_plan).with_new_children(children)?,
+            Arc::clone(&self.base_plan).replace_children(
+                children,
+                datafusion::physical_plan::ReplaceChildrenOptions::new(
+                    datafusion::physical_plan::ChildrenPropertiesMode::Recompute,
+                ),
+            )?,
             Arc::clone(&self.embedded_columns),
             Arc::clone(&self.embedding_models),
         )) as Arc<dyn ExecutionPlan>)
@@ -124,6 +159,8 @@ impl ExecutionPlan for EmbeddingTableExec {
             self.schema(),
             to_sendable_stream(
                 s,
+                self.predicate.clone(),
+                self.limit,
                 Arc::clone(&self.projected_schema),
                 Arc::clone(&self.embedded_columns),
                 Arc::clone(&self.embedding_models),
@@ -136,7 +173,7 @@ impl ExecutionPlan for EmbeddingTableExec {
 impl EmbeddingTableExec {
     pub(crate) fn new(
         projected_schema: &SchemaRef,
-        filters: &[Expr],
+        predicate: Option<Arc<dyn PhysicalExpr>>,
         limit: Option<usize>,
         base_plan: Arc<dyn ExecutionPlan>,
         embedded_columns: Arc<HashMap<String, EmbeddingColumnConfig>>,
@@ -144,7 +181,7 @@ impl EmbeddingTableExec {
     ) -> Self {
         Self {
             projected_schema: Arc::clone(projected_schema),
-            filters: filters.to_vec(),
+            predicate,
             limit,
             properties: Self::compute_properties(&base_plan, projected_schema),
             base_plan,
@@ -172,14 +209,32 @@ impl EmbeddingTableExec {
 
 fn to_sendable_stream(
     mut base_stream: SendableRecordBatchStream,
+    predicate: Option<Arc<dyn PhysicalExpr>>,
+    limit: Option<usize>,
     projected_schema: SchemaRef,
     embedded_columns: Arc<HashMap<String, EmbeddingColumnConfig>>,
     embedding_models: Arc<RwLock<EmbeddingModelStore>>,
 ) -> impl Stream<Item = DataFusionResult<RecordBatch>> + 'static {
     stream! {
-        while let Some(batch_result) = base_stream.next().await {
+        let mut remaining = limit;
+        while remaining != Some(0) {
+            let Some(batch_result) = base_stream.next().await else {
+                break;
+            };
+            let batch_result = batch_result.and_then(|batch| match &predicate {
+                Some(predicate) => batch_filter(&batch, predicate),
+                None => Ok(batch),
+            });
             match batch_result {
                 Ok(batch) => {
+                    let batch = match remaining {
+                        Some(rows) if batch.num_rows() > rows => batch.slice(0, rows),
+                        _ => batch,
+                    };
+                    if batch.num_rows() == 0 {
+                        continue;
+                    }
+                    remaining = remaining.map(|rows| rows.saturating_sub(batch.num_rows()));
                     match compute_additional_embedding_columns(&batch, &embedded_columns, Arc::clone(&embedding_models)).await {
                         Ok(embeddings) => {
 
@@ -419,7 +474,8 @@ pub(super) async fn get_vectors(
         .collect();
 
     tracing::trace!("Sending request to upstream embedding model");
-    let embedded_data = model.embed(EmbeddingInput::StringArray(column)).await?;
+    let embedded_data =
+        std::sync::Arc::unwrap_or_clone(model.embed(EmbeddingInput::StringArray(column)).await?);
     tracing::trace!("Received response from upstream embedding model");
 
     let mut builder = FixedSizeListBuilder::with_capacity(
@@ -516,9 +572,11 @@ pub(super) fn get_vectors_in_process(
                 .collect::<Result<Vec<_>, _>>()
         })?;
 
-        for embed in embeds.iter().flatten() {
-            builder.values().append_slice(embed);
-            builder.append(true);
+        for batch in &embeds {
+            for embed in batch.iter() {
+                builder.values().append_slice(embed);
+                builder.append(true);
+            }
         }
     }
 
@@ -774,7 +832,7 @@ pub(super) async fn get_vectors_per_list_element(
     let embedded: Vec<Vec<f32>> = if flat.is_empty() {
         Vec::new()
     } else {
-        model.embed(EmbeddingInput::StringArray(flat)).await?
+        std::sync::Arc::unwrap_or_clone(model.embed(EmbeddingInput::StringArray(flat)).await?)
     };
 
     build_multi_vector_list_array(&validity, &lengths, &embedded, vector_length)
@@ -799,7 +857,10 @@ pub(super) fn get_vectors_per_list_element_in_process(
                 .map(|chunk| model.embed_sync(EmbeddingInput::StringArray(chunk)))
                 .collect::<Result<Vec<_>, _>>()
         })?;
-        batches.into_iter().flatten().collect()
+        batches
+            .into_iter()
+            .flat_map(std::sync::Arc::unwrap_or_clone)
+            .collect()
     };
 
     build_multi_vector_list_array(&validity, &lengths, &embedded, vector_length)
@@ -866,13 +927,18 @@ async fn get_vectors_with_chunker(
         })
         .await??;
 
-        batches.into_iter().flatten().collect()
+        batches
+            .into_iter()
+            .flat_map(std::sync::Arc::unwrap_or_clone)
+            .collect()
     } else {
         // Move chunks into embed; avoid cloning the full Vec<String>.
-        model
-            .embed(EmbeddingInput::StringArray(chunks))
-            .await
-            .boxed()?
+        std::sync::Arc::unwrap_or_clone(
+            model
+                .embed(EmbeddingInput::StringArray(chunks))
+                .await
+                .boxed()?,
+        )
     };
 
     let vector_length = model.size();
@@ -1010,18 +1076,21 @@ mod tests {
             -1
         }
 
-        async fn embed(&self, input: EmbeddingInput) -> Result<Vec<Vec<f32>>, embeddings::Error> {
+        async fn embed(
+            &self,
+            input: EmbeddingInput,
+        ) -> Result<std::sync::Arc<Vec<Vec<f32>>>, embeddings::Error> {
             match input {
                 EmbeddingInput::String(s) => {
                     let v = self.map.get(&s).cloned().unwrap_or_default();
-                    Ok(vec![v])
+                    Ok(std::sync::Arc::new(vec![v]))
                 }
                 EmbeddingInput::StringArray(arr) => {
                     let v = arr
                         .iter()
                         .map(|s| self.map.get(s).cloned().unwrap_or_default())
                         .collect();
-                    Ok(v)
+                    Ok(std::sync::Arc::new(v))
                 }
                 _ => Err(embeddings::Error::FailedToCreateEmbedding {
                     source: Box::<dyn std::error::Error + Send + Sync>::from(

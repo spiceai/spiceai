@@ -120,10 +120,8 @@ runtime:
     api_key:
       enabled: true
       keys:
-        - ReadOnly:
-            key: read-only-api-key-12345
-        - ReadWrite:
-            key: read-write-api-key-67890
+        - read-only-api-key-12345
+        - read-write-api-key-67890:rw
 
   # CORS configuration
   cors:
@@ -396,7 +394,7 @@ datasets:
         vector_size: 1536
     vectors:
       enabled: true
-      engine: duckdb
+      engine: s3_vectors
       partition_by:
         - name: category
           expression: category
@@ -412,7 +410,7 @@ datasets:
         index: articles_index
     acceleration:
       enabled: true
-      engine: duckdb
+      engine: cayenne
       mode: file # memory, file, file_create
       refresh_on_startup: auto # always, auto
       refresh_mode: full # full, append, changes, caching
@@ -438,11 +436,7 @@ datasets:
         id: upsert # drop, upsert, upsert_dedup, upsert_dedup_by_row_id
       snapshots: enabled # disabled, enabled, bootstrap_only, create_only
       params:
-        duckdb_file: ./data/postgres.duckdb
-        file_watcher: 'true'
-        connection_pool_size: '5'
-        on_refresh_recompute_statistics: 'true'
-        optimizer_duckdb_aggregate_pushdown: 'true'
+        cayenne_file_path: ./data/postgres.cayenne
       metrics:
         metrics:
           - name: acceleration.refresh_duration_ms
@@ -541,25 +535,6 @@ datasets:
         connection_pool_size: '15'
 
   # ---------------------------------------------------------------------------
-  # Turso accelerator test
-  # ---------------------------------------------------------------------------
-  - name: turso_accel
-    from: postgres:public.data
-    params:
-      pg_host: localhost
-      pg_port: '5432'
-      pg_db: db
-      pg_user: user
-      pg_pass: pass
-    acceleration:
-      enabled: true
-      engine: turso
-      mode: file
-      params:
-        turso_turso_file: ./data/accel.turso
-        turso_internal_timestamp_format: integer_millis # rfc3339, integer_millis
-
-  # ---------------------------------------------------------------------------
   # Cayenne accelerator test
   # ---------------------------------------------------------------------------
   - name: cayenne_accel
@@ -623,6 +598,11 @@ datasets:
       json_format: jsonl # json, jsonl
       flatten_json: 'true'
       refresh_skip: enabled # enabled, disabled
+      s3_changes_queue_url: https://sqs.us-east-1.amazonaws.com/123456789012/s3-events
+      s3_changes_region: us-east-1
+      s3_changes_key_prefix: data/
+      s3_changes_backfill_interval: 1h
+      s3_on_object_removed: ignore # ignore, rebuild (full listing rebuild, not a row-level delete)
       # CSV params
       csv_has_header: 'true'
       csv_quote: '"'
@@ -823,6 +803,13 @@ datasets:
       github_workflow_logs: 'true'
       max_concurrent_requests: '6'
       include: '*.md'
+
+  - name: github_pulls_key_service
+    from: github:github.com/spiceai/spiceai/pulls
+    params:
+      github_client_id: client-id
+      github_installation_id: '123456'
+      github_private_key_kms: https://spice-vault.vault.azure.net/keys/github-app # or arn:aws:kms:<region>:<account>:alias/<name>
 
   # ---------------------------------------------------------------------------
   # Git connector
@@ -1153,7 +1140,7 @@ views:
       GROUP BY 1
     acceleration:
       enabled: true
-      engine: duckdb
+      engine: cayenne
       mode: memory
       refresh_mode: full
       refresh_check_interval: 5m
@@ -1163,9 +1150,9 @@ views:
     sql: SELECT id, content FROM postgres_full
     vectors:
       enabled: true
-      engine: duckdb
+      engine: s3_vectors
       params:
-        duckdb_file: ./vectors/view.duckdb
+        s3_vectors_bucket: my-vectors
 
 # =============================================================================
 # MODELS
@@ -1282,7 +1269,9 @@ models:
   - name: google_model
     from: google:gemini-1.5-pro
     params:
-      google_api_key: google-api-key
+      google_project: my-gcp-project
+      google_location: us-central1
+      google_service_account_key: '{"client_email": "spice@my-gcp-project.iam.gserviceaccount.com"}'
       tools: auto
       system_prompt: You are Gemini.
       google_temperature: '0.7'
@@ -1317,7 +1306,7 @@ models:
     from: huggingface:mistralai/Mistral-7B-Instruct-v0.2
     params:
       model_type: mistral
-      huggingface_token: hf_xxx
+      hf_token: hf_xxx
       tools: auto
       system_prompt: You are a helpful assistant.
 
@@ -1372,7 +1361,7 @@ embeddings:
   - name: hf_embeddings
     from: huggingface:sentence-transformers/all-MiniLM-L6-v2
     params:
-      huggingface_token: hf_xxx
+      hf_token: hf_xxx
 
   # File-based embeddings
   - name: file_embeddings

@@ -21,7 +21,9 @@ use async_trait::async_trait;
 use secrecy::{ExposeSecret, SecretString};
 use std::collections::HashMap;
 
-use crate::provider::{ListModels, ListModelsError, ListModelsResult, get_required_param};
+use crate::provider::{
+    ListModels, ListModelsResult, classify_openai_compatible_error, get_required_param,
+};
 
 const PROVIDER_NAME: &str = "OpenAI";
 const API_BASE: &str = "https://api.openai.com/v1";
@@ -47,7 +49,7 @@ impl OpenAiModelLister {
             .with_api_base(&api_base);
 
         Ok(Self {
-            client: Client::with_config(config),
+            client: crate::provider::client_without_retry(config),
         })
     }
 
@@ -59,7 +61,7 @@ impl OpenAiModelLister {
             .with_api_base(api_base.unwrap_or(API_BASE));
 
         Self {
-            client: Client::with_config(config),
+            client: crate::provider::client_without_retry(config),
         }
     }
 }
@@ -71,28 +73,12 @@ impl ListModels for OpenAiModelLister {
     }
 
     async fn list_models(&self) -> ListModelsResult<Vec<String>> {
-        let response = self.client.models().list().await.map_err(|e| {
-            // Map OpenAI errors to our error types
-            let message = e.to_string();
-            if message.contains("401") || message.contains("Unauthorized") {
-                ListModelsError::InvalidCredentials {
-                    provider: PROVIDER_NAME.to_string(),
-                }
-            } else if message.contains("429") || message.contains("rate") {
-                ListModelsError::RateLimited {
-                    provider: PROVIDER_NAME.to_string(),
-                }
-            } else if message.contains("402") || message.contains("quota") {
-                ListModelsError::QuotaExceeded {
-                    provider: PROVIDER_NAME.to_string(),
-                }
-            } else {
-                ListModelsError::NetworkError {
-                    provider: PROVIDER_NAME.to_string(),
-                    message,
-                }
-            }
-        })?;
+        let response = self
+            .client
+            .models()
+            .list()
+            .await
+            .map_err(|e| classify_openai_compatible_error(&e, PROVIDER_NAME))?;
 
         // Filter to commonly used chat models
         let chat_models: Vec<String> = response
@@ -114,6 +100,8 @@ impl ListModels for OpenAiModelLister {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::provider::ListModelsError;
+    use async_openai::config::Config;
 
     #[test]
     fn test_from_params_missing_key() {
@@ -129,8 +117,10 @@ mod tests {
     fn test_from_params_with_key() {
         let mut params = HashMap::new();
         params.insert("openai_api_key".to_string(), SecretString::from("test-key"));
-        let result = OpenAiModelLister::from_params(&params);
-        result.expect("should succeed");
+        let lister = OpenAiModelLister::from_params(&params).expect("should succeed");
+        let config = lister.client.config();
+        assert_eq!(config.api_base(), "https://api.openai.com/v1");
+        assert_eq!(config.api_key().expose_secret(), "test-key");
     }
 
     #[test]
@@ -141,8 +131,11 @@ mod tests {
             "openai_api_base".to_string(),
             SecretString::from("https://custom.api.com"),
         );
-        // Verify that from_params succeeds with custom base URL
-        let result = OpenAiModelLister::from_params(&params);
-        result.expect("should succeed with custom base URL");
+        // The key must go to the configured base, not to `api.openai.com`.
+        let lister =
+            OpenAiModelLister::from_params(&params).expect("should succeed with custom base URL");
+        let config = lister.client.config();
+        assert_eq!(config.api_base(), "https://custom.api.com");
+        assert_eq!(config.api_key().expose_secret(), "test-key");
     }
 }

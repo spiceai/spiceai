@@ -26,7 +26,7 @@ limitations under the License.
 //!     the source is `gtid_mode = ON`, GTID auto-positioning from an executed
 //!     set (failover-safe),
 //!   - [`buffer_rows_event`] to decode a rows event into a [`TransactionBuffer`],
-//!   - [`readiness_heartbeat`] / [`record_watermark`] / [`commit_ts_ms`] for
+//!   - [`readiness_heartbeat`] / [`record_watermark`] / [`transaction_commit_ts_ms`] for
 //!     lag-based readiness and freshness metrics,
 //!   - [`adopt_current_layout`] + [`compute_pk_source_indexes`] for compatible
 //!     mid-stream `ALTER` adoption, and [`layout_event_mismatch`] to check an
@@ -42,10 +42,13 @@ limitations under the License.
 //! A crash replays at most `checkpoint_interval` of already-applied changes,
 //! which the accelerator's PK upsert absorbs idempotently (at-least-once).
 
+use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 
-use arrow::datatypes::SchemaRef;
+use arrow::datatypes::{DataType, FieldRef, Schema, SchemaRef};
+use arrow_tools::schema_evolution::is_widening_cast;
 use bitvec::slice::BitSlice;
+use datafusion_table_providers::sql::arrow_sql_gen::mysql::map_column_to_data_type;
 use mysql_async::binlog::events::{OptionalMetaExtractor, RowsEventData, TableMapEvent};
 use mysql_async::binlog::row::BinlogRow;
 use mysql_async::binlog::value::BinlogValue;
@@ -53,12 +56,17 @@ use mysql_async::consts::ColumnType;
 use mysql_async::{BinlogStream, BinlogStreamRequest, Conn, Value};
 use mysql_common::io::ParseBuf;
 
+use super::ColumnTypeChanges;
+use super::changes::MemberLayout;
 use super::config::{BinlogPosition, ReplicationParams};
 use super::gtid::GtidSet;
 use super::metrics::MetricsCollector;
 use super::rows::{TransactionBuffer, normalize_binlog_value};
 use super::setup::TableLayout;
-use super::{Error, Result};
+use super::{
+    Error, Result, RetypeNotFollowedSnafu, RetypeRefusal, RetypeRefusalReason,
+    source_retype_keeps_every_value,
+};
 use crate::cdc::{ChangeEnvelope, StreamError, build_heartbeat_envelope};
 
 /// Binlog events start at offset 4 (after the magic header); positions below
@@ -89,8 +97,27 @@ pub(super) const MIN_VALID_EVENT_POS: u64 = 4;
 /// A floor rather than an assignment: an operator who already raised
 /// `net_write_timeout` past this — the manual workaround for exactly this
 /// symptom — must not have it lowered by connecting a newer runtime, so the
-/// statement takes the greater of their value and this one.
+/// floor is applied only to a session that inherits something lower.
 const DUMP_NET_WRITE_TIMEOUT_SECS: u32 = 180;
+
+/// What the operator loses whenever the dump session keeps a `net_write_timeout`
+/// below the floor — carried by the statement that raises it, and by the read
+/// that decides whether to raise it.
+const NET_WRITE_TIMEOUT_NOT_RAISED: &str = "the source can still abort the shared binlog connection when one dataset's apply loop stalls, delaying changes for every changes-mode dataset on it. Grant the replication user permission to set session variables, or raise the source's `net_write_timeout`. See: https://spiceai.org/docs/components/data-connectors/mysql";
+
+/// What to tell an operator when the floor was not applied to a dump session.
+///
+/// `reason` says which way it went — the source answered `NULL`, or the read
+/// itself failed — because the remedy differs and the consequence does not.
+///
+/// A function rather than two inline `format!`s so both messages are assertable:
+/// this warning is the only account anyone gets of a floor that was skipped, and
+/// the two branches drifted apart the moment they were written separately.
+fn net_write_timeout_left_alone_warning(connection: &str, reason: &str) -> String {
+    format!(
+        "Could not raise `net_write_timeout` on the MySQL binlog dump session for '{connection}' ({reason}), so it was left as the source set it: {NET_WRITE_TIMEOUT_NOT_RAISED}"
+    )
+}
 
 /// One statement issued on the dump connection before `COM_BINLOG_DUMP`.
 struct PreDumpStatement {
@@ -104,10 +131,17 @@ struct PreDumpStatement {
 
 /// The session setup a dump connection needs, in the order it is issued.
 ///
+/// `inherited_net_write_timeout` is what this connection already carries, as read
+/// by [`inherited_net_write_timeout`], or `None` when the server did not answer
+/// with a value.
+///
 /// Split out from [`open_binlog_stream`] so the statements — in particular
-/// which of them address a *user* variable versus a *system* one — are
-/// assertable without a `MySQL` server.
-fn pre_dump_session_statements(checkpoint_interval: Duration) -> Vec<PreDumpStatement> {
+/// which of them address a *user* variable versus a *system* one, and which
+/// values they assign — are assertable without a `MySQL` server.
+fn pre_dump_session_statements(
+    checkpoint_interval: Duration,
+    inherited_net_write_timeout: Option<u32>,
+) -> Vec<PreDumpStatement> {
     // Ask the source to send heartbeat events while idle so the stream can
     // detect dead connections and advance its checkpoint. Half the
     // checkpoint interval (min 500ms) keeps idle persists within ~1.5×
@@ -128,44 +162,111 @@ fn pre_dump_session_statements(checkpoint_interval: Duration) -> Vec<PreDumpStat
                 rejection_warning: None,
             })
             .collect();
-    // `net_write_timeout` is a system variable, so it needs the `SESSION`
-    // form — the `SET @net_write_timeout` spelling the heartbeats use would
-    // define an unrelated user variable and leave the server default in place.
-    // `GREATEST` against the inherited value keeps this a floor in one
-    // statement, with no round-trip to read the current setting first.
-    statements.push(PreDumpStatement {
-        sql: format!(
-            "SET SESSION net_write_timeout = \
-             CAST(GREATEST(@@SESSION.net_write_timeout, {DUMP_NET_WRITE_TIMEOUT_SECS}) AS UNSIGNED)"
-        ),
-        rejection_warning: Some(
-            "the source can still abort the shared binlog connection when one dataset's apply loop stalls, delaying changes for every changes-mode dataset on it. Grant the replication user permission to set session variables, or raise the source's net_write_timeout. See: https://spiceai.org/docs/components/data-connectors/mysql",
-        ),
-    });
+    // [`open_binlog_stream`] warns when the inherited value could not be read.
+    if let Some(sql) =
+        net_write_timeout_floor_statement(inherited_net_write_timeout, DUMP_NET_WRITE_TIMEOUT_SECS)
+    {
+        statements.push(PreDumpStatement {
+            sql,
+            rejection_warning: Some(NET_WRITE_TIMEOUT_NOT_RAISED),
+        });
+    }
     statements
 }
 
+/// The statement that raises a session's `net_write_timeout` to `floor`, or
+/// `None` when nothing may be assigned to it.
+///
+/// `net_write_timeout` is a system variable, so it needs the `SESSION` form —
+/// the `SET @net_write_timeout` spelling the heartbeats use would define an
+/// unrelated user variable and leave the server default in place. Its value has
+/// to be an integer literal: `MySQL` 8.x answers a function expression there
+/// with `ER_WRONG_TYPE_FOR_VAR` (1232) and keeps the inherited value, so the
+/// floor is resolved against the value read from the connection rather than by
+/// a server-side `GREATEST`.
+///
+/// Nothing is issued for a session already at or above the floor — there is
+/// nothing to raise — and nothing is issued when the inherited value could not
+/// be read, since assigning the floor blind is what would clamp an operator's
+/// higher setting down.
+pub(super) fn net_write_timeout_floor_statement(
+    inherited_net_write_timeout: Option<u32>,
+    floor: u32,
+) -> Option<String> {
+    inherited_net_write_timeout
+        .is_some_and(|inherited| inherited < floor)
+        .then(|| format!("SET SESSION net_write_timeout = {floor}"))
+}
+
+/// The `net_write_timeout`, in seconds, this connection has inherited.
+///
+/// Read on the connection because the floor cannot be resolved server-side: see
+/// [`net_write_timeout_floor_statement`] for why the assignment has to be a
+/// literal.
+///
+/// `Ok(None)` is a server that answered with SQL `NULL`, which is a different
+/// thing from a read that failed and leads to the same floor being skipped for a
+/// different reason — so the error is returned rather than flattened into the
+/// `None`, and the caller says which one happened. Typed as `Option<u32>`
+/// internally so a `NULL` answer decodes instead of panicking in `FromRow`.
+pub(super) async fn inherited_net_write_timeout(
+    conn: &mut Conn,
+) -> std::result::Result<Option<u32>, mysql_async::Error> {
+    Ok(
+        mysql_async::prelude::Queryable::query_first::<Option<u32>, _>(
+            conn,
+            "SELECT @@SESSION.net_write_timeout",
+        )
+        .await?
+        .flatten(),
+    )
+}
+
+/// `connection` is the shared source's `host:port` label, not a dataset: one dump
+/// serves every `refresh_mode: changes` dataset on the source, so anything this
+/// function reports is about the connection they share.
 pub(super) async fn open_binlog_stream(
     params: &ReplicationParams,
     resume: &BinlogPosition,
-    dataset_name: &str,
+    connection: &str,
     use_gtid: bool,
     gtid: &GtidSet,
 ) -> std::result::Result<BinlogStream, mysql_async::Error> {
     let mut conn = Conn::new(params.opts.clone()).await?;
 
+    let inherited_timeout = match inherited_net_write_timeout(&mut conn).await {
+        Ok(Some(inherited)) => Some(inherited),
+        Ok(None) => {
+            tracing::warn!(
+                connection = %connection,
+                "{}",
+                net_write_timeout_left_alone_warning(connection, "the source answered NULL")
+            );
+            None
+        }
+        Err(e) => {
+            tracing::warn!(
+                connection = %connection,
+                error = %e,
+                "{}",
+                net_write_timeout_left_alone_warning(connection, &format!("the read failed: {e}"))
+            );
+            None
+        }
+    };
+
     for PreDumpStatement {
         sql,
         rejection_warning,
-    } in pre_dump_session_statements(params.checkpoint_interval)
+    } in pre_dump_session_statements(params.checkpoint_interval, inherited_timeout)
     {
         if let Err(e) = mysql_async::prelude::Queryable::query_drop(&mut conn, sql.as_str()).await {
             match rejection_warning {
                 Some(consequence) => {
-                    tracing::warn!(dataset = %dataset_name, statement = %sql, error = %e, "Failed to configure the MySQL binlog dump session for dataset {dataset_name}: {consequence}");
+                    tracing::warn!(connection = %connection, statement = %sql, error = %e, "Failed to configure the MySQL binlog dump session for '{connection}': {consequence}");
                 }
                 None => {
-                    tracing::debug!(dataset = %dataset_name, statement = %sql, error = %e, "failed to set a binlog dump session variable");
+                    tracing::debug!(connection = %connection, statement = %sql, error = %e, "failed to set a binlog dump session variable");
                 }
             }
         }
@@ -493,15 +594,39 @@ pub(super) fn readiness_heartbeat(
     })
 }
 
-pub(super) fn record_watermark(metrics: &MetricsCollector, event_timestamp: u32) {
-    if event_timestamp > 0 {
-        metrics.record_commit_watermark(
-            SystemTime::UNIX_EPOCH + Duration::from_secs(u64::from(event_timestamp)),
-        );
+pub(super) fn record_watermark(metrics: &MetricsCollector, commit_ts_ms: Option<i64>) {
+    if let Some(ms) = commit_ts_ms
+        .and_then(|ms| u64::try_from(ms).ok())
+        .filter(|&ms| ms > 0)
+    {
+        metrics.record_commit_watermark(SystemTime::UNIX_EPOCH + Duration::from_millis(ms));
     }
 }
 
-pub(super) fn commit_ts_ms(event_timestamp: u32) -> Option<i64> {
+/// The commit time of a transaction, in milliseconds since the epoch: its GTID event's
+/// commit time when the server wrote one, else its event header's.
+///
+/// `MySQL` 8.0.1 and later write the commit time, in microseconds, into every
+/// transaction's GTID event, anonymous or not. An event header carries whole seconds
+/// only, so a commit time read from one is up to a second old; it is the fallback for a
+/// server that writes no commit time, such as `MariaDB`.
+pub(super) fn transaction_commit_ts_ms(
+    immediate_commit_ts_ms: Option<i64>,
+    event_timestamp: u32,
+) -> Option<i64> {
+    immediate_commit_ts_ms.or_else(|| commit_ts_ms(event_timestamp))
+}
+
+/// A GTID event's `immediate_commit_timestamp`, in microseconds since the epoch, as
+/// milliseconds; `None` when the server wrote none, which it records as zero.
+pub(super) fn immediate_commit_ts_ms(immediate_commit_timestamp_us: u64) -> Option<i64> {
+    if immediate_commit_timestamp_us == 0 {
+        return None;
+    }
+    i64::try_from(immediate_commit_timestamp_us / 1000).ok()
+}
+
+fn commit_ts_ms(event_timestamp: u32) -> Option<i64> {
     (event_timestamp > 0).then(|| i64::from(event_timestamp) * 1000)
 }
 
@@ -531,6 +656,11 @@ pub(super) struct AdoptedLayout {
     pub(super) layout: TableLayout,
     pub(super) column_map: Vec<usize>,
     pub(super) pk_source_indexes: Vec<usize>,
+    /// The schema the member's change batches are built with from here on, when
+    /// the member widens column types and a column's source type widened
+    /// losslessly (see [`widen_to_source_types`]); `None` when every column keeps
+    /// its type.
+    pub(super) widened_schema: Option<SchemaRef>,
 }
 
 /// Re-fetch the source table's layout and reconcile it against the dataset
@@ -543,11 +673,13 @@ pub(super) async fn adopt_current_layout(
     params: &ReplicationParams,
     database: &str,
     table: &str,
-    schema: &SchemaRef,
-    old_layout: &TableLayout,
+    old: &MemberLayout,
     primary_keys: &[String],
     dataset_name: &str,
+    column_type_changes: ColumnTypeChanges,
 ) -> Result<AdoptedLayout> {
+    let schema = old.change_schemas.dataset();
+    let old_layout = &old.layout;
     let mut conn = super::setup::connect(params).await?;
     let layout = super::setup::fetch_table_layout(&mut conn, database, table).await?;
     if let Err(e) = conn.disconnect().await {
@@ -555,6 +687,23 @@ pub(super) async fn adopt_current_layout(
     }
 
     let column_map = layout.column_map(schema, database, table)?;
+    if let Some(refusal) = lossy_retype(schema, old_layout, &layout, &column_map) {
+        return RetypeNotFollowedSnafu { refusal }.fail();
+    }
+    let widened_schema = match column_type_changes {
+        ColumnTypeChanges::Keep => None,
+        ColumnTypeChanges::Widen => {
+            widen_to_source_types(schema, &layout, &column_map, primary_keys)
+        }
+    };
+    if let Some(refusal) = unfollowable_retype(
+        widened_schema.as_ref().unwrap_or(schema),
+        old_layout,
+        &layout,
+        &column_map,
+    ) {
+        return RetypeNotFollowedSnafu { refusal }.fail();
+    }
     let pk_source_indexes = compute_pk_source_indexes(schema, primary_keys, &column_map);
 
     let old_names: std::collections::HashSet<&str> =
@@ -584,7 +733,204 @@ pub(super) async fn adopt_current_layout(
         layout,
         column_map,
         pk_source_indexes,
+        widened_schema,
     })
+}
+
+/// The Arrow type the `MySQL` table provider infers for a numeric
+/// `information_schema.COLUMNS.COLUMN_TYPE`, or `None` for any other type, so a
+/// type adopted mid-stream is the type a restart would register.
+fn numeric_arrow_type(column_type: &str) -> Option<DataType> {
+    let lower = column_type.trim().to_ascii_lowercase();
+    let wire_type = match type_base_name(&lower).as_str() {
+        "tinyint" => ColumnType::MYSQL_TYPE_TINY,
+        "smallint" => ColumnType::MYSQL_TYPE_SHORT,
+        "mediumint" => ColumnType::MYSQL_TYPE_INT24,
+        "int" | "integer" => ColumnType::MYSQL_TYPE_LONG,
+        "bigint" => ColumnType::MYSQL_TYPE_LONGLONG,
+        "float" => ColumnType::MYSQL_TYPE_FLOAT,
+        "double" => ColumnType::MYSQL_TYPE_DOUBLE,
+        "decimal" | "numeric" => ColumnType::MYSQL_TYPE_NEWDECIMAL,
+        _ => return None,
+    };
+    let (precision, scale) = if wire_type == ColumnType::MYSQL_TYPE_NEWDECIMAL {
+        let (precision, scale) = decimal_precision_and_scale(&lower)?;
+        (Some(precision), Some(scale))
+    } else {
+        (None, None)
+    };
+    map_column_to_data_type(
+        wire_type,
+        false,
+        false,
+        lower.contains("unsigned"),
+        false,
+        precision,
+        scale,
+    )
+}
+
+/// `(precision, scale)` of a `decimal(p[,s])` column type. `MySQL` always
+/// reports both in `COLUMN_TYPE`; a bare `decimal` is `decimal(10,0)`.
+pub(super) fn decimal_precision_and_scale(column_type: &str) -> Option<(u8, i8)> {
+    let Some(open) = column_type.find('(') else {
+        return Some((10, 0));
+    };
+    let close = column_type[open..].find(')')? + open;
+    let mut parts = column_type[open + 1..close].split(',').map(str::trim);
+    let precision = parts.next()?.parse().ok()?;
+    let scale = parts.next().map_or(Some(0), |s| s.parse().ok())?;
+    Some((precision, scale))
+}
+
+/// The lowercase type name a `COLUMN_TYPE` starts with (`int` for
+/// `int(11) unsigned`).
+pub(super) fn type_base_name(column_type: &str) -> String {
+    column_type
+        .chars()
+        .take_while(char::is_ascii_alphabetic)
+        .collect::<String>()
+        .to_ascii_lowercase()
+}
+
+/// Why a replicated column's new source type cannot be followed, or `None`
+/// when every replicated column's new type holds each value of its old one.
+///
+/// An `ALTER` that changes a column to a type that does not hold every value of
+/// its old one (`BIGINT` to `DOUBLE`, `DOUBLE` to `INT`) rewrites the stored
+/// values in place, with no row event: `9007199254740993` becomes
+/// `9007199254740992`. The acceleration still holds the old values, and no
+/// later change can repair a row it does not touch; on a key column, a change
+/// matched by a rewritten key misses the row the acceleration holds.
+///
+/// The old and new types are both the source's, and are compared by the values
+/// each holds ([`source_retype_keeps_every_value`]), never by the Arrow types
+/// they map to: a dataset whose `columns` declare their own types is judged by
+/// what the `ALTER` did to the source, and `DECIMAL(18,0)` to `BIGINT` loses
+/// nothing though no Arrow widening turns a decimal into an integer.
+fn lossy_retype(
+    schema: &SchemaRef,
+    old_layout: &TableLayout,
+    layout: &TableLayout,
+    column_map: &[usize],
+) -> Option<RetypeRefusal> {
+    schema
+        .fields()
+        .iter()
+        .zip(column_map)
+        .find_map(|(field, &source_index)| {
+            let column = layout.columns.get(source_index)?;
+            let old_column = old_layout.columns.iter().find(|c| c.name == column.name)?;
+            (source_retype_keeps_every_value(&old_column.column_type, &column.column_type)
+                == Some(false))
+            .then(|| {
+                RetypeRefusal::new(
+                    field.name(),
+                    &old_column.column_type,
+                    &column.column_type,
+                    RetypeRefusalReason::SourceRewroteValues,
+                )
+            })
+        })
+}
+
+/// Why a replicated column's new source type, though it loses no stored value,
+/// cannot be followed by the member's change batches, or `None` when every
+/// retyped column can be. `schema` is the one the batches are built with after
+/// adoption: the dataset schema, or its widening under `sync_all_columns`.
+///
+/// - An integer column that becomes a `DECIMAL` with a scale keeps its integer
+///   type, since no accelerator widens an integer to a decimal, so the first
+///   fractional value the source sends would fail to decode. A scale of `0`
+///   holds only integers, which decode exactly into the integer type. The
+///   column's built type counts as well as its old source type: one followed
+///   from `INT` to `DECIMAL(10,0)` is still built as an integer, so a scale its
+///   `DECIMAL` gains later is refused too.
+/// - A column still built as `Float32` (under `block`, or a primary key under
+///   `sync_all_columns`) whose source is no longer `FLOAT` would have its new
+///   values rounded to `f32` with nothing to say so.
+/// - A column still built as an unsigned integer whose source becomes a
+///   `DECIMAL` receives each value as decimal text, which the unsigned decode
+///   reads as the raw bytes of a `BIT` value: `42` would be stored as `13362`.
+fn unfollowable_retype(
+    schema: &SchemaRef,
+    old_layout: &TableLayout,
+    layout: &TableLayout,
+    column_map: &[usize],
+) -> Option<RetypeRefusal> {
+    schema
+        .fields()
+        .iter()
+        .zip(column_map)
+        .find_map(|(field, &source_index)| {
+            let column = layout.columns.get(source_index)?;
+            let old_column = old_layout.columns.iter().find(|c| c.name == column.name)?;
+            let from = numeric_arrow_type(&old_column.column_type)?;
+            let to = numeric_arrow_type(&column.column_type)?;
+            if from == to {
+                return None;
+            }
+            let reason = if (from.is_integer() || field.data_type().is_integer())
+                && matches!(
+                    to,
+                    DataType::Decimal128(_, scale) | DataType::Decimal256(_, scale) if scale > 0
+                ) {
+                RetypeRefusalReason::FractionIntoInteger
+            } else if *field.data_type() == DataType::Float32 {
+                RetypeRefusalReason::StaysFloat32
+            } else if field.data_type().is_unsigned_integer()
+                && matches!(to, DataType::Decimal128(..) | DataType::Decimal256(..))
+            {
+                RetypeRefusalReason::DecimalIntoUnsignedInteger
+            } else {
+                return None;
+            };
+            Some(RetypeRefusal::new(
+                field.name(),
+                &old_column.column_type,
+                &column.column_type,
+                reason,
+            ))
+        })
+}
+
+/// `schema` with each column whose source type is now a lossless widening of
+/// its current type (`INT` to `DOUBLE`, `DECIMAL(10,2)` to `DECIMAL(12,2)`)
+/// retyped to the source's type, so the values the source now sends decode
+/// as what they are and reach `on_schema_change` as a schema change, rather
+/// than failing to decode as the old type.
+///
+/// Primary-key columns keep their type: a key's typed encoding must not change
+/// under the rows already stored by it. Any other change keeps the current type
+/// too, and a value that type cannot hold fails to decode.
+fn widen_to_source_types(
+    schema: &SchemaRef,
+    layout: &TableLayout,
+    column_map: &[usize],
+    primary_keys: &[String],
+) -> Option<SchemaRef> {
+    let mut changed = false;
+    let fields: Vec<FieldRef> = schema
+        .fields()
+        .iter()
+        .zip(column_map)
+        .map(|(field, &source_index)| {
+            let widened = layout
+                .columns
+                .get(source_index)
+                .filter(|_| !primary_keys.iter().any(|pk| pk == field.name()))
+                .and_then(|column| numeric_arrow_type(&column.column_type))
+                .filter(|to| is_widening_cast(field.data_type(), to));
+            match widened {
+                Some(to) => {
+                    changed = true;
+                    Arc::new(field.as_ref().clone().with_data_type(to))
+                }
+                None => Arc::clone(field),
+            }
+        })
+        .collect();
+    changed.then(|| Arc::new(Schema::new_with_metadata(fields, schema.metadata().clone())))
 }
 
 /// A coarse binlog column-type class, used to compare a layout fetched from
@@ -624,12 +970,7 @@ enum BinlogTypeClass {
 /// 5.6), `TEXT` / `BLOB` (all sent as `MYSQL_TYPE_BLOB`, distinguished only by
 /// a length byte in the metadata), and `REAL` (`REAL_AS_FLOAT` `sql_mode`).
 fn source_type_class(column_type: &str) -> Option<BinlogTypeClass> {
-    let base: String = column_type
-        .chars()
-        .take_while(char::is_ascii_alphabetic)
-        .collect::<String>()
-        .to_ascii_lowercase();
-    match base.as_str() {
+    match type_base_name(column_type).as_str() {
         "tinyint" => Some(BinlogTypeClass::Int8),
         "smallint" => Some(BinlogTypeClass::Int16),
         "mediumint" => Some(BinlogTypeClass::Int24),
@@ -1018,6 +1359,30 @@ mod tests {
     use super::*;
     use crate::mysql_replication::setup::SourceColumn;
 
+    /// A transaction's commit time comes from its GTID event, to the millisecond, and
+    /// from its event header's whole seconds only when the server wrote no commit time.
+    #[test]
+    fn a_commit_time_is_the_gtid_events_and_falls_back_to_the_header() {
+        // 2026-10-15T15:20:26.123456Z, as a GTID event records it.
+        let immediate_us = 1_792_077_626_123_456_u64;
+        assert_eq!(
+            immediate_commit_ts_ms(immediate_us),
+            Some(1_792_077_626_123)
+        );
+        assert_eq!(
+            transaction_commit_ts_ms(immediate_commit_ts_ms(immediate_us), 1_792_077_626),
+            Some(1_792_077_626_123)
+        );
+        // No commit time in the GTID event: the header's whole second.
+        assert_eq!(immediate_commit_ts_ms(0), None);
+        assert_eq!(
+            transaction_commit_ts_ms(immediate_commit_ts_ms(0), 1_792_077_626),
+            Some(1_792_077_626_000)
+        );
+        // Neither: no commit time at all.
+        assert_eq!(transaction_commit_ts_ms(None, 0), None);
+    }
+
     /// `MySQL`'s documented default for `net_write_timeout`, which is what aborts
     /// a dump whose socket the pump stopped draining (#12527).
     const SERVER_DEFAULT_NET_WRITE_TIMEOUT_SECS: u32 = 60;
@@ -1032,6 +1397,17 @@ mod tests {
             .map(|statement| statement.sql.as_str())
     }
 
+    /// The value a `SET` statement assigns: everything after its first `=`.
+    ///
+    /// `MySQL` answers an integer system variable assigned a non-integer value
+    /// with `ER_WRONG_TYPE_FOR_VAR` (1232) and keeps the inherited setting, so
+    /// what this returns has to parse as an integer.
+    fn assigned_value(sql: &str) -> &str {
+        sql.split_once('=')
+            .map(|(_, value)| value.trim())
+            .unwrap_or_default()
+    }
+
     /// The warning the statement setting `variable` carries, if it carries one.
     fn statement_rejection_warning(
         statements: &[PreDumpStatement],
@@ -1044,20 +1420,20 @@ mod tests {
     }
 
     #[test]
-    fn the_dump_session_raises_net_write_timeout() {
+    fn the_dump_session_raises_a_lower_net_write_timeout_to_the_floor() {
         // Regression test for #12527: without this the source aborts the shared
         // dump 60s into one dataset's slow apply cycle, and every
         // `refresh_mode: changes` dataset on the connection re-streams from its
         // acked position while already behind.
-        let statements = pre_dump_session_statements(Duration::from_secs(10));
+        let statements = pre_dump_session_statements(
+            Duration::from_secs(10),
+            Some(SERVER_DEFAULT_NET_WRITE_TIMEOUT_SECS),
+        );
         let sql = statement_setting(&statements, "net_write_timeout")
-            .expect("the dump session must raise net_write_timeout");
+            .expect("a session below the floor must have net_write_timeout raised");
         assert_eq!(
             sql,
-            format!(
-                "SET SESSION net_write_timeout = \
-                 CAST(GREATEST(@@SESSION.net_write_timeout, {DUMP_NET_WRITE_TIMEOUT_SECS}) AS UNSIGNED)"
-            ),
+            format!("SET SESSION net_write_timeout = {DUMP_NET_WRITE_TIMEOUT_SECS}"),
             "net_write_timeout is a SYSTEM variable: the `SET @net_write_timeout` spelling the \
              heartbeats use would define an unrelated user variable and silently leave the \
              server default in place"
@@ -1075,19 +1451,95 @@ mod tests {
     }
 
     #[test]
+    fn the_floor_is_assigned_as_an_integer_literal() {
+        // Regression test for #13307. An integer system variable assigned a
+        // function expression — `GREATEST(...)`, cast or not — is answered with
+        // `ER_WRONG_TYPE_FOR_VAR` (1232): the assignment never takes effect, the
+        // session keeps the server default, and the only trace is the rejection
+        // warning. Every statement the dump session issues has to assign a value
+        // the server will accept.
+        let statements = pre_dump_session_statements(
+            Duration::from_secs(10),
+            Some(SERVER_DEFAULT_NET_WRITE_TIMEOUT_SECS),
+        );
+        let sql = statement_setting(&statements, "net_write_timeout")
+            .expect("a session below the floor must have net_write_timeout raised");
+        assert_eq!(
+            assigned_value(sql).parse::<u32>().ok(),
+            Some(DUMP_NET_WRITE_TIMEOUT_SECS),
+            "the assigned value must be the floor as an integer literal, not an expression \
+             the server will refuse: {sql}"
+        );
+    }
+
+    #[test]
     fn the_dump_session_never_lowers_an_operators_higher_net_write_timeout() {
         // Raising `net_write_timeout` on the source is the manual workaround for
         // this symptom, so an operator who has already done it must not have it
-        // lowered by connecting a runtime carrying this fix. `GREATEST` against
-        // the session's inherited value makes the statement a floor; a bare
-        // assignment would clamp their setting down to ours.
-        let statements = pre_dump_session_statements(Duration::from_secs(10));
-        let sql = statement_setting(&statements, "net_write_timeout")
-            .expect("the dump session must raise net_write_timeout");
-        assert!(
-            sql.contains("GREATEST(@@SESSION.net_write_timeout,"),
-            "the statement must take the greater of the inherited value and ours: {sql}"
+        // lowered by connecting a runtime carrying this fix. The floor is
+        // resolved against the value read from the connection, so a session at
+        // or above it is left alone rather than assigned down to ours.
+        for inherited in [
+            DUMP_NET_WRITE_TIMEOUT_SECS,
+            DUMP_NET_WRITE_TIMEOUT_SECS + 1,
+            DUMP_NET_WRITE_TIMEOUT_SECS * 10,
+        ] {
+            let statements = pre_dump_session_statements(Duration::from_secs(10), Some(inherited));
+            assert_eq!(
+                statement_setting(&statements, "net_write_timeout"),
+                None,
+                "a session inheriting {inherited}s already clears the \
+                 {DUMP_NET_WRITE_TIMEOUT_SECS}s floor, so nothing may be assigned to it"
+            );
+        }
+    }
+
+    #[test]
+    fn an_unreadable_net_write_timeout_is_left_as_the_source_set_it() {
+        // With no value read there is no way to tell a server default from an
+        // operator's raised setting, and assigning the floor blind would clamp
+        // the latter down. `open_binlog_stream` warns instead.
+        let statements = pre_dump_session_statements(Duration::from_secs(10), None);
+        assert_eq!(
+            statement_setting(&statements, "net_write_timeout"),
+            None,
+            "an unread net_write_timeout must not be assigned a value"
         );
+    }
+
+    #[test]
+    fn a_skipped_floor_says_which_connection_why_and_what_it_costs() {
+        // This warning is the only account anyone gets of a floor that was not
+        // applied, so both branches have to carry the same three things: the
+        // connection it is about, why the value was left alone, and what that
+        // costs. Asserted for both, because they are two call sites of one
+        // message and drifted apart when they were two messages.
+        for (reason, expected_reason) in [
+            ("the source answered NULL", "the source answered NULL"),
+            (
+                "the read failed: Access denied",
+                "the read failed: Access denied",
+            ),
+        ] {
+            let warning = net_write_timeout_left_alone_warning("db.internal:3306", reason);
+            assert!(
+                warning.contains("'db.internal:3306'"),
+                "the connection must be named, and quoted: {warning}"
+            );
+            assert!(warning.contains(expected_reason), "{warning}");
+            assert!(
+                warning.contains("`net_write_timeout`"),
+                "the setting is a system identifier: {warning}"
+            );
+            assert!(
+                warning.contains("https://spiceai.org/docs/"),
+                "the warning must point at the fix: {warning}"
+            );
+            assert!(
+                warning.contains("abort the shared binlog connection"),
+                "the warning must say what is lost: {warning}"
+            );
+        }
     }
 
     #[test]
@@ -1095,7 +1547,10 @@ mod tests {
         // The heartbeat spellings are tried in pairs and one is always unknown,
         // so those must stay quiet; a rejected net_write_timeout leaves the
         // reconnect cliff in place and is the one the user can act on.
-        let statements = pre_dump_session_statements(Duration::from_secs(10));
+        let statements = pre_dump_session_statements(
+            Duration::from_secs(10),
+            Some(SERVER_DEFAULT_NET_WRITE_TIMEOUT_SECS),
+        );
         for statement in &statements {
             assert_eq!(
                 statement.rejection_warning.is_some(),
@@ -1115,8 +1570,12 @@ mod tests {
     #[test]
     fn both_heartbeat_spellings_are_set_as_user_variables_in_nanoseconds() {
         // Half the checkpoint interval, in nanoseconds, on both the pre-8.4 and
-        // 8.4 spellings — unchanged by the net_write_timeout addition.
-        let statements = pre_dump_session_statements(Duration::from_secs(10));
+        // 8.4 spellings — independent of whatever net_write_timeout the
+        // session inherited.
+        let statements = pre_dump_session_statements(
+            Duration::from_secs(10),
+            Some(SERVER_DEFAULT_NET_WRITE_TIMEOUT_SECS),
+        );
         for var in ["master_heartbeat_period", "source_heartbeat_period"] {
             assert_eq!(
                 statement_setting(&statements, var),
@@ -1130,7 +1589,7 @@ mod tests {
     fn a_tiny_checkpoint_interval_floors_the_heartbeat_at_500ms() {
         // A sub-second interval would otherwise ask the source to heartbeat
         // continuously.
-        let statements = pre_dump_session_statements(Duration::from_millis(100));
+        let statements = pre_dump_session_statements(Duration::from_millis(100), None);
         assert_eq!(
             statement_setting(&statements, "master_heartbeat_period"),
             Some("SET @master_heartbeat_period = 500000000")
@@ -1160,6 +1619,252 @@ mod tests {
         layout_mismatch_against(&layout_of(columns), |ordinal| {
             event.get(ordinal).copied().flatten()
         })
+    }
+
+    #[test]
+    fn numeric_column_types_map_like_the_table_provider() {
+        for (column_type, expected) in [
+            ("tinyint", Some(DataType::Int8)),
+            ("tinyint(3) unsigned", Some(DataType::UInt8)),
+            ("smallint", Some(DataType::Int16)),
+            ("mediumint", Some(DataType::Int32)),
+            ("int", Some(DataType::Int32)),
+            ("INT UNSIGNED", Some(DataType::UInt32)),
+            ("bigint", Some(DataType::Int64)),
+            ("bigint unsigned", Some(DataType::UInt64)),
+            ("float", Some(DataType::Float32)),
+            ("double", Some(DataType::Float64)),
+            ("decimal(12,2)", Some(DataType::Decimal128(12, 2))),
+            ("decimal(65,30)", Some(DataType::Decimal256(65, 30))),
+            ("decimal", Some(DataType::Decimal128(10, 0))),
+            ("varchar(20)", None),
+            ("datetime(6)", None),
+        ] {
+            assert_eq!(numeric_arrow_type(column_type), expected, "{column_type}");
+        }
+    }
+
+    fn schema_of(fields: &[(&str, DataType)]) -> SchemaRef {
+        Arc::new(Schema::new(
+            fields
+                .iter()
+                .map(|(name, data_type)| {
+                    arrow::datatypes::Field::new(*name, data_type.clone(), true)
+                })
+                .collect::<Vec<_>>(),
+        ))
+    }
+
+    #[test]
+    fn a_widened_source_type_retypes_the_column_and_nothing_else() {
+        let schema = schema_of(&[
+            ("id", DataType::Int64),
+            ("k", DataType::Int32),
+            ("price", DataType::Decimal128(10, 2)),
+            ("ratio", DataType::Float64),
+            ("name", DataType::Utf8),
+        ]);
+        // `id` widens too, but a key keeps its type; `ratio` narrows to INT,
+        // which is not a widening; `name` is not numeric.
+        let layout = layout_of(&[
+            ("id", "double"),
+            ("k", "double"),
+            ("price", "decimal(12,2)"),
+            ("ratio", "int"),
+            ("name", "varchar(20)"),
+        ]);
+        let widened =
+            widen_to_source_types(&schema, &layout, &[0, 1, 2, 3, 4], &["id".to_string()])
+                .expect("k and price widen");
+        let types: Vec<_> = widened
+            .fields()
+            .iter()
+            .map(|f| f.data_type().clone())
+            .collect();
+        assert_eq!(
+            types,
+            vec![
+                DataType::Int64,
+                DataType::Float64,
+                DataType::Decimal128(12, 2),
+                DataType::Float64,
+                DataType::Utf8,
+            ]
+        );
+    }
+
+    #[test]
+    fn a_column_retyped_to_a_type_that_loses_values_is_refused() {
+        let schema = schema_of(&[("id", DataType::Int64), ("k", DataType::Int64)]);
+        let old = layout_of(&[("id", "bigint"), ("k", "bigint")]);
+        let retyped = |id: &str, k: &str| {
+            lossy_retype(&schema, &old, &layout_of(&[("id", id), ("k", k)]), &[0, 1])
+        };
+        let rewrote = RetypeRefusalReason::SourceRewroteValues;
+        assert_eq!(
+            retyped("bigint", "double"),
+            Some(RetypeRefusal::new("k", "bigint", "double", rewrote))
+        );
+        assert_eq!(
+            retyped("double", "bigint"),
+            Some(RetypeRefusal::new("id", "bigint", "double", rewrote))
+        );
+        // `DECIMAL(18,0)` holds 18 integer digits; a `BIGINT` can have 19.
+        assert_eq!(
+            retyped("bigint", "decimal(18,0)"),
+            Some(RetypeRefusal::new("k", "bigint", "decimal(18,0)", rewrote))
+        );
+        // Types that hold every old value, and non-numeric types, are followed.
+        assert_eq!(retyped("bigint", "decimal(19,0)"), None);
+        assert_eq!(retyped("bigint", "bigint"), None);
+        assert_eq!(retyped("bigint", "varchar(40)"), None);
+    }
+
+    /// Regression test for a lossless `ALTER` the stream refused: every
+    /// `DECIMAL(18,0)` value is a `BIGINT`, though no Arrow widening turns a
+    /// decimal into an integer.
+    #[test]
+    fn a_zero_scale_decimal_retyped_to_an_integer_that_holds_it_is_followed() {
+        let schema = schema_of(&[("id", DataType::Int64), ("k", DataType::Decimal128(18, 0))]);
+        let old = layout_of(&[("id", "bigint"), ("k", "decimal(18,0)")]);
+        let retyped = |k: &str| {
+            let layout = layout_of(&[("id", "bigint"), ("k", k)]);
+            (
+                lossy_retype(&schema, &old, &layout, &[0, 1]),
+                unfollowable_retype(&schema, &old, &layout, &[0, 1]),
+            )
+        };
+        assert_eq!(retyped("bigint"), (None, None));
+        assert_eq!(
+            retyped("bigint unsigned"),
+            (
+                Some(RetypeRefusal::new(
+                    "k",
+                    "decimal(18,0)",
+                    "bigint unsigned",
+                    RetypeRefusalReason::SourceRewroteValues
+                )),
+                None
+            )
+        );
+    }
+
+    #[test]
+    fn a_retype_the_change_batches_cannot_follow_is_refused() {
+        let old = layout_of(&[("id", "bigint"), ("k", "int"), ("f", "float")]);
+        let layout = |k: &str, f: &str| layout_of(&[("id", "bigint"), ("k", k), ("f", f)]);
+        let refused = |schema: &SchemaRef, k: &str, f: &str| {
+            unfollowable_retype(schema, &old, &layout(k, f), &[0, 1, 2])
+        };
+        let registered = schema_of(&[
+            ("id", DataType::Int64),
+            ("k", DataType::Int32),
+            ("f", DataType::Float32),
+        ]);
+        assert_eq!(
+            refused(&registered, "decimal(12,2)", "float"),
+            Some(RetypeRefusal::new(
+                "k",
+                "int",
+                "decimal(12,2)",
+                RetypeRefusalReason::FractionIntoInteger
+            ))
+        );
+        // `block` keeps the registered `Float32`.
+        assert_eq!(
+            refused(&registered, "int", "double"),
+            Some(RetypeRefusal::new(
+                "f",
+                "float",
+                "double",
+                RetypeRefusalReason::StaysFloat32
+            ))
+        );
+        // `sync_all_columns` widens a non-key `FLOAT` to `Float64`, which follows,
+        // but keeps a primary key's type.
+        let widened = |primary_keys: &[String]| {
+            widen_to_source_types(
+                &registered,
+                &layout("int", "double"),
+                &[0, 1, 2],
+                primary_keys,
+            )
+            .unwrap_or_else(|| Arc::clone(&registered))
+        };
+        assert_eq!(
+            refused(&widened(&["id".to_string()]), "int", "double"),
+            None
+        );
+        assert!(refused(&widened(&["f".to_string()]), "int", "double").is_some());
+        // Retypes the batches decode exactly are followed.
+        assert_eq!(refused(&registered, "decimal(10,0)", "float"), None);
+        assert_eq!(refused(&registered, "bigint", "float"), None);
+        assert_eq!(refused(&registered, "int", "float"), None);
+        // A column followed from `INT` to `DECIMAL(10,0)` is still built as
+        // `Int32`, so a scale its `DECIMAL` gains later is refused as well.
+        assert_eq!(
+            unfollowable_retype(
+                &registered,
+                &layout("decimal(10,0)", "float"),
+                &layout("decimal(12,2)", "float"),
+                &[0, 1, 2]
+            ),
+            Some(RetypeRefusal::new(
+                "k",
+                "decimal(10,0)",
+                "decimal(12,2)",
+                RetypeRefusalReason::FractionIntoInteger
+            ))
+        );
+
+        // An unsigned integer column reads decimal text as `BIT` bytes, so a
+        // `DECIMAL` source is refused at any scale; a signed one parses it.
+        let unsigned_old = layout_of(&[("id", "bigint"), ("k", "int unsigned")]);
+        let unsigned = schema_of(&[("id", DataType::Int64), ("k", DataType::UInt32)]);
+        let unsigned_retype = |k: &str| {
+            unfollowable_retype(
+                &unsigned,
+                &unsigned_old,
+                &layout_of(&[("id", "bigint"), ("k", k)]),
+                &[0, 1],
+            )
+        };
+        assert_eq!(
+            unsigned_retype("decimal(10,0)"),
+            Some(RetypeRefusal::new(
+                "k",
+                "int unsigned",
+                "decimal(10,0)",
+                RetypeRefusalReason::DecimalIntoUnsignedInteger
+            ))
+        );
+        assert_eq!(unsigned_retype("bigint"), None);
+    }
+
+    #[test]
+    fn a_column_typed_by_the_dataset_is_judged_by_its_source_types() {
+        // The dataset declares `k` as text; an `INT` to `BIGINT` change on the
+        // source loses nothing, whatever the dataset's own type.
+        let schema = schema_of(&[("id", DataType::Int64), ("k", DataType::Utf8)]);
+        assert_eq!(
+            lossy_retype(
+                &schema,
+                &layout_of(&[("id", "bigint"), ("k", "int")]),
+                &layout_of(&[("id", "bigint"), ("k", "bigint")]),
+                &[0, 1]
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn an_unchanged_layout_keeps_the_same_schema() {
+        let schema = schema_of(&[("id", DataType::Int64), ("k", DataType::Int32)]);
+        let layout = layout_of(&[("id", "bigint"), ("k", "int")]);
+        assert_eq!(
+            widen_to_source_types(&schema, &layout, &[0, 1], &["id".to_string()]),
+            None
+        );
     }
 
     #[test]
@@ -1213,7 +1918,9 @@ mod tests {
     }
 
     /// Widths within the integer family are distinct classes — a swap between
-    /// two integer columns of different widths still scrambles values.
+    /// two integer columns of different widths still scrambles values — while
+    /// each declared width still matches its own wire type, so a healthy
+    /// stream is never failed.
     #[test]
     fn integer_widths_are_distinguished() {
         for (declared, event) in [
@@ -1222,9 +1929,28 @@ mod tests {
             ("mediumint(9)", ColumnType::MYSQL_TYPE_LONG),
             ("bigint(20)", ColumnType::MYSQL_TYPE_LONG),
         ] {
-            assert!(
-                mismatch_against(&[("n", declared)], &[Some(event)]).is_some(),
+            assert_eq!(
+                mismatch_against(&[("n", declared)], &[Some(event)]),
+                Some(LayoutEventMismatch {
+                    ordinal: 0,
+                    column: "n".to_string(),
+                    source_type: declared.to_string(),
+                }),
                 "{declared} must not be accepted against {event:?}"
+            );
+        }
+
+        for (declared, event) in [
+            ("tinyint(4)", ColumnType::MYSQL_TYPE_TINY),
+            ("smallint(6)", ColumnType::MYSQL_TYPE_SHORT),
+            ("mediumint(9)", ColumnType::MYSQL_TYPE_INT24),
+            ("int(11)", ColumnType::MYSQL_TYPE_LONG),
+            ("bigint(20)", ColumnType::MYSQL_TYPE_LONGLONG),
+        ] {
+            assert_eq!(
+                mismatch_against(&[("n", declared)], &[Some(event)]),
+                None,
+                "{declared} must be accepted against its own wire type {event:?}"
             );
         }
     }

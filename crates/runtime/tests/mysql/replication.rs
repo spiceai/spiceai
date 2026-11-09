@@ -39,8 +39,9 @@ use async_trait::async_trait;
 use data_components::cdc::{ChangeEnvelope, ChangesStream, StreamError};
 use data_components::cdc::{InitialSnapshotMode, InvalidCheckpointBehavior};
 use data_components::mysql_replication::{
-    CursorType, PersistedPosition, PositionStore, ReplicationMetricsCollector, ReplicationParams,
-    ReplicationStreamInput, StoreError, encode_checkpoint_schema_json, start_replication_stream,
+    ColumnTypeChanges, CursorType, PersistedPosition, PositionStore, ReplicationMetricsCollector,
+    ReplicationParams, ReplicationStreamInput, StoreError, encode_checkpoint_schema_json,
+    start_replication_stream,
 };
 use futures::StreamExt;
 use mysql_async::prelude::Queryable;
@@ -48,16 +49,10 @@ use mysql_async::prelude::Queryable;
 use crate::init_tracing;
 use crate::mysql::common;
 
-// 13324 base; this suite also uses +1 (purged-position), +2 (stale-backlog),
-// +5 (version matrix: pinned 8.0 fallback). Distinct from the other MySQL suites
-// (comments 13320, e2e 13322/13323, refresh_retry 13327, schema_inference
-// 13328, rehydration 13337) so parallel test binaries never fight over a
-// container.
-const MYSQL_REPLICATION_PORT: u16 = 13324;
 /// Pinned image for the pre-8.2 positioning branch (`SHOW MASTER STATUS`
 /// fallback). The modern `SHOW BINARY LOG STATUS` branch is exercised by the
-/// rest of this suite via `mysql:latest` (always an 8.2+ version), so it needs
-/// no separate pin here.
+/// rest of this suite on the `MySQL` LTS lines in `test/source_versions.json`
+/// (all 8.2+), so it needs no separate pin here.
 const MYSQL_IMAGE_8_0: &str = "docker.io/library/mysql:8.0";
 
 /// In-memory [`PositionStore`] standing in for the accelerator sidecar.
@@ -126,6 +121,7 @@ fn stream_input(
         position_store: store,
         schema_json: Some(schema_json),
         metrics: ReplicationMetricsCollector::new(),
+        column_type_changes: ColumnTypeChanges::Keep,
     }
 }
 
@@ -245,8 +241,8 @@ fn ids_of(envelope: &ChangeEnvelope) -> Vec<i32> {
 async fn bootstrap_then_stream_changes_then_resume() -> Result<(), anyhow::Error> {
     let _tracing = init_tracing(Some("data_components::mysql_replication=debug,info"));
 
-    let port = MYSQL_REPLICATION_PORT;
-    let _container = common::start_mysql_docker_container(port).await?;
+    let container = common::start_mysql_docker_container().await?;
+    let port = container.host_port(3306)?;
     let pool = setup_source_table(port).await?;
     let store: Arc<MemoryPositionStore> = Arc::new(MemoryPositionStore::default());
 
@@ -419,8 +415,8 @@ async fn bootstrap_then_stream_changes_then_resume() -> Result<(), anyhow::Error
 async fn purged_position_behavior() -> Result<(), anyhow::Error> {
     let _tracing = init_tracing(Some("data_components::mysql_replication=debug,info"));
 
-    let port = MYSQL_REPLICATION_PORT + 1;
-    let _container = common::start_mysql_docker_container(port).await?;
+    let container = common::start_mysql_docker_container().await?;
+    let port = container.host_port(3306)?;
     let pool = setup_source_table(port).await?;
 
     // A persisted position pointing at a binlog file the server never had —
@@ -506,6 +502,64 @@ async fn purged_position_behavior() -> Result<(), anyhow::Error> {
         .expect("rebuild persists a fresh position")
         .position;
     assert_ne!(repersisted.file, "binlog.999999");
+    drop(stream);
+
+    // `restart` with the initial snapshot DISABLED: the same rebuild, reached
+    // end to end through `resolve_start_position`. Regression test for #13024.
+    //
+    // `initial_snapshot: disabled` governs the first load. It cannot mean that
+    // an acceleration whose history the source dropped may keep serving rows
+    // the source no longer has, and this is the arm where that used to happen:
+    // the member streamed on from a freshly captured head, so a row deleted at
+    // the source inside the purged window kept being served by every later
+    // query — and persisting that head up front made it permanent, because the
+    // next start resumed cleanly and never revisited the gap.
+    let store: Arc<MemoryPositionStore> = Arc::new(MemoryPositionStore::default());
+    store.save(&stale).await.expect("save stale position");
+    let mut input = stream_input(port, 200_203, Arc::clone(&store) as Arc<dyn PositionStore>);
+    input.params.invalid_position_behavior = InvalidCheckpointBehavior::Restart;
+    input.params.snapshot_mode = InitialSnapshotMode::Disabled;
+    let mut stream = start_replication_stream(input);
+
+    let envelope = next_envelope(
+        &mut stream,
+        "the rebuild signal under `initial_snapshot: disabled` (without it the member streams \
+         on from the source head and keeps every row deleted inside the purged window)",
+    )
+    .await?;
+    assert!(
+        envelope.history_unavailable(),
+        "a purged position under `restart` must ask the consumer to rebuild whatever \
+         `initial_snapshot` says"
+    );
+    // The rebuild does not use the snapshot machinery the mode disabled: it is
+    // one zero-row signal the consumer answers with an atomic replacement.
+    assert_eq!(num_rows(&envelope), 0);
+    assert!(ops_of(&envelope).is_empty());
+
+    // The stale position survives until the rebuild commits. Recording the new
+    // head before the replacement lands is what made the divergence permanent,
+    // and it would also let a crash mid-rebuild resume past rows that never
+    // arrived.
+    let held = store
+        .load()
+        .await
+        .expect("store readable")
+        .expect("the stale checkpoint is still there")
+        .position;
+    assert_eq!(
+        held.file, "binlog.999999",
+        "the fresh head must not be persisted before the rebuild is applied"
+    );
+
+    envelope.commit().await?;
+    let repersisted = store
+        .load()
+        .await
+        .expect("store readable")
+        .expect("rebuild persists a fresh position")
+        .position;
+    assert_ne!(repersisted.file, "binlog.999999");
 
     pool.disconnect().await?;
     Ok(())
@@ -520,8 +574,8 @@ async fn purged_position_behavior() -> Result<(), anyhow::Error> {
 async fn resume_with_stale_backlog_is_not_ready_until_caught_up() -> Result<(), anyhow::Error> {
     let _tracing = init_tracing(Some("data_components::mysql_replication=debug,info"));
 
-    let port = MYSQL_REPLICATION_PORT + 2;
-    let _container = common::start_mysql_docker_container(port).await?;
+    let container = common::start_mysql_docker_container().await?;
+    let port = container.host_port(3306)?;
     let pool = setup_source_table(port).await?;
     let store: Arc<MemoryPositionStore> = Arc::new(MemoryPositionStore::default());
 
@@ -582,8 +636,8 @@ async fn resume_with_stale_backlog_is_not_ready_until_caught_up() -> Result<(), 
 /// Minimal cold-bootstrap → Ready → live-insert flow. Reaching Ready proves
 /// `fetch_head_position` succeeded on this server version. Run here on a pinned
 /// 8.0 to exercise the `SHOW MASTER STATUS` fallback; the modern
-/// `SHOW BINARY LOG STATUS` branch is covered by the rest of the suite on
-/// `mysql:latest`.
+/// `SHOW BINARY LOG STATUS` branch is covered by the rest of the suite on the
+/// `MySQL` LTS lines.
 async fn bootstrap_and_stream_once(port: u16, server_id: u32) -> Result<(), anyhow::Error> {
     let pool = setup_source_table(port).await?;
     let store: Arc<MemoryPositionStore> = Arc::new(MemoryPositionStore::default());
@@ -631,12 +685,128 @@ async fn bootstrap_and_stream_once(port: u16, server_id: u32) -> Result<(), anyh
 
 /// Version matrix — pre-8.2: positioning must fall back to `SHOW MASTER STATUS`
 /// (8.0 does not have `SHOW BINARY LOG STATUS`). The modern `SHOW BINARY LOG
-/// STATUS` branch is covered by the rest of this suite on `mysql:latest`, so it
-/// gets no duplicate pin here.
+/// STATUS` branch is covered by the rest of this suite on the `MySQL` LTS lines,
+/// so it gets no duplicate pin here.
 #[tokio::test(flavor = "multi_thread")]
 async fn bootstrap_streams_on_mysql_8_0() -> Result<(), anyhow::Error> {
     let _tracing = init_tracing(Some("data_components::mysql_replication=debug,info"));
-    let port = MYSQL_REPLICATION_PORT + 5;
-    let _container = common::start_mysql_docker_container_with_image(port, MYSQL_IMAGE_8_0).await?;
+    let container = common::start_mysql_docker_container_with_image(MYSQL_IMAGE_8_0).await?;
+    let port = container.host_port(3306)?;
     bootstrap_and_stream_once(port, 200_401).await
+}
+
+/// Rows in the source table of
+/// [`snapshot_survives_a_writer_stall_past_the_sources_net_write_timeout`]:
+/// ~100 MB of result set, far more than the socket buffers between the server
+/// and the reader can hold, so a stalled reader leaves the server blocked on
+/// its write with `net_write_timeout` running.
+const STALL_TABLE_ROWS: i32 = 400_000;
+
+/// What the source's `net_write_timeout` is lowered to for the stall test, so a
+/// stall of seconds does what a multi-minute writer exclusion does at the 60s
+/// server default.
+const STALL_SOURCE_NET_WRITE_TIMEOUT_SECS: u32 = 2;
+
+/// How long the stall test stops taking snapshot rows. Time is what is under
+/// test here: it has to outlast [`STALL_SOURCE_NET_WRITE_TIMEOUT_SECS`] once the
+/// buffers have filled.
+const SNAPSHOT_STALL: Duration = Duration::from_secs(15);
+
+/// The snapshot session's `net_write_timeout` floor
+/// (`SNAPSHOT_NET_WRITE_TIMEOUT_SECS` in `mysql_replication::bootstrap`).
+const SNAPSHOT_NET_WRITE_TIMEOUT_FLOOR_SECS: u64 = 1200;
+
+/// A snapshot whose consumer stalls past the source's `net_write_timeout` must
+/// still deliver every row exactly once, rather than failing with `bytes
+/// remaining on stream` (see `SNAPSHOT_NET_WRITE_TIMEOUT_SECS` for why the
+/// consumer stalls).
+#[tokio::test(flavor = "multi_thread")]
+async fn snapshot_survives_a_writer_stall_past_the_sources_net_write_timeout()
+-> Result<(), anyhow::Error> {
+    let _tracing = init_tracing(Some("data_components::mysql_replication=debug,info"));
+    let container = common::start_mysql_docker_container().await?;
+    let port = container.host_port(3306)?;
+    let pool = common::get_mysql_conn(port)?;
+    let mut conn = pool.get_conn().await?;
+    // New sessions, the snapshot's included, inherit the global value.
+    conn.query_drop(format!(
+        "SET GLOBAL net_write_timeout = {STALL_SOURCE_NET_WRITE_TIMEOUT_SECS}"
+    ))
+    .await?;
+    conn.query_drop("CREATE TABLE stall_rows (id INT PRIMARY KEY, name TEXT NOT NULL)")
+        .await?;
+    conn.query_drop(format!(
+        "SET SESSION cte_max_recursion_depth = {STALL_TABLE_ROWS}"
+    ))
+    .await?;
+    conn.query_drop(format!(
+        "INSERT INTO stall_rows \
+         WITH RECURSIVE seq (n) AS (SELECT 1 UNION ALL SELECT n + 1 FROM seq WHERE n < {STALL_TABLE_ROWS}) \
+         SELECT n, REPEAT('x', 255) FROM seq"
+    ))
+    .await?;
+
+    let store: Arc<MemoryPositionStore> = Arc::new(MemoryPositionStore::default());
+    let mut stream = start_replication_stream(ReplicationStreamInput {
+        dataset_name: "stall_rows".into(),
+        table: "stall_rows".into(),
+        ..stream_input(port, 200_501, store as Arc<dyn PositionStore>)
+    });
+
+    let envelope = next_envelope(&mut stream, "truncate barrier").await?;
+    assert_eq!(ops_of(&envelope), vec!["t"]);
+    envelope.commit().await?;
+    let envelope = next_change_envelope(&mut stream, "first snapshot batch").await?;
+    let mut ids = ids_of(&envelope);
+    envelope.commit().await?;
+
+    // Stop taking rows, as the apply loop does while the table's writers are
+    // excluded.
+    tokio::time::sleep(SNAPSHOT_STALL).await;
+
+    // The server is now blocked writing the rest of the result set to the
+    // snapshot session, which has to carry the floor rather than the 2s it
+    // inherited. Asserted once the snapshot has drained, so a stream that died
+    // fails on its own error.
+    let snapshot_session: Option<u64> = conn
+        .query_first(
+            "SELECT id FROM information_schema.processlist \
+             WHERE id <> CONNECTION_ID() \
+             AND info LIKE 'SELECT %FROM `mysqldb`.`stall_rows`'",
+        )
+        .await?;
+    drop(conn);
+    let snapshot_session_timeout = match snapshot_session {
+        Some(id) => common::session_net_write_timeout(&pool, id).await?,
+        None => None,
+    };
+
+    // The rest of the snapshot, up to the zero-row boundary that follows it.
+    loop {
+        let envelope = next_envelope(&mut stream, "the rest of the snapshot").await?;
+        if num_rows(&envelope) == 0 {
+            envelope.commit().await?;
+            break;
+        }
+        assert!(
+            ops_of(&envelope).iter().all(|op| op == "c"),
+            "a snapshot batch carries only creates"
+        );
+        ids.extend(ids_of(&envelope));
+        envelope.commit().await?;
+    }
+    ids.sort_unstable();
+    assert_eq!(
+        ids,
+        (1..=STALL_TABLE_ROWS).collect::<Vec<_>>(),
+        "every source row must arrive exactly once"
+    );
+    assert_eq!(
+        snapshot_session_timeout,
+        Some(SNAPSHOT_NET_WRITE_TIMEOUT_FLOOR_SECS),
+        "while stalled, the snapshot session must still have been reading stall_rows, with its net_write_timeout raised to the floor"
+    );
+
+    pool.disconnect().await?;
+    Ok(())
 }

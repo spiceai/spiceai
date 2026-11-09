@@ -12,6 +12,7 @@ version.workspace = true
 anyhow.workspace = true
 async-trait.workspace = true
 aws-config.workspace = true
+aws-identity = { path = "../aws-identity" }
 aws-credential-types.workspace = true
 aws-runtime.workspace = true
 aws-sdk-s3.workspace = true
@@ -21,6 +22,7 @@ fundu.workspace = true
 iceberg.workspace = true
 iceberg-storage-opendal.workspace = true
 object_store.workspace = true
+object_store_spawn = { path = "../object_store_spawn" }
 reqwest.workspace = true
 reqsign-core.workspace = true
 secrecy.workspace = true
@@ -31,8 +33,6 @@ util = { workspace = true, default-features = false, features = [] }
 url.workspace = true
 
 [dev-dependencies]
-aws-sdk-cognitoidentity.workspace = true
-aws-sdk-cognitoidentityprovider.workspace = true
 tempfile.workspace = true
 
 [lints]

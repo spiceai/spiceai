@@ -24,9 +24,7 @@ use crate::{
         Builder, BuilderTarget, ExtendedMetrics, MetricCollector, QueryMetric, QueryStatus,
         StatisticsCollector, system_time_to_unix_epoch_ms,
     },
-    spicetest::search::evaluate::{
-        calculate_retrieval_metrics, calculate_retrieval_metrics_at_all_k,
-    },
+    spicetest::search::evaluate::calculate_retrieval_metrics,
 };
 use anyhow::{Context, Result};
 use arrow::{
@@ -40,9 +38,13 @@ use super::{SpiceTest, TestCompleted, TestNotStarted, TestState};
 mod evaluate;
 mod worker;
 pub use evaluate::RetrievalMetrics;
-pub use worker::SearchResult;
-pub use worker::{SearchConfig, SearchRequest};
+pub use worker::{
+    CorpusId, SearchApiResponse, SearchConfig, SearchMethod, SearchRequest, SearchResponse,
+    SearchResult, SqlPipeline, SqlSearchHit, SqlSearchResponse,
+};
 use worker::{VectorSearchWorker, VectorSearchWorkerResult};
+
+pub use evaluate::{QueryId, QueryRetrievalMetrics, RetrievalEvaluation};
 
 #[derive(Default)]
 pub struct NotStarted {
@@ -99,6 +101,7 @@ impl SpiceTest<NotStarted> {
             .http_client()?;
 
         // Split the requests among workers based on the parallel_count
+        let method = self.state.config.method().clone();
         let requests = self.state.config.into_requests();
         let chunk_size = if self.state.parallel_count > 0 {
             requests.len().div_ceil(self.state.parallel_count)
@@ -110,7 +113,9 @@ impl SpiceTest<NotStarted> {
             .chunks(chunk_size)
             .enumerate()
             .map(|(worker_id, chunk)| {
-                let worker_config = SearchConfig::new().add_requests(chunk.iter().cloned());
+                let worker_config = SearchConfig::new()
+                    .with_method(method.clone())
+                    .add_requests(chunk.iter().cloned());
                 VectorSearchWorker::new(worker_id, http_client.clone(), worker_config).start()
             })
             .collect();
@@ -209,25 +214,22 @@ impl SpiceTest<Completed> {
         calculate_retrieval_metrics(qrels, &transformed_results, 10)
     }
 
-    /// Calculate retrieval-quality metrics (NDCG, Recall, MRR, Precision) at every rank cutoff `k`
-    /// in `1..=n`, where `n` is the largest number of results returned for any query. Computing the
-    /// full metric-vs-`k` curve requires no additional search — it is post-processing over the
-    /// already-ranked results. The `transform` function converts the search results into a format
-    /// suitable for evaluation. The returned map is keyed by `k` (ascending).
-    pub fn calculate_search_score_metrics_at_all_k<S, F>(
+    /// Evaluate retrieval quality (NDCG, Recall, MRR, Precision) for every judged query at every
+    /// rank cutoff `k` in `1..=n`, where `n` is the largest number of results returned for any
+    /// query. Computing the full metric-vs-`k` curve requires no additional search — it is
+    /// post-processing over the already-ranked results. The `transform` function converts the
+    /// search results into a format suitable for evaluation.
+    pub fn evaluate_search_results<S, F>(
         &self,
         qrels: &HashMap<String, HashMap<String, i32, S>, S>,
         transform: F,
-    ) -> Result<BTreeMap<usize, RetrievalMetrics>>
+    ) -> Result<RetrievalEvaluation>
     where
         S: ::std::hash::BuildHasher,
         F: Fn(&BTreeMap<String, SearchResult>) -> HashMap<String, HashMap<String, f64, S>, S>,
     {
         let transformed_results = transform(&self.state.search_results);
-        Ok(calculate_retrieval_metrics_at_all_k(
-            qrels,
-            &transformed_results,
-        ))
+        RetrievalEvaluation::up_to_longest_result_list(qrels, &transformed_results)
     }
 }
 

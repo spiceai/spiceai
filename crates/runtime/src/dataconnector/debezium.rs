@@ -466,6 +466,7 @@ impl DataConnector for Debezium {
                 // the first rebalance callback after `subscribe` seeks before any
                 // messages are delivered.
                 let kafka_consumer = KafkaConsumer::create_with_existing_group_id(
+                    &dataset_name,
                     &metadata.consumer_group_id,
                     &self.kafka_config,
                     &metadata.offsets,
@@ -515,7 +516,7 @@ impl DataConnector for Debezium {
                 || matches!(acceleration.engine.to_unpartitioned(), Engine::Arrow),
             super::InvalidConfigurationNoSourceSnafu {
                 dataconnector: "debezium",
-                message: "The Debezium data connector requires Kafka message keys for accelerators other than Arrow. Configure a primary key or message.key.columns in Debezium, or use the Arrow acceleration engine for full-row CDC matching with full before images for keyless updates and deletes. For details, visit: https://spiceai.org/docs/components/data-connectors/debezium",
+                message: keyless_messages_message(),
                 connector_component: ConnectorComponent::from(dataset),
             }
         );
@@ -708,6 +709,7 @@ async fn get_metadata_from_kafka(
             SCHEMA_INFERENCE_TIMEOUT
         };
         let fetch_result = KafkaConsumer::fetch_latest_message::<ChangeEventKey, ChangeEvent>(
+            &dataset.name.to_string(),
             topic,
             kafka_config,
             peek_timeout,
@@ -827,6 +829,7 @@ async fn fetch_latest_change_event(
     let dataset_name = dataset.name.to_string();
 
     match KafkaConsumer::fetch_latest_message::<ChangeEventKey, ChangeEvent>(
+        &dataset.name.to_string(),
         topic,
         kafka_config,
         SCHEMA_INFERENCE_TIMEOUT,
@@ -917,6 +920,7 @@ async fn refresh_schema_if_evolved(
 
     // Try to peek at the latest Kafka message for the current schema
     let peek_result = KafkaConsumer::fetch_latest_message::<ChangeEventKey, ChangeEvent>(
+        &dataset.name.to_string(),
         topic,
         kafka_config,
         SCHEMA_INFERENCE_TIMEOUT,
@@ -1107,4 +1111,22 @@ fn primary_keys_from_acceleration(dataset: &DatasetSpec) -> Vec<String> {
         .and_then(|a| a.primary_key.as_ref())
         .map(|pk| pk.iter().map(ToString::to_string).collect())
         .unwrap_or_default()
+}
+
+/// The configuration error for a topic whose messages carry no Kafka key, on an
+/// acceleration that needs one. It names the fix at the source rather than the
+/// `arrow` engine, the only one that accepts keyless messages, which is deprecated.
+fn keyless_messages_message() -> String {
+    "The Debezium messages for this dataset carry no Kafka message key, so updates and deletes cannot be applied to its acceleration. Give the source table a primary key, or set `message.key.columns` in the Debezium connector, so that each message carries a key. For details, visit: https://spiceai.org/docs/components/data-connectors/debezium".to_string()
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn the_keyless_error_names_the_fix_at_the_source_not_a_deprecated_engine() {
+        assert_eq!(
+            super::keyless_messages_message(),
+            "The Debezium messages for this dataset carry no Kafka message key, so updates and deletes cannot be applied to its acceleration. Give the source table a primary key, or set `message.key.columns` in the Debezium connector, so that each message carries a key. For details, visit: https://spiceai.org/docs/components/data-connectors/debezium"
+        );
+    }
 }

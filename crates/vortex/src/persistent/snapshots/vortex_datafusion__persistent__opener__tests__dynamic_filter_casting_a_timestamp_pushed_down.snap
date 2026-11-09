@@ -1,0 +1,9 @@
+---
+source: crates/vortex/src/persistent/opener.rs
+expression: "pretty_format_batches_with_options(&batches, &format_options)?.to_string()"
+---
++----------------------+
+| ts                   |
++----------------------+
+| 1970-01-01T00:00:03Z |
++----------------------+

@@ -15,7 +15,7 @@ limitations under the License.
 */
 
 use arrow_schema::ArrowError;
-use datafusion::sql::TableReference;
+use datafusion::common::TableReference;
 use itertools::Itertools;
 use search::aggregation;
 use snafu::prelude::*;
@@ -85,6 +85,11 @@ pub enum Error {
 
     #[snafu(display("Invalid WHERE condition: {where_cond}"))]
     InvalidWhereCondition { where_cond: String },
+
+    #[snafu(display("Invalid WHERE condition: {}", source.message()))]
+    WhereConditionTooDeep {
+        source: datafusion::error::DataFusionError,
+    },
 
     #[snafu(display(
         "An invalid search keyword was specified: '{keyword}'. Verify the keyword and try again."

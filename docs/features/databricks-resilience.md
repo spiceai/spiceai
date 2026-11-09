@@ -73,8 +73,9 @@ The connector checks each table's type against Unity Catalog metadata before att
 | `EXTERNAL`          | Yes       | Tables with external storage locations |
 | `FOREIGN`           | Yes       | Lakehouse Federation foreign tables    |
 | `MATERIALIZED_VIEW` | Yes       | Materialized views                     |
-| `VIEW`              | No        | Skipped with a debug log               |
-| `STREAMING_TABLE`   | No        | Skipped with a debug log               |
+| `VIEW`              | Yes       | Queried on the warehouse or cluster; has no storage location, so fails in `delta_lake` mode |
+| `STREAMING_TABLE`   | Yes       | Queried on the warehouse or cluster; has no storage location, so fails in `delta_lake` mode |
+| Other (e.g. `METRIC_VIEW`) | No | Skipped with a debug log              |
 
 Unsupported table types are:
 

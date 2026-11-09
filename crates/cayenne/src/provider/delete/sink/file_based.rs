@@ -40,7 +40,6 @@ use async_trait::async_trait;
 use data_components::delete::DeletionSink;
 use datafusion::datasource::listing::ListingTable;
 use datafusion::execution::TaskContext;
-use datafusion::execution::config::SessionConfig;
 use datafusion::execution::context::SessionContext;
 use datafusion::execution::runtime_env::RuntimeEnv;
 use datafusion_catalog::TableProvider;
@@ -91,9 +90,6 @@ struct DeletionCheckScanResult {
 pub struct FileBasedDeletionSink {
     /// Main listing table to enumerate files and collect per-file statistics.
     listing_table: Arc<ArcSwap<ListingTable>>,
-    /// Protected snapshot listing tables keyed by snapshot ID (PK-based strategies only).
-    /// `None` for position-based tables.
-    protected_snapshot_tables: Option<Vec<(String, Arc<ListingTable>)>>,
     /// The retention filter expression (e.g., `event_time < literal`).
     filter: Expr,
     /// Table name for logging.
@@ -131,8 +127,6 @@ impl FileBasedDeletionSink {
     /// # Arguments
     ///
     /// * `listing_table` - Main listing table for the current snapshot.
-    /// * `protected_snapshot_tables` - Protected snapshot listing tables keyed
-    ///   by snapshot ID. `None` for position-based tables.
     /// * `filter` - Retention filter expression.
     /// * `table_name` - Table name for logging.
     /// * `catalog` - Metadata catalog for clearing snapshot sequence records.
@@ -145,7 +139,6 @@ impl FileBasedDeletionSink {
     #[expect(clippy::too_many_arguments)]
     pub fn new(
         listing_table: Arc<ArcSwap<ListingTable>>,
-        protected_snapshot_tables: Option<Vec<(String, Arc<ListingTable>)>>,
         filter: Expr,
         table_name: String,
         catalog: Arc<dyn MetadataCatalog>,
@@ -159,7 +152,6 @@ impl FileBasedDeletionSink {
     ) -> Self {
         Self {
             listing_table,
-            protected_snapshot_tables,
             filter,
             table_name,
             catalog,
@@ -246,6 +238,12 @@ impl FileBasedDeletionSink {
         let mut retired_cache_paths = HashSet::new();
         let mut delete_error = None;
 
+        if !eligible_files.is_empty() {
+            // The write lock and listing fence keep new captures out until the
+            // deletion finishes. Reject cached views before unlinking any file.
+            self.provider.invalidate_scan_views_before_file_removal();
+        }
+
         for (meta, num_rows) in eligible_files {
             let row_count = num_rows.unwrap_or(0);
             let Ok(rows) = u64::try_from(row_count) else {
@@ -304,9 +302,11 @@ impl FileBasedDeletionSink {
         // file already removed by this partial batch releases its cached
         // segments immediately and cannot disappear from a later directory
         // listing before ever being invalidated.
+        let removed_files: Vec<_> = retired_cache_paths.iter().cloned().collect();
         self.provider
-            .invalidate_segment_cache_paths(retired_cache_paths)
+            .invalidate_retired_paths(retired_cache_paths)
             .await;
+        self.remove_manifest_rows(&removed_files).await;
         if let Some(error) = delete_error {
             return Err(error);
         }
@@ -318,6 +318,43 @@ impl FileBasedDeletionSink {
         );
 
         Ok(total_rows)
+    }
+
+    /// Drop the snapshot-manifest rows (`cayenne_snapshot_file`) of data files this
+    /// sink removed, so the manifest goes on naming only files their snapshot still
+    /// holds. Opening the table compares the manifest with the files on disk, and a
+    /// row left for a file retention removed would read as a file lost outside Spice.
+    ///
+    /// Each path ends `<snapshot_id>/<file name>`, the manifest's key. Best-effort,
+    /// like the rest of the post-delete cleanup: the files are already gone, and a
+    /// row left behind is dropped the next time the manifest is rebuilt from the
+    /// directory listing.
+    async fn remove_manifest_rows(&self, removed_files: &[object_store::path::Path]) {
+        let mut by_snapshot: HashMap<String, Vec<String>> = HashMap::new();
+        for path in removed_files {
+            let parts: Vec<_> = path.parts().collect();
+            let [.., snapshot_id, file_name] = parts.as_slice() else {
+                continue;
+            };
+            by_snapshot
+                .entry(snapshot_id.as_ref().to_string())
+                .or_default()
+                .push(file_name.as_ref().to_string());
+        }
+        for (snapshot_id, file_names) in by_snapshot {
+            if let Err(error) = self
+                .catalog
+                .remove_snapshot_files(&self.table_id, &snapshot_id, &file_names)
+                .await
+            {
+                tracing::warn!(
+                    table = %self.table_name,
+                    snapshot_id,
+                    %error,
+                    "Retention: failed to drop the snapshot-manifest rows of deleted files"
+                );
+            }
+        }
     }
 
     /// Internal implementation that returns structured deletion results
@@ -348,7 +385,7 @@ impl FileBasedDeletionSink {
         // Vortex footer/segment caches live inside the VortexFormat embedded in the
         // shared ListingTable and are unaffected by this SessionContext.
         let ctx = SessionContext::new_with_config_rt(
-            SessionConfig::default(),
+            util::session_state::session_config(),
             Arc::clone(&self.runtime_env),
         );
 
@@ -386,11 +423,24 @@ impl FileBasedDeletionSink {
             }
         }
 
-        // 2. Discover and delete eligible files from protected snapshot tables
+        // 2. Discover and delete eligible files from protected snapshot tables.
+        // Resolve listings here, inside `write_lock`, so a snapshot published
+        // after plan build is not invisible to this delete (#14217).
         let mut emptied_snapshot_ids = Vec::new();
+        let protected_snapshot_tables = if self.provider.is_position_based() {
+            None
+        } else {
+            Some(
+                self.provider
+                    .build_protected_snapshot_listing_tables()?
+                    .into_iter()
+                    .map(|(snapshot_id, _, table)| (snapshot_id, table))
+                    .collect::<Vec<_>>(),
+            )
+        };
 
         for (idx, (snapshot_id, snapshot_table)) in
-            self.protected_snapshot_tables.iter().flatten().enumerate()
+            protected_snapshot_tables.iter().flatten().enumerate()
         {
             let scan_result = self
                 .retention_eligible_files(&ctx, snapshot_table, &col_name, &threshold)
@@ -442,7 +492,17 @@ impl DeletionSink for FileBasedDeletionSink {
         _context: Arc<TaskContext>,
     ) -> Result<u64, Box<dyn std::error::Error + Send + Sync>> {
         // Acquire write lock to prevent racing with concurrent inserts or catalog refreshes.
-        let _write_guard = self.write_lock.lock().await;
+        let _write_guard = if crate::provider::write_lock_held::is_held() {
+            None
+        } else {
+            Some(self.write_lock.lock().await)
+        };
+        self.provider.ensure_publication_outcome_known()?;
+        // Materialize pending inline rows in THIS hold so retention sees the
+        // same files the later listing scan will delete (#14217).
+        self.provider
+            .checkpoint_inlined_data_if_present_for_delete()
+            .await?;
         // Acquire the listing fence in write mode so new scan plan-builds
         // cannot resolve a file listing while we are physically unlinking
         // files. In-flight scans that already released their read fence
@@ -482,9 +542,14 @@ impl FileBasedDeletionSink {
     /// Clean up protected snapshots that were fully emptied by file-based retention.
     ///
     /// For each emptied snapshot:
-    /// 1. Remove the snapshot sequence from the catalog.
-    /// 2. Remove the entry from the in-memory `protected_snapshots` map.
-    /// 3. Delete the now-empty snapshot directory from disk.
+    /// 1. Remove the snapshot sequence (roster row) from the catalog.
+    /// 2. Delete the snapshot's `cayenne_snapshot_file` manifest rows and its
+    ///    `cayenne_snapshot_file_statistics` stats-cache rows from the catalog.
+    ///    The append maintenance lane wrote these rows while the snapshot was
+    ///    live and populated; nothing else reconciles them once retention has
+    ///    physically removed the files, so skipping this leaks metastore rows.
+    /// 3. Remove the entry from the in-memory `protected_snapshots` map.
+    /// 4. Delete the now-empty snapshot directory from disk.
     ///
     /// Errors are logged as warnings but do not fail the overall delete operation
     /// — the data files are already removed, so cleanup is best-effort.
@@ -503,14 +568,29 @@ impl FileBasedDeletionSink {
                 continue;
             }
 
-            // 2. Remove from in-memory map (copy-on-write atomic publish)
+            // 2. Delete the snapshot's manifest rows and stats-cache rows so
+            //    they do not leak once retention has removed the physical files.
+            //    Best-effort: on failure warn and continue, the roster row is
+            //    already gone.
+            if let Err(e) = self
+                .catalog
+                .clear_snapshot_cached_metadata(&self.table_id, snapshot_id)
+                .await
+            {
+                tracing::warn!(
+                    "Failed to clear cached metadata for snapshot {snapshot_id} in table {}: {e}",
+                    self.table_name
+                );
+            }
+
+            // 3. Remove from in-memory map (copy-on-write atomic publish)
             self.protected_snapshots.rcu(|current| {
                 let mut new_map = (**current).clone();
                 new_map.remove(snapshot_id);
                 Arc::new(new_map)
             });
 
-            // 3. Delete the empty snapshot directory
+            // 4. Delete the empty snapshot directory
             let snapshot_dir = std::path::PathBuf::from(&self.table_path)
                 .join(&self.table_id)
                 .join(snapshot_id);

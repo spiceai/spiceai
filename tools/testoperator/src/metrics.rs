@@ -213,6 +213,47 @@ pub static SEARCH_PRECISION: LazyLock<Gauge<f64>> = LazyLock::new(|| {
         .build()
 });
 
+// Per-query search metrics. Separate measurement names keep the `query_id` points out of the
+// run-level `score`/`search_*` series, which dashboards read without a `query_id` filter.
+
+pub static SEARCH_QUERY_NDCG: LazyLock<Gauge<f64>> = LazyLock::new(|| {
+    meter()
+        .f64_gauge("search_query_ndcg")
+        .with_description("NDCG@k of one search query.")
+        .with_unit("ratio")
+        .build()
+});
+
+pub static SEARCH_QUERY_RECALL: LazyLock<Gauge<f64>> = LazyLock::new(|| {
+    meter()
+        .f64_gauge("search_query_recall")
+        .with_description(
+            "Recall@k of one search query: fraction of its relevant documents in the top k results.",
+        )
+        .with_unit("ratio")
+        .build()
+});
+
+pub static SEARCH_QUERY_RECIPROCAL_RANK: LazyLock<Gauge<f64>> = LazyLock::new(|| {
+    meter()
+        .f64_gauge("search_query_reciprocal_rank")
+        .with_description(
+            "Reciprocal rank@k of one search query: 1 / rank of its first relevant result.",
+        )
+        .with_unit("ratio")
+        .build()
+});
+
+pub static SEARCH_QUERY_PRECISION: LazyLock<Gauge<f64>> = LazyLock::new(|| {
+    meter()
+        .f64_gauge("search_query_precision")
+        .with_description(
+            "Precision@k of one search query: fraction of its top k results that are relevant.",
+        )
+        .with_unit("ratio")
+        .build()
+});
+
 // Text to Sql specific metrics
 // Aggregate Text to Sql specific metrics (run-level)
 pub static TEXT_TO_SQL_EXACT_MATCH_RATE: LazyLock<Gauge<f64>> = LazyLock::new(|| {

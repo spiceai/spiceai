@@ -21,6 +21,10 @@ on:
       # Self-referencing so an edit to this file is exercised by the gate it
       # defines, rather than only when one of the paths above also changes.
       - '.github/workflows/nextest_config_check.yml'
+      # Read by the guard's step-budget check (STEP_BUDGETS in
+      # check_nextest_config.py): a change to a step's timeout-minutes alone
+      # has to run the guard too.
+      - '.github/workflows/integration.yml'
   push:
     branches:
       - trunk
@@ -31,6 +35,10 @@ on:
       # Self-referencing so an edit to this file is exercised by the gate it
       # defines, rather than only when one of the paths above also changes.
       - '.github/workflows/nextest_config_check.yml'
+      # Read by the guard's step-budget check (STEP_BUDGETS in
+      # check_nextest_config.py): a change to a step's timeout-minutes alone
+      # has to run the guard too.
+      - '.github/workflows/integration.yml'
   workflow_dispatch:
 
 concurrency:
@@ -39,6 +47,7 @@ concurrency:
 
 jobs:
   check-nextest-config:
+    environment: secret-free
     name: Validate nextest timeout ceilings
     # GitHub-hosted on purpose: this is a sub-second check and must not queue
     # behind the saturated self-hosted pool.
@@ -51,7 +60,7 @@ jobs:
 
       # 3.11 for `tomllib` in the standard library — this check needs no pip deps.
       - name: Set up Python
-        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
         with:
           python-version: '3.11'
 

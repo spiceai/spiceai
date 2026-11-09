@@ -22,9 +22,12 @@ pub mod chat;
 pub mod config;
 pub mod databricks;
 pub mod embeddings;
+pub mod evaluate;
 pub mod google;
+pub mod hf;
 #[cfg(feature = "local_embed")]
 pub mod model2vec;
+mod model_info;
 pub mod openai;
 pub mod progress;
 pub mod provider;
@@ -32,7 +35,15 @@ pub mod rerank;
 pub mod responses;
 pub mod spiceai;
 pub mod streaming_utils;
+pub mod typesafe;
+pub mod workload_identity;
 pub mod xai;
+
+// Engine crates register through `register_local_chat_engine!`, which names `linkme` through
+// this crate so they need no `linkme` dependency of their own.
+#[cfg(feature = "local_llm")]
+#[doc(hidden)]
+pub use linkme;
 
 pub enum HealthCheck {
     Required,

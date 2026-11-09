@@ -1,0 +1,7 @@
+{
+  "tenant_id": "north",
+  "paid_orders": 4,
+  "gross_cents": 22200,
+  "currency": "USD",
+  "definition": "paid-gross-v1"
+}

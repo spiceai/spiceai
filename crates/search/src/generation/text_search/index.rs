@@ -34,12 +34,14 @@ use tantivy::schema::{
     TextOptions, Type,
 };
 use tantivy::{TantivyDocument, TantivyError};
-use tantivy_datafusion_filter::{array_to_terms, is_tokenized, text_tokenizer};
+use tantivy_datafusion_filter::{
+    array_to_terms, is_tokenized, set_document_values, text_tokenizer,
+};
 use tokio::sync::Mutex;
 
 use crate::aggregation::write_to_json_string;
 use crate::generation::text_search::query::FullTextSearchQuery;
-use crate::generation::text_search::util::with_json_subset_column;
+use crate::generation::text_search::util::{with_json_subset_column, without_columns};
 use crate::generation::text_search::{
     FailedToInsertDataIntoIndexSnafu, FullTextSearchFieldIndex, IndexCreationSnafu,
     InvalidIndexingSnafu, PersistedIndexColumnChangedSnafu, PersistedIndexMissingColumnsSnafu,
@@ -56,6 +58,17 @@ pub static INDEX_UNIQUE_FIELD_NAME: &str = "__spice.unique_field";
 
 /// Tantivy's built-in English Snowball-stemmed tokenizer.
 static EN_STEM_TOKENIZER_NAME: &str = "en_stem";
+
+/// Whether primary-key deletion needs the derived `INDEX_UNIQUE_FIELD_NAME` addressing field
+/// rather than an exact-match term on the primary key column(s) directly.
+///
+/// This is true whenever a primary key column's own tantivy field is tokenized: a single
+/// primary key column that also appears in `search_fields` is indexed as `TEXT`, not `STRING`
+/// (see `create_tantivy_schema`), so a delete term built from its raw, untokenized value would
+/// never match the tokenized postings actually written for it.
+fn needs_unique_field(primary_key: &[String], search_fields: &[String]) -> bool {
+    primary_key.len() > 1 || primary_key.iter().any(|p| search_fields.contains(p))
+}
 
 /// A [`TextOptions`] for [`tantivy::schema::TEXT`] with [`EN_STEM_TOKENIZER_NAME`] tokenization.
 fn tokenized_text_options() -> TextOptions {
@@ -280,6 +293,13 @@ impl Index for FullTextDatabaseIndex {
         true
     }
 
+    fn requires_rebuild(&self) -> bool {
+        // An in-memory index starts every process empty, and a file-backed one is empty when
+        // its directory was not carried over. Either way it holds none of the accelerator's
+        // rows until they are replayed through `compute_index` (#14618).
+        self.reader.searcher().num_docs() == 0
+    }
+
     async fn on_write_start(&self, window: WriteWindow) -> Result<(), DataFusionError> {
         // A stream-attached index never defers: its change/append stream calls
         // `compute_index` outside this lifecycle, and the shared writer cannot commit one
@@ -290,7 +310,12 @@ impl Index for FullTextDatabaseIndex {
         // length of the refresh, and would discard stream documents staged alongside it.
         // A stream-attached index is told about deletions explicitly by its stream, so it does
         // not depend on the replace-window clear to drop rows the source removed.
-        if self.stream_attached.load(Ordering::Acquire) {
+        //
+        // A `Rebuild` window is the exception: it runs before any stream attaches, so nothing
+        // else stages into the writer while it is open. Deferring it is what keeps a replay
+        // that fails part-way from committing a partial index that `requires_rebuild` would
+        // then report as complete.
+        if self.stream_attached.load(Ordering::Acquire) && window != WriteWindow::Rebuild {
             return Ok(());
         }
 
@@ -487,7 +512,7 @@ impl FullTextDatabaseIndex {
         search_field: &str,
     ) -> Result<FullTextSearchFieldIndex, super::Error> {
         let mut search_index = FullTextSearchFieldIndex::try_new(
-            self.reader.searcher(),
+            self.reader.clone(),
             search_field.to_string(),
             self.primary_key.clone(),
         )?;
@@ -496,7 +521,8 @@ impl FullTextDatabaseIndex {
     }
 
     /// Given a [`RecordBatch`] of new data, find all [`Term`]s we need to delete. These terms are
-    /// an exact match on either a primary key (if one primary key column), or `INDEX_UNIQUE_FIELD_NAME`.
+    /// an exact match on either a primary key (if one untokenized primary key column), or
+    /// `INDEX_UNIQUE_FIELD_NAME`.
     fn existing_terms_to_delete(
         &self,
         index_schema: &tantivy::schema::Schema,
@@ -507,24 +533,26 @@ impl FullTextDatabaseIndex {
             return Ok(vec![]);
         };
 
-        let (pk_field, pk) = if self.primary_key.len() == 1 {
+        let (pk_field, pk) = if needs_unique_field(&self.primary_key, &self.search_fields) {
+            // Either multiple primary key columns, or the single primary key column is also a
+            // tokenized search field: neither can be addressed with an exact-match term, so
+            // tantivy::Index has derived field `INDEX_UNIQUE_FIELD_NAME` instead.
+            let Some((pk_field, _)) = index_schema.find_field(INDEX_UNIQUE_FIELD_NAME) else {
+                return Err(super::Error::InvalidIndexingError {
+                    source: Box::from(TantivyError::FieldNotFound(pk.clone())),
+                    context: format!(
+                        "Full text search requires the column '{INDEX_UNIQUE_FIELD_NAME}' for this primary key configuration, but is not present.",
+                    ),
+                });
+            };
+            (pk_field, INDEX_UNIQUE_FIELD_NAME.to_string())
+        } else {
             let Some((pk_field, _)) = index_schema.find_field(pk.as_str()) else {
                 return Err(super::Error::FailedToRetrieveDataFromIndex {
                     source: TantivyError::FieldNotFound(pk.clone()),
                 });
             };
             (pk_field, pk.clone())
-        } else {
-            // Primary key has multiple columns. Therefore tantivy::Index has derived field `INDEX_UNIQUE_FIELD_NAME`.
-            let Some((pk_field, _)) = index_schema.find_field(INDEX_UNIQUE_FIELD_NAME) else {
-                return Err(super::Error::InvalidIndexingError {
-                    source: Box::from(TantivyError::FieldNotFound(pk.clone())),
-                    context: format!(
-                        "Full text search has multiple primary key columns, so the column '{INDEX_UNIQUE_FIELD_NAME}' should be present, but is not.",
-                    ),
-                });
-            };
-            (pk_field, INDEX_UNIQUE_FIELD_NAME.to_string())
         };
 
         Ok(rb
@@ -543,10 +571,13 @@ impl FullTextDatabaseIndex {
     /// Update the underlying [`tantivy::Index`] with new data from [`RecordBatch`]s. Additional
     /// columns present will be ignored.
     ///
-    /// If there is a multi-column primary key (as specified by [`Self::primary_key`]), an additional column is used in the [`tantivy::Index`] for unique lookup (required since updates = deletion -> insertion).
+    /// If there is a multi-column primary key, or a single primary key column that is also a
+    /// tokenized search field (as specified by [`Self::primary_key`] and [`Self::search_fields`]),
+    /// an additional column is used in the [`tantivy::Index`] for unique lookup (required since
+    /// updates = deletion -> insertion).
     async fn update_index(&self, rb: &[RecordBatch]) -> Result<(), super::Error> {
         // Construct column for `INDEX_UNIQUE_FIELD_NAME` if needed.
-        let rb = if self.primary_key.len() > 1 {
+        let rb = if needs_unique_field(&self.primary_key, &self.search_fields) {
             rb.iter()
                 .map(|r| with_json_subset_column(r, &self.primary_key, INDEX_UNIQUE_FIELD_NAME))
                 .collect::<Result<Vec<RecordBatch>, _>>()
@@ -561,20 +592,51 @@ impl FullTextDatabaseIndex {
         // Prepare documents to insert/delete with read lock.
         let index_schema = self.reader.searcher().schema().clone();
         let terms_to_delete = self.existing_terms_to_delete(&index_schema, &rb)?;
+
         // Convert to tantivy documents one record batch at a time. Encoding all
         // batches into a single JSON string and parsing it into one Vec<Map> held
         // the whole document set in memory three times over (JSON string + maps +
         // documents); decoding per batch bounds the intermediate footprint to a
         // single batch while the documents accumulate.
+        //
+        // Primary-key columns are excluded from this JSON pipeline and set directly
+        // on the parsed documents afterwards, through the same encoding used to build
+        // `terms_to_delete` above. Arrow-json's JSON representation for Float32/Float16,
+        // Binary, and view types does not always parse back through tantivy's JSON
+        // deserializer into the same value `array_to_terms` produces for the delete
+        // term, so an update on those types could delete nothing (stale duplicate) or
+        // fail to parse at all (#12235).
         let mut docs = Vec::new();
         for batch in &rb {
-            let doc_json =
-                write_to_json_string(slice::from_ref(batch)).context(InvalidIndexingSnafu {
+            let non_pk_batch = without_columns(batch, &self.primary_key).map_err(|e| {
+                super::Error::FailedToRetrieveDataFromSource {
+                    source: DataFusionError::ArrowError(Box::new(e), None),
+                }
+            })?;
+            let doc_json = write_to_json_string(slice::from_ref(&non_pk_batch)).context(
+                InvalidIndexingSnafu {
                     context: "Failed to write data to intermediate JSON string for indexing"
                         .to_string(),
-                })?;
+                },
+            )?;
             let mut batch_docs = parse_json_array(&index_schema, doc_json.as_str())
                 .context(FailedToInsertDataIntoIndexSnafu)?;
+
+            for pk in &self.primary_key {
+                let Some((pk_field, _)) = index_schema.find_field(pk.as_str()) else {
+                    return Err(super::Error::FailedToRetrieveDataFromIndex {
+                        source: TantivyError::FieldNotFound(pk.clone()),
+                    });
+                };
+                if let Some(arr) = batch.column_by_name(pk.as_str()) {
+                    set_document_values(pk_field, arr, &mut batch_docs).map_err(|e| {
+                        super::Error::FailedToRetrieveDataFromSource {
+                            source: DataFusionError::ArrowError(Box::new(e), None),
+                        }
+                    })?;
+                }
+            }
+
             docs.append(&mut batch_docs);
         }
 
@@ -640,7 +702,7 @@ impl FullTextDatabaseIndex {
     /// Deletes every document whose primary key matches a row of `keys` — the tantivy
     /// counterpart of `update_index`'s delete-then-insert, minus the insert.
     async fn delete_terms_for(&self, keys: &RecordBatch) -> Result<(), super::Error> {
-        let rb = if self.primary_key.len() > 1 {
+        let rb = if needs_unique_field(&self.primary_key, &self.search_fields) {
             vec![with_json_subset_column(
                 keys,
                 &self.primary_key,
@@ -842,7 +904,7 @@ impl FullTextDatabaseIndex {
         }
 
         // If we need `INDEX_UNIQUE_FIELD_NAME`, add to schema.
-        if primary_key.len() > 1 {
+        if needs_unique_field(primary_key, search_fields) {
             schema_builder.add_text_field(INDEX_UNIQUE_FIELD_NAME, tantivy::schema::STRING);
         }
 
@@ -1071,6 +1133,117 @@ mod tests {
             false,
         )
         .expect("Failed to create FullTextDatabaseIndex")
+    }
+
+    /// Regression test for #14618: an index holding no documents asks to be rebuilt from its
+    /// accelerator, and stops asking once it holds them.
+    #[tokio::test]
+    async fn an_index_requires_a_rebuild_only_while_it_holds_no_documents() {
+        let index = new_test_index();
+        assert!(
+            index.requires_rebuild(),
+            "a new in-memory index holds none of the accelerator's rows"
+        );
+
+        index
+            .compute_index(vec![batch(&[1, 2], &["alpha", "beta"])])
+            .await
+            .expect("failed to compute_index");
+        index.reader.reload().expect("failed to reload the reader");
+
+        assert!(
+            !index.requires_rebuild(),
+            "an index that holds documents must not be replayed into again"
+        );
+    }
+
+    /// A file-backed index reopened from a surviving directory already holds its documents,
+    /// so a warm restart must not replay the accelerator into it.
+    #[tokio::test]
+    async fn a_reopened_file_index_does_not_require_a_rebuild() {
+        let dir = tempfile::tempdir().expect("failed to create a temp dir");
+        let open = || {
+            FullTextDatabaseIndex::try_new(
+                create_test_table(),
+                vec!["content".to_string()],
+                Some(vec!["id".to_string()]),
+                Some(dir.path().to_path_buf()),
+                &["content".to_string()],
+                false,
+            )
+            .expect("Failed to create FullTextDatabaseIndex")
+        };
+
+        let first = open();
+        assert!(first.requires_rebuild(), "a new index directory is empty");
+        first
+            .compute_index(vec![batch(&[1], &["alpha"])])
+            .await
+            .expect("failed to compute_index");
+        drop(first);
+
+        assert!(
+            !open().requires_rebuild(),
+            "the reopened index already holds the committed document"
+        );
+    }
+
+    /// A stream-attached index commits every write as it arrives, except inside a rebuild
+    /// window: a startup replay that fails part-way must leave a file-backed index empty, so
+    /// the next startup still sees it needs a rebuild instead of trusting a partial one.
+    #[tokio::test]
+    async fn a_failed_rebuild_of_a_stream_attached_index_commits_nothing() {
+        let dir = tempfile::tempdir().expect("failed to create a temp dir");
+        let open = || {
+            FullTextDatabaseIndex::try_new(
+                create_test_table(),
+                vec!["content".to_string()],
+                Some(vec!["id".to_string()]),
+                Some(dir.path().to_path_buf()),
+                &["content".to_string()],
+                true,
+            )
+            .expect("Failed to create FullTextDatabaseIndex")
+        };
+
+        let first = open();
+        first
+            .on_write_start(WriteWindow::Rebuild)
+            .await
+            .expect("on_write_start failed");
+        first
+            .compute_index(vec![batch(&[1], &["alpha"])])
+            .await
+            .expect("failed to compute_index");
+        // A later batch of the replay fails, so the window is rolled back.
+        first
+            .on_write_failed()
+            .await
+            .expect("on_write_failed failed");
+        drop(first);
+
+        let reopened = open();
+        assert!(
+            reopened.requires_rebuild(),
+            "the batch staged before the failure must not have been committed"
+        );
+
+        reopened
+            .on_write_start(WriteWindow::Rebuild)
+            .await
+            .expect("on_write_start failed");
+        reopened
+            .compute_index(vec![batch(&[1, 2], &["alpha", "beta"])])
+            .await
+            .expect("failed to compute_index");
+        reopened
+            .on_write_complete()
+            .await
+            .expect("on_write_complete failed");
+        assert!(
+            !reopened.requires_rebuild(),
+            "a completed rebuild window commits the replayed documents"
+        );
     }
 
     const EXPUNGE_FIXTURE_IDS: [i32; 8] = [1, 2, 3, 4, 5, 6, 7, 8];
@@ -1760,6 +1933,52 @@ mod tests {
         }
     }
 
+    /// When a single-column primary key is also configured as a search field, its tantivy
+    /// field is tokenized (see `create_tantivy_schema`), so a delete term built from its raw,
+    /// untokenized value would never match the tokenized postings actually indexed. An update
+    /// on that primary key must still delete the superseded document rather than leave a
+    /// stale duplicate behind.
+    #[tokio::test]
+    async fn test_updates_overwrite_when_primary_key_is_also_a_tokenized_search_field() {
+        let pk_value = "hello world";
+        let batch =
+            record_batch!(("title", Utf8, [pk_value])).expect("Failed to create test batch");
+
+        let index = FullTextDatabaseIndex::try_new(
+            Arc::new(
+                MemTable::try_new(batch.schema(), vec![vec![batch.clone()]])
+                    .expect("Failed to create test table"),
+            ),
+            vec!["title".to_string()],
+            Some(vec!["title".to_string()]),
+            None,
+            &[],
+            false,
+        )
+        .expect("Failed to create FullTextDatabaseIndex");
+
+        index
+            .compute_index(vec![batch.clone()])
+            .await
+            .expect("failed to compute_index");
+        assert_eq!(bm25_collection_size(&index), 1);
+
+        // Re-index the exact same primary key value. This is a delete-then-insert of the
+        // same row: if the delete term fails to match the tokenized postings, the old
+        // document lingers as a stale duplicate alongside the new one.
+        index
+            .compute_index(vec![batch])
+            .await
+            .expect("failed to compute_index");
+        wait_for_superseded_docs_expunged(&index).await;
+
+        assert_eq!(
+            bm25_collection_size(&index),
+            1,
+            "updating a tokenized primary key should replace the document, not duplicate it"
+        );
+    }
+
     /// A segment big enough to sit alone at its size level still has to be rewritten once
     /// most of its documents have been superseded. Otherwise tantivy keeps counting those
     /// documents in BM25's collection size and the index scores every query against rows
@@ -2095,8 +2314,7 @@ mod tests {
             .await
             .expect("on_write_complete failed");
 
-        // A `FullTextSearchFieldIndex` snapshots the searcher when it is built, so the
-        // post-commit revision needs a freshly built one.
+        // Each search takes a searcher at the latest commit, so the clear is now visible.
         {
             let search_index = index
                 .full_text_search_field_index("content")
@@ -2442,16 +2660,18 @@ mod tests {
                 .expect("failed to create the index"),
         );
 
-        // Configuring `title` as a search column asks for it tokenized instead, so the terms
-        // the persisted index holds for it are no longer the ones a delete would address.
+        // Configuring `title` as a search column asks for it tokenized instead, which also
+        // requires the derived `INDEX_UNIQUE_FIELD_NAME` addressing column (see
+        // `needs_unique_field`) that the persisted index — built before `title` became a
+        // search column — does not have.
         let error = file_backed_index(directory.path(), &["content", "title"], &["title"])
             .expect_err(
                 "a persisted index whose primary key is indexed differently must be rejected",
             );
         let message = error.to_string();
         assert!(
-            message.contains("(untokenized)") && message.contains("(tokenized)"),
-            "the error must say how the column's indexing changed, got: {message}"
+            message.contains(INDEX_UNIQUE_FIELD_NAME),
+            "the error must name the missing addressing column, got: {message}"
         );
         assert!(
             error.is_user_error(),

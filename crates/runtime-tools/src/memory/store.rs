@@ -24,6 +24,7 @@ use snafu::ResultExt;
 use std::{borrow::Cow, sync::Arc};
 use tracing_futures::Instrument;
 
+use crate::builtin::function_tool::current_principal_requires_read_only;
 use crate::utils::parameters;
 use app::App;
 use tokio::sync::RwLock;
@@ -131,8 +132,15 @@ impl SpiceModelTool for StoreMemoryTool {
 
     async fn call(&self, arg: &str) -> Result<Value, Box<dyn std::error::Error + Send + Sync>> {
         let span = tracing::span!(target: "task_history", tracing::Level::INFO, "tool_use::store_memory", tool = self.name().to_string(), input = arg);
-        let table_name = memory_table_name(&self.app).await?;
         let result: Result<Value, Box<dyn std::error::Error + Send + Sync>> = async {
+            // Auth gate before table lookup so RO rejection does not depend on app
+            // wiring and is covered by unit tests without a live memory dataset.
+            // Inside this future so `task_history` records a refusal as an error,
+            // like every other failure below.
+            if current_principal_requires_read_only().await {
+                return Err("Failed to store memories: the API key on this request does not allow write access. Retry with a read-write API key (a `runtime.auth.api-key.keys` entry ending in `:rw`). See https://spiceai.org/docs/api/auth".into());
+            }
+            let table_name = memory_table_name(&self.app).await?;
             let params: StoreMemoryParams = serde_json::from_str(arg).boxed()?;
             validate_store_memory_params(&params)?;
 
@@ -166,8 +174,28 @@ impl SpiceModelTool for StoreMemoryTool {
 mod tests {
     use super::{
         MAX_MEMORY_THOUGHT_BYTES, MAX_MEMORY_THOUGHTS_PER_REQUEST, MAX_MEMORY_TOTAL_BYTES,
-        StoreMemoryParams, validate_store_memory_params,
+        StoreMemoryParams, StoreMemoryTool, validate_store_memory_params,
     };
+    use app::AppBuilder;
+    use arrow::record_batch::RecordBatch;
+    use arrow_schema::Schema;
+    use async_trait::async_trait;
+    use datafusion::common::TableReference;
+    use datafusion::datasource::TableProvider;
+    use datafusion::execution::SendableRecordBatchStream;
+    use datafusion::logical_expr::LogicalPlan;
+    use datafusion::prelude::SessionContext;
+    use runtime_auth::{AuthPrincipalRef, AuthRequestContext};
+    use runtime_query_engine::query_engine::{
+        QueryEngine, QueryRequest, Result as QueryEngineResult, UpdateType,
+    };
+    use runtime_request_context::{Protocol, RequestContext as SpiceRequestContext};
+    use spicepod::component::dataset::Dataset;
+    use spicepod::component::runtime::ApiKey;
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::{Arc, Mutex};
+    use tokio::sync::RwLock;
+    use tools::SpiceModelTool;
 
     #[test]
     fn test_store_memory_rejects_empty_thoughts() {
@@ -217,6 +245,241 @@ mod tests {
         assert!(
             err.to_string()
                 .contains(&MAX_MEMORY_TOTAL_BYTES.to_string())
+        );
+    }
+
+    /// Records `write_data` calls so principal gating can be asserted on the
+    /// real [`StoreMemoryTool`] path (not a duplicated predicate).
+    struct RecordingQueryEngine {
+        session: Arc<SessionContext>,
+        write_calls: AtomicU64,
+        batches_written: Mutex<Vec<RecordBatch>>,
+    }
+
+    impl std::fmt::Debug for RecordingQueryEngine {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.debug_struct("RecordingQueryEngine")
+                .field("write_calls", &self.write_calls.load(Ordering::SeqCst))
+                .finish_non_exhaustive()
+        }
+    }
+
+    impl RecordingQueryEngine {
+        fn new() -> Self {
+            Self {
+                session: Arc::new(SessionContext::new()),
+                write_calls: AtomicU64::new(0),
+                batches_written: Mutex::new(Vec::new()),
+            }
+        }
+
+        fn write_calls(&self) -> u64 {
+            self.write_calls.load(Ordering::SeqCst)
+        }
+    }
+
+    #[async_trait]
+    impl QueryEngine for RecordingQueryEngine {
+        fn session_context(&self) -> &Arc<SessionContext> {
+            &self.session
+        }
+
+        async fn get_table(&self, _table_ref: &TableReference) -> Option<Arc<dyn TableProvider>> {
+            None
+        }
+
+        fn get_table_sync(&self, _table_ref: &TableReference) -> Option<Arc<dyn TableProvider>> {
+            None
+        }
+
+        fn table_exists(&self, _table_ref: &TableReference) -> bool {
+            true
+        }
+
+        async fn get_arrow_schema(&self, _table_ref: TableReference) -> QueryEngineResult<Schema> {
+            Ok(Schema::empty())
+        }
+
+        fn get_user_table_names(&self) -> Vec<TableReference> {
+            Vec::new()
+        }
+
+        fn get_public_table_names(&self) -> QueryEngineResult<Vec<String>> {
+            Ok(Vec::new())
+        }
+
+        fn is_writable(&self, _table_ref: &TableReference) -> bool {
+            true
+        }
+
+        fn is_path_catalog_writable(&self, _table_ref: &TableReference) -> bool {
+            true
+        }
+
+        async fn execute_query(
+            &self,
+            _request: QueryRequest,
+        ) -> QueryEngineResult<SendableRecordBatchStream> {
+            unimplemented!("store_memory principal tests do not execute queries")
+        }
+
+        async fn execute_plan(
+            &self,
+            _plan: LogicalPlan,
+        ) -> QueryEngineResult<SendableRecordBatchStream> {
+            unimplemented!("store_memory principal tests do not execute plans")
+        }
+
+        async fn write_data(
+            &self,
+            _table_ref: &TableReference,
+            _schema: Arc<Schema>,
+            data: Vec<RecordBatch>,
+            _update_type: UpdateType,
+        ) -> QueryEngineResult<()> {
+            self.write_calls.fetch_add(1, Ordering::SeqCst);
+            self.batches_written
+                .lock()
+                .expect("batches lock")
+                .extend(data);
+            Ok(())
+        }
+    }
+
+    fn spice_ctx_with_api_key(key: &str) -> Arc<SpiceRequestContext> {
+        let ctx = Arc::new(SpiceRequestContext::builder(Protocol::Http).build());
+        let principal: AuthPrincipalRef = Arc::new(ApiKey::parse_str(key));
+        ctx.set_auth_principal(principal)
+            .expect("set_auth_principal");
+        ctx
+    }
+
+    fn store_memory_tool(engine: Arc<RecordingQueryEngine>) -> StoreMemoryTool {
+        let app = Arc::new(
+            AppBuilder::new("store_memory_auth_test")
+                .with_dataset(Dataset::new("memory:memories", "memories"))
+                .build(),
+        );
+        StoreMemoryTool::new(
+            engine as Arc<dyn QueryEngine>,
+            Arc::new(RwLock::new(Some(app))),
+            None,
+            None,
+        )
+    }
+
+    #[tokio::test]
+    async fn store_memory_rejects_read_only_principal() {
+        let engine = Arc::new(RecordingQueryEngine::new());
+        let tool = store_memory_tool(Arc::clone(&engine));
+        let ctx = spice_ctx_with_api_key("topsecret123");
+        let err = ctx
+            .scope(async {
+                tool.call(r#"{"thoughts":["remember this"]}"#)
+                    .await
+                    .expect_err("RO principal must reject store_memory")
+            })
+            .await;
+        assert_eq!(
+            err.to_string(),
+            "Failed to store memories: the API key on this request does not allow write access. Retry with a read-write API key (a `runtime.auth.api-key.keys` entry ending in `:rw`). See https://spiceai.org/docs/api/auth"
+        );
+        assert_eq!(
+            engine.write_calls(),
+            0,
+            "RO principal must not reach write_data"
+        );
+    }
+
+    #[tokio::test]
+    async fn store_memory_allows_read_write_principal() {
+        let engine = Arc::new(RecordingQueryEngine::new());
+        let tool = store_memory_tool(Arc::clone(&engine));
+        let ctx = spice_ctx_with_api_key("writer456:rw");
+        let value = ctx
+            .scope(async {
+                tool.call(r#"{"thoughts":["remember this"]}"#)
+                    .await
+                    .expect("RW principal must allow store_memory")
+            })
+            .await;
+        assert_eq!(value, serde_json::Value::Null);
+        assert_eq!(
+            engine.write_calls(),
+            1,
+            "RW principal must invoke write_data once"
+        );
+    }
+
+    /// Records the span and message of every `task_history` ERROR event. The
+    /// `runtime.task_history` exporter takes a row's `error_message` from the
+    /// first ERROR event on its span, so a failure without one reads as success.
+    #[derive(Clone, Default)]
+    struct TaskHistoryErrors(Arc<Mutex<Vec<TaskHistoryError>>>);
+
+    /// The name of the span an ERROR event was recorded on, and its message.
+    type TaskHistoryError = (Option<String>, String);
+
+    impl TaskHistoryErrors {
+        fn recorded(&self) -> Vec<TaskHistoryError> {
+            self.0.lock().expect("task_history errors lock").clone()
+        }
+    }
+
+    impl<S> tracing_subscriber::Layer<S> for TaskHistoryErrors
+    where
+        S: tracing::Subscriber + for<'a> tracing_subscriber::registry::LookupSpan<'a>,
+    {
+        fn on_event(
+            &self,
+            event: &tracing::Event<'_>,
+            ctx: tracing_subscriber::layer::Context<'_, S>,
+        ) {
+            if event.metadata().target() != "task_history"
+                || *event.metadata().level() != tracing::Level::ERROR
+            {
+                return;
+            }
+            let mut message = String::new();
+            event.record(&mut MessageVisitor(&mut message));
+            let span = ctx.event_span(event).map(|span| span.name().to_string());
+            self.0
+                .lock()
+                .expect("task_history errors lock")
+                .push((span, message));
+        }
+    }
+
+    struct MessageVisitor<'a>(&'a mut String);
+
+    impl tracing::field::Visit for MessageVisitor<'_> {
+        fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+            if field.name() == "message" {
+                *self.0 = format!("{value:?}");
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn store_memory_read_only_refusal_is_recorded_in_task_history() {
+        use tracing_subscriber::layer::SubscriberExt;
+
+        let errors = TaskHistoryErrors::default();
+        let _subscriber =
+            tracing::subscriber::set_default(tracing_subscriber::registry().with(errors.clone()));
+        let engine = Arc::new(RecordingQueryEngine::new());
+        let tool = store_memory_tool(Arc::clone(&engine));
+        let err = spice_ctx_with_api_key("topsecret123")
+            .scope(async {
+                tool.call(r#"{"thoughts":["remember this"]}"#)
+                    .await
+                    .expect_err("RO principal must reject store_memory")
+            })
+            .await;
+        assert_eq!(
+            errors.recorded(),
+            vec![(Some("tool_use::store_memory".to_string()), err.to_string())],
+            "a refused write must be recorded as an error on its task_history span"
         );
     }
 }

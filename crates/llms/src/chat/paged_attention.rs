@@ -45,10 +45,7 @@ impl FromStr for PagedAttentionMode {
         match s.trim().to_ascii_lowercase().as_str() {
             "" | "auto" => Ok(Self::Auto),
             "disabled" => Ok(Self::Disabled),
-            other => Err(format!(
-                "must be one of: {}. Found {other}",
-                Self::VALUES.join(", ")
-            )),
+            _ => Err(format!("must be one of: {}", Self::VALUES.join(", "))),
         }
     }
 }
@@ -82,8 +79,9 @@ mod tests {
         // Booleans in particular: a Spicepod that spells this `true`/`false` has to fail
         // loudly rather than have one of them quietly read as a mode.
         for raw in ["true", "false", "1", "0", "on", "off", "eager", "maybe"] {
-            assert!(
-                raw.parse::<PagedAttentionMode>().is_err(),
+            assert_eq!(
+                raw.parse::<PagedAttentionMode>(),
+                Err("must be one of: auto, disabled".to_string()),
                 "{raw:?} should be rejected"
             );
         }

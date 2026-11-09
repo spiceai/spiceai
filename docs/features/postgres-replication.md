@@ -2,17 +2,17 @@
 
 Stream every `INSERT`, `UPDATE`, and `DELETE` from a PostgreSQL table directly into a Spice-accelerated dataset over Postgres' native logical replication protocol — no Debezium, no Kafka, no external services.
 
-This is the recommended way to keep a Spice accelerator (DuckDB, SQLite, Postgres, Cayenne, Arrow) continuously in sync with a Postgres source.
+This is the recommended way to keep a Spice accelerator (Cayenne, SQLite, Postgres, Arrow) continuously in sync with a Postgres source.
 
 ## How it works
 
 ```
 ┌────────────────┐   WAL (pgoutput)   ┌───────────────────┐   ChangeBatch   ┌───────────────┐
 │   PostgreSQL   │──────────────────▶│    Spice runtime  │────────────────▶│  Accelerator  │
-│  wal_level=    │   replication     │  (postgres        │    (INSERT/     │  DuckDB /     │
+│  wal_level=    │   replication     │  (postgres        │    (INSERT/     │  Cayenne /    │
 │  logical       │   slot            │   connector)      │     UPDATE /    │  SQLite /     │
-│                │                   │                   │     DELETE)     │  Postgres /   │
-└────────────────┘                   └───────────────────┘                 │  Cayenne      │
+│                │                   │                   │     DELETE)     │  Postgres     │
+└────────────────┘                   └───────────────────┘                 │               │
                                                                            └───────────────┘
 ```
 
@@ -55,18 +55,18 @@ On managed Postgres services:
 | Azure Database    | Under **Replication**, set *Replication support* to `LOGICAL`.        |
 | Supabase / Neon   | Logical replication is enabled by default.                            |
 
-### 2. The source table must have a replica identity
+### 2. Every row needs a primary key
 
-Spice needs the primary key columns in every `UPDATE`/`DELETE` event, so one of the following must be true:
+Spice applies each `UPDATE` and `DELETE` to the row with the same primary key, so the key columns must be in every event:
 
 - The table has a **primary key** (default — nothing to do).
-- Or the table has `REPLICA IDENTITY FULL`:
+- Or the table has no primary key: set `acceleration.primary_key` to columns that identify a row, and make Postgres send those columns with every event — `REPLICA IDENTITY USING INDEX` on a unique index over them, or `REPLICA IDENTITY FULL`:
 
   ```sql
   ALTER TABLE public.users REPLICA IDENTITY FULL;
   ```
 
-Tables with `REPLICA IDENTITY NOTHING` are rejected at startup with an actionable error.
+`REPLICA IDENTITY FULL` alone is not enough: a dataset with no primary key fails to load. Tables with `REPLICA IDENTITY NOTHING` are rejected at startup with an actionable error.
 
 ### 3. The Postgres role needs these privileges
 
@@ -98,7 +98,7 @@ datasets:
       #   pg_sslrootcert: ${secrets:pg_ca_pem}
     acceleration:
       enabled: true
-      engine: duckdb           # or: sqlite | postgres | cayenne | arrow
+      engine: cayenne          # or: sqlite | postgres | arrow
       refresh_mode: changes    # <-- triggers WAL streaming
       primary_key: id
       on_conflict:
@@ -109,7 +109,7 @@ Start the runtime. Spice will:
 
 - Auto-create publication `spice_users_<dataset-hash>_pub`.
 - Auto-create replication slot `spice_users_<dataset-hash>_<instance-hash>`.
-- Snapshot `public.users` into the DuckDB accelerator.
+- Snapshot `public.users` into the Cayenne accelerator.
 - Stream every subsequent change as it commits on Postgres.
 
 ## Full configuration reference
@@ -174,13 +174,12 @@ Note: `prefer` behaves as plaintext here because the replication transport does 
 
 | Engine     | `INSERT` |          `UPDATE`           | `DELETE` | Notes                                                                                                                                                                                                 |
 | ---------- | :------: | :-------------------------: | :------: | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `duckdb`   |    ✅     |         ✅ (upsert)          |    ✅     | Recommended for most workloads.                                                                                                                                                                       |
 | `sqlite`   |    ✅     |         ✅ (upsert)          |    ✅     | Great for small/medium datasets.                                                                                                                                                                      |
 | `postgres` |    ✅     |         ✅ (upsert)          |    ✅     | Use when the accelerator is another Postgres.                                                                                                                                                         |
-| `cayenne`  |    ✅     |         ✅ (upsert)          |    ✅     | S3-backed Vortex format, good for read-heavy analytics.                                                                                                                                               |
+| `cayenne`  |    ✅     |         ✅ (upsert)          |    ✅     | The default. Recommended for most workloads.                                                                                                                                                          |
 | `arrow`    |    ✅     | ✅ (upsert with primary key) |    ✅     | Arrow's in-memory engine uses a hash index for primary-key upserts. Without a primary key, updates are appended as new rows. `DELETE` and `TRUNCATE` are applied via Arrow's `DeletionTableProvider`. |
 
-For Arrow workloads that need true upsert semantics (so `UPDATE`s replace existing rows instead of duplicating them), configure a primary key. DuckDB, SQLite, Postgres, and Cayenne also support upsert behavior.
+For Arrow workloads that need true upsert semantics (so `UPDATE`s replace existing rows instead of duplicating them), configure a primary key. Cayenne, SQLite, and Postgres also support upsert behavior.
 
 ## Sharing one slot across multiple datasets
 
@@ -200,7 +199,7 @@ datasets:
       pg_replication_slot: spice_app_cdc
     acceleration:
       enabled: true
-      engine: duckdb
+      engine: cayenne
       refresh_mode: changes
       primary_key: id
       on_conflict:
@@ -211,7 +210,7 @@ datasets:
     params: *repl
     acceleration:
       enabled: true
-      engine: duckdb
+      engine: cayenne
       refresh_mode: changes
       primary_key: id
       on_conflict:
@@ -237,6 +236,9 @@ Every Spice replica must have its own replication slot. Spice handles this autom
 | ------------------------------- | --------------------------------------------------------------- |
 | `SPICE_INSTANCE_ID` env         | Preferred — set it explicitly per replica.                      |
 | `HOSTNAME` / `COMPUTERNAME` env | Fallback — works on k8s where each pod has a distinct hostname. |
+| The host name                   | Last fallback, when none of the variables above is set.         |
+
+An empty variable counts as unset. When an instance's identity changes, for example when `SPICE_INSTANCE_ID` is set on an instance that had none, its default slot name changes too: Spice creates a new slot, and the old slot keeps retaining WAL on the source until it is dropped. Find slots no replica consumes with `SELECT slot_name, active FROM pg_replication_slots WHERE slot_name LIKE 'spice_%'`, then drop a confirmed-abandoned one with `SELECT pg_drop_replication_slot('<slot name>')`.
 
 ### Example: Kubernetes StatefulSet
 
@@ -442,7 +444,7 @@ The replication stream is designed to survive transient failures without operato
 
 ### Rebuilding an accelerator from scratch
 
-Delete the accelerator's local storage (DuckDB file, SQLite file, etc.) and drop the replication slot:
+Delete the accelerator's local storage (Cayenne data and metadata directories, SQLite file, etc.) and drop the replication slot:
 
 ```sql
 SELECT pg_drop_replication_slot('spice_users_<instance-hash>');
@@ -466,8 +468,9 @@ Dropping or renaming columns in use by Spice will require rebuilding the acceler
 
 | Symptom                                                                    | Cause and fix                                                                                                                                                           |
 | -------------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| Error: *`Table public.X has REPLICA IDENTITY NOTHING`*                     | Run `ALTER TABLE public.X REPLICA IDENTITY FULL;` (or add a primary key).                                                                                               |
-| Error: *`Table public.X has no primary key and no REPLICA IDENTITY FULL`*  | Either add a primary key, or run `ALTER TABLE ... REPLICA IDENTITY FULL;`.                                                                                              |
+| Error: *`Table public.X has REPLICA IDENTITY NOTHING`*                     | Run `ALTER TABLE public.X REPLICA IDENTITY DEFAULT;` if the table has a primary key. Otherwise run `ALTER TABLE public.X REPLICA IDENTITY FULL;` and set `acceleration.primary_key`. |
+| Error: *`Table public.X has no primary key and REPLICA IDENTITY DEFAULT`*  | Add a primary key, or run `ALTER TABLE public.X REPLICA IDENTITY FULL;` and set `acceleration.primary_key`.                                                               |
+| Error: *`Table public.X has no primary key, and refresh_mode: changes needs one`* | Set `acceleration.primary_key` to columns that identify a row. Postgres must send them with every change: run `ALTER TABLE public.X REPLICA IDENTITY FULL;`, or use `REPLICA IDENTITY USING INDEX` on a unique index over them. |
 | Error: *`Source table public.X does not exist`*                            | The fully qualified table in `from: postgres:<schema>.<table>` is wrong or the role lacks SELECT.                                                                       |
 | Error: *`replication slot "..." already exists`* on startup                | Another Spice replica is using the same slot name. Set `pg_replication_slot` uniquely, or ensure `SPICE_INSTANCE_ID` differs between replicas.                          |
 | Error mentioning *permission denied for database* during setup             | The role needs `CREATE` on the database, or you need to pre-create the publication/slot yourself.                                                                       |

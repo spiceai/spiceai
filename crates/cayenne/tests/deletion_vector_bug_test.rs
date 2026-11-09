@@ -23,7 +23,7 @@ limitations under the License.
 
 #![allow(clippy::expect_used)]
 
-mod common;
+use crate::common;
 
 use arrow::array::{Int64Array, RecordBatch, StringArray};
 

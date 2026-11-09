@@ -44,9 +44,9 @@ use std::{
 
 use crate::{init_tracing, utils::test_request_context};
 use arrow_flight::{
-    FlightDescriptor,
+    FlightData, FlightDescriptor,
     flight_service_client::FlightServiceClient,
-    sql::{CommandStatementQuery, ProstMessageExt},
+    sql::{CommandStatementQuery, CommandStatementUpdate, ProstMessageExt},
 };
 use prost::Message;
 use rand::RngExt;
@@ -55,7 +55,7 @@ use rcgen::{
 };
 use runtime::{Runtime, auth::EndpointAuth, config::Config};
 use runtime_auth::IdentitySource;
-use runtime_tls::TlsConfig;
+use runtime_tls::{ClientTrustPem, TlsConfig};
 use tonic::transport::{Certificate, Channel, ClientTlsConfig, Identity};
 
 const LOCALHOST: IpAddr = IpAddr::V4(Ipv4Addr::LOCALHOST);
@@ -154,7 +154,7 @@ async fn start_runtime_with_mtls(
     let tls_config = TlsConfig::try_new_with_client_auth_mode(
         pki.server_cert_pem.as_bytes(),
         pki.server_key_pem.as_bytes(),
-        Some(pki.ca_pem.as_bytes()),
+        Some(ClientTrustPem::ca_only(pki.ca_pem.as_bytes())),
         enforcement,
     )
     .expect("valid TlsConfig with client auth");
@@ -228,6 +228,28 @@ async fn flight_show_tables(
     };
     let req = FlightDescriptor::new_cmd(cmd.as_any().encode_to_vec());
     let _ = client.get_flight_info(req).await?;
+    Ok(())
+}
+
+/// Runs `sql` as a Flight SQL statement update, which `DoPut` refuses
+/// without an authenticated principal.
+async fn flight_statement_update(
+    client: &mut FlightServiceClient<Channel>,
+    sql: &str,
+) -> Result<(), tonic::Status> {
+    let cmd = CommandStatementUpdate {
+        query: sql.to_string(),
+        transaction_id: None,
+    };
+    let message = FlightData {
+        flight_descriptor: Some(FlightDescriptor::new_cmd(cmd.as_any().encode_to_vec())),
+        ..Default::default()
+    };
+    let mut results = client
+        .do_put(futures::stream::iter([message]))
+        .await?
+        .into_inner();
+    while results.message().await?.is_some() {}
     Ok(())
 }
 
@@ -379,6 +401,13 @@ async fn test_public_mtls_required_channel_mode() -> Result<(), anyhow::Error> {
                 .await
                 .expect("flight show tables under valid cert");
             tracing::info!("Flight get_flight_info OK with valid client cert");
+
+            // No API key is on the wire, so only the certificate can be the
+            // principal that `DoPut` requires.
+            flight_statement_update(&mut flight_client, "SELECT 1")
+                .await
+                .expect("a statement update under a valid client cert is authenticated");
+            tracing::info!("Flight DoPut authenticated by the client cert");
 
             // 5. Flight: no client cert. tonic's `Channel::connect()`
             //    may complete the TCP connect before the TLS

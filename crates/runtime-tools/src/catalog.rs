@@ -50,4 +50,72 @@ pub trait SpiceToolCatalog: Send + Sync {
     /// Tool will either be built with default parameters, or additional
     /// parameters from the catalog.
     async fn get(&self, name: &str) -> Option<Arc<dyn SpiceModelTool>>;
+
+    /// Synchronous lookup used by the MCP gateway to validate `Mcp-Param-*`
+    /// headers before the async `tools/call` path runs.
+    ///
+    /// Return `None` only when the catalog cannot resolve the tool without I/O.
+    /// rmcp caches that miss per tool name, so catalogs that can answer
+    /// synchronously must do so here (see [`Self::try_all`]).
+    ///
+    /// Default is `None` so downstream implementers keep compiling. Catalogs
+    /// that participate in MCP `Mcp-Param-*` validation must override this.
+    /// Wrappers must forward; inheriting the default is a silent miss.
+    fn try_get(&self, _name: &str) -> Option<Arc<dyn SpiceModelTool>> {
+        None
+    }
+
+    /// Synchronous listing used to keep the MCP schema snapshot populated.
+    ///
+    /// Return every tool the catalog can expose without I/O. Empty means the
+    /// snapshot cannot yet name this catalog's tools from this method.
+    ///
+    /// Default is empty so downstream implementers keep compiling. Catalogs
+    /// that participate in MCP schema snapshots must override this. Wrappers
+    /// must forward; inheriting the default leaves the snapshot unnamed
+    /// until a gateway `tools/list` folds in a warmed [`Self::all`] page.
+    fn try_all(&self) -> Vec<Arc<dyn SpiceModelTool>> {
+        Vec::new()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Downstream-shaped catalog that implements only the methods that existed
+    /// before `try_get` / `try_all`. Used to prove those lookups need defaults.
+    struct DownstreamCatalog;
+
+    #[async_trait]
+    impl SpiceToolCatalog for DownstreamCatalog {
+        fn as_any(&self) -> &dyn std::any::Any {
+            self
+        }
+
+        fn name(&self) -> &'static str {
+            "downstream"
+        }
+
+        async fn all(&self) -> Vec<Arc<dyn SpiceModelTool>> {
+            Vec::new()
+        }
+
+        async fn get(&self, _name: &str) -> Option<Arc<dyn SpiceModelTool>> {
+            None
+        }
+    }
+
+    #[test]
+    fn default_try_get_and_try_all_are_empty() {
+        let catalog = DownstreamCatalog;
+        assert!(
+            catalog.try_get("any").is_none(),
+            "default try_get must be a miss so downstream impls compile"
+        );
+        assert!(
+            catalog.try_all().is_empty(),
+            "default try_all must be empty so downstream impls compile"
+        );
+    }
 }

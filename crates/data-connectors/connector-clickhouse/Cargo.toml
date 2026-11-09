@@ -20,19 +20,20 @@ edition.workspace = true
 version.workspace = true
 rust-version.workspace = true
 license-file.workspace = true
+repository.workspace = true
 description = "ClickHouse data connector for Spice.ai runtime"
 
 [dependencies]
 arrow.workspace = true
 async-stream.workspace = true
 async-trait.workspace = true
-bigdecimal.workspace = true
 chrono.workspace = true
 chrono-tz = "0.8.6"
 clickhouse-rs.workspace = true
 data-connector-api = { path = "../../data-connector-api" }
-data_components = { path = "../../data_components", features = ["federation"] }
+data_components = { path = "../../data_components" }
 datafusion.workspace = true
+datafusion-federation.workspace = true
 datafusion-table-providers.workspace = true
 futures.workspace = true
 linkme.workspace = true
@@ -50,6 +51,7 @@ uuid.workspace = true
 default = []
 
 [dev-dependencies]
+insta.workspace = true
 runtime = { path = "../../runtime" }
 
 [lints]

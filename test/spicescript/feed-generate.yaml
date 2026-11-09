@@ -1,0 +1,64 @@
+name: feed-generate
+description: >
+  The built-in feed sources generate the same typed rows as PostgreSQL,
+  accept source-neutral inserts, updates and deletes, and keep NULL distinct
+  from empty strings. PostgreSQL and MySQL targets apply the same row images.
+
+sources:
+  src: { kind: '${matrix.src}' }
+  ref: { kind: postgres }
+matrix:
+  src: [kafka, mongodb, dynamodb, postgres, mysql]
+
+spicepod:
+  version: v1
+  kind: Spicepod
+  name: feed-generate
+  datasets:
+    - from: '${sources.src.from_prefix}t${sources.src.from_suffix}'
+      name: t
+      params: ${sources.src.table_params}
+      acceleration: { enabled: true, engine: cayenne, mode: file, refresh_mode: full, refresh_check_interval: 1h }
+variants:
+  kafka:
+    when: { src: kafka }
+    datasets: { t: { acceleration: { refresh_mode: append } } }
+  others:
+    when: { src: [mongodb, dynamodb, postgres, mysql] }
+defaults:
+  expect: { oracle: ref }
+steps:
+  - generate:
+      src:
+        table: t
+        rows: 40
+        primary-key: id
+        seed: 19
+        columns:
+          - { name: id, sequence: 1 }
+          - { name: n, bigint: [-100, 100] }
+          - { name: b, bool: 0.5 }
+          - { name: s, choice: ['', 'a,b', 'quote"', "apostrophe'", 'λ'], nulls: 0.2 }
+    mirror: ref
+  - start: {}
+  - query: SELECT id, n, b, s FROM t
+    eventually: 60s
+  - write:
+      src: "INSERT INTO t VALUES (41, -9223372036854775808, true, ''); INSERT INTO t VALUES (42, 9223372036854775807, false, NULL)"
+    mirror: ref
+  - refresh: t
+    when: { src: [mongodb, dynamodb, postgres, mysql] }
+  - query: SELECT id, n, b, s FROM t
+    eventually: 60s
+  - write:
+      src:
+        - "UPDATE t SET s = E'new\\nline\\t雪', n = n + 1 WHERE id <= 10"
+        - "DELETE FROM t WHERE id BETWEEN 11 AND 20"
+        - "UPDATE t SET s = 'no rows' WHERE false"
+        - "DELETE FROM t WHERE false"
+    mirror: ref
+    when: { src: [mongodb, dynamodb, postgres, mysql] }
+  - refresh: t
+    when: { src: [mongodb, dynamodb, postgres, mysql] }
+  - query: SELECT id, n, b, s FROM t
+    eventually: 60s

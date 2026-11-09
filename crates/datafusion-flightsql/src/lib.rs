@@ -48,7 +48,7 @@ limitations under the License.
 use std::sync::Arc;
 
 use arrow::datatypes::Schema;
-use arrow::ipc::writer::{CompressionContext, DictionaryTracker, IpcDataGenerator};
+use arrow::ipc::writer::{DictionaryTracker, IpcDataGenerator, IpcWriteContext};
 use arrow_flight::flight_service_server::FlightService;
 use arrow_flight::{
     Action, ActionType, Criteria, FlightData, FlightDescriptor, FlightInfo, HandshakeRequest,
@@ -265,7 +265,7 @@ impl FlightSqlService {
         // Pre-compute schema flight data once, matching the runtime's approach.
         let options = IpcWriteOptions::default();
         let mut dict_tracker = DictionaryTracker::new(true);
-        let mut compression_context = CompressionContext::default();
+        let mut compression_context = IpcWriteContext::default();
         let encoder = IpcDataGenerator::default();
         let schema_ipc = IpcMessage(
             encoder
@@ -293,18 +293,25 @@ impl FlightSqlService {
                         // the expanded schema we advertised in GetFlightInfo.
                         let batch = arrow_tools::schema::cast_view_columns(batch, &schema)
                             .map_err(|e| Status::internal(e.to_string()))?;
-                        let (dicts, batch_data) = encoder
-                            .encode(
-                                &batch,
-                                &mut dict_tracker,
-                                &options,
-                                &mut compression_context,
-                            )
-                            .map_err(|e| Status::internal(e.to_string()))?;
-                        for dict in dicts {
-                            yield dict.into();
+                        // Split a large batch so no single message exceeds a
+                        // client's default gRPC receive limit.
+                        for slice in arrow_tools::ipc::split_batch_for_flight(
+                            batch,
+                            arrow_tools::ipc::FLIGHT_TARGET_MESSAGE_BYTES,
+                        ) {
+                            let (dicts, batch_data) = encoder
+                                .encode(
+                                    &slice,
+                                    &mut dict_tracker,
+                                    &options,
+                                    &mut compression_context,
+                                )
+                                .map_err(|e| Status::internal(e.to_string()))?;
+                            for dict in dicts {
+                                yield dict.into();
+                            }
+                            yield batch_data.into();
                         }
-                        yield batch_data.into();
                     }
                     Err(e) => {
                         Err(handle_datafusion_error(e))?;

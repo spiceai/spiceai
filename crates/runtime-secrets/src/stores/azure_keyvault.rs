@@ -201,10 +201,11 @@ impl std::str::FromStr for AuthMethod {
             "managed_identity" => Ok(Self::ManagedIdentity),
             "workload_identity" => Ok(Self::WorkloadIdentity),
             "cli" => Ok(Self::Cli),
-            other => Err(format!(
+            _ => Err(
                 "must be one of: default, service_principal, managed_identity, \
-                 workload_identity, cli. Found {other}."
-            )),
+                 workload_identity, cli."
+                    .to_string(),
+            ),
         }
     }
 }

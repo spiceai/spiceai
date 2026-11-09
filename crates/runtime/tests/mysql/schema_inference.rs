@@ -46,10 +46,6 @@ use crate::utils::{
 };
 use crate::{configure_test_datafusion, init_tracing};
 
-// A distinct, unused host port so this test can start its own container without
-// racing the replication suite (which uses 13324). The container name is derived
-// from the port, so a unique port also means a unique container.
-const MYSQL_INFERENCE_PORT: u16 = 13328;
 const CHANGE_PROPAGATION_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Composite-PK table so the test also proves multi-column key inference (in key
@@ -165,12 +161,13 @@ async fn test_inference_enables_cdc_without_declared_pk() -> Result<(), anyhow::
 
     test_request_context()
         .scope(async {
-            let _container = common::start_mysql_docker_container(MYSQL_INFERENCE_PORT)
+            let container = common::start_mysql_docker_container()
                 .await
                 .map_err(|e| anyhow!("start container: {e}"))?;
+            let port = container.host_port(3306)?;
 
             // Create + seed on the source (retry to absorb InnoDB DDL-readiness races).
-            let pool = common::get_mysql_conn(MYSQL_INFERENCE_PORT)?;
+            let pool = common::get_mysql_conn(port)?;
             let retry_strategy = FibonacciBackoffBuilder::new().max_retries(Some(10)).build();
             retry(retry_strategy, || async {
                 exec(&pool, "DROP TABLE IF EXISTS inventory")
@@ -184,7 +181,7 @@ async fn test_inference_enables_cdc_without_declared_pk() -> Result<(), anyhow::
             .await?;
 
             let app = AppBuilder::new("mysql_schema_inference_test")
-                .with_dataset(inventory_dataset(MYSQL_INFERENCE_PORT))
+                .with_dataset(inventory_dataset(port))
                 .build();
 
             configure_test_datafusion();

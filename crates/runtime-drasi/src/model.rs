@@ -246,6 +246,20 @@ mod tests {
         );
     }
 
+    #[test]
+    fn http_update_matches_the_upsert_wire_shape() {
+        let node = node();
+        let change = HttpSourceChange::Update {
+            element: (&node).into(),
+            timestamp: Some(1_699_900_000_000_000_000),
+        };
+
+        let json = serde_json::to_value(&change).expect("serializes");
+        assert_eq!(json["operation"], "update");
+        assert_eq!(json["element"]["id"], "public.users:12345");
+        assert_eq!(json["element"]["properties"]["username"], "john_doe");
+    }
+
     /// A delete carries identity only — no element object, no properties.
     #[test]
     fn http_delete_carries_identity_only() {
@@ -344,7 +358,7 @@ mod tests {
             "evt-1".to_string(),
             "2026-01-01T00:00:00Z".to_string(),
             vec![PlatformChange {
-                op: "i",
+                op: "u",
                 payload: PlatformPayload {
                     after: Some(&node),
                     before: None,
@@ -360,7 +374,11 @@ mod tests {
         let json = serde_json::to_value(&envelope).expect("serializes");
         assert_eq!(json["specversion"], "1.0");
         assert!(json["data"].is_array());
-        assert_eq!(json["data"][0]["op"], "i");
+        assert_eq!(json["data"][0]["op"], "u");
+        assert_eq!(
+            json["data"][0]["payload"]["after"]["id"],
+            "public.users:12345"
+        );
         assert!(json["data"][0]["payload"].get("before").is_none());
     }
 }

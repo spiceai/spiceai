@@ -1,0 +1,89 @@
+name: flight-writes
+description: >
+  Writes over Flight to a Cayenne acceleration (`access: read_write`,
+  `write_mode: acceleration`) leave it holding what a PostgreSQL model holds
+  after the same writes: DoPut appends and replaces rows by primary key,
+  twenty thousand rows in one DoPut land whole, and Flight SQL ExecuteUpdate
+  UPDATE and DELETE report the rows they changed. A read-only key, no key, and
+  a dataset that is not writable are refused.
+
+sources:
+  src: { kind: postgres }
+
+spicepod:
+  version: v1
+  kind: Spicepod
+  name: flight-writes
+  runtime:
+    auth:
+      api-key:
+        enabled: true
+        keys: [writer:rw, reader:ro]
+  datasets:
+    - from: postgres:public.items
+      name: items
+      params: ${sources.src.params}
+      access: read_write
+      acceleration: { enabled: true, engine: cayenne, mode: file, refresh_mode: full, write_mode: acceleration, primary_key: id }
+    - from: postgres:public.items
+      name: items_ro
+      params: ${sources.src.params}
+
+defaults:
+  api-key: writer
+  expect: { oracle: src }
+
+steps:
+  - source-exec:
+      src: |
+        CREATE TABLE items (id bigint PRIMARY KEY, name text, qty int);
+        INSERT INTO items VALUES (1, 'one', 10), (2, 'two', 20);
+        CREATE TABLE model (id bigint PRIMARY KEY, name text, qty int);
+        INSERT INTO model SELECT * FROM items;
+  - start: {}
+  - query: SELECT id, name, qty FROM items
+    oracle-sql: SELECT id, name, qty FROM model
+
+  # DoPut: new keys appended, an existing key replaced.
+  - flight-put: { dataset: items, rows: [[3, three, 30], [2, two again, 21], [4, null, null]] }
+  - source-exec: { src: "INSERT INTO model VALUES (3, 'three', 30), (2, 'two again', 21), (4, NULL, NULL) ON CONFLICT (id) DO UPDATE SET name = EXCLUDED.name, qty = EXCLUDED.qty" }
+  - query: SELECT id, name, qty FROM items
+    oracle-sql: SELECT id, name, qty FROM model
+
+  # Refused: a read-only key, no key, a dataset that is not writable.
+  - flight-put: { dataset: items, rows: [[99, no, 0]] }
+    api-key: reader
+    expect-error: Permission denied. Ensure the credentials have the required permissions.
+  - flight-put: { dataset: items, rows: [[99, no, 0]] }
+    api-key: none
+    expect-error: Missing authorization header
+  - flight-put: { dataset: items_ro, rows: [[99, no, 0]] }
+    expect-error: "Path doesn't exist or is not writable: spice.public.items_ro"
+  - query: SELECT id, name, qty FROM items
+    oracle-sql: SELECT id, name, qty FROM model
+
+  # ExecuteUpdate reports what it changed.
+  - flight-exec: UPDATE items SET qty = qty + 1 WHERE id <= 2
+    count: 2
+  - source-exec: { src: "UPDATE model SET qty = qty + 1 WHERE id <= 2" }
+  - flight-exec: DELETE FROM items WHERE name IS NULL
+    count: 1
+  - source-exec: { src: "DELETE FROM model WHERE name IS NULL" }
+  - query: SELECT id, name, qty FROM items
+    oracle-sql: SELECT id, name, qty FROM model
+  - flight-exec: DELETE FROM items WHERE id = 1
+    api-key: reader
+    expect-error: Write access denied. Verify that authentication key used has write access and try again.
+  - flight-exec: DELETE FROM items WHERE id = 1
+    api-key: none
+    expect-error: Missing authorization header
+
+  # Twenty thousand rows in one DoPut.
+  - flight-put:
+      dataset: items
+      from-source: { src: "SELECT g, 'bulk', g % 97 FROM generate_series(1000, 20999) g" }
+  - source-exec: { src: "INSERT INTO model SELECT g, 'bulk', g % 97 FROM generate_series(1000, 20999) g" }
+  - query: SELECT count(*) AS n, sum(id) AS s, sum(qty) AS q FROM items
+    oracle-sql: SELECT count(*) AS n, sum(id) AS s, sum(qty) AS q FROM model
+  - query: SELECT id, name, qty FROM items
+    oracle-sql: SELECT id, name, qty FROM model

@@ -144,15 +144,58 @@ impl Error {
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
 
+/// A named scalar UDF expression, for asserting what a connector's federation
+/// deny-list does and does not allow. The deny-list matches on the function's
+/// name, so the body and the argument types are irrelevant -- only the name and
+/// the argument count are. A backend that also answers per *call* is the
+/// exception: reach for [`stub_udf_called_with`] there, since the arguments are
+/// then part of the question.
+#[cfg(all(test, any(feature = "adbc", feature = "snowflake")))]
+pub(crate) fn stub_udf(name: &str, arity: usize) -> datafusion::logical_expr::Expr {
+    use datafusion::prelude::col;
+
+    stub_udf_called_with(name, (0..arity).map(|i| col(format!("c{i}"))).collect())
+}
+
+/// The same stub called with `args` instead of bare columns, for a backend whose
+/// [`FunctionSupport`](datafusion_table_providers::util::supported_functions::FunctionSupport)
+/// answers per *call* — where a literal argument is what decides whether the
+/// dialect can render it.
+#[cfg(all(test, any(feature = "adbc", feature = "snowflake")))]
+pub(crate) fn stub_udf_called_with(
+    name: &str,
+    args: Vec<datafusion::logical_expr::Expr>,
+) -> datafusion::logical_expr::Expr {
+    use datafusion::arrow::datatypes::DataType;
+    use datafusion::logical_expr::{ColumnarValue, Expr, Volatility, create_udf};
+
+    let udf = std::sync::Arc::new(create_udf(
+        name,
+        vec![DataType::Utf8; args.len()],
+        DataType::Utf8,
+        Volatility::Immutable,
+        std::sync::Arc::new(|args: &[ColumnarValue]| Ok(args[0].clone())),
+    ));
+    Expr::ScalarFunction(datafusion::logical_expr::expr::ScalarFunction::new_udf(
+        udf, args,
+    ))
+}
+
 #[cfg(feature = "adbc")]
 pub mod adbc;
-#[cfg(not(windows))]
 pub mod cayenne;
 #[cfg(feature = "databricks")]
 pub mod databricks;
 pub mod deferred;
-#[cfg(feature = "duckdb")]
+#[cfg(feature = "adbc")]
 pub mod ducklake;
+// Only the ADBC catalog connector reads the `query_federation` parameter today,
+// because only its dataset connector offers one. The MySQL, PostgreSQL, DuckLake
+// and Snowflake catalogs install their deny-list with no opt-out, matching
+// theirs. Offering the PostgreSQL catalog the parameter is user-facing surface
+// and needs a signed-off Enhancement first -- see #14228.
+#[cfg(feature = "adbc")]
+mod federation;
 pub mod glue;
 pub mod iceberg;
 #[cfg(feature = "mssql")]
@@ -269,7 +312,7 @@ pub async fn register_all() {
         ),
     );
 
-    #[cfg(feature = "duckdb")]
+    #[cfg(feature = "adbc")]
     registry.insert(
         ducklake::PREFIX.to_string(),
         CatalogConnectorFactory::new(
@@ -329,7 +372,7 @@ pub async fn register_all() {
         ),
     );
 
-    #[cfg(all(not(windows), feature = "spicebench"))]
+    #[cfg(feature = "spicebench")]
     registry.insert(
         cayenne::PREFIX.to_string(),
         CatalogConnectorFactory::new(
@@ -604,7 +647,7 @@ mod tests {
                 guard.contains_key("databricks"),
                 "databricks should be registered"
             );
-            #[cfg(feature = "duckdb")]
+            #[cfg(feature = "adbc")]
             assert!(
                 guard.contains_key(ducklake::PREFIX),
                 "ducklake should be registered"
@@ -634,14 +677,14 @@ mod tests {
                 guard.contains_key(oracle::PREFIX),
                 "oracle should be registered"
             );
-            #[cfg(all(not(windows), feature = "spicebench"))]
+            #[cfg(feature = "spicebench")]
             assert!(
                 guard.contains_key(cayenne::PREFIX),
                 "cayenne should be registered"
             );
             // Guard against accidental re-registration: by default (without the
             // `spicebench` feature) the Cayenne catalog connector must NOT be registered.
-            #[cfg(all(not(windows), not(feature = "spicebench")))]
+            #[cfg(not(feature = "spicebench"))]
             assert!(
                 !guard.contains_key(cayenne::PREFIX),
                 "cayenne should not be registered without the spicebench feature"

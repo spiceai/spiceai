@@ -19,7 +19,7 @@ limitations under the License.
 //!
 //! Every test drives the transport-neutral orchestrator
 //! [`runtime::datafusion::query::run_transaction`] against an **accelerator-only**
-//! Cayenne table (`on_conflict` upsert + `refresh_mode: full`) whose source is a
+//! Cayenne table (`write_mode: acceleration` + `refresh_mode: full`) whose source is a
 //! local CSV file — fully self-contained, no external Postgres or S3. This is the
 //! configuration that routes gated writes through the staged commit path (see
 //! `transaction::resolve_cayenne_staged`).
@@ -57,7 +57,7 @@ use crate::utils::{runtime_ready_check, test_request_context};
 // Harness
 // ---------------------------------------------------------------------------
 
-/// Build an accelerator-only Cayenne dataset (`on_conflict: upsert` +
+/// Build an accelerator-only Cayenne dataset (`write_mode: acceleration` +
 /// `refresh_mode: full` + a primary key) seeded from a local CSV file. This is
 /// the exact shape `resolve_cayenne_staged` accepts as a transaction
 /// participant, and it is fully self-contained (no external source).
@@ -90,6 +90,7 @@ fn make_txn_dataset(
         params: Some(Params::from_string_map(params)),
         primary_key: Some("id".to_string()),
         on_conflict,
+        write_mode: spicepod::acceleration::WriteMode::Acceleration,
         ..Acceleration::default()
     });
     dataset
@@ -135,7 +136,7 @@ async fn build_ready_runtime(app: app::App) -> Result<Arc<Runtime>, String> {
 /// `RequestContext::current` is the exact context the write path's sink reads
 /// back (source 1 of `resolve_request_context`). This is the single most
 /// important detail for actually exercising atomicity — see the module docs.
-async fn run_txn(rt: &Runtime, sql: &str) -> Result<Vec<RecordBatch>, TransactionError> {
+pub(crate) async fn run_txn(rt: &Runtime, sql: &str) -> Result<Vec<RecordBatch>, TransactionError> {
     let statements = transaction_statements(sql)
         .expect("test SQL must be a well-formed BEGIN…COMMIT transaction body");
     let context = Arc::new(
@@ -145,7 +146,7 @@ async fn run_txn(rt: &Runtime, sql: &str) -> Result<Vec<RecordBatch>, Transactio
     );
     let df = rt.datafusion();
     context
-        .scope(async move { run_transaction(&df, &statements, None, false).await })
+        .scope(async move { run_transaction(&df, &statements, None, false, |_| 0).await })
         .await
         .map(|outcome| {
             outcome
@@ -157,7 +158,7 @@ async fn run_txn(rt: &Runtime, sql: &str) -> Result<Vec<RecordBatch>, Transactio
 
 /// Human-readable rendering of a [`TransactionError`] (the type derives neither
 /// `Debug` nor `Display`) for assertion messages.
-fn describe(err: &TransactionError) -> String {
+pub(crate) fn describe(err: &TransactionError) -> String {
     match err {
         TransactionError::Rejected(m) => format!("Rejected({m})"),
         TransactionError::Plan(e) => format!("Plan({e})"),
@@ -192,6 +193,35 @@ async fn read_n(rt: &Runtime, table: &str, id: &str) -> Option<i64> {
     Some(col.value(0))
 }
 
+/// `SUM(n)` across `table`, as the quota tests' oracle. `COALESCE` so an empty
+/// table reads 0 rather than NULL — the reservation gate is written the same way,
+/// because a NULL gate aborts (see `test_txn_null_gate_fail_safe`) and a quota
+/// system must admit its first reservation.
+async fn read_sum(rt: &Runtime, table: &str) -> i64 {
+    let df = rt.datafusion();
+    let sql = format!("SELECT COALESCE(SUM(n), 0) FROM {table}");
+    let batches = df
+        .query_builder(&sql)
+        .build()
+        .run()
+        .await
+        .unwrap_or_else(|e| panic!("read query `{sql}` failed to plan: {e}"))
+        .data
+        .try_collect::<Vec<RecordBatch>>()
+        .await
+        .unwrap_or_else(|e| panic!("read query `{sql}` failed to execute: {e}"));
+    let batch = batches
+        .iter()
+        .find(|b| b.num_rows() > 0)
+        .unwrap_or_else(|| panic!("read query `{sql}` returned no rows"));
+    batch
+        .column(0)
+        .as_any()
+        .downcast_ref::<Int64Array>()
+        .expect("SUM(n) should be Int64")
+        .value(0)
+}
+
 // ---------------------------------------------------------------------------
 // Tests driving the run_transaction orchestrator
 // ---------------------------------------------------------------------------
@@ -201,7 +231,6 @@ async fn read_n(rt: &Runtime, table: &str, id: &str) -> Option<i64> {
 /// `BEGIN; SELECT assert((SELECT n …) < 5); UPDATE … n=n+1; COMMIT;` on `a=0`
 /// leaves `a=1`.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[cfg(not(target_os = "windows"))]
 async fn test_txn_commit_applies_update() -> Result<(), String> {
     let _tracing = crate::init_tracing(Some("integration=debug,info"));
 
@@ -252,7 +281,6 @@ async fn test_txn_commit_applies_update() -> Result<(), String> {
 /// path is not reading the transaction back (staging not wired), the UPDATE
 /// publishes immediately and the final assertion — that `a` is still `0` — fails.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[cfg(not(target_os = "windows"))]
 async fn test_txn_gate_fail_rolls_back() -> Result<(), String> {
     let _tracing = crate::init_tracing(Some("integration=debug,info"));
 
@@ -293,7 +321,6 @@ async fn test_txn_gate_fail_rolls_back() -> Result<(), String> {
 /// cap enforcement: a `< cap` gate admits exactly `cap` commits, aborts the rest,
 /// and leaves the counter pinned at `cap`.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[cfg(not(target_os = "windows"))]
 async fn test_txn_cap_enforcement() -> Result<(), String> {
     let _tracing = crate::init_tracing(Some("integration=debug,info"));
 
@@ -359,13 +386,168 @@ async fn test_txn_cap_enforcement() -> Result<(), String> {
         .await
 }
 
+/// quota reservation, sequential: an `assert(SUM + k <= QUOTA)` gate followed by
+/// an `INSERT` admits exactly the reservations that fit and aborts the rest.
+///
+/// Distinct from [`test_txn_cap_enforcement`] in the two ways that matter. The
+/// gate reads an **aggregate over every row** rather than one key, so the
+/// transaction's read set is the whole table; and the write **inserts a new key**
+/// rather than updating an existing one. Together those are the shape a
+/// reservation system has — "is there room left, and if so take some" — and they
+/// reach the staged commit path differently from a single-key counter.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_txn_quota_reservation_admits_only_what_fits() -> Result<(), String> {
+    let _tracing = crate::init_tracing(Some("integration=debug,info"));
+
+    test_request_context()
+        .scope(async {
+            const QUOTA: i64 = 100;
+            const RESERVATION: i64 = 30;
+            const ATTEMPTS: usize = 5;
+            // The seed already holds 10 of the quota, so three reservations of 30
+            // fit exactly (10 + 90 = 100) and the fourth would exceed it.
+            const SEEDED: i64 = 10;
+            const EXPECTED_COMMITS: usize = 3;
+
+            let temp = tempfile::tempdir().map_err(|e| e.to_string())?;
+            let csv = temp.path().join("seed.csv");
+            write_seed_csv(&csv, &[("r0", SEEDED)])?;
+            let app = AppBuilder::new("test_txn_quota_sequential")
+                .with_dataset(make_txn_dataset(
+                    "t",
+                    &csv,
+                    &temp.path().join("data"),
+                    &temp.path().join("meta"),
+                ))
+                .build();
+            let rt = build_ready_runtime(app).await?;
+            assert_eq!(read_sum(&rt, "t").await, SEEDED, "seeded quota usage");
+
+            let mut commits = 0usize;
+            let mut aborts = 0usize;
+            for attempt in 0..ATTEMPTS {
+                // A distinct key per attempt: reserving is an insert, and reusing a
+                // key would upsert over an earlier reservation instead of adding to
+                // the total, quietly making the quota unreachable.
+                let sql = format!(
+                    "BEGIN; \
+                     SELECT assert((SELECT COALESCE(SUM(n), 0) FROM t) + {RESERVATION} <= {QUOTA}); \
+                     INSERT INTO t (id, n) VALUES ('r{attempt}_user', {RESERVATION}); COMMIT;"
+                );
+                match run_txn(&rt, &sql).await {
+                    Ok(_) => commits += 1,
+                    Err(err @ (TransactionError::Query(_) | TransactionError::Stream(_))) => {
+                        assert!(
+                            describe(&err).contains("assertion failed"),
+                            "attempt {attempt}: expected a gate abort, got {}",
+                            describe(&err)
+                        );
+                        aborts += 1;
+                    }
+                    Err(other) => {
+                        return Err(format!(
+                            "attempt {attempt}: unexpected error {}",
+                            describe(&other)
+                        ));
+                    }
+                }
+            }
+
+            assert_eq!(commits, EXPECTED_COMMITS, "only the reservations that fit commit");
+            assert_eq!(aborts, ATTEMPTS - EXPECTED_COMMITS, "the rest abort at the gate");
+            assert_eq!(
+                read_sum(&rt, "t").await,
+                QUOTA,
+                "the admitted reservations must land exactly on the quota"
+            );
+            Ok(())
+        })
+        .await
+}
+
+/// quota reservation, concurrent: the quota is never oversubscribed.
+///
+/// This is the write-skew question, and the reason the aggregate gate deserves
+/// its own test. Per-key optimistic concurrency compares the keys a transaction
+/// touched, but every reservation here inserts a *different* key while reading
+/// the same aggregate — so nothing about the keys reveals the conflict, and two
+/// transactions that each saw room could each take it. Cayenne's answer is to
+/// degrade the keyset and fall back to per-table conflict detection
+/// (`mark_pk_keyset_occ_degraded`), which until now only a unit test covered.
+///
+/// The safety invariant is asserted strictly: committed reservations must never
+/// exceed the quota. Liveness is asserted weakly — at least one must get through
+/// — because a concurrent attempt may legitimately lose either at the gate or to
+/// a conflict, and pinning the exact commit count would make the test a race.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn test_txn_quota_holds_under_concurrent_reservations() -> Result<(), String> {
+    let _tracing = crate::init_tracing(Some("integration=debug,info"));
+
+    test_request_context()
+        .scope(async {
+            const QUOTA: i64 = 100;
+            const RESERVATION: i64 = 30;
+            const SEEDED: i64 = 10;
+            // More contenders than can fit, so the gate and the conflict detector
+            // are both under real pressure.
+            const CONTENDERS: usize = 8;
+
+            let temp = tempfile::tempdir().map_err(|e| e.to_string())?;
+            let csv = temp.path().join("seed.csv");
+            write_seed_csv(&csv, &[("r0", SEEDED)])?;
+            let app = AppBuilder::new("test_txn_quota_concurrent")
+                .with_dataset(make_txn_dataset(
+                    "t",
+                    &csv,
+                    &temp.path().join("data"),
+                    &temp.path().join("meta"),
+                ))
+                .build();
+            let rt = build_ready_runtime(app).await?;
+
+            let mut tasks = Vec::with_capacity(CONTENDERS);
+            for contender in 0..CONTENDERS {
+                let rt = Arc::clone(&rt);
+                tasks.push(tokio::spawn(async move {
+                    let sql = format!(
+                        "BEGIN; \
+                         SELECT assert((SELECT COALESCE(SUM(n), 0) FROM t) + {RESERVATION} <= {QUOTA}); \
+                         INSERT INTO t (id, n) VALUES ('u{contender}', {RESERVATION}); COMMIT;"
+                    );
+                    run_txn(&rt, &sql).await.is_ok()
+                }));
+            }
+
+            let mut commits = 0usize;
+            for task in tasks {
+                if task.await.map_err(|e| format!("reservation task panicked: {e}"))? {
+                    commits += 1;
+                }
+            }
+
+            let total = read_sum(&rt, "t").await;
+            assert!(
+                total <= QUOTA,
+                "the quota was oversubscribed: {commits} reservations of {RESERVATION} \
+                 committed over a seeded {SEEDED}, leaving SUM(n)={total} against a \
+                 quota of {QUOTA}"
+            );
+            assert!(
+                commits >= 1,
+                "no reservation got through at all (SUM(n)={total}); the gate or the \
+                 conflict detector is rejecting everything"
+            );
+            Ok(())
+        })
+        .await
+}
+
 /// NULL-gate is fail-safe: comparing against a value from an absent row yields
 /// NULL, and `assert(NULL)` aborts (no write published).
 ///
 /// Deliberately uses a value comparison (`< 5`) against a missing row — NOT
 /// `IS NOT NULL`, which is the known-deferred bug #11832.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[cfg(not(target_os = "windows"))]
 async fn test_txn_null_gate_fail_safe() -> Result<(), String> {
     let _tracing = crate::init_tracing(Some("integration=debug,info"));
 
@@ -412,7 +594,6 @@ async fn test_txn_null_gate_fail_safe() -> Result<(), String> {
 /// `CayenneAccelerator` per engine, so both tables resolve to the same metastore
 /// catalog and the commit fuses their publishes into one metastore transaction.
 #[test]
-#[cfg(not(target_os = "windows"))]
 fn test_txn_multi_table_atomic() -> Result<(), String> {
     // The two-table fused commit plans/unparses deeper than the ~2 MiB default
     // test-thread stack in debug builds (single-table txns stay under it); run
@@ -513,7 +694,6 @@ async fn run_test_txn_multi_table_atomic() -> Result<(), String> {
 /// commits cleanly) proves the conflict is caused by the stale token, not a
 /// broken harness.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[cfg(not(target_os = "windows"))]
 async fn test_txn_occ_conflict_stale_token() -> Result<(), anyhow::Error> {
     use cayenne::metadata::{CreateTableOptions, VortexConfig};
     use cayenne::provider::Error as CayenneError;
@@ -756,7 +936,6 @@ async fn row_a_value(ctx: &SessionContext, table: &str) -> Result<Option<i64>, a
 /// regression (e.g. accidentally publishing synchronously per statement or an
 /// O(n) commit), not against fine-grained perf drift.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[cfg(not(target_os = "windows"))]
 async fn bench_txn_gated_commit_throughput() -> Result<(), String> {
     let _tracing = crate::init_tracing(Some("integration=info"));
 

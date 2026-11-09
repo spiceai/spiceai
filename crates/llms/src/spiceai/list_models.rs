@@ -22,7 +22,9 @@ use secrecy::{ExposeSecret, SecretString};
 use std::collections::HashMap;
 
 use crate::config::HostedModelConfig;
-use crate::provider::{ListModels, ListModelsError, ListModelsResult, get_required_param};
+use crate::provider::{
+    ListModels, ListModelsResult, classify_openai_compatible_error, get_required_param,
+};
 use crate::spiceai::{api_base, is_cloud_platform};
 
 // Names the provider in credential/network errors. Endpoint-neutral: this lister targets the
@@ -64,7 +66,7 @@ impl SpiceAiModelLister {
             .with_api_key(api_key.map(ExposeSecret::expose_secret));
 
         Self {
-            client: Client::with_config(config),
+            client: crate::provider::client_without_retry(config),
         }
     }
 
@@ -87,23 +89,12 @@ impl ListModels for SpiceAiModelLister {
     }
 
     async fn list_models(&self) -> ListModelsResult<Vec<String>> {
-        let response = self.client.models().list().await.map_err(|e| {
-            let message = e.to_string();
-            if message.contains("401") || message.contains("Unauthorized") {
-                ListModelsError::InvalidCredentials {
-                    provider: PROVIDER_NAME.to_string(),
-                }
-            } else if message.contains("429") || message.contains("rate") {
-                ListModelsError::RateLimited {
-                    provider: PROVIDER_NAME.to_string(),
-                }
-            } else {
-                ListModelsError::NetworkError {
-                    provider: PROVIDER_NAME.to_string(),
-                    message,
-                }
-            }
-        })?;
+        let response = self
+            .client
+            .models()
+            .list()
+            .await
+            .map_err(|e| classify_openai_compatible_error(&e, PROVIDER_NAME))?;
 
         let models: Vec<String> = response.data.into_iter().map(|m| m.id).collect();
 
@@ -118,6 +109,11 @@ impl ListModels for SpiceAiModelLister {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::GenericAuthMechanism;
+    use crate::provider::ListModelsError;
+    use serde_json::json;
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
 
     #[test]
     fn test_from_params_missing_key() {
@@ -137,8 +133,17 @@ mod tests {
             SecretString::from("http://localhost:8090"),
         );
 
-        SpiceAiModelLister::from_params(&params)
+        let lister = SpiceAiModelLister::from_params(&params)
             .expect("a Spice runtime endpoint should not require an API key");
+        // The self-hosted runtime is the one listed, not the cloud default, and
+        // no credential is invented for it.
+        let config = lister.client.config();
+        assert_eq!(config.base_url, "http://localhost:8090/v1");
+        assert!(
+            config.auth.is_none(),
+            "no key was configured, so none may be sent: {:?}",
+            config.auth
+        );
     }
 
     #[test]
@@ -163,13 +168,34 @@ mod tests {
             "spiceai_api_key".to_string(),
             SecretString::from("test-key"),
         );
-        let result = SpiceAiModelLister::from_params(&params);
-        result.expect("should succeed");
+        let lister = SpiceAiModelLister::from_params(&params).expect("should succeed");
+        let config = lister.client.config();
+        assert_eq!(config.base_url, "https://data.spiceai.io/v1");
+        let Some(GenericAuthMechanism::ApiKey(provider)) = &config.auth else {
+            panic!("the key must be sent as an API key, got: {:?}", config.auth);
+        };
+        assert_eq!(provider.get_token(), "test-key");
     }
 
-    #[test]
-    fn test_common_models_not_empty() {
-        let models = SpiceAiModelLister::common_models();
-        assert!(!models.is_empty());
+    /// A Spice endpoint that lists no models still serves the common ones, so an
+    /// empty listing falls back to them rather than reporting nothing.
+    #[tokio::test]
+    async fn list_models_falls_back_to_common_models_on_an_empty_listing() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/v1/models"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(json!({"object": "list", "data": []})),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+        let endpoint = server.uri();
+        let lister = SpiceAiModelLister::new(None, Some(endpoint.as_str()));
+        let models = lister
+            .list_models()
+            .await
+            .expect("the mock serves an empty listing");
+        assert_eq!(models, SpiceAiModelLister::common_models());
     }
 }

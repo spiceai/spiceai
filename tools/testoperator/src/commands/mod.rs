@@ -24,6 +24,7 @@ use crate::args::{CommonArgs, DatasetTestArgs};
 use test_framework::{
     anyhow,
     app::{App, AppBuilder},
+    layout::{Layout, apply_layout, benchmark_tables},
     opentelemetry_sdk::Resource,
     queries::{Query, QuerySet},
     spiced::{SpicedInstance, StartRequest},
@@ -39,6 +40,7 @@ const AUTOMATIC_REFERENCE_SCHEMA: &str = "__test_reference";
 #[cfg(feature = "append")]
 pub(crate) mod append;
 pub(crate) mod bench;
+pub(crate) mod cold_start;
 pub(crate) mod data_consistency;
 pub(crate) mod dispatch;
 pub(crate) mod htap;
@@ -73,11 +75,12 @@ pub(crate) fn create_telemetry_with_resource(common: &CommonArgs, resource: Reso
 
 /// Build a test configuration with validation data if applicable
 ///
-/// This is a common helper for bench, throughput, and load tests that:
+/// This is a common helper for bench, throughput, load, and query tests that:
 /// 1. Loads the query set from args
 /// 2. Applies query overrides if specified
 /// 3. Adds validation data for scenario queries when validation is enabled
 /// 4. Adds reference schema for validation against known good tables
+/// 5. Fails closed when `--validate` is set but no result oracle can be resolved
 ///
 /// # Returns
 /// Tuple of (`QuerySet`, `NotStarted` builder)
@@ -101,20 +104,62 @@ pub(crate) async fn build_test_with_validation(
         .with_query_set_type(query_set.clone())
         .with_query_overrides(query_overrides);
 
+    let mut has_scenario_validation_data = false;
     // Add validation data if this is a scenario query set with validation enabled
     if args.validate
         && let Some(validation_data) =
             query_set.get_validation_data(args.scenario_query_file.as_deref())?
     {
+        has_scenario_validation_data = !validation_data.is_empty();
         test_builder = test_builder.with_validation_data(validation_data);
     }
 
     // Add reference schema for validation against known good tables
-    if let Some(ref_schema) = reference_schema {
+    if let Some(ref_schema) = reference_schema.clone() {
+        println!("Validating query results against {ref_schema}.* tables");
         test_builder = test_builder.with_reference_schema(Some(ref_schema));
     }
 
+    ensure_validation_oracle(
+        args,
+        &query_set,
+        reference_schema.as_deref(),
+        has_scenario_validation_data,
+    )?;
+
     Ok((query_set, test_builder))
+}
+
+fn has_static_answer_oracle(query_set: &QuerySet, scale_factor: f64) -> bool {
+    matches!(query_set, QuerySet::Tpch | QuerySet::ParameterizedTpch)
+        && (scale_factor - 1.0).abs() < f64::EPSILON
+}
+
+/// `--validate` without an oracle would otherwise fall through to TPC-H gold
+/// files and fail every TPC-DS (or TPC-H SF≠1) query with `NoExpectedAnswer`.
+/// Fail at start with the action that actually produces a comparison.
+fn ensure_validation_oracle(
+    args: &DatasetTestArgs,
+    query_set: &QuerySet,
+    reference_schema: Option<&str>,
+    has_scenario_validation_data: bool,
+) -> anyhow::Result<()> {
+    if !args.validate {
+        return Ok(());
+    }
+    if has_scenario_validation_data
+        || has_static_answer_oracle(query_set, args.scale_factor.unwrap_or(1.0))
+        || reference_schema.is_some()
+    {
+        return Ok(());
+    }
+
+    anyhow::bail!(
+        "--validate is set for query set '{query_set}' but no result oracle is available, so query results cannot be checked. \
+TPC-H has static answers at scale factor 1 only; TPC-DS has none. \
+Compare against unaccelerated clones under a reference schema: start spiced via testoperator (`-s <spiced-binary>`) so it can inject `{AUTOMATIC_REFERENCE_SCHEMA}.*` datasets, \
+or add those clones to the spicepod (`scripts/add_test_reference_datasets.py`) and pass `--reference-schema {AUTOMATIC_REFERENCE_SCHEMA}`."
+    )
 }
 
 fn supports_automatic_reference_validation(query_set: &QuerySet) -> bool {
@@ -408,7 +453,7 @@ pub(crate) async fn get_app_and_start_request(
     // remains unset and all metric operations are no-ops.
 
     let app = load_app(args).await?;
-    let start_request = start_request_from_app(args, app.clone())?;
+    let start_request = start_request_from_app(args, app.clone()).await?;
 
     Ok((app, start_request))
 }
@@ -416,15 +461,70 @@ pub(crate) async fn get_app_and_start_request(
 pub(crate) async fn get_dataset_app_and_start_request(
     args: &DatasetTestArgs,
 ) -> anyhow::Result<(App, StartRequest)> {
-    let mut app = load_app(&args.common).await?;
-    add_automatic_reference_datasets(args, &mut app).await?;
-    let start_request = start_request_from_app(&args.common, app.clone())?;
+    let app = prepare_dataset_app(args).await?;
+    let start_request = start_request_from_app(&args.common, app.clone()).await?;
 
     Ok((app, start_request))
 }
 
-fn start_request_from_app(args: &CommonArgs, app: App) -> anyhow::Result<StartRequest> {
-    let mut start_request = StartRequest::new(args.spiced_path_buf(), from_app(app))?;
+/// The app and start request an HTAP run starts `spiced` with: the spicepod
+/// under its `--layout`. HTAP checks Spice's answers against the source
+/// database itself, so it adds no reference datasets.
+pub(crate) async fn get_htap_app_and_start_request(
+    args: &DatasetTestArgs,
+) -> anyhow::Result<(App, StartRequest)> {
+    ensure_layout_applies(args)?;
+    let mut app = load_app(&args.common).await?;
+    apply_layout_option(args, &mut app)?;
+    let start_request = start_request_from_app(&args.common, app.clone()).await?;
+    Ok((app, start_request))
+}
+
+/// The app a dataset test starts `spiced` with: the spicepod, the
+/// `__test_reference.*` clones `--validate` needs, and the `--layout`.
+pub(crate) async fn prepare_dataset_app(args: &DatasetTestArgs) -> anyhow::Result<App> {
+    let mut app = load_app(&args.common).await?;
+    add_automatic_reference_datasets(args, &mut app).await?;
+    apply_layout_option(args, &mut app)?;
+    Ok(app)
+}
+
+/// Configure `--layout` on the app's accelerated datasets. The reference clones
+/// added before it carry no acceleration, so the layout never reaches them.
+fn apply_layout_option(args: &DatasetTestArgs, app: &mut App) -> anyhow::Result<()> {
+    let Some(layout) = &args.layout else {
+        return Ok(());
+    };
+    let query_set = args.load_query_set()?;
+    let tables = benchmark_tables(&query_set).ok_or_else(|| {
+        anyhow::anyhow!(
+            "--layout needs a benchmark query set with layout keys (tpch, tpch[parameterized], tpcds, clickbench or chbench), not {query_set:?}"
+        )
+    })?;
+    let applied = apply_layout(&mut app.datasets, tables, layout)?;
+    // A layout run is a different test of the same spicepod: its own name keeps
+    // its timings and plans out of the default layout's metric series and
+    // snapshots.
+    app.name = layout_test_name(&app.name, layout);
+    println!(
+        "Configured layout '{layout}' on {} accelerated datasets of '{}':",
+        applied.len(),
+        app.name
+    );
+    for dataset in &applied {
+        println!("  {dataset}");
+    }
+    Ok(())
+}
+
+async fn start_request_from_app(args: &CommonArgs, app: App) -> anyhow::Result<StartRequest> {
+    let mut spicepod = from_app(app);
+    // `from_app` writes the newest spicepod version, which releases before 2.0
+    // reject; `spiced` gets the version the spicepod file declares.
+    spicepod.version = Spicepod::load_exact(args.spicepod_path.clone())
+        .await?
+        .version;
+    let mut start_request = StartRequest::new(args.spiced_path_buf(), spicepod)?;
 
     if let Some(ref data_dir) = args.data_dir {
         start_request = start_request.with_data_dir(data_dir.clone());
@@ -582,6 +682,24 @@ pub(crate) fn ensure_shared_client_connections(
     Ok(())
 }
 
+/// The test name of `name`'s spicepod run under `layout`, following the spicepod
+/// naming convention's test-variant suffix.
+fn layout_test_name(name: &str, layout: &Layout) -> String {
+    format!("{name}-layout[{layout}]")
+}
+
+/// `--layout` rewrites the spicepod testoperator starts `spiced` with, so it
+/// cannot reach an instance testoperator does not start; refuse it there rather
+/// than report results for a layout that was never configured.
+pub(crate) fn ensure_layout_applies(args: &DatasetTestArgs) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        args.layout.is_none()
+            || !(args.common.is_system_adapter() || args.common.is_external_instance()),
+        "--layout configures the spicepod testoperator starts spiced with, so it cannot apply to an external spiced instance or a system adapter; drop --layout, or let testoperator start spiced"
+    );
+    Ok(())
+}
+
 pub(crate) fn duration_millis_between(end: Instant, start: Instant) -> anyhow::Result<u64> {
     let duration = end
         .checked_duration_since(start)
@@ -669,19 +787,29 @@ pub(crate) async fn process_spiced_metrics(
 
 #[cfg(test)]
 mod tests {
+    use std::path::Path;
+
     use clap::Parser;
-    use test_framework::spicepod::component::dataset::Dataset;
+    use test_framework::{
+        gh_utils::map_numbers_to_strings, spicepod::component::dataset::Dataset,
+        utils::scan_directory_for_yamls,
+    };
 
     use super::*;
+    use crate::args::dispatch::DispatchTestFile;
 
     fn validation_args(query_set: &str) -> DatasetTestArgs {
+        validation_args_at_scale(query_set, "100")
+    }
+
+    fn validation_args_at_scale(query_set: &str, scale_factor: &str) -> DatasetTestArgs {
         DatasetTestArgs::parse_from([
             "testoperator",
             "--query-set",
             query_set,
             "--validate",
             "--scale-factor",
-            "100",
+            scale_factor,
         ])
     }
 
@@ -730,6 +858,80 @@ mod tests {
                 .iter()
                 .all(|dataset| dataset.name != "__test_reference.existing.lineitem")
         );
+    }
+
+    #[tokio::test]
+    async fn tpcds_validate_without_reference_is_an_error() {
+        let (args, query_set, _) = validation_context("tpcds").await;
+        let err = ensure_validation_oracle(&args, &query_set, None, false)
+            .expect_err("tpcds --validate with no reference must fail closed");
+        let message = err.to_string();
+        assert!(
+            message.contains("no result oracle"),
+            "error must name the missing oracle: {message}"
+        );
+        assert!(
+            message.contains("__test_reference"),
+            "error must name the reference schema to inject: {message}"
+        );
+    }
+
+    #[tokio::test]
+    async fn tpcds_validate_with_reference_schema_is_ok() {
+        let (args, query_set, _) = validation_context("tpcds").await;
+        ensure_validation_oracle(&args, &query_set, Some("__test_reference"), false)
+            .expect("a resolved reference schema is a TPC-DS oracle");
+    }
+
+    #[tokio::test]
+    async fn tpch_sf1_validate_without_reference_is_ok() {
+        let args = validation_args_at_scale("tpch", "1");
+        let query_set = args.load_query_set().expect("should load query set");
+        ensure_validation_oracle(&args, &query_set, None, false)
+            .expect("TPC-H SF-1 has static answers");
+    }
+
+    #[tokio::test]
+    async fn tpch_sf100_validate_without_reference_is_an_error() {
+        let (args, query_set, _) = validation_context("tpch").await;
+        let err = ensure_validation_oracle(&args, &query_set, None, false)
+            .expect_err("TPC-H SF-100 has no static answers");
+        assert!(
+            err.to_string().contains("no result oracle"),
+            "error must name the missing oracle: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn automatic_tpcds_reference_datasets_can_be_generated() {
+        let (args, query_set, queries) = validation_context("tpcds").await;
+        let table_names = reference_table_names(&queries);
+        assert!(table_names.contains("store_sales"));
+
+        let mut app = App::default();
+        add_unqualified_datasets(&mut app, &table_names);
+
+        assert_eq!(
+            validation_reference_schema(&args, &app, &query_set, &queries, false),
+            None
+        );
+
+        add_automatic_reference_datasets(&args, &mut app)
+            .await
+            .expect("should add TPC-DS reference datasets");
+
+        assert!(
+            app.datasets
+                .iter()
+                .any(|dataset| dataset.name == "__test_reference.store_sales")
+        );
+        assert_eq!(
+            validation_reference_schema(&args, &app, &query_set, &queries, false),
+            Some("__test_reference".to_string())
+        );
+
+        ensure_validation_oracle(&args, &query_set, Some("__test_reference"), false)
+            .expect("generated TPC-DS references are an oracle");
     }
 
     #[tokio::test]
@@ -813,6 +1015,298 @@ mod tests {
         assert_eq!(
             validation_reference_schema(&args, &app, &query_set, &queries, false),
             Some("__test_reference".to_string())
+        );
+    }
+
+    /// Scale factor 1 benchmarks that keep an explicit `validate_results: false`,
+    /// each with its reason in its dispatch file:
+    ///
+    /// - `glue[csv]` and `iceberg[hadoop]`: TPC-H Q6 returns a wrong answer. Both
+    ///   sources type `l_discount` as a double, and Spice types the literal
+    ///   `0.06 + 0.01` as a `Float64` just below 0.07, so Q6's `BETWEEN` drops
+    ///   every row at 0.07.
+    /// - `mssql`, `mssql[catalog]` and `odbc[athena]`: their TPC-H tables hold
+    ///   different text columns than the parquet the TPC-H answer files were
+    ///   computed from, so no answer file is their oracle.
+    /// - The TPC-H sources that hold `DuckDB` 1.x data — Databricks, Glue, Oracle,
+    ///   Spice Cloud, Snowflake, `DynamoDB` and `BigQuery`: `DuckDB` 1.x writes
+    ///   different free-text columns than `dbgen`, so Q2, Q10, Q13 and Q20 cannot
+    ///   match the answer files.
+    ///
+    /// - The six `ClickBench` arms whose acceleration holds only part of the
+    ///   source, because a runner cannot hold all of it: their `refresh_sql` keeps
+    ///   a subset, while the `__test_reference.*` clone drops acceleration and
+    ///   reads every row, so it answers a different question. A `LIMIT` subset
+    ///   also keeps unspecified rows, so no reference could be built for it.
+    ///
+    /// Every other scale factor 1 TPC-H, TPC-DS and `ClickBench` dispatch must
+    /// validate against an oracle.
+    const BENCH_DISPATCHES_THAT_SKIP_RESULT_VALIDATION: &[&str] = &[
+        "clickbench/sf1/accelerated/s3[parquet]-arrow.yaml",
+        "clickbench/sf1/accelerated/s3[parquet]-arrow-partitioned.yaml",
+        "clickbench/sf1/accelerated/s3[parquet]-cayenne[memory].yaml",
+        "clickbench/sf1/accelerated/s3[parquet]-postgres.yaml",
+        "clickbench/sf1/accelerated/s3[parquet]-sqlite[memory].yaml",
+        "tpch/sf1/accelerated/databricks[delta_lake]-cayenne[file].yaml",
+        "tpch/sf1/federated/adbc[bigquery].yaml",
+        "tpch/sf1/federated/databricks[catalog].yaml",
+        "tpch/sf1/federated/databricks[delta_lake].yaml",
+        "tpch/sf1/federated/databricks[spark_connect].yaml",
+        "tpch/sf1/federated/databricks[sql_warehouse].yaml",
+        "tpch/sf1/federated/dynamodb.yaml",
+        "tpch/sf1/federated/glue[catalog].yaml",
+        "tpch/sf1/federated/glue[csv].yaml",
+        "tpch/sf1/federated/glue[parquet].yaml",
+        "tpch/sf1/federated/iceberg[hadoop].yaml",
+        "tpch/sf1/federated/mssql.yaml",
+        "tpch/sf1/federated/mssql[catalog].yaml",
+        "tpch/sf1/federated/odbc[athena].yaml",
+        "tpch/sf1/federated/oracle.yaml",
+        "tpch/sf1/federated/oracle[catalog].yaml",
+        "tpch/sf1/federated/snowflake[catalog].yaml",
+        "tpch/sf1/federated/spicecloud.yaml",
+        "tpch/sf1/federated/spicecloud[catalog].yaml",
+    ];
+
+    /// rustc `--test` names this module's tests `commands::tests::<fn>`.
+    /// nextest's `test(=…)` matches that string exactly, so the leaf name
+    /// selects nothing and `make nextest` would stay green after a dispatch
+    /// dropped validation.
+    fn oracle_dispatch_guard_rustc_test_name() -> String {
+        format!(
+            "{}::benchmark_dispatches_validate_results_against_an_oracle",
+            module_path!()
+                .strip_prefix(concat!(env!("CARGO_PKG_NAME"), "::"))
+                .expect("unit-test module_path starts with the crate name")
+        )
+    }
+
+    fn makefile_nextest_filter() -> String {
+        let makefile =
+            std::fs::read_to_string(Path::new(env!("CARGO_MANIFEST_DIR")).join("../../Makefile"))
+                .expect("should read the repository Makefile");
+        makefile
+            .lines()
+            .find(|line| line.starts_with("NEXTEST_FILTER :="))
+            .expect("Makefile should define NEXTEST_FILTER")
+            .to_string()
+    }
+
+    #[test]
+    fn nextest_filter_selects_the_oracle_dispatch_guard_by_its_rustc_name() {
+        let rustc_test_name = oracle_dispatch_guard_rustc_test_name();
+        assert_eq!(
+            rustc_test_name,
+            "commands::tests::benchmark_dispatches_validate_results_against_an_oracle",
+            "this function's rustc --test name is what nextest's test(=…) must match"
+        );
+        let filter = makefile_nextest_filter();
+        let needle = format!("test(={rustc_test_name})");
+        assert!(
+            filter.contains(&needle),
+            "NEXTEST_FILTER must select the oracle dispatch guard with `{needle}`; a leaf-only test(=…) matches no test. filter={filter}"
+        );
+    }
+
+    /// Whether `testoperator_run_bench.yml` starts a local `PostgreSQL` whose
+    /// version `postgres_version` sets: its `postgres_tpch` service (the
+    /// condition on that service's image), or the CH-benCH source.
+    fn reads_the_local_postgres_source(
+        query_set: &str,
+        scale_factor: &str,
+        spicepod: &str,
+    ) -> bool {
+        query_set == "chbench"
+            || (spicepod.contains("postgres")
+                && !spicepod.contains("ducklake")
+                && (((query_set.starts_with("tpch") || query_set == "tpcds")
+                    && (scale_factor == "1" || scale_factor == "10"))
+                    || (query_set == "clickbench" && spicepod.contains("s3[parquet]-postgres"))))
+    }
+
+    /// Every CH-benCH HTAP dispatch config names source versions its source
+    /// lists, so a weekly source-version run cannot start an unsupported or
+    /// retired server.
+    #[test]
+    fn htap_dispatches_expand_to_listed_source_versions() {
+        let dispatch_root = Path::new(env!("CARGO_MANIFEST_DIR")).join("dispatch/chbench");
+        let mut runs = 0;
+        for dispatch_path in
+            scan_directory_for_yamls(&dispatch_root).expect("should scan the dispatch directory")
+        {
+            let dispatch_file =
+                std::fs::File::open(&dispatch_path).expect("should open the dispatch file");
+            let dispatch: DispatchTestFile =
+                yaml::from_reader(dispatch_file).expect("should parse the dispatch file");
+            for htap in &dispatch.tests.htap {
+                runs += htap
+                    .expand_runs()
+                    .unwrap_or_else(|e| panic!("{}: {e}", dispatch_path.display()))
+                    .len();
+            }
+        }
+        assert!(runs > 0, "should find CH-benCH HTAP dispatches");
+    }
+
+    /// Every scale factor 1 TPC-H, TPC-DS, `ClickBench` and CH-benCH benchmark
+    /// dispatch validates its results against an oracle it can actually resolve,
+    /// except those in `BENCH_DISPATCHES_THAT_SKIP_RESULT_VALIDATION`. Benchmarks
+    /// at larger scale factors measure performance and leave `validate_results`
+    /// unset.
+    ///
+    /// Each `bench` entry is resolved the way `testoperator_run_bench.yml` runs
+    /// it — the inputs `testoperator dispatch` sends (one run per layout and
+    /// `PostgreSQL` line it expands to), the spicepod under
+    /// `test/spicepods/<query set>/sf<scale factor>/` (`test/spicepods/chbench/`
+    /// for CH-benCH), `spiced` started by testoperator — through the same calls a
+    /// run makes before its first query, layout included.
+    /// `--validate` stops a run that has no oracle, so a dispatch that could not
+    /// be validated fails here instead of in the scheduled run.
+    #[tokio::test]
+    async fn benchmark_dispatches_validate_results_against_an_oracle() {
+        nextest_filter_selects_the_oracle_dispatch_guard_by_its_rustc_name();
+        let repo_root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let dispatch_root = repo_root.join("tools/testoperator/dispatch");
+        let mut checked = 0;
+        let mut seen_opt_outs = BTreeSet::new();
+        for query_set_directory in ["tpch", "tpcds", "clickbench", "chbench"] {
+            let dispatch_directory = dispatch_root.join(query_set_directory);
+            for dispatch_path in scan_directory_for_yamls(&dispatch_directory)
+                .expect("should scan the dispatch directory")
+            {
+                let dispatch_file =
+                    std::fs::File::open(&dispatch_path).expect("should open the dispatch file");
+                let dispatch: DispatchTestFile =
+                    yaml::from_reader(dispatch_file).expect("should parse the dispatch file");
+                let relative = dispatch_path
+                    .strip_prefix(&dispatch_root)
+                    .expect("dispatch file is under the dispatch directory")
+                    .to_string_lossy()
+                    .replace('\\', "/");
+                if BENCH_DISPATCHES_THAT_SKIP_RESULT_VALIDATION.contains(&relative.as_str()) {
+                    seen_opt_outs.insert(relative);
+                    for bench in &dispatch.tests.bench {
+                        let dispatch_name = dispatch_path.display();
+                        assert_eq!(
+                            bench.validate_results,
+                            Some(false),
+                            "{dispatch_name} is opted out of result validation for the reason in its dispatch file; keep `validate_results: false`"
+                        );
+                        checked += 1;
+                    }
+                    continue;
+                }
+                for throughput in &dispatch.tests.throughput {
+                    throughput
+                        .ensure_only_bench_settings_unset("throughput")
+                        .unwrap_or_else(|e| panic!("{}: {e}", dispatch_path.display()));
+                }
+                for load in &dispatch.tests.load {
+                    load.bench_args
+                        .ensure_only_bench_settings_unset("load")
+                        .unwrap_or_else(|e| panic!("{}: {e}", dispatch_path.display()));
+                }
+                let runs = dispatch
+                    .tests
+                    .bench
+                    .iter()
+                    .flat_map(|bench| {
+                        bench
+                            .expand_runs()
+                            .unwrap_or_else(|e| panic!("{}: {e}", dispatch_path.display()))
+                    })
+                    .collect::<Vec<_>>();
+                for bench in &runs {
+                    let dispatch_name = dispatch_path.display();
+
+                    // The workflow inputs, exactly as `testoperator dispatch` sends them.
+                    let inputs = map_numbers_to_strings(
+                        serde_json::to_value(bench).expect("should serialize the bench inputs"),
+                    );
+                    let query_set = inputs["query_set"]
+                        .as_str()
+                        .expect("query_set should serialize as a string");
+                    let scale_factor = inputs["scale_factor"].as_str().unwrap_or("1");
+                    if scale_factor != "1" {
+                        assert_eq!(
+                            bench.validate_results, None,
+                            "{dispatch_name} benchmarks scale factor {scale_factor}, which measures performance; results are validated at scale factor 1, so leave `validate_results` unset"
+                        );
+                        checked += 1;
+                        continue;
+                    }
+                    assert_eq!(
+                        bench.validate_results,
+                        Some(true),
+                        "{dispatch_name} must set `validate_results: true` on its scale factor 1 bench test"
+                    );
+                    if bench.postgres_version.is_some() {
+                        assert!(
+                            reads_the_local_postgres_source(
+                                query_set,
+                                scale_factor,
+                                &bench.spicepod_path.to_string_lossy()
+                            ),
+                            "{dispatch_name} sets `postgres_version`, but testoperator_run_bench.yml starts its local postgres_tpch service only for a `postgres` spicepod (not DuckLake) on TPC-H or TPC-DS at scale factor 1 or 10, or for ClickBench's s3[parquet]-postgres, so the version would not apply"
+                        );
+                    }
+                    // testoperator_run_bench.yml's path: CH-benCH spicepods carry no
+                    // scale-factor directory, since the scale factor sets the source.
+                    let spicepod_path = if query_set == "chbench" {
+                        repo_root
+                            .join("test/spicepods/chbench")
+                            .join(&bench.spicepod_path)
+                    } else {
+                        repo_root
+                            .join("test/spicepods")
+                            .join(query_set.split('[').next().unwrap_or(query_set))
+                            .join(format!("sf{scale_factor}"))
+                            .join(&bench.spicepod_path)
+                    };
+                    let spicepod_path = spicepod_path.to_string_lossy();
+
+                    let mut command_line = vec![
+                        "testoperator",
+                        "--spicepod-path",
+                        spicepod_path.as_ref(),
+                        "--query-set",
+                        query_set,
+                        "--scale-factor",
+                        scale_factor,
+                        "--validate",
+                    ];
+                    if let Some(query_overrides) = inputs["query_overrides"].as_str() {
+                        command_line.extend(["--query-overrides", query_overrides]);
+                    }
+                    if let Some(layout) = inputs["layout"].as_str() {
+                        command_line.extend(["--layout", layout]);
+                    }
+                    let args = DatasetTestArgs::try_parse_from(command_line).unwrap_or_else(|e| {
+                        panic!("{dispatch_name} should translate to testoperator arguments: {e}")
+                    });
+
+                    let app = prepare_dataset_app(&args).await.unwrap_or_else(|e| {
+                        panic!("{dispatch_name} should load its spicepod, add its reference datasets and configure its layout: {e:#}")
+                    });
+                    if let Err(e) = build_test_with_validation(&args, &app, NotStarted::new()).await
+                    {
+                        panic!("{dispatch_name} cannot validate its results: {e}");
+                    }
+                    checked += 1;
+                }
+            }
+        }
+        assert_eq!(
+            seen_opt_outs,
+            BENCH_DISPATCHES_THAT_SKIP_RESULT_VALIDATION
+                .iter()
+                .map(|path| (*path).to_string())
+                .collect::<BTreeSet<_>>(),
+            "every listed result-validation opt-out must exist as a dispatch file"
+        );
+        assert!(
+            checked > 0,
+            "should find TPC-H, TPC-DS and ClickBench benchmark dispatches"
         );
     }
 }

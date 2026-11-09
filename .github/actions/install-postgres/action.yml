@@ -19,7 +19,10 @@ runs:
         sudo apt-get update
         sudo apt-get install -y postgresql
         sudo service postgresql start
-        sleep 5
+        for attempt in {1..30}; do
+          pg_isready -q && break
+          sleep 1
+        done
         sudo -u postgres psql -tc "SELECT 1 FROM pg_roles WHERE rolname='postgres'" | grep -q 1 || sudo -u postgres createuser -s postgres
         sudo -u postgres psql -c "ALTER USER postgres PASSWORD 'postgres';"
         sudo -u postgres createdb ${{ inputs.pg-db }}
@@ -28,20 +31,41 @@ runs:
       if: runner.os == 'macOS'
       shell: bash
       run: |
+        # Homebrew's API and bottle hosts fail transiently; retry each network step.
+        retry() {
+          for attempt in 1 2 3; do
+            "$@" && return 0
+            echo "::warning::'$*' failed (attempt ${attempt}/3)"
+            sleep $((attempt * 15))
+          done
+          return 1
+        }
         # macos-15 runner bug requires 'brew update': https://github.com/actions/runner-images/issues/11855#issuecomment-2754201066
-        brew update
-        brew install postgresql
-        export PATH="/opt/homebrew/opt/postgresql@18/bin:$PATH"
-        echo "/opt/homebrew/opt/postgresql@18/bin" >> $GITHUB_PATH
+        # A stale index only matters if the install below fails, so don't fail on it here.
+        retry brew update || echo "::warning::brew update failed; installing with the image's formula index"
+        retry brew install postgresql@18
+        pg_bin="$(brew --prefix postgresql@18)/bin"
+        export PATH="${pg_bin}:$PATH"
+        echo "${pg_bin}" >> "$GITHUB_PATH"
         brew services start postgresql@18
-        sleep 5
+        for attempt in {1..30}; do
+          pg_isready -q && break
+          sleep 1
+        done
         createuser -s postgres
         psql -d postgres -c "ALTER USER postgres PASSWORD 'postgres';"
         createdb ${{ inputs.pg-db }}
 
     - name: Wait for PostgreSQL to start
       shell: bash
-      run: sleep 10
+      run: |
+        for attempt in {1..30}; do
+          pg_isready -h localhost -q && exit 0
+          sleep 1
+        done
+        echo "::error::PostgreSQL is not accepting connections on localhost after 30s"
+        pg_isready -h localhost
+        exit 1
 
     - name: Check PostgreSQL
       shell: bash

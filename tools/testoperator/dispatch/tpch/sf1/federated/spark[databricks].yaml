@@ -1,8 +1,0 @@
-tests:
-  bench:
-    spicepod_path: federated/spark[databricks].yaml
-    query_set: tpch
-    query_overrides: spark
-    runner_type: spiceai-dev-runners
-    validate_results: true
-    ready_wait: 900

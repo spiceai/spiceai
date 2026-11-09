@@ -1,0 +1,33 @@
+name: mysql-unsigned-negation
+description: >
+  Native MySQL unsigned columns negate to signed results and reject overflow,
+  including comparisons and IN predicates.
+sources:
+  src: { kind: mysql }
+spicepod:
+  version: v1
+  kind: Spicepod
+  name: mysql-unsigned-negation
+  datasets:
+    - { from: 'mysql:native_u', name: native_u, params: '${sources.src.params}' }
+defaults:
+  expect: { oracle: src }
+steps:
+  - source-exec:
+      src: >
+        CREATE TABLE native_u (id int PRIMARY KEY, u BIGINT UNSIGNED);
+        INSERT INTO native_u VALUES (1,0), (2,1), (3,9223372036854775807),
+        (4,9223372036854775808), (5,9223372036854775809), (6,18446744073709551615), (7,NULL);
+  - start: {}
+  - query: SELECT id, -u AS n FROM native_u WHERE id <= 4 ORDER BY id
+  - query: SELECT arrow_typeof(u) AS a, arrow_typeof(-u) AS b FROM native_u WHERE id = 1
+    expect: { rows: [[UInt64, Int64]] }
+  - query: SELECT -u AS n FROM native_u WHERE id = 5
+    expect-error: true
+  - query: SELECT -u AS n FROM native_u WHERE id = 6
+    expect-error: true
+  - query: SELECT -u < 0 AS b FROM native_u WHERE id = 5
+    expect-error: true
+  - query: SELECT id, -u AS n FROM native_u WHERE id = 7
+  - query: SELECT -u IN (-1, -2) AS b FROM native_u WHERE id = 5
+    expect-error: true

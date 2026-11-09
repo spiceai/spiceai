@@ -264,6 +264,10 @@ impl DataConnectorFactory for FlightSQLFactory {
             }
             // Extract bearer token for per-endpoint client auth propagation.
             let token = client.token().cloned();
+            #[expect(
+                clippy::disallowed_methods,
+                reason = "installs `deny_spice_specific_functions()` with `with_function_support` a few lines below"
+            )]
             let flightsql_factory =
                 DataComponentFlightSQLFactory::new(client, endpoint, cookie_store);
             let flightsql_factory = if let Some(t) = token {

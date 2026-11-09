@@ -20,10 +20,14 @@ edition.workspace = true
 version.workspace = true
 rust-version.workspace = true
 license-file.workspace = true
+repository.workspace = true
 description = "PostgreSQL data connector for Spice.ai runtime"
 
 [dependencies]
 linkme.workspace = true
+arrow.workspace = true
+arrow-schema.workspace = true
+arrow_tools = { path = "../../arrow_tools" }
 async-stream.workspace = true
 async-trait.workspace = true
 serde.workspace = true

@@ -14,12 +14,11 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-//! The process-wide segment cache lives in a `OnceLock`, so it is exercised from
-//! its own integration binary rather than a unit test that would leak the install
-//! into every other test in the library binary.
+//! The process-wide segment cache lives in a `OnceLock`, so this needs a process
+//! of its own rather than a unit test that would leak the install into every
+//! other test in the library binary (see `crate::require_process_per_test`).
 //!
-//! All of it is one test on purpose: install order is process state, and the
-//! default test harness runs a binary's tests on threads of one process.
+//! All of it is one test on purpose: install order is process state.
 
 use vortex::VortexSessionDefault;
 use vortex::session::VortexSession;
@@ -37,6 +36,9 @@ fn format() -> VortexFormat {
 
 #[test]
 fn the_installed_cache_is_shared_by_every_format_and_installed_once() {
+    crate::require_process_per_test(
+        "this test installs the process-wide segment cache, which cannot be undone",
+    );
     // Before any install, and with no per-format size, scans run uncached.
     assert_eq!(
         format().segment_cache_capacity_bytes(),

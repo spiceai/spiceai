@@ -1,0 +1,985 @@
+/*
+Copyright 2024-2026 The Spice.ai OSS Authors
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+     https://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+*/
+
+//! Guards for upstream `DataFusion` wrong-results fixes that the `spiceai-54` fork
+//! carries as backports (see `docs/dev/fork_patches.md`). Each test runs the
+//! fix's upstream regression query in a session built from the configuration
+//! every Spice session starts from, and fails if the backport is lost when the
+//! fork is re-cut.
+
+use std::path::Path;
+
+use arrow::util::display::array_value_to_string;
+use datafusion::prelude::{SessionConfig, SessionContext};
+
+use crate::session_config::get_df_default_config;
+
+/// A session built from the configuration every Spice session starts from.
+fn spice_session(configure: impl FnOnce(&mut SessionConfig)) -> SessionContext {
+    let mut config = get_df_default_config();
+    configure(&mut config);
+    SessionContext::new_with_config(config)
+}
+
+async fn run_statements(ctx: &SessionContext, statements: &[&str]) {
+    for statement in statements {
+        ctx.sql(statement)
+            .await
+            .expect("setup statement plans")
+            .collect()
+            .await
+            .expect("setup statement runs");
+    }
+}
+
+/// The rows `sql` returns, in order, rendered as `a,b,…` with NULL spelled out,
+/// or the error it fails with.
+async fn answer(ctx: &SessionContext, sql: &str) -> Result<Vec<String>, String> {
+    let batches = ctx
+        .sql(sql)
+        .await
+        .map_err(|error| error.to_string())?
+        .collect()
+        .await
+        .map_err(|error| error.to_string())?;
+    let mut rows = Vec::new();
+    for batch in &batches {
+        for row in 0..batch.num_rows() {
+            let mut rendered = Vec::with_capacity(batch.num_columns());
+            for column in batch.columns() {
+                rendered.push(if column.is_null(row) {
+                    "NULL".to_string()
+                } else {
+                    array_value_to_string(column, row).map_err(|error| error.to_string())?
+                });
+            }
+            rows.push(rendered.join(","));
+        }
+    }
+    Ok(rows)
+}
+
+/// [`answer`], sorted, for a query whose row order SQL does not fix.
+async fn sorted_answer(ctx: &SessionContext, sql: &str) -> Result<Vec<String>, String> {
+    let mut rows = answer(ctx, sql).await?;
+    rows.sort_unstable();
+    Ok(rows)
+}
+
+fn sorted(rows: &[&str]) -> Vec<String> {
+    let mut rows: Vec<String> = rows.iter().map(ToString::to_string).collect();
+    rows.sort_unstable();
+    rows
+}
+
+fn owned(rows: &[&str]) -> Vec<String> {
+    rows.iter().map(ToString::to_string).collect()
+}
+
+/// apache/datafusion#22810. `NOT IN (subquery)` is a null-aware anti join, and
+/// `SortMergeJoinExec` has no null-aware mode; with `prefer_hash_join` off the
+/// planner picked it anyway, and the NULL in the subquery stopped excluding rows.
+#[tokio::test(flavor = "multi_thread")]
+async fn not_in_stays_a_hash_join_when_sort_merge_joins_are_preferred() {
+    let ctx = spice_session(|config| {
+        config.options_mut().optimizer.prefer_hash_join = false;
+        config.options_mut().execution.target_partitions = 4;
+    });
+    run_statements(
+        &ctx,
+        &[
+            "CREATE TABLE nia_left(x INT) AS VALUES (1), (2), (3), (4)",
+            "CREATE TABLE nia_right(y INT) AS VALUES (2), (NULL)",
+        ],
+    )
+    .await;
+    assert_eq!(
+        answer(
+            &ctx,
+            "SELECT x FROM nia_left WHERE x NOT IN (SELECT y FROM nia_right) ORDER BY x"
+        )
+        .await,
+        Ok(Vec::new()),
+        "a NULL among the subquery's values leaves no row selected"
+    );
+}
+
+/// apache/datafusion#23684. The `TopK` aggregation over `max(y)` dropped the
+/// groups whose maximum is NULL.
+#[tokio::test(flavor = "multi_thread")]
+async fn topk_aggregation_keeps_groups_whose_max_is_null() {
+    let ctx = spice_session(|_| {});
+    run_statements(
+        &ctx,
+        &["CREATE TABLE topk_mixed(s VARCHAR, y BIGINT) AS VALUES ('n1', CAST(NULL AS BIGINT)), ('n2', CAST(NULL AS BIGINT)), ('v1', 10), ('v2', 20), ('v3', 30)"],
+    )
+    .await;
+    let top = |order: &str| {
+        format!(
+            "SELECT max_y FROM (SELECT s, max(y) AS max_y FROM topk_mixed GROUP BY s) ORDER BY max_y {order} LIMIT 4"
+        )
+    };
+    assert_eq!(
+        answer(&ctx, &top("DESC NULLS LAST")).await,
+        Ok(owned(&["30", "20", "10", "NULL"]))
+    );
+    assert_eq!(
+        answer(&ctx, &top("DESC NULLS FIRST")).await,
+        Ok(owned(&["NULL", "NULL", "30", "20"]))
+    );
+}
+
+/// apache/datafusion#24247. The simplifier folded `log(a, 1)`, `log(a, a)`,
+/// `power(a, 0)` and their kin to constants, which is wrong where `a` is NULL.
+#[tokio::test(flavor = "multi_thread")]
+async fn log_and_power_simplification_keeps_null() {
+    let ctx = spice_session(|_| {});
+    assert_eq!(
+        answer(
+            &ctx,
+            "SELECT log(a, 1) IS NULL, log(a, a) IS NULL, log(a, power(a, b)) IS NULL, power(a, 0) IS NULL, power(a, log(a, b)) IS NULL FROM (VALUES (CAST(NULL AS DOUBLE), CAST(2.0 AS DOUBLE))) AS t(a, b)"
+        )
+        .await,
+        Ok(owned(&["true,true,true,true,true"]))
+    );
+}
+
+/// apache/datafusion#24248. The simplifier folded `(a XOR b) XOR a` to `b` and
+/// `a XOR a` to `0`, which is wrong where `a` is NULL.
+#[tokio::test(flavor = "multi_thread")]
+async fn xor_simplification_keeps_null() {
+    let ctx = spice_session(|_| {});
+    assert_eq!(
+        sorted_answer(
+            &ctx,
+            "SELECT (a # b) # a AS l, a # (b # a) AS r, a # a AS s FROM (VALUES (CAST(NULL AS INT), 7), (3, 7)) AS t(a, b)"
+        )
+        .await,
+        Ok(sorted(&["7,7,0", "NULL,NULL,NULL"]))
+    );
+}
+
+/// apache/datafusion#24380. The simplifier folded `col ~ '.*'` to `true`, which
+/// is wrong where `col` is NULL.
+#[tokio::test(flavor = "multi_thread")]
+async fn regex_match_all_simplification_keeps_null() {
+    let ctx = spice_session(|_| {});
+    assert_eq!(
+        answer(
+            &ctx,
+            "WITH vals(id, col) AS (VALUES (1, 'foo'), (2, ''), (3, CAST(NULL AS VARCHAR))) SELECT col, col ~ '.*' FROM vals ORDER BY id"
+        )
+        .await,
+        Ok(owned(&["foo,true", ",true", "NULL,NULL"]))
+    );
+}
+
+/// apache/datafusion#24686. Merging nested projections that each redefine `i`
+/// substituted the wrong layer, so six `i + 1` layers added three.
+#[tokio::test(flavor = "multi_thread")]
+async fn nested_projections_keep_every_layer() {
+    let ctx = spice_session(|_| {});
+    run_statements(&ctx, &["CREATE TABLE np(i INT) AS VALUES (3), (4), (5)"]).await;
+    assert_eq!(
+        sorted_answer(
+            &ctx,
+            "SELECT i FROM (SELECT i + 1 AS i FROM (SELECT i + 1 AS i FROM (SELECT i + 1 AS i FROM (SELECT i + 1 AS i FROM (SELECT i + 1 AS i FROM (SELECT i + 1 AS i FROM np))))))"
+        )
+        .await,
+        Ok(sorted(&["9", "10", "11"]))
+    );
+}
+
+/// apache/datafusion#24958. A sort pushed below a `GlobalLimitExec` ignored its
+/// `skip`, so `LIMIT 4 OFFSET 3` returned one row. The inner limit has no order,
+/// so which four rows it keeps is not fixed; how many it keeps is.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_sort_over_limit_offset_keeps_every_row() {
+    let ctx = spice_session(|_| {});
+    run_statements(
+        &ctx,
+        &["CREATE TABLE t1(a INT) AS VALUES (1), (2), (3), (4), (5), (6), (7), (8), (9), (10)"],
+    )
+    .await;
+    let rows = answer(
+        &ctx,
+        "SELECT * FROM (SELECT a FROM t1 LIMIT 4 OFFSET 3) ORDER BY a",
+    )
+    .await;
+    assert_eq!(rows.map(|rows| rows.len()), Ok(4));
+}
+
+/// apache/datafusion#24997. `COUNT` with `ORDER BY` counted only its first
+/// argument, and grouped it panicked.
+#[tokio::test(flavor = "multi_thread")]
+async fn count_with_order_by_counts_every_argument() {
+    let ctx = spice_session(|_| {});
+    run_statements(
+        &ctx,
+        &["CREATE TABLE count_order_by_t(a INT, b INT, c INT) AS VALUES (1, NULL, 10), (2, 20, 10), (3, 30, 20), (NULL, 40, 20)"],
+    )
+    .await;
+    assert_eq!(
+        answer(&ctx, "SELECT COUNT(a, c ORDER BY b) FROM count_order_by_t").await,
+        Ok(owned(&["3"]))
+    );
+    assert_eq!(
+        sorted_answer(
+            &ctx,
+            "SELECT c, COUNT(a ORDER BY b) FROM count_order_by_t GROUP BY c"
+        )
+        .await,
+        Ok(sorted(&["10,2", "20,1"]))
+    );
+}
+
+/// apache/datafusion#25348. `3 NOT IN (subquery)` compares a constant, and its
+/// plan ignored a NULL among the subquery's values.
+#[tokio::test(flavor = "multi_thread")]
+async fn constant_not_in_sees_the_subquerys_null() {
+    let ctx = spice_session(|_| {});
+    run_statements(
+        &ctx,
+        &[
+            "CREATE TABLE naconst_t1(id INT) AS VALUES (1), (2)",
+            "CREATE TABLE naconst_t2(id INT) AS VALUES (1), (NULL)",
+        ],
+    )
+    .await;
+    assert_eq!(
+        answer(
+            &ctx,
+            "SELECT id FROM naconst_t1 WHERE 3 NOT IN (SELECT id FROM naconst_t2) ORDER BY id"
+        )
+        .await,
+        Ok(Vec::new())
+    );
+}
+
+/// A correlated `NOT IN (subquery)` in a `WHERE` clause is planned as the
+/// `NOT EXISTS` it equals there. The fork's null-aware hash join takes a single
+/// key and checks the subquery's NULLs over every row, so with a correlation it
+/// applied the NULL rules to the correlation key, missed that the correlation
+/// excludes a NULL, or failed to plan. The expected rows are `SQLite`'s.
+#[tokio::test(flavor = "multi_thread")]
+async fn correlated_not_in_is_answered_as_not_exists() {
+    let ctx = spice_session(|_| {});
+    run_statements(
+        &ctx,
+        &[
+            "CREATE TABLE nacorr_t1(id INT, g INT) AS VALUES (1, 1), (2, 2), (3, NULL), (NULL, 1)",
+            "CREATE TABLE nacorr_t2(id INT, g INT) AS VALUES (1, 1), (NULL, 2), (4, NULL), (2, 3)",
+        ],
+    )
+    .await;
+    let cases: [(&str, &[&str]); 4] = [
+        (
+            "SELECT id FROM nacorr_t1 WHERE 3 NOT IN \
+             (SELECT nacorr_t2.id FROM nacorr_t2 WHERE nacorr_t2.g = nacorr_t1.g)",
+            &["1", "3", "NULL"],
+        ),
+        (
+            "SELECT id FROM nacorr_t1 WHERE nacorr_t1.id NOT IN \
+             (SELECT nacorr_t2.id FROM nacorr_t2 WHERE nacorr_t2.g = nacorr_t1.g)",
+            &["3"],
+        ),
+        (
+            "SELECT id FROM nacorr_t1 WHERE 3 NOT IN \
+             (SELECT nacorr_t2.id FROM nacorr_t2 WHERE nacorr_t2.g > nacorr_t1.g)",
+            &["2", "3"],
+        ),
+        (
+            "SELECT id FROM nacorr_t1 WHERE nacorr_t1.id NOT IN \
+             (SELECT nacorr_t2.id FROM nacorr_t2 WHERE nacorr_t2.g > nacorr_t1.g)",
+            &["3"],
+        ),
+    ];
+    let mut answers = Vec::with_capacity(cases.len());
+    for (sql, _) in cases {
+        answers.push((sql, sorted_answer(&ctx, sql).await));
+    }
+    let expected: Vec<_> = cases
+        .iter()
+        .map(|(sql, rows)| (*sql, Ok(sorted(rows))))
+        .collect();
+    assert_eq!(answers, expected);
+}
+
+/// apache/datafusion#24516. A scalar subquery that returns no rows is NULL, but its
+/// nullability came from its projected field, so `IS NULL` over one whose field is
+/// non-nullable was folded to `false`.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_empty_scalar_subquery_is_null() {
+    let ctx = spice_session(|_| {});
+    run_statements(
+        &ctx,
+        &[
+            "CREATE TABLE essq_t(id INT) AS VALUES (1), (2)",
+            "CREATE TABLE essq_u(z INT NOT NULL)",
+        ],
+    )
+    .await;
+    assert_eq!(
+        (
+            answer(&ctx, "SELECT (SELECT 1 WHERE FALSE) IS NULL").await,
+            sorted_answer(
+                &ctx,
+                "SELECT id FROM essq_t WHERE (SELECT z FROM essq_u) IS NULL"
+            )
+            .await,
+        ),
+        (Ok(owned(&["true"])), Ok(sorted(&["1", "2"])))
+    );
+}
+
+/// apache/datafusion#23429, which #24516 is written against. `x IN (subquery)` is
+/// NULL when `x` matches no row and the subquery holds a NULL, but its nullability
+/// came from `x` alone, and the simplifier folds on it (`A = A` to `true`).
+#[tokio::test(flavor = "multi_thread")]
+async fn an_in_subquery_over_a_nullable_column_is_nullable() {
+    let ctx = spice_session(|_| {});
+    run_statements(
+        &ctx,
+        &[
+            "CREATE TABLE innl_s(c INT NOT NULL) AS VALUES (1), (2)",
+            "CREATE TABLE innl_t(a INT) AS VALUES (2), (NULL)",
+        ],
+    )
+    .await;
+    let plan = ctx
+        .sql("SELECT c IN (SELECT a FROM innl_t) AS in_t FROM innl_s")
+        .await
+        .expect("the query plans");
+    assert!(
+        plan.schema()
+            .field_with_unqualified_name("in_t")
+            .expect("the IN column")
+            .is_nullable(),
+        "an IN over a subquery that can hold a NULL is nullable"
+    );
+}
+
+/// apache/datafusion#25227. Parquet column statistics were cast along with the
+/// column, so `MAX(CAST(a AS INT))` over the strings `'1'`, `'100'`, `'2'` was
+/// answered from the string maximum `'2'`.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_cast_aggregate_is_not_answered_from_uncast_statistics() {
+    let dir = tempfile::tempdir().expect("temporary directory");
+    let path = dir.path().join("cast_strings.parquet");
+    let ctx = spice_session(|_| {});
+    write_parquet(
+        &ctx,
+        "SELECT * FROM (VALUES ('1'), ('100'), ('2')) AS t(a)",
+        &path,
+    )
+    .await;
+    run_statements(
+        &ctx,
+        &[&format!(
+            "CREATE EXTERNAL TABLE cast_stats_strings STORED AS PARQUET LOCATION '{}'",
+            path.display()
+        )],
+    )
+    .await;
+    assert_eq!(
+        answer(
+            &ctx,
+            "SELECT MIN(CAST(a AS INT)), MAX(CAST(a AS INT)) FROM cast_stats_strings"
+        )
+        .await,
+        Ok(owned(&["1,100"]))
+    );
+}
+
+async fn write_parquet(ctx: &SessionContext, select: &str, path: &Path) {
+    run_statements(
+        ctx,
+        &[&format!(
+            "COPY ({select}) TO '{}' STORED AS PARQUET",
+            path.display()
+        )],
+    )
+    .await;
+}
+
+/// spiceai/datafusion#252. `FilterPushdown` gives a hash join its dynamic filter
+/// after `JoinSelection` has chosen the build side, and `HashJoinExec::swap_inputs`
+/// rejects a join that has one. A plan that is optimized twice (a table provider
+/// that returns an optimized sub-plan from `scan`, as `vector_search` does) runs
+/// `JoinSelection` again on such a join, so the join must keep its order.
+#[test]
+fn join_selection_keeps_the_order_of_a_join_with_a_dynamic_filter() {
+    use arrow::array::{Int32Array, RecordBatch};
+    use arrow::datatypes::{DataType, Field, Schema};
+    use datafusion::common::config::ConfigOptions;
+    use datafusion::common::{JoinType, NullEquality};
+    use datafusion::datasource::memory::MemorySourceConfig;
+    use datafusion::physical_expr::PhysicalExpr;
+    use datafusion::physical_expr::expressions::{Column, DynamicFilterPhysicalExpr, lit};
+    use datafusion::physical_optimizer::PhysicalOptimizerRule;
+    use datafusion::physical_optimizer::join_selection::JoinSelection;
+    use datafusion::physical_plan::ExecutionPlan;
+    use datafusion::physical_plan::joins::{HashJoinExec, PartitionMode};
+    use std::sync::Arc;
+
+    let source = |name: &str, rows: i32| -> Arc<dyn ExecutionPlan> {
+        let schema = Arc::new(Schema::new(vec![Field::new(name, DataType::Int32, false)]));
+        let batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![Arc::new(Int32Array::from_iter_values(0..rows))],
+        )
+        .expect("batch matches its schema");
+        MemorySourceConfig::try_new_exec(&[vec![batch]], schema, None)
+            .expect("memory source builds")
+    };
+    // The build (left) side is bigger, so statistics alone would swap the inputs.
+    let (big, small) = (source("big_col", 10_000), source("small_col", 10));
+    let probe_key: Arc<dyn PhysicalExpr> = Arc::new(Column::new("small_col", 0));
+    let join = |dynamic_filter: Option<Arc<DynamicFilterPhysicalExpr>>| {
+        let join = HashJoinExec::try_new(
+            Arc::clone(&big),
+            Arc::clone(&small),
+            vec![(Arc::new(Column::new("big_col", 0)), Arc::clone(&probe_key))],
+            None,
+            &JoinType::Inner,
+            None,
+            PartitionMode::CollectLeft,
+            NullEquality::NullEqualsNothing,
+            false,
+        )
+        .expect("join builds");
+        let join = match dynamic_filter {
+            Some(filter) => join
+                .with_dynamic_filter_expr(filter)
+                .expect("filter matches the probe side"),
+            None => join,
+        };
+        Arc::new(join) as Arc<dyn ExecutionPlan>
+    };
+    let select = |plan| {
+        JoinSelection::new()
+            .optimize(plan, &ConfigOptions::new())
+            .expect("join selection succeeds")
+    };
+
+    // Without a dynamic filter the bigger build side is swapped behind a projection.
+    assert!(
+        select(join(None)).downcast_ref::<HashJoinExec>().is_none(),
+        "the join should swap when it has no dynamic filter"
+    );
+
+    let filter = Arc::new(DynamicFilterPhysicalExpr::new(
+        vec![Arc::clone(&probe_key)],
+        lit(true),
+    ));
+    let kept = select(join(Some(filter)));
+    let kept = kept
+        .downcast_ref::<HashJoinExec>()
+        .expect("a join with a dynamic filter keeps its inputs");
+    assert_eq!(kept.left().schema().field(0).name(), "big_col");
+    assert_eq!(kept.dynamic_expressions_produced().len(), 1);
+}
+
+/// spiceai/datafusion#266. A grouped aggregate emits all of its groups as one
+/// batch and hands them on as `batch_size` slices of it, and each slice shares
+/// the whole batch's buffers. `ExternalSorter` must charge a slice for its own
+/// rows: charging every slice for the whole batch reserves memory quadratic in
+/// the group count, so `GROUP BY … ORDER BY` over many groups fails with
+/// `ResourcesExhausted` long before its rows fill the pool.
+///
+/// Spilling is disabled, so the sort has to fit in the pool or fail: the groups
+/// occupy about 4 MiB, which the pool holds several times over, while charging
+/// each of the 32 slices for the whole batch asks for about 128 MiB.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_sort_over_aggregate_output_slices_charges_each_slice_for_its_own_rows() {
+    use datafusion::common::config::ConfigNonZeroUsize;
+    use datafusion::execution::disk_manager::{DiskManagerBuilder, DiskManagerMode};
+    use datafusion::execution::runtime_env::RuntimeEnvBuilder;
+
+    const GROUPS: usize = 32 * 8192;
+    const POOL_BYTES: usize = 48 * 1024 * 1024;
+
+    let mut config = get_df_default_config();
+    config.options_mut().execution.target_partitions = 1;
+    config.options_mut().execution.batch_size =
+        ConfigNonZeroUsize::try_new(8192).expect("non-zero batch size");
+    let runtime = RuntimeEnvBuilder::new()
+        .with_memory_limit(POOL_BYTES, 1.0)
+        .with_disk_manager_builder(
+            DiskManagerBuilder::default().with_mode(DiskManagerMode::Disabled),
+        )
+        .build_arc()
+        .expect("runtime builds");
+    let ctx = SessionContext::new_with_config_rt(config, runtime);
+    run_statements(
+        &ctx,
+        &[&format!(
+            "CREATE TABLE sort_slices AS SELECT value AS k, value AS v FROM generate_series(1, {GROUPS})"
+        )],
+    )
+    .await;
+
+    let rows = answer(
+        &ctx,
+        "SELECT k, SUM(v) AS s FROM sort_slices GROUP BY k ORDER BY s DESC",
+    )
+    .await
+    .expect("the sort fits in the pool without spilling");
+    let expected: Vec<String> = (1..=GROUPS).rev().map(|k| format!("{k},{k}")).collect();
+    assert_eq!(rows.len(), GROUPS, "one row per group");
+    if let Some((index, (got, want))) = rows
+        .iter()
+        .zip(&expected)
+        .enumerate()
+        .find(|(_, (got, want))| got != want)
+    {
+        panic!("row {index} is {got}, expected {want}: groups must sort by their sum, descending");
+    }
+}
+
+/// spiceai/datafusion#277. An ordered aggregate (here one whose leading group
+/// key is a constant, as TPC-DS Q78's `d_year` is under `d_year = 2000`) must
+/// emit the groups left at end of input with one `EmitTo::All`. Emitting them as
+/// repeated `EmitTo::First(batch_size)` renumbers every group still held, so the
+/// drain costs time quadratic in the group count.
+#[tokio::test]
+async fn an_ordered_aggregate_emits_its_remaining_groups_once() {
+    use std::sync::{Arc, Mutex};
+
+    use arrow::array::{ArrayRef, BooleanArray, Int32Array, Int64Array, RecordBatch};
+    use arrow::datatypes::{DataType, Field, Schema};
+    use datafusion::common::{Result, not_impl_err};
+    use datafusion::datasource::memory::MemorySourceConfig;
+    use datafusion::datasource::source::DataSourceExec;
+    use datafusion::execution::TaskContext;
+    use datafusion::logical_expr::function::AccumulatorArgs;
+    use datafusion::logical_expr::{
+        Accumulator, AggregateUDF, AggregateUDFImpl, EmitTo, GroupsAccumulator, Signature,
+        Volatility,
+    };
+    use datafusion::physical_expr::aggregate::AggregateExprBuilder;
+    use datafusion::physical_expr::expressions::col;
+    use datafusion::physical_expr::{LexOrdering, PhysicalSortExpr};
+    use datafusion::physical_plan::aggregates::{AggregateExec, AggregateMode, PhysicalGroupBy};
+    use datafusion::physical_plan::{ExecutionPlan, InputOrderMode, collect};
+
+    type Emits = Arc<Mutex<Vec<EmitTo>>>;
+
+    /// `SUM(v)` that records every `EmitTo` it is asked for.
+    #[derive(Debug)]
+    struct EmitProbe {
+        signature: Signature,
+        emits: Emits,
+    }
+    impl PartialEq for EmitProbe {
+        fn eq(&self, other: &Self) -> bool {
+            self.signature == other.signature
+        }
+    }
+    impl Eq for EmitProbe {}
+    impl std::hash::Hash for EmitProbe {
+        fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+            self.signature.hash(state);
+        }
+    }
+    impl AggregateUDFImpl for EmitProbe {
+        fn name(&self) -> &'static str {
+            "emit_probe"
+        }
+        fn signature(&self) -> &Signature {
+            &self.signature
+        }
+        fn return_type(&self, _arg_types: &[DataType]) -> Result<DataType> {
+            Ok(DataType::Int64)
+        }
+        fn accumulator(&self, _args: AccumulatorArgs) -> Result<Box<dyn Accumulator>> {
+            not_impl_err!("emit_probe runs only as a groups accumulator")
+        }
+        fn groups_accumulator_supported(&self, _args: AccumulatorArgs) -> bool {
+            true
+        }
+        fn create_groups_accumulator(
+            &self,
+            _args: AccumulatorArgs,
+        ) -> Result<Box<dyn GroupsAccumulator>> {
+            Ok(Box::new(EmitProbeGroups {
+                sums: Vec::new(),
+                emits: Arc::clone(&self.emits),
+            }))
+        }
+    }
+
+    struct EmitProbeGroups {
+        sums: Vec<i64>,
+        emits: Emits,
+    }
+    impl EmitProbeGroups {
+        fn take(&mut self, emit_to: EmitTo) -> ArrayRef {
+            self.emits
+                .lock()
+                .expect("emit log lock is not poisoned")
+                .push(emit_to);
+            Arc::new(Int64Array::from(emit_to.take_needed(&mut self.sums)))
+        }
+        fn add(&mut self, values: &ArrayRef, group_indices: &[usize], total_num_groups: usize) {
+            self.sums.resize(total_num_groups, 0);
+            let values = values
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .expect("emit_probe takes an Int64 argument");
+            for (&group, value) in group_indices.iter().zip(values.values()) {
+                self.sums[group] += value;
+            }
+        }
+    }
+    impl GroupsAccumulator for EmitProbeGroups {
+        fn update_batch(
+            &mut self,
+            values: &[ArrayRef],
+            group_indices: &[usize],
+            _opt_filter: Option<&BooleanArray>,
+            total_num_groups: usize,
+        ) -> Result<()> {
+            self.add(&values[0], group_indices, total_num_groups);
+            Ok(())
+        }
+        fn merge_batch(
+            &mut self,
+            values: &[ArrayRef],
+            group_indices: &[usize],
+            total_num_groups: usize,
+        ) -> Result<()> {
+            self.add(&values[0], group_indices, total_num_groups);
+            Ok(())
+        }
+        fn evaluate(&mut self, emit_to: EmitTo) -> Result<ArrayRef> {
+            Ok(self.take(emit_to))
+        }
+        fn state(&mut self, emit_to: EmitTo) -> Result<Vec<ArrayRef>> {
+            Ok(vec![self.take(emit_to)])
+        }
+        fn convert_to_state(
+            &self,
+            _values: &[ArrayRef],
+            _opt_filter: Option<&BooleanArray>,
+        ) -> Result<Vec<ArrayRef>> {
+            not_impl_err!("emit_probe does not skip partial aggregation")
+        }
+        fn size(&self) -> usize {
+            self.sums.capacity() * size_of::<i64>()
+        }
+    }
+
+    const BATCH_SIZE: usize = 8;
+    const GROUPS: usize = 10 * BATCH_SIZE;
+
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("k", DataType::Int32, false),
+        Field::new("g", DataType::Int32, false),
+        Field::new("v", DataType::Int64, false),
+    ]));
+    let groups = i32::try_from(GROUPS).expect("group count fits in i32");
+    let batch = RecordBatch::try_new(
+        Arc::clone(&schema),
+        vec![
+            Arc::new(Int32Array::from(vec![2000; GROUPS])),
+            Arc::new(Int32Array::from_iter_values(0..groups)),
+            Arc::new(Int64Array::from_iter_values((0..groups).map(i64::from))),
+        ],
+    )
+    .expect("batch matches its schema");
+    let ordering = LexOrdering::new([PhysicalSortExpr::new_default(
+        col("k", &schema).expect("k exists"),
+    )])
+    .expect("ordering is not empty");
+    let input = MemorySourceConfig::try_new(&[vec![batch]], Arc::clone(&schema), None)
+        .expect("memory source builds")
+        .try_with_sort_information(vec![ordering])
+        .expect("input is sorted on k");
+    let input = DataSourceExec::from_data_source(input);
+
+    let emits = Emits::default();
+    let probe = Arc::new(AggregateUDF::from(EmitProbe {
+        signature: Signature::exact(vec![DataType::Int64], Volatility::Immutable),
+        emits: Arc::clone(&emits),
+    }));
+    let aggregate = AggregateExec::try_new(
+        AggregateMode::Partial,
+        PhysicalGroupBy::new_single(vec![
+            (col("k", &schema).expect("k exists"), "k".to_string()),
+            (col("g", &schema).expect("g exists"), "g".to_string()),
+        ]),
+        vec![Arc::new(
+            AggregateExprBuilder::new(probe, vec![col("v", &schema).expect("v exists")])
+                .schema(Arc::clone(&schema))
+                .alias("probe")
+                .build()
+                .expect("aggregate builds"),
+        )],
+        vec![None],
+        input,
+        Arc::clone(&schema),
+    )
+    .expect("aggregate plans");
+    assert!(
+        matches!(
+            aggregate.input_order_mode(),
+            InputOrderMode::PartiallySorted(_)
+        ),
+        "the guard needs the ordered aggregate path, got {:?}",
+        aggregate.input_order_mode()
+    );
+
+    let config = get_df_default_config().with_batch_size(BATCH_SIZE);
+    let task = Arc::new(TaskContext::default().with_session_config(config));
+    let output = collect(Arc::new(aggregate) as Arc<dyn ExecutionPlan>, task)
+        .await
+        .expect("aggregate runs");
+
+    let rows: Vec<usize> = output.iter().map(RecordBatch::num_rows).collect();
+    assert_eq!(rows, vec![BATCH_SIZE; GROUPS / BATCH_SIZE]);
+    let mut got: Vec<(i32, i32, i64)> = output
+        .iter()
+        .flat_map(|batch| {
+            let column = |index: usize| batch.column(index).as_any();
+            let k = column(0).downcast_ref::<Int32Array>().expect("k is Int32");
+            let g = column(1).downcast_ref::<Int32Array>().expect("g is Int32");
+            let probe = column(2)
+                .downcast_ref::<Int64Array>()
+                .expect("probe is Int64");
+            (0..batch.num_rows())
+                .map(|row| (k.value(row), g.value(row), probe.value(row)))
+                .collect::<Vec<_>>()
+        })
+        .collect();
+    got.sort_unstable();
+    let expected: Vec<(i32, i32, i64)> = (0..groups).map(|g| (2000, g, i64::from(g))).collect();
+    assert_eq!(
+        got, expected,
+        "every group must be emitted once with its sum"
+    );
+    let emits = emits.lock().expect("emit log lock is not poisoned").clone();
+    assert_eq!(
+        emits,
+        vec![EmitTo::All],
+        "the groups left at end of input must be emitted once"
+    );
+}
+
+/// spiceai/datafusion#279 and #280. A join with a high fan-out yields many output
+/// batches per input batch without polling an input, so unless each output batch
+/// spends the cooperative budget, the task running it never yields: a cancelled
+/// or timed-out query cannot stop it, and on a single-threaded runtime nothing
+/// else runs. Each query here runs on a single-threaded runtime and must give its
+/// 100 ms read timeout a chance to fire. A sort-merge join sorts its inputs
+/// first, and that read yields, so its inputs are finite and share one key.
+#[test]
+fn every_join_yields_to_the_scheduler() {
+    let mut never_yielded = Vec::new();
+    for (operator, prefer_hash_join, sql) in [
+        (
+            "HashJoinExec",
+            true,
+            "SELECT max(a.value + b.value) FROM range(1, 10000) b JOIN range(1, 1000000000000) a ON a.value % 2 = b.value % 2",
+        ),
+        (
+            "SortMergeJoinExec",
+            false,
+            "SELECT max(a.value + b.value) FROM range(1, 20000) b JOIN range(1, 20000) a ON a.value / 1000000 = b.value / 1000000",
+        ),
+        (
+            "NestedLoopJoinExec",
+            true,
+            "SELECT max(a.value + b.value) FROM range(1, 10000) b JOIN range(1, 1000000000000) a ON a.value + b.value > 1",
+        ),
+        (
+            "CrossJoinExec",
+            true,
+            "SELECT max(a.value + b.value) FROM range(1, 10000) b CROSS JOIN range(1, 1000000000000) a",
+        ),
+    ] {
+        let (done, finished) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_time()
+                .build()
+                .expect("runtime builds");
+            let result = runtime.block_on(async {
+                let ctx = spice_session(|config| {
+                    config.options_mut().optimizer.prefer_hash_join = prefer_hash_join;
+                    // One partition keeps repartition exchanges, which yield on their own, out
+                    // of the plan. A sort-merge join is planned only over several partitions.
+                    if prefer_hash_join {
+                        config.options_mut().execution.target_partitions = 1;
+                    }
+                });
+                let plan = ctx
+                    .sql(sql)
+                    .await
+                    .expect("query plans")
+                    .create_physical_plan()
+                    .await
+                    .expect("physical plan");
+                let shown = datafusion::physical_plan::displayable(plan.as_ref())
+                    .indent(false)
+                    .to_string();
+                assert!(
+                    shown.contains(operator),
+                    "{sql} is not planned with {operator}:\n{shown}"
+                );
+                let mut stream = datafusion::physical_plan::execute_stream(plan, ctx.task_ctx())
+                    .expect("query executes");
+                tokio::time::timeout(
+                    std::time::Duration::from_millis(100),
+                    futures::StreamExt::next(&mut stream),
+                )
+                .await
+                .is_err()
+            });
+            let _ = done.send(result);
+        });
+        if finished.recv_timeout(std::time::Duration::from_secs(30)) != Ok(true) {
+            never_yielded.push(operator);
+        }
+    }
+    assert!(
+        never_yielded.is_empty(),
+        "{never_yielded:?} never yielded, so their queries' read timeouts could not fire"
+    );
+}
+
+/// The SQL planner refuses a data type nested more than 64 array or struct
+/// levels deep, and still plans one at the limit.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_cast_to_a_type_nested_past_the_limit_is_refused() {
+    let ctx = spice_session(|_| {});
+    assert_eq!(
+        answer(
+            &ctx,
+            &format!("SELECT CAST(NULL AS INT{}) IS NULL", "[]".repeat(64))
+        )
+        .await,
+        Ok(owned(&["true"]))
+    );
+    let error = answer(
+        &ctx,
+        &format!("SELECT CAST(NULL AS INT{}) IS NULL", "[]".repeat(65)),
+    )
+    .await
+    .expect_err("65 levels exceed the limit");
+    assert!(
+        error.contains("SQL data type nesting depth exceeds the maximum of 64"),
+        "{error}"
+    );
+}
+
+/// Array and struct levels count toward the same limit: a type alternating
+/// `ARRAY<…>` and `STRUCT<…>` plans at 64 levels and is refused at 65.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_cast_to_a_mixed_array_and_struct_type_past_the_limit_is_refused() {
+    // PostgreSQL, the dialect Spice sessions default to, has no `STRUCT<…>` type syntax.
+    let ctx = spice_session(|config| {
+        config.options_mut().sql_parser.dialect = datafusion::common::config::Dialect::Generic;
+    });
+    let nested = |levels: usize| {
+        (0..levels).fold("INT".to_string(), |inner, level| {
+            if level % 2 == 0 {
+                format!("ARRAY<{inner}>")
+            } else {
+                format!("STRUCT<a {inner}>")
+            }
+        })
+    };
+    assert_eq!(
+        answer(
+            &ctx,
+            &format!("SELECT CAST(NULL AS {}) IS NULL", nested(64))
+        )
+        .await,
+        Ok(owned(&["true"]))
+    );
+    let error = answer(
+        &ctx,
+        &format!("SELECT CAST(NULL AS {}) IS NULL", nested(65)),
+    )
+    .await
+    .expect_err("65 levels exceed the limit");
+    assert!(
+        error.contains("SQL data type nesting depth exceeds the maximum of 64"),
+        "{error}"
+    );
+}
+
+/// spiceai/datafusion#287. With more than one `COUNT(DISTINCT …)` the plan keeps
+/// the generic `ScalarValue` set per aggregate instead of rewriting a single
+/// distinct into a `GROUP BY`. A list or struct value read from a batch is a
+/// one-row slice that shares the batch's buffers, so each stored distinct value
+/// must be a compacted copy: kept as a slice, each one is charged the whole
+/// batch, and 50,000 three-element lists asked for tens of GB and failed with
+/// `ResourcesExhausted`.
+///
+/// Spilling is disabled and the pool is 256 MiB, which the real distinct state
+/// (a few MB per aggregate) fits many times over. Four partitions run the
+/// partial and final aggregates, so the merged state's values are checked too.
+#[tokio::test(flavor = "multi_thread")]
+async fn several_count_distinct_over_nested_values_charge_each_value_once() {
+    use datafusion::execution::disk_manager::{DiskManagerBuilder, DiskManagerMode};
+    use datafusion::execution::runtime_env::RuntimeEnvBuilder;
+
+    const POOL_BYTES: usize = 256 * 1024 * 1024;
+
+    let mut config = get_df_default_config();
+    config.options_mut().execution.target_partitions = 4;
+    let runtime = RuntimeEnvBuilder::new()
+        .with_memory_limit(POOL_BYTES, 1.0)
+        .with_disk_manager_builder(
+            DiskManagerBuilder::default().with_mode(DiskManagerMode::Disabled),
+        )
+        .build_arc()
+        .expect("runtime builds");
+    let ctx = SessionContext::new_with_config_rt(config, runtime);
+    run_statements(
+        &ctx,
+        &["CREATE TABLE distinct_nested AS SELECT value AS id, \
+           [value, value + 1, value % 7] AS l, \
+           named_struct('a', value, 'b', value % 7) AS s, \
+           CAST(value % 5 AS INT) AS grp \
+           FROM generate_series(0, 49999)"],
+    )
+    .await;
+
+    for (sql, expected) in [
+        (
+            "SELECT count(DISTINCT l), count(DISTINCT grp) FROM distinct_nested",
+            vec!["50000,5".to_string()],
+        ),
+        (
+            "SELECT count(DISTINCT s), count(DISTINCT grp) FROM distinct_nested",
+            vec!["50000,5".to_string()],
+        ),
+        (
+            "SELECT grp, count(DISTINCT l), count(DISTINCT s) FROM distinct_nested \
+             GROUP BY grp ORDER BY grp",
+            (0..5).map(|grp| format!("{grp},10000,10000")).collect(),
+        ),
+    ] {
+        assert_eq!(
+            answer(&ctx, sql).await,
+            Ok(expected),
+            "{sql} must fit in a {POOL_BYTES}-byte pool"
+        );
+    }
+}

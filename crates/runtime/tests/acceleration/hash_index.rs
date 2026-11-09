@@ -66,7 +66,7 @@ async fn test_hash_index_arrow_accelerator() -> Result<(), anyhow::Error> {
 
             dataset.acceleration = Some(Acceleration {
                 enabled: true,
-                engine: None, // Uses Arrow/MemTable by default
+                engine: Some("arrow".to_string()),
                 mode: Mode::Memory,
                 refresh_mode: Some(RefreshMode::Full),
                 primary_key: Some("id".to_string()),

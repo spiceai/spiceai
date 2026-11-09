@@ -39,6 +39,7 @@ pub mod resilience;
 pub mod rows;
 pub mod setup;
 pub mod shared;
+mod value_domain;
 
 use std::sync::Arc;
 
@@ -51,6 +52,88 @@ use crate::cdc::{ChangeEnvelope, ChangesStream, NoOpCommitter, StreamError};
 pub use config::{BinlogPosition, CursorType, ReplicationParams, derive_server_id, process_nonce};
 pub use gtid::GtidSet;
 pub use metrics::{Metrics as ReplicationMetrics, MetricsCollector as ReplicationMetricsCollector};
+pub use value_domain::source_retype_keeps_every_value;
+
+/// A source `ALTER` that changed a replicated column's type in a way the change
+/// stream does not follow, so the stream stops at it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RetypeRefusal {
+    /// The dataset column.
+    pub column: String,
+    /// The source `COLUMN_TYPE` before the `ALTER`.
+    pub from: String,
+    /// The source `COLUMN_TYPE` after it.
+    pub to: String,
+    pub reason: RetypeRefusalReason,
+}
+
+impl RetypeRefusal {
+    #[must_use]
+    pub fn new(
+        column: impl Into<String>,
+        from: impl Into<String>,
+        to: impl Into<String>,
+        reason: RetypeRefusalReason,
+    ) -> Self {
+        Self {
+            column: column.into(),
+            from: from.into(),
+            to: to.into(),
+            reason,
+        }
+    }
+}
+
+/// Why the change stream does not follow a [`RetypeRefusal`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RetypeRefusalReason {
+    /// The new type does not hold every value of the old one, so the source
+    /// rewrote stored values in place, with no row change for any of them.
+    SourceRewroteValues,
+    /// An integer column became a `DECIMAL` with a scale, and the dataset keeps
+    /// the integer type, which cannot store a fractional value.
+    FractionIntoInteger,
+    /// The dataset keeps the column `Float32` while the source is no longer
+    /// `FLOAT`, which would round the new values.
+    StaysFloat32,
+    /// The dataset keeps the column an unsigned integer while the source
+    /// became a `DECIMAL`, whose values the change stream cannot read into it.
+    DecimalIntoUnsignedInteger,
+}
+
+/// The cause clause of the dataset error a [`RetypeRefusal`] stops the stream
+/// with.
+impl std::fmt::Display for RetypeRefusal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let Self {
+            column,
+            from,
+            to,
+            reason,
+        } = self;
+        write!(f, "column '{column}' changed from `{from}` to `{to}`")?;
+        match reason {
+            RetypeRefusalReason::SourceRewroteValues => write!(
+                f,
+                ", which does not hold every `{from}` value, and MySQL rewrites such values in \
+                 place without sending row changes, so the dataset may hold values the source no \
+                 longer has"
+            ),
+            RetypeRefusalReason::FractionIntoInteger => f.write_str(
+                ", and the dataset keeps the column's integer type, which cannot store a \
+                 fractional value",
+            ),
+            RetypeRefusalReason::StaysFloat32 => f.write_str(
+                ", and the dataset keeps the column's `Float32` type, which would round the new \
+                 values",
+            ),
+            RetypeRefusalReason::DecimalIntoUnsignedInteger => f.write_str(
+                ", and the dataset keeps the column's unsigned integer type, which the change \
+                 stream cannot read a decimal value into",
+            ),
+        }
+    }
+}
 
 #[derive(Debug, Snafu)]
 pub enum Error {
@@ -122,6 +205,9 @@ pub enum Error {
     #[snafu(display("Schema mismatch: {message}"))]
     SchemaMismatch { message: String },
 
+    #[snafu(display("{refusal}"))]
+    RetypeNotFollowed { refusal: RetypeRefusal },
+
     #[snafu(display("Failed to build the ready-signal change batch: {message}"))]
     BuildReadySignal { message: String },
 
@@ -181,6 +267,16 @@ pub enum Error {
          See: https://spiceai.org/docs/components/data-connectors/mysql"
     ))]
     AnonymousTransactionUnderGtid { dataset: String },
+
+    #[snafu(display(
+        "MySQL replication for {dataset}: this dataset is positioning by GTID, but the source \
+         committed a transaction under the tagged GTID '{gtid}'. Spice records the transactions \
+         it applied as untagged GTIDs, so it cannot record this one or resume after it, and \
+         replication stopped rather than skip or repeat transactions. Commit transactions on \
+         the source without a GTID tag. \
+         See: https://spiceai.org/docs/components/data-connectors/mysql"
+    ))]
+    TaggedTransactionUnderGtid { dataset: String, gtid: String },
 }
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
@@ -386,11 +482,18 @@ pub fn check_resume_compatibility(
     Ok(())
 }
 
-/// Compare two Arrow schema JSON strings for equivalence.
+/// Compare the columns of two Arrow schema JSON strings.
 ///
-/// Exact string match is preferred (fast path). Otherwise both sides are
-/// parsed as [`serde_json::Value`] so map key order differences in field
-/// metadata do not false-positive into [`ResumeDrift::DatasetSchemaChanged`].
+/// Only the `fields` array is compared: the column names, types, nullability
+/// and per-column metadata that binlog row images are decoded into.
+/// Schema-level metadata is ignored. Schema inference stamps it with source
+/// catalog estimates (`spice.inferred_row_count`, `spice.inferred_table_bytes`)
+/// and other descriptions of the table that change without any change to its
+/// columns, for example when `ANALYZE TABLE` refreshes `TABLE_ROWS`. The source
+/// side of the decode is guarded separately by the layout fingerprint.
+///
+/// Both sides are parsed as [`serde_json::Value`], so map key order
+/// differences in field metadata do not count as a change.
 fn dataset_schemas_equivalent(a: &str, b: &str) -> bool {
     if a == b {
         return true;
@@ -399,7 +502,10 @@ fn dataset_schemas_equivalent(a: &str, b: &str) -> bool {
         serde_json::from_str::<serde_json::Value>(a),
         serde_json::from_str::<serde_json::Value>(b),
     ) {
-        (Ok(left), Ok(right)) => left == right,
+        (Ok(left), Ok(right)) => match (left.get("fields"), right.get("fields")) {
+            (Some(left), Some(right)) => left == right,
+            _ => false,
+        },
         _ => false,
     }
 }
@@ -459,6 +565,23 @@ pub struct ReplicationStreamInput {
     /// Shared collector the stream updates as it processes events; the
     /// connector reads it via its `MetricsProvider`.
     pub metrics: Arc<ReplicationMetricsCollector>,
+    /// What the stream does when a source `ALTER` widens a column's type.
+    pub column_type_changes: ColumnTypeChanges,
+}
+
+/// What a replication stream does when a source `ALTER` changes a column's
+/// type to one that holds every value of the old type (`INT` to `DOUBLE`).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum ColumnTypeChanges {
+    /// Keep the column's registered type: a later value is stored when that
+    /// type holds it exactly and refused otherwise. The dataset's change
+    /// batches never change schema, so the stream suits `on_schema_change:
+    /// block`, which never evolves the acceleration.
+    #[default]
+    Keep,
+    /// Retype the column in the change batches to the new type, so the value
+    /// reaches the dataset's `on_schema_change` policy as a schema change.
+    Widen,
 }
 
 /// Starts the bootstrap+binlog replication stream.
@@ -567,16 +690,20 @@ mod tests {
 
     #[test]
     fn checkpoint_meta_parse_non_schema_json_as_err() {
-        assert!(
-            CheckpointMeta::parse(r#""just a string""#).is_err(),
+        const NEITHER: &str = "persisted checkpoint schema_json is neither a v2 CheckpointMeta envelope nor a legacy Arrow schema object";
+        assert_eq!(
+            CheckpointMeta::parse(r#""just a string""#),
+            Err(NEITHER.to_string()),
             "non-object JSON must not look like a legacy Arrow schema"
         );
-        assert!(
-            CheckpointMeta::parse(r#"{"not_fields":[]}"#).is_err(),
+        assert_eq!(
+            CheckpointMeta::parse(r#"{"not_fields":[]}"#),
+            Err(NEITHER.to_string()),
             "object without `fields` must not look like a legacy Arrow schema"
         );
-        assert!(
-            CheckpointMeta::parse("42").is_err(),
+        assert_eq!(
+            CheckpointMeta::parse("42"),
+            Err(NEITHER.to_string()),
             "numeric JSON must not look like a legacy Arrow schema"
         );
     }
@@ -664,5 +791,29 @@ mod tests {
             .expect("serialize");
         check_resume_compatibility(Some(&meta), Some(current), &layout.fingerprint())
             .expect("equivalent schema JSON must resume despite metadata key order");
+    }
+
+    #[test]
+    fn resume_ignores_schema_level_metadata() {
+        let layout = layout(&[("id", "int")]);
+        let field = r#"{"name":"id","data_type":"Int32","nullable":false,"dict_id":0,"dict_is_ordered":false,"metadata":{}}"#;
+        let stored = format!(
+            r#"{{"fields":[{field}],"metadata":{{"spice.inferred_row_count":"100","spice.inferred_table_bytes":"16384"}}}}"#
+        );
+        let current = format!(
+            r#"{{"fields":[{field}],"metadata":{{"spice.inferred_row_count":"1000","spice.inferred_table_bytes":"65536"}}}}"#
+        );
+        let meta = CheckpointMeta::new(stored, layout.fingerprint())
+            .to_schema_json()
+            .expect("serialize");
+        check_resume_compatibility(Some(&meta), Some(&current), &layout.fingerprint())
+            .expect("changed source estimates must not count as schema drift");
+
+        let retyped = r#"{"fields":[{"name":"id","data_type":"Int64","nullable":false,"dict_id":0,"dict_is_ordered":false,"metadata":{}}],"metadata":{"spice.inferred_row_count":"100","spice.inferred_table_bytes":"16384"}}"#;
+        assert_eq!(
+            check_resume_compatibility(Some(&meta), Some(retyped), &layout.fingerprint()),
+            Err(ResumeDrift::DatasetSchemaChanged),
+            "a column type change must still count as drift"
+        );
     }
 }

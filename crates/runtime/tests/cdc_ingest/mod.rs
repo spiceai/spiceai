@@ -35,7 +35,7 @@ use app::AppBuilder;
 use futures::TryStreamExt;
 use runtime::{Runtime, auth::EndpointAuth, config::Config};
 use spicepod::{
-    acceleration::{Acceleration, OnConflictBehavior, RefreshMode},
+    acceleration::{Acceleration, Mode, OnConflictBehavior, RefreshMode},
     component::dataset::Dataset,
     semantic::Column,
 };
@@ -74,6 +74,52 @@ fn cdc_orders_dataset() -> Dataset {
         ..Acceleration::default()
     });
     dataset
+}
+
+/// `write_mode: acceleration` is refused with a change stream, including the one a
+/// `cdc:` source refreshes by when `refresh_mode` is omitted: the source's changes
+/// would overwrite writes kept only in the acceleration.
+#[tokio::test]
+async fn write_mode_acceleration_is_refused_with_a_default_change_stream() {
+    use runtime::status::ComponentStatus;
+
+    test_request_context()
+        .scope(async {
+            configure_test_datafusion();
+            let mut dataset = cdc_orders_dataset();
+            if let Some(acceleration) = dataset.acceleration.as_mut() {
+                acceleration.refresh_mode = None;
+                acceleration.on_conflict = HashMap::new();
+                acceleration.write_mode = spicepod::acceleration::WriteMode::Acceleration;
+            }
+            let app = AppBuilder::new("cdc_write_mode_acceleration")
+                .with_dataset(dataset)
+                .build();
+            let rt = Arc::new(Runtime::builder().with_app(app).build().await);
+            // A refused dataset is retried, so loading never finishes: watch its status.
+            let load = tokio::spawn(Arc::clone(&rt).load_components());
+            let name = datafusion::common::TableReference::from("orders");
+            let refused = wait_until_true(Duration::from_secs(30), || async {
+                matches!(
+                    rt.status().get_dataset_statuses().get(&name),
+                    Some(ComponentStatus::Error(_))
+                )
+            })
+            .await;
+            let status = rt.status().get_dataset_statuses().get(&name).cloned();
+            assert!(refused, "the dataset should fail to load, got {status:?}");
+            let Some(ComponentStatus::Error(Some(message))) = status else {
+                panic!("expected an error message, got {status:?}");
+            };
+            assert!(
+                message.contains(
+                    "Dataset 'orders' sets `acceleration.write_mode: acceleration` and refreshes by `changes`"
+                ),
+                "{message}"
+            );
+            load.abort();
+        })
+        .await;
 }
 
 async fn start_http(rt: Arc<Runtime>) -> String {
@@ -290,6 +336,172 @@ async fn cdc_ingest_json_create_update_delete() -> anyhow::Result<()> {
             assert!(
                 resp.status().is_client_error(),
                 "expected 4xx for bad content-type"
+            );
+
+            Ok(())
+        })
+        .await
+}
+
+/// The same dataset accelerated by Cayenne in `mode: memory` — the CDC-fed half of
+/// #12008. Here the RAM mem-tier is the permanent store AND the rows arrive through
+/// a change stream, so nothing is ever checkpointed to Vortex and every delete the
+/// stream carries has to be applied to the tier itself.
+///
+/// `cdc:` is push-based Debezium over HTTP, so this needs no database, container or
+/// credential — which is what makes the CDC-fed memory case testable end to end at
+/// all.
+///
+/// Deliberately NOT named `orders`. `cdc_ingest`'s push-target registry is
+/// process-wide and keyed by dataset name, so two `#[tokio::test]` cases sharing a
+/// name would have whichever runtime registered last own the handle, and either
+/// server could post events into the other's runtime.
+fn cdc_orders_dataset_cayenne_memory() -> Dataset {
+    let mut dataset = Dataset::new(format!("cdc:{CAYENNE_MEMORY_TABLE}"), CAYENNE_MEMORY_TABLE);
+    dataset.columns = vec![
+        Column {
+            name: "id".to_string(),
+            r#type: Some("int64".to_string()),
+            nullable: Some(true),
+            ..Column::new("id")
+        },
+        Column {
+            name: "name".to_string(),
+            r#type: Some("utf8".to_string()),
+            nullable: Some(true),
+            ..Column::new("name")
+        },
+    ];
+    let mut on_conflict = HashMap::new();
+    on_conflict.insert("id".to_string(), OnConflictBehavior::Upsert);
+    dataset.acceleration = Some(Acceleration {
+        enabled: true,
+        engine: Some("cayenne".to_string()),
+        mode: Mode::Memory,
+        refresh_mode: Some(RefreshMode::Changes),
+        primary_key: Some("id".to_string()),
+        on_conflict,
+        ..Acceleration::default()
+    });
+    dataset
+}
+
+/// The dataset this test owns. See `cdc_orders_dataset_cayenne_memory` for why it
+/// must differ from every other `cdc:` test's.
+const CAYENNE_MEMORY_TABLE: &str = "orders_cayenne_memory";
+
+/// A source DELETE must remove the row from a `mode: memory` Cayenne acceleration
+/// fed by CDC.
+///
+/// This configuration — memory-resident tier AND a change stream — had no coverage
+/// at all, which is why it is here. It is NOT a regression test for the mem-tier
+/// rebuild: neutering `delete_mem_tier_rows_matching` leaves this test green, so
+/// whatever route the apply loop takes for a `cdc:` delete on this config, it is
+/// not the one that rebuild fixes. That matches #12008's own scope note, which
+/// records CDC-originated per-key deletes as unaffected.
+///
+/// The client-statement half of #12008 is covered in
+/// `crates/runtime/tests/acceleration/cayenne_memory.rs`, where the equivalent
+/// negative control does flip.
+#[tokio::test]
+async fn cdc_ingest_delete_removes_a_cayenne_memory_mode_row() -> anyhow::Result<()> {
+    let _tracing = init_tracing(Some("integration=debug,info"));
+
+    test_request_context()
+        .scope(async {
+            configure_test_datafusion();
+            let app = AppBuilder::new("cdc_ingest_cayenne_memory")
+                .with_dataset(cdc_orders_dataset_cayenne_memory())
+                .build();
+
+            let rt = Arc::new(Runtime::builder().with_app(app).build().await);
+            let load_rt = Arc::clone(&rt);
+            tokio::select! {
+                () = tokio::time::sleep(Duration::from_mins(1)) => {
+                    anyhow::bail!("timed out loading components");
+                }
+                () = load_rt.load_components() => {}
+            }
+            runtime_ready_check(&rt).await;
+
+            let base = start_http(Arc::clone(&rt)).await;
+            let client = reqwest::Client::new();
+            let url = format!("{base}/v1/datasets/{CAYENNE_MEMORY_TABLE}/cdc");
+            let registered = wait_until_true(Duration::from_secs(15), || async {
+                runtime::dataconnector::cdc_ingest::lookup(CAYENNE_MEMORY_TABLE).is_some()
+            })
+            .await;
+            assert!(registered, "CDC ingest handle never registered");
+
+            let post = |body: &'static str| {
+                let client = client.clone();
+                let url = url.clone();
+                async move {
+                    let resp = client
+                        .post(&url)
+                        .header("content-type", "application/json")
+                        .body(body)
+                        .send()
+                        .await
+                        .expect("post cdc event");
+                    assert_eq!(
+                        resp.status(),
+                        reqwest::StatusCode::OK,
+                        "cdc event rejected: {}",
+                        resp.text().await.unwrap_or_default()
+                    );
+                }
+            };
+
+            let ids = |rt: Arc<Runtime>| async move {
+                rt.datafusion()
+                    .query_builder(&format!("SELECT id FROM {CAYENNE_MEMORY_TABLE} ORDER BY id"))
+                    .build()
+                    .run()
+                    .await
+                    .expect("query")
+                    .data
+                    .try_collect::<Vec<_>>()
+                    .await
+                    .expect("collect")
+                    .iter()
+                    .flat_map(|b| {
+                        let c = b
+                            .column(0)
+                            .as_any()
+                            .downcast_ref::<arrow::array::Int64Array>()
+                            .expect("id col");
+                        (0..b.num_rows()).map(|i| c.value(i)).collect::<Vec<_>>()
+                    })
+                    .collect::<Vec<i64>>()
+            };
+
+            post(r#"{"before":null,"after":{"id":1,"name":"alice"},"op":"c","ts_ms":1,"source":{}}"#).await;
+            post(r#"{"before":null,"after":{"id":2,"name":"bob"},"op":"c","ts_ms":2,"source":{}}"#).await;
+
+            // Precondition: both rows arrived through the change stream and are
+            // being served from RAM. Without this the delete assertion below could
+            // pass on a table that never held the row.
+            let loaded = wait_until_true(Duration::from_secs(15), || {
+                let rt = Arc::clone(&rt);
+                async move { ids(rt).await == vec![1, 2] }
+            })
+            .await;
+            assert!(loaded, "CDC creates never became visible in the accelerator");
+
+            // A source DELETE for key 1.
+            post(r#"{"before":{"id":1,"name":"alice"},"after":null,"op":"d","ts_ms":3,"source":{}}"#).await;
+
+            let deleted = wait_until_true(Duration::from_secs(15), || {
+                let rt = Arc::clone(&rt);
+                async move { ids(rt).await == vec![2] }
+            })
+            .await;
+            let observed = ids(Arc::clone(&rt)).await;
+            eprintln!("[cdc mode:memory] after DELETE of key 1, rows = {observed:?}");
+            assert!(
+                deleted,
+                "a CDC DELETE must remove the row from a mode: memory Cayenne acceleration; rows were {observed:?}"
             );
 
             Ok(())

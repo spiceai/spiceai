@@ -1,0 +1,114 @@
+name: postgres-catalog
+description: >
+  A PostgreSQL catalog registers exactly the tables its include and exclude
+  patterns select (a partitioned table by its parent, a materialized view, a
+  column of an unsupported type as text), answers every one of them as
+  PostgreSQL does, and follows tables and schemas created, dropped and renamed
+  at the source on its own refresh, without a restart.
+
+sources:
+  src: { kind: postgres }
+
+spicepod:
+  version: v1
+  kind: Spicepod
+  name: postgres-catalog
+  catalogs:
+    - from: pg:postgres
+      name: pg
+      include: ['public.*', 'other*.*']
+      exclude: ['public.secret']
+      params: ${sources.src.params}
+
+defaults:
+  expect: { oracle: src }
+
+steps:
+  - source-exec:
+      src: |
+        CREATE TABLE orders (id int PRIMARY KEY, item_id int, qty int, placed timestamp, note text);
+        CREATE TABLE items (id int PRIMARY KEY, name text NOT NULL, price numeric(10, 2));
+        INSERT INTO items SELECT i, 'item ' || i, i * 2.5 FROM generate_series(1, 50) i;
+        INSERT INTO orders SELECT i, 1 + i % 50, i % 7, TIMESTAMP '2024-01-01' + i * INTERVAL '1 hour', CASE WHEN i % 5 = 0 THEN NULL ELSE 'n' || i END FROM generate_series(1, 500) i;
+        CREATE TABLE secret (id int);
+        CREATE TABLE events (id int, at date NOT NULL, kind text) PARTITION BY RANGE (at);
+        CREATE TABLE events_2024 PARTITION OF events FOR VALUES FROM ('2024-01-01') TO ('2025-01-01');
+        CREATE TABLE events_2025 PARTITION OF events FOR VALUES FROM ('2025-01-01') TO ('2026-01-01');
+        INSERT INTO events SELECT i, DATE '2024-06-01' + i * 2, 'k' || (i % 4) FROM generate_series(1, 200) i;
+        CREATE MATERIALIZED VIEW item_totals AS SELECT item_id, count(*) AS orders, sum(qty) AS qty FROM orders GROUP BY item_id;
+        CREATE TABLE typed (id int PRIMARY KEY, doc jsonb);
+        INSERT INTO typed VALUES (1, '{"tags": ["spice", null]}'), (2, NULL);
+        CREATE SCHEMA other;
+        CREATE TABLE other.t1 (id int, v text);
+        INSERT INTO other.t1 VALUES (1, 'one'), (2, NULL);
+        CREATE SCHEMA ignored;
+        CREATE TABLE ignored.x (id int);
+  - start: {}
+
+  - query: >
+      SELECT table_schema, table_name FROM information_schema.tables
+      WHERE table_catalog = 'pg' AND table_schema <> 'information_schema' ORDER BY 1, 2
+    expect:
+      rows:
+        - [other, t1]
+        - [public, events]
+        - [public, item_totals]
+        - [public, items]
+        - [public, orders]
+        - [public, typed]
+  - query: SELECT * FROM pg.public.orders
+    oracle-sql: SELECT * FROM orders
+  - query: SELECT * FROM pg.public.events
+    oracle-sql: SELECT * FROM events
+  - query: SELECT kind, count(*), min(at), max(at) FROM pg.public.events WHERE at >= DATE '2025-01-01' GROUP BY kind
+    oracle-sql: SELECT kind, count(*), min(at), max(at) FROM events WHERE at >= DATE '2025-01-01' GROUP BY kind
+  - query: SELECT * FROM pg.public.item_totals
+    oracle-sql: SELECT * FROM item_totals
+  - query: SELECT id, doc FROM pg.public.typed
+    oracle-sql: SELECT id, doc::text FROM typed
+  - query: SELECT * FROM pg.other.t1
+    oracle-sql: SELECT * FROM other.t1
+  - query: >
+      SELECT i.name, count(*) AS n, sum(o.qty) AS qty FROM pg.public.orders o
+      JOIN pg.public.items i ON o.item_id = i.id WHERE o.note IS NOT NULL GROUP BY i.name
+    oracle-sql: >
+      SELECT i.name, count(*) AS n, sum(o.qty) AS qty FROM orders o
+      JOIN items i ON o.item_id = i.id WHERE o.note IS NOT NULL GROUP BY i.name
+  - query: SELECT * FROM pg.public.secret
+    expect-error: true
+  - query: SELECT * FROM pg.ignored.x
+    expect-error: true
+
+  # Source DDL reaches the catalog on its own periodic refresh.
+  - source-exec:
+      src: |
+        CREATE TABLE later (id int PRIMARY KEY, v text);
+        INSERT INTO later VALUES (1, 'new'), (2, NULL);
+        DROP TABLE items CASCADE;
+        ALTER TABLE orders RENAME TO orders_v2;
+        CREATE SCHEMA other2;
+        CREATE TABLE other2.t2 (id int);
+        INSERT INTO other2.t2 VALUES (42);
+        DROP SCHEMA other CASCADE;
+  - query: >
+      SELECT table_schema, table_name FROM information_schema.tables
+      WHERE table_catalog = 'pg' AND table_schema <> 'information_schema' ORDER BY 1, 2
+    expect:
+      rows:
+        - [other2, t2]
+        - [public, events]
+        - [public, item_totals]
+        - [public, later]
+        - [public, orders_v2]
+        - [public, typed]
+    eventually: 150s
+  - query: SELECT * FROM pg.public.later
+    oracle-sql: SELECT * FROM later
+  - query: SELECT * FROM pg.public.orders_v2
+    oracle-sql: SELECT * FROM orders_v2
+  - query: SELECT * FROM pg.other2.t2
+    oracle-sql: SELECT * FROM other2.t2
+  - query: SELECT * FROM pg.public.orders
+    expect-error: true
+  - query: SELECT * FROM pg.public.items
+    expect-error: true

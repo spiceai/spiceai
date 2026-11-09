@@ -1,0 +1,61 @@
+# Known failing (#15539): on a cluster, TPC-H joins over Cayenne
+# accelerations fail with "executor_table: table 'orders' must be
+# catalog-qualified" (8 of the 22 queries).
+name: cluster-tpch-joins
+description: >
+  On a cluster scheduler with one executor, TPC-H's multi-table queries over
+  Cayenne accelerations answer as PostgreSQL does over the same rows.
+
+sources:
+  backend: { kind: '${matrix.backend}' }
+  ref: { kind: postgres }
+
+matrix:
+  backend: [postgres]
+
+variants:
+  cayenne: cayenne-file
+
+spicepod:
+  version: v1
+  kind: Spicepod
+  name: tpch-coverage
+  datasets:
+    - from: '${matrix.backend}:region'
+      name: region
+      params: ${sources.backend.params}
+    - from: '${matrix.backend}:nation'
+      name: nation
+      params: ${sources.backend.params}
+    - from: '${matrix.backend}:supplier'
+      name: supplier
+      params: ${sources.backend.params}
+    - from: '${matrix.backend}:customer'
+      name: customer
+      params: ${sources.backend.params}
+    - from: '${matrix.backend}:part'
+      name: part
+      params: ${sources.backend.params}
+    - from: '${matrix.backend}:partsupp'
+      name: partsupp
+      params: ${sources.backend.params}
+    - from: '${matrix.backend}:orders'
+      name: orders
+      params: ${sources.backend.params}
+    - from: '${matrix.backend}:lineitem'
+      name: lineitem
+      params: ${sources.backend.params}
+
+defaults:
+  cluster: { executors: 1 }
+  # A cluster buckets each acceleration on this column (--cluster).
+  cluster-partition-by: { region: r_regionkey, nation: n_nationkey, supplier: s_suppkey, customer: c_custkey, part: p_partkey, partsupp: ps_partkey, orders: o_orderkey, lineitem: l_orderkey }
+  expect: { oracle: ref }
+  compare-variants: false
+
+steps:
+  - dbgen: { scale: 0.01, into: [backend, ref] }
+  - start: {}
+  - corpus: ../../../../crates/test-framework/src/queries/tpch/q12.sql
+  - corpus: ../../../../crates/test-framework/src/queries/tpch/q14.sql
+  - corpus: ../../../../crates/test-framework/src/queries/tpch/q3.sql

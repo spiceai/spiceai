@@ -82,7 +82,7 @@ pub(crate) fn request_labels(req: &CreateEmbeddingRequest) -> Vec<KeyValue> {
 pub(crate) fn handle_metrics(duration: Duration, is_failure: bool, labels: &[KeyValue]) {
     EMBEDDING_REQUESTS.add(1, labels);
 
-    EMBEDDING_INTERNAL_DURATION_MS.record(duration.as_secs_f64(), labels);
+    EMBEDDING_INTERNAL_DURATION_MS.record(duration.as_secs_f64() * 1000.0, labels);
 
     if is_failure {
         FAILURES.add(1, labels);

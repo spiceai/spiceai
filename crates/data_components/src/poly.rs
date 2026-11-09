@@ -20,6 +20,7 @@ use datafusion::{
     datasource::TableProvider,
     error::Result as DataFusionResult,
     logical_expr::{LogicalPlan, TableProviderFilterPushDown},
+    optimizer::OptimizerRule,
     prelude::Expr,
 };
 use datafusion_federation::{
@@ -109,6 +110,11 @@ impl FederationProvider for PolyTableProvider {
             .and_then(|f| f.compute_context())
     }
 
+    fn pre_federation_optimizer_rules(&self) -> Vec<Arc<dyn OptimizerRule + Send + Sync>> {
+        self.get_federation_provider()
+            .map_or_else(Vec::new, |f| f.pre_federation_optimizer_rules())
+    }
+
     fn analyzer(&self, plan: &LogicalPlan) -> Option<FederationAnalyzerForLogicalPlan> {
         self.get_federation_provider()
             .and_then(|f| f.analyzer(plan))
@@ -147,7 +153,8 @@ impl TableLayer for PolyTableProvider {
             | LayerWalk::CdcDetection
             | LayerWalk::Source
             | LayerWalk::RetentionDelete
-            | LayerWalk::Index => None,
+            | LayerWalk::Index
+            | LayerWalk::Passthrough => None,
         }
     }
 

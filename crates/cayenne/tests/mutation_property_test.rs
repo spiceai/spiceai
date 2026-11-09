@@ -49,7 +49,7 @@ limitations under the License.
 #![allow(clippy::expect_used)]
 #![allow(clippy::clone_on_ref_ptr)]
 
-mod common;
+use crate::common;
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -135,8 +135,22 @@ impl Rng {
 enum Mode {
     /// Explicit `deletion_mode: key` — the deletion index is authoritative.
     Key,
-    /// Default (`auto` resolves to position even for PK tables).
+    /// Explicit `deletion_mode: position` (merge-on-read position deletes).
     Position,
+    /// The default `deletion_mode: auto`, with the default target file size: these
+    /// tables stay inside its position-delete bound, so the whole run is on
+    /// position deletes, reclaimed by whole-table rewrites that race the writers
+    /// (the reclaim trigger is two tombstones). `run_workload` checks it never left
+    /// position deletes.
+    Auto,
+    /// `deletion_mode: auto` with a 1 MiB target file size, a 32 KiB bound that
+    /// every run is meant to cross under live writers: position deletes and
+    /// whole-table reclaims first, then key deletes and the reclaims of rows the
+    /// bake cannot reach. Non-vacuity of that crossing is pinned by
+    /// `prop_auto_crossing_observes_position_then_key_switch_impl`: the random
+    /// walks alone would still pass if adaptive sizing regressed and stayed on
+    /// position deletes.
+    AutoCrossing,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -160,6 +174,10 @@ struct OpWeights {
     upsert: u32,
     delete: u32,
     delete_all: u32,
+    /// Delete by a predicate over a non-PK column: the scan-and-match path,
+    /// which `delete` (PK index) and `delete_all` (no matching) never reach.
+    /// A `retention_sql` DELETE has this shape.
+    delete_predicate: u32,
     overwrite: u32,
     compact: u32,
     restart: u32,
@@ -239,7 +257,7 @@ fn config(
             // `MoveToColdTier` op in the same serialization order production uses.
             cold_tier_background_interval_ms: 0,
             cold_tier_gc_interval_ms: COLD_GC_GRACE_MS,
-            cold_clustering_columns: vec!["id".to_string()],
+            cluster_by: vec!["id".to_string()],
             cold_target_file_size_mb: 1,
             ..base
         },
@@ -250,7 +268,21 @@ fn config(
             deletion_mode: DeletionMode::Key,
             ..base
         },
-        Mode::Position => base,
+        Mode::Position => VortexConfig {
+            deletion_mode: DeletionMode::Position,
+            ..base
+        },
+        Mode::Auto => VortexConfig {
+            deletion_mode: DeletionMode::Auto,
+            target_vortex_file_size_mb: VortexConfig::default().target_vortex_file_size_mb,
+            bake_deletion_index_trigger: 2,
+            ..base
+        },
+        Mode::AutoCrossing => VortexConfig {
+            deletion_mode: DeletionMode::Auto,
+            bake_deletion_index_trigger: 2,
+            ..base
+        },
     }
 }
 
@@ -426,6 +458,23 @@ async fn overwrite(table: &Arc<CayenneTableProvider>, rows: &[(i64, i64)]) -> Te
         .await?;
     datafusion_physical_plan::collect(plan, ctx.task_ctx()).await?;
     Ok(())
+}
+
+/// Delete rows whose non-PK `value` is in `[lo, hi)`.
+///
+/// Weighted into the memory configs as well as the file ones, because a filtered
+/// client DELETE materializes the mem-tier before it captures its scan sources:
+/// a row that is still RAM-resident is matched and removed like a durable one.
+/// Those walks are the randomized coverage for that path — take the checkpoint
+/// away and every memory workload fails with rows the model deleted still served
+/// (regression coverage for spiceai/spiceai#12008 under `cdc_durability: memory`;
+/// `mode: memory`, which never checkpoints, is still uncovered).
+async fn delete_predicate(table: &Arc<CayenneTableProvider>, lo: i64, hi: i64) -> TestResult<()> {
+    delete_filter(
+        table,
+        col("value").gt_eq(lit(lo)).and(col("value").lt(lit(hi))),
+    )
+    .await
 }
 
 /// One "settle" pass. File compacts small files; memory additionally checkpoints
@@ -630,14 +679,40 @@ async fn verify_aggregate_queries(
 
 #[derive(Clone, Debug)]
 enum Op {
-    Upsert { rows: Vec<(i64, i64)> },
-    Delete { key: i64 },
+    Upsert {
+        rows: Vec<(i64, i64)>,
+    },
+    Delete {
+        key: i64,
+    },
     DeleteAll,
-    Overwrite { rows: Vec<(i64, i64)> },
+    /// Delete every row whose non-PK `value` falls in `[lo, hi)`.
+    DeletePredicate {
+        lo: i64,
+        hi: i64,
+    },
+    Overwrite {
+        rows: Vec<(i64, i64)>,
+    },
     Compact,
     Restart,
     MoveToColdTier,
 }
+
+/// One live value to anchor a predicate window on; `None` when the table is
+/// empty.
+fn sample_live_value(model: &Model, rng: &mut Rng) -> Option<i64> {
+    if model.is_empty() {
+        return None;
+    }
+    let len = u64::try_from(model.len()).expect("model len fits u64");
+    let idx = usize::try_from(rng.below(len)).expect("index below len fits usize");
+    model.values().nth(idx).copied()
+}
+
+/// Value domain for the non-PK `value` column; `DeletePredicate` sizes its
+/// window against it.
+const VALUE_SPACE: i64 = 1_000_000;
 
 fn random_rows(rng: &mut Rng, key_space: i64, batch_size: i64) -> Vec<(i64, i64)> {
     debug_assert!(
@@ -650,7 +725,7 @@ fn random_rows(rng: &mut Rng, key_space: i64, batch_size: i64) -> Vec<(i64, i64)
     // debug_assert above catches the misconfiguration in tests.
     for _ in 0..batch_size.max(1) {
         let k = rng.below_i64(key_space);
-        let v = rng.below_i64(1_000_000);
+        let v = rng.below_i64(VALUE_SPACE);
         // last-writer-wins within the batch (a batch may not repeat a PK)
         if let Some(slot) = rows.iter_mut().find(|(ek, _): &&mut (i64, i64)| *ek == k) {
             slot.1 = v;
@@ -661,10 +736,17 @@ fn random_rows(rng: &mut Rng, key_space: i64, batch_size: i64) -> Vec<(i64, i64)
     rows
 }
 
-fn gen_op(rng: &mut Rng, w: &OpWeights, key_space: i64, batch_size: i64) -> Op {
+fn gen_op(
+    rng: &mut Rng,
+    w: &OpWeights,
+    key_space: i64,
+    batch_size: i64,
+    live_value: Option<i64>,
+) -> Op {
     let total = w.upsert
         + w.delete
         + w.delete_all
+        + w.delete_predicate
         + w.overwrite
         + w.compact
         + w.restart
@@ -679,6 +761,7 @@ fn gen_op(rng: &mut Rng, w: &OpWeights, key_space: i64, batch_size: i64) -> Op {
         (w.upsert, 0u8),
         (w.delete, 1),
         (w.delete_all, 2),
+        (w.delete_predicate, 7),
         (w.overwrite, 3),
         (w.compact, 4),
         (w.restart, 5),
@@ -693,6 +776,18 @@ fn gen_op(rng: &mut Rng, w: &OpWeights, key_space: i64, batch_size: i64) -> Op {
                     key: rng.below_i64(key_space),
                 },
                 2 => Op::DeleteAll,
+                7 => {
+                    // A window narrower than `VALUE_SPACE` matches nothing, and a
+                    // blind one rarely intersects a table holding a few rows.
+                    // Anchoring half on a live value reaches deletion-vector
+                    // writing rather than only the scan-and-match plan.
+                    let width = 1 + rng.below_i64(VALUE_SPACE / 2);
+                    let lo = match live_value {
+                        Some(v) if rng.below(2) == 0 => (v - rng.below_i64(width)).max(0),
+                        _ => rng.below_i64(VALUE_SPACE),
+                    };
+                    Op::DeletePredicate { lo, hi: lo + width }
+                }
                 3 => Op::Overwrite {
                     rows: random_rows(rng, key_space, batch_size),
                 },
@@ -717,6 +812,7 @@ fn apply_model(model: &mut Model, op: &Op) {
             model.remove(key);
         }
         Op::DeleteAll => model.clear(),
+        Op::DeletePredicate { lo, hi } => model.retain(|_, v| !(*v >= *lo && *v < *hi)),
         Op::Overwrite { rows } => {
             model.clear();
             for (k, v) in rows {
@@ -731,7 +827,9 @@ fn apply_model(model: &mut Model, op: &Op) {
 // Harness
 // ============================================================================
 
-async fn run_sequential(fixture: &TestFixture, w: &Workload, seed: u64) -> TestResult<()> {
+/// Returns whether the table was seen on key deletes after it opened on position
+/// deletes (see [`Mode::Auto`]).
+async fn run_sequential(fixture: &TestFixture, w: &Workload, seed: u64) -> TestResult<bool> {
     let name = format!("seq_{:?}_{:?}_{seed}", w.mode, w.durability);
     let (mut table, mut ctx) = create_table(
         fixture,
@@ -742,12 +840,20 @@ async fn run_sequential(fixture: &TestFixture, w: &Workload, seed: u64) -> TestR
         w.cold,
     )
     .await?;
+    if matches!(w.mode, Mode::AutoCrossing) {
+        assert!(
+            table.should_capture_positions(),
+            "AutoCrossing non-vacuity: a fresh auto table must start on position deletes (seed={seed})"
+        );
+    }
+    let opened_on_positions = table.should_capture_positions();
+    let mut left_positions = false;
     let mut rng = Rng::new(seed);
     let mut model = Model::new();
     let mut history: Vec<Op> = Vec::with_capacity(w.ops);
-
     for step in 0..w.ops {
-        let op = gen_op(&mut rng, &w.weights, w.population, w.batch_size);
+        let live_value = sample_live_value(&model, &mut rng);
+        let op = gen_op(&mut rng, &w.weights, w.population, w.batch_size, live_value);
         history.push(op.clone());
         match &op {
             Op::Upsert { rows } => upsert(&table, rows, w.durability).await?,
@@ -757,6 +863,7 @@ async fn run_sequential(fixture: &TestFixture, w: &Workload, seed: u64) -> TestR
                 let live_keys: Vec<i64> = model.keys().copied().collect();
                 delete_all(&table, &live_keys, w.durability).await?;
             }
+            Op::DeletePredicate { lo, hi } => delete_predicate(&table, *lo, *hi).await?,
             Op::Overwrite { rows } => overwrite(&table, rows).await?,
             Op::Compact => {
                 settle(&table, w.durability).await?;
@@ -774,6 +881,7 @@ async fn run_sequential(fixture: &TestFixture, w: &Workload, seed: u64) -> TestR
                     table.checkpoint_mem_tier().await?;
                 }
                 table.drain_in_flight_maintenance().await?;
+                left_positions |= opened_on_positions && !table.should_capture_positions();
                 let (t, c) = reopen_table(fixture, &name).await?;
                 table = t;
                 ctx = c;
@@ -792,16 +900,24 @@ async fn run_sequential(fixture: &TestFixture, w: &Workload, seed: u64) -> TestR
                 table.run_cold_tier_gc_tick().await;
             }
         }
+        let rows_before_op = model.len();
         apply_model(&mut model, &op);
+        let retired_rows = model.len() < rows_before_op;
         let live = read_rows(&ctx, &name).await?;
-        assert_converged(
-            &live,
-            &model,
-            &format!(
-                "seq diverged after step {step} ({op:?}) mode={:?} durability={:?} seed={seed}\nhistory={history:?}",
-                w.mode, w.durability,
-            ),
+        let step_msg = format!(
+            "seq diverged after step {step} ({op:?}) mode={:?} durability={:?} seed={seed}\nhistory={history:?}",
+            w.mode, w.durability,
         );
+        assert_converged(&live, &model, &step_msg);
+
+        // Retiring rows is when a maintained count drifts and when deletion
+        // vectors leave holes for a stale min/max to prune around. The
+        // coordinator can fold `COUNT(*)` from an `Exact` count at any time, so
+        // the contract has to hold here, not only after the final settle.
+        if retired_rows {
+            verify_aggregate_queries(&ctx, table.as_ref(), &name, &model, w.population, &step_msg)
+                .await?;
+        }
     }
 
     // Final settle (memory: checkpoint RAM + bake; both: compact) so the reopened
@@ -809,6 +925,7 @@ async fn run_sequential(fixture: &TestFixture, w: &Workload, seed: u64) -> TestR
     // before reopening from the catalog (see the loop's Op::Restart).
     settle(&table, w.durability).await?;
     table.drain_in_flight_maintenance().await?;
+    left_positions |= opened_on_positions && !table.should_capture_positions();
     let (t, c) = reopen_table(fixture, &name).await?;
     let final_state = read_rows(&c, &name).await?;
     let msg = format!(
@@ -817,10 +934,12 @@ async fn run_sequential(fixture: &TestFixture, w: &Workload, seed: u64) -> TestR
     );
     assert_converged(&final_state, &model, &msg);
     verify_aggregate_queries(&c, t.as_ref(), &name, &model, w.population, &msg).await?;
-    Ok(())
+    Ok(left_positions)
 }
 
-async fn run_concurrent(fixture: &TestFixture, w: &Workload, seed: u64) -> TestResult<()> {
+/// Returns whether the table was seen on key deletes after it opened on position
+/// deletes (see [`Mode::Auto`]).
+async fn run_concurrent(fixture: &TestFixture, w: &Workload, seed: u64) -> TestResult<bool> {
     let name = format!("conc_{:?}_{:?}_{seed}", w.mode, w.durability);
     let (table0, ctx0) = create_table(
         fixture,
@@ -831,6 +950,14 @@ async fn run_concurrent(fixture: &TestFixture, w: &Workload, seed: u64) -> TestR
         w.cold,
     )
     .await?;
+    if matches!(w.mode, Mode::AutoCrossing) {
+        assert!(
+            table0.should_capture_positions(),
+            "AutoCrossing non-vacuity: a fresh auto table must start on position deletes (seed={seed})"
+        );
+    }
+    let opened_on_positions = table0.should_capture_positions();
+    let mut left_positions = false;
     let mut rng = Rng::new(seed);
 
     for start in (0..w.population).step_by(20) {
@@ -885,7 +1012,8 @@ async fn run_concurrent(fixture: &TestFixture, w: &Workload, seed: u64) -> TestR
     // Compact op is a no-op here); `restart` reopens under the write lock.
     let mut history: Vec<Op> = Vec::with_capacity(w.ops);
     for _ in 0..w.ops {
-        let op = gen_op(&mut rng, &w.weights, w.population, w.batch_size);
+        let live_value = sample_live_value(&model, &mut rng);
+        let op = gen_op(&mut rng, &w.weights, w.population, w.batch_size, live_value);
         history.push(op.clone());
         match &op {
             Op::Upsert { rows } => {
@@ -900,6 +1028,10 @@ async fn run_concurrent(fixture: &TestFixture, w: &Workload, seed: u64) -> TestR
                 let live_keys: Vec<i64> = model.keys().copied().collect();
                 let t = handle.read().await;
                 delete_all(&t, &live_keys, w.durability).await?;
+            }
+            Op::DeletePredicate { lo, hi } => {
+                let t = handle.read().await;
+                delete_predicate(&t, *lo, *hi).await?;
             }
             Op::Overwrite { rows } => {
                 let t = handle.read().await;
@@ -921,6 +1053,7 @@ async fn run_concurrent(fixture: &TestFixture, w: &Workload, seed: u64) -> TestR
                     guard.checkpoint_mem_tier().await?;
                 }
                 guard.drain_in_flight_maintenance().await?;
+                left_positions |= opened_on_positions && !guard.should_capture_positions();
                 let (nt, nc) = reopen_table(fixture, &name).await?;
                 if w.durability == Durability::Memory {
                     nt.install_slot_advancer(Arc::new(NoopSlotAdvancer));
@@ -955,6 +1088,7 @@ async fn run_concurrent(fixture: &TestFixture, w: &Workload, seed: u64) -> TestR
     // Quiesce before the final assertion so no detached compaction from this (or
     // an earlier, since-replaced) instance commits mid-read.
     table.drain_in_flight_maintenance().await?;
+    left_positions |= opened_on_positions && !table.should_capture_positions();
 
     let live = read_rows(&ctx, &name).await?;
     let msg = format!(
@@ -963,15 +1097,24 @@ async fn run_concurrent(fixture: &TestFixture, w: &Workload, seed: u64) -> TestR
     );
     assert_converged(&live, &model, &msg);
     verify_aggregate_queries(&ctx, table.as_ref(), &name, &model, w.population, &msg).await?;
-    Ok(())
+    Ok(left_positions)
 }
 
 async fn run_workload(fixture: TestFixture, w: Workload) -> TestResult<()> {
+    let mut seeds_that_left_positions = 0usize;
     for seed in 0..w.seeds {
-        match w.concurrency {
+        let left_positions = match w.concurrency {
             Concurrency::Sequential => run_sequential(&fixture, &w, seed).await?,
             Concurrency::ConcurrentWithCompaction => run_concurrent(&fixture, &w, seed).await?,
-        }
+        };
+        seeds_that_left_positions += usize::from(left_positions);
+    }
+    match w.mode {
+        Mode::Auto => assert_eq!(
+            seeds_that_left_positions, 0,
+            "Auto non-vacuity: a table inside its bound must stay on position deletes"
+        ),
+        Mode::Key | Mode::Position | Mode::AutoCrossing => {}
     }
     Ok(())
 }
@@ -1037,6 +1180,7 @@ const SEQUENTIAL_MIXED: OpWeights = OpWeights {
     upsert: 40,
     delete: 25,
     delete_all: 8,
+    delete_predicate: 10,
     overwrite: 12,
     compact: 8,
     restart: 7,
@@ -1046,6 +1190,7 @@ const CONCURRENT_MIXED: OpWeights = OpWeights {
     upsert: 40,
     delete: 60,
     delete_all: 0,
+    delete_predicate: 10,
     overwrite: 0,
     // Compaction is driven by the background loop (foreground `compact` is a
     // no-op here); `restart` reopens the table from the catalog mid-stream, under
@@ -1059,6 +1204,7 @@ const CONCURRENT_UPSERT_ONLY: OpWeights = OpWeights {
     upsert: 100,
     delete: 0,
     delete_all: 0,
+    delete_predicate: 0,
     overwrite: 0,
     compact: 0,
     restart: 0,
@@ -1073,6 +1219,7 @@ const MEMORY_MIXED: OpWeights = OpWeights {
     upsert: 45,
     delete: 25,
     delete_all: 0,
+    delete_predicate: 10,
     overwrite: 0,
     compact: 25,
     restart: 5,
@@ -1194,6 +1341,7 @@ fn sequential_cold() -> Workload {
             upsert: 40,
             delete: 25,
             delete_all: 5,
+            delete_predicate: 10,
             overwrite: 10,
             compact: 5,
             restart: 5,
@@ -1218,6 +1366,7 @@ fn concurrent_cold() -> Workload {
             upsert: 40,
             delete: 55,
             delete_all: 0,
+            delete_predicate: 10,
             overwrite: 0,
             compact: 0,
             restart: 3,
@@ -1269,6 +1418,90 @@ async fn prop_harness_stack_headroom_impl(_f: TestFixture) -> TestResult<()> {
 }
 test_with_backends!(prop_harness_stack_headroom_impl);
 
+// --- AutoCrossing non-vacuity (mode transition, not only model convergence) ---
+//
+// SplitMix64 of the key — values that do not compress, so listed bytes track
+// row count (same recipe as the unit tests in `auto_deletion_mode.rs`).
+fn incompressible_value(id: i64) -> i64 {
+    let mut z = u64::from_ne_bytes(id.to_ne_bytes()).wrapping_add(0x9E37_79B9_7F4A_7C15);
+    z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+    z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+    i64::from_ne_bytes((z ^ (z >> 31)).to_ne_bytes())
+}
+
+/// Observe position mode before growth and key mode afterward on an
+/// `AutoCrossing` table. The random `AutoCrossing` walks would still pass if
+/// adaptive sizing regressed and never left position deletes; this pins the
+/// transition through `should_capture_positions` and listed bytes.
+async fn prop_auto_crossing_observes_position_then_key_switch_impl(
+    f: TestFixture,
+) -> TestResult<()> {
+    // `AutoCrossing`'s bound: its 1 MiB target file size / 32.
+    const BOUND: u64 = 32 * 1024;
+    let name = "auto_crossing_mode_switch";
+    let (table, _ctx) =
+        create_table(&f, name, Mode::AutoCrossing, Durability::File, None, false).await?;
+
+    assert!(
+        table.should_capture_positions(),
+        "AutoCrossing non-vacuity: empty auto table must start on position deletes"
+    );
+
+    // Seed a few keys, then upsert them so the deletion index is past the
+    // reclaim trigger (2) before the size-driven switch.
+    let seed: Vec<(i64, i64)> = (0..16).map(|id| (id, 100)).collect();
+    upsert(&table, &seed, Durability::File).await?;
+    let upserted: Vec<(i64, i64)> = (0..8).map(|id| (id, 200)).collect();
+    upsert(&table, &upserted, Durability::File).await?;
+    table.flush_pending_maintenance().await?;
+
+    // Grow past the bound.
+    let grow: Vec<(i64, i64)> = (1_000..61_000)
+        .map(|id| (id, incompressible_value(id)))
+        .collect();
+    for chunk in grow.chunks(8_000) {
+        upsert(&table, chunk, Durability::File).await?;
+    }
+    table.flush_pending_maintenance().await?;
+
+    let bytes = table.warm_listed_bytes().await?;
+    assert!(
+        bytes > BOUND,
+        "AutoCrossing non-vacuity premise: grown table ({bytes} B) must exceed the {BOUND} B bound"
+    );
+
+    // Growth + flush may already have requested/run the switch; if not, the
+    // reclaim pass under compaction_lock does it (same path as production). A pass
+    // declines without running while another pass holds the compaction lock or a
+    // staged append is in flight, so poll until one runs, within a deadline.
+    if table.should_capture_positions() {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        let mut attempts = 0_u32;
+        let mut ran = false;
+        while table.should_capture_positions() && std::time::Instant::now() < deadline {
+            attempts += 1;
+            ran = table
+                .compact_current_snapshot_small_files()
+                .await
+                .map_err(|e| -> Box<dyn std::error::Error> { e.into() })?;
+            if ran {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        assert!(
+            ran || !table.should_capture_positions(),
+            "AutoCrossing non-vacuity: reclaim pass must run after growth past the bound ({attempts} attempts)"
+        );
+    }
+    assert!(
+        !table.should_capture_positions(),
+        "AutoCrossing non-vacuity: after growth past the bound the table must be on key deletes"
+    );
+    Ok(())
+}
+test_with_backends!(prop_auto_crossing_observes_position_then_key_switch_impl);
+
 // --- Sequential convergence (GREEN) ---
 async fn prop_sequential_key_impl(f: TestFixture) -> TestResult<()> {
     run_workload(f, sequential(Mode::Key)).await
@@ -1276,8 +1509,16 @@ async fn prop_sequential_key_impl(f: TestFixture) -> TestResult<()> {
 async fn prop_sequential_position_impl(f: TestFixture) -> TestResult<()> {
     run_workload(f, sequential(Mode::Position)).await
 }
+async fn prop_sequential_auto_impl(f: TestFixture) -> TestResult<()> {
+    run_workload(f, sequential(Mode::Auto)).await
+}
+async fn prop_sequential_auto_crossing_impl(f: TestFixture) -> TestResult<()> {
+    run_workload(f, sequential(Mode::AutoCrossing)).await
+}
 test_with_backends!(prop_sequential_key_impl);
 test_with_backends!(prop_sequential_position_impl);
+test_with_backends!(prop_sequential_auto_impl);
+test_with_backends!(prop_sequential_auto_crossing_impl);
 
 // --- Memory-CDC convergence + count-exactness (mem-tier checkpoint + bake) ---
 //
@@ -1291,6 +1532,89 @@ async fn prop_sequential_memory_impl(f: TestFixture) -> TestResult<()> {
     run_workload(f, sequential_memory()).await
 }
 test_with_backends!(prop_sequential_memory_impl);
+
+/// [`assert_converged`] plus a physical row count, which catches a duplicate
+/// row that `read_rows` would fold into the key/value map.
+async fn assert_converged_no_duplicates(
+    ctx: &SessionContext,
+    name: &str,
+    model: &Model,
+    message: &str,
+) -> TestResult<()> {
+    assert_converged(&read_rows(ctx, name).await?, model, message);
+    let count = scalar_i64(ctx, &format!("SELECT COUNT(*) FROM {name}")).await?;
+    assert_eq!(
+        count,
+        i64::try_from(model.len()).expect("model size fits i64"),
+        "{message}: duplicate physical rows"
+    );
+    Ok(())
+}
+
+// A memory-durable table can receive a durable write when CDC cannot use the
+// mem tier. Walk both write paths against one model after every write.
+async fn prop_mixed_memory_and_durable_upserts_impl(f: TestFixture) -> TestResult<()> {
+    let name = "mixed_memory_and_durable_upserts";
+    let (table, ctx) = create_table(&f, name, Mode::Key, Durability::Memory, None, false).await?;
+    let mut model = Model::new();
+    let initial: Vec<(i64, i64)> = (0..8).map(|id| (id, 0)).collect();
+    upsert(&table, &initial, Durability::Memory).await?;
+    model.extend(initial);
+
+    let mut rng = Rng::new(14413);
+    for step in 0..24 {
+        let rows = random_rows(&mut rng, 8, 4);
+        let durability = if step % 2 == 0 {
+            Durability::File
+        } else {
+            Durability::Memory
+        };
+        upsert(&table, &rows, durability).await?;
+        model.extend(rows);
+        let message = format!("mixed upsert step {step} ({durability:?})");
+        assert_converged_no_duplicates(&ctx, name, &model, &message).await?;
+    }
+    Ok(())
+}
+test_with_backends!(prop_mixed_memory_and_durable_upserts_impl);
+
+// A durable upsert of keys first written through the mem tier must hide the
+// old rows whether a checkpoint moves them into a file before the upsert or
+// after it.
+async fn durable_upsert_of_mem_tier_keys(
+    f: TestFixture,
+    name: &str,
+    checkpoint_first: bool,
+) -> TestResult<()> {
+    let (table, ctx) = create_table(&f, name, Mode::Key, Durability::Memory, None, false).await?;
+    let old: Vec<(i64, i64)> = (1..=100).map(|id| (id, 1)).collect();
+    upsert(&table, &old, Durability::Memory).await?;
+    if checkpoint_first {
+        assert_eq!(
+            table.checkpoint_mem_tier().await?,
+            100,
+            "{name}: the checkpoint must move every key to files"
+        );
+    }
+    let new: Vec<(i64, i64)> = (1..=100).map(|id| (id, 2)).collect();
+    upsert(&table, &new, Durability::File).await?;
+    let model: Model = new.into_iter().collect();
+    assert_converged_no_duplicates(&ctx, name, &model, name).await?;
+    if !checkpoint_first {
+        table.checkpoint_mem_tier().await?;
+        assert_converged_no_duplicates(&ctx, name, &model, &format!("{name} after checkpoint"))
+            .await?;
+    }
+    Ok(())
+}
+async fn durable_upsert_after_mem_tier_checkpoint_impl(f: TestFixture) -> TestResult<()> {
+    durable_upsert_of_mem_tier_keys(f, "durable_upsert_after_mem_tier_checkpoint", true).await
+}
+async fn mem_tier_checkpoint_after_durable_upsert_impl(f: TestFixture) -> TestResult<()> {
+    durable_upsert_of_mem_tier_keys(f, "mem_tier_checkpoint_after_durable_upsert", false).await
+}
+test_with_backends!(durable_upsert_after_mem_tier_checkpoint_impl);
+test_with_backends!(mem_tier_checkpoint_after_durable_upsert_impl);
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn prop_concurrent_memory_sqlite() -> TestResult<()> {
@@ -1333,7 +1657,7 @@ async fn prop_concurrent_cold_sqlite() -> TestResult<()> {
 // cause instead of surfacing as a rare seed-dependent walk failure. Run in both
 // deletion modes, which take different prune paths (key index vs position).
 async fn reupsert_after_overwrite_delete_is_visible_impl(f: TestFixture) -> TestResult<()> {
-    for mode in [Mode::Key, Mode::Position] {
+    for mode in [Mode::Key, Mode::Position, Mode::Auto, Mode::AutoCrossing] {
         let name = format!("reupsert_min_{mode:?}");
         let (table, ctx) = create_table(&f, &name, mode, Durability::File, None, false).await?;
 
@@ -1437,6 +1761,58 @@ async fn prop_concurrent_mixed_dense_bloom_position_sqlite() -> TestResult<()> {
     .map_err(|e| -> Box<dyn std::error::Error> { e })
 }
 
+// The same concurrent stresses on the default `deletion_mode: auto`: whole-table
+// reclaims that run alongside the writers, and (crossing) the switch to key
+// deletes under them.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn prop_concurrent_upsert_only_auto_sqlite() -> TestResult<()> {
+    common::run_with_backend(BackendType::Sqlite, |f| {
+        run_workload(f, concurrent_upsert_only(Mode::Auto))
+    })
+    .await
+    .map_err(|e| -> Box<dyn std::error::Error> { e })
+}
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn prop_concurrent_mixed_auto_sqlite() -> TestResult<()> {
+    common::run_with_backend(BackendType::Sqlite, |f| {
+        run_workload(f, concurrent_mixed(Mode::Auto))
+    })
+    .await
+    .map_err(|e| -> Box<dyn std::error::Error> { e })
+}
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn prop_concurrent_mixed_auto_crossing_sqlite() -> TestResult<()> {
+    common::run_with_backend(BackendType::Sqlite, |f| {
+        run_workload(f, concurrent_mixed(Mode::AutoCrossing))
+    })
+    .await
+    .map_err(|e| -> Box<dyn std::error::Error> { e })
+}
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn prop_concurrent_mixed_dense_auto_sqlite() -> TestResult<()> {
+    common::run_with_backend(BackendType::Sqlite, |f| {
+        run_workload(f, concurrent_mixed_dense(Mode::Auto, None))
+    })
+    .await
+    .map_err(|e| -> Box<dyn std::error::Error> { e })
+}
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn prop_concurrent_mixed_dense_auto_crossing_sqlite() -> TestResult<()> {
+    common::run_with_backend(BackendType::Sqlite, |f| {
+        run_workload(f, concurrent_mixed_dense(Mode::AutoCrossing, None))
+    })
+    .await
+    .map_err(|e| -> Box<dyn std::error::Error> { e })
+}
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn prop_concurrent_mixed_dense_bloom_auto_sqlite() -> TestResult<()> {
+    common::run_with_backend(BackendType::Sqlite, |f| {
+        run_workload(f, concurrent_mixed_dense(Mode::Auto, Some(0)))
+    })
+    .await
+    .map_err(|e| -> Box<dyn std::error::Error> { e })
+}
+
 // ============================================================================
 // Snapshot-isolation under concurrent reads (overwrite torn-publish class)
 // ============================================================================
@@ -1534,6 +1910,14 @@ async fn prop_concurrent_reads_observe_consistent_snapshot_key_sqlite() -> TestR
 async fn prop_concurrent_reads_observe_consistent_snapshot_position_sqlite() -> TestResult<()> {
     common::run_with_backend(BackendType::Sqlite, |f| async move {
         run_concurrent_reads_mode(&f, Mode::Position).await
+    })
+    .await
+    .map_err(|e| -> Box<dyn std::error::Error> { e })
+}
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn prop_concurrent_reads_observe_consistent_snapshot_auto_sqlite() -> TestResult<()> {
+    common::run_with_backend(BackendType::Sqlite, |f| async move {
+        run_concurrent_reads_mode(&f, Mode::Auto).await
     })
     .await
     .map_err(|e| -> Box<dyn std::error::Error> { e })

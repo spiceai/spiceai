@@ -20,14 +20,14 @@ use arrow::array::{ListArray, StringArray, StructArray};
 use arrow::array::{ListBuilder, RecordBatch, StringBuilder, new_null_array};
 use arrow::datatypes::{DataType, Field, SchemaRef};
 use arrow_flight::{FlightData, SchemaAsIpc, flight_service_server::FlightService};
-use arrow_ipc::writer::{self, CompressionContext, DictionaryTracker, IpcDataGenerator};
+use arrow_ipc::writer::{self, DictionaryTracker, IpcDataGenerator, IpcWriteContext};
 use async_stream::try_stream;
 use data_components::cdc::changes_schema;
+use datafusion::common::TableReference;
 use datafusion::common::{Constraint, Constraints};
 use datafusion::datasource::TableProvider;
 use datafusion::error::DataFusionError;
 use datafusion::execution::SendableRecordBatchStream;
-use datafusion::sql::TableReference;
 use futures::StreamExt;
 use tokio::sync::broadcast::error::RecvError;
 use tonic::{Request, Response, Status, Streaming};
@@ -108,7 +108,7 @@ fn update_stats(update: &DataUpdate) -> (usize, usize, usize) {
 struct ChangeFlightEncoder {
     encoder: IpcDataGenerator,
     tracker: DictionaryTracker,
-    compression_context: CompressionContext,
+    compression_context: IpcWriteContext,
     write_options: writer::IpcWriteOptions,
     schema: Option<SchemaRef>,
 }
@@ -118,7 +118,7 @@ impl Default for ChangeFlightEncoder {
         Self {
             encoder: IpcDataGenerator::default(),
             tracker: DictionaryTracker::new(false),
-            compression_context: CompressionContext::default(),
+            compression_context: IpcWriteContext::default(),
             write_options: writer::IpcWriteOptions::default(),
             schema: None,
         }
@@ -142,18 +142,25 @@ impl ChangeFlightEncoder {
             self.tracker = DictionaryTracker::new(false);
         }
 
-        let (flight_dictionaries, flight_batch) = self
-            .encoder
-            .encode(
-                record_batch,
-                &mut self.tracker,
-                &self.write_options,
-                &mut self.compression_context,
-            )
-            .map_err(|source| Status::internal(format!("Unable to encode batch: {source}")))?;
+        // A large change batch goes out as several messages, each under a
+        // client's default gRPC receive limit.
+        for slice in arrow_tools::ipc::split_batch_for_flight(
+            record_batch.clone(),
+            arrow_tools::ipc::FLIGHT_TARGET_MESSAGE_BYTES,
+        ) {
+            let (flight_dictionaries, flight_batch) = self
+                .encoder
+                .encode(
+                    &slice,
+                    &mut self.tracker,
+                    &self.write_options,
+                    &mut self.compression_context,
+                )
+                .map_err(|source| Status::internal(format!("Unable to encode batch: {source}")))?;
 
-        flights.extend(flight_dictionaries.into_iter().map(Into::into));
-        flights.push(flight_batch.into());
+            flights.extend(flight_dictionaries.into_iter().map(Into::into));
+            flights.push(flight_batch.into());
+        }
 
         Ok(flights)
     }

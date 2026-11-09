@@ -1,0 +1,1809 @@
+{
+  "repository": "https://github.com/spiceai/docs",
+  "revision": "31f71082804b7a5f711d2370e413881ef68319c9",
+  "path": "website/docs/reference/sql",
+  "functions": [
+    {
+      "name": "abs",
+      "canonical": "abs",
+      "page": "scalar_functions"
+    },
+    {
+      "name": "acos",
+      "canonical": "acos",
+      "page": "scalar_functions"
+    },
+    {
+      "name": "acosh",
+      "canonical": "acosh",
+      "page": "scalar_functions"
+    },
+    {
+      "name": "asin",
+      "canonical": "asin",
+      "page": "scalar_functions"
+    },
+    {
+      "name": "asinh",
+      "canonical": "asinh",
+      "page": "scalar_functions"
+    },
+    {
+      "name": "atan",
+      "canonical": "atan",
+      "page": "scalar_functions"
+    },
+    {
+      "name": "atan2",
+      "canonical": "atan2",
+      "page": "scalar_functions"
+    },
+    {
+      "name": "atanh",
+      "canonical": "atanh",
+      "page": "scalar_functions"
+    },
+    {
+      "name": "cbrt",
+      "canonical": "cbrt",
+      "page": "scalar_functions"
+    },
+    {
+      "name": "ceil",
+      "canonical": "ceil",
+      "page": "scalar_functions"
+    },
+    {
+      "name": "cos",
+      "canonical": "cos",
+      "page": "scalar_functions"
+    },
+    {
+      "name": "cosh",
+      "canonical": "cosh",
+      "page": "scalar_functions"
+    },
+    {
+      "name": "cot",
+      "canonical": "cot",
+      "page": "scalar_functions"
+    },
+    {
+      "name": "degrees",
+      "canonical": "degrees",
+      "page": "scalar_functions"
+    },
+    {
+      "name": "exp",
+      "canonical": "exp",
+      "page": "scalar_functions"
+    },
+    {
+      "name": "factorial",
+      "canonical": "factorial",
+      "page": "scalar_functions"
+    },
+    {
+      "name": "floor",
+      "canonical": "floor",
+      "page": "scalar_functions"
+    },
+    {
+      "name": "gcd",
+      "canonical": "gcd",
+      "page": "scalar_functions"
+    },
+    {
+      "name": "isnan",
+      "canonical": "isnan",
+      "page": "scalar_functions"
+    },
+    {
+      "name": "iszero",
+      "canonical": "iszero",
+      "page": "scalar_functions"
+    },
+    {
+      "name": "lcm",
+      "canonical": "lcm",
+      "page": "scalar_functions"
+    },
+    {
+      "name": "mod",
+      "canonical": "mod",
+      "page": "scalar_functions"
+    },
+    {
+      "name": "pmod",
+      "canonical": "pmod",
+      "page": "scalar_functions"
+    },
+    {
+      "name": "ln",
+      "canonical": "ln",
+      "page": "scalar_functions"
+    },
+    {
+      "name": "log",
+      "canonical": "log",
+      "page": "scalar_functions"
+    },
+    {
+      "name": "log10",
+      "canonical": "log10",
+      "page": "scalar_functions"
+    },
+    {
+      "name": "log2",
+      "canonical": "log2",
+      "page": "scalar_functions"
+    },
+    {
+      "name": "nanvl",
+      "canonical": "nanvl",
+      "page": "scalar_functions"
+    },
+    {
+      "name": "pi",
+      "canonical": "pi",
+      "page": "scalar_functions"
+    },
+    {
+      "name": "pow",
+      "canonical": "pow",
+      "page": "scalar_functions"
+    },
+    {
+      "name": "power",
+      "canonical": "pow",
+      "page": "scalar_functions"
+    },
+    {
+      "name": "radians",
+      "canonical": "radians",
+      "page": "scalar_functions"
+    },
+    {
+      "name": "random",
+      "canonical": "random",
+      "page": "scalar_functions"
+    },
+    {
+      "name": "round",
+      "canonical": "round",
+      "page": "scalar_functions"
+    },
+    {
+      "name": "rint",
+      "canonical": "rint",
+      "page": "scalar_functions"
+    },
+    {
+      "name": "signum",
+      "canonical": "signum",
+      "page": "scalar_functions"
+    },
+    {
+      "name": "sin",
+      "canonical": "sin",
+      "page": "scalar_functions"
+    },
+    {
+      "name": "sinh",
+      "canonical": "sinh",
+      "page": "scalar_functions"
+    },
+    {
+      "name": "sqrt",
+      "canonical": "sqrt",
+      "page": "scalar_functions"
+    },
+    {
+      "name": "tan",
+      "canonical": "tan",
+      "page": "scalar_functions"
+    },
+    {
+      "name": "tanh",
+      "canonical": "tanh",
+      "page": "scalar_functions"
+    },
+    {
+      "name": "trunc",
+      "canonical": "trunc",
+      "page": "scalar_functions"
+    },
+    {
+      "name": "width_bucket",
+      "canonical": "width_bucket",
+      "page": "scalar_functions"
+    },
+    {
+      "name": "CASE",
+      "canonical": "CASE",
+      "page": "scalar_functions"
+    },
+    {
+      "name": "coalesce",
+      "canonical": "coalesce",
+      "page": "scalar_functions"
+    },
+    {
+      "name": "greatest",
+      "canonical": "greatest",
+      "page": "scalar_functions"
+    },
+    {
+      "name": "if",
+      "canonical": "if",
+      "page": "scalar_functions"
+    },
+    {
+      "name": "least",
+      "canonical": "least",
+      "page": "scalar_functions"
+    },
+    {
+      "name": "nullif",
+      "canonical": "nullif",
+      "page": "scalar_functions"
+    },
+    {
+      "name": "nvl",
+      "canonical": "nvl",
+      "page": "scalar_functions"
+    },
+    {
+      "name": "ifnull",
+      "canonical": "nvl",
+      "page": "scalar_functions"
+    },
+    {
+      "name": "nvl2",
+      "canonical": "nvl2",
+      "page": "scalar_functions"
+    },
+    {
+      "name": "ascii",
+      "canonical": "ascii",
+      "page": "scalar_functions"
+    },
+    {
+      "name": "bit_length",
+      "canonical": "bit_length",
+      "page": "scalar_functions"
+    },
+    {
+      "name": "btrim",
+      "canonical": "btrim",
+      "page": "scalar_functions"
+    },
+    {
+      "name": "trim",
+      "canonical": "trim",
+      "page": "scalar_functions"
+    },
+    {
+      "name": "char_length",
+      "canonical": "character_length",
+      "page": "scalar_functions"
+    },
+    {
+      "name": "character_length",
+      "canonical": "character_length",
+      "page": "scalar_functions"
+    },
+    {
+      "name": "length",
+      "canonical": "length",
+      "page": "scalar_functions"
+    },
+    {
+      "name": "chr",
+      "canonical": "chr",
+      "page": "scalar_functions"
+    },
+    {
+      "name": "concat",
+      "canonical": "concat",
+      "page": "scalar_functions"
+    },
+    {
+      "name": "concat_ws",
+      "canonical": "concat_ws",
+      "page": "scalar_functions"
+    },
+    {
+      "name": "contains",
+      "canonical": "contains",
+      "page": "scalar_functions"
+    },
+    {
+      "name": "like",
+      "canonical": "like",
+      "page": "scalar_functions"
+    },
+    {
+      "name": "ilike",
+      "canonical": "ilike",
+      "page": "scalar_functions"
+    },
+    {
+      "name": "ends_with",
+      "canonical": "ends_with",
+      "page": "scalar_functions"
+    },
+    {
+      "name": "find_in_set",
+      "canonical": "find_in_set",
+      "page": "scalar_functions"
+    },
+    {
+      "name": "initcap",
+      "canonical": "initcap",
+      "page": "scalar_functions"
+    },
+    {
+      "name": "instr",
+      "canonical": "strpos",
+      "page": "scalar_functions"
+    },
+    {
+      "name": "left",
+      "canonical": "left",
+      "page": "scalar_functions"
+    },
+    {
+      "name": "levenshtein",
+      "canonical": "levenshtein",
+      "page": "scalar_functions"
+    },
+    {
+      "name": "lower",
+      "canonical": "lower",
+      "page": "scalar_functions"
+    },
+    {
+      "name": "luhn_check",
+      "canonical": "luhn_check",
+      "page": "scalar_functions"
+    },
+    {
+      "name": "lpad",
+      "canonical": "lpad",
+      "page": "scalar_functions"
+    },
+    {
+      "name": "ltrim",
+      "canonical": "ltrim",
+      "page": "scalar_functions"
+    },
+    {
+      "name": "octet_length",
+      "canonical": "octet_length",
+      "page": "scalar_functions"
+    },
+    {
+      "name": "overlay",
+      "canonical": "overlay",
+      "page": "scalar_functions"
+    },
+    {
+      "name": "parse_url",
+      "canonical": "parse_url",
+      "page": "scalar_functions"
+    },
+    {
+      "name": "position",
+      "canonical": "strpos",
+      "page": "scalar_functions"
+    },
+    {
+      "name": "repeat",
+      "canonical": "repeat",
+      "page": "scalar_functions"
+    },
+    {
+      "name": "replace",
+      "canonical": "replace",
+      "page": "scalar_functions"
+    },
+    {
+      "name": "reverse",
+      "canonical": "reverse",
+      "page": "scalar_functions"
+    },
+    {
+      "name": "right",
+      "canonical": "right",
+      "page": "scalar_functions"
+    },
+    {
+      "name": "rpad",
+      "canonical": "rpad",
+      "page": "scalar_functions"
+    },
+    {
+      "name": "rtrim",
+      "canonical": "rtrim",
+      "page": "scalar_functions"
+    },
+    {
+      "name": "split_part",
+      "canonical": "split_part",
+      "page": "scalar_functions"
+    },
+    {
+      "name": "starts_with",
+      "canonical": "starts_with",
+      "page": "scalar_functions"
+    },
+    {
+      "name": "strpos",
+      "canonical": "strpos",
+      "page": "scalar_functions"
+    },
+    {
+      "name": "substr",
+      "canonical": "substr",
+      "page": "scalar_functions"
+    },
+    {
+      "name": "substring",
+      "canonical": "substring",
+      "page": "scalar_functions"
+    },
+    {
+      "name": "substr_index",
+      "canonical": "substr_index",
+      "page": "scalar_functions"
+    },
+    {
+      "name": "substring_index",
+      "canonical": "substring_index",
+      "page": "scalar_functions"
+    },
+    {
+      "name": "to_hex",
+      "canonical": "to_hex",
+      "page": "scalar_functions"
+    },
+    {
+      "name": "translate",
+      "canonical": "translate",
+      "page": "scalar_functions"
+    },
+    {
+      "name": "upper",
+      "canonical": "upper",
+      "page": "scalar_functions"
+    },
+    {
+      "name": "uuid",
+      "canonical": "uuid",
+      "page": "scalar_functions"
+    },
+    {
+      "name": "bit_get",
+      "canonical": "bit_get",
+      "page": "scalar_functions"
+    },
+    {
+      "name": "bit_count",
+      "canonical": "bit_count",
+      "page": "scalar_functions"
+    },
+    {
+      "name": "bitmap_count",
+      "canonical": "bitmap_count",
+      "page": "scalar_functions"
+    },
+    {
+      "name": "regexp_like",
+      "canonical": "regexp_like",
+      "page": "scalar_functions"
+    },
+    {
+      "name": "regexp_match",
+      "canonical": "regexp_match",
+      "page": "scalar_functions"
+    },
+    {
+      "name": "regexp_replace",
+      "canonical": "regexp_replace",
+      "page": "scalar_functions"
+    },
+    {
+      "name": "regexp_count",
+      "canonical": "regexp_count",
+      "page": "scalar_functions"
+    },
+    {
+      "name": "regexp_instr",
+      "canonical": "regexp_instr",
+      "page": "scalar_functions"
+    },
+    {
+      "name": "current_date",
+      "canonical": "current_date",
+      "page": "scalar_functions"
+    },
+    {
+      "name": "today",
+      "canonical": "today",
+      "page": "scalar_functions"
+    },
+    {
+      "name": "current_time",
+      "canonical": "current_time",
+      "page": "scalar_functions"
+    },
+    {
+      "name": "current_timestamp",
+      "canonical": "now",
+      "page": "scalar_functions"
+    },
+    {
+      "name": "date_bin",
+      "canonical": "date_bin",
+      "page": "scalar_functions"
+    },
+    {
+      "name": "date_add",
+      "canonical": "date_add",
+      "page": "scalar_functions"
+    },
+    {
+      "name": "date_sub",
+      "canonical": "date_sub",
+      "page": "scalar_functions"
+    },
+    {
+      "name": "last_day",
+      "canonical": "last_day",
+      "page": "scalar_functions"
+    },
+    {
+      "name": "next_day",
+      "canonical": "next_day",
+      "page": "scalar_functions"
+    },
+    {
+      "name": "date_format",
+      "canonical": "to_char",
+      "page": "scalar_functions"
+    },
+    {
+      "name": "date_part",
+      "canonical": "date_part",
+      "page": "scalar_functions"
+    },
+    {
+      "name": "datepart",
+      "canonical": "datepart",
+      "page": "scalar_functions"
+    },
+    {
+      "name": "date_trunc",
+      "canonical": "date_trunc",
+      "page": "scalar_functions"
+    },
+    {
+      "name": "datetrunc",
+      "canonical": "datetrunc",
+      "page": "scalar_functions"
+    },
+    {
+      "name": "from_unixtime",
+      "canonical": "from_unixtime",
+      "page": "scalar_functions"
+    },
+    {
+      "name": "make_date",
+      "canonical": "make_date",
+      "page": "scalar_functions"
+    },
+    {
+      "name": "now",
+      "canonical": "now",
+      "page": "scalar_functions"
+    },
+    {
+      "name": "to_char",
+      "canonical": "to_char",
+      "page": "scalar_functions"
+    },
+    {
+      "name": "to_date",
+      "canonical": "to_date",
+      "page": "scalar_functions"
+    },
+    {
+      "name": "to_local_time",
+      "canonical": "to_local_time",
+      "page": "scalar_functions"
+    },
+    {
+      "name": "to_timestamp",
+      "canonical": "to_timestamp",
+      "page": "scalar_functions"
+    },
+    {
+      "name": "to_timestamp_micros",
+      "canonical": "to_timestamp_micros",
+      "page": "scalar_functions"
+    },
+    {
+      "name": "to_timestamp_millis",
+      "canonical": "to_timestamp_millis",
+      "page": "scalar_functions"
+    },
+    {
+      "name": "to_timestamp_nanos",
+      "canonical": "to_timestamp_nanos",
+      "page": "scalar_functions"
+    },
+    {
+      "name": "to_timestamp_seconds",
+      "canonical": "to_timestamp_seconds",
+      "page": "scalar_functions"
+    },
+    {
+      "name": "to_unixtime",
+      "canonical": "to_unixtime",
+      "page": "scalar_functions"
+    },
+    {
+      "name": "array",
+      "canonical": "array",
+      "page": "scalar_functions"
+    },
+    {
+      "name": "array_add",
+      "canonical": "array_add",
+      "page": "scalar_functions"
+    },
+    {
+      "name": "list_add",
+      "canonical": "array_add",
+      "page": "scalar_functions"
+    },
+    {
+      "name": "array_any_value",
+      "canonical": "array_any_value",
+      "page": "scalar_functions"
+    },
+    {
+      "name": "list_any_value",
+      "canonical": "array_any_value",
+      "page": "scalar_functions"
+    },
+    {
+      "name": "array_append",
+      "canonical": "array_append",
+      "page": "scalar_functions"
+    },
+    {
+      "name": "list_append",
+      "canonical": "array_append",
+      "page": "scalar_functions"
+    },
+    {
+      "name": "array_push_back",
+      "canonical": "array_append",
+      "page": "scalar_functions"
+    },
+    {
+      "name": "list_push_back",
+      "canonical": "array_append",
+      "page": "scalar_functions"
+    },
+    {
+      "name": "array_avg",
+      "canonical": "array_avg",
+      "page": "scalar_functions"
+    },
+    {
+      "name": "list_avg",
+      "canonical": "array_avg",
+      "page": "scalar_functions"
+    },
+    {
+      "name": "array_cat",
+      "canonical": "array_concat",
+      "page": "scalar_functions"
+    },
+    {
+      "name": "array_concat",
+      "canonical": "array_concat",
+      "page": "scalar_functions"
+    },
+    {
+      "name": "list_concat",
+      "canonical": "array_concat",
+      "page": "scalar_functions"
+    },
+    {
+      "name": "list_cat",
+      "canonical": "array_concat",
+      "page": "scalar_functions"
+    },
+    {
+      "name": "array_contains",
+      "canonical": "array_has",
+      "page": "scalar_functions"
+    },
+    {
+      "name": "array_dims",
+      "canonical": "array_dims",
+      "page": "scalar_functions"
+    },
+    {
+      "name": "list_dims",
+      "canonical": "array_dims",
+      "page": "scalar_functions"
+    },
+    {
+      "name": "array_distance",
+      "canonical": "array_distance",
+      "page": "scalar_functions"
+    },
+    {
+      "name": "list_distance",
+      "canonical": "array_distance",
+      "page": "scalar_functions"
+    },
+    {
+      "name": "array_distinct",
+      "canonical": "array_distinct",
+      "page": "scalar_functions"
+    },
+    {
+      "name": "list_distinct",
+      "canonical": "array_distinct",
+      "page": "scalar_functions"
+    },
+    {
+      "name": "array_element",
+      "canonical": "array_element",
+      "page": "scalar_functions"
+    },
+    {
+      "name": "array_extract",
+      "canonical": "array_element",
+      "page": "scalar_functions"
+    },
+    {
+      "name": "list_element",
+      "canonical": "array_element",
+      "page": "scalar_functions"
+    },
+    {
+      "name": "list_extract",
+      "canonical": "array_element",
+      "page": "scalar_functions"
+    },
+    {
+      "name": "array_except",
+      "canonical": "array_except",
+      "page": "scalar_functions"
+    },
+    {
+      "name": "list_except",
+      "canonical": "array_except",
+      "page": "scalar_functions"
+    },
+    {
+      "name": "array_has",
+      "canonical": "array_has",
+      "page": "scalar_functions"
+    },
+    {
+      "name": "list_has",
+      "canonical": "array_has",
+      "page": "scalar_functions"
+    },
+    {
+      "name": "array_has_all",
+      "canonical": "array_has_all",
+      "page": "scalar_functions"
+    },
+    {
+      "name": "list_has_all",
+      "canonical": "array_has_all",
+      "page": "scalar_functions"
+    },
+    {
+      "name": "array_has_any",
+      "canonical": "array_has_any",
+      "page": "scalar_functions"
+    },
+    {
+      "name": "list_has_any",
+      "canonical": "array_has_any",
+      "page": "scalar_functions"
+    },
+    {
+      "name": "arrays_overlap",
+      "canonical": "array_has_any",
+      "page": "scalar_functions"
+    },
+    {
+      "name": "array_intersect",
+      "canonical": "array_intersect",
+      "page": "scalar_functions"
+    },
+    {
+      "name": "list_intersect",
+      "canonical": "array_intersect",
+      "page": "scalar_functions"
+    },
+    {
+      "name": "array_length",
+      "canonical": "array_length",
+      "page": "scalar_functions"
+    },
+    {
+      "name": "list_length",
+      "canonical": "array_length",
+      "page": "scalar_functions"
+    },
+    {
+      "name": "array_max",
+      "canonical": "array_max",
+      "page": "scalar_functions"
+    },
+    {
+      "name": "list_max",
+      "canonical": "array_max",
+      "page": "scalar_functions"
+    },
+    {
+      "name": "array_min",
+      "canonical": "array_min",
+      "page": "scalar_functions"
+    },
+    {
+      "name": "list_min",
+      "canonical": "array_min",
+      "page": "scalar_functions"
+    },
+    {
+      "name": "array_ndims",
+      "canonical": "array_ndims",
+      "page": "scalar_functions"
+    },
+    {
+      "name": "list_ndims",
+      "canonical": "array_ndims",
+      "page": "scalar_functions"
+    },
+    {
+      "name": "array_pop_back",
+      "canonical": "array_pop_back",
+      "page": "scalar_functions"
+    },
+    {
+      "name": "list_pop_back",
+      "canonical": "array_pop_back",
+      "page": "scalar_functions"
+    },
+    {
+      "name": "array_pop_front",
+      "canonical": "array_pop_front",
+      "page": "scalar_functions"
+    },
+    {
+      "name": "list_pop_front",
+      "canonical": "array_pop_front",
+      "page": "scalar_functions"
+    },
+    {
+      "name": "array_position",
+      "canonical": "array_position",
+      "page": "scalar_functions"
+    },
+    {
+      "name": "list_position",
+      "canonical": "array_position",
+      "page": "scalar_functions"
+    },
+    {
+      "name": "array_indexof",
+      "canonical": "array_position",
+      "page": "scalar_functions"
+    },
+    {
+      "name": "list_indexof",
+      "canonical": "array_position",
+      "page": "scalar_functions"
+    },
+    {
+      "name": "array_positions",
+      "canonical": "array_positions",
+      "page": "scalar_functions"
+    },
+    {
+      "name": "list_positions",
+      "canonical": "array_positions",
+      "page": "scalar_functions"
+    },
+    {
+      "name": "array_prepend",
+      "canonical": "array_prepend",
+      "page": "scalar_functions"
+    },
+    {
+      "name": "list_prepend",
+      "canonical": "array_prepend",
+      "page": "scalar_functions"
+    },
+    {
+      "name": "array_push_front",
+      "canonical": "array_prepend",
+      "page": "scalar_functions"
+    },
+    {
+      "name": "list_push_front",
+      "canonical": "array_prepend",
+      "page": "scalar_functions"
+    },
+    {
+      "name": "array_product",
+      "canonical": "array_product",
+      "page": "scalar_functions"
+    },
+    {
+      "name": "list_product",
+      "canonical": "array_product",
+      "page": "scalar_functions"
+    },
+    {
+      "name": "array_remove",
+      "canonical": "array_remove",
+      "page": "scalar_functions"
+    },
+    {
+      "name": "list_remove",
+      "canonical": "array_remove",
+      "page": "scalar_functions"
+    },
+    {
+      "name": "array_remove_n",
+      "canonical": "array_remove_n",
+      "page": "scalar_functions"
+    },
+    {
+      "name": "list_remove_n",
+      "canonical": "array_remove_n",
+      "page": "scalar_functions"
+    },
+    {
+      "name": "array_remove_all",
+      "canonical": "array_remove_all",
+      "page": "scalar_functions"
+    },
+    {
+      "name": "list_remove_all",
+      "canonical": "array_remove_all",
+      "page": "scalar_functions"
+    },
+    {
+      "name": "array_repeat",
+      "canonical": "array_repeat",
+      "page": "scalar_functions"
+    },
+    {
+      "name": "list_repeat",
+      "canonical": "array_repeat",
+      "page": "scalar_functions"
+    },
+    {
+      "name": "array_replace",
+      "canonical": "array_replace",
+      "page": "scalar_functions"
+    },
+    {
+      "name": "list_replace",
+      "canonical": "array_replace",
+      "page": "scalar_functions"
+    },
+    {
+      "name": "array_replace_n",
+      "canonical": "array_replace_n",
+      "page": "scalar_functions"
+    },
+    {
+      "name": "list_replace_n",
+      "canonical": "array_replace_n",
+      "page": "scalar_functions"
+    },
+    {
+      "name": "array_replace_all",
+      "canonical": "array_replace_all",
+      "page": "scalar_functions"
+    },
+    {
+      "name": "list_replace_all",
+      "canonical": "array_replace_all",
+      "page": "scalar_functions"
+    },
+    {
+      "name": "array_resize",
+      "canonical": "array_resize",
+      "page": "scalar_functions"
+    },
+    {
+      "name": "list_resize",
+      "canonical": "array_resize",
+      "page": "scalar_functions"
+    },
+    {
+      "name": "array_reverse",
+      "canonical": "array_reverse",
+      "page": "scalar_functions"
+    },
+    {
+      "name": "list_reverse",
+      "canonical": "array_reverse",
+      "page": "scalar_functions"
+    },
+    {
+      "name": "array_scale",
+      "canonical": "array_scale",
+      "page": "scalar_functions"
+    },
+    {
+      "name": "list_scale",
+      "canonical": "array_scale",
+      "page": "scalar_functions"
+    },
+    {
+      "name": "array_slice",
+      "canonical": "array_slice",
+      "page": "scalar_functions"
+    },
+    {
+      "name": "list_slice",
+      "canonical": "array_slice",
+      "page": "scalar_functions"
+    },
+    {
+      "name": "array_sort",
+      "canonical": "array_sort",
+      "page": "scalar_functions"
+    },
+    {
+      "name": "list_sort",
+      "canonical": "array_sort",
+      "page": "scalar_functions"
+    },
+    {
+      "name": "array_subtract",
+      "canonical": "array_subtract",
+      "page": "scalar_functions"
+    },
+    {
+      "name": "list_subtract",
+      "canonical": "array_subtract",
+      "page": "scalar_functions"
+    },
+    {
+      "name": "array_sum",
+      "canonical": "array_sum",
+      "page": "scalar_functions"
+    },
+    {
+      "name": "list_sum",
+      "canonical": "array_sum",
+      "page": "scalar_functions"
+    },
+    {
+      "name": "array_to_string",
+      "canonical": "array_to_string",
+      "page": "scalar_functions"
+    },
+    {
+      "name": "list_to_string",
+      "canonical": "array_to_string",
+      "page": "scalar_functions"
+    },
+    {
+      "name": "array_join",
+      "canonical": "array_to_string",
+      "page": "scalar_functions"
+    },
+    {
+      "name": "list_join",
+      "canonical": "array_to_string",
+      "page": "scalar_functions"
+    },
+    {
+      "name": "array_union",
+      "canonical": "array_union",
+      "page": "scalar_functions"
+    },
+    {
+      "name": "list_union",
+      "canonical": "array_union",
+      "page": "scalar_functions"
+    },
+    {
+      "name": "arrays_zip",
+      "canonical": "arrays_zip",
+      "page": "scalar_functions"
+    },
+    {
+      "name": "list_zip",
+      "canonical": "arrays_zip",
+      "page": "scalar_functions"
+    },
+    {
+      "name": "cardinality",
+      "canonical": "cardinality",
+      "page": "scalar_functions"
+    },
+    {
+      "name": "empty",
+      "canonical": "empty",
+      "page": "scalar_functions"
+    },
+    {
+      "name": "array_empty",
+      "canonical": "empty",
+      "page": "scalar_functions"
+    },
+    {
+      "name": "list_empty",
+      "canonical": "empty",
+      "page": "scalar_functions"
+    },
+    {
+      "name": "flatten",
+      "canonical": "flatten",
+      "page": "scalar_functions"
+    },
+    {
+      "name": "make_array",
+      "canonical": "make_array",
+      "page": "scalar_functions"
+    },
+    {
+      "name": "make_list",
+      "canonical": "make_array",
+      "page": "scalar_functions"
+    },
+    {
+      "name": "range",
+      "canonical": "range",
+      "page": "scalar_functions"
+    },
+    {
+      "name": "generate_series",
+      "canonical": "generate_series",
+      "page": "scalar_functions"
+    },
+    {
+      "name": "string_to_array",
+      "canonical": "string_to_array",
+      "page": "scalar_functions"
+    },
+    {
+      "name": "string_to_list",
+      "canonical": "string_to_array",
+      "page": "scalar_functions"
+    },
+    {
+      "name": "struct",
+      "canonical": "struct",
+      "page": "scalar_functions"
+    },
+    {
+      "name": "named_struct",
+      "canonical": "named_struct",
+      "page": "scalar_functions"
+    },
+    {
+      "name": "get_field",
+      "canonical": "get_field",
+      "page": "scalar_functions"
+    },
+    {
+      "name": "map",
+      "canonical": "map",
+      "page": "scalar_functions"
+    },
+    {
+      "name": "map_keys",
+      "canonical": "map_keys",
+      "page": "scalar_functions"
+    },
+    {
+      "name": "map_values",
+      "canonical": "map_values",
+      "page": "scalar_functions"
+    },
+    {
+      "name": "map_entries",
+      "canonical": "map_entries",
+      "page": "scalar_functions"
+    },
+    {
+      "name": "map_extract",
+      "canonical": "map_extract",
+      "page": "scalar_functions"
+    },
+    {
+      "name": "element_at",
+      "canonical": "map_extract",
+      "page": "scalar_functions"
+    },
+    {
+      "name": "digest",
+      "canonical": "digest",
+      "page": "scalar_functions"
+    },
+    {
+      "name": "md5",
+      "canonical": "md5",
+      "page": "scalar_functions"
+    },
+    {
+      "name": "sha224",
+      "canonical": "sha224",
+      "page": "scalar_functions"
+    },
+    {
+      "name": "sha256",
+      "canonical": "sha256",
+      "page": "scalar_functions"
+    },
+    {
+      "name": "sha384",
+      "canonical": "sha384",
+      "page": "scalar_functions"
+    },
+    {
+      "name": "sha512",
+      "canonical": "sha512",
+      "page": "scalar_functions"
+    },
+    {
+      "name": "encode",
+      "canonical": "encode",
+      "page": "scalar_functions"
+    },
+    {
+      "name": "decode",
+      "canonical": "decode",
+      "page": "scalar_functions"
+    },
+    {
+      "name": "union_extract",
+      "canonical": "union_extract",
+      "page": "scalar_functions"
+    },
+    {
+      "name": "union_tag",
+      "canonical": "union_tag",
+      "page": "scalar_functions"
+    },
+    {
+      "name": "obj_description",
+      "canonical": "obj_description",
+      "page": "scalar_functions"
+    },
+    {
+      "name": "col_description",
+      "canonical": "col_description",
+      "page": "scalar_functions"
+    },
+    {
+      "name": "arrow_cast",
+      "canonical": "arrow_cast",
+      "page": "scalar_functions"
+    },
+    {
+      "name": "arrow_try_cast",
+      "canonical": "arrow_try_cast",
+      "page": "scalar_functions"
+    },
+    {
+      "name": "arrow_typeof",
+      "canonical": "arrow_typeof",
+      "page": "scalar_functions"
+    },
+    {
+      "name": "arrow_metadata",
+      "canonical": "arrow_metadata",
+      "page": "scalar_functions"
+    },
+    {
+      "name": "version",
+      "canonical": "version",
+      "page": "scalar_functions"
+    },
+    {
+      "name": "ai",
+      "canonical": "ai",
+      "page": "scalar_functions"
+    },
+    {
+      "name": "embed",
+      "canonical": "ai",
+      "page": "scalar_functions"
+    },
+    {
+      "name": "bucket",
+      "canonical": "bucket",
+      "page": "scalar_functions"
+    },
+    {
+      "name": "truncate",
+      "canonical": "truncate",
+      "page": "scalar_functions"
+    },
+    {
+      "name": "any_value",
+      "canonical": "any_value",
+      "page": "aggregate_functions"
+    },
+    {
+      "name": "array_agg",
+      "canonical": "array_agg",
+      "page": "aggregate_functions"
+    },
+    {
+      "name": "avg",
+      "canonical": "avg",
+      "page": "aggregate_functions"
+    },
+    {
+      "name": "mean",
+      "canonical": "mean",
+      "page": "aggregate_functions"
+    },
+    {
+      "name": "bit_and",
+      "canonical": "bit_and",
+      "page": "aggregate_functions"
+    },
+    {
+      "name": "bit_or",
+      "canonical": "bit_or",
+      "page": "aggregate_functions"
+    },
+    {
+      "name": "bit_xor",
+      "canonical": "bit_xor",
+      "page": "aggregate_functions"
+    },
+    {
+      "name": "bool_and",
+      "canonical": "bool_and",
+      "page": "aggregate_functions"
+    },
+    {
+      "name": "bool_or",
+      "canonical": "bool_or",
+      "page": "aggregate_functions"
+    },
+    {
+      "name": "count",
+      "canonical": "count",
+      "page": "aggregate_functions"
+    },
+    {
+      "name": "first_value",
+      "canonical": "first_value",
+      "page": "aggregate_functions"
+    },
+    {
+      "name": "grouping",
+      "canonical": "grouping",
+      "page": "aggregate_functions"
+    },
+    {
+      "name": "last_value",
+      "canonical": "last_value",
+      "page": "aggregate_functions"
+    },
+    {
+      "name": "max",
+      "canonical": "max",
+      "page": "aggregate_functions"
+    },
+    {
+      "name": "median",
+      "canonical": "median",
+      "page": "aggregate_functions"
+    },
+    {
+      "name": "min",
+      "canonical": "min",
+      "page": "aggregate_functions"
+    },
+    {
+      "name": "percentile_cont",
+      "canonical": "percentile_cont",
+      "page": "aggregate_functions"
+    },
+    {
+      "name": "quantile_cont",
+      "canonical": "percentile_cont",
+      "page": "aggregate_functions"
+    },
+    {
+      "name": "string_agg",
+      "canonical": "string_agg",
+      "page": "aggregate_functions"
+    },
+    {
+      "name": "sum",
+      "canonical": "sum",
+      "page": "aggregate_functions"
+    },
+    {
+      "name": "var",
+      "canonical": "var",
+      "page": "aggregate_functions"
+    },
+    {
+      "name": "var_sample",
+      "canonical": "var_sample",
+      "page": "aggregate_functions"
+    },
+    {
+      "name": "var_samp",
+      "canonical": "var_samp",
+      "page": "aggregate_functions"
+    },
+    {
+      "name": "var_pop",
+      "canonical": "var_pop",
+      "page": "aggregate_functions"
+    },
+    {
+      "name": "var_population",
+      "canonical": "var_population",
+      "page": "aggregate_functions"
+    },
+    {
+      "name": "corr",
+      "canonical": "corr",
+      "page": "aggregate_functions"
+    },
+    {
+      "name": "covar",
+      "canonical": "covar_samp",
+      "page": "aggregate_functions"
+    },
+    {
+      "name": "covar_pop",
+      "canonical": "covar_pop",
+      "page": "aggregate_functions"
+    },
+    {
+      "name": "covar_samp",
+      "canonical": "covar_samp",
+      "page": "aggregate_functions"
+    },
+    {
+      "name": "nth_value",
+      "canonical": "nth_value",
+      "page": "aggregate_functions"
+    },
+    {
+      "name": "regr_avgx",
+      "canonical": "regr_avgx",
+      "page": "aggregate_functions"
+    },
+    {
+      "name": "regr_avgy",
+      "canonical": "regr_avgy",
+      "page": "aggregate_functions"
+    },
+    {
+      "name": "regr_count",
+      "canonical": "regr_count",
+      "page": "aggregate_functions"
+    },
+    {
+      "name": "regr_intercept",
+      "canonical": "regr_intercept",
+      "page": "aggregate_functions"
+    },
+    {
+      "name": "regr_r2",
+      "canonical": "regr_r2",
+      "page": "aggregate_functions"
+    },
+    {
+      "name": "regr_slope",
+      "canonical": "regr_slope",
+      "page": "aggregate_functions"
+    },
+    {
+      "name": "regr_sxx",
+      "canonical": "regr_sxx",
+      "page": "aggregate_functions"
+    },
+    {
+      "name": "regr_sxy",
+      "canonical": "regr_sxy",
+      "page": "aggregate_functions"
+    },
+    {
+      "name": "regr_syy",
+      "canonical": "regr_syy",
+      "page": "aggregate_functions"
+    },
+    {
+      "name": "stddev",
+      "canonical": "stddev",
+      "page": "aggregate_functions"
+    },
+    {
+      "name": "stddev_samp",
+      "canonical": "stddev_samp",
+      "page": "aggregate_functions"
+    },
+    {
+      "name": "stddev_pop",
+      "canonical": "stddev_pop",
+      "page": "aggregate_functions"
+    },
+    {
+      "name": "approx_distinct",
+      "canonical": "approx_distinct",
+      "page": "aggregate_functions"
+    },
+    {
+      "name": "approx_median",
+      "canonical": "approx_median",
+      "page": "aggregate_functions"
+    },
+    {
+      "name": "approx_percentile_cont",
+      "canonical": "approx_percentile_cont",
+      "page": "aggregate_functions"
+    },
+    {
+      "name": "approx_percentile_cont_with_weight",
+      "canonical": "approx_percentile_cont_with_weight",
+      "page": "aggregate_functions"
+    },
+    {
+      "name": "json_contains",
+      "canonical": "json_contains",
+      "page": "json"
+    },
+    {
+      "name": "json_get",
+      "canonical": "json_get",
+      "page": "json"
+    },
+    {
+      "name": "json_get_str",
+      "canonical": "json_get_str",
+      "page": "json"
+    },
+    {
+      "name": "json_get_int",
+      "canonical": "json_get_int",
+      "page": "json"
+    },
+    {
+      "name": "json_get_float",
+      "canonical": "json_get_float",
+      "page": "json"
+    },
+    {
+      "name": "json_get_bool",
+      "canonical": "json_get_bool",
+      "page": "json"
+    },
+    {
+      "name": "json_get_json",
+      "canonical": "json_get_json",
+      "page": "json"
+    },
+    {
+      "name": "json_get_array",
+      "canonical": "json_get_array",
+      "page": "json"
+    },
+    {
+      "name": "json_as_text",
+      "canonical": "json_as_text",
+      "page": "json"
+    },
+    {
+      "name": "json_length",
+      "canonical": "json_length",
+      "page": "json"
+    },
+    {
+      "name": "json_object_keys",
+      "canonical": "json_object_keys",
+      "page": "json"
+    },
+    {
+      "name": "json_keys",
+      "canonical": "json_object_keys",
+      "page": "json"
+    },
+    {
+      "name": "flatten_json",
+      "canonical": "flatten_json",
+      "page": "json"
+    },
+    {
+      "name": "flatten_json_properties",
+      "canonical": "flatten_json_properties",
+      "page": "json"
+    },
+    {
+      "name": "json_tree",
+      "canonical": "json_tree",
+      "page": "json"
+    },
+    {
+      "name": "ai",
+      "canonical": "ai",
+      "page": "ai"
+    },
+    {
+      "name": "ai_if",
+      "canonical": "ai_if",
+      "page": "ai"
+    },
+    {
+      "name": "ai_probability",
+      "canonical": "ai_probability",
+      "page": "ai"
+    },
+    {
+      "name": "ai_classify",
+      "canonical": "ai_classify",
+      "page": "ai"
+    },
+    {
+      "name": "ai_score",
+      "canonical": "ai_score",
+      "page": "ai"
+    },
+    {
+      "name": "ai_decide",
+      "canonical": "ai_decide",
+      "page": "ai"
+    },
+    {
+      "name": "embed",
+      "canonical": "embed",
+      "page": "ai"
+    },
+    {
+      "name": "vector_search",
+      "canonical": "vector_search",
+      "page": "search"
+    },
+    {
+      "name": "text_search",
+      "canonical": "text_search",
+      "page": "search"
+    },
+    {
+      "name": "rrf",
+      "canonical": "rrf",
+      "page": "search"
+    },
+    {
+      "name": "rerank",
+      "canonical": "rerank",
+      "page": "search"
+    }
+  ],
+  "topics": [
+    "SELECT Syntax",
+    "Subqueries",
+    "EXPLAIN",
+    "Information Schema",
+    "AI Functions",
+    "Operators and Literals",
+    "Scalar Functions",
+    "Aggregate Functions",
+    "Window Functions",
+    "JSON Functions and Operators",
+    "Search",
+    "Prepared Statements",
+    "DML (Data Manipulation Language)",
+    "Data Types"
+  ],
+  "operators": [
+    "+",
+    "-",
+    "*",
+    "/",
+    "%",
+    "=",
+    "!=",
+    "<",
+    "<=",
+    ">",
+    ">=",
+    "<=>",
+    "IS DISTINCT FROM",
+    "IS NOT DISTINCT FROM",
+    "~",
+    "~*",
+    "!~",
+    "!~*",
+    "~~",
+    "~~*",
+    "!~~",
+    "!~~*",
+    "AND",
+    "OR",
+    "&",
+    "|",
+    "#",
+    ">>",
+    "<<",
+    "CAST(expr AS type)",
+    "::",
+    "||",
+    "@>",
+    "<@"
+  ],
+  "document_sha256": {
+    "aggregate_functions.md": "941695224a28915c85768c3bd17e1bf748c9ce517bdd884393394957d7b6ee0c",
+    "ai.md": "926902f49f4e55ee4db909bc5e4d5c9984b81a6a4d5053778f2950a2d04fb10a",
+    "dml.md": "eb982949db14d931048fb28740021baf72c34ba8e7cc644589b7c104b0fbf758",
+    "explain.md": "6d2316b5a0046d2db8cac43a65b70bbcf06d990dd5260253a04cca7fc155df79",
+    "index.md": "68a1e8175ad76bb25235d3d4fe786118bdb669b9caa9c7060fe597adaf45641c",
+    "information_schema.md": "c1a6e63c5abfcd675694f3b657c93d143feff681d8fb974c0969dc99a57a04c9",
+    "json.md": "63f52a3c0bc0a0cd7fa035ea5531e440bd371548c4401844b87fa2b316746cda",
+    "operators.md": "0d2ad753b9667da7bffe134949f3071ce0174034e2abc8dd673b29e1ee36029d",
+    "prepared_statements.md": "16c0989d29c3e6da095ca2c002abdad1e8e16abfd79a548ef0ba4efd6ca6cab7",
+    "scalar_functions.md": "6983c3397e2871d8c1dd1e9c630304c3baab9b38b20284782dd078cac8e00065",
+    "search.md": "c6a7276eb61d6fc964d606af2973997cdf32acf7526fa87373281a51f11020e1",
+    "select.md": "f319152433c5884d923e32b74570506daadf98dd54d63497db4bbf178da59548",
+    "subqueries.md": "98ae499e9728dc2dbe9b584007b0c01e5454a5ca4b6253defa4b2b7a8b4223cb"
+  },
+  "syntax": {
+    "select_features": [
+      "Window Functions (OVER Clause)",
+      "WITH clause",
+      "SELECT clause",
+      "FROM clause",
+      "WHERE clause",
+      "JOIN clause",
+      "INNER JOIN",
+      "LEFT OUTER JOIN",
+      "RIGHT OUTER JOIN",
+      "FULL OUTER JOIN",
+      "NATURAL JOIN",
+      "CROSS JOIN",
+      "GROUP BY clause",
+      "GROUP BY ALL",
+      "HAVING clause",
+      "QUALIFY clause",
+      "UNION clause",
+      "ORDER BY clause",
+      "ORDER BY ALL",
+      "LIMIT clause",
+      "EXCLUDE, EXCEPT, REPLACE, and ILIKE clauses"
+    ],
+    "explain_options": [
+      "ANALYZE",
+      "VERBOSE",
+      "FORMAT",
+      "METRICS",
+      "LEVEL",
+      "TIMING",
+      "SUMMARY",
+      "COSTS"
+    ]
+  }
+}

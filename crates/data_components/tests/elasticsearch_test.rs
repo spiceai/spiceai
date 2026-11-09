@@ -19,7 +19,7 @@ limitations under the License.
 //! Requires a running Elasticsearch instance (see `ELASTICSEARCH_URL` env var, default `http://localhost:9200`).
 //!
 //! ```sh
-//! cargo test -p data_components --features elasticsearch --test elasticsearch_test
+//! cargo test -p data_components --features elasticsearch --test integration -- elasticsearch_test::
 //! ```
 
 #![cfg(feature = "elasticsearch")]

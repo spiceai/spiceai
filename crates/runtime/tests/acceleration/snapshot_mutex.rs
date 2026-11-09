@@ -26,8 +26,8 @@ use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
 use async_trait::async_trait;
 use data_components::arrow::write::MemTable;
+use datafusion::common::TableReference;
 use datafusion::datasource::TableProvider;
-use datafusion::sql::TableReference;
 use runtime::Runtime;
 use runtime::accelerated::refresh::{AccelerationRefreshMode, Refresh, Refresher};
 use runtime::accelerated::{SnapshotCreateTrigger, SnapshotCreationConfig};
@@ -64,6 +64,13 @@ impl DatasetCheckpointer for MockCheckpointer {
         Ok(None)
     }
 
+    async fn set_schema(
+        &self,
+        _schema: &arrow::datatypes::SchemaRef,
+    ) -> runtime_acceleration::dataset_checkpoint::Result<()> {
+        Ok(())
+    }
+
     async fn last_checkpoint_time(
         &self,
     ) -> runtime_acceleration::dataset_checkpoint::Result<Option<SystemTime>> {
@@ -87,6 +94,36 @@ fn unique_temp_dir(prefix: &str) -> PathBuf {
         .unwrap_or_default()
         .as_nanos();
     std::env::temp_dir().join(format!("{prefix}_{nanos}"))
+}
+
+/// Whether a snapshot has been published under `root` and nothing is still writing:
+/// `metadata.json` exists, no multipart upload is staged (a `#` file beside its
+/// destination), and the local copy staged for the upload has been removed.
+async fn snapshot_published(root: &Path, staged_copy: &Path) -> anyhow::Result<bool> {
+    if tokio::fs::try_exists(staged_copy).await? {
+        return Ok(false);
+    }
+    let mut pending = vec![root.to_path_buf()];
+    let mut metadata = false;
+    while let Some(dir) = pending.pop() {
+        let Ok(mut entries) = tokio::fs::read_dir(&dir).await else {
+            continue;
+        };
+        while let Some(entry) = entries.next_entry().await? {
+            let path = entry.path();
+            if entry.file_type().await?.is_dir() {
+                pending.push(path);
+                continue;
+            }
+            let name = entry.file_name();
+            let name = name.to_string_lossy();
+            if name.contains('#') {
+                return Ok(false);
+            }
+            metadata |= name == "metadata.json";
+        }
+    }
+    Ok(metadata)
 }
 
 async fn count_files(root: &Path) -> anyhow::Result<usize> {
@@ -121,7 +158,26 @@ async fn test_snapshot_interval_serializes_with_accelerator_writes() -> anyhow::
     let local_snapshot_file = temp_root.join("acceleration.db");
 
     tokio::fs::create_dir_all(&snapshot_dir).await?;
-    tokio::fs::write(&local_snapshot_file, b"snapshot-data").await?;
+    let metadata_dir = temp_root.join("metadata");
+    let data_dir = local_snapshot_file.clone();
+    tokio::fs::create_dir_all(&metadata_dir).await?;
+    let catalog = Arc::new(cayenne::CayenneCatalog::new(format!(
+        "sqlite://{}",
+        metadata_dir.join("cayenne.db").display()
+    ))?) as Arc<dyn cayenne::MetadataCatalog>;
+    catalog.init().await?;
+    let ctx = datafusion::prelude::SessionContext::new();
+    let _snapshot_table = cayenne::CayenneTableProviderBuilder::new(catalog, ctx.runtime_env())
+        .create(cayenne::metadata::CreateTableOptions {
+            table_name: "snapshot_mutex_test".to_string(),
+            schema: Arc::new(Schema::new(vec![Field::new("id", DataType::Int32, false)])),
+            primary_key: vec![],
+            on_conflict: None,
+            base_path: data_dir.display().to_string(),
+            partition_column: None,
+            vortex_config: cayenne::metadata::VortexConfig::default(),
+        })
+        .await?;
 
     let snapshots = Snapshots {
         enabled: true,
@@ -172,8 +228,8 @@ async fn test_snapshot_interval_serializes_with_accelerator_writes() -> anyhow::
     let snapshot_manager = SnapshotManager::try_new(
         "snapshot_mutex_test".to_string(),
         snapshot_behavior,
-        runtime_acceleration::snapshot::AccelerationLayout::file(local_snapshot_file.clone()),
-        AccelerationEngine::DuckDB,
+        runtime_acceleration::snapshot::AccelerationLayout::cayenne(metadata_dir, data_dir),
+        AccelerationEngine::Cayenne,
     )
     .await
     .expect("Failed to create snapshot manager");
@@ -199,9 +255,13 @@ async fn test_snapshot_interval_serializes_with_accelerator_writes() -> anyhow::
     );
     drop(lock_guard);
 
-    let snapshot_wait = tokio::time::timeout(Duration::from_secs(3), async move {
+    // A file appears as soon as the upload starts, so wait for the snapshot to be
+    // published: the temp dir is removed below, and a snapshot still writing into it
+    // fails that removal.
+    let staged_copy = local_snapshot_file.with_extension("snapshot_tmp");
+    let snapshot_wait = tokio::time::timeout(Duration::from_secs(10), async move {
         loop {
-            if count_files(&snapshot_dir).await? > 0 {
+            if snapshot_published(&snapshot_dir, &staged_copy).await? {
                 return Ok::<(), anyhow::Error>(());
             }
             tokio::time::sleep(Duration::from_millis(50)).await;

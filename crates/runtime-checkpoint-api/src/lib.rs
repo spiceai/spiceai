@@ -51,7 +51,7 @@ limitations under the License.
 //! # Where each shape is implemented
 //!
 //! Every shape is implemented **per storage engine**, in the sibling
-//! `runtime-checkpoint-{duckdb,sqlite,postgres,turso}` crates — one crate per engine, so
+//! `runtime-checkpoint-{duckdb,sqlite,postgres}` crates — one crate per engine, so
 //! the stitch binary links only the engines it enables. Each of those crates bundles its
 //! stores behind `runtime_acceleration::sidecar::AcceleratorSidecar`, which the engine's
 //! accelerator returns from `DataAccelerator::sidecar`.
@@ -115,4 +115,16 @@ pub trait BlobCheckpointStore: Send + Sync {
     /// Persist `data` as the current blob checkpoint for this dataset, overwriting any
     /// previously stored value.
     async fn upsert(&self, data: &str) -> Result<(), CheckpointError>;
+
+    /// Discard this dataset's blob checkpoint, so the next [`Self::get`] returns
+    /// `Ok(None)`. Deleting a checkpoint that does not exist is not an error.
+    ///
+    /// Called when the accelerated table is rebuilt (a schema change recreates it):
+    /// a checkpoint describing the old contents would otherwise make the next refresh
+    /// resume as if the new, empty table were already populated.
+    ///
+    /// Deliberately has no default implementation: this trait reaches its callers as
+    /// `Arc<dyn BlobCheckpointStore>`, and a defaulted method that an engine silently
+    /// inherits compiles and then does nothing at runtime.
+    async fn delete(&self) -> Result<(), CheckpointError>;
 }

@@ -16,8 +16,9 @@ limitations under the License.
 
 use async_trait::async_trait;
 use datafusion::{
+    catalog::Session,
     error::Result,
-    execution::context::{QueryPlanner, SessionState},
+    execution::context::QueryPlanner,
     logical_expr::LogicalPlan,
     physical_plan::ExecutionPlan,
     physical_planner::{DefaultPhysicalPlanner, ExtensionPlanner, PhysicalPlanner},
@@ -61,7 +62,7 @@ impl QueryPlanner for ExtensionPlanQueryPlanner {
     async fn create_physical_plan(
         &self,
         logical_plan: &LogicalPlan,
-        session_state: &SessionState,
+        session_state: &dyn Session,
     ) -> Result<Arc<dyn ExecutionPlan>> {
         // Before the condition is reduced to a filter list that can no longer
         // express it. See `crate::dml_guard`.

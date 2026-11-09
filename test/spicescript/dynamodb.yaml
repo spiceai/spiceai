@@ -1,0 +1,93 @@
+name: dynamodb
+description: >
+  The DynamoDB connector against LocalStack: a table answers the corpus as
+  PostgreSQL does over the same rows, federated, accelerated into Cayenne,
+  and kept current by DynamoDB Streams; after puts, updates and deletes in
+  both, every place still agrees.
+
+sources:
+  ddb:
+    kind: docker
+    image: docker.io/localstack/localstack:4.9
+    ports: [4566]
+    env: { SERVICES: dynamodb, AWS_DEFAULT_REGION: us-east-1 }
+    ready: awslocal dynamodb list-tables
+  ref: { kind: postgres }
+
+variants:
+  federated: {}
+  cayenne: { datasets: { t: { acceleration: { enabled: true, engine: cayenne, mode: file } } } }
+  cayenne-changes: { datasets: { t: { acceleration: { enabled: true, engine: cayenne, mode: file, refresh_mode: changes } } } }
+
+spicepod:
+  version: v1
+  kind: Spicepod
+  name: dynamodb
+  datasets:
+    - from: dynamodb:t_${sources.ddb.namespace}
+      name: t
+      params:
+        dynamodb_aws_region: us-east-1
+        dynamodb_aws_auth: key
+        dynamodb_aws_access_key_id: test
+        dynamodb_aws_secret_access_key: test
+        endpoint_url: http://127.0.0.1:${sources.ddb.port.4566}
+
+defaults:
+  expect: { oracle: ref }
+  compare-variants: false
+
+steps:
+  - source-exec:
+      ddb: |
+        python3 - <<'PY'
+        import boto3
+        from decimal import Decimal
+        d = boto3.resource('dynamodb', endpoint_url='http://localhost:4566', region_name='us-east-1', aws_access_key_id='test', aws_secret_access_key='test')
+        t = d.create_table(TableName='t_${sources.ddb.namespace}', KeySchema=[{'AttributeName': 'id', 'KeyType': 'HASH'}],
+            AttributeDefinitions=[{'AttributeName': 'id', 'AttributeType': 'N'}], BillingMode='PAY_PER_REQUEST',
+            StreamSpecification={'StreamEnabled': True, 'StreamViewType': 'NEW_AND_OLD_IMAGES'})
+        t.wait_until_exists()
+        with t.batch_writer() as w:
+            for g in range(1, 301):
+                item = {'id': g, 'i': g % 17 - 8, 'f': Decimal(str(g * 0.5)), 'b': g % 2 == 0}
+                if g % 10 != 0:
+                    item['s'] = ['apple', 'banana', 'cherry'][g % 3]
+                w.put_item(Item=item)
+        PY
+  - source-exec:
+      ref: >-
+        CREATE TABLE t (id bigint PRIMARY KEY, i bigint, s text, f numeric, b boolean);
+        INSERT INTO t SELECT g, g % 17 - 8, CASE WHEN g % 10 = 0 THEN NULL ELSE (ARRAY['apple', 'banana', 'cherry'])[g % 3 + 1] END, g * 0.5, g % 2 = 0
+          FROM generate_series(1, 300) g;
+  - start: {}
+  - query: SELECT count(*) AS n FROM t
+    expect: { rows: [['300']] }
+    eventually: 60s
+  - corpus: corpus/dynamodb.sql
+
+  - source-exec:
+      ddb: |
+        python3 - <<'PY'
+        import boto3
+        from decimal import Decimal
+        t = boto3.resource('dynamodb', endpoint_url='http://localhost:4566', region_name='us-east-1', aws_access_key_id='test', aws_secret_access_key='test').Table('t_${sources.ddb.namespace}')
+        t.put_item(Item={'id': 301, 'i': 4, 's': 'durian', 'f': Decimal('0.25'), 'b': True})
+        for g in range(1, 301, 3):
+            t.update_item(Key={'id': g}, UpdateExpression='SET f = :f', ExpressionAttributeValues={':f': Decimal('99.5')})
+        t.update_item(Key={'id': 7}, UpdateExpression='REMOVE s SET i = :z', ExpressionAttributeValues={':z': 0})
+        for g in range(1, 301):
+            if g % 17 == 0:
+                t.delete_item(Key={'id': g})
+        PY
+  - source-exec:
+      ref: >-
+        INSERT INTO t VALUES (301, 4, 'durian', 0.25, true);
+        UPDATE t SET f = 99.5 WHERE id % 3 = 1 AND id <= 300;
+        UPDATE t SET s = NULL, i = 0 WHERE id = 7;
+        DELETE FROM t WHERE id % 17 = 0 AND id <= 300;
+  - refresh: t
+    only: cayenne
+  - query: SELECT count(*) AS n, sum(f) AS sf FROM t
+    eventually: 60s
+  - corpus: corpus/dynamodb.sql

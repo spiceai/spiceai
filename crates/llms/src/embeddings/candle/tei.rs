@@ -22,7 +22,7 @@ use std::{
 
 use crate::embeddings::{
     Embed, Error, FailedToCreateEmbeddingSnafu, FailedToInstantiateEmbeddingModelSnafu, Result,
-    candle::util::link_files_into_tmp_dir, encode_embedding,
+    candle::util::link_files_into_tmp_dir_blocking, encode_embedding,
 };
 use async_openai::types::embeddings::{
     CreateEmbeddingRequest, CreateEmbeddingResponse, Embedding, EmbeddingInput, EmbeddingUsage,
@@ -31,6 +31,7 @@ use async_trait::async_trait;
 use cache::{CacheProvider, result::embeddings::CachedEmbeddingResult};
 use chunking::{Chunker, ChunkingConfig, RecursiveSplittingChunker};
 use futures::future::join_all;
+use huggingface_hub::Requester;
 use snafu::ResultExt;
 use tei_backend::{Backend, DType, ModelType, Pool};
 use tei_core::{
@@ -41,7 +42,13 @@ use tei_core::{
 };
 use tokenizers::{Tokenizer, TruncationDirection};
 
-use super::util::{download_hf_artifacts, inputs_from_openai, load_tokenization, pool_from_str};
+use super::util::{
+    LoadedTokenization, PoolConfig, download_hf_artifacts, inputs_from_openai, load_tokenization,
+    pool_from_str,
+};
+use crate::hf::HubParams;
+
+const DOCS_URL: &str = "https://spiceai.org/docs/components/embeddings/huggingface";
 
 #[derive(Debug)]
 pub struct TeiEmbed {
@@ -85,42 +92,31 @@ impl TeiEmbed {
         .into_iter()
         .collect();
 
-        let model_root = link_files_into_tmp_dir(files)?;
+        let model_root = link_files_into_tmp_dir_blocking(files).await?;
         tracing::trace!(
             "Embedding model has files linked at location={:?}",
             model_root
         );
 
-        // Check if user provided pooling is valid, and only default to mean when user doesn't provide one.
-        let pool = if let Some(pooling) = pooling_overwrite {
-            match pool_from_str(&pooling) {
-                Some(pool) => pool,
-                None => {
-                    return Err(Error::FailedToCreateEmbedding {
-                        source: format!("Invalid pooling mode: {pooling}").into(),
-                    });
-                }
-            }
-        } else {
-            tracing::warn!(
-                "`params.pooling` not provided for embedding model. Often this can be found in `1_Pooling/config.json`. Defaulting to mean pooling."
-            );
-            Self::DEFAULT_POOLING_OPERATOR
-        };
+        // Only error if the user-provided value is incorrect; `from_dir` picks the default.
+        let pool = pooling_overwrite
+            .map(|pooling| {
+                pool_from_str(&pooling).ok_or_else(|| Error::FailedToCreateEmbedding {
+                    source: format!("Invalid pooling mode: {pooling}").into(),
+                })
+            })
+            .transpose()?;
 
-        Self::from_dir(
-            &model_root,
-            Some(pool),
-            max_seq_length_overwrite,
-            truncation,
-        )
-        .await
+        Self::from_dir(&model_root, pool, max_seq_length_overwrite, truncation).await
     }
 
+    /// Downloads the model `model_id` (`org/name`) at `revision` from the Hugging Face Hub
+    /// into the Hugging Face cache, for the embedding model `name`, and loads it.
     pub async fn from_hf(
+        name: &str,
         model_id: &str,
         revision: Option<&str>,
-        hf_token: Option<&str>,
+        hub: HubParams<'_>,
         pooling_overwrite: Option<&str>,
         max_seq_length_overwrite: Option<usize>,
         truncation: Option<TruncationDirection>,
@@ -138,7 +134,21 @@ impl TeiEmbed {
             })
             .transpose()?
             .flatten();
-        let model_root = download_hf_artifacts(model_id, revision, hf_token).await?;
+        let requester = Requester {
+            kind: "embedding model",
+            name: name.to_string(),
+            docs_url: DOCS_URL,
+            // Spice loads an embedding model once.
+            retried: false,
+        };
+        let model_root = async {
+            let snapshot = crate::hf::open_model(requester, model_id, revision, hub).await?;
+            download_hf_artifacts(&snapshot).await
+        }
+        .await
+        .map_err(|source| Error::FailedToDownloadModel {
+            source: Box::new(source),
+        })?;
         Self::from_dir(&model_root, pool, max_seq_length_overwrite, truncation).await
     }
 
@@ -149,12 +159,29 @@ impl TeiEmbed {
         max_seq_length_overwrite: Option<usize>,
         truncation: Option<TruncationDirection>,
     ) -> Result<Self> {
-        let (tokenizer, config, token) = load_tokenization(root, max_seq_length_overwrite)?;
+        // Reads config.json / the sentence-transformers config and parses
+        // tokenizer.json on a blocking thread (see `load_tokenization`).
+        let LoadedTokenization {
+            tokenizer,
+            config,
+            tokenization: token,
+        } = load_tokenization(root, max_seq_length_overwrite).await?;
 
         // Load [`Backend`]
-        // TODO: add pooling parameter from https://github.com/spiceai/spiceai/pull/3174
-        let model_type =
-            ModelType::Embedding(pooling_overwrite.unwrap_or(Self::DEFAULT_POOLING_OPERATOR));
+        // `params.pooling` wins, then the model's `1_Pooling/config.json` (as
+        // `text-embeddings-inference` does), then mean pooling.
+        let pool = if let Some(pool) = pooling_overwrite {
+            pool
+        } else if let Some(pool) = PoolConfig::pool_from_dir(root) {
+            tracing::debug!("Using {pool:?} pooling from `1_Pooling/config.json`.");
+            pool
+        } else {
+            tracing::warn!(
+                "`params.pooling` not provided and no `1_Pooling/config.json` found for embedding model. Defaulting to mean pooling."
+            );
+            Self::DEFAULT_POOLING_OPERATOR
+        };
+        let model_type = ModelType::Embedding(pool);
 
         // Last 3 parameters are not used (since we are using `candle` feature flag).
         let backend = Backend::new(
@@ -256,7 +283,7 @@ impl Embed for TeiEmbed {
         self.cache_model_id.as_deref()
     }
 
-    async fn embed(&self, input: EmbeddingInput) -> Result<Vec<Vec<f32>>> {
+    async fn embed(&self, input: EmbeddingInput) -> Result<Arc<Vec<Vec<f32>>>> {
         let cache_key = self.embedding_input_cache_key(&input);
 
         let cached_response = if let Some(key) = cache_key {
@@ -265,8 +292,10 @@ impl Embed for TeiEmbed {
             None
         };
 
-        if let Some(CachedEmbeddingResult::Vector(cached)) = cached_response {
-            return Ok(cached);
+        if let Some(cached) = cached_response
+            && let CachedEmbeddingResult::Vector(vectors) = cached.as_ref()
+        {
+            return Ok(std::sync::Arc::clone(vectors));
         }
 
         let inputs = inputs_from_openai(&input);
@@ -279,20 +308,27 @@ impl Embed for TeiEmbed {
 
         let results: Vec<Vec<f32>> = resp.into_iter().map(|r| r.results).collect();
 
+        let results = std::sync::Arc::new(results);
         if let Some(key) = cache_key {
-            self.put_cached_embed(key, CachedEmbeddingResult::Vector(results.clone()))
-                .await;
+            self.put_cached_embed(
+                key,
+                CachedEmbeddingResult::Vector(std::sync::Arc::clone(&results)),
+            )
+            .await;
         }
 
         Ok(results)
     }
 
     #[expect(clippy::cast_possible_truncation)]
-    async fn embed_request(&self, req: CreateEmbeddingRequest) -> Result<CreateEmbeddingResponse> {
-        if let Some(CachedEmbeddingResult::Response(cached)) =
-            self.get_cached_embed((&req).into()).await
+    async fn embed_request(
+        &self,
+        req: CreateEmbeddingRequest,
+    ) -> Result<Arc<CreateEmbeddingResponse>> {
+        if let Some(cached) = self.get_cached_embed((&req).into()).await
+            && let CachedEmbeddingResult::Response(response) = cached.as_ref()
         {
-            return Ok(cached);
+            return Ok(std::sync::Arc::clone(response));
         }
 
         let model_name = req.model.clone();
@@ -327,8 +363,12 @@ impl Embed for TeiEmbed {
             },
         };
 
-        self.put_cached_embed((&req).into(), CachedEmbeddingResult::Response(resp.clone()))
-            .await;
+        let resp = std::sync::Arc::new(resp);
+        self.put_cached_embed(
+            (&req).into(),
+            CachedEmbeddingResult::Response(std::sync::Arc::clone(&resp)),
+        )
+        .await;
 
         Ok(resp)
     }

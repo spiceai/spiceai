@@ -50,6 +50,7 @@ mod bloom;
 mod extract;
 mod index;
 mod sbbf;
+mod sbbf_layout;
 
 #[cfg(test)]
 mod tests;

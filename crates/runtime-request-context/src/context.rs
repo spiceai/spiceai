@@ -15,7 +15,7 @@ limitations under the License.
 */
 #![allow(clippy::missing_errors_doc)]
 
-use super::{CacheControl, CacheKeyType, CacheNamespace, Protocol, UserAgent, baggage};
+use super::{CacheControl, CacheKeyType, CacheNamespace, Protocol, UserAgent};
 use crate::TraceParent;
 use app::App;
 use futures::{Stream, StreamExt};
@@ -134,13 +134,11 @@ pub struct AsyncMarker {
 }
 
 impl AsyncMarker {
-    // This can only be called in async contexts due to .await
-    #[must_use]
-    #[expect(clippy::unused_async)]
-    pub async fn new() -> Self {
-        AsyncMarker {
+    /// Callers `.await` this, so it does not compile from synchronous code.
+    pub fn new() -> impl Future<Output = Self> + Send {
+        std::future::ready(AsyncMarker {
             marker: PhantomData,
-        }
+        })
     }
 }
 
@@ -577,14 +575,13 @@ impl RequestContextBuilder {
         };
         self.cache_control = CacheControl::from_headers(headers);
         self.client_supplied_cache_key = match self.cache_control {
-            CacheControl::Cache(CacheKeyType::ClientSupplied) => headers
+            CacheControl::Cache(CacheKeyType::ClientSupplied)
+            | CacheControl::Revalidate(CacheKeyType::ClientSupplied) => headers
                 .get("Spice-Cache-Key")
                 .and_then(|h| h.to_str().ok())
                 .map(str::to_string),
             _ => None,
         };
-
-        self.baggage.extend(baggage::from_headers(headers));
 
         self.authorization_header = headers
             .get(http::header::AUTHORIZATION)
@@ -701,41 +698,14 @@ impl RequestContextBuilder {
     pub fn build(self) -> RequestContext {
         let mut dimensions = self.baggage;
 
-        let add_runtime_dimensions = |dimensions: &mut Vec<KeyValue>| {
+        if let Some(client) = self.user_agent.metric_client() {
+            dimensions.push(KeyValue::new("client", client));
             dimensions.push(KeyValue::new("runtime", super::RUNTIME_NAME));
             dimensions.push(KeyValue::new("runtime_version", super::RUNTIME_VERSION));
             dimensions.push(KeyValue::new(
                 "runtime_system",
                 Arc::clone(&*super::RUNTIME_SYSTEM),
             ));
-        };
-
-        match self.user_agent {
-            UserAgent::Absent => (),
-            UserAgent::Raw(raw) => {
-                // Display appends runtime identity; keep that combined value for metric
-                // continuity (runtime is also recorded separately below).
-                dimensions.push(KeyValue::new("user_agent", UserAgent::Raw(raw).to_string()));
-                add_runtime_dimensions(&mut dimensions);
-            }
-            UserAgent::Parsed(parsed) => {
-                dimensions.push(KeyValue::new("client", Arc::clone(&parsed.client_name)));
-                dimensions.push(KeyValue::new(
-                    "client_version",
-                    Arc::clone(&parsed.client_version),
-                ));
-
-                if let Some(client_system) = &parsed.client_system {
-                    dimensions.push(KeyValue::new("client_system", Arc::clone(client_system)));
-                }
-                // Display appends runtime identity; keep that combined value for metric
-                // continuity (runtime is also recorded separately below).
-                dimensions.push(KeyValue::new(
-                    "user_agent",
-                    UserAgent::Parsed(parsed).to_string(),
-                ));
-                add_runtime_dimensions(&mut dimensions);
-            }
         }
 
         let user_cache_key = self
@@ -760,6 +730,10 @@ impl RequestContextBuilder {
                 let cache_key_type = CacheKeyType::from_app_runtime(self.app.as_ref());
                 CacheControl::OnlyIfCached(cache_key_type)
             }
+            CacheControl::Revalidate(CacheKeyType::Default) => {
+                let cache_key_type = CacheKeyType::from_app_runtime(self.app.as_ref());
+                CacheControl::Revalidate(cache_key_type)
+            }
             // If sanitized out, fall back to default
             CacheControl::Cache(CacheKeyType::ClientSupplied) if user_cache_key.is_none() => {
                 CacheControl::Cache(CacheKeyType::Default)
@@ -778,6 +752,9 @@ impl RequestContextBuilder {
                 if user_cache_key.is_none() =>
             {
                 CacheControl::OnlyIfCached(CacheKeyType::Default)
+            }
+            CacheControl::Revalidate(CacheKeyType::ClientSupplied) if user_cache_key.is_none() => {
+                CacheControl::Revalidate(CacheKeyType::Default)
             }
             cache_control => cache_control,
         };
@@ -979,6 +956,47 @@ mod tests {
             .build();
 
         assert!(ctx.client_trace_id().is_none());
+    }
+
+    /// HTTP and Flight both build their request context from the request's
+    /// headers: a client's `no-cache` revalidates under the cache key a plain
+    /// request would read, including its own `Spice-Cache-Key`.
+    #[test]
+    fn no_cache_revalidates_under_the_request_cache_key_on_http_and_flight() {
+        for protocol in [Protocol::Http, Protocol::Flight, Protocol::FlightSQL] {
+            let mut headers = HeaderMap::new();
+            headers.append("cache-control", HeaderValue::from_static("no-cache"));
+            let ctx = RequestContextBuilder::new(protocol)
+                .from_headers(&headers)
+                .build();
+            let plain = RequestContextBuilder::new(protocol)
+                .from_headers(&HeaderMap::new())
+                .build();
+            assert_eq!(
+                ctx.cache_control.cache_key_type(),
+                plain.cache_control.cache_key_type(),
+                "{protocol:?}"
+            );
+            assert!(
+                matches!(ctx.cache_control, CacheControl::Revalidate(_)),
+                "{protocol:?}"
+            );
+
+            headers.append("Spice-Cache-Key", HeaderValue::from_static("foo"));
+            let ctx = RequestContextBuilder::new(protocol)
+                .from_headers(&headers)
+                .build();
+            assert_eq!(
+                ctx.cache_control,
+                CacheControl::Revalidate(CacheKeyType::ClientSupplied),
+                "{protocol:?}"
+            );
+            assert_eq!(
+                ctx.client_supplied_cache_key,
+                Some(String::from("foo")),
+                "{protocol:?}"
+            );
+        }
     }
 
     #[test]

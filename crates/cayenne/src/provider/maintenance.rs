@@ -47,6 +47,15 @@ pub(crate) enum SnapshotMaintenanceTrigger {
         number_picker_candidate_files: usize,
         compaction_trigger_files: usize,
     },
+    /// The in-memory key deletion index has grown past the point where it must be
+    /// reclaimed, on a table whose only reclaiming pass is the current-snapshot
+    /// full rewrite. `over_memory_ceiling` distinguishes the routine size trigger
+    /// from the OOM backstop, which is worth a WARN.
+    DeletionIndexSize {
+        deletion_index_len: usize,
+        trigger_len: usize,
+        over_memory_ceiling: bool,
+    },
 }
 
 fn should_warn_protected_snapshot_age(
@@ -189,6 +198,115 @@ impl PostWriteMaintenanceState {
     }
 }
 
+/// What one retention pass did.
+///
+/// `Deferred` is not a failure and not an empty delete: the pass declined to run because
+/// materializing the inline corpus while a staged inline-conflict tombstone, a mem-tier
+/// seal shadow, or an append finalization is in flight would resurrect a superseded row
+/// or serve a live one twice. Keeping it distinct from `Deleted(0)` is what lets each
+/// caller pick its own retry — the background loop has a debounce to retry after, the
+/// synchronous drain does not.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RetentionPass {
+    Deleted(u64),
+    /// Deferred behind something that publishes within milliseconds — an unpublished
+    /// inline-conflict tombstone or a staged append mid-finalize. Worth re-arming: the
+    /// next debounce almost certainly finds the window closed.
+    DeferredTransient,
+    /// Deferred behind a mem-tier seal shadow, which is NOT transient: it stands until
+    /// the next full checkpoint — 10s by default, and indefinitely when the age trigger
+    /// is off and the size gate is unmet. Re-arming would poll at the debounce interval
+    /// for that whole span, dragging `run_maintenance_state`'s metastore vacuum and WAL
+    /// checkpoint tail along on every pass. The checkpoint that clears a shadow arms
+    /// retention itself (see `checkpoint_mem_tier_inner`), so waiting for it costs one
+    /// checkpoint of latency and no polling.
+    DeferredUntilCheckpoint,
+}
+
+/// Spacing between background retention passes after consecutive failures.
+///
+/// A retention pass that fails for a reason that does not clear on its own (a
+/// `retention_sql` whose implicit cast cannot convert a stored value, say)
+/// would otherwise be retried on every post-write debounce, about ten times a
+/// second, each logging an error. The delay doubles from
+/// [`Self::BASE_DELAY`] per consecutive failure up to [`Self::MAX_DELAY`], and
+/// resets once a pass completes.
+///
+/// Each failure arms a one-shot retry timer tagged with the backoff's
+/// `generation`. Any later failure or success moves the generation on, so a
+/// timer armed for an earlier failure finds itself obsolete when it wakes and
+/// does not queue a pass: a synchronous drain that already ran the owed retry
+/// is not followed by a stray pass from the old timer, and an old timer cannot
+/// fire a newer failure's retry ahead of that failure's own backoff.
+#[derive(Debug, Default)]
+pub(crate) struct RetentionBackoff {
+    consecutive_failures: u32,
+    retry_at: Option<tokio::time::Instant>,
+    /// Bumped on every failure and success; never reset, so a stale timer's
+    /// tag cannot come back into use.
+    generation: u64,
+}
+
+impl RetentionBackoff {
+    pub(crate) const BASE_DELAY: Duration = Duration::from_secs(1);
+    pub(crate) const MAX_DELAY: Duration = Duration::from_secs(300);
+
+    /// Delay before the retry that follows the `failures`-th consecutive failure.
+    pub(crate) fn delay_after(failures: u32) -> Duration {
+        let doublings = failures.saturating_sub(1).min(16);
+        Self::BASE_DELAY
+            .saturating_mul(1_u32 << doublings)
+            .min(Self::MAX_DELAY)
+    }
+
+    /// Record a failed pass at `now`; returns the attempt number and the delay
+    /// before the next one. The retry timer armed for this failure should be
+    /// tagged with [`Self::generation`] read under the same lock.
+    pub(crate) fn record_failure(&mut self, now: tokio::time::Instant) -> (u32, Duration) {
+        self.consecutive_failures = self.consecutive_failures.saturating_add(1);
+        let delay = Self::delay_after(self.consecutive_failures);
+        self.retry_at = Some(now + delay);
+        self.generation = self.generation.wrapping_add(1);
+        (self.consecutive_failures, delay)
+    }
+
+    /// Record a completed pass: clears the owed retry and invalidates any retry
+    /// timer still sleeping.
+    pub(crate) fn record_success(&mut self) {
+        self.consecutive_failures = 0;
+        self.retry_at = None;
+        self.generation = self.generation.wrapping_add(1);
+    }
+
+    /// Tag for the retry timer armed by the most recent failure.
+    pub(crate) fn generation(&self) -> u64 {
+        self.generation
+    }
+
+    /// Whether a retry timer tagged `generation` still owns the owed retry,
+    /// i.e. no pass has completed or failed since it was armed.
+    pub(crate) fn timer_is_current(&self, generation: u64) -> bool {
+        self.retry_at.is_some() && self.generation == generation
+    }
+
+    /// Whether a background pass at `now` should leave retention to the
+    /// scheduled retry.
+    pub(crate) fn is_waiting(&self, now: tokio::time::Instant) -> bool {
+        self.retry_at.is_some_and(|retry_at| now < retry_at)
+    }
+
+    /// Failures since the last completed pass.
+    #[cfg(test)]
+    pub(crate) fn consecutive_failures(&self) -> u32 {
+        self.consecutive_failures
+    }
+
+    /// Whether a failed pass still owes a retry.
+    pub(crate) fn retry_owed(&self) -> bool {
+        self.retry_at.is_some()
+    }
+}
+
 pub(crate) enum RetentionFailureAction {
     Requeue,
     ReturnError,
@@ -198,9 +316,14 @@ pub(crate) enum RetentionFailureAction {
 pub(crate) struct PostWriteMaintenance {
     pub(crate) state: ParkingMutex<PostWriteMaintenanceState>,
     pub(crate) scheduled: AtomicBool,
-    /// How many queued live-row deltas the persisted `num_rows` does not
-    /// include yet.
-    pub(crate) outstanding_live_rows_deltas: AtomicU64,
+    /// Backoff after failed background retention passes.
+    pub(crate) retention_backoff: ParkingMutex<RetentionBackoff>,
+    /// How many live-row deltas the persisted `num_rows` does not include yet.
+    ///
+    /// Shared with every outstanding [`OutstandingLiveRowsDelta`], which is what
+    /// lets a writer mark its delta outstanding before the commit that publishes
+    /// its rows and release it again if that commit never happens.
+    outstanding_live_rows_deltas: Arc<AtomicU64>,
 }
 
 impl PostWriteMaintenance {
@@ -222,13 +345,32 @@ impl PostWriteMaintenance {
         self.outstanding_live_rows_deltas.load(Ordering::Acquire) > 0
     }
 
-    /// Count one delta being folded into the queued state.
+    /// Mark a live-row delta outstanding *before* the commit that publishes the
+    /// rows it describes.
     ///
-    /// Call with [`Self::state`] held, so this and the `live_rows_delta` it
-    /// accounts for become visible to a drain together.
-    pub(crate) fn record_queued_live_rows_delta(&self) {
+    /// Queueing the delta is what normally marks it outstanding, and that
+    /// happens once the commit has returned. Rows are visible to scans from the
+    /// moment the commit publishes them, so between those two points every
+    /// proxy for "rows the persisted count does not describe yet" reads false
+    /// and the short count is served as a provably exact one — which the
+    /// coordinator folds straight into a `COUNT(*)` answer. Reserving first
+    /// means the count is already reported as drifting by the reader's first
+    /// opportunity to see the rows.
+    ///
+    /// Dropping the reservation releases it, which is what a publish that fails
+    /// needs: no rows became visible, so no delta is outstanding. Handing it to
+    /// the maintenance queue with [`OutstandingLiveRowsDelta::queue`] keeps it
+    /// outstanding until a persist retires it through
+    /// [`Self::retire_applied_live_rows_deltas`].
+    ///
+    /// This is the only way to mark a delta outstanding, so that a commit cannot
+    /// stake its claim after publishing the rows the claim is about.
+    pub(crate) fn reserve_live_rows_delta(&self) -> OutstandingLiveRowsDelta {
         self.outstanding_live_rows_deltas
             .fetch_add(1, Ordering::AcqRel);
+        OutstandingLiveRowsDelta {
+            outstanding: Some(Arc::clone(&self.outstanding_live_rows_deltas)),
+        }
     }
 
     /// Retire the `count` deltas a persist folded into `num_rows`.
@@ -241,23 +383,163 @@ impl PostWriteMaintenance {
     /// refuse. Being a count also makes it order-independent: two drains that
     /// finish out of order retire the same total either way.
     pub(crate) fn retire_applied_live_rows_deltas(&self, count: u64) {
-        if count == 0 {
-            return;
+        release_outstanding_live_rows_deltas(&self.outstanding_live_rows_deltas, count);
+    }
+}
+
+/// Take `count` deltas off the outstanding tally.
+///
+/// `saturating_sub` for the arithmetic alone: every release pairs with a
+/// reservation, but wrapping here would read as a permanently outstanding queue
+/// and strand the table on `Inexact` for the life of the process.
+fn release_outstanding_live_rows_deltas(outstanding: &AtomicU64, count: u64) {
+    if count == 0 {
+        return;
+    }
+    let _ = outstanding.fetch_update(Ordering::AcqRel, Ordering::Acquire, |remaining| {
+        Some(remaining.saturating_sub(count))
+    });
+}
+
+/// A live-row delta counted as outstanding before the rows it describes become
+/// visible, from [`PostWriteMaintenance::reserve_live_rows_delta`].
+///
+/// Held across the commit that publishes those rows, so the maintained row
+/// count is never reported as a provably exact live count while it is short by
+/// this delta. It is released on drop and kept by [`Self::queue`]: a commit that
+/// fails publishes nothing, and one that succeeds owes the count a delta until
+/// maintenance persists it.
+#[must_use = "dropping the reservation releases it, reopening the window between the publish and the queued delta"]
+pub(crate) struct OutstandingLiveRowsDelta {
+    /// `None` once the reservation has been handed to the maintenance queue,
+    /// which is what stops the drop from releasing a delta that is still owed.
+    outstanding: Option<Arc<AtomicU64>>,
+}
+
+impl OutstandingLiveRowsDelta {
+    /// The rows this delta describes are now visible to scans.
+    ///
+    /// From here the claim stops being released implicitly. A commit that is
+    /// cancelled or fails *after* publishing has left rows the persisted count
+    /// does not describe and will never queue a delta for them, so releasing on
+    /// drop would restore the pre-write count to `Exact` while short — the wrong
+    /// answer this whole gate exists to refuse. Holding the claim instead costs
+    /// that table the metadata `COUNT(*)` fold until a full-rewrite `Set`
+    /// re-baselines it, which is a scan rather than a wrong number.
+    ///
+    /// Call it as soon as the publish returns, since every suspension point
+    /// between the publish and this call is a cancellation that loses the claim.
+    pub(crate) fn published(mut self) -> PublishedLiveRowsDelta {
+        let outstanding = self
+            .outstanding
+            .take()
+            .unwrap_or_else(|| Arc::new(AtomicU64::new(0)));
+        PublishedLiveRowsDelta { outstanding }
+    }
+}
+
+impl Drop for OutstandingLiveRowsDelta {
+    fn drop(&mut self) {
+        if let Some(outstanding) = self.outstanding.take() {
+            release_outstanding_live_rows_deltas(&outstanding, 1);
         }
-        // `saturating_sub` for the arithmetic alone: every retirement pairs
-        // with recorded deltas, but wrapping here would read as a permanently
-        // outstanding queue and strand the table on `Inexact`.
-        let _ = self.outstanding_live_rows_deltas.fetch_update(
-            Ordering::AcqRel,
-            Ordering::Acquire,
-            |outstanding| Some(outstanding.saturating_sub(count)),
-        );
+    }
+}
+
+/// A live-row delta whose rows are visible to scans, from
+/// [`OutstandingLiveRowsDelta::published`].
+///
+/// Deliberately has **no** `Drop`: the only way to reach one implicitly is a
+/// commit cancelled or failed between its publish and its
+/// `schedule_post_write_maintenance` call, and that commit really has left the
+/// persisted count short. The two explicit outcomes are [`Self::queue`] — the
+/// delta is on its way to a persist that will retire it — and [`Self::release`],
+/// for a commit whose net row count did not move and so owes the count nothing.
+#[must_use = "a published claim must be queued or released; dropping it holds the table on Inexact"]
+pub(crate) struct PublishedLiveRowsDelta {
+    outstanding: Arc<AtomicU64>,
+}
+
+impl PublishedLiveRowsDelta {
+    /// Hand the claim to the maintenance queue that will persist the delta.
+    ///
+    /// Nothing to do: the claim is already counted, and
+    /// [`PostWriteMaintenance::retire_applied_live_rows_deltas`] is what clears
+    /// it once a persist has folded the delta into `num_rows`. Call it under the
+    /// same lock that folds the delta into the queued state, so the claim and
+    /// the `live_rows_delta_count` that retires it stay paired.
+    pub(crate) fn queue(self) {
+        drop(self);
+    }
+
+    /// Release the claim for a commit that moved no net row count.
+    ///
+    /// The persisted count already describes this commit's rows, so there is no
+    /// delta to persist and nothing would ever retire the claim.
+    pub(crate) fn release(self) {
+        release_outstanding_live_rows_deltas(&self.outstanding, 1);
     }
 }
 
 #[cfg(test)]
 mod post_write_maintenance_tests {
-    use super::PostWriteMaintenance;
+    use super::{PostWriteMaintenance, RetentionBackoff};
+    use std::time::Duration;
+
+    /// The retry spacing doubles per consecutive failure and stops at the cap,
+    /// so a pass that can never succeed logs a bounded number of lines.
+    #[test]
+    fn retention_backoff_doubles_to_the_cap_and_resets() {
+        let delays: Vec<u64> = (1..=12)
+            .map(|n| RetentionBackoff::delay_after(n).as_secs())
+            .collect();
+        assert_eq!(delays, [1, 2, 4, 8, 16, 32, 64, 128, 256, 300, 300, 300]);
+        assert_eq!(
+            RetentionBackoff::delay_after(u32::MAX),
+            RetentionBackoff::MAX_DELAY
+        );
+
+        let now = tokio::time::Instant::now();
+        let mut backoff = RetentionBackoff::default();
+        assert!(!backoff.is_waiting(now));
+        assert_eq!(backoff.record_failure(now), (1, Duration::from_secs(1)));
+        assert_eq!(backoff.record_failure(now), (2, Duration::from_secs(2)));
+        assert!(backoff.is_waiting(now));
+        assert!(!backoff.is_waiting(now + Duration::from_secs(2)));
+        assert!(backoff.retry_owed());
+        backoff.record_success();
+        assert!(!backoff.retry_owed());
+        assert_eq!(backoff.record_failure(now), (1, Duration::from_secs(1)));
+    }
+
+    /// A retry timer armed for one failure is invalidated by any later success
+    /// or failure, so it neither queues a pass after a drain already ran the
+    /// owed retry nor fires a newer failure's retry early.
+    #[test]
+    fn retention_retry_timer_is_invalidated_by_later_outcomes() {
+        let now = tokio::time::Instant::now();
+        let mut backoff = RetentionBackoff::default();
+
+        backoff.record_failure(now);
+        let first = backoff.generation();
+        assert!(backoff.timer_is_current(first));
+
+        // A synchronous drain ran the owed retry and it completed.
+        backoff.record_success();
+        assert!(!backoff.timer_is_current(first));
+
+        // A newer failure arms its own timer; the old one stays obsolete.
+        backoff.record_failure(now);
+        let second = backoff.generation();
+        assert_ne!(first, second);
+        assert!(!backoff.timer_is_current(first));
+        assert!(backoff.timer_is_current(second));
+
+        // Consecutive failures without a success also retire the earlier timer.
+        backoff.record_failure(now);
+        assert!(!backoff.timer_is_current(second));
+        assert!(backoff.timer_is_current(backoff.generation()));
+    }
 
     /// A table that has never queued a delta has nothing outstanding, so its
     /// maintained count starts eligible to be served `Exact`.
@@ -273,7 +555,7 @@ mod post_write_maintenance_tests {
     fn a_queued_delta_stays_outstanding_until_it_is_applied() {
         let maintenance = PostWriteMaintenance::default();
 
-        maintenance.record_queued_live_rows_delta();
+        maintenance.reserve_live_rows_delta().published().queue();
         assert!(maintenance.has_unapplied_live_rows_delta());
 
         maintenance.retire_applied_live_rows_deltas(1);
@@ -286,8 +568,8 @@ mod post_write_maintenance_tests {
     fn one_drain_retires_every_delta_it_coalesced() {
         let maintenance = PostWriteMaintenance::default();
 
-        maintenance.record_queued_live_rows_delta();
-        maintenance.record_queued_live_rows_delta();
+        maintenance.reserve_live_rows_delta().published().queue();
+        maintenance.reserve_live_rows_delta().published().queue();
         assert!(maintenance.has_unapplied_live_rows_delta());
 
         maintenance.retire_applied_live_rows_deltas(2);
@@ -302,9 +584,9 @@ mod post_write_maintenance_tests {
     fn a_later_success_does_not_cover_an_abandoned_delta() {
         let maintenance = PostWriteMaintenance::default();
 
-        maintenance.record_queued_live_rows_delta();
+        maintenance.reserve_live_rows_delta().published().queue();
         // Its drain's persist failed, so nothing is retired for it.
-        maintenance.record_queued_live_rows_delta();
+        maintenance.reserve_live_rows_delta().published().queue();
         maintenance.retire_applied_live_rows_deltas(1);
 
         assert!(maintenance.has_unapplied_live_rows_delta());
@@ -317,8 +599,8 @@ mod post_write_maintenance_tests {
     fn out_of_order_drains_retire_the_same_total() {
         let maintenance = PostWriteMaintenance::default();
 
-        maintenance.record_queued_live_rows_delta();
-        maintenance.record_queued_live_rows_delta();
+        maintenance.reserve_live_rows_delta().published().queue();
+        maintenance.reserve_live_rows_delta().published().queue();
 
         maintenance.retire_applied_live_rows_deltas(1);
         assert!(maintenance.has_unapplied_live_rows_delta());
@@ -333,11 +615,93 @@ mod post_write_maintenance_tests {
     fn a_write_after_a_drain_re_arms_the_signal() {
         let maintenance = PostWriteMaintenance::default();
 
-        maintenance.record_queued_live_rows_delta();
+        maintenance.reserve_live_rows_delta().published().queue();
         maintenance.retire_applied_live_rows_deltas(1);
 
-        maintenance.record_queued_live_rows_delta();
+        maintenance.reserve_live_rows_delta().published().queue();
         assert!(maintenance.has_unapplied_live_rows_delta());
+    }
+
+    /// A reservation counts from the moment it is taken, which is what lets a
+    /// writer claim its delta before publishing the rows the delta describes.
+    #[test]
+    fn a_reservation_is_outstanding_before_it_is_queued() {
+        let maintenance = PostWriteMaintenance::default();
+
+        let reserved = maintenance.reserve_live_rows_delta();
+        assert!(
+            maintenance.has_unapplied_live_rows_delta(),
+            "a reservation that only counts once queued cannot cover the publish that precedes \
+             the queueing",
+        );
+
+        reserved.published().queue();
+        assert!(
+            maintenance.has_unapplied_live_rows_delta(),
+            "queueing hands the reservation on; only a persist retires it",
+        );
+
+        maintenance.retire_applied_live_rows_deltas(1);
+        assert!(!maintenance.has_unapplied_live_rows_delta());
+    }
+
+    /// A commit that never publishes owes the count nothing, so dropping its
+    /// reservation has to release it — otherwise a failed write strands the
+    /// table on `Inexact` with no delta to drain and nothing to retire it.
+    #[test]
+    fn a_dropped_reservation_is_released() {
+        let maintenance = PostWriteMaintenance::default();
+
+        drop(maintenance.reserve_live_rows_delta());
+
+        assert!(!maintenance.has_unapplied_live_rows_delta());
+    }
+
+    /// Reservations are independent: releasing one must not clear another
+    /// commit's claim.
+    #[test]
+    fn dropping_one_reservation_leaves_the_others_outstanding() {
+        let maintenance = PostWriteMaintenance::default();
+
+        let kept = maintenance.reserve_live_rows_delta();
+        drop(maintenance.reserve_live_rows_delta());
+
+        assert!(maintenance.has_unapplied_live_rows_delta());
+
+        kept.published().queue();
+        maintenance.retire_applied_live_rows_deltas(1);
+        assert!(!maintenance.has_unapplied_live_rows_delta());
+    }
+
+    /// A commit cancelled or failed *after* its publish has left rows the
+    /// persisted count does not describe and will never queue a delta for them,
+    /// so its claim must survive being dropped. Releasing it would restore the
+    /// pre-write count to `Exact` while short, which is the wrong `COUNT(*)`
+    /// this gate exists to refuse.
+    #[test]
+    fn a_published_claim_survives_a_commit_that_never_queues_it() {
+        let maintenance = PostWriteMaintenance::default();
+
+        drop(maintenance.reserve_live_rows_delta().published());
+
+        assert!(
+            maintenance.has_unapplied_live_rows_delta(),
+            "a claim dropped after the rows were published must stay outstanding: the count is \
+             short by a delta nothing will ever queue",
+        );
+    }
+
+    /// The counterpart: a commit whose net row count did not move owes the
+    /// count nothing, and nothing would ever retire a claim it left behind — so
+    /// that one is released explicitly rather than stranding the table on
+    /// `Inexact` for a delta that does not exist.
+    #[test]
+    fn a_published_claim_for_an_unmoved_count_is_released() {
+        let maintenance = PostWriteMaintenance::default();
+
+        maintenance.reserve_live_rows_delta().published().release();
+
+        assert!(!maintenance.has_unapplied_live_rows_delta());
     }
 
     /// Retiring more than is outstanding must not wrap: a wrapped counter
@@ -347,7 +711,7 @@ mod post_write_maintenance_tests {
     fn retiring_more_than_is_outstanding_does_not_wrap() {
         let maintenance = PostWriteMaintenance::default();
 
-        maintenance.record_queued_live_rows_delta();
+        maintenance.reserve_live_rows_delta().published().queue();
         maintenance.retire_applied_live_rows_deltas(5);
 
         assert!(!maintenance.has_unapplied_live_rows_delta());

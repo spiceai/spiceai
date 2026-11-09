@@ -243,6 +243,7 @@ fn input_items_from_assistant_message(
         items.push(InputItem::Item(Item::FunctionCall(FunctionToolCall {
             call_id: function_call.name.clone(),
             name: function_call.name,
+            namespace: None,
             arguments: function_call.arguments,
             id: None,
             status: Some(OutputStatus::Completed),
@@ -260,6 +261,7 @@ fn input_item_from_chat_tool_call(
             Ok(InputItem::Item(Item::FunctionCall(FunctionToolCall {
                 call_id: function_call.id,
                 name: function_call.function.name,
+                namespace: None,
                 arguments: function_call.function.arguments,
                 id: None,
                 status: Some(OutputStatus::Completed),
@@ -318,6 +320,7 @@ fn easy_message(role: ResponsesRole, content: EasyInputContent) -> InputItem {
         r#type: MessageType::Message,
         role,
         content,
+        phase: None,
     })
 }
 
@@ -453,11 +456,13 @@ fn response_tool_from_chat_tool(tool: ChatCompletionTools) -> Result<ResponsesTo
             parameters: function_tool.function.parameters,
             strict: function_tool.function.strict,
             description: function_tool.function.description,
+            defer_loading: None,
         })),
         ChatCompletionTools::Custom(custom_tool) => Ok(ResponsesTool::Custom(CustomToolParam {
             name: custom_tool.custom.name,
             description: custom_tool.custom.description,
             format: convert_json(custom_tool.custom.format, "custom tool format")?,
+            defer_loading: None,
         })),
     }
 }
@@ -483,39 +488,29 @@ fn response_tool_choice_from_chat_tool_choice(
                 name: custom.custom.name,
             },
         )),
-        ChatCompletionToolChoiceOption::AllowedTools(allowed_tools) => {
-            let tools = allowed_tools
-                .allowed_tools
+        ChatCompletionToolChoiceOption::AllowedTools(choice) => {
+            let allowed = choice.allowed_tools;
+            let tools = allowed
+                .tools
                 .into_iter()
-                .flat_map(|allowed| {
-                    allowed
-                        .tools
-                        .into_iter()
-                        .map(move |tool| (allowed.mode.clone(), tool))
-                })
-                .map(|(mode, tool)| {
+                .map(|tool| {
                     let chat_tool = serde_json::from_value::<ChatCompletionTools>(tool)
                         .map_err(|e| invalid_conversion("allowed tool", e))?;
                     let response_tool = response_tool_from_chat_tool(chat_tool)?;
-                    let tool_value = serde_json::to_value(response_tool)
-                        .map_err(|e| invalid_conversion("allowed tool", e))?;
-                    Ok((mode, tool_value))
+                    serde_json::to_value(response_tool)
+                        .map_err(|e| invalid_conversion("allowed tool", e))
                 })
                 .collect::<Result<Vec<_>, OpenAIError>>()?;
 
-            let mode = tools
-                .first()
-                .map_or(ChatToolChoiceAllowedMode::Auto, |(mode, _)| mode.clone());
-
             Ok(ResponsesToolChoiceParam::AllowedTools(
                 ResponsesToolChoiceAllowed {
-                    mode: match mode {
+                    mode: match allowed.mode {
                         ChatToolChoiceAllowedMode::Auto => ResponsesToolChoiceAllowedMode::Auto,
                         ChatToolChoiceAllowedMode::Required => {
                             ResponsesToolChoiceAllowedMode::Required
                         }
                     },
-                    tools: tools.into_iter().map(|(_, tool)| tool).collect(),
+                    tools,
                 },
             ))
         }
@@ -1228,5 +1223,45 @@ mod tests {
             "output": [],
             "status": status
         })
+    }
+
+    /// A Responses-API message has to deserialize with no `type` field.
+    ///
+    /// `EasyInputMessage::type` is `#[serde(default)]` only because the
+    /// `spiceai/async-openai` fork makes it so. Upstream requires the field, and
+    /// the Responses API does not send it on every message — so without the patch
+    /// a reply that omits it fails to deserialize and the request errors, on a
+    /// path this adapter builds and reads (`InputItem::EasyMessage`).
+    ///
+    /// The control has to establish that the field is still *read*, and a present
+    /// `"type":"message"` cannot: `MessageType` has one variant, which is also its
+    /// default, so consuming the field and ignoring it produce the same value. A
+    /// value no variant names separates them — it deserializes only if nothing is
+    /// looking at the field, which is the regression `#[serde(default)]` must not
+    /// become (`#[serde(skip)]`, or the field dropped).
+    #[test]
+    fn a_responses_message_deserializes_with_or_without_its_type_field() {
+        let omitted: EasyInputMessage =
+            serde_json::from_str(r#"{"role":"user","content":"hello"}"#)
+                .expect("a responses message may omit `type`");
+        assert_eq!(
+            omitted.r#type,
+            MessageType::Message,
+            "an omitted `type` has to default to a message"
+        );
+
+        let present: EasyInputMessage =
+            serde_json::from_str(r#"{"role":"user","content":"hello","type":"message"}"#)
+                .expect("a responses message may carry `type`");
+        assert_eq!(present.r#type, MessageType::Message);
+
+        serde_json::from_str::<EasyInputMessage>(
+            r#"{"role":"user","content":"hello","type":"not_a_message_type"}"#,
+        )
+        .expect_err(
+            "a `type` no variant names has to be refused: if it deserializes, the field is \
+             being ignored rather than defaulted, and the two assertions above cannot tell \
+             those apart",
+        );
     }
 }

@@ -1,0 +1,12 @@
+---
+source: crates/runtime-decide/tests/decisions.rs
+expression: rows
+---
++----+--------+-----+-----------+-------+
+| id | refund | p   | team      | upset |
++----+--------+-----+-----------+-------+
+| 0  | true   | 0.9 | billing   | 2.0   |
+| 25 | false  | 0.1 | technical | 0.0   |
+| 50 | true   | 0.9 | billing   | 2.0   |
+| 75 | false  | 0.1 | account   | 0.0   |
++----+--------+-----+-----------+-------+

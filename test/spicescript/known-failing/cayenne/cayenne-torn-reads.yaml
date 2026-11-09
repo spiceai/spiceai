@@ -1,0 +1,102 @@
+# Known failing (#15540): readers see part of a source
+# transaction. A self-join of a CDC acceleration reads the table at two
+# points; in memory mode and on partitioned layouts a single scan can show a
+# moved row twice or half a transfer, and a partitioned full refresh exposes a
+# partial swap.
+name: cayenne-torn-reads
+description: >
+  A reader never sees part of a source transaction. While PostgreSQL commits
+  transfers between rows (one row down, another up) and moves rows to new
+  keys (insert the copy, delete the original) in single transactions, every
+  read of the row count and the total through Spice holds the invariant, on a
+  Cayenne CDC acceleration and on a full refresh every second, in file and
+  memory mode and partitioned; afterwards both agree with the source.
+
+sources:
+  src: { kind: postgres }
+
+variants:
+  file: {}
+  memory: { datasets: { '*': { acceleration: { mode: memory } } } }
+  partitioned: { datasets: { '*': { acceleration: { partition_by: [{ bucket: 'bucket(4, id)' }] } } } }
+
+spicepod:
+  version: v1
+  kind: Spicepod
+  name: cayenne-torn-reads
+  datasets:
+    - from: postgres:public.accounts
+      name: by_changes
+      params: ${sources.src.params}
+      acceleration: { enabled: true, engine: cayenne, mode: file, refresh_mode: changes, primary_key: id }
+    - from: postgres:public.accounts
+      name: by_refresh
+      params: ${sources.src.params}
+      acceleration: { enabled: true, engine: cayenne, mode: file, refresh_mode: full, refresh_check_interval: 1s }
+
+defaults:
+  compare-variants: false
+
+steps:
+  - source-exec:
+      src: |
+        CREATE TABLE accounts (id bigint PRIMARY KEY, balance bigint NOT NULL);
+        INSERT INTO accounts SELECT g, 100 FROM generate_series(1, 1000) g;
+  - start: {}
+  - query: SELECT count(*) AS n, sum(balance) AS total FROM by_changes
+    expect: { rows: [['1000', '100000']] }
+    eventually: 60s
+
+  # Transfers, and moves of the lowest key to a new one, each one transaction.
+  - background:
+      id: transfers
+      concurrency: 2
+      source-exec:
+        src: >
+          BEGIN;
+          UPDATE accounts SET balance = balance - 7 WHERE id = (SELECT id FROM accounts ORDER BY id OFFSET (${round} * 37) % 900 LIMIT 1);
+          UPDATE accounts SET balance = balance + 7 WHERE id = (SELECT id FROM accounts ORDER BY id OFFSET (${round} * 91) % 900 LIMIT 1);
+          COMMIT;
+  - background:
+      id: moves
+      every: 50ms
+      source-exec:
+        src: >
+          BEGIN;
+          INSERT INTO accounts SELECT id + 1000000, balance FROM accounts WHERE id = (SELECT min(id) FROM accounts);
+          DELETE FROM accounts WHERE id = (SELECT min(id) FROM accounts);
+          COMMIT;
+  - background:
+      id: read-changes
+      concurrency: 4
+      query: SELECT count(*) AS n, sum(balance) AS total FROM by_changes
+      expect: { n: '1000', total: '100000' }
+  - background:
+      id: read-refresh
+      concurrency: 4
+      query: SELECT count(*) AS n, sum(balance) AS total FROM by_refresh
+      expect: { n: '1000', total: '100000' }
+  # A self-join reads the table twice; both reads must be the same version.
+  - background:
+      id: read-join
+      concurrency: 2
+      query: SELECT count(*) AS n FROM by_changes a JOIN by_changes b ON a.id = b.id
+      expect: { n: '1000' }
+  - query: SELECT count(*) AS n FROM by_changes
+    expect: { rows: [['1000']] }
+    consistently: 30s
+  - stop-background: moves
+  - stop-background: transfers
+  - stop-background: read-changes
+  - stop-background: read-refresh
+  - stop-background: read-join
+
+  # Then both hold exactly what the source holds.
+  - query: SELECT id, balance FROM by_changes
+    oracle-sql: SELECT id, balance FROM accounts
+    expect: { oracle: src }
+    eventually: 60s
+  - query: SELECT id, balance FROM by_refresh
+    oracle-sql: SELECT id, balance FROM accounts
+    expect: { oracle: src }
+    eventually: 60s

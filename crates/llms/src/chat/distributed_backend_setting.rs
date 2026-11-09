@@ -44,10 +44,7 @@ impl FromStr for DistributedBackendSetting {
         match s.trim().to_ascii_lowercase().as_str() {
             "" | "none" => Ok(Self::None),
             "ring" => Ok(Self::Ring),
-            other => Err(format!(
-                "must be one of: {}. Found {other}",
-                Self::VALUES.join(", ")
-            )),
+            _ => Err(format!("must be one of: {}", Self::VALUES.join(", "))),
         }
     }
 }
@@ -78,8 +75,9 @@ mod tests {
     #[test]
     fn rejects_values_outside_the_spec() {
         for raw in ["nccl", "true", "false", "1", "0"] {
-            assert!(
-                raw.parse::<DistributedBackendSetting>().is_err(),
+            assert_eq!(
+                raw.parse::<DistributedBackendSetting>(),
+                Err("must be one of: none, ring".to_string()),
                 "{raw:?} should be rejected"
             );
         }

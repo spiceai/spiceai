@@ -303,6 +303,23 @@ const MAX_POLL_INTERVAL: Duration = Duration::from_secs(5);
 /// Maximum time to wait for a distributed query to complete (1 hour)
 const POLL_TIMEOUT: Duration = Duration::from_hours(1);
 
+/// The query's duration as the server recorded it, from `created_at` to
+/// `completed_at`. The client only notices completion at its next status poll,
+/// which can be seconds after the query finished.
+fn server_duration(query_json: &serde_json::Value) -> Result<Duration> {
+    let timestamp = |field: &str| {
+        let value = query_json
+            .get(field)
+            .and_then(serde_json::Value::as_str)
+            .ok_or_else(|| anyhow::anyhow!("Query response missing '{field}'"))?;
+        chrono::DateTime::parse_from_rfc3339(value)
+            .map_err(|e| anyhow::anyhow!("Query response '{field}' is not RFC 3339: {e}"))
+    };
+    (timestamp("completed_at")? - timestamp("created_at")?)
+        .to_std()
+        .map_err(|e| anyhow::anyhow!("Query completed before it was created: {e}"))
+}
+
 /// Distributed query executor - executes queries via async /v1/queries endpoint
 pub struct DistributedExecutor {
     client: reqwest::Client,
@@ -330,7 +347,6 @@ impl QueryExecutor for DistributedExecutor {
     // The async `/v1/queries` endpoint reports a `row_count` in its status, not
     // the rows, so `collect_batches` is irrelevant here — `batches` is `None`.
     async fn execute(&self, query: &Query, _collect_batches: bool) -> Result<ExecutionResult> {
-        let start = std::time::Instant::now();
         let sql_text = query.to_sql_with_inlined_params();
         let queries_url = format!("{}/v1/queries", self.base_url);
 
@@ -444,7 +460,7 @@ impl QueryExecutor for DistributedExecutor {
         let row_count = total_row_count_u64 as usize;
 
         Ok(ExecutionResult {
-            duration: start.elapsed(),
+            duration: server_duration(&query_json)?,
             row_count,
             batches: None, // Distributed mode doesn't return batches
         })
@@ -460,5 +476,29 @@ impl QueryExecutor for DistributedExecutor {
 
     fn clone_box(&self) -> Box<dyn QueryExecutor> {
         Box::new(self.clone())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn server_duration_spans_created_to_completed() {
+        let response = serde_json::json!({
+            "created_at": "2026-10-23T07:41:20.100+00:00",
+            "started_at": "2026-10-23T07:41:20.150+00:00",
+            "completed_at": "2026-10-23T07:41:23.300+00:00",
+        });
+        assert_eq!(
+            server_duration(&response).expect("duration"),
+            Duration::from_millis(3200)
+        );
+    }
+
+    #[test]
+    fn server_duration_requires_completed_at() {
+        let response = serde_json::json!({ "created_at": "2026-10-23T07:41:20.100+00:00" });
+        server_duration(&response).expect_err("completed_at is required");
     }
 }

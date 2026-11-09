@@ -26,7 +26,7 @@ limitations under the License.
 //!
 //! Regression test for <https://github.com/spiceai/spiceai/issues/13018>.
 
-mod common;
+use crate::common;
 
 use std::path::Path;
 use std::sync::Arc;

@@ -14,19 +14,19 @@
 
 //! **Out-of-Spice** reference SQL engines for result-correctness.
 //!
-//! These engines are **not** Spice accelerators. They are the embedded engine
-//! crates (DuckDB, SQLite / `rusqlite`, chDB) used as external oracles:
+//! These engines are **not** Spice accelerators. They are independent engines
+//! (installed DuckDB via ADBC, SQLite / `rusqlite`, chDB) used as external oracles:
 //!
 //! | Engine | Crate | Spice accelerator counterpart |
 //! |--------|-------|-------------------------------|
-//! | DuckDB | `duckdb` | `accelerator_duckdb` |
+//! | DuckDB | `duckdb-oracle` | (none) |
 //! | SQLite | `rusqlite` | `accelerator_sqlite` |
 //! | chDB   | `chdb-rust` | (none — ClickHouse-compatible reference only) |
 //!
 //! Correctness matrix:
 //! 1. Standalone engines agree with each other on portable SQL (this module +
 //!    `result_correctness_standalone_engines_test`).
-//! 2. Spice accelerators (Cayenne, DuckDB accel, SQLite accel) match a
+//! 2. Spice accelerators (Cayenne, SQLite accel) match a
 //!    standalone oracle on the same data/SQL (see cayenne `result_correctness_vs_*`
 //!    and runtime `acceleration/result_correctness`).
 
@@ -38,7 +38,8 @@ use arrow::array::RecordBatch;
 
 // --- SQLite (always available via cayenne → rusqlite) ---
 
-#[expect(unused_imports)] // re-exported for integration test crates
+// Re-exported for `result_correctness_standalone_engines_test`, the only user.
+#[cfg_attr(not(feature = "result-correctness-duckdb"), expect(unused_imports))]
 pub use super::sqlite_engine::{
     load_sqlite_from_batches, load_sqlite_from_parquet, sqlite_query_batches,
 };
@@ -48,20 +49,34 @@ pub const STANDALONE_DUCKDB: &str = "standalone-duckdb";
 pub const STANDALONE_SQLITE: &str = "standalone-sqlite";
 pub const STANDALONE_CHDB: &str = "standalone-chdb";
 pub const SPICE_CAYENNE: &str = "spice-cayenne";
-pub const SPICE_DUCKDB_ACCEL: &str = "spice-duckdb-accel";
 pub const SPICE_SQLITE_ACCEL: &str = "spice-sqlite-accel";
 
 // --- DuckDB (feature `result-correctness-duckdb`) ---
+
+/// Open a DuckDB database to serve as an oracle.
+///
+/// `integer_division` makes `/` on two integers truncate, as it does in
+/// DataFusion (and so Cayenne), PostgreSQL and SQLite; DuckDB otherwise returns a
+/// double. Without it the two engines answer different questions whenever a
+/// query divides integers — TPC-DS Q21, Q34, Q73, Q78 and Q83 all do — and the
+/// disagreement says nothing about either engine's correctness.
+#[cfg(feature = "result-correctness-duckdb")]
+pub fn open_duckdb_oracle(db_path: &Path) -> duckdb_oracle::Connection {
+    let conn = duckdb_oracle::Connection::open(db_path).unwrap_or_else(|error| panic!("{error}"));
+    conn.execute_batch("SET integer_division = true;")
+        .expect("set DuckDB integer division");
+    conn
+}
 
 /// Load named parquet tables into an in-process DuckDB database (not Spice).
 #[cfg(feature = "result-correctness-duckdb")]
 pub fn load_duckdb_from_parquet(
     parquet_dir: &Path,
     tables: &[&str],
-) -> (tempfile::TempDir, duckdb::Connection) {
+) -> (tempfile::TempDir, duckdb_oracle::Connection) {
     let temp = tempfile::tempdir().expect("duckdb temp");
     let db_path = temp.path().join("parity.duckdb");
-    let conn = duckdb::Connection::open(&db_path).expect("duckdb open");
+    let conn = open_duckdb_oracle(&db_path);
     for table in tables {
         let path = parquet_dir.join(format!("{table}.parquet"));
         conn.execute_batch(&format!(
@@ -76,24 +91,17 @@ pub fn load_duckdb_from_parquet(
 /// Execute SQL on standalone DuckDB; return Arrow batches.
 #[cfg(feature = "result-correctness-duckdb")]
 pub fn duckdb_query_batches(
-    conn: &duckdb::Connection,
+    conn: &duckdb_oracle::Connection,
     sql: &str,
 ) -> Result<Vec<RecordBatch>, String> {
-    let mut stmt = conn
-        .prepare(sql)
-        .map_err(|e| format!("duckdb prepare: {e}"))?;
-    let batches: Vec<RecordBatch> = stmt
-        .query_arrow([])
-        .map_err(|e| format!("duckdb query_arrow: {e}"))?
-        .collect();
-    Ok(batches)
+    conn.query(sql).map_err(|e| e.to_string())
 }
 
 /// Load RecordBatches into standalone DuckDB via a temp parquet staging dir.
 #[cfg(feature = "result-correctness-duckdb")]
 pub fn load_duckdb_from_batches(
     tables: &[(&str, RecordBatch)],
-) -> (tempfile::TempDir, duckdb::Connection) {
+) -> (tempfile::TempDir, duckdb_oracle::Connection) {
     let stage = tempfile::tempdir().expect("duckdb stage");
     for (name, batch) in tables {
         let path = stage.path().join(format!("{name}.parquet"));

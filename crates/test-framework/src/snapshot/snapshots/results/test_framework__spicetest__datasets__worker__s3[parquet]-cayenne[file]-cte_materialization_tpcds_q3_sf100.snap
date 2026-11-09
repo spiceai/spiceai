@@ -1,0 +1,18 @@
+---
+source: crates/test-framework/src/spicetest/datasets/worker.rs
+description: "Query: tpcds_q3"
+---
++--------+----------+------------------------+-----------+
+| d_year | brand_id | brand                  | sum_agg   |
++--------+----------+------------------------+-----------+
+| 1998   | 10014010 | edu packamalgamalg #10 | -8835.10  |
+| 1998   | 4002001  | importoedu pack #1     | -40850.80 |
+| 1998   | 1004002  | edu packamalg #2       | -45244.83 |
+| 1998   | 1002001  | importoamalg #1        | -49496.54 |
+| 1998   | 4001002  | amalgedu pack #2       | -51210.68 |
+| 1998   | 7001003  | amalgbrand #3          | -53095.85 |
+| 1998   | 7011003  | amalgnameless #3       | -54572.14 |
+| 1998   | 7003004  | exportibrand #4        | -54611.98 |
+| 1998   | 9014011  | edu packunivamalg #11  | -56762.15 |
+| 1998   | 8002007  | importonameless #7     | -57581.75 |
++--------+----------+------------------------+-----------+

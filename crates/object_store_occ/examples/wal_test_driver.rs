@@ -1,0 +1,437 @@
+/*
+Copyright 2024-2026 The Spice.ai OSS Authors
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+     https://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+*/
+
+//! JSON-lines worker for the process-level WAL qualification harness.
+//! Run via `test/object_store_occ/e2e.py`; this is not a runtime API.
+//!
+//! A location is a local directory, or `s3://bucket/prefix` on an S3-compatible
+//! service configured through the standard `AWS_*` environment variables
+//! (`AWS_ENDPOINT`, `AWS_ALLOW_HTTP`, `AWS_ACCESS_KEY_ID`, ...).
+//!
+//! ```text
+//! wal_test_driver <location>                 serve the protocol on stdin/stdout
+//! wal_test_driver --probe <location>         report conditional-write enforcement
+//! wal_test_driver --export <location> <dir>  copy every object into a directory
+//! wal_test_driver --purge <location>         delete every object under an s3:// prefix
+//! ```
+#![expect(
+    clippy::expect_used,
+    reason = "qualification worker reports test preconditions"
+)]
+
+use std::collections::BTreeMap;
+use std::io::{BufRead, Write};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU8, Ordering};
+
+use async_trait::async_trait;
+use bytes::Bytes;
+use futures::{StreamExt, TryStreamExt};
+use object_store::aws::AmazonS3Builder;
+use object_store::path::Path;
+use object_store::prefix::PrefixStore;
+use object_store::{ObjectStore, ObjectStoreExt};
+use object_store_occ::store::{
+    self, ExpectedRevision, ObjectStoreState, StateChange, StateRecord, StateStore, WriteId,
+    WriteOutcome,
+};
+use object_store_occ::wal::{
+    CommitOutcome, CommitReceipt, Limits, PreparedCommit, Resolution, Snapshot, Transaction,
+    WalStateStore,
+};
+use object_store_occ::{Enforcement, LocalConditionalPut, probe_conditional_writes};
+use serde::Deserialize;
+use serde_json::{Value, json};
+
+type Result<T> = std::result::Result<T, Box<dyn std::error::Error>>;
+
+const USAGE: &str =
+    "usage: wal_test_driver [--probe | --purge] <location> | --export <location> <directory>";
+
+/// Concurrent requests while exporting a store's objects.
+const EXPORT_CONCURRENCY: usize = 16;
+
+/// Splits `s3://bucket/prefix` into its bucket and prefix; any other location
+/// is a local directory.
+fn object_store_location(location: &str) -> Option<(&str, Path)> {
+    let rest = location.strip_prefix("s3://")?;
+    let (bucket, prefix) = rest.split_once('/').unwrap_or((rest, ""));
+    Some((bucket, Path::from(prefix)))
+}
+
+fn open_store(location: &str) -> Result<Arc<dyn ObjectStore>> {
+    let Some((bucket, prefix)) = object_store_location(location) else {
+        return Ok(Arc::new(LocalConditionalPut::new(location)?));
+    };
+    // The S3 client accepts an empty bucket name, and a purge through it then
+    // lists nothing and reports success.
+    if bucket.is_empty() {
+        return Err(format!("{location} names no bucket; expected s3://bucket[/prefix]").into());
+    }
+    let store = AmazonS3Builder::from_env()
+        .with_bucket_name(bucket)
+        .build()?;
+    Ok(Arc::new(PrefixStore::new(store, prefix)))
+}
+
+fn enforcement(enforcement: &Enforcement) -> String {
+    match enforcement {
+        Enforcement::Enforced => "enforced".to_owned(),
+        Enforcement::Ignored => "ignored".to_owned(),
+        Enforcement::Unsupported => "unsupported".to_owned(),
+        Enforcement::Unknown(reason) => format!("unknown: {reason}"),
+    }
+}
+
+/// Reports whether the store refuses a duplicate create and a stale update,
+/// which every WAL guarantee depends on.
+async fn probe(location: &str) -> Result<()> {
+    let store = open_store(location)?;
+    let support = probe_conditional_writes(store.as_ref(), &Path::default()).await;
+    emit(&json!({
+        "create": enforcement(&support.create),
+        "update": enforcement(&support.update),
+    }));
+    Ok(())
+}
+
+/// Copies every object under `location` into `directory`, keeping its key as
+/// the relative path, so a history's backing store outlives the service.
+async fn export(location: &str, directory: &std::path::Path) -> Result<()> {
+    let store = open_store(location)?;
+    let keys: Vec<Path> = store
+        .list(None)
+        .map_ok(|meta| meta.location)
+        .try_collect()
+        .await?;
+    futures::stream::iter(keys.iter().map(|key| {
+        let store = Arc::clone(&store);
+        let file = directory.join(key.as_ref());
+        async move {
+            let bytes = store.get(key).await?.bytes().await?;
+            if let Some(parent) = file.parent() {
+                tokio::fs::create_dir_all(parent).await?;
+            }
+            tokio::fs::write(&file, bytes).await?;
+            Ok::<_, Box<dyn std::error::Error>>(())
+        }
+    }))
+    .buffer_unordered(EXPORT_CONCURRENCY)
+    .try_collect::<()>()
+    .await?;
+    emit(&json!({"exported": keys.len()}));
+    Ok(())
+}
+
+/// Deletes every object under an `s3://bucket/prefix` location. The WAL keeps
+/// no garbage collector, so a shared service accumulates every run's history
+/// until something removes it. A whole bucket is never purged.
+async fn purge(location: &str) -> Result<()> {
+    let Some((_, prefix)) = object_store_location(location) else {
+        return Err(format!("{location} is not an s3:// location").into());
+    };
+    if prefix.as_ref().is_empty() {
+        return Err(format!("refusing to purge every object in {location}; name a prefix").into());
+    }
+    let store = open_store(location)?;
+    // List before deleting, so a paginated listing never races its own deletes.
+    let keys: Vec<Path> = store
+        .list(None)
+        .map_ok(|meta| meta.location)
+        .try_collect()
+        .await?;
+    let deleted = store
+        .delete_stream(futures::stream::iter(keys.into_iter().map(Ok)).boxed())
+        .try_fold(0_usize, |deleted, _| async move { Ok(deleted + 1) })
+        .await?;
+    emit(&json!({"deleted": deleted}));
+    Ok(())
+}
+
+#[derive(Deserialize)]
+#[serde(tag = "op", rename_all = "snake_case", deny_unknown_fields)]
+enum Command {
+    Snapshot {
+        name: String,
+    },
+    Read {
+        snapshot: Option<String>,
+        prefix: String,
+    },
+    Get {
+        snapshot: Option<String>,
+        transaction: Option<String>,
+        key: String,
+    },
+    Begin {
+        name: String,
+        snapshot: Option<String>,
+    },
+    Change {
+        name: String,
+        changes: BTreeMap<String, Option<Bytes>>,
+    },
+    View {
+        name: String,
+        prefix: String,
+    },
+    Prepare {
+        name: String,
+    },
+    Commit {
+        name: String,
+        barrier: Option<u8>,
+    },
+    Checkpoint {
+        snapshot: Option<String>,
+        barrier: Option<u8>,
+    },
+    Resolve {
+        receipt: CommitReceipt,
+    },
+    Release {
+        name: String,
+    },
+}
+
+fn emit(value: &Value) {
+    let mut stdout = std::io::stdout().lock();
+    serde_json::to_writer(&mut stdout, value).expect("write protocol response");
+    writeln!(stdout).expect("terminate protocol response");
+    stdout.flush().expect("flush protocol response");
+}
+
+struct Barriers {
+    inner: Arc<dyn StateStore>,
+    armed: Arc<AtomicU8>,
+}
+
+impl Barriers {
+    async fn stop(&self, point: u8) {
+        if self.armed.load(Ordering::SeqCst) == point {
+            emit(&json!({"paused": point}));
+            std::future::pending::<()>().await;
+        }
+    }
+}
+
+#[async_trait]
+impl StateStore for Barriers {
+    async fn read(&self, key: &Path) -> store::Result<Option<StateRecord>> {
+        self.inner.read(key).await
+    }
+
+    async fn compare_exchange(
+        &self,
+        key: &Path,
+        expected: ExpectedRevision<'_>,
+        change: StateChange,
+        id: WriteId,
+    ) -> store::Result<WriteOutcome> {
+        if key.as_ref().ends_with("/head") {
+            self.stop(1).await;
+        }
+        let outcome = self
+            .inner
+            .compare_exchange(key, expected, change, id)
+            .await?;
+        if matches!(outcome, WriteOutcome::Applied) {
+            if key.as_ref().contains("/wal/") {
+                self.stop(2).await;
+            }
+            if key.as_ref().ends_with("/head") {
+                self.stop(3).await;
+            }
+            if key.as_ref().contains("/pages/") {
+                self.stop(4).await;
+            }
+            if key.as_ref().contains("/checkpoints/") {
+                self.stop(5).await;
+            }
+        }
+        Ok(outcome)
+    }
+}
+
+struct Driver {
+    store: WalStateStore,
+    armed: Arc<AtomicU8>,
+    snapshots: BTreeMap<String, Snapshot>,
+    transactions: BTreeMap<String, Transaction>,
+    attempts: BTreeMap<String, PreparedCommit>,
+}
+
+impl Driver {
+    async fn snapshot(&self, name: Option<&str>) -> Result<Snapshot> {
+        match name {
+            Some(name) => Ok(self.snapshots.get(name).ok_or("unknown snapshot")?.clone()),
+            None => Ok(self.store.snapshot().await?),
+        }
+    }
+
+    async fn execute(&mut self, command: Command) -> Result<Value> {
+        match command {
+            Command::Snapshot { name } => {
+                let snapshot = self.store.snapshot().await?;
+                let sequence = snapshot.sequence();
+                self.snapshots.insert(name, snapshot);
+                Ok(json!({"sequence": sequence}))
+            }
+            Command::Read { snapshot, prefix } => {
+                let snapshot = self.snapshot(snapshot.as_deref()).await?;
+                let rows: Vec<_> = snapshot.scan_prefix(&prefix).collect();
+                Ok(json!({"sequence": snapshot.sequence(), "rows": rows}))
+            }
+            Command::Get {
+                snapshot,
+                transaction,
+                key,
+            } => {
+                let value = if let Some(name) = transaction {
+                    if snapshot.is_some() {
+                        return Err("select either transaction or snapshot".into());
+                    }
+                    self.transactions
+                        .get(&name)
+                        .ok_or("unknown transaction")?
+                        .get(&key)
+                        .cloned()
+                } else {
+                    self.snapshot(snapshot.as_deref()).await?.get(&key).cloned()
+                };
+                Ok(json!({"value": value}))
+            }
+            Command::Begin { name, snapshot } => {
+                let snapshot = self.snapshot(snapshot.as_deref()).await?;
+                let sequence = snapshot.sequence();
+                self.transactions.insert(name, snapshot.transaction());
+                Ok(json!({"sequence": sequence}))
+            }
+            Command::Change { name, changes } => {
+                let tx = self
+                    .transactions
+                    .get_mut(&name)
+                    .ok_or("unknown transaction")?;
+                for (key, value) in changes {
+                    match value {
+                        Some(value) => tx.put(key, value)?,
+                        None => tx.delete(key)?,
+                    }
+                }
+                Ok(json!({"ok": true}))
+            }
+            Command::View { name, prefix } => {
+                let tx = self.transactions.get(&name).ok_or("unknown transaction")?;
+                let rows: Vec<_> = tx.scan_prefix(&prefix).await?.into_iter().collect();
+                Ok(json!({"rows": rows}))
+            }
+            Command::Prepare { name } => {
+                let tx = self
+                    .transactions
+                    .remove(&name)
+                    .ok_or("unknown transaction")?;
+                let attempt = tx.prepare().await?;
+                let receipt = serde_json::to_value(attempt.receipt())?;
+                self.attempts.insert(name, attempt);
+                Ok(json!({"receipt": receipt}))
+            }
+            Command::Commit { name, barrier } => {
+                let attempt = self.attempts.get(&name).ok_or("unknown prepared commit")?;
+                self.armed.store(barrier.unwrap_or(0), Ordering::SeqCst);
+                let result = self.store.commit(attempt).await?;
+                self.armed.store(0, Ordering::SeqCst);
+                Ok(match result {
+                    CommitOutcome::Committed { sequence } => {
+                        json!({"outcome": "committed", "sequence": sequence})
+                    }
+                    CommitOutcome::Conflict => json!({"outcome": "conflict"}),
+                    CommitOutcome::Unknown { source } => {
+                        json!({"outcome": "unknown", "diagnostic": format!("{source:?}")})
+                    }
+                })
+            }
+            Command::Checkpoint { snapshot, barrier } => {
+                let snapshot = self.snapshot(snapshot.as_deref()).await?;
+                self.armed.store(barrier.unwrap_or(0), Ordering::SeqCst);
+                let result = self.store.checkpoint(&snapshot).await?;
+                self.armed.store(0, Ordering::SeqCst);
+                Ok(json!({"outcome": match result {
+                    WriteOutcome::Applied => "applied",
+                    WriteOutcome::Conflict => "conflict",
+                    WriteOutcome::Unknown { .. } => "unknown",
+                }}))
+            }
+            Command::Resolve { receipt } => Ok(match self.store.resolve(&receipt).await? {
+                Resolution::Committed { sequence } => {
+                    json!({"outcome": "committed", "sequence": sequence})
+                }
+                Resolution::Rejected => json!({"outcome": "rejected"}),
+                Resolution::Pending => json!({"outcome": "pending"}),
+            }),
+            Command::Release { name } => {
+                self.snapshots.remove(&name);
+                self.transactions.remove(&name);
+                self.attempts.remove(&name);
+                Ok(json!({"ok": true}))
+            }
+        }
+    }
+}
+
+fn main() -> Result<()> {
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()?;
+    match args.iter().map(String::as_str).collect::<Vec<_>>()[..] {
+        ["--probe", location] => runtime.block_on(probe(location)),
+        ["--export", location, directory] => {
+            runtime.block_on(export(location, std::path::Path::new(directory)))
+        }
+        ["--purge", location] => runtime.block_on(purge(location)),
+        [location] if !location.starts_with("--") => serve(&runtime, location),
+        _ => Err(USAGE.into()),
+    }
+}
+
+fn serve(runtime: &tokio::runtime::Runtime, location: &str) -> Result<()> {
+    let inner: Arc<dyn StateStore> = Arc::new(ObjectStoreState::new(open_store(location)?));
+    let armed = Arc::new(AtomicU8::new(0));
+    let state: Arc<dyn StateStore> = Arc::new(Barriers {
+        inner,
+        armed: Arc::clone(&armed),
+    });
+    let store = runtime.block_on(WalStateStore::open(
+        state,
+        Path::from("domain"),
+        Limits::default(),
+    ))?;
+    let mut driver = Driver {
+        store,
+        armed,
+        snapshots: BTreeMap::new(),
+        transactions: BTreeMap::new(),
+        attempts: BTreeMap::new(),
+    };
+    emit(&json!({"ready": true}));
+    // Stdio is synchronous on the supervisor thread, outside the async runtime.
+    for line in std::io::stdin().lock().lines() {
+        let command = serde_json::from_str(&line?)?;
+        let response = runtime.block_on(driver.execute(command));
+        emit(&response.unwrap_or_else(|error| json!({"error": error.to_string()})));
+    }
+    Ok(())
+}

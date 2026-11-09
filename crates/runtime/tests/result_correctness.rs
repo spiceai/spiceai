@@ -19,14 +19,16 @@ limitations under the License.
 //!
 //! | Spice side | Standalone oracle |
 //! |------------|-------------------|
-//! | `DuckDB` accelerator (`DataAccelerator`) | `duckdb` crate |
 //! | `SQLite` accelerator (`DataAccelerator`) | `rusqlite` crate |
+//!
+//! The micro tests here reach the accelerator `TableProvider` directly; `surfaces` runs the
+//! same SQL through a Spicepod-built runtime, in-process and over HTTP and Flight SQL, and
+//! compares it with both `rusqlite` and the installed `DuckDB` library (`duckdb-oracle`).
 //!
 //! Cayenne vs standalone oracles live under `crates/cayenne/tests/result_correctness_*`.
 //! Standalone DuckDB↔SQLite agreement (no Spice) lives under
 //! `result_correctness_standalone_engines_test`.
 
-#![recursion_limit = "256"]
 #![allow(clippy::expect_used)]
 #![allow(clippy::unwrap_used)]
 #![allow(clippy::too_many_lines)]
@@ -37,10 +39,9 @@ limitations under the License.
 // real; fixture values are far inside f64's exact-integer range.
 #![allow(clippy::cast_precision_loss)]
 
-// Accelerator engines are their own crates and self-register through a linkme slice. Each
-// integration test is a separate binary that links independently, and the linker drops an
-// unreferenced slice static, so a binary exercising Cayenne must name the crate itself.
-#[cfg(not(windows))]
+// Accelerator engines are their own crates and self-register through a linkme slice, and the
+// linker drops an unreferenced slice static, so a test exercising Cayenne names the crate
+// itself rather than relying on another module to.
 use accelerator_cayenne as _;
 
 use std::collections::HashMap;
@@ -48,17 +49,20 @@ use std::sync::Arc;
 
 use arrow::array::{Int64Array, RecordBatch, StringArray};
 use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
+use datafusion::common::TableReference;
 use datafusion::common::{Constraints, ToDFSchema};
 use datafusion::datasource::TableProvider;
 use datafusion::execution::context::SessionContext;
 use datafusion::logical_expr::dml::InsertOp;
 use datafusion::physical_plan::collect;
-use datafusion::sql::TableReference;
 use datafusion_table_providers::util::test::MockExec;
 use test_framework::queries::Query;
 use test_framework::queries::validation::{
-    QueryValidationResult, RowOrder, compare_query_result_batches,
+    QueryValidationResult, RowOrder, compare_query_result_batches_with_sort_check,
+    has_top_level_limit, has_top_level_order_by,
 };
+
+mod surfaces;
 
 // ---------------------------------------------------------------------------
 // Shared micro fixtures (id, name, value) / (id, region)
@@ -151,12 +155,27 @@ fn micro_queries() -> Vec<Query> {
     ]
 }
 
+fn write_parquet(path: &std::path::Path, batch: &RecordBatch) {
+    use datafusion::parquet::arrow::ArrowWriter;
+    use datafusion::parquet::file::properties::WriterProperties;
+
+    let file = std::fs::File::create(path).expect("parquet file");
+    let mut writer = ArrowWriter::try_new(
+        file,
+        batch.schema(),
+        Some(WriterProperties::builder().build()),
+    )
+    .expect("writer");
+    writer.write(batch).expect("write");
+    writer.close().expect("close");
+}
+
 fn create_cmd(name: &str, schema: SchemaRef) -> datafusion::logical_expr::CreateExternalTable {
     let df_schema = ToDFSchema::to_dfschema_ref(schema).expect("df schema");
     datafusion::logical_expr::CreateExternalTable {
         schema: df_schema,
         name: TableReference::bare(name),
-        location: String::new(),
+        locations: vec![],
         file_type: String::new(),
         table_partition_cols: vec![],
         if_not_exists: true,
@@ -220,17 +239,32 @@ async fn spice_query(
 }
 
 fn compare(query: &Query, spice: &[RecordBatch], standalone: &[RecordBatch]) -> String {
-    let sql_upper = query.sql.to_ascii_uppercase();
-    let has_order = sql_upper.contains("ORDER BY");
-    let has_limit = sql_upper.contains("LIMIT") || sql_upper.contains("OFFSET");
-    let order = if has_order && has_limit {
+    // Multiset unless the row set itself depends on order, so tied rows under a
+    // non-unique `ORDER BY` do not fail; the sort check below is tie-tolerant and
+    // verifies each side against its own `ORDER BY` regardless. Both predicates are
+    // parser-backed so an `ORDER BY`/`LIMIT` in a subquery is not mistaken for a
+    // top-level one.
+    let order = if has_top_level_order_by(&query.sql) && has_top_level_limit(&query.sql) {
         RowOrder::Preserved
     } else {
         RowOrder::Multiset
     };
-    match compare_query_result_batches(&query.name, spice, standalone, order) {
-        Ok(QueryValidationResult::Pass) => "PASS".into(),
-        Ok(QueryValidationResult::Fail(reason)) => format!("FAIL {reason:?}"),
+    match compare_query_result_batches_with_sort_check(
+        &query.name,
+        &query.sql,
+        spice,
+        standalone,
+        order,
+    ) {
+        Ok(comparison) => match comparison.result {
+            QueryValidationResult::Pass if comparison.unchecked.is_empty() => "PASS".into(),
+            // Content matched but the ORDER BY was not fully verified — named, so
+            // it does not read as a clean pass.
+            QueryValidationResult::Pass => {
+                format!("ORDER_UNCHECKED {}", comparison.unchecked.join("; "))
+            }
+            QueryValidationResult::Fail(reason) => format!("FAIL {reason:?}"),
+        },
         Err(e) => format!("COMPARE_ERR {e}"),
     }
 }
@@ -251,7 +285,9 @@ mod sqlite_accel {
     use rusqlite::Connection;
     use std::sync::Arc;
 
-    fn load_standalone_sqlite(tables: &[(&str, RecordBatch)]) -> (tempfile::TempDir, Connection) {
+    pub(super) fn load_standalone_sqlite(
+        tables: &[(&str, RecordBatch)],
+    ) -> (tempfile::TempDir, Connection) {
         let temp = tempfile::tempdir().expect("sqlite temp");
         let path = temp.path().join("oracle.sqlite");
         let conn = Connection::open(&path).expect("open");
@@ -327,7 +363,10 @@ mod sqlite_accel {
         }
     }
 
-    fn standalone_query(conn: &Connection, sql: &str) -> Result<Vec<RecordBatch>, String> {
+    pub(super) fn standalone_query(
+        conn: &Connection,
+        sql: &str,
+    ) -> Result<Vec<RecordBatch>, String> {
         // Reuse cayenne-style conversion via a minimal path: fetch as text/int and build batches.
         // Prefer duck-simple: only types used by micro suite.
         use arrow::array::{Int64Builder, StringBuilder};
@@ -482,41 +521,24 @@ mod sqlite_accel {
 }
 
 // ---------------------------------------------------------------------------
-// Spice DuckDB accelerator ↔ standalone duckdb crate
+// Standalone DuckDB oracle, through the installed DuckDB library
 // ---------------------------------------------------------------------------
 
-#[cfg(feature = "duckdb")]
-mod duckdb_accel {
-    use super::{
-        compare, create_cmd, insert_batch, make_dim, make_fact, micro_queries, spice_query,
-    };
-    use accelerator_duckdb::DuckDBAccelerator;
+mod standalone_duckdb {
+    use super::write_parquet;
     use arrow::array::RecordBatch;
-    use data_accelerator_api::DataAccelerator;
-    use datafusion::datasource::TableProvider;
-    use duckdb::Connection;
-    use std::sync::Arc;
+    use duckdb_oracle::Connection;
 
-    fn load_standalone_duckdb(tables: &[(&str, RecordBatch)]) -> (tempfile::TempDir, Connection) {
-        use datafusion::parquet::arrow::ArrowWriter;
-        use datafusion::parquet::file::properties::WriterProperties;
-
+    pub(super) fn load_standalone_duckdb(
+        tables: &[(&str, RecordBatch)],
+    ) -> (tempfile::TempDir, Connection) {
         let stage = tempfile::tempdir().expect("stage");
         for (name, batch) in tables {
-            let path = stage.path().join(format!("{name}.parquet"));
-            let file = std::fs::File::create(&path).expect("parquet file");
-            let mut writer = ArrowWriter::try_new(
-                file,
-                batch.schema(),
-                Some(WriterProperties::builder().build()),
-            )
-            .expect("writer");
-            writer.write(batch).expect("write");
-            writer.close().expect("close");
+            write_parquet(&stage.path().join(format!("{name}.parquet")), batch);
         }
         let temp = tempfile::tempdir().expect("duckdb temp");
         let db = temp.path().join("oracle.duckdb");
-        let conn = Connection::open(&db).expect("open");
+        let conn = Connection::open(&db).unwrap_or_else(|e| panic!("open the DuckDB oracle: {e}"));
         for (name, _) in tables {
             let path = stage.path().join(format!("{name}.parquet"));
             conn.execute_batch(&format!(
@@ -530,52 +552,10 @@ mod duckdb_accel {
         (temp, conn)
     }
 
-    fn standalone_query(conn: &Connection, sql: &str) -> Result<Vec<RecordBatch>, String> {
-        let mut stmt = conn.prepare(sql).map_err(|e| e.to_string())?;
-        let batches: Vec<RecordBatch> = stmt.query_arrow([]).map_err(|e| e.to_string())?.collect();
-        Ok(batches)
-    }
-
-    #[tokio::test(flavor = "multi_thread")]
-    async fn spice_duckdb_accel_vs_standalone_duckdb_micro() {
-        let fact = make_fact(2_048, 64);
-        let dim = make_dim(256);
-
-        let accel = DuckDBAccelerator::new();
-        let t_table = accel
-            .create_external_table(create_cmd("t", fact.schema()), None, vec![], None)
-            .await
-            .expect("create t");
-        let d_table = accel
-            .create_external_table(create_cmd("d", dim.schema()), None, vec![], None)
-            .await
-            .expect("create d");
-        insert_batch(&t_table, fact.clone()).await;
-        insert_batch(&d_table, dim.clone()).await;
-        let spice_tables: Vec<(String, Arc<dyn TableProvider>)> =
-            vec![("t".into(), t_table), ("d".into(), d_table)];
-
-        let (_tmp, conn) = load_standalone_duckdb(&[("t", fact), ("d", dim)]);
-
-        let mut fails = Vec::new();
-        for q in micro_queries() {
-            let spice = spice_query(&spice_tables, &q.sql)
-                .await
-                .unwrap_or_else(|e| panic!("spice sql {}: {e}", q.name));
-            let standalone = standalone_query(&conn, &q.sql)
-                .unwrap_or_else(|e| panic!("duckdb sql {}: {e}", q.name));
-            let status = compare(&q, &spice, &standalone);
-            eprintln!(
-                "spice-duckdb-accel vs standalone-duckdb / {} -> {status}",
-                q.name
-            );
-            if !status.starts_with("PASS") {
-                fails.push(format!("{}: {status}", q.name));
-            }
-        }
-        assert!(
-            fails.is_empty(),
-            "Spice DuckDB accelerator vs standalone DuckDB failures: {fails:#?}"
-        );
+    pub(super) fn standalone_query(
+        conn: &Connection,
+        sql: &str,
+    ) -> Result<Vec<RecordBatch>, String> {
+        conn.query(sql).map_err(|e| e.to_string())
     }
 }

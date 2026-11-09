@@ -8,6 +8,7 @@ use std::fmt::Formatter;
 use std::str::FromStr;
 use std::sync::Arc;
 
+use arrow_schema::DataType;
 use arrow_schema::Schema;
 use arrow_schema::SchemaRef;
 use async_trait::async_trait;
@@ -37,6 +38,7 @@ use datafusion_datasource::file_scan_config::FileScanConfigBuilder;
 use datafusion_datasource::file_sink_config::FileSinkConfig;
 use datafusion_datasource::sink::DataSinkExec;
 use datafusion_datasource::source::DataSourceExec;
+use datafusion_execution::runtime_env::RuntimeEnv;
 use datafusion_expr::dml::InsertOp;
 use datafusion_physical_expr::LexRequirement;
 use datafusion_physical_expr::PhysicalExprRef;
@@ -52,8 +54,8 @@ use object_store::ObjectMeta;
 use object_store::ObjectStore;
 use object_store::path::Path;
 use vortex::VortexSessionDefault;
+use vortex::array::stats::StatsSet;
 use vortex::arrow::ArrowSessionExt;
-use vortex::arrow::FromArrowType;
 use vortex::dtype::DType;
 use vortex::dtype::Nullability;
 use vortex::dtype::PType;
@@ -71,16 +73,19 @@ use vortex::scalar::ScalarValue as VortexScalarValue;
 use vortex::session::VortexSession;
 
 use super::access_plan::VortexAccessPlanProvider;
+use super::access_plan::VortexRuntimeAccessPlanProvider;
 use super::cache::CachedVortexMetadata;
 use super::cache::cache_footer;
 use super::segment_cache;
 use super::segment_cache::SharedSegmentCache;
 use super::sink::{ShardSpec, VortexSink};
 use super::source::VortexSource;
+use super::write_observer::VortexWriteObserver;
 use crate::PrecisionExt as _;
 use crate::convert::TryToDataFusion;
 
-const DEFAULT_FOOTER_INITIAL_READ_SIZE_BYTES: usize = MAX_POSTSCRIPT_SIZE as usize + EOF_SIZE;
+pub(super) const DEFAULT_FOOTER_INITIAL_READ_SIZE_BYTES: usize =
+    MAX_POSTSCRIPT_SIZE as usize + EOF_SIZE;
 const DEFAULT_TARGET_FILE_SIZE_MB: usize = 128;
 
 /// Controls projection-expression pushdown into Vortex scans.
@@ -265,22 +270,41 @@ pub struct WriteShardConfig {
     /// partition value), resolved by name against the write schema. Empty ⇒
     /// distribute whole batches instead of splitting them row-wise.
     pub shard_key_columns: Vec<String>,
-    /// Ascending split points that RANGE-partition rows on the single
+    /// Ascending split points that RANGE-partition rows on the first
     /// `shard_key_columns` entry, giving each output file a disjoint, contiguous
-    /// slice of that key's domain so a predicate on it prunes. `None` ⇒ hash the
-    /// key instead, which spreads every key range across every file.
+    /// slice of that column's domain so a predicate on it prunes. `None` ⇒ hash
+    /// the key instead, which spreads every key range across every file.
     ///
-    /// Supply `write_concurrency - 1` bounds. Ignored unless exactly one shard
-    /// key column is set: ordering a composite key needs a lexicographic
-    /// comparison this does not implement, so a multi-column key hashes.
+    /// Supply `write_concurrency - 1` bounds. Ignored when `shard_key_columns`
+    /// is empty. A composite key still range-splits on its leading column —
+    /// ordering every column would need a lexicographic comparison this does
+    /// not implement — and the remaining columns ride on the spec so an
+    /// estimated-bounds hash fallback can rebalance when the unsampled
+    /// remainder is one value of that leading column.
     pub range_bounds: Option<Vec<ScalarValue>>,
+    /// Sort each shard's rows by the shard key — every column, leading one
+    /// first — in runs of at most this many uncompressed bytes before encoding
+    /// them. Applies to range- and hash-partitioned writes; a round-robin or
+    /// single-writer write has no key to sort by and ignores it. `None` ⇒ rows
+    /// keep their arrival order within a shard.
+    pub run_sort_bytes: Option<u64>,
+    /// The `range_bounds` were estimated from a sample that may not describe
+    /// every row the write will see (a table's first load samples the head of
+    /// its own input). If one range shard then receives far more than its share
+    /// of the rows, the writer hashes the key for the rest of the write instead
+    /// of leaving one encoder the remainder. Bounds read off the rows being
+    /// rewritten keep their split however the rows fall.
+    pub range_bounds_estimated: bool,
 }
 
 /// Vortex implementation of a `DataFusion` [`FileFormat`].
+#[derive(Clone)]
 pub struct VortexFormat {
     session: VortexSession,
     opts: VortexTableOptions,
     access_plan_provider: Option<Arc<dyn VortexAccessPlanProvider>>,
+    runtime_access_plan_provider: Option<Arc<dyn VortexRuntimeAccessPlanProvider>>,
+    write_observer: Option<Arc<dyn VortexWriteObserver>>,
     segment_cache: Option<Arc<SharedSegmentCache>>,
     write_shard: Option<WriteShardConfig>,
 }
@@ -292,6 +316,17 @@ impl Debug for VortexFormat {
             .field(
                 "access_plan_provider",
                 &self.access_plan_provider.as_ref().map(|_| "configured"),
+            )
+            .field(
+                "runtime_access_plan_provider",
+                &self
+                    .runtime_access_plan_provider
+                    .as_ref()
+                    .map(|_| "configured"),
+            )
+            .field(
+                "write_observer",
+                &self.write_observer.as_ref().map(|_| "configured"),
             )
             .field("segment_cache", &self.segment_cache)
             .finish_non_exhaustive()
@@ -475,6 +510,8 @@ impl VortexFormat {
             session,
             opts,
             access_plan_provider: None,
+            runtime_access_plan_provider: None,
+            write_observer: None,
             segment_cache,
             write_shard: None,
         }
@@ -486,11 +523,101 @@ impl VortexFormat {
         &self.opts
     }
 
-    /// Invalidates cached Vortex segments for the exact object-store paths and
-    /// physically evicts them before returning.
-    pub async fn invalidate_segment_cache_paths(&self, paths: HashSet<Path>) {
+    /// Invalidates every cached artifact Vortex holds for the exact object-store
+    /// paths — this format's decoded segments and the file footers in
+    /// `DataFusion`'s shared
+    /// [`FileMetadataCache`](datafusion_execution::cache::cache_manager::FileMetadataCache)
+    /// — evicting the ones it can reach before returning.
+    ///
+    /// Callers pass the paths of objects a retirement has confirmed absent.
+    /// Neither cache has a TTL or any invalidation of its own, so a retired
+    /// artifact leaves only when another `put` pushes it out under capacity
+    /// pressure. Both outcomes cost something: pressure that does arrive
+    /// reclaims the entry, but until then it holds a share of a budget every
+    /// other table draws on and displaces a live artifact when it is finally
+    /// evicted, and pressure that never arrives — an idle or generously sized
+    /// cache — leaves it resident for the life of the process. This call is the
+    /// only way to hand that share back without waiting on that pressure.
+    ///
+    /// The two halves are not equally ordered against reads already in flight.
+    /// The segment half is: `SharedSegmentCache` registers per-path state and
+    /// drains in-flight puts before enumerating keys. Both of those waits are
+    /// bounded, so a host too saturated to finish them gives up rather than
+    /// holding this caller — returning means the wait is over, not always that
+    /// every segment is gone. Which segments stay has three outcomes, not two:
+    ///
+    /// - giving up on the key search leaves every key it would have found cached
+    ///   until capacity evicts them;
+    /// - giving up on an in-flight write whose put then **completes** costs only a
+    ///   moment of residency, because that put removes its own entry once it sees
+    ///   the path retired — that self-removal is what makes the bounded drain safe;
+    /// - giving up on one that is then **cancelled between its insert and that
+    ///   self-removal** leaves the entry cached until capacity evicts it, exactly
+    ///   as the search case does. Closing that window needs the retirement
+    ///   tombstone tracked in <https://github.com/spiceai/spiceai/issues/12963>.
+    ///
+    /// The footer half is not ordered against in-flight reads at all —
+    /// `infer_schema` and `infer_stats` miss the cache, `await` the object-store
+    /// read, and only then insert what they read, so a scan that missed before
+    /// this call can insert after it and leave one entry per raced path behind,
+    /// on the same terms as any other un-evicted entry above. Giving the footer
+    /// side the same coordination is tracked in
+    /// <https://github.com/spiceai/spiceai/issues/13447>.
+    ///
+    /// No entry either half leaves behind can serve stale data, because every
+    /// caller has already deleted the underlying file.
+    ///
+    /// Both caches key on the object-store location, so one path set addresses
+    /// both; taking them together is what stops a caller releasing one and
+    /// silently retaining the other. Evicting a path that turns out to still be
+    /// live costs a re-read, not correctness: a stale footer was never servable,
+    /// because every read site checks
+    /// [`CachedFileMetadataEntry::is_valid_for`](datafusion_execution::cache::cache_manager::CachedFileMetadataEntry::is_valid_for)
+    /// against the current object.
+    pub async fn invalidate_cached_paths(
+        &self,
+        runtime_env: &RuntimeEnv,
+        table: &str,
+        paths: HashSet<Path>,
+    ) {
+        if paths.is_empty() {
+            return;
+        }
+
+        // One set clone so the footer sweep below still has the paths after the
+        // segment cache consumes them; that ordering is what keeps a failed join
+        // from also costing the segment invalidation.
+        let footer_paths = paths.clone();
         if let Some(cache) = self.segment_cache.as_ref() {
             cache.invalidate_paths(paths).await;
+        }
+
+        // This cache is shared by every table on the environment it belongs to,
+        // its lock is taken by every format's `get`/`put`, and dropping an entry
+        // deallocates a parsed footer — so a retirement spanning thousands of
+        // files would hold a runtime worker for milliseconds against a lock every
+        // other table's scans need. Same reasoning as the segment key scan, which
+        // is on the blocking pool for it.
+        //
+        // "the environment it belongs to" is load-bearing: the cache hangs off
+        // the `RuntimeEnv`, not the process. A deployment that carves a dedicated
+        // Cayenne compaction environment has a second one, which compaction fills
+        // and this sweep never reaches, because every retirement caller passes the
+        // table context's query environment. Tracked in
+        // spiceai/spiceai#13497 — the fix is in how the two environments are built,
+        // not here.
+        let footer_cache = runtime_env.cache_manager.get_file_metadata_cache();
+        if let Err(error) = tokio::task::spawn_blocking(move || {
+            for path in &footer_paths {
+                footer_cache.remove(path);
+            }
+        })
+        .await
+        {
+            tracing::error!(
+                target: "vortex::footer_cache",
+                "Failed to release the memory cached for the files table '{table}' has just retired, so the runtime keeps holding it until another table's reads push it out. Restart the runtime to reclaim it immediately. Cause: {error}. See: https://spiceai.org/docs/components/data-accelerators/cayenne"
+            );
         }
     }
 
@@ -511,28 +638,46 @@ impl VortexFormat {
         access_plan_provider: Arc<dyn VortexAccessPlanProvider>,
     ) -> Self {
         Self {
-            session: self.session.clone(),
-            opts: self.opts.clone(),
             access_plan_provider: Some(access_plan_provider),
-            segment_cache: self.segment_cache.clone(),
-            write_shard: self.write_shard.clone(),
+            ..self.clone()
+        }
+    }
+
+    /// Creates a format whose scans also plan each file from the scan's runtime
+    /// predicate as the file opens. See [`VortexRuntimeAccessPlanProvider`].
+    #[must_use]
+    pub fn with_runtime_access_plan_provider(
+        &self,
+        runtime_access_plan_provider: Arc<dyn VortexRuntimeAccessPlanProvider>,
+    ) -> Self {
+        Self {
+            runtime_access_plan_provider: Some(runtime_access_plan_provider),
+            ..self.clone()
+        }
+    }
+
+    /// Returns a format whose writes report the file and file-local row position
+    /// of every batch they emit, so a caller can build a row-address index during
+    /// the write rather than by reading the finished files back.
+    #[must_use]
+    pub fn with_write_observer(&self, write_observer: Arc<dyn VortexWriteObserver>) -> Self {
+        Self {
+            write_observer: Some(write_observer),
+            ..self.clone()
         }
     }
 
     /// Returns a format that fans writes across `config.write_concurrency`
     /// concurrent shard writers (clamped to the session `target_partitions`),
-    /// routing rows by `config.shard_key_columns` — range-partitioned when
-    /// `config.range_bounds` supplies split points for a single key column,
+    /// routing rows by `config.shard_key_columns` — range-partitioned on the
+    /// first key column when `config.range_bounds` supplies split points,
     /// hashed otherwise, and round-robin when no key is set. Used by the Cayenne
     /// accelerator to parallelize the Vortex encode.
     #[must_use]
     pub fn with_write_shard(&self, config: WriteShardConfig) -> Self {
         Self {
-            session: self.session.clone(),
-            opts: self.opts.clone(),
-            access_plan_provider: self.access_plan_provider.clone(),
-            segment_cache: self.segment_cache.clone(),
             write_shard: Some(config),
+            ..self.clone()
         }
     }
 
@@ -638,20 +783,31 @@ impl VortexFormat {
                 return ShardSpec::RoundRobin(partitions);
             }
         }
-        // Range-partition when the caller supplied bounds for a single key
-        // column: same row-wise split as `Hash`, so every encoder is fed from
-        // the first batch, but the shards tile the key domain in order instead
-        // of scattering it, which is what lets a file's zone maps prune.
-        if let (Some(bounds), [expr]) = (write_shard.range_bounds.as_ref(), exprs.as_slice())
+        // Range-partition when the caller supplied bounds: same row-wise split
+        // as `Hash`, so every encoder is fed from the first batch, but the
+        // shards tile the first key column's domain in order instead of
+        // scattering it, which is what lets a file's zone maps prune. Remaining
+        // key columns are not part of the range comparison; they ride on
+        // `hash_exprs` so an estimated-bounds fallback can still rebalance a
+        // composite key.
+        if let Some(bounds) = write_shard.range_bounds.as_ref()
             && !bounds.is_empty()
+            && let Some(expr) = exprs.first()
         {
             return ShardSpec::Range {
                 expr: Arc::clone(expr),
+                hash_exprs: exprs,
                 bounds: bounds.clone(),
                 partitions,
+                run_sort_bytes: write_shard.run_sort_bytes,
+                hash_fallback: write_shard.range_bounds_estimated,
             };
         }
-        ShardSpec::Hash { exprs, partitions }
+        ShardSpec::Hash {
+            exprs,
+            partitions,
+            run_sort_bytes: write_shard.run_sort_bytes,
+        }
     }
 }
 
@@ -771,7 +927,9 @@ impl FileFormat for VortexFormat {
                         })
                 })
             })
-            .buffer_unordered(state.config_options().execution.meta_fetch_concurrency)
+            .buffer_unordered(usize::from(
+                state.config_options().execution.meta_fetch_concurrency,
+            ))
             .try_collect::<Vec<_>>()
             .await?;
 
@@ -897,20 +1055,30 @@ impl FileFormat for VortexFormat {
                     .zip(column_size)
                     .map(|(acc, size)| acc + size);
 
-                let target_dtype = DType::from_arrow(field.as_ref());
-                let min = scalar_stat_to_df(
-                    Stat::Min,
-                    stats_set.get(Stat::Min),
-                    stats_dtype,
-                    &target_dtype,
-                );
-
-                let max = scalar_stat_to_df(
-                    Stat::Max,
-                    stats_set.get(Stat::Max),
-                    stats_dtype,
-                    &target_dtype,
-                );
+                let target_dtype = session.arrow().from_arrow_field(field.as_ref()).map_err(|e| {
+                    DataFusionError::Execution(format!(
+                        "Failed to infer statistics for Vortex file {}: column '{}' has no Vortex type: {e}",
+                        object.location,
+                        field.name()
+                    ))
+                })?;
+                // Float bounds and sums leave NaN out; see `bounds_account_for_nan`.
+                let bounds_usable = bounds_account_for_nan(stats_set, stats_dtype);
+                let bound = |stat: Stat| {
+                    if bounds_usable {
+                        stat_bound_to_df(
+                            stat,
+                            stats_set.get(stat),
+                            stats_dtype,
+                            &target_dtype,
+                            field.data_type(),
+                        )
+                    } else {
+                        stats::Precision::Absent
+                    }
+                };
+                let min = bound(Stat::Min);
+                let max = bound(Stat::Max);
 
                 let null_count = stats_set.get_as::<usize>(Stat::NullCount, &PType::U64.into());
 
@@ -921,13 +1089,13 @@ impl FileFormat for VortexFormat {
                 // arrow type: the sum of e.g. an `Int32` column is an `Int64` in
                 // DataFusion, and narrowing here would lose width or overflow.
                 let sum = match Stat::Sum.dtype(stats_dtype) {
-                    Some(sum_dtype) => scalar_stat_to_df(
+                    Some(sum_dtype) if bounds_usable => scalar_stat_to_df(
                         Stat::Sum,
                         stats_set.get(Stat::Sum),
                         stats_dtype,
                         &sum_dtype,
                     ),
-                    None => stats::Precision::Absent,
+                    _ => stats::Precision::Absent,
                 };
 
                 column_statistics.push(ColumnStatistics {
@@ -981,6 +1149,10 @@ impl FileFormat for VortexFormat {
 
         source = source
             .with_file_metadata_cache(state.runtime_env().cache_manager.get_file_metadata_cache());
+
+        if let Some(provider) = self.runtime_access_plan_provider.as_ref() {
+            source = source.with_runtime_access_plan_provider(Arc::clone(provider));
+        }
 
         let conf = FileScanConfigBuilder::from(file_scan_config)
             .with_source(Arc::new(source))
@@ -1038,6 +1210,7 @@ impl FileFormat for VortexFormat {
             self.session.clone(),
             target_file_size,
             shard_spec,
+            self.write_observer.clone(),
         ));
 
         Ok(Arc::new(DataSinkExec::new(input, sink, order_requirements)) as _)
@@ -1053,6 +1226,140 @@ impl FileFormat for VortexFormat {
         }
 
         Arc::new(source) as _
+    }
+}
+
+/// Whether a column's min, max and sum can be used as `DataFusion` statistics.
+///
+/// Vortex leaves NaN out of a float column's min, max and sum, while `DataFusion`
+/// orders a NaN like any other value (`NaN = NaN`; a positive NaN sorts above
+/// `+inf`, a negative one below `-inf`) and sums it to NaN. Bounds that left a NaN
+/// out would let pruning skip the rows a NaN probe or an `x > c` matches, and let
+/// `MIN`/`MAX`/`SUM` be answered from metadata without them, so a float column's
+/// are usable only when its stats record that it holds no NaN.
+#[must_use]
+pub fn bounds_account_for_nan(stats: &StatsSet, dtype: &DType) -> bool {
+    !dtype.is_float()
+        || stats
+            .get_as::<u64>(Stat::NaNCount, &PType::U64.into())
+            .as_exact()
+            == Some(0)
+}
+
+/// A `Min` or `Max` bound, tagged as the column's own Arrow type.
+///
+/// Bounds are compared against literals of the column's type. `FilterExec` builds
+/// an `Interval` from the pair and asserts both endpoints share one type, taking
+/// whichever end the file does not describe from the column, so a bound tagged
+/// for another type fails planning for every query that projects that column,
+/// rather than only costing pruning.
+///
+/// Vortex has one string dtype and one binary dtype where Arrow has several
+/// representations, so a footer bound on a `LargeUtf8` column surfaces as `Utf8`.
+/// The column's Vortex dtype is tried first because it reconstructs the types
+/// Vortex models directly (dictionaries, temporal extensions); the fallback
+/// converts on the value's own dtype and copies the column's tag onto the
+/// payload. Decimal bounds also use the column's Arrow storage width: Vortex
+/// chooses their width from precision, independently of the Arrow field's width.
+/// A value that cannot carry the column's type is reported as no bound.
+fn stat_bound_to_df(
+    stat: Stat,
+    value: stats::Precision<VortexScalarValue>,
+    stats_dtype: &DType,
+    target_dtype: &DType,
+    column_type: &DataType,
+) -> stats::Precision<datafusion_common::ScalarValue> {
+    let Some(scalar_dtype) = stat.dtype(stats_dtype) else {
+        return stats::Precision::Absent;
+    };
+
+    value.and_then(|value| {
+        let scalar = Scalar::try_new(scalar_dtype, Some(value)).ok()?;
+        scalar
+            .cast(target_dtype)
+            .ok()
+            .and_then(|cast| cast.try_to_df().ok())
+            .or_else(|| scalar.try_to_df().ok())
+            .and_then(|bound| retag_bound_to_column(&bound, column_type))
+    })
+}
+
+/// `value` as `column_type`, keeping the payload.
+///
+/// Arrow's string and binary families each hold several representations that
+/// Vortex collapses to one dtype, and a bound recorded under one of them still
+/// describes the other: bytes for a string column while they are valid UTF-8,
+/// text for a binary column as its bytes. A bound with no value describes no
+/// bound, so it is dropped rather than retagged.
+fn retag_bound_to_column(value: &ScalarValue, column_type: &DataType) -> Option<ScalarValue> {
+    if value.is_null() {
+        return None;
+    }
+    let value_type = value.data_type();
+    if &value_type == column_type {
+        return Some(value.clone());
+    }
+
+    // Vortex uses the narrowest decimal width for its precision. Restoring the
+    // Arrow field's width only widens storage, without rounding or rescaling.
+    if matches!(
+        (&value_type, column_type),
+        (
+            DataType::Decimal32(p, s),
+            DataType::Decimal64(target_p, target_s)
+                | DataType::Decimal128(target_p, target_s)
+                | DataType::Decimal256(target_p, target_s),
+        ) | (
+            DataType::Decimal64(p, s),
+            DataType::Decimal128(target_p, target_s)
+                | DataType::Decimal256(target_p, target_s),
+        ) | (
+            DataType::Decimal128(p, s),
+            DataType::Decimal256(target_p, target_s),
+        ) if p == target_p && s == target_s
+    ) {
+        return value
+            .cast_to(column_type)
+            .ok()
+            .filter(|bound| !bound.is_null());
+    }
+
+    match column_type {
+        DataType::Utf8 | DataType::LargeUtf8 | DataType::Utf8View => {
+            let text = match value {
+                ScalarValue::Utf8(text)
+                | ScalarValue::LargeUtf8(text)
+                | ScalarValue::Utf8View(text) => text.clone()?,
+                ScalarValue::Binary(bytes)
+                | ScalarValue::LargeBinary(bytes)
+                | ScalarValue::BinaryView(bytes) => {
+                    std::str::from_utf8(bytes.as_deref()?).ok()?.to_string()
+                }
+                _ => return None,
+            };
+            Some(match column_type {
+                DataType::Utf8 => ScalarValue::Utf8(Some(text)),
+                DataType::LargeUtf8 => ScalarValue::LargeUtf8(Some(text)),
+                _ => ScalarValue::Utf8View(Some(text)),
+            })
+        }
+        DataType::Binary | DataType::LargeBinary | DataType::BinaryView => {
+            let bytes = match value {
+                ScalarValue::Binary(bytes)
+                | ScalarValue::LargeBinary(bytes)
+                | ScalarValue::BinaryView(bytes) => bytes.clone()?,
+                ScalarValue::Utf8(text)
+                | ScalarValue::LargeUtf8(text)
+                | ScalarValue::Utf8View(text) => text.as_deref()?.as_bytes().to_vec(),
+                _ => return None,
+            };
+            Some(match column_type {
+                DataType::Binary => ScalarValue::Binary(Some(bytes)),
+                DataType::LargeBinary => ScalarValue::LargeBinary(Some(bytes)),
+                _ => ScalarValue::BinaryView(Some(bytes)),
+            })
+        }
+        _ => None,
     }
 }
 
@@ -1088,6 +1395,147 @@ mod tests {
 
     use super::*;
     use crate::common_tests::TestSessionContext;
+    use crate::convert::FromDataFusion;
+    use datafusion_common::arrow::datatypes::i256;
+    use datafusion_physical_plan::{StatisticsArgs, StatisticsContext};
+
+    #[test]
+    fn decimal_bounds_preserve_arrow_width_and_statistical_precision() -> anyhow::Result<()> {
+        for expected in [
+            ScalarValue::Decimal32(Some(-4_200), 5, 2),
+            ScalarValue::Decimal64(Some(-4_200), 5, 2),
+            ScalarValue::Decimal128(Some(-4_200), 5, 2),
+            ScalarValue::Decimal256(Some(i256::from_i128(-4_200)), 5, 2),
+            ScalarValue::Decimal64(Some(4_200), 10, 2),
+            ScalarValue::Decimal128(Some(4_200), 10, 2),
+            ScalarValue::Decimal256(Some(i256::from_i128(4_200)), 10, 2),
+            ScalarValue::Decimal128(Some(i128::from(i64::MAX) + 1), 20, 2),
+            ScalarValue::Decimal256(Some(i256::from_i128(i128::from(i64::MAX) + 1)), 20, 2),
+            ScalarValue::Decimal256(Some(i256::from_i128(i128::MAX)), 50, 10),
+            ScalarValue::Decimal128(Some(99_999), 5, -2),
+            ScalarValue::Decimal256(Some(i256::ZERO), 5, 2),
+        ] {
+            let scalar = Scalar::from_df(&expected)?;
+            let raw = scalar
+                .value()
+                .cloned()
+                .ok_or_else(|| anyhow::anyhow!("expected a non-null decimal bound"))?;
+            let column_type = expected.data_type();
+            for stat in [Stat::Min, Stat::Max] {
+                for value in [
+                    stats::Precision::Exact(raw.clone()),
+                    stats::Precision::Inexact(raw.clone()),
+                ] {
+                    let expected_stat = value.as_ref().map(|_| expected.clone());
+                    assert_eq!(
+                        stat_bound_to_df(stat, value, scalar.dtype(), scalar.dtype(), &column_type),
+                        expected_stat,
+                        "{stat:?} bound for {column_type:?}"
+                    );
+                }
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn decimal_bounds_reject_narrowing_rescaling_and_nulls() {
+        for (value, column_type) in [
+            (
+                ScalarValue::Decimal64(Some(42), 5, 2),
+                DataType::Decimal32(5, 2),
+            ),
+            (
+                ScalarValue::Decimal64(Some(4_200), 10, 2),
+                DataType::Decimal128(10, 3),
+            ),
+            (
+                ScalarValue::Decimal64(Some(4_200), 10, 2),
+                DataType::Decimal128(12, 2),
+            ),
+            (
+                ScalarValue::Decimal64(Some(i64::MAX), 9, 2),
+                DataType::Decimal32(9, 2),
+            ),
+            (
+                ScalarValue::Decimal32(None, 5, 2),
+                DataType::Decimal128(5, 2),
+            ),
+            (ScalarValue::Int64(Some(42)), DataType::Decimal128(10, 2)),
+        ] {
+            assert_eq!(retag_bound_to_column(&value, &column_type), None);
+        }
+    }
+
+    #[test]
+    fn string_bounds_take_the_columns_representation() {
+        assert_eq!(
+            retag_bound_to_column(
+                &ScalarValue::Utf8(Some("N".to_string())),
+                &DataType::LargeUtf8
+            ),
+            Some(ScalarValue::LargeUtf8(Some("N".to_string()))),
+            "a `Utf8` bound keeps its value as the `LargeUtf8` column's bound"
+        );
+        assert_eq!(
+            retag_bound_to_column(
+                &ScalarValue::LargeUtf8(Some("N".to_string())),
+                &DataType::Utf8View
+            ),
+            Some(ScalarValue::Utf8View(Some("N".to_string()))),
+            "and back the other way"
+        );
+        assert_eq!(
+            retag_bound_to_column(&ScalarValue::Utf8(None), &DataType::LargeUtf8),
+            None,
+            "a bound with no value describes no bound"
+        );
+    }
+
+    #[test]
+    fn bounds_survive_the_string_and_binary_families_being_swapped() {
+        assert_eq!(
+            retag_bound_to_column(
+                &ScalarValue::Binary(Some(b"Y".to_vec())),
+                &DataType::LargeUtf8
+            ),
+            Some(ScalarValue::LargeUtf8(Some("Y".to_string()))),
+            "a bound recorded as bytes is still the string column's bound"
+        );
+        assert_eq!(
+            retag_bound_to_column(
+                &ScalarValue::LargeUtf8(Some("Y".to_string())),
+                &DataType::Binary
+            ),
+            Some(ScalarValue::Binary(Some(b"Y".to_vec()))),
+            "and the same holds for a binary column whose bound came back as text"
+        );
+        assert_eq!(
+            retag_bound_to_column(
+                &ScalarValue::Binary(Some(vec![0xff, 0xfe])),
+                &DataType::Utf8
+            ),
+            None,
+            "bytes that are not text are not a bound for a string column"
+        );
+    }
+
+    #[test]
+    fn a_bound_of_another_family_is_dropped_rather_than_mistagged() {
+        assert_eq!(
+            retag_bound_to_column(&ScalarValue::Int32(Some(7)), &DataType::LargeUtf8),
+            None,
+            "a number is not a bound for a string column"
+        );
+        assert_eq!(
+            retag_bound_to_column(
+                &ScalarValue::LargeUtf8(Some("N".to_string())),
+                &DataType::Int64
+            ),
+            None,
+            "and text is not a bound for a numeric column"
+        );
+    }
 
     #[tokio::test]
     async fn create_table() -> anyhow::Result<()> {
@@ -1122,6 +1570,22 @@ mod tests {
             .await?
             .collect()
             .await?;
+
+        // The table's OPTIONS must reach the Vortex format the table reads with.
+        let provider = ctx.session.table_provider("my_tbl").await?;
+        let listing = provider
+            .downcast_ref::<datafusion::datasource::listing::ListingTable>()
+            .ok_or_else(|| anyhow::anyhow!("a Vortex external table is a listing table"))?;
+        let format = listing
+            .options()
+            .format
+            .downcast_ref::<VortexFormat>()
+            .ok_or_else(|| anyhow::anyhow!("the table must read with the Vortex format"))?;
+        assert_eq!(format.options().footer_initial_read_size_bytes, 12345);
+        assert_eq!(
+            format.options().scan_concurrency,
+            ScanConcurrency::Explicit(3)
+        );
 
         Ok(())
     }
@@ -1165,10 +1629,8 @@ mod tests {
         let state = ctx.session.state();
 
         // --- All columns: per-column byte_size present, total == sum ---------
-        let all = provider
-            .scan(&state, None, &[], None)
-            .await?
-            .partition_statistics(None)?;
+        let all_plan = provider.scan(&state, None, &[], None).await?;
+        let all = StatisticsContext::new().compute(&*all_plan, &StatisticsArgs::new())?;
         assert_eq!(all.num_rows.get_value(), Some(&n), "row count");
 
         let id_bytes = *all.column_statistics[0]
@@ -1206,10 +1668,10 @@ mod tests {
         // --- Projected scans: total reflects ONLY the projected columns ------
         // Project [id] (fixed-width): total is just the int column.
         let proj_id_cols = vec![0usize];
-        let proj_id = provider
+        let proj_id_plan = provider
             .scan(&state, Some(&proj_id_cols), &[], None)
-            .await?
-            .partition_statistics(None)?;
+            .await?;
+        let proj_id = StatisticsContext::new().compute(&*proj_id_plan, &StatisticsArgs::new())?;
         assert_eq!(
             proj_id.total_byte_size.get_value(),
             Some(&id_bytes),
@@ -1218,10 +1680,8 @@ mod tests {
 
         // Project [s] (variable-width survives, fat `data` dropped).
         let proj_s_cols = vec![1usize];
-        let proj_s = provider
-            .scan(&state, Some(&proj_s_cols), &[], None)
-            .await?
-            .partition_statistics(None)?;
+        let proj_s_plan = provider.scan(&state, Some(&proj_s_cols), &[], None).await?;
+        let proj_s = StatisticsContext::new().compute(&*proj_s_plan, &StatisticsArgs::new())?;
         assert_eq!(
             proj_s.total_byte_size.get_value(),
             Some(&s_bytes),
@@ -1234,6 +1694,90 @@ mod tests {
                 .expect("projected total present")
                 < all_total,
             "projected total must drop the unprojected wide `data` column"
+        );
+
+        Ok(())
+    }
+
+    /// Footer eviction must not be conditional on this format owning a segment
+    /// cache. The two caches are independent — a format with no segment cache
+    /// still `put`s every footer it reads into the shared, process-wide
+    /// `FileMetadataCache` — so gating the eviction on the segment cache would
+    /// leave exactly those deployments unable to release anything.
+    ///
+    /// Also pins the blast radius: only the named paths are evicted.
+    #[tokio::test]
+    async fn invalidating_retired_paths_evicts_their_footers_with_no_segment_cache()
+    -> anyhow::Result<()> {
+        let ctx = TestSessionContext::default();
+        for table in ["retired", "live"] {
+            ctx.session
+                .sql(&format!(
+                    "CREATE EXTERNAL TABLE {table} (id INT NOT NULL) \
+                     STORED AS vortex LOCATION '{table}/'"
+                ))
+                .await?
+                .collect()
+                .await?;
+            ctx.session
+                .sql(&format!("INSERT INTO {table} VALUES (1), (2), (3)"))
+                .await?
+                .collect()
+                .await?;
+            // Reading is what caches the footers (`infer_schema` / `infer_stats`).
+            ctx.session
+                .sql(&format!("SELECT * FROM {table}"))
+                .await?
+                .collect()
+                .await?;
+        }
+
+        let runtime_env = ctx.session.runtime_env();
+        // `LOCATION 'retired/'` resolves against the process working directory,
+        // so match the table's own directory rather than a leading prefix.
+        let cached = |table: &str| {
+            let dir = format!("/{table}/");
+            runtime_env
+                .cache_manager
+                .get_file_metadata_cache()
+                .list_entries()
+                .into_keys()
+                .filter(|path| path.as_ref().contains(&dir))
+                .collect::<HashSet<Path>>()
+        };
+
+        let retired = cached("retired");
+        let live_before = cached("live");
+        assert!(
+            !retired.is_empty() && !live_before.is_empty(),
+            "reading both tables must cache both tables' footers"
+        );
+
+        let format =
+            VortexFormat::new_with_options(VortexSession::default(), VortexTableOptions::default());
+        assert_eq!(
+            format.segment_cache_capacity_bytes(),
+            None,
+            "this test's whole point is a format with no segment cache of its own"
+        );
+
+        // Retire through the entry point production uses, so a footer eviction
+        // reached only when a segment cache happens to exist fails here. The
+        // extra path was never cached — it stands in for a retirement reporting
+        // a file whose footer no scan ever read, which must pass harmlessly.
+        let mut to_retire = retired.clone();
+        to_retire.insert(Path::from("retired/never-opened.vortex"));
+        format
+            .invalidate_cached_paths(&runtime_env, "retired", to_retire)
+            .await;
+        assert!(
+            cached("retired").is_empty(),
+            "a retired file's footer must not survive its file, segment cache or not"
+        );
+        assert_eq!(
+            cached("live"),
+            live_before,
+            "a table nothing retired must keep every footer it had"
         );
 
         Ok(())
@@ -1270,6 +1814,8 @@ mod tests {
             write_concurrency,
             shard_key_columns: keys.iter().map(|s| (*s).to_string()).collect(),
             range_bounds,
+            run_sort_bytes: None,
+            range_bounds_estimated: false,
         })
     }
 
@@ -1329,19 +1875,37 @@ mod tests {
         }
     }
 
-    /// A composite key hashes: ordering it needs a lexicographic comparison the
-    /// range split does not implement.
+    /// A composite key with bounds range-splits on the leading column and keeps
+    /// every key column for a hash fallback. Ordering the full key would need a
+    /// lexicographic comparison the range split does not implement.
     #[test]
-    fn build_shard_spec_composite_key_with_bounds_still_hashes() {
+    fn build_shard_spec_composite_key_with_bounds_ranges_on_the_leading_column() {
         let schema = schema_with(&[
             ("k", arrow_schema::DataType::Int64),
             ("j", arrow_schema::DataType::Int64),
         ]);
         let bounds = vec![ScalarValue::Int64(Some(10))];
-        assert!(matches!(
-            shard_format_with_bounds(2, &["k", "j"], Some(bounds)).build_shard_spec(&schema, 8),
-            ShardSpec::Hash { .. }
-        ));
+        match shard_format_with_bounds(2, &["k", "j"], Some(bounds)).build_shard_spec(&schema, 8) {
+            ShardSpec::Range {
+                expr, hash_exprs, ..
+            } => {
+                assert!(
+                    expr.to_string().contains('k'),
+                    "range routing uses the leading shard key column, got {expr}"
+                );
+                assert_eq!(
+                    hash_exprs.len(),
+                    2,
+                    "the fallback must hash every shard key column"
+                );
+                let names: String = hash_exprs.iter().map(ToString::to_string).collect();
+                assert!(
+                    names.contains('k') && names.contains('j'),
+                    "hash exprs must reference both key columns, got: {names}"
+                );
+            }
+            other => panic!("expected Range on the leading column, got {other:?}"),
+        }
     }
 
     /// Without bounds a keyed write hashes, which is the behavior that predates
@@ -1374,7 +1938,9 @@ mod tests {
             ("payload", arrow_schema::DataType::Utf8),
         ]);
         match shard_format(4, &["w_id", "d_id"]).build_shard_spec(&schema, 8) {
-            ShardSpec::Hash { exprs, partitions } => {
+            ShardSpec::Hash {
+                exprs, partitions, ..
+            } => {
                 assert_eq!(partitions, 4);
                 assert_eq!(exprs.len(), 2, "composite key must hash both columns");
                 let names: String = exprs.iter().map(ToString::to_string).collect();

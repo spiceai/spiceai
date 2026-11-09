@@ -23,7 +23,7 @@ limitations under the License.
 //! entirely from in-memory manifest data: each cold file's persisted
 //! statistics blob yields a per-PK-column min/max hyper-rectangle, and a file
 //! is dirty iff any tombstoned key falls inside its rectangle. Cold files are
-//! Z-order clustered on the PK by default, so rectangles are tight and a
+//! curve-clustered on the PK by default, so rectangles are tight and a
 //! tombstone hits few files.
 //!
 //! When a file carries a per-file PK bloom (`ColdTierFile::pk_bloom`), a
@@ -51,7 +51,7 @@ use arrow_schema::Schema;
 use datafusion_common::ScalarValue;
 use datafusion_common::stats::Precision;
 
-use super::pk_index::PkBloom;
+use super::pk_index::{PkBloom, PkByteRange};
 use crate::metadata::ColdTierFile;
 use crate::row_converter::{Row, RowConverter};
 use crate::stats::statistics_from_persisted_blob;
@@ -317,6 +317,39 @@ fn pk_bounds_from_manifest(
     Some(bounds)
 }
 
+/// A cold file's single-column integer PK range in the row-converter byte
+/// encoding (see [`PkByteRange`]). `None` when the file has no usable
+/// statistics, the key is composite or not an integer, or a bound cannot be
+/// encoded, so the caller treats the file as always a candidate.
+pub(crate) fn pk_byte_range_from_manifest(
+    file: &ColdTierFile,
+    schema: &Arc<Schema>,
+    pk_indices: &[usize],
+    converter: &RowConverter,
+) -> Option<PkByteRange> {
+    let [idx] = pk_indices else {
+        return None;
+    };
+    if !schema.field(*idx).data_type().is_integer() {
+        return None;
+    }
+    let bounds = pk_bounds_from_manifest(file, schema, pk_indices)?;
+    let (min, max) = bounds.first()?;
+    if min.data_type() != *schema.field(*idx).data_type()
+        || max.data_type() != *schema.field(*idx).data_type()
+        || min.partial_cmp(max)?.is_gt()
+    {
+        return None;
+    }
+    let columns: Vec<ArrayRef> = vec![min.to_array().ok()?, max.to_array().ok()?];
+    let merged = arrow::compute::concat(&[columns[0].as_ref(), columns[1].as_ref()]).ok()?;
+    let rows = converter.convert_columns(&[merged]).ok()?;
+    Some(PkByteRange {
+        min: rows.row(0).data().to_vec().into_boxed_slice(),
+        max: rows.row(1).data().to_vec().into_boxed_slice(),
+    })
+}
+
 /// Whether a key tuple falls inside every per-column bound (point-in-
 /// hyper-rectangle). Incomparable values (type mismatch, NULL) count as
 /// "inside" — conservative dirty.
@@ -416,7 +449,7 @@ mod composite_key_tests {
 
     /// A cold manifest row whose stats blob (built with the PRODUCTION
     /// serializer) covers the given per-PK-column `[min, max]` ranges —
-    /// the Z-order shape of real promoted orderline files: a tight `ol_o_id`
+    /// the clustered shape of real promoted orderline files: a tight `ol_o_id`
     /// band while `w_id`/`d_id`/`number` span their full domains.
     fn cold_file(url: &str, o_id_range: (i64, i64)) -> ColdTierFile {
         let schema = orderline_schema();
@@ -515,7 +548,7 @@ mod composite_key_tests {
     #[test]
     fn orderline_delivery_tombstones_dirty_only_their_o_id_band() {
         // Three cold generations of orderline data, banded by ol_o_id (the
-        // realistic Z-order outcome for this key shape).
+        // realistic clustering outcome for this key shape).
         let files = vec![
             cold_file("f1", (1, 1000)),
             cold_file("f2", (1001, 2000)),

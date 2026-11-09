@@ -20,7 +20,7 @@ use runtime::dataconnector::parameters::RuntimeConnectorContext;
 use std::{sync::Arc, time::Duration};
 
 use async_trait::async_trait;
-use datafusion::{datasource::TableProvider, sql::TableReference};
+use datafusion::{common::TableReference, datasource::TableProvider};
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use serde_json::json;
 use snafu::{ResultExt, prelude::*};
@@ -40,6 +40,7 @@ use runtime::{
     dataconnector::{create_new_connector, parameters::ConnectorParamsBuilder},
     extension::{Error as ExtensionError, Extension, ExtensionFactory, ExtensionManifest, Result},
     federated::FederatedTable,
+    internal_table::{InternalAccelerationSource, internal_acceleration},
     spice_metrics::get_metrics_table_reference,
     status,
 };
@@ -89,6 +90,11 @@ pub enum Error {
         "Spice Cloud HTTP client not initialized. Ensure the extension is initialized before use."
     ))]
     ClientNotInitialized {},
+
+    #[snafu(display("Unable to configure the Spice Cloud metrics table: {source}"))]
+    UnableToCreateInternalSource {
+        source: runtime::internal_table::Error,
+    },
 
     #[snafu(display("Unable to build accelerated table: {source}"))]
     UnableToBuildAcceleratedTable {
@@ -174,7 +180,7 @@ impl SpiceExtension {
         runtime: Arc<Runtime>,
         from: String,
     ) -> Result<()> {
-        let retention = Retention::builder()
+        let retention = Retention::builder(get_metrics_table_reference().to_string())
             .time_column(Some("timestamp".to_string()))
             .time_format(Some(TimeFormat::UnixSeconds))
             .time_period(Some(Duration::from_mins(30))) // delete metrics older than 30 minutes
@@ -195,7 +201,7 @@ impl SpiceExtension {
             runtime.status(),
             metrics_table_reference.clone(),
             from.as_str(),
-            Acceleration::default(),
+            internal_acceleration(),
             refresh,
             retention,
             runtime.secrets(),
@@ -366,7 +372,7 @@ pub async fn create_synced_internal_accelerated_table(
     secrets: Arc<RwLock<Secrets>>,
     runtime: Arc<Runtime>,
 ) -> Result<Arc<AcceleratedTable>, Error> {
-    let ctx = Arc::clone(&runtime.datafusion().ctx);
+    let ctx = runtime.datafusion().internal_table_context();
     let source_table_provider = get_spiceai_table_provider(
         table_reference.table(),
         from,
@@ -375,6 +381,14 @@ pub async fn create_synced_internal_accelerated_table(
     )
     .await?;
     let federated_table = Arc::new(FederatedTable::new_unchecked(source_table_provider));
+    let source = InternalAccelerationSource::new(
+        &runtime,
+        table_reference.clone(),
+        acceleration.clone(),
+        Arc::clone(&secrets),
+    )
+    .await
+    .context(UnableToCreateInternalSourceSnafu)?;
 
     let accelerated_table_provider = accelerator_engine_registry
         .create_accelerator_table(
@@ -383,7 +397,7 @@ pub async fn create_synced_internal_accelerated_table(
             None,
             &acceleration,
             secrets,
-            None,
+            Some(&source),
             ctx,
         )
         .await
@@ -401,6 +415,7 @@ pub async fn create_synced_internal_accelerated_table(
     builder.cpu_runtime(runtime.datafusion().refresh_runtime().cloned());
 
     builder.retention(retention);
+    builder.node_local();
 
     let accelerated_table = builder
         .build()

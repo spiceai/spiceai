@@ -22,19 +22,24 @@ limitations under the License.
 //!   - Look up the source table schema (via the federated table) and hand everything
 //!     off to `data_components::postgres_replication::start_replication_stream`.
 
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 
+use crate::write_back::PG13_SERVER_VERSION_NUM;
 use async_stream::try_stream;
 use data_components::cdc::{AccelerationContents, ChangesStream, InitialSnapshotMode, StreamError};
 use data_components::postgres_replication::{
     AppliedLsn, AppliedLsnStore, NoopAppliedLsnStore, PgOutputFormat, RecordedPosition,
     ReplicationMetrics, ReplicationMetricsCollector, ReplicationParams, ReplicationStreamInput,
-    SchemaEvolutionPolicy, config, start_replication_stream,
+    SchemaEvolutionPolicy, UnusableReason, XactStatus, XidRegistry, config,
+    start_replication_stream,
 };
 use data_connector_api::federated::FederatedTableProvider;
 use data_connector_api::parameters::ConnectorContext;
-use datafusion::sql::TableReference;
+use datafusion::common::TableReference;
+use datafusion_table_providers::sql::db_connection_pool::postgrespool::PostgresConnectionPool;
+use datafusion_table_providers::util::column_reference::ColumnReference;
 use futures::StreamExt;
 use opentelemetry::KeyValue;
 use runtime_api_types::v1::ComponentType;
@@ -140,7 +145,7 @@ impl AppliedLsnStore for SidecarAppliedLsnStore {
                 streaming_from = %self.identity,
                 "this acceleration's recorded position belongs to a different source, so its contents cannot be resumed against this one; it will be rebuilt from the source"
             );
-            return Ok(RecordedPosition::ForeignSource);
+            return Ok(RecordedPosition::Unusable(UnusableReason::ForeignSource));
         }
         Ok(RecordedPosition::At(AppliedLsn { lsn: stored.lsn }))
     }
@@ -166,6 +171,269 @@ impl AppliedLsnStore for SidecarAppliedLsnStore {
     }
 }
 
+/// Load the outstanding-write-back-transaction registry for a dataset.
+///
+/// The registry persists into `spice_sys_postgres_write_back_xids`, a sibling of
+/// the applied-LSN watermark in the dataset's own accelerator, keyed by the same
+/// [`source_identity`] so a repointed accelerator discards a foreign set. This is
+/// the single construction site: the deliverer takes the returned `Arc`, and a
+/// follow-up can hand the *same* `Arc` to the replication member registration for
+/// the pump's echo filter.
+///
+/// Garbage collection runs separately — startup reconciliation in the caller's
+/// cache-miss path (see
+/// [`Postgres::write_back_xid_registry`](crate::Postgres::write_back_xid_registry)),
+/// repeated periodically by [`spawn_write_back_registry_reconciliation`] — never
+/// here, so a cached hit never repeats it.
+///
+/// # Errors
+///
+/// Returns an error if the connection params cannot be resolved, there is no
+/// usable accelerator connection to persist into, or the persisted registry
+/// cannot be loaded. Any of these means change-echo suppression cannot be set
+/// up for this dataset — the caller must fail dataset setup rather than fall
+/// back to unsuppressed delivery.
+pub(crate) async fn load_write_back_xid_registry(
+    params: &Parameters,
+    dataset: &DatasetSpec,
+    context: &dyn ConnectorContext,
+) -> Result<Arc<XidRegistry>, Box<dyn std::error::Error + Send + Sync>> {
+    let dataset_name = dataset.name.to_string();
+    let repl_params = replication_params_from_connector_params(params, &dataset_name)?;
+    let (schema_name, table_name) = split_schema_table(&dataset.from);
+    let identity = source_identity(&repl_params, &schema_name, &table_name);
+
+    let store = context
+        .blob_checkpoint_store(dataset, crate::write_back::WRITE_BACK_XID_TABLE)
+        .await
+        .ok_or(
+            "no usable accelerator connection to persist the change-echo suppression registry into",
+        )?;
+
+    Ok(XidRegistry::load(store, identity, dataset_name).await?)
+}
+
+/// Startup garbage collection for a freshly-loaded write-back registry.
+///
+/// Runs before the registry is shared with the delivery path or the pump;
+/// [`spawn_write_back_registry_reconciliation`] then repeats the reconciliation
+/// periodically for the life of the process. Resolves what the registry cannot
+/// on its own — each outstanding entry's `pg_xact_status` and the server's
+/// current transaction id — and hands them to [`XidRegistry::gc`] together with
+/// the dataset's durably-applied LSN, so an aborted delivery, a lost unregister,
+/// an entry from a rewound source, or an entry stranded far behind the server is
+/// dropped rather than lingering into a 32-bit xid wraparound.
+///
+/// # Errors
+///
+/// Returns an error if a connection cannot be opened, the server version cannot
+/// be read, or the current transaction id cannot be resolved. Each of these is
+/// an input `gc` needs to be sound, so the caller must not cache or activate an
+/// unvalidated registry on failure — running unreconciled would risk suppressing
+/// a genuine, unrelated transaction via a stale entry. A single entry's own
+/// `pg_xact_status` lookup failing is not one of these inputs: it degrades that
+/// one entry to [`XactStatus::Unknown`] and continues, since the epoch-distance
+/// safety valve still bounds it.
+pub(crate) async fn run_write_back_registry_gc(
+    pool: &Arc<PostgresConnectionPool>,
+    params: &Parameters,
+    dataset: &DatasetSpec,
+    context: &dyn ConnectorContext,
+    registry: &Arc<XidRegistry>,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    if registry.outstanding_xid8s().await.is_empty() {
+        // Nothing to reconcile, so skip the server and sidecar round trips.
+        return Ok(());
+    }
+
+    // The durably-applied LSN, so garbage collection can drop an entry whose echo
+    // the applied floor has provably consumed. An unresolvable watermark reads as
+    // 0, which only makes that one rule conservative (the aborted, rewind, and
+    // epoch-distance rules still apply).
+    let applied_lsn = resolve_applied_lsn(params, dataset, context).await;
+    reconcile_registry(pool, &dataset.name.to_string(), registry, applied_lsn).await
+}
+
+/// How often [`spawn_write_back_registry_reconciliation`]'s task re-runs
+/// reconciliation. The wraparound safety valve needs a pass to run well within
+/// the time the source takes to assign 2^31 transaction ids; at one hour the
+/// source would have to sustain ~600k write transactions per second to cross
+/// that between passes. A pass with nothing outstanding skips the server round
+/// trip entirely, so the steady-state cost of the cadence is a map lookup.
+const WRITE_BACK_REGISTRY_RECONCILE_INTERVAL: Duration = Duration::from_hours(1);
+
+/// Spawn the periodic re-run of write-back registry reconciliation for one
+/// dataset.
+///
+/// Startup reconciliation alone leaves a hole on a long-lived process: an entry
+/// whose delivery `COMMIT` failed ambiguously and actually aborted server-side
+/// has no observed commit LSN and no upper bound, so no steady-state prune ever
+/// removes it — only reconciliation against `pg_xact_status` does, and a process
+/// that never restarts would otherwise never repeat that. Left alone past ~2^31
+/// source transactions, the entry's low 32 bits collide with a fresh xid and
+/// suppress a genuine, unrelated change. The same cadence re-applies the rewind
+/// and epoch-distance rules.
+///
+/// The task holds only weak references, so it exits at its next tick once the
+/// connector (pool) or registry is gone, and keeps neither alive. The
+/// applied-LSN floor is passed as 0: resolving it needs the setup-time
+/// `ConnectorContext`, which cannot outlive setup, and 0 only makes the
+/// consumed rule conservative — consumed entries are already removed in steady
+/// state by `prune_acked`, while the rules this task exists for (aborted,
+/// rewind, epoch-distance) do not use the floor.
+pub(crate) fn spawn_write_back_registry_reconciliation(
+    pool: &Arc<PostgresConnectionPool>,
+    dataset_name: String,
+    registry: &Arc<XidRegistry>,
+) {
+    let pool = Arc::downgrade(pool);
+    let registry = Arc::downgrade(registry);
+    drop(tokio::spawn(async move {
+        let mut ticks = tokio::time::interval(WRITE_BACK_REGISTRY_RECONCILE_INTERVAL);
+        ticks.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        // The first tick resolves immediately, and startup reconciliation
+        // already ran; consume it so the first re-run is one interval out.
+        ticks.tick().await;
+        loop {
+            ticks.tick().await;
+            let (Some(pool), Some(registry)) = (pool.upgrade(), registry.upgrade()) else {
+                return;
+            };
+            if let Err(e) = reconcile_registry(&pool, &dataset_name, &registry, 0).await {
+                tracing::warn!(
+                    dataset = %dataset_name,
+                    error = %e,
+                    "Durable write-back for dataset '{dataset_name}' failed a periodic reconciliation of its change-echo suppression registry, so a stale entry may linger until the next pass or restart. Cause: {e}"
+                );
+            }
+        }
+    }));
+}
+
+/// One reconciliation pass: resolve every outstanding entry's `pg_xact_status`
+/// and the server's current transaction id, and hand them to
+/// [`XidRegistry::gc`] with the given durably-applied floor. Shared by startup
+/// ([`run_write_back_registry_gc`], which resolves the real floor) and the
+/// periodic task (which passes 0).
+async fn reconcile_registry(
+    pool: &Arc<PostgresConnectionPool>,
+    dataset_name: &str,
+    registry: &Arc<XidRegistry>,
+    applied_lsn: u64,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let outstanding = registry.outstanding_xid8s().await;
+    if outstanding.is_empty() {
+        // Nothing to reconcile, so skip the server round trip entirely.
+        return Ok(());
+    }
+
+    let db = pool.connect_direct().await?;
+
+    let server_version_num: i32 = db
+        .conn
+        .query_one("SELECT current_setting('server_version_num')::int4", &[])
+        .await?
+        .get(0);
+    // `pg_xact_status`/`pg_snapshot_xmax` are PG13+; PG10-12 use the `txid_*`
+    // equivalents (same semantics). `pg_snapshot_xmax` reads the current xid8
+    // without assigning one, so garbage collection never consumes an xid.
+    let pg13_plus = server_version_num >= PG13_SERVER_VERSION_NUM;
+    let (current_xid_sql, status_sql) = if pg13_plus {
+        (
+            "SELECT pg_snapshot_xmax(pg_current_snapshot())::text",
+            "SELECT pg_xact_status($1::text::xid8)::text",
+        )
+    } else {
+        (
+            "SELECT txid_snapshot_xmax(txid_current_snapshot())::text",
+            "SELECT txid_status($1::text::bigint)::text",
+        )
+    };
+
+    let current_xid8 = read_u64_text(&db.conn, current_xid_sql).await?;
+
+    let mut statuses: HashMap<u64, XactStatus> = HashMap::with_capacity(outstanding.len());
+    for xid8 in outstanding {
+        // Bind the id as its decimal text. The inner `::text` keeps the inferred
+        // parameter type `text` — the driver can encode a `String` as `text` but
+        // has no `xid8` (or, for the bound `String`, `bigint`) pairing, so an
+        // `xid8`/`bigint` parameter would be rejected client-side before the
+        // query ran — and the SQL side casts onward. The status likewise comes
+        // back as text.
+        let param = xid8.to_string();
+        let status = match db.conn.query_one(status_sql, &[&param]).await {
+            Ok(row) => {
+                let raw: Option<String> = row.get(0);
+                xact_status_from_text(raw.as_deref())
+            }
+            Err(e) => {
+                tracing::warn!(
+                    dataset = %dataset_name,
+                    xid8,
+                    error = %e,
+                    "durable write-back for dataset '{dataset_name}' could not read a transaction's status while garbage-collecting its change-echo suppression registry; that entry is left to the epoch-distance safety valve"
+                );
+                XactStatus::Unknown
+            }
+        };
+        statuses.insert(xid8, status);
+    }
+
+    registry.gc(&statuses, current_xid8, applied_lsn).await;
+    Ok(())
+}
+
+/// Read a single decimal `u64` returned as text (used for xid8 values, whose
+/// `FromSql` the driver does not provide).
+async fn read_u64_text(
+    conn: &tokio_postgres::Client,
+    sql: &str,
+) -> std::result::Result<u64, String> {
+    let row = conn.query_one(sql, &[]).await.map_err(|e| e.to_string())?;
+    let raw: String = row.get(0);
+    raw.trim().parse::<u64>().map_err(|e| e.to_string())
+}
+
+/// Map `pg_xact_status`/`txid_status` text to the registry's [`XactStatus`]. A
+/// NULL result (too old to resolve) is [`XactStatus::Unknown`], handled by the
+/// epoch-distance safety valve rather than the aborted rule.
+fn xact_status_from_text(status: Option<&str>) -> XactStatus {
+    match status {
+        Some("committed") => XactStatus::Committed,
+        Some("aborted") => XactStatus::Aborted,
+        Some("in progress") => XactStatus::InProgress,
+        _ => XactStatus::Unknown,
+    }
+}
+
+/// The dataset's durably-applied LSN, read from the same sidecar watermark the
+/// pump resumes from. Returns 0 when nothing durable is recorded (ephemeral
+/// accelerator, unreachable store, foreign source) — the conservative input for
+/// the applied-floor garbage-collection rule.
+async fn resolve_applied_lsn(
+    params: &Parameters,
+    dataset: &DatasetSpec,
+    context: &dyn ConnectorContext,
+) -> u64 {
+    let Ok(repl_params) =
+        replication_params_from_connector_params(params, &dataset.name.to_string())
+    else {
+        return 0;
+    };
+    let (schema_name, table_name) = split_schema_table(&dataset.from);
+    let Some(blobs) = resolve_watermark_store(context, dataset).await else {
+        return 0;
+    };
+    let store = SidecarAppliedLsnStore {
+        blobs,
+        identity: source_identity(&repl_params, &schema_name, &table_name),
+    };
+    match store.load().await {
+        Ok(RecordedPosition::At(applied)) => applied.lsn,
+        _ => 0,
+    }
+}
+
 /// `async` so the watermark store is resolved here, before the stream is built: the
 /// generator then holds only the resolved store, which owns a connection pool and no
 /// runtime and so cannot pin the runtime for as long as the stream lives.
@@ -176,6 +444,7 @@ pub async fn build_changes_stream(
     federated_table: Arc<dyn FederatedTableProvider>,
     metrics: Arc<ReplicationMetricsCollector>,
     acceleration: AccelerationContents,
+    write_back_registry: Option<Arc<XidRegistry>>,
 ) -> ChangesStream {
     let dataset_name = dataset.name.to_string();
     let (schema_name, table_name) = split_schema_table(&dataset.from);
@@ -206,8 +475,11 @@ pub async fn build_changes_stream(
         .as_ref()
         .is_some_and(accelerator_is_ephemeral);
     params_for_stream.ephemeral_accelerator = ephemeral;
-    // Observed by the runtime just before this stream was built, and only ever
-    // read to decide whether a *missing* watermark is evidence of a gap.
+    // Observed by the runtime just before this stream was built
+    // (`probe_acceleration_contents`). Read in both directions of the gap
+    // decision: against a *missing* watermark, only Empty licenses skipping
+    // the rebuild; against a *present*, usable one, only NonEmpty licenses
+    // the resume. Unknown (probe failed) rebuilds under its own cause.
     params_for_stream.acceleration = acceleration;
     if params_for_stream.initial_snapshot && ephemeral {
         params_for_stream.snapshot_on_resume = true;
@@ -249,12 +521,12 @@ pub async fn build_changes_stream(
         .map(|pk| pk.iter().map(ToString::to_string).collect())
         .unwrap_or_default();
 
-    // UPDATE events rely on `on_conflict: upsert` (or an upsert-dedup
-    // variant) to mutate the existing row in place, and the conflict target
-    // MUST match the dataset's primary key — otherwise the accelerator's
-    // write path falls through to append and silently inserts duplicate rows
-    // on every UPDATE. DuckDB / SQLite / Postgres / Cayenne all need this;
-    // the Arrow engine genuinely can't support upsert and is documented as
+    // UPDATE events must replace the row stored under the dataset's primary
+    // key — otherwise the accelerator's write path falls through to append and
+    // silently inserts duplicate rows on every UPDATE. Cayenne keeps one row per
+    // declared `primary_key` on its own; DuckDB / SQLite / Postgres
+    // also need an `on_conflict: upsert` (or upsert-dedup) entry keyed on it.
+    // The Arrow engine genuinely can't support upsert and is documented as
     // append-only for UPDATEs — skip the check there.
     let engine = dataset
         .acceleration
@@ -266,6 +538,8 @@ pub async fn build_changes_stream(
         runtime_component::dataset::acceleration::Engine::Arrow
             | runtime_component::dataset::acceleration::Engine::PartitionedArrow
     );
+    let keeps_one_row_per_key_alone =
+        engine == runtime_component::dataset::acceleration::Engine::Cayenne;
     // The on_conflict map is keyed on a ColumnReference (same type as
     // primary_key), so checking whether the PK has an Upsert entry is a
     // direct lookup. This is a much tighter check than "any value is
@@ -273,10 +547,11 @@ pub async fn build_changes_stream(
     // would previously pass and still let UPDATEs append duplicate rows.
     let has_upsert_on_pk = dataset.acceleration.as_ref().is_some_and(|a| {
         a.primary_key.as_ref().is_some_and(|pk| {
-            matches!(
-                a.on_conflict.get(pk),
-                Some(runtime_component::dataset::acceleration::OnConflictBehavior::Upsert(_))
-            )
+            keeps_one_row_per_key_alone
+                || matches!(
+                    a.on_conflict.get(pk),
+                    Some(runtime_component::dataset::acceleration::OnConflictBehavior::Upsert(_))
+                )
         })
     });
 
@@ -301,6 +576,8 @@ pub async fn build_changes_stream(
         }
     };
 
+    let missing_key_message = missing_primary_key_message(dataset);
+
     Box::pin(try_stream! {
         let table_provider = federated_table.table_provider().await;
         let schema = table_provider.schema();
@@ -320,30 +597,42 @@ pub async fn build_changes_stream(
             declared_pks.clone()
         };
 
-        // refresh_mode: changes is useless without a PK — DELETE and UPDATE
-        // require one to route the change to a row. Fail fast with a clear
-        // message instead of erroring cryptically later in the refresh loop.
+        // The dataset load normally rejects a table without a key first (see
+        // `changes_dataset_lacks_primary_key`); the stream still never starts
+        // without one.
         if primary_keys.is_empty() {
             Err(StreamError::External(format!(
-                "postgres replication for dataset `{dataset_name}`: no primary key available. \
-                 Set `acceleration.primary_key` on the dataset (and a matching \
-                 `acceleration.on_conflict` entry) — `refresh_mode: changes` cannot route \
-                 UPDATE/DELETE events without one."
+                "postgres replication for dataset `{dataset_name}`: {missing_key_message}"
             )))?;
         }
 
         // Now that primary_keys is resolved, report the upsert-config error
         // with a concrete PK hint. Two cases produce this error:
         //   1. `acceleration.primary_key` is set but `on_conflict` is missing
-        //      the Upsert entry keyed on the PK.
+        //      the Upsert entry keyed on the PK (never on Cayenne).
         //   2. `acceleration.primary_key` is unset (we're relying on the
         //      source table's PK), in which case the user must also set
         //      `acceleration.primary_key` — `on_conflict` can only be keyed
         //      on a ColumnReference, and acceleration's write path consults
         //      only its own `primary_key` / `on_conflict` config.
         if engine_supports_upsert && !has_upsert_on_pk {
-            let pk_hint = primary_keys.first().cloned().unwrap_or_else(|| "<pk>".to_string());
-            let msg = if declared_pks.is_empty() {
+            // Composite keys hint the full parenthesized column list — a
+            // single-column suggestion would mis-route UPDATE/DELETE events.
+            let pk_hint = match primary_keys.as_slice() {
+                [] => "<pk>".to_string(),
+                [single] => single.clone(),
+                composite => format!("({})", composite.join(", ")),
+            };
+            let msg = if declared_pks.is_empty() && keeps_one_row_per_key_alone {
+                format!(
+                    "postgres replication for dataset `{dataset_name}`: the source table's \
+                     primary key (`{pk_hint}`) is not declared on the dataset. \
+                     `refresh_mode: changes` requires `acceleration.primary_key: {pk_hint}` so \
+                     UPDATE events replace rows on the `{engine}` engine — without the \
+                     declaration, the accelerator's write path falls through to append and \
+                     produces duplicate rows."
+                )
+            } else if declared_pks.is_empty() {
                 format!(
                     "postgres replication for dataset `{dataset_name}`: the source table's \
                      primary key (`{pk_hint}`) is not declared on the dataset. \
@@ -377,6 +666,7 @@ pub async fn build_changes_stream(
             metrics,
             policy: schema_evolution_policy,
             applied_lsn_store,
+            write_back_registry,
         };
 
         let mut inner = start_replication_stream(input);
@@ -848,7 +1138,7 @@ fn accelerator_is_ephemeral(
         // `memory_mode` branch), so nothing about it survives a restart. Only its
         // file modes (local disk or S3 Express One Zone, both of which require a
         // file mode) persist independently of this process.
-        Engine::DuckDB | Engine::Sqlite | Engine::Turso | Engine::Cayenne => {
+        Engine::Sqlite | Engine::Cayenne => {
             matches!(acceleration.mode, Mode::Memory | Mode::FileCreate)
         }
         // External storage (another Postgres) persists independently of this
@@ -1109,6 +1399,59 @@ fn split_schema_table(from: &str) -> (String, String) {
     }
 }
 
+/// Whether `dataset` streams changes but has no key to route UPDATE and DELETE
+/// events by: no `acceleration.primary_key`, and no source primary key for the
+/// runtime to apply as one. `REPLICA IDENTITY FULL` does not supply a key — the
+/// full old row is not unique when the table holds identical rows.
+pub(crate) fn changes_dataset_lacks_primary_key(
+    dataset: &DatasetSpec,
+    provider: &Arc<dyn datafusion::datasource::TableProvider>,
+) -> bool {
+    let Some(acceleration) = dataset.acceleration.as_ref() else {
+        return false;
+    };
+    let schema = provider.schema();
+    acceleration.enabled
+        && acceleration.refresh_mode
+            == Some(runtime_component::dataset::acceleration::RefreshMode::Changes)
+        && acceleration
+            .primary_key
+            .as_ref()
+            .is_none_or(ColumnReference::is_empty)
+        && data_components::inferred_schema::InferredSchema::from_metadata(schema.metadata())
+            .primary_key
+            .is_empty()
+        && extract_primary_keys(provider).is_empty()
+}
+
+/// Where the replica identity and primary key requirements are documented.
+const CDC_DOCS: &str = "https://spiceai.org/docs/features/cdc/postgres-replication";
+
+/// The fix for [`changes_dataset_lacks_primary_key`]: a declared key, plus a
+/// replica identity that makes Postgres send that key's columns with every
+/// UPDATE and DELETE.
+pub(crate) fn missing_primary_key_message(dataset: &DatasetSpec) -> String {
+    use runtime_component::dataset::acceleration::Engine;
+    let (schema_name, table_name) = split_schema_table(&dataset.from);
+    let engine = dataset
+        .acceleration
+        .as_ref()
+        .map(|a| a.engine.to_unpartitioned())
+        .unwrap_or_default();
+    let on_conflict_note = match engine {
+        Engine::Cayenne | Engine::Arrow | Engine::PartitionedArrow => "",
+        _ => " with a matching `acceleration.on_conflict` upsert entry",
+    };
+    format!(
+        "Table `{schema_name}.{table_name}` has no primary key, and `refresh_mode: changes` needs \
+         one to apply UPDATE and DELETE events. Set `acceleration.primary_key` to the columns \
+         that identify a row{on_conflict_note}. Postgres sends those columns with every \
+         change only under `REPLICA IDENTITY FULL` (run \
+         `ALTER TABLE {schema_name}.{table_name} REPLICA IDENTITY FULL;`) or \
+         `REPLICA IDENTITY USING INDEX` on a unique index over them. See: {CDC_DOCS}"
+    )
+}
+
 fn extract_primary_keys(provider: &Arc<dyn datafusion::datasource::TableProvider>) -> Vec<String> {
     use datafusion::common::Constraint;
     let Some(constraints) = provider.constraints() else {
@@ -1271,12 +1614,16 @@ TXTE85+Or9IUwDI9543jsyCvuQ8=
         assert!(!ephemeral(Engine::Cayenne, Mode::File));
         assert!(!ephemeral(Engine::Cayenne, Mode::FileUpdate));
 
-        for engine in [Engine::DuckDB, Engine::Sqlite, Engine::Turso] {
-            assert!(ephemeral(engine, Mode::Memory), "{engine} memory");
-            assert!(ephemeral(engine, Mode::FileCreate), "{engine} file_create");
-            assert!(!ephemeral(engine, Mode::File), "{engine} file");
-            assert!(!ephemeral(engine, Mode::FileUpdate), "{engine} file_update");
-        }
+        assert!(ephemeral(Engine::Sqlite, Mode::Memory), "sqlite memory");
+        assert!(
+            ephemeral(Engine::Sqlite, Mode::FileCreate),
+            "sqlite file_create"
+        );
+        assert!(!ephemeral(Engine::Sqlite, Mode::File), "sqlite file");
+        assert!(
+            !ephemeral(Engine::Sqlite, Mode::FileUpdate),
+            "sqlite file_update"
+        );
 
         // Arrow is in-memory whatever `mode` says; Postgres is external storage.
         for mode in [Mode::Memory, Mode::File, Mode::FileCreate, Mode::FileUpdate] {

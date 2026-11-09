@@ -21,9 +21,9 @@ use async_trait::async_trait;
 use datafusion::arrow::datatypes::{Schema, SchemaRef};
 use datafusion::{
     catalog::CatalogProvider,
+    common::TableReference,
     common::{Statistics, stats::Precision},
     datasource::TableProvider,
-    sql::TableReference,
 };
 use datafusion_federation::FederatedTableProviderAdaptor;
 use spice_table::{LayerWalk, SpiceTable, TableLayer};
@@ -32,10 +32,12 @@ use spice_table::{LayerWalk, SpiceTable, TableLayer};
 /// defined, so connectors keep reaching them through this crate.
 pub use arrow_tools::metadata_keys::{
     CLUSTERING_KEY_METADATA_KEY, CLUSTERING_METADATA_KEY, DESCRIPTION_METADATA_KEY,
-    FOREIGN_KEYS_METADATA_KEY, INFERRED_COLUMN_STATS_METADATA_KEY, INFERRED_INDEXES_METADATA_KEY,
-    INFERRED_PRIMARY_KEY_METADATA_KEY, INFERRED_ROW_COUNT_METADATA_KEY,
-    INFERRED_SHARD_KEY_METADATA_KEY, INFERRED_SORT_COLUMNS_METADATA_KEY,
-    INFERRED_TABLE_BYTES_METADATA_KEY, PARTITION_METADATA_KEY, SOURCE_TYPE_METADATA_KEY,
+    FOREIGN_KEYS_METADATA_KEY, HTTP_RESPONSE_STATUS_METADATA_KEY,
+    HTTP_TRANSIENT_FAILURE_METRIC_NAME, INFERRED_COLUMN_STATS_METADATA_KEY,
+    INFERRED_INDEXES_METADATA_KEY, INFERRED_PRIMARY_KEY_METADATA_KEY,
+    INFERRED_ROW_COUNT_METADATA_KEY, INFERRED_SHARD_KEY_METADATA_KEY,
+    INFERRED_SORT_COLUMNS_METADATA_KEY, INFERRED_TABLE_BYTES_METADATA_KEY, PARTITION_METADATA_KEY,
+    SOURCE_TYPE_METADATA_KEY,
 };
 
 /// Metadata to merge into fields, keyed by field name.
@@ -52,19 +54,19 @@ pub mod debezium;
 pub mod debezium_kafka;
 #[cfg(feature = "delta_lake")]
 pub mod delta_lake;
-#[cfg(feature = "duckdb")]
-pub mod duckdb;
-#[cfg(feature = "duckdb")]
+#[cfg(feature = "adbc")]
 pub mod ducklake;
 #[cfg(feature = "elasticsearch")]
 pub mod elasticsearch;
-#[cfg(feature = "federation")]
 pub mod federation;
+pub mod file_schema_drift;
 pub mod flight;
 #[cfg(feature = "flightsql")]
 pub mod flightsql;
+pub mod fresh_file_listing;
 pub mod function_support;
 pub mod iceberg;
+pub mod incremental_append;
 pub mod inferred_schema;
 #[cfg(any(feature = "debezium", feature = "kafka"))]
 pub mod kafka;
@@ -99,8 +101,6 @@ pub mod spark_connect;
 pub mod spice_cloud;
 #[cfg(feature = "sqlite")]
 pub mod sqlite;
-#[cfg(feature = "turso")]
-pub mod turso;
 pub mod unity_catalog;
 
 pub mod catalog_filter;
@@ -109,6 +109,7 @@ pub mod pk_filter_expr;
 pub mod rate_limit;
 
 pub mod cdc;
+pub mod csv_header_projection;
 pub mod delete;
 pub mod http;
 pub mod index_maintenance;
@@ -247,11 +248,13 @@ impl TableLayer for MetadataEnrichedTableProvider {
         // Exhaustive on purpose: a wildcard would answer a future walk kind
         // for this layer without anyone deciding what it should say.
         match walk {
+            // Table and column descriptions change no row, column, or type.
             LayerWalk::Read
             | LayerWalk::CdcDetection
             | LayerWalk::Source
             | LayerWalk::RetentionDelete
-            | LayerWalk::Index => Some(below),
+            | LayerWalk::Index
+            | LayerWalk::Passthrough => Some(below),
             LayerWalk::Write => None,
         }
     }

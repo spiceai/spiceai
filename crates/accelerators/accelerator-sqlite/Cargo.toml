@@ -20,6 +20,7 @@ edition.workspace = true
 version.workspace = true
 rust-version.workspace = true
 license-file.workspace = true
+repository.workspace = true
 description = "SQLite data accelerator: implements data-accelerator-api::DataAccelerator over a SQLite table provider."
 
 [dependencies]
@@ -28,7 +29,7 @@ data_components = { path = "../../data_components", features = ["sqlite"] }
 runtime-acceleration = { path = "../../runtime-acceleration", features = ["sqlite"] }
 runtime-checkpoint-api = { path = "../../runtime-checkpoint-api" }
 runtime-checkpoint-sqlite = { path = "../../runtime-checkpoint-sqlite" }
-runtime-udfs-api = { path = "../../runtime-udfs-api" }
+runtime-datafusion = { path = "../../runtime-datafusion" }
 runtime-parameters = { path = "../../runtime-parameters" }
 runtime-table-partition = { path = "../../runtime-table-partition" }
 async-trait.workspace = true
@@ -44,10 +45,11 @@ spicepod = { path = "../../spicepod" }
 tracing.workspace = true
 rusqlite.workspace = true
 snafu.workspace = true
+util = { path = "../../util" }
 
 [dev-dependencies]
 runtime-acceleration = { path = "../../runtime-acceleration", features = ["sqlite", "test-support"] }
-datafusion-table-providers = { workspace = true, features = ["sqlite", "duckdb"] }
+datafusion-table-providers = { workspace = true, features = ["sqlite"] }
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
 
 [lints]

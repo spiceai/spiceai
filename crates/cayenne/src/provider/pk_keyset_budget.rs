@@ -58,15 +58,15 @@ static GLOBAL_PK_KEYSET_BUDGET: LazyLock<RwLock<Option<PkKeysetBudget>>> =
 /// arithmetic can be exercised on an instance: every reserve/release rule below
 /// is a property of this type, and testing it through the process-global static
 /// would make each assertion depend on whichever other test happens to be
-/// running beside it.
-#[derive(Debug)]
-struct PkKeysetBudget {
+/// running beside it. A clone shares the ceiling and its reservations.
+#[derive(Debug, Clone)]
+pub(crate) struct PkKeysetBudget {
     total: Arc<AtomicU64>,
     used: Arc<AtomicU64>,
 }
 
 impl PkKeysetBudget {
-    fn new(total: u64) -> Self {
+    pub(crate) fn new(total: u64) -> Self {
         Self {
             total: Arc::new(AtomicU64::new(total)),
             used: Arc::new(AtomicU64::new(0)),
@@ -77,8 +77,19 @@ impl PkKeysetBudget {
         self.total.load(Ordering::Relaxed)
     }
 
-    fn used(&self) -> u64 {
+    pub(crate) fn used(&self) -> u64 {
         self.used.load(Ordering::Relaxed)
+    }
+
+    /// Reserves `bytes` for a cache built before its table publishes it, so
+    /// the bytes count against the ceiling while it is built; `None` when they
+    /// do not fit. The reservation is returned when it drops.
+    #[must_use]
+    pub(crate) fn reserve(&self, bytes: u64) -> Option<KeysetReservation> {
+        self.try_reserve(bytes).then(|| KeysetReservation {
+            budget: self.clone(),
+            bytes,
+        })
     }
 
     /// See [`try_reserve_keyset_bytes`] for what this does and does not
@@ -122,6 +133,19 @@ impl PkKeysetBudget {
     }
 }
 
+/// Bytes [`PkKeysetBudget::reserve`] holds against a ceiling, returned on drop.
+#[derive(Debug)]
+pub(crate) struct KeysetReservation {
+    budget: PkKeysetBudget,
+    bytes: u64,
+}
+
+impl Drop for KeysetReservation {
+    fn drop(&mut self) {
+        self.budget.release(self.bytes);
+    }
+}
+
 /// Install the process-global keyset ceiling, or change an installed one. `0`
 /// removes it.
 ///
@@ -150,6 +174,12 @@ pub fn global_pk_keyset_total() -> Option<u64> {
         .read()
         .as_ref()
         .map(PkKeysetBudget::total)
+}
+
+/// The installed ceiling, sharing its reservations, or `None` when unset.
+#[must_use]
+pub(crate) fn global_pk_keyset_budget() -> Option<PkKeysetBudget> {
+    GLOBAL_PK_KEYSET_BUDGET.read().clone()
 }
 
 /// Aggregate keyset bytes currently reserved across every table.

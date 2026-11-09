@@ -28,10 +28,10 @@ use http::{
 use object_store::{
     ClientOptions, CopyOptions, GetOptions, GetResult, ListResult, MultipartUpload, ObjectMeta,
     ObjectStore, PutMultipartOptions, PutOptions, PutPayload, PutResult,
-    client::SpawnedReqwestConnector,
     http::{HttpBuilder, HttpStore},
     path::Path,
 };
+use object_store_spawn::SpawnedReqwestConnector;
 use serde::Deserialize;
 use snafu::prelude::*;
 use tokio::runtime::Handle;

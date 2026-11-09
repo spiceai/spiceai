@@ -17,6 +17,7 @@ limitations under the License.
 #![allow(clippy::missing_errors_doc)]
 
 use std::collections::HashSet;
+use std::time::Instant;
 use std::{collections::HashMap, sync::Arc};
 
 use super::embeddings::table::EmbeddingTable;
@@ -37,12 +38,12 @@ use cache::key::{CacheKey, RawCacheKey, SearchKey};
 use cache::result::CacheStatus;
 use cache::result::query::CachedStream;
 use cache::result::search::{CachedAggregationResult, CachedSearchResult};
-use cache::{Sizeable, TabledCacheProvider};
+use cache::{AsTableRefs, Sizeable, TabledCacheProvider};
 use datafusion::catalog::TableProvider;
+use datafusion::common::TableReference;
 use datafusion::common::{Column, DFSchema, SchemaError};
 use datafusion::error::DataFusionError;
 use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
-use datafusion::sql::TableReference;
 use datafusion_expr::Expr;
 use futures::StreamExt;
 use itertools::Itertools;
@@ -55,8 +56,6 @@ use runtime_request_context::{AsyncMarker, CacheControl, CacheKeyType, RequestCo
 use search::index::SearchIndex;
 use search::index::chunking::ChunkedSearchIndex;
 use search::index::compound::CompoundVectorIndex;
-#[cfg(feature = "duckdb")]
-use search::index::duckdb::DuckDBVectorIndex;
 use search::index::native_vector::NativeVectorIndex;
 #[cfg(feature = "s3_vectors")]
 use search::index::s3_vectors::S3Vector;
@@ -75,7 +74,7 @@ use crate::types::VectorSearchResult;
 pub struct SearchEngine<E: TableProviderExplorer> {
     pub df: Arc<dyn QueryEngine>,
 
-    explicit_primary_keys: HashMap<TableReference, Vec<String>>,
+    explicit_primary_keys: ExplicitPrimaryKeys,
 
     search_cache: Option<Arc<dyn TabledCacheProvider<CachedSearchResult> + Send + Sync>>,
 
@@ -85,7 +84,7 @@ pub struct SearchEngine<E: TableProviderExplorer> {
 impl<E: TableProviderExplorer> SearchEngine<E> {
     pub fn new(
         df: Arc<dyn QueryEngine>,
-        explicit_primary_keys: HashMap<TableReference, Vec<String>>,
+        explicit_primary_keys: ExplicitPrimaryKeys,
         explorer: E,
     ) -> Self {
         SearchEngine {
@@ -176,15 +175,11 @@ impl<E: TableProviderExplorer> SearchEngine<E> {
             }
         }
 
-        #[cfg(feature = "duckdb")]
-        {
-            use search::index::duckdb::DuckDBVectorIndex;
-            if let Some((indexes, _)) = self
-                .explorer
-                .find_index::<DuckDBVectorIndex>(&table_provider)
-            {
-                embedding_columns.extend(indexes.iter().map(|i| i.search_column()));
-            }
+        // A sidecar's Spice table is searched by the upstream that embeds it.
+        if embedding_columns.is_empty() {
+            embedding_columns.extend(crate::delegated::delegated_embedding_columns(
+                table_provider.as_ref(),
+            ));
         }
 
         Some(embedding_columns.into_iter().collect())
@@ -297,15 +292,6 @@ impl<E: TableProviderExplorer> SearchEngine<E> {
             return Some(Arc::new(index.clone()) as Arc<dyn SearchIndex>);
         }
 
-        #[cfg(feature = "duckdb")]
-        if let Some((indexes, _)) = self.explorer.find_index::<DuckDBVectorIndex>(tbl)
-            && let Some(index) = indexes
-                .into_iter()
-                .find(|idx| idx.search_column() == embedding_column)
-        {
-            return Some(Arc::new(index.clone()) as Arc<dyn SearchIndex>);
-        }
-
         if let Some((indexes, _)) = self.explorer.find_index::<CompoundVectorIndex>(tbl)
             && let Some(index) = indexes
                 .into_iter()
@@ -357,6 +343,19 @@ impl<E: TableProviderExplorer> SearchEngine<E> {
                 table_provider.as_ref(),
                 spice_table::LayerWalk::Read,
             ) else {
+                // `vector_search` over a sidecar's Spice table runs on the
+                // upstream that embeds the column.
+                if crate::delegated::delegated_embedding_columns(table_provider.as_ref())
+                    .iter()
+                    .any(|column| column == embedding_column)
+                {
+                    return Ok(Arc::new(VectorUDTFGeneration::new(
+                        &self.df,
+                        tbl,
+                        embedding_column,
+                        false,
+                    )));
+                }
                 return Err(Error::CannotVectorSearchDataset {
                     data_source: tbl.clone(),
                 });
@@ -489,9 +488,11 @@ impl<E: TableProviderExplorer> SearchEngine<E> {
                 } else {
                     None
                 };
+            // A client key partitions the search key; it never replaces it.
+            let search_cache_key = CacheKey::Search(&search_key);
             let cache_key = match scoped_user_cache_key.as_deref() {
-                Some(cache_key) => CacheKey::ClientSupplied(cache_key),
-                _ => CacheKey::Search(&search_key),
+                Some(cache_key) => CacheKey::ClientSupplied(cache_key, &search_cache_key),
+                _ => search_cache_key,
             };
 
             let raw_cache_key = {
@@ -500,15 +501,26 @@ impl<E: TableProviderExplorer> SearchEngine<E> {
                 cache_key.as_raw_key_in_namespace(cache_provider.hasher(), ns_tag, ns_id)
             };
 
-            match (
-                cache_control,
-                cache_provider.get_raw_key(&raw_cache_key.as_u64()).await,
-            ) {
-                (CacheControl::NoCache, _) => {
+            let cached = cache_provider
+                .get_raw_key_validated(&raw_cache_key.as_u64(), &|value| {
+                    !cache_provider.tables_changed_since(
+                        value.as_table_refs().as_ref(),
+                        value.read_started_at(),
+                    )
+                })
+                .await;
+            match (cache_control, cached) {
+                (CacheControl::NoCache | CacheControl::Revalidate(_), _) => {
                     tracing::trace!("Search cache bypass");
+                    let read_started_at = Instant::now();
                     let results = self.search(req).await?;
                     (
-                        wrap_cache_to_result(raw_cache_key, results, Arc::clone(&cache_provider)),
+                        wrap_cache_to_result(
+                            raw_cache_key,
+                            results,
+                            Arc::clone(&cache_provider),
+                            read_started_at,
+                        ),
                         CacheStatus::CacheBypass,
                     )
                 }
@@ -520,9 +532,15 @@ impl<E: TableProviderExplorer> SearchEngine<E> {
                     None,
                 ) => {
                     tracing::trace!("Search cache miss");
+                    let read_started_at = Instant::now();
                     let results = self.search(req).await?;
                     (
-                        wrap_cache_to_result(raw_cache_key, results, Arc::clone(&cache_provider)),
+                        wrap_cache_to_result(
+                            raw_cache_key,
+                            results,
+                            Arc::clone(&cache_provider),
+                            read_started_at,
+                        ),
                         CacheStatus::CacheMiss,
                     )
                 }
@@ -540,7 +558,7 @@ impl<E: TableProviderExplorer> SearchEngine<E> {
                         let result = AggregationResult {
                             data: Box::pin(CachedStream::new(
                                 Arc::clone(&cached_aggregation_result.records),
-                                Arc::clone(&cached_aggregation_result.schema),
+                                cached_aggregation_result.schema.arc(),
                             )),
                             primary_key: cached_aggregation_result.primary_keys.clone(),
                             data_columns: cached_aggregation_result.data_columns.clone(),
@@ -592,7 +610,7 @@ impl<E: TableProviderExplorer> SearchEngine<E> {
 
         let search_result = async {
             tracing::info!(target: "task_history", tables = tables.iter().join(","), limit = %limit, "labels");
-            let table_primary_keys = get_primary_keys_with_overrides(&self.df, &tables, &self.explicit_primary_keys)
+            let table_primary_keys = get_primary_keys_with_overrides(&self.df, &tables, &self.explicit_primary_keys.snapshot())
                 .await?;
 
             // Stringify the WHERE filter once; per-table work only rebinds it to each schema.
@@ -667,7 +685,7 @@ impl<E: TableProviderExplorer> SearchEngine<E> {
 
                     Ok((tbl.clone(), agg_result))
                 }
-            }).collect::<Vec<_>>()).await?.into_iter().filter_map(|(tbl, result)| Some((tbl, result?))).collect();
+            })).await?.into_iter().filter_map(|(tbl, result)| Some((tbl, result?))).collect();
 
             Ok(response)
 
@@ -753,6 +771,7 @@ fn wrap_cache_to_result(
     key: RawCacheKey,
     aggregation_result: HashMap<TableReference, AggregationResult>,
     cache_provider: Arc<dyn TabledCacheProvider<CachedSearchResult> + Send + Sync>,
+    read_started_at: Instant,
 ) -> HashMap<TableReference, AggregationResult> {
     // each hashmap entry is an aggregation result which contains a sendable record batch stream
     // for each table reference, we need to wrap the batch stream in another stream to pull out the record batches
@@ -807,7 +826,12 @@ fn wrap_cache_to_result(
                 yield batch_result;
             }
 
-            if records_size < cache_max_size {
+            // The compaction above cannot decouple every shape: a dictionary
+            // below the top level has no copy at all, so an entry over it would
+            // pin the producer's allocation while being billed only for the
+            // buffers it declares. The SQL results cache declines such a result
+            // at its own admission; this one has the same budget to keep.
+            if records_size < cache_max_size && cache::batches_boundable(&records) {
                 let cached_result = CachedAggregationResult::new(
                     records,
                     cloned_primary_key,
@@ -857,13 +881,22 @@ fn wrap_cache_to_result(
 
         tracing::trace!("Caching search results for key: {}", key.as_u64());
 
-        let result = CachedSearchResult {
-            results: Arc::new(results),
-            input_tables: Arc::new(expected_keys),
-        };
+        let result = CachedSearchResult::new(
+            Arc::new(results),
+            Arc::new(expected_keys.clone()),
+            read_started_at,
+        );
 
         if result.get_memory_size() > cache_provider.max_size() {
             tracing::trace!("Search results exceed cache size, not caching");
+            return;
+        }
+
+        // A table invalidation that landed after this search began must not
+        // publish a stale result (the gate alone only orders concurrent inserts
+        // against the scan, not work that started earlier and finishes later).
+        if cache_provider.tables_changed_since(&expected_keys, read_started_at) {
+            tracing::trace!("Skipping search cache put; a table changed since the search began");
             return;
         }
 
@@ -909,6 +942,49 @@ async fn get_primary_keys_with_overrides(
         }
     }
     Ok(tbl_to_pks)
+}
+
+/// The primary keys that the installed app declares for its datasets and views (`row_id`).
+/// Clones share one set, which [`Self::update`] replaces when the app changes.
+#[derive(Clone, Debug, Default)]
+pub struct ExplicitPrimaryKeys(Arc<std::sync::RwLock<HashMap<TableReference, Vec<String>>>>);
+
+impl ExplicitPrimaryKeys {
+    /// Replaces the keys with those of the app in `app`.
+    pub async fn update(&self, app: Arc<tokio::sync::RwLock<Option<Arc<app::App>>>>) {
+        let keys = parse_explicit_primary_keys(app).await;
+        *self
+            .0
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = keys;
+    }
+
+    #[must_use]
+    pub fn get(&self, table: &TableReference) -> Option<Vec<String>> {
+        self.read().get(table).cloned()
+    }
+
+    #[must_use]
+    pub fn snapshot(&self) -> HashMap<TableReference, Vec<String>> {
+        self.read().clone()
+    }
+
+    #[must_use]
+    pub fn ptr_eq(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.0, &other.0)
+    }
+
+    fn read(&self) -> std::sync::RwLockReadGuard<'_, HashMap<TableReference, Vec<String>>> {
+        self.0
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+}
+
+impl From<HashMap<TableReference, Vec<String>>> for ExplicitPrimaryKeys {
+    fn from(keys: HashMap<TableReference, Vec<String>>) -> Self {
+        Self(Arc::new(std::sync::RwLock::new(keys)))
+    }
 }
 
 /// Compute the primary keys for each table in the app.

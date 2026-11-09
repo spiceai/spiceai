@@ -18,7 +18,7 @@ limitations under the License.
 //! firing on `Inner`-joins above the 10M-row build-side threshold.
 //!
 //! When the same-source inner-join build side exceeds
-//! [`crate::ANTI_JOIN_SORT_MERGE_MIN_EXACT_ROWS`] (10M), the rewriter at
+//! [`crate::ANTI_JOIN_SORT_MERGE_MIN_ROWS`] (10M), the rewriter at
 //! `crates/cayenne/src/optimizer_rules.rs:360-430` replaces the
 //! `HashJoinExec` with `SortMergeJoinExec` + explicit `SortExec` inputs on
 //! both sides. The rationale is correctness/safety: `HashJoinExec`'s build
@@ -40,10 +40,9 @@ limitations under the License.
 //! ~72M at SF100, `catalog_sales` ~14M at SF10, `inventory` ~117M at SF10),
 //! so the rewriter fires on most fact-side inner joins at production scale
 //! factors. End-to-end TPC-DS-on-Cayenne shows substantial query-time and
-//! memory regressions as a result. The `pairs.yaml` testoperator manifest
-//! at `tools/testoperator/dispatch/perf-cayenne-vs-duckdb/` carries the
-//! end-to-end benchmark; this Criterion bench is the focused per-rule
-//! reproducer.
+//! memory regressions as a result. The TPC-DS Cayenne Spicepods under
+//! `test/spicepods/tpcds/` carry the end-to-end benchmark; this Criterion
+//! bench is the focused per-rule reproducer.
 //!
 //! ## What this bench measures
 //!
@@ -51,9 +50,9 @@ limitations under the License.
 //! aggregating the row count. The only difference is the preloaded table
 //! size:
 //!
-//! - `below_threshold/<N>` for `N < ANTI_JOIN_SORT_MERGE_MIN_EXACT_ROWS` —
+//! - `below_threshold/<N>` for `N < ANTI_JOIN_SORT_MERGE_MIN_ROWS` —
 //!   the rule does not fire; `HashJoinExec` runs unchanged.
-//! - `above_threshold/<N>` for `N > ANTI_JOIN_SORT_MERGE_MIN_EXACT_ROWS` —
+//! - `above_threshold/<N>` for `N > ANTI_JOIN_SORT_MERGE_MIN_ROWS` —
 //!   the rule fires; `SortMergeJoinExec` with `SortExec` inputs runs
 //!   instead.
 //!
@@ -96,7 +95,7 @@ use tempfile::TempDir;
 use tokio::runtime::Runtime;
 
 /// Just below the rewriter's 10M-row gate
-/// (`ANTI_JOIN_SORT_MERGE_MIN_EXACT_ROWS`).
+/// (`ANTI_JOIN_SORT_MERGE_MIN_ROWS`).
 const BELOW_THRESHOLD_ROWS: usize = 5_000_000;
 /// Just above the rewriter's 10M-row gate — small margin so the data-size
 /// delta vs the below-lane is modest.

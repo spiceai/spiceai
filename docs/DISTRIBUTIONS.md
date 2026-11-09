@@ -15,7 +15,7 @@ The Spice open source project provides multiple distribution variants to support
 | macOS    | aarch64 (Apple Silicon) | Native (build host)                    | —                   |
 | Windows  | x86_64 (MSVC)           | —                                      | MSVC toolchain      |
 
-> **Note:** Open source Windows support is CLI (`spice`) only. The runtime daemon (`spiced`) is not supported on Windows natively in open source builds — use WSL instead. Native Windows runtime support is available with managed enterprise deployments.
+> **Note:** Windows support is CLI (`spice`) only. The runtime daemon (`spiced`) does not build for native Windows: run it under WSL or in Docker, and use the Windows CLI against it.
 
 ## Distribution Availability
 
@@ -28,6 +28,7 @@ The Spice open source project provides multiple distribution variants to support
 | CUDA (Linux)            | Nightly only     | ✅           | ✅          |
 | Allocator variants      | Nightly only     | ✅           | ✅          |
 | ODBC connector          | Local build only | ✅           | ✅          |
+| ScyllaDB connector      | Local build only | ✅           | ✅          |
 | Acceleration snapshots  | Local build only | ✅           | ✅          |
 | HTTP function servers   | Local build only | ✅           | ✅          |
 | WASM user functions     | Local build only | ✅           | ✅          |
@@ -48,6 +49,7 @@ The default distribution includes the standard data and AI/ML feature set. This 
 
 **Not included by default:**
 
+- ODBC (`odbc`), Elasticsearch (`elasticsearch`), NFS (`nfs`), and ScyllaDB (`scylladb`) data connectors
 - Acceleration snapshots (`snapshots` feature)
 - HTTP-backed function servers (`http-functions` feature)
 - WebAssembly user-defined functions (`wasm-functions` feature; Rust source compilation additionally requires `wasm-functions-compile`)
@@ -76,7 +78,7 @@ The data distribution excludes AI/ML model support, resulting in a smaller binar
 
 **Included Features:**
 
-- All data connectors
+- The default distribution's data connectors, minus ADBC (`adbc` feature)
 - All data accelerators
 - Acceleration snapshots in Cloud Platform and Enterprise distributions; local open source builds can enable this with the `snapshots` feature
 - Default memory allocator (snmalloc)
@@ -185,6 +187,13 @@ Alternative allocator that may perform better for certain memory allocation patt
 docker pull ghcr.io/spiceai/spiceai-nightly:latest-jemalloc
 ```
 
+**Heap profiling:** the shipped jemalloc build has the heap profiler compiled out; build with `alloc-jemalloc-profiling` to turn the profiler on. jemalloc is built under the `_rjem_` prefix, so it reads `_RJEM_MALLOC_CONF`, not `MALLOC_CONF`:
+
+```bash
+make install SPICED_NON_DEFAULT_FEATURES="alloc-jemalloc-profiling"
+_RJEM_MALLOC_CONF=prof:true,prof_final:true,prof_prefix:/tmp/spiced.prof spiced
+```
+
 ### mimalloc
 
 Microsoft's mimalloc allocator, designed for performance and security.
@@ -213,9 +222,9 @@ docker pull ghcr.io/spiceai/spiceai-nightly:latest-sysalloc
 | Linux aarch64                 | ✅       | Nightly         | Nightly         | ❌     | ❌               |
 | macOS aarch64 (Apple Silicon) | ✅       | Nightly         | Nightly         | ✅     | ❌               |
 | Windows (WSL)                 | ✅       | Nightly         | Nightly         | ❌     | Nightly         |
-| Windows (Native)              | ❌       | Enterprise only | Enterprise only | ❌     | Enterprise only |
+| Windows (Native)              | ❌       | ❌               | ❌               | ❌     | ❌               |
 
-> **Note:** Native Windows support for the Spice runtime is available with the [Spice Cloud Platform](https://spice.ai/pricing) and [Spice.ai Enterprise](https://docs.spice.ai/docs/enterprise). Open source users on Windows should use Windows Subsystem for Linux (WSL).
+> **Note:** The Spice runtime does not run natively on Windows in any distribution. On Windows, run it under Windows Subsystem for Linux (WSL) or in Docker, and use the Windows `spice` CLI against it.
 
 ## Choosing a Distribution
 
@@ -230,14 +239,16 @@ docker pull ghcr.io/spiceai/spiceai-nightly:latest-sysalloc
 
 ## Additional Connectors
 
-Some connectors require additional dependencies and are available with the [Spice Cloud Platform](https://spice.ai/pricing) and [Spice.ai Enterprise](https://docs.spice.ai/docs/enterprise):
+Some connectors are outside the default distribution and are available with the [Spice Cloud Platform](https://spice.ai/pricing) and [Spice.ai Enterprise](https://docs.spice.ai/docs/enterprise):
 
 - **ODBC** - Connect to any ODBC-compatible data source
+- **ScyllaDB** - Query ScyllaDB keyspaces over CQL
 
-These can be built locally for development and testing:
+Either can be built locally for development and testing:
 
 ```bash
-make install-odbc
+make install-odbc      # ODBC
+make install-scylladb  # ScyllaDB
 ```
 
 ## Enterprise Features
@@ -249,7 +260,6 @@ The following features are available with the [Spice Cloud Platform](https://spi
 - **Function Servers** - Run HTTP-backed user-defined scalar and table functions from `functions:` declarations. The default open source distribution supports inline SQL functions only; local builds can enable HTTP-backed function servers with `http-functions`.
 - **WASM Functions** - Run sandboxed WebAssembly table functions from `functions:` declarations using Arrow IPC batches as the data ABI. Local open source builds can enable precompiled modules with `wasm-functions`; compiling Rust sources to WASM at startup additionally requires `wasm-functions-compile`.
 - **OIDC Token Verification** - Validate identity tokens from enterprise providers (Okta, Azure AD, Auth0, Google, etc.) for secure access to Spice runtime endpoints.
-- **Native Windows Runtime Support** - Run `spiced` natively on Windows in managed enterprise deployments. Open source users on Windows should use WSL.
 
 ### Linux arm64 Notes
 
@@ -283,6 +293,9 @@ SPICED_NON_DEFAULT_FEATURES="snapshots" make install
 
 # Build with globally persisted HTTP rate-control state
 SPICED_NON_DEFAULT_FEATURES="rate-control" make install
+
+# Build with the ScyllaDB data connector
+SPICED_NON_DEFAULT_FEATURES="scylladb" make install
 
 # Build with non-default features added to defaults
 SPICED_NON_DEFAULT_FEATURES="odbc" make install

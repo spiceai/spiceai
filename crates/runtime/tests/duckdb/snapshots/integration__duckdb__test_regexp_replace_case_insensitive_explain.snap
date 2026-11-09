@@ -1,16 +1,13 @@
 ---
 source: crates/runtime/tests/duckdb/mod.rs
-expression: pretty
+expression: stable_plan(&explain_plan)
 ---
-+---------------+------------------------------------------------------------------------------------------------------------------------------------------------------------------+
-| plan_type     | plan                                                                                                                                                             |
-+---------------+------------------------------------------------------------------------------------------------------------------------------------------------------------------+
-| logical_plan  | Federated                                                                                                                                                        |
-|               |  Projection: regexp_replace(csv_test.region, Utf8("america"), Utf8("australia"), Utf8("i"))                                                                      |
-|               |   TableScan: csv_test projection=[region]                                                                                                                        |
-| physical_plan | SchemaCastScanExec                                                                                                                                               |
-|               |   CooperativeExec                                                                                                                                                |
-|               |     BytesProcessedExec                                                                                                                                           |
-|               |       VirtualExecutionPlan name=duckdb compute_context=:memory: base_sql=SELECT regexp_replace("csv_test"."region", 'america', 'australia', 'i') FROM "csv_test" |
-|               |                                                                                                                                                                  |
-+---------------+------------------------------------------------------------------------------------------------------------------------------------------------------------------+
+logical_plan: Projection: regexp_replace(csv_test.region, Utf8("america"), Utf8("australia"), Utf8("i"))
+logical_plan:   Federated
+logical_plan:  Projection: csv_test.region
+logical_plan:   TableScan: csv_test projection=[region]
+physical_plan: ProjectionExec: expr=[regexp_replace(region@0, america, australia, i) as regexp_replace(csv_test.region,Utf8("america"),Utf8("australia"),Utf8("i"))]
+physical_plan:   RepartitionExec: partitioning=RoundRobinBatch(3), input_partitions=1
+physical_plan:     SchemaCastScanExec
+physical_plan:       BytesProcessedExec
+physical_plan:         VirtualExecutionPlan name=adbc compute_context=<id> base_sql=SELECT "<duckdb_view>"."region" FROM "<duckdb_view>"

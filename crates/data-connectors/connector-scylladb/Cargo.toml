@@ -20,6 +20,7 @@ edition.workspace = true
 version.workspace = true
 rust-version.workspace = true
 license-file.workspace = true
+repository.workspace = true
 description = "ScyllaDB data connector for Spice.ai runtime"
 
 [dependencies]
@@ -45,6 +46,7 @@ default = []
 
 [dev-dependencies]
 runtime = { path = "../../runtime" }
+tokio.workspace = true
 
 [lints]
 workspace = true

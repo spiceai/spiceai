@@ -1,0 +1,18 @@
+---
+source: crates/test-framework/src/spicetest/datasets/worker.rs
+description: "Query: tpcds_q30"
+---
++------------------+--------------+--------------+-------------+-----------------------+-------------+---------------+--------------+--------------------+---------+------------------------------------+-----------------------+------------------+
+| c_customer_id    | c_salutation | c_first_name | c_last_name | c_preferred_cust_flag | c_birth_day | c_birth_month | c_birth_year | c_birth_country    | c_login | c_email_address                    | c_last_review_date_sk | ctr_total_return |
++------------------+--------------+--------------+-------------+-----------------------+-------------+---------------+--------------+--------------------+---------+------------------------------------+-----------------------+------------------+
+| AAAAAAAAAAAAMBAA | Ms.          | Karen        | Flowers     | N                     | 28          | 1             | 1984         | TOKELAU            |         | Karen.Flowers@o7gcmDkX8r9UTjr9.edu | 2452325               | 6815.13          |
+| AAAAAAAAAAAIDAAA | Miss         | Kathryn      | Kennedy     | Y                     | 18          | 2             | 1929         | RUSSIAN FEDERATION |         | Kathryn.Kennedy@Keq3U5XSJQCG.edu   | 2452430               | 4937.69          |
+| AAAAAAAAAAAILBAA | Mrs.         | Nancy        |             | Y                     |             | 4             |              | ECUADOR            |         |                                    |                       | 3666.06          |
+| AAAAAAAAAAAMABAA | Dr.          | Jimmie       | Hernandez   | N                     | 19          | 10            | 1987         | PALAU              |         | Jimmie.Hernandez@ScsOYe2G.com      | 2452583               | 3165.50          |
+| AAAAAAAAAAAMNBAA | Dr.          | Lee          | Singer      | N                     | 13          | 5             | 1982         | CANADA             |         | Lee.Singer@uMv.org                 | 2452578               | 3119.52          |
+| AAAAAAAAAAANKBAA |              | Manuel       | Furman      | N                     | 18          |               | 1948         |                    |         | Manuel.Furman@zpkB9ryF3e2Yblr.com  |                       | 11025.28         |
+| AAAAAAAAAAAOIAAA | Dr.          | Jessica      | Ellis       | N                     | 10          | 2             | 1991         | PAKISTAN           |         | Jessica.Ellis@NT1q3o2d0ZV9aU.org   | 2452357               | 3277.00          |
+| AAAAAAAAAABFGAAA | Mr.          | Chad         | Andersen    | Y                     | 9           | 7             | 1948         | FAROE ISLANDS      |         | Chad.Andersen@H3P9NngO1uq.edu      | 2452402               | 2581.88          |
+| AAAAAAAAAABFGAAA | Mr.          | Chad         | Andersen    | Y                     | 9           | 7             | 1948         | FAROE ISLANDS      |         | Chad.Andersen@H3P9NngO1uq.edu      | 2452402               | 3354.10          |
+| AAAAAAAAAABFNBAA | Miss         | Debra        | Valdez      | Y                     | 1           | 7             | 1951         | BENIN              |         | Debra.Valdez@7.com                 | 2452445               | 6274.45          |
++------------------+--------------+--------------+-------------+-----------------------+-------------+---------------+--------------+--------------------+---------+------------------------------------+-----------------------+------------------+

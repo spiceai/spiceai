@@ -68,8 +68,11 @@ runs:
           VERSION="v${VERSION}"
         fi
 
-        # Strip leading 'v' for filename
-        FILE_VERSION="${VERSION#v}"
+        # Tag without leading 'v' is what `protoc --version` prints (libprotoc 28.0-rc1).
+        # The zip filename uses a different RC spelling (28.0-rc-1). Keep them apart:
+        # FILE_VERSION is for assets and the cache path only.
+        REPORTED_VERSION="${VERSION#v}"
+        FILE_VERSION="${REPORTED_VERSION}"
 
         # Handle rc releases (e.g. 28.0rc1 or 28.0-rc1 -> 28.0-rc-1)
         if [[ "${FILE_VERSION}" == *rc* ]]; then
@@ -108,43 +111,158 @@ runs:
           exit 1
         fi
 
+        # Install into the per-agent tool cache, never into a shared $HOME path.
+        # Two self-hosted agents on one Mac both run as `runner`, so they share
+        # /Users/runner/.local/bin/protoc. Concurrent `unzip -o` onto that file is
+        # what Info-ZIP reports as "write error (disk full?)" + fchmod EBADF and a
+        # truncated binary, even when the volume has hundreds of GiB free
+        # (https://github.com/spiceai/spiceai/actions/runs/34808408443/job/103865050346
+        # overlapped Build (release) on spiceai-macos-mbp-runner-03-02 writing the
+        # same path).
+        if [ -n "${RUNNER_TOOL_CACHE:-}" ]; then
+          INSTALL_DIR="${RUNNER_TOOL_CACHE}/protoc/${FILE_VERSION}/${ARCH_SUFFIX}"
+        else
+          INSTALL_DIR="${HOME}/.local/protoc/${FILE_VERSION}/${ARCH_SUFFIX}-${RUNNER_NAME:-shared}"
+        fi
+        PROTOC_BIN="${INSTALL_DIR}/bin/protoc"
+        STAGING_ROOT="${RUNNER_TEMP:-${TMPDIR:-/tmp}}"
+        mkdir -p "${STAGING_ROOT}"
+
+        protoc_version_ok() {
+          local bin="$1"
+          [ -x "${bin}" ] || return 1
+          local got
+          got="$("${bin}" --version 2>/dev/null | awk '{print $NF}')"
+          [ "${got}" = "${REPORTED_VERSION}" ]
+        }
+
+        publish_protoc() {
+          echo "${INSTALL_DIR}/bin" >> "${GITHUB_PATH}"
+          echo "protoc installed: ${PROTOC_BIN} (${VERSION})"
+          "${PROTOC_BIN}" --version
+        }
+
+        if protoc_version_ok "${PROTOC_BIN}"; then
+          echo "protoc ${VERSION} already present at ${PROTOC_BIN}; skipping download."
+          publish_protoc
+          exit 0
+        fi
+
         echo "Downloading protoc ${VERSION}: ${DOWNLOAD_URL}"
         echo "Expected SHA256: ${EXPECTED_SHA256}"
+        echo "Install dir: ${INSTALL_DIR}"
 
-        INSTALL_DIR="${HOME}/.local"
-        mkdir -p "${INSTALL_DIR}"
+        download_and_verify() {
+          local zip="$1"
+          curl -fsSL --retry 5 --retry-delay 2 -o "${zip}" "${DOWNLOAD_URL}"
+          local actual
+          if command -v sha256sum &>/dev/null; then
+            actual=$(sha256sum "${zip}" | awk '{print $1}')
+          else
+            actual=$(shasum -a 256 "${zip}" | awk '{print $1}')
+          fi
+          if [ "${actual}" != "${EXPECTED_SHA256}" ]; then
+            echo "SHA256 mismatch for ${FILENAME}" >&2
+            echo "  Expected: ${EXPECTED_SHA256}" >&2
+            echo "  Actual:   ${actual}" >&2
+            return 1
+          fi
+          echo "SHA256 verified: ${actual}"
+        }
 
-        TEMP_ZIP="$(mktemp)"
-        curl -fsSL -o "${TEMP_ZIP}" "${DOWNLOAD_URL}"
+        extract_to() {
+          local zip="$1"
+          local dest="$2"
+          if command -v python3 &>/dev/null; then
+            python3 - "${zip}" "${dest}" <<'PY'
+        import sys, zipfile
+        with zipfile.ZipFile(sys.argv[1]) as zf:
+            zf.extractall(sys.argv[2])
+        PY
+          else
+            unzip -qo "${zip}" -d "${dest}"
+          fi
+        }
 
-        # Validate SHA256
-        if command -v sha256sum &>/dev/null; then
-          ACTUAL_SHA256=$(sha256sum "${TEMP_ZIP}" | awk '{print $1}')
-        else
-          # macOS uses shasum
-          ACTUAL_SHA256=$(shasum -a 256 "${TEMP_ZIP}" | awk '{print $1}')
-        fi
+        extract_atomically() {
+          local zip="$1"
+          local staging replacing old
+          # Called from `cmd && extract_atomically`, which suppresses `set -e`
+          # inside this function. A failed mktemp then leaves staging empty and
+          # Python extractall("") unpacks into the checkout.
+          if ! staging="$(mktemp -d "${STAGING_ROOT}/protoc-extract.XXXXXX")"; then
+            echo "::warning::failed to create staging directory under ${STAGING_ROOT}"
+            return 1
+          fi
+          if [ -z "${staging}" ] || [ ! -d "${staging}" ]; then
+            echo "::warning::mktemp returned an unusable staging path '${staging}'"
+            return 1
+          fi
+          if ! extract_to "${zip}" "${staging}"; then
+            echo "::warning::failed extracting ${FILENAME} into ${staging}"
+            df -h "${STAGING_ROOT}" "${HOME}" / 2>/dev/null || df -h
+            rm -rf "${staging}"
+            return 1
+          fi
+          if [ ! -f "${staging}/bin/protoc" ]; then
+            echo "extract did not produce ${staging}/bin/protoc" >&2
+            rm -rf "${staging}"
+            return 1
+          fi
+          chmod +x "${staging}/bin/protoc"
+          mkdir -p "$(dirname "${INSTALL_DIR}")"
+          replacing="${INSTALL_DIR}.new.$$"
+          old="${INSTALL_DIR}.old.$$"
+          rm -rf "${replacing}" "${old}"
+          mv "${staging}" "${replacing}"
+          if [ -e "${INSTALL_DIR}" ]; then
+            mv "${INSTALL_DIR}" "${old}" || true
+          fi
+          if ! mv "${replacing}" "${INSTALL_DIR}"; then
+            # Another process won the replace; keep a working dest if it is already good.
+            rm -rf "${replacing}"
+            if [ -f "${INSTALL_DIR}/bin/protoc" ]; then
+              rm -rf "${old}"
+              return 0
+            fi
+            if [ -e "${old}" ]; then
+              mv "${old}" "${INSTALL_DIR}" || true
+            fi
+            return 1
+          fi
+          rm -rf "${old}"
+        }
 
-        if [ "${ACTUAL_SHA256}" != "${EXPECTED_SHA256}" ]; then
-          echo "SHA256 mismatch for ${FILENAME}" >&2
-          echo "  Expected: ${EXPECTED_SHA256}" >&2
-          echo "  Actual:   ${ACTUAL_SHA256}" >&2
+        success=0
+        for attempt in 1 2 3; do
+          # `set -e` is still on in this loop. A failed mktemp here used to abort
+          # the action before the three attempts and the final `df -h`.
+          if ! TEMP_ZIP="$(mktemp "${STAGING_ROOT}/protoc.XXXXXX")"; then
+            echo "::warning::protoc install attempt ${attempt}/3 failed: could not create temp zip under ${STAGING_ROOT}"
+            sleep $((attempt * 2))
+            continue
+          fi
+          if download_and_verify "${TEMP_ZIP}" && extract_atomically "${TEMP_ZIP}"; then
+            rm -f "${TEMP_ZIP}"
+            if protoc_version_ok "${PROTOC_BIN}"; then
+              success=1
+              break
+            fi
+            echo "::warning::protoc at ${PROTOC_BIN} did not report version ${REPORTED_VERSION} after extract"
+          else
+            echo "::warning::protoc install attempt ${attempt}/3 failed"
+          fi
           rm -f "${TEMP_ZIP}"
+          sleep $((attempt * 2))
+        done
+
+        if [ "${success}" -ne 1 ]; then
+          echo "::error::Failed to install protoc ${VERSION} after 3 attempts"
+          df -h "${STAGING_ROOT}" "${HOME}" / 2>/dev/null || df -h
           exit 1
         fi
-        echo "SHA256 verified: ${ACTUAL_SHA256}"
 
-        unzip -q -o "${TEMP_ZIP}" -d "${INSTALL_DIR}"
-        rm -f "${TEMP_ZIP}"
-
-        # Ensure the binary is executable
-        chmod +x "${INSTALL_DIR}/bin/protoc"
-
-        # Add to PATH for subsequent steps
-        echo "${INSTALL_DIR}/bin" >> "${GITHUB_PATH}"
-
-        echo "protoc installed: ${INSTALL_DIR}/bin/protoc (${VERSION})"
-        "${INSTALL_DIR}/bin/protoc" --version
+        publish_protoc
 
     - name: Determine version and download protoc (Windows)
       if: runner.os == 'Windows'
@@ -184,8 +302,11 @@ runs:
           $Version = "v$Version"
         }
 
-        # Strip leading 'v' for filename
-        $FileVersion = $Version.TrimStart("v")
+        # Tag without leading 'v' is what `protoc --version` prints (libprotoc 28.0-rc1).
+        # The zip filename uses a different RC spelling (28.0-rc-1). Keep them apart:
+        # $FileVersion is for assets and the cache path only.
+        $ReportedVersion = $Version.TrimStart("v")
+        $FileVersion = $ReportedVersion
 
         # Handle rc releases
         $FileVersion = $FileVersion -replace "-?rc(\d+)$", "-rc-`$1"
@@ -217,28 +338,77 @@ runs:
         }
         $ExpectedSha256 = $asset.digest -replace '^sha256:', ''
 
+        if (-not [string]::IsNullOrEmpty($env:RUNNER_TOOL_CACHE)) {
+          $InstallDir = Join-Path $env:RUNNER_TOOL_CACHE "protoc\$FileVersion\$ArchSuffix"
+        } else {
+          $suffix = if ($env:RUNNER_NAME) { $env:RUNNER_NAME } else { "shared" }
+          $InstallDir = Join-Path $env:USERPROFILE ".local\protoc\$FileVersion\$ArchSuffix-$suffix"
+        }
+        $ProtocBin = Join-Path $InstallDir "bin\protoc.exe"
+
+        function Test-ProtocVersion {
+          param([string]$Bin)
+          if (-not (Test-Path $Bin)) { return $false }
+          try {
+            $got = (& $Bin --version | Out-String).Trim().Split()[-1]
+            return $got -eq $ReportedVersion
+          } catch {
+            return $false
+          }
+        }
+
+        if (Test-ProtocVersion $ProtocBin) {
+          Write-Host "protoc ${Version} already present at ${ProtocBin}; skipping download."
+          "$InstallDir\bin" | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+          Write-Host "protoc installed: $ProtocBin ($Version)"
+          & $ProtocBin --version
+          return
+        }
+
         Write-Host "Downloading protoc ${Version}: ${DownloadUrl}"
         Write-Host "Expected SHA256: ${ExpectedSha256}"
+        Write-Host "Install dir: ${InstallDir}"
 
-        $InstallDir = "$env:USERPROFILE\.local\protoc"
-        New-Item -ItemType Directory -Force -Path $InstallDir | Out-Null
+        $stagingRoot = if ($env:RUNNER_TEMP) { $env:RUNNER_TEMP } else { $env:TEMP }
+        $success = $false
+        foreach ($attempt in 1, 2, 3) {
+          try {
+            $TempZip = Join-Path $stagingRoot ("protoc-" + [guid]::NewGuid().ToString() + ".zip")
+            Invoke-WebRequest -Uri $DownloadUrl -OutFile $TempZip
 
-        $TempZip = [System.IO.Path]::GetTempFileName() + ".zip"
-        Invoke-WebRequest -Uri $DownloadUrl -OutFile $TempZip
+            $ActualSha256 = (Get-FileHash -Path $TempZip -Algorithm SHA256).Hash.ToLower()
+            if ($ActualSha256 -ne $ExpectedSha256) {
+              throw "SHA256 mismatch for ${Filename}: expected ${ExpectedSha256}, got ${ActualSha256}"
+            }
+            Write-Host "SHA256 verified: ${ActualSha256}"
 
-        # Validate SHA256
-        $ActualSha256 = (Get-FileHash -Path $TempZip -Algorithm SHA256).Hash.ToLower()
-        if ($ActualSha256 -ne $ExpectedSha256) {
-          Remove-Item -Force $TempZip
-          throw "SHA256 mismatch for ${Filename}: expected ${ExpectedSha256}, got ${ActualSha256}"
+            $staging = Join-Path $stagingRoot ("protoc-extract-" + [guid]::NewGuid().ToString())
+            New-Item -ItemType Directory -Force -Path $staging | Out-Null
+            Expand-Archive -Path $TempZip -DestinationPath $staging -Force
+            if (-not (Test-Path (Join-Path $staging "bin\protoc.exe"))) {
+              throw "extract did not produce bin\protoc.exe"
+            }
+            New-Item -ItemType Directory -Force -Path (Split-Path $InstallDir) | Out-Null
+            if (Test-Path $InstallDir) {
+              Remove-Item -Recurse -Force $InstallDir
+            }
+            Move-Item -Path $staging -Destination $InstallDir
+            Remove-Item -Force $TempZip
+            if (Test-ProtocVersion $ProtocBin) {
+              $success = $true
+              break
+            }
+            Write-Host "::warning::protoc at $ProtocBin did not report version $ReportedVersion after extract"
+          } catch {
+            Write-Host "::warning::protoc install attempt ${attempt}/3 failed: $_"
+            Start-Sleep -Seconds (2 * $attempt)
+          }
         }
-        Write-Host "SHA256 verified: ${ActualSha256}"
 
-        Expand-Archive -Path $TempZip -DestinationPath $InstallDir -Force
-        Remove-Item -Force $TempZip
+        if (-not $success) {
+          throw "Failed to install protoc ${Version} after 3 attempts"
+        }
 
-        # Add to PATH for subsequent steps
         "$InstallDir\bin" | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
-
-        Write-Host "protoc installed: $InstallDir\bin\protoc.exe ($Version)"
-        & "$InstallDir\bin\protoc.exe" --version
+        Write-Host "protoc installed: $ProtocBin ($Version)"
+        & $ProtocBin --version

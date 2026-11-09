@@ -1,0 +1,53 @@
+name: sql-surface-known
+description: >
+  Generated documented-SQL cases with reproduced errors or schema mismatches.
+  These cases remain executable until their tracked failures are resolved.
+
+sources:
+  lake: { kind: files }
+
+spicepod:
+  version: v1
+  kind: Spicepod
+  name: sql-surface-known
+  # Keep floating aggregate evaluation stable across independent requests.
+  runtime:
+    cpu: { cores: 1 }
+  datasets:
+    - from: 'file://${sources.lake.path}/t/'
+      name: t
+      params: { file_format: parquet }
+    - from: 'file://${sources.lake.path}/u/'
+      name: u
+      params: { file_format: parquet }
+
+steps:
+  - generate:
+      lake:
+        table: t
+        rows: 400
+        seed: 31
+        files: 4
+        columns:
+          - { name: id, sequence: 1 }
+          - { name: i, int: [-50, 50], nulls: 0.1 }
+          - { name: big, bigint: [0, 10000000000] }
+          - { name: d, decimal: { range: [-100, 100], scale: 2 } }
+          - { name: f, float: [0, 50] }
+          - { name: s, choice: [apple, Apple, "O'Brien", naïve, '', b], nulls: 0.1 }
+          - { name: dt, date: ['2024-01-01', '2024-12-31'] }
+          - { name: ts, timestamp: ['2024-01-01', '2024-12-31'] }
+          - { name: b, bool: 0.33 }
+  - generate:
+      lake:
+        table: u
+        rows: 150
+        seed: 32
+        columns:
+          - { name: id, sequence: 1 }
+          - { name: t_id, int: [1, 440] }
+          - { name: label, choice: [red, blue, green] }
+  - start: {}
+  - corpus: ../../corpus/sql-surface-known.sql
+    protocols: [flightsql, http]
+    expect: {}

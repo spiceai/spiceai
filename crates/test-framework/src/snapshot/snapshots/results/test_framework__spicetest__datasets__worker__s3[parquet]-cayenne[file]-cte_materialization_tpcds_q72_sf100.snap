@@ -1,0 +1,18 @@
+---
+source: crates/test-framework/src/spicetest/datasets/worker.rs
+description: "Query: tpcds_q72"
+---
++-------------+----------------------+------------+----------+-------+-----------+
+| i_item_desc | w_warehouse_name     | d_week_seq | no_promo | promo | total_cnt |
++-------------+----------------------+------------+----------+-------+-----------+
+|             | Social, royal laws m | 5213       | 0        | 11    | 11        |
+|             | Terms overcome instr | 5214       | 0        | 10    | 10        |
+|             | Certainly fede       | 5203       | 0        | 9     | 9         |
+|             | New, sudden          | 5200       | 0        | 9     | 9         |
+|             | Operations wo        | 5204       | 0        | 9     | 9         |
+|             | Well local pr        | 5198       | 0        | 9     | 9         |
+|             |                      | 5213       | 0        | 9     | 9         |
+|             | Conventional childr  | 5202       | 0        | 8     | 8         |
+|             | Inappropriate, p     | 5210       | 0        | 8     | 8         |
+|             | New, possib          | 5202       | 0        | 8     | 8         |
++-------------+----------------------+------------+----------+-------+-----------+

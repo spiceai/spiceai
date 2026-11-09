@@ -17,7 +17,7 @@ limitations under the License.
 //! Path-asserted subset vs full current-snapshot small-file compaction (P1-1).
 //!
 //! - **Subset**: PK + `DeletionMode::Key` + `max_files_per_pick` proper subset.
-//! - **Full**: append-only (position strategy) always rewrites the whole snapshot.
+//! - **Subset**: append-only (position strategy) while it holds no position deletes.
 
 #![allow(clippy::expect_used)]
 use std::sync::Arc;
@@ -136,7 +136,7 @@ async fn probe_subset_path() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn probe_full_path_append_only() {
+async fn probe_subset_path_append_only() {
     let temp = tempfile::tempdir().expect("tmp");
     let data_path = temp.path().join("data");
     tokio::fs::create_dir_all(&data_path).await.expect("dir");
@@ -177,7 +177,7 @@ async fn probe_full_path_append_only() {
         insert(&table, batch(i * 1500, 1500)).await;
     }
     for _ in 0..50 {
-        if table.last_small_file_compact_path() == LastSmallFileCompactPath::Full {
+        if table.last_small_file_compact_path() == LastSmallFileCompactPath::Subset {
             break;
         }
         let _ = table.maybe_compact_small_files().await.expect("compact");
@@ -185,6 +185,6 @@ async fn probe_full_path_append_only() {
     }
     assert_eq!(
         table.last_small_file_compact_path(),
-        LastSmallFileCompactPath::Full
+        LastSmallFileCompactPath::Subset
     );
 }

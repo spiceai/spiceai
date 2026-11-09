@@ -33,6 +33,15 @@ pub struct Rows {
 }
 
 impl Rows {
+    /// Heap capacity retained by the encoded bytes and row offsets.
+    pub(crate) fn allocated_bytes(&self) -> usize {
+        self.buffer.capacity().saturating_add(
+            self.offsets
+                .capacity()
+                .saturating_mul(std::mem::size_of::<usize>()),
+        )
+    }
+
     /// Borrow row `i`.
     ///
     /// # Panics

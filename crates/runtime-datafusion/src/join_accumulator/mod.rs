@@ -1156,7 +1156,7 @@ mod tests {
     use arrow::datatypes::{DataType, Field, Schema};
     use datafusion::common::Column;
     use datafusion::physical_plan::expressions::col;
-    use datafusion_pruning::{PruningPredicate, PruningStatistics};
+    use datafusion_pruning::{PruningPredicateBuilder, PruningStatistics};
     use std::sync::Mutex;
 
     static INLIST_MEMORY_TEST_LOCK: Mutex<()> = Mutex::new(());
@@ -1632,7 +1632,9 @@ mod tests {
             .expect("Should update second range");
 
         let physical_expr = range_bounds.physical_expr(left_expr);
-        let pruning_predicate = PruningPredicate::try_new(physical_expr, Arc::clone(&schema))
+        let pruning_predicate = PruningPredicateBuilder::new()
+            .with_file_schema(Arc::clone(&schema))
+            .try_build(physical_expr)
             .expect("Range fallback should produce a pruning predicate");
         let pruning_stats = TestPruningStats {
             min_values: Arc::new(UInt64Array::from(vec![0, 30, 105, 200])) as ArrayRef,

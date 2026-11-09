@@ -293,6 +293,82 @@ fn bench_upsert_operation(c: &mut Criterion) {
     group.finish();
 }
 
+// Benchmark: a small upsert into a large table with no conflicting key. This is the
+// shape of every write to an append-mostly keyed table such as the task history, where
+// a write's cost grew with the rows the table already held.
+fn bench_upsert_small_batch_into_large_table(c: &mut Criterion) {
+    const INSERTED_ROWS: usize = 512;
+
+    let mut group = c.benchmark_group("upsert_small_batch_into_large_table");
+    group.sample_size(20);
+    let rt = tokio::runtime::Runtime::new().expect("Failed to create runtime");
+
+    for existing_rows in [10_000, 100_000, 500_000] {
+        let (initial_batch, schema) = create_test_batch(existing_rows);
+        let insert_ids: Vec<String> = (existing_rows..existing_rows + INSERTED_ROWS)
+            .map(|i| format!("id_{i:05}"))
+            .collect();
+        let insert_values: Vec<String> = (0..INSERTED_ROWS).map(|i| format!("value_{i}")).collect();
+        let insert_batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![
+                Arc::new(StringArray::from(insert_ids)),
+                Arc::new(StringArray::from(insert_values)),
+            ],
+        )
+        .expect("Failed to create insert batch");
+
+        group.bench_with_input(
+            BenchmarkId::new("existing_rows", existing_rows),
+            &existing_rows,
+            |b, _| {
+                // Building the table validates every existing key, which is not the
+                // write being measured, so it happens in setup.
+                b.iter_batched(
+                    || {
+                        let table = rt.block_on(async {
+                            MemTable::try_new(
+                                Arc::clone(&schema),
+                                vec![vec![initial_batch.clone()]],
+                            )
+                            .expect("Failed to create table")
+                            .try_with_constraints(Constraints::new_unverified(vec![
+                                Constraint::PrimaryKey(vec![0]),
+                            ]))
+                            .await
+                            .expect("Failed to set constraints")
+                            .with_on_conflict(
+                                OnConflict::try_from("upsert:id").expect("create on_conflict"),
+                            )
+                        });
+                        (table, SessionContext::new())
+                    },
+                    |(table, ctx)| {
+                        rt.block_on(async {
+                            let exec = Arc::new(MockExec::new(
+                                vec![Ok(insert_batch.clone())],
+                                Arc::clone(&schema),
+                            ));
+                            let insertion = table
+                                .insert_into(&ctx.state(), exec, InsertOp::Append)
+                                .await
+                                .expect("Failed to create insertion plan");
+                            black_box(
+                                collect(insertion, ctx.task_ctx())
+                                    .await
+                                    .expect("Failed to execute"),
+                            );
+                        });
+                    },
+                    criterion::BatchSize::PerIteration,
+                );
+            },
+        );
+    }
+
+    group.finish();
+}
+
 criterion_group!(
     benches,
     bench_check_unique_constraint,
@@ -300,5 +376,6 @@ criterion_group!(
     bench_filter_existing,
     bench_insert_with_primary_key,
     bench_upsert_operation,
+    bench_upsert_small_batch_into_large_table,
 );
 criterion_main!(benches);

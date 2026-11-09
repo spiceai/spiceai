@@ -1,0 +1,24 @@
+{
+  "scope": "Offline structural validation against CRDs rendered from the pinned operator chart. No Kubernetes API server, admission webhook, image pull, identity provider, or Enterprise runtime was contacted. Nested Spicepod uses preserve-unknown-fields and needs separate runtime validation.",
+  "rendered_resources": 9,
+  "crds": [
+    "SpicepodSet",
+    "SpicepodCluster"
+  ],
+  "results": [
+    {
+      "file": "spicepodcluster.template.json",
+      "schema_kind": "SpicepodCluster",
+      "api_version": "spice.ai/v2",
+      "valid": true,
+      "errors": []
+    },
+    {
+      "file": "spicepodset.template.json",
+      "schema_kind": "SpicepodSet",
+      "api_version": "spice.ai/v2",
+      "valid": true,
+      "errors": []
+    }
+  ]
+}

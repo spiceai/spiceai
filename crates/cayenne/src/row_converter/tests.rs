@@ -27,13 +27,13 @@ use std::sync::Arc;
 
 use arrow::array::{
     Array, ArrayRef, BinaryArray, BinaryViewArray, BooleanArray, Date32Array, Date64Array,
-    Decimal128Array, Decimal256Array, FixedSizeBinaryArray, Float32Array, Float64Array, Int8Array,
-    Int16Array, Int32Array, Int64Array, LargeBinaryArray, LargeStringArray, StringArray,
-    StringViewArray, Time32SecondArray, Time64NanosecondArray, TimestampMicrosecondArray,
-    UInt8Array, UInt16Array, UInt32Array, UInt64Array,
+    Decimal128Array, Decimal256Array, Float32Array, Float64Array, Int8Array, Int16Array,
+    Int32Array, Int64Array, LargeBinaryArray, LargeStringArray, StringArray, StringViewArray,
+    Time32SecondArray, Time64NanosecondArray, TimestampMicrosecondArray, UInt8Array, UInt16Array,
+    UInt32Array, UInt64Array,
 };
 use arrow::datatypes::{DataType, i256};
-use arrow_schema::SortOptions;
+use arrow_schema::{ArrowError, SortOptions};
 
 use super::{OwnedRow, RowConverter, RowFormatVersion, Rows, SortField};
 
@@ -58,7 +58,7 @@ fn assert_matches_arrow_row_opts(columns: &[ArrayRef], options: SortOptions) {
     )
     .expect("arrow-row converter builds");
 
-    let our_rows = ours.convert_columns(columns).expect("vendored encode");
+    let mut our_rows = ours.convert_columns(columns).expect("vendored encode");
     let their_rows = theirs.convert_columns(columns).expect("arrow-row encode");
 
     let num_rows = match columns.first() {
@@ -85,6 +85,128 @@ fn assert_matches_arrow_row_opts(columns: &[ArrayRef], options: SortOptions) {
             reencoded.row(i).as_ref(),
             "round-trip changed row {i} for {data_types:?}"
         );
+    }
+
+    // Stale bytes must not survive in null payloads or variable-width padding.
+    // Exercise the reuse path against Arrow's independent encoder for every
+    // type and sort option covered by this helper.
+    our_rows.buffer.fill(0xa5);
+    let reused = ours
+        .convert_columns_reusing(columns, Some(our_rows))
+        .expect("encode with reused buffers");
+    assert_eq!(reused.num_rows(), num_rows);
+    for i in 0..num_rows {
+        assert_eq!(
+            reused.row(i).as_ref(),
+            their_rows.row(i).data(),
+            "reused row {i} differs from arrow-row for {data_types:?} with {options:?}"
+        );
+    }
+}
+
+/// Reusing a scratch must reuse its allocation, not merely produce equal bytes.
+///
+/// Every other test here compares encoded bytes, which an implementation that
+/// dropped the scratch and encoded into fresh buffers would satisfy too. The
+/// scratch here comes from a larger batch, so it carries more capacity than the
+/// smaller batch needs, while a fresh encode sizes its buffers to the batch.
+/// Capacity is tracked by the `Vec` rather than the allocator, so the check holds
+/// even when an allocator hands a just-freed block straight back.
+#[test]
+fn reusing_a_scratch_keeps_its_allocation() {
+    let converter = RowConverter::new(vec![SortField::new(DataType::Int64)]).expect("converter");
+    let large: ArrayRef = Arc::new(Int64Array::from_iter_values(0..4096_i64));
+    let small: ArrayRef = Arc::new(Int64Array::from_iter_values(0..512_i64));
+
+    let scratch = converter
+        .convert_columns(&[large])
+        .expect("encode the larger batch");
+    let buffer_ptr = scratch.buffer.as_ptr();
+    let buffer_capacity = scratch.buffer.capacity();
+    let offsets_capacity = scratch.offsets.capacity();
+
+    let reused = converter
+        .convert_columns_reusing(&[Arc::clone(&small)], Some(scratch))
+        .expect("encode the smaller batch into the scratch");
+    let fresh = converter
+        .convert_columns(&[small])
+        .expect("encode the smaller batch into fresh buffers");
+
+    assert!(
+        fresh.buffer.capacity() < buffer_capacity,
+        "precondition: the smaller batch must need less capacity than the scratch holds"
+    );
+    assert_eq!(
+        reused.buffer.capacity(),
+        buffer_capacity,
+        "the byte buffer must keep the scratch's allocation"
+    );
+    assert_eq!(
+        reused.offsets.capacity(),
+        offsets_capacity,
+        "the offset buffer must keep the scratch's allocation"
+    );
+    assert_eq!(
+        reused.buffer.as_ptr(),
+        buffer_ptr,
+        "the byte buffer must not move"
+    );
+    assert_eq!(
+        reused.buffer, fresh.buffer,
+        "reuse must not change the encoded bytes"
+    );
+    assert_eq!(
+        reused.offsets, fresh.offsets,
+        "reuse must not change the row boundaries"
+    );
+}
+
+#[test]
+fn reused_rows_match_arrow_across_changing_batches() {
+    let converter = RowConverter::new(vec![
+        SortField::new(DataType::Int64),
+        SortField::new(DataType::Utf8),
+    ])
+    .expect("composite converter");
+    let reference = arrow_row::RowConverter::new(vec![
+        arrow_row::SortField::new(DataType::Int64),
+        arrow_row::SortField::new(DataType::Utf8),
+    ])
+    .expect("reference converter");
+    let mut scratch = None;
+    for count in [129, 1, 0, 257, 63, 8, 65, 0, 129] {
+        let ids: ArrayRef = Arc::new(
+            (0..count + 3)
+                .map(|i| if i % 3 == 0 { None } else { Some(i64::from(i)) })
+                .collect::<Int64Array>(),
+        );
+        let strings: ArrayRef = Arc::new(
+            (0..count + 3)
+                .map(|i| match i % 4 {
+                    0 => None,
+                    1 => Some(""),
+                    2 => Some("short"),
+                    _ => Some(LONG),
+                })
+                .collect::<StringArray>(),
+        );
+        let count = usize::try_from(count).expect("nonnegative batch size");
+        let columns = [ids.slice(3, count), strings.slice(3, count)];
+        let rows = converter
+            .convert_columns_reusing(&columns, scratch.take())
+            .expect("reuse across changing batch sizes");
+        let expected = reference.convert_columns(&columns).expect("reference rows");
+        assert_eq!(rows.num_rows(), count);
+        for i in 0..count {
+            assert_eq!(rows.row(i).as_ref(), expected.row(i).data());
+        }
+        let decoded = converter
+            .convert_rows(rows.iter())
+            .expect("decode reused rows");
+        for (actual, expected) in decoded.iter().zip(&columns) {
+            assert_eq!(actual.as_ref(), expected.as_ref());
+        }
+        scratch = Some(rows);
     }
 }
 
@@ -330,28 +452,15 @@ fn unsupported_primary_key_types_error() {
             true,
         ))),
     ] {
+        let Err(err) = RowConverter::new(vec![SortField::new(dt.clone())]) else {
+            panic!("expected {dt:?} to be rejected");
+        };
+        let expected = format!("cayenne row_converter: unsupported primary key type: {dt}");
         assert!(
-            RowConverter::new(vec![SortField::new(dt.clone())]).is_err(),
-            "expected {dt:?} to be rejected"
+            matches!(&err, ArrowError::NotYetImplemented(message) if *message == expected),
+            "{dt:?}: {err:?}"
         );
     }
-}
-
-#[test]
-fn unsupported_type_does_not_reach_arrow_row() {
-    // Sanity: FixedSizeBinary is a valid arrow-row type but is not a Cayenne PK type, so we
-    // deliberately reject it even though arrow-row would accept it.
-    let fsb = FixedSizeBinaryArray::try_from_iter(vec![vec![1u8, 2, 3, 4]].into_iter())
-        .expect("build fixed-size-binary array");
-    assert!(
-        arrow_row::RowConverter::new(vec![arrow_row::SortField::new(fsb.data_type().clone())])
-            .is_ok(),
-        "arrow-row accepts FixedSizeBinary"
-    );
-    assert!(
-        RowConverter::new(vec![SortField::new(fsb.data_type().clone())]).is_err(),
-        "cayenne rejects FixedSizeBinary as a primary key"
-    );
 }
 
 #[test]
@@ -382,9 +491,16 @@ fn decode_rejects_truncated_fixed_bytes() {
         buffer: vec![1u8, 0, 0],
         offsets: vec![0, 3],
     };
+    let err = converter
+        .convert_rows(rows.iter())
+        .expect_err("truncated fixed-width row must error, not panic");
     assert!(
-        converter.convert_rows(rows.iter()).is_err(),
-        "truncated fixed-width row must error, not panic"
+        matches!(
+            &err,
+            ArrowError::InvalidArgumentError(message)
+                if message == "row_converter: truncated row, expected at least 9 bytes, got 3"
+        ),
+        "{err:?}"
     );
 }
 
@@ -397,8 +513,15 @@ fn decode_rejects_truncated_variable_bytes() {
         buffer: vec![2u8],
         offsets: vec![0, 1],
     };
+    let err = converter
+        .convert_rows(rows.iter())
+        .expect_err("truncated variable-width row must error, not panic");
     assert!(
-        converter.convert_rows(rows.iter()).is_err(),
-        "truncated variable-width row must error, not panic"
+        matches!(
+            &err,
+            ArrowError::InvalidArgumentError(message)
+                if message == "row_converter: truncated or malformed row bytes"
+        ),
+        "{err:?}"
     );
 }

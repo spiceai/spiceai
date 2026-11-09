@@ -22,6 +22,7 @@ limitations under the License.
 
 use crate::row_converter::OwnedRow;
 use hash_index::{PrehashedBuildHasher, hash_key_128, hash_key_bytes};
+use parking_lot::Mutex as ParkingMutex;
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, LazyLock};
 
@@ -44,16 +45,32 @@ use std::sync::{Arc, LazyLock};
 /// at these cardinalities: ~0.3% collision odds at the same scale.)
 #[inline]
 pub(crate) fn pk_digest(key: &OwnedRow) -> u128 {
-    hash_key_128(key.as_ref())
+    pk_digest_bytes(key.as_ref())
+}
+
+/// [`pk_digest`] over an encoded key that is still borrowed from a [`Rows`]
+/// batch, so the conflict loop can compute a row's identity without first
+/// copying it into an [`OwnedRow`].
+///
+/// Both spellings must stay one function: the digest a row is filed under has
+/// to equal the digest it is later probed by, and `insert_with_digest` only
+/// checks that under `debug_assert`. Hashing the bytes directly at a borrowed
+/// call site would leave two definitions of primary-key identity that a change
+/// to the seed or the hash could silently pull apart in release builds.
+///
+/// [`Rows`]: crate::row_converter::Rows
+#[inline]
+pub(crate) fn pk_digest_bytes(key: &[u8]) -> u128 {
+    hash_key_128(key)
 }
 
 /// A set of primary-key [`OwnedRow`]s identified by their [`pk_digest`] and
 /// fronted by [`PrehashedBuildHasher`]. Presents a `HashSet`-like API while
-/// keying on the 128-bit digest, so the per-apply accumulators
-/// (`incoming_keys` / `kept_keys` / bloom-MISS keys) share the conflict loop's
-/// single hash pass. The `OwnedRow` is retained (as the map value) because
-/// downstream consumers — the keyset insert, bloom rebuild, deletion lists, and
-/// shard routing — need the raw key bytes, never the digest.
+/// keying on the 128-bit digest, so the per-apply accumulators (`kept_keys` and
+/// the bloom-MISS keys) share the conflict loop's single hash pass. The
+/// `OwnedRow` is retained (as the map value) because downstream consumers — the
+/// keyset insert, bloom rebuild, deletion lists, and shard routing — need the
+/// raw key bytes, never the digest.
 #[derive(Debug, Clone, Default)]
 pub(crate) struct PkDigestSet {
     inner: HashMap<u128, OwnedRow, PrehashedBuildHasher>,
@@ -108,12 +125,9 @@ impl PkDigestSet {
         self.inner.extend(other.inner);
     }
 
-    /// Copy every key of `other` into `self`, reusing its stored digests.
-    pub(crate) fn extend_ref(&mut self, other: &PkDigestSet) {
-        self.inner.reserve(other.inner.len());
-        for (&digest, key) in &other.inner {
-            self.inner.insert(digest, key.clone());
-        }
+    /// Iterate key identities without copying the retained key bytes.
+    pub(crate) fn digests(&self) -> impl Iterator<Item = u128> {
+        self.inner.keys().copied()
     }
 
     /// Iterate `(digest, key)` pairs, so a consumer rebuilding another
@@ -152,8 +166,12 @@ pub(crate) fn approx_pk_keyset_entry_bytes(key: &OwnedRow) -> usize {
     // those bounds the cache at a fraction of its believed size - a
     // counting-allocator measurement puts the real per-entry cost at 1.6-3.5x
     // a key-plus-location-only figure.
-    key.as_ref().len()
-        + std::mem::size_of::<u128>()
+    key.as_ref().len() + pk_keyset_entry_overhead_bytes()
+}
+
+/// What [`approx_pk_keyset_entry_bytes`] charges a key besides its encoded bytes.
+pub(crate) const fn pk_keyset_entry_overhead_bytes() -> usize {
+    std::mem::size_of::<u128>()
         + std::mem::size_of::<PkKeysetEntry>()
         + PK_KEYSET_CACHE_HASHMAP_ENTRY_OVERHEAD_BYTES
 }
@@ -175,9 +193,10 @@ pub(crate) fn approx_captured_file_bytes(path: &str) -> usize {
 pub(crate) enum RowLocation {
     /// Row lives in the inline memtable; tombstoned by an inlined-data rewrite.
     Inlined,
-    /// Row lives in a Vortex file but its file-local position is unknown — a
-    /// cold-rebuilt keyset entry, or any entry under `deletion_mode: key`.
-    /// Tombstoned by a key-based deletion vector.
+    /// Row tombstoned by a key-based deletion: a Vortex file row whose
+    /// file-local position is unknown (a cold-rebuilt keyset entry, or any entry
+    /// under `deletion_mode: key`), or a CDC mem-tier row
+    /// ([`RowLocation::MEM_TIER`]).
     FileUnlocated,
     /// Row lives at a known `(file path, file-local position)`, captured by the
     /// `row_idx()` read-back under `deletion_mode: position`. Tombstoned by a
@@ -185,6 +204,15 @@ pub(crate) enum RowLocation {
     /// `file_path` `Arc` is shared across all rows in the same file, so the
     /// per-entry cost is one pointer + the `u64` position.
     FilePositioned { file_path: Arc<str>, position: u64 },
+}
+
+impl RowLocation {
+    /// The location of a CDC mem-tier row. Not `Inlined`: that location's inline
+    /// tombstone only hides metastore-inlined rows. A key deletion hides the row
+    /// both in the mem tier (scans filter it against the file deletion snapshot)
+    /// and in the file a checkpoint or spill moves it to, and the mem-tier append
+    /// folds both key lists into its own tombstones.
+    pub(crate) const MEM_TIER: Self = Self::FileUnlocated;
 }
 
 /// Outcome of [`CachedPkKeyset::try_insert_with_digest`].
@@ -211,6 +239,13 @@ pub(crate) struct CachedPkKeyset {
     /// capture pass can skip them. Reset whenever the keyset is rebuilt (e.g.
     /// after compaction), which is exactly when the file set changes.
     pub(crate) captured_files: HashSet<Arc<str>>,
+    /// Whether any entry may be [`RowLocation::Inlined`]: set by every write of
+    /// that location (and by [`Self::location_mut`], whose writes this cannot
+    /// see), cleared by [`Self::relocate_inlined_to_file_unlocated`] once it has
+    /// relabeled them all. A CDC mem-tier table records its keys as
+    /// [`RowLocation::MEM_TIER`], never `Inlined`, so its checkpoints skip a walk
+    /// over every key the table holds.
+    may_hold_inlined: bool,
 }
 
 impl CachedPkKeyset {
@@ -219,6 +254,7 @@ impl CachedPkKeyset {
             keys: HashMap::with_capacity_and_hasher(capacity, PrehashedBuildHasher),
             approx_bytes: 0,
             captured_files: HashSet::new(),
+            may_hold_inlined: false,
         }
     }
 
@@ -249,6 +285,7 @@ impl CachedPkKeyset {
             pk_digest(&key),
             "insert_with_digest called with a digest that does not match the key"
         );
+        self.note_location(&location);
         match self.keys.entry(digest) {
             std::collections::hash_map::Entry::Occupied(mut entry) => {
                 entry.get_mut().location = location;
@@ -286,6 +323,7 @@ impl CachedPkKeyset {
         );
         match self.keys.entry(digest) {
             std::collections::hash_map::Entry::Occupied(mut entry) => {
+                self.may_hold_inlined |= matches!(location, RowLocation::Inlined);
                 entry.get_mut().location = location;
                 PkKeysetInsertOutcome::Updated
             }
@@ -294,6 +332,7 @@ impl CachedPkKeyset {
                 if self.approx_bytes.saturating_add(entry_bytes) > max_bytes {
                     return PkKeysetInsertOutcome::OverBudget;
                 }
+                self.may_hold_inlined |= matches!(location, RowLocation::Inlined);
                 self.approx_bytes = self.approx_bytes.saturating_add(entry_bytes);
                 entry.insert(PkKeysetEntry {
                     row: key.clone(),
@@ -312,6 +351,7 @@ impl CachedPkKeyset {
     /// with `FileUnlocated`.
     pub(crate) fn insert_if_absent(&mut self, key: OwnedRow, location: RowLocation) {
         if let std::collections::hash_map::Entry::Vacant(entry) = self.keys.entry(pk_digest(&key)) {
+            self.may_hold_inlined |= matches!(location, RowLocation::Inlined);
             self.approx_bytes = self
                 .approx_bytes
                 .saturating_add(approx_pk_keyset_entry_bytes(&key));
@@ -356,12 +396,16 @@ impl CachedPkKeyset {
         }
     }
 
-    /// Mutable access to a key's [`RowLocation`] (position-capture upgrade).
+    /// Mutable access to a key's [`RowLocation`] (position-capture upgrade). The
+    /// caller may write any location, so the keyset assumes it wrote `Inlined`.
     #[inline]
     pub(crate) fn location_mut(&mut self, key: &OwnedRow) -> Option<&mut RowLocation> {
-        self.keys
+        let location = self
+            .keys
             .get_mut(&pk_digest(key))
-            .map(|entry| &mut entry.location)
+            .map(|entry| &mut entry.location);
+        self.may_hold_inlined |= location.is_some();
+        location
     }
 
     /// Iterate every retained key's [`OwnedRow`] bytes (bloom rebuild, sharding).
@@ -376,10 +420,44 @@ impl CachedPkKeyset {
         self.keys.values().map(|entry| &entry.location)
     }
 
-    /// Mutable iterator over every entry's [`RowLocation`] (the
-    /// `Inlined -> FileUnlocated` flip after an inline checkpoint).
-    pub(crate) fn locations_mut(&mut self) -> impl Iterator<Item = &mut RowLocation> {
-        self.keys.values_mut().map(|entry| &mut entry.location)
+    /// Relabel every `Inlined` entry `FileUnlocated`: a checkpoint moved the inline
+    /// rows into files, so each now names a file row whose position is unknown.
+    /// Returns whether any entry was `Inlined`. Walks the keyset only when an
+    /// entry may be `Inlined`; a checkpoint runs this under the listing fence, and
+    /// the walk visits every key the table holds.
+    pub(crate) fn relocate_inlined_to_file_unlocated(&mut self) -> bool {
+        if !self.may_hold_inlined {
+            return false;
+        }
+        let mut relocated = false;
+        for entry in self.keys.values_mut() {
+            relocated |= relocate_inlined(&mut entry.location);
+        }
+        self.may_hold_inlined = false;
+        relocated
+    }
+
+    /// Record a location about to be written into the keyset.
+    fn note_location(&mut self, location: &RowLocation) {
+        self.may_hold_inlined |= matches!(location, RowLocation::Inlined);
+    }
+
+    /// Forget every captured row position: relabel each `FilePositioned` entry
+    /// `FileUnlocated` and drop the record of which files the read-back covered,
+    /// releasing those files' share of `approx_bytes`. A later delete of any of
+    /// these keys then records a key tombstone, not a position delete.
+    pub(crate) fn forget_positions(&mut self) {
+        for entry in self.keys.values_mut() {
+            if matches!(entry.location, RowLocation::FilePositioned { .. }) {
+                entry.location = RowLocation::FileUnlocated;
+            }
+        }
+        let captured_bytes: usize = self
+            .captured_files
+            .drain()
+            .map(|path| approx_captured_file_bytes(&path))
+            .sum();
+        self.approx_bytes = self.approx_bytes.saturating_sub(captured_bytes);
     }
 
     /// Consume the keyset into `(key, location)` pairs (the shard split).
@@ -749,6 +827,14 @@ impl PkBloom {
         }
     }
 
+    /// `(inserted keys, allocated bits)` for this filter.
+    pub(crate) fn density(&self) -> (u64, u64) {
+        (
+            u64::try_from(self.inserted_keys).unwrap_or(u64::MAX),
+            u64::try_from(self.size_bytes()).unwrap_or(u64::MAX / 8) * 8,
+        )
+    }
+
     /// The frame version this filter serializes as.
     #[cfg(test)]
     pub(crate) fn frame_version(&self) -> u32 {
@@ -762,16 +848,28 @@ impl PkBloom {
         (0..PK_BLOOM_NUM_HASHES).map(move |i| h1.wrapping_add(u64::from(i).wrapping_mul(h2)))
     }
 
-    /// The block index and the eight per-lane masks for a key, for the
-    /// split-block layout. Fixed length and branch-free so it vectorises.
+    /// The hash the split-block layout places `key` by.
     #[inline]
-    fn split_block_locate(block_mask: u64, key: &[u8]) -> (usize, [u32; 8]) {
+    pub(crate) fn split_block_hash(key: &[u8]) -> u64 {
         // The crate's existing one-shot XXH3-64, the same primitive the WAL
         // checksum and the frame fingerprint use. One-shot rather than the
         // streaming `Hasher`: for a 16-byte key the streaming path's setup
         // costs more than the hash, and more than the two FNV passes it
         // replaces.
-        let hash = hash_index::hash_key_bytes_oneshot(key);
+        hash_index::hash_key_bytes_oneshot(key)
+    }
+
+    /// The block index and the eight per-lane masks for a key, for the
+    /// split-block layout.
+    #[inline]
+    fn split_block_locate(block_mask: u64, key: &[u8]) -> (usize, [u32; 8]) {
+        Self::split_block_locate_hash(block_mask, Self::split_block_hash(key))
+    }
+
+    /// [`Self::split_block_locate`] for a key's [`Self::split_block_hash`].
+    /// Fixed length and branch-free so it vectorises.
+    #[inline]
+    fn split_block_locate_hash(block_mask: u64, hash: u64) -> (usize, [u32; 8]) {
         let block = usize::try_from((hash >> 32) & block_mask).unwrap_or(0);
         // The low half, deliberately: the high half already chose the block, so
         // the lanes draw on bits the block selection did not consume.
@@ -802,6 +900,25 @@ impl PkBloom {
             }
         }
         self.inserted_keys = self.inserted_keys.saturating_add(1);
+    }
+
+    /// Insert the keys whose [`Self::split_block_hash`]es are `hashes`.
+    ///
+    /// Returns `false`, inserting nothing, for a filter of the scattered layout,
+    /// which places keys by other hashes.
+    #[must_use]
+    pub(crate) fn insert_split_block_hashes(&mut self, hashes: &[u64]) -> bool {
+        let PkBloomRepr::SplitBlock { blocks, block_mask } = &mut self.repr else {
+            return false;
+        };
+        for &hash in hashes {
+            let (index, masks) = Self::split_block_locate_hash(*block_mask, hash);
+            for (lane, mask) in blocks[index].iter_mut().zip(masks) {
+                *lane |= mask;
+            }
+        }
+        self.inserted_keys = self.inserted_keys.saturating_add(hashes.len());
+        true
     }
 
     pub(crate) fn maybe_contains(&self, key: &[u8]) -> bool {
@@ -1036,25 +1153,57 @@ pub(crate) const COLD_PK_BLOOM_PER_FILE_MAX_BYTES: usize = 32 * 1024 * 1024;
 /// (a false positive would wrongly drop a genuinely new row). Blooms stay a
 /// list, not a union, because each is right-sized to its file's key count.
 pub(crate) struct ColdPkExistence {
-    blooms: Vec<PkBloom>,
+    files: Vec<ColdFileProbe>,
+}
+
+/// Inclusive `[min, max]` of a cold file's primary key in the row-converter
+/// byte encoding probes use. Only built for a single fixed-width integer key
+/// column, where the encoding's byte order equals the numeric order.
+pub(crate) struct PkByteRange {
+    pub(crate) min: Box<[u8]>,
+    pub(crate) max: Box<[u8]>,
+}
+
+struct ColdFileProbe {
+    bloom: PkBloom,
+    /// `None` = no usable range, so the file is always a bloom candidate.
+    range: Option<PkByteRange>,
 }
 
 impl ColdPkExistence {
+    #[cfg(test)]
     pub(crate) fn new(blooms: Vec<PkBloom>) -> Self {
-        Self { blooms }
+        Self::with_ranges(blooms.into_iter().map(|b| (b, None)).collect())
+    }
+
+    /// One entry per live cold file: its bloom and, when known, its key range.
+    pub(crate) fn with_ranges(files: Vec<(PkBloom, Option<PkByteRange>)>) -> Self {
+        Self {
+            files: files
+                .into_iter()
+                .map(|(bloom, range)| ColdFileProbe { bloom, range })
+                .collect(),
+        }
     }
 
     /// `true` if `key` MAY live in any cold file (definitely absent when every
-    /// file's bloom misses — blooms have no false negatives).
+    /// file's bloom misses or the key lies outside every file's key range —
+    /// neither test has false negatives).
     pub(crate) fn maybe_contains(&self, key: &[u8]) -> bool {
-        self.blooms.iter().any(|b| b.maybe_contains(key))
+        self.files.iter().any(|f| {
+            f.range.as_ref().is_none_or(|r| {
+                // Different lengths mean the encoding is not the one the range
+                // was built in, so the range cannot exclude the key.
+                key.len() != r.min.len() || (key >= r.min.as_ref() && key <= r.max.as_ref())
+            }) && f.bloom.maybe_contains(key)
+        })
     }
 
     /// Approximate resident bytes across all per-file blooms, for logging.
     pub(crate) fn approx_bytes(&self) -> usize {
-        self.blooms
+        self.files
             .iter()
-            .map(PkBloom::size_bytes)
+            .map(|f| f.bloom.size_bytes())
             .fold(0, usize::saturating_add)
     }
 }
@@ -1186,6 +1335,20 @@ impl CachedPkIndex {
             Self::Bloom(bloom) => bloom.size_bytes(),
         }
     }
+
+    /// `(inserted keys, allocated bits)` when this index is a bloom, `None` when
+    /// it is still an exact keyset.
+    ///
+    /// Their ratio is the filter's density. It is worth exporting because a
+    /// filter can be resident at many times the bits-per-key the sizing code
+    /// asks for, and nothing else makes that visible: the bytes alone look like
+    /// a large table, and the key count alone looks correct.
+    pub(crate) fn bloom_density(&self) -> Option<(u64, u64)> {
+        match self {
+            Self::Exact(_) => None,
+            Self::Bloom(bloom) => Some(bloom.density()),
+        }
+    }
 }
 
 /// One committed key batch held while a PK existence index was checked out of
@@ -1243,6 +1406,12 @@ pub(crate) struct PendingPkKeys {
     /// describes a table state that has since been superseded (a DELETE, a
     /// compaction, a recovery) and must not be cached when it comes back.
     invalidated: bool,
+    /// Whether a checkpoint moved the inline rows into files while the index was
+    /// checked out (see [`Self::relocate_inlined_after_flush`]), so the restore
+    /// relabels the index's own `Inlined` entries. The batches held at the flush
+    /// were relabeled then; batches recorded after it keep the location they were
+    /// committed with.
+    inline_flush: InlineFlush,
 }
 
 impl PendingPkKeys {
@@ -1256,13 +1425,16 @@ impl PendingPkKeys {
     /// was never stored back, so the next validation rebuilds from the table and
     /// already sees those keys.
     ///
+    /// Private to this module: callers open a window through [`PkCheckoutGuard`],
+    /// which owns closing it again (see there for what a leaked window costs).
+    ///
     /// Opening a SECOND window while one is outstanding puts two independently-aged
     /// indexes over one cache: each was read at a different point, so whichever is
     /// stored last silently reverts the other's keys. Neither is trustworthy, so both
     /// are marked for discard and the cache goes cold — one rebuild instead of a
     /// cache that answers "absent" for a live key. Writers are serialized by the
     /// table write lock, so this is a backstop, not a routine path.
-    pub(crate) fn begin_checkout(&mut self) {
+    fn begin_checkout(&mut self) {
         if self.outstanding == 0 {
             self.overflowed = false;
             self.invalidated = false;
@@ -1271,6 +1443,7 @@ impl PendingPkKeys {
         }
         self.batches.clear();
         self.approx_bytes = 0;
+        self.inline_flush = InlineFlush::NotFlushed;
         self.outstanding = self.outstanding.saturating_add(1);
     }
 
@@ -1285,6 +1458,46 @@ impl PendingPkKeys {
         self.invalidated = true;
         self.batches.clear();
         self.approx_bytes = 0;
+        self.inline_flush = InlineFlush::NotFlushed;
+    }
+
+    /// Report that a checkpoint moved every inline row into files while an index
+    /// was checked out. The index stays valid — the flush changed where those rows
+    /// live, not which keys are live — so instead of discarding it (which costs the
+    /// next apply a rebuild from a full-table key scan), the restore relabels the
+    /// `Inlined` entries the index and the batches held so far carry, exactly as
+    /// the flush relabels an index sitting in its cache cell. A no-op when nothing
+    /// is checked out.
+    ///
+    /// Only sound for an index whose `Inlined` entries all name rows this flush
+    /// moved: an entry for a row written to the inline memtable after the flush
+    /// would be relabeled too, and that row is still inline. The per-shard index
+    /// qualifies. It is checked out, built and restored by one apply holding
+    /// `write_lock`, which every inline write also takes, so no row reaches the
+    /// inline memtable while it is out; validation only reads it, and keys join
+    /// it in `append_to_shard`, after the restore. An index rebuilt during the
+    /// checkout holds the moved keys too: the rebuild reads the inline rows under
+    /// the same listing fence as the snapshot list the flush registers its file
+    /// in, so each moved row is in one or the other. The table-wide index qualifies
+    /// too: it is checked out by an apply holding `write_lock`, or by a durable write
+    /// holding the checkpoint lock this flush runs under from before its checkout
+    /// until it records its keys (`lock_mem_tier_checkpoint_for_durable_write`), so
+    /// no inline row is written during a checkout that a flush can land in. Its
+    /// per-key OCC stamps predate the flush, so the restore that relabels it marks
+    /// per-key OCC degraded (`store_cached_pk_index`).
+    pub(crate) fn relocate_inlined_after_flush(&mut self) {
+        if self.outstanding == 0 {
+            return;
+        }
+        let mut relocated = self.inline_flush == InlineFlush::RelocatedHeldKeys;
+        for batch in &mut self.batches {
+            relocated |= relocate_inlined(&mut batch.location);
+        }
+        self.inline_flush = if relocated {
+            InlineFlush::RelocatedHeldKeys
+        } else {
+            InlineFlush::Flushed
+        };
     }
 
     /// Hold one committed key batch. A no-op when no index is checked out, or once
@@ -1312,6 +1525,7 @@ impl PendingPkKeys {
             self.overflowed = true;
             self.batches.clear();
             self.approx_bytes = 0;
+            self.inline_flush = InlineFlush::NotFlushed;
             return;
         }
         self.approx_bytes = self.approx_bytes.saturating_add(batch_bytes);
@@ -1325,10 +1539,15 @@ impl PendingPkKeys {
     /// Close the checkout window and hand back everything committed during it. With
     /// several windows outstanding every one of them reports a discard, and the flags
     /// only reset once the last closes.
-    pub(crate) fn end_checkout(&mut self) -> RestoredPkKeys {
+    ///
+    /// Private to this module: reached through [`PkCheckoutGuard::close`] or that
+    /// guard's [`Drop`].
+    fn end_checkout(&mut self) -> RestoredPkKeys {
         let restored = RestoredPkKeys {
             batches: std::mem::take(&mut self.batches),
-            discard_index: self.overflowed || self.invalidated,
+            overflowed: self.overflowed,
+            invalidated: self.invalidated,
+            inline_flush: std::mem::take(&mut self.inline_flush),
         };
         self.approx_bytes = 0;
         self.outstanding = self.outstanding.saturating_sub(1);
@@ -1372,23 +1591,206 @@ impl PendingPkKeys {
     }
 }
 
+/// RAII holder for a [`PendingPkKeys`] checkout window, and the only way to open
+/// one.
+///
+/// The window has to close on EVERY exit path, not just the one that stores an
+/// index back. A window left open latches the log permanently: the next
+/// [`PendingPkKeys::begin_checkout`] finds one already outstanding and sets
+/// `invalidated`, and `outstanding` never returns to zero to clear it again. From
+/// there [`PendingPkKeys::record`] holds nothing and every later
+/// [`PendingPkKeys::end_checkout`] reports a discard — so the cached keyset is
+/// dropped and rebuilt on every write, and, until it is rebuilt, a key committed
+/// during a checkout is no longer held for the restore, reads as absent, and its
+/// row is written a second time under a primary key that already exists.
+///
+/// A guard makes that unrepresentable. `?`, an early return, a panic, and a
+/// dropped or cancelled validation stream all run [`Drop`], and
+/// [`PendingPkKeys::begin_checkout`] is private to this module, so no caller can
+/// open a window it does not also own.
+pub(crate) struct PkCheckoutGuard {
+    pending: Arc<ParkingMutex<PendingPkKeys>>,
+    /// Republishes the resident-byte accounting of the cache this window covers.
+    /// Keys recorded while the window is open are accounted against that cache's
+    /// published bytes as they land (`record_pending_pk_keys`), on top of the bytes
+    /// the checked-out index itself still holds. A restore overwrites both with the
+    /// stored index's size; an abandoned window restores nothing, so without this
+    /// the bytes of an index that no longer exists and of keys that were just
+    /// dropped would stay reserved against the table's memory account until an
+    /// unrelated publish happened to overwrite them.
+    ///
+    /// Run by [`Drop`] on the abandon path only — [`Self::close`] hands the window
+    /// to a restore, which publishes the truth itself.
+    release_accounting: Option<Box<dyn FnOnce() + Send>>,
+    /// Set by [`Self::close`], which has already closed the window and owns the
+    /// keys it handed back, so [`Drop`] must not close it a second time.
+    closed: bool,
+}
+
+impl PkCheckoutGuard {
+    /// Open a checkout window over `pending`.
+    ///
+    /// `release_accounting` is what an *abandoned* window must do to the published
+    /// resident bytes of the cache it covers (see the field); the table passes a
+    /// closure that republishes what the cache cell actually holds.
+    pub(crate) fn open(
+        pending: &Arc<ParkingMutex<PendingPkKeys>>,
+        release_accounting: impl FnOnce() + Send + 'static,
+    ) -> Self {
+        pending.lock().begin_checkout();
+        Self {
+            pending: Arc::clone(pending),
+            release_accounting: Some(Box::new(release_accounting)),
+            closed: false,
+        }
+    }
+
+    /// Close the window and take the keys committed during it, to replay into the
+    /// index being stored back. Callers hold the matching cache lock across this
+    /// call so no writer can commit a key into the gap between the close and the
+    /// store (see `store_cached_pk_index`).
+    pub(crate) fn close(mut self) -> RestoredPkKeys {
+        self.closed = true;
+        self.pending.lock().end_checkout()
+    }
+}
+
+impl Drop for PkCheckoutGuard {
+    fn drop(&mut self) {
+        if self.closed {
+            return;
+        }
+        // Abandoned: no index is coming back, so the keys held for it have nothing
+        // to replay into. Closing drops them along with the window, and the cache
+        // stays cold — the next validation rebuilds from the table and sees every
+        // committed key.
+        let _ = self.pending.lock().end_checkout();
+        // The pending lock is released before this runs: the release takes the
+        // cache cell's lock and the publish lock, never the pending log's.
+        if let Some(release) = self.release_accounting.take() {
+            release();
+        }
+    }
+}
+
+/// A per-shard PK existence index together with the checkout window opened over
+/// the gap it leaves in the sharded cache.
+///
+/// The sharded index travels a long way from where it is built
+/// (`build_sharded_pk_index`) to where it is stored back
+/// (`store_sharded_pk_index`): through the prepared insert, the raw-stream drain,
+/// the per-table cap spill, the global byte-budget wait — which can divert the
+/// whole apply to the durable path — and the per-shard validation. Pairing the
+/// index with its window in one value means every one of those exits carries both
+/// or drops both, so there is no shape where the index is abandoned and the window
+/// stays open.
+pub(crate) struct CheckedOutShardedPkIndex {
+    index: ShardedPkIndex,
+    checkout: PkCheckoutGuard,
+}
+
+impl CheckedOutShardedPkIndex {
+    pub(crate) fn new(index: ShardedPkIndex, checkout: PkCheckoutGuard) -> Self {
+        Self { index, checkout }
+    }
+
+    /// The index itself, for the read-only per-shard existence probes.
+    pub(crate) fn index(&self) -> &ShardedPkIndex {
+        &self.index
+    }
+
+    /// Split into index and window, for the restore that stores one and closes the
+    /// other.
+    pub(crate) fn into_parts(self) -> (ShardedPkIndex, PkCheckoutGuard) {
+        (self.index, self.checkout)
+    }
+}
+
 /// Keys committed while an index was checked out, handed to the restore.
 pub(crate) struct RestoredPkKeys {
     batches: Vec<PendingPkKeyBatch>,
-    discard_index: bool,
+    /// The log stopped recording, so keys committed during the checkout are
+    /// unrecoverable. Either this or `invalidated` discards the index; they are
+    /// kept apart so the discard counter can name which condition fired.
+    overflowed: bool,
+    /// The cache was invalidated while the index was out.
+    invalidated: bool,
+    /// See [`PendingPkKeys::relocate_inlined_after_flush`]: whether a checkpoint
+    /// moved the inline rows into files during the checkout, and whether that
+    /// relabeled any of `batches`' `Inlined` keys.
+    inline_flush: InlineFlush,
+}
+
+/// Whether a checkpoint moved the inline rows into files while a primary-key
+/// index was checked out ([`PendingPkKeys::relocate_inlined_after_flush`]).
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+enum InlineFlush {
+    /// No checkpoint moved the inline rows during the checkout.
+    #[default]
+    NotFlushed,
+    /// A checkpoint moved the inline rows into files, and no held batch carried
+    /// an `Inlined` key to relabel.
+    Flushed,
+    /// A checkpoint moved the inline rows into files and relabeled at least one
+    /// held batch's `Inlined` keys.
+    RelocatedHeldKeys,
+}
+
+/// The location a key lives at after a checkpoint moved every inline row into a
+/// file: an `Inlined` entry now names a file row whose position is unknown.
+/// Everything else is unchanged.
+/// Returns whether it was `Inlined`.
+fn relocate_inlined(location: &mut RowLocation) -> bool {
+    let inlined = matches!(location, RowLocation::Inlined);
+    if inlined {
+        *location = RowLocation::FileUnlocated;
+    }
+    inlined
 }
 
 impl RestoredPkKeys {
+    /// Whether a checkpoint moved the inline rows into files while the index was
+    /// out, so the restore must relabel the index's `Inlined` entries
+    /// (`FileUnlocated`) before caching it. The batches committed before that flush
+    /// were relabeled when it happened.
+    pub(crate) const fn relocates_inlined(&self) -> bool {
+        !matches!(self.inline_flush, InlineFlush::NotFlushed)
+    }
+
+    /// Whether the flush relabeled any of the held batches' `Inlined` keys.
+    pub(crate) const fn relocated_inline_keys(&self) -> bool {
+        matches!(self.inline_flush, InlineFlush::RelocatedHeldKeys)
+    }
+
     /// Whether the index that was checked out must be dropped rather than cached:
     /// keys committed during the checkout went unheld (the log hit its cap), or the
     /// cache was invalidated while the index was out. Caching it either way would
     /// answer "absent" for a live key, which reads as a new primary key.
     pub(crate) fn index_must_be_discarded(&self) -> bool {
-        self.discard_index
+        self.overflowed || self.invalidated
+    }
+
+    /// Which of the two conditions forced the discard, as a metric label.
+    ///
+    /// They are different problems: `overflowed` means the pending-key log's
+    /// byte cap is too small for the commit rate during a validation, while
+    /// `invalidated` means something superseded the table state (a delete, a
+    /// compaction, a recovery, or a second concurrent checkout). Collapsing them
+    /// into one counter hides which lever to reach for — and an `invalidated`
+    /// rate on a table doing neither is how a checkout-time guard firing on
+    /// indexes that needed no invalidating becomes visible.
+    pub(crate) const fn discard_reason(&self) -> Option<&'static str> {
+        match (self.overflowed, self.invalidated) {
+            (true, _) => Some("overflowed"),
+            (false, true) => Some("invalidated"),
+            (false, false) => None,
+        }
     }
 
     /// Replay every held batch, oldest first, so a key committed twice ends on its
-    /// most recent location and sequence.
+    /// most recent location and sequence. A batch committed before an inline flush
+    /// that happened during the checkout was relabeled at the flush, the way the
+    /// flush relabels the cached index (see [`Self::relocates_inlined`]).
     pub(crate) fn batches(&self) -> impl Iterator<Item = (&PkDigestSet, &RowLocation, i64)> {
         self.batches
             .iter()
@@ -1603,6 +2005,16 @@ impl ShardedPkIndex {
         }
     }
 
+    /// Relabel every `Inlined` entry `FileUnlocated`: a checkpoint moved the inline
+    /// rows into files. A bloom carries no locations, so it is unchanged.
+    pub(crate) fn relocate_inlined_to_file_unlocated(&mut self) {
+        if let Self::Exact(keysets) = self {
+            for keyset in keysets.iter_mut() {
+                keyset.relocate_inlined_to_file_unlocated();
+            }
+        }
+    }
+
     /// Borrowed existence view for shard `i`, handed to that shard's validation.
     pub(crate) fn existence_ref(&self, i: usize) -> PkExistenceRef<'_> {
         match self {
@@ -1622,6 +2034,39 @@ impl ShardedPkIndex {
                 .iter()
                 .map(PkBloom::size_bytes)
                 .fold(0, usize::saturating_add),
+        }
+    }
+
+    /// Live keys across all shards: exact entries, or inserted keys in bloom
+    /// mode.
+    pub(crate) fn key_count(&self) -> usize {
+        match self {
+            Self::Exact(keysets) => keysets
+                .iter()
+                .map(CachedPkKeyset::len)
+                .fold(0, usize::saturating_add),
+            Self::Bloom(blooms) => blooms
+                .iter()
+                .map(|bloom| bloom.inserted_keys)
+                .fold(0, usize::saturating_add),
+        }
+    }
+
+    /// `(inserted keys, allocated bits)` summed over the per-shard filters when
+    /// this index is in bloom mode, `None` while it is still exact. See
+    /// [`CachedPkIndex::bloom_density`] for why the ratio matters.
+    pub(crate) fn bloom_density(&self) -> Option<(u64, u64)> {
+        match self {
+            Self::Exact(_) => None,
+            Self::Bloom(blooms) => Some(blooms.iter().map(PkBloom::density).fold(
+                (0_u64, 0_u64),
+                |(keys, bits), (shard_keys, shard_bits)| {
+                    (
+                        keys.saturating_add(shard_keys),
+                        bits.saturating_add(shard_bits),
+                    )
+                },
+            )),
         }
     }
 
@@ -1863,11 +2308,13 @@ mod tests {
     use super::{
         BoundedShardedPkIndexBuilder, COLD_PK_BLOOM_PER_FILE_MAX_BYTES, CachedPkKeyset,
         ColdPkExistence, LEGACY_PK_BLOOM_PROBE_FINGERPRINT, PK_BLOOM_FRAME_VERSION_SPLIT_BLOCK,
-        PK_INDEX_SIDECAR_MAGIC, PK_INDEX_SIDECAR_VERSION, PkBloom, PkBloomRepr, PkDigestSet,
-        PkKeysetInsertOutcome, RowLocation, SCATTERED_PROBE_FINGERPRINT, ShardedPkIndex,
-        approx_pk_keyset_entry_bytes, deserialize_pk_bloom_sidecar, deserialize_pk_blooms_sidecar,
-        pk_digest, serialize_pk_blooms_sidecar, shard_of_pk,
+        PK_INDEX_SIDECAR_MAGIC, PK_INDEX_SIDECAR_VERSION, ParkingMutex, PendingPkKeys, PkBloom,
+        PkBloomRepr, PkCheckoutGuard, PkDigestSet, PkKeysetInsertOutcome, RowLocation,
+        SCATTERED_PROBE_FINGERPRINT, ShardedPkIndex, approx_pk_keyset_entry_bytes,
+        deserialize_pk_bloom_sidecar, deserialize_pk_blooms_sidecar, pk_digest,
+        serialize_pk_blooms_sidecar, shard_of_pk,
     };
+    use std::sync::Arc;
 
     /// Degrading after a mid-batch stop must not lose the rest of the batch.
     ///
@@ -2214,6 +2661,36 @@ mod tests {
                 "false negative after round-trip -- a missed conflict writes a duplicate live row"
             );
         }
+    }
+
+    /// Inserting keys by their hashes sets exactly the bits inserting the keys
+    /// does, so a filter built from hashes probes like one built from keys.
+    #[test]
+    fn inserting_split_block_hashes_matches_inserting_keys() {
+        let keys: Vec<[u8; 16]> = (0..20_000u128).map(u128::to_le_bytes).collect();
+        let mut by_key = PkBloom::with_byte_budget(64 * 1024);
+        for key in &keys {
+            by_key.insert(key);
+        }
+        let hashes: Vec<u64> = keys
+            .iter()
+            .map(|key| PkBloom::split_block_hash(key))
+            .collect();
+        let mut by_hash = PkBloom::with_byte_budget(64 * 1024);
+        assert!(by_hash.insert_split_block_hashes(&hashes));
+        assert_eq!(by_hash.to_bytes(), by_key.to_bytes());
+
+        let mut scattered = PkBloom::scattered_with_expected_keys(keys.len(), 64 * 1024);
+        let before = scattered.to_bytes();
+        assert!(
+            !scattered.insert_split_block_hashes(&hashes),
+            "the scattered layout cannot place keys by their split-block hashes"
+        );
+        assert_eq!(
+            scattered.to_bytes(),
+            before,
+            "a refused insert sets nothing"
+        );
     }
 
     /// The property the whole versioning scheme rests on: a v2 reader must reject
@@ -2680,6 +3157,82 @@ mod tests {
         assert_eq!(existence.approx_bytes(), 0);
     }
 
+    /// Every way a keyset entry can come to say `Inlined` must leave it for the
+    /// relabel to find: the relabel walks only a keyset flagged as possibly
+    /// holding one, so a write path that set the location without the flag would
+    /// leave a flushed row labeled inline, and a later upsert would tombstone the
+    /// inline copy only, keeping the file row live beside the new one. A keyset
+    /// that only ever held other locations is not walked.
+    #[test]
+    fn a_relabel_finds_an_inlined_entry_from_every_write_path() {
+        type WritePath = fn(&mut CachedPkKeyset, &super::OwnedRow);
+        let paths: [(&str, WritePath); 6] = [
+            ("insert", |keyset, row| {
+                keyset.insert(row.clone(), RowLocation::Inlined);
+            }),
+            ("insert_with_digest over an entry", |keyset, row| {
+                keyset.insert(row.clone(), RowLocation::MEM_TIER);
+                keyset.insert_with_digest(pk_digest(row), row.clone(), RowLocation::Inlined);
+            }),
+            ("try_insert_with_digest, new", |keyset, row| {
+                keyset.try_insert_with_digest(
+                    pk_digest(row),
+                    row,
+                    RowLocation::Inlined,
+                    usize::MAX,
+                );
+            }),
+            ("try_insert_with_digest, present", |keyset, row| {
+                keyset.insert(row.clone(), RowLocation::MEM_TIER);
+                keyset.relocate_inlined_to_file_unlocated();
+                keyset.try_insert_with_digest(
+                    pk_digest(row),
+                    row,
+                    RowLocation::Inlined,
+                    usize::MAX,
+                );
+            }),
+            ("insert_if_absent", |keyset, row| {
+                keyset.insert_if_absent(row.clone(), RowLocation::Inlined);
+            }),
+            ("location_mut", |keyset, row| {
+                keyset.insert(row.clone(), RowLocation::MEM_TIER);
+                keyset.relocate_inlined_to_file_unlocated();
+                *keyset.location_mut(row).expect("present") = RowLocation::Inlined;
+            }),
+        ];
+        for (path, write) in paths {
+            let mut keyset = CachedPkKeyset::with_capacity(4);
+            let row = owned_key(b"pk-a");
+            keyset.insert(owned_key(b"pk-b"), RowLocation::MEM_TIER);
+            write(&mut keyset, &row);
+            assert!(
+                matches!(
+                    keyset.location_by_digest(pk_digest(&row)),
+                    Some(RowLocation::Inlined)
+                ),
+                "{path}: the write stores an inline location"
+            );
+            assert!(keyset.relocate_inlined_to_file_unlocated(), "{path}");
+            assert!(
+                matches!(
+                    keyset.location_by_digest(pk_digest(&row)),
+                    Some(RowLocation::FileUnlocated)
+                ),
+                "{path}: the relabel moves the entry to a file"
+            );
+            assert!(!keyset.relocate_inlined_to_file_unlocated(), "{path}");
+        }
+
+        let mut keyset = CachedPkKeyset::with_capacity(4);
+        keyset.insert(owned_key(b"pk-a"), RowLocation::MEM_TIER);
+        keyset.insert_if_absent(owned_key(b"pk-b"), RowLocation::MEM_TIER);
+        assert!(
+            !keyset.may_hold_inlined,
+            "a keyset that never held an inline location is not walked"
+        );
+    }
+
     #[test]
     fn try_insert_with_digest_on_new_key_inserts_and_grows_budget() {
         let mut keyset = CachedPkKeyset::with_capacity(4);
@@ -2762,6 +3315,255 @@ mod tests {
         assert!(
             keyset.location_by_digest(digest).is_none(),
             "an over-budget key must not be retrievable afterward"
+        );
+    }
+    /// A checkout window abandoned without a restore must not latch the log.
+    ///
+    /// `begin_checkout` reads a window that is still outstanding as two
+    /// independently-aged indexes over one cache and sets `invalidated`, and the
+    /// flags only clear once `outstanding` returns to zero. So a window that is
+    /// never closed makes every LATER checkout invalid for the life of the
+    /// process: `record` holds nothing, `existence` reports nothing to the
+    /// in-flight validation — which then reads a key another writer just
+    /// committed as new and writes a second live row under an existing primary
+    /// key — and every restore discards its index, rebuilding the keyset on every
+    /// write.
+    ///
+    /// [`PkCheckoutGuard`] is what makes the window impossible to abandon; this
+    /// pins the behaviour it buys.
+    /// The accounting release runs only when a window is abandoned. A restore
+    /// closes the window and publishes the stored index's size itself, so running
+    /// the release there too would publish a stale figure over the true one.
+    #[test]
+    fn only_an_abandoned_checkout_runs_its_accounting_release() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let pending = Arc::new(ParkingMutex::new(PendingPkKeys::default()));
+        let released = Arc::new(AtomicUsize::new(0));
+        let release = |released: &Arc<AtomicUsize>| {
+            let released = Arc::clone(released);
+            move || {
+                released.fetch_add(1, Ordering::Relaxed);
+            }
+        };
+
+        let closed = PkCheckoutGuard::open(&pending, release(&released));
+        drop(closed.close());
+        assert_eq!(
+            released.load(Ordering::Relaxed),
+            0,
+            "a restore publishes the truth itself, so a closed window must not release"
+        );
+
+        drop(PkCheckoutGuard::open(&pending, release(&released)));
+        assert_eq!(
+            released.load(Ordering::Relaxed),
+            1,
+            "an abandoned window must release the accounting it grew"
+        );
+    }
+
+    #[test]
+    fn an_abandoned_checkout_leaves_the_next_one_usable() {
+        let pending = Arc::new(ParkingMutex::new(PendingPkKeys::default()));
+
+        // A validation that fails, panics, or is cancelled part-way: the window
+        // opened, nothing restored an index, and the guard closed it on the way out.
+        drop(PkCheckoutGuard::open(&pending, || {}));
+
+        let checkout = PkCheckoutGuard::open(&pending, || {});
+        let mut keys = PkDigestSet::with_capacity(1);
+        let k = owned_key(&key(7));
+        keys.insert_with_digest(pk_digest(&k), k.clone());
+        pending
+            .lock()
+            .record(&keys, &RowLocation::FileUnlocated, 11, usize::MAX);
+
+        assert!(
+            pending
+                .lock()
+                .existence()
+                .is_some_and(|existence| existence.location_by_digest(pk_digest(&k)).is_some()),
+            "the in-flight validation must see a key committed during its own \
+             checkout — missing it reads the key as new and duplicates the row"
+        );
+
+        let restored = checkout.close();
+        assert!(
+            !restored.index_must_be_discarded(),
+            "a clean checkout must restore its index rather than force a rebuild"
+        );
+        assert_eq!(
+            restored.batches().count(),
+            1,
+            "the key committed during the checkout must be replayed into the index"
+        );
+    }
+
+    /// A window must be closed exactly once. `close` already closed it and owns
+    /// the keys it handed back, so the guard's own `Drop` must not close it a
+    /// second time: that would drive `outstanding` to zero while another window is
+    /// still open, resetting the flags that window's index depends on.
+    #[test]
+    fn closing_a_checkout_does_not_also_close_it_on_drop() {
+        let pending = Arc::new(ParkingMutex::new(PendingPkKeys::default()));
+
+        let outer = PkCheckoutGuard::open(&pending, || {});
+        let inner = PkCheckoutGuard::open(&pending, || {});
+        assert_eq!(pending.lock().outstanding, 2, "two windows are open");
+
+        drop(inner.close());
+        assert_eq!(
+            pending.lock().outstanding,
+            1,
+            "closing one window must decrement the count exactly once"
+        );
+
+        assert!(
+            outer.close().index_must_be_discarded(),
+            "the index `outer` holds was aged against a second checkout, so it must              still be discarded once that sibling closes — a second decrement on drop              would zero the count, clear the flag, and cache an index that silently              reverts the other's keys"
+        );
+        assert_eq!(
+            pending.lock().outstanding,
+            0,
+            "closing every window must return the count to zero exactly"
+        );
+    }
+
+    /// An inline flush during a checkout relabels instead of discarding: the index
+    /// is still valid, the batches committed before the flush come back
+    /// `FileUnlocated` (their rows now live in a file), and a batch committed after
+    /// it keeps the location it was committed with — both in the restore and in the
+    /// existence view the in-flight validation reads.
+    #[test]
+    fn an_inline_flush_during_a_checkout_relabels_the_keys_it_moved() {
+        let pending = Arc::new(ParkingMutex::new(PendingPkKeys::default()));
+        let checkout = PkCheckoutGuard::open(&pending, || {});
+
+        let digest_set = |id: u64| {
+            let mut keys = PkDigestSet::with_capacity(1);
+            let k = owned_key(&key(id));
+            let digest = pk_digest(&k);
+            keys.insert_with_digest(digest, k);
+            (keys, digest)
+        };
+        let (before, before_digest) = digest_set(1);
+        let (after, after_digest) = digest_set(2);
+        let (file, file_digest) = digest_set(3);
+
+        pending
+            .lock()
+            .record(&before, &RowLocation::Inlined, 1, usize::MAX);
+        pending.lock().relocate_inlined_after_flush();
+        pending
+            .lock()
+            .record(&after, &RowLocation::Inlined, 2, usize::MAX);
+        pending
+            .lock()
+            .record(&file, &RowLocation::FileUnlocated, 3, usize::MAX);
+
+        let existence = pending
+            .lock()
+            .existence()
+            .expect("three keys were committed during the checkout");
+        assert!(matches!(
+            existence.location_by_digest(before_digest),
+            Some(RowLocation::FileUnlocated)
+        ));
+        assert!(matches!(
+            existence.location_by_digest(after_digest),
+            Some(RowLocation::Inlined)
+        ));
+        assert!(matches!(
+            existence.location_by_digest(file_digest),
+            Some(RowLocation::FileUnlocated)
+        ));
+
+        let restored = checkout.close();
+        assert!(
+            !restored.index_must_be_discarded(),
+            "a flush changes where rows live, not which keys are live, so the index \
+             must be restored rather than rebuilt from a full-table scan"
+        );
+        assert!(restored.relocates_inlined());
+        let locations: Vec<RowLocation> = restored
+            .batches()
+            .map(|(_, location, _)| location.clone())
+            .collect();
+        assert!(matches!(
+            locations.as_slice(),
+            [
+                RowLocation::FileUnlocated,
+                RowLocation::Inlined,
+                RowLocation::FileUnlocated
+            ]
+        ));
+    }
+
+    /// With nothing checked out a flush has no index to relabel, and it must not
+    /// leak into the next checkout; an invalidation after a flush still discards.
+    #[test]
+    fn an_inline_flush_outside_a_checkout_is_a_no_op_and_invalidation_still_wins() {
+        let pending = Arc::new(ParkingMutex::new(PendingPkKeys::default()));
+        pending.lock().relocate_inlined_after_flush();
+        let restored = PkCheckoutGuard::open(&pending, || {}).close();
+        assert!(!restored.relocates_inlined());
+        assert!(!restored.index_must_be_discarded());
+
+        let checkout = PkCheckoutGuard::open(&pending, || {});
+        pending.lock().relocate_inlined_after_flush();
+        pending.lock().invalidate();
+        let restored = checkout.close();
+        assert!(
+            restored.index_must_be_discarded(),
+            "a superseded table state must still drop the index"
+        );
+        assert!(!restored.relocates_inlined());
+    }
+
+    #[test]
+    fn relocating_a_sharded_index_relabels_only_inlined_entries() {
+        let mut inlined = CachedPkKeyset::with_capacity(2);
+        inlined.insert(owned_key(&key(1)), RowLocation::Inlined);
+        inlined.insert(owned_key(&key(2)), RowLocation::FileUnlocated);
+        let mut index = ShardedPkIndex::from_exact(inlined, 1);
+        index.relocate_inlined_to_file_unlocated();
+        let ShardedPkIndex::Exact(keysets) = &index else {
+            panic!("an exact index stays exact");
+        };
+        assert!(
+            keysets[0]
+                .locations()
+                .all(|location| matches!(location, RowLocation::FileUnlocated))
+        );
+    }
+
+    /// The guard must not soften the deliberate backstop it wraps: two windows
+    /// open at once put two independently-aged indexes over one cache, so BOTH
+    /// must be marked for discard rather than one silently reverting the other's
+    /// keys.
+    #[test]
+    fn two_concurrent_checkouts_are_both_discarded() {
+        let pending = Arc::new(ParkingMutex::new(PendingPkKeys::default()));
+
+        let first = PkCheckoutGuard::open(&pending, || {});
+        let second = PkCheckoutGuard::open(&pending, || {});
+
+        assert!(
+            second.close().index_must_be_discarded(),
+            "an index checked out alongside another must not be cached"
+        );
+        assert!(
+            first.close().index_must_be_discarded(),
+            "the index it was opened over must not be cached either"
+        );
+
+        // ...and the flags clear once the last window closes, so the NEXT
+        // checkout is trusted again.
+        let third = PkCheckoutGuard::open(&pending, || {});
+        assert!(
+            !third.close().index_must_be_discarded(),
+            "the discard must not outlive the overlap that caused it"
         );
     }
 }

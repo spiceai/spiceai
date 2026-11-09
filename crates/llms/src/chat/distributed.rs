@@ -58,6 +58,9 @@ pub struct DistributedConfig {
     pub node_rank: usize,
     /// Ordered node addresses (host or IP); index == rank, length == world size.
     pub nodes: Vec<String>,
+    /// Whether spiced runs with `--allow-insecure-connections`. An engine that connects the
+    /// nodes without authentication serves the model only when this is set.
+    pub allow_insecure_connections: bool,
 }
 
 impl DistributedConfig {
@@ -99,6 +102,17 @@ impl DistributedConfig {
     }
 }
 
+/// Refuses a distributed model in a build without multi-node inference, whichever engine
+/// would serve it.
+pub(crate) fn ensure_distributed_build() -> Result<(), ChatError> {
+    if !cfg!(feature = "distributed") {
+        return Err(ChatError::FailedToLoadModel {
+            source: "`distributed_backend: ring` was requested, but this build does not include multi-node distributed inference — a Spice enterprise feature (build with the `distributed` Cargo feature to enable it).".into(),
+        });
+    }
+    Ok(())
+}
+
 /// Translate a [`DistributedConfig`] into a per-node mistral.rs ring topology,
 /// write it to a temp `RING_CONFIG` file, and point the `RING_CONFIG` env var at
 /// it. mistral.rs reads that env var while building the pipeline (there is no
@@ -111,11 +125,7 @@ pub(crate) fn configure_ring_distributed(
         DistributedBackend::Ring => {}
     }
 
-    if !cfg!(feature = "distributed") {
-        return Err(ChatError::FailedToLoadModel {
-            source: "`distributed_backend: ring` was requested, but this build does not include multi-node distributed inference — a Spice enterprise feature (build with the `distributed` Cargo feature to enable it).".into(),
-        });
-    }
+    ensure_distributed_build()?;
 
     if let Err((param, message)) = cfg.validate() {
         return Err(ChatError::InvalidParamValueError {
@@ -205,6 +215,7 @@ mod tests {
             backend: DistributedBackend::Ring,
             node_rank,
             nodes: (0..n).map(|i| format!("10.0.0.{i}")).collect(),
+            allow_insecure_connections: false,
         }
     }
 

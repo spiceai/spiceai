@@ -35,6 +35,7 @@ pub mod google;
 pub mod huggingface;
 pub mod openai;
 pub mod spiceai;
+pub mod typesafe;
 pub mod xai;
 
 use std::sync::LazyLock;
@@ -58,6 +59,7 @@ source_specs!(XAI_SPEC, xai::XaiModelParams);
 source_specs!(BEDROCK_SPEC, bedrock::BedrockModelParams);
 source_specs!(SPICEAI_SPEC, spiceai::SpiceAiModelParams);
 source_specs!(GOOGLE_SPEC, google::GoogleModelParams);
+source_specs!(TYPESAFE_SPEC, typesafe::TypeSafeModelParams);
 
 /// Returns the parameter specifications for a given model source, generated
 /// from that source's `#[derive(TypedParams)]` struct (the single source of
@@ -76,6 +78,7 @@ pub fn get_params_spec(source: &ModelSource) -> &'static [ParameterSpec] {
         ModelSource::Bedrock => &BEDROCK_SPEC,
         ModelSource::SpiceAI => &SPICEAI_SPEC,
         ModelSource::Google => &GOOGLE_SPEC,
+        ModelSource::TypeSafe => &TYPESAFE_SPEC,
     }
 }
 
@@ -98,6 +101,87 @@ mod tests {
 
     fn empty_secrets() -> Arc<RwLock<runtime_secrets::Secrets>> {
         Arc::new(RwLock::new(runtime_secrets::Secrets::new()))
+    }
+
+    /// What the typed-params crate logs while `parse` runs, one line per event.
+    async fn typed_params_warnings<F: std::future::Future>(parse: F) -> String {
+        use tracing_subscriber::Layer as _;
+        use tracing_subscriber::layer::SubscriberExt as _;
+
+        #[derive(Clone, Default)]
+        struct CapturedLogs(Arc<parking_lot::Mutex<Vec<u8>>>);
+
+        impl std::io::Write for CapturedLogs {
+            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().extend_from_slice(buf);
+                Ok(buf.len())
+            }
+
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+
+        impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for CapturedLogs {
+            type Writer = Self;
+
+            fn make_writer(&'a self) -> Self::Writer {
+                self.clone()
+            }
+        }
+
+        let logs = CapturedLogs::default();
+        let layer = tracing_subscriber::fmt::layer()
+            .with_ansi(false)
+            .without_time()
+            .with_level(false)
+            .with_target(false)
+            .with_writer(logs.clone())
+            .with_filter(
+                tracing_subscriber::filter::Targets::new()
+                    .with_target("runtime_parameters_typed", tracing::Level::TRACE),
+            );
+        let _guard = tracing::subscriber::set_default(tracing_subscriber::registry().with(layer));
+        parse.await;
+        String::from_utf8_lossy(&logs.0.lock()).into_owned()
+    }
+
+    #[tokio::test]
+    async fn a_bare_override_on_a_prefixed_provider_warns_as_a_deprecated_alias() {
+        // The runtime applies `reasoning_effort` for a `hf` model, so the warning must not
+        // say it is ignored.
+        let warnings = typed_params_warnings(async {
+            huggingface::HuggingFaceModelParams::try_from_params(
+                "model huggingface",
+                params(&[("hf_token", "hf_abc"), ("reasoning_effort", "low")]),
+                &empty_secrets(),
+            )
+            .await
+            .expect("huggingface params should deserialize");
+        })
+        .await;
+        assert_eq!(
+            warnings.trim_end(),
+            format!(
+                "Parameter 'reasoning_effort' is deprecated for model huggingface: {}",
+                common::UNPREFIXED_DEPRECATED_MESSAGE
+            )
+        );
+    }
+
+    #[tokio::test]
+    async fn a_prefixed_override_logs_nothing() {
+        let warnings = typed_params_warnings(async {
+            huggingface::HuggingFaceModelParams::try_from_params(
+                "model huggingface",
+                params(&[("hf_token", "hf_abc"), ("hf_reasoning_effort", "low")]),
+                &empty_secrets(),
+            )
+            .await
+            .expect("huggingface params should deserialize");
+        })
+        .await;
+        assert_eq!(warnings, "");
     }
 
     #[tokio::test]
@@ -144,17 +228,19 @@ mod tests {
         );
     }
 
+    /// Regression test for #13932: `hf_token` is the documented key, shared with
+    /// the embeddings and reranker components.
     #[tokio::test]
-    async fn huggingface_accepts_prefixed_token_and_runtime_model_type() {
+    async fn huggingface_accepts_hf_token_and_runtime_model_type() {
         let typed = huggingface::HuggingFaceModelParams::try_from_params(
             "model huggingface",
-            params(&[("huggingface_token", "hf_abc"), ("model_type", "llama")]),
+            params(&[("hf_token", "hf_abc"), ("model_type", "llama")]),
             &empty_secrets(),
         )
         .await
         .expect("huggingface params should deserialize");
         assert_eq!(
-            typed.token.as_ref().map(ExposeSecret::expose_secret),
+            typed.hf_token.as_ref().map(ExposeSecret::expose_secret),
             Some("hf_abc")
         );
         assert_eq!(typed.model_type.as_deref(), Some("llama"));
@@ -162,6 +248,75 @@ mod tests {
             typed.distributed_backend,
             llms::chat::DistributedBackendSetting::None
         );
+    }
+
+    #[tokio::test]
+    async fn huggingface_accepts_huggingface_token_alias() {
+        let typed = huggingface::HuggingFaceModelParams::try_from_params(
+            "model huggingface",
+            params(&[("huggingface_token", "hf_abc")]),
+            &empty_secrets(),
+        )
+        .await
+        .expect("huggingface params should deserialize");
+        assert_eq!(
+            typed.hf_token.as_ref().map(ExposeSecret::expose_secret),
+            Some("hf_abc")
+        );
+    }
+
+    #[test]
+    fn huggingface_spec_advertises_hf_token() {
+        // The schema generator renders this spec list, so the key it advertises
+        // must be the key `try_from_params` reads.
+        let specs = get_params_spec(&ModelSource::HuggingFace);
+        let token = specs
+            .iter()
+            .find(|s| s.name == "hf_token")
+            .expect("spec for hf_token");
+        assert_eq!(token.r#type, ParameterType::Runtime);
+        assert!(
+            specs.iter().all(|s| s.name != "token"),
+            "only one spec may render to the `hf_token` key"
+        );
+    }
+
+    /// `construct_model` and the responses API read the prefixed passthrough
+    /// overrides (`{prefix}_temperature`, `{prefix}_tools`, …) through
+    /// `get_openai_request_overrides(component, source.short_name())`, while
+    /// `try_from_params` consumes them under the struct's `prefix`. When the two
+    /// disagree, an override spelled the documented way is warned about as unknown
+    /// and one spelled the struct's way is consumed but never applied (#13932).
+    #[test]
+    fn model_param_prefixes_match_the_source_short_name() {
+        for (source, prefix) in [
+            (ModelSource::OpenAi, openai::OpenAiModelParams::PREFIX),
+            (ModelSource::Azure, azure::AzureModelParams::PREFIX),
+            (ModelSource::File, file::FileModelParams::PREFIX),
+            (
+                ModelSource::Databricks,
+                databricks::DatabricksModelParams::PREFIX,
+            ),
+            (
+                ModelSource::HuggingFace,
+                huggingface::HuggingFaceModelParams::PREFIX,
+            ),
+            (
+                ModelSource::Anthropic,
+                anthropic::AnthropicModelParams::PREFIX,
+            ),
+            (ModelSource::Xai, xai::XaiModelParams::PREFIX),
+            (ModelSource::Bedrock, bedrock::BedrockModelParams::PREFIX),
+            (ModelSource::SpiceAI, spiceai::SpiceAiModelParams::PREFIX),
+            (ModelSource::Google, google::GoogleModelParams::PREFIX),
+            (ModelSource::TypeSafe, typesafe::TypeSafeModelParams::PREFIX),
+        ] {
+            assert_eq!(
+                prefix,
+                source.short_name(),
+                "params struct prefix for {source:?} must match the source short name"
+            );
+        }
     }
 
     #[tokio::test]

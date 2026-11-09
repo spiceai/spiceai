@@ -33,7 +33,6 @@ limitations under the License.
 //!   - `monolithic` — `cap = N` (one durable plan, the pre-fix behavior), vs
 //!   - `chunked`    — `cap = 2048` (the default; `⌈N/2048⌉` plans).
 
-#![cfg(not(windows))]
 #![allow(clippy::expect_used)]
 
 use std::collections::HashMap;
@@ -51,9 +50,9 @@ use data_components::cdc::{
     ChangeBatch, ChangeEnvelope, ChangesStream, CommitChange, CommitError, StreamError,
     changes_schema,
 };
+use datafusion::common::TableReference;
 use datafusion::datasource::TableProvider;
 use datafusion::prelude::SessionContext;
-use datafusion::sql::TableReference;
 use futures::StreamExt;
 use futures::stream as fstream;
 use runtime::accelerated::refresh::Refresh;

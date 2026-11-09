@@ -149,23 +149,46 @@ mod tests {
 
     #[test]
     fn test_invalid_top_level() {
-        let json = json!(42);
-        let result = convert_json_to_param_values(json);
-        result.expect_err("should error on invalid top-level JSON");
+        for json in [json!(42), json!("x"), json!(true), json!(null)] {
+            let err = convert_json_to_param_values(json.clone())
+                .expect_err("should error on invalid top-level JSON");
+            assert!(
+                matches!(err, Error::JsonArrayOrObjectRequired),
+                "{json}: unexpected error {err:?}"
+            );
+            assert_eq!(
+                err.to_string(),
+                "Parameters must be a JSON array or an object"
+            );
+        }
     }
 
     #[test]
     fn test_array_with_nested_array() {
         let json = json!([1, [2, 3]]);
-        let result = convert_json_to_param_values(json);
-        result.expect_err("should error on nested array");
+        let err = convert_json_to_param_values(json).expect_err("should error on nested array");
+        assert!(
+            matches!(err, Error::NestedValues),
+            "unexpected error {err:?}"
+        );
+        assert_eq!(
+            err.to_string(),
+            "Nested arrays or objects are not supported as parameter values"
+        );
     }
 
     #[test]
     fn test_object_with_nested_object() {
         let json = json!({"a": 1, "b": {"c": 2}});
-        let result = convert_json_to_param_values(json);
-        result.expect_err("should error on nested object");
+        let err = convert_json_to_param_values(json).expect_err("should error on nested object");
+        assert!(
+            matches!(err, Error::NestedValues),
+            "unexpected error {err:?}"
+        );
+        assert_eq!(
+            err.to_string(),
+            "Nested arrays or objects are not supported as parameter values"
+        );
     }
 
     #[test]
@@ -253,19 +276,5 @@ mod tests {
         );
         expected_map.insert("is_active".to_string(), ScalarValue::Boolean(Some(true)));
         assert_eq_param_values(&result, &ParamValues::from(expected_map));
-    }
-
-    #[test]
-    fn test_error_with_specific_index() {
-        let json = json!([1, "two", [3]]);
-        let result = convert_json_to_param_values(json);
-        result.expect_err("should error on nested array");
-    }
-
-    #[test]
-    fn test_error_with_specific_key() {
-        let json = json!({"a": 1, "b": "two", "c": {"d": 3}});
-        let result = convert_json_to_param_values(json);
-        result.expect_err("should error on nested object");
     }
 }

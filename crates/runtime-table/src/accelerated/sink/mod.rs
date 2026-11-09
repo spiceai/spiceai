@@ -19,6 +19,7 @@ use datafusion::{
     physical_plan::RecordBatchStream,
 };
 use multi::MultiSink;
+use runtime_table_partition::provider::PartitionTableProvider;
 use spice_table::{Index, WriteWindow};
 use std::{pin::Pin, sync::Arc};
 use table::TableSink;
@@ -28,6 +29,33 @@ use super::synchronized_table::SynchronizedTable;
 
 pub(crate) mod multi;
 pub(crate) mod table;
+
+/// What a refresh's write carries to the dataset's own table.
+#[derive(Debug, Default)]
+pub struct RefreshWrite {
+    /// Counts the rows the table receives but does not keep.
+    pub superseded: Option<Arc<util::session_state::SupersededRows>>,
+    /// Orders the copies of a key the write repeats by version, for
+    /// a refresh that orders versions by `time_column`.
+    pub row_versions: Option<Arc<dyn util::session_state::RowVersions>>,
+}
+
+impl RefreshWrite {
+    /// `state` carrying this write to the table it runs against.
+    pub(crate) fn state(
+        &self,
+        state: &datafusion::execution::SessionState,
+    ) -> datafusion::execution::SessionState {
+        let state = match &self.superseded {
+            Some(rows) => util::session_state::with_superseded_rows(state, Arc::clone(rows)),
+            None => state.clone(),
+        };
+        match &self.row_versions {
+            Some(versions) => util::session_state::with_row_versions(&state, Arc::clone(versions)),
+            None => state,
+        }
+    }
+}
 
 #[derive(Debug)]
 pub enum AccelerationSink {
@@ -89,14 +117,23 @@ impl AccelerationSink {
         }
     }
 
+    /// Write `record_batch_stream` to the acceleration, carrying `write` to the
+    /// dataset's own table.
     pub async fn insert_into(
         &self,
         record_batch_stream: Pin<Box<dyn RecordBatchStream + Send>>,
         overwrite: InsertOp,
+        write: &RefreshWrite,
     ) -> Result<(), RetryError<crate::accelerated::Error>> {
         match self {
-            AccelerationSink::Table(sink) => sink.insert_into(record_batch_stream, overwrite).await,
-            AccelerationSink::Multi(sink) => sink.insert_into(record_batch_stream, overwrite).await,
+            AccelerationSink::Table(sink) => {
+                sink.insert_into(record_batch_stream, overwrite, write)
+                    .await
+            }
+            AccelerationSink::Multi(sink) => {
+                sink.insert_into(record_batch_stream, overwrite, write)
+                    .await
+            }
         }
     }
 }
@@ -172,6 +209,43 @@ pub(crate) async fn rollback_indexes<'a>(
                 index.name()
             );
         }
+    }
+}
+
+/// Builds each Cayenne table's scan view and file listing for the data a refresh
+/// just wrote, so the queries the refresh releases when it completes do not all
+/// stall listing the new files at once.
+///
+/// A partitioned table is prepared partition by partition, the ones its write just
+/// created included. The write walk stops at the partitioned table, so it is resolved
+/// here rather than by each sink: a sink holds the table under the layers the
+/// accelerator stacks over it, and finds no partitions by downcasting it directly.
+///
+/// Call it last, after the index hooks: a refresh superseded by a newer request is
+/// dropped mid-await, and dropping it here skips nothing the write still owes.
+pub(crate) async fn prepare_tables_for_reads(
+    providers: &[Arc<dyn datafusion::datasource::TableProvider>],
+) {
+    for provider in providers {
+        if let Some(partitioned) = spice_table::find_concrete::<PartitionTableProvider>(
+            provider.as_ref(),
+            spice_table::LayerWalk::Write,
+        ) {
+            for partition in partitioned.partition_table_providers().await {
+                prepare_table_for_reads(partition.as_ref()).await;
+            }
+        } else {
+            prepare_table_for_reads(provider.as_ref()).await;
+        }
+    }
+}
+
+async fn prepare_table_for_reads(provider: &dyn datafusion::datasource::TableProvider) {
+    if let Some(cayenne) = spice_table::find_concrete::<cayenne::CayenneTableProvider>(
+        provider,
+        spice_table::LayerWalk::Write,
+    ) {
+        cayenne.prepare_scan_view_for_reads().await;
     }
 }
 
@@ -413,14 +487,6 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn no_indexes_is_a_successful_finalize() {
-        let erased: Vec<Arc<dyn Index + Send + Sync>> = vec![];
-        finalize_indexes("TestSink", erased.iter())
-            .await
-            .expect("an empty index set cannot fail");
-    }
-
     /// An [`Index`] whose start outcome and start-fatality are configurable, recording how
     /// many times it was started and rolled back.
     #[derive(Debug)]
@@ -609,13 +675,5 @@ mod tests {
             0,
             "an index that never started must not be rolled back"
         );
-    }
-
-    #[tokio::test]
-    async fn no_indexes_is_a_successful_prepare() {
-        let erased: Vec<Arc<dyn Index + Send + Sync>> = vec![];
-        prepare_indexes("TestSink", erased.iter(), WriteWindow::Append)
-            .await
-            .expect("an empty index set cannot fail");
     }
 }

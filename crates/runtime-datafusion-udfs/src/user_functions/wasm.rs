@@ -43,21 +43,22 @@ use arrow::array::{ArrayRef, RecordBatchOptions};
 use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use arrow::record_batch::RecordBatch;
 use arrow_ipc::{reader::StreamReader, writer::StreamWriter};
+use arrow_tools::map_entries::{self, MapEntriesNormalizer};
 use datafusion::catalog::{
     Session, TableFunctionImpl, TableProvider, default_table_source::provider_as_source,
 };
+use datafusion::common::TableReference;
 use datafusion::common::{Column, DataFusionError, Result as DataFusionResult, Spans};
 use datafusion::datasource::TableType;
 use datafusion::execution::SessionState;
 use datafusion::logical_expr::{
     ColumnarValue, LogicalPlan, ScalarFunctionArgs, ScalarUDF, ScalarUDFImpl, Signature, Subquery,
-    TableScan, Volatility as DfVolatility,
+    TableScanBuilder, Volatility as DfVolatility,
     simplify::{ExprSimplifyResult, SimplifyContext},
 };
 use datafusion::physical_plan::ExecutionPlan;
 use datafusion::prelude::{Expr, SessionContext};
 use datafusion::scalar::ScalarValue;
-use datafusion::sql::TableReference;
 use datafusion_datasource::memory::MemorySourceConfig;
 use datafusion_datasource::source::DataSourceExec;
 use serde_json::Value;
@@ -236,6 +237,16 @@ pub enum WasmBuildError {
     DecodeArrow { source: arrow::error::ArrowError },
 
     #[snafu(display(
+        "failed to read the Arrow IPC stream returned by WASM function '{function_name}' ({source}), so the function cannot return rows. \
+        Return the MAP column with an `entries` field that is non-nullable and holds no null entries, as the Arrow map layout requires. \
+        See: https://spiceai.org/docs/features/functions"
+    ))]
+    MapEntriesNotNormalizable {
+        function_name: String,
+        source: arrow_tools::map_entries::Error,
+    },
+
+    #[snafu(display(
         "WASM table function output schema does not match declared return schema: {details}"
     ))]
     ReturnSchemaMismatch { details: String },
@@ -382,6 +393,7 @@ async fn build_table_func(
             entrypoint: config.entrypoint,
             limits,
         }),
+        table_type: super::table_type_for_volatility(decl.volatility),
     }))
 }
 
@@ -437,13 +449,11 @@ impl ScalarUDFImpl for WasmScalarTableArgUdf {
         #[expect(deprecated)]
         let provider = self.table_func.call(&args)?;
         let table_source = provider_as_source(provider);
-        let table_scan = TableScan::try_new(
+        let table_scan = TableScanBuilder::new(
             TableReference::bare(format!("{}_result", self.name)),
             table_source,
-            None,
-            vec![],
-            None,
-        )?;
+        )
+        .build()?;
         Ok(ExprSimplifyResult::Simplified(Expr::ScalarSubquery(
             Subquery {
                 subquery: Arc::new(LogicalPlan::TableScan(table_scan)),
@@ -462,6 +472,8 @@ struct WasmTableFunc {
     output_schema: SchemaRef,
     configured_input_source: Option<InputSource>,
     runner: Arc<WasmRunner>,
+    /// See [`super::table_type_for_volatility`].
+    table_type: TableType,
 }
 
 impl Debug for WasmTableFunc {
@@ -488,6 +500,7 @@ impl TableFunctionImpl for WasmTableFunc {
             input_source,
             runner: Arc::clone(&self.runner),
             args,
+            table_type: self.table_type,
         }))
     }
 }
@@ -546,6 +559,7 @@ struct WasmTableProvider {
     input_source: InputSource,
     runner: Arc<WasmRunner>,
     args: Vec<ScalarValue>,
+    table_type: TableType,
 }
 
 #[async_trait::async_trait]
@@ -555,7 +569,7 @@ impl TableProvider for WasmTableProvider {
     }
 
     fn table_type(&self) -> TableType {
-        TableType::Base
+        self.table_type
     }
 
     async fn scan(
@@ -582,7 +596,7 @@ impl TableProvider for WasmTableProvider {
             .await
             .map_err(|source| DataFusionError::Execution(source.to_string()))?
             .map_err(|e| DataFusionError::Execution(e.to_string()))?;
-        let mut batches = decode_ipc(&output_ipc, Arc::clone(&self.output_schema))
+        let mut batches = decode_ipc(&self.name, &output_ipc, Arc::clone(&self.output_schema))
             .map_err(|e| DataFusionError::Execution(e.to_string()))?;
         for batch in &batches {
             validate_schema(
@@ -1126,14 +1140,42 @@ fn encode_ipc(schema: &SchemaRef, batches: &[RecordBatch]) -> Result<Vec<u8>> {
     Ok(bytes)
 }
 
-fn decode_ipc(bytes: &[u8], empty_schema: SchemaRef) -> Result<Vec<RecordBatch>> {
+fn decode_ipc(
+    function_name: &str,
+    bytes: &[u8],
+    empty_schema: SchemaRef,
+) -> Result<Vec<RecordBatch>> {
     if bytes.is_empty() {
         return Ok(vec![RecordBatch::new_empty(empty_schema)]);
     }
     let reader = StreamReader::try_new(Cursor::new(bytes), None).context(DecodeArrowSnafu)?;
+    // A WASM module is free to declare a MAP's `entries` field nullable, which the Arrow map
+    // layout forbids. `ArrayData` validation refuses to build a batch under that declaration, so
+    // such a stream is read through `read_ipc_stream`, which relabels the stream's schema message,
+    // decodes every buffer with full validation, and brings each batch back to the map it
+    // describes. One stream carries one schema, so what its batches need is resolved once.
+    let declared = reader.schema();
+    let normalizer = MapEntriesNormalizer::for_schema(&declared);
+    if !Arc::ptr_eq(normalizer.decode_schema(), &declared) {
+        return map_entries::read_ipc_stream(bytes).map_err(|error| match error {
+            map_entries::Error::UndecodableStream { source } => {
+                WasmBuildError::DecodeArrow { source }
+            }
+            named => WasmBuildError::MapEntriesNotNormalizable {
+                function_name: function_name.to_string(),
+                source: named,
+            },
+        });
+    }
+    // A conforming declaration decodes as it stands. The normalizer still refuses a map whose
+    // entries hold nulls, naming the column, where a later kernel would fail without naming it.
     reader
-        .collect::<std::result::Result<Vec<_>, _>>()
-        .context(DecodeArrowSnafu)
+        .map(|batch| {
+            normalizer
+                .normalize(batch.context(DecodeArrowSnafu)?)
+                .context(MapEntriesNotNormalizableSnafu { function_name })
+        })
+        .collect()
 }
 
 fn validate_schema(function_name: &str, actual: &Schema, expected: &Schema) -> Result<()> {
@@ -1526,6 +1568,45 @@ mod tests {
         assert!(matches!(err, WasmBuildError::CallExport { .. }));
     }
 
+    /// A table-function call plans as a `TableScan` of the provider it
+    /// returned, so the provider's table type is the only trace of the
+    /// declared volatility the SQL results cache can see. Anything not
+    /// declared `immutable` must plan as `Temporary`, which the cache never
+    /// stores.
+    #[tokio::test]
+    async fn wasm_table_udtf_scan_is_temporary_unless_immutable() {
+        use datafusion::common::tree_node::{TreeNode, TreeNodeRecursion};
+
+        let temp_dir = tempfile::tempdir().expect("tempdir");
+        let module = identity_wasm(&temp_dir);
+        for (volatility, expected) in [
+            (Volatility::Immutable, TableType::Base),
+            (Volatility::Stable, TableType::Temporary),
+            (Volatility::Volatile, TableType::Temporary),
+        ] {
+            let mut decl = wasm_identity_decl(&module);
+            decl.volatility = volatility;
+            let udtf = build_table_udtf(&decl, None).await.expect("builds");
+            let ctx = SessionContext::new();
+            ctx.register_udtf(&decl.name, udtf);
+            let plan = ctx
+                .state()
+                .create_logical_plan("SELECT value FROM wasm_identity()")
+                .await
+                .expect("plans");
+
+            let mut scan_types = Vec::new();
+            plan.apply(|node| {
+                if let LogicalPlan::TableScan(scan) = node {
+                    scan_types.push(scan.source.table_type());
+                }
+                Ok(TreeNodeRecursion::Continue)
+            })
+            .expect("walks the plan");
+            assert_eq!(scan_types, [expected], "{volatility:?}");
+        }
+    }
+
     #[tokio::test]
     async fn wasm_table_udtf_round_trips_arrow_ipc_from_input_table() {
         let temp_dir = tempfile::tempdir().expect("tempdir");
@@ -1900,5 +1981,83 @@ mod tests {
             .downcast_ref::<Int64Array>()
             .expect("int64 values");
         assert_eq!(values.values(), &[1_i64, 2, 3]);
+    }
+
+    /// Builds a `MapArray` the way the Arrow IPC reader does — straight from `ArrayData`, so
+    /// neither of `MapArray::try_new`'s `entries` checks runs and a module's non-conforming
+    /// declaration survives the decode.
+    fn nullable_entries_map_batch() -> RecordBatch {
+        use arrow::array::{Array, ArrayData, MapArray, StringArray, StructArray};
+        use arrow::buffer::Buffer;
+        use arrow::datatypes::Fields;
+
+        let entry_fields: Fields = vec![
+            Field::new("key", DataType::Utf8, false),
+            Field::new("value", DataType::Utf8, true),
+        ]
+        .into();
+        let data_type = DataType::Map(
+            Arc::new(Field::new(
+                "entries",
+                DataType::Struct(entry_fields.clone()),
+                true,
+            )),
+            false,
+        );
+
+        let entries = StructArray::try_new(
+            entry_fields,
+            vec![
+                Arc::new(StringArray::from(vec!["k0"])) as ArrayRef,
+                Arc::new(StringArray::from(vec![Some("v0")])) as ArrayRef,
+            ],
+            None,
+        )
+        .expect("entries struct");
+
+        let builder = ArrayData::builder(data_type.clone())
+            .len(1)
+            .add_buffer(Buffer::from_slice_ref([0_i32, 1]))
+            .add_child_data(entries.to_data());
+        // SAFETY: the offsets, buffers and child data are well formed. Only the
+        // `entries` nullability declaration is what `ArrayData::validate` rejects,
+        // and reproducing it is the point of the fixture — the IPC reader builds
+        // such a map without either entries check.
+        let data = unsafe { builder.build_unchecked() };
+
+        RecordBatch::try_new(
+            Arc::new(Schema::new(vec![Field::new("m", data_type, true)])),
+            vec![Arc::new(MapArray::from(data)) as ArrayRef],
+        )
+        .expect("map batch")
+    }
+
+    fn ipc_stream(batch: &RecordBatch) -> Vec<u8> {
+        let mut buf = Vec::new();
+        {
+            let mut writer = StreamWriter::try_new(&mut buf, &batch.schema()).expect("ipc writer");
+            writer.write(batch).expect("write batch");
+            writer.finish().expect("finish stream");
+        }
+        buf
+    }
+
+    /// Regression test for #13495: a WASM module declaring a `MAP`'s `entries` nullable — which
+    /// the Arrow map layout forbids — is brought into line at the decode point. Left as declared,
+    /// `validate_schema` rejects the batch for a nullability difference it never explains, and
+    /// any kernel that rebuilds the column fails reporting nulls the column does not hold.
+    #[test]
+    fn a_nullable_entries_map_returned_by_a_module_is_decoded_and_accepted() {
+        let batch = nullable_entries_map_batch();
+        let declared = arrow_tools::map_entries::conforming_schema(batch.schema());
+
+        let decoded = decode_ipc("m_fn", &ipc_stream(&batch), Arc::clone(&declared))
+            .expect("a nullable entries declaration is relabelled, not refused");
+        let [decoded] = decoded.as_slice() else {
+            panic!("one batch in, one batch out");
+        };
+        assert_eq!(&decoded.schema(), &declared);
+        validate_schema("m_fn", decoded.schema().as_ref(), declared.as_ref())
+            .expect("the corrected batch matches the function's declared return schema");
     }
 }

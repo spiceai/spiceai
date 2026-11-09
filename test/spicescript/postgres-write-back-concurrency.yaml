@@ -1,0 +1,103 @@
+name: postgres-write-back-concurrency
+description: >
+  Writes through Spice to a CDC Cayenne dataset backed by PostgreSQL,
+  running while the source itself is written, end in the same rows in Spice
+  and in PostgreSQL: inserts keyed by round (so a lost or doubled write
+  shows in the count) and increments (so a lost update shows in the sum),
+  Spice's on some keys and the source's on others, with write_back and
+  write_through.
+
+sources:
+  src: { kind: postgres }
+
+variants:
+  write-back: {}
+  write-through: { datasets: { '*': { acceleration: { write_mode: write_through } } } }
+
+spicepod:
+  version: v1
+  kind: Spicepod
+  name: postgres-write-back-concurrency
+  datasets:
+    - from: postgres:public.acct
+      name: acct
+      params: { $merge: '${sources.src.params}', pg_replication_slot: 'wc_acct_${sources.src.namespace}' }
+      access: read_write
+      replication: { enabled: true }
+      acceleration: { enabled: true, engine: cayenne, mode: file, refresh_mode: changes, write_mode: write_back, primary_key: id }
+    - from: postgres:public.log
+      name: log
+      params: { $merge: '${sources.src.params}', pg_replication_slot: 'wc_log_${sources.src.namespace}' }
+      access: read_write
+      replication: { enabled: true }
+      acceleration: { enabled: true, engine: cayenne, mode: file, refresh_mode: changes, write_mode: write_back, primary_key: id }
+
+defaults:
+  cluster-partition-by: { '*': id }
+  expect: { oracle: src }
+  compare-variants: false
+
+steps:
+  - source-exec:
+      src: |
+        -- bal is bigint: write_through refuses arithmetic on narrower
+        -- columns (known-failing/write-back/postgres-write-through-arithmetic.yaml).
+        CREATE TABLE acct (id int PRIMARY KEY, bal bigint NOT NULL);
+        INSERT INTO acct SELECT i, 1000 FROM generate_series(1, 200) i;
+        CREATE TABLE log (id bigint PRIMARY KEY, who text NOT NULL);
+  - start: {}
+  - query: SELECT count(*) AS n, sum(bal) AS total FROM acct
+    expect: { rows: [['200', '200000']] }
+    eventually: 60s
+
+  # Spice writes keys 1-100 and log ids from 1; the source keys 101-200 and
+  # log ids from 1,000,000. Under write_back the two Spice writes are one
+  # transaction, from one writer; under write_through, which takes no
+  # transactions, they are separate statements from two.
+  - background:
+      id: spice-writes
+      query: >-
+        BEGIN; UPDATE acct SET bal = bal + 1 WHERE id = 1 + (${round} % 100);
+        INSERT INTO log VALUES (${round} + 1, 'spice'); COMMIT;
+      every: 20ms
+    only: write-back
+  - background:
+      id: spice-writes
+      concurrency: 2
+      query: >-
+        UPDATE acct SET bal = bal + 1 WHERE id = 1 + (${round} % 100)
+      every: 20ms
+    only: write-through
+  - background:
+      id: spice-inserts
+      query: INSERT INTO log VALUES (${round} + 1, 'spice')
+      every: 20ms
+    only: write-through
+  - background:
+      id: source-writes
+      source-exec:
+        src: >-
+          UPDATE acct SET bal = bal + 1 WHERE id = 101 + (${round} % 100);
+          INSERT INTO log VALUES (1000000 + ${round}, 'source');
+      every: 20ms
+  - sleep: 20s
+  # A write-back transaction conflicts with CDC applying the source's writes
+  # to the same table, and is retried by the caller; the source's writes keep
+  # most of them from committing, so the answers below show which did.
+  - stop-background: { id: spice-writes, allow: ['^409 Conflict: transaction write conflict'] }
+  - stop-background: { id: spice-inserts }
+    only: write-through
+  - stop-background: { id: source-writes }
+
+  # Everything delivered and replicated: the two agree.
+  - query: SELECT * FROM acct
+    eventually: 90s
+  - query: SELECT * FROM log
+    eventually: 90s
+  - query: SELECT who, count(*) AS n, count(DISTINCT id) AS ids FROM log GROUP BY who ORDER BY who
+  - query: SELECT sum(bal) - 200000 AS added FROM acct
+  - restart: {}
+  - query: SELECT * FROM acct
+    eventually: 60s
+  - query: SELECT * FROM log
+    eventually: 60s

@@ -1,0 +1,638 @@
+[
+  {
+    "slug": "2025-spice-ai-year-in-review",
+    "title": "2025 Spice AI Year in Review",
+    "date": "'2026-01-02T20:15:30'",
+    "words": 1939,
+    "headings": [
+      "## Frequently Asked Questions",
+      "### What is Spice.ai?",
+      "### What were the biggest Spice releases in 2025?",
+      "### How does Spice compare to a traditional data warehouse?"
+    ]
+  },
+  {
+    "slug": "a-developers-guide-to-understanding-spice-ai",
+    "title": "A Developer's Guide to Understanding Spice.ai",
+    "date": "'2026-02-05T22:12:21'",
+    "words": 4689,
+    "headings": [
+      "# Full refresh every 8 hours",
+      "# Append mode: check for new records from the last day every 10 minutes",
+      "# Continuous ingestion using Kafka",
+      "# CDC with Debezium or DynamoDB Streams",
+      "## Frequently Asked Questions",
+      "### What is Spice.ai used for?",
+      "### How is Spice different from a data warehouse like Snowflake or Databricks?",
+      "### What programming languages work with Spice?",
+      "### Can Spice be deployed at the edge or on-premises?",
+      "### Is Spice AI open source?"
+    ]
+  },
+  {
+    "slug": "a-new-class-of-applications-that-learn-and-adapt",
+    "title": "A New Class of Applications That Learn and Adapt",
+    "date": "'2021-12-30T18:08:39'",
+    "words": 1246,
+    "headings": []
+  },
+  {
+    "slug": "adding-spice-the-next-generation-of-spice-ai-oss",
+    "title": "Adding Spice - The Next Generation of Spice.ai OSS",
+    "date": "'2024-03-28T18:57:06'",
+    "words": 1251,
+    "headings": [
+      "## Frequently Asked Questions",
+      "### What is Spice.ai OSS?",
+      "### How is Spice.ai OSS different from a traditional database or data warehouse?",
+      "### What programming languages and protocols does Spice support?"
+    ]
+  },
+  {
+    "slug": "ai-needs-ai-ready-data",
+    "title": "AI needs AI-ready data",
+    "date": "'2021-12-05T04:30:17'",
+    "words": 1357,
+    "headings": []
+  },
+  {
+    "slug": "amazon-s3-vectors",
+    "title": "Spice.ai Now Supports Amazon S3 Vectors For Vector Search at Petabyte Scale!",
+    "date": "'2025-07-16T18:59:00'",
+    "words": 1203,
+    "headings": [
+      "## Frequently Asked Questions",
+      "### What is Amazon S3 Vectors?",
+      "### How does Spice.ai integrate with S3 Vectors?",
+      "### Can I combine vector search with keyword search in Spice?"
+    ]
+  },
+  {
+    "slug": "announcing-spice-ai-open-source-1-0-stable",
+    "title": "Announcing Spice.ai Open Source 1.0-stable: A Portable Compute Engine for Data-Grounded AI - Now Ready for Production",
+    "date": "'2025-01-22T19:24:40'",
+    "words": 3136,
+    "headings": [
+      "## Frequently Asked Questions",
+      "### What is Spice.ai OSS 1.0-stable?",
+      "### How does Spice ground AI in data?",
+      "### Does Spice 1.0 replace a data warehouse like Snowflake or Databricks?",
+      "### What real-world results have enterprises achieved with Spice?"
+    ]
+  },
+  {
+    "slug": "announcing-spice-cloud-v1-7-0",
+    "title": "Spice Cloud v1.7.0: DataFusion v49, Full-Text Search Updates & More",
+    "date": "'2025-09-24T17:41:00'",
+    "words": 528,
+    "headings": []
+  },
+  {
+    "slug": "apache-ballista-at-spice-ai",
+    "title": "Apache Ballista at Spice AI: Distributed Query Execution Without the Operational Tax",
+    "date": "'2026-04-09T00:00:00'",
+    "words": 4184,
+    "headings": [
+      "## The Problem: Single-Node Ceilings",
+      "## Why Apache Ballista",
+      "### Early Distributed Results: Spice vs. Spark",
+      "## The Architecture",
+      "### Distributed Query Flow",
+      "## Multi-Active Schedulers with Object Store State",
+      "## What We Built on Top of Ballista",
+      "### 1. Bidirectional Control Streams",
+      "### 2. Remote Catalog and UDF Synchronization",
+      "### 3. mTLS Cluster Security",
+      "### 4. Shuffle Backends",
+      "### 5. Vortex Shuffle Format",
+      "### 6. Custom Codec for Spice Extensions",
+      "### 7. Observability",
+      "## Distributed Acceleration",
+      "### How It Works",
+      "### Partition Management Cycle",
+      "### What This Enables",
+      "## Use Case: Distributed Embeddings",
+      "## Configuration: Simple by Default, Powerful When Needed",
+      "### Single-Node (unchanged)",
+      "### Distributed Cluster",
+      "# Scheduler",
+      "# Executor (role inferred from --scheduler-address)",
+      "### HA Cluster with Object Store",
+      "## Business Value",
+      "### For Data Engineers",
+      "### For Platform Teams",
+      "### For Teams Evaluating Spark or Trino",
+      "## What's Next"
+    ]
+  },
+  {
+    "slug": "apache-iceberg-at-spice-ai",
+    "title": "Apache Iceberg at Spice AI: How we Query, Accelerate, and Write to Open Table Formats",
+    "date": "'2026-02-25T00:00:00'",
+    "words": 4057,
+    "headings": [
+      "## What is Apache Iceberg?",
+      "## The latency gap: Why Iceberg alone isn't enough for applications",
+      "## How Spice.ai bridges the gap",
+      "## Connecting Iceberg to Spice",
+      "# 2025-01-27T19:08:37Z  INFO Registered catalog 'ice' with 1 schema and 8 tables",
+      "## Accelerating Iceberg tables",
+      "## Writing back to Iceberg",
+      "## Under the hood: How Spice queries Iceberg",
+      "### Apache DataFusion: Spice's query engine",
+      "### How a query flows through the system",
+      "### Schema discovery: Loading tables from a namespace",
+      "### Query optimization through Iceberg metadata",
+      "## Key Iceberg features Spice leverages",
+      "### ACID transactions via optimistic concurrency",
+      "### Hidden partitioning",
+      "### Schema evolution without rewrites",
+      "### Time travel",
+      "### File-level pruning via metadata statistics",
+      "## Error handling: Making failures actionable",
+      "## Production lessons",
+      "### 1. Catalog discovery is a startup bottleneck",
+      "### 2. S3 request signing can expire on large tables",
+      "### 3. Environment credentials can leak into explicit configs",
+      "### 4. Not every table in a catalog is an Iceberg table",
+      "## Our contributions to iceberg-rust",
+      "## Current limitations and future work",
+      "## Apache Iceberg + Spice AI: Summary",
+      "## Frequently Asked Questions",
+      "### What is Apache Iceberg?",
+      "### How does Spice AI integrate with Apache Iceberg?",
+      "### Can Spice AI accelerate Iceberg tables for low-latency queries?",
+      "### Does Spice AI support writes to Iceberg tables?",
+      "### What Iceberg catalog types does Spice support?"
+    ]
+  },
+  {
+    "slug": "aws-workshop-federated-queries-and-hybrid-search-with-spice",
+    "title": "AWS Workshop: Federated Queries and Hybrid Search with Spice.ai",
+    "date": "'2026-05-12T00:00:00'",
+    "words": 313,
+    "headings": [
+      "## What the workshop covers"
+    ]
+  },
+  {
+    "slug": "barracuda-networks-100x-faster-query-responses-with-spice",
+    "title": "Barracuda Networks Gains 100x Faster Query Responses and 50% Reduction in Operational Costs with Spice.ai OSS",
+    "date": "'2026-06-12T09:00:00'",
+    "words": 1185,
+    "headings": [
+      "## Solution",
+      "## Benefits",
+      "### Up to 100x Faster Data Lake Query Responses",
+      "### 30x Faster Audit Log Queries",
+      "### Consolidation of Multiple Data Operations into a Single Runtime",
+      "### 50% Reduction in Operational Costs",
+      "## Getting Started with Spice",
+      "## About Spice AI",
+      "## About Barracuda"
+    ]
+  },
+  {
+    "slug": "basis-set-ventures-deploys-spice-ai",
+    "title": "Basis Set Ventures Deploys Spice.ai to Power Natural Language Queries and Mitigate Hallucinations",
+    "date": "'2025-09-17T17:51:00'",
+    "words": 2277,
+    "headings": []
+  },
+  {
+    "slug": "cluster-sidecar-architecture",
+    "title": "Localhost Latency at Scale: The Spice Cluster-Sidecar Architecture",
+    "date": "'2026-04-21T09:00:00'",
+    "words": 6955,
+    "headings": [
+      "## The problem: applications need fast, safe, distributed access to data",
+      "## The solution: an application-local data, search, and inference plane",
+      "### Architecture at a glance",
+      "### The sidecar as a sandbox",
+      "## Why split the tiers",
+      "### Sidecars stay lightweight",
+      "### The cluster ingests once",
+      "### Query delegation uses Arrow Flight end-to-end",
+      "## The cluster tier: Ballista + Spice Cayenne",
+      "### Apache Ballista: distributed SQL execution",
+      "### Cayenne: acceleration that scales past 1 TB",
+      "### Acceleration snapshots: single writer, many readers",
+      "## Results caching: the third latency tier",
+      "## Engineering decisions",
+      "### 1. Declarative sidecar configuration",
+      "### 2. Cache coherency is a refresh policy, not a protocol",
+      "### 3. Resilience through local state",
+      "## Putting it together: a request path",
+      "## When to use it",
+      "## A concrete example: a multi-tenant agent platform",
+      "## A minimal spicepod illustrating the pattern",
+      "## The Spice Cloud hybrid model",
+      "## Self-hosted at enterprise scale: Spice.ai Enterprise",
+      "## Getting started"
+    ]
+  },
+  {
+    "slug": "contribution-of-tableproviders-to-datafusion",
+    "title": "Spice AI Announces Contribution of TableProviders for PostgreSQL, MySQL, DuckDB, and SQLite to the Apache DataFusion Project",
+    "date": "'2024-07-04T19:11:00'",
+    "words": 508,
+    "headings": []
+  },
+  {
+    "slug": "databricks-partnership",
+    "title": "Announcing Our Partnership with Databricks!",
+    "date": "'2025-06-10T19:04:00'",
+    "words": 447,
+    "headings": []
+  },
+  {
+    "slug": "getting-started-with-amazon-s3-vectors-and-spice",
+    "title": "Getting started with Amazon S3 Vectors and Spice",
+    "date": "'2025-07-31T21:35:21'",
+    "words": 5595,
+    "headings": []
+  },
+  {
+    "slug": "how-we-use-apache-datafusion-at-spice-ai",
+    "title": "How we use Apache DataFusion at Spice AI",
+    "date": "'2026-01-15T19:31:56'",
+    "words": 4652,
+    "headings": [
+      "## Frequently Asked Questions",
+      "### What is Apache DataFusion?",
+      "### How does Spice AI use Apache DataFusion?",
+      "### What are DataFusion TableProviders?",
+      "### Can DataFusion handle federated queries across multiple databases?",
+      "### Does Spice contribute back to the Apache DataFusion project?"
+    ]
+  },
+  {
+    "slug": "interviewing-at-spice-ai",
+    "title": "Interviewing at Spice AI",
+    "date": "'2024-03-14T19:22:00'",
+    "words": 1241,
+    "headings": []
+  },
+  {
+    "slug": "introducing-spice-cayenne-data-accelerator",
+    "title": "Introducing Spice Cayenne: The Next-Generation Data Accelerator Built on Vortex for Performance and Scale",
+    "date": "'2025-12-17T23:58:50'",
+    "words": 2102,
+    "headings": [
+      "## Frequently Asked Questions",
+      "### What is Spice Cayenne?",
+      "### How does Cayenne compare to DuckDB for data acceleration?",
+      "### What is the Vortex columnar format?",
+      "### When should I use Cayenne instead of DuckDB or Arrow acceleration in Spice?"
+    ]
+  },
+  {
+    "slug": "introducing-spice-skills-for-ai-coding-agents",
+    "title": "Introducing Spice Skills for AI Agents",
+    "date": "'2026-03-26T09:00:00'",
+    "words": 754,
+    "headings": [
+      "## What's Included",
+      "## Installation",
+      "## Why Skills",
+      "## Skill Structure",
+      "## Get Started"
+    ]
+  },
+  {
+    "slug": "making-apps-that-learn-and-adapt",
+    "title": "Making Apps That Learn And Adapt",
+    "date": "'2021-11-05T05:55:47'",
+    "words": 1047,
+    "headings": []
+  },
+  {
+    "slug": "making-object-storage-operational",
+    "title": "Making Object Storage Operational for Real-Time and AI Workloads",
+    "date": "'2025-10-06T17:37:00'",
+    "words": 1844,
+    "headings": [
+      "## Frequently Asked Questions",
+      "### Why is object storage alone not enough for real-time workloads?",
+      "### How does Spice make object storage operational?",
+      "### Can Spice handle both search and structured queries on object storage data?"
+    ]
+  },
+  {
+    "slug": "multi-tenancy-for-ai-agents-without-pipelines",
+    "title": "Multi-Tenancy for AI Agents without the Pipelines",
+    "date": "'2026-04-15T00:00:00'",
+    "words": 2121,
+    "headings": [
+      "## The AI Agent Challenge in Multi-Tenant SaaS",
+      "## What Spice Enables",
+      "## Pattern 1: Query-Time Tenant Isolation",
+      "### Variant: View-Based Tenant Isolation",
+      "## Pattern 2: Config-Level Tenant Isolation",
+      "## Pattern 3: Runtime-Level Tenant Isolation",
+      "## Pattern 4: Hybrid Isolation",
+      "# router config (conceptual)",
+      "## Getting Started"
+    ]
+  },
+  {
+    "slug": "on-writing",
+    "title": "On Writing",
+    "date": "'2024-05-23T19:14:00'",
+    "words": 1204,
+    "headings": []
+  },
+  {
+    "slug": "openclaw-and-spice-governed-access-to-production-data-for-enterprise-agents",
+    "title": "Building an Enterprise SRE Agent with OpenClaw and Spice",
+    "date": "'2026-05-19T00:00:00'",
+    "words": 1442,
+    "headings": [
+      "## How does Spice give OpenClaw governed access to production data?",
+      "## What does the OpenClaw SRE architecture look like?",
+      "## Incident one: latency spike",
+      "## Incident two: PgBouncer and Postgres connection exhaustion",
+      "## How does the agent assess customer impact?",
+      "## How does Spice make agent activity observable?",
+      "## What changes when deploying AI agents in production?",
+      "## Key takeaways",
+      "## Getting started with governed AI agents"
+    ]
+  },
+  {
+    "slug": "operationalizing-amazon-s3-for-ai",
+    "title": "Operationalizing Amazon S3 for AI: From Data Lake to AI-Ready Platform in Minutes",
+    "date": "'2026-02-03T18:03:10'",
+    "words": 3564,
+    "headings": [
+      "## Frequently Asked Questions",
+      "### What does it mean to operationalize Amazon S3 for AI?",
+      "### Can S3 be used as a vector database for AI applications?",
+      "### How does Spice accelerate queries on S3 data?",
+      "### What is the difference between S3 Tables and traditional S3 storage for analytics?"
+    ]
+  },
+  {
+    "slug": "real-time-acceleration-with-dynamodb-streams",
+    "title": "Real-Time\u00a0Control\u00a0Plane Acceleration with DynamoDB Streams\u00a0",
+    "date": "'2026-01-22T19:42:03'",
+    "words": 3055,
+    "headings": []
+  },
+  {
+    "slug": "real-time-hybrid-search-using-rrf",
+    "title": "Real-Time Hybrid Search Using RRF: A Hands-On Guide with Spice",
+    "date": "'2025-10-23T16:10:00'",
+    "words": 2652,
+    "headings": [
+      "## Frequently Asked Questions",
+      "### What is Reciprocal Rank Fusion (RRF) and how does it work?",
+      "### When should I use hybrid search instead of vector search alone?",
+      "### How does Spice implement hybrid search in a single query?",
+      "### What is the advantage of RRF over other fusion methods like weighted scoring?"
+    ]
+  },
+  {
+    "slug": "spice-2-0-is-now-available",
+    "title": "Spice 2.0: Real-Time Analytical Query on Operational Data, Without ETL",
+    "date": "'2026-07-09T16:00:00'",
+    "words": 4084,
+    "headings": [
+      "## What's New in Spice 2.x",
+      "## Performance",
+      "### Analytics on live operational data: CH-BenCHmark",
+      "### Operational freshness under load",
+      "### Spice 2.0 vs. Spice 1.x: same hardware, same data",
+      "### Distributed query: near-linear scaling",
+      "## Early feedback on 2.0",
+      "### Barracuda Networks - Spice Cayenne acceleration for email archive search",
+      "### Summation - Unified AI-driven decision platform",
+      "### Lenovo - Real-time, governed data for enterprise agents",
+      "## Spice 2.0 in Depth",
+      "### High-Throughput Change-Data-Capture (CDC) Replication",
+      "### Multi-Node Distributed Compute built on Apache Ballista",
+      "### Cluster-Sidecar Architecture",
+      "### Spice Cayenne (GA)",
+      "### Spice Kubernetes Operator",
+      "### Enterprise Security & Control",
+      "### The Spice Cloud Hybrid Model",
+      "## What's next",
+      "## Start building",
+      "## Additional 2.0 Highlights"
+    ]
+  },
+  {
+    "slug": "spice-ai-achieves-soc-2-type-ii-compliance",
+    "title": "Spice AI achieves SOC 2 Type II compliance",
+    "date": "'2024-03-05T19:25:00'",
+    "words": 609,
+    "headings": []
+  },
+  {
+    "slug": "spice-ai-for-github-copilot-extension-now-available",
+    "title": "The Spice.ai for GitHub Copilot Extension is now available!",
+    "date": "'2024-10-27T19:07:00'",
+    "words": 999,
+    "headings": []
+  },
+  {
+    "slug": "spice-ai-is-now-generally-available",
+    "title": "Spice.ai is now generally available!",
+    "date": "'2023-10-25T19:34:00'",
+    "words": 1169,
+    "headings": []
+  },
+  {
+    "slug": "spice-and-power-bi",
+    "title": "Faster, Simpler Dashboards with Spice and Power BI",
+    "date": "'2025-09-15T18:51:00'",
+    "words": 1589,
+    "headings": []
+  },
+  {
+    "slug": "spice-cloud-v1-10",
+    "title": "Spice Cloud v1.10: Caching Acceleration Mode, DynamoDB Streams Support, & More!",
+    "date": "'2025-12-10T18:30:11'",
+    "words": 782,
+    "headings": []
+  },
+  {
+    "slug": "spice-cloud-v1-11",
+    "title": "Spice Cloud v1.11: Spice Cayenne Reaches Beta, Apache DataFusion v51, DynamoDB Streams Improvements, & More",
+    "date": "'2026-01-30T17:56:27'",
+    "words": 1632,
+    "headings": []
+  },
+  {
+    "slug": "spice-cloud-v1-8-0-iceberg-writes",
+    "title": "Spice Cloud v1.8.0: Iceberg Write Support, Acceleration Snapshots & More",
+    "date": "'2025-10-08T17:29:00'",
+    "words": 878,
+    "headings": []
+  },
+  {
+    "slug": "spice-cloud-v1-9-0-cayenne-data-accelerator",
+    "title": "Spice Cloud v1.9.0: Introducing the Spice Cayenne Data Accelerator",
+    "date": "'2025-11-20T18:21:00'",
+    "words": 626,
+    "headings": []
+  },
+  {
+    "slug": "spice-cloud-v2-0-rc-2",
+    "title": "Spice Cloud v2.0-rc.2: Cayenne RC, ADBC BigQuery, and Catalog Connectors",
+    "date": "'2026-04-20T12:30:00'",
+    "words": 873,
+    "headings": [
+      "## New in Spice Cloud!",
+      "### Update Channel for Preview Releases",
+      "### [api.spice.ai](https://api.spice.ai) Management API",
+      "### Audit Log",
+      "## Major v2.0-rc.2 Features",
+      "### Spice Cayenne Reaches RC",
+      "### ADBC Data Connector & Catalog",
+      "### New Catalog Connectors",
+      "### Apache DataFusion v52 Upgrade",
+      "## Additional Updates",
+      "## Related Deep Dives",
+      "### Apache Iceberg at Spice AI: Query, Accelerate, and Write to Open Table Formats",
+      "### Vortex at Spice AI: The Columnar Format for Data-Intensive Workloads",
+      "### Apache Ballista at Spice AI: Distributed Query Execution Without the Operational Tax",
+      "## Join the Spice Community on Slack"
+    ]
+  },
+  {
+    "slug": "spice-firecache",
+    "title": "Spice Firecache | Cloud-Scale DuckDB",
+    "date": "'2023-12-05T19:28:00'",
+    "words": 1178,
+    "headings": []
+  },
+  {
+    "slug": "spice-oss-rebuilt-in-rust",
+    "title": "Spice OSS, rebuilt in Rust",
+    "date": "'2024-04-01T19:19:00'",
+    "words": 293,
+    "headings": []
+  },
+  {
+    "slug": "spice-sql-query-federation-acceleration",
+    "title": "Getting Started with Spice.ai SQL Query Federation & Acceleration",
+    "date": "'2025-10-14T17:15:00'",
+    "words": 2077,
+    "headings": [
+      "## Frequently Asked Questions",
+      "### What is SQL query federation?",
+      "### How does data acceleration differ from caching?",
+      "### Can Spice query data without moving it from the source?",
+      "### What data sources does Spice support for federation?"
+    ]
+  },
+  {
+    "slug": "spiceais-approach-to-time-series-ai",
+    "title": "Spice.ai's approach to Time-Series AI",
+    "date": "'2021-11-18T18:27:54'",
+    "words": 1288,
+    "headings": []
+  },
+  {
+    "slug": "spicepods-from-zero-to-hero",
+    "title": "Spicepods: From Zero to Hero",
+    "date": "'2021-12-02T18:41:30'",
+    "words": 2126,
+    "headings": []
+  },
+  {
+    "slug": "teaching-apps-how-to-learn-with-spicepods",
+    "title": "Teaching Apps how to Learn with Spicepods",
+    "date": "'2021-11-15T18:20:37'",
+    "words": 1271,
+    "headings": []
+  },
+  {
+    "slug": "the-analytics-replica-pattern-shortening-the-path-to-data-based-ai",
+    "title": "The Analytics Replica Pattern: The Shortest Path to Data-Grounded AI",
+    "date": "'2026-07-29T00:00:00'",
+    "words": 1622,
+    "headings": [
+      "## Introduction",
+      "## Real-time analytics on operational data",
+      "## What use cases does the analytics replica pattern enable?",
+      "## Why use Spice as an analytics replica?",
+      "## Spice Cayenne: Analytical query built for fast ingest",
+      "## Availability and Pricing",
+      "## Try It",
+      "## Frequently Asked Questions",
+      "### How is an analytics replica different from a read replica?",
+      "### How is the analytics replica pattern different from ETL into a data warehouse?",
+      "### How is an analytics replica different from an HTAP database?",
+      "### Do I have to replicate the entire database?",
+      "### Can AI agents safely query an analytics replica?",
+      "### How fresh is the data in an analytics replica?"
+    ]
+  },
+  {
+    "slug": "true-hybrid-search",
+    "title": "True Hybrid Search: Vector, Full-Text, and SQL in One Runtime",
+    "date": "'2025-09-22T17:46:00'",
+    "words": 2490,
+    "headings": [
+      "## Frequently Asked Questions",
+      "### What makes a hybrid search implementation \"true\" hybrid?",
+      "### Is hybrid search slower than running vector search alone?",
+      "### How does hybrid search combine results from vector and keyword search?",
+      "### Do you need a separate vector database for hybrid search?",
+      "### What role do embeddings play in hybrid search?",
+      "### When is keyword search better than vector search?",
+      "### What is a common mistake when implementing hybrid search?"
+    ]
+  },
+  {
+    "slug": "vortex-at-spice-ai-the-columnar-format-for-data-intensive-workloads",
+    "title": "Vortex at Spice AI: The Columnar Format for Data-Intensive Workloads",
+    "date": "'2026-04-07T00:00:00'",
+    "words": 3789,
+    "headings": [
+      "## TL;DR",
+      "## Introduction",
+      "## Engineering at Spice AI Series",
+      "## So, What Is Vortex?",
+      "## How Vortex Fits in Spice's Architecture",
+      "## Why Vortex for Cayenne?",
+      "## Cayenne Architecture",
+      "## Key Design Decisions",
+      "### Virtual Files: Directories as ListingTables",
+      "### Deletion Vectors and Sequence Numbers",
+      "### Compaction",
+      "### Compression Strategies",
+      "## DataFusion Integration",
+      "## Distributed Execution: Vortex Shuffles",
+      "## Contributing to Vortex",
+      "## Production Lessons",
+      "## Getting Started with Vortex and Cayenne",
+      "## Conclusion"
+    ]
+  },
+  {
+    "slug": "what-data-informs-ai-driven-decision-making",
+    "title": "What Data Informs AI-driven Decision Making?",
+    "date": "'2022-01-04T05:36:13'",
+    "words": 1753,
+    "headings": []
+  },
+  {
+    "slug": "write-to-apache-iceberg-tables-with-sql",
+    "title": "Write to Apache Iceberg Tables with SQL in Spice",
+    "date": "'2025-11-18T23:27:09'",
+    "words": 2049,
+    "headings": [
+      "## Frequently Asked Questions",
+      "### Do you need Apache Spark to write to Apache Iceberg tables?",
+      "### Can Spice write data from other databases into Iceberg tables?",
+      "### Can other query engines read the data Spice writes to Iceberg?",
+      "### Can you update or delete rows in an Iceberg table with Spice?",
+      "### What happens if an INSERT does not match the Iceberg table schema?",
+      "### Why write to Iceberg tables instead of plain Parquet files on object storage?",
+      "### Can you query data immediately after writing it to an Iceberg table?"
+    ]
+  }
+]

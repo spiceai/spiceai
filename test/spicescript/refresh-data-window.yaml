@@ -1,0 +1,75 @@
+name: refresh-data-window
+description: >
+  `refresh_data_window` loads into Cayenne only the rows whose time column
+  falls inside the window ending now, for each `time_format`: timestamptz,
+  timestamp, epoch seconds and milliseconds, ISO 8601 text and date; rows
+  from before the window and none from inside it are missing, rows in the
+  future are kept, and a refresh after time moves on drops nothing it should
+  keep.
+
+sources:
+  src: { kind: postgres }
+
+spicepod:
+  version: v1
+  kind: Spicepod
+  name: refresh-data-window
+  datasets:
+    - { from: postgres:public.t, name: w_tz, params: '${sources.src.params}', time_column: ts, time_format: timestamptz,
+        acceleration: { enabled: true, engine: cayenne, mode: file, refresh_data_window: 1d } }
+    - { from: postgres:public.t, name: w_naive, params: '${sources.src.params}', time_column: ts_naive, time_format: timestamp,
+        acceleration: { enabled: true, engine: cayenne, mode: file, refresh_data_window: 1d } }
+    - { from: postgres:public.t, name: w_secs, params: '${sources.src.params}', time_column: secs, time_format: unix_seconds,
+        acceleration: { enabled: true, engine: cayenne, mode: file, refresh_data_window: 1d } }
+    - { from: postgres:public.t, name: w_ms, params: '${sources.src.params}', time_column: ms, time_format: unix_millis,
+        acceleration: { enabled: true, engine: cayenne, mode: file, refresh_data_window: 1d } }
+    - { from: postgres:public.t, name: w_iso, params: '${sources.src.params}', time_column: iso, time_format: ISO8601,
+        acceleration: { enabled: true, engine: cayenne, mode: file, refresh_data_window: 1d } }
+    - { from: postgres:public.t, name: w_day, params: '${sources.src.params}', time_column: day, time_format: date,
+        acceleration: { enabled: true, engine: cayenne, mode: file, refresh_data_window: 3d } }
+
+defaults:
+  cluster-partition-by: { '*': id }
+  expect: { oracle: src }
+
+steps:
+  # Rows at hours from now; every column holds the same instant. The window
+  # edge is never within an hour of a row.
+  - source-exec:
+      src: |
+        CREATE TABLE t (id int PRIMARY KEY, ts timestamptz, ts_naive timestamp, secs bigint, ms bigint, iso text, day date);
+        CREATE FUNCTION add_rows(first_id int, hours_ago int[]) RETURNS void LANGUAGE sql AS $$
+          INSERT INTO t SELECT first_id + n - 1, s, s AT TIME ZONE 'UTC', extract(epoch FROM s)::bigint,
+            (extract(epoch FROM s) * 1000)::bigint, to_char(s AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS"Z"'),
+            (s AT TIME ZONE 'UTC')::date
+          FROM unnest(hours_ago) WITH ORDINALITY AS u(h, n), LATERAL (SELECT date_trunc('second', now()) - h * INTERVAL '1 hour') AS x(s)
+        $$;
+        SELECT add_rows(1, ARRAY[200, 72, 30, 23, 12, 1, -1, -48]);
+  - start: {}
+  - query: SELECT id FROM w_tz ORDER BY id
+    oracle-sql: SELECT id FROM t WHERE ts >= now() - INTERVAL '1 day' ORDER BY id
+  - query: SELECT id FROM w_naive ORDER BY id
+    oracle-sql: SELECT id FROM t WHERE ts >= now() - INTERVAL '1 day' ORDER BY id
+  - query: SELECT id FROM w_secs ORDER BY id
+    oracle-sql: SELECT id FROM t WHERE ts >= now() - INTERVAL '1 day' ORDER BY id
+  - query: SELECT id FROM w_ms ORDER BY id
+    oracle-sql: SELECT id FROM t WHERE ts >= now() - INTERVAL '1 day' ORDER BY id
+  - query: SELECT id FROM w_iso ORDER BY id
+    oracle-sql: SELECT id FROM t WHERE ts >= now() - INTERVAL '1 day' ORDER BY id
+  # A date is in the window when its midnight is.
+  - query: SELECT id FROM w_day ORDER BY id
+    oracle-sql: SELECT id FROM t WHERE day::timestamp >= (now() AT TIME ZONE 'UTC') - INTERVAL '3 days' ORDER BY id
+  - query: SELECT * FROM w_tz ORDER BY id
+    oracle-sql: SELECT * FROM t WHERE ts >= now() - INTERVAL '1 day' ORDER BY id
+
+  # New rows, inside and outside the window; a full refresh reloads the window.
+  - source-exec: { src: "SELECT add_rows(100, ARRAY[60, 20, 0])" }
+  - refresh: w_tz
+  - refresh: w_ms
+  - refresh: w_iso
+  - query: SELECT id FROM w_tz ORDER BY id
+    oracle-sql: SELECT id FROM t WHERE ts >= now() - INTERVAL '1 day' ORDER BY id
+  - query: SELECT id FROM w_ms ORDER BY id
+    oracle-sql: SELECT id FROM t WHERE ts >= now() - INTERVAL '1 day' ORDER BY id
+  - query: SELECT id FROM w_iso ORDER BY id
+    oracle-sql: SELECT id FROM t WHERE ts >= now() - INTERVAL '1 day' ORDER BY id

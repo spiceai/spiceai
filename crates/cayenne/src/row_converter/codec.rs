@@ -75,6 +75,14 @@ impl RowCodec {
     }
 
     pub(crate) fn convert_columns(&self, columns: &[ArrayRef]) -> Result<Rows, ArrowError> {
+        self.convert_columns_reusing(columns, None)
+    }
+
+    pub(crate) fn convert_columns_reusing(
+        &self,
+        columns: &[ArrayRef],
+        scratch: Option<Rows>,
+    ) -> Result<Rows, ArrowError> {
         if columns.len() != self.fields.len() {
             return Err(ArrowError::InvalidArgumentError(format!(
                 "Incorrect number of arrays provided to RowConverter, expected {} got {}",
@@ -105,7 +113,15 @@ impl RowCodec {
             Some(c) => c.len(),
             None => 0,
         };
-        let mut offsets = Vec::with_capacity(num_rows + 1);
+        let Rows {
+            mut buffer,
+            mut offsets,
+        } = scratch.unwrap_or_else(|| Rows {
+            buffer: Vec::new(),
+            offsets: Vec::new(),
+        });
+        offsets.clear();
+        offsets.reserve(num_rows + 1);
         offsets.push(0usize);
 
         let mut tracker = LengthTracker::new(num_rows);
@@ -113,7 +129,10 @@ impl RowCodec {
             codec.append_lengths(column.as_ref(), &mut tracker);
         }
         let total = tracker.extend_offsets(0, &mut offsets);
-        let mut buffer = vec![0u8; total];
+        // Codecs leave null payloads and variable-width padding untouched, so
+        // every byte must be zeroed even when reusing an existing allocation.
+        buffer.clear();
+        buffer.resize(total, 0);
 
         for (column, codec) in columns.iter().zip(&self.codecs) {
             codec.encode(

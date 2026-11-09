@@ -18,14 +18,11 @@ use arrow_schema::SchemaRef;
 
 use crate::{access::AccessMode, find_first_delimiter};
 use acceleration::Engine;
-use datafusion::sql::{
-    TableReference,
-    sqlparser::{
-        dialect::{Dialect, GenericDialect},
-        parser::{Parser, ParserError},
-    },
+use datafusion::common::TableReference;
+use datafusion::sql::sqlparser::{
+    dialect::{Dialect, GenericDialect},
+    parser::{Parser, ParserError},
 };
-use datafusion_table_providers::util::column_reference;
 use snafu::prelude::*;
 use spicepod::{
     component::{dataset as spicepod_dataset, embeddings::ColumnEmbeddingConfig},
@@ -84,10 +81,10 @@ pub enum Error {
     ))]
     OnConflictTargetMismatch { extra_detail: String },
 
-    #[snafu(display("Error parsing column reference {column_ref}: {source}"))]
+    #[snafu(display("Failed to parse the column reference '{column_ref}': {source}"))]
     UnableToParseColumnReference {
         column_ref: String,
-        source: column_reference::Error,
+        source: util::column_reference::Error,
     },
 
     #[snafu(display("Error parsing {field} as duration: {source}"))]
@@ -257,14 +254,17 @@ pub use runtime_acceleration::OnSchemaChange;
 /// Controls when the table is marked ready for queries.
 #[derive(Debug, Clone, Copy, PartialEq, Default)]
 pub enum ReadyState {
-    /// The table is ready once the initial load completes.
+    /// The table is ready once the initial load completes, or immediately when an existing
+    /// acceleration from a previous run can serve it.
     #[default]
     OnLoad,
-    /// The table is ready immediately, with fallback to federated table for queries until the initial load completes.
+    /// The table is ready immediately. Until the initial load completes, queries are served from
+    /// an existing acceleration if there is one, and otherwise fall back to the federated table.
     OnRegistration,
     /// The table is ready once the federated source's schema has been resolved (which also implies access
     /// to the source has been verified), without waiting for the initial data refresh to complete. Queries
-    /// fall back to the federated source until the initial load completes.
+    /// are served from an existing acceleration if there is one, and otherwise fall back to the federated
+    /// source until the initial load completes.
     OnSchemaResolved,
 }
 

@@ -1,0 +1,29 @@
+[2m2026-09-08T02:43:40.194452Z[0m [32m INFO[0m [2mspiced[0m[2m:[0m Starting runtime v2.1.1+models.metal
+[2m2026-09-08T02:43:40.195852Z[0m [32m INFO[0m [2mruntime::init::caching[0m[2m:[0m Initialized sql results cache; max size: 128.00 MiB, item ttl: 1s, hashing algorithm: XXH3, encoding: none
+[2m2026-09-08T02:43:40.195900Z[0m [32m INFO[0m [2mruntime::init::caching[0m[2m:[0m Initialized search results cache; max size: 128.00 MiB, item ttl: 1s, engine: Moka
+[2m2026-09-08T02:43:40.195914Z[0m [32m INFO[0m [2mruntime::init::caching[0m[2m:[0m Initialized embeddings cache; max size: 128.00 MiB, item ttl: 1s, engine: Moka
+[2m2026-09-08T02:43:40.197365Z[0m [32m INFO[0m [2mruntime::datafusion[0m[2m:[0m Cayenne global encode-concurrency budget active (caps aggregate write-encode shards across all tables) [3mencode_budget[0m[2m=[0m12
+[2m2026-09-08T02:43:40.197431Z[0m [32m INFO[0m [2mruntime::datafusion[0m[2m:[0m Cayenne dynamic-tuning memory budget active (cgroup-aware) [3mmemory_budget[0m[2m=[0m137438953472
+[2m2026-09-08T02:43:40.197870Z[0m [32m INFO[0m [2mruntime::init::task_history[0m[2m:[0m Task history enabled: retention_period=28800s, retention_check_interval=900s
+[2m2026-09-08T02:43:40.198028Z[0m [32m INFO[0m [2mruntime::init::dataset[0m[2m:[0m Loading datasets: 5 tasks dispatched, 0 skipped at accelerator init (of 5 total; localpod datasets may be chained).
+[2m2026-09-08T02:43:40.198032Z[0m [32m INFO[0m [2mruntime::init::dataset[0m[2m:[0m Dataset orders initializing...
+[2m2026-09-08T02:43:40.198027Z[0m [32m INFO[0m [2mruntime::init::dataset[0m[2m:[0m Dataset order_items initializing...
+[2m2026-09-08T02:43:40.198044Z[0m [32m INFO[0m [2mruntime::init::dataset[0m[2m:[0m Dataset articles initializing...
+[2m2026-09-08T02:43:40.198044Z[0m [32m INFO[0m [2mruntime::init::dataset[0m[2m:[0m Dataset returns initializing...
+[2m2026-09-08T02:43:40.198039Z[0m [32m INFO[0m [2mruntime::init::dataset[0m[2m:[0m Dataset customers initializing...
+[2m2026-09-08T02:43:40.200228Z[0m [32m INFO[0m [2mruntime::init::dataset[0m[2m:[0m Dataset articles registered (file://data/articles.csv), results cache enabled. [3mduration_ms[0m[2m=[0m0
+[2m2026-09-08T02:43:40.200230Z[0m [32m INFO[0m [2mruntime::init::dataset[0m[2m:[0m Dataset returns registered (file://data/returns.csv), results cache enabled. [3mduration_ms[0m[2m=[0m0
+[2m2026-09-08T02:43:40.200270Z[0m [32m INFO[0m [2mruntime::init::dataset[0m[2m:[0m Dataset orders registered (file://data/orders.csv), results cache enabled. [3mduration_ms[0m[2m=[0m0
+[2m2026-09-08T02:43:40.200269Z[0m [32m INFO[0m [2mruntime::init::dataset[0m[2m:[0m Dataset order_items registered (file://data/order_items.csv), results cache enabled. [3mduration_ms[0m[2m=[0m0
+[2m2026-09-08T02:43:40.200254Z[0m [32m INFO[0m [2mruntime::init::dataset[0m[2m:[0m Dataset customers registered (file://data/customers.csv), results cache enabled. [3mduration_ms[0m[2m=[0m0
+[2m2026-09-08T02:43:40.200429Z[0m [32m INFO[0m [2mruntime::datafusion[0m[2m:[0m Initializing view paid_orders
+[2m2026-09-08T02:43:40.200470Z[0m [32m INFO[0m [2mruntime::datafusion[0m[2m:[0m Initializing view daily_sales
+[2m2026-09-08T02:43:40.200512Z[0m [33m WARN[0m [2mruntime::datafusion[0m[2m:[0m Dependent table paid_orders for view daily_sales does not exist, retrying...
+[2m2026-09-08T02:43:40.200830Z[0m [32m INFO[0m [2mruntime::datafusion[0m[2m:[0m View paid_orders registered.
+[2m2026-09-08T02:43:40.397607Z[0m [32m INFO[0m [2mruntime::flight[0m[2m:[0m Spice Runtime Flight listening on 127.0.0.1:15055
+[2m2026-09-08T02:43:40.397870Z[0m [32m INFO[0m [2mruntime::http[0m[2m:[0m Spice Runtime HTTP listening on 127.0.0.1:18094
+[2m2026-09-08T02:43:41.202602Z[0m [32m INFO[0m [2mruntime::datafusion[0m[2m:[0m Dependent table paid_orders for view daily_sales found
+[2m2026-09-08T02:43:41.203002Z[0m [32m INFO[0m [2mruntime::datafusion[0m[2m:[0m View daily_sales registered.
+[2m2026-09-08T02:43:41.220082Z[0m [32m INFO[0m [2mruntime[0m[2m:[0m All components are loaded. Spice runtime is ready!
+[2m2026-09-08T02:43:41.479425Z[0m [32m INFO[0m [2mruntime[0m[2m:[0m Shutdown initiated; waiting up to 30s for connections to drain
+[2m2026-09-08T02:43:41.479622Z[0m [32m INFO[0m [2mspiced[0m[2m:[0m Goodbye!

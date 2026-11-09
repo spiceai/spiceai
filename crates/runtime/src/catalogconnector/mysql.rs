@@ -27,9 +27,10 @@ use crate::{
 };
 use async_trait::async_trait;
 use data_components::RefreshableCatalogProvider;
+use data_components::mysql::pool::{self, PoolParams, PoolSettings};
 use data_components::mysql::provider::MySQLCatalogProvider;
 use datafusion_table_providers::mysql::MySQLTableFactory;
-use datafusion_table_providers::sql::db_connection_pool::mysqlpool::MySQLConnectionPool;
+use runtime_datafusion::function_support::deny_spice_functions_for_mysql_table_providers;
 use std::any::Any;
 use std::sync::Arc;
 
@@ -50,6 +51,9 @@ pub const PARAMETERS: &[ParameterSpec] = &[
     ParameterSpec::component("db").description("The MySQL database name."),
     ParameterSpec::component("sslmode").description("The SSL mode for the connection."),
     ParameterSpec::component("sslrootcert").description("The path to the SSL root certificate."),
+    ParameterSpec::component("connection_max_lifetime")
+        .description(pool::CONNECTION_MAX_LIFETIME_DESCRIPTION)
+        .default("5m"),
 ];
 
 /// A catalog connector for `MySQL`, providing access to schemas and tables
@@ -79,16 +83,57 @@ impl CatalogConnector for MySQLCatalog {
     ) -> super::Result<Arc<dyn RefreshableCatalogProvider>> {
         let connector_component = ConnectorComponent::from(catalog);
 
-        let pool = MySQLConnectionPool::new(self.params.parameters.to_secret_map())
-            .await
-            .map_err(|e| super::Error::UnableToGetCatalogProvider {
-                connector: PREFIX.to_string(),
-                connector_component: connector_component.clone(),
-                source: Box::new(e),
-            })?;
+        // The catalog takes no pool size parameters, so its pool keeps the size its connection
+        // parameters give; only the connection lifetime is resolved here.
+        let pool_settings = PoolSettings::resolve(
+            PoolParams {
+                connection_max_lifetime: self.params.user_set("connection_max_lifetime"),
+                connection_string: self
+                    .params
+                    .parameters
+                    .get("connection_string")
+                    .expose()
+                    .ok(),
+                ..PoolParams::default()
+            },
+            None,
+        )
+        .map_err(|error| super::Error::InvalidConfigurationNoSource {
+            connector: PREFIX.to_string(),
+            connector_component: connector_component.clone(),
+            message: error.to_string(),
+        })?;
+
+        let pool = pool::connect(
+            self.params.parameters.to_secret_map(),
+            pool_settings,
+            format!("catalog '{}'", catalog.name),
+        )
+        .await
+        .map_err(|e| super::Error::UnableToGetCatalogProvider {
+            connector: PREFIX.to_string(),
+            connector_component: connector_component.clone(),
+            source: Box::new(e),
+        })?;
 
         let pool = Arc::new(pool);
-        let table_factory = Arc::new(MySQLTableFactory::new(Arc::clone(&pool)));
+        // Install the Spice function deny-list so federation evaluates locally
+        // anything MySQL cannot run, instead of unparsing it into the SQL sent to
+        // MySQL where it fails as an unknown function. That covers the Spice-only
+        // UDFs `json_get_str`, the embedding/distance functions and the rest
+        // (issues #10703 and #13664), and `btrim` — which a plain `trim(col)`
+        // becomes, since `trim` is one of that UDF's aliases and the unparser
+        // emits the canonical name (issue #13794). The dataset connector installs
+        // the same list; `mysql_btrim_evaluates_locally_on_both_registration_paths`
+        // covers both call sites.
+        #[expect(
+            clippy::disallowed_methods,
+            reason = "installs `deny_spice_functions_for_mysql_table_providers()` on the next line"
+        )]
+        let table_factory = Arc::new(
+            MySQLTableFactory::new(Arc::clone(&pool))
+                .with_function_support(deny_spice_functions_for_mysql_table_providers()),
+        );
 
         // Create a separate mysql_async::Pool for metadata queries.
         // `MySQLTableFactory` requires `MySQLConnectionPool` while metadata discovery uses
@@ -293,6 +338,28 @@ mod tests {
         }
     }
 
+    /// The pool options every metadata pool is built with: no idle connection
+    /// kept, and at most one open.
+    fn metadata_pool_opts() -> mysql_async::PoolOpts {
+        mysql_async::PoolOpts::default().with_constraints(
+            mysql_async::PoolConstraints::new(0, 1).expect("0..=1 is a valid pool constraint"),
+        )
+    }
+
+    /// The `Debug` rendering of the options a metadata pool was built with.
+    /// `mysql_async::Pool` has no accessor for its `Opts`, and creating the
+    /// pool never connects, so this is how a test reads them back.
+    fn pool_opts_debug(pool: &mysql_async::Pool) -> String {
+        let debug = format!("{pool:?}");
+        debug
+            .strip_prefix("Pool { opts: ")
+            .and_then(|rest| rest.split_once(", inner: Inner {"))
+            .map_or_else(
+                || panic!("unexpected mysql_async::Pool Debug rendering: {debug}"),
+                |(opts, _)| opts.to_string(),
+            )
+    }
+
     #[tokio::test]
     async fn test_create_metadata_pool_from_connection_string() {
         let mut params = HashMap::new();
@@ -314,17 +381,37 @@ mod tests {
         params.insert("tcp_port".to_string(), "3306".to_string());
         params.insert("db".to_string(), "mydb".to_string());
         let connector_params = make_connector_params(params).await;
-        MySQLCatalog::create_metadata_pool(&connector_params)
+        let pool = MySQLCatalog::create_metadata_pool(&connector_params)
             .expect("should create pool from individual params");
+        let expected = mysql_async::Opts::from(
+            mysql_async::OptsBuilder::default()
+                .user(Some("root"))
+                .pass(Some("password"))
+                .ip_or_hostname("127.0.0.1")
+                .tcp_port(3306)
+                .db_name(Some("mydb"))
+                .ssl_opts(Some(mysql_async::SslOpts::default()))
+                .pool_opts(metadata_pool_opts()),
+        );
+        assert_eq!(pool_opts_debug(&pool), format!("{expected:?}"));
     }
 
     #[tokio::test]
     async fn test_create_metadata_pool_defaults_host_and_port() {
-        // With no host/port, should default to localhost:3306
+        // With no params: localhost:3306, no credentials or database, and TLS
+        // required (the `sslmode` default).
         let params = HashMap::new();
         let connector_params = make_connector_params(params).await;
-        MySQLCatalog::create_metadata_pool(&connector_params)
+        let pool = MySQLCatalog::create_metadata_pool(&connector_params)
             .expect("should succeed with default host and port");
+        let expected = mysql_async::Opts::from(
+            mysql_async::OptsBuilder::default()
+                .ip_or_hostname("localhost")
+                .tcp_port(3306)
+                .ssl_opts(Some(mysql_async::SslOpts::default()))
+                .pool_opts(metadata_pool_opts()),
+        );
+        assert_eq!(pool_opts_debug(&pool), format!("{expected:?}"));
     }
 
     #[tokio::test]
@@ -335,9 +422,18 @@ mod tests {
             "not-a-valid-url".to_string(),
         );
         let connector_params = make_connector_params(params).await;
-        assert!(
-            MySQLCatalog::create_metadata_pool(&connector_params).is_err(),
-            "should fail with invalid connection string"
+        let err = MySQLCatalog::create_metadata_pool(&connector_params)
+            .expect_err("should fail with invalid connection string");
+        assert_eq!(
+            err.downcast_ref::<mysql_async::UrlError>(),
+            Some(&mysql_async::UrlError::Parse(
+                mysql_async::ParseError::RelativeUrlWithoutBase
+            )),
+            "expected a URL parse error, got {err}"
+        );
+        assert_eq!(
+            err.to_string(),
+            "URL parse error: relative URL without a base"
         );
     }
 
@@ -353,8 +449,21 @@ mod tests {
         params.insert("user".to_string(), "individual_user".to_string());
         params.insert("host".to_string(), "individual_host".to_string());
         let connector_params = make_connector_params(params).await;
-        // Should succeed using connection_string, not individual params
-        MySQLCatalog::create_metadata_pool(&connector_params)
+        let pool = MySQLCatalog::create_metadata_pool(&connector_params)
             .expect("should create pool from connection_string when both are present");
+        let opts = pool_opts_debug(&pool);
+        assert!(
+            opts.starts_with(
+                "Opts { inner: InnerOpts { mysql_opts: MysqlOpts { user: Some(\"conn_user\"), \
+                 pass: Some(\"conn_pass\"), db_name: Some(\"conndb\"), "
+            ),
+            "the connection string's credentials and database must win, got {opts}"
+        );
+        assert!(
+            opts.ends_with(
+                "address: HostPort { host: \"connhost\", port: 3307, resolved_ips: None } } }"
+            ),
+            "the connection string's host and port must win, got {opts}"
+        );
     }
 }

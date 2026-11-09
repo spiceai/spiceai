@@ -37,10 +37,10 @@ use datafusion::datasource::DefaultTableSource;
 use datafusion::error::DataFusionError;
 use datafusion::logical_expr::LogicalPlan;
 use datafusion_expr::LogicalPlanBuilder;
-use elasticsearch::Elasticsearch;
+use elasticsearch::{DocumentVersion, Elasticsearch};
 use futures::{StreamExt, TryStreamExt};
 use llms::embeddings::Embed;
-use spice_table::{Index, WriteWindow};
+use spice_table::{GroupPruning, Index, WriteWindow};
 use tokio::sync::Mutex;
 
 use crate::SEARCH_SCORE_COLUMN_NAME;
@@ -51,8 +51,7 @@ use data_components::elasticsearch::search_table::{
 };
 
 /// Default kNN candidate-pool size used when a `LIMIT` cannot be pushed down to the
-/// Elasticsearch index scan. Matches the DuckDB vector backend's default
-/// (`DEFAULT_DUCKDB_VECTOR_SEARCH_LIMIT`).
+/// Elasticsearch index scan.
 const DEFAULT_ELASTICSEARCH_VECTOR_SEARCH_LIMIT: usize = 1000;
 
 /// Adapter that implements [`QueryEmbedder`] using an [`Embed`] model.
@@ -62,12 +61,12 @@ struct EmbedQueryAdapter(Arc<dyn Embed>);
 #[async_trait]
 impl QueryEmbedder for EmbedQueryAdapter {
     async fn embed_query(&self, query: &str) -> Result<Vec<f32>, DataFusionError> {
-        let mut vectors = self
+        let vectors = self
             .0
             .embed(llms::embeddings::EmbeddingInput::String(query.to_string()))
             .await
             .map_err(|e| DataFusionError::External(Box::new(e)))?;
-        vectors.pop().ok_or_else(|| {
+        vectors.first().cloned().ok_or_else(|| {
             DataFusionError::Execution("No embedding vector computed for query".to_string())
         })
     }
@@ -122,6 +121,106 @@ pub struct ElasticsearchIndex {
     pub write_maintenance: Arc<ElasticsearchIndexWriteMaintenance>,
 }
 
+/// A client whose every call is a test failure.
+///
+/// Some write-path helpers take the whole [`ElasticsearchIndex`] but touch neither the
+/// cluster nor the embedder — they are handed the embeddings and the `_id`s. Those tests
+/// still have to populate the struct's fields, and this makes an accidental call loud
+/// rather than letting a stub quietly answer one.
+#[cfg(test)]
+pub(super) mod unused_client {
+    use elasticsearch::{
+        Elasticsearch, Error, MappingResponse, Result, SearchRequest, SearchResponse,
+    };
+
+    #[derive(Debug)]
+    pub(crate) struct UnusedClient;
+
+    impl UnusedClient {
+        fn refuse<T>(method: &str) -> Result<T> {
+            Err(Error::ElasticsearchError {
+                status: 500,
+                message: format!("unexpected call to {method}"),
+            })
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl Elasticsearch for UnusedClient {
+        async fn get_mapping(&self, _: &str) -> Result<MappingResponse> {
+            Self::refuse("get_mapping")
+        }
+        async fn search(&self, _: &str, _: &SearchRequest) -> Result<SearchResponse> {
+            Self::refuse("search")
+        }
+        async fn search_raw(&self, _: &str, _: &serde_json::Value) -> Result<SearchResponse> {
+            Self::refuse("search_raw")
+        }
+        async fn open_point_in_time(&self, _: &str, _: &str) -> Result<String> {
+            Self::refuse("open_point_in_time")
+        }
+        async fn search_point_in_time(&self, _: &serde_json::Value) -> Result<SearchResponse> {
+            Self::refuse("search_point_in_time")
+        }
+        async fn close_point_in_time(&self, _: &str) -> Result<()> {
+            Self::refuse("close_point_in_time")
+        }
+        async fn index_exists(&self, _: &str) -> Result<bool> {
+            Self::refuse("index_exists")
+        }
+        async fn create_index(&self, _: &str, _: &serde_json::Value) -> Result<serde_json::Value> {
+            Self::refuse("create_index")
+        }
+        async fn put_mapping(&self, _: &str, _: &serde_json::Value) -> Result<serde_json::Value> {
+            Self::refuse("put_mapping")
+        }
+        async fn get_index_refresh_interval(&self, _: &str) -> Result<Option<String>> {
+            Self::refuse("get_index_refresh_interval")
+        }
+        async fn put_index_settings(
+            &self,
+            _: &str,
+            _: &serde_json::Value,
+        ) -> Result<serde_json::Value> {
+            Self::refuse("put_index_settings")
+        }
+        async fn refresh_index(&self, _: &str) -> Result<serde_json::Value> {
+            Self::refuse("refresh_index")
+        }
+        async fn force_merge(&self, _: &str, _: u32) -> Result<serde_json::Value> {
+            Self::refuse("force_merge")
+        }
+        async fn index_document(
+            &self,
+            _: &str,
+            _: &str,
+            _: &serde_json::Value,
+        ) -> Result<serde_json::Value> {
+            Self::refuse("index_document")
+        }
+        async fn bulk_index(
+            &self,
+            _: &str,
+            _: &[(Option<String>, serde_json::Value)],
+        ) -> Result<serde_json::Value> {
+            Self::refuse("bulk_index")
+        }
+        async fn delete_by_query(
+            &self,
+            _: &str,
+            _: &serde_json::Value,
+        ) -> Result<serde_json::Value> {
+            Self::refuse("delete_by_query")
+        }
+        async fn bulk_delete_if_unchanged(
+            &self,
+            _: &[elasticsearch::DocumentVersion],
+        ) -> Result<serde_json::Value> {
+            Self::refuse("bulk_delete_if_unchanged")
+        }
+    }
+}
+
 /// Optional Elasticsearch maintenance to run around full/append table-sink writes.
 #[derive(Debug, Clone, Default)]
 pub struct ElasticsearchIndexWriteOptions {
@@ -132,6 +231,240 @@ pub struct ElasticsearchIndexWriteOptions {
     pub force_merge_segments: Option<u32>,
 }
 
+/// How long Elasticsearch keeps a replacing write's snapshot open between two uses of it.
+const REPLACE_SNAPSHOT_KEEP_ALIVE: &str = "5m";
+
+/// How often a replacing write renews its snapshot's keep-alive while rows are still being
+/// written, well inside [`REPLACE_SNAPSHOT_KEEP_ALIVE`] so one slow renewal does not lose it.
+const REPLACE_SNAPSHOT_RENEW_INTERVAL: std::time::Duration = std::time::Duration::from_mins(1);
+
+/// Documents read from the snapshot, and conditionally deleted, per request.
+const REPLACE_RECONCILE_PAGE_SIZE: usize = 1000;
+
+/// The documents an Elasticsearch index held when a replacing write (a `refresh_mode: full`
+/// refresh) started, kept as a point-in-time reader.
+///
+/// A replacing write removes a row by not sending it again, so its document has to be found
+/// and deleted once the write is done. Every document the write *did* send was rewritten and
+/// carries a new `(seq_no, primary_term)`; a document still at the version this snapshot
+/// recorded is one the write left out. Deleting each snapshot document conditionally on that
+/// version removes exactly those, and leaves anything written since — by this write or a
+/// concurrent one — in place, without a second copy of the index or an alias swap. Readers
+/// keep seeing the dropped rows until the write completes, never an empty index.
+#[derive(Debug)]
+struct ReplaceSnapshot {
+    /// Elasticsearch may hand back a new id on any search against the reader, so the renewal
+    /// task and the reconcile both read and update the latest one here.
+    pit_id: Arc<parking_lot::Mutex<String>>,
+    /// `None` once [`Self::stop_renewal`] has ended it.
+    renewal: Option<tokio::task::JoinHandle<()>>,
+}
+
+impl ReplaceSnapshot {
+    /// `None` when the index does not exist yet: it holds no documents the write could drop.
+    async fn open(
+        client: &Arc<dyn Elasticsearch>,
+        es_index: &str,
+    ) -> Result<Option<Self>, DataFusionError> {
+        // A point-in-time reader sees only searchable documents, so make every earlier write
+        // searchable first; one still inside `refresh_interval` would otherwise be missing
+        // from the snapshot and never reconciled.
+        let snapshot = async {
+            client.refresh_index(es_index).await?;
+            client
+                .open_point_in_time(es_index, REPLACE_SNAPSHOT_KEEP_ALIVE)
+                .await
+        };
+        let pit_id = match snapshot.await {
+            Ok(pit_id) => pit_id,
+            Err(elasticsearch::Error::ElasticsearchError { status: 404, .. }) => return Ok(None),
+            Err(e) => {
+                return Err(DataFusionError::Execution(format!(
+                    "Failed to snapshot the search index '{es_index}' (elasticsearch) before a full refresh, so documents for rows the refresh drops cannot be found afterwards and searches will keep returning those rows until a full refresh can snapshot it. Check that the Elasticsearch credentials can read the index. Cause: {e}. See: https://spiceai.org/docs/features/search"
+                )));
+            }
+        };
+        let pit_id = Arc::new(parking_lot::Mutex::new(pit_id));
+        let renewal = tokio::spawn(Self::renew(Arc::clone(client), Arc::clone(&pit_id)));
+        Ok(Some(Self {
+            pit_id,
+            renewal: Some(renewal),
+        }))
+    }
+
+    /// Renews the reader's keep-alive until the write finishes, however long it runs. Stops
+    /// at the first failed renewal: the reader is gone, and the reconcile reports that.
+    async fn renew(client: Arc<dyn Elasticsearch>, pit_id: Arc<parking_lot::Mutex<String>>) {
+        loop {
+            tokio::time::sleep(REPLACE_SNAPSHOT_RENEW_INTERVAL).await;
+            let id = pit_id.lock().clone();
+            let body = serde_json::json!({
+                "pit": { "id": id, "keep_alive": REPLACE_SNAPSHOT_KEEP_ALIVE },
+                "size": 0,
+                "track_total_hits": false,
+            });
+            match client.search_point_in_time(&body).await {
+                Ok(resp) => {
+                    if let Some(new_id) = resp.pit_id {
+                        *pit_id.lock() = new_id;
+                    }
+                }
+                Err(e) => {
+                    tracing::debug!("Stopped renewing a full-refresh snapshot: {e}");
+                    return;
+                }
+            }
+        }
+    }
+
+    /// Deletes every snapshot document the write did not rewrite, page by page, and closes
+    /// the reader. Returns how many documents were deleted.
+    async fn delete_unrewritten(
+        mut self,
+        client: &dyn Elasticsearch,
+        es_index: &str,
+    ) -> Result<u64, DataFusionError> {
+        self.stop_renewal().await;
+        let mut pit_id = self.pit_id.lock().clone();
+        let result = Self::delete_pages(client, &mut pit_id).await;
+        *self.pit_id.lock() = pit_id;
+        self.close(client, es_index).await;
+        result.map_err(|cause| {
+            DataFusionError::Execution(format!(
+                "Failed to remove the documents for rows a full refresh dropped from the search index '{es_index}' (elasticsearch), so searches can return rows the dataset no longer has until the next full refresh succeeds. Cause: {cause}. See: https://spiceai.org/docs/features/search"
+            ))
+        })
+    }
+
+    async fn delete_pages(client: &dyn Elasticsearch, pit_id: &mut String) -> Result<u64, String> {
+        let mut search_after: Option<Vec<serde_json::Value>> = None;
+        let mut deleted = 0;
+        loop {
+            let mut body = serde_json::json!({
+                "pit": { "id": *pit_id, "keep_alive": REPLACE_SNAPSHOT_KEEP_ALIVE },
+                "size": REPLACE_RECONCILE_PAGE_SIZE,
+                "_source": false,
+                "seq_no_primary_term": true,
+                "track_total_hits": false,
+                "sort": [{ "_shard_doc": "asc" }],
+            });
+            if let Some(after) = search_after.take() {
+                body["search_after"] = serde_json::Value::Array(after);
+            }
+            let page = client
+                .search_point_in_time(&body)
+                .await
+                .map_err(|e| format!("reading the snapshot failed: {e}"))?;
+            if let Some(new_id) = page.pit_id {
+                *pit_id = new_id;
+            }
+            // A page missing a shard's hits would end the reconcile early, or skip that
+            // shard's documents, as if they were not there.
+            if let Some(shards) = page.shards.as_ref().filter(|shards| shards.failed > 0) {
+                return Err(format!(
+                    "{} of {} shards failed to answer the snapshot search, so their documents were not checked",
+                    shards.failed, shards.total
+                ));
+            }
+            if page.timed_out {
+                return Err(
+                    "the snapshot search timed out, so not every document was checked".to_string(),
+                );
+            }
+            let hits = page.hits.hits;
+            let Some(last) = hits.last() else {
+                return Ok(deleted);
+            };
+            search_after = Some(last.sort.clone().ok_or_else(|| {
+                "the snapshot returned a document without sort values, so it cannot be paged"
+                    .to_string()
+            })?);
+            let full_page = hits.len() == REPLACE_RECONCILE_PAGE_SIZE;
+            let versions = hits
+                .into_iter()
+                .map(|hit| match (hit.index, hit.seq_no, hit.primary_term) {
+                    (Some(index), Some(seq_no), Some(primary_term)) => Ok(DocumentVersion {
+                        index,
+                        id: hit.id,
+                        routing: hit.routing,
+                        seq_no,
+                        primary_term,
+                    }),
+                    _ => Err(
+                        "the snapshot returned a document without its index or sequence number"
+                            .to_string(),
+                    ),
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            let response = client
+                .bulk_delete_if_unchanged(&versions)
+                .await
+                .map_err(|e| format!("the delete request failed: {e}"))?;
+            deleted += count_conditional_deletes(&response)?;
+            if !full_page {
+                return Ok(deleted);
+            }
+        }
+    }
+}
+
+impl ReplaceSnapshot {
+    /// Stops the renewal and waits for it to end. `abort` takes effect at the renewal's next
+    /// `.await`, so one already past its request could otherwise store a newer reader id after
+    /// the caller has read the id.
+    async fn stop_renewal(&mut self) {
+        if let Some(renewal) = self.renewal.take() {
+            renewal.abort();
+            // The aborted task's `JoinError::Cancelled` (or its normal end) is the expected result.
+            let _ = renewal.await;
+        }
+    }
+
+    /// Stops the renewal and releases the reader. A failure only delays the release until
+    /// the keep-alive lapses, so it is not reported.
+    async fn close(mut self, client: &dyn Elasticsearch, es_index: &str) {
+        self.stop_renewal().await;
+        let pit_id = self.pit_id.lock().clone();
+        if let Err(e) = client.close_point_in_time(&pit_id).await {
+            tracing::debug!("Could not close a full-refresh snapshot of '{es_index}': {e}");
+        }
+    }
+}
+
+impl Drop for ReplaceSnapshot {
+    fn drop(&mut self) {
+        if let Some(renewal) = &self.renewal {
+            renewal.abort();
+        }
+    }
+}
+
+/// Counts the documents a conditional bulk delete removed. A `409` is a document rewritten
+/// since the snapshot and a `404` one already deleted; both are expected and left alone. Any
+/// other per-item outcome is an error, since that document may still be served. Failures are
+/// described without the document id, which is the row's primary key.
+fn count_conditional_deletes(response: &serde_json::Value) -> Result<u64, String> {
+    let items = response
+        .get("items")
+        .and_then(serde_json::Value::as_array)
+        .ok_or_else(|| {
+            format!(
+                "the bulk response carries no `items`; got {}",
+                write::describe_unexpected_response(response)
+            )
+        })?;
+    let mut deleted = 0;
+    for (position, item) in items.iter().enumerate() {
+        let outcome = item.get("delete").unwrap_or(item);
+        match outcome.get("status").and_then(serde_json::Value::as_u64) {
+            Some(200) => deleted += 1,
+            Some(404 | 409) => {}
+            _ => return Err(write::describe_bulk_failure(position, outcome)),
+        }
+    }
+    Ok(deleted)
+}
+
 /// Stateful helper shared by Elasticsearch-backed indexes that write to the same ES index.
 #[derive(Debug)]
 pub struct ElasticsearchIndexWriteMaintenance {
@@ -139,6 +472,8 @@ pub struct ElasticsearchIndexWriteMaintenance {
     write_cycle_active: AtomicBool,
     refresh_interval_overridden: AtomicBool,
     previous_refresh_interval: Mutex<PreviousRefreshInterval>,
+    /// Set for the length of a replacing write; see [`ReplaceSnapshot`].
+    replace_snapshot: parking_lot::Mutex<Option<ReplaceSnapshot>>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -163,19 +498,66 @@ impl ElasticsearchIndexWriteMaintenance {
             write_cycle_active: AtomicBool::new(false),
             refresh_interval_overridden: AtomicBool::new(false),
             previous_refresh_interval: Mutex::new(PreviousRefreshInterval::default()),
+            replace_snapshot: parking_lot::Mutex::new(None),
         }
     }
 
-    async fn on_write_start(
+    /// Starts a write cycle for `window`. The `refresh_interval` tuning is applied once per
+    /// cycle; later calls in the same cycle skip it.
+    ///
+    /// A [`WriteWindow::ReplaceAll`] write snapshots the index (see [`ReplaceSnapshot`]) so
+    /// [`Self::on_write_complete`] can delete the documents of every row the write dropped.
+    /// The sinks run each index's `on_write_start` before the write sends any row, so the
+    /// snapshot never misses one of this write's rows. Every start first closes the snapshot
+    /// it finds. When a vector and a full-text index share this Elasticsearch index, and so
+    /// this maintenance, that is the other index's snapshot of the same write, taken before any
+    /// row was sent, so the fresh one replaces it at no loss. Otherwise it belongs to a
+    /// replacing write that was dropped without `on_write_failed`, as a refresh request
+    /// arriving mid-refresh drops the running one and can change the refresh mode. It predates
+    /// the dropped write's rows, so a replacing write reconciling against it would keep a row
+    /// the dropped write rewrote, and an append would delete the documents of every row the
+    /// dropped write had not re-sent.
+    ///
+    /// The tuning and the snapshot are independent, and the sink writes whichever of them
+    /// fails, so neither failure costs the write the other. A failed tuning that opened the
+    /// cycle leaves no cycle open: the caller does not call `on_write_failed` on an index whose
+    /// own start failed, so the next write would otherwise skip the tuning. A refused snapshot
+    /// leaves the cycle the tuning opened, so the write's `on_write_complete` restores what the
+    /// tuning overrode. A snapshot outlives a failed tuning, since the write still has to
+    /// remove the rows it dropped.
+    pub async fn on_write_start(
+        &self,
+        client: &Arc<dyn Elasticsearch>,
+        es_index: &str,
+        window: WriteWindow,
+    ) -> Result<(), DataFusionError> {
+        let first_start = !self.write_cycle_active.swap(true, Ordering::AcqRel);
+        let stale = self.replace_snapshot.lock().take();
+        if let Some(stale) = stale {
+            stale.close(client.as_ref(), es_index).await;
+        }
+        let tuned = if first_start {
+            self.tune_refresh_interval(client.as_ref(), es_index)
+                .await
+                .inspect_err(|_| self.abandon_write_cycle())
+        } else {
+            Ok(())
+        };
+        let snapshotted = if window == WriteWindow::ReplaceAll {
+            ReplaceSnapshot::open(client, es_index)
+                .await
+                .map(|snapshot| *self.replace_snapshot.lock() = snapshot)
+        } else {
+            Ok(())
+        };
+        snapshotted.and(tuned)
+    }
+
+    async fn tune_refresh_interval(
         &self,
         client: &dyn Elasticsearch,
         es_index: &str,
     ) -> Result<(), DataFusionError> {
-        let first_start = !self.write_cycle_active.swap(true, Ordering::AcqRel);
-        if !first_start {
-            return Ok(());
-        }
-
         let Some(refresh_interval) = self.options.refresh_interval_during_write.as_deref() else {
             return Ok(());
         };
@@ -187,19 +569,15 @@ impl ElasticsearchIndexWriteMaintenance {
             return Ok(());
         }
 
-        let previous = match client.get_index_refresh_interval(es_index).await {
-            Ok(previous) => previous,
-            Err(e) => {
-                self.abandon_write_cycle();
-                return Err(DataFusionError::External(Box::new(e)));
-            }
-        };
+        let previous = client
+            .get_index_refresh_interval(es_index)
+            .await
+            .map_err(|e| DataFusionError::External(Box::new(e)))?;
         let body = serde_json::json!({ "index": { "refresh_interval": refresh_interval } });
-
-        if let Err(e) = client.put_index_settings(es_index, &body).await {
-            self.abandon_write_cycle();
-            return Err(DataFusionError::External(Box::new(e)));
-        }
+        client
+            .put_index_settings(es_index, &body)
+            .await
+            .map_err(|e| DataFusionError::External(Box::new(e)))?;
 
         *self.previous_refresh_interval.lock().await = match previous {
             Some(refresh_interval) => PreviousRefreshInterval::Value(refresh_interval),
@@ -211,13 +589,7 @@ impl ElasticsearchIndexWriteMaintenance {
         Ok(())
     }
 
-    /// Undo everything [`Self::on_write_start`] set before it failed, so a failed start
-    /// leaves no write cycle open.
-    ///
-    /// A caller that abandons the write does not call `on_write_failed` on the index whose
-    /// start failed — a start that fails partway owns its own cleanup — so without this the
-    /// cycle stays open forever and every later write's start short-circuits as a
-    /// second-batch no-op, silently dropping the `refresh_interval` tuning.
+    /// Undo the write cycle a failed [`Self::on_write_start`] opened.
     fn abandon_write_cycle(&self) {
         self.refresh_interval_overridden
             .store(false, Ordering::Release);
@@ -229,10 +601,15 @@ impl ElasticsearchIndexWriteMaintenance {
         client: &dyn Elasticsearch,
         es_index: &str,
     ) -> Result<(), DataFusionError> {
-        if !self.write_cycle_active.swap(false, Ordering::AcqRel) {
-            return Ok(());
+        // A failed write proves nothing about which rows the source still has, so delete
+        // nothing; the next full refresh reconciles the index.
+        let snapshot = self.replace_snapshot.lock().take();
+        if let Some(snapshot) = snapshot {
+            snapshot.close(client, es_index).await;
         }
-        self.restore_refresh_interval(client, es_index).await?;
+        if self.write_cycle_active.swap(false, Ordering::AcqRel) {
+            self.restore_refresh_interval(client, es_index).await?;
+        }
         Ok(())
     }
 
@@ -241,8 +618,21 @@ impl ElasticsearchIndexWriteMaintenance {
         client: &dyn Elasticsearch,
         es_index: &str,
     ) -> Result<(), DataFusionError> {
+        // Reconcile whether or not a cycle is open, since a snapshot outlives a failed tuning
+        // (see `on_write_start`). Deleting first lets the refresh below, when one runs, publish
+        // the deletions with the write; a failure still restores the refresh interval before
+        // it is reported.
+        let snapshot = self.replace_snapshot.lock().take();
+        let reconciled = match snapshot {
+            Some(snapshot) => snapshot.delete_unrewritten(client, es_index).await.map(|n| {
+                tracing::debug!(
+                    "Removed {n} document(s) for rows a full refresh dropped from Elasticsearch index '{es_index}'."
+                );
+            }),
+            None => Ok(()),
+        };
         if !self.write_cycle_active.swap(false, Ordering::AcqRel) {
-            return Ok(());
+            return reconciled;
         }
 
         let restored_refresh_interval = self.restore_refresh_interval(client, es_index).await?;
@@ -263,7 +653,7 @@ impl ElasticsearchIndexWriteMaintenance {
             );
         }
 
-        Ok(())
+        reconciled
     }
 
     async fn restore_refresh_interval(
@@ -474,14 +864,9 @@ impl Index for ElasticsearchIndex {
             .await
     }
 
-    async fn on_write_start(&self, _window: WriteWindow) -> Result<(), DataFusionError> {
-        // The refresh-interval override applies to any write window. Clearing the index for
-        // `WriteWindow::ReplaceAll` cannot be an in-place delete — Elasticsearch has no
-        // deferred window to hide it, so a `_delete_by_query` + reindex would serve an empty
-        // or half-populated index to readers for the length of the refresh. It needs an
-        // atomic index-per-refresh alias swap, tracked separately in #12413.
+    async fn on_write_start(&self, window: WriteWindow) -> Result<(), DataFusionError> {
         self.write_maintenance
-            .on_write_start(self.client.as_ref(), &self.es_index)
+            .on_write_start(&self.client, &self.es_index, window)
             .await
     }
 
@@ -513,6 +898,37 @@ impl Index for ElasticsearchIndex {
     /// removes every document matching it.
     fn deletes_by_partial_key(&self) -> bool {
         true
+    }
+
+    async fn delete_group_remainder(
+        &self,
+        group_columns: &[String],
+        members: RecordBatch,
+    ) -> Result<(), DataFusionError> {
+        delete::delete_group_remainder(
+            self.client.as_ref(),
+            &self.es_index,
+            &self.primary_key,
+            group_columns,
+            &members,
+        )
+        .await
+    }
+
+    /// The same field-value addressing [`Index::deletes_by_partial_key`] reports, applied to the
+    /// rest of a key group: a `_delete_by_query` reaches every document sharing the group's key,
+    /// and `must_not` on the surviving `_id`s keeps the members.
+    ///
+    /// That addressing needs every key column to have a `term` form. A key this index cannot
+    /// render one for — a float, date or timestamp column — prunes nothing at all, because
+    /// `collect_groups` drops the whole group rather than filter on part of its key, so it is
+    /// reported as unsupported and the caller warns that superseded chunks stay in place.
+    fn group_pruning(&self) -> GroupPruning {
+        if delete::key_renders_terms(&self.primary_key) {
+            GroupPruning::Complete
+        } else {
+            GroupPruning::Unsupported
+        }
     }
 }
 
@@ -734,14 +1150,9 @@ impl Index for ElasticsearchTextIndex {
             .await
     }
 
-    async fn on_write_start(&self, _window: WriteWindow) -> Result<(), DataFusionError> {
-        // The refresh-interval override applies to any write window. Clearing the index for
-        // `WriteWindow::ReplaceAll` cannot be an in-place delete — Elasticsearch has no
-        // deferred window to hide it, so a `_delete_by_query` + reindex would serve an empty
-        // or half-populated index to readers for the length of the refresh. It needs an
-        // atomic index-per-refresh alias swap, tracked separately in #12413.
+    async fn on_write_start(&self, window: WriteWindow) -> Result<(), DataFusionError> {
         self.write_maintenance
-            .on_write_start(self.client.as_ref(), &self.es_index)
+            .on_write_start(&self.client, &self.es_index, window)
             .await
     }
 
@@ -773,6 +1184,31 @@ impl Index for ElasticsearchTextIndex {
     fn deletes_by_partial_key(&self) -> bool {
         true
     }
+
+    async fn delete_group_remainder(
+        &self,
+        group_columns: &[String],
+        members: RecordBatch,
+    ) -> Result<(), DataFusionError> {
+        delete::delete_group_remainder(
+            self.client.as_ref(),
+            &self.es_index,
+            &self.primary_key,
+            group_columns,
+            &members,
+        )
+        .await
+    }
+
+    /// Same group addressing as [`ElasticsearchIndex`], including the key types it cannot
+    /// address.
+    fn group_pruning(&self) -> GroupPruning {
+        if delete::key_renders_terms(&self.primary_key) {
+            GroupPruning::Complete
+        } else {
+            GroupPruning::Unsupported
+        }
+    }
 }
 
 #[cfg(test)]
@@ -798,6 +1234,10 @@ mod write_maintenance_tests {
         /// When set, every `put_index_settings` call fails — the shape of an ES cluster that
         /// rejects the `refresh_interval` override `on_write_start` applies.
         fail_put_settings: bool,
+        /// When set, `open_point_in_time` fails, so a replacing write cannot snapshot the index.
+        fail_open_point_in_time: bool,
+        /// The body every `search_point_in_time` call answers with.
+        snapshot_page: Option<serde_json::Value>,
     }
 
     #[async_trait::async_trait]
@@ -863,13 +1303,24 @@ mod write_maintenance_tests {
             unimplemented!()
         }
         async fn open_point_in_time(&self, _: &str, _: &str) -> elasticsearch::Result<String> {
-            unimplemented!()
+            assert!(
+                self.fail_open_point_in_time,
+                "open_point_in_time is only expected where it fails"
+            );
+            Err(elasticsearch::Error::ElasticsearchError {
+                status: 503,
+                message: "snapshot unavailable".to_string(),
+            })
         }
         async fn search_point_in_time(
             &self,
             _: &serde_json::Value,
         ) -> elasticsearch::Result<SearchResponse> {
-            unimplemented!()
+            let page = self
+                .snapshot_page
+                .clone()
+                .expect("search_point_in_time is only expected where a page is set");
+            Ok(serde_json::from_value(page).expect("the test page is a search response"))
         }
         async fn close_point_in_time(&self, _: &str) -> elasticsearch::Result<()> {
             unimplemented!()
@@ -913,6 +1364,16 @@ mod write_maintenance_tests {
         ) -> elasticsearch::Result<serde_json::Value> {
             unimplemented!()
         }
+        async fn bulk_delete_if_unchanged(
+            &self,
+            _: &[elasticsearch::DocumentVersion],
+        ) -> elasticsearch::Result<serde_json::Value> {
+            unimplemented!()
+        }
+    }
+
+    fn dyn_es(client: &Arc<MockElasticsearch>) -> Arc<dyn Elasticsearch> {
+        Arc::clone(client) as Arc<dyn Elasticsearch>
     }
 
     fn make_maintenance(
@@ -924,10 +1385,10 @@ mod write_maintenance_tests {
     /// `on_write_start` with no options configured is a pure no-op: no ES calls.
     #[tokio::test]
     async fn write_start_no_options_is_noop() {
-        let client = MockElasticsearch::default();
+        let client = Arc::new(MockElasticsearch::default());
         let m = make_maintenance(ElasticsearchIndexWriteOptions::default());
 
-        m.on_write_start(&client, "my-index")
+        m.on_write_start(&dyn_es(&client), "my-index", WriteWindow::Append)
             .await
             .expect("on_write_start should succeed");
 
@@ -941,20 +1402,20 @@ mod write_maintenance_tests {
     /// This is the core correctness guarantee of the fix for issue #3.
     #[tokio::test]
     async fn write_start_fires_once_per_cycle_not_per_batch() {
-        let client = MockElasticsearch::default();
+        let client = Arc::new(MockElasticsearch::default());
         let m = make_maintenance(ElasticsearchIndexWriteOptions {
             refresh_interval_during_write: Some("-1".to_string()),
             force_merge_segments: None,
         });
 
         // Simulate three batches before on_write_complete.
-        m.on_write_start(&client, "my-index")
+        m.on_write_start(&dyn_es(&client), "my-index", WriteWindow::Append)
             .await
             .expect("first start");
-        m.on_write_start(&client, "my-index")
+        m.on_write_start(&dyn_es(&client), "my-index", WriteWindow::Append)
             .await
             .expect("second start — must be no-op");
-        m.on_write_start(&client, "my-index")
+        m.on_write_start(&dyn_es(&client), "my-index", WriteWindow::Append)
             .await
             .expect("third start — must be no-op");
 
@@ -977,23 +1438,23 @@ mod write_maintenance_tests {
     /// partway start owns its cleanup — so this has to be self-contained.
     #[tokio::test]
     async fn a_failed_write_start_leaves_no_write_cycle_open() {
-        let failing = MockElasticsearch {
+        let failing = Arc::new(MockElasticsearch {
             fail_put_settings: true,
             ..Default::default()
-        };
+        });
         let m = make_maintenance(ElasticsearchIndexWriteOptions {
             refresh_interval_during_write: Some("-1".to_string()),
             force_merge_segments: None,
         });
 
-        m.on_write_start(&failing, "my-index")
+        m.on_write_start(&dyn_es(&failing), "my-index", WriteWindow::Append)
             .await
             .expect_err("the override was rejected");
 
         // A second write, against a healthy cluster, must apply the override rather than
         // treat itself as another batch of the abandoned cycle.
-        let healthy = MockElasticsearch::default();
-        m.on_write_start(&healthy, "my-index")
+        let healthy = Arc::new(MockElasticsearch::default());
+        m.on_write_start(&dyn_es(&healthy), "my-index", WriteWindow::Append)
             .await
             .expect("a later write starts a fresh cycle");
 
@@ -1004,21 +1465,123 @@ mod write_maintenance_tests {
         );
     }
 
-    /// `on_write_complete` restores the refresh_interval and calls `_refresh`.
-    /// `force_merge` must NOT be called when `force_merge_segments` is `None`.
+    /// A refresh dropped mid-write leaves its cycle open with `refresh_interval` overridden. A
+    /// replacing write that then fails to snapshot must not abandon that cycle: abandoning it
+    /// forgets the override, so `on_write_complete` would never restore `refresh_interval` and
+    /// the index would stay at the write-time value (`-1` stops refreshing it altogether).
     #[tokio::test]
-    async fn write_complete_restores_interval_and_refreshes() {
-        let client = MockElasticsearch {
+    async fn a_failed_snapshot_inside_an_open_cycle_still_restores_refresh_interval() {
+        let client = Arc::new(MockElasticsearch {
             refresh_interval: std::sync::Mutex::new(Some("30s".to_string())),
+            fail_open_point_in_time: true,
             ..Default::default()
-        };
+        });
         let m = make_maintenance(ElasticsearchIndexWriteOptions {
             refresh_interval_during_write: Some("-1".to_string()),
             force_merge_segments: None,
         });
 
-        m.on_write_start(&client, "my-index").await.expect("start");
-        m.on_write_complete(&client, "my-index")
+        // A write opens the cycle and overrides `refresh_interval`, then is dropped.
+        m.on_write_start(&dyn_es(&client), "my-index", WriteWindow::Append)
+            .await
+            .expect("start");
+        // The next, replacing write cannot snapshot the index; the sink carries on with it.
+        m.on_write_start(&dyn_es(&client), "my-index", WriteWindow::ReplaceAll)
+            .await
+            .expect_err("the snapshot was refused");
+        m.on_write_complete(client.as_ref(), "my-index")
+            .await
+            .expect("complete");
+
+        assert_eq!(
+            client.put_settings_calls.load(Ordering::Relaxed),
+            2,
+            "refresh_interval must be overridden once and restored once"
+        );
+    }
+
+    /// The `refresh_interval` override does not depend on the snapshot: a replacing write whose
+    /// snapshot is refused still bulk-loads with the override, and its completion restores it.
+    #[tokio::test]
+    async fn a_refused_snapshot_on_the_first_start_still_tunes_refresh_interval() {
+        let client = Arc::new(MockElasticsearch {
+            refresh_interval: std::sync::Mutex::new(Some("30s".to_string())),
+            fail_open_point_in_time: true,
+            ..Default::default()
+        });
+        let m = make_maintenance(ElasticsearchIndexWriteOptions {
+            refresh_interval_during_write: Some("-1".to_string()),
+            force_merge_segments: None,
+        });
+
+        m.on_write_start(&dyn_es(&client), "my-index", WriteWindow::ReplaceAll)
+            .await
+            .expect_err("the snapshot was refused");
+        m.on_write_complete(client.as_ref(), "my-index")
+            .await
+            .expect("complete");
+
+        assert_eq!(
+            client.put_settings_calls.load(Ordering::Relaxed),
+            2,
+            "refresh_interval must be overridden once and restored once"
+        );
+    }
+
+    /// Elasticsearch answers a search that not every shard completed with the hits it has and
+    /// no error. A reconcile that read such a page as complete would stop early, or skip a
+    /// shard's documents, and report success while their stale documents stay searchable.
+    #[tokio::test]
+    async fn an_incomplete_snapshot_page_fails_the_reconcile() {
+        for (page, expected) in [
+            (
+                serde_json::json!({
+                    "pit_id": "pit-1",
+                    "timed_out": false,
+                    "_shards": { "total": 2, "successful": 1, "skipped": 0, "failed": 1 },
+                    "hits": { "hits": [] },
+                }),
+                "1 of 2 shards failed to answer the snapshot search, so their documents were not checked",
+            ),
+            (
+                serde_json::json!({
+                    "pit_id": "pit-1",
+                    "timed_out": true,
+                    "_shards": { "total": 2, "successful": 2, "skipped": 0, "failed": 0 },
+                    "hits": { "hits": [] },
+                }),
+                "the snapshot search timed out, so not every document was checked",
+            ),
+        ] {
+            let client = MockElasticsearch {
+                snapshot_page: Some(page),
+                ..Default::default()
+            };
+            let mut pit_id = "pit-0".to_string();
+            assert_eq!(
+                ReplaceSnapshot::delete_pages(&client, &mut pit_id).await,
+                Err(expected.to_string())
+            );
+        }
+    }
+
+    /// `on_write_complete` restores the refresh_interval and calls `_refresh`.
+    /// `force_merge` must NOT be called when `force_merge_segments` is `None`.
+    #[tokio::test]
+    async fn write_complete_restores_interval_and_refreshes() {
+        let client = Arc::new(MockElasticsearch {
+            refresh_interval: std::sync::Mutex::new(Some("30s".to_string())),
+            ..Default::default()
+        });
+        let m = make_maintenance(ElasticsearchIndexWriteOptions {
+            refresh_interval_during_write: Some("-1".to_string()),
+            force_merge_segments: None,
+        });
+
+        m.on_write_start(&dyn_es(&client), "my-index", WriteWindow::Append)
+            .await
+            .expect("start");
+        m.on_write_complete(client.as_ref(), "my-index")
             .await
             .expect("complete");
 
@@ -1043,14 +1606,16 @@ mod write_maintenance_tests {
     /// `on_write_complete` calls `force_merge` with the configured segment count.
     #[tokio::test]
     async fn write_complete_calls_force_merge_when_configured() {
-        let client = MockElasticsearch::default();
+        let client = Arc::new(MockElasticsearch::default());
         let m = make_maintenance(ElasticsearchIndexWriteOptions {
             refresh_interval_during_write: None,
             force_merge_segments: Some(1),
         });
 
-        m.on_write_start(&client, "my-index").await.expect("start");
-        m.on_write_complete(&client, "my-index")
+        m.on_write_start(&dyn_es(&client), "my-index", WriteWindow::Append)
+            .await
+            .expect("start");
+        m.on_write_complete(client.as_ref(), "my-index")
             .await
             .expect("complete");
 
@@ -1073,25 +1638,25 @@ mod write_maintenance_tests {
     /// correctly re-applies the refresh_interval override for a subsequent cycle.
     #[tokio::test]
     async fn write_failed_resets_cycle_so_next_start_reapplies_override() {
-        let client = MockElasticsearch {
+        let client = Arc::new(MockElasticsearch {
             refresh_interval: std::sync::Mutex::new(Some("30s".to_string())),
             ..Default::default()
-        };
+        });
         let m = make_maintenance(ElasticsearchIndexWriteOptions {
             refresh_interval_during_write: Some("-1".to_string()),
             force_merge_segments: None,
         });
 
         // First write cycle fails.
-        m.on_write_start(&client, "my-index")
+        m.on_write_start(&dyn_es(&client), "my-index", WriteWindow::Append)
             .await
             .expect("start cycle 1");
-        m.on_write_failed(&client, "my-index")
+        m.on_write_failed(client.as_ref(), "my-index")
             .await
             .expect("failed cycle 1");
 
         // Second write cycle — must re-apply the override.
-        m.on_write_start(&client, "my-index")
+        m.on_write_start(&dyn_es(&client), "my-index", WriteWindow::Append)
             .await
             .expect("start cycle 2");
 
@@ -1113,13 +1678,13 @@ mod write_maintenance_tests {
     /// The `write_cycle_active` guard prevents spurious maintenance calls.
     #[tokio::test]
     async fn write_complete_without_start_is_noop() {
-        let client = MockElasticsearch::default();
+        let client = Arc::new(MockElasticsearch::default());
         let m = make_maintenance(ElasticsearchIndexWriteOptions {
             refresh_interval_during_write: Some("-1".to_string()),
             force_merge_segments: Some(1),
         });
 
-        m.on_write_complete(&client, "my-index")
+        m.on_write_complete(client.as_ref(), "my-index")
             .await
             .expect("complete without start must be no-op");
 
@@ -1141,8 +1706,11 @@ mod write_maintenance_tests {
 
     #[async_trait::async_trait]
     impl Embed for NoopEmbed {
-        async fn embed(&self, _input: EmbeddingInput) -> llms::embeddings::Result<Vec<Vec<f32>>> {
-            Ok(vec![])
+        async fn embed(
+            &self,
+            _input: EmbeddingInput,
+        ) -> llms::embeddings::Result<std::sync::Arc<Vec<Vec<f32>>>> {
+            Ok(std::sync::Arc::new(vec![]))
         }
         fn size(&self) -> i32 {
             3
@@ -1216,29 +1784,31 @@ mod write_maintenance_tests {
         let offset_col = ChunkedSearchIndex::chunking_offset_col("content");
         let embedding = embedding_col("content");
 
-        let query = index.query_result_schema();
-        query
-            .field_with_name(CHUNKED_INDEX_CHUNK_KEY)
-            .expect("query schema should expose the chunk key column");
-        query
-            .field_with_name(&offset_col)
-            .expect("query schema should expose the offset column");
-        query
-            .field_with_name(&embedding)
-            .expect("query schema should expose the embedding column");
-        query
-            .field_with_name(SEARCH_SCORE_COLUMN_NAME)
-            .expect("query schema should expose the score column");
-
-        let list = index.list_result_schema();
-        list.field_with_name(CHUNKED_INDEX_CHUNK_KEY)
-            .expect("list schema should expose the chunk key column");
-        list.field_with_name(&offset_col)
-            .expect("list schema should expose the offset column");
-        list.field_with_name(&embedding)
-            .expect("list schema should expose the embedding column");
-        list.field_with_name(SEARCH_SCORE_COLUMN_NAME)
-            .expect_err("list schema should not expose the score column");
+        // Every column, in order, with its exact type and nullability: the augmented key
+        // (the row's key, then the chunk key), the chunk offsets, the embedding, and — for a
+        // query only — the score.
+        let item = |data_type: DataType| Arc::new(Field::new("item", data_type, false));
+        let mut fields = vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new(CHUNKED_INDEX_CHUNK_KEY, DataType::UInt64, false),
+            Field::new(
+                &offset_col,
+                DataType::FixedSizeList(item(DataType::Int32), 2),
+                false,
+            ),
+            Field::new(
+                &embedding,
+                DataType::FixedSizeList(item(DataType::Float32), 3),
+                true,
+            ),
+        ];
+        assert_eq!(*index.list_result_schema(), Schema::new(fields.clone()));
+        fields.push(Field::new(
+            SEARCH_SCORE_COLUMN_NAME,
+            DataType::Float64,
+            true,
+        ));
+        assert_eq!(*index.query_result_schema(), Schema::new(fields));
     }
 
     /// The core fallback-contract guard: a `CompoundVectorIndex` pairing an in-memory warm
@@ -1259,6 +1829,32 @@ mod write_maintenance_tests {
         )
         .expect("memory warm index should build");
 
+        // What each side answers with on its own.
+        let warm_query = memory
+            .query_table_provider("query")
+            .expect("warm query plan")
+            .schema()
+            .as_arrow()
+            .clone();
+        let warm_list = memory
+            .list_table_provider()
+            .expect("warm list plan")
+            .schema()
+            .as_arrow()
+            .clone();
+        let es_query = es_index
+            .query_table_provider("query")
+            .expect("Elasticsearch query plan")
+            .schema()
+            .as_arrow()
+            .clone();
+        let es_list = es_index
+            .list_table_provider()
+            .expect("Elasticsearch list plan")
+            .schema()
+            .as_arrow()
+            .clone();
+
         let compound = CompoundVectorIndex::try_new(
             Arc::new(memory) as Arc<dyn VectorIndex>,
             Arc::new(es_index) as Arc<dyn VectorIndex>,
@@ -1266,11 +1862,383 @@ mod write_maintenance_tests {
         )
         .expect("compound index should build");
 
-        compound
+        let query = compound
             .query_table_provider("query")
             .expect("query fallback plan should build over the augmented primary key + metadata");
-        compound
+        let list = compound
             .list_table_provider()
             .expect("list fallback plan should build over the augmented primary key + metadata");
+
+        let offsets =
+            DataType::FixedSizeList(Arc::new(Field::new("item", DataType::Int32, false)), 2);
+        for (label, fallback, warm, es) in [
+            ("query", query.schema().as_arrow(), &warm_query, &es_query),
+            ("list", list.schema().as_arrow(), &warm_list, &es_list),
+        ] {
+            // The fallback answers with exactly the warm index's columns...
+            assert_eq!(fallback, warm, "{label} fallback schema");
+            // ...each of which Elasticsearch provides by name...
+            for field in warm.fields() {
+                es.field_with_name(field.name()).unwrap_or_else(|_| {
+                    panic!("the Elasticsearch {label} plan lacks '{}'", field.name())
+                });
+            }
+            // ...and the row and chunk keys and the chunk offsets reach it with their own
+            // types, so none of them is cast on the way.
+            for (key, data_type) in [
+                ("id", DataType::Int64),
+                (CHUNKED_INDEX_CHUNK_KEY, DataType::UInt64),
+                ("content_offset", offsets.clone()),
+            ] {
+                let warm_type = warm
+                    .field_with_name(key)
+                    .unwrap_or_else(|_| panic!("the warm {label} plan lacks '{key}'"))
+                    .data_type();
+                let es_type = es
+                    .field_with_name(key)
+                    .unwrap_or_else(|_| panic!("the Elasticsearch {label} plan lacks '{key}'"))
+                    .data_type();
+                assert_eq!(warm_type, &data_type, "warm {label} '{key}'");
+                assert_eq!(es_type, &data_type, "Elasticsearch {label} '{key}'");
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod chunked_group_pruning_tests {
+    use super::*;
+
+    use std::collections::{HashMap, HashSet};
+    use std::sync::Mutex as StdMutex;
+
+    use arrow::array::{Int64Array, StringArray};
+    use elasticsearch::{
+        Elasticsearch as ElasticsearchTrait, Error as EsError, FieldMapping, IndexMapping,
+        MappingResponse, Mappings, Result as EsResult, SearchRequest, SearchResponse,
+    };
+    use llms::embeddings::EmbeddingInput;
+    use serde_json::{Value, json};
+
+    use crate::index::chunking::{CHUNKED_INDEX_CHUNK_KEY, ChunkedSearchIndex, DelimChunker};
+    use crate::metadata::MetadataColumn;
+
+    const DIMS: i32 = 3;
+
+    /// One unit vector per input, so the write path's embedding count matches its row count.
+    #[derive(Debug)]
+    struct OnesEmbed;
+
+    #[async_trait::async_trait]
+    impl Embed for OnesEmbed {
+        async fn embed(
+            &self,
+            input: EmbeddingInput,
+        ) -> llms::embeddings::Result<Arc<Vec<Vec<f32>>>> {
+            let n = match input {
+                EmbeddingInput::String(_) => 1,
+                EmbeddingInput::StringArray(v) => v.len(),
+                _ => 0,
+            };
+            Ok(Arc::new(vec![vec![1.0, 0.0, 0.0]; n]))
+        }
+        fn size(&self) -> i32 {
+            DIMS
+        }
+    }
+
+    /// An Elasticsearch stand-in that holds documents by `_id` and answers `_delete_by_query`
+    /// by evaluating the query against them.
+    ///
+    /// It is a model, not a cluster: it understands exactly the clause kinds this module emits
+    /// (`term`, `ids`, and `bool` with `filter` / `should` / `must_not` /
+    /// `minimum_should_match`), and a query naming anything else fails the test rather than
+    /// matching nothing. Modelling the boolean semantics — rather than asserting a literal
+    /// request body — is what makes the surviving document set, not the spelling of the query,
+    /// the thing under test.
+    #[derive(Debug, Default)]
+    struct StoreClient {
+        docs: StdMutex<Vec<(String, Value)>>,
+    }
+
+    impl StoreClient {
+        /// The `_spice.chunk_id`s the store holds for source row `id`, ascending.
+        fn stored_chunk_ids(&self, id: i64) -> Vec<u64> {
+            let docs = self.docs.lock().expect("docs mutex should not be poisoned");
+            let mut chunk_ids: Vec<u64> = docs
+                .iter()
+                .filter(|(_, doc)| doc["id"].as_i64() == Some(id))
+                .filter_map(|(_, doc)| doc[CHUNKED_INDEX_CHUNK_KEY].as_u64())
+                .collect();
+            chunk_ids.sort_unstable();
+            chunk_ids
+        }
+    }
+
+    /// Does `doc` (stored under `_id`) satisfy `query`? `None` for a clause shape this model does
+    /// not implement, which the caller turns into a failed request.
+    fn matches(query: &Value, id: &str, doc: &Value) -> Option<bool> {
+        if let Some(values) = query.get("ids").and_then(|ids| ids.get("values")) {
+            let values = values.as_array()?;
+            return Some(values.iter().any(|v| v.as_str() == Some(id)));
+        }
+        if let Some(term) = query.get("term").and_then(Value::as_object) {
+            let (path, wanted) = term.iter().next()?;
+            // A `keyword` multi-field matches on its parent field's stored value.
+            let field = path.strip_suffix(".keyword").unwrap_or(path);
+            return Some(doc.get(field) == Some(wanted));
+        }
+        // `filter` / `should` / `must_not` are always arrays in the bodies this module emits, so
+        // any other spelling is a shape the model does not implement rather than an empty one.
+        let b = query.get("bool")?.as_object()?;
+        let all = |key: &str| -> Option<bool> {
+            match b.get(key) {
+                None => Some(true),
+                Some(Value::Array(clauses)) => clauses
+                    .iter()
+                    .try_fold(true, |ok, clause| Some(ok & matches(clause, id, doc)?)),
+                Some(_) => None,
+            }
+        };
+        let mut ok = all("filter")?;
+        if let Some(shoulds) = b.get("should") {
+            let minimum = b.get("minimum_should_match")?.as_u64()?;
+            let hits = shoulds.as_array()?.iter().try_fold(0u64, |hits, clause| {
+                Some(hits + u64::from(matches(clause, id, doc)?))
+            })?;
+            ok &= hits >= minimum;
+        }
+        match b.get("must_not") {
+            None => {}
+            Some(Value::Array(clauses)) => {
+                for clause in clauses {
+                    ok &= !matches(clause, id, doc)?;
+                }
+            }
+            Some(_) => return None,
+        }
+        Some(ok)
+    }
+
+    fn unexpected(method: &str) -> EsError {
+        EsError::ElasticsearchError {
+            status: 500,
+            message: format!("unexpected call to {method}"),
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl ElasticsearchTrait for StoreClient {
+        async fn bulk_delete_if_unchanged(
+            &self,
+            _docs: &[elasticsearch::DocumentVersion],
+        ) -> EsResult<serde_json::Value> {
+            Err(unexpected("bulk_delete_if_unchanged"))
+        }
+
+        async fn bulk_index(
+            &self,
+            _index: &str,
+            docs: &[(Option<String>, Value)],
+        ) -> EsResult<Value> {
+            let mut store = self.docs.lock().expect("docs mutex should not be poisoned");
+            let mut items = Vec::with_capacity(docs.len());
+            for (id, doc) in docs {
+                let id = id.clone().ok_or_else(|| EsError::ElasticsearchError {
+                    status: 400,
+                    message: "a chunked write must name every document's _id".to_string(),
+                })?;
+                match store.iter_mut().find(|(existing, _)| *existing == id) {
+                    Some(slot) => slot.1 = doc.clone(),
+                    None => store.push((id.clone(), doc.clone())),
+                }
+                items.push(json!({"index": {"_id": id, "status": 200}}));
+            }
+            Ok(json!({"errors": false, "items": items}))
+        }
+
+        async fn delete_by_query(&self, _index: &str, query: &Value) -> EsResult<Value> {
+            let mut store = self.docs.lock().expect("docs mutex should not be poisoned");
+            let mut doomed = HashSet::new();
+            for (id, doc) in store.iter() {
+                let hit = matches(query, id, doc).ok_or_else(|| EsError::ElasticsearchError {
+                    status: 400,
+                    message: format!("query shape not modelled: {query}"),
+                })?;
+                if hit {
+                    doomed.insert(id.clone());
+                }
+            }
+            let deleted = doomed.len() as u64;
+            store.retain(|(id, _)| !doomed.contains(id));
+
+            Ok(json!({
+                "took": 1, "timed_out": false, "total": deleted, "deleted": deleted,
+                "batches": 1, "version_conflicts": 0, "noops": 0,
+                "retries": {"bulk": 0, "search": 0}, "throttled_millis": 0, "failures": [],
+            }))
+        }
+
+        async fn get_mapping(&self, index: &str) -> EsResult<MappingResponse> {
+            let keyword = FieldMapping {
+                field_type: Some("keyword".to_string()),
+                properties: None,
+                fields: None,
+                ignore_above: None,
+                index: None,
+                normalizer: None,
+                dims: None,
+                similarity: None,
+            };
+            Ok(MappingResponse::from([(
+                index.to_string(),
+                IndexMapping {
+                    mappings: Mappings {
+                        properties: HashMap::from([("id".to_string(), keyword)]),
+                    },
+                },
+            )]))
+        }
+
+        async fn search(&self, _index: &str, _body: &SearchRequest) -> EsResult<SearchResponse> {
+            Err(unexpected("search"))
+        }
+        async fn search_raw(&self, _index: &str, _body: &Value) -> EsResult<SearchResponse> {
+            Err(unexpected("search_raw"))
+        }
+        async fn open_point_in_time(&self, _index: &str, _keep_alive: &str) -> EsResult<String> {
+            Err(unexpected("open_point_in_time"))
+        }
+        async fn search_point_in_time(&self, _body: &Value) -> EsResult<SearchResponse> {
+            Err(unexpected("search_point_in_time"))
+        }
+        async fn close_point_in_time(&self, _pit_id: &str) -> EsResult<()> {
+            Err(unexpected("close_point_in_time"))
+        }
+        async fn index_exists(&self, _index: &str) -> EsResult<bool> {
+            Err(unexpected("index_exists"))
+        }
+        async fn create_index(&self, _index: &str, _body: &Value) -> EsResult<Value> {
+            Err(unexpected("create_index"))
+        }
+        async fn put_mapping(&self, _index: &str, _body: &Value) -> EsResult<Value> {
+            Err(unexpected("put_mapping"))
+        }
+        async fn get_index_refresh_interval(&self, _index: &str) -> EsResult<Option<String>> {
+            Err(unexpected("get_index_refresh_interval"))
+        }
+        async fn put_index_settings(&self, _index: &str, _body: &Value) -> EsResult<Value> {
+            Err(unexpected("put_index_settings"))
+        }
+        async fn refresh_index(&self, _index: &str) -> EsResult<Value> {
+            Err(unexpected("refresh_index"))
+        }
+        async fn force_merge(&self, _index: &str, _max_num_segments: u32) -> EsResult<Value> {
+            Err(unexpected("force_merge"))
+        }
+        async fn index_document(&self, _index: &str, _id: &str, _doc: &Value) -> EsResult<Value> {
+            Err(unexpected("index_document"))
+        }
+    }
+
+    /// An [`ElasticsearchIndex`] shaped as the inner index of a [`ChunkedSearchIndex`]: keyed by
+    /// the source row's `id` plus the chunk id, one document per chunk.
+    fn chunked_index(client: &Arc<StoreClient>) -> Arc<ElasticsearchIndex> {
+        let embedded_column = "content".to_string();
+        let primary_key =
+            ChunkedSearchIndex::augment_primary_key(vec![Field::new("id", DataType::Int64, false)]);
+        let offset_field = Field::new(
+            ChunkedSearchIndex::chunking_offset_col(&embedded_column),
+            DataType::FixedSizeList(Arc::new(Field::new("item", DataType::Int32, false)), 2),
+            false,
+        );
+        let metadata_columns: MetadataColumns = vec![MetadataColumn::NonFilterable(Arc::new(
+            offset_field.clone(),
+        ))]
+        .into();
+        let source_schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("content", DataType::Utf8, true),
+            offset_field,
+            Field::new(CHUNKED_INDEX_CHUNK_KEY, DataType::UInt64, false),
+            Field::new(
+                embedding_col(&embedded_column),
+                DataType::FixedSizeList(
+                    Arc::new(Field::new("item", DataType::Float32, false)),
+                    DIMS,
+                ),
+                true,
+            ),
+        ]));
+
+        Arc::new(ElasticsearchIndex {
+            client: Arc::clone(client) as Arc<dyn Elasticsearch>,
+            es_index: "idx".to_string(),
+            embedded_column,
+            vector_field: embedding_col("content"),
+            text_fields: vec![],
+            primary_key,
+            compute_query: Arc::new(OnesEmbed),
+            dims: DIMS,
+            similarity: "cosine".to_string(),
+            source_schema,
+            metadata_columns,
+            batch_write_rows: 1000,
+            write_maintenance: Arc::new(ElasticsearchIndexWriteMaintenance::default()),
+        })
+    }
+
+    /// Source rows as the chunking layer receives them: the base key and the text to chunk.
+    fn content_rows(rows: &[(i64, &str)]) -> RecordBatch {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("content", DataType::Utf8, true),
+        ]));
+        RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(Int64Array::from(
+                    rows.iter().map(|(id, _)| *id).collect::<Vec<_>>(),
+                )),
+                Arc::new(StringArray::from(
+                    rows.iter().map(|(_, text)| *text).collect::<Vec<_>>(),
+                )),
+            ],
+        )
+        .expect("valid test batch")
+    }
+
+    /// Regression test for #13717 over a real [`ElasticsearchIndex`]: a row rewritten to text
+    /// that chunks into fewer pieces is upserted under chunk ids `0..n` and nothing above them,
+    /// so every higher chunk id the previous text produced stays in the index — the row keeps
+    /// answering searches for a word its current text does not contain.
+    #[tokio::test]
+    async fn a_shortened_row_drops_the_chunks_it_no_longer_produces() {
+        let client = Arc::new(StoreClient::default());
+        let idx = ChunkedSearchIndex::new(
+            chunked_index(&client) as Arc<dyn SearchIndex>,
+            Arc::new(DelimChunker { delim: ' ' }),
+        );
+
+        idx.write(content_rows(&[(1, "aaa bbb"), (2, "ddd eee")]))
+            .await
+            .expect("the first write lands");
+        assert_eq!(client.stored_chunk_ids(1), vec![0, 1]);
+        assert_eq!(client.stored_chunk_ids(2), vec![0, 1]);
+
+        idx.write(content_rows(&[(1, "ccc")]))
+            .await
+            .expect("the rewrite lands");
+
+        assert_eq!(
+            client.stored_chunk_ids(1),
+            vec![0],
+            "the chunk 'bbb' produced goes with the text that produced it"
+        );
+        assert_eq!(
+            client.stored_chunk_ids(2),
+            vec![0, 1],
+            "a row the write did not touch keeps every chunk"
+        );
     }
 }

@@ -30,7 +30,7 @@ use datafusion::{
     physical_plan::ExecutionPlan,
     prelude::SessionContext,
 };
-use spice_table::{Index, WriteWindow};
+use spice_table::{GroupPruning, Index, WriteWindow};
 
 use super::{CompoundReadMode, CompoundSearchIndex, CompoundVectorIndex, Error};
 use crate::index::{SearchIndex, VectorIndex};
@@ -63,6 +63,8 @@ struct MockIndex {
     write_complete_fatal: bool,
     /// What this mock reports from `Index::deletes_by_partial_key`.
     deletes_partial_key: bool,
+    /// What this mock reports from `Index::group_pruning`.
+    group_pruning: GroupPruning,
     events: Arc<Mutex<Vec<String>>>,
 }
 
@@ -83,6 +85,7 @@ impl MockIndex {
             write_start_fatal: false,
             write_complete_fatal: false,
             deletes_partial_key: false,
+            group_pruning: GroupPruning::Complete,
             events: Arc::clone(events),
         }
     }
@@ -190,6 +193,10 @@ impl Index for MockIndex {
 
     fn deletes_by_partial_key(&self) -> bool {
         self.deletes_partial_key
+    }
+
+    fn group_pruning(&self) -> GroupPruning {
+        self.group_pruning.clone()
     }
 
     fn write_start_failure_is_fatal(&self) -> bool {
@@ -376,8 +383,8 @@ fn try_new_rejects_primary_fields_mismatch() {
     assert!(matches!(err, Error::PrimaryFieldsMismatch { .. }), "{err}");
 }
 
-#[test]
-fn try_new_accepts_primary_fields_in_different_order() {
+#[tokio::test]
+async fn try_new_accepts_primary_fields_in_different_order() {
     let events = Arc::new(Mutex::new(vec![]));
     let pk_a = vec![
         Field::new("id", DataType::Int64, false),
@@ -387,17 +394,72 @@ fn try_new_accepts_primary_fields_in_different_order() {
         Field::new("tenant", DataType::Utf8, false),
         Field::new("id", DataType::Int64, false),
     ];
+    // Each index reports its results with its key columns in its own order.
+    let primary_results = Arc::new(Schema::new(vec![
+        Field::new("id", DataType::Int64, false),
+        Field::new("tenant", DataType::Utf8, false),
+        Field::new("source", DataType::Utf8, false),
+    ]));
+    let secondary_results = Arc::new(Schema::new(vec![
+        Field::new("tenant", DataType::Utf8, false),
+        Field::new("id", DataType::Int64, false),
+        Field::new("source", DataType::Utf8, false),
+    ]));
     let mut primary = MockIndex::new("primary", &events);
-    primary.primary_fields = pk_a;
+    primary.primary_fields = pk_a.clone();
+    primary.query_batches = vec![RecordBatch::new_empty(primary_results)];
     let mut secondary = MockIndex::new("secondary", &events);
     secondary.primary_fields = pk_b;
+    secondary.query_batches = vec![
+        RecordBatch::try_new(
+            secondary_results,
+            vec![
+                Arc::new(StringArray::from(vec!["t2", "t1"])),
+                Arc::new(Int64Array::from(vec![2_i64, 1])),
+                Arc::new(StringArray::from(vec!["secondary"; 2])),
+            ],
+        )
+        .expect("valid secondary batch"),
+    ];
 
-    CompoundSearchIndex::try_new(
+    let idx = CompoundSearchIndex::try_new(
         Arc::new(primary),
         Arc::new(secondary),
-        CompoundReadMode::PrimaryOnly,
+        CompoundReadMode::FallbackToSecondary,
     )
     .expect("field order must not matter for key compatibility");
+    assert_eq!(
+        idx.primary_fields(),
+        pk_a,
+        "the compound is keyed by the primary's fields"
+    );
+
+    // The primary has no results, so the secondary answers: its key columns are matched to
+    // the primary's by name, not by position.
+    let plan = idx.query_table_provider("q").expect("plan builds");
+    let batches = SessionContext::new()
+        .execute_logical_plan(Arc::unwrap_or_clone(plan))
+        .await
+        .expect("plan executes")
+        .sort(vec![datafusion::prelude::col("id").sort(true, false)])
+        .expect("sorts")
+        .collect()
+        .await
+        .expect("plan collects");
+    assert_eq!(
+        datafusion::arrow::util::pretty::pretty_format_batches(&batches)
+            .expect("format results")
+            .to_string(),
+        [
+            "+----+--------+-----------+",
+            "| id | tenant | source    |",
+            "+----+--------+-----------+",
+            "| 1  | t1     | secondary |",
+            "| 2  | t2     | secondary |",
+            "+----+--------+-----------+",
+        ]
+        .join("\n")
+    );
 }
 
 #[test]
@@ -641,6 +703,81 @@ fn partial_key_deletion_requires_both_halves() {
             vector.deletes_by_partial_key(),
             expected,
             "vector: primary={primary_partial}, secondary={secondary_partial}"
+        );
+    }
+}
+
+/// `delete_group_remainder` fans out to both halves, so the compound prunes whenever *either*
+/// half can — the production warm index pairs a memory primary that prunes with an S3 Vectors
+/// or Elasticsearch secondary that cannot, and an intersection here would switch the memory
+/// half's pruning off. The half that cannot is named by its `Index::name` (the mock's is the
+/// constant `MockIndex`), so the caller can say what stays behind.
+#[test]
+fn group_pruning_reaches_the_half_that_can_and_names_the_half_that_cannot() {
+    let events = Arc::new(Mutex::new(vec![]));
+    let mock = |label: &'static str, pruning: GroupPruning| {
+        let mut idx = MockIndex::new(label, &events);
+        idx.dimension = Some(4);
+        idx.group_pruning = pruning;
+        idx
+    };
+
+    for (primary, secondary, expected) in [
+        (
+            GroupPruning::Complete,
+            GroupPruning::Complete,
+            GroupPruning::Complete,
+        ),
+        (
+            GroupPruning::Complete,
+            GroupPruning::Unsupported,
+            GroupPruning::Partial {
+                cannot: vec!["MockIndex"],
+            },
+        ),
+        (
+            GroupPruning::Unsupported,
+            GroupPruning::Complete,
+            GroupPruning::Partial {
+                cannot: vec!["MockIndex"],
+            },
+        ),
+        (
+            GroupPruning::Partial {
+                cannot: vec!["deeper"],
+            },
+            GroupPruning::Unsupported,
+            GroupPruning::Partial {
+                cannot: vec!["deeper", "MockIndex"],
+            },
+        ),
+        (
+            GroupPruning::Unsupported,
+            GroupPruning::Unsupported,
+            GroupPruning::Unsupported,
+        ),
+    ] {
+        let search = compound(
+            mock("primary", primary.clone()),
+            mock("secondary", secondary.clone()),
+            CompoundReadMode::PrimaryOnly,
+        );
+        assert_eq!(
+            search.group_pruning(),
+            expected,
+            "search: primary={primary:?}, secondary={secondary:?}"
+        );
+
+        let vector = CompoundVectorIndex::try_new(
+            Arc::new(mock("primary", primary.clone())) as Arc<dyn VectorIndex>,
+            Arc::new(mock("secondary", secondary.clone())) as Arc<dyn VectorIndex>,
+            CompoundReadMode::PrimaryOnly,
+        )
+        .expect("compatible vector indexes");
+        assert_eq!(
+            vector.group_pruning(),
+            expected,
+            "vector: primary={primary:?}, secondary={secondary:?}"
         );
     }
 }
@@ -1177,11 +1314,16 @@ mod warm_memory {
 
     #[async_trait]
     impl Embed for ByteEmbed {
-        async fn embed(&self, input: EmbeddingInput) -> llms::embeddings::Result<Vec<Vec<f32>>> {
+        async fn embed(
+            &self,
+            input: EmbeddingInput,
+        ) -> llms::embeddings::Result<std::sync::Arc<Vec<Vec<f32>>>> {
             match input {
-                EmbeddingInput::String(s) => Ok(vec![byte_vector(&s)]),
-                EmbeddingInput::StringArray(v) => Ok(v.iter().map(|s| byte_vector(s)).collect()),
-                _ => Ok(vec![]),
+                EmbeddingInput::String(s) => Ok(std::sync::Arc::new(vec![byte_vector(&s)])),
+                EmbeddingInput::StringArray(v) => Ok(std::sync::Arc::new(
+                    v.iter().map(|s| byte_vector(s)).collect(),
+                )),
+                _ => Ok(std::sync::Arc::new(vec![])),
             }
         }
         fn size(&self) -> i32 {

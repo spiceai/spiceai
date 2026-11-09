@@ -15,7 +15,7 @@ limitations under the License.
 */
 use app::App;
 use async_trait::async_trait;
-use datafusion::sql::TableReference;
+use datafusion::common::TableReference;
 use itertools::Itertools;
 use tools::SpiceModelTool;
 

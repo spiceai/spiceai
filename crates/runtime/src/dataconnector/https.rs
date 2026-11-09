@@ -24,34 +24,37 @@ use crate::dataconnector::client_identity::{
     TLS_CLIENT_KEY_FILE,
 };
 use crate::dataconnector::http_rate_control::{
-    self, HttpRateControlConfig, HttpRateControlMetricSource, HttpRateControlMetrics,
-    HttpRateControlMetricsProvider,
+    self, HTTP_RATE_CONTROL_METRIC_SPECS, HttpRateControlConfig, HttpRateControlMetricSource,
+    HttpRateControlMetrics, HttpRateControlMetricsProvider,
 };
 use crate::dataconnector::listing::{
     LISTING_TABLE_PARAMETERS, ListingTableConnector, build_fragments,
     detect_file_extension_from_url_or_path, parse_file_extension_param,
 };
-use runtime_metrics::component::MetricsProvider;
+use data_components::http::metrics::{HttpCacheMetrics, names as http_cache_metric_names};
+use opentelemetry::KeyValue;
+use runtime_api_types::v1::ComponentType;
+use runtime_metrics::component::{MetricSpec, MetricType, MetricsProvider, ObserveMetricCallback};
 
 use data_components::http::auth::{
     ClientAuthMethod, HttpAuthenticator, OAuth2Auth, OAuth2Config, OAuthGrant, TokenHeader,
 };
 use data_components::http::json_nest::HttpJsonNesting;
 use data_components::rate_limit::RateLimiter;
-use runtime_datafusion::url_table::{is_blocked_internal_hostname, is_internal_ip};
-use secrecy::ExposeSecret;
+use percent_encoding::percent_decode_str;
+use runtime_object_store::{http_auth, ssrf};
+use secrecy::{ExposeSecret, SecretString};
 use serde_json::Value;
 use snafu::prelude::*;
 use spicepod::semantic::Column;
 use std::any::Any;
 use std::collections::HashMap;
 use std::future::Future;
-use std::net::IpAddr;
 use std::path::PathBuf;
 use std::pin::Pin;
 use std::sync::{Arc, LazyLock};
 use tokio::runtime::Handle;
-use url::Url;
+use url::{Url, form_urlencoded};
 
 use super::{ConnectorComponent, ConnectorParams};
 use super::{
@@ -67,6 +70,12 @@ use reqwest::{
 use std::time::Duration;
 
 const DEFAULT_CLIENT_TIMEOUT_SECS: u64 = 30;
+
+/// The `client_timeout` an HTTPS dataset gets when it sets none. Also the
+/// default bound for the rate-control acquire wait, so it must stay equal to
+/// the GraphQL client's timeout for datasets that share an origin.
+pub const DEFAULT_CLIENT_TIMEOUT: Duration = Duration::from_secs(DEFAULT_CLIENT_TIMEOUT_SECS);
+const DEFAULT_CONNECT_TIMEOUT_SECS: u64 = 10;
 
 fn parse_pagination_max_pages(value: &str) -> Option<usize> {
     let trimmed = value.trim();
@@ -85,6 +94,37 @@ fn parse_pagination_max_pages(value: &str) -> Option<usize> {
     }
 }
 
+/// Resolves the hosts a redirect introduced through [`ssrf::redirect_destination_guard`], so a
+/// redirect cannot reach an internal address by name. The dataset's own host and a proxy's
+/// resolve unchecked.
+#[derive(Default)]
+struct RedirectHostResolver {
+    redirect_hosts: Arc<parking_lot::Mutex<std::collections::HashSet<String>>>,
+}
+
+/// `host` as [`RedirectHostResolver`] keys it: `example.com.` and `example.com` name the same host.
+fn redirect_host_key(host: &str) -> String {
+    host.trim_end_matches('.').to_ascii_lowercase()
+}
+
+impl reqwest::dns::Resolve for RedirectHostResolver {
+    fn resolve(&self, name: reqwest::dns::Name) -> reqwest::dns::Resolving {
+        let host = name.as_str().to_string();
+        let guarded = self
+            .redirect_hosts
+            .lock()
+            .contains(&redirect_host_key(&host));
+        Box::pin(async move {
+            let addresses: Vec<std::net::SocketAddr> = if guarded {
+                ssrf::redirect_destination_guard().resolve(&host).await?
+            } else {
+                tokio::net::lookup_host((host.as_str(), 0)).await?.collect()
+            };
+            Ok(Box::new(addresses.into_iter()) as reqwest::dns::Addrs)
+        })
+    }
+}
+
 #[derive(Debug)]
 pub struct Https {
     params: Parameters,
@@ -96,6 +136,10 @@ pub struct Https {
     metrics: Arc<HttpRateControlMetrics>,
     emit_rate_control_metrics: bool,
     rate_control_metric_source: Option<HttpRateControlMetricSource>,
+    /// Occupancy of this dataset's HTTP response cache. Held here rather than on
+    /// the table provider because metrics are registered against the dataset
+    /// before the provider is built.
+    cache_metrics: Arc<HttpCacheMetrics>,
 }
 
 impl std::fmt::Display for Https {
@@ -152,8 +196,6 @@ impl Https {
         }
 
         // Vortex is a structured columnar format handled by the listing connector.
-        // It is only built on non-Windows targets (see `get_file_format_and_extension`).
-        #[cfg(not(windows))]
         if file_format == "vortex" {
             return true;
         }
@@ -183,8 +225,6 @@ impl Https {
                 return true;
             }
 
-            // Vortex is only built on non-Windows targets.
-            #[cfg(not(windows))]
             if extension.as_deref() == Some("vortex") {
                 return true;
             }
@@ -201,6 +241,64 @@ impl Https {
     /// a dynamic HTTP API endpoint (as opposed to a static file download).
     fn has_dynamic_api_params(&self) -> bool {
         params_indicate_dynamic_api(&self.params)
+    }
+
+    /// Validate `on_error_response` on a dataset bound for the listing connector.
+    ///
+    /// The listing connector never reaches [`resolve_http_provider_params`], so it cannot
+    /// honour an action that records a row. It does already refuse a response the origin
+    /// did not mark successful, which is exactly what `error` asks for — so `error` is
+    /// accepted as the statement of that behaviour rather than refused, and one `params`
+    /// block stays shareable between a structured and a dynamic dataset. An unparseable
+    /// value is rejected in the same words the dynamic path uses, so the setting means the
+    /// same thing wherever it is written.
+    ///
+    /// [`resolve_http_provider_params`]: Https::resolve_http_provider_params
+    fn ensure_error_response_action_supported_for_structured_dataset(
+        &self,
+        dataset: &DatasetSpec,
+    ) -> DataConnectorResult<()> {
+        use data_components::http::provider::ErrorResponseAction;
+
+        match self.parse_error_response_action(dataset)? {
+            None | Some(ErrorResponseAction::Error) => Ok(()),
+            Some(action) => Err(DataConnectorError::InvalidConfigurationNoSource {
+                dataconnector: "https".to_string(),
+                connector_component: ConnectorComponent::from(dataset),
+                message: format!(
+                    "`on_error_response: {action}` is not supported for structured HTTP file datasets that use the listing connector, which cannot record a response body as a row. Those datasets always fail a request the origin did not answer successfully: remove the parameter, or set `on_error_response: error` to state that. Set `{action}` on a dynamic JSON HTTP API dataset instead. See: https://spiceai.org/docs/components/data-connectors/https"
+                ),
+            }),
+        }
+    }
+
+    /// Read `on_error_response`, or `None` when the dataset does not set it.
+    ///
+    /// Both routes that read this parameter go through here so that an unparseable value
+    /// is refused in one set of words rather than two that have to be kept in step. A
+    /// misspelt action must not fall back to a different policy: silently reading
+    /// `on_error_response: eror` as the default would leave the operator believing they
+    /// had configured something they had not.
+    fn parse_error_response_action(
+        &self,
+        dataset: &DatasetSpec,
+    ) -> DataConnectorResult<Option<data_components::http::provider::ErrorResponseAction>> {
+        use data_components::http::provider::ErrorResponseAction;
+
+        let Some(value) = self.params.get("on_error_response").expose().ok() else {
+            return Ok(None);
+        };
+
+        value.parse::<ErrorResponseAction>().map(Some).map_err(|()| {
+            DataConnectorError::InvalidConfigurationNoSource {
+                dataconnector: "https".to_string(),
+                connector_component: ConnectorComponent::from(dataset),
+                message: format!(
+                    "'{value}' is not a valid `on_error_response`. Expected one of: {}. See: https://spiceai.org/docs/components/data-connectors/https",
+                    ErrorResponseAction::accepted_values()
+                ),
+            }
+        })
     }
 
     fn ensure_rate_control_supported_for_structured_dataset(
@@ -248,8 +346,11 @@ struct HttpProviderParams {
     request_filters: RequestFilterParams,
     rate_control: HttpRateControlConfig,
     max_request_partitions: Option<usize>,
+    cache_max_size_bytes: usize,
+    cache_fallback_ttl: Option<Duration>,
     health_probe: Option<String>,
     pagination: Option<data_components::http::provider::PaginationConfig>,
+    error_response_action: data_components::http::provider::ErrorResponseAction,
 }
 
 impl Https {
@@ -271,6 +372,10 @@ impl Https {
             .ok()
             .and_then(|v| v.parse::<u32>().ok())
             .unwrap_or(3);
+
+        let error_response_action = self
+            .parse_error_response_action(dataset)?
+            .unwrap_or_default();
 
         let backoff_method = self
             .params
@@ -370,12 +475,53 @@ impl Https {
             })
             .unwrap_or_default();
 
-        let rate_control = http_rate_control::resolve_config(
+        let mut rate_control = http_rate_control::resolve_config(
             &self.params,
             self.runtime_rate_control_params.as_ref(),
             dataset,
             "https",
         )?;
+        rate_control.apply_default_acquire_timeout(self.configured_client_timeout());
+
+        // Both of these bound memory, so an unparseable value is refused rather
+        // than quietly replaced by a default: silently falling back would leave
+        // the operator believing a budget they set is in force.
+        let cache_max_size_bytes = match self
+            .params
+            .get("response_cache_max_size_bytes")
+            .expose()
+            .ok()
+        {
+            Some(value) => value.parse::<usize>().map_err(|_| {
+                DataConnectorError::InvalidConfigurationNoSource {
+                    dataconnector: "https".to_string(),
+                    connector_component: ConnectorComponent::from(dataset),
+                    message: format!(
+                        "Invalid `response_cache_max_size_bytes` value '{value}'. Expected a whole number of bytes, for example '67108864' for 64 MiB. Use '0' to disable the response cache. See: https://spiceai.org/docs/components/data-connectors/https"
+                    ),
+                }
+            })?,
+            None => data_components::http::provider::DEFAULT_HTTP_CACHE_MAX_SIZE_BYTES,
+        };
+
+        let cache_fallback_ttl = match self
+            .params
+            .get("response_cache_fallback_ttl")
+            .expose()
+            .ok()
+        {
+            Some(value) => Some(fundu::parse_duration(value).map_err(|source| {
+                DataConnectorError::InvalidConfiguration {
+                    dataconnector: "https".to_string(),
+                    connector_component: ConnectorComponent::from(dataset),
+                    message: format!(
+                        "Invalid `response_cache_fallback_ttl` value '{value}'. Expected a duration, for example '5m' or '30s'. Leave it unset to keep responses from an origin that sends no `Cache-Control` uncached. See: https://spiceai.org/docs/components/data-connectors/https"
+                    ),
+                    source: Box::new(source),
+                }
+            })?),
+            None => None,
+        };
 
         let max_request_partitions = self
             .params
@@ -526,8 +672,11 @@ impl Https {
             },
             rate_control,
             max_request_partitions,
+            cache_max_size_bytes,
+            cache_fallback_ttl,
             health_probe,
             pagination,
+            error_response_action,
         })
     }
 
@@ -808,22 +957,31 @@ impl Https {
     }
 
     /// Build HTTP client with configured timeouts and connection pool settings
-    async fn build_http_client(&self, dataset: &DatasetSpec) -> DataConnectorResult<Client> {
-        let timeout_secs = self
-            .params
-            .get("client_timeout")
-            .expose()
-            .ok()
-            .and_then(|t| t.parse::<u64>().ok())
-            .unwrap_or(DEFAULT_CLIENT_TIMEOUT_SECS);
+    fn configured_client_timeout(&self) -> Duration {
+        Duration::from_secs(
+            self.params
+                .get("client_timeout")
+                .expose()
+                .ok()
+                .and_then(|t| t.parse::<u64>().ok())
+                .unwrap_or(DEFAULT_CLIENT_TIMEOUT_SECS),
+        )
+    }
 
-        let connect_timeout_secs = self
-            .params
-            .get("connect_timeout")
-            .expose()
-            .ok()
-            .and_then(|t| t.parse::<u64>().ok())
-            .unwrap_or(10);
+    fn configured_connect_timeout(&self) -> Duration {
+        Duration::from_secs(
+            self.params
+                .get("connect_timeout")
+                .expose()
+                .ok()
+                .and_then(|t| t.parse::<u64>().ok())
+                .unwrap_or(DEFAULT_CONNECT_TIMEOUT_SECS),
+        )
+    }
+
+    async fn build_http_client(&self, dataset: &DatasetSpec) -> DataConnectorResult<Client> {
+        let client_timeout = self.configured_client_timeout();
+        let connect_timeout = self.configured_connect_timeout();
 
         let pool_max_idle_per_host = self
             .params
@@ -841,36 +999,37 @@ impl Https {
             .and_then(|v| v.parse::<u64>().ok())
             .unwrap_or(90);
 
+        let origin_host = Url::parse(dataset.from.as_str())
+            .ok()
+            .and_then(|url| url.host_str().map(redirect_host_key));
+        let resolver = RedirectHostResolver::default();
+        let redirect_hosts = Arc::clone(&resolver.redirect_hosts);
+
         let mut builder = Client::builder()
             .user_agent(util::spiceai_user_agent())
-            .connect_timeout(Duration::from_secs(connect_timeout_secs))
-            .timeout(Duration::from_secs(timeout_secs))
-            .redirect(reqwest::redirect::Policy::custom(|attempt| {
+            .connect_timeout(connect_timeout)
+            .timeout(client_timeout)
+            .redirect(reqwest::redirect::Policy::custom(move |attempt| {
                 const MAX_REDIRECTS: usize = 5;
                 if attempt.previous().len() >= MAX_REDIRECTS {
                     return attempt.error("too many redirects");
                 }
                 // SSRF defense-in-depth: refuse to follow a redirect to an
-                // internal target. Reuses the URL-table SSRF classifier so the
-                // two guards stay in lock-step — covering loopback, private/
-                // RFC1918, link-local (incl. the cloud-metadata endpoint),
-                // unique-local, CGNAT, unspecified, multicast, and reserved
-                // ranges for both IPv4 and IPv6, including IPv4-mapped IPv6
-                // forms like `::ffff:169.254.169.254`. Hostname redirects (e.g.
-                // `localhost`) can't be DNS-resolved in this synchronous
-                // closure, so well-known internal names are rejected by literal
-                // match; reqwest resolves any remaining hostnames at connect time.
-                let to_internal = match attempt.url().host() {
-                    Some(url::Host::Ipv4(ip)) => is_internal_ip(IpAddr::V4(ip)),
-                    Some(url::Host::Ipv6(ip)) => is_internal_ip(IpAddr::V6(ip)),
-                    Some(url::Host::Domain(domain)) => is_blocked_internal_hostname(domain),
-                    None => false,
-                };
-                if to_internal {
+                // internal target, with the same classifier URL tables use.
+                if ssrf::redirect_target_is_internal(attempt.url()) {
                     return attempt.error("redirect to a private address is not allowed");
+                }
+                // This closure cannot resolve DNS, so the resolver checks the
+                // addresses of each new host a redirect names.
+                if let Some(url::Host::Domain(host)) = attempt.url().host() {
+                    let host = redirect_host_key(host);
+                    if origin_host.as_deref() != Some(host.as_str()) {
+                        redirect_hosts.lock().insert(host);
+                    }
                 }
                 attempt.follow()
             }))
+            .dns_resolver(Arc::new(resolver))
             .pool_max_idle_per_host(pool_max_idle_per_host)
             .pool_idle_timeout(Duration::from_secs(pool_idle_timeout_secs));
 
@@ -883,7 +1042,9 @@ impl Https {
             builder = builder.use_rustls_tls().identity(identity);
         }
 
-        builder
+        // The provider decodes compressed bodies itself, so it can refuse one that
+        // expands like a compression bomb before it is held in memory.
+        http_body_limit::decode_manually(builder)
             .build()
             .boxed()
             .map_err(|e| DataConnectorError::InternalWithSource {
@@ -1147,8 +1308,11 @@ impl Https {
             request_filters,
             rate_control,
             max_request_partitions,
+            cache_max_size_bytes,
+            cache_fallback_ttl,
             health_probe,
             pagination,
+            error_response_action,
         } = self.resolve_http_provider_params(dataset)?;
 
         let RequestFilterParams {
@@ -1167,12 +1331,17 @@ impl Https {
             file_format,
             acceleration_enabled,
         )
+        .with_table_reference(dataset.name.clone())
         .with_max_retries(max_retries)
         .with_backoff_method(backoff_method)
         .with_max_retry_duration(max_retry_duration)
         .with_retry_jitter(retry_jitter)
         .with_headers(custom_headers)
         .with_max_request_partitions(max_request_partitions)
+        .with_error_response_action(error_response_action)
+        .with_dataset_name(dataset.name.to_string())
+        .with_cache_limits(cache_max_size_bytes, cache_fallback_ttl)
+        .with_cache_metrics(Arc::clone(&self.cache_metrics))
         .with_health_probe(health_probe)
         .map_err(|e| DataConnectorError::InvalidConfiguration {
             dataconnector: "https".to_string(),
@@ -1285,7 +1454,7 @@ impl Https {
 
         let rate_limiter = self
             .rate_control_registry
-            .shared_rate_limiter(&base_url)
+            .shared_rate_limiter_for_config(&base_url, &rate_control)
             .await;
         self.metrics.set_rate_limiter(&rate_limiter);
         let rate_limiter: Arc<dyn RateLimiter> = rate_limiter;
@@ -1336,9 +1505,8 @@ const OAUTH_PARAM_KEYS: &[&str] = &[
 ];
 
 /// File formats served by the listing connector rather than the dynamic JSON
-/// API provider. `vortex` is handled separately because it is only built on
-/// non-Windows targets, and `json` because it is structured only when no
-/// dynamic-API param is set.
+/// API provider. `vortex` is handled separately, and `json` because it is
+/// structured only when no dynamic-API param is set.
 const STRUCTURED_FILE_FORMATS: &[&str] = &[
     "parquet", "csv", "tsv", "arrow", "avro", "jsonl", "ndjson", "ldjson", "soda", "socrata",
 ];
@@ -1458,7 +1626,14 @@ fn build_json_nest_schema(
         let nullable = column.nullable.unwrap_or(true);
         fields.push(arrow_schema::Field::new(name, dt, nullable));
     }
-    Ok(std::sync::Arc::new(arrow_schema::Schema::new(fields)))
+    // Carry the base schema's HTTP-provenance marker forward even though the
+    // decomposed schema is otherwise a different set of fields: it is what
+    // `cache::http_fetch_status` checks to tell a real HTTP-connector
+    // batch from an unrelated dataset that happens to have a same-shaped
+    // `response_status` column of its own (see `HTTP_RESPONSE_STATUS_METADATA_KEY`).
+    Ok(std::sync::Arc::new(
+        arrow_schema::Schema::new_with_metadata(fields, base.metadata().clone()),
+    ))
 }
 
 /// Compute the static schema (no source I/O) for an HTTPS dataset in
@@ -1553,6 +1728,11 @@ fn parse_http_json_nesting(dataset: &DatasetSpec) -> DataConnectorResult<Option<
         .filter(|name| HTTP_METADATA_FIELDS.contains(&name.as_str()))
         .cloned()
         .collect();
+    // The user-declared subset, captured before `_fetched_at` and
+    // `response_status` are force-added below regardless of declaration —
+    // see `HttpJsonNesting::catch_all_exclusions` for why only this subset
+    // may take a same-named JSON body key away from the catch-all.
+    let catch_all_exclusions = metadata_fields.clone();
 
     // Ensure `fetched_at` is always present so caching TTL eviction and
     // append-mode `time_column` work even when the user omits the column.
@@ -1561,10 +1741,42 @@ fn parse_http_json_nesting(dataset: &DatasetSpec) -> DataConnectorResult<Option<
         metadata_fields.insert("_fetched_at".to_string());
     }
 
+    // `cache::batches_cacheable` tells a transient origin failure from real
+    // data by the row's `response_status` — not only for `refresh_mode:
+    // caching` (every fetch there, regardless of `caching_stale_if_error`),
+    // but also for the independent, runtime-wide SQL results cache
+    // (`cache::to_cached_record_batch_stream`), which can cache the result of
+    // any query against any dataset — accelerated or not, whatever its
+    // refresh mode — whenever `runtime.caching.sql_results` is enabled.
+    //
+    // The HTTP connector also tags every fetched batch's *schema* with the
+    // real per-fetch status (`HTTP_RESPONSE_STATUS_METADATA_KEY`, set by
+    // `HttpTableProvider::schema_with_fetch_status`), but that signal alone
+    // is not reliable once a query plan wraps the scan in another operator:
+    // a `FilterExec` (any `WHERE` clause) rebuilds its output batches against
+    // the plan's own schema, fixed at plan-construction time, which discards
+    // the dynamic per-fetch metadata — a regression test
+    // (`a_5xx_response_is_not_cached_by_the_sql_results_cache_on_an_unaccelerated_dataset`
+    // in `caching_mode_stale_if_error.rs`) reproduces this with a plain
+    // `SELECT * ... WHERE request_path = ...`. Only the materialized
+    // `response_status` *column* survives such an operator (its data is
+    // preserved by value, independent of schema-object identity), so force
+    // it in unconditionally, the same way as `_fetched_at` above, rather
+    // than leaving either caller unable to detect the failure because the
+    // column never existed. A narrower gap remains for a `SELECT` that
+    // doesn't project `response_status` at all — see the PR discussion for
+    // #14157.
+
+    if !column_order.iter().any(|n| n == "response_status") {
+        column_order.push("response_status".to_string());
+        metadata_fields.insert("response_status".to_string());
+    }
+
     Ok(Some(HttpJsonNesting::new(
         column_order,
         json_column.name.clone(),
         metadata_fields,
+        catch_all_exclusions,
     )))
 }
 
@@ -1600,6 +1812,7 @@ impl DataConnector for Https {
             self.ensure_rate_control_supported_for_structured_dataset(dataset)?;
             self.ensure_client_identity_supported_for_structured_dataset(dataset)?;
             self.ensure_auth_supported_for_structured_dataset(dataset)?;
+            self.ensure_error_response_action_supported_for_structured_dataset(dataset)?;
             self.warn_ignored_http_headers(dataset);
             // Use ListingTableConnector for file-based structured formats (parquet, csv, etc.)
             // which properly handles file parsing with correct schemas
@@ -1631,15 +1844,19 @@ impl DataConnector for Https {
     }
 
     fn metrics_provider(&self) -> Option<Arc<dyn MetricsProvider>> {
-        if !self.emit_rate_control_metrics {
-            return None;
-        }
-
-        Some(Arc::new(HttpRateControlMetricsProvider::new(
-            "http",
-            Arc::clone(&self.metrics),
-            self.rate_control_metric_source.clone(),
-        )))
+        // Always `Some`: the response cache reports unconditionally, because
+        // memory it holds is otherwise attributable to nothing. Rate control
+        // still reports only where it was asked to.
+        Some(Arc::new(HttpsMetricsProvider {
+            cache_metrics: Arc::clone(&self.cache_metrics),
+            rate_control: self.emit_rate_control_metrics.then(|| {
+                HttpRateControlMetricsProvider::new(
+                    "http",
+                    Arc::clone(&self.metrics),
+                    self.rate_control_metric_source.clone(),
+                )
+            }),
+        }))
     }
 
     fn initialization_for_dataset(&self, dataset: &DatasetSpec) -> ComponentInitialization {
@@ -1651,6 +1868,105 @@ impl DataConnector for Https {
             ComponentInitialization::OnStartup(StartupOptions {
                 dataset_health_monitor: DatasetHealthMonitor::Disabled,
             })
+        }
+    }
+}
+
+/// Occupancy of one dataset's HTTP response cache.
+///
+/// This cache is not one of the caches under `runtime.caching`, so nothing else
+/// reports it: without these, memory it holds shows up only as process RSS with
+/// nothing to attribute it to. Both auto-register for that reason — an operator
+/// should not have to know the cache exists in order to see it.
+const HTTP_CACHE_METRIC_SPECS: &[MetricSpec] = &[
+    MetricSpec::new(
+        http_cache_metric_names::RESPONSE_CACHE_SIZE_BYTES,
+        MetricType::ObservableGaugeU64,
+    )
+    .description(
+        "Bytes retained by the HTTP connector's response cache, counting response bodies, their headers and the request keys they are held under. Excludes the cache's own per-entry bookkeeping.",
+    )
+    .unit("By")
+    .auto_register(),
+    MetricSpec::new(
+        http_cache_metric_names::RESPONSE_CACHE_ITEMS_COUNT,
+        MetricType::ObservableGaugeU64,
+    )
+    .description("Number of responses held by the HTTP connector's response cache.")
+    .auto_register(),
+];
+
+/// Everything this connector reports when rate control is emitting too.
+///
+/// Advertising is not free: dataset initialization registers every auto metric a
+/// provider advertises, and a metric with no callback behind it fails
+/// registration and logs an error. So the list has to narrow to what this
+/// provider can actually observe — see [`HttpsMetricsProvider::available_metrics`].
+static HTTP_ALL_METRIC_SPECS: LazyLock<Vec<MetricSpec>> = LazyLock::new(|| {
+    let mut specs = HTTP_CACHE_METRIC_SPECS.to_vec();
+    specs.extend_from_slice(HTTP_RATE_CONTROL_METRIC_SPECS);
+    specs
+});
+
+/// Reports both of this connector's metric families through one provider.
+///
+/// They are reported together because a dataset registers exactly one provider,
+/// and the two have different lifetimes: the response cache always reports,
+/// while rate control reports only for the dataset that owns the shared
+/// controller.
+#[derive(Debug)]
+struct HttpsMetricsProvider {
+    cache_metrics: Arc<HttpCacheMetrics>,
+    rate_control: Option<HttpRateControlMetricsProvider>,
+}
+
+impl MetricsProvider for HttpsMetricsProvider {
+    fn component_type(&self) -> ComponentType {
+        ComponentType::Dataset
+    }
+
+    fn component_name(&self) -> &'static str {
+        "http"
+    }
+
+    fn available_metrics(&self) -> &'static [MetricSpec] {
+        // Only what this provider can observe. Every auto-registering metric
+        // advertised here is registered for the dataset, and one whose callback
+        // is absent fails that registration with an error log — so advertising
+        // the rate-control family while it is disabled would put eleven of those
+        // in the log of every ordinary HTTP dataset.
+        if self.rate_control.is_some() {
+            &HTTP_ALL_METRIC_SPECS
+        } else {
+            HTTP_CACHE_METRIC_SPECS
+        }
+    }
+
+    fn callback_to_observe_metric(
+        &self,
+        metric: &MetricSpec,
+        attributes: Vec<KeyValue>,
+    ) -> Option<ObserveMetricCallback> {
+        match metric.name {
+            http_cache_metric_names::RESPONSE_CACHE_SIZE_BYTES => {
+                let metrics = Arc::clone(&self.cache_metrics);
+                Some(ObserveMetricCallback::U64(Box::new(move |observer| {
+                    observer.observe(metrics.retained_bytes(), &attributes);
+                })))
+            }
+            http_cache_metric_names::RESPONSE_CACHE_ITEMS_COUNT => {
+                let metrics = Arc::clone(&self.cache_metrics);
+                Some(ObserveMetricCallback::U64(Box::new(move |observer| {
+                    observer.observe(metrics.items(), &attributes);
+                })))
+            }
+            // Delegating rather than inheriting a default: rate control owns how
+            // its own metrics are labelled (it relabels `name` to `origin`), and
+            // reimplementing that here would drift from it.
+            _ => self
+                .rate_control
+                .as_ref()
+                .and_then(|provider| provider.callback_to_observe_metric(metric, attributes)),
         }
     }
 }
@@ -1694,6 +2010,11 @@ static PARAMETERS: LazyLock<Vec<ParameterSpec>> = LazyLock::new(|| {
             .description("Inline PEM private key (or ${ secrets:... } reference) matching 'tls_client_certificate'. Must be set together with 'tls_client_certificate'. Mutually exclusive with 'tls_client_certificate_file' and 'tls_client_key_file'. Applies to dynamic JSON API endpoints only; structured HTTP file datasets reject mTLS client identity params."),
         ParameterSpec::runtime("http_headers")
             .description("Custom HTTP headers to include in requests. Format: 'Header1: Value1, Header2: Value2'. Headers are applied to all requests. Applies to dynamic JSON API endpoints only; structured HTTP file datasets ignore these headers."),
+        // Validation happens via `ErrorResponseAction::parse`, which trims and is
+        // case-insensitive. `one_of` would match in `Parameters::try_new` and reject
+        // " error " before the parser ever saw it, so we don't use it here.
+        ParameterSpec::runtime("on_error_response")
+            .description("What a response the origin did not mark successful becomes: 'error' fails the request (a refresh then keeps the accelerated table's previous contents), 'warn' records it as a row and warns, 'store' records it as a row silently. 'warn' and 'store' apply to client errors only — a 5xx or 429 that outlives the retries always fails the request, because a server error is a statement about the origin rather than about the resource. Applies to a response the origin answered; a connection failure or timeout is unaffected. Defaults to 'error'."),
         ParameterSpec::runtime("max_retries")
             .description("Maximum number of retries for HTTP requests. Default: 3"),
         ParameterSpec::runtime("retry_backoff_method")
@@ -1723,6 +2044,10 @@ static PARAMETERS: LazyLock<Vec<ParameterSpec>> = LazyLock::new(|| {
             .description("Maximum size (in bytes) for request_headers filter values. Default: 16384 (16KiB)."),
         ParameterSpec::runtime("max_request_partitions")
             .description("Maximum number of HTTP request partitions that can be created from request_path, request_query, request_body, and request_headers filters. If unset, the number of request partitions is not capped."),
+        ParameterSpec::runtime("response_cache_max_size_bytes")
+            .description("Byte budget for the responses this dataset caches, counting response bodies and the request keys they are held under. Once reached, entries are evicted to stay inside it. Set '0' to disable the response cache. Default: 67108864 (64 MiB), applied per dataset, so raise it only where a dataset earns it. Applies to dynamic JSON API endpoints only; structured HTTP file datasets do not use this cache."),
+        ParameterSpec::runtime("response_cache_fallback_ttl")
+            .description("How long to keep a response whose origin sent no 'Cache-Control' header at all, for example '5m' or '30s'. An origin that did send 'Cache-Control' is always honoured instead, including its refusals. Unset by default, which keeps such responses uncached."),
         ParameterSpec::runtime("health_probe")
             .description("Custom health probe path for endpoint validation (e.g., '/health', '/api/status'). The endpoint must return a 2xx status code to pass validation. If not set, a random path is used and any status (including 404) is accepted."),
         ParameterSpec::runtime("pagination")
@@ -1799,6 +2124,7 @@ impl DataConnectorFactory for HttpsFactory {
                             metrics: Arc::new(HttpRateControlMetrics::default()),
                             emit_rate_control_metrics: false,
                             rate_control_metric_source: None,
+                            cache_metrics: HttpCacheMetrics::new(),
                         };
                         connector.is_structured_format(dataset)
                     };
@@ -1820,6 +2146,7 @@ impl DataConnectorFactory for HttpsFactory {
                 metrics,
                 emit_rate_control_metrics,
                 rate_control_metric_source,
+                cache_metrics: HttpCacheMetrics::new(),
             }) as Arc<dyn DataConnector>)
         })
     }
@@ -1920,9 +2247,27 @@ impl ListingTableConnector for HttpListingConnector {
             let _ = u.set_port(Some(n));
         }
 
-        if let Some(p) = self.params.get("password").expose().ok()
-            && u.set_password(Some(p)).is_err()
-        {
+        // The user name and password reach the object store as an `Authorization`
+        // header through `http_auth`, so the URL carries neither.
+        let username = self.params.get("username").expose().ok().map_or_else(
+            || {
+                percent_decode_str(u.username())
+                    .decode_utf8_lossy()
+                    .into_owned()
+            },
+            ToString::to_string,
+        );
+        let password = match self.params.get("password").ok() {
+            Some(password) => Some(password.clone()),
+            None => u.password().map(|password| {
+                SecretString::from(
+                    percent_decode_str(password)
+                        .decode_utf8_lossy()
+                        .into_owned(),
+                )
+            }),
+        };
+        if u.set_username("").is_err() || u.set_password(None).is_err() {
             return Err(
                 DataConnectorError::UnableToConnectInvalidUsernameOrPassword {
                     dataconnector: "https".to_string(),
@@ -1931,18 +2276,27 @@ impl ListingTableConnector for HttpListingConnector {
             );
         }
 
-        if let Some(p) = self.params.get("username").expose().ok()
-            && u.set_username(p).is_err()
-        {
-            return Err(
-                DataConnectorError::UnableToConnectInvalidUsernameOrPassword {
-                    dataconnector: "https".to_string(),
-                    connector_component: ConnectorComponent::from(dataset),
-                },
-            );
+        let mut fragment = build_fragments(&self.params, vec!["client_timeout"]);
+        // The operator wrote `http://` in the dataset URL. That is the
+        // permission the object store's `allow_http` setting requires. An
+        // `https://` dataset stays HTTPS-only, so a redirect cannot switch
+        // the fetch to plaintext.
+        if u.scheme() == "http" {
+            if !fragment.is_empty() {
+                fragment.push('&');
+            }
+            fragment.push_str("allow_http=true");
         }
-
-        u.set_fragment(Some(&build_fragments(&self.params, vec!["client_timeout"])));
+        if !username.is_empty() || password.is_some() {
+            let token = http_auth::register(
+                &u,
+                &username,
+                password.unwrap_or_else(|| SecretString::from(String::new())),
+            );
+            form_urlencoded::Serializer::for_suffix(&mut fragment, 0)
+                .append_pair(http_auth::FRAGMENT_KEY, &token);
+        }
+        u.set_fragment(Some(&fragment));
 
         Ok(u)
     }
@@ -1965,7 +2319,7 @@ data_connector_api::register_data_connector!(
 mod tests {
     use super::*;
     use crate::component::dataset::Dataset;
-    use crate::component::dataset::acceleration::Acceleration;
+    use crate::component::dataset::acceleration::{Acceleration, StaleIfError};
     use crate::component::dataset::builder::DatasetBuilder;
     use crate::dataconnector::parameters::RuntimeConnectorContext;
     use crate::parameters::Parameters;
@@ -1998,6 +2352,7 @@ mod tests {
         ];
 
         for (k, v) in extra {
+            params.retain(|(key, _)| key.as_str() != *k);
             params.push(((*k).to_string(), (*v).to_string().into()));
         }
 
@@ -2028,6 +2383,7 @@ mod tests {
             metrics: Arc::new(HttpRateControlMetrics::default()),
             emit_rate_control_metrics: true,
             rate_control_metric_source: None,
+            cache_metrics: HttpCacheMetrics::new(),
         }
     }
 
@@ -2054,6 +2410,23 @@ mod tests {
         });
 
         dataset
+    }
+
+    #[tokio::test]
+    async fn http_dataset_url_opts_into_plaintext() {
+        let dataset = test_dataset("http://example.com/data/", RefreshMode::Full, None).await;
+        let connector =
+            HttpListingConnector::new(test_params(&[]).await, tokio::runtime::Handle::current());
+        let url = connector
+            .get_object_store_url(&dataset, None)
+            .expect("an http dataset URL is valid");
+        assert_eq!(url.fragment(), Some("allow_http=true"));
+
+        let https = test_dataset("https://example.com/data/", RefreshMode::Full, None).await;
+        let url = connector
+            .get_object_store_url(&https, None)
+            .expect("an https dataset URL is valid");
+        assert_eq!(url.fragment(), Some(""));
     }
 
     fn test_client_identity_pems() -> (String, String) {
@@ -2125,12 +2498,16 @@ uGgYIHbi/F+GaiUPzDyqe5p9
         }
     }
 
-    fn assert_conflicting_rate_control_error(error: DataConnectorError) {
+    /// Assert a shared-origin rate-control conflict that quotes exactly
+    /// `differences`, the parameters it resolves differently with both values.
+    fn assert_conflicting_rate_control_error(error: DataConnectorError, differences: &str) {
         match error {
             DataConnectorError::InvalidConfigurationNoSource { message, .. } => {
                 assert!(
-                    message.contains("different rate-control settings"),
-                    "expected shared-origin rate-control conflict, got: {message}"
+                    message.contains(&format!(
+                        "must resolve to the same rate-control settings, but this one differs from those already targeting it: {differences}. Set "
+                    )),
+                    "expected shared-origin rate-control conflict on {differences}, got: {message}"
                 );
             }
             other => panic!("expected shared-origin rate-control conflict, got: {other}"),
@@ -2472,7 +2849,10 @@ uGgYIHbi/F+GaiUPzDyqe5p9
         else {
             panic!("mixed configured/unconfigured origin should be rejected");
         };
-        assert_conflicting_rate_control_error(error);
+        assert_conflicting_rate_control_error(
+            error,
+            "`max_concurrent_requests` is unset here and 2 there",
+        );
 
         let unconfigured = test_connector_with(&[]).await;
         let configured = test_connector_with(&[("max_concurrent_requests", "2")]).await;
@@ -2499,7 +2879,148 @@ uGgYIHbi/F+GaiUPzDyqe5p9
         else {
             panic!("mixed unconfigured/configured origin should be rejected");
         };
-        assert_conflicting_rate_control_error(error);
+        assert_conflicting_rate_control_error(
+            error,
+            "`max_concurrent_requests` is 2 here and unset there",
+        );
+    }
+
+    /// Create HTTP providers for `datasets` (each a name and its params) that
+    /// all target `origin`, in order, returning the first failure.
+    async fn create_providers_on_one_origin(
+        origin: &str,
+        datasets: &[&[(&str, &str)]],
+    ) -> DataConnectorResult<()> {
+        for (index, params) in datasets.iter().enumerate() {
+            let connector = test_connector_with(params).await;
+            let dataset =
+                test_dataset(&format!("{origin}/data{index}"), RefreshMode::Append, None).await;
+            connector.create_http_table_provider(&dataset).await?;
+        }
+        Ok(())
+    }
+
+    /// Regression test for #14914: an explicit `rate_control_window` equal to
+    /// the default resolves to the same window as an unset one, so datasets that
+    /// set it either way share their origin, in either load order.
+    #[tokio::test]
+    async fn test_http_rate_control_window_equal_to_default_shares_origin() {
+        let explicit: &[(&str, &str)] = &[
+            ("requests_per_second_limit", "10"),
+            ("rate_control_window", "10s"),
+        ];
+        let unset: &[(&str, &str)] = &[("requests_per_second_limit", "10")];
+
+        create_providers_on_one_origin(
+            "https://window-explicit-first.example.com",
+            &[explicit, unset],
+        )
+        .await
+        .expect("an explicit default window must share an origin with an unset one");
+        create_providers_on_one_origin(
+            "https://window-unset-first.example.com",
+            &[unset, explicit],
+        )
+        .await
+        .expect("an unset window must share an origin with an explicit default one");
+
+        let Err(error) = create_providers_on_one_origin(
+            "https://window-differs.example.com",
+            &[
+                unset,
+                &[
+                    ("requests_per_second_limit", "10"),
+                    ("rate_control_window", "20s"),
+                ],
+            ],
+        )
+        .await
+        else {
+            panic!("a window that resolves differently must be rejected");
+        };
+        assert_conflicting_rate_control_error(
+            error,
+            "`rate_control_window` is 20s here and 10s there",
+        );
+    }
+
+    /// The acquire timeout defaults to each dataset's `client_timeout`, but only
+    /// bounds the wait of a rate controller. Datasets without rate control build
+    /// none, so different client timeouts cannot conflict; rate-limited datasets
+    /// that share a controller must agree on its bound.
+    #[tokio::test]
+    async fn test_http_rate_control_acquire_default_conflicts_only_with_a_controller() {
+        create_providers_on_one_origin(
+            "https://client-timeouts-unlimited.example.com",
+            &[&[("client_timeout", "30")], &[("client_timeout", "60")]],
+        )
+        .await
+        .expect("datasets without rate control must share an origin whatever their timeouts");
+
+        let Err(error) = create_providers_on_one_origin(
+            "https://client-timeouts-limited.example.com",
+            &[
+                &[
+                    ("client_timeout", "30"),
+                    ("requests_per_second_limit", "10"),
+                ],
+                &[
+                    ("client_timeout", "60"),
+                    ("requests_per_second_limit", "10"),
+                ],
+            ],
+        )
+        .await
+        else {
+            panic!("rate-limited datasets with different acquire bounds must be rejected");
+        };
+        assert_conflicting_rate_control_error(
+            error,
+            "`rate_control_acquire_timeout` is 60s here and 30s there",
+        );
+    }
+
+    /// One failure threshold written as a percentage and as a fraction parses
+    /// to two adjacent floats, and must still share an origin.
+    #[tokio::test]
+    async fn test_http_rate_control_failure_threshold_spellings_share_origin() {
+        create_providers_on_one_origin(
+            "https://threshold-spellings.example.com",
+            &[
+                &[
+                    ("requests_per_second_limit", "10"),
+                    ("rate_control_failure_threshold", "33.3%"),
+                ],
+                &[
+                    ("requests_per_second_limit", "10"),
+                    ("rate_control_failure_threshold", "0.333"),
+                ],
+            ],
+        )
+        .await
+        .expect("two spellings of one failure threshold must share an origin");
+
+        let Err(error) = create_providers_on_one_origin(
+            "https://threshold-differs.example.com",
+            &[
+                &[
+                    ("requests_per_second_limit", "10"),
+                    ("rate_control_failure_threshold", "33.3%"),
+                ],
+                &[
+                    ("requests_per_second_limit", "10"),
+                    ("rate_control_failure_threshold", "0.334"),
+                ],
+            ],
+        )
+        .await
+        else {
+            panic!("a different failure threshold must be rejected");
+        };
+        assert_conflicting_rate_control_error(
+            error,
+            "`rate_control_failure_threshold` is 33.4% here and 33.3% there",
+        );
     }
 
     #[tokio::test]
@@ -2526,6 +3047,69 @@ uGgYIHbi/F+GaiUPzDyqe5p9
             .expect_err("structured formats should bypass JSON refresh_sql validation");
 
         assert_invalid_url_error(error);
+    }
+
+    /// `error` names what the listing route already does, so writing it is a statement
+    /// rather than a request the route cannot meet — and one `params` block stays
+    /// shareable between a structured dataset and a dynamic one.
+    #[tokio::test]
+    async fn test_http_structured_format_accepts_on_error_response_error() {
+        let connector =
+            test_connector_with(&[("file_format", "csv"), ("on_error_response", "error")]).await;
+        let dataset = test_dataset("https://example.com/data.csv", RefreshMode::Full, None).await;
+
+        // The listing route may still fail for unrelated reasons (it resolves a real URL),
+        // so what is asserted is that it does not fail *on this parameter*.
+        if let Err(error) = connector
+            .read_provider(&RuntimeConnectorContext::for_dataset(&dataset), &dataset)
+            .await
+        {
+            assert!(
+                !error.to_string().contains("on_error_response"),
+                "`error` must not be refused on a structured dataset, got: {error}"
+            );
+        }
+    }
+
+    /// The two actions that record a row cannot be honoured by the listing route, which
+    /// never builds an `HttpTableProvider` — and a value that parses as nothing at all is
+    /// refused in the same words the dynamic route uses, so the setting means one thing
+    /// wherever it is written.
+    #[tokio::test]
+    async fn test_http_structured_format_rejects_recording_on_error_response() {
+        for (value, expected) in [
+            ("store", "`on_error_response: store` is not supported"),
+            ("warn", "`on_error_response: warn` is not supported"),
+            ("not-an-action", "is not a valid `on_error_response`"),
+        ] {
+            let connector =
+                test_connector_with(&[("file_format", "csv"), ("on_error_response", value)]).await;
+            let dataset =
+                test_dataset("https://example.com/data.csv", RefreshMode::Full, None).await;
+
+            let error = connector
+                .read_provider(&RuntimeConnectorContext::for_dataset(&dataset), &dataset)
+                .await
+                .expect_err(
+                    "a structured HTTP file dataset must not accept a setting it cannot apply",
+                );
+
+            match error {
+                DataConnectorError::InvalidConfigurationNoSource { message, .. } => {
+                    assert!(
+                        message.contains(expected),
+                        "expected '{expected}' for '{value}', got: {message}"
+                    );
+                    assert!(
+                        message.contains("data-connectors/https"),
+                        "every refusal must link the docs, got: {message}"
+                    );
+                }
+                other => {
+                    panic!("expected InvalidConfigurationNoSource for '{value}', got: {other}")
+                }
+            }
+        }
     }
 
     #[tokio::test]
@@ -2690,7 +3274,6 @@ uGgYIHbi/F+GaiUPzDyqe5p9
         assert!(connector.is_structured_format(&dataset));
     }
 
-    #[cfg(not(windows))]
     #[tokio::test]
     async fn test_http_structured_format_detects_explicit_vortex() {
         let connector = test_connector(Some("vortex")).await;
@@ -2700,7 +3283,6 @@ uGgYIHbi/F+GaiUPzDyqe5p9
         assert!(connector.is_structured_format(&dataset));
     }
 
-    #[cfg(not(windows))]
     #[tokio::test]
     async fn test_http_auto_structured_format_detects_vortex_extension() {
         let connector = test_connector(None).await;
@@ -2961,6 +3543,31 @@ uGgYIHbi/F+GaiUPzDyqe5p9
         .await;
         let dataset = test_dataset("https://example.com/api", RefreshMode::Append, None).await;
 
+        // The identity comes from exactly the inline PEMs given, in their roles.
+        match connector
+            .resolve_client_identity_config(&dataset)
+            .expect("inline mTLS params should be valid")
+            .expect("expected a client identity config")
+        {
+            ClientIdentityConfig::FromPem {
+                cert_pem: resolved_cert,
+                key_pem: resolved_key,
+            } => {
+                assert_eq!(resolved_cert, cert_pem.as_bytes());
+                assert_eq!(resolved_key, key_pem.as_bytes());
+            }
+            config @ ClientIdentityConfig::FromFiles { .. } => {
+                panic!("expected an inline identity config, got {config:?}")
+            }
+        }
+        assert!(
+            connector
+                .resolve_client_identity(&dataset)
+                .await
+                .expect("the inline identity should parse")
+                .is_some(),
+            "a configured inline identity must yield a client identity"
+        );
         connector
             .build_http_client(&dataset)
             .await
@@ -2989,10 +3596,203 @@ uGgYIHbi/F+GaiUPzDyqe5p9
         .await;
         let dataset = test_dataset("https://example.com/api", RefreshMode::Append, None).await;
 
+        // The identity is read from exactly the two files given, in their roles.
+        match connector
+            .resolve_client_identity_config(&dataset)
+            .expect("file-based mTLS params should be valid")
+            .expect("expected a client identity config")
+        {
+            ClientIdentityConfig::FromFiles {
+                cert_path: resolved_cert,
+                key_path: resolved_key,
+            } => {
+                assert_eq!(resolved_cert, cert_path);
+                assert_eq!(resolved_key, key_path);
+            }
+            config @ ClientIdentityConfig::FromPem { .. } => {
+                panic!("expected a file-based identity config, got {config:?}")
+            }
+        }
+        assert!(
+            connector
+                .resolve_client_identity(&dataset)
+                .await
+                .expect("the identity files should be read and parse")
+                .is_some(),
+            "a configured file identity must yield a client identity"
+        );
         connector
             .build_http_client(&dataset)
             .await
             .expect("valid file-based mTLS identity should build an HTTP client");
+    }
+
+    #[tokio::test]
+    async fn response_cache_limits_default_when_unset() {
+        let connector = test_connector_with(&[]).await;
+        let dataset = test_dataset("https://api.example.com/data", RefreshMode::Append, None).await;
+
+        let params = connector
+            .resolve_http_provider_params(&dataset)
+            .expect("defaults should resolve");
+
+        assert_eq!(
+            params.cache_max_size_bytes,
+            data_components::http::provider::DEFAULT_HTTP_CACHE_MAX_SIZE_BYTES
+        );
+        assert_eq!(
+            params.cache_fallback_ttl, None,
+            "an origin that sends no Cache-Control stays uncached unless a fallback was asked for"
+        );
+    }
+
+    #[tokio::test]
+    async fn response_cache_limits_are_taken_from_the_dataset() {
+        let connector = test_connector_with(&[
+            ("response_cache_max_size_bytes", "1048576"),
+            ("response_cache_fallback_ttl", "90s"),
+        ])
+        .await;
+        let dataset = test_dataset("https://api.example.com/data", RefreshMode::Append, None).await;
+
+        let params = connector
+            .resolve_http_provider_params(&dataset)
+            .expect("configured cache limits should resolve");
+
+        assert_eq!(params.cache_max_size_bytes, 1_048_576);
+        assert_eq!(params.cache_fallback_ttl, Some(Duration::from_secs(90)));
+    }
+
+    /// Both parameters bound memory, so an unusable value is refused rather than
+    /// replaced by a default: falling back silently would leave the operator
+    /// believing a budget they set is in force.
+    #[tokio::test]
+    async fn an_unparseable_response_cache_size_is_refused() {
+        let connector = test_connector_with(&[("response_cache_max_size_bytes", "64MiB")]).await;
+        let dataset = test_dataset("https://api.example.com/data", RefreshMode::Append, None).await;
+
+        let Err(error) = connector.resolve_http_provider_params(&dataset) else {
+            panic!("an unparseable cache size should be refused");
+        };
+        let message = error.to_string();
+        assert!(
+            message.contains("response_cache_max_size_bytes") && message.contains("64MiB"),
+            "the message must name the parameter and the value it rejected: {message}"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_unparseable_response_cache_fallback_ttl_is_refused() {
+        let connector = test_connector_with(&[("response_cache_fallback_ttl", "soon")]).await;
+        let dataset = test_dataset("https://api.example.com/data", RefreshMode::Append, None).await;
+
+        let Err(error) = connector.resolve_http_provider_params(&dataset) else {
+            panic!("an unparseable fallback TTL should be refused");
+        };
+        let message = error.to_string();
+        assert!(
+            message.contains("response_cache_fallback_ttl"),
+            "the message must name the parameter: {message}"
+        );
+    }
+
+    /// The cache reports whether or not rate control does. Before this, the
+    /// connector had no metrics provider at all unless rate control was emitting,
+    /// so the memory this cache holds was attributable to nothing.
+    #[tokio::test]
+    async fn the_response_cache_reports_without_rate_control() {
+        let mut connector = test_connector_with(&[]).await;
+        connector.emit_rate_control_metrics = false;
+
+        let metrics_provider = DataConnector::metrics_provider(&connector)
+            .expect("the response cache reports even with rate control off");
+
+        for metric_name in [
+            http_cache_metric_names::RESPONSE_CACHE_SIZE_BYTES,
+            http_cache_metric_names::RESPONSE_CACHE_ITEMS_COUNT,
+        ] {
+            let metric = metrics_provider
+                .get_metric(metric_name)
+                .unwrap_or_else(|| panic!("metric {metric_name} should be available"));
+            assert!(
+                metric.auto_register,
+                "{metric_name} must auto-register: an operator should not have to know the cache exists to see it"
+            );
+            assert!(
+                metrics_provider
+                    .callback_to_observe_metric(metric, vec![])
+                    .is_some(),
+                "{metric_name} must have an observation callback"
+            );
+        }
+
+        // Advertising is not free. Dataset initialization registers every auto
+        // metric a provider advertises, and one whose callback is absent fails
+        // that registration with an error log — so advertising the rate-control
+        // family while it is disabled would put one of those in the log of every
+        // ordinary HTTP dataset.
+        for metric in metrics_provider.available_metrics() {
+            assert!(
+                metrics_provider
+                    .callback_to_observe_metric(metric, vec![])
+                    .is_some(),
+                "{} is advertised but cannot be observed, so registering it fails",
+                metric.name
+            );
+        }
+        assert!(
+            metrics_provider
+                .get_metric("rate_control_available_permits")
+                .is_none(),
+            "rate-control metrics must not be advertised while rate control is off"
+        );
+    }
+
+    /// Rate-control metrics keep working through the combined provider — a
+    /// delegating impl that silently answered `None` would leave them
+    /// registered but never observed.
+    /// An `AsyncInstrument` that records what a metric callback observes.
+    #[derive(Default)]
+    struct RecordingInstrument(parking_lot::Mutex<Vec<u64>>);
+
+    impl opentelemetry::metrics::AsyncInstrument<u64> for RecordingInstrument {
+        fn observe(&self, measurement: u64, _attributes: &[KeyValue]) {
+            self.0.lock().push(measurement);
+        }
+    }
+
+    #[tokio::test]
+    async fn rate_control_metrics_still_observe_through_the_combined_provider() {
+        let connector = test_connector_with(&[("max_concurrent_requests", "4")]).await;
+        // Apply the resolved config the way creating the table provider does,
+        // so the metric has the configured value to report.
+        let dataset = test_dataset("https://example.com/api", RefreshMode::Append, None).await;
+        let config = http_rate_control::resolve_config(
+            &connector.params,
+            connector.runtime_rate_control_params.as_ref(),
+            &dataset,
+            "https",
+        )
+        .expect("the rate-control config should resolve");
+        connector.metrics.set_config(&config);
+        let metrics_provider =
+            DataConnector::metrics_provider(&connector).expect("the connector exposes metrics");
+
+        let metric = metrics_provider
+            .get_metric("rate_control_max_concurrent_requests")
+            .expect("rate-control metrics remain available");
+        let Some(ObserveMetricCallback::U64(callback)) =
+            metrics_provider.callback_to_observe_metric(metric, vec![])
+        else {
+            panic!("a rate-control metric must still be observed, as a u64, not just listed");
+        };
+        let observed = RecordingInstrument::default();
+        callback(&observed);
+        assert_eq!(
+            *observed.0.lock(),
+            vec![4],
+            "the callback must observe the configured max_concurrent_requests"
+        );
     }
 
     #[tokio::test]
@@ -3300,7 +4100,7 @@ uGgYIHbi/F+GaiUPzDyqe5p9
         assert_eq!(nesting.json_field_name(), "data");
         assert_eq!(
             nesting.column_order,
-            vec!["id", "name", "data", "_fetched_at"]
+            vec!["id", "name", "data", "_fetched_at", "response_status"]
         );
         assert!(nesting.static_fields().contains("id"));
         assert!(nesting.static_fields().contains("name"));
@@ -3419,6 +4219,131 @@ uGgYIHbi/F+GaiUPzDyqe5p9
         assert!(nesting.static_fields().contains("id"));
     }
 
+    /// Regression test for #14156/#14157: without this, a `refresh_mode:
+    /// caching` dataset that decomposes JSON into named columns never carries
+    /// `response_status` unless the user happens to declare it, so
+    /// `cache::batches_cacheable` can never see a transient origin failure —
+    /// not just for the stale-if-error fallback, but for the unconditional
+    /// "don't cache a 5xx as if it were data" check every caching-mode fetch
+    /// goes through. Forced regardless of `caching_stale_if_error`: leaving it
+    /// out when stale-if-error happens to be disabled would still let a 5xx
+    /// silently overwrite the last good cached entry. The schema-level
+    /// `HTTP_RESPONSE_STATUS_METADATA_KEY` marker alone is not enough: a
+    /// `FilterExec` (any `WHERE` clause) rebuilds its output against the
+    /// plan's own, plan-time-fixed schema and discards the dynamic per-fetch
+    /// metadata — see the comment above this function.
+    #[tokio::test]
+    async fn parse_http_json_nesting_force_includes_response_status_when_stale_if_error_enabled() {
+        let mut dataset = test_dataset("http://example.com/api", RefreshMode::Caching, None).await;
+        dataset.acceleration = Some(Acceleration {
+            enabled: true,
+            refresh_mode: Some(RefreshMode::Caching),
+            caching_stale_if_error: StaleIfError::Enabled,
+            ..Default::default()
+        });
+        dataset.columns = vec![
+            Column::new("id"),
+            Column::new("version"),
+            column_with_marker("extra", Value::String("*".to_string())),
+        ];
+
+        let nesting = parse_http_json_nesting(&dataset)
+            .expect("parse should succeed")
+            .expect("expected Some(nesting) when marker is present");
+
+        assert!(
+            nesting.column_order.iter().any(|n| n == "response_status"),
+            "response_status must be force-included so stale-if-error can detect a transient failure"
+        );
+        assert!(nesting.metadata_fields.contains("response_status"));
+    }
+
+    #[tokio::test]
+    async fn parse_http_json_nesting_force_includes_response_status_even_when_stale_if_error_disabled()
+     {
+        let mut dataset = test_dataset("http://example.com/api", RefreshMode::Caching, None).await;
+        dataset.acceleration = Some(Acceleration {
+            enabled: true,
+            refresh_mode: Some(RefreshMode::Caching),
+            caching_stale_if_error: StaleIfError::Disabled,
+            ..Default::default()
+        });
+        dataset.columns = vec![
+            Column::new("id"),
+            Column::new("version"),
+            column_with_marker("extra", Value::String("*".to_string())),
+        ];
+
+        let nesting = parse_http_json_nesting(&dataset)
+            .expect("parse should succeed")
+            .expect("expected Some(nesting) when marker is present");
+
+        assert!(
+            nesting.column_order.iter().any(|n| n == "response_status"),
+            "batches_cacheable's unconditional 'don't cache a 5xx as data' check needs \
+            response_status regardless of caching_stale_if_error"
+        );
+    }
+
+    /// Regression test: `cache::batches_cacheable` isn't only called for
+    /// `refresh_mode: caching` — the independent, runtime-wide SQL results
+    /// cache (`runtime.caching.sql_results`) calls it for the query result of
+    /// *any* dataset, whatever its refresh mode. `response_status` has to be
+    /// force-included here too, or that cache can store a transient 5xx/429
+    /// from an `append`/`full` JSON-decomposed dataset as if it were ordinary
+    /// data and keep serving it for the entry's TTL.
+    #[tokio::test]
+    async fn parse_http_json_nesting_force_includes_response_status_for_non_caching_refresh_modes()
+    {
+        let mut dataset = test_dataset("http://example.com/api", RefreshMode::Append, None).await;
+        dataset.acceleration = Some(Acceleration {
+            enabled: true,
+            refresh_mode: Some(RefreshMode::Append),
+            ..Default::default()
+        });
+        dataset.columns = vec![
+            Column::new("id"),
+            Column::new("version"),
+            column_with_marker("extra", Value::String("*".to_string())),
+        ];
+
+        let nesting = parse_http_json_nesting(&dataset)
+            .expect("parse should succeed")
+            .expect("expected Some(nesting) when marker is present");
+
+        assert!(
+            nesting.column_order.iter().any(|n| n == "response_status"),
+            "the runtime-wide SQL results cache can call batches_cacheable for any \
+            dataset's query result, regardless of its own refresh mode"
+        );
+    }
+
+    #[tokio::test]
+    async fn parse_http_json_nesting_force_includes_response_status_for_a_finite_stale_if_error_window()
+     {
+        let mut dataset = test_dataset("http://example.com/api", RefreshMode::Caching, None).await;
+        dataset.acceleration = Some(Acceleration {
+            enabled: true,
+            refresh_mode: Some(RefreshMode::Caching),
+            caching_stale_if_error: StaleIfError::For(std::time::Duration::from_mins(1)),
+            ..Default::default()
+        });
+        dataset.columns = vec![
+            Column::new("id"),
+            Column::new("version"),
+            column_with_marker("extra", Value::String("*".to_string())),
+        ];
+
+        let nesting = parse_http_json_nesting(&dataset)
+            .expect("parse should succeed")
+            .expect("expected Some(nesting) when marker is present");
+
+        assert!(
+            nesting.column_order.iter().any(|n| n == "response_status"),
+            "a finite stale-if-error window also needs response_status to detect a transient failure"
+        );
+    }
+
     #[tokio::test]
     async fn parse_http_json_nesting_rejects_catchall_named_after_metadata() {
         let mut dataset = test_dataset("http://example.com/api", RefreshMode::Append, None).await;
@@ -3511,8 +4436,8 @@ uGgYIHbi/F+GaiUPzDyqe5p9
         ];
         let schema = static_schema_for_https_dataset(&params, &dataset)
             .expect("json_nest dynamic mode -> Some");
-        // 3 user-declared columns + auto-injected _fetched_at
-        assert_eq!(schema.fields().len(), 4);
+        // 3 user-declared columns + auto-injected _fetched_at + response_status
+        assert_eq!(schema.fields().len(), 5);
         // User-declared columns default to Utf8.
         for name in &["id", "name", "data"] {
             let f = schema
@@ -3539,7 +4464,7 @@ uGgYIHbi/F+GaiUPzDyqe5p9
                 .iter()
                 .map(|f| f.name().clone())
                 .collect::<Vec<_>>(),
-            vec!["id", "name", "data", "_fetched_at"]
+            vec!["id", "name", "data", "_fetched_at", "response_status"]
         );
     }
 
@@ -3554,8 +4479,8 @@ uGgYIHbi/F+GaiUPzDyqe5p9
         ];
         let schema = static_schema_for_https_dataset(&params, &dataset)
             .expect("json_nest dynamic mode -> Some");
-        // 3 user-declared columns + auto-injected _fetched_at
-        assert_eq!(schema.fields().len(), 4);
+        // 3 user-declared columns + auto-injected _fetched_at + response_status
+        assert_eq!(schema.fields().len(), 5);
         assert_eq!(schema.field(0).name(), "id");
         assert_eq!(schema.field(0).data_type(), &arrow_schema::DataType::Int64);
         assert!(!schema.field(0).is_nullable());
@@ -3568,6 +4493,8 @@ uGgYIHbi/F+GaiUPzDyqe5p9
             schema.field(3).data_type(),
             &arrow_schema::DataType::Timestamp(arrow_schema::TimeUnit::Nanosecond, None),
         );
+        assert_eq!(schema.field(4).name(), "response_status");
+        assert_eq!(schema.field(4).data_type(), &arrow_schema::DataType::UInt16,);
     }
 
     #[tokio::test]
@@ -3607,13 +4534,18 @@ uGgYIHbi/F+GaiUPzDyqe5p9
             !nesting.static_fields().contains("_fetched_at"),
             "_fetched_at must not be a static body field"
         );
-        // Auto-injected at the end, after user-declared columns.
-        assert_eq!(
-            nesting
-                .column_order
-                .last()
-                .expect("column_order should include auto-injected _fetched_at"),
-            "_fetched_at"
+        // Auto-injected after the user-declared columns (response_status is
+        // also auto-injected, after _fetched_at — see
+        // parse_http_json_nesting_force_includes_response_status_for_non_caching_refresh_modes).
+        let user_declared = ["id", "title", "extra"];
+        let fetched_at_index = nesting
+            .column_order
+            .iter()
+            .position(|c| c == "_fetched_at")
+            .expect("column_order should include auto-injected _fetched_at");
+        assert!(
+            fetched_at_index >= user_declared.len(),
+            "_fetched_at must come after every user-declared column"
         );
     }
 
@@ -3662,5 +4594,311 @@ uGgYIHbi/F+GaiUPzDyqe5p9
             &arrow_schema::DataType::Timestamp(arrow_schema::TimeUnit::Nanosecond, None),
             "_fetched_at should have its base_table_schema type"
         );
+    }
+
+    const MIB: usize = 1024 * 1024;
+
+    /// A gzip-compressed JSON object of `len` bytes, `{"a":"…"}`, whose string holds
+    /// `fill(i)` at offset `i`, built a block at a time so the whole is never held.
+    fn gzip_json(len: usize, fill: fn(usize) -> u8) -> Vec<u8> {
+        use std::io::Write;
+        let mut encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+        encoder.write_all(br#"{"a":""#).expect("compress");
+        let mut offset = 0;
+        while offset < len - 8 {
+            let block: Vec<u8> = (offset..(offset + MIB).min(len - 8)).map(fill).collect();
+            encoder.write_all(&block).expect("compress");
+            offset += block.len();
+        }
+        encoder.write_all(br#""}"#).expect("compress");
+        encoder.finish().expect("finish gzip")
+    }
+
+    /// Zero-padded ascending eight-digit numbers separated by spaces, like an id column:
+    /// text that compresses a few times over, as real data does.
+    fn ids(i: usize) -> u8 {
+        let (number, position) = (i / 9, i % 9);
+        if position == 8 {
+            return b' ';
+        }
+        let place = 10usize.pow(u32::try_from(7 - position).expect("a digit place"));
+        b"0123456789"[number / place % 10]
+    }
+
+    /// Serve `body` as gzip-compressed JSON to every request, and count the requests
+    /// for `/data`.
+    async fn serve_gzip(body: Vec<u8>) -> (String, Arc<std::sync::atomic::AtomicUsize>) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind the test origin");
+        let origin = format!(
+            "http://{}",
+            listener.local_addr().expect("test origin address")
+        );
+        let requests = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counter = Arc::clone(&requests);
+        let body = Arc::new(body);
+        tokio::spawn(async move {
+            while let Ok((mut socket, _)) = listener.accept().await {
+                let counter = Arc::clone(&counter);
+                let body = Arc::clone(&body);
+                tokio::spawn(async move {
+                    let mut request = Vec::new();
+                    let mut buf = [0u8; 1024];
+                    while !request.windows(4).any(|w| w == b"\r\n\r\n") {
+                        match socket.read(&mut buf).await {
+                            Ok(0) | Err(_) => return,
+                            Ok(n) => request.extend_from_slice(&buf[..n]),
+                        }
+                    }
+                    // The connector also probes the origin on a path of its own, in the
+                    // background; only requests for the dataset count.
+                    if request.starts_with(b"GET /data") {
+                        counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    }
+                    let head = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\
+                         Content-Encoding: gzip\r\nContent-Length: {}\r\n\
+                         Connection: close\r\n\r\n",
+                        body.len()
+                    );
+                    // A client that refuses the body hangs up part way through it.
+                    let _ = socket.write_all(head.as_bytes()).await;
+                    let _ = socket.write_all(&body).await;
+                });
+            }
+        });
+        (origin, requests)
+    }
+
+    /// Query `content` from a dynamic HTTP dataset at `{origin}/data`, through the
+    /// connector's own client, and count the requests the query made for it.
+    async fn query_content(
+        origin: &str,
+        requests: &std::sync::atomic::AtomicUsize,
+    ) -> (datafusion::error::Result<Vec<String>>, usize) {
+        let connector = test_connector_with(&[
+            ("file_format", "json"),
+            ("request_query_filters", "enabled"),
+            ("client_timeout", "300"),
+        ])
+        .await;
+        let dataset = test_dataset(&format!("{origin}/data"), RefreshMode::Append, None).await;
+        let provider = connector
+            .read_provider(&RuntimeConnectorContext::for_dataset(&dataset), &dataset)
+            .await
+            .expect("build the HTTP provider");
+        let ctx = datafusion::prelude::SessionContext::new();
+        ctx.register_table("origin", provider)
+            .expect("register the table");
+
+        let before = requests.load(std::sync::atomic::Ordering::SeqCst);
+        let rows = async {
+            let batches = ctx
+                .sql("SELECT content FROM origin")
+                .await?
+                .collect()
+                .await?;
+            Ok::<_, datafusion::error::DataFusionError>(
+                batches
+                    .iter()
+                    .flat_map(|batch| {
+                        let content = batch
+                            .column(0)
+                            .as_any()
+                            .downcast_ref::<arrow::array::StringArray>()
+                            .expect("content is a string column");
+                        content
+                            .iter()
+                            .map(|value| value.unwrap_or_default().to_string())
+                            .collect::<Vec<_>>()
+                    })
+                    .collect(),
+            )
+        }
+        .await;
+        let made = requests.load(std::sync::atomic::Ordering::SeqCst) - before;
+        (rows, made)
+    }
+
+    #[tokio::test]
+    async fn compression_bomb_is_refused_just_past_the_floor_without_retrying() {
+        let len = http_body_limit::RATIO_CHECK_FLOOR_BYTES + 64 * MIB;
+        let body = gzip_json(len, |_| b'A');
+        assert!(
+            body.len() * http_body_limit::MAX_COMPRESSION_RATIO < len,
+            "the response expands past the ratio: {} bytes on the wire",
+            body.len()
+        );
+        let (origin, requests) = serve_gzip(body).await;
+
+        let (rows, made) = query_content(&origin, &requests).await;
+        let message = match rows {
+            Err(error) => error.to_string(),
+            Ok(rows) => panic!(
+                "a compression bomb fails the query, but it returned rows of {:?} bytes",
+                rows.iter().map(String::len).collect::<Vec<_>>()
+            ),
+        };
+        let (prefix, rest) = message
+            .split_once(" decoded (")
+            .unwrap_or_else(|| panic!("no byte counts in {message}"));
+        let (counts, suffix) = rest
+            .split_once(" received)")
+            .unwrap_or_else(|| panic!("no byte counts in {message}"));
+        assert!(
+            prefix.ends_with(&format!(
+                "Failed to read the response from {origin} for dataset 'http_test': the \
+                 gzip-compressed response body expanded more than 100:1 when"
+            )),
+            "{message}"
+        );
+        assert_eq!(
+            suffix,
+            ", which is refused once a body passes 64 MiB decoded. Ask the endpoint for an \
+             uncompressed response by adding `Accept-Encoding: identity` to `http_headers`, \
+             or request less data per call. \
+             See: https://spiceai.org/docs/components/data-connectors/https"
+        );
+
+        // Refused as soon as it passed the floor: never more than one decode block past it.
+        let (decoded, received) = counts
+            .split_once(" bytes from ")
+            .unwrap_or_else(|| panic!("malformed byte counts in {message}"));
+        let decoded: usize = decoded.parse().expect("decoded byte count");
+        let received: usize = received.parse().expect("received byte count");
+        assert!(
+            decoded > http_body_limit::RATIO_CHECK_FLOOR_BYTES
+                && decoded
+                    <= http_body_limit::RATIO_CHECK_FLOOR_BYTES
+                        + http_body_limit::DECODE_BLOCK_BYTES,
+            "refused at {decoded} decoded bytes"
+        );
+        assert!(decoded > received * http_body_limit::MAX_COMPRESSION_RATIO);
+
+        // The refusal is permanent: the origin is asked once, not once per retry.
+        assert_eq!(made, 1);
+    }
+
+    #[tokio::test]
+    async fn large_compressed_response_at_a_realistic_ratio_is_read_in_full() {
+        let len = http_body_limit::RATIO_CHECK_FLOOR_BYTES + 16 * MIB;
+        let body = gzip_json(len, ids);
+        let ratio = len / body.len();
+        assert!(
+            (2..http_body_limit::MAX_COMPRESSION_RATIO).contains(&ratio),
+            "the response compresses {ratio}:1"
+        );
+        let (origin, requests) = serve_gzip(body).await;
+
+        let (rows, made) = query_content(&origin, &requests).await;
+        let rows = rows.expect("a large compressed response at a realistic ratio is read");
+        assert_eq!(rows.len(), 1);
+        let row = rows[0].as_bytes();
+        assert_eq!(row.len(), len);
+        assert_eq!(&row[..6], br#"{"a":""#);
+        assert_eq!(&row[len - 2..], br#""}"#);
+        assert!(
+            row[6..len - 2]
+                .iter()
+                .enumerate()
+                .all(|(i, &b)| b == ids(i)),
+            "the decoded response matches what was sent"
+        );
+        assert_eq!(made, 1);
+    }
+
+    /// Answer every request with `response` and count the requests.
+    async fn serve_fixed(response: String) -> (u16, Arc<std::sync::atomic::AtomicUsize>) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind the test server");
+        let port = listener.local_addr().expect("test server address").port();
+        let requests = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counter = Arc::clone(&requests);
+        tokio::spawn(async move {
+            while let Ok((mut socket, _)) = listener.accept().await {
+                let mut request = Vec::new();
+                let mut buf = [0u8; 1024];
+                while !request.windows(4).any(|w| w == b"\r\n\r\n") {
+                    match socket.read(&mut buf).await {
+                        Ok(0) | Err(_) => break,
+                        Ok(n) => request.extend_from_slice(&buf[..n]),
+                    }
+                }
+                counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                let _ = socket.write_all(response.as_bytes()).await;
+            }
+        });
+        (port, requests)
+    }
+
+    const OK_RESPONSE: &str = "HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\n[]";
+
+    /// `localhost.` resolves to a loopback address but, with its trailing dot, is not a
+    /// well-known internal name, so only the resolved address shows that the redirect reaches
+    /// an internal host.
+    #[tokio::test]
+    async fn a_redirect_to_a_name_that_resolves_to_loopback_is_refused() {
+        let (target_port, target_requests) = serve_fixed(OK_RESPONSE.to_string()).await;
+        let (origin_port, _) = serve_fixed(format!(
+            "HTTP/1.1 302 Found\r\nLocation: http://localhost.:{target_port}/data\r\n\
+             Content-Length: 0\r\nConnection: close\r\n\r\n"
+        ))
+        .await;
+        let origin = format!("http://127.0.0.1:{origin_port}/data");
+        let connector = test_connector(Some("json")).await;
+        let dataset = test_dataset(&origin, RefreshMode::Append, None).await;
+        let client = connector
+            .build_http_client(&dataset)
+            .await
+            .expect("build the HTTP client");
+
+        let error = client
+            .get(&origin)
+            .send()
+            .await
+            .expect_err("the redirect is refused");
+
+        let message =
+            std::iter::successors(Some(&error as &(dyn std::error::Error + 'static)), |e| {
+                e.source()
+            })
+            .map(ToString::to_string)
+            .collect::<Vec<_>>()
+            .join(": ");
+        assert!(
+            message.contains("Refused to connect to localhost."),
+            "unexpected error: {message}"
+        );
+        assert_eq!(
+            target_requests.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "the redirect target is never reached"
+        );
+    }
+
+    /// The operator chose the dataset's host, so its resolved address is not checked.
+    #[tokio::test]
+    async fn the_dataset_host_may_resolve_to_loopback() {
+        let (port, requests) = serve_fixed(OK_RESPONSE.to_string()).await;
+        let origin = format!("http://localhost.:{port}/data");
+        let connector = test_connector(Some("json")).await;
+        let dataset = test_dataset(&origin, RefreshMode::Append, None).await;
+        let client = connector
+            .build_http_client(&dataset)
+            .await
+            .expect("build the HTTP client");
+
+        let response = client
+            .get(&origin)
+            .send()
+            .await
+            .expect("the origin answers");
+
+        assert_eq!(response.status(), reqwest::StatusCode::OK);
+        assert_eq!(requests.load(std::sync::atomic::Ordering::SeqCst), 1);
     }
 }

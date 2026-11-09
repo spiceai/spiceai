@@ -1,0 +1,100 @@
+name: snapshot-source-moved-location
+description: >
+  A file_format snapshot dataset pointed at another snapshot location never
+  serves the rows it restored from the previous one. The new location lists
+  the previous location's snapshot, but none of its files, so any rows the
+  reader serves after the move come from its copy of the old location.
+
+sources:
+  src: { kind: postgres }
+  lake: { kind: rustfs }
+  # Copies the snapshot metadata, without its files, to the new location.
+  s3cli:
+    kind: docker
+    image: docker.io/localstack/localstack:4.9
+    host-network: true
+    env: { SERVICES: sqs }
+    ready: python3 -c 'import boto3'
+
+variants:
+  writer: {}
+  reader:
+    spicepod:
+      runtime: { state: null }
+      datasets:
+        - from: s3://${sources.lake.shared_bucket}/state/snapshots/
+          name: t
+          params:
+            file_format: snapshot
+            s3_endpoint: ${sources.lake.endpoint}
+            s3_region: us-east-1
+            s3_auth: key
+            s3_key: ${sources.lake.key}
+            s3_secret: ${sources.lake.secret}
+            allow_http: 'true'
+          acceleration: { refresh_check_interval: 1s }
+
+spicepod:
+  version: v1
+  kind: Spicepod
+  name: snapshot-source-moved-location
+  runtime:
+    state:
+      location: s3://${sources.lake.shared_bucket}/state/
+      params:
+        s3_endpoint: ${sources.lake.endpoint}
+        s3_region: us-east-1
+        s3_auth: key
+        s3_key: ${sources.lake.key}
+        s3_secret: ${sources.lake.secret}
+        allow_http: 'true'
+  datasets:
+    - from: postgres:public.t
+      name: t
+      params: ${sources.src.params}
+      acceleration:
+        enabled: true
+        engine: cayenne
+        mode: file
+        refresh_mode: full
+        snapshots: create_only
+
+defaults:
+  # The writer publishes what the reader restores, so they run side by side.
+  run-variants: side-by-side
+  compare-variants: false
+
+steps:
+  - source-exec: { src: "CREATE TABLE t (id int PRIMARY KEY, v text); INSERT INTO t SELECT i, 'v' || i FROM generate_series(1, 3) i" }
+  - start: {}
+    only: writer
+  - assert-log: { contains: 'Snapshot created dataset=t' }
+    eventually: 30s
+    only: writer
+  - start: { ready: false }
+    only: reader
+  - query: SELECT count(*) AS n, sum(id) AS s FROM t
+    expect: { rows: [['3', '6']] }
+    eventually: 60s
+    only: reader
+
+  - source-exec:
+      s3cli: |
+        python3 - <<'PY'
+        import boto3
+        s3 = boto3.client('s3', endpoint_url='${sources.lake.endpoint}'.replace('127.0.0.1', '${sources.s3cli.host_from_container}'),
+            region_name='us-east-1', aws_access_key_id='${sources.lake.key}', aws_secret_access_key='${sources.lake.secret}')
+        s3.copy_object(Bucket='${sources.lake.shared_bucket}', Key='elsewhere/snapshots/metadata.json',
+            CopySource={'Bucket': '${sources.lake.shared_bucket}', 'Key': 'state/snapshots/metadata.json'})
+        PY
+    only: reader
+  - restart:
+      ready: false
+      patch:
+        datasets:
+          t: { from: 's3://${sources.lake.shared_bucket}/elsewhere/snapshots/' }
+    only: reader
+  - query: SELECT count(*) AS n FROM t
+    expect-error: '.'
+    consistently: 10s
+    only: reader

@@ -1,0 +1,10 @@
+---
+source: crates/test-framework/src/spicetest/datasets/worker.rs
+description: "Query: tpcds_q37"
+---
++------------------+----------------------------------------------------------------------+-----------------+
+| i_item_id        | i_item_desc                                                          | i_current_price |
++------------------+----------------------------------------------------------------------+-----------------+
+| AAAAAAAAIOOMCAAA | Just strong parties give best sure, communist eyes. American, social | 29.32           |
+| AAAAAAAAKPACBAAA | Urban, prime years might not                                         | 26.10           |
++------------------+----------------------------------------------------------------------+-----------------+

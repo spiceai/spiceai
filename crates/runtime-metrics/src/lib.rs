@@ -27,6 +27,7 @@ pub mod cluster;
 pub mod component;
 pub mod components;
 pub mod datasets;
+pub mod drasi;
 pub mod embeddings;
 pub mod http;
 pub mod llms;

@@ -77,6 +77,7 @@ mod elasticsearch;
 pub mod megascience;
 #[cfg(feature = "s3_vectors")]
 mod s3_vectors;
+mod sidecar;
 mod tables;
 
 #[derive(Clone, Serialize, Debug, Deserialize)]
@@ -113,8 +114,7 @@ pub struct SearchTestCase {
 enum AccelerationOptions {
     NoAcceleration,
     Arrow,
-    DuckDb,
-    DuckDbFile,
+    CayenneMemory,
     Cayenne,
     /// Cayenne acceleration with `on_zero_results: use_source`, so a warm search
     /// tier that returns nothing falls through to the external vector engine index.
@@ -126,8 +126,7 @@ impl fmt::Display for AccelerationOptions {
         let s = match self {
             AccelerationOptions::NoAcceleration => "no_acceleration",
             AccelerationOptions::Arrow => "arrow",
-            AccelerationOptions::DuckDb => "duckdb",
-            AccelerationOptions::DuckDbFile => "duckdb_file",
+            AccelerationOptions::CayenneMemory => "cayenne_memory",
             AccelerationOptions::Cayenne => "cayenne",
             AccelerationOptions::CayenneWithZeroResults => "cayenne_with_zero_results",
         };
@@ -151,19 +150,9 @@ impl AccelerationOptions {
                 engine: Some("arrow".to_string()),
                 ..Default::default()
             },
-            AccelerationOptions::DuckDb => Acceleration {
+            AccelerationOptions::CayenneMemory => Acceleration {
                 enabled: true,
-                engine: Some("duckdb".to_string()),
-                ..Default::default()
-            },
-            AccelerationOptions::DuckDbFile => Acceleration {
-                enabled: true,
-                engine: Some("duckdb".to_string()),
-                mode: Mode::File,
-                params: Some(spicepod::param::Params::from_string_map(HashMap::from([(
-                    "duckdb_file".to_string(),
-                    format!(".spice/data/duckdb_acceleration_{unique_id}.db"),
-                )]))),
+                engine: Some("cayenne".to_string()),
                 ..Default::default()
             },
             AccelerationOptions::Cayenne | AccelerationOptions::CayenneWithZeroResults => {
@@ -212,7 +201,6 @@ const S3_VECTORS_FALLBACK_ARN_ENV: &str = "AWS_S3_VECTORS_FALLBACK_INDEX_ARN";
 #[serde(rename_all = "snake_case")]
 enum VectorEngineOptions {
     NoVectorEngine,
-    DuckDb,
     S3Vectors,
     /// S3 Vectors backed by a long-lived, never-deleted index, used to exercise the warm-tier
     /// fallback path: when the warm tier is empty, searches fall through to this persisted index.
@@ -223,7 +211,6 @@ impl fmt::Display for VectorEngineOptions {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let s = match self {
             VectorEngineOptions::NoVectorEngine => "no_vector_engine",
-            VectorEngineOptions::DuckDb => "duckdb",
             VectorEngineOptions::S3Vectors => "s3_vectors",
             VectorEngineOptions::S3VectorsFallback => "s3_vectors_fallback",
         };
@@ -238,11 +225,6 @@ impl VectorEngineOptions {
                 enabled: false,
                 ..Default::default()
             },
-            VectorEngineOptions::DuckDb => VectorStore {
-                enabled: true,
-                engine: Some("duckdb".to_string()),
-                ..Default::default()
-            },
             VectorEngineOptions::S3Vectors | VectorEngineOptions::S3VectorsFallback => {
                 let mut params = HashMap::from([
                     ("s3_vectors_aws_region".to_string(), "us-east-2".to_string()),
@@ -255,6 +237,10 @@ impl VectorEngineOptions {
                         "${ env:AWS_S3_VECTORS_SECRET }".to_string(),
                     ),
                 ]);
+                params.extend(crate::utils::aws_session_token_param(
+                    "s3_vectors_aws_session_token",
+                    "AWS_S3_VECTORS_SESSION_TOKEN",
+                ));
                 match self {
                     // The fallback engine targets a pre-seeded index by ARN. `s3_vectors_arn` is
                     // mutually exclusive with `s3_vectors_bucket`/`s3_vectors_index`, and an
@@ -353,7 +339,6 @@ impl EmbeddingModels {
 async fn test_megascience_permutations(
     #[values(
         VectorEngineOptions::NoVectorEngine,
-        VectorEngineOptions::DuckDb,
         VectorEngineOptions::S3Vectors,
         VectorEngineOptions::S3VectorsFallback
     )]
@@ -363,8 +348,7 @@ async fn test_megascience_permutations(
     #[values(
         AccelerationOptions::NoAcceleration,
         AccelerationOptions::Arrow,
-        AccelerationOptions::DuckDb,
-        AccelerationOptions::DuckDbFile,
+        AccelerationOptions::CayenneMemory,
         AccelerationOptions::Cayenne,
         AccelerationOptions::CayenneWithZeroResults
     )]
@@ -423,6 +407,7 @@ async fn test_megascience_permutations(
     // Give the (non-fallback) S3 Vectors engine a unique per-permutation index name so parallel
     // runs don't clobber each other. The fallback engine deliberately keeps the ARN-identified,
     // long-lived index it set in `to_vector_store`, so a prior run's vectors remain to fall back to.
+    // S3 Vectors index names allow lowercase letters, digits, hyphens and dots, not underscores.
     if matches!(vector_engine, VectorEngineOptions::S3Vectors)
         && let Some(params) = vector_store.params.as_mut()
     {
@@ -430,7 +415,7 @@ async fn test_megascience_permutations(
             "s3_vectors_index".to_string(),
             ParamValue::String(format!(
                 "{}-{}-{}-{}",
-                acceleration_opt,
+                acceleration_opt.to_string().replace('_', "-"),
                 table_option.to_string().replace('_', "-"),
                 column_config.to_string().replace('_', "-"),
                 rand::random::<u8>() % 11
@@ -465,15 +450,12 @@ async fn test_megascience_permutations(
     let _es_container;
     let es_endpoint: String;
     if matches!(text_engine, TextEngineOptions::Elasticsearch) {
-        // Pick a random high port to avoid collisions with other parallel test runs.
-        let port = {
-            use rand::RngExt;
-            let mut rng = rand::rng();
-            rng.random_range(19200_u16..19300_u16)
-        };
-        let container = elasticsearch::start_elasticsearch_docker_container(port)
+        let container = elasticsearch::start_elasticsearch_docker_container()
             .await
             .expect("failed to start Elasticsearch Docker container");
+        let port = container
+            .host_port(9200)
+            .expect("Elasticsearch container must publish TCP port 9200");
         es_endpoint = elasticsearch::elasticsearch_endpoint(port);
         _es_container = Some(container);
     } else {
@@ -594,23 +576,13 @@ fn validate_combination(
             "Elasticsearch text engine only applies to FTS column configurations".to_string(),
         );
     }
-    if matches!(&vector_engine, VectorEngineOptions::DuckDb)
-        && !matches!(
-            &acceleration_opt,
-            AccelerationOptions::DuckDb | AccelerationOptions::DuckDbFile
-        )
-    {
-        return Err(
-            "DuckDB vector engine requires DuckDB acceleration (duckdb or duckdb_file)".to_string(),
-        );
-    }
     if matches!(&vector_engine, VectorEngineOptions::S3Vectors)
         && !matches!(
             (&table_option, &acceleration_opt),
             (
                 megascience::TableOptions::Dataset,
                 AccelerationOptions::Arrow
-                    | AccelerationOptions::DuckDb
+                    | AccelerationOptions::CayenneMemory
                     | AccelerationOptions::Cayenne
             )
         )
@@ -846,15 +818,17 @@ pub(crate) async fn run_search(
                         });
 
                         // This is okay to fail. Some times SQL plans cannot be prepared (e.g. FTS on a vector index).
-                        // Do not return error, but make a snapshot to ensure if this changes in future, we can track it.
+                        // Do not return error, but snapshot the real error so a future change is tracked.
                         let mut disp =
-                            if let Ok(stream) = client.sql(format!("EXPLAIN {sql}").as_str()).await {
-                                match stream.try_collect::<Vec<arrow::record_batch::RecordBatch>>().await {
+                            match client.sql(format!("EXPLAIN {sql}").as_str()).await {
+                                Ok(stream) => match stream
+                                    .try_collect::<Vec<arrow::record_batch::RecordBatch>>()
+                                    .await
+                                {
                                     Ok(c) => arrow::util::pretty::pretty_format_batches(&c)?.to_string(),
-                                    Err(e) => format!("Could not prepare EXPLAIN plan: {e}")
-                                }
-                            } else {
-                                format!("Could not prepare EXPLAIN plan. SQL error: {resp}")
+                                    Err(e) => format!("Could not prepare EXPLAIN plan: {e}"),
+                                },
+                                Err(e) => format!("Could not prepare EXPLAIN plan: {e}"),
                             };
                         disp = sanitize_cayenne_file_paths(&disp);
                         disp = replace_s3_vector_index_names(&disp);
@@ -866,6 +840,44 @@ pub(crate) async fn run_search(
                         });
                     }
                 }
+            }
+            Ok(())
+        })
+        .await
+}
+
+/// `/v1/search` rejects empty and whitespace-only `text` with HTTP 400 before
+/// any dataset or embedding model is loaded.
+#[tokio::test]
+async fn search_rejects_empty_and_whitespace_text_with_http_400() -> Result<(), anyhow::Error> {
+    let _tracing = init_tracing(None);
+
+    test_request_context()
+        .scope(async {
+            let api_config = start_app(AppBuilder::new("search_empty_text").build()).await?;
+            let base_url = format!("http://{}", api_config.http_bind_address);
+
+            for text in ["", "   ", "\t\n "] {
+                let mut headers = HeaderMap::new();
+                headers.insert(ACCEPT, HeaderValue::from_static("application/json"));
+                headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
+                let err = http_post(
+                    &format!("{base_url}/v1/search"),
+                    &json!({
+                        "datasets": ["products"],
+                        "text": text,
+                        "limit": 3
+                    })
+                    .to_string(),
+                    headers,
+                )
+                .await
+                .expect_err("empty text must be rejected");
+                assert_eq!(
+                    err.to_string(),
+                    "HTTP error: 400 Bad Request - Search text must not be empty",
+                    "text={text:?}"
+                );
             }
             Ok(())
         })

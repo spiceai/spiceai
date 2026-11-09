@@ -23,6 +23,7 @@ use util::format_datafusion_error;
 mod arrow;
 mod connector;
 pub mod dml;
+mod filter;
 mod json_nest;
 pub mod provider;
 mod request_builder;
@@ -89,6 +90,16 @@ pub enum Error {
     #[snafu(display("Failed to convert DynamoDB items to Arrow: {source}"))]
     ConversionError {
         source: Box<dyn std::error::Error + std::marker::Send + Sync>,
+    },
+
+    #[snafu(display(
+        "DynamoDB attribute '{column}' has the number {value}, which does not fit its column type {data_type}. \
+         Increase schema_infer_max_records so schema inference sees this value, or declare the column's type in `columns`"
+    ))]
+    NumberDoesNotFitColumn {
+        column: String,
+        value: String,
+        data_type: ::arrow::datatypes::DataType,
     },
 
     #[snafu(display("Invalid item access: {message}"))]

@@ -1,0 +1,68 @@
+name: append-kill
+description: >
+  Append refresh into Cayenne on a short interval, which holds new rows in
+  memory by default before they reach files: rows appended just before
+  spiced is killed are there after it restarts, exactly once, with the
+  default in-memory durability and with `cayenne_cdc_durability: file`.
+
+sources:
+  src: { kind: postgres }
+
+variants:
+  memory-durability: {}
+  file-durability:
+    datasets: { events: { acceleration: { params: { cayenne_cdc_durability: file } } } }
+
+spicepod:
+  version: v1
+  kind: Spicepod
+  name: append-kill
+  datasets:
+    - from: postgres:public.events
+      name: events
+      params: ${sources.src.params}
+      time_column: ts
+      time_format: timestamptz
+      acceleration:
+        enabled: true
+        engine: cayenne
+        mode: file
+        refresh_mode: append
+        refresh_check_interval: 1s
+        primary_key: id
+        on_conflict: { id: upsert }
+
+defaults:
+  cluster-partition-by: { '*': id }
+  expect: { oracle: src }
+
+steps:
+  - source-exec:
+      src: |
+        CREATE TABLE events (id int PRIMARY KEY, ts timestamptz NOT NULL, v int);
+        INSERT INTO events SELECT i, TIMESTAMPTZ '2100-01-01 00:00Z' + i * INTERVAL '1 second', i FROM generate_series(1, 1000) i;
+  - start: {}
+  - query: SELECT * FROM events
+  - assert-log: { contains: 'cdc_durability=memory' }
+    only: memory-durability
+  - assert-log: { contains: 'cdc_durability=file' }
+    only: file-durability
+
+  # Appended, served, then killed before anything else happens.
+  - source-exec: { src: "INSERT INTO events SELECT i, TIMESTAMPTZ '2100-01-01 00:00Z' + i * INTERVAL '1 second', i FROM generate_series(1001, 1500) i" }
+  - query: SELECT count(*) AS n, max(id) AS m FROM events
+    eventually: 30s
+  - kill-spiced: {}
+  - start: {}
+  - query: SELECT * FROM events
+  - query: SELECT count(*) AS n, count(DISTINCT id) AS ids FROM events
+
+  # Killed while rows are still arriving.
+  - source-exec: { src: "INSERT INTO events SELECT i, TIMESTAMPTZ '2100-01-01 00:00Z' + i * INTERVAL '1 second', i FROM generate_series(1501, 1600) i" }
+  - sleep: 1s
+  - kill-spiced: {}
+  - source-exec: { src: "INSERT INTO events SELECT i, TIMESTAMPTZ '2100-01-01 00:00Z' + i * INTERVAL '1 second', i FROM generate_series(1601, 1700) i" }
+  - start: {}
+  - query: SELECT * FROM events
+    eventually: 30s
+  - query: SELECT count(*) AS n, count(DISTINCT id) AS ids FROM events

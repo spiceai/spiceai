@@ -29,6 +29,7 @@ pub struct LocalFileRegistry;
 impl LocalFileRegistry {
     #[expect(
         clippy::unused_async,
+        clippy::unused_async_trait_impl,
         reason = "Async for API consistency with SpicerackRegistry"
     )]
     pub async fn get_pod(

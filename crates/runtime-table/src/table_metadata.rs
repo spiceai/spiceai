@@ -88,6 +88,23 @@ mod tests {
 
     use super::table_provider_with_spicepod_metadata;
 
+    /// The layers a read walks through, outermost first, by type.
+    fn read_layers(table: &dyn TableProvider) -> Vec<&'static str> {
+        spice_table::nodes(table, LayerWalk::Read)
+            .map(|node| {
+                if node.layer_as::<IndexLayer>().is_some() {
+                    "IndexLayer"
+                } else if node.layer_as::<EmbeddingTable>().is_some() {
+                    "EmbeddingTable"
+                } else if node.layer_as::<MetadataEnrichedTableProvider>().is_some() {
+                    "MetadataEnrichedTableProvider"
+                } else {
+                    "unexpected layer"
+                }
+            })
+            .collect()
+    }
+
     #[test]
     fn embedding_table_metadata_wrap_preserves_downcast() {
         // Regression test for CDC-over-embeddings: when a dataset carries table- or
@@ -107,7 +124,7 @@ mod tests {
         ) as Arc<dyn TableProvider>;
 
         let embedding_table = Arc::new(EmbeddingTable {
-            base_table,
+            base_table: Arc::clone(&base_table),
             embedded_columns: HashMap::new(),
             embedding_models: Arc::new(tokio::sync::RwLock::new(HashMap::new())),
         })
@@ -125,22 +142,34 @@ mod tests {
             &columns,
         );
 
-        let embedding_node = spice_table::nodes(wrapped.as_ref(), LayerWalk::Read)
-            .find(|node| node.layer_as::<EmbeddingTable>().is_some())
-            .expect(
-                "metadata wrap must keep the embedding layer discoverable for the changes stream",
-            );
-
-        // Metadata enrichment is pushed *below* the embedding layer, not stacked on
-        // top of it, so the source-facing schema carries no synthetic columns.
-        assert!(
-            spice_table::find_layer::<MetadataEnrichedTableProvider>(
-                embedding_node.below().as_ref(),
-                LayerWalk::Read
-            )
-            .is_some(),
-            "enrichment should sit below the embedding layer"
+        // The embedding layer stays outermost — nothing opaque is stacked above the
+        // layer the changes stream looks for — and the enrichment is pushed *below*
+        // it, directly onto the source table.
+        assert_eq!(
+            read_layers(wrapped.as_ref()),
+            ["EmbeddingTable", "MetadataEnrichedTableProvider"],
+            "metadata wrap must keep the embedding layer discoverable for the changes stream"
         );
+        let embedding_node = spice_table::nodes(wrapped.as_ref(), LayerWalk::Read)
+            .next()
+            .expect("the embedding layer is the outermost node");
+        let enrichment_node = spice_table::nodes(embedding_node.below().as_ref(), LayerWalk::Read)
+            .next()
+            .expect("enrichment sits below the embedding layer");
+        assert!(
+            Arc::ptr_eq(enrichment_node.below(), &base_table),
+            "the enrichment wraps the source table itself"
+        );
+
+        // So the source-facing schema carries no synthetic columns.
+        let source_fields: Vec<String> = embedding_node
+            .below()
+            .schema()
+            .fields()
+            .iter()
+            .map(|field| field.name().clone())
+            .collect();
+        assert_eq!(source_fields, ["id", "content"]);
     }
 
     /// Builds the provider stack a dataset with `embeddings` produces:
@@ -250,6 +279,36 @@ mod tests {
             spice_table::find_layer::<EmbeddingTable>(index_node.below().as_ref(), LayerWalk::Read)
                 .is_some(),
             "an embedding layer nested under an index layer must stay discoverable"
+        );
+
+        // The whole stack, exactly: the enrichment is pushed under both the index and
+        // the embedding layer, onto the source table, and nothing is stacked on top.
+        assert_eq!(
+            read_layers(wrapped.as_ref()),
+            [
+                "IndexLayer",
+                "EmbeddingTable",
+                "MetadataEnrichedTableProvider"
+            ]
+        );
+        let base = spice_table::nodes(wrapped.as_ref(), LayerWalk::Read)
+            .last()
+            .expect("a layered stack")
+            .below();
+        assert!(
+            base.downcast_ref::<MemTable>().is_some(),
+            "the stack must end at the source table"
+        );
+
+        // And the dataset still exposes its spicepod table metadata through it.
+        assert_eq!(
+            wrapped
+                .schema()
+                .metadata()
+                .get("source_owner")
+                .map(String::as_str),
+            Some("analytics"),
+            "an embeddings + full-text dataset must still expose its spicepod table metadata"
         );
     }
 

@@ -152,6 +152,17 @@ impl ExecutionPlan for ElasticsearchQueryExec {
         &self.properties
     }
 
+    fn apply_expressions(
+        &self,
+        _f: &mut dyn FnMut(
+            &Arc<dyn datafusion::physical_plan::PhysicalExpr>,
+        ) -> datafusion::error::Result<
+            datafusion::common::tree_node::TreeNodeRecursion,
+        >,
+    ) -> datafusion::error::Result<datafusion::common::tree_node::TreeNodeRecursion> {
+        Ok(datafusion::common::tree_node::TreeNodeRecursion::Continue)
+    }
+
     fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> {
         vec![]
     }
@@ -667,10 +678,9 @@ fn parse_timestamp_to_unit(v: &serde_json::Value, unit: TimeUnit) -> Option<i64>
         parse_datetime_to_nanos(s)?
     } else if let Some(ms) = v.as_i64() {
         ms.checked_mul(1_000_000)?
-    } else if let Some(ms) = v.as_u64() {
-        i64::try_from(ms).ok()?.checked_mul(1_000_000)?
     } else {
-        return None;
+        let ms = v.as_u64()?;
+        i64::try_from(ms).ok()?.checked_mul(1_000_000)?
     };
     Some(match unit {
         TimeUnit::Second => nanos.div_euclid(1_000_000_000),
@@ -884,6 +894,10 @@ mod tests {
             score: Some(1.0),
             sort: None,
             source,
+            seq_no: None,
+            primary_term: None,
+            index: None,
+            routing: None,
         }
     }
 
@@ -893,12 +907,18 @@ mod tests {
             score: Some(1.0),
             sort: Some(vec![json!(id)]),
             source: json!({ "title": format!("title-{id}") }),
+            seq_no: None,
+            primary_term: None,
+            index: None,
+            routing: None,
         }
     }
 
     fn search_response(hits: Vec<Hit>, pit_id: Option<&str>) -> SearchResponse {
         SearchResponse {
             pit_id: pit_id.map(ToString::to_string),
+            timed_out: false,
+            shards: None,
             hits: HitsEnvelope {
                 total: Some(HitsTotal {
                     value: u64::try_from(hits.len()).expect("hit count should fit in u64"),
@@ -1087,6 +1107,13 @@ mod tests {
             _query: &serde_json::Value,
         ) -> elasticsearch::Result<serde_json::Value> {
             Err(unexpected_call_error("delete_by_query"))
+        }
+
+        async fn bulk_delete_if_unchanged(
+            &self,
+            _docs: &[elasticsearch::DocumentVersion],
+        ) -> elasticsearch::Result<serde_json::Value> {
+            Err(unexpected_call_error("bulk_delete_if_unchanged"))
         }
     }
 

@@ -45,11 +45,12 @@ impl ToolCatalogFactory for McpCatalogFactory {
         };
 
         let mcp_type = MCPType::from_str(id)?;
-        let cfg = MCPConfig::from_type(&mcp_type, &params_with_secrets, &env);
+        let cfg = MCPConfig::from_type(&mcp_type, &params_with_secrets, &env)?;
 
-        let ctlg = McpToolCatalog::try_new(cfg, component.name.as_str())
-            .await
-            .boxed()?;
+        let ctlg =
+            McpToolCatalog::try_new(cfg, component.name.as_str(), component.description.clone())
+                .await
+                .boxed()?;
 
         Ok(Arc::new(ctlg))
     }

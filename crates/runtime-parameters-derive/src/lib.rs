@@ -170,6 +170,9 @@ fn expand(input: &DeriveInput) -> syn::Result<proc_macro2::TokenStream> {
 
     let field_idents: Vec<&syn::Ident> = specs.iter().map(|s| &s.ident).collect();
     let expect_deprecated = any_deprecated.then(|| quote! { #[expect(deprecated)] });
+    // An `async fn` with no `.await` fails `unused_async_trait_impl`. Secret
+    // autoload is the only await. Structs without it return a ready future.
+    let needs_await = specs.iter().any(|spec| spec.autoload_secret);
 
     // `params` is only mutated (via `.remove`, or by `consume_passthrough`) when there
     // are fields to consume or a passthrough table; a struct with neither (e.g. a store
@@ -265,12 +268,29 @@ fn expand(input: &DeriveInput) -> syn::Result<proc_macro2::TokenStream> {
         }
     });
 
-    Ok(quote! {
-        #expect_deprecated
-        impl ::runtime_parameters_typed::TypedParams for #struct_ident {
-            const PREFIX: &'static str = #prefix;
-
+    let try_from_params = if needs_await {
+        quote! {
             async fn try_from_params<__R: ::runtime_parameters_typed::SecretAutoload>(
+                component_name: &str,
+                params: ::runtime_parameters_typed::__private::HashMap<
+                    ::std::string::String,
+                    ::runtime_parameters_typed::__private::SecretString,
+                >,
+                secrets: &::runtime_parameters_typed::__private::Arc<
+                    ::runtime_parameters_typed::__private::RwLock<__R>,
+                >,
+            ) -> ::std::result::Result<Self, ::runtime_parameters_typed::ParamsError> {
+                let __empty_sources = ::runtime_parameters_typed::__private::HashMap::new();
+                Self::try_from_params_with_secret_sources(
+                    component_name,
+                    params,
+                    secrets,
+                    &__empty_sources,
+                )
+                .await
+            }
+
+            async fn try_from_params_with_secret_sources<__R: ::runtime_parameters_typed::SecretAutoload>(
                 component_name: &str,
                 #params_binding: ::runtime_parameters_typed::__private::HashMap<
                     ::std::string::String,
@@ -279,11 +299,72 @@ fn expand(input: &DeriveInput) -> syn::Result<proc_macro2::TokenStream> {
                 secrets: &::runtime_parameters_typed::__private::Arc<
                     ::runtime_parameters_typed::__private::RwLock<__R>,
                 >,
+                secret_sources: &::runtime_parameters_typed::__private::HashMap<
+                    ::std::string::String,
+                    ::std::string::String,
+                >,
             ) -> ::std::result::Result<Self, ::runtime_parameters_typed::ParamsError> {
+                let _ = secret_sources;
                 #(#field_stmts)*
                 #leftover
                 ::std::result::Result::Ok(Self { #(#field_idents),* })
             }
+        }
+    } else {
+        quote! {
+            async fn try_from_params<__R: ::runtime_parameters_typed::SecretAutoload>(
+                component_name: &str,
+                params: ::runtime_parameters_typed::__private::HashMap<
+                    ::std::string::String,
+                    ::runtime_parameters_typed::__private::SecretString,
+                >,
+                secrets: &::runtime_parameters_typed::__private::Arc<
+                    ::runtime_parameters_typed::__private::RwLock<__R>,
+                >,
+            ) -> ::std::result::Result<Self, ::runtime_parameters_typed::ParamsError> {
+                let __empty_sources = ::runtime_parameters_typed::__private::HashMap::new();
+                Self::try_from_params_with_secret_sources(
+                    component_name,
+                    params,
+                    secrets,
+                    &__empty_sources,
+                )
+                .await
+            }
+
+            fn try_from_params_with_secret_sources<__R: ::runtime_parameters_typed::SecretAutoload>(
+                component_name: &str,
+                #params_binding: ::runtime_parameters_typed::__private::HashMap<
+                    ::std::string::String,
+                    ::runtime_parameters_typed::__private::SecretString,
+                >,
+                _secrets: &::runtime_parameters_typed::__private::Arc<
+                    ::runtime_parameters_typed::__private::RwLock<__R>,
+                >,
+                secret_sources: &::runtime_parameters_typed::__private::HashMap<
+                    ::std::string::String,
+                    ::std::string::String,
+                >,
+            ) -> impl ::std::future::Future<
+                Output = ::std::result::Result<Self, ::runtime_parameters_typed::ParamsError>,
+            > + ::std::marker::Send {
+                let secret_sources = secret_sources.clone();
+                ::std::future::ready((|| {
+                    let _ = &secret_sources;
+                    #(#field_stmts)*
+                    #leftover
+                    ::std::result::Result::Ok(Self { #(#field_idents),* })
+                })())
+            }
+        }
+    };
+
+    Ok(quote! {
+        #expect_deprecated
+        impl ::runtime_parameters_typed::TypedParams for #struct_ident {
+            const PREFIX: &'static str = #prefix;
+
+            #try_from_params
         }
 
         #specs_impl
@@ -405,15 +486,32 @@ fn expand_field(
     }
 
     // Typing: `SecretString` passes through unexposed; everything else parses.
+    // Provenance is looked up on the user-facing key and then aliases so a
+    // spicepod that writes the alias still masks partial interpolations.
+    let secret_source = quote! {
+        ::runtime_parameters_typed::secret_source_for_keys(
+            &secret_sources,
+            &[#user_key, #(#alias_keys),*],
+        )
+    };
     let parse_value = if is_secret_string {
         quote! { __v }
     } else if let Some(parse_with) = &spec.parse_with {
         quote! {
-            ::runtime_parameters_typed::parse_param_with(#user_key, &__v, #parse_with)?
+            ::runtime_parameters_typed::parse_param_with(
+                #user_key,
+                &__v,
+                #parse_with,
+                #secret_source,
+            )?
         }
     } else {
         quote! {
-            ::runtime_parameters_typed::parse_param::<#inner_ty>(#user_key, &__v)?
+            ::runtime_parameters_typed::parse_param::<#inner_ty>(
+                #user_key,
+                &__v,
+                #secret_source,
+            )?
         }
     };
 
@@ -429,12 +527,12 @@ fn expand_field(
             let #ident = match #raw {
                 ::std::option::Option::Some(__v) => #parse_value,
                 ::std::option::Option::None => {
-                    return ::std::result::Result::Err(
+                    ::std::result::Result::Err(
                         ::runtime_parameters_typed::ParamsError::MissingRequired {
                             user_key: #user_key.to_string(),
                             hint: #hint.to_string(),
                         },
-                    );
+                    )?
                 }
             };
         }
@@ -858,5 +956,33 @@ mod tests {
         let out = expand_str(&input).expect("valid struct should expand");
         assert!(out.contains("\"file_format\""), "expansion: {out}");
         assert!(!out.contains("file_file_format"), "expansion: {out}");
+    }
+
+    #[test]
+    fn no_autoload_returns_a_ready_future() {
+        let input: DeriveInput = parse_quote! {
+            #[params(prefix = "x")]
+            struct P { a: Option<String> }
+        };
+        let out = expand_str(&input).expect("valid struct should expand");
+        assert!(out.contains("future :: ready"), "expansion: {out}");
+        assert!(
+            !out.contains("async fn try_from_params_with_secret_sources"),
+            "the provenance method must stay a ready future: {out}"
+        );
+    }
+
+    #[test]
+    fn autoload_keeps_an_async_fn() {
+        let input: DeriveInput = parse_quote! {
+            #[params(prefix = "x")]
+            struct P {
+                #[param(autoload_secret)]
+                a: Option<SecretString>,
+            }
+        };
+        let out = expand_str(&input).expect("valid struct should expand");
+        assert!(out.contains("async fn"), "expansion: {out}");
+        assert!(out.contains(". await"), "expansion: {out}");
     }
 }

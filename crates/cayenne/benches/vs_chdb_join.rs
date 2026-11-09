@@ -19,8 +19,7 @@
 //! `vs_duckdb_join` lanes ingest, so the join plans run on identical input.
 //!
 //! Lanes:
-//! - `cayenne`       — Cayenne with the SQLite metastore (default)
-//! - `cayenne_turso` — Cayenne with the Turso metastore (--features turso)
+//! - `cayenne`       — Cayenne with the SQLite metastore
 //! - `chdb`          — chDB (embedded ClickHouse), MergeTree engine
 
 #![allow(clippy::expect_used)]

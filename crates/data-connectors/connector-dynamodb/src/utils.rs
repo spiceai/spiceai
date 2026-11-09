@@ -14,13 +14,9 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use crate::table_schema::DynamoDBTableSchema;
 use aws_sdk_dynamodb::types::AttributeValue;
 use chrono::{DateTime, FixedOffset, NaiveDate};
-use datafusion::common::tree_node::{TreeNodeRecursion, TreeNodeVisitor};
 use datafusion::common::{DataFusionError, ScalarValue};
-use datafusion::logical_expr::{BinaryExpr, Expr, Operator};
-use std::collections::HashMap;
 use std::str::FromStr;
 use std::sync::Arc;
 use util::time_format::format_datetime;
@@ -203,132 +199,6 @@ pub fn scalar_to_attribute_value(
         _ => Err(DataFusionError::NotImplemented(
             "ScalarValue type not supported".to_string(),
         )),
-    }
-}
-
-pub struct FilterStringVisitor<'a> {
-    schema: &'a DynamoDBTableSchema,
-    attribute_values: &'a mut HashMap<String, AttributeValue>,
-    value_counter: &'a mut usize,
-    pub result_stack: Vec<String>,
-    pub error: Option<DataFusionError>,
-}
-
-impl<'a> FilterStringVisitor<'a> {
-    pub fn new(
-        schema: &'a DynamoDBTableSchema,
-        attribute_values: &'a mut HashMap<String, AttributeValue>,
-        value_counter: &'a mut usize,
-    ) -> Self {
-        Self {
-            schema,
-            attribute_values,
-            value_counter,
-            result_stack: Vec::new(),
-            error: None,
-        }
-    }
-
-    fn get_column_alias(&self, column_name: &str) -> String {
-        if self.schema.is_flattened_field(column_name) {
-            // One allocation: "#seg1.#seg2..." without intermediate Vec/String per segment.
-            let segment_count = column_name.bytes().filter(|&b| b == b'.').count() + 1;
-            let mut alias = String::with_capacity(column_name.len() + segment_count);
-            let mut first = true;
-            for segment in column_name.split('.') {
-                if !first {
-                    alias.push('.');
-                }
-                first = false;
-                alias.push('#');
-                alias.push_str(segment);
-            }
-            alias
-        } else {
-            let mut alias = String::with_capacity(column_name.len() + 1);
-            alias.push('#');
-            alias.push_str(column_name);
-            alias
-        }
-    }
-}
-
-impl<'n> TreeNodeVisitor<'n> for FilterStringVisitor<'_> {
-    type Node = Expr;
-
-    fn f_down(&mut self, _node: &'n Self::Node) -> Result<TreeNodeRecursion, DataFusionError> {
-        Ok(TreeNodeRecursion::Continue)
-    }
-
-    fn f_up(&mut self, node: &'n Self::Node) -> Result<TreeNodeRecursion, DataFusionError> {
-        if self.error.is_some() {
-            return Ok(TreeNodeRecursion::Stop);
-        }
-
-        match node {
-            Expr::Column(col) => {
-                self.result_stack.push(self.get_column_alias(col.name()));
-                Ok(TreeNodeRecursion::Continue)
-            }
-            Expr::Literal(scalar, _) => {
-                let value_key = format!(":v{}", self.value_counter);
-                *self.value_counter += 1;
-
-                match scalar_to_attribute_value(scalar, &self.schema.time_format()) {
-                    Ok(attr_value) => {
-                        self.attribute_values.insert(value_key.clone(), attr_value);
-                        self.result_stack.push(value_key);
-                        Ok(TreeNodeRecursion::Continue)
-                    }
-                    Err(e) => {
-                        self.error = Some(e);
-                        Ok(TreeNodeRecursion::Stop)
-                    }
-                }
-            }
-            Expr::BinaryExpr(BinaryExpr { op, .. }) => {
-                let Some(right_str) = self.result_stack.pop() else {
-                    self.error = Some(DataFusionError::Internal(
-                        "Missing right operand in result stack".to_string(),
-                    ));
-                    return Ok(TreeNodeRecursion::Stop);
-                };
-
-                let Some(left_str) = self.result_stack.pop() else {
-                    self.error = Some(DataFusionError::Internal(
-                        "Missing left operand in result stack".to_string(),
-                    ));
-                    return Ok(TreeNodeRecursion::Stop);
-                };
-
-                let op_str = match op {
-                    Operator::Eq => "=",
-                    Operator::NotEq => "<>",
-                    Operator::Lt => "<",
-                    Operator::LtEq => "<=",
-                    Operator::Gt => ">",
-                    Operator::GtEq => ">=",
-                    Operator::And => "AND",
-                    Operator::Or => "OR",
-                    _ => {
-                        self.error = Some(DataFusionError::NotImplemented(format!(
-                            "Operator {op:?} not supported"
-                        )));
-                        return Ok(TreeNodeRecursion::Stop);
-                    }
-                };
-
-                self.result_stack
-                    .push(format!("({left_str} {op_str} {right_str})"));
-                Ok(TreeNodeRecursion::Continue)
-            }
-            _ => {
-                self.error = Some(DataFusionError::NotImplemented(
-                    "Expression type not supported in filters".to_string(),
-                ));
-                Ok(TreeNodeRecursion::Stop)
-            }
-        }
     }
 }
 

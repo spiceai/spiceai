@@ -16,109 +16,29 @@ TPC-H/TPC-DS/ClickBench/CH-benCHmark/SSB/SpiceBench/SQLLancer/micro. Entry point
   ↔ standalone oracles
 
 Run with `cargo test -p cayenne --features result-correctness-duckdb|result-correctness-chdb`
-and `cargo test -p runtime --features duckdb,sqlite --test result_correctness`
+and `cargo test -p runtime --features duckdb,sqlite --test integration result_correctness::`
 — not with `cargo bench` or Criterion features. See
 `crates/cayenne/tests/correctness/README.md`. Do not treat those tests as perf
 regressions or fold them into this matrix.
 
-The comparison has two layers:
+The comparison runs in process: the `vs_duckdb_*` benches in
+`crates/cayenne/benches/` drive `CayenneTableProvider` and an installed DuckDB,
+loaded over ADBC through `duckdb-oracle`, with identical Arrow input. Run them
+with `cargo bench -p cayenne --features duckdb-bench --bench <name>`.
 
-- End-to-end spicepod benchmarks: real `spiced` ingesting from real sources,
-  with queries via Flight. These live in
-  `tools/testoperator/dispatch/perf-cayenne-vs-duckdb/pairs.yaml`, which
-  references existing yamls under `test/spicepods/`. Run them with
-  `testoperator run bench`, `throughput`, `load`, or `append` on each side of a pair.
-- Mixed append+query benchmarks: analytical query workers running while
-  append/upsert/retention loads mutate data. These are `pairs.yaml` entries
-  with `workload: mixed` and append dispatch yamls under
-  `tools/testoperator/dispatch/tpch/`. Run them with
-  `testoperator run append --concurrency <N> --load-interval <S> --load-steps <N>`.
-- In-process micro-benchmarks: direct `CayenneTableProvider` vs
-  `duckdb::Connection` on identical Arrow input. These live in
-  `crates/cayenne/benches/vs_duckdb_*.rs` and run with
-  `cargo bench -p cayenne --features duckdb-bench --bench <name>`.
+There is no end-to-end comparison inside `spiced`: the DuckDB acceleration
+engine was removed in v2.5 (#15684), so a Spicepod cannot accelerate into
+DuckDB. For end-to-end Cayenne numbers, run the Cayenne Spicepods under
+`test/spicepods/` with `testoperator run bench`, `throughput`, `load` or
+`append`, and compare against an earlier `spiced` build.
 
-## Layer 1 — Spicepod matrix
-
-`tools/testoperator/dispatch/perf-cayenne-vs-duckdb/pairs.yaml` lists every
-paired (cayenne, duckdb) spicepod plus the workload they should be
-compared on. The manifest references existing yamls under
-`test/spicepods/` rather than duplicating them, so the comparison always
-runs against the same pods that drive the dedicated benchmark workflows.
-
-To compare a single pair locally:
-
-```sh
-# Cayenne side
-cargo run -p testoperator -- run bench \
-  -p test/spicepods/tpch/sf1/accelerated/file\[parquet\]-cayenne\[file\].yaml \
-  -s spiced -d ./.data --query-set tpch --validate
-
-# DuckDB side
-cargo run -p testoperator -- run bench \
-  -p test/spicepods/tpch/sf1/accelerated/file\[parquet\]-duckdb\[file\].yaml \
-  -s spiced -d ./.data --query-set tpch --validate
-```
-
-Then diff the query durations. A first-class `testoperator compare`
-subcommand that ingests `pairs.yaml` and produces a side-by-side report is
-planned — see the manifest's README for the input format.
-
-### Mixed append+query runs
-
-The matrix includes `workload: mixed` entries for real-world interference
-tests: one or more analytical query workers loop over the query set while
-the append worker periodically generates new load files. This is the
-Cayenne-vs-DuckDB analogue of the CH-benCH idea: reads and writes compete
-for the same accelerator instead of being measured in isolation.
-
-Run both sides of the SF1 mixed pair locally with the same duration,
-append cadence, load count, and query-worker count:
-
-```sh
-# Cayenne side
-cargo run -p testoperator -- run append \
-  -p test/spicepods/tpch/sf1/accelerated/append/file\[parquet\]-cayenne\[file\]-append.yaml \
-  -s spiced -d ./.data --query-set tpch --validate \
-  --duration 720 --concurrency 4 --load-interval 30 --load-steps 20
-
-# DuckDB side
-cargo run -p testoperator -- run append \
-  -p test/spicepods/tpch/sf1/accelerated/append/file\[parquet\]-duckdb\[file\]-append.yaml \
-  -s spiced -d ./.data --query-set tpch --validate \
-  --duration 720 --concurrency 4 --load-interval 30 --load-steps 20
-```
-
-The pass/fail bar is correctness first: all analytical queries must
-succeed, appended row counts must match expectations, and memory/health
-metrics must remain stable. The performance comparison then looks at
-query latency under write pressure, append completion, and resource usage.
-For a source-level OLTP plus analytical-query benchmark, use
-`testoperator run htap --query-set chbench`; that command follows the
-CH-benCH shape directly and complements these accelerator-pair runs.
-
-### Fair-comparison rules
-
-Two pods are a valid pair only if they differ in the accelerator engine
-(and accelerator-specific tuning) and nothing else. Specifically:
-
-- `mode: file` on both sides. Cayenne does not support memory mode, so a
-  `cayenne[file]` vs `duckdb[memory]` pair is rejected.
-- Identical source connector, schema, primary key, partition column,
-  retention policy, refresh policy, and `on_conflict` semantics.
-- The same query overrides on both runs (or none).
-
-When something must differ — e.g. one engine supports a feature the other
-doesn't — the pair carries a `notes:` explanation and `must_beat: false`.
-See `tools/testoperator/dispatch/perf-cayenne-vs-duckdb/README.md` for
-the full rule set.
-
-## Layer 2 — In-process micro-benchmarks
+## In-process micro-benchmarks
 
 The `vs_duckdb_*` benches in `crates/cayenne/benches/` exercise the
 accelerator-internal write/read paths directly, with no spiced and no
 Flight. They run identical work against `CayenneTableProvider` and a
-file-backed `duckdb::Connection`.
+file-backed DuckDB database opened through `duckdb-oracle` (an installed
+DuckDB over ADBC).
 
 | Bench                  | What it measures                                                        |
 | ---------------------- | ----------------------------------------------------------------------- |
@@ -158,27 +78,17 @@ auto-discovery from picking up the helper as a standalone target.
 The micro-benches isolate the engine's hot path. They explicitly do not
 measure:
 
-- Flight serialization or DataFusion plan construction overhead — those
-  are covered by the layer-1 spicepod benchmarks.
-- Real read/write interference — covered by the mixed append+query runs,
-  where analytical query workers execute while append loads are generated.
-- Resource consumption (peak RSS, disk usage) — covered by spiced's OTLP
-  metrics during layer-1 runs.
+- Flight serialization or DataFusion plan construction overhead.
+- Real read/write interference between queries and loads.
+- Resource consumption (peak RSS, disk usage).
 
-For end-to-end "is Cayenne winning?" answers, run the layer-1 pairs.
-For "why is Cayenne winning/losing on path X?" investigations, run the
-layer-2 micro-bench that targets that path.
+Measure those end to end on a Cayenne Spicepod with `testoperator`, against
+an earlier `spiced` build. For "why is Cayenne winning or losing on path X?",
+run the micro-bench that targets that path.
 
 ## Adding a new dimension
 
-1. If the new dimension is a workload, decide whether it's better served
-   by a spicepod pair (more realistic) or a micro-bench (more isolated).
-2. **Spicepod pair**: add the yamls under `test/spicepods/`, append an
-  entry to `pairs.yaml`, and document any unavoidable asymmetry. For a
-  real-world mixed workload, use `workload: mixed` and include the append
-  cadence plus query concurrency in the entry.
-3. **Micro-bench**: add `crates/cayenne/benches/vs_duckdb_<dimension>.rs`,
-   register it in `crates/cayenne/Cargo.toml`'s `[[bench]]` section, and
-   reuse the helpers in `crates/cayenne/benches/vs_duckdb_helpers/common.rs`
-   where possible.
-4. Update this page with the new entry.
+1. Add `crates/cayenne/benches/vs_duckdb_<dimension>.rs`, register it in
+   `crates/cayenne/Cargo.toml`'s `[[bench]]` section, and reuse the helpers in
+   `crates/cayenne/benches/vs_duckdb_helpers/common.rs` where possible.
+2. Update this page with the new entry.

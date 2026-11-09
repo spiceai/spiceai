@@ -20,7 +20,8 @@ use std::{
     sync::{Arc, OnceLock},
 };
 
-use crate::maintained_aggregate::MaintainedAggregateRegistry;
+use crate::maintained_aggregate::{MaintainedAggregateRegistry, PredicateConjuncts};
+use crate::provider::lookup_index::LookupIndexExplain;
 use arrow_schema::SchemaRef;
 use datafusion::config::ConfigOptions;
 use datafusion::error::Result;
@@ -40,7 +41,9 @@ use parking_lot::Mutex;
 
 use datafusion_physical_expr::Partitioning;
 use datafusion_physical_plan::{
-    DisplayAs, ExecutionPlan, PlanProperties, SortOrderPushdownResult,
+    ChildStats, ChildrenPropertiesMode, DisplayAs, ExecutionPlan, InputDistributionRequirements,
+    PlanProperties, ReplaceChildrenOptions, SortOrderPushdownResult, StatisticsArgs,
+    StatisticsContext,
     execution_plan::{CardinalityEffect, InvariantLevel, check_default_invariants},
     expressions::PhysicalSortExpr,
     filter_pushdown::{
@@ -127,7 +130,7 @@ pub struct CayenneAccelerationExec {
     maintained_aggregate_epoch: u64,
     /// Column-statistics overlay sourced from the table's maintained optimizer
     /// aggregate (live min/max + integer NDV), aligned to the inner plan's
-    /// output schema. Consumed in [`Self::partition_statistics`] to refill
+    /// output schema. Consumed in [`Self::statistics_with_overlay`] to refill
     /// column stats the Cayenne base+delta `UnionExec` drops to
     /// `Precision::Absent` via `DataFusion`'s generic `col_stats_union`
     optimizer_column_overlay: Option<Arc<Statistics>>,
@@ -136,6 +139,9 @@ pub struct CayenneAccelerationExec {
     /// table provider's `scan()`, which costs the message a name and nothing
     /// else — no execution behaviour reads this.
     table_name: Option<Arc<str>>,
+    /// The point-lookup index decision made while planning this scan. This is
+    /// stable plan metadata for `EXPLAIN`; execution does not consult it.
+    lookup_index: Option<LookupIndexExplain>,
 }
 
 impl CayenneAccelerationExec {
@@ -151,6 +157,7 @@ impl CayenneAccelerationExec {
             maintained_aggregate_epoch: 0,
             optimizer_column_overlay: None,
             table_name: None,
+            lookup_index: None,
         }
     }
 
@@ -167,6 +174,7 @@ impl CayenneAccelerationExec {
             maintained_aggregate_epoch: 0,
             optimizer_column_overlay: None,
             table_name: None,
+            lookup_index: None,
         }
     }
 
@@ -187,6 +195,7 @@ impl CayenneAccelerationExec {
             maintained_aggregate_epoch,
             optimizer_column_overlay: None,
             table_name: None,
+            lookup_index: None,
         }
     }
 
@@ -210,12 +219,13 @@ impl CayenneAccelerationExec {
             maintained_aggregate_epoch,
             optimizer_column_overlay: None,
             table_name: None,
+            lookup_index: None,
         }
     }
 
     /// Attaches a column-statistics overlay sourced from the table's maintained
     /// optimizer aggregate (live min/max + integer NDV). At
-    /// [`Self::partition_statistics`] this refills only the columns the Cayenne
+    /// [`Self::statistics_with_overlay`] this refills only the columns the Cayenne
     /// base+delta `UnionExec` wiped to `Precision::Absent`, restoring the
     /// join-key signal `JoinSelection` needs without overriding any surviving
     /// child statistic. A `None` overlay (cold aggregate) is a no-op.
@@ -237,6 +247,13 @@ impl CayenneAccelerationExec {
         self
     }
 
+    /// Attaches the scan-local lookup-index decision for `EXPLAIN`.
+    #[must_use]
+    pub(crate) fn with_lookup_index(mut self, lookup_index: Option<LookupIndexExplain>) -> Self {
+        self.lookup_index = lookup_index;
+        self
+    }
+
     /// Returns the maintained aggregate registry and scan epoch captured for
     /// this table scan, if aggregate maintenance is enabled for the table.
     #[must_use]
@@ -250,6 +267,51 @@ impl CayenneAccelerationExec {
     /// scan guard AND any maintained-aggregate registry — so both survive the
     /// optimizer transforms applied by the plan-rewriting trait methods
     /// (`with_new_children`, `with_fetch`, `try_swapping_with_projection`).
+    fn with_child(
+        &self,
+        children: Vec<Arc<dyn ExecutionPlan>>,
+    ) -> datafusion::error::Result<Arc<dyn ExecutionPlan>> {
+        let [input]: [Arc<dyn ExecutionPlan>; 1] =
+            children
+                .try_into()
+                .map_err(|children: Vec<Arc<dyn ExecutionPlan>>| {
+                    DataFusionError::External(
+                        super::Error::InvalidChildrenCount {
+                            children_count: children.len(),
+                        }
+                        .into(),
+                    )
+                })?;
+        Ok(Arc::new(self.wrap_rewritten_child(input)))
+    }
+
+    /// The child's statistics, with column statistics the child left `Absent`
+    /// refilled from the optimizer column overlay.
+    ///
+    /// The overlay is a per-table (global) aggregate: its min/max/NDV describe
+    /// the whole table, not any single partition. Only the table-wide aggregate
+    /// stats (`partition == None`) may be refilled from it. Per-partition stats
+    /// (`partition == Some(_)`) pass through unchanged — filling them from the
+    /// global aggregate would misstate a partition's statistics and mislead
+    /// partition-level pruning/optimization.
+    fn statistics_with_overlay(
+        &self,
+        child_stats: Arc<Statistics>,
+        partition: Option<usize>,
+    ) -> Arc<Statistics> {
+        let Some(overlay) = self
+            .optimizer_column_overlay
+            .as_ref()
+            .filter(|_| partition.is_none())
+        else {
+            return child_stats;
+        };
+        Arc::new(restore_absent_column_statistics(
+            Arc::unwrap_or_clone(child_stats),
+            overlay,
+        ))
+    }
+
     fn wrap_rewritten_child(&self, inner: Arc<dyn ExecutionPlan>) -> Self {
         // The output schema is stable across child rewrites (projection/limit
         // pushdown), so the optimizer column overlay stays aligned and valid.
@@ -262,6 +324,7 @@ impl CayenneAccelerationExec {
             maintained_aggregate_epoch: self.maintained_aggregate_epoch,
             optimizer_column_overlay: self.optimizer_column_overlay.clone(),
             table_name: self.table_name.clone(),
+            lookup_index: self.lookup_index.clone(),
         }
     }
 
@@ -276,7 +339,7 @@ impl CayenneAccelerationExec {
     /// would over-reserve the pool by that factor and refuse queries that fit.
     ///
     /// See [`partition_decode_share`] for how a total that does not divide evenly
-    /// is split.
+    /// is split, and [`output_decode_share`] for when a share may be zero.
     fn decode_fan_out(&self, partition: usize) -> Option<usize> {
         let total = (*self
             .decode_concurrency
@@ -286,7 +349,12 @@ impl CayenneAccelerationExec {
             .output_partitioning()
             .partition_count()
             .max(1);
-        Some(partition_decode_share(total, partitions, partition))
+        Some(output_decode_share(
+            &self.inner,
+            total,
+            partitions,
+            partition,
+        ))
     }
 
     /// Returns a stable identity for the underlying scan source, derived from
@@ -345,16 +413,22 @@ impl CayenneAccelerationExec {
         plan_has_pushed_filter(&self.inner)
     }
 
-    /// Like [`Self::has_pushed_filter`] but detects a predicate pushed onto a file
-    /// source ANYWHERE in the wrapped plan — including below a deletion-filter exec
-    /// on a merge-on-read table (which [`Self::has_pushed_filter`]'s shallow walk
-    /// stops above). The maintained-aggregate rewrite's soundness guard uses this:
-    /// a maintained view answers the unfiltered relation, so it must decline when a
-    /// query predicate has narrowed the scan — even when a pending-tombstone
-    /// deletion-filter exec sits between the scan wrapper and the source.
+    /// The predicate every row this scan produces satisfied: no conjuncts when it
+    /// produces every live row of the table, or `None` when the wrapped plan does
+    /// something to its rows that a predicate cannot describe. A maintained
+    /// aggregate view describes the live rows its own filter selects, so the
+    /// maintained-aggregate rewrite may substitute the view for this scan only
+    /// when the two predicates are the same. See [`plan_relation_predicate`].
     #[must_use]
-    pub(crate) fn has_pushed_filter_deep(&self) -> bool {
-        plan_has_pushed_filter_deep(&self.inner)
+    pub(crate) fn relation_predicate(&self) -> Option<PredicateConjuncts> {
+        plan_relation_predicate(&self.inner)
+    }
+
+    /// Whether every column this scan outputs is the stored table column of the
+    /// same name. See [`plan_outputs_table_columns`].
+    #[must_use]
+    pub(crate) fn outputs_table_columns(&self) -> bool {
+        plan_outputs_table_columns(&self.inner)
     }
 
     /// Push additional dynamic filters into the underlying file source.
@@ -540,32 +614,137 @@ pub(crate) fn plan_has_pushed_filter(plan: &Arc<dyn ExecutionPlan>) -> bool {
         .any(|config| config.file_source().filter().is_some())
 }
 
-/// Like [`plan_has_pushed_filter`] but walks the ENTIRE subtree (every descendant,
-/// not just the identity-preserving whitelist), so a query predicate pushed onto a
-/// file source BELOW a non-passthrough operator is still detected. The critical
-/// case is a merge-on-read table with pending tombstones: `scan()` wraps the Vortex
-/// `DataSourceExec` in a deletion-filter exec (which is NOT identity-preserving, so
-/// [`plan_has_pushed_filter`] stops above it), and a Vortex-convertible `WHERE` is
-/// pushed THROUGH that exec onto the source. The aggregate-rewrite soundness guard
-/// must see that predicate — otherwise a maintained / whole-file aggregate silently
-/// serves the unfiltered relation for a filtered query. Over-detection is sound for
-/// that guard: it only ever causes a decline (the real scan+aggregate runs).
-/// Distinct from [`plan_has_pushed_filter`], which is intentionally shallow because
-/// the deletion-filter exec's delete-aware `num_rows` math must NOT see a filtered
-/// (subset) count as a whole-table count.
-pub(crate) fn plan_has_pushed_filter_deep(plan: &Arc<dyn ExecutionPlan>) -> bool {
+/// The predicate `plan` applies to the live rows of the table it scans: no
+/// conjuncts when it produces every live row, the conjuncts of `P` when it
+/// produces exactly the live rows satisfying `P`, and `None` when it cannot be
+/// established.
+///
+/// A query's `WHERE` or `LIMIT` does not have to stay above the scan. Physical
+/// `FilterPushdown` hands a predicate to a Vortex source that accepts it, and to
+/// a `FilterExec` inside the scan when a branch cannot evaluate it: the in-memory
+/// branch that `scan()` already wraps in the query's filters absorbs it, and
+/// `UnionExec` wraps each rejecting branch in its own `FilterExec`. Either way the
+/// `FilterExec` above the scan is removed. A `LIMIT` in a subquery becomes a fetch
+/// inside the scan. So the scan's own subtree is the only place to read either.
+///
+/// Every path from `plan` to a source that produces rows must apply the same
+/// conjuncts, gathered from the `FilterExec`s on the path and the file source's
+/// pushed predicate. A path ending in an `EmptyExec` produces no rows, so it
+/// constrains nothing. The walk fails closed: only nodes known to pass every row
+/// through count, so an operator added later is treated as changing the scan's
+/// rows until it is listed here. The deletion-filter execs are listed because
+/// they remove only rows that are no longer live, which is the relation a
+/// maintained view describes. Any fetch, a volatile or dynamic predicate, paths
+/// that disagree, or a plan in which no path produces rows yield `None`.
+pub(crate) fn plan_relation_predicate(plan: &Arc<dyn ExecutionPlan>) -> Option<PredicateConjuncts> {
+    match relation_rows(plan, &PredicateConjuncts::default())? {
+        RelationRows::NoRows => None,
+        RelationRows::Matching(predicate) => Some(predicate),
+    }
+}
+
+/// The rows a path through a scan subtree produces, relative to the table's
+/// live rows. See [`plan_relation_predicate`].
+enum RelationRows {
+    /// None at all: every path ends in an `EmptyExec`.
+    NoRows,
+    /// Exactly the live rows that satisfy every conjunct.
+    Matching(PredicateConjuncts),
+}
+
+/// [`plan_relation_predicate`] for the subtree at `plan`, where `applied` holds
+/// the conjuncts the `FilterExec`s above it on the path apply.
+#[expect(deprecated)]
+fn relation_rows(
+    plan: &Arc<dyn ExecutionPlan>,
+    applied: &PredicateConjuncts,
+) -> Option<RelationRows> {
+    if plan.fetch().is_some() {
+        return None;
+    }
     if let Some(data_source_exec) = plan.downcast_ref::<DataSourceExec>() {
-        return data_source_exec
+        let source = data_source_exec.data_source();
+        if let Some(config) = source.downcast_ref::<FileScanConfig>() {
+            let mut applied = applied.clone();
+            if let Some(predicate) = config.file_source().filter() {
+                applied.try_add_predicate(&predicate)?;
+            }
+            return Some(RelationRows::Matching(applied));
+        }
+        return source
+            .downcast_ref::<datafusion::datasource::memory::MemorySourceConfig>()
+            .map(|_| RelationRows::Matching(applied.clone()));
+    }
+    if let Some(filter) = plan.downcast_ref::<datafusion_physical_plan::filter::FilterExec>() {
+        let mut applied = applied.clone();
+        applied.try_add_predicate(filter.predicate())?;
+        return relation_rows(filter.input(), &applied);
+    }
+    if plan.is::<datafusion_physical_plan::empty::EmptyExec>() {
+        return Some(RelationRows::NoRows);
+    }
+    let passes_every_row = plan.is::<CayenneAccelerationExec>()
+        || plan.is::<UnionExec>()
+        || plan.is::<ProjectionExec>()
+        || plan.is::<RepartitionExec>()
+        || plan.is::<datafusion_physical_plan::coalesce_batches::CoalesceBatchesExec>()
+        || plan.is::<datafusion_physical_plan::coalesce_partitions::CoalescePartitionsExec>()
+        || plan.is::<datafusion_physical_plan::coop::CooperativeExec>()
+        || plan.is::<runtime_datafusion::extension::bytes_processed::BytesProcessedExec>()
+        || plan.is::<crate::provider::delete::KeyBasedDeletionFilterExec>()
+        || plan.is::<crate::provider::delete::Int64PkDeletionFilterExec>();
+    if !passes_every_row {
+        return None;
+    }
+    let mut rows = RelationRows::NoRows;
+    for child in plan.children() {
+        rows = match (rows, relation_rows(child, applied)?) {
+            (RelationRows::NoRows, child_rows) => child_rows,
+            (matching, RelationRows::NoRows) => matching,
+            (RelationRows::Matching(predicate), RelationRows::Matching(child_predicate)) => {
+                if predicate != child_predicate {
+                    return None;
+                }
+                RelationRows::Matching(predicate)
+            }
+        };
+    }
+    Some(rows)
+}
+
+/// Whether every column `plan` outputs is the table column of the same name, with
+/// its stored values: every projection in the subtree, a `ProjectionExec` or one
+/// pushed into a file source, selects a column under that column's own name.
+///
+/// A projection pushed into the scan can compute a value and name it after a
+/// table column (`c + 1 AS c`), and nothing above the scan can tell that column
+/// from the stored one. A maintained view and a dynamic filter both describe the
+/// stored values, so neither applies to such a column.
+pub(crate) fn plan_outputs_table_columns(plan: &Arc<dyn ExecutionPlan>) -> bool {
+    let selects_own_column = |expr: &Arc<dyn PhysicalExpr>, alias: &str| {
+        expr.downcast_ref::<Column>()
+            .is_some_and(|column| column.name() == alias)
+    };
+    if let Some(projection) = plan.downcast_ref::<ProjectionExec>()
+        && !projection
+            .expr()
+            .iter()
+            .all(|projected| selects_own_column(&projected.expr, &projected.alias))
+    {
+        return false;
+    }
+    if let Some(data_source_exec) = plan.downcast_ref::<DataSourceExec>()
+        && let Some(config) = data_source_exec
             .data_source()
             .downcast_ref::<FileScanConfig>()
-            .is_some_and(|config| config.file_source().filter().is_some());
+        && let Some(projection) = config.file_source().projection()
+        && !projection
+            .iter()
+            .all(|projected| selects_own_column(&projected.expr, &projected.alias))
+    {
+        return false;
     }
-    for child in plan.children() {
-        if plan_has_pushed_filter_deep(child) {
-            return true;
-        }
-    }
-    false
+    plan.children().into_iter().all(plan_outputs_table_columns)
 }
 
 /// Splits the file-backed scans under `plan` decode CONCURRENTLY, summed across the
@@ -643,14 +822,43 @@ fn plan_decode_concurrency(plan: &Arc<dyn ExecutionPlan>) -> Option<usize> {
 /// divide evenly, which a mixed base+delta plan routinely does, and refusing queries
 /// that fit.
 ///
-/// The floor of one batch is the one deliberate exception. With fewer decodes than
-/// partitions some streams take a zero share, and a stream charging nothing is
-/// unaccounted for the batch it is holding; those partitions charge one batch each,
-/// which is the accounting this scaling started from.
+/// With fewer decodes than partitions some streams take a zero share;
+/// [`output_decode_share`] decides whether that zero stands.
 fn partition_decode_share(total: usize, partitions: usize, partition: usize) -> usize {
     let partitions = partitions.max(1);
     let extra = usize::from(partition < total % partitions);
-    ((total / partitions) + extra).max(1)
+    (total / partitions) + extra
+}
+
+/// The decode share an accounted output stream of `inner` pre-charges.
+///
+/// Under a round-robin `RepartitionExec`, the repartition's input tasks run every
+/// decode and its output streams only receive batches, so a zero share stands: that
+/// stream charges nothing before a poll and only the batch it emits after one.
+/// Flooring it at one would charge one estimated batch per output partition, so a
+/// one-file scan fanned out to 64 partitions would hold 64 initial estimates for one
+/// decode.
+///
+/// Anywhere else an output stream is the inner partition that decodes, and the
+/// shares are spread by index rather than by which partition holds a file, so every
+/// stream charges at least one batch.
+fn output_decode_share(
+    inner: &Arc<dyn ExecutionPlan>,
+    total: usize,
+    partitions: usize,
+    partition: usize,
+) -> usize {
+    let share = partition_decode_share(total, partitions, partition);
+    let receives_round_robin = inner
+        .downcast_ref::<RepartitionExec>()
+        .is_some_and(|repartition| {
+            matches!(repartition.partitioning(), Partitioning::RoundRobinBatch(_))
+        });
+    if receives_round_robin {
+        share
+    } else {
+        share.max(1)
+    }
 }
 
 /// Counts file-backed scan sources (snapshot generations) and the total files
@@ -869,7 +1077,11 @@ fn push_dynamic_filters_to_data_source(
         return Ok(None);
     }
 
-    plan.with_new_children(new_children).map(Some)
+    plan.replace_children(
+        new_children,
+        ReplaceChildrenOptions::new(ChildrenPropertiesMode::Recompute),
+    )
+    .map(Some)
 }
 
 pub(crate) fn round_robin_repartition_if_needed(
@@ -909,7 +1121,31 @@ impl DisplayAs for CayenneAccelerationExec {
         write!(
             f,
             "CayenneAccelerationExec: snapshots_scanned={snapshots_scanned}, files_scanned={files_scanned}"
-        )
+        )?;
+        if let Some(lookup) = &self.lookup_index {
+            // The index that served the lookup, or `none`; the counts say how
+            // much of what it read the index covered.
+            write!(f, ", lookup_index={}", lookup.served_by().unwrap_or("none"))?;
+            if let Some(candidate_files) = lookup.candidate_files {
+                write!(f, ", candidate_files={candidate_files}")?;
+            }
+            if let Some(uncovered_files) = lookup.uncovered_files {
+                write!(f, ", uncovered_files={uncovered_files}")?;
+            }
+            if let Some(candidate_batches) = lookup.candidate_batches {
+                write!(f, ", candidate_batches={candidate_batches}")?;
+            }
+            if let Some(uncovered_batches) = lookup.uncovered_batches {
+                write!(f, ", uncovered_batches={uncovered_batches}")?;
+            }
+            if let Some(candidate_rows) = lookup.candidate_rows {
+                write!(f, ", candidate_rows={candidate_rows}")?;
+            }
+            if let Some(reason) = lookup.reason {
+                write!(f, ", lookup_index_reason={}", reason.as_str())?;
+            }
+        }
+        Ok(())
     }
 }
 
@@ -950,6 +1186,18 @@ impl ExecutionPlan for CayenneAccelerationExec {
         vec![Distribution::UnspecifiedDistribution; self.children().len()]
     }
 
+    fn input_distribution_requirements(&self) -> InputDistributionRequirements {
+        InputDistributionRequirements::new(vec![
+            Distribution::UnspecifiedDistribution;
+            self.children().len()
+        ])
+    }
+
+    /// Owns no dynamic filters; the scan's dynamic filters are produced by joins above it.
+    fn dynamic_expressions_produced(&self) -> Vec<Arc<dyn PhysicalExpr>> {
+        Vec::new()
+    }
+
     fn required_input_ordering(&self) -> Vec<Option<OrderingRequirements>> {
         vec![None; self.children().len()]
     }
@@ -962,32 +1210,47 @@ impl ExecutionPlan for CayenneAccelerationExec {
         vec![false]
     }
 
+    fn apply_expressions(
+        &self,
+        _f: &mut dyn FnMut(
+            &Arc<dyn datafusion::physical_plan::PhysicalExpr>,
+        ) -> datafusion::error::Result<
+            datafusion::common::tree_node::TreeNodeRecursion,
+        >,
+    ) -> datafusion::error::Result<datafusion::common::tree_node::TreeNodeRecursion> {
+        Ok(datafusion::common::tree_node::TreeNodeRecursion::Continue)
+    }
+
     fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> {
         vec![&self.inner]
+    }
+
+    /// `properties()` is read from the child, so there is nothing to keep or recompute.
+    fn replace_children(
+        self: Arc<Self>,
+        children: Vec<Arc<dyn ExecutionPlan>>,
+        _options: ReplaceChildrenOptions,
+    ) -> datafusion::error::Result<Arc<dyn ExecutionPlan>> {
+        self.with_child(children)
+    }
+
+    fn with_new_children_and_same_properties(
+        self: Arc<Self>,
+        children: Vec<Arc<dyn ExecutionPlan>>,
+    ) -> datafusion::error::Result<Arc<dyn ExecutionPlan>> {
+        self.with_child(children)
     }
 
     fn with_new_children(
         self: Arc<Self>,
         children: Vec<Arc<dyn ExecutionPlan>>,
     ) -> datafusion::error::Result<Arc<dyn ExecutionPlan>> {
-        if children.len() != 1 {
-            return Err(DataFusionError::External(
-                super::Error::InvalidChildrenCount {
-                    children_count: children.len(),
-                }
-                .into(),
-            ));
-        }
-
-        let Some(input) = children.into_iter().next() else {
-            unreachable!("should have one input");
-        };
-        Ok(Arc::new(self.wrap_rewritten_child(input)))
+        self.with_child(children)
     }
 
     fn reset_state(self: Arc<Self>) -> Result<Arc<dyn ExecutionPlan>> {
         let children = self.children().into_iter().cloned().collect();
-        self.with_new_children(children)
+        self.with_child(children)
     }
 
     fn repartitioned(
@@ -1020,6 +1283,8 @@ impl ExecutionPlan for CayenneAccelerationExec {
                     .unwrap_or("unknown");
                 DataFusionError::External(Box::new(super::Error::TooManyOpenFiles {
                     file_path: file_path.to_string(),
+                    open_file_limit: open_file_limit(),
+                    message: msg.clone(),
                 }))
             } else {
                 e
@@ -1067,25 +1332,27 @@ impl ExecutionPlan for CayenneAccelerationExec {
     }
 
     fn partition_statistics(&self, partition: Option<usize>) -> Result<Arc<Statistics>> {
-        let child_stats = self.inner.partition_statistics(partition)?;
-        // The overlay is a per-table (global) aggregate: its min/max/NDV
-        // describe the whole table, not any single partition. Only the
-        // table-wide aggregate stats (`partition == None`) may be refilled from
-        // it. Per-partition stats (`partition == Some(_)`) must pass through
-        // unchanged — filling them from the global aggregate would violate
-        // `partition_statistics(Some(_))` semantics and mislead partition-level
-        // pruning/optimization.
-        let Some(overlay) = self
-            .optimizer_column_overlay
-            .as_ref()
-            .filter(|_| partition.is_none())
-        else {
-            return Ok(child_stats);
+        StatisticsContext::new().compute(self, &StatisticsArgs::new().with_partition(partition))
+    }
+
+    fn child_stats_requests(&self, partition: Option<usize>) -> Vec<ChildStats> {
+        vec![ChildStats::At(partition)]
+    }
+
+    fn statistics_from_inputs(
+        &self,
+        input_stats: &[Arc<Statistics>],
+        args: &StatisticsArgs,
+    ) -> Result<Arc<Statistics>> {
+        let [child_stats] = input_stats else {
+            return Err(DataFusionError::External(
+                super::Error::InvalidChildrenCount {
+                    children_count: input_stats.len(),
+                }
+                .into(),
+            ));
         };
-        Ok(Arc::new(restore_absent_column_statistics(
-            Arc::unwrap_or_clone(child_stats),
-            overlay,
-        )))
+        Ok(self.statistics_with_overlay(Arc::clone(child_stats), args.partition()))
     }
 
     // Allow optimizer to push limits through to inputs
@@ -1111,8 +1378,22 @@ impl ExecutionPlan for CayenneAccelerationExec {
         &self,
         projection: &ProjectionExec,
     ) -> Result<Option<Arc<dyn ExecutionPlan>>> {
+        // `try_swapping_with_projection` is called with a projection whose input is
+        // the receiver, and implementations read that input: `ProjectionExec`
+        // collapses the chain starting at `projection.input()`. Handing the inner
+        // plan a projection whose input is this wrapper would make an inner
+        // `ProjectionExec` find no chain and return the projection unchanged, still
+        // above this wrapper; rewrapping that nests a copy of this node on every
+        // step of the pushdown's descent, without bound. So the projection is
+        // re-rooted on the inner plan first. The wrapper's schema is the inner
+        // plan's, so the expressions and output schema carry over unchanged.
+        let projection = ProjectionExec::try_new_with_schema_metadata(
+            projection.expr().iter().cloned(),
+            Arc::clone(&self.inner),
+            projection.schema().as_ref(),
+        )?;
         self.inner
-            .try_swapping_with_projection(projection)
+            .try_swapping_with_projection(&projection)
             .map(|plan| {
                 plan.map(|plan| Arc::new(self.wrap_rewritten_child(plan)) as Arc<dyn ExecutionPlan>)
             })
@@ -1146,6 +1427,15 @@ impl ExecutionPlan for CayenneAccelerationExec {
     ) -> Result<SortOrderPushdownResult<Arc<dyn ExecutionPlan>>> {
         let result = self.inner.try_pushdown_sort(order)?;
         Ok(result.map(|plan| Arc::new(self.wrap_rewritten_child(plan)) as Arc<dyn ExecutionPlan>))
+    }
+
+    /// Not serializable. Forwarding to the child would ship a scan without this
+    /// node's snapshot guard, memory accounting and statistics overlay.
+    fn try_to_proto(
+        &self,
+        _ctx: &datafusion::physical_plan::proto::ExecutionPlanEncodeCtx<'_>,
+    ) -> Result<Option<datafusion_proto::protobuf::PhysicalPlanNode>> {
+        Ok(None)
     }
 }
 
@@ -1250,9 +1540,12 @@ struct MemoryAccountedScanStream<S> {
     /// Concurrent split decodes running beneath this stream, from
     /// [`CayenneAccelerationExec::decode_fan_out`]. The charge is
     /// `estimate * fan_out`, because a Vortex file scan holds that many
-    /// canonicalized batches at once while emitting one. Its source guarantees at
-    /// least 1, so a serial scan charges exactly one batch.
+    /// canonicalized batches at once while emitting one. Zero for a stream with no
+    /// decode share, which charges as one batch except before its first
+    /// ([`Self::charge_before_poll`]).
     fan_out: usize,
+    /// True once this stream has emitted a batch.
+    emitted: bool,
     /// True while the reservation covers an in-progress decode rather than a
     /// batch already handed downstream. Keeps the charge in place across a
     /// `Pending`, which is exactly when Vortex is expanding buffers.
@@ -1267,6 +1560,25 @@ struct MemoryAccountedScanStream<S> {
     /// its pool, and those two numbers are what separate "this scan can never
     /// fit" from "this scan cannot fit right now".
     pool: Arc<dyn MemoryPool>,
+}
+
+/// The soft open file limit this process runs under, for the `TooManyOpenFiles`
+/// message. `None` where it cannot be read.
+fn open_file_limit() -> Option<u64> {
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    {
+        let mut limit = libc::rlimit {
+            rlim_cur: 0,
+            rlim_max: 0,
+        };
+        // SAFETY: `limit` is a valid, writable `rlimit` that outlives the call.
+        let rc = unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &raw mut limit) };
+        (rc == 0).then_some(limit.rlim_cur)
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    {
+        None
+    }
 }
 
 /// Explains a query-pool refusal in terms an operator can act on, and logs it.
@@ -1407,6 +1719,7 @@ impl<S> MemoryAccountedScanStream<S> {
             reservation,
             estimate: INITIAL_BATCH_ESTIMATE_BYTES,
             fan_out,
+            emitted: false,
             decode_charged: false,
             table_name,
             partition,
@@ -1414,12 +1727,29 @@ impl<S> MemoryAccountedScanStream<S> {
         }
     }
 
-    /// Bytes to hold for `per_batch` across every concurrently decoding split.
+    /// Bytes to hold for `per_batch` across every concurrently decoding split, and
+    /// never less than one batch.
     ///
     /// Saturating: a pathological fan-out must degrade into "charge everything and
     /// let the pool refuse", never wrap into a small charge.
     fn charge_for(&self, per_batch: usize) -> usize {
-        per_batch.saturating_mul(self.fan_out)
+        per_batch.saturating_mul(self.fan_out.max(1))
+    }
+
+    /// Bytes to hold before the next poll.
+    ///
+    /// A stream with no decode share charges nothing before its first batch: it
+    /// starts no decode, and an initial estimate on every such stream is what a
+    /// round-robin fan-out over few decodes would otherwise multiply. After its
+    /// first batch it charges one batch at its running estimate, as a decoding
+    /// stream does, which covers what it can still materialize itself, such as a
+    /// batch a repartition reads back from a spill file.
+    fn charge_before_poll(&self) -> usize {
+        if self.fan_out == 0 && !self.emitted {
+            0
+        } else {
+            self.charge_for(self.estimate)
+        }
     }
 }
 
@@ -1441,7 +1771,7 @@ where
             // The previous batch has been handed downstream; whatever holds it
             // now reserves for itself, so keeping its bytes here would
             // double-count them.
-            let estimate = self.charge_for(self.estimate);
+            let estimate = self.charge_before_poll();
             let mut refused = None;
             if let Some(reservation) = self.reservation.as_mut() {
                 reservation.free();
@@ -1480,6 +1810,7 @@ where
                 // Settle to the measured size, still scaled: the emitted batch is
                 // one of `fan_out` in flight, and the others stay resident while
                 // this one is handed downstream.
+                self.emitted = true;
                 let settled = self.charge_for(actual);
                 let mut refused = None;
                 if let Some(reservation) = self.reservation.as_mut()
@@ -1585,20 +1916,28 @@ mod tests {
                     .map(|partition| partition_decode_share(total, partitions, partition))
                     .collect();
                 let charged: usize = shares.iter().sum();
-                // Below one decode per partition the floor takes over: every stream
-                // still holds a batch, so it charges one rather than nothing.
-                let expected = total.max(partitions);
                 assert_eq!(
-                    charged, expected,
+                    charged, total,
                     "total={total} over {partitions} partitions charged {charged} \
                      (shares {shares:?})"
                 );
-                assert!(
-                    shares.iter().all(|share| *share >= 1),
-                    "every accounted stream must charge at least the batch it holds"
-                );
             }
         }
+    }
+
+    /// Only the outputs of a round-robin repartition, which decode nothing, may take a
+    /// zero share; a stream that is itself a decoding partition charges at least one
+    /// batch however the shares fall by index.
+    #[test]
+    fn only_round_robin_outputs_take_a_zero_decode_share() {
+        let direct = one_partition_plan();
+        let round_robin = round_robin_repartition_if_needed(Arc::clone(&direct), 64)
+            .expect("repartition")
+            .expect("one partition fans out to 64");
+        assert_eq!(output_decode_share(&round_robin, 1, 64, 0), 1);
+        assert_eq!(output_decode_share(&round_robin, 1, 64, 63), 0);
+        assert_eq!(output_decode_share(&direct, 1, 2, 0), 1);
+        assert_eq!(output_decode_share(&direct, 1, 2, 1), 1);
     }
 
     /// The remainder must land on distinct partitions, so no stream is charged two
@@ -1652,6 +1991,58 @@ mod tests {
             err.to_string().contains("Resources exhausted"),
             "expected a pool refusal, got: {err}"
         );
+    }
+
+    /// A stream with no decode share pre-charges nothing before its first batch, so
+    /// the output partitions of a round-robin fan-out over fewer decodes do not each
+    /// hold an initial estimate. From its second poll on it pre-charges one batch,
+    /// because it can still materialize one itself, as a spill read-back does.
+    #[tokio::test]
+    async fn a_stream_with_no_decode_share_pre_charges_only_after_its_first_batch() {
+        let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)]));
+        let batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![Arc::new(Int64Array::from((0..16_i64).collect::<Vec<_>>()))],
+        )
+        .expect("batch");
+        let batch_bytes = batch.get_array_memory_size();
+        let context = pool_context(INITIAL_BATCH_ESTIMATE_BYTES * 2);
+        let pool = Arc::clone(context.memory_pool());
+
+        // Records what the pool holds each time the stream polls its input, which is
+        // after the pre-charge for that poll.
+        let reserved_at_poll = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let mut batches = vec![batch.clone(), batch].into_iter();
+        let inner = futures::stream::poll_fn({
+            let pool = Arc::clone(&pool);
+            let reserved_at_poll = Arc::clone(&reserved_at_poll);
+            move |_| {
+                reserved_at_poll.lock().expect("lock").push(pool.reserved());
+                std::task::Poll::Ready(batches.next().map(Ok))
+            }
+        });
+        let mut stream = MemoryAccountedScanStream::new(
+            Box::pin(inner),
+            Arc::clone(&schema),
+            Some(Arc::from("test_table")),
+            63,
+            &context,
+            0,
+        );
+        stream.next().await.expect("first").expect("first batch");
+        assert_eq!(pool.reserved(), batch_bytes, "the emitted batch is charged");
+        stream.next().await.expect("second").expect("second batch");
+        assert!(stream.next().await.is_none());
+        assert_eq!(
+            *reserved_at_poll.lock().expect("lock"),
+            vec![
+                0,
+                INITIAL_BATCH_ESTIMATE_BYTES,
+                INITIAL_BATCH_ESTIMATE_BYTES
+            ],
+            "no charge before the first batch, one estimated batch before each later poll"
+        );
+        assert_eq!(pool.reserved(), 0, "the charge is released at the end");
     }
 
     /// The charge must cover every split a Vortex scan decodes concurrently, not
@@ -2173,6 +2564,64 @@ mod tests {
         );
     }
 
+    /// A projection above the wrapper, over a projection the wrapper holds, must
+    /// collapse into one projection beneath the wrapper. If the outer projection is
+    /// delegated without re-rooting it, the inner `ProjectionExec` hands it back
+    /// still above the wrapper and the projection pushdown nests wrappers without
+    /// bound.
+    #[test]
+    fn projection_over_wrapped_projection_collapses_beneath_the_wrapper() {
+        use datafusion::physical_optimizer::PhysicalOptimizerRule;
+        use datafusion::physical_optimizer::projection_pushdown::ProjectionPushdown;
+
+        let scan = one_partition_plan();
+        let id = col("id", &scan.schema()).expect("id column should exist");
+        let inner = Arc::new(
+            ProjectionExec::try_new(
+                vec![(Arc::clone(&id), "a".to_string()), (id, "b".to_string())],
+                scan,
+            )
+            .expect("inner projection should be created"),
+        );
+        let exec: Arc<dyn ExecutionPlan> = Arc::new(CayenneAccelerationExec::new(inner));
+        let exec_schema = exec.schema();
+        let outer = ProjectionExec::try_new(
+            vec![
+                (col("b", &exec_schema).expect("b column"), "x".to_string()),
+                (col("a", &exec_schema).expect("a column"), "y".to_string()),
+            ],
+            Arc::clone(&exec),
+        )
+        .expect("outer projection should be created");
+
+        let swapped = exec
+            .try_swapping_with_projection(&outer)
+            .expect("projection swap should be attempted")
+            .expect("the projections should collapse");
+        let child = swapped.children()[0];
+        assert!(
+            swapped.is::<CayenneAccelerationExec>()
+                && child.is::<ProjectionExec>()
+                && child.children()[0].is::<DataSourceExec>(),
+            "expected one projection beneath the wrapper, got:\n{}",
+            datafusion::physical_plan::displayable(swapped.as_ref()).indent(true)
+        );
+        assert_eq!(swapped.schema(), outer.schema());
+
+        let optimized = ProjectionPushdown::new()
+            .optimize(Arc::new(outer), &ConfigOptions::default())
+            .expect("projection pushdown should succeed");
+        let rendered = datafusion::physical_plan::displayable(optimized.as_ref())
+            .indent(true)
+            .to_string();
+        assert_eq!(
+            rendered.matches("CayenneAccelerationExec").count(),
+            1,
+            "{rendered}"
+        );
+        assert_eq!(rendered.matches("ProjectionExec").count(), 1, "{rendered}");
+    }
+
     #[test]
     fn scan_identity_returns_none_for_non_file_data_source() {
         // MemorySourceConfig is not a FileScanConfig, so scan_identity must
@@ -2191,8 +2640,8 @@ mod tests {
         use datafusion_common::stats::Precision;
 
         let exec = CayenneAccelerationExec::new(one_partition_plan());
-        let stats = exec
-            .partition_statistics(Some(0))
+        let stats = StatisticsContext::new()
+            .compute(&exec, &StatisticsArgs::new().with_partition(Some(0)))
             .expect("partition statistics should be available");
         assert_eq!(
             stats.num_rows,
@@ -2200,8 +2649,8 @@ mod tests {
             "clean scan must keep the inner plan's exact row count"
         );
         // Aggregate over all partitions must likewise stay exact.
-        let agg = exec
-            .partition_statistics(None)
+        let agg = StatisticsContext::new()
+            .compute(&exec, &StatisticsArgs::new())
             .expect("aggregate statistics should be available");
         assert_eq!(agg.num_rows, Precision::Exact(3));
     }
@@ -2295,8 +2744,8 @@ mod tests {
             UnionExec::try_new(vec![memory, empty]).expect("union exec should be created");
 
         // Sanity: the union poisons min/max + distinct_count to Absent.
-        let poisoned = union
-            .partition_statistics(None)
+        let poisoned = StatisticsContext::new()
+            .compute(union.as_ref(), &StatisticsArgs::new())
             .expect("union statistics should be available");
         assert!(matches!(
             poisoned.column_statistics[0].min_value,
@@ -2328,8 +2777,8 @@ mod tests {
 
         // Without an overlay: poisoned stats pass through unchanged.
         let plain = CayenneAccelerationExec::new(Arc::clone(&union));
-        let plain_stats = plain
-            .partition_statistics(None)
+        let plain_stats = StatisticsContext::new()
+            .compute(&plain, &StatisticsArgs::new())
             .expect("statistics should be available");
         assert!(matches!(
             plain_stats.column_statistics[0].min_value,
@@ -2345,8 +2794,8 @@ mod tests {
         // `col > max` range filter and aren't needed downstream).
         let restored_exec = CayenneAccelerationExec::new(Arc::clone(&union))
             .with_optimizer_column_overlay(Some(overlay));
-        let restored = restored_exec
-            .partition_statistics(None)
+        let restored = StatisticsContext::new()
+            .compute(&restored_exec, &StatisticsArgs::new())
             .expect("statistics should be available");
         let col = &restored.column_statistics[0];
         assert!(matches!(col.min_value, Precision::Absent));
@@ -2360,11 +2809,17 @@ mod tests {
         // The overlay is a per-table (global) aggregate, so it must NOT be
         // applied to per-partition stats: `partition_statistics(Some(_))` must
         // return the child's partition stats untouched.
-        let per_partition = restored_exec
-            .partition_statistics(Some(0))
+        let per_partition = StatisticsContext::new()
+            .compute(
+                &restored_exec,
+                &StatisticsArgs::new().with_partition(Some(0)),
+            )
             .expect("per-partition statistics should be available");
-        let child_partition = union
-            .partition_statistics(Some(0))
+        let child_partition = StatisticsContext::new()
+            .compute(
+                union.as_ref(),
+                &StatisticsArgs::new().with_partition(Some(0)),
+            )
             .expect("child per-partition statistics should be available");
         assert_eq!(
             per_partition.column_statistics[0].min_value,
@@ -2583,6 +3038,32 @@ mod tests {
         assert_eq!(
             cap_distinct_count_at_rows(Precision::Inexact(5), Precision::Absent),
             Precision::Inexact(5)
+        );
+    }
+
+    #[test]
+    fn too_many_open_files_message_keeps_the_cause_and_the_limit() {
+        let cause = "External error: Unable to open file /data/t/a.vortex: Too many open files (os error 24)";
+        let error = super::super::Error::TooManyOpenFiles {
+            file_path: "/data/t/a.vortex".to_string(),
+            open_file_limit: Some(1024),
+            message: cause.to_string(),
+        };
+        assert_eq!(
+            error.to_string(),
+            "Failed to open Cayenne acceleration file '/data/t/a.vortex' because the process reached its open file limit of 1024, which client connections and all other open files also count against. Raise the limit where spiced is started (`ulimit -n`, or the container's `nofile` limit), or write fewer, larger acceleration files with `cayenne_target_file_size_mb`. See: https://spiceai.org/docs/components/data-accelerators/cayenne#params. Cause: External error: Unable to open file /data/t/a.vortex: Too many open files (os error 24)"
+        );
+
+        let unknown_limit = super::super::Error::TooManyOpenFiles {
+            file_path: "/data/t/a.vortex".to_string(),
+            open_file_limit: None,
+            message: cause.to_string(),
+        };
+        assert!(
+            unknown_limit
+                .to_string()
+                .contains("reached its open file limit, which client connections"),
+            "{unknown_limit}"
         );
     }
 }

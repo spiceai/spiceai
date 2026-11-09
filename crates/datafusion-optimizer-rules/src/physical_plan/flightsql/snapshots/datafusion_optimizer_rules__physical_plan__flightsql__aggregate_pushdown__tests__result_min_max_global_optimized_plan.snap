@@ -1,0 +1,9 @@
+---
+source: crates/datafusion-optimizer-rules/src/physical_plan/flightsql/aggregate_pushdown.rs
+expression: plan_display(&optimized)
+---
+AggregateExec: mode=Final, gby=[], aggr=[min(l_quantity), max(l_quantity)]
+  CoalescePartitionsExec
+    UnionExec
+      PartialAggregationFlightSqlExec sql=SELECT MIN("l_quantity") AS "__agg_0", MAX("l_quantity") AS "__agg_1" FROM foo.foo.lineitem
+      PartialAggregationFlightSqlExec sql=SELECT MIN("l_quantity") AS "__agg_0", MAX("l_quantity") AS "__agg_1" FROM foo.foo.lineitem

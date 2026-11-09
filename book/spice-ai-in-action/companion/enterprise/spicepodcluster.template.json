@@ -1,0 +1,126 @@
+{
+  "apiVersion": "spice.ai/v2",
+  "kind": "SpicepodCluster",
+  "metadata": {
+    "name": "northstar-cluster",
+    "namespace": "spice-book"
+  },
+  "spec": {
+    "schedulerSpec": {
+      "image": {
+        "repository": "REPLACE_ENTERPRISE_REPOSITORY",
+        "tag": "REPLACE_TESTED_RUNTIME_TAG",
+        "pullPolicy": "IfNotPresent",
+        "pullSecret": "northstar-registry"
+      },
+      "env": [
+        {
+          "name": "BOOK_API_KEY",
+          "valueFrom": {
+            "secretKeyRef": {
+              "name": "northstar-runtime",
+              "key": "api-key"
+            }
+          }
+        }
+      ],
+      "serviceAccount": {
+        "enabled": true,
+        "create": false,
+        "name": "northstar-data"
+      },
+      "replicas": 2,
+      "resources": {
+        "requests": {
+          "cpu": "1",
+          "memory": "2Gi"
+        },
+        "limits": {
+          "memory": "4Gi"
+        }
+      },
+      "updateStrategy": {
+        "type": "RollingOrdered"
+      },
+      "spicepod": {
+        "version": "v1",
+        "kind": "Spicepod",
+        "name": "northstar-enterprise",
+        "runtime": {
+          "auth": {
+            "api_key": {
+              "enabled": true,
+              "keys": [
+                "${ env:BOOK_API_KEY }"
+              ]
+            }
+          },
+          "scheduler": {
+            "state_location": "s3://REPLACE_BUCKET/northstar/cluster/",
+            "params": {
+              "region": "us-west-2",
+              "auth": "iam_role"
+            },
+            "partition_assignment_interval": "30s",
+            "partition_discovery_timeout": "60s"
+          }
+        }
+      }
+    },
+    "executorSpec": {
+      "image": {
+        "repository": "REPLACE_ENTERPRISE_REPOSITORY",
+        "tag": "REPLACE_TESTED_RUNTIME_TAG",
+        "pullPolicy": "IfNotPresent",
+        "pullSecret": "northstar-registry"
+      },
+      "env": [
+        {
+          "name": "BOOK_API_KEY",
+          "valueFrom": {
+            "secretKeyRef": {
+              "name": "northstar-runtime",
+              "key": "api-key"
+            }
+          }
+        }
+      ],
+      "serviceAccount": {
+        "enabled": true,
+        "create": false,
+        "name": "northstar-data"
+      },
+      "replicas": 3,
+      "resources": {
+        "requests": {
+          "cpu": "2",
+          "memory": "4Gi"
+        },
+        "limits": {
+          "memory": "8Gi"
+        }
+      },
+      "updateStrategy": {
+        "type": "RollingOrdered"
+      },
+      "volumeClaimTemplates": [
+        {
+          "metadata": {
+            "name": "data"
+          },
+          "spec": {
+            "accessModes": [
+              "ReadWriteOnce"
+            ],
+            "storageClassName": "REPLACE_STORAGE_CLASS",
+            "resources": {
+              "requests": {
+                "storage": "40Gi"
+              }
+            }
+          }
+        }
+      ]
+    }
+  }
+}

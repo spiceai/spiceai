@@ -16,18 +16,18 @@ limitations under the License.
 
 #![deny(missing_docs)]
 
-//! Cayenne: a lakehouse format using `SQLite` (or Turso) for transactional metadata
+//! Cayenne: a lakehouse format using `SQLite` for transactional metadata
 //! and Vortex files as the data lake.
 //!
 //! This module provides a lakehouse format that combines:
-//! - `SQLite` or Turso for transactional metadata management (schemas, tables, files,
+//! - `SQLite` for transactional metadata management (schemas, tables, files,
 //!   inline-data memtable, deletion vectors, snapshot sequences)
 //! - Vortex files for efficient columnar data storage
 //!
 //! # Architecture
 //!
 //! Cayenne has three key components:
-//! - **Metadata catalog**: `SQLite`/Turso database storing table metadata, file
+//! - **Metadata catalog**: `SQLite` database storing table metadata, file
 //!   references, deletion vectors, and the inline-data level-0 memtable.
 //! - **Data lake**: directory of Vortex files containing the persistent data.
 //! - **Staging WAL**: crash-safe write-ahead log for in-progress appends.
@@ -65,22 +65,59 @@ pub mod hll;
 #[cfg(feature = "partition-table-provider")]
 pub use ddl::CayenneDdlHandler;
 pub(crate) mod bounded_fifo;
+pub mod cte_materialization;
 pub mod logical_optimizer;
 pub mod maintained_aggregate;
 pub mod metadata;
 pub mod metastore;
+pub mod metastore_layout;
 
-/// Z-order clustering kernel, re-exported for benchmarks only. Not a stable API.
+/// Cold-tier clustering kernel, re-exported for benchmarks only. Not a stable API.
 #[doc(hidden)]
-pub mod __bench_zorder {
-    pub use crate::provider::zorder::zorder_keys;
+pub mod __bench_clustering {
+    pub use crate::provider::clustering::cluster_keys;
+}
+
+/// In-memory segment statistics pruning, re-exported for benchmarks only. Not a stable API.
+#[doc(hidden)]
+pub mod __bench_segment_pruning {
+    pub use crate::provider::file_pruning::{
+        build_listing_pruning_predicate, should_prune_statistics, statistics_from_record_batches,
+        statistics_may_match,
+    };
+}
+
+/// Returns whether Cayenne can encode `data_type` as a clustering dimension.
+///
+/// This is exposed for accelerator configuration validation so unsupported
+/// columns fail dataset registration instead of silently producing a constant
+/// clustering key.
+#[doc(hidden)]
+#[must_use]
+pub fn is_clusterable_type(data_type: &arrow_schema::DataType) -> bool {
+    provider::clustering::is_clusterable(data_type)
 }
 pub mod optimizer_rules;
 #[cfg(feature = "partition-table-provider")]
 pub(crate) mod partition_creator;
-pub(crate) mod partition_naming;
+pub mod partition_naming;
 pub mod provider;
 pub(crate) mod resource_starvation;
+/// Probe and build accounting for a table's secondary indexes (the
+/// acceleration's `indexes`), so a check can prove a query used row selection
+/// rather than silently falling back to an ordinary scan.
+pub mod lookup_index {
+    pub use crate::provider::IndexPersistence;
+    pub use crate::provider::lookup_index::{LookupIndexCounters, LookupIndexVerification};
+}
+
+/// Per-file scan statistics accounting, so a check can prove concurrent cold
+/// scans shared their footer reads and metastore writes. Not a stable API.
+#[doc(hidden)]
+pub mod scan_file_statistics {
+    pub use crate::provider::ScanFileStatisticsCounters;
+}
+
 pub mod row_converter;
 pub(crate) mod schema;
 pub mod stats;
@@ -92,29 +129,38 @@ pub use catalog_provider::{
     CayenneCatalogProvider, CayenneCatalogProviderConfig, CayenneSchemaProvider,
 };
 pub use cayenne_catalog::{CayenneCatalog, is_retryable_write_conflict};
+pub use cte_materialization::{
+    CTE_SCAN_NODE_NAME, CayenneCteMaterialization, CayenneCteMaterializationPlanner,
+    MATERIALIZED_CTE_NODE_NAME,
+};
 pub use metadata::{
     CdcDurability, DataFile, DeleteFile, InlinedData, InlinedDataStats, InlinedDelete,
     ObjectStoreConfig, PartitionMetadata, StorageClass, TableMetadata, TableStatistics,
 };
 pub use metastore::sqlite::{SqliteAutoVacuum, SqliteMetastoreConfig, set_sqlite_metastore_config};
 #[cfg(feature = "partition-table-provider")]
-pub use partition_creator::CayennePartitionCreator;
-pub use provider::constants::{STAGING_DIR_NAME, STAGING_WAL_FILENAME, STAGING_WAL_TMP_FILENAME};
+pub use partition_creator::{CayennePartitionCreator, partition_column_labels};
+pub use provider::RebuildableWrite;
+pub use provider::constants::{
+    LOOKUP_INDEX_DIR_NAME, STAGING_DIR_NAME, STAGING_WAL_FILENAME, STAGING_WAL_TMP_FILENAME,
+};
 pub use provider::{
-    CayenneCdcWrite, CayenneContext, CayenneStagedAppend, CayenneStagedUpsert,
-    CayenneTableProvider, CayenneTableProviderBuilder, CayenneTransaction, EncodeBudgetSnapshot,
-    LastSmallFileCompactPath, PARTITIONED_WAL_DIR, PartitionedWal, PartitionedWalEntry,
-    PreparedOverwrite, PreparedStagedAppend, PreparedTxnCommit, QueryObservations, SlotAdvancer,
-    TimeRetentionFilterBuilder, TransactionCommit, TransactionWriteToken, TxnTable,
+    AutoKeyDeletesReason, AutoKeyTableKind, CayenneCdcWrite, CayenneContext, CayenneStagedAppend,
+    CayenneStagedUpsert, CayenneTableProvider, CayenneTableProviderBuilder, CayenneTransaction,
+    DeletionModeChoice, EncodeBudgetSnapshot, FileDeletionHold, LastSmallFileCompactPath,
+    LookupIndexSnapshotHold, PARTITIONED_WAL_DIR, PartitionedWal, PartitionedWalEntry,
+    PreparedOverwrite, PreparedStagedAppend, PreparedTxnCommit, QueryObservations, ScanViewReuse,
+    SlotAdvancer, SnapshotDirPins, TableStorage, TimeRetentionFilterBuilder, TransactionCommit,
+    TransactionWriteToken, TxnTable, auto_keeps_small_tables_compacted, auto_key_deletes_reason,
     begin_compaction_shutdown, cap_global_encode_concurrency, clear_global_mem_tier_pool_account,
     compaction_budget, compaction_budget_permits, deregister_query_observations,
     drain_compaction_tasks, encode_budget_snapshot, global_mem_tier_pool_account_bytes,
-    global_mem_tier_total, global_mem_tier_used, global_qph, in_flight_compaction_tasks,
-    record_global_query, record_query_latency, register_query_observations,
-    release_global_mem_tier_bytes, reset_compaction_shutdown, set_compaction_runtime_env,
-    set_compaction_runtime_handle, set_cpu_burstable, set_global_encode_concurrency,
-    set_global_mem_tier_bytes, set_global_mem_tier_pool_account, set_global_memory_budget,
-    set_global_pk_keyset_bytes, set_query_admission_governor, try_reserve_global_mem_tier_bytes,
-    update_global_mem_tier_total,
+    global_mem_tier_total, global_mem_tier_used, global_pk_keyset_total, global_pk_keyset_used,
+    global_qph, in_flight_compaction_tasks, record_global_query, record_query_latency,
+    register_query_observations, release_global_mem_tier_bytes, reset_compaction_shutdown,
+    set_compaction_runtime_env, set_compaction_runtime_handle, set_cpu_burstable,
+    set_global_encode_concurrency, set_global_mem_tier_bytes, set_global_mem_tier_pool_account,
+    set_global_memory_budget, set_global_pk_keyset_bytes, set_query_admission_governor,
+    try_reserve_global_mem_tier_bytes, update_global_mem_tier_total,
 };
 pub use schema::{CAYENNE_TYPE_REWRITE_RULES, transform_schema_for_vortex};

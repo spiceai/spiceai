@@ -1,0 +1,1243 @@
+/*
+Copyright 2024-2026 The Spice.ai OSS Authors
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+     https://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+*/
+
+//! One `spiced` process: its ports, working directory and log stay the same
+//! across restarts, so a restarted instance finds its own acceleration files
+//! and replication slots again.
+
+use secrecy::SecretString;
+use std::{
+    collections::BTreeMap,
+    path::{Path, PathBuf},
+    sync::Arc,
+    time::Duration,
+};
+
+use anyhow::{Context, Result, bail, ensure};
+use arrow::array::RecordBatch;
+use flight_client::{Credentials, FlightClient};
+use futures::TryStreamExt;
+use nix::{sys::signal::Signal, unistd::Pid};
+use tokio::process::{Child, Command};
+
+use crate::docker::free_port;
+
+const ERROR_GRACE: Duration = Duration::from_secs(20);
+
+/// How long to wait, once `/v1/ready` has answered 200, for datasets still
+/// reported as loading.
+const SETTLE_AFTER_READY: Duration = Duration::from_secs(30);
+
+pub struct Spiced {
+    pub binary: PathBuf,
+    pub dir: PathBuf,
+    env: BTreeMap<String, String>,
+    /// Variables of the runner's own environment the process does not inherit.
+    env_removed: Vec<String>,
+    http: u16,
+    /// Serves HTTP on every interface, not only loopback, for a container
+    /// that cannot reach this machine's loopback.
+    http_on_every_interface: bool,
+    flight: u16,
+    metrics: u16,
+    otel: u16,
+    child: Option<Child>,
+    flight_client: Option<FlightClient>,
+    /// Sends the API key, if the runtime requires one, on every request.
+    http_client: reqwest::Client,
+    /// Sends no key unless asked, for a step that chooses its own.
+    bare_client: reqwest::Client,
+    api_key: Option<String>,
+    /// The root certificate the runtime's TLS certificate chains to, when it
+    /// serves TLS.
+    tls_ca: Option<PathBuf>,
+    /// Arguments passed to `spiced` after the endpoint flags.
+    extra_args: Vec<String>,
+    /// The datasets the spicepod of the latest start declares.
+    declared_datasets: Vec<String>,
+    /// Flight SQL clients kept by session name, for statements that share one.
+    sessions: std::collections::HashMap<
+        String,
+        arrow_flight::sql::client::FlightSqlServiceClient<tonic::transport::Channel>,
+    >,
+    /// Runs `spiced` in a container rather than as a local process.
+    container: Option<ContainerRun>,
+    /// The `binary` last copied into `dir` for a container to run.
+    staged_from: Option<PathBuf>,
+}
+
+/// A container `spiced` runs in: on the host's network, so it serves on the
+/// same local ports a process would, with the binary and `volumes` mounted
+/// and its working directory at the same path as on the host. Everything
+/// else, the temporary directory included, is its own.
+#[derive(Debug, Clone)]
+pub struct ContainerRun {
+    pub image: String,
+    pub name: String,
+    /// `docker run -v` specifications.
+    pub volumes: Vec<String>,
+    /// Whether the daemon runs rootless, so its containers live in a user
+    /// namespace where the daemon's own user is root.
+    pub rootless: bool,
+}
+
+/// The `docker run --user` a container runs as, so that it may write in, and
+/// leave files the runner owns in, the instance directory owned by `uid:gid`.
+///
+/// A rootful daemon maps container IDs to the host's one for one, so the
+/// directory's own owner is the answer. A rootless daemon maps its own user to
+/// root and every other container ID to a subordinate ID the host never gave
+/// the directory, so a container under the owner's ID cannot create anything
+/// there: `spiced` then fails to take its instance lock with "Permission
+/// denied". Root in that namespace is the daemon's user, the one the runner
+/// shares the directory with.
+fn container_user(rootless: bool, uid: u32, gid: u32) -> String {
+    if rootless {
+        "0:0".to_string()
+    } else {
+        format!("{uid}:{gid}")
+    }
+}
+
+/// Which API key a request presents.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Key {
+    /// The script's key (`defaults.api-key`), or none if it has none.
+    Default,
+    None,
+    Given(String),
+}
+
+/// The `--http` address `spiced` listens on.
+fn http_listen(every_interface: bool, port: impl std::fmt::Display) -> String {
+    let host = if every_interface {
+        "0.0.0.0"
+    } else {
+        "127.0.0.1"
+    };
+    format!("{host}:{port}")
+}
+
+/// Whether `command_line` is a `spiced` this tool started serving HTTP on
+/// `port`, on either address [`Spiced::start`] passes.
+pub fn serves_http_on(command_line: &str, port: impl std::fmt::Display + Copy) -> bool {
+    let args: Vec<&str> = command_line.split_whitespace().collect();
+    [false, true].into_iter().any(|every| {
+        let address = http_listen(every, port);
+        args.windows(2)
+            .any(|pair| pair[0] == "--http" && pair[1] == address)
+    })
+}
+
+impl Spiced {
+    pub fn new(binary: PathBuf, dir: PathBuf, env: BTreeMap<String, String>) -> Result<Self> {
+        std::fs::create_dir_all(&dir)?;
+        Ok(Self {
+            binary,
+            dir,
+            env,
+            env_removed: Vec::new(),
+            http: free_port()?,
+            http_on_every_interface: false,
+            flight: free_port()?,
+            metrics: free_port()?,
+            otel: free_port()?,
+            child: None,
+            flight_client: None,
+            declared_datasets: Vec::new(),
+            http_client: reqwest::Client::builder()
+                .timeout(Duration::from_secs(60))
+                .build()?,
+            bare_client: reqwest::Client::builder()
+                .timeout(Duration::from_secs(60))
+                .build()?,
+            api_key: None,
+            tls_ca: None,
+            extra_args: Vec::new(),
+            sessions: std::collections::HashMap::new(),
+            container: None,
+            staged_from: None,
+        })
+    }
+
+    /// Runs `spiced` in this container on every start.
+    /// The container this instance runs in, if it runs in one.
+    pub fn container_name(&self) -> Option<&str> {
+        self.container.as_ref().map(|run| run.name.as_str())
+    }
+
+    pub fn set_container(&mut self, run: ContainerRun) {
+        self.container = Some(run);
+    }
+
+    /// Serves HTTP on `port`, one a script was told in advance
+    /// (`${instance.http_port}`) so that a container can reach it.
+    pub fn set_http_port(&mut self, port: u16) {
+        self.http = port;
+    }
+
+    /// Serves HTTP on every interface (`0.0.0.0`) rather than only loopback,
+    /// so a container behind a rootless Docker daemon, which reaches this
+    /// machine only at its routable address, can post to it.
+    pub fn set_http_on_every_interface(&mut self, every: bool) {
+        self.http_on_every_interface = every;
+    }
+
+    /// Serves Flight on `port`, one a script was told in advance
+    /// (`${instance.flight_port}`) so that a sidecar can read from it.
+    pub fn set_flight_port(&mut self, port: u16) {
+        self.flight = port;
+    }
+
+    /// Starts the process without `key` from the runner's environment.
+    pub fn remove_env(&mut self, key: &str) {
+        self.env_removed.push(key.to_string());
+    }
+
+    /// What a client of its own needs to reach this `spiced` over Flight.
+    pub fn flight_target(&self) -> FlightTarget {
+        FlightTarget {
+            endpoint: Arc::from(self.flight_endpoint()),
+            api_key: self.api_key.clone(),
+            tls_ca: self.tls_ca.clone(),
+        }
+    }
+
+    fn scheme(&self) -> &'static str {
+        if self.tls_ca.is_some() {
+            "https"
+        } else {
+            "http"
+        }
+    }
+
+    fn client_builder(&self) -> Result<reqwest::ClientBuilder> {
+        let mut builder = reqwest::Client::builder().timeout(Duration::from_secs(60));
+        if let Some(ca) = &self.tls_ca {
+            let pem =
+                std::fs::read(ca).with_context(|| format!("Failed to read {}", ca.display()))?;
+            builder = builder.tls_certs_only([reqwest::Certificate::from_pem(&pem)?]);
+        }
+        Ok(builder)
+    }
+
+    /// Passes `args` to `spiced` on every start.
+    pub fn set_extra_args(&mut self, args: Vec<String>) {
+        self.extra_args = args;
+    }
+
+    /// Connects over TLS, trusting `ca`, from now on.
+    pub fn set_tls(&mut self, ca: Option<PathBuf>) -> Result<()> {
+        self.tls_ca = ca;
+        self.bare_client = self.client_builder()?.build()?;
+        let key = self.api_key.clone();
+        self.set_api_key(key)
+    }
+
+    /// Presents `key` on every request this client makes from now on.
+    pub fn set_api_key(&mut self, key: Option<String>) -> Result<()> {
+        let mut headers = reqwest::header::HeaderMap::new();
+        if let Some(key) = &key {
+            headers.insert(
+                "x-api-key",
+                key.parse()
+                    .context("the API key is not a valid header value")?,
+            );
+        }
+        self.http_client = self.client_builder()?.default_headers(headers).build()?;
+        self.api_key = key;
+        self.flight_client = None;
+        Ok(())
+    }
+
+    async fn connect_flight(&self, key: Option<&str>) -> Result<FlightClient> {
+        FlightTarget {
+            endpoint: Arc::from(self.flight_endpoint()),
+            api_key: key.map(str::to_string),
+            tls_ca: self.tls_ca.clone(),
+        }
+        .connect()
+        .await
+    }
+
+    /// The runtime's HTTP endpoint, as the `spice` CLI takes it.
+    /// The Flight endpoint, as the `spice` CLI's `--endpoint` takes it.
+    pub fn flight_endpoint(&self) -> String {
+        format!("{}://127.0.0.1:{}", self.scheme(), self.flight)
+    }
+
+    pub fn http_endpoint(&self) -> String {
+        format!("{}://127.0.0.1:{}", self.scheme(), self.http)
+    }
+
+    pub fn log_path(&self) -> PathBuf {
+        self.dir.join("spiced.log")
+    }
+
+    pub fn is_running(&mut self) -> bool {
+        self.child
+            .as_mut()
+            .is_some_and(|c| matches!(c.try_wait(), Ok(None)))
+    }
+
+    /// Replaces the spicepod file, for a running `spiced` that watches it.
+    pub fn write_spicepod(&self, spicepod_yaml: &str) -> Result<()> {
+        // Written beside it and renamed over it, so a watcher never reads half.
+        let tmp = self.dir.join(".spicepod.yaml.tmp");
+        std::fs::write(&tmp, spicepod_yaml)?;
+        std::fs::rename(&tmp, self.dir.join("spicepod.yaml"))?;
+        Ok(())
+    }
+
+    /// Writes the spicepod and starts `spiced`; does not wait for readiness.
+    pub fn start(&mut self, spicepod_yaml: &str) -> Result<()> {
+        if self.is_running() {
+            bail!("spiced is already running");
+        }
+        std::fs::write(self.dir.join("spicepod.yaml"), spicepod_yaml)?;
+        self.declared_datasets = declared_datasets(spicepod_yaml);
+        let log = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(self.log_path())?;
+        let mut command = match self.container.clone() {
+            None => {
+                let mut command = Command::new(&self.binary);
+                for key in &self.env_removed {
+                    command.env_remove(key);
+                }
+                if !self.env_removed.is_empty() {
+                    shadow_dotenv_files(&self.dir)?;
+                }
+                command.current_dir(&self.dir).envs(&self.env);
+                command
+            }
+            Some(run) => {
+                let binary = self.stage_binary()?;
+                self.container_command(&run, &binary)?
+            }
+        };
+        let child = command
+            .arg("--telemetry-enabled=false")
+            .args([
+                "--http",
+                &http_listen(self.http_on_every_interface, self.http),
+            ])
+            .args(["--flight", &format!("127.0.0.1:{}", self.flight)])
+            .args(["--metrics", &format!("127.0.0.1:{}", self.metrics)])
+            .args(["--open_telemetry", &format!("127.0.0.1:{}", self.otel)])
+            .args(&self.extra_args)
+            .stdout(log.try_clone()?)
+            .stderr(log)
+            .kill_on_drop(true)
+            .spawn()
+            .with_context(|| format!("Failed to start {}", self.binary.display()))?;
+        // Lets a later run stop this process if this runner is killed.
+        if let Some(pid) = child.id() {
+            std::fs::write(
+                self.dir.join(crate::reap::PID_FILE),
+                format!("{pid} {}\n", self.http),
+            )?;
+            crate::cleanup::track_process(pid, self.http);
+        }
+        if let Some(run) = &self.container {
+            crate::cleanup::track_container(&run.name, &run.name, None);
+        }
+        self.child = Some(child);
+        self.flight_client = None;
+        Ok(())
+    }
+
+    /// The binary a container runs: a copy of `binary` in this instance's
+    /// directory, made again only when `binary` changes.
+    ///
+    /// A `docker run -v` source is a path on the Docker daemon's filesystem,
+    /// which need not be this process's: under Docker-in-Docker the daemon
+    /// shares only the runner's work volume, and for a source it cannot see
+    /// it mounts an empty directory, so the container fails with
+    /// `exec /usr/local/bin/spiced failed: Permission denied`. The instance
+    /// directory is mounted into the container already, so the daemon sees
+    /// the copy wherever it sees the rest of the run.
+    fn stage_binary(&mut self) -> Result<PathBuf> {
+        let copy = std::path::absolute(self.dir.join("spiced.bin"))?;
+        if self.staged_from.as_ref() != Some(&self.binary) {
+            std::fs::copy(&self.binary, &copy).with_context(|| {
+                format!(
+                    "Failed to copy {} to {} for its container",
+                    self.binary.display(),
+                    copy.display()
+                )
+            })?;
+            self.staged_from = Some(self.binary.clone());
+        }
+        Ok(copy)
+    }
+
+    /// `docker run` for `run`, in the foreground so that its output is the log
+    /// and the signals `stop` sends reach `spiced`.
+    fn container_command(&self, run: &ContainerRun, binary: &Path) -> Result<Command> {
+        use std::os::unix::fs::MetadataExt;
+
+        // A container left behind by an interrupted run would hold the name.
+        let _ = std::process::Command::new("docker")
+            .args(["rm", "-f", &run.name])
+            .output();
+        let dir = std::path::absolute(&self.dir)?;
+        let owner = std::fs::metadata(&dir)?;
+        let mut command = Command::new("docker");
+        command
+            .args(["run", "--rm", "--init", "--network", "host"])
+            .args(["--name", &run.name])
+            .arg("--label")
+            .arg(format!(
+                "{}={}",
+                crate::docker::RUNNER_LABEL,
+                std::process::id()
+            ))
+            // Files it writes in the shared directories stay the runner's.
+            .args([
+                "--user",
+                &container_user(run.rootless, owner.uid(), owner.gid()),
+            ])
+            .arg("-v")
+            .arg(format!("{}:/usr/local/bin/spiced:ro", binary.display()))
+            .arg("-v")
+            .arg(format!("{0}:{0}", dir.display()))
+            .arg("-w")
+            .arg(&dir)
+            .arg("-e")
+            .arg(format!("HOME={}", dir.display()));
+        for volume in &run.volumes {
+            command.args(["-v", volume]);
+        }
+        for (key, value) in &self.env {
+            command.arg("-e").arg(format!("{key}={value}"));
+        }
+        command.arg(&run.image).arg("/usr/local/bin/spiced");
+        Ok(command)
+    }
+
+    /// Stops this instance's container at once, if it runs in one.
+    async fn kill_container(&self) {
+        if let Some(run) = &self.container {
+            let _ = Command::new("docker")
+                .args(["kill", &run.name])
+                .output()
+                .await;
+            crate::cleanup::untrack_container(&run.name);
+        }
+    }
+
+    /// Waits until a scheduler has at least `count` executors ready to take work
+    /// (or, with `joined_only`, registered with it), whether or not its own
+    /// components are ready yet: the verbose `/v1/ready` reports the executors
+    /// on a line of their own, `executors: <ready>/<registered> ready (…)`.
+    pub async fn wait_executors(
+        &mut self,
+        count: usize,
+        timeout: Duration,
+        joined_only: bool,
+    ) -> Result<()> {
+        let url = format!(
+            "{}://127.0.0.1:{}/v1/ready?min_ready_executors={count}&verbose=true",
+            self.scheme(),
+            self.http
+        );
+        let deadline = tokio::time::Instant::now() + timeout;
+        loop {
+            ensure!(
+                self.is_running(),
+                "spiced exited; see {}",
+                self.log_path().display()
+            );
+            let body = match self.http_client.get(&url).send().await {
+                Ok(r) => r.text().await.unwrap_or_default(),
+                Err(e) => e.to_string(),
+            };
+            let joined = body
+                .lines()
+                .filter_map(|l| l.split("executors: ").nth(1))
+                .filter_map(|rest| {
+                    let (ready, rest) = rest.split_once('/')?;
+                    let registered = rest.split(|c: char| !c.is_ascii_digit()).next()?;
+                    if joined_only { registered } else { ready }
+                        .trim()
+                        .parse::<usize>()
+                        .ok()
+                })
+                .any(|n| n >= count);
+            if joined {
+                return Ok(());
+            }
+            ensure!(
+                tokio::time::Instant::now() < deadline,
+                "no executor {} after {timeout:?}: {}",
+                if joined_only { "registered" } else { "ready" },
+                body.split_whitespace().collect::<Vec<_>>().join(" ")
+            );
+            tokio::time::sleep(Duration::from_millis(250)).await;
+        }
+    }
+
+    pub async fn wait_ready(&mut self, timeout: Duration) -> Result<()> {
+        let url = format!("{}://127.0.0.1:{}/v1/ready", self.scheme(), self.http);
+        let deadline = tokio::time::Instant::now() + timeout;
+        let mut erroring_since: Option<tokio::time::Instant> = None;
+        loop {
+            if !self.is_running() {
+                bail!(
+                    "spiced exited before it was ready; see {}",
+                    self.log_path().display()
+                );
+            }
+            if let Ok(r) = self.http_client.get(&url).send().await
+                && r.status().is_success()
+            {
+                self.wait_loaded_after_ready().await;
+                return self.wait_flight(deadline, timeout).await;
+            }
+            // A dataset can report `Error` while it retries a transient
+            // failure, so only an error that persists ends the wait early.
+            let status = self.dataset_status().await.unwrap_or_default();
+            let erroring = status.contains(r#""status":"Error""#);
+            if erroring {
+                erroring_since.get_or_insert_with(tokio::time::Instant::now);
+            } else {
+                erroring_since = None;
+            }
+            // Whichever limit ends the wait, a dataset in Error is reported
+            // the same way, so the same failure always reads the same.
+            let error_persisted = erroring_since.is_some_and(|since| since.elapsed() > ERROR_GRACE);
+            let timed_out = tokio::time::Instant::now() > deadline;
+            if erroring && (error_persisted || timed_out) {
+                bail!(
+                    "spiced not ready: a dataset is in Error: {status}; see {}",
+                    self.log_path().display()
+                );
+            }
+            if timed_out {
+                bail!(
+                    "spiced not ready after {timeout:?}; dataset status: {status}; see {}",
+                    self.log_path().display()
+                );
+            }
+            tokio::time::sleep(Duration::from_millis(250)).await;
+        }
+    }
+
+    /// A dataset's entry from `/v1/datasets?status=true`.
+    pub async fn dataset_info(&self, dataset: &str) -> Result<serde_json::Value> {
+        let url = format!(
+            "{}://127.0.0.1:{}/v1/datasets?status=true",
+            self.scheme(),
+            self.http
+        );
+        let all: serde_json::Value = self.http_client.get(url).send().await?.json().await?;
+        all.as_array()
+            .and_then(|list| {
+                list.iter()
+                    .find(|d| d.get("name").and_then(serde_json::Value::as_str) == Some(dataset))
+            })
+            .cloned()
+            .with_context(|| format!("spiced has no dataset '{dataset}'"))
+    }
+
+    /// The Prometheus exposition from `/metrics`.
+    pub async fn metrics(&self) -> Result<String> {
+        let url = format!("{}://127.0.0.1:{}/metrics", self.scheme(), self.metrics);
+        Ok(self.http_client.get(url).send().await?.text().await?)
+    }
+
+    /// Waits until the Flight port accepts connections. `spiced` answers HTTP
+    /// (`/health`, and `/v1/ready`) up to ~0.1 s before its Flight listener
+    /// is bound, and queries go over Flight.
+    async fn wait_flight(&self, deadline: tokio::time::Instant, timeout: Duration) -> Result<()> {
+        while tokio::net::TcpStream::connect(("127.0.0.1", self.flight))
+            .await
+            .is_err()
+        {
+            if tokio::time::Instant::now() > deadline {
+                bail!(
+                    "spiced answered HTTP but Flight did not accept connections on port {} within {timeout:?}; see {}",
+                    self.flight,
+                    self.log_path().display()
+                );
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        Ok(())
+    }
+
+    /// Waits until `spiced` answers `/health` and accepts Flight connections,
+    /// without waiting for datasets.
+    pub async fn wait_http(&mut self, timeout: Duration) -> Result<()> {
+        let deadline = tokio::time::Instant::now() + timeout;
+        self.wait_health(timeout).await?;
+        self.wait_flight(deadline, timeout).await
+    }
+
+    /// Waits until `spiced` answers `/health`. A cluster executor serves no
+    /// client Flight, so this is all it offers to wait on.
+    pub async fn wait_health(&mut self, timeout: Duration) -> Result<()> {
+        let url = format!("{}://127.0.0.1:{}/health", self.scheme(), self.http);
+        let deadline = tokio::time::Instant::now() + timeout;
+        loop {
+            if !self.is_running() {
+                bail!("spiced exited; see {}", self.log_path().display());
+            }
+            if let Ok(r) = self.http_client.get(&url).send().await
+                && r.status().is_success()
+            {
+                return Ok(());
+            }
+            if tokio::time::Instant::now() > deadline {
+                bail!("spiced did not answer /health within {timeout:?}");
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    }
+
+    /// Whether `/v1/ready` answers ready.
+    pub async fn ready(&self) -> bool {
+        let url = format!("{}://127.0.0.1:{}/v1/ready", self.scheme(), self.http);
+        matches!(self.http_client.get(url).send().await, Ok(r) if r.status().is_success())
+    }
+
+    /// On loaded CI runners, `/v1/ready` has answered 200 before the
+    /// spicepod's datasets were registered (the runtime's own components were
+    /// ready, and the datasets not yet known), so a query found its table
+    /// missing. So once ready, wait up to [`SETTLE_AFTER_READY`] for every
+    /// declared dataset to be listed and loaded, and say so in the script's
+    /// output: that line is the evidence of readiness reported early.
+    async fn wait_loaded_after_ready(&self) {
+        let loading = not_yet_loaded(
+            &self.dataset_status().await.unwrap_or_default(),
+            &self.declared_datasets,
+        );
+        if loading.is_empty() {
+            return;
+        }
+        crate::runner::emit(&format!(
+            "   /v1/ready answered 200 while datasets were still loading: {}; waiting up to {SETTLE_AFTER_READY:?} for them",
+            loading.join(", ")
+        ));
+        let deadline = tokio::time::Instant::now() + SETTLE_AFTER_READY;
+        while tokio::time::Instant::now() < deadline
+            && !not_yet_loaded(
+                &self.dataset_status().await.unwrap_or_default(),
+                &self.declared_datasets,
+            )
+            .is_empty()
+        {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    }
+
+    async fn dataset_status(&self) -> Result<String> {
+        let url = format!(
+            "{}://127.0.0.1:{}/v1/datasets?status=true",
+            self.scheme(),
+            self.http
+        );
+        Ok(self.http_client.get(url).send().await?.text().await?)
+    }
+
+    /// SIGTERM, then SIGKILL if `spiced` has not exited within 30 seconds.
+    /// Asks `spiced` to shut down (SIGTERM) and waits for it. Fails if it does
+    /// not exit within `timeout` (it is then killed) or exits unsuccessfully,
+    /// since either is a shutdown that was not graceful.
+    pub async fn stop(&mut self, timeout: Duration) -> Result<()> {
+        let Some(child) = self.child.as_mut() else {
+            return Ok(());
+        };
+        if let Some(pid) = child.id() {
+            let _ = nix::sys::signal::kill(Pid::from_raw(pid.cast_signed()), Signal::SIGTERM);
+            crate::cleanup::untrack_process(pid);
+        }
+        let started = std::time::Instant::now();
+        let waited = tokio::time::timeout(timeout, child.wait()).await;
+        let outcome = match waited {
+            Ok(Ok(status)) if status.success() => Ok(()),
+            Ok(Ok(status)) => Err(anyhow::anyhow!(
+                "spiced exited with {status} on SIGTERM after {:.1}s; see {}",
+                started.elapsed().as_secs_f64(),
+                self.log_path().display()
+            )),
+            Ok(Err(e)) => Err(e.into()),
+            Err(_) => {
+                child.kill().await?;
+                Err(anyhow::anyhow!(
+                    "spiced did not exit within {timeout:?} of SIGTERM and was killed; see {}",
+                    self.log_path().display()
+                ))
+            }
+        };
+        self.child = None;
+        self.flight_client = None;
+        self.kill_container().await;
+        outcome
+    }
+
+    /// Kills `spiced` without letting it shut down. With `freeze_first` it is
+    /// sent SIGSTOP first, so it is frozen at one point before it dies.
+    pub async fn kill(&mut self, freeze_first: bool) -> Result<()> {
+        let Some(mut child) = self.child.take() else {
+            bail!("spiced is not running");
+        };
+        if let Some(pid) = child.id() {
+            crate::cleanup::untrack_process(pid);
+            if freeze_first {
+                nix::sys::signal::kill(Pid::from_raw(pid.cast_signed()), Signal::SIGSTOP)?;
+            }
+        }
+        self.kill_container().await;
+        child.kill().await?;
+        self.flight_client = None;
+        Ok(())
+    }
+
+    async fn flight(&mut self) -> Result<&FlightClient> {
+        if self.flight_client.is_none() {
+            let client = self.connect_flight(self.api_key.as_deref()).await?;
+            self.flight_client = Some(client);
+        }
+        self.flight_client
+            .as_ref()
+            .context("flight client was just created")
+    }
+
+    pub async fn query(&mut self, sql: &str) -> Result<Vec<RecordBatch>> {
+        let client = self.flight().await?;
+        let stream = client.query(sql).await?;
+        Ok(stream.try_collect().await?)
+    }
+
+    /// Retains the Flight stream's schema when a query returns no batches.
+    pub async fn query_with_schema(&mut self, sql: &str, key: &Key) -> Result<Vec<RecordBatch>> {
+        let client = match key {
+            Key::Default => self.flight().await?.clone(),
+            Key::None => self.connect_flight(None).await?,
+            Key::Given(key) => self.connect_flight(Some(key)).await?,
+        };
+        answer_with_schema(&client, sql).await
+    }
+
+    /// Runs an unprepared Flight SQL statement and consumes every endpoint.
+    pub async fn query_flightsql(&self, sql: &str, key: &Key) -> Result<Vec<RecordBatch>> {
+        use arrow_flight::sql::client::FlightSqlServiceClient;
+        let channel = flight_client::tls::new_tls_flight_channel(
+            &self.flight_endpoint(),
+            self.tls_ca.as_deref(),
+        )
+        .await?;
+        let mut client = FlightSqlServiceClient::new(channel);
+        let key = match key {
+            Key::Default => self.api_key.as_deref(),
+            Key::None => None,
+            Key::Given(key) => Some(key.as_str()),
+        };
+        if let Some(key) = key {
+            client.handshake("spicescript", key).await?;
+        }
+        let info = client.execute(sql.to_string(), None).await?;
+        Self::read_flightsql(&mut client, info).await
+    }
+
+    async fn read_flightsql(
+        client: &mut arrow_flight::sql::client::FlightSqlServiceClient<tonic::transport::Channel>,
+        info: arrow_flight::FlightInfo,
+    ) -> Result<Vec<RecordBatch>> {
+        let schema = Arc::new(info.clone().try_decode_schema()?);
+        let mut batches = Vec::new();
+        for endpoint in info.endpoint {
+            let ticket = endpoint
+                .ticket
+                .context("Flight SQL endpoint has no ticket")?;
+            let mut stream = client.do_get(ticket).await?;
+            while let Some(batch) = stream.try_next().await? {
+                ensure!(
+                    schema.as_ref() == batch.schema().as_ref(),
+                    "Flight SQL advertised schema {schema:?}, streamed {:?}",
+                    batch.schema()
+                );
+                batches.push(batch);
+            }
+            let streamed = stream
+                .schema()
+                .context("Flight SQL endpoint returned no schema")?;
+            ensure!(
+                schema.as_ref() == streamed.as_ref(),
+                "Flight SQL advertised schema {schema:?}, streamed {streamed:?}"
+            );
+        }
+        if batches.is_empty() {
+            batches.push(RecordBatch::new_empty(schema));
+        }
+        Ok(batches)
+    }
+
+    /// Runs a query presenting `key` on a connection of its own.
+    /// Writes `rows` (values as text, `null` for NULL) to `dataset` with a
+    /// Flight `DoPut`, each column cast to the dataset's type.
+    pub async fn flight_put(
+        &self,
+        dataset: &str,
+        rows: &[Vec<serde_json::Value>],
+        key: &Key,
+    ) -> Result<()> {
+        use arrow::array::{ArrayRef, StringArray};
+        let key = match key {
+            Key::Default => self.api_key.clone(),
+            Key::None => None,
+            Key::Given(k) => Some(k.clone()),
+        };
+        let mut client = self.connect_flight(key.as_deref()).await?;
+        let schema = client
+            .get_schema(vec![dataset.to_string()])
+            .await
+            .with_context(|| format!("Failed to read the schema of '{dataset}'"))?;
+        let mut columns: Vec<ArrayRef> = Vec::new();
+        for (i, field) in schema.fields().iter().enumerate() {
+            let texts: Vec<Option<String>> = rows
+                .iter()
+                .map(|row| match row.get(i) {
+                    None | Some(serde_json::Value::Null) => None,
+                    Some(serde_json::Value::String(s)) => Some(s.clone()),
+                    Some(other) => Some(other.to_string()),
+                })
+                .collect();
+            let raw: ArrayRef = Arc::new(StringArray::from(texts));
+            columns.push(
+                arrow::compute::cast(&raw, field.data_type()).with_context(|| {
+                    format!(
+                        "column {} does not cast to {}",
+                        field.name(),
+                        field.data_type()
+                    )
+                })?,
+            );
+        }
+        let batch = RecordBatch::try_new(Arc::new(schema), columns)?;
+        client.publish(dataset, vec![batch]).await?;
+        Ok(())
+    }
+
+    /// Runs a statement over Flight SQL `ExecuteUpdate`, returning the count
+    /// of rows it reports affected.
+    pub async fn flight_update(&self, sql: &str, key: &Key) -> Result<i64> {
+        use arrow_flight::sql::client::FlightSqlServiceClient;
+        let channel =
+            tonic::transport::Endpoint::from_shared(format!("http://127.0.0.1:{}", self.flight))?
+                .connect()
+                .await
+                .context("Failed to connect to spiced over Flight")?;
+        let mut client = FlightSqlServiceClient::new(channel);
+        let key = match key {
+            Key::Default => self.api_key.clone(),
+            Key::None => None,
+            Key::Given(k) => Some(k.clone()),
+        };
+        if let Some(key) = key {
+            client.handshake("spicescript", &key).await?;
+        }
+        Ok(client.execute_update(sql.to_string(), None).await?)
+    }
+
+    /// Runs `sql` as a Flight SQL prepared statement with `parameters` bound,
+    /// each cast to the type the server's parameter schema gives it.
+    pub async fn query_prepared(
+        &mut self,
+        sql: &str,
+        parameters: &[serde_json::Value],
+        session: Option<&str>,
+        key: &Key,
+        verify_schema: bool,
+    ) -> Result<Vec<RecordBatch>> {
+        use arrow::array::{ArrayRef, StringArray};
+        use arrow_flight::sql::client::FlightSqlServiceClient;
+        use futures::TryStreamExt;
+        let mut client = if let Some(client) = session.and_then(|s| self.sessions.get(s)) {
+            client.clone()
+        } else {
+            let channel = tonic::transport::Endpoint::from_shared(format!(
+                "http://127.0.0.1:{}",
+                self.flight
+            ))?
+            .connect()
+            .await
+            .context("Failed to connect to spiced over Flight")?;
+            let mut client = FlightSqlServiceClient::new(channel);
+            let key = match key {
+                Key::Default => self.api_key.clone(),
+                Key::None => None,
+                Key::Given(k) => Some(k.clone()),
+            };
+            if let Some(key) = key {
+                client.handshake("spicescript", &key).await?;
+            }
+            if let Some(session) = session {
+                self.sessions.insert(session.to_string(), client.clone());
+            }
+            client
+        };
+        let mut statement = client.prepare(sql.to_string(), None).await?;
+        if !parameters.is_empty() {
+            let declared = statement.parameter_schema()?.clone();
+            let mut fields = Vec::new();
+            let mut columns: Vec<ArrayRef> = Vec::new();
+            for (i, value) in parameters.iter().enumerate() {
+                let text = match value {
+                    serde_json::Value::Null => None,
+                    serde_json::Value::String(s) => Some(s.clone()),
+                    other => Some(other.to_string()),
+                };
+                // A type the server could not infer (`Null`) comes from the value.
+                let from_value = match value {
+                    serde_json::Value::Number(n) if n.is_i64() => arrow::datatypes::DataType::Int64,
+                    serde_json::Value::Number(_) => arrow::datatypes::DataType::Float64,
+                    serde_json::Value::Bool(_) => arrow::datatypes::DataType::Boolean,
+                    serde_json::Value::Null => arrow::datatypes::DataType::Null,
+                    _ => arrow::datatypes::DataType::Utf8,
+                };
+                let target = match declared.fields().get(i).map(|f| f.data_type().clone()) {
+                    Some(arrow::datatypes::DataType::Null) | None => from_value,
+                    Some(declared) => declared,
+                };
+                let column: ArrayRef = if text.is_none() {
+                    arrow::array::new_null_array(&target, 1)
+                } else {
+                    let raw: ArrayRef = Arc::new(StringArray::from(vec![text]));
+                    arrow::compute::cast(&raw, &target).with_context(|| {
+                        format!("parameter {} ({value}) does not cast to {target}", i + 1)
+                    })?
+                };
+                let name = declared
+                    .fields()
+                    .get(i)
+                    .map_or_else(|| format!("${}", i + 1), |f| f.name().clone());
+                fields.push(arrow::datatypes::Field::new(name, target, true));
+                columns.push(column);
+            }
+            let batch =
+                RecordBatch::try_new(Arc::new(arrow::datatypes::Schema::new(fields)), columns)?;
+            statement.set_parameters(batch)?;
+        }
+        let info = statement.execute().await?;
+        let batches = if verify_schema {
+            Self::read_flightsql(&mut client, info).await?
+        } else {
+            let mut batches = Vec::new();
+            for endpoint in info.endpoint {
+                let Some(ticket) = endpoint.ticket else {
+                    continue;
+                };
+                let stream = client.do_get(ticket).await?;
+                batches.extend(stream.try_collect::<Vec<_>>().await?);
+            }
+            batches
+        };
+        let _ = statement.close().await;
+        Ok(batches)
+    }
+
+    pub async fn query_as(&mut self, sql: &str, key: &Key) -> Result<Vec<RecordBatch>> {
+        let key = match key {
+            Key::Default => return self.query(sql).await,
+            Key::None => None,
+            Key::Given(k) => Some(k.as_str()),
+        };
+        let client = self.connect_flight(key).await?;
+        let stream = client.query(sql).await?;
+        Ok(stream.try_collect().await?)
+    }
+
+    /// Sends one HTTP request to the runtime; returns the status, the headers
+    /// (names lowercased) and the body.
+    pub async fn http(
+        &self,
+        method: &str,
+        path: &str,
+        headers: &[(String, String)],
+        body: Option<&str>,
+        key: &Key,
+    ) -> Result<(u16, Vec<(String, String)>, String)> {
+        let url = format!("{}://127.0.0.1:{}{path}", self.scheme(), self.http);
+        let method = reqwest::Method::from_bytes(method.as_bytes())
+            .with_context(|| format!("'{method}' is not an HTTP method"))?;
+        let mut request = match key {
+            Key::Default => self.http_client.request(method, url),
+            Key::None => self.bare_client.request(method, url),
+            Key::Given(k) => self.bare_client.request(method, url).header("x-api-key", k),
+        };
+        for (name, value) in headers {
+            request = request.header(name, value);
+        }
+        if let Some(body) = body {
+            request = request.body(body.to_string());
+        }
+        let response = request.send().await?;
+        let status = response.status().as_u16();
+        let headers = response
+            .headers()
+            .iter()
+            .map(|(k, v)| {
+                (
+                    k.as_str().to_ascii_lowercase(),
+                    String::from_utf8_lossy(v.as_bytes()).into_owned(),
+                )
+            })
+            .collect();
+        let body = response
+            .text()
+            .await
+            .context("connection lost while reading the response body")?;
+        Ok((status, headers, body))
+    }
+
+    /// Runs a statement through `/v1/sql`, which unlike a Flight ticket accepts
+    /// a `BEGIN; …; COMMIT;` transaction body. Returns the response body.
+    pub async fn exec(&self, sql: &str) -> Result<String> {
+        let url = format!("{}://127.0.0.1:{}/v1/sql", self.scheme(), self.http);
+        let response = self
+            .http_client
+            .post(url)
+            .header("Content-Type", "text/plain")
+            .body(sql.to_string())
+            .send()
+            .await?;
+        let status = response.status();
+        let body = response
+            .text()
+            .await
+            .context("connection lost while reading the response body")?;
+        if !status.is_success() {
+            bail!("{status}: {body}");
+        }
+        Ok(body)
+    }
+
+    /// Asks `spiced` to start a refresh, with `refresh_sql` in place of the
+    /// dataset's own when given; it returns before the refresh runs.
+    pub async fn refresh(&self, dataset: &str, refresh_sql: Option<&str>) -> Result<()> {
+        let url = format!(
+            "{}://127.0.0.1:{}/v1/datasets/{dataset}/acceleration/refresh",
+            self.scheme(),
+            self.http
+        );
+        let mut request = self.http_client.post(url);
+        if let Some(sql) = refresh_sql {
+            request = request.json(&serde_json::json!({ "refresh_sql": sql }));
+        }
+        let response = request.send().await?;
+        let status = response.status();
+        let body = response
+            .text()
+            .await
+            .context("connection lost while reading the response body")?;
+        if !status.is_success() {
+            bail!("refresh of '{dataset}' returned {status}: {body}");
+        }
+        Ok(())
+    }
+}
+
+/// A `spiced`'s Flight endpoint and the credentials its clients present,
+/// for clients that each open a connection of their own (a `load`).
+#[derive(Debug, Clone)]
+pub struct FlightTarget {
+    endpoint: Arc<str>,
+    api_key: Option<String>,
+    tls_ca: Option<PathBuf>,
+}
+
+impl FlightTarget {
+    /// Opens a connection of its own.
+    pub async fn connect(&self) -> Result<FlightClient> {
+        let credentials = match &self.api_key {
+            Some(key) => Credentials::new("spicescript", SecretString::from(key.clone())),
+            None => Credentials::anonymous(),
+        };
+        FlightClient::try_new(
+            Arc::clone(&self.endpoint),
+            credentials,
+            None,
+            self.tls_ca.as_deref(),
+        )
+        .await
+        .context("Failed to connect to spiced over Flight")
+    }
+}
+
+/// The answer to `sql`, keeping the stream's schema in an empty batch when
+/// Flight sends no batch at all.
+pub async fn answer_with_schema(client: &FlightClient, sql: &str) -> Result<Vec<RecordBatch>> {
+    let mut stream = client.query(sql).await?;
+    let mut batches = Vec::new();
+    while let Some(batch) = stream.try_next().await? {
+        batches.push(batch);
+    }
+    if batches.is_empty() {
+        let schema = stream.schema().context("Flight returned no schema")?;
+        batches.push(RecordBatch::new_empty(Arc::clone(schema)));
+    }
+    Ok(batches)
+}
+
+impl Drop for Spiced {
+    /// Dropping the `docker run` process leaves its container running, so a
+    /// container instance dropped without being stopped is removed here,
+    /// unless `--keep`.
+    fn drop(&mut self) {
+        if let Some(run) = &self.container {
+            crate::cleanup::remove_if_tracked(&run.name);
+        }
+    }
+}
+
+/// Writes an empty `.env` and `.env.local` into `dir` unless it has them.
+/// `spiced` reads each name from its working directory or the nearest ancestor
+/// that has it, so a variable kept out of its environment would come back from
+/// a file above the run directory, such as a checkout's `.env`. Variables a
+/// script sets reach it through its environment, as before.
+fn shadow_dotenv_files(dir: &Path) -> Result<()> {
+    for name in [".env", ".env.local"] {
+        let path = dir.join(name);
+        if !path.exists() {
+            std::fs::write(&path, "")
+                .with_context(|| format!("Failed to write {}", path.display()))?;
+        }
+    }
+    Ok(())
+}
+
+/// The names of the datasets a spicepod declares.
+fn declared_datasets(spicepod_yaml: &str) -> Vec<String> {
+    let Ok(spicepod) = yaml::from_str::<serde_json::Value>(spicepod_yaml) else {
+        return Vec::new();
+    };
+    spicepod
+        .get("datasets")
+        .and_then(serde_json::Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|d| d.get("name").and_then(serde_json::Value::as_str))
+        .map(str::to_string)
+        .collect()
+}
+
+/// The datasets of `declared` that `/v1/datasets?status=true` (its body,
+/// `text`) does not list yet, then those it reports as not loaded:
+/// `Initializing` or `NotLoaded`.
+fn not_yet_loaded(text: &str, declared: &[String]) -> Vec<String> {
+    let list = match serde_json::from_str::<serde_json::Value>(text) {
+        Ok(serde_json::Value::Array(list)) => list,
+        _ => Vec::new(),
+    };
+    let listed: std::collections::BTreeSet<&str> = list
+        .iter()
+        .filter_map(|d| d.get("name").and_then(serde_json::Value::as_str))
+        .collect();
+    let missing = declared
+        .iter()
+        .filter(|name| !listed.contains(name.as_str()))
+        .cloned();
+    let loading = list
+        .iter()
+        .filter(|d| {
+            matches!(
+                d.get("status").and_then(serde_json::Value::as_str),
+                Some("Initializing" | "NotLoaded")
+            )
+        })
+        .filter_map(|d| d.get("name").and_then(serde_json::Value::as_str))
+        .map(str::to_string);
+    missing.chain(loading).collect()
+}
+
+#[cfg(test)]
+mod not_yet_loaded_tests {
+    use super::{declared_datasets, not_yet_loaded};
+
+    #[test]
+    fn names_the_declared_datasets_not_listed_or_loaded_yet() {
+        let declared = declared_datasets(
+            "version: v1\nkind: Spicepod\nname: p\ndatasets:\n  - from: postgres:a\n    name: a\n  - from: postgres:u\n    name: u\n  - { from: 'postgres:b', name: b }\n",
+        );
+        assert_eq!(declared, ["a", "u", "b"]);
+        let text = r#"[
+            {"name": "a", "status": "Ready"},
+            {"name": "b", "status": "Initializing"},
+            {"name": "c", "status": "Error", "error_message": "x"},
+            {"name": "d", "status": "NotLoaded"},
+            {"name": "e", "status": "Refreshing"}
+        ]"#;
+        assert_eq!(not_yet_loaded(text, &declared), ["u", "b", "d"]);
+        // Nothing listed yet: every declared dataset is missing.
+        assert_eq!(not_yet_loaded("[]", &declared), ["a", "u", "b"]);
+        assert!(not_yet_loaded("[]", &[]).is_empty());
+        assert!(declared_datasets("not: [yaml").is_empty());
+    }
+}
+
+#[cfg(test)]
+mod container_user_tests {
+    use super::container_user;
+
+    // A non-root owner, so the two answers differ: with a root-owned
+    // directory both would be `0:0` and a lost rootless branch would pass.
+    const UID: u32 = 1001;
+    const GID: u32 = 121;
+
+    #[test]
+    fn rootful_runs_as_the_directory_owner() {
+        assert_eq!(container_user(false, UID, GID), "1001:121");
+    }
+
+    #[test]
+    fn rootless_runs_as_the_daemon_user_not_the_directory_owner() {
+        assert_eq!(container_user(true, UID, GID), "0:0");
+    }
+}
+
+#[cfg(test)]
+mod http_listen_tests {
+    use super::{http_listen, serves_http_on};
+
+    #[test]
+    fn listens_on_loopback_unless_asked_for_every_interface() {
+        assert_eq!(http_listen(false, 29141), "127.0.0.1:29141");
+        assert_eq!(http_listen(true, 29141), "0.0.0.0:29141");
+    }
+
+    #[test]
+    fn recognizes_its_spiced_on_either_address_and_nothing_else() {
+        let loopback =
+            "spiced --telemetry-enabled=false --http 127.0.0.1:29141 --flight 127.0.0.1:29142";
+        let every =
+            "spiced --telemetry-enabled=false --http 0.0.0.0:29141 --flight 127.0.0.1:29142";
+        assert!(serves_http_on(loopback, 29141));
+        assert!(serves_http_on(every, "29141"));
+        // Another port, another host, or the port given to another flag.
+        assert!(!serves_http_on(loopback, 29143));
+        // A port that is only a prefix of the one served.
+        assert!(!serves_http_on(loopback, 2914));
+        assert!(!serves_http_on("spiced --http 10.0.0.5:29141", 29141));
+        assert!(!serves_http_on(
+            "spiced --http 127.0.0.1:1 --flight 127.0.0.1:29142",
+            29142
+        ));
+    }
+}

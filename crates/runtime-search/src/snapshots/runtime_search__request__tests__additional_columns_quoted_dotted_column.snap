@@ -1,0 +1,5 @@
+---
+source: crates/runtime-search/src/request.rs
+expression: "run_parse_additional_columns(&[\"\\\"quoted.with_dot\\\"\"]).as_str()"
+---
+[Column { relation: None, name: "quoted.with_dot" }]

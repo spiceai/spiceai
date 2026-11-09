@@ -19,13 +19,15 @@ use std::{collections::HashMap, sync::Arc, time::Duration};
 use super::{
     CheckAvailability, Dataset, Error, InvalidColumnTypeSnafu, InvalidConfigurationSnafu,
     OnSchemaChange, ReadyState, Result, TimeFormat, UnsupportedTypeAction, acceleration,
-    declared_schema, replication, validate_identifier,
+    declared_schema, replication, snapshot_source::SnapshotSource, validate_identifier,
 };
 use crate::Runtime;
 use crate::component::access::AccessMode;
 use app::App;
-use datafusion::sql::TableReference;
-use runtime_acceleration::snapshot::SnapshotBehavior;
+use datafusion::common::TableReference;
+use runtime_acceleration::snapshot::{
+    SNAPSHOTS_ENTERPRISE_ONLY_MESSAGE, SnapshotBehavior, snapshots_enabled,
+};
 use snafu::prelude::*;
 use spicepod::{
     acceleration as spicepod_acceleration,
@@ -54,8 +56,8 @@ pub struct DatasetBuilder {
     pub time_partition_column: Option<String>,
     pub time_partition_format: Option<TimeFormat>,
     pub acceleration: Option<acceleration::Acceleration>,
-    pub acceleration_snapshot_behavior: spicepod_acceleration::SnapshotBehavior,
-    pub acceleration_snapshot_compaction: spicepod_acceleration::SnapshotsCompaction,
+    /// The acceleration as written in the spicepod, for its snapshot settings.
+    pub acceleration_spec: Option<spicepod_acceleration::Acceleration>,
     pub embeddings: Vec<ColumnEmbeddingConfig>,
     pub app: Option<Arc<App>>,
     pub unsupported_type_action: Option<UnsupportedTypeAction>,
@@ -68,44 +70,62 @@ pub struct DatasetBuilder {
     pub drasi: Option<spicepod::drasi::Drasi>,
     pub check_availability: CheckAvailability,
     pub check_availability_interval: Option<Duration>,
+    /// Set when the dataset reads acceleration snapshots (`file_format: snapshot`). Its
+    /// acceleration is built from this once the snapshots' engine is known.
+    pub(crate) snapshot_source: Option<SnapshotSource>,
 }
 
 impl TryFrom<spicepod_dataset::Dataset> for DatasetBuilder {
     type Error = crate::Error;
 
-    fn try_from(dataset: spicepod_dataset::Dataset) -> std::result::Result<Self, Self::Error> {
+    fn try_from(mut dataset: spicepod_dataset::Dataset) -> std::result::Result<Self, Self::Error> {
+        crate::opentelemetry_logs::apply_dataset_defaults(&mut dataset);
+
+        // Honoured here; the deprecation is reported by the load path
+        // (`init::dataset::warn_about_acceleration_block`), not from this conversion, which
+        // read-only callers run too.
         #[expect(deprecated)]
         let ready_state = match dataset.acceleration.as_ref().map(|a| a.ready_state) {
-            Some(Some(ready_state)) => {
-                tracing::warn!(
-                    "{}: `dataset.acceleration.ready_state` is deprecated, use `dataset.ready_state` instead.",
-                    dataset.name
-                );
-                ReadyState::from(ready_state)
-            }
+            Some(Some(ready_state)) => ReadyState::from(ready_state),
             _ => ReadyState::from(dataset.ready_state),
         };
 
-        let acceleration_snapshot_behavior = dataset
-            .acceleration
-            .as_ref()
-            .map_or(spicepod_acceleration::SnapshotBehavior::Disabled, |a| {
-                a.snapshots
-            });
-
-        let acceleration_snapshot_compaction = dataset
-            .acceleration
-            .as_ref()
-            .map_or(spicepod_acceleration::SnapshotsCompaction::Disabled, |a| {
-                a.snapshots_compaction
-            });
+        let acceleration_spec = dataset.acceleration.clone();
 
         let metadata = dataset.metadata();
 
-        let acceleration = dataset
-            .acceleration
-            .map(acceleration::Acceleration::try_from)
-            .transpose()?;
+        let snapshot_source =
+            SnapshotSource::from_spicepod(&dataset).context(crate::InvalidSpicepodDatasetSnafu)?;
+
+        // A snapshot dataset's acceleration block is completed only once the engine that
+        // created its snapshots is known; see `build`.
+        let acceleration = if snapshot_source.is_some() {
+            None
+        } else {
+            let name = &dataset.name;
+            dataset
+                .acceleration
+                .map(acceleration::Acceleration::try_from)
+                .transpose()
+                .map_err(|err| match err {
+                    runtime_acceleration::AccelerationParseError::AcceleratorEngineRemoved {
+                        name: engine,
+                    } => crate::Error::AcceleratedDatasetEngineRemoved {
+                        dataset: name.clone(),
+                        engine,
+                    },
+                    err => err.into(),
+                })?
+        };
+
+        if runtime_component::vector_engine::uses_removed_vector_engine(
+            dataset.vectors.as_ref(),
+            &dataset.columns,
+        ) {
+            return Err(crate::Error::DatasetVectorEngineRemoved {
+                dataset: dataset.name,
+            });
+        }
 
         validate_identifier(&dataset.name).context(crate::ComponentSnafu)?;
 
@@ -172,8 +192,7 @@ impl TryFrom<spicepod_dataset::Dataset> for DatasetBuilder {
             time_partition_format: dataset.time_partition_format.map(TimeFormat::from),
             embeddings: dataset.embeddings,
             acceleration,
-            acceleration_snapshot_behavior,
-            acceleration_snapshot_compaction,
+            acceleration_spec,
             app: None,
             unsupported_type_action: dataset
                 .unsupported_type_action
@@ -187,12 +206,12 @@ impl TryFrom<spicepod_dataset::Dataset> for DatasetBuilder {
             drasi: dataset.drasi,
             check_availability: CheckAvailability::from(dataset.check_availability),
             check_availability_interval,
+            snapshot_source,
         })
     }
 }
 
 impl DatasetBuilder {
-    #[expect(clippy::result_large_err)]
     pub fn try_new(from: String, name: &str) -> std::result::Result<Self, crate::Error> {
         Ok(DatasetBuilder {
             from,
@@ -208,8 +227,7 @@ impl DatasetBuilder {
             time_partition_column: None,
             time_partition_format: None,
             acceleration: None,
-            acceleration_snapshot_behavior: spicepod_acceleration::SnapshotBehavior::Disabled,
-            acceleration_snapshot_compaction: spicepod_acceleration::SnapshotsCompaction::Disabled,
+            acceleration_spec: None,
             embeddings: Vec::default(),
             app: None,
             unsupported_type_action: None,
@@ -222,10 +240,10 @@ impl DatasetBuilder {
             drasi: None,
             check_availability: CheckAvailability::default(),
             check_availability_interval: None,
+            snapshot_source: None,
         })
     }
 
-    #[expect(clippy::result_large_err)]
     pub(crate) fn parse_table_reference(
         name: &str,
     ) -> std::result::Result<TableReference, crate::Error> {
@@ -287,13 +305,40 @@ impl DatasetBuilder {
             missing_component: "runtime".to_string(),
         })?;
 
-        if let Some(acceleration) = self.acceleration.as_mut() {
+        if let Some(source) = self.snapshot_source.take() {
+            ensure!(
+                snapshots_enabled(),
+                InvalidConfigurationSnafu {
+                    config_key: "params.file_format",
+                    message: format!(
+                        "Dataset '{}' reads acceleration snapshots (`file_format: snapshot`), which this build of Spice does not include. {SNAPSHOTS_ENTERPRISE_ONLY_MESSAGE}",
+                        self.name
+                    ),
+                }
+            );
+            // Until its snapshots have been described the dataset has no acceleration: it
+            // is pending, and loading it resolves the engine (`resolve_snapshot_source`).
+            if let Some(engine) = runtime
+                .snapshot_sources()
+                .engine(&self.name, source.location())
+            {
+                let mut acceleration =
+                    acceleration::Acceleration::try_from(source.acceleration(&self.name, engine)?)?;
+                acceleration.snapshot_behavior = SnapshotBehavior::bootstrap_only(
+                    Arc::new(source.snapshots(&self.params)),
+                    runtime.secrets_weak(),
+                    runtime.tokio_io_runtime(),
+                );
+                self.acceleration = Some(acceleration);
+            }
+        } else if let Some(acceleration) = self.acceleration.as_mut() {
+            let spec = self.acceleration_spec.unwrap_or_default();
             acceleration.snapshot_behavior = SnapshotBehavior::from(
-                app.snapshots.clone(),
-                self.acceleration_snapshot_behavior,
+                Some(app.dataset_snapshots(&spec)),
+                spec.snapshots,
                 runtime.secrets_weak(),
                 runtime.tokio_io_runtime(),
-                self.acceleration_snapshot_compaction,
+                spec.snapshots_compaction,
             );
         }
 

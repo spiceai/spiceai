@@ -1,17 +1,38 @@
 name: Setup CH-benCH MySQL
 description: 'Starts a MySQL container configured for CH-benCH benchmarking (binlog CDC)'
 
+inputs:
+  version:
+    description: >-
+      MySQL release line to start; one of the `mysql` LTS versions in
+      test/source_versions.json.
+    required: false
+    default: '8.4'
+
 runs:
   using: 'composite'
   steps:
+    - name: Check the MySQL version is supported
+      shell: bash
+      env:
+        VERSION: ${{ inputs.version }}
+      run: |
+        if ! jq -e --arg v "${VERSION}" '.mysql.versions | map(.version) | index($v)' test/source_versions.json > /dev/null; then
+          echo "::error::MySQL ${VERSION} is not a supported version; use one of: $(jq -r '[.mysql.versions[].version] | join(", ")' test/source_versions.json)"
+          exit 1
+        fi
+
     - name: Start MySQL for CH-benCH
       shell: bash
+      env:
+        IMAGE: mysql:${{ inputs.version }}
       run: |
-        # MySQL 8.0 defaults already satisfy the CDC connector (log_bin=ON,
+        # The MySQL defaults already satisfy the CDC connector (log_bin=ON,
         # binlog_format=ROW, binlog_row_image=FULL); set them explicitly for
-        # clarity. mysql_native_password lets the connector authenticate over
-        # plaintext, and log_bin_trust_function_creators lets the non-SUPER
-        # `bench` user create the `_bench_ts` triggers during seed.
+        # clarity. The connector and the CH-benCH driver authenticate with the
+        # default `caching_sha2_password` plugin over plaintext, and
+        # log_bin_trust_function_creators lets the non-SUPER `bench` user create
+        # the `_bench_ts` triggers during seed.
         # innodb_use_native_aio=0 disables Linux native async I/O: on shared CI
         # runners the host-wide fs.aio-max-nr budget is often exhausted by other
         # containers, so io_setup() returns EAGAIN and InnoDB aborts on startup
@@ -32,8 +53,7 @@ runs:
           -e MYSQL_ROOT_PASSWORD=rootpw -e MYSQL_DATABASE=chbench \
           -e MYSQL_USER=bench -e MYSQL_PASSWORD=bench \
           -p 3306:3306 \
-          mysql:8.0 \
-          --default-authentication-plugin=mysql_native_password \
+          "${IMAGE}" \
           --log-bin-trust-function-creators=1 \
           --binlog-format=ROW \
           --binlog-row-image=FULL \
@@ -58,8 +78,11 @@ runs:
         # snapshots the seeded tables on startup, so seed rows need not be in the
         # binlog). The loader falls back gracefully if this privilege is absent
         # (e.g. on the in-cluster pod, which should grant it too for the speedup).
+        # Over TCP, as the CH-benCH clients connect: the image's entrypoint first
+        # runs a temporary server on the Unix socket only, and stops it before
+        # starting the real one.
         for _ in {1..60}; do
-          if docker exec chbench-mysql mysql -uroot -prootpw -e 'SELECT 1' > /dev/null 2>&1; then
+          if docker exec chbench-mysql mysql -h 127.0.0.1 -P 3306 -uroot -prootpw -e 'SELECT 1' > /dev/null 2>&1; then
             echo "MySQL is ready"
             docker exec chbench-mysql mysql -uroot -prootpw -e \
               "GRANT REPLICATION SLAVE, REPLICATION CLIENT, SESSION_VARIABLES_ADMIN ON *.* TO 'bench'@'%'; FLUSH PRIVILEGES;"

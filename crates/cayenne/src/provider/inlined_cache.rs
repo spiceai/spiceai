@@ -21,6 +21,7 @@ limitations under the License.
 
 use crate::metadata::InlinedData;
 use arrow::record_batch::RecordBatch;
+use arrow_tools::batch_bytes::RetainedBytes;
 use datafusion_common::Statistics;
 use std::sync::Arc;
 
@@ -30,15 +31,26 @@ use std::sync::Arc;
 /// without a second metastore round-trip) with the pre-decoded,
 /// deletion-filtered `RecordBatch`es for that entry.
 ///
-/// `Clone` is cheap: the envelope is small metadata and each `RecordBatch`
-/// shares its Arrow buffers via `Arc`. The append-only inline-cache delta path
-/// clones the base view's entries (structural sharing of the buffers) before
-/// appending the newly decoded entries.
+/// Stored in [`InlinedCache::view`] as `Arc<InlinedViewEntry>`, not by value:
+/// `batches: Vec<RecordBatch>` is a real per-entry allocation (one `Vec` plus
+/// one `RecordBatch` clone per element), so cloning an *entry* is not free the
+/// way cloning one already-Arc'd `RecordBatch` is. The append-only inline-cache
+/// delta path (`CayenneTableProvider::extend_inlined_cache_delta`) extends the
+/// base view on every scan that observes a new write, so entry-level `Clone`
+/// cost is paid once per entry per scan — sharing entries via `Arc` turns that
+/// into a refcount bump instead.
 #[derive(Clone)]
 pub(crate) struct InlinedViewEntry {
     /// Original metastore envelope; provides `inlined_id`, `sequence_number`,
     /// and other fields required to reconstruct a rewrite.
-    pub(crate) envelope: InlinedData,
+    ///
+    /// `Arc<InlinedData>`, not by value: the envelope carries the entry's
+    /// serialized IPC payload, and the scan path clones an entry per visible
+    /// entry per scan (`CayenneTableProvider::pruned_inlined_batches_with_removal`
+    /// and `apply_tombstone_removal_to_entry`), so an envelope clone is a
+    /// refcount bump instead of a copy of that payload. The metastore keeps its
+    /// owned `Vec<u8>` representation; the `Arc` is added here, on cache entry.
+    pub(crate) envelope: Arc<InlinedData>,
     /// Batches already decoded from IPC and filtered through the deletion map.
     /// Empty when all rows in this entry were removed by the deletion filter.
     pub(crate) batches: Vec<RecordBatch>,
@@ -107,7 +119,13 @@ pub(crate) struct InlinedCache {
     pub(crate) batches: Arc<Vec<RecordBatch>>,
     /// Per-entry view used by the upsert-rewrite path to avoid a second
     /// metastore round-trip and re-decode.
-    pub(crate) view: Arc<Vec<InlinedViewEntry>>,
+    ///
+    /// `Arc<InlinedViewEntry>` per element, not by value: extending this cache
+    /// with new entries (`CayenneTableProvider::extend_inlined_cache_delta`)
+    /// clones the outer `Vec`, and an element clone that is itself a refcount
+    /// bump is what keeps that an O(entries)-pointers operation instead of
+    /// O(entries)-allocations.
+    pub(crate) view: Arc<Vec<Arc<InlinedViewEntry>>>,
 }
 
 /// Outcome of a durable inlined-data commit that has not yet been published to the in-memory caches.
@@ -123,4 +141,151 @@ pub(crate) struct InlinedDurableCommit {
     /// advances `published_inlined_seq` to this value to make the appended rows
     /// visible.
     pub(crate) published_seq: Option<i64>,
+}
+
+/// Resident Arrow bytes of `batches`, counting each physical allocation once.
+///
+/// [`RecordBatch::get_array_memory_size`] cannot be used for this: the batches
+/// in this cache come out of the IPC reader, which points every buffer of an
+/// entry at one body allocation, and that sum bills the allocation once per
+/// buffer. On a table whose entries carry 19 buffers it reported 554 MB for a
+/// cache holding 28.7 MB. See [`RetainedBytes`] for the dedupe.
+///
+/// Counts buffer capacity only. The Arrow bookkeeping structs are a real cost —
+/// on a cache of one-row batches they rival the values themselves — and the
+/// mem-tier limit counts them, but they are an estimate rather than a
+/// measurement, and a gauge that was disbelieved for over-reporting does not get
+/// to carry one. `cayenne_inline_cache_batches` beside it is what that cost
+/// tracks: bytes far below what the batch count implies is a cache paying per
+/// batch rather than per row.
+pub(crate) fn resident_bytes(batches: &[RecordBatch]) -> usize {
+    let mut bytes = RetainedBytes::new();
+    for batch in batches {
+        bytes.add(batch);
+    }
+    bytes.buffer_bytes()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use arrow::array::{Int64Array, StringArray};
+    use arrow::datatypes::{DataType, Field, Schema};
+
+    /// Two columns and eight rows: enough buffers that a per-reference sum and a
+    /// per-allocation sum are far apart, small enough to reason about by hand.
+    fn fixture() -> RecordBatch {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("name", DataType::Utf8, false),
+        ]));
+        let ids: Vec<i64> = (0..8).collect();
+        let names: Vec<String> = ids.iter().map(|id| format!("name-{id}")).collect();
+        RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(Int64Array::from(ids)),
+                Arc::new(StringArray::from(names)),
+            ],
+        )
+        .expect("the fixture batch should build")
+    }
+
+    fn per_reference_sum(batches: &[RecordBatch]) -> usize {
+        batches
+            .iter()
+            .map(RecordBatch::get_array_memory_size)
+            .fold(0, usize::saturating_add)
+    }
+
+    /// The cache's own shape: one row group per metastore entry, decoded from
+    /// IPC, so every column and child buffer is a slice of the one allocation
+    /// the message body was read into.
+    ///
+    /// The bound is the serialized stream itself — the body allocation cannot
+    /// exceed the bytes it was read from — which is external to how the size is
+    /// computed. `get_array_memory_size` is ~3x past it on this two-column
+    /// fixture and ~19x on a real table's schema.
+    #[test]
+    fn an_ipc_decoded_batch_cannot_exceed_the_bytes_it_was_decoded_from() {
+        let batch = fixture();
+        let mut ipc = Vec::new();
+        {
+            let mut writer = arrow::ipc::writer::StreamWriter::try_new(&mut ipc, &batch.schema())
+                .expect("the IPC writer should build");
+            writer.write(&batch).expect("the batch should serialize");
+            writer.finish().expect("the stream should finish");
+        }
+
+        let decoded: Vec<RecordBatch> =
+            arrow::ipc::reader::StreamReader::try_new(std::io::Cursor::new(&ipc), None)
+                .expect("the IPC reader should build")
+                .collect::<Result<_, _>>()
+                .expect("the stream should decode");
+
+        let reported = resident_bytes(&decoded);
+        assert!(
+            reported <= ipc.len(),
+            "the decoded batch is reported at {reported} B, more than the {} B of IPC it was \
+             decoded from — the reader gave every buffer a slice of one body allocation, so the \
+             sum is billing that allocation once per buffer",
+            ipc.len()
+        );
+        assert!(
+            per_reference_sum(&decoded) > reported,
+            "the fixture no longer shares an allocation across its buffers, so this test has \
+             stopped covering the over-report it exists for"
+        );
+    }
+
+    /// Many one-row batches sliced from one parent — what the scan path leaves
+    /// in the cache — hold exactly the parent's allocations and nothing more.
+    #[test]
+    fn slices_of_one_batch_are_counted_once_across_all_of_them() {
+        let parent = fixture();
+        let slices: Vec<RecordBatch> = (0..parent.num_rows())
+            .map(|row| parent.slice(row, 1))
+            .collect();
+
+        let parent_bytes = resident_bytes(std::slice::from_ref(&parent));
+        let slice_bytes = resident_bytes(&slices);
+        assert_eq!(
+            slice_bytes,
+            parent_bytes,
+            "{} slices of one batch are reported at {slice_bytes} B against the parent's \
+             {parent_bytes} B; they share the parent's allocations and add none of their own",
+            slices.len()
+        );
+        assert!(
+            per_reference_sum(&slices) >= parent_bytes * slices.len(),
+            "the per-reference sum should bill the parent once per slice, which is the \
+             over-report this counts each allocation once to avoid"
+        );
+    }
+
+    /// Nothing is shared here, so the count must not fall below the payload the
+    /// batch demonstrably holds — a dedupe that over-matched would under-report
+    /// and be just as wrong in the other direction.
+    #[test]
+    fn independently_allocated_columns_are_all_counted() {
+        let batch = fixture();
+        let reported = resident_bytes(std::slice::from_ref(&batch));
+
+        // 8 i64 values, plus 9 i32 offsets, plus the "name-N" bytes.
+        let payload = 8 * 8 + 9 * 4 + 8 * "name-0".len();
+        assert!(
+            reported >= payload,
+            "an unshared batch holding at least {payload} B of values is reported at \
+             {reported} B"
+        );
+        assert!(
+            reported <= per_reference_sum(std::slice::from_ref(&batch)),
+            "counting each allocation once must never exceed the per-reference sum"
+        );
+    }
+
+    #[test]
+    fn an_empty_cache_is_zero() {
+        assert_eq!(resident_bytes(&[]), 0);
+    }
 }

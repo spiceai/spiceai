@@ -38,9 +38,15 @@ use runtime_parameters::ParameterSpec;
 use crate::accelerated::{AcceleratorSetup, RegisteredAcceleratedTable};
 use crate::federated::FederatedTableProvider;
 use crate::parameters::{ConnectorContext, ConnectorParams};
+use crate::write_back::WriteBackDeliverer;
 use crate::{AnyErrorResult, DataConnectorResult};
 
 pub type NewDataConnectorResult = AnyErrorResult<Arc<dyn DataConnector>>;
+
+/// Request timeout of the client [`default_spice_client`] builds. Connectors
+/// that use that client derive rate-control defaults from it, the same way the
+/// HTTPS connector derives them from its `client_timeout` parameter.
+pub const DEFAULT_SPICE_CLIENT_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Creates a default reqwest client with standard Spice settings.
 ///
@@ -56,7 +62,7 @@ pub fn default_spice_client(content_type: &'static str) -> reqwest::Result<reqwe
     reqwest::Client::builder()
         .user_agent(util::spiceai_user_agent())
         .connect_timeout(Duration::from_secs(10))
-        .timeout(Duration::from_secs(30))
+        .timeout(DEFAULT_SPICE_CLIENT_TIMEOUT)
         .default_headers(headers)
         .build()
 }
@@ -254,6 +260,18 @@ pub trait DataConnector: Debug + Send + Sync + 'static {
         false
     }
 
+    /// Whether a cluster executor can keep an acceleration refreshed by this
+    /// connector's change stream to the partitions it serves.
+    ///
+    /// That takes a change stream that applies by primary key and resumes after
+    /// a replacement of the acceleration by a full read of the federated table,
+    /// which must read the source's current rows; and one that rebuilds from
+    /// the source an acceleration reported as [`AccelerationContents::Unknown`].
+    /// Without it, every executor applies every change.
+    fn supports_partitioned_changes(&self) -> bool {
+        false
+    }
+
     /// The CDC stream for `dataset`, if this connector produces one.
     ///
     /// `async` so that anything the stream needs from `context` — a checkpoint
@@ -319,6 +337,39 @@ pub trait DataConnector: Debug + Send + Sync + 'static {
     /// perfectly safe inner connector as unsafe and reject a valid dataset.
     fn supports_durable_write_back_delivery(&self) -> bool {
         false
+    }
+
+    /// A connector-owned durable write-back deliverer for `dataset`, or `None`
+    /// to keep the worker's `TableProvider`-driven delivery.
+    ///
+    /// A connector returns `Some` when it must own the transaction each delivery
+    /// runs in — `PostgreSQL` stamps every delivery transaction with its id so
+    /// the CDC pump can drop the echo it will later stream back, which it cannot
+    /// do from behind the `TableProvider`. See [`WriteBackDeliverer`].
+    ///
+    /// `None` means "this connector never delivers through a connector-owned
+    /// transaction for this dataset" (the common case: every dataset that does
+    /// not need echo suppression). `Some(Err(_))` means "this dataset needs one
+    /// but it could not be set up" — the caller fails dataset setup rather than
+    /// silently falling back to the `TableProvider` path, which for a durable
+    /// write-back `PostgreSQL` dataset would commit writes without registering
+    /// their xids and reopen the double-apply window this exists to close.
+    ///
+    /// Defaults to `None`: the worker drives delivery through the source's
+    /// `TableProvider` exactly as before, so a connector that does not override
+    /// this is unaffected.
+    ///
+    /// **Wrappers must forward this.** Inheriting the default would report a
+    /// connector that owns its delivery as if it did not, silently dropping back
+    /// to the `TableProvider` path and, for `PostgreSQL`, never capturing the
+    /// transaction id the echo filter needs — the defaulted-no-op wrapper bug
+    /// (#10460) applied to this capability.
+    async fn write_back_deliverer(
+        &self,
+        _context: &dyn ConnectorContext,
+        _dataset: &DatasetSpec,
+    ) -> Option<DataConnectorResult<Arc<dyn WriteBackDeliverer>>> {
+        None
     }
 
     async fn metadata_provider(

@@ -88,6 +88,24 @@ pub fn pick_txn_type(rng: &mut impl Rng, mix: &[u32; 5]) -> TxnType {
     TxnType::NewOrder
 }
 
+/// Puts a `NewOrder`'s lines in the order its transaction locks their `stock` rows: by supply
+/// warehouse, then item.
+///
+/// Lines are generated in random item order, and two orders that share `stock` rows and lock
+/// them in opposite orders deadlock: the database aborts one of them, and the run records a
+/// source error. Locked in one global order, they cannot deadlock on those rows. The rollback
+/// line (an unused item, `ol_i_id < 0`) stays last, where TPC-C puts it, so a rolled-back order
+/// still locks every other line first.
+///
+/// Each line is `(ol_i_id, ol_supply_w_id, ol_quantity, remote)`.
+pub fn sort_lines_in_lock_order(lines: &mut [(i32, i32, i32, i32)]) {
+    let ordered = match lines.last() {
+        Some(&(ol_i_id, ..)) if ol_i_id < 0 => lines.len() - 1,
+        _ => lines.len(),
+    };
+    lines[..ordered].sort_by_key(|&(ol_i_id, ol_supply_w_id, ..)| (ol_supply_w_id, ol_i_id));
+}
+
 /// Per-terminal warehouse/district assignment to reduce contention.
 ///
 /// Each terminal "owns" a home warehouse and a slice of districts within it.
@@ -169,5 +187,36 @@ pub async fn execute(
         TxnType::Delivery => delivery::run(client, rng, assignment.num_warehouses).await,
         TxnType::OrderStatus => order_status::run(client, rng, assignment.num_warehouses).await,
         TxnType::StockLevel => stock_level::run(client, rng, assignment.num_warehouses).await,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::sort_lines_in_lock_order;
+
+    #[test]
+    fn new_order_lines_lock_stock_by_warehouse_then_item_with_the_rollback_line_last() {
+        let mut lines = vec![
+            (70, 1, 5, 0),
+            (3, 2, 1, 1),
+            (40, 1, 2, 0),
+            (3, 1, 7, 0),
+            (-1, 1, 3, 0),
+        ];
+        sort_lines_in_lock_order(&mut lines);
+        assert_eq!(
+            lines,
+            vec![
+                (3, 1, 7, 0),
+                (40, 1, 2, 0),
+                (70, 1, 5, 0),
+                (3, 2, 1, 1),
+                (-1, 1, 3, 0),
+            ]
+        );
+
+        let mut committed = vec![(9, 1, 1, 0), (2, 1, 4, 0), (9, 1, 2, 0)];
+        sort_lines_in_lock_order(&mut committed);
+        assert_eq!(committed, vec![(2, 1, 4, 0), (9, 1, 1, 0), (9, 1, 2, 0)]);
     }
 }

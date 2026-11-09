@@ -439,13 +439,33 @@ mod tests {
 
     #[test]
     fn index_name_length_restricted() {
-        let index_name = "a".repeat(INDEX_NAME_MAX_LENGTH + 1);
         let column_name = "col1";
         let partition_value = ScalarValue::from("val");
         let partition_by = vec![col("col1")];
 
-        PartitionedIndexName::new(&index_name, column_name, &partition_by, &partition_value)
-            .expect_err("Should error on long index name");
+        // 45 characters is the limit: the remaining 18 of the 63 S3 Vectors
+        // allows go to the three hashes and their separators.
+        let too_long = "a".repeat(46);
+        let err =
+            PartitionedIndexName::new(&too_long, column_name, &partition_by, &partition_value)
+                .expect_err("Should error on long index name");
+        assert!(
+            matches!(&err, Error::InvalidIndexNameLength { index, len: 46 } if *index == too_long),
+            "unexpected error: {err:?}"
+        );
+        assert_eq!(
+            err.to_string(),
+            format!(
+                "Index names are restricted to 45 characters when using 'partition_by', but {too_long} is 46 characters"
+            )
+        );
+
+        // A name of exactly the limit is accepted and kept whole.
+        let at_limit = "a".repeat(45);
+        let name =
+            PartitionedIndexName::new(&at_limit, column_name, &partition_by, &partition_value)
+                .expect("a 45-character index name must be accepted");
+        assert_eq!(name.index_name, at_limit);
     }
 
     #[test]

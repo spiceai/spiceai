@@ -24,7 +24,7 @@ use std::sync::{Arc, Weak};
 use app::App;
 use arrow::array::{RecordBatch, StringArray};
 use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
-use datafusion::common::TableReference;
+use datafusion::common::{DFSchema, ScalarValue, TableReference};
 use datafusion::error::{DataFusionError, Result as DFResult};
 use datafusion::execution::TaskContext;
 use datafusion::physical_expr::{EquivalenceProperties, Partitioning};
@@ -33,6 +33,8 @@ use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use datafusion::physical_plan::{DisplayAs, DisplayFormatType, ExecutionPlan, PlanProperties};
 use iceberg::{Catalog, NamespaceIdent, TableCreation, TableIdent};
 use iceberg_datafusion::IcebergTableProvider;
+use runtime_cluster::PartitionValue;
+use runtime_cluster::write_through::partition_value_sql;
 use spicepod::acceleration::Acceleration;
 
 use super::acceleration_options::DatasetOptions;
@@ -44,6 +46,7 @@ use datafusion::catalog::CatalogProviderList;
 
 use crate::component::dataset::acceleration::{Acceleration as RuntimeAcceleration, Mode};
 use crate::dataaccelerator::AccelerationSource;
+use runtime_acceleration::acceleration::SettingsRebuild;
 
 /// Creates a result schema for DDL operations (single "result" column).
 fn ddl_result_schema() -> SchemaRef {
@@ -87,13 +90,16 @@ impl IcebergDdlAccelerationSource {
     fn new(
         app_name: String,
         name: TableReference,
-        acceleration: RuntimeAcceleration,
+        mut acceleration: RuntimeAcceleration,
         time_column: Option<String>,
     ) -> Self {
         let app = App {
             name: app_name,
             ..App::default()
         };
+        // `CREATE TABLE` has no path that rebuilds an acceleration, so a stored table
+        // keeps the settings it was built with when they change.
+        acceleration.settings_rebuild = SettingsRebuild::Unsupported;
 
         Self {
             app: Arc::new(app),
@@ -124,6 +130,12 @@ impl AccelerationSource for IcebergDdlAccelerationSource {
 
     fn secrets(&self) -> Arc<tokio::sync::RwLock<crate::secrets::Secrets>> {
         Arc::new(tokio::sync::RwLock::new(crate::secrets::Secrets::new()))
+    }
+
+    fn snapshot_notifications(
+        &self,
+    ) -> Option<Arc<runtime_acceleration::snapshot::notifications::SnapshotNotifications>> {
+        None
     }
 
     fn acceleration(&self) -> Option<&RuntimeAcceleration> {
@@ -267,6 +279,17 @@ impl ExecutionPlan for IcebergCreateSchemaExec {
 
     fn properties(&self) -> &Arc<PlanProperties> {
         &self.properties
+    }
+
+    fn apply_expressions(
+        &self,
+        _f: &mut dyn FnMut(
+            &Arc<dyn datafusion::physical_plan::PhysicalExpr>,
+        ) -> datafusion::error::Result<
+            datafusion::common::tree_node::TreeNodeRecursion,
+        >,
+    ) -> datafusion::error::Result<datafusion::common::tree_node::TreeNodeRecursion> {
+        Ok(datafusion::common::tree_node::TreeNodeRecursion::Continue)
     }
 
     fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> {
@@ -444,6 +467,17 @@ impl ExecutionPlan for IcebergCreateTableExec {
         &self.properties
     }
 
+    fn apply_expressions(
+        &self,
+        _f: &mut dyn FnMut(
+            &Arc<dyn datafusion::physical_plan::PhysicalExpr>,
+        ) -> datafusion::error::Result<
+            datafusion::common::tree_node::TreeNodeRecursion,
+        >,
+    ) -> datafusion::error::Result<datafusion::common::tree_node::TreeNodeRecursion> {
+        Ok(datafusion::common::tree_node::TreeNodeRecursion::Continue)
+    }
+
     fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> {
         vec![]
     }
@@ -558,6 +592,18 @@ impl ExecutionPlan for IcebergCreateTableExec {
                             &dataset_options,
                             partition_expr_sql.as_ref(),
                             &datafusion,
+                        )
+                        .await?;
+
+                        record_existing_partitions(
+                            &datafusion,
+                            &TableReference::full(
+                                df_catalog_name.clone(),
+                                df_schema_name.clone(),
+                                table_name.clone(),
+                            ),
+                            Arc::clone(&provider),
+                            partition_expr_sql.as_ref(),
                         )
                         .await?;
 
@@ -964,7 +1010,7 @@ async fn initialize_partition_metadata(
     if let Some(expr_sql) = partition_expr_sql
         && let Some(registry) = executor_registry
     {
-        let table_ref = datafusion::sql::TableReference::full(
+        let table_ref = datafusion::common::TableReference::full(
             catalog_name.to_string(),
             schema_name.to_string(),
             table_name.to_string(),
@@ -977,6 +1023,84 @@ async fn initialize_partition_metadata(
             tracing::warn!(table = %table_ref, error = %error, "Failed to initialize partition metadata for table");
         }
     }
+}
+
+/// The partitions `source` holds, as the partition store records them.
+async fn partition_values_of(
+    ctx: &datafusion::prelude::SessionContext,
+    source: Arc<dyn datafusion::datasource::TableProvider>,
+    partition_expr_sql: &str,
+) -> DFResult<Vec<PartitionValue>> {
+    let df_schema = DFSchema::try_from(source.schema())?;
+    let expression = ctx.parse_sql_expr(partition_expr_sql, &df_schema)?;
+    let batches = ctx
+        .read_table(source)?
+        .select(vec![expression])?
+        .distinct()?
+        .collect()
+        .await?;
+    let mut values = Vec::new();
+    for batch in &batches {
+        for row in 0..batch.num_rows() {
+            let scalar = ScalarValue::try_from_array(batch.column(0), row)?;
+            let value = (!scalar.is_null()).then(|| partition_value_sql(&scalar));
+            values.push(HashMap::from([(partition_expr_sql.to_string(), value)]));
+        }
+    }
+    Ok(values)
+}
+
+/// On the scheduler, records the partitions an existing table holds, each
+/// assigned to a connected executor, in the write that lists the table: the
+/// scheduler reads only the partitions a table lists, so a table listed without
+/// them reads as empty. A partition an executor already holds keeps it.
+async fn record_existing_partitions(
+    datafusion: &Weak<DataFusion>,
+    table: &TableReference,
+    source: Arc<dyn datafusion::datasource::TableProvider>,
+    partition_expr_sql: Option<&String>,
+) -> DFResult<()> {
+    let Some(df) = datafusion.upgrade() else {
+        return Ok(());
+    };
+    let (Some(partition_expr_sql), Some(registry)) = (partition_expr_sql, df.executor_registry())
+    else {
+        return Ok(());
+    };
+    if !matches!(
+        df.cluster_config.effective_role(),
+        Some(crate::config::ClusterRole::Scheduler)
+    ) {
+        return Ok(());
+    }
+
+    let values = partition_values_of(&df.ctx, source, partition_expr_sql).await?;
+    let mut executors: Vec<String> = registry
+        .flight_sql_clients_snapshot()
+        .await
+        .into_keys()
+        .collect();
+    executors.sort();
+    if executors.is_empty() && !values.is_empty() {
+        return Err(DataFusionError::Execution(format!(
+            "Cannot accelerate the existing table {table}: no executor is connected to hold its partitions; retry when an executor is connected"
+        )));
+    }
+    let assignments: Vec<(&PartitionValue, &str)> = values
+        .iter()
+        .zip(executors.iter().cycle())
+        .map(|(value, executor)| (value, executor.as_str()))
+        .collect();
+    registry
+        .federated_partition_store()
+        .create_and_assign_partitions(
+            table,
+            std::slice::from_ref(partition_expr_sql),
+            &assignments,
+        )
+        .await
+        .map_err(|e| DataFusionError::External(Box::new(e)))?;
+    Ok(())
 }
 
 #[expect(clippy::too_many_arguments)]
@@ -1270,6 +1394,17 @@ impl ExecutionPlan for IcebergDropTableExec {
         &self.properties
     }
 
+    fn apply_expressions(
+        &self,
+        _f: &mut dyn FnMut(
+            &Arc<dyn datafusion::physical_plan::PhysicalExpr>,
+        ) -> datafusion::error::Result<
+            datafusion::common::tree_node::TreeNodeRecursion,
+        >,
+    ) -> datafusion::error::Result<datafusion::common::tree_node::TreeNodeRecursion> {
+        Ok(datafusion::common::tree_node::TreeNodeRecursion::Continue)
+    }
+
     fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> {
         vec![]
     }
@@ -1345,5 +1480,85 @@ impl ExecutionPlan for IcebergDropTableExec {
             ddl_result_schema(),
             stream,
         )))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::component::dataset::acceleration::RefreshMode;
+
+    /// A table `CREATE TABLE` accelerates is never rebuilt for changed settings, though
+    /// its acceleration reads as a rebuildable one (`file` mode, `full` refresh,
+    /// write-through). Nothing on this path handles a rebuild, so a stored table keeps the
+    /// settings it was built with instead of failing to register.
+    #[test]
+    fn an_iceberg_ddl_table_keeps_its_stored_settings() {
+        let acceleration = RuntimeAcceleration {
+            mode: Mode::File,
+            ..RuntimeAcceleration::default()
+        };
+        assert!(
+            acceleration.rebuilds_on_settings_change(RefreshMode::Full),
+            "the acceleration alone qualifies for a rebuild"
+        );
+
+        let source = IcebergDdlAccelerationSource::new(
+            "app".to_string(),
+            TableReference::bare("t"),
+            acceleration,
+            None,
+        );
+        assert!(
+            !runtime_acceleration::acceleration_source::rebuilds_on_settings_change(&source),
+            "an Iceberg DDL table must keep its stored settings"
+        );
+    }
+
+    /// The partitions of an existing table are found from its rows, recorded as
+    /// the write path records them.
+    #[tokio::test]
+    async fn an_existing_tables_partitions_are_found_from_its_rows() {
+        use arrow::array::Int64Array;
+        use datafusion::datasource::MemTable;
+
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("region", DataType::Utf8, true),
+        ]));
+        let batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![
+                Arc::new(Int64Array::from(vec![1, 2, 3, 4])),
+                Arc::new(StringArray::from(vec![
+                    Some("east"),
+                    Some("east"),
+                    Some("it's"),
+                    None,
+                ])),
+            ],
+        )
+        .expect("batch");
+        let source = Arc::new(MemTable::try_new(schema, vec![vec![batch]]).expect("table"));
+
+        let mut values = partition_values_of(
+            &datafusion::prelude::SessionContext::new(),
+            source,
+            "region",
+        )
+        .await
+        .expect("partition values")
+        .into_iter()
+        .map(|value| value.get("region").cloned().flatten())
+        .collect::<Vec<_>>();
+        values.sort();
+        assert_eq!(
+            values,
+            [
+                None,
+                Some("'east'".to_string()),
+                Some("'it''s'".to_string())
+            ]
+        );
     }
 }

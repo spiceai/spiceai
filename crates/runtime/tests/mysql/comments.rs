@@ -16,7 +16,7 @@ limitations under the License.
 
 //! Integration tests verifying that `MySQL` table and column comments are
 //! accessible via `obj_description` and `col_description` UDFs when the dataset
-//! is loaded with `DuckDB` acceleration.
+//! is loaded with `Cayenne` acceleration.
 
 use std::{sync::Arc, time::Duration};
 
@@ -36,13 +36,11 @@ use crate::{
     utils::{register_test_connectors, run_query, runtime_ready_check, test_request_context},
 };
 
-const MYSQL_COMMENTS_PORT: u16 = 13320;
-
 fn commented_dataset(port: u16) -> Dataset {
     let mut ds = make_mysql_dataset("orders", "orders", port, false);
     ds.acceleration = Some(Acceleration {
         enabled: true,
-        engine: Some("duckdb".to_string()),
+        engine: Some("cayenne".to_string()),
         refresh_mode: Some(RefreshMode::Full),
         ..Acceleration::default()
     });
@@ -143,26 +141,27 @@ async fn start_runtime(dataset: Dataset) -> Result<Arc<runtime::Runtime>, anyhow
 
 /// `obj_description('orders')` returns the `MySQL` table comment and
 /// `col_description('orders', N)` returns `MySQL` column comments by 1-based
-/// position when the dataset is accelerated with `DuckDB`.
+/// position when the dataset is accelerated with `Cayenne`.
 #[tokio::test]
-async fn test_mysql_comments_with_duckdb_acceleration() -> Result<(), anyhow::Error> {
+async fn test_mysql_comments_with_cayenne_acceleration() -> Result<(), anyhow::Error> {
     let _tracing = init_tracing(Some("integration=debug,info"));
 
     test_request_context()
         .scope(async {
-            let _container = start_mysql_docker_container(MYSQL_COMMENTS_PORT).await?;
+            let container = start_mysql_docker_container().await?;
+            let port = container.host_port(3306)?;
 
-            wait_for_ddl_ready(MYSQL_COMMENTS_PORT).await?;
+            wait_for_ddl_ready(port).await?;
 
             let retry_strategy = FibonacciBackoffBuilder::new().max_retries(Some(3)).build();
             retry(retry_strategy, || async {
-                seed_orders(MYSQL_COMMENTS_PORT)
+                seed_orders(port)
                     .await
                     .map_err(RetryError::transient)
             })
             .await?;
 
-            let rt = start_runtime(commented_dataset(MYSQL_COMMENTS_PORT)).await?;
+            let rt = start_runtime(commented_dataset(port)).await?;
 
             let obj_results =
                 run_query(&rt, "SELECT obj_description('orders') AS table_comment").await?;

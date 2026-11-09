@@ -51,7 +51,7 @@ pub struct Config {
     pub runtime: Option<SpicepodRuntime>,
 }
 
-pub use runtime_component::ClusterRole;
+pub use runtime_component::{ClusterRole, Role};
 
 impl Config {
     #[must_use]
@@ -133,9 +133,10 @@ impl Default for Config {
 
 #[derive(Debug, Clone, clap::Parser)]
 pub struct ClusterConfig {
-    /// Configure cluster node role: scheduler or executor
+    /// The role this runtime runs as. Defaults to `server`, or to `executor`
+    /// when `--scheduler-address` is set.
     #[arg(long = "role", value_name = "ROLE", required = false, action)]
-    pub role: Option<ClusterRole>,
+    pub role: Option<Role>,
 
     /// The bind address for the internal cluster gRPC service.
     /// Used by both schedulers and executors.
@@ -165,7 +166,8 @@ pub struct ClusterConfig {
     #[arg(long = "node-mtls-key-file", value_name = "NODE_MTLS_KEY_FILE")]
     pub node_mtls_key_file: Option<String>,
 
-    /// Allow insecure cluster communication without mTLS. WARNING: Only use this flag in development or testing environments and never in production.
+    /// Allow cluster connections without mTLS for local development and testing.
+    /// Use only on a trusted network; cluster connections are not authenticated or encrypted.
     #[arg(long = "allow-insecure-connections", default_value_t = false, action = ArgAction::SetTrue)]
     pub allow_insecure_connections: bool,
 
@@ -180,7 +182,7 @@ pub struct ClusterConfig {
     /// For executors: used during registration to tell the scheduler how to contact this node.
     ///
     /// The fully qualified advertise URL will be constructed as:
-    ///   https://<node-advertise-address>:<port from --node-bind-address> (http:// if --allow-insecure-connections is set)
+    ///   https://<node-advertise-address>:<port from --node-bind-address> (http:// without cluster mTLS)
     #[arg(long = "node-advertise-address", value_name = "NODE_ADVERTISE_ADDRESS")]
     pub node_advertise_address: Option<String>,
 }
@@ -202,9 +204,44 @@ impl Default for ClusterConfig {
 
 impl ClusterConfig {
     #[must_use]
-    pub fn with_role(mut self, role: ClusterRole) -> Self {
+    pub fn with_role(mut self, role: Role) -> Self {
         self.role = Some(role);
         self
+    }
+
+    /// The role this runtime runs as: `--role` when given, else `executor`
+    /// when `--scheduler-address` is set, else `server`.
+    #[must_use]
+    pub fn effective_role(&self) -> Role {
+        match self.role {
+            Some(role) => role,
+            None if self.scheduler_address.is_some() => Role::Executor,
+            None => Role::Server,
+        }
+    }
+
+    /// The cluster membership of [`Self::effective_role`]: `None` for a server
+    /// or sidecar.
+    #[must_use]
+    pub fn cluster_role(&self) -> Option<ClusterRole> {
+        self.effective_role().cluster_role()
+    }
+
+    /// Rejects `--scheduler-address`, which joins a cluster as an executor, with
+    /// a `--role` that does not join one. The message names the fix.
+    ///
+    /// # Errors
+    ///
+    /// When `--role server` or `--role sidecar` is combined with `--scheduler-address`.
+    pub fn validate_role(&self) -> Result<(), String> {
+        match self.role {
+            Some(role @ (Role::Server | Role::Sidecar)) if self.scheduler_address.is_some() => {
+                Err(format!(
+                    "`--scheduler-address` joins a cluster as an executor and cannot be used with `--role {role}`. Remove `--scheduler-address`, or use `--role executor`."
+                ))
+            }
+            _ => Ok(()),
+        }
     }
 
     #[must_use]

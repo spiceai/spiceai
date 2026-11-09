@@ -1,0 +1,9 @@
+---
+source: crates/test-framework/src/spicetest/datasets/worker.rs
+description: "Query: tpcds_q90"
+---
++-------------+
+| am_pm_ratio |
++-------------+
+| 1.10978043  |
++-------------+
