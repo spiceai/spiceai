@@ -316,7 +316,23 @@ message SpicePhysicalPlanNode {
         IcebergTableScanExecNode iceberg_table_scan = 5;
         HttpExecNode http_exec = 6;
         HeaderProjectedCsvScanExecNode header_projected_csv_scan = 7;
+        FederatedSchemaCastScanExecNode federated_schema_cast_scan = 8;
+        FederatedQueryExecNode federated_query = 9;
     }
+}
+
+// Federation's `SchemaCastScanExec`, which casts its one input to `schema`.
+message FederatedSchemaCastScanExecNode {
+    // Prost-encoded `datafusion_common.Schema`.
+    bytes schema = 1;
+}
+
+// A query pushed down to a federated SQL source. Its connection to the source
+// cannot be serialized, so the executor plans the query again against its own
+// registration of the same datasets.
+message FederatedQueryExecNode {
+    // Prost-encoded `datafusion.LogicalPlanNode`; tables are encoded by reference.
+    bytes logical_plan = 1;
 }
 
 // Headered CSV/TSV scan that binds columns by header name.
