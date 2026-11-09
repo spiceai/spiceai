@@ -16,7 +16,9 @@ limitations under the License.
 
 //! Metadata catalog implementation for Cayenne.
 
-use super::catalog::{CatalogError, CatalogResult, MetadataCatalog, SnapshotSequenceCommit};
+use super::catalog::{
+    CatalogError, CatalogResult, MemTierDurableCommit, MetadataCatalog, SnapshotSequenceCommit,
+};
 use super::metadata::{
     ColdTierFile, CompressionStrategy, CreateTableOptions, DeleteFile, DeletionType,
     IndexRunRecord, InlinedData, InlinedDataStats, InlinedDelete, PartitionMetadata,
@@ -3091,6 +3093,124 @@ impl MetadataCatalog for CayenneCatalog {
             .await?;
         }
         txn.commit().await
+    }
+
+    async fn commit_mem_tier_durable(&self, mut commit: MemTierDurableCommit) -> CatalogResult<()> {
+        let table_id = &commit.table_id;
+        ensure_reinsert_keys_have_key_based_delete_file(
+            table_id,
+            &commit.reinsert_delete_files,
+            commit.insert_pk_bytes.len(),
+        )?;
+        // Reinsert metadata lives on the key-vector rows, not in per-key
+        // insert records. Stamp only the reinsert group: pure deletes must
+        // remain delete-only even when the same commit also appends rows.
+        let reinsert_sequence =
+            (!commit.insert_pk_bytes.is_empty()).then_some(commit.sequence_number);
+        for file in &mut commit.pure_delete_files {
+            file.reinsert_sequence = None;
+        }
+        for file in &mut commit.reinsert_delete_files {
+            if reinsert_sequence.is_some_and(|seq| seq <= file.sequence_number) {
+                return Err(CatalogError::InvalidOperationNoSource {
+                    message: format!(
+                        "Insert sequence {} must exceed delete sequence {}",
+                        commit.sequence_number, file.sequence_number
+                    ),
+                });
+            }
+            file.reinsert_sequence = if file.deletion_type == DeletionType::KeyBased {
+                reinsert_sequence
+            } else {
+                None
+            };
+        }
+        commit
+            .pure_delete_files
+            .append(&mut commit.reinsert_delete_files);
+        if commit
+            .pure_delete_files
+            .iter()
+            .any(|file| file.table_id != *table_id)
+            || commit
+                .inline_data
+                .iter()
+                .any(|data| data.table_id != *table_id)
+        {
+            return Err(CatalogError::InvalidOperationNoSource {
+                message: format!("Mem-tier commit rows must belong to table '{table_id}'"),
+            });
+        }
+        let max_attempts = DEFAULT_CONCURRENT_WRITE_MAX_ATTEMPTS;
+        for attempt in 1..=max_attempts {
+            let result = async {
+                let tx = self.begin_transaction().await?;
+                let applied = async {
+                    Self::apply_inlined_mutation_in_txn(
+                        tx.as_ref(),
+                        table_id,
+                        &[],
+                        &[],
+                        &commit.inline_data,
+                        commit.sequence_number,
+                    )
+                    .await?;
+                    for chunk in commit.pure_delete_files.chunks(32_000 / 10) {
+                        let (sql, params) = Self::build_insert_delete_files_chunk_sql(chunk);
+                        tx.execute(ExecuteParams { sql: &sql, params }).await?;
+                    }
+                    if let Some(snapshot) = &commit.snapshot_sequence {
+                        tx.execute(ExecuteParams {
+                            sql: SNAPSHOT_SEQUENCE_UPSERT_SQL,
+                            params: vec![
+                                MetastoreValue::Text(table_id.clone()),
+                                MetastoreValue::Text(snapshot.snapshot_id.clone()),
+                                MetastoreValue::Integer(snapshot.sequence_number),
+                            ],
+                        })
+                        .await?;
+                    }
+                    if commit.clear_inlined {
+                        for sql in [
+                            "DELETE FROM cayenne_inlined_data WHERE table_id = ?1",
+                            "DELETE FROM cayenne_inlined_delete WHERE table_id = ?1",
+                        ] {
+                            tx.execute(ExecuteParams {
+                                sql,
+                                params: vec![MetastoreValue::Text(table_id.clone())],
+                            })
+                            .await?;
+                        }
+                    }
+                    CatalogResult::Ok(())
+                }
+                .await;
+                if let Err(error) = applied {
+                    tx.rollback().await?;
+                    return Err(error);
+                }
+                tx.commit().await
+            }
+            .await;
+            match result {
+                Ok(()) => return Ok(()),
+                Err(error) => {
+                    if !retry_on_metastore_write_conflict(
+                        &error,
+                        attempt,
+                        max_attempts,
+                        "commit mem-tier metadata",
+                    )
+                    .await
+                    {
+                        return Err(error);
+                    }
+                }
+            }
+        }
+        Err(CatalogError::InvalidOperationNoSource {
+            message: "Mem-tier commit exhausted write attempts".to_string(),
+        })
     }
 
     async fn get_table_delete_files(&self, table_id: &str) -> CatalogResult<Vec<DeleteFile>> {
