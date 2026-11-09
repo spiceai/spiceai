@@ -869,8 +869,9 @@ pub fn build_auth_credentials_in(
     }
 }
 
-/// No credential is set. The Databricks model and embedding loaders name it too, and they build
-/// without the `databricks` feature.
+/// The message for a configuration that sets no credential. The Databricks model and embedding
+/// loaders also reference this constant by name, and they are compiled without the `databricks`
+/// feature, so the constant is not gated on it.
 pub const NO_CREDENTIAL_MESSAGE: &str = "Missing credentials: set `databricks_token`, `databricks_client_id` with `databricks_client_secret`, or workload identity federation (`databricks_client_id` with `databricks_oidc_token_filepath`, or `databricks_client_id` alone in a GitHub Actions job with `permissions: id-token: write`)";
 
 /// Both a token and service-principal credentials are set. Parameters absent from the Spicepod are
