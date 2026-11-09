@@ -17,6 +17,12 @@ sources:
 # upstream refuses every query after its 10,000th handshake
 # (known-failing/flight-auth/flight-auth-handshake-limit.yaml), and the load
 # below sends many more.
+# The spicepod as written, and the same with the prototype object-native
+# Cayenne metastore (`runtime.params.cayenne_vnext`) in place of SQLite.
+variants:
+  as-written: federated
+  object-native: object-native
+
 spicepod:
   version: v1
   kind: Spicepod

@@ -20,6 +20,8 @@ variants:
     datasets: { '*': { acceleration: { params: { cayenne_deletion_mode: key } } } }
   position:
     datasets: { '*': { acceleration: { params: { cayenne_deletion_mode: position } } } }
+  # The spicepod as written, with the prototype object-native Cayenne metastore.
+  object-native: object-native
 
 spicepod:
   version: v1

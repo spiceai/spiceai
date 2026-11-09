@@ -13,6 +13,8 @@ variants:
   secs: {}
   tz: { datasets: { events: { time_column: ts, time_format: timestamptz } } }
   iso: { datasets: { events: { time_column: iso, time_format: iso8601 } } }
+  # The spicepod as written, with the prototype object-native Cayenne metastore.
+  object-native: object-native
 spicepod:
   version: v1
   kind: Spicepod

@@ -9,6 +9,8 @@ sources:
 variants:
   full: {}
   append: { datasets: { t: { acceleration: { refresh_mode: append } } } }
+  # The spicepod as written, with the prototype object-native Cayenne metastore.
+  object-native: object-native
 spicepod:
   version: v1
   kind: Spicepod
@@ -37,11 +39,11 @@ steps:
   - query: SELECT id FROM t
     oracle-sql: SELECT id FROM t WHERE id <= 10
     eventually: 30s
-    only: full
+    only: [full, object-native]
   # A plain refresh afterwards uses the configured SQL again.
   - http: { method: POST, path: /v1/datasets/t/acceleration/refresh }
     expect: { status: 201 }
-    only: full
+    only: [full, object-native]
   - query: SELECT id FROM t
     eventually: 30s
   # PATCH keeps the SQL for later refreshes.
@@ -52,4 +54,4 @@ steps:
   - query: SELECT id FROM t
     oracle-sql: SELECT id FROM t WHERE id <= 20
     eventually: 30s
-    only: full
+    only: [full, object-native]

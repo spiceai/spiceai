@@ -25,6 +25,8 @@ variants:
     datasets: { t: { acceleration: { refresh_mode: append } } }
   others:
     when: { src: [mongodb, dynamodb, postgres, mysql] }
+  # The spicepod as written, with the prototype object-native Cayenne metastore.
+  object-native: object-native
 defaults:
   expect: { oracle: ref }
 steps:

@@ -14,6 +14,8 @@ sources:
 
 variants:
   partitioned: { datasets: { t: { acceleration: { partition_by: ['bucket(4, id)'] } } } }
+  # The spicepod as written, with the prototype object-native Cayenne metastore.
+  object-native: object-native
 
 spicepod:
   version: v1

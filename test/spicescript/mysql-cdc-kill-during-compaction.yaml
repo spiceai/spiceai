@@ -7,6 +7,12 @@ description: >
 sources: { src: { kind: mysql } }
 matrix:
   run: [1, 2, 3]
+# The spicepod as written, and the same with the prototype object-native
+# Cayenne metastore (`runtime.params.cayenne_vnext`) in place of SQLite.
+variants:
+  as-written: federated
+  object-native: object-native
+
 spicepod:
   version: v1
   kind: Spicepod

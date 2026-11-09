@@ -55,6 +55,8 @@ variants:
           - { name: n, type: bigint }
           - { name: v, type: bigint }
           - { name: s, type: text }
+  # The spicepod as written, with the prototype object-native Cayenne metastore.
+  object-native: object-native
 
 defaults:
   expect: { oracle: ref }

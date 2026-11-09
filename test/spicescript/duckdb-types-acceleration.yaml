@@ -18,6 +18,8 @@ variants:
   arrow: arrow-memory
   sqlite: sqlite-file
   cayenne: cayenne-file
+  # `cayenne` with the prototype object-native Cayenne metastore.
+  cayenne-object-native: cayenne-file-object-native
   cayenne-memory: cayenne-memory
 
 spicepod:

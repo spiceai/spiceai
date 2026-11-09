@@ -33,6 +33,8 @@ variants:
   keep-partitioned: { when: { policy: keep, layout: partitioned }, datasets: { ev: { acceleration: { primary_key: id, partition_by: [region] } } } }
   none: { when: { policy: none, layout: plain }, datasets: {} }
   none-partitioned: { when: { policy: none, layout: partitioned }, datasets: { ev: { acceleration: { partition_by: [region] } } } }
+  # The spicepod as written, with the prototype object-native Cayenne metastore.
+  object-native: object-native
 
 spicepod:
   version: v1

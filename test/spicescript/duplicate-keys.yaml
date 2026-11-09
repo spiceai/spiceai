@@ -16,6 +16,8 @@ variants:
   upsert: { datasets: { t: { acceleration: { on_conflict: { id: upsert } } } } }
   upsert-dedup: { datasets: { t: { acceleration: { on_conflict: { id: upsert_dedup } } } } }
   upsert-dedup-by-row-id: { datasets: { t: { acceleration: { on_conflict: { id: upsert_dedup_by_row_id } } } } }
+  # The spicepod as written, with the prototype object-native Cayenne metastore.
+  object-native: object-native
 
 spicepod:
   version: v1

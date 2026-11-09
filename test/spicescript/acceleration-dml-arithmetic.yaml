@@ -14,6 +14,8 @@ sources:
 
 variants:
   cayenne-file: cayenne-file
+  # `cayenne-file` with the prototype object-native Cayenne metastore.
+  cayenne-file-object-native: cayenne-file-object-native
   cayenne-memory: cayenne-memory
   sqlite-file: sqlite-file
   sqlite-memory: sqlite-memory

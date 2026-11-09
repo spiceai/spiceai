@@ -24,6 +24,8 @@ sources:
 
 variants:
   cayenne: { datasets: { '*': { acceleration: { engine: cayenne, mode: file } } } }
+  # `cayenne` with the prototype object-native Cayenne metastore.
+  cayenne-object-native: { datasets: { '*': { acceleration: { engine: cayenne, mode: file } } }, spicepod: { runtime: { params: { cayenne_vnext: enabled } } } }
   arrow: { datasets: { '*': { acceleration: { engine: arrow, mode: memory, on_conflict: { id: upsert } } } } }
 
 spicepod:
@@ -97,12 +99,12 @@ steps:
   # a durable acceleration survives this: a push source cannot be re-read, so
   # an in-memory one restarts empty and holds only what arrives afterwards.
   - restart: {}
-    only: cayenne
+    only: [cayenne, cayenne-object-native]
   - source-exec:
       src: |
         UPDATE t SET v = 'after restart' WHERE id <= 20;
         DELETE FROM t WHERE id > 590;
-    only: cayenne
+    only: [cayenne, cayenne-object-native]
   - query: SELECT * FROM t
     eventually: 60s
-    only: cayenne
+    only: [cayenne, cayenne-object-native]

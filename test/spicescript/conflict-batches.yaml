@@ -23,6 +23,8 @@ variants:
   partitioned:
     when: { mode: file }
     datasets: { across: &part { acceleration: { partition_by: [region] } }, wsame: *part, wdiff: *part, ap: *part }
+  # The spicepod as written, with the prototype object-native Cayenne metastore.
+  object-native: object-native
 
 spicepod:
   version: v1

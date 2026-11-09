@@ -23,6 +23,8 @@ variants:
     datasets:
       '*': { acceleration: { engine: sqlite, on_conflict: { id: upsert } } }
       t: { acceleration: { indexes: { i: enabled, dt: enabled } } }
+  # The spicepod as written, with the prototype object-native Cayenne metastore.
+  object-native: object-native
 
 spicepod:
   version: v1
