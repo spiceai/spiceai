@@ -35,7 +35,7 @@ use std::{collections::HashMap, sync::Arc};
 use tokio::sync::Notify;
 
 mod catalog;
-pub use catalog::{ObjectNativeCatalog, dataset_log_at, new_dataset_folder};
+pub use catalog::{ObjectNativeCatalog, TableReaders, dataset_log_at, new_dataset_folder};
 
 /// One head log: a serial writer and its last acknowledged state. The catalog
 /// keeps one for its name registry and one per dataset. No database is used.
@@ -98,6 +98,11 @@ pub struct NativeCatalogConfig {
     /// dropped dataset's log are kept before a catalog that opens may remove
     /// them: anything newer may belong to a process still writing it.
     pub reclaim_after: std::time::Duration,
+    /// How long after a dataset is dropped the instance that dropped it waits
+    /// before it deletes the dataset's folder, once no scan of its tables still
+    /// runs and no restore point is being taken from them: the window in which a
+    /// query planned just before the drop opens its files.
+    pub dropped_grace: std::time::Duration,
     /// How long the coordinator of a transaction across datasets tries to
     /// commit it before it aborts it instead, so its client gets an answer and
     /// its datasets accept other changes again.
@@ -112,6 +117,7 @@ impl Default for NativeCatalogConfig {
             checkpoint_after_batches: 1,
             attempt_horizon: object_store_occ::headlog::DEFAULT_ATTEMPT_HORIZON,
             reclaim_after: std::time::Duration::from_hours(1),
+            dropped_grace: std::time::Duration::from_secs(5),
             transaction_deadline: std::time::Duration::from_secs(60),
         }
     }
@@ -527,6 +533,22 @@ impl Inner {
             .map_err(invalid)?;
         self.staged_checkpoint = at;
         Ok(())
+    }
+
+    /// Whether a change to `table_id` is applied here but not yet committed.
+    fn has_uncommitted(&self, table_id: &str) -> bool {
+        self.pending
+            .iter()
+            .any(|buffer| buffer.tables.contains(table_id) || buffer.tables.contains(""))
+    }
+
+    /// Whether an unresolved transaction across datasets reserves `table_id`.
+    fn reserved(&self, table_id: &str) -> bool {
+        self.reader
+            .state
+            .prepared
+            .values()
+            .any(|prepared| prepared.footprint.contains(table_id))
     }
 
     fn table(&self, id: &str) -> CatalogResult<&cayenne_metastore_actions::TableState> {
@@ -1010,6 +1032,53 @@ impl MetadataCatalog for Domain {
             .reader
             .get_all_snapshot_files(table_id)
             .await
+    }
+    fn keeps_retirement_record(&self) -> bool {
+        true
+    }
+    async fn retired_snapshots(&self, table_id: &str) -> CatalogResult<Option<Vec<String>>> {
+        let inner = self.inner.take().await;
+        // Only committed state may license a delete: a buffered change is applied
+        // here but may never commit, and a poisoned log's last commit may not
+        // have landed.
+        if inner.poisoned || inner.has_uncommitted(table_id) || inner.reserved(table_id) {
+            return Ok(None);
+        }
+        Ok(Some(
+            inner.table(table_id)?.retired.iter().cloned().collect(),
+        ))
+    }
+    async fn forget_retired_snapshots(
+        &self,
+        table_id: &str,
+        snapshot_ids: &[String],
+    ) -> CatalogResult<bool> {
+        if snapshot_ids.is_empty() {
+            return Ok(true);
+        }
+        let mut inner = self.inner.take().await;
+        // A reserved table refuses every change until its transaction resolves,
+        // and a refused record stops the whole log; the next sweep forgets them.
+        if inner.reserved(table_id) {
+            return Ok(false);
+        }
+        let retired = &inner.table(table_id)?.retired;
+        let ids: Vec<String> = snapshot_ids
+            .iter()
+            .filter(|id| retired.contains(*id))
+            .cloned()
+            .collect();
+        if ids.is_empty() {
+            return Ok(true);
+        }
+        inner
+            .commit(vec![
+                actions::remove_files(table_id, proto::Select::Listed, &ids),
+                actions::remove_file_stats(table_id, proto::Select::Listed, &ids),
+                actions::forget_retired(table_id, &ids),
+            ])
+            .await?;
+        Ok(true)
     }
     async fn get_snapshot_files(
         &self,
@@ -1616,10 +1685,9 @@ impl MetadataCatalog for Domain {
         }
         let mut groups: Vec<(&str, &str, Vec<SnapshotFile>)> = Vec::new();
         for file in files {
-            match groups
-                .iter_mut()
-                .find(|(table, snapshot, _)| *table == file.table_id && *snapshot == file.snapshot_id)
-            {
+            match groups.iter_mut().find(|(table, snapshot, _)| {
+                *table == file.table_id && *snapshot == file.snapshot_id
+            }) {
                 Some((_, _, rows)) => rows.push(file.clone()),
                 None => groups.push((&file.table_id, &file.snapshot_id, vec![file.clone()])),
             }

@@ -6,13 +6,24 @@ description: >
   compaction commits again. Each run kills at the first moment a compaction
   holds a permit, after a different amount of change. Waits for compaction
   keep writing new data rather than waiting for time, since compaction needs
-  new data to trigger.
+  new data to trigger. A full refresh killed while it overwrites a table
+  leaves it with every row from before or every row from after, never part of
+  either. With object-native data (#16133), the files the compactions and the
+  overwrite retired are deleted from the state location after the grace.
 
 sources:
   src: { kind: postgres }
+  # The state locations of the object-native-data variants.
+  lake: { kind: rustfs }
+  slow-lake: { kind: rustfs, latency: 20ms }
 
 matrix:
   run: [1, 2, 3, 4, 5]
+
+variants:
+  local: {}
+  object-native-data-rustfs: object-native-data-rustfs
+  object-native-data-rustfs-latency: object-native-data-rustfs-latency
 
 spicepod:
   version: v1
@@ -34,6 +45,16 @@ spicepod:
           cayenne_cdc_mem_tier_max_age_ms: '200'
           cayenne_compaction_trigger_files: '2'
           cayenne_compaction_background_interval_ms: '200'
+    # Refreshed in full only when asked: each refresh overwrites the table.
+    - from: postgres:public.snap
+      name: snap_full
+      params: ${sources.src.params}
+      acceleration:
+        enabled: true
+        engine: cayenne
+        mode: file
+        refresh_mode: full
+        params: { cayenne_inline_max_rows: '0' }
 
 defaults:
   expect: { oracle: src }
@@ -43,6 +64,8 @@ steps:
       src: |
         CREATE TABLE orders (o_id bigint PRIMARY KEY, v integer NOT NULL, grp integer NOT NULL, note text);
         INSERT INTO orders SELECT i, i % 1000, i % 97, 'note ' || i FROM generate_series(1, 1000000) AS i;
+        CREATE TABLE snap (id bigint PRIMARY KEY, batch integer NOT NULL, payload text NOT NULL);
+        INSERT INTO snap SELECT i, 1, repeat('a', 64) FROM generate_series(1, 300000) AS i;
   - start: {}
   - query: SELECT count(*), sum(v), sum(grp) FROM orders
     eventually: 120s
@@ -80,3 +103,41 @@ steps:
       drive: { src: "UPDATE orders SET v = v + 1 WHERE o_id % 50 = ${round} % 50", every: 2s, rounds: 60 }
   - query: SELECT count(*), sum(v), sum(grp) FROM orders
     eventually: 60s
+
+  # A full refresh killed while it overwrites the table: after the restart the
+  # dataset holds one whole batch, the one from before or the one from after,
+  # and the source's rows once it refreshes again. Whether the kill lands in
+  # the middle of the overwrite is not controlled; the load is large enough
+  # that it usually does.
+  - source-exec:
+      src: |
+        BEGIN;
+        DELETE FROM snap;
+        INSERT INTO snap SELECT i, 2, repeat('b', 64) FROM generate_series(1, 300000) AS i;
+        COMMIT;
+  - refresh: { dataset: snap_full, wait: false }
+  - sleep: 500ms
+  - kill-spiced: {}
+  - start: {}
+  - query: SELECT count(DISTINCT batch) AS batches, count(*) AS n, count(DISTINCT id) AS ids FROM snap_full
+    expect: { rows: [['1', '300000', '300000']] }
+  - refresh: snap_full
+  - query: SELECT batch, count(*) AS n FROM snap_full GROUP BY batch
+    oracle-sql: SELECT batch, count(*) AS n FROM snap GROUP BY batch
+
+  # What the compactions and the overwrite retired is deleted after the grace:
+  # no dataset folder is left marked dropped, and the overwritten table holds
+  # about one generation of files. (Files an interrupted write left that no
+  # commit names are the orphan rules' to reclaim.)
+  - assert-objects: { source: lake, prefix: state/cayenne/v1/datasets/, contains: /dropped, max: 0 }
+    eventually: 60s
+    only: object-native-data-rustfs
+  - assert-objects: { source: lake, prefix: state/cayenne/v1/datasets/snap_full-, contains: .vortex, min: 1, max: 32 }
+    eventually: 60s
+    only: object-native-data-rustfs
+  - assert-objects: { source: slow-lake, prefix: state/cayenne/v1/datasets/, contains: /dropped, max: 0 }
+    eventually: 60s
+    only: object-native-data-rustfs-latency
+  - assert-objects: { source: slow-lake, prefix: state/cayenne/v1/datasets/snap_full-, contains: .vortex, min: 1, max: 32 }
+    eventually: 60s
+    only: object-native-data-rustfs-latency

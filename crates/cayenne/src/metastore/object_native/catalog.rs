@@ -74,8 +74,55 @@ pub struct ObjectNativeCatalog {
     datasets: Path,
     transactions: Path,
     routes: RwLock<Routes>,
-    /// Serializes creating and dropping datasets.
-    ddl: tokio::sync::Mutex<()>,
+    /// Serializes creating and dropping datasets, and deleting a dropped
+    /// dataset's folder.
+    ddl: Arc<tokio::sync::Mutex<()>>,
+    /// Folders of datasets dropped in this process whose deletion is pending.
+    dropping: Arc<parking_lot::Mutex<HashSet<String>>>,
+    /// What tells whether this process still reads each table's files, by table
+    /// id: a dropped dataset's folder is deleted once none of its tables is read.
+    readers: parking_lot::Mutex<HashMap<String, Vec<TableReaders>>>,
+}
+
+/// Whether this process still reads one table's files: the scans in flight on
+/// it, by snapshot, and the hold a restore point being taken keeps on its
+/// deletions. Weak, so a table that is gone reads nothing.
+#[derive(Clone, Debug)]
+pub struct TableReaders {
+    scans: std::sync::Weak<parking_lot::Mutex<HashMap<String, usize>>>,
+    deletions: std::sync::Weak<tokio::sync::RwLock<()>>,
+}
+
+impl TableReaders {
+    /// The readers of a table whose scans count themselves in `scans` and whose
+    /// restore points hold `deletions` shared.
+    #[must_use]
+    pub fn new(
+        scans: &Arc<parking_lot::Mutex<HashMap<String, usize>>>,
+        deletions: &Arc<tokio::sync::RwLock<()>>,
+    ) -> Self {
+        Self {
+            scans: Arc::downgrade(scans),
+            deletions: Arc::downgrade(deletions),
+        }
+    }
+
+    /// Whether a scan or a restore point still reads the table's files.
+    fn reading(&self) -> bool {
+        let scanning = self
+            .scans
+            .upgrade()
+            .is_some_and(|scans| !scans.lock().is_empty());
+        let archiving = self
+            .deletions
+            .upgrade()
+            .is_some_and(|fence| fence.try_write().is_err());
+        scanning || archiving
+    }
+
+    fn gone(&self) -> bool {
+        self.scans.strong_count() == 0 && self.deletions.strong_count() == 0
+    }
 }
 
 /// Which log holds each table.
@@ -149,6 +196,62 @@ fn created_at(name: &str) -> Option<chrono::DateTime<chrono::Utc>> {
     let id = name.get(name.len().checked_sub(36)?..)?;
     let (seconds, nanos) = uuid::Uuid::parse_str(id).ok()?.get_timestamp()?.to_unix();
     chrono::DateTime::from_timestamp(i64::try_from(seconds).ok()?, nanos)
+}
+
+/// Delete a dropped dataset's folder at `prefix`: its data through
+/// `data_store`, its log through `store`, in batched requests, and its `dropped`
+/// marker last. Returns the data files and bytes deleted.
+async fn delete_dropped_folder(
+    store: &Arc<dyn ObjectStore>,
+    data_store: &Arc<dyn ObjectStore>,
+    prefix: &Path,
+) -> CatalogResult<(u64, u64)> {
+    let marker = prefix.clone().join(DROPPED);
+    let data = prefix.clone().join("data");
+    let listed: Vec<object_store::ObjectMeta> = store
+        .list(Some(prefix))
+        .try_collect()
+        .await
+        .map_err(invalid)?;
+    let (data_objects, log_objects): (Vec<_>, Vec<_>) = listed
+        .into_iter()
+        .filter(|meta| meta.location != marker)
+        .partition(|meta| meta.location.prefix_matches(&data));
+    let sizes: HashMap<Path, u64> = data_objects
+        .iter()
+        .map(|meta| (meta.location.clone(), meta.size))
+        .collect();
+    let data_deleted = crate::dataset_storage::delete_in_batches(
+        data_store,
+        data_objects.into_iter().map(|meta| meta.location).collect(),
+    )
+    .await;
+    let log_deleted = crate::dataset_storage::delete_in_batches(
+        store,
+        log_objects.into_iter().map(|meta| meta.location).collect(),
+    )
+    .await;
+    for outcome in [&data_deleted, &log_deleted] {
+        if let Some(error) = &outcome.first_error {
+            return Err(invalid(error));
+        }
+        if outcome.failed > 0 {
+            return Err(invalid(format!(
+                "{} object(s) were neither deleted nor reported absent",
+                outcome.failed
+            )));
+        }
+    }
+    let files = u64::try_from(data_deleted.deleted.len()).unwrap_or(u64::MAX);
+    let bytes = data_deleted
+        .deleted
+        .iter()
+        .map(|path| sizes.get(path).copied().unwrap_or(0))
+        .sum();
+    match store.delete(&marker).await {
+        Ok(()) | Err(object_store::Error::NotFound { .. }) => Ok((files, bytes)),
+        Err(error) => Err(invalid(error)),
+    }
 }
 
 /// Delete every object under `prefix`.
@@ -715,7 +818,9 @@ impl ObjectNativeCatalog {
             datasets,
             transactions,
             routes: RwLock::new(routes),
-            ddl: tokio::sync::Mutex::new(()),
+            ddl: Arc::new(tokio::sync::Mutex::new(())),
+            dropping: Arc::new(parking_lot::Mutex::new(HashSet::new())),
+            readers: parking_lot::Mutex::new(HashMap::new()),
         };
         catalog.recover().await?;
         catalog.reclaim().await?;
@@ -775,6 +880,90 @@ impl ObjectNativeCatalog {
         let folder = rest.strip_suffix("/data")?;
         let uuid = folder.strip_prefix(&format!("{}-", slug(name)))?;
         (!folder.contains('/') && uuid::Uuid::parse_str(uuid).is_ok()).then(|| folder.to_string())
+    }
+
+    /// Tell the catalog how to see whether this process still reads `table_id`'s
+    /// files, so dropping its dataset waits for those reads before deleting them.
+    pub fn register_readers(&self, table_id: &str, readers: TableReaders) {
+        let mut registered = self.readers.lock();
+        registered.retain(|_, tables| {
+            tables.retain(|table| !table.gone());
+            !tables.is_empty()
+        });
+        registered
+            .entry(table_id.to_string())
+            .or_default()
+            .push(readers);
+    }
+
+    /// Whether `path`, a table's recorded data path, is a dataset folder's data in
+    /// this catalog's location: its files go with the dataset's folder when the
+    /// dataset is dropped.
+    #[must_use]
+    pub fn holds_data_at(&self, path: &str) -> bool {
+        let Ok(url) = url::Url::parse(path) else {
+            return false;
+        };
+        url.path()
+            .trim_matches('/')
+            .strip_prefix(self.datasets.as_ref())
+            .and_then(|rest| rest.strip_prefix('/'))
+            .and_then(|rest| rest.split_once('/'))
+            .is_some_and(|(folder, rest)| {
+                !folder.is_empty() && (rest == "data" || rest.starts_with("data/"))
+            })
+    }
+
+    /// Delete a dropped dataset's folder, its log and its data, once this process
+    /// no longer reads it: `dropped_grace` after the drop, and then once every
+    /// scan of its tables has ended and no restore point is being taken from
+    /// them. The `dropped` marker goes last, so a process that stops first leaves
+    /// the folder to a later open's [`Self::reclaim`].
+    fn reclaim_dropped_folder(&self, name: &str, folder: &str, readers: Vec<TableReaders>) {
+        let store = Arc::clone(&self.store);
+        let data_store = self.data_store();
+        let prefix = self.datasets.clone().join(folder);
+        let grace = self.config.dropped_grace;
+        let name = name.to_string();
+        let folder = folder.to_string();
+        let ddl = Arc::clone(&self.ddl);
+        let dropping = Arc::clone(&self.dropping);
+        dropping.lock().insert(folder.clone());
+        tokio::spawn(async move {
+            tokio::time::sleep(grace).await;
+            while readers.iter().any(TableReaders::reading) {
+                tokio::time::sleep(grace.max(std::time::Duration::from_millis(100))).await;
+            }
+            // Under the DDL lock, so no create can take the folder while it goes.
+            let _ddl = ddl.lock().await;
+            if !dropping.lock().remove(&folder) {
+                return;
+            }
+            match delete_dropped_folder(&store, &data_store, &prefix).await {
+                Ok((files, bytes)) => {
+                    crate::provider::maintenance_metrics::track_reclaimed(
+                        &name,
+                        crate::provider::maintenance_metrics::MaintenanceOp::RetiredDirSweep,
+                        files,
+                        bytes,
+                        0,
+                    );
+                    tracing::debug!(
+                        "Deleted the {files} object(s) of dataset '{name}''s dropped acceleration in '{prefix}'"
+                    );
+                }
+                Err(error) => {
+                    crate::provider::maintenance_metrics::track_maintenance(
+                        &name,
+                        crate::provider::maintenance_metrics::MaintenanceOp::RetiredDirSweep,
+                        crate::provider::maintenance_metrics::MaintenanceOutcome::Failed,
+                    );
+                    tracing::warn!(
+                        "Failed to delete the files of dataset '{name}''s dropped acceleration under '{prefix}', so they keep using storage until Spice deletes them at a start at least an hour after the drop; no data is lost. Cause: {error}"
+                    );
+                }
+            }
+        });
     }
 
     /// The prefix of the log that holds `dataset`, for tools and tests that read
@@ -912,6 +1101,12 @@ impl ObjectNativeCatalog {
         let Some(domain) = domain else {
             return self.registry.drop_table(name).await;
         };
+        let table_ids: Vec<String> = domain
+            .tables()
+            .await
+            .into_iter()
+            .map(|(id, _, _)| id)
+            .collect();
         let dropped = domain.drop_table(name).await?;
         if own.is_some_and(|own| Arc::ptr_eq(&own, &domain)) {
             // Written before the registry forgets the name, so a log no name
@@ -936,9 +1131,20 @@ impl ObjectNativeCatalog {
                     .map(|((source, partition), value)| position(&source, &partition, Some(value))),
             );
             self.registry.commit_actions(unregister).await?;
-            let mut routes = self.routes.write();
-            routes.refresh(&domain, Vec::new());
-            routes.datasets.remove(name);
+            {
+                let mut routes = self.routes.write();
+                routes.refresh(&domain, Vec::new());
+                routes.datasets.remove(name);
+            }
+            let readers: Vec<TableReaders> = {
+                let mut registered = self.readers.lock();
+                table_ids
+                    .iter()
+                    .filter_map(|id| registered.remove(id))
+                    .flatten()
+                    .collect()
+            };
+            self.reclaim_dropped_folder(name, &domain.folder, readers);
             return Ok(dropped);
         }
         let tables = domain.tables().await;
@@ -1337,6 +1543,10 @@ impl MetadataCatalog for ObjectNativeCatalog {
 
     async fn create_table(&self, options: CreateTableOptions) -> CatalogResult<String> {
         let _ddl = self.ddl.lock().await;
+        if let Some(folder) = self.folder_named_by(&options.table_name, &options.base_path) {
+            // A create that names a folder whose deletion is pending keeps it.
+            self.dropping.lock().remove(&folder);
+        }
         self.create_dataset(options).await
     }
 
@@ -1478,6 +1688,21 @@ impl MetadataCatalog for ObjectNativeCatalog {
     async fn get_all_snapshot_files(&self, table_id: &str) -> CatalogResult<Vec<SnapshotFile>> {
         self.for_table(table_id)
             .get_all_snapshot_files(table_id)
+            .await
+    }
+    fn keeps_retirement_record(&self) -> bool {
+        true
+    }
+    async fn retired_snapshots(&self, table_id: &str) -> CatalogResult<Option<Vec<String>>> {
+        self.for_table(table_id).retired_snapshots(table_id).await
+    }
+    async fn forget_retired_snapshots(
+        &self,
+        table_id: &str,
+        snapshot_ids: &[String],
+    ) -> CatalogResult<bool> {
+        self.for_table(table_id)
+            .forget_retired_snapshots(table_id, snapshot_ids)
             .await
     }
     async fn get_snapshot_files(

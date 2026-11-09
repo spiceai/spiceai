@@ -4224,6 +4224,21 @@ impl MetadataCatalog for CayenneCatalog {
             .await
     }
 
+    fn keeps_retirement_record(&self) -> bool {
+        false
+    }
+    async fn retired_snapshots(&self, _table_id: &str) -> CatalogResult<Option<Vec<String>>> {
+        // The SQLite metastore keeps no retirement record; its tables sweep the
+        // directories they retired in this process.
+        Ok(None)
+    }
+    async fn forget_retired_snapshots(
+        &self,
+        _table_id: &str,
+        _snapshot_ids: &[String],
+    ) -> CatalogResult<bool> {
+        Ok(false)
+    }
     async fn get_all_snapshot_files(&self, table_id: &str) -> CatalogResult<Vec<SnapshotFile>> {
         self.metastore
             .query_helper(

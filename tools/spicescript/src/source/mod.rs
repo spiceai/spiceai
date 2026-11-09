@@ -121,6 +121,11 @@ pub trait Source: Send + Sync {
         anyhow::bail!("this source has no objects to list under '{prefix}'")
     }
 
+    /// The objects (or files) under `prefix` in this namespace, with their sizes.
+    async fn sizes(&self, _namespace: &str, prefix: &str) -> Result<Vec<(String, u64)>> {
+        anyhow::bail!("this source has no objects to list under '{prefix}'")
+    }
+
     /// Writes a generated table: by default creates it (unless appending) and
     /// loads the rows.
     async fn generate(&self, namespace: &str, spec: &crate::generate::TableSpec) -> Result<u64> {

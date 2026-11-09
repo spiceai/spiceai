@@ -7571,6 +7571,9 @@ impl CayenneTableProvider {
         if !self.maintenance_still_admitted() {
             return;
         }
+        // Snapshots a commit retired without naming them here (an overwrite or a
+        // full rewrite moves the current snapshot) go to the retired ledger too.
+        self.adopt_durable_retirements().await;
         let (protected_snapshot_ids, in_use_snapshot_ids) = self.snapshot_cleanup_pins();
         let pins = SnapshotSweepPins {
             current_snapshot_id: self.get_current_snapshot_id(),
@@ -7853,6 +7856,62 @@ impl CayenneTableProvider {
         }
     }
 
+    /// Adopt the catalog's durable retirement record on a background task: see
+    /// [`Self::adopt_durable_retirements`].
+    fn schedule_durable_retirement_adoption(&self) {
+        if !self.catalog.keeps_retirement_record()
+            || !self.data_in_store()
+            || !self.maintenance_still_admitted()
+        {
+            return;
+        }
+        let table = self.clone_for_write();
+        tokio::spawn(async move {
+            table.adopt_durable_retirements().await;
+        });
+    }
+
+    /// Put every snapshot the catalog's durable retirement record names into the
+    /// retired ledger, so the retired-directory sweep deletes their files once
+    /// their grace passes: snapshots retired before a restart, and those a commit
+    /// retired without naming them here (an overwrite or a full rewrite moves the
+    /// current snapshot). A snapshot this instance still reads as current or
+    /// protected is left for a later pass.
+    async fn adopt_durable_retirements(&self) {
+        if !self.catalog.keeps_retirement_record() || !self.data_in_store() {
+            return;
+        }
+        let table_name = self.table_metadata.table_name.as_str();
+        match self
+            .catalog
+            .retired_snapshots(&self.table_metadata.table_id)
+            .await
+        {
+            Ok(Some(ids)) => {
+                let current = self.get_current_snapshot_id();
+                let protected = self.protected_snapshots.load();
+                self.retire_snapshot_dirs(
+                    ids.iter()
+                        .map(String::as_str)
+                        .filter(|id| *id != current && !protected.contains_key(*id)),
+                );
+            }
+            Ok(None) => {}
+            Err(error) => {
+                tracing::warn!(
+                    target: "cayenne::compaction",
+                    table = table_name,
+                    "Failed to read which snapshots of table '{table_name}' are retired, so their files keep using storage until a later sweep retries; no data is lost. Cause: {error}"
+                );
+                maintenance_metrics::track_maintenance(
+                    table_name,
+                    MaintenanceOp::RetiredDirSweep,
+                    MaintenanceOutcome::Failed,
+                );
+            }
+        }
+    }
+
     /// The pins the instance replacing this one must be opened over.
     #[must_use]
     pub fn snapshot_dir_pins(&self) -> SnapshotDirPins {
@@ -7961,9 +8020,7 @@ impl CayenneTableProvider {
     /// finishing starts another.
     fn follow_up_retired_snapshot_dirs(&self) {
         if !self.maintenance_still_admitted()
-            || self
-                .retired_snapshot_follow_up
-                .swap(true, Ordering::AcqRel)
+            || self.retired_snapshot_follow_up.swap(true, Ordering::AcqRel)
         {
             return;
         }
@@ -8824,51 +8881,67 @@ impl CayenneTableProvider {
 
     /// Delete `objects` and evict them from the file caches, returning what this
     /// call deleted (an object already gone counts as nothing reclaimed) along
-    /// with the first error. Every object is attempted; the totals cover the
+    /// with the first error. Every object is attempted, in batched requests
+    /// ([`crate::dataset_storage::delete_in_batches`]); the totals cover the
     /// deletes that succeeded even when another failed.
     async fn delete_objects_counted(
         &self,
         objects: Vec<ObjectMeta>,
         operation: &'static str,
     ) -> (RetiredDirReclaim, Result<()>) {
-        let mut reclaimed = RetiredDirReclaim::default();
         let store = match self.require_object_store() {
             Ok(config) => Arc::clone(&config.store),
-            Err(error) => return (reclaimed, Err(error)),
+            Err(error) => return (RetiredDirReclaim::default(), Err(error)),
         };
-        let table_name = self.table_metadata.table_name.clone();
-        let deletes = stream::iter(objects).map(|meta| {
-            let store = Arc::clone(&store);
-            let table_name = table_name.clone();
-            async move {
-                let location = meta.location;
-                match store.delete(&location).await {
-                    Ok(()) => Ok((location, Some(meta.size))),
-                    Err(object_store::Error::NotFound { .. }) => Ok((location, None)),
-                    Err(source) => Err(Error::ObjectStore {
-                        operation,
-                        table: table_name,
-                        source,
-                    }),
-                }
-            }
-        });
-        let mut deletes = deletes.buffer_unordered(OBJECT_STORE_MOVE_CONCURRENCY);
-        let mut retired_cache_paths = HashSet::new();
-        let mut first_error = None;
-        while let Some(result) = deletes.next().await {
-            match result {
-                Ok((path, freed)) => {
-                    if let Some(size) = freed {
-                        reclaimed.files = reclaimed.files.saturating_add(1);
-                        reclaimed.bytes = reclaimed.bytes.saturating_add(size);
-                    }
-                    retired_cache_paths.insert(path);
-                }
-                Err(error) if first_error.is_none() => first_error = Some(error),
-                Err(_) => {}
-            }
+        self.delete_sized_counted(
+            &store,
+            objects
+                .into_iter()
+                .map(|meta| (meta.location, meta.size))
+                .collect(),
+            operation,
+        )
+        .await
+    }
+
+    /// [`Self::delete_objects_counted`] over `(path, size)` pairs through `store`.
+    async fn delete_sized_counted(
+        &self,
+        store: &Arc<dyn ObjectStore>,
+        objects: Vec<(ObjectStorePath, u64)>,
+        operation: &'static str,
+    ) -> (RetiredDirReclaim, Result<()>) {
+        let mut reclaimed = RetiredDirReclaim::default();
+        let sizes: HashMap<ObjectStorePath, u64> = objects.iter().cloned().collect();
+        let outcome = crate::dataset_storage::delete_in_batches(
+            store,
+            objects.into_iter().map(|(path, _)| path).collect(),
+        )
+        .await;
+        for path in &outcome.deleted {
+            reclaimed.files = reclaimed.files.saturating_add(1);
+            reclaimed.bytes = reclaimed
+                .bytes
+                .saturating_add(sizes.get(path).copied().unwrap_or(0));
         }
+        let first_error = outcome.first_error.map(|source| Error::ObjectStore {
+            operation,
+            table: self.table_metadata.table_name.clone(),
+            source,
+        });
+        let first_error = match first_error {
+            Some(error) => Some(error),
+            None if outcome.failed > 0 => Some(Error::Internal {
+                table: self.table_metadata.table_name.clone(),
+                message: format!(
+                    "{} object(s) were neither deleted nor reported absent by the store",
+                    outcome.failed
+                ),
+            }),
+            None => None,
+        };
+        let mut retired_cache_paths = outcome.deleted;
+        retired_cache_paths.extend(outcome.missing);
         self.invalidate_retired_paths(retired_cache_paths).await;
         (reclaimed, first_error.map_or(Ok(()), Err))
     }
@@ -9006,20 +9079,57 @@ impl CayenneTableProvider {
     }
 
     /// Object-store mirror of the detached deletion in
-    /// [`Self::sweep_retired_snapshot_dirs`]: delete each due retired snapshot
-    /// prefix, keeping files a live snapshot references in place, and drop the
-    /// ledger entry once nothing is left under it.
+    /// [`Self::sweep_retired_snapshot_dirs`]: delete each due retired snapshot's
+    /// files, keeping files a live snapshot references in place, and drop the
+    /// ledger entry once they are gone.
+    ///
+    /// With a catalog that keeps the durable retirement record
+    /// ([`MetadataCatalog::retired_snapshots`]), only snapshots a committed change
+    /// retired are touched, their files are the ones their manifest rows name (a
+    /// snapshot with none is listed), deletes go out in batches of at most
+    /// [`crate::dataset_storage::DELETE_BATCH`] keys, and each batch's snapshots
+    /// are forgotten in one commit once their files are gone. A crash between the
+    /// deletes and that commit leaves the snapshots retired, and the next pass,
+    /// in this process or after a restart, deletes what is left and forgets them.
     async fn sweep_retired_snapshot_prefixes(
         &self,
         due: Vec<String>,
         live_snapshot_ids: &HashSet<String>,
     ) {
         let table_name = self.table_metadata.table_name.as_str();
-        let all_rows = match self
-            .catalog
-            .get_all_snapshot_files(&self.table_metadata.table_id)
-            .await
-        {
+        let table_id = self.table_metadata.table_id.as_str();
+        let durable: Option<HashSet<String>> = if self.catalog.keeps_retirement_record() {
+            match self.catalog.retired_snapshots(table_id).await {
+                Ok(Some(ids)) => Some(ids.into_iter().collect()),
+                // A change to the table is applied but not committed, its last
+                // commit's outcome is unknown, or a transaction reserves it: no
+                // committed record licenses a delete yet, so come back later.
+                Ok(None) => {
+                    maintenance_metrics::track_maintenance(
+                        table_name,
+                        MaintenanceOp::RetiredDirSweep,
+                        MaintenanceOutcome::DeclinedNotDue,
+                    );
+                    return;
+                }
+                Err(error) => {
+                    tracing::warn!(
+                        target: "cayenne::compaction",
+                        table = table_name,
+                        "Failed to read which snapshots of table '{table_name}' are retired, so their files keep using storage until a later sweep retries; no data is lost. Cause: {error}"
+                    );
+                    maintenance_metrics::track_maintenance(
+                        table_name,
+                        MaintenanceOp::RetiredDirSweep,
+                        MaintenanceOutcome::Failed,
+                    );
+                    return;
+                }
+            }
+        } else {
+            None
+        };
+        let all_rows = match self.catalog.get_all_snapshot_files(table_id).await {
             Ok(rows) => rows,
             Err(error) => {
                 tracing::warn!(target: "cayenne::compaction", table = table_name, %error, "Retired-prefix sweep skipped: failed to read snapshot manifest (will retry)");
@@ -9040,47 +9150,120 @@ impl CayenneTableProvider {
                 return;
             }
         };
+        let keeps = |id: &str, name: &str| {
+            live_referenced
+                .as_ref()
+                .is_some_and(|live| live.contains(&Self::manifest_file_relative_path(id, name)))
+        };
         let (mut reclaimed_dirs, mut failed_dirs) = (0_u64, 0_u64);
-        let mut reclaimed = RetiredDirReclaim::default();
+        let mut planned: Vec<(String, Vec<(ObjectStorePath, u64)>)> = Vec::with_capacity(due.len());
         for id in due {
-            let prefix = ObjectStorePath::from(format!("{root}{id}/"));
-            let listed: Vec<ObjectMeta> = match store.list(Some(&prefix)).try_collect().await {
-                Ok(listed) => listed,
-                Err(error) => {
-                    failed_dirs = failed_dirs.saturating_add(1);
-                    tracing::warn!(target: "cayenne::compaction", table = table_name, snapshot_id = %id, %error, "Failed to list retired snapshot prefix (will retry)");
-                    continue;
-                }
+            if let Some(durable) = &durable
+                && !durable.contains(&id)
+            {
+                // Forgotten by an earlier pass once its files were gone: nothing
+                // committed licenses another delete under it.
+                self.retired_snapshot_dirs.lock().remove(&id);
+                self.snapshot_last_listed.lock().remove(&id);
+                continue;
+            }
+            let named: Vec<(ObjectStorePath, u64)> = if durable.is_some() {
+                all_rows
+                    .iter()
+                    .filter(|row| row.snapshot_id == id && !keeps(&id, &row.file_path))
+                    .map(|row| {
+                        (
+                            ObjectStorePath::from(format!("{root}{id}/{}", row.file_path)),
+                            u64::try_from(row.file_size_bytes).unwrap_or(0),
+                        )
+                    })
+                    .collect()
+            } else {
+                Vec::new()
             };
-            // With a manifest, keep every file a live snapshot references in place;
-            // without one, no cross-snapshot reference can exist.
-            let doomed: Vec<ObjectMeta> = match &live_referenced {
-                Some(live) => listed
+            let has_rows = all_rows.iter().any(|row| row.snapshot_id == id);
+            let doomed = if durable.is_some() && has_rows {
+                named
+            } else {
+                let prefix = ObjectStorePath::from(format!("{root}{id}/"));
+                let listed: Vec<ObjectMeta> = match store.list(Some(&prefix)).try_collect().await {
+                    Ok(listed) => listed,
+                    Err(error) => {
+                        failed_dirs = failed_dirs.saturating_add(1);
+                        tracing::warn!(target: "cayenne::compaction", table = table_name, snapshot_id = %id, %error, "Failed to list retired snapshot prefix (will retry)");
+                        continue;
+                    }
+                };
+                // With a manifest, keep every file a live snapshot references in
+                // place; without one, no cross-snapshot reference can exist.
+                listed
                     .into_iter()
                     .filter(|meta| {
-                        meta.location.filename().is_some_and(|name| {
-                            Self::is_compactable_data_file(name)
-                                && !live.contains(&Self::manifest_file_relative_path(&id, name))
-                        })
+                        live_referenced.is_none()
+                            || meta.location.filename().is_some_and(|name| {
+                                Self::is_compactable_data_file(name) && !keeps(&id, name)
+                            })
                     })
-                    .collect(),
-                None => listed,
+                    .map(|meta| (meta.location, meta.size))
+                    .collect()
             };
+            planned.push((id, doomed));
+        }
+        let mut reclaimed = RetiredDirReclaim::default();
+        for batch in Self::retired_delete_batches(planned) {
+            let ids: Vec<String> = batch.iter().map(|(id, _)| id.clone()).collect();
+            let objects: Vec<(ObjectStorePath, u64)> =
+                batch.into_iter().flat_map(|(_, objects)| objects).collect();
             let (deleted, outcome) = self
-                .delete_objects_counted(doomed, "delete object from snapshot cleanup")
+                .delete_sized_counted(&store, objects, "delete object from snapshot cleanup")
                 .await;
             reclaimed.files = reclaimed.files.saturating_add(deleted.files);
             reclaimed.bytes = reclaimed.bytes.saturating_add(deleted.bytes);
             if let Err(error) = outcome {
-                failed_dirs = failed_dirs.saturating_add(1);
-                tracing::warn!(target: "cayenne::compaction", table = table_name, snapshot_id = %id, %error, "Failed to delete retired snapshot prefix (will retry)");
+                failed_dirs =
+                    failed_dirs.saturating_add(u64::try_from(ids.len()).unwrap_or(u64::MAX));
+                tracing::warn!(
+                    target: "cayenne::compaction",
+                    table = table_name,
+                    "Failed to delete files of {} snapshot(s) of table '{table_name}' that no query reads any more, so they keep using storage until a later sweep retries; no data is lost. Cause: {error}",
+                    ids.len()
+                );
                 continue;
             }
-            let remaining: Vec<_> = match store.list(Some(&prefix)).try_collect().await {
-                Ok(remaining) => remaining,
-                Err(_) => continue,
+            let gone: Vec<String> = if durable.is_some() {
+                match self.catalog.forget_retired_snapshots(table_id, &ids).await {
+                    Ok(true) => ids,
+                    // A transaction reserves the table: the files are gone, and a
+                    // later pass forgets the snapshots.
+                    Ok(false) => continue,
+                    Err(error) => {
+                        failed_dirs = failed_dirs
+                            .saturating_add(u64::try_from(ids.len()).unwrap_or(u64::MAX));
+                        tracing::warn!(
+                            target: "cayenne::compaction",
+                            table = table_name,
+                            "Deleted the files of {} retired snapshot(s) of table '{table_name}' but failed to record it, so a later sweep records it again; no data is lost. Cause: {error}",
+                            ids.len()
+                        );
+                        continue;
+                    }
+                }
+            } else {
+                let mut gone = Vec::with_capacity(ids.len());
+                for id in ids {
+                    let prefix = ObjectStorePath::from(format!("{root}{id}/"));
+                    if let Ok(remaining) = store
+                        .list(Some(&prefix))
+                        .try_collect::<Vec<ObjectMeta>>()
+                        .await
+                        && remaining.is_empty()
+                    {
+                        gone.push(id);
+                    }
+                }
+                gone
             };
-            if remaining.is_empty() {
+            for id in gone {
                 self.retired_snapshot_dirs.lock().remove(&id);
                 self.snapshot_last_listed.lock().remove(&id);
                 reclaimed_dirs = reclaimed_dirs.saturating_add(1);
@@ -9103,6 +9286,29 @@ impl CayenneTableProvider {
                 0,
             );
         }
+    }
+
+    /// Group retired snapshots' deletions into batches of at most
+    /// [`crate::dataset_storage::DELETE_BATCH`] objects, in order; a snapshot
+    /// with more objects than that is a batch of its own. Pure; extracted for
+    /// unit tests.
+    fn retired_delete_batches<T>(planned: Vec<(String, Vec<T>)>) -> Vec<Vec<(String, Vec<T>)>> {
+        let mut batches: Vec<Vec<(String, Vec<T>)>> = Vec::new();
+        let mut size = 0_usize;
+        for (id, objects) in planned {
+            let n = objects.len();
+            let fits = batches.last().is_some() && size + n <= crate::dataset_storage::DELETE_BATCH;
+            if fits {
+                if let Some(last) = batches.last_mut() {
+                    last.push((id, objects));
+                }
+                size += n;
+            } else {
+                batches.push(vec![(id, objects)]);
+                size = n;
+            }
+        }
+        batches
     }
 
     async fn delete_prefix_refcounted(
@@ -9854,27 +10060,33 @@ impl CayenneTableProvider {
                 .await?;
         }
 
-        // Phase 2: delete staging originals.
+        // Phase 2: delete staging originals, in batched requests.
         let store = Arc::clone(&config.store);
-        let table_name = self.table_metadata.table_name.clone();
-        stream::iter(
+        let outcome = crate::dataset_storage::delete_in_batches(
+            &store,
             file_moves
                 .iter()
                 .map(|(source, _)| source.clone())
-                .map(Ok::<_, Error>),
+                .collect(),
         )
-        .try_for_each_concurrent(OBJECT_STORE_MOVE_CONCURRENCY, |source| {
-            let store = Arc::clone(&store);
-            let table_name = table_name.clone();
-            async move {
-                store.delete(&source).await.map_err(|e| Error::ObjectStore {
-                    operation: "delete staging file after copy",
-                    table: table_name,
-                    source: e,
-                })
+        .await;
+        if let Some(source) = outcome.first_error {
+            return Err(Error::ObjectStore {
+                operation: "delete staging file after copy",
+                table: self.table_metadata.table_name.clone(),
+                source,
+            });
+        }
+        ensure!(
+            outcome.failed == 0,
+            InternalSnafu {
+                table: self.table_metadata.table_name.clone(),
+                message: format!(
+                    "{} staging file(s) were neither deleted nor reported absent after their copy",
+                    outcome.failed
+                ),
             }
-        })
-        .await?;
+        );
 
         tracing::debug!(
             "Moved {} file(s) from staging to snapshot {current_snapshot} (S3) for table {}",
@@ -11046,6 +11258,27 @@ impl CayenneTableProvider {
         // enabled, one directory listing only when the manifest reads back empty,
         // and one `listing_fence` read acquisition across them.
         provider.schedule_orphan_dv_sweep();
+
+        // Startup replay for the durable retirement record: the files of
+        // snapshots a commit retired before a restart, or during a sweep a crash
+        // stopped, are deleted by this instance's sweep once their grace passes.
+        provider.schedule_durable_retirement_adoption();
+
+        // Dropping this table's dataset deletes its folder once this process no
+        // longer reads it: the catalog asks these pins first.
+        if let Some(native) = provider
+            .catalog
+            .as_any()
+            .downcast_ref::<crate::metastore::object_native::ObjectNativeCatalog>(
+        ) {
+            native.register_readers(
+                &provider.table_metadata.table_id,
+                crate::metastore::object_native::TableReaders::new(
+                    &provider.snapshot_scan_refs,
+                    &provider.file_deletion_fence,
+                ),
+            );
+        }
 
         if let Err(error) = provider
             .rebuild_maintained_aggregates_from_visible_state()
@@ -15333,27 +15566,18 @@ impl CayenneTableProvider {
                 table: table_name.clone(),
                 message: format!("failed to resolve object store: {err}"),
             })?;
-        let mut deletes = stream::iter(locations.into_iter().map(|location| {
-            let store = Arc::clone(&store);
-            async move {
-                match store.delete(&location).await {
-                    Ok(()) | Err(object_store::Error::NotFound { .. }) => Ok(location),
-                    Err(source) => Err(source),
-                }
-            }
-        }))
-        .buffer_unordered(OBJECT_STORE_MOVE_CONCURRENCY);
-        let mut removed = HashSet::new();
-        let mut first_error = None;
-        while let Some(result) = deletes.next().await {
-            match result {
-                Ok(location) => {
-                    removed.insert(location);
-                }
-                Err(source) if first_error.is_none() => first_error = Some(source),
-                Err(_) => {}
-            }
+        let outcome = crate::dataset_storage::delete_in_batches(&store, locations).await;
+        let failed = outcome.failed;
+        let mut first_error = outcome.first_error;
+        if first_error.is_none() && failed > 0 {
+            first_error = Some(object_store::Error::Generic {
+                store: "cayenne",
+                source: format!("{failed} object(s) were neither deleted nor reported absent")
+                    .into(),
+            });
         }
+        let mut removed = outcome.deleted;
+        removed.extend(outcome.missing);
         self.invalidate_retired_paths(removed).await;
         // The query that found the superseded copies listed this directory
         // through the shared list-files cache, and nothing else is guaranteed to
@@ -23155,6 +23379,16 @@ impl CayenneTableProvider {
         drop(Arc::clone(&self.file_deletion_fence).read_owned().await);
     }
 
+    /// Test-only: adopt the catalog's durable retirement record, then run the
+    /// retired-directory sweep as if the grace had elapsed, and every cached scan
+    /// view no scan holds had gone idle, and wait for its deletions.
+    #[doc(hidden)]
+    pub async fn reclaim_retired_snapshots_now(&self) {
+        self.evict_stale_scan_view(Instant::now() + Self::SCAN_VIEW_EVICTION_INTERVAL * 4);
+        self.adopt_durable_retirements().await;
+        self.sweep_retired_snapshot_dirs_now().await;
+    }
+
     /// Whether [`Self::quiesce`] has closed this instance's maintenance.
     #[doc(hidden)]
     #[must_use]
@@ -23528,6 +23762,9 @@ impl CayenneTableProvider {
             reclaimed_tombstones =
                 reclaimed_tombstones.saturating_add(u64::try_from(df.delete_count).unwrap_or(0));
         };
+        // Deletion vectors in the dataset's store go out in batched requests
+        // first; the loop below reads each one's outcome.
+        let batched = self.delete_deletion_vector_objects(&orphaned).await;
         for df in &orphaned {
             if df.path_is_relative {
                 // Relative paths are object-store keys, not local fs paths; the
@@ -23546,12 +23783,11 @@ impl CayenneTableProvider {
                 None => Ok(None),
             };
             let unlinked = match location {
-                Ok(Some((store, location))) => match store.delete(&location).await {
-                    Ok(()) => Ok(()),
-                    Err(object_store::Error::NotFound { .. }) => {
-                        Err(std::io::Error::from(std::io::ErrorKind::NotFound))
-                    }
-                    Err(error) => Err(std::io::Error::other(error)),
+                Ok(Some(_)) => match batched.get(&df.path) {
+                    Some(Ok(true)) => Ok(()),
+                    Some(Ok(false)) => Err(std::io::Error::from(std::io::ErrorKind::NotFound)),
+                    Some(Err(error)) => Err(std::io::Error::other(error.clone())),
+                    None => Err(std::io::Error::other("the delete was not attempted")),
                 },
                 Ok(None) => tokio::fs::remove_file(&df.path).await,
                 Err(error) => Err(std::io::Error::other(error)),
@@ -23673,6 +23909,47 @@ impl CayenneTableProvider {
         } else {
             OrphanDvSweepPass::Complete
         }
+    }
+
+    /// Delete the deletion-vector objects among `files` that live in the
+    /// dataset's store, in batched requests
+    /// ([`crate::dataset_storage::delete_in_batches`]). By each file's recorded
+    /// path: `Ok(true)` deleted now, `Ok(false)` already absent, `Err` failed.
+    async fn delete_deletion_vector_objects(
+        &self,
+        files: &[crate::metadata::DeleteFile],
+    ) -> HashMap<String, std::result::Result<bool, String>> {
+        let Some(storage) = self.dataset_storage.as_ref() else {
+            return HashMap::new();
+        };
+        let mut by_location: HashMap<ObjectStorePath, String> = HashMap::new();
+        for file in files.iter().filter(|file| !file.path_is_relative) {
+            if let Ok(Some(location)) = storage.resolve(&file.path) {
+                by_location.insert(location, file.path.clone());
+            }
+        }
+        let outcome = crate::dataset_storage::delete_in_batches(
+            storage.store(),
+            by_location.keys().cloned().collect(),
+        )
+        .await;
+        let error = outcome.first_error.as_ref().map_or_else(
+            || "the store reported it neither deleted nor absent".to_string(),
+            ToString::to_string,
+        );
+        by_location
+            .into_iter()
+            .map(|(location, path)| {
+                let result = if outcome.deleted.contains(&location) {
+                    Ok(true)
+                } else if outcome.missing.contains(&location) {
+                    Ok(false)
+                } else {
+                    Err(error.clone())
+                };
+                (path, result)
+            })
+            .collect()
     }
 
     /// Capture ONE coherent orphan-eligibility view: the surviving-sequence floor

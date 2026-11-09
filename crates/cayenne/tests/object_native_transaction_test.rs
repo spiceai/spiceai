@@ -368,6 +368,88 @@ async fn a_change_to_a_reserved_dataset_waits_for_the_transaction() {
     );
 }
 
+/// While a transaction across datasets holds a dataset prepared, a sweep can
+/// neither read which of the dataset's snapshots are retired nor forget them: it
+/// waits for the transaction, so it never deletes on the strength of a state a
+/// pending outcome may change and never commits on a reserved table (a refused
+/// record would stop the dataset's log). It answers once the transaction is
+/// resolved, and the log keeps accepting changes.
+#[tokio::test]
+async fn a_sweep_waits_for_a_transaction_that_reserves_the_dataset() {
+    let (faults, _store, catalog, orders, audit) = setup().await;
+    let first = uuid::Uuid::now_v7().to_string();
+    let merged = uuid::Uuid::now_v7().to_string();
+    catalog
+        .commit_publications(&[publication(&orders, &first, 3)])
+        .await
+        .expect("publish a protected snapshot");
+    assert!(
+        catalog
+            .swap_protected_snapshots(&orders, std::slice::from_ref(&first), &merged, 4)
+            .await
+            .expect("merge")
+    );
+    assert_eq!(
+        catalog.retired_snapshots(&orders).await.expect("read"),
+        Some(vec![first.clone()])
+    );
+
+    faults.arm(Op::Create, is_decision, Fault::Hold);
+    let coordinator = tokio::spawn({
+        let catalog = Arc::clone(&catalog);
+        let (orders, audit) = (orders.clone(), audit.clone());
+        async move { catalog.commit_publications(&across(&orders, &audit)).await }
+    });
+    let held = faults.wait_held(None).await;
+    let read = tokio::spawn({
+        let catalog = Arc::clone(&catalog);
+        let orders = orders.clone();
+        async move { catalog.retired_snapshots(&orders).await }
+    });
+    let forget = tokio::spawn({
+        let catalog = Arc::clone(&catalog);
+        let (orders, first) = (orders.clone(), first.clone());
+        async move {
+            catalog
+                .forget_retired_snapshots(&orders, std::slice::from_ref(&first))
+                .await
+        }
+    });
+    // A bounded wait for something that must not happen.
+    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+    assert!(
+        !read.is_finished() && !forget.is_finished(),
+        "the sweep did not wait for the transaction"
+    );
+    faults.clear_rules();
+    faults.deliver(held).await.expect("the decision lands");
+    faults
+        .respond(held)
+        .expect("release the decision's response");
+    coordinator
+        .await
+        .expect("coordinator task")
+        .expect("the transaction commits");
+    let read = read.await.expect("read task").expect("read");
+    assert!(
+        read == Some(vec![first.clone()]) || read == Some(vec![]),
+        "the retired set after the transaction: {read:?}"
+    );
+    assert!(forget.await.expect("forget task").expect("forget"));
+    assert_eq!(
+        catalog.retired_snapshots(&orders).await.expect("read"),
+        Some(vec![])
+    );
+    assert_eq!(
+        published(&catalog, &orders, &audit).await,
+        [Some(5), Some(6)]
+    );
+    catalog
+        .commit_publications(&[publication(&orders, "orders-later", 7)])
+        .await
+        .expect("the log accepts changes after the sweep");
+}
+
 /// A dropped dataset's log, and the log of a create that stopped before the
 /// registry named the dataset, are removed once older than `reclaim_after`; the
 /// logs of datasets that exist are kept with their state.

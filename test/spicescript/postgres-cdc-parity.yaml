@@ -242,28 +242,35 @@ steps:
   - assert-files: { lacks: ['(^|/)s3:', '\.arrow$'] }
     only: &object-store-data [object-store-data-path-rustfs, object-native-data-rustfs]
 
-  # 180 s of CDC updates and deletes: the data files and deletion vectors in
-  # the bucket stay within the same bound halfway through and at the end, and
-  # the table still matches the source. The bounds are a few compactions' worth
-  # of the table (about 20,000 rows), far below what 180 s of unreclaimed
-  # snapshots would leave.
+  # 180 s of CDC updates and deletes at a fixed rate: the data files and
+  # deletion vectors in the bucket stay within the same bound halfway through
+  # and at the end, and the table still matches the source. The bounds are a
+  # few compactions' worth of the table (about 20,000 rows), far below what
+  # 180 s of unreclaimed snapshots would leave. In the state location the
+  # dataset's objects are sampled every 10 s across several reclamation cycles
+  # (a retired snapshot is deleted about 5 s after its retirement), as a series
+  # that must stay under the bound and not trend upward (#16133).
   - background:
       id: churn
       source-exec: { src: "UPDATE orders SET o_qty = (o_qty + 1) % 50 WHERE o_id % 97 = ${round} % 97; DELETE FROM orders WHERE o_id % 991 = ${round} % 991" }
       every: 1s
     only: *object-store-data
   - sleep: 90s
-    only: *object-store-data
+    only: object-store-data-path-rustfs
   - assert-objects: { source: lake, prefix: data/orders/, contains: .vortex, max: 400 }
     only: object-store-data-path-rustfs
   - assert-objects: { source: lake, prefix: data/orders/, contains: .arrow, max: 200 }
     only: object-store-data-path-rustfs
-  - assert-objects: { source: lake, prefix: state/cayenne/v1/datasets/orders-, contains: .vortex, max: 400 }
-    only: object-native-data-rustfs
-  - assert-objects: { source: lake, prefix: state/cayenne/v1/datasets/orders-, contains: .arrow, max: 200 }
-    only: object-native-data-rustfs
   - sleep: 90s
-    only: *object-store-data
+    only: object-store-data-path-rustfs
+  - sample-objects:
+      source: lake
+      prefix: state/cayenne/v1/datasets/orders-
+      contains: /data/
+      every: 10s
+      for: 180s
+      max-objects: 600
+    only: object-native-data-rustfs
   - stop-background: { id: churn }
     only: *object-store-data
   - query: SELECT * FROM orders
