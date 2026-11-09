@@ -176,7 +176,11 @@ impl ListingTableConnector for File {
         }
 
         let path = get_path(dataset);
+        // Canonical, so it compares equal to the root a resolved symlink target
+        // shares with it: a relative `.` and its absolute form are one inotify
+        // watch, and dropping the target's root must not drop this one.
         let watch_path = watch_root(&path);
+        let watch_path = watch_path.canonicalize().unwrap_or(watch_path);
         let directory_dataset = path.is_dir();
         let mode = if directory_dataset {
             RecursiveMode::Recursive
@@ -237,11 +241,13 @@ impl ListingTableConnector for File {
             }
 
             let mut extra_roots = Vec::new();
+            let mut file_watch = None;
             refresh_resolved_file_watch(
                 &mut watcher,
                 &path,
                 &watch_path,
                 &mut extra_roots,
+                &mut file_watch,
                 &watched_names,
             );
 
@@ -260,6 +266,7 @@ impl ListingTableConnector for File {
                                     &path,
                                     &watch_path,
                                     &mut extra_roots,
+                                    &mut file_watch,
                                     &watched_names,
                                 );
                                 pending = true;
@@ -320,13 +327,19 @@ fn watched_file_names(path: &Path) -> Vec<OsString> {
     names
 }
 
-/// The file names to accept events for and the extra directories to watch for
-/// `path`, read from where it resolves now. `None` while `path` does not resolve,
-/// so the caller keeps what it last watched.
-fn resolved_file_watch(
-    path: &Path,
-    configured_root: &Path,
-) -> Option<(Vec<OsString>, Vec<PathBuf>)> {
+/// What to watch for `path`, read from where it resolves now. `None` while
+/// `path` does not resolve, so the caller keeps what it last watched.
+struct ResolvedFileWatch {
+    /// File names whose events trigger a refresh.
+    names: Vec<OsString>,
+    /// Directories to watch besides the configured root.
+    roots: Vec<PathBuf>,
+    /// The file `path` resolves to, watched itself so writes through a hard
+    /// link in another directory are seen.
+    file: PathBuf,
+}
+
+fn resolved_file_watch(path: &Path, configured_root: &Path) -> Option<ResolvedFileWatch> {
     let resolved = path.canonicalize().ok()?;
     let mut names = Vec::new();
     if let Some(name) = path.file_name() {
@@ -343,7 +356,11 @@ fn resolved_file_watch(
     } else {
         vec![root]
     };
-    Some((names, roots))
+    Some(ResolvedFileWatch {
+        names,
+        roots,
+        file: resolved,
+    })
 }
 
 fn refresh_resolved_file_watch(
@@ -351,6 +368,7 @@ fn refresh_resolved_file_watch(
     path: &Path,
     configured_root: &Path,
     extra_roots: &mut Vec<PathBuf>,
+    file_watch: &mut Option<PathBuf>,
     names: &Mutex<Vec<OsString>>,
 ) {
     if path.is_dir() {
@@ -359,7 +377,12 @@ fn refresh_resolved_file_watch(
     // While the path does not resolve (a symlink whose target was deleted ahead
     // of its recreation), keep the last resolved name and parent watch, so the
     // recreation and the writes after it still trigger a refresh.
-    let Some((resolved_names, desired)) = resolved_file_watch(path, configured_root) else {
+    let Some(ResolvedFileWatch {
+        names: resolved_names,
+        roots: desired,
+        file,
+    }) = resolved_file_watch(path, configured_root)
+    else {
         return;
     };
     let mut guard = names
@@ -384,6 +407,18 @@ fn refresh_resolved_file_watch(
         }
     }
     *extra_roots = desired;
+
+    // Also watch the file itself, as the watcher did before it watched
+    // directories: a write through a hard link in another directory reaches
+    // only the inode. Re-arm it on every refresh, because a replace leaves the
+    // old watch on the replaced inode.
+    if let Some(old) = file_watch.take() {
+        let _ = watcher.unwatch(&old);
+    }
+    match watcher.watch(&file, RecursiveMode::NonRecursive) {
+        Ok(()) => *file_watch = Some(file),
+        Err(e) => tracing::debug!("Failed to watch resolved file {}: {e}", file.display()),
+    }
 }
 
 fn file_watch_event_is_relevant(event: &notify::Event, watched_names: Option<&[OsString]>) -> bool {
@@ -558,15 +593,131 @@ mod tests {
         let recreated = resolved_file_watch(&alias, &root);
         let _ = std::fs::remove_dir_all(&root);
 
-        let (names, roots) = resolved.expect("resolves before the delete");
-        assert!(names.iter().any(|name| name.as_os_str() == "actual.csv"));
-        assert_eq!(roots, vec![real_dir.clone()]);
+        let watch = resolved.expect("resolves before the delete");
+        assert!(
+            watch
+                .names
+                .iter()
+                .any(|name| name.as_os_str() == "actual.csv")
+        );
+        assert_eq!(watch.roots, vec![real_dir.clone()]);
+        assert_eq!(watch.file, real_dir.join("actual.csv"));
         assert!(
             while_gone.is_none(),
             "a dangling symlink must not replace the last resolved watch"
         );
-        let (names, roots) = recreated.expect("resolves after the recreate");
-        assert!(names.iter().any(|name| name.as_os_str() == "actual.csv"));
-        assert_eq!(roots, vec![real_dir]);
+        let watch = recreated.expect("resolves after the recreate");
+        assert!(
+            watch
+                .names
+                .iter()
+                .any(|name| name.as_os_str() == "actual.csv")
+        );
+        assert_eq!(watch.roots, vec![real_dir]);
+    }
+
+    /// The next event on `rx` within two seconds that the watch accepts.
+    #[cfg(target_os = "linux")]
+    fn accepts_an_event(
+        rx: &std::sync::mpsc::Receiver<notify::Event>,
+        names: &Mutex<Vec<OsString>>,
+    ) -> bool {
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        while let Some(left) = deadline.checked_duration_since(std::time::Instant::now()) {
+            let Ok(event) = rx.recv_timeout(left) else {
+                return false;
+            };
+            let names = names
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if file_watch_event_is_relevant(&event, Some(names.as_slice())) {
+                return true;
+            }
+        }
+        false
+    }
+
+    /// A write through a hard link reaches only the dataset's inode: from
+    /// another directory it makes no event on the watched parent, and from the
+    /// same directory it carries the other name. The file watch sees both, and
+    /// is re-armed on the new inode after an atomic replace.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn writes_through_hard_links_reach_the_file_watch() {
+        use std::io::Write;
+        let append = |path: &Path| {
+            std::fs::OpenOptions::new()
+                .append(true)
+                .open(path)
+                .expect("open for append")
+                .write_all(b"2\n")
+                .expect("append");
+        };
+        let root =
+            std::env::temp_dir().join(format!("spice-file-watch-links-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let data = root.join("data");
+        let other = root.join("other");
+        std::fs::create_dir_all(&data).expect("create data dir");
+        std::fs::create_dir_all(&other).expect("create other dir");
+        let path = data.join("names.csv");
+        std::fs::write(&path, b"id\n1\n").expect("write dataset");
+
+        let names = Mutex::new(Vec::new());
+        let (tx, rx) = std::sync::mpsc::channel();
+        let mut watcher =
+            notify::recommended_watcher(move |res: Result<notify::Event, notify::Error>| {
+                if let Ok(event) = res {
+                    let _ = tx.send(event);
+                }
+            })
+            .expect("create watcher");
+        let configured_root = watch_root(&path).canonicalize().expect("canonical root");
+        watcher
+            .watch(&configured_root, RecursiveMode::NonRecursive)
+            .expect("watch root");
+        let mut extra_roots = Vec::new();
+        let mut file_watch = None;
+        refresh_resolved_file_watch(
+            &mut watcher,
+            &path,
+            &configured_root,
+            &mut extra_roots,
+            &mut file_watch,
+            &names,
+        );
+
+        std::fs::hard_link(&path, other.join("alias.csv")).expect("link from another dir");
+        std::fs::hard_link(&path, data.join("writer.csv")).expect("link in the same dir");
+        while rx.try_recv().is_ok() {}
+        append(&other.join("alias.csv"));
+        let from_other_dir = accepts_an_event(&rx, &names);
+        while rx.try_recv().is_ok() {}
+        append(&data.join("writer.csv"));
+        let from_same_dir = accepts_an_event(&rx, &names);
+
+        let tmp = data.join("names.csv.tmp");
+        std::fs::write(&tmp, b"id\n1\n2\n3\n").expect("write replacement");
+        std::fs::rename(&tmp, &path).expect("atomic replace");
+        let replace_seen = accepts_an_event(&rx, &names);
+        refresh_resolved_file_watch(
+            &mut watcher,
+            &path,
+            &configured_root,
+            &mut extra_roots,
+            &mut file_watch,
+            &names,
+        );
+        std::fs::hard_link(&path, other.join("alias-2.csv")).expect("link the new inode");
+        while rx.try_recv().is_ok() {}
+        append(&other.join("alias-2.csv"));
+        let after_replace = accepts_an_event(&rx, &names);
+
+        drop(watcher);
+        let _ = std::fs::remove_dir_all(&root);
+        assert!(from_other_dir, "a hard link in another directory");
+        assert!(from_same_dir, "a hard link in the same directory");
+        assert!(replace_seen, "the atomic replace");
+        assert!(after_replace, "a hard link to the replacing inode");
     }
 }
