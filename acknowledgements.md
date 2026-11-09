@@ -42,37 +42,37 @@ Spice.ai acknowledges the following open source projects for making this project
 - arc-swap 1.9.1, Apache-2.0 OR MIT 
   <br/>https://github.com/vorner/arc-swap
 
-- arrow 59.3.0, Apache-2.0 
+- arrow 59.3.2, Apache-2.0 
   <br/>https://github.com/apache/arrow-rs
 
-- arrow-array 59.3.0, Apache-2.0 AND MIT 
+- arrow-array 59.3.2, Apache-2.0 AND MIT 
   <br/>https://github.com/apache/arrow-rs
 
-- arrow-buffer 59.3.0, Apache-2.0 
+- arrow-buffer 59.3.2, Apache-2.0 
   <br/>https://github.com/apache/arrow-rs
 
-- arrow-cast 59.3.0, Apache-2.0 
+- arrow-cast 59.3.2, Apache-2.0 
   <br/>https://github.com/apache/arrow-rs
 
-- arrow-csv 59.3.0, Apache-2.0 
+- arrow-csv 59.3.2, Apache-2.0 
   <br/>https://github.com/apache/arrow-rs
 
-- arrow-flight 59.3.0, Apache-2.0 
+- arrow-flight 59.3.2, Apache-2.0 
   <br/>https://github.com/apache/arrow-rs
 
-- arrow-ipc 59.3.0, Apache-2.0 
+- arrow-ipc 59.3.2, Apache-2.0 
   <br/>https://github.com/apache/arrow-rs
 
-- arrow-json 59.3.0, Apache-2.0 
+- arrow-json 59.3.2, Apache-2.0 
   <br/>https://github.com/apache/arrow-rs
 
 - arrow-odbc 25.3.0, MIT 
   <br/>https://github.com/pacman82/arrow-odbc
 
-- arrow-row 59.3.0, Apache-2.0 
+- arrow-row 59.3.2, Apache-2.0 
   <br/>https://github.com/apache/arrow-rs
 
-- arrow-schema 59.3.0, Apache-2.0 
+- arrow-schema 59.3.2, Apache-2.0 
   <br/>https://github.com/apache/arrow-rs
 
 - assert_cmd 2.2.2, Apache-2.0 OR MIT 
@@ -115,12 +115,6 @@ Spice.ai acknowledges the following open source projects for making this project
   <br/>https://github.com/smithy-lang/smithy-rs
 
 - aws-sdk-bedrockruntime 1.135.0, Apache-2.0 
-  <br/>https://github.com/awslabs/aws-sdk-rust
-
-- aws-sdk-cognitoidentity 1.104.0, Apache-2.0 
-  <br/>https://github.com/awslabs/aws-sdk-rust
-
-- aws-sdk-cognitoidentityprovider 1.123.0, Apache-2.0 
   <br/>https://github.com/awslabs/aws-sdk-rust
 
 - aws-sdk-dynamodb 1.116.0, Apache-2.0 
@@ -171,13 +165,16 @@ Spice.ai acknowledges the following open source projects for making this project
 - azure_core 0.31.0, MIT 
   <br/>https://github.com/azure/azure-sdk-for-rust
 
+- azure_core 1.1.0, MIT 
+  <br/>https://github.com/azure/azure-sdk-for-rust
+
 - azure_data_cosmos 0.30.0, MIT 
   <br/>https://github.com/azure/azure-sdk-for-rust
 
-- azure_identity 0.31.0, MIT 
+- azure_identity 1.0.0, MIT 
   <br/>https://github.com/azure/azure-sdk-for-rust
 
-- azure_security_keyvault_secrets 0.10.0, MIT 
+- azure_security_keyvault_secrets 1.0.1, MIT 
   <br/>https://github.com/azure/azure-sdk-for-rust
 
 - ballista-core 55.0.0, Apache-2.0 
@@ -795,7 +792,7 @@ Spice.ai acknowledges the following open source projects for making this project
 - parking_lot 0.12.5, Apache-2.0 OR MIT 
   <br/>https://github.com/Amanieu/parking_lot
 
-- parquet 59.3.0, Apache-2.0 
+- parquet 59.3.2, Apache-2.0 
   <br/>https://github.com/apache/arrow-rs
 
 - paste 1.0.15, Apache-2.0 OR MIT 
