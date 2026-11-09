@@ -1915,6 +1915,11 @@ async fn a_failed_deletion_vector_read_at_open_is_an_error_not_more_rows() {
         )
         .await;
     }
+    // No compaction from here to the listing: one could fold the vectors the
+    // DELETE writes before they are listed, leaving the reopen below nothing to
+    // read. (A scan racing a protected merge's publish has its own test,
+    // `a_scan_between_a_protected_merge_commit_and_its_publish_reads_every_row`.)
+    let compaction = table.hold_compaction().await;
     run(&ctx, &format!("DELETE FROM {name} WHERE id <= 5")).await;
     let expected: Vec<(i64, i64)> = (6..=UPSERTS).map(|id| (id, id * 7)).collect();
     assert_eq!(sorted_rows(&ctx, name).await, expected);
@@ -1922,6 +1927,7 @@ async fn a_failed_deletion_vector_read_at_open_is_an_error_not_more_rows() {
         !setup.objects_ending_with(".arrow").await.is_empty(),
         "precondition: the table has deletion vectors"
     );
+    drop(compaction);
     table.quiesce().await;
     drop((table, ctx));
 
