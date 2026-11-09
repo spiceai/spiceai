@@ -505,7 +505,7 @@ struct Instance {
     named: BTreeMap<String, Vec<RecordBatch>>,
     /// Kernel key quota room the combination reserved for its executor
     /// containers, which each gives back as it starts (see `crate::keyquota`).
-    key_room: Option<Arc<crate::keyquota::Reservation<'static>>>,
+    key_room: Option<KeyRoom>,
     /// What `${…}` placeholders resolve to, in the spicepod and in step SQL.
     context: Value,
     /// The `spice` CLI that `spice` steps run.
@@ -825,7 +825,15 @@ async fn run_combination(
             .unwrap_or(u64::MAX);
         key_room.release(executor_containers.saturating_sub(created));
         for instance in &mut instances {
-            instance.key_room = Some(Arc::clone(&key_room));
+            let unstarted = instance
+                .executors
+                .iter()
+                .map(|executor| executor.container_name().is_some())
+                .collect();
+            instance.key_room = Some(KeyRoom {
+                reservation: Arc::clone(&key_room),
+                unstarted,
+            });
         }
         match schedule {
             Schedule::Lockstep => {
@@ -1508,6 +1516,28 @@ async fn run_independent(
     }
 }
 
+/// The share of its combination's kernel key quota reservation that an
+/// instance's executor containers hold until each first starts.
+struct KeyRoom {
+    reservation: Arc<crate::keyquota::Reservation<'static>>,
+    /// By executor index: whether it runs in a container that has not yet
+    /// started, and so still holds a share.
+    unstarted: Vec<bool>,
+}
+
+impl KeyRoom {
+    /// Gives back executor `index`'s share once, the first time it starts
+    /// healthy; a restart takes a key of its own and gives back nothing, so it
+    /// cannot spend a share held for another executor.
+    fn executor_started(&mut self, index: usize) {
+        if let Some(unstarted) = self.unstarted.get_mut(index)
+            && std::mem::take(unstarted)
+        {
+            self.reservation.release(1);
+        }
+    }
+}
+
 /// Stops an instance's `spiced`, executors and sidecar together.
 async fn stop_processes(instance: &mut Instance) {
     let mut stopping = vec![instance.spiced.stop(TEARDOWN_TIMEOUT)];
@@ -1865,6 +1895,32 @@ mod tests {
     use serde_json::json;
 
     use super::*;
+
+    /// An executor gives back its share of the combination's reservation the
+    /// first time it starts, and only then: a restart (after `kill-executor`)
+    /// must not spend a share still held for a spare that has not started.
+    #[test]
+    fn an_executor_gives_back_its_key_share_once() {
+        let pool: &'static crate::keyquota::Reservations =
+            Box::leak(Box::new(crate::keyquota::Reservations::new()));
+        let reservation = Arc::new(crate::keyquota::Reservation::held_in(pool, 2));
+        // Executor 0 and a spare, both in containers; executor 2 runs on the host.
+        let mut room = KeyRoom {
+            reservation: Arc::clone(&reservation),
+            unstarted: vec![true, true, false],
+        };
+        room.executor_started(0);
+        assert_eq!(reservation.remaining(), 1);
+        // Executor 0 restarts: the spare's share stays held.
+        room.executor_started(0);
+        assert_eq!(reservation.remaining(), 1);
+        // A host process, and an index past the executors, hold no share.
+        room.executor_started(2);
+        room.executor_started(7);
+        assert_eq!(reservation.remaining(), 1);
+        room.executor_started(1);
+        assert_eq!(reservation.remaining(), 0);
+    }
 
     #[test]
     fn role_args_are_found_and_stripped_in_both_spellings() {

@@ -173,9 +173,22 @@ impl Reservation<'_> {
         *reserved = reserved.saturating_sub(released);
     }
 
+    /// Containers still to start.
     #[cfg(test)]
-    fn remaining(&self) -> u64 {
+    pub fn remaining(&self) -> u64 {
         self.remaining.load(Ordering::Relaxed)
+    }
+}
+
+#[cfg(test)]
+impl<'a> Reservation<'a> {
+    /// A reservation of `containers` in `pool`, without reading a quota.
+    pub fn held_in(pool: &'a Reservations, containers: u64) -> Self {
+        *pool.0.lock() += containers;
+        Self {
+            pool,
+            remaining: AtomicU64::new(containers),
+        }
     }
 }
 
