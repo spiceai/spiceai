@@ -8,21 +8,40 @@ description: >
   A `mode: file_create` Cayenne acceleration is rebuilt from its source
   whenever it loads: after a watched Spicepod changes the dataset, and after a
   restart, it answers with the source's current rows, not with what the
-  deleted acceleration held and not with nothing.
+  deleted acceleration held and not with nothing. A query running while the
+  watched change reloads the dataset answers with every row of the old copy or
+  of the new one, or fails; never with part of either. With object-native data
+  (#16133), each reload writes a new folder in the state location and the
+  instance deletes the previous one once no query reads it, so after the grace
+  only the current folder is left and no folder is marked dropped.
 
 sources:
   src: { kind: postgres }
+  # The state locations of the object-native-data variants.
+  lake: { kind: rustfs }
+  slow-lake: { kind: rustfs, latency: 20ms }
+
+variants:
+  local: {}
+  object-native-data-rustfs: object-native-data-rustfs
+  object-native-data-rustfs-latency: object-native-data-rustfs-latency
 
 spicepod:
   version: v1
   kind: Spicepod
   name: cayenne-file-create-reload
   datasets:
-    # No refresh schedule: only a load reads the source's new rows.
+    # No refresh schedule: only a load reads the source's new rows. Every row
+    # goes to a data file, so the folders hold data, not only rows in the log.
     - from: postgres:public.fc
       name: file_create_reload
       params: ${sources.src.params}
-      acceleration: { enabled: true, engine: cayenne, mode: file_create, refresh_mode: full }
+      acceleration:
+        enabled: true
+        engine: cayenne
+        mode: file_create
+        refresh_mode: full
+        params: { cayenne_inline_max_rows: '0' }
 
 defaults:
   expect: { oracle: src }
@@ -42,19 +61,59 @@ steps:
   - query: SELECT count(*) AS n FROM file_create_reload
     expect: { rows: [['8']] }
 
-  # Changing the dataset reloads it, which recreates the acceleration.
+  # Changing the dataset reloads it, which recreates the acceleration. Queries
+  # keep running across the reload: each answers with the old copy's 8 rows or
+  # the new copy's 16, or fails.
+  - background:
+      id: reader
+      query: SELECT count(*) IN (8, 16) AS whole FROM file_create_reload
+      every: 100ms
+      expect: { whole: 'true' }
   - edit-spicepod:
       datasets:
         file_create_reload: { params: { pg_sslmode: prefer } }
   - query: SELECT id, v FROM file_create_reload
     oracle-sql: SELECT id, v FROM fc
     eventually: 60s
+  - stop-background: { id: reader, allow: ['.'] }
   - explain: SELECT id, v FROM file_create_reload
     contains: CayenneAccelerationExec
 
-  # So does a restart.
+  # The previous copy's folder is deleted by this instance once no query reads
+  # it: one folder (one log head) is left, none marked dropped.
+  - assert-objects: { source: lake, prefix: state/cayenne/v1/datasets/file_create_reload-, contains: /dropped, max: 0 }
+    eventually: 60s
+    only: object-native-data-rustfs
+  - assert-objects: { source: lake, prefix: state/cayenne/v1/datasets/file_create_reload-, contains: /head, min: 1, max: 1 }
+    eventually: 60s
+    only: object-native-data-rustfs
+  - assert-objects: { source: slow-lake, prefix: state/cayenne/v1/datasets/file_create_reload-, contains: /dropped, max: 0 }
+    eventually: 60s
+    only: object-native-data-rustfs-latency
+  - assert-objects: { source: slow-lake, prefix: state/cayenne/v1/datasets/file_create_reload-, contains: /head, min: 1, max: 1 }
+    eventually: 60s
+    only: object-native-data-rustfs-latency
+
+  # So does a restart; the folder the restart replaced is deleted by the
+  # restarted instance once the grace passes, with no further start.
   - source-exec: { src: "INSERT INTO fc SELECT i, 'v' || i FROM generate_series(17, 24) i" }
   - restart: {}
   - query: SELECT id, v FROM file_create_reload
     oracle-sql: SELECT id, v FROM fc
     eventually: 60s
+  - assert-objects: { source: lake, prefix: state/cayenne/v1/datasets/file_create_reload-, contains: /dropped, max: 0 }
+    eventually: 60s
+    only: object-native-data-rustfs
+  - assert-objects: { source: lake, prefix: state/cayenne/v1/datasets/file_create_reload-, contains: /head, min: 1, max: 1 }
+    eventually: 60s
+    only: object-native-data-rustfs
+  - assert-objects: { source: lake, prefix: state/cayenne/v1/datasets/file_create_reload-, contains: .vortex, min: 1 }
+    only: object-native-data-rustfs
+  - assert-objects: { source: slow-lake, prefix: state/cayenne/v1/datasets/file_create_reload-, contains: /dropped, max: 0 }
+    eventually: 60s
+    only: object-native-data-rustfs-latency
+  - assert-objects: { source: slow-lake, prefix: state/cayenne/v1/datasets/file_create_reload-, contains: /head, min: 1, max: 1 }
+    eventually: 60s
+    only: object-native-data-rustfs-latency
+  - assert-log: { lacks: ['were not removed from the object store', 'Deleted the acceleration data directory'] }
+    only: [object-native-data-rustfs, object-native-data-rustfs-latency]

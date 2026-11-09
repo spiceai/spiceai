@@ -136,6 +136,16 @@ pub(super) fn describe(action: &Action) -> String {
                 .map_or_else(String::new, |m| format!(", mirrored to {m}"))
         ),
         Action::WaitMetric(w) => format!("wait-metric {} {:?}", w.name, w.condition),
+        Action::SampleObjects(s) => format!(
+            "sample-objects {}/{}{} every {:?} for {:?}",
+            s.source,
+            s.prefix,
+            s.contains
+                .as_ref()
+                .map_or_else(String::new, |contains| format!("*{contains}*")),
+            s.every,
+            s.duration
+        ),
         Action::Slt(s) if s.setup => format!("slt-setup {} on {}", s.file, s.source),
         Action::Slt(s) => format!("slt {} over {}", s.file, s.source),
         Action::Sleep(d) => format!("sleep {d:?}"),
@@ -570,6 +580,52 @@ pub(super) async fn run_instance_step(
             );
             return Ok(format!(" ({} objects)", found.len()));
         }
+        Action::SampleObjects(s) => {
+            let namespace = namespace(instance, &s.source)?;
+            let mut objects = Vec::new();
+            let mut bytes = Vec::new();
+            let mut over = Vec::new();
+            let end = Instant::now() + s.duration;
+            loop {
+                let next = Instant::now() + s.every;
+                let mut found = sources.get(&s.source)?.sizes(&namespace, &s.prefix).await?;
+                if let Some(contains) = &s.contains {
+                    found.retain(|(key, _)| key.contains(contains.as_str()));
+                }
+                let (count, size) = (found.len(), found.iter().map(|(_, size)| size).sum::<u64>());
+                if s.max_objects.is_some_and(|max| count > max)
+                    || s.max_bytes.is_some_and(|max| size > max)
+                {
+                    over.push(format!(
+                        "sample {}: {count} objects, {size} bytes",
+                        objects.len()
+                    ));
+                }
+                objects.push(count as u64);
+                bytes.push(size);
+                if next >= end {
+                    break;
+                }
+                tokio::time::sleep_until(next.into()).await;
+            }
+            let series = format!("objects {objects:?}, bytes {bytes:?}");
+            ensure!(
+                over.is_empty(),
+                "objects under '{}' in '{}' went over their bound ({}): {}; series: {series}",
+                s.prefix,
+                s.source,
+                bound_text(s.max_objects, s.max_bytes),
+                over.join(", ")
+            );
+            if let Err(trend) = flat_series(&objects).and_then(|()| flat_series(&bytes)) {
+                bail!(
+                    "objects under '{}' in '{}' trend upward: {trend}; series: {series}",
+                    s.prefix,
+                    s.source
+                );
+            }
+            return Ok(format!(" {series}"));
+        }
         Action::MarkMetrics(id) => {
             let text = instance.spiced.metrics().await?;
             instance.metric_marks.insert(id.clone(), text);
@@ -706,9 +762,61 @@ pub(super) async fn run_instance_step(
     Ok(format!(" ({:.1}s)", started.elapsed().as_secs_f64()))
 }
 
+/// The bounds of a `sample-objects` step, for its failure message.
+fn bound_text(max_objects: Option<usize>, max_bytes: Option<u64>) -> String {
+    match (max_objects, max_bytes) {
+        (Some(objects), Some(bytes)) => format!("at most {objects} objects and {bytes} bytes"),
+        (Some(objects), None) => format!("at most {objects} objects"),
+        (None, Some(bytes)) => format!("at most {bytes} bytes"),
+        (None, None) => "none".to_string(),
+    }
+}
+
+/// Whether a sampled series does not trend upward: the peak of its last third
+/// is at most a quarter (and at least one unit) above the peak of its middle
+/// third. The first third is the run warming up and is not compared.
+fn flat_series(samples: &[u64]) -> std::result::Result<(), String> {
+    if samples.len() < 6 {
+        return Err(format!("{} samples, fewer than six", samples.len()));
+    }
+    let third = samples.len() / 3;
+    let peak = |part: &[u64]| part.iter().copied().max().unwrap_or(0);
+    let middle = peak(&samples[third..2 * third]);
+    let last = peak(&samples[2 * third..]);
+    let allowed = middle.saturating_add((middle / 4).max(1));
+    if last > allowed {
+        return Err(format!(
+            "the last third peaks at {last}, above {allowed} (its middle third's peak {middle} and a quarter more)"
+        ));
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
-    use super::wipe_instance_dir;
+    use super::{flat_series, wipe_instance_dir};
+
+    #[test]
+    fn a_series_that_levels_off_is_flat_and_one_that_climbs_is_not() {
+        // Warm-up growth in the first third does not count.
+        assert_eq!(
+            flat_series(&[10, 40, 90, 100, 95, 105, 100, 98, 110]),
+            Ok(())
+        );
+        assert_eq!(
+            flat_series(&[10, 20, 30, 40, 50, 60, 70, 80, 90]),
+            Err(
+                "the last third peaks at 90, above 75 (its middle third's peak 60 and a quarter more)"
+                    .to_string()
+            )
+        );
+        // A small series may grow by one.
+        assert_eq!(flat_series(&[0, 0, 1, 1, 2, 2]), Ok(()));
+        assert_eq!(
+            flat_series(&[1, 2, 3, 4, 5]),
+            Err("5 samples, fewer than six".to_string())
+        );
+    }
 
     #[test]
     fn wiping_keeps_the_harness_files_and_the_kept_paths() {
