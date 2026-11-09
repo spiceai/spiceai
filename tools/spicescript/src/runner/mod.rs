@@ -731,7 +731,10 @@ async fn run_combination(
         // a quota shared with every other job on the host, so a combination
         // starts its sources only once there is room for all of them, instead
         // of failing part way through (see `crate::keyquota`).
-        crate::keyquota::wait_for_room(
+        // Reserved, not only checked: two combinations admitted together must
+        // not each start part of their sources and then wait on each other's
+        // room. Released once these sources are up and hold their own keys.
+        let reservation = crate::keyquota::reserve_room(
             resolved
                 .iter()
                 .map(|(_, _, kind, _)| source::containers(kind))
@@ -754,6 +757,7 @@ async fn run_combination(
             sources.state.insert(name.clone(), SourceState::Running);
             sources.kinds.insert(name.clone(), kind);
         }
+        drop(reservation);
         let mut instances = create_instances(script, options, combo, run_id, &sources).await?;
         match schedule {
             Schedule::Lockstep => {

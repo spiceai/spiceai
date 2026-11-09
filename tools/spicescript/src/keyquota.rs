@@ -137,19 +137,98 @@ pub fn is_quota_error(message: &str) -> bool {
     message.contains("unable to join session keyring")
 }
 
+/// Containers a source set has been admitted for but not yet finished
+/// starting. Admission counts them against the room, so two sets admitted
+/// together cannot each start part of their containers and then wait on the
+/// rest of each other's room.
+pub struct Reservations(parking_lot::Mutex<u64>);
+
+impl Reservations {
+    pub const fn new() -> Self {
+        Self(parking_lot::const_mutex(0))
+    }
+}
+
+static RESERVATIONS: Reservations = Reservations::new();
+
+/// Room held for a source set until it is dropped, once the set has started
+/// (its containers then hold their own keys) or failed.
+pub struct Reservation<'a> {
+    pool: &'a Reservations,
+    containers: u64,
+}
+
+impl Drop for Reservation<'_> {
+    fn drop(&mut self) {
+        let mut reserved = self.pool.0.lock();
+        *reserved = reserved.saturating_sub(self.containers);
+    }
+}
+
 /// Waits until the quota has room for `containers` more containers, saying
 /// so once in the script's output if it has to wait. Returns without waiting
 /// where the quota cannot be read, and fails after [`WAIT_LIMIT`].
 pub async fn wait_for_room(containers: u64, what: &str) -> anyhow::Result<()> {
-    wait_for_room_with(containers, what, KeyQuota::read, WAIT_LIMIT, POLL_INTERVAL).await
+    wait_until(
+        containers,
+        what,
+        KeyQuota::read,
+        WAIT_LIMIT,
+        POLL_INTERVAL,
+        |quota| quota.room() >= containers,
+    )
+    .await
 }
 
-async fn wait_for_room_with(
+/// Waits until the quota has room for a whole set of `containers` beyond what
+/// other sets have reserved, and reserves it until the returned
+/// [`Reservation`] is dropped.
+pub async fn reserve_room(containers: u64, what: &str) -> anyhow::Result<Reservation<'static>> {
+    reserve_room_in(
+        &RESERVATIONS,
+        containers,
+        what,
+        KeyQuota::read,
+        WAIT_LIMIT,
+        POLL_INTERVAL,
+    )
+    .await
+}
+
+async fn reserve_room_in<'a>(
+    pool: &'a Reservations,
+    containers: u64,
+    what: &str,
+    read: impl FnMut() -> Option<KeyQuota>,
+    limit: Duration,
+    interval: Duration,
+) -> anyhow::Result<Reservation<'a>> {
+    let mut reserved_now = 0;
+    wait_until(containers, what, read, limit, interval, |quota| {
+        let mut reserved = pool.0.lock();
+        if quota.room().saturating_sub(*reserved) >= containers {
+            *reserved += containers;
+            reserved_now = containers;
+            true
+        } else {
+            false
+        }
+    })
+    .await?;
+    Ok(Reservation {
+        pool,
+        containers: reserved_now,
+    })
+}
+
+/// Polls `read` until `admit` accepts the quota (or it cannot be read).
+async fn wait_until(
     containers: u64,
     what: &str,
     mut read: impl FnMut() -> Option<KeyQuota>,
     limit: Duration,
     interval: Duration,
+    mut admit: impl FnMut(&KeyQuota) -> bool,
 ) -> anyhow::Result<()> {
     let started = Instant::now();
     let mut said = false;
@@ -157,7 +236,7 @@ async fn wait_for_room_with(
         let Some(quota) = read() else {
             return Ok(());
         };
-        if quota.room() >= containers {
+        if containers == 0 || admit(&quota) {
             if said {
                 crate::runner::emit(&format!(
                     "   kernel key quota has room again after {:.0?}; starting {what}",
@@ -239,7 +318,7 @@ mod tests {
     async fn waits_until_room_appears_then_starts() {
         let mut samples = [195, 195, 190, 150].into_iter();
         let mut reads = 0;
-        wait_for_room_with(
+        wait_until(
             3,
             "test",
             || {
@@ -255,6 +334,7 @@ mod tests {
             },
             Duration::from_secs(60),
             Duration::from_secs(1),
+            |quota| quota.room() >= 3,
         )
         .await
         .expect("room appears");
@@ -271,12 +351,13 @@ mod tests {
             bytes: 14_000,
             max_bytes: 20_000,
         };
-        let error = wait_for_room_with(
+        let error = wait_until(
             1,
             "source 'src'",
             || Some(full),
             Duration::from_secs(10),
             Duration::from_secs(1),
+            |quota| quota.room() >= 1,
         )
         .await
         .expect_err("never has room");
@@ -290,14 +371,73 @@ mod tests {
 
     #[tokio::test]
     async fn does_not_wait_where_the_quota_cannot_be_read() {
-        wait_for_room_with(
+        wait_until(
             1_000_000,
             "test",
             || None,
             Duration::ZERO,
             Duration::from_secs(1),
+            |_| false,
         )
         .await
         .expect("nothing to wait for");
+    }
+
+    /// Two source sets that each fit the room alone but not together: the
+    /// second waits until the first's reservation is released, instead of both
+    /// starting part of their containers and waiting on each other.
+    #[tokio::test(start_paused = true)]
+    async fn a_second_set_waits_for_the_first_sets_reservation() {
+        let pool = Reservations::new();
+        // 200 max keys, 194 used: room = 200 - 194 - RESERVE(4) = 2.
+        let quota = || {
+            Some(KeyQuota {
+                uid: 1000,
+                keys: 194,
+                max_keys: 200,
+                bytes: 0,
+                max_bytes: 20_000,
+            })
+        };
+        let first = reserve_room_in(
+            &pool,
+            2,
+            "A",
+            quota,
+            Duration::from_secs(60),
+            Duration::from_secs(1),
+        )
+        .await
+        .expect("A fits");
+        let second = reserve_room_in(
+            &pool,
+            2,
+            "B",
+            quota,
+            Duration::from_secs(3),
+            Duration::from_secs(1),
+        )
+        .await;
+        assert!(
+            format!(
+                "{:#}",
+                second.err().expect("B must wait while A holds the room")
+            )
+            .contains("waited 3s"),
+        );
+        drop(first);
+        let second = reserve_room_in(
+            &pool,
+            2,
+            "B",
+            quota,
+            Duration::from_secs(3),
+            Duration::from_secs(1),
+        )
+        .await
+        .expect("B fits once A's reservation is released");
+        assert_eq!(*pool.0.lock(), 2);
+        drop(second);
+        assert_eq!(*pool.0.lock(), 0);
     }
 }
