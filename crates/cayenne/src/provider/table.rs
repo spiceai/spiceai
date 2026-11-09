@@ -180,6 +180,10 @@ use vortex_datafusion::VortexRuntimeAccessPlanProvider;
 use vortex_datafusion::VortexWriteObserver;
 
 const POST_WRITE_MAINTENANCE_DEBOUNCE: Duration = Duration::from_millis(100);
+/// First wait of a post-write manifest rebuild retried because
+/// `compaction_lock` was held; doubles up to the maximum below.
+const MANIFEST_REBUILD_RETRY_INITIAL_BACKOFF: Duration = Duration::from_millis(10);
+const MANIFEST_REBUILD_RETRY_MAX_BACKOFF: Duration = Duration::from_secs(1);
 const OBJECT_STORE_MOVE_CONCURRENCY: usize = 16;
 /// How long [`CayenneTableProvider::evolve_schema_live`] and
 /// [`CayenneTableProvider::promote_warm_to_cold`] wait for in-flight
@@ -3265,6 +3269,14 @@ pub struct CayenneTableProvider {
     /// spawns and released when it finishes, so a burst of commits produces one
     /// sweep.
     snapshot_cleanup_scheduled: Arc<AtomicBool>,
+    /// A post-write manifest rebuild found `compaction_lock` held and no
+    /// rebuild has read the live set since. Set by the skipped pass, cleared
+    /// by every rebuild as it starts (under the lock), so a rebuild that runs
+    /// for any other reason covers the skipped one.
+    manifest_rebuild_pending: Arc<AtomicBool>,
+    /// Holds the single task that retries a pending manifest rebuild: set
+    /// before it spawns, released when it exits.
+    manifest_rebuild_retry_scheduled: Arc<AtomicBool>,
     /// An unserved sweep request. Set by every commit and consumed by the pass
     /// before it sweeps, so a commit arriving mid-pass earns another pass rather
     /// than being dropped on the closed slot.
@@ -11516,6 +11528,8 @@ impl CayenneTableProvider {
             last_write_shape: Arc::new(AtomicU64::new(0)),
             post_write_maintenance: Arc::new(PostWriteMaintenance::default()),
             snapshot_cleanup_scheduled: Arc::new(AtomicBool::new(false)),
+            manifest_rebuild_pending: Arc::new(AtomicBool::new(false)),
+            manifest_rebuild_retry_scheduled: Arc::new(AtomicBool::new(false)),
             snapshot_cleanup_pending: Arc::new(AtomicBool::new(false)),
             snapshot_cleanup_rearmed: Arc::new(AtomicBool::new(false)),
             snapshot_cleanup_rearms_left: Arc::new(AtomicU8::new(0)),
@@ -13979,6 +13993,8 @@ impl CayenneTableProvider {
             last_write_shape: Arc::clone(&self.last_write_shape),
             post_write_maintenance: Arc::clone(&self.post_write_maintenance),
             snapshot_cleanup_scheduled: Arc::clone(&self.snapshot_cleanup_scheduled),
+            manifest_rebuild_pending: Arc::clone(&self.manifest_rebuild_pending),
+            manifest_rebuild_retry_scheduled: Arc::clone(&self.manifest_rebuild_retry_scheduled),
             snapshot_cleanup_pending: Arc::clone(&self.snapshot_cleanup_pending),
             snapshot_cleanup_rearmed: Arc::clone(&self.snapshot_cleanup_rearmed),
             snapshot_cleanup_rearms_left: Arc::clone(&self.snapshot_cleanup_rearms_left),
@@ -24401,6 +24417,9 @@ impl CayenneTableProvider {
                 || self.orphan_dv_sweep_state.load(Ordering::Acquire) != COALESCED_TASK_IDLE
                 || self.snapshot_cleanup_scheduled.load(Ordering::Acquire)
                 || self.inline_checkpoint_scheduled.load(Ordering::Acquire)
+                || self
+                    .manifest_rebuild_retry_scheduled
+                    .load(Ordering::Acquire)
             {
                 tokio::time::sleep(std::time::Duration::from_millis(1)).await;
             }
@@ -25575,27 +25594,22 @@ impl CayenneTableProvider {
         // prunes the manifest to its OWN new snapshot under that lock. Rebuilding
         // here without it could re-add (now-dead) protected-snapshot rows just
         // after that prune, or race the pointer/protected-set read. Holding the
-        // lock pins the live set for the whole rebuild; if a compaction is
-        // already running (`try_lock` fails) we skip — it populates the manifest
-        // for its new snapshot, and the next maintenance debounce repopulates.
+        // lock pins the live set for the whole rebuild. When another pass holds
+        // the lock (`try_write` fails) — a compaction, a merge, or the previous
+        // pass's rebuild, which read the live set before this write published —
+        // the rebuild is re-armed to run once the lock is free, so the manifest
+        // names this write's files without waiting for another write.
         // The append path itself never clears tombstones, so deferring the
         // manifest off the publish fence cannot resurrect or vanish a row.
         if state.refresh_listing || had_stats || retention_deleted > 0 {
             if let Ok(_compaction_guard) = self.compaction_lock.try_write() {
-                // A quiesced instance's view of the live set may already be
-                // behind its replacement's, so it writes no manifest rows. A
-                // table in the object-native location records each write's files
-                // when it commits, so a listing can only add files nothing
-                // committed.
-                if self.maintenance_still_admitted() && !self.data_in_object_native_location() {
-                    self.rebuild_live_snapshot_manifests().await;
-                }
-            } else {
+                self.rebuild_live_snapshot_manifests_if_admitted().await;
+            } else if !self.data_in_object_native_location() {
                 tracing::trace!(
                     table = self.table_metadata.table_name.as_str(),
-                    "Skipping post-write manifest rebuild: a compaction holds the lock \
-                     (it will populate the manifest for its new snapshot)"
+                    "Post-write manifest rebuild found the compaction lock held; retrying once it is free"
                 );
+                self.schedule_manifest_rebuild_retry();
             }
         }
 
@@ -26781,6 +26795,10 @@ impl CayenneTableProvider {
     /// manifest is not yet the scan's file source, so an incomplete manifest
     /// cannot make a scan miss a live file or read one outside its snapshot.
     async fn rebuild_live_snapshot_manifests(&self) {
+        // This rebuild reads the live set after every write whose rebuild was
+        // skipped so far has published, so it covers them.
+        self.manifest_rebuild_pending
+            .store(false, Ordering::Release);
         // Snapshot the live set as one coherent read (current + protected). The
         // held `compaction_lock` keeps a compaction from repointing it mid-pass.
         let current_snapshot = self.get_current_snapshot_id();
@@ -26834,6 +26852,110 @@ impl CayenneTableProvider {
                 }
             }
         }
+    }
+
+    /// The post-write manifest rebuild, under a `compaction_lock` the caller
+    /// holds exclusively.
+    ///
+    /// A quiesced instance's view of the live set may already be behind its
+    /// replacement's, so it writes no manifest rows. A table in the
+    /// object-native location records each write's files when it commits, so a
+    /// listing can only add files nothing committed.
+    async fn rebuild_live_snapshot_manifests_if_admitted(&self) {
+        if self.maintenance_still_admitted() && !self.data_in_object_native_location() {
+            self.rebuild_live_snapshot_manifests().await;
+        }
+    }
+
+    /// Run a post-write manifest rebuild that found `compaction_lock` held once
+    /// the lock is free.
+    ///
+    /// Nothing else re-runs that rebuild: the next one comes only with the next
+    /// write, and the open-time backfill only fills an empty manifest. The pass
+    /// holding the lock does not cover the skipped write either: a previous
+    /// rebuild read the live set before that write published, and a compaction
+    /// or merge records only its own output. Without this the manifest keeps
+    /// missing the write's files while the table takes no write.
+    ///
+    /// Records the rebuild as pending, then starts the single retry task unless
+    /// one is running. The task polls the lock with `try_write` and backs off,
+    /// rather than waiting on `write()`: a queued writer would turn away the
+    /// shared-mode protected merges that may run beside a long one. Every
+    /// rebuild clears the pending mark as it starts, so the task does nothing
+    /// (and takes no lock) when a later write's rebuild got there first.
+    fn schedule_manifest_rebuild_retry(&self) {
+        // Record the request FIRST, so a task already running picks it up in
+        // its exit re-check instead of it being dropped on the held slot.
+        self.manifest_rebuild_pending.store(true, Ordering::Release);
+        if self.is_maintenance_closed()
+            || self
+                .manifest_rebuild_retry_scheduled
+                .swap(true, Ordering::AcqRel)
+        {
+            return;
+        }
+        if !self.maintenance_still_admitted() {
+            self.manifest_rebuild_retry_scheduled
+                .store(false, Ordering::Release);
+            return;
+        }
+
+        let table = self.clone_for_write();
+        tokio::spawn(async move {
+            // Releases the slot on ANY exit (completion, early return, panic
+            // unwind, or abort-drop), so a stuck flag can never suppress later
+            // retries or hang `drain_in_flight_maintenance`. Disarmed when the
+            // loop hands the slot on.
+            struct ReleaseSlot(Option<Arc<AtomicBool>>);
+            impl Drop for ReleaseSlot {
+                fn drop(&mut self) {
+                    if let Some(flag) = &self.0 {
+                        flag.store(false, Ordering::Release);
+                    }
+                }
+            }
+            let mut slot = ReleaseSlot(Some(Arc::clone(&table.manifest_rebuild_retry_scheduled)));
+
+            let mut backoff = MANIFEST_REBUILD_RETRY_INITIAL_BACKOFF;
+            loop {
+                tokio::time::sleep(backoff).await;
+                if !table.maintenance_still_admitted() {
+                    return;
+                }
+                if table.manifest_rebuild_pending.load(Ordering::Acquire) {
+                    let Ok(_compaction_guard) = table.compaction_lock.try_write() else {
+                        backoff = (backoff * 2).min(MANIFEST_REBUILD_RETRY_MAX_BACKOFF);
+                        continue;
+                    };
+                    // Consumed here even if the rebuild declines (a quiesced
+                    // instance), so the loop cannot spin on it.
+                    table
+                        .manifest_rebuild_pending
+                        .store(false, Ordering::Release);
+                    table.rebuild_live_snapshot_manifests_if_admitted().await;
+                }
+
+                // Open the slot, then re-check. A skip after this store claims
+                // the slot itself; one before it is caught here. Either way no
+                // pending rebuild is lost.
+                table
+                    .manifest_rebuild_retry_scheduled
+                    .store(false, Ordering::Release);
+                if !table.manifest_rebuild_pending.load(Ordering::Acquire) {
+                    slot.0 = None;
+                    return;
+                }
+                if table
+                    .manifest_rebuild_retry_scheduled
+                    .swap(true, Ordering::AcqRel)
+                {
+                    // Another task owns the slot and will handle the request.
+                    slot.0 = None;
+                    return;
+                }
+                backoff = MANIFEST_REBUILD_RETRY_INITIAL_BACKOFF;
+            }
+        });
     }
 
     /// Manifest snapshot model (phase 5): backfill `cayenne_snapshot_file` for a

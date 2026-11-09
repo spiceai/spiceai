@@ -453,3 +453,117 @@ async fn compaction_leftovers_are_reclaimed_on_a_local_directory() -> TestResult
     let dir = tempfile::TempDir::new()?;
     compaction_leftovers_are_reclaimed(Storage::Local(dir.path().to_path_buf())).await
 }
+
+/// How long the manifest may take to name a write's files once nothing holds
+/// the compaction lock.
+const MANIFEST_DEADLINE: Duration = Duration::from_secs(10);
+
+/// Data files and deletion vectors in storage that the catalog does not name.
+async fn unnamed_files(
+    catalog: &Arc<dyn MetadataCatalog>,
+    table: &CayenneTableProvider,
+    storage: &Storage,
+) -> TestResult<Vec<String>> {
+    let named = named_by_catalog(catalog, table, storage).await?;
+    Ok(reclaimable(&storage.files().await?)
+        .into_keys()
+        .filter(|path| !named.contains(path))
+        .collect())
+}
+
+/// A table not placed in the object-native location names a write's files in
+/// its manifest from the post-write maintenance pass, which skips that step
+/// when another pass holds the compaction lock. The manifest must still name
+/// the write's files once the lock is free, without another write to prompt it.
+async fn a_skipped_manifest_rebuild_names_the_files_once_the_lock_is_free(
+    storage: Storage,
+) -> TestResult {
+    let fixture = TestFixture::new(common::BackendType::Sqlite).await?;
+    let catalog: Arc<dyn MetadataCatalog> = Arc::clone(&fixture.catalog);
+    let ctx = SessionContext::new();
+    let table = Arc::new(
+        storage
+            .builder(Arc::clone(&catalog), ctx.runtime_env())
+            .create(CreateTableOptions {
+                table_name: TABLE.to_string(),
+                schema: schema(),
+                primary_key: vec!["id".to_string()],
+                on_conflict: Some(OnConflict::Upsert(ColumnReference::new(vec![
+                    "id".to_string(),
+                ]))),
+                base_path: storage.base_path(),
+                partition_column: None,
+                vortex_config: parked_config(),
+            })
+            .await?,
+    );
+    for value in 0..3 {
+        upsert(&table, 1, value).await?;
+        common::poll_inlined_data_count_zero(&fixture.catalog, table.table_id()).await?;
+    }
+    table.drain_in_flight_maintenance().await?;
+    assert_eq!(
+        unnamed_files(&catalog, &table, &storage).await?,
+        Vec::<String>::new(),
+        "after the maintenance of the first writes, the catalog names every file"
+    );
+
+    // The write's maintenance pass runs while the lock is held, so its manifest
+    // rebuild is skipped.
+    let held = table.hold_compaction().await;
+    upsert(&table, 1, 3).await?;
+    common::poll_inlined_data_count_zero(&fixture.catalog, table.table_id()).await?;
+    table.flush_pending_maintenance().await?;
+    let unnamed = unnamed_files(&catalog, &table, &storage).await?;
+    assert!(
+        unnamed.iter().any(|path| {
+            std::path::Path::new(path)
+                .extension()
+                .is_some_and(|extension| extension == "vortex")
+        }),
+        "while the lock is held the write's data file is not named yet: {unnamed:?}"
+    );
+
+    drop(held);
+    let deadline = Instant::now() + MANIFEST_DEADLINE;
+    loop {
+        let unnamed = unnamed_files(&catalog, &table, &storage).await?;
+        if unnamed.is_empty() {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "{} file(s) still not named by the catalog {}s after the compaction lock was released, with no further write: {unnamed:?}",
+            unnamed.len(),
+            MANIFEST_DEADLINE.as_secs()
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert_eq!(rows(&table).await?, vec![(1, 3)]);
+    table.drain_in_flight_maintenance().await?;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_skipped_manifest_rebuild_names_the_files_once_the_lock_is_free_on_an_object_store()
+-> TestResult {
+    let url = url::Url::parse(&format!(
+        "s3://cayenne-test/{}/data",
+        uuid::Uuid::now_v7().simple()
+    ))?;
+    a_skipped_manifest_rebuild_names_the_files_once_the_lock_is_free(Storage::Store {
+        store: Arc::new(InMemory::new()),
+        url,
+    })
+    .await
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_skipped_manifest_rebuild_names_the_files_once_the_lock_is_free_on_a_local_directory()
+-> TestResult {
+    let dir = tempfile::TempDir::new()?;
+    a_skipped_manifest_rebuild_names_the_files_once_the_lock_is_free(Storage::Local(
+        dir.path().to_path_buf(),
+    ))
+    .await
+}
