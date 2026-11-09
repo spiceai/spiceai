@@ -2682,6 +2682,57 @@ impl CacheRefreshHelper {
         })
     }
 
+    /// Once `earlier`'s write has landed and released `key`, refreshes the
+    /// stored entry for `filters` from the origin as the key's new leader, in
+    /// the background. Used by a lookup that fetched for itself because it may
+    /// not replay `earlier`'s finished result: it cannot store that answer, and
+    /// without this the cache would keep `earlier`'s older one. If another
+    /// lookup leads the key by then, its fetch is at least as new, and it
+    /// stores that instead.
+    #[expect(clippy::too_many_arguments)]
+    fn refresh_after_release(
+        earlier: InFlightFetch,
+        in_flight_revalidations: &InFlightRevalidations,
+        key: String,
+        federated: &Arc<dyn TableProvider>,
+        session_state: &SessionState,
+        dataset_name: &str,
+        filters: &[Expr],
+        namespace: CacheNamespace,
+        batch_write_tx: &CacheWriteSender,
+        io_runtime: &Handle,
+    ) {
+        let in_flight = Arc::clone(in_flight_revalidations);
+        let federated = Arc::clone(federated);
+        // Owned for the background task; taken only on this path.
+        let session_state = session_state.clone();
+        let dataset = dataset_name.to_string();
+        let filters = filters.to_vec();
+        let writer = batch_write_tx.clone();
+        let deadline = tokio::time::Instant::now() + FOLLOWER_WAIT_TIMEOUT;
+        if let Err(error) = batch_write_tx.spawn_owned(io_runtime, async move {
+            earlier.released(deadline).await;
+            match CacheKeyClaim::acquire(&in_flight, key, None) {
+                ClaimOutcome::Leader(claim) => Self::refresh_entry(
+                    federated,
+                    &session_state,
+                    &dataset,
+                    &filters,
+                    namespace,
+                    writer,
+                    claim,
+                )
+                .await
+                .map(|_| ()),
+                ClaimOutcome::Follower(_) => Ok(()),
+            }
+        }) {
+            tracing::debug!(
+                "Declining to refresh the stored entry for dataset '{dataset_name}' after a zero-TTL lookup: {error}"
+            );
+        }
+    }
+
     /// Handle a cache miss by fetching from source and returning a stream.
     /// Returns a `SendableRecordBatchStream` containing the fetched data, empty stream, or error stream.
     ///
@@ -2733,55 +2784,59 @@ impl CacheRefreshHelper {
         // needs, in which case it fetches for itself and, holding no claim,
         // does not write.
         let key = compute_cache_key_from_filters_and_namespace(filters, namespace.storage_id());
-        let wait_until = tokio::time::Instant::now() + FOLLOWER_WAIT_TIMEOUT;
-        let mut claim = loop {
-            match CacheKeyClaim::acquire(&in_flight_revalidations, key.clone(), limit) {
-                ClaimOutcome::Leader(claim) => break claim,
-                // An earlier lookup's fetch finished before this one began and
-                // is older than the TTL; its write has not landed yet. Replaying
-                // it would serve an answer older than this lookup (#16148), and
-                // fetching without the claim would leave the cache holding that
-                // older answer once its write lands. So wait for the write to
-                // release the key, then fetch and store as the leader.
-                ClaimOutcome::Follower(in_flight)
-                    if !in_flight.replayable_for(lookup_started_at, max_age)
-                        && tokio::time::Instant::now() < wait_until =>
-                {
+        let mut claim = match CacheKeyClaim::acquire(&in_flight_revalidations, key.clone(), limit) {
+            ClaimOutcome::Leader(claim) => claim,
+            ClaimOutcome::Follower(in_flight) => {
+                let replayable = in_flight.replayable_for(lookup_started_at, max_age);
+                if !replayable {
+                    // An earlier lookup's fetch finished before this one began
+                    // and is older than the TTL; its write has not landed yet.
+                    // Replaying it would serve an answer older than this lookup
+                    // (#16148), so this lookup asks the origin itself, without
+                    // waiting for that write. Holding no claim, it cannot store
+                    // what it fetches, and once the earlier write lands the cache
+                    // would hold the older answer, which `caching_stale_if_error`
+                    // could serve later. So a background refresh stores a fresh
+                    // copy as soon as that write releases the key.
                     tracing::debug!(
-                        "Cache miss for dataset {dataset_name} found a finished fetch for the same key older than its `caching_ttl` ({max_age:?}); waiting for its write to land before fetching"
+                        "Cache miss for dataset {dataset_name} found a finished fetch for the same key older than its `caching_ttl` ({max_age:?}); fetching for itself and refreshing the stored entry once that fetch's write lands"
                     );
-                    in_flight.released(wait_until).await;
-                }
-                ClaimOutcome::Follower(in_flight) => {
-                    let own_fetch = UncoalescedFetch {
-                        federated,
+                    Self::refresh_after_release(
+                        in_flight.clone(),
+                        &in_flight_revalidations,
+                        key,
+                        &federated,
                         session_state,
                         dataset_name,
                         filters,
-                        limit,
-                        task_context: batch_write_tx.task_context(session_state),
-                        schema: fallback_schema,
-                        stale_if_error,
-                        max_age,
-                        expired_batches,
-                    };
-                    if !in_flight.replayable_for(lookup_started_at, max_age) {
-                        tracing::debug!(
-                            "Cache miss for dataset {dataset_name} waited {FOLLOWER_WAIT_TIMEOUT:?} for an earlier write of the same key to land; fetching for itself"
-                        );
-                        drop(in_flight);
-                        return own_fetch.run().await;
-                    }
-                    if in_flight.serves(limit) {
-                        return Self::follow_cache_miss(in_flight.state, own_fetch).await;
-                    }
+                        namespace,
+                        &batch_write_tx,
+                        io_runtime,
+                    );
+                }
+                let own_fetch = UncoalescedFetch {
+                    federated,
+                    session_state,
+                    dataset_name,
+                    filters,
+                    limit,
+                    task_context: batch_write_tx.task_context(session_state),
+                    schema: fallback_schema,
+                    stale_if_error,
+                    max_age,
+                    expired_batches,
+                };
+                if replayable && in_flight.serves(limit) {
+                    return Self::follow_cache_miss(in_flight.state, own_fetch).await;
+                }
+                if replayable {
                     tracing::debug!(
                         "Cache miss for dataset {dataset_name} found an in-flight fetch for the same key bounded at {fetched:?} rows, below this request's limit {limit:?}; fetching for itself",
                         fetched = in_flight.limit
                     );
-                    drop(in_flight);
-                    return own_fetch.run().await;
                 }
+                drop(in_flight);
+                return own_fetch.run().await;
             }
         };
 
@@ -3258,6 +3313,23 @@ pub(crate) static SHARED_SESSION_STATE: LazyLock<Arc<SessionState>> = LazyLock::
 });
 
 /// Whether a filtered cache read must ask the origin before it may serve stored rows.
+/// Whether a caching scan with these settings can never serve a stored entry: a
+/// zero TTL, no stale-while-revalidate window and no stale-if-error fallback.
+/// Such a lookup answers from the origin and stores nothing; storing would only
+/// queue writes nothing reads, and a stored answer could be replayed in place of
+/// the origin's current one (#16148).
+pub(super) fn passes_through(
+    filters: &[Expr],
+    max_age: Option<Duration>,
+    stale_while_revalidate: Option<Duration>,
+    stale_if_error: StaleIfError,
+) -> bool {
+    !filters.is_empty()
+        && effective_max_age(max_age).is_zero()
+        && stale_while_revalidate.unwrap_or_default().is_zero()
+        && !stale_if_error.serves_stale_on_error()
+}
+
 pub(super) fn uses_source_first(
     filters: &[Expr],
     max_age: Option<Duration>,
@@ -3556,6 +3628,40 @@ impl ExecutionPlan for CachingAccelerationScanExec {
             Some(request) => (request, true),
             None => (self.filters.clone(), false),
         };
+
+        // Nothing stored could ever be served: ask the origin, store nothing.
+        if passes_through(
+            &self.filters,
+            self.max_age,
+            self.stale_while_revalidate,
+            self.stale_if_error,
+        ) {
+            let schema = self.input.schema();
+            let federated = Arc::clone(&self.federated);
+            let session_state = Arc::clone(&self.session_state);
+            let dataset_name = self.dataset_name.clone();
+            let limit = self.limit;
+            let task_context = Arc::clone(&context);
+            let fetch_schema = Arc::clone(&schema);
+            let stream = futures::stream::once(async move {
+                UncoalescedFetch {
+                    federated,
+                    session_state: &session_state,
+                    dataset_name: &dataset_name,
+                    filters: &fill_filters,
+                    limit,
+                    task_context,
+                    schema: fetch_schema,
+                    stale_if_error: StaleIfError::Disabled,
+                    max_age: Duration::ZERO,
+                    expired_batches: None,
+                }
+                .run()
+                .await
+            })
+            .flatten();
+            return Ok(Box::pin(RecordBatchStreamAdapter::new(schema, stream)));
+        }
 
         // With neither a fresh nor an SWR window, a stale-if-error entry can
         // only be served after a failing fetch. Do not execute its scan until
@@ -7225,9 +7331,9 @@ mod tests {
     /// Under `caching_ttl: 0s` a miss that finds a fetch whose result was
     /// published before the lookup began (its write not yet landed) does not
     /// replay it, which would serve an answer older than the lookup (#16148).
-    /// It waits for that write to release the key, then fetches the origin and
-    /// stores the answer as the leader, so the cache does not end up holding
-    /// the older one.
+    /// It answers from the origin at once, without waiting for that write, and
+    /// once the write releases the key a background refresh stores the origin's
+    /// answer, so the cache does not end up holding the older one.
     #[tokio::test]
     async fn a_zero_ttl_miss_does_not_replay_a_published_fetch() {
         use futures::StreamExt;
@@ -7263,38 +7369,34 @@ mod tests {
         )
         .expect("leader batch");
         leader.publish_ready(Arc::new(vec![published]));
-        let lookup_started_at = tokio::time::Instant::now();
         let session_state = test_session_state();
         let io = tokio::runtime::Handle::current();
 
-        // The leader's write lands (releasing the key) while the miss waits.
-        let miss = CacheRefreshHelper::handle_cache_miss(
-            Arc::clone(&http_source) as Arc<dyn TableProvider>,
-            &session_state,
-            "test_dataset",
-            &filters,
-            None,
-            Arc::clone(&schema),
-            false,
-            false,
-            StaleIfError::Disabled,
-            Duration::ZERO,
-            None,
-            &io,
-            Arc::new(vec![].into()),
-            batch_write_tx,
-            CacheNamespace::Public,
-            Arc::clone(&in_flight),
-            lookup_started_at,
-        );
-        let land = async {
-            tokio::task::yield_now().await;
-            drop(leader);
-        };
-        let (mut stream, ()) =
-            tokio::time::timeout(Duration::from_secs(5), async { tokio::join!(miss, land) })
-                .await
-                .expect("the miss proceeds once the leader's write releases the key");
+        // Answered while the leader's write is still pending: no waiting on it.
+        let mut stream = tokio::time::timeout(
+            Duration::from_secs(5),
+            CacheRefreshHelper::handle_cache_miss(
+                Arc::clone(&http_source) as Arc<dyn TableProvider>,
+                &session_state,
+                "test_dataset",
+                &filters,
+                None,
+                Arc::clone(&schema),
+                false,
+                false,
+                StaleIfError::Disabled,
+                Duration::ZERO,
+                None,
+                &io,
+                Arc::new(vec![].into()),
+                batch_write_tx,
+                CacheNamespace::Public,
+                Arc::clone(&in_flight),
+                tokio::time::Instant::now(),
+            ),
+        )
+        .await
+        .expect("the miss answers without waiting for the earlier write");
 
         // The miss is served the origin's row, not the leader's published one.
         let mut served = Vec::new();
@@ -7314,8 +7416,9 @@ mod tests {
         );
 
         drop(stream);
-        // The miss's sender went with it, so the writer flushes what it was
-        // given and exits.
+        // The earlier write lands, releasing the key to the background refresh;
+        // the writer exits once that refresh, the last sender, has stored.
+        drop(leader);
         await_writer_exit(handle).await;
 
         let stored: Vec<String> = accelerator
@@ -8358,8 +8461,8 @@ mod tests {
 
     /// Counts accelerator executions through the actual caching scan plan.
     /// A backend-first success must not execute its child, whereas an origin
-    /// failure reads it once, and the disabled and nonzero-TTL paths retain
-    /// their normal cache-first scan.
+    /// failure reads it once; a zero TTL with no fallback never reads it, and
+    /// the nonzero-TTL and SWR paths retain their normal cache-first scan.
     #[tokio::test]
     async fn zero_ttl_backend_first_only_scans_on_failure() {
         let schema = http_cache_schema();
@@ -8395,7 +8498,7 @@ mod tests {
                 None,
                 StaleIfError::Disabled,
                 503,
-                1,
+                0,
                 "error",
             ),
             (
