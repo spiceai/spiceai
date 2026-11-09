@@ -150,7 +150,7 @@ pub type Result<T, E = Error> = std::result::Result<T, E>;
 /// the argument count are. A backend that also answers per *call* is the
 /// exception: reach for [`stub_udf_called_with`] there, since the arguments are
 /// then part of the question.
-#[cfg(all(test, any(feature = "duckdb", feature = "snowflake")))]
+#[cfg(all(test, any(feature = "adbc", feature = "snowflake")))]
 pub(crate) fn stub_udf(name: &str, arity: usize) -> datafusion::logical_expr::Expr {
     use datafusion::prelude::col;
 
@@ -161,7 +161,7 @@ pub(crate) fn stub_udf(name: &str, arity: usize) -> datafusion::logical_expr::Ex
 /// [`FunctionSupport`](datafusion_table_providers::util::supported_functions::FunctionSupport)
 /// answers per *call* — where a literal argument is what decides whether the
 /// dialect can render it.
-#[cfg(all(test, any(feature = "duckdb", feature = "snowflake")))]
+#[cfg(all(test, any(feature = "adbc", feature = "snowflake")))]
 pub(crate) fn stub_udf_called_with(
     name: &str,
     args: Vec<datafusion::logical_expr::Expr>,
@@ -187,7 +187,7 @@ pub mod cayenne;
 #[cfg(feature = "databricks")]
 pub mod databricks;
 pub mod deferred;
-#[cfg(feature = "duckdb")]
+#[cfg(feature = "adbc")]
 pub mod ducklake;
 // Only the ADBC catalog connector reads the `query_federation` parameter today,
 // because only its dataset connector offers one. The MySQL, PostgreSQL, DuckLake
@@ -330,7 +330,7 @@ pub async fn register_all() {
         ),
     );
 
-    #[cfg(feature = "duckdb")]
+    #[cfg(feature = "adbc")]
     registry.insert(
         ducklake::PREFIX.to_string(),
         CatalogConnectorFactory::new(
@@ -665,7 +665,7 @@ mod tests {
                 guard.contains_key("databricks"),
                 "databricks should be registered"
             );
-            #[cfg(feature = "duckdb")]
+            #[cfg(feature = "adbc")]
             assert!(
                 guard.contains_key(ducklake::PREFIX),
                 "ducklake should be registered"

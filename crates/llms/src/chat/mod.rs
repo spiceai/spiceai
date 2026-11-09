@@ -490,6 +490,11 @@ pub struct LocalModelOptions<'a> {
     /// The nodes the model is split across, for an engine that serves distributed models
     /// ([`engine::LocalChatEngine::distributed`]); mistral.rs reads its ring from the environment.
     pub distributed: Option<&'a DistributedConfig>,
+    /// How many requests the llama.cpp engine decodes together, each in its own sequence of one
+    /// shared cache. `None` takes the engine's own choice, one request at a time until
+    /// continuous batching is enabled (#15598). Tests set it; no Spicepod field, flag or
+    /// environment variable reaches it.
+    pub concurrent_requests: Option<std::num::NonZeroU32>,
 }
 
 /// A local model's Spicepod name and its `reasoning_effort` default. The loader checks the
