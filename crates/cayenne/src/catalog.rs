@@ -306,6 +306,27 @@ pub struct SnapshotSequenceCommit {
     pub sequence_number: i64,
 }
 
+/// The durable effects of one mem-tier seal or checkpoint.
+#[derive(Debug, Default)]
+pub struct MemTierDurableCommit {
+    /// Table receiving the mutation.
+    pub table_id: String,
+    /// Delete-only vectors, without a reinsert stamp.
+    pub pure_delete_files: Vec<DeleteFile>,
+    /// Vectors whose keys are reinserted at `sequence_number`.
+    pub reinsert_delete_files: Vec<DeleteFile>,
+    /// Reinsert keys (used to gate the per-vector reinsert stamp).
+    pub insert_pk_bytes: Vec<Vec<u8>>,
+    /// Reserved shadow/reinsert sequence, above every tombstone sequence.
+    pub sequence_number: i64,
+    /// Protected snapshot registration for a data-bearing checkpoint.
+    pub snapshot_sequence: Option<SnapshotSequenceCommit>,
+    /// Unpublished seal shadow rows, stamped with `sequence_number`.
+    pub inline_data: Vec<InlinedData>,
+    /// Clear the superseded inline corpus AND its deletion markers.
+    pub clear_inlined: bool,
+}
+
 // Transaction support is currently not exposed at the catalog level.
 // Each catalog implementation can use backend-specific transactions internally
 // to ensure atomicity of operations.
@@ -433,6 +454,10 @@ pub trait MetadataCatalog: Send + Sync {
         deleted_inlined_ids: Vec<String>,
         replaced_delete_file_ids: Vec<String>,
     ) -> CatalogResult<()>;
+
+    /// Atomically persist all metadata effects of one mem-tier seal or checkpoint.
+    /// Failure leaves the catalog unchanged; visibility publication remains the caller's job.
+    async fn commit_mem_tier_durable(&self, commit: MemTierDurableCommit) -> CatalogResult<()>;
 
     /// Get all active delete files for a table (across all virtual files).
     async fn get_table_delete_files(&self, table_id: &str) -> CatalogResult<Vec<DeleteFile>>;
