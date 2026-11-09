@@ -4201,6 +4201,13 @@ pub(crate) enum CheckpointAttempt {
 /// is a fixed constant rather than a tunable knob.
 pub(crate) const ORPHANED_DV_CLEANUP_MIN_FILES: usize = 20;
 
+/// Key deletion vectors at or above which a key-delete table whose current snapshot
+/// holds rows rewrites that snapshot whole, so the vectors it applies are dropped
+/// with the rows they hid (see `deletion_vector_reclaim_decision`). A change stream
+/// writes about one a commit; the rewrites are paced to a tenth of the time, so on
+/// a large table the count can pass this while the previous rewrite's pace runs.
+pub(crate) const DELETION_VECTOR_RECLAIM_TRIGGER: usize = 64;
+
 /// Floor on how often a table samples its metastore footprint gauges.
 ///
 /// Matches the default background compaction interval, so at default settings
@@ -6887,34 +6894,43 @@ impl CayenneTableProvider {
     /// Atomically commit a snapshot rewrite to the catalog, clearing exactly the
     /// state the rewrite materialized (see [`RewriteScope`]).
     ///
-    /// A scope that clears every delete-file row also removes those rows' files
-    /// once the commit succeeds: no row names them afterwards, and nothing else
-    /// would. Such a rewrite excludes writers, so the rows read before the commit
-    /// are the rows it clears.
+    /// The commit also removes the files of the delete-file rows it clears, once
+    /// it succeeds: no row names them afterwards, and nothing else would. A scope
+    /// that clears every row excludes writers, so the rows read before the commit
+    /// are the rows it clears. A fenced scope clears the rows at or below its
+    /// cutoff, and no write straddles that cutoff (see
+    /// `rewrite_current_snapshot_for_compaction`), so every such row is committed
+    /// before this read and the rows read at or below it are the rows it clears.
     pub(crate) async fn commit_snapshot_rewrite(
         &self,
         replaced_snapshot_id: &str,
         new_snapshot_id: &str,
         scope: &RewriteScope,
     ) -> CatalogResult<()> {
-        let cleared_delete_files = match scope {
-            RewriteScope::All | RewriteScope::AllTombstonesFoldedSnapshots { .. } => {
-                self.catalog
-                    .get_table_delete_files(&self.table_metadata.table_id)
-                    .await
-                    .unwrap_or_else(|error| {
-                        // The commit does not depend on this read; without it the
-                        // cleared rows' files stay on disk.
-                        tracing::debug!(
-                            target: "cayenne::compaction",
-                            table = self.table_metadata.table_name.as_str(),
-                            %error,
-                            "Could not list the deletion vectors a snapshot rewrite clears; their files stay on disk"
-                        );
-                        Vec::new()
-                    })
+        let cleared_at_or_below = match scope {
+            RewriteScope::All | RewriteScope::AllTombstonesFoldedSnapshots { .. } => i64::MAX,
+            RewriteScope::Fenced { cutoff, .. } => *cutoff,
+        };
+        let cleared_delete_files: Vec<_> = match self
+            .catalog
+            .get_table_delete_files(&self.table_metadata.table_id)
+            .await
+        {
+            Ok(files) => files
+                .into_iter()
+                .filter(|file| file.sequence_number <= cleared_at_or_below)
+                .collect(),
+            Err(error) => {
+                // The commit does not depend on this read; without it the cleared
+                // rows' files stay in storage.
+                tracing::debug!(
+                    target: "cayenne::compaction",
+                    table = self.table_metadata.table_name.as_str(),
+                    %error,
+                    "Could not list the deletion vectors a snapshot rewrite clears; their files stay in storage"
+                );
+                Vec::new()
             }
-            RewriteScope::Fenced { .. } => Vec::new(),
         };
         // A table in the object-native location scans only its manifest: a
         // rewrite whose writer has not recorded its output yet records it now,
@@ -9235,7 +9251,9 @@ impl CayenneTableProvider {
     /// With a catalog that keeps the durable retirement record
     /// ([`MetadataCatalog::retired_snapshots`]), only snapshots a committed change
     /// retired are touched, their files are the ones their manifest rows name (a
-    /// snapshot with none is listed), deletes go out in batches of at most
+    /// snapshot with none is listed, unless the dataset is in the object-native
+    /// location, whose committed state names every file it keeps), deletes go out
+    /// in batches of at most
     /// [`crate::dataset_storage::DELETE_BATCH`] keys, and each batch's snapshots
     /// are forgotten in one commit once their files are gone. A crash between the
     /// deletes and that commit leaves the snapshots retired, and the next pass,
@@ -9337,7 +9355,12 @@ impl CayenneTableProvider {
             if self.uncommitted_files.holds_snapshot(&id) {
                 continue;
             }
-            let doomed = if durable.is_some() && has_rows {
+            // A dataset in the object-native location keeps no file its committed
+            // state does not name: a retired snapshot with no manifest rows holds
+            // no committed file, so there is nothing to delete by listing it.
+            // Whatever an unfinished write left under it is the orphan sweep's.
+            let doomed = if durable.is_some() && (has_rows || self.data_in_object_native_location())
+            {
                 named
             } else {
                 let prefix = ObjectStorePath::from(format!("{root}{id}/"));
@@ -15604,6 +15627,7 @@ impl CayenneTableProvider {
         if let Some(auto) = self.pk_deletion_mode.auto() {
             auto.forget_reclaim_pace();
         }
+        self.context.whole_table_reclaim_pace().forget();
     }
 
     /// Bytes this table currently reserves against the query memory pool for its
@@ -22385,12 +22409,18 @@ impl CayenneTableProvider {
         let key_reclaim = !self.pk_deletion_strategy.is_position_based()
             && auto.is_some_and(|auto| !auto.uses_positions());
         if !self.should_capture_positions() && !key_reclaim {
-            return ReclaimDecision::NotDue;
+            return self.deletion_vector_reclaim_decision();
         }
         let deletion_index_len = self.pk_deletion_snapshot().delete_len();
+        // Key deletion vectors pile up on a key-delete table whose index stays
+        // small (see `deletion_vector_reclaim_decision`); an `auto` table on key
+        // deletes takes its paced reclaim for them as well.
+        let vectors_due = key_reclaim
+            && !self.should_capture_positions()
+            && self.context.key_deletion_vector_files() >= DELETION_VECTOR_RECLAIM_TRIGGER;
         // An empty index has nothing to reclaim — whatever the trigger, even a
         // configured 0 — and this path is a whole-snapshot rewrite.
-        if deletion_index_len == 0 {
+        if deletion_index_len == 0 && !vectors_due {
             return ReclaimDecision::NotDue;
         }
         // The CONFIGURED trigger, not the adaptive one: the controller lowers that
@@ -22402,7 +22432,8 @@ impl CayenneTableProvider {
         // learn that its tombstones hid nothing.
         let trigger_len = self.context.effective_reclaim_deletion_index_trigger();
         let over_memory_ceiling = self.deletion_index_over_memory_ceiling();
-        if deletion_index_len < trigger_len && !over_memory_ceiling {
+        let index_due = deletion_index_len >= trigger_len || over_memory_ceiling;
+        if !index_due && !vectors_due {
             return ReclaimDecision::NotDue;
         }
         if !over_memory_ceiling
@@ -22443,11 +22474,89 @@ impl CayenneTableProvider {
             );
             return ReclaimDecision::Backpressure;
         }
+        if !index_due {
+            return ReclaimDecision::Due(SnapshotMaintenanceTrigger::DeletionVectorFiles {
+                deletion_vector_files: self.context.key_deletion_vector_files(),
+                trigger_files: DELETION_VECTOR_RECLAIM_TRIGGER,
+            });
+        }
         ReclaimDecision::Due(SnapshotMaintenanceTrigger::DeletionIndexSize {
             deletion_index_len,
             trigger_len,
             over_memory_ceiling,
         })
+    }
+
+    /// The whole-table reclaim of a key-delete table that is not `auto`: due once
+    /// the key deletion vectors its metastore holds reach
+    /// [`DELETION_VECTOR_RECLAIM_TRIGGER`], paced to a tenth of the time as an
+    /// `auto` table's reclaims are, and deferred while the change-stream apply has
+    /// no headroom.
+    ///
+    /// A key deletion vector is reclaimed once no live row sits below its sequence
+    /// (the orphaned-vector sweep), or when a rewrite applies it. The seq-prefix
+    /// bake rewrites only protected snapshots, and the rows of the current
+    /// snapshot stay below every later vector until that snapshot is rewritten: a
+    /// change stream into a table it loaded once writes about one vector a commit,
+    /// and while the keys it touches stay fewer than the bake's trigger, neither
+    /// the bake nor the deletion-index reclaim ever fires, so they would pile up
+    /// without bound. Counted in files rather than tombstones because the files
+    /// are what grows: the index keeps one entry a key. The pass that takes the
+    /// trigger confirms the current snapshot holds rows before it rewrites.
+    fn deletion_vector_reclaim_decision(&self) -> ReclaimDecision {
+        if self.pk_deletion_strategy.is_position_based()
+            || self.pk_deletion_mode.auto().is_some()
+            || self.should_capture_positions()
+        {
+            return ReclaimDecision::NotDue;
+        }
+        let deletion_vector_files = self.context.key_deletion_vector_files();
+        if deletion_vector_files < DELETION_VECTOR_RECLAIM_TRIGGER {
+            return ReclaimDecision::NotDue;
+        }
+        if !self.context.whole_table_reclaim_pace().due(Instant::now()) {
+            return ReclaimDecision::Paced;
+        }
+        if self.context.whole_table_reclaim_should_defer_for_apply() {
+            tracing::debug!(
+                target: "cayenne::compaction",
+                table = self.table_metadata.table_name.as_str(),
+                deletion_vector_files,
+                "Deferring the whole-table deletion-vector reclaim: CDC apply at/over capacity (back-pressure)",
+            );
+            return ReclaimDecision::Backpressure;
+        }
+        ReclaimDecision::Due(SnapshotMaintenanceTrigger::DeletionVectorFiles {
+            deletion_vector_files,
+            trigger_files: DELETION_VECTOR_RECLAIM_TRIGGER,
+        })
+    }
+
+    /// Count the key deletion vectors this table's metastore holds, for
+    /// [`Self::deletion_vector_reclaim_decision`]: one metastore read, on a
+    /// key-delete table only. A failed read leaves the previous count.
+    async fn refresh_key_deletion_vector_count(&self) {
+        if self.pk_deletion_strategy.is_position_based() || self.should_capture_positions() {
+            return;
+        }
+        match self
+            .catalog
+            .get_table_delete_files(&self.table_metadata.table_id)
+            .await
+        {
+            Ok(files) => self.context.set_key_deletion_vector_files(
+                files
+                    .iter()
+                    .filter(|file| file.source_data_file_path.is_none())
+                    .count(),
+            ),
+            Err(error) => tracing::debug!(
+                target: "cayenne::compaction",
+                table = self.table_metadata.table_name.as_str(),
+                %error,
+                "Failed to count the table's deletion vectors; keeping the previous count",
+            ),
+        }
     }
 
     /// [`Self::deletion_index_reclaim_decision`], as the trigger to run with.
@@ -22504,6 +22613,7 @@ impl CayenneTableProvider {
         let small_files = self.new_current_files_above_compaction_threshold();
         let reclaim = self.deletion_index_reclaim_decision();
         let deletion_index_trigger = reclaim.trigger();
+
         if !small_files && deletion_index_trigger.is_none() {
             maintenance_metrics::track_compaction(
                 table_name,
@@ -25952,6 +26062,16 @@ impl CayenneTableProvider {
                 trigger,
                 "Running current-snapshot compaction because the small-file count trigger fired"
             ),
+            SnapshotMaintenanceTrigger::DeletionVectorFiles {
+                deletion_vector_files,
+                trigger_files,
+            } => tracing::debug!(
+                target: "cayenne::compaction",
+                table = self.table_metadata.table_name.as_str(),
+                deletion_vector_files,
+                trigger_files,
+                "Running current-snapshot compaction because the deletion-vector count trigger fired"
+            ),
             SnapshotMaintenanceTrigger::DeletionIndexSize {
                 deletion_index_len,
                 trigger_len,
@@ -26938,7 +27058,12 @@ impl CayenneTableProvider {
         trigger: SnapshotMaintenanceTrigger,
     ) -> std::result::Result<Option<tokio::sync::OwnedSemaphorePermit>, Option<CompactionOutcome>>
     {
-        if self.pk_deletion_mode.auto().is_none()
+        let takes_permit = self.pk_deletion_mode.auto().is_some()
+            || matches!(
+                trigger,
+                SnapshotMaintenanceTrigger::DeletionVectorFiles { .. }
+            );
+        if !takes_permit
             || matches!(
                 trigger,
                 SnapshotMaintenanceTrigger::DeletionIndexSize {
@@ -26993,6 +27118,15 @@ impl CayenneTableProvider {
             if matches!(result, Ok(true)) && auto.uses_positions() {
                 auto.record_kept_compacted();
             }
+        } else if reclaim {
+            self.context
+                .whole_table_reclaim_pace()
+                .record(pass_start.elapsed(), Instant::now());
+        }
+        // A committed rewrite dropped the deletion vectors it applied; the next
+        // trigger counts what is left.
+        if reclaim && matches!(result, Ok(true)) {
+            self.context.set_key_deletion_vector_files(0);
         }
         let table = self.table_metadata.table_name.clone();
         let result_label = if result.is_ok() {
@@ -27543,8 +27677,12 @@ impl CayenneTableProvider {
         // 135–136 ms with that table on explicit key deletes. The reclaim budget
         // (`compaction::whole_table_reclaim_budget`) bounds how many such encodes run
         // at once across tables, and in `spiced` they run on the low-priority
-        // compaction runtime.
-        let write_policy = if reclaim && self.pk_deletion_mode.auto().is_some() {
+        // compaction runtime. The deletion-vector reclaim of an explicit key-delete
+        // table is the same rewrite under the same budget, and takes none either.
+        let write_policy = if reclaim
+            && (self.pk_deletion_mode.auto().is_some()
+                || !self.pk_deletion_strategy.is_position_based())
+        {
             rewrite_write_policy(rewrite_is_sorted).without_encode_budget()
         } else {
             rewrite_write_policy(rewrite_is_sorted)
@@ -45801,6 +45939,7 @@ impl super::compaction::CompactionRunner for CayenneTableProvider {
         if self.ensure_publication_outcome_known().is_err() {
             return Ok(false);
         }
+
         let Some(_pass) = super::compaction::try_track_compaction_pass() else {
             return Ok(false);
         };
@@ -45964,6 +46103,9 @@ impl super::compaction::CompactionRunner for CayenneTableProvider {
                 }
             }
         }
+        // The whole-table reclaim below reads how many key deletion vectors the
+        // table holds; count them once a trigger.
+        self.refresh_key_deletion_vector_count().await;
         // Attempt a pass of compacting current (i.e. append-based) data files.
         // When compaction runs, protected snapshots are folded in.
         let compaction_ran = self

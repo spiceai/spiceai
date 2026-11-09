@@ -2525,3 +2525,165 @@ async fn the_catalog_recognizes_its_datasets_data_in_both_recorded_forms() {
         );
     }
 }
+
+/// The deletion vectors of a dataset whose data is in the location, as objects.
+async fn deletion_vector_objects(bucket: &InMemory, prefix: &str) -> usize {
+    let metas: Vec<ObjectMeta> = bucket
+        .list(Some(&Path::from(prefix)))
+        .try_collect()
+        .await
+        .expect("list the dataset's data");
+    metas
+        .iter()
+        .filter(|meta| has_extension(meta.location.as_ref(), &["arrow"]))
+        .count()
+}
+
+/// A steady change stream of updates and deletes at a fixed rate, one commit per
+/// cycle, into a keyed table loaded once, with background compaction running as the
+/// accelerator runs it: the deletion vectors in the location stay under a bound and
+/// do not trend upward, and the table matches the source, live and reopened from the
+/// store alone. The loaded rows stay in the current snapshot, below every later
+/// deletion vector, and the updates hit the same keys again and again, so the
+/// deletion index stays as small as the table and its own triggers never fire; one
+/// vector a commit would pile up unless the vectors themselves bring on the rewrite
+/// that applies them, and that rewrite deletes their objects.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn deletion_vectors_stay_bounded_under_a_steady_change_stream() {
+    const KEYS: i64 = 4_000;
+    const CYCLES: usize = 300;
+    const BOUND: usize = 200;
+    let name = "dv_churn";
+    let (setup, catalog) = KeyedSetup::new(name).await;
+    let store = setup.store(None);
+    let catalog: Arc<dyn MetadataCatalog> = Arc::new(catalog);
+    let config = VortexConfig {
+        compaction_background_interval_ms: 50,
+        ..cdc_config(CdcDurability::Memory)
+    };
+    let (table, ctx) = setup.create(name, &store, catalog, config).await;
+    table.install_slot_advancer(Arc::new(NoopSlotAdvancer));
+    // Background compaction, as the accelerator starts it for every table.
+    assert!(
+        table.spawn_background_compaction(Arc::new(tokio::sync::Semaphore::new(1))),
+        "background compaction"
+    );
+
+    // The initial load replaces the table's rows, as a dataset's first refresh does:
+    // they go into the current snapshot, below every later change.
+    let mut model: std::collections::BTreeMap<i64, i64> = (1..=KEYS).map(|id| (id, id)).collect();
+    let seed: Vec<(i64, i64)> = model.iter().map(|(id, v)| (*id, *v)).collect();
+    let input = datafusion::datasource::memory::MemorySourceConfig::try_new_exec(
+        &[vec![rows_batch(&seed)]],
+        schema(),
+        None,
+    )
+    .expect("seed input");
+    let plan = table
+        .insert_into(
+            &ctx.state(),
+            input,
+            datafusion::logical_expr::dml::InsertOp::Overwrite,
+        )
+        .await
+        .expect("plan the initial load");
+    datafusion::physical_plan::collect(plan, ctx.task_ctx())
+        .await
+        .expect("initial load");
+
+    let mut samples = Vec::with_capacity(CYCLES);
+    for round in 0..i64::try_from(CYCLES).expect("small") {
+        // `UPDATE … WHERE id % 97 = round % 97`, then `DELETE … WHERE id % 991 = round % 991`.
+        let updates: Vec<(i64, i64)> = model
+            .iter()
+            .filter(|(id, _)| *id % 97 == round % 97)
+            .map(|(id, v)| (*id, v + 1))
+            .collect();
+        if !updates.is_empty() {
+            cdc_upsert(&table, &updates).await;
+            model.extend(updates);
+        }
+        let deletes: Vec<i64> = model
+            .keys()
+            .copied()
+            .filter(|id| id % 991 == round % 991)
+            .collect();
+        if !deletes.is_empty() {
+            cdc_delete(&table, &deletes).await;
+            for id in &deletes {
+                model.remove(id);
+            }
+        }
+        table.checkpoint_mem_tier().await.expect("checkpoint");
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        samples.push(deletion_vector_objects(&setup.bucket, &setup.data_prefix).await);
+    }
+    table.drain_in_flight_maintenance().await.expect("drain");
+    let expected: Vec<(i64, i64)> = model.into_iter().collect();
+    let live = sorted_rows(&ctx, name).await;
+    table.quiesce().await;
+    drop((table, ctx));
+    let (_reopened, reopened_ctx, _) = setup.reopen(name, &store).await;
+    let reopened = sorted_rows(&reopened_ctx, name).await;
+
+    let third = samples.len() / 3;
+    let middle_peak = samples[third..2 * third].iter().copied().max().unwrap_or(0);
+    let last_peak = samples[2 * third..].iter().copied().max().unwrap_or(0);
+    let every_tenth: Vec<usize> = samples.iter().copied().step_by(10).collect();
+    assert!(
+        live == expected && reopened == expected,
+        "the table matches the source: {} rows live and {} reopened, {} expected",
+        live.len(),
+        reopened.len(),
+        expected.len()
+    );
+    assert!(
+        last_peak <= BOUND && last_peak <= middle_peak + middle_peak / 4 + 1,
+        "deletion vectors stay under {BOUND} with no upward trend: middle-third peak {middle_peak}, last-third peak {last_peak}, every tenth cycle {every_tenth:?}"
+    );
+}
+
+/// The retired-snapshot sweep of a dataset whose data is in the location deletes
+/// what the committed state names and lists nothing: the snapshot an initial load
+/// replaces holds no committed file, so its sweep has nothing to delete and no
+/// reason to list it. Anything an unfinished write left there is the orphan sweep's.
+#[tokio::test]
+async fn retiring_a_snapshot_with_no_committed_files_lists_nothing() {
+    let (setup, catalog, table, ctx) = create("facts").await;
+    run(
+        &ctx,
+        "INSERT OVERWRITE facts SELECT value AS id, value * 10 AS v FROM generate_series(1, 2000)",
+    )
+    .await;
+    run(
+        &ctx,
+        "INSERT INTO facts SELECT value AS id, value * 10 AS v FROM generate_series(2001, 2500)",
+    )
+    .await;
+    let table_id = table.metadata().table_id.clone();
+    let retired_before = catalog
+        .retired_snapshots(&table_id)
+        .await
+        .expect("read the retirement record")
+        .unwrap_or_default();
+
+    setup.counting.watch(&setup.data_prefix);
+    table.reclaim_retired_snapshots_now().await;
+    let lists = setup.counting.lists();
+    let retired_after = catalog
+        .retired_snapshots(&table_id)
+        .await
+        .expect("read the retirement record")
+        .unwrap_or_default();
+
+    assert_eq!(
+        (
+            retired_before.len(),
+            retired_after.len(),
+            lists,
+            count_and_sum(&ctx, "facts").await
+        ),
+        (1, 0, 0, (2500, expected_sum(1, 2500))),
+        "the replaced snapshot is retired, then forgotten without a listing"
+    );
+}
