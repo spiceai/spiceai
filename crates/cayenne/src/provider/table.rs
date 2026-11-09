@@ -7717,6 +7717,17 @@ impl CayenneTableProvider {
         // Snapshots a commit retired without naming them here (an overwrite or a
         // full rewrite moves the current snapshot) go to the retired ledger too.
         self.adopt_durable_retirements().await;
+        self.maybe_schedule_orphan_sweep();
+        if self.reclaims_snapshots_from_committed_state() {
+            // Every snapshot that left the live set is in the retirement record,
+            // adopted into the retired ledger above, and the retirement sweep
+            // deletes its files by name, re-arming itself for what it must defer.
+            // Anything else under the table's prefix is a file no commit names,
+            // which is the orphan sweep's. A listing of the prefix here would
+            // find nothing either sweep does not already own.
+            self.sweep_retired_snapshot_dirs();
+            return;
+        }
         let (protected_snapshot_ids, in_use_snapshot_ids) = self.snapshot_cleanup_pins();
         let pins = SnapshotSweepPins {
             current_snapshot_id: self.get_current_snapshot_id(),
@@ -7724,7 +7735,6 @@ impl CayenneTableProvider {
             in_use_snapshot_ids,
             grace: Self::SNAPSHOT_CLEANUP_GRACE,
         };
-        self.maybe_schedule_orphan_sweep();
         let Some(_deleting) = self.claim_file_deletions() else {
             return;
         };
@@ -8914,6 +8924,20 @@ impl CayenneTableProvider {
         crate::metastore_layout::is_object_native_data_path(&self.table_metadata.path)
     }
 
+    /// Whether the cleanup a commit schedules takes the snapshots it reclaims
+    /// from the committed state instead of listing the table's prefix: a table
+    /// whose data is in the object-native location on a store, in a catalog
+    /// that keeps the durable retirement record. Every commit that takes a
+    /// snapshot out of the live set records it as retired there, and the orphan
+    /// sweep reclaims what no commit names, so a uuid7-age sweep of the prefix
+    /// has nothing left to find. Other tables keep that sweep: what it deletes
+    /// has no other reclaimer there.
+    fn reclaims_snapshots_from_committed_state(&self) -> bool {
+        self.data_in_store()
+            && self.data_in_object_native_location()
+            && self.catalog.keeps_retirement_record()
+    }
+
     /// Whether scans resolve this table's files from the manifest instead of
     /// listing its snapshot directory.
     pub(crate) fn scans_from_manifest(&self) -> bool {
@@ -9138,6 +9162,26 @@ impl CayenneTableProvider {
 
         self.delete_objects_and_invalidate(objects, "delete object from snapshot cleanup")
             .await
+    }
+
+    /// Delete the named `(file name, size)` objects under the snapshot prefix
+    /// `prefix`, in batched requests and without listing it.
+    async fn delete_written_snapshot_files(
+        &self,
+        prefix: &ObjectStorePath,
+        files: Vec<(String, u64)>,
+    ) -> Result<()> {
+        if files.is_empty() {
+            return Ok(());
+        }
+        let store = Arc::clone(&self.require_object_store()?.store);
+        let objects = files
+            .into_iter()
+            .map(|(name, size)| (crate::object_child(prefix, &name), size))
+            .collect();
+        self.delete_sized_counted(&store, objects, "delete object from snapshot cleanup")
+            .await
+            .1
     }
 
     async fn cleanup_old_snapshots_s3(&self, pins: &SnapshotSweepPins) -> Result<bool> {
@@ -31269,11 +31313,21 @@ impl CayenneTableProvider {
     }
 
     async fn cleanup_failed_compaction_snapshot(&self, new_snapshot_id: &str, is_s3: bool) {
+        let written = self.uncommitted_files.files(new_snapshot_id);
         self.uncommitted_files.forget(new_snapshot_id);
         if is_s3 {
             match self.snapshot_object_store_prefix(new_snapshot_id) {
                 Ok(Some(prefix)) => {
-                    if let Err(e) = self.delete_prefix_with_object_store(&prefix).await {
+                    let deleted = if self.data_in_object_native_location() {
+                        // A table in the object-native location deletes by name the
+                        // files this process wrote or copied there. Anything else
+                        // under the prefix, such as an upload that failed part way,
+                        // is a file no commit names: the orphan sweep's.
+                        self.delete_written_snapshot_files(&prefix, written).await
+                    } else {
+                        self.delete_prefix_with_object_store(&prefix).await
+                    };
+                    if let Err(e) = deleted {
                         tracing::warn!(
                             "Failed to clean up failed compaction snapshot prefix {} for table {}: {e}",
                             new_snapshot_id,
