@@ -275,7 +275,7 @@ jobs:
           # first — and any brew-level breakage (an unreadable global lock, a half-written
           # `brew`) then fails the build over a toolchain it already had (#13463).
           # `setup-cc` probes the same way for every other macOS job; this step and its
-          # twin in build_and_release.yml are the two that still call brew directly.
+          # twin in build_release.yml are the two that still call brew directly.
           brew_bin="$(command -v brew || true)"
           if [ -z "$brew_bin" ]; then
             echo "::error::'brew' is not on PATH, so cmake and unixodbc cannot be installed or verified on this runner."

@@ -223,6 +223,90 @@ pub(crate) enum RetentionPass {
     DeferredUntilCheckpoint,
 }
 
+/// Spacing between background retention passes after consecutive failures.
+///
+/// A retention pass that fails for a reason that does not clear on its own (a
+/// `retention_sql` whose implicit cast cannot convert a stored value, say)
+/// would otherwise be retried on every post-write debounce, about ten times a
+/// second, each logging an error. The delay doubles from
+/// [`Self::BASE_DELAY`] per consecutive failure up to [`Self::MAX_DELAY`], and
+/// resets once a pass completes.
+///
+/// Each failure arms a one-shot retry timer tagged with the backoff's
+/// `generation`. Any later failure or success moves the generation on, so a
+/// timer armed for an earlier failure finds itself obsolete when it wakes and
+/// does not queue a pass: a synchronous drain that already ran the owed retry
+/// is not followed by a stray pass from the old timer, and an old timer cannot
+/// fire a newer failure's retry ahead of that failure's own backoff.
+#[derive(Debug, Default)]
+pub(crate) struct RetentionBackoff {
+    consecutive_failures: u32,
+    retry_at: Option<tokio::time::Instant>,
+    /// Bumped on every failure and success; never reset, so a stale timer's
+    /// tag cannot come back into use.
+    generation: u64,
+}
+
+impl RetentionBackoff {
+    pub(crate) const BASE_DELAY: Duration = Duration::from_secs(1);
+    pub(crate) const MAX_DELAY: Duration = Duration::from_secs(300);
+
+    /// Delay before the retry that follows the `failures`-th consecutive failure.
+    pub(crate) fn delay_after(failures: u32) -> Duration {
+        let doublings = failures.saturating_sub(1).min(16);
+        Self::BASE_DELAY
+            .saturating_mul(1_u32 << doublings)
+            .min(Self::MAX_DELAY)
+    }
+
+    /// Record a failed pass at `now`; returns the attempt number and the delay
+    /// before the next one. The retry timer armed for this failure should be
+    /// tagged with [`Self::generation`] read under the same lock.
+    pub(crate) fn record_failure(&mut self, now: tokio::time::Instant) -> (u32, Duration) {
+        self.consecutive_failures = self.consecutive_failures.saturating_add(1);
+        let delay = Self::delay_after(self.consecutive_failures);
+        self.retry_at = Some(now + delay);
+        self.generation = self.generation.wrapping_add(1);
+        (self.consecutive_failures, delay)
+    }
+
+    /// Record a completed pass: clears the owed retry and invalidates any retry
+    /// timer still sleeping.
+    pub(crate) fn record_success(&mut self) {
+        self.consecutive_failures = 0;
+        self.retry_at = None;
+        self.generation = self.generation.wrapping_add(1);
+    }
+
+    /// Tag for the retry timer armed by the most recent failure.
+    pub(crate) fn generation(&self) -> u64 {
+        self.generation
+    }
+
+    /// Whether a retry timer tagged `generation` still owns the owed retry,
+    /// i.e. no pass has completed or failed since it was armed.
+    pub(crate) fn timer_is_current(&self, generation: u64) -> bool {
+        self.retry_at.is_some() && self.generation == generation
+    }
+
+    /// Whether a background pass at `now` should leave retention to the
+    /// scheduled retry.
+    pub(crate) fn is_waiting(&self, now: tokio::time::Instant) -> bool {
+        self.retry_at.is_some_and(|retry_at| now < retry_at)
+    }
+
+    /// Failures since the last completed pass.
+    #[cfg(test)]
+    pub(crate) fn consecutive_failures(&self) -> u32 {
+        self.consecutive_failures
+    }
+
+    /// Whether a failed pass still owes a retry.
+    pub(crate) fn retry_owed(&self) -> bool {
+        self.retry_at.is_some()
+    }
+}
+
 pub(crate) enum RetentionFailureAction {
     Requeue,
     ReturnError,
@@ -232,6 +316,8 @@ pub(crate) enum RetentionFailureAction {
 pub(crate) struct PostWriteMaintenance {
     pub(crate) state: ParkingMutex<PostWriteMaintenanceState>,
     pub(crate) scheduled: AtomicBool,
+    /// Backoff after failed background retention passes.
+    pub(crate) retention_backoff: ParkingMutex<RetentionBackoff>,
     /// How many live-row deltas the persisted `num_rows` does not include yet.
     ///
     /// Shared with every outstanding [`OutstandingLiveRowsDelta`], which is what
@@ -397,7 +483,63 @@ impl PublishedLiveRowsDelta {
 
 #[cfg(test)]
 mod post_write_maintenance_tests {
-    use super::PostWriteMaintenance;
+    use super::{PostWriteMaintenance, RetentionBackoff};
+    use std::time::Duration;
+
+    /// The retry spacing doubles per consecutive failure and stops at the cap,
+    /// so a pass that can never succeed logs a bounded number of lines.
+    #[test]
+    fn retention_backoff_doubles_to_the_cap_and_resets() {
+        let delays: Vec<u64> = (1..=12)
+            .map(|n| RetentionBackoff::delay_after(n).as_secs())
+            .collect();
+        assert_eq!(delays, [1, 2, 4, 8, 16, 32, 64, 128, 256, 300, 300, 300]);
+        assert_eq!(
+            RetentionBackoff::delay_after(u32::MAX),
+            RetentionBackoff::MAX_DELAY
+        );
+
+        let now = tokio::time::Instant::now();
+        let mut backoff = RetentionBackoff::default();
+        assert!(!backoff.is_waiting(now));
+        assert_eq!(backoff.record_failure(now), (1, Duration::from_secs(1)));
+        assert_eq!(backoff.record_failure(now), (2, Duration::from_secs(2)));
+        assert!(backoff.is_waiting(now));
+        assert!(!backoff.is_waiting(now + Duration::from_secs(2)));
+        assert!(backoff.retry_owed());
+        backoff.record_success();
+        assert!(!backoff.retry_owed());
+        assert_eq!(backoff.record_failure(now), (1, Duration::from_secs(1)));
+    }
+
+    /// A retry timer armed for one failure is invalidated by any later success
+    /// or failure, so it neither queues a pass after a drain already ran the
+    /// owed retry nor fires a newer failure's retry early.
+    #[test]
+    fn retention_retry_timer_is_invalidated_by_later_outcomes() {
+        let now = tokio::time::Instant::now();
+        let mut backoff = RetentionBackoff::default();
+
+        backoff.record_failure(now);
+        let first = backoff.generation();
+        assert!(backoff.timer_is_current(first));
+
+        // A synchronous drain ran the owed retry and it completed.
+        backoff.record_success();
+        assert!(!backoff.timer_is_current(first));
+
+        // A newer failure arms its own timer; the old one stays obsolete.
+        backoff.record_failure(now);
+        let second = backoff.generation();
+        assert_ne!(first, second);
+        assert!(!backoff.timer_is_current(first));
+        assert!(backoff.timer_is_current(second));
+
+        // Consecutive failures without a success also retire the earlier timer.
+        backoff.record_failure(now);
+        assert!(!backoff.timer_is_current(second));
+        assert!(backoff.timer_is_current(backoff.generation()));
+    }
 
     /// A table that has never queued a delta has nothing outstanding, so its
     /// maintained count starts eligible to be served `Exact`.

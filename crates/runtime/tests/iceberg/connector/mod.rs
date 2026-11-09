@@ -60,22 +60,24 @@ async fn iceberg_integration_test_dataset() -> Result<(), anyhow::Error> {
 }
 
 #[tokio::test]
-async fn iceberg_integration_test_duckdb_acceleration() -> Result<(), anyhow::Error> {
+async fn iceberg_integration_test_cayenne_acceleration() -> Result<(), anyhow::Error> {
     let _ = rustls::crypto::CryptoProvider::install_default(
         rustls::crypto::aws_lc_rs::default_provider(),
     );
     let _tracing = init_tracing(None);
     test_request_context()
         .scope(async {
+            let acceleration_dir =
+                tempfile::tempdir().context("Creating the Cayenne acceleration directory")?;
             let mut dataset = make_iceberg_dataset("tpch_sf1", "customer", "customer")?;
             dataset.acceleration = Some(Acceleration {
                 enabled: true,
-                engine: Some("duckdb".to_string()),
+                engine: Some("cayenne".to_string()),
                 mode: Mode::File,
                 params: get_params(
                     &Mode::File,
-                    Some("./iceberg_duckdb_simple.db".to_string()),
-                    "duckdb",
+                    Some(acceleration_dir.path().to_string_lossy().into_owned()),
+                    "cayenne",
                 ),
                 ..Acceleration::default()
             });
@@ -83,7 +85,7 @@ async fn iceberg_integration_test_duckdb_acceleration() -> Result<(), anyhow::Er
             let _ = run_iceberg_test(
                 "iceberg_dataset_test",
                 dataset,
-                "SELECT * FROM customer LIMIT 10",
+                "SELECT * FROM customer ORDER BY c_custkey LIMIT 10",
                 true,
                 Some("iceberg_integration_test_duckdb_acceleration"),
             )
@@ -95,22 +97,24 @@ async fn iceberg_integration_test_duckdb_acceleration() -> Result<(), anyhow::Er
 }
 
 #[tokio::test]
-async fn iceberg_integration_test_duckdb_acceleration_restart() -> Result<(), anyhow::Error> {
+async fn iceberg_integration_test_cayenne_acceleration_restart() -> Result<(), anyhow::Error> {
     let _ = rustls::crypto::CryptoProvider::install_default(
         rustls::crypto::aws_lc_rs::default_provider(),
     );
     let _tracing = init_tracing(None);
     test_request_context()
         .scope(async {
+            let acceleration_dir = tempfile::tempdir()
+                .context("Creating the Cayenne acceleration directory both runtimes share")?;
             let mut dataset = make_iceberg_dataset("tpch_sf1", "customer", "customer")?;
             dataset.acceleration = Some(Acceleration {
                 enabled: true,
-                engine: Some("duckdb".to_string()),
+                engine: Some("cayenne".to_string()),
                 mode: Mode::File,
                 params: get_params(
                     &Mode::File,
-                    Some("./iceberg_duckdb_restart.db".to_string()),
-                    "duckdb",
+                    Some(acceleration_dir.path().to_string_lossy().into_owned()),
+                    "cayenne",
                 ),
                 ..Acceleration::default()
             });
@@ -118,7 +122,7 @@ async fn iceberg_integration_test_duckdb_acceleration_restart() -> Result<(), an
             let rt = run_iceberg_test(
                 "iceberg_dataset_test",
                 dataset.clone(),
-                "SELECT * FROM customer LIMIT 10",
+                "SELECT * FROM customer ORDER BY c_custkey LIMIT 10",
                 false,
                 None,
             )
@@ -130,7 +134,7 @@ async fn iceberg_integration_test_duckdb_acceleration_restart() -> Result<(), an
             let _ = run_iceberg_test(
                 "iceberg_dataset_test",
                 dataset,
-                "SELECT * FROM customer LIMIT 10",
+                "SELECT * FROM customer ORDER BY c_custkey LIMIT 10",
                 true,
                 Some("iceberg_integration_test_duckdb_acceleration_restart"),
             )

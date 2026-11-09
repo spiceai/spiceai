@@ -2,9 +2,9 @@ name: files-coverage
 description: >
   Tables read from Parquet and CSV files answer the extended corpus and
   ternary logic partitioning as PostgreSQL answers them over the same
-  generated rows: read in place, and accelerated into Cayenne and DuckDB.
-  An ungrouped count over a NOT IN whose subquery yields a NULL is 0 in
-  each, including where eager aggregation rewrites it over Cayenne.
+  generated rows: read in place, and accelerated into Cayenne. An ungrouped
+  count over a NOT IN whose subquery yields a NULL is 0 in each, including
+  where eager aggregation rewrites it over Cayenne.
 
 sources:
   lake: { kind: files }
@@ -16,7 +16,6 @@ matrix:
 variants:
   federated: {}
   cayenne: cayenne-file
-  duckdb: duckdb-file
 
 spicepod:
   version: v1

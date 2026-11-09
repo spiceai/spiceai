@@ -1585,6 +1585,8 @@ pub struct DataFusion {
 
     pub temp_directory: Option<String>,
     pub cluster_config: Arc<ResolvedClusterConfig>,
+    /// The `--role` this runtime started with.
+    role: crate::config::Role,
     pub scheduler_server: RwLock<Option<Arc<SchedulerServer<LogicalPlanNode, PhysicalPlanNode>>>>,
     pub executor: RwLock<Option<Arc<Executor>>>,
     /// Registry of connected executor control streams for `PollNow` broadcasts.
@@ -2206,6 +2208,12 @@ impl DataFusion {
             .map_err(|_| Error::UnableToLockWritableCatalogs {})?
             .insert(catalog_name.to_string());
         Ok(())
+    }
+
+    /// The `--role` this runtime started with.
+    #[must_use]
+    pub fn role(&self) -> crate::config::Role {
+        self.role
     }
 
     /// Returns true if the catalog allows DDL operations (CREATE TABLE, DROP TABLE, etc.).
@@ -4461,6 +4469,20 @@ impl DataFusion {
                     });
                 }
             }
+        } else if let Some(delete_expr) = retention_delete_expr.as_ref()
+            && let Err(err) = crate::accelerated::ensure_no_fallible_implicit_cast(
+                delete_expr,
+                &source_table_provider.schema(),
+            )
+        {
+            // Without a source fallback nothing reads evicted rows back, so this
+            // is not refused. The retention pass will still fail on every row
+            // the cast cannot convert, so say so once here instead of leaving
+            // only the per-pass retention errors.
+            tracing::warn!(
+                "Dataset {}: `retention_sql` will fail when retention runs on rows it cannot convert: {err}",
+                dataset.name
+            );
         }
 
         accelerated_table_builder.retention(retention);
@@ -9123,9 +9145,9 @@ mod tests {
 
     mod validate_distributed_engine_tests {
         use super::super::*;
-        use crate::config::{ClusterConfig, ClusterRole};
+        use crate::config::{ClusterConfig, Role};
 
-        fn make_cluster_config(role: ClusterRole) -> ResolvedClusterConfig {
+        fn make_cluster_config(role: Role) -> ResolvedClusterConfig {
             let config = ClusterConfig {
                 role: Some(role),
                 allow_insecure_connections: true,
@@ -9142,28 +9164,28 @@ mod tests {
 
         #[test]
         fn arrow_allowed_in_distributed_mode() {
-            let config = make_cluster_config(ClusterRole::Scheduler);
+            let config = make_cluster_config(Role::Scheduler);
             validate_distributed_engine(&config, Engine::Arrow, "ds")
                 .expect("arrow engine should be allowed in distributed mode");
         }
 
         #[test]
         fn partitioned_arrow_allowed_in_distributed_mode() {
-            let config = make_cluster_config(ClusterRole::Scheduler);
+            let config = make_cluster_config(Role::Scheduler);
             validate_distributed_engine(&config, Engine::PartitionedArrow, "ds")
                 .expect("partitioned_arrow engine should be allowed in distributed mode");
         }
 
         #[test]
         fn cayenne_allowed_in_distributed_mode() {
-            let config = make_cluster_config(ClusterRole::Scheduler);
+            let config = make_cluster_config(Role::Scheduler);
             validate_distributed_engine(&config, Engine::Cayenne, "ds")
                 .expect("cayenne engine should be allowed in distributed mode");
         }
 
         #[test]
         fn duckdb_rejected_in_distributed_mode() {
-            let config = make_cluster_config(ClusterRole::Scheduler);
+            let config = make_cluster_config(Role::Scheduler);
             let result = validate_distributed_engine(&config, Engine::DuckDB, "my_dataset");
             assert!(
                 matches!(
@@ -9182,7 +9204,7 @@ mod tests {
 
         #[test]
         fn sqlite_rejected_in_distributed_mode() {
-            let config = make_cluster_config(ClusterRole::Executor);
+            let config = make_cluster_config(Role::Executor);
             let result = validate_distributed_engine(&config, Engine::Sqlite, "my_dataset");
             assert!(
                 matches!(
@@ -9195,7 +9217,7 @@ mod tests {
 
         #[test]
         fn postgresql_rejected_in_distributed_mode() {
-            let config = make_cluster_config(ClusterRole::Scheduler);
+            let config = make_cluster_config(Role::Scheduler);
             let result = validate_distributed_engine(&config, Engine::PostgreSQL, "my_dataset");
             assert!(
                 matches!(

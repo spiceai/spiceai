@@ -13,7 +13,7 @@ sources:
 
 matrix:
   source: [missing-table, bad-credentials, connection-refused]
-  engine: [cayenne, duckdb, sqlite]
+  engine: [cayenne, sqlite]
   snapshots: [bootstrap_only, enabled]
 
 variants:
