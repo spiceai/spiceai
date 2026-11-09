@@ -30,15 +30,44 @@ AMD64 = "a" * 64
 ARM64 = "b" * 64
 
 
-def dockerfile(version="2.0.0", amd64=AMD64, arm64=ARM64, copy=True, platforms=("linux-amd64", "linux-arm64")) -> str:
+def download(tag="v${DUCKDB_VERSION}", amd64="${DUCKDB_SHA256_AMD64}", arm64="${DUCKDB_SHA256_ARM64}", multi_arch=True) -> list[str]:
+    """The download step as the real Dockerfiles write it."""
+    url = f"https://github.com/duckdb/duckdb/releases/download/{tag}/duckdb-shared-libs-"
+    if not multi_arch:
+        return [
+            "RUN set -eux; \\",
+            f'    curl -fSLo /tmp/libduckdb.tar.gz "{url}linux-amd64.tar.gz"; \\',
+            f'    echo "{amd64}  /tmp/libduckdb.tar.gz" | sha256sum -c -; \\',
+            "    tar -C /root -xzf /tmp/libduckdb.tar.gz libduckdb.so",
+        ]
+    return [
+        "RUN set -eux; \\",
+        '    case "${TARGETARCH}" in \\',
+        f'      amd64|"") duckdb_platform=linux-amd64; duckdb_sha256="{amd64}" ;; \\',
+        f'      arm64) duckdb_platform=linux-arm64; duckdb_sha256="{arm64}" ;; \\',
+        "    esac; \\",
+        f'    curl -fSLo /tmp/libduckdb.tar.gz "{url}${{duckdb_platform}}.tar.gz"; \\',
+        '    echo "${duckdb_sha256}  /tmp/libduckdb.tar.gz" | sha256sum -c -; \\',
+        "    tar -C /root -xzf /tmp/libduckdb.tar.gz libduckdb.so",
+    ]
+
+
+def dockerfile(
+    version="2.0.0",
+    amd64=AMD64,
+    arm64=ARM64,
+    copy=True,
+    platforms=("linux-amd64", "linux-arm64"),
+    steps=None,
+) -> str:
     lines = ["FROM ubuntu:26.04 AS libduckdb"]
-    lines += [f"# downloads duckdb-shared-libs-{platform}.tar.gz" for platform in platforms]
     if version is not None:
         lines.append(f"ARG DUCKDB_VERSION={version}")
     if amd64 is not None:
         lines.append(f"ARG DUCKDB_SHA256_AMD64={amd64}")
     if arm64 is not None:
         lines.append(f"ARG DUCKDB_SHA256_ARM64={arm64}")
+    lines += steps if steps is not None else download(multi_arch="linux-arm64" in platforms)
     lines.append("FROM ubuntu:26.04")
     if copy:
         lines.append("COPY --from=libduckdb /root/libduckdb.so /usr/lib/libduckdb.so")
@@ -124,6 +153,43 @@ class CheckTest(unittest.TestCase):
         self.assertEqual(
             self.run_check({"Dockerfile": dockerfile(copy=False)}),
             ["Dockerfile downloads libduckdb but never copies it to /usr/lib/libduckdb.so"],
+        )
+
+    def test_download_of_another_release_fails(self):
+        # The ARGs still say 2.0.0, but the image installs 1.5.6.
+        self.assertEqual(
+            self.run_check(
+                {"Dockerfile": dockerfile(steps=download(tag="v1.5.6", amd64="c" * 64, arm64="d" * 64))}
+            ),
+            [
+                "Dockerfile downloads DuckDB release v1.5.6: use v${DUCKDB_VERSION} so the pinned version is the one installed",
+                f'Dockerfile sets duckdb_sha256="{"c" * 64}": set it from ${{DUCKDB_SHA256_AMD64}} or ${{DUCKDB_SHA256_ARM64}}',
+                f'Dockerfile sets duckdb_sha256="{"d" * 64}": set it from ${{DUCKDB_SHA256_AMD64}} or ${{DUCKDB_SHA256_ARM64}}',
+            ],
+        )
+
+    def test_literal_checksum_in_an_amd64_only_image_fails(self):
+        self.assertEqual(
+            self.run_check(
+                {
+                    "Dockerfile-cuda-release": dockerfile(
+                        arm64=None,
+                        platforms=("linux-amd64",),
+                        steps=download(amd64="c" * 64, multi_arch=False),
+                    )
+                }
+            ),
+            [
+                f"Dockerfile-cuda-release verifies the DuckDB archive against {'c' * 64}: "
+                "use ${DUCKDB_SHA256_AMD64} or ${DUCKDB_SHA256_ARM64}"
+            ],
+        )
+
+    def test_unverified_download_fails(self):
+        steps = [line for line in download() if "sha256sum" not in line]
+        self.assertEqual(
+            self.run_check({"Dockerfile": dockerfile(steps=steps)}),
+            ["Dockerfile never verifies the DuckDB archive with sha256sum -c"],
         )
 
     def test_duplicate_arg_fails(self):

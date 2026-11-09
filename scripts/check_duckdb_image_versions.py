@@ -38,6 +38,41 @@ ARGS = {
     "DUCKDB_SHA256_ARM64": "linux-arm64",
 }
 COPY_RE = re.compile(r"^COPY\s+--from=\S+\s+/root/libduckdb\.so\s+\S*/usr/lib/libduckdb\.so\s*$", re.M)
+# The ARGs only pin the image if the download consumes them: every DuckDB
+# release URL must name `v${DUCKDB_VERSION}`, and every checksum the archive is
+# verified against must come from a checksum ARG, never a literal.
+DOWNLOAD_RE = re.compile(r"duckdb/duckdb/releases/download/([^/\s\"]+)/duckdb-shared-libs")
+VERIFY_RE = re.compile(r"echo\s+\"([^\"\s]*)\s+\S*libduckdb\S*\"\s*\|\s*sha256sum\s+-c")
+ASSIGN_RE = re.compile(r"\b(duckdb_sha256)=(\"[^\"]*\"|\S+?)\s*;")
+CHECKSUM_ARGS = ("${DUCKDB_SHA256_AMD64}", "${DUCKDB_SHA256_ARM64}")
+
+
+def download_errors(name: str, text: str) -> list[str]:
+    errors = []
+    urls = DOWNLOAD_RE.findall(text)
+    if not urls:
+        errors.append(f"{name} never downloads a DuckDB release")
+    for tag in urls:
+        if tag != "v${DUCKDB_VERSION}":
+            errors.append(
+                f"{name} downloads DuckDB release {tag}: use v${{DUCKDB_VERSION}} so the pinned version is the one installed"
+            )
+    assignments = ASSIGN_RE.findall(text)
+    for var, value in assignments:
+        if value.strip('"') not in CHECKSUM_ARGS:
+            errors.append(
+                f"{name} sets {var}={value}: set it from ${{DUCKDB_SHA256_AMD64}} or ${{DUCKDB_SHA256_ARM64}}"
+            )
+    checks = VERIFY_RE.findall(text)
+    if not checks:
+        errors.append(f"{name} never verifies the DuckDB archive with sha256sum -c")
+    for checksum in checks:
+        if checksum in CHECKSUM_ARGS or (checksum == "${duckdb_sha256}" and assignments):
+            continue
+        errors.append(
+            f"{name} verifies the DuckDB archive against {checksum}: use ${{DUCKDB_SHA256_AMD64}} or ${{DUCKDB_SHA256_ARM64}}"
+        )
+    return errors
 
 
 def dockerfiles(root: Path) -> list[Path]:
@@ -86,6 +121,7 @@ def check(root: Path) -> list[str]:
                     f"{VERSIONS_FILE} is DuckDB {newest['version']}, which needs "
                     f"{arg}={expected[arg]}"
                 )
+        errors.extend(download_errors(path.name, text))
         if not COPY_RE.search(text):
             errors.append(
                 f"{path.name} downloads libduckdb but never copies it to /usr/lib/libduckdb.so"
