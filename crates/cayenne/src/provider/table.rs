@@ -3879,16 +3879,9 @@ pub(crate) fn upsert_on_primary_key(
 /// grew (q20's correlated rescans paid it per outer group).
 pub(crate) type InlinedDeletionMaps = crate::provider::mem_tier::InMemTombstones;
 
-/// What [`super::delete::detect_deletion_type_and_read`] reads from a table's
-/// deletion-vector files: deleted positions per data file, deleted keys with their
-/// delete sequence, re-inserted keys with theirs, and the key vectors whose file is
-/// missing.
-type DeletionVectorRead = (
-    HashMap<String, RoaringBitmap>,
-    HashMap<Box<[u8]>, i64>,
-    HashMap<Box<[u8]>, i64>,
-    Vec<super::delete::MissingKeyDeletionVector>,
-);
+/// What [`super::delete::read_deletion_vectors`] reads from a table's
+/// deletion-vector files.
+type DeletionVectorRead = super::delete::DeletionVectorReadResult;
 
 /// The error a synchronous retention drain gets when the pass is waiting on a recent
 /// write to become durable ([`RetentionPass::DeferredUntilCheckpoint`]).
@@ -18877,26 +18870,47 @@ impl CayenneTableProvider {
         Ok(Some(results))
     }
 
-    /// Write one key-based deletion-vector file per `(delete_sequence, keys)`
-    /// group, each recorded at its own group's sequence, in a single
-    /// [`DeletionVectorWriter::write`]: the files are written concurrently and
-    /// the deletions directory is synced once, rather than a file write, a file
-    /// sync and a directory sync per group in turn. A mem-tier checkpoint
-    /// carries one group per appended segment that holds tombstones — thousands
-    /// on a table whose every CDC batch deletes, and a sequential pass over them
-    /// held such a checkpoint for minutes.
+    /// Write the key deletes of several `(delete_sequence, keys)` groups. A mem-tier
+    /// checkpoint or seal carries one group per appended segment that holds
+    /// tombstones — thousands on a table whose every CDC batch deletes.
+    ///
+    /// A table whose data is in its dataset store writes them as ONE file whose
+    /// keys carry their own sequence (`KEY_DELETE_SEQUENCE_COLUMN`), recorded at the
+    /// highest: on an object store every file is a PUT and a log entry, so one per
+    /// group cost hundreds of requests a second under CDC. Other tables write one
+    /// file per group, each recorded at its own group's sequence, in a single
+    /// [`DeletionVectorWriter::write`]: the files are written concurrently and the
+    /// deletions directory is synced once, rather than a file write, a file sync
+    /// and a directory sync per group in turn.
     async fn write_key_deletion_vectors_by_sequence(
         &self,
         groups: Vec<(i64, Vec<Box<[u8]>>)>,
     ) -> CatalogResult<Vec<crate::metadata::DeleteFile>> {
-        let specs: Vec<DeletionVectorWriteSpec> = groups
+        let groups: Vec<(i64, Vec<Box<[u8]>>)> = groups
             .into_iter()
             .filter(|(_, row_keys)| !row_keys.is_empty())
-            .map(|(delete_sequence, row_keys)| {
-                DeletionVectorWriteSpec::new_key_based(row_keys)
-                    .with_sequence_number(delete_sequence)
-            })
             .collect();
+        let specs: Vec<DeletionVectorWriteSpec> =
+            if groups.len() > 1 && self.dataset_storage.is_some() {
+                vec![DeletionVectorWriteSpec::new_key_based_with_sequences(
+                    groups
+                        .into_iter()
+                        .flat_map(|(delete_sequence, row_keys)| {
+                            row_keys
+                                .into_iter()
+                                .map(move |row_key| (row_key, delete_sequence))
+                        })
+                        .collect(),
+                )]
+            } else {
+                groups
+                    .into_iter()
+                    .map(|(delete_sequence, row_keys)| {
+                        DeletionVectorWriteSpec::new_key_based(row_keys)
+                            .with_sequence_number(delete_sequence)
+                    })
+                    .collect()
+            };
         if specs.is_empty() {
             return Ok(Vec::new());
         }
@@ -27500,16 +27514,9 @@ impl CayenneTableProvider {
                 cleared_by_bloom: 0,
             });
         }
-        let storage = self.dataset_storage.clone();
-        let (_, deleted_row_keys, _, _) = tokio::task::spawn_blocking(move || {
-            super::delete::detect_deletion_type_and_read(delete_files, storage.as_deref())
-        })
-        .await
-        .map_err(|join_error| {
-            internal(format!(
-                "carry-forward classification reader task failed: {join_error}"
-            ))
-        })??;
+        let (_, deleted_row_keys, _, _) =
+            super::delete::read_deletion_vectors(delete_files, self.dataset_storage.clone())
+                .await?;
         if deleted_row_keys.is_empty() {
             return Ok(ColdFilePartition {
                 dirty: Vec::new(),
@@ -39477,15 +39484,8 @@ impl CayenneTableProvider {
                 .iter()
                 .map(|file| file.delete_file_id.clone())
                 .collect();
-            let storage = storage.map(Arc::clone);
-            let result = task::spawn_blocking(move || {
-                super::delete::detect_deletion_type_and_read(delete_files, storage.as_deref())
-            })
-            .await
-            .map_err(|err| CatalogError::InvalidOperation {
-                message: "Deletion vector reader task panicked or was cancelled.".to_string(),
-                source: Box::new(err),
-            })?;
+            let result =
+                super::delete::read_deletion_vectors(delete_files, storage.map(Arc::clone)).await;
             let error = match result {
                 Ok(read) => return Ok(read),
                 Err(error) => error,

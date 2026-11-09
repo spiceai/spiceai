@@ -55,7 +55,7 @@ pub(crate) use filter_exec::{
     InsertRecordHandling, Int64PkDeletionFilterExec, KeyBasedDeletionFilterExec, is_pk_visible_i64,
 };
 pub(crate) use vector_io::{
-    DeletionIdentifier, DeletionVectorWriteResult, DeletionVectorWriteSpec, DeletionVectorWriter,
-    MissingKeyDeletionVector, cleanup_uncommitted_delete_paths, detect_deletion_type_and_read,
-    remove_dropped_deletion_vector_files,
+    DeletionIdentifier, DeletionVectorReadResult, DeletionVectorWriteResult,
+    DeletionVectorWriteSpec, DeletionVectorWriter, MissingKeyDeletionVector,
+    cleanup_uncommitted_delete_paths, read_deletion_vectors, remove_dropped_deletion_vector_files,
 };
