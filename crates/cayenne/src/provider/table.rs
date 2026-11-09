@@ -62885,6 +62885,14 @@ mod tests {
             .await
             .expect("position capture should not error");
         insert_batch(&provider, id_value_batch(schema, &[1, 2, 3], &[11, 21, 31])).await;
+        // The writes above schedule post-write maintenance behind a 100 ms
+        // debounce. On a loaded runner the test reaches the reclaim after that
+        // debounce, and the maintenance pass then races it: let it finish first,
+        // so the reclaim below sees a quiet table.
+        provider
+            .drain_in_flight_maintenance()
+            .await
+            .expect("drain the writes' post-write maintenance");
         assert!(
             provider.deletion_index_reclaim_trigger().is_some(),
             "precondition: the upserts' tombstones are over the trigger of two"
@@ -62927,6 +62935,14 @@ mod tests {
         .await;
         let schema = Arc::clone(&provider.table_metadata.schema);
         insert_batch(&provider, id_value_batch(schema, &[1, 2, 3], &[10, 20, 30])).await;
+        // The writes above schedule post-write maintenance behind a 100 ms
+        // debounce. On a loaded runner the test reaches the reclaim after that
+        // debounce, and the maintenance pass then races it: let it finish first,
+        // so the reclaim below sees a quiet table.
+        provider
+            .drain_in_flight_maintenance()
+            .await
+            .expect("drain the writes' post-write maintenance");
         install_int64_deletes(&provider, &[(1, i64::MAX - 1), (1_000, i64::MAX - 1)]);
         assert!(
             provider
@@ -62969,6 +62985,14 @@ mod tests {
         insert_batch(&provider, id_value_batch(Arc::clone(&schema), &[1], &[10])).await;
         insert_batch(&provider, id_value_batch(Arc::clone(&schema), &[2], &[20])).await;
         insert_batch(&provider, id_value_batch(schema, &[3, 4], &[30, 40])).await;
+        // The writes above schedule post-write maintenance behind a 100 ms
+        // debounce. On a loaded runner the test reaches the reclaim after that
+        // debounce, and the maintenance pass then races it: let it finish first,
+        // so the reclaim below sees a quiet table.
+        provider
+            .drain_in_flight_maintenance()
+            .await
+            .expect("drain the writes' post-write maintenance");
         install_int64_deletes(&provider, &[(1, i64::MAX - 1), (2, i64::MAX - 1)]);
         assert!(
             provider
@@ -63018,6 +63042,14 @@ mod tests {
                     roaring::RoaringBitmap::from_iter([0u32]),
                 )),
             )])));
+        // The writes above schedule post-write maintenance behind a 100 ms
+        // debounce. On a loaded runner the test reaches the reclaim after that
+        // debounce, and the maintenance pass then races it: let it finish first,
+        // so the reclaim below sees a quiet table.
+        provider
+            .drain_in_flight_maintenance()
+            .await
+            .expect("drain the writes' post-write maintenance");
         install_int64_deletes(&provider, &[(1_000, 10), (1_001, 11), (1_002, 12)]);
         assert!(
             provider
@@ -63053,6 +63085,14 @@ mod tests {
         let schema = Arc::clone(&provider.table_metadata.schema);
         insert_batch(&provider, id_value_batch(schema, &[1, 2, 3], &[10, 20, 30])).await;
 
+        // The writes above schedule post-write maintenance behind a 100 ms
+        // debounce. On a loaded runner the test reaches the reclaim after that
+        // debounce, and the maintenance pass then races it: let it finish first,
+        // so the reclaim below sees a quiet table.
+        provider
+            .drain_in_flight_maintenance()
+            .await
+            .expect("drain the writes' post-write maintenance");
         install_int64_deletes(&provider, &[(1_000, 10), (1_001, 11), (1_002, 12)]);
         assert!(
             provider.deletion_index_reclaim_trigger().is_some(),
