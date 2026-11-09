@@ -45,8 +45,13 @@ on:
 
 jobs:
   dispatch-htap:
+    environment: ci
     name: Dispatch HTAP - ${{ github.event.inputs.scale_factor || github.event.schedule }}
     runs-on: spiceai-dev-runners
+    permissions:
+      contents: read
+      actions: write  # dispatches the HTAP workflow
+      id-token: write  # RustFS credentials
     # The dispatcher only fires the workflow_dispatch events (spaced ~80s apart) and exits; the runs
     # themselves serialize via the htap workflow's queue: max concurrency group, not here. So this
     # only needs to cover the build + dispatch loop (≤~10 min for the largest batch), not the sum of
@@ -62,12 +67,21 @@ jobs:
         with:
           persist-credentials: false
 
+      - name: Get RustFS credentials
+        id: rustfs
+        uses: ./.github/actions/rustfs-credentials
+        with:
+          endpoint: ${{ vars.TEST_MINIO_ENDPOINT }}
+          duration-seconds: '7200'
+          export-env: 'false'
+
       - name: Install MinIO
         uses: ./.github/actions/setup-minio
         with:
-          minio_endpoint: ${{ secrets.TEST_MINIO_ENDPOINT }}
-          minio_access_key: ${{ secrets.TEST_MINIO_ACCESS_KEY }}
-          minio_secret_key: ${{ secrets.TEST_MINIO_SECRET_KEY }}
+          minio_endpoint: ${{ vars.TEST_MINIO_ENDPOINT }}
+          minio_access_key: ${{ steps.rustfs.outputs.access-key-id }}
+          minio_secret_key: ${{ steps.rustfs.outputs.secret-access-key }}
+          minio_session_token: ${{ steps.rustfs.outputs.session-token }}
 
       - name: Setup spiced
         uses: ./.github/actions/setup-spiced
@@ -83,17 +97,19 @@ jobs:
       - name: Build Testoperator
         uses: ./.github/actions/build-testoperator
         with:
-          minio_endpoint: ${{ secrets.TEST_MINIO_ENDPOINT }}
-          minio_access_key: ${{ secrets.TEST_MINIO_ACCESS_KEY }}
-          minio_secret_key: ${{ secrets.TEST_MINIO_SECRET_KEY }}
+          minio_endpoint: ${{ vars.TEST_MINIO_ENDPOINT }}
+          minio_access_key: ${{ steps.rustfs.outputs.access-key-id }}
+          minio_secret_key: ${{ steps.rustfs.outputs.secret-access-key }}
+          minio_session_token: ${{ steps.rustfs.outputs.session-token }}
 
       - name: Build spicepod validator
         id: build-spicepod-validator
         uses: ./.github/actions/build-spicepod-validator
         with:
-          minio_endpoint: ${{ secrets.TEST_MINIO_ENDPOINT }}
-          minio_access_key: ${{ secrets.TEST_MINIO_ACCESS_KEY }}
-          minio_secret_key: ${{ secrets.TEST_MINIO_SECRET_KEY }}
+          minio_endpoint: ${{ vars.TEST_MINIO_ENDPOINT }}
+          minio_access_key: ${{ steps.rustfs.outputs.access-key-id }}
+          minio_secret_key: ${{ steps.rustfs.outputs.secret-access-key }}
+          minio_session_token: ${{ steps.rustfs.outputs.session-token }}
 
       - name: Set spicepod validator path
         run: echo "SPICEPOD_VALIDATOR=${{ steps.build-spicepod-validator.outputs.validator-path }}" >> $GITHUB_ENV

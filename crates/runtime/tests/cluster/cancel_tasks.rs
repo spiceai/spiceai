@@ -185,7 +185,7 @@ async fn test_cancel_tasks_via_control_stream() -> Result<(), anyhow::Error> {
                     52151,
                 )),
                 cluster: ClusterConfig {
-                    role: Some(runtime::config::ClusterRole::Scheduler),
+                    role: Some(runtime::config::Role::Scheduler),
                     node_bind_address: std::net::SocketAddr::V4(SocketAddrV4::new(
                         Ipv4Addr::LOCALHOST,
                         52152,
@@ -242,7 +242,7 @@ async fn test_cancel_tasks_via_control_stream() -> Result<(), anyhow::Error> {
                     52153,
                 )),
                 cluster: ClusterConfig {
-                    role: Some(runtime::config::ClusterRole::Executor),
+                    role: Some(runtime::config::Role::Executor),
                     node_bind_address: std::net::SocketAddr::V4(SocketAddrV4::new(
                         Ipv4Addr::LOCALHOST,
                         52154,

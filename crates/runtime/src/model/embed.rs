@@ -16,7 +16,10 @@ limitations under the License.
 #![allow(clippy::implicit_hasher)]
 
 use crate::embeddings::params as embedding_params;
-use crate::token_providers::databricks::{DatabricksM2MTokenProvider, DatabricksU2MTokenProvider};
+use crate::token_providers::databricks::{
+    DatabricksM2MTokenProvider, DatabricksU2MTokenProvider, get_workload_identity_token_provider,
+    model_error,
+};
 use bytes::Bytes;
 use cache::CacheProvider;
 use cache::result::embeddings::CachedEmbeddingResult;
@@ -102,6 +105,12 @@ pub async fn try_to_embedding(
 
     match prefix {
         EmbeddingPrefix::Azure => {
+            // Read before `params` moves into the typed params: federation params win over a key
+            // autoloaded from a secret store, but not over one the Spicepod writes.
+            let key_in_spicepod = llms::workload_identity::key_in_spicepod(
+                &params,
+                &["azure_api_key", "azure_entra_token"],
+            );
             let typed =
                 embedding_params::azure::AzureEmbeddingParams::try_from_params_with_secret_sources(
                     &component_name,
@@ -115,10 +124,15 @@ pub async fn try_to_embedding(
                 model_id,
                 component.name.as_str(),
                 &typed,
+                key_in_spicepod,
                 embeddings_cache.clone(),
             )
+            .await
         }
         EmbeddingPrefix::OpenAi => {
+            // Read before `params` moves into the typed params: federation params win over an
+            // API key autoloaded from a secret store, but not over one the Spicepod writes.
+            let api_key_in_spicepod = llms::workload_identity::openai_api_key_in_spicepod(&params);
             let typed = embedding_params::openai::OpenAiEmbeddingParams::try_from_params_with_secret_sources(
                 &component_name,
                 params,
@@ -131,6 +145,7 @@ pub async fn try_to_embedding(
                 model_id,
                 component,
                 &typed,
+                api_key_in_spicepod,
                 secrets,
                 embeddings_cache.clone(),
             )
@@ -196,6 +211,12 @@ pub async fn try_to_embedding(
             google(model_id, &typed, embeddings_cache.clone()).await
         }
         EmbeddingPrefix::Databricks => {
+            // Read before `params` moves into the typed params: federation params win over a key
+            // autoloaded from a secret store, but not over one the Spicepod writes.
+            let key_in_spicepod = llms::workload_identity::key_in_spicepod(
+                &params,
+                &["databricks_token", "databricks_client_secret"],
+            );
             let typed = embedding_params::databricks::DatabricksEmbeddingParams::try_from_params_with_secret_sources(
                 &component_name,
                 params,
@@ -205,8 +226,10 @@ pub async fn try_to_embedding(
             .await
             .map_err(params_err)?;
             databricks(
+                &component.name,
                 model_id,
                 &typed,
+                key_in_spicepod,
                 Arc::clone(&token_provider_registry),
                 embeddings_cache.clone(),
             )
@@ -253,7 +276,50 @@ pub async fn try_to_embedding(
         EmbeddingPrefix::Model2Vec => Err(EmbedError::UnknownModelSource {
             from: "model2vec".to_string(),
         }),
+        EmbeddingPrefix::SpiceAi => {
+            let typed = embedding_params::spiceai::SpiceAiEmbeddingParams::try_from_params_with_secret_sources(
+                &component_name,
+                params,
+                &secrets,
+                &secret_sources,
+            )
+            .await
+            .map_err(params_err)?;
+            spiceai(model_id, &typed, embeddings_cache.clone())
+        }
     }
+}
+
+/// An embedding model served by the Spice.ai Cloud Platform, or by another Spice runtime, such as
+/// the cluster an application sidecar reads from. Both serve the `OpenAI`-compatible
+/// `/v1/embeddings`, so the model is driven through the same client as `from: spiceai` chat
+/// models.
+fn spiceai(
+    model_id: Option<String>,
+    params: &embedding_params::spiceai::SpiceAiEmbeddingParams,
+    embeddings_cache: Option<Arc<dyn CacheProvider<CachedEmbeddingResult> + Send + Sync>>,
+) -> Result<Arc<dyn Embed>, EmbedError> {
+    let Some(model_id) = model_id else {
+        return Err(EmbedError::ModelNotProvided {
+            model_source: "spiceai".to_string(),
+        });
+    };
+    let endpoint = params.endpoint.as_str();
+    let api_key = params.api_key.as_ref().map(ExposeSecret::expose_secret);
+    // A self-hosted Spice runtime may not require authentication, but the Spice.ai Cloud Platform
+    // always does, so an unset key there is a misconfiguration.
+    if api_key.is_none() && llms::spiceai::is_cloud_platform(Some(endpoint)) {
+        return Err(EmbedError::FailedToInstantiateEmbeddingModel {
+            source: "Missing `spiceai_api_key`. Embedding models served by the Spice.ai Cloud Platform require an API key. Set `spiceai_api_key`, or set `spiceai_endpoint` to the Spice runtime serving the model. See: https://spiceai.org/docs/components/embeddings".into(),
+        });
+    }
+    Ok(Arc::new(
+        OpenaiEmbed::new(
+            llms::spiceai::new_spiceai_client(model_id, Some(endpoint), api_key),
+            None,
+        )
+        .set_cache(embeddings_cache),
+    ))
 }
 
 #[cfg(feature = "models")]
@@ -489,8 +555,10 @@ async fn huggingface(
 }
 
 async fn databricks(
+    embedding_name: &str,
     model_id: Option<String>,
     params: &embedding_params::databricks::DatabricksEmbeddingParams,
+    key_in_spicepod: Option<&str>,
     token_provider_registry: Arc<TokenProviderRegistry>,
     embeddings_cache: Option<Arc<dyn CacheProvider<CachedEmbeddingResult> + Send + Sync>>,
 ) -> Result<Arc<dyn Embed>, EmbedError> {
@@ -512,6 +580,34 @@ async fn databricks(
     let user_agent = Some(data_components::databricks::user_agent());
     #[cfg(not(feature = "databricks"))]
     let user_agent: Option<&'static str> = None;
+
+    let embedding_error = |error| EmbedError::FailedToInstantiateEmbeddingModel {
+        source: Box::new(model_error(error)),
+    };
+    if let Some(identity) = params
+        .federation()
+        .workload_identity(key_in_spicepod)
+        .map_err(embedding_error)?
+    {
+        let token_provider = get_workload_identity_token_provider(
+            &format!("embedding '{embedding_name}' (databricks)"),
+            endpoint,
+            identity,
+            &token_provider_registry,
+        )
+        .await
+        .map_err(embedding_error)?;
+        return Ok(Arc::new(
+            llms::databricks::from_token_provider(
+                endpoint,
+                model_id.as_str(),
+                token_provider,
+                user_agent,
+                HealthCheck::Required,
+            )
+            .set_cache(embeddings_cache),
+        ) as Arc<dyn Embed>);
+    }
 
     match (token_opt, client_id, client_secret) {
         (Some(_), Some(_) | None, Some(_)) => {
@@ -634,15 +730,16 @@ async fn file(
     ))
 }
 
-fn azure(
+async fn azure(
     model_id: Option<String>,
-    model_name: &str,
+    component_name: &str,
     params: &embedding_params::azure::AzureEmbeddingParams,
+    key_in_spicepod: Option<&'static str>,
     embeddings_cache: Option<Arc<dyn CacheProvider<CachedEmbeddingResult> + Send + Sync>>,
 ) -> Result<Arc<dyn Embed>, EmbedError> {
     let Some(model_name) = model_id else {
         return Err(EmbedError::FailedToInstantiateEmbeddingModel {
-            source: format!("For embedding model '{model_name}', model id must be specified in `from:azure:<model_id>`.").into(),
+            source: format!("For embedding model '{component_name}', model id must be specified in `from:azure:<model_id>`.").into(),
         });
     };
     let api_key = params.api_key.as_ref().map(ExposeSecret::expose_secret);
@@ -656,10 +753,27 @@ fn azure(
         });
     }
 
+    if let Some(client) = llms::workload_identity::azure_federated_client(
+        &format!("embedding '{component_name}' (azure)"),
+        &model_name,
+        &params.federation(),
+        key_in_spicepod,
+        api_key.is_some() || entra_token.is_some(),
+        &llms::workload_identity::AzureEnvironment::from_process(),
+        llms::openai::ChatBackend::ChatCompletions,
+    )
+    .await
+    .map_err(llms::workload_identity::FederationError::into_embed_error)?
+    {
+        return Ok(Arc::new(
+            OpenaiEmbed::new(client, None).set_cache(embeddings_cache),
+        ));
+    }
+
     if api_key.is_none() && entra_token.is_none() {
         return Err(EmbedError::FailedToInstantiateEmbeddingModel {
             source: format!(
-                "Azure embedding model '{model_name}' requires 'azure_api_key' or 'azure_entra_token'."
+                "Azure embedding model '{component_name}' requires `azure_api_key`, `azure_entra_token`, or a Microsoft Entra workload identity: `azure_tenant_id` and `azure_client_id`, or on AKS a pod labeled `azure.workload.identity/use: \"true\"`. See https://spiceai.org/docs/components/embeddings/azure for details."
             )
             .into(),
         });
@@ -685,14 +799,30 @@ async fn openai(
     model_id: Option<String>,
     component: &spicepod::component::embeddings::Embeddings,
     params: &embedding_params::openai::OpenAiEmbeddingParams,
+    api_key_in_spicepod: Option<&'static str>,
     secrets: Arc<RwLock<Secrets>>,
     embeddings_cache: Option<Arc<dyn CacheProvider<CachedEmbeddingResult> + Send + Sync>>,
 ) -> Result<Arc<dyn Embed>, EmbedError> {
     let usage_tier = params.usage_tier;
+    let model = model_id.unwrap_or(DEFAULT_EMBEDDING_MODEL.to_string());
 
-    let mut embed = OpenaiEmbed::new(
+    if let Some(client) = llms::workload_identity::openai_federated_client(
+        &format!("embedding '{}' (openai)", component.name),
+        &model,
+        &params.federation(),
+        api_key_in_spicepod,
+        llms::openai::ChatBackend::ChatCompletions,
+    )
+    .await
+    .map_err(llms::workload_identity::FederationError::into_embed_error)?
+    {
+        let embed = OpenaiEmbed::new(client, Some(usage_tier.into())).set_cache(embeddings_cache);
+        return with_tokenizer_file(embed, component, secrets).await;
+    }
+
+    let embed = OpenaiEmbed::new(
         llms::openai::new_openai_client(
-            model_id.unwrap_or(DEFAULT_EMBEDDING_MODEL.to_string()),
+            model,
             Some(params.endpoint.as_str()),
             params.api_key.as_ref().map(ExposeSecret::expose_secret),
             params.org_id.as_deref(),
@@ -702,7 +832,18 @@ async fn openai(
         Some(usage_tier.into()),
     )
     .set_cache(embeddings_cache);
+    with_tokenizer_file(embed, component, secrets).await
+}
 
+/// `embed`, with the tokenizer the embedding names, if any.
+async fn with_tokenizer_file<C>(
+    mut embed: OpenaiEmbed<C>,
+    component: &spicepod::component::embeddings::Embeddings,
+    secrets: Arc<RwLock<Secrets>>,
+) -> Result<Arc<dyn Embed>, EmbedError>
+where
+    C: async_openai::config::Config + Clone + Send + Sync + std::fmt::Debug + 'static,
+{
     // For OpenAI compatible embedding models, we allow users to
     // specific the tokenizer being used, so that the model can chunk data properly.
     if let Some(tokenizer_file) = component.find_any_file(ModelFileType::Tokenizer) {

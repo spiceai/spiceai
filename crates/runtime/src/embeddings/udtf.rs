@@ -39,7 +39,6 @@ use datafusion::logical_expr::{ColumnarValue, DocSection, Documentation, Signatu
 use datafusion::{
     catalog::{Session, TableFunctionImpl, TableProvider},
     common::Column,
-    common::TableReference,
     datasource::{DefaultTableSource, TableType},
     error::{DataFusionError, Result as DataFusionResult},
     logical_expr::{Operator, SortExpr, expr::ScalarFunction},
@@ -67,7 +66,7 @@ use std::{
 };
 
 use runtime_datafusion_udfs::cosine_distance::COSINE_DISTANCE_UDF_NAME;
-use search::{SEARCH_SCORE_COLUMN_NAME, generation::util::append_fields};
+use search::{SEARCH_SCORE_COLUMN_NAME, generation::util::append_fields, provider::UdtfSource};
 use snafu::ResultExt;
 
 use crate::datafusion::{SPICE_DEFAULT_CATALOG, SPICE_DEFAULT_SCHEMA};
@@ -77,14 +76,14 @@ use runtime_request_context::{AsyncMarker, RequestContext};
 use runtime_search::{
     candidate::vector::ChunkedNonIndexVectorGeneration,
     embeddings::table::EmbeddingTable,
+    search_engine::ExplicitPrimaryKeys,
     udtf::{EmbeddingColumnConfig, table_ref_from_column_expr},
 };
 
 #[cfg(any(feature = "s3_vectors", feature = "elasticsearch", feature = "duckdb"))]
 use {
-    crate::search::util::find_index_in_table_provider,
-    search::index::SearchIndex,
-    search::provider::{SearchQueryProvider, UdtfSource},
+    crate::search::util::find_index_in_table_provider, search::index::SearchIndex,
+    search::provider::SearchQueryProvider,
 };
 
 #[cfg(feature = "elasticsearch")]
@@ -179,12 +178,12 @@ pub struct VectorSearchTableFunc {
     // store a pointer to use for Hash/Eq since UDTF impls require this trait bound but we cannot feasibly make `DataFusion` implement them.
     df_ptr: u64,
 
-    explicit_pks: HashMap<TableReference, Vec<String>>,
+    explicit_pks: ExplicitPrimaryKeys,
 }
 
 impl PartialEq for VectorSearchTableFunc {
     fn eq(&self, other: &Self) -> bool {
-        self.df_ptr == other.df_ptr && self.explicit_pks == other.explicit_pks
+        self.df_ptr == other.df_ptr && self.explicit_pks.ptr_eq(&other.explicit_pks)
     }
 }
 
@@ -217,7 +216,7 @@ pub fn parse_limit_scalar(scalar: &ScalarValue) -> Result<u64, DataFusionError> 
 
 impl VectorSearchTableFunc {
     #[must_use]
-    pub fn new(df: Weak<DataFusion>, explicit_pks: HashMap<TableReference, Vec<String>>) -> Self {
+    pub fn new(df: Weak<DataFusion>, explicit_pks: ExplicitPrimaryKeys) -> Self {
         let ptr = df.as_ptr().addr() as u64;
         Self {
             df,
@@ -385,20 +384,6 @@ impl VectorSearchTableFunc {
             }
         }
 
-        #[cfg(feature = "duckdb")]
-        {
-            use search::index::duckdb::DuckDBVectorIndex;
-            if let Some((duckdb_indexes, _)) =
-                find_index_in_table_provider::<DuckDBVectorIndex>(tbl)
-            {
-                vector_indexes.extend(
-                    duckdb_indexes
-                        .into_iter()
-                        .map(|c| Arc::new(c.clone()) as Arc<dyn SearchIndex>),
-                );
-            }
-        }
-
         // Chunked search indexes (used by both S3 Vectors and Elasticsearch engines
         // when chunking is enabled) are discovered once here to avoid registering
         // the same `ChunkedSearchIndex` twice when both features are enabled.
@@ -546,16 +531,32 @@ impl TableFunctionImpl for VectorSearchTableFunc {
         }
 
         // If an embedding column is defined, fallback to JIT or.
-        let embedding_table_provider = spice_table::find_layer::<EmbeddingTable>(
+        let Some(embedding_table_provider) = spice_table::find_layer::<EmbeddingTable>(
             table_provider.as_ref(),
             spice_table::LayerWalk::Read,
-        )
-        .ok_or_else(|| {
-            DataFusionError::Plan(format!(
+        ) else {
+            // A sidecar's Spice table is searched by the upstream that holds its
+            // embeddings. One call carries one query.
+            if args.queries.len() <= 1
+                && let Some(delegated) = runtime_search::delegated::delegated_search(
+                    table_provider.as_ref(),
+                    &UdtfSource::VectorSearch {
+                        table: args.tbl.to_string(),
+                        query: args.query.clone(),
+                        column: args.column.clone(),
+                        limit: args.limit,
+                        include_score: args.include_score,
+                        distance_metric: args.distance_metric.map(|m| m.as_str().to_string()),
+                    },
+                )
+            {
+                return Ok(delegated);
+            }
+            return Err(DataFusionError::Plan(format!(
                 "Table '{}' does not have an embedding index.",
-                args.tbl.clone()
-            ))
-        })?;
+                args.tbl
+            )));
+        };
 
         let (col, _) = args.get_column_and_config(&embedding_table_provider.embedded_columns)?;
         // Both chunked-scalar and multi-vector (list-typed) columns use
@@ -585,7 +586,6 @@ impl TableFunctionImpl for VectorSearchTableFunc {
             let pks = self
                 .explicit_pks
                 .get(&args.tbl)
-                .cloned()
                 .or_else(|| get_primary_keys(&table_provider).ok());
 
             let model_name = embedding_table_provider

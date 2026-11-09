@@ -238,7 +238,10 @@ print-rust-gate-features:
 # every DuckDB result-correctness lane compares against: Arrow types, NULLs and
 # settings round-trip through ADBC, and a database file reopens. It loads the
 # libduckdb `nextest` installs, needing no credentials and no service.
-NEXTEST_FILTER := kind(=lib) + kind(=proc-macro) + kind(=bin) + (package(=runtime) & binary(=rate_control)) + (package(=runtime) & binary(=cayenne_runtime_tuning)) + (package(=cayenne) & kind(=test)) + (package(=runtime-acceleration) & binary(=optional_snapshot_files)) + (package(=vortex-datafusion) & kind(=test)) + (package(=runtime-cloud-connect) & kind(=test)) + (package(=spice) & binary(=cli_integration)) + (package(=spice) & binary(=connect_service_cli)) + binary(=metrics) + (package(=testoperator) & (test(=commands::tests::benchmark_dispatches_validate_results_against_an_oracle) | test(=commands::tests::nextest_filter_selects_the_oracle_dispatch_guard_by_its_rustc_name))) + (package(=runtime-udfs-api) & binary(=json_semantics)) + (package(=connector-adbc) & binary(=adbc_cancellation)) + (binary_id(=llms::integration) & test(/^(anthropic_stream_errors|list_models_errors|model2vec_hf_cache|safetensors_hf_cache|gguf_hf_cache)::/)) + (binary_id(=llms-llamacpp::integration) & test(/^load_errors::/)) + binary_id(=llama-cpp::integration) + binary_id(=duckdb-oracle::integration) + (binary_id(=spiced::integration) - test(/^cloud_connect_bootstrap::/)) + (package(=runtime) & binary(=results_cache_growth)) + (package(=runtime) & binary(=chat_tool_use))
+# `runtime-datafusion`'s `is_distinct_from_precedence` binary is self-contained
+# (in-memory SessionContext, no credentials) and gates the vendored sqlparser
+# fix that binds `IS [NOT] DISTINCT FROM` tighter than `AND` / `OR`.
+NEXTEST_FILTER := kind(=lib) + kind(=proc-macro) + kind(=bin) + (package(=runtime) & binary(=rate_control)) + (package(=runtime) & binary(=cayenne_runtime_tuning)) + (package(=cayenne) & kind(=test)) + (package(=runtime-acceleration) & binary(=optional_snapshot_files)) + (package(=vortex-datafusion) & kind(=test)) + (package(=runtime-cloud-connect) & kind(=test)) + (package(=spice) & binary(=cli_integration)) + (package(=spice) & binary(=connect_service_cli)) + binary(=metrics) + (package(=testoperator) & (test(=commands::tests::benchmark_dispatches_validate_results_against_an_oracle) | test(=commands::tests::nextest_filter_selects_the_oracle_dispatch_guard_by_its_rustc_name))) + (package(=runtime-udfs-api) & binary(=json_semantics)) + (package(=connector-adbc) & binary(=adbc_cancellation)) + (binary_id(=llms::integration) & test(/^(anthropic_stream_errors|list_models_errors|model2vec_hf_cache|safetensors_hf_cache|gguf_hf_cache)::/)) + (binary_id(=llms-llamacpp::integration) & test(/^load_errors::/)) + binary_id(=llama-cpp::integration) + binary_id(=duckdb-oracle::integration) + (binary_id(=spiced::integration) - test(/^cloud_connect_bootstrap::/)) + (package(=runtime) & binary(=results_cache_growth)) + (package(=runtime) & binary(=chat_tool_use)) + (package(=runtime-datafusion) & binary(=is_distinct_from_precedence))
 # Extra narrowing for callers that can't run everything (CI lacks credentials
 # for some tests). It has to *intersect* the expression above rather than sit
 # beside it: nextest unions repeated `-E` flags, so a second `-E 'not (…)'` would
@@ -318,11 +321,11 @@ nextest-packages:
 test-integration:
 	# Test if .env file exists, and login to Spice if not
 	@test -f .env || (`spice login`)
-	@cargo nextest run -p runtime --test integration --features postgres,mysql,delta_lake,duckdb,sqlite,turso --no-capture
+	@cargo nextest run -p runtime --test integration --features postgres,mysql,delta_lake,duckdb,sqlite --no-capture
 
 .PHONY: test-integration-without-spiceai-dataset
 test-integration-without-spiceai-dataset:
-	@cargo nextest run -p runtime --test integration --features postgres,mysql,delta_lake,duckdb,sqlite,turso --no-capture -E 'not test(spiceai_integration_test)'
+	@cargo nextest run -p runtime --test integration --features postgres,mysql,delta_lake,duckdb,sqlite --no-capture -E 'not test(spiceai_integration_test)'
 
 .PHONY: test-integration-models
 test-integration-models:
@@ -532,7 +535,7 @@ TARGET_DIR := $(or $(CARGO_TARGET_DIR),target)
 # `default = [...]` array in bin/spiced/Cargo.toml.
 #
 # Note: postgres-accel enables the PostgreSQL data accelerator (separate from postgres connector)
-SPICED_DATA_FEATURES := duckdb,postgres,postgres-accel,sqlite,mysql,flightsql,delta_lake,databricks,dremio,clickhouse,cosmosdb,sharepoint,snapshots,snowflake,spark,ftp,sftp,debezium,kafka,anonymous_telemetry,mssql,dynamodb,imap,alloc-snmalloc,oracle,runtime/s3_vectors,mongodb,iceberg-write,turso,smb
+SPICED_DATA_FEATURES := duckdb,postgres,postgres-accel,sqlite,mysql,flightsql,delta_lake,databricks,dremio,clickhouse,cosmosdb,sharepoint,snapshots,snowflake,spark,ftp,sftp,debezium,kafka,anonymous_telemetry,mssql,dynamodb,imap,alloc-snmalloc,oracle,runtime/s3_vectors,mongodb,iceberg-write,smb
 
 .PHONY: install
 install: build

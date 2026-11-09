@@ -23,28 +23,42 @@ limitations under the License.
 //! partition whose running total does not fit in `Int64` can still cancel at
 //! merge; [`Accumulator::evaluate`] is the only narrowing point.
 //!
+//! A batch is totalled in `u64` lanes over the halves of each value (see
+//! [`exact_sum_i64`]), which is exact and vectorizes, and the batch total is
+//! then added to the running total with a check. `GROUP BY` gets
+//! [`CheckedSumGroups`], which keeps one `i128` total per group and the same
+//! partial state, so the hash aggregate does not fall back to adapting the
+//! row accumulator group by group (and, once it skips partial aggregation,
+//! row by row).
+//!
 //! `SUM(DISTINCT)` is covered too: `DataFusion`'s distinct accumulator wraps
 //! unique values with `add_wrapping`, so `{i64::MAX, 1}` becomes `i64::MIN`.
 //! Distinct state stays a list of unique keys; evaluate is the narrowing point.
 
 use std::collections::{HashMap, HashSet};
+use std::marker::PhantomData;
 use std::mem::{size_of, size_of_val};
 use std::sync::Arc;
 
-use arrow::array::{Array, ArrayRef, AsArray, PrimitiveArray};
+use arrow::array::{Array, ArrayRef, AsArray, BooleanArray, PrimitiveArray};
+use arrow::buffer::NullBuffer;
 use arrow::datatypes::{
-    DECIMAL128_MAX_PRECISION, DataType, Decimal128Type, Field, FieldRef, Int64Type, UInt64Type,
+    ArrowPrimitiveType, DECIMAL128_MAX_PRECISION, DataType, Decimal128Type, Field, FieldRef,
+    Int64Type, UInt64Type,
 };
-use datafusion::common::{Result, ScalarValue, exec_err, not_impl_err};
+use datafusion::common::{Result, ScalarValue, exec_err, internal_err, not_impl_err};
 use datafusion::functions_aggregate::sum::sum_udaf;
+use datafusion::logical_expr::expr::{AggregateFunction, AggregateFunctionParams};
 use datafusion::logical_expr::function::{AccumulatorArgs, StateFieldsArgs};
 use datafusion::logical_expr::utils::{AggregateOrderSensitivity, format_state_name};
 use datafusion::logical_expr::{
-    Accumulator, AggregateUDF, AggregateUDFImpl, Documentation, GroupsAccumulator, ReversedUDAF,
-    SetMonotonicity, Signature, StatisticsArgs,
+    Accumulator, AggregateUDF, AggregateUDFImpl, Documentation, EmitTo, Expr, GroupsAccumulator,
+    Operator, ReversedUDAF, SetMonotonicity, Signature, StatisticsArgs,
 };
+use datafusion::physical_expr::NullState;
 
 use super::is_checked_sum_return_type;
+use super::sum_plus_literal::sum_plus_literal;
 
 /// Wide enough for any pair of `i64`/`u64` totals that can still cancel to a
 /// representable `SUM` result. `DECIMAL128_MAX_PRECISION` is 38.
@@ -133,7 +147,8 @@ impl AggregateUDFImpl for CheckedSum {
 
     fn groups_accumulator_supported(&self, args: AccumulatorArgs) -> bool {
         if is_checked_sum_return_type(args.return_field.data_type()) {
-            return false;
+            // `SUM(DISTINCT)` keeps the row accumulator, as the built-in does.
+            return !args.is_distinct;
         }
         self.inner.groups_accumulator_supported(args)
     }
@@ -142,12 +157,18 @@ impl AggregateUDFImpl for CheckedSum {
         &self,
         args: AccumulatorArgs,
     ) -> Result<Box<dyn GroupsAccumulator>> {
-        if is_checked_sum_return_type(args.return_field.data_type()) {
-            return not_impl_err!(
-                "checked integer SUM does not provide a GroupsAccumulator; use the row accumulator"
-            );
+        match args.return_field.data_type() {
+            DataType::Int64 if !args.is_distinct => {
+                Ok(Box::new(CheckedSumGroups::<Int64Type>::new()))
+            }
+            DataType::UInt64 if !args.is_distinct => {
+                Ok(Box::new(CheckedSumGroups::<UInt64Type>::new()))
+            }
+            data_type if is_checked_sum_return_type(data_type) => not_impl_err!(
+                "checked integer SUM(DISTINCT) does not provide a GroupsAccumulator; use the row accumulator"
+            ),
+            _ => self.inner.create_groups_accumulator(args),
         }
-        self.inner.create_groups_accumulator(args)
     }
 
     fn create_sliding_accumulator(&self, args: AccumulatorArgs) -> Result<Box<dyn Accumulator>> {
@@ -187,6 +208,54 @@ impl AggregateUDFImpl for CheckedSum {
         self.inner.value_from_stats(statistics_args)
     }
 
+    /// `DataFusion` offers `SUM(arg + literal)` here when several `SUM`s share
+    /// `arg`, to rewrite to `SUM(arg) + literal * COUNT(arg)`. A signed
+    /// integer `arg` gets the exact rewrite in `sum_plus_literal`.
+    ///
+    /// Every other type is left as written rather than handed to the
+    /// built-in's rewrite: that one adds and multiplies with wrapping kernels,
+    /// widens a decimal `SUM`'s result type to precision 38, and does not plan
+    /// for an interval (it multiplies two intervals).
+    fn simplify_expr_op_literal(
+        &self,
+        agg_function: &AggregateFunction,
+        arg: &Expr,
+        op: Operator,
+        lit: &Expr,
+        _arg_is_left: bool,
+    ) -> Result<Option<Expr>> {
+        // The rewrite's `COUNT` counts every non-NULL `arg`, which is the set
+        // of rows a plain `SUM` adds and not the set a `DISTINCT` or `FILTER`
+        // one adds. `DataFusion` offers only plain aggregates here
+        // (`candidate_linear_param`); declining the rest keeps the answer
+        // exact if it ever offers more.
+        let AggregateFunctionParams {
+            args: _,
+            distinct,
+            filter,
+            order_by,
+            null_treatment,
+        } = &agg_function.params;
+        if *distinct || filter.is_some() || !order_by.is_empty() || null_treatment.is_some() {
+            return Ok(None);
+        }
+        // `+` only, as the built-in, so the operand order does not matter.
+        if op != Operator::Plus {
+            return Ok(None);
+        }
+        let Expr::Literal(value, _) = lit else {
+            return Ok(None);
+        };
+        let k = match value {
+            ScalarValue::Int8(k) => k.map(i64::from),
+            ScalarValue::Int16(k) => k.map(i64::from),
+            ScalarValue::Int32(k) => k.map(i64::from),
+            ScalarValue::Int64(k) => *k,
+            _ => None,
+        };
+        Ok(k.map(|k| sum_plus_literal(agg_function, arg, k)))
+    }
+
     fn coerce_types(&self, arg_types: &[DataType]) -> Result<Vec<DataType>> {
         self.inner.coerce_types(arg_types)
     }
@@ -204,7 +273,7 @@ impl AggregateUDFImpl for CheckedSum {
     }
 }
 
-fn int64_overflow() -> datafusion::error::DataFusionError {
+pub(super) fn int64_overflow() -> datafusion::error::DataFusionError {
     datafusion::error::DataFusionError::Execution(
         "Overflow in SUM of BIGINT: the total is not representable as an Int64".to_string(),
     )
@@ -216,7 +285,7 @@ fn uint64_overflow() -> datafusion::error::DataFusionError {
     )
 }
 
-fn checked_sum_state_type() -> DataType {
+pub(super) fn checked_sum_state_type() -> DataType {
     DataType::Decimal128(CHECKED_SUM_STATE_PRECISION, CHECKED_SUM_STATE_SCALE)
 }
 
@@ -390,6 +459,271 @@ fn fold_distinct_u64(values: &HashSet<u64>) -> Result<ScalarValue> {
     Ok(ScalarValue::UInt64(Some(value)))
 }
 
+/// Values per lane pass in [`exact_sum_i64`] and [`exact_sum_u64`]. Each value
+/// adds less than 2^32 to a `u64` lane, so no lane can overflow in a chunk of
+/// 2^31 values.
+const EXACT_SUM_CHUNK: usize = 1 << 31;
+
+/// Mask of the low 32 bits of a `u64`.
+const LOW_HALF: u64 = 0xFFFF_FFFF;
+
+/// Exact total of `values`.
+///
+/// Each value is read as its two's-complement bits and split into 32-bit
+/// halves. The halves, and the count of negative values, are summed in `u64`
+/// lanes, which cannot overflow within a chunk and which the compiler can
+/// vectorize; the lanes are recombined in `i128`, subtracting 2^64 for each
+/// negative value. The result never overflows: a slice holds fewer than 2^64
+/// values, each of magnitude at most 2^63.
+fn exact_sum_i64(values: &[i64]) -> i128 {
+    exact_sum_i64_in_chunks(values, EXACT_SUM_CHUNK)
+}
+
+/// [`exact_sum_i64`] with lane passes of `chunk_len` values, which must be
+/// between 1 and [`EXACT_SUM_CHUNK`].
+fn exact_sum_i64_in_chunks(values: &[i64], chunk_len: usize) -> i128 {
+    let mut total = 0_i128;
+    for chunk in values.chunks(chunk_len) {
+        let (mut high, mut low, mut negative) = (0_u64, 0_u64, 0_u64);
+        for &value in chunk {
+            let bits = value.cast_unsigned();
+            high += bits >> 32;
+            low += bits & LOW_HALF;
+            negative += bits >> 63;
+        }
+        total += (i128::from(high) << 32) + i128::from(low) - (i128::from(negative) << 64);
+    }
+    total
+}
+
+/// Exact total of `values`, summed in two `u64` lanes over the 32-bit halves
+/// of each value. See [`exact_sum_i64`].
+fn exact_sum_u64(values: &[u64]) -> u128 {
+    exact_sum_u64_in_chunks(values, EXACT_SUM_CHUNK)
+}
+
+/// [`exact_sum_u64`] with lane passes of `chunk_len` values, which must be
+/// between 1 and [`EXACT_SUM_CHUNK`].
+fn exact_sum_u64_in_chunks(values: &[u64], chunk_len: usize) -> u128 {
+    let mut total = 0_u128;
+    for chunk in values.chunks(chunk_len) {
+        let (mut high, mut low) = (0_u64, 0_u64);
+        for &value in chunk {
+            high += value >> 32;
+            low += value & LOW_HALF;
+        }
+        total += (u128::from(high) << 32) + u128::from(low);
+    }
+    total
+}
+
+/// The `Int64` / `UInt64` input of a [`CheckedSumGroups`]. A value widens to
+/// its `i128` amount with `Into`, and a total narrows back to the `SUM` result
+/// with `TryFrom`, which fails when the total is not representable.
+trait CheckedSumInput: ArrowPrimitiveType<Native: Into<i128> + TryFrom<i128>> + Send + Sized {
+    fn values_of(array: &ArrayRef) -> Result<&PrimitiveArray<Self>>;
+
+    /// Whether a partial total from another partition is a total this input
+    /// type can produce. The row accumulator rejects the same values on merge.
+    fn partial_in_range(partial: i128) -> bool;
+
+    fn overflow() -> datafusion::error::DataFusionError;
+}
+
+impl CheckedSumInput for Int64Type {
+    fn values_of(array: &ArrayRef) -> Result<&PrimitiveArray<Self>> {
+        int64_values(array)
+    }
+
+    fn partial_in_range(_partial: i128) -> bool {
+        true
+    }
+
+    fn overflow() -> datafusion::error::DataFusionError {
+        int64_overflow()
+    }
+}
+
+impl CheckedSumInput for UInt64Type {
+    fn values_of(array: &ArrayRef) -> Result<&PrimitiveArray<Self>> {
+        uint64_values(array)
+    }
+
+    fn partial_in_range(partial: i128) -> bool {
+        partial >= 0
+    }
+
+    fn overflow() -> datafusion::error::DataFusionError {
+        uint64_overflow()
+    }
+}
+
+/// Checked `SUM(BIGINT)` for `GROUP BY`: one `i128` total per group.
+///
+/// Adding one `Int64` or `UInt64` value cannot overflow an `i128` total
+/// before 2^64 values reach one group; every add is still checked, and
+/// [`GroupsAccumulator::evaluate`] is the only narrowing point, as in
+/// [`CheckedInt64Sum`]. The partial state is the row accumulators':
+/// `Decimal128(38, 0)`, null for a group that has seen no value. As for the
+/// built-in `SUM`, [`NullState`] tracks which groups have seen a value.
+#[derive(Debug)]
+struct CheckedSumGroups<T: CheckedSumInput> {
+    /// One total per group; 0 for a group that has seen no value.
+    sums: Vec<i128>,
+    null_state: NullState,
+    input: PhantomData<T>,
+}
+
+impl<T: CheckedSumInput> CheckedSumGroups<T> {
+    fn new() -> Self {
+        Self {
+            sums: Vec::new(),
+            null_state: NullState::new(),
+            input: PhantomData,
+        }
+    }
+
+    /// Adds each non-null row of `values` that `opt_filter` keeps to its
+    /// group. `widen` gives the amount a value adds, or `None` when the value
+    /// is out of range for `T`.
+    fn accumulate<V: ArrowPrimitiveType + Send>(
+        &mut self,
+        values: &PrimitiveArray<V>,
+        group_indices: &[usize],
+        opt_filter: Option<&BooleanArray>,
+        total_num_groups: usize,
+        widen: impl Fn(V::Native) -> Option<i128> + Send + Sync,
+    ) -> Result<()> {
+        ensure_rows(values.len(), group_indices.len(), "group indices")?;
+        if let Some(filter) = opt_filter {
+            ensure_rows(values.len(), filter.len(), "filter values")?;
+        }
+        self.sums.resize(total_num_groups, 0);
+        let sums = &mut self.sums;
+        let mut overflow = false;
+        let mut bad_group = None;
+        self.null_state.accumulate(
+            group_indices,
+            values,
+            opt_filter,
+            total_num_groups,
+            |group, value| {
+                let Some(sum) = sums.get_mut(group) else {
+                    bad_group = Some(group);
+                    return;
+                };
+                if let Some(total) = widen(value).and_then(|wide| sum.checked_add(wide)) {
+                    *sum = total;
+                } else {
+                    overflow = true;
+                }
+            },
+        );
+        if let Some(group) = bad_group {
+            return internal_err!(
+                "checked SUM got group index {group} for {total_num_groups} groups"
+            );
+        }
+        if overflow {
+            return Err(T::overflow());
+        }
+        Ok(())
+    }
+}
+
+fn ensure_rows(expected: usize, actual: usize, what: &str) -> Result<()> {
+    if expected == actual {
+        Ok(())
+    } else {
+        internal_err!("checked SUM got {actual} {what} for {expected} rows")
+    }
+}
+
+fn decimal_state(sums: Vec<i128>, nulls: Option<NullBuffer>) -> Result<ArrayRef> {
+    let state = PrimitiveArray::<Decimal128Type>::try_new(sums.into(), nulls)?
+        .with_precision_and_scale(CHECKED_SUM_STATE_PRECISION, CHECKED_SUM_STATE_SCALE)?;
+    Ok(Arc::new(state))
+}
+
+impl<T: CheckedSumInput> GroupsAccumulator for CheckedSumGroups<T> {
+    fn update_batch(
+        &mut self,
+        values: &[ArrayRef],
+        group_indices: &[usize],
+        opt_filter: Option<&BooleanArray>,
+        total_num_groups: usize,
+    ) -> Result<()> {
+        let values = T::values_of(first_array(values)?)?;
+        self.accumulate(
+            values,
+            group_indices,
+            opt_filter,
+            total_num_groups,
+            |value| Some(value.into()),
+        )
+    }
+
+    fn merge_batch(
+        &mut self,
+        values: &[ArrayRef],
+        group_indices: &[usize],
+        total_num_groups: usize,
+    ) -> Result<()> {
+        let partials = decimal128_values(first_array(values)?)?;
+        self.accumulate(partials, group_indices, None, total_num_groups, |partial| {
+            T::partial_in_range(partial).then_some(partial)
+        })
+    }
+
+    fn evaluate(&mut self, emit_to: EmitTo) -> Result<ArrayRef> {
+        let sums = emit_to.take_needed(&mut self.sums);
+        let nulls = self.null_state.build(emit_to);
+        // A group that has seen no value holds 0, so every total narrows.
+        let totals = sums
+            .into_iter()
+            .map(|sum| T::Native::try_from(sum).map_err(|_| T::overflow()))
+            .collect::<Result<Vec<_>>>()?;
+        Ok(Arc::new(PrimitiveArray::<T>::try_new(
+            totals.into(),
+            nulls,
+        )?))
+    }
+
+    fn state(&mut self, emit_to: EmitTo) -> Result<Vec<ArrayRef>> {
+        let sums = emit_to.take_needed(&mut self.sums);
+        let nulls = self.null_state.build(emit_to);
+        Ok(vec![decimal_state(sums, nulls)?])
+    }
+
+    /// Each row becomes its own partial total: the widened value, or null
+    /// when the value is null or the filter drops the row.
+    fn convert_to_state(
+        &self,
+        values: &[ArrayRef],
+        opt_filter: Option<&BooleanArray>,
+    ) -> Result<Vec<ArrayRef>> {
+        let values = T::values_of(first_array(values)?)?;
+        let sums: Vec<i128> = values.values().iter().map(|&value| value.into()).collect();
+        let nulls = match opt_filter {
+            None => values.nulls().cloned(),
+            Some(filter) => {
+                ensure_rows(values.len(), filter.len(), "filter values")?;
+                // A null filter value drops the row, as `false` does.
+                let kept = filter.nulls().map_or_else(
+                    || filter.values().clone(),
+                    |filter_nulls| filter_nulls.inner() & filter.values(),
+                );
+                NullBuffer::union(values.nulls(), Some(&NullBuffer::new(kept)))
+            }
+        };
+        Ok(vec![decimal_state(sums, nulls)?])
+    }
+
+    fn size(&self) -> usize {
+        self.sums.capacity() * size_of::<i128>() + self.null_state.size()
+    }
+}
+
 #[derive(Debug, Default)]
 struct CheckedInt64Sum {
     sum: Option<i128>,
@@ -405,13 +739,13 @@ impl CheckedInt64Sum {
         if values.null_count() == values.len() {
             return Ok(());
         }
-        let mut acc = self.sum.unwrap_or(0);
-        for value in values.iter().flatten() {
-            acc = acc
-                .checked_add(i128::from(value))
-                .ok_or_else(int64_overflow)?;
-        }
-        self.sum = Some(acc);
+        let batch = if values.null_count() == 0 {
+            exact_sum_i64(values.values())
+        } else {
+            values.iter().flatten().map(i128::from).sum()
+        };
+        let acc = self.sum.unwrap_or(0);
+        self.sum = Some(acc.checked_add(batch).ok_or_else(int64_overflow)?);
         Ok(())
     }
 }
@@ -462,13 +796,13 @@ impl CheckedUInt64Sum {
         if values.null_count() == values.len() {
             return Ok(());
         }
-        let mut acc = self.sum.unwrap_or(0);
-        for value in values.iter().flatten() {
-            acc = acc
-                .checked_add(u128::from(value))
-                .ok_or_else(uint64_overflow)?;
-        }
-        self.sum = Some(acc);
+        let batch = if values.null_count() == 0 {
+            exact_sum_u64(values.values())
+        } else {
+            values.iter().flatten().map(u128::from).sum()
+        };
+        let acc = self.sum.unwrap_or(0);
+        self.sum = Some(acc.checked_add(batch).ok_or_else(uint64_overflow)?);
         Ok(())
     }
 }
@@ -1163,6 +1497,263 @@ mod state_tests {
         assert_eq!(
             acc.evaluate().expect("NULL-only frame"),
             ScalarValue::UInt64(None)
+        );
+    }
+
+    /// `xorshift64*`: seeded inputs without a dependency.
+    fn next_random(state: &mut u64) -> u64 {
+        *state ^= *state >> 12;
+        *state ^= *state << 25;
+        *state ^= *state >> 27;
+        state.wrapping_mul(0x2545_F491_4F6C_DD1D)
+    }
+
+    #[test]
+    fn exact_sums_match_an_i128_fold_on_extremes_and_seeded_values() {
+        const SEED: u64 = 0x5EED_0000_0000_0042;
+        let signed_extremes = [i64::MIN, i64::MIN + 1, -1, 0, 1, i64::MAX - 1, i64::MAX];
+        let unsigned_extremes = [
+            0,
+            1,
+            u64::from(u32::MAX),
+            u64::from(u32::MAX) + 1,
+            u64::MAX - 1,
+            u64::MAX,
+        ];
+        let mut state = SEED;
+        let mut signed_cases: Vec<Vec<i64>> = vec![vec![i64::MIN; 8_192], vec![i64::MAX; 8_192]];
+        let mut unsigned_cases: Vec<Vec<u64>> = vec![vec![u64::MAX; 8_192]];
+        for len in [0_usize, 1, 2, 3, 7, 64, 1_000, 8_192] {
+            signed_cases.push(
+                (0..len)
+                    .map(|i| {
+                        let bits = next_random(&mut state);
+                        if bits.is_multiple_of(4) {
+                            signed_extremes[i % signed_extremes.len()]
+                        } else {
+                            bits.cast_signed()
+                        }
+                    })
+                    .collect(),
+            );
+            unsigned_cases.push(
+                (0..len)
+                    .map(|i| {
+                        let bits = next_random(&mut state);
+                        if bits.is_multiple_of(4) {
+                            unsigned_extremes[i % unsigned_extremes.len()]
+                        } else {
+                            bits
+                        }
+                    })
+                    .collect(),
+            );
+        }
+        for (case, values) in signed_cases.iter().enumerate() {
+            let fold: i128 = values.iter().map(|&value| i128::from(value)).sum();
+            assert_eq!(
+                exact_sum_i64(values),
+                fold,
+                "seed {SEED:#x}, signed case {case} ({} values)",
+                values.len()
+            );
+            for chunk_len in [1, 2, 3, 1_000] {
+                assert_eq!(
+                    exact_sum_i64_in_chunks(values, chunk_len),
+                    fold,
+                    "seed {SEED:#x}, signed case {case}, chunks of {chunk_len}"
+                );
+            }
+        }
+        for (case, values) in unsigned_cases.iter().enumerate() {
+            let fold: u128 = values.iter().map(|&value| u128::from(value)).sum();
+            assert_eq!(
+                exact_sum_u64(values),
+                fold,
+                "seed {SEED:#x}, unsigned case {case} ({} values)",
+                values.len()
+            );
+            for chunk_len in [1, 2, 3, 1_000] {
+                assert_eq!(
+                    exact_sum_u64_in_chunks(values, chunk_len),
+                    fold,
+                    "seed {SEED:#x}, unsigned case {case}, chunks of {chunk_len}"
+                );
+            }
+        }
+    }
+
+    fn int64_groups(array: &ArrayRef) -> Vec<Option<i64>> {
+        array.as_primitive::<Int64Type>().iter().collect()
+    }
+
+    fn state_rows(states: &[ArrayRef]) -> Vec<Option<i128>> {
+        assert_eq!(states.len(), 1, "checked SUM has one state column");
+        assert_eq!(
+            states[0].data_type(),
+            &checked_sum_state_type(),
+            "checked SUM state type"
+        );
+        states[0].as_primitive::<Decimal128Type>().iter().collect()
+    }
+
+    #[test]
+    fn int64_groups_skip_null_and_filtered_rows_and_null_groups_with_no_value() {
+        let mut acc = CheckedSumGroups::<Int64Type>::new();
+        let filter =
+            BooleanArray::from(vec![Some(true), Some(true), Some(true), Some(false), None]);
+        acc.update_batch(
+            &[int64_col(&[Some(5), None, Some(-2), Some(7), Some(100)])],
+            &[0, 1, 0, 2, 2],
+            Some(&filter),
+            4,
+        )
+        .expect("update with a filter");
+        assert_eq!(
+            int64_groups(&acc.evaluate(EmitTo::All).expect("evaluate")),
+            vec![Some(3), None, None, None]
+        );
+    }
+
+    #[test]
+    fn int64_groups_keep_a_wide_state_that_cancels_on_merge_or_overflows_at_evaluate() {
+        let mut partial = CheckedSumGroups::<Int64Type>::new();
+        partial
+            .update_batch(
+                &[int64_col(&[Some(i64::MAX), Some(i64::MAX), Some(1)])],
+                &[0, 0, 1],
+                None,
+                2,
+            )
+            .expect("partial MAX+MAX");
+        let state = partial.state(EmitTo::All).expect("partial state");
+        assert_eq!(
+            state_rows(&state),
+            vec![Some(i128::from(i64::MAX) * 2), Some(1)]
+        );
+
+        let mut cancel = CheckedSumGroups::<Int64Type>::new();
+        cancel
+            .merge_batch(&state, &[0, 1], 2)
+            .expect("merge the partial");
+        cancel
+            .update_batch(&[int64_col(&[Some(-i64::MAX)])], &[0], None, 2)
+            .expect("add -MAX");
+        assert_eq!(
+            int64_groups(&cancel.evaluate(EmitTo::All).expect("MAX+MAX-MAX fits")),
+            vec![Some(i64::MAX), Some(1)]
+        );
+
+        let mut overflow = CheckedSumGroups::<Int64Type>::new();
+        overflow
+            .merge_batch(&state, &[0, 1], 2)
+            .expect("merge the partial");
+        let error = overflow
+            .evaluate(EmitTo::All)
+            .expect_err("MAX+MAX must overflow at evaluate");
+        assert_eq!(error.to_string(), int64_overflow().to_string());
+    }
+
+    #[test]
+    fn int64_groups_emit_first_keeps_the_remaining_groups_in_order() {
+        let mut acc = CheckedSumGroups::<Int64Type>::new();
+        acc.update_batch(
+            &[int64_col(&[Some(1), Some(2), Some(3), None])],
+            &[0, 1, 2, 3],
+            None,
+            4,
+        )
+        .expect("four groups");
+        assert_eq!(
+            int64_groups(&acc.evaluate(EmitTo::First(2)).expect("first two groups")),
+            vec![Some(1), Some(2)]
+        );
+        acc.update_batch(&[int64_col(&[Some(10), Some(20)])], &[0, 1], None, 2)
+            .expect("indices shifted down by two");
+        assert_eq!(
+            int64_groups(&acc.evaluate(EmitTo::All).expect("remaining groups")),
+            vec![Some(13), Some(20)]
+        );
+    }
+
+    #[test]
+    fn groups_convert_to_state_widens_each_row_and_round_trips_through_merge() {
+        let acc = CheckedSumGroups::<Int64Type>::new();
+        let filter = BooleanArray::from(vec![Some(true), Some(true), None, Some(true)]);
+        let state = acc
+            .convert_to_state(
+                &[int64_col(&[Some(i64::MAX), None, Some(-4), Some(9)])],
+                Some(&filter),
+            )
+            .expect("convert filtered rows");
+        assert_eq!(
+            state_rows(&state),
+            vec![Some(i128::from(i64::MAX)), None, None, Some(9)]
+        );
+        assert_eq!(
+            state_rows(
+                &acc.convert_to_state(&[int64_col(&[Some(-1), None])], None)
+                    .expect("convert unfiltered rows")
+            ),
+            vec![Some(-1), None]
+        );
+
+        let mut merged = CheckedSumGroups::<Int64Type>::new();
+        merged
+            .merge_batch(&state, &[0, 0, 0, 1], 2)
+            .expect("merge converted rows");
+        assert_eq!(
+            int64_groups(&merged.evaluate(EmitTo::All).expect("evaluate merged rows")),
+            vec![Some(i64::MAX), Some(9)]
+        );
+    }
+
+    #[test]
+    fn uint64_groups_overflow_past_max_and_reject_a_negative_partial() {
+        let mut acc = CheckedSumGroups::<UInt64Type>::new();
+        acc.update_batch(
+            &[uint64_col(&[Some(u64::MAX), Some(1), Some(5)])],
+            &[0, 0, 1],
+            None,
+            2,
+        )
+        .expect("UInt64 update");
+        let state = acc.state(EmitTo::All).expect("UInt64 state");
+        assert_eq!(
+            state_rows(&state),
+            vec![Some(i128::from(u64::MAX) + 1), Some(5)]
+        );
+
+        let mut overflow = CheckedSumGroups::<UInt64Type>::new();
+        overflow
+            .merge_batch(&state, &[0, 1], 2)
+            .expect("merge UInt64 state");
+        let error = overflow
+            .evaluate(EmitTo::All)
+            .expect_err("MAX+1 must overflow at evaluate");
+        assert_eq!(error.to_string(), uint64_overflow().to_string());
+
+        let negative = decimal_state(vec![-1], None).expect("decimal state");
+        let mut rejected = CheckedSumGroups::<UInt64Type>::new();
+        let error = rejected
+            .merge_batch(&[negative], &[0], 1)
+            .expect_err("a negative partial is out of range for UInt64");
+        assert_eq!(error.to_string(), uint64_overflow().to_string());
+    }
+
+    #[test]
+    fn groups_refuse_a_batch_whose_group_indices_do_not_cover_its_rows() {
+        let mut acc = CheckedSumGroups::<Int64Type>::new();
+        let error = acc
+            .update_batch(&[int64_col(&[Some(1), Some(2)])], &[0], None, 1)
+            .expect_err("two rows with one group index");
+        assert!(
+            matches!(
+                &error,
+                datafusion::error::DataFusionError::Internal(message)
+                    if message.starts_with("checked SUM got 1 group indices for 2 rows")
+            ),
+            "got {error}"
         );
     }
 }

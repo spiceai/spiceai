@@ -405,7 +405,6 @@ const LOCAL_COPY_PARAMS: &[&str] = &[
     "duckdb_file",
     "duckdb_data_dir",
     "sqlite_file",
-    "turso_file",
     "cayenne_s3_zone_ids",
 ];
 
@@ -445,7 +444,6 @@ fn local_copy_params(
     match engine {
         Engine::DuckDB => vec![("duckdb_file", path("duckdb"))],
         Engine::Sqlite => vec![("sqlite_file", path("sqlite"))],
-        Engine::Turso => vec![("turso_file", path("turso"))],
         _ => Vec::new(),
     }
 }
@@ -627,6 +625,19 @@ pub(crate) fn cannot_load_snapshot_message(dataset: &TableReference, cause: &str
 pub(crate) fn unavailable_engine_cause(location: &str, engine: &str) -> String {
     format!(
         "the snapshots at '{location}' were created with the '{engine}' engine, which this build of Spice does not include. Run a build that includes '{engine}'"
+    )
+}
+
+/// The error for a snapshot dataset whose snapshots were created with `engine`, an
+/// acceleration engine removed in v2.5: no build of Spice can load them.
+pub(crate) fn removed_engine_snapshot_message(
+    dataset: &TableReference,
+    location: &str,
+    engine: &str,
+) -> String {
+    format!(
+        "Failed to load dataset '{dataset}' from its snapshots, so it cannot be queried: the snapshots at '{location}' were created with the '{engine}' engine, and {}",
+        runtime_acceleration::removed_engine_message(engine)
     )
 }
 
@@ -833,7 +844,6 @@ mod tests {
         for (engine, param, suffix) in [
             (Engine::DuckDB, "duckdb_file", "duckdb"),
             (Engine::Sqlite, "sqlite_file", "sqlite"),
-            (Engine::Turso, "turso_file", "turso"),
         ] {
             let path = path_of(&source, engine, param);
             assert!(
@@ -954,25 +964,27 @@ mod tests {
     fn an_engine_the_snapshots_were_not_created_with_is_rejected() {
         let mut declared = snapshot_dataset();
         declared.acceleration = Some(spicepod_acceleration::Acceleration {
-            engine: Some("duckdb".to_string()),
+            engine: Some("arrow".to_string()),
             ..Default::default()
         });
-        let source = source(&declared);
-
-        let message = source
+        let message = source(&declared)
             .acceleration(&TableReference::bare("modules"), Engine::Cayenne)
             .expect_err("the configured engine differs")
             .to_string();
         assert_eq!(
             message,
             format!(
-                "Invalid configuration for 'acceleration.engine': Dataset 'modules' reads snapshots from 's3://bucket-b/snapshots/' that were created with the 'cayenne' engine, but `acceleration.engine` is 'duckdb'. Remove `acceleration.engine`, which a snapshot dataset takes from its snapshots. See: {SNAPSHOT_SOURCE_DOCS}"
+                "Invalid configuration for 'acceleration.engine': Dataset 'modules' reads snapshots from 's3://bucket-b/snapshots/' that were created with the 'cayenne' engine, but `acceleration.engine` is 'arrow'. Remove `acceleration.engine`, which a snapshot dataset takes from its snapshots. See: {SNAPSHOT_SOURCE_DOCS}"
             )
         );
 
+        declared.acceleration = Some(spicepod_acceleration::Acceleration {
+            engine: Some("cayenne".to_string()),
+            ..Default::default()
+        });
         assert!(
-            source
-                .acceleration(&TableReference::bare("modules"), Engine::DuckDB)
+            source(&declared)
+                .acceleration(&TableReference::bare("modules"), Engine::Cayenne)
                 .is_ok(),
             "the engine the snapshots were created with is accepted"
         );
@@ -1180,11 +1192,16 @@ mod tests {
         assert_eq!(
             cannot_load_snapshot_message(
                 &dataset,
-                &unavailable_engine_cause("s3://bucket-b/snapshots/", "turso")
+                &unavailable_engine_cause("s3://bucket-b/snapshots/", "duckdb")
             ),
             format!(
-                "Failed to load dataset 'modules' from its snapshots, so it cannot be queried: the snapshots at 's3://bucket-b/snapshots/' were created with the 'turso' engine, which this build of Spice does not include. Run a build that includes 'turso'. See: {SNAPSHOT_SOURCE_DOCS}"
+                "Failed to load dataset 'modules' from its snapshots, so it cannot be queried: the snapshots at 's3://bucket-b/snapshots/' were created with the 'duckdb' engine, which this build of Spice does not include. Run a build that includes 'duckdb'. See: {SNAPSHOT_SOURCE_DOCS}"
             )
+        );
+
+        assert_eq!(
+            removed_engine_snapshot_message(&dataset, "s3://bucket-b/snapshots/", "turso"),
+            "Failed to load dataset 'modules' from its snapshots, so it cannot be queried: the snapshots at 's3://bucket-b/snapshots/' were created with the 'turso' engine, and the acceleration engine `turso` is no longer supported as of v2.5 and cannot be used. Set `acceleration.engine: cayenne`, or remove `engine` to use the default, which is `cayenne`, then delete the old engine's acceleration files and snapshots. See: https://spiceai.org/docs/components/data-accelerators/cayenne/migration"
         );
     }
 }

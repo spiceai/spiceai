@@ -15,7 +15,7 @@
 
 [![GitHub Actions Workflow Status - build](https://img.shields.io/github/actions/workflow/status/spiceai/spiceai/build_nightly.yml?branch=trunk&label=build)](https://github.com/spiceai/spiceai/actions/workflows/build_nightly.yml?query=branch%3Atrunk)
 [![GitHub Actions Workflow Status - docker build](https://img.shields.io/github/actions/workflow/status/spiceai/spiceai/spiced_docker_dev.yml?branch=trunk&label=docker%20build)](https://github.com/spiceai/spiceai/actions/workflows/spiced_docker_dev.yml?query=branch%3Atrunk)
-[![GitHub Actions Workflow Status - unit tests](https://img.shields.io/github/actions/workflow/status/spiceai/spiceai/build_and_release.yml?branch=trunk&label=unit%20tests)](https://github.com/spiceai/spiceai/actions/workflows/build_and_release.yml?query=branch%3Atrunk)
+[![GitHub Actions Workflow Status - unit tests](https://img.shields.io/github/actions/workflow/status/spiceai/spiceai/build_release.yml?branch=trunk&label=unit%20tests)](https://github.com/spiceai/spiceai/actions/workflows/build_release.yml?query=branch%3Atrunk)
 [![GitHub Actions Workflow Status - integration tests](https://img.shields.io/github/actions/workflow/status/spiceai/spiceai/integration.yml?branch=trunk&label=integration%20tests)](https://github.com/spiceai/spiceai/actions/workflows/integration.yml?query=branch%3Atrunk)
 
 </div>
@@ -96,7 +96,7 @@ Add a sandboxed, analytics-ready replica alongside **PostgreSQL, MySQL, and Mong
 
 ### Cluster-Sidecar Architecture: localhost latency, cluster scale
 
-Each application gets a complete data plane on `localhost`. A lightweight Spice sidecar runs in the application pod, serves SQL/search/LLM-inference from a scoped working set, and transparently delegates the long tail to a central Spice cluster (Ballista distributed query, Cayenne acceleration, hybrid search indexing) over Arrow Flight. Three latency tiers: results cache (microseconds) → local working set (single-digit milliseconds) → cluster delegation. The application **never holds credentials** to Postgres, S3, Snowflake, or Iceberg — only a token to its sidecar. [Read the architecture deep dive →](https://spice.ai/blog/cluster-sidecar-architecture)
+Each application gets a complete data plane on `localhost`. A lightweight Spice sidecar runs in the application pod, serves SQL/search/LLM-inference from a scoped working set, and transparently delegates the long tail to a central Spice cluster (Ballista distributed query, Cayenne acceleration, hybrid search indexing) over Arrow Flight. Three latency tiers: results cache (microseconds) → local working set (single-digit milliseconds) → cluster delegation. The application **never holds credentials** to Postgres, S3, Snowflake, or Iceberg — only a token to its sidecar. Start one with `spiced --role sidecar`: it plans each query next to the application and sends remote Spice reads to the cluster as Substrait plans ([docs](docs/features/cluster-sidecar.md)). [Read the architecture deep dive →](https://spice.ai/blog/cluster-sidecar-architecture)
 
 ### Apache Ballista distributed query
 
@@ -104,7 +104,7 @@ Spice extends Apache Ballista with **multi-active scheduler HA coordinated throu
 
 ### Spice Cayenne — the acceleration engine that powers Spice
 
-Cayenne is built on the [Vortex columnar format](https://github.com/vortex-data/vortex) and a transactional SQLite (or Turso) metastore, and is tuned end to end for high-rate CDC ingestion and low-latency queries on the same table — multi-file acceleration without DuckDB's single-file ceiling. **Generally available** since v2.0, it runs fully in RAM (`mode: memory`) or durably on local disk or S3 Express One Zone (`mode: file`), with an optional cold tier on object storage.
+Cayenne is built on the [Vortex columnar format](https://github.com/vortex-data/vortex) and a transactional SQLite metastore, and is tuned end to end for high-rate CDC ingestion and low-latency queries on the same table — multi-file acceleration without DuckDB's single-file ceiling. **Generally available** since v2.0, it runs fully in RAM (`mode: memory`) or durably on local disk or S3 Express One Zone (`mode: file`), with an optional cold tier on object storage.
 
 - **Point lookups and selective joins** — `indexes` builds secondary indexes, so a lookup that pins every indexed column to a value reads the matching rows instead of scanning, and in `mode: file` a selective hash join probes the index with its join keys instead of scanning the table.
 - **A data layout that prunes** — In `mode: file`, `cayenne_cluster_by` (or `CREATE TABLE … CLUSTER BY`) clusters the rows in every tier's data files on one or more columns, and full refreshes write key-range files, so filtered queries open only the files that can match.
@@ -123,7 +123,7 @@ Connect to any Iceberg catalog (REST, AWS Glue, Hadoop), query tables with full 
 
 ### Petabyte-scale hybrid search
 
-Native **Amazon S3 Vectors** (Day 1 launch partner) for billions of vectors at up to 90% lower cost than traditional vector DBs. Plus DuckDB HNSW and Elasticsearch kNN as `.vectors.engine` backends. Spice manages the full lifecycle — ingestion → embedding (AWS Bedrock, Google Vertex AI, HuggingFace, OpenAI, Model2Vec for 500x faster static embeddings, multi-vector ColBERT-style late interaction with MaxSim) → indexing → query. Vector and full-text indexes serve from a warm in-memory tier by default, and full-text search pushes SQL filters down into the Tantivy index. SQL-integrated via `vector_search`, `text_search`, `rrf` (reciprocal rank fusion), and `rerank` UDTFs.
+Native **Amazon S3 Vectors** (Day 1 launch partner) for billions of vectors at up to 90% lower cost than traditional vector DBs. Plus Elasticsearch kNN as a `.vectors.engine` backend, and Cayenne indexes embedding columns for `vector_search` itself. Spice manages the full lifecycle — ingestion → embedding (AWS Bedrock, Google Vertex AI, HuggingFace, OpenAI, Model2Vec for 500x faster static embeddings, multi-vector ColBERT-style late interaction with MaxSim) → indexing → query. Vector and full-text indexes serve from a warm in-memory tier by default, and full-text search pushes SQL filters down into the Tantivy index. SQL-integrated via `vector_search`, `text_search`, `rrf` (reciprocal rank fusion), and `rerank` UDTFs.
 
 ```sql
 SELECT * FROM rerank(
@@ -341,10 +341,9 @@ Configured as `.vectors.engine` on a column-level embedding.
 | Name            | Description                                                          | Status |
 | --------------- | -------------------------------------------------------------------- | ------ |
 | `s3_vectors`    | Amazon S3 Vectors for petabyte-scale vector storage and querying     | Alpha  |
-| `duckdb`        | DuckDB with HNSW vector index                                        | Deprecated |
 | `elasticsearch`<sup>†</sup> | Elasticsearch with kNN                                  | Alpha  |
 
-The `duckdb` vector engine is deprecated in v2.4 and will be removed in v2.5, together with the DuckDB accelerator it requires. A Cayenne acceleration indexes embedding columns for `vector_search` without a `vectors` block. See the [migration guide](https://spiceai.org/docs/components/data-accelerators/cayenne/migration#migrating-the-duckdb-vector-engine).
+The `duckdb` vector engine was removed in v2.5, and a dataset or view that sets it fails to load. A Cayenne acceleration indexes embedding columns for `vector_search` without a `vectors` block. See the [migration guide](https://spiceai.org/docs/components/data-accelerators/cayenne/migration#migrating-the-duckdb-vector-engine).
 
 <sup>†</sup> Available in Spice.ai Enterprise; not included in the open-source release binaries. To use it with the open-source runtime, build with `make install SPICED_NON_DEFAULT_FEATURES=elasticsearch`.
 

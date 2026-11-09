@@ -40,13 +40,9 @@ mod anthropic;
 mod bedrock;
 mod embedding;
 mod embedding_filter_limit;
-#[cfg(feature = "duckdb")]
 mod fts_caching_restart;
-#[cfg(feature = "duckdb")]
 mod fts_restart;
 pub(crate) mod hf;
-#[cfg(feature = "duckdb")]
-mod hnsw_index;
 mod local;
 mod messages;
 mod models_http_endpoint;
@@ -626,15 +622,9 @@ pub(crate) fn get_anthropic_model(
 ) -> spicepod::component::model::Model {
     let mut model =
         spicepod::component::model::Model::new(format!("anthropic:{}", model.into()), name);
-    let secret = crate::utils::anthropic_credential_secret();
-    let param = if secret == crate::utils::ANTHROPIC_AUTH_TOKEN_SECRET {
-        "anthropic_auth_token"
-    } else {
-        "anthropic_api_key"
-    };
     model
         .params
-        .insert(param.to_string(), format!("${{ secrets:{secret} }}").into());
+        .extend(crate::utils::anthropic_credential_params());
     model
 }
 

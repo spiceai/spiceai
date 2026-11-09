@@ -21,7 +21,7 @@ use std::sync::atomic::Ordering;
 use std::time::Instant;
 
 use tokio::sync::OwnedMutexGuard;
-use turso_shared::{DEFAULT_CONCURRENT_WRITE_MAX_ATTEMPTS, retry_backoff_delay};
+use write_retry::{DEFAULT_CONCURRENT_WRITE_MAX_ATTEMPTS, retry_backoff_delay};
 
 use super::column_stats::ColumnStatsAccumulator;
 use super::context::CayenneContext;

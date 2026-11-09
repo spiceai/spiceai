@@ -240,6 +240,28 @@ pub enum CatalogError {
     ))]
     SettingsChangeRequiresRebuild { table_name: String, changes: String },
 
+    /// The data files of the table's current snapshot do not match the files the
+    /// metastore records for it (a file is missing, has a different size, or the
+    /// snapshot directory is gone), and the caller asked for such a table to be
+    /// rebuilt from the source ([`crate::metadata::SettingsChangeAction::Rebuild`]).
+    /// Worded as the cause clause the caller's message embeds.
+    #[snafu(display(
+        "the existing acceleration of dataset '{table_name}' does not match its Cayenne metastore ({damage})"
+    ))]
+    StoredDataFilesRequireRebuild { table_name: String, damage: String },
+
+    /// The data files of the table's current snapshot do not match the files the
+    /// metastore records for it, and the table cannot be rebuilt from the source
+    /// now, so serving it would answer queries with missing rows or fail them.
+    #[snafu(display(
+        "Failed to load table '{table_name}': its acceleration does not match its Cayenne metastore ({damage}), so it cannot be served. {remedy}"
+    ))]
+    StoredDataFilesDamaged {
+        table_name: String,
+        damage: String,
+        remedy: String,
+    },
+
     #[snafu(display(
         "Failed to load table {table_name}: the datalake location changed from '{stored}' to '{configured}' while published datalake files exist. Revert 'cayenne_datalake_location' to '{stored}', or delete the acceleration and re-register the dataset to publish to the new location."
     ))]
@@ -978,6 +1000,24 @@ pub trait MetadataCatalog: Send + Sync {
 
     /// Clear all manifest rows for a table.
     async fn clear_snapshot_files(&self, table_id: &str) -> CatalogResult<()>;
+
+    /// Drop the manifest rows of `file_names` (snapshot-relative file names) from
+    /// one snapshot's manifest, for files removed from the snapshot in place (for
+    /// example by file-based retention), so the manifest keeps naming only files
+    /// the snapshot still holds.
+    async fn remove_snapshot_files(
+        &self,
+        table_id: &str,
+        snapshot_id: &str,
+        file_names: &[String],
+    ) -> CatalogResult<()>;
+
+    /// Check, when reopening an existing table outside `create_table` (as
+    /// partition children are), that the data files its live snapshots record
+    /// are still on disk, with the non-rebuildable (`KeepStored`) handling:
+    /// a missing snapshot directory or a resized file is an error, and files
+    /// that are only missing are logged at WARN.
+    async fn verify_existing_stored_data_files(&self, table_name: &str) -> CatalogResult<()>;
 
     /// List every cold-tier file for a table (the cold scan's file source).
     /// Read under the scan's listing fence so the cold file set is captured

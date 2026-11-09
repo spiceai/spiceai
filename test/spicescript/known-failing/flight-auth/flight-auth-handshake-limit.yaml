@@ -1,0 +1,45 @@
+# Known failing: with API keys required, a Flight client that authenticates
+# with a handshake before each query, as `flight_client` does (and so the
+# `spice.ai` connector a sidecar reads its upstream with), is refused with
+# "Invalid credentials" from about its 10,000th query on, and so is every
+# query after, until spiced restarts. Each handshake creates a session in a
+# store capped at 10,000 (`MAX_SESSIONS` in crates/runtime/src/flight/session.rs);
+# that the cap is the cause is unverified.
+name: flight-auth-handshake-limit
+description: >
+  With API keys required, a client presenting a valid key gets every answer
+  to 11,000 Flight queries from 8 connections, and to the query after them.
+
+sources:
+  src: { kind: postgres }
+
+spicepod:
+  version: v1
+  kind: Spicepod
+  name: flight-auth-handshake-limit
+  runtime:
+    auth:
+      api-key: { enabled: true, keys: [handshake-key] }
+  datasets:
+    - { from: 'postgres:public.orders', name: orders, params: '${sources.src.params}' }
+
+defaults:
+  api-key: handshake-key
+  expect: { oracle: src }
+
+steps:
+  - generate:
+      src:
+        table: orders
+        rows: 100
+        seed: 12
+        primary-key: id
+        columns:
+          - { name: id, sequence: 1 }
+          - { name: amount, decimal: { range: [0, 1000], scale: 2 } }
+  - start: {}
+  - load:
+      queries: ['SELECT count(*) AS n, sum(amount) AS total FROM orders']
+      clients: 8
+      count: 11000
+  - query: SELECT count(*) AS n FROM orders

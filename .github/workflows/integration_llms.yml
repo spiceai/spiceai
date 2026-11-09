@@ -34,6 +34,11 @@ on:
           - all
           - hosted
           - self-hosted
+      models:
+        description: 'Comma-separated models to run instead of each group''s whole set, such as `azure,openai`. Empty runs them all.'
+        required: false
+        default: ''
+        type: string
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref_name }}-${{ github.ref_name == 'trunk' && github.sha || 'any-sha' }}
@@ -50,6 +55,7 @@ env:
 
 jobs:
   setup-matrix:
+    environment: secret-free
     name: Setup strategy matrix
     runs-on: spiceai-dev-runners
     # Evaluates one inline script.
@@ -79,19 +85,34 @@ jobs:
                 name: 'hosted',
                 needs_env: true,
                 runner,
-                // Bedrock is left out until CI has credentials that can invoke it (#13558).
-                model_allowlist: 'anthropic,openai,xai'
+                model_allowlist: 'anthropic,openai,azure,xai,bedrock'
               }
             ];
 
             if (context.eventName === 'workflow_dispatch') {
               const name = context.payload.inputs.run;
-
-              if (name === 'all') {
-                return matrix;
+              const requested = (context.payload.inputs.models || '')
+                .split(',')
+                .map(model => model.trim())
+                .filter(Boolean);
+              const groups = name === 'all' ? matrix : matrix.filter(m => m.name === name);
+              if (requested.length === 0) {
+                return groups;
               }
-
-              return matrix.filter(m => m.name === name);
+              // Keep each group's share of the requested models, and the groups that have one.
+              const narrowed = groups
+                .map(m => ({
+                  ...m,
+                  model_allowlist: m.model_allowlist
+                    .split(',')
+                    .filter(model => requested.includes(model))
+                    .join(',')
+                }))
+                .filter(m => m.model_allowlist !== '');
+              if (narrowed.length === 0) {
+                core.setFailed(`No group runs any of the requested models: ${requested.join(', ')}`);
+              }
+              return narrowed;
             }
 
             // On pull_request, only run tests that don't require secrets
@@ -108,13 +129,14 @@ jobs:
     # 2026-09-29..10-13). The `test` legs follow it there through
     # `setup-matrix`. The standard pool on every other event.
     runs-on: ${{ github.event_name == 'merge_group' && 'spiceai-macos-large' || 'spiceai-macos' }}
+    environment: ci-build
     # Slowest observed success in the 2026-07-25..08-08 window: 17 min, but
     # every sample had a warm sccache. Sized against the other macOS workspace
     # builds (pr.yml peaks at 117 min) so a cold cache cannot turn a passing
     # build into a red one.
     timeout-minutes: 300
     env:
-      HAS_SPICEIO_SECRET: ${{ secrets.UNAS_SMB_PASS != '' }}
+      HAS_SPICEIO_SECRET: ${{ secrets.SMB_PASSWORD != '' }}
       TEST_BINARY_OBJECT_KEY: test_binaries/${{ github.run_id }}/llms_integration_test
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -140,7 +162,7 @@ jobs:
         uses: spiceai/spiceio/.github/actions/setup@dd13a600d4af72fb179563000674f76812208534 # v0.11.0 assets; no gh; strips Authorization on cross-host redirect
         with:
           smb-url: smb://runner@192.168.3.148/ai_platform_dev
-          smb-pass: ${{ secrets.UNAS_SMB_PASS }}
+          smb-pass: ${{ secrets.SMB_PASSWORD }}
           token: ${{ github.token }}
           bucket: build
           region: us-west-1
@@ -160,8 +182,8 @@ jobs:
           test_binary_url="${SPICEIO_ENDPOINT%/}/build/${TEST_BINARY_OBJECT_KEY}"
           curl --fail --silent --show-error --upload-file ./llms_integration_test "$test_binary_url"
 
+      # The `test` legs run in `ci`, which has no NAS password, so they read this copy.
       - name: Upload test binary
-        if: env.HAS_SPICEIO_SECRET != 'true'
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
         with:
           name: llms-integration-test-binary
@@ -179,8 +201,22 @@ jobs:
     # Slowest observed success in the 2026-07-25..08-08 window: 4 min.
     timeout-minutes: 90
     env:
-      HAS_SPICEIO_SECRET: ${{ secrets.UNAS_SMB_PASS != '' }}
+      HAS_SPICEIO_SECRET: ${{ secrets.SMB_PASSWORD != '' }}
       TEST_BINARY_OBJECT_KEY: test_binaries/${{ github.run_id }}/llms_integration_test
+      # Workload identity federation: spiced and the tests exchange this job's GitHub OIDC token
+      # for provider access tokens with these IDs, and exchange again before each expires.
+      OPENAI_IDENTITY_PROVIDER_ID: ${{ secrets.OPENAI_IDENTITY_PROVIDER_ID }}
+      OPENAI_SERVICE_ACCOUNT_ID: ${{ secrets.OPENAI_SERVICE_ACCOUNT_ID }}
+      ANTHROPIC_FEDERATION_RULE_ID: ${{ secrets.ANTHROPIC_FEDERATION_RULE_ID }}
+      ANTHROPIC_ORGANIZATION_ID: ${{ secrets.ANTHROPIC_ORGANIZATION_ID }}
+      ANTHROPIC_SERVICE_ACCOUNT_ID: ${{ secrets.ANTHROPIC_SERVICE_ACCOUNT_ID }}
+      ANTHROPIC_WORKSPACE_ID: ${{ secrets.ANTHROPIC_WORKSPACE_ID }}
+      # Azure OpenAI authenticates as a managed identity whose federated credential trusts this
+      # job's GitHub OIDC token (subject `repo:spiceai/spiceai:environment:ci`).
+      AZURE_OPENAI_ENDPOINT: ${{ secrets.AZURE_OPENAI_ENDPOINT }}
+      AZURE_OPENAI_TENANT_ID: ${{ secrets.AZURE_OPENAI_TENANT_ID }}
+      AZURE_OPENAI_CLIENT_ID: ${{ secrets.AZURE_OPENAI_CLIENT_ID }}
+      HAS_BEDROCK_ROLE: ${{ secrets.AWS_BEDROCK_ROLE_ARN != '' }}
     strategy:
       # The two arms cover disjoint model sets — self-hosted local models and the hosted
       # providers — so one arm's result says nothing about the other's, and cancelling the
@@ -188,12 +224,14 @@ jobs:
       fail-fast: false
       matrix:
         target: ${{ fromJson(needs.setup-matrix.outputs.matrix) }}
-    # Holds the Anthropic workload identity federation IDs (`ANTHROPIC_*` secrets).
+    # Holds the OpenAI, Anthropic and Azure OpenAI workload identity federation IDs
+    # (`OPENAI_*`, `ANTHROPIC_*` and `AZURE_OPENAI_*` secrets).
     environment: ci
     permissions:
       contents: read
       actions: read
-      # Anthropic access tokens are minted from this job's GitHub OIDC token.
+      # Exchanged for OpenAI, Anthropic and Microsoft Entra access tokens: workload identity
+      # federation.
       id-token: write
 
     steps:
@@ -201,13 +239,28 @@ jobs:
         with:
           persist-credentials: false
 
+      # Bedrock: an IAM role that trusts this job's GitHub OIDC token (subject
+      # `repo:spiceai/spiceai:environment:ci`), so CI holds no AWS access key. The credentials go
+      # to the test step alone, and are assumed before spiceio starts, so no build-cache endpoint
+      # can reach the STS call.
+      - name: Assume the Bedrock role
+        if: matrix.target.needs_env && env.HAS_BEDROCK_ROLE == 'true' && contains(format(',{0},', matrix.target.model_allowlist), ',bedrock,')
+        id: bedrock-role
+        uses: aws-actions/configure-aws-credentials@e1253824e5c10ff9df46874f81ed3ec929e19cfd # v6.3.0
+        with:
+          role-to-assume: ${{ secrets.AWS_BEDROCK_ROLE_ARN }}
+          role-session-name: gha-llms-bedrock-${{ github.run_id }}
+          aws-region: us-east-1
+          output-env-credentials: false
+          output-credentials: true
+
       - name: Set up spiceio
         if: runner.os == 'macOS' && env.HAS_SPICEIO_SECRET == 'true'
         id: setup-spiceio
         uses: spiceai/spiceio/.github/actions/setup@dd13a600d4af72fb179563000674f76812208534 # v0.11.0 assets; no gh; strips Authorization on cross-host redirect
         with:
           smb-url: smb://runner@192.168.3.148/ai_platform_dev
-          smb-pass: ${{ secrets.UNAS_SMB_PASS }}
+          smb-pass: ${{ secrets.SMB_PASSWORD }}
           token: ${{ github.token }}
           bucket: build
           region: us-west-1
@@ -238,39 +291,41 @@ jobs:
       - name: Mark test binary as executable
         run: chmod +x ./integration_test/llms_integration_test
 
-      - name: Mint an Anthropic access token
-        if: matrix.target.needs_env == true
-        uses: ./.github/actions/anthropic-token
-        with:
-          federation-rule-id: ${{ secrets.ANTHROPIC_FEDERATION_RULE_ID }}
-          organization-id: ${{ secrets.ANTHROPIC_ORGANIZATION_ID }}
-          service-account-id: ${{ secrets.ANTHROPIC_SERVICE_ACCOUNT_ID }}
-          workspace-id: ${{ secrets.ANTHROPIC_WORKSPACE_ID }}
-
       - name: Run integration test
         env:
           MODEL_ALLOWLIST: ${{ matrix.target.model_allowlist }}
-          SPICE_OPENAI_API_KEY: ${{ secrets.SPICE_SECRET_OPENAI_API_KEY }}
           SPICE_XAI_API_KEY: ${{ secrets.SPICE_SECRET_XAI_API_KEY }}
+          SPICE_BEDROCK_REGION: us-east-1
+          SPICE_BEDROCK_ACCESS_KEY: ${{ steps.bedrock-role.outputs.aws-access-key-id }}
+          SPICE_BEDROCK_SECRET_KEY: ${{ steps.bedrock-role.outputs.aws-secret-access-key }}
+          SPICE_BEDROCK_SESSION_TOKEN: ${{ steps.bedrock-role.outputs.aws-session-token }}
         run: |
           # The spiceio setup action exports AWS_ENDPOINT_URL for sccache; the AWS SDK
           # honours it for every service, so leaving it set sends this suite's Bedrock
           # calls to the local build cache instead of AWS.
           unset AWS_ENDPOINT_URL
-          if [ "${{ matrix.target.needs_env }}" == "true" ]; then
-            if [ -z "$SPICE_OPENAI_API_KEY" ]; then
-              echo "Error: 'SPICE_OPENAI_API_KEY' is not defined."
+          # Bedrock runs as the CI role (`AWS_BEDROCK_ROLE_ARN`): until the `ci` environment has
+          # one, the other providers still run, and the run says Bedrock did not.
+          if [[ ",${MODEL_ALLOWLIST}," == *",bedrock,"* && "${HAS_BEDROCK_ROLE}" != "true" ]]; then
+            echo "::warning::AWS_BEDROCK_ROLE_ARN is not set in the ci environment, so this run does not test Bedrock. Create the Bedrock CI role and set the secret."
+            MODEL_ALLOWLIST=$(printf '%s' "$MODEL_ALLOWLIST" | tr ',' '\n' | grep -vx bedrock | paste -sd, - || true)
+            if [ -z "$MODEL_ALLOWLIST" ]; then
+              echo "::error::This run tests only Bedrock, which needs AWS_BEDROCK_ROLE_ARN."
               exit 1
             fi
-            if [ -z "${SPICE_ANTHROPIC_AUTH_TOKEN:-}" ]; then
-              echo "Error: 'SPICE_ANTHROPIC_AUTH_TOKEN' is not defined."
-              exit 1
-            fi
-            if [ -z "$SPICE_XAI_API_KEY" ]; then
-              echo "Error: 'SPICE_XAI_API_KEY' is not defined."
-              exit 1
-            fi
+            export MODEL_ALLOWLIST
           fi
+          # Each provider's credential is required only when the run tests that provider.
+          runs() { [[ ",${MODEL_ALLOWLIST}," == *",$1,"* ]]; }
+          for check in openai:OPENAI_IDENTITY_PROVIDER_ID anthropic:ANTHROPIC_FEDERATION_RULE_ID \
+            azure:AZURE_OPENAI_CLIENT_ID xai:SPICE_XAI_API_KEY; do
+            model="${check%%:*}"
+            variable="${check#*:}"
+            if runs "$model" && [ -z "${!variable:-}" ]; then
+              echo "Error: '${variable}' is not defined, so the ${model} tests cannot authenticate."
+              exit 1
+            fi
+          done
           test_binary=./integration_test/llms_integration_test
           # The live-provider tests live under `integration.rs`'s `llms` module; the
           # binary's other modules are credential-free and run in `make nextest`.
@@ -309,10 +364,11 @@ jobs:
         run: kill ${{ steps.setup-spiceio.outputs.pid }} || true
 
   llama-cpp-engine:
+    environment: secret-free
     name: llama.cpp engine (Qwen3-0.6B GGUF)
-    # The engine's model and differential tests download Qwen3-0.6B (639 MB), and its MTP
-    # tests Qwen3.5-0.8B (550 MB), from Hugging Face and run them; its no-network tests run
-    # in `make nextest`.
+    # The engine's model, differential and greedy-pick tests download Qwen3-0.6B (639 MB), its
+    # MTP tests Qwen3.5-0.8B (550 MB), and its content-part tests both, from Hugging Face and run
+    # them; its no-network tests run in `make nextest`.
     if: github.event_name != 'workflow_dispatch' || inputs.run != 'hosted'
     runs-on: ${{ github.event_name == 'merge_group' && 'spiceai-macos-large' || 'spiceai-macos' }}
     # Sized like the build job above: a cold cache rebuilds llama.cpp and mistral.rs.
@@ -330,10 +386,10 @@ jobs:
       - name: Set up the C and C++ toolchain
         uses: ./.github/actions/setup-cc
 
-      - name: Run the llama.cpp engine's model, differential, Harmony, MTP, prefix-reuse, Hugging Face resolution and unsupported-architecture tests
+      - name: Run the llama.cpp engine's model, content-part, differential, greedy-pick, Harmony, MTP, prefix-reuse, Hugging Face resolution and unsupported-architecture tests
         env:
           # Metal runners do not have `xcrun metal`
           # See `https://github.com/EricLBuehler/mistral.rs/pull/1311`
           MISTRALRS_METAL_PRECOMPILE: 0
         run: |
-          cargo test -p llms-llamacpp --features metal --test integration -- model:: differential:: distributed:: harmony:: mtp:: prefix_reuse:: hf_resolution:: unsupported::
+          cargo test -p llms-llamacpp --features metal --test integration -- model:: content_parts:: differential:: distributed:: greedy:: harmony:: mtp:: prefix_reuse:: hf_resolution:: unsupported::

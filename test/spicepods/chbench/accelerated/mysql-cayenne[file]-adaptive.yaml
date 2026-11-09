@@ -149,6 +149,7 @@ datasets:
         cayenne_datalake_s3_endpoint: ${secrets:S3_ENDPOINT}
         cayenne_datalake_s3_key: ${secrets:S3_KEY}
         cayenne_datalake_s3_secret: ${secrets:S3_SECRET}
+        cayenne_datalake_s3_session_token: ${secrets:S3_SESSION_TOKEN}
         cayenne_datalake_s3_allow_http: 'true'
 
   - from: mysql:customer

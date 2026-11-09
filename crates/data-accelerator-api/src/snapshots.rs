@@ -215,7 +215,7 @@ pub async fn download_snapshot(
 /// downloads it.
 ///
 /// Thin composition of [`should_download_snapshot`] and [`download_snapshot`], kept for
-/// callers (`DuckDB`, `SQLite`, Turso) that make the decision and perform the download at
+/// callers (`DuckDB`, `SQLite`) that make the decision and perform the download at
 /// the same point in their startup, with no side-effecting setup of their own in
 /// between.
 ///

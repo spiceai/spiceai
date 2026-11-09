@@ -98,6 +98,11 @@ impl CheckedIntegerOp {
         }
     }
 
+    /// The operator this kernel checks.
+    pub(crate) fn op(&self) -> Operator {
+        self.op
+    }
+
     fn kernel(
         &self,
     ) -> fn(

@@ -27,7 +27,10 @@ use super::{
 use crate::accelerated::AcceleratedTable;
 use crate::cluster::ExecutorRegistry;
 use crate::cluster::ResolvedClusterConfig;
-use crate::{config::ClusterRole, status};
+use crate::{
+    config::{ClusterRole, Role},
+    status,
+};
 use crate::{dataaccelerator::AcceleratorEngineRegistry, datafusion::SPICE_SCP_SCHEMA};
 use cache::Caching;
 use cayenne::optimizer_rules::{
@@ -97,7 +100,7 @@ use runtime_datafusion_index::analyzer::IndexTableScanExtensionPlanner;
 use runtime_metrics::telemetry::track_bytes_processed;
 use runtime_object_store::registry::SpiceObjectStoreRegistry;
 use spicepod::component::runtime::{
-    CteMaterialization, QueryErrorLogging, RuntimeMode, SpillCompression as SpiceSpillCompression,
+    CteMaterialization, QueryErrorLogging, SpillCompression as SpiceSpillCompression,
 };
 use spicepod::metric::Metrics;
 use tokio::{
@@ -342,7 +345,7 @@ pub struct DataFusionBuilder {
     accelerator_engine_registry: Arc<AcceleratorEngineRegistry>,
     memory_limit: Option<u64>,
     target_partitions: Option<usize>,
-    runtime_mode: RuntimeMode,
+    role: Role,
     prefer_hash_join: Option<bool>,
     eager_aggregation: Option<bool>,
     eager_aggregation_min_reduction_factor: Option<usize>,
@@ -477,7 +480,7 @@ impl DataFusionBuilder {
             accelerator_engine_registry,
             memory_limit: None,
             target_partitions: None,
-            runtime_mode: RuntimeMode::default(),
+            role: Role::default(),
             prefer_hash_join: None,
             eager_aggregation: None,
             eager_aggregation_min_reduction_factor: None,
@@ -591,10 +594,11 @@ impl DataFusionBuilder {
         self
     }
 
-    /// Selects the defaults for settings the Spicepod leaves unset.
+    /// The `--role` this runtime started with, which selects the defaults for
+    /// settings the Spicepod leaves unset.
     #[must_use]
-    pub fn runtime_mode(mut self, runtime_mode: RuntimeMode) -> Self {
-        self.runtime_mode = runtime_mode;
+    pub fn role(mut self, role: Role) -> Self {
+        self.role = role;
         self
     }
 
@@ -994,9 +998,9 @@ impl DataFusionBuilder {
             // across the whole node. Size from the CPU budget instead, which is
             // the same number wherever detection was already correct.
             let budget = cpu_budget::cpu_budget();
-            let target_partitions = match self.runtime_mode {
-                RuntimeMode::Server => budget.target_partitions(),
-                RuntimeMode::Sidecar => budget.sidecar_target_partitions(),
+            let target_partitions = match self.role {
+                Role::Sidecar => budget.sidecar_target_partitions(),
+                Role::Server | Role::Scheduler | Role::Executor => budget.target_partitions(),
             };
             config = config.with_target_partitions(target_partitions);
             tracing::info!(
@@ -1177,7 +1181,9 @@ impl DataFusionBuilder {
         )));
 
         if matches!(
-            self.cluster_config.as_ref().and_then(|cfg| cfg.role()),
+            self.cluster_config
+                .as_ref()
+                .and_then(|cfg| cfg.effective_role()),
             Some(ClusterRole::Scheduler)
         ) {
             // Pushes partial aggregates into per-executor Flight SQL. Checked
@@ -1510,6 +1516,7 @@ impl DataFusionBuilder {
             cdc_apply_runtime: OnceLock::new(),
             compaction_runtime: OnceLock::new(),
             compaction_runtime_env,
+            internal_table_ctx: OnceLock::new(),
             compaction_memory_bytes,
             query_memory_pool_bytes,
             mem_tier_budget_bytes,
@@ -1519,6 +1526,7 @@ impl DataFusionBuilder {
             metrics: self.metrics,
             resource_monitor: self.resource_monitor,
             cluster_config: self.cluster_config.unwrap_or_default(),
+            role: self.role,
             scheduler_server: RwLock::new(None),
             executor: RwLock::new(None),
             executor_stream_registry: RwLock::new(None),
@@ -4274,6 +4282,201 @@ mod tests {
         assert_eq!(
             rows, expected_rows,
             "the unrewritten plan returned wrong rows"
+        );
+    }
+
+    /// Runs `NOT IN` queries whose subquery yields a NULL, then counts, over a
+    /// parquet table in a session built with `eager_aggregation`. Returns whether
+    /// the `count(id)` plan pre-aggregates below the join, that plan rendered, and
+    /// each query with every row it returned (or the error it raised).
+    #[cfg(not(windows))]
+    async fn count_over_a_null_aware_anti_join_on_parquet(
+        eager_aggregation: bool,
+    ) -> (bool, String, Vec<(&'static str, String)>) {
+        use datafusion::parquet::data_type::{Int32Type, Int64Type};
+        use datafusion::parquet::file::properties::WriterProperties;
+        use datafusion::parquet::file::writer::SerializedFileWriter;
+        use datafusion::parquet::schema::parser::parse_message_type;
+        use datafusion::prelude::ParquetReadOptions;
+
+        // 20,000 rows; `qty` has 17 distinct values and every tenth row is NULL.
+        // The rule's cost gate reads the number of distinct values from the
+        // file's column statistics and declines the push without it. A writer
+        // that records it, as DuckDB does, is what puts this file within the
+        // rule's reach, so the column chunk is written with that statistic.
+        let dir = tempfile::tempdir().expect("temp dir");
+        let path = dir.path().join("t.parquet");
+        let schema = Arc::new(
+            parse_message_type("message t { optional int64 id; optional int32 qty; }")
+                .expect("parse the parquet schema"),
+        );
+        let mut writer = SerializedFileWriter::new(
+            std::fs::File::create(&path).expect("create the parquet file"),
+            schema,
+            Arc::new(WriterProperties::builder().build()),
+        )
+        .expect("open the parquet writer");
+        let mut row_group = writer.next_row_group().expect("start the row group");
+
+        let ids: Vec<i64> = (1..=20_000).collect();
+        let mut id = row_group
+            .next_column()
+            .expect("open the id column")
+            .expect("the id column");
+        let present = vec![1_i16; ids.len()];
+        id.typed::<Int64Type>()
+            .write_batch_with_statistics(
+                &ids,
+                Some(present.as_slice()),
+                None,
+                Some(&1),
+                Some(&20_000),
+                None,
+            )
+            .expect("write the id column");
+        id.close().expect("close the id column");
+
+        let qty: Vec<Option<i32>> = (1..=20_000_i32)
+            .map(|i| if i % 10 == 0 { None } else { Some(i % 17 - 8) })
+            .collect();
+        let definition_levels: Vec<i16> = qty.iter().map(|v| i16::from(v.is_some())).collect();
+        let values: Vec<i32> = qty.iter().flatten().copied().collect();
+        let mut qty = row_group
+            .next_column()
+            .expect("open the qty column")
+            .expect("the qty column");
+        qty.typed::<Int32Type>()
+            .write_batch_with_statistics(
+                &values,
+                Some(definition_levels.as_slice()),
+                None,
+                Some(&-8),
+                Some(&8),
+                Some(17),
+            )
+            .expect("write the qty column");
+        qty.close().expect("close the qty column");
+        row_group.close().expect("close the row group");
+        writer.close().expect("close the parquet file");
+        let path = path.to_str().expect("utf-8 path");
+
+        let df = DataFusionBuilder::new(
+            status::RuntimeStatus::new(),
+            Arc::new(AcceleratorEngineRegistry::default()),
+            tokio::runtime::Handle::current(),
+        )
+        .eager_aggregation(Some(eager_aggregation))
+        .build();
+        df.ctx
+            .register_parquet("t", path, ParquetReadOptions::default())
+            .await
+            .expect("register the parquet table");
+
+        let plan = df
+            .ctx
+            .sql("SELECT count(id) FROM t WHERE qty NOT IN (SELECT NULL::INT)")
+            .await
+            .expect("plan the query")
+            .create_physical_plan()
+            .await
+            .expect("build the physical plan");
+        let rendered = datafusion::physical_plan::displayable(plan.as_ref())
+            .indent(true)
+            .to_string();
+
+        let mut results = Vec::new();
+        for query in [
+            "SELECT count(*) FROM t WHERE qty NOT IN (SELECT qty FROM t WHERE id <= 50)",
+            "SELECT count(*) FROM t WHERE qty NOT IN (SELECT NULL::INT)",
+            "SELECT count(id) FROM t WHERE qty NOT IN (SELECT NULL::INT)",
+            "SELECT coalesce(count(*), 42) FROM t WHERE qty NOT IN (SELECT NULL::INT)",
+            // Control: the subquery has no NULL, so rows survive the anti join.
+            "SELECT count(*) FROM t WHERE qty NOT IN (SELECT qty FROM t WHERE id <= 9)",
+        ] {
+            let value = match df.ctx.sql(query).await {
+                Ok(frame) => match frame.collect().await {
+                    Ok(batches) => {
+                        // Every row, so a second row from an ungrouped aggregate
+                        // fails the comparison instead of passing unseen.
+                        let mut rows = Vec::new();
+                        for batch in &batches {
+                            assert_eq!(batch.num_columns(), 1, "{query} returns one column");
+                            let column = batch.column(0);
+                            for row in 0..batch.num_rows() {
+                                rows.push(if column.is_null(row) {
+                                    "NULL".to_string()
+                                } else {
+                                    arrow::util::display::array_value_to_string(column, row)
+                                        .expect("format the value")
+                                });
+                            }
+                        }
+                        if rows.is_empty() {
+                            "<no rows>".to_string()
+                        } else {
+                            rows.join(" | ")
+                        }
+                    }
+                    Err(e) => format!("error: {e}"),
+                },
+                Err(e) => format!("error: {e}"),
+            };
+            results.push((query, value));
+        }
+        (aggregates_below_a_join(&plan, false), rendered, results)
+    }
+
+    /// `count` over a `NOT IN` whose subquery holds a NULL is 0: the null-aware
+    /// anti join emits no rows and an ungrouped aggregate still emits one. With eager
+    /// aggregation the pushed partial count is merged by a `SUM`, which is NULL over
+    /// no rows, so `count(id)` returned NULL and `count(*)` failed its non-nullable
+    /// schema check. The disabled session is the control, and the plan check shows
+    /// the rule fires, so the enabled run exercises the rewrite.
+    #[tokio::test]
+    #[cfg(not(windows))]
+    async fn count_over_not_in_with_a_null_is_zero_under_eager_aggregation() {
+        let expected = vec![
+            (
+                "SELECT count(*) FROM t WHERE qty NOT IN (SELECT qty FROM t WHERE id <= 50)",
+                "0".to_string(),
+            ),
+            (
+                "SELECT count(*) FROM t WHERE qty NOT IN (SELECT NULL::INT)",
+                "0".to_string(),
+            ),
+            (
+                "SELECT count(id) FROM t WHERE qty NOT IN (SELECT NULL::INT)",
+                "0".to_string(),
+            ),
+            (
+                "SELECT coalesce(count(*), 42) FROM t WHERE qty NOT IN (SELECT NULL::INT)",
+                "0".to_string(),
+            ),
+            (
+                "SELECT count(*) FROM t WHERE qty NOT IN (SELECT qty FROM t WHERE id <= 9)",
+                "8467".to_string(),
+            ),
+        ];
+
+        let (pushed, plan, results) = count_over_a_null_aware_anti_join_on_parquet(true).await;
+        assert!(
+            pushed,
+            "with eager aggregation enabled the count has to be pre-aggregated below the \
+             anti join, or this test no longer exercises the rewrite: {plan}"
+        );
+        assert_eq!(
+            results, expected,
+            "eager aggregation changed a count: {plan}"
+        );
+
+        let (pushed, plan, results) = count_over_a_null_aware_anti_join_on_parquet(false).await;
+        assert!(
+            !pushed,
+            "with eager aggregation disabled nothing may be pre-aggregated below the join: {plan}"
+        );
+        assert_eq!(
+            results, expected,
+            "the unrewritten plan returned a wrong count"
         );
     }
 
