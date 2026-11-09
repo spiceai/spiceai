@@ -147,6 +147,16 @@ jobs:
         env:
           RUSTC_WRAPPER: ${{ env.RUSTC_WRAPPER }}
 
+      # `tools/spiceschema` builds `runtime` with `openapi`, `models` and `mcp` but not the
+      # connector features, a set no step above compiles (`models` and `mcp` are excluded
+      # from the powerset). Nothing else builds it before merge: `generate-openapi.yml` runs
+      # only on `trunk` pushes, so a break here shows up there after the merge, and trunk's
+      # OpenAPI spec stops regenerating until someone fixes it.
+      - name: Check tools/spiceschema
+        run: cargo check -p spiceschema --profile lint
+        env:
+          RUSTC_WRAPPER: ${{ env.RUSTC_WRAPPER }}
+
       - name: Show sccache stats
         if: always() && (runner.os == 'macOS' && env.SCCACHE_SETUP == 'true' && steps.setup-spiceio.outputs.endpoint != '')
         # `always()`: this is the one step that reports cache health, and without it
