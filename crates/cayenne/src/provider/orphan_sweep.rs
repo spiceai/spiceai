@@ -23,8 +23,9 @@ limitations under the License.
 //!   and it sits in a live (current or protected) snapshot directory, a staging
 //!   directory without a staging WAL, a compaction's scratch directory, or a
 //!   snapshot directory nothing refers to. A retired directory (the
-//!   retired-directory sweep's) and a directory an open reader holds or listed
-//!   recently are skipped whole;
+//!   retired-directory sweep's: one this process retired, or one the committed
+//!   retirement record names until that sweep forgets it) and a directory an
+//!   open reader holds or listed recently are skipped whole;
 //! - no write of this process still holds it ([`super::uncommitted_files`]),
 //!   whatever its age, so an upload or a commit still in flight keeps its files;
 //! - it is older than the age floor, measured on the store's clock: its
@@ -33,6 +34,8 @@ limitations under the License.
 //!
 //! The sweep does not run while the table's state cannot be read (a commit whose
 //! outcome is unknown stops the dataset's log until it reads its state back),
+//! while its retirement record is not settled (a change applied but not
+//! committed, or a transaction reserving the table),
 //! while an earlier write of the table could not learn whether it committed, or
 //! while a transaction across datasets is prepared on the table: a prepared
 //! transaction names files its commit would add. A file is never adopted.

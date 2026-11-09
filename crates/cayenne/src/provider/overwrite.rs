@@ -955,6 +955,9 @@ impl CayenneTableProvider {
     async fn remove_unpublished_snapshot_dir(&self, snapshot_id: &str) {
         if self.data_in_store() {
             self.remove_unpublished_snapshot_objects(snapshot_id).await;
+            // Discarded: what its writer recorded is no longer a write in flight,
+            // and anything left under it is the orphan sweep's.
+            self.uncommitted_files().forget(snapshot_id);
             return;
         }
         let snapshot_dir = self.snapshot_dir_path_for(snapshot_id);

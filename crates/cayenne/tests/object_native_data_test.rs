@@ -1942,7 +1942,12 @@ async fn scans_under_store_latency_are_stable(stream: ChangeStream) {
         wrong[0]
     );
 
-    // Quiesced: the count answered from statistics equals a forced scan's.
+    // Quiesced: the count answered from statistics equals a forced scan's. A
+    // table that reuses scan views within a lag may answer from a view captured
+    // up to that lag before the last apply, so the comparison waits it out.
+    if stream == ChangeStream::RuntimeDefaults {
+        tokio::time::sleep(Duration::from_millis(1_100)).await;
+    }
     let stats_count = count_and_sum(&ctx, name).await.0;
     let exact = sorted_rows(&ctx, name).await.len();
     assert_eq!(usize::try_from(stats_count).expect("count"), exact);
@@ -2132,4 +2137,116 @@ async fn sealed_rows_inline_against_data_files() {
         inline.log_bytes > 0 && files.data_bytes > 0,
         "both arms wrote"
     );
+}
+
+/// A first keyed load of a dataset in the location whose input repeats keys
+/// rewrites the files that hold superseded copies before it commits: the
+/// committed snapshot names the rewritten files, never the ones the rewrite
+/// deleted, so a scan and a restart read the last arrival of every key.
+#[tokio::test]
+async fn a_first_keyed_load_with_repeated_keys_names_only_the_files_it_keeps() {
+    let (setup, catalog, _table, _ctx) = create("anchor").await;
+    let (data_url, data_prefix, table, ctx) =
+        add_dataset(&setup, &catalog, "loaded", &["id"]).await;
+    // 8 batches of the same 500 keys: each key arrives once per batch, the
+    // last batch with the highest `v`, so the survivors are `v` in 3501..=4000.
+    let batches: Vec<arrow::array::RecordBatch> = (0..8_i64)
+        .map(|batch| {
+            arrow::array::RecordBatch::try_new(
+                schema(),
+                vec![
+                    Arc::new(Int64Array::from_iter_values(0..500)),
+                    Arc::new(Int64Array::from_iter_values(
+                        (1..=500).map(|row| batch * 500 + row),
+                    )),
+                ],
+            )
+            .expect("batch")
+        })
+        .collect();
+    let input = datafusion::datasource::memory::MemorySourceConfig::try_new_exec(
+        &[batches],
+        schema(),
+        None,
+    )
+    .expect("input");
+    let insert = table
+        .insert_into(&ctx.state(), input, datafusion_expr::dml::InsertOp::Append)
+        .await
+        .expect("plan the load");
+    datafusion::physical_plan::collect(insert, ctx.task_ctx())
+        .await
+        .expect("load");
+    let survivors = (500, (3501..=4000).sum::<i64>());
+    assert_eq!(
+        count_and_sum(&ctx, "loaded").await,
+        survivors,
+        "the load keeps the last arrival of every key"
+    );
+    table.drain_in_flight_maintenance().await.expect("drain");
+    // Every file the committed state names is in the store.
+    let stored: std::collections::HashSet<String> = objects_under(&setup, &data_prefix, ".vortex")
+        .await
+        .into_iter()
+        .collect();
+    let metadata = catalog.get_table("loaded").await.expect("table");
+    let named = catalog
+        .get_all_snapshot_files(&metadata.table_id)
+        .await
+        .expect("manifest");
+    assert!(!named.is_empty(), "the load committed data files");
+    for file in &named {
+        let key = format!(
+            "{data_prefix}/{}/{}/{}",
+            metadata.table_id, file.snapshot_id, file.file_path
+        );
+        assert!(
+            stored.contains(&key),
+            "the committed state names '{key}', which the store lacks; stored: {stored:?}"
+        );
+    }
+    drop((table, ctx, catalog));
+    let (_catalog, _table, ctx) = reopen_in(&setup.store, &data_url, "loaded").await;
+    assert_eq!(
+        count_and_sum(&ctx, "loaded").await,
+        survivors,
+        "a restart reads the same rows"
+    );
+}
+
+/// A dataset's data path is recorded relative to the location and read back
+/// resolved against the URL the catalog was opened at: the catalog recognizes
+/// its datasets' data in both forms, and only under that URL, so a drop deletes
+/// the folder of a copied location and never takes another bucket's data for
+/// its own.
+#[tokio::test]
+async fn the_catalog_recognizes_its_datasets_data_in_both_recorded_forms() {
+    let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let catalog = ObjectNativeCatalog::open_or_create_at(
+        Arc::clone(&store),
+        Path::from("moved/cayenne/v1/catalog"),
+        "s3://bucket/moved/cayenne/v1",
+    )
+    .await
+    .expect("open the catalog");
+    catalog.init().await.expect("init");
+    let cases = [
+        ("s3://bucket/moved/cayenne/v1/datasets/orders-1/data", true),
+        ("s3://bucket/moved/cayenne/v1/datasets/orders-1/data/", true),
+        ("datasets/orders-1/data", true),
+        ("datasets/orders-1/data/", true),
+        ("datasets/orders-1/log", false),
+        ("datasets//data", false),
+        ("s3://other/moved/cayenne/v1/datasets/orders-1/data", false),
+        ("s3://bucket/state/cayenne/v1/datasets/orders-1/data", false),
+        ("s3://bucket/moved/cayenne/v1/datasets/orders-1/log", false),
+        ("/var/spice/data/orders", false),
+    ];
+    for (path, expected) in cases {
+        assert_eq!(
+            catalog.holds_data_at(path),
+            expected,
+            "holds_data_at({path})"
+        );
+    }
 }

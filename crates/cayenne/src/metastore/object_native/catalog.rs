@@ -997,18 +997,38 @@ impl ObjectNativeCatalog {
             .push(readers);
     }
 
-    /// Whether `path`, a table's recorded data path, is a dataset folder's data in
-    /// this catalog's location: its files go with the dataset's folder when the
-    /// dataset is dropped.
+    /// Whether `path`, a table's data path, is a dataset folder's data in this
+    /// catalog's location: its files go with the dataset's folder when the dataset
+    /// is dropped. `path` is either the absolute URL a read of the table returns
+    /// (the state records it relative to the location and resolves it against the
+    /// URL the catalog was opened at) or the relative form itself,
+    /// `datasets/<folder>/data`.
     #[must_use]
     pub fn holds_data_at(&self, path: &str) -> bool {
-        let Ok(url) = url::Url::parse(path) else {
-            return false;
+        let in_datasets = match url::Url::parse(path) {
+            Ok(url) => {
+                // Opened at a location URL: the data must be under that URL, not
+                // under the same key prefix of another bucket.
+                if let Some(anchor) = self.anchor.as_deref()
+                    && !path
+                        .strip_prefix(anchor)
+                        .is_some_and(|rest| rest.starts_with('/'))
+                {
+                    return false;
+                }
+                url.path()
+                    .trim_matches('/')
+                    .strip_prefix(self.datasets.as_ref())
+                    .and_then(|rest| rest.strip_prefix('/'))
+                    .map(str::to_string)
+            }
+            Err(_) => path
+                .trim_matches('/')
+                .strip_prefix("datasets/")
+                .map(str::to_string),
         };
-        url.path()
-            .trim_matches('/')
-            .strip_prefix(self.datasets.as_ref())
-            .and_then(|rest| rest.strip_prefix('/'))
+        in_datasets
+            .as_deref()
             .and_then(|rest| rest.split_once('/'))
             .is_some_and(|(folder, rest)| {
                 !folder.is_empty() && (rest == "data" || rest.starts_with("data/"))

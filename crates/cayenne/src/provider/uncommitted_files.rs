@@ -76,6 +76,21 @@ impl UncommittedFiles {
         self.by_snapshot.lock().contains_key(snapshot_id)
     }
 
+    /// Stops holding the files `names` of `snapshot_id`, which its writer
+    /// deleted before any commit named them (a rewrite replaced them). The
+    /// snapshot stays held: its writer is still building it.
+    pub(crate) fn drop_files<'a>(
+        &self,
+        snapshot_id: &str,
+        names: impl IntoIterator<Item = &'a str>,
+    ) {
+        if let Some(files) = self.by_snapshot.lock().get_mut(snapshot_id) {
+            for name in names {
+                files.remove(name);
+            }
+        }
+    }
+
     /// Stops tracking `snapshot_id`: its files are now named by a commit, or the
     /// writer discarded the snapshot.
     pub(crate) fn forget(&self, snapshot_id: &str) {

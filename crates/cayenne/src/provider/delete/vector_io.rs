@@ -1016,10 +1016,9 @@ async fn fetch_deletion_vector(storage: &DatasetStorage, path: &str) -> FetchedD
                 // lost, and reading on without it would bring back rows the
                 // dataset deleted.
                 Err(object_store::Error::NotFound { .. }) if storage.in_location() => {
-                    return FetchedDeletionVector::Lost(storage.missing(
-                        crate::dataset_storage::DataFileKind::Deletion,
-                        &location,
-                    ));
+                    return FetchedDeletionVector::Lost(
+                        storage.missing(crate::dataset_storage::DataFileKind::Deletion, &location),
+                    );
                 }
                 Err(object_store::Error::NotFound { .. }) => {
                     Err(std::io::Error::from(std::io::ErrorKind::NotFound))
@@ -1116,7 +1115,9 @@ pub async fn read_deletion_vectors(
                 }
                 FetchedDeletionVector::Local => open_local_deletion_vector(&delete_file.path),
                 FetchedDeletionVector::Lost(error) => {
-                    return Err(datafusion_common::DataFusionError::External(Box::new(error)));
+                    return Err(datafusion_common::DataFusionError::External(Box::new(
+                        error,
+                    )));
                 }
             };
             state.add(&delete_file, opened)?;

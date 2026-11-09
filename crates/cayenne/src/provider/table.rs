@@ -9254,6 +9254,12 @@ impl CayenneTableProvider {
                 Vec::new()
             };
             let has_rows = all_rows.iter().any(|row| row.snapshot_id == id);
+            // A write of this process still building files under the snapshot
+            // (one that began before the commit retired it) keeps it until the
+            // write ends: a listing below would find files nothing names yet.
+            if self.uncommitted_files.holds_snapshot(&id) {
+                continue;
+            }
             let doomed = if durable.is_some() && has_rows {
                 named
             } else {
@@ -15779,6 +15785,13 @@ impl CayenneTableProvider {
         }
         let mut removed = outcome.deleted;
         removed.extend(outcome.missing);
+        // The snapshot's files are what its writer recorded, and a file it
+        // deleted is no longer one of them: the manifest authored from the
+        // record before the commit must not name it.
+        self.uncommitted_files.drop_files(
+            snapshot_id,
+            removed.iter().filter_map(ObjectStorePath::filename),
+        );
         self.invalidate_retired_paths(removed).await;
         // The query that found the superseded copies listed this directory
         // through the shared list-files cache, and nothing else is guaranteed to
@@ -23702,12 +23715,21 @@ impl CayenneTableProvider {
             std::time::Duration::from_millis(self.orphan_age_floor_ms.load(Ordering::Acquire));
 
         let live = self.live_snapshot_ids_for_sweep().await?;
+        // Snapshots the committed retirement record names belong to the
+        // retired-snapshot sweep until it forgets them; without a settled record
+        // (a change not committed yet, an unknown outcome, a reservation) the
+        // sweep cannot tell which they are, so it does not run.
+        let Some(durably_retired) = self.durably_retired_snapshots().await? else {
+            report.skipped = Some("the table's retired snapshots are not settled");
+            return Ok(report);
+        };
         // Directories other sweeps own or readers hold, skipped whole: retired
         // ones, and ones a scan holds or listed within the cleanup grace.
         let untouchable: HashSet<String> = {
             let (_, in_use) = self.snapshot_cleanup_pins();
             let mut untouchable = in_use;
             untouchable.extend(self.retired_snapshot_dirs.lock().keys().cloned());
+            untouchable.extend(durably_retired.iter().cloned());
             untouchable
         };
         let objects: Vec<ObjectMeta> = store
@@ -23765,10 +23787,15 @@ impl CayenneTableProvider {
         // A directory that left the live set since the listing (a compaction
         // retired it) belongs to the retired-directory sweep now.
         let live_now = self.live_snapshot_ids_for_sweep().await?;
+        let Some(durably_retired_now) = self.durably_retired_snapshots().await? else {
+            report.skipped = Some("the table's retired snapshots are not settled");
+            return Ok(report);
+        };
         let untouchable_now: HashSet<String> = {
             let (_, in_use) = self.snapshot_cleanup_pins();
             let mut untouchable = in_use;
             untouchable.extend(self.retired_snapshot_dirs.lock().keys().cloned());
+            untouchable.extend(durably_retired_now);
             untouchable
         };
         let mut doomed = Vec::new();
@@ -23844,6 +23871,20 @@ impl CayenneTableProvider {
             );
         }
         Ok(report)
+    }
+
+    /// The snapshots the catalog's committed retirement record names, for the
+    /// orphan sweep: `Some(empty)` for a catalog that keeps no record, `None`
+    /// while the record is not settled.
+    async fn durably_retired_snapshots(&self) -> Result<Option<HashSet<String>>> {
+        if !self.catalog.keeps_retirement_record() {
+            return Ok(Some(HashSet::new()));
+        }
+        Ok(self
+            .catalog
+            .retired_snapshots(&self.table_metadata.table_id)
+            .await?
+            .map(|ids| ids.into_iter().collect()))
     }
 
     /// The table's current and protected snapshot ids, from this instance's
@@ -24464,23 +24505,28 @@ impl CayenneTableProvider {
         let mut unlinked_files = 0_u64;
         let mut unlinked_bytes = 0_u64;
         let mut failed_unlinks = 0_usize;
+        let mut deleted = self.delete_deletion_vector_objects(orphaned).await;
         for df in orphaned {
-            let deleted = match self.dataset_storage.as_ref() {
-                Some(storage) => match storage.resolve(&df.path) {
-                    Ok(Some(location)) => storage.store().delete(&location).await,
-                    Ok(None) => Ok(()),
-                    Err(error) => Err(error),
-                },
-                None => Ok(()),
+            let outcome = match self
+                .dataset_storage
+                .as_ref()
+                .map(|storage| storage.resolve(&df.path))
+            {
+                Some(Ok(Some(_))) => deleted
+                    .remove(&df.path)
+                    .unwrap_or_else(|| Err("the delete was not attempted".to_string())),
+                Some(Err(error)) => Err(error.to_string()),
+                // Not an object of the dataset's store: nothing to delete.
+                Some(Ok(None)) | None => Ok(false),
             };
-            match deleted {
-                Ok(()) => {
+            match outcome {
+                Ok(true) => {
                     unlinked_files = unlinked_files.saturating_add(1);
                     unlinked_bytes = unlinked_bytes
                         .saturating_add(u64::try_from(df.file_size_bytes).unwrap_or(0));
                 }
                 // Removed by an earlier pass that stopped before counting it.
-                Err(object_store::Error::NotFound { .. }) => {}
+                Ok(false) => {}
                 Err(e) => {
                     failed_unlinks += 1;
                     tracing::warn!(
@@ -37913,16 +37959,26 @@ impl CayenneTableProvider {
         let stats = if self.pk_deletion_strategy.is_position_based() {
             let _fence = self.listing_fence.write().await;
             let target_size_bytes = self.context.target_file_size_bytes();
+            let current_snapshot_id = self.get_current_snapshot_id();
             let (_rows, _ops, stats) = self
                 .write_to_snapshot(
                     stream,
                     target_size_bytes,
-                    &self.get_current_snapshot_id(),
+                    &current_snapshot_id,
                     ctx.state().config().target_partitions(),
                     estimated_bytes,
                     super::delta_encoding::WritePolicy::DELTA,
                 )
                 .await?;
+            // A table in the object-native location scans only its manifest: the
+            // files the checkpoint wrote into the current snapshot are recorded
+            // before its rows leave memory.
+            if self.data_in_object_native_location() {
+                let written = self.uncommitted_files.files(&current_snapshot_id);
+                self.record_files_in_manifest(&current_snapshot_id, &written)
+                    .await?;
+                self.uncommitted_files.forget(&current_snapshot_id);
+            }
             // Clear under the publish locks (inner to the held fence), uniform
             // with phase 2. Position-based tables never engage `append_to_mem_tier`
             // (`is_cdc_memory_mode()` is false for them — always a single shard),
@@ -38003,6 +38059,11 @@ impl CayenneTableProvider {
                 let snapshot_dir = self.snapshot_dir_path_for(&new_snapshot_id);
                 Self::sync_snapshot_dir(&snapshot_dir).await?;
             }
+            // A table in the object-native location scans only its manifest: the
+            // checkpoint snapshot's files are recorded before the commit that
+            // registers it.
+            self.record_new_protected_snapshot_files(&new_snapshot_id, sequence_number)
+                .await?;
 
             let OnConflictUpdate {
                 deletion_update,
