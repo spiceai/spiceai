@@ -98,6 +98,11 @@ spicepod:
 
 defaults:
   expect: { oracle: src }
+  # Every query is checked against its instance's own source. The instances do
+  # not end with the same rows: the timed churn and the writes under readers
+  # below run on some variants only, for a number of rounds that depends on
+  # timing, so their final answers are not compared with one another.
+  compare-variants: false
 
 steps:
   - source-exec:
@@ -303,6 +308,13 @@ steps:
 
   # An instance that loses its directory serves the same rows from the
   # location alone: the source is down, so it cannot load them again.
+  # Expected failures (ledger): a `refresh_mode: changes` dataset is not
+  # registered while its source cannot be reached, so its copy in the location
+  # is not served until the source is back ("table … not found" on every
+  # object-native-data variant). On object-native-data-local the data files are
+  # under `.spice/data`, which the wipe removes, so `orders` then refuses to
+  # load with "Deletion vector file is missing…" even with the source back
+  # (local data is not in the location yet).
   - query: SELECT * FROM orders
     id: orders-before-wipe
     only: *object-native-data
