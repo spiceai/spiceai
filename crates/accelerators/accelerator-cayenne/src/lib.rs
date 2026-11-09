@@ -24,6 +24,8 @@ mod native_sidecar;
 pub mod partitioned_insert_strategy;
 pub mod s3;
 pub mod snapshot_engine;
+#[cfg(test)]
+mod table_create_tests;
 pub mod unfinished_uploads;
 
 use std::any::Any;
@@ -3214,6 +3216,185 @@ impl CayenneAccelerator {
         Ok("object_native")
     }
 
+    /// `source`'s sidecar in the `metastore_type` metastore under `metadata_dir`, which
+    /// is where its dataset checkpoint, append cursor and connector offsets are kept.
+    async fn sidecar_in(
+        &self,
+        source: &dyn AccelerationSource,
+        metadata_dir: &str,
+        metastore_type: &str,
+        open_option: OpenOption,
+    ) -> Result<Arc<dyn AcceleratorSidecar>, CheckpointError> {
+        use datafusion_table_providers::sqlite::SqliteTableProviderFactory;
+
+        if metastore_type == "object_native" {
+            let head = format!("{metadata_dir}/object_native/catalog/head");
+            // A catalog in `runtime.state.location` is checked when it is opened.
+            if open_option == OpenOption::OpenExisting
+                && source.app().runtime.state.is_none()
+                && !path_exists(&head).await
+            {
+                return Err(CheckpointError::Store {
+                    source: format!("Cayenne object-native catalog does not exist at {head}")
+                        .into(),
+                });
+            }
+            let catalog = self
+                .get_or_create_catalog(metadata_dir, "object_native", source)
+                .await
+                .map_err(|source| CheckpointError::Store {
+                    source: Box::new(source),
+                })?;
+            return Ok(Arc::new(native_sidecar::NativeSidecar::new(
+                catalog,
+                source.name().to_string(),
+            )));
+        }
+
+        let metadata_db_path = format!("{metadata_dir}/{METASTORE_DB_FILE}");
+        if open_option == OpenOption::OpenExisting && !path_exists(&metadata_db_path).await {
+            return Err(CheckpointError::Store {
+                source: format!("Cayenne metadata directory does not exist at {metadata_db_path}")
+                    .into(),
+            });
+        }
+
+        if let Some(parent) = std::path::Path::new(&metadata_db_path).parent() {
+            tokio::fs::create_dir_all(parent)
+                .await
+                .map_err(|source| CheckpointError::Store {
+                    source: Box::new(source),
+                })?;
+        }
+
+        let sqlite_factory = SqliteTableProviderFactory::new();
+        let pool = sqlite_factory
+            .get_or_init_instance(
+                Arc::from(metadata_db_path.as_str()),
+                datafusion_table_providers::sql::db_connection_pool::Mode::File,
+                std::time::Duration::from_secs(5),
+            )
+            .await
+            .map_err(|source| CheckpointError::Store {
+                source: Box::new(source),
+            })?;
+
+        Ok(Arc::new(SqliteSidecar::new(
+            Arc::new(pool),
+            source.name().to_string(),
+        )))
+    }
+
+    /// Clears the dataset checkpoint and append cursor `source` has in the
+    /// `metastore_type` metastore, whose catalog does not hold its table: the table is
+    /// about to be created there empty, and either one, left from a table that metastore
+    /// held before (a dataset moved to the other metastore and back, a drop that did not
+    /// reach the sidecar), would mark the empty table loaded and skip its initial load.
+    async fn clear_load_state_of_new_table(
+        &self,
+        source: &dyn AccelerationSource,
+        metadata_dir: &str,
+        metastore_type: &str,
+    ) -> Result<()> {
+        let table_name = source.name().to_string();
+        let sidecar = self
+            .sidecar_in(
+                source,
+                metadata_dir,
+                metastore_type,
+                OpenOption::OpenExisting,
+            )
+            .await
+            .boxed()
+            .context(AccelerationCreationFailedSnafu)?;
+        let checkpoint = sidecar
+            .dataset_checkpointer(runtime_acceleration::snapshot::SnapshotBehavior::Disabled)
+            .await
+            .boxed()
+            .context(AccelerationCreationFailedSnafu)?;
+        let cursor = sidecar
+            .blob_checkpoint_store(runtime_checkpoint_api::APPEND_CURSOR_TABLE)
+            .boxed()
+            .context(AccelerationCreationFailedSnafu)?;
+        let had_checkpoint = checkpoint.exists().await;
+        let had_cursor = cursor
+            .get()
+            .await
+            .boxed()
+            .context(AccelerationCreationFailedSnafu)?
+            .is_some();
+        if had_checkpoint {
+            checkpoint
+                .delete()
+                .await
+                .context(AccelerationCreationFailedSnafu)?;
+        }
+        if had_cursor {
+            cursor
+                .delete()
+                .await
+                .boxed()
+                .context(AccelerationCreationFailedSnafu)?;
+        }
+        if had_checkpoint || had_cursor {
+            tracing::info!(
+                target: "spiced::acceleration::cayenne",
+                "Dataset '{table_name}' (cayenne) has no table in its metastore, so it is created empty and loaded from its source; the load record left from an earlier table of the same name is cleared."
+            );
+        }
+        Ok(())
+    }
+
+    /// Drops `table_name`'s copy in the object-native metastore, when one exists, for
+    /// a `mode: file_create` start that moves the dataset there from `SQLite`. A copy
+    /// whose data is in the state location has its folder deleted by the catalog, as
+    /// for any placed dataset that drops its acceleration; one at the data path shares
+    /// the local directory the move deletes.
+    async fn drop_older_object_native_copy(
+        &self,
+        source: &dyn AccelerationSource,
+        table_name: &str,
+    ) -> std::result::Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        let metadata_dir = Self::resolve_metadata_dir(source.acceleration());
+        if !self
+            .existing_native_catalog_holds(&metadata_dir, source, table_name)
+            .await?
+        {
+            return Ok(());
+        }
+        let native = self
+            .get_or_create_catalog(&metadata_dir, "object_native", source)
+            .await?;
+        let placed = match native.get_table(table_name).await {
+            Ok(stored) if data_in_state_location(native.as_ref(), &stored.path) => {
+                Some(stored.path)
+            }
+            Ok(_) | Err(_) => None,
+        };
+        if native
+            .drop_table(table_name)
+            .await
+            .boxed()
+            .context(AccelerationInitializationFailedSnafu)?
+        {
+            tracing::info!(
+                "Dropped the older object-native Cayenne table metadata for '{table_name}' (file_create mode)"
+            );
+        }
+        if let Some(data_path) = placed.as_deref() {
+            tracing::info!(
+                target: "spiced::acceleration::cayenne",
+                "{}",
+                placed_acceleration_dropped_message(
+                    table_name,
+                    placed_dataset_folder(data_path),
+                    true
+                )
+            );
+        }
+        Ok(())
+    }
+
     fn vnext_notice(&self, dataset: &str, outcome: &str) {
         if self.vnext_notices.lock().insert(dataset.to_string()) {
             // The accelerator crate's own target is below the default log level;
@@ -3725,8 +3906,20 @@ impl CayenneAccelerator {
                 .context(AccelerationCreationFailedSnafu)?;
             // Get or create the shared catalog (lazy initialization)
             let metastore_type = self.metastore_type_for(source, &metadata_dir).await?;
-            self.get_or_create_catalog(&metadata_dir, metastore_type, source)
-                .await?
+            let catalog = self
+                .get_or_create_catalog(&metadata_dir, metastore_type, source)
+                .await?;
+            // A table this metastore does not hold is created empty below; nothing may
+            // mark it loaded. A snapshot bootstrap imports the table before this point,
+            // so a restored table keeps the state it came with.
+            if matches!(
+                catalog.get_table(table_name).await,
+                Err(cayenne::CatalogError::TableNotFound { .. })
+            ) {
+                self.clear_load_state_of_new_table(source, &metadata_dir, metastore_type)
+                    .await?;
+            }
+            catalog
         };
 
         // Maintained aggregates hold for the primary key the table has once it opens: a
@@ -4665,8 +4858,6 @@ impl DataAccelerator for CayenneAccelerator {
         open_option: OpenOption,
     ) -> Result<Arc<dyn AcceleratorSidecar>, CheckpointError> {
         {
-            use datafusion_table_providers::sqlite::SqliteTableProviderFactory;
-
             // Resolving the data directory validates the acceleration configuration; the
             // metastore path below is derived independently of it.
             self.file_path(source)
@@ -4683,71 +4874,14 @@ impl DataAccelerator for CayenneAccelerator {
                 })?;
 
             let metadata_dir = Self::resolve_metadata_dir(source.acceleration());
-            let metadata_db_path = format!("{metadata_dir}/{METASTORE_DB_FILE}");
-
             let metastore_type = self
                 .metastore_type_for(source, &metadata_dir)
                 .await
                 .map_err(|source| CheckpointError::Store {
                     source: Box::new(source),
                 })?;
-            if metastore_type == "object_native" {
-                let head = format!("{metadata_dir}/object_native/catalog/head");
-                // A catalog in `runtime.state.location` is checked when it is opened.
-                if open_option == OpenOption::OpenExisting
-                    && source.app().runtime.state.is_none()
-                    && !path_exists(&head).await
-                {
-                    return Err(CheckpointError::Store {
-                        source: format!("Cayenne object-native catalog does not exist at {head}")
-                            .into(),
-                    });
-                }
-                let catalog = self
-                    .get_or_create_catalog(&metadata_dir, "object_native", source)
-                    .await
-                    .map_err(|source| CheckpointError::Store {
-                        source: Box::new(source),
-                    })?;
-                return Ok(Arc::new(native_sidecar::NativeSidecar::new(
-                    catalog,
-                    source.name().to_string(),
-                )));
-            }
-
-            if open_option == OpenOption::OpenExisting && !path_exists(&metadata_db_path).await {
-                return Err(CheckpointError::Store {
-                    source: format!(
-                        "Cayenne metadata directory does not exist at {metadata_db_path}"
-                    )
-                    .into(),
-                });
-            }
-
-            if let Some(parent) = std::path::Path::new(&metadata_db_path).parent() {
-                tokio::fs::create_dir_all(parent).await.map_err(|source| {
-                    CheckpointError::Store {
-                        source: Box::new(source),
-                    }
-                })?;
-            }
-
-            let sqlite_factory = SqliteTableProviderFactory::new();
-            let pool = sqlite_factory
-                .get_or_init_instance(
-                    Arc::from(metadata_db_path.as_str()),
-                    datafusion_table_providers::sql::db_connection_pool::Mode::File,
-                    std::time::Duration::from_secs(5),
-                )
+            self.sidecar_in(source, &metadata_dir, metastore_type, open_option)
                 .await
-                .map_err(|source| CheckpointError::Store {
-                    source: Box::new(source),
-                })?;
-
-            Ok(Arc::new(SqliteSidecar::new(
-                Arc::new(pool),
-                source.name().to_string(),
-            )))
         }
     }
 
@@ -4990,18 +5124,32 @@ impl DataAccelerator for CayenneAccelerator {
                     "Dropped existing Cayenne table metadata for '{table_name}' (file_create mode)"
                 );
             }
+            // Moving from SQLite under `runtime.params.cayenne_vnext`: the
+            // object-native metastore may still hold the copy from before the flag
+            // was turned off, which missed every change since. It is dropped too,
+            // so the table this start creates there is new and empty.
+            if catalog
+                .as_any()
+                .downcast_ref::<cayenne::metastore::object_native::ObjectNativeCatalog>()
+                .is_none()
+                && Self::vnext_enabled(source)?
+                && acceleration.partition_by.is_empty()
+            {
+                self.drop_older_object_native_copy(source, &table_name)
+                    .await?;
+            }
 
             if let Some(data_path) = placed.as_deref() {
                 // Its data is in the state location, not in the local directory,
                 // which holds nothing of it; the catalog deletes its folder.
-                tracing::info!(
-                    "{}",
-                    placed_acceleration_dropped_message(
-                        &table_name,
-                        placed_dataset_folder(data_path),
-                        true
-                    )
+                let message = placed_acceleration_dropped_message(
+                    &table_name,
+                    placed_dataset_folder(data_path),
+                    true,
                 );
+                // The accelerator crate's own target is below the default log
+                // level; this line is for the operator.
+                tracing::info!(target: "spiced::acceleration::cayenne", "{message}");
             } else if placement == LocationPlacement::New {
                 // Nothing of it is stored, here or in the state location.
             } else if path_exists(&path_buf).await {
@@ -5122,7 +5270,11 @@ impl DataAccelerator for CayenneAccelerator {
             Self::resolve_default_data_path(&source.name().to_string().replace(['.', '/'], "_"))
         } else {
             let dir_path = self.resolve_storage_config(source).boxed()?;
-            Self::ensure_directory(&dir_path).await.boxed()?;
+            // A dataset whose data files are in the state location has no local data
+            // directory, so none is created for it.
+            if self.location_placement(source).await? == LocationPlacement::Elsewhere {
+                Self::ensure_directory(&dir_path).await.boxed()?;
+            }
             dir_path
         };
         let arrow_schema = Self::transformed_arrow_schema(&cmd, source).boxed()?;
@@ -5704,7 +5856,10 @@ impl DataAccelerator for CayenneAccelerator {
             );
         }
         if let Some(folder) = &placed_folder {
+            // The accelerator crate's own target is below the default log level; this
+            // line is for the operator.
             tracing::info!(
+                target: "spiced::acceleration::cayenne",
                 "{}",
                 placed_acceleration_dropped_message(table_name, folder, false)
             );
@@ -9586,7 +9741,7 @@ mod tests {
     /// when the test runs alone, and shows up as a zero count under a parallel
     /// `cargo test`. Installing globally keeps every callsite enabled; the thread-local
     /// sink is what keeps concurrent tests from reading each other's lines.
-    fn capture_logs() -> CaptureGuard {
+    pub(crate) fn capture_logs() -> CaptureGuard {
         static INSTALLED: std::sync::OnceLock<()> = std::sync::OnceLock::new();
         INSTALLED.get_or_init(|| {
             tracing::subscriber::set_global_default(
@@ -9604,10 +9759,10 @@ mod tests {
         CaptureGuard(logs)
     }
 
-    struct CaptureGuard(CapturedLogs);
+    pub(crate) struct CaptureGuard(CapturedLogs);
 
     impl CaptureGuard {
-        fn occurrences_of(&self, needle: &str) -> usize {
+        pub(crate) fn occurrences_of(&self, needle: &str) -> usize {
             self.0.occurrences_of(needle)
         }
     }
