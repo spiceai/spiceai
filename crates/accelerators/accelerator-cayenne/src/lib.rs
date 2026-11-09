@@ -1416,6 +1416,31 @@ async fn object_store_table_prefixes(
     Ok(prefixes)
 }
 
+/// What an operator reads when a dataset whose data is in the state location
+/// drops its acceleration: for `mode: file_create` (`recreate`), or when the
+/// acceleration is rebuilt or removed. The previous folder is deleted by this
+/// instance once no query reads it, so nothing is left for the operator to do.
+fn placed_acceleration_dropped_message(dataset: &str, recreate: bool) -> String {
+    if recreate {
+        format!(
+            "Dataset '{dataset}' (cayenne) dropped its acceleration for `mode: file_create` and reloads from its source into a new folder in the state location. Its previous folder is deleted once no query reads it."
+        )
+    } else {
+        format!(
+            "Dataset '{dataset}' (cayenne) dropped its acceleration. Its folder in the state location is deleted once no query reads it."
+        )
+    }
+}
+
+/// Whether the stored table `stored_path` keeps its data in a dataset folder of the
+/// object-native catalog's location, which deletes the folder when the dataset drops.
+fn data_in_state_location(catalog: &dyn cayenne::MetadataCatalog, stored_path: &str) -> bool {
+    catalog
+        .as_any()
+        .downcast_ref::<cayenne::metastore::object_native::ObjectNativeCatalog>()
+        .is_some_and(|native| native.holds_data_at(stored_path))
+}
+
 /// The warning an operator reads when a dataset's acceleration was recreated, and the
 /// files of the previous one, in an object store, are left in place under `prefixes`.
 fn previous_acceleration_left_in_place_warning(table_name: &str, prefixes: &[String]) -> String {
@@ -3377,17 +3402,17 @@ impl CayenneAccelerator {
                         runtime_state_location::StateFeature::CayenneData,
                     );
                     cayenne::metastore::object_native::ObjectNativeCatalog::open_or_create_at(
-                            runtime_state_location::metrics::metered(
-                                store,
-                                runtime_state_location::StateFeature::CayenneMetastore,
-                            ),
-                            object_store::path::Path::from(prefix)
-                                .join("v1")
-                                .join("catalog"),
-                            &format!("{}/cayenne/v1", state.location.trim_end_matches('/')),
-                        )
-                        .await
-                        .map(|native| native.with_data_store(data_store))
+                        runtime_state_location::metrics::metered(
+                            store,
+                            runtime_state_location::StateFeature::CayenneMetastore,
+                        ),
+                        object_store::path::Path::from(prefix)
+                            .join("v1")
+                            .join("catalog"),
+                        &format!("{}/cayenne/v1", state.location.trim_end_matches('/')),
+                    )
+                    .await
+                    .map(|native| native.with_data_store(data_store))
                 }
                 None => {
                     cayenne::metastore::object_native::ObjectNativeCatalog::open_or_create_local(
@@ -4790,6 +4815,10 @@ impl DataAccelerator for CayenneAccelerator {
                 .await
                 .boxed()
                 .context(AccelerationInitializationFailedSnafu)?;
+            let placed = match catalog.get_table(&table_name).await {
+                Ok(stored) => data_in_state_location(catalog.as_ref(), &stored.path),
+                Err(_) => false,
+            };
             if catalog
                 .drop_table(&table_name)
                 .await
@@ -4801,7 +4830,11 @@ impl DataAccelerator for CayenneAccelerator {
                 );
             }
 
-            if path_exists(&path_buf).await {
+            if placed {
+                // Its data is in the state location, not in the local directory,
+                // which holds nothing of it; the catalog deletes its folder.
+                tracing::info!("{}", placed_acceleration_dropped_message(&table_name, true));
+            } else if path_exists(&path_buf).await {
                 // The proofs run here rather than earlier because
                 // `snapshot_before_recreate` creates both directories, so an overlap
                 // only a symlink reveals is resolvable now even though the open-time
@@ -5436,12 +5469,18 @@ impl DataAccelerator for CayenneAccelerator {
         let mut removed_dirs = vec![dir_path.clone()];
         let mut left_in_place = None;
         let mut stored_elsewhere = false;
+        let mut placed = false;
         if source.acceleration().is_some() {
             let catalog = self.catalog_for_source(source).await?;
             // A failed lookup must not fall back to the configured directory: that is
             // where the dataset now puts its data, which may already hold files. Only a
             // table that is not there leaves the configured directory to clear.
             match catalog.get_table(table_name).await {
+                Ok(stored) if data_in_state_location(catalog.as_ref(), &stored.path) => {
+                    // The catalog deletes the dataset's folder once no query reads it.
+                    removed_dirs.clear();
+                    placed = true;
+                }
                 Ok(stored) if stored.path.starts_with("s3://") => {
                     removed_dirs.clear();
                     left_in_place = Some(
@@ -5488,6 +5527,9 @@ impl DataAccelerator for CayenneAccelerator {
                 "{}",
                 previous_acceleration_left_in_place_warning(table_name, &prefixes)
             );
+        }
+        if placed {
+            tracing::info!("{}", placed_acceleration_dropped_message(table_name, false));
         }
 
         // Recreate the local data directory so the next create_external_table works.
@@ -7607,6 +7649,18 @@ mod tests {
         assert!(
             message.contains("metadata"),
             "the error must name the dataset and both resolved paths; got: {message}"
+        );
+    }
+
+    #[test]
+    fn the_dropped_placed_acceleration_message_says_what_happens_to_its_files() {
+        assert_eq!(
+            placed_acceleration_dropped_message("orders", true),
+            "Dataset 'orders' (cayenne) dropped its acceleration for `mode: file_create` and reloads from its source into a new folder in the state location. Its previous folder is deleted once no query reads it."
+        );
+        assert_eq!(
+            placed_acceleration_dropped_message("orders", false),
+            "Dataset 'orders' (cayenne) dropped its acceleration. Its folder in the state location is deleted once no query reads it."
         );
     }
 
