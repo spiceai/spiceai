@@ -24,8 +24,9 @@ limitations under the License.
 //! on the bytes actually decompressed.
 
 use bytes::Bytes;
+use memchr::memmem;
 use snafu::ResultExt;
-use std::collections::VecDeque;
+use std::borrow::Cow;
 use std::io::{Cursor, Read, Write};
 use zip::{CompressionMethod, ZipArchive, ZipWriter, write::SimpleFileOptions};
 
@@ -232,12 +233,15 @@ pub(crate) fn rebuild_package(raw: &Bytes, format: DocumentType, limits: Limits)
 /// `/DecodeParms` predictor is accepted only on the final stage of a chain that
 /// ends in Flate (see [`apply_decode_parms`]).
 ///
-/// The dictionary in front of each `stream` keyword is tokenised, not scanned
-/// for byte patterns. PDF whitespace (including NUL) and `%` comments between
-/// tokens cannot hide a key, and a `/Filter` that appears inside a string or a
-/// nested dictionary is not the stream's filter. A `stream` that does not
-/// follow a dictionary is content, not a stream; a dictionary that does follow
-/// one but cannot be parsed fails closed.
+/// Streams are found the way `PDFium` reads them, by parsing forward from each
+/// object's `obj` keyword ([`pdf_streams`]), so no bytes in front of an object
+/// (a decoy stream, an unterminated string, a comment) can hide it. Each
+/// stream's dictionary is tokenised, not scanned for byte patterns. PDF
+/// whitespace (including NUL) and `%` comments between tokens cannot hide a
+/// key, and a `/Filter` that appears inside a string or a nested dictionary is
+/// not the stream's filter. A `stream` word that does not follow an object's
+/// dictionary is content, not a stream; a dictionary that cannot be parsed
+/// fails closed.
 pub(crate) fn ensure_pdf_within_budget(raw: &Bytes) -> Result<()> {
     let budget = MAX_PACKAGE_BYTES;
     let mut consumed: u64 = 0;
@@ -393,346 +397,185 @@ fn decode_stage(filter: PdfFilter, data: &[u8], cap: u64) -> Vec<u8> {
     }
 }
 
-/// Every stream object in `raw`, each paired with its declared filter chain.
-/// A `stream` byte sequence that is not the keyword after a dictionary — the
-/// word inside content, or `endstream` — is not a stream object. After each
-/// real stream is recorded, its payload is skipped (via `/Length`, or by
-/// finding `endstream`) so dictionary-like bytes inside the content cannot be
-/// mistaken for another stream declaration.
+/// Every stream object `PDFium` could decode in `raw`, each paired with its
+/// declared filter chain.
+///
+/// `PDFium` reads an object by seeking to the offset the cross-reference table
+/// gives for it and parsing `N G obj` there, whatever the bytes before that
+/// offset are. So nothing before an object decides whether its stream is
+/// budgeted: not an earlier stream whose payload seems to cover it, not a
+/// literal string or `%` comment that seems to hold it, and not a malformed or
+/// unterminated earlier object. Every `obj` keyword is a place `PDFium` may
+/// start reading, and the object parsed forward from it is a stream when a
+/// dictionary and then the `stream` keyword follow.
+///
+/// Two outcomes fail the document closed, as a single [`PdfFilter::Unbounded`]
+/// stream. A dictionary this scan cannot parse could end wherever `PDFium`'s
+/// more lenient parser ends it, so it fails closed when any `stream` keyword
+/// follows it. And parsing from every `obj` lets objects nested in strings or
+/// comments make the scan read the same bytes again, so it fails closed once its
+/// work passes [`SCAN_WORK_PER_BYTE`] reads of each byte.
 fn pdf_streams(raw: &[u8]) -> Vec<PdfStream> {
-    const KEYWORD: &[u8] = b"stream";
+    let work_limit = raw
+        .len()
+        .saturating_mul(SCAN_WORK_PER_BYTE)
+        .saturating_add(SCAN_WORK_ALLOWANCE);
+    let mut work = 0usize;
     let mut streams = Vec::new();
-    let mut from = 0;
-    // Strings and comments are lexed from the end of the last validated payload
-    // so binary stream bytes (e.g. a `0x28` in an image) cannot look like `(`.
-    let mut lexer = PdfLexer::new(0);
-    while let Some(rel) = find(&raw[from..], KEYWORD) {
-        let pos = from + rel;
-        from = pos + KEYWORD.len();
-        if !is_stream_keyword(raw, pos) || lexer.covers(raw, pos) {
+    let mut last_dict_start = None;
+    for pos in memmem::find_iter(raw, b"obj") {
+        if !is_obj_keyword(raw, pos) {
             continue;
         }
-        let Some(stream_info) = stream_before(raw, &lexer) else {
-            continue;
-        };
-        // Stream data begins after the end-of-line that follows the keyword.
-        let mut data = from;
-        if raw.get(data) == Some(&b'\r') {
-            data += 1;
+        let from = pos + b"obj".len();
+        let dict_start = from + ws_len(&raw[from..]);
+        work = work.saturating_add(dict_start - from);
+        // An `obj` in a comment just before a dictionary reaches the same
+        // dictionary as the object's own keyword; it is one stream, counted once.
+        if raw[dict_start..].starts_with(b"<<") && last_dict_start != Some(dict_start) {
+            last_dict_start = Some(dict_start);
+            match object_body(raw, dict_start, &mut work) {
+                ObjectBody::NotAStream => {}
+                ObjectBody::Stream(stream) => streams.push(stream),
+                ObjectBody::Unparsable => {
+                    // No `stream` keyword after it means no stream object
+                    // starts anywhere later either, so the scan is complete.
+                    if has_stream_keyword_from(raw, dict_start) {
+                        streams.push(unverifiable_stream());
+                    }
+                    break;
+                }
+            }
         }
-        if raw.get(data) == Some(&b'\n') {
-            data += 1;
+        if work > work_limit {
+            streams.push(unverifiable_stream());
+            break;
         }
-        streams.push(PdfStream {
-            filters: stream_info.filters,
-            data_start: data,
-        });
-        // Do not resume the keyword search inside this stream's payload, and
-        // do not let that payload participate in later string detection.
-        from = stream_payload_end(raw, data, stream_info.length);
-        lexer.restart(from);
     }
     streams
 }
 
-/// `stream` at `pos` is a keyword when a token boundary precedes it. `>` covers
-/// a dictionary closed flush against the keyword (`>>stream`); `/stream` is a
-/// name and `endstream` is a different keyword, so neither matches.
-fn is_stream_keyword(raw: &[u8], pos: usize) -> bool {
-    pos == 0 || is_pdf_whitespace(raw[pos - 1]) || raw[pos - 1] == b'>'
+/// A document is read about once by [`pdf_streams`]. Past this many reads per
+/// byte (plus [`SCAN_WORK_ALLOWANCE`]), objects are nested to make the scan
+/// quadratic, and the document fails closed.
+const SCAN_WORK_PER_BYTE: usize = 4;
+
+/// Work [`pdf_streams`] may spend on any document, however small, before
+/// [`SCAN_WORK_PER_BYTE`] applies.
+const SCAN_WORK_ALLOWANCE: usize = 1024 * 1024;
+
+/// What an object holds, parsed forward from its dictionary at `dict_start`.
+enum ObjectBody {
+    /// A dictionary with no `stream` keyword after it.
+    NotAStream,
+    Stream(PdfStream),
+    /// A dictionary this scan cannot parse, so where it ends is unknown.
+    Unparsable,
 }
 
-/// Index just past a stream's payload: `/Length` bytes from `data_start` when
-/// known *and* an `endstream` sits at that boundary; otherwise the first
-/// `endstream` after `data_start`.
-///
-/// Trusting a bare length would let `/Length 999999999` on an empty stream
-/// skip to EOF and hide a later Flate bomb. Requiring `endstream` at the
-/// claimed boundary still allows a payload that embeds the ASCII bytes
-/// `endstream` mid-content, because the real terminator is the one at
-/// `data_start + Length`.
-fn stream_payload_end(raw: &[u8], data_start: usize, length: Option<u64>) -> usize {
-    if let Some(len) = length {
-        let by_length = data_start
-            .saturating_add(usize::try_from(len).unwrap_or(usize::MAX))
-            .min(raw.len());
-        let after = after_endstream(raw, by_length);
-        if after > by_length {
-            return after;
-        }
-        // Claimed length has no matching endstream — treat as unverifiable.
+/// Parses the dictionary at `dict_start` and, after PDF whitespace and
+/// comments, the `stream` keyword that makes it a stream object, adding the
+/// bytes read to `work`.
+fn object_body(raw: &[u8], dict_start: usize, work: &mut usize) -> ObjectBody {
+    let Some(dict) = parse_dictionary(&raw[dict_start..], 0) else {
+        return ObjectBody::Unparsable;
+    };
+    let dict_end = dict_start + dict.consumed;
+    let keyword = dict_end + ws_len(&raw[dict_end..]);
+    *work = work.saturating_add(keyword - dict_start);
+    if !(raw[keyword..].starts_with(b"stream") && is_stream_keyword(raw, keyword)) {
+        return ObjectBody::NotAStream;
     }
-    find_endstream(raw, data_start).map_or(raw.len(), |pos| pos + b"endstream".len())
-}
-
-/// If `endstream` sits at or just after `at` (with optional whitespace), return
-/// the index past that keyword; otherwise `at`.
-fn after_endstream(raw: &[u8], at: usize) -> usize {
-    let mut i = at;
-    i += ws_len(&raw[i..]);
-    if raw[i..].starts_with(b"endstream")
-        && (i + b"endstream".len() == raw.len()
-            || is_pdf_whitespace(raw[i + b"endstream".len()])
-            || is_pdf_delimiter(raw[i + b"endstream".len()]))
-    {
-        return i + b"endstream".len();
-    }
-    at
-}
-
-fn find_endstream(raw: &[u8], from: usize) -> Option<usize> {
-    const KEYWORD: &[u8] = b"endstream";
-    let mut cursor = from;
-    while let Some(rel) = find(&raw[cursor..], KEYWORD) {
-        let pos = cursor + rel;
-        let boundary_before = pos == 0 || is_pdf_whitespace(raw[pos - 1]);
-        let after = pos + KEYWORD.len();
-        let boundary_after =
-            after == raw.len() || is_pdf_whitespace(raw[after]) || is_pdf_delimiter(raw[after]);
-        if boundary_before && boundary_after {
-            return Some(pos);
-        }
-        cursor = pos + 1;
-    }
-    None
-}
-
-struct StreamInfo {
-    filters: Vec<PdfFilter>,
-    /// Direct `/Length` in bytes, or the uniquely resolved value of an
-    /// indirect `/Length N G R`. `None` when the length is absent or when more
-    /// than one candidate object definition exists (ambiguous / decoy).
-    length: Option<u64>,
-}
-
-/// The `/Filter` chain and `/Length` of the dictionary that ends just before
-/// the `stream` keyword `lexer` last reached (see [`PdfLexer::covers`]).
-///
-/// `None` when `stream` is not preceded by a dictionary (content, not a stream
-/// object). When a dictionary is there but its chain cannot be determined, the
-/// filters are a single [`PdfFilter::Unbounded`] stage so the document fails
-/// closed.
-fn stream_before(raw: &[u8], lexer: &PdfLexer) -> Option<StreamInfo> {
-    let close = lexer.dict_closer(raw)?;
-    let parsed = filters_of_dict(raw, close, lexer).unwrap_or(ParsedDict {
-        consumed: 0,
-        filters: vec![PdfFilter::Unbounded],
-        length: None,
-        length_ref: None,
-    });
-    let length = parsed.length.or_else(|| {
-        parsed
-            .length_ref
-            .and_then(|(obj, generation)| resolve_indirect_int(raw, obj, generation))
-    });
-    Some(StreamInfo {
-        filters: parsed.filters,
-        length,
+    let data_start = stream_data_start(raw, keyword + b"stream".len());
+    *work = work.saturating_add(data_start - keyword);
+    ObjectBody::Stream(PdfStream {
+        filters: dict.filters,
+        data_start,
     })
 }
 
-/// Resolves an indirect object `obj gen R` whose body is an integer, used for
-/// `/Length N G R`. Returns a value only when exactly one matching object
-/// header exists in `raw` (PDF whitespace between the numbers is allowed, so
-/// `6\t0 obj` counts). A Catalog string that embeds a second fake definition
-/// makes the reference ambiguous, so discovery falls back to `endstream`
-/// instead of trusting a decoy integer.
-fn resolve_indirect_int(raw: &[u8], obj: u32, generation: u32) -> Option<u64> {
-    let mut values = Vec::new();
-    let mut i = 0;
-    while i < raw.len() {
-        if i > 0 && !is_pdf_whitespace(raw[i - 1]) {
-            i += 1;
-            continue;
-        }
-        let Some((header_end, parsed_obj, parsed_gen)) = parse_object_header(&raw[i..]) else {
-            i += 1;
-            continue;
-        };
-        i += header_end;
-        if parsed_obj != obj || parsed_gen != generation {
-            continue;
-        }
-        let rest = skip_ws(&raw[i..]);
-        if let Some(value) = parse_u64(rest) {
-            values.push(value);
-        }
-    }
-    (values.len() == 1).then(|| values[0])
-}
-
-/// Parses an `obj gen obj` header at the start of `data`, allowing PDF
-/// whitespace between the tokens. Returns `(bytes_consumed, obj, generation)`.
-fn parse_object_header(data: &[u8]) -> Option<(usize, u32, u32)> {
-    let obj = parse_u64(data)?;
-    let after_obj = skip_number(data)?;
-    let gen_at = after_obj + ws_len(&data[after_obj..]);
-    let generation = parse_u64(&data[gen_at..])?;
-    let after_gen = gen_at + skip_number(&data[gen_at..])?;
-    let kw_at = after_gen + ws_len(&data[after_gen..]);
-    if !data[kw_at..].starts_with(b"obj") || !token_ends(data, kw_at + 3) {
-        return None;
-    }
-    let obj = u32::try_from(obj).ok()?;
-    let generation = u32::try_from(generation).ok()?;
-    Some((kw_at + 3, obj, generation))
-}
-
-fn parse_u64(data: &[u8]) -> Option<u64> {
-    let mut i = 0;
-    // PDF integers may carry an optional leading `+` (ISO 32000-1 §7.3.3).
-    if data.first() == Some(&b'+') {
-        i = 1;
-    }
-    let mut value: u64 = 0;
-    let mut digits = 0usize;
-    while i < data.len() && data[i].is_ascii_digit() {
-        value = value
-            .checked_mul(10)?
-            .checked_add(u64::from(data[i] - b'0'))?;
-        digits += 1;
-        i += 1;
-    }
-    (digits > 0).then_some(value)
-}
-
-/// A forward scan of the bytes from the end of the last validated stream
-/// payload to the `stream` keyword being checked. Each byte is classified once,
-/// and what the dictionary lookup needs is kept as the scan goes, so finding
-/// every stream stays linear in the document's size however many `stream`
-/// words, comments, or `<<` bytes the document holds.
-///
-/// The scan starts outside any string or comment: at the start of the document
-/// or just past a validated payload, so binary stream bytes (e.g. a `0x28` in
-/// an image) never open a string. Literal strings and `%` comments are
-/// consumed as whole tokens. The first `%` outside a string owns the rest of
-/// its line, so `>>`, `(`, or a second `%` inside it is comment text. A `%`
-/// inside a string is string text, including one in a string opened on an
-/// earlier line, so it cannot hide the dictionary's `>>`. A string that never
-/// closes runs to the end of the document.
-struct PdfLexer {
-    /// Where the scan started.
-    start: usize,
-    /// Every byte before `cursor` is classified. A string or comment is
-    /// consumed whole, so `cursor` can sit past a position it covers.
-    cursor: usize,
-    /// Index just past the last byte before `cursor` that is neither PDF
-    /// whitespace nor comment text: where a dictionary's `>>` has to end for
-    /// the `stream` keyword after it to belong to that dictionary.
-    significant_end: usize,
-    /// Starts of the nearest [`MAX_DICT_CANDIDATES`] `<<` outside strings and
-    /// comments, oldest first: the candidate dictionary openers.
-    dict_openers: VecDeque<usize>,
-}
-
-impl PdfLexer {
-    fn new(start: usize) -> Self {
-        Self {
-            start,
-            cursor: start,
-            significant_end: start,
-            dict_openers: VecDeque::with_capacity(MAX_DICT_CANDIDATES),
-        }
-    }
-
-    /// Starts a new scan at `start`, the end of a validated stream payload.
-    fn restart(&mut self, start: usize) {
-        self.start = start;
-        self.cursor = start;
-        self.significant_end = start;
-        self.dict_openers.clear();
-    }
-
-    /// Whether `pos` sits inside a literal string or a `%` comment, scanning
-    /// forward to it. A `stream` there is text, not a keyword, so a Catalog
-    /// string such as `(<< /Length 999999999 >>stream)` cannot invent a
-    /// phantom stream. `pos` never decreases between calls on the same scan.
-    fn covers(&mut self, raw: &[u8], pos: usize) -> bool {
-        while self.cursor < pos {
-            let i = self.cursor;
-            match raw[i] {
-                b'%' => {
-                    self.cursor = raw[i..]
-                        .iter()
-                        .position(|&b| b == b'\n' || b == b'\r')
-                        .map_or(raw.len(), |offset| i + offset);
-                }
-                b'(' => {
-                    self.cursor = skip_literal_string(&raw[i..]).map_or(raw.len(), |len| i + len);
-                    self.significant_end = self.cursor;
-                }
-                byte => {
-                    if !is_pdf_whitespace(byte) {
-                        self.significant_end = i + 1;
-                    }
-                    if byte == b'<' && raw.get(i + 1) == Some(&b'<') {
-                        if self.dict_openers.len() == MAX_DICT_CANDIDATES {
-                            self.dict_openers.pop_front();
-                        }
-                        self.dict_openers.push_back(i);
-                    }
-                    self.cursor = i + 1;
-                }
-            }
-        }
-        self.cursor > pos
-    }
-
-    /// Index just past the `>>` that closes the dictionary before the position
-    /// last passed to [`Self::covers`], after PDF whitespace and comments.
-    /// `None` when no dictionary closer sits there, which is what distinguishes
-    /// a real stream from the word `stream`.
-    fn dict_closer(&self, raw: &[u8]) -> Option<usize> {
-        let close = self.significant_end;
-        (close >= 2 && &raw[close - 2..close] == b">>").then_some(close)
+/// A stream that fails the document closed when it is budgeted.
+fn unverifiable_stream() -> PdfStream {
+    PdfStream {
+        filters: vec![PdfFilter::Unbounded],
+        data_start: 0,
     }
 }
 
-/// How far back from a dictionary closer its opening `<<` is looked for.
-/// Stream dictionaries are a few hundred bytes; past this the chain cannot be
-/// attributed and the stream fails closed.
-const DICT_LOOKBACK_BYTES: usize = 1024 * 1024;
+/// `obj` at `pos` may be the keyword of an object header (`N G obj`) that
+/// `PDFium` parses: whitespace separates it from the generation number before
+/// it, and a token boundary follows it. `PDFium` reads only `0-9`, `+`, `-`, and
+/// `.` as number characters, so the token before `obj` ends in one of them,
+/// unless a `%` comment could sit between that number and `obj`: the
+/// whitespace before `obj` crosses an end-of-line, and the line before it holds
+/// a `%`. That case is taken as a header, so no header `PDFium` accepts is
+/// missed. `endobj`, and `obj` after a word, as in page text such as
+/// `(prefix obj << … >>stream)`, do not match.
+fn is_obj_keyword(raw: &[u8], pos: usize) -> bool {
+    if pos == 0 || !is_pdf_whitespace(raw[pos - 1]) || !token_ends(raw, pos + b"obj".len()) {
+        return false;
+    }
+    let Some(last) = raw[..pos].iter().rposition(|&b| !is_pdf_whitespace(b)) else {
+        return false;
+    };
+    if matches!(raw[last], b'0'..=b'9' | b'+' | b'-' | b'.') {
+        return true;
+    }
+    // Only a header whose last token sits on an earlier line looks back along
+    // that line, so each line is searched at most once and the scan stays
+    // linear however many `obj` words one line holds.
+    if memchr::memchr2(b'\n', b'\r', &raw[last + 1..pos]).is_none() {
+        return false;
+    }
+    let line_start = memchr::memrchr2(b'\n', b'\r', &raw[..last]).map_or(0, |eol| eol + 1);
+    memchr::memchr(b'%', &raw[line_start..=last]).is_some()
+}
 
-/// Cap on opening-`<<` candidates tried per stream, nearest first. The match is
-/// the candidate whose token parse ends exactly on the closer; the rest open
-/// dictionaries nested inside it. Stopping here bounds the work per stream, and
-/// failing closed when none match is safe.
-const MAX_DICT_CANDIDATES: usize = 64;
+/// `stream` at `pos` is a keyword when it is a whole token: a token boundary
+/// precedes it (`>` covers a dictionary closed flush against it, `>>stream`)
+/// and one follows it. `streamX` is a different word to `PDFium`, `/stream` is a
+/// name, and `endstream` is a different keyword, so none of them match.
+fn is_stream_keyword(raw: &[u8], pos: usize) -> bool {
+    (pos == 0 || is_pdf_whitespace(raw[pos - 1]) || raw[pos - 1] == b'>')
+        && token_ends(raw, pos + b"stream".len())
+}
+
+/// Whether a `stream` keyword appears at or after `from`.
+fn has_stream_keyword_from(raw: &[u8], from: usize) -> bool {
+    memmem::find_iter(&raw[from..], b"stream").any(|rel| is_stream_keyword(raw, from + rel))
+}
+
+/// Where a stream's data begins: just past the first end-of-line (`\n`, `\r`,
+/// or `\r\n`) after the `stream` keyword, which is where `PDFium` starts
+/// reading it whatever sits between the keyword and that end-of-line.
+fn stream_data_start(raw: &[u8], after_keyword: usize) -> usize {
+    let Some(offset) = raw[after_keyword..]
+        .iter()
+        .position(|&b| b == b'\n' || b == b'\r')
+    else {
+        return raw.len();
+    };
+    let eol = after_keyword + offset;
+    if raw[eol] == b'\r' && raw.get(eol + 1) == Some(&b'\n') {
+        eol + 2
+    } else {
+        eol + 1
+    }
+}
 
 /// Deepest nesting of arrays/dictionaries accepted while skipping a value.
 /// Past this the parse fails closed rather than overflowing the stack on an
 /// attacker-controlled nest.
 const MAX_VALUE_DEPTH: usize = 32;
 
-/// The top-level `/Filter` chain and `/Length` of the dictionary that closes
-/// at `close`, trying `lexer`'s `<<` openers nearest first. A `<<` inside a
-/// `%` comment or a literal string is not an opener, so it was never recorded.
-/// `None` when no candidate opening parses as that dictionary.
-fn filters_of_dict(raw: &[u8], close: usize, lexer: &PdfLexer) -> Option<ParsedDict> {
-    let window_start = close.saturating_sub(DICT_LOOKBACK_BYTES);
-    lexer
-        .dict_openers
-        .iter()
-        .rev()
-        .take_while(|&&start| start >= window_start)
-        .find_map(|&start| {
-            parse_dictionary(&raw[start..close], 0)
-                .filter(|parsed| parsed.consumed == close - start)
-        })
-}
-
 struct ParsedDict {
     consumed: usize,
     /// Empty when the dictionary declares no `/Filter`.
     filters: Vec<PdfFilter>,
-    /// Direct integer `/Length`, when declared as a number.
-    length: Option<u64>,
-    /// Indirect `/Length N G R`, when declared as a reference.
-    length_ref: Option<(u32, u32)>,
 }
 
 /// Parses one `<< … >>` dictionary starting at `data[0]`, recording its
-/// top-level `/Filter` and `/Length`. Nested dictionaries, strings, and arrays
+/// top-level `/Filter`. Nested dictionaries, strings, and arrays
 /// are skipped as values, so a `/Filter` inside one of them cannot shadow the
 /// real key. `depth` bounds how deep nested values may go.
 fn parse_dictionary(data: &[u8], depth: usize) -> Option<ParsedDict> {
@@ -742,8 +585,6 @@ fn parse_dictionary(data: &[u8], depth: usize) -> Option<ParsedDict> {
     let mut i = 2;
     let mut filters: Option<Vec<PdfFilter>> = None;
     let mut decode_parms: Option<DecodeParms> = None;
-    let mut length: Option<u64> = None;
-    let mut length_ref: Option<(u32, u32)> = None;
     loop {
         i += ws_len(&data[i..]);
         if data.get(i..i + 2) == Some(b">>") {
@@ -753,8 +594,6 @@ fn parse_dictionary(data: &[u8], depth: usize) -> Option<ParsedDict> {
                     filters.unwrap_or_default(),
                     decode_parms.unwrap_or(DecodeParms::NoPredictor),
                 ),
-                length,
-                length_ref,
             });
         }
         if data.get(i) != Some(&b'/') {
@@ -763,7 +602,7 @@ fn parse_dictionary(data: &[u8], depth: usize) -> Option<ParsedDict> {
         let (name, name_len) = read_name(&data[i + 1..]);
         i += 1 + name_len;
         i += ws_len(&data[i..]);
-        match name.as_slice() {
+        match name.as_ref() {
             b"Filter" => {
                 let (value, value_len) = parse_filter_value(&data[i..], depth)?;
                 i += value_len;
@@ -774,20 +613,6 @@ fn parse_dictionary(data: &[u8], depth: usize) -> Option<ParsedDict> {
                 } else {
                     value
                 });
-            }
-            b"Length" => {
-                let (value, value_len) = parse_length_value(&data[i..])?;
-                i += value_len;
-                match value {
-                    LengthValue::Direct(n) => {
-                        length = Some(n);
-                        length_ref = None;
-                    }
-                    LengthValue::Indirect { obj, generation } => {
-                        length = None;
-                        length_ref = Some((obj, generation));
-                    }
-                }
             }
             // Resolved against the filter chain once the dictionary closes, so
             // the order of `/Filter` and `/DecodeParms` does not matter.
@@ -862,8 +687,8 @@ fn predicts_final_flate(filters: &[PdfFilter], entry: PredictorEntry) -> bool {
 fn parse_decode_parms(data: &[u8]) -> DecodeParms {
     if data.first() != Some(&b'[') {
         return match decode_parms_entry_predicts(data) {
-            Some(false) => DecodeParms::NoPredictor,
-            Some(true) => DecodeParms::Predictor(PredictorEntry::Dictionary),
+            Some((false, _)) => DecodeParms::NoPredictor,
+            Some((true, _)) => DecodeParms::Predictor(PredictorEntry::Dictionary),
             None => DecodeParms::Unverifiable,
         };
     }
@@ -880,38 +705,46 @@ fn parse_decode_parms(data: &[u8]) -> DecodeParms {
             }
             None => return DecodeParms::Unverifiable,
             Some(_) => {
-                match decode_parms_entry_predicts(&data[i..]) {
-                    Some(false) => {}
-                    Some(true) if predictor.is_none() => predictor = Some(index),
-                    Some(true) | None => return DecodeParms::Unverifiable,
+                let Some((predicts, len)) = decode_parms_entry_predicts(&data[i..]) else {
+                    return DecodeParms::Unverifiable;
+                };
+                if predicts && predictor.replace(index).is_some() {
+                    return DecodeParms::Unverifiable;
                 }
-                match skip_value(&data[i..], 1) {
-                    Some(len) => i += len,
-                    None => return DecodeParms::Unverifiable,
-                }
+                i += len;
                 index += 1;
             }
         }
     }
 }
 
-/// Whether one `/DecodeParms` entry declares a predictor among its own keys:
-/// `Some(false)` for `null` or a dictionary without one, `Some(true)` for a
-/// dictionary with one, and `None` when that cannot be decided (an indirect
-/// reference, a predictor nested inside another value, or a parse failure).
-fn decode_parms_entry_predicts(data: &[u8]) -> Option<bool> {
-    if data.starts_with(b"null") && token_ends(data, 4) {
-        return Some(false);
+/// Whether one `/DecodeParms` entry declares a predictor among its own keys,
+/// and how many bytes the entry takes: `Some((false, _))` for `null` or a
+/// dictionary without one, `Some((true, _))` for a dictionary with one, and
+/// `None` when that cannot be decided (an indirect reference, a predictor
+/// nested inside another value, or a parse failure).
+fn decode_parms_entry_predicts(data: &[u8]) -> Option<(bool, usize)> {
+    if let Some(len) = skip_keyword(data, b"null") {
+        return Some((false, len));
     }
-    if !data.starts_with(b"<<") {
+    let (own, nested, len) = predictor_keys_in_dictionary(data, 0)?;
+    (!nested).then_some((own, len))
+}
+
+/// Walks the dictionary at `data[0]` once and reports whether it has a
+/// `/Predictor` or `/P` key of its own, whether a dictionary or array nested in
+/// one of its other values has one, and how many bytes it takes. `None` when it
+/// cannot be parsed or nests past [`MAX_VALUE_DEPTH`].
+fn predictor_keys_in_dictionary(data: &[u8], depth: usize) -> Option<(bool, bool, usize)> {
+    if depth > MAX_VALUE_DEPTH || !data.starts_with(b"<<") {
         return None;
     }
+    let (mut own, mut nested) = (false, false);
     let mut i = 2;
-    let mut predicts = false;
     loop {
         i += ws_len(&data[i..]);
         if data.get(i..i + 2) == Some(b">>") {
-            return Some(predicts);
+            return Some((own, nested, i + 2));
         }
         if data.get(i) != Some(&b'/') {
             return None;
@@ -919,92 +752,45 @@ fn decode_parms_entry_predicts(data: &[u8]) -> Option<bool> {
         let (name, name_len) = read_name(&data[i + 1..]);
         i += 1 + name_len;
         i += ws_len(&data[i..]);
-        if name.as_slice() == b"Predictor" || name.as_slice() == b"P" {
-            predicts = true;
-        } else if decode_parms_has_predictor_at(&data[i..], 1) {
-            return None;
-        }
-        i += skip_value(&data[i..], 1)?;
+        let is_predictor = matches!(&*name, b"Predictor" | b"P");
+        own |= is_predictor;
+        let (inner, value_len) = predictor_in_value(&data[i..], depth + 1)?;
+        nested |= inner && !is_predictor;
+        i += value_len;
     }
 }
 
-/// True when `data` holds a `/Predictor` or `/P` key, searching nested
-/// dictionaries and arrays. Parse failures and excessive nesting count as a
-/// predictor so the caller fails closed.
-fn decode_parms_has_predictor_at(data: &[u8], depth: usize) -> bool {
+/// Whether the value at `data[0]` holds a `/Predictor` or `/P` key, in it or in
+/// any dictionary or array nested in it, and how many bytes the value takes.
+/// The value is read once, nesting included. `None` when it cannot be parsed
+/// or nests past [`MAX_VALUE_DEPTH`]; callers treat that as a predictor, so the
+/// document fails closed.
+fn predictor_in_value(data: &[u8], depth: usize) -> Option<(bool, usize)> {
     if depth > MAX_VALUE_DEPTH {
-        return true;
+        return None;
     }
     match data.first() {
         Some(b'<') if data.get(1) == Some(&b'<') => {
-            let mut i = 2;
-            loop {
-                i += ws_len(&data[i..]);
-                if data.get(i..i + 2) == Some(b">>") {
-                    return false;
-                }
-                if data.get(i) != Some(&b'/') {
-                    return true;
-                }
-                let (name, name_len) = read_name(&data[i + 1..]);
-                i += 1 + name_len;
-                i += ws_len(&data[i..]);
-                if name.as_slice() == b"Predictor" || name.as_slice() == b"P" {
-                    return true;
-                }
-                // Nested DecodeParms arrays/dicts can still hold a predictor.
-                if decode_parms_has_predictor_at(&data[i..], depth + 1) {
-                    return true;
-                }
-                match skip_value(&data[i..], depth + 1) {
-                    Some(len) => i += len,
-                    None => return true,
-                }
-            }
+            predictor_keys_in_dictionary(data, depth).map(|(own, nested, len)| (own || nested, len))
         }
         Some(b'[') => {
+            let mut found = false;
             let mut i = 1;
             loop {
                 i += ws_len(&data[i..]);
                 match data.get(i) {
-                    Some(b']') => return false,
-                    None => return true,
+                    Some(b']') => return Some((found, i + 1)),
+                    None => return None,
                     Some(_) => {
-                        if decode_parms_has_predictor_at(&data[i..], depth + 1) {
-                            return true;
-                        }
-                        match skip_value(&data[i..], depth + 1) {
-                            Some(len) => i += len,
-                            None => return true,
-                        }
+                        let (nested, value_len) = predictor_in_value(&data[i..], depth + 1)?;
+                        found |= nested;
+                        i += value_len;
                     }
                 }
             }
         }
-        _ => false,
+        _ => skip_value(data, depth).map(|len| (false, len)),
     }
-}
-
-enum LengthValue {
-    Direct(u64),
-    Indirect { obj: u32, generation: u32 },
-}
-
-/// A `/Length` value: a direct integer, or an `N G R` indirect reference.
-fn parse_length_value(data: &[u8]) -> Option<(LengthValue, usize)> {
-    let n_len = skip_number(data)?;
-    let n = parse_u64(data)?;
-    let gen_at = n_len + ws_len(&data[n_len..]);
-    if let Some(gen_len) = skip_number(&data[gen_at..]) {
-        let r_at = gen_at + gen_len + ws_len(&data[gen_at + gen_len..]);
-        if data.get(r_at) == Some(&b'R') && token_ends(data, r_at + 1) {
-            let generation = parse_u64(&data[gen_at..])?;
-            let obj = u32::try_from(n).ok()?;
-            let generation = u32::try_from(generation).ok()?;
-            return Some((LengthValue::Indirect { obj, generation }, r_at + 1));
-        }
-    }
-    Some((LengthValue::Direct(n), n_len))
 }
 
 /// The `/Filter` value at `data[0]` (already past whitespace): a name, an array
@@ -1069,7 +855,7 @@ fn skip_value(data: &[u8], depth: usize) -> Option<usize> {
         Some(b'(') => skip_literal_string(data),
         Some(b'<') => {
             if data.get(1) == Some(&b'<') {
-                parse_dictionary(data, depth + 1).map(|parsed| parsed.consumed)
+                skip_dictionary(data, depth + 1)
             } else {
                 skip_hex_string(data)
             }
@@ -1080,6 +866,30 @@ fn skip_value(data: &[u8], depth: usize) -> Option<usize> {
         Some(b'n') => skip_keyword(data, b"null"),
         Some(b'+' | b'-' | b'.' | b'0'..=b'9') => skip_number_or_reference(data),
         _ => None,
+    }
+}
+
+/// Skips the `<< … >>` dictionary at `data[0]` as a value, reading each byte
+/// once. Only a stream's own dictionary declares its filters and parameters
+/// ([`parse_dictionary`]); a nested one is skipped whole, so nesting never
+/// multiplies the work.
+fn skip_dictionary(data: &[u8], depth: usize) -> Option<usize> {
+    if depth > MAX_VALUE_DEPTH || !data.starts_with(b"<<") {
+        return None;
+    }
+    let mut i = 2;
+    loop {
+        i += ws_len(&data[i..]);
+        if data.get(i..i + 2) == Some(b">>") {
+            return Some(i + 2);
+        }
+        if data.get(i) != Some(&b'/') {
+            return None;
+        }
+        let (_, name_len) = read_name(&data[i + 1..]);
+        i += 1 + name_len;
+        i += ws_len(&data[i..]);
+        i += skip_value(&data[i..], depth + 1)?;
     }
 }
 
@@ -1193,15 +1003,19 @@ fn token_ends(data: &[u8], at: usize) -> bool {
         .is_none_or(|&b| is_pdf_whitespace(b) || is_pdf_delimiter(b))
 }
 
-/// PDF whitespace is NUL, tab, LF, form feed, CR, and space (ISO 32000-1
-/// §7.2.2). Rust's `is_ascii_whitespace` leaves NUL out, which would split a
-/// `/Filter` key from its value.
 fn is_octal(b: u8) -> bool {
     matches!(b, b'0'..=b'7')
 }
 
+/// Whitespace as `PDFium` tokenises it: NUL, tab, LF, form feed, CR, and space
+/// (ISO 32000-1 §7.2.2), plus the bytes 0x80 and 0xFF, which `PDFium`'s
+/// character table also treats as whitespace. A byte `PDFium` splits tokens on
+/// must split them here too, or an object, a dictionary, or a `stream` keyword
+/// written with it is a stream `PDFium` decodes and this scan never budgets.
+/// Rust's `is_ascii_whitespace` leaves NUL out, which would split a `/Filter`
+/// key from its value.
 fn is_pdf_whitespace(b: u8) -> bool {
-    matches!(b, 0x00 | 0x09 | 0x0A | 0x0C | 0x0D | 0x20)
+    matches!(b, 0x00 | 0x09 | 0x0A | 0x0C | 0x0D | 0x20 | 0x80 | 0xFF)
 }
 
 fn is_pdf_delimiter(b: u8) -> bool {
@@ -1229,43 +1043,35 @@ fn ws_len(data: &[u8]) -> usize {
     i
 }
 
-fn skip_ws(data: &[u8]) -> &[u8] {
-    &data[ws_len(data)..]
-}
-
-/// Test helper view of [`stream_before`]: just the filter chain.
-#[cfg(test)]
-fn filters_before(raw: &[u8], keyword_pos: usize) -> Option<Vec<PdfFilter>> {
-    let mut lexer = PdfLexer::new(0);
-    if lexer.covers(raw, keyword_pos) {
-        return None;
-    }
-    stream_before(raw, &lexer).map(|info| info.filters)
-}
-
-/// A PDF name token (without its leading `/`), with `#XX` hex escapes decoded,
+/// A PDF name token (without its leading `/`), with `#XX` escapes decoded,
 /// and the number of raw bytes consumed. Decoding escapes is what makes an
-/// obfuscated `/Fl#61teDecode` classify as `FlateDecode`.
-fn read_name(data: &[u8]) -> (Vec<u8>, usize) {
-    let mut name = Vec::new();
+/// obfuscated `/Fl#61teDecode` classify as `FlateDecode`. Escapes decode as
+/// `PDFium` decodes them: `#` and the two bytes after it, wherever it is not
+/// among the last two bytes of the name, with a digit that is not hex read as
+/// 0, so `/Decode#5zarms` is `/DecodeParms`.
+fn read_name(data: &[u8]) -> (Cow<'_, [u8]>, usize) {
+    let len = data
+        .iter()
+        .position(|&b| is_pdf_whitespace(b) || is_pdf_delimiter(b))
+        .unwrap_or(data.len());
+    let token = &data[..len];
+    if !token.contains(&b'#') {
+        return (Cow::Borrowed(token), len);
+    }
+    let mut name = Vec::with_capacity(len);
     let mut i = 0;
-    while i < data.len() {
-        let b = data[i];
-        if is_pdf_whitespace(b) || is_pdf_delimiter(b) {
-            break;
-        }
-        if b == b'#'
-            && i + 2 < data.len()
-            && let (Some(hi), Some(lo)) = (hex_value(data[i + 1]), hex_value(data[i + 2]))
-        {
+    while i < len {
+        if token[i] == b'#' && i + 2 < len {
+            let hi = hex_value(token[i + 1]).unwrap_or(0);
+            let lo = hex_value(token[i + 2]).unwrap_or(0);
             name.push((hi << 4) | lo);
             i += 3;
             continue;
         }
-        name.push(b);
+        name.push(token[i]);
         i += 1;
     }
-    (name, i)
+    (Cow::Owned(name), len)
 }
 
 fn hex_value(b: u8) -> Option<u8> {
@@ -1275,15 +1081,6 @@ fn hex_value(b: u8) -> Option<u8> {
         b'A'..=b'F' => Some(b - b'A' + 10),
         _ => None,
     }
-}
-
-fn find(haystack: &[u8], needle: &[u8]) -> Option<usize> {
-    if needle.is_empty() || haystack.len() < needle.len() {
-        return None;
-    }
-    haystack
-        .windows(needle.len())
-        .position(|window| window == needle)
 }
 
 /// Inflates `data` as a zlib stream (PDF `/FlateDecode`), falling back to raw
@@ -1719,23 +1516,23 @@ mod tests {
     }
 
     #[test]
-    fn filters_before_reads_a_name_and_an_array() {
-        let single = b"<< /Length 3 /Filter /FlateDecode >>stream";
+    fn reads_a_filter_name_and_a_filter_array() {
+        let filters_of = |raw: &[u8]| -> Vec<Vec<PdfFilter>> {
+            pdf_streams(raw).into_iter().map(|s| s.filters).collect()
+        };
         assert_eq!(
-            filters_before(single, single.len() - b"stream".len()),
-            Some(vec![PdfFilter::Flate])
+            filters_of(b"1 0 obj << /Length 3 /Filter /FlateDecode >>stream\n"),
+            vec![vec![PdfFilter::Flate]]
         );
-
-        let chain = b"<< /Filter [/ASCII85Decode /FlateDecode] /DecodeParms << /x 1 >> >>stream";
         assert_eq!(
-            filters_before(chain, chain.len() - b"stream".len()),
-            Some(vec![PdfFilter::Ascii85, PdfFilter::Flate])
+            filters_of(
+                b"1 0 obj << /Filter [/ASCII85Decode /FlateDecode] /DecodeParms << /x 1 >> >>stream\n"
+            ),
+            vec![vec![PdfFilter::Ascii85, PdfFilter::Flate]]
         );
-
-        let stored = b"<< /Length 3 >>stream";
         assert_eq!(
-            filters_before(stored, stored.len() - b"stream".len()),
-            Some(vec![])
+            filters_of(b"1 0 obj << /Length 3 >>stream\n"),
+            vec![Vec::<PdfFilter>::new()]
         );
     }
 
@@ -1843,13 +1640,36 @@ mod tests {
         );
     }
 
-    /// Each byte is lexed once, so a document packed with what would cost a
-    /// rescan per occurrence if each check restarted at the last payload —
-    /// `stream` in comment lines or as a bare word, comment lines between a
-    /// dictionary and its `stream`, `<<` in a comment inside the dictionary —
-    /// is scanned in linear time, and the stream behind it is still found with
-    /// its filter. A per-occurrence rescan takes minutes at these sizes, which
-    /// trips the test timeout.
+    /// Each `/DecodeParms` value is read once per nesting level, so a stream
+    /// dictionary nested sixteen deep in `/DecodeParms` costs linear time.
+    /// Reading every level twice doubles the work per level; two thousand such
+    /// streams then take minutes and trip the test timeout.
+    #[test]
+    fn scans_deeply_nested_decode_parms_in_linear_time() {
+        let mut value = format!("({})", "x".repeat(64)).into_bytes();
+        for _ in 0..16 {
+            let mut outer = b"<< /DecodeParms ".to_vec();
+            outer.extend_from_slice(&value);
+            outer.extend_from_slice(b" >>");
+            value = outer;
+        }
+        let mut pdf = b"%PDF-1.7\n".to_vec();
+        for object in 1..=2000 {
+            pdf.extend_from_slice(format!("{object} 0 obj\n").as_bytes());
+            pdf.extend_from_slice(&value);
+            pdf.extend_from_slice(b"\nstream\n\nendstream\nendobj\n");
+        }
+        assert_eq!(pdf_streams(&pdf).len(), 2000);
+        ensure_pdf_within_budget(&Bytes::from(pdf))
+            .expect("stored streams with nested parameters are within the budget");
+    }
+
+    /// A document packed with `stream` in comment lines or as a bare word,
+    /// comment lines between a dictionary and its `stream`, or `<<` in a
+    /// comment inside the dictionary is scanned in linear time, and the stream
+    /// behind it is still found with its filter. A scan that re-read the
+    /// document per occurrence would take minutes at these sizes and trip the
+    /// test timeout.
     #[test]
     fn finds_a_stream_behind_megabytes_of_comments_and_stream_words() {
         let pdf = |before_dict: &[u8], in_dict: &[u8], gap: &[u8]| {
@@ -1934,15 +1754,18 @@ mod tests {
         ensure_pdf_within_budget(&pdf).expect("a terminal image codec stream is accepted");
     }
 
-    /// Builds `<< /Length N <dict> stream\n <data>` and asserts the one real
+    /// Builds `1 0 obj << /Length N <dict entries> stream\n <data>`, splicing
+    /// `/Length` in after `dict`'s opening `<<`, and asserts the one real
     /// stream's chain is actually budgeted: the final expansion exceeds
     /// `remaining`, so a scan that drops a stage, treats the stream as stored,
     /// or stops at a decoy image codec would accept it instead.
     fn assert_chain_budgeted(dict: &[u8], data: &[u8]) {
+        let entries = dict
+            .strip_prefix(b"<<")
+            .expect("the dictionary under test opens with <<");
         let mut pdf = b"%PDF-1.7\n1 0 obj\n<< /Length ".to_vec();
         pdf.extend_from_slice(data.len().to_string().as_bytes());
-        pdf.push(b' ');
-        pdf.extend_from_slice(dict);
+        pdf.extend_from_slice(entries);
         pdf.extend_from_slice(b" stream\n");
         pdf.extend_from_slice(data);
         pdf.extend_from_slice(b"\nendstream\nendobj\n");
@@ -2097,7 +1920,7 @@ mod tests {
     /// stop the dictionary parse before `/Filter` is read.
     #[test]
     fn reads_a_filter_after_an_indirect_length() {
-        let raw = b"<< /Length 4 0 R /Filter /FlateDecode >>stream";
+        let raw = b"1 0 obj << /Length 4 0 R /Filter /FlateDecode >>stream\n";
         let streams = pdf_streams(raw);
         assert_eq!(streams.len(), 1);
         assert_eq!(streams[0].filters, vec![PdfFilter::Flate]);
@@ -2160,9 +1983,9 @@ mod tests {
             .expect("ordinary text that mentions stream must not be rejected");
     }
 
-    /// A direct `/Length 999999999` on an empty stream must not skip to EOF
-    /// and hide a later Flate bomb: the claimed length has no matching
-    /// `endstream`, so discovery falls back to the real terminator.
+    /// A direct `/Length 999999999` on an empty stream must not hide a later
+    /// Flate bomb, as it would if the scan trusted the length and skipped to
+    /// the end of the document.
     #[test]
     fn still_budgets_after_a_direct_length_decoy() {
         let bomb = flate_bomb();
@@ -2187,9 +2010,10 @@ mod tests {
         );
     }
 
-    /// Object headers may use a tab between numbers (`6\t0 obj`). That form
-    /// must still resolve so a Catalog-string decoy spelled with spaces is
-    /// not the unique match.
+    /// Object headers may use a tab between numbers (`6\t0 obj`). A Catalog
+    /// string holding a fake object 6 with a huge value must not hide the later
+    /// Flate bomb, as it would if the scan took that value for the empty
+    /// stream's indirect `/Length`.
     #[test]
     fn still_budgets_when_the_real_length_object_uses_a_tab() {
         let bomb = flate_bomb();
@@ -2377,6 +2201,29 @@ mod tests {
         }
     }
 
+    /// `PDFium` decodes a `#` escape whatever its two digits are, reading a
+    /// digit that is not hex as 0, so `/Decode#5zarms` is `/DecodeParms` and
+    /// `/#5zredictor` is `/Predictor` to it. A predictor on the first of two
+    /// Flate stages, hidden behind either spelling, must still fail closed.
+    #[test]
+    fn rejects_a_predictor_behind_a_non_hex_name_escape() {
+        let data = deflate(&deflate(&png_predicted(b"hello world", 1)));
+        for decl in [
+            b"[/FlateDecode /FlateDecode] /Decode#5zarms [<< /Predictor 12 /Columns 1 >> null]"
+                .as_slice(),
+            b"[/FlateDecode /FlateDecode] /DecodeParms [<< /#5zredictor 12 /Columns 1 >> null]"
+                .as_slice(),
+        ] {
+            let pdf = loadable_pdf_with_content_stream(decl, &data);
+            assert_eq!(
+                pdf_too_large_reason(&pdf),
+                UNVERIFIABLE_REASON,
+                "/Filter {}",
+                String::from_utf8_lossy(decl)
+            );
+        }
+    }
+
     /// A predictor with no `/Filter` applies to nothing a reader decodes, but
     /// it is not a shape writers produce, so it fails closed.
     #[test]
@@ -2385,9 +2232,10 @@ mod tests {
         assert_eq!(pdf_too_large_reason(&pdf), UNVERIFIABLE_REASON);
     }
 
-    /// A Catalog string that contains the bytes of a fake `N 0 obj` /Length
-    /// must not make discovery skip past a later Flate stream. The empty
-    /// stream's real length is 0; trusting the decoy would advance to EOF.
+    /// A Catalog string that contains the bytes of a fake `N 0 obj` holding a
+    /// huge `/Length` value must not hide a later Flate stream, as it would if
+    /// the scan trusted the decoy and skipped to the end of the document. The
+    /// empty stream's real length is 0.
     #[test]
     fn still_budgets_a_stream_after_an_indirect_length_decoy() {
         let bomb = flate_bomb();
@@ -2459,10 +2307,9 @@ mod tests {
         assert_chain_budgeted(&dict, &data);
     }
 
-    /// A `/Length` that correctly covers a payload containing the bytes
-    /// `endstream` must still skip the whole payload. Stopping at the embedded
-    /// keyword would resume inside the image and hide the following Flate bomb.
-    /// Covers both a direct length and a uniquely resolved indirect length.
+    /// A payload containing the bytes `endstream` must not hide the following
+    /// Flate bomb, as it would if the scan stopped at the embedded keyword and
+    /// resumed inside the image. Covers both a direct and an indirect length.
     #[test]
     fn still_budgets_after_a_payload_with_embedded_endstream_bytes() {
         let bomb = flate_bomb();
@@ -2504,8 +2351,8 @@ mod tests {
         }
     }
 
-    /// A legal `/Length +N` (optional leading plus) must still be read as a
-    /// direct length so the stream is budgeted, not rejected as unboundable.
+    /// A legal `/Length +N` (optional leading plus) must still parse, so the
+    /// stream is budgeted, not rejected as unboundable.
     #[test]
     fn budgets_a_stream_whose_length_has_a_leading_plus() {
         let data = single_flate();
@@ -2516,7 +2363,7 @@ mod tests {
     }
 
     /// An earlier unfiltered stream whose payload contains a `(` byte must not
-    /// make the following Flate stream look like it sits inside a string.
+    /// hide the following Flate stream.
     #[test]
     fn still_budgets_a_flate_stream_after_a_payload_with_a_paren_byte() {
         let bomb = flate_bomb();
@@ -2572,9 +2419,8 @@ mod tests {
     }
 
     /// A literal string that contains dictionary-like text and the word
-    /// `stream` must not invent a phantom stream whose huge `/Length` hides
-    /// the real Flate page stream. Covers both a `/Length` decoy and a bare
-    /// `<< >>stream` with no length.
+    /// `stream` must not hide the real Flate page stream behind it. Covers both
+    /// a huge `/Length` decoy and a bare `<< >>stream` with no length.
     #[test]
     fn still_budgets_when_a_string_contains_a_fake_stream() {
         for note in [
@@ -2626,5 +2472,316 @@ mod tests {
             Bytes::from(out)
         };
         assert_eq!(pdf_too_large_reason(&pdf), UNVERIFIABLE_REASON);
+    }
+
+    /// A loadable single-page PDF whose `/Contents` is object 5, with `decoy`
+    /// written in front of it. The cross-reference table points at each
+    /// object's header (its first `5 0`), so `PDFium` reads object 5 at its
+    /// offset whatever the decoy bytes before it are. `contents` is object 5
+    /// from its header on, or empty when `decoy` already holds it.
+    fn pdf_with_decoy_before_contents(decoy: &[u8], contents: &[u8]) -> Bytes {
+        let objs: [&[u8]; 3] = [
+            b"<< /Type /Catalog /Pages 2 0 R >>",
+            b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>",
+            b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Contents 5 0 R \
+              /Resources << /Font << /F1 << /Type /Font /Subtype /Type1 /BaseFont /Helvetica >> >> >> >>",
+        ];
+        let mut out = b"%PDF-1.7\n".to_vec();
+        let mut offsets = Vec::with_capacity(5);
+        for (i, body) in objs.iter().enumerate() {
+            offsets.push(out.len());
+            out.extend_from_slice(format!("{} 0 obj\n", i + 1).as_bytes());
+            out.extend_from_slice(body);
+            out.extend_from_slice(b"\nendobj\n");
+        }
+        offsets.push(out.len());
+        out.extend_from_slice(decoy);
+        out.extend_from_slice(contents);
+        let contents_at =
+            offsets[3] + memmem::find(&out[offsets[3]..], b"5 0").expect("object 5 has a header");
+        offsets.push(contents_at);
+        let xref_pos = out.len();
+        out.extend_from_slice(b"xref\n0 6\n0000000000 65535 f \n");
+        for off in offsets {
+            out.extend_from_slice(format!("{off:010} 00000 n \n").as_bytes());
+        }
+        out.extend_from_slice(
+            format!("trailer\n<< /Size 6 /Root 1 0 R >>\nstartxref\n{xref_pos}\n%%EOF").as_bytes(),
+        );
+        Bytes::from(out)
+    }
+
+    /// Object 5, a Flate stream holding `data`, written as `prefix`, the header
+    /// and dictionary, the `stream` keyword, `after_keyword`, then `data`.
+    fn flate_contents_object(prefix: &[u8], after_keyword: &[u8], data: &[u8]) -> Vec<u8> {
+        let mut obj = prefix.to_vec();
+        obj.extend_from_slice(&contents_object_spelled(
+            b"5 0 obj ",
+            b" ",
+            after_keyword,
+            data,
+        ));
+        obj
+    }
+
+    /// Object 5, a Flate stream holding `data`, written as `header` (`5 0 obj`
+    /// and what follows it), the dictionary, `before_keyword`, the `stream`
+    /// keyword, `after_keyword`, then `data`.
+    fn contents_object_spelled(
+        header: &[u8],
+        before_keyword: &[u8],
+        after_keyword: &[u8],
+        data: &[u8],
+    ) -> Vec<u8> {
+        let mut obj = header.to_vec();
+        obj.extend_from_slice(b"<< /Length ");
+        obj.extend_from_slice(data.len().to_string().as_bytes());
+        obj.extend_from_slice(b" /Filter /FlateDecode >>");
+        obj.extend_from_slice(before_keyword);
+        obj.extend_from_slice(b"stream");
+        obj.extend_from_slice(after_keyword);
+        obj.extend_from_slice(data);
+        obj.extend_from_slice(b"\nendstream\nendobj\n");
+        obj
+    }
+
+    /// Each way of writing bytes in front of a page's Flate stream that made
+    /// the scan skip it, as `(name, decoy, contents)` for
+    /// [`pdf_with_decoy_before_contents`]. `PDFium` still reads the stream in
+    /// every one, because it reads object 5 at the offset its cross-reference
+    /// entry gives.
+    fn decoys_before_contents(data: &[u8]) -> Vec<(&'static str, Vec<u8>, Vec<u8>)> {
+        let plain = flate_contents_object(b"", b"\n", data);
+        let mut spanning = b"4 0 obj\n<< /Length ".to_vec();
+        spanning.extend_from_slice(plain.len().to_string().as_bytes());
+        spanning.extend_from_slice(b" >>\nstream\n");
+        spanning.extend_from_slice(&plain);
+        spanning.extend_from_slice(b"endstream\nendobj\n");
+        vec![
+            (
+                "a decoy `streamX` with /Length 0 (regression test for #15826)",
+                b"4 0 obj\n<< /Length 0 >>streamX\nendobj\n".to_vec(),
+                plain.clone(),
+            ),
+            (
+                "a decoy stream whose /Length 0 has no endstream after it",
+                b"4 0 obj\n<< /Length 0 >>\nstream\nendobj\n".to_vec(),
+                plain.clone(),
+            ),
+            (
+                "a decoy stream with no /Length and no endstream",
+                b"4 0 obj\n<< >>\nstream\nendobj\n".to_vec(),
+                plain.clone(),
+            ),
+            (
+                "an unterminated literal string in an earlier object",
+                b"4 0 obj\n(unterminated\nendobj\n".to_vec(),
+                plain.clone(),
+            ),
+            (
+                "a decoy stream whose verified /Length spans the object",
+                spanning,
+                Vec::new(),
+            ),
+            (
+                "a comment that starts the object's header line",
+                Vec::new(),
+                flate_contents_object(b"%x ", b"\n", data),
+            ),
+            (
+                "bytes between the stream keyword and its end-of-line",
+                Vec::new(),
+                flate_contents_object(b"", b"   \n", data),
+            ),
+            // `PDFium` reads bytes 0x80 and 0xFF as whitespace between tokens.
+            (
+                "byte 0x80 between the generation number and `obj`",
+                Vec::new(),
+                contents_object_spelled(b"5 0\x80obj ", b" ", b"\n", data),
+            ),
+            (
+                "byte 0xFF between `obj` and the dictionary",
+                Vec::new(),
+                contents_object_spelled(b"5 0 obj\xff", b" ", b"\n", data),
+            ),
+            (
+                "byte 0x80 between the dictionary and `stream`",
+                Vec::new(),
+                contents_object_spelled(b"5 0 obj ", b"\x80", b"\n", data),
+            ),
+            (
+                "byte 0xFF between the dictionary and `stream`",
+                Vec::new(),
+                contents_object_spelled(b"5 0 obj ", b"\xff", b"\n", data),
+            ),
+            (
+                "byte 0x80 between `stream` and its end-of-line",
+                Vec::new(),
+                contents_object_spelled(b"5 0 obj ", b" ", b"\x80\n", data),
+            ),
+            (
+                "a comment between the generation number and `obj`",
+                Vec::new(),
+                contents_object_spelled(b"5 0 %c\nobj ", b" ", b"\n", data),
+            ),
+        ]
+    }
+
+    /// Page text that spells object syntax after a word that is not a number
+    /// (`prefix obj << /Filter /LZWDecode >>stream`) is not an object header,
+    /// so it neither adds a stream that cannot be budgeted nor hides one. The
+    /// page stream is stored, so the text sits in the document as written, and
+    /// `PDFium` must load it and read it back.
+    #[tokio::test]
+    async fn accepts_page_text_that_spells_object_syntax() {
+        use crate::DocumentParser as _;
+        for text in [
+            b"(prefix obj << /Filter /LZWDecode >>stream) Tj".as_slice(),
+            b"(see obj << /Unfinished) Tj".as_slice(),
+        ] {
+            let mut content = b"BT /F1 24 Tf 72 700 Td ".to_vec();
+            content.extend_from_slice(text);
+            content.extend_from_slice(b" ET");
+            let mut object = b"5 0 obj << /Length ".to_vec();
+            object.extend_from_slice(content.len().to_string().as_bytes());
+            object.extend_from_slice(b" >> stream\n");
+            object.extend_from_slice(&content);
+            object.extend_from_slice(b"\nendstream\nendobj\n");
+            let pdf = pdf_with_decoy_before_contents(b"", &object);
+            let shown = String::from_utf8_lossy(text);
+            ensure_pdf_within_budget(&pdf).unwrap_or_else(|e| {
+                panic!("{shown}: page text must not be read as an object: {e}")
+            });
+            let read = crate::PdfParser::default()
+                .parse(&pdf)
+                .await
+                .unwrap_or_else(|e| panic!("{shown}: PDFium should load the document: {e}"))
+                .as_flat_utf8()
+                .expect("flat utf8 text");
+            assert!(
+                read.contains("obj <<"),
+                "{shown}: PDFium should read the page text, got {read:?}"
+            );
+        }
+    }
+
+    /// A single line holding a million `obj` words after other words is
+    /// scanned in linear time, and the bomb after it is still budgeted. Looking
+    /// back to the start of the line for every one of them would take minutes
+    /// and trip the test timeout.
+    #[test]
+    fn budgets_a_bomb_after_a_line_of_obj_words() {
+        let decoy = b"a obj ".repeat(1_000_000);
+        let contents = flate_contents_object(b"\n", b"\n", &flate_bomb());
+        let pdf = pdf_with_decoy_before_contents(&decoy, &contents);
+        match ensure_pdf_within_budget(&pdf) {
+            Err(Error::DocumentTooLarge { reason, .. }) => assert_eq!(
+                reason,
+                "its compressed streams decompress to more than 256 MiB, the per-document limit"
+            ),
+            other => panic!("expected the budget to reject the bomb, got {other:?}"),
+        }
+    }
+
+    /// No bytes in front of an object can keep its stream out of the budget,
+    /// because `PDFium` reads the object at its own offset. Every shape here
+    /// was accepted with a Flate bomb behind it.
+    #[test]
+    fn budgets_a_bomb_whatever_precedes_its_object() {
+        for (shape, decoy, contents) in decoys_before_contents(&flate_bomb()) {
+            let pdf = pdf_with_decoy_before_contents(&decoy, &contents);
+            match ensure_pdf_within_budget(&pdf) {
+                Err(Error::DocumentTooLarge { reason, .. }) => assert_eq!(
+                    reason,
+                    "its compressed streams decompress to more than 256 MiB, the per-document limit",
+                    "{shape}"
+                ),
+                other => panic!("{shape}: expected the budget to reject the bomb, got {other:?}"),
+            }
+        }
+    }
+
+    /// Differential check against `PDFium`: for each shape, `PDFium` extracts
+    /// the text of the page's Flate stream, and the scan lists that same stream,
+    /// with its filter and at the byte `PDFium` starts reading it from.
+    #[tokio::test]
+    async fn every_stream_pdfium_reads_is_scanned() {
+        use crate::DocumentParser as _;
+        let content = b"BT /F1 24 Tf 72 700 Td (PDFIUM READ THIS STREAM) Tj ET";
+        let data = deflate(content);
+        for (shape, decoy, contents) in decoys_before_contents(&data) {
+            let pdf = pdf_with_decoy_before_contents(&decoy, &contents);
+            let data_start = memmem::find(&pdf, &data).expect("the stream data is in the document");
+            let scanned: Vec<(usize, Vec<PdfFilter>)> = pdf_streams(&pdf)
+                .into_iter()
+                .map(|stream| (stream.data_start, stream.filters))
+                .collect();
+            assert!(
+                scanned.contains(&(data_start, vec![PdfFilter::Flate])),
+                "{shape}: the scan must list the stream at {data_start}, got {scanned:?}"
+            );
+            let text = crate::PdfParser::default()
+                .parse(&pdf)
+                .await
+                .unwrap_or_else(|e| panic!("{shape}: PDFium should load the document: {e}"))
+                .as_flat_utf8()
+                .expect("flat utf8 text");
+            assert!(
+                text.contains("PDFIUM READ THIS STREAM"),
+                "{shape}: PDFium should read the page stream, got {text:?}"
+            );
+        }
+    }
+
+    /// A dictionary the scan cannot parse could end wherever `PDFium`'s more
+    /// lenient parser ends it, so a `stream` keyword after it may begin a stream
+    /// that cannot be budgeted: the document fails closed. With no `stream`
+    /// keyword after it, no stream can start there, and the document is
+    /// accepted.
+    #[test]
+    fn an_unparsable_dictionary_before_a_stream_fails_closed() {
+        let unparsable = [
+            b"4 0 obj\n<< /Note >>\nendobj\n".as_slice(),
+            b"4 0 obj\n<< /Length 9 << /Filter /FlateDecode >> >>\nendobj\n",
+        ];
+        let contents = flate_contents_object(b"", b"\n", &deflate(b"BT ET"));
+        for decoy in unparsable {
+            let pdf = pdf_with_decoy_before_contents(decoy, &contents);
+            assert_eq!(
+                pdf_too_large_reason(&pdf),
+                UNVERIFIABLE_REASON,
+                "{}",
+                String::from_utf8_lossy(decoy)
+            );
+
+            let mut after_every_stream = contents.clone();
+            after_every_stream.extend_from_slice(decoy);
+            let pdf = pdf_with_decoy_before_contents(b"", &after_every_stream);
+            ensure_pdf_within_budget(&pdf)
+                .expect("an unparsable dictionary after every stream cannot hide one");
+        }
+    }
+
+    /// Objects nested inside each other's strings make a forward parse from
+    /// every `obj` re-read the same bytes, quadratic in the nesting depth. The
+    /// scan stops at its work limit and fails closed instead; reading every
+    /// level would take minutes at this size and trip the test timeout.
+    #[test]
+    fn nested_objects_fail_closed_at_the_work_limit() {
+        let depth = 100_000;
+        let mut pdf = b"%PDF-1.7\n".to_vec();
+        for level in 1..=depth {
+            pdf.extend_from_slice(format!("{level} 0 obj << /Note (").as_bytes());
+        }
+        for _ in 0..depth {
+            pdf.extend_from_slice(b") >>");
+        }
+        pdf.extend_from_slice(b"\nstream\n\nendstream\nendobj\n");
+        let streams = pdf_streams(&pdf);
+        assert_eq!(
+            streams.last().map(|stream| stream.filters.clone()),
+            Some(vec![PdfFilter::Unbounded])
+        );
+        assert_eq!(pdf_too_large_reason(&Bytes::from(pdf)), UNVERIFIABLE_REASON);
     }
 }
