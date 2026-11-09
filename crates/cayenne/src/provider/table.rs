@@ -18637,13 +18637,16 @@ impl CayenneTableProvider {
     ///   on the main scan path (`InsertRecordHandling::Apply`) and resurrect
     ///   the key's older durable copies.
     ///
-    /// The groups need SEPARATE catalog commits because
-    /// `commit_on_conflict_deletions` stamps its per-commit reinsert sequence
-    /// on every key-based delete file it carries. Pure deletes commit first;
-    /// the reinsert commit carries the protected-snapshot registration
-    /// (`target_snapshot_id`, `None` for a tombstones-only flush with no data
-    /// files). A crash between the two leaves the slot un-advanced, so the
-    /// replayed tail re-commits idempotently (per-side max merge).
+    /// Both groups, the protected-snapshot registration (`target_snapshot_id`,
+    /// `None` for a tombstones-only flush with no data files), any inline
+    /// shadow rows, and the clearing of the inline rows the snapshot replaces
+    /// commit in ONE metastore transaction (`commit_mem_tier_durable`), which
+    /// stamps the reinsert sequence on the reinsert group only and leaves pure
+    /// deletes delete-only. Splitting them into separate commits lets a crash
+    /// between them persist a state no single version of the table had, such as
+    /// new row versions without the tombstones that hide the old ones, or baked
+    /// file rows alongside the inline shadows they replace: duplicate keys
+    /// after restart (#16147).
     async fn commit_mem_tier_checkpoint_metadata(
         &self,
         snapshot: &crate::provider::mem_tier::MemTier,
