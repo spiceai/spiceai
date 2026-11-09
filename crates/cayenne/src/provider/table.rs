@@ -67814,12 +67814,14 @@ mod tests {
         };
 
         // A query captures a scan view, which this table keeps reusing for an
-        // hour whatever is written after it.
+        // hour whatever is written after it. The view holds a row because an
+        // empty view is not reused once a write has published.
+        write(&[1], &[10]).await;
         assert_eq!(
             collect_id_value_pairs(&ctx, &provider, "ma_rebuild_reused_view").await,
-            vec![],
+            vec![(1, 10)],
         );
-        write(&[1, 2], &[10, 20]).await;
+        write(&[2], &[20]).await;
         // Stale, as after a durable delete; the next write's delta is dropped.
         provider.mark_maintained_aggregates_stale();
         write(&[3], &[30]).await;
@@ -67833,7 +67835,7 @@ mod tests {
         );
         assert_eq!(
             collect_id_value_pairs(&ctx, &provider, "ma_rebuild_reused_view").await,
-            vec![],
+            vec![(1, 10)],
             "precondition: the table's scans still answer from the view captured before the writes"
         );
 
