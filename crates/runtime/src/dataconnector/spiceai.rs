@@ -14,9 +14,9 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
+use crate::config::Role;
 use crate::dataconnector::ConnectorContext;
 use app::App;
-use app::spicepod::component::runtime::RuntimeMode;
 use std::any::Any;
 use std::borrow::Borrow;
 use std::future::Future;
@@ -461,7 +461,7 @@ impl DataConnectorFactory for SpiceAIFactory {
                 flight_client,
                 Arc::new(SpiceCloudPlatformDialect {}),
             )
-            .with_substrait(context.runtime_mode() == RuntimeMode::Sidecar);
+            .with_substrait(context.role() == Role::Sidecar);
             Ok(Arc::new(SpiceAI { flight_factory }) as Arc<dyn DataConnector>)
         })
     }
