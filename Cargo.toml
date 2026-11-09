@@ -10,7 +10,9 @@ members = [
     "crates/ansi_colors",
     "crates/app",
     "crates/arrow_tools",
+    "crates/aws-identity",
     "crates/aws-kms-signer",
+    "crates/azure-credential",
     "crates/azure-key-vault-signer",
     "crates/aws-sdk-credential-bridge",
     "crates/backoff",
@@ -73,7 +75,6 @@ members = [
     "crates/runtime-component",
     "crates/runtime-api-types",
     "crates/runtime-checkpoint-api",
-    "crates/runtime-checkpoint-duckdb",
     "crates/runtime-checkpoint-sqlite",
     "crates/runtime-checkpoint-postgres",
     "crates/runtime-auth",
@@ -317,7 +318,6 @@ delta_kernel_default_engine = { version = "0.27.1", default-features = false, fe
 derive_builder = "0.20.2"
 dotenv = { path = "crates/dotenv" }
 duration-parse = { path = "crates/duration-parse" }
-duckdb = "1.4.4" # the crate version that matches DuckDB v1.4.4
 dyn-hash = "1.0.0"
 encoding_rs = "0.8.34"
 fs4 = "0.13.1"
@@ -674,7 +674,6 @@ candle-index-select-cu = { git = "https://github.com/spiceai/candle-index-select
 delta_kernel = { git = "https://github.com/spiceai/delta-kernel-rs.git", rev = "16ac28606464d742b6837de4a51f41011c3f6dc0" } # branch: spiceai-0.27 (Delta Kernel 0.27.1)
 delta_kernel_default_engine = { git = "https://github.com/spiceai/delta-kernel-rs.git", rev = "16ac28606464d742b6837de4a51f41011c3f6dc0" } # branch: spiceai-0.27 (Delta Kernel 0.27.1)
 
-duckdb = { git = "https://github.com/spiceai/duckdb-rs.git", rev = "40a0ad2a7de6a8ba06d242ce7e04ffcd7a664df9" } # branch: spiceai-1.4.4 (DuckDB v1.4.4, arrow 59; must match the rev datafusion-table-providers pins, or cargo resolves two copies of duckdb)
 rusqlite = { git = "https://github.com/spiceai/rusqlite.git", rev = "e39c9c46dea1f0983cd8d87dabb69b41c9efe1fd" } # master @ tip (PR #2 merged: rusqlite 0.40.1 + bundled-decimal)
 tokio-rusqlite = { git = "https://github.com/spiceai/tokio-rusqlite.git", rev = "b10df82e3bbc4f4700562a14a3a00714cbc2f0c7" }
 
