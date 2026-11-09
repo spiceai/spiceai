@@ -36,6 +36,7 @@
   "debezium-offset-recovery": 34,
   "derived-table-scopes": 14,
   "distinct-on-scopes": 5,
+  "duckdb-hugeint": 1,
   "duckdb-nested-union-all": 4,
   "duckdb-timestamp-deletes": 4,
   "duckdb-types-acceleration": 2,
