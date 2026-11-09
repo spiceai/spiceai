@@ -303,8 +303,7 @@ fn watch_root(path: &Path) -> PathBuf {
     }
     path.parent()
         .filter(|parent| !parent.as_os_str().is_empty())
-        .map(Path::to_path_buf)
-        .unwrap_or_else(|| PathBuf::from("."))
+        .map_or_else(|| PathBuf::from("."), Path::to_path_buf)
 }
 
 fn watched_file_names(path: &Path) -> Vec<OsString> {
@@ -321,6 +320,32 @@ fn watched_file_names(path: &Path) -> Vec<OsString> {
     names
 }
 
+/// The file names to accept events for and the extra directories to watch for
+/// `path`, read from where it resolves now. `None` while `path` does not resolve,
+/// so the caller keeps what it last watched.
+fn resolved_file_watch(
+    path: &Path,
+    configured_root: &Path,
+) -> Option<(Vec<OsString>, Vec<PathBuf>)> {
+    let resolved = path.canonicalize().ok()?;
+    let mut names = Vec::new();
+    if let Some(name) = path.file_name() {
+        names.push(name.to_owned());
+    }
+    if let Some(name) = resolved.file_name()
+        && !names.iter().any(|existing| existing.as_os_str() == name)
+    {
+        names.push(name.to_owned());
+    }
+    let root = watch_root(&resolved);
+    let roots = if root.as_path() == configured_root {
+        Vec::new()
+    } else {
+        vec![root]
+    };
+    Some((names, roots))
+}
+
 fn refresh_resolved_file_watch(
     watcher: &mut RecommendedWatcher,
     path: &Path,
@@ -331,19 +356,17 @@ fn refresh_resolved_file_watch(
     if path.is_dir() {
         return;
     }
+    // While the path does not resolve (a symlink whose target was deleted ahead
+    // of its recreation), keep the last resolved name and parent watch, so the
+    // recreation and the writes after it still trigger a refresh.
+    let Some((resolved_names, desired)) = resolved_file_watch(path, configured_root) else {
+        return;
+    };
     let mut guard = names
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
-    *guard = watched_file_names(path);
+    *guard = resolved_names;
     drop(guard);
-
-    let desired: Vec<PathBuf> = path
-        .canonicalize()
-        .ok()
-        .map(|resolved| watch_root(&resolved))
-        .into_iter()
-        .filter(|root| root != configured_root)
-        .collect();
 
     for old in extra_roots.iter() {
         if !desired.contains(old) {
@@ -510,5 +533,40 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
         assert!(names.iter().any(|name| name.as_os_str() == "names.csv"));
         assert!(names.iter().any(|name| name.as_os_str() == "actual.csv"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn resolved_file_watch_is_none_while_the_symlink_target_is_gone() {
+        let root =
+            std::env::temp_dir().join(format!("spice-file-watch-resolve-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join("real")).expect("create real dir");
+        let real = root.join("real").join("actual.csv");
+        std::fs::write(&real, b"x").expect("write target");
+        let alias = root.join("names.csv");
+        std::os::unix::fs::symlink(&real, &alias).expect("symlink");
+        let real_dir = root
+            .join("real")
+            .canonicalize()
+            .expect("canonical real dir");
+
+        let resolved = resolved_file_watch(&alias, &root);
+        std::fs::remove_file(&real).expect("delete target");
+        let while_gone = resolved_file_watch(&alias, &root);
+        std::fs::write(&real, b"y").expect("recreate target");
+        let recreated = resolved_file_watch(&alias, &root);
+        let _ = std::fs::remove_dir_all(&root);
+
+        let (names, roots) = resolved.expect("resolves before the delete");
+        assert!(names.iter().any(|name| name.as_os_str() == "actual.csv"));
+        assert_eq!(roots, vec![real_dir.clone()]);
+        assert!(
+            while_gone.is_none(),
+            "a dangling symlink must not replace the last resolved watch"
+        );
+        let (names, roots) = recreated.expect("resolves after the recreate");
+        assert!(names.iter().any(|name| name.as_os_str() == "actual.csv"));
+        assert_eq!(roots, vec![real_dir]);
     }
 }
