@@ -174,6 +174,11 @@ impl Spiced {
     }
 
     /// Runs `spiced` in this container on every start.
+    /// The container this instance runs in, if it runs in one.
+    pub fn container_name(&self) -> Option<&str> {
+        self.container.as_ref().map(|run| run.name.as_str())
+    }
+
     pub fn set_container(&mut self, run: ContainerRun) {
         self.container = Some(run);
     }
