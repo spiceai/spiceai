@@ -363,6 +363,21 @@ async fn test_file_watcher_symlink_to_another_directory() -> Result<(), anyhow::
                 .expect("append via target");
             wait_for_row_count(&rt, 12).await?;
 
+            // Delete the target, then recreate it: the watch on its directory
+            // must survive the window where the symlink dangles.
+            std::fs::remove_file(&real).expect("delete target");
+            tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+            std::fs::write(&real, csv_with_rows(13)).expect("recreate target");
+            wait_for_row_count(&rt, 13).await?;
+
+            std::fs::OpenOptions::new()
+                .append(true)
+                .open(&real)
+                .expect("open recreated target")
+                .write_all(b"14,name14,20,City,1\n")
+                .expect("append to recreated target");
+            wait_for_row_count(&rt, 14).await?;
+
             drop(rt);
             Ok(())
         })
