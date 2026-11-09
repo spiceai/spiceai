@@ -8,7 +8,7 @@ query's `ORDER BY`** (see [Row order](#row-order)) between:
 
 1. **Standalone engines outside Spice** — raw embedded crates used as oracles  
    (`duckdb-oracle` via ADBC, `rusqlite`, `chdb-rust`)
-2. **Spice accelerators** — Cayenne, DuckDB accelerator, SQLite accelerator
+2. **Spice accelerators** — Cayenne, SQLite accelerator
 
 They measure correctness only. Numeric compare uses existing float tolerance.
 
@@ -20,7 +20,6 @@ They measure correctness only. Numeric compare uses existing float tolerance.
 | `standalone-sqlite` | SQLite **outside** Spice | `rusqlite` (not Spice SQLite accel) |
 | `standalone-chdb` | chDB **outside** Spice | `chdb-rust` |
 | `spice-cayenne` | Cayenne accelerator | `CayenneTableProvider` |
-| `spice-duckdb-accel` | Spice DuckDB accelerator | `accelerator_duckdb` |
 | `spice-sqlite-accel` | Spice SQLite accelerator | `accelerator_sqlite` |
 
 **DuckDB and chDB cannot both run** in one process; the chDB lane is a separate
@@ -33,7 +32,6 @@ test binary from the `integration` binary that holds the DuckDB lanes.
 standalone-duckdb          —            ✅ cayenne suite          —
 standalone-sqlite          ✅                 —                   —
 spice-cayenne              ✅                 ✅                   ✅
-spice-duckdb-accel         ✅ (runtime)       —                   —
 spice-sqlite-accel         —                  ✅ (runtime)        —
 ```
 
@@ -129,8 +127,7 @@ Dedicated binary (not the full `integration` suite):
 
 | Test | Features | Engines | Suites |
 |------|----------|---------|--------|
-| `spice_duckdb_accel_vs_standalone_duckdb_micro` | `duckdb,sqlite` | Spice DuckDB accel ↔ standalone DuckDB | micro shapes |
-| `spice_sqlite_accel_vs_standalone_sqlite_micro` | `duckdb,sqlite` | Spice SQLite accel ↔ standalone SQLite | micro shapes |
+| `spice_sqlite_accel_vs_standalone_sqlite_micro` | `sqlite` | Spice SQLite accel ↔ standalone SQLite | micro shapes |
 
 ### CH-benCHmark load-mode matrix (Cayenne only)
 
@@ -208,11 +205,10 @@ is not in its run, because a target whose `required-features` are unmet is dropp
 by cargo silently, which is how the lanes above once went unbuilt.
 
 The runtime accelerator lane stays out of the fast gate on purpose.
-`runtime/duckdb,runtime/sqlite` flow through the whole `--all` build, so
-every runtime test binary the gate builds relinks with them at hundreds of megabytes
-each — a permanent cost on every sign-off for two micro-shape comparisons. It is
-a module of runtime's `integration` test binary, so the integration workflow,
-which already builds with `duckdb,sqlite`, runs it.
+`runtime/sqlite` flows through the whole `--all` build, so every runtime test
+binary the gate builds relinks with it — a permanent cost on every sign-off for a
+micro-shape comparison. It is a module of runtime's `integration` test binary, so
+the integration workflow, which already builds with `adbc,sqlite`, runs it.
 
 Optional env: `CAYENNE_PARITY_SCRATCH`, `CAYENNE_PARITY_*_SF`,
 `CAYENNE_PARITY_SSB_SCALE`, `CLICKBENCH_HITS_PARQUET`, `SQLLANCER_EXTRA_SQL`.

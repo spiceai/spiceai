@@ -37,7 +37,7 @@ use runtime::{Runtime, auth::EndpointAuth, config::Config};
 use tonic::transport::Channel;
 
 use super::{
-    compare, duckdb_accel, make_dim, make_fact, micro_queries, sqlite_accel, write_parquet,
+    compare, make_dim, make_fact, micro_queries, sqlite_accel, standalone_duckdb, write_parquet,
 };
 use crate::configure_test_datafusion;
 use crate::utils::{
@@ -181,7 +181,7 @@ async fn surfaces_match_standalone_oracles(engine: &str, storage: Storage) {
     .expect("the spicepod must be written");
 
     let (_sqlite_dir, sqlite) = sqlite_accel::load_standalone_sqlite(&tables);
-    let (_duckdb_dir, duckdb) = duckdb_accel::load_standalone_duckdb(&tables);
+    let (_duckdb_dir, duckdb) = standalone_duckdb::load_standalone_duckdb(&tables);
 
     register_test_connectors().await;
     configure_test_datafusion();
@@ -238,7 +238,7 @@ async fn surfaces_match_standalone_oracles(engine: &str, storage: Storage) {
         let oracles = [
             (
                 "standalone-duckdb",
-                duckdb_accel::standalone_query(&duckdb, &q.sql)
+                standalone_duckdb::standalone_query(&duckdb, &q.sql)
                     .unwrap_or_else(|e| panic!("duckdb sql {}: {e}", q.name)),
             ),
             (
