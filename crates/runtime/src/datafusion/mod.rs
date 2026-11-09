@@ -2945,11 +2945,6 @@ impl DataFusion {
         Ok(())
     }
 
-    /// Steady-state hot-path probe: returns `true` iff at least one
-    /// dataset placeholder is awaiting initialization.
-    ///
-    /// Single `Acquire`-ordered atomic load. Pods with no deferred
-    /// datasets, and post-warm-up pods, pay nothing here.
     /// Whether `dataset_name` is registered with its loaded provider: registered,
     /// and not a placeholder still awaiting its first-reference initialization
     /// (which stays registered when that initialization fails).
@@ -2963,6 +2958,11 @@ impl DataFusion {
                     .contains_key(dataset_name))
     }
 
+    /// Steady-state hot-path probe: returns `true` iff at least one
+    /// dataset placeholder is awaiting initialization.
+    ///
+    /// Single `Acquire`-ordered atomic load. Pods with no deferred
+    /// datasets, and post-warm-up pods, pay nothing here.
     #[must_use]
     pub fn has_pending_initializations(&self) -> bool {
         self.pending_initializations_count
