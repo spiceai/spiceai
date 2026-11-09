@@ -19,7 +19,8 @@ limitations under the License.
 //! it reaches every node's GPU, its own included, and splits each weight across them. The
 //! nodes add up their partial results over direct connections between every pair of them.
 
-use std::net::{IpAddr, TcpListener, TcpStream, ToSocketAddrs};
+use std::io::{ErrorKind, Read};
+use std::net::{IpAddr, Shutdown, TcpListener, TcpStream, ToSocketAddrs};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::thread;
@@ -48,18 +49,48 @@ const RANK_WAIT_NOTE: Duration = Duration::from_secs(30);
 /// Threads llama.cpp's RPC server uses for work it runs on the CPU.
 const RPC_THREADS: usize = 4;
 
-/// How long one probe of a rank's port waits for the connection.
+/// How long one probe of a rank's port waits for the connection, and then for the server to
+/// close it.
 const PROBE_TIMEOUT: Duration = Duration::from_secs(1);
 
 /// How long this node's GPU server has to start accepting connections.
 const SERVE_START: Duration = Duration::from_secs(30);
 
-/// Whether something accepts connections at `endpoint`. llama.cpp's RPC client aborts the
-/// process when it cannot connect, so a rank is reached only once this says it listens.
+/// Whether a server at `endpoint` takes a connection and is done with it: the probe connects,
+/// sends nothing, and waits for the server to close the connection, as llama.cpp's RPC server
+/// does once it reads no request.
+///
+/// llama.cpp's RPC client aborts the process when it cannot connect, so a rank is reached only
+/// once this holds. Its server takes one connection at a time with a backlog of one, and on
+/// macOS a connection that arrives while another waits for `accept` is reset. A probe that only
+/// connected would wait there while the server is busy with another client, and the connection
+/// right after it would be reset; waiting for the close leaves nothing of the probe's behind.
 fn listening(endpoint: &str) -> bool {
     endpoint.to_socket_addrs().is_ok_and(|mut addrs| {
-        addrs.any(|addr| TcpStream::connect_timeout(&addr, PROBE_TIMEOUT).is_ok())
+        addrs.any(|addr| {
+            TcpStream::connect_timeout(&addr, PROBE_TIMEOUT).is_ok_and(|mut probe| {
+                probe.shutdown(Shutdown::Write).is_ok()
+                    && probe.set_read_timeout(Some(PROBE_TIMEOUT)).is_ok()
+                    && closed_by_peer(&mut probe)
+            })
+        })
     })
+}
+
+/// Reads `stream` until its peer closes it, for at most [`PROBE_TIMEOUT`]: true at the close,
+/// false on an error, or when the peer is still sending or silent at the deadline.
+fn closed_by_peer(stream: &mut TcpStream) -> bool {
+    let deadline = Instant::now() + PROBE_TIMEOUT;
+    let mut buf = [0_u8; 64];
+    while Instant::now() < deadline {
+        match stream.read(&mut buf) {
+            Ok(0) => return true,
+            Ok(_) => {}
+            Err(e) if e.kind() == ErrorKind::Interrupted => {}
+            Err(_) => return false,
+        }
+    }
+    false
 }
 
 fn port(rank: usize) -> Result<u16> {
@@ -351,10 +382,9 @@ pub(crate) async fn reach_ranks(cfg: &DistributedConfig, name: &str) -> Result<V
                 Some(attempt) => attempts[rank] = Some(attempt),
                 None => {
                     let at = endpoint.clone();
-                    // llama.cpp's server takes one connection at a time with a backlog of one,
-                    // and its client aborts the process when it cannot connect. Another rank's
-                    // server is probed first; the head's own is already known to listen, and a
-                    // probe right before the connection could fill that backlog.
+                    // llama.cpp's client aborts the process when it cannot connect, so another
+                    // rank's server is probed first. The head's own already took the probe that
+                    // started it, and nothing else connects to it before this.
                     let probe = rank > 0;
                     attempts[rank] = Some(tokio::task::spawn_blocking(move || {
                         (!probe || listening(&at))
