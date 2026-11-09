@@ -3322,7 +3322,7 @@ impl CayenneAccelerator {
             url: url::Url::parse(&datasets_url)
                 .boxed()
                 .context(AccelerationCreationFailedSnafu)?,
-            store: native.store(),
+            store: native.data_store(),
         };
         let unsupported = object_native_data_unsupported(source);
         match catalog.get_table(table_name).await {
@@ -3383,7 +3383,9 @@ impl CayenneAccelerator {
                         params: state.params.clone(),
                         source: spicepod::component::runtime::StateSource::RuntimeState,
                     };
-                    let (store, prefix) = runtime_state_location::build_object_store(
+                    // One client for the location; the logs' requests and the data
+                    // files' are measured apart.
+                    let (store, prefix) = runtime_state_location::build_unmetered_object_store(
                         secrets,
                         tokio::runtime::Handle::current(),
                         &location,
@@ -3392,15 +3394,23 @@ impl CayenneAccelerator {
                     .await
                     .boxed()
                     .context(AccelerationInitializationFailedSnafu)?;
+                    let data_store = runtime_state_location::metrics::metered(
+                        Arc::clone(&store),
+                        runtime_state_location::StateFeature::CayenneData,
+                    );
                     let native =
                         cayenne::metastore::object_native::ObjectNativeCatalog::open_or_create_at(
-                            store,
+                            runtime_state_location::metrics::metered(
+                                store,
+                                runtime_state_location::StateFeature::CayenneMetastore,
+                            ),
                             object_store::path::Path::from(prefix)
                                 .join("v1")
                                 .join("catalog"),
                             &format!("{}/cayenne/v1", state.location.trim_end_matches('/')),
                         )
-                        .await;
+                        .await
+                        .map(|native| native.with_data_store(data_store));
                     if native.is_ok() {
                         // A local record that this instance uses the catalog in the state
                         // location, so a start with `cayenne_vnext` disabled finds it on

@@ -140,6 +140,7 @@ impl StateStoreMetrics {
     fn publish_counters_at_zero(&self) {
         for feature in StateFeature::ALL
             .into_iter()
+            .filter(|feature| feature.has_conflict_and_cleanup_counters())
             .filter_map(StateFeature::metric_label)
         {
             let labels = feature_labels(feature);
@@ -521,6 +522,34 @@ mod tests {
 
     fn requests(feature: &str, operation: &str) -> String {
         format!("state_store_request_duration_ms{{feature={feature},operation={operation}}}")
+    }
+
+    #[tokio::test]
+    async fn cayenne_data_has_requests_but_no_conflict_or_cleanup_series() {
+        let recorded = Recorded::new();
+        recorded.metrics.publish_counters_at_zero();
+        let store = recorded.store(StateFeature::CayenneData);
+        store
+            .put(&Path::from("d/data/t/s/f.vortex"), PutPayload::from_static(b"x"))
+            .await
+            .expect("put a data file");
+
+        let mut expected = BTreeMap::new();
+        for feature in [
+            "scheduler",
+            "rate_control",
+            "results_cache_warmup",
+            "snapshots",
+            "cayenne_metastore",
+        ] {
+            expected.insert(format!("state_store_conflicts_total{{feature={feature}}}"), 0);
+            expected.insert(
+                format!("state_store_cleanup_deleted_total{{feature={feature}}}"),
+                0,
+            );
+        }
+        expected.insert(requests("cayenne_data", "write"), 1);
+        assert_eq!(recorded.series(), expected);
     }
 
     #[tokio::test]

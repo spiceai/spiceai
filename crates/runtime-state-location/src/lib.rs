@@ -186,18 +186,22 @@ pub enum StateFeature {
     Snapshots,
     /// The Cayenne object-native metastore's head logs.
     CayenneMetastore,
+    /// The data files of Cayenne datasets kept in the state location, beside
+    /// their metastore logs.
+    CayenneData,
     /// The startup check of a `runtime.state` location, which keeps
     /// `format.json` and its probe object in the location's `_spice/` folder.
     StartupCheck,
 }
 
 impl StateFeature {
-    pub const ALL: [Self; 6] = [
+    pub const ALL: [Self; 7] = [
         Self::Scheduler,
         Self::RateControl,
         Self::ResultsCacheWarmup,
         Self::Snapshots,
         Self::CayenneMetastore,
+        Self::CayenneData,
         Self::StartupCheck,
     ];
 
@@ -211,8 +215,18 @@ impl StateFeature {
             Self::ResultsCacheWarmup => Some("results_cache_warmup"),
             Self::Snapshots => Some("snapshots"),
             Self::CayenneMetastore => Some("cayenne_metastore"),
+            Self::CayenneData => Some("cayenne_data"),
             Self::StartupCheck => None,
         }
+    }
+
+    /// Whether `state_store_conflicts_total` and `state_store_cleanup_deleted_total`
+    /// apply to the feature, so they are published at zero for it. Cayenne data
+    /// files are written once under unique keys, so no write conflicts, and
+    /// their cleanup is counted per table in `cayenne_maintenance_reclaimed_*`.
+    #[must_use]
+    pub fn has_conflict_and_cleanup_counters(self) -> bool {
+        !matches!(self, Self::CayenneData | Self::StartupCheck)
     }
 
     /// The folder the feature writes under in a `runtime.state` location.
@@ -222,7 +236,7 @@ impl StateFeature {
             Self::RateControl => "rate-control",
             Self::ResultsCacheWarmup => "results-cache",
             Self::Snapshots => SNAPSHOTS_STATE_FOLDER,
-            Self::CayenneMetastore => "cayenne",
+            Self::CayenneMetastore | Self::CayenneData => "cayenne",
             Self::StartupCheck => "_spice",
         }
     }
@@ -234,6 +248,7 @@ impl StateFeature {
             Self::ResultsCacheWarmup => "SQL results cache warmup state",
             Self::Snapshots => "snapshot",
             Self::CayenneMetastore => "Cayenne metastore",
+            Self::CayenneData => "Cayenne data",
             Self::StartupCheck => "shared state location check",
         }
     }
@@ -247,6 +262,7 @@ impl StateFeature {
             Self::ResultsCacheWarmup => "SQL results cache warmup",
             Self::Snapshots => "acceleration snapshots",
             Self::CayenneMetastore => "the Cayenne metastore",
+            Self::CayenneData => "Cayenne data files",
             Self::StartupCheck => "the startup check",
         }
     }
@@ -262,6 +278,7 @@ impl StateFeature {
                 | Self::RateControl
                 | Self::ResultsCacheWarmup
                 | Self::CayenneMetastore
+                | Self::CayenneData
                 | Self::StartupCheck,
                 _,
             ) => &S3_PARAMETERS,
@@ -293,7 +310,9 @@ impl StateFeature {
 /// `abfss://` that is the container root, whatever path the URL has.
 ///
 /// Every request through the store is recorded in the state-store
-/// [`metrics`] under `feature`'s label, when it has one.
+/// [`metrics`] under `feature`'s label, when it has one. Two features sharing
+/// one store build it with [`build_unmetered_object_store`] and meter it once
+/// for each.
 ///
 /// `s3://`, `abfs://`, `abfss://`, `gs://` and `file://` locations build the
 /// same store for every feature. A snapshot location with another scheme is
@@ -314,7 +333,13 @@ pub async fn build_object_store(
     Ok((metrics::metered(store, feature), prefix))
 }
 
-async fn build_unmetered_object_store(
+/// [`build_object_store`] without the metrics: the caller meters the store with
+/// [`metrics::metered`], once for each feature whose requests go through it.
+///
+/// # Errors
+///
+/// As [`build_object_store`].
+pub async fn build_unmetered_object_store(
     secrets: Arc<RwLock<Secrets>>,
     io_runtime: Handle,
     state: &StateLocation,
@@ -349,8 +374,12 @@ async fn build_unmetered_object_store(
             })?;
 
         // The Cayenne metastore acknowledges a source once its commit is
-        // published, so its puts must be on disk when they return.
-        let local = if feature == StateFeature::CayenneMetastore {
+        // published, so its puts, and those of the data files the commit names,
+        // must be on disk when they return.
+        let local = if matches!(
+            feature,
+            StateFeature::CayenneMetastore | StateFeature::CayenneData
+        ) {
             object_store_occ::LocalConditionalPut::new_durable(&local_path)
         } else {
             object_store_occ::LocalConditionalPut::new(&local_path)

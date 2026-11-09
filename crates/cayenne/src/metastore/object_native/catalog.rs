@@ -61,6 +61,9 @@ const DECISION: &str = "decision";
 /// The name registry and every dataset's log.
 pub struct ObjectNativeCatalog {
     store: Arc<dyn ObjectStore>,
+    /// The location's store as the data files of datasets in the location use
+    /// it: the same bucket, its requests measured apart from the logs'.
+    data_store: Option<Arc<dyn ObjectStore>>,
     config: NativeCatalogConfig,
     /// The name registry's log, at the catalog's prefix. It also holds tables
     /// created before datasets had logs of their own, and positions whose key
@@ -705,6 +708,7 @@ impl ObjectNativeCatalog {
         registry.commit_actions(stale).await?;
         let catalog = Self {
             store,
+            data_store: None,
             config,
             registry,
             prefix,
@@ -731,11 +735,26 @@ impl ObjectNativeCatalog {
         (routes.datasets.len(), routes.by_table.len(), replayed)
     }
 
-    /// The store the catalog's logs are in. A dataset whose data files are in the
-    /// location keeps them under [`Self::datasets_prefix`] in this store.
+    /// The store the catalog's logs are in.
     #[must_use]
     pub fn store(&self) -> Arc<dyn ObjectStore> {
         Arc::clone(&self.store)
+    }
+
+    /// Data files of datasets in the location go through `store`: the same
+    /// location as [`Self::store`], measured as data rather than as the logs.
+    #[must_use]
+    pub fn with_data_store(mut self, store: Arc<dyn ObjectStore>) -> Self {
+        self.data_store = Some(store);
+        self
+    }
+
+    /// The store a dataset whose data files are in the location keeps them in,
+    /// under [`Self::datasets_prefix`]: the one [`Self::with_data_store`] set,
+    /// or else [`Self::store`].
+    #[must_use]
+    pub fn data_store(&self) -> Arc<dyn ObjectStore> {
+        Arc::clone(self.data_store.as_ref().unwrap_or(&self.store))
     }
 
     /// The prefix of the dataset folders (`…/cayenne/v1/datasets`) in [`Self::store`].

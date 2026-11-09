@@ -1819,7 +1819,7 @@ pub async fn build_s3_object_store(
         tracing::debug!("Standard S3 object store configured for data path {data_path}");
         return Ok(Some(cayenne::metadata::ObjectStoreConfig {
             url,
-            store: metered_data_store(store),
+            store,
         }));
     }
     // Check if this is S3 Express One Zone storage
@@ -1873,7 +1873,7 @@ pub async fn build_s3_object_store(
 
         return Ok(Some(cayenne::metadata::ObjectStoreConfig {
             url: primary_url,
-            store: metered_data_store(Arc::new(MultiZoneS3ExpressStore::new(zone_stores))),
+            store: Arc::new(MultiZoneS3ExpressStore::new(zone_stores)),
         }));
     }
 
@@ -1886,17 +1886,8 @@ pub async fn build_s3_object_store(
 
     Ok(Some(cayenne::metadata::ObjectStoreConfig {
         url,
-        store: metered_data_store(store),
-    }))
-}
-
-/// A data-path store whose requests count in the `state_store_*` metrics with
-/// `feature="cayenne"`, as the metastore's do.
-fn metered_data_store(store: Arc<dyn object_store::ObjectStore>) -> Arc<dyn object_store::ObjectStore> {
-    runtime_state_location::metrics::metered(
         store,
-        runtime_state_location::StateFeature::CayenneMetastore,
-    )
+    }))
 }
 
 /// A standard S3 (or S3-compatible) store for `url` through the shared
