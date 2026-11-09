@@ -231,6 +231,16 @@ pub struct RemoveBySnapshot {
     pub snapshot_ids: Vec<String>,
 }
 
+/// Snapshots of one table, by id: retired by `RetireSnapshots`, forgotten by
+/// `ForgetRetired` once their files are deleted.
+#[derive(Clone, PartialEq, Eq, prost::Message)]
+pub struct SnapshotIds {
+    #[prost(string, tag = "1")]
+    pub table_id: String,
+    #[prost(string, repeated, tag = "2")]
+    pub snapshot_ids: Vec<String>,
+}
+
 #[derive(Clone, PartialEq, Eq, prost::Message)]
 pub struct SetFileStats {
     #[prost(string, tag = "1")]
@@ -540,7 +550,7 @@ pub enum Outcome {
 pub struct Action {
     #[prost(
         oneof = "action::Kind",
-        tags = "1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38"
+        tags = "1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40"
     )]
     pub kind: Option<action::Kind>,
 }
@@ -624,6 +634,14 @@ pub mod action {
         Prepare(super::Prepare),
         #[prost(message, tag = "38")]
         Resolve(super::Resolve),
+        /// Snapshots whose files await deletion. A commit that takes a snapshot out
+        /// of the live set retires it without this action; a checkpoint states the
+        /// retired set with it.
+        #[prost(message, tag = "39")]
+        RetireSnapshots(super::SnapshotIds),
+        /// Retired snapshots whose files are deleted.
+        #[prost(message, tag = "40")]
+        ForgetRetired(super::SnapshotIds),
     }
 }
 
@@ -675,6 +693,7 @@ impl Action {
             Kind::ClearInsertRecords(a) => &a.table_id,
             Kind::AddPartition(a) => &a.table_id,
             Kind::Unconverted(a) => &a.table_id,
+            Kind::RetireSnapshots(a) | Kind::ForgetRetired(a) => &a.table_id,
             Kind::AdvanceSourcePosition(_) | Kind::Prepare(_) | Kind::Resolve(_) => return None,
         })
     }
@@ -724,6 +743,8 @@ impl Action {
                 Kind::Unconverted(_) => "Unconverted",
                 Kind::Prepare(_) => "Prepare",
                 Kind::Resolve(_) => "Resolve",
+                Kind::RetireSnapshots(_) => "RetireSnapshots",
+                Kind::ForgetRetired(_) => "ForgetRetired",
             },
         }
     }

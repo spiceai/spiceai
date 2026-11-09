@@ -55,6 +55,7 @@ mod column_stats_test;
 mod commit_overwrite_atomicity_test;
 mod cross_partition_overwrite_test;
 mod cte_materialization_query_test;
+mod data_file_lifecycle_test;
 mod data_inlining_test;
 mod datafusion_dynamic_filter_backports_test;
 mod deletion_mode_harness;

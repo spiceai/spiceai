@@ -117,6 +117,12 @@ pub struct TableState {
     pub insert_records: BTreeMap<Vec<u8>, i64>,
     pub pending_write_back: BTreeMap<Vec<u8>, i64>,
     pub partitions: BTreeMap<String, Partition>,
+    /// Snapshots that left the live set and whose files are not yet deleted: the
+    /// durable retirement record. A commit that moves the current snapshot away
+    /// from one, or removes it from the protected set, retires it in the same
+    /// record; a sweep deletes its files only after that commit, and then
+    /// forgets it (`ForgetRetired`). A snapshot made live again leaves the set.
+    pub retired: BTreeSet<String>,
 }
 
 impl TableState {
@@ -363,7 +369,15 @@ impl DatasetState {
                         }
                     );
                 }
-                table.current_snapshot_id.clone_from(&a.snapshot_id);
+                let previous =
+                    std::mem::replace(&mut table.current_snapshot_id, a.snapshot_id.clone());
+                if previous != a.snapshot_id
+                    && !previous.is_empty()
+                    && !table.groups.contains_key(&previous)
+                {
+                    table.retired.insert(previous);
+                }
+                table.retired.remove(&a.snapshot_id);
             }
             Kind::AdvanceSeq(a) => {
                 let table = self.table(name, &a.table_id)?;
@@ -415,9 +429,9 @@ impl DatasetState {
                     .retain(|(snapshot, _), _| !selects(kind, &a.snapshot_ids, snapshot));
             }
             Kind::SetGroup(a) => {
-                self.table(name, &a.table_id)?
-                    .groups
-                    .insert(a.snapshot_id.clone(), a.seq);
+                let table = self.table(name, &a.table_id)?;
+                table.groups.insert(a.snapshot_id.clone(), a.seq);
+                table.retired.remove(&a.snapshot_id);
             }
             Kind::RemoveGroups(a) => {
                 let table = self.table(name, &a.table_id)?;
@@ -435,9 +449,16 @@ impl DatasetState {
                     );
                 }
                 let kind = select(a.select);
-                table
-                    .groups
-                    .retain(|snapshot, _| !selects(kind, &a.snapshot_ids, snapshot));
+                let current = table.current_snapshot_id.clone();
+                let mut removed = Vec::new();
+                table.groups.retain(|snapshot, _| {
+                    let keep = !selects(kind, &a.snapshot_ids, snapshot);
+                    if !keep && *snapshot != current {
+                        removed.push(snapshot.clone());
+                    }
+                    keep
+                });
+                table.retired.extend(removed);
             }
             Kind::AddDeleteFiles(a) => {
                 let table = self.table(name, &a.table_id)?;
@@ -664,6 +685,26 @@ impl DatasetState {
             }
             Kind::Unconverted(a) => {
                 self.unknown.insert(a.table_id.clone());
+            }
+            Kind::RetireSnapshots(a) => {
+                let table = self.table(name, &a.table_id)?;
+                for id in &a.snapshot_ids {
+                    ensure!(
+                        !table.live_snapshots().contains(id.as_str()),
+                        GuardSnafu {
+                            action: name,
+                            table_id: a.table_id.clone(),
+                            guard: format!("snapshot {id} is not live"),
+                        }
+                    );
+                }
+                table.retired.extend(a.snapshot_ids.iter().cloned());
+            }
+            Kind::ForgetRetired(a) => {
+                let table = self.table(name, &a.table_id)?;
+                for id in &a.snapshot_ids {
+                    table.retired.remove(id);
+                }
             }
             Kind::Prepare(a) => self.prepare(a)?,
             Kind::Resolve(a) => {
@@ -912,6 +953,111 @@ mod tests {
         Record {
             actions: vec![action],
         }
+    }
+
+    fn set_current(table_id: &str, snapshot: &str) -> Action {
+        Action::new(Kind::SetCurrentSnapshot(crate::proto::SetCurrentSnapshot {
+            table_id: table_id.into(),
+            snapshot_id: snapshot.into(),
+            ..Default::default()
+        }))
+    }
+
+    fn set_group(table_id: &str, snapshot: &str) -> Action {
+        Action::new(Kind::SetGroup(crate::proto::SetGroup {
+            table_id: table_id.into(),
+            snapshot_id: snapshot.into(),
+            seq: 1,
+        }))
+    }
+
+    fn remove_groups(table_id: &str, snapshots: &[&str]) -> Action {
+        Action::new(Kind::RemoveGroups(crate::proto::RemoveGroups {
+            table_id: table_id.into(),
+            select: crate::proto::Select::Listed as i32,
+            snapshot_ids: snapshots.iter().map(ToString::to_string).collect(),
+            require_present: true,
+        }))
+    }
+
+    fn retired(state: &DatasetState) -> Vec<&str> {
+        state.tables["t"]
+            .retired
+            .iter()
+            .map(String::as_str)
+            .collect()
+    }
+
+    /// Every snapshot that leaves the live set is retired by the commit that
+    /// takes it out, and only those: a protected snapshot the current one moves
+    /// to, or a snapshot made live again, is not retired.
+    #[test]
+    fn a_snapshot_that_leaves_the_live_set_is_retired_by_that_commit() {
+        let mut state = DatasetState::default();
+        state.apply(&one(create("t"))).expect("create");
+        state
+            .apply(&Record {
+                actions: vec![set_group("t", "g1"), set_group("t", "g2")],
+            })
+            .expect("protect");
+        assert!(retired(&state).is_empty());
+
+        // A protected merge: g1 and g2 out, g3 in.
+        state
+            .apply(&Record {
+                actions: vec![remove_groups("t", &["g1", "g2"]), set_group("t", "g3")],
+            })
+            .expect("merge");
+        assert_eq!(retired(&state), ["g1", "g2"]);
+
+        // The current snapshot moves to a protected one: the old current is
+        // retired, the protected one stays live.
+        state.apply(&one(set_current("t", "g3"))).expect("move");
+        assert_eq!(retired(&state), ["g1", "g2", "s"]);
+
+        // A full rewrite: every protected snapshot and the current one retire.
+        state
+            .apply(&Record {
+                actions: vec![
+                    Action::new(Kind::RemoveGroups(crate::proto::RemoveGroups {
+                        table_id: "t".into(),
+                        select: crate::proto::Select::All as i32,
+                        ..Default::default()
+                    })),
+                    set_current("t", "c2"),
+                ],
+            })
+            .expect("rewrite");
+        assert_eq!(retired(&state), ["g1", "g2", "g3", "s"]);
+
+        // Made live again: no longer retired.
+        state.apply(&one(set_group("t", "g1"))).expect("restore");
+        assert_eq!(retired(&state), ["g2", "g3", "s"]);
+
+        // Forgotten after deletion, and a forgotten id is not retired again by
+        // forgetting it twice.
+        let forget = || {
+            Action::new(Kind::ForgetRetired(crate::proto::SnapshotIds {
+                table_id: "t".into(),
+                snapshot_ids: vec!["g2".into(), "s".into()],
+            }))
+        };
+        state.apply(&one(forget())).expect("forget");
+        state.apply(&one(forget())).expect("forget again");
+        assert_eq!(retired(&state), ["g3"]);
+
+        // A live snapshot cannot be stated retired.
+        let refused = state.apply(&one(Action::new(Kind::RetireSnapshots(
+            crate::proto::SnapshotIds {
+                table_id: "t".into(),
+                snapshot_ids: vec!["c2".into()],
+            },
+        ))));
+        assert!(
+            matches!(&refused, Err(ApplyError::Guard { guard, .. }) if guard == "snapshot c2 is not live"),
+            "{refused:?}"
+        );
+        assert_eq!(retired(&state), ["g3"]);
     }
 
     #[test]

@@ -52,7 +52,7 @@ pub const DATASET_STORE_SCHEME: &str = "cayenne";
 const STORE_NAME: &str = "cayenne";
 
 /// Deletes are passed to the inner store in batches of at most this many paths.
-const DELETE_BATCH: usize = 1_000;
+pub(crate) const DELETE_BATCH: usize = 1_000;
 
 /// A store for a dataset whose data is in a local directory addressed as
 /// `file:///…`: object paths are absolute paths without the leading `/`, and
@@ -213,6 +213,56 @@ impl DatasetStorage {
                 source: Box::new(error),
             })
     }
+}
+
+/// What one batched delete did to each path it was given.
+#[derive(Debug, Default)]
+pub(crate) struct BatchedDelete {
+    /// Paths the store reports deleted by this call.
+    pub deleted: std::collections::HashSet<Path>,
+    /// Paths the store reports absent: deleted by an earlier pass, so this call
+    /// reclaimed nothing for them.
+    pub missing: std::collections::HashSet<Path>,
+    /// Paths given but neither deleted nor absent, so they may still be stored.
+    pub failed: usize,
+    /// The first error for a failed path.
+    pub first_error: Option<ObjectStoreError>,
+}
+
+/// Delete `paths` through `store`'s `delete_stream`, which an S3 store sends as
+/// `DeleteObjects` requests of up to [`DELETE_BATCH`] keys each, instead of one
+/// request per object. Every path is attempted; a failure of one does not stop
+/// the others.
+pub(crate) async fn delete_in_batches(
+    store: &Arc<dyn ObjectStore>,
+    paths: Vec<Path>,
+) -> BatchedDelete {
+    let mut outcome = BatchedDelete::default();
+    if paths.is_empty() {
+        return outcome;
+    }
+    let given: std::collections::HashSet<Path> = paths.iter().cloned().collect();
+    let mut results = store.delete_stream(stream::iter(paths.into_iter().map(Ok)).boxed());
+    while let Some(result) = results.next().await {
+        match result {
+            Ok(path) => {
+                outcome.deleted.insert(path);
+            }
+            Err(ObjectStoreError::NotFound { path, .. }) => {
+                outcome.missing.insert(Path::from(path));
+            }
+            Err(error) => {
+                if outcome.first_error.is_none() {
+                    outcome.first_error = Some(error);
+                }
+            }
+        }
+    }
+    outcome.failed = given
+        .iter()
+        .filter(|path| !outcome.deleted.contains(*path) && !outcome.missing.contains(*path))
+        .count();
+    outcome
 }
 
 fn outside(authority: &str, location: &str) -> ObjectStoreError {
