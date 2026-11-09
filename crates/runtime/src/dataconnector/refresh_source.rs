@@ -112,7 +112,7 @@ struct SourceFailureReport {
 /// (rejected credentials, TLS), which no retry clears, and a warning otherwise.
 /// Queries keep being served from the acceleration either way.
 ///
-/// The status is set on every failure while the dataset is registered, not only
+/// The status is set on every failure while the dataset is registered and loaded, not only
 /// when a report is due, so a status written over it (such as registration's) is
 /// restored by the next attempt. Before the dataset is registered it is not served
 /// from anything, so the status is left to the loader.
@@ -150,7 +150,7 @@ impl ReportingRefreshSource {
         })
     }
 
-    fn report(&self, err: &RefreshSourceError) {
+    async fn report(&self, err: &RefreshSourceError) {
         let configuration_error = err
             .downcast_ref::<crate::dataconnector::DataConnectorError>()
             .is_some_and(|err| !err.is_retriable());
@@ -160,16 +160,18 @@ impl ReportingRefreshSource {
             super::reconnecting::unreachable_source_warning(&self.dataset.name, &err.to_string())
         };
         // The message says the dataset is served from its acceleration, which is
-        // true only once the dataset is registered. Until then the loader owns
-        // its status, and when the load fails (an acceleration that cannot be
-        // opened without the source, say) the dataset is never registered: its
-        // status must keep the load error that names the fix, not flip back to
-        // this every time the source is retried (#16149).
+        // true only once its loaded provider is registered. Until then the loader
+        // owns its status, and when the load fails (an acceleration that cannot be
+        // opened without the source, say) the dataset is never registered, or
+        // stays a first-reference placeholder: its status must keep the load error
+        // that names the fix, not flip back to this every time the source is
+        // retried (#16149).
         if self
             .dataset
             .runtime()
             .datafusion()
-            .table_exists(&self.dataset.name)
+            .serves_loaded_dataset(&self.dataset.name)
+            .await
         {
             self.status.update_dataset(
                 &self.dataset.name,
@@ -233,7 +235,7 @@ impl RefreshSource for ReportingRefreshSource {
         let result = self.inner.read_provider().await;
         match &result {
             Ok(_) => self.reached(),
-            Err(err) => self.report(err),
+            Err(err) => self.report(err).await,
         }
         result
     }

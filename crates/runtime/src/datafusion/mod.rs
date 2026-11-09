@@ -2950,6 +2950,19 @@ impl DataFusion {
     ///
     /// Single `Acquire`-ordered atomic load. Pods with no deferred
     /// datasets, and post-warm-up pods, pay nothing here.
+    /// Whether `dataset_name` is registered with its loaded provider: registered,
+    /// and not a placeholder still awaiting its first-reference initialization
+    /// (which stays registered when that initialization fails).
+    pub async fn serves_loaded_dataset(&self, dataset_name: &TableReference) -> bool {
+        self.table_exists(dataset_name)
+            && (!self.has_pending_initializations()
+                || !self
+                    .pending_initializations
+                    .read()
+                    .await
+                    .contains_key(dataset_name))
+    }
+
     #[must_use]
     pub fn has_pending_initializations(&self) -> bool {
         self.pending_initializations_count
