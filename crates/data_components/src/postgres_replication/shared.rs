@@ -3426,9 +3426,11 @@ async fn run_pump(source: Arc<SharedSource>, shutdown_drain: crate::cdc::Shutdow
     // chunk of filtered/unrelated WAL the slot decodes), so emit at most one
     // heartbeat round per `heartbeat_every`. The per-keepalive `credit_idle`
     // ACK is unaffected. Members share the slot's connection params, so the
-    // interval is derived from the source's ready_lag.
+    // interval is derived from the source's ready_lag. Set to `None` on every
+    // successful connect, below, so a heartbeat sent on an earlier connection
+    // never throttles the next one.
     let heartbeat_every = crate::cdc::heartbeat_interval(params.ready_lag);
-    let mut last_heartbeat_at: Option<std::time::Instant> = None;
+    let mut last_heartbeat_at: Option<std::time::Instant>;
     // When the stream dropped (set as the inner loop breaks to reconnect); consumed
     // on the next successful connect to attribute the disconnected duration.
     let mut disconnect_at: Option<std::time::Instant> = None;
