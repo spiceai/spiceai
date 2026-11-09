@@ -58,6 +58,10 @@ spicepod:
 
 defaults:
   expect: { oracle: src }
+  # Every query is checked against its instance's own source. The `drive`
+  # writes run for a number of rounds that depends on timing, so instances end
+  # with different rows and are not compared with one another.
+  compare-variants: false
 
 steps:
   - source-exec:
