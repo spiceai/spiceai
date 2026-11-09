@@ -43,6 +43,9 @@ spicepod:
 
 defaults:
   expect: { oracle: src }
+  # Each variant drives its own source until its own compaction starts, so
+  # their rows differ by design; each is checked against its own source instead.
+  compare-variants: false
 
 steps:
   - source-exec:

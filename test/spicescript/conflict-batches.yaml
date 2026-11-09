@@ -23,8 +23,11 @@ variants:
   partitioned:
     when: { mode: file }
     datasets: { across: &part { acceleration: { partition_by: [region] } }, wsame: *part, wdiff: *part, ap: *part }
-  # The spicepod as written, with the prototype object-native Cayenne metastore.
-  object-native: object-native
+  # Each variant above that keeps an unpartitioned Cayenne file acceleration,
+  # with the prototype object-native Cayenne metastore.
+  upsert-object-native: { datasets: { across: *upsert, wsame: *upsert, wdiff: *upsert, ap: *upsert, lp: *upsert }, spicepod: &vnext { runtime: { params: { cayenne_vnext: enabled } } } }
+  drop-object-native: { datasets: { across: *drop, wsame: *drop, wdiff: *drop, ap: *drop, lp: *drop }, spicepod: *vnext }
+  none-object-native: { spicepod: *vnext }
 
 spicepod:
   version: v1
