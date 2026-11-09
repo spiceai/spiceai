@@ -307,7 +307,15 @@ fn run<'m, S: Shared<'m>>(
                 }
             }
         }
-        admit(model, shared, split, &mut slots, &mut waiting, eog, &mut tick);
+        admit(
+            model,
+            shared,
+            split,
+            &mut slots,
+            &mut waiting,
+            eog,
+            &mut tick,
+        );
         if !step(model, shared, split, &mut slots, &mut tick) {
             std::thread::sleep(PAUSED_POLL);
         }
@@ -354,7 +362,16 @@ fn admit<'m, S: Shared<'m>>(
             return;
         };
         let argmax = split && greedy_alone(slots);
-        start(model, shared, argmax, &mut slots[free], job, eog, reserve, tick);
+        start(
+            model,
+            shared,
+            argmax,
+            &mut slots[free],
+            job,
+            eog,
+            reserve,
+            tick,
+        );
     }
 }
 
