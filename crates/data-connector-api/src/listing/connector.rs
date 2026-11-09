@@ -4657,6 +4657,112 @@ mod tests {
         );
     }
 
+    fn write_id_file(path: &std::path::Path, ids: &[i64]) {
+        if path.extension().is_some_and(|ext| ext == "csv") {
+            let body: String = ids.iter().map(|id| format!("{id}\n")).collect();
+            std::fs::write(path, format!("id\n{body}")).expect("write csv");
+            return;
+        }
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "id",
+            arrow_schema::DataType::Int64,
+            false,
+        )]));
+        let batch = datafusion::arrow::record_batch::RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![Arc::new(datafusion::arrow::array::Int64Array::from(
+                ids.to_vec(),
+            ))],
+        )
+        .expect("batch");
+        let file = std::fs::File::create(path).expect("create parquet file");
+        let mut writer = datafusion::parquet::arrow::ArrowWriter::try_new(file, schema, None)
+            .expect("parquet writer");
+        writer.write(&batch).expect("write batch");
+        writer.close().expect("close parquet file");
+    }
+
+    async fn id_rows(ctx: &SessionContext) -> DFResult<usize> {
+        let batches = ctx.sql("SELECT id FROM facts").await?.collect().await?;
+        Ok(batches
+            .iter()
+            .map(datafusion::arrow::record_batch::RecordBatch::num_rows)
+            .sum())
+    }
+
+    /// The guard `wrap` stacks over a file listing, for CSV and Parquet: removing
+    /// every matching file fails the scan with the missing-source error instead of
+    /// answering zero rows, an existing zero-row file still scans as zero rows, and
+    /// restored files are read again.
+    #[tokio::test]
+    async fn reject_empty_listing_errors_on_a_removed_source_and_reads_restored_files() {
+        for extension in [".csv", ".parquet"] {
+            let dir = tempfile::tempdir().expect("tempdir");
+            let file = dir.path().join(format!("part-0{extension}"));
+            write_id_file(&file, &[1, 2, 3]);
+
+            let table_path = ListingTableUrl::parse(format!("{}/", dir.path().display()))
+                .expect("listing table url");
+            let format: Arc<dyn FileFormat> = if extension == ".csv" {
+                Arc::new(CsvFormat::default().with_has_header(true))
+            } else {
+                Arc::new(ParquetFormat::default())
+            };
+            let options = ListingOptions::new(format).with_file_extension(extension);
+            let schema = Arc::new(Schema::new(vec![Field::new(
+                "id",
+                arrow_schema::DataType::Int64,
+                false,
+            )]));
+            let listing = Arc::new(
+                ListingTable::try_new(
+                    ListingTableConfig::new(table_path.clone())
+                        .with_listing_options(options)
+                        .with_schema(schema),
+                )
+                .expect("create listing table"),
+            );
+            let provider = reject_empty_listing(
+                listing,
+                None,
+                table_path,
+                "facts".to_string(),
+                extension.to_string(),
+            );
+            let ctx = SessionContext::new();
+            ctx.register_table("facts", provider)
+                .expect("register table");
+
+            assert_eq!(id_rows(&ctx).await.expect("initial scan"), 3, "{extension}");
+
+            std::fs::remove_file(&file).expect("remove the only data file");
+            let err = id_rows(&ctx)
+                .await
+                .expect_err("a removed source is an error, not zero rows")
+                .to_string();
+            assert!(
+                err.contains("No data files are yet available for dataset facts"),
+                "{extension}: {err}"
+            );
+
+            write_id_file(&file, &[]);
+            assert_eq!(
+                id_rows(&ctx)
+                    .await
+                    .expect("an existing zero-row file scans"),
+                0,
+                "{extension}"
+            );
+
+            write_id_file(&file, &[1, 2, 3, 4]);
+            assert_eq!(
+                id_rows(&ctx).await.expect("a restored file is read"),
+                4,
+                "{extension}"
+            );
+        }
+    }
+
     #[tokio::test]
     async fn test_location_pushdown_stays_inexact_for_other_metadata_filters() {
         use datafusion_expr::{col, lit};
