@@ -1675,6 +1675,38 @@
     },
     {
       "run": "mysql-cdc-parity",
+      "who": "object-native-data-rustfs",
+      "key": "query: SELECT * FROM orders #9",
+      "kind": "error",
+      "signature": "still failing after <n> attempts over <duration>: Spice rejected the query: Query execution failed. table 'spice.public.orders' not found: table 'spice.public.orders' not found",
+      "group": "cayenne"
+    },
+    {
+      "run": "mysql-cdc-parity",
+      "who": "object-native-data-rustfs",
+      "key": "query: SELECT * FROM customers #8",
+      "kind": "error",
+      "signature": "still failing after <n> attempts over <duration>: Spice rejected the query: Query execution failed. table 'spice.public.customers' not found: table 'spice.public.customers' not found",
+      "group": "cayenne"
+    },
+    {
+      "run": "mysql-cdc-parity",
+      "who": "object-native-data-rustfs-latency",
+      "key": "query: SELECT * FROM orders #9",
+      "kind": "error",
+      "signature": "still failing after <n> attempts over <duration>: Spice rejected the query: Query execution failed. table 'spice.public.orders' not found: table 'spice.public.orders' not found",
+      "group": "cayenne"
+    },
+    {
+      "run": "mysql-cdc-parity",
+      "who": "object-native-data-rustfs-latency",
+      "key": "query: SELECT * FROM customers #8",
+      "kind": "error",
+      "signature": "still failing after <n> attempts over <duration>: Spice rejected the query: Query execution failed. table 'spice.public.customers' not found: table 'spice.public.customers' not found",
+      "group": "cayenne"
+    },
+    {
+      "run": "mysql-cdc-parity",
       "who": "object-native-data-local",
       "key": "query: SELECT * FROM customers #9",
       "kind": "error",

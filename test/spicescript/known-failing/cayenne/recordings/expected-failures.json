@@ -34,24 +34,6 @@
       ]
     }
   ],
-  "cayenne-file-create-reload": [
-    {
-      "run": "cayenne-file-create-reload",
-      "who": "default",
-      "key": "query: SELECT id, v FROM file_create_reload #2",
-      "kind": "empty",
-      "signature": "still failing after <n> attempts over <duration>: Spice returned no rows, expected 16",
-      "group": "cayenne"
-    },
-    {
-      "run": "cayenne-file-create-reload",
-      "who": "default",
-      "key": "query: SELECT id, v FROM file_create_reload #3",
-      "kind": "empty",
-      "signature": "still failing after <n> attempts over <duration>: Spice returned no rows, expected 24",
-      "group": "cayenne"
-    }
-  ],
   "cayenne-file-durability-date-key": [
     {
       "run": "cayenne-file-durability-date-key",
