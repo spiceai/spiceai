@@ -115,7 +115,7 @@ own section below — a count here would be one more thing to keep true by hand.
 | [candle-layer-norm](#candle-and-its-kernel-crates) | `dfdbfbb953ceeb0366e5e3b69f2933204309d3dd` | `main` |
 | [candle-rotary](#candle-and-its-kernel-crates) | `e12f91a6c8beec5373ccec91a5ccad80619cf065` | `main` |
 | [clickhouse-rs](#clickhouse-rs) | `d93e350575d4be2f56f37d513bfbfc672d128528` | `async-await` |
-| [datafusion](#datafusion) | `c766690ae1a0a7dab5a223a6ac57b98ad9d725e7` | `spiceai-55` |
+| [datafusion](#datafusion) | `59a3510f01992a0fe486c5c4bf337422a7533403` | `spiceai-55` |
 | [datafusion-ballista](#datafusion-ballista) | `6e7a8775a6deb99c2ebf924f1ff5b3111d38e615` | `spiceai-55` |
 | [datafusion-federation](#datafusion-federation-and-datafusion-table-providers) | `300acfcfb51abfa9c477f57bff3e0529ec4f5f1a` | `spiceai-55` |
 | [datafusion-table-providers](#datafusion-federation-and-datafusion-table-providers) | `d323656c3bebc04fdce2ebc1cec31081f53b100d` | `spiceai-55` |
@@ -231,7 +231,10 @@ every join's output cooperative. On top of #280, #281 reads a sort key over a
 `SELECT DISTINCT` that the list does not show from a `SELECT` above it, #282 refuses a
 derived table whose outputs PostgreSQL shortens to one name, #276 keeps an ungrouped
 `COUNT` that eager aggregation pushes below a join at 0 when the join emits no rows, and #285
-keeps that count's field non-nullable. On top of #285, #283 bounds grouped top-k preallocation and #287 stores a compacted copy of each nested `COUNT(DISTINCT …)` value. The pin is the merge commit of #287. These commits descend
+keeps that count's field non-nullable. On top of #285, #283 bounds grouped top-k preallocation and #287 stores a compacted copy of each nested `COUNT(DISTINCT …)` value. On top of #287,
+#286 hands an async UDF batches no larger than its `ideal_batch_size`, and #288 keeps a struct column
+in a Parquet scan's projection and row filter when `get_field` keys into a map inside it, and makes
+`get_field` apply the parent's nulls to the field it extracts. The pin is the merge commit of #288. These commits descend
 from #268's merge commit, so the existing patches remain in the commit ancestry. None changes a
 manifest except the `IoWaitHook` patch, which adds `pin-project-lite` to `common-runtime`'s. #240 threads its metadata filters through the listing calls in
 `catalog-listing`'s `table.rs` and `helpers.rs`, next to the metadata-column rows'
@@ -286,6 +289,7 @@ is the same shape as the loss these guards exist to catch ([#13625](https://gith
 | CASE type inference reads every result branch (fork PR #272) | Pre-analysis schemas can report Int32 while execution produces the common wider type | query failure | `test/spicescript/case-mixed-widths.yaml`; fork `issue_15538_case_schema_includes_all_result_branches` |
 | Unsigned negation returns a checked signed result; UInt64 returns Int64, accepting -2^63 and rejecting overflow (fork PR #272). Ranking results remain UInt64 | Negating ranking functions is rejected, or unsigned negation returns decimal instead of signed BIGINT | result type mismatch; query failure | `test/spicescript/unsigned-negation.yaml`, `test/spicescript/mysql-unsigned-negation.yaml`; fork signed-result schema and execution regressions |
 | Aggregate dependencies retain only proven group dependencies (fork PR #272) | DISTINCT over a join can make later grouping discard keys and merge groups | wrong data | `test/spicescript/groupby-join-key-dependency.yaml`; fork `issue_15538_aggregate_dependencies_do_not_invent_join_dependencies` |
+| Parquet struct-field pruning stops at the first step that is not a struct, so `get_field(s, 'm', 'k')` over a map `m` inside struct `s` reads all of `s.m` and looks the key up on the decoded batch; when a file's `s` lacks a field the table's has, the schema adapter narrows `get_field(CAST(s), 'm', 'k')` to `get_field(s, 'm', 'k')` while the map type is unchanged, so the row filter still applies to that file; `get_field` applies the parent struct's or map's nulls to the field it extracts, for every child layout including `Null`, sparse and dense `Union` and `RunEndEncoded`, without duplicating a dense union's shared slots or expanding runs (spiceai/datafusion#288) | The scan treats the map key as a nested Parquet field, matches no leaf, and drops `s` from its read schema. `SELECT s['m']['k']` on a federated Parquet dataset fails with `Internal error: PhysicalExpr Column references column 's' …`, and the same lookup in `WHERE` fails in the row filter. Losing the cast-narrowing fix can also drop the predicate silently: the PR's run at fork `a10eb645` showed `SELECT id FROM evo WHERE som['mm']['k'] = 1` returning `[0, 2, 3]` instead of `[0, 2]`, with no error. Losing the parent-null masking returns a child's leftover value for a row whose parent struct is NULL once the cast is narrowed away | query failure; silent (wrong data) | `test/spicescript/parquet-struct-map-key.yaml` (federated against Arrow and Cayenne, with an `explain` check that the lookup is pushed into the scan, and a dataset whose files' structs differ). In the fork, `projection_read_plan.rs::build_projection_read_plan_keeps_map_under_struct_for_key_lookup`, `row_filter.rs::get_field_map_key_under_struct_filters_rows` and `get_field_map_key_under_evolved_struct_filters_rows`, `schema_rewriter.rs::test_narrow_struct_cast_map_key_under_evolved_struct`, `getfield.rs::test_get_field_applies_parent_struct_nulls` and the `test_get_field_*_with_nullable_parent`, `test_get_field_dense_union_shared_offset_no_value_duplication` and `test_get_field_ree_preserves_*` cases, and `parquet_nested_schema_pruning.slt` |
 | Unparser: a projection reading no aggregate outputs keeps the aggregation in a derived table (#15538) | A pruned global aggregate returns its input's rows instead of one row, and a pruned grouped aggregate loses its groups | silent (wrong data) | `test/spicescript/unparse-pruned-aggregate.yaml`, including empty inputs, nested aggregates, `HAVING`, and `QUALIFY`; in the fork, `test_unparser_preserves_pruned_aggregate_rows` |
 | Unparser: aggregate scopes retain correlated subquery bindings and require uniquely addressable grouping outputs (fork PR #270) | Correlated projections lose their FROM binding; grouping sets hit internal grouping-id errors; qualified duplicate grouping names collide | query failure | `test/spicescript/unparse-aggregate-scopes.yaml`; fork `test_unparser_preserves_aggregate_projection_scope_guards` |
 | Unparser: scan filters apply before scan projection (#15538) | The SQL for a filtered INTERSECT or EXCEPT reads `right.id` outside a derived table that projects only the compared columns | silent (query failure) | `test/spicescript/unparse-set-operations.yaml`; in the fork, `test_unparser_preserves_filtered_set_operation_scope` |
@@ -365,6 +369,7 @@ is the same shape as the loss these guards exist to catch ([#13625](https://gith
 | `HashJoinExec`, `SortMergeJoinExec`, `NestedLoopJoinExec` and `CrossJoinExec` wrap their output streams in `coop::cooperative`, so each output batch spends the cooperative budget (spiceai/datafusion#279, #280) | A join with a high fan-out yields many output batches per input batch without polling an input, so the task running it never yields: a query that times out or whose client disconnects keeps its CPU busy until the join finishes the input it holds, up to ~26 s measured on a nested-loop join ([#15741](https://github.com/spiceai/spiceai/issues/15741)) | silent (CPU / hang) | `crates/runtime-datafusion/src/fork_backport_guards.rs::every_join_yields_to_the_scheduler`; in the fork, `physical-plan/src/joins/cancellation_tests.rs` and `core/tests/execution/coop.rs::nested_loop_join_agg_yields` and `::cross_join_agg_yields` |
 | Grouped top-k preallocation is bounded by a constant instead of `LIMIT` (`TopKHashTable`/`TopKHeap`/`PriorityMap` in the aggregates path; spiceai/datafusion#283) | `TopKHashTable`/`TopKHeap`/`PriorityMap` preallocate proportional to `LIMIT` (unchecked multiply), so a huge `LIMIT` over a small input OOMs outside the memory pool | silent (query failure / memory) | **GAP** — see [Open gaps](#open-gaps) |
 | `COUNT(DISTINCT …)` over a list, struct, map or other nested value stores a compacted copy of each value it first inserts, in `DistinctCountAccumulator` and `SlidingDistinctCountAccumulator`, so a stored value no longer shares the buffers of the batch it was read from (`functions-aggregate/src/count.rs`; spiceai/datafusion#287) | With two or more `COUNT(DISTINCT …)` in a query (no single-distinct rewrite), every distinct nested value is a one-row slice that keeps its whole batch alive and is charged for it, so the reservation grows with rows × batch size: two `COUNT(DISTINCT)` over 50,000 three-element lists asked for 56.8 GB and failed with `ResourcesExhausted`, federated and accelerated alike, grouped or not | silent (query failure / memory) | `crates/runtime-datafusion/src/fork_backport_guards.rs::several_count_distinct_over_nested_values_charge_each_value_once` (lists, structs and a grouped variant under a 256 MiB pool with spilling disabled); in the fork, `count::tests::*_size_charges_each_value_once` and `sqllogictest/test_files/count_distinct_nested_memory.slt` |
+| `AsyncFuncExec` coalesces its input to the smallest `ideal_batch_size` its async UDFs declare (or `execution.batch_size` when none declares one) and slices larger input batches, so it emits output after each UDF-sized batch (`physical-plan/src/async_func.rs`; spiceai/datafusion#286) | An async UDF that declares a smaller `ideal_batch_size`, such as `ai` and the `ai_*` decision functions, is called on every chunk of an 8,192-row batch before any row comes out, so a `LIMIT` above it cannot stop early and every row of the batch costs a model call | silent (cost / latency) | **GAP** — no test here drives an async UDF under a `LIMIT` and counts its calls; in the fork, `core/tests/user_defined/user_defined_async_scalar_functions.rs::test_async_udf_limit_stops_early` |
 
 ## arrow-rs
 
@@ -873,7 +878,7 @@ patch is a build failure, so no behaviour guard applies.
 
 ## Open gaps
 
-**59 rows above are marked GAP** — they have no repo-side guard. Every one of them
+**60 rows above are marked GAP** — they have no repo-side guard. Every one of them
 is accounted for below; `scripts/check_fork_patches.py` fails if that count and this
 sentence disagree, so the list cannot quietly fall behind the tables.
 
@@ -1021,7 +1026,10 @@ without becoming a flaky timing test:
     `snowflake-rs` note above: it is blocked with the rest of that fork);
     `async-openai` retry-after handling; `datafusion`'s `IoWaitHook` carry through
     `SpawnedTask`/`JoinSet`, which no cluster query here reaches yet (a stage's
-    scan is polled on Ballista's own shuffle-writer tasks, which are guarded).
+    scan is polled on Ballista's own shuffle-writer tasks, which are guarded);
+    `datafusion`'s async UDF input capped at the UDF's `ideal_batch_size`
+    (spiceai/datafusion#286), whose loss shows as more model calls before a `LIMIT`
+    stops, and which a test here could count once one serves `ai` from a stub model.
 
 **Unoptimised builds only.** No query answers anything differently; what is lost
 is stack headroom in a debug build (release builds were not measured):
