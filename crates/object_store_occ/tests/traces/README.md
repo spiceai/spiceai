@@ -212,3 +212,45 @@ LocalConditionalPut::new_durable, and compares the head and stored files with
 writer's commit is refused by `Writer::prepare` before any request; the replay
 checks that as the model's store-side refusal. Controls: a commit naming files
 whose PUT has not returned, and a reader that lists the prefix.
+
+## Data-file retirement traces
+
+`data-files-retire.jsonl` holds the witnesses of `data-files-retire` (16) and
+`data-files-retire-prepared` (18), `data-files-retire-walk.jsonl` 20 walks of
+each (seed 42, 40 steps), and `data-files-retire-controls.jsonl` the
+counterexample of each of six controls for the property it must fail. They
+exist only here. Generated serially from the repository root (`TRACE_JSON`
+appends, so delete the files first; the controls file is then filtered to the
+`FAIL` line of each run's expected property):
+
+    cargo build --release -p cayenne-metastore-model
+    B=target/release/cayenne-metastore-model; T=crates/object_store_occ/tests/traces
+    for r in data-files-retire data-files-retire-prepared; do
+      TRACE_JSON=$T/data-files-retire.jsonl $B run $r
+      WALK=42:20:40 TRACE_JSON=$T/data-files-retire-walk.jsonl $B run $r
+    done
+    for r in data-files-retire-sweep-uncommitted data-files-retire-ignores-pins \
+      data-files-retire-forget-early data-files-retire-ignores-live-references \
+      data-files-retire-ignores-restore-hold \
+      data-files-retire-prepared-orphan-ignores-reservation; do
+      EXHAUST=1 TRACE_JSON=$T/data-files-retire-controls.jsonl $B run $r
+    done
+
+`../data_file_replay.rs` replays them through the real head log, whose records
+here are this test's own retirement encoding (a snapshot that retires the
+snapshots live at its base, a prepared transaction, its resolve, a forget),
+folded into live and retired sets after every action, and through data PUTs,
+GETs and `delete_stream` deletes on the fault store (a failed delete is a
+`Fail` fault on its path). The sweep's rules are checked against the real
+head when a trace plans, deletes, forgets, starts a restore point or sweeps an
+orphan. Added invariants: a pinned scan's files, a restore point's remaining
+files and a prepared transaction's files exist, and a forgotten snapshot's
+files are gone unless a live or another retired snapshot names them. For each control
+counterexample the safe implementation must refuse the unsafe step by its
+rule, and the implementation with that rule removed must reach a state where
+an independent invariant fails.
+
+Not covered: the engine's `RetireSnapshots`/`ForgetRetired` actions and the
+catalog that answers the retired set are not driven (they live in the Cayenne
+crates); a scan's pins are the replay's own bookkeeping, not the engine's scan
+references; deletes go one key per request rather than in batches.

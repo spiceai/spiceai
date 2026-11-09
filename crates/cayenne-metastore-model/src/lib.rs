@@ -2375,6 +2375,71 @@ fn additional_runs() -> Vec<Run> {
             2,
             "aborted or abandoned upload never visible to a reader",
         ),
+        // Retirement of committed snapshots and reader protection.
+        ("data-files-retire", "data-files-intent-retire", 2, ""),
+        ("data-files-retire-3", "data-files-intent-retire", 3, ""),
+        (
+            "data-files-retire-sweep-uncommitted",
+            "data-files-intent-retire-sweep-uncommitted",
+            2,
+            "committed files exist",
+        ),
+        (
+            "data-files-retire-ignores-pins",
+            "data-files-intent-retire-ignores-pins",
+            2,
+            "pinned reader finds every file",
+        ),
+        (
+            "data-files-retire-forget-early",
+            "data-files-intent-retire-forget-early",
+            2,
+            "forgotten snapshot leaves no file",
+        ),
+        (
+            "data-files-retire-ignores-live-references",
+            "data-files-intent-retire-ignores-live-references",
+            2,
+            "committed files exist",
+        ),
+        (
+            "data-files-retire-3-ignores-pinned-references",
+            "data-files-intent-retire-ignores-pinned-references",
+            3,
+            "pinned reader finds every file",
+        ),
+        (
+            "data-files-retire-ignores-restore-hold",
+            "data-files-intent-retire-ignores-restore-hold",
+            2,
+            "restore point copies every file",
+        ),
+        (
+            "data-files-retire-prepared",
+            "data-files-intent-retire-prepared",
+            2,
+            "",
+        ),
+        (
+            "data-files-retire-prepared-lean-3",
+            "data-files-intent-retire-prepared-lean",
+            3,
+            "",
+        ),
+        (
+            "data-files-retire-prepared-orphan-ignores-reservation",
+            "data-files-intent-retire-prepared-orphan-ignores-reservation",
+            2,
+            "committed files exist",
+        ),
+        // Not a control: the retirement sweep's reservation check is not
+        // needed for these properties (see the README).
+        (
+            "data-files-retire-prepared-lean-3-retire-ignores-reservation",
+            "data-files-intent-retire-prepared-lean-retire-ignores-reservation",
+            3,
+            "",
+        ),
     ] {
         runs.push(Run {
             name,
@@ -3118,7 +3183,8 @@ pub fn transaction_steps(run: &str, actions: &[String]) -> Option<Vec<Transactio
 }
 
 pub use data_files::{
-    File as DataFile, Key as DataFileKey, Op as DataFileOp, Step as DataFileStep,
+    CommitKind as DataFileCommitKind, File as DataFile, Key as DataFileKey, Op as DataFileOp,
+    Prepared as DataFilePrepared, Snapshot as DataFileSnapshot, Step as DataFileStep,
 };
 
 /// What each action of a `data-files` trace from `run` does in the model, for a

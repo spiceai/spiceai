@@ -29,6 +29,35 @@
 //! out of every commit. (Cayenne's orphan sweep adds an age floor on the store's
 //! clock as a backstop; the `retention` runs model age.)
 //!
+//! In the `retire` runs (on top of `intent`) the head holds snapshots: each
+//! accepted commit is a snapshot named by its attempt, and the live set is the
+//! snapshots no commit has retired. A compaction is a commit that, in the same
+//! record, adds a new snapshot and retires every snapshot live at its base; it
+//! may keep a file of a retired snapshot in place (the new snapshot references
+//! it). The head records each accepted attempt, so an unknown outcome resolves
+//! by attempt, as the head log does, rather than by files a later compaction
+//! may retire. Reclamation runs in the lease holder's process: a sweep reads
+//! the committed retired set, and declines while the holder has a commit whose
+//! outcome it does not know (its local view would include a change that may not
+//! land), while a prepared transaction reserves the table, and while a restore
+//! point holds deletions. It skips each retired snapshot a scan pins, plans the
+//! deletes of the files of the rest that no live or pinned snapshot references
+//! (a compaction can keep a retired snapshot's file in place), and, only
+//! after every delete has returned, commits one record that forgets those
+//! snapshots (the retired entries and their files' rows together). Deletes are
+//! requests that can land late (after a crash or a takeover of the sweeping
+//! process) or fail; a sweep with a failed delete or a crash before its forget
+//! leaves the snapshots retired, and a later sweep deletes again (a delete of a
+//! missing key is a no-op) and forgets them. A scan reads the head and pins its
+//! live snapshots in one step and fetches their files; a restore point reads
+//! the head and copies the live files while it holds deletions. In the
+//! `prepared` runs a commit can instead record a prepared transaction: a new
+//! snapshot and the snapshots it retires, applied only by a later resolve
+//! commit (`CommitTx`) or discarded (`AbortTx`), and while it is unresolved the
+//! table refuses other changes and both sweeps decline. The orphan sweep treats
+//! a retired snapshot's files as named until its forget. `lean` runs have no
+//! scans or restore points, so a larger upload bound stays exhaustive.
+//!
 //! Controls: `no-upload-before-commit` lets a commit name a file whose upload
 //! has not returned; `no-committed-read` makes the reader list the store
 //! instead of reading the head; `no-resolve-by-head` resolves an unknown
@@ -37,7 +66,17 @@
 //! holder's sweep delete a file its own write in flight still holds (reclaiming
 //! too early); `adopt-by-listing` lets a commit name every unnamed file the
 //! store lists, as a maintenance pass that derives its file set from a listing
-//! would.
+//! would. In the `retire` runs: `sweep-uncommitted` plans from the holder's
+//! local view, with its compaction applied before the record commits;
+//! `ignores-pins` deletes a snapshot a scan pins; `forget-early` forgets the
+//! snapshots before their deletes return; `ignores-live-references` deletes a
+//! retired file a live snapshot keeps in place; `ignores-pinned-references`
+//! keeps only files live snapshots reference, so a file a pinned retired
+//! snapshot references in place goes with another retired snapshot's sweep;
+//! `ignores-restore-hold` sweeps
+//! while a restore point copies; `orphan-ignores-reservation` lets the orphan
+//! sweep run while a prepared transaction reserves the table, and
+//! `retire-ignores-reservation` lets the retirement sweep do so.
 use stateright::{Model, Property};
 
 /// Writer processes.
@@ -52,6 +91,12 @@ const ATTEMPTS: u8 = 3;
 const RETRIES: u8 = 1;
 /// Head reads by the reader.
 const READS: u8 = 2;
+/// In the `retire` runs: lease takeovers, scans, restore points and failed
+/// deletes, smaller so the added reclamation stays exhaustive.
+const RETIRE_TAKES: u8 = 1;
+const RETIRE_READS: u8 = 1;
+const RESTORES: u8 = 1;
+const DELETE_FAILURES: u8 = 1;
 
 #[derive(Clone, Debug)]
 pub(crate) struct Protocol {
@@ -70,6 +115,32 @@ pub struct Key {
 /// A key and the bytes stored under it, as the uploading writer's index: keys
 /// are unique, so the bytes are fixed by the upload that created the key.
 pub type File = (Key, u8);
+/// A committed snapshot: the attempt that committed it and its files.
+pub type Snapshot = (u8, Vec<File>);
+
+/// What a commit request publishes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum CommitKind {
+    /// A new snapshot of the uploaded files.
+    Append,
+    /// A new snapshot of the uploaded files that retires every snapshot live
+    /// at the base, in the same record.
+    Compact,
+    /// As `Compact`, and the new snapshot keeps the first file of the first
+    /// retired snapshot in place.
+    CompactKeep,
+    /// A prepared transaction: a new snapshot that retires every snapshot live
+    /// at the base, applied only when a later resolve commits it.
+    Prepare,
+}
+
+/// An unresolved prepared transaction the head records.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub struct Prepared {
+    pub id: u8,
+    pub files: Vec<File>,
+    pub retire: Vec<u8>,
+}
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 struct Request {
@@ -77,7 +148,13 @@ struct Request {
     writer: usize,
     generation: u8,
     base: u8,
+    /// New uploads the request names.
     files: Vec<File>,
+    kind: CommitKind,
+    /// Committed files the new snapshot keeps in place.
+    keep: Vec<File>,
+    /// Snapshots it retires.
+    retire: Vec<u8>,
 }
 #[derive(Clone, Debug, Default, PartialEq, Eq, Hash)]
 struct Writer {
@@ -90,6 +167,19 @@ struct Writer {
     /// The outstanding commit attempt, and whether its response was lost.
     pending: Option<(Request, bool)>,
 }
+/// A reclamation pass in one process: the snapshots it will forget, the
+/// generation it runs under, and whether one of its deletes failed.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+struct Sweep {
+    writer: usize,
+    generation: u8,
+    snapshots: Vec<u8>,
+    failed: bool,
+}
+/// A delete request in flight: the file, the sweeping process's generation, and
+/// whether the sweep that sent it still waits for it.
+type Delete = (File, u8, bool);
+
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 #[expect(
     clippy::struct_excessive_bools,
@@ -98,7 +188,8 @@ struct Writer {
 pub(crate) struct State {
     version: u8,
     lease: u8,
-    /// The committed file set the head names.
+    /// The committed file set the head names (in the `retire` runs: the files
+    /// of the live snapshots).
     head: Vec<File>,
     /// The committed file set at every head version (a ghost for the checks).
     history: Vec<Vec<File>>,
@@ -131,6 +222,39 @@ pub(crate) struct State {
     /// A fenced writer, still running, had an upload land after the takeover.
     fenced_landed: bool,
     reclaimed: bool,
+    // The `retire` runs; empty or false otherwise.
+    /// Committed live snapshots, by id.
+    live: Vec<Snapshot>,
+    /// Committed retired snapshots whose forget has not committed.
+    retired: Vec<Snapshot>,
+    /// Attempts the head records as accepted.
+    applied: Vec<u8>,
+    /// The unresolved prepared transaction the head records.
+    prepared: Option<Prepared>,
+    sweep: Option<Sweep>,
+    deletes: Vec<Delete>,
+    /// Snapshots the scan pins.
+    pins: Vec<u8>,
+    /// A restore point in progress: head version, the keys it copies, the next.
+    restore: Option<(u8, Vec<Key>, usize)>,
+    /// Every copy: key and whether the store returned it.
+    copied: Vec<(Key, bool)>,
+    /// Snapshots whose forget committed, with their files (a ghost).
+    forgotten: Vec<Snapshot>,
+    /// Snapshots a sweep planned and ended without forgetting (a ghost).
+    interrupted: Vec<u8>,
+    /// Each resolved unknown outcome, by attempt, and whether it resolved committed.
+    attempt_resolutions: Vec<(u8, bool)>,
+    restores: u8,
+    delete_failures: u8,
+    fetched_retired: bool,
+    kept_in_place: bool,
+    landed_after_takeover: bool,
+    resumed: bool,
+    copied_retired: bool,
+    tx_committed: bool,
+    tx_aborted: bool,
+    planned_while_reserved: bool,
 }
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum Action {
@@ -147,17 +271,45 @@ pub(crate) enum Action {
     Read,
     Fetch,
     Sweep(usize),
+    Compact(usize),
+    CompactKeep(usize),
+    Prepare(usize),
+    CommitTx(usize),
+    AbortTx(usize),
+    Plan,
+    DeleteLand(usize),
+    DeleteFail(usize),
+    Forget,
+    Unpin,
+    RestoreStart,
+    RestoreCopy,
+    RestoreEnd,
 }
 
 fn keys(files: &[File]) -> impl Iterator<Item = Key> + '_ {
     files.iter().map(|(k, _)| *k)
 }
-fn insert_sorted<T: Ord + Copy>(set: &mut Vec<T>, items: impl IntoIterator<Item = T>) {
+fn insert_sorted<T: Ord>(set: &mut Vec<T>, items: impl IntoIterator<Item = T>) {
     for item in items {
         if let Err(at) = set.binary_search(&item) {
             set.insert(at, item);
         }
     }
+}
+/// The union of the snapshots' files, sorted.
+fn files_of(snapshots: &[Snapshot]) -> Vec<File> {
+    let mut files = Vec::new();
+    for (_, named) in snapshots {
+        insert_sorted(&mut files, named.iter().copied());
+    }
+    files
+}
+/// Move the snapshots `ids` from `live` to `retired`.
+fn retire(live: &mut Vec<Snapshot>, retired: &mut Vec<Snapshot>, ids: &[u8]) {
+    let (gone, kept): (Vec<Snapshot>, Vec<Snapshot>) =
+        live.drain(..).partition(|(id, _)| ids.contains(id));
+    *live = kept;
+    insert_sorted(retired, gone);
 }
 
 impl Protocol {
@@ -170,6 +322,24 @@ impl Protocol {
     fn has(&self, t: &str) -> bool {
         self.mode.contains(t)
     }
+    fn retiring(&self) -> bool {
+        self.has("retire")
+    }
+    fn takes(&self) -> u8 {
+        if self.retiring() { RETIRE_TAKES } else { TAKES }
+    }
+    fn reads(&self) -> u8 {
+        if self.has("lean") {
+            0
+        } else if self.retiring() {
+            RETIRE_READS
+        } else {
+            READS
+        }
+    }
+    fn restores(&self) -> u8 {
+        if self.has("lean") { 0 } else { RESTORES }
+    }
     /// The store's files the committed head does not name, sorted.
     fn unnamed(s: &State) -> Vec<File> {
         s.store
@@ -181,6 +351,9 @@ impl Protocol {
     /// The writer holding the current lease, if one runs.
     fn holder(s: &State) -> Option<&Writer> {
         s.writers.iter().find(|w| w.generation == Some(s.lease))
+    }
+    fn holder_index(s: &State) -> Option<usize> {
+        s.writers.iter().position(|w| w.generation == Some(s.lease))
     }
     /// Whether `writer` recorded `file` before uploading it and has not seen the
     /// outcome of the commit that names it yet.
@@ -196,6 +369,126 @@ impl Protocol {
     fn named(s: &State, files: &[File]) -> usize {
         files.iter().filter(|f| s.head.contains(f)).count()
     }
+    /// Whether the outcome of `request` is committed, as the head shows it.
+    fn landed(&self, s: &State, request: &Request) -> bool {
+        if self.retiring() {
+            s.applied.contains(&request.attempt)
+        } else {
+            Self::named(s, &request.files) == request.files.len()
+        }
+    }
+    /// Whether the orphan sweep counts `file` as named: by a live snapshot, by
+    /// a retired snapshot until its forget, or, while a prepared transaction
+    /// reserves the table, by anything at all (the sweep declines).
+    fn named_for_orphans(&self, s: &State, file: File) -> bool {
+        s.head.contains(&file)
+            || s.retired.iter().any(|(_, files)| files.contains(&file))
+            || s.prepared.is_some() && !self.has("orphan-ignores-reservation")
+    }
+    /// The live and retired snapshots the sweeping process reads: the committed
+    /// head, and in `sweep-uncommitted` its own compaction in flight applied
+    /// as if it had landed.
+    fn local_view(&self, s: &State, holder: &Writer) -> (Vec<Snapshot>, Vec<Snapshot>) {
+        let (mut live, mut retired) = (s.live.clone(), s.retired.clone());
+        if self.has("sweep-uncommitted")
+            && let Some((request, _)) = &holder.pending
+            && matches!(request.kind, CommitKind::Compact | CommitKind::CompactKeep)
+            && !s.applied.contains(&request.attempt)
+        {
+            let mut files = request.files.clone();
+            insert_sorted(&mut files, request.keep.iter().copied());
+            retire(&mut live, &mut retired, &request.retire);
+            insert_sorted(&mut live, [(request.attempt, files)]);
+        }
+        (live, retired)
+    }
+    /// The sweep the lease holder would plan now: its process, the snapshots
+    /// it will forget, the deletes it sends, and whether a live snapshot kept
+    /// a file in place.
+    fn plan(&self, s: &State) -> Option<(usize, Vec<u8>, Vec<File>, bool)> {
+        let h = Self::holder_index(s)?;
+        let holder = &s.writers[h];
+        if s.sweep.is_some()
+            || s.prepared.is_some() && !self.has("retire-ignores-reservation")
+            || s.restore.is_some() && !self.has("ignores-restore-hold")
+            || holder.pending.is_some() && !self.has("sweep-uncommitted")
+        {
+            return None;
+        }
+        let (live, retired) = self.local_view(s, holder);
+        let candidates: Vec<&Snapshot> = retired
+            .iter()
+            .filter(|(id, _)| self.has("ignores-pins") || !s.pins.contains(id))
+            .collect();
+        if candidates.is_empty() {
+            return None;
+        }
+        // Files a live snapshot, or a snapshot a scan pins, references (in
+        // place, from a retired snapshot's files) stay.
+        let mut referenced = files_of(&live);
+        if !self.has("ignores-pinned-references") && !self.has("ignores-pins") {
+            for (_, files) in retired.iter().filter(|(id, _)| s.pins.contains(id)) {
+                insert_sorted(&mut referenced, files.iter().copied());
+            }
+        }
+        let mut doomed = Vec::new();
+        let mut kept = false;
+        for (_, files) in &candidates {
+            for f in files {
+                if self.has("ignores-live-references") || !referenced.contains(f) {
+                    insert_sorted(&mut doomed, [*f]);
+                } else {
+                    kept = true;
+                }
+            }
+        }
+        let ids = candidates.iter().map(|(id, _)| *id).collect();
+        Some((h, ids, doomed, kept))
+    }
+    /// Deletes in flight the running sweep still waits for.
+    fn outstanding(s: &State) -> usize {
+        s.deletes.iter().filter(|d| d.2).count()
+    }
+    /// End the running sweep without a forget: its deletes no longer report,
+    /// and its snapshots stay retired for a later sweep.
+    fn end_sweep(next: &mut State) {
+        if let Some(sweep) = next.sweep.take() {
+            for delete in &mut next.deletes {
+                delete.2 = false;
+            }
+            next.deletes.sort_unstable();
+            insert_sorted(&mut next.interrupted, sweep.snapshots);
+        }
+    }
+    /// After a delete of the running sweep returned: a sweep with a failed
+    /// delete ends once its last delete returns.
+    fn settle_sweep(next: &mut State) {
+        if next.sweep.as_ref().is_some_and(|sweep| sweep.failed) && Self::outstanding(next) == 0 {
+            Self::end_sweep(next);
+        }
+    }
+    fn refresh_head(next: &mut State) {
+        next.head = files_of(&next.live);
+    }
+    fn commit_enabled(&self, s: &State, w: usize, kind: CommitKind) -> bool {
+        let writer = &s.writers[w];
+        let ready = writer.generation.is_some()
+            && writer.pending.is_none()
+            && s.attempts < ATTEMPTS
+            && s.prepared.is_none();
+        ready
+            && match kind {
+                CommitKind::Append => {
+                    !writer.finished.is_empty()
+                        || self.has("no-upload-before-commit") && !writer.started.is_empty()
+                        || self.has("adopt-by-listing") && !Self::unnamed(s).is_empty()
+                }
+                CommitKind::Compact | CommitKind::CompactKeep => {
+                    self.retiring() && !writer.finished.is_empty() && !s.live.is_empty()
+                }
+                CommitKind::Prepare => self.has("prepared") && !writer.finished.is_empty(),
+            }
+    }
     /// Whether `action` is enabled in `s`. The model lists only enabled
     /// actions, so a seeded walk (`WALK`) runs to its length rather than
     /// stopping at the first disabled pick.
@@ -208,14 +501,10 @@ impl Protocol {
                     && s.uploads < self.uploads
             }
             Action::FinishUpload(i) => i < s.puts.len(),
-            Action::Commit(w) => {
-                writer(w).generation.is_some()
-                    && writer(w).pending.is_none()
-                    && s.attempts < ATTEMPTS
-                    && (!writer(w).finished.is_empty()
-                        || self.has("no-upload-before-commit") && !writer(w).started.is_empty()
-                        || self.has("adopt-by-listing") && !Self::unnamed(s).is_empty())
-            }
+            Action::Commit(w) => self.commit_enabled(s, w, CommitKind::Append),
+            Action::Compact(w) => self.commit_enabled(s, w, CommitKind::Compact),
+            Action::CompactKeep(w) => self.commit_enabled(s, w, CommitKind::CompactKeep),
+            Action::Prepare(w) => self.commit_enabled(s, w, CommitKind::Prepare),
             Action::Deliver(i) | Action::Drop(i) => i < s.net.len(),
             Action::Timeout(w) => matches!(writer(w).pending, Some((_, false))),
             Action::Retry(w) => match &writer(w).pending {
@@ -225,18 +514,18 @@ impl Protocol {
                 _ => false,
             },
             // The request could still land while the head is at its base, so
-            // the outcome stays unknown unless the head names its files.
+            // the outcome stays unknown unless the head shows it landed.
             Action::Resolve(w) => match &writer(w).pending {
                 Some((request, true)) => {
-                    Self::named(s, &request.files) == request.files.len()
+                    self.landed(s, request)
                         || s.version != request.base
                         || self.has("no-resolve-by-head")
                 }
                 _ => false,
             },
-            Action::Takeover(w) => s.takes < TAKES && writer(w).generation != Some(s.lease),
+            Action::Takeover(w) => s.takes < self.takes() && writer(w).generation != Some(s.lease),
             Action::Crash(w) => s.crashes < CRASHES && *writer(w) != Writer::default(),
-            Action::Read => s.reads < READS,
+            Action::Read => s.reads < self.reads() && (!self.retiring() || s.pins.is_empty()),
             Action::Fetch => s
                 .snapshot
                 .as_ref()
@@ -245,7 +534,7 @@ impl Protocol {
             // pass the lease condition. In the `intent` runs: an unnamed file
             // the holder's own intent does not protect.
             Action::Sweep(i) => s.store.get(i).is_some_and(|f| {
-                !s.head.contains(f)
+                !self.named_for_orphans(s, *f)
                     && if self.has("intent") {
                         Self::holder(s).is_some_and(|holder| {
                             self.has("sweep-ignores-intent") || !Self::intends(holder, *f)
@@ -254,7 +543,138 @@ impl Protocol {
                         f.0.generation < s.lease
                     }
             }),
+            Action::CommitTx(w) | Action::AbortTx(w) => {
+                s.prepared.is_some()
+                    && Self::holder_index(s) == Some(w)
+                    && writer(w).pending.is_none()
+            }
+            Action::Plan => self.retiring() && self.plan(s).is_some(),
+            Action::DeleteLand(i) => i < s.deletes.len(),
+            Action::DeleteFail(i) => i < s.deletes.len() && s.delete_failures < DELETE_FAILURES,
+            Action::Forget => s.sweep.as_ref().is_some_and(|sweep| {
+                self.has("forget-early") || !sweep.failed && Self::outstanding(s) == 0
+            }),
+            Action::Unpin => !s.pins.is_empty(),
+            Action::RestoreStart => {
+                self.retiring()
+                    && s.restores < self.restores()
+                    && s.restore.is_none()
+                    && (s.sweep.is_none() || self.has("ignores-restore-hold"))
+            }
+            Action::RestoreCopy => s
+                .restore
+                .as_ref()
+                .is_some_and(|(_, listed, next)| *next < listed.len()),
+            Action::RestoreEnd => s.restore.is_some(),
         }
+    }
+    /// Quiescence for the reclamation check: a lease holder runs with no
+    /// commit in flight, no scan or restore point holds anything, no
+    /// transaction is prepared, and only new work or faults remain enabled.
+    fn quiescent(&self, s: &State) -> bool {
+        let Some(holder) = Self::holder(s) else {
+            return false;
+        };
+        if holder.pending.is_some()
+            || !s.pins.is_empty()
+            || s.restore.is_some()
+            || s.prepared.is_some()
+        {
+            return false;
+        }
+        let mut listed = vec![];
+        self.actions(s, &mut listed);
+        !listed.into_iter().any(|a| {
+            !matches!(
+                a,
+                Action::StartUpload(_)
+                    | Action::Commit(_)
+                    | Action::Compact(_)
+                    | Action::CompactKeep(_)
+                    | Action::Prepare(_)
+                    | Action::Read
+                    | Action::RestoreStart
+                    | Action::Crash(_)
+                    | Action::Takeover(_)
+                    | Action::Timeout(_)
+                    | Action::Retry(_)
+                    | Action::Drop(_)
+                    | Action::DeleteFail(_)
+            )
+        })
+    }
+    fn send(&self, s: &State, next: &mut State, w: usize, kind: CommitKind) -> Option<()> {
+        let writer = &s.writers[w];
+        let generation = writer.generation?;
+        let mut files = writer.finished.clone();
+        if self.has("no-upload-before-commit") {
+            files.extend(writer.started.iter().copied());
+        }
+        if self.has("adopt-by-listing") {
+            let adopted: Vec<File> = Self::unnamed(s)
+                .into_iter()
+                .filter(|f| !files.contains(f))
+                .collect();
+            files.extend(adopted);
+        }
+        files.sort_unstable();
+        // The writer reads the head it commits on.
+        let retire: Vec<u8> = match kind {
+            CommitKind::Append => vec![],
+            _ => s.live.iter().map(|(id, _)| *id).collect(),
+        };
+        let keep: Vec<File> = match kind {
+            CommitKind::CompactKeep => s
+                .live
+                .first()
+                .and_then(|(_, files)| files.first())
+                .copied()
+                .into_iter()
+                .collect(),
+            _ => vec![],
+        };
+        let request = Request {
+            attempt: s.attempts,
+            writer: w,
+            generation,
+            base: s.version,
+            files,
+            kind,
+            keep,
+            retire,
+        };
+        next.attempts += 1;
+        let writer = &mut next.writers[w];
+        writer.finished.clear();
+        if self.has("no-upload-before-commit") {
+            writer.started.clear();
+        }
+        writer.pending = Some((request.clone(), false));
+        next.net.push(request);
+        Some(())
+    }
+    /// Apply an accepted request to the `retire` head.
+    fn publish(next: &mut State, request: &Request) {
+        insert_sorted(&mut next.applied, [request.attempt]);
+        match request.kind {
+            CommitKind::Append => {
+                insert_sorted(&mut next.live, [(request.attempt, request.files.clone())]);
+            }
+            CommitKind::Compact | CommitKind::CompactKeep => {
+                let mut files = request.files.clone();
+                insert_sorted(&mut files, request.keep.iter().copied());
+                retire(&mut next.live, &mut next.retired, &request.retire);
+                insert_sorted(&mut next.live, [(request.attempt, files)]);
+            }
+            CommitKind::Prepare => {
+                next.prepared = Some(Prepared {
+                    id: request.attempt,
+                    files: request.files.clone(),
+                    retire: request.retire.clone(),
+                });
+            }
+        }
+        Self::refresh_head(next);
     }
 }
 
@@ -289,6 +709,28 @@ impl Model for Protocol {
             fenced_refused: false,
             fenced_landed: false,
             reclaimed: false,
+            live: vec![],
+            retired: vec![],
+            applied: vec![],
+            prepared: None,
+            sweep: None,
+            deletes: vec![],
+            pins: vec![],
+            restore: None,
+            copied: vec![],
+            forgotten: vec![],
+            interrupted: vec![],
+            attempt_resolutions: vec![],
+            restores: 0,
+            delete_failures: 0,
+            fetched_retired: false,
+            kept_in_place: false,
+            landed_after_takeover: false,
+            resumed: false,
+            copied_retired: false,
+            tx_committed: false,
+            tx_aborted: false,
+            planned_while_reserved: false,
         }]
     }
     fn actions(&self, s: &State, a: &mut Vec<Action>) {
@@ -302,6 +744,15 @@ impl Model for Protocol {
                 Action::Takeover(w),
                 Action::Crash(w),
             ]);
+            if self.retiring() {
+                a.extend([
+                    Action::Compact(w),
+                    Action::CompactKeep(w),
+                    Action::Prepare(w),
+                    Action::CommitTx(w),
+                    Action::AbortTx(w),
+                ]);
+            }
         }
         a.extend((0..s.puts.len()).map(Action::FinishUpload));
         for i in 0..s.net.len() {
@@ -309,8 +760,22 @@ impl Model for Protocol {
         }
         a.extend([Action::Read, Action::Fetch]);
         a.extend((0..s.store.len()).map(Action::Sweep));
+        if self.retiring() {
+            a.extend([
+                Action::Plan,
+                Action::Forget,
+                Action::Unpin,
+                Action::RestoreStart,
+                Action::RestoreCopy,
+                Action::RestoreEnd,
+            ]);
+            for i in 0..s.deletes.len() {
+                a.extend([Action::DeleteLand(i), Action::DeleteFail(i)]);
+            }
+        }
         a.retain(|action| self.enabled(s, action));
     }
+    #[expect(clippy::too_many_lines, reason = "one arm per action")]
     fn next_state(&self, s: &State, action: Action) -> Option<State> {
         if !self.enabled(s, &action) {
             return None;
@@ -346,37 +811,10 @@ impl Model for Protocol {
                     next.fenced_landed |= file.0.generation < s.lease;
                 }
             }
-            Action::Commit(w) => {
-                let writer = &s.writers[w];
-                let generation = writer.generation?;
-                let mut files = writer.finished.clone();
-                if self.has("no-upload-before-commit") {
-                    files.extend(writer.started.iter().copied());
-                }
-                if self.has("adopt-by-listing") {
-                    let adopted: Vec<File> = Self::unnamed(s)
-                        .into_iter()
-                        .filter(|f| !files.contains(f))
-                        .collect();
-                    files.extend(adopted);
-                }
-                files.sort_unstable();
-                let request = Request {
-                    attempt: s.attempts,
-                    writer: w,
-                    generation,
-                    base: s.version,
-                    files,
-                };
-                next.attempts += 1;
-                let writer = &mut next.writers[w];
-                writer.finished.clear();
-                if self.has("no-upload-before-commit") {
-                    writer.started.clear();
-                }
-                writer.pending = Some((request.clone(), false));
-                next.net.push(request);
-            }
+            Action::Commit(w) => self.send(s, &mut next, w, CommitKind::Append)?,
+            Action::Compact(w) => self.send(s, &mut next, w, CommitKind::Compact)?,
+            Action::CompactKeep(w) => self.send(s, &mut next, w, CommitKind::CompactKeep)?,
+            Action::Prepare(w) => self.send(s, &mut next, w, CommitKind::Prepare)?,
             Action::Deliver(i) => {
                 // The store evaluates the conditional publication: the exact
                 // base version and the lease generation.
@@ -385,7 +823,11 @@ impl Model for Protocol {
                 let accepted = s.version == request.base && s.lease == request.generation;
                 if accepted {
                     next.version += 1;
-                    insert_sorted(&mut next.head, request.files.iter().copied());
+                    if self.retiring() {
+                        Self::publish(&mut next, &request);
+                    } else {
+                        insert_sorted(&mut next.head, request.files.iter().copied());
+                    }
                     next.history.push(next.head.clone());
                     next.accepted = true;
                 }
@@ -406,6 +848,13 @@ impl Model for Protocol {
                                 .collect();
                             *writer = Writer::default();
                             insert_sorted(&mut next.dropped, unnamed);
+                            if next
+                                .sweep
+                                .as_ref()
+                                .is_some_and(|sweep| sweep.writer == request.writer)
+                            {
+                                Self::end_sweep(&mut next);
+                            }
                         }
                     }
                 }
@@ -425,11 +874,15 @@ impl Model for Protocol {
             }
             Action::Resolve(w) => {
                 let (request, _) = s.writers[w].pending.as_ref()?;
-                let committed = Self::named(s, &request.files) == request.files.len();
+                let committed = self.landed(s, request);
                 if !committed {
                     insert_sorted(&mut next.aborted, keys(&request.files));
                 }
-                next.resolutions.push((request.files.clone(), committed));
+                if self.retiring() {
+                    next.attempt_resolutions.push((request.attempt, committed));
+                } else {
+                    next.resolutions.push((request.files.clone(), committed));
+                }
                 next.writers[w].pending = None;
             }
             Action::Takeover(w) => {
@@ -448,6 +901,9 @@ impl Model for Protocol {
                     generation: Some(next.lease),
                     ..Writer::default()
                 };
+                if s.sweep.as_ref().is_some_and(|sweep| sweep.writer == w) {
+                    Self::end_sweep(&mut next);
+                }
             }
             Action::Crash(w) => {
                 let old = &s.writers[w];
@@ -457,6 +913,9 @@ impl Model for Protocol {
                     keys(&old.started).chain(keys(&old.finished)),
                 );
                 next.writers[w] = Writer::default();
+                if s.sweep.as_ref().is_some_and(|sweep| sweep.writer == w) {
+                    Self::end_sweep(&mut next);
+                }
             }
             Action::Read => {
                 next.reads += 1;
@@ -467,6 +926,10 @@ impl Model for Protocol {
                 };
                 next.snapshot = Some((s.version, listed));
                 next.fetched = 0;
+                if self.retiring() {
+                    // The scan pins the snapshots it reads, in the same step.
+                    next.pins = s.live.iter().map(|(id, _)| *id).collect();
+                }
             }
             Action::Fetch => {
                 let (version, listed) = s.snapshot.as_ref()?;
@@ -474,18 +937,120 @@ impl Model for Protocol {
                 let bytes = s.store.iter().find(|(k, _)| *k == key).map(|(_, b)| *b);
                 next.observed.push((*version, key, bytes));
                 next.fetched += 1;
+                next.fetched_retired |= bytes.is_some() && !s.head.iter().any(|(k, _)| *k == key);
+            }
+            Action::Unpin => {
+                next.pins.clear();
+                next.snapshot = None;
+                next.fetched = 0;
             }
             Action::Sweep(i) => {
                 next.store.remove(i);
                 next.reclaimed = true;
             }
+            Action::CommitTx(_) | Action::AbortTx(_) => {
+                let tx = s.prepared.clone()?;
+                next.prepared = None;
+                next.version += 1;
+                if matches!(action, Action::CommitTx(_)) {
+                    retire(&mut next.live, &mut next.retired, &tx.retire);
+                    insert_sorted(&mut next.live, [(tx.id, tx.files)]);
+                    Self::refresh_head(&mut next);
+                    next.tx_committed = true;
+                } else {
+                    insert_sorted(&mut next.aborted, keys(&tx.files));
+                    next.tx_aborted = true;
+                }
+                next.history.push(next.head.clone());
+            }
+            Action::Plan => {
+                let (writer, snapshots, doomed, kept) = self.plan(s)?;
+                let generation = s.writers[writer].generation?;
+                insert_sorted(
+                    &mut next.deletes,
+                    doomed.into_iter().map(|f| (f, generation, true)),
+                );
+                next.sweep = Some(Sweep {
+                    writer,
+                    generation,
+                    snapshots,
+                    failed: false,
+                });
+                next.kept_in_place |= kept;
+                next.planned_while_reserved |= s.prepared.is_some();
+            }
+            Action::DeleteLand(i) => {
+                let (file, generation, _) = *s.deletes.get(i)?;
+                next.deletes.remove(i);
+                if let Ok(at) = next.store.binary_search(&file) {
+                    next.store.remove(at);
+                }
+                next.landed_after_takeover |= generation < s.lease;
+                Self::settle_sweep(&mut next);
+            }
+            Action::DeleteFail(i) => {
+                let (_, _, owned) = *s.deletes.get(i)?;
+                next.deletes.remove(i);
+                next.delete_failures += 1;
+                if owned && let Some(sweep) = &mut next.sweep {
+                    sweep.failed = true;
+                }
+                Self::settle_sweep(&mut next);
+            }
+            Action::Forget => {
+                let sweep = s.sweep.clone()?;
+                next.sweep = None;
+                for delete in &mut next.deletes {
+                    delete.2 = false;
+                }
+                next.deletes.sort_unstable();
+                // One record, through the sweeping process's serial writer: a
+                // fenced process's commit is refused, and a reserved table
+                // refuses it before any request.
+                let committed = s.writers[sweep.writer].generation == Some(sweep.generation)
+                    && sweep.generation == s.lease
+                    && s.prepared.is_none();
+                if committed {
+                    next.version += 1;
+                    let (gone, kept): (Vec<Snapshot>, Vec<Snapshot>) = next
+                        .retired
+                        .drain(..)
+                        .partition(|(id, _)| sweep.snapshots.contains(id));
+                    next.retired = kept;
+                    next.resumed |= gone
+                        .iter()
+                        .any(|(id, _)| s.interrupted.binary_search(id).is_ok());
+                    insert_sorted(&mut next.forgotten, gone);
+                    next.history.push(next.head.clone());
+                } else {
+                    insert_sorted(&mut next.interrupted, sweep.snapshots);
+                }
+            }
+            Action::RestoreStart => {
+                next.restores += 1;
+                next.restore = Some((s.version, keys(&s.head).collect(), 0));
+            }
+            Action::RestoreCopy => {
+                let (_, listed, at) = s.restore.as_ref()?;
+                let key = *listed.get(*at)?;
+                let found = s.store.iter().any(|(k, _)| *k == key);
+                next.copied.push((key, found));
+                next.copied_retired |= found && !s.head.iter().any(|(k, _)| *k == key);
+                if let Some(restore) = &mut next.restore {
+                    restore.2 += 1;
+                }
+            }
+            Action::RestoreEnd => next.restore = None,
         }
         (next != *s).then_some(next)
     }
     fn properties(&self) -> Vec<Property<Self>> {
-        vec![
+        let mut properties = vec![
             Property::always("committed files exist", |_, s: &State| {
                 s.head.iter().all(|f| s.store.contains(f))
+                    && s.prepared
+                        .as_ref()
+                        .is_none_or(|tx| tx.files.iter().all(|f| s.store.contains(f)))
             }),
             Property::always("reader sees only committed files", |_, s: &State| {
                 s.observed.iter().all(|&(version, key, bytes)| {
@@ -505,16 +1070,25 @@ impl Model for Protocol {
                     })
                 },
             ),
-            Property::always("unknown outcome resolves all-or-nothing", |_, s: &State| {
-                s.resolutions.iter().all(|(files, committed)| {
-                    let named = Self::named(s, files);
-                    if *committed {
-                        named == files.len()
-                    } else {
-                        named == 0
+            Property::always(
+                "unknown outcome resolves all-or-nothing",
+                |model: &Self, s: &State| {
+                    if model.retiring() {
+                        return s
+                            .attempt_resolutions
+                            .iter()
+                            .all(|(attempt, committed)| s.applied.contains(attempt) == *committed);
                     }
-                })
-            }),
+                    s.resolutions.iter().all(|(files, committed)| {
+                        let named = Self::named(s, files);
+                        if *committed {
+                            named == files.len()
+                        } else {
+                            named == 0
+                        }
+                    })
+                },
+            ),
             Property::sometimes("commit accepted", |_, s: &State| s.accepted),
             Property::sometimes("orphan upload after an aborted commit", |_, s: &State| {
                 s.store
@@ -526,17 +1100,123 @@ impl Model for Protocol {
                 "fenced writer's upload lands after a takeover",
                 |_, s: &State| s.fenced_landed,
             ),
-            Property::sometimes("unknown outcome resolved as committed", |_, s: &State| {
-                s.resolutions.iter().any(|(_, committed)| *committed)
-            }),
-            Property::sometimes("unknown outcome resolved as aborted", |_, s: &State| {
-                s.resolutions.iter().any(|(_, committed)| !*committed)
-            }),
+            Property::sometimes(
+                "unknown outcome resolved as committed",
+                |model: &Self, s: &State| {
+                    if model.retiring() {
+                        s.attempt_resolutions
+                            .iter()
+                            .any(|(_, committed)| *committed)
+                    } else {
+                        s.resolutions.iter().any(|(_, committed)| *committed)
+                    }
+                },
+            ),
+            Property::sometimes(
+                "unknown outcome resolved as aborted",
+                |model: &Self, s: &State| {
+                    if model.retiring() {
+                        s.attempt_resolutions
+                            .iter()
+                            .any(|(_, committed)| !*committed)
+                    } else {
+                        s.resolutions.iter().any(|(_, committed)| !*committed)
+                    }
+                },
+            ),
             Property::sometimes("reader fetches a committed file", |_, s: &State| {
                 s.observed.iter().any(|(_, _, bytes)| bytes.is_some())
             }),
             Property::sometimes("orphan reclaimed", |_, s: &State| s.reclaimed),
-        ]
+        ];
+        if !self.retiring() {
+            return properties;
+        }
+        properties.extend([
+            Property::always("pinned reader finds every file", |_, s: &State| {
+                s.observed.iter().all(|(_, _, bytes)| bytes.is_some())
+            }),
+            Property::always("restore point copies every file", |_, s: &State| {
+                s.copied.iter().all(|(_, found)| *found)
+            }),
+            // Unless a live snapshot or another retired one (whose own sweep
+            // deletes it) still names it.
+            Property::always("forgotten snapshot leaves no file", |_, s: &State| {
+                s.forgotten.iter().all(|(_, files)| {
+                    files.iter().all(|f| {
+                        s.head.contains(f)
+                            || s.retired.iter().any(|(_, named)| named.contains(f))
+                            || !s.store.contains(f)
+                    })
+                })
+            }),
+            Property::always(
+                "retired snapshots reclaimed at quiescence",
+                |model: &Self, s: &State| !model.quiescent(s) || s.retired.is_empty(),
+            ),
+            Property::sometimes("snapshot retired by a commit", |_, s: &State| {
+                !s.retired.is_empty() || !s.forgotten.is_empty()
+            }),
+            Property::sometimes("retired snapshot deleted and forgotten", |_, s: &State| {
+                s.forgotten
+                    .iter()
+                    .any(|(_, files)| files.iter().any(|f| !s.head.contains(f)))
+            }),
+            // The holder could sweep but for a scan's pin on a retired snapshot.
+            Property::sometimes("sweep waits for a snapshot a scan pins", |_, s: &State| {
+                s.retired.iter().any(|(id, _)| s.pins.contains(id))
+                    && s.sweep.is_none()
+                    && s.restore.is_none()
+                    && s.prepared.is_none()
+                    && Self::holder(s).is_some_and(|holder| holder.pending.is_none())
+            }),
+            Property::sometimes(
+                "scan reads a file of its snapshot after the snapshot retired",
+                |_, s: &State| s.fetched_retired,
+            ),
+            Property::sometimes(
+                "live snapshot keeps a retired snapshot's file in place",
+                |_, s: &State| s.kept_in_place && !s.forgotten.is_empty(),
+            ),
+            Property::sometimes("delete lands after a takeover", |_, s: &State| {
+                s.landed_after_takeover
+            }),
+            Property::sometimes(
+                "interrupted sweep's snapshots forgotten by a later sweep",
+                |_, s: &State| s.resumed,
+            ),
+            Property::sometimes(
+                "restore point copies a file retired after it started",
+                |_, s: &State| s.copied_retired,
+            ),
+        ]);
+        if self.has("prepared") {
+            properties.extend([
+                Property::sometimes("prepared transaction committed", |_, s: &State| {
+                    s.tx_committed
+                }),
+                Property::sometimes("prepared transaction aborted", |_, s: &State| s.tx_aborted),
+            ]);
+        }
+        if self.has("ignores-reservation") {
+            properties.push(Property::sometimes(
+                "sweep plans while a transaction is prepared",
+                |_, s: &State| s.planned_while_reserved,
+            ));
+        }
+        if self.has("lean") {
+            // No scans or restore points: their witnesses cannot be reached.
+            properties.retain(|p| {
+                !matches!(
+                    p.name,
+                    "reader fetches a committed file"
+                        | "sweep waits for a snapshot a scan pins"
+                        | "scan reads a file of its snapshot after the snapshot retired"
+                        | "restore point copies a file retired after it started"
+                )
+            });
+        }
+        properties
     }
 }
 
@@ -553,14 +1233,19 @@ pub enum Op {
         key: Key,
         acknowledged: bool,
     },
-    /// `Commit(w)`: writer `w` sends a conditional head publication on
-    /// `base_version` and `generation` that adds `files`.
+    /// `Commit(w)`, `Compact(w)`, `CompactKeep(w)`, `Prepare(w)`: writer `w`
+    /// sends a conditional head publication on `base_version` and
+    /// `generation` that adds `files` (new uploads) and `keep` (committed files
+    /// kept in place) as snapshot `attempt` and retires `retire`.
     CommitSent {
         writer: usize,
         attempt: u8,
         generation: u8,
         base_version: u8,
         files: Vec<Key>,
+        kind: CommitKind,
+        keep: Vec<Key>,
+        retire: Vec<u8>,
     },
     /// `Deliver(i)`: the store evaluates a commit request; `accepted` when it
     /// published, `fenced` when the lease generation refused it, `answered`
@@ -589,13 +1274,50 @@ pub enum Op {
     Takeover { writer: usize, generation: u8 },
     /// `Crash(w)`: the writer process restarts and forgets its state.
     Crash { writer: usize },
-    /// `Read`: the reader reads the head (`version`, `files`).
-    ReadHead { version: u8, files: Vec<Key> },
+    /// `Read`: the reader reads the head (`version`, `files`), and in the
+    /// `retire` runs pins the live snapshots `pins` in the same step.
+    ReadHead {
+        version: u8,
+        files: Vec<Key>,
+        pins: Vec<u8>,
+    },
     /// `Fetch`: the reader GETs the next file of its snapshot; `found` when the
     /// store returned it.
     Fetch { key: Key, found: bool },
-    /// `Sweep(i)`: the orphan sweep deletes an unnamed fenced-generation file.
+    /// `Unpin`: the scan ends and releases its pins.
+    Unpinned,
+    /// `Sweep(i)`: the orphan sweep deletes an unnamed file.
     Swept { key: Key },
+    /// `CommitTx(w)` / `AbortTx(w)`: the lease holder commits the resolve
+    /// record of the prepared transaction `id`.
+    TxResolved { writer: usize, id: u8, commit: bool },
+    /// `Plan`: the holder's sweep reads the committed retired set and sends
+    /// the deletes of `deletes` for the snapshots `snapshots`.
+    SweepPlanned {
+        writer: usize,
+        generation: u8,
+        snapshots: Vec<u8>,
+        deletes: Vec<Key>,
+    },
+    /// `DeleteLand(i)`: a delete request lands; `acknowledged` when the sweep
+    /// that sent it still waits for it.
+    DeleteLanded { key: Key, acknowledged: bool },
+    /// `DeleteFail(i)`: a delete request fails and the object stays.
+    DeleteFailed { key: Key, acknowledged: bool },
+    /// `Forget`: the sweep commits the record forgetting `snapshots`;
+    /// `committed` when the head accepted it.
+    Forgotten {
+        writer: usize,
+        generation: u8,
+        snapshots: Vec<u8>,
+        committed: bool,
+    },
+    /// `RestoreStart`: a restore point reads the head and holds deletions.
+    RestoreStarted { version: u8, files: Vec<Key> },
+    /// `RestoreCopy`: the restore point GETs its next file.
+    RestoreCopied { key: Key, found: bool },
+    /// `RestoreEnd`: the restore point releases its hold.
+    RestoreEnded,
 }
 
 /// What one action of a `data-files` trace does, as the model takes it.
@@ -609,6 +1331,53 @@ pub struct Step {
     pub head: Vec<File>,
     /// The store's data files after the action.
     pub store: Vec<File>,
+    /// In the `retire` runs: the live and retired snapshots and the prepared
+    /// transaction after the action.
+    pub live: Vec<Snapshot>,
+    pub retired: Vec<Snapshot>,
+    pub prepared: Option<Prepared>,
+}
+
+fn parse(text: &str) -> Option<Action> {
+    let (name, arguments) = match text.split_once('(') {
+        Some((name, rest)) => (
+            name,
+            rest.strip_suffix(')')?
+                .split(',')
+                .map(|part| part.trim().parse::<usize>().ok())
+                .collect::<Option<Vec<_>>>()?,
+        ),
+        None => (text, Vec::new()),
+    };
+    Some(match (name, arguments.as_slice()) {
+        ("StartUpload", &[w]) => Action::StartUpload(w),
+        ("FinishUpload", &[i]) => Action::FinishUpload(i),
+        ("Commit", &[w]) => Action::Commit(w),
+        ("Compact", &[w]) => Action::Compact(w),
+        ("CompactKeep", &[w]) => Action::CompactKeep(w),
+        ("Prepare", &[w]) => Action::Prepare(w),
+        ("CommitTx", &[w]) => Action::CommitTx(w),
+        ("AbortTx", &[w]) => Action::AbortTx(w),
+        ("Deliver", &[i]) => Action::Deliver(i),
+        ("Drop", &[i]) => Action::Drop(i),
+        ("Timeout", &[w]) => Action::Timeout(w),
+        ("Retry", &[w]) => Action::Retry(w),
+        ("Resolve", &[w]) => Action::Resolve(w),
+        ("Takeover", &[w]) => Action::Takeover(w),
+        ("Crash", &[w]) => Action::Crash(w),
+        ("Read", &[]) => Action::Read,
+        ("Fetch", &[]) => Action::Fetch,
+        ("Unpin", &[]) => Action::Unpin,
+        ("Sweep", &[i]) => Action::Sweep(i),
+        ("Plan", &[]) => Action::Plan,
+        ("DeleteLand", &[i]) => Action::DeleteLand(i),
+        ("DeleteFail", &[i]) => Action::DeleteFail(i),
+        ("Forget", &[]) => Action::Forget,
+        ("RestoreStart", &[]) => Action::RestoreStart,
+        ("RestoreCopy", &[]) => Action::RestoreCopy,
+        ("RestoreEnd", &[]) => Action::RestoreEnd,
+        _ => return None,
+    })
 }
 
 /// Step `actions` through the model in `mode`, or `None` when one is not
@@ -619,32 +1388,7 @@ pub fn steps(mode: &str, bound: usize, actions: &[String]) -> Option<Vec<Step>> 
     let mut state = protocol.init_states().pop()?;
     let mut out = Vec::with_capacity(actions.len());
     for text in actions {
-        let (name, arguments) = match text.split_once('(') {
-            Some((name, rest)) => (
-                name,
-                rest.strip_suffix(')')?
-                    .split(',')
-                    .map(|part| part.trim().parse::<usize>().ok())
-                    .collect::<Option<Vec<_>>>()?,
-            ),
-            None => (text.as_str(), Vec::new()),
-        };
-        let action = match (name, arguments.as_slice()) {
-            ("StartUpload", &[w]) => Action::StartUpload(w),
-            ("FinishUpload", &[i]) => Action::FinishUpload(i),
-            ("Commit", &[w]) => Action::Commit(w),
-            ("Deliver", &[i]) => Action::Deliver(i),
-            ("Drop", &[i]) => Action::Drop(i),
-            ("Timeout", &[w]) => Action::Timeout(w),
-            ("Retry", &[w]) => Action::Retry(w),
-            ("Resolve", &[w]) => Action::Resolve(w),
-            ("Takeover", &[w]) => Action::Takeover(w),
-            ("Crash", &[w]) => Action::Crash(w),
-            ("Read", &[]) => Action::Read,
-            ("Fetch", &[]) => Action::Fetch,
-            ("Sweep", &[i]) => Action::Sweep(i),
-            _ => return None,
-        };
+        let action = parse(text)?;
         let mut enabled = vec![];
         protocol.actions(&state, &mut enabled);
         if !enabled.contains(&action) {
@@ -665,7 +1409,10 @@ pub fn steps(mode: &str, bound: usize, actions: &[String]) -> Option<Vec<Step>> 
                     acknowledged: next.writers[w].finished.iter().any(|f| f.0 == key),
                 }
             }
-            Action::Commit(w) => {
+            Action::Commit(w)
+            | Action::Compact(w)
+            | Action::CompactKeep(w)
+            | Action::Prepare(w) => {
                 let request = next.net.last()?;
                 Op::CommitSent {
                     writer: w,
@@ -673,6 +1420,9 @@ pub fn steps(mode: &str, bound: usize, actions: &[String]) -> Option<Vec<Step>> 
                     generation: request.generation,
                     base_version: request.base,
                     files: keys(&request.files).collect(),
+                    kind: request.kind,
+                    keep: keys(&request.keep).collect(),
+                    retire: request.retire.clone(),
                 }
             }
             Action::Deliver(i) => {
@@ -703,7 +1453,11 @@ pub fn steps(mode: &str, bound: usize, actions: &[String]) -> Option<Vec<Step>> 
             Action::Resolve(w) => Op::Resolved {
                 writer: w,
                 attempt: pending(w)?,
-                committed: next.resolutions.last()?.1,
+                committed: if protocol.retiring() {
+                    next.attempt_resolutions.last()?.1
+                } else {
+                    next.resolutions.last()?.1
+                },
             },
             Action::Takeover(w) => Op::Takeover {
                 writer: w,
@@ -712,7 +1466,11 @@ pub fn steps(mode: &str, bound: usize, actions: &[String]) -> Option<Vec<Step>> 
             Action::Crash(w) => Op::Crash { writer: w },
             Action::Read => {
                 let (version, files) = next.snapshot.clone()?;
-                Op::ReadHead { version, files }
+                Op::ReadHead {
+                    version,
+                    files,
+                    pins: next.pins.clone(),
+                }
             }
             Action::Fetch => {
                 let &(_, key, bytes) = next.observed.last()?;
@@ -721,9 +1479,50 @@ pub fn steps(mode: &str, bound: usize, actions: &[String]) -> Option<Vec<Step>> 
                     found: bytes.is_some(),
                 }
             }
+            Action::Unpin => Op::Unpinned,
             Action::Sweep(i) => Op::Swept {
                 key: state.store[i].0,
             },
+            Action::CommitTx(w) | Action::AbortTx(w) => Op::TxResolved {
+                writer: w,
+                id: state.prepared.as_ref()?.id,
+                commit: matches!(action, Action::CommitTx(_)),
+            },
+            Action::Plan => {
+                let sweep = next.sweep.as_ref()?;
+                Op::SweepPlanned {
+                    writer: sweep.writer,
+                    generation: sweep.generation,
+                    snapshots: sweep.snapshots.clone(),
+                    deletes: next.deletes.iter().filter(|d| d.2).map(|d| d.0.0).collect(),
+                }
+            }
+            Action::DeleteLand(i) => Op::DeleteLanded {
+                key: state.deletes[i].0.0,
+                acknowledged: state.deletes[i].2,
+            },
+            Action::DeleteFail(i) => Op::DeleteFailed {
+                key: state.deletes[i].0.0,
+                acknowledged: state.deletes[i].2,
+            },
+            Action::Forget => {
+                let sweep = state.sweep.as_ref()?;
+                Op::Forgotten {
+                    writer: sweep.writer,
+                    generation: sweep.generation,
+                    snapshots: sweep.snapshots.clone(),
+                    committed: next.version > state.version,
+                }
+            }
+            Action::RestoreStart => {
+                let (version, files, _) = next.restore.clone()?;
+                Op::RestoreStarted { version, files }
+            }
+            Action::RestoreCopy => {
+                let &(key, found) = next.copied.last()?;
+                Op::RestoreCopied { key, found }
+            }
+            Action::RestoreEnd => Op::RestoreEnded,
         };
         out.push(Step {
             action: text.clone(),
@@ -732,6 +1531,9 @@ pub fn steps(mode: &str, bound: usize, actions: &[String]) -> Option<Vec<Step>> 
             lease: next.lease,
             head: next.head.clone(),
             store: next.store.clone(),
+            live: next.live.clone(),
+            retired: next.retired.clone(),
+            prepared: next.prepared.clone(),
         });
         state = next;
     }
