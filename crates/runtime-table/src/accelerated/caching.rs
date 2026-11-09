@@ -141,17 +141,34 @@ impl InFlightFetch {
         })
     }
 
-    /// Waits until the leader's claim on this key is released, which drops its
-    /// sender, or until `deadline`. A queued write releases the claim once it
-    /// has landed and removed the key from the map; a short pause after the
-    /// sender goes keeps a caller that acquires again from spinning in the
-    /// moment before the key is removed.
-    async fn released(mut self, deadline: tokio::time::Instant) {
+    /// Waits until the leader's claim on `key` is released, or until
+    /// `deadline`. A leader that writes nothing removes the key and then drops
+    /// its sender. A queued write gives up the sender when it is enqueued but
+    /// keeps the key until it has landed, which on the batched writer is the
+    /// next flush, so this also waits for this fetch's entry to leave
+    /// `in_flight`.
+    async fn released(
+        mut self,
+        in_flight: &InFlightRevalidations,
+        key: &str,
+        deadline: tokio::time::Instant,
+    ) {
         let _ = tokio::time::timeout_at(deadline, async {
             while self.state.changed().await.is_ok() {}
-            tokio::time::sleep(Duration::from_millis(1)).await;
+            while self.holds(in_flight, key) {
+                tokio::time::sleep(RELEASE_POLL_INTERVAL).await;
+            }
         })
         .await;
+    }
+
+    /// Whether `key`'s entry in `in_flight` is still this fetch, rather than
+    /// gone or a later leader's.
+    fn holds(&self, in_flight: &InFlightRevalidations, key: &str) -> bool {
+        in_flight
+            .lock()
+            .get(key)
+            .is_some_and(|entry| Arc::ptr_eq(&entry.published_at, &self.published_at))
     }
 }
 
@@ -345,6 +362,12 @@ impl Drop for CacheKeyClaim {
 /// [`FetchState::Failed`] on drop, waking followers at once); timing out only
 /// costs the extra origin call the follower would have made anyway.
 const FOLLOWER_WAIT_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// How often [`InFlightFetch::released`] checks whether a queued write has
+/// landed and released its key. The batched writer flushes every
+/// [`CACHE_WRITE_FLUSH_INTERVAL_MS`], so this adds at most this much to a
+/// background refresh that waits for it.
+const RELEASE_POLL_INTERVAL: Duration = Duration::from_millis(10);
 
 /// The terminal outcome a follower observes while waiting on a leader's fetch.
 enum FollowerResult {
@@ -2711,7 +2734,7 @@ impl CacheRefreshHelper {
         let writer = batch_write_tx.clone();
         let deadline = tokio::time::Instant::now() + FOLLOWER_WAIT_TIMEOUT;
         if let Err(error) = batch_write_tx.spawn_owned(io_runtime, async move {
-            earlier.released(deadline).await;
+            earlier.released(&in_flight, &key, deadline).await;
             match CacheKeyClaim::acquire(&in_flight, key, None) {
                 ClaimOutcome::Leader(claim) => Self::refresh_entry(
                     federated,
@@ -7438,6 +7461,119 @@ mod tests {
             stored,
             ["body"],
             "the miss stores the origin's answer as the leader, not the earlier one"
+        );
+    }
+
+    /// Like [`a_zero_ttl_miss_does_not_replay_a_published_fetch`], but the
+    /// leader's write is queued on the batched writer rather than dropped. A
+    /// queued write gives up the claim's sender when it is enqueued and removes
+    /// the key only after the next flush lands, so the background refresh must
+    /// wait for that removal: one that resumes when the sender goes finds the
+    /// key still held, skips the refresh, and leaves the cache holding the
+    /// leader's older answer.
+    #[tokio::test]
+    async fn a_zero_ttl_miss_refreshes_after_a_queued_leader_write_lands() {
+        use futures::StreamExt;
+
+        let http_source = Arc::new(MockHttpTableProvider::with_status(200, "body"));
+        let schema = http_source.schema();
+        let accelerator = Arc::new(MockAcceleratorTableProvider::new(
+            Arc::clone(&schema),
+            vec![],
+        ));
+        let in_flight: InFlightRevalidations =
+            Arc::new(parking_lot::Mutex::new(std::collections::HashMap::new()));
+        let (batch_write_tx, handle) = spawn_test_cache_write_consumer(&accelerator, &in_flight);
+
+        let filters = vec![col("content").eq(lit("test"))];
+        let key = compute_cache_key_from_filters_and_namespace(
+            &filters,
+            CacheNamespace::Public.storage_id(),
+        );
+        let mut leader = leader_claim(&in_flight, &key);
+        // The leader's row matches the key's filter, so a later replace of the
+        // key removes it.
+        let published = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![
+                Arc::new(StringArray::from(vec!["/leader"])) as ArrayRef,
+                Arc::new(StringArray::from(vec![""])) as ArrayRef,
+                Arc::new(StringArray::from(vec!["test"])) as ArrayRef,
+                Arc::new(UInt16Array::from(vec![200_u16])) as ArrayRef,
+                Arc::new(TimestampNanosecondArray::from(vec![Some(0_i64)])) as ArrayRef,
+            ],
+        )
+        .expect("leader batch");
+        leader.publish_ready(Arc::new(vec![published.clone()]));
+        // The leader queues its write, as the miss path does after publishing;
+        // the batched writer holds the key until its next flush lands.
+        batch_write_tx
+            .send_claimed(
+                CacheWriteRequest {
+                    batches: vec![published],
+                    filters: filters.clone(),
+                    cache_key: key.clone(),
+                    namespace_id: CacheNamespace::Public.storage_id().into(),
+                    replaces_existing: false,
+                },
+                leader,
+            )
+            .await
+            .expect("queue the leader's write");
+        assert!(
+            in_flight.lock().contains_key(&key),
+            "the queued write holds the key until it lands"
+        );
+
+        let session_state = test_session_state();
+        let io = tokio::runtime::Handle::current();
+        let stream = CacheRefreshHelper::handle_cache_miss(
+            Arc::clone(&http_source) as Arc<dyn TableProvider>,
+            &session_state,
+            "test_dataset",
+            &filters,
+            None,
+            Arc::clone(&schema),
+            false,
+            false,
+            StaleIfError::Disabled,
+            Duration::ZERO,
+            None,
+            &io,
+            Arc::new(vec![].into()),
+            batch_write_tx,
+            CacheNamespace::Public,
+            Arc::clone(&in_flight),
+            tokio::time::Instant::now(),
+        )
+        .await;
+        let served: Vec<RecordBatch> = stream.map(|batch| batch.expect("stream")).collect().await;
+        assert_eq!(
+            served.iter().map(RecordBatch::num_rows).sum::<usize>(),
+            1,
+            "the miss serves the origin's one row"
+        );
+
+        // The writer exits once the background refresh, its last sender, is done.
+        await_writer_exit(handle).await;
+
+        let stored: Vec<String> = accelerator
+            .get_data()
+            .iter()
+            .flat_map(|batch| {
+                batch
+                    .column_by_name("content")
+                    .and_then(|c| c.as_any().downcast_ref::<StringArray>())
+                    .expect("content column")
+                    .iter()
+                    .map(|v| v.unwrap_or_default().to_string())
+                    .collect::<Vec<_>>()
+            })
+            .collect();
+        assert_eq!(
+            stored,
+            ["body"],
+            "once the leader's queued write lands, the refresh replaces its older answer"
         );
     }
 
