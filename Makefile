@@ -448,11 +448,33 @@ lint-rust:
 	$(PYTHON) scripts/test_nextest_build_targets.py
 	## All except metal, cuda, nfs (nfs requires system libnfs library)
 	cargo clippy $(CARGO_PROFILE) --keep-going $(_LINT_TARGET_FLAGS) $(_FEATURES_FLAGS) $(_LINT_WORKSPACE_FLAGS) -- $(_CLIPPY_LINT_FLAGS)
+	## Feature sets the workspace pass above never compiles. Not in a scoped run (PACKAGES=…), which is a fail-first pass ahead of this full one. See check-rust-feature-sets
+	$(if $(strip $(PACKAGES)),,$(MAKE) --no-print-directory check-rust-feature-sets)
 
 lint-rust-fix:
 	cargo fmt $(_FMT_FLAGS)
 	## All except metal, cuda, nfs (nfs requires system libnfs library)
 	cargo clippy $(CARGO_PROFILE) $(_LINT_TARGET_FLAGS) --fix --allow-dirty $(_FEATURES_FLAGS) $(_LINT_WORKSPACE_FLAGS) -- $(_CLIPPY_LINT_FLAGS)
+
+# Feature sets something builds that the workspace lint never compiles. That
+# lint resolves every crate once, with `spiced`'s features unified in, so there
+# `runtime` always has `databricks` and every other capability on. An item
+# behind `#[cfg(feature = "…")]` that code outside that gate uses still compiles
+# in that resolve, and breaks every build without the feature, as #16108 did:
+# - `runtime` alone, with no features: the smallest set, and the one the
+#   sign-off's targeted pre-lint builds for a changed crate that declares none.
+# - `tools/spiceschema`, which generates `.schema/openapi.json` from `runtime`
+#   with only `openapi`, `models` and `mcp`.
+# - `runtime-tools` under its own `mcp` feature, which a graph including
+#   `runtime` completes for it, hiding what the declaration leaves out (#13648).
+# One cargo invocation per package: selecting several in one would unify their
+# features and compile none of these sets. `check`, not `clippy`: the lint
+# levels are the workspace pass's job, and this asks only whether they compile.
+.PHONY: check-rust-feature-sets
+check-rust-feature-sets:
+	cargo check $(CARGO_PROFILE) -p runtime
+	cargo check $(CARGO_PROFILE) -p spiceschema
+	cargo check $(CARGO_PROFILE) -p runtime-tools --features mcp
 
 check-rust-features:
 	cargo check $(CARGO_PROFILE) --no-default-features
