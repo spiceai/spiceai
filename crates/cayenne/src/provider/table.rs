@@ -27708,7 +27708,9 @@ impl CayenneTableProvider {
     /// rather than waiting on `write()`: a queued writer would turn away the
     /// shared-mode protected merges that may run beside a long one. Every
     /// rebuild clears the pending mark as it starts, so the task does nothing
-    /// (and takes no lock) when a later write's rebuild got there first.
+    /// (and takes no lock) when a later write's rebuild got there first. After
+    /// a rebuild the task schedules the post-write compaction pass, which may
+    /// have declined while the task held the lock.
     fn schedule_manifest_rebuild_retry(&self) {
         // Record the request FIRST, so a task already running picks it up in
         // its exit re-check instead of it being dropped on the held slot.
@@ -27749,7 +27751,7 @@ impl CayenneTableProvider {
                     return;
                 }
                 if table.manifest_rebuild_pending.load(Ordering::Acquire) {
-                    let Ok(_compaction_guard) = table.compaction_lock.try_write() else {
+                    let Ok(compaction_guard) = table.compaction_lock.try_write() else {
                         backoff = (backoff * 2).min(MANIFEST_REBUILD_RETRY_MAX_BACKOFF);
                         continue;
                     };
@@ -27759,6 +27761,16 @@ impl CayenneTableProvider {
                         .manifest_rebuild_pending
                         .store(false, Ordering::Release);
                     table.rebuild_live_snapshot_manifests_if_admitted().await;
+                    drop(compaction_guard);
+                    // A post-write compaction pass that tried the lock during
+                    // this rebuild declined as busy and ended, and nothing
+                    // else schedules another until the next write. Schedule
+                    // it here, as the post-write maintenance pass does after
+                    // its own rebuild, so an idle table is still consolidated.
+                    // Called while this task still holds its slot, so
+                    // `drain_in_flight_maintenance` sees the pass claimed
+                    // before it sees this task finish.
+                    table.schedule_post_write_compaction();
                 }
 
                 // Open the slot, then re-check. A skip after this store claims
@@ -50919,16 +50931,26 @@ mod tests {
     /// Releases `guard`, the caller's hold on the compaction lock taken before
     /// its writes, once nothing those writes queued can still run: the pending
     /// post-write maintenance is drained, its compaction pass has parked on the
-    /// held lock, and a manifest-rebuild retry it armed has finished. An explicit
+    /// held lock, and the manifest rebuild it skipped has run. An explicit
     /// maintenance call after this has the table to itself; without it, a pass
     /// the writes queued can take the lock or the tier first, and the explicit
     /// call declines.
+    ///
+    /// The skipped rebuild runs here, under the held lock, because the
+    /// manifest-rebuild retry it armed would otherwise run it once the lock is
+    /// free and then schedule a compaction pass, which would merge the tier the
+    /// caller is arranging. With the rebuild done the retry finds nothing
+    /// pending, takes no lock, and schedules nothing.
     async fn release_compaction_quiet<G>(provider: &CayenneTableProvider, guard: G) {
         provider
             .flush_pending_maintenance()
             .await
             .expect("drain pending post-write maintenance");
         park_post_write_compaction(provider).await;
+        provider
+            .manifest_rebuild_pending
+            .store(false, std::sync::atomic::Ordering::Release);
+        provider.rebuild_live_snapshot_manifests_if_admitted().await;
         drop(guard);
         provider
             .drain_in_flight_maintenance()

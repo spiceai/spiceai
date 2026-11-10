@@ -839,3 +839,85 @@ async fn a_small_file_landing_during_a_declined_pass_is_compacted_without_anothe
         "after a restart the table holds the same rows"
     );
 }
+
+/// Writes whose post-write maintenance finds `compaction_lock` held arm the manifest
+/// rebuild retry, and the post-write compaction pass they schedule declines on the same
+/// held lock and ends. The table is still due a pass, and no further write comes to
+/// schedule one. Once the lock is free the retry rebuilds the manifest, and the table
+/// must then be consolidated without another write.
+#[tokio::test]
+async fn a_pass_declined_on_a_held_lock_runs_after_the_manifest_rebuild_retry() {
+    const NAME: &str = "pk_less_declined_on_held_lock";
+    let schema = id_value_schema();
+    let ctx = SessionContext::new();
+    let (provider, _temp_dir) = create_cayenne_table_with_config(
+        NAME,
+        Arc::clone(&schema),
+        four_file_count_trigger(),
+        Vec::new(),
+        ctx.runtime_env(),
+    )
+    .await;
+    let trigger = provider.context.compaction_picker_config().trigger_files;
+    assert_eq!(trigger, 4, "fixture: four files qualify the tier by count");
+
+    let held = provider.hold_compaction().await;
+    for i in 0..4 {
+        insert_batch(&provider, id_value_rows(&schema, i * 50, 50)).await;
+    }
+    provider
+        .flush_pending_maintenance()
+        .await
+        .expect("the writes' maintenance runs while the lock is held");
+    assert!(
+        provider
+            .manifest_rebuild_retry_scheduled
+            .load(Ordering::Acquire),
+        "precondition: the maintenance found the lock held and armed the manifest rebuild retry"
+    );
+    // With the lock still held, an idle worker means the scheduled pass declined and ended.
+    for _ in 0..5_000 {
+        if provider.post_write_compaction_state.load(Ordering::Acquire)
+            == super::super::COALESCED_TASK_IDLE
+        {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+    }
+    assert_eq!(
+        provider.post_write_compaction_state.load(Ordering::Acquire),
+        super::super::COALESCED_TASK_IDLE,
+        "precondition: the post-write pass declined on the held lock and ended"
+    );
+    assert!(
+        provider.post_write_compaction_due(),
+        "precondition: the declined pass left the table due a pass"
+    );
+    assert_eq!(
+        list_current(&provider).await.files.len(),
+        4,
+        "precondition: nothing compacted while the lock was held"
+    );
+
+    drop(held);
+    provider
+        .drain_in_flight_maintenance()
+        .await
+        .expect("drain the retry and the pass it schedules");
+    let files = list_current(&provider).await.files.len();
+    assert!(
+        files < 4,
+        "the table must be consolidated once the lock is free, with no further write; it still has {files} files"
+    );
+    let expected: Vec<i64> = (0..200).collect();
+    assert_eq!(
+        scan_sorted_ids(&provider).await,
+        expected,
+        "every row stays visible"
+    );
+    assert_eq!(
+        ids_after_reopen(&provider, NAME).await,
+        expected,
+        "after a restart the table holds the same rows"
+    );
+}
