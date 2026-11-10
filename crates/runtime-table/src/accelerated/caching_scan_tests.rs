@@ -608,6 +608,22 @@ async fn fallback_uses_each_callers_saved_namespace() {
     assert_eq!(fixture.cache.scans.load(Ordering::SeqCst), 3);
 }
 
+/// A zero TTL with neither a stale-while-revalidate window nor a stale-if-error
+/// fallback can never serve a stored entry, so each lookup asks the origin and
+/// the accelerator is neither read nor written (#16148).
+#[tokio::test]
+async fn zero_ttl_without_a_fallback_passes_through_to_the_origin() {
+    let fixture = Fixture::new(Duration::ZERO, Duration::ZERO, StaleIfError::Disabled, 200).await;
+    for _ in 0..2 {
+        let batches = collect(fixture.plan(QUERY).await, fixture.ctx.task_ctx())
+            .await
+            .expect("query");
+        assert_eq!(contents(&batches), ["origin"]);
+    }
+    assert_eq!(fixture.source.scans.load(Ordering::SeqCst), 2);
+    assert_eq!(fixture.cache.scans.load(Ordering::SeqCst), 0);
+}
+
 #[tokio::test]
 async fn cache_first_modes_still_plan_the_accelerator() {
     for (ttl, swr, policy, sql) in [
@@ -621,12 +637,6 @@ async fn cache_first_modes_still_plan_the_accelerator() {
             Duration::ZERO,
             Duration::from_mins(1),
             StaleIfError::Enabled,
-            QUERY,
-        ),
-        (
-            Duration::ZERO,
-            Duration::ZERO,
-            StaleIfError::Disabled,
             QUERY,
         ),
         (
