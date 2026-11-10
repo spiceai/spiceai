@@ -4065,9 +4065,9 @@ impl DataFusion {
         // Retention and later builders read `dataset.time_column`; keep them on the
         // resolved names so a legacy `last_modified` alias is visible everywhere.
         let mut resolved_dataset = dataset.clone();
-        resolved_dataset.time_column = resolved_time.time_column.clone();
+        resolved_dataset.time_column.clone_from(&resolved_time.time_column);
         resolved_dataset.time_format = resolved_time.time_format;
-        resolved_dataset.time_partition_column = resolved_time.time_partition_column.clone();
+        resolved_dataset.time_partition_column.clone_from(&resolved_time.time_partition_column);
         resolved_dataset.time_partition_format = resolved_time.time_partition_format;
         let dataset = &resolved_dataset;
         // A deferred provider reports the primary key the checkpoint recorded, so an
