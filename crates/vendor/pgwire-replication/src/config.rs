@@ -363,6 +363,13 @@ pub struct ReplicationConfig {
     /// allowing the server to release WAL segments. Too infrequent updates
     /// may cause WAL accumulation; too frequent updates add overhead.
     ///
+    /// Every periodic status update asks the server to reply. While the
+    /// connection is silent, the idle-wakeup updates (see
+    /// [`Self::idle_wakeup_interval`]) take their place and ask for a reply
+    /// once this interval has passed since the last update that asked, so a
+    /// consumer that learns the server's clock and WAL end only from keepalives
+    /// gets one about this often, rounded up to the next idle wakeup.
+    ///
     /// This interval also bounds the server-side liveness window: while a
     /// consumer is backpressured (see [`Self::feedback_while_backpressured`])
     /// the worker proactively re-sends a standby status update on every

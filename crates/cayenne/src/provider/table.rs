@@ -1690,6 +1690,12 @@ struct ScanView {
     /// bundle. Fence-serialized snapshot events (truncate / full-delete /
     /// `INSERT OVERWRITE` / reopen) bump only `scan_input_version`.
     structural_version: u64,
+    /// The capture held no rows at all: no snapshot files, no inline entries and
+    /// no visible mem-tier segments. Such a view is lag-reused only while nothing
+    /// has been published since it was captured (see
+    /// [`ScanViewCache::try_serve_latest`]). Errs towards `false`, which only
+    /// keeps the ordinary lag reuse.
+    captured_nothing: bool,
 }
 
 /// A completed, cached scan view plus its identity and ordering metadata. Held by
@@ -2107,6 +2113,15 @@ impl ScanViewCache {
                 // Zero when the view was captured at or after the request.
                 requested_at.saturating_duration_since(current.captured_at) <= lag
                     && current.view.structural_version == structural
+                    // An empty capture is reused only while nothing has been
+                    // published since. Otherwise a table's first load (a CDC
+                    // snapshot) stays invisible for up to `lag` after it lands,
+                    // and a dataset marked ready on that load answers with no
+                    // rows (#15038). Lag is an allowance for change, not for
+                    // missing the initial data; an empty view is cheap to
+                    // capture again.
+                    && (!current.view.captured_nothing
+                        || (version_before == version_after && current.order == version_after))
             }
         };
         if !servable {
@@ -34280,12 +34295,20 @@ impl CayenneTableProvider {
             self.visible_mem_tier_segments_for_build(&raw.mem_tier_shards, &raw.deletion_snapshot)?;
         let union_tombstones =
             crate::provider::mem_tier::ShardedMemTier::union_tombstones(&raw.mem_tier_shards);
+        let captured_nothing = raw.warm_files.files.is_empty()
+            && raw
+                .protected_files
+                .values()
+                .all(|captured| captured.files.is_empty())
+            && raw.inlined_view.is_empty()
+            && visible_segments.is_empty();
         Ok(ScanView {
             raw,
             merged_deletions,
             visible_segments,
             union_tombstones,
             structural_version,
+            captured_nothing,
         })
     }
 
@@ -67907,12 +67930,14 @@ mod tests {
         };
 
         // A query captures a scan view, which this table keeps reusing for an
-        // hour whatever is written after it.
+        // hour whatever is written after it. The view holds a row because an
+        // empty view is not reused once a write has published.
+        write(&[1], &[10]).await;
         assert_eq!(
             collect_id_value_pairs(&ctx, &provider, "ma_rebuild_reused_view").await,
-            vec![],
+            vec![(1, 10)],
         );
-        write(&[1, 2], &[10, 20]).await;
+        write(&[2], &[20]).await;
         // Stale, as after a durable delete; the next write's delta is dropped.
         provider.mark_maintained_aggregates_stale();
         write(&[3], &[30]).await;
@@ -67926,7 +67951,7 @@ mod tests {
         );
         assert_eq!(
             collect_id_value_pairs(&ctx, &provider, "ma_rebuild_reused_view").await,
-            vec![],
+            vec![(1, 10)],
             "precondition: the table's scans still answer from the view captured before the writes"
         );
 

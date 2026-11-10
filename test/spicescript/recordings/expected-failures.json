@@ -3266,22 +3266,6 @@
     {
       "run": "surface",
       "who": "sqlite",
-      "key": "query: SELECT id, unnest(a) AS e FROM ev",
-      "kind": "error",
-      "signature": "Spice rejected the query: Tonic error: code: 'Client specified an invalid argument', message: \"Failed to execute query.\\nConnectionError Error(\\\"no such function: UNNEST in SELECT `ev`.`id`, UNNEST(`ev`.`a`) AS `e` FROM `ev` at offset 18\\\")\": code: 'Client specified an invalid argument', message: \"F",
-      "group": "sqlite"
-    },
-    {
-      "run": "surface",
-      "who": "sqlite",
-      "key": "query: SELECT e, count(*) FROM (SELECT unnest(a) AS e FROM ev) u GROUP BY e",
-      "kind": "error",
-      "signature": "Spice rejected the query: Tonic error: code: 'Client specified an invalid argument', message: \"Failed to execute query.\\nConnectionError Error(\\\"no such function: UNNEST in SELECT `u`.`e`, count(1) AS `count(*)` FROM (SELECT UNNEST(`ev`.`a`) AS `e` FROM `ev`) AS `u` GROUP BY `u`.`e` at offset 52\\\")\"",
-      "group": "sqlite"
-    },
-    {
-      "run": "surface",
-      "who": "sqlite",
       "key": "query: SELECT id FROM ev WHERE array_has(a, 3)",
       "kind": "error",
       "signature": "Spice rejected the query: Tonic error: code: 'Client specified an invalid argument', message: \"Failed to execute query.\\nConnectionError Error(\\\"no such function: array_has in SELECT `ev`.`id` FROM `ev` WHERE array_has(`ev`.`a`, 3) at offset 33\\\")\": code: 'Client specified an invalid argument', mess",
@@ -3293,14 +3277,6 @@
       "key": "query: SELECT id, array_to_string(t, '|') AS joined FROM ev",
       "kind": "error",
       "signature": "Spice rejected the query: Tonic error: code: 'Client specified an invalid argument', message: \"Failed to execute query.\\nConnectionError Error(\\\"no such function: array_to_string in SELECT `ev`.`id`, array_to_string(`ev`.`t`, '|') AS `joined` FROM `ev` at offset 18\\\")\": code: 'Client specified an in",
-      "group": "sqlite"
-    },
-    {
-      "run": "surface",
-      "who": "sqlite",
-      "key": "query: SELECT id, array_agg(e ORDER BY e) AS sorted FROM (SELECT id, unnest(a) AS e FROM ev WHERE id < 50) u GROUP BY id",
-      "kind": "error",
-      "signature": "Spice rejected the query: Tonic error: code: 'Client specified an invalid argument', message: \"Failed to execute query.\\nConnectionError Error(\\\"no such function: UNNEST in SELECT `u`.`id`, `u`.`e` FROM (SELECT `ev`.`id`, UNNEST(`ev`.`a`) AS `e` FROM `ev` WHERE (`ev`.`id` < 50)) AS `u` at offset 49\\",
       "group": "sqlite"
     },
     {

@@ -37,3 +37,12 @@ steps:
       src: { file: seed/surface-postgres.sql }
   - start: {}
   - corpus: corpus/surface.sql
+  # SQLite has no UNNEST, so a plan with one runs the UNNEST and the joins above
+  # it locally there: a cross join keeps every pair and a join can read the
+  # unnested column.
+  - query: SELECT count(*) AS n FROM ev a CROSS JOIN (SELECT * FROM unnest(range(0, 100))) b
+    oracle-sql: SELECT count(*) AS n FROM ev a CROSS JOIN generate_series(0, 99) b
+  - query: SELECT a.id, b.x FROM ev a JOIN (SELECT unnest([1, 2, 3]) AS x) b ON a.id = b.x
+    oracle-sql: SELECT a.id, b.x FROM ev a JOIN unnest(ARRAY[1, 2, 3]) AS b(x) ON a.id = b.x
+  - query: SELECT id FROM ev WHERE id IN (SELECT unnest([1, 2, 3]))
+    oracle-sql: SELECT id FROM ev WHERE id IN (SELECT unnest(ARRAY[1, 2, 3]))
