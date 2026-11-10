@@ -126,6 +126,7 @@ fn publication(table_id: &str, snapshot: &str, sequence: i64) -> CatalogPublicat
         inline_tombstone: None,
         pending_durable_flips: Vec::new(),
         dirty_pk_bytes: Vec::new(),
+        files: Vec::new(),
     }
 }
 

@@ -1142,6 +1142,22 @@ impl Inner {
     ) -> CatalogResult<Vec<Action>> {
         let mut batch = Vec::new();
         for publication in publications {
+            if !publication.files.is_empty() {
+                if publication.files.iter().any(|file| {
+                    file.table_id != publication.table_id
+                        || file.snapshot_id != publication.snapshot_id
+                }) {
+                    return Err(invalid(
+                        "a published file does not belong to the published snapshot",
+                    ));
+                }
+                batch.push(actions::add_files(
+                    &publication.table_id,
+                    &publication.snapshot_id,
+                    &publication.files,
+                    true,
+                ));
+            }
             batch.extend(self.conflict_batch(
                 publication.delete_files.clone(),
                 &publication.table_id,

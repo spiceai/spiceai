@@ -60,6 +60,7 @@ use super::Result;
 use super::constants::{STAGING_DIR_NAME, STAGING_WAL_FILENAME, STAGING_WAL_TMP_FILENAME};
 use super::on_conflict::{PostValidationState, PreparedOnConflictDeletionPublish};
 use super::table::{CayenneTableProvider, PreparedAppendSnapshotPublish};
+use super::uncommitted_files::DiscardedFinalKeyWrite;
 use crate::metadata::SnapshotFile;
 use crate::metastore::MetastoreTransaction;
 use crate::provider::Error;
@@ -496,9 +497,18 @@ impl Drop for PreparedStagedAppend {
         // An append at its final keys that ends here without being discarded
         // keeps its files: committed, they are the table's; otherwise they are
         // orphans for the orphan sweep.
-        self.table
+        let ended = self
+            .table
             .uncommitted_files()
-            .end_final_key_write(&self.staging_snapshot_id);
+            .discard_final_key_write(&self.staging_snapshot_id);
+        // A keyed write into a new protected snapshot recorded its keys in the
+        // primary-key cache when it prepared, so that the next write validates
+        // against them. Ending uncommitted, those keys are not the table's.
+        if self.target_kind == StagingWalTargetKind::ProtectedSnapshot
+            && matches!(ended, DiscardedFinalKeyWrite::Uncommitted { .. })
+        {
+            self.table.clear_cached_pk_keyset();
+        }
     }
 }
 
@@ -507,6 +517,36 @@ impl PreparedStagedAppend {
     #[must_use]
     pub fn row_count(&self) -> u64 {
         self.row_count
+    }
+
+    /// Whether this is a keyed write into a new protected snapshot that wrote
+    /// its files at their final keys: it commits once, in one record that names
+    /// the files and makes the snapshot live
+    /// ([`super::table::CayenneCdcWrite::finish`]).
+    pub(crate) fn writes_new_protected_snapshot_at_final_keys(&self) -> bool {
+        self.target_kind == StagingWalTargetKind::ProtectedSnapshot
+            && self.table.is_final_key_write(&self.staging_snapshot_id)
+    }
+
+    /// The files this write put at their final keys, with their sizes.
+    pub(crate) fn final_key_files(&self) -> Vec<(String, u64)> {
+        self.table
+            .uncommitted_files()
+            .files(&self.staging_snapshot_id)
+    }
+
+    /// Record that the commit naming this write's final-key files was accepted.
+    pub(crate) fn mark_final_key_files_committed(&self) {
+        self.table
+            .uncommitted_files()
+            .mark_final_key_write_committed(&self.staging_snapshot_id);
+    }
+
+    /// Feed the maintained-aggregate registry from this write, under the
+    /// listing fence the caller holds (see [`Self::apply_under_held_barrier`]).
+    pub(crate) fn feed_ivm_under_held_fence(&self) {
+        self.table
+            .feed_staged_ivm_under_fence(self.ivm_feed_batches.as_ref());
     }
 
     /// Attach the IVM insert batches captured at Stage A (write path → receipt),
@@ -1115,10 +1155,13 @@ impl PreparedStagedAppend {
     ///
     /// Returns an error if clearing the staging directory fails.
     pub async fn rollback(self) -> Result<()> {
+        // A write at its final keys deletes exactly the files it wrote when it
+        // is discarded; its target directory holds nothing else to clear.
+        let final_keys = self.table.is_final_key_write(&self.staging_snapshot_id);
         self.table
             .clear_staging_snapshot_dir(&self.staging_snapshot_id)
             .await?;
-        if self.target_kind == StagingWalTargetKind::ProtectedSnapshot {
+        if self.target_kind == StagingWalTargetKind::ProtectedSnapshot && !final_keys {
             self.table
                 .clear_snapshot_dir(&self.target_snapshot_id)
                 .await?;
@@ -1894,14 +1937,18 @@ impl CayenneTableProvider {
     ///    finalize's move**, so even at the instant of hand-off there is no torn
     ///    concurrent directory mutation (see the lock note below).
     /// 3. **Roll-forward vs roll-back is decided by the DURABLE snapshot sequence,
-    ///    not the provider pointer.** A single-table CDC upsert commits its
-    ///    `snapshot_sequence` synchronously in Stage A
+    ///    not the provider pointer.** A single-table CDC upsert that stages
+    ///    commits its `snapshot_sequence` in Stage A
     ///    (`commit_on_conflict_deletions_with_tombstone`), which runs *before*
-    ///    `finish()`. Since `not-in-flight ⟹ finish() ran (or the receipt was
-    ///    dropped)`, a *committed* upsert always has a durable sequence when
-    ///    recovery sees its WAL ⟹ it is always rolled FORWARD, never back. An
-    ///    append abandoned *before* its sequence commit has no durable sequence
-    ///    and is correctly rolled back (it published no rows).
+    ///    `finish()`; inside a same-record scope that commit is buffered, and the
+    ///    WAL and staged files stay until the scope's record commits. Since
+    ///    `not-in-flight ⟹ finish() ran (or the receipt was dropped)`, a
+    ///    *committed* upsert always has a durable sequence when recovery sees its
+    ///    WAL ⟹ it is always rolled FORWARD, never back. An append abandoned
+    ///    *before* its sequence commit has no durable sequence and is correctly
+    ///    rolled back (it published no rows). A table that writes at final keys
+    ///    stages no upsert: it commits each in one record, and recovery has
+    ///    nothing to finish.
     /// 4. **The roll-forward move is idempotent.**
     ///    `move_staged_files_to_snapshot` renames whatever is in the (uuid-named)
     ///    `_staging/<id>/` dir into the target; once finalize has moved the files
@@ -2037,9 +2084,12 @@ impl CayenneTableProvider {
             // never acknowledged, so recovery discards it rather than adopt it; this is
             // also what keeps a write fenced by another instance's takeover out
             // of the dataset. Copies it left in the target are orphans, which the
-            // orphan sweep reclaims.
+            // orphan sweep reclaims. A table that writes at final keys stages no
+            // write at all, so a staging WAL it finds, whatever its target, was
+            // left by an earlier build and is cleared the same way.
             if self.data_in_object_native_location()
-                && wal.target_kind == StagingWalTargetKind::CurrentSnapshot
+                && (wal.target_kind == StagingWalTargetKind::CurrentSnapshot
+                    || self.writes_at_final_keys())
             {
                 let named: std::collections::HashSet<String> = self
                     .metadata_catalog()

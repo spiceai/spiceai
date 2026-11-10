@@ -64,9 +64,9 @@ pub(super) struct PreparedResolvedAppend {
 
 /// A failed publication, and whether its snapshot's files must be kept because
 /// the catalog may reference them.
-struct Failure {
-    error: Error,
-    keep_files: bool,
+pub(super) struct Failure {
+    pub(super) error: Error,
+    pub(super) keep_files: bool,
 }
 
 impl Failure {
@@ -227,7 +227,7 @@ async fn commit_metadata(
 /// before anything is discarded: present, the publication stands; absent, it
 /// never happened; unreadable, the files are kept and the table refuses writes
 /// until it is reloaded.
-async fn resolve_failed_commit(
+pub(super) async fn resolve_failed_commit(
     catalog: &dyn MetadataCatalog,
     prepared: &mut PreparedOnConflictDeletionPublish,
     error: Error,

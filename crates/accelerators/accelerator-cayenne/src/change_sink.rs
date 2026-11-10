@@ -199,7 +199,7 @@ impl CayenneChangeSinkBackend {
         if !same_record {
             return self.apply_cdc_groups(batch, options, ctx).await;
         }
-        let (write, deletes) =
+        let (write, after_commit) =
             cayenne::catalog::with_same_record_commits(self.apply_cdc_groups(batch, options, ctx))
                 .await;
         let mut write = write?;
@@ -210,7 +210,9 @@ impl CayenneChangeSinkBackend {
         let durable = write.durability == StorageDurability::Durable;
         let finalizer = write.finalizer.take();
         write.finalizer = Some(Box::pin(async move {
-            let (finished, finalize_deletes) =
+            // The write's data goes into the record first, then the positions,
+            // so a position never commits without the rows it covers.
+            let (finished, finalize_after_commit) =
                 cayenne::catalog::with_same_record_commits(async move {
                     if let Some(finalizer) = finalizer {
                         finalizer.await?;
@@ -224,14 +226,15 @@ impl CayenneChangeSinkBackend {
                 })
                 .await;
             finished?;
-            deletes.extend(finalize_deletes);
+            after_commit.extend(finalize_after_commit);
             catalog
                 .commit_pending_for(&table_id)
                 .await
                 .map_err(|error| DataFusionError::External(Box::new(error)))?;
-            // Staging objects the write no longer needs go only now that the
-            // record naming its files has committed.
-            deletes.run().await;
+            // Only now that the record has committed do the rows become visible,
+            // and do the staging objects the write no longer needs go. The
+            // source is acknowledged after this returns.
+            after_commit.run().await;
             Ok(())
         }));
         Ok(write)
@@ -265,9 +268,11 @@ impl CayenneChangeSinkBackend {
         let mut finalizer: Option<BoxFuture<'static, Result<()>>> = None;
         let mut max_epoch: Option<u64> = None;
         for (op, rows) in groups {
-            // A later sub-operation can conflict with the previous append.
+            // A later sub-operation can conflict with the previous append, so
+            // it must see that append's rows: they are published now, and still
+            // commit in the batch's one record.
             if let Some(pending) = finalizer.take() {
-                pending.await?;
+                cayenne::catalog::publish_before_commit(pending).await?;
             }
             let epoch = match op {
                 ChangeOperationType::Upsert => {
@@ -294,7 +299,8 @@ impl CayenneChangeSinkBackend {
                         // The driver owns and polls this future even if the
                         // producer drops its receipt. No task is spawned here.
                         // Dropping an unpublished staged write retains its WAL;
-                        // it is recovery-required, not rolled back. A failed
+                        // it is recovery-required, not rolled back. One written
+                        // at final keys leaves only orphans. A failed
                         // predecessor must fence this owner before dropping it.
                         finalizer = Some(Box::pin(async move {
                             write

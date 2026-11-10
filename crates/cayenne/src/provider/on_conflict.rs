@@ -125,6 +125,7 @@ impl PreparedOnConflictDeletionPublish {
                 inline_tombstone: payload.inline_tombstone.clone(),
                 pending_durable_flips: payload.pending_durable_flips.clone(),
                 dirty_pk_bytes: Vec::new(),
+                files: Vec::new(),
             })
     }
 

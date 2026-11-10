@@ -483,11 +483,10 @@ enum TombstonePushdown {
 
 /// Result of a Cayenne CDC append write.
 ///
-/// A write can be fully complete when this value is returned, or it can have a
-/// staged append whose WAL is durable but whose file publish still needs to be
-/// finalized. CDC catch-up mode can safely commit the source offset once this
-/// value is returned; callers must still drive [`Self::finish`] to make the
-/// rows visible and release the table write guard.
+/// A write can be fully complete when this value is returned, or it can be
+/// prepared and still need [`Self::finish`] to commit it and make its rows
+/// visible. Commit a source position for it only once `finish` has returned,
+/// in the same record as its data or after it.
 #[must_use]
 pub struct CayenneCdcWrite {
     table: CayenneTableProvider,
@@ -624,6 +623,13 @@ impl CayenneCdcWrite {
     ///
     /// Returns an error if the staged append cannot be published.
     pub async fn finish(self) -> Result<u64> {
+        if self
+            .prepared_append
+            .as_ref()
+            .is_some_and(PreparedStagedAppend::writes_new_protected_snapshot_at_final_keys)
+        {
+            return self.finish_in_one_record().await;
+        }
         if let Some(prepared_append) = self.prepared_append {
             // Taken before the publish below, because the rows it makes visible
             // are described by a `num_rows` delta that only reaches the
@@ -821,6 +827,210 @@ impl CayenneCdcWrite {
         } else {
             Ok(self.rows)
         }
+    }
+
+    /// Commit a keyed write into a new protected snapshot, whose data files and
+    /// deletion vectors are already at their final keys, in one record: the
+    /// snapshot's file names, its sequence, the deletes that hide the rows it
+    /// replaces, and its inline tombstone. The tombstone commits inactive and
+    /// is applied in memory when the rows are published: the catalog's readable
+    /// state takes a record before it commits, and an inline-cache rebuild
+    /// reads active tombstones from that state, so an active one would hide the
+    /// old inline row before its replacement is visible. Its record makes the
+    /// replacement live, so opening the table activates it. Nothing the write
+    /// prepared is committed before this record, so a crash leaves all of it or
+    /// none of it, and recovery has nothing to finish. Its rows become visible
+    /// only after the record commits.
+    ///
+    /// Inside [`crate::catalog::with_same_record_commits`] the record is only
+    /// buffered: the scope's owner adds what it commits with it (a source
+    /// position) and commits it, then runs this write's publish. Elsewhere the
+    /// record commits here and the rows are published before this returns.
+    async fn finish_in_one_record(mut self) -> Result<u64> {
+        let table = self.table.clone_for_write_operations();
+        let (Some(prepared_append), Some(mut prepared)) =
+            (self.prepared_append.take(), self.prepared_on_conflict.take())
+        else {
+            return Err(Error::Internal {
+                table: table.table_name().to_string(),
+                message:
+                    "A keyed write into a new protected snapshot has no deletes prepared to commit"
+                        .to_string(),
+            });
+        };
+        let rows = self.rows;
+        let publish = OneRecordPublish {
+            table: table.clone_for_write_operations(),
+            prepared_append,
+            stats: self.stats.take(),
+            validated_file_keys: std::mem::take(&mut self.validated_file_keys),
+        };
+        let Some(mut publication) = prepared.catalog_publication() else {
+            prepared.retain_files_for_wal_recovery();
+            return Err(Error::Internal {
+                table: table.table_name().to_string(),
+                message: "A keyed write into a new protected snapshot has no record to commit"
+                    .to_string(),
+            });
+        };
+        publication.files = table
+            .new_protected_snapshot_manifest_rows(
+                &prepared.target_snapshot_id,
+                &publish.prepared_append.final_key_files(),
+                prepared.snapshot_sequence,
+            )
+            .await;
+        let catalog = Arc::clone(table.catalog());
+
+        if crate::catalog::commit_left_to_scope_owner() {
+            // Buffered; the scope's owner commits it.
+            if let Err(source) = catalog
+                .commit_publications(std::slice::from_ref(&publication))
+                .await
+            {
+                prepared.retain_files_for_wal_recovery();
+                return Err(Error::Catalog { source });
+            }
+            let state = Arc::new(ParkingMutex::new(Some((publish, prepared))));
+            let run = {
+                let state = Arc::clone(&state);
+                Box::pin(async move {
+                    let taken = state.lock().take();
+                    if let Some((publish, prepared)) = taken {
+                        publish.run(prepared).await;
+                    }
+                })
+            };
+            let abandon = Box::new(move || {
+                if let Some((publish, mut prepared)) = state.lock().take() {
+                    // The record may still commit, or may have: its fate is
+                    // unknown here, so its files and deletes are kept and the
+                    // table refuses work until it is reloaded from its catalog.
+                    prepared.retain_files_for_wal_recovery();
+                    publish
+                        .table
+                        .publication_outcome_unknown()
+                        .store(true, Ordering::Release);
+                    publish.table.clear_cached_pk_keyset();
+                }
+            });
+            // The scope's owner always takes it; a task outside every scope
+            // would have committed above instead.
+            if let Some(run) = crate::catalog::publish_after_commit(run, abandon) {
+                run.await;
+            }
+            return Ok(rows);
+        }
+
+        let commit_start = Instant::now();
+        let committed = match catalog
+            .commit_publications(std::slice::from_ref(&publication))
+            .await
+        {
+            Ok(()) => {
+                crate::catalog::commit_at_acknowledgement_for(catalog.as_ref(), table.table_id())
+                    .await
+            }
+            Err(error) => Err(error),
+        };
+        if let Err(source) = committed {
+            match super::append_commit::resolve_failed_commit(
+                catalog.as_ref(),
+                &mut prepared,
+                Error::Catalog { source },
+            )
+            .await
+            {
+                Ok(()) => {}
+                Err(failure) => {
+                    table.clear_cached_pk_keyset();
+                    if !failure.keep_files {
+                        // It did not commit: its deletion vectors go with
+                        // `prepared`, its data files here.
+                        drop(prepared);
+                        if let Err(error) = publish.prepared_append.rollback().await {
+                            tracing::debug!(
+                                table = table.table_name(),
+                                %error,
+                                "Deleting the files of a keyed write that did not commit failed; the orphan sweep reclaims them"
+                            );
+                        }
+                    }
+                    return Err(failure.error);
+                }
+            }
+        }
+        record_cayenne_write_phase(table.table_name(), "publish_commit", commit_start);
+        publish.run(prepared).await;
+        Ok(rows)
+    }
+}
+
+/// The in-memory half of [`CayenneCdcWrite::finish_in_one_record`]: what makes
+/// a committed keyed write's rows visible.
+struct OneRecordPublish {
+    table: CayenneTableProvider,
+    prepared_append: PreparedStagedAppend,
+    stats: Option<Arc<ColumnStatsAccumulator>>,
+    validated_file_keys: PkDigestSet,
+}
+
+impl OneRecordPublish {
+    /// Publish the write whose record has committed. Infallible: the rows are
+    /// the table's from the commit on, so nothing here may undo it.
+    async fn run(self, mut prepared: PreparedOnConflictDeletionPublish) {
+        let Self {
+            table,
+            prepared_append,
+            stats,
+            validated_file_keys,
+        } = self;
+        prepared.mark_catalog_committed();
+        prepared_append.mark_final_key_files_committed();
+        let superseded = prepared.superseded;
+        let reserved_live_rows_delta = table.reserve_live_rows_delta();
+        let publish_start = Instant::now();
+        let published_live_rows_delta = {
+            let lock_wait_start = Instant::now();
+            let _visibility = table.visibility_lock_arc().lock_owned().await;
+            let _fence = table.lock_listing_fence_write_owned().await;
+            record_cayenne_write_phase(table.table_name(), "publish_lock_wait", lock_wait_start);
+            let deletion_apply_start = Instant::now();
+            table.publish_prepared_on_conflict_deletions(prepared);
+            prepared_append.feed_ivm_under_held_fence();
+            record_cayenne_write_phase(
+                table.table_name(),
+                "publish_deletion_apply",
+                deletion_apply_start,
+            );
+            reserved_live_rows_delta.published()
+        };
+        let rows = prepared_append.row_count();
+        if let Err(error) = prepared_append.finish().await {
+            tracing::debug!(
+                table = table.table_name(),
+                %error,
+                "Ending a published keyed write failed"
+            );
+        }
+        record_cayenne_write_phase(table.table_name(), "publish", publish_start);
+        let retention_requested = table.has_retention_delete_filters();
+        if retention_requested {
+            table.clear_cached_pk_keyset();
+        } else {
+            let record_seq = table.sequence_high_water().await;
+            table.record_file_pk_keys(&validated_file_keys, record_seq);
+        }
+        let live_rows_delta = i64::try_from(rows)
+            .unwrap_or(i64::MAX)
+            .saturating_sub(i64::try_from(superseded).unwrap_or(i64::MAX));
+        table.schedule_post_write_maintenance(
+            stats,
+            false,
+            retention_requested,
+            live_rows_delta,
+            published_live_rows_delta,
+        );
     }
 }
 
@@ -3168,7 +3378,7 @@ pub struct CayenneTableProvider {
     inflight_staging_appends: Arc<ParkingMutex<HashMap<String, Arc<PkDigestSet>>>>,
     /// Staged appends whose staged files or staging WAL wait to be deleted until
     /// the record holding their changes commits (see
-    /// [`crate::catalog::DeletesAfterCommit`]). Recovery leaves their WALs alone,
+    /// [`crate::catalog::AfterCommit`]). Recovery leaves their WALs alone,
     /// as it does an in-flight append's.
     staging_deletes_after_commit: Arc<ParkingMutex<HashSet<String>>>,
     /// Admission of change-stream appends to staging: each holds it shared while
@@ -11761,7 +11971,10 @@ impl CayenneTableProvider {
         // so the upsert applies exactly once across the crash (replacement
         // visible, old inline copy hidden) instead of leaving a duplicate. There
         // are no in-flight runtime writers at open time, so this cannot race a
-        // live stage. Skipped for position-based tables (no inline tombstones).
+        // live stage. A table that writes at final keys commits each inactive
+        // tombstone in the record that makes its replacement live, so there too
+        // an inactive tombstone has a durable replacement. Skipped for
+        // position-based tables (no inline tombstones).
         if !provider.pk_deletion_strategy.is_position_based() {
             let flipped = provider
                 .catalog
@@ -26841,26 +27054,13 @@ impl CayenneTableProvider {
             ManifestSequenceTag::Uniform { .. } => std::collections::HashMap::new(),
         };
 
-        // Compute a per-file integrity digest only when the feature is enabled.
-        // Vortex data files are immutable once published, so a digest already
-        // recorded for this (snapshot, file) is reused rather than recomputed —
-        // bounding the whole-file read-back to a file's first appearance.
-        let compute_digests = self.context.integrity_checksums();
-
+        // A per-file integrity digest is computed only when the feature is
+        // enabled. Vortex data files are immutable once published, so a digest
+        // already recorded for this (snapshot, file) is reused rather than
+        // recomputed — bounding the whole-file read-back to a file's first
+        // appearance.
         let mut replacement = Vec::with_capacity(files.len());
         for (file_name, size) in &files {
-            // Reuse the per-file footer row count when the scan path already
-            // persisted it for this exact (snapshot, file); the manifest entry is
-            // a hint until the manifest becomes the scan's file source, so a 0
-            // here is correct-but-imprecise, never wrong.
-            let row_count = self
-                .catalog
-                .get_snapshot_file_statistics(&table_id, snapshot_id, file_name)
-                .await
-                .ok()
-                .flatten()
-                .map_or(0, |stats| stats.num_rows);
-
             let existing_entry = existing.get(file_name);
             let (min_sequence, max_sequence) = match tag {
                 ManifestSequenceTag::Uniform { min, max } => (min, max),
@@ -26875,46 +27075,16 @@ impl CayenneTableProvider {
                         (*existing_min, *existing_max)
                     }),
             };
-
-            // Reuse a digest a prior flush already recorded for this immutable
-            // file (preserved even when the feature is now off, so toggling off
-            // never wipes it); otherwise compute one from the file bytes when
-            // the feature is on.
-            let digest = if let Some(existing_digest) =
-                existing_entry.and_then(|(_, _, digest)| digest.clone())
-            {
-                Some(existing_digest)
-            } else if compute_digests {
-                match self.read_data_file_bytes(snapshot_id, file_name).await {
-                    Ok(bytes) => Some(super::file_digest::compute(&bytes)),
-                    // A digest is a best-effort integrity aid; a transient
-                    // read-back failure must not abort the commit. Leave it
-                    // unset (the file stays unverifiable) and surface the miss.
-                    Err(error) => {
-                        tracing::warn!(
-                            table = self.table_metadata.table_name.as_str(),
-                            snapshot_id,
-                            file = file_name.as_str(),
-                            %error,
-                            "could not read data file to compute integrity digest; leaving it unset",
-                        );
-                        None
-                    }
-                }
-            } else {
-                None
-            };
-
-            replacement.push(SnapshotFile {
-                table_id: table_id.clone(),
-                snapshot_id: snapshot_id.to_string(),
-                file_path: file_name.clone(),
-                row_count,
-                file_size_bytes: i64::try_from(*size).unwrap_or(i64::MAX),
-                min_sequence,
-                max_sequence,
-                digest,
-            });
+            replacement.push(
+                self.manifest_row(
+                    snapshot_id,
+                    file_name,
+                    *size,
+                    (min_sequence, max_sequence),
+                    existing_entry.and_then(|(_, _, digest)| digest.clone()),
+                )
+                .await,
+            );
         }
 
         self.catalog
@@ -26923,6 +27093,88 @@ impl CayenneTableProvider {
         self.uncommitted_files.forget(snapshot_id);
 
         Ok(files)
+    }
+
+    /// The manifest row of `file_name` (`size` bytes) in `snapshot_id`, tagged
+    /// with the commit-sequence range `sequences`.
+    async fn manifest_row(
+        &self,
+        snapshot_id: &str,
+        file_name: &str,
+        size: u64,
+        (min_sequence, max_sequence): (i64, i64),
+        existing_digest: Option<String>,
+    ) -> SnapshotFile {
+        let table_id = self.table_metadata.table_id.clone();
+        // Reuse the per-file footer row count when the scan path already
+        // persisted it for this exact (snapshot, file); the manifest entry is
+        // a hint until the manifest becomes the scan's file source, so a 0
+        // here is correct-but-imprecise, never wrong.
+        let row_count = self
+            .catalog
+            .get_snapshot_file_statistics(&table_id, snapshot_id, file_name)
+            .await
+            .ok()
+            .flatten()
+            .map_or(0, |stats| stats.num_rows);
+
+        // Reuse a digest a prior flush already recorded for this immutable
+        // file (preserved even when the feature is now off, so toggling off
+        // never wipes it); otherwise compute one from the file bytes when
+        // the feature is on.
+        let digest = if let Some(existing_digest) = existing_digest {
+            Some(existing_digest)
+        } else if self.context.integrity_checksums() {
+            match self.read_data_file_bytes(snapshot_id, file_name).await {
+                Ok(bytes) => Some(super::file_digest::compute(&bytes)),
+                // A digest is a best-effort integrity aid; a transient
+                // read-back failure must not abort the commit. Leave it
+                // unset (the file stays unverifiable) and surface the miss.
+                Err(error) => {
+                    tracing::warn!(
+                        table = self.table_metadata.table_name.as_str(),
+                        snapshot_id,
+                        file = file_name,
+                        %error,
+                        "could not read data file to compute integrity digest; leaving it unset",
+                    );
+                    None
+                }
+            }
+        } else {
+            None
+        };
+
+        SnapshotFile {
+            table_id,
+            snapshot_id: snapshot_id.to_string(),
+            file_path: file_name.to_string(),
+            row_count,
+            file_size_bytes: i64::try_from(size).unwrap_or(i64::MAX),
+            min_sequence,
+            max_sequence,
+            digest,
+        }
+    }
+
+    /// The manifest rows of `files`, written at their final keys into
+    /// `snapshot_id`, a protected snapshot that a write publishes at
+    /// `sequence`: the range `[sequence, sequence]`, as
+    /// [`Self::record_new_protected_snapshot_files`] tags them.
+    pub(crate) async fn new_protected_snapshot_manifest_rows(
+        &self,
+        snapshot_id: &str,
+        files: &[(String, u64)],
+        sequence: i64,
+    ) -> Vec<SnapshotFile> {
+        let mut rows = Vec::with_capacity(files.len());
+        for (file_name, size) in files {
+            rows.push(
+                self.manifest_row(snapshot_id, file_name, *size, (sequence, sequence), None)
+                    .await,
+            );
+        }
+        rows
     }
 
     /// Snapshot GC of stale manifest rows: drop every manifest row whose
