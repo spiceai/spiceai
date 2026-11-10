@@ -25,7 +25,9 @@ limitations under the License.
 //! available at the paths the state records.
 
 use crate::{
-    catalog::{CatalogError, CatalogResult, MetadataCatalog, SnapshotSequenceCommit},
+    catalog::{
+        CatalogError, CatalogResult, MemTierDurableCommit, MetadataCatalog, SnapshotSequenceCommit,
+    },
     metadata::{
         ColdTierFile, CreateTableOptions, DeleteFile, DeletionType, IndexRunRecord, InlinedData,
         InlinedDataStats, InlinedDelete, PartitionMetadata, SnapshotFile, SnapshotFileStatistics,
@@ -788,6 +790,9 @@ impl MetadataCatalog for DatasetStateReader {
         _index_key: &str,
         _run_name: &str,
     ) -> CatalogResult<()> {
+        Err(invalid("the dataset state reader is read-only"))
+    }
+    async fn commit_mem_tier_durable(&self, _commit: MemTierDurableCommit) -> CatalogResult<()> {
         Err(invalid("the dataset state reader is read-only"))
     }
     async fn add_inlined_data(&self, _data: InlinedData) -> CatalogResult<String> {

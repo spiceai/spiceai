@@ -17,7 +17,9 @@ limitations under the License.
 
 use super::{actions, state_reader::DatasetStateReader};
 use crate::{
-    catalog::{CatalogError, CatalogResult, MetadataCatalog, SnapshotSequenceCommit},
+    catalog::{
+        CatalogError, CatalogResult, MemTierDurableCommit, MetadataCatalog, SnapshotSequenceCommit,
+    },
     metadata::{
         ColdTierFile, CreateTableOptions, DeleteFile, IndexRunRecord, InlinedData,
         InlinedDataStats, InlinedDelete, PartitionMetadata, SnapshotFile, SnapshotFileStatistics,
@@ -1867,6 +1869,83 @@ impl MetadataCatalog for Domain {
             proto::Select::All,
             &[],
         ));
+        inner.commit(batch).await
+    }
+    /// One record holding the seal's or checkpoint's inline rows, delete files,
+    /// snapshot sequence and inline clear, in the order the SQLite metastore
+    /// applies them in one transaction.
+    async fn commit_mem_tier_durable(&self, commit: MemTierDurableCommit) -> CatalogResult<()> {
+        let MemTierDurableCommit {
+            table_id,
+            mut pure_delete_files,
+            mut reinsert_delete_files,
+            insert_pk_bytes,
+            sequence_number,
+            snapshot_sequence,
+            inline_data,
+            clear_inlined,
+        } = commit;
+        if !insert_pk_bytes.is_empty()
+            && !reinsert_delete_files
+                .iter()
+                .any(|f| f.deletion_type == crate::metadata::DeletionType::KeyBased)
+        {
+            return Err(invalid("reinsert keys require a key-based delete file"));
+        }
+        // Pure deletes stay delete-only; only the reinsert group is stamped.
+        let reinsert_sequence = (!insert_pk_bytes.is_empty()).then_some(sequence_number);
+        for file in &mut pure_delete_files {
+            file.reinsert_sequence = None;
+        }
+        for file in &mut reinsert_delete_files {
+            if reinsert_sequence.is_some_and(|sequence| sequence <= file.sequence_number) {
+                return Err(invalid("insert sequence must exceed delete sequence"));
+            }
+            file.reinsert_sequence = (file.deletion_type
+                == crate::metadata::DeletionType::KeyBased)
+                .then_some(reinsert_sequence)
+                .flatten();
+        }
+        pure_delete_files.append(&mut reinsert_delete_files);
+        if pure_delete_files.iter().any(|f| f.table_id != table_id)
+            || inline_data.iter().any(|d| d.table_id != table_id)
+        {
+            return Err(invalid(format!(
+                "Mem-tier commit rows must belong to table '{table_id}'"
+            )));
+        }
+        let mut inner = self.inner.take().await;
+        let mut batch: Vec<Action> = inline_data
+            .iter()
+            .map(|data| {
+                let id = if data.inlined_id.is_empty() {
+                    uuid::Uuid::now_v7().to_string()
+                } else {
+                    data.inlined_id.clone()
+                };
+                actions::add_inlined(&table_id, data, &id, sequence_number)
+            })
+            .collect();
+        let (_, deletes) = inner.delete_batch(&pure_delete_files)?;
+        batch.extend(deletes);
+        if let Some(snapshot) = snapshot_sequence {
+            batch.push(actions::set_group(
+                &table_id,
+                &snapshot.snapshot_id,
+                snapshot.sequence_number,
+            ));
+        }
+        if clear_inlined {
+            batch.push(actions::remove_inlined(&table_id, proto::Select::All, &[]));
+            batch.push(actions::remove_inlined_deletes(
+                &table_id,
+                proto::Select::All,
+                &[],
+            ));
+        }
+        if batch.is_empty() {
+            return Ok(());
+        }
         inner.commit(batch).await
     }
     async fn add_inlined_delete(&self, delete: InlinedDelete) -> CatalogResult<String> {

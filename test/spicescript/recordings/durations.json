@@ -110,6 +110,7 @@
   "mysql-unsigned-negation": 7,
   "newest-by-time": 12,
   "on-zero-results": 20,
+  "parquet-struct-map-key": 5,
   "partitioning": 5,
   "postgres-catalog": 63,
   "postgres-catalog-cdc": 34,

@@ -23,7 +23,9 @@ use super::{
     replay_state,
 };
 use crate::{
-    catalog::{CatalogError, CatalogResult, MetadataCatalog, SnapshotSequenceCommit},
+    catalog::{
+        CatalogError, CatalogResult, MemTierDurableCommit, MetadataCatalog, SnapshotSequenceCommit,
+    },
     metadata::{
         ColdTierFile, CreateTableOptions, DeleteFile, IndexRunRecord, InlinedData,
         InlinedDataStats, InlinedDelete, PartitionMetadata, SnapshotFile, SnapshotFileStatistics,
@@ -1855,6 +1857,11 @@ impl MetadataCatalog for ObjectNativeCatalog {
                 insert_sequence,
                 snapshot_sequence,
             )
+            .await
+    }
+    async fn commit_mem_tier_durable(&self, commit: MemTierDurableCommit) -> CatalogResult<()> {
+        self.for_table(&commit.table_id)
+            .commit_mem_tier_durable(commit)
             .await
     }
     async fn add_inlined_delete(&self, delete: InlinedDelete) -> CatalogResult<String> {

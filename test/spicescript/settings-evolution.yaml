@@ -153,6 +153,13 @@ steps:
     eventually: 60s
     when: { refresh_mode: full }
     except: object-native
+  # And it keeps saying so while the source is retried: the dataset is not
+  # served, so the status must not go back to claiming it is (#16149).
+  - sleep: 5s
+    when: { refresh_mode: full }
+  - assert-status: { dataset: trips, status: Error, message-contains: partition_by }
+    when: { refresh_mode: full }
+    except: object-native
   - start-source: src
     when: { refresh_mode: full }
   - restart: {}
