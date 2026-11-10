@@ -4062,6 +4062,13 @@ impl DataFusion {
             constraint_columns,
             resolved_time,
         } = setup;
+        // Retention and later builders read `dataset.time_column`; keep them on the
+        // resolved names so a legacy `last_modified` alias is visible everywhere.
+        let mut dataset = dataset.clone();
+        dataset.time_column = resolved_time.time_column.clone();
+        dataset.time_format = resolved_time.time_format;
+        dataset.time_partition_column = resolved_time.time_partition_column.clone();
+        dataset.time_partition_format = resolved_time.time_partition_format;
         // A deferred provider reports the primary key the checkpoint recorded, so an
         // acceleration registered while its source is down keeps its existing key.
         let source_constraints = source_table_provider.constraints();
