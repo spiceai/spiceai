@@ -39240,7 +39240,9 @@ impl CayenneTableProvider {
         owned_capture_write_lock: Option<tokio::sync::OwnedMutexGuard<()>>,
     ) -> Result<u64> {
         if crate::catalog::commits_deferred() {
-            return self.checkpoint_mem_tier_inner(owned_capture_write_lock).await;
+            return self
+                .checkpoint_mem_tier_inner(owned_capture_write_lock)
+                .await;
         }
         let result = crate::catalog::with_deferred_commits(
             self.checkpoint_mem_tier_inner(owned_capture_write_lock),

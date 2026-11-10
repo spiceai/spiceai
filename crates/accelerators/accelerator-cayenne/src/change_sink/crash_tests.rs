@@ -3654,16 +3654,15 @@ async fn a_kill_at_any_storage_write_of_a_periodic_checkpoint_loses_no_change() 
         });
         let resume = saved.max(acknowledged);
         let state = match &reopened {
-            Ok(rows) => match states.iter().position(|state| state == rows) {
-                Some(applied) => {
+            Ok(rows) => {
+                if let Some(applied) = states.iter().position(|state| state == rows) {
                     if i64::try_from(applied).expect("round") < resume {
                         problems.push(format!(
                             "the rows hold {applied} bursts, but the source resumes after burst {resume}"
                         ));
                     }
                     format!("after burst {applied}")
-                }
-                None => {
+                } else {
                     let (applied, nearest) = states
                         .iter()
                         .enumerate()
@@ -3675,14 +3674,14 @@ async fn a_kill_at_any_storage_write_of_a_periodic_checkpoint_loses_no_change() 
                     let missing: Vec<_> =
                         nearest.iter().filter(|row| !rows.contains(row)).collect();
                     let extra: Vec<_> = rows.iter().filter(|row| !nearest.contains(row)).collect();
-                    let duplicated = rows.len()
-                        - rows.iter().map(|(id, _)| id).collect::<BTreeSet<_>>().len();
+                    let duplicated =
+                        rows.len() - rows.iter().map(|(id, _)| id).collect::<BTreeSet<_>>().len();
                     problems.push(format!(
                         "the rows are no whole number of bursts (nearest: after burst {applied}, without {missing:?}, with {extra:?}, {duplicated} duplicated keys)"
                     ));
                     format!("between bursts (near burst {applied})")
                 }
-            },
+            }
             Err(error) => {
                 problems.push(format!("the reopened table refuses queries: {error}"));
                 "refused".to_string()
