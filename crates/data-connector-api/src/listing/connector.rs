@@ -4659,7 +4659,11 @@ mod tests {
 
     fn write_id_file(path: &std::path::Path, ids: &[i64]) {
         if path.extension().is_some_and(|ext| ext == "csv") {
-            let body: String = ids.iter().map(|id| format!("{id}\n")).collect();
+            let body = ids.iter().fold(String::new(), |mut body, id| {
+                use std::fmt::Write as _;
+                let _ = writeln!(body, "{id}");
+                body
+            });
             std::fs::write(path, format!("id\n{body}")).expect("write csv");
             return;
         }
