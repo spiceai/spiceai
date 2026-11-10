@@ -16,7 +16,7 @@ limitations under the License.
 
 use std::sync::Arc;
 
-use arrow::datatypes::Schema;
+use arrow::datatypes::{DataType, Schema};
 use data_components::object::metadata::MetadataColumn;
 use datafusion::common::TableReference;
 
@@ -44,6 +44,11 @@ fn requests_last_modified_metadata(column: &str, schema: &Schema) -> bool {
             && schema.fields().find(LEGACY_LAST_MODIFIED_COLUMN).is_none())
 }
 
+fn is_timestamptz_column(schema: &Schema, column: &str) -> bool {
+    schema
+        .column_with_name(column)
+        .is_some_and(|(_, field)| matches!(field.data_type(), DataType::Timestamp(_, Some(_))))
+}
 fn resolve_time_column_alias(
     column: Option<&str>,
     time_format: Option<TimeFormat>,
@@ -68,7 +73,10 @@ fn resolve_time_column_alias(
         resolved_column = metadata_name.to_string();
     }
 
-    let resolved_format = if resolved_column == metadata_name && time_format.is_none() {
+    let resolved_format = if resolved_column == metadata_name
+        && time_format.is_none()
+        && is_timestamptz_column(schema, &resolved_column)
+    {
         if !aliased {
             tracing::warn!(
                 "Dataset '{dataset_name}' sets `{column_key}: {resolved_column}` without `{format_key}`. Defaulting `{format_key}` to `timestamptz` because the metadata column is Timestamp(µs, UTC). See: {LAST_MODIFIED_DOCS}"
@@ -315,5 +323,20 @@ mod tests {
             resolved.time_partition_format,
             Some(TimeFormat::Timestamptz)
         );
+    }
+
+    #[test]
+    fn resolve_does_not_default_timestamptz_for_naive_timestamp_data_column() {
+        let dataset = spec_with_time_column(MetadataColumn::LastModified.name());
+        let schema = schema(&[(
+            MetadataColumn::LastModified.name(),
+            DataType::Timestamp(TimeUnit::Microsecond, None),
+        )]);
+        let resolved = dataset.resolve_time_columns(&schema);
+        assert_eq!(
+            resolved.time_column.as_deref(),
+            Some(MetadataColumn::LastModified.name())
+        );
+        assert_eq!(resolved.time_format, None);
     }
 }
