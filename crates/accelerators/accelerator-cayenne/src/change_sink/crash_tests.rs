@@ -1526,7 +1526,11 @@ async fn a_reader_sees_no_row_of_a_burst_whose_record_is_not_committed() {
         "before its head write, a reader sees exactly the committed rows"
     );
     assert_eq!(
-        (key_committed, aggregates_committed, rows_committed == rows_before),
+        (
+            key_committed,
+            aggregates_committed,
+            rows_committed == rows_before
+        ),
         (key_before, aggregates_before, true),
         "after its head write and before its publish, a reader sees the rows from before the burst"
     );
@@ -1611,7 +1615,11 @@ async fn an_inline_burst_read_while_its_record_is_buffered_is_visible_once_ackno
     expected.insert(NEW_KEY, value(NEW_KEY, 1));
     let expected: Vec<(i64, i64)> = expected.into_iter().collect();
     assert_eq!(
-        (new_key_after, rows_after == expected, rows_rebuilt == expected),
+        (
+            new_key_after,
+            rows_after == expected,
+            rows_rebuilt == expected
+        ),
         (vec![(NEW_KEY, value(NEW_KEY, 1))], true, true),
         "once acknowledged, the inline burst's row is visible"
     );

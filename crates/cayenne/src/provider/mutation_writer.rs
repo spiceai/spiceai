@@ -704,9 +704,9 @@ impl<'a> AppendMutationWriter<'a> {
                     // inline tombstone wait for the one record that also names the
                     // snapshot's files, so a commit by anything else on the table
                     // (the previous burst's, a merge's) cannot make them durable
-                    // without those files. The tombstone stays inactive in that
-                    // record and is applied in memory at the publish, as on the
-                    // staged path (see `CayenneCdcWrite::finish_in_one_record`).
+                    // without those files. The tombstone commits active in that
+                    // record, and inline-view rebuilds skip it until the publish
+                    // (see `CayenneCdcWrite::finish_in_one_record`).
                     let one_record = prepared_append.writes_new_protected_snapshot_at_final_keys();
                     match self
                         .table
