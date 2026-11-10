@@ -45,8 +45,9 @@ use crate::StateFeature;
 static METRICS: OnceLock<StateStoreMetrics> = OnceLock::new();
 
 /// Creates the state-store instruments from the global meter provider and
-/// publishes both counters at zero for every feature. Requests made before
-/// this runs are not recorded, so call it once the provider is installed.
+/// publishes both counters at zero for every feature an instance always has.
+/// Requests made before this runs are not recorded, so call it once the
+/// provider is installed.
 pub fn init() {
     METRICS
         .get_or_init(|| StateStoreMetrics::new(&opentelemetry::global::meter("state_store")))
@@ -63,6 +64,13 @@ pub fn record_cleanup_deleted(feature: StateFeature, objects: usize) {
 /// Wraps `store` so that every request `feature` makes through it is measured.
 /// Returns `store` itself for a feature without a metric label.
 pub(crate) fn metered(store: Arc<dyn ObjectStore>, feature: StateFeature) -> Arc<dyn ObjectStore> {
+    if let (false, Some(metrics), Some(label)) = (
+        published_at_startup(feature),
+        METRICS.get(),
+        feature.metric_label(),
+    ) {
+        metrics.publish_feature_at_zero(label);
+    }
     match feature.metric_label() {
         Some(feature) => Arc::new(MeteredStore {
             inner: store,
@@ -71,6 +79,15 @@ pub(crate) fn metered(store: Arc<dyn ObjectStore>, feature: StateFeature) -> Arc
         }),
         None => store,
     }
+}
+
+/// Whether `feature`'s counters are published at zero when the instance
+/// starts. The Cayenne metastore keeps state in the location only under
+/// `runtime.params.cayenne_vnext`, so its counters are published when its
+/// store is first built instead, and an instance without the flag reports
+/// no series for it.
+fn published_at_startup(feature: StateFeature) -> bool {
+    feature != StateFeature::CayenneMetastore
 }
 
 /// The kind of a request, the `operation` label.
@@ -138,12 +155,17 @@ impl StateStoreMetrics {
     fn publish_counters_at_zero(&self) {
         for feature in StateFeature::ALL
             .into_iter()
+            .filter(|feature| published_at_startup(*feature))
             .filter_map(StateFeature::metric_label)
         {
-            let labels = feature_labels(feature);
-            self.conflicts.add(0, &labels);
-            self.cleanup_deleted.add(0, &labels);
+            self.publish_feature_at_zero(feature);
         }
+    }
+
+    fn publish_feature_at_zero(&self, feature: &'static str) {
+        let labels = feature_labels(feature);
+        self.conflicts.add(0, &labels);
+        self.cleanup_deleted.add(0, &labels);
     }
 
     fn record_request(&self, feature: &'static str, operation: Operation, started: Instant) {
@@ -610,7 +632,6 @@ mod tests {
             "rate_control",
             "results_cache_warmup",
             "snapshots",
-            "cayenne_metastore",
         ] {
             for counter in [
                 "state_store_conflicts_total",
@@ -623,7 +644,36 @@ mod tests {
                 );
             }
         }
-        assert_eq!(series.len(), 10, "no series for an unmetered feature");
+        assert_eq!(
+            series.len(),
+            8,
+            "no series for an unmetered feature, nor for the Cayenne metastore, which an instance without `cayenne_vnext` never uses"
+        );
+    }
+
+    #[test]
+    fn the_cayenne_metastore_counters_are_published_when_its_store_is_built() {
+        let recorded = Recorded::new();
+        recorded.metrics.publish_counters_at_zero();
+        assert!(!published_at_startup(StateFeature::CayenneMetastore));
+        recorded.metrics.publish_feature_at_zero(
+            StateFeature::CayenneMetastore
+                .metric_label()
+                .expect("the Cayenne metastore is metered"),
+        );
+
+        let series = recorded.series();
+        for counter in [
+            "state_store_conflicts_total",
+            "state_store_cleanup_deleted_total",
+        ] {
+            assert_eq!(
+                series.get(&format!("{counter}{{feature=cayenne_metastore}}")),
+                Some(&0),
+                "{counter}"
+            );
+        }
+        assert_eq!(series.len(), 10);
     }
 
     #[test]

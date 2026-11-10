@@ -37,6 +37,9 @@ spicepod:
 defaults:
   cluster-partition-by: { '*': id }
   expect: { oracle: src }
+  # Each variant's source stamps its own `now()` timestamps, which the rows
+  # include, so each variant is checked against its own source instead.
+  compare-variants: false
 
 steps:
   # Rows at hours from now; every column holds the same instant. The window

@@ -16,10 +16,11 @@ sources:
     ready: rpk cluster health | grep -E 'Healthy:.+true'
 
 # The spicepod as written, and the same with the prototype object-native Cayenne
-# metastore in place of SQLite.
+# metastore in place of SQLite. The variant puts both datasets in `mode: file`,
+# since `mode: memory` stays on SQLite under the flag.
 variants:
   as-written: federated
-  object-native: object-native
+  object-native: { spicepod: { runtime: { params: { cayenne_vnext: enabled } } }, datasets: { '*': { acceleration: { mode: file } } } }
 
 spicepod:
   version: v1
