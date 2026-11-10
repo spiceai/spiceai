@@ -918,6 +918,7 @@ impl CayenneCdcWrite {
                     }
                 })
             };
+            let published = table.clone_for_write_operations();
             let abandon = Box::new(move || {
                 if let Some((publish, mut prepared)) = state.lock().take() {
                     // The record may still commit, or may have: its fate is
@@ -929,6 +930,14 @@ impl CayenneCdcWrite {
                         .publication_outcome_unknown()
                         .store(true, Ordering::Release);
                     publish.table.clear_cached_pk_keyset();
+                } else {
+                    // Published before its record, which did not commit: its rows
+                    // are visible without being durable, so the table refuses work
+                    // until it is reloaded from its catalog.
+                    published
+                        .publication_outcome_unknown()
+                        .store(true, Ordering::Release);
+                    published.clear_cached_pk_keyset();
                 }
             });
             // The scope's owner always takes it; a task outside every scope
@@ -15363,8 +15372,9 @@ impl CayenneTableProvider {
         // now) or has already published — in which case its protected snapshot
         // was registered before this read and the check below sees it. Reading
         // protected first inverts that: the publish can slip between the two
-        // reads and leave both looking empty over live rows.
-        if self.has_inflight_staging_appends() {
+        // reads and leave both looking empty over live rows. A write whose
+        // publish waits for its record's commit holds rows no count shows yet.
+        if self.has_inflight_staging_appends() || self.has_held_publishes() {
             return false;
         }
         // A registered protected snapshot means rows outside the current manifest.
@@ -15415,6 +15425,7 @@ impl CayenneTableProvider {
     /// Returns an error if the catalog cannot list the table's files.
     pub async fn holds_rows(&self) -> CatalogResult<bool> {
         if self.has_inflight_staging_appends()
+            || self.has_held_publishes()
             || !self.protected_snapshots.load().is_empty()
             || !self.mem_tier.is_empty()
             || self.inlined_row_count.load(Ordering::Acquire) != 0
@@ -23188,9 +23199,10 @@ impl CayenneTableProvider {
         // so they belong to the current-snapshot pass as a whole. A pass that
         // reaches the full re-encode reports its own outcome under `full`.
         let table_name = self.table_metadata.table_name.as_str();
-        // A staged append is mid-finalization; files would be neither cleanly in
-        //  nor out of our scan.
-        if self.has_inflight_staging_appends() {
+        // A staged append is mid-finalization, or a write's publish waits for
+        // its record's commit; files would be neither cleanly in nor out of
+        // our scan, and the deletes would not yet be in the deletion index.
+        if self.has_inflight_staging_appends() || self.has_held_publishes() {
             maintenance_metrics::track_compaction(
                 table_name,
                 CompactionKind::SubsetCurrent,
@@ -26398,7 +26410,7 @@ impl CayenneTableProvider {
         let pass_start = std::time::Instant::now();
         let table_name = self.table_metadata.table_name.as_str();
 
-        if self.has_inflight_staging_appends() {
+        if self.has_inflight_staging_appends() || self.has_held_publishes() {
             maintenance_metrics::track_compaction(
                 table_name,
                 CompactionKind::SubsetCurrent,
@@ -35269,12 +35281,19 @@ impl CayenneTableProvider {
         }
     }
 
+    /// Whether a write's publish waits for the commit of the record that holds
+    /// its catalog change. Its deletes are in the catalog but not yet in the
+    /// in-memory deletion index, so a compaction that ran now would rewrite
+    /// rows those deletes hide; compaction declines meanwhile.
+    pub(crate) fn has_held_publishes(&self) -> bool {
+        *self.held_publishes.borrow() > 0
+    }
+
     /// Whether a change is committed or buffered but not yet published: a staged
     /// write's tombstone, or a write waiting for its record's commit.
     /// Maintenance that rewrites the inline corpus defers meanwhile.
     pub(crate) fn inline_changes_unpublished(&self) -> bool {
-        self.pending_inline_tombstones.load(Ordering::Acquire) > 0
-            || *self.held_publishes.borrow() > 0
+        self.pending_inline_tombstones.load(Ordering::Acquire) > 0 || self.has_held_publishes()
     }
 
     /// Serve `replaced` to inline-view rebuilds in place of the catalog's
@@ -41235,6 +41254,9 @@ impl CayenneTableProvider {
     #[doc(hidden)]
     pub async fn checkpoint_inlined_data(&self) -> Result<u64> {
         self.ensure_publication_outcome_known()?;
+        // The flush clears every inline entry, including one a write whose
+        // publish waits for its commit has buffered: that write publishes first.
+        self.wait_for_held_publishes().await?;
         let batches = self.read_inlined_batches().await?;
         if batches.is_empty() {
             let stats = self
