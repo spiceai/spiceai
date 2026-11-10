@@ -39216,8 +39216,24 @@ impl CayenneTableProvider {
 
     /// Checkpoint for a caller that already holds both `write_lock` and
     /// `mem_checkpoint_lock` (write-path spill and schema evolution).
+    ///
+    /// As [`Self::checkpoint_mem_tier`], its metastore changes commit as one
+    /// record, before `fire_slot_advancer` acknowledges the source. Inside a
+    /// deferred scope they are already buffered, and `fire_slot_advancer` or
+    /// the scope's owner commits them.
     async fn checkpoint_mem_tier_holding_locks(&self) -> Result<u64> {
-        self.checkpoint_mem_tier_inner(None).await
+        if crate::catalog::commits_deferred() {
+            return self.checkpoint_mem_tier_inner(None).await;
+        }
+        let result =
+            crate::catalog::with_deferred_commits(self.checkpoint_mem_tier_inner(None)).await;
+        match (
+            result,
+            self.catalog().commit_pending_for(self.table_id()).await,
+        ) {
+            (Ok(_), Err(error)) => Err(error.into()),
+            (result, _) => result,
+        }
     }
 
     /// `owned_capture_write_lock` decides who releases `write_lock` after the
