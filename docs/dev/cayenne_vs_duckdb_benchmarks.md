@@ -7,16 +7,16 @@ retention, throughput — and to catch regressions early.
 
 **Result correctness is a separate gate.** Full-content SQL result equality
 compares **standalone engines outside Spice** (`duckdb` / `rusqlite` / `chdb-rust`
-crates) with **Spice accelerators** (Cayenne, DuckDB accel, SQLite accel) on
+crates) with **Spice accelerators** (Cayenne, SQLite accel) on
 TPC-H/TPC-DS/ClickBench/CH-benCHmark/SSB/SpiceBench/SQLLancer/micro. Entry points:
 
 - `crates/cayenne/tests/correctness/` — inventory, standalone DuckDB↔SQLite
   baseline, Cayenne↔standalone oracles
-- `crates/runtime/tests/result_correctness.rs` — Spice DuckDB/SQLite accelerators
-  ↔ standalone oracles
+- `crates/runtime/tests/result_correctness.rs` — the Spice SQLite accelerator
+  ↔ standalone SQLite, and Spicepod-built runtimes ↔ standalone SQLite and DuckDB
 
 Run with `cargo test -p cayenne --features result-correctness-duckdb|result-correctness-chdb`
-and `cargo test -p runtime --features duckdb,sqlite --test integration result_correctness::`
+and `ADBC_DRIVER_PATH="$(python3 scripts/libduckdb.py)" cargo nextest run -p runtime --features sqlite --test integration -E 'test(/^result_correctness::/)'`
 — not with `cargo bench` or Criterion features. See
 `crates/cayenne/tests/correctness/README.md`. Do not treat those tests as perf
 regressions or fold them into this matrix.
