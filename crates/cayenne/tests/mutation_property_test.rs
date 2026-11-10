@@ -314,7 +314,7 @@ async fn create_table(
         on_conflict: Some(OnConflict::Upsert(ColumnReference::new(vec![
             "id".to_string(),
         ]))),
-        base_path: fixture.data_store.base_path.clone(),
+        base_path: fixture.data_store.base_path(name),
         partition_column: None,
         vortex_config: config(mode, durability, pk_keyset_cache_mb, cold_url),
     };
@@ -324,8 +324,7 @@ async fn create_table(
     let table = Arc::new(
         fixture
             .data_store
-            .builder(catalog, ctx.runtime_env())
-            .create(opts)
+            .create(catalog, ctx.runtime_env(), opts)
             .await?,
     );
     if durability == Durability::Memory {
@@ -352,8 +351,7 @@ async fn reopen_table(
     let provider = Arc::new(
         fixture
             .data_store
-            .builder(catalog, ctx.runtime_env())
-            .open(name)
+            .open(catalog, ctx.runtime_env(), name)
             .await?,
     );
     ctx.register_table(name, Arc::clone(&provider) as Arc<dyn TableProvider>)?;
@@ -1118,11 +1116,13 @@ async fn run_concurrent(
 }
 
 async fn run_workload(fixture: TestFixture, w: Workload) -> TestResult<()> {
-    let fixture = if matches!(w.mode, Mode::AutoCrossing) {
+    let fixture = if matches!(w.mode, Mode::AutoCrossing) || w.cold {
         // A table in an object store starts on key deletes (its storage class
         // tunes it so), so the crossing from position deletes exists only for a
-        // table on a local directory.
-        fixture.on_local_store()
+        // table on a local directory. The runtime never places a dataset with a
+        // datalake tier in the object-native location, so a cold walk runs on
+        // local data files too.
+        fixture.on_local_store().await?
     } else {
         fixture
     };
@@ -1455,7 +1455,7 @@ async fn prop_harness_stack_headroom_impl(_f: TestFixture) -> TestResult<()> {
     descend(63);
     Ok(())
 }
-test_with_backends!(prop_harness_stack_headroom_impl);
+test_on_data_store!(prop_harness_stack_headroom_impl);
 
 // --- AutoCrossing non-vacuity (mode transition, not only model convergence) ---
 //
@@ -1478,7 +1478,7 @@ async fn prop_auto_crossing_observes_position_then_key_switch_impl(
     // `AutoCrossing`'s bound: its 1 MiB target file size / 32.
     const BOUND: u64 = 32 * 1024;
     // Only a table on a local directory starts on position deletes; see `run_workload`.
-    let f = f.on_local_store();
+    let f = f.on_local_store().await?;
     let name = "auto_crossing_mode_switch";
     let (table, _ctx) =
         create_table(&f, name, Mode::AutoCrossing, Durability::File, None, false).await?;
@@ -1541,7 +1541,7 @@ async fn prop_auto_crossing_observes_position_then_key_switch_impl(
     );
     Ok(())
 }
-test_with_backends!(prop_auto_crossing_observes_position_then_key_switch_impl);
+test_on_data_store!(prop_auto_crossing_observes_position_then_key_switch_impl);
 
 // --- Sequential convergence (GREEN) ---
 async fn prop_sequential_key_impl(f: TestFixture) -> TestResult<()> {
@@ -1556,10 +1556,10 @@ async fn prop_sequential_auto_impl(f: TestFixture) -> TestResult<()> {
 async fn prop_sequential_auto_crossing_impl(f: TestFixture) -> TestResult<()> {
     run_workload(f, sequential(Mode::AutoCrossing)).await
 }
-test_with_backends!(prop_sequential_key_impl);
-test_with_backends!(prop_sequential_position_impl);
-test_with_backends!(prop_sequential_auto_impl);
-test_with_backends!(prop_sequential_auto_crossing_impl);
+test_on_data_store!(prop_sequential_key_impl);
+test_on_data_store!(prop_sequential_position_impl);
+test_on_data_store!(prop_sequential_auto_impl);
+test_on_data_store!(prop_sequential_auto_crossing_impl);
 
 // --- Memory-CDC convergence + count-exactness (mem-tier checkpoint + bake) ---
 //
@@ -1572,7 +1572,7 @@ test_with_backends!(prop_sequential_auto_crossing_impl);
 async fn prop_sequential_memory_impl(f: TestFixture) -> TestResult<()> {
     run_workload(f, sequential_memory()).await
 }
-test_with_backends!(prop_sequential_memory_impl);
+test_on_data_store!(prop_sequential_memory_impl);
 
 /// [`assert_converged`] plus a physical row count, which catches a duplicate
 /// row that `read_rows` would fold into the key/value map.
@@ -1617,7 +1617,7 @@ async fn prop_mixed_memory_and_durable_upserts_impl(f: TestFixture) -> TestResul
     }
     Ok(())
 }
-test_with_backends!(prop_mixed_memory_and_durable_upserts_impl);
+test_on_data_store!(prop_mixed_memory_and_durable_upserts_impl);
 
 // A durable upsert of keys first written through the mem tier must hide the
 // old rows whether a checkpoint moves them into a file before the upsert or
@@ -1654,12 +1654,12 @@ async fn durable_upsert_after_mem_tier_checkpoint_impl(f: TestFixture) -> TestRe
 async fn mem_tier_checkpoint_after_durable_upsert_impl(f: TestFixture) -> TestResult<()> {
     durable_upsert_of_mem_tier_keys(f, "mem_tier_checkpoint_after_durable_upsert", false).await
 }
-test_with_backends!(durable_upsert_after_mem_tier_checkpoint_impl);
-test_with_backends!(mem_tier_checkpoint_after_durable_upsert_impl);
+test_on_data_store!(durable_upsert_after_mem_tier_checkpoint_impl);
+test_on_data_store!(mem_tier_checkpoint_after_durable_upsert_impl);
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn prop_concurrent_memory_sqlite() -> TestResult<()> {
-    common::run_with_backend(BackendType::Sqlite, |f| {
+    common::run_with_backend(BackendType::for_data_store(), |f| {
         run_workload(f, concurrent_memory())
     })
     .await
@@ -1678,14 +1678,16 @@ async fn prop_concurrent_memory_sqlite() -> TestResult<()> {
 async fn prop_sequential_cold_impl(f: TestFixture) -> TestResult<()> {
     run_workload(f, sequential_cold()).await
 }
-test_with_backends!(prop_sequential_cold_impl);
+test_on_data_store!(prop_sequential_cold_impl);
 
 // Foreground promotions + restarts with a background compactor/bake loop.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn prop_concurrent_cold_sqlite() -> TestResult<()> {
-    common::run_with_backend(BackendType::Sqlite, |f| run_workload(f, concurrent_cold()))
-        .await
-        .map_err(|e| -> Box<dyn std::error::Error> { e })
+    common::run_with_backend(BackendType::for_data_store(), |f| {
+        run_workload(f, concurrent_cold())
+    })
+    .await
+    .map_err(|e| -> Box<dyn std::error::Error> { e })
 }
 
 // --- Focused regression: re-upsert after overwrite+delete stays visible ---
@@ -1715,12 +1717,12 @@ async fn reupsert_after_overwrite_delete_is_visible_impl(f: TestFixture) -> Test
     }
     Ok(())
 }
-test_with_backends!(reupsert_after_overwrite_delete_is_visible_impl);
+test_on_data_store!(reupsert_after_overwrite_delete_is_visible_impl);
 
 // --- Concurrent pure-upsert convergence (GREEN control: loss needs deletes) ---
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn prop_concurrent_upsert_only_key_sqlite() -> TestResult<()> {
-    common::run_with_backend(BackendType::Sqlite, |f| {
+    common::run_with_backend(BackendType::for_data_store(), |f| {
         run_workload(f, concurrent_upsert_only(Mode::Key))
     })
     .await
@@ -1728,7 +1730,7 @@ async fn prop_concurrent_upsert_only_key_sqlite() -> TestResult<()> {
 }
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn prop_concurrent_upsert_only_position_sqlite() -> TestResult<()> {
-    common::run_with_backend(BackendType::Sqlite, |f| {
+    common::run_with_backend(BackendType::for_data_store(), |f| {
         run_workload(f, concurrent_upsert_only(Mode::Position))
     })
     .await
@@ -1748,7 +1750,7 @@ async fn prop_concurrent_upsert_only_position_sqlite() -> TestResult<()> {
 // updates), so these now converge.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn prop_concurrent_mixed_key_sqlite() -> TestResult<()> {
-    common::run_with_backend(BackendType::Sqlite, |f| {
+    common::run_with_backend(BackendType::for_data_store(), |f| {
         run_workload(f, concurrent_mixed(Mode::Key))
     })
     .await
@@ -1756,7 +1758,7 @@ async fn prop_concurrent_mixed_key_sqlite() -> TestResult<()> {
 }
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn prop_concurrent_mixed_position_sqlite() -> TestResult<()> {
-    common::run_with_backend(BackendType::Sqlite, |f| {
+    common::run_with_backend(BackendType::for_data_store(), |f| {
         run_workload(f, concurrent_mixed(Mode::Position))
     })
     .await
@@ -1770,7 +1772,7 @@ async fn prop_concurrent_mixed_position_sqlite() -> TestResult<()> {
 // re-insert-over-tombstone handling differs between them.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn prop_concurrent_mixed_dense_key_sqlite() -> TestResult<()> {
-    common::run_with_backend(BackendType::Sqlite, |f| {
+    common::run_with_backend(BackendType::for_data_store(), |f| {
         run_workload(f, concurrent_mixed_dense(Mode::Key, None))
     })
     .await
@@ -1778,7 +1780,7 @@ async fn prop_concurrent_mixed_dense_key_sqlite() -> TestResult<()> {
 }
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn prop_concurrent_mixed_dense_position_sqlite() -> TestResult<()> {
-    common::run_with_backend(BackendType::Sqlite, |f| {
+    common::run_with_backend(BackendType::for_data_store(), |f| {
         run_workload(f, concurrent_mixed_dense(Mode::Position, None))
     })
     .await
@@ -1787,7 +1789,7 @@ async fn prop_concurrent_mixed_dense_position_sqlite() -> TestResult<()> {
 // Same dense stress, but forcing the bloom existence-filter conflict path.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn prop_concurrent_mixed_dense_bloom_key_sqlite() -> TestResult<()> {
-    common::run_with_backend(BackendType::Sqlite, |f| {
+    common::run_with_backend(BackendType::for_data_store(), |f| {
         run_workload(f, concurrent_mixed_dense(Mode::Key, Some(0)))
     })
     .await
@@ -1795,7 +1797,7 @@ async fn prop_concurrent_mixed_dense_bloom_key_sqlite() -> TestResult<()> {
 }
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn prop_concurrent_mixed_dense_bloom_position_sqlite() -> TestResult<()> {
-    common::run_with_backend(BackendType::Sqlite, |f| {
+    common::run_with_backend(BackendType::for_data_store(), |f| {
         run_workload(f, concurrent_mixed_dense(Mode::Position, Some(0)))
     })
     .await
@@ -1807,7 +1809,7 @@ async fn prop_concurrent_mixed_dense_bloom_position_sqlite() -> TestResult<()> {
 // deletes under them.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn prop_concurrent_upsert_only_auto_sqlite() -> TestResult<()> {
-    common::run_with_backend(BackendType::Sqlite, |f| {
+    common::run_with_backend(BackendType::for_data_store(), |f| {
         run_workload(f, concurrent_upsert_only(Mode::Auto))
     })
     .await
@@ -1815,7 +1817,7 @@ async fn prop_concurrent_upsert_only_auto_sqlite() -> TestResult<()> {
 }
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn prop_concurrent_mixed_auto_sqlite() -> TestResult<()> {
-    common::run_with_backend(BackendType::Sqlite, |f| {
+    common::run_with_backend(BackendType::for_data_store(), |f| {
         run_workload(f, concurrent_mixed(Mode::Auto))
     })
     .await
@@ -1823,7 +1825,7 @@ async fn prop_concurrent_mixed_auto_sqlite() -> TestResult<()> {
 }
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn prop_concurrent_mixed_auto_crossing_sqlite() -> TestResult<()> {
-    common::run_with_backend(BackendType::Sqlite, |f| {
+    common::run_with_backend(BackendType::for_data_store(), |f| {
         run_workload(f, concurrent_mixed(Mode::AutoCrossing))
     })
     .await
@@ -1831,7 +1833,7 @@ async fn prop_concurrent_mixed_auto_crossing_sqlite() -> TestResult<()> {
 }
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn prop_concurrent_mixed_dense_auto_sqlite() -> TestResult<()> {
-    common::run_with_backend(BackendType::Sqlite, |f| {
+    common::run_with_backend(BackendType::for_data_store(), |f| {
         run_workload(f, concurrent_mixed_dense(Mode::Auto, None))
     })
     .await
@@ -1839,7 +1841,7 @@ async fn prop_concurrent_mixed_dense_auto_sqlite() -> TestResult<()> {
 }
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn prop_concurrent_mixed_dense_auto_crossing_sqlite() -> TestResult<()> {
-    common::run_with_backend(BackendType::Sqlite, |f| {
+    common::run_with_backend(BackendType::for_data_store(), |f| {
         run_workload(f, concurrent_mixed_dense(Mode::AutoCrossing, None))
     })
     .await
@@ -1847,7 +1849,7 @@ async fn prop_concurrent_mixed_dense_auto_crossing_sqlite() -> TestResult<()> {
 }
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn prop_concurrent_mixed_dense_bloom_auto_sqlite() -> TestResult<()> {
-    common::run_with_backend(BackendType::Sqlite, |f| {
+    common::run_with_backend(BackendType::for_data_store(), |f| {
         run_workload(f, concurrent_mixed_dense(Mode::Auto, Some(0)))
     })
     .await
@@ -1941,7 +1943,7 @@ async fn run_concurrent_reads_mode(fixture: &TestFixture, mode: Mode) -> TestRes
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn prop_concurrent_reads_observe_consistent_snapshot_key_sqlite() -> TestResult<()> {
-    common::run_with_backend(BackendType::Sqlite, |f| async move {
+    common::run_with_backend(BackendType::for_data_store(), |f| async move {
         run_concurrent_reads_mode(&f, Mode::Key).await
     })
     .await
@@ -1949,7 +1951,7 @@ async fn prop_concurrent_reads_observe_consistent_snapshot_key_sqlite() -> TestR
 }
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn prop_concurrent_reads_observe_consistent_snapshot_position_sqlite() -> TestResult<()> {
-    common::run_with_backend(BackendType::Sqlite, |f| async move {
+    common::run_with_backend(BackendType::for_data_store(), |f| async move {
         run_concurrent_reads_mode(&f, Mode::Position).await
     })
     .await
@@ -1957,7 +1959,7 @@ async fn prop_concurrent_reads_observe_consistent_snapshot_position_sqlite() -> 
 }
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn prop_concurrent_reads_observe_consistent_snapshot_auto_sqlite() -> TestResult<()> {
-    common::run_with_backend(BackendType::Sqlite, |f| async move {
+    common::run_with_backend(BackendType::for_data_store(), |f| async move {
         run_concurrent_reads_mode(&f, Mode::Auto).await
     })
     .await
@@ -2131,7 +2133,7 @@ fn a_dropped_data_file_put_turns_the_fuzz_walk_red() {
                 .expect("build the test runtime");
             runtime.block_on(async {
                 let store: Arc<dyn object_store::ObjectStore> = Arc::new(DropsOneDataPut::new(2));
-                let fixture = TestFixture::with_data_store(BackendType::Sqlite, Some(store))
+                let fixture = TestFixture::with_data_store(BackendType::ObjectNative, Some(store))
                     .await
                     .expect("fixture");
                 let walk = Workload {

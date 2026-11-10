@@ -167,7 +167,7 @@ async fn a_vortex_listing_table_writes_and_scans_through_a_per_dataset_url() -> 
 /// in the `RuntimeEnv` stays the source's.
 #[tokio::test]
 async fn datasets_in_a_shared_bucket_reach_only_their_own_store() -> TestResult {
-    let fixture = common::TestFixture::new(common::BackendType::Sqlite).await?;
+    let fixture = common::TestFixture::new(common::BackendType::ObjectNative).await?;
     let catalog: Arc<dyn MetadataCatalog> = Arc::clone(&fixture.catalog);
     let ctx = SessionContext::new();
     let bucket = url::Url::parse("s3://bucket/")?;
@@ -189,21 +189,24 @@ async fn datasets_in_a_shared_bucket_reach_only_their_own_store() -> TestResult 
     for (name, store) in [("orders", &store_a), ("events", &store_b)] {
         let data_url = format!("s3://bucket/state/{name}/data");
         let table = Arc::new(
-            CayenneTableProviderBuilder::new(Arc::clone(&catalog), ctx.runtime_env())
-                .with_object_store(ObjectStoreConfig {
+            crate::common::table_builder_on_store(
+                Arc::clone(&catalog),
+                ctx.runtime_env(),
+                ObjectStoreConfig {
                     url: url::Url::parse(&data_url)?,
                     store: Arc::clone(store),
-                })
-                .create(CreateTableOptions {
-                    table_name: name.to_string(),
-                    schema: schema(),
-                    primary_key: vec![],
-                    on_conflict: None,
-                    base_path: data_url,
-                    partition_column: None,
-                    vortex_config: vortex_config(),
-                })
-                .await?,
+                },
+            )
+            .create(CreateTableOptions {
+                table_name: name.to_string(),
+                schema: schema(),
+                primary_key: vec![],
+                on_conflict: None,
+                base_path: data_url,
+                partition_column: None,
+                vortex_config: vortex_config(),
+            })
+            .await?,
         );
         ctx.register_table(name, Arc::clone(&table) as Arc<dyn TableProvider>)?;
         tables.push(table);
@@ -278,7 +281,7 @@ async fn datasets_in_a_shared_bucket_reach_only_their_own_store() -> TestResult 
 /// data path, so a request can never reach another dataset's objects through it.
 #[tokio::test]
 async fn a_dataset_store_refuses_a_path_outside_the_dataset() -> TestResult {
-    let fixture = common::TestFixture::new(common::BackendType::Sqlite).await?;
+    let fixture = common::TestFixture::new(common::BackendType::ObjectNative).await?;
     let catalog: Arc<dyn MetadataCatalog> = Arc::clone(&fixture.catalog);
     let ctx = SessionContext::new();
     let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
@@ -289,21 +292,24 @@ async fn a_dataset_store_refuses_a_path_outside_the_dataset() -> TestResult {
         )
         .await?;
     let data_url = "s3://bucket/state/mine/data".to_string();
-    let table = CayenneTableProviderBuilder::new(catalog, ctx.runtime_env())
-        .with_object_store(ObjectStoreConfig {
+    let table = crate::common::table_builder_on_store(
+        catalog,
+        ctx.runtime_env(),
+        ObjectStoreConfig {
             url: url::Url::parse(&data_url)?,
             store,
-        })
-        .create(CreateTableOptions {
-            table_name: "mine".to_string(),
-            schema: schema(),
-            primary_key: vec![],
-            on_conflict: None,
-            base_path: data_url,
-            partition_column: None,
-            vortex_config: vortex_config(),
-        })
-        .await?;
+        },
+    )
+    .create(CreateTableOptions {
+        table_name: "mine".to_string(),
+        schema: schema(),
+        primary_key: vec![],
+        on_conflict: None,
+        base_path: data_url,
+        partition_column: None,
+        vortex_config: vortex_config(),
+    })
+    .await?;
 
     let registered = ctx.runtime_env().object_store(dataset_url(&table)?)?;
     let error = registered
@@ -323,7 +329,7 @@ async fn a_dataset_store_refuses_a_path_outside_the_dataset() -> TestResult {
 /// it was.
 #[tokio::test]
 async fn a_local_dataset_store_leaves_the_shared_file_store_alone() -> TestResult {
-    let fixture = common::TestFixture::new(common::BackendType::Sqlite).await?;
+    let fixture = common::TestFixture::new(common::BackendType::ObjectNative).await?;
     let catalog: Arc<dyn MetadataCatalog> = Arc::clone(&fixture.catalog);
     let ctx = SessionContext::new();
     let shared_file_store = ctx
@@ -333,21 +339,24 @@ async fn a_local_dataset_store_leaves_the_shared_file_store_alone() -> TestResul
     let dir = std::fs::canonicalize(&fixture.data_path)?;
     let dir_url = url::Url::from_directory_path(&dir).map_err(|()| "directory URL")?;
     let table = Arc::new(
-        CayenneTableProviderBuilder::new(catalog, ctx.runtime_env())
-            .with_object_store(ObjectStoreConfig {
+        crate::common::table_builder_on_store(
+            catalog,
+            ctx.runtime_env(),
+            ObjectStoreConfig {
                 url: url::Url::parse("file:///")?,
                 store: Arc::new(object_store_occ::DurableLocalFileSystem::new()),
-            })
-            .create(CreateTableOptions {
-                table_name: "local_orders".to_string(),
-                schema: schema(),
-                primary_key: vec![],
-                on_conflict: None,
-                base_path: dir_url.to_string(),
-                partition_column: None,
-                vortex_config: vortex_config(),
-            })
-            .await?,
+            },
+        )
+        .create(CreateTableOptions {
+            table_name: "local_orders".to_string(),
+            schema: schema(),
+            primary_key: vec![],
+            on_conflict: None,
+            base_path: dir_url.to_string(),
+            partition_column: None,
+            vortex_config: vortex_config(),
+        })
+        .await?,
     );
     ctx.register_table("local_orders", Arc::clone(&table) as Arc<dyn TableProvider>)?;
     ctx.sql(
@@ -556,7 +565,7 @@ impl ObjectStore for DataReadCountingStore {
 /// what they return.
 #[tokio::test]
 async fn a_scan_reads_its_data_files_through_the_dataset_store() -> TestResult {
-    let fixture = common::TestFixture::new(common::BackendType::Sqlite).await?;
+    let fixture = common::TestFixture::new(common::BackendType::ObjectNative).await?;
     let catalog: Arc<dyn MetadataCatalog> = Arc::clone(&fixture.catalog);
     let counting = Arc::new(DataReadCountingStore::default());
     let store: Arc<dyn ObjectStore> = Arc::clone(&counting) as Arc<dyn ObjectStore>;
@@ -568,18 +577,21 @@ async fn a_scan_reads_its_data_files_through_the_dataset_store() -> TestResult {
 
     let ctx = SessionContext::new();
     let table = Arc::new(
-        CayenneTableProviderBuilder::new(Arc::clone(&catalog), ctx.runtime_env())
-            .with_object_store(config.clone())
-            .create(CreateTableOptions {
-                table_name: "scanned".to_string(),
-                schema: schema(),
-                primary_key: vec![],
-                on_conflict: None,
-                base_path: data_url,
-                partition_column: None,
-                vortex_config: vortex_config(),
-            })
-            .await?,
+        crate::common::table_builder_on_store(
+            Arc::clone(&catalog),
+            ctx.runtime_env(),
+            config.clone(),
+        )
+        .create(CreateTableOptions {
+            table_name: "scanned".to_string(),
+            schema: schema(),
+            primary_key: vec![],
+            on_conflict: None,
+            base_path: data_url,
+            partition_column: None,
+            vortex_config: vortex_config(),
+        })
+        .await?,
     );
     ctx.register_table("scanned", Arc::clone(&table) as Arc<dyn TableProvider>)?;
     for (first, last) in [(1, 1000), (1001, 2500)] {
@@ -594,8 +606,7 @@ async fn a_scan_reads_its_data_files_through_the_dataset_store() -> TestResult {
     drop(table);
 
     let ctx = SessionContext::new();
-    let table = CayenneTableProviderBuilder::new(catalog, ctx.runtime_env())
-        .with_object_store(config)
+    let table = crate::common::table_builder_on_store(catalog, ctx.runtime_env(), config)
         .open("scanned")
         .await?;
     ctx.register_table("scanned", Arc::new(table) as Arc<dyn TableProvider>)?;
@@ -676,27 +687,30 @@ async fn appends_to_an_object_store_data_path_reach_data_files_and_compact() -> 
         ..VortexConfig::default()
     };
     let table = Arc::new(
-        CayenneTableProviderBuilder::new(Arc::clone(&catalog), ctx.runtime_env())
-            .with_object_store(ObjectStoreConfig {
+        crate::common::table_builder_on_store(
+            Arc::clone(&catalog),
+            ctx.runtime_env(),
+            ObjectStoreConfig {
                 url: url::Url::parse(&data_url)?,
                 store: Arc::clone(&store),
-            })
-            .create(CreateTableOptions {
-                table_name: "events".to_string(),
-                schema: schema(),
-                primary_key: vec!["id".to_string()],
-                on_conflict: Some(
-                    datafusion_table_providers::util::on_conflict::OnConflict::Upsert(
-                        datafusion_table_providers::util::column_reference::ColumnReference::new(
-                            vec!["id".to_string()],
-                        ),
-                    ),
+            },
+        )
+        .create(CreateTableOptions {
+            table_name: "events".to_string(),
+            schema: schema(),
+            primary_key: vec!["id".to_string()],
+            on_conflict: Some(
+                datafusion_table_providers::util::on_conflict::OnConflict::Upsert(
+                    datafusion_table_providers::util::column_reference::ColumnReference::new(vec![
+                        "id".to_string(),
+                    ]),
                 ),
-                base_path: data_url,
-                partition_column: None,
-                vortex_config,
-            })
-            .await?,
+            ),
+            base_path: data_url,
+            partition_column: None,
+            vortex_config,
+        })
+        .await?,
     );
     ctx.register_table("events", Arc::clone(&table) as Arc<dyn TableProvider>)?;
     assert!(

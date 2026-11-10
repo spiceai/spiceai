@@ -542,12 +542,15 @@ impl Location {
         name: &str,
         config: &VortexConfig,
     ) -> CayenneTableProviderBuilder {
-        CayenneTableProviderBuilder::new(catalog, ctx.runtime_env())
-            .with_object_store(ObjectStoreConfig {
+        crate::common::table_builder_on_store(
+            catalog,
+            ctx.runtime_env(),
+            ObjectStoreConfig {
                 url: url::Url::parse(&self.data_url).expect("data url"),
                 store,
-            })
-            .with_context(CayenneContext::new(config, ctx.runtime_env(), name))
+            },
+        )
+        .with_context(CayenneContext::new(config, ctx.runtime_env(), name))
     }
 
     /// Create `name` in a new location; `keyed` upserts on `id`.

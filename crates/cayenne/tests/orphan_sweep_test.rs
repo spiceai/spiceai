@@ -37,7 +37,7 @@ use cayenne::metastore::object_native::{
     NativeCatalogConfig, ObjectNativeCatalog, new_dataset_folder,
 };
 use cayenne::provider::orphan_sweep::{UnfinishedUpload, UnfinishedUploads};
-use cayenne::{CayenneTableProvider, CayenneTableProviderBuilder, MetadataCatalog};
+use cayenne::{CayenneTableProvider, MetadataCatalog};
 use chrono::Utc;
 use datafusion::arrow::datatypes::{DataType, Field, Schema};
 use datafusion::datasource::TableProvider;
@@ -356,12 +356,15 @@ impl Rig {
         let data_prefix = data_url.trim_start_matches("s3://bucket/").to_string();
         let ctx = SessionContext::new();
         let catalog: Arc<dyn MetadataCatalog> = Arc::clone(&native) as Arc<dyn MetadataCatalog>;
-        let builder = CayenneTableProviderBuilder::new(catalog, ctx.runtime_env())
-            .with_object_store(ObjectStoreConfig {
+        let builder = crate::common::table_builder_on_store(
+            catalog,
+            ctx.runtime_env(),
+            ObjectStoreConfig {
                 url: url::Url::parse(&data_url).expect("data url"),
                 store: Arc::clone(&self.store),
-            })
-            .with_unfinished_uploads(Arc::new(Uploads(Arc::clone(&self.tracking))));
+            },
+        )
+        .with_unfinished_uploads(Arc::new(Uploads(Arc::clone(&self.tracking))));
         let table = if native.get_table(name).await.is_ok() {
             builder.open(name).await.expect("open the table")
         } else {

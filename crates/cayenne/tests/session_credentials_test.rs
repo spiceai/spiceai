@@ -39,8 +39,8 @@ use crate::common::{self, TestFixture};
 use arrow::array::Int64Array;
 use aws_credential_types::Credentials;
 use aws_credential_types::provider::{ProvideCredentials, SharedCredentialsProvider, future};
+use cayenne::MetadataCatalog;
 use cayenne::metadata::{CreateTableOptions, ObjectStoreConfig, VortexConfig};
-use cayenne::{CayenneTableProviderBuilder, MetadataCatalog};
 use datafusion::arrow::datatypes::{DataType, Field, Schema};
 use datafusion::datasource::TableProvider;
 use datafusion::prelude::SessionContext;
@@ -153,31 +153,34 @@ async fn a_table_keeps_answering_across_session_credential_replacements() -> Tes
         uuid::Uuid::now_v7().simple()
     );
 
-    let fixture = TestFixture::new(common::BackendType::Sqlite).await?;
+    let fixture = TestFixture::new(common::BackendType::ObjectNative).await?;
     let catalog: Arc<dyn MetadataCatalog> = Arc::clone(&fixture.catalog);
     let ctx = SessionContext::new();
-    let table = CayenneTableProviderBuilder::new(catalog, ctx.runtime_env())
-        .with_object_store(ObjectStoreConfig {
+    let table = crate::common::table_builder_on_store(
+        catalog,
+        ctx.runtime_env(),
+        ObjectStoreConfig {
             url: url::Url::parse(&data_url)?,
             store: Arc::new(store),
-        })
-        .create(CreateTableOptions {
-            table_name: "sessions".to_string(),
-            schema: Arc::new(Schema::new(vec![
-                Field::new("id", DataType::Int64, false),
-                Field::new("v", DataType::Int64, false),
-            ])),
-            primary_key: vec![],
-            on_conflict: None,
-            base_path: data_url,
-            partition_column: None,
-            vortex_config: VortexConfig {
-                inline_max_rows: 0,
-                inline_max_bytes: 0,
-                ..VortexConfig::default()
-            },
-        })
-        .await?;
+        },
+    )
+    .create(CreateTableOptions {
+        table_name: "sessions".to_string(),
+        schema: Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("v", DataType::Int64, false),
+        ])),
+        primary_key: vec![],
+        on_conflict: None,
+        base_path: data_url,
+        partition_column: None,
+        vortex_config: VortexConfig {
+            inline_max_rows: 0,
+            inline_max_bytes: 0,
+            ..VortexConfig::default()
+        },
+    })
+    .await?;
     ctx.register_table("sessions", Arc::new(table) as Arc<dyn TableProvider>)?;
 
     let started = Instant::now();

@@ -1,8 +1,8 @@
 ---
 name: Cayenne data store
 
-# Cayenne's data-path suites with every table's data files in an object store
-# rather than a local directory. Pull requests and the merge queue run them on
+# Cayenne's data-path suites on the object-native metastore, with every table
+# placed in its object-store location. Pull requests and the merge queue run them on
 # the in-memory store with bounded seeds; the nightly run adds RustFS, through
 # the S3 client, at full seed depth.
 on:

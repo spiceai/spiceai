@@ -38,7 +38,7 @@ async fn rustfs() -> Option<(Arc<dyn ObjectStore>, String)> {
         eprintln!("skipped: set CAYENNE_TEST_DATA_STORE=rustfs and CAYENNE_TEST_RUSTFS_* to run");
         return None;
     }
-    let fixture = TestFixture::new(BackendType::Sqlite)
+    let fixture = TestFixture::new(BackendType::ObjectNative)
         .await
         .unwrap_or_else(|error| panic!("the rustfs fixture: {error}"));
     let config = fixture

@@ -370,9 +370,9 @@ async fn a_dataset_commits_while_another_datasets_commit_is_in_flight() {
 mod data_path {
     use super::*;
     use arrow::array::Int64Array;
+    use cayenne::MetadataCatalog;
     use cayenne::metadata::{CreateTableOptions, ObjectStoreConfig, VortexConfig};
     use cayenne::metastore::object_native::{NativeCatalogConfig, new_dataset_folder};
-    use cayenne::{CayenneTableProviderBuilder, MetadataCatalog};
     use datafusion::arrow::datatypes::{DataType, Field, Schema};
     use datafusion::datasource::TableProvider;
     use datafusion::prelude::SessionContext;
@@ -479,11 +479,14 @@ mod data_path {
             )
         });
         let ctx = SessionContext::new();
-        let builder = CayenneTableProviderBuilder::new(Arc::clone(catalog), ctx.runtime_env())
-            .with_object_store(ObjectStoreConfig {
+        let builder = crate::common::table_builder_on_store(
+            Arc::clone(catalog),
+            ctx.runtime_env(),
+            ObjectStoreConfig {
                 url: url::Url::parse(&data_url).expect("data url"),
                 store: Arc::clone(store),
-            });
+            },
+        );
         let table = if create {
             builder
                 .create(CreateTableOptions {
