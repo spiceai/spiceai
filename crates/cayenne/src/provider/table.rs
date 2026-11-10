@@ -39202,7 +39202,7 @@ impl CayenneTableProvider {
         }
         // Keep `guards` alive across `inner`; pass only the `write` guard.
         let write = guards.write.take();
-        let rows = self.checkpoint_mem_tier_inner(write).await?;
+        let rows = self.checkpoint_mem_tier_in_one_record(write).await?;
         Ok(CheckpointAttempt::Completed(rows))
     }
 
@@ -39224,17 +39224,28 @@ impl CayenneTableProvider {
 
     /// Checkpoint for a caller that already holds both `write_lock` and
     /// `mem_checkpoint_lock` (write-path spill and schema evolution).
-    ///
-    /// As [`Self::checkpoint_mem_tier`], its metastore changes commit as one
-    /// record, before `fire_slot_advancer` acknowledges the source. Inside a
-    /// deferred scope they are already buffered, and `fire_slot_advancer` or
-    /// the scope's owner commits them.
     async fn checkpoint_mem_tier_holding_locks(&self) -> Result<u64> {
+        self.checkpoint_mem_tier_in_one_record(None).await
+    }
+
+    /// [`Self::checkpoint_mem_tier_inner`] for a caller that holds
+    /// `mem_checkpoint_lock` (and `write_lock`, or passes its guard as
+    /// `owned_capture_write_lock`). As [`Self::checkpoint_mem_tier`], its
+    /// metastore changes commit as one record, before `fire_slot_advancer`
+    /// acknowledges the source, so a crash leaves all of the checkpoint or none
+    /// of it. Inside a deferred scope they are already buffered, and
+    /// `fire_slot_advancer` or the scope's owner commits them.
+    async fn checkpoint_mem_tier_in_one_record(
+        &self,
+        owned_capture_write_lock: Option<tokio::sync::OwnedMutexGuard<()>>,
+    ) -> Result<u64> {
         if crate::catalog::commits_deferred() {
-            return self.checkpoint_mem_tier_inner(None).await;
+            return self.checkpoint_mem_tier_inner(owned_capture_write_lock).await;
         }
-        let result =
-            crate::catalog::with_deferred_commits(self.checkpoint_mem_tier_inner(None)).await;
+        let result = crate::catalog::with_deferred_commits(
+            self.checkpoint_mem_tier_inner(owned_capture_write_lock),
+        )
+        .await;
         match (
             result,
             self.catalog().commit_pending_for(self.table_id()).await,
