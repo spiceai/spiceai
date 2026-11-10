@@ -79,18 +79,30 @@ pub(super) async fn start_executors(
         })
 }
 
-/// Turns off the SQL results cache unless the script configures it. A cached
-/// answer is up to a TTL old, so a query repeated soon after a change could be
-/// answered without reading the acceleration or the source at all: a check that
-/// the source's change arrived, or that an acceleration serves while its source
-/// is down, would compare against the cache instead.
+/// What [`cluster_args`] returns: the scheduler's arguments and each
+/// executor's.
+pub(super) struct ClusterArgs {
+    pub scheduler: Vec<String>,
+    /// Each executor's arguments, with the node port it serves the cluster on.
+    pub executors: Vec<(Vec<String>, u16)>,
+}
+
 /// `--cluster`: the scheduler and executor arguments, with node mTLS from the
 /// run's generated CA and certificates.
+///
+/// Every node listens and advertises on `127.0.0.1`, except when
+/// `scheduler_reached_at` is set: container executors behind a rootless
+/// Docker daemon live in its network namespace, where this machine's
+/// loopback is out of reach, so the scheduler then listens on every
+/// interface and executors dial it at that routable address. They still
+/// reach each other on their namespace's loopback, and the scheduler reaches
+/// them through the port forwards [`crate::spiced::Spiced`] adds.
 pub(super) fn cluster_args(
     pki: &std::path::Path,
     context: &Value,
     executors: usize,
-) -> Result<(Vec<String>, Vec<Vec<String>>)> {
+    scheduler_reached_at: Option<std::net::IpAddr>,
+) -> Result<ClusterArgs> {
     let file = |name: &str| pki.join(name).display().to_string();
     let scheduler_port = context["instance"]["port"].to_string();
     let mtls = |node: &str| {
@@ -103,40 +115,46 @@ pub(super) fn cluster_args(
             file(&format!("{node}.key")),
         ]
     };
-    let mut scheduler: Vec<String> = [
-        "--role",
-        "scheduler",
-        "--node-advertise-address",
-        "127.0.0.1",
-        "--node-bind-address",
-    ]
-    .iter()
-    .map(ToString::to_string)
-    .collect();
-    scheduler.push(format!("127.0.0.1:{scheduler_port}"));
+    let (scheduler_host, scheduler_bind) = match scheduler_reached_at {
+        Some(ip) => (ip.to_string(), "0.0.0.0".to_string()),
+        None => ("127.0.0.1".to_string(), "127.0.0.1".to_string()),
+    };
+    let mut scheduler: Vec<String> = vec![
+        "--role".to_string(),
+        "scheduler".to_string(),
+        "--node-advertise-address".to_string(),
+        scheduler_host.clone(),
+        "--node-bind-address".to_string(),
+        format!("{scheduler_bind}:{scheduler_port}"),
+    ];
     scheduler.extend(mtls("scheduler"));
     let mut all = Vec::new();
     for n in 0..executors {
         let port = if n == 0 {
-            context["instance"]["executor_port"].to_string()
+            context["instance"]["executor_port"]
+                .as_u64()
+                .and_then(|p| u16::try_from(p).ok())
+                .context("the instance has no executor port")?
         } else {
-            crate::docker::free_port()?.to_string()
+            crate::docker::free_port()?
         };
-        let mut executor: Vec<String> = ["--role", "executor", "--scheduler-address"]
-            .iter()
-            .map(ToString::to_string)
-            .collect();
-        executor.push(format!("https://127.0.0.1:{scheduler_port}"));
-        executor.extend([
+        let mut executor: Vec<String> = vec![
+            "--role".to_string(),
+            "executor".to_string(),
+            "--scheduler-address".to_string(),
+            format!("https://{scheduler_host}:{scheduler_port}"),
             "--node-advertise-address".to_string(),
             "127.0.0.1".to_string(),
             "--node-bind-address".to_string(),
-        ]);
-        executor.push(format!("127.0.0.1:{port}"));
+            format!("127.0.0.1:{port}"),
+        ];
         executor.extend(mtls("executor"));
-        all.push(executor);
+        all.push((executor, port));
     }
-    Ok((scheduler, all))
+    Ok(ClusterArgs {
+        scheduler,
+        executors: all,
+    })
 }
 
 /// The engine an acceleration block runs, or `None` when it is disabled,
@@ -277,7 +295,95 @@ pub(super) fn make_cluster_ready(
 mod tests {
     use serde_json::json;
 
-    use super::{make_cluster_ready, undistributed_engine, unpartitionable_acceleration};
+    use super::{
+        cluster_args, make_cluster_ready, undistributed_engine, unpartitionable_acceleration,
+    };
+
+    /// The node addresses of a one-executor cluster, without the mTLS files.
+    fn addresses(
+        scheduler_reached_at: Option<std::net::IpAddr>,
+    ) -> (Vec<String>, Vec<String>, u16) {
+        let context = json!({ "instance": { "port": 41001, "executor_port": 41002 } });
+        let args = cluster_args(
+            std::path::Path::new("/pki"),
+            &context,
+            1,
+            scheduler_reached_at,
+        )
+        .expect("cluster args");
+        let strip = |args: &[String]| -> Vec<String> {
+            args.iter()
+                .take_while(|a| !a.starts_with("--node-mtls"))
+                .cloned()
+                .collect()
+        };
+        let (executor, port) = &args.executors[0];
+        (strip(&args.scheduler), strip(executor), *port)
+    }
+
+    #[test]
+    fn nodes_listen_and_advertise_on_loopback_by_default() {
+        let (scheduler, executor, port) = addresses(None);
+        assert_eq!(
+            scheduler,
+            [
+                "--role",
+                "scheduler",
+                "--node-advertise-address",
+                "127.0.0.1",
+                "--node-bind-address",
+                "127.0.0.1:41001"
+            ]
+        );
+        assert_eq!(
+            executor,
+            [
+                "--role",
+                "executor",
+                "--scheduler-address",
+                "https://127.0.0.1:41001",
+                "--node-advertise-address",
+                "127.0.0.1",
+                "--node-bind-address",
+                "127.0.0.1:41002"
+            ]
+        );
+        assert_eq!(port, 41002);
+    }
+
+    #[test]
+    fn executors_behind_a_rootless_daemon_dial_the_scheduler_at_the_routable_address() {
+        let routable: std::net::IpAddr = "10.1.2.3".parse().expect("address");
+        let (scheduler, executor, port) = addresses(Some(routable));
+        assert_eq!(
+            scheduler,
+            [
+                "--role",
+                "scheduler",
+                "--node-advertise-address",
+                "10.1.2.3",
+                "--node-bind-address",
+                "0.0.0.0:41001"
+            ]
+        );
+        // Executors still listen on, and advertise, their namespace's loopback,
+        // where their peers reach them directly and the scheduler through a
+        // port forward.
+        assert_eq!(
+            executor,
+            [
+                "--role",
+                "executor",
+                "--scheduler-address",
+                "https://10.1.2.3:41001",
+                "--node-advertise-address",
+                "127.0.0.1",
+                "--node-bind-address",
+                "127.0.0.1:41002"
+            ]
+        );
+        assert_eq!(port, 41002);
+    }
 
     fn pod(acceleration: &serde_json::Value) -> serde_json::Value {
         json!({ "datasets": [{ "name": "t", "acceleration": acceleration }] })

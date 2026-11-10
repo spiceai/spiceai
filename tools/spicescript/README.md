@@ -653,7 +653,7 @@ Defaults (`defaults:`):
 - **Comparing variants:** `compare-variants: false` turns off agreement between variants; `compare-to: <variant>` compares every variant with one.
 - **Protocols and auth:** `also-http: true` also asks every query over HTTP JSON and requires the same answer; `also-async: true` also runs every query as a `/v1/queries` job (a distributed job on a cluster) and requires the same answer; `api-key`; `tls: { ca }`.
 - **Running spiced:** `spiced-args`, `executor-args`.
-- **Clusters:** `cluster: { executors, spare, containers }`, and `cluster-partition-by: { <dataset or *>: <column> }` for `--cluster` runs. `containers: true` runs each executor in a container of its own on the host's network (Linux only; elsewhere the script is skipped), with the work and script directories mounted. Each executor writes shuffle output to its own `/tmp`, so a stage reads another executor's output over the network, as on separate hosts; a spicepod that sets `runtime.query.temp_directory` to a shared path undoes this, since an executor reads a peer's shuffle file from disk wherever its path exists.
+- **Clusters:** `cluster: { executors, spare, containers }`, and `cluster-partition-by: { <dataset or *>: <column> }` for `--cluster` runs. `containers: true` runs each executor in a container of its own on the host's network (Linux only; elsewhere the script is skipped), with the work and script directories mounted. Each executor writes shuffle output to its own `/tmp`, so a stage reads another executor's output over the network, as on separate hosts; a spicepod that sets `runtime.query.temp_directory` to a shared path undoes this, since an executor reads a peer's shuffle file from disk wherever its path exists. Under a rootless Docker daemon the host's network is the daemon's own namespace, which cannot reach this machine's loopback or be reached at its own: the scheduler then listens on every interface and executors dial it at this machine's routable address (which the node certificates also name), while spicescript forwards each executor's ports into that namespace through RootlessKit's port API (`dockerd-rootless/api.sock` beside the daemon's socket).
 - **Scheduling:**
   - `exclusive: true` runs the script alone, its instances one after another;
   - `run-variants: side-by-side` runs variants that work together (a snapshot writer and its reader) a step at a time, as one job.
@@ -820,6 +820,7 @@ fails anywhere.
 | `source/document.rs` | Kafka, MongoDB and DynamoDB containers and batched row application. |
 | `source/` | One module per source kind; `mod.rs` holds the `Source` trait. |
 | `docker.rs` | Containers on fixed host ports, so a restarted container keeps its address. |
+| `rootlesskit.rs` | Port forwards into a rootless Docker daemon's network namespace, so this machine reaches a host-network container executor. |
 | `keyquota.rs` | The kernel key quota a rootless Docker daemon's containers share: waiting for room before starting them. |
 | `ledger.rs` | Expected failures: recording, signatures, judging a run against them. |
 | `compare.rs`, `template.rs` | Answer comparison glue, placeholders and merge patches. |

@@ -77,6 +77,9 @@ pub struct Spiced {
     container: Option<ContainerRun>,
     /// The `binary` last copied into `dir` for a container to run.
     staged_from: Option<PathBuf>,
+    /// Port forwards into a rootless daemon's network namespace, so this
+    /// machine reaches a container instance at the ports it serves.
+    forwards: Vec<crate::rootlesskit::Forward>,
 }
 
 /// A container `spiced` runs in: on the host's network, so it serves on the
@@ -90,8 +93,14 @@ pub struct ContainerRun {
     /// `docker run -v` specifications.
     pub volumes: Vec<String>,
     /// Whether the daemon runs rootless, so its containers live in a user
-    /// namespace where the daemon's own user is root.
+    /// namespace where the daemon's own user is root, and its `host` network
+    /// is a namespace of its own, which this machine reaches only through
+    /// port forwards.
     pub rootless: bool,
+    /// Ports beyond the instance's own HTTP, Flight, metrics and `OpenTelemetry` ports
+    /// to forward from this machine into the daemon's namespace when
+    /// `rootless`, such as a cluster executor's node port.
+    pub forward_ports: Vec<u16>,
 }
 
 /// The `docker run --user` a container runs as, so that it may write in, and
@@ -170,6 +179,7 @@ impl Spiced {
             sessions: std::collections::HashMap::new(),
             container: None,
             staged_from: None,
+            forwards: Vec::new(),
         })
     }
 
@@ -327,6 +337,9 @@ impl Spiced {
             }
             Some(run) => {
                 let binary = self.stage_binary()?;
+                if run.rootless && self.forwards.is_empty() {
+                    self.forwards = self.forward_into_daemon(&run)?;
+                }
                 self.container_command(&run, &binary)?
             }
         };
@@ -359,6 +372,24 @@ impl Spiced {
         self.child = Some(child);
         self.flight_client = None;
         Ok(())
+    }
+
+    /// Forwards this instance's ports from this machine's loopback into a
+    /// rootless daemon's network namespace, where a host-network container
+    /// serves them. The ports stay the same across restarts, so the forwards
+    /// are made once and kept until the instance is dropped.
+    fn forward_into_daemon(&self, run: &ContainerRun) -> Result<Vec<crate::rootlesskit::Forward>> {
+        let socket = crate::rootlesskit::api_socket().with_context(|| {
+            format!(
+                "Failed to start container {}: under a rootless Docker daemon this machine reaches a host-network container only through RootlessKit's port API, and no `dockerd-rootless/api.sock` was found beside the daemon's socket (`DOCKER_HOST`), or in `$XDG_RUNTIME_DIR`",
+                run.name
+            )
+        })?;
+        [self.http, self.flight, self.metrics, self.otel]
+            .into_iter()
+            .chain(run.forward_ports.iter().copied())
+            .map(|port| crate::rootlesskit::Forward::add(&socket, port))
+            .collect()
     }
 
     /// The binary a container runs: a copy of `binary` in this instance's

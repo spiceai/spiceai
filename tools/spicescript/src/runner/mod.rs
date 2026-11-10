@@ -1099,6 +1099,17 @@ async fn create_instances(
     } else {
         "host.docker.internal".to_string()
     };
+    // Container executors behind a rootless daemon cannot reach this
+    // machine's loopback either, so the scheduler then listens on, and the
+    // executors dial it at, the routable address (see `cluster_args`).
+    let executors_behind_rootless = cfg!(target_os = "linux")
+        && executors_in_containers(script, options)
+        && crate::docker::daemon_is_rootless().await;
+    let scheduler_reached_at = if executors_behind_rootless {
+        Some(crate::docker::routable_address()?)
+    } else {
+        None
+    };
     let mut instances = Vec::new();
     for target in &options.targets {
         for (variant_name, variant) in variants {
@@ -1143,7 +1154,14 @@ async fn create_instances(
                 "sources": source_ctx,
                 "matrix": combo,
                 "variant": { "name": variant_name },
-                "instance": { "name": label, "dir": dir.display().to_string(), "port": crate::docker::free_port()?,
+                "instance": { "name": label, "dir": dir.display().to_string(),
+                    // The scheduler's node port, free on the wildcard address
+                    // too when the scheduler listens there.
+                    "port": crate::docker::free_port_on(if executors_behind_rootless {
+                        std::net::Ipv4Addr::UNSPECIFIED.into()
+                    } else {
+                        std::net::Ipv4Addr::LOCALHOST.into()
+                    })?,
                     "executor_port": crate::docker::free_port()?, "http_port": http_port,
                     "flight_port": crate::docker::free_port()?,
                     "host_from_container": host_from_container },
@@ -1244,12 +1262,13 @@ async fn create_instances(
                     &options.pki,
                     &context,
                     executor_count + spare_count,
+                    scheduler_reached_at,
                 )?)
             } else {
                 None
             };
             let executor_args: Vec<Value> = match &cluster_args {
-                Some((_, executors)) => executors.iter().map(|a| json!(a)).collect(),
+                Some(args) => args.executors.iter().map(|(a, _)| json!(a)).collect(),
                 None => script
                     .defaults
                     .executor_args
@@ -1291,6 +1310,14 @@ async fn create_instances(
                             "/etc/ssl/certs:/etc/ssl/certs:ro".to_string(),
                         ],
                         rootless: crate::docker::daemon_is_rootless().await,
+                        // The scheduler fetches results from the executor's
+                        // node port, which lives in the daemon's namespace.
+                        forward_ports: cluster_args
+                            .as_ref()
+                            .filter(|_| executors_behind_rootless)
+                            .and_then(|args| args.executors.get(n))
+                            .map(|(_, port)| vec![*port])
+                            .unwrap_or_default(),
                     });
                 }
                 executors.push(executor);
@@ -1324,8 +1351,8 @@ async fn create_instances(
             }
             spiced.set_api_key(script.defaults.api_key.clone())?;
             spiced.set_tls(script.defaults.tls.as_ref().map(|t| script.dir.join(&t.ca)))?;
-            if let Some((scheduler, _)) = &cluster_args {
-                spiced_args.extend(scheduler.iter().cloned());
+            if let Some(args) = &cluster_args {
+                spiced_args.extend(args.scheduler.iter().cloned());
             }
             spiced.set_extra_args(spiced_args);
             instances.push(Instance {
@@ -1779,6 +1806,11 @@ fn strip_role_arg(args: &mut Vec<String>) {
     }
 }
 
+/// Turns off the SQL results cache unless the script configures it. A cached
+/// answer is up to a TTL old, so a query repeated soon after a change could be
+/// answered without reading the acceleration or the source at all: a check that
+/// the source's change arrived, or that an acceleration serves while its source
+/// is down, would compare against the cache instead.
 fn disable_results_cache_unless_configured(spicepod: &mut Value) {
     let Some(root) = spicepod.as_object_mut() else {
         return;

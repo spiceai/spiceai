@@ -31,9 +31,9 @@ pub const ROLES: [&str; 2] = ["scheduler", "executor"];
 
 /// Writes `ca.crt` and, for each of [`ROLES`], `<role>.crt` and `<role>.key`
 /// into `dir`, and returns `dir`. Each node certificate is valid for
-/// `localhost` and `127.0.0.1`, for both server and client authentication,
-/// since a cluster node is both.
-pub fn generate(dir: &Path) -> Result<PathBuf> {
+/// `localhost`, `127.0.0.1` and each of `extra_ips`, for both server and
+/// client authentication, since a cluster node is both.
+pub fn generate(dir: &Path, extra_ips: &[std::net::IpAddr]) -> Result<PathBuf> {
     std::fs::create_dir_all(dir).with_context(|| {
         format!(
             "Failed to create the cluster PKI directory {}",
@@ -65,6 +65,8 @@ pub fn generate(dir: &Path) -> Result<PathBuf> {
             SanType::DnsName("localhost".try_into()?),
             SanType::IpAddress(std::net::Ipv4Addr::LOCALHOST.into()),
         ];
+        node.subject_alt_names
+            .extend(extra_ips.iter().copied().map(SanType::IpAddress));
         node.key_usages = vec![
             KeyUsagePurpose::DigitalSignature,
             KeyUsagePurpose::KeyEncipherment,
