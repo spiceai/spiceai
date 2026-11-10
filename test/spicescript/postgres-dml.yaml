@@ -1,16 +1,17 @@
 name: postgres-dml
 description: >
   DELETE and UPDATE through Spice reach PostgreSQL (write-through), by key, by
-  predicate and for every row: on a federated dataset, and on DuckDB and
-  Cayenne accelerations, whose refresh then serves what PostgreSQL holds.
+  predicate and for every row: on a federated dataset, and on a Cayenne acceleration, whose refresh then serves what PostgreSQL holds.
+  Integer arithmetic in them reaches PostgreSQL as written, so PostgreSQL
+  applies its own overflow rules.
 
 sources:
   src: { kind: postgres }
 
 variants:
   federated: {}
-  duckdb: { datasets: { items: { acceleration: { enabled: true, engine: duckdb, refresh_mode: full } } } }
   cayenne: { datasets: { items: { acceleration: { enabled: true, engine: cayenne, mode: file, refresh_mode: full } } } }
+  cayenne-memory: { datasets: { items: { acceleration: { enabled: true, engine: cayenne, mode: memory, refresh_mode: full } } } }
 
 spicepod:
   version: v1
@@ -30,7 +31,7 @@ defaults:
 
 steps:
   - source-exec:
-      src: CREATE TABLE items (id int PRIMARY KEY, name text NOT NULL, value int NOT NULL); INSERT INTO items VALUES (1, 'alpha', 10), (2, 'beta', 20), (3, 'gamma', 30), (4, 'delta', 40);
+      src: CREATE TABLE items (id int PRIMARY KEY, name text NOT NULL, value int NOT NULL, n bigint NOT NULL); INSERT INTO items VALUES (1, 'alpha', 10, 100), (2, 'beta', 20, 200), (3, 'gamma', 30, 300), (4, 'delta', 40, 9223372036854775807);
   - start: {}
 
   - spice-exec: DELETE FROM items WHERE id = 2
@@ -56,9 +57,30 @@ steps:
     oracle-sql: SELECT id, name, value FROM items
     eventually: 30s
 
+  # Spice evaluates integer + - * with overflow checks of its own; a statement
+  # PostgreSQL evaluates must reach it with the operators, not those checks
+  # (regression test for #15516's checked arithmetic reaching PostgreSQL).
+  - spice-exec: UPDATE items SET n = n + 1, value = 5 WHERE id = 1
+  - spice-exec: UPDATE items SET n = n * 2 - 1 WHERE n - 299 = 1
+  - source-query: { src: "SELECT id, n FROM items ORDER BY id" }
+    expect: { rows: [['1', '101'], ['3', '599'], ['4', '9223372036854775807']] }
+  # PostgreSQL refuses the overflow and changes nothing (the next check reads
+  # row 4 back). Spice reports the refusal only as `db error`, without
+  # PostgreSQL's message, so the check does not match on its text.
+  - spice-exec: UPDATE items SET n = n + 1 WHERE id = 4
+    expect-error: true
+  - spice-exec: DELETE FROM items WHERE n - 1 = 100
+  - source-query: { src: "SELECT id, n FROM items ORDER BY id" }
+    expect: { rows: [['3', '599'], ['4', '9223372036854775807']] }
+  - refresh: items
+    except: federated
+  - query: SELECT id, name, value, n FROM items
+    oracle-sql: SELECT id, name, value, n FROM items
+    eventually: 30s
+
   - spice-exec: UPDATE items SET value = 0
   - source-query: { src: "SELECT count(*), sum(value) FROM items" }
-    expect: { rows: [['3', '0']] }
+    expect: { rows: [['2', '0']] }
 
   - spice-exec: DELETE FROM items
   - source-query: { src: "SELECT count(*) FROM items" }

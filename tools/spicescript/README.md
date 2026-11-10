@@ -48,9 +48,11 @@ target/debug/spicescript --jobs 8 --spiced trunk=target/release/spiced test/spic
 target/debug/spicescript --jobs 4 \
   --spiced release=$HOME/.spice/bin/spiced --spiced dev=target/release/spiced \
   test/spicescript/postgres-cdc-parity.yaml
-# Start on a release and upgrade in place to the build under test at each `upgrade` step:
+# Upgrade scripts start on the release their `from:` names, downloaded once, and move
+# to the build under test at each `upgrade` step; --from replaces that release:
+target/debug/spicescript --spiced dev=target/release/spiced test/spicescript/cayenne-upgrade.yaml
 target/debug/spicescript --from $HOME/.spice/bin/spiced \
-  --spiced dev=target/release/spiced test/spicescript/postgres-upgrade.yaml
+  --spiced dev=target/release/spiced test/spicescript/cayenne-upgrade.yaml
 # Every instance as a scheduler with one executor, over node mTLS:
 target/debug/spicescript --cluster test/spicescript/query-coverage.yaml
 # Known-failing scripts of one group, without waiting out every limit:
@@ -62,17 +64,32 @@ target/debug/spicescript --check test/spicescript
 ```
 
 Docker must be running. The `aws` CLI is needed for object-store sources, and
-`duckdb` for Iceberg sources and `dbgen`. The DuckLake source fetches the
-DuckDB CLI matching Spice's embedded DuckDB into `~/.cache/spicescript/`
-(override with `SPICESCRIPT_DUCKLAKE_DUCKDB`).
+`duckdb` for Iceberg sources and `dbgen`. `duckdb` and `ducklake` sources
+fetch the DuckDB release they use into `~/.cache/spicescript/` (see
+**DuckDB releases** below).
+
+Under a rootless Docker daemon, every running container holds one kernel key
+charged to the daemon's uid. That uid's quota (`kernel.keys.maxkeys` and
+`kernel.keys.maxbytes`, 200 keys and 20000 bytes by default) is shared with
+everything else running as it on the host, and when it is full runc refuses
+to start a container ("unable to join session keyring … disk quota
+exceeded"). On Linux the runner reads the quota from `/proc/key-users`. Before
+a matrix combination takes its `--jobs` slots, it reserves room for every
+container it starts (its sources, and its executors when they run in
+containers), so it never holds slots while it waits for room. Every container
+start also waits for room, and a start refused for the quota is retried. A
+wait is reported in the script's output. After 15 minutes without room the
+script fails, naming the quota and the fix; time spent waiting on room that
+this run's other combinations have reserved does not count toward that.
 
 | Option | Meaning |
 | --- | --- |
 | `<SCRIPTS>…` | Script files, or directories of `*.yaml` scripts (not their subdirectories, except that `known-failing/` includes its group directories). |
 | `--spiced [NAME=]PATH` | A `spiced` to test; repeat it to run every script on several binaries, which must give identical answers. Default: `~/.spice/bin/spiced`. |
-| `--from PATH` | Start every instance on this binary; each `upgrade` step moves it to the binary under test, over the same data. |
-| `--cluster` | Run every instance as a scheduler plus one executor over node mTLS. Scripts that can't run distributed (memory-mode Cayenne, DuckDB or SQLite accelerations) are skipped. |
-| `--jobs N` | Run up to N `spiced` processes at once (default 1). Every instance of every matrix combination is a job of its own, taking a slot per process, executors included, and freeing it when it finishes. A combination that stops and starts a source its instances share, or whose variants work together (`run-variants: side-by-side`), runs its instances a step at a time as one job; a script with `defaults.exclusive` runs alone. Scripts ask for slots longest first, from recorded durations. Each script's output is printed when it finishes, with progress lines and the slowest scripts at the end. |
+| `--from PATH` | Start every instance on this binary instead of the release its script's `from:` names (see [Upgrades](#upgrades)); each `upgrade` step moves it to the binary under test, over the same data. Combine it with `--matrix from=…` to run one base version. |
+| `--from-release FROM=VERSION` | Start the runs whose `from:` is `FROM` (such as `2.3.x`) on release `VERSION` (such as `2.3.2`) instead of the one it resolves to (see [Upgrades](#upgrades)). Repeat it for several. |
+| `--cluster` | Run every instance as a scheduler plus one executor over node mTLS. Scripts that can't run distributed (memory-mode Cayenne, DuckDB or SQLite accelerations) are skipped, as are instances whose `spiced-args` choose a `--role` other than `server`, such as `sidecar`; a `--role server` gives way to the scheduler role. |
+| `--jobs N` | Run up to N `spiced` processes at once (default 1). Every instance of every matrix combination is a job of its own, taking a slot per process, executors and sidecar included, and freeing it when it finishes. A combination that stops and starts a source its instances share, or whose variants work together (`run-variants: side-by-side`), runs its instances a step at a time as one job; a script with `defaults.exclusive` runs alone. Scripts ask for slots longest first, from recorded durations. Each script's output is printed when it finishes, with progress lines and the slowest scripts at the end. |
 | `--partition I/N` | Run only share I of N (1-based), for splitting a suite across CI jobs. Scripts go longest first, by recorded duration, to the share with the least work so far, so every job computes the same split and the shares take about as long. |
 | `--record-durations` | Write each script's run time to `recordings/durations.json` beside it. A script without a recorded duration is refused unless this is set, so a new script gets one when it's added. Record from a `--jobs 1` run. |
 | `--max-wait DURATION` | Cap every wait (`eventually`, readiness, refreshes) at this length. For known-failing scripts, which otherwise wait out every limit. |
@@ -85,6 +102,7 @@ DuckDB CLI matching Spice's embedded DuckDB into `~/.cache/spicescript/`
 | `--keep` | Leave source containers running after the run, for debugging. |
 | `--spice-cli PATH` | The `spice` CLI that `spice` steps run. |
 | `--record-failures` | Rewrite each run script's entries in its directory's `recordings/expected-failures.json` with the failures this run saw (see [Expected failures](#expected-failures)). |
+| `--duckdb-version VERSION` | The DuckDB release `duckdb` and `ducklake` sources use when their spec names no `version` (also `SPICESCRIPT_DUCKDB_VERSION`); defaults to the newest in `test/duckdb_versions.json`. `--record-failures` refuses any other, since the ledger is recorded at the default. |
 | `--check` | Parse every script, including its corpora, and stop. Also fails on an `avoid:` whose defect no longer fails anywhere. |
 
 **Logs and cleanup.** Each failure prints the step, what was expected and what
@@ -96,7 +114,7 @@ leaves its logs in a directory of its own:
 DIR/<script>/script.yaml                  the script as run
 DIR/<script>/output.txt                   what the run printed for it
 DIR/<script>/[<combination>/]<source>.log each source container's output
-DIR/<script>/[<combination>/]<instance>/  its spiced.log (executors' too), spicepod, slt and random-query reports
+DIR/<script>/[<combination>/]<instance>/  its spiced.log (executors' and sidecar's too), spicepod, slt and random-query reports
 ```
 
 `<combination>` is the matrix combination (`src_postgres`), for a script with
@@ -148,16 +166,38 @@ steps:
 
 | Kind | What it is |
 | --- | --- |
-| `postgres`, `mysql`, `clickhouse` | A database in Docker. Each instance gets its own database inside it. `${sources.<name>.params}` holds the connector parameters. |
+| `postgres`, `mysql`, `clickhouse` | A database in Docker. Each instance gets its own database inside it. `${sources.<name>.params}` holds the connector parameters. A run's `mysql` sources share a Docker network, where `${sources.<name>.peer_host}` and `${sources.<name>.peer_port}` reach one from another, so one can replicate from another. |
 | `kafka` | Redpanda (`v26.1.6`), with a topic prefix per instance. Tables are `<namespace>_<table>`, created with three partitions on first write. Connector params include bootstrap servers and PLAINTEXT security. |
-| `mongodb` | MongoDB (`8.0`) single-node replica set, with a database per instance. Connector params include its connection string. |
+| `mongodb` | MongoDB (`9.0`) single-node replica set, with a database per instance. Connector params include its connection string. |
 | `dynamodb` | LocalStack (`4.9`), with a table-name prefix per instance. Tables are `<namespace>_<table>`, created on first write with a numeric or string HASH key and `NEW_AND_OLD_IMAGES` streams. Connector params include endpoint, region and test credentials. |
 | `rustfs` | An S3-compatible store with conditional writes, with a bucket per instance, managed with the `aws` CLI. `${sources.<name>.params}` holds the `s3_*` parameters. `.bucket`, `.endpoint`, `.key` and `.secret` serve other uses, such as a Cayenne data tier or a state location. `.shared_bucket` is one bucket every instance shares, for two variants that act as replicas over one state location. |
 | `files` | A directory per instance (`${sources.<name>.path}`) holding generated Parquet or CSV part files. |
 | `iceberg` | An Iceberg REST catalog over rustfs. `source-exec` and oracle queries run through the `duckdb` CLI attached to the catalog, so a script writes Iceberg with plain SQL and checks Spice against DuckDB reading the same tables. |
-| `ducklake` | A DuckLake catalog written with the DuckDB CLI matching Spice's embedded DuckDB. |
+| `duckdb` | A DuckDB file per instance, written before `start` or while Spice is stopped. `${sources.<name>.params}` holds `duckdb_open`; `.path` is the file path and `.adbc_params` holds the DuckDB ADBC parameters. CLI and library are one DuckDB release (see **DuckDB releases**). |
+| `ducklake` | A DuckLake lake with its catalog in PostgreSQL, written with the CLI of one DuckDB release (see **DuckDB releases**). `version` is that release; the catalog runs the default PostgreSQL image. |
 | `docker` | Any image: `image`, `ports`, `env` (`${port.N}` is the host port of container port N), `command`, and `ready` (a shell command that succeeds once the container is ready). `source-exec` runs a shell command inside it and `source-query` returns the lines it prints. `host-network: true` lets the container reach `spiced` and the other sources on the host: on Linux it shares the host's network, elsewhere Docker routes to the host, and `${sources.<name>.host_from_container}` is the host's address from inside the container either way. Useful for services such as Debezium Server. |
 | `mock-http` | An HTTP server whose routes the script sets with `source-exec`: `path`, and optionally `method`, `query`, `headers-match`, `status`, `headers`, `body`, `delay-ms` and `times`; `reset` removes them all. `source-query` reads what it received: `count <path>`, `log <path>`, `header <path> <name>`. |
+
+**DuckDB releases.** `spiced` reads `duckdb:` and `ducklake:` through the
+DuckDB library installed on the host, so each `duckdb` or `ducklake` source
+writes its data and checks answers with the `duckdb` CLI of one release and
+lends `spiced` that release's library. The release is the source's `version`
+(which may be a `${matrix.<key>}` placeholder, so a script can run each
+release as a combination of its own), else `--duckdb-version`, else the
+newest release `test/duckdb_versions.json` lists. `spiced` loads one DuckDB
+library, so the `duckdb` and `ducklake` sources of one run must resolve to
+the same release; the runner refuses the run before starting any source
+otherwise. The CLI and library are downloaded once into `~/.cache/spicescript/duckdb-<version>/`;
+`SPICESCRIPT_DUCKDB_CLI` (`duckdb` sources), `SPICESCRIPT_DUCKLAKE_DUCKDB`
+(`ducklake` sources) and `SPICESCRIPT_DUCKDB_LIBRARY` name local builds
+instead.
+
+For `duckdb` and `ducklake` sources, the runner adds the library directory to the
+`spiced` process's `LD_LIBRARY_PATH` (Linux) or `DYLD_FALLBACK_LIBRARY_PATH`
+(macOS), keeping existing search paths. This lets `duckdb:` load `libduckdb`
+by name. Its read-only file connection can coexist with CLI oracle queries.
+Direct `adbc:` opens read-write and holds the file lock: check the CLI oracle
+before `start` or after `stop`, or mirror the data to another source.
 
 Files and object stores answer no queries themselves, so a script mirrors their
 rows into a database to have an oracle (`generate: … mirror: <source>`).
@@ -188,7 +228,7 @@ with each other, and each ran the writes separately.
 **Variants** are [JSON merge patches](https://www.rfc-editor.org/rfc/rfc7386).
 `spicepod:` patches the whole spicepod, and `datasets:` patches datasets by name
 (`*` for all), since a merge patch replaces a list wholesale. A variant may also
-set `env:`, and `when: { <matrix key>: <value> }` to exist only in some
+set `env:` for `spiced`, whose values take the same placeholders, and `when: { <matrix key>: <value> }` to exist only in some
 combinations. Variants run in alphabetical order, and the first is the one the
 others are compared with.
 
@@ -208,7 +248,12 @@ file_format: parquet }`.
 **Placeholders**: `${sources.<name>.<field>}`, `${matrix.<key>}`,
 `${variant.name}`, `${instance.name}`, `${instance.dir}`, `${instance.port}`
 (a free port for the script's own use), `${instance.http_port}` (the port
-`spiced` serves HTTP on, for a container that posts to it), `${script.dir}`, `${pki.dir}` (this run's node mTLS CA and certificates: `ca.crt`, `scheduler.crt`/`.key`, `executor.crt`/`.key`, generated when the run starts).
+`spiced` serves HTTP on, for a container that posts to it),
+`${instance.flight_port}` (the port it serves Flight on, for a
+[sidecar](#sidecars) to read from), `${instance.host_from_container}` (the
+host such a container reaches `spiced` at: `host.docker.internal`, or this machine's routable address
+when a rootless Docker daemon runs a `host-network` source, since its containers cannot reach this
+machine's loopback; `spiced` then serves HTTP on every interface), `${script.dir}`, `${pki.dir}` (this run's node mTLS CA and certificates: `ca.crt`, `scheduler.crt`/`.key`, `executor.crt`/`.key`, generated when the run starts).
 Spice's own `${secrets:…}` and `${env:…}` pass through to `spiced`.
 
 ### Steps
@@ -219,7 +264,7 @@ Spice's own `${secrets:…}` and `${env:…}` pass through to `spiced`.
 | `stop: {}` | SIGTERM, then SIGKILL after 45 s; fails if the shutdown wasn't clean. |
 | `kill-spiced: {}` | SIGKILL; `{ signal: STOP-then-KILL }` freezes it first. |
 | `restart: {}` | Stop (or `{ kill: KILL }`) and start again; takes `start`'s options. |
-| `upgrade: {}` | Like `restart`, but starts the binary under test (see `--from`). |
+| `upgrade: {}` | Like `restart`, but starts the binary under test (see [Upgrades](#upgrades)). |
 | `wait-ready: { timeout }` | Wait for `/v1/ready`. |
 | `edit-spicepod: <patch>` | Rewrite the running instance's spicepod (for `--pods-watcher-enabled`). |
 | `start-source`, `stop-source`, `pause-source`, `unpause-source: <name>` | Control a source container; it keeps its host port across a stop. |
@@ -232,7 +277,7 @@ Spice's own `${secrets:…}` and `${env:…}` pass through to `spiced`.
 | `spice-exec: <sql>` | Run a statement through `/v1/sql` (accepts `BEGIN; …; COMMIT;`); `expect-error`. |
 | `flight-put: { dataset, rows \| from-source }` | Write rows with Flight `DoPut`; `times: n` repeats it. |
 | `flight-exec: <sql>` | Flight SQL `ExecuteUpdate`; `count: n` affected rows. |
-| `http: { path, method, headers, body, api-key }` | One request; `expect: { status, headers, lacks-headers, body-contains, body-matches, body-lacks }`. |
+| `http: { path, method, query, headers, body, api-key }` | One request; `query:` maps URL parameters, which are encoded and appended to `path`. `expect: { status, headers, lacks-headers, body-contains, body-matches, body-lacks, json }`; `json` checks the body as JSON (see [JSON responses](#json-responses)). |
 | `spice: [args…]` | Run the `spice` CLI against the instance; `output-contains`, `expect-error`. |
 | `refresh: <dataset>` | Trigger a refresh and wait for it to finish; `expect-error`; `wait: false` only triggers it. |
 | `explain: <sql>` | `EXPLAIN` (`analyze: true`), requiring `contains:` fragments or the absence of `omits:` ones. |
@@ -244,6 +289,7 @@ Spice's own `${secrets:…}` and `${env:…}` pass through to `spiced`.
 | `wait-metric: { name, labels, above \| below \| increases \| increased-by, since, timeout, drive }` | Wait for a series to meet a condition. `drive` writes new data each round while waiting, for conditions (such as a compaction) that need new data rather than time. |
 | `background: { id, query \| source-exec, concurrency, every, expect }` | Loop a query or a source write until `stop-background: <id>`. `expect: { column: value }` is an invariant every answer must keep. `${round}` counts iterations. |
 | `stop-background: { id, allow }` | Stop it; fails on any error not matching `allow`. Prints the iteration count, the P99 latency and the commonest allowed errors. |
+| `load: { queries \| corpus, clients, duration \| count, expect, faults, recover-within, … }` | Queries from many clients at once, every answer checked, with faults applied while they run (see [Load](#load)). |
 | `kill-executor: n`, `start-executors: {}`, `add-executor: {}` | Cluster: kill executor n, restart the stopped ones, or start a spare (`defaults.cluster.spare`). |
 | `corpus: <file.sql>` | One `query` per statement in the file (see Corpora). |
 | `slt-setup` / `slt: { file, source }` | Run a sqllogictest file: statements on the source, then its queries through Spice against the recorded answers. |
@@ -251,10 +297,15 @@ Spice's own `${secrets:…}` and `${env:…}` pass through to `spiced`.
 | `random-queries: { tables, joins, seed, queries, depth, oracle, protocols, avoid }` | Random nested-subquery queries checked against an oracle or across protocols. |
 | `sleep: 5s` | Wait; prefer `eventually`, `consistently` and `drive`. |
 
-Any step takes `only: <variant>` or `except: <variant>` (or a list), and
-`when: { <matrix key>: <value> }`. A failed lifecycle step (`start`, `stop`,
-`restart`, `upgrade`, `kill-spiced`, `wait-ready`) skips the rest of that
-instance; any other failure is a failed check and the script goes on.
+Any step takes `only: <variant>` or `except: <variant>` (or a list),
+`when: { <matrix key>: <value> }`, and `cluster: true` (only when the
+instance runs as a cluster: `--cluster`, `defaults.cluster` or
+`defaults.executor-args`) or `cluster: false` (only when it does not), so
+one script can run in both topologies. With a [sidecar](#sidecars),
+`on: sidecar | upstream` chooses which `spiced` the step reaches. A failed
+lifecycle step (`start`, `stop`, `restart`, `upgrade`, `kill-spiced`,
+`wait-ready`) skips the rest of that instance; any other failure is a failed
+check and the script goes on.
 
 `protocols` on `query`, `corpus`, and inside `random-queries` selects the
 transports to compare: `flight`, `flightsql`, and `http` (`/v1/sql`, JSON).
@@ -319,6 +370,190 @@ options independently on HTTP and Flight SQL because live plan metrics vary.
 
 ADBC is a client API; its Flight SQL driver uses the Flight SQL protocol.
 This scenario exercises Flight SQL directly, rather than an ADBC driver.
+
+### Upgrades
+
+```yaml
+name: orders-upgrade
+matrix:
+  from: [2.3.x, 2.4.x]               # one run per base release: name[from=2.4.x]
+from: '${matrix.from}'               # or one release: from: 2.4.x, from: 2.4.0
+steps:
+  - start: {}                        # on the base release
+  - query: SELECT * FROM orders
+  - upgrade: {}                      # on the binary under test, over the same data
+  - query: SELECT * FROM orders
+```
+
+`from:` names the release a script's instances start on, as `X.Y.Z` or `X.Y.x`,
+the newest published X.Y release on GitHub with a `spiced` build for this host.
+Before running, spicescript lists the releases once (with `GITHUB_TOKEN` or
+`GH_TOKEN` if set, for the API's rate limit) and caches the list for an hour in
+`~/.cache/spicescript/releases.json`, which records what each `X.Y.x` resolved
+to and when; if GitHub can't be reached, an older cached list is used with a
+warning. It then downloads each release the selected runs need
+(`spiced_<os>_<arch>.tar.gz` from the GitHub release) once into
+`~/.cache/spicescript/spiced-<version>/` and checks its `--version`. The output
+names the release behind each `from:`, and each run the release it starts on:
+
+```
+from 2.3.x: v2.3.3 (newest published), ~/.cache/spicescript/spiced-2.3.3/spiced
+from 2.4.x: v2.4.0 (newest published), ~/.cache/spicescript/spiced-2.4.0/spiced
+== orders-upgrade[from=2.3.x]: …
+   from   v2.3.3 (2.3.x)
+```
+
+Executors start on the release too, and `upgrade` moves the scheduler and
+executors to the binary under test. Because `X.Y.x` follows the releases, a
+new patch release changes what the same commit upgrades from.
+
+- Without `from:`, instances start on the binary under test and `upgrade` is a
+  restart. A `from:` on a script with no `upgrade` step is rejected.
+- `--from-release 2.3.x=2.3.2` starts the runs whose `from:` is `2.3.x` on
+  v2.3.2 instead; repeat it for several. With `--matrix from=2.3.x` it narrows
+  the run to that one base release.
+- `--from PATH` starts every instance on that binary instead, whatever the
+  script names.
+- OSS release builds have only the `release` and `models` features. A release
+  asked for another one (acceleration snapshots, for one) starts anyway and
+  logs that the feature is in the Enterprise distribution. spicescript fails
+  the start on that line, naming the release, rather than letting a later
+  check fail for a reason it can't see.
+
+### Sidecars
+
+```yaml
+spicepod:                            # the upstream: a server, or with --cluster a scheduler
+  datasets:
+    - { from: 'postgres:public.orders', name: orders, params: '${sources.src.params}' }
+sidecar:
+  spicepod:                          # the application's sidecar
+    datasets:
+      - from: spice.ai:orders
+        name: orders
+        params: { spiceai_endpoint: 'http://127.0.0.1:${instance.flight_port}' }
+  args: []                           # after --role sidecar
+  env: {}
+  api-key: ~                         # what the runner presents to the sidecar
+steps:
+  - start: {}                        # the upstream, then the sidecar
+  - query: SELECT count(*) AS n FROM orders               # through the sidecar
+  - query: SELECT count(*) AS n FROM orders
+    on: upstream                                          # straight to the upstream
+```
+
+`sidecar:` runs a second `spiced` beside every instance, with `--role sidecar`
+and its own spicepod, whose datasets read the instance (the *upstream*):
+`${instance.flight_port}` is the port the upstream serves Flight on (the
+scheduler's under `--cluster`), and every other placeholder resolves as in
+the upstream's spicepod. The sidecar always runs the binary under test, also
+before an `upgrade`, since a release may have no sidecar role. It keeps its
+directory, log (`<instance>/sidecar/spiced.log`) and ports across restarts,
+and counts as one more process toward `--jobs`.
+
+Steps reach the sidecar, as the application would, except the ones that
+start, stop or wait on processes (`start`, `stop`, `kill-spiced`, `restart`,
+`upgrade`, `wait-ready`, `kill-executor`, `start-executors`,
+`add-executor`, `edit-spicepod`), which reach the upstream and keep their
+meaning there:
+
+| Step | With a sidecar |
+| --- | --- |
+| `start` | Starts the upstream (and executors), then the sidecar, waiting for each as the step asks. |
+| `stop` | Stops the sidecar, then the upstream. |
+| `kill-spiced` | Kills the upstream; the sidecar keeps running, as an application's would. |
+| `restart`, `upgrade` | Restart the upstream under the running sidecar, then start the sidecar if a `stop` stopped it. |
+| `kill-executor`, `start-executors`, `add-executor` | Act on the upstream's executors. |
+
+`on: upstream` sends any other step to the upstream instead: a query there is
+an oracle for the same query through the sidecar (`id:` on one, `expect: {
+same-as }` on the other). `on: sidecar` makes `start`, `stop`, `kill-spiced`,
+`restart` and `wait-ready` act on the sidecar alone. A step that reaches no
+`spiced` (`source-exec`, `generate`, …) takes no `on:`.
+
+Authentication: the runner presents `defaults.api-key` to the upstream and
+`sidecar.api-key` (none by default) to the sidecar. A `spice.ai:` dataset
+presents the `spiceai_api_key` its spicepod gives it; an upstream without
+auth refuses a key with `Unauthorized`, so give the upstream and the
+dataset a key both or neither. The sidecar does not inherit
+`SPICEAI_API_KEY` from the runner's environment, which a dataset without a
+key would otherwise pick up, unless `sidecar.env` sets it. Nor does it read a
+`.env` or `.env.local` above its directory, such as the checkout's: its
+directory gets empty files of both names. An upstream with
+API keys refuses Flight queries after its 10,000th handshake
+([known-failing](../../test/spicescript/known-failing/flight-auth/flight-auth-handshake-limit.yaml)),
+so a script that loads a sidecar runs its upstream without them.
+
+### Load
+
+```yaml
+- load:
+    corpus: corpus/sidecar.sql       # or queries: [SQL, { sql, oracle-sql, expect, expect-empty }, …]
+    clients: 128                     # each on a Flight connection of its own (default 8)
+    duration: 30s                    # or count: 100000, across all clients
+    expect: { oracle: src }          # each query's, unless it names its own; default defaults.expect
+    query-timeout: 30s               # a query slower than this is an error (default defaults.query-timeout)
+    min-qps: 100                     # optional bounds, off by default: CI hosts vary
+    max-p99: 250ms
+    max-p999: 1s
+- load:
+    corpus: corpus/sidecar.sql
+    clients: 32
+    duration: 75s
+    recover-within: 30s              # errors allowed until this long after each fault ends
+    faults:                          # steps run while the load goes on, at their offsets
+      - { at: 10s, kill-executor: 0, cluster: true }
+      - { at: 15s, start-executors: {}, cluster: true }
+      - { at: 10s, restart: { kill: KILL }, cluster: false }
+```
+
+A `load` runs its queries from `clients` concurrent clients, each taking the
+load's next query in turn, until `duration` has passed or `count` queries
+have started. It reaches the sidecar when the script has one, else the
+instance (`on:` chooses).
+
+- **Every answer is checked.** Each query's expected answer is asked of the
+  oracle once, before the load starts (so the queries must read data that
+  does not change during it), typed with the schema of the first answer,
+  and compared with every answer exactly as a `query` step compares one.
+  A query needs an expectation (`oracle`, `rows` or `same-as`); a corpus
+  takes `-- expect-empty` and `-- oracle-sql:` and nothing else. A wrong
+  answer fails the step, faults or not, naming the query, its SQL and the
+  first mismatch.
+- **Errors.** Without faults, any error fails the step. With faults, an
+  error is allowed only for a query in flight between a fault's start and
+  `recover-within` after its end; the step also fails unless some query
+  that started after the last such window answered right, so a load that
+  ends before recovery shows nothing. A client waits 100 ms after an error
+  before its next query, as a retrying application would, and keeps its
+  connection, which reconnects by itself.
+- **Faults** are steps (`start`, `stop`, `kill-spiced`, `restart`,
+  `upgrade`, `wait-ready`, `kill-executor`, `start-executors`,
+  `add-executor`) with an `at:` offset, run in order of `at` (or once the
+  one before finishes), on the instance as the steps around the load see it;
+  each takes `on:`, `cluster:`, `when:`, `only:` and `except:`. Faults need a
+  `duration` and `recover-within`. A fault that fails stops the load and
+  fails the step.
+- **Output.** The step reports its queries, right answers per second, and
+  the P99 and P99.9 latency of the right answers with their count; a
+  percentile needs ten answers beyond it (1,000 for P99, 10,000 for P99.9)
+  and reads `n/a` without them. With faults it adds each fault's time and
+  window, and the right answers and errors of the queries started before,
+  during and after the windows. The three commonest errors follow, numbers
+  masked:
+
+```text
+   ok   default               26 load: corpus/sidecar.sql from 32 clients, for 75s, 3 faults (75.0s) 32 clients over 75.0s: 194458 queries, 2548.2 right answers/s, p99 25.7ms, p99.9 48.0ms (of 191130 right answers), 0 wrong, 3328 errors (3328 within fault windows)
+        fault kill-executor 0 at +10.0s took 0.0s; errors allowed until +40.0s
+        fault start-executors at +15.0s took 6.2s; errors allowed until +51.2s
+        before faults +0.0s..+10.0s: 36521 right answers (3651.6/s), 25 errors
+        fault windows +10.0s..+51.2s: 77332 right answers (1877.2/s), 3303 errors
+        after faults +51.2s..+75.0s: 77277 right answers (3245.6/s), 0 errors
+        2129× Tonic error: code: 'Internal error', message: "Query execution failed. Cannot query orders: no ready executor serves # of its # partitions; retry the query": co…
+```
+
+- **Bounds** (`min-qps`, `max-p99`, `max-p999`) fail the step when missed;
+  one whose percentile has too few answers fails rather than passes.
 
 ### Source-neutral writes
 
@@ -427,6 +662,45 @@ After the run, every instance's final answer to each query is compared with the
 first instance's, so variants and binaries must agree even where a query names
 no oracle.
 
+### JSON responses
+
+`json:` under an `http` step's `expect` holds assertions on the response body
+parsed as JSON, for any endpoint that answers JSON (`/v1/sql`, `/v1/datasets`,
+`/v1/status`). Each names the values it checks with a JSON Pointer
+([RFC 6901](https://www.rfc-editor.org/rfc/rfc6901)), where a `*` segment stands
+for every element of an array or every member of an object:
+
+```yaml
+- http:
+    path: /v1/sql
+    headers: { content-type: text/plain }
+    body: SELECT task, span_id, labels FROM runtime.task_history
+  expect:
+    status: 200
+    json:
+      - { pointer: '', type: array, length: '>=1' }      # the whole body
+      - { pointer: /*/task, equals: sql_query }          # every row
+      - { pointer: /*/span_id, matches: '^[0-9a-f]{16}$' }
+      - { pointer: /*/labels/protocol, equals: http, count: '>=1' }
+      - { pointer: /0/missing, exists: false }
+```
+
+| Key | The values must |
+| --- | --- |
+| `equals` | equal this JSON value; numbers compare by value, so `7` equals `7.0` |
+| `matches` | match this regular expression (a non-string is matched as its JSON text) |
+| `type` | be `null`, `boolean`, `number`, `integer`, `string`, `array` or `object` |
+| `length` | have this many elements, members or characters: `3`, `'>=3'` or `'<=3'` |
+| `above`, `below` | be numbers strictly above or below this bound |
+| `exists: false` | not exist: the pointer reaches nothing |
+
+An assertion's keys all apply to each value. Without `count`, every value the
+pointer reaches must satisfy them, and it must reach at least one, so a pointer
+that matches nothing fails instead of passing vacuously. `count: N`, `'>=N'` or
+`'<=N'` instead requires that many of the reached values to satisfy them:
+`count: '>=1'` is "some row", `count: 0` is "no row". Like the other
+expectations, `json` retries under `eventually` and `consistently`.
+
 ### Corpora
 
 A `corpus: <file.sql>` step runs each statement in the file (relative to the
@@ -532,11 +806,13 @@ fails anywhere.
 | `main.rs` | Command line, `--jobs` scheduling, progress and summaries. |
 | `script.rs` | The script format: parsing, validation, durations. |
 | `runner/mod.rs` | Running a script: instances, variants, the comparison of their answers. |
-| `runner/steps.rs` | The dispatcher for every step, and how steps appear in reports. |
+| `runner/steps.rs` | The dispatcher for every step, which `spiced` (sidecar or upstream) it reaches, and how steps appear in reports. |
 | `runner/query.rs` | `query` and `explain`: answers, the SQL sent to sources, HTTP agreement. |
 | `runner/checks.rs` | Status, log, file and metric assertions. |
 | `runner/background.rs` | Background loops and their invariants. |
+| `runner/load.rs` | Load steps: concurrent clients, every answer checked, faults and their windows, throughput and latency. |
 | `runner/api.rs` | Refreshes, the `spice` CLI, HTTP steps, source queries. |
+| `json_assert.rs` | JSON Pointer predicates for the `http` step's `expect: { json }`. |
 | `runner/generators.rs` | TLP, random queries, sqllogictest. |
 | `runner/cluster.rs` | Scheduler and executors: arguments, readiness, spicepod changes. |
 | `spiced.rs` | One `spiced` process, or container: start, readiness, stop, Flight and HTTP clients. |
@@ -544,6 +820,7 @@ fails anywhere.
 | `source/document.rs` | Kafka, MongoDB and DynamoDB containers and batched row application. |
 | `source/` | One module per source kind; `mod.rs` holds the `Source` trait. |
 | `docker.rs` | Containers on fixed host ports, so a restarted container keeps its address. |
+| `keyquota.rs` | The kernel key quota a rootless Docker daemon's containers share: waiting for room before starting them. |
 | `ledger.rs` | Expected failures: recording, signatures, judging a run against them. |
 | `compare.rs`, `template.rs` | Answer comparison glue, placeholders and merge patches. |
 | `generate.rs`, `tpch.rs` | Seeded generated tables, TPC-H loading. |

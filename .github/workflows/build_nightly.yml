@@ -30,6 +30,7 @@ env:
 
 jobs:
   check_commits:
+    environment: secret-free
     runs-on: ubuntu-24.04
     outputs:
       has_new_commits: ${{ steps.check_commits.outputs.has_new_commits }}
@@ -60,6 +61,7 @@ jobs:
         shell: bash
 
   setup:
+    environment: secret-free
     needs: check_commits
     if: needs.check_commits.outputs.has_new_commits == 'true'
 
@@ -91,6 +93,7 @@ jobs:
   # ==================== BINARY BUILD JOBS ====================
 
   build-linux-x64:
+    environment: secret-free
     name: Build - Linux x64
     needs: [check_commits, setup]
     if: needs.check_commits.outputs.has_new_commits == 'true'
@@ -160,6 +163,7 @@ jobs:
           path: spice_linux_x86_64.tar.gz
 
   build-linux-arm64:
+    environment: secret-free
     name: Build - Linux aarch64
     needs: [check_commits, setup]
     if: needs.check_commits.outputs.has_new_commits == 'true'
@@ -231,6 +235,7 @@ jobs:
           path: spice_linux_aarch64.tar.gz
 
   build-macos-arm64:
+    environment: secret-free
     name: Build - macOS aarch64
     needs: [check_commits, setup]
     if: needs.check_commits.outputs.has_new_commits == 'true'
@@ -270,7 +275,7 @@ jobs:
           # first — and any brew-level breakage (an unreadable global lock, a half-written
           # `brew`) then fails the build over a toolchain it already had (#13463).
           # `setup-cc` probes the same way for every other macOS job; this step and its
-          # twin in build_and_release.yml are the two that still call brew directly.
+          # twin in build_release.yml are the two that still call brew directly.
           brew_bin="$(command -v brew || true)"
           if [ -z "$brew_bin" ]; then
             echo "::error::'brew' is not on PATH, so cmake and unixodbc cannot be installed or verified on this runner."
@@ -397,6 +402,10 @@ jobs:
     if: needs.check_commits.outputs.has_new_commits == 'true'
 
     runs-on: hosted-linux-arm-runner
+    environment: ci
+    permissions:
+      contents: read
+      id-token: write
 
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -440,10 +449,12 @@ jobs:
         # Authenticate to Docker Hub before building so the ubuntu base image
         # pull uses authenticated rate limits instead of anonymous (per-IP) limits.
         if: github.repository == 'spiceai/spiceai'
-        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
+        uses: docker/login-action@8aa5831fb8d48d8f76594c7ddde61ae58019f550 # v4.8.0
+        env:
+          DOCKERHUB_OIDC_CONNECTIONID: ${{ vars.DOCKERHUB_OIDC_CONNECTIONID }}
+          DOCKERHUB_OIDC_EXPIREIN: '21600'
         with:
-          username: ${{ secrets.DOCKERHUB_USERNAME }}
-          password: ${{ secrets.DOCKERHUB_TOKEN }}
+          username: ${{ vars.DOCKERHUB_ORGANIZATION }}
 
       - name: Build ARM64 Docker image
         uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
@@ -467,6 +478,10 @@ jobs:
     if: needs.check_commits.outputs.has_new_commits == 'true'
 
     runs-on: ubuntu-24.04
+    environment: ci
+    permissions:
+      contents: read
+      id-token: write
 
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -491,10 +506,12 @@ jobs:
         # Authenticate to Docker Hub before building so the ubuntu base image
         # pull uses authenticated rate limits instead of anonymous (per-IP) limits.
         if: github.repository == 'spiceai/spiceai'
-        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
+        uses: docker/login-action@8aa5831fb8d48d8f76594c7ddde61ae58019f550 # v4.8.0
+        env:
+          DOCKERHUB_OIDC_CONNECTIONID: ${{ vars.DOCKERHUB_OIDC_CONNECTIONID }}
+          DOCKERHUB_OIDC_EXPIREIN: '21600'
         with:
-          username: ${{ secrets.DOCKERHUB_USERNAME }}
-          password: ${{ secrets.DOCKERHUB_TOKEN }}
+          username: ${{ vars.DOCKERHUB_ORGANIZATION }}
 
       - name: Build AMD64 Docker image
         uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
@@ -518,6 +535,11 @@ jobs:
     if: needs.check_commits.outputs.has_new_commits == 'true' && (github.event_name == 'schedule' || inputs.publish)
 
     runs-on: ubuntu-24.04
+    environment: ci
+    permissions:
+      contents: write
+      packages: write
+      id-token: write
 
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -545,10 +567,12 @@ jobs:
         # rate limits instead of anonymous (per-IP) limits when pulling
         # registry:2 below.
         if: github.repository == 'spiceai/spiceai'
-        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
+        uses: docker/login-action@8aa5831fb8d48d8f76594c7ddde61ae58019f550 # v4.8.0
+        env:
+          DOCKERHUB_OIDC_CONNECTIONID: ${{ vars.DOCKERHUB_OIDC_CONNECTIONID }}
+          DOCKERHUB_OIDC_EXPIREIN: '21600'
         with:
-          username: ${{ secrets.DOCKERHUB_USERNAME }}
-          password: ${{ secrets.DOCKERHUB_TOKEN }}
+          username: ${{ vars.DOCKERHUB_ORGANIZATION }}
 
       - name: Start local registry
         run: |
@@ -556,7 +580,7 @@ jobs:
 
       - name: Login to GitHub Package Registry
         if: github.event_name == 'schedule' || inputs.publish
-        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
+        uses: docker/login-action@8aa5831fb8d48d8f76594c7ddde61ae58019f550 # v4.8.0
         with:
           registry: ghcr.io
           username: ${{ github.repository_owner }}

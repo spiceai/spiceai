@@ -3,15 +3,14 @@ description: >
   Random queries (as in random-queries.yaml) over PostgreSQL CDC accelerations
   after rounds of randomized changes at the source (updates to values and to
   NULL, deletes, inserts and key changes, in single statements and in one
-  transaction) answer as PostgreSQL answers over the same rows, on Cayenne
-  and DuckDB.
+  transaction) answer as PostgreSQL answers over the same rows, on Cayenne, in file and memory mode.
 
 sources:
   src: { kind: postgres }
 
 variants:
   cayenne: {}
-  duckdb: { datasets: { '*': { acceleration: { engine: duckdb, mode: memory, on_conflict: { id: upsert } } } } }
+  cayenne-memory: { datasets: { '*': { acceleration: { mode: memory } } } }
 
 spicepod:
   version: v1
@@ -73,7 +72,7 @@ steps:
   - query: SELECT count(*) AS n, sum(t_id) AS st, count(DISTINCT label) AS nl FROM u
     eventually: 60s
     expect: { oracle: src }
-  - random-queries: { tables: [t, u], joins: ['t.id = u.t_id'], seed: 11, queries: 200, depth: 2, oracle: src, avoid: [not, decimal-int, unread-groups, nested-union, join-key-dependency, set-operation-nulls, case-widening, unsigned-rank] }
+  - random-queries: { tables: [t, u], joins: ['t.id = u.t_id'], seed: 11, queries: 200, depth: 2, oracle: src, avoid: [decimal-int] }
 
   # Round 1: single statements.
   - source-exec:
@@ -91,7 +90,7 @@ steps:
   - query: SELECT count(*) AS n, sum(t_id) AS st, count(DISTINCT label) AS nl FROM u
     eventually: 60s
     expect: { oracle: src }
-  - random-queries: { tables: [t, u], joins: ['t.id = u.t_id'], seed: 12, queries: 200, depth: 2, oracle: src, avoid: [not, decimal-int, unread-groups, nested-union, join-key-dependency, set-operation-nulls, case-widening, unsigned-rank] }
+  - random-queries: { tables: [t, u], joins: ['t.id = u.t_id'], seed: 12, queries: 200, depth: 2, oracle: src, avoid: [decimal-int] }
 
   # Round 2: key changes and a transaction mixing every kind of change.
   - source-exec:
@@ -112,4 +111,4 @@ steps:
   - query: SELECT count(*) AS n, sum(t_id) AS st, count(DISTINCT label) AS nl FROM u
     eventually: 60s
     expect: { oracle: src }
-  - random-queries: { tables: [t, u], joins: ['t.id = u.t_id'], seed: 13, queries: 200, depth: 2, oracle: src, avoid: [not, decimal-int, unread-groups, nested-union, join-key-dependency, set-operation-nulls, case-widening, unsigned-rank] }
+  - random-queries: { tables: [t, u], joins: ['t.id = u.t_id'], seed: 13, queries: 200, depth: 2, oracle: src, avoid: [decimal-int] }

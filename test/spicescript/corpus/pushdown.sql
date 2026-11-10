@@ -48,3 +48,6 @@ SELECT id FROM t WHERE id IN (SELECT t_id FROM u WHERE label = 'red');
 SELECT id FROM t WHERE EXISTS (SELECT 1 FROM u WHERE u.t_id = t.id AND u.label = 'blue');
 SELECT id FROM t WHERE i > (SELECT avg(i) FROM t);
 SELECT x.k, x.n FROM (SELECT i % 3 AS k, count(*) AS n FROM t GROUP BY i % 3) AS x WHERE x.n > 1;
+
+-- Duplicate names preserve the nullability of each outer-join side.
+SELECT t.id, u.id FROM t LEFT JOIN u ON t.id = u.t_id WHERE t.id < 30;

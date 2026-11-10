@@ -33,7 +33,7 @@ use runtime_checkpoint_api::{
     BlobCheckpointStore, CheckpointError, debezium::DebeziumCheckpointStore,
     kafka::KafkaCheckpointStore, mongodb::MongoCheckpointStore, mysql_binlog::MySqlBinlogStore,
 };
-use runtime_component::dataset::DatasetSpec;
+use runtime_component::{Role, dataset::DatasetSpec};
 use token_provider::registry::TokenProviderRegistry;
 use tokio::{runtime::Handle, sync::RwLock};
 
@@ -103,6 +103,10 @@ impl RuntimeConnectorContext {
 impl ConnectorContext for RuntimeConnectorContext {
     fn app(&self) -> Arc<App> {
         Arc::clone(&self.app)
+    }
+
+    fn role(&self) -> Role {
+        self.runtime.role()
     }
 
     fn http_rate_control_registry(&self) -> Arc<HttpRateControlRegistry> {

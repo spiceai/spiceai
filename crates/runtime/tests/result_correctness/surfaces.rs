@@ -37,7 +37,7 @@ use runtime::{Runtime, auth::EndpointAuth, config::Config};
 use tonic::transport::Channel;
 
 use super::{
-    compare, duckdb_accel, make_dim, make_fact, micro_queries, sqlite_accel, write_parquet,
+    compare, make_dim, make_fact, micro_queries, sqlite_accel, standalone_duckdb, write_parquet,
 };
 use crate::configure_test_datafusion;
 use crate::utils::{
@@ -49,21 +49,38 @@ const LOCALHOST: IpAddr = IpAddr::V4(Ipv4Addr::LOCALHOST);
 const FACT_ROWS: usize = 2_048;
 const DIM_ROWS: usize = 256;
 
-/// A Spicepod accelerating `t` and `d` from parquet files in `dir` with `engine`.
-fn spicepod(engine: &str, dir: &std::path::Path) -> String {
+/// Where an acceleration keeps its rows.
+#[derive(Clone, Copy)]
+enum Storage {
+    Memory,
+    File,
+}
+
+impl Storage {
+    fn label(self) -> &'static str {
+        match self {
+            Storage::Memory => "memory",
+            Storage::File => "file",
+        }
+    }
+}
+
+/// A Spicepod accelerating `t` and `d` from parquet files in `dir` with `engine`, keeping
+/// the rows in `storage`.
+fn spicepod(engine: &str, storage: Storage, dir: &std::path::Path) -> String {
     let mut datasets = String::new();
     for name in ["t", "d"] {
-        // Cayenne runs in `mode: file`, as the runtime's other Cayenne refresh tests do, and
-        // one process keeps one Cayenne metastore, so both datasets share its directory.
-        // Every other engine runs in memory.
-        let storage = if engine == "cayenne" {
-            format!(
+        // A file-mode Cayenne acceleration keeps its data and metastore under `dir`, and one
+        // process keeps one file-mode Cayenne metastore, so both datasets share its
+        // directory. A memory-mode Cayenne acceleration keeps both in RAM.
+        let storage = match (engine, storage) {
+            ("cayenne", Storage::File) => format!(
                 "      mode: file\n      params:\n        cayenne_file_path: {data}\n        cayenne_metadata_dir: {meta}\n",
                 data = dir.join(format!("cayenne_{name}_data")).display(),
                 meta = dir.join("cayenne_metadata").display(),
-            )
-        } else {
-            "      mode: memory\n".to_string()
+            ),
+            (_, Storage::File) => panic!("only Cayenne runs these surfaces in `mode: file`"),
+            (_, Storage::Memory) => "      mode: memory\n".to_string(),
         };
         write!(
             datasets,
@@ -72,7 +89,10 @@ fn spicepod(engine: &str, dir: &std::path::Path) -> String {
         )
         .expect("writing to a String cannot fail");
     }
-    format!("version: v1\nkind: Spicepod\nname: surfaces_{engine}\ndatasets:\n{datasets}")
+    format!(
+        "version: v1\nkind: Spicepod\nname: surfaces_{engine}_{mode}\ndatasets:\n{datasets}",
+        mode = storage.label()
+    )
 }
 
 /// Decodes `/v1/sql`'s `application/vnd.spiceai.sql.v1+json` answer with the Arrow schema
@@ -144,9 +164,11 @@ fn row_count(batches: &[RecordBatch]) -> usize {
     batches.iter().map(RecordBatch::num_rows).sum()
 }
 
-/// Loads `engine` from a Spicepod, deletes the source files, starts the HTTP and Flight
-/// servers, and compares every micro query on every client with both standalone oracles.
-async fn surfaces_match_standalone_oracles(engine: &str) {
+/// Loads `engine` in `storage` from a Spicepod, deletes the source files, starts the HTTP
+/// and Flight servers, and compares every micro query on every client with both standalone
+/// oracles.
+async fn surfaces_match_standalone_oracles(engine: &str, storage: Storage) {
+    let subject = format!("{engine}[{}]", storage.label());
     let tables = [("t", make_fact(FACT_ROWS, 64)), ("d", make_dim(DIM_ROWS))];
     let dir = tempfile::tempdir().expect("temp dir");
     for (name, batch) in &tables {
@@ -154,12 +176,12 @@ async fn surfaces_match_standalone_oracles(engine: &str) {
     }
     std::fs::write(
         dir.path().join("spicepod.yaml"),
-        spicepod(engine, dir.path()),
+        spicepod(engine, storage, dir.path()),
     )
     .expect("the spicepod must be written");
 
     let (_sqlite_dir, sqlite) = sqlite_accel::load_standalone_sqlite(&tables);
-    let (_duckdb_dir, duckdb) = duckdb_accel::load_standalone_duckdb(&tables);
+    let (_duckdb_dir, duckdb) = standalone_duckdb::load_standalone_duckdb(&tables);
 
     register_test_connectors().await;
     configure_test_datafusion();
@@ -207,12 +229,16 @@ async fn surfaces_match_standalone_oracles(engine: &str) {
         .await
         .expect("the Flight server accepted a connection");
 
+    if engine == "cayenne" {
+        assert_cayenne_storage(&rt, storage).await;
+    }
+
     let mut fails = Vec::new();
     for q in micro_queries() {
         let oracles = [
             (
                 "standalone-duckdb",
-                duckdb_accel::standalone_query(&duckdb, &q.sql)
+                standalone_duckdb::standalone_query(&duckdb, &q.sql)
                     .unwrap_or_else(|e| panic!("duckdb sql {}: {e}", q.name)),
             ),
             (
@@ -242,20 +268,20 @@ async fn surfaces_match_standalone_oracles(engine: &str) {
             let spice = match spice {
                 Ok(batches) if row_count(batches) > 0 => batches,
                 Ok(_) => {
-                    fails.push(format!("{engine}/{surface}/{}: empty answer", q.name));
+                    fails.push(format!("{subject}/{surface}/{}: empty answer", q.name));
                     continue;
                 }
                 Err(e) => {
-                    fails.push(format!("{engine}/{surface}/{}: query failed: {e}", q.name));
+                    fails.push(format!("{subject}/{surface}/{}: query failed: {e}", q.name));
                     continue;
                 }
             };
             for (oracle, expected) in &oracles {
                 let status = compare(&q, spice, expected);
-                eprintln!("{engine}/{surface} vs {oracle} / {} -> {status}", q.name);
+                eprintln!("{subject}/{surface} vs {oracle} / {} -> {status}", q.name);
                 if !status.starts_with("PASS") {
                     fails.push(format!(
-                        "{engine}/{surface} vs {oracle}/{}: {status}",
+                        "{subject}/{surface} vs {oracle}/{}: {status}",
                         q.name
                     ));
                 }
@@ -264,39 +290,59 @@ async fn surfaces_match_standalone_oracles(engine: &str) {
     }
     assert!(
         fails.is_empty(),
-        "Spice {engine} acceleration vs standalone oracles failures: {fails:#?}"
+        "Spice {subject} acceleration vs standalone oracles failures: {fails:#?}"
     );
 }
 
-async fn run(engine: &'static str) {
+/// Fails unless a scan of `t` reads Cayenne in `storage`: a memory-mode acceleration scans
+/// its in-RAM tier and no file, while a file-mode one scans the Vortex files it wrote.
+async fn assert_cayenne_storage(rt: &Arc<Runtime>, storage: Storage) {
+    let plan = run_query(
+        rt,
+        "EXPLAIN SELECT SUM(value) FROM t WHERE id BETWEEN 10 AND 50",
+    )
+    .await
+    .expect("EXPLAIN must succeed");
+    let plan = arrow::util::pretty::pretty_format_batches(&plan)
+        .expect("the plan must format")
+        .to_string();
+    let (scan, files) = match storage {
+        Storage::Memory => (
+            "CayenneAccelerationExec: snapshots_scanned=0, files_scanned=0",
+            false,
+        ),
+        Storage::File => ("CayenneAccelerationExec", true),
+    };
+    assert!(
+        plan.contains(scan) && plan.contains("file_type=vortex") == files,
+        "a `mode: {}` Cayenne scan must contain `{scan}` and {} Vortex files:\n{plan}",
+        storage.label(),
+        if files { "read" } else { "read no" },
+    );
+}
+
+async fn run(engine: &'static str, storage: Storage) {
     test_request_context()
-        .scope(surfaces_match_standalone_oracles(engine))
+        .scope(surfaces_match_standalone_oracles(engine, storage))
         .await;
 }
 
 #[tokio::test(flavor = "multi_thread")]
 async fn arrow_surfaces_vs_standalone_engines() {
-    run("arrow").await;
-}
-
-#[tokio::test(flavor = "multi_thread")]
-async fn duckdb_surfaces_vs_standalone_engines() {
-    run("duckdb").await;
+    run("arrow", Storage::Memory).await;
 }
 
 #[tokio::test(flavor = "multi_thread")]
 async fn sqlite_surfaces_vs_standalone_engines() {
-    run("sqlite").await;
+    run("sqlite", Storage::Memory).await;
 }
 
-#[cfg(feature = "turso")]
-#[tokio::test(flavor = "multi_thread")]
-async fn turso_surfaces_vs_standalone_engines() {
-    run("turso").await;
-}
-
-#[cfg(not(windows))]
 #[tokio::test(flavor = "multi_thread")]
 async fn cayenne_surfaces_vs_standalone_engines() {
-    run("cayenne").await;
+    run("cayenne", Storage::File).await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn cayenne_memory_surfaces_vs_standalone_engines() {
+    run("cayenne", Storage::Memory).await;
 }

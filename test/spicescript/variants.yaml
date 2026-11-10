@@ -18,13 +18,6 @@ cayenne-file:
 cayenne-memory:
   datasets: { '*': { acceleration: { enabled: true, engine: cayenne, mode: memory } } }
 
-duckdb:
-  datasets: { '*': { acceleration: { enabled: true, engine: duckdb } } }
-duckdb-file:
-  datasets: { '*': { acceleration: { enabled: true, engine: duckdb, mode: file } } }
-duckdb-memory:
-  datasets: { '*': { acceleration: { enabled: true, engine: duckdb, mode: memory } } }
-
 sqlite:
   datasets: { '*': { acceleration: { enabled: true, engine: sqlite } } }
 sqlite-file:
@@ -32,7 +25,3 @@ sqlite-file:
 sqlite-memory:
   datasets: { '*': { acceleration: { enabled: true, engine: sqlite, mode: memory } } }
 
-turso-file:
-  datasets: { '*': { acceleration: { enabled: true, engine: turso, mode: file } } }
-turso-memory:
-  datasets: { '*': { acceleration: { enabled: true, engine: turso, mode: memory } } }

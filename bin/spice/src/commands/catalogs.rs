@@ -17,7 +17,7 @@ limitations under the License.
 //! Catalogs command implementation - lists catalogs configured by the runtime.
 
 use crate::context::RuntimeContext;
-use crate::error::{self, InvalidResponseSnafu, Result, RuntimeUnavailableSnafu};
+use crate::error::{self, InvalidResponseSnafu, Result};
 use crate::output::{OutputFormat, TableRow, write_json, write_table};
 use clap::Args;
 use runtime_api_types::v1::CatalogInfo;
@@ -52,12 +52,10 @@ impl TableRow for CatalogInfo {
 
 /// Execute the catalogs command.
 pub async fn execute(ctx: &RuntimeContext, args: &CatalogsArgs) -> Result<()> {
-    let response = ctx.get("/v1/catalogs").await.map_err(|_| {
-        RuntimeUnavailableSnafu {
-            endpoint: ctx.http_endpoint().to_string(),
-        }
-        .build()
-    })?;
+    let response = ctx
+        .get("/v1/catalogs")
+        .await
+        .map_err(|e| error::runtime_unreachable(ctx.http_endpoint(), &e))?;
 
     let response = error::check_response(response, ctx.http_endpoint()).await?;
 

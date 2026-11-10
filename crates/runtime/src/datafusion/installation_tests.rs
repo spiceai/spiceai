@@ -306,7 +306,6 @@ async fn change_sink_installation_publishes_a_live_owner() {
     installation(Outcome::Complete).await;
 }
 
-#[cfg(not(windows))]
 #[tokio::test]
 async fn change_sink_initialization_refusal_keeps_installed_generation_live() {
     use crate::component::dataset::acceleration::Mode;
@@ -414,7 +413,6 @@ async fn change_sink_initialization_refusal_keeps_installed_generation_live() {
     .expect("initialization validation must finish");
 }
 
-#[cfg(not(windows))]
 struct InitializationCase {
     engine: crate::component::dataset::acceleration::Engine,
     accelerator: Arc<dyn data_accelerator_api::DataAccelerator>,
@@ -422,8 +420,7 @@ struct InitializationCase {
     expected_error: &'static str,
 }
 
-#[cfg(not(windows))]
-fn invalid_initializations(storage: &std::path::Path) -> [InitializationCase; 4] {
+fn invalid_initializations(storage: &std::path::Path) -> [InitializationCase; 2] {
     use crate::component::dataset::acceleration::Engine;
 
     let invalid_file = storage
@@ -447,21 +444,9 @@ fn invalid_initializations(storage: &std::path::Path) -> [InitializationCase; 4]
             expected_error: "contains the Cayenne metastore directory",
         },
         InitializationCase {
-            engine: Engine::DuckDB,
-            accelerator: Arc::new(accelerator_duckdb::DuckDBAccelerator::new()),
-            params: vec![("duckdb_file", invalid_file.clone())],
-            expected_error: "extension",
-        },
-        InitializationCase {
             engine: Engine::Sqlite,
             accelerator: Arc::new(accelerator_sqlite::SqliteAccelerator::new()),
-            params: vec![("sqlite_file", invalid_file.clone())],
-            expected_error: "extension",
-        },
-        InitializationCase {
-            engine: Engine::Turso,
-            accelerator: Arc::new(accelerator_turso::TursoAccelerator::new()),
-            params: vec![("turso_file", invalid_file)],
+            params: vec![("sqlite_file", invalid_file)],
             expected_error: "extension",
         },
     ]
@@ -469,7 +454,6 @@ fn invalid_initializations(storage: &std::path::Path) -> [InitializationCase; 4]
 
 /// A Cayenne build that rejects its settings releases the dataset's generation: a
 /// retry reports the same cause, and a corrected configuration loads without a restart.
-#[cfg(not(windows))]
 #[tokio::test]
 async fn rejected_build_releases_the_generation() {
     use crate::component::dataset::acceleration::{Engine, Mode};

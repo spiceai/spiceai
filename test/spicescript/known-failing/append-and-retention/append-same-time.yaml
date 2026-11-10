@@ -4,14 +4,15 @@ description: >
   than the stored maximum time, so a row committed after a refresh with the
   same time value as the newest loaded row is never loaded — for epoch
   seconds and for timestamps alike (two rows in one second are ordinary).
-  With `refresh_append_overlap` the same row loads once; dates already get
-  this treatment by default (an inclusive bound and a dedupe against loaded
-  rows), other time columns do not.
+  With `refresh_append_overlap` the same row loads once; dates and ISO 8601
+  text already get this treatment by default (an inclusive bound and a dedupe
+  against loaded rows), other time columns do not.
 sources:
   src: { kind: postgres }
 variants:
   secs: {}
   tz: { datasets: { events: { time_column: ts, time_format: timestamptz } } }
+  iso: { datasets: { events: { time_column: iso, time_format: iso8601 } } }
 spicepod:
   version: v1
   kind: Spicepod
@@ -25,13 +26,15 @@ spicepod:
       acceleration: { enabled: true, engine: cayenne, mode: file, refresh_mode: append }
 defaults:
   expect: { oracle: src }
+  # The variants pass and fail differently by design, so agreement between them proves nothing.
+  compare-variants: false
 steps:
   - source-exec:
       src: |
-        CREATE TABLE events (id int NOT NULL, ts timestamptz NOT NULL, secs bigint NOT NULL);
-        INSERT INTO events VALUES (1, '2031-05-01 10:00:00Z', 1935396000), (2, '2031-05-01 10:00:05Z', 1935396005);
+        CREATE TABLE events (id int NOT NULL, ts timestamptz NOT NULL, secs bigint NOT NULL, iso text NOT NULL);
+        INSERT INTO events VALUES (1, '2031-05-01 10:00:00Z', 1935396000, '2031-05-01T10:00:00Z'), (2, '2031-05-01 10:00:05Z', 1935396005, '2031-05-01T10:00:05Z');
   - start: {}
   - query: SELECT * FROM events
-  - source-exec: { src: "INSERT INTO events VALUES (3, '2031-05-01 10:00:05Z', 1935396005), (4, '2031-05-01 10:00:06Z', 1935396006)" }
+  - source-exec: { src: "INSERT INTO events VALUES (3, '2031-05-01 10:00:05Z', 1935396005, '2031-05-01T10:00:05Z'), (4, '2031-05-01 10:00:06Z', 1935396006, '2031-05-01T10:00:06Z')" }
   - refresh: events
   - query: SELECT * FROM events

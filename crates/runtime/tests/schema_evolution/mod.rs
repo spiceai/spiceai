@@ -43,9 +43,9 @@ use crate::{
 };
 
 #[cfg(feature = "postgres")]
-const DUCKDB_FILE_PATH: &str = "./schema_evolution.duckdb";
+const CAYENNE_DIR: &str = "./schema_evolution_cayenne";
 #[cfg(feature = "postgres")]
-const DUCKDB_FILE_UPDATE_PATH: &str = "./schema_evolution_file_update.duckdb";
+const CAYENNE_FILE_UPDATE_DIR: &str = "./schema_evolution_file_update_cayenne";
 
 #[cfg(feature = "postgres")]
 use spicepod::component::dataset::OnSchemaChange;
@@ -56,8 +56,9 @@ async fn test_schema_evolution() -> Result<(), anyhow::Error> {
     let _tracing = init_tracing(Some("integration=debug,info"));
     register_test_connectors().await;
 
-    if std::fs::metadata(DUCKDB_FILE_PATH).is_ok() {
-        std::fs::remove_file(DUCKDB_FILE_PATH).expect("should remove local database");
+    if std::fs::metadata(CAYENNE_DIR).is_ok() {
+        std::fs::remove_dir_all(CAYENNE_DIR)
+            .expect("should remove the Cayenne acceleration directory");
     }
 
     test_request_context()
@@ -136,8 +137,9 @@ async fn test_schema_evolution() -> Result<(), anyhow::Error> {
 
             running_container.cleanup().await;
 
-            if std::fs::metadata(DUCKDB_FILE_PATH).is_ok() {
-                std::fs::remove_file(DUCKDB_FILE_PATH).expect("should remove local database");
+            if std::fs::metadata(CAYENNE_DIR).is_ok() {
+                std::fs::remove_dir_all(CAYENNE_DIR)
+                    .expect("should remove the Cayenne acceleration directory");
             }
 
             Ok(())
@@ -182,14 +184,14 @@ async fn execute_pg_statement(db_conn: &PostgresConnection, sql: &str) {
 
 #[cfg(feature = "postgres")]
 async fn initialize_runtime(port: usize) -> Result<Runtime, anyhow::Error> {
-    initialize_runtime_with_mode(port, Mode::File, DUCKDB_FILE_PATH).await
+    initialize_runtime_with_mode(port, Mode::File, CAYENNE_DIR).await
 }
 
 #[cfg(feature = "postgres")]
 async fn initialize_runtime_with_mode(
     port: usize,
     mode: Mode,
-    duckdb_file: &str,
+    cayenne_dir: &str,
 ) -> Result<Runtime, anyhow::Error> {
     // Re-register connectors in case a previous runtime shutdown cleared them
     register_test_connectors().await;
@@ -210,10 +212,10 @@ async fn initialize_runtime_with_mode(
     ds.params = Some(params.clone());
     ds.acceleration = Some(Acceleration {
         enabled: true,
-        engine: Some("duckdb".to_string()),
+        engine: Some("cayenne".to_string()),
         mode,
         params: Some(Params::from_string_map(
-            vec![("duckdb_file".to_string(), duckdb_file.to_string())]
+            vec![("cayenne_file_path".to_string(), cayenne_dir.to_string())]
                 .into_iter()
                 .collect(),
         )),
@@ -297,8 +299,9 @@ async fn test_schema_evolution_file_update_mode() -> Result<(), anyhow::Error> {
     let _tracing = init_tracing(Some("integration=debug,info"));
     register_test_connectors().await;
 
-    if std::fs::metadata(DUCKDB_FILE_UPDATE_PATH).is_ok() {
-        std::fs::remove_file(DUCKDB_FILE_UPDATE_PATH).expect("should remove local database");
+    if std::fs::metadata(CAYENNE_FILE_UPDATE_DIR).is_ok() {
+        std::fs::remove_dir_all(CAYENNE_FILE_UPDATE_DIR)
+            .expect("should remove the Cayenne acceleration directory");
     }
 
     test_request_context()
@@ -316,7 +319,7 @@ async fn test_schema_evolution_file_update_mode() -> Result<(), anyhow::Error> {
             reset_pg_table(&db_conn).await;
 
             let rt = Arc::new(
-                initialize_runtime_with_mode(port, Mode::FileUpdate, DUCKDB_FILE_UPDATE_PATH)
+                initialize_runtime_with_mode(port, Mode::FileUpdate, CAYENNE_FILE_UPDATE_DIR)
                     .await?,
             );
 
@@ -332,7 +335,7 @@ async fn test_schema_evolution_file_update_mode() -> Result<(), anyhow::Error> {
             )
             .await;
             let rt = Arc::new(
-                initialize_runtime_with_mode(port, Mode::FileUpdate, DUCKDB_FILE_UPDATE_PATH)
+                initialize_runtime_with_mode(port, Mode::FileUpdate, CAYENNE_FILE_UPDATE_DIR)
                     .await?,
             );
             run_and_verify_query(&rt, sql, "test_schema_evolution_file_update_add_column").await;
@@ -343,7 +346,7 @@ async fn test_schema_evolution_file_update_mode() -> Result<(), anyhow::Error> {
             reset_pg_table(&db_conn).await;
             execute_pg_statement(&db_conn, "ALTER TABLE public.chameleon DROP COLUMN age;").await;
             let rt = Arc::new(
-                initialize_runtime_with_mode(port, Mode::FileUpdate, DUCKDB_FILE_UPDATE_PATH)
+                initialize_runtime_with_mode(port, Mode::FileUpdate, CAYENNE_FILE_UPDATE_DIR)
                     .await?,
             );
             run_and_verify_query(
@@ -363,16 +366,16 @@ async fn test_schema_evolution_file_update_mode() -> Result<(), anyhow::Error> {
             )
             .await;
             let rt = Arc::new(
-                initialize_runtime_with_mode(port, Mode::FileUpdate, DUCKDB_FILE_UPDATE_PATH)
+                initialize_runtime_with_mode(port, Mode::FileUpdate, CAYENNE_FILE_UPDATE_DIR)
                     .await?,
             );
             run_and_verify_query(&rt, sql, "test_schema_evolution_file_update_change_type").await;
 
             running_container.cleanup().await;
 
-            if std::fs::metadata(DUCKDB_FILE_UPDATE_PATH).is_ok() {
-                std::fs::remove_file(DUCKDB_FILE_UPDATE_PATH)
-                    .expect("should remove local database");
+            if std::fs::metadata(CAYENNE_FILE_UPDATE_DIR).is_ok() {
+                std::fs::remove_dir_all(CAYENNE_FILE_UPDATE_DIR)
+                    .expect("should remove the Cayenne acceleration directory");
             }
 
             Ok(())
@@ -524,19 +527,6 @@ async fn run_file_update_csv_phases(
         .await
 }
 
-#[cfg(feature = "duckdb")]
-#[tokio::test]
-async fn test_file_update_csv_duckdb() -> Result<(), anyhow::Error> {
-    let temp_dir = tempfile::tempdir()?;
-    let accel_file = temp_dir.path().join("sample.duckdb");
-    let csv_file = temp_dir.path().join("sample.csv");
-    let params = HashMap::from([(
-        "duckdb_file".to_string(),
-        accel_file.to_string_lossy().to_string(),
-    )]);
-    run_file_update_csv_phases("duckdb", params, &csv_file.to_string_lossy()).await
-}
-
 #[cfg(feature = "sqlite")]
 #[tokio::test]
 async fn test_file_update_csv_sqlite() -> Result<(), anyhow::Error> {
@@ -550,7 +540,6 @@ async fn test_file_update_csv_sqlite() -> Result<(), anyhow::Error> {
     run_file_update_csv_phases("sqlite", params, &csv_file.to_string_lossy()).await
 }
 
-#[cfg(not(windows))]
 #[tokio::test]
 async fn test_file_update_csv_cayenne() -> Result<(), anyhow::Error> {
     let temp_dir = tempfile::tempdir()?;
@@ -580,7 +569,6 @@ async fn test_file_update_csv_cayenne() -> Result<(), anyhow::Error> {
 // `mode: file` storage. Assertions are explicit (row counts + column set) so the cases pass
 // on first CI run without pre-accepted insta `.snap` files.
 
-#[cfg(any(feature = "duckdb", feature = "sqlite", not(windows)))]
 async fn init_drop_recreate_csv_runtime(
     csv_path: &str,
     engine: &str,
@@ -599,7 +587,6 @@ async fn init_drop_recreate_csv_runtime(
     .await
 }
 
-#[cfg(any(feature = "duckdb", feature = "sqlite", not(windows)))]
 #[expect(clippy::expect_used)]
 async fn assert_csv_query(
     rt: &Arc<Runtime>,
@@ -631,7 +618,6 @@ async fn assert_csv_query(
     );
 }
 
-#[cfg(any(feature = "duckdb", feature = "sqlite", not(windows)))]
 async fn run_drop_recreate_csv_phases(
     engine: &str,
     accel_params: HashMap<String, String>,
@@ -684,19 +670,6 @@ async fn run_drop_recreate_csv_phases(
         .await
 }
 
-#[cfg(feature = "duckdb")]
-#[tokio::test]
-async fn test_drop_recreate_full_csv_duckdb() -> Result<(), anyhow::Error> {
-    let temp_dir = tempfile::tempdir()?;
-    let accel_file = temp_dir.path().join("sample.duckdb");
-    let csv_file = temp_dir.path().join("sample.csv");
-    let params = HashMap::from([(
-        "duckdb_file".to_string(),
-        accel_file.to_string_lossy().to_string(),
-    )]);
-    run_drop_recreate_csv_phases("duckdb", params, &csv_file.to_string_lossy()).await
-}
-
 #[cfg(feature = "sqlite")]
 #[tokio::test]
 async fn test_drop_recreate_full_csv_sqlite() -> Result<(), anyhow::Error> {
@@ -710,7 +683,6 @@ async fn test_drop_recreate_full_csv_sqlite() -> Result<(), anyhow::Error> {
     run_drop_recreate_csv_phases("sqlite", params, &csv_file.to_string_lossy()).await
 }
 
-#[cfg(not(windows))]
 #[tokio::test]
 async fn test_drop_recreate_full_csv_cayenne() -> Result<(), anyhow::Error> {
     let temp_dir = tempfile::tempdir()?;
@@ -831,8 +803,8 @@ async fn assert_query_row_count(rt: &Arc<Runtime>, sql: &str, expected_rows: usi
 /// Asserts the accelerated column `column` reports arrow type `arrow_type` (e.g. `Int64`),
 /// proving an in-place type widening was applied to the engine table and the registered
 /// schema. Reads the type from the result batch's Arrow schema rather than `arrow_typeof`,
-/// which is a `DataFusion` scalar function the accelerator engine (`DuckDB`) cannot evaluate
-/// when the projection is pushed down.
+/// a `DataFusion` scalar function that an engine the projection is pushed down to may not
+/// evaluate.
 #[cfg(feature = "postgres")]
 #[expect(clippy::expect_used)]
 async fn assert_column_arrow_type(rt: &Arc<Runtime>, column: &str, arrow_type: &str) {
@@ -852,110 +824,9 @@ async fn assert_column_arrow_type(rt: &Arc<Runtime>, column: &str, arrow_type: &
     );
 }
 
-/// Restart-time widening under `sync_all_columns`: an additive column and a lossless
-/// `int4 -> int8` type widening are both adopted in place, and the accelerated dataset
-/// keeps serving (rather than deferring on the old schema as `block` would).
-#[cfg(all(feature = "postgres", feature = "duckdb"))]
-#[tokio::test]
-async fn test_schema_evolution_widening_duckdb_sync_all_columns() -> Result<(), anyhow::Error> {
-    let _tracing = init_tracing(Some("integration=debug,info"));
-    register_test_connectors().await;
-
-    test_request_context()
-        .scope(async {
-            let temp_dir = tempfile::tempdir()?;
-            let accel_file = temp_dir.path().join("widen.duckdb");
-            let params = HashMap::from([(
-                "duckdb_file".to_string(),
-                accel_file.to_string_lossy().to_string(),
-            )]);
-
-            let running_container = common::start_postgres_docker_container().await?;
-            let port = usize::from(running_container.host_port(5432)?);
-            let pool = common::get_postgres_connection_pool(port, None).await?;
-            let db_conn = pool
-                .connect_direct()
-                .await
-                .expect("connection can be established");
-
-            reset_pg_table(&db_conn).await;
-
-            // Phase 1: initial load (id, town, age).
-            let rt = Arc::new(
-                init_widen_pg_runtime(
-                    port,
-                    "duckdb",
-                    params.clone(),
-                    OnSchemaChange::SyncAllColumns,
-                )
-                .await?,
-            );
-            assert_query_row_count(&rt, "SELECT id, town, age FROM cham ORDER BY id ASC", 3).await;
-            rt.shutdown().await;
-            drop(rt);
-
-            // Phase 2: additive widening — a new nullable column is adopted in place on
-            // restart. Existing rows are preserved (with the column backfilled NULL); the
-            // restart evolves the schema rather than re-fetching the source, so the row
-            // count is unchanged. Under `block` this query would error (country is not in
-            // the registered schema); under `sync_all_columns` the column is queryable.
-            execute_pg_statement(
-                &db_conn,
-                "ALTER TABLE public.chameleon ADD COLUMN country varchar NULL;",
-            )
-            .await;
-            let rt = Arc::new(
-                init_widen_pg_runtime(
-                    port,
-                    "duckdb",
-                    params.clone(),
-                    OnSchemaChange::SyncAllColumns,
-                )
-                .await?,
-            );
-            assert_query_row_count(
-                &rt,
-                "SELECT id, town, age, country FROM cham ORDER BY id ASC",
-                3,
-            )
-            .await;
-            rt.shutdown().await;
-            drop(rt);
-
-            // Phase 3: type widening — int4 -> int8 applied in place to the existing rows.
-            execute_pg_statement(
-                &db_conn,
-                "ALTER TABLE public.chameleon ALTER COLUMN age TYPE int8;",
-            )
-            .await;
-            let rt = Arc::new(
-                init_widen_pg_runtime(
-                    port,
-                    "duckdb",
-                    params.clone(),
-                    OnSchemaChange::SyncAllColumns,
-                )
-                .await?,
-            );
-            assert_query_row_count(
-                &rt,
-                "SELECT id, town, age, country FROM cham ORDER BY id ASC",
-                3,
-            )
-            .await;
-            assert_column_arrow_type(&rt, "age", "Int64").await;
-            rt.shutdown().await;
-            drop(rt);
-
-            running_container.cleanup().await;
-            Ok(())
-        })
-        .await
-}
-
-/// Restart-time widening on the Cayenne engine under `sync_all_columns` — same scenario
-/// as the `DuckDB` case, validating the `Cayenne` metastore schema update + provider swap.
-#[cfg(all(feature = "postgres", not(windows)))]
+/// Restart-time widening under `sync_all_columns` updates the Cayenne metastore
+/// schema and swaps the provider for additive columns and lossless type widening.
+#[cfg(feature = "postgres")]
 #[tokio::test]
 async fn test_schema_evolution_widening_cayenne_sync_all_columns() -> Result<(), anyhow::Error> {
     let _tracing = init_tracing(Some("integration=debug,info"));
@@ -1028,6 +899,31 @@ async fn test_schema_evolution_widening_cayenne_sync_all_columns() -> Result<(),
             rt.shutdown().await;
             drop(rt);
 
+            // Phase 3: type widening — int4 -> int8 applied in place to the existing rows.
+            execute_pg_statement(
+                &db_conn,
+                "ALTER TABLE public.chameleon ALTER COLUMN age TYPE int8;",
+            )
+            .await;
+            let rt = Arc::new(
+                init_widen_pg_runtime(
+                    port,
+                    "cayenne",
+                    params.clone(),
+                    OnSchemaChange::SyncAllColumns,
+                )
+                .await?,
+            );
+            assert_query_row_count(
+                &rt,
+                "SELECT id, town, age, country FROM cham ORDER BY id ASC",
+                3,
+            )
+            .await;
+            assert_column_arrow_type(&rt, "age", "Int64").await;
+            rt.shutdown().await;
+            drop(rt);
+
             running_container.cleanup().await;
             Ok(())
         })
@@ -1037,7 +933,7 @@ async fn test_schema_evolution_widening_cayenne_sync_all_columns() -> Result<(),
 /// `append_new_columns` adopts a new nullable column but does NOT apply a type widening:
 /// the `int4 -> int8` change falls back to block-equivalent behavior (the dataset keeps
 /// serving the prior schema instead of evolving the type).
-#[cfg(all(feature = "postgres", feature = "duckdb"))]
+#[cfg(feature = "postgres")]
 #[tokio::test]
 async fn test_schema_evolution_append_new_columns_only() -> Result<(), anyhow::Error> {
     let _tracing = init_tracing(Some("integration=debug,info"));
@@ -1046,9 +942,9 @@ async fn test_schema_evolution_append_new_columns_only() -> Result<(), anyhow::E
     test_request_context()
         .scope(async {
             let temp_dir = tempfile::tempdir()?;
-            let accel_file = temp_dir.path().join("append.duckdb");
+            let accel_file = temp_dir.path().join("append_cayenne");
             let params = HashMap::from([(
-                "duckdb_file".to_string(),
+                "cayenne_file_path".to_string(),
                 accel_file.to_string_lossy().to_string(),
             )]);
 
@@ -1065,7 +961,7 @@ async fn test_schema_evolution_append_new_columns_only() -> Result<(), anyhow::E
             let rt = Arc::new(
                 init_widen_pg_runtime(
                     port,
-                    "duckdb",
+                    "cayenne",
                     params.clone(),
                     OnSchemaChange::AppendNewColumns,
                 )
@@ -1084,7 +980,7 @@ async fn test_schema_evolution_append_new_columns_only() -> Result<(), anyhow::E
             let rt = Arc::new(
                 init_widen_pg_runtime(
                     port,
-                    "duckdb",
+                    "cayenne",
                     params.clone(),
                     OnSchemaChange::AppendNewColumns,
                 )
@@ -1111,7 +1007,7 @@ async fn test_schema_evolution_append_new_columns_only() -> Result<(), anyhow::E
             let rt = Arc::new(
                 init_widen_pg_runtime(
                     port,
-                    "duckdb",
+                    "cayenne",
                     params.clone(),
                     OnSchemaChange::AppendNewColumns,
                 )

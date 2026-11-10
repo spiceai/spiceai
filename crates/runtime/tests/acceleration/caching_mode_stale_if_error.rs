@@ -592,43 +592,6 @@ async fn a_finite_window_serves_stale_inside_it_and_propagates_the_failure_past_
     Ok(())
 }
 
-/// The same window on `DuckDB`, which stores `_fetched_at` at microsecond
-/// precision: the read path has to normalize the stored timestamp before it can
-/// measure staleness, or a finite window could never prove an entry is inside
-/// it and would fail closed on every read.
-#[cfg(feature = "duckdb")]
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn a_finite_window_is_measured_from_a_microsecond_fetched_at_on_duckdb()
--> Result<(), anyhow::Error> {
-    let _tracing = init_tracing(None);
-    register_test_connectors().await;
-
-    let temp = tempfile::tempdir()?;
-    let (inside, past) = serve_inside_and_past_window(
-        "caching_stale_if_error_finite_duckdb",
-        &format!("{}s", WINDOW.as_secs()),
-        Some("duckdb"),
-        Mode::File,
-        vec![(
-            "duckdb_file".to_string(),
-            temp.path()
-                .join("cache.duckdb")
-                .to_string_lossy()
-                .to_string(),
-        )],
-    )
-    .await?;
-
-    assert_eq!(
-        inside,
-        vec![200; ROWS],
-        "a microsecond `_fetched_at` is read as inside the window"
-    );
-    let err = past.expect_err("and as past it once it is");
-    eprintln!("past the window the client sees: {err}");
-    Ok(())
-}
-
 /// `enabled` is `stale-if-error=∞`, the unbounded form the finite window
 /// replaces: the stale rows are served however far past the TTL they are.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -1096,8 +1059,7 @@ async fn a_5xx_response_is_not_cached_by_the_sql_results_cache_under_a_narrow_pr
 /// Regression tests for #15356: an origin that answers `[]` to a cached request
 /// has retracted the rows it returned before, so that answer replaces the
 /// entry, on the file-mode Cayenne acceleration the issue was reported on.
-// Cayenne is not built on Windows, so neither is a test that loads it.
-#[cfg(all(feature = "sqlite", not(target_os = "windows")))]
+#[cfg(feature = "sqlite")]
 mod empty_response {
     use super::*;
 

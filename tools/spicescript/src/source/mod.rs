@@ -30,6 +30,7 @@ use crate::docker::Container;
 
 pub mod clickhouse;
 pub mod document;
+pub mod duckdb;
 pub mod duckdb_cli;
 pub mod ducklake;
 pub mod files;
@@ -158,7 +159,20 @@ pub trait Source: Send + Sync {
     }
 }
 
-/// Starts a source of `kind`; `files`, `rustfs`, `iceberg` and `ducklake`
+/// How many containers [`start`] runs for a source of `kind`, which is what it
+/// needs of the kernel key quota a rootless Docker daemon's containers share
+/// (see [`crate::keyquota`]). Kept beside `start` so the two change together.
+pub fn containers(kind: &str) -> u64 {
+    match kind {
+        "files" | "mock-http" | "duckdb" => 0,
+        "iceberg" => 2,
+        // `ducklake` runs a PostgreSQL catalog; the rest run one container each,
+        // and an unknown kind fails in `start` before it starts any.
+        _ => 1,
+    }
+}
+
+/// Starts a source of `kind`; `files`, `rustfs`, `iceberg`, `duckdb` and `ducklake`
 /// sources keep their directories under `work`.
 pub async fn start(
     name: &str,
@@ -181,9 +195,10 @@ pub async fn start(
         "iceberg" => Box::new(iceberg::Iceberg::start(name, run_id, dir).await?),
         "clickhouse" => Box::new(clickhouse::ClickHouse::start(name, run_id, version).await?),
         "mock-http" => Box::new(mock_http::MockHttp::start().await?),
+        "duckdb" => Box::new(duckdb::DuckDb::start(version, dir).await?),
         "ducklake" => Box::new(ducklake::DuckLake::start(name, run_id, version, dir).await?),
         other => anyhow::bail!(
-            "unknown source kind '{other}'; expected kafka, mongodb, dynamodb, postgres, mysql, clickhouse, files, rustfs, iceberg, ducklake, mock-http or docker"
+            "unknown source kind '{other}'; expected kafka, mongodb, dynamodb, postgres, mysql, clickhouse, files, rustfs, iceberg, duckdb, ducklake, mock-http or docker"
         ),
     };
     Ok(source)

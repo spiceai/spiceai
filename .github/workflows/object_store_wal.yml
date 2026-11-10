@@ -30,6 +30,7 @@ jobs:
       (github.event.pull_request.head.repo.full_name == github.repository &&
       github.event.pull_request.user.login != 'dependabot[bot]')
     runs-on: spiceai-dev-runners
+    environment: ci-build
     # A merge group's checkout takes the full history, sized for a cold runner
     # cloning from scratch.
     timeout-minutes: 45
@@ -78,7 +79,7 @@ jobs:
         env:
           RELEVANT: ${{ github.event_name != 'merge_group' || steps.changes.outputs.relevant_changes == 'true' }}
           SPICEIO_RELEVANT: ${{ github.event_name == 'workflow_dispatch' || steps.spiceio.outputs.relevant == 'true' }}
-          HAS_SPICEIO_SECRET: ${{ secrets.UNAS_SMB_PASS != '' }}
+          HAS_SPICEIO_SECRET: ${{ secrets.SMB_PASSWORD != '' }}
         with:
           script: |
             // Every leg runs in parallel. The disk legs qualify the local
@@ -111,7 +112,7 @@ jobs:
               return legs.filter((leg) => leg.store !== 'spiceio');
             }
             if (process.env.HAS_SPICEIO_SECRET !== 'true') {
-              core.warning('UNAS_SMB_PASS is not available to this run, so the spiceio leg does not run. It runs on branches of spiceai/spiceai and in the merge queue.');
+              core.warning('SMB_PASSWORD is not available to this run, so the spiceio leg does not run. It runs on branches of spiceai/spiceai and in the merge queue.');
               return legs.filter((leg) => leg.store !== 'spiceio');
             }
             return legs;
@@ -125,19 +126,13 @@ jobs:
       matrix:
         include: ${{ fromJson(needs.plan.outputs.legs) }}
     runs-on: ${{ matrix.runner }}
+    environment: ci-build
     timeout-minutes: 45
     services:
       redis:
-        # GitHub service containers require Linux. An empty image skips macOS.
-        image: ${{ matrix.os == 'Linux' && 'redis:7.4.11-bookworm' || '' }}
-        # Pull as the Docker Hub account integration.yml logs in with. An
-        # anonymous pull counts against Docker Hub's unauthenticated rate
-        # limit, and a 429 there fails the job before any step runs. The plan
-        # job's `if:` keeps fork and Dependabot PRs out, so the secrets are
-        # set wherever this job runs.
-        credentials:
-          username: ${{ secrets.DOCKERHUB_USERNAME }}
-          password: ${{ secrets.DOCKERHUB_TOKEN }}
+        # GitHub service containers require Linux. An empty image skips macOS. A service
+        # starts before any step can log in, so it pulls from ECR Public, not Docker Hub.
+        image: ${{ matrix.os == 'Linux' && 'public.ecr.aws/docker/library/redis:7.4.11-bookworm' || '' }}
         ports:
           - 6379/tcp
         options: >-
@@ -338,7 +333,7 @@ jobs:
         env:
           SPICEIO_SMB_SERVER: 192.168.3.148
           SPICEIO_SMB_USER: runner
-          SPICEIO_SMB_PASS: ${{ secrets.UNAS_SMB_PASS }}
+          SPICEIO_SMB_PASS: ${{ secrets.SMB_PASSWORD }}
           SPICEIO_SMB_SHARE: ai_platform_dev
           SPICEIO_BUCKET: ${{ env.WAL_BUCKET }}
           # spiceio moves to the next port when this one is taken.

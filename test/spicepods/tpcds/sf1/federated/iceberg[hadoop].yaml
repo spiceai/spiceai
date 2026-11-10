@@ -9,6 +9,7 @@ datasets:
       iceberg_s3_endpoint: ${secrets:S3_ENDPOINT}
       iceberg_s3_access_key_id: ${secrets:S3_KEY}
       iceberg_s3_secret_access_key: ${secrets:S3_SECRET}
+      iceberg_s3_session_token: ${secrets:S3_SESSION_TOKEN}
       iceberg_s3_region: us-east-1
   - from: iceberg:s3a://benchmarks/hadoop/tpcds/catalog_returns
     name: catalog_returns

@@ -61,7 +61,6 @@ async fn query_error(ctx: &datafusion::prelude::SessionContext, sql: &str) -> St
 }
 
 #[tokio::test]
-#[cfg(not(windows))]
 async fn built_session_errors_on_bigint_sum_and_add() {
     let df = DataFusionBuilder::new(
         status::RuntimeStatus::new(),
@@ -161,7 +160,6 @@ async fn built_session_errors_on_bigint_sum_and_add() {
 /// must still return `MAX` with the rule on and off, and a true overflow
 /// must still error. `Int32` `SUM` on the same stats still pushes (control).
 #[tokio::test]
-#[cfg(not(windows))]
 async fn built_session_eager_aggregation_keeps_representable_integer_sum() {
     use arrow::array::StringArray;
     use datafusion::physical_plan::displayable;

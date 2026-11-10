@@ -14,10 +14,14 @@ limitations under the License.
 #![allow(clippy::borrowed_box)]
 #![allow(clippy::needless_pass_by_value)]
 
-use crate::chat::{LocalModelOptions, PagedAttentionMode, ReasoningDefault, message_to_mistral};
+use crate::chat::{
+    ContentSupport, LocalModelOptions, PagedAttentionMode, ReasoningDefault, message_to_mistral,
+};
 use crate::streaming_utils::create_stream_response_with_timestamp;
 
-use super::{Chat, Error as ChatError, FailedToRunModelSnafu, Result, nsql::SqlGeneration};
+use super::{
+    Chat, Error as ChatError, FailedToRunModelSnafu, Result, TokenLimits, nsql::SqlGeneration,
+};
 use async_openai::{
     error::{ApiError, OpenAIError},
     types::chat::{
@@ -45,8 +49,8 @@ use mistralrs::core::{
 };
 use mistralrs::{
     ChatCompletionChunkResponse, ChatCompletionResponse, ChunkChoice, Constraint, Device, Function,
-    ModelDType, NormalRequest, Request as MistralRequest, Response as MistralResponse,
-    SamplingParams, Tool, ToolCallResponse, ToolChoice, ToolType,
+    MessageContent, ModelDType, NormalRequest, Request as MistralRequest,
+    Response as MistralResponse, SamplingParams, Tool, ToolCallResponse, ToolChoice, ToolType,
 };
 
 use serde::Deserialize;
@@ -75,6 +79,8 @@ pub struct MistralLlama {
     model_name: String,
     /// What the chat template does with each `reasoning_effort` value.
     reasoning_support: ReasoningSupport,
+    /// Which shapes of a message's content the chat template reads.
+    content_support: ContentSupport,
     /// RAII drop guard that keeps the per-node `RING_CONFIG` temp file alive for
     /// the model's lifetime (its `Drop` deletes the file on model teardown).
     /// `None` for single-node models. Never read directly.
@@ -110,6 +116,8 @@ impl MistralLlama {
             reasoning,
             // mistral.rs reads its ring from `RING_CONFIG`, which the caller wrote.
             distributed: _,
+            // mistral.rs schedules its own requests.
+            concurrent_requests: _,
         } = options;
         for weight in model_weights {
             if !weight.exists() {
@@ -561,6 +569,7 @@ impl MistralLlama {
         reasoning: ReasoningDefault<'_>,
     ) -> Result<Self> {
         let reasoning_support = Self::reasoning_support(&pipeline).await;
+        let content_support = Self::content_support(&pipeline).await;
         if let Some(effort) = reasoning.effort {
             reasoning_controls(Some(effort), &reasoning_support, reasoning.model_name).map_err(
                 |message| ChatError::InvalidParamValueError {
@@ -578,6 +587,7 @@ impl MistralLlama {
             counter: AtomicUsize::new(0),
             model_name: reasoning.model_name.to_string(),
             reasoning_support,
+            content_support,
             ring_config,
         })
     }
@@ -623,6 +633,67 @@ impl MistralLlama {
             );
             ReasoningSupport::default()
         })
+    }
+
+    /// Renders a conversation for each role with markers in each shape of a message's content,
+    /// to learn which the chat template reads ([`ContentSupport`]), off the async runtime as
+    /// [`Self::reasoning_support`] renders. Named templates are probed apart, the `tool_use`
+    /// one by rendering with a tool; a single template renders alike with or without tools.
+    async fn content_support(
+        pipeline: &Arc<tokio::sync::Mutex<dyn Pipeline + Sync + Send>>,
+    ) -> ContentSupport {
+        let pipeline = Arc::clone(pipeline);
+        tokio::task::spawn_blocking(move || {
+            let pipeline = pipeline.blocking_lock();
+            let processor = pipeline.get_processor();
+            let named = pipeline
+                .get_chat_template()
+                .is_some_and(|t| t.chat_template.as_ref().is_some_and(|t| t.0.is_right()));
+            ContentSupport::from_renders(|messages, with_tools| {
+                let tools = if with_tools && named {
+                    vec![Tool {
+                        tp: ToolType::Function,
+                        function: Function {
+                            description: None,
+                            name: "probe".to_string(),
+                            parameters: None,
+                            strict: None,
+                        },
+                    }]
+                } else {
+                    Vec::new()
+                };
+                processor
+                    .process(&*pipeline, messages, true, false, None, None, tools)
+                    .map(|(_, prompt)| prompt)
+                    .ok()
+            })
+        })
+        .await
+        .unwrap_or_else(|e| {
+            tracing::debug!(
+                "Checking which message content the chat template reads stopped, so a message's text parts reach it joined: {e}"
+            );
+            ContentSupport::default()
+        })
+    }
+
+    /// `req`'s messages as the chat template reads them: [`message_to_mistral`]'s, fitted to
+    /// the template by [`ContentSupport::rewrite`]. Public for tests.
+    #[doc(hidden)]
+    pub fn template_messages(
+        &self,
+        req: &CreateChatCompletionRequest,
+    ) -> Result<Vec<IndexMap<String, MessageContent>>, OpenAIError> {
+        let mut messages = req
+            .messages
+            .iter()
+            .map(message_to_mistral)
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(|part| OpenAIError::InvalidArgument(part.refusal(&self.model_name)))?;
+        let with_tools = req.tools.as_ref().is_some_and(|tools| !tools.is_empty());
+        self.content_support.rewrite(&mut messages, with_tools);
+        Ok(messages)
     }
 
     // TODO: handle passing in [`SamplingParams`] from request.
@@ -703,16 +774,13 @@ impl MistralLlama {
     async fn send_message(
         &self,
         req: CreateChatCompletionRequest,
+        messages: Vec<IndexMap<String, MessageContent>>,
         tool_choice: Option<ToolChoice>,
         reasoning: ReasoningControls,
     ) -> Result<Receiver<MistralResponse>> {
         let max_len = Self::completion_limit(&req);
         let message = RequestMessage::Chat {
-            messages: req
-                .messages
-                .iter()
-                .map(message_to_mistral)
-                .collect::<Vec<_>>(),
+            messages,
             enable_thinking: reasoning.enable_thinking,
             reasoning_effort: reasoning.reasoning_effort,
         };
@@ -817,6 +885,22 @@ impl Chat for MistralLlama {
         Ok(())
     }
 
+    /// The longest sequence mistral.rs runs the model with: it refuses a longer prompt.
+    async fn token_limits(&self) -> TokenLimits {
+        // Only one model runs in this pipeline.
+        let context_window = self
+            .pipeline
+            .max_sequence_length(None)
+            .ok()
+            .flatten()
+            .and_then(|length| u64::try_from(length).ok())
+            .filter(|window| *window > 0);
+        TokenLimits {
+            context_window,
+            max_output_tokens: None,
+        }
+    }
+
     async fn stream<'a>(
         &self,
         prompt: String,
@@ -879,8 +963,9 @@ impl Chat for MistralLlama {
     ) -> Result<ChatCompletionResponseStream, OpenAIError> {
         let tool_choice = request_tool_choice(&req)?;
         let reasoning = self.request_reasoning(&req)?;
+        let messages = self.template_messages(&req)?;
         let recver = self
-            .send_message(req, tool_choice, reasoning)
+            .send_message(req, messages, tool_choice, reasoning)
             .await
             .map_err(|e| {
                 OpenAIError::ApiError(ApiError {
@@ -899,8 +984,9 @@ impl Chat for MistralLlama {
     ) -> Result<CreateChatCompletionResponse, OpenAIError> {
         let tool_choice = request_tool_choice(&req)?;
         let reasoning = self.request_reasoning(&req)?;
+        let messages = self.template_messages(&req)?;
         let mut recver = self
-            .send_message(req, tool_choice, reasoning)
+            .send_message(req, messages, tool_choice, reasoning)
             .await
             .map_err(|e| {
                 OpenAIError::ApiError(ApiError {
@@ -1073,6 +1159,9 @@ const REASONING_DOCS: &str = "https://spiceai.org/docs/components/models";
 /// The opening tag of a `<think>…</think>` reasoning block.
 const THINK_OPEN_TAG: &str = "<think>";
 
+/// The token that opens a Mistral reasoning model's `[THINK]…[/THINK]` block.
+const MISTRAL_THINK_OPEN_TAG: &str = "[THINK]";
+
 /// The token Gemma 4 chat templates add to the prompt to turn reasoning on.
 const GEMMA_THINK_TOKEN: &str = "<|think|>";
 
@@ -1150,10 +1239,13 @@ impl ReasoningSupport {
 }
 
 /// Whether a rendered prompt starts the model inside a reasoning block, by the test
-/// `mistral.rs` applies to parse the reply: a prompt that ends in `<think>`, or one that
-/// carries Gemma 4's `<|think|>`.
+/// `mistral.rs` applies to parse the reply: a prompt that ends in `<think>` or Mistral's
+/// `[THINK]`, or one that carries Gemma 4's `<|think|>`.
 fn opens_reasoning(prompt: &str) -> bool {
-    prompt.trim_end().ends_with(THINK_OPEN_TAG) || prompt.contains(GEMMA_THINK_TOKEN)
+    let end = prompt.trim_end();
+    end.ends_with(THINK_OPEN_TAG)
+        || end.ends_with(MISTRAL_THINK_OPEN_TAG)
+        || prompt.contains(GEMMA_THINK_TOKEN)
 }
 
 /// Whether `prompt` names `level` as a whole word, ignoring case, as GLM-5.3 does with
@@ -1669,6 +1761,24 @@ mod tests {
     }
 
     /// Classifies a template from one of the renders above, none of which fails.
+    /// Mistral Large 4's template: it takes `low`, `medium` and `high` in its model settings,
+    /// renders an unset effort as `high` and raises on any other level; the model opens its own
+    /// `[THINK]` block.
+    fn mistral_large_4_render(
+        _: Option<bool>,
+        effort: Option<TemplateReasoningEffort>,
+    ) -> Option<String> {
+        let level = match effort {
+            None | Some(TemplateReasoningEffort::High) => "high",
+            Some(TemplateReasoningEffort::Low) => "low",
+            Some(TemplateReasoningEffort::Medium) => "medium",
+            Some(_) => return None,
+        };
+        Some(format!(
+            "<s>[MODEL_SETTINGS]{{\"reasoning_effort\": \"{level}\"}}[/MODEL_SETTINGS][INST]Hi[/INST]"
+        ))
+    }
+
     fn classify(
         render: fn(Option<bool>, Option<TemplateReasoningEffort>) -> String,
     ) -> ReasoningSupport {
@@ -1711,6 +1821,28 @@ mod tests {
                 "{name}"
             );
         }
+    }
+
+    #[test]
+    fn mistral_large_4_always_reasons_and_names_low_medium_and_high() {
+        assert_eq!(
+            ReasoningSupport::from_renders(mistral_large_4_render),
+            ReasoningSupport {
+                always_reasons: true,
+                levels: Some(vec![
+                    TemplateReasoningEffort::Low,
+                    TemplateReasoningEffort::Medium,
+                    TemplateReasoningEffort::High
+                ]),
+            }
+        );
+    }
+
+    #[test]
+    fn a_prompt_that_opens_a_mistral_think_block_starts_in_reasoning() {
+        assert!(opens_reasoning("[INST]Hi[/INST][THINK]"));
+        assert!(opens_reasoning("[INST]Hi[/INST][THINK]\n"));
+        assert!(!opens_reasoning("[INST]Hi[/INST]"));
     }
 
     #[test]

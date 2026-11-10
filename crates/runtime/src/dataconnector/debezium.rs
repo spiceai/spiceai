@@ -466,6 +466,7 @@ impl DataConnector for Debezium {
                 // the first rebalance callback after `subscribe` seeks before any
                 // messages are delivered.
                 let kafka_consumer = KafkaConsumer::create_with_existing_group_id(
+                    &dataset_name,
                     &metadata.consumer_group_id,
                     &self.kafka_config,
                     &metadata.offsets,
@@ -708,6 +709,7 @@ async fn get_metadata_from_kafka(
             SCHEMA_INFERENCE_TIMEOUT
         };
         let fetch_result = KafkaConsumer::fetch_latest_message::<ChangeEventKey, ChangeEvent>(
+            &dataset.name.to_string(),
             topic,
             kafka_config,
             peek_timeout,
@@ -827,6 +829,7 @@ async fn fetch_latest_change_event(
     let dataset_name = dataset.name.to_string();
 
     match KafkaConsumer::fetch_latest_message::<ChangeEventKey, ChangeEvent>(
+        &dataset.name.to_string(),
         topic,
         kafka_config,
         SCHEMA_INFERENCE_TIMEOUT,
@@ -917,6 +920,7 @@ async fn refresh_schema_if_evolved(
 
     // Try to peek at the latest Kafka message for the current schema
     let peek_result = KafkaConsumer::fetch_latest_message::<ChangeEventKey, ChangeEvent>(
+        &dataset.name.to_string(),
         topic,
         kafka_config,
         SCHEMA_INFERENCE_TIMEOUT,

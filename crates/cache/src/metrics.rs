@@ -312,11 +312,13 @@ pub enum RevalidationOutcome {
     EncodeFailed,
     /// The cache write itself failed.
     PutFailed,
+    /// The revalidation did not finish before its deadline and was cancelled.
+    TimedOut,
 }
 
 impl RevalidationOutcome {
     /// Every variant, so a caller publishing the series up front cannot omit one.
-    pub const ALL: [Self; 8] = [
+    pub const ALL: [Self; 9] = [
         Self::Stored,
         Self::QueryFailed,
         Self::CollectFailed,
@@ -325,6 +327,7 @@ impl RevalidationOutcome {
         Self::Unboundable,
         Self::EncodeFailed,
         Self::PutFailed,
+        Self::TimedOut,
     ];
 
     fn as_str(self) -> &'static str {
@@ -337,6 +340,7 @@ impl RevalidationOutcome {
             Self::Unboundable => "unboundable",
             Self::EncodeFailed => "encode_failed",
             Self::PutFailed => "put_failed",
+            Self::TimedOut => "timed_out",
         }
     }
 
@@ -452,7 +456,7 @@ macro_rules! generate_cache_metrics {
                             "_cache_stale_swr_count"
                         ))
                         .with_description(
-                            "Number of stale-while-revalidate background refreshes skipped due to existing in-flight revalidation.",
+                            "Number of stale-while-revalidate background refreshes skipped because a revalidation of the same entry is in flight or the concurrent revalidation limit is reached.",
                         )
                         .build()
                 });

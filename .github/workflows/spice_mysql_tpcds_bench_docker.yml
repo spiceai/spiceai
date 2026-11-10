@@ -6,6 +6,11 @@ on:
 jobs:
   build:
     runs-on: ubuntu-24.04
+    environment: ci
+    permissions:
+      contents: read
+      packages: write
+      id-token: write
 
     steps:
       - name: Check disk space
@@ -55,10 +60,12 @@ jobs:
         # Authenticate to Docker Hub before pulling so we use the authenticated
         # rate limits instead of anonymous (per-IP) limits.
         if: github.repository == 'spiceai/spiceai'
-        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
+        uses: docker/login-action@8aa5831fb8d48d8f76594c7ddde61ae58019f550 # v4.8.0
+        env:
+          DOCKERHUB_OIDC_CONNECTIONID: ${{ vars.DOCKERHUB_OIDC_CONNECTIONID }}
+          DOCKERHUB_OIDC_EXPIREIN: '21600'
         with:
-          username: ${{ secrets.DOCKERHUB_USERNAME }}
-          password: ${{ secrets.DOCKERHUB_TOKEN }}
+          username: ${{ vars.DOCKERHUB_ORGANIZATION }}
 
       - name: Pull MySQL Docker image
         run: docker pull mysql:latest
@@ -85,7 +92,7 @@ jobs:
           done
 
       - name: Login to GHCR
-        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
+        uses: docker/login-action@8aa5831fb8d48d8f76594c7ddde61ae58019f550 # v4.8.0
         with:
           registry: ghcr.io
           username: ${{ github.repository_owner }}

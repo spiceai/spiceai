@@ -5,6 +5,7 @@ on:
 
 jobs:
   build:
+    environment: secret-free
     name: Build ${{ matrix.name }} binaries
     runs-on: ${{ matrix.runner }}
     strategy:
@@ -59,14 +60,8 @@ jobs:
             rsync -av "${{ steps.build-spiced.outputs.target_dir_relative }}/" /home/spiceai/build/target/
           fi
 
-      - name: Update build cache (Windows)
-        if: matrix.target_os == 'windows'
-        run: |
-          if (Test-Path C:/spiceai/build/target) {
-            Copy-Item -Recurse -Force "${{ steps.build-spiced.outputs.target_dir_relative }}/*" C:/spiceai/build/target
-          }
-
   test_acceleration:
+    environment: secret-free
     name: '${{ matrix.acceleration.engine }} acceleration on ${{ matrix.target.name }}'
     runs-on: ${{ matrix.target.runner }}
     needs:
@@ -78,7 +73,7 @@ jobs:
         acceleration:
           [
             { engine: arrow, mode: memory },
-            { engine: duckdb, mode: memory },
+            { engine: cayenne, mode: memory },
             { engine: sqlite, mode: memory },
             { engine: postgres },
           ]

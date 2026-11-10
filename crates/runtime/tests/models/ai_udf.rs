@@ -42,10 +42,10 @@ async fn test_ai_udf_basic() -> Result<(), anyhow::Error> {
     test_request_context()
         .scope(async {
             // Verify API keys exist
-            verify_env_secret_exists("SPICE_OPENAI_API_KEY")
+            verify_env_secret_exists(crate::utils::openai_credential_secret())
                 .await
                 .map_err(anyhow::Error::msg)?;
-            verify_env_secret_exists("SPICE_ANTHROPIC_API_KEY")
+            verify_env_secret_exists(crate::utils::anthropic_credential_secret())
                 .await
                 .map_err(anyhow::Error::msg)?;
 
@@ -159,10 +159,10 @@ async fn test_ai_udf_with_dataset() -> Result<(), anyhow::Error> {
     test_request_context()
         .scope(async {
             // Verify API keys exist
-            verify_env_secret_exists("SPICE_OPENAI_API_KEY")
+            verify_env_secret_exists(crate::utils::openai_credential_secret())
                 .await
                 .map_err(anyhow::Error::msg)?;
-            verify_env_secret_exists("SPICE_ANTHROPIC_API_KEY")
+            verify_env_secret_exists(crate::utils::anthropic_credential_secret())
                 .await
                 .map_err(anyhow::Error::msg)?;
             verify_env_secret_exists("SPICE_XAI_API_KEY")
@@ -236,10 +236,10 @@ async fn test_ai_udf_left_truncate() -> Result<(), anyhow::Error> {
     test_request_context()
         .scope(async {
             // Verify API keys exist
-            verify_env_secret_exists("SPICE_OPENAI_API_KEY")
+            verify_env_secret_exists(crate::utils::openai_credential_secret())
                 .await
                 .map_err(anyhow::Error::msg)?;
-            verify_env_secret_exists("SPICE_ANTHROPIC_API_KEY")
+            verify_env_secret_exists(crate::utils::anthropic_credential_secret())
                 .await
                 .map_err(anyhow::Error::msg)?;
             verify_env_secret_exists("SPICE_XAI_API_KEY")

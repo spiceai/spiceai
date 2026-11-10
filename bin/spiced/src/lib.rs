@@ -17,6 +17,13 @@ limitations under the License.
 #![allow(clippy::missing_errors_doc)]
 #![recursion_limit = "256"]
 
+// Windows users run `spiced` under WSL or in Docker, and the Windows `spice` CLI
+// connects to it.
+#[cfg(windows)]
+compile_error!(
+    "spiced does not build for native Windows. Run it under WSL or in Docker. See: https://spiceai.org/docs/installation"
+);
+
 use std::collections::HashMap;
 use std::env;
 use std::net::SocketAddr;
@@ -51,7 +58,7 @@ use connector_databricks as _;
 use connector_delta_lake as _;
 #[cfg(feature = "dremio")]
 use connector_dremio as _;
-#[cfg(feature = "duckdb")]
+#[cfg(feature = "adbc")]
 use connector_duckdb as _;
 use connector_ducklake as _;
 #[cfg(feature = "dynamodb")]
@@ -101,16 +108,11 @@ use connector_spark as _;
 
 // Same force-linkage for accelerator engines, which self-register via
 // `register_data_accelerator!` into a linkme slice of their own.
-#[cfg(not(windows))]
 use accelerator_cayenne as _;
-#[cfg(feature = "duckdb")]
-use accelerator_duckdb as _;
 #[cfg(feature = "postgres-accel")]
 use accelerator_postgres as _;
 #[cfg(feature = "sqlite")]
 use accelerator_sqlite as _;
-#[cfg(feature = "turso")]
-use accelerator_turso as _;
 use connector_spiceai as _;
 // The llama.cpp engine registers itself for GGUF models through `llms::register_local_chat_engine!`.
 #[cfg(feature = "llamacpp")]
@@ -123,8 +125,8 @@ use otel_arrow::OtelArrowExporter;
 use podswatcher::PodsWatcher;
 use repl::ReplConfig;
 use runtime::cluster::ResolvedClusterConfig;
-use runtime::config::ClusterRole;
 use runtime::config::Config as RuntimeConfig;
+use runtime::config::{ClusterRole, Role};
 use runtime::datafusion::DataFusion;
 use runtime::spice_metrics;
 use runtime::{Runtime, auth::EndpointAuth, extension::ExtensionFactory};
@@ -633,11 +635,14 @@ pub fn install_cpu_budget(args: &Args, app: Option<&App>) -> Result<(), cpu_budg
         .and_then(|cpu| cpu.cores.as_ref())
         .map(ToString::to_string);
     let env_cores = cpu_budget::CpuConfig::env_cores();
-    let config = cpu_budget::CpuConfig::from_sources(
+    let mut config = cpu_budget::CpuConfig::from_sources(
         args.cpu_cores.as_deref(),
         env_cores.as_deref(),
         spicepod_cores.as_deref(),
     );
+    if args.runtime.cluster.effective_role() == Role::Sidecar {
+        config = config.for_sidecar();
+    }
 
     let budget = cpu_budget::CpuBudget::resolve(&config, &cpu_budget::HostReadings::detect())?;
     if let Err(err) = budget.install() {
@@ -647,7 +652,6 @@ pub fn install_cpu_budget(args: &Args, app: Option<&App>) -> Result<(), cpu_budg
     // lost to an earlier one, the summary and the Vortex declaration below must
     // still report the same numbers.
     cpu_budget::cpu_budget().log_summary();
-    #[cfg(not(windows))]
     declare_vortex_parallelism();
     Ok(())
 }
@@ -660,7 +664,6 @@ pub fn install_cpu_budget(args: &Args, app: Option<&App>) -> Result<(), cpu_budg
 /// effect. The declaration is first-write-wins on the Vortex side: a call
 /// arriving after anything read the parallelism fails, and the warning names
 /// the value that stayed in effect.
-#[cfg(not(windows))]
 fn declare_vortex_parallelism() {
     let Some(cores) = std::num::NonZeroUsize::new(cpu_budget::cpu_budget().vortex_parallelism())
     else {
@@ -712,6 +715,9 @@ pub async fn run(args: Args, app_bundle: AppBundle) -> Result<()> {
         extension_factories.push(Box::new(tpc_extension_factory));
     }
 
+    // A scheduler or executor: an explicit `--role`, or an executor implied by `--scheduler-address`.
+    let is_cluster_mode = args.runtime.cluster.cluster_role().is_some();
+
     let runtime_config = app.as_ref().map(|app| &app.runtime);
     let app_name = app.as_ref().map(|app| app.name.clone());
     let spicepod_tls_config = runtime_config.and_then(|rt| rt.tls.clone());
@@ -725,9 +731,7 @@ pub async fn run(args: Args, app_bundle: AppBundle) -> Result<()> {
     // A `SetOnce` lets `start_anonymous_telemetry` wait for the value.
     let telemetry_config: Arc<SetOnce<TelemetryConfig>> = Arc::new(SetOnce::new());
 
-    let is_executor = matches!(args.runtime.cluster.role, Some(ClusterRole::Executor))
-        || (args.runtime.cluster.role.is_none()
-            && args.runtime.cluster.scheduler_address.is_some());
+    let is_executor = args.runtime.cluster.effective_role() == Role::Executor;
 
     if !is_executor {
         // Resolve immediately from the local spicepod (or use default).
@@ -780,10 +784,6 @@ pub async fn run(args: Args, app_bundle: AppBundle) -> Result<()> {
         .with_runtime_config(args.runtime.clone())
         .with_rate_limits(rate_limits)
         .with_io_runtime(Handle::current());
-
-    // Check for explicit cluster role OR implicit executor role (scheduler_address set without explicit role)
-    let is_cluster_mode =
-        args.runtime.cluster.role.is_some() || args.runtime.cluster.scheduler_address.is_some();
 
     // Create MetricsReader for cluster mode to enable on-demand OTLP metrics collection
     let metrics_reader = if is_cluster_mode {
@@ -1136,9 +1136,6 @@ pub async fn run(args: Args, app_bundle: AppBundle) -> Result<()> {
         // same reason as the compaction metrics above (bind to the real Prometheus
         // meter, not the early noop one). Localizes *which* valve is stalling the CDC
         // apply path when ingest falls behind.
-        // Gated like the dependency itself: `accelerator-cayenne` is a
-        // `cfg(not(windows))` target dependency, so on Windows the crate does not exist.
-        #[cfg(not(windows))]
         accelerator_cayenne::register_cayenne_telemetry();
     }
 
@@ -1557,10 +1554,8 @@ pub async fn build_app(args: &Args) -> Result<AppBundle> {
     let cloud_connect_config_dir = cloud_connect_startup.config_dir().to_path_buf();
     let cloud_managed_state = cloud_connect_startup.identity_observed();
     let cloud_connect_identity = cloud_connect_startup.into_identity();
-    // Check for explicit executor role OR implicit executor role (scheduler_address set without explicit role)
-    let is_executor = matches!(args.runtime.cluster.role, Some(ClusterRole::Executor))
-        || (args.runtime.cluster.role.is_none()
-            && args.runtime.cluster.scheduler_address.is_some());
+    // An explicit `--role executor`, or one implied by `--scheduler-address`.
+    let is_executor = args.runtime.cluster.effective_role() == Role::Executor;
 
     if is_executor {
         // If a spicepod is explicitly provided, load just the runtime config (e.g. flight rate
@@ -1570,10 +1565,10 @@ pub async fn build_app(args: &Args) -> Result<AppBundle> {
             && let Ok(built_app) = AppBuilder::build_from_path(path.clone()).await
         {
             let mut app = App::default();
-            // Copy only runtime flight, telemetry, and CPU config from the
-            // spicepod. An executor is the deployment shape most likely to be
-            // running under a CPU request, so `runtime.cpu` must come across
-            // too — everything else it needs arrives from the scheduler.
+            // Retain local Flight, telemetry, and CPU config. An executor is the
+            // deployment shape most likely to be running under a CPU request, so
+            // `runtime.cpu` must come across too — everything else it needs
+            // arrives from the scheduler.
             app.runtime.flight = built_app.runtime.flight;
             app.runtime.telemetry = built_app.runtime.telemetry;
             app.runtime.cpu = built_app.runtime.cpu;
@@ -1590,8 +1585,10 @@ pub async fn build_app(args: &Args) -> Result<AppBundle> {
         tracing::info!(
             "Starting as a cluster executor, without a Spicepod. The runtime will initialize its components upon joining the cluster."
         );
+        let mut app = App::default();
+        app.runtime = apply_overrides(app.runtime, &args.set_runtime)?;
         return Ok(AppBundle {
-            app: Some(Arc::new(App::default())),
+            app: Some(Arc::new(app)),
             spicepod_load_error: None,
             running_deployment: None,
             deployment_note: None,
@@ -1986,6 +1983,7 @@ async fn start_anonymous_telemetry(
             spicepod_name.map_or_else(|| "unknown", String::as_str),
             telemetry_properties,
             cpu_budget::cpu_budget().configured_cores(),
+            env!("GIT_COMMIT_SHA"),
         )
         .await;
     }

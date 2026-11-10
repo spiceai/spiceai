@@ -29,8 +29,12 @@ permissions:
   packages: write
 jobs:
   build-binary:
+    environment: ci
     name: Build spidapter
     runs-on: spiceai-dev-runners
+    permissions:
+      contents: read
+      id-token: write  # RustFS credentials
     env:
       CARGO_TERM_COLOR: always
       CARGO_INCREMENTAL: 0
@@ -39,12 +43,21 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
+      - name: Get RustFS credentials
+        id: rustfs
+        uses: ./.github/actions/rustfs-credentials
+        with:
+          endpoint: ${{ vars.TEST_MINIO_ENDPOINT }}
+          duration-seconds: '21600'
+          export-env: 'false'
+
       - name: Install MinIO
         uses: ./.github/actions/setup-minio
         with:
-          minio_endpoint: ${{ secrets.TEST_MINIO_ENDPOINT }}
-          minio_access_key: ${{ secrets.TEST_MINIO_ACCESS_KEY }}
-          minio_secret_key: ${{ secrets.TEST_MINIO_SECRET_KEY }}
+          minio_endpoint: ${{ vars.TEST_MINIO_ENDPOINT }}
+          minio_access_key: ${{ steps.rustfs.outputs.access-key-id }}
+          minio_secret_key: ${{ steps.rustfs.outputs.secret-access-key }}
+          minio_session_token: ${{ steps.rustfs.outputs.session-token }}
 
       - name: Build spidapter
         uses: ./.github/actions/build-spidapter
@@ -53,9 +66,10 @@ jobs:
           upload_artifact: 'true'
           force_rebuild: 'true'
           download_from_minio: 'true'
-          minio_endpoint: ${{ secrets.TEST_MINIO_ENDPOINT }}
-          minio_access_key: ${{ secrets.TEST_MINIO_ACCESS_KEY }}
-          minio_secret_key: ${{ secrets.TEST_MINIO_SECRET_KEY }}
+          minio_endpoint: ${{ vars.TEST_MINIO_ENDPOINT }}
+          minio_access_key: ${{ steps.rustfs.outputs.access-key-id }}
+          minio_secret_key: ${{ steps.rustfs.outputs.secret-access-key }}
+          minio_session_token: ${{ steps.rustfs.outputs.session-token }}
 
       - name: Print version
         run: ./target/release/spidapter --version
@@ -64,6 +78,11 @@ jobs:
     name: Build Docker image
     needs: build-binary
     runs-on: ubuntu-24.04
+    environment: ci
+    permissions:
+      contents: read
+      packages: write
+      id-token: write
 
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -84,13 +103,15 @@ jobs:
         # Authenticate to Docker Hub before building so the base image pull
         # uses the authenticated rate limits instead of anonymous (per-IP) limits.
         if: github.repository == 'spiceai/spiceai'
-        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
+        uses: docker/login-action@8aa5831fb8d48d8f76594c7ddde61ae58019f550 # v4.8.0
+        env:
+          DOCKERHUB_OIDC_CONNECTIONID: ${{ vars.DOCKERHUB_OIDC_CONNECTIONID }}
+          DOCKERHUB_OIDC_EXPIREIN: '21600'
         with:
-          username: ${{ secrets.DOCKERHUB_USERNAME }}
-          password: ${{ secrets.DOCKERHUB_TOKEN }}
+          username: ${{ vars.DOCKERHUB_ORGANIZATION }}
 
       - name: Login to GitHub Container Registry
-        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
+        uses: docker/login-action@8aa5831fb8d48d8f76594c7ddde61ae58019f550 # v4.8.0
         with:
           registry: ghcr.io
           username: ${{ github.repository_owner }}

@@ -460,10 +460,6 @@ async fn symlink(target: &Path, link: &Path) -> io::Result<()> {
         {
             std::os::unix::fs::symlink(target, link)
         }
-        #[cfg(windows)]
-        {
-            std::os::windows::fs::symlink_file(target, link)
-        }
     })
     .await
     .map_err(io::Error::other)?
@@ -552,8 +548,6 @@ mod tests {
             let _ = std::fs::remove_file(&entry);
             #[cfg(unix)]
             std::os::unix::fs::symlink("../../blobs/gone", &entry).expect("a stale link");
-            #[cfg(windows)]
-            std::fs::write(&entry, b"stale").expect("a stale entry");
             let repairs = (0..8).map(|_| {
                 let (cache, repo, etag) = (cache.clone(), repo.clone(), etag.clone());
                 tokio::spawn(

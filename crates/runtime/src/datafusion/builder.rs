@@ -24,19 +24,19 @@ use super::{
     DataFusion, SPICE_DEFAULT_CATALOG, SPICE_DEFAULT_SCHEMA, SPICE_METADATA_SCHEMA,
     SPICE_RUNTIME_SCHEMA,
 };
-#[cfg(not(windows))]
 use crate::accelerated::AcceleratedTable;
 use crate::cluster::ExecutorRegistry;
 use crate::cluster::ResolvedClusterConfig;
-use crate::{config::ClusterRole, status};
+use crate::{
+    config::{ClusterRole, Role},
+    status,
+};
 use crate::{dataaccelerator::AcceleratorEngineRegistry, datafusion::SPICE_SCP_SCHEMA};
 use cache::Caching;
-#[cfg(not(windows))]
 use cayenne::optimizer_rules::{
     CayenneAntiJoinSortMergeRewriter, CayenneDynamicFilterSharing, CayenneJoinRewriter,
     CayenneMaintainedAggregateRewriter, CayenneOptimizerConfig, CayenneStatsAggregateRewriter,
 };
-#[cfg(not(windows))]
 use cayenne::{
     CayenneCteMaterialization, CayenneCteMaterializationPlanner, CayenneTableProvider,
     logical_optimizer::{
@@ -44,11 +44,8 @@ use cayenne::{
         CayennePushDownSemiJoin, CayenneReassociateCrossJoin,
     },
 };
-#[cfg(not(windows))]
 use data_accelerator_api::upsert_dedup::UpsertDedupTableProvider;
-#[cfg(not(windows))]
 use data_components::poly::PolyTableProvider;
-#[cfg(not(windows))]
 use datafusion::catalog::TableProvider;
 use datafusion::logical_expr::ScalarUDF;
 use datafusion::optimizer::{Optimizer, OptimizerRule};
@@ -69,17 +66,7 @@ use datafusion::{config::SpillCompression, physical_planner::ExtensionPlanner};
 use datafusion_federation::FederatedPlanner;
 use runtime_datafusion::analyzer_rule::{PartitionedTableScanRewrite, TablePartitionProvider};
 
-#[cfg(feature = "duckdb")]
-use {
-    datafusion_optimizer_rules::logical_plan::duckdb::aggregate_pushdown::DuckDBAggregateLogicalPushdown,
-    datafusion_optimizer_rules::logical_plan::duckdb::planner::DuckDBLogicalExtensionPlanner,
-    datafusion_optimizer_rules::physical_plan::duckdb::aggregate_pushdown::DuckDBAggregatePushdownRewriter,
-    datafusion_optimizer_rules::physical_plan::duckdb::intermediate_index_cte::DuckDBIntermediateIndexMaterializationOptimizer,
-};
-
 use crate::cluster::partition::service::PartitionService;
-#[cfg(feature = "duckdb")]
-use datafusion::physical_optimizer::PhysicalOptimizerRule;
 use datafusion::physical_optimizer::optimizer::PhysicalOptimizer;
 use datafusion_optimizer_rules::{
     logical_plan::{
@@ -92,7 +79,6 @@ use datafusion_optimizer_rules::{
         flightsql::broadcast_join::{ExecutorAddressProvider, FlightSQLBroadcastJoinPushdown},
     },
 };
-#[cfg(not(windows))]
 use runtime_datafusion::join_accumulator::clamp_maximum_shared_inlist_memory_bytes;
 use runtime_datafusion::optimizer_rule::RegexpMatchNullCheckRewrite;
 use runtime_datafusion::{
@@ -349,6 +335,7 @@ pub struct DataFusionBuilder {
     accelerator_engine_registry: Arc<AcceleratorEngineRegistry>,
     memory_limit: Option<u64>,
     target_partitions: Option<usize>,
+    role: Role,
     prefer_hash_join: Option<bool>,
     eager_aggregation: Option<bool>,
     eager_aggregation_min_reduction_factor: Option<usize>,
@@ -357,6 +344,7 @@ pub struct DataFusionBuilder {
     temp_directory: Option<String>,
     accelerated_refresh_semaphore: Option<Arc<Semaphore>>,
     query_admission_semaphore: Option<Arc<Semaphore>>,
+    query_admission_limit: Option<usize>,
     task_history_enabled: bool,
     query_error_logging: QueryErrorLogging,
     output_preview: OutputPreview,
@@ -399,13 +387,6 @@ pub struct DataFusionBuilder {
     /// without them — it would shrink the query pool for a tier cap that never
     /// installs.
     dedicated_thread_pools_enabled: bool,
-    /// Coordinated query-pool ceiling (bytes) when `DuckDB` file accelerators are
-    /// present, computed by the Runtime builder's cgroup-aware budget so the query
-    /// pool + each `DuckDB` instance's own `memory_limit` can't over-commit the
-    /// memory available to this process (the cgroup limit in a container).
-    /// Applied as a `min`-cap on the DEFAULT query pool only (an explicit
-    /// `runtime.query.memory_limit` still wins). `None` = no `DuckDB` coordination.
-    duckdb_query_pool_cap: Option<u64>,
     cayenne_optimizer_rules: CayenneOptimizerRules,
     /// Arbitrary additional analyzer rules.
     additional_analyzer_rules: Vec<Arc<dyn AnalyzerRule + Send + Sync>>,
@@ -482,6 +463,7 @@ impl DataFusionBuilder {
             accelerator_engine_registry,
             memory_limit: None,
             target_partitions: None,
+            role: Role::default(),
             prefer_hash_join: None,
             eager_aggregation: None,
             eager_aggregation_min_reduction_factor: None,
@@ -490,6 +472,7 @@ impl DataFusionBuilder {
             temp_directory: None,
             accelerated_refresh_semaphore: None,
             query_admission_semaphore: None,
+            query_admission_limit: None,
             task_history_enabled: true,
             query_error_logging: QueryErrorLogging::default(),
             output_preview: OutputPreview::Build,
@@ -511,7 +494,6 @@ impl DataFusionBuilder {
             cayenne_reservation_bytes: 0,
             cayenne_workload: runtime_acceleration::CayenneWorkload::default(),
             dedicated_thread_pools_enabled: true,
-            duckdb_query_pool_cap: None,
             cayenne_optimizer_rules: CayenneOptimizerRules::default(),
             additional_analyzer_rules: vec![],
             executor_registry: None,
@@ -591,6 +573,14 @@ impl DataFusionBuilder {
     #[must_use]
     pub fn target_partitions(mut self, target_partitions: Option<usize>) -> Self {
         self.target_partitions = target_partitions;
+        self
+    }
+
+    /// The `--role` this runtime started with, which selects the defaults for
+    /// settings the Spicepod leaves unset.
+    #[must_use]
+    pub fn role(mut self, role: Role) -> Self {
+        self.role = role;
         self
     }
 
@@ -683,6 +673,7 @@ impl DataFusionBuilder {
             }
         };
         self.query_admission_semaphore = permits.map(|n| Arc::new(Semaphore::new(n)));
+        self.query_admission_limit = permits;
         self
     }
 
@@ -759,19 +750,6 @@ impl DataFusionBuilder {
     #[must_use]
     pub fn dedicated_thread_pools_enabled(mut self, enabled: bool) -> Self {
         self.dedicated_thread_pools_enabled = enabled;
-        self
-    }
-
-    /// Coordinated query-pool ceiling (bytes) when `DuckDB` file accelerators are
-    /// present. Reduces ONLY the default query pool (via a `min`-cap in
-    /// [`effective_query_memory_limit`]) so the query pool + each `DuckDB` instance's
-    /// own `memory_limit` can't over-commit the memory available to this process
-    /// (the cgroup limit in a container). Set by the Runtime builder;
-    /// `None` disables the reduction and an explicit `runtime.query.memory_limit`
-    /// always wins.
-    #[must_use]
-    pub fn duckdb_query_pool_cap(mut self, cap: Option<u64>) -> Self {
-        self.duckdb_query_pool_cap = cap;
         self
     }
 
@@ -878,7 +856,6 @@ impl DataFusionBuilder {
             self.memory_limit,
             cayenne_cdc_active,
             self.cayenne_reservation_bytes,
-            self.duckdb_query_pool_cap,
         );
         let compaction_memory_bytes = compaction_memory_fraction.map(|fraction| {
             #[expect(
@@ -926,31 +903,22 @@ impl DataFusionBuilder {
         let query_memory_pool_bytes = effective_memory_limit;
         let mem_tier_budget_bytes = cayenne_cdc_active.then(|| {
             let total_memory = crate::resource_monitor::get_total_memory();
-            let external_reservation_bytes =
-                runtime_acceleration::memory_budget::duckdb_total_reservation_bytes();
             let budget = coordinated_mem_tier_budget(
                 total_memory,
                 query_memory_pool_bytes,
                 compaction_memory_bytes.unwrap_or(0),
-                external_reservation_bytes,
             );
             // The tier floor (available/32) can exceed the coordinated remainder when the
-            // query pool + compaction + external (DuckDB) reservations leave too
-            // little room; the clamp then installs `floor > remainder`, a deliberate
-            // small over-commit so a nonzero global cap always exists (memory mode
-            // then leans on per-table caps + spill). Warn whenever that binds —
-            // whether from an explicit runtime.query.memory_limit OR from a large
-            // co-resident DuckDB accelerator reservation (which can now trigger it
-            // even when runtime.query.memory_limit is unset).
-            if budget <= total_memory / MEM_TIER_FLOOR_FRACTION
-                && (self.memory_limit.is_some() || external_reservation_bytes > 0)
-            {
+            // query pool + compaction pool leave too little room; the clamp then installs
+            // `floor > remainder`, a deliberate small over-commit so a nonzero global cap
+            // always exists (memory mode then leans on per-table caps + spill). Only an
+            // explicit runtime.query.memory_limit can squeeze it that far.
+            if budget <= total_memory / MEM_TIER_FLOOR_FRACTION && self.memory_limit.is_some() {
                 tracing::warn!(
                     query_memory_pool_bytes,
                     total_memory,
-                    external_reservation_bytes,
                     mem_tier_budget_bytes = budget,
-                    "Cayenne in-memory CDC ingestion has limited memory available: the query pool, compaction pool, and co-resident DuckDB accelerator reservations leave little room for in-memory CDC, so ingestion spills to disk more often and combined memory ceilings may slightly exceed the memory available to this process (the cgroup limit when running in a container). Consider lowering runtime.query.memory_limit or per-dataset duckdb_memory_limit to give in-memory CDC more room."
+                    "Cayenne in-memory CDC ingestion has limited memory available: the query pool and compaction pool leave little room for in-memory CDC, so ingestion spills to disk more often and combined memory ceilings may slightly exceed the memory available to this process (the cgroup limit when running in a container). Consider lowering runtime.query.memory_limit to give in-memory CDC more room."
                 );
             }
             budget
@@ -988,7 +956,11 @@ impl DataFusionBuilder {
             // pod with a CPU request and no limit would fan every query out
             // across the whole node. Size from the CPU budget instead, which is
             // the same number wherever detection was already correct.
-            let target_partitions = cpu_budget::cpu_budget().target_partitions();
+            let budget = cpu_budget::cpu_budget();
+            let target_partitions = match self.role {
+                Role::Sidecar => budget.sidecar_target_partitions(),
+                Role::Server | Role::Scheduler | Role::Executor => budget.target_partitions(),
+            };
             config = config.with_target_partitions(target_partitions);
             tracing::info!(
                 target_partitions,
@@ -1058,15 +1030,12 @@ impl DataFusionBuilder {
         // the `exact_join_filter` rule is registered below.
         let exact_join_filter_memory_limit = exact_join_filter_memory_limit(effective_memory_limit);
 
-        #[cfg(not(windows))]
-        {
-            config = config.with_option_extension(cayenne_optimizer_config(
-                self.cayenne_sort_merge_min_rows,
-                self.cayenne_sort_merge_memory_pool_fraction,
-                effective_memory_limit,
-                exact_join_filter_memory_limit,
-            ));
-        }
+        config = config.with_option_extension(cayenne_optimizer_config(
+            self.cayenne_sort_merge_min_rows,
+            self.cayenne_sort_merge_memory_pool_fraction,
+            effective_memory_limit,
+            exact_join_filter_memory_limit,
+        ));
 
         let datafusion_ref = super::iceberg_ddl::new_shared_datafusion_ref();
 
@@ -1091,27 +1060,6 @@ impl DataFusionBuilder {
             ))
             .with_runtime_env(Arc::clone(&query_runtime_env));
 
-        #[cfg(feature = "duckdb")]
-        {
-            let mut physical_optimizers_with_duckdb: Vec<
-                Arc<dyn PhysicalOptimizerRule + Send + Sync>,
-            > = vec![
-                DuckDBAggregatePushdownRewriter::new(),
-                DuckDBIntermediateIndexMaterializationOptimizer::new(),
-            ];
-
-            physical_optimizers_with_duckdb.extend(
-                state
-                    .physical_optimizer_rules()
-                    .clone()
-                    .unwrap_or_else(|| PhysicalOptimizer::new().rules),
-            );
-
-            state = state
-                .with_optimizer_rule(DuckDBAggregateLogicalPushdown::new())
-                .with_physical_optimizer_rules(physical_optimizers_with_duckdb);
-        }
-
         state = state
             .with_physical_optimizer_rule(Arc::new(HttpParamsPushdown))
             .with_physical_optimizer_rule(Arc::new(EmptyHashJoinExecPhysicalOptimization {}))
@@ -1130,58 +1078,50 @@ impl DataFusionBuilder {
             self.cte_materialization,
         );
 
-        #[cfg(not(windows))]
-        {
-            // Cayenne is not built on Windows, so its physical optimizer rules
-            // are only configured for supported targets. By default the ordinary
-            // inner-join probe filter is handled by DataFusion 53's native
-            // hash-join dynamic-filter pushdown (no Cayenne-specific physical
-            // rule); the InList budget for it is sized in
-            // `configure_hash_join_memory_limits` above. The opt-in
-            // `CayenneJoinRewriter` below (gated on `exact_join_filter`) restores
-            // the forked exact in-list accumulator path on top of that default.
-            // Windows keeps DataFusion's standard hash-join dynamic filters.
-            if self.cayenne_optimizer_rules.dynamic_filter_sharing() {
-                state = state
-                    .with_physical_optimizer_rule(Arc::new(CayenneDynamicFilterSharing::new()));
-            }
-            if self.cayenne_optimizer_rules.maintained_aggregate() {
-                state = state.with_physical_optimizer_rule(Arc::new(
-                    CayenneMaintainedAggregateRewriter::new(),
-                ));
-            }
-            if self.cayenne_optimizer_rules.stats_aggregate() {
-                state = state
-                    .with_physical_optimizer_rule(Arc::new(CayenneStatsAggregateRewriter::new()));
-            }
-            if self.cayenne_optimizer_rules.anti_join_sort_merge() {
-                state = state.with_physical_optimizer_rule(Arc::new(
-                    CayenneAntiJoinSortMergeRewriter::new(),
-                ));
-            }
-            // Opt-in: restores the forked exact in-list join accumulator seam
-            // (`ExactLeftAccumulator`). Off by default — the default path uses
-            // DataFusion 53's native hash-join dynamic-filter pushdown sized by
-            // `configure_hash_join_memory_limits` above. When enabled, clamp the
-            // process-wide shared in-list reservation and register the rewriter
-            // after the sort-merge rewrite so it only touches remaining
-            // `HashJoinExec` nodes.
-            if self.cayenne_optimizer_rules.exact_join_filter() {
-                clamp_maximum_shared_inlist_memory_bytes(exact_join_filter_memory_limit);
-                state = state.with_physical_optimizer_rule(Arc::new(CayenneJoinRewriter::new()));
-            } else {
-                let _ = exact_join_filter_memory_limit;
-            }
+        // By default the ordinary inner-join probe filter is handled by
+        // DataFusion 53's native hash-join dynamic-filter pushdown (no
+        // Cayenne-specific physical rule); the InList budget for it is sized
+        // in `configure_hash_join_memory_limits` above. The opt-in
+        // `CayenneJoinRewriter` below (gated on `exact_join_filter`) restores
+        // the forked exact in-list accumulator path on top of that default.
+        if self.cayenne_optimizer_rules.dynamic_filter_sharing() {
+            state =
+                state.with_physical_optimizer_rule(Arc::new(CayenneDynamicFilterSharing::new()));
         }
-        #[cfg(windows)]
-        let _ = exact_join_filter_memory_limit;
+        if self.cayenne_optimizer_rules.maintained_aggregate() {
+            state = state
+                .with_physical_optimizer_rule(Arc::new(CayenneMaintainedAggregateRewriter::new()));
+        }
+        if self.cayenne_optimizer_rules.stats_aggregate() {
+            state =
+                state.with_physical_optimizer_rule(Arc::new(CayenneStatsAggregateRewriter::new()));
+        }
+        if self.cayenne_optimizer_rules.anti_join_sort_merge() {
+            state = state
+                .with_physical_optimizer_rule(Arc::new(CayenneAntiJoinSortMergeRewriter::new()));
+        }
+        // Opt-in: restores the forked exact in-list join accumulator seam
+        // (`ExactLeftAccumulator`). Off by default — the default path uses
+        // DataFusion 53's native hash-join dynamic-filter pushdown sized by
+        // `configure_hash_join_memory_limits` above. When enabled, clamp the
+        // process-wide shared in-list reservation and register the rewriter
+        // after the sort-merge rewrite so it only touches remaining
+        // `HashJoinExec` nodes.
+        if self.cayenne_optimizer_rules.exact_join_filter() {
+            clamp_maximum_shared_inlist_memory_bytes(exact_join_filter_memory_limit);
+            state = state.with_physical_optimizer_rule(Arc::new(CayenneJoinRewriter::new()));
+        } else {
+            let _ = exact_join_filter_memory_limit;
+        }
 
         state = state.with_physical_optimizer_rule(Arc::new(BytesProcessedPhysicalOptimizer::new(
             Arc::new(Box::new(track_bytes_processed)),
         )));
 
         if matches!(
-            self.cluster_config.as_ref().and_then(|cfg| cfg.role()),
+            self.cluster_config
+                .as_ref()
+                .and_then(|cfg| cfg.effective_role()),
             Some(ClusterRole::Scheduler)
         ) {
             // Pushes partial aggregates into per-executor Flight SQL. Checked
@@ -1410,24 +1350,15 @@ impl DataFusionBuilder {
                 )));
 
                 // Distributed Cayenne DDL analyzer rule.
-                #[cfg(not(windows))]
-                {
-                    Some(
-                        Arc::new(super::cayenne_ddl::DistributedCayenneDdlHandler::new(
-                            Arc::clone(executor_registry),
-                        )) as Arc<dyn datafusion_ddl::CatalogDdlHandler>,
-                    )
-                }
-                #[cfg(windows)]
-                None
+                Some(
+                    Arc::new(super::cayenne_ddl::DistributedCayenneDdlHandler::new(
+                        Arc::clone(executor_registry),
+                    )) as Arc<dyn datafusion_ddl::CatalogDdlHandler>,
+                )
             } else {
                 // Single node spice uses default [`cayenne::CayenneDdlHandler`].
-                if cfg!(windows) {
-                    None
-                } else {
-                    Some(Arc::new(cayenne::CayenneDdlHandler {})
-                        as Arc<dyn datafusion_ddl::CatalogDdlHandler>)
-                }
+                Some(Arc::new(cayenne::CayenneDdlHandler {})
+                    as Arc<dyn datafusion_ddl::CatalogDdlHandler>)
             };
 
         if let Some(ref cayenne_ddl_handler) = cayenne_ddl_handler {
@@ -1512,6 +1443,7 @@ impl DataFusionBuilder {
             accelerator_engine_registry: self.accelerator_engine_registry,
             acceleration_refresh_semaphore: self.accelerated_refresh_semaphore,
             query_admission_semaphore: self.query_admission_semaphore,
+            query_admission_limit: self.query_admission_limit,
             task_history_enabled: self.task_history_enabled,
             query_error_logging: self.query_error_logging,
             task_history_captured_output: self.output_preview == OutputPreview::Build,
@@ -1522,6 +1454,7 @@ impl DataFusionBuilder {
             cdc_apply_runtime: OnceLock::new(),
             compaction_runtime: OnceLock::new(),
             compaction_runtime_env,
+            internal_table_ctx: OnceLock::new(),
             compaction_memory_bytes,
             query_memory_pool_bytes,
             mem_tier_budget_bytes,
@@ -1531,12 +1464,12 @@ impl DataFusionBuilder {
             metrics: self.metrics,
             resource_monitor: self.resource_monitor,
             cluster_config: self.cluster_config.unwrap_or_default(),
+            role: self.role,
             scheduler_server: RwLock::new(None),
             executor: RwLock::new(None),
             executor_stream_registry: RwLock::new(None),
             partition_service: self.partition_service,
             partition_load_tracker: self.partition_load_tracker,
-            #[cfg(not(windows))]
             cayenne_ddl_handler,
         }
     }
@@ -1554,31 +1487,23 @@ fn with_spice_logical_optimizers(
         .map_or_else(|| Optimizer::new().rules, |optimizer| optimizer.rules);
 
     insert_regexp_match_null_check_rewrite(&mut optimizer_rules);
-    #[cfg(not(windows))]
-    {
-        if cte_materialization.is_auto() {
-            insert_cayenne_cte_materialization(&mut optimizer_rules);
-        }
-        if cayenne_optimizer_rules.filter_propagation() {
-            insert_cayenne_filter_propagation_rule(&mut optimizer_rules);
-        }
-        if cayenne_optimizer_rules.cross_join_reassociation() {
-            insert_cayenne_cross_join_reassociation_rule(&mut optimizer_rules);
-        }
-        if cayenne_optimizer_rules.inlist_to_range() {
-            insert_cayenne_inlist_to_range_rewrite(&mut optimizer_rules);
-        }
-        if cayenne_optimizer_rules.semi_join_pushdown() {
-            insert_cayenne_push_down_semi_join(&mut optimizer_rules);
-        }
-        if cayenne_optimizer_rules.join_reorder() {
-            insert_cayenne_join_reorder_rule(&mut optimizer_rules);
-        }
+    if cte_materialization.is_auto() {
+        insert_cayenne_cte_materialization(&mut optimizer_rules);
     }
-    #[cfg(windows)]
-    {
-        let _ = cayenne_optimizer_rules;
-        let _ = cte_materialization;
+    if cayenne_optimizer_rules.filter_propagation() {
+        insert_cayenne_filter_propagation_rule(&mut optimizer_rules);
+    }
+    if cayenne_optimizer_rules.cross_join_reassociation() {
+        insert_cayenne_cross_join_reassociation_rule(&mut optimizer_rules);
+    }
+    if cayenne_optimizer_rules.inlist_to_range() {
+        insert_cayenne_inlist_to_range_rewrite(&mut optimizer_rules);
+    }
+    if cayenne_optimizer_rules.semi_join_pushdown() {
+        insert_cayenne_push_down_semi_join(&mut optimizer_rules);
+    }
+    if cayenne_optimizer_rules.join_reorder() {
+        insert_cayenne_join_reorder_rule(&mut optimizer_rules);
     }
     runtime_datafusion::checked_arithmetic::install_checked_single_distinct(&mut optimizer_rules);
     optimizer_rules.extend(trailing_rules);
@@ -1587,7 +1512,6 @@ fn with_spice_logical_optimizers(
     state.with_optimizer_rules(runtime_decide::guard_async_calls(optimizer_rules))
 }
 
-#[cfg(not(windows))]
 fn insert_cayenne_cte_materialization(rules: &mut Vec<Arc<dyn OptimizerRule + Send + Sync>>) {
     // Run first so the two inlined CTE copies are still identical, before
     // projection/filter pushdown specializes each reference.
@@ -1623,7 +1547,6 @@ fn insert_regexp_match_null_check_rewrite(rules: &mut Vec<Arc<dyn OptimizerRule 
     }
 }
 
-#[cfg(not(windows))]
 fn insert_cayenne_filter_propagation_rule(rules: &mut Vec<Arc<dyn OptimizerRule + Send + Sync>>) {
     if !rules
         .iter()
@@ -1649,7 +1572,6 @@ fn insert_cayenne_filter_propagation_rule(rules: &mut Vec<Arc<dyn OptimizerRule 
     }
 }
 
-#[cfg(not(windows))]
 fn insert_cayenne_cross_join_reassociation_rule(
     rules: &mut Vec<Arc<dyn OptimizerRule + Send + Sync>>,
 ) {
@@ -1683,7 +1605,6 @@ fn insert_cayenne_cross_join_reassociation_rule(
     }
 }
 
-#[cfg(not(windows))]
 fn insert_cayenne_inlist_to_range_rewrite(rules: &mut Vec<Arc<dyn OptimizerRule + Send + Sync>>) {
     // Run the IN-list → BETWEEN rewrite ahead of `simplify_expressions` so the
     // downstream simplifier can fold the resulting `Expr::Between` the same way
@@ -1707,7 +1628,6 @@ fn insert_cayenne_inlist_to_range_rewrite(rules: &mut Vec<Arc<dyn OptimizerRule 
     }
 }
 
-#[cfg(not(windows))]
 fn insert_cayenne_push_down_semi_join(rules: &mut Vec<Arc<dyn OptimizerRule + Send + Sync>>) {
     // Run after `decorrelate_predicate_subquery` has turned `col IN (subquery)`
     // into the `LeftSemi` join this rule pushes down, and before `push_down_filter`
@@ -1737,7 +1657,6 @@ fn insert_cayenne_push_down_semi_join(rules: &mut Vec<Arc<dyn OptimizerRule + Se
     }
 }
 
-#[cfg(not(windows))]
 fn insert_cayenne_join_reorder_rule(rules: &mut Vec<Arc<dyn OptimizerRule + Send + Sync>>) {
     // Cost-based left-deep join reordering (IK84). It must run *after* the
     // inner-join graph is fully formed AND base-table predicates are pushed to
@@ -1760,7 +1679,6 @@ fn insert_cayenne_join_reorder_rule(rules: &mut Vec<Arc<dyn OptimizerRule + Send
     }
 }
 
-#[cfg(not(windows))]
 fn is_cayenne_accelerated_table_provider(provider: &dyn TableProvider) -> bool {
     if is_cayenne_table_provider(provider) {
         return true;
@@ -1770,7 +1688,6 @@ fn is_cayenne_accelerated_table_provider(provider: &dyn TableProvider) -> bool {
         .is_some_and(|table| is_cayenne_table_provider(table.get_accelerator().as_ref()))
 }
 
-#[cfg(not(windows))]
 fn is_cayenne_table_provider(provider: &dyn TableProvider) -> bool {
     if provider.is::<CayenneTableProvider>() || has_cayenne_accelerator_metadata(provider) {
         return true;
@@ -1790,7 +1707,6 @@ fn is_cayenne_table_provider(provider: &dyn TableProvider) -> bool {
     false
 }
 
-#[cfg(not(windows))]
 fn has_cayenne_accelerator_metadata(provider: &dyn TableProvider) -> bool {
     provider
         .schema()
@@ -1828,7 +1744,6 @@ pub(crate) fn effective_query_memory_limit(
     memory_limit: Option<u64>,
     cayenne_cdc_active: bool,
     cayenne_reservation_bytes: u64,
-    duckdb_query_pool_cap: Option<u64>,
 ) -> u64 {
     if let Some(limit) = memory_limit {
         // An explicit limit bypasses the reservation-aware derivation below, and
@@ -1847,7 +1762,7 @@ pub(crate) fn effective_query_memory_limit(
     } else {
         let total_memory = crate::resource_monitor::get_total_memory();
         let floor = total_memory.saturating_mul(CAYENNE_QUERY_MEMORY_FLOOR_PERCENT) / 100;
-        let default_limit = if cayenne_cdc_active {
+        if cayenne_cdc_active {
             // Cayenne CDC active. Base is CAYENNE_QUERY_MEMORY_PERCENT of host, leaving
             // room for the off-pool in-memory tier (clamped to <= host/5 by
             // `coordinated_mem_tier_budget`) plus a host/10 headroom for the off-pool
@@ -1916,27 +1831,6 @@ pub(crate) fn effective_query_memory_limit(
                 util::human_readable_bytes(default_limit as usize)
             );
             default_limit
-        };
-
-        // Coordinated DuckDB cap: when DuckDB file accelerators are present the
-        // Runtime builder computes a reduced query-pool ceiling (see
-        // `runtime_acceleration::memory_budget`) that leaves room for each DuckDB instance's
-        // own `memory_limit`, so the query pool + DuckDB ceilings can't over-commit
-        // host RAM. It only ever LOWERS the default (an explicit
-        // `runtime.query.memory_limit` short-circuits above and is never reduced).
-        match duckdb_query_pool_cap {
-            Some(cap) => {
-                let capped = default_limit.min(cap);
-                if capped < default_limit {
-                    tracing::debug!(
-                        default_query_memory_bytes = default_limit,
-                        coordinated_query_memory_bytes = capped,
-                        "Query memory pool reduced below its default by the coordinated DuckDB accelerator budget, leaving room for each DuckDB instance's own memory_limit."
-                    );
-                }
-                capped
-            }
-            None => default_limit,
         }
     }
 }
@@ -1972,17 +1866,15 @@ pub(crate) const MEM_TIER_FLOOR_FRACTION: u64 = 32;
 /// The query pool, carved compaction pool, and this tier are otherwise each
 /// derived from total RAM IN ISOLATION (`builder.rs` query pool, compaction carve,
 /// and `mod.rs` `get_total_memory()/4`) and sum to >100% of host. Sizing the tier
-/// as the host RAM left AFTER the query pool, the compaction pool, any memory
-/// reserved outside both by another subsystem (`external_reservation_bytes` — today
-/// a co-resident `DuckDB` accelerator's ceiling), and a headroom reserve is the missing
-/// cross-subsystem coordination. For the coordinated default inputs — a query pool
+/// as the host RAM left AFTER the query pool, the compaction pool, and a headroom
+/// reserve is the missing cross-subsystem coordination. For the coordinated default inputs — a query pool
 /// sized to leave room (see [`effective_query_memory_limit`]) — it yields
-/// `query_pool + compaction + external + tier + headroom ≤ host`. While that
+/// `query_pool + compaction + tier + headroom ≤ host`. While that
 /// remainder reaches the `host/32` floor the result is clamped to `[host/32, host/5]`:
 /// the `host/5` ceiling keeps the tier ≤ 1/5 of host when the pools are small.
 ///
-/// A greedy explicit `runtime.query.memory_limit`, or a large external reservation,
-/// can leave a remainder BELOW the floor. The tier then yields to the remainder rather
+/// A greedy explicit `runtime.query.memory_limit` can leave a remainder BELOW the
+/// floor. The tier then yields to the remainder rather
 /// than clamping up to a floor that would overcommit the host — down to a 1-byte
 /// refuse-all gate, since a 0 budget would uninstall the global aggregate cap entirely
 /// (see [`MEM_TIER_FLOOR_FRACTION`]). So the inequality above holds exactly, except for
@@ -1993,34 +1885,24 @@ pub(crate) fn coordinated_mem_tier_budget(
     total_memory: u64,
     query_pool_bytes: u64,
     compaction_pool_bytes: u64,
-    external_reservation_bytes: u64,
 ) -> u64 {
     let headroom = total_memory / MEM_TIER_HEADROOM_FRACTION;
     let base_ceiling = total_memory / MEM_TIER_CEILING_FRACTION;
     let floor = (total_memory / MEM_TIER_FLOOR_FRACTION).min(base_ceiling);
-    // Memory reserved OUTSIDE the query and compaction pools by other subsystems —
-    // today a co-resident DuckDB accelerator's aggregate ceiling (see
-    // `runtime_acceleration::memory_budget`), and any future external consumer — carved from
-    // the same host RAM by the coordinated budget. Subtract it here so the tier,
-    // and especially its query-light float below, can't reclaim room already
-    // reserved elsewhere. `0` when nothing external is reserved.
     let remainder = total_memory
         .saturating_sub(query_pool_bytes)
         .saturating_sub(compaction_pool_bytes)
-        .saturating_sub(external_reservation_bytes)
         .saturating_sub(headroom);
-    // Floating ceiling for query-light deployments: when the query + compaction
-    // pools are sized well below the default partition (an operator who set a low
-    // `runtime.query.memory_limit`), let the tier reclaim part of the freed RAM
-    // above the base host/5 cap — up to `host / MEM_TIER_FLOAT_CEILING_FRACTION` —
-    // but only the room left beyond a DOUBLED headroom reserve, so the off-pool
-    // caches/memtables the single headroom covers keep their slack. `float_room`
-    // subtracts the external reservation just like `remainder`, so the float can
-    // never reclaim externally-reserved RAM. Raising only the ceiling never lifts
+    // Floating ceiling for query-light deployments: when the query + compaction pools
+    // are sized well below the default partition (an operator who set a low
+    // `runtime.query.memory_limit`), let the tier reclaim part of the freed RAM above
+    // the base host/5 cap — up to `host / MEM_TIER_FLOAT_CEILING_FRACTION` — but only
+    // the room left beyond a DOUBLED headroom reserve, so the off-pool caches/memtables
+    // the single headroom covers keep their slack. Raising only the ceiling never lifts
     // the result above `remainder` (the ceiling caps from above, and `remainder` is
-    // computed with the single headroom), so the floating ceiling preserves the
-    // #11449 no-overcommit invariant `query_pool + compaction + external + tier +
-    // headroom <= host` for ANY ceiling.
+    // computed with the single headroom), so the floating ceiling preserves the #11449
+    // no-overcommit invariant `query_pool + compaction + tier + headroom <= host` for
+    // ANY ceiling.
     //
     // Honesty under a tight explicit `runtime.query.memory_limit`: when the remainder
     // is below the floor, yield to the remainder instead of clamping up to a floor
@@ -2037,13 +1919,11 @@ pub(crate) fn coordinated_mem_tier_budget(
     let float_room = total_memory
         .saturating_sub(query_pool_bytes)
         .saturating_sub(compaction_pool_bytes)
-        .saturating_sub(external_reservation_bytes)
         .saturating_sub(2 * headroom);
     let ceiling = base_ceiling.max(float_room.min(total_memory / MEM_TIER_FLOAT_CEILING_FRACTION));
     remainder.clamp(floor, ceiling)
 }
 
-#[cfg(not(windows))]
 fn cayenne_optimizer_config(
     sort_merge_min_rows: Option<usize>,
     sort_merge_memory_pool_fraction: Option<f64>,
@@ -2232,9 +2112,6 @@ pub(crate) fn default_extension_planners(
         Arc::new(datafusion_ddl::DdlExtensionPlanner),
         // One stateless DML planner handles all DmlExtensionNodes from any handler.
         Arc::new(datafusion_dml::DmlExtensionPlanner),
-        #[cfg(feature = "duckdb")]
-        DuckDBLogicalExtensionPlanner::new(),
-        #[cfg(not(windows))]
         Arc::new(CayenneCteMaterializationPlanner),
     ];
     planners
@@ -2498,32 +2375,20 @@ fn decide_spark_collision(
 
 #[cfg(test)]
 mod tests {
-    #[cfg(not(windows))]
     use arrow::datatypes::{DataType, Field, Schema};
-    #[cfg(not(windows))]
     use cayenne::logical_optimizer::PROPAGATED_FILTER_ALIAS_PREFIX;
-    #[cfg(not(windows))]
     use cayenne::optimizer_rules::CayenneOptimizerConfig;
-    #[cfg(not(windows))]
     use datafusion::catalog::{MemTable, TableProvider};
-    #[cfg(not(windows))]
     use datafusion::common::ScalarValue;
-    #[cfg(not(windows))]
     use datafusion::common::stats::Precision;
-    #[cfg(not(windows))]
     use datafusion::common::tree_node::{TreeNode, TreeNodeRecursion};
-    #[cfg(not(windows))]
     use datafusion::execution::SessionStateBuilder;
     use datafusion::execution::object_store::ObjectStoreRegistry;
-    #[cfg(not(windows))]
     use datafusion::logical_expr::Operator;
     use datafusion::optimizer::Analyzer;
-    #[cfg(not(windows))]
     use datafusion::prelude::SessionContext;
-    #[cfg(not(windows))]
     use datafusion_expr::{Expr, LogicalPlan};
 
-    #[cfg(not(windows))]
     use super::CteMaterialization;
     use super::{
         CAYENNE_QUERY_MEMORY_FLOOR_PERCENT, CAYENNE_QUERY_MEMORY_PERCENT, CayenneOptimizerRules,
@@ -2534,17 +2399,14 @@ mod tests {
         runtime_env_with_effective_memory_limit_and_object_store_registry,
         validate_compaction_memory_fraction,
     };
-    #[cfg(not(windows))]
     use super::{
         SPARK_AGGREGATE_COLLISIONS, SPARK_SCALAR_COLLISIONS, SPARK_SCALAR_NAMES_LENT_TO_BUILT_IN,
         SPARK_WINDOW_COLLISIONS, names_already_registered,
     };
     use crate::dataaccelerator::AcceleratorEngineRegistry;
-    #[cfg(not(windows))]
     use data_components::poly::PolyTableProvider;
     use runtime_object_store::registry::SpiceObjectStoreRegistry;
     use runtime_status as status;
-    #[cfg(not(windows))]
     use std::collections::HashMap;
     use std::sync::Arc;
 
@@ -2574,7 +2436,6 @@ mod tests {
     /// `json_as_text` cannot be federated to `BigQuery` at all: no `BigQuery`
     /// function returns a container node's *original* bytes — `JSON_QUERY`
     /// re-renders it — so there is no faithful rendering to push down.
-    #[cfg(not(windows))]
     #[tokio::test]
     async fn json_extraction_keeps_the_semantics_the_pushdown_guidance_assumes() {
         let mut state = SessionStateBuilder::new().with_default_features().build();
@@ -2647,7 +2508,6 @@ mod tests {
     ///
     /// Losing the rewrite would not fail a query; it would quietly stop the cast
     /// form from federating, which is the whole point of recommending it.
-    #[cfg(not(windows))]
     #[tokio::test]
     async fn a_cast_of_json_get_becomes_the_typed_accessor_that_federates() {
         let mut state = SessionStateBuilder::new().with_default_features().build();
@@ -2691,23 +2551,15 @@ mod tests {
     #[test]
     fn effective_query_memory_limit_honors_explicit_value() {
         assert_eq!(
-            effective_query_memory_limit(Some(123 << 30), true, 0, None),
+            effective_query_memory_limit(Some(123 << 30), true, 0),
             123 << 30
         );
         assert_eq!(
-            effective_query_memory_limit(Some(123 << 30), false, 0, None),
+            effective_query_memory_limit(Some(123 << 30), false, 0),
             123 << 30
         );
         // A nonzero CDC reservation never overrides an explicit limit.
-        assert_eq!(
-            effective_query_memory_limit(Some(7), true, 1 << 30, None),
-            7
-        );
-        // Nor does a DuckDB query-pool cap override an explicit limit.
-        assert_eq!(
-            effective_query_memory_limit(Some(123 << 30), false, 0, Some(1 << 30)),
-            123 << 30
-        );
+        assert_eq!(effective_query_memory_limit(Some(7), true, 1 << 30), 7);
     }
 
     /// Cayenne active, no explicit limit: a per-table CDC reservation at/under the
@@ -2723,28 +2575,25 @@ mod tests {
         let floor = total.saturating_mul(CAYENNE_QUERY_MEMORY_FLOOR_PERCENT) / 100;
 
         // Reservation within the base headroom -> no reduction, stays at base 70%.
-        assert_eq!(effective_query_memory_limit(None, true, 0, None), base);
-        assert_eq!(
-            effective_query_memory_limit(None, true, headroom, None),
-            base
-        );
+        assert_eq!(effective_query_memory_limit(None, true, 0), base);
+        assert_eq!(effective_query_memory_limit(None, true, headroom), base);
 
         // Reservation above the headroom -> reduced by exactly the excess.
         let excess = headroom / 2;
         assert_eq!(
-            effective_query_memory_limit(None, true, headroom + excess, None),
+            effective_query_memory_limit(None, true, headroom + excess),
             base - excess
         );
 
         // A reservation larger than the whole host floors the pool, never 0.
-        let floored = effective_query_memory_limit(None, true, total.saturating_mul(2), None);
+        let floored = effective_query_memory_limit(None, true, total.saturating_mul(2));
         assert_eq!(floored, floor);
         assert!(floored > 0);
 
         // A pod with no Cayenne acceleration reports a zero reservation and keeps
         // the standard default untouched.
         assert_eq!(
-            effective_query_memory_limit(None, false, 0, None),
+            effective_query_memory_limit(None, false, 0),
             total.saturating_mul(DEFAULT_QUERY_MEMORY_PERCENT) / 100
         );
 
@@ -2755,35 +2604,21 @@ mod tests {
         let bulk_base = total.saturating_mul(DEFAULT_QUERY_MEMORY_PERCENT) / 100;
         let bulk_reservation = total / 50;
         assert_eq!(
-            effective_query_memory_limit(None, false, bulk_reservation, None),
+            effective_query_memory_limit(None, false, bulk_reservation),
             bulk_base - bulk_reservation,
             "a bulk-only Cayenne pod subtracts its whole cache reservation"
         );
         assert!(
-            effective_query_memory_limit(None, false, bulk_reservation, None)
-                > effective_query_memory_limit(None, true, bulk_reservation, None),
+            effective_query_memory_limit(None, false, bulk_reservation)
+                > effective_query_memory_limit(None, true, bulk_reservation),
             "bulk-only must leave queries strictly more memory than the CDC partition"
         );
 
         // ...and is floored identically, so a pathological cache config cannot
         // starve queries on either branch.
         assert_eq!(
-            effective_query_memory_limit(None, false, total.saturating_mul(2), None),
+            effective_query_memory_limit(None, false, total.saturating_mul(2)),
             floor
-        );
-
-        // A DuckDB query-pool cap lowers (never raises) the default query pool.
-        let non_cayenne_default = total.saturating_mul(DEFAULT_QUERY_MEMORY_PERCENT) / 100;
-        let half = non_cayenne_default / 2;
-        assert_eq!(
-            effective_query_memory_limit(None, false, 0, Some(half)),
-            half,
-            "a smaller cap reduces the default"
-        );
-        assert_eq!(
-            effective_query_memory_limit(None, false, 0, Some(non_cayenne_default * 2)),
-            non_cayenne_default,
-            "a larger cap never raises the default"
         );
     }
 
@@ -2828,7 +2663,7 @@ mod tests {
                 let pre_carve = total.saturating_mul(CAYENNE_QUERY_MEMORY_PERCENT) / 100;
                 let compaction = pre_carve.saturating_mul(compaction_pct) / 100;
                 let query_pool = pre_carve.saturating_sub(compaction);
-                let tier = coordinated_mem_tier_budget(total, query_pool, compaction, 0);
+                let tier = coordinated_mem_tier_budget(total, query_pool, compaction);
                 let headroom = total / MEM_TIER_HEADROOM_FRACTION;
                 let sum = query_pool + compaction + tier + headroom;
                 assert!(
@@ -2855,7 +2690,7 @@ mod tests {
 
             // A tiny query pool (query-light) → the tier floats up to the raised
             // ceiling to use the spare RAM, never above it.
-            let big = coordinated_mem_tier_budget(total, total / 100, 0, 0);
+            let big = coordinated_mem_tier_budget(total, total / 100, 0);
             assert_eq!(
                 big, float_ceiling,
                 "a query-light deployment floats the tier to the raised ceiling"
@@ -2871,7 +2706,7 @@ mod tests {
             // BASE ceiling (the float only helps when the pool is sized down) and
             // at/above the floor (remainder still allows the lower clamp).
             let pre_carve = total.saturating_mul(CAYENNE_QUERY_MEMORY_PERCENT) / 100;
-            let moderate = coordinated_mem_tier_budget(total, pre_carve, 0, 0);
+            let moderate = coordinated_mem_tier_budget(total, pre_carve, 0);
             assert!(
                 moderate <= base_ceiling,
                 "the default partition does not float above the base ceiling"
@@ -2887,7 +2722,7 @@ mod tests {
             // global cap is never disabled (try_reserve fails → spill). The
             // meaningful claim here is the refuse-all gate, not "no host
             // overcommit" via the floor — the pool already consumes `total`.
-            let small = coordinated_mem_tier_budget(total, total, 0, 0);
+            let small = coordinated_mem_tier_budget(total, total, 0);
             assert_eq!(
                 small, 1,
                 "a greedy pool installs a 1-byte refuse-all gate rather than the host/32 floor"
@@ -2896,33 +2731,6 @@ mod tests {
             assert!(
                 small < floor,
                 "a greedy pool yields BELOW the floor rather than clamping up to it (floor={floor}, small={small})"
-            );
-        }
-    }
-
-    /// A non-zero external (`DuckDB`) reservation is subtracted from BOTH the tier
-    /// remainder and its query-light float, so the tier can only shrink — it can't
-    /// reclaim externally-reserved memory — and `query + external + tier + headroom`
-    /// never exceeds host RAM.
-    #[test]
-    fn coordinated_tier_budget_reserves_external_bytes() {
-        for gib in [16_u64, 64, 256, 1024] {
-            let total = gib << 30;
-            let headroom = total / MEM_TIER_HEADROOM_FRACTION;
-            let query_pool = total / 10; // query-light: the tier would otherwise float up
-            let external = total / 2; // a sizeable co-resident DuckDB reservation
-
-            let with_ext = coordinated_mem_tier_budget(total, query_pool, 0, external);
-            let no_ext = coordinated_mem_tier_budget(total, query_pool, 0, 0);
-
-            assert!(
-                with_ext <= no_ext,
-                "gib={gib}: an external reservation must never grow the tier"
-            );
-            let sum = query_pool + external + with_ext + headroom;
-            assert!(
-                sum <= total,
-                "gib={gib}: overcommit — query={query_pool} external={external} tier={with_ext} headroom={headroom} sum={sum} > total={total}"
             );
         }
     }
@@ -3060,7 +2868,6 @@ mod tests {
     /// loop's skip: a test that registers its own functions would still pass
     /// with the skip deleted.
     #[tokio::test]
-    #[cfg(not(windows))]
     async fn the_built_session_keeps_the_built_in_date_trunc() {
         let df = DataFusionBuilder::new(
             status::RuntimeStatus::new(),
@@ -3122,7 +2929,6 @@ mod tests {
     /// documented spelling — did not plan at all; only
     /// `factorial(CAST(5 AS INT))` did (regression test for #14361).
     #[tokio::test]
-    #[cfg(not(windows))]
     async fn the_built_session_keeps_the_built_in_factorial() {
         let df = DataFusionBuilder::new(
             status::RuntimeStatus::new(),
@@ -3157,7 +2963,6 @@ mod tests {
     /// `ceiling(1.5)` answers the built-in's `Float64`. (`len` is not lent:
     /// Spark's `length` is kept, and registers it itself.)
     #[tokio::test]
-    #[cfg(not(windows))]
     async fn a_spark_only_name_resolves_to_the_kept_built_in() {
         let df = DataFusionBuilder::new(
             status::RuntimeStatus::new(),
@@ -3210,7 +3015,6 @@ mod tests {
     /// field is `'DOW'` or `'Dow'`. `EXTRACT` stayed on Sunday = 0. Other
     /// units (`month`, `isodow`) must not move with this binding.
     #[tokio::test]
-    #[cfg(not(windows))]
     async fn the_built_session_keeps_the_built_in_date_part() {
         let df = DataFusionBuilder::new(
             status::RuntimeStatus::new(),
@@ -3388,7 +3192,6 @@ mod tests {
     /// it fails this test and has to be decided on: added to the registration
     /// loop's skip, or listed here once it is meant to ship.
     #[tokio::test]
-    #[cfg(not(windows))]
     async fn the_built_session_registers_exactly_the_shipped_spark_functions() {
         let df = DataFusionBuilder::new(
             status::RuntimeStatus::new(),
@@ -3555,7 +3358,6 @@ mod tests {
     /// the base's type for truncated silently — `2.5⁴` in `DECIMAL(2,1)`
     /// answered `3.9`.
     #[tokio::test]
-    #[cfg(not(windows))]
     async fn the_built_session_keeps_the_built_in_math_and_string_functions() {
         let df = DataFusionBuilder::new(
             status::RuntimeStatus::new(),
@@ -3628,7 +3430,6 @@ mod tests {
     /// bytes `C3 A9` (one character) answer 2 under Spark's and 1 under the
     /// built-in. This pins the `Keep::Spark` entry in `SPARK_SCALAR_COLLISIONS`.
     #[tokio::test]
-    #[cfg(not(windows))]
     async fn the_built_session_keeps_spark_length_for_binary() {
         use arrow::array::Int32Array;
 
@@ -3669,7 +3470,6 @@ mod tests {
     /// accelerated in `DuckDB`. The `PostgreSQL` and `SQLite` renderings still
     /// skip the NULL (#13875, unresolved).
     #[tokio::test]
-    #[cfg(not(windows))]
     async fn the_built_session_keeps_spark_concat_over_the_built_in() {
         let df = DataFusionBuilder::new(
             status::RuntimeStatus::new(),
@@ -3704,7 +3504,6 @@ mod tests {
     /// rendering does not produce, which surfaces as an internal assertion
     /// rather than a function error (regression test for #14361).
     #[tokio::test]
-    #[cfg(not(windows))]
     async fn the_built_session_keeps_the_built_in_ceil_type() {
         let df = DataFusionBuilder::new(
             status::RuntimeStatus::new(),
@@ -3734,7 +3533,6 @@ mod tests {
     /// `SPARK_SCALAR_COLLISIONS`). The collision-set test ignores the `Keep`
     /// field, so this is what fails when one of these entries is flipped.
     #[tokio::test]
-    #[cfg(not(windows))]
     async fn the_built_session_answers_each_collision_as_decided() {
         let df = DataFusionBuilder::new(
             status::RuntimeStatus::new(),
@@ -3790,7 +3588,6 @@ mod tests {
     }
 
     #[tokio::test]
-    #[cfg(not(windows))]
     async fn the_built_session_concatenates_an_untyped_null() {
         use arrow::array::{ArrayRef, RecordBatch, StringArray};
 
@@ -3832,7 +3629,6 @@ mod tests {
     /// drops a built-in leaves an entry deciding nothing, and the table must
     /// say so rather than carry a decision no collision reaches.
     #[test]
-    #[cfg(not(windows))]
     fn the_spark_collision_tables_are_exactly_the_collision_set() {
         use std::collections::{BTreeMap, BTreeSet};
 
@@ -4041,7 +3837,6 @@ mod tests {
     }
 
     #[test]
-    #[cfg(not(windows))]
     fn test_built_datafusion_registers_cayenne_optimizer_config() {
         let rt = tokio::runtime::Builder::new_current_thread()
             .enable_all()
@@ -4201,7 +3996,6 @@ mod tests {
 
     /// Whether `plan` has an `AggregateExec` anywhere below a `HashJoinExec`, which
     /// is where eager aggregation puts the pre-aggregation it pushes.
-    #[cfg(not(windows))]
     fn aggregates_below_a_join(
         plan: &Arc<dyn datafusion::physical_plan::ExecutionPlan>,
         below_a_join: bool,
@@ -4221,7 +4015,6 @@ mod tests {
     /// Plans `SUM(amount) GROUP BY name` over `fact JOIN dim` in a session built
     /// with `eager_aggregation`, and returns whether the plan pre-aggregates below the
     /// join, the rendered plan, and the query's rows.
-    #[cfg(not(windows))]
     async fn plan_an_aggregate_over_a_join(eager_aggregation: bool) -> (bool, String, String) {
         use arrow::array::{Int32Array, RecordBatch, StringArray};
 
@@ -4307,7 +4100,6 @@ mod tests {
     /// the disabled session is the control that shows the plan check can tell the
     /// two apart.
     #[tokio::test]
-    #[cfg(not(windows))]
     async fn eager_aggregation_pushes_an_aggregate_below_a_join() {
         let expected_rows = [
             "+------+--------+",
@@ -4342,8 +4134,202 @@ mod tests {
         );
     }
 
-    #[test]
+    /// Runs `NOT IN` queries whose subquery yields a NULL, then counts, over a
+    /// parquet table in a session built with `eager_aggregation`. Returns whether
+    /// the `count(id)` plan pre-aggregates below the join, that plan rendered, and
+    /// each query with every row it returned (or the error it raised).
     #[cfg(not(windows))]
+    async fn count_over_a_null_aware_anti_join_on_parquet(
+        eager_aggregation: bool,
+    ) -> (bool, String, Vec<(&'static str, String)>) {
+        use datafusion::parquet::data_type::{Int32Type, Int64Type};
+        use datafusion::parquet::file::properties::WriterProperties;
+        use datafusion::parquet::file::writer::SerializedFileWriter;
+        use datafusion::parquet::schema::parser::parse_message_type;
+        use datafusion::prelude::ParquetReadOptions;
+
+        // 20,000 rows; `qty` has 17 distinct values and every tenth row is NULL.
+        // The rule's cost gate reads the number of distinct values from the
+        // file's column statistics and declines the push without it. A writer
+        // that records it, as DuckDB does, is what puts this file within the
+        // rule's reach, so the column chunk is written with that statistic.
+        let dir = tempfile::tempdir().expect("temp dir");
+        let path = dir.path().join("t.parquet");
+        let schema = Arc::new(
+            parse_message_type("message t { optional int64 id; optional int32 qty; }")
+                .expect("parse the parquet schema"),
+        );
+        let mut writer = SerializedFileWriter::new(
+            std::fs::File::create(&path).expect("create the parquet file"),
+            schema,
+            Arc::new(WriterProperties::builder().build()),
+        )
+        .expect("open the parquet writer");
+        let mut row_group = writer.next_row_group().expect("start the row group");
+
+        let ids: Vec<i64> = (1..=20_000).collect();
+        let mut id = row_group
+            .next_column()
+            .expect("open the id column")
+            .expect("the id column");
+        let present = vec![1_i16; ids.len()];
+        id.typed::<Int64Type>()
+            .write_batch_with_statistics(
+                &ids,
+                Some(present.as_slice()),
+                None,
+                Some(&1),
+                Some(&20_000),
+                None,
+            )
+            .expect("write the id column");
+        id.close().expect("close the id column");
+
+        let qty: Vec<Option<i32>> = (1..=20_000_i32)
+            .map(|i| if i % 10 == 0 { None } else { Some(i % 17 - 8) })
+            .collect();
+        let definition_levels: Vec<i16> = qty.iter().map(|v| i16::from(v.is_some())).collect();
+        let values: Vec<i32> = qty.iter().flatten().copied().collect();
+        let mut qty = row_group
+            .next_column()
+            .expect("open the qty column")
+            .expect("the qty column");
+        qty.typed::<Int32Type>()
+            .write_batch_with_statistics(
+                &values,
+                Some(definition_levels.as_slice()),
+                None,
+                Some(&-8),
+                Some(&8),
+                Some(17),
+            )
+            .expect("write the qty column");
+        qty.close().expect("close the qty column");
+        row_group.close().expect("close the row group");
+        writer.close().expect("close the parquet file");
+        let path = path.to_str().expect("utf-8 path");
+
+        let df = DataFusionBuilder::new(
+            status::RuntimeStatus::new(),
+            Arc::new(AcceleratorEngineRegistry::default()),
+            tokio::runtime::Handle::current(),
+        )
+        .eager_aggregation(Some(eager_aggregation))
+        .build();
+        df.ctx
+            .register_parquet("t", path, ParquetReadOptions::default())
+            .await
+            .expect("register the parquet table");
+
+        let plan = df
+            .ctx
+            .sql("SELECT count(id) FROM t WHERE qty NOT IN (SELECT NULL::INT)")
+            .await
+            .expect("plan the query")
+            .create_physical_plan()
+            .await
+            .expect("build the physical plan");
+        let rendered = datafusion::physical_plan::displayable(plan.as_ref())
+            .indent(true)
+            .to_string();
+
+        let mut results = Vec::new();
+        for query in [
+            "SELECT count(*) FROM t WHERE qty NOT IN (SELECT qty FROM t WHERE id <= 50)",
+            "SELECT count(*) FROM t WHERE qty NOT IN (SELECT NULL::INT)",
+            "SELECT count(id) FROM t WHERE qty NOT IN (SELECT NULL::INT)",
+            "SELECT coalesce(count(*), 42) FROM t WHERE qty NOT IN (SELECT NULL::INT)",
+            // Control: the subquery has no NULL, so rows survive the anti join.
+            "SELECT count(*) FROM t WHERE qty NOT IN (SELECT qty FROM t WHERE id <= 9)",
+        ] {
+            let value = match df.ctx.sql(query).await {
+                Ok(frame) => match frame.collect().await {
+                    Ok(batches) => {
+                        // Every row, so a second row from an ungrouped aggregate
+                        // fails the comparison instead of passing unseen.
+                        let mut rows = Vec::new();
+                        for batch in &batches {
+                            assert_eq!(batch.num_columns(), 1, "{query} returns one column");
+                            let column = batch.column(0);
+                            for row in 0..batch.num_rows() {
+                                rows.push(if column.is_null(row) {
+                                    "NULL".to_string()
+                                } else {
+                                    arrow::util::display::array_value_to_string(column, row)
+                                        .expect("format the value")
+                                });
+                            }
+                        }
+                        if rows.is_empty() {
+                            "<no rows>".to_string()
+                        } else {
+                            rows.join(" | ")
+                        }
+                    }
+                    Err(e) => format!("error: {e}"),
+                },
+                Err(e) => format!("error: {e}"),
+            };
+            results.push((query, value));
+        }
+        (aggregates_below_a_join(&plan, false), rendered, results)
+    }
+
+    /// `count` over a `NOT IN` whose subquery holds a NULL is 0: the null-aware
+    /// anti join emits no rows and an ungrouped aggregate still emits one. With eager
+    /// aggregation the pushed partial count is merged by a `SUM`, which is NULL over
+    /// no rows, so `count(id)` returned NULL and `count(*)` failed its non-nullable
+    /// schema check. The disabled session is the control, and the plan check shows
+    /// the rule fires, so the enabled run exercises the rewrite.
+    #[tokio::test]
+    #[cfg(not(windows))]
+    async fn count_over_not_in_with_a_null_is_zero_under_eager_aggregation() {
+        let expected = vec![
+            (
+                "SELECT count(*) FROM t WHERE qty NOT IN (SELECT qty FROM t WHERE id <= 50)",
+                "0".to_string(),
+            ),
+            (
+                "SELECT count(*) FROM t WHERE qty NOT IN (SELECT NULL::INT)",
+                "0".to_string(),
+            ),
+            (
+                "SELECT count(id) FROM t WHERE qty NOT IN (SELECT NULL::INT)",
+                "0".to_string(),
+            ),
+            (
+                "SELECT coalesce(count(*), 42) FROM t WHERE qty NOT IN (SELECT NULL::INT)",
+                "0".to_string(),
+            ),
+            (
+                "SELECT count(*) FROM t WHERE qty NOT IN (SELECT qty FROM t WHERE id <= 9)",
+                "8467".to_string(),
+            ),
+        ];
+
+        let (pushed, plan, results) = count_over_a_null_aware_anti_join_on_parquet(true).await;
+        assert!(
+            pushed,
+            "with eager aggregation enabled the count has to be pre-aggregated below the \
+             anti join, or this test no longer exercises the rewrite: {plan}"
+        );
+        assert_eq!(
+            results, expected,
+            "eager aggregation changed a count: {plan}"
+        );
+
+        let (pushed, plan, results) = count_over_a_null_aware_anti_join_on_parquet(false).await;
+        assert!(
+            !pushed,
+            "with eager aggregation disabled nothing may be pre-aggregated below the join: {plan}"
+        );
+        assert_eq!(
+            results, expected,
+            "the unrewritten plan returned a wrong count"
+        );
+    }
+
+    #[test]
     fn test_cayenne_provider_predicate_detects_poly_accelerator_metadata() {
         let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)]));
         let table =
@@ -4362,11 +4348,7 @@ mod tests {
 
     /// Builds a full `DataFusion` instance and verifies the analyzer rules on
     /// the resulting `SessionContext` have the correct ordering.
-    ///
-    /// Skipped on Windows because the Cayenne DDL analyzer rule is not registered
-    /// there, resulting in a different rule list.
     #[test]
-    #[cfg(not(windows))]
     fn test_built_datafusion_analyzer_rule_ordering() {
         let rt = tokio::runtime::Builder::new_current_thread()
             .enable_all()
@@ -4400,7 +4382,6 @@ mod tests {
     }
 
     #[test]
-    #[cfg(not(windows))]
     fn test_built_datafusion_uses_conservative_cayenne_optimizer_defaults() {
         let rt = tokio::runtime::Builder::new_current_thread()
             .enable_all()
@@ -4450,7 +4431,6 @@ mod tests {
     }
 
     #[test]
-    #[cfg(not(windows))]
     fn test_built_datafusion_registers_cte_materialization_when_auto() {
         let rt = tokio::runtime::Builder::new_current_thread()
             .enable_all()
@@ -4491,7 +4471,6 @@ mod tests {
     }
 
     #[test]
-    #[cfg(not(windows))]
     fn test_built_datafusion_can_disable_cayenne_logical_rule() {
         let rt = tokio::runtime::Builder::new_current_thread()
             .enable_all()
@@ -4526,7 +4505,6 @@ mod tests {
     }
 
     #[test]
-    #[cfg(not(windows))]
     fn test_built_datafusion_can_disable_all_cayenne_optimizer_rules() {
         let rt = tokio::runtime::Builder::new_current_thread()
             .enable_all()
@@ -4564,7 +4542,6 @@ mod tests {
     /// `EnforceDistribution` and `EnforceSorting`). Every name `SKIPPABLE_RULES` lists must
     /// belong to a rule the session registers once every optional rule is on.
     #[test]
-    #[cfg(not(windows))]
     fn every_point_lookup_skippable_rule_is_registered() {
         let rt = tokio::runtime::Builder::new_current_thread()
             .enable_all()
@@ -4594,8 +4571,6 @@ mod tests {
         let unregistered: Vec<&str> = crate::datafusion::point_lookup::SKIPPABLE_RULES
             .iter()
             .copied()
-            // The `DuckDB` rules are only compiled in with the `duckdb` feature.
-            .filter(|name| cfg!(feature = "duckdb") || !name.starts_with("DuckDB"))
             .filter(|name| !registered.contains(name))
             .collect();
         assert!(
@@ -4605,7 +4580,6 @@ mod tests {
     }
 
     #[test]
-    #[cfg(not(windows))]
     fn test_built_datafusion_can_enable_one_cayenne_physical_rule() {
         let mut rules = CayenneOptimizerRules::none();
         rules.set_dynamic_filter_sharing(true);
@@ -4616,7 +4590,6 @@ mod tests {
     }
 
     #[test]
-    #[cfg(not(windows))]
     fn test_built_datafusion_can_select_each_cayenne_optimizer_rule() {
         let mut filter_propagation = CayenneOptimizerRules::none();
         filter_propagation.set_filter_propagation(true);
@@ -4694,7 +4667,6 @@ mod tests {
     }
 
     #[test]
-    #[cfg(not(windows))]
     fn test_selected_cayenne_inlist_rule_rewrites_only_cayenne_backed_queries() {
         let rt = tokio::runtime::Builder::new_current_thread()
             .enable_all()
@@ -4739,7 +4711,6 @@ mod tests {
     }
 
     #[test]
-    #[cfg(not(windows))]
     fn test_regexp_null_check_rewrite_runs_for_every_local_query() {
         let rt = tokio::runtime::Builder::new_current_thread()
             .enable_all()
@@ -4791,7 +4762,6 @@ mod tests {
     }
 
     #[test]
-    #[cfg(not(windows))]
     fn test_enabled_cayenne_filter_propagation_rewrites_only_selective_large_fact_queries() {
         let rt = tokio::runtime::Builder::new_current_thread()
             .enable_all()
@@ -4846,7 +4816,6 @@ mod tests {
     }
 
     #[test]
-    #[cfg(not(windows))]
     fn test_enabled_cayenne_filter_propagation_handles_mixed_cayenne_and_non_cayenne_joins() {
         let rt = tokio::runtime::Builder::new_current_thread()
             .enable_all()
@@ -4929,7 +4898,6 @@ mod tests {
     }
 
     #[test]
-    #[cfg(not(windows))]
     fn test_built_datafusion_registers_cayenne_logical_rule_when_enabled() {
         let rt = tokio::runtime::Builder::new_current_thread()
             .enable_all()
@@ -5019,7 +4987,6 @@ mod tests {
     }
 
     #[test]
-    #[cfg(not(windows))]
     fn test_built_datafusion_decorrelates_cayenne_propagated_subquery() {
         let rt = tokio::runtime::Builder::new_current_thread()
             .enable_all()
@@ -5100,7 +5067,6 @@ mod tests {
     /// and asserts the final plan has at most one `LeftSemi` for the selective
     /// large-fact shape — proving the cycle guard holds across decorrelation.
     #[test]
-    #[cfg(not(windows))]
     fn test_built_datafusion_does_not_stack_redundant_left_semi_after_decorrelation() {
         let rt = tokio::runtime::Builder::new_current_thread()
             .enable_all()
@@ -5174,7 +5140,6 @@ mod tests {
     /// Cayenne physical optimizer rules must run after `DataFusion`'s built-in
     /// physical optimizer rules.
     #[test]
-    #[cfg(not(windows))]
     fn test_built_datafusion_registers_cayenne_rules_after_datafusion_rules() {
         let rt = tokio::runtime::Builder::new_current_thread()
             .enable_all()
@@ -5239,7 +5204,6 @@ mod tests {
         );
     }
 
-    #[cfg(not(windows))]
     fn built_datafusion_cayenne_rule_names(
         rules: CayenneOptimizerRules,
     ) -> (Vec<String>, Vec<String>) {
@@ -5276,7 +5240,6 @@ mod tests {
         (logical_rule_names, physical_rule_names)
     }
 
-    #[cfg(not(windows))]
     fn register_inlist_test_table(ctx: &SessionContext, table_name: &str, cayenne_backed: bool) {
         let mut metadata = HashMap::new();
         if cayenne_backed {
@@ -5297,7 +5260,6 @@ mod tests {
         .expect("in-list test table should register");
     }
 
-    #[cfg(not(windows))]
     fn register_large_fact_dimension_tables(ctx: &SessionContext) {
         register_stat_table(
             ctx,
@@ -5331,7 +5293,6 @@ mod tests {
         );
     }
 
-    #[cfg(not(windows))]
     fn register_stat_table(
         ctx: &SessionContext,
         table_name: &str,
@@ -5357,14 +5318,12 @@ mod tests {
         .expect("selective large-fact stat table should register");
     }
 
-    #[cfg(not(windows))]
     #[derive(Debug)]
     struct StatMemTable {
         inner: MemTable,
         num_rows: usize,
     }
 
-    #[cfg(not(windows))]
     impl StatMemTable {
         fn try_new(
             schema: Arc<Schema>,
@@ -5378,7 +5337,6 @@ mod tests {
         }
     }
 
-    #[cfg(not(windows))]
     #[async_trait::async_trait]
     impl TableProvider for StatMemTable {
         fn schema(&self) -> Arc<Schema> {
@@ -5408,7 +5366,6 @@ mod tests {
         }
     }
 
-    #[cfg(not(windows))]
     async fn optimized_inlist_query_plan(ctx: &SessionContext, table_name: &str) -> LogicalPlan {
         ctx.sql(&format!(
             "SELECT id FROM {table_name} WHERE id IN (5, 6, 7, 8)"
@@ -5419,7 +5376,6 @@ mod tests {
         .expect("in-list test query should optimize")
     }
 
-    #[cfg(not(windows))]
     async fn optimized_sql_query_plan(ctx: &SessionContext, sql: &str) -> LogicalPlan {
         ctx.sql(sql)
             .await
@@ -5428,7 +5384,6 @@ mod tests {
             .expect("test query should optimize")
     }
 
-    #[cfg(not(windows))]
     fn logical_plan_contains_expr(
         plan: &LogicalPlan,
         matches_expr: impl Fn(&Expr) -> bool,
@@ -5457,7 +5412,6 @@ mod tests {
         found
     }
 
-    #[cfg(not(windows))]
     fn logical_plan_has_inlist_range_rewrite(plan: &LogicalPlan) -> bool {
         logical_plan_contains_expr(plan, expr_is_id_between_5_and_8)
             || (logical_plan_contains_expr(plan, |expr| {
@@ -5467,7 +5421,6 @@ mod tests {
             }))
     }
 
-    #[cfg(not(windows))]
     fn logical_plan_has_propagated_filter_marker(plan: &LogicalPlan) -> bool {
         let mut found = false;
         let _ = plan.apply(|node| {
@@ -5492,7 +5445,6 @@ mod tests {
         found
     }
 
-    #[cfg(not(windows))]
     fn expr_has_propagated_filter_marker(expr: &Expr) -> bool {
         matches!(
             expr,
@@ -5508,7 +5460,6 @@ mod tests {
         )
     }
 
-    #[cfg(not(windows))]
     fn expr_is_id_between_5_and_8(expr: &Expr) -> bool {
         matches!(
             expr,
@@ -5520,7 +5471,6 @@ mod tests {
         )
     }
 
-    #[cfg(not(windows))]
     fn expr_is_id_literal_comparison(expr: &Expr, operator: Operator, literal: i64) -> bool {
         let Expr::BinaryExpr(binary) = expr else {
             return false;
@@ -5534,7 +5484,6 @@ mod tests {
                 && expr_is_id_column(&binary.right))
     }
 
-    #[cfg(not(windows))]
     fn reversed_comparison_operator(operator: Operator) -> Operator {
         match operator {
             Operator::GtEq => Operator::LtEq,
@@ -5545,17 +5494,14 @@ mod tests {
         }
     }
 
-    #[cfg(not(windows))]
     fn expr_is_id_column(expr: &Expr) -> bool {
         matches!(expr, Expr::Column(column) if column.name == "id")
     }
 
-    #[cfg(not(windows))]
     fn expr_is_int64_literal(expr: &Expr, expected: i64) -> bool {
         matches!(expr, Expr::Literal(ScalarValue::Int64(Some(value)), _) if *value == expected)
     }
 
-    #[cfg(not(windows))]
     fn expr_tree_contains(expr: &Expr, matches_expr: &impl Fn(&Expr) -> bool) -> bool {
         let mut found = false;
         let _ = expr.apply(|expr| {

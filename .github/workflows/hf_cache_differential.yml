@@ -24,6 +24,7 @@ concurrency:
 
 jobs:
   differential:
+    environment: ci
     name: Spice's Hugging Face cache against the hf CLI
     # The check builds and runs the change's code on persistent self-hosted runners in a public
     # repository, so a pull request from a fork or from Dependabot runs it only once a maintainer
@@ -42,7 +43,7 @@ jobs:
       # The dev runner image has no C toolchain, and rustc links through cc.
       - uses: ./.github/actions/setup-cc
       # The dev runner image has python3 but no pip.
-      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
         with:
           python-version: '3.12'
       - name: Install the hf CLI
@@ -52,6 +53,10 @@ jobs:
           "$RUNNER_TEMP/hf-cli/bin/python" -m pip install 'huggingface_hub==2.2.0'
           echo "$RUNNER_TEMP/hf-cli/bin" >> "$GITHUB_PATH"
       - name: Compare Spice's cache with the hf CLI's
+        # The Hub rate-limits anonymous requests per IP, and the jobs on the self-hosted pool share
+        # one, so the tools and the script authenticate with HF_TOKEN. Both tools redact it.
+        env:
+          HF_TOKEN: ${{ secrets.SPICE_SECRET_HF_TOKEN }}
         run: scripts/hf_cache_differential.sh "$RUNNER_TEMP/hf_cache_differential"
       # The tools' output for each repository; the caches themselves are gigabytes.
       - name: Upload the tools' output

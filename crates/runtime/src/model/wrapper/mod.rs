@@ -315,6 +315,10 @@ impl ChatWrapper {
 #[deny(clippy::missing_trait_methods)]
 #[async_trait]
 impl Chat for ChatWrapper {
+    async fn token_limits(&self) -> llms::chat::TokenLimits {
+        self.chat.token_limits().await
+    }
+
     /// Expect `captured_output` to be instrumented by the underlying chat model (to not reopen/parse streams). i.e.
     /// ```rust
     /// tracing::info!(target: "task_history", captured_output = %chat_output)

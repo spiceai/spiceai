@@ -40,10 +40,20 @@ pub(super) async fn start_executors(
         return Ok(());
     }
     let active = instance.active_executors;
-    for executor in instance.executors.iter_mut().take(active) {
+    for (index, executor) in instance.executors.iter_mut().enumerate().take(active) {
         if !executor.is_running() {
+            if let Some(name) = executor.container_name() {
+                // The combination reserved this room before it took its
+                // `--jobs` slots; this waits only if something outside the
+                // run took it meanwhile, or for a restart.
+                crate::keyquota::wait_for_room(1, &format!("executor container {name}")).await?;
+            }
             executor.start(&instance.spicepod_yaml)?;
             executor.wait_health(timeout).await?;
+            // Healthy, so its container is running and holds its own key.
+            if let Some(key_room) = &mut instance.key_room {
+                key_room.executor_started(index);
+            }
         }
     }
     let mut running = 0;
@@ -131,8 +141,7 @@ pub(super) fn cluster_args(
 
 /// The engine an acceleration block runs, or `None` when it is disabled,
 /// with the Spicepod's defaults applied: omitted `enabled` is true, and an
-/// omitted `engine` is Cayenne (Arrow only on Windows, where the harness
-/// does not run).
+/// omitted `engine` is Cayenne.
 fn accelerated_engine(acceleration: &Value) -> Option<&str> {
     if acceleration.get("enabled").and_then(Value::as_bool) == Some(false) {
         return None;

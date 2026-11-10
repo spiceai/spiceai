@@ -338,4 +338,81 @@ mod tests {
         }
         assert_eq!(expected, groups - 2, "every group's sum, in order");
     }
+
+    /// Streams one batch through the results cache with a query pool of
+    /// `pool_size`; returns whether the result was stored, the rows streamed
+    /// and the bytes still reserved.
+    async fn cache_one_batch(batch: RecordBatch, pool_size: usize) -> (bool, usize, usize) {
+        use cache::QueryResultsCacheProvider;
+        use cache::key::RawCacheKey;
+        use datafusion::common::TableReference;
+        use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
+        use futures::TryStreamExt;
+        use std::collections::HashSet;
+
+        let memory = pool(pool_size);
+        let provider = Arc::new(
+            QueryResultsCacheProvider::try_new(
+                &spicepod::component::caching::SQLResultsCacheConfig {
+                    item_ttl: Some("10m".to_string()),
+                    ..Default::default()
+                },
+                Box::new([]),
+            )
+            .expect("valid cache provider"),
+        );
+        let key = RawCacheKey::new(46);
+        let schema = batch.schema();
+        let rows = cache::to_cached_record_batch_stream(
+            Arc::clone(&provider),
+            Box::pin(RecordBatchStreamAdapter::new(
+                schema,
+                futures::stream::iter([Ok(batch)]),
+            )),
+            key,
+            Arc::new(HashSet::from([TableReference::bare("t")])),
+            std::time::Instant::now(),
+            None,
+            &memory,
+        )
+        .try_collect::<Vec<_>>()
+        .await
+        .expect("the stream yields no errors")
+        .iter()
+        .map(RecordBatch::num_rows)
+        .sum();
+        let stored = provider
+            .get_raw_key(&key)
+            .await
+            .expect("cache access should succeed")
+            .is_some();
+        (stored, rows, memory.reserved())
+    }
+
+    /// The results cache gives up a held result when refused, so it must not
+    /// take the headroom kept for consumers that fail the query when refused.
+    #[tokio::test]
+    async fn a_held_results_cache_copy_cannot_take_the_unspillable_headroom() {
+        let schema = Arc::new(Schema::new(vec![Field::new("v", DataType::Int64, false)]));
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![Arc::new(Int64Array::from_iter_values(0..100_000))],
+        )
+        .expect("build the batch");
+        let result_size = arrow_tools::record_batch::compacted_memory_size(&batch);
+        // The result fits in this pool, but not under its spillable cap.
+        let pool_size = result_size + spillable_headroom_bytes(result_size) / 2;
+        assert!(pool_size - spillable_headroom_bytes(pool_size) < result_size);
+
+        assert_eq!(
+            cache_one_batch(batch.clone(), 2 * result_size).await,
+            (true, 100_000, 0),
+            "a result under the spillable cap is cached"
+        );
+        assert_eq!(
+            cache_one_batch(batch, pool_size).await,
+            (false, 100_000, 0),
+            "a result over the spillable cap is not cached"
+        );
+    }
 }

@@ -40,23 +40,6 @@ fn make_duckdb_dataset(ds_name: &str, fn_name: &str, path_str: &str) -> Dataset 
     dataset
 }
 
-fn make_duckdb_acceleration_dataset(ds_name: &str, fn_name: &str, path_str: &str) -> Dataset {
-    let mut dataset = Dataset::new(
-        format!("duckdb:read_{fn_name}({path_str})"),
-        fn_name.to_string(),
-    );
-    dataset.acceleration = Some(Acceleration {
-        enabled: true,
-        engine: Some("duckdb".to_string()),
-        mode: Mode::Memory,
-        refresh_mode: Some(RefreshMode::Full),
-        refresh_sql: None,
-        ..Acceleration::default()
-    });
-    dataset.name = ds_name.to_string();
-    dataset
-}
-
 fn make_test_query(table_name: &str) -> String {
     format!("SELECT DISTINCT(\"VendorID\") FROM {table_name} ORDER BY \"VendorID\" DESC")
 }
@@ -181,7 +164,7 @@ async fn duckdb_order_by_special_cases() -> Result<(), String> {
             }
 
             let app = AppBuilder::new("duckdb_order_by_test")
-                .with_dataset(make_duckdb_acceleration_dataset(
+                .with_dataset(make_duckdb_dataset(
                     "csv_test",
                     "csv",
                     &format!("'{}'", sample_csv_path.display()),
@@ -239,7 +222,6 @@ async fn duckdb_order_by_special_cases() -> Result<(), String> {
         .await
 }
 
-#[cfg(not(windows))]
 #[tokio::test]
 async fn duckdb_regexp() -> Result<(), String> {
     let _tracing = init_tracing(Some("integration=debug,info"));
@@ -252,7 +234,7 @@ async fn duckdb_regexp() -> Result<(), String> {
             std::fs::write(temp_file.path(), sample_csv_contents)
                 .expect("failed to write sample file");
 
-            let mut other_dataset = make_duckdb_acceleration_dataset(
+            let mut other_dataset = make_duckdb_dataset(
                 "csv_test_cayenne",
                 "csv",
                 &format!("'{}'", temp_file.path().display()),
@@ -264,7 +246,7 @@ async fn duckdb_regexp() -> Result<(), String> {
             });
 
             let app = AppBuilder::new("duckdb_regexp_test")
-                .with_dataset(make_duckdb_acceleration_dataset(
+                .with_dataset(make_duckdb_dataset(
                     "csv_test",
                     "csv",
                     &format!("'{}'", temp_file.path().display()),
@@ -392,10 +374,7 @@ async fn duckdb_regexp() -> Result<(), String> {
                     .try_collect::<Vec<RecordBatch>>()
                     .await
                     .map_err(|e| format!("explain plan for `{query}` execution failed: {e}"))?;
-                let pretty = arrow::util::pretty::pretty_format_batches(&explain_plan)
-                    .map_err(|e| anyhow::Error::msg(e.to_string()))
-                    .expect("Should format batches");
-                insta::assert_snapshot!(format!("{name}_explain"), pretty);
+                insta::assert_snapshot!(format!("{name}_explain"), stable_plan(&explain_plan));
             }
 
             Ok(())
@@ -416,7 +395,7 @@ async fn duckdb_json_functions() -> Result<(), String> {
                 .expect("failed to write sample file");
 
             let app = AppBuilder::new("duckdb_json_test")
-                .with_dataset(make_duckdb_acceleration_dataset(
+                .with_dataset(make_duckdb_dataset(
                     "json_test",
                     "csv",
                     &format!("'{}'", temp_file.path().display()),
@@ -501,10 +480,7 @@ async fn duckdb_json_functions() -> Result<(), String> {
                     .try_collect::<Vec<RecordBatch>>()
                     .await
                     .map_err(|e| format!("explain plan for `{query}` execution failed: {e}"))?;
-                let pretty = arrow::util::pretty::pretty_format_batches(&explain_plan)
-                    .map_err(|e| anyhow::Error::msg(e.to_string()))
-                    .expect("Should format batches");
-                insta::assert_snapshot!(format!("{name}_explain"), pretty);
+                insta::assert_snapshot!(format!("{name}_explain"), stable_plan(&explain_plan));
             }
 
             Ok(())
@@ -603,11 +579,11 @@ async fn duckdb_connector_does_not_push_down_spice_functions() -> Result<(), Str
                 .expect("Should format batches");
             let plan = pretty.to_string();
 
-            // With federation working the scan appears as VirtualExecutionPlan name=duckdb;
-            // on the scan fallback path it appears as DuckSqlExec. Either indicates that
-            // the DuckDB connector is being used for the table scan.
+            // The DuckDB connector reads through ADBC: with federation working the
+            // scan appears as `VirtualExecutionPlan name=adbc`, carrying the SQL
+            // DuckDB receives.
             assert!(
-                plan.contains("name=duckdb") || plan.contains("DuckSqlExec"),
+                plan.contains("VirtualExecutionPlan name=adbc"),
                 "expected the connector plan to push a scan down to DuckDB; plan was:\n{plan}"
             );
             // json_get_str must not appear in any SQL sent to DuckDB.
@@ -623,750 +599,6 @@ async fn duckdb_connector_does_not_push_down_spice_functions() -> Result<(), Str
             assert!(
                 plan.contains("json_get_str"),
                 "json_get_str must still appear in the plan, evaluated locally:\n{plan}"
-            );
-
-            Ok(())
-        })
-        .await
-}
-
-#[tokio::test]
-async fn test_duckdb_settings_persist() -> Result<(), String> {
-    use spicepod::param::Params;
-    use std::collections::HashMap;
-
-    let _tracing = init_tracing(Some("integration=debug,info"));
-    register_test_connectors().await;
-
-    test_request_context()
-        .scope(async {
-            // Create a temporary DuckDB file
-            let temp_dir = std::env::temp_dir().join("spiced_duckdb_settings_test");
-            std::fs::create_dir_all(&temp_dir).expect("failed to create temp dir");
-            let duckdb_file = temp_dir.join("test_settings.db");
-
-            defer! {
-                std::fs::remove_dir_all(&temp_dir).expect("failed to remove temp dir");
-            }
-
-            // Create a dataset with DuckDB acceleration and custom settings
-            let mut accel_params = HashMap::new();
-            accel_params.insert(
-                "duckdb_file".to_string(),
-                duckdb_file
-                    .to_str()
-                    .expect("DuckDB file path should be valid UTF-8")
-                    .to_string(),
-            );
-            accel_params.insert(
-                "duckdb_index_scan_percentage".to_string(),
-                "0.05".to_string(),
-            ); // 5% as decimal
-            accel_params.insert(
-                "duckdb_index_scan_max_count".to_string(),
-                "5000".to_string(),
-            );
-
-            // Create a simple CSV file for testing
-            let csv_file = temp_dir.join("test.csv");
-            std::fs::write(&csv_file, "id,name\n1,test\n2,test2\n").expect("failed to write csv");
-
-            let mut dataset = Dataset::new(
-                format!("file:{}", csv_file.display()),
-                "test_settings".to_string(),
-            );
-            dataset.name = "test_settings".to_string();
-            dataset.acceleration = Some(Acceleration {
-                enabled: true,
-                engine: Some("duckdb".to_string()),
-                mode: Mode::File,
-                refresh_mode: Some(RefreshMode::Full),
-                params: Some(Params::from_string_map(accel_params)),
-                ..Acceleration::default()
-            });
-
-            let app = AppBuilder::new("duckdb_settings_test")
-                .with_dataset(dataset)
-                .build();
-
-            configure_test_datafusion();
-
-            let rt = Runtime::builder().with_app(app).build().await;
-            let cloned_rt = Arc::new(rt.clone());
-
-            // Set a timeout for the test
-            tokio::select! {
-                () = tokio::time::sleep(std::time::Duration::from_secs(30)) => {
-                    return Err("Timed out waiting for datasets to load".to_string());
-                }
-                () = Arc::clone(&cloned_rt).load_components() => {}
-            }
-
-            runtime_ready_check(&cloned_rt).await;
-
-            // Verify the accelerated dataset loaded successfully
-            println!("✅ DuckDB accelerator initialized successfully with custom settings:");
-            println!("   - duckdb_index_scan_percentage: 0.05 (5%)");
-            println!("   - duckdb_index_scan_max_count: 5000");
-            println!("   - PRAGMA enable_checkpoint_on_shutdown (automatic)");
-
-            // Query the accelerated table to ensure it's working
-            let df = cloned_rt.datafusion();
-            let result = df
-                .query_builder("SELECT COUNT(*) as row_count FROM test_settings")
-                .build()
-                .run()
-                .await
-                .map_err(|e| format!("Failed to query test_settings: {e}"))?;
-
-            let batches: Vec<RecordBatch> = result
-                .data
-                .try_collect()
-                .await
-                .map_err(|e| format!("Failed to collect results: {e}"))?;
-
-            // Verify we got data
-            if batches.is_empty() || batches[0].num_rows() == 0 {
-                return Err("No rows returned from query".to_string());
-            }
-
-            let count_col = batches[0]
-                .column(0)
-                .as_any()
-                .downcast_ref::<arrow::array::Int64Array>()
-                .ok_or_else(|| "Failed to downcast count column".to_string())?;
-            let count = count_col.value(0);
-
-            println!("✅ Query successful: test_settings table has {count} rows");
-
-            if count != 2 {
-                return Err(format!("Expected 2 rows, got {count}"));
-            }
-
-            // Shutdown the runtime
-            cloned_rt.shutdown().await;
-            drop(cloned_rt);
-            drop(rt);
-
-            // Give time for shutdown and checkpoint
-            tokio::time::sleep(tokio::time::Duration::from_secs(2)).await;
-
-            // Verify the file was checkpointed (file should exist and be non-zero)
-            if !duckdb_file.exists() {
-                return Err("DuckDB file does not exist after shutdown".to_string());
-            }
-
-            let metadata = std::fs::metadata(&duckdb_file)
-                .map_err(|e| format!("Failed to get file metadata: {e}"))?;
-
-            println!(
-                "✓ DuckDB file size after shutdown: {} bytes",
-                metadata.len()
-            );
-
-            if metadata.len() == 0 {
-                return Err(
-                    "DuckDB file is empty after shutdown - checkpoint may have failed".to_string(),
-                );
-            }
-
-            Ok(())
-        })
-        .await
-}
-
-#[tokio::test]
-async fn test_duckdb_all_settings() -> Result<(), String> {
-    use spicepod::param::Params;
-    use std::collections::HashMap;
-
-    let _tracing = init_tracing(Some("integration=debug,info"));
-    register_test_connectors().await;
-
-    Box::pin(test_request_context()
-        .scope(async {
-            // Test 1: Index scan settings with custom file
-            println!("\n=== Test 1: Index Scan Settings with Custom File ===");
-            {
-                let temp_dir = std::env::temp_dir().join("spiced_duckdb_test_1");
-                std::fs::create_dir_all(&temp_dir).expect("failed to create temp dir");
-                let duckdb_file = temp_dir.join("test_index_scan.db");
-
-                defer! {
-                    std::fs::remove_dir_all(&temp_dir).expect("failed to remove temp dir");
-                }
-
-                let mut accel_params = HashMap::new();
-                accel_params.insert("duckdb_file".to_string(), duckdb_file.to_str().expect("DuckDB file path should be valid UTF-8").to_string());
-                accel_params.insert("duckdb_index_scan_percentage".to_string(), "0.05".to_string());
-                accel_params.insert("duckdb_index_scan_max_count".to_string(), "5000".to_string());
-
-                let csv_file = temp_dir.join("test.csv");
-                std::fs::write(&csv_file, "id,name\n1,test\n2,test2\n").expect("failed to write csv");
-
-                let mut dataset = Dataset::new(format!("file:{}", csv_file.display()), "test_index_scan".to_string());
-                dataset.name = "test_index_scan".to_string();
-                dataset.acceleration = Some(Acceleration {
-                    enabled: true,
-                    engine: Some("duckdb".to_string()),
-                    mode: Mode::File,
-                    refresh_mode: Some(RefreshMode::Full),
-                    params: Some(Params::from_string_map(accel_params)),
-                    ..Acceleration::default()
-                });
-
-                let app = AppBuilder::new("duckdb_test_index_scan").with_dataset(dataset).build();
-                configure_test_datafusion();
-                let rt = Runtime::builder().with_app(app).build().await;
-                let cloned_rt = Arc::new(rt.clone());
-
-                tokio::select! {
-                    () = tokio::time::sleep(std::time::Duration::from_secs(30)) => {
-                        return Err("Test 1: Timed out waiting for datasets to load".to_string());
-                    }
-                    () = Arc::clone(&cloned_rt).load_components() => {}
-                }
-
-                runtime_ready_check(&cloned_rt).await;
-
-                // Verify query works
-                let df = cloned_rt.datafusion();
-                let result = df
-                    .query_builder("SELECT COUNT(*) FROM test_index_scan")
-                    .build()
-                    .run()
-                    .await
-                    .map_err(|e| format!("Test 1: Query failed: {e}"))?;
-                let batches: Vec<RecordBatch> = result.data.try_collect().await
-                    .map_err(|e| format!("Test 1: Failed to collect: {e}"))?;
-
-                let count_col = batches[0].column(0).as_any().downcast_ref::<arrow::array::Int64Array>()
-                    .ok_or_else(|| "Test 1: Failed to downcast".to_string())?;
-                assert_eq!(count_col.value(0), 2, "Test 1: Expected 2 rows");
-
-                println!("✅ Index scan settings applied successfully");
-                println!("   - duckdb_file: custom path");
-                println!("   - index_scan_percentage: 0.05");
-                println!("   - index_scan_max_count: 5000");
-
-                cloned_rt.shutdown().await;
-                drop(cloned_rt);
-                drop(rt);
-                tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
-
-                // Verify checkpoint occurred
-                assert!(duckdb_file.exists(), "Test 1: DuckDB file should exist");
-                let metadata = std::fs::metadata(&duckdb_file)
-                    .map_err(|e| format!("Test 1: Failed to get metadata: {e}"))?;
-                assert!(metadata.len() > 0, "Test 1: File should be non-zero");
-                println!("✅ Checkpoint verified: {} bytes", metadata.len());
-            }
-
-            // Test 2: Memory limit setting
-            println!("\n=== Test 2: Memory Limit Setting ===");
-            {
-                let temp_dir = std::env::temp_dir().join("spiced_duckdb_test_2");
-                std::fs::create_dir_all(&temp_dir).expect("failed to create temp dir");
-
-                defer! {
-                    std::fs::remove_dir_all(&temp_dir).expect("failed to remove temp dir");
-                }
-
-                let mut accel_params = HashMap::new();
-                accel_params.insert("duckdb_memory_limit".to_string(), "512MB".to_string());
-
-                let csv_file = temp_dir.join("test.csv");
-                std::fs::write(&csv_file, "id,value\n1,100\n2,200\n3,300\n").expect("failed to write csv");
-
-                let mut dataset = Dataset::new(format!("file:{}", csv_file.display()), "test_memory".to_string());
-                dataset.name = "test_memory".to_string();
-                dataset.acceleration = Some(Acceleration {
-                    enabled: true,
-                    engine: Some("duckdb".to_string()),
-                    mode: Mode::Memory,
-                    refresh_mode: Some(RefreshMode::Full),
-                    params: Some(Params::from_string_map(accel_params)),
-                    ..Acceleration::default()
-                });
-
-                let app = AppBuilder::new("duckdb_test_memory").with_dataset(dataset).build();
-                configure_test_datafusion();
-                let rt = Runtime::builder().with_app(app).build().await;
-                let cloned_rt = Arc::new(rt.clone());
-
-                tokio::select! {
-                    () = tokio::time::sleep(std::time::Duration::from_secs(30)) => {
-                        return Err("Test 2: Timed out waiting for datasets to load".to_string());
-                    }
-                    () = Arc::clone(&cloned_rt).load_components() => {}
-                }
-
-                runtime_ready_check(&cloned_rt).await;
-
-                let df = cloned_rt.datafusion();
-                let result = df
-                    .query_builder("SELECT SUM(value) as total FROM test_memory")
-                    .build()
-                    .run()
-                    .await
-                    .map_err(|e| format!("Test 2: Query failed: {e}"))?;
-                let batches: Vec<RecordBatch> = result.data.try_collect().await
-                    .map_err(|e| format!("Test 2: Failed to collect: {e}"))?;
-
-                let sum_col = batches[0].column(0).as_any().downcast_ref::<arrow::array::Int64Array>()
-                    .ok_or_else(|| "Test 2: Failed to downcast".to_string())?;
-                assert_eq!(sum_col.value(0), 600, "Test 2: Expected sum of 600");
-
-                println!("✅ Memory limit setting applied successfully");
-                println!("   - memory_limit: 512MB");
-                println!("   - mode: Memory");
-
-                cloned_rt.shutdown().await;
-                drop(cloned_rt);
-                drop(rt);
-                tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
-            }
-
-            // Test 3: Preserve insertion order
-            println!("\n=== Test 3: Preserve Insertion Order ===");
-            {
-                let temp_dir = std::env::temp_dir().join("spiced_duckdb_test_3");
-                std::fs::create_dir_all(&temp_dir).expect("failed to create temp dir");
-
-                defer! {
-                    std::fs::remove_dir_all(&temp_dir).expect("failed to remove temp dir");
-                }
-
-                let mut accel_params = HashMap::new();
-                accel_params.insert("duckdb_preserve_insertion_order".to_string(), "true".to_string());
-
-                let csv_file = temp_dir.join("test.csv");
-                std::fs::write(&csv_file, "id,name\n3,charlie\n1,alice\n2,bob\n").expect("failed to write csv");
-
-                let mut dataset = Dataset::new(format!("file:{}", csv_file.display()), "test_order".to_string());
-                dataset.name = "test_order".to_string();
-                dataset.acceleration = Some(Acceleration {
-                    enabled: true,
-                    engine: Some("duckdb".to_string()),
-                    mode: Mode::File,
-                    refresh_mode: Some(RefreshMode::Full),
-                    params: Some(Params::from_string_map(accel_params)),
-                    ..Acceleration::default()
-                });
-
-                let app = AppBuilder::new("duckdb_test_order").with_dataset(dataset).build();
-                configure_test_datafusion();
-                let rt = Runtime::builder().with_app(app).build().await;
-                let cloned_rt = Arc::new(rt.clone());
-
-                tokio::select! {
-                    () = tokio::time::sleep(std::time::Duration::from_secs(30)) => {
-                        return Err("Test 3: Timed out waiting for datasets to load".to_string());
-                    }
-                    () = Arc::clone(&cloned_rt).load_components() => {}
-                }
-
-                runtime_ready_check(&cloned_rt).await;
-
-                let df = cloned_rt.datafusion();
-                let result = df
-                    .query_builder("SELECT * FROM test_order")
-                    .build()
-                    .run()
-                    .await
-                    .map_err(|e| format!("Test 3: Query failed: {e}"))?;
-                let batches: Vec<RecordBatch> = result.data.try_collect().await
-                    .map_err(|e| format!("Test 3: Failed to collect: {e}"))?;
-
-                assert!(!batches.is_empty(), "Test 3: Should have results");
-                assert_eq!(batches[0].num_rows(), 3, "Test 3: Expected 3 rows");
-
-                println!("✅ Preserve insertion order setting applied successfully");
-                println!("   - preserve_insertion_order: true");
-
-                cloned_rt.shutdown().await;
-                drop(cloned_rt);
-                drop(rt);
-                tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
-            }
-
-            // Test 4: Combined settings
-            println!("\n=== Test 4: Combined Settings ===");
-            {
-                let temp_dir = std::env::temp_dir().join("spiced_duckdb_test_4");
-                std::fs::create_dir_all(&temp_dir).expect("failed to create temp dir");
-                let duckdb_file = temp_dir.join("test_combined.db");
-
-                defer! {
-                    std::fs::remove_dir_all(&temp_dir).expect("failed to remove temp dir");
-                }
-
-                let mut accel_params = HashMap::new();
-                accel_params.insert("duckdb_file".to_string(), duckdb_file.to_str().expect("DuckDB file path should be valid UTF-8").to_string());
-                accel_params.insert("duckdb_memory_limit".to_string(), "256MB".to_string());
-                accel_params.insert("duckdb_index_scan_percentage".to_string(), "0.10".to_string());
-                accel_params.insert("duckdb_index_scan_max_count".to_string(), "1000".to_string());
-                accel_params.insert("duckdb_preserve_insertion_order".to_string(), "false".to_string());
-
-                let csv_file = temp_dir.join("test.csv");
-                std::fs::write(&csv_file, "id,category,amount\n1,A,100\n2,B,200\n3,A,150\n4,C,300\n").expect("failed to write csv");
-
-                let mut dataset = Dataset::new(format!("file:{}", csv_file.display()), "test_combined".to_string());
-                dataset.name = "test_combined".to_string();
-                dataset.acceleration = Some(Acceleration {
-                    enabled: true,
-                    engine: Some("duckdb".to_string()),
-                    mode: Mode::File,
-                    refresh_mode: Some(RefreshMode::Full),
-                    params: Some(Params::from_string_map(accel_params)),
-                    ..Acceleration::default()
-                });
-
-                let app = AppBuilder::new("duckdb_test_combined").with_dataset(dataset).build();
-                configure_test_datafusion();
-                let rt = Runtime::builder().with_app(app).build().await;
-                let cloned_rt = Arc::new(rt.clone());
-
-                tokio::select! {
-                    () = tokio::time::sleep(std::time::Duration::from_secs(30)) => {
-                        return Err("Test 4: Timed out waiting for datasets to load".to_string());
-                    }
-                    () = Arc::clone(&cloned_rt).load_components() => {}
-                }
-
-                runtime_ready_check(&cloned_rt).await;
-
-                let df = cloned_rt.datafusion();
-
-                // Test aggregation
-                let result = df
-                    .query_builder("SELECT category, SUM(amount) as total FROM test_combined GROUP BY category ORDER BY category")
-                    .build()
-                    .run()
-                    .await
-                    .map_err(|e| format!("Test 4: Aggregation query failed: {e}"))?;
-                let batches: Vec<RecordBatch> = result.data.try_collect().await
-                    .map_err(|e| format!("Test 4: Failed to collect: {e}"))?;
-
-                assert_eq!(batches[0].num_rows(), 3, "Test 4: Expected 3 categories");
-
-                println!("✅ Combined settings applied successfully");
-                println!("   - file: custom path");
-                println!("   - memory_limit: 256MB");
-                println!("   - index_scan_percentage: 0.10");
-                println!("   - index_scan_max_count: 1000");
-                println!("   - preserve_insertion_order: false");
-                println!("   - PRAGMA enable_checkpoint_on_shutdown: automatic");
-
-                cloned_rt.shutdown().await;
-                drop(cloned_rt);
-                drop(rt);
-                tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
-
-                // Verify checkpoint
-                assert!(duckdb_file.exists(), "Test 4: DuckDB file should exist");
-                let metadata = std::fs::metadata(&duckdb_file)
-                    .map_err(|e| format!("Test 4: Failed to get metadata: {e}"))?;
-                assert!(metadata.len() > 0, "Test 4: File should be non-zero");
-                println!("✅ Checkpoint verified: {} bytes", metadata.len());
-            }
-
-            println!("\n=== All DuckDB Settings Tests Passed ===");
-            Ok(())
-        }))
-        .await
-}
-
-/// Test that verifies `DuckDB` connection pool handles concurrent queries correctly.
-///
-/// **Critical for**: `duckdb-rs` fork (`spiceai/duckdb-rs`, spiceai-57)
-///
-/// This test exercises the connection pool improvements in the duckdb-rs fork by
-/// running multiple concurrent queries against a DuckDB-accelerated dataset.
-/// The connection pool must efficiently manage connections and avoid deadlocks
-/// or connection exhaustion under concurrent load.
-///
-/// **Patches tested**:
-/// - Connection pool improvements for memory allocation
-/// - Arrow 57 compatibility in duckdb-rs
-/// - `register_arrow_scan_view` method for arrow stream support
-///
-/// **What happens without the patch**: Concurrent queries may fail with connection
-/// errors, deadlocks, or memory issues due to inefficient connection handling.
-#[tokio::test]
-async fn test_duckdb_connection_pool_concurrent_queries() -> Result<(), String> {
-    use spicepod::param::Params;
-    use std::collections::HashMap;
-    use std::fmt::Write as _;
-
-    let _tracing = init_tracing(Some("integration=debug,info"));
-
-    test_request_context()
-        .scope(async {
-            let temp_dir = std::env::temp_dir().join("spiced_duckdb_pool_test");
-            std::fs::create_dir_all(&temp_dir).expect("failed to create temp dir");
-
-            defer! {
-                let _ = std::fs::remove_dir_all(&temp_dir);
-            }
-
-            // Create a CSV file with more data for meaningful concurrent queries
-            let csv_file = temp_dir.join("test_concurrent.csv");
-            let mut csv_content = String::from("id,category,value\n");
-            for i in 1..=1000 {
-                let _ = writeln!(csv_content, "{},{},{}", i, ['A', 'B', 'C'][i % 3], i * 10);
-            }
-            std::fs::write(&csv_file, csv_content).expect("failed to write csv");
-
-            let mut accel_params = HashMap::new();
-            // Use memory mode for faster operations
-            accel_params.insert("duckdb_memory_limit".to_string(), "256MB".to_string());
-
-            let mut dataset = Dataset::new(
-                format!("file:{}", csv_file.display()),
-                "concurrent_test".to_string(),
-            );
-            dataset.name = "concurrent_test".to_string();
-            dataset.acceleration = Some(Acceleration {
-                enabled: true,
-                engine: Some("duckdb".to_string()),
-                mode: Mode::Memory,
-                refresh_mode: Some(RefreshMode::Full),
-                params: Some(Params::from_string_map(accel_params)),
-                ..Acceleration::default()
-            });
-
-            let app = AppBuilder::new("duckdb_pool_test")
-                .with_dataset(dataset)
-                .build();
-            configure_test_datafusion();
-            let rt = Arc::new(Runtime::builder().with_app(app).build().await);
-
-            tokio::select! {
-                () = tokio::time::sleep(std::time::Duration::from_secs(30)) => {
-                    return Err("Timed out waiting for datasets to load".to_string());
-                }
-                () = Arc::clone(&rt).load_components() => {}
-            }
-
-            runtime_ready_check(&rt).await;
-
-            // Run multiple concurrent queries to test connection pool
-            let queries = [
-                "SELECT COUNT(*) FROM concurrent_test",
-                "SELECT category, SUM(value) FROM concurrent_test GROUP BY category",
-                "SELECT AVG(value) FROM concurrent_test WHERE category = 'A'",
-                "SELECT MAX(value), MIN(value) FROM concurrent_test",
-                "SELECT * FROM concurrent_test WHERE id < 100 ORDER BY id",
-                "SELECT category, COUNT(*) FROM concurrent_test GROUP BY category",
-                "SELECT value FROM concurrent_test WHERE value > 5000 ORDER BY value DESC LIMIT 10",
-                "SELECT DISTINCT category FROM concurrent_test ORDER BY category",
-            ];
-
-            let num_iterations = 3;
-            let mut handles = Vec::new();
-
-            for iteration in 0..num_iterations {
-                for (i, query) in queries.iter().enumerate() {
-                    let rt_clone = Arc::clone(&rt);
-                    let query = (*query).to_string();
-                    let handle = tokio::spawn(async move {
-                        let result = rt_clone
-                            .datafusion()
-                            .query_builder(&query)
-                            .build()
-                            .run()
-                            .await;
-
-                        match result {
-                            Ok(query_result) => {
-                                let batches: Result<Vec<RecordBatch>, _> =
-                                    query_result.data.try_collect().await;
-                                match batches {
-                                    Ok(b) => {
-                                        tracing::debug!(
-                                            "Query {}-{} completed: {} batches",
-                                            iteration,
-                                            i,
-                                            b.len()
-                                        );
-                                        Ok(())
-                                    }
-                                    Err(e) => {
-                                        Err(format!("Query {iteration}-{i} collection failed: {e}"))
-                                    }
-                                }
-                            }
-                            Err(e) => Err(format!("Query {iteration}-{i} execution failed: {e}")),
-                        }
-                    });
-                    handles.push(handle);
-                }
-            }
-
-            // Wait for all concurrent queries to complete
-            let results: Vec<_> = futures::future::join_all(handles).await;
-
-            // Check for any failures
-            let mut errors = Vec::new();
-            for (i, result) in results.into_iter().enumerate() {
-                match result {
-                    Ok(Ok(())) => {}
-                    Ok(Err(e)) => errors.push(format!("Task {i}: {e}")),
-                    Err(e) => errors.push(format!("Task {i} panicked: {e}")),
-                }
-            }
-
-            if !errors.is_empty() {
-                return Err(format!(
-                    "DuckDB connection pool test FAILED - {} queries failed out of {}:\n{}",
-                    errors.len(),
-                    num_iterations * queries.len(),
-                    errors.join("\n")
-                ));
-            }
-
-            tracing::info!(
-                "DuckDB connection pool test PASSED - {} concurrent queries completed successfully",
-                num_iterations * queries.len()
-            );
-
-            rt.shutdown().await;
-            Ok(())
-        })
-        .await
-}
-
-/// A Parquet file written with an all-null column has `DataType::Null` in its Arrow schema
-/// metadata (logical type Unknown). `DuckDB` doesn't have a Null type and silently coerces
-/// it to INT32 when creating the acceleration table. Without the fix this produces a schema
-/// mismatch at query time; with the fix the accelerator normalises the column to INT32 before
-/// creating the table so both sides agree.
-#[tokio::test]
-async fn duckdb_acceleration_null_typed_parquet_column() -> Result<(), String> {
-    use arrow::array::{Int64Array, NullArray};
-    use arrow::datatypes::{DataType, Field, Schema};
-    use arrow::record_batch::RecordBatch;
-    use datafusion::parquet::arrow::ArrowWriter;
-
-    let _tracing = init_tracing(Some("integration=debug,info"));
-    register_test_connectors().await;
-
-    test_request_context()
-        .scope(async {
-            // Build a parquet file whose `untyped` column carries DataType::Null — the same
-            // situation as a pyarrow file where every value in a column is null and the
-            // column was never given an explicit type.
-            let schema = Arc::new(Schema::new(vec![
-                Field::new("id", DataType::Int64, false),
-                Field::new("untyped", DataType::Null, true),
-            ]));
-            let batch = RecordBatch::try_new(
-                Arc::clone(&schema),
-                vec![
-                    Arc::new(Int64Array::from(vec![1, 2, 3])),
-                    Arc::new(NullArray::new(3)),
-                ],
-            )
-            .map_err(|e| format!("failed to create batch: {e}"))?;
-
-            let temp_dir =
-                tempfile::tempdir().map_err(|e| format!("failed to create temp dir: {e}"))?;
-            let parquet_path = temp_dir.path().join("null_col.parquet");
-            {
-                let file = std::fs::File::create(&parquet_path)
-                    .map_err(|e| format!("failed to create parquet file: {e}"))?;
-                let mut writer = ArrowWriter::try_new(file, Arc::clone(&schema), None)
-                    .map_err(|e| format!("failed to create ArrowWriter: {e}"))?;
-                writer
-                    .write(&batch)
-                    .map_err(|e| format!("failed to write batch: {e}"))?;
-                writer
-                    .close()
-                    .map_err(|e| format!("failed to close writer: {e}"))?;
-            }
-
-            let mut dataset = Dataset::new(
-                format!("duckdb:read_parquet('{}')", parquet_path.display()),
-                "null_col_parquet".to_string(),
-            );
-            dataset.name = "null_col_parquet".to_string();
-            dataset.acceleration = Some(Acceleration {
-                enabled: true,
-                engine: Some("duckdb".to_string()),
-                mode: Mode::Memory,
-                refresh_mode: Some(RefreshMode::Full),
-                ..Acceleration::default()
-            });
-
-            let app = AppBuilder::new("duckdb_null_col_test")
-                .with_dataset(dataset)
-                .build();
-
-            configure_test_datafusion();
-            let rt = Runtime::builder().with_app(app).build().await;
-            let cloned_rt = Arc::new(rt);
-
-            tokio::select! {
-                () = tokio::time::sleep(std::time::Duration::from_secs(30)) => {
-                    return Err("Timed out waiting for dataset to load".to_string());
-                }
-                () = Arc::clone(&cloned_rt).load_components() => {}
-            }
-
-            runtime_ready_check(&cloned_rt).await;
-
-            let result = cloned_rt
-                .datafusion()
-                .query_builder("SELECT id, untyped FROM null_col_parquet ORDER BY id")
-                .build()
-                .run()
-                .await
-                .map_err(|e| format!("query failed: {e}"))?;
-
-            let batches: Vec<RecordBatch> = result
-                .data
-                .try_collect()
-                .await
-                .map_err(|e| format!("failed to collect results: {e}"))?;
-
-            assert_batches_eq!(
-                [
-                    "+----+---------+",
-                    "| id | untyped |",
-                    "+----+---------+",
-                    "| 1  |         |",
-                    "| 2  |         |",
-                    "| 3  |         |",
-                    "+----+---------+",
-                ],
-                &batches
-            );
-
-            let result = cloned_rt
-                .datafusion()
-                .query_builder("describe null_col_parquet")
-                .build()
-                .run()
-                .await
-                .map_err(|e| format!("query failed: {e}"))?;
-
-            let batches: Vec<RecordBatch> = result
-                .data
-                .try_collect()
-                .await
-                .map_err(|e| format!("failed to collect results: {e}"))?;
-
-            assert_batches_eq!(
-                [
-                    "+-------------+-----------+-------------+",
-                    "| column_name | data_type | is_nullable |",
-                    "+-------------+-----------+-------------+",
-                    "| id          | Int64     | YES         |",
-                    "| untyped     | Int32     | YES         |",
-                    "+-------------+-----------+-------------+",
-                ],
-                &batches
             );
 
             Ok(())
@@ -1395,14 +627,14 @@ async fn duckdb_federated_inner_product_nulls_a_non_finite_result() -> Result<()
 
     test_request_context()
         .scope(async {
-            // A TempDir rather than a NamedTempFile: `duckdb::Connection::open`
+            // A TempDir rather than a NamedTempFile: `duckdb_oracle::Connection::open`
             // wants to create the database itself, and the directory guard is
             // what removes it (and DuckDB's `.wal` sidecar) when the test ends.
             let db_dir = tempfile::tempdir().expect("should create temp dir");
             let db_path = db_dir.path().join("vecs.db");
 
             {
-                let conn = duckdb::Connection::open(&db_path)
+                let conn = duckdb_oracle::Connection::open(&db_path)
                     .map_err(|e| format!("failed to open duckdb file: {e}"))?;
                 conn.execute_batch(
                     "CREATE TABLE vecs (id INTEGER, emb FLOAT[3], q FLOAT[3]);
@@ -1535,6 +767,36 @@ async fn duckdb_federated_inner_product_nulls_a_non_finite_result() -> Result<()
         .await
 }
 
+/// The rows of an `EXPLAIN` as `plan_type: line`, one plan line each, with the
+/// tokens that change from run to run replaced: the view a `duckdb:` table function
+/// is read through is named after the file path it reads, and the compute context
+/// is a fresh identifier per database.
+fn stable_plan(batches: &[RecordBatch]) -> String {
+    let view = regex::Regex::new(r"spice_duckdb_[0-9a-f]+__view").expect("a valid pattern");
+    let context = regex::Regex::new(r"compute_context=\S+").expect("a valid pattern");
+    let mut lines = Vec::new();
+    for batch in batches {
+        let column = |index: usize| {
+            batch
+                .column(index)
+                .as_any()
+                .downcast_ref::<arrow::array::StringArray>()
+                .expect("EXPLAIN returns string columns")
+        };
+        let (plan_types, plans) = (column(0), column(1));
+        for row in 0..batch.num_rows() {
+            for line in plans.value(row).lines() {
+                lines.push(format!("{}: {}", plan_types.value(row), line.trim_end()));
+            }
+        }
+    }
+    let plan = lines.join("\n");
+    let plan = view.replace_all(&plan, "<duckdb_view>");
+    context
+        .replace_all(&plan, "compute_context=<id>")
+        .into_owned()
+}
+
 /// `EXPLAIN` a statement and return the formatted plan.
 async fn formatted_explain(rt: &Runtime, sql: &str) -> Result<String, String> {
     let batches: Vec<RecordBatch> = rt
@@ -1581,146 +843,6 @@ async fn sorted_int64_column(rt: &Runtime, sql: &str) -> Result<Vec<i64>, String
     Ok(values)
 }
 
-/// A `DuckDB` accelerator with an `indexes` entry must rewrite a scan whose
-/// `WHERE` covers the indexed column plus at least one other column into a
-/// materialized CTE bound to that index.
-///
-/// `DuckDBIntermediateIndexMaterializationOptimizer` reads the index list off the
-/// `DuckSqlExec` the accelerator's table builds, and returns the plan untouched
-/// when that list is empty. So the rule can be switched off end to end by a change
-/// on either side of the table/exec boundary, with nothing to show for it but a
-/// slower plan — no error, no wrong rows, and no failing test until this one.
-///
-/// Three things about the query shape are load-bearing:
-///
-/// * `query_federation: disabled` is what puts a `DuckSqlExec` in the plan at all.
-///   With acceleration federation on, the scan is handed to the federation
-///   provider's own SQL executor and there is no exec node for the rule to rewrite.
-/// * Two predicates, only one of them on the indexed column. A single predicate on
-///   the indexed column alone is the already-optimal case the rule declines.
-/// * No `ORDER BY`: the materialization is not currently supported alongside a
-///   sort that reaches the scan, so a sorted query would not exercise the rewrite.
-///
-/// The unindexed dataset is the control: it pins that the CTE comes from the index
-/// rather than from something the accelerator does to every query, and that the
-/// rewrite returns the same rows as the plan it replaces.
-#[tokio::test]
-async fn duckdb_accelerator_materializes_an_indexed_filter_into_a_cte() -> Result<(), String> {
-    use spicepod::acceleration::IndexType;
-    use spicepod::param::Params;
-    use std::collections::HashMap;
-
-    fn accelerated_csv_dataset(
-        ds_name: &str,
-        csv_path: &std::path::Path,
-        indexes: HashMap<String, IndexType>,
-    ) -> Dataset {
-        let mut dataset = Dataset::new(format!("file:{}", csv_path.display()), ds_name.to_string());
-        dataset.name = ds_name.to_string();
-        dataset.acceleration = Some(Acceleration {
-            enabled: true,
-            engine: Some("duckdb".to_string()),
-            mode: Mode::Memory,
-            refresh_mode: Some(RefreshMode::Full),
-            indexes,
-            params: Some(Params::from_string_map(HashMap::from([(
-                "query_federation".to_string(),
-                "disabled".to_string(),
-            )]))),
-            ..Acceleration::default()
-        });
-        dataset
-    }
-
-    let _tracing = init_tracing(Some("integration=debug,info"));
-    register_test_connectors().await;
-
-    test_request_context()
-        .scope(async {
-            let temp_dir = std::env::temp_dir().join("spiced_duckdb_index_cte_test");
-            std::fs::create_dir_all(&temp_dir).expect("failed to create temp dir");
-            defer! {
-                std::fs::remove_dir_all(&temp_dir).expect("failed to remove temp dir");
-            }
-
-            let csv_path = temp_dir.join("trips.csv");
-            let rows = (0..200)
-                .map(|id| {
-                    let city = if id % 2 == 0 { "sf" } else { "nyc" };
-                    let status = if id % 3 == 0 { "open" } else { "closed" };
-                    format!("{id},{city},{status}")
-                })
-                .collect::<Vec<_>>()
-                .join("\n");
-            std::fs::write(&csv_path, format!("id,city,status\n{rows}\n"))
-                .expect("failed to write csv");
-
-            let app = AppBuilder::new("duckdb_index_cte_test")
-                .with_dataset(accelerated_csv_dataset(
-                    "trips_indexed",
-                    &csv_path,
-                    HashMap::from([("city".to_string(), IndexType::Enabled)]),
-                ))
-                .with_dataset(accelerated_csv_dataset(
-                    "trips_unindexed",
-                    &csv_path,
-                    HashMap::new(),
-                ))
-                .build();
-
-            configure_test_datafusion();
-            let rt = Runtime::builder().with_app(app).build().await;
-            let cloned_rt = Arc::new(rt.clone());
-
-            tokio::select! {
-                () = tokio::time::sleep(std::time::Duration::from_mins(1)) => {
-                    return Err("Timed out waiting for datasets to load".to_string());
-                }
-                () = cloned_rt.load_components() => {}
-            }
-
-            runtime_ready_check(&rt).await;
-
-            let query = |table: &str| {
-                format!("SELECT id FROM {table} WHERE city = 'sf' AND status = 'open'")
-            };
-
-            let indexed_plan = formatted_explain(&rt, &query("trips_indexed")).await?;
-            assert!(
-                indexed_plan.contains("DuckSqlExec"),
-                "the accelerated scan must reach DuckDB through a DuckSqlExec, which is the node \
-                 carrying the index list; plan was:\n{indexed_plan}"
-            );
-            assert!(
-                indexed_plan.contains("_intermediate_materialize"),
-                "the filter on the indexed column must be materialized into a CTE; \
-                 plan was:\n{indexed_plan}"
-            );
-
-            let unindexed_plan = formatted_explain(&rt, &query("trips_unindexed")).await?;
-            assert!(
-                !unindexed_plan.contains("_intermediate_materialize"),
-                "a dataset with no index must not get the CTE, or the assertion above \
-                 says nothing about the index; plan was:\n{unindexed_plan}"
-            );
-
-            // The rewrite must not change the answer.
-            let indexed_rows = sorted_int64_column(&rt, &query("trips_indexed")).await?;
-            let unindexed_rows = sorted_int64_column(&rt, &query("trips_unindexed")).await?;
-            assert_eq!(
-                unindexed_rows, indexed_rows,
-                "the CTE rewrite returned different rows than the plan it replaced"
-            );
-            assert!(
-                !indexed_rows.is_empty(),
-                "the query must match rows, or neither plan is exercised"
-            );
-
-            Ok(())
-        })
-        .await
-}
-
 /// The `id`s a query returns, in order, with `parameters` bound positionally.
 async fn binary_filter_ids(
     rt: &Runtime,
@@ -1763,8 +885,7 @@ async fn binary_filter_ids(
 /// *text* `'xff'`: compared against a BLOB column it matched the row holding
 /// the bytes `xff` instead of the byte `0xFF`, with no error. The literal
 /// therefore must not reach `DuckDB` in that spelling, whether it was written
-/// as a literal, folded from a cast, or bound as a parameter, and whether the
-/// table is `DuckDB`-federated or `DuckDB`-accelerated.
+/// as a literal, folded from a cast, or bound as a parameter.
 #[tokio::test]
 async fn duckdb_binary_literal_filters_agree_with_local_evaluation() -> Result<(), String> {
     use datafusion::common::{ParamValues, ScalarValue};
@@ -1777,7 +898,7 @@ async fn duckdb_binary_literal_filters_agree_with_local_evaluation() -> Result<(
             let db_dir = tempfile::tempdir().expect("should create temp dir");
             let db_path = db_dir.path().join("blobs.db");
             {
-                let conn = duckdb::Connection::open(&db_path)
+                let conn = duckdb_oracle::Connection::open(&db_path)
                     .map_err(|e| format!("failed to open duckdb file: {e}"))?;
                 conn.execute_batch(
                     "CREATE TABLE blobs (id INTEGER, b BLOB);
@@ -1811,7 +932,6 @@ async fn duckdb_binary_literal_filters_agree_with_local_evaluation() -> Result<(
 
             let app = AppBuilder::new("duckdb_binary_literal_filters")
                 .with_dataset(dataset("federated", None))
-                .with_dataset(dataset("duckdb_accelerated", Some("duckdb")))
                 .with_dataset(dataset("local", Some("arrow")))
                 .build();
 
@@ -1855,7 +975,7 @@ async fn duckdb_binary_literal_filters_agree_with_local_evaluation() -> Result<(
                     "local evaluation of `{predicate}` is the reference"
                 );
 
-                for table in ["federated", "duckdb_accelerated"] {
+                for table in ["federated"] {
                     let sql = format!("SELECT id FROM {table} WHERE {predicate} ORDER BY id");
                     let ids = binary_filter_ids(&rt, &sql, parameters.clone()).await?;
                     let plan = if parameters.is_none() {
@@ -1882,7 +1002,7 @@ async fn duckdb_binary_literal_filters_agree_with_local_evaluation() -> Result<(
             let projection = "SELECT id, b = X'ff' AS is_ff, X'00ff' AS literal \
                               FROM {table} ORDER BY id";
             let mut rendered = Vec::new();
-            for table in ["local", "federated", "duckdb_accelerated"] {
+            for table in ["local", "federated"] {
                 let sql = projection.replace("{table}", table);
                 let batches: Vec<RecordBatch> = rt
                     .datafusion()
@@ -1922,235 +1042,6 @@ async fn duckdb_binary_literal_filters_agree_with_local_evaluation() -> Result<(
                 rendered[1], rendered[0],
                 "federated projection must agree with local"
             );
-            assert_eq!(
-                rendered[2], rendered[0],
-                "accelerated projection must agree with local"
-            );
-
-            Ok(())
-        })
-        .await
-}
-
-/// Every row a statement returns, each rendered as `col|col|…` (`NULL` for a
-/// null), sorted so two answers compare as multisets.
-async fn sorted_rows(rt: &Runtime, sql: &str) -> Result<Vec<String>, String> {
-    use arrow::util::display::{ArrayFormatter, FormatOptions};
-
-    let batches: Vec<RecordBatch> = rt
-        .datafusion()
-        .query_builder(sql)
-        .build()
-        .run()
-        .await
-        .map_err(|e| format!("query `{sql}` failed: {e}"))?
-        .data
-        .try_collect()
-        .await
-        .map_err(|e| format!("query `{sql}` collect failed: {e}"))?;
-
-    let options = FormatOptions::default().with_null("NULL");
-    let mut rows = Vec::new();
-    for batch in &batches {
-        let formatters = batch
-            .columns()
-            .iter()
-            .map(|column| ArrayFormatter::try_new(column.as_ref(), &options))
-            .collect::<Result<Vec<_>, _>>()
-            .map_err(|e| format!("failed to format the rows of `{sql}`: {e}"))?;
-        for row in 0..batch.num_rows() {
-            rows.push(
-                formatters
-                    .iter()
-                    .map(|formatter| formatter.value(row).to_string())
-                    .collect::<Vec<_>>()
-                    .join("|"),
-            );
-        }
-    }
-    rows.sort_unstable();
-    Ok(rows)
-}
-
-/// `INTERSECT` and `EXCEPT` compare rows with NULLs treated as equal, and must
-/// keep doing so when the whole query is handed to `DuckDB` as SQL. They are
-/// sent as `EXISTS`/`NOT EXISTS` subqueries, and correlating those with `=`
-/// made every row with a NULL in a compared column drop out of an `INTERSECT`
-/// and survive an `EXCEPT`: TPC-DS q38 counted 0 rows instead of 111, and q87
-/// 46704 instead of 46449 (regression test for #14941).
-///
-/// The same three tables are accelerated twice: into one `DuckDB` file, where
-/// the set operation is pushed down, and into Arrow, where `DataFusion`
-/// evaluates it. Each query must return the same rows from both, and the rows
-/// written out below.
-#[tokio::test]
-async fn duckdb_file_acceleration_set_operations_match_nulls() -> Result<(), String> {
-    use arrow::array::{Int64Array, StringArray};
-    use arrow::datatypes::{DataType, Field, Schema};
-    use datafusion::parquet::arrow::ArrowWriter;
-    use spicepod::param::Params;
-    use std::collections::HashMap;
-
-    let _tracing = init_tracing(Some("integration=debug,info"));
-    register_test_connectors().await;
-
-    test_request_context()
-        .scope(async {
-            let temp_dir =
-                tempfile::tempdir().map_err(|e| format!("failed to create temp dir: {e}"))?;
-            let schema = Arc::new(Schema::new(vec![
-                Field::new("name", DataType::Utf8, true),
-                Field::new("day", DataType::Int64, true),
-            ]));
-            let write_table = |table: &str,
-                               names: Vec<Option<&str>>,
-                               days: Vec<Option<i64>>|
-             -> Result<std::path::PathBuf, String> {
-                let batch = RecordBatch::try_new(
-                    Arc::clone(&schema),
-                    vec![
-                        Arc::new(StringArray::from(names)),
-                        Arc::new(Int64Array::from(days)),
-                    ],
-                )
-                .map_err(|e| format!("failed to build table {table}: {e}"))?;
-                let path = temp_dir.path().join(format!("{table}.parquet"));
-                let file = std::fs::File::create(&path)
-                    .map_err(|e| format!("failed to create {}: {e}", path.display()))?;
-                let mut writer = ArrowWriter::try_new(file, Arc::clone(&schema), None)
-                    .map_err(|e| format!("failed to open a writer for {table}: {e}"))?;
-                writer
-                    .write(&batch)
-                    .map_err(|e| format!("failed to write {table}: {e}"))?;
-                writer
-                    .close()
-                    .map_err(|e| format!("failed to close {table}: {e}"))?;
-                Ok(path)
-            };
-
-            let tables = [
-                (
-                    "a",
-                    write_table(
-                        "a",
-                        vec![None, None, Some("x"), Some("y"), Some("z"), None],
-                        vec![Some(1), Some(1), Some(2), None, Some(3), None],
-                    )?,
-                ),
-                (
-                    "b",
-                    write_table(
-                        "b",
-                        vec![None, Some("x"), Some("y"), Some("w")],
-                        vec![Some(1), Some(2), None, Some(4)],
-                    )?,
-                ),
-                (
-                    "c",
-                    write_table(
-                        "c",
-                        vec![None, Some("y"), Some("x")],
-                        vec![Some(1), None, Some(5)],
-                    )?,
-                ),
-            ];
-
-            let duckdb_file = temp_dir.path().join("set_operations.db");
-            let mut app = AppBuilder::new("duckdb_set_operations_test");
-            for (table, path) in &tables {
-                for engine in ["duckdb", "arrow"] {
-                    let name = format!("{table}_{engine}");
-                    let mut dataset =
-                        Dataset::new(format!("file:{}", path.display()), name.clone());
-                    dataset.name = name;
-                    dataset.acceleration = Some(Acceleration {
-                        enabled: true,
-                        engine: Some(engine.to_string()),
-                        mode: if engine == "duckdb" {
-                            Mode::File
-                        } else {
-                            Mode::Memory
-                        },
-                        refresh_mode: Some(RefreshMode::Full),
-                        params: (engine == "duckdb").then(|| {
-                            Params::from_string_map(HashMap::from([(
-                                "duckdb_file".to_string(),
-                                duckdb_file.display().to_string(),
-                            )]))
-                        }),
-                        ..Acceleration::default()
-                    });
-                    app = app.with_dataset(dataset);
-                }
-            }
-
-            configure_test_datafusion();
-            let rt = Runtime::builder().with_app(app.build()).build().await;
-            let cloned_rt = Arc::new(rt.clone());
-
-            tokio::select! {
-                () = tokio::time::sleep(std::time::Duration::from_mins(1)) => {
-                    return Err("Timed out waiting for datasets to load".to_string());
-                }
-                () = cloned_rt.load_components() => {}
-            }
-
-            runtime_ready_check(&rt).await;
-
-            // Each `{a}`, `{b}` and `{c}` stands for `SELECT name, day` from that
-            // table, accelerated by the engine under test.
-            let cases = [
-                ("INTERSECT", "{a} INTERSECT {b}", vec!["NULL|1", "x|2", "y|NULL"]),
-                ("EXCEPT", "{a} EXCEPT {b}", vec!["NULL|NULL", "z|3"]),
-                // The shape of TPC-DS q38: a chained INTERSECT, counted.
-                (
-                    "chained INTERSECT",
-                    "SELECT count(*) FROM ({a} INTERSECT {b} INTERSECT {c}) AS s",
-                    vec!["2"],
-                ),
-                // The shape of TPC-DS q87: a chained EXCEPT, counted.
-                (
-                    "chained EXCEPT",
-                    "SELECT count(*) FROM ({a} EXCEPT {b} EXCEPT {c}) AS s",
-                    vec!["2"],
-                ),
-                (
-                    "INTERSECT under a filter",
-                    "SELECT * FROM ({a} INTERSECT {b}) AS s WHERE name IS NULL OR day IS NULL",
-                    vec!["NULL|1", "y|NULL"],
-                ),
-            ];
-            let render = |template: &str, engine: &str| {
-                ["a", "b", "c"].iter().fold(template.to_string(), |sql, table| {
-                    sql.replace(
-                        &format!("{{{table}}}"),
-                        &format!("SELECT name, day FROM {table}_{engine}"),
-                    )
-                })
-            };
-
-            let mut failures = Vec::new();
-            for (label, template, expected) in &cases {
-                let duckdb_sql = render(template, "duckdb");
-                let arrow_sql = render(template, "arrow");
-
-                let plan = formatted_explain(&rt, &duckdb_sql).await?;
-                if !plan.contains("EXISTS") {
-                    failures.push(format!(
-                        "{label}: the set operation was not pushed down to DuckDB, so this case \
-                         does not test the SQL sent there; plan was:\n{plan}"
-                    ));
-                }
-
-                let duckdb_rows = sorted_rows(&rt, &duckdb_sql).await?;
-                let arrow_rows = sorted_rows(&rt, &arrow_sql).await?;
-                if duckdb_rows != arrow_rows || arrow_rows != *expected {
-                    failures.push(format!(
-                        "{label}: `{duckdb_sql}`\n    duckdb:   {duckdb_rows:?}\n    arrow:    {arrow_rows:?}\n    expected: {expected:?}"
-                    ));
-                }
-            }
-            assert!(failures.is_empty(), "{}", failures.join("\n"));
 
             Ok(())
         })
@@ -2177,7 +1068,7 @@ async fn duckdb_federated_union_keeps_each_inputs_own_bound() -> Result<(), Stri
         .scope(async {
             let db_dir = tempfile::tempdir().expect("should create temp dir");
             let db_path = db_dir.path().join("union_bounds.db");
-            let oracle = duckdb::Connection::open(&db_path)
+            let oracle = duckdb_oracle::Connection::open(&db_path)
                 .map_err(|e| format!("failed to open duckdb file: {e}"))?;
             oracle
                 .execute_batch(
@@ -2227,13 +1118,19 @@ async fn duckdb_federated_union_keeps_each_inputs_own_bound() -> Result<(), Stri
             ];
             for (sql, expected) in cases {
                 let mut from_duckdb: Vec<i64> = oracle
-                    .prepare(sql)
-                    .and_then(|mut statement| {
-                        statement
-                            .query_map([], |row| row.get::<_, i64>(0))?
-                            .collect::<Result<Vec<_>, _>>()
+                    .query(sql)
+                    .map_err(|e| format!("`{sql}` failed in DuckDB: {e}"))?
+                    .iter()
+                    .flat_map(|batch| {
+                        batch
+                            .column(0)
+                            .as_any()
+                            .downcast_ref::<arrow::array::Int64Array>()
+                            .expect("`a` is BIGINT")
+                            .values()
+                            .to_vec()
                     })
-                    .map_err(|e| format!("`{sql}` failed in DuckDB: {e}"))?;
+                    .collect();
                 from_duckdb.sort_unstable();
                 assert_eq!(
                     from_duckdb, expected,

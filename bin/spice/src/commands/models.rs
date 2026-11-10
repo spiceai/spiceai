@@ -17,7 +17,7 @@ limitations under the License.
 //! Models command implementation - lists models loaded by the runtime.
 
 use crate::context::RuntimeContext;
-use crate::error::{self, InvalidResponseSnafu, Result, RuntimeUnavailableSnafu};
+use crate::error::{self, InvalidResponseSnafu, Result};
 use crate::output::{OutputFormat, TableRow, write_json, write_table};
 use clap::Args;
 use runtime_api_types::v1::{ModelInfo, ModelListResponse};
@@ -59,12 +59,10 @@ impl TableRow for ModelInfo {
 
 /// Execute the models command.
 pub async fn execute(ctx: &RuntimeContext, args: &ModelsArgs) -> Result<()> {
-    let response = ctx.get("/v1/models?status=true").await.map_err(|_| {
-        RuntimeUnavailableSnafu {
-            endpoint: ctx.http_endpoint().to_string(),
-        }
-        .build()
-    })?;
+    let response = ctx
+        .get("/v1/models?status=true")
+        .await
+        .map_err(|e| error::runtime_unreachable(ctx.http_endpoint(), &e))?;
 
     let response = error::check_response(response, ctx.http_endpoint()).await?;
 

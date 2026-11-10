@@ -37,7 +37,10 @@ use super::{create_api_bindings_config, get_anthropic_model, get_xai_model};
 use crate::{
     init_tracing,
     models::openai::get_openai_model,
-    utils::{runtime_ready_check, test_request_context, verify_env_secret_exists},
+    utils::{
+        anthropic_credential_secret, openai_credential_secret, runtime_ready_check,
+        test_request_context, verify_env_secret_exists,
+    },
 };
 
 const REFUND: &str = "I was charged twice for my order and I want my money back today.";
@@ -49,7 +52,7 @@ struct Provider {
     /// Names the provider's test, and the model in the Spicepod.
     label: &'static str,
     /// Secrets the model reads, which a run must have.
-    secrets: &'static [&'static str],
+    secrets: fn() -> Vec<&'static str>,
     build: fn(&str) -> Model,
 }
 
@@ -61,10 +64,14 @@ fn openai_chat(name: &str) -> Model {
     model
 }
 
-/// An `OpenAI` decision model, which answers through `OpenAI`'s Decisions API.
+/// An `OpenAI` decision model, which answers through `OpenAI`'s Decisions API. It takes only
+/// an API key, not the workload identity federation params of chat models.
 fn openai_decisions(name: &str) -> Model {
-    let mut model = openai_chat(name);
-    model.from = "openai:gpt-6-luna".to_string();
+    let mut model = Model::new("openai:gpt-6-luna", name);
+    model.params.insert(
+        "openai_api_key".to_string(),
+        "${ secrets:SPICE_OPENAI_API_KEY }".into(),
+    );
     model
 }
 
@@ -94,33 +101,40 @@ fn bedrock(name: &str) -> Model {
 const PROVIDERS: &[Provider] = &[
     Provider {
         label: "openai_chat",
-        secrets: &["SPICE_OPENAI_API_KEY"],
+        secrets: || vec![openai_credential_secret()],
         build: openai_chat,
     },
     Provider {
         label: "openai_decisions",
-        secrets: &["SPICE_OPENAI_API_KEY"],
+        secrets: || vec!["SPICE_OPENAI_API_KEY"],
         build: openai_decisions,
     },
     Provider {
         label: "anthropic",
-        secrets: &["SPICE_ANTHROPIC_API_KEY"],
+        secrets: || vec![anthropic_credential_secret()],
         build: anthropic,
     },
     Provider {
         label: "xai",
-        secrets: &["SPICE_XAI_API_KEY"],
+        secrets: || vec!["SPICE_XAI_API_KEY"],
         build: xai,
     },
     Provider {
         label: "typesafe",
-        secrets: &["TYPESAFE_API_KEY"],
+        secrets: || vec!["TYPESAFE_API_KEY"],
         build: typesafe,
     },
     #[cfg(feature = "bedrock")]
     Provider {
         label: "bedrock",
-        secrets: &["AWS_BEDROCK_KEY", "AWS_BEDROCK_SECRET"],
+        // Without `AWS_BEDROCK_KEY`, spiced uses the AWS credential chain instead.
+        secrets: || {
+            if std::env::var_os("AWS_BEDROCK_KEY").is_some() {
+                vec!["AWS_BEDROCK_KEY", "AWS_BEDROCK_SECRET"]
+            } else {
+                vec![]
+            }
+        },
         build: bedrock,
     },
 ];
@@ -323,7 +337,7 @@ async fn provider_answers_decisions(
 
     test_request_context()
         .scope(async {
-            for secret in provider.secrets {
+            for secret in (provider.secrets)() {
                 verify_env_secret_exists(secret)
                     .await
                     .map_err(anyhow::Error::msg)?;
@@ -346,7 +360,7 @@ async fn decisions_route_by_model_name() -> Result<(), anyhow::Error> {
     let _tracing = init_tracing(None);
     test_request_context()
         .scope(async {
-            for secret in ["SPICE_OPENAI_API_KEY", "SPICE_ANTHROPIC_API_KEY"] {
+            for secret in [openai_credential_secret(), anthropic_credential_secret()] {
                 verify_env_secret_exists(secret)
                     .await
                     .map_err(anyhow::Error::msg)?;

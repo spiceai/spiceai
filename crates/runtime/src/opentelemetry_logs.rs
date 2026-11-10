@@ -83,6 +83,10 @@ pub const MAX_LOGS_BATCH_ROWS: usize = 8192;
 /// its 32-bit Arrow offset limit when resource and scope values repeat across many rows.
 const MAX_LOGS_BATCH_STRING_BYTES: usize = 256 * 1024 * 1024;
 
+/// Expanded string bytes per logs export, across all its batches. Resource and scope values
+/// repeat on every row, so a small export can otherwise expand to an unbounded size.
+const MAX_LOGS_EXPORT_STRING_BYTES: usize = 4 * MAX_LOGS_MESSAGE_BYTES;
+
 /// Largest OTLP logs message the gRPC receiver accepts, the same bound as an OTLP/HTTP body.
 /// The gRPC default of 4 MiB rejects a Collector batch of 8,192 records of about 500 bytes.
 pub const MAX_LOGS_MESSAGE_BYTES: usize = 128 * 1024 * 1024;
@@ -469,6 +473,7 @@ pub fn export_to_batches(
         received_unix_nano,
         max_rows,
         MAX_LOGS_BATCH_STRING_BYTES,
+        MAX_LOGS_EXPORT_STRING_BYTES,
     )
 }
 
@@ -477,6 +482,7 @@ fn export_to_batches_with_limits(
     received_unix_nano: u64,
     max_rows: usize,
     max_string_bytes: usize,
+    max_export_string_bytes: usize,
 ) -> Result<LogsBatches, ArrowError> {
     let max_rows = max_rows.max(1);
     let max_string_bytes = max_string_bytes.max(1);
@@ -484,6 +490,7 @@ fn export_to_batches_with_limits(
     let mut batches = Vec::with_capacity(total.div_ceil(max_rows));
     let mut rejected = 0;
     let mut batch_string_bytes = 0_usize;
+    let mut export_string_bytes = 0_usize;
     let mut builders = LogsBuilders::with_capacity(total.min(max_rows));
     for resource_logs in &request.resource_logs {
         let resource = ResourceColumns::new(
@@ -513,6 +520,12 @@ fn export_to_batches_with_limits(
                     return Err(ArrowError::InvalidArgumentError(format!(
                         "The OpenTelemetry logs export contains one record that expands to {} string bytes, above the per-batch limit of {max_string_bytes} bytes; reduce the record's body or attributes",
                         prepared.string_bytes
+                    )));
+                }
+                export_string_bytes = export_string_bytes.saturating_add(prepared.string_bytes);
+                if export_string_bytes > max_export_string_bytes {
+                    return Err(ArrowError::InvalidArgumentError(format!(
+                        "The OpenTelemetry logs export expands to more than {max_export_string_bytes} string bytes, with resource and scope attributes repeated on every record; send its records in smaller exports"
                     )));
                 }
                 if builders.len() > 0
@@ -1123,7 +1136,7 @@ mod tests {
     fn expanded_strings_split_batches_at_the_byte_limit() {
         let request = request_with(vec![], None, vec![LogRecord::default(); 5]);
         // Each empty record adds "{}" to its record, resource and scope attribute columns.
-        let batches = export_to_batches_with_limits(&request, RECEIVED, usize::MAX, 12)
+        let batches = export_to_batches_with_limits(&request, RECEIVED, usize::MAX, 12, usize::MAX)
             .expect("batches")
             .batches;
         let sizes: Vec<usize> = batches.iter().map(RecordBatch::num_rows).collect();
@@ -1133,7 +1146,9 @@ mod tests {
     #[test]
     fn a_record_larger_than_the_byte_limit_is_invalid() {
         let request = request_with(vec![], None, vec![LogRecord::default()]);
-        let Err(error) = export_to_batches_with_limits(&request, RECEIVED, usize::MAX, 5) else {
+        let Err(error) =
+            export_to_batches_with_limits(&request, RECEIVED, usize::MAX, 5, usize::MAX)
+        else {
             panic!("three empty attribute objects use six string bytes");
         };
         let ArrowError::InvalidArgumentError(message) = error else {
@@ -1142,6 +1157,32 @@ mod tests {
         assert_eq!(
             message,
             "The OpenTelemetry logs export contains one record that expands to 6 string bytes, above the per-batch limit of 5 bytes; reduce the record's body or attributes"
+        );
+    }
+
+    #[test]
+    fn an_export_that_expands_past_the_export_limit_is_invalid() {
+        // Each record repeats the 96-byte resource attributes and adds "{}" twice: 100 bytes.
+        let request = request_with(
+            vec![s("k", &"v".repeat(88))],
+            None,
+            vec![LogRecord::default(); 5],
+        );
+        let at_limit = export_to_batches_with_limits(&request, RECEIVED, 2, usize::MAX, 500)
+            .expect("an export at the limit is stored");
+        let sizes: Vec<usize> = at_limit.batches.iter().map(RecordBatch::num_rows).collect();
+        assert_eq!(sizes, vec![2, 2, 1]);
+
+        let Err(error) = export_to_batches_with_limits(&request, RECEIVED, 2, usize::MAX, 499)
+        else {
+            panic!("an export one byte over the limit must be rejected");
+        };
+        let ArrowError::InvalidArgumentError(message) = error else {
+            panic!("an oversized export must be an invalid argument");
+        };
+        assert_eq!(
+            message,
+            "The OpenTelemetry logs export expands to more than 499 string bytes, with resource and scope attributes repeated on every record; send its records in smaller exports"
         );
     }
 

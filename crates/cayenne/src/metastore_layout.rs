@@ -84,7 +84,7 @@ fn absolute_dir(path: &str, spelling: PathSpelling) -> std::io::Result<PathBuf> 
 
 /// Make a configured Cayenne *data* directory absolute, or `Ok(None)` when it is an
 /// object-store location (`s3://…`) — which can never contain the metastore, since
-/// `SQLite`/Turso cannot run on object storage.
+/// `SQLite` cannot run on object storage.
 ///
 /// The exemption belongs to the data path alone, because it is the data path a
 /// recursive delete walks. It must not be applied to a metadata path: [`is_local_path`]

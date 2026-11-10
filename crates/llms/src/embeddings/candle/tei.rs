@@ -43,7 +43,8 @@ use tei_core::{
 use tokenizers::{Tokenizer, TruncationDirection};
 
 use super::util::{
-    LoadedTokenization, download_hf_artifacts, inputs_from_openai, load_tokenization, pool_from_str,
+    LoadedTokenization, PoolConfig, download_hf_artifacts, inputs_from_openai, load_tokenization,
+    pool_from_str,
 };
 use crate::hf::HubParams;
 
@@ -97,30 +98,16 @@ impl TeiEmbed {
             model_root
         );
 
-        // Check if user provided pooling is valid, and only default to mean when user doesn't provide one.
-        let pool = if let Some(pooling) = pooling_overwrite {
-            match pool_from_str(&pooling) {
-                Some(pool) => pool,
-                None => {
-                    return Err(Error::FailedToCreateEmbedding {
-                        source: format!("Invalid pooling mode: {pooling}").into(),
-                    });
-                }
-            }
-        } else {
-            tracing::warn!(
-                "`params.pooling` not provided for embedding model. Often this can be found in `1_Pooling/config.json`. Defaulting to mean pooling."
-            );
-            Self::DEFAULT_POOLING_OPERATOR
-        };
+        // Only error if the user-provided value is incorrect; `from_dir` picks the default.
+        let pool = pooling_overwrite
+            .map(|pooling| {
+                pool_from_str(&pooling).ok_or_else(|| Error::FailedToCreateEmbedding {
+                    source: format!("Invalid pooling mode: {pooling}").into(),
+                })
+            })
+            .transpose()?;
 
-        Self::from_dir(
-            &model_root,
-            Some(pool),
-            max_seq_length_overwrite,
-            truncation,
-        )
-        .await
+        Self::from_dir(&model_root, pool, max_seq_length_overwrite, truncation).await
     }
 
     /// Downloads the model `model_id` (`org/name`) at `revision` from the Hugging Face Hub
@@ -181,9 +168,20 @@ impl TeiEmbed {
         } = load_tokenization(root, max_seq_length_overwrite).await?;
 
         // Load [`Backend`]
-        // TODO: add pooling parameter from https://github.com/spiceai/spiceai/pull/3174
-        let model_type =
-            ModelType::Embedding(pooling_overwrite.unwrap_or(Self::DEFAULT_POOLING_OPERATOR));
+        // `params.pooling` wins, then the model's `1_Pooling/config.json` (as
+        // `text-embeddings-inference` does), then mean pooling.
+        let pool = if let Some(pool) = pooling_overwrite {
+            pool
+        } else if let Some(pool) = PoolConfig::pool_from_dir(root) {
+            tracing::debug!("Using {pool:?} pooling from `1_Pooling/config.json`.");
+            pool
+        } else {
+            tracing::warn!(
+                "`params.pooling` not provided and no `1_Pooling/config.json` found for embedding model. Defaulting to mean pooling."
+            );
+            Self::DEFAULT_POOLING_OPERATOR
+        };
+        let model_type = ModelType::Embedding(pool);
 
         // Last 3 parameters are not used (since we are using `candle` feature flag).
         let backend = Backend::new(

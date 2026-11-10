@@ -1,8 +1,7 @@
 name: mysql-cdc-parity
 description: >
   MySQL binlog CDC converges to the source after inserts, updates, deletes, key
-  changes and large transactions, across a clean stop and a kill: Cayenne under
-  every metastore and deletion mode, and DuckDB.
+  changes and large transactions, across a clean stop and a kill: Cayenne under each deletion mode, and in memory.
 
 sources:
   src: { kind: mysql }
@@ -12,14 +11,8 @@ variants:
     datasets: { '*': { acceleration: { params: { cayenne_metastore: sqlite, cayenne_deletion_mode: key } } } }
   sqlite-position:
     datasets: { '*': { acceleration: { params: { cayenne_metastore: sqlite, cayenne_deletion_mode: position } } } }
-  turso-key:
-    datasets: { '*': { acceleration: { params: { cayenne_metastore: turso, cayenne_deletion_mode: key } } } }
-  turso-position:
-    datasets: { '*': { acceleration: { params: { cayenne_metastore: turso, cayenne_deletion_mode: position } } } }
-  duckdb:
-    datasets:
-      orders: { acceleration: { engine: duckdb, mode: memory, on_conflict: { o_id: upsert } } }
-      customers: { acceleration: { engine: duckdb, mode: memory, on_conflict: { c_id: upsert } } }
+  cayenne-memory:
+    datasets: { '*': { acceleration: { mode: memory } } }
 
 spicepod:
   version: v1

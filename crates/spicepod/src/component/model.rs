@@ -325,6 +325,20 @@ impl Model {
             .collect()
     }
 
+    /// The `files` entries a GGUF repository resolves: `.gguf` files, and names of a
+    /// quantization or its folder (`Q4_K_M`, `UD-Q2_K_XL/`, `model.v1`), typed `weights` or
+    /// untyped. Weights of another format and the model's other files are not among them.
+    /// Read from `files` as written: they name files of the repository, not of this machine, so
+    /// a local directory of the same name expands nothing.
+    #[must_use]
+    pub fn gguf_selectors(&self) -> Vec<String> {
+        self.files
+            .iter()
+            .filter(|f| f.is_gguf_selector())
+            .map(|f| f.path.clone())
+            .collect()
+    }
+
     /// Get all files for the model component, if a [`ModelFile`] is a directory, include all files in the directory too.
     #[must_use]
     pub fn get_all_files(&self) -> Vec<ModelFile> {
@@ -426,6 +440,14 @@ impl ModelFile {
         }
     }
 
+    /// Whether [`Model::gguf_selectors`] keeps this entry: typed `weights` or untyped, and not
+    /// weights of another format by its extension.
+    #[must_use]
+    pub fn is_gguf_selector(&self) -> bool {
+        matches!(self.file_type(), Some(ModelFileType::Weights) | None)
+            && !is_other_weights_format(&self.path)
+    }
+
     /// Returns the [`ModelFileType`] if explicitly set, otherwise attempts to determine the file
     /// type for the [`ModelFile`] based on the file path.
     #[must_use]
@@ -485,6 +507,15 @@ pub(crate) fn determine_type_from_path(p: &str) -> Option<ModelFileType> {
     }
 
     None
+}
+
+/// A weights file of a format other than GGUF, by the extensions [`is_llm_file`] recognizes.
+fn is_other_weights_format(path: &str) -> bool {
+    Path::new(path).extension().is_some_and(|extension| {
+        ["safetensors", "ggml", "bin"]
+            .iter()
+            .any(|other| extension.eq_ignore_ascii_case(other))
+    })
 }
 
 /// Returns true if the file is an LLM model file. Possible false negatives, but attempts to be positively certain (i.e. avoid false positives).
@@ -548,6 +579,59 @@ mod tests {
     }
 
     use super::*;
+
+    fn file(path: &str, r#type: Option<ModelFileType>) -> ModelFile {
+        ModelFile {
+            path: path.to_string(),
+            name: None,
+            r#type,
+            params: None,
+        }
+    }
+
+    #[test]
+    fn gguf_selectors_are_gguf_files_and_quantization_names() {
+        let mut model = Model::new("huggingface:huggingface.co/unsloth/Qwen3-0.6B-GGUF", "qwen");
+        model.files = vec![
+            file("Q4_K_M", Some(ModelFileType::Weights)),
+            file("model.v1", None),
+            file("UD-Q2_K_XL/", None),
+            file("gguf/Model-Q8_0.gguf", None),
+            file("Model-Q4_0.gguf", Some(ModelFileType::Weights)),
+            file("model.safetensors", None),
+            file(
+                "model-00001-of-00002.safetensors",
+                Some(ModelFileType::Weights),
+            ),
+            file("pytorch_model.bin", None),
+            file("config.json", None),
+            file("tokenizer.json", None),
+            file("chat.json", Some(ModelFileType::TokenizerConfig)),
+        ];
+        assert_eq!(
+            model.gguf_selectors(),
+            [
+                "Q4_K_M",
+                "model.v1",
+                "UD-Q2_K_XL/",
+                "gguf/Model-Q8_0.gguf",
+                "Model-Q4_0.gguf"
+            ]
+        );
+    }
+
+    /// `src` is a directory of this crate, where its tests run: a selector of the same name names
+    /// the repository's quantization or folder, not the local directory's files.
+    #[test]
+    fn a_selector_is_not_expanded_against_a_local_directory() {
+        assert!(
+            Path::new("src").is_dir(),
+            "the tests run in the crate's directory"
+        );
+        let mut model = Model::new("huggingface:huggingface.co/unsloth/Qwen3-0.6B-GGUF", "qwen");
+        model.files = vec![file("src", Some(ModelFileType::Weights))];
+        assert_eq!(model.gguf_selectors(), ["src"]);
+    }
 
     #[test]
     fn test_huggingface_path_regex() {

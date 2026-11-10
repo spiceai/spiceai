@@ -10,6 +10,10 @@ on:
     paths:
       - '.github/scripts/github_release.py'
       - '.github/scripts/test_github_release.py'
+      - '.github/scripts/get_release_version.py'
+      - '.github/scripts/test_get_release_version.py'
+      - '.github/scripts/publish_release.py'
+      - '.github/scripts/test_publish_release.py'
       - '.github/workflows/release_script_test.yml'
   push:
     branches:
@@ -17,6 +21,10 @@ on:
     paths:
       - '.github/scripts/github_release.py'
       - '.github/scripts/test_github_release.py'
+      - '.github/scripts/get_release_version.py'
+      - '.github/scripts/test_get_release_version.py'
+      - '.github/scripts/publish_release.py'
+      - '.github/scripts/test_publish_release.py'
       - '.github/workflows/release_script_test.yml'
   workflow_dispatch:
 
@@ -26,6 +34,7 @@ concurrency:
 
 jobs:
   test-github-release-script:
+    environment: secret-free
     name: Unit tests for github_release.py
     runs-on: ubuntu-24.04
     steps:
@@ -46,3 +55,9 @@ jobs:
         env:
           GITHUB_TOKEN: test-token
         run: python .github/scripts/test_github_release.py -v
+
+      - name: Run get_release_version.py tests
+        run: python .github/scripts/test_get_release_version.py -v
+
+      - name: Run publish_release.py tests
+        run: python .github/scripts/test_publish_release.py -v

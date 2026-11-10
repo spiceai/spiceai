@@ -15,6 +15,7 @@ limitations under the License.
 */
 
 use base64::{Engine as _, engine::general_purpose};
+use sha2::{Digest, Sha256};
 use snafu::prelude::*;
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -218,8 +219,8 @@ impl ClientTlsOptions {
     }
 }
 
-async fn resolve_client_identity(identity: &ClientIdentity) -> Result<Identity> {
-    match identity {
+async fn resolve_client_identity(identity: &ClientIdentity) -> Result<(Identity, [u8; 32])> {
+    let (cert, key) = match identity {
         ClientIdentity::FromFiles {
             cert_path,
             key_path,
@@ -245,12 +246,14 @@ async fn resolve_client_identity(identity: &ClientIdentity) -> Result<Identity> 
                 .context(FailedToReadClientKeySnafu {
                     path: key_path.display().to_string(),
                 })?;
-            Ok(Identity::from_pem(cert, key))
+            (cert, key)
         }
-        ClientIdentity::FromPem { cert_pem, key_pem } => {
-            Ok(Identity::from_pem(cert_pem.clone(), key_pem.clone()))
-        }
-    }
+        ClientIdentity::FromPem { cert_pem, key_pem } => (cert_pem.clone(), key_pem.clone()),
+    };
+    // Hash the bytes actually installed on this channel. Re-reading a certificate
+    // path later could group clients across an identity rotation.
+    let identity_scope = Sha256::digest(&cert).into();
+    Ok((Identity::from_pem(cert, key), identity_scope))
 }
 
 /// Creates a new TLS-enabled Flight channel.
@@ -286,6 +289,16 @@ pub async fn new_tls_flight_channel_with_options(
     endpoint_str: &str,
     opts: &ClientTlsOptions,
 ) -> Result<Channel> {
+    Ok(new_tls_flight_channel_with_scope(endpoint_str, opts)
+        .await?
+        .0)
+}
+
+/// Builds a channel together with the identity scope of its resolved certificate.
+pub(crate) async fn new_tls_flight_channel_with_scope(
+    endpoint_str: &str,
+    opts: &ClientTlsOptions,
+) -> Result<(Channel, Option<[u8; 32]>)> {
     if let Some(tls_info) = extract_tls_endpoint_info(endpoint_str) {
         // Use the normalized URL (https://) for tonic compatibility
         let mut endpoint = crate::configure_endpoint_for_high_throughput(
@@ -302,27 +315,31 @@ pub async fn new_tls_flight_channel_with_options(
             .ca_certificate(cert)
             .domain_name(tls_info.domain_name);
 
+        let mut identity_scope = None;
         if let Some(identity) = &opts.client_identity {
-            let resolved = resolve_client_identity(identity).await?;
+            let (resolved, scope) = resolve_client_identity(identity).await?;
             tls_config = tls_config.identity(resolved);
+            identity_scope = Some(scope);
         }
 
         endpoint = endpoint
             .tls_config(tls_config)
             .context(UnableToConnectToEndpointSnafu)?;
 
-        endpoint
+        let channel = endpoint
             .connect()
             .await
-            .context(UnableToConnectToEndpointSnafu)
+            .context(UnableToConnectToEndpointSnafu)?;
+        Ok((channel, identity_scope))
     } else {
         // Non-TLS endpoint, connect without TLS config
-        crate::configure_endpoint_for_high_throughput(
+        let channel = crate::configure_endpoint_for_high_throughput(
             Endpoint::from_str(endpoint_str).context(UnableToConnectToEndpointSnafu)?,
         )
         .connect()
         .await
-        .context(UnableToConnectToEndpointSnafu)
+        .context(UnableToConnectToEndpointSnafu)?;
+        Ok((channel, None))
     }
 }
 

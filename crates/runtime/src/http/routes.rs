@@ -118,6 +118,9 @@ use tower_http::limit::RequestBodyLimitLayer;
         v1::responses::post,
         v1::messages::post,
         v1::messages::count_tokens,
+        v1::gemini::list_models,
+        v1::gemini::get_model,
+        v1::gemini::post,
         v1::models::get,
         v1::workers::get,
         v1::nsql::get_context,
@@ -527,6 +530,13 @@ pub(crate) fn routes(
                 v1::messages::COUNT_TOKENS_PATH,
                 post(v1::messages::count_tokens),
             )
+            .route(v1::gemini::MODELS_PATH, get(v1::gemini::list_models))
+            .route(
+                v1::gemini::MODEL_PATH,
+                get(v1::gemini::get_model)
+                    .post(v1::gemini::post)
+                    .layer(ModelContextLayer),
+            )
             .route("/v1/embeddings", post(v1::embeddings::post))
             .route(
                 "/v1/decisions",
@@ -541,9 +551,12 @@ pub(crate) fn routes(
             .layer(Extension(search))
             .layer(Extension(Arc::clone(&rt.embeds)))
             .layer(Extension(Arc::clone(&rt.workers)))
-            .layer(Extension(rt.responses_llms()))
             .layer(Extension(v1::messages::MessagesModels {
                 messages: rt.messages_llms(),
+                chat: rt.completion_llms(),
+                capabilities: rt.model_capabilities(),
+            }))
+            .layer(Extension(v1::gemini::GeminiModels {
                 chat: rt.completion_llms(),
                 capabilities: rt.model_capabilities(),
             }));
@@ -661,6 +674,9 @@ pub(crate) fn routes(
     if let Some(auth_layer) = auth_layer {
         tracing::info!("Enabled API key authentication on HTTP routes");
         authenticated_router = authenticated_router.route_layer(auth_layer);
+        // In front of authentication: the Gemini routes also take the key in `x-goog-api-key`.
+        authenticated_router = authenticated_router
+            .route_layer(middleware::from_fn(v1::gemini::accept_google_api_key));
     }
 
     // mTLS route gate. Wired onto the authenticated router *before* the
@@ -696,6 +712,8 @@ pub(crate) fn routes(
         // The Messages API needs every `/v1/messages` error in its error envelope, including the
         // shutdown, mTLS, auth, and body-limit rejections above, so this wraps them.
         .route_layer(middleware::from_fn(v1::messages::encode_layer_errors))
+        // The same for the Gemini API's routes and its error body.
+        .route_layer(middleware::from_fn(v1::gemini::encode_layer_errors))
         .route_layer(middleware::from_fn_with_state(
             Arc::clone(&rt.df),
             track_metrics,
@@ -751,6 +769,7 @@ async fn track_metrics(
     req.extensions_mut().insert(Arc::clone(&request_context));
 
     let request_dimensions = request_context.to_dimensions();
+    let protocol_dimensions = request_context.to_protocol_dimensions();
 
     // Read before the request is handed on: whether a `/v1/sql` stream can carry
     // its `Server-Timing` total as a trailer depends on the request.
@@ -790,6 +809,7 @@ async fn track_metrics(
         .await;
 
     let latency_ms = start.elapsed().as_secs_f64() * 1000.0;
+    let unauthenticated = response.status() == http::StatusCode::UNAUTHORIZED;
     let status = http_status_label(response.status().as_u16());
 
     let mut labels = vec![
@@ -798,7 +818,14 @@ async fn track_metrics(
         KeyValue::new("status", status),
     ];
 
-    labels.extend(request_dimensions);
+    // This layer wraps the auth layer, so it also sees requests the auth layer
+    // rejected. Their client dimensions come from headers a caller chose without
+    // proving who it is, so a `401` carries only the runtime-defined labels.
+    if unauthenticated {
+        labels.extend_from_slice(protocol_dimensions);
+    } else {
+        labels.extend(request_dimensions);
+    }
 
     metrics::REQUESTS_TOTAL.add(1, &labels);
     metrics::REQUESTS.add(1, &labels);
@@ -1188,13 +1215,17 @@ const CORS_ALLOWED_HEADERS: &[&str] = &[
     "anthropic-version",
     "anthropic-beta",
     "anthropic-dangerous-direct-browser-access",
+    // The Gemini API's headers, which Google's web SDK sends on every call: the key in
+    // `x-goog-api-key`, and `x-goog-api-client`.
+    "x-goog-api-key",
+    "x-goog-api-client",
 ];
 
 /// Closed-set `Access-Control-Allow-Headers` when a requested name is
 /// not a valid [`HeaderValue`]. Must stay aligned with
 /// [`CORS_ALLOWED_HEADERS`].
 const CORS_ALLOWED_HEADERS_VALUE: HeaderValue = HeaderValue::from_static(
-    "accept, content-type, authorization, mcp-protocol-version, mcp-method, mcp-name, mcp-session-id, x-api-key, anthropic-version, anthropic-beta, anthropic-dangerous-direct-browser-access",
+    "accept, content-type, authorization, mcp-protocol-version, mcp-method, mcp-name, mcp-session-id, x-api-key, anthropic-version, anthropic-beta, anthropic-dangerous-direct-browser-access, x-goog-api-key, x-goog-api-client",
 );
 
 fn is_allowed_cors_request_header(name: &str) -> bool {

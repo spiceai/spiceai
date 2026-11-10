@@ -34,26 +34,28 @@ pub mod aggregate_clause_pushdown;
 pub mod catalog;
 #[cfg(feature = "postgres")]
 pub mod catalog_changes;
-#[cfg(all(feature = "postgres", feature = "duckdb"))]
+#[cfg(feature = "postgres")]
 pub mod comments;
 pub mod common;
 #[cfg(feature = "postgres")]
 pub mod dml;
+#[cfg(feature = "postgres")]
+pub mod federation_differential;
 #[cfg(feature = "postgres")]
 pub mod numeric_scale;
 #[cfg(feature = "postgres")]
 pub mod replication;
 #[cfg(feature = "postgres")]
 pub mod replication_shared;
-#[cfg(all(feature = "postgres", feature = "duckdb"))]
+#[cfg(feature = "postgres")]
 pub mod replication_tpch;
-#[cfg(all(feature = "postgres", feature = "duckdb"))]
+#[cfg(feature = "postgres")]
 pub mod replication_type_change;
-#[cfg(all(feature = "postgres", feature = "duckdb"))]
+#[cfg(feature = "postgres")]
 pub mod schema_inference;
-#[cfg(all(feature = "postgres", feature = "sqlite", not(windows)))]
+#[cfg(all(feature = "postgres", feature = "sqlite"))]
 pub mod write_back;
-#[cfg(all(feature = "postgres", not(target_os = "windows")))]
+#[cfg(feature = "postgres")]
 pub mod write_back_delivery;
 
 #[tokio::test]

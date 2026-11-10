@@ -16,15 +16,11 @@ limitations under the License.
 
 //! Metastore backend abstraction for Cayenne catalog storage.
 //!
-//! This module provides a trait-based abstraction over different database backends
-//! that can be used to store Cayenne metadata. This allows swapping between `SQLite`,
-//! Turso, or other storage implementations.
+//! This module provides a trait-based abstraction over the database that stores
+//! Cayenne metadata. `sqlite::SqliteMetastore` implements it.
 
 pub mod snapshot;
 pub mod sqlite;
-
-#[cfg(feature = "turso")]
-pub mod turso;
 
 use std::collections::HashSet;
 use std::fmt::Display;
@@ -103,7 +99,7 @@ pub enum TableIdEncoding {
 ///
 /// Used by [`validate_existing_schema`] to compare the actual schema of an existing
 /// metadata table against the expected schema. Only column names are checked — types
-/// and constraints are not compared because `SQLite`/`libSQL` type affinity makes
+/// and constraints are not compared because `SQLite` type affinity makes
 /// exact type matching unreliable and columns may be added with `ALTER TABLE`.
 #[derive(Debug, Clone)]
 pub struct ExpectedTable {
@@ -117,7 +113,7 @@ pub struct ExpectedTable {
 
 /// Expected schema definitions for all Cayenne metadata tables.
 ///
-/// These must be kept in sync with the DDL constants in `sqlite.rs` and `turso.rs`.
+/// These must be kept in sync with the DDL constants in `sqlite.rs`.
 /// When the schema changes, update both the DDL constants **and** these definitions.
 pub const EXPECTED_TABLES: &[ExpectedTable] = &[
     ExpectedTable {
@@ -175,8 +171,7 @@ pub const EXPECTED_TABLES: &[ExpectedTable] = &[
         table_id_encoding: TableIdEncoding::RawUuidBlob,
         // Composite-PK table keyed on (table_id, pk_bytes); the former
         // `insert_record_id` UUID column was never read and is dropped. SQLite
-        // declares it `WITHOUT ROWID`; Turso uses a plain rowid table because it
-        // does not support `WITHOUT ROWID` under its `mvcc` journal mode.
+        // declares it `WITHOUT ROWID`.
         //
         // `table_id` stores the 16 raw bytes of the UUID (`BLOB`) rather than
         // the 36-char text — a pure re-encoding to cut WAL write volume on hot
@@ -227,7 +222,7 @@ pub const EXPECTED_TABLES: &[ExpectedTable] = &[
         // Authoritative per-snapshot data-file manifest (manifest snapshot
         // model). Captured in metastore snapshots so a snapshot-bootstrapped
         // node inherits the complete file set. Column order MUST match the DDL
-        // in `sqlite.rs`/`turso.rs` and the export/import column order.
+        // in `sqlite.rs` and the export/import column order.
         name: "cayenne_snapshot_file",
         table_id_encoding: TableIdEncoding::Text,
         columns: &[
@@ -245,7 +240,7 @@ pub const EXPECTED_TABLES: &[ExpectedTable] = &[
         // Cold-tier object-store manifest. Table-scoped (no snapshot_id),
         // append-only. Carries each cold file's stats blob inline (one row, no
         // join) so listing-time pruning needs no object-store round-trip.
-        // Column order MUST match the DDL in `sqlite.rs`/`turso.rs` and the
+        // Column order MUST match the DDL in `sqlite.rs` and the
         // export/import column order.
         name: "cayenne_cold_tier_file",
         table_id_encoding: TableIdEncoding::Text,
@@ -870,8 +865,8 @@ pub trait MetastoreTransaction: Send + Sync {
 
 /// Trait for metastore backend implementations.
 ///
-/// This trait abstracts the database layer for the Cayenne catalog, allowing
-/// different storage backends (`SQLite`, Turso, etc.) to be used interchangeably.
+/// This trait abstracts the database layer for the Cayenne catalog, so the catalog
+/// logic does not depend on `SQLite` directly.
 #[async_trait]
 pub trait MetastoreBackend: Send + Sync {
     /// Initialize the metastore schema (create tables if they don't exist).
@@ -936,7 +931,7 @@ pub trait MetastoreBackend: Send + Sync {
     /// multiple tasks share the same metastore.
     ///
     /// The backend-specific BEGIN statement is sent automatically
-    /// (e.g. `BEGIN TRANSACTION` for `SQLite`, `BEGIN CONCURRENT` for Turso).
+    /// (`BEGIN IMMEDIATE` for `SQLite`).
     ///
     /// # Errors
     ///

@@ -213,7 +213,6 @@ mod tests {
         );
     }
 
-    #[cfg(not(windows))]
     #[tokio::test]
     async fn test_dataset_registered_trace_default_acceleration_cache() {
         let acceleration = Acceleration {
@@ -243,7 +242,7 @@ mod tests {
     async fn test_dataset_registered_trace_with_acceleration_complex() {
         let acceleration = Acceleration {
             enabled: true,
-            engine: Engine::DuckDB,
+            engine: Engine::Cayenne,
             mode: Mode::File,
             refresh_mode: Some(RefreshMode::Append),
             refresh_check_interval: Some(Duration::from_secs(30)),
@@ -268,7 +267,7 @@ mod tests {
         let info = dataset_registered_trace(test_data_connector.as_ref(), &ds, false);
         assert_eq!(
             info,
-            "Dataset taxi_trips registered (s3://taxi_trips/2024/), acceleration (duckdb:file, append, 30s refresh, 1hr retention, fallback on source on empty result)."
+            "Dataset taxi_trips registered (s3://taxi_trips/2024/), acceleration (cayenne:file, append, 30s refresh, 1hr retention, fallback on source on empty result)."
         );
     }
 
@@ -279,7 +278,6 @@ mod tests {
         assert_eq!(info, "View taxi_trips_vw registered.");
     }
 
-    #[cfg(not(windows))]
     #[test]
     fn test_view_registered_trace_with_default_acceleration() {
         let table_ref = TableReference::from("taxi_trips_vw");
@@ -299,7 +297,7 @@ mod tests {
         let table_ref = TableReference::from("taxi_trips_vw");
         let acceleration = Some(Acceleration {
             enabled: true,
-            engine: Engine::DuckDB,
+            engine: Engine::Cayenne,
             mode: Mode::File,
             refresh_check_interval: Some(Duration::from_secs(30)),
             ..Default::default()
@@ -307,7 +305,7 @@ mod tests {
         let info = view_registered_trace(&table_ref, acceleration.as_ref());
         assert_eq!(
             info,
-            "View taxi_trips_vw registered, acceleration (duckdb:file, 30s refresh)."
+            "View taxi_trips_vw registered, acceleration (cayenne:file, 30s refresh)."
         );
     }
 }

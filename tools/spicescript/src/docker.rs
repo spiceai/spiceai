@@ -37,6 +37,7 @@ use bollard::{
 };
 use futures::StreamExt;
 
+#[derive(Clone)]
 pub struct ContainerSpec {
     pub name: String,
     pub image: String,
@@ -48,6 +49,9 @@ pub struct ContainerSpec {
     /// A Docker network to join (created if missing), so containers of one
     /// source can reach each other by name.
     pub network: Option<String>,
+    /// Another name peers on `network` reach the container by. A container
+    /// name can outgrow the 63 characters a host name label may hold.
+    pub alias: Option<String>,
 }
 
 pub struct Container {
@@ -67,7 +71,53 @@ impl Container {
 
     /// Starts a container publishing each port in `host_ports` on the host
     /// port given there, and every other port of `spec` on a free one.
+    ///
+    /// Waits for room in the kernel key quota first, and retries a start that
+    /// runc refused because the quota filled meanwhile (see [`crate::keyquota`]).
     pub async fn start_on(spec: ContainerSpec, host_ports: HashMap<u16, u16>) -> Result<Self> {
+        let mut attempt = 1;
+        loop {
+            crate::keyquota::wait_for_room(1, &format!("container {}", spec.name)).await?;
+            match Self::start_once(spec.clone(), host_ports.clone()).await {
+                Err(e)
+                    if attempt < QUOTA_ATTEMPTS
+                        && crate::keyquota::is_quota_error(&format!("{e:#}")) =>
+                {
+                    crate::runner::emit(&format!(
+                        "   the kernel key quota was full starting {}; waiting for room and trying again ({attempt} of {QUOTA_ATTEMPTS} attempts made)",
+                        spec.name
+                    ));
+                    attempt += 1;
+                }
+                result => return result,
+            }
+        }
+    }
+
+    /// Starts this container again after [`Self::stop`], keeping its data and
+    /// ports. Like [`Self::start_on`], it waits for room in the kernel key
+    /// quota and retries a start refused for it: a restart takes a new key.
+    pub async fn start_stopped(&self) -> Result<()> {
+        let mut attempt = 1;
+        loop {
+            crate::keyquota::wait_for_room(1, &format!("container {}", self.name)).await?;
+            match self.resume().await {
+                Err(e)
+                    if attempt < QUOTA_ATTEMPTS
+                        && crate::keyquota::is_quota_error(&format!("{e:#}")) =>
+                {
+                    crate::runner::emit(&format!(
+                        "   the kernel key quota was full restarting {}; waiting for room and trying again ({attempt} of {QUOTA_ATTEMPTS} attempts made)",
+                        self.name
+                    ));
+                    attempt += 1;
+                }
+                result => return result,
+            }
+        }
+    }
+
+    async fn start_once(spec: ContainerSpec, host_ports: HashMap<u16, u16>) -> Result<Self> {
         anyhow::ensure!(
             !crate::cleanup::shutting_down(),
             "not starting container {}: the run is shutting down",
@@ -172,14 +222,19 @@ impl Container {
                 let mut config = config.clone();
                 // Under another name, keep the original as an alias on the
                 // container's network, so its peers still find it by it.
-                if name != spec.name
+                let aliases: Vec<String> = (name != spec.name)
+                    .then(|| spec.name.clone())
+                    .into_iter()
+                    .chain(spec.alias.clone())
+                    .collect();
+                if !aliases.is_empty()
                     && let Some(network) = spec.network.as_deref().filter(|n| *n != "host")
                 {
                     config.networking_config = Some(NetworkingConfig {
                         endpoints_config: HashMap::from([(
                             network.to_string(),
                             EndpointSettings {
-                                aliases: Some(vec![spec.name.clone()]),
+                                aliases: Some(aliases),
                                 ..Default::default()
                             },
                         )]),
@@ -702,6 +757,10 @@ fn pull_error_text(err: &bollard::errors::Error) -> String {
 /// host) can take longer than the client's request timeout, and creating the
 /// container again usually succeeds.
 const CREATE_ATTEMPTS: u32 = 5;
+/// Starts of one container refused for a full kernel key quota before the
+/// failure is reported. Each waits for room first, so the quota filling again
+/// between that check and runc is what this rides out.
+const QUOTA_ATTEMPTS: u32 = 5;
 
 /// How long to wait before trying again after Docker did not answer in time,
 /// and between lookups of a container a timed-out attempt created.
@@ -825,7 +884,62 @@ fn runner_label() -> HashMap<&'static str, String> {
     HashMap::from([(RUNNER_LABEL, std::process::id().to_string())])
 }
 
+/// Whether the Docker daemon runs rootless. Its `host` network is then
+/// `RootlessKit`'s namespace, not this machine's: a container there still
+/// reaches other containers' published ports at 127.0.0.1, because the daemon
+/// listens for them inside that namespace too, but nothing that listens only
+/// on this machine's loopback, such as `spiced`.
+pub async fn daemon_is_rootless() -> bool {
+    static ROOTLESS: tokio::sync::OnceCell<bool> = tokio::sync::OnceCell::const_new();
+    *ROOTLESS
+        .get_or_init(|| async {
+            let Ok(docker) = Docker::connect_with_local_defaults() else {
+                return false;
+            };
+            docker
+                .info()
+                .await
+                .ok()
+                .and_then(|info| info.security_options)
+                .is_some_and(|options| options.iter().any(|o| o == "name=rootless"))
+        })
+        .await
+}
+
+/// This machine's address on the interface its default route leaves by. A
+/// rootless daemon's containers reach a listener on it through the daemon's
+/// outbound NAT, which never leads to this machine's loopback.
+pub fn routable_address() -> Result<std::net::IpAddr> {
+    let socket = std::net::UdpSocket::bind(("0.0.0.0", 0))?;
+    // Connecting a UDP socket sends nothing; it only chooses the route.
+    // 192.0.2.1 is TEST-NET-1 (RFC 5737), so no real host is ever named.
+    socket
+        .connect(("192.0.2.1", 9))
+        .context("Failed to find this machine's routable address: no default route")?;
+    let ip = socket.local_addr()?.ip();
+    anyhow::ensure!(
+        !ip.is_unspecified() && !ip.is_loopback(),
+        "Failed to find this machine's routable address: the default route leaves from {ip}"
+    );
+    Ok(ip)
+}
+
+/// A port no listener on this machine's loopback holds; see [`free_port_on`].
 pub fn free_port() -> Result<u16> {
+    free_port_on(std::net::Ipv4Addr::LOCALHOST.into())
+}
+
+/// Whether a listener could bind `ip:port` now. Probing the wildcard address
+/// also finds a listener on any single address, such as `127.0.0.2`, that a
+/// loopback probe misses.
+fn port_is_free(ip: std::net::IpAddr, port: u16) -> bool {
+    std::net::TcpListener::bind((ip, port)).is_ok()
+}
+
+/// A port this run has not given out and that a listener could bind on `ip`.
+/// Pass the address the port will be served on: a port for a server that
+/// listens on every interface must be probed on `0.0.0.0`.
+pub fn free_port_on(ip: std::net::IpAddr) -> Result<u16> {
     const LOW: u16 = 20000;
     const HIGH: u16 = 32768;
     static GIVEN: std::sync::LazyLock<parking_lot::Mutex<std::collections::HashSet<u16>>> =
@@ -840,8 +954,7 @@ pub fn free_port() -> Result<u16> {
         let offset =
             NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed) % u32::from(HIGH - LOW);
         let port = LOW + u16::try_from(offset).unwrap_or(0);
-        if GIVEN.lock().contains(&port) || std::net::TcpListener::bind(("127.0.0.1", port)).is_err()
-        {
+        if GIVEN.lock().contains(&port) || !port_is_free(ip, port) {
             continue;
         }
         if GIVEN.lock().insert(port) {
@@ -935,6 +1048,23 @@ mod port_tests {
             );
             assert!(seen.insert(port), "port {port} was given out twice");
         }
+    }
+
+    /// Linux routes all of 127.0.0.0/8 to loopback, so a listener on
+    /// 127.0.0.2 leaves 127.0.0.1 bindable while it blocks the wildcard.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_wildcard_probe_sees_a_listener_on_another_local_address() {
+        let held = std::net::TcpListener::bind(("127.0.0.2", 0)).expect("listen on 127.0.0.2");
+        let port = held.local_addr().expect("local addr").port();
+        assert!(super::port_is_free(
+            std::net::Ipv4Addr::LOCALHOST.into(),
+            port
+        ));
+        assert!(!super::port_is_free(
+            std::net::Ipv4Addr::UNSPECIFIED.into(),
+            port
+        ));
     }
 }
 
@@ -1113,10 +1243,18 @@ mod pull_tests {
         pull_broke_off, pull_error_text, pull_image, pull_with_retries, registry_credentials,
     };
 
-    /// `docker login` to Docker Hub as `user` with password `s3cr3t`, as the
-    /// Docker CLI stores it.
-    const HUB_LOGIN: &str =
-        r#"{"auths":{"https://index.docker.io/v1/":{"auth":"dXNlcjpzM2NyM3Q="}}}"#;
+    /// Made-up Docker Hub login used only by these tests. It is sent only to
+    /// the fake Docker daemon below on `127.0.0.1`, never to a real registry.
+    const HUB_USER: &str = "user";
+    const HUB_PASSWORD: &str = "s3cr3t";
+
+    /// The test login in a Docker CLI `config.json`, as `docker login` stores
+    /// it: `auth` is the base64 encoding of `{username}:{password}`.
+    fn hub_login_config() -> String {
+        let auth =
+            base64::engine::general_purpose::STANDARD.encode(format!("{HUB_USER}:{HUB_PASSWORD}"));
+        format!(r#"{{"auths":{{"https://index.docker.io/v1/":{{"auth":"{auth}"}}}}}}"#)
+    }
 
     /// A Docker API that answers every request with `body` after the
     /// headers of a `200 OK`, then closes the connection, and keeps each
@@ -1160,8 +1298,8 @@ mod pull_tests {
 
     fn hub_login() -> DockerCredentials {
         DockerCredentials {
-            username: Some("user".into()),
-            password: Some("s3cr3t".into()),
+            username: Some(HUB_USER.into()),
+            password: Some(HUB_PASSWORD.into()),
             serveraddress: Some("https://index.docker.io/v1/".into()),
             ..Default::default()
         }
@@ -1175,7 +1313,7 @@ mod pull_tests {
             "clickhouse/clickhouse-server:24.8",
         ] {
             assert_eq!(
-                registry_credentials(HUB_LOGIN, image),
+                registry_credentials(&hub_login_config(), image),
                 Some(hub_login()),
                 "{image}"
             );
@@ -1186,11 +1324,11 @@ mod pull_tests {
         let ghcr = r#"{"auths":{"ghcr.io":{"username":"bot","password":"token"}}}"#;
         assert_eq!(registry_credentials(ghcr, "mongo:8.0"), None);
         assert_eq!(
-            registry_credentials(HUB_LOGIN, "ghcr.io/spiceai/image:1"),
+            registry_credentials(&hub_login_config(), "ghcr.io/spiceai/image:1"),
             None
         );
         assert_eq!(
-            registry_credentials(HUB_LOGIN, "localhost:5000/image"),
+            registry_credentials(&hub_login_config(), "localhost:5000/image"),
             None
         );
         assert_eq!(
@@ -1227,8 +1365,8 @@ mod pull_tests {
                 .expect("base64"),
         )
         .expect("JSON");
-        assert_eq!(login["username"], "user");
-        assert_eq!(login["password"], "s3cr3t");
+        assert_eq!(login["username"], HUB_USER);
+        assert_eq!(login["password"], HUB_PASSWORD);
         assert_eq!(login["serveraddress"], "https://index.docker.io/v1/");
         // Without a login the header is empty: Docker pulls anonymously.
         assert!(sent[1].is_empty(), "{sent:?}");

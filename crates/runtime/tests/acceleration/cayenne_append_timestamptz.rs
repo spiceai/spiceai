@@ -105,7 +105,6 @@ async fn write_source(path: &std::path::Path, ids: &[i64]) -> Result<(), anyhow:
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
-#[cfg(not(target_os = "windows"))]
 async fn cayenne_append_refresh_advances_a_timezone_aware_time_column() -> Result<(), anyhow::Error>
 {
     let _tracing = crate::init_tracing(Some("integration=debug,info"));
