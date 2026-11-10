@@ -2025,3 +2025,91 @@ async fn an_inline_burst_on_the_sqlite_catalog_is_committed_before_it_is_visible
     );
     table.quiesce().await;
 }
+
+/// A keyed CDC burst whose changes split into several groups, each written
+/// inline: an upsert of an inline key, a delete of that key, and an upsert of a
+/// new key. A later group reads the rows of an earlier one, so the earlier
+/// groups' rows are published before the burst's record commits; the final
+/// group's are not. Once acknowledged, and after a reopen from the committed
+/// state, the table holds exactly the burst's outcome.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_multi_group_inline_burst_holds_exactly_its_outcome() {
+    const KEY: i64 = 700;
+    const NEW_KEY: i64 = 5_000;
+    let (location, process) = Location::seeded_with(&[KEY]).await;
+    process.table.quiesce().await;
+    drop(process);
+    let inline = VortexConfig {
+        inline_max_rows: 1_024,
+        inline_max_bytes: 1 << 20,
+        ..cdc_config()
+    };
+    let process = location.open_with(&inline).await;
+    let rows_before = process.rows().await;
+    let bottom = Arc::clone(&location.bottom) as Arc<dyn ObjectStore>;
+    let head_before = head_commit(&bottom).await;
+
+    let (sink, options) = durable_sink(&process.table);
+    let (held, mut holding) = tokio::sync::oneshot::channel::<()>();
+    let (release, released) = tokio::sync::oneshot::channel::<()>();
+    let save = save_position(&process.catalog, 1);
+    let position: PositionWrite = Box::pin(async move {
+        let _ = held.send(());
+        released
+            .await
+            .map_err(|error| Box::new(error) as Box<dyn std::error::Error + Send + Sync>)?;
+        save.await
+    });
+    let burst = tokio::spawn(async move {
+        let outcome = apply_burst(
+            &sink,
+            options,
+            mixed_changes(&[("c", KEY), ("d", KEY), ("c", NEW_KEY)], 1),
+            position,
+        )
+        .await;
+        drop(sink);
+        outcome
+    });
+    tokio::time::timeout(Duration::from_secs(60), &mut holding)
+        .await
+        .expect("the burst reaches its position write within 60 s")
+        .expect("the burst reaches its position write");
+    let head_held = head_commit(&bottom).await;
+    let (rows_held, key_held, _) = process.rebuilt_view(KEY).await;
+    let (_, new_key_held, _) = process.rebuilt_view(NEW_KEY).await;
+    release.send(()).expect("release the burst");
+    burst
+        .await
+        .expect("the burst does not panic")
+        .expect("the burst commits");
+    let rows_after = process.rows().await;
+    let (rows_rebuilt, _, _) = process.rebuilt_view(KEY).await;
+    process.table.quiesce().await;
+    drop(process);
+    let reopened = location.open_with(&inline).await;
+    let rows_reopened = reopened.rows().await;
+    eprintln!(
+        "multi-group inline burst: held (head {head_held}, before {head_before}): key {KEY} {key_held:?}, key {NEW_KEY} {new_key_held:?}, rows {} (before {}); acknowledged: rows {}, rebuilt {}, reopened {}",
+        rows_held.len(),
+        rows_before.len(),
+        rows_after.len(),
+        rows_rebuilt.len(),
+        rows_reopened.len()
+    );
+    let mut expected: BTreeMap<i64, i64> = rows_before.into_iter().collect();
+    expected.remove(&KEY);
+    expected.insert(NEW_KEY, value(NEW_KEY, 1));
+    let expected: Vec<(i64, i64)> = expected.into_iter().collect();
+    assert_eq!(head_held, head_before, "the held record is not committed");
+    assert_eq!(
+        (
+            rows_after == expected,
+            rows_rebuilt == expected,
+            rows_reopened == expected
+        ),
+        (true, true, true),
+        "the burst's outcome, exactly: acknowledged {rows_after:?}, reopened {rows_reopened:?}"
+    );
+    reopened.table.quiesce().await;
+}
