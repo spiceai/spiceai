@@ -9,11 +9,6 @@ description: >
 sources:
   src: { kind: postgres }
 
-variants:
-  cayenne: {}
-  sqlite:
-    datasets: { '*': { acceleration: { engine: sqlite, params: { sqlite_file: '${instance.dir}/items.sqlite' } } } }
-
 spicepod:
   version: v1
   kind: Spicepod

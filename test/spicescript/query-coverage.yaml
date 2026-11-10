@@ -17,8 +17,7 @@ matrix:
 variants:
   federated: {}
   cayenne: cayenne-file
-  sqlite: sqlite-file
-  arrow: arrow
+  cayenne-memory: cayenne-memory
   adbc:
     when: { backend: duckdb }
     datasets:

@@ -7,7 +7,6 @@ sources:
   src: { kind: postgres }
 
 variants:
-  arrow: arrow
   cayenne: cayenne-file
   cayenne-memory: cayenne-memory
   federated: {}

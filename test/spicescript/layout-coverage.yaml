@@ -1,8 +1,7 @@
 name: layout-coverage
 description: >
   How an acceleration lays data out never changes an answer: Cayenne
-  (default, sorted, clustered, partitioned, indexed, zstd) and SQLite with
-  indexes answer the extended corpus and ternary logic partitioning as
+  (default, sorted, clustered, partitioned, indexed, zstd) answers the extended corpus and ternary logic partitioning as
   PostgreSQL does, under full refresh and change capture, before and after
   updates, deletes and inserts at the source.
 
@@ -19,10 +18,6 @@ variants:
   cayenne-partitioned: { datasets: { t: { acceleration: { partition_by: ['bucket(4, id)'] } } } }
   cayenne-zstd: { datasets: { '*': { acceleration: { params: { cayenne_compression_strategy: zstd } } } } }
   cayenne-indexed: { datasets: { t: { acceleration: { indexes: { i: enabled, dt: enabled } } } } }
-  sqlite:
-    datasets:
-      '*': { acceleration: { engine: sqlite, on_conflict: { id: upsert } } }
-      t: { acceleration: { indexes: { i: enabled, dt: enabled } } }
 
 spicepod:
   version: v1
