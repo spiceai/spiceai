@@ -49916,6 +49916,13 @@ mod tests {
         for i in 0..4 {
             insert_batch(&provider, batch_of(i * 50, 50)).await;
         }
+        // The inserts' debounced post-write manifest rebuild would otherwise run
+        // beside the rewrite below and could re-add the source snapshot's rows
+        // after its commit deletes them.
+        provider
+            .drain_in_flight_maintenance()
+            .await
+            .expect("drain in-flight maintenance");
 
         let source_snapshot_id = provider.get_current_snapshot_id();
         let generation_before = provider.current_dir_generation.load(Ordering::Relaxed);
@@ -50398,6 +50405,26 @@ mod tests {
         );
     }
 
+    /// Releases `guard`, the caller's hold on the compaction lock taken before
+    /// its writes, once nothing those writes queued can still run: the pending
+    /// post-write maintenance is drained, its compaction pass has parked on the
+    /// held lock, and a manifest-rebuild retry it armed has finished. An explicit
+    /// maintenance call after this has the table to itself; without it, a pass
+    /// the writes queued can take the lock or the tier first, and the explicit
+    /// call declines.
+    async fn release_compaction_quiet<G>(provider: &CayenneTableProvider, guard: G) {
+        provider
+            .flush_pending_maintenance()
+            .await
+            .expect("drain pending post-write maintenance");
+        park_post_write_compaction(provider).await;
+        drop(guard);
+        provider
+            .drain_in_flight_maintenance()
+            .await
+            .expect("drain in-flight maintenance");
+    }
+
     /// Waits, holding the caller's compaction lock, for the detached post-write
     /// compaction pass to reach that lock, find it held, and exit.
     ///
@@ -50727,7 +50754,7 @@ mod tests {
             "sanity: all inserted rows visible before compaction"
         );
 
-        drop(compaction_setup_guard);
+        release_compaction_quiet(&provider, compaction_setup_guard).await;
 
         let merged = provider
             .compact_protected_snapshots_subset(usize::MAX)
@@ -50936,9 +50963,9 @@ mod tests {
     /// A key-mode upsert table holding three protected snapshots that no
     /// maintenance pass has merged, with a merge of two already due. The seed
     /// writes run under `compaction_lock`, so the write-driven passes they
-    /// schedule decline as busy, and this waits for those passes to end before
-    /// handing the table over — otherwise one of them merges the snapshots behind
-    /// the caller's back.
+    /// schedule decline as busy, and [`release_compaction_quiet`] waits for those
+    /// passes to end before handing the table over — otherwise one of them merges
+    /// the snapshots, or holds the lock, behind the caller's back.
     async fn three_unmerged_protected_snapshots(
         table_name: &str,
         ctx: &SessionContext,
@@ -50956,25 +50983,15 @@ mod tests {
         )
         .await;
         let schema = provider.table_schema();
-        {
-            let _no_merge = provider.compaction_lock.write().await;
-            for i in 0..3i64 {
-                insert_batch(
-                    &provider,
-                    id_value_batch(Arc::clone(&schema), &[i], &[i * 10]),
-                )
-                .await;
-            }
-            provider
-                .flush_pending_maintenance()
-                .await
-                .expect("drain the seed writes' bookkeeping");
-            while provider.post_write_compaction_state.load(Ordering::Acquire)
-                != COALESCED_TASK_IDLE
-            {
-                tokio::time::sleep(Duration::from_millis(1)).await;
-            }
+        let no_merge = provider.compaction_lock.write().await;
+        for i in 0..3i64 {
+            insert_batch(
+                &provider,
+                id_value_batch(Arc::clone(&schema), &[i], &[i * 10]),
+            )
+            .await;
         }
+        release_compaction_quiet(&provider, no_merge).await;
         assert_eq!(
             provider.protected_snapshot_ids().len(),
             3,
@@ -52284,7 +52301,7 @@ mod tests {
                 .join(id);
             on_disk_bytes.insert(id.clone(), sum_vortex_file_bytes(&dir).await);
         }
-        drop(compaction_setup_guard);
+        release_compaction_quiet(&provider, compaction_setup_guard).await;
 
         let merged = provider
             .compact_protected_snapshots_subset(usize::MAX)
@@ -52522,7 +52539,7 @@ mod tests {
             .keys()
             .cloned()
             .collect();
-        drop(compaction_setup_guard);
+        release_compaction_quiet(&provider, compaction_setup_guard).await;
 
         let merged = provider
             .compact_protected_snapshots_subset(usize::MAX)
@@ -66013,9 +66030,11 @@ mod tests {
         )
         .await;
         let schema = Arc::clone(&provider.table_metadata.schema);
+        let no_merge = provider.compaction_lock.write().await;
         insert_batch(&provider, id_value_batch(Arc::clone(&schema), &[1], &[10])).await;
         insert_batch(&provider, id_value_batch(Arc::clone(&schema), &[2], &[20])).await;
         insert_batch(&provider, id_value_batch(schema, &[3, 4], &[30, 40])).await;
+        release_compaction_quiet(&provider, no_merge).await;
         install_int64_deletes(&provider, &[(1, i64::MAX - 1), (2, i64::MAX - 1)]);
         assert!(
             provider

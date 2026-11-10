@@ -800,7 +800,20 @@ async fn a_small_file_landing_during_a_declined_pass_is_compacted_without_anothe
     );
 
     // Leave the coalesced worker claimed so the retry's own schedule cannot start
-    // a second pass under these assertions.
+    // a second pass under these assertions. The raced append's debounced
+    // maintenance rebuilds the manifest under the compaction lock; let it finish
+    // first, so the retry does not find the lock held and decline.
+    provider
+        .flush_pending_maintenance()
+        .await
+        .expect("drain the raced append's maintenance");
+    while provider
+        .manifest_rebuild_retry_scheduled
+        .load(Ordering::Acquire)
+    {
+        tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+    }
+    drop(provider.compaction_lock.write().await);
     assert!(
         provider
             .compact_current_snapshot_small_files()
