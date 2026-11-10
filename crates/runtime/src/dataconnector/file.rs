@@ -234,6 +234,16 @@ impl ListingTableConnector for File {
 
             match watcher.watch(&watch_path, mode) {
                 Ok(()) => (),
+                // A parent that permits traversal but not listing (mode 0111)
+                // refuses the directory watch. Keep the inode watch below so
+                // in-place writes still refresh, as before the parent watch.
+                Err(e) if !directory_dataset => {
+                    tracing::warn!(
+                        "Failed to watch {} for {}: {e}. Watching the file only; detecting atomic replacements needs read permission on that directory.",
+                        watch_path.display(),
+                        path.display()
+                    );
+                }
                 Err(e) => {
                     tracing::error!("Failed to watch file: {e}");
                     return;
