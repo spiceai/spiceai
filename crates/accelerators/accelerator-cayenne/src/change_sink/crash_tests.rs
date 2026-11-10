@@ -787,7 +787,8 @@ async fn run_until_killed(
 }
 
 /// The action names of each commit to the dataset's log after `after`, oldest
-/// first; a source position shows its value.
+/// first; a source position shows its value, and an inline tombstone written
+/// inactive says so.
 async fn records_after(store: &Arc<dyn ObjectStore>, after: u64) -> Vec<Vec<String>> {
     use prost::Message;
     let log = cayenne::metastore::object_native::dataset_log_at(
@@ -822,6 +823,13 @@ async fn records_after(store: &Arc<dyn ObjectStore>, after: u64) -> Vec<Vec<Stri
                                 "AdvanceSourcePosition({})",
                                 String::from_utf8_lossy(&position.position)
                             ),
+                            Some(cayenne_metastore_actions::Kind::AddInlinedDelete(delete)) => {
+                                if delete.published {
+                                    "AddInlinedDelete".to_string()
+                                } else {
+                                    "AddInlinedDelete(inactive)".to_string()
+                                }
+                            }
                             _ => action.name().to_string(),
                         })
                         .collect::<Vec<_>>()
@@ -858,8 +866,9 @@ fn count(record: &[String], kind: &str) -> usize {
 /// leaves no data file or deletion vector that no commit names.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_kill_at_any_storage_request_of_two_pipelined_cdc_bursts_is_all_or_nothing_per_burst() {
-    // A clean run: count the pair's requests, and show that burst 2's prepared
-    // metastore changes commit in burst 1's record, the window this test is for.
+    // A clean run: count the pair's requests, and show that each burst commits
+    // in one record of its own, although burst 2 prepares while burst 1's record
+    // is still open.
     let (location, process) = Location::seeded().await;
     let bottom = Arc::clone(&location.bottom) as Arc<dyn ObjectStore>;
     let before = head_commit(&bottom).await;
@@ -911,27 +920,35 @@ async fn a_kill_at_any_storage_request_of_two_pipelined_cdc_bursts_is_all_or_not
             "a later record changes data: {records:?}"
         );
     }
-    // Each burst writes one key deletion vector and one inline tombstone. Burst
-    // 2's are in burst 1's record, and burst 2's record names only its files.
-    assert_eq!(
-        (
-            count(&records[first_record], "AddDeleteFiles"),
-            count(&records[first_record], "AddInlinedDelete"),
-            count(&records[first_record], "AddFiles"),
-        ),
-        (2, 2, 1),
-        "burst 1's record holds both bursts' deletes and burst 1's files: {:?}",
-        records[first_record]
-    );
-    assert_eq!(
-        (
-            count(&records[second_record], "AddDeleteFiles"),
-            count(&records[second_record], "AddInlinedDelete"),
-            count(&records[second_record], "AddFiles"),
-        ),
-        (0, 0, 1),
-        "burst 2's record names its files and no deletes: {:?}",
-        records[second_record]
+    // Each burst writes one key deletion vector and one inline tombstone, and
+    // its record holds them with its files and its sequence: nothing burst 2
+    // prepares rides in burst 1's record. The tombstone commits inactive and is
+    // applied in memory when the burst's rows are published.
+    for (burst, record) in [(1, first_record), (2, second_record)] {
+        assert_eq!(
+            (
+                count(&records[record], "AddDeleteFiles"),
+                count(&records[record], "AddInlinedDelete"),
+                count(&records[record], "AddInlinedDelete(inactive)"),
+                count(&records[record], "AddFiles"),
+                count(&records[record], "SetGroup"),
+            ),
+            (1, 0, 1, 1, 1),
+            "burst {burst}'s record holds its own files, deletes, tombstone and sequence: {:?}",
+            records[record]
+        );
+    }
+    // Each data file is written once, at its final key: nothing is staged,
+    // copied or listed, and each burst writes the dataset head once.
+    let staged_or_copied: Vec<&String> = steps
+        .iter()
+        .filter(|step| {
+            step.starts_with("copy ") || step.starts_with("list ") || step.contains("/_staging/")
+        })
+        .collect();
+    assert!(
+        staged_or_copied.is_empty(),
+        "requests that stage, copy or list: {staged_or_copied:?}"
     );
     let reopened = location.open().await;
     assert_eq!(reopened.rows().await, expected(2), "the clean run's rows");
@@ -939,9 +956,9 @@ async fn a_kill_at_any_storage_request_of_two_pipelined_cdc_bursts_is_all_or_not
     reopened.table.quiesce().await;
     drop(reopened);
 
-    // The window: burst 1's record, which holds burst 2's deletes, has
-    // committed, and the record naming burst 2's files has not. A kill there
-    // must leave enough for recovery to finish burst 2.
+    // The window: burst 1's record has committed and burst 2's has not, while
+    // burst 2's files are already stored. A kill there must leave burst 2 out
+    // entirely.
     let heads: Vec<usize> = steps
         .iter()
         .enumerate()

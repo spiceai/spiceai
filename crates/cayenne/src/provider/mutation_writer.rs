@@ -636,17 +636,14 @@ impl<'a> AppendMutationWriter<'a> {
                     )
                 };
                 let target_size_bytes = self.context.target_file_size_bytes();
-                // An append into the current snapshot writes at its final keys on
-                // an object store. A new protected snapshot keeps the staged write:
-                // its Stage A commit already registers the snapshot and the deletes
-                // that hide the rows it supersedes, and recovery completes the write
-                // from the staged files and their WAL. At final keys nothing names
-                // the files until Stage B commits, so a crash in between would leave
-                // those deletes with no replacement rows.
-                if !(target_kind == StagingWalTargetKind::CurrentSnapshot
-                    && self
-                        .table
-                        .begin_final_key_write(&staging_snapshot_id, &target_snapshot_id))
+                // On an object store a table in the object-native location writes
+                // each file once, at its final key in the snapshot it commits to.
+                // A new protected snapshot then commits once, at finalize, in one
+                // record with the deletes that hide the rows it replaces
+                // (`CayenneCdcWrite::finish`); nothing below commits it.
+                if !self
+                    .table
+                    .begin_final_key_write(&staging_snapshot_id, &target_snapshot_id)
                 {
                     self.table
                         .clear_new_staging_snapshot_dir(&staging_snapshot_id)
@@ -703,16 +700,29 @@ impl<'a> AppendMutationWriter<'a> {
                 // gone; the only remaining synchronous resort is the hard error
                 // path below when staging genuinely cannot complete.
                 let prepared_on_conflict = if stage_on_conflict {
+                    // At final keys the deletes, the snapshot's sequence and its
+                    // inline tombstone wait for the one record that also names the
+                    // snapshot's files, so a commit by anything else on the table
+                    // (the previous burst's, a merge's) cannot make them durable
+                    // without those files. The tombstone stays inactive in that
+                    // record and is applied in memory at the publish, as on the
+                    // staged path (see `CayenneCdcWrite::finish_in_one_record`).
+                    let one_record = prepared_append.writes_new_protected_snapshot_at_final_keys();
                     match self
                         .table
                         .prepare_on_conflict_deletions_for_staged_snapshot(
                             on_conflict_deletions,
                             target_snapshot_id,
-                            false,
+                            one_record,
                         )
                         .await
                     {
-                        Ok(prepared_on_conflict) => Some(prepared_on_conflict),
+                        Ok(mut prepared_on_conflict) => {
+                            // The record makes the snapshot live, and the publish
+                            // adds it to the protected snapshots in memory.
+                            prepared_on_conflict.publish_as_protected_snapshot |= one_record;
+                            Some(prepared_on_conflict)
+                        }
                         Err(err) => {
                             if let Err(cleanup_err) = prepared_append.rollback().await {
                                 tracing::warn!(

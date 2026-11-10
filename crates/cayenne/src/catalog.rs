@@ -305,6 +305,9 @@ pub struct CatalogPublication {
     pub pending_durable_flips: Vec<String>,
     /// Primary keys requiring federated write-back.
     pub dirty_pk_bytes: Vec<Vec<u8>>,
+    /// The protected snapshot's data files, named in the same commit that makes
+    /// it live. Empty when the writer names them in a commit of its own.
+    pub files: Vec<SnapshotFile>,
 }
 
 /// How the metastore changes of the current task commit.
@@ -320,45 +323,53 @@ enum CommitScope {
 
 tokio::task_local! {
     static DEFERRED_COMMITS: CommitScope;
-    static DELETES_AFTER_COMMIT: Arc<DeletesAfterCommit>;
+    static AFTER_COMMIT: Arc<AfterCommit>;
 }
 
-/// One object delete a write inside [`with_same_record_commits`] left for the
-/// scope's owner.
-struct DeleteAfterCommit {
-    /// Send the delete. An error stops the deletes queued after this one.
-    run: futures::future::BoxFuture<'static, Result<(), String>>,
-    /// Called instead of `run` when the delete is not sent: the record did not
-    /// commit, an earlier delete failed, or the owner dropped the deletes.
+/// One step a write inside [`with_same_record_commits`] left for the scope's
+/// owner to take once the record holding its changes commits.
+struct LeftForCommit<T> {
+    /// Take the step.
+    run: futures::future::BoxFuture<'static, T>,
+    /// Called instead of `run` when the step is not taken: the record did not
+    /// commit, an earlier delete failed, or the owner dropped the steps.
     abandon: Box<dyn FnOnce() + Send>,
 }
 
-/// The object deletes a write inside [`with_same_record_commits`] must not send
-/// before the record holding its changes commits: deleting the staged copy of a
-/// file, or the staging WAL that lets recovery finish the write, before then
-/// leaves a crash with neither the committed state nor the means to recover it.
+/// What a write inside [`with_same_record_commits`] must not do before the
+/// record holding its changes commits:
+///
+/// - make its rows visible to queries: a crash or a failed commit would then
+///   take back rows a query has already read;
+/// - delete objects that recovery would need without that record: the staged
+///   copy of a file, or the staging WAL that lets recovery finish the write.
+///
 /// The owner runs them after its `commit_pending` succeeds; dropped unrun, each
-/// is abandoned, which leaves its objects for recovery.
+/// is abandoned, which leaves its objects for recovery and its rows unpublished.
 #[derive(Default)]
-pub struct DeletesAfterCommit {
-    pending: parking_lot::Mutex<Vec<DeleteAfterCommit>>,
+pub struct AfterCommit {
+    publishes: parking_lot::Mutex<Vec<LeftForCommit<()>>>,
+    deletes: parking_lot::Mutex<Vec<LeftForCommit<Result<(), String>>>>,
 }
 
-impl std::fmt::Debug for DeletesAfterCommit {
+impl std::fmt::Debug for AfterCommit {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("DeletesAfterCommit")
-            .field("pending", &self.pending.lock().len())
+        f.debug_struct("AfterCommit")
+            .field("publishes", &self.publishes.lock().len())
+            .field("deletes", &self.deletes.lock().len())
             .finish()
     }
 }
 
-impl DeletesAfterCommit {
-    /// Send the deletes in the order they were left, stopping at the first that
-    /// fails: a later delete may depend on an earlier one (a staging WAL goes
-    /// only after the staged files it describes). Call only once the record
-    /// holding the writes' changes has committed.
+impl AfterCommit {
+    /// Publish the writes' rows, then send the deletes in the order they were
+    /// left, stopping at the first that fails: a later delete may depend on an
+    /// earlier one (a staging WAL goes only after the staged files it
+    /// describes). Call only once the record holding the writes' changes has
+    /// committed.
     pub async fn run(self) {
-        let mut pending = std::mem::take(&mut *self.pending.lock()).into_iter();
+        self.publish_now().await;
+        let mut pending = std::mem::take(&mut *self.deletes.lock()).into_iter();
         while let Some(delete) = pending.next() {
             if let Err(error) = delete.run.await {
                 tracing::debug!(
@@ -373,18 +384,39 @@ impl DeletesAfterCommit {
         }
     }
 
-    /// Append the deletes of `other`, to run after these.
+    /// Publish the writes' rows now, before their record commits, and keep the
+    /// deletes for [`Self::run`].
+    async fn publish_now(&self) {
+        let publishes = std::mem::take(&mut *self.publishes.lock());
+        for publish in publishes {
+            publish.run.await;
+        }
+    }
+
+    /// Append the steps of `other`, to run after these.
     pub fn extend(&self, other: Self) {
-        let mut moved = std::mem::take(&mut *other.pending.lock());
-        self.pending.lock().append(&mut moved);
+        let mut publishes = std::mem::take(&mut *other.publishes.lock());
+        self.publishes.lock().append(&mut publishes);
+        let mut deletes = std::mem::take(&mut *other.deletes.lock());
+        self.deletes.lock().append(&mut deletes);
         // Empty now, so dropping it abandons nothing.
         drop(other);
     }
+
+    fn take(&self) -> Self {
+        Self {
+            publishes: parking_lot::Mutex::new(std::mem::take(&mut *self.publishes.lock())),
+            deletes: parking_lot::Mutex::new(std::mem::take(&mut *self.deletes.lock())),
+        }
+    }
 }
 
-impl Drop for DeletesAfterCommit {
+impl Drop for AfterCommit {
     fn drop(&mut self) {
-        for delete in std::mem::take(&mut *self.pending.lock()) {
+        for publish in std::mem::take(&mut *self.publishes.lock()) {
+            (publish.abandon)();
+        }
+        for delete in std::mem::take(&mut *self.deletes.lock()) {
             (delete.abandon)();
         }
     }
@@ -393,7 +425,7 @@ impl Drop for DeletesAfterCommit {
 /// Whether the current task is inside [`with_same_record_commits`], whose owner
 /// sends the object deletes left with [`delete_after_commit`].
 pub(crate) fn deletes_wait_for_commit() -> bool {
-    DELETES_AFTER_COMMIT.try_with(|_| ()).is_ok()
+    AFTER_COMMIT.try_with(|_| ()).is_ok()
 }
 
 /// Leave `run` for the owner of the enclosing [`with_same_record_commits`] to
@@ -403,16 +435,60 @@ pub(crate) fn delete_after_commit(
     run: futures::future::BoxFuture<'static, Result<(), String>>,
     abandon: Box<dyn FnOnce() + Send>,
 ) -> Option<futures::future::BoxFuture<'static, Result<(), String>>> {
-    match DELETES_AFTER_COMMIT.try_with(Arc::clone) {
-        Ok(deletes) => {
-            deletes
-                .pending
-                .lock()
-                .push(DeleteAfterCommit { run, abandon });
+    match AFTER_COMMIT.try_with(Arc::clone) {
+        Ok(after) => {
+            after.deletes.lock().push(LeftForCommit { run, abandon });
             None
         }
         Err(_) => Some(run),
     }
+}
+
+/// Leave `run`, which makes a write's rows visible to queries, for the owner of
+/// the enclosing [`with_same_record_commits`] to run once its record commits,
+/// or return it to run now when the task is in no such scope. `abandon` is
+/// called if the owner never runs it.
+pub(crate) fn publish_after_commit(
+    run: futures::future::BoxFuture<'static, ()>,
+    abandon: Box<dyn FnOnce() + Send>,
+) -> Option<futures::future::BoxFuture<'static, ()>> {
+    match AFTER_COMMIT.try_with(Arc::clone) {
+        Ok(after) => {
+            after.publishes.lock().push(LeftForCommit { run, abandon });
+            None
+        }
+        Err(_) => Some(run),
+    }
+}
+
+/// Run `work`, a write whose rows a later change of the same record must see,
+/// and publish its rows when it returns, before the enclosing
+/// [`with_same_record_commits`] commits: its metastore changes still commit in
+/// that record, and its object deletes still wait for it. Outside such a scope
+/// this is `work`, which then commits and publishes on its own.
+///
+/// # Errors
+///
+/// Returns `work`'s error; its rows are then not published.
+pub async fn publish_before_commit<T, E, F>(work: F) -> Result<T, E>
+where
+    F: std::future::Future<Output = Result<T, E>>,
+{
+    let Ok(enclosing) = AFTER_COMMIT.try_with(Arc::clone) else {
+        return work.await;
+    };
+    let (output, after) = with_same_record_commits(work).await;
+    let output = output?;
+    after.publish_now().await;
+    enclosing.extend(after);
+    Ok(output)
+}
+
+/// Whether the current task is inside [`with_same_record_commits`]: its owner,
+/// not the write, commits the write's metastore changes, and the write leaves
+/// its in-memory publish for after that commit ([`publish_after_commit`]).
+pub(crate) fn commit_left_to_scope_owner() -> bool {
+    DEFERRED_COMMITS.try_with(|scope| *scope) == Ok(CommitScope::SameRecord)
 }
 
 /// Run `work` with its metastore changes deferred: a catalog that buffers may
@@ -426,23 +502,19 @@ pub async fn with_deferred_commits<F: std::future::Future>(work: F) -> F::Output
 /// [`with_deferred_commits`], where a write path inside `work` that would commit
 /// at its own acknowledgement point leaves that to the caller, so everything
 /// `work` changes commits in the caller's one record. Use it only where the
-/// caller acknowledges nothing until its `commit_pending` returns. The object
-/// deletes `work` would send after one of its own commits come back unsent: run
-/// them with [`DeletesAfterCommit::run`] only after that `commit_pending`
-/// succeeds.
-pub async fn with_same_record_commits<F: std::future::Future>(
-    work: F,
-) -> (F::Output, DeletesAfterCommit) {
-    let deletes = Arc::new(DeletesAfterCommit::default());
+/// caller acknowledges nothing until its `commit_pending` returns. What `work`
+/// would do after one of its own commits (publish its rows, delete staging
+/// objects) comes back undone: run it with [`AfterCommit::run`] only after that
+/// `commit_pending` succeeds.
+pub async fn with_same_record_commits<F: std::future::Future>(work: F) -> (F::Output, AfterCommit) {
+    let after = Arc::new(AfterCommit::default());
     let output = DEFERRED_COMMITS
         .scope(
             CommitScope::SameRecord,
-            DELETES_AFTER_COMMIT.scope(Arc::clone(&deletes), work),
+            AFTER_COMMIT.scope(Arc::clone(&after), work),
         )
         .await;
-    let left = DeletesAfterCommit::default();
-    *left.pending.lock() = std::mem::take(&mut *deletes.pending.lock());
-    (output, left)
+    (output, after.take())
 }
 
 /// Whether the current task is inside [`with_deferred_commits`] or

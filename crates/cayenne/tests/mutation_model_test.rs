@@ -707,6 +707,7 @@ async fn test_publication_tombstone_replay_impl(fixture: TestFixture) -> TestRes
         }),
         pending_durable_flips: vec![],
         dirty_pk_bytes: vec![],
+        files: vec![],
     };
     fixture
         .catalog
@@ -810,6 +811,7 @@ async fn test_publication_without_reinsert_sequence_impl(fixture: TestFixture) -
         inline_tombstone: None,
         pending_durable_flips: vec![],
         dirty_pk_bytes: vec![],
+        files: vec![],
     };
     fixture.catalog.commit_publications(&[publication]).await?;
     let files = fixture

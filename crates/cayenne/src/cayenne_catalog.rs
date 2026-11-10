@@ -2348,6 +2348,19 @@ impl MetadataCatalog for CayenneCatalog {
                 inline_tombstone: publication.inline_tombstone.clone(),
                 pending_durable_flips: publication.pending_durable_flips.clone(),
             };
+            if !publication.files.is_empty()
+                && let Err(error) = self
+                    .replace_snapshot_files_in_txn(
+                        txn.as_mut(),
+                        &publication.table_id,
+                        &publication.snapshot_id,
+                        &publication.files,
+                    )
+                    .await
+            {
+                let _ = txn.rollback().await;
+                return Err(error);
+            }
             if let Err(error) = Self::apply_prepared_on_conflict_payload_in_txn(
                 txn.as_mut(),
                 &mut payload,

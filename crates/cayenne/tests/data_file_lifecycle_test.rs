@@ -1545,6 +1545,63 @@ impl Step {
     }
 }
 
+/// The head commit of `dataset`'s log.
+async fn head_commit(store: &Arc<dyn ObjectStore>, dataset: &str) -> u64 {
+    let log = cayenne::metastore::object_native::dataset_log_at(
+        Arc::clone(store),
+        &Path::from(CATALOG),
+        dataset,
+    )
+    .await
+    .expect("read the registry")
+    .expect("the dataset has a log");
+    let (reader, _) = object_store_occ::headlog::Reader::open(Arc::clone(store), log)
+        .await
+        .expect("open the head log");
+    reader.state().head.commit
+}
+
+/// The action names of each record committed to `dataset`'s log after `after`,
+/// oldest first.
+async fn log_records_after(
+    store: &Arc<dyn ObjectStore>,
+    dataset: &str,
+    after: u64,
+) -> Vec<Vec<String>> {
+    use prost::Message;
+    let log = cayenne::metastore::object_native::dataset_log_at(
+        Arc::clone(store),
+        &Path::from(CATALOG),
+        dataset,
+    )
+    .await
+    .expect("read the registry")
+    .expect("the dataset has a log");
+    let (_, opened) = object_store_occ::headlog::Reader::open(Arc::clone(store), log)
+        .await
+        .expect("open the head log");
+    opened
+        .records
+        .into_iter()
+        .filter(|entry| entry.commit > after)
+        .map(|entry| {
+            object_store_occ::headlog::Group::decode(entry.record.payload)
+                .expect("group")
+                .payloads
+                .into_iter()
+                .flat_map(|payload| {
+                    cayenne_metastore_actions::Record::decode(payload)
+                        .expect("record")
+                        .actions
+                        .iter()
+                        .map(|action| action.name().to_string())
+                        .collect::<Vec<_>>()
+                })
+                .collect()
+        })
+        .collect()
+}
+
 /// Run `step` once to count its storage requests, then once per request with the
 /// process killed just before it. After each kill, a new process over the same
 /// storage serves either every row from before or every row from after (after
@@ -1552,7 +1609,9 @@ impl Step {
 /// names, and keeps both true through its own sweeps; its orphan sweep then
 /// leaves no data file and no deletion vector that no commit names.
 async fn kill_at_every_request(step: Step) {
-    let (_location, process) = step.start().await;
+    let (location, process) = step.start().await;
+    let log_store = Arc::clone(&location.probe.inner) as Arc<dyn ObjectStore>;
+    let before = head_commit(&log_store, "orders").await;
     process.instance.clear_steps();
     assert_eq!(
         step.run(Arc::clone(&process.table)).await,
@@ -1564,7 +1623,7 @@ async fn kill_at_every_request(step: Step) {
     drop(process);
     assert!(!steps.is_empty());
     eprintln!("{step:?}: {} storage requests", steps.len());
-    if matches!(step, Step::Append | Step::Upsert) {
+    if matches!(step, Step::Append | Step::Upsert | Step::ChangeStreamUpsert) {
         // Each data file is written once, at its final key: nothing is staged,
         // copied, or listed on the write path.
         let staged_or_copied: Vec<&String> = steps
@@ -1579,6 +1638,34 @@ async fn kill_at_every_request(step: Step) {
             staged_or_copied.is_empty(),
             "{step:?}: requests that stage, copy or list: {staged_or_copied:?}"
         );
+    }
+    if matches!(step, Step::ChangeStreamUpsert) {
+        // A keyed write into a new protected snapshot commits in one record: its
+        // files, its deletes and its sequence. The only other record the step
+        // may write is the sequence allocator's block reservation (one per
+        // block of sequences, here the first write after the table opened).
+        let heads = steps
+            .iter()
+            .filter(|step| step.starts_with("put ") && step.ends_with("/head"))
+            .count();
+        let records = log_records_after(&log_store, "orders", before).await;
+        let written = &records[..heads.min(records.len())];
+        let with_data: Vec<&Vec<String>> = written
+            .iter()
+            .filter(|record| record.iter().any(|action| action != "AdvanceSeq"))
+            .collect();
+        assert_eq!(
+            with_data.len(),
+            1,
+            "{step:?}: one record holds the write, the rest only reserve sequences: {written:?}"
+        );
+        for kind in ["AddFiles", "AddDeleteFiles", "SetGroup"] {
+            assert!(
+                with_data[0].iter().any(|action| action == kind),
+                "{step:?}: the write's record has no {kind}: {:?}",
+                with_data[0]
+            );
+        }
     }
 
     let mut acknowledged = 0;

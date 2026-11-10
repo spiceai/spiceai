@@ -1463,6 +1463,7 @@ fn protected_snapshot(
         inline_tombstone: None,
         pending_durable_flips: Vec::new(),
         dirty_pk_bytes: Vec::new(),
+        files: Vec::new(),
     }
 }
 
