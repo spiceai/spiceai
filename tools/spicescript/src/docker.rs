@@ -905,7 +905,9 @@ pub async fn publishing_also_on<F: std::future::Future>(
     ALSO_PUBLISH_ON.scope(address, work).await
 }
 
-fn also_publish_on() -> Option<std::net::IpAddr> {
+/// The address [`publishing_also_on`] gave the current task, if any. A source
+/// that serves from this process rather than a container listens there too.
+pub fn also_publish_on() -> Option<std::net::IpAddr> {
     ALSO_PUBLISH_ON.try_with(|address| *address).ok().flatten()
 }
 
