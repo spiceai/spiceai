@@ -24,11 +24,6 @@ spicepod:
       params: ${sources.src.params}
       acceleration:
         enabled: false
-    - from: duckdb:main.dec
-      name: dec
-      params: ${sources.src.params}
-      acceleration:
-        enabled: false
 
 defaults:
   # A cluster buckets each acceleration on this column (--cluster).
