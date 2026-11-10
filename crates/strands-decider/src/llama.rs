@@ -41,17 +41,20 @@ pub struct LlamaHiddenStates<'m> {
 impl<'m> LlamaHiddenStates<'m> {
     /// A context of `n_ctx` tokens, at least the checkpoint's `max_length`, on `model`, with
     /// `adapter` applied at scale 1 (its trained `alpha / rank`). `n_batch` is the most tokens
-    /// one decode takes.
+    /// one decode takes. `n_threads` is the CPU threads a decode uses; llama.cpp's default
+    /// when `None`.
     pub fn new(
         backend: &Backend,
         model: &'m Model,
         adapter: Option<Arc<LoraAdapter<'m>>>,
         n_ctx: u32,
         n_batch: u32,
+        n_threads: Option<NonZeroU32>,
     ) -> Result<Self> {
         let params = ContextParams::default()
             .with_n_ctx(NonZeroU32::new(n_ctx))
             .with_n_batch(n_batch)
+            .with_n_threads(n_threads)
             .with_hidden_states(true);
         let mut context = model.new_context(backend, &params).context(LlamaSnafu)?;
         if let Some(adapter) = adapter {

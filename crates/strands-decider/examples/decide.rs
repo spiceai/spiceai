@@ -66,6 +66,18 @@ struct Args {
     /// Layers offloaded to the GPU; all when unset.
     #[arg(long)]
     gpu_layers: Option<u32>,
+    /// CPU threads per decode; llama.cpp's default when unset.
+    #[arg(long)]
+    threads: Option<std::num::NonZeroU32>,
+    /// Unmeasured evaluations before the measured ones.
+    #[arg(long, default_value_t = 0)]
+    warmup: usize,
+    /// Measured evaluations; with more than one, each one's latency is written to `--latencies`.
+    #[arg(long, default_value_t = 1)]
+    repeat: usize,
+    /// File for one latency per line, in milliseconds.
+    #[arg(long)]
+    latencies: Option<PathBuf>,
 }
 
 /// `spec` split at its first `=` into the question and its comma-separated options, each
@@ -140,12 +152,26 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         None => None,
     };
     let n_ctx = u32::try_from(decider.config().max_length)?;
-    let mut hidden = LlamaHiddenStates::new(backend, &model, adapter, n_ctx, 512)?;
+    let mut hidden = LlamaHiddenStates::new(backend, &model, adapter, n_ctx, 512, args.threads)?;
 
-    let started = std::time::Instant::now();
-    let evaluation =
-        decider.evaluate(&mut hidden, &Content::from(args.state.as_str()), &questions)?;
-    let elapsed = started.elapsed();
+    let state = Content::from(args.state.as_str());
+    for _ in 0..args.warmup {
+        decider.evaluate(&mut hidden, &state, &questions)?;
+    }
+    let mut latencies_ms = Vec::with_capacity(args.repeat);
+    let mut last = None;
+    for _ in 0..args.repeat.max(1) {
+        let started = std::time::Instant::now();
+        let evaluation = decider.evaluate(&mut hidden, &state, &questions)?;
+        latencies_ms.push(started.elapsed().as_secs_f64() * 1000.0);
+        last = Some(evaluation);
+    }
+    let evaluation = last.ok_or("no evaluation ran")?;
+    let elapsed = std::time::Duration::from_secs_f64(latencies_ms[latencies_ms.len() - 1] / 1000.0);
+    if let Some(path) = &args.latencies {
+        let lines: Vec<String> = latencies_ms.iter().map(|ms| format!("{ms:.3}")).collect();
+        std::fs::write(path, lines.join("\n") + "\n")?;
+    }
 
     for (name, answer) in &evaluation.answers {
         match answer {

@@ -52,6 +52,7 @@ pub struct ContextParams {
     n_seq_max: Option<u32>,
     kv_unified: Option<bool>,
     hidden_states: bool,
+    n_threads: Option<NonZeroU32>,
 }
 
 impl ContextParams {
@@ -92,6 +93,14 @@ impl ContextParams {
         self
     }
 
+    /// The CPU threads a decode uses, for both single-token and batch decodes; llama.cpp's
+    /// default when unset.
+    #[must_use]
+    pub fn with_n_threads(mut self, n_threads: Option<NonZeroU32>) -> Self {
+        self.n_threads = n_threads;
+        self
+    }
+
     /// Makes every decode output the final hidden state of each token it marks for output,
     /// one per token rather than pooled per sequence: the model's last layer after its final
     /// norm, the input to its output head. [`Context::hidden_state`] reads them.
@@ -121,6 +130,11 @@ impl ContextParams {
         }
         if let Some(kv_unified) = self.kv_unified {
             raw.kv_unified = kv_unified;
+        }
+        if let Some(n_threads) = self.n_threads {
+            let n_threads = i32::try_from(n_threads.get()).unwrap_or(i32::MAX);
+            raw.n_threads = n_threads;
+            raw.n_threads_batch = n_threads;
         }
         if self.hidden_states {
             // With no pooling, llama.cpp keeps a row per output token: the graph's `t_embd`,
