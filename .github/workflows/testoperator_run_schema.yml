@@ -408,8 +408,18 @@ jobs:
           # (self-hosted) runner as well, so git uses the URL-embedded token only:
           # otherwise a helper (osxkeychain / git-credential-manager) can intercept
           # the push and block on an interactive credential prompt, hanging the job.
-          git -c credential.helper='' -c credential.interactive=false \
-            push "https://x-access-token:${GH_TOKEN}@github.com/${{ github.repository }}" "HEAD:${BRANCH_NAME}"
+          if ! push_log="$(git -c credential.helper='' -c credential.interactive=false \
+            push "https://x-access-token:${GH_TOKEN}@github.com/${{ github.repository }}" "HEAD:${BRANCH_NAME}" 2>&1)"; then
+            echo "${push_log}"
+            # A new branch from a release-branch commit is refused on every run
+            # (GitHub times out checking it for workflow changes); keep the
+            # snapshots as an artifact and say so.
+            printf '%s\n' "${push_log}" >"${RUNNER_TEMP}/snapshot-push.log"
+            bash .github/scripts/save_unpushable_snapshots.sh \
+              "${RUNNER_TEMP}/snapshot-push.log" "${BRANCH_NAME}" "${{ github.ref_name }}" || true
+            exit 1
+          fi
+          echo "${push_log}"
 
           PR_URL="$(gh pr list --head "${BRANCH_NAME}" --state open --json url --jq .[].url)"
           if [[ -n "${PR_URL}" ]]; then
@@ -431,3 +441,14 @@ jobs:
           # Never fall back to an interactive prompt; fail fast if auth is rejected.
           GIT_TERMINAL_PROMPT: '0'
           GCM_INTERACTIVE: 'never'
+
+      - name: Upload snapshots GitHub refused to push
+        # save_unpushable_snapshots.sh leaves the snapshot commit here when
+        # GitHub will not let GITHUB_TOKEN create the snapshot branch.
+        if: ${{ failure() }}
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
+        with:
+          name: unpushed-snapshots
+          path: ${{ runner.temp }}/unpushed-snapshots/
+          if-no-files-found: ignore
+          retention-days: 14
