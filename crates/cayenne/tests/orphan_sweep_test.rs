@@ -19,7 +19,9 @@ limitations under the License.
 //! unreferenced object goes only once the store dates it older than the floor
 //! and no write in flight holds it; an object whose commit outcome is unknown,
 //! a reader's snapshot and a committed file the listing misses are kept;
-//! unfinished multipart uploads are aborted after the floor.
+//! unfinished multipart uploads are aborted after the floor. A table that is
+//! never written again is swept when it opens, the sweep deletes in batched
+//! requests, and it counts what it reclaimed.
 
 use std::collections::{BTreeMap, HashSet};
 use std::fmt::{self, Display, Formatter};
@@ -60,12 +62,46 @@ const LOCATION: &str = "s3://bucket/state/cayenne/v1";
 const FLOOR: Duration = Duration::from_millis(400);
 
 /// An in-memory store that tracks its unfinished multipart uploads, initiated
-/// on its own clock, and can hide keys from listings.
+/// on its own clock, can hide keys from listings, lists some keys as last
+/// modified earlier than they were, and records the keys of every delete call.
 #[derive(Debug, Default)]
 struct TrackingStore {
     inner: InMemory,
     uploads: Arc<Mutex<BTreeMap<String, UnfinishedUpload>>>,
     hidden: Mutex<HashSet<String>>,
+    /// Keys listed as last modified this long before the store stamped them.
+    aged: Mutex<BTreeMap<String, Duration>>,
+    /// The keys of each `delete_stream` call, in order.
+    deletes: Arc<Mutex<Vec<Vec<String>>>>,
+}
+
+impl TrackingStore {
+    /// `meta` as the listings report it: hidden keys dropped, aged keys backdated.
+    fn listed(
+        hidden: &HashSet<String>,
+        aged: &BTreeMap<String, Duration>,
+        mut meta: ObjectMeta,
+    ) -> Option<ObjectMeta> {
+        if hidden.contains(meta.location.as_ref()) {
+            return None;
+        }
+        if let Some(age) = aged.get(meta.location.as_ref()) {
+            meta.last_modified -= chrono::Duration::from_std(*age).expect("an age");
+        }
+        Some(meta)
+    }
+
+    /// The `DeleteObjects` requests an S3 store sends for the recorded delete
+    /// calls that touch a key under `prefix`: each call's keys in requests of
+    /// up to 1000 keys.
+    fn delete_requests_under(&self, prefix: &str) -> Vec<usize> {
+        self.deletes
+            .lock()
+            .iter()
+            .filter(|keys| keys.iter().any(|key| key.starts_with(prefix)))
+            .flat_map(|keys| keys.chunks(1000).map(<[String]>::len))
+            .collect()
+    }
 }
 
 impl Display for TrackingStore {
@@ -145,14 +181,29 @@ impl ObjectStore for TrackingStore {
         &self,
         locations: BoxStream<'static, object_store::Result<Path>>,
     ) -> BoxStream<'static, object_store::Result<Path>> {
-        self.inner.delete_stream(locations)
+        let deletes = Arc::clone(&self.deletes);
+        let call = {
+            let mut calls = deletes.lock();
+            calls.push(Vec::new());
+            calls.len() - 1
+        };
+        self.inner.delete_stream(
+            locations
+                .inspect(move |path| {
+                    if let Ok(path) = path {
+                        deletes.lock()[call].push(path.to_string());
+                    }
+                })
+                .boxed(),
+        )
     }
     fn list(&self, prefix: Option<&Path>) -> BoxStream<'static, object_store::Result<ObjectMeta>> {
         let hidden = self.hidden.lock().clone();
+        let aged = self.aged.lock().clone();
         self.inner
             .list(prefix)
-            .try_filter(move |meta| {
-                futures::future::ready(!hidden.contains(meta.location.as_ref()))
+            .try_filter_map(move |meta| {
+                futures::future::ready(Ok(Self::listed(&hidden, &aged, meta)))
             })
             .boxed()
     }
@@ -162,19 +213,22 @@ impl ObjectStore for TrackingStore {
         offset: &Path,
     ) -> BoxStream<'static, object_store::Result<ObjectMeta>> {
         let hidden = self.hidden.lock().clone();
+        let aged = self.aged.lock().clone();
         self.inner
             .list_with_offset(prefix, offset)
-            .try_filter(move |meta| {
-                futures::future::ready(!hidden.contains(meta.location.as_ref()))
+            .try_filter_map(move |meta| {
+                futures::future::ready(Ok(Self::listed(&hidden, &aged, meta)))
             })
             .boxed()
     }
     async fn list_with_delimiter(&self, prefix: Option<&Path>) -> object_store::Result<ListResult> {
         let mut result = self.inner.list_with_delimiter(prefix).await?;
         let hidden = self.hidden.lock().clone();
-        result
-            .objects
-            .retain(|meta| !hidden.contains(meta.location.as_ref()));
+        let aged = self.aged.lock().clone();
+        result.objects = std::mem::take(&mut result.objects)
+            .into_iter()
+            .filter_map(|meta| Self::listed(&hidden, &aged, meta))
+            .collect();
         Ok(result)
     }
     async fn copy_opts(
@@ -245,6 +299,22 @@ impl Rig {
             Arc::clone(&tracking) as Arc<dyn ObjectStore>
         ));
         let store = Arc::clone(&faults) as Arc<dyn ObjectStore>;
+        Self {
+            tracking,
+            faults,
+            store,
+        }
+    }
+
+    /// A rig whose tables use the tracking store directly: the fault layer
+    /// sends each key of a delete call on its own, so the tracking store sees
+    /// the calls the table makes only without it.
+    fn without_faults() -> Self {
+        let tracking = Arc::new(TrackingStore::default());
+        let faults = Arc::new(FaultStore::new(
+            Arc::clone(&tracking) as Arc<dyn ObjectStore>
+        ));
+        let store = Arc::clone(&tracking) as Arc<dyn ObjectStore>;
         Self {
             tracking,
             faults,
@@ -801,4 +871,206 @@ async fn a_committed_file_the_listing_misses_is_not_dropped() {
         .place(rig.catalog().await, "orders", Some(data_url))
         .await;
     assert_eq!(reopened.count().await.expect("count"), (5000, 5000));
+}
+
+/// A snapshot directory nothing refers to under `placed`'s table, holding one
+/// planted object of `size` bytes per entry of `sizes`; returns the directory
+/// and the planted keys.
+async fn plant_orphans(rig: &Rig, placed: &Placed, sizes: &[usize]) -> (String, Vec<String>) {
+    let stored = placed.native.get_table("orders").await.expect("table");
+    let dir = format!(
+        "{}/{}/{}",
+        placed.data_prefix,
+        stored.table_id,
+        uuid::Uuid::now_v7()
+    );
+    let mut keys = Vec::with_capacity(sizes.len());
+    for (i, size) in sizes.iter().enumerate() {
+        let key = format!("{dir}/orphan-{i:05}.vortex");
+        rig.store
+            .put(
+                &Path::from(key.as_str()),
+                PutPayload::from(vec![0_u8; *size]),
+            )
+            .await
+            .expect("plant an orphan");
+        keys.push(key);
+    }
+    (dir, keys)
+}
+
+/// A crashed write left objects no commit names, and the dataset is never
+/// written again. Its next open sweeps them on the one-hour floor: the object
+/// the store dates two hours old goes, the one it dates half an hour old stays,
+/// and every committed file and row is kept.
+#[tokio::test]
+async fn an_orphan_of_a_table_that_is_not_written_again_is_reclaimed_at_open() {
+    let rig = Rig::new();
+    let placed = rig.place(rig.catalog().await, "orders", None).await;
+    placed.insert(1, 1000).await.expect("write");
+    placed
+        .table
+        .drain_in_flight_maintenance()
+        .await
+        .expect("drain");
+    let stored = placed.native.get_table("orders").await.expect("table");
+    let dir = format!(
+        "{}/{}/{}",
+        placed.data_prefix, stored.table_id, stored.current_snapshot_id
+    );
+    let old = format!("{dir}/crashed-old.vortex");
+    let young = format!("{dir}/crashed-young.vortex");
+    for key in [&old, &young] {
+        rig.store
+            .put(
+                &Path::from(key.as_str()),
+                PutPayload::from_static(b"orphan"),
+            )
+            .await
+            .expect("plant an orphan");
+    }
+    rig.tracking.aged.lock().extend([
+        (old.clone(), Duration::from_hours(2)),
+        (young.clone(), Duration::from_mins(30)),
+    ]);
+    let named = placed.named_keys().await;
+    let before = rig.data_files(&placed.data_prefix).await;
+    assert!(
+        before.contains(&old)
+            && before.contains(&young)
+            && named.iter().all(|key| before.contains(key)),
+        "the orphans and the committed files are stored: {before:?}"
+    );
+    let data_url = placed.data_url.clone();
+    drop(placed);
+
+    // A restart: a new catalog and table over the same store, and no write.
+    let reopened = rig
+        .place(rig.catalog().await, "orders", Some(data_url))
+        .await;
+    eventually("the orphan older than the floor is reclaimed", || async {
+        !rig.data_files(&reopened.data_prefix).await.contains(&old)
+    })
+    .await;
+    let remaining = rig.data_files(&reopened.data_prefix).await;
+    let mut lost: Vec<&String> = named
+        .iter()
+        .filter(|key| !remaining.contains(key))
+        .collect();
+    lost.sort();
+    assert_eq!(
+        (
+            remaining.contains(&young),
+            lost,
+            reopened.count().await.expect("count")
+        ),
+        (true, Vec::<&String>::new(), (1000, 1000)),
+        "the orphan younger than the floor is kept, no committed file is lost, rows"
+    );
+}
+
+/// The sweep deletes what it reclaims in batched requests: 1001 orphans go in
+/// two `DeleteObjects` requests, not one request each.
+#[tokio::test]
+async fn the_orphan_sweep_deletes_in_batched_requests() {
+    const ORPHANS: usize = 1001;
+    let rig = Rig::without_faults();
+    let placed = rig.place(rig.catalog().await, "orders", None).await;
+    placed.insert(1, 1000).await.expect("write");
+    placed
+        .table
+        .drain_in_flight_maintenance()
+        .await
+        .expect("drain");
+    let (dir, keys) = plant_orphans(&rig, &placed, &[8; ORPHANS]).await;
+    assert_eq!(rig.data_files(&dir).await, keys, "the orphans are stored");
+    placed.table.set_orphan_age_floor(Duration::ZERO);
+    let swept = placed.table.sweep_orphan_files_now().await.expect("sweep");
+    assert_eq!(
+        (
+            swept.deleted.len(),
+            rig.tracking.delete_requests_under(&dir).len(),
+            rig.data_files(&dir).await.len(),
+            placed.count().await.expect("count"),
+        ),
+        (ORPHANS, ORPHANS.div_ceil(1000), 0, (1000, 1000)),
+        "orphans deleted, delete requests, orphans left, rows"
+    );
+}
+
+/// The sweep counts the files and bytes it reclaims in
+/// `cayenne_maintenance_reclaimed_{files,bytes}_total` under its own `op`.
+#[tokio::test]
+async fn the_orphan_sweep_counts_what_it_reclaims() {
+    crate::common::require_process_per_test("it installs the process-wide meter provider");
+    let reader = telemetry::metrics_reader::MetricsReader::new_cumulative();
+    opentelemetry::global::set_meter_provider(
+        opentelemetry_sdk::metrics::SdkMeterProvider::builder()
+            .with_reader(reader.clone())
+            .build(),
+    );
+    let rig = Rig::new();
+    let placed = rig.place(rig.catalog().await, "orders", None).await;
+    placed.insert(1, 1000).await.expect("write");
+    placed
+        .table
+        .drain_in_flight_maintenance()
+        .await
+        .expect("drain");
+    let sizes = [100, 200, 300];
+    let (_dir, keys) = plant_orphans(&rig, &placed, &sizes).await;
+    placed.table.set_orphan_age_floor(Duration::ZERO);
+    let swept = placed.table.sweep_orphan_files_now().await.expect("sweep");
+    let mut deleted = swept.deleted.clone();
+    deleted.sort();
+    let stored = placed.native.get_table("orders").await.expect("table");
+    let table_prefix = format!("{}/{}/", placed.data_prefix, stored.table_id);
+    let planted: Vec<String> = keys
+        .iter()
+        .map(|key| key.trim_start_matches(&table_prefix).to_string())
+        .collect();
+    assert_eq!(
+        (
+            deleted,
+            reclaimed(&reader, "cayenne_maintenance_reclaimed_files_total"),
+            reclaimed(&reader, "cayenne_maintenance_reclaimed_bytes_total"),
+        ),
+        (planted, 3, 600),
+        "objects the sweep deleted, and the files and bytes it counted"
+    );
+}
+
+/// The cumulative value of the counter `name` for the `orders` table and the
+/// orphan sweep's `op`.
+fn reclaimed(reader: &telemetry::metrics_reader::MetricsReader, name: &str) -> u64 {
+    use opentelemetry_sdk::metrics::data::{AggregatedMetrics, MetricData, ResourceMetrics};
+    use opentelemetry_sdk::metrics::reader::MetricReader as _;
+    let mut resource_metrics = ResourceMetrics::default();
+    reader
+        .collect(&mut resource_metrics)
+        .expect("collect metrics");
+    let mut total = 0;
+    for metric in resource_metrics
+        .scope_metrics()
+        .flat_map(opentelemetry_sdk::metrics::data::ScopeMetrics::metrics)
+    {
+        if metric.name() != name {
+            continue;
+        }
+        if let AggregatedMetrics::U64(MetricData::Sum(sum)) = metric.data() {
+            for point in sum.data_points() {
+                let label = |key: &str| {
+                    point
+                        .attributes()
+                        .find(|attribute| attribute.key.as_str() == key)
+                        .map(|attribute| attribute.value.as_str().to_string())
+                        .unwrap_or_default()
+                };
+                if label("table") == "orders" && label("op") == "orphan_file_sweep" {
+                    total += point.value();
+                }
+            }
+        }
+    }
+    total
 }

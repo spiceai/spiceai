@@ -49,6 +49,13 @@ limitations under the License.
 //! Multipart uploads started under the table's prefix and never completed are
 //! aborted on the same floor, measured from the time the store says each was
 //! initiated, when the store can list them ([`UnfinishedUploads`]).
+//!
+//! The sweep runs when the table opens, so the objects a write that crashed or
+//! was fenced left behind are reclaimed even if the table is never written
+//! again, and then at most every [`ORPHAN_SWEEP_INTERVAL`], after a commit or on
+//! the background maintenance tick. It deletes in batched requests
+//! ([`crate::dataset_storage::delete_in_batches`]) and counts what it reclaimed
+//! under `op="orphan_file_sweep"`.
 
 use std::collections::HashSet;
 use std::time::Duration;
@@ -106,6 +113,9 @@ pub struct OrphanSweep {
     pub kept_in_flight: usize,
     /// Unfinished multipart uploads aborted.
     pub aborted_uploads: Vec<String>,
+    /// Objects the sweep tried to delete that may still be stored; the next
+    /// sweep retries them.
+    pub failed: usize,
 }
 
 /// Where a listed object sits, relative to the table's prefix.

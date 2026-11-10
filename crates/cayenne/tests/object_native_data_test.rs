@@ -528,6 +528,9 @@ async fn reopen_in(
             .await
             .expect("reopen the table"),
     );
+    // The orphan sweep an open runs lists the data path; wait for it, so the
+    // caller counts only its own requests.
+    table.wait_for_orphan_sweep().await;
     ctx.register_table(name, Arc::clone(&table) as Arc<dyn TableProvider>)
         .expect("register");
     (catalog, table, ctx)
@@ -635,6 +638,9 @@ async fn writes_scan_their_committed_files_and_reopen_from_the_store() {
             .await
             .expect("reopen the table"),
     );
+    // The orphan sweep the open runs lists the data path; wait for it, so only
+    // the scan is counted.
+    table.wait_for_orphan_sweep().await;
     ctx.register_table("orders", Arc::clone(&table) as Arc<dyn TableProvider>)
         .expect("register");
     setup.counting.watch(&setup.data_prefix);
