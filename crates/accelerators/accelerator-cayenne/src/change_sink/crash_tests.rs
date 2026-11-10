@@ -3092,6 +3092,19 @@ async fn memory_mode_bursts_whose_deletes_overflow_the_tier_budget_commit_exactl
         durable_deletes >= 5,
         "the five overflowing deletes are written durably: {records:?}"
     );
+    // Each checkpoint, a spill's included, commits as one record: the files of
+    // its snapshot with the snapshot's sequence.
+    let checkpoints: Vec<&Vec<String>> = records
+        .iter()
+        .filter(|record| record.iter().any(|action| action == "AddFiles"))
+        .collect();
+    assert!(
+        checkpoints.len() >= 3
+            && checkpoints
+                .iter()
+                .all(|record| record.iter().any(|action| action == "SetGroup")),
+        "each checkpoint commits its files and its sequence in one record: {records:?}"
+    );
 }
 
 /// A process with the memory-mode table: seeded with the inline and file keys,
