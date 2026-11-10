@@ -123,7 +123,7 @@ own section below — a count here would be one more thing to keep true by hand.
 | [docx-rs](#docx-rs) | `81faaf2187185b097710b9ee589bf039efdd74de` | `jeadie/render-zip-upgrade` |
 | [graph-rs-sdk](#graph-rs-sdk) | `25bc483efc3200df7a4f5426c176cddb18a84ad9` | `spiceai` |
 | [iceberg-rust](#iceberg-rust) | `1f0744b900e69e1b3fafa721aa4283bd4b048a61` | `spiceai-0.11.0-df-55` |
-| [llama.cpp](#llamacpp) | `b04e915148235494231d58104ef7b5e60cd8e634` | `fix/narrow-f32-to-bf16-opt-in` (TEMPORARY: spiceai/llama.cpp#37) |
+| [llama.cpp](#llamacpp) | `8829a4085c203f73ff7da86256ef9c832a12cf42` | `spiceai-b11999` |
 | [mistral.rs](#mistralrs-and-text-embeddings-inference) | `d7ddf3bb84ad753e6da385c02e9f8e16bc9a39ec` | `spiceai` |
 | [model2vec-rs](#model2vec-rs) | `55fef28a3556895b20204634b788f7c836b610bc` | `spiceai` |
 | [orc-rust](#orc-rust) | `d9632e7ae973456c81c660c04e5f55cc86489bcb` | `spiceai-0.9` |
@@ -777,9 +777,9 @@ rather than by taking them. A re-cut cannot lose what the fork does not carry.
 Upstream [ggml-org/llama.cpp](https://github.com/ggml-org/llama.cpp). The fork carries
 upstream releases with the Spice patches below: each `spiceai-<release>` branch is the previous
 Spice branch with the upstream release tag merged in, and the pin is its tagged tip,
-`<release>-spiceai.<n>`, or a commit on it that no tag names yet: today spiceai/llama.cpp#37's branch, two commits
-past the squash of spiceai/llama.cpp#36, which is fifteen commits past `b11999-spiceai.1` (#21, #20, #23, #25, then #22, which
-carried #18 and #19 over from `spiceai-b11803`, then #24, #26, #27, #29, #30, #31, #33, #34, #35, #36), which is upstream
+`<release>-spiceai.<n>`, or a commit on it that no tag names yet: today the squash of
+spiceai/llama.cpp#37, sixteen commits past `b11999-spiceai.1` (#21, #20, #23, #25, then #22, which
+carried #18 and #19 over from `spiceai-b11803`, then #24, #26, #27, #29, #30, #31, #33, #34, #35, #36, #37), which is upstream
 `b11984` and then `b11999` merged into `spiceai-b11803`, with `spiceai-b11803` merged in again at
 spiceai/llama.cpp#16. Since `b11984` the DeepSeek-V4.1 model (`deepseek41`) is upstream's, and the fork keeps only
 its fixes on top; of those, the ones without a row below (a LoRA adapter on `output.weight`,

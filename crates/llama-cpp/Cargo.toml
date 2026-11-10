@@ -12,7 +12,7 @@ version.workspace = true
 autotests = false
 
 [dependencies]
-llama-cpp-src = { git = "https://github.com/spiceai/llama.cpp", rev = "b04e915148235494231d58104ef7b5e60cd8e634" } # branch: fix/narrow-f32-to-bf16-opt-in (TEMPORARY: spiceai/llama.cpp#37, on spiceai-b11999 past the squash of #36)
+llama-cpp-src = { git = "https://github.com/spiceai/llama.cpp", rev = "8829a4085c203f73ff7da86256ef9c832a12cf42" } # branch: spiceai-b11999 (the squash of spiceai/llama.cpp#37, past tag b11999-spiceai.1)
 snafu.workspace = true
 tracing.workspace = true
 
