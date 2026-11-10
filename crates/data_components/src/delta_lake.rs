@@ -2996,7 +2996,7 @@ mod column_mapping_filter_tests {
             mapped("id", "col-id", 1, DeltaType::INTEGER),
             mapped("st", "col-st", 2, st),
             mapped("outer", "col-outer", 5, outer),
-            mapped("l", "col-l", 8, ArrayType::new(element.into(), true)),
+            mapped("l", "col-l", 8, ArrayType::new(element, true)),
             mapped(
                 "m",
                 "col-m",
