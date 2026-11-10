@@ -1,0 +1,88 @@
+name: zz probe bridge executors
+# Temporary: proves spicescript's cluster-shuffle on the rootless dev runners,
+# once on trunk and once on the fix. Never merged.
+on:
+  push:
+    branches: [grokspice/probe-bridge-base, grokspice/probe-bridge-fix, grokspice/probe-bridge-fix-3]
+permissions:
+  contents: read
+jobs:
+  unit:
+    if: github.ref_name != 'grokspice/probe-bridge-base'
+    runs-on: spiceai-dev-runners
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: ./.github/actions/setup-rust
+      - uses: ./.github/actions/setup-cc
+      - name: Format
+        run: cargo fmt -p spicescript -- --check
+      - name: Clippy
+        run: >-
+          cargo clippy -p spicescript --bins --tests -- -Dwarnings -Dclippy::pedantic
+          -Dclippy::unwrap_used -Dclippy::expect_used -Dclippy::clone_on_ref_ptr
+          -Aclippy::module_name_repetitions -Aclippy::large_futures -Aclippy::too_many_lines
+          -Dclippy::equatable_if_let -Dclippy::needless_collect -Dclippy::redundant_clone
+          -Dclippy::todo -Dclippy::assertions_on_result_states -Dclippy::allow_attributes
+      - name: Unit tests
+        run: cargo test -p spicescript --bins
+
+  cluster-shuffle:
+    runs-on: spiceai-dev-runners
+    environment: ci
+    permissions:
+      contents: read
+      id-token: write
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Get RustFS credentials
+        id: rustfs
+        uses: ./.github/actions/rustfs-credentials
+        with:
+          endpoint: ${{ vars.TEST_MINIO_ENDPOINT }}
+          duration-seconds: '3600'
+          export-env: 'false'
+      - name: Install MinIO
+        uses: ./.github/actions/setup-minio
+        with:
+          minio_endpoint: ${{ vars.TEST_MINIO_ENDPOINT }}
+          minio_access_key: ${{ steps.rustfs.outputs.access-key-id }}
+          minio_secret_key: ${{ steps.rustfs.outputs.secret-access-key }}
+          minio_session_token: ${{ steps.rustfs.outputs.session-token }}
+      - name: Setup spiced (trunk build)
+        uses: ./.github/actions/setup-spiced
+      - name: Build spicescript
+        id: spicescript
+        uses: ./.github/actions/build-tool
+        with:
+          package: spicescript
+      - name: Login to DockerHub
+        uses: docker/login-action@8aa5831fb8d48d8f76594c7ddde61ae58019f550 # v4.8.0
+        env:
+          DOCKERHUB_OIDC_CONNECTIONID: ${{ vars.DOCKERHUB_OIDC_CONNECTIONID }}
+          DOCKERHUB_OIDC_EXPIREIN: '21600'
+        with:
+          username: ${{ vars.DOCKERHUB_ORGANIZATION }}
+      - name: Install the AWS CLI
+        run: |
+          command -v unzip >/dev/null || { sudo apt-get update && sudo apt-get install -y unzip; }
+          if ! command -v aws >/dev/null; then
+            curl -fsSL -o "$RUNNER_TEMP/awscliv2.zip" https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip
+            unzip -q "$RUNNER_TEMP/awscliv2.zip" -d "$RUNNER_TEMP"
+            sudo "$RUNNER_TEMP/aws/install"
+          fi
+      - name: Run cluster-shuffle
+        run: |
+          docker info --format 'security={{.SecurityOptions}}'
+          "${{ steps.spicescript.outputs.path }}" \
+            --spiced "$(command -v spiced)" \
+            --work-dir "$RUNNER_TEMP/spicescript" \
+            --log-capture "$RUNNER_TEMP/spicescript-logs" \
+            test/spicescript/cluster-shuffle.yaml
+      - name: Show executor and scheduler logs
+        if: failure()
+        run: |
+          find "$RUNNER_TEMP/spicescript" "$RUNNER_TEMP/spicescript-logs" -name '*.log' 2>/dev/null | head -20 | while read -r f; do
+            echo "=== $f"; tail -n 40 "$f"
+          done
