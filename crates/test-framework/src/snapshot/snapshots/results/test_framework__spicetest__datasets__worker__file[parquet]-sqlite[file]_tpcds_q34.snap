@@ -5,5 +5,11 @@ description: "Query: tpcds_q34"
 +-------------+--------------+--------------+-----------------------+------------------+-----+
 | c_last_name | c_first_name | c_salutation | c_preferred_cust_flag | ss_ticket_number | cnt |
 +-------------+--------------+--------------+-----------------------+------------------+-----+
-| Cole        | Ruby         | Dr.          | N                     | 932              | 16  |
+| Brunson     | Albert       | Ms.          | N                     | 3324             | 15  |
+| Garrison    | Kevin        | Sir          | N                     | 539              | 16  |
+| Johnson     | Rebecca      | Ms.          | N                     | 7824             | 16  |
+| Little      | Will         | Mr.          | N                     | 8768             | 16  |
+| Mcgee       | John         | Sir          | N                     | 2181             | 15  |
+| Perry       | Dustin       | Mr.          |                       | 9759             | 15  |
+| Sanderson   | Sean         | Sir          | N                     | 3754             | 15  |
 +-------------+--------------+--------------+-----------------------+------------------+-----+
