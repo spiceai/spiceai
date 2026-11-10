@@ -114,10 +114,6 @@ const PK_DELETE_FLUSH_BATCH_SIZE: usize = 50_000;
 enum StagedPkDelete {
     Int64 {
         delete_files: Vec<DeleteFile>,
-        /// Tombstone snapshot captured when the delete began. Used only to count
-        /// how many keys are newly deleted (not already tombstoned) — it is never
-        /// re-published, so a concurrent update is never observed here.
-        initial: Arc<Int64PkDeletionSnapshot>,
         /// This delete's primary keys, de-duplicated across chunks. Published by
         /// merging (compare-and-swap) onto the live snapshot at commit.
         new_pks: HashSet<i64>,
@@ -128,7 +124,6 @@ enum StagedPkDelete {
     },
     RowKeys {
         delete_files: Vec<DeleteFile>,
-        initial: Arc<RowConverterDeletionSnapshot>,
         new_keys: HashSet<Box<[u8]>>,
         delete_sequence: Option<i64>,
         storage: Option<Arc<DatasetStorage>>,
@@ -529,20 +524,14 @@ impl StagedPkDelete {
         storage: Option<&Arc<DatasetStorage>>,
     ) -> super::super::Result<Self> {
         match strategy {
-            PkDeletionStrategyWithCache::Int64Pk {
-                deletion_snapshot, ..
-            } => Ok(Self::Int64 {
+            PkDeletionStrategyWithCache::Int64Pk { .. } => Ok(Self::Int64 {
                 delete_files: Vec::new(),
-                initial: deletion_snapshot.load_full(),
                 new_pks: HashSet::new(),
                 delete_sequence: None,
                 storage: storage.map(Arc::clone),
             }),
-            PkDeletionStrategyWithCache::RowConverterBased {
-                deletion_snapshot, ..
-            } => Ok(Self::RowKeys {
+            PkDeletionStrategyWithCache::RowConverterBased { .. } => Ok(Self::RowKeys {
                 delete_files: Vec::new(),
-                initial: deletion_snapshot.load_full(),
                 new_keys: HashSet::new(),
                 delete_sequence: None,
                 storage: storage.map(Arc::clone),
@@ -619,23 +608,13 @@ impl StagedPkDelete {
         Ok(())
     }
 
-    /// Number of keys this delete newly tombstones — keys not already deleted
-    /// when the delete began. Re-deletions of already-tombstoned keys are not
-    /// counted, preserving the pre-refactor "rows affected" semantics.
+    /// Number of rows this delete removes: one per key. Every key it holds is
+    /// the key of a row its scan found live, so a key written again after an
+    /// earlier delete counts, and a key with no live row is never in it.
     fn new_count(&self) -> usize {
         match self {
-            Self::Int64 {
-                initial, new_pks, ..
-            } => new_pks
-                .iter()
-                .filter(|pk| initial.tombstones.get(**pk).is_none())
-                .count(),
-            Self::RowKeys {
-                initial, new_keys, ..
-            } => new_keys
-                .iter()
-                .filter(|key| initial.tombstones.get(key.as_ref()).is_none())
-                .count(),
+            Self::Int64 { new_pks, .. } => new_pks.len(),
+            Self::RowKeys { new_keys, .. } => new_keys.len(),
         }
     }
 }
@@ -953,139 +932,12 @@ impl CayenneDeletionSink {
         })
     }
 
-    async fn prepare_delete_all_rows_from_tables(
-        &self,
-        ctx: &SessionContext,
-        tables: &[DeleteScanTable],
-    ) -> super::super::Result<Option<PreparedDeletionPublish>> {
-        let table_name = &self.table_metadata.table_name;
-        // For position-based deletions, we need per-file row tracking
-        // For PK-based deletions, we can still batch across all files
-        match &self.pk_deletion_strategy {
-            PkDeletionStrategyWithCache::Int64Pk { .. } => {
-                let mut pending_pk_values = HashSet::with_capacity(PK_DELETE_FLUSH_BATCH_SIZE);
-                let mut delete_sequence = None;
-                let mut staged = StagedPkDelete::new(
-                    &self.pk_deletion_strategy,
-                    table_name,
-                    self.dataset_storage.as_ref(),
-                )?;
-                for table in tables {
-                    let scan_plan = table
-                        .scan(&ctx.state(), Some(&self.pk_column_indices), &[])
-                        .await?;
-                    let mut stream = execute_stream(scan_plan, ctx.task_ctx())?;
-                    while let Some(batch) = stream.next().await {
-                        let batch = batch?;
-                        pending_pk_values.extend(self.extract_int64_pk_values(&batch, &[0])?);
-                        if pending_pk_values.len() >= PK_DELETE_FLUSH_BATCH_SIZE {
-                            let row_keys = pending_pk_values.drain().map(i64_key).collect();
-                            let results = self
-                                .write_key_based_chunk_with_shared_sequence(
-                                    row_keys,
-                                    &mut delete_sequence,
-                                )
-                                .await?;
-                            staged.absorb(
-                                results,
-                                Self::assigned_delete_sequence(delete_sequence, table_name)?,
-                                table_name,
-                            )?;
-                        }
-                    }
-                }
-                if !pending_pk_values.is_empty() {
-                    let row_keys = pending_pk_values.into_iter().map(i64_key).collect();
-                    let results = self
-                        .write_key_based_chunk_with_shared_sequence(row_keys, &mut delete_sequence)
-                        .await?;
-                    staged.absorb(
-                        results,
-                        Self::assigned_delete_sequence(delete_sequence, table_name)?,
-                        table_name,
-                    )?;
-                }
-                if delete_sequence.is_none() {
-                    return Ok(None);
-                }
-                self.prepare_staged_pk_deletions(staged).map(Some)
-            }
-            PkDeletionStrategyWithCache::RowConverterBased { .. } => {
-                let Some(ref row_converter) = self.pk_row_converter else {
-                    return Err(Error::Internal {
-                        table: table_name.clone(),
-                        message: "RowConverter not available for RowConverterBased strategy"
-                            .to_string(),
-                    });
-                };
-                let mut pending_row_keys = HashSet::with_capacity(PK_DELETE_FLUSH_BATCH_SIZE);
-                let mut delete_sequence = None;
-                let mut staged = StagedPkDelete::new(
-                    &self.pk_deletion_strategy,
-                    table_name,
-                    self.dataset_storage.as_ref(),
-                )?;
-                for table in tables {
-                    let scan_plan = table
-                        .scan(&ctx.state(), Some(&self.pk_column_indices), &[])
-                        .await?;
-                    let mut stream = execute_stream(scan_plan, ctx.task_ctx())?;
-                    let projected_indices: Vec<usize> = (0..self.pk_column_indices.len()).collect();
-                    while let Some(batch) = stream.next().await {
-                        let batch = batch?;
-                        let pk_columns: Vec<ArrayRef> = projected_indices
-                            .iter()
-                            .map(|&index| Arc::clone(batch.column(index)))
-                            .collect();
-                        if pk_columns.iter().any(|column| column.null_count() > 0) {
-                            return Err(Error::DataValidation {
-                                table: table_name.clone(),
-                                message: null_primary_key_message(&batch, &projected_indices),
-                            });
-                        }
-                        let rows = row_converter.convert_columns(&pk_columns)?;
-                        pending_row_keys.extend(rows.iter().map(|row| bytes_key(row.as_ref())));
-                        if pending_row_keys.len() >= PK_DELETE_FLUSH_BATCH_SIZE {
-                            let results = self
-                                .write_key_based_chunk_with_shared_sequence(
-                                    pending_row_keys.drain().collect(),
-                                    &mut delete_sequence,
-                                )
-                                .await?;
-                            staged.absorb(
-                                results,
-                                Self::assigned_delete_sequence(delete_sequence, table_name)?,
-                                table_name,
-                            )?;
-                        }
-                    }
-                }
-                if !pending_row_keys.is_empty() {
-                    let results = self
-                        .write_key_based_chunk_with_shared_sequence(
-                            pending_row_keys.into_iter().collect(),
-                            &mut delete_sequence,
-                        )
-                        .await?;
-                    staged.absorb(
-                        results,
-                        Self::assigned_delete_sequence(delete_sequence, table_name)?,
-                        table_name,
-                    )?;
-                }
-                if delete_sequence.is_none() {
-                    return Ok(None);
-                }
-                self.prepare_staged_pk_deletions(staged).map(Some)
-            }
-            PkDeletionStrategyWithCache::PositionBased { .. } => {
-                // Position-based deletion for "delete all" (delete w/o filters)
-                // Note: Delete all is NOT available using retention so this is unreachable
-                Err(Error::Internal {
-                    table: table_name.clone(),
-                    message: "Position-based deletion without primary key is not yet supported for delete-all operations".to_string(),
-                })
-            }
+    /// A `DELETE` without a filter of a table without a primary key, which
+    /// deletes by position: not supported (retention always has a filter).
+    fn delete_all_by_position_unsupported(&self) -> Error {
+        Error::Internal {
+            table: self.table_metadata.table_name.clone(),
+            message: "Position-based deletion without primary key is not yet supported for delete-all operations".to_string(),
         }
     }
 
@@ -1518,14 +1370,8 @@ impl CayenneDeletionSink {
         );
         let mut all_tables = vec![self.capture_main_scan_source().await?];
         all_tables.extend(self.additional_scan_tables.iter().cloned());
-        if self.filters.is_empty() {
-            // Delete-all removes every row, so no version is preferred over another and
-            // the thresholds carry no information.
-            let plain: Vec<DeleteScanTable> = all_tables
-                .iter()
-                .map(|source| source.table.clone())
-                .collect();
-            self.prepare_delete_all_rows_from_tables(&ctx, &plain).await
+        if self.filters.is_empty() && self.pk_deletion_strategy.is_position_based() {
+            Err(self.delete_all_by_position_unsupported())
         } else if self.pk_deletion_strategy.is_position_based() {
             // As in `delete_from`: a position tombstone can only hide the version it
             // matched, so the per-snapshot visibility rules carry nothing for it.
@@ -1793,14 +1639,10 @@ impl DeletionSink for CayenneDeletionSink {
         let mut all_tables = vec![self.capture_main_scan_source().await?];
         all_tables.extend(self.additional_scan_tables.iter().cloned());
 
-        let prepared = if self.filters.is_empty() {
-            // See above: delete-all needs no per-snapshot visibility.
-            let plain: Vec<DeleteScanTable> = all_tables
-                .iter()
-                .map(|source| source.table.clone())
-                .collect();
-            self.prepare_delete_all_rows_from_tables(&ctx, &plain).await
-        } else if self.pk_deletion_strategy.is_position_based() {
+        if self.filters.is_empty() && self.pk_deletion_strategy.is_position_based() {
+            return Err(Box::new(self.delete_all_by_position_unsupported()));
+        }
+        let prepared = if self.pk_deletion_strategy.is_position_based() {
             // A position tombstone names a file and row position, so it can only ever
             // hide the version it matched — the per-snapshot thresholds that keep a key
             // tombstone off a live row carry nothing for it.

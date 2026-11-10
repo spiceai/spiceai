@@ -3438,6 +3438,115 @@ async fn an_update_waits_for_an_upsert_in_flight() {
     a_key_delete_during_an_append(KeyDelete::Update, AppendTarget::ProtectedUpsert).await;
 }
 
+/// A SQL key-list `DELETE` reports every row it deletes, also rows a committed
+/// change-stream append put in a protected snapshot: key 500 is in the current
+/// snapshot, keys 700 and 1500 only in the protected one.
+async fn a_sql_key_delete_counts_rows_in_a_protected_snapshot(upserts: bool, delete_all: bool) {
+    let config = VortexConfig {
+        deletion_mode: DeletionMode::Key,
+        compaction_trigger_files: 1_000_000,
+        compaction_trigger_protected_snapshots: 1_000_000,
+        compaction_trigger_snapshot_age_ms: 0,
+        compaction_background_interval_ms: 0,
+        ..vortex_config()
+    };
+    let on_conflict =
+        upserts.then(|| OnConflict::Upsert(ColumnReference::new(vec!["id".to_string()])));
+    let (setup, _catalog, table, ctx) =
+        create_keyed_with_config("events", &["id"], on_conflict, config).await;
+    run(
+        &ctx,
+        "INSERT INTO events SELECT value AS id, value * 10 AS v FROM generate_series(1, 1000)",
+    )
+    .await;
+    if !upserts {
+        // Without `on_conflict` the append may hold key 700 again only once
+        // its committed row is gone.
+        run(&ctx, "DELETE FROM events WHERE id IN (700)").await;
+    }
+    // Key 1 is deleted and not written again: a delete must not count it.
+    run(&ctx, "DELETE FROM events WHERE id IN (1)").await;
+    table.drain_in_flight_maintenance().await.expect("drain");
+
+    let mut appended: Vec<(i64, i64)> = (1001..=2000).map(|id| (id, id * 10)).collect();
+    appended.push((700, 7001));
+    let batch = rows_batch(&appended);
+    let stream: datafusion::execution::SendableRecordBatchStream = Box::pin(
+        datafusion::physical_plan::stream::RecordBatchStreamAdapter::new(
+            batch.schema(),
+            futures::stream::iter([Ok(batch)]),
+        ),
+    );
+    let write = table
+        .write_cdc_append_stream(stream, &SessionContext::new().task_ctx())
+        .await
+        .expect("stage the append");
+    write.finish().await.expect("the append commits");
+    table.drain_in_flight_maintenance().await.expect("drain");
+
+    if delete_all {
+        // A `DELETE` without a filter reports every live row: 1999, after the
+        // append put key 700 back and with key 1 gone.
+        let live = sorted_rows(&ctx, "events").await.len();
+        let reported = deleted_by(&ctx, "DELETE FROM events").await;
+        let after = sorted_rows(&ctx, "events").await.len();
+        drop((table, ctx));
+        let (_catalog, _table, reopened_ctx) =
+            reopen_in(&setup.store, &setup.data_url, "events").await;
+        let reopened = sorted_rows(&reopened_ctx, "events").await.len();
+        assert_eq!(
+            (live, reported, after, reopened),
+            (1999, 1999, 0, 0),
+            "live rows, rows the DELETE reported, rows after it, rows after a reopen (upserts: {upserts})"
+        );
+        return;
+    }
+    let before = sorted_rows(&ctx, "events")
+        .await
+        .into_iter()
+        .filter(|(id, _)| [500, 700, 1500].contains(id))
+        .collect::<Vec<_>>();
+    let reported = deleted_by(&ctx, "DELETE FROM events WHERE id IN (500, 700, 1500)").await;
+    let after = sorted_rows(&ctx, "events")
+        .await
+        .into_iter()
+        .filter(|(id, _)| [500, 700, 1500].contains(id))
+        .collect::<Vec<_>>();
+    drop((table, ctx));
+    let (_catalog, _table, reopened_ctx) = reopen_in(&setup.store, &setup.data_url, "events").await;
+    let reopened_rows = sorted_rows(&reopened_ctx, "events").await;
+    assert_eq!(
+        (before, reported, after, reopened_rows.len()),
+        (
+            vec![(500, 5000), (700, 7001), (1500, 15000)],
+            3,
+            Vec::new(),
+            1996
+        ),
+        "rows named before the DELETE, rows it reported, rows named after it, rows after a reopen (upserts: {upserts})"
+    );
+}
+
+#[tokio::test]
+async fn a_sql_key_delete_counts_rows_in_a_protected_snapshot_after_a_delete() {
+    a_sql_key_delete_counts_rows_in_a_protected_snapshot(false, false).await;
+}
+
+#[tokio::test]
+async fn a_sql_key_delete_counts_rows_in_a_protected_snapshot_of_an_upsert() {
+    a_sql_key_delete_counts_rows_in_a_protected_snapshot(true, false).await;
+}
+
+#[tokio::test]
+async fn a_sql_delete_all_counts_rows_in_a_protected_snapshot_after_a_delete() {
+    a_sql_key_delete_counts_rows_in_a_protected_snapshot(false, true).await;
+}
+
+#[tokio::test]
+async fn a_sql_delete_all_counts_rows_in_a_protected_snapshot_of_an_upsert() {
+    a_sql_key_delete_counts_rows_in_a_protected_snapshot(true, true).await;
+}
+
 /// Retention of a dataset whose data is in the location lists nothing: it finds
 /// the expired rows in the files each live snapshot's committed state names, on
 /// a table without a key (position deletes) and on a keyed one (key deletes).
