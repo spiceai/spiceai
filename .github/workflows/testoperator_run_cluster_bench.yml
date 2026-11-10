@@ -670,7 +670,16 @@ jobs:
 
           git commit -m "fix(cluster-bench): ${commit_summary}"
           if git ls-remote --exit-code --heads origin "${BRANCH_NAME}" >/dev/null 2>&1; then
-            git pull --rebase origin "${BRANCH_NAME}"
+            # Move only the snapshot commit. Runs against one image can check
+            # out different trunk heads, and `git pull --rebase` would also
+            # replay every trunk commit between them onto the branch as new
+            # commits, putting unrelated source changes in the PR.
+            git fetch origin "refs/heads/${BRANCH_NAME}"
+            if ! git rebase --onto FETCH_HEAD HEAD^; then
+              git rebase --abort || true
+              echo "::error::This run's snapshots conflict with snapshots another run already pushed to ${BRANCH_NAME}; resolve the .snap conflict on that branch by hand."
+              exit 1
+            fi
           fi
           # Non-interactive: a credential helper on the runner can otherwise intercept
           # this push and block on a prompt forever. See
