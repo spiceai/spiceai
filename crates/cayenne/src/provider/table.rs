@@ -3175,6 +3175,29 @@ pub struct CayenneTableProvider {
     ///
     /// Shared across writer clones.
     inlined_tombstones_awaiting_publish: Arc<ParkingMutex<HashSet<String>>>,
+    /// Inline entries an inline write rewrote or removed, by id, as readers saw
+    /// them before that write: the catalog serves the rewrite from when it is
+    /// applied, before its commit and before the write's publish makes the
+    /// replacement rows visible (they sit above `published_inlined_seq`). An
+    /// inline-view rebuild serves these instead of the catalog's version, so a
+    /// reader keeps seeing the old rows until the replacement is visible. Added
+    /// before the write's catalog change and removed by its publish, under the
+    /// listing fence with the generation bump; removed at once if the catalog
+    /// change fails. One whose publish never runs stays: the table then refuses
+    /// writes until it is reloaded, and until then readers see the rows from
+    /// before the write.
+    ///
+    /// Shared across writer clones.
+    inlined_entries_awaiting_publish: Arc<ParkingMutex<HashMap<String, Arc<InlinedData>>>>,
+    /// Inline writes whose catalog change is buffered in a same-record scope
+    /// ([`crate::catalog::with_same_record_commits`]) and whose publish waits
+    /// for that scope's commit. Another inline write waits for this to reach
+    /// zero before it reads the inline view, and maintenance that rewrites the
+    /// inline corpus defers while it is not zero
+    /// ([`Self::inline_changes_unpublished`]).
+    ///
+    /// Shared across writer clones.
+    unpublished_inline_writes: Arc<tokio::sync::watch::Sender<u64>>,
     /// Durable `published = 1` flips owed for tombstones in
     /// [`Self::inlined_locally_published`] but not yet persisted (cycle-4 lever
     /// b1★). Drained by (a) the NEXT staged batch's Stage-A folded transaction
@@ -7100,19 +7123,25 @@ impl CayenneTableProvider {
         Ok(self.write_lock_arc().lock_owned().await)
     }
 
-    /// Wait for in-flight pipelined Stage-B publishes (staged WALs + staged
-    /// inline tombstones) to drain, up to `timeout`. Returns `false` on
-    /// timeout — the caller turns that into its own structured error (a
-    /// still-pending publish after the window means a wedged Stage-B task).
+    /// Wait for in-flight pipelined Stage-B publishes (staged WALs, staged
+    /// inline tombstones, and inline writes waiting for their record's commit)
+    /// to drain, up to `timeout`. Returns `false` on timeout — the caller turns
+    /// that into its own structured error (a still-pending publish after the
+    /// window means a wedged Stage-B task). A caller inside the same-record
+    /// scope that holds such a publish cannot wait for that scope's commit, so
+    /// it publishes the scope's held writes first.
     ///
     /// Callers must hold `write_lock`: it blocks new Stage-A commits, so the
     /// pending set can only shrink, while Stage-B needs only the visibility
     /// lock + listing fence and therefore completes under the held lock.
     pub(crate) async fn drain_inflight_staged_writes(&self, timeout: Duration) -> bool {
         let deadline = Instant::now() + timeout;
-        while self.has_inflight_staging_appends()
-            || self.pending_inline_tombstones.load(Ordering::Acquire) > 0
+        if crate::catalog::commit_left_to_scope_owner()
+            && (self.has_inflight_staging_appends() || self.inline_changes_unpublished())
         {
+            crate::catalog::publish_held_writes_now().await;
+        }
+        while self.has_inflight_staging_appends() || self.inline_changes_unpublished() {
             if Instant::now() >= deadline {
                 return false;
             }
@@ -11899,6 +11928,8 @@ impl CayenneTableProvider {
             seq_allocator,
             inlined_locally_published: Arc::new(ParkingMutex::new(HashSet::new())),
             inlined_tombstones_awaiting_publish: Arc::new(ParkingMutex::new(HashSet::new())),
+            inlined_entries_awaiting_publish: Arc::new(ParkingMutex::new(HashMap::new())),
+            unpublished_inline_writes: Arc::new(tokio::sync::watch::Sender::new(0)),
             pending_durable_tombstone_flips: Arc::new(ParkingMutex::new(Vec::new())),
             pending_tombstone_deltas: Arc::new(
                 ParkingMutex::new(PendingTombstoneDeltas::default()),
@@ -14404,6 +14435,8 @@ impl CayenneTableProvider {
             inlined_tombstones_awaiting_publish: Arc::clone(
                 &self.inlined_tombstones_awaiting_publish,
             ),
+            inlined_entries_awaiting_publish: Arc::clone(&self.inlined_entries_awaiting_publish),
+            unpublished_inline_writes: Arc::clone(&self.unpublished_inline_writes),
             pending_durable_tombstone_flips: Arc::clone(&self.pending_durable_tombstone_flips),
             pending_tombstone_deltas: Arc::clone(&self.pending_tombstone_deltas),
             inlined_cache: Arc::clone(&self.inlined_cache),
@@ -19562,6 +19595,7 @@ impl CayenneTableProvider {
             }
 
             rewrite.removed_rows += original_rows.saturating_sub(remaining_rows);
+            rewrite.replaced.push(Arc::clone(&entry.envelope));
             if remaining_rows == 0 {
                 rewrite
                     .deleted_inlined_ids
@@ -22576,9 +22610,7 @@ impl CayenneTableProvider {
     ///
     /// Returns an error if reading, sorting, or rewriting fails.
     pub async fn sort_and_rewrite_data(&self, target_size_bytes: usize) -> Result<()> {
-        if self.pending_inline_tombstones.load(Ordering::Acquire) > 0
-            || self.has_inflight_staging_appends()
-        {
+        if self.inline_changes_unpublished() || self.has_inflight_staging_appends() {
             tracing::debug!(
                 table = %self.table_metadata.table_name,
                 "Deferring sort-and-rewrite: a staged inline-conflict tombstone or append finalization is in flight"
@@ -25844,7 +25876,7 @@ impl CayenneTableProvider {
             // just defer again (its release arms once the window closes), and one
             // that failed would fail again. Otherwise the next pass reclaims and
             // re-syncs the budget, after which the arm is a no-op.
-            if !failed && table.pending_inline_tombstones.load(Ordering::Acquire) == 0 {
+            if !failed && !table.inline_changes_unpublished() {
                 table.arm_inline_tombstone_reclaim();
             }
         });
@@ -32867,7 +32899,7 @@ impl CayenneTableProvider {
             // Deferring costs only latency: the in-flight finalize publishes within
             // milliseconds, and re-arming brings the loop back on the next debounce.
             let shadow_present = self.mem_tier_shadow_present.load(Ordering::Acquire);
-            if self.pending_inline_tombstones.load(Ordering::Acquire) > 0
+            if self.inline_changes_unpublished()
                 || shadow_present
                 || self.has_inflight_staging_appends()
             {
@@ -35120,8 +35152,151 @@ impl CayenneTableProvider {
         true
     }
 
+    /// Run `publish`, an inline write's publish followed by what it schedules,
+    /// once the write's catalog change has committed: now when it has, or,
+    /// inside a same-record scope, after the scope's owner commits the record
+    /// that holds it. Until then `unpublished_inline_writes` counts it,
+    /// so other inline writes wait for it and inline maintenance defers. If the
+    /// owner never runs it, its record's fate is unknown here: the table refuses
+    /// work until it is reloaded, and readers keep seeing the rows from before
+    /// the write.
+    pub(crate) async fn publish_inline_write(
+        &self,
+        publish: impl std::future::Future<Output = ()> + Send + 'static,
+    ) {
+        if !crate::catalog::commit_left_to_scope_owner() {
+            publish.await;
+            return;
+        }
+        self.unpublished_inline_writes.send_modify(|count| *count += 1);
+        let release = Arc::new(UnpublishedInlineWrite {
+            count: Arc::clone(&self.unpublished_inline_writes),
+            released: AtomicBool::new(false),
+        });
+        let run = {
+            let release = ReleaseUnpublishedInlineWrite(Arc::clone(&release));
+            Box::pin(async move {
+                // Released when the publish ends, or if it is dropped unfinished.
+                let _release = release;
+                publish.await;
+            })
+        };
+        let table = self.clone_for_write();
+        let abandon = Box::new(move || {
+            table
+                .publication_outcome_unknown
+                .store(true, Ordering::Release);
+            table.clear_cached_pk_keyset();
+            release.release();
+        });
+        if let Some(run) = crate::catalog::publish_after_commit(run, abandon) {
+            run.await;
+        }
+    }
+
+    /// Wait until no inline write's publish waits for its commit, so a write
+    /// that reads the inline view sees every inline change before its own. A
+    /// write of the scope that holds such a publish cannot wait for its commit,
+    /// so it publishes the scope's held writes now instead.
+    async fn wait_for_unpublished_inline_writes(&self) -> Result<()> {
+        if *self.unpublished_inline_writes.borrow() == 0 {
+            return Ok(());
+        }
+        if crate::catalog::commit_left_to_scope_owner() {
+            crate::catalog::publish_held_writes_now().await;
+        }
+        let mut count = self.unpublished_inline_writes.subscribe();
+        match tokio::time::timeout(
+            STAGED_WRITE_DRAIN_TIMEOUT,
+            count.wait_for(|count| *count == 0),
+        )
+        .await
+        {
+            Ok(Ok(_)) => Ok(()),
+            Ok(Err(_)) | Err(_) => Err(Error::Internal {
+                table: self.table_metadata.table_name.clone(),
+                message: format!(
+                    "A change-stream write did not commit within {} s, so this write was not applied; retry it",
+                    STAGED_WRITE_DRAIN_TIMEOUT.as_secs()
+                ),
+            }),
+        }
+    }
+
+    /// Whether an inline change is committed or buffered but not yet published:
+    /// a staged write's tombstone, or an inline write waiting for its record's
+    /// commit. Maintenance that rewrites the inline corpus defers meanwhile.
+    pub(crate) fn inline_changes_unpublished(&self) -> bool {
+        self.pending_inline_tombstones.load(Ordering::Acquire) > 0
+            || *self.unpublished_inline_writes.borrow() > 0
+    }
+
+    /// Serve `replaced` to inline-view rebuilds in place of the catalog's
+    /// versions until [`Self::release_replaced_inlined_entries`]. Returns their ids.
+    fn hold_replaced_inlined_entries(&self, replaced: &[Arc<InlinedData>]) -> Vec<String> {
+        if replaced.is_empty() {
+            return Vec::new();
+        }
+        let mut awaiting = self.inlined_entries_awaiting_publish.lock();
+        replaced
+            .iter()
+            .map(|entry| {
+                awaiting
+                    .entry(entry.inlined_id.clone())
+                    .or_insert_with(|| Arc::clone(entry));
+                entry.inlined_id.clone()
+            })
+            .collect()
+    }
+
+    fn release_replaced_inlined_entries(&self, ids: &[String]) {
+        if ids.is_empty() {
+            return;
+        }
+        let mut awaiting = self.inlined_entries_awaiting_publish.lock();
+        for id in ids {
+            awaiting.remove(id);
+        }
+    }
+
+    /// `entries`, read from the catalog, as readers see them: an entry an
+    /// unpublished inline write rewrote or removed is served as it was before
+    /// that write. Only entries above `above_sequence` are considered, as the
+    /// catalog read was.
+    fn with_replaced_inlined_entries(
+        &self,
+        mut entries: Vec<InlinedData>,
+        above_sequence: i64,
+    ) -> Vec<InlinedData> {
+        let awaiting = self.inlined_entries_awaiting_publish.lock();
+        if awaiting.is_empty() {
+            return entries;
+        }
+        let mut seen = HashSet::new();
+        for entry in &mut entries {
+            if let Some(original) = awaiting.get(&entry.inlined_id) {
+                *entry = InlinedData::clone(original);
+                seen.insert(entry.inlined_id.clone());
+            }
+        }
+        let mut restored = false;
+        for (id, original) in awaiting.iter() {
+            if !seen.contains(id) && original.sequence_number > above_sequence {
+                entries.push(InlinedData::clone(original));
+                restored = true;
+            }
+        }
+        if restored {
+            entries.sort_by_key(|entry| entry.sequence_number);
+        }
+        entries
+    }
+
     /// Write small batches directly to the metastore, optionally atomically
-    /// rewriting inline rows they replace.
+    /// rewriting inline rows they replace. Returns `None` when the batches do
+    /// not fit inline, and otherwise the write's publish, which makes its rows
+    /// visible: run it once the write's catalog change has committed
+    /// ([`Self::publish_inline_write`]).
     pub(crate) async fn try_inline_batches_with_inlined_deletions(
         &self,
         batches: &[RecordBatch],
@@ -35129,15 +35304,15 @@ impl CayenneTableProvider {
         deleted_inlined_row_keys: &[Box<[u8]>],
         file_deleted_pk_i64: &[i64],
         file_deleted_row_keys: &[Box<[u8]>],
-    ) -> Result<bool> {
+    ) -> Result<Option<InlinedWritePublish>> {
         let total_rows = batches.iter().map(RecordBatch::num_rows).sum::<usize>();
         if total_rows == 0 {
-            return Ok(true); // nothing to write
+            return Ok(Some(InlinedWritePublish::nothing(self))); // nothing to write
         }
         let inline_max_rows = self.context.inline_max_rows();
         let inline_max_bytes = self.context.inline_max_bytes();
         if inline_max_rows == 0 || inline_max_bytes == 0 || total_rows > inline_max_rows {
-            return Ok(false);
+            return Ok(None);
         }
         // Coalesce before serializing. A CDC write arrives as one RecordBatch per
         // row, and both the IPC stream and the decode are structure-preserving, so
@@ -35154,10 +35329,14 @@ impl CayenneTableProvider {
         }
         .map_err(|e| Error::Arrow { source: e })?;
         if ipc_bytes.len() > inline_max_bytes {
-            return Ok(false);
+            return Ok(None);
         }
 
         // --- Past this point, inlining WILL proceed (all size checks passed). ---
+
+        // The rewrite below reads the inline view readers see, so an inline
+        // write whose publish still waits for its commit must publish first.
+        self.wait_for_unpublished_inline_writes().await?;
 
         let has_file_deletions =
             !file_deleted_pk_i64.is_empty() || !file_deleted_row_keys.is_empty();
@@ -35194,6 +35373,7 @@ impl CayenneTableProvider {
             )
             .await?;
         let removed_rows = rewrite.removed_rows;
+        let awaiting_publish = self.hold_replaced_inlined_entries(&rewrite.replaced);
 
         // Durably commit the inlined data WITHOUT publishing visibility yet, so
         // making the new inlined row visible and hiding the file-backed row it
@@ -35201,88 +35381,57 @@ impl CayenneTableProvider {
         // `scan_state_lock.write()`. The inline-row sequence (`inline_seq`,
         // reserved above from the same allocator and strictly above
         // `delete_seq`) is passed in; `commit_inlined_mutation` no longer mutates
-        // the DB counter.
-        let inlined_commit = self
-            .commit_inlined_data_durable(
-                rewrite,
-                vec![InlinedData::pending_catalog_insert(
-                    self.table_metadata.table_id.clone(),
-                    None,
-                    ipc_bytes,
-                    i64::try_from(total_rows).unwrap_or(i64::MAX),
-                )],
-                Some(inline_seq),
-            )
-            .await?;
+        // the DB counter. Until the publish, readers see the entries the rewrite
+        // replaces as they were (`inlined_entries_awaiting_publish`).
+        let durable = async {
+            let inlined_commit = self
+                .commit_inlined_data_durable(
+                    rewrite,
+                    vec![InlinedData::pending_catalog_insert(
+                        self.table_metadata.table_id.clone(),
+                        None,
+                        ipc_bytes,
+                        i64::try_from(total_rows).unwrap_or(i64::MAX),
+                    )],
+                    Some(inline_seq),
+                )
+                .await?;
 
-        // Persist file-backed deletion vectors durably BEFORE the in-memory
-        // publish, so all durable I/O is complete by the time the write guard is
-        // taken and the guard is held only for the synchronous cache flips.
-        if let Some(delete_seq) = delete_seq {
-            self.persist_file_deletions_after_inlined_insert(
-                file_deleted_pk_i64,
-                file_deleted_row_keys,
-                delete_seq,
-            )
-            .await
-            .map_err(|err| Error::Catalog { source: err })?;
-        }
-
-        #[cfg(test)]
-        self.run_test_pre_inline_publish_hook().await;
-
-        // Atomically publish both in-memory visibility changes: make the new inlined row visible (generation bump) and hide the superseded
-        // file-backed row (deletion cache). Scans capture the (inlined view, deletion view) pair under `scan_state_lock.read()`,
-        // so committing both halves here under one `.write()` closes the duplicate-PK window.
-        // Only synchronous in-memory work runs under the guard; all durable I/O above is already complete.
-        let maintained_aggregate_insert = {
-            let _visibility = self.visibility_lock_arc().lock_owned().await;
-            let _fence = self.lock_listing_fence_write_owned().await;
-            let _view_guard = self.scan_state_lock.write().await;
-            if let Some(commit) = inlined_commit {
-                // `inlined_row_count` must reflect the actual number of rows
-                // living in the inline memtable — scan paths use it as a
-                // visibility signal (`> 0` → read inline data). Only subtract
-                // inlined supersedes (prior inline entries rewritten), NOT
-                // file-backed supersedes. The file-backed supersede netting is
-                // handled by `live_rows_delta` in `try_inline_or_restream`.
-                self.publish_inlined_mutation(
-                    total_rows,
-                    commit.removed_rows,
-                    commit.published_seq,
-                );
-            }
+            // Persist file-backed deletion vectors durably BEFORE the in-memory
+            // publish, so all durable I/O is complete by the time the write guard
+            // is taken and the guard is held only for the synchronous cache flips.
             if let Some(delete_seq) = delete_seq {
-                self.update_file_deletion_cache(
+                self.persist_file_deletions_after_inlined_insert(
                     file_deleted_pk_i64,
                     file_deleted_row_keys,
                     delete_seq,
-                );
+                )
+                .await
+                .map_err(|err| Error::Catalog { source: err })?;
             }
-            if self.maintained_aggregates.supports_retraction()
-                || !(removed_rows > 0 || has_file_deletions)
-            {
-                // The per-PK index retracts superseded rows' old contributions,
-                // so the insert feed maintains UPDATEs incrementally.
-                self.prepare_maintained_aggregate_insert_batches(Arc::new(batches.to_vec()))
-            } else {
-                self.mark_maintained_aggregates_stale();
-                None
+            Ok::<_, Error>(inlined_commit)
+        }
+        .await;
+        let inlined_commit = match durable {
+            Ok(commit) => commit,
+            Err(error) => {
+                self.release_replaced_inlined_entries(&awaiting_publish);
+                return Err(error);
             }
         };
 
-        self.apply_maintained_aggregate_insert_batches(maintained_aggregate_insert)
-            .await;
-
-        tracing::debug!(
-            table = self.table_metadata.table_name,
-            rows = total_rows,
-            inlined_rows_removed = removed_rows,
-            file_pk_deletions = file_deleted_pk_i64.len() + file_deleted_row_keys.len(),
-            "Inlined write"
-        );
-
-        Ok(true)
+        Ok(Some(InlinedWritePublish {
+            table: self.clone_for_write(),
+            total_rows,
+            commit: inlined_commit,
+            delete_seq,
+            file_deleted_pk_i64: file_deleted_pk_i64.to_vec(),
+            file_deleted_row_keys: file_deleted_row_keys.to_vec(),
+            removed_rows,
+            has_file_deletions,
+            batches: batches.to_vec(),
+            awaiting_publish,
+        }))
     }
 
     #[must_use]
@@ -35583,6 +35732,7 @@ impl CayenneTableProvider {
             .catalog
             .get_inlined_data(&self.table_metadata.table_id)
             .await?;
+        let inlined = self.with_replaced_inlined_entries(inlined, i64::MIN);
 
         let view: Vec<Arc<InlinedViewEntry>> = if inlined.is_empty() {
             Vec::new()
@@ -35693,6 +35843,8 @@ impl CayenneTableProvider {
                 base.materialized_through_sequence,
             )
             .await?;
+        let new_entries =
+            self.with_replaced_inlined_entries(new_entries, base.materialized_through_sequence);
 
         // Nothing appended AND no tombstone removal ⇒ the visible set is unchanged.
         // Restamp the existing payload under the new generation/epoch/seq without
@@ -38720,7 +38872,7 @@ impl CayenneTableProvider {
         };
         // A guaranteed checkpoint would wait for staged inline tombstones to publish
         // (`wait_for_staged_inline_tombstones`); a best-effort one retries instead.
-        if self.pending_inline_tombstones.load(Ordering::Acquire) > 0 {
+        if self.inline_changes_unpublished() {
             return Ok(CheckpointAttempt::Busy);
         }
         // Keep `guards` alive across `inner`; pass only the `write` guard.
@@ -39902,7 +40054,7 @@ impl CayenneTableProvider {
     /// would otherwise stall every checkpoint of the table without a word.
     async fn wait_for_staged_inline_tombstones(&self) -> Result<()> {
         let deadline = Instant::now() + STAGED_WRITE_DRAIN_TIMEOUT;
-        while self.pending_inline_tombstones.load(Ordering::Acquire) > 0 {
+        while self.inline_changes_unpublished() {
             if Instant::now() >= deadline {
                 return Err(Error::Internal {
                     table: self.table_metadata.table_name.clone(),
@@ -41300,7 +41452,7 @@ impl CayenneTableProvider {
         // which BLOCKS inline upserts at `mutation_writer.rs`) and position-based
         // deletes (whose tables don't support upserts) — so a staged inline-
         // conflict tombstone can never coexist with that path.)
-        if self.pending_inline_tombstones.load(Ordering::Acquire) > 0 {
+        if self.inline_changes_unpublished() {
             tracing::debug!(
                 table = %self.table_metadata.table_name,
                 "Deferring inline checkpoint: staged inline-conflict tombstone(s) not yet published"
@@ -46277,6 +46429,129 @@ fn active_transaction(
     } else {
         txn.mark_unregistered_read();
         None
+    }
+}
+
+/// An inline write's in-memory publish: makes its rows visible and hides the
+/// rows it replaces, as one step under the scan fences. From
+/// [`CayenneTableProvider::try_inline_batches_with_inlined_deletions`]; run only
+/// once the write's catalog change has committed
+/// ([`CayenneTableProvider::publish_inline_write`]).
+pub(crate) struct InlinedWritePublish {
+    table: CayenneTableProvider,
+    total_rows: usize,
+    commit: Option<InlinedDurableCommit>,
+    delete_seq: Option<i64>,
+    file_deleted_pk_i64: Vec<i64>,
+    file_deleted_row_keys: Vec<Box<[u8]>>,
+    removed_rows: usize,
+    has_file_deletions: bool,
+    batches: Vec<RecordBatch>,
+    /// Entries readers see as they were until this publish.
+    awaiting_publish: Vec<String>,
+}
+
+impl InlinedWritePublish {
+    /// A write of no rows: nothing to publish.
+    fn nothing(table: &CayenneTableProvider) -> Self {
+        Self {
+            table: table.clone_for_write(),
+            total_rows: 0,
+            commit: None,
+            delete_seq: None,
+            file_deleted_pk_i64: Vec::new(),
+            file_deleted_row_keys: Vec::new(),
+            removed_rows: 0,
+            has_file_deletions: false,
+            batches: Vec::new(),
+            awaiting_publish: Vec::new(),
+        }
+    }
+
+    /// Make the write's rows visible. Scans capture the (inlined view, deletion
+    /// view) pair under `scan_state_lock.read()`, so making the new inlined row
+    /// visible (generation bump) and hiding the superseded file-backed row
+    /// (deletion cache) under one `.write()` closes the duplicate-key window.
+    /// Only synchronous in-memory work runs under the guard.
+    pub(crate) async fn run(self) {
+        if self.total_rows == 0 {
+            return;
+        }
+        let table = &self.table;
+        #[cfg(test)]
+        table.run_test_pre_inline_publish_hook().await;
+        let maintained_aggregate_insert = {
+            let _visibility = table.visibility_lock_arc().lock_owned().await;
+            let _fence = table.lock_listing_fence_write_owned().await;
+            let _view_guard = table.scan_state_lock.write().await;
+            table.release_replaced_inlined_entries(&self.awaiting_publish);
+            if let Some(commit) = self.commit {
+                // `inlined_row_count` must reflect the actual number of rows
+                // living in the inline memtable — scan paths use it as a
+                // visibility signal (`> 0` → read inline data). Only subtract
+                // inlined supersedes (prior inline entries rewritten), NOT
+                // file-backed supersedes. The file-backed supersede netting is
+                // handled by `live_rows_delta` in `try_inline_or_restream`.
+                table.publish_inlined_mutation(
+                    self.total_rows,
+                    commit.removed_rows,
+                    commit.published_seq,
+                );
+            }
+            if let Some(delete_seq) = self.delete_seq {
+                table.update_file_deletion_cache(
+                    &self.file_deleted_pk_i64,
+                    &self.file_deleted_row_keys,
+                    delete_seq,
+                );
+            }
+            if table.maintained_aggregates.supports_retraction()
+                || !(self.removed_rows > 0 || self.has_file_deletions)
+            {
+                // The per-PK index retracts superseded rows' old contributions,
+                // so the insert feed maintains UPDATEs incrementally.
+                table.prepare_maintained_aggregate_insert_batches(Arc::new(self.batches))
+            } else {
+                table.mark_maintained_aggregates_stale();
+                None
+            }
+        };
+
+        table
+            .apply_maintained_aggregate_insert_batches(maintained_aggregate_insert)
+            .await;
+
+        tracing::debug!(
+            table = table.table_metadata.table_name,
+            rows = self.total_rows,
+            inlined_rows_removed = self.removed_rows,
+            file_pk_deletions = self.file_deleted_pk_i64.len() + self.file_deleted_row_keys.len(),
+            "Inlined write"
+        );
+    }
+}
+
+/// Counts one inline write in `unpublished_inline_writes` until it publishes or
+/// is abandoned, whichever comes first.
+struct UnpublishedInlineWrite {
+    count: Arc<tokio::sync::watch::Sender<u64>>,
+    released: AtomicBool,
+}
+
+impl UnpublishedInlineWrite {
+    fn release(&self) {
+        if !self.released.swap(true, Ordering::AcqRel) {
+            self.count
+                .send_modify(|count| *count = count.saturating_sub(1));
+        }
+    }
+}
+
+struct ReleaseUnpublishedInlineWrite(Arc<UnpublishedInlineWrite>);
+
+impl Drop for ReleaseUnpublishedInlineWrite {
+    fn drop(&mut self) {
+        self.0.release();
     }
 }
 

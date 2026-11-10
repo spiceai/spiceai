@@ -1703,13 +1703,13 @@ impl<'a> AppendMutationWriter<'a> {
                 });
             }
 
-            // Taken before the inline write, which makes its rows visible as
-            // soon as it returns. The resident-inline-row proxy covers this
-            // window today, but it is cleared by a checkpoint that does not
-            // drain the delta queue, so the count still needs its own claim.
+            // Taken before the inline write's publish, which makes its rows
+            // visible. The resident-inline-row proxy covers that window today,
+            // but it is cleared by a checkpoint that does not drain the delta
+            // queue, so the count still needs its own claim.
             let reserved_live_rows_delta = self.table.reserve_live_rows_delta();
 
-            if self
+            if let Some(publish) = self
                 .table
                 .try_inline_batches_with_inlined_deletions(
                     buffer.batches(),
@@ -1720,12 +1720,6 @@ impl<'a> AppendMutationWriter<'a> {
                 )
                 .await?
             {
-                // The inline rows are visible now, so the claim survives from
-                // here. `try_inline_batches_with_inlined_deletions` awaits the
-                // maintained-aggregate apply after its own visibility flip, so
-                // a cancellation inside it still loses the claim — see #13721.
-                let published_live_rows_delta = reserved_live_rows_delta.published();
-
                 // Inline tier0 (metastore BLOB) write — the synchronous CDC hot
                 // loop. Always skip NDV here (lazy): these rows contribute their
                 // distinct-count for free when the inline memtable later spills to
@@ -1749,22 +1743,6 @@ impl<'a> AppendMutationWriter<'a> {
                 let live_rows_delta = i64::try_from(buffer.total_rows())
                     .unwrap_or(i64::MAX)
                     .saturating_sub(i64::try_from(superseded).unwrap_or(i64::MAX));
-                // `write_cdc_pipelined` reaches this inline commit without consulting
-                // `InlineMutationPolicy`, so unlike the staged path it can land here on
-                // a table that has retention delete filters — and an inlined outcome
-                // returns `CayenneCdcWrite::completed`, whose `finish` schedules
-                // nothing. This is the only place on that route that can arm the
-                // retention the header comment above promises the scheduler picks up.
-                self.table.schedule_post_write_maintenance(
-                    Some(Arc::new(stats_acc)),
-                    false,
-                    self.table.has_retention_delete_filters(),
-                    live_rows_delta,
-                    published_live_rows_delta,
-                );
-
-                self.table
-                    .schedule_inline_checkpoint_if_memtable_pressure_exceeded();
 
                 // METRIC 4 (burst shape): rows + Arrow bytes of this inlined CDC
                 // batch. Both are exact here — the whole delta fit in the buffer.
@@ -1773,6 +1751,40 @@ impl<'a> AppendMutationWriter<'a> {
                     buffer.total_rows() as u64,
                     buffer.total_bytes() as u64,
                 );
+
+                // The publish makes the rows visible once the write's catalog
+                // change has committed: now, or after the enclosing same-record
+                // scope commits its record. What it schedules reads the
+                // published state, so it follows the publish.
+                let table = self.table.clone_for_write_operations();
+                let retention_requested = table.has_retention_delete_filters();
+                self.table
+                    .publish_inline_write(async move {
+                        publish.run().await;
+                        // The inline rows are visible now, so the claim
+                        // survives from here. `run` awaits the
+                        // maintained-aggregate apply after its own visibility
+                        // flip, so a cancellation inside it still loses the
+                        // claim — see #13721.
+                        let published_live_rows_delta = reserved_live_rows_delta.published();
+                        // `write_cdc_pipelined` reaches this inline commit
+                        // without consulting `InlineMutationPolicy`, so unlike
+                        // the staged path it can land here on a table that has
+                        // retention delete filters — and an inlined outcome
+                        // returns `CayenneCdcWrite::completed`, whose `finish`
+                        // schedules nothing. This is the only place on that
+                        // route that can arm the retention the header comment
+                        // above promises the scheduler picks up.
+                        table.schedule_post_write_maintenance(
+                            Some(Arc::new(stats_acc)),
+                            false,
+                            retention_requested,
+                            live_rows_delta,
+                            published_live_rows_delta,
+                        );
+                        table.schedule_inline_checkpoint_if_memtable_pressure_exceeded();
+                    })
+                    .await;
 
                 return Ok(InlineMutationOutcome::Inlined {
                     rows: u64::try_from(buffer.total_rows()).unwrap_or(u64::MAX),

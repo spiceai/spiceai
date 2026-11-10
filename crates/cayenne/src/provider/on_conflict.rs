@@ -413,6 +413,9 @@ pub(crate) struct InlinedDataRewrite {
     pub(crate) updated_data: Vec<InlinedData>,
     pub(crate) deleted_inlined_ids: Vec<String>,
     pub(crate) removed_rows: usize,
+    /// The entries `updated_data` and `deleted_inlined_ids` replace, as readers
+    /// see them until the rewrite is published.
+    pub(crate) replaced: Vec<Arc<InlinedData>>,
 }
 
 impl InlinedDataRewrite {

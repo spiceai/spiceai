@@ -484,6 +484,16 @@ where
     Ok(output)
 }
 
+/// Publish now the rows of the writes the enclosing [`with_same_record_commits`]
+/// holds for after its commit, for a later write of the same scope that must
+/// read them and cannot wait for that commit. Their metastore changes still
+/// commit in the scope's one record. A no-op outside such a scope.
+pub(crate) async fn publish_held_writes_now() {
+    if let Ok(after) = AFTER_COMMIT.try_with(Arc::clone) {
+        after.publish_now().await;
+    }
+}
+
 /// Whether the current task is inside [`with_same_record_commits`]: its owner,
 /// not the write, commits the write's metastore changes, and the write leaves
 /// its in-memory publish for after that commit ([`publish_after_commit`]).
