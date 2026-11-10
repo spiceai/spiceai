@@ -2942,6 +2942,19 @@ impl DataFusion {
         Ok(())
     }
 
+    /// Whether `dataset_name` is registered with its loaded provider: registered,
+    /// and not a placeholder still awaiting its first-reference initialization
+    /// (which stays registered when that initialization fails).
+    pub async fn serves_loaded_dataset(&self, dataset_name: &TableReference) -> bool {
+        self.table_exists(dataset_name)
+            && (!self.has_pending_initializations()
+                || !self
+                    .pending_initializations
+                    .read()
+                    .await
+                    .contains_key(dataset_name))
+    }
+
     /// Steady-state hot-path probe: returns `true` iff at least one
     /// dataset placeholder is awaiting initialization.
     ///

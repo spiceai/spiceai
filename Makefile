@@ -321,11 +321,12 @@ nextest-packages:
 test-integration:
 	# Test if .env file exists, and login to Spice if not
 	@test -f .env || (`spice login`)
-	@cargo nextest run -p runtime --test integration --features postgres,mysql,delta_lake,adbc,sqlite --no-capture
+	# The `adbc::` tests need the SQLite ADBC driver; run them with `dbc install sqlite` and `-E 'test(/^adbc::/)'`, as integration_adbc.yml does.
+	@cargo nextest run -p runtime --test integration --features postgres,mysql,delta_lake,adbc,sqlite --no-capture -E 'not test(/^adbc::/)'
 
 .PHONY: test-integration-without-spiceai-dataset
 test-integration-without-spiceai-dataset:
-	@cargo nextest run -p runtime --test integration --features postgres,mysql,delta_lake,adbc,sqlite --no-capture -E 'not test(spiceai_integration_test)'
+	@cargo nextest run -p runtime --test integration --features postgres,mysql,delta_lake,adbc,sqlite --no-capture -E 'not test(spiceai_integration_test) and not test(/^adbc::/)'
 
 .PHONY: test-integration-models
 test-integration-models:

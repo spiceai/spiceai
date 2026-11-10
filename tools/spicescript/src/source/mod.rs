@@ -159,6 +159,19 @@ pub trait Source: Send + Sync {
     }
 }
 
+/// How many containers [`start`] runs for a source of `kind`, which is what it
+/// needs of the kernel key quota a rootless Docker daemon's containers share
+/// (see [`crate::keyquota`]). Kept beside `start` so the two change together.
+pub fn containers(kind: &str) -> u64 {
+    match kind {
+        "files" | "mock-http" | "duckdb" => 0,
+        "iceberg" => 2,
+        // `ducklake` runs a PostgreSQL catalog; the rest run one container each,
+        // and an unknown kind fails in `start` before it starts any.
+        _ => 1,
+    }
+}
+
 /// Starts a source of `kind`; `files`, `rustfs`, `iceberg`, `duckdb` and `ducklake`
 /// sources keep their directories under `work`.
 pub async fn start(
