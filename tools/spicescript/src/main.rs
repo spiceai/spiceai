@@ -335,19 +335,8 @@ async fn run(cli: Cli) -> Result<bool> {
             from.display()
         );
     }
-    // A fresh CA and node certificates for this run's cluster instances. A
-    // container executor behind a rootless Docker daemon reaches the
-    // scheduler at this machine's routable address (see `runner::cluster`),
-    // so the certificates name it too.
-    let routable = if cfg!(target_os = "linux") && docker::daemon_is_rootless().await {
-        vec![docker::routable_address()?]
-    } else {
-        Vec::new()
-    };
-    let pki = pki::generate(
-        &work_dir.join(format!("pki-{}", std::process::id())),
-        &routable,
-    )?;
+    // A fresh CA and node certificates for this run's cluster instances.
+    let pki = pki::generate(&work_dir.join(format!("pki-{}", std::process::id())))?;
     let options = runner::Options {
         targets,
         from_override: cli.from,

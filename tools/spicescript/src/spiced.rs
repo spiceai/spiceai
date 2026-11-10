@@ -109,9 +109,6 @@ pub struct ContainerRun {
 pub struct Relay {
     /// The bridge network's gateway address in the daemon's namespace.
     pub gateway: std::net::IpAddr,
-    /// Ports beyond the instance's own HTTP, Flight, metrics and
-    /// `OpenTelemetry` ports to relay, such as a cluster executor's node port.
-    pub extra_ports: Vec<u16>,
 }
 
 /// The `docker run --user` a container runs as, so that it may write in, and
@@ -417,10 +414,7 @@ impl Spiced {
                 run.name
             )
         })?;
-        let ports: Vec<u16> = [self.http, self.flight, self.metrics, self.otel]
-            .into_iter()
-            .chain(relay.extra_ports.iter().copied())
-            .collect();
+        let ports = [self.http, self.flight, self.metrics, self.otel];
         let mut command = std::process::Command::new("docker");
         command
             .args(["run", "-d", "--rm", "--init", "--network", "bridge"])

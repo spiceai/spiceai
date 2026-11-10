@@ -18,15 +18,16 @@ limitations under the License.
 //! rootless Docker daemon.
 //!
 //! A rootless daemon's `host` network is its own namespace, not this
-//! machine's, and `docker run -p` does nothing for a container on it. So a
-//! container executor there cannot be reached at the ports it serves. The
-//! daemon does publish a bridge-network container's ports, on this machine's
-//! loopback and on its namespace's loopback alike, so a relay container on
-//! the bridge network publishes the executor's ports and passes each
-//! connection on to the executor, which listens on the bridge's gateway
-//! address in the daemon's namespace. The relay is this binary, run in a
-//! container with [`ARG`] as its first argument, so it needs no image of its
-//! own.
+//! machine's, and `docker run -p` does nothing for a container on it. A
+//! cluster behind such a daemon runs entirely in that namespace (see
+//! `runner::cluster_behind_rootless`), so this machine cannot reach its
+//! nodes at the ports they serve. The daemon does publish a bridge-network
+//! container's ports, on this machine's loopback and on its namespace's
+//! alike, so a relay container on the bridge network publishes a node's
+//! ports and passes each connection on to the node, which serves them on the
+//! bridge's gateway address in the daemon's namespace. The relay is this
+//! binary, run in a container with [`ARG`] as its first argument, so it
+//! needs no image of its own.
 
 use std::net::{IpAddr, SocketAddr};
 

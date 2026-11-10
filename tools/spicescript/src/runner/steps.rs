@@ -26,9 +26,9 @@ use crate::script::{Action, KillSignal, LoadEnd, Script, Step, Tier};
 use crate::{compare, template};
 
 use super::{
-    DEFAULT_READY_TIMEOUT, Instance, POLL, STOP_TIMEOUT, SourceState, Sources, apply_patch,
-    assert_files, assert_log, assert_status, check_error_text, explain, http_step, max_wait,
-    namespace, random_queries, refresh, run_query, run_slt, source_query, spice_cli,
+    DEFAULT_READY_TIMEOUT, Instance, KeyRoom, POLL, STOP_TIMEOUT, SourceState, Sources,
+    apply_patch, assert_files, assert_log, assert_status, check_error_text, explain, http_step,
+    max_wait, namespace, random_queries, refresh, run_query, run_slt, source_query, spice_cli,
     start_background, start_executors, stop_background, tlp, wait_metric,
 };
 
@@ -234,6 +234,21 @@ fn ready_default(script: &Script) -> Duration {
 
 /// Starts the sidecar unless it is running, once its upstream is up, and
 /// waits for it as the start asks.
+/// Waits for room in the kernel key quota for the instance's `spiced` when it
+/// runs in a container, as a cluster's scheduler does behind a rootless
+/// daemon. The combination reserved this room; this waits only if something
+/// outside the run took it meanwhile, or for a restart.
+async fn wait_for_scheduler_room(instance: &Instance) -> Result<()> {
+    if let Some(name) = instance.spiced.container_name() {
+        let containers = instance
+            .key_room
+            .as_ref()
+            .map_or(1, KeyRoom::scheduler_containers_to_start);
+        crate::keyquota::wait_for_room(containers, &format!("scheduler container {name}")).await?;
+    }
+    Ok(())
+}
+
 async fn start_sidecar(instance: &mut Instance, timeout: Duration, wait_ready: bool) -> Result<()> {
     let Some(sidecar) = instance.sidecar.as_mut() else {
         return Ok(());
@@ -314,6 +329,7 @@ async fn run_step(
             patch,
         } => {
             apply_patch(instance, patch.as_ref())?;
+            wait_for_scheduler_room(instance).await?;
             instance.spiced.start(&instance.spicepod_yaml)?;
             let timeout = max_wait(ready_timeout.unwrap_or(ready_default));
             // A scheduler with accelerations is ready only once an executor
@@ -370,6 +386,7 @@ async fn run_step(
                 }
             }
             apply_patch(instance, patch.as_ref())?;
+            wait_for_scheduler_room(instance).await?;
             instance.spiced.start(&instance.spicepod_yaml)?;
             let timeout = max_wait(ready_timeout.unwrap_or(ready_default));
             // A scheduler with accelerations is ready only once an executor

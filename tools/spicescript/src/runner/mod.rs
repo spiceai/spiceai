@@ -86,7 +86,7 @@ use api::{http_step, refresh, source_query, spice_cli};
 use background::{start_background, stop_background};
 use checks::{assert_files, assert_log, assert_status, metric_value, wait_metric};
 use cluster::{
-    RootlessAddresses, cluster_args, make_cluster_ready, start_executors, undistributed_engine,
+    cluster_args, make_cluster_ready, start_executors, undistributed_engine,
     unpartitionable_acceleration,
 };
 use generators::{random_queries, run_slt, tlp};
@@ -261,18 +261,21 @@ fn runs_cluster(script: &Script, options: &Options) -> bool {
 }
 
 /// Whether the cluster's executors run in containers behind a rootless
-/// Docker daemon, where each also has a relay container (see
-/// [`crate::relay`]).
-async fn executors_behind_rootless(script: &Script, options: &Options) -> bool {
+/// Docker daemon. Its `host` network is then a namespace of its own, which
+/// cannot reach this machine's loopback or be reached at its own, so the
+/// whole cluster runs there: the scheduler in a container too, every node
+/// on that namespace's `127.0.0.1`, and a relay container for each (see
+/// [`crate::relay`]) publishing the ports this machine reaches it at.
+async fn cluster_behind_rootless(script: &Script, options: &Options) -> bool {
     cfg!(target_os = "linux")
         && executors_in_containers(script, options)
         && crate::docker::daemon_is_rootless().await
 }
 
-/// The containers each executor runs in: its own, and its relay's behind a
-/// rootless daemon.
-async fn containers_per_executor(script: &Script, options: &Options) -> u64 {
-    if executors_behind_rootless(script, options).await {
+/// The containers each cluster node runs in: its own, and its relay's behind
+/// a rootless daemon.
+async fn containers_per_node(script: &Script, options: &Options) -> u64 {
+    if cluster_behind_rootless(script, options).await {
         2
     } else {
         1
@@ -306,6 +309,14 @@ fn executor_containers_bound(
         .cluster
         .as_ref()
         .map_or(1, |c| c.executors + c.spare);
+    u64::try_from(per_instance)
+        .unwrap_or(u64::MAX)
+        .saturating_mul(instances_bound(script, options, combo))
+}
+
+/// The most instances a combination creates: one per variant it runs, on
+/// each target.
+fn instances_bound(script: &Script, options: &Options, combo: &Map<String, Value>) -> u64 {
     let variants = if script.variants.is_empty() {
         1
     } else {
@@ -315,7 +326,7 @@ fn executor_containers_bound(
             .filter(|v| when_matches(&v.when, combo))
             .count()
     };
-    u64::try_from(per_instance * variants * options.targets.len()).unwrap_or(u64::MAX)
+    u64::try_from(variants * options.targets.len()).unwrap_or(u64::MAX)
 }
 
 /// How a combination's instances run.
@@ -564,6 +575,34 @@ const STOP_TIMEOUT: Duration = Duration::from_secs(45);
 /// `STOP_TIMEOUT`; at the end of a script it only costs time.
 const TEARDOWN_TIMEOUT: Duration = Duration::from_secs(5);
 
+/// The container a cluster node of `script` runs in under
+/// `defaults.cluster.containers`, named for this run and `node`, with a relay
+/// that publishes its ports when the cluster runs behind a rootless daemon
+/// (`relay_gateway`; see `cluster_behind_rootless`).
+async fn cluster_container(
+    script: &Script,
+    options: &Options,
+    node: &str,
+    relay_gateway: Option<std::net::IpAddr>,
+) -> Result<ContainerRun> {
+    let work_dir = std::path::absolute(&options.work_dir)?;
+    let script_dir = std::path::absolute(&script.dir)?;
+    Ok(ContainerRun {
+        image: EXECUTOR_IMAGE.to_string(),
+        name: format!("spicescript-{}-{node}", std::process::id())
+            .replace(|c: char| !c.is_ascii_alphanumeric() && c != '-', "-"),
+        volumes: vec![
+            format!("{0}:{0}", work_dir.display()),
+            format!("{0}:{0}:ro", script_dir.display()),
+            // The cluster's TLS clients load the system's root
+            // certificates, which the image has none of.
+            "/etc/ssl/certs:/etc/ssl/certs:ro".to_string(),
+        ],
+        rootless: crate::docker::daemon_is_rootless().await,
+        relay: relay_gateway.map(|gateway| crate::spiced::Relay { gateway }),
+    })
+}
+
 /// The image cluster executors run in under `defaults.cluster.containers`:
 /// a Linux `spiced` needs nothing beyond its base libraries.
 const EXECUTOR_IMAGE: &str = "ubuntu:26.04";
@@ -793,9 +832,17 @@ async fn run_combination(
         .iter()
         .map(|(_, _, kind, _)| source::containers(kind))
         .sum();
-    let per_executor = containers_per_executor(script, options).await;
-    let executor_containers =
-        executor_containers_bound(script, options, combo).saturating_mul(per_executor);
+    let per_executor = containers_per_node(script, options).await;
+    // Behind a rootless daemon each instance's scheduler is a container with
+    // a relay too.
+    let scheduler_containers = if cluster_behind_rootless(script, options).await {
+        instances_bound(script, options, combo).saturating_mul(per_executor)
+    } else {
+        0
+    };
+    let executor_containers = executor_containers_bound(script, options, combo)
+        .saturating_mul(per_executor)
+        .saturating_add(scheduler_containers);
     let key_room = Arc::new(
         crate::keyquota::reserve_room(
             source_containers + executor_containers,
@@ -844,7 +891,19 @@ async fn run_combination(
             .count()
             .try_into()
             .unwrap_or(u64::MAX);
-        key_room.release(executor_containers.saturating_sub(created.saturating_mul(per_executor)));
+        let schedulers: u64 = instances
+            .iter()
+            .filter(|instance| instance.spiced.container_name().is_some())
+            .count()
+            .try_into()
+            .unwrap_or(u64::MAX);
+        key_room.release(
+            executor_containers.saturating_sub(
+                created
+                    .saturating_add(schedulers)
+                    .saturating_mul(per_executor),
+            ),
+        );
         for instance in &mut instances {
             let unstarted = instance
                 .executors
@@ -854,6 +913,7 @@ async fn run_combination(
             instance.key_room = Some(KeyRoom {
                 reservation: Arc::clone(&key_room),
                 unstarted,
+                scheduler_unstarted: instance.spiced.container_name().is_some(),
                 per_executor,
             });
         }
@@ -1121,15 +1181,10 @@ async fn create_instances(
     } else {
         "host.docker.internal".to_string()
     };
-    // Container executors behind a rootless daemon cannot reach this
-    // machine's loopback either, nor be reached at their own; see
-    // `cluster_args`.
-    let executors_behind_rootless = executors_behind_rootless(script, options).await;
-    let rootless_cluster = if executors_behind_rootless {
-        Some(RootlessAddresses {
-            routable: crate::docker::routable_address()?,
-            gateway: crate::docker::bridge_gateway().await?,
-        })
+    // Behind a rootless daemon the whole cluster runs in its namespace; see
+    // `cluster_behind_rootless`.
+    let relay_gateway = if cluster_behind_rootless(script, options).await {
+        Some(crate::docker::bridge_gateway().await?)
     } else {
         None
     };
@@ -1177,14 +1232,7 @@ async fn create_instances(
                 "sources": source_ctx,
                 "matrix": combo,
                 "variant": { "name": variant_name },
-                "instance": { "name": label, "dir": dir.display().to_string(),
-                    // The scheduler's node port, free on the wildcard address
-                    // too when the scheduler listens there.
-                    "port": crate::docker::free_port_on(if executors_behind_rootless {
-                        std::net::Ipv4Addr::UNSPECIFIED.into()
-                    } else {
-                        std::net::Ipv4Addr::LOCALHOST.into()
-                    })?,
+                "instance": { "name": label, "dir": dir.display().to_string(), "port": crate::docker::free_port()?,
                     "executor_port": crate::docker::free_port()?, "http_port": http_port,
                     "flight_port": crate::docker::free_port()?,
                     "host_from_container": host_from_container },
@@ -1285,13 +1333,12 @@ async fn create_instances(
                     &options.pki,
                     &context,
                     executor_count + spare_count,
-                    rootless_cluster,
                 )?)
             } else {
                 None
             };
             let executor_args: Vec<Value> = match &cluster_args {
-                Some(args) => args.executors.iter().map(|(a, _)| json!(a)).collect(),
+                Some((_, executors)) => executors.iter().map(|a| json!(a)).collect(),
                 None => script
                     .defaults
                     .executor_args
@@ -1319,31 +1366,15 @@ async fn create_instances(
                 executor.set_extra_args(serde_json::from_value(args)?);
                 executor.set_api_key(script.defaults.api_key.clone())?;
                 if containers {
-                    let work_dir = std::path::absolute(&options.work_dir)?;
-                    let script_dir = std::path::absolute(&script.dir)?;
-                    executor.set_container(ContainerRun {
-                        image: EXECUTOR_IMAGE.to_string(),
-                        name: format!("spicescript-{}-{run_id}-{index}-{name}", std::process::id())
-                            .replace(|c: char| !c.is_ascii_alphanumeric() && c != '-', "-"),
-                        volumes: vec![
-                            format!("{0}:{0}", work_dir.display()),
-                            format!("{0}:{0}:ro", script_dir.display()),
-                            // The cluster's TLS clients load the system's root
-                            // certificates, which the image has none of.
-                            "/etc/ssl/certs:/etc/ssl/certs:ro".to_string(),
-                        ],
-                        rootless: crate::docker::daemon_is_rootless().await,
-                        // The scheduler and the other executors reach the
-                        // executor's node port through the relay too.
-                        relay: rootless_cluster.map(|addresses| crate::spiced::Relay {
-                            gateway: addresses.gateway,
-                            extra_ports: cluster_args
-                                .as_ref()
-                                .and_then(|args| args.executors.get(n))
-                                .map(|(_, port)| vec![*port])
-                                .unwrap_or_default(),
-                        }),
-                    });
+                    executor.set_container(
+                        cluster_container(
+                            script,
+                            options,
+                            &format!("{run_id}-{index}-{name}"),
+                            relay_gateway,
+                        )
+                        .await?,
+                    );
                 }
                 executors.push(executor);
             }
@@ -1376,8 +1407,19 @@ async fn create_instances(
             }
             spiced.set_api_key(script.defaults.api_key.clone())?;
             spiced.set_tls(script.defaults.tls.as_ref().map(|t| script.dir.join(&t.ca)))?;
-            if let Some(args) = &cluster_args {
-                spiced_args.extend(args.scheduler.iter().cloned());
+            if let Some(gateway) = relay_gateway {
+                spiced.set_container(
+                    cluster_container(
+                        script,
+                        options,
+                        &format!("{run_id}-{index}-scheduler"),
+                        Some(gateway),
+                    )
+                    .await?,
+                );
+            }
+            if let Some((scheduler, _)) = &cluster_args {
+                spiced_args.extend(scheduler.iter().cloned());
             }
             spiced.set_extra_args(spiced_args);
             instances.push(Instance {
@@ -1595,8 +1637,11 @@ struct KeyRoom {
     /// By executor index: whether it runs in a container that has not yet
     /// started, and so still holds a share.
     unstarted: Vec<bool>,
-    /// The containers an executor's first start creates, each holding a key:
-    /// its own, and its relay's behind a rootless daemon.
+    /// Whether the scheduler runs in a container that has not yet started,
+    /// and so still holds a share.
+    scheduler_unstarted: bool,
+    /// The containers a node's first start creates, each holding a key: its
+    /// own, and its relay's behind a rootless daemon.
     per_executor: u64,
 }
 
@@ -1609,6 +1654,24 @@ impl KeyRoom {
             self.per_executor
         } else {
             1
+        }
+    }
+
+    /// The containers starting the scheduler creates: its own and, the
+    /// first time, its relay's.
+    fn scheduler_containers_to_start(&self) -> u64 {
+        if self.scheduler_unstarted {
+            self.per_executor
+        } else {
+            1
+        }
+    }
+
+    /// Gives back the scheduler container's share once, the first time it
+    /// starts.
+    fn scheduler_started(&mut self) {
+        if std::mem::take(&mut self.scheduler_unstarted) {
+            self.reservation.release(self.per_executor);
         }
     }
 
@@ -1998,6 +2061,7 @@ mod tests {
         let mut room = KeyRoom {
             reservation: Arc::clone(&reservation),
             unstarted: vec![true, true],
+            scheduler_unstarted: true,
             per_executor: 2,
         };
         assert_eq!(room.containers_to_start(0), 2);
@@ -2007,6 +2071,11 @@ mod tests {
         room.executor_started(0);
         assert_eq!(reservation.remaining(), 2);
         assert_eq!(room.containers_to_start(1), 2);
+        // The scheduler's container and relay give back their two once.
+        room.scheduler_started();
+        assert_eq!(reservation.remaining(), 0);
+        room.scheduler_started();
+        assert_eq!(reservation.remaining(), 0);
     }
 
     /// An executor gives back its share of the combination's reservation the
@@ -2021,6 +2090,7 @@ mod tests {
         let mut room = KeyRoom {
             reservation: Arc::clone(&reservation),
             unstarted: vec![true, true, false],
+            scheduler_unstarted: false,
             per_executor: 1,
         };
         room.executor_started(0);
