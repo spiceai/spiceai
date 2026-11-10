@@ -232,9 +232,11 @@ async fn wait_for_row_count(rt: &Runtime, expected: usize) -> Result<(), anyhow:
 }
 
 fn csv_with_rows(n: usize) -> String {
+    use std::fmt::Write as _;
+
     let mut out = String::from("id,name,age,city,score\n");
     for i in 1..=n {
-        out.push_str(&format!("{i},name{i},20,City,1\n"));
+        let _ = writeln!(out, "{i},name{i},20,City,1");
     }
     out
 }
