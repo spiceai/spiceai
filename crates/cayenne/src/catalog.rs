@@ -328,26 +328,29 @@ pub struct MemTierDurableCommit {
 }
 
 /// One table's durable append publication. A slice is one atomic transaction.
+///
+/// It borrows from the prepared write it publishes: a commit runs once per CDC
+/// batch, and the replaced keys alone are one entry per changed row.
 #[derive(Clone, Debug)]
-pub struct CatalogPublication {
+pub struct CatalogPublication<'a> {
     /// Table whose state changes.
-    pub table_id: String,
+    pub table_id: &'a str,
     /// Replacement files registered as a protected snapshot.
-    pub snapshot_id: String,
+    pub snapshot_id: &'a str,
     /// Visibility sequence of the protected snapshot.
     pub snapshot_sequence: i64,
     /// Sequence of replacement primary keys, if present.
     pub insert_sequence: Option<i64>,
     /// Durable deletion vectors.
-    pub delete_files: Vec<DeleteFile>,
+    pub delete_files: &'a [DeleteFile],
     /// Primary keys replaced by the publication.
-    pub insert_pk_bytes: Vec<Vec<u8>>,
+    pub insert_pk_bytes: &'a [Vec<u8>],
     /// Inline deletion marker committed with the replacement snapshot.
-    pub inline_tombstone: Option<InlinedDelete>,
+    pub inline_tombstone: Option<&'a InlinedDelete>,
     /// Existing inline deletion markers to activate.
-    pub pending_durable_flips: Vec<String>,
+    pub pending_durable_flips: &'a [String],
     /// Primary keys requiring federated write-back.
-    pub dirty_pk_bytes: Vec<Vec<u8>>,
+    pub dirty_pk_bytes: std::borrow::Cow<'a, [Vec<u8>]>,
 }
 
 /// How the metastore changes of the current task commit.
@@ -432,7 +435,10 @@ pub trait MetadataCatalog: Send + Sync {
     fn as_any(&self) -> &dyn std::any::Any;
 
     /// Commit every table publication together, or leave all tables unchanged.
-    async fn commit_publications(&self, publications: &[CatalogPublication]) -> CatalogResult<()>;
+    async fn commit_publications(
+        &self,
+        publications: &[CatalogPublication<'_>],
+    ) -> CatalogResult<()>;
 
     /// Make every change accepted so far durable, before something that depends
     /// on it is acknowledged: a source position, a returned write. A catalog that

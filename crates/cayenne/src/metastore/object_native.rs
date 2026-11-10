@@ -252,7 +252,7 @@ impl Domain {
     async fn prepare(
         &self,
         txn: &str,
-        publications: &[crate::catalog::CatalogPublication],
+        publications: &[crate::catalog::CatalogPublication<'_>],
     ) -> CatalogResult<Vec<String>> {
         let mut inner = self.inner.take_reserved().await;
         let mut batch = inner.publication_actions(publications)?;
@@ -779,21 +779,21 @@ impl Inner {
     /// The actions that publish `publications` in one record.
     fn publication_actions(
         &self,
-        publications: &[crate::catalog::CatalogPublication],
+        publications: &[crate::catalog::CatalogPublication<'_>],
     ) -> CatalogResult<Vec<Action>> {
         let mut batch = Vec::new();
         for publication in publications {
             batch.extend(self.conflict_batch(
-                publication.delete_files.clone(),
-                &publication.table_id,
-                &publication.insert_pk_bytes,
+                publication.delete_files.to_vec(),
+                publication.table_id,
+                publication.insert_pk_bytes,
                 publication.insert_sequence,
                 Some(SnapshotSequenceCommit {
-                    snapshot_id: publication.snapshot_id.clone(),
+                    snapshot_id: publication.snapshot_id.to_string(),
                     sequence_number: publication.snapshot_sequence,
                 }),
             )?);
-            if let Some(tombstone) = &publication.inline_tombstone {
+            if let Some(tombstone) = publication.inline_tombstone {
                 batch.push(actions::inlined_delete(
                     tombstone,
                     &tombstone.inlined_id,
@@ -802,15 +802,15 @@ impl Inner {
             }
             if !publication.pending_durable_flips.is_empty() {
                 batch.push(actions::set_published(
-                    &publication.table_id,
+                    publication.table_id,
                     proto::Select::Listed,
-                    &publication.pending_durable_flips,
+                    publication.pending_durable_flips,
                     true,
                 ));
             }
             if !publication.dirty_pk_bytes.is_empty() {
                 batch.push(Action::new(Kind::MarkDirty(proto::AddKeys {
-                    table_id: publication.table_id.clone(),
+                    table_id: publication.table_id.to_string(),
                     keys: publication
                         .dirty_pk_bytes
                         .iter()
@@ -869,7 +869,7 @@ impl MetadataCatalog for Domain {
 
     async fn commit_publications(
         &self,
-        publications: &[crate::catalog::CatalogPublication],
+        publications: &[crate::catalog::CatalogPublication<'_>],
     ) -> CatalogResult<()> {
         let mut inner = self.inner.take().await;
         let batch = inner.publication_actions(publications)?;

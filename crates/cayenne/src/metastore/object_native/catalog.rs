@@ -896,7 +896,7 @@ impl ObjectNativeCatalog {
     /// wait on each other.
     async fn commit_across(
         &self,
-        mut groups: Vec<(Arc<Domain>, Vec<crate::catalog::CatalogPublication>)>,
+        mut groups: Vec<(Arc<Domain>, Vec<crate::catalog::CatalogPublication<'_>>)>,
     ) -> CatalogResult<()> {
         groups.sort_by(|(a, _), (b, _)| a.folder.cmp(&b.folder));
         let mut reservations = Vec::with_capacity(groups.len());
@@ -1231,11 +1231,12 @@ impl MetadataCatalog for ObjectNativeCatalog {
 
     async fn commit_publications(
         &self,
-        publications: &[crate::catalog::CatalogPublication],
+        publications: &[crate::catalog::CatalogPublication<'_>],
     ) -> CatalogResult<()> {
-        let mut groups: Vec<(Arc<Domain>, Vec<crate::catalog::CatalogPublication>)> = Vec::new();
+        let mut groups: Vec<(Arc<Domain>, Vec<crate::catalog::CatalogPublication<'_>>)> =
+            Vec::new();
         for publication in publications {
-            let domain = self.for_table(&publication.table_id);
+            let domain = self.for_table(publication.table_id);
             match groups
                 .iter_mut()
                 .find(|(grouped, _)| Arc::ptr_eq(grouped, &domain))

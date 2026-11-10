@@ -104,6 +104,37 @@ fn ensure_reinsert_keys_have_key_based_delete_file(
     Ok(())
 }
 
+/// Validate an on-conflict publication's delete files and stamp its key-based
+/// ones with the sequence its `reinsert_key_count` replaced keys are written at.
+fn stamp_on_conflict_delete_files(
+    table_id: &str,
+    delete_files: &mut [DeleteFile],
+    reinsert_key_count: usize,
+    insert_sequence: Option<i64>,
+) -> CatalogResult<()> {
+    let reinsert_sequence = insert_sequence.filter(|_| reinsert_key_count > 0);
+    ensure_reinsert_keys_have_key_based_delete_file(table_id, delete_files, reinsert_key_count)?;
+    for file in delete_files {
+        if file.table_id != table_id {
+            return Err(CatalogError::InvalidOperationNoSource {
+                message: "Deferred on-conflict payload spans multiple tables".to_string(),
+            });
+        }
+        if file.deletion_type == DeletionType::KeyBased {
+            file.reinsert_sequence = reinsert_sequence;
+        }
+        if reinsert_sequence.is_some_and(|sequence| sequence <= file.sequence_number) {
+            return Err(CatalogError::InvalidOperationNoSource {
+                message: format!(
+                    "Deferred upsert reinsert sequence must exceed delete sequence {}",
+                    file.sequence_number
+                ),
+            });
+        }
+    }
+    Ok(())
+}
+
 /// The metastore plus a process-local op counter. Query / execute / begin
 /// increment the counter; shutdown / WAL checkpoint / vacuum do not (those are
 /// maintenance, not scan-path catalog I/O).
@@ -491,34 +522,38 @@ impl CayenneCatalog {
         snapshot_sequence: i64,
         insert_sequence: Option<i64>,
     ) -> CatalogResult<()> {
+        stamp_on_conflict_delete_files(
+            &payload.table_id,
+            &mut payload.delete_files,
+            payload.insert_pk_bytes.len(),
+            insert_sequence,
+        )?;
+        Self::write_on_conflict_rows_in_txn(
+            txn,
+            &payload.table_id,
+            &payload.delete_files,
+            payload.inline_tombstone.as_ref(),
+            &payload.pending_durable_flips,
+            target_snapshot_id,
+            snapshot_sequence,
+        )
+        .await
+    }
+
+    /// Write an on-conflict publication's rows, its delete files already
+    /// stamped by [`stamp_on_conflict_delete_files`].
+    async fn write_on_conflict_rows_in_txn(
+        txn: &mut dyn MetastoreTransaction,
+        table_id: &str,
+        delete_files: &[DeleteFile],
+        inline_tombstone: Option<&InlinedDelete>,
+        pending_durable_flips: &[String],
+        target_snapshot_id: &str,
+        snapshot_sequence: i64,
+    ) -> CatalogResult<()> {
         const MAX_PARAMS: usize = 32_000;
 
-        let table_id = payload.table_id.as_str();
-        let reinsert_sequence = insert_sequence.filter(|_| !payload.insert_pk_bytes.is_empty());
-        ensure_reinsert_keys_have_key_based_delete_file(
-            table_id,
-            &payload.delete_files,
-            payload.insert_pk_bytes.len(),
-        )?;
-        for file in &mut payload.delete_files {
-            if file.table_id != table_id {
-                return Err(CatalogError::InvalidOperationNoSource {
-                    message: "Deferred on-conflict payload spans multiple tables".to_string(),
-                });
-            }
-            if file.deletion_type == DeletionType::KeyBased {
-                file.reinsert_sequence = reinsert_sequence;
-            }
-            if reinsert_sequence.is_some_and(|sequence| sequence <= file.sequence_number) {
-                return Err(CatalogError::InvalidOperationNoSource {
-                    message: format!(
-                        "Deferred upsert reinsert sequence must exceed delete sequence {}",
-                        file.sequence_number
-                    ),
-                });
-            }
-        }
-        for chunk in payload.delete_files.chunks(MAX_PARAMS / 10) {
+        for chunk in delete_files.chunks(MAX_PARAMS / 10) {
             let (sql, params) = Self::build_insert_delete_files_chunk_sql(chunk);
             txn.execute(ExecuteParams { sql: &sql, params }).await?;
         }
@@ -531,7 +566,7 @@ impl CayenneCatalog {
             ],
         })
         .await?;
-        if let Some(tombstone) = &payload.inline_tombstone {
+        if let Some(tombstone) = inline_tombstone {
             txn.execute(ExecuteParams {
                 // An exact replay is a no-op, including an ambiguous-commit
                 // retry after the first transaction actually committed. A
@@ -550,7 +585,7 @@ impl CayenneCatalog {
             })
             .await?;
         }
-        for inlined_id in &payload.pending_durable_flips {
+        for inlined_id in pending_durable_flips {
             txn.execute(ExecuteParams {
                 sql: "UPDATE cayenne_inlined_delete SET published = 1 WHERE table_id = ?1 AND inlined_id = ?2",
                 params: vec![
@@ -2383,36 +2418,44 @@ impl MetadataCatalog for CayenneCatalog {
     }
     async fn commit_publications(
         &self,
-        publications: &[crate::catalog::CatalogPublication],
+        publications: &[crate::catalog::CatalogPublication<'_>],
     ) -> CatalogResult<()> {
         if publications.is_empty() {
             return Ok(());
         }
         let mut txn = self.begin_transaction().await?;
         for publication in publications {
-            let mut payload = crate::provider::on_conflict::PreparedOnConflictDurablePayload {
-                table_id: publication.table_id.clone(),
-                delete_files: publication.delete_files.clone(),
-                insert_pk_bytes: publication.insert_pk_bytes.clone(),
-                inline_tombstone: publication.inline_tombstone.clone(),
-                pending_durable_flips: publication.pending_durable_flips.clone(),
-            };
-            if let Err(error) = Self::apply_prepared_on_conflict_payload_in_txn(
-                txn.as_mut(),
-                &mut payload,
-                &publication.snapshot_id,
-                publication.snapshot_sequence,
+            // Only the delete files are stamped, so only they are copied; the
+            // replaced keys, one per changed row, are only counted.
+            let mut delete_files = publication.delete_files.to_vec();
+            let applied = match stamp_on_conflict_delete_files(
+                publication.table_id,
+                &mut delete_files,
+                publication.insert_pk_bytes.len(),
                 publication.insert_sequence,
-            )
-            .await
-            {
+            ) {
+                Ok(()) => {
+                    Self::write_on_conflict_rows_in_txn(
+                        txn.as_mut(),
+                        publication.table_id,
+                        &delete_files,
+                        publication.inline_tombstone,
+                        publication.pending_durable_flips,
+                        publication.snapshot_id,
+                        publication.snapshot_sequence,
+                    )
+                    .await
+                }
+                Err(error) => Err(error),
+            };
+            if let Err(error) = applied {
                 let _ = txn.rollback().await;
                 return Err(error);
             }
             if let Err(error) = self
                 .mark_dirty_keys_in_txn(
                     txn.as_mut(),
-                    &publication.table_id,
+                    publication.table_id,
                     &publication.dirty_pk_bytes,
                     publication.snapshot_sequence,
                 )
@@ -2422,7 +2465,7 @@ impl MetadataCatalog for CayenneCatalog {
                 return Err(error);
             }
         }
-        crate::provider::append_commit::commit_transaction(txn, &publications[0].table_id).await
+        crate::provider::append_commit::commit_transaction(txn, publications[0].table_id).await
     }
 
     async fn init(&self) -> CatalogResult<()> {

@@ -91,21 +91,21 @@ async fn create(catalog: &ObjectNativeCatalog, name: &str) -> String {
 }
 
 /// Publish snapshot `snapshot` at `sequence` on `table_id`.
-fn publication(table_id: &str, snapshot: &str, sequence: i64) -> CatalogPublication {
+fn publication<'a>(table_id: &'a str, snapshot: &'a str, sequence: i64) -> CatalogPublication<'a> {
     CatalogPublication {
-        table_id: table_id.to_string(),
-        snapshot_id: snapshot.to_string(),
+        table_id,
+        snapshot_id: snapshot,
         snapshot_sequence: sequence,
         insert_sequence: None,
-        delete_files: Vec::new(),
-        insert_pk_bytes: Vec::new(),
+        delete_files: &[],
+        insert_pk_bytes: &[],
         inline_tombstone: None,
-        pending_durable_flips: Vec::new(),
-        dirty_pk_bytes: Vec::new(),
+        pending_durable_flips: &[],
+        dirty_pk_bytes: std::borrow::Cow::Borrowed(&[]),
     }
 }
 
-fn across(orders: &str, audit: &str) -> Vec<CatalogPublication> {
+fn across<'a>(orders: &'a str, audit: &'a str) -> Vec<CatalogPublication<'a>> {
     vec![
         publication(orders, "orders-txn", 5),
         publication(audit, "audit-txn", 6),

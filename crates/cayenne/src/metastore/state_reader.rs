@@ -132,7 +132,7 @@ impl MetadataCatalog for DatasetStateReader {
 
     async fn commit_publications(
         &self,
-        _publications: &[crate::catalog::CatalogPublication],
+        _publications: &[crate::catalog::CatalogPublication<'_>],
     ) -> CatalogResult<()> {
         Err(invalid("the dataset state reader is read-only"))
     }
