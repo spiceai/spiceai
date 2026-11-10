@@ -198,32 +198,29 @@ async fn start_runtime(
     Ok(rt)
 }
 
-/// `(count(*), sum(id))` of `table`, `sum` 0 when the table is empty.
-async fn count_and_sum(rt: &Arc<Runtime>, table: &str) -> Result<(i64, i64), anyhow::Error> {
-    let sql = format!("SELECT count(*), coalesce(sum(id), 0) FROM {table}");
-    let batches = run_query(rt, &sql).await?;
-    let batch = batches
-        .iter()
-        .find(|b| b.num_rows() == 1)
-        .ok_or_else(|| anyhow::anyhow!("{sql}: no summary row"))?;
-    let int = |i: usize| -> Result<i64, anyhow::Error> {
-        let column = arrow::compute::cast(batch.column(i), &DataType::Int64)?;
-        Ok(column
+/// Every `id` in `table`, in order, so a check compares the exact rows.
+async fn ids(rt: &Arc<Runtime>, table: &str) -> Result<Vec<i64>, anyhow::Error> {
+    let sql = format!("SELECT id FROM {table} ORDER BY id");
+    let mut ids = Vec::new();
+    for batch in run_query(rt, &sql).await? {
+        let column = arrow::compute::cast(batch.column(0), &DataType::Int64)?;
+        let column = column
             .as_any()
             .downcast_ref::<Int64Array>()
-            .expect("cast to Int64")
-            .value(0))
-    };
-    Ok((int(0)?, int(1)?))
+            .expect("cast to Int64");
+        ids.extend((0..column.len()).map(|i| column.value(i)));
+    }
+    Ok(ids)
 }
 
-/// `(count, sum(id))` of the ids `first..first + ROWS_PER_OBJECT` for each `first`.
-fn expected(firsts: &[i64]) -> (i64, i64) {
-    let ids = firsts
+/// The ids `first..first + ROWS_PER_OBJECT` for each `first`, in order.
+fn expected(firsts: &[i64]) -> Vec<i64> {
+    let mut ids: Vec<i64> = firsts
         .iter()
-        .flat_map(|first| *first..*first + ROWS_PER_OBJECT);
-    let (count, sum) = ids.fold((0, 0), |(count, sum), id| (count + 1, sum + id));
-    (count, sum)
+        .flat_map(|first| *first..*first + ROWS_PER_OBJECT)
+        .collect();
+    ids.sort_unstable();
+    ids
 }
 
 /// Requests a refresh of `table` and returns how it ended.
@@ -247,17 +244,18 @@ async fn refresh(
 async fn assert_refresh_fails_and_keeps(
     rt: &Arc<Runtime>,
     table: &str,
-    kept: (i64, i64),
+    kept: &[i64],
 ) -> Result<(), anyhow::Error> {
     let outcome = refresh(rt, table).await?;
     ensure!(
         outcome.is_terminal_failure(),
         "{table}: a refresh of a source with no data files must fail, got {outcome:?}"
     );
-    let now = count_and_sum(rt, table).await?;
+    let now = ids(rt, table).await?;
     ensure!(
         now == kept,
-        "{table}: the failed refresh must keep the last loaded rows {kept:?}, got {now:?}"
+        "{table}: the failed refresh must keep the last loaded ids, got {} rows",
+        now.len()
     );
     Ok(())
 }
@@ -265,17 +263,18 @@ async fn assert_refresh_fails_and_keeps(
 async fn assert_refresh_loads(
     rt: &Arc<Runtime>,
     table: &str,
-    loaded: (i64, i64),
+    loaded: &[i64],
 ) -> Result<(), anyhow::Error> {
     let outcome = refresh(rt, table).await?;
     ensure!(
         outcome.is_answered(),
         "{table}: a refresh of a restored source must succeed, got {outcome:?}"
     );
-    let now = count_and_sum(rt, table).await?;
+    let now = ids(rt, table).await?;
     ensure!(
         now == loaded,
-        "{table}: expected {loaded:?} after the refresh, got {now:?}"
+        "{table}: the refresh must load exactly the restored ids, got {} rows",
+        now.len()
     );
     Ok(())
 }
@@ -306,9 +305,9 @@ async fn deleted_s3_objects_fail_the_refresh_and_keep_the_acceleration() -> Resu
                 let rt = start_runtime(&endpoint, dir.path()).await?;
                 let prefix_rows = expected(&[0, 1000, 2000]);
                 let one_object = expected(&[0]);
-                ensure!(count_and_sum(&rt, "prefix_cay").await? == prefix_rows);
-                ensure!(count_and_sum(&rt, "marker_cay").await? == one_object);
-                ensure!(count_and_sum(&rt, "object_cay").await? == one_object);
+                ensure!(ids(&rt, "prefix_cay").await? == prefix_rows);
+                ensure!(ids(&rt, "marker_cay").await? == one_object);
+                ensure!(ids(&rt, "object_cay").await? == one_object);
 
                 for i in 0..3 {
                     delete_object(&client, &prefix_part(i)).await?;
@@ -320,17 +319,17 @@ async fn deleted_s3_objects_fail_the_refresh_and_keep_the_acceleration() -> Resu
                 ensure!(list_keys(&client, "marker/").await? == vec!["marker/".to_string()]);
                 ensure!(list_keys(&client, OBJECT_KEY).await?.is_empty());
 
-                assert_refresh_fails_and_keeps(&rt, "prefix_cay", prefix_rows).await?;
-                assert_refresh_fails_and_keeps(&rt, "marker_cay", one_object).await?;
-                assert_refresh_fails_and_keeps(&rt, "object_cay", one_object).await?;
+                assert_refresh_fails_and_keeps(&rt, "prefix_cay", &prefix_rows).await?;
+                assert_refresh_fails_and_keeps(&rt, "marker_cay", &one_object).await?;
+                assert_refresh_fails_and_keeps(&rt, "object_cay", &one_object).await?;
 
                 // Restored objects (different rows) load on the next refresh.
                 put_object(&client, &prefix_part(0), parquet_bytes(5000)).await?;
                 put_object(&client, &marker_part(), parquet_bytes(6000)).await?;
                 put_object(&client, OBJECT_KEY, parquet_bytes(7000)).await?;
-                assert_refresh_loads(&rt, "prefix_cay", expected(&[5000])).await?;
-                assert_refresh_loads(&rt, "marker_cay", expected(&[6000])).await?;
-                assert_refresh_loads(&rt, "object_cay", expected(&[7000])).await?;
+                assert_refresh_loads(&rt, "prefix_cay", &expected(&[5000])).await?;
+                assert_refresh_loads(&rt, "marker_cay", &expected(&[6000])).await?;
+                assert_refresh_loads(&rt, "object_cay", &expected(&[7000])).await?;
                 Ok::<(), anyhow::Error>(())
             }
             .await;
