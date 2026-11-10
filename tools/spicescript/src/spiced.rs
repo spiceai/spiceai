@@ -213,8 +213,19 @@ impl Spiced {
         self.container.as_ref().map(|run| run.name.as_str())
     }
 
-    pub fn set_container(&mut self, run: ContainerRun) {
+    /// Runs `spiced` in `run`'s container. A bridged one publishes its ports
+    /// on every interface, so they are given out again from those free on
+    /// every interface: a loopback probe misses a listener on another address.
+    pub fn set_container(&mut self, run: ContainerRun) -> Result<()> {
+        if run.bridge.is_some() {
+            let every = std::net::Ipv4Addr::UNSPECIFIED.into();
+            self.http = crate::docker::free_port_on(every)?;
+            self.flight = crate::docker::free_port_on(every)?;
+            self.metrics = crate::docker::free_port_on(every)?;
+            self.otel = crate::docker::free_port_on(every)?;
+        }
         self.container = Some(run);
+        Ok(())
     }
 
     /// Serves HTTP on `port`, one a script was told in advance

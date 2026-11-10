@@ -1152,18 +1152,28 @@ async fn create_instances(
             }
             // `spiced` serves HTTP on every interface when `rootless_reach`
             // is set, so its port must be free on the wildcard address too.
-            let http_port = crate::docker::free_port_on(if rootless_reach {
-                std::net::Ipv4Addr::UNSPECIFIED.into()
+            // A port served beyond loopback must be free there too: a loopback
+            // probe misses a listener on another address. Bridged nodes serve
+            // the scheduler and executor ports at the routable address.
+            let wide_ip: std::net::IpAddr = std::net::Ipv4Addr::UNSPECIFIED.into();
+            let loopback_ip: std::net::IpAddr = std::net::Ipv4Addr::LOCALHOST.into();
+            let http_port = crate::docker::free_port_on(if rootless_reach || bridge.is_some() {
+                wide_ip
             } else {
-                std::net::Ipv4Addr::LOCALHOST.into()
+                loopback_ip
             })?;
+            let node_ip = if bridge.is_some() {
+                wide_ip
+            } else {
+                loopback_ip
+            };
             let context = json!({
                 "sources": source_ctx,
                 "matrix": combo,
                 "variant": { "name": variant_name },
-                "instance": { "name": label, "dir": dir.display().to_string(), "port": crate::docker::free_port()?,
-                    "executor_port": crate::docker::free_port()?, "http_port": http_port,
-                    "flight_port": crate::docker::free_port()?,
+                "instance": { "name": label, "dir": dir.display().to_string(), "port": crate::docker::free_port_on(node_ip)?,
+                    "executor_port": crate::docker::free_port_on(node_ip)?, "http_port": http_port,
+                    "flight_port": crate::docker::free_port_on(node_ip)?,
                     "host_from_container": host_from_container },
                 "script": { "dir": std::path::absolute(&script.dir)?.display().to_string() },
                 "pki": { "dir": options.pki.display().to_string() },
@@ -1314,7 +1324,7 @@ async fn create_instances(
                         ],
                         rootless: crate::docker::daemon_is_rootless().await,
                         bridge,
-                    });
+                    })?;
                 }
                 executors.push(executor);
             }

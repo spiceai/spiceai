@@ -226,7 +226,7 @@ pub(super) fn cluster_args(
 pub(super) fn spicepod_for_bridge(spicepod: &mut Value, address: std::net::IpAddr) {
     match spicepod {
         Value::String(text) if text.contains("127.0.0.1") => {
-            *text = text.replace("127.0.0.1", &address.to_string());
+            *text = bridged_host(text, &address.to_string());
         }
         Value::Array(items) => {
             for item in items {
@@ -240,6 +240,28 @@ pub(super) fn spicepod_for_bridge(spicepod: &mut Value, address: std::net::IpAdd
         }
         _ => {}
     }
+}
+
+/// `text` with `127.0.0.1` replaced by `address` wherever it is a host: after
+/// `://` or `@` in a URL, or at the start of a `host:port` or of one in a
+/// comma-separated list. Elsewhere, such as
+/// inside a file path, it is left as it is.
+fn bridged_host(text: &str, address: &str) -> String {
+    const LOOPBACK: &str = "127.0.0.1";
+    let mut out = String::with_capacity(text.len());
+    let mut rest = text;
+    while let Some(at) = rest.find(LOOPBACK) {
+        let before = &text[..text.len() - rest.len() + at];
+        let after = &rest[at + LOOPBACK.len()..];
+        let is_host =
+            (before.is_empty() || before.ends_with("://") || before.ends_with(['@', ',']))
+                && (after.is_empty() || after.starts_with([':', '/', ',']));
+        out.push_str(&rest[..at]);
+        out.push_str(if is_host { address } else { LOOPBACK });
+        rest = after;
+    }
+    out.push_str(rest);
+    out
 }
 
 /// The engine an acceleration block runs, or `None` when it is disabled,
@@ -489,6 +511,23 @@ mod tests {
         spicepod_for_bridge(
             &mut spicepod,
             std::net::Ipv4Addr::new(10, 244, 0, 183).into(),
+        );
+        // Only a host is rewritten: a path that holds the text keeps it.
+        let mut paths = json!({
+            "file": "file:/work/127.0.0.1/rows.csv",
+            "plain": "127.0.0.1:29150",
+            "auth": "postgres://u:p@127.0.0.1:5432/db",
+            "list": "127.0.0.1:9092,127.0.0.1:9093"
+        });
+        spicepod_for_bridge(&mut paths, std::net::Ipv4Addr::new(10, 244, 0, 183).into());
+        assert_eq!(
+            paths,
+            json!({
+                "file": "file:/work/127.0.0.1/rows.csv",
+                "plain": "10.244.0.183:29150",
+                "auth": "postgres://u:p@10.244.0.183:5432/db",
+                "list": "10.244.0.183:9092,10.244.0.183:9093"
+            })
         );
         assert_eq!(
             spicepod,
