@@ -27708,7 +27708,9 @@ impl CayenneTableProvider {
     /// rather than waiting on `write()`: a queued writer would turn away the
     /// shared-mode protected merges that may run beside a long one. Every
     /// rebuild clears the pending mark as it starts, so the task does nothing
-    /// (and takes no lock) when a later write's rebuild got there first.
+    /// (and takes no lock) when a later write's rebuild got there first. After
+    /// a rebuild the task schedules the post-write compaction pass, which may
+    /// have declined while the task held the lock.
     fn schedule_manifest_rebuild_retry(&self) {
         // Record the request FIRST, so a task already running picks it up in
         // its exit re-check instead of it being dropped on the held slot.
@@ -27749,7 +27751,7 @@ impl CayenneTableProvider {
                     return;
                 }
                 if table.manifest_rebuild_pending.load(Ordering::Acquire) {
-                    let Ok(_compaction_guard) = table.compaction_lock.try_write() else {
+                    let Ok(compaction_guard) = table.compaction_lock.try_write() else {
                         backoff = (backoff * 2).min(MANIFEST_REBUILD_RETRY_MAX_BACKOFF);
                         continue;
                     };
@@ -27759,6 +27761,16 @@ impl CayenneTableProvider {
                         .manifest_rebuild_pending
                         .store(false, Ordering::Release);
                     table.rebuild_live_snapshot_manifests_if_admitted().await;
+                    drop(compaction_guard);
+                    // A post-write compaction pass that tried the lock during
+                    // this rebuild declined as busy and ended, and nothing
+                    // else schedules another until the next write. Schedule
+                    // it here, as the post-write maintenance pass does after
+                    // its own rebuild, so an idle table is still consolidated.
+                    // Called while this task still holds its slot, so
+                    // `drain_in_flight_maintenance` sees the pass claimed
+                    // before it sees this task finish.
+                    table.schedule_post_write_compaction();
                 }
 
                 // Open the slot, then re-check. A skip after this store claims
