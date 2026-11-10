@@ -3189,15 +3189,15 @@ pub struct CayenneTableProvider {
     ///
     /// Shared across writer clones.
     inlined_entries_awaiting_publish: Arc<ParkingMutex<HashMap<String, Arc<InlinedData>>>>,
-    /// Inline writes whose catalog change is buffered in a same-record scope
-    /// ([`crate::catalog::with_same_record_commits`]) and whose publish waits
-    /// for that scope's commit. Another inline write waits for this to reach
-    /// zero before it reads the inline view, and maintenance that rewrites the
-    /// inline corpus defers while it is not zero
-    /// ([`Self::inline_changes_unpublished`]).
+    /// Writes (inline upserts, key deletes) whose catalog change is buffered in
+    /// a same-record scope ([`crate::catalog::with_same_record_commits`]) and
+    /// whose publish waits for that scope's commit. An inline write waits for
+    /// this to reach zero before it reads the inline view, a key delete before
+    /// it acts, and maintenance that rewrites the inline corpus defers while it
+    /// is not zero ([`Self::inline_changes_unpublished`]).
     ///
     /// Shared across writer clones.
-    unpublished_inline_writes: Arc<tokio::sync::watch::Sender<u64>>,
+    held_publishes: Arc<tokio::sync::watch::Sender<u64>>,
     /// Durable `published = 1` flips owed for tombstones in
     /// [`Self::inlined_locally_published`] but not yet persisted (cycle-4 lever
     /// b1★). Drained by (a) the NEXT staged batch's Stage-A folded transaction
@@ -11929,7 +11929,7 @@ impl CayenneTableProvider {
             inlined_locally_published: Arc::new(ParkingMutex::new(HashSet::new())),
             inlined_tombstones_awaiting_publish: Arc::new(ParkingMutex::new(HashSet::new())),
             inlined_entries_awaiting_publish: Arc::new(ParkingMutex::new(HashMap::new())),
-            unpublished_inline_writes: Arc::new(tokio::sync::watch::Sender::new(0)),
+            held_publishes: Arc::new(tokio::sync::watch::Sender::new(0)),
             pending_durable_tombstone_flips: Arc::new(ParkingMutex::new(Vec::new())),
             pending_tombstone_deltas: Arc::new(
                 ParkingMutex::new(PendingTombstoneDeltas::default()),
@@ -14436,7 +14436,7 @@ impl CayenneTableProvider {
                 &self.inlined_tombstones_awaiting_publish,
             ),
             inlined_entries_awaiting_publish: Arc::clone(&self.inlined_entries_awaiting_publish),
-            unpublished_inline_writes: Arc::clone(&self.unpublished_inline_writes),
+            held_publishes: Arc::clone(&self.held_publishes),
             pending_durable_tombstone_flips: Arc::clone(&self.pending_durable_tombstone_flips),
             pending_tombstone_deltas: Arc::clone(&self.pending_tombstone_deltas),
             inlined_cache: Arc::clone(&self.inlined_cache),
@@ -19880,6 +19880,52 @@ impl CayenneTableProvider {
         } else {
             self.bump_inlined_generation();
         }
+    }
+
+    /// Make a delete whose catalog change has committed visible: its key
+    /// deletes and its inline rewrite, as one step under the scan fences.
+    pub(crate) async fn publish_delete(
+        &self,
+        file_delete: Option<super::delete::PreparedDeletionPublish>,
+        inline_rewrite: &InlinedDataRewrite,
+        awaiting_publish: &[String],
+    ) {
+        let _visibility = self.visibility_lock_arc().lock_owned().await;
+        let _fence = self.lock_listing_fence_write_owned().await;
+        let _view_guard = self.scan_state_lock.write().await;
+        if let Some(file_delete) = file_delete
+            && let Err(error) = file_delete.publish()
+        {
+            // The delete is committed but cannot be applied in memory: refuse
+            // work until the table is reloaded from its catalog.
+            tracing::warn!(
+                table = self.table_metadata.table_name.as_str(),
+                %error,
+                "Cayenne could not apply a committed delete to dataset '{}' in memory, so the dataset refuses writes until it is reloaded",
+                self.table_metadata.table_name
+            );
+            self.publication_outcome_unknown
+                .store(true, Ordering::Release);
+        }
+        self.release_replaced_inlined_entries(awaiting_publish);
+        if !inline_rewrite.is_empty() {
+            self.publish_inlined_rewrite(inline_rewrite);
+        }
+    }
+
+    /// Delete the files of deletion vectors a committed change replaced.
+    pub(crate) fn remove_dropped_deletion_vector_files(
+        &self,
+        replaced: Vec<crate::metadata::DeleteFile>,
+    ) {
+        if replaced.is_empty() {
+            return;
+        }
+        super::delete::remove_dropped_deletion_vector_files(
+            replaced,
+            Arc::clone(&self.file_deletion_fence),
+            self.dataset_storage.clone(),
+        );
     }
 
     pub(crate) fn publish_inlined_rewrite(&self, rewrite: &InlinedDataRewrite) {
@@ -35152,15 +35198,15 @@ impl CayenneTableProvider {
         true
     }
 
-    /// Run `publish`, an inline write's publish followed by what it schedules,
-    /// once the write's catalog change has committed: now when it has, or,
-    /// inside a same-record scope, after the scope's owner commits the record
-    /// that holds it. Until then `unpublished_inline_writes` counts it,
-    /// so other inline writes wait for it and inline maintenance defers. If the
+    /// Run `publish`, a write's publish (which makes its changes visible) and
+    /// what follows it, once the write's catalog change has committed: now when
+    /// it has, or, inside a same-record scope, after the scope's owner commits
+    /// the record that holds it. Until then `held_publishes` counts it, so
+    /// inline writes and key deletes wait for it and inline maintenance defers. If the
     /// owner never runs it, its record's fate is unknown here: the table refuses
     /// work until it is reloaded, and readers keep seeing the rows from before
     /// the write.
-    pub(crate) async fn publish_inline_write(
+    pub(crate) async fn publish_when_committed(
         &self,
         publish: impl std::future::Future<Output = ()> + Send + 'static,
     ) {
@@ -35168,13 +35214,13 @@ impl CayenneTableProvider {
             publish.await;
             return;
         }
-        self.unpublished_inline_writes.send_modify(|count| *count += 1);
-        let release = Arc::new(UnpublishedInlineWrite {
-            count: Arc::clone(&self.unpublished_inline_writes),
+        self.held_publishes.send_modify(|count| *count += 1);
+        let release = Arc::new(HeldPublish {
+            count: Arc::clone(&self.held_publishes),
             released: AtomicBool::new(false),
         });
         let run = {
-            let release = ReleaseUnpublishedInlineWrite(Arc::clone(&release));
+            let release = ReleaseHeldPublish(Arc::clone(&release));
             Box::pin(async move {
                 // Released when the publish ends, or if it is dropped unfinished.
                 let _release = release;
@@ -35194,18 +35240,18 @@ impl CayenneTableProvider {
         }
     }
 
-    /// Wait until no inline write's publish waits for its commit, so a write
-    /// that reads the inline view sees every inline change before its own. A
+    /// Wait until no write's publish waits for its commit, so a write that
+    /// reads the inline view sees every change before its own. A
     /// write of the scope that holds such a publish cannot wait for its commit,
     /// so it publishes the scope's held writes now instead.
-    async fn wait_for_unpublished_inline_writes(&self) -> Result<()> {
-        if *self.unpublished_inline_writes.borrow() == 0 {
+    async fn wait_for_held_publishes(&self) -> Result<()> {
+        if *self.held_publishes.borrow() == 0 {
             return Ok(());
         }
         if crate::catalog::commit_left_to_scope_owner() {
             crate::catalog::publish_held_writes_now().await;
         }
-        let mut count = self.unpublished_inline_writes.subscribe();
+        let mut count = self.held_publishes.subscribe();
         match tokio::time::timeout(
             STAGED_WRITE_DRAIN_TIMEOUT,
             count.wait_for(|count| *count == 0),
@@ -35223,17 +35269,17 @@ impl CayenneTableProvider {
         }
     }
 
-    /// Whether an inline change is committed or buffered but not yet published:
-    /// a staged write's tombstone, or an inline write waiting for its record's
-    /// commit. Maintenance that rewrites the inline corpus defers meanwhile.
+    /// Whether a change is committed or buffered but not yet published: a staged
+    /// write's tombstone, or a write waiting for its record's commit.
+    /// Maintenance that rewrites the inline corpus defers meanwhile.
     pub(crate) fn inline_changes_unpublished(&self) -> bool {
         self.pending_inline_tombstones.load(Ordering::Acquire) > 0
-            || *self.unpublished_inline_writes.borrow() > 0
+            || *self.held_publishes.borrow() > 0
     }
 
     /// Serve `replaced` to inline-view rebuilds in place of the catalog's
     /// versions until [`Self::release_replaced_inlined_entries`]. Returns their ids.
-    fn hold_replaced_inlined_entries(&self, replaced: &[Arc<InlinedData>]) -> Vec<String> {
+    pub(crate) fn hold_replaced_inlined_entries(&self, replaced: &[Arc<InlinedData>]) -> Vec<String> {
         if replaced.is_empty() {
             return Vec::new();
         }
@@ -35249,7 +35295,7 @@ impl CayenneTableProvider {
             .collect()
     }
 
-    fn release_replaced_inlined_entries(&self, ids: &[String]) {
+    pub(crate) fn release_replaced_inlined_entries(&self, ids: &[String]) {
         if ids.is_empty() {
             return;
         }
@@ -35296,7 +35342,7 @@ impl CayenneTableProvider {
     /// rewriting inline rows they replace. Returns `None` when the batches do
     /// not fit inline, and otherwise the write's publish, which makes its rows
     /// visible: run it once the write's catalog change has committed
-    /// ([`Self::publish_inline_write`]).
+    /// ([`Self::publish_when_committed`]).
     pub(crate) async fn try_inline_batches_with_inlined_deletions(
         &self,
         batches: &[RecordBatch],
@@ -35336,7 +35382,7 @@ impl CayenneTableProvider {
 
         // The rewrite below reads the inline view readers see, so an inline
         // write whose publish still waits for its commit must publish first.
-        self.wait_for_unpublished_inline_writes().await?;
+        self.wait_for_held_publishes().await?;
 
         let has_file_deletions =
             !file_deleted_pk_i64.is_empty() || !file_deleted_row_keys.is_empty();
@@ -41759,6 +41805,7 @@ impl CayenneTableProvider {
 
             matched_deleted_rows += entry_matched_rows;
             rewrite.removed_rows += original_rows.saturating_sub(remaining_rows);
+            rewrite.replaced.push(Arc::new(entry.clone()));
             if remaining_rows == 0 {
                 rewrite.deleted_inlined_ids.push(entry.inlined_id);
             } else {
@@ -46436,7 +46483,7 @@ fn active_transaction(
 /// rows it replaces, as one step under the scan fences. From
 /// [`CayenneTableProvider::try_inline_batches_with_inlined_deletions`]; run only
 /// once the write's catalog change has committed
-/// ([`CayenneTableProvider::publish_inline_write`]).
+/// ([`CayenneTableProvider::publish_when_committed`]).
 pub(crate) struct InlinedWritePublish {
     table: CayenneTableProvider,
     total_rows: usize,
@@ -46531,14 +46578,14 @@ impl InlinedWritePublish {
     }
 }
 
-/// Counts one inline write in `unpublished_inline_writes` until it publishes or
+/// Counts one inline write in `held_publishes` until it publishes or
 /// is abandoned, whichever comes first.
-struct UnpublishedInlineWrite {
+struct HeldPublish {
     count: Arc<tokio::sync::watch::Sender<u64>>,
     released: AtomicBool,
 }
 
-impl UnpublishedInlineWrite {
+impl HeldPublish {
     fn release(&self) {
         if !self.released.swap(true, Ordering::AcqRel) {
             self.count
@@ -46547,9 +46594,9 @@ impl UnpublishedInlineWrite {
     }
 }
 
-struct ReleaseUnpublishedInlineWrite(Arc<UnpublishedInlineWrite>);
+struct ReleaseHeldPublish(Arc<HeldPublish>);
 
-impl Drop for ReleaseUnpublishedInlineWrite {
+impl Drop for ReleaseHeldPublish {
     fn drop(&mut self) {
         self.0.release();
     }

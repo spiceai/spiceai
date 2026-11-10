@@ -1759,7 +1759,7 @@ impl<'a> AppendMutationWriter<'a> {
                 let table = self.table.clone_for_write_operations();
                 let retention_requested = table.has_retention_delete_filters();
                 self.table
-                    .publish_inline_write(async move {
+                    .publish_when_committed(async move {
                         publish.run().await;
                         // The inline rows are visible now, so the claim
                         // survives from here. `run` awaits the

@@ -740,6 +740,11 @@ impl DeletionSink for InlineAwareDeletionSink {
             let delete_files = prepared_file_delete
                 .as_ref()
                 .map_or_else(Vec::new, |prepared| prepared.delete_files().to_vec());
+            // The catalog serves the rewrite from when it is applied; readers
+            // keep the entries it replaces as they were until the publish.
+            let awaiting_publish = self
+                .table
+                .hold_replaced_inlined_entries(&inline_rewrite.replaced);
             if let Err(error) = self
                 .table
                 .metadata_catalog()
@@ -755,18 +760,37 @@ impl DeletionSink for InlineAwareDeletionSink {
                 )
                 .await
             {
+                self.table
+                    .release_replaced_inlined_entries(&awaiting_publish);
                 return Err(Box::new(error));
             }
             if let Some(prepared) = &mut prepared_file_delete {
                 prepared.mark_catalog_committed();
             }
-            if let Some(prepared) = prepared_file_delete {
-                prepared.publish()?;
+            if crate::catalog::commit_left_to_scope_owner() {
+                // Buffered: the scope's owner commits the record, then runs this
+                // publish, so no reader sees the delete before it is durable.
+                // The vectors it replaces go only after that commit.
+                let table = self.table.clone_for_write();
+                self.table
+                    .publish_when_committed(async move {
+                        table
+                            .publish_delete(prepared_file_delete, &inline_rewrite, &awaiting_publish)
+                            .await;
+                        table.remove_dropped_deletion_vector_files(replaced_vectors);
+                    })
+                    .await;
+            } else {
+                if let Some(prepared) = prepared_file_delete {
+                    prepared.publish()?;
+                }
+                self.table
+                    .release_replaced_inlined_entries(&awaiting_publish);
+                if !inline_rewrite.is_empty() {
+                    self.table.publish_inlined_rewrite(&inline_rewrite);
+                }
+                file_sink.remove_replaced_deletion_vector_files(replaced_vectors);
             }
-            if !inline_rewrite.is_empty() {
-                self.table.publish_inlined_rewrite(&inline_rewrite);
-            }
-            file_sink.remove_replaced_deletion_vector_files(replaced_vectors);
         }
 
         let mut deleted = inlined_deleted.checked_add(file_deleted).ok_or_else(|| {
