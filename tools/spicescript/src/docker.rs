@@ -165,15 +165,10 @@ impl Container {
             .map(|(container, host)| {
                 (
                     format!("{container}/tcp"),
-                    Some(
-                        binding_addresses(also)
-                            .into_iter()
-                            .map(|ip| PortBinding {
-                                host_ip: Some(ip),
-                                host_port: Some(host.to_string()),
-                            })
-                            .collect(),
-                    ),
+                    Some(vec![PortBinding {
+                        host_ip: Some(binding_address(also).into()),
+                        host_port: Some(host.to_string()),
+                    }]),
                 )
             })
             .collect::<HashMap<_, _>>();
@@ -894,10 +889,11 @@ tokio::task_local! {
     static ALSO_PUBLISH_ON: Option<std::net::IpAddr>;
 }
 
-/// Runs `work`, in which every container started publishes its ports on
-/// `address` as well as on loopback, where one is given: for peers that reach
-/// this machine at that address, such as cluster executors in bridge
-/// containers behind a rootless daemon (see [`crate::spiced::ContainerRun`]).
+/// Runs `work`, in which every container started publishes its ports where
+/// they are reached at `address` as well as on loopback, where one is given:
+/// for peers that reach this machine at that address, such as cluster
+/// executors in bridge containers behind a rootless daemon (see
+/// [`crate::spiced::ContainerRun`]).
 pub async fn publishing_also_on<F: std::future::Future>(
     address: Option<std::net::IpAddr>,
     work: F,
@@ -911,12 +907,17 @@ pub fn also_publish_on() -> Option<std::net::IpAddr> {
     ALSO_PUBLISH_ON.try_with(|address| *address).ok().flatten()
 }
 
-/// The host addresses a container's port is published on: loopback, and
-/// `also` when given.
-fn binding_addresses(also: Option<std::net::IpAddr>) -> Vec<String> {
-    std::iter::once("127.0.0.1".to_string())
-        .chain(also.map(|ip| ip.to_string()))
-        .collect()
+/// The host address a container's port is published on: loopback, or, when
+/// it must also be reached at `also`, every interface. A rootless daemon
+/// cannot publish one port on two host addresses: it binds each at its own
+/// loopback inside its namespace, so the second fails with "address already
+/// in use". Every interface is loopback and `also`, the routable address.
+fn binding_address(also: Option<std::net::IpAddr>) -> &'static str {
+    if also.is_some() {
+        "0.0.0.0"
+    } else {
+        "127.0.0.1"
+    }
 }
 
 fn runner_label() -> HashMap<&'static str, String> {
@@ -1520,18 +1521,16 @@ mod pull_tests {
 
 #[cfg(test)]
 mod also_publish_tests {
-    use super::{also_publish_on, binding_addresses, publishing_also_on};
+    use super::{also_publish_on, binding_address, publishing_also_on};
 
     #[tokio::test]
     async fn publishes_on_the_extra_address_only_within_its_scope() {
         let address: std::net::IpAddr = std::net::Ipv4Addr::new(10, 244, 0, 183).into();
         assert_eq!(also_publish_on(), None);
-        assert_eq!(binding_addresses(also_publish_on()), ["127.0.0.1"]);
-        let inside = publishing_also_on(Some(address), async {
-            binding_addresses(also_publish_on())
-        })
-        .await;
-        assert_eq!(inside, ["127.0.0.1", "10.244.0.183"]);
+        assert_eq!(binding_address(also_publish_on()), "127.0.0.1");
+        let inside =
+            publishing_also_on(Some(address), async { binding_address(also_publish_on()) }).await;
+        assert_eq!(inside, "0.0.0.0");
         assert_eq!(
             publishing_also_on(None, async { also_publish_on() }).await,
             None

@@ -95,8 +95,8 @@ pub struct ContainerRun {
     pub rootless: bool,
     /// Runs the container on Docker's default bridge network instead of the
     /// host's, serving on every interface inside it, and publishes each port
-    /// `spiced` serves on loopback and on this address, which its cluster
-    /// peers reach it at.
+    /// `spiced` serves where it is reached on loopback and at this address,
+    /// the one its cluster peers reach it at.
     ///
     /// A rootless daemon's `host` network is `RootlessKit`'s namespace, not
     /// this machine's, so nothing here reaches a listener in a host-network
@@ -107,18 +107,14 @@ pub struct ContainerRun {
 }
 
 /// The ports a container [`ContainerRun::bridge`] publishes, `-p` by `-p`:
-/// each of `ports` on loopback and on `address`, at the same number inside.
-fn publish_args(address: std::net::IpAddr, ports: &[u16]) -> Vec<String> {
+/// each of `ports` at the same number inside, on every interface, which is
+/// loopback and the routable address. A rootless daemon cannot publish one
+/// port on both: it binds each at its own loopback, and the second fails
+/// with "address already in use".
+fn publish_args(ports: &[u16]) -> Vec<String> {
     ports
         .iter()
-        .flat_map(|port| {
-            [
-                "-p".to_string(),
-                format!("127.0.0.1:{port}:{port}"),
-                "-p".to_string(),
-                format!("{address}:{port}:{port}"),
-            ]
-        })
+        .flat_map(|port| ["-p".to_string(), format!("0.0.0.0:{port}:{port}")])
         .collect()
 }
 
@@ -444,10 +440,10 @@ impl Spiced {
         let owner = std::fs::metadata(&dir)?;
         let mut command = Command::new("docker");
         command.args(["run", "--rm", "--init"]);
-        if let Some(address) = run.bridge {
+        if run.bridge.is_some() {
             let mut ports = vec![self.http, self.flight, self.metrics, self.otel];
             ports.extend(node_bind_port(&self.extra_args));
-            command.args(publish_args(address, &ports));
+            command.args(publish_args(&ports));
         } else {
             command.args(["--network", "host"]);
         }
@@ -1299,20 +1295,10 @@ mod bridge_tests {
     use super::{node_bind_port, publish_args};
 
     #[test]
-    fn publishes_each_port_on_loopback_and_the_peer_address() {
-        let address = std::net::Ipv4Addr::new(10, 244, 0, 183).into();
+    fn publishes_each_port_once_on_every_interface() {
         assert_eq!(
-            publish_args(address, &[29141, 29150]),
-            [
-                "-p",
-                "127.0.0.1:29141:29141",
-                "-p",
-                "10.244.0.183:29141:29141",
-                "-p",
-                "127.0.0.1:29150:29150",
-                "-p",
-                "10.244.0.183:29150:29150",
-            ]
+            publish_args(&[29141, 29150]),
+            ["-p", "0.0.0.0:29141:29141", "-p", "0.0.0.0:29150:29150"]
         );
     }
 
