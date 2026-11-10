@@ -212,8 +212,10 @@ impl CayenneChangeSinkBackend {
         write.finalizer = Some(Box::pin(async move {
             // The write's data goes into the record first, then the positions,
             // so a position never commits without the rows it covers.
-            let (finished, finalize_after_commit) =
-                cayenne::catalog::with_same_record_commits(async move {
+            // Part of the burst's scope, so the finalizer's write reads the
+            // burst's earlier, unpublished groups as its own.
+            let (finished, finalize_after_commit) = after_commit
+                .continue_scope(async move {
                     if let Some(finalizer) = finalizer {
                         finalizer.await?;
                     }
@@ -268,11 +270,13 @@ impl CayenneChangeSinkBackend {
         let mut finalizer: Option<BoxFuture<'static, Result<()>>> = None;
         let mut max_epoch: Option<u64> = None;
         for (op, rows) in groups {
-            // A later sub-operation can conflict with the previous append, so
-            // it must see that append's rows: they are published now, and still
-            // commit in the batch's one record.
+            // A later group can conflict with the previous append, so that
+            // append is finished first. Inside the batch's same-record scope its
+            // changes are only buffered and its publish waits for the batch's
+            // one record: the later group reads them from the table's writer
+            // view, and no reader sees them before that record commits.
             if let Some(pending) = finalizer.take() {
-                cayenne::catalog::publish_before_commit(pending).await?;
+                pending.await?;
             }
             let epoch = match op {
                 ChangeOperationType::Upsert => {

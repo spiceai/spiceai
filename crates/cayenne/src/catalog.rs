@@ -332,11 +332,12 @@ struct LeftForCommit<T> {
     /// Take the step.
     run: futures::future::BoxFuture<'static, T>,
     /// Called instead of `run` when the step is not taken: the record did not
-    /// commit, an earlier delete failed, or the owner dropped the steps. For a
-    /// publish, also called after `run` when it ran before the record committed
-    /// and the record then does not commit.
+    /// commit, an earlier delete failed, or the owner dropped the steps.
     abandon: Box<dyn FnOnce() + Send>,
 }
+
+/// Source of [`AfterCommit::scope`] ids.
+static NEXT_SAME_RECORD_SCOPE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
 
 /// What a write inside [`with_same_record_commits`] must not do before the
 /// record holding its changes commits:
@@ -348,36 +349,54 @@ struct LeftForCommit<T> {
 ///
 /// The owner runs them after its `commit_pending` succeeds; dropped unrun, each
 /// is abandoned, which leaves its objects for recovery and its rows unpublished.
-#[derive(Default)]
+///
+/// A later write of the same scope that must read what an earlier one changed
+/// reads it from the table's writer view (the catalog's buffered state and the
+/// table's unpublished changes), never from what readers see, so nothing is
+/// published before the record commits.
 pub struct AfterCommit {
+    /// Identifies the scope to the tables it writes, which tell its own
+    /// unpublished changes from those of other scopes.
+    scope: u64,
     publishes: parking_lot::Mutex<Vec<LeftForCommit<()>>>,
     deletes: parking_lot::Mutex<Vec<LeftForCommit<Result<(), String>>>>,
-    /// The `abandon` of each publish run before the record committed
-    /// ([`publish_held_writes_now`]): called if the record does not commit,
-    /// since its rows are then visible without being durable.
-    published_early: parking_lot::Mutex<Vec<Box<dyn FnOnce() + Send>>>,
+}
+
+impl Default for AfterCommit {
+    fn default() -> Self {
+        Self::in_scope(NEXT_SAME_RECORD_SCOPE.fetch_add(1, std::sync::atomic::Ordering::Relaxed))
+    }
 }
 
 impl std::fmt::Debug for AfterCommit {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("AfterCommit")
+            .field("scope", &self.scope)
             .field("publishes", &self.publishes.lock().len())
             .field("deletes", &self.deletes.lock().len())
-            .field("published_early", &self.published_early.lock().len())
             .finish()
     }
 }
 
 impl AfterCommit {
-    /// Publish the writes' rows, then send the deletes in the order they were
-    /// left, stopping at the first that fails: a later delete may depend on an
-    /// earlier one (a staging WAL goes only after the staged files it
-    /// describes). Call only once the record holding the writes' changes has
-    /// committed.
+    fn in_scope(scope: u64) -> Self {
+        Self {
+            scope,
+            publishes: parking_lot::Mutex::new(Vec::new()),
+            deletes: parking_lot::Mutex::new(Vec::new()),
+        }
+    }
+
+    /// Publish the writes' rows, in the order the writes left them, then send
+    /// the deletes in the order they were left, stopping at the first that
+    /// fails: a later delete may depend on an earlier one (a staging WAL goes
+    /// only after the staged files it describes). Call only once the record
+    /// holding the writes' changes has committed.
     pub async fn run(self) {
-        self.publish_now().await;
-        // The record committed: what was published early is durable.
-        self.published_early.lock().clear();
+        let publishes = std::mem::take(&mut *self.publishes.lock());
+        for publish in publishes {
+            publish.run.await;
+        }
         let mut pending = std::mem::take(&mut *self.deletes.lock()).into_iter();
         while let Some(delete) = pending.next() {
             if let Err(error) = delete.run.await {
@@ -393,35 +412,32 @@ impl AfterCommit {
         }
     }
 
-    /// Publish the writes' rows now, before their record commits, and keep the
-    /// deletes for [`Self::run`].
-    async fn publish_now(&self) {
-        let publishes = std::mem::take(&mut *self.publishes.lock());
-        for publish in publishes {
-            publish.run.await;
-            self.published_early.lock().push(publish.abandon);
-        }
-    }
-
     /// Append the steps of `other`, to run after these.
     pub fn extend(&self, other: Self) {
         let mut publishes = std::mem::take(&mut *other.publishes.lock());
         self.publishes.lock().append(&mut publishes);
         let mut deletes = std::mem::take(&mut *other.deletes.lock());
         self.deletes.lock().append(&mut deletes);
-        let mut published_early = std::mem::take(&mut *other.published_early.lock());
-        self.published_early.lock().append(&mut published_early);
         // Empty now, so dropping it abandons nothing.
         drop(other);
     }
 
+    /// Run `work` as [`with_same_record_commits`] does, as part of this scope:
+    /// a table tells the changes `work` leaves unpublished from other scopes'
+    /// as it tells this scope's own. Use it for a later step of the write
+    /// whose record this scope's changes go into.
+    pub async fn continue_scope<F: std::future::Future>(
+        &self,
+        work: F,
+    ) -> (F::Output, AfterCommit) {
+        same_record_scope(Arc::new(Self::in_scope(self.scope)), work).await
+    }
+
     fn take(&self) -> Self {
         Self {
+            scope: self.scope,
             publishes: parking_lot::Mutex::new(std::mem::take(&mut *self.publishes.lock())),
             deletes: parking_lot::Mutex::new(std::mem::take(&mut *self.deletes.lock())),
-            published_early: parking_lot::Mutex::new(std::mem::take(
-                &mut *self.published_early.lock(),
-            )),
         }
     }
 }
@@ -434,9 +450,6 @@ impl Drop for AfterCommit {
         for delete in std::mem::take(&mut *self.deletes.lock()) {
             (delete.abandon)();
         }
-        for abandon in std::mem::take(&mut *self.published_early.lock()) {
-            abandon();
-        }
     }
 }
 
@@ -444,6 +457,11 @@ impl Drop for AfterCommit {
 /// sends the object deletes left with [`delete_after_commit`].
 pub(crate) fn deletes_wait_for_commit() -> bool {
     AFTER_COMMIT.try_with(|_| ()).is_ok()
+}
+
+/// The id of the [`with_same_record_commits`] scope the current task is in.
+pub(crate) fn same_record_scope_id() -> Option<u64> {
+    AFTER_COMMIT.try_with(|after| after.scope).ok()
 }
 
 /// Leave `run` for the owner of the enclosing [`with_same_record_commits`] to
@@ -479,39 +497,6 @@ pub(crate) fn publish_after_commit(
     }
 }
 
-/// Run `work`, a write whose rows a later change of the same record must see,
-/// and publish its rows when it returns, before the enclosing
-/// [`with_same_record_commits`] commits: its metastore changes still commit in
-/// that record, and its object deletes still wait for it. Outside such a scope
-/// this is `work`, which then commits and publishes on its own.
-///
-/// # Errors
-///
-/// Returns `work`'s error; its rows are then not published.
-pub async fn publish_before_commit<T, E, F>(work: F) -> Result<T, E>
-where
-    F: std::future::Future<Output = Result<T, E>>,
-{
-    let Ok(enclosing) = AFTER_COMMIT.try_with(Arc::clone) else {
-        return work.await;
-    };
-    let (output, after) = with_same_record_commits(work).await;
-    let output = output?;
-    after.publish_now().await;
-    enclosing.extend(after);
-    Ok(output)
-}
-
-/// Publish now the rows of the writes the enclosing [`with_same_record_commits`]
-/// holds for after its commit, for a later write of the same scope that must
-/// read them and cannot wait for that commit. Their metastore changes still
-/// commit in the scope's one record. A no-op outside such a scope.
-pub(crate) async fn publish_held_writes_now() {
-    if let Ok(after) = AFTER_COMMIT.try_with(Arc::clone) {
-        after.publish_now().await;
-    }
-}
-
 /// Whether the current task is inside [`with_same_record_commits`]: its owner,
 /// not the write, commits the write's metastore changes, and the write leaves
 /// its in-memory publish for after that commit ([`publish_after_commit`]).
@@ -535,7 +520,13 @@ pub async fn with_deferred_commits<F: std::future::Future>(work: F) -> F::Output
 /// objects) comes back undone: run it with [`AfterCommit::run`] only after that
 /// `commit_pending` succeeds.
 pub async fn with_same_record_commits<F: std::future::Future>(work: F) -> (F::Output, AfterCommit) {
-    let after = Arc::new(AfterCommit::default());
+    same_record_scope(Arc::new(AfterCommit::default()), work).await
+}
+
+async fn same_record_scope<F: std::future::Future>(
+    after: Arc<AfterCommit>,
+    work: F,
+) -> (F::Output, AfterCommit) {
     let output = DEFERRED_COMMITS
         .scope(
             CommitScope::SameRecord,
@@ -1594,47 +1585,80 @@ pub trait CatalogFactory: Send + Sync {
 #[cfg(test)]
 mod after_commit_tests {
     use super::*;
-    use std::sync::atomic::{AtomicBool, Ordering};
 
-    /// A publish left for after the record's commit that a later write of the
-    /// scope runs early: `(published, abandoned)` once the scope's steps are
-    /// run after a commit (`committed`) or dropped because it failed.
-    async fn publish_early_then(committed: bool) -> (bool, bool) {
-        let published = Arc::new(AtomicBool::new(false));
-        let abandoned = Arc::new(AtomicBool::new(false));
-        let ((), after) = with_same_record_commits({
-            let published = Arc::clone(&published);
-            let abandoned = Arc::clone(&abandoned);
-            async move {
-                let left = publish_after_commit(
-                    Box::pin(async move { published.store(true, Ordering::SeqCst) }),
-                    Box::new(move || abandoned.store(true, Ordering::SeqCst)),
-                );
-                assert!(left.is_none(), "inside a scope the publish is left");
-                publish_held_writes_now().await;
-            }
+    /// Two publishes left by writes of one scope, the second by a later step
+    /// of the same write ([`AfterCommit::continue_scope`]): what each step saw
+    /// as its scope, and the events once the steps are run after a commit
+    /// (`committed`) or dropped because it failed.
+    async fn left_publishes_then(committed: bool) -> ((Option<u64>, Option<u64>), Vec<String>) {
+        let events = Arc::new(parking_lot::Mutex::new(Vec::new()));
+        let leave = |name: &'static str| {
+            let ran = Arc::clone(&events);
+            let abandoned = Arc::clone(&events);
+            let left = publish_after_commit(
+                Box::pin(async move { ran.lock().push(format!("published {name}")) }),
+                Box::new(move || abandoned.lock().push(format!("abandoned {name}"))),
+            );
+            assert!(left.is_none(), "inside a scope the publish is left");
+        };
+        let (first_scope, after) = with_same_record_commits(async {
+            leave("first");
+            events.lock().push("first written".to_string());
+            same_record_scope_id()
         })
         .await;
+        let (second_scope, later) = after
+            .continue_scope(async {
+                leave("second");
+                events.lock().push("second written".to_string());
+                same_record_scope_id()
+            })
+            .await;
+        after.extend(later);
+        events.lock().push("record committed or failed".to_string());
         if committed {
             after.run().await;
         } else {
             drop(after);
         }
-        (
-            published.load(Ordering::SeqCst),
-            abandoned.load(Ordering::SeqCst),
-        )
+        let events = events.lock().clone();
+        ((first_scope, second_scope), events)
     }
 
     #[tokio::test]
-    async fn a_publish_run_before_its_record_is_abandoned_if_the_record_does_not_commit() {
+    async fn a_scope_publishes_its_writes_in_order_only_after_its_record_commits() {
+        let (committed_scopes, committed) = left_publishes_then(true).await;
+        let (failed_scopes, failed) = left_publishes_then(false).await;
+        assert!(committed_scopes.0.is_some(), "a scope has an id");
         assert_eq!(
             (
-                publish_early_then(true).await,
-                publish_early_then(false).await
+                committed_scopes.0 == committed_scopes.1,
+                failed_scopes.0 == failed_scopes.1,
+                committed_scopes.0 == failed_scopes.0,
+                same_record_scope_id(),
             ),
-            ((true, false), (true, true)),
-            "(committed, not committed): (published, abandoned)"
+            (true, true, false, None),
+            "a continued scope keeps its id, another scope has its own, and no task outside one has any"
+        );
+        assert_eq!(
+            (committed, failed),
+            (
+                vec![
+                    "first written".to_string(),
+                    "second written".to_string(),
+                    "record committed or failed".to_string(),
+                    "published first".to_string(),
+                    "published second".to_string(),
+                ],
+                vec![
+                    "first written".to_string(),
+                    "second written".to_string(),
+                    "record committed or failed".to_string(),
+                    "abandoned first".to_string(),
+                    "abandoned second".to_string(),
+                ],
+            ),
+            "(committed, not committed): nothing is published before the record commits"
         );
     }
 }

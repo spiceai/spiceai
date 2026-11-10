@@ -860,11 +860,12 @@ impl CayenneCdcWrite {
             });
         };
         let rows = self.rows;
-        let publish = OneRecordPublish {
+        let mut publish = OneRecordPublish {
             table: table.clone_for_write_operations(),
             prepared_append,
             stats: self.stats.take(),
             validated_file_keys: std::mem::take(&mut self.validated_file_keys),
+            held: None,
         };
         // The tombstone commits active in the record that makes its replacement
         // live. Until the publish adds the replacement to the scanned
@@ -899,7 +900,14 @@ impl CayenneCdcWrite {
             .await;
         let catalog = Arc::clone(table.catalog());
 
-        if crate::catalog::commit_left_to_scope_owner() {
+        if let Some(scope) = crate::catalog::same_record_scope_id()
+            .filter(|_| crate::catalog::commit_left_to_scope_owner())
+        {
+            // Read before the record is buffered: from there until the step is
+            // left for the scope's owner below, nothing may suspend, or a
+            // cancelled caller would drop the prepared deletes the buffered
+            // record names.
+            let record_seq = table.sequence_high_water().await;
             // Buffered; the scope's owner commits it.
             if let Err(source) = catalog
                 .commit_publications(std::slice::from_ref(&publication))
@@ -908,6 +916,27 @@ impl CayenneCdcWrite {
                 prepared.retain_files_for_wal_recovery();
                 return Err(Error::Catalog { source });
             }
+            // A later write of the scope reads this one from the writer view:
+            // its keys are in the keyset now, the keys it tombstones count as
+            // tombstoned, and a delete need not wait for its publish.
+            if table.has_retention_delete_filters() {
+                table.clear_cached_pk_keyset();
+            } else {
+                table.record_file_pk_keys(&publish.validated_file_keys, record_seq);
+            }
+            publish.held = Some((
+                table.hold_unpublished(
+                    scope,
+                    UnpublishedKind::Staged {
+                        staging: publish.prepared_append.staging_snapshot_id().to_string(),
+                        tombstone: prepared.inlined_delete_id.is_some(),
+                    },
+                ),
+                table.hold_unpublished_key_deletes(UnpublishedKeyDeletes::superseded(
+                    &prepared.deleted_pk_i64,
+                    &prepared.deleted_row_keys,
+                )),
+            ));
             let state = Arc::new(ParkingMutex::new(Some((publish, prepared))));
             let run = {
                 let state = Arc::clone(&state);
@@ -1010,6 +1039,10 @@ struct OneRecordPublish {
     prepared_append: PreparedStagedAppend,
     stats: Option<Arc<ColumnStatsAccumulator>>,
     validated_file_keys: PkDigestSet,
+    /// Inside a same-record scope, until the publish: the write counted as its
+    /// scope's unpublished change, and the keys it tombstones held for later
+    /// writes ([`CayenneTableProvider::hold_unpublished`]).
+    held: Option<(HeldPublish, Option<UnpublishedKeyDeletesHold>)>,
 }
 
 impl OneRecordPublish {
@@ -1021,6 +1054,7 @@ impl OneRecordPublish {
             prepared_append,
             stats,
             validated_file_keys,
+            held,
         } = self;
         prepared.mark_catalog_committed();
         prepared_append.mark_final_key_files_committed();
@@ -1068,6 +1102,7 @@ impl OneRecordPublish {
             live_rows_delta,
             published_live_rows_delta,
         );
+        drop(held);
     }
 }
 
@@ -3196,17 +3231,33 @@ pub struct CayenneTableProvider {
     /// writes until it is reloaded, and until then readers see the rows from
     /// before the write.
     ///
-    /// Shared across writer clones.
-    inlined_entries_awaiting_publish: Arc<ParkingMutex<HashMap<String, Arc<InlinedData>>>>,
-    /// Writes (inline upserts, key deletes) whose catalog change is buffered in
-    /// a same-record scope ([`crate::catalog::with_same_record_commits`]) and
-    /// whose publish waits for that scope's commit. An inline write waits for
-    /// this to reach zero before it reads the inline view, a key delete before
-    /// it acts, and maintenance that rewrites the inline corpus defers while it
-    /// is not zero ([`Self::inline_changes_unpublished`]).
+    /// Each entry keeps one version per unpublished write that replaced it, in
+    /// the order those writes were made; readers see the first. Writes of one
+    /// same-record scope publish in that order, so once a write publishes,
+    /// readers see the entry as the next write found it: each step shows the
+    /// writes up to it, never part of a later one.
     ///
     /// Shared across writer clones.
-    held_publishes: Arc<tokio::sync::watch::Sender<u64>>,
+    inlined_entries_awaiting_publish: Arc<ParkingMutex<AwaitingInlinedEntries>>,
+    /// Writes (inline upserts, key deletes) whose catalog change is buffered in
+    /// a same-record scope ([`crate::catalog::with_same_record_commits`]) and
+    /// whose publish waits for that scope's commit, with each scope's staged
+    /// appends in the same wait. An inline write waits for other scopes' writes
+    /// to publish before it reads the inline view, a key delete before it acts,
+    /// and maintenance that rewrites the inline corpus defers while any write
+    /// waits ([`Self::inline_changes_unpublished`]). A later write of the same
+    /// scope reads the scope's own changes from the writer view instead
+    /// ([`Self::scope_has_unpublished_changes`]).
+    ///
+    /// Shared across writer clones.
+    held_publishes: Arc<tokio::sync::watch::Sender<UnpublishedScopes>>,
+    /// Keys that writes whose publish waits for their scope's commit tombstone,
+    /// by hold: the deletion index takes them only at the publish, while a later
+    /// upsert must treat them as tombstoned already (a re-insert over a
+    /// tombstone), as it would once they are published.
+    ///
+    /// Shared across writer clones.
+    unpublished_key_deletes: Arc<ParkingMutex<UnpublishedKeyDeleteHolds>>,
     /// Durable `published = 1` flips owed for tombstones in
     /// [`Self::inlined_locally_published`] but not yet persisted (cycle-4 lever
     /// b1★). Drained by (a) the NEXT staged batch's Stage-A folded transaction
@@ -7136,21 +7187,21 @@ impl CayenneTableProvider {
     /// inline tombstones, and inline writes waiting for their record's commit)
     /// to drain, up to `timeout`. Returns `false` on timeout — the caller turns
     /// that into its own structured error (a still-pending publish after the
-    /// window means a wedged Stage-B task). A caller inside the same-record
-    /// scope that holds such a publish cannot wait for that scope's commit, so
-    /// it publishes the scope's held writes first.
+    /// window means a wedged Stage-B task). A caller inside a same-record scope
+    /// waits only for the other scopes' changes: its own scope publishes after
+    /// the caller's record commits, and the caller reads those changes from the
+    /// writer view. A key tombstone the caller writes takes a sequence above
+    /// every earlier write of its scope, so it hides their rows of its keys as
+    /// it would once they publish.
     ///
     /// Callers must hold `write_lock`: it blocks new Stage-A commits, so the
     /// pending set can only shrink, while Stage-B needs only the visibility
     /// lock + listing fence and therefore completes under the held lock.
     pub(crate) async fn drain_inflight_staged_writes(&self, timeout: Duration) -> bool {
         let deadline = Instant::now() + timeout;
-        if crate::catalog::commit_left_to_scope_owner()
-            && (self.has_inflight_staging_appends() || self.inline_changes_unpublished())
+        while self.staging_appends_inflight_by_others()
+            || self.inline_changes_unpublished_by_others()
         {
-            crate::catalog::publish_held_writes_now().await;
-        }
-        while self.has_inflight_staging_appends() || self.inline_changes_unpublished() {
             if Instant::now() >= deadline {
                 return false;
             }
@@ -11938,7 +11989,8 @@ impl CayenneTableProvider {
             inlined_locally_published: Arc::new(ParkingMutex::new(HashSet::new())),
             inlined_tombstones_awaiting_publish: Arc::new(ParkingMutex::new(HashSet::new())),
             inlined_entries_awaiting_publish: Arc::new(ParkingMutex::new(HashMap::new())),
-            held_publishes: Arc::new(tokio::sync::watch::Sender::new(0)),
+            held_publishes: Arc::new(tokio::sync::watch::Sender::new(UnpublishedScopes::default())),
+            unpublished_key_deletes: Arc::new(ParkingMutex::new(Vec::new())),
             pending_durable_tombstone_flips: Arc::new(ParkingMutex::new(Vec::new())),
             pending_tombstone_deltas: Arc::new(
                 ParkingMutex::new(PendingTombstoneDeltas::default()),
@@ -14446,6 +14498,7 @@ impl CayenneTableProvider {
             ),
             inlined_entries_awaiting_publish: Arc::clone(&self.inlined_entries_awaiting_publish),
             held_publishes: Arc::clone(&self.held_publishes),
+            unpublished_key_deletes: Arc::clone(&self.unpublished_key_deletes),
             pending_durable_tombstone_flips: Arc::clone(&self.pending_durable_tombstone_flips),
             pending_tombstone_deltas: Arc::clone(&self.pending_tombstone_deltas),
             inlined_cache: Arc::clone(&self.inlined_cache),
@@ -16989,7 +17042,7 @@ impl CayenneTableProvider {
             // the WRITE fence, so read after the scans below, the rows of a checkpoint
             // landing in between would be in neither this snapshot list nor the
             // inline corpus — and their keys missing from the rebuilt index.
-            let inlined_batches = self.read_inlined_batches_if_present().await?;
+            let inlined_batches = self.keyset_inlined_batches().await?;
             // Wait-free Arc::clone — the inner HashMap is shared, not cloned.
             let protected_snapshots = self.protected_snapshots.load_full();
             let current_snapshot_id = self.get_current_snapshot_id();
@@ -17606,7 +17659,7 @@ impl CayenneTableProvider {
             // full rebuild captures them in, and for the same reasons — see
             // `load_existing_pk_index`.
             let staged_keys = self.snapshot_inflight_staged_pk_keys();
-            let inlined_batches = self.read_inlined_batches_if_present().await?;
+            let inlined_batches = self.keyset_inlined_batches().await?;
             let protected_snapshots = self.protected_snapshots.load_full();
             // Pin the snapshot dirs this path reads (the protected snapshots folded
             // by `extend_bloom_with_protected_and_inline` below) against the
@@ -18330,6 +18383,26 @@ impl CayenneTableProvider {
             } else {
                 None
             };
+        // Keys an earlier write tombstones whose publish waits for its scope's
+        // commit, which the deletion index does not hold yet.
+        let unpublished_deletes = if reinsert_over_tombstone.is_some() {
+            self.unpublished_key_deletes()
+        } else {
+            Vec::new()
+        };
+        // Whether the latest unpublished write naming this key deleted it: the
+        // key set may still hold it, as it held it before that delete.
+        let deleted_unpublished = |row_idx: usize, key: &[u8]| {
+            let int64 = int64_pk_array.map(|arr| arr.value(row_idx));
+            unpublished_deletes
+                .iter()
+                .rev()
+                .find(|keys| match int64 {
+                    Some(value) => keys.pk_i64.contains(&value),
+                    None => keys.row_keys.contains(key),
+                })
+                .is_some_and(|keys| keys.kind == UnpublishedKeyDeleteKind::Delete)
+        };
 
         // Route a key with NO live existence-index entry but a pending DELETE
         // tombstone through the on-conflict re-insert path so the new row gets an
@@ -18357,7 +18430,11 @@ impl CayenneTableProvider {
                     PkDeletionSnapshot::Int64Pk { tombstones } => {
                         if let Some(arr) = int64_pk_array {
                             let value = arr.value(row_idx);
-                            if tombstones.get(value).is_some() {
+                            if tombstones.get(value).is_some()
+                                || unpublished_deletes
+                                    .iter()
+                                    .any(|keys| keys.pk_i64.contains(&value))
+                            {
                                 deleted_pk_i64.push(value);
                                 deleted_inlined_pk_i64.push(value);
                                 *reinserted_over_tombstone += 1;
@@ -18365,7 +18442,11 @@ impl CayenneTableProvider {
                         }
                     }
                     PkDeletionSnapshot::RowConverterBased { tombstones } => {
-                        if tombstones.get(key).is_some() {
+                        if tombstones.get(key).is_some()
+                            || unpublished_deletes
+                                .iter()
+                                .any(|keys| keys.row_keys.contains(key))
+                        {
                             // Box::from once, then clone for the dual-list push (file + inline).
                             let row_key = bytes_key(key);
                             deleted_row_keys.push(row_key.clone());
@@ -18503,6 +18584,22 @@ impl CayenneTableProvider {
                     if let Some(existing) = existing {
                         match ctx.on_conflict {
                             OnConflict::DoNothingAll | OnConflict::DoNothing(_) => false,
+                            // A key an unpublished delete of the current write's
+                            // scope removed is a re-insert over that delete's
+                            // tombstone, as it is once the delete publishes and
+                            // the key set no longer holds it.
+                            OnConflict::Upsert(_) if deleted_unpublished(row_idx, key.as_ref()) => {
+                                probe_reinsert_over_tombstone(
+                                    row_idx,
+                                    key.as_ref(),
+                                    &mut deleted_pk_i64,
+                                    &mut deleted_inlined_pk_i64,
+                                    &mut deleted_row_keys,
+                                    &mut deleted_inlined_row_keys,
+                                    &mut reinserted_over_tombstone,
+                                );
+                                true
+                            }
                             OnConflict::Upsert(_) => {
                                 let is_inlined_conflict = matches!(existing, RowLocation::Inlined);
                                 match &self.pk_deletion_strategy {
@@ -19573,8 +19670,10 @@ impl CayenneTableProvider {
 
         // Use the generation-keyed cache to avoid a second metastore round-trip
         // and IPC re-decode on every upsert. The batches in each entry are
-        // already deletion-map-filtered, so we skip that step here.
-        let view = self.cached_inlined_view().await?;
+        // already deletion-map-filtered, so we skip that step here. A write
+        // after an unpublished one of its own scope reads the writer view,
+        // which holds that write's entries and rewrites.
+        let view = self.writer_inlined_view().await?;
         if view.is_empty() {
             return Ok(InlinedDataRewrite::default());
         }
@@ -19899,7 +19998,7 @@ impl CayenneTableProvider {
         &self,
         file_delete: Option<super::delete::PreparedDeletionPublish>,
         inline_rewrite: &InlinedDataRewrite,
-        awaiting_publish: &[String],
+        awaiting_publish: &HeldInlinedEntries,
     ) {
         let _visibility = self.visibility_lock_arc().lock_owned().await;
         let _fence = self.lock_listing_fence_write_owned().await;
@@ -33214,10 +33313,16 @@ impl CayenneTableProvider {
             } => !cached_deleted_row_ids.load().is_empty(),
             PkDeletionStrategyWithCache::Int64Pk {
                 deletion_snapshot, ..
-            } => deletion_snapshot.load().tombstones.has_deletions(),
+            } => {
+                deletion_snapshot.load().tombstones.has_deletions()
+                    || self.has_unpublished_key_deletes()
+            }
             PkDeletionStrategyWithCache::RowConverterBased {
                 deletion_snapshot, ..
-            } => deletion_snapshot.load().tombstones.has_deletions(),
+            } => {
+                deletion_snapshot.load().tombstones.has_deletions()
+                    || self.has_unpublished_key_deletes()
+            }
         }
     }
 
@@ -35214,23 +35319,22 @@ impl CayenneTableProvider {
     /// what follows it, once the write's catalog change has committed: now when
     /// it has, or, inside a same-record scope, after the scope's owner commits
     /// the record that holds it. Until then `held_publishes` counts it, so
-    /// inline writes and key deletes wait for it and inline maintenance defers. If the
-    /// owner never runs it, its record's fate is unknown here: the table refuses
-    /// work until it is reloaded, and readers keep seeing the rows from before
-    /// the write.
+    /// other scopes' inline writes and key deletes wait for it and inline
+    /// maintenance defers, while later writes of its own scope read it from the
+    /// writer view. If the owner never runs it, its record's fate is unknown
+    /// here: the table refuses work until it is reloaded, and readers keep
+    /// seeing the rows from before the write.
     pub(crate) async fn publish_when_committed(
         &self,
         publish: impl std::future::Future<Output = ()> + Send + 'static,
     ) {
-        if !crate::catalog::commit_left_to_scope_owner() {
+        let Some(scope) = crate::catalog::same_record_scope_id()
+            .filter(|_| crate::catalog::commit_left_to_scope_owner())
+        else {
             publish.await;
             return;
-        }
-        self.held_publishes.send_modify(|count| *count += 1);
-        let release = Arc::new(HeldPublish {
-            count: Arc::clone(&self.held_publishes),
-            released: AtomicBool::new(false),
-        });
+        };
+        let release = Arc::new(self.hold_unpublished(scope, UnpublishedKind::Publish));
         let run = {
             let release = ReleaseHeldPublish(Arc::clone(&release));
             Box::pin(async move {
@@ -35252,21 +35356,40 @@ impl CayenneTableProvider {
         }
     }
 
-    /// Wait until no write's publish waits for its commit, so a write that
-    /// reads the inline view sees every change before its own. A
-    /// write of the scope that holds such a publish cannot wait for its commit,
-    /// so it publishes the scope's held writes now instead.
+    /// Count a change of `scope` whose publish waits for the scope's commit,
+    /// until the returned hold is released.
+    pub(crate) fn hold_unpublished(&self, scope: u64, kind: UnpublishedKind) -> HeldPublish {
+        self.held_publishes
+            .send_modify(|scopes| scopes.add(scope, &kind));
+        HeldPublish {
+            scopes: Arc::clone(&self.held_publishes),
+            scope,
+            kind: ParkingMutex::new(Some(kind)),
+        }
+    }
+
+    /// Whether the current task's same-record scope has a change to this
+    /// table that is buffered and not yet published: a later write of the
+    /// scope then reads from the writer view, which holds it, and not from
+    /// what readers see.
+    pub(crate) fn scope_has_unpublished_changes(&self) -> bool {
+        crate::catalog::same_record_scope_id()
+            .is_some_and(|scope| self.held_publishes.borrow().holds(scope))
+    }
+
+    /// Wait until no other same-record scope has a write whose publish waits
+    /// for its commit, so a write that reads the inline view sees every
+    /// change before its own. Changes of the current task's own scope stay
+    /// unpublished; that write reads them from the writer view.
     async fn wait_for_held_publishes(&self) -> Result<()> {
-        if *self.held_publishes.borrow() == 0 {
+        let scope = crate::catalog::same_record_scope_id();
+        if self.held_publishes.borrow().publishes_of_others(scope) == 0 {
             return Ok(());
         }
-        if crate::catalog::commit_left_to_scope_owner() {
-            crate::catalog::publish_held_writes_now().await;
-        }
-        let mut count = self.held_publishes.subscribe();
+        let mut scopes = self.held_publishes.subscribe();
         match tokio::time::timeout(
             STAGED_WRITE_DRAIN_TIMEOUT,
-            count.wait_for(|count| *count == 0),
+            scopes.wait_for(|scopes| scopes.publishes_of_others(scope) == 0),
         )
         .await
         {
@@ -35286,7 +35409,7 @@ impl CayenneTableProvider {
     /// in-memory deletion index, so a compaction that ran now would rewrite
     /// rows those deletes hide; compaction declines meanwhile.
     pub(crate) fn has_held_publishes(&self) -> bool {
-        *self.held_publishes.borrow() > 0
+        self.held_publishes.borrow().publishes > 0
     }
 
     /// Whether a change is committed or buffered but not yet published: a staged
@@ -35296,41 +35419,106 @@ impl CayenneTableProvider {
         self.pending_inline_tombstones.load(Ordering::Acquire) > 0 || self.has_held_publishes()
     }
 
+    /// [`Self::inline_changes_unpublished`], leaving out the changes of the
+    /// current task's own same-record scope, which its later writes read from
+    /// the writer view.
+    fn inline_changes_unpublished_by_others(&self) -> bool {
+        let scope = crate::catalog::same_record_scope_id();
+        let scopes = self.held_publishes.borrow();
+        let own_tombstones = scopes.tombstones_of(scope);
+        self.pending_inline_tombstones.load(Ordering::Acquire) > own_tombstones
+            || scopes.publishes_of_others(scope) > 0
+    }
+
+    /// Whether an append staged by another scope (or by a write outside every
+    /// scope) has not yet published.
+    fn staging_appends_inflight_by_others(&self) -> bool {
+        let scope = crate::catalog::same_record_scope_id();
+        let scopes = self.held_publishes.borrow();
+        self.inflight_staging_appends
+            .lock()
+            .keys()
+            .any(|staging| !scopes.stages(scope, staging))
+    }
+
+    /// Keep `keys`, which a write whose publish waits for its scope's commit
+    /// tombstones, in [`Self::unpublished_key_deletes`] until the returned
+    /// hold drops. `None` when there are no keys.
+    pub(crate) fn hold_unpublished_key_deletes(
+        &self,
+        keys: UnpublishedKeyDeletes,
+    ) -> Option<UnpublishedKeyDeletesHold> {
+        if keys.is_empty() {
+            return None;
+        }
+        let id = NEXT_UNPUBLISHED_HOLD.fetch_add(1, Ordering::Relaxed);
+        self.unpublished_key_deletes
+            .lock()
+            .push((id, Arc::new(keys)));
+        Some(UnpublishedKeyDeletesHold {
+            holds: Arc::clone(&self.unpublished_key_deletes),
+            id,
+        })
+    }
+
+    /// The keys of [`Self::unpublished_key_deletes`], for a re-insert check.
+    pub(crate) fn unpublished_key_deletes(&self) -> Vec<Arc<UnpublishedKeyDeletes>> {
+        self.unpublished_key_deletes
+            .lock()
+            .iter()
+            .map(|(_, keys)| Arc::clone(keys))
+            .collect()
+    }
+
+    fn has_unpublished_key_deletes(&self) -> bool {
+        !self.unpublished_key_deletes.lock().is_empty()
+    }
+
     /// Serve `replaced` to inline-view rebuilds in place of the catalog's
-    /// versions until [`Self::release_replaced_inlined_entries`]. Returns their ids.
+    /// versions until [`Self::release_replaced_inlined_entries`]. An entry an
+    /// earlier unpublished write already replaced keeps that write's version
+    /// first.
     pub(crate) fn hold_replaced_inlined_entries(
         &self,
         replaced: &[Arc<InlinedData>],
-    ) -> Vec<String> {
+    ) -> HeldInlinedEntries {
         if replaced.is_empty() {
-            return Vec::new();
+            return HeldInlinedEntries::default();
         }
+        let holder = NEXT_UNPUBLISHED_HOLD.fetch_add(1, Ordering::Relaxed);
         let mut awaiting = self.inlined_entries_awaiting_publish.lock();
-        replaced
+        let ids = replaced
             .iter()
             .map(|entry| {
                 awaiting
                     .entry(entry.inlined_id.clone())
-                    .or_insert_with(|| Arc::clone(entry));
+                    .or_default()
+                    .push((holder, Arc::clone(entry)));
                 entry.inlined_id.clone()
             })
-            .collect()
+            .collect();
+        HeldInlinedEntries { holder, ids }
     }
 
-    pub(crate) fn release_replaced_inlined_entries(&self, ids: &[String]) {
-        if ids.is_empty() {
+    pub(crate) fn release_replaced_inlined_entries(&self, held: &HeldInlinedEntries) {
+        if held.ids.is_empty() {
             return;
         }
         let mut awaiting = self.inlined_entries_awaiting_publish.lock();
-        for id in ids {
-            awaiting.remove(id);
+        for id in &held.ids {
+            if let Some(versions) = awaiting.get_mut(id) {
+                versions.retain(|(holder, _)| *holder != held.holder);
+                if versions.is_empty() {
+                    awaiting.remove(id);
+                }
+            }
         }
     }
 
     /// `entries`, read from the catalog, as readers see them: an entry an
     /// unpublished inline write rewrote or removed is served as it was before
-    /// that write. Only entries above `above_sequence` are considered, as the
-    /// catalog read was.
+    /// the first such write. Only entries above `above_sequence` are
+    /// considered, as the catalog read was.
     fn with_replaced_inlined_entries(
         &self,
         mut entries: Vec<InlinedData>,
@@ -35340,16 +35528,20 @@ impl CayenneTableProvider {
         if awaiting.is_empty() {
             return entries;
         }
+        let first = |id: &str| awaiting.get(id).and_then(|versions| versions.first());
         let mut seen = HashSet::new();
         for entry in &mut entries {
-            if let Some(original) = awaiting.get(&entry.inlined_id) {
+            if let Some((_, original)) = first(&entry.inlined_id) {
                 *entry = InlinedData::clone(original);
                 seen.insert(entry.inlined_id.clone());
             }
         }
         let mut restored = false;
-        for (id, original) in awaiting.iter() {
-            if !seen.contains(id) && original.sequence_number > above_sequence {
+        for (id, versions) in awaiting.iter() {
+            if let Some((_, original)) = versions.first()
+                && !seen.contains(id)
+                && original.sequence_number > above_sequence
+            {
                 entries.push(InlinedData::clone(original));
                 restored = true;
             }
@@ -35358,6 +35550,34 @@ impl CayenneTableProvider {
             entries.sort_by_key(|entry| entry.sequence_number);
         }
         entries
+    }
+
+    /// The inline view a write reads to rewrite the entries holding keys it
+    /// replaces. Inside a same-record scope with changes of its own not yet
+    /// published, that is the catalog's buffered state with every tombstone it
+    /// holds applied: what readers see once the scope's earlier writes publish.
+    /// Elsewhere it is the view readers see.
+    async fn writer_inlined_view(&self) -> Result<Arc<Vec<Arc<InlinedViewEntry>>>> {
+        if !self.scope_has_unpublished_changes() {
+            return self.cached_inlined_view().await;
+        }
+        let entries = self
+            .catalog
+            .get_inlined_data(&self.table_metadata.table_id)
+            .await?;
+        if entries.is_empty() {
+            return Ok(Arc::new(Vec::new()));
+        }
+        let deletions = self
+            .load_inlined_deletion_maps_for(InlinedViewFor::Writer)
+            .await?;
+        let mut view = Vec::with_capacity(entries.len());
+        for entry in entries {
+            view.push(Arc::new(
+                self.decode_and_filter_inlined_entry(entry, &deletions)?,
+            ));
+        }
+        Ok(Arc::new(view))
     }
 
     /// Write small batches directly to the metastore, optionally atomically
@@ -35488,6 +35708,16 @@ impl CayenneTableProvider {
             }
         };
 
+        // Until the publish adds them to the deletion index, a later write
+        // treats the keys this write supersedes in files as tombstoned already.
+        let unpublished_deletes = if crate::catalog::commit_left_to_scope_owner() {
+            self.hold_unpublished_key_deletes(UnpublishedKeyDeletes::superseded(
+                file_deleted_pk_i64,
+                file_deleted_row_keys,
+            ))
+        } else {
+            None
+        };
         Ok(Some(InlinedWritePublish {
             table: self.clone_for_write(),
             total_rows,
@@ -35499,6 +35729,7 @@ impl CayenneTableProvider {
             has_file_deletions,
             batches: batches.to_vec(),
             awaiting_publish,
+            _unpublished_deletes: unpublished_deletes,
         }))
     }
 
@@ -35588,6 +35819,22 @@ impl CayenneTableProvider {
         // Cache miss: populate both `batches` and `view` together.
         self.populate_inlined_cache(current_gen).await?;
         Ok((*self.inlined_cache.load().batches).clone())
+    }
+
+    /// The inline rows a key-set rebuild folds in: inside a same-record scope
+    /// with changes of its own not yet published, the writer view, so the
+    /// scope's unpublished inline rows are in the key set its later writes
+    /// check; elsewhere the rows readers see.
+    async fn keyset_inlined_batches(&self) -> Result<Vec<RecordBatch>> {
+        if !self.scope_has_unpublished_changes() {
+            return self.read_inlined_batches_if_present().await;
+        }
+        Ok(self
+            .writer_inlined_view()
+            .await?
+            .iter()
+            .flat_map(|entry| entry.batches.iter().cloned())
+            .collect())
     }
 
     /// [`Self::read_inlined_batches`], skipped when the table holds no inline rows.
@@ -36116,6 +36363,14 @@ impl CayenneTableProvider {
     }
 
     async fn load_inlined_deletion_maps(&self) -> Result<InlinedDeletionMaps> {
+        self.load_inlined_deletion_maps_for(InlinedViewFor::Readers)
+            .await
+    }
+
+    async fn load_inlined_deletion_maps_for(
+        &self,
+        view: InlinedViewFor,
+    ) -> Result<InlinedDeletionMaps> {
         if self.pk_deletion_strategy.is_position_based() {
             return Ok(InlinedDeletionMaps::default());
         }
@@ -36176,9 +36431,11 @@ impl CayenneTableProvider {
         // The publish removes the id under the listing fence, where it records
         // a deferred-flip id in `inlined_locally_published`, so a rebuild applies
         // the tombstone exactly when the replacement is in the listing.
+        // A write of the scope that holds such a tombstone reads it as applied,
+        // as it will be once the scope's writes publish.
         let inlined_deletes: Vec<InlinedDelete> = {
             let awaiting = self.inlined_tombstones_awaiting_publish.lock();
-            if awaiting.is_empty() {
+            if awaiting.is_empty() || view == InlinedViewFor::Writer {
                 inlined_deletes
             } else {
                 inlined_deletes
@@ -38997,6 +39254,22 @@ impl CayenneTableProvider {
         // appear while it runs; wait for the ones already staged, whose publication takes
         // neither this lock nor `write_lock`.
         self.wait_for_staged_inline_tombstones().await?;
+        // The current task's own scope may still hold unpublished changes,
+        // which it publishes only after this checkpoint's caller commits. An
+        // empty tier has nothing to fold and returns below; folding a non-empty
+        // one would bake the inline corpus readers see, without those changes.
+        ensure!(
+            !self.scope_has_unpublished_changes()
+                || self
+                    .mem_tier
+                    .shards()
+                    .iter()
+                    .all(|shard| shard.load().is_empty()),
+            InternalSnafu {
+                table: self.table_metadata.table_name.clone(),
+                message: "A change-stream write found rows in the in-memory tier while its own earlier changes were unpublished, so it was not applied; retry it".to_string(),
+            }
+        );
         let checkpoint_start = Instant::now();
         // Capture the corpus to flush AND reserve this checkpoint's
         // snapshot_sequence ATOMICALLY under ALL shard `mem_tier_publish_locks`
@@ -40122,7 +40395,7 @@ impl CayenneTableProvider {
     /// would otherwise stall every checkpoint of the table without a word.
     async fn wait_for_staged_inline_tombstones(&self) -> Result<()> {
         let deadline = Instant::now() + STAGED_WRITE_DRAIN_TIMEOUT;
-        while self.inline_changes_unpublished() {
+        while self.inline_changes_unpublished_by_others() {
             if Instant::now() >= deadline {
                 return Err(Error::Internal {
                     table: self.table_metadata.table_name.clone(),
@@ -41259,6 +41532,15 @@ impl CayenneTableProvider {
         self.ensure_publication_outcome_known()?;
         // The flush clears every inline entry, including one a write whose
         // publish waits for its commit has buffered: that write publishes first.
+        // A flush inside the scope that holds such a write would bake the
+        // corpus readers see without it, so it is refused there.
+        ensure!(
+            !self.scope_has_unpublished_changes(),
+            InternalSnafu {
+                table: self.table_metadata.table_name.clone(),
+                message: "An inline flush ran inside a change-stream write whose earlier changes are unpublished, so it was not applied; retry it".to_string(),
+            }
+        );
         self.wait_for_held_publishes().await?;
         let batches = self.read_inlined_batches().await?;
         if batches.is_empty() {
@@ -41738,15 +42020,24 @@ impl CayenneTableProvider {
         }
 
         // Inline tombstones are keyed by primary key, so a table with none has none.
+        // The catalog's inline entries include the unpublished ones of the
+        // current task's scope; so do the tombstones a write of that scope reads.
+        let view = if self.scope_has_unpublished_changes() {
+            InlinedViewFor::Writer
+        } else {
+            InlinedViewFor::Readers
+        };
         let legacy_inlined_deletions = if position_based {
             InlinedDeletionMaps::default()
         } else {
-            self.load_inlined_deletion_maps().await.map_err(|e| {
-                datafusion_common::DataFusionError::Execution(format!(
-                    "Failed to read inlined delete metadata for delete on table {}: {e}",
-                    self.table_metadata.table_name
-                ))
-            })?
+            self.load_inlined_deletion_maps_for(view)
+                .await
+                .map_err(|e| {
+                    datafusion_common::DataFusionError::Execution(format!(
+                        "Failed to read inlined delete metadata for delete on table {}: {e}",
+                        self.table_metadata.table_name
+                    ))
+                })?
         };
 
         let coerced_filters = self.coerce_filters_for_inlined_delete(filters)?;
@@ -46520,7 +46811,10 @@ pub(crate) struct InlinedWritePublish {
     has_file_deletions: bool,
     batches: Vec<RecordBatch>,
     /// Entries readers see as they were until this publish.
-    awaiting_publish: Vec<String>,
+    awaiting_publish: HeldInlinedEntries,
+    /// The keys this write supersedes in files, held as tombstoned for later
+    /// writes until the publish puts them in the deletion index.
+    _unpublished_deletes: Option<UnpublishedKeyDeletesHold>,
 }
 
 impl InlinedWritePublish {
@@ -46536,7 +46830,8 @@ impl InlinedWritePublish {
             removed_rows: 0,
             has_file_deletions: false,
             batches: Vec::new(),
-            awaiting_publish: Vec::new(),
+            awaiting_publish: HeldInlinedEntries::default(),
+            _unpublished_deletes: None,
         }
     }
 
@@ -46603,19 +46898,134 @@ impl InlinedWritePublish {
     }
 }
 
-/// Counts one inline write in `held_publishes` until it publishes or
-/// is abandoned, whichever comes first.
-struct HeldPublish {
-    count: Arc<tokio::sync::watch::Sender<u64>>,
-    released: AtomicBool,
+/// Each inline entry replaced by unpublished writes: one version per write, by
+/// hold id, oldest first (see `inlined_entries_awaiting_publish`).
+type AwaitingInlinedEntries = HashMap<String, Vec<(u64, Arc<InlinedData>)>>;
+
+/// Keys of unpublished writes, by hold id, oldest first (see
+/// `unpublished_key_deletes`).
+type UnpublishedKeyDeleteHolds = Vec<(u64, Arc<UnpublishedKeyDeletes>)>;
+
+/// Source of the ids of [`HeldInlinedEntries`] and [`UnpublishedKeyDeletesHold`].
+static NEXT_UNPUBLISHED_HOLD: AtomicU64 = AtomicU64::new(1);
+
+/// A change of a same-record scope whose publish waits for the scope's commit.
+#[derive(Debug)]
+pub(crate) enum UnpublishedKind {
+    /// An inline upsert or a key delete, published after the commit.
+    Publish,
+    /// An append into a new protected snapshot, by its staging id, and whether
+    /// it wrote an inline tombstone (counted in `pending_inline_tombstones`
+    /// until its publish).
+    Staged { staging: String, tombstone: bool },
+}
+
+/// What one same-record scope has changed in a table and not yet published.
+#[derive(Debug, Default)]
+struct ScopeUnpublished {
+    publishes: u64,
+    staged: Vec<String>,
+    tombstones: u64,
+}
+
+impl ScopeUnpublished {
+    fn is_empty(&self) -> bool {
+        self.publishes == 0 && self.staged.is_empty() && self.tombstones == 0
+    }
+}
+
+/// The changes to a table that same-record scopes have buffered and not yet
+/// published, in all and by scope (see `held_publishes`).
+#[derive(Debug, Default)]
+pub(crate) struct UnpublishedScopes {
+    /// Inline upserts and key deletes of every scope.
+    publishes: u64,
+    by_scope: HashMap<u64, ScopeUnpublished>,
+}
+
+impl UnpublishedScopes {
+    fn add(&mut self, scope: u64, kind: &UnpublishedKind) {
+        let own = self.by_scope.entry(scope).or_default();
+        match kind {
+            UnpublishedKind::Publish => {
+                own.publishes += 1;
+                self.publishes += 1;
+            }
+            UnpublishedKind::Staged { staging, tombstone } => {
+                own.staged.push(staging.clone());
+                own.tombstones += u64::from(*tombstone);
+            }
+        }
+    }
+
+    fn remove(&mut self, scope: u64, kind: &UnpublishedKind) {
+        let Some(own) = self.by_scope.get_mut(&scope) else {
+            return;
+        };
+        match kind {
+            UnpublishedKind::Publish => {
+                own.publishes = own.publishes.saturating_sub(1);
+                self.publishes = self.publishes.saturating_sub(1);
+            }
+            UnpublishedKind::Staged { staging, tombstone } => {
+                if let Some(index) = own.staged.iter().position(|held| held == staging) {
+                    own.staged.swap_remove(index);
+                }
+                own.tombstones = own.tombstones.saturating_sub(u64::from(*tombstone));
+            }
+        }
+        if own.is_empty() {
+            self.by_scope.remove(&scope);
+        }
+    }
+
+    /// Whether `scope` has a change not yet published.
+    fn holds(&self, scope: u64) -> bool {
+        self.by_scope.contains_key(&scope)
+    }
+
+    /// The inline upserts and key deletes of scopes other than `scope`.
+    fn publishes_of_others(&self, scope: Option<u64>) -> u64 {
+        let own = scope
+            .and_then(|scope| self.by_scope.get(&scope))
+            .map_or(0, |own| own.publishes);
+        self.publishes.saturating_sub(own)
+    }
+
+    fn tombstones_of(&self, scope: Option<u64>) -> u64 {
+        scope
+            .and_then(|scope| self.by_scope.get(&scope))
+            .map_or(0, |own| own.tombstones)
+    }
+
+    /// Whether `staging` is an append of `scope` waiting for its commit.
+    fn stages(&self, scope: Option<u64>, staging: &str) -> bool {
+        scope
+            .and_then(|scope| self.by_scope.get(&scope))
+            .is_some_and(|own| own.staged.iter().any(|held| held == staging))
+    }
+}
+
+/// Counts one change of a scope in `held_publishes` until it publishes or is
+/// abandoned, whichever comes first.
+pub(crate) struct HeldPublish {
+    scopes: Arc<tokio::sync::watch::Sender<UnpublishedScopes>>,
+    scope: u64,
+    kind: ParkingMutex<Option<UnpublishedKind>>,
 }
 
 impl HeldPublish {
-    fn release(&self) {
-        if !self.released.swap(true, Ordering::AcqRel) {
-            self.count
-                .send_modify(|count| *count = count.saturating_sub(1));
+    pub(crate) fn release(&self) {
+        if let Some(kind) = self.kind.lock().take() {
+            self.scopes
+                .send_modify(|scopes| scopes.remove(self.scope, &kind));
         }
+    }
+}
+
+impl Drop for HeldPublish {
+    fn drop(&mut self) {
+        self.release();
     }
 }
 
@@ -46625,6 +47035,70 @@ impl Drop for ReleaseHeldPublish {
     fn drop(&mut self) {
         self.0.release();
     }
+}
+
+/// Whether a write's key tombstones delete their keys or supersede them.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) enum UnpublishedKeyDeleteKind {
+    /// A delete: the keys have no row once it publishes.
+    #[default]
+    Delete,
+    /// An upsert: the write holds a new row for each key.
+    Supersede,
+}
+
+/// Keys a write tombstones, by the table's key encoding.
+#[derive(Debug, Default)]
+pub(crate) struct UnpublishedKeyDeletes {
+    pub(crate) kind: UnpublishedKeyDeleteKind,
+    pub(crate) pk_i64: HashSet<i64>,
+    pub(crate) row_keys: HashSet<Box<[u8]>>,
+}
+
+impl UnpublishedKeyDeletes {
+    /// The keys an upsert supersedes.
+    pub(crate) fn superseded(pk_i64: &[i64], row_keys: &[Box<[u8]>]) -> Self {
+        Self {
+            kind: UnpublishedKeyDeleteKind::Supersede,
+            pk_i64: pk_i64.iter().copied().collect(),
+            row_keys: row_keys.iter().cloned().collect(),
+        }
+    }
+
+    fn is_empty(&self) -> bool {
+        self.pk_i64.is_empty() && self.row_keys.is_empty()
+    }
+}
+
+/// Keeps keys in the table's `unpublished_key_deletes` until dropped.
+pub(crate) struct UnpublishedKeyDeletesHold {
+    holds: Arc<ParkingMutex<UnpublishedKeyDeleteHolds>>,
+    id: u64,
+}
+
+impl Drop for UnpublishedKeyDeletesHold {
+    fn drop(&mut self) {
+        self.holds.lock().retain(|(id, _)| *id != self.id);
+    }
+}
+
+/// The inline entries one write replaced, held for readers until its publish
+/// ([`CayenneTableProvider::hold_replaced_inlined_entries`]).
+#[derive(Debug, Default)]
+pub(crate) struct HeldInlinedEntries {
+    holder: u64,
+    ids: Vec<String>,
+}
+
+/// Whose view of the inline tombstones a read builds.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum InlinedViewFor {
+    /// What queries see: a tombstone whose replacement is not yet published
+    /// does not apply.
+    Readers,
+    /// What a write of a same-record scope sees: every tombstone the catalog
+    /// holds, its scope's unpublished ones included.
+    Writer,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
