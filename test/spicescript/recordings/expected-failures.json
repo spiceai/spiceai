@@ -614,7 +614,7 @@
   "debezium-offset-recovery": [
     {
       "run": "debezium-offset-recovery",
-      "who": "default",
+      "who": "as-written",
       "key": "query: SELECT * FROM acct #2",
       "kind": "wrong-answer",
       "signature": "answer differs from the expected one: (DataMismatch|RowCountMismatch) \\{",
@@ -897,7 +897,17 @@
   "http-caching-keys": [
     {
       "run": "http-caching-keys",
-      "who": "default",
+      "who": "as-written",
+      "key": "source-query: {\"api\":\"count /v1/missing\"} #2",
+      "kind": "other",
+      "signature": "the source answered \\[\\[Some\\(\"(\\d+|<n>)\"\\)\\]\\], expected \\[\\[Some\\(\"(3|<n>)\"\\)\\]\\]",
+      "pattern": "the source answered \\[\\[Some\\(\"(\\d+|<n>)\"\\)\\]\\], expected \\[\\[Some\\(\"(3|<n>)\"\\)\\]\\]",
+      "group": "caching-http",
+      "may-pass": true
+    },
+    {
+      "run": "http-caching-keys",
+      "who": "object-native",
       "key": "source-query: {\"api\":\"count /v1/missing\"} #2",
       "kind": "other",
       "signature": "the source answered \\[\\[Some\\(\"(\\d+|<n>)\"\\)\\]\\], expected \\[\\[Some\\(\"(3|<n>)\"\\)\\]\\]",
@@ -1669,7 +1679,7 @@
   "postgres-cdc-atomicity": [
     {
       "run": "postgres-cdc-atomicity",
-      "who": "default",
+      "who": "as-written",
       "key": "query: SELECT count(*) AS n FROM by_changes",
       "kind": "wrong-answer",
       "signature": "answer differs from the expected one: DataMismatch \\{ column: \"n\", row_number: 1, expected: .*1000.*, actual: ",
@@ -1679,7 +1689,7 @@
     },
     {
       "run": "postgres-cdc-atomicity",
-      "who": "default",
+      "who": "as-written",
       "key": "stop-background: read-changes",
       "kind": "other",
       "signature": "<n> of <m> iterations failed; first: invariant broken: n = above expected Some(\"1000\")",
@@ -2170,7 +2180,7 @@
   "postgres-write-back-outage": [
     {
       "run": "postgres-write-back-outage",
-      "who": "default",
+      "who": "as-written",
       "key": "query: SELECT count(*), sum(balance) FROM accounts #2",
       "kind": "wrong-answer",
       "signature": "(RowCountMismatch \\{ expected: 101, actual: 100 \\}|DataMismatch \\{ column: \"count\\(\\*\\)\", row_number: 1, expected: .*101.*, actual: .*100)",
@@ -2180,7 +2190,7 @@
     },
     {
       "run": "postgres-write-back-outage",
-      "who": "default",
+      "who": "as-written",
       "key": "query: SELECT * FROM accounts #2",
       "kind": "wrong-answer",
       "signature": "(RowCountMismatch \\{ expected: 101, actual: 100 \\}|DataMismatch \\{ column: \"count\\(\\*\\)\", row_number: 1, expected: .*101.*, actual: .*100)",
@@ -2190,7 +2200,7 @@
     },
     {
       "run": "postgres-write-back-outage",
-      "who": "default",
+      "who": "as-written",
       "key": "query: SELECT * FROM accounts #3",
       "kind": "wrong-answer",
       "signature": "(RowCountMismatch \\{ expected: 101, actual: 100 \\}|DataMismatch \\{ column: \"count\\(\\*\\)\", row_number: 1, expected: .*101.*, actual: .*100)",
@@ -2200,7 +2210,7 @@
     },
     {
       "run": "postgres-write-back-outage",
-      "who": "default",
+      "who": "as-written",
       "key": "query: SELECT count(*), sum(balance) FROM accounts #3",
       "kind": "wrong-answer",
       "signature": "(RowCountMismatch \\{ expected: 101, actual: 100 \\}|DataMismatch \\{ column: \"count\\(\\*\\)\", row_number: 1, expected: .*101.*, actual: .*100)",
@@ -2210,7 +2220,7 @@
     },
     {
       "run": "postgres-write-back-outage",
-      "who": "default",
+      "who": "as-written",
       "key": "query: SELECT * FROM accounts #4",
       "kind": "wrong-answer",
       "signature": "(RowCountMismatch \\{ expected: 101, actual: 100 \\}|DataMismatch \\{ column: \"count\\(\\*\\)\", row_number: 1, expected: .*101.*, actual: .*100)",
