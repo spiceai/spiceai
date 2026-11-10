@@ -199,9 +199,10 @@ impl CayenneChangeSinkBackend {
         if !same_record {
             return self.apply_cdc_groups(batch, options, ctx).await;
         }
-        let mut write =
+        let (write, deletes) =
             cayenne::catalog::with_same_record_commits(self.apply_cdc_groups(batch, options, ctx))
-                .await?;
+                .await;
+        let mut write = write?;
         let catalog = Arc::clone(self.table.catalog());
         let table_id = self.table.table_id().to_string();
         // A write kept in the in-memory tier is not durable yet; its checkpoint
@@ -209,22 +210,29 @@ impl CayenneChangeSinkBackend {
         let durable = write.durability == StorageDurability::Durable;
         let finalizer = write.finalizer.take();
         write.finalizer = Some(Box::pin(async move {
-            cayenne::catalog::with_same_record_commits(async move {
-                if let Some(finalizer) = finalizer {
-                    finalizer.await?;
-                }
-                if durable {
-                    for position in positions {
-                        position.await.map_err(DataFusionError::External)?;
+            let (finished, finalize_deletes) =
+                cayenne::catalog::with_same_record_commits(async move {
+                    if let Some(finalizer) = finalizer {
+                        finalizer.await?;
                     }
-                }
-                Ok::<(), DataFusionError>(())
-            })
-            .await?;
+                    if durable {
+                        for position in positions {
+                            position.await.map_err(DataFusionError::External)?;
+                        }
+                    }
+                    Ok::<(), DataFusionError>(())
+                })
+                .await;
+            finished?;
+            deletes.extend(finalize_deletes);
             catalog
                 .commit_pending_for(&table_id)
                 .await
-                .map_err(|error| DataFusionError::External(Box::new(error)))
+                .map_err(|error| DataFusionError::External(Box::new(error)))?;
+            // Staging objects the write no longer needs go only now that the
+            // record naming its files has committed.
+            deletes.run().await;
+            Ok(())
         }));
         Ok(write)
     }
