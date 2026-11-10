@@ -92,7 +92,12 @@ use object_store::{
 /// [`UpdateVersion`]: object_store::UpdateVersion
 pub struct LocalConditionalPut {
     inner: Arc<LocalFileSystem>,
+    /// The directory object keys are relative to: the store's directory, or
+    /// `/` for a store keyed by absolute paths.
     root: PathBuf,
+    /// The store's directory: it holds the root lock, and a put syncs the
+    /// directories it created up to it.
+    base: PathBuf,
     durable: bool,
     /// The queue the workers publish from.
     writes: Arc<WriteQueue>,
@@ -271,10 +276,16 @@ fn publication_lock_path(root: &std::path::Path, location: &Path) -> PathBuf {
 /// Runs on its own thread with blocking filesystem calls. The lock and
 /// publication have one owner, even when the caller drops its future or shuts
 /// its runtime down. Closing the queue drains accepted writes and exits.
-fn write_worker(root: &std::path::Path, durable: bool, queue: &WriteQueue) {
+fn write_worker(
+    root: &std::path::Path,
+    base: &std::path::Path,
+    durable: bool,
+    queue: &WriteQueue,
+) {
     while let Some((directory, request)) = queue.take() {
         let result = publish(
             root,
+            base,
             durable,
             &request.location,
             &request.path,
@@ -472,6 +483,7 @@ fn stamp(
 /// Port any change to that function, such as an fsync option, here too.
 fn publish(
     root: &std::path::Path,
+    base: &std::path::Path,
     durable: bool,
     location: &Path,
     path: &std::path::Path,
@@ -486,7 +498,7 @@ fn publish(
     // locks only the root file, exclusively; holding it shared excludes that
     // process while writers to other directories publish in parallel.
     // Reversing this order can deadlock with a writer that still uses it.
-    let legacy_guard = open_lock_file(&root.join(".spice-object-store-occ.lock"))?;
+    let legacy_guard = open_lock_file(&base.join(".spice-object-store-occ.lock"))?;
     legacy_guard.lock_shared().map_err(worker_error)?;
     let directory_guard = lock_file(&publication_lock_path(root, location))?;
     // `LocalFileSystem` reports a directory at an object's path as no object.
@@ -568,7 +580,7 @@ fn publish(
         }
     })?;
     if durable {
-        sync_directories(root, path, created_parent)?;
+        sync_directories(base, path, created_parent)?;
     }
     Ok(PutResult {
         e_tag: Some(local_etag(&written, modified)),
@@ -579,7 +591,7 @@ fn publish(
 impl std::fmt::Debug for LocalConditionalPut {
     fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
         f.debug_struct("LocalConditionalPut")
-            .field("root", &self.root)
+            .field("root", &self.base)
             .finish_non_exhaustive()
     }
 }
@@ -595,7 +607,9 @@ impl LocalConditionalPut {
     /// Returns an error if the `LocalFileSystem` cannot be initialized
     /// (e.g. `root` does not exist or is not a directory).
     pub fn new(root: impl Into<PathBuf>) -> Result<Self, ObjectStoreError> {
-        Self::with_durability(root, false)
+        let root = root.into();
+        let inner = LocalFileSystem::new_with_prefix(&root)?;
+        Self::with_layout(inner, root.clone(), root, false)
     }
 
     /// Creates a `LocalConditionalPut` whose puts survive power loss: each
@@ -606,19 +620,49 @@ impl LocalConditionalPut {
     ///
     /// As [`LocalConditionalPut::new`].
     pub fn new_durable(root: impl Into<PathBuf>) -> Result<Self, ObjectStoreError> {
-        Self::with_durability(root, true)
+        let root = root.into();
+        let inner = LocalFileSystem::new_with_prefix(&root)?;
+        Self::with_layout(inner, root.clone(), root, true)
     }
 
-    fn with_durability(root: impl Into<PathBuf>, durable: bool) -> Result<Self, ObjectStoreError> {
-        let root = root.into();
-        let inner = Arc::new(LocalFileSystem::new_with_prefix(&root)?);
+    /// A durable store over directory `directory` whose object keys are
+    /// absolute paths without the leading `/`, as the paths of `file://` URLs
+    /// are: `var/spice/state/cayenne/v1/head` for `/var/spice/state/cayenne/v1/head`.
+    /// A local location is then keyed as an S3 store is keyed from its bucket's
+    /// root, so a `file://` URL under it names the same object an `s3://` URL
+    /// under a bucket names. `directory` holds the store's root lock, and a put
+    /// syncs the directories it created up to `directory`. Keep the keys under
+    /// `directory`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the store's writers cannot be started.
+    pub fn new_durable_keyed_by_absolute_path(
+        directory: impl Into<PathBuf>,
+    ) -> Result<Self, ObjectStoreError> {
+        Self::with_layout(
+            LocalFileSystem::new(),
+            PathBuf::from("/"),
+            directory.into(),
+            true,
+        )
+    }
+
+    fn with_layout(
+        inner: LocalFileSystem,
+        root: PathBuf,
+        base: PathBuf,
+        durable: bool,
+    ) -> Result<Self, ObjectStoreError> {
+        let inner = Arc::new(inner);
         let writes = Arc::new(WriteQueue::default());
         for worker in 0..WRITE_WORKERS {
             let worker_root = root.clone();
+            let worker_base = base.clone();
             let queue = Arc::clone(&writes);
             let spawned = std::thread::Builder::new()
                 .name(format!("local-state-writer-{worker}"))
-                .spawn(move || write_worker(&worker_root, durable, &queue));
+                .spawn(move || write_worker(&worker_root, &worker_base, durable, &queue));
             if let Err(source) = spawned {
                 writes.close();
                 return Err(worker_error(source));
@@ -627,6 +671,7 @@ impl LocalConditionalPut {
         Ok(Self {
             inner,
             root,
+            base,
             durable,
             writes,
         })
@@ -642,7 +687,7 @@ impl Drop for LocalConditionalPut {
 impl Display for LocalConditionalPut {
     fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
         let mode = if self.durable { ", durable" } else { "" };
-        write!(f, "LocalConditionalPut({}{mode})", self.root.display())
+        write!(f, "LocalConditionalPut({}{mode})", self.base.display())
     }
 }
 
@@ -1493,6 +1538,68 @@ mod tests {
             stored <= SystemTime::now(),
             "stored {stored:?} is ahead of the clock"
         );
+    }
+
+    /// A store keyed by absolute paths writes the file the key names, keeps its
+    /// root lock in its directory rather than at `/`, and refuses a stale
+    /// conditional update as a store keyed from its directory does.
+    #[tokio::test]
+    async fn a_store_keyed_by_absolute_path_writes_where_the_key_names() {
+        let dir = tempfile::tempdir().expect("create temp dir");
+        let store = LocalConditionalPut::new_durable_keyed_by_absolute_path(dir.path())
+            .expect("create store");
+        let file = dir.path().join("cayenne/v1/head");
+        let key = Path::from_absolute_path(&file).expect("absolute key");
+        assert_eq!(
+            format!("/{key}"),
+            file.to_string_lossy(),
+            "the key is the absolute path without its leading slash"
+        );
+        let created = store
+            .put_opts(
+                &key,
+                b"v1".as_slice().into(),
+                PutOptions::from(PutMode::Create),
+            )
+            .await
+            .expect("create");
+        assert_eq!(std::fs::read(&file).expect("read the file"), b"v1");
+        assert!(
+            dir.path().join(".spice-object-store-occ.lock").is_file(),
+            "the root lock is in the store's directory"
+        );
+        store
+            .put_opts(
+                &key,
+                b"v2".as_slice().into(),
+                PutOptions::from(PutMode::Update(UpdateVersion {
+                    e_tag: created.e_tag.clone(),
+                    version: None,
+                })),
+            )
+            .await
+            .expect("update on the current version");
+        let stale = store
+            .put_opts(
+                &key,
+                b"v3".as_slice().into(),
+                PutOptions::from(PutMode::Update(UpdateVersion {
+                    e_tag: created.e_tag,
+                    version: None,
+                })),
+            )
+            .await;
+        assert!(
+            matches!(stale, Err(ObjectStoreError::Precondition { .. })),
+            "got {stale:?}"
+        );
+        let listed: Vec<_> = store
+            .list(Some(&Path::from_absolute_path(dir.path()).expect("prefix")))
+            .map_ok(|meta| meta.location)
+            .try_collect()
+            .await
+            .expect("list");
+        assert_eq!(listed, vec![key]);
     }
 
     /// A directory at an object's path is no object, as `LocalFileSystem`

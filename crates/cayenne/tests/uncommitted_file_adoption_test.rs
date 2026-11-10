@@ -258,7 +258,9 @@ impl Rig {
     async fn new() -> Self {
         let kind = std::env::var("CAYENNE_TEST_DATA_STORE").unwrap_or_else(|_| "local".into());
         let (raw, dir): (Arc<dyn ObjectStore>, Option<tempfile::TempDir>) = match kind.as_str() {
-            "" | "local" => {
+            // `local-location` runs on the same local directory store: this rig
+            // addresses its objects by `s3://` URLs, so its keys stay relative.
+            "" | "local" | "local-location" => {
                 let dir = tempfile::tempdir().expect("temp dir");
                 let store =
                     object_store_occ::local_conditional_put::LocalConditionalPut::new(dir.path())
@@ -267,7 +269,7 @@ impl Rig {
             }
             "memory" | "fault" => (Arc::new(object_store::memory::InMemory::new()), None),
             other => panic!(
-                "CAYENNE_TEST_DATA_STORE is '{other}'; this test runs on 'local', 'memory' or 'fault'"
+                "CAYENNE_TEST_DATA_STORE is '{other}'; this test runs on 'local', 'local-location', 'memory' or 'fault'"
             ),
         };
         let counting = Arc::new(CountingStore::new(Arc::clone(&raw)));
