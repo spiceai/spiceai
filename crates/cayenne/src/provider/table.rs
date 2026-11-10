@@ -50931,16 +50931,26 @@ mod tests {
     /// Releases `guard`, the caller's hold on the compaction lock taken before
     /// its writes, once nothing those writes queued can still run: the pending
     /// post-write maintenance is drained, its compaction pass has parked on the
-    /// held lock, and a manifest-rebuild retry it armed has finished. An explicit
+    /// held lock, and the manifest rebuild it skipped has run. An explicit
     /// maintenance call after this has the table to itself; without it, a pass
     /// the writes queued can take the lock or the tier first, and the explicit
     /// call declines.
+    ///
+    /// The skipped rebuild runs here, under the held lock, because the
+    /// manifest-rebuild retry it armed would otherwise run it once the lock is
+    /// free and then schedule a compaction pass, which would merge the tier the
+    /// caller is arranging. With the rebuild done the retry finds nothing
+    /// pending, takes no lock, and schedules nothing.
     async fn release_compaction_quiet<G>(provider: &CayenneTableProvider, guard: G) {
         provider
             .flush_pending_maintenance()
             .await
             .expect("drain pending post-write maintenance");
         park_post_write_compaction(provider).await;
+        provider
+            .manifest_rebuild_pending
+            .store(false, std::sync::atomic::Ordering::Release);
+        provider.rebuild_live_snapshot_manifests_if_admitted().await;
         drop(guard);
         provider
             .drain_in_flight_maintenance()
