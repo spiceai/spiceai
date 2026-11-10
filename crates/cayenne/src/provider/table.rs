@@ -848,9 +848,10 @@ impl CayenneCdcWrite {
     /// record commits here and the rows are published before this returns.
     async fn finish_in_one_record(mut self) -> Result<u64> {
         let table = self.table.clone_for_write_operations();
-        let (Some(prepared_append), Some(mut prepared)) =
-            (self.prepared_append.take(), self.prepared_on_conflict.take())
-        else {
+        let (Some(prepared_append), Some(mut prepared)) = (
+            self.prepared_append.take(),
+            self.prepared_on_conflict.take(),
+        ) else {
             return Err(Error::Internal {
                 table: table.table_name().to_string(),
                 message:
@@ -922,47 +923,58 @@ impl CayenneCdcWrite {
             return Ok(rows);
         }
 
-        let commit_start = Instant::now();
-        let committed = match catalog
-            .commit_publications(std::slice::from_ref(&publication))
-            .await
-        {
-            Ok(()) => {
-                crate::catalog::commit_at_acknowledgement_for(catalog.as_ref(), table.table_id())
-                    .await
-            }
-            Err(error) => Err(error),
-        };
-        if let Err(source) = committed {
-            match super::append_commit::resolve_failed_commit(
-                catalog.as_ref(),
-                &mut prepared,
-                Error::Catalog { source },
-            )
-            .await
+        // A task of its own, so cancelling the caller cannot drop the prepared
+        // deletes mid-commit: dropped armed, they delete deletion vectors a
+        // commit that landed names.
+        let table_name = table.table_name().to_string();
+        tokio::spawn(async move {
+            let commit_start = Instant::now();
+            let committed = match catalog
+                .commit_publications(std::slice::from_ref(&publication))
+                .await
             {
-                Ok(()) => {}
-                Err(failure) => {
-                    table.clear_cached_pk_keyset();
-                    if !failure.keep_files {
-                        // It did not commit: its deletion vectors go with
-                        // `prepared`, its data files here.
-                        drop(prepared);
-                        if let Err(error) = publish.prepared_append.rollback().await {
-                            tracing::debug!(
-                                table = table.table_name(),
-                                %error,
-                                "Deleting the files of a keyed write that did not commit failed; the orphan sweep reclaims them"
-                            );
+                Ok(()) => {
+                    crate::catalog::commit_at_acknowledgement_for(catalog.as_ref(), table.table_id())
+                        .await
+                }
+                Err(error) => Err(error),
+            };
+            if let Err(source) = committed {
+                match super::append_commit::resolve_failed_commit(
+                    catalog.as_ref(),
+                    &mut prepared,
+                    Error::Catalog { source },
+                )
+                .await
+                {
+                    Ok(()) => {}
+                    Err(failure) => {
+                        table.clear_cached_pk_keyset();
+                        if !failure.keep_files {
+                            // It did not commit: its deletion vectors go with
+                            // `prepared`, its data files here.
+                            drop(prepared);
+                            if let Err(error) = publish.prepared_append.rollback().await {
+                                tracing::debug!(
+                                    table = table.table_name(),
+                                    %error,
+                                    "Deleting the files of a keyed write that did not commit failed; the orphan sweep reclaims them"
+                                );
+                            }
                         }
+                        return Err(failure.error);
                     }
-                    return Err(failure.error);
                 }
             }
-        }
-        record_cayenne_write_phase(table.table_name(), "publish_commit", commit_start);
-        publish.run(prepared).await;
-        Ok(rows)
+            record_cayenne_write_phase(table.table_name(), "publish_commit", commit_start);
+            publish.run(prepared).await;
+            Ok(rows)
+        })
+        .await
+        .map_err(|source| Error::TaskPanicked {
+            table: table_name,
+            source,
+        })?
     }
 }
 

@@ -506,9 +506,7 @@ pub async fn with_deferred_commits<F: std::future::Future>(work: F) -> F::Output
 /// would do after one of its own commits (publish its rows, delete staging
 /// objects) comes back undone: run it with [`AfterCommit::run`] only after that
 /// `commit_pending` succeeds.
-pub async fn with_same_record_commits<F: std::future::Future>(
-    work: F,
-) -> (F::Output, AfterCommit) {
+pub async fn with_same_record_commits<F: std::future::Future>(work: F) -> (F::Output, AfterCommit) {
     let after = Arc::new(AfterCommit::default());
     let output = DEFERRED_COMMITS
         .scope(
