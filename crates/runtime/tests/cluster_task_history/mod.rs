@@ -18,7 +18,9 @@ limitations under the License.
 //!
 //! A scheduler's `runtime.task_history` combines its own rows with the rows its peer
 //! schedulers return from their `runtime.local_task_history`, so each peer must read its
-//! local table on the scheduler itself, whether or not it has executors.
+//! local table on the scheduler itself, whether or not it has executors. It also includes
+//! the rows of every executor in the cluster, whichever scheduler the executor started
+//! against.
 
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -33,7 +35,7 @@ use datafusion::common::TableReference;
 use futures::TryStreamExt;
 use runtime::auth::EndpointAuth;
 use runtime::cluster::ResolvedClusterConfig;
-use runtime::config::{ClusterConfig, ClusterRole, Config};
+use runtime::config::{ClusterConfig, Config, Role};
 use runtime::dataupdate::{DataUpdate, UpdateType};
 use runtime::{Result as RuntimeResult, Runtime};
 use rustls::crypto::{CryptoProvider, aws_lc_rs};
@@ -44,7 +46,7 @@ use tokio::time::{Instant, sleep};
 
 use crate::{
     configure_test_datafusion, init_tracing,
-    utils::{runtime_ready_check, test_request_context},
+    utils::{free_ports, runtime_ready_check, test_request_context},
 };
 
 /// A scheduler or executor running in this process.
@@ -55,19 +57,10 @@ struct Node {
     cluster_addr: String,
 }
 
-/// `N` distinct free ports. Every listener stays bound until all `N` are picked, so the
-/// operating system cannot return the same port twice.
-fn free_ports<const N: usize>() -> [u16; N] {
-    let listeners: [std::net::TcpListener; N] = std::array::from_fn(|_| {
-        std::net::TcpListener::bind("127.0.0.1:0").expect("bind ephemeral port")
-    });
-    listeners.map(|listener| listener.local_addr().expect("local addr").port())
-}
-
 async fn start_node(
     name: &str,
     pki: &PkiConfig,
-    role: ClusterRole,
+    role: Role,
     scheduler_address: Option<&str>,
     runtime: SpicepodRuntime,
 ) -> Result<Node, anyhow::Error> {
@@ -124,7 +117,7 @@ async fn start_scheduler(
         }),
         ..SpicepodRuntime::default()
     };
-    let scheduler = start_node(name, pki, ClusterRole::Scheduler, None, runtime).await?;
+    let scheduler = start_node(name, pki, Role::Scheduler, None, runtime).await?;
     Arc::clone(&scheduler.rt).load_components().await;
     runtime_ready_check(&scheduler.rt).await;
     Ok(scheduler)
@@ -153,7 +146,7 @@ async fn start_executor(
     let executor = start_node(
         name,
         pki,
-        ClusterRole::Executor,
+        Role::Executor,
         Some(&scheduler.cluster_addr),
         SpicepodRuntime::default(),
     )
@@ -168,14 +161,15 @@ async fn start_executor(
     Ok(executor)
 }
 
-/// Writes one `runtime.local_task_history` row with `trace_id` on `scheduler`.
-async fn seed_task_history(scheduler: &Node, trace_id: &str) -> Result<(), anyhow::Error> {
-    let table = TableReference::partial("runtime", "local_task_history");
-    let df = scheduler.rt.datafusion();
+/// Writes one row with `trace_id` to `node`'s `runtime.<table>`: `local_task_history` on a
+/// scheduler, `task_history` on an executor.
+async fn seed_task_history(node: &Node, table: &str, trace_id: &str) -> Result<(), anyhow::Error> {
+    let table = TableReference::partial("runtime", table);
+    let df = node.rt.datafusion();
     let schema = df
         .get_table(&table)
         .await
-        .ok_or_else(|| anyhow::Error::msg("runtime.local_task_history is not registered"))?
+        .ok_or_else(|| anyhow::Error::msg(format!("{table} is not registered")))?
         .schema();
     let now = i64::try_from(SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos())?;
     let columns = schema
@@ -184,9 +178,7 @@ async fn seed_task_history(scheduler: &Node, trace_id: &str) -> Result<(), anyho
         .map(|field| -> Result<ArrayRef, anyhow::Error> {
             Ok(match (field.name().as_str(), field.data_type()) {
                 ("trace_id", _) => Arc::new(StringArray::from(vec![trace_id])),
-                ("node_id", _) => {
-                    Arc::new(StringArray::from(vec![scheduler.cluster_addr.as_str()]))
-                }
+                ("node_id", _) => Arc::new(StringArray::from(vec![node.cluster_addr.as_str()])),
                 (_, DataType::Utf8) => Arc::new(StringArray::from(vec!["seed"])),
                 (_, DataType::Timestamp(_, tz)) => Arc::new(
                     TimestampNanosecondArray::from(vec![now]).with_timezone_opt(tz.clone()),
@@ -286,8 +278,8 @@ async fn run_task_history_across_schedulers() -> Result<(), anyhow::Error> {
         sleep(Duration::from_millis(100)).await;
     }
 
-    seed_task_history(&s1, "seed-scheduler1").await?;
-    seed_task_history(&s2, "seed-scheduler2").await?;
+    seed_task_history(&s1, "local_task_history", "seed-scheduler1").await?;
+    seed_task_history(&s2, "local_task_history", "seed-scheduler2").await?;
 
     // Schedulers find each other through heartbeats in the shared state.
     let expected = ["seed-scheduler1", "seed-scheduler2"];
@@ -317,11 +309,58 @@ async fn run_task_history_across_schedulers() -> Result<(), anyhow::Error> {
     Ok(())
 }
 
+/// The executor starts against scheduler 1. Scheduler 2's `runtime.task_history` must
+/// include the row seeded on the executor.
+async fn run_executor_task_history_on_peer_scheduler() -> Result<(), anyhow::Error> {
+    let _ = CryptoProvider::install_default(aws_lc_rs::default_provider());
+    configure_test_datafusion();
+
+    let pki_dir = tempfile::tempdir()?;
+    let state_dir = tempfile::tempdir()?;
+    let pki = init_pki(pki_dir.path()).map_err(anyhow::Error::msg)?;
+    let state_location = format!("file://{}", state_dir.path().display());
+
+    let s1 = start_scheduler("scheduler1", &pki, &state_location).await?;
+    let s2 = start_scheduler("scheduler2", &pki, &state_location).await?;
+    let executor = start_executor("executor", &pki, &s1).await?;
+    seed_task_history(&executor, "task_history", "seed-executor").await?;
+
+    // The executor finds scheduler 2 through scheduler 1's membership.
+    let expected = ["seed-executor"];
+    let start = Instant::now();
+    loop {
+        let from_s2 = seeded_trace_ids(&s2).await;
+        if matches!(&from_s2, Ok(ids) if *ids == expected) {
+            break;
+        }
+        if start.elapsed() > Duration::from_mins(2) {
+            anyhow::bail!(
+                "scheduler2 should return the row seeded on the executor of scheduler1; got {from_s2:?}"
+            );
+        }
+        sleep(Duration::from_millis(500)).await;
+    }
+
+    executor.handle.abort();
+    for scheduler in [s1, s2] {
+        scheduler.rt.shutdown().await;
+        scheduler.handle.abort();
+    }
+    Ok(())
+}
+
 #[tokio::test(flavor = "multi_thread")]
-#[cfg(not(target_os = "windows"))]
 async fn task_history_on_each_scheduler_includes_its_peer() -> Result<(), anyhow::Error> {
     let _tracing = init_tracing(Some("integration=debug,info"));
     test_request_context()
         .scope(async { run_task_history_across_schedulers().await })
+        .await
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn task_history_on_a_peer_scheduler_includes_the_executor() -> Result<(), anyhow::Error> {
+    let _tracing = init_tracing(Some("integration=debug,info"));
+    test_request_context()
+        .scope(async { run_executor_task_history_on_peer_scheduler().await })
         .await
 }

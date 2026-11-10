@@ -51,6 +51,15 @@ result-correctness = { max-threads = 1 }
 # Keep this group for local nextest runs too.
 github-api-tests = { max-threads = 1 }
 
+# The Hugging Face tests that download and load a local LLM with mistral.rs. Each
+# one downloads gigabytes of weights and loads them on the CPU or GPU of the
+# runner, so several at once compete for memory, disk and network, and each load
+# takes longer. `LOCAL_LLM_INIT_MUTEX` in `tests/models/hf.rs` loads one model at
+# a time under `cargo test`, where all tests share one process. nextest runs each
+# test in its own process, where that mutex holds back nothing, so this group
+# does the same job for nextest.
+local-llm-tests = { max-threads = 1 }
+
 # Correctness/convergence property tests: the accelerated table MUST converge to
 # the reference model on every run. These are deterministic correctness checks,
 # not best-effort work — so a retry that happens to pass only HIDES a real bug
@@ -152,6 +161,11 @@ slow-timeout = { period = "120s", terminate-after = 8 }
 # Hold every GitHub test to the `github-api-tests` group — see its definition
 # above for why the shared secondary rate limit makes parallelism self-defeating
 # here.
+# Load one local LLM at a time — see the `local-llm-tests` group above.
+[[profile.default.overrides]]
+filter = 'test(=models::hf::nsql::huggingface_test_nsql) | test(=models::hf::huggingface_test_chat_completion) | test(=models::hf::huggingface_test_gemma_chat_completion) | test(=models::hf::huggingface_test_gemma4_chat_completion)'
+test-group = 'local-llm-tests'
+
 [[profile.default.overrides]]
 filter = 'test(/^github::/)'
 test-group = 'github-api-tests'
@@ -175,6 +189,15 @@ retries = 0
 filter = 'test(=mysql::replication_e2e::mysql_binlog_replication_survives_a_dump_reconnect_cayenne) | test(=mysql::replication_e2e::mysql_binlog_replication_decodes_every_column_type_cayenne)'
 retries = 0
 slow-timeout = { period = "120s", terminate-after = 10 }
+
+# The `spice orca` test waits as long as the CLI itself may: up to 330s for the
+# Codex warning (the runtime's 120s health wait, Orca's 180s answer wait and 30s
+# between them), 90s for the project, then 30s each for Orca and the runtime to
+# stop, 480s in all. The global ceiling of 360s would kill it inside a wait the
+# CLI is still allowed to take. 600s keeps 1.25x headroom over the 480s.
+[[profile.default.overrides]]
+filter = 'test(=coding_agents::orca_runs_every_agent_through_spice_and_keeps_the_runtime_until_it_quits)'
+slow-timeout = { period = "120s", terminate-after = 5 }
 
 # Result-correctness parity lanes: Cayenne (and the Spice accelerators) against
 # standalone DuckDB/SQLite on the same rows. runtime's `result_correctness`

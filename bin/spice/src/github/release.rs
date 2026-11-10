@@ -289,6 +289,9 @@ fn format_size(bytes: u64) -> String {
 
 pub struct Arch(pub String);
 
+/// The runtime asset prefix. There is no Windows runtime asset.
+const RUNTIME_ASSET_PREFIX: &str = "spiced";
+
 pub enum SystemType {
     Linux(Arch),
     Darwin(Arch),
@@ -335,14 +338,6 @@ impl SystemType {
         }
     }
 
-    /// Get the runtime asset prefix for the current platform.
-    fn runtime_asset_prefix(&self) -> &str {
-        match self {
-            SystemType::Windows(_) => "spiced.exe",
-            _ => "spiced",
-        }
-    }
-
     /// Get the runtime asset names for the current platform.
     ///
     /// Returns a list of possible asset names to try, in order of preference.
@@ -354,17 +349,24 @@ impl SystemType {
     /// # Arguments
     /// * `flavor` - The flavor to install: "default" (auto-detect), or "cuda" (explicit CUDA)
     /// * `target_version` - The release tag (e.g. "v2.0.0-rc.1") to determine naming strategy
+    ///
+    /// Empty on Windows: no release publishes a native Windows runtime, which runs
+    /// under WSL or in Docker instead.
     pub fn runtime_asset_names(&self, flavor: &str, target_version: &str) -> Vec<String> {
+        if matches!(self, SystemType::Windows(_)) {
+            return Vec::new();
+        }
+
         let accelerator = match flavor {
             "cuda" => {
                 // Explicit CUDA request - try to detect CUDA version
-                #[cfg(any(target_os = "linux", target_os = "windows"))]
+                #[cfg(target_os = "linux")]
                 {
                     detect_cuda_accelerator()
                 }
-                #[cfg(not(any(target_os = "linux", target_os = "windows")))]
+                #[cfg(not(target_os = "linux"))]
                 {
-                    tracing::warn!("CUDA flavor is only supported on Linux and Windows");
+                    tracing::warn!("CUDA flavor is only supported on Linux");
                     None
                 }
             }
@@ -388,7 +390,7 @@ impl SystemType {
             // New naming (v1.11+/trunk): accelerator without "models_" prefix
             names.push(format!(
                 "{prefix}_{accel}_{os}_{arch}.tar.gz",
-                prefix = self.runtime_asset_prefix(),
+                prefix = RUNTIME_ASSET_PREFIX,
                 os = self.os_type_name(),
                 arch = self.arch()
             ));
@@ -398,7 +400,7 @@ impl SystemType {
             if !is_v2_or_later(target_version) {
                 names.push(format!(
                     "{prefix}_models_{accel}_{os}_{arch}.tar.gz",
-                    prefix = self.runtime_asset_prefix(),
+                    prefix = RUNTIME_ASSET_PREFIX,
                     os = self.os_type_name(),
                     arch = self.arch()
                 ));
@@ -408,7 +410,7 @@ impl SystemType {
         // Fallback: base runtime without accelerator
         names.push(format!(
             "{prefix}_{os}_{arch}.tar.gz",
-            prefix = self.runtime_asset_prefix(),
+            prefix = RUNTIME_ASSET_PREFIX,
             os = self.os_type_name(),
             arch = self.arch()
         ));
@@ -445,7 +447,7 @@ fn get_rust_arch() -> &'static str {
     std::env::consts::ARCH
 }
 
-/// Detect hardware accelerator (Metal on macOS, CUDA on Linux and Windows).
+/// Detect hardware accelerator (Metal on macOS, CUDA on Linux).
 fn detect_accelerator() -> Option<String> {
     #[cfg(target_os = "macos")]
     {
@@ -454,15 +456,18 @@ fn detect_accelerator() -> Option<String> {
         }
     }
 
-    #[cfg(any(target_os = "linux", target_os = "windows"))]
+    #[cfg(target_os = "linux")]
     {
-        return detect_cuda_accelerator();
+        detect_cuda_accelerator()
     }
 
-    None
+    #[cfg(not(target_os = "linux"))]
+    {
+        None
+    }
 }
 
-#[cfg(any(target_os = "linux", target_os = "windows"))]
+#[cfg(target_os = "linux")]
 fn detect_cuda_accelerator() -> Option<String> {
     let cuda_version = get_cuda_version()?;
     let Some(accelerator) = cuda_accelerator(&cuda_version) else {
@@ -475,7 +480,7 @@ fn detect_cuda_accelerator() -> Option<String> {
     Some(accelerator)
 }
 
-#[cfg(any(target_os = "linux", target_os = "windows", test))]
+#[cfg(any(target_os = "linux", test))]
 fn cuda_accelerator(cuda_version: &str) -> Option<String> {
     // Supported CUDA compute capabilities
     ["80", "86", "87", "89", "90"]
@@ -502,8 +507,8 @@ fn has_metal_device() -> bool {
     }
 }
 
-/// Get CUDA compute capability (Linux and Windows only).
-#[cfg(any(target_os = "linux", target_os = "windows"))]
+/// Get CUDA compute capability (Linux only).
+#[cfg(target_os = "linux")]
 fn get_cuda_version() -> Option<String> {
     use std::process::Command;
 
@@ -526,6 +531,7 @@ fn get_cuda_version() -> Option<String> {
 ///
 /// `nvidia-smi` emits one compute capability per line. The runtime release is
 /// selected for the first GPU reported by the command.
+#[cfg(any(target_os = "linux", test))]
 fn parse_cuda_version(output: &str) -> Option<String> {
     let value = output
         .lines()
@@ -764,27 +770,12 @@ mod tests {
     // default flavor on x86 - auto-detects accelerator, but in tests no accelerator is present
     #[case(SystemType::linux_x86(), "default", "spiced_linux_x86_64.tar.gz")]
     #[case(SystemType::darwin_x86(), "default", "spiced_darwin_x86_64.tar.gz")]
-    #[case(
-        SystemType::windows_x86(),
-        "default",
-        "spiced.exe_windows_x86_64.tar.gz"
-    )]
     // default flavor on arm
     #[case(SystemType::linux_arm(), "default", "spiced_linux_aarch64.tar.gz")]
     #[case(SystemType::darwin_arm(), "default", "spiced_darwin_aarch64.tar.gz")]
-    #[case(
-        SystemType::windows_arm(),
-        "default",
-        "spiced.exe_windows_aarch64.tar.gz"
-    )]
     // unknown flavor falls back to default behavior
     #[case(SystemType::linux_x86(), "unknown", "spiced_linux_x86_64.tar.gz")]
     #[case(SystemType::darwin_x86(), "unknown", "spiced_darwin_x86_64.tar.gz")]
-    #[case(
-        SystemType::windows_x86(),
-        "unknown",
-        "spiced.exe_windows_x86_64.tar.gz"
-    )]
     fn test_runtime_asset_names(
         #[case] os_type: SystemType,
         #[case] flavor: &str,
@@ -813,18 +804,29 @@ mod tests {
     fn a_dual_gpu_report_selects_the_matching_cuda_asset() {
         let capability = parse_cuda_version("8.6\n8.6\n").expect("GPU capability is present");
         let accelerator = cuda_accelerator(&capability).expect("capability 86 is supported");
-        let names = SystemType::windows_x86()
+        let names = SystemType::linux_x86()
             .runtime_asset_names_for_accelerator(Some(&accelerator), "v1.0.0");
 
         assert_eq!(
             names.first().map(String::as_str),
-            Some("spiced.exe_cuda_86_windows_x86_64.tar.gz")
+            Some("spiced_cuda_86_linux_x86_64.tar.gz")
         );
     }
 
     #[test]
     fn unsupported_cuda_capability_has_no_accelerator_asset() {
         assert_eq!(cuda_accelerator("999"), None);
+    }
+
+    #[rstest]
+    #[case(SystemType::windows_x86(), "default")]
+    #[case(SystemType::windows_arm(), "default")]
+    #[case(SystemType::windows_x86(), "cuda")]
+    fn windows_has_no_runtime_asset(#[case] os_type: SystemType, #[case] flavor: &str) {
+        assert_eq!(
+            os_type.runtime_asset_names(flavor, "v2.0.0"),
+            Vec::<String>::new()
+        );
     }
 
     #[test]

@@ -279,10 +279,7 @@ async fn mssql_integration_test() -> Result<(), String> {
                 .await?;
             }
 
-            running_container.remove().await.map_err(|e| {
-                tracing::error!("running_container.remove: {e}");
-                e.to_string()
-            })?;
+            running_container.cleanup().await;
 
             Ok(())
         })

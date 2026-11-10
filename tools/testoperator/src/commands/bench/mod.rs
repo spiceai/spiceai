@@ -53,7 +53,7 @@ pub(crate) fn emit_acceleration_size_if_applicable(
         ds.acceleration.as_ref().is_some_and(|accel| {
             matches!(accel.mode, Mode::File | Mode::FileCreate | Mode::FileUpdate)
                 && accel.enabled
-                && matches!(accel.engine_name(), "sqlite" | "duckdb" | "cayenne")
+                && matches!(accel.engine_name(), "sqlite" | "cayenne")
         })
     }) {
         return Ok(());
@@ -194,7 +194,7 @@ async fn run_inner(
     // A layout run's answers are checked by `--validate` against the unaccelerated
     // oracle, and its plans legitimately differ from the default layout's (index
     // lookups, sorts), so it records no result or explain-plan snapshots.
-    let benchmark_test = if args.layout.is_some() {
+    let benchmark_test = if args.layout.is_some() || !args.snapshots {
         benchmark_test
     } else {
         benchmark_test
@@ -602,7 +602,7 @@ mod tests {
         for scenario in [
             "dynamodb-arrow",
             "dynamodb-federated",
-            "dynamodb-duckdb[file]",
+            "dynamodb-cayenne[file]",
             "dynamodb-scylladb-alternator-federated",
             "glue[csv]-federated",
             "iceberg[hadoop]-federated",
@@ -629,8 +629,8 @@ mod tests {
             "glue[parquet]-federated",
             "glue[catalog]-federated",
             "iceberg[catalog]-federated",
-            "iceberg-duckdb[file]",
-            "s3[parquet]-duckdb[file]",
+            "iceberg-cayenne[file]",
+            "s3[parquet]-cayenne[file]",
         ] {
             assert_eq!(
                 snapshot_predicate(scenario, "tpch_q1"),

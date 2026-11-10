@@ -23,7 +23,7 @@ use datafusion::{
     arrow::datatypes::SchemaRef,
     common::TableReference,
     common::{
-        Result, ToDFSchema,
+        DFSchema, Result, ToDFSchema,
         tree_node::{Transformed, TransformedResult},
     },
     config::ConfigOptions,
@@ -31,8 +31,8 @@ use datafusion::{
     error::DataFusionError,
     execution::SessionState,
     logical_expr::{
-        EmptyRelation, Expr, FetchType, Limit, LogicalPlan, LogicalPlanBuilder, SkipType, Sort,
-        TableScan, Union, lit,
+        EmptyRelation, Expr, ExprSchemable, FetchType, Limit, LogicalPlan, LogicalPlanBuilder,
+        SkipType, Sort, TableScan, Union,
     },
     optimizer::AnalyzerRule,
     prelude::SessionContext,
@@ -53,8 +53,43 @@ use parking_lot::RwLock;
 pub type PartitionValue = HashMap<String, Option<String>>;
 
 /// The [`TableProvider`]s that read a table's partitions, each with the partition values it
-/// serves.
+/// serves. The values are SQL, as [`partition_predicate`] reads them; a provider with no
+/// values reads its whole source.
 pub type PartitionProviders = Vec<(Arc<dyn TableProvider>, Vec<PartitionValue>)>;
+
+/// The filter that selects the rows of one partition: `<expression> = <value>` for each of
+/// its expressions, or `<expression> IS NULL` for a null value, joined with `AND`. Each value
+/// is SQL (`'us-east'`, `42`); a value of another type is cast to its expression's type.
+/// `parse` turns SQL into an expression over the table.
+///
+/// # Errors
+///
+/// Returns an error if an expression or value cannot be parsed, or a value cannot be cast
+/// to its expression's type.
+pub fn partition_predicate(
+    partition_value: &PartitionValue,
+    df_schema: &DFSchema,
+    parse: impl Fn(&str) -> Result<Expr>,
+) -> Result<Option<Expr>> {
+    let mut entries: Vec<_> = partition_value.iter().collect();
+    entries.sort_by_key(|(expression, _)| *expression);
+    let predicates = entries
+        .into_iter()
+        .map(|(expression, value)| {
+            let expression = parse(expression)?;
+            let Some(value) = value else {
+                return Ok(expression.is_null());
+            };
+            let mut value = parse(value)?;
+            let expression_type = expression.get_type(df_schema)?;
+            if value.get_type(df_schema)? != expression_type {
+                value = value.cast_to(&expression_type, df_schema)?;
+            }
+            Ok(expression.eq(value))
+        })
+        .collect::<Result<Vec<_>>>()?;
+    Ok(predicates.into_iter().reduce(Expr::and))
+}
 
 /// Define how to get partitions for a given table, and how they are partitioned.
 pub trait TablePartitionProvider: Send + Sync + Debug {
@@ -178,28 +213,57 @@ impl AnalyzerRule for PartitionedTableScanRewrite {
 
             let mut sub_scans = Vec::with_capacity(providers.len());
             for (provider, partition_values) in providers {
-                let mut filters = scan.filters.clone();
+                let filters = scan.filters.clone();
 
-                // Convert partition values (HashMap<String, String>) to filter Exprs and combine with OR.
-                let partition_exprs: Vec<Expr> = partition_values
-                    .iter()
-                    .filter_map(|pv| {
-                        partition_value_to_expr(pv, &df_schema, &self.session_state).transpose()
-                    })
-                    .collect::<Result<Vec<_>, _>>()?;
+                // Each partition the provider serves becomes a filter; the filters are ORed.
+                let partition_exprs: Vec<Expr> = if partition_values.is_empty() {
+                    Vec::new()
+                } else {
+                    let state = self.session_state.upgrade().ok_or_else(|| {
+                        DataFusionError::Plan(
+                            "SessionState has been dropped, cannot parse partition expression"
+                                .to_string(),
+                        )
+                    })?;
+                    let state = state.read();
+                    partition_values
+                        .iter()
+                        .filter_map(|pv| {
+                            partition_predicate(pv, &df_schema, |sql| {
+                                state.create_logical_expr(sql, &df_schema)
+                            })
+                            .transpose()
+                        })
+                        .collect::<Result<Vec<_>, _>>()?
+                };
 
-                if let Some(partition_filter) =
-                    util::expr::combine_exprs_balanced(partition_exprs, Expr::or)
-                {
-                    filters.push(partition_filter);
-                }
-                let plan = LogicalPlanBuilder::scan_with_filters(
-                    scan.table_name.clone(),
-                    Arc::new(DefaultTableSource::new(Arc::clone(&provider))),
-                    scan.projection.clone(),
-                    filters,
-                )?
-                .build()?;
+                let source = Arc::new(DefaultTableSource::new(Arc::clone(&provider)));
+                let plan = match util::expr::combine_exprs_balanced(partition_exprs, Expr::or) {
+                    // A filter node, not a scan filter: the optimizer pushes it into
+                    // the scan only where the provider applies it, so a source that
+                    // holds other partitions' rows never returns them.
+                    Some(partition_filter) => LogicalPlanBuilder::scan_with_filters(
+                        scan.table_name.clone(),
+                        source,
+                        None,
+                        filters,
+                    )?
+                    .filter(partition_filter)?
+                    .project(
+                        scan.projected_schema
+                            .columns()
+                            .into_iter()
+                            .map(Expr::Column),
+                    )?
+                    .build()?,
+                    None => LogicalPlanBuilder::scan_with_filters(
+                        scan.table_name.clone(),
+                        source,
+                        scan.projection.clone(),
+                        filters,
+                    )?
+                    .build()?,
+                };
                 sub_scans.push(Arc::new(plan));
             }
 
@@ -379,43 +443,13 @@ fn push_sort_topk_into_union(limit: Limit) -> Result<Transformed<LogicalPlan>, D
     })))
 }
 
-/// Converts a [`PartitionValue`] (e.g. `{"bucket(3, org_id)": "42"}`) into a filter [`Expr`]
-/// (e.g. `bucket(3, org_id) = '42'`). Multiple keys are `AND`ed together.
-fn partition_value_to_expr(
-    pv: &PartitionValue,
-    df_schema: &datafusion::common::DFSchema,
-    state: &Weak<RwLock<SessionState>>,
-) -> Result<Option<Expr>, DataFusionError> {
-    let mut expr: Option<Expr> = None;
-    for (partition_expr_str, val) in pv {
-        let col_expr = state
-            .upgrade()
-            .ok_or_else(|| {
-                DataFusionError::Plan(
-                    "SessionState has been dropped, cannot parse partition expression".to_string(),
-                )
-            })?
-            .read()
-            .create_logical_expr(partition_expr_str, df_schema)?;
-        let new_expr = match val {
-            None => col_expr.is_null(),
-            Some(v) => col_expr.eq(lit(v.clone())),
-        };
-        expr = match expr {
-            Some(existing) => Some(existing.and(new_expr)),
-            None => Some(new_expr),
-        };
-    }
-    Ok(expr)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use datafusion::{
         arrow::datatypes::{DataType, Field, Schema},
         datasource::empty::EmptyTable,
-        logical_expr::{LogicalPlanBuilder, SortExpr, col},
+        logical_expr::{LogicalPlanBuilder, SortExpr, col, lit},
         prelude::SessionContext,
     };
     use std::collections::HashMap;
@@ -868,5 +902,119 @@ mod tests {
 
         // No Sort in original plan, so no Sort(TopK) should be pushed into union legs.
         insta::assert_snapshot!("limit_without_sort_no_pushdown", result.display_indent());
+    }
+
+    /// Two sources that each hold every row, each serving one region.
+    #[derive(Debug)]
+    struct WholeTableSources {
+        table: Arc<dyn TableProvider>,
+    }
+
+    impl TablePartitionProvider for WholeTableSources {
+        fn get_partitions(
+            &self,
+            _table: &TableReference,
+            _schema: &SchemaRef,
+        ) -> Result<PartitionProviders> {
+            let serving = |region: Option<&str>| {
+                vec![HashMap::from([(
+                    "region".to_string(),
+                    region.map(str::to_string),
+                )])]
+            };
+            Ok(vec![
+                (Arc::clone(&self.table), serving(Some("'east'"))),
+                (Arc::clone(&self.table), serving(Some("'it''s'"))),
+                (Arc::clone(&self.table), serving(None)),
+            ])
+        }
+
+        fn should_partition(&self, _tbl: &TableScan) -> bool {
+            true
+        }
+    }
+
+    /// A source that holds rows of partitions it does not serve contributes only the rows
+    /// of the partitions it serves.
+    #[tokio::test]
+    async fn each_source_contributes_only_the_partitions_it_serves() {
+        use datafusion::arrow::array::{Int64Array, RecordBatch, StringArray};
+        use datafusion::datasource::MemTable;
+
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("region", DataType::Utf8, true),
+        ]));
+        let batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![
+                Arc::new(Int64Array::from(vec![1, 2, 3, 4, 5])),
+                Arc::new(StringArray::from(vec![
+                    Some("east"),
+                    Some("east"),
+                    Some("it's"),
+                    None,
+                    None,
+                ])),
+            ],
+        )
+        .expect("batch");
+        let table: Arc<dyn TableProvider> =
+            Arc::new(MemTable::try_new(Arc::clone(&schema), vec![vec![batch]]).expect("mem table"));
+        let ctx = SessionContext::new();
+        ctx.register_table("t", Arc::clone(&table))
+            .expect("register");
+        ctx.add_analyzer_rule(Arc::new(PartitionedTableScanRewrite::new(
+            Arc::new(WholeTableSources { table }),
+            &ctx,
+        )));
+
+        let rows = ctx
+            .sql("SELECT region, COUNT(*) AS n FROM t GROUP BY region ORDER BY region")
+            .await
+            .expect("plan")
+            .collect()
+            .await
+            .expect("execute");
+        insta::assert_snapshot!(
+            datafusion::arrow::util::pretty::pretty_format_batches(&rows)
+                .expect("format")
+                .to_string(),
+            @r"
+        +--------+---+
+        | region | n |
+        +--------+---+
+        | east   | 2 |
+        | it's   | 1 |
+        |        | 2 |
+        +--------+---+
+        "
+        );
+    }
+
+    /// A value that is not a literal of the expression's type is cast to it.
+    #[test]
+    fn a_partition_value_is_cast_to_its_expression_type() {
+        let schema = Schema::new(vec![
+            Field::new("day", DataType::Date32, false),
+            Field::new("partition_id", DataType::Int32, false),
+        ]);
+        let df_schema = schema.to_dfschema().expect("schema");
+        let ctx = SessionContext::new();
+        let state = ctx.state();
+        let predicate = partition_predicate(
+            &HashMap::from([
+                ("day".to_string(), Some("'2024-01-02'".to_string())),
+                ("partition_id".to_string(), Some("7".to_string())),
+            ]),
+            &df_schema,
+            |sql| state.create_logical_expr(sql, &df_schema),
+        )
+        .expect("predicate")
+        .expect("one predicate");
+        assert_eq!(
+            predicate.to_string(),
+            r#"day = CAST(Utf8("2024-01-02") AS Date32) AND partition_id = CAST(Int64(7) AS Int32)"#
+        );
     }
 }

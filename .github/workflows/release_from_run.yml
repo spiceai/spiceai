@@ -1,5 +1,11 @@
 name: release_from_run
 
+# Recovery publish for release lines cut before build_release and
+# publish_release existed (2.4 and earlier), whose tag builds still publish
+# their own binaries. Newer releases are published only by publish_release.
+# workflow_dispatch needs the file on the default branch, so it stays here
+# until those lines are retired.
+
 on:
   workflow_dispatch:
     inputs:
@@ -18,6 +24,7 @@ permissions:
 
 jobs:
   publish:
+    environment: github-publish
     name: Publish binaries from existing run
     runs-on: ubuntu-24.04
     env:
@@ -68,12 +75,13 @@ jobs:
 
       - name: Publish binaries to GitHub release
         shell: bash
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           set -euo pipefail
 
           OWNER_NAME="${GITHUB_REPOSITORY%%/*}"
           REPO_NAME="${GITHUB_REPOSITORY#*/}"
-          export GITHUB_TOKEN="${{ secrets.GITHUB_TOKEN }}"
 
           shopt -s nullglob
           RELEASE_ARTIFACT=("${ARTIFACT_DIR}"/*.tar.gz)

@@ -78,7 +78,9 @@ pub struct DatasetBuilder {
 impl TryFrom<spicepod_dataset::Dataset> for DatasetBuilder {
     type Error = crate::Error;
 
-    fn try_from(dataset: spicepod_dataset::Dataset) -> std::result::Result<Self, Self::Error> {
+    fn try_from(mut dataset: spicepod_dataset::Dataset) -> std::result::Result<Self, Self::Error> {
+        crate::opentelemetry_logs::apply_dataset_defaults(&mut dataset);
+
         // Honoured here; the deprecation is reported by the load path
         // (`init::dataset::warn_about_acceleration_block`), not from this conversion, which
         // read-only callers run too.
@@ -100,11 +102,30 @@ impl TryFrom<spicepod_dataset::Dataset> for DatasetBuilder {
         let acceleration = if snapshot_source.is_some() {
             None
         } else {
+            let name = &dataset.name;
             dataset
                 .acceleration
                 .map(acceleration::Acceleration::try_from)
-                .transpose()?
+                .transpose()
+                .map_err(|err| match err {
+                    runtime_acceleration::AccelerationParseError::AcceleratorEngineRemoved {
+                        name: engine,
+                    } => crate::Error::AcceleratedDatasetEngineRemoved {
+                        dataset: name.clone(),
+                        engine,
+                    },
+                    err => err.into(),
+                })?
         };
+
+        if runtime_component::vector_engine::uses_removed_vector_engine(
+            dataset.vectors.as_ref(),
+            &dataset.columns,
+        ) {
+            return Err(crate::Error::DatasetVectorEngineRemoved {
+                dataset: dataset.name,
+            });
+        }
 
         validate_identifier(&dataset.name).context(crate::ComponentSnafu)?;
 

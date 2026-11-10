@@ -16,6 +16,10 @@ limitations under the License.
 
 //! Translates dependency diagnostics before they reach Spice's log sinks.
 
+use std::collections::HashMap;
+use std::sync::Mutex;
+use std::time::{Duration, Instant};
+
 use tracing_log::{
     LogTracer,
     log::{self, Level, LevelFilter, Log, Metadata, Record, SetLoggerError},
@@ -36,6 +40,9 @@ trait LogTransformRule: Send + Sync {
 struct LogTransform {
     message: String,
     diagnostic: Option<LogDiagnostic>,
+    /// Repeated warnings with the same key collapse to the first one, plus a
+    /// count when the burst keeps going. `None` emits every record.
+    collapse_key: Option<String>,
 }
 
 /// Optional detail emitted at DEBUG, with the message escaped onto one line.
@@ -53,6 +60,7 @@ pub(super) fn init() -> Result<(), SetLoggerError> {
 struct DependencyLogTracer {
     inner: LogTracer,
     rules: &'static [&'static dyn LogTransformRule],
+    collapse: Mutex<CollapseGate>,
 }
 
 impl Default for DependencyLogTracer {
@@ -60,6 +68,7 @@ impl Default for DependencyLogTracer {
         Self {
             inner: LogTracer::default(),
             rules: DEFAULT_RULES,
+            collapse: Mutex::new(CollapseGate::default()),
         }
     }
 }
@@ -77,6 +86,46 @@ impl DependencyLogTracer {
                 .build(),
         );
     }
+
+    fn emit(&self, record: &Record<'_>, transform: &LogTransform) {
+        let skipped = if let Some(key) = transform.collapse_key.as_deref() {
+            let decision = {
+                let mut gate = self
+                    .collapse
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                gate.decide(key, Instant::now())
+            };
+            match decision {
+                // The warning is the sampled line. The debug diagnostic stays
+                // so an operator who turned diagnostics on can still see the
+                // retries the warning no longer lists.
+                Collapse::Suppress => {
+                    self.forward_diagnostic(record, transform.diagnostic.as_ref());
+                    return;
+                }
+                Collapse::Emit { skipped } => skipped,
+            }
+        } else {
+            0
+        };
+        let message = with_skipped(&transform.message, skipped);
+
+        // Forward directly to preserve source locations and the current span,
+        // and avoid re-entering the global dependency logger.
+        self.forward(record, record.level(), format_args!("{message}"));
+        self.forward_diagnostic(record, transform.diagnostic.as_ref());
+    }
+
+    fn forward_diagnostic(&self, record: &Record<'_>, diagnostic: Option<&LogDiagnostic>) {
+        if let Some(diagnostic) = diagnostic {
+            self.forward(
+                record,
+                Level::Debug,
+                format_args!("{}: {:?}", diagnostic.label, diagnostic.message),
+            );
+        }
+    }
 }
 
 impl Log for DependencyLogTracer {
@@ -89,25 +138,28 @@ impl Log for DependencyLogTracer {
             return;
         }
 
-        let Some(transform) = self.rules.iter().find_map(|rule| rule.transform(record)) else {
-            self.inner.log(record);
+        if let Some(transform) = self.rules.iter().find_map(|rule| rule.transform(record)) {
+            self.emit(record, &transform);
             return;
-        };
-
-        // Forward directly to preserve source locations and the current span,
-        // and avoid re-entering the global dependency logger.
-        self.forward(
-            record,
-            record.level(),
-            format_args!("{}", transform.message),
-        );
-        if let Some(diagnostic) = transform.diagnostic {
-            self.forward(
-                record,
-                Level::Debug,
-                format_args!("{}: {:?}", diagnostic.label, diagnostic.message),
-            );
         }
+
+        // A retry format this build does not recognize still has to be one
+        // line, and a burst of identical lines has to collapse. The first
+        // copy stays so the new format is visible.
+        if record.target() == OPENDAL_RETRY_TARGET && record.level() == Level::Warn {
+            let message = one_line(&record.args().to_string());
+            self.emit(
+                record,
+                &LogTransform {
+                    collapse_key: Some(format!("opendal-retry:{message}")),
+                    message,
+                    diagnostic: None,
+                },
+            );
+            return;
+        }
+
+        self.inner.log(record);
     }
 
     fn flush(&self) {
@@ -126,11 +178,13 @@ impl LogTransformRule for OpenDalS3ReadRetryRule {
         }
 
         // OpenDAL's default retry interceptor formats its error into the log
-        // record. Recognize only the supported diagnostic; a different error
-        // or dependency format must still reach the normal bridge.
+        // record. Recognize the diagnostics this runtime produces; a different
+        // error still reaches the bridge, flattened and collapsed.
         let diagnostic = record.args().to_string();
+        let recognized = recognize_opendal_read_retry(&diagnostic)?;
         Some(LogTransform {
-            message: s3_read_retry_message(&diagnostic)?,
+            message: recognized.message,
+            collapse_key: Some(recognized.collapse_key),
             diagnostic: Some(LogDiagnostic {
                 label: "S3 read retry diagnostic",
                 message: diagnostic,
@@ -139,9 +193,37 @@ impl LogTransformRule for OpenDalS3ReadRetryRule {
     }
 }
 
+struct RecognizedRetry {
+    message: String,
+    collapse_key: String,
+}
+
+fn recognize_opendal_read_retry(diagnostic: &str) -> Option<RecognizedRetry> {
+    let (attempt, delay, error) = split_read_retry(diagnostic)?;
+    if let Some(message) = s3_connection_closed_message(attempt, &delay, error) {
+        return Some(RecognizedRetry {
+            message,
+            collapse_key: format!("s3-connection-closed:{attempt}"),
+        });
+    }
+    if let Some(message) = io_timeout_message(attempt, &delay, error) {
+        return Some(RecognizedRetry {
+            message,
+            collapse_key: format!("object-store-io-timeout:{attempt}"),
+        });
+    }
+    None
+}
+
 /// Formats the known connection-closure warning without inferring a logical
 /// table name from an object path, which can have an arbitrary layout.
+#[cfg(test)]
 fn s3_read_retry_message(diagnostic: &str) -> Option<String> {
+    let (attempt, delay, error) = split_read_retry(diagnostic)?;
+    s3_connection_closed_message(attempt, &delay, error)
+}
+
+fn split_read_retry(diagnostic: &str) -> Option<(u32, String, &str)> {
     let (retry, error) = diagnostic.split_once(" because: ")?;
     let (attempt, delay) = retry
         .strip_prefix("will retry Read (attempt ")?
@@ -153,24 +235,33 @@ fn s3_read_retry_message(diagnostic: &str) -> Option<String> {
         return None;
     }
     let delay = format!("{seconds:.3}");
-    let delay = delay.trim_end_matches('0').trim_end_matches('.');
+    let delay = delay
+        .trim_end_matches('0')
+        .trim_end_matches('.')
+        .to_string();
+    Some((attempt, delay, error))
+}
 
+fn context_value<'a>(context: &'a str, key: &str) -> Option<&'a str> {
+    let mut values = context.lines().filter_map(|line| {
+        let (name, value) = line.trim_start().split_once(": ")?;
+        (name == key).then_some(value)
+    });
+    let value = values.next()?;
+    values.next().is_none().then_some(value)
+}
+
+fn s3_connection_closed_message(attempt: u32, delay: &str, error: &str) -> Option<String> {
     let (context, source) = error
         .strip_prefix("Unexpected (temporary) at read => send http request\n\nContext:\n")?
         .split_once("\nSource:\n")?;
-    let context_value = |key: &str| {
-        let mut values = context.lines().filter_map(|line| {
-            let (name, value) = line.trim_start().split_once(": ")?;
-            (name == key).then_some(value)
-        });
-        let value = values.next()?;
-        values.next().is_none().then_some(value)
-    };
-    if context_value("service")? != "s3" || context_value("called")? != "reqwest::send" {
+    if context_value(context, "service")? != "s3"
+        || context_value(context, "called")? != "reqwest::send"
+    {
         return None;
     }
 
-    let object_url = context_value("url")?;
+    let object_url = context_value(context, "url")?;
     if source.trim()
         != format!(
             "error sending request for url ({object_url}): client error (SendRequest): connection closed before message completed"
@@ -191,6 +282,143 @@ fn s3_read_retry_message(diagnostic: &str) -> Option<String> {
     Some(format!(
         "Reading file '{url}' (S3) was interrupted, so Spice will retry in {delay}s (attempt {attempt}). Cause: The connection closed before the response completed. If this continues, check network access to S3 and any proxy timeouts. See: https://spiceai.org/docs/troubleshooting"
     ))
+}
+
+/// `OpenDAL`'s timeout layer reports only the budget, not the object. The
+/// message names that budget so a burst of identical timeouts is actionable.
+fn io_timeout_message(attempt: u32, delay: &str, error: &str) -> Option<String> {
+    let rest = error.strip_prefix(
+        "Unexpected (temporary) at read => io operation timeout reached\n\nContext:\n",
+    )?;
+    let context = rest
+        .split_once("\nSource:\n")
+        .map_or(rest, |(context, _)| context);
+    let timeout = context_value(context, "timeout")?;
+    let seconds = timeout.parse::<f64>().ok()?;
+    if !seconds.is_finite() || seconds <= 0.0 {
+        return None;
+    }
+    let timeout = format!("{seconds:.3}");
+    let timeout = timeout.trim_end_matches('0').trim_end_matches('.');
+
+    Some(format!(
+        "Reading a file timed out after {timeout}s, so Spice will retry in {delay}s (attempt {attempt}). If this continues, check that storage is reachable and that any proxy timeout is longer than {timeout}s. See: https://spiceai.org/docs/troubleshooting"
+    ))
+}
+
+/// A metadata refresh can time out hundreds of reads in the same second.
+/// Emit the first, then again as the burst crosses each threshold, and again
+/// after a quiet minute. Everything in between is counted, not logged.
+const COLLAPSE_WINDOW: Duration = Duration::from_secs(60);
+const COLLAPSE_EMIT_AT: [u64; 4] = [1, 100, 1_000, 10_000];
+
+/// Distinct retry classes remembered at once. A repeated class updates its
+/// one entry and does not walk the map. A class this build has not recognized
+/// is keyed by its whole diagnostic, so a storm of different objects would
+/// otherwise keep one entry each. Past the cap, the class that has been quiet
+/// the longest is dropped. Its unreported count goes with it: the next time
+/// that class appears, it logs as a new one.
+const COLLAPSE_MAX_WINDOWS: usize = 64;
+
+#[derive(Default)]
+struct CollapseGate {
+    windows: HashMap<String, CollapseWindow>,
+}
+
+struct CollapseWindow {
+    start: Instant,
+    last_seen: Instant,
+    seen: u64,
+    suppressed: u64,
+}
+
+enum Collapse {
+    Emit { skipped: u64 },
+    Suppress,
+}
+
+impl CollapseWindow {
+    fn advance(&mut self, now: Instant) -> Collapse {
+        self.last_seen = now;
+        if self.seen > 0 && now.duration_since(self.start) >= COLLAPSE_WINDOW {
+            let skipped = self.suppressed;
+            self.start = now;
+            self.seen = 1;
+            self.suppressed = 0;
+            return Collapse::Emit { skipped };
+        }
+        self.seen += 1;
+        if COLLAPSE_EMIT_AT.contains(&self.seen) {
+            let skipped = self.suppressed;
+            self.suppressed = 0;
+            return Collapse::Emit { skipped };
+        }
+        self.suppressed += 1;
+        Collapse::Suppress
+    }
+}
+
+impl CollapseGate {
+    fn decide(&mut self, key: &str, now: Instant) -> Collapse {
+        if let Some(window) = self.windows.get_mut(key) {
+            return window.advance(now);
+        }
+        self.evict_least_recent();
+        let mut window = CollapseWindow {
+            start: now,
+            last_seen: now,
+            seen: 0,
+            suppressed: 0,
+        };
+        let decision = window.advance(now);
+        self.windows.insert(key.to_string(), window);
+        decision
+    }
+
+    /// Called only when admitting a class the map does not already hold, and
+    /// only once the map is full. The repeated-class path never scans.
+    fn evict_least_recent(&mut self) {
+        if self.windows.len() < COLLAPSE_MAX_WINDOWS {
+            return;
+        }
+        let Some(oldest) = self
+            .windows
+            .iter()
+            .min_by_key(|(_, window)| window.last_seen)
+            .map(|(key, _)| key.clone())
+        else {
+            return;
+        };
+        self.windows.remove(&oldest);
+    }
+}
+
+fn with_skipped(message: &str, skipped: u64) -> String {
+    if skipped == 0 {
+        return message.to_string();
+    }
+    let note = format!("{skipped} similar retries were not logged.");
+    match message.rsplit_once(" See: ") {
+        Some((head, tail)) => format!("{head} {note} See: {tail}"),
+        None => format!("{message} {note}"),
+    }
+}
+
+fn one_line(message: &str) -> String {
+    let mut out = String::with_capacity(message.len());
+    let mut spaced = false;
+    for c in message.chars() {
+        if c.is_whitespace() {
+            if !spaced && !out.is_empty() {
+                out.push(' ');
+                spaced = true;
+            }
+        } else {
+            out.push(c);
+            spaced = false;
+        }
+    }
+    out
 }
 
 #[cfg(test)]
@@ -281,6 +509,178 @@ mod tests {
         }
     }
 
+    fn timeout_diagnostic() -> String {
+        "will retry Read (attempt 1) after 1s because: Unexpected (temporary) at read => io operation timeout reached\n\nContext:\n   timeout: 10\n".to_string()
+    }
+
+    #[test]
+    fn io_timeout_message_names_the_budget_the_retry_and_the_action() {
+        assert_eq!(
+            recognize_opendal_read_retry(&timeout_diagnostic())
+                .expect("recognized io timeout")
+                .message,
+            "Reading a file timed out after 10s, so Spice will retry in 1s (attempt 1). If this continues, check that storage is reachable and that any proxy timeout is longer than 10s. See: https://spiceai.org/docs/troubleshooting"
+        );
+    }
+
+    #[test]
+    fn io_timeout_burst_logs_the_first_read_and_the_size_of_the_burst() {
+        let tracer = DependencyLogTracer::default();
+        let diagnostic = timeout_diagnostic();
+        let mut combined = String::new();
+        for _ in 0..120 {
+            combined.push_str(&output_with_tracer(
+                &tracer,
+                "warn",
+                OPENDAL_RETRY_TARGET,
+                Level::Warn,
+                &diagnostic,
+            ));
+        }
+        let warns: Vec<_> = combined
+            .lines()
+            .filter(|line| line.contains("WARN"))
+            .collect();
+        assert_eq!(warns.len(), 2, "{combined}");
+        assert!(warns[0].contains("timed out after 10s"), "{combined}");
+        assert!(warns[0].contains("attempt 1"), "{combined}");
+        assert!(!warns[0].contains("similar retries"), "{combined}");
+        assert!(
+            warns[1].contains("98 similar retries were not logged"),
+            "{combined}"
+        );
+        assert!(
+            !combined.contains("io operation timeout reached"),
+            "{combined}"
+        );
+        for line in &warns {
+            assert_eq!(line.matches("WARN").count(), 1, "{line}");
+        }
+
+        let second_attempt = diagnostic.replace("attempt 1", "attempt 2");
+        let again = output_with_tracer(
+            &tracer,
+            "warn",
+            OPENDAL_RETRY_TARGET,
+            Level::Warn,
+            &second_attempt,
+        );
+        assert!(again.contains("attempt 2"), "{again}");
+        assert!(!again.contains("similar retries"), "{again}");
+    }
+
+    #[test]
+    fn collapse_gate_retains_at_most_64_classes() {
+        let mut gate = CollapseGate::default();
+        let start = Instant::now();
+        for index in 0_u32..80 {
+            let at = start + Duration::from_secs(u64::from(index));
+            let decision = gate.decide(&format!("class-{index}"), at);
+            assert!(
+                matches!(decision, Collapse::Emit { skipped: 0 }),
+                "first sight of class-{index} should log"
+            );
+        }
+        assert_eq!(gate.windows.len(), COLLAPSE_MAX_WINDOWS);
+        assert!(!gate.windows.contains_key("class-0"));
+        assert!(!gate.windows.contains_key("class-15"));
+        assert!(gate.windows.contains_key("class-16"));
+        assert!(gate.windows.contains_key("class-79"));
+
+        // Repeating a class the map still holds must not drop another class.
+        let repeat_at = start + Duration::from_secs(80);
+        for _ in 0..50 {
+            let decision = gate.decide("class-79", repeat_at);
+            assert!(
+                matches!(decision, Collapse::Suppress),
+                "class-79 is inside its first window"
+            );
+        }
+        assert_eq!(gate.windows.len(), COLLAPSE_MAX_WINDOWS);
+        assert!(gate.windows.contains_key("class-16"));
+        assert!(gate.windows.contains_key("class-79"));
+
+        let decision = gate.decide("class-new", repeat_at + Duration::from_secs(1));
+        assert!(matches!(decision, Collapse::Emit { skipped: 0 }));
+        assert_eq!(gate.windows.len(), COLLAPSE_MAX_WINDOWS);
+        assert!(!gate.windows.contains_key("class-16"));
+        assert!(gate.windows.contains_key("class-new"));
+        assert!(gate.windows.contains_key("class-79"));
+    }
+
+    #[test]
+    fn suppressed_retry_still_logs_the_debug_diagnostic() {
+        let tracer = DependencyLogTracer::default();
+        let diagnostic = timeout_diagnostic();
+        let first = output_with_tracer(
+            &tracer,
+            "debug",
+            OPENDAL_RETRY_TARGET,
+            Level::Warn,
+            &diagnostic,
+        );
+        assert!(first.contains("WARN"), "{first}");
+        assert!(first.contains("S3 read retry diagnostic"), "{first}");
+
+        let second = output_with_tracer(
+            &tracer,
+            "debug",
+            OPENDAL_RETRY_TARGET,
+            Level::Warn,
+            &diagnostic,
+        );
+        assert!(
+            !second.contains("WARN"),
+            "the repeated warning is collapsed: {second}"
+        );
+        assert!(
+            second.contains("S3 read retry diagnostic"),
+            "the collapsed retry still keeps its diagnostic: {second}"
+        );
+        assert!(second.contains("io operation timeout reached"), "{second}");
+
+        let at_warn = output_with_tracer(
+            &tracer,
+            "warn",
+            OPENDAL_RETRY_TARGET,
+            Level::Warn,
+            &diagnostic,
+        );
+        assert!(
+            at_warn.is_empty(),
+            "a warn filter does not show the diagnostic: {at_warn}"
+        );
+    }
+
+    #[test]
+    fn collapse_gate_reports_the_quiet_gap_on_the_next_event() {
+        let mut gate = CollapseGate::default();
+        let start = Instant::now();
+        assert!(matches!(
+            gate.decide("k", start),
+            Collapse::Emit { skipped: 0 }
+        ));
+        assert!(matches!(gate.decide("k", start), Collapse::Suppress));
+        assert!(matches!(
+            gate.decide("k", start + COLLAPSE_WINDOW),
+            Collapse::Emit { skipped: 1 }
+        ));
+    }
+
+    #[test]
+    fn unrecognized_opendal_retry_is_one_line_and_a_repeat_is_not_logged() {
+        let tracer = DependencyLogTracer::default();
+        let message = "will retry Read (attempt 1) after 1s because: something new\n\nContext:\n   detail: kept\n";
+        let first = output_with_tracer(&tracer, "warn", OPENDAL_RETRY_TARGET, Level::Warn, message);
+        assert_eq!(first.lines().count(), 1, "{first}");
+        assert!(first.contains("something new"), "{first}");
+        assert!(first.contains("detail: kept"), "{first}");
+        assert!(!first.contains("timed out after"), "{first}");
+        let second =
+            output_with_tracer(&tracer, "warn", OPENDAL_RETRY_TARGET, Level::Warn, message);
+        assert!(second.is_empty(), "{second}");
+    }
+
     #[derive(Clone, Default)]
     struct Writer(Arc<Mutex<Vec<u8>>>);
 
@@ -355,6 +755,7 @@ mod tests {
                     label: "Dependency diagnostic",
                     message: message.to_string(),
                 }),
+                collapse_key: None,
             })
         }
     }

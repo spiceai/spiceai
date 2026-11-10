@@ -22,12 +22,13 @@ limitations under the License.
 
 pub mod catalog;
 pub mod factory;
+mod http_client;
 pub mod server;
 pub mod tool;
 
 pub use catalog::attach_mcp_schema_snapshot;
 
-use std::{collections::HashMap, str::FromStr};
+use std::{collections::HashMap, str::FromStr, time::Duration};
 
 use http::{HeaderName, HeaderValue, header::AUTHORIZATION};
 use rmcp::ErrorData as McpError;
@@ -62,6 +63,18 @@ pub enum Error {
     UnderlyingInitilizationError { source: McpError },
 }
 
+impl Error {
+    /// Returns `true` when the error is a mistake in the tool's Spicepod configuration, which
+    /// no retry can clear.
+    #[must_use]
+    pub fn is_configuration_error(&self) -> bool {
+        matches!(
+            self,
+            Error::InvalidMCPDirective { .. } | Error::InvalidMcpArgs { .. }
+        )
+    }
+}
+
 pub type Result<T, E = Error> = std::result::Result<T, E>;
 
 /// Prefix every tool-use task name carries.
@@ -84,6 +97,34 @@ const TOOL_USE_PREFIX: &str = "tool_use::";
 pub(crate) fn task_name_for_exposed_tool(exposed_name: &str) -> String {
     format!("{TOOL_USE_PREFIX}{exposed_name}")
 }
+
+/// Longest wait for an MCP server to finish its handshake. Model loading waits for tools, so a
+/// server that never answers must not hold it forever. A stdio server started through
+/// `npx`/`uvx` may download its package first, so this allows more than a request.
+pub const MCP_HANDSHAKE_TIMEOUT: Duration = Duration::from_mins(2);
+
+/// Longest wait for a `tools/list` or `ping` answer.
+pub const MCP_REQUEST_TIMEOUT: Duration = Duration::from_secs(60);
+
+/// Longest wait for one `tools/call`. Tools do real work, so this is longer than
+/// [`MCP_REQUEST_TIMEOUT`]; it exists so that a stalled server cannot hold a caller forever.
+pub const MCP_CALL_TOOL_TIMEOUT: Duration = Duration::from_mins(10);
+
+/// Largest MCP response, in bytes, Spice accepts from an MCP server over
+/// Streamable HTTP, and the largest serialized tool result it passes on.
+///
+/// A JSON body is capped as a whole. A POST that comes back as SSE is capped
+/// as a whole too: progress notifications and the final result count together,
+/// so that stream is rejected even when every individual event is under the
+/// limit. A GET SSE stream keeps rmcp's per-event cap, set to this same value.
+/// 16 MiB is rmcp's own default event limit, and it is far above real tool
+/// output: a whole 1M-token model context is about 4 MiB of text.
+///
+/// The bound exists because one tool result is copied several times on its
+/// way to the caller (decoded, re-serialized, captured to task history, and
+/// written to the HTTP response or model context), so its size multiplies
+/// into peak memory.
+const MAX_TOOL_RESULT_SIZE: usize = crate::utils::MAX_TOOL_RESULT_BYTES;
 
 const MCP_AUTH_TOKEN_PARAM: &str = "mcp_auth_token";
 /// Custom HTTP headers, formatted `Name: Value` and delimited like the HTTP

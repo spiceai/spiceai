@@ -28,3 +28,15 @@ pub enum AccessMode {
     /// Full read-write access including DDL operations (CREATE TABLE, DROP TABLE, etc.)
     ReadWriteCreate,
 }
+
+impl AccessMode {
+    /// The value of this mode in a Spicepod's `access` field.
+    #[must_use]
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            AccessMode::Read => "read",
+            AccessMode::ReadWrite => "read_write",
+            AccessMode::ReadWriteCreate => "read_write_create",
+        }
+    }
+}

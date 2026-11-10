@@ -8,7 +8,11 @@ Limit: skip=0, fetch=5
       Union
         Sort: test_table.id ASC NULLS LAST, fetch=5
           SubqueryAlias: test_table
-            TableScan: test_table, unsupported_filters=[partition_id = Utf8("0")]
+            Projection: test_table.id, test_table.name, test_table.partition_id
+              Filter: test_table.partition_id = CAST(Int64(0) AS Int32)
+                TableScan: test_table
         Sort: test_table.id ASC NULLS LAST, fetch=5
           SubqueryAlias: test_table
-            TableScan: test_table, unsupported_filters=[partition_id = Utf8("1")]
+            Projection: test_table.id, test_table.name, test_table.partition_id
+              Filter: test_table.partition_id = CAST(Int64(1) AS Int32)
+                TableScan: test_table

@@ -21,7 +21,7 @@ use std::sync::atomic::Ordering;
 use std::time::Instant;
 
 use tokio::sync::OwnedMutexGuard;
-use turso_shared::{DEFAULT_CONCURRENT_WRITE_MAX_ATTEMPTS, retry_backoff_delay};
+use write_retry::{DEFAULT_CONCURRENT_WRITE_MAX_ATTEMPTS, retry_backoff_delay};
 
 use super::column_stats::ColumnStatsAccumulator;
 use super::context::CayenneContext;
@@ -34,12 +34,25 @@ use crate::CayenneCatalog;
 use crate::catalog::{CatalogResult, MetadataCatalog};
 use crate::metastore::MetastoreTransaction;
 
-/// Owns the write lock until durable publication, visibility, and maintenance
+/// Owns the write lock, and the mem-tier checkpoint lock a streaming write
+/// validated under, until durable publication, visibility, and maintenance
 /// bookkeeping are complete, including when the requesting task is cancelled.
 pub(super) struct PreparedResolvedAppend {
     pub table: CayenneTableProvider,
     pub context: Arc<CayenneContext>,
     pub _write_guard: OwnedMutexGuard<()>,
+    /// When autocommit `UPDATE` already held `write_lock`, `_write_guard` is a
+    /// dummy (the mutex is not reentrant). This clone of the real owned hold
+    /// keeps exclusive access until `commit`'s spawned task finishes, so
+    /// cancelling the UPDATE stream cannot drop the lock mid-publish.
+    /// Task-local [`super::write_lock_held`] does not propagate into
+    /// `tokio::spawn`.
+    pub _held_write_lock: Option<Arc<OwnedMutexGuard<()>>>,
+    /// Holds the mem-tier checkpoint off until publication has acted on what
+    /// validation decided about where each replaced row lives
+    /// ([`CayenneTableProvider::lock_mem_tier_checkpoint_for_durable_write`]).
+    /// `None` for a transaction's staged upsert, which does not take it.
+    pub _checkpoint_guard: Option<OwnedMutexGuard<()>>,
     pub snapshot_id: String,
     pub rows: u64,
     pub stats: Arc<ColumnStatsAccumulator>,

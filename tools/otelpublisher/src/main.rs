@@ -14,7 +14,9 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use clap::Parser;
+mod logs_load;
+
+use clap::{Parser, Subcommand};
 use opentelemetry_proto::tonic::{
     collector::metrics::v1::{
         ExportMetricsServiceRequest, metrics_service_client::MetricsServiceClient,
@@ -35,6 +37,9 @@ use tonic::{
 #[derive(Parser)]
 #[clap(about = "Spice.ai Open Telemetry Publisher Utility")]
 pub struct Args {
+    #[command(subcommand)]
+    pub command: Option<Command>,
+
     #[arg(
         long,
         value_name = "OTEL_ENDPOINT",
@@ -51,9 +56,19 @@ pub struct Args {
     pub api_key: Option<String>,
 }
 
+#[derive(Subcommand)]
+pub enum Command {
+    /// Send OTLP log exports as fast as they are acknowledged, then report acknowledged
+    /// records per second and the export latency distribution.
+    LogsLoad(logs_load::LogsLoadArgs),
+}
+
 #[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error>> {
+async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let args = Args::parse();
+    if let Some(Command::LogsLoad(load)) = args.command {
+        return logs_load::run(load).await;
+    }
 
     // Set up the Otel client
     let mut otel_endpoint = args.otel_endpoint;
@@ -108,11 +123,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut request = request.into_request();
 
     if let Some(api_key) = args.api_key {
-        let metadata_value = match MetadataValue::try_from(api_key) {
+        // The Flight port's authentication reads `authorization: Bearer <key>`.
+        let metadata_value = match MetadataValue::try_from(format!("Bearer {api_key}")) {
             Ok(metadata_value) => metadata_value,
             Err(e) => panic!("Invalid API key: {e}"),
         };
-        request.metadata_mut().insert("x-api-key", metadata_value);
+        request
+            .metadata_mut()
+            .insert("authorization", metadata_value);
     }
 
     client.export(request).await?;

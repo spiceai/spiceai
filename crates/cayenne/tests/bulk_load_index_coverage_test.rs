@@ -20,12 +20,10 @@ limitations under the License.
 
 use crate::common;
 
-use arrow::array::{Int64Array, StringArray};
 use arrow::datatypes::{DataType, Field, Schema};
-use arrow::record_batch::RecordBatch;
 use cayenne::metadata::DeletionMode;
 use common::lookup_index::{
-    TableSpec, counters, file_mode_config, int64_column, open_table, query,
+    TableSpec, counters, file_mode_config, int64_column, open_table, query, repeating_load,
 };
 use datafusion::execution::runtime_env::RuntimeEnv;
 use datafusion_expr::dml::InsertOp;
@@ -37,11 +35,6 @@ use std::sync::Arc;
 /// fold that did would publish files it had not indexed yet.
 const BATCH_ROWS: i64 = 100_000;
 const BATCHES: i64 = 24;
-
-/// In every batch after the first, each row at position 999 mod 1000 repeats
-/// the key of the row at 500 mod 1000 of the batch before it, so both files
-/// hold superseded copies and the fold rewrites both.
-const REPEAT_EVERY: i64 = 1000;
 
 test_with_backends!(bulk_load_with_repeats_is_indexed_when_it_returns_impl);
 
@@ -70,31 +63,9 @@ async fn bulk_load_with_repeats_is_indexed_when_it_returns_impl(
     )
     .await;
 
-    let batches = (0..BATCHES)
-        .map(|batch| {
-            let rows = batch * BATCH_ROWS..(batch + 1) * BATCH_ROWS;
-            let ids: Vec<i64> = rows
-                .clone()
-                .map(|row| {
-                    if batch > 0 && row % REPEAT_EVERY == REPEAT_EVERY - 1 {
-                        row - BATCH_ROWS - (REPEAT_EVERY - 1 - 500)
-                    } else {
-                        row
-                    }
-                })
-                .collect();
-            RecordBatch::try_new(
-                Arc::clone(&schema),
-                vec![
-                    Arc::new(Int64Array::from(ids)),
-                    Arc::new(Int64Array::from(rows.clone().collect::<Vec<_>>())),
-                    Arc::new(StringArray::from(
-                        rows.map(|row| format!("{row:016x}")).collect::<Vec<_>>(),
-                    )),
-                ],
-            )
-        })
-        .collect::<Result<Vec<_>, _>>()?;
+    // Both of the load's files hold superseded copies, so the fold rewrites
+    // both.
+    let batches = repeating_load(&schema, BATCHES, BATCH_ROWS);
     common::write_batches(&provider, batches, InsertOp::Append).await?;
 
     // Key 500 is written by row 500 of the first batch and repeated by row

@@ -21,11 +21,13 @@ base64 = "0.22.1"
 # The flatbuffer an Arrow IPC schema message is, read to correct a map declaration in place.
 flatbuffers.workspace = true
 snafu.workspace = true
-datafusion.workspace = true
+datafusion-common.workspace = true
 serde_json.workspace = true
 tracing.workspace = true
 
 [dev-dependencies]
+# The compressed-message guard tests encode and decode compressed batches.
+arrow-ipc = { workspace = true, features = ["lz4", "zstd"] }
 insta = {workspace = true, features = ["json"]}
 arrow-json.workspace = true
 criterion = { version = "0.7", features = ["html_reports"] }

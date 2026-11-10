@@ -38,6 +38,28 @@ struct SearchResponse {
     pub duration_ms: u128,
 }
 
+/// Validates basic `/v1/search` request parameters, returning an error message
+/// for a `400 Bad Request` if the request is invalid.
+fn validate_request(payload: &SearchRequestHTTPJson) -> Option<&'static str> {
+    // For now, force the user to specify which data.
+    if payload
+        .base
+        .datasets
+        .as_ref()
+        .is_some_and(std::vec::Vec::is_empty)
+    {
+        return Some("No data sources provided");
+    }
+
+    if payload.base.limit.is_some_and(|limit| limit == 0) {
+        return Some("Limit must be greater than 0");
+    }
+
+    // Empty/whitespace `text` is rejected in `SearchRequest::try_from` so HTTP
+    // and MCP share one enforcement path; that error maps to HTTP 400 below.
+    None
+}
+
 /// Search
 ///
 /// Perform a vector similarity search (VSS) operation on a dataset.
@@ -122,18 +144,8 @@ pub(crate) async fn post(
 ) -> Response {
     let start_time = Instant::now();
 
-    // For now, force the user to specify which data.
-    if payload
-        .base
-        .datasets
-        .as_ref()
-        .is_some_and(std::vec::Vec::is_empty)
-    {
-        return (StatusCode::BAD_REQUEST, "No data sources provided").into_response();
-    }
-
-    if payload.base.limit.is_some_and(|limit| limit == 0) {
-        return (StatusCode::BAD_REQUEST, "Limit must be greater than 0").into_response();
+    if let Some(msg) = validate_request(&payload) {
+        return (StatusCode::BAD_REQUEST, msg).into_response();
     }
 
     let span = tracing::span!(target: "task_history", tracing::Level::INFO, "search", input = %payload.base.text);
@@ -215,6 +227,35 @@ pub(crate) async fn post(
 
             tracing::error!(target: "task_history", parent: &span, "{e}");
             (error_type, e.to_string()).into_response()
+        }
+    }
+}
+
+#[cfg(test)]
+mod validate_tests {
+    use super::*;
+
+    fn req(json: serde_json::Value) -> SearchRequestHTTPJson {
+        serde_json::from_value(json).expect("valid request json")
+    }
+
+    #[test]
+    fn rejects_zero_limit_and_empty_datasets() {
+        let r = req(serde_json::json!({"datasets": ["products"], "text": "boots", "limit": 0}));
+        assert_eq!(validate_request(&r), Some("Limit must be greater than 0"));
+        let r = req(serde_json::json!({"datasets": [], "text": "boots"}));
+        assert_eq!(validate_request(&r), Some("No data sources provided"));
+    }
+
+    #[test]
+    fn empty_text_passes_http_only_checks_then_fails_try_from() {
+        // HTTP-only validate_request no longer duplicates the shared text check;
+        // TryFrom (used by both HTTP and MCP) is the enforcement point.
+        for text in ["", "   ", "\t\n "] {
+            let r = req(serde_json::json!({"datasets": ["products"], "text": text, "limit": 3}));
+            assert_eq!(validate_request(&r), None, "text={text:?}");
+            let err = SearchRequest::try_from(r).expect_err("empty text must fail try_from");
+            assert_eq!(err, "Search text must not be empty", "text={text:?}");
         }
     }
 }

@@ -32,7 +32,6 @@ use futures::{Stream, TryStreamExt as _};
 use rand::RngExt as _;
 use runtime::{
     Runtime,
-    accelerated::refresh::Refresh,
     auth::EndpointAuth,
     component::dataset::acceleration::{Acceleration, Engine},
     config::Config,
@@ -55,9 +54,11 @@ const LOCALHOST: IpAddr = IpAddr::V4(Ipv4Addr::LOCALHOST);
 
 mod do_get;
 mod do_put;
+mod prepared_statement_handles;
 mod prepared_statements;
 mod query_errors;
 mod server_timing;
+mod sidecar;
 mod statement_substrait_plan;
 mod statement_update;
 mod trace_id;
@@ -263,7 +264,6 @@ async fn register_test_table(
             engine: Engine::Arrow,
             ..Acceleration::default()
         },
-        Refresh::default(),
         None,
         Arc::new(RwLock::new(Secrets::default())),
         runtime,

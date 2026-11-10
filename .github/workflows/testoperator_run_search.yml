@@ -1,5 +1,5 @@
 name: testoperator search tests
-run-name: bench - ${{ github.event.inputs.benchmark_dataset }} - ${{ github.event.inputs.spicepod_path }}
+run-name: bench - ${{ github.event.inputs.spicepod_path }}
 
 on:
   workflow_dispatch:
@@ -20,35 +20,34 @@ on:
         options:
           - 'spiceai-dev-runners'
           - 'spiceai-dev-large-runners'
-      benchmark_dataset:
-        description: 'Built-in MTEB dataset to run against. Select "custom" to test the spicepod as-is.'
-        required: false
-        default: 'custom'
-        type: choice
-        options:
-          - 'custom'
-          - 'quora_retrieval'
-          - 'miracl_en_retrieval'
-          - 'fiqa_retrieval'
-          - 'trec_covid_retrieval'
-          - 'arguana_retrieval'
-          - 'scidocs_retrieval'
-          - 'scifact_retrieval'
-          - 'nfcorpus_retrieval'
-          - 'touche2020_retrieval'
-          - 'msmarco_retrieval'
-          - 'stackoverflow_qa_retrieval'
       ready_wait:
         description: 'Seconds to wait for the spiced instance to become ready'
         required: false
         default: 1800
         type: number
+      sql_pipeline:
+        description: 'Parameterized SQL search pipeline: a file path or the SQL text. Leave empty to search through /v1/search.'
+        required: false
+        default: ''
+        type: string
 
 jobs:
   run-bench:
     name: Run Search tests
     runs-on: ${{ github.event.inputs.runner_type }}
     timeout-minutes: 600
+    # Holds the OpenAI workload identity federation IDs (`OPENAI_*` secrets).
+    environment: ci
+    permissions:
+      contents: read
+      actions: read
+      # Exchanged for OpenAI access tokens: workload identity federation.
+      id-token: write
+    env:
+      # Workload identity federation: spiced and the tests exchange this job's GitHub OIDC token
+      # for provider access tokens with these IDs, and exchange again before each expires.
+      OPENAI_IDENTITY_PROVIDER_ID: ${{ secrets.OPENAI_IDENTITY_PROVIDER_ID }}
+      OPENAI_SERVICE_ACCOUNT_ID: ${{ secrets.OPENAI_SERVICE_ACCOUNT_ID }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -62,19 +61,45 @@ jobs:
           fi
           echo "Spicepod file found at ${{ github.event.inputs.spicepod_path }}"
 
+      - name: Validate SQL pipeline
+        if: github.event.inputs.sql_pipeline != ''
+        env:
+          SQL_PIPELINE: ${{ github.event.inputs.sql_pipeline }}
+        run: |
+          # Same rule as `testoperator run search --sql-pipeline`: a value that ends with `.sql` or
+          # has no whitespace is a file path, and other values are SQL text.
+          if [ -f "$SQL_PIPELINE" ]; then
+            echo "SQL pipeline file found at $SQL_PIPELINE"
+          elif [[ "$SQL_PIPELINE" == *.sql || "$SQL_PIPELINE" != *[[:space:]]* ]]; then
+            echo "Error: SQL pipeline file not found at $SQL_PIPELINE"
+            exit 1
+          else
+            echo "SQL pipeline is inline SQL"
+          fi
+
+      - name: Get RustFS credentials
+        id: rustfs
+        uses: ./.github/actions/rustfs-credentials
+        with:
+          endpoint: ${{ vars.TEST_MINIO_ENDPOINT }}
+          duration-seconds: '36000'
+          export-env: 'false'
+
       - name: Install MinIO
         uses: ./.github/actions/setup-minio
         with:
-          minio_endpoint: ${{ secrets.TEST_MINIO_ENDPOINT }}
-          minio_access_key: ${{ secrets.TEST_MINIO_ACCESS_KEY }}
-          minio_secret_key: ${{ secrets.TEST_MINIO_SECRET_KEY }}
+          minio_endpoint: ${{ vars.TEST_MINIO_ENDPOINT }}
+          minio_access_key: ${{ steps.rustfs.outputs.access-key-id }}
+          minio_secret_key: ${{ steps.rustfs.outputs.secret-access-key }}
+          minio_session_token: ${{ steps.rustfs.outputs.session-token }}
 
       - name: Build spicepod validator
         uses: ./.github/actions/build-spicepod-validator
         with:
-          minio_endpoint: ${{ secrets.TEST_MINIO_ENDPOINT }}
-          minio_access_key: ${{ secrets.TEST_MINIO_ACCESS_KEY }}
-          minio_secret_key: ${{ secrets.TEST_MINIO_SECRET_KEY }}
+          minio_endpoint: ${{ vars.TEST_MINIO_ENDPOINT }}
+          minio_access_key: ${{ steps.rustfs.outputs.access-key-id }}
+          minio_secret_key: ${{ steps.rustfs.outputs.secret-access-key }}
+          minio_session_token: ${{ steps.rustfs.outputs.session-token }}
 
       - name: Validate spicepod
         run: |
@@ -92,9 +117,10 @@ jobs:
       - name: Build Testoperator
         uses: ./.github/actions/build-testoperator
         with:
-          minio_endpoint: ${{ secrets.TEST_MINIO_ENDPOINT }}
-          minio_access_key: ${{ secrets.TEST_MINIO_ACCESS_KEY }}
-          minio_secret_key: ${{ secrets.TEST_MINIO_SECRET_KEY }}
+          minio_endpoint: ${{ vars.TEST_MINIO_ENDPOINT }}
+          minio_access_key: ${{ steps.rustfs.outputs.access-key-id }}
+          minio_secret_key: ${{ steps.rustfs.outputs.secret-access-key }}
+          minio_session_token: ${{ steps.rustfs.outputs.session-token }}
 
       - name: Extract spicepod filename path
         id: extract_spicepod_filename
@@ -103,28 +129,42 @@ jobs:
           SPICEPOD_FILENAME=$(basename $SPICEPOD_PATH)
           echo "SPICEPOD_FILENAME=${SPICEPOD_FILENAME}" >> $GITHUB_OUTPUT
 
+      # Short-lived AWS credentials, kept out of the job's environment and passed to the step below.
+      - name: Assume the S3 Vectors role
+        id: aws-s3-vectors
+        uses: aws-actions/configure-aws-credentials@e1253824e5c10ff9df46874f81ed3ec929e19cfd # v6.3.0
+        with:
+          role-to-assume: ${{ secrets.AWS_S3_VECTORS_ROLE_ARN }}
+          role-session-name: gha-s3-vectors-${{ github.run_id }}
+          role-duration-seconds: 36000
+          aws-region: us-east-1
+          output-env-credentials: false
+          output-credentials: true
+
       - name: Run the benchmark test - ${{ steps.extract_spicepod_filename.outputs.SPICEPOD_FILENAME }}
         env:
-          BENCHMARK_DATASET: ${{ github.event.inputs.benchmark_dataset }}
-          S3_ENDPOINT: ${{ secrets.TEST_MINIO_ENDPOINT }}
-          S3_KEY: ${{ secrets.TEST_MINIO_ACCESS_KEY }}
-          S3_SECRET: ${{ secrets.TEST_MINIO_SECRET_KEY }}
-          OPENAI_API_KEY: ${{ secrets.SPICE_SECRET_OPENAI_API_KEY }}
-          AWS_S3_VECTORS_KEY: ${{ secrets.AWS_S3_VECTORS_KEY }}
-          AWS_S3_VECTORS_SECRET: ${{ secrets.AWS_S3_VECTORS_SECRET }}
+          SQL_PIPELINE: ${{ github.event.inputs.sql_pipeline }}
+          S3_ENDPOINT: ${{ vars.TEST_MINIO_ENDPOINT }}
+          S3_KEY: ${{ steps.rustfs.outputs.access-key-id }}
+          S3_SECRET: ${{ steps.rustfs.outputs.secret-access-key }}
+          S3_SESSION_TOKEN: ${{ steps.rustfs.outputs.session-token }}
+          AWS_S3_VECTORS_KEY: ${{ steps.aws-s3-vectors.outputs.aws-access-key-id }}
+          AWS_S3_VECTORS_SECRET: ${{ steps.aws-s3-vectors.outputs.aws-secret-access-key }}
+          AWS_S3_VECTORS_SESSION_TOKEN: ${{ steps.aws-s3-vectors.outputs.aws-session-token }}
           SPICEAI_BENCHMARK_METRICS_KEY: ${{ secrets.SPICEAI_BENCHMARK_METRICS_KEY }}
           SPICED_COMMIT: ${{ steps.setup-spiced.outputs.SPICED_COMMIT }}
         run: |
           rm -rf .spice/data
-          # A "custom" (or empty) selection tests the spicepod as-is: omit --benchmark-dataset so the
-          # tool runs a custom search rather than downloading an MTEB dataset.
-          dataset_flag=""
-          if [ -n "$BENCHMARK_DATASET" ] && [ "$BENCHMARK_DATASET" != "custom" ]; then
-            dataset_flag="--benchmark-dataset $BENCHMARK_DATASET"
+          # The spicepod loads its own data and names it in `metadata.benchmark_dataset`.
+          # An empty SQL pipeline sends each query to /v1/search; a set one (file or SQL) sends it to
+          # /v1/sql.
+          sql_pipeline_args=()
+          if [ -n "$SQL_PIPELINE" ]; then
+            sql_pipeline_args=(--sql-pipeline "$SQL_PIPELINE")
           fi
           testoperator run search \
             --ready-wait ${{ github.event.inputs.ready_wait }} \
             --concurrency 10 \
-            $dataset_flag \
+            "${sql_pipeline_args[@]}" \
             --metrics \
             -p "${{ github.event.inputs.spicepod_path }}"

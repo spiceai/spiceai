@@ -1,0 +1,59 @@
+name: metrics-agreement-cdc
+description: >
+  Metrics agree with a known workload: change capture of 100 inserts, 40
+  updates and 10 deletes applies exactly 150 rows and absorbs exactly 10
+  deleted keys; one miss and two hits of the same query move the results
+  cache's misses, hits and requests by exactly 1, 2 and 3; and a refresh that
+  fails because its source is down counts exactly one refresh error.
+
+sources:
+  src: { kind: postgres }
+
+spicepod:
+  version: v1
+  kind: Spicepod
+  name: metrics-agreement-cdc
+  runtime: { caching: { sql_results: { enabled: true, item_ttl: 300s } } }
+  datasets:
+    - from: postgres:public.t
+      name: c
+      params: ${sources.src.params}
+      acceleration: { enabled: true, engine: cayenne, mode: file, refresh_mode: changes, primary_key: id }
+    - from: postgres:public.t
+      name: f
+      params: ${sources.src.params}
+      acceleration: { enabled: true, engine: cayenne, mode: file, refresh_mode: full }
+
+steps:
+  - source-exec: { src: "CREATE TABLE t (id int PRIMARY KEY, v int); INSERT INTO t SELECT i, i FROM generate_series(1, 100) i" }
+  - start: {}
+  - query: SELECT count(*) AS n FROM c
+    expect: { rows: [['100']] }
+    eventually: 30s
+
+  - mark-metrics: before-cdc
+  - source-exec: { src: "INSERT INTO t SELECT i, i FROM generate_series(101, 200) i; UPDATE t SET v = 0 WHERE id <= 40; DELETE FROM t WHERE id > 190" }
+  # Past the results cache, which ages answers out on its TTL rather than on
+  # each change.
+  - http: { method: POST, path: /v1/sql, headers: { cache-control: no-cache }, body: 'SELECT count(*) AS n, sum(v) AS s FROM c' }
+    expect: { status: 200, body-contains: '"n":190,"s":17325' }
+    eventually: 30s
+  - wait-metric: { name: dataset_acceleration_cdc_apply_burst_rows_total, labels: { dataset: c }, increased-by: 150, since: before-cdc, timeout: 30s }
+  - wait-metric: { name: cayenne_cdc_absorbed_delete_keys_total, labels: { table: c }, increased-by: 10, since: before-cdc, timeout: 30s }
+
+  - mark-metrics: before-cache
+  - http: { method: POST, path: /v1/sql, body: SELECT count(*) AS agree_n FROM f }
+    expect: { status: 200, headers: { results-cache-status: MISS } }
+  - http: { method: POST, path: /v1/sql, body: SELECT count(*) AS agree_n FROM f }
+    expect: { status: 200, headers: { results-cache-status: HIT } }
+  - http: { method: POST, path: /v1/sql, body: SELECT count(*) AS agree_n FROM f }
+    expect: { status: 200, headers: { results-cache-status: HIT } }
+  - wait-metric: { name: results_cache_misses, increased-by: 1, since: before-cache, timeout: 30s }
+  - wait-metric: { name: results_cache_hits, increased-by: 2, since: before-cache, timeout: 30s }
+  - wait-metric: { name: results_cache_requests, increased-by: 3, since: before-cache, timeout: 30s }
+
+  - mark-metrics: before-failure
+  - stop-source: src
+  - refresh: f
+    expect-error: true
+  - wait-metric: { name: dataset_acceleration_refresh_errors, labels: { dataset: f }, increased-by: 1, since: before-failure, timeout: 30s }

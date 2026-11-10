@@ -145,12 +145,12 @@ async fn construct_model(
         ModelSource::OpenAi => {
             let p = typed_params::<OpenAiModelParams>(component, params, source.clone(), secrets)
                 .await?;
-            openai(model_id, params, &p)
+            openai(&component.name, model_id, params, &p).await
         }
         ModelSource::Azure => {
             let p = typed_params::<AzureModelParams>(component, params, source.clone(), secrets)
                 .await?;
-            azure(model_id, component.name.as_str(), &p)
+            azure(model_id, component.name.as_str(), &p).await
         }
         ModelSource::Xai => {
             let p =
@@ -184,11 +184,7 @@ async fn construct_model(
 pub fn get_openai_responses_request_overrides(model: &Model, prefix: &str) -> Vec<(String, Value)> {
     let mut request_overrides: HashMap<String, Value> = HashMap::new();
     for &key in OPENAI_RESPONSES_DEFAULT_PARAM_KEYS.iter() {
-        if let Some(value) = model.params.get(key) {
-            request_overrides.insert(key.to_string(), value.clone());
-        } else if let Some(value) = model.params.get(&format!("{prefix}_{key}")) {
-            request_overrides.insert(key.to_string(), value.clone());
-        } else if let Some(value) = model.params.get(&format!("openai_{key}")) {
+        if let Some(value) = crate::model::chat::request_default(model, prefix, key) {
             request_overrides.insert(key.to_string(), value.clone());
         }
     }
@@ -196,7 +192,8 @@ pub fn get_openai_responses_request_overrides(model: &Model, prefix: &str) -> Ve
     request_overrides.into_iter().collect()
 }
 
-fn openai(
+async fn openai(
+    model_name: &str,
     model_id: Option<String>,
     raw_params: &HashMap<String, SecretString>,
     params: &OpenAiModelParams,
@@ -224,68 +221,46 @@ fn openai(
         });
     }
 
-    Ok(Arc::new(llms::openai::new_openai_client(
-        model_id.unwrap_or(DEFAULT_LLM_MODEL.to_string()),
-        api_base,
+    let model = model_id.unwrap_or(DEFAULT_LLM_MODEL.to_string());
+    let label = format!("model '{model_name}' (openai)");
+    if let Some(client) = llms::workload_identity::openai_federated_client(
+        &label,
+        &model,
+        &params.federation(),
+        llms::workload_identity::openai_api_key_in_spicepod(raw_params),
+        llms::openai::ChatBackend::ChatCompletions,
+    )
+    .await
+    .map_err(llms::workload_identity::FederationError::into_llm_error)?
+    {
+        return Ok(Arc::new(client) as Arc<dyn Responses>);
+    }
+    if let Some(message) = llms::workload_identity::openai_missing_credential(
+        &label,
         api_key,
-        org_id,
-        project_id,
-        usage_tier,
+        params.endpoint.as_str(),
+    ) {
+        return Err(LlmError::FailedToAuthenticate {
+            source: message.into(),
+        });
+    }
+
+    Ok(Arc::new(llms::openai::new_openai_client(
+        model, api_base, api_key, org_id, project_id, usage_tier,
     )) as Arc<dyn Responses>)
 }
 
-fn azure(
+async fn azure(
     model_id: Option<String>,
-    model_name: &str,
+    component_name: &str,
     params: &AzureModelParams,
 ) -> Result<Arc<dyn Responses>, LlmError> {
-    let Some(model_name) = model_id else {
-        return Err(LlmError::FailedToLoadModel {
-            source: format!(
-    "Azure model '{model_name}' requires a model ID in the format `from:azure:<model_id>`. See https://spiceai.org/docs/components/models/azure for details."
-).into(),
-        });
-    };
-    let api_base = params.endpoint.as_deref();
-    let api_version = params.api_version.as_deref();
-    let deployment_name = params.deployment_name.as_deref();
-    let api_key = params.api_key.as_ref().map(ExposeSecret::expose_secret);
-    let entra_token = params.entra_token.as_ref().map(ExposeSecret::expose_secret);
-
-    if api_base.is_none() {
-        return Err(LlmError::FailedToLoadModel {
-            source: format!(
-    "Azure model '{model_name}' requires the 'endpoint' parameter. See https://spiceai.org/docs/components/models/azure for details."
-).into(),
-        });
-    }
-
-    if api_key.is_some() && entra_token.is_some() {
-        return Err(LlmError::FailedToLoadModel {
-            source: format!(
-                "Azure model '{model_name}' allows only one of 'azure_api_key' or 'azure_entra_token'. See https://spiceai.org/docs/components/models/azure for details."
-            )
-            .into(),
-        });
-    }
-
-    if api_key.is_none() && entra_token.is_none() {
-        return Err(LlmError::FailedToLoadModel {
-            source: format!(
-                "Azure model '{model_name}' requires either 'azure_api_key' or 'azure_entra_token'. See https://spiceai.org/docs/components/models/azure for details."
-            )
-            .into(),
-        });
-    }
-
-    Ok(Arc::new(llms::openai::new_azure_client(
-        model_name,
-        api_base,
-        api_version,
-        deployment_name,
-        entra_token,
-        api_key,
-    )) as Arc<dyn Responses>)
+    Ok(
+        match super::chat::azure_client(model_id, component_name, params).await? {
+            super::chat::AzureClient::Federated(client) => Arc::new(client) as Arc<dyn Responses>,
+            super::chat::AzureClient::Key(client) => Arc::new(client) as Arc<dyn Responses>,
+        },
+    )
 }
 
 fn xai(model_id: Option<&str>, params: &XaiModelParams) -> Result<Arc<dyn Responses>, LlmError> {
@@ -301,6 +276,26 @@ fn xai(model_id: Option<&str>, params: &XaiModelParams) -> Result<Arc<dyn Respon
 mod tests {
     use super::*;
     use spicepod::component::model::Model;
+
+    #[test]
+    fn a_prefixed_responses_override_takes_precedence_over_its_bare_alias() {
+        let mut model = Model::new("azure:gpt-4o", "test_model");
+        model.params.insert(
+            "prompt_cache_key".to_string(),
+            Value::String("bare".to_string()),
+        );
+        model.params.insert(
+            "azure_prompt_cache_key".to_string(),
+            Value::String("prefixed".to_string()),
+        );
+        assert_eq!(
+            get_openai_responses_request_overrides(&model, "azure"),
+            vec![(
+                "prompt_cache_key".to_string(),
+                Value::String("prefixed".to_string())
+            )]
+        );
+    }
 
     #[test]
     fn test_get_openai_responses_request_overrides_with_prompt_cache() {

@@ -1,0 +1,43 @@
+name: slt-sqlite-select
+description: >
+  SQLite's sqllogictest select1-3 corpus (5,320 queries over one integer table)
+  answers through Spice as recorded, over PostgreSQL and MySQL, federated and
+  accelerated into Cayenne. A failure counts only when the source itself gives
+  the recorded answer; where it does not, the difference is the dialect's.
+  The corpus is not vendored: link SQLite's `test` directory (for example from
+  github.com/gregrahn/sqllogictest) to test/spicescript/slt-sqlite.
+
+sources:
+  src: { kind: '${matrix.source}' }
+
+matrix:
+  source: [postgres, mysql]
+  file: [select1.test, select2.test, select3.test]
+
+variants:
+  federated: {}
+  cayenne:
+    datasets: { '*': { acceleration: { enabled: true, engine: cayenne, mode: file, refresh_mode: full } } }
+
+spicepod:
+  version: v1
+  kind: Spicepod
+  name: slt-sqlite-select
+  datasets:
+    - from: '${matrix.source}:t1'
+      name: t1
+      params: ${sources.src.params}
+
+steps:
+  - slt-setup: { file: '../slt-sqlite/${matrix.file}', source: src }
+  - start: {}
+  - slt:
+      file: '../slt-sqlite/${matrix.file}'
+      source: src
+      # DataFusion limitations the source does not share, so an accelerated
+      # dataset rejects queries its federated form answers. Inventory, not passes.
+      known-errors:
+        # Correlated scalar subqueries with a non-equality correlation.
+        - Physical plan does not support logical expression ScalarSubquery
+        # Two unaliased scalar subqueries in one SELECT get the same name.
+        - Projections require unique expression names

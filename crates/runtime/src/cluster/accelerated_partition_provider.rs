@@ -21,6 +21,9 @@ limitations under the License.
 
 use std::sync::Arc;
 
+use app::App;
+use tokio::sync::RwLock;
+
 use arrow::datatypes::SchemaRef;
 use datafusion::{catalog::TableProvider, common::TableReference, datasource::DefaultTableSource};
 use datafusion_expr::TableScan;
@@ -32,12 +35,33 @@ use crate::accelerated::AcceleratedTable;
 /// Wraps an [`ExecutorRegistry`] with the `AcceleratedTable`-specific
 /// `should_partition` logic so it can be installed as a `TablePartitionProvider`.
 #[derive(Debug)]
-pub struct AcceleratedPartitionProvider(Arc<ExecutorRegistry>);
+pub struct AcceleratedPartitionProvider {
+    registry: Arc<ExecutorRegistry>,
+    /// The app whose partitioned datasets and views the scheduler discovers.
+    app: Option<Arc<RwLock<Option<Arc<App>>>>>,
+}
 
 impl AcceleratedPartitionProvider {
     #[must_use]
-    pub fn from_registry(registry: Arc<ExecutorRegistry>) -> Self {
-        Self(registry)
+    pub fn from_registry(
+        registry: Arc<ExecutorRegistry>,
+        app: Option<Arc<RwLock<Option<Arc<App>>>>>,
+    ) -> Self {
+        Self { registry, app }
+    }
+
+    /// Whether `table` is a dataset or view the app partitions with
+    /// `partition_by`, whose partitions the scheduler discovers. Assumed so
+    /// while the app is being replaced.
+    fn is_discovered(&self, table: &TableReference) -> bool {
+        let Some(app) = &self.app else {
+            return false;
+        };
+        let Ok(app) = app.try_read() else {
+            return true;
+        };
+        app.as_deref()
+            .is_some_and(|app| runtime_cluster::service::get_partition_config(app, table).is_some())
     }
 }
 
@@ -75,8 +99,8 @@ impl TablePartitionProvider for AcceleratedPartitionProvider {
         schema: &SchemaRef,
     ) -> datafusion::error::Result<PartitionProviders> {
         Ok(self
-            .0
-            .resolve_accelerated_partitions(table, schema)?
+            .registry
+            .resolve_accelerated_partitions(table, schema, self.is_discovered(table))?
             .into_iter()
             // Executors only materialize data for their assigned partitions; bucket filters are
             // redundant and expensive to evaluate per-row.

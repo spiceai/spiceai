@@ -30,11 +30,8 @@ proc verify_datasets_access {} {
             set catalog_page_available 1
             exp_continue
         }
-        " ERROR " {
-            # allow stream to complete
-            sleep 2
-            send_user "Error detected\n"
-            exit 1
+        -ex $::repl_error_marker {
+            repl_errored "Waiting for the list of datasets"
         }
         "chat> " {
             # end of model response
@@ -68,11 +65,8 @@ proc verify_num_issues {} {
     repl_send "How many issues stored in database?\r"
 
     expect {
-        " ERROR " {
-            # allow stream to complete
-            sleep 2
-            send_user "Error detected\n"
-            exit 1
+        -ex $::repl_error_marker {
+            repl_errored "Waiting for the issue count"
         }
         "chat> " {
             # end of model response
@@ -96,11 +90,8 @@ proc verify_catalog_page {} {
     repl_send "find top 3 exclusive deals in catalog pages. Respond with a short bullet list.\r"
 
     expect {
-        " ERROR " {
-            # allow stream to complete
-            sleep 2
-            send_user "Error detected\n"
-            exit 1
+        -ex $::repl_error_marker {
+            repl_errored "Waiting for the catalog page deals"
         }
         "chat> " {
             # end of model response

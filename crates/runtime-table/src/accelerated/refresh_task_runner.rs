@@ -21,7 +21,7 @@ use super::{
     metrics,
     refresh::RefreshOverrides,
     refresh_completion::RefreshRequestId,
-    refresh_task::{RefreshOutcome, RefreshTask},
+    refresh_task::{RefreshOutcome, RefreshTask, append_cursor::AppendCursorStore},
     synchronized_table::SynchronizedTable,
 };
 use futures::{FutureExt, future::BoxFuture};
@@ -30,7 +30,7 @@ use tokio::{
     select,
     sync::{
         Semaphore,
-        mpsc::{self, Receiver, Sender},
+        mpsc::{self, Sender},
     },
     task::JoinHandle,
 };
@@ -75,6 +75,8 @@ pub struct RefreshTaskRunnerBuilder {
     /// Forwarded to the refresh task so the caching stale-row refresh claims
     /// the keys it replaces.
     in_flight_revalidations: Option<crate::accelerated::caching::InFlightRevalidations>,
+    /// Where an append refresh keeps the source snapshot it last loaded.
+    append_cursor_store: Option<AppendCursorStore>,
 }
 
 impl RefreshTaskRunnerBuilder {
@@ -113,6 +115,7 @@ impl RefreshTaskRunnerBuilder {
             engine_type_rewrites: &[],
             snapshot_refresh_state: None,
             in_flight_revalidations: None,
+            append_cursor_store: None,
         }
     }
 
@@ -213,6 +216,13 @@ impl RefreshTaskRunnerBuilder {
         self
     }
 
+    /// Where an append refresh keeps the source snapshot it last loaded.
+    #[must_use]
+    pub fn with_append_cursor_store(mut self, store: Option<AppendCursorStore>) -> Self {
+        self.append_cursor_store = store;
+        self
+    }
+
     /// Shares the caching accelerator's claim set with the refresh task, so
     /// its periodic stale-row refresh claims the keys it replaces.
     #[must_use]
@@ -264,6 +274,9 @@ impl RefreshTaskRunnerBuilder {
         refresh_task_builder =
             refresh_task_builder.with_snapshot_refresh_state(self.snapshot_refresh_state);
 
+        refresh_task_builder =
+            refresh_task_builder.with_append_cursor_store(self.append_cursor_store);
+
         if let Some(flag) = self.initial_load_completed {
             refresh_task_builder = refresh_task_builder.with_initial_load_completed(flag);
         }
@@ -311,7 +324,7 @@ pub type RefreshRequest = (RefreshRequestId, Option<RefreshOverrides>);
 pub type RefreshTaskCompletion = (RefreshRequestId, super::Result<RefreshOutcome>);
 
 type RefreshTaskStartSender = Sender<RefreshRequest>;
-type RefreshTaskCompletionReceiver = Receiver<RefreshTaskCompletion>;
+type RefreshTaskCompletionReceiver = mpsc::UnboundedReceiver<RefreshTaskCompletion>;
 
 impl RefreshTaskRunner {
     #[expect(clippy::too_many_arguments)]
@@ -350,8 +363,10 @@ impl RefreshTaskRunner {
 
         let (start_refresh, mut on_start_refresh) = mpsc::channel::<RefreshRequest>(1);
 
+        // Unbounded, so reporting a finished refresh never waits on the refresher: the
+        // refresher can itself be waiting to hand this loop its next request.
         let (notify_refresh_complete, on_refresh_complete) =
-            mpsc::channel::<RefreshTaskCompletion>(1);
+            mpsc::unbounded_channel::<RefreshTaskCompletion>();
 
         let dataset_name = self.dataset_name.clone();
         let notify_refresh_complete = Arc::new(notify_refresh_complete);
@@ -367,6 +382,8 @@ impl RefreshTaskRunner {
             // arriving mid-refresh replaces both together: the running future is
             // dropped by the `select!` below, so it never reports at all.
             let mut running_request: RefreshRequestId = 0;
+            // The owed reload the in-flight refresh runs as, if any.
+            let mut running_reload: Option<u64> = None;
 
             loop {
                 if let Some(task) = task_completion.take() {
@@ -375,13 +392,16 @@ impl RefreshTaskRunner {
                             match res {
                                 Ok(Ok(outcome)) => {
                                     tracing::debug!("Dataset {dataset_name} refreshed successfully ({outcome:?})");
-                                    if let Err(err) = notify_refresh_complete.send((running_request, Ok(outcome))).await {
+                                    if let Some(generation) = running_reload.take() {
+                                        base_refresh.write().await.reload_succeeded(generation);
+                                    }
+                                    if let Err(err) = notify_refresh_complete.send((running_request, Ok(outcome))) {
                                         tracing::debug!("Failed to send refresh task completion for dataset {dataset_name}: {err}");
                                     }
                                 },
                                 Ok(Err(err)) => {
                                     tracing::debug!("Dataset {dataset_name} failed to refresh with error: {err}");
-                                    if let Err(err) = notify_refresh_complete.send((running_request, Err(err))).await {
+                                    if let Err(err) = notify_refresh_complete.send((running_request, Err(err))) {
                                         tracing::debug!("Failed to send refresh task completion for dataset {dataset_name}: {err}");
                                     }
                                 },
@@ -400,7 +420,7 @@ impl RefreshTaskRunner {
                                         message: panic_message.clone(),
                                     };
 
-                                    if let Err(err) = notify_refresh_complete.send((running_request, Err(panic_error))).await {
+                                    if let Err(err) = notify_refresh_complete.send((running_request, Err(panic_error))) {
                                         tracing::debug!("Failed to send refresh task completion for dataset {dataset_name}: {err}");
                                     }
                                 }
@@ -409,6 +429,7 @@ impl RefreshTaskRunner {
                         Some((request_id, overrides_opt)) = on_start_refresh.recv() => {
                             running_request = request_id;
                             let request = Self::create_refresh_from_overrides(Arc::clone(&base_refresh), overrides_opt).await;
+                            running_reload = request.reload.then_some(request.reload_generation);
                             task_completion = Some(Self::wrap_refresh_future(Arc::clone(&refresh_task), request));
                         }
                     }
@@ -417,6 +438,7 @@ impl RefreshTaskRunner {
                         Some((request_id, overrides_opt)) = on_start_refresh.recv() => {
                             running_request = request_id;
                             let request = Self::create_refresh_from_overrides(Arc::clone(&base_refresh), overrides_opt).await;
+                            running_reload = request.reload.then_some(request.reload_generation);
                             task_completion = Some(Self::wrap_refresh_future(Arc::clone(&refresh_task), request));
                         }
                         else => {
@@ -455,7 +477,7 @@ impl RefreshTaskRunner {
         if let Some(overrides) = overrides_opt {
             r = r.with_overrides(&overrides);
         }
-        r
+        r.for_run()
     }
 
     fn wrap_refresh_future(refresh_task: Arc<RefreshTask>, request: Refresh) -> RefreshRunFuture {
@@ -488,5 +510,223 @@ impl RefreshTaskRunner {
 impl Drop for RefreshTaskRunner {
     fn drop(&mut self) {
         self.abort();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use arrow::array::{Array, Int64Array, RecordBatch};
+    use arrow_schema::{DataType, Field, Schema};
+    use data_components::arrow::write::MemTable;
+    use datafusion::physical_plan::collect;
+    use datafusion::prelude::SessionContext;
+    use runtime_component::dataset::TimeFormat;
+    use runtime_component::dataset::acceleration::RefreshMode;
+
+    /// A refresh the timer or a client asks for while a reload is owed runs as that reload,
+    /// and its success settles it.
+    #[tokio::test]
+    async fn a_refresh_requested_while_a_reload_is_owed_reloads_and_settles_it() {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("ts", DataType::Int64, false),
+        ]));
+        // Ids 1 to 6 are older (ts 1 to 6) than those the acceleration holds (7 to 12, ts 107 to 112).
+        let rows = |ids: std::ops::RangeInclusive<i64>| {
+            let ts = ids
+                .clone()
+                .map(|id| if id <= 6 { id } else { id + 100 })
+                .collect::<Vec<_>>();
+            RecordBatch::try_new(
+                Arc::clone(&schema),
+                vec![
+                    Arc::new(Int64Array::from(ids.collect::<Vec<_>>())),
+                    Arc::new(Int64Array::from(ts)),
+                ],
+            )
+            .expect("batch builds")
+        };
+        let accelerator = Arc::new(
+            MemTable::try_new(Arc::clone(&schema), vec![vec![rows(7..=12)]])
+                .expect("accelerator builds"),
+        ) as Arc<dyn TableProvider>;
+        let source = Arc::new(
+            MemTable::try_new(Arc::clone(&schema), vec![vec![rows(1..=12)]])
+                .expect("source builds"),
+        ) as Arc<dyn TableProvider>;
+        let mut refresh = Refresh::new(RefreshMode::Append)
+            .time_column("ts".to_string())
+            .time_format(TimeFormat::UnixSeconds);
+        refresh.owe_reload();
+        let refresh = Arc::new(RwLock::new(refresh));
+        let mut runner = RefreshTaskRunner::builder(
+            status::RuntimeStatus::new(),
+            TableReference::bare("owed_reload"),
+            Arc::new(FederatedTable::new_unchecked(source)),
+            None,
+            Arc::clone(&refresh),
+            Arc::clone(&accelerator),
+            Handle::current(),
+            Arc::new(Mutex::new(())),
+        )
+        .build();
+        let (start, mut completed) = runner.start().expect("the runner starts");
+
+        start.send((1, None)).await.expect("the request is sent");
+        let (id, outcome) = completed.recv().await.expect("the refresh completes");
+        assert_eq!(id, 1);
+        outcome.expect("the refresh succeeds");
+
+        let ctx = SessionContext::new();
+        let plan = accelerator
+            .scan(&ctx.state(), None, &[], None)
+            .await
+            .expect("the acceleration scans");
+        let mut ids: Vec<i64> = collect(plan, ctx.task_ctx())
+            .await
+            .expect("the acceleration reads")
+            .iter()
+            .flat_map(|batch| {
+                let ids = batch
+                    .column(0)
+                    .as_any()
+                    .downcast_ref::<Int64Array>()
+                    .expect("id is Int64");
+                (0..ids.len()).map(|i| ids.value(i)).collect::<Vec<_>>()
+            })
+            .collect();
+        ids.sort_unstable();
+        assert_eq!(ids, (1..=12).collect::<Vec<_>>());
+        assert!(!refresh.read().await.reload, "the reload is settled");
+    }
+
+    fn id_ts_schema() -> Arc<Schema> {
+        Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("ts", DataType::Int64, true),
+        ]))
+    }
+
+    fn id_ts_rows(schema: &Arc<Schema>, ids: std::ops::RangeInclusive<i64>) -> RecordBatch {
+        RecordBatch::try_new(
+            Arc::clone(schema),
+            vec![
+                Arc::new(Int64Array::from(ids.clone().collect::<Vec<_>>())),
+                Arc::new(Int64Array::from(ids.collect::<Vec<_>>())),
+            ],
+        )
+        .expect("batch builds")
+    }
+
+    async fn acceleration_ids(accelerator: &Arc<dyn TableProvider>) -> Vec<i64> {
+        let ctx = SessionContext::new();
+        let plan = accelerator
+            .scan(&ctx.state(), None, &[], None)
+            .await
+            .expect("the acceleration scans");
+        let mut ids: Vec<i64> = collect(plan, ctx.task_ctx())
+            .await
+            .expect("the acceleration reads")
+            .iter()
+            .flat_map(|batch| {
+                let ids = batch
+                    .column(0)
+                    .as_any()
+                    .downcast_ref::<Int64Array>()
+                    .expect("id is Int64");
+                (0..ids.len()).map(|i| ids.value(i)).collect::<Vec<_>>()
+            })
+            .collect();
+        ids.sort_unstable();
+        ids
+    }
+
+    /// Runs one refresh of an append dataset `events` (time column `ts`) holding ids 1 to
+    /// 6, whose source holds ids 1 to 12, with `overrides` sent straight to the worker,
+    /// past the checks made before a refresh is queued.
+    async fn run_append_refresh_with(
+        overrides: RefreshOverrides,
+    ) -> (super::super::Result<RefreshOutcome>, Vec<i64>) {
+        let schema = id_ts_schema();
+        let accelerator = Arc::new(
+            MemTable::try_new(Arc::clone(&schema), vec![vec![id_ts_rows(&schema, 1..=6)]])
+                .expect("accelerator builds"),
+        ) as Arc<dyn TableProvider>;
+        let source = Arc::new(
+            MemTable::try_new(Arc::clone(&schema), vec![vec![id_ts_rows(&schema, 1..=12)]])
+                .expect("source builds"),
+        ) as Arc<dyn TableProvider>;
+        let refresh = Refresh::new(RefreshMode::Append)
+            .time_column("ts".to_string())
+            .time_format(TimeFormat::UnixSeconds);
+        let mut runner = RefreshTaskRunner::builder(
+            status::RuntimeStatus::new(),
+            TableReference::bare("events"),
+            Arc::new(FederatedTable::new_unchecked(source)),
+            None,
+            Arc::new(RwLock::new(refresh)),
+            Arc::clone(&accelerator),
+            Handle::current(),
+            Arc::new(Mutex::new(())),
+        )
+        .build();
+        let (start, mut completed) = runner.start().expect("the runner starts");
+        start
+            .send((1, Some(overrides)))
+            .await
+            .expect("the request is sent");
+        let (id, outcome) = completed.recv().await.expect("the refresh completes");
+        assert_eq!(id, 1);
+        (outcome, acceleration_ids(&accelerator).await)
+    }
+
+    /// A refresh in a mode only another worker drives, or none, fails the refresh with
+    /// an error naming the mode, instead of panicking the worker.
+    #[tokio::test]
+    async fn a_refresh_in_a_mode_the_worker_cannot_run_fails_without_panicking() {
+        for mode in [RefreshMode::Changes, RefreshMode::Disabled] {
+            let (outcome, ids) = run_append_refresh_with(RefreshOverrides {
+                sql: None,
+                mode: Some(mode),
+                max_jitter: None,
+            })
+            .await;
+            let err = outcome.expect_err("the refresh fails");
+            assert!(
+                matches!(err, super::super::Error::RefreshModeCannotRun { .. }),
+                "{mode:?}: {err}"
+            );
+            assert_eq!(
+                ids,
+                (1..=6).collect::<Vec<_>>(),
+                "{mode:?}: nothing is written"
+            );
+        }
+    }
+
+    /// A one-off `refresh_sql` that leaves out the time column fails an append refresh
+    /// before anything is written: its rows would carry a NULL time, and the next
+    /// append would read them again.
+    #[tokio::test]
+    async fn an_override_refresh_sql_without_the_time_column_writes_nothing() {
+        let (outcome, ids) = run_append_refresh_with(RefreshOverrides {
+            sql: Some("SELECT id FROM events".to_string()),
+            mode: None,
+            max_jitter: None,
+        })
+        .await;
+        let err = outcome.expect_err("the refresh fails");
+        assert!(err.to_string().contains("time_column 'ts'"), "{err}");
+        assert_eq!(ids, (1..=6).collect::<Vec<_>>());
+
+        let (outcome, ids) = run_append_refresh_with(RefreshOverrides {
+            sql: Some("SELECT id, ts FROM events".to_string()),
+            mode: None,
+            max_jitter: None,
+        })
+        .await;
+        outcome.expect("a refresh_sql that selects the time column refreshes");
+        assert_eq!(ids, (1..=12).collect::<Vec<_>>());
     }
 }

@@ -16,7 +16,6 @@ limitations under the License.
 
 use std::{
     net::{Ipv4Addr, Ipv6Addr},
-    str::FromStr,
     sync::Arc,
 };
 
@@ -34,7 +33,6 @@ use arrow::{
         TimestampSecondType, i256,
     },
 };
-use bigdecimal::{BigDecimal, ToPrimitive};
 use chrono::NaiveDate;
 use chrono_tz::Tz;
 use clickhouse_rs::{
@@ -75,13 +73,12 @@ pub(crate) enum Error {
         value: String,
     },
 
-    #[snafu(display("Cannot represent BigDecimal as i128: {big_decimal}"))]
-    FailedToConvertBigDecimalToI128 { big_decimal: BigDecimal },
-
-    #[snafu(display("Failed to parse decimal string as BigInteger '{value}': {source}"))]
-    FailedToParseBigDecimalFromClickhouse {
+    #[snafu(display(
+        "The {clickhouse_type} value {value} cannot be represented at the column's scale"
+    ))]
+    DecimalOutOfRange {
+        clickhouse_type: SqlType,
         value: String,
-        source: bigdecimal::ParseBigDecimalError,
     },
 
     #[snafu(display("Unsupported column type: {:?}", column_type))]
@@ -359,15 +356,14 @@ fn append_value(
             let scale = (*align).try_into().unwrap_or_default();
             append!(builder, Decimal128Builder, t, value, |v| {
                 let v = from_sql::<Decimal>(v, t)?;
-                let v = BigDecimal::from_str(v.to_string().as_str()).context(
-                    FailedToParseBigDecimalFromClickhouseSnafu {
+                let Some(unscaled) = decimal_to_i128(&v, scale) else {
+                    return DecimalOutOfRangeSnafu {
+                        clickhouse_type: t.clone(),
                         value: v.to_string(),
-                    },
-                )?;
-                let Some(v) = to_decimal_128(&v, scale) else {
-                    return FailedToConvertBigDecimalToI128Snafu { big_decimal: v }.fail();
+                    }
+                    .fail();
                 };
-                v
+                unscaled
             });
         }
         SqlType::Array(inner) => {
@@ -490,8 +486,19 @@ fn enum_name<V: Copy + PartialEq + std::fmt::Display>(
         })
 }
 
-fn to_decimal_128(decimal: &BigDecimal, scale: i8) -> Option<i128> {
-    (decimal * 10i128.pow(scale.try_into().unwrap_or_default())).to_i128()
+/// The unscaled value of `decimal` at `scale` digits after the point, as an
+/// Arrow `Decimal128` stores it.
+///
+/// This reads the driver's exact integer and scale rather than its text: the
+/// driver renders a negative value with no integer digits wrongly (-0.05 at
+/// scale 6 as `0.-50000`), so parsing the text failed or misread the value.
+/// Returns `None` when the value would lose digits at `scale` or overflow.
+fn decimal_to_i128(decimal: &Decimal, scale: i8) -> Option<i128> {
+    let unscaled = i128::from(decimal.internal::<i64>());
+    let target = u32::try_from(scale).ok()?;
+    let source = u32::try_from(decimal.scale()).ok()?;
+    let widen = target.checked_sub(source)?;
+    unscaled.checked_mul(10i128.checked_pow(widen)?)
 }
 
 #[cfg(test)]
@@ -564,6 +571,50 @@ mod tests {
             SqlType::Date,
             "a Date32 column no longer reports SqlType::Date, so block_to_arrow's Date arm does \
              not claim it and the column is rejected as an unsupported type"
+        );
+    }
+
+    /// A negative decimal with no integer digits decodes to its exact value.
+    /// The driver renders -0.05 at scale 6 as `0.-50000`, so a decode that
+    /// parsed that text failed the whole query (#15545).
+    #[test]
+    fn negative_fractional_decimals_decode_exactly() {
+        use super::block_to_arrow;
+        use arrow::array::{Array, Decimal128Array};
+        use clickhouse_rs::{Block, types::Decimal};
+
+        let block = Block::new().add_column(
+            "d",
+            vec![
+                Some(Decimal::new(-500_000, 6)),
+                Some(Decimal::new(-50_000, 6)),
+                Some(Decimal::new(-12_345, 6)),
+                Some(Decimal::new(-1, 6)),
+                Some(Decimal::new(12_345_678, 6)),
+                None,
+            ],
+        );
+
+        let batch = block_to_arrow(&block).expect("decimal block converts");
+        let column = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<Decimal128Array>()
+            .expect("a ClickHouse Decimal column is a Decimal128 array");
+        assert_eq!(column.scale(), 6);
+        let values: Vec<Option<String>> = (0..column.len())
+            .map(|i| column.is_valid(i).then(|| column.value_as_string(i)))
+            .collect();
+        assert_eq!(
+            values,
+            vec![
+                Some("-0.500000".to_string()),
+                Some("-0.050000".to_string()),
+                Some("-0.012345".to_string()),
+                Some("-0.000001".to_string()),
+                Some("12.345678".to_string()),
+                None,
+            ]
         );
     }
 

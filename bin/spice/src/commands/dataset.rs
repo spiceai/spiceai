@@ -24,6 +24,9 @@ use ansi_colors::Color;
 use clap::{Args, Subcommand};
 use serde::{Deserialize, Serialize};
 use snafu::ResultExt;
+use spice_cloud_client::endpoints::{
+    DEFAULT_REGION as DEFAULT_CLOUD_REGION, is_spice_cloud_flight_endpoint, is_valid_region,
+};
 use std::collections::HashMap;
 use std::fs;
 use std::io::{self, BufRead, Write};
@@ -36,6 +39,37 @@ mod data_source {
     pub const S3: &str = "s3";
     pub const FTP: &str = "ftp";
     pub const SFTP: &str = "sftp";
+    pub const SPICE_AI: &str = "spice.ai";
+    pub const SPICEAI: &str = "spiceai";
+}
+
+/// Returns true if `from` reads from a Spice Cloud app, which requires `spiceai_region`.
+///
+/// Splits `from` the way the runtime does: the source ends at the first `://`, `:` or `/`,
+/// and a `from` with no delimiter defaults to the `spice.ai` source. A path that is a Flight
+/// URL needs a region only when it points at Spice Cloud (`spice.ai:https://flight.spiceai.io`),
+/// not at a self-hosted runtime (`spiceai:http://localhost:50051`).
+fn is_spice_cloud_source(from: &str) -> bool {
+    if from.is_empty() || from == "sink" {
+        return false;
+    }
+
+    let (source, path) = match from.find([':', '/']) {
+        Some(pos) => {
+            let delimiter_len = if from[pos..].starts_with("://") { 3 } else { 1 };
+            (&from[..pos], &from[pos + delimiter_len..])
+        }
+        None => (data_source::SPICE_AI, from),
+    };
+
+    if (source != data_source::SPICE_AI && source != data_source::SPICEAI) || path.is_empty() {
+        return false;
+    }
+
+    let is_flight_url = ["http://", "https://", "grpc://", "grpc+tls://"]
+        .iter()
+        .any(|scheme| path.starts_with(scheme));
+    !is_flight_url || is_spice_cloud_flight_endpoint(path)
 }
 
 /// Arguments for the dataset command.
@@ -213,6 +247,20 @@ fn configure_dataset() -> Result<()> {
         }
     }
 
+    // Handle region for Spice Cloud
+    if is_spice_cloud_source(&from) {
+        let region = prompt_with_default(&mut reader, "spiceai_region", DEFAULT_CLOUD_REGION)?;
+        if !is_valid_region(&region) {
+            return InvalidArgumentSnafu {
+                message: format!(
+                    "Invalid Spice Cloud region: {region}. To list available regions, run 'spice cloud regions'"
+                ),
+            }
+            .fail();
+        }
+        params.insert("spiceai_region".to_string(), region);
+    }
+
     // Ask about local acceleration
     let accelerate_str = prompt_with_default(&mut reader, "locally accelerate (y/n)?", "y")?;
     let accelerate = accelerate_str.is_empty() || accelerate_str.to_lowercase() == "y";
@@ -349,6 +397,42 @@ mod tests {
         assert!(!is_valid_dataset_name("my dataset")); // spaces
         assert!(!is_valid_dataset_name("my.dataset")); // dots
         assert!(!is_valid_dataset_name("my/dataset")); // slashes
+    }
+
+    #[test]
+    fn test_is_spice_cloud_source() {
+        assert!(is_spice_cloud_source(
+            "spice.ai/spiceai/quickstart/datasets/taxi_trips"
+        ));
+        assert!(is_spice_cloud_source("spice.ai:eth.recent_blocks"));
+        assert!(is_spice_cloud_source(
+            "spiceai:spiceai/quickstart/datasets/taxi_trips"
+        ));
+        assert!(is_spice_cloud_source("spiceai/eth.recent_blocks"));
+        // No source prefix defaults to spice.ai.
+        assert!(is_spice_cloud_source("eth.recent_blocks"));
+        // Spice Cloud Flight URLs still need a region.
+        assert!(is_spice_cloud_source("spice.ai:https://flight.spiceai.io"));
+        assert!(is_spice_cloud_source(
+            "spiceai:https://us-west-2-prod-aws-flight.spiceai.io"
+        ));
+        assert!(is_spice_cloud_source(
+            "spice.ai:grpc+tls://us-east-1-prod-aws-flight.spiceai.io:443"
+        ));
+
+        assert!(!is_spice_cloud_source("spiceai:http://localhost:50051"));
+        assert!(!is_spice_cloud_source(
+            "spice.ai:https://remote.example.com:50051"
+        ));
+        assert!(!is_spice_cloud_source(
+            "spice.ai:grpc+tls://remote.example.com:50051"
+        ));
+        assert!(!is_spice_cloud_source("spice.ai/"));
+        assert!(!is_spice_cloud_source("spiceaix:foo"));
+        assert!(!is_spice_cloud_source("s3://bucket/spice.ai/data.parquet"));
+        assert!(!is_spice_cloud_source("postgres:public.users"));
+        assert!(!is_spice_cloud_source("sink"));
+        assert!(!is_spice_cloud_source(""));
     }
 
     #[test]

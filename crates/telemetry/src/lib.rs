@@ -2489,10 +2489,6 @@ pub mod cayenne {
     /// `tier` label (`current` / `protected` / `cold` / `delete_vector` /
     /// `inline`) splits files, bytes, and rows so the growth can be attributed
     /// to the layer producing it.
-    #[expect(
-        clippy::too_many_lines,
-        reason = "one gauge family emitted per tier; splitting it would separate the label vocabulary from the values it labels"
-    )]
     pub fn track_table_storage(storage: &CayenneTableStorage, dimensions: &[KeyValue]) {
         let files = STORAGE_FILES.get_or_init(|| {
             operational_meter()

@@ -244,8 +244,9 @@ impl Decider {
                     span.in_scope(|| {
                         tracing::error!(target: "task_history", "{}", failure.telemetry());
                     });
+                    let remedy = failure.remedy();
                     exec_datafusion_err!(
-                        "{function}: model '{model_name}' could not answer a row, so the query stopped. Cause: {failure}. Retry the query, or pass `on_error => 'null'` to return NULL for rows the model cannot answer."
+                        "{function}: model '{model_name}' could not answer a row, so the query stopped. Cause: {failure}. {remedy}"
                     )
                 })?;
 
@@ -318,6 +319,18 @@ enum Failure {
 }
 
 impl Failure {
+    /// What the user can do when this failure stops the query.
+    fn remedy(&self) -> &'static str {
+        match self {
+            Self::Model(error) if !is_transient(error) => {
+                "Pass `on_error => 'null'` to return NULL for rows the model cannot answer."
+            }
+            Self::Model(_) | Self::Refused { .. } => {
+                "Retry the query, or pass `on_error => 'null'` to return NULL for rows the model cannot answer."
+            }
+        }
+    }
+
     /// Text for `runtime.task_history`, without provider response bodies.
     fn telemetry(&self) -> String {
         match self {
@@ -336,15 +349,24 @@ impl fmt::Display for Failure {
     }
 }
 
-/// Whether a failed call may succeed when made again.
+/// Whether a failed call may succeed when made again. Each attempt is billed, so a
+/// failure that the same request gets every time, such as a client error or a reply cut
+/// off at the output token limit, is not retried.
 fn is_transient(error: &EvaluateError) -> bool {
-    matches!(
-        error,
+    match error {
         EvaluateError::RateLimited { .. }
-            | EvaluateError::ServiceUnavailable { .. }
-            | EvaluateError::ModelCallFailed { .. }
-            | EvaluateError::UnparseableResponse { .. }
-    )
+        | EvaluateError::ServiceUnavailable { .. }
+        | EvaluateError::ModelCallFailed { .. }
+        | EvaluateError::UnparseableResponse { .. } => true,
+        EvaluateError::ReplyTruncated { .. }
+        | EvaluateError::InvalidRequest { .. }
+        | EvaluateError::AuthenticationFailed { .. }
+        | EvaluateError::PermissionDenied { .. }
+        | EvaluateError::ModelNotFound { .. }
+        | EvaluateError::HttpClientCreationFailed { .. }
+        | EvaluateError::HealthCheckFailed { .. }
+        | EvaluateError::RatePermitFailed { .. } => false,
+    }
 }
 
 /// Asks one row's questions, retrying transient failures.
@@ -467,6 +489,61 @@ mod tests {
             null_rows_warning("ai_if", "luna", 3, 8, &failure),
             "ai_if: model 'luna' could not answer 3 of 8 distinct inputs, so their rows return NULL (`on_error => 'null'`). First cause: Evaluation of model 'luna' failed: authentication failed"
         );
+    }
+
+    #[test]
+    fn only_a_failure_a_retry_can_change_is_transient() {
+        let model = || "luna".to_string();
+        let message = || "upstream".to_string();
+        for (error, transient) in [
+            (
+                EvaluateError::RateLimited {
+                    model: model(),
+                    message: message(),
+                },
+                true,
+            ),
+            (
+                EvaluateError::ServiceUnavailable {
+                    model: model(),
+                    message: message(),
+                },
+                true,
+            ),
+            (
+                EvaluateError::ModelCallFailed {
+                    model: model(),
+                    source: message().into(),
+                },
+                true,
+            ),
+            (EvaluateError::ReplyTruncated { model: model() }, false),
+            (
+                EvaluateError::InvalidRequest {
+                    model: model(),
+                    message: message(),
+                },
+                false,
+            ),
+            (
+                EvaluateError::PermissionDenied {
+                    model: model(),
+                    message: message(),
+                },
+                false,
+            ),
+            (
+                EvaluateError::ModelNotFound {
+                    model: model(),
+                    message: message(),
+                },
+                false,
+            ),
+        ] {
+            assert_eq!(is_transient(&error), transient, "{error:?}");
+            let retry_advised = Failure::Model(error).remedy().starts_with("Retry");
+            assert_eq!(retry_advised, transient);
+        }
     }
 
     #[test]

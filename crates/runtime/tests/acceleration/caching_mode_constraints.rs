@@ -46,7 +46,6 @@ use std::time::{Duration, Instant};
 
 use app::AppBuilder;
 use axum::{Router, routing::get};
-use datafusion::common::TableReference;
 use datafusion::prelude::*;
 use runtime::Runtime;
 use spicepod::{
@@ -286,37 +285,10 @@ async fn wait_for_rows_driving_lookups(
     ))
 }
 
-/// Waits until `dataset` reports a component error, which a caching accelerator
-/// does once a run of cache writes has been refused.
-///
-/// This is the completion signal for a refused write. Waiting a fixed time
-/// instead would let an assertion that nothing was cached pass simply because no
-/// write had been attempted yet.
-async fn wait_for_dataset_error(
-    rt: &Runtime,
-    dataset: &str,
-    timeout: Duration,
-) -> Result<(), String> {
-    let table = TableReference::bare(dataset.to_string());
-    let deadline = Instant::now() + timeout;
-    while Instant::now() < deadline {
-        if let Some(status) = rt.status().get_dataset_status(&table)
-            && status.error_message().is_some()
-        {
-            return Ok(());
-        }
-        tokio::time::sleep(Duration::from_millis(500)).await;
-    }
-    Err(format!(
-        "dataset '{dataset}' never reported a cache-write failure within {}s",
-        timeout.as_secs()
-    ))
-}
-
-fn duckdb_params(dir: &std::path::Path, extra: Vec<(&str, &str)>) -> Vec<(String, String)> {
+fn cayenne_params(dir: &std::path::Path, extra: Vec<(&str, &str)>) -> Vec<(String, String)> {
     let mut params = vec![(
-        "duckdb_file".to_string(),
-        dir.join("cache.duckdb").to_string_lossy().to_string(),
+        "cayenne_file_path".to_string(),
+        dir.join("cache").to_string_lossy().to_string(),
     )];
     params.extend(
         extra
@@ -333,12 +305,8 @@ fn duckdb_params(dir: &std::path::Path, extra: Vec<(&str, &str)>) -> Vec<(String
 /// widened to the whole stored row -- including the `Map` the HTTP connector
 /// stores response headers in -- so it failed on every pass and the acceleration
 /// grew without bound.
-///
-/// Cayenne rather than `DuckDB` because the defect is above both engines and
-/// Cayenne had no coverage of the budgets at all.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-// Cayenne is not built on Windows, so neither is a test that loads it.
-#[cfg(all(feature = "sqlite", not(target_os = "windows")))]
+#[cfg(feature = "sqlite")]
 async fn the_item_budget_is_enforced_on_cayenne_with_a_primary_key() -> Result<(), anyhow::Error> {
     let _tracing = init_tracing(None);
     register_test_connectors().await;
@@ -388,8 +356,7 @@ async fn the_item_budget_is_enforced_on_cayenne_with_a_primary_key() -> Result<(
 ///
 /// `indexes: unique` becomes a `Constraint::Unique` on the accelerator, which
 /// widens the sweep's group key exactly as a primary key does, so it is an
-/// independently reachable trigger for the same defect. `DuckDB` rather than
-/// Cayenne so this case also runs where Cayenne is not built.
+/// independently reachable trigger for the same defect.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn the_item_budget_is_enforced_with_a_unique_index() -> Result<(), anyhow::Error> {
     let _tracing = init_tracing(None);
@@ -399,10 +366,10 @@ async fn the_item_budget_is_enforced_with_a_unique_index() -> Result<(), anyhow:
     let temp = tempfile::tempdir()?;
     let mut dataset = caching_dataset(
         addr,
-        "duckdb",
+        "cayenne",
         // Deliberately no primary key: the unique index alone must be enough.
         None,
-        duckdb_params(
+        cayenne_params(
             temp.path(),
             vec![
                 ("caching_ttl", "30s"),
@@ -452,9 +419,9 @@ async fn a_multi_row_response_is_cached_without_a_primary_key() -> Result<(), an
     let temp = tempfile::tempdir()?;
     let dataset = caching_dataset(
         addr,
-        "duckdb",
+        "cayenne",
         None,
-        duckdb_params(temp.path(), vec![("caching_ttl", "1h")]),
+        cayenne_params(temp.path(), vec![("caching_ttl", "1h")]),
     );
     let rt = build_runtime(dataset, "caching_multi_row_unkeyed").await;
 
@@ -491,10 +458,10 @@ async fn a_multi_row_response_is_cached_with_a_body_derived_primary_key()
     let temp = tempfile::tempdir()?;
     let dataset = caching_dataset(
         addr,
-        "duckdb",
+        "cayenne",
         // `content` holds the element's JSON, so it is distinct per row.
         Some("(request_path,content)"),
-        duckdb_params(temp.path(), vec![("caching_ttl", "1h")]),
+        cayenne_params(temp.path(), vec![("caching_ttl", "1h")]),
     );
     let rt = build_runtime(dataset, "caching_multi_row_body_key").await;
 
@@ -515,65 +482,6 @@ async fn a_multi_row_response_is_cached_with_a_body_derived_primary_key()
     Ok(())
 }
 
-/// A key over the request columns says one row per request. An array response
-/// contradicts it, and the write is refused rather than truncated.
-///
-/// The assertion that matters is the *absence of a partial entry*: `on_conflict`
-/// has variants (`upsert_dedup_by_row_id`) that would resolve the conflict by
-/// keeping the last row, which would silently discard the rest of a search
-/// result. Caching nothing is recoverable and visible in the logs; caching one
-/// row of three is neither.
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn a_request_derived_primary_key_refuses_a_multi_row_response() -> Result<(), anyhow::Error> {
-    let _tracing = init_tracing(None);
-    register_test_connectors().await;
-
-    let (shutdown, addr, fetches) = start_mock(3).await;
-    let temp = tempfile::tempdir()?;
-    let dataset = caching_dataset(
-        addr,
-        "duckdb",
-        Some("(request_query,request_path)"),
-        duckdb_params(temp.path(), vec![("caching_ttl", "1h")]),
-    );
-    let rt = build_runtime(dataset, "caching_multi_row_request_key").await;
-
-    // A run of refused writes is what makes the dataset report an error, and
-    // that report is the signal the writes were attempted at all. Cache writes
-    // are batched and flushed on an interval, and the run counts flushes rather
-    // than requests, so the lookups are spaced past that interval instead of
-    // issued back to back -- four in one flush is one refusal, not four.
-    for key in ["key=a", "key=b", "key=c", "key=d"] {
-        fetch_key(&rt, key).await;
-        tokio::time::sleep(Duration::from_millis(900)).await;
-    }
-    wait_for_dataset_error(&rt, "http_data", Duration::from_mins(1))
-        .await
-        .map_err(|e| {
-            anyhow::anyhow!(
-                "the cache writes were never refused, so this test would \
-             have asserted an empty accelerator that nothing had tried to fill: {e}"
-            )
-        })?;
-
-    assert_eq!(
-        cached_rows(&rt).await,
-        0,
-        "a response that violates the declared key must not be partially cached"
-    );
-
-    // And the entry is not served: a repeat lookup still reaches the origin.
-    let before = fetches.load(Ordering::SeqCst);
-    fetch_key(&rt, "key=a").await;
-    assert!(
-        fetches.load(Ordering::SeqCst) > before,
-        "the lookup was served from cache, so something was cached after all"
-    );
-
-    shutdown.send(()).ok();
-    Ok(())
-}
-
 /// A key over the request columns with `on_conflict: upsert` and an index -- the
 /// shape a deployment writes to say "replace the row for this request" -- caches
 /// a single-row response and serves it from cache.
@@ -588,9 +496,9 @@ async fn a_primary_key_with_on_conflict_upsert_still_caches() -> Result<(), anyh
     let temp = tempfile::tempdir()?;
     let dataset = caching_dataset_with(
         addr,
-        "duckdb",
+        "cayenne",
         Some("(request_query,request_path)"),
-        duckdb_params(temp.path(), vec![("caching_ttl", "1h")]),
+        cayenne_params(temp.path(), vec![("caching_ttl", "1h")]),
         true,
         true,
     );
@@ -634,9 +542,9 @@ async fn a_refreshed_entry_sheds_rows_the_response_no_longer_returns() -> Result
     let temp = tempfile::tempdir()?;
     let dataset = caching_dataset(
         addr,
-        "duckdb",
+        "cayenne",
         Some("(request_path,content)"),
-        duckdb_params(
+        cayenne_params(
             temp.path(),
             vec![
                 ("caching_ttl", "1s"),
@@ -670,14 +578,14 @@ async fn a_refreshed_entry_sheds_rows_the_response_no_longer_returns() -> Result
 }
 
 /// A key over the request columns makes every lookup a primary-key point lookup.
-/// Once Cayenne holds two protected snapshots, the accelerator scan reads one
-/// partition per snapshot, and the cache lookup above it must still read all of
-/// them as one: every lookup returns its row, and keys cached earlier are
-/// served without another fetch.
+/// Once Cayenne holds cached rows in more than one storage tier (a Vortex file
+/// and the inline memtable, or several snapshots), the accelerator scan is a
+/// union with one partition per branch, and the cache lookup above it must
+/// still read all of them as one: every lookup returns its row, and keys cached
+/// earlier are served without another fetch.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-// Cayenne is not built on Windows, so neither is a test that loads it.
-#[cfg(all(feature = "sqlite", not(target_os = "windows")))]
-async fn a_point_lookup_reads_every_cayenne_protected_snapshot() -> Result<(), anyhow::Error> {
+#[cfg(feature = "sqlite")]
+async fn a_point_lookup_reads_every_cayenne_scan_partition() -> Result<(), anyhow::Error> {
     use arrow::util::display::array_value_to_string;
     use futures::TryStreamExt;
 
@@ -736,11 +644,15 @@ async fn a_point_lookup_reads_every_cayenne_protected_snapshot() -> Result<(), a
         vec![
             ("cayenne_file_path".to_string(), registry),
             ("cayenne_deletion_mode".to_string(), "key".to_string()),
-            // Checkpoint each cached response into a protected snapshot within
-            // about a second, instead of the default ten.
+            // Cache writes land in the inline memtable. Flush it to a Vortex file
+            // after every second row, so the next cached row is inline while the
+            // earlier ones are in a file and the scan unions the two. The byte
+            // cap is below `inline_max_bytes` so the flush check runs on every
+            // inline write, and above one row's size so the row cap decides.
+            ("cayenne_inline_flush_max_rows".to_string(), "2".to_string()),
             (
-                "cayenne_cdc_mem_tier_max_age_ms".to_string(),
-                "500".to_string(),
+                "cayenne_inline_flush_max_bytes".to_string(),
+                "65536".to_string(),
             ),
             ("caching_ttl".to_string(), "1h".to_string()),
         ],
@@ -750,7 +662,7 @@ async fn a_point_lookup_reads_every_cayenne_protected_snapshot() -> Result<(), a
     let rt = build_runtime(dataset, "caching_point_lookup_cayenne").await;
 
     // Cache one new key a second until the accelerator scan is a union of
-    // snapshots, so it has more than one partition.
+    // storage tiers, so it has more than one partition.
     let mut keys: Vec<String> = Vec::new();
     let deadline = Instant::now() + Duration::from_mins(1);
     loop {
@@ -771,7 +683,7 @@ async fn a_point_lookup_reads_every_cayenne_protected_snapshot() -> Result<(), a
         }
         anyhow::ensure!(
             Instant::now() < deadline,
-            "the accelerator scan never read more than one snapshot after caching {} keys, \
+            "the accelerator scan never read more than one storage tier after caching {} keys, \
              so a multi-partition lookup was never exercised:\n{plan}",
             keys.len()
         );

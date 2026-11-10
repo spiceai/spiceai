@@ -1,0 +1,73 @@
+name: flight-prepared
+description: >
+  Flight SQL prepared statements bind their parameters as PostgreSQL binds
+  the same values written into the SQL: `$n` and `?` placeholders, one and
+  more than ten parameters, parameters in CASE and COALESCE, NULL, mixed
+  types, the same statement run again with other values, over federated and
+  Cayenne-accelerated tables; a missing value is refused naming the
+  placeholder.
+
+sources:
+  src: { kind: postgres }
+
+variants:
+  federated: {}
+  cayenne: cayenne-file
+
+spicepod:
+  version: v1
+  kind: Spicepod
+  name: flight-prepared
+  datasets:
+    - { from: 'postgres:public.t', name: t, params: '${sources.src.params}' }
+
+defaults:
+  expect: { oracle: src }
+  compare-variants: false
+
+steps:
+  - source-exec:
+      src: |
+        CREATE TABLE t (id int PRIMARY KEY, name text, score double precision, n bigint, d date);
+        INSERT INTO t SELECT i, CASE WHEN i % 7 = 0 THEN NULL ELSE 'name ' || i END, i * 1.5, i * 1000, DATE '2024-01-01' + i FROM generate_series(1, 200) i;
+  - start: {}
+  - query: SELECT id, name FROM t WHERE id = $1
+    parameters: [42]
+    oracle-sql: SELECT id, name FROM t WHERE id = 42
+  - query: SELECT id, name FROM t WHERE id = $1
+    parameters: [43]
+    oracle-sql: SELECT id, name FROM t WHERE id = 43
+  - query: SELECT id FROM t WHERE id > ? AND score < ?
+    parameters: [10, 30.0]
+    oracle-sql: SELECT id FROM t WHERE id > 10 AND score < 30.0
+  - query: SELECT id FROM t WHERE name = $1 OR n = $2
+    parameters: ['name 5', 9000]
+    oracle-sql: SELECT id FROM t WHERE name = 'name 5' OR n = 9000
+  - query: SELECT id FROM t WHERE id IN ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
+    parameters: [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12]
+    oracle-sql: SELECT id FROM t WHERE id IN (1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12)
+  - query: SELECT id FROM t WHERE id IN (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    parameters: [101, 102, 103, 104, 105, 106, 107, 108, 109, 110, 111]
+    oracle-sql: SELECT id FROM t WHERE id IN (101, 102, 103, 104, 105, 106, 107, 108, 109, 110, 111)
+  - query: SELECT id, CASE WHEN score > $1 THEN $2 ELSE $3 END AS band FROM t WHERE id <= 20
+    parameters: [15.0, high, low]
+    oracle-sql: SELECT id, CASE WHEN score > 15.0 THEN 'high' ELSE 'low' END AS band FROM t WHERE id <= 20
+  # In a projection over Cayenne this fails (known-failing/datafusion/flight-prepared-coalesce.yaml).
+  - query: SELECT id, COALESCE(name, $1) AS name FROM t WHERE id <= 21
+    parameters: [missing]
+    oracle-sql: SELECT id, COALESCE(name, 'missing') AS name FROM t WHERE id <= 21
+    only: federated
+  - query: SELECT id, name FROM t WHERE COALESCE(name, $1) = $1 AND id <= 30
+    parameters: [missing]
+    oracle-sql: SELECT id, name FROM t WHERE COALESCE(name, 'missing') = 'missing' AND id <= 30
+  - query: SELECT id FROM t WHERE d >= $1 AND d < $2
+    parameters: ['2024-03-01', '2024-04-01']
+    oracle-sql: SELECT id FROM t WHERE d >= DATE '2024-03-01' AND d < DATE '2024-04-01'
+  - query: SELECT count(*) AS n FROM t WHERE name IS NOT DISTINCT FROM $1
+    parameters: [null]
+    oracle-sql: SELECT count(*) AS n FROM t WHERE name IS NULL
+  - query: SELECT count(*) AS n FROM t
+    parameters: []
+  - query: SELECT id FROM t WHERE id = $1 AND n = $2
+    parameters: [1]
+    expect-error: No value found for placeholder with id $2

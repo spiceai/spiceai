@@ -19,11 +19,11 @@ use util::fibonacci_backoff::FibonacciBackoffBuilder;
 
 pub mod acceleration;
 pub mod acceleration_source;
+pub mod cayenne_workload;
 pub mod change_sink;
 pub mod dataset_checkpoint;
 mod engine;
 pub mod layout;
-pub mod memory_budget;
 pub mod schema_change;
 pub mod sidecar;
 pub mod snapshot;
@@ -34,17 +34,21 @@ pub mod testing;
 pub use acceleration::Acceleration;
 pub use acceleration::ParseError as AccelerationParseError;
 pub use acceleration_source::AccelerationSource;
-pub use engine::Engine;
+pub use cayenne_workload::{CayenneAccelerationDemand, CayenneWorkload};
+pub use engine::{CAYENNE_MIGRATION_DOCS, Engine, removed_engine_message};
 pub use schema_change::OnSchemaChange;
 pub use sidecar::{AcceleratorSidecar, OpenOption};
-pub use snapshot::{SnapshotDownloadInfo, SnapshotPoll};
+pub use snapshot::{SnapshotDownloadInfo, SnapshotPoll, SnapshotPollOutcome};
 
 #[derive(Debug, Snafu)]
 pub enum Error {
     #[snafu(display(
-        "Unknown acceleration engine '{name}'. Valid engines are: arrow, duckdb, sqlite, turso, postgres/postgresql, cayenne/vortex. Docs: https://spiceai.org/docs/components/data-accelerators"
+        "Unknown acceleration engine '{name}'. Valid engines are: arrow, sqlite, postgres/postgresql, cayenne/vortex. Docs: https://spiceai.org/docs/components/data-accelerators"
     ))]
     AcceleratorEngineNotAvailable { name: String },
+
+    #[snafu(display("{}", engine::removed_engine_message(name)))]
+    AcceleratorEngineRemoved { name: &'static str },
 }
 
 /// Indicates whether a data accelerator was bootstrapped (initialized from existing data)

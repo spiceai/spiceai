@@ -38,9 +38,11 @@ limitations under the License.
 //! produces an identical rejection.
 
 pub mod config;
+pub mod dead_letter;
 pub mod element;
 pub mod error;
 pub mod model;
+pub mod queue;
 pub mod sink;
 pub mod transport;
 

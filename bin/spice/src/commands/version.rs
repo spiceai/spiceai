@@ -61,16 +61,24 @@ pub struct VersionArgs {
     pub output: OutputFormat,
 }
 
-/// Get the CLI version string.
+/// Get the CLI version string, naming the commit it was built from
+/// (`v2.5.0 (6c9b6e4a7e)`), as every build does.
 #[must_use]
 pub fn cli_version() -> String {
     let version = env!("CARGO_PKG_VERSION");
-    if cfg!(feature = "release") {
-        format!("v{version}")
-    } else {
-        let git_hash = option_env!("GIT_COMMIT_HASH").unwrap_or("unknown");
-        format!("v{version} ({git_hash})")
-    }
+    let git_hash = option_env!("GIT_COMMIT_HASH").unwrap_or("unknown");
+    format!("v{version} ({git_hash})")
+}
+
+/// The version a CLI or runtime reported, without the `(<commit>)` that follows
+/// it: `v2.5.0+models (6c9b6e4a7e)` becomes `v2.5.0+models`.
+///
+/// For a service that parses a semver version, such as Spice Cloud.
+#[must_use]
+pub fn without_commit(version: &str) -> &str {
+    version
+        .split_once(" (")
+        .map_or(version, |(semver, _)| semver)
 }
 
 /// Get just the semver version (e.g., "v1.2.3").
@@ -281,20 +289,33 @@ mod tests {
         );
     }
 
-    /// `spice version` prints the bare semver for a release build, and names
-    /// the commit for any other build.
+    /// `spice version` names the commit for every build, release builds
+    /// included, as a fixed 10-character hash.
     #[test]
     fn test_cli_version_format() {
-        let semver = format!("v{}", env!("CARGO_PKG_VERSION"));
-        let expected = if cfg!(feature = "release") {
-            semver
-        } else {
-            format!(
-                "{semver} ({})",
-                option_env!("GIT_COMMIT_HASH").unwrap_or("unknown")
-            )
-        };
-        assert_eq!(cli_version(), expected);
+        let hash = option_env!("GIT_COMMIT_HASH").unwrap_or("unknown");
+        assert_eq!(
+            cli_version(),
+            format!("v{} ({hash})", env!("CARGO_PKG_VERSION"))
+        );
+        assert!(
+            hash == "unknown" || (hash.len() == 10 && hash.chars().all(|c| c.is_ascii_hexdigit())),
+            "GIT_COMMIT_HASH must be a 10-character hash or 'unknown', got {hash:?}"
+        );
+    }
+
+    #[test]
+    fn without_commit_leaves_the_semver_version() {
+        assert_eq!(without_commit("v2.5.0 (6c9b6e4a7e)"), "v2.5.0");
+        assert_eq!(
+            without_commit("v2.5.0+models.metal (6c9b6e4a7e)"),
+            "v2.5.0+models.metal"
+        );
+        assert_eq!(
+            without_commit("v2.5.0-unstable-dev+models (6c9b6e4a7e)"),
+            "v2.5.0-unstable-dev+models"
+        );
+        assert_eq!(without_commit("v2.4.1+models"), "v2.4.1+models");
     }
 
     #[test]

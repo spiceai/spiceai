@@ -17,10 +17,10 @@ so no reviewer would catch the difference by reading the result.
 | [`evidence-rule/`](evidence-rule/) | Evidence — no claim without a reproduction |
 
 Each directory holds its own `README.md`, `evals.json`, `score_eval.py`, and
-frozen `fixtures/`, and follows the conventions of the prompt evals in
-[`.github/prompts/evals/`](../prompts/evals/): a scorer that takes `--eval` and
-`--output`, exits 0 only when every assertion passes, and prints per-assertion
-evidence with `--json`.
+frozen `fixtures/`, and follows the conventions of the skill evals in
+[`.agents/skills/write-release-notes/evals/`](../../.agents/skills/write-release-notes/evals/):
+a scorer that takes `--eval` and `--output`, exits 0 only when every assertion
+passes, and prints per-assertion evidence with `--json`.
 
 Two rules carry over from there, and both matter more here than they do for a
 prompt eval:

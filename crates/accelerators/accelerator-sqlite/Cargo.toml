@@ -20,6 +20,7 @@ edition.workspace = true
 version.workspace = true
 rust-version.workspace = true
 license-file.workspace = true
+repository.workspace = true
 description = "SQLite data accelerator: implements data-accelerator-api::DataAccelerator over a SQLite table provider."
 
 [dependencies]
@@ -48,7 +49,7 @@ util = { path = "../../util" }
 
 [dev-dependencies]
 runtime-acceleration = { path = "../../runtime-acceleration", features = ["sqlite", "test-support"] }
-datafusion-table-providers = { workspace = true, features = ["sqlite", "duckdb"] }
+datafusion-table-providers = { workspace = true, features = ["sqlite"] }
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
 
 [lints]

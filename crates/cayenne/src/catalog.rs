@@ -17,8 +17,8 @@ limitations under the License.
 //! Trait abstraction for metadata catalog operations.
 //!
 //! This trait defines the interface for managing table metadata
-//! and file references. It can be implemented by different RDBMS backends
-//! (`SQLite`, Turso, etc.).
+//! and file references. `CayenneCatalog` implements it over the `SQLite`
+//! metastore.
 
 use super::metadata::{
     ColdTierFile, CreateTableOptions, DeleteFile, IndexRunRecord, InlinedData, InlinedDataStats,
@@ -202,10 +202,13 @@ pub enum CatalogError {
     #[snafu(display("Failed to get partition data files. {source}"))]
     FailedToGetPartitionDataFiles { source: Box<CatalogError> },
 
+    /// The connection string names a scheme the metastore does not open. Only
+    /// `sqlite://` (or a bare path) is accepted, so a stray scheme fails here
+    /// rather than becoming part of a relative file path.
     #[snafu(display(
-        "Turso backend requested but 'turso' feature is not enabled. Enable with --features turso"
+        "Cayenne metastore connection strings must use 'sqlite://' or a bare path, but found '{scheme}://'"
     ))]
-    TursoNotEnabled,
+    UnsupportedMetastoreScheme { scheme: String },
 
     /// Constraint violation (e.g., unique constraint, foreign key constraint)
     /// Used for handling concurrent insert conflicts.
@@ -236,6 +239,28 @@ pub enum CatalogError {
         "the existing acceleration of dataset '{table_name}' was built with settings it cannot adopt in place ({changes})"
     ))]
     SettingsChangeRequiresRebuild { table_name: String, changes: String },
+
+    /// The data files of the table's current snapshot do not match the files the
+    /// metastore records for it (a file is missing, has a different size, or the
+    /// snapshot directory is gone), and the caller asked for such a table to be
+    /// rebuilt from the source ([`crate::metadata::SettingsChangeAction::Rebuild`]).
+    /// Worded as the cause clause the caller's message embeds.
+    #[snafu(display(
+        "the existing acceleration of dataset '{table_name}' does not match its Cayenne metastore ({damage})"
+    ))]
+    StoredDataFilesRequireRebuild { table_name: String, damage: String },
+
+    /// The data files of the table's current snapshot do not match the files the
+    /// metastore records for it, and the table cannot be rebuilt from the source
+    /// now, so serving it would answer queries with missing rows or fail them.
+    #[snafu(display(
+        "Failed to load table '{table_name}': its acceleration does not match its Cayenne metastore ({damage}), so it cannot be served. {remedy}"
+    ))]
+    StoredDataFilesDamaged {
+        table_name: String,
+        damage: String,
+        remedy: String,
+    },
 
     #[snafu(display(
         "Failed to load table {table_name}: the datalake location changed from '{stored}' to '{configured}' while published datalake files exist. Revert 'cayenne_datalake_location' to '{stored}', or delete the acceleration and re-register the dataset to publish to the new location."
@@ -279,6 +304,27 @@ pub struct SnapshotSequenceCommit {
     pub snapshot_id: String,
     /// Sequence number assigned to the snapshot.
     pub sequence_number: i64,
+}
+
+/// The durable effects of one mem-tier seal or checkpoint.
+#[derive(Debug, Default)]
+pub struct MemTierDurableCommit {
+    /// Table receiving the mutation.
+    pub table_id: String,
+    /// Delete-only vectors, without a reinsert stamp.
+    pub pure_delete_files: Vec<DeleteFile>,
+    /// Vectors whose keys are reinserted at `sequence_number`.
+    pub reinsert_delete_files: Vec<DeleteFile>,
+    /// Reinsert keys (used to gate the per-vector reinsert stamp).
+    pub insert_pk_bytes: Vec<Vec<u8>>,
+    /// Reserved shadow/reinsert sequence, above every tombstone sequence.
+    pub sequence_number: i64,
+    /// Protected snapshot registration for a data-bearing checkpoint.
+    pub snapshot_sequence: Option<SnapshotSequenceCommit>,
+    /// Unpublished seal shadow rows, stamped with `sequence_number`.
+    pub inline_data: Vec<InlinedData>,
+    /// Clear the superseded inline corpus AND its deletion markers.
+    pub clear_inlined: bool,
 }
 
 // Transaction support is currently not exposed at the catalog level.
@@ -394,13 +440,24 @@ pub trait MetadataCatalog: Send + Sync {
 
     /// Atomically commit deletion-vector rows and an inline-data rewrite for
     /// one logical delete. A failure leaves both catalog areas unchanged.
+    ///
+    /// `replaced_delete_file_ids` names delete-file rows that `delete_files`
+    /// supersede: a position deletion vector that holds every position deleted
+    /// from its data file replaces the earlier ones for that file. They are
+    /// removed in the same transaction, so no reader sees a file's deletions
+    /// missing or counted from two rows.
     async fn commit_delete_files_with_inlined_rewrite(
         &self,
         delete_files: Vec<DeleteFile>,
         table_id: &str,
         updated_data: Vec<InlinedData>,
         deleted_inlined_ids: Vec<String>,
+        replaced_delete_file_ids: Vec<String>,
     ) -> CatalogResult<()>;
+
+    /// Atomically persist all metadata effects of one mem-tier seal or checkpoint.
+    /// Failure leaves the catalog unchanged; visibility publication remains the caller's job.
+    async fn commit_mem_tier_durable(&self, commit: MemTierDurableCommit) -> CatalogResult<()>;
 
     /// Get all active delete files for a table (across all virtual files).
     async fn get_table_delete_files(&self, table_id: &str) -> CatalogResult<Vec<DeleteFile>>;
@@ -850,6 +907,24 @@ pub trait MetadataCatalog: Send + Sync {
 
     /// Clear all manifest rows for a table.
     async fn clear_snapshot_files(&self, table_id: &str) -> CatalogResult<()>;
+
+    /// Drop the manifest rows of `file_names` (snapshot-relative file names) from
+    /// one snapshot's manifest, for files removed from the snapshot in place (for
+    /// example by file-based retention), so the manifest keeps naming only files
+    /// the snapshot still holds.
+    async fn remove_snapshot_files(
+        &self,
+        table_id: &str,
+        snapshot_id: &str,
+        file_names: &[String],
+    ) -> CatalogResult<()>;
+
+    /// Check, when reopening an existing table outside `create_table` (as
+    /// partition children are), that the data files its live snapshots record
+    /// are still on disk, with the non-rebuildable (`KeepStored`) handling:
+    /// a missing snapshot directory or a resized file is an error, and files
+    /// that are only missing are logged at WARN.
+    async fn verify_existing_stored_data_files(&self, table_name: &str) -> CatalogResult<()>;
 
     /// List every cold-tier file for a table (the cold scan's file source).
     /// Read under the scan's listing fence so the cold file set is captured

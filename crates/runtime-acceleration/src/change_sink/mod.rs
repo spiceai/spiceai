@@ -39,7 +39,7 @@ use datafusion::execution::context::SessionContext;
 use futures::future::BoxFuture;
 use tokio::sync::Mutex;
 
-pub use batch::{AppendValidation, CdcRows, ChangeBatch, ChangePayload, SetKey};
+pub use batch::{CdcRows, ChangeBatch, ChangePayload, ScopedInput, SetKey, replaced_scope_filters};
 pub use driver::{ChangePermit, ChangeSink, Publication, Submission, WriteReceipt};
 
 /// The producer's recovery contract. This does not contain a source offset.

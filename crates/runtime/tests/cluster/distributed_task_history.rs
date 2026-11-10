@@ -280,7 +280,6 @@ fn single_i64(rows: &[RecordBatch]) -> i64 {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-#[cfg(not(target_os = "windows"))]
 async fn test_distributed_query_records_parent_and_stage_rows() -> Result<(), anyhow::Error> {
     // Serialize against other tests in this module — shared DF_SLOT +
     // global subscriber would race otherwise.
@@ -457,7 +456,6 @@ async fn test_distributed_query_records_parent_and_stage_rows() -> Result<(), an
 }
 
 #[tokio::test(flavor = "multi_thread")]
-#[cfg(not(target_os = "windows"))]
 async fn test_distributed_query_records_error_on_failure() -> Result<(), anyhow::Error> {
     let _serial = test_lock().lock().await;
     test_request_context()
@@ -525,7 +523,6 @@ async fn test_distributed_query_records_error_on_failure() -> Result<(), anyhow:
 }
 
 #[tokio::test(flavor = "multi_thread")]
-#[cfg(not(target_os = "windows"))]
 async fn test_distributed_query_captures_plan_from_executed_graph() -> Result<(), anyhow::Error> {
     let _serial = test_lock().lock().await;
     test_request_context()
@@ -643,6 +640,45 @@ async fn test_distributed_query_captures_plan_from_executed_graph() -> Result<()
                 *slot.lock().expect("slot poisoned") = None;
             }
             harness.shutdown().await;
+            Ok(())
+        })
+        .await
+}
+
+/// Task history is read only on the scheduler, so a distributed query that
+/// reads it is rejected before it is submitted.
+#[tokio::test(flavor = "multi_thread")]
+async fn test_distributed_query_rejects_task_history() -> Result<(), anyhow::Error> {
+    let _serial = test_lock().lock().await;
+    test_request_context()
+        .scope(async {
+            configure_test_datafusion();
+
+            let harness = ClusterHarness::builder()
+                .scheduler(AppBuilder::new("test_distributed_task_history_rejected").build())
+                .executors(1)
+                .start()
+                .await?;
+            harness.wait_for_executors(Duration::from_secs(15)).await?;
+
+            let result = QueryBuilder::new(
+                "SELECT COUNT(*) FROM runtime.task_history",
+                harness.scheduler.datafusion(),
+            )
+            .build()
+            .submit_distributed("th_test_rejected")
+            .await;
+            harness.shutdown().await;
+
+            let error = result.err().ok_or_else(|| {
+                anyhow::anyhow!("a distributed query on runtime.task_history should be rejected")
+            })?;
+            assert!(
+                error
+                    .to_string()
+                    .contains("task history is read only on the scheduler"),
+                "unexpected error: {error}"
+            );
             Ok(())
         })
         .await

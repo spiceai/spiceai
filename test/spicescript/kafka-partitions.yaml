@@ -1,0 +1,54 @@
+name: kafka-partitions
+description: >
+  A Kafka topic spread over three partitions loads every message with the
+  schema of its JSON; a full text index over a topic finds the messages
+  containing a term. (A topic holding a tombstone does not load:
+  known-failing/streaming-sources/kafka-tombstone.yaml.)
+
+sources:
+  kafka:
+    kind: docker
+    image: docker.redpanda.com/redpandadata/redpanda:v26.1.6
+    ports: [19092]
+    command: [redpanda, start, --smp, '1', --overprovisioned, --node-id, '0', --mode, dev-container,
+      --kafka-addr, 'internal://0.0.0.0:9092,external://0.0.0.0:19092',
+      --advertise-kafka-addr, 'internal://127.0.0.1:9092,external://127.0.0.1:${port.19092}']
+    ready: rpk cluster health | grep -E 'Healthy:.+true'
+
+spicepod:
+  version: v1
+  kind: Spicepod
+  name: kafka-partitions
+  datasets:
+    - from: kafka:parts_${sources.kafka.namespace}
+      name: parts
+      params:
+        kafka_bootstrap_servers: 127.0.0.1:${sources.kafka.port.19092}
+        kafka_security_protocol: PLAINTEXT
+      acceleration: { enabled: true, engine: cayenne, refresh_mode: append }
+    - from: kafka:docs_${sources.kafka.namespace}
+      name: docs
+      params:
+        kafka_bootstrap_servers: 127.0.0.1:${sources.kafka.port.19092}
+        kafka_security_protocol: PLAINTEXT
+      acceleration: { enabled: true, engine: cayenne, refresh_mode: append }
+      columns:
+        - name: title
+          full_text_search: { enabled: true, row_id: [id] }
+
+steps:
+  - source-exec:
+      kafka: >-
+        rpk topic create parts_${sources.kafka.namespace} -p 1 && rpk topic add-partitions parts_${sources.kafka.namespace} -n 2 && rpk topic create docs_${sources.kafka.namespace} &&
+        for p in 0 1 2; do printf '%s\n' "{\"id\": $((p * 10 + 1)), \"part\": $p}" "{\"id\": $((p * 10 + 2)), \"part\": $p}" | rpk topic produce parts_${sources.kafka.namespace} -p $p; done &&
+        printf '%s\n' '{"id": 1, "title": "how to gitignore untracked files"}' '{"id": 2, "title": "rebase onto main"}' '{"id": 3, "title": "untracked files after merge"}' | rpk topic produce docs_${sources.kafka.namespace}
+  - start: { ready: false }
+  - query: SELECT id, part FROM parts
+    expect: { rows: [['1', '0'], ['2', '0'], ['11', '1'], ['12', '1'], ['21', '2'], ['22', '2']] }
+    eventually: 60s
+  - query: SELECT id, title FROM docs
+    expect: { rows: [['1', how to gitignore untracked files], ['2', rebase onto main], ['3', untracked files after merge]] }
+    eventually: 60s
+  - query: SELECT id FROM text_search(docs, 'untracked')
+    expect: { rows: [['1'], ['3']] }
+    eventually: 60s

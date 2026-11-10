@@ -79,7 +79,6 @@ use datafusion::physical_plan::{
 use futures::StreamExt;
 
 use data_components::flightsql::{FlightSqlClient, FlightSqlExec, query_to_stream};
-use data_components::sql_expr::to_sql_preserving_precedence;
 use flight_client::cookie::CookieStore;
 
 /// Pass-through nodes that may sit between a `HashJoinExec` and the federated
@@ -300,6 +299,16 @@ fn try_rewrite(
     let Some(right) = resolve_federated_side(join.right()) else {
         return Ok(Transformed::no(plan));
     };
+
+    // executor_table() and exact numeric encoding belong to Spice peers.
+    if left
+        .flight_execs
+        .iter()
+        .chain(&right.flight_execs)
+        .any(|scan| !scan.uses_spice_sql())
+    {
+        return Ok(Transformed::no(plan));
+    }
 
     // Pick the smaller side (by stats) as the broadcast dimension; it must be
     // below the threshold. The other side is the partitioned fact.
@@ -549,9 +558,31 @@ fn build_join_sql(
 ) -> Option<String> {
     let fact_fe = *fact.flight_execs.first()?;
     let dim_fe = *dim.flight_execs.first()?;
+    // The dimension is rebuilt from its table and filters only; a pushed-down
+    // `LIMIT` on its scan would be lost.
+    if dim.flight_execs.iter().any(|fe| fe.limit().is_some()) {
+        return None;
+    }
+    // Every fact executor runs this one join SQL, and the dimension is gathered with
+    // one filter list. Scans that differ, such as a `UNION ALL` of differently
+    // filtered or limited reads of one table, cannot share them.
+    if dim
+        .flight_execs
+        .iter()
+        .any(|fe| fe.filters() != dim_fe.filters())
+    {
+        return None;
+    }
 
     // Fact subquery: the executor's own local scan (its partition), filters incl.
     let fact_sql = fact_fe.sql().ok()?;
+    if fact
+        .flight_execs
+        .iter()
+        .any(|fe| fe.sql().ok().as_ref() != Some(&fact_sql))
+    {
+        return None;
+    }
 
     // Dimension gathered from every peer via executor_table, UNION ALL.
     let dim_table = dim_fe.table_reference().to_string();
@@ -562,7 +593,7 @@ fn build_join_sql(
         .map(|f| quote_ident(f.name()))
         .collect::<Vec<_>>()
         .join(", ");
-    let dim_where = render_filters(dim_fe.filters())?;
+    let dim_where = render_filters(dim_fe)?;
     let dim_union = addresses
         .iter()
         .map(|addr| {
@@ -644,13 +675,14 @@ fn build_join_sql(
     ))
 }
 
-fn render_filters(filters: &[datafusion::logical_expr::Expr]) -> Option<String> {
+fn render_filters(scan: &FlightSqlExec) -> Option<String> {
+    let filters = scan.filters();
     if filters.is_empty() {
         return Some(String::new());
     }
     let parts = filters
         .iter()
-        .map(|f| to_sql_preserving_precedence(f).map(|s| format!("({s})")))
+        .map(|f| scan.filter_sql(f).map(|s| format!("({s})")))
         .collect::<std::result::Result<Vec<_>, _>>()
         .ok()?;
     Some(format!(" WHERE {}", parts.join(" AND ")))
@@ -716,17 +748,27 @@ mod tests {
     /// A leaf scan with an exact row-count statistic, so the broadcast cost
     /// gate (`dim_rows × executors × margin < fact_rows`) can be evaluated.
     fn flight_exec(schema: &SchemaRef, table: &str, rows: usize) -> Arc<dyn ExecutionPlan> {
+        filtered_flight_exec(schema, table, rows, &[])
+    }
+
+    fn filtered_flight_exec(
+        schema: &SchemaRef,
+        table: &str,
+        rows: usize,
+        filters: &[datafusion::logical_expr::Expr],
+    ) -> Arc<dyn ExecutionPlan> {
         Arc::new(
             FlightSqlExec::new(
                 None,
                 schema,
                 &TableReference::parse_str(table),
                 dummy_client(),
-                &[],
+                filters,
                 None,
                 Arc::new(CookieStore::new()),
             )
             .expect("build FlightSqlExec")
+            .with_spice_sql(true)
             .with_statistics(Statistics::new_unknown(schema).with_num_rows(Precision::Exact(rows))),
         )
     }
@@ -914,6 +956,122 @@ mod tests {
         assert!(
             !result.transformed,
             "a residual FilterExec must block the broadcast rewrite"
+        );
+    }
+
+    #[tokio::test]
+    async fn bails_on_limited_dim_scan() {
+        // `JOIN (SELECT * FROM dim LIMIT 5) d`: the limit is folded into the dim's
+        // scan. The broadcast SQL gathers the dim from its table and filters, so
+        // rewriting would join every dim row.
+        let fact_schema = schema_of(&[("f_key", DataType::Int64), ("f_val", DataType::Int64)]);
+        let dim_schema = schema_of(&[("d_key", DataType::Int64), ("d_name", DataType::Utf8)]);
+        let dim = flight_exec(&dim_schema, "cat.sch.dim", 10)
+            .with_fetch(Some(5))
+            .expect("FlightSqlExec supports a fetch");
+        let join = inner_hash_join(
+            flight_exec(&fact_schema, "cat.sch.fact", 1_000),
+            dim,
+            vec![("f_key", 0, "d_key", 0)],
+            NullEquality::NullEqualsNothing,
+        );
+
+        let result =
+            try_rewrite(join, &[ADDR.to_string()], 25_000_000).expect("rewrite should not error");
+        assert!(
+            !result.transformed,
+            "a limited dim scan must block the broadcast rewrite"
+        );
+    }
+
+    #[tokio::test]
+    async fn broadcasts_identical_fact_scans() {
+        // The scans of a routed table read one table with the same SQL, one per
+        // executor; each executor can run the one join SQL.
+        let fact_schema = schema_of(&[("f_key", DataType::Int64), ("f_val", DataType::Int64)]);
+        let dim_schema = schema_of(&[("d_key", DataType::Int64), ("d_name", DataType::Utf8)]);
+        let fact = UnionExec::try_new(vec![
+            flight_exec(&fact_schema, "cat.sch.fact", 1_000),
+            flight_exec(&fact_schema, "cat.sch.fact", 1_000),
+        ])
+        .expect("valid UnionExec");
+        let join = inner_hash_join(
+            fact,
+            flight_exec(&dim_schema, "cat.sch.dim", 10),
+            vec![("f_key", 0, "d_key", 0)],
+            NullEquality::NullEqualsNothing,
+        );
+
+        let result =
+            try_rewrite(join, &[ADDR.to_string()], 25_000_000).expect("rewrite should not error");
+        assert!(
+            result.transformed,
+            "identical fact scans must still broadcast"
+        );
+    }
+
+    #[tokio::test]
+    async fn bails_on_fact_scans_that_differ() {
+        // `(SELECT * FROM fact LIMIT 100) UNION ALL (SELECT * FROM fact LIMIT 200)`:
+        // one join SQL for both scans would apply the first scan's limit to both.
+        let fact_schema = schema_of(&[("f_key", DataType::Int64), ("f_val", DataType::Int64)]);
+        let dim_schema = schema_of(&[("d_key", DataType::Int64), ("d_name", DataType::Utf8)]);
+        let limited = |fetch| {
+            flight_exec(&fact_schema, "cat.sch.fact", 1_000)
+                .with_fetch(Some(fetch))
+                .expect("FlightSqlExec supports a fetch")
+        };
+        let fact = UnionExec::try_new(vec![limited(100), limited(200)]).expect("valid UnionExec");
+        let join = inner_hash_join(
+            fact,
+            flight_exec(&dim_schema, "cat.sch.dim", 10),
+            vec![("f_key", 0, "d_key", 0)],
+            NullEquality::NullEqualsNothing,
+        );
+
+        let result =
+            try_rewrite(join, &[ADDR.to_string()], 25_000_000).expect("rewrite should not error");
+        assert!(
+            !result.transformed,
+            "fact scans with different SQL must block the broadcast rewrite"
+        );
+    }
+
+    #[tokio::test]
+    async fn bails_on_dim_scans_that_differ() {
+        // `(SELECT * FROM dim WHERE d_key < 5) UNION ALL (SELECT * FROM dim WHERE d_key > 5)`:
+        // gathering the dimension with the first scan's filters would drop the second.
+        use datafusion::logical_expr::{col, lit};
+
+        let fact_schema = schema_of(&[("f_key", DataType::Int64), ("f_val", DataType::Int64)]);
+        let dim_schema = schema_of(&[("d_key", DataType::Int64), ("d_name", DataType::Utf8)]);
+        let dim = UnionExec::try_new(vec![
+            filtered_flight_exec(
+                &dim_schema,
+                "cat.sch.dim",
+                5,
+                &[col("d_key").lt(lit(5_i64))],
+            ),
+            filtered_flight_exec(
+                &dim_schema,
+                "cat.sch.dim",
+                5,
+                &[col("d_key").gt(lit(5_i64))],
+            ),
+        ])
+        .expect("valid UnionExec");
+        let join = inner_hash_join(
+            flight_exec(&fact_schema, "cat.sch.fact", 1_000),
+            dim,
+            vec![("f_key", 0, "d_key", 0)],
+            NullEquality::NullEqualsNothing,
+        );
+
+        let result =
+            try_rewrite(join, &[ADDR.to_string()], 25_000_000).expect("rewrite should not error");
+        assert!(
+            !result.transformed,
+            "dim scans with different filters must block the broadcast rewrite"
         );
     }
 

@@ -3,7 +3,6 @@ source: crates/runtime/src/http/v1/mod.rs
 expression: "serde_json::from_str::<serde_json::Value>(&result_without_sql).expect(\"to parse\")"
 ---
 {
-  "row_count": 2,
   "schema": {
     "fields": [
       {
@@ -34,5 +33,6 @@ expression: "serde_json::from_str::<serde_json::Value>(&result_without_sql).expe
       "customer_id": "67890",
       "total_sales": 125000
     }
-  ]
+  ],
+  "row_count": 2
 }

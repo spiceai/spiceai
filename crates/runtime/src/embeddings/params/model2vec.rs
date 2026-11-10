@@ -24,6 +24,9 @@ pub struct Model2VecEmbeddingParams {
     /// The Hugging Face access token.
     #[param(runtime, autoload_secret)]
     pub hf_token: Option<SecretString>,
+    /// The Hugging Face Hub endpoint to download the embedding model from, to read through a mirror or proxy of the Hub. Defaults to `HF_ENDPOINT`, then `https://huggingface.co`.
+    #[param(runtime)]
+    pub hf_endpoint: Option<String>,
     /// The subfolder within the Hugging Face repo containing the model.
     #[param(runtime)]
     pub subfolder: Option<String>,

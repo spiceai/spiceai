@@ -26,7 +26,7 @@ limitations under the License.
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use arrow::array::{Array, Int64Array, RecordBatch};
+use arrow::array::{Array, Int64Array, RecordBatch, StringArray};
 use arrow::datatypes::SchemaRef;
 use cayenne::lookup_index::{IndexPersistence, LookupIndexCounters, LookupIndexVerification};
 use cayenne::metadata::{CdcDurability, CreateTableOptions, DeletionMode, VortexConfig};
@@ -168,6 +168,52 @@ pub fn runtime_with_pool(bytes: usize) -> (Arc<RuntimeEnv>, Arc<dyn MemoryPool>)
         .build_arc()
         .expect("runtime env");
     (runtime_env, pool)
+}
+
+/// The batch a repeated-key load test writes: one row per entry of `ids`, its
+/// `payload` the row number from `rows` and its `label` that number in hex.
+pub fn keyed_rows(schema: &SchemaRef, ids: Vec<i64>, rows: std::ops::Range<i64>) -> RecordBatch {
+    RecordBatch::try_new(
+        Arc::clone(schema),
+        vec![
+            Arc::new(Int64Array::from(ids)),
+            Arc::new(Int64Array::from(rows.clone().collect::<Vec<_>>())),
+            Arc::new(StringArray::from(
+                rows.map(|row| format!("{row:016x}")).collect::<Vec<_>>(),
+            )),
+        ],
+    )
+    .expect("keyed rows batch")
+}
+
+/// Rows between a key's repeats: see [`repeating_load`].
+pub const REPEAT_EVERY: i64 = 1000;
+/// The row, mod [`REPEAT_EVERY`], whose key the next batch repeats.
+const REPEATED_ROW: i64 = 500;
+
+/// `batches` batches of `batch_rows` rows over `schema` (`id`, `payload`,
+/// `label`). In every batch after the first, each row at position 999 mod
+/// [`REPEAT_EVERY`] repeats the key of the row at 500 mod [`REPEAT_EVERY`] of
+/// the batch before it, so a load of them holds superseded copies in every
+/// file, and the later copy wins. `batches - 1` times `batch_rows /
+/// REPEAT_EVERY` copies are superseded.
+pub fn repeating_load(schema: &SchemaRef, batches: i64, batch_rows: i64) -> Vec<RecordBatch> {
+    (0..batches)
+        .map(|batch| {
+            let rows = batch * batch_rows..(batch + 1) * batch_rows;
+            let ids = rows
+                .clone()
+                .map(|row| {
+                    if batch > 0 && row % REPEAT_EVERY == REPEAT_EVERY - 1 {
+                        row - batch_rows - (REPEAT_EVERY - 1 - REPEATED_ROW)
+                    } else {
+                        row
+                    }
+                })
+                .collect();
+            keyed_rows(schema, ids, rows)
+        })
+        .collect()
 }
 
 /// Replaces the table's rows with `batches`, in one write.

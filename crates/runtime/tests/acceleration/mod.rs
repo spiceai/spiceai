@@ -22,73 +22,52 @@ use std::sync::Arc;
 
 mod caching_mode;
 mod caching_mode_constraints;
-#[cfg(feature = "duckdb")]
 mod caching_mode_per_principal;
-#[cfg(feature = "duckdb")]
 mod caching_mode_post_filter;
 mod caching_mode_request_method;
 mod caching_mode_stale_if_error;
-#[cfg(not(target_os = "windows"))]
 mod cayenne_append_overlap;
-#[cfg(not(target_os = "windows"))]
 mod cayenne_append_timestamptz;
-#[cfg(not(target_os = "windows"))]
 mod cayenne_maintained_aggregates;
-#[cfg(not(target_os = "windows"))]
 mod cayenne_memory;
-#[cfg(not(target_os = "windows"))]
 mod cayenne_on_conflict_batches;
-#[cfg(feature = "duckdb")]
-mod checkpoint_duckdb;
 #[cfg(feature = "postgres-accel")]
 mod checkpoint_postgres;
 #[cfg(feature = "sqlite")]
 mod checkpoint_sqlite;
-#[cfg(feature = "turso")]
-mod checkpoint_turso;
-#[cfg(feature = "duckdb")]
 mod cron;
-#[cfg(feature = "duckdb")]
-mod duckdb_builtin_pushdown;
-#[cfg(any(feature = "duckdb", feature = "sqlite"))]
+#[cfg(feature = "sqlite")]
+mod decimal_division;
+#[cfg(feature = "sqlite")]
 mod empty_projection_scan;
-#[cfg(feature = "duckdb")]
-mod file_create_duckdb;
-#[cfg(feature = "duckdb")]
-mod file_swap_duckdb;
 #[cfg(feature = "sqlite")]
 mod file_watcher;
 mod hash_index;
 mod localpod_sync;
-#[cfg(all(feature = "postgres-accel", feature = "duckdb", feature = "sqlite"))]
+#[cfg(all(feature = "postgres-accel", feature = "sqlite"))]
 mod on_conflict;
+mod pk_insert_semantics;
 #[cfg(feature = "sqlite")]
 mod sqlite_builtin_pushdown;
+#[cfg(feature = "sqlite")]
+mod sqlite_interval_arithmetic;
+#[cfg(feature = "sqlite")]
+mod sqlite_query_errors;
 
-#[cfg(not(target_os = "windows"))]
 mod newest_by_time;
-#[cfg(not(target_os = "windows"))]
 mod on_conflict_cayenne;
-#[cfg(feature = "duckdb")]
 mod on_conflict_options;
 mod on_zero_results_retention;
-#[cfg(any(feature = "duckdb", feature = "sqlite"))]
 mod on_zero_results_subqueries;
 mod partition_by_arrow;
-#[cfg(not(target_os = "windows"))]
 mod partition_by_cayenne;
 #[cfg(feature = "postgres-accel")]
 mod query_push_down;
 mod refresh;
-#[cfg(any(feature = "duckdb", feature = "sqlite", feature = "turso"))]
 mod reload_file_accelerated;
 mod retention_arrow;
-#[cfg(not(target_os = "windows"))]
 mod retention_cayenne;
-#[cfg(not(target_os = "windows"))]
 mod settings_change_cayenne;
-#[cfg(feature = "duckdb")]
-mod single_instance_duckdb;
 #[cfg(feature = "snapshots")]
 mod snapshot_lock_contention;
 #[cfg(feature = "snapshots")]
@@ -108,6 +87,28 @@ pub(crate) async fn trigger_refresh(
         .await
         .map_err(|e| anyhow::anyhow!("refresh_table failed for {table}: {e}"))?
         .ok_or_else(|| anyhow::anyhow!("no refresh notifier for {table}"))?;
+    Ok(())
+}
+
+/// Queue a refresh of `table` and wait for it to complete, within `timeout`.
+pub(crate) async fn refresh_and_wait(
+    rt: &Arc<runtime::Runtime>,
+    table: &str,
+    timeout: std::time::Duration,
+) -> Result<(), anyhow::Error> {
+    let waiter = rt
+        .datafusion()
+        .refresh_table(&datafusion::common::TableReference::from(table), None)
+        .await
+        .map_err(|e| anyhow::anyhow!("refresh_table failed for {table}: {e}"))?
+        .ok_or_else(|| anyhow::anyhow!("no refresh notifier for {table}"))?;
+    let outcome = tokio::time::timeout(timeout, waiter.wait())
+        .await
+        .map_err(|_| anyhow::anyhow!("the refresh of {table} did not complete in {timeout:?}"))?;
+    anyhow::ensure!(
+        outcome.is_answered(),
+        "the refresh of {table} did not complete: {outcome:?}"
+    );
     Ok(())
 }
 
@@ -151,7 +152,11 @@ pub(crate) fn has_vortex_file(dir: &std::path::Path) -> bool {
 }
 
 pub(crate) fn get_params(mode: &Mode, file: Option<String>, engine: &str) -> Option<Params> {
-    let param_name = format!("{engine}_file");
+    let param_name = if engine == "cayenne" {
+        "cayenne_file_path".to_string()
+    } else {
+        format!("{engine}_file")
+    };
     if mode == &Mode::File {
         return Some(Params::from_string_map(
             vec![(param_name, file.unwrap_or_default())]
@@ -160,6 +165,30 @@ pub(crate) fn get_params(mode: &Mode, file: Option<String>, engine: &str) -> Opt
         ));
     }
     None
+}
+
+/// A CSV file dataset, accelerated in memory by `engine` with full refreshes,
+/// or unaccelerated when `engine` is `None`.
+#[cfg(feature = "sqlite")]
+pub(crate) fn csv_dataset(
+    from: &str,
+    name: &str,
+    engine: Option<&str>,
+) -> spicepod::component::dataset::Dataset {
+    let mut dataset = spicepod::component::dataset::Dataset::new(from, name);
+    dataset.params = Some(Params::from_string_map(
+        vec![("file_format".to_string(), "csv".to_string())]
+            .into_iter()
+            .collect(),
+    ));
+    dataset.acceleration = engine.map(|engine| spicepod::acceleration::Acceleration {
+        enabled: true,
+        engine: Some(engine.to_string()),
+        mode: Mode::Memory,
+        refresh_mode: Some(spicepod::acceleration::RefreshMode::Full),
+        ..spicepod::acceleration::Acceleration::default()
+    });
+    dataset
 }
 
 /// Materializes the runtime's configured datasets — the [`Dataset`] values that
@@ -244,4 +273,24 @@ async fn wait_for_checkpoints(
             result.map(|_| ())
         }
     }
+}
+
+/// Read a persisted Cayenne table through a fresh catalog and provider.
+pub(crate) async fn query_cayenne_file(
+    data_dir: &std::path::Path,
+    table: &str,
+    sql: &str,
+) -> anyhow::Result<Vec<arrow::array::RecordBatch>> {
+    use cayenne::{CayenneCatalog, CayenneTableProviderBuilder, MetadataCatalog};
+    let catalog = Arc::new(CayenneCatalog::new(format!(
+        "sqlite://{}",
+        data_dir.join("metadata/cayenne.db").display()
+    ))?) as Arc<dyn MetadataCatalog>;
+    catalog.init().await?;
+    let ctx = datafusion::prelude::SessionContext::new();
+    let provider = CayenneTableProviderBuilder::new(catalog, ctx.runtime_env())
+        .open(table)
+        .await?;
+    ctx.register_table(table, Arc::new(provider))?;
+    Ok(ctx.sql(sql).await?.collect().await?)
 }

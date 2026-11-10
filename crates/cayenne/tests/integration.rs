@@ -28,6 +28,11 @@ limitations under the License.
 //! first; under plain `cargo test` that call fails the test before it changes
 //! anything its neighbours would see.
 
+#![expect(
+    clippy::expect_used,
+    reason = "set-up and helpers outside `#[test]` functions fail fast with `expect`"
+)]
+
 #[macro_use]
 mod common;
 #[path = "correctness/support/mod.rs"]
@@ -67,6 +72,7 @@ mod filtered_delete_scan_test;
 mod fixed_offset_timezone_test;
 mod float_nan_predicate_test;
 mod float_zero_predicate_test;
+mod fold_listing_cache_test;
 mod in_list_null_semantics_test;
 mod incremental_stats_test;
 mod ingest_fsync_regression_test;
@@ -79,6 +85,7 @@ mod large_upsert_test;
 mod layout_pruning_ab_test;
 mod light_encode_roundtrip;
 mod limit_underdelivery_key_deletion_regression_test;
+mod listing_cache_retention_race_test;
 mod lookup_index_budget_test;
 mod lookup_index_composition_test;
 mod lookup_index_lifecycle_test;
@@ -91,6 +98,7 @@ mod maintained_aggregate_serve_soundness_test;
 mod max_column_count_test;
 mod mem_tier_budget_fallback_upsert_test;
 mod mem_tier_budget_sharded_release_test;
+mod mem_tier_durable_atomicity_test;
 mod mem_tier_overwrite_retention_test;
 mod memory_accounting_test;
 mod memory_mode_cdc_delete_test;
@@ -110,6 +118,7 @@ mod partition_chunking_test;
 mod partition_pruning_test;
 mod partitioned_overlay_test;
 mod position_based_deletion_test;
+mod position_delete_inline_test;
 mod position_mode_reclaim_test;
 mod position_mode_upsert_test;
 mod predicate_delete_ram_tier_rows;
@@ -137,8 +146,6 @@ mod staged_append_test;
 mod stats_edge_cases_test;
 mod string_bounds_statistics_test;
 mod timestamp_unit_roundtrip_test;
-#[cfg(feature = "turso")]
-mod turso_0_7_2_open_compat_test;
 mod update_test;
 mod upsert_with_pending_deletions_test;
 mod vortex_compressible_test;

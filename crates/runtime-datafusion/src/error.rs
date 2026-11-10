@@ -27,7 +27,14 @@ pub use util::{
 
 #[derive(Debug)]
 pub enum SpiceExternalError {
-    AccelerationNotReady { dataset_name: String },
+    AccelerationNotReady {
+        dataset_name: String,
+    },
+    /// A cluster scheduler cannot route the query to executors that have loaded
+    /// the data it reads. Retrying later can succeed.
+    PartitionsUnavailable {
+        message: String,
+    },
 }
 
 impl SpiceExternalError {
@@ -36,6 +43,11 @@ impl SpiceExternalError {
         dataset_name: String,
     ) -> Box<dyn std::error::Error + Send + Sync> {
         Box::new(Self::AccelerationNotReady { dataset_name })
+    }
+
+    #[must_use]
+    pub fn partitions_unavailable(message: String) -> Box<dyn std::error::Error + Send + Sync> {
+        Box::new(Self::PartitionsUnavailable { message })
     }
 }
 
@@ -48,6 +60,7 @@ impl Display for SpiceExternalError {
                 f,
                 "Acceleration not ready; loading initial data for {dataset_name}"
             ),
+            SpiceExternalError::PartitionsUnavailable { message } => write!(f, "{message}"),
         }
     }
 }
@@ -70,6 +83,24 @@ pub fn get_spice_df_error(e: &DataFusionError) -> Option<&SpiceExternalError> {
             }
         }
         _ => None,
+    }
+}
+
+/// Whether `e`, or an error it wraps, is [`SpiceExternalError::PartitionsUnavailable`].
+#[must_use]
+pub fn is_partitions_unavailable(e: &DataFusionError) -> bool {
+    match e {
+        DataFusionError::External(source) => source
+            .downcast_ref::<SpiceExternalError>()
+            .is_some_and(|e| matches!(e, SpiceExternalError::PartitionsUnavailable { .. })),
+        DataFusionError::Context(_, source) | DataFusionError::Diagnostic(_, source) => {
+            is_partitions_unavailable(source)
+        }
+        DataFusionError::Shared(source) => is_partitions_unavailable(source),
+        DataFusionError::Collection(errors) => {
+            errors.first().is_some_and(is_partitions_unavailable)
+        }
+        _ => false,
     }
 }
 

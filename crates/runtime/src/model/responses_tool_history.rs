@@ -102,11 +102,8 @@ fn is_spice_tool_call(item: &InputItem) -> bool {
 }
 
 /// `input` with each of Spice's `mcp_call` items replaced by what the model saw: the
-/// `function_call`, then its `function_call_output`. Other items, hosted MCP calls included, are
-/// unchanged.
-///
-/// The `function_call` has no `id`. `OpenAI` resolves a replayed call's ID to the `call_id` it
-/// stored, and requires the reasoning item it was emitted with; without an ID, it requires neither.
+/// `function_call` (see [`replayed_call`]), then its `function_call_output`. Other items, hosted
+/// MCP calls included, are unchanged.
 pub(crate) fn replay_spice_tool_calls(input: InputParam) -> InputParam {
     let InputParam::Items(items) = input else {
         return input;
@@ -127,6 +124,28 @@ pub(crate) fn replay_spice_tool_calls(input: InputParam) -> InputParam {
     )
 }
 
+/// A call to one of Spice's tools, as Spice sends it to the provider in each request after the
+/// one that made it: the next round of the tool-use loop, and each later turn.
+///
+/// Both must be the same, item for item, so that the provider's prompt cache serves a later turn
+/// up to the end of the earlier one. Measured on 2026-10-15 with `gpt-4o-mini`: when the round
+/// kept the call's `id` and the later turn did not, the later turn read 4,864 of 12,784 tokens
+/// from the cache; when neither kept it, 12,672 of 12,787.
+///
+/// The call has no `id`, because the `mcp_call` item that a client sends back does not keep it.
+/// Also, `OpenAI` resolves a call's `id` to the call it stored, and then requires the reasoning
+/// item that the call was emitted with; without an `id`, it requires neither.
+pub(crate) fn replayed_call(call_id: String, name: String, arguments: String) -> FunctionToolCall {
+    FunctionToolCall {
+        arguments,
+        call_id,
+        namespace: None,
+        name,
+        id: None,
+        status: Some(OutputStatus::Completed),
+    }
+}
+
 /// `call`, one of Spice's `mcp_call` items, as the model saw it.
 fn replayed(call: MCPToolCall) -> [InputItem; 2] {
     let call_id = spice_call_id(&call).unwrap_or_default().to_string();
@@ -135,14 +154,11 @@ fn replayed(call: MCPToolCall) -> [InputItem; 2] {
         .or(call.error)
         .unwrap_or_else(|| RESULT_NOT_SENT_BACK.to_string());
     [
-        InputItem::Item(Item::FunctionCall(FunctionToolCall {
-            arguments: call.arguments,
-            call_id: call_id.clone(),
-            namespace: None,
-            name: call.name,
-            id: None,
-            status: Some(OutputStatus::Completed),
-        })),
+        InputItem::Item(Item::FunctionCall(replayed_call(
+            call_id.clone(),
+            call.name,
+            call.arguments,
+        ))),
         InputItem::Item(Item::FunctionCallOutput(FunctionCallOutputItemParam {
             call_id,
             output: FunctionCallOutput::Text(output),

@@ -25,17 +25,21 @@ use datafusion::sql::sqlparser::dialect::{GenericDialect, PostgreSqlDialect};
 use datafusion::sql::sqlparser::keywords::Keyword;
 use datafusion::sql::sqlparser::parser::Parser;
 use datafusion::sql::sqlparser::tokenizer::Token;
+use runtime_query_engine::sql_depth_guard::{
+    ensure_data_types_within_depth_limit, ensure_filter_within_depth_limit,
+};
 use schemars::JsonSchema;
 use search::pipeline::valid_keywords;
 use serde::{Deserialize, Serialize};
+use snafu::ResultExt;
 
-use crate::error::{Error, Result};
+use crate::error::{Error, Result, WhereConditionTooDeepSnafu};
 
 #[derive(Debug, Clone, JsonSchema, Serialize, Deserialize)]
 #[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
 #[serde(rename_all = "lowercase")]
 pub struct SearchRequestBaseJson {
-    /// The text to search documents for similarity
+    /// The text to search documents for similarity. Must contain at least one non-whitespace character.
     pub text: String,
 
     /// The datasets to search for similarity. If None, search across all datasets. For available datasets, use the `list_datasets` tool and ensure `can_search_documents==true`.
@@ -93,10 +97,21 @@ pub struct SearchRequest {
     pub keywords: Vec<String>,
 }
 
+/// Rejects empty or whitespace-only search text for every consumer of
+/// [`SearchRequestBaseJson`] / [`SearchRequestHTTPJson`] (HTTP `/v1/search` and
+/// the MCP/search tool).
+fn reject_empty_search_text(text: &str) -> std::result::Result<(), String> {
+    if text.trim().is_empty() {
+        return Err("Search text must not be empty".to_string());
+    }
+    Ok(())
+}
+
 impl TryFrom<SearchRequestHTTPJson> for SearchRequest {
     type Error = String;
 
     fn try_from(req: SearchRequestHTTPJson) -> Result<Self, Self::Error> {
+        reject_empty_search_text(&req.base.text)?;
         Ok(SearchRequest::new(
             req.base.text,
             req.base.datasets,
@@ -116,6 +131,7 @@ impl TryFrom<SearchRequestBaseJson> for SearchRequest {
     type Error = String;
 
     fn try_from(req: SearchRequestBaseJson) -> Result<Self, Self::Error> {
+        reject_empty_search_text(&req.text)?;
         Ok(SearchRequest::new(
             req.text,
             req.datasets,
@@ -199,6 +215,8 @@ impl SearchRequest {
     }
 
     pub fn parse_where_cond(where_cond: String) -> Result<Expr> {
+        ensure_data_types_within_depth_limit(&where_cond, &PostgreSqlDialect {})
+            .context(WhereConditionTooDeepSnafu)?;
         let parser = Parser::new(&PostgreSqlDialect {});
         let mut parser =
             parser
@@ -223,6 +241,9 @@ impl SearchRequest {
             return Err(Error::InvalidWhereCondition { where_cond });
         }
 
+        // The request's cache key clones and hashes the condition recursively.
+        ensure_filter_within_depth_limit(&expr).context(WhereConditionTooDeepSnafu)?;
+
         Ok(expr)
     }
 
@@ -231,6 +252,10 @@ impl SearchRequest {
             .iter()
             .map(|c| {
                 let select_statement = format!("SELECT {c} FROM testing");
+                ensure_data_types_within_depth_limit(&select_statement, &GenericDialect)
+                    .map_err(|_| Error::InvalidAdditionalColumns {
+                        additional_column: c.clone(),
+                    })?;
                 let parser = Parser::new(&GenericDialect);
                 let mut parser = parser.try_with_sql(&select_statement).map_err(|err| {
                     tracing::trace!("parsing 'additional_columns' for search failed. {err}");
@@ -600,5 +625,90 @@ pub(crate) mod tests {
         } else {
             panic!("Expected BinaryOp expression");
         }
+    }
+
+    #[test]
+    fn try_from_rejects_empty_and_whitespace_text() {
+        for text in ["", "   ", "\t\n "] {
+            let base = SearchRequestBaseJson {
+                text: text.to_string(),
+                datasets: Some(vec!["products".to_string()]),
+                limit: Some(3),
+                where_cond: None,
+                additional_columns: vec![],
+            };
+            let err = SearchRequest::try_from(base).expect_err("empty text must fail");
+            assert_eq!(err, "Search text must not be empty", "text={text:?}");
+
+            let http = SearchRequestHTTPJson {
+                base: SearchRequestBaseJson {
+                    text: text.to_string(),
+                    datasets: Some(vec!["products".to_string()]),
+                    limit: Some(3),
+                    where_cond: None,
+                    additional_columns: vec![],
+                },
+                keywords: None,
+            };
+            let err = SearchRequest::try_from(http).expect_err("empty text must fail");
+            assert_eq!(err, "Search text must not be empty", "text={text:?}");
+        }
+    }
+
+    #[test]
+    fn try_from_accepts_non_empty_text() {
+        let base = SearchRequestBaseJson {
+            text: " boots ".to_string(),
+            datasets: Some(vec!["products".to_string()]),
+            limit: Some(3),
+            where_cond: None,
+            additional_columns: vec![],
+        };
+        let req = SearchRequest::try_from(base).expect("non-empty text must succeed");
+        assert_eq!(req.text, " boots ");
+    }
+
+    /// Regression test: a long `where` chain overflowed the stack while the
+    /// request's cache key cloned and hashed it, aborting the process. On a
+    /// 2 MiB thread, the default worker stack, it is now rejected when the
+    /// request is parsed, and a condition at the cap still builds a key.
+    #[test]
+    fn deep_where_condition_is_rejected_before_the_cache_key() {
+        use runtime_query_engine::sql_depth_guard::MAX_UNPROTECTED_EXPR_DEPTH;
+
+        let request = |where_cond: String| SearchRequestBaseJson {
+            text: "x".to_string(),
+            datasets: None,
+            limit: None,
+            where_cond: Some(where_cond),
+            additional_columns: vec![],
+        };
+        std::thread::Builder::new()
+            .stack_size(2 * 1024 * 1024)
+            .spawn(move || {
+                let deep = vec!["1=1"; 2000].join(" AND ");
+                match SearchRequest::try_from(request(deep)) {
+                    Ok(parsed) => {
+                        let _ = SearchKey::from(&parsed);
+                        panic!("a 2000-term where condition was accepted");
+                    }
+                    Err(err) => assert_eq!(
+                        err,
+                        format!(
+                            "Invalid WHERE condition: it is nested more than \
+                             {MAX_UNPROTECTED_EXPR_DEPTH} levels deep. Simplify it (for example, \
+                             replace a long chain of OR conditions with an IN list)."
+                        )
+                    ),
+                }
+
+                let at = vec!["true"; MAX_UNPROTECTED_EXPR_DEPTH].join(" AND ");
+                let parsed = SearchRequest::try_from(request(at))
+                    .expect("a where condition at the cap is accepted");
+                let _ = SearchKey::from(&parsed);
+            })
+            .expect("test thread spawns")
+            .join()
+            .expect("test thread completes");
     }
 }

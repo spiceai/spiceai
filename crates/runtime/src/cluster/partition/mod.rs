@@ -109,18 +109,24 @@ pub type Result<T, E = Error> = std::result::Result<T, E>;
 /// calling this function, so that bare, partial, and fully-qualified references
 /// all produce the same key and match correctly against the assignments map.
 #[expect(clippy::implicit_hasher)]
+#[must_use]
 pub fn get_partition_filter_exprs(
     tbl: &ResolvedTableReference,
     assignments: &HashMap<ResolvedTableReference, Vec<Expr>>,
 ) -> Vec<Expr> {
-    let partitions = assignments.get(tbl).cloned().unwrap_or_default();
+    combine_partition_exprs(assignments.get(tbl).cloned().unwrap_or_default())
+}
+
+/// Combines partition expressions with OR (union of partitions) into a
+/// single-element `Vec<Expr>`, so applying it via `.filter()` is correct.
+/// Returns an empty `Vec` for no partitions.
+#[must_use]
+pub fn combine_partition_exprs(partitions: Vec<Expr>) -> Vec<Expr> {
     if partitions.is_empty() {
         return vec![];
     }
-    // Combine multiple partition expressions with OR (union of partitions) using a
-    // balanced tree to avoid O(n)-depth nesting that can exceed recursion limits
-    // during expression traversal/serialization. Wrap in a single-element Vec so
-    // `.filter()` applies it as one predicate.
+    // Combine with a balanced tree to avoid O(n)-depth nesting that can exceed
+    // recursion limits during expression traversal/serialization.
     let combined = util::expr::combine_exprs_balanced(partitions, Expr::or)
         .unwrap_or_else(|| unreachable!("partitions is not empty"));
     vec![combined]

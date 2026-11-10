@@ -14,8 +14,8 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-//! The Flight/DoPut keepalive and tunables shared between the cluster
-//! write-through logic and the runtime flight service.
+//! The Flight/DoPut keepalive, abandon message and tunables shared between the
+//! cluster write-through logic and the runtime flight service.
 
 /// `app_metadata` sentinel that marks a `FlightData` message as a keepalive,
 /// used to prevent the executor's `DoPut` idle timeout from firing on streams
@@ -80,6 +80,21 @@ pub fn is_keepalive(message: &arrow_flight::FlightData) -> bool {
 pub fn keepalive() -> arrow_flight::FlightData {
     arrow_flight::FlightData {
         app_metadata: bytes::Bytes::from_static(KEEPALIVE_APP_METADATA),
+        ..Default::default()
+    }
+}
+
+/// `app_metadata` sentinel that marks a `FlightData` message as the writer abandoning
+/// its write: the receiver fails the write instead of committing what it received.
+/// The end of the stream commits the write, and a client cannot break off a streaming
+/// request once the receiver has answered it, so abandoning takes a message.
+pub const ABANDON_APP_METADATA: &[u8] = b"spice-abandon";
+
+/// The message a writer sends to abandon its write; see [`ABANDON_APP_METADATA`].
+#[must_use]
+pub fn abandon() -> arrow_flight::FlightData {
+    arrow_flight::FlightData {
+        app_metadata: bytes::Bytes::from_static(ABANDON_APP_METADATA),
         ..Default::default()
     }
 }

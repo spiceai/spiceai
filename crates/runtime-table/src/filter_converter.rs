@@ -65,7 +65,7 @@ pub(crate) fn create_timestamp_filter_convert(
 /// [`data_type_to_timestamp_format`] for integer columns.
 ///
 /// Returns `None` for formats that don't represent unix epoch integers.
-fn time_format_to_unix_scale(time_format: Option<TimeFormat>) -> Option<u128> {
+pub(crate) fn time_format_to_unix_scale(time_format: Option<TimeFormat>) -> Option<u128> {
     match time_format {
         Some(TimeFormat::UnixSeconds) => Some(1_000_000_000),
         Some(TimeFormat::UnixMillis) => Some(1_000_000),
@@ -136,7 +136,7 @@ mod test {
             Field::new("timestamp", DataType::Utf8, false),
             TimeFormat::UnixSeconds,
             1_620_000_000_000_000_000,
-            r#"timestamp > Utf8("2021-05-03T00:00:00.000000000")"#,
+            "timestamp >= Utf8(\"2021-05-02\") AND (CAST(timestamp AS Timestamp(µs)) > TimestampMicrosecond(1620000000000000, None) OR CAST(timestamp AS Timestamp(µs)) = TimestampMicrosecond(1620000000000000, None) AND TRY_CAST(timestamp AS Timestamp(ns)) > TimestampNanosecond(1620000000000000000, None))",
         );
     }
 

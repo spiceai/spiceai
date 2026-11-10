@@ -30,6 +30,7 @@ jobs:
       (github.event.pull_request.head.repo.full_name == github.repository &&
       github.event.pull_request.user.login != 'dependabot[bot]')
     runs-on: spiceai-dev-runners
+    environment: ci-build
     # A merge group's checkout takes the full history, sized for a cold runner
     # cloning from scratch.
     timeout-minutes: 45
@@ -78,7 +79,7 @@ jobs:
         env:
           RELEVANT: ${{ github.event_name != 'merge_group' || steps.changes.outputs.relevant_changes == 'true' }}
           SPICEIO_RELEVANT: ${{ github.event_name == 'workflow_dispatch' || steps.spiceio.outputs.relevant == 'true' }}
-          HAS_SPICEIO_SECRET: ${{ secrets.UNAS_SMB_PASS != '' }}
+          HAS_SPICEIO_SECRET: ${{ secrets.SMB_PASSWORD != '' }}
         with:
           script: |
             // Every leg runs in parallel. The disk legs qualify the local
@@ -111,7 +112,7 @@ jobs:
               return legs.filter((leg) => leg.store !== 'spiceio');
             }
             if (process.env.HAS_SPICEIO_SECRET !== 'true') {
-              core.warning('UNAS_SMB_PASS is not available to this run, so the spiceio leg does not run. It runs on branches of spiceai/spiceai and in the merge queue.');
+              core.warning('SMB_PASSWORD is not available to this run, so the spiceio leg does not run. It runs on branches of spiceai/spiceai and in the merge queue.');
               return legs.filter((leg) => leg.store !== 'spiceio');
             }
             return legs;
@@ -125,11 +126,13 @@ jobs:
       matrix:
         include: ${{ fromJson(needs.plan.outputs.legs) }}
     runs-on: ${{ matrix.runner }}
+    environment: ci-build
     timeout-minutes: 45
     services:
       redis:
-        # GitHub service containers require Linux. An empty image skips macOS.
-        image: ${{ matrix.os == 'Linux' && 'redis:7.4.11-bookworm' || '' }}
+        # GitHub service containers require Linux. An empty image skips macOS. A service
+        # starts before any step can log in, so it pulls from ECR Public, not Docker Hub.
+        image: ${{ matrix.os == 'Linux' && 'public.ecr.aws/docker/library/redis:7.4.11-bookworm' || '' }}
         ports:
           - 6379/tcp
         options: >-
@@ -166,7 +169,7 @@ jobs:
         if: runner.os == 'Linux'
       # The dev runner image has python3 but no pip. The macOS runners carry
       # Homebrew interpreters, and installing one through setup-python needs sudo.
-      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
         if: runner.os == 'Linux'
         with:
           python-version: '3.12'
@@ -330,7 +333,7 @@ jobs:
         env:
           SPICEIO_SMB_SERVER: 192.168.3.148
           SPICEIO_SMB_USER: runner
-          SPICEIO_SMB_PASS: ${{ secrets.UNAS_SMB_PASS }}
+          SPICEIO_SMB_PASS: ${{ secrets.SMB_PASSWORD }}
           SPICEIO_SMB_SHARE: ai_platform_dev
           SPICEIO_BUCKET: ${{ env.WAL_BUCKET }}
           # spiceio moves to the next port when this one is taken.

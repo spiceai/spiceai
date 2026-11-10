@@ -156,7 +156,6 @@ async fn alter_to_double(
 
 /// Cayenne evolves the table live under `sync_all_columns`, so the change
 /// after the `ALTER` lands with its fractional value.
-#[cfg(not(target_os = "windows"))]
 #[tokio::test(flavor = "multi_thread")]
 async fn cayenne_sync_all_columns_widens_live() -> Result<(), anyhow::Error> {
     let _tracing = init_tracing(Some("integration=debug,info"));
@@ -195,7 +194,6 @@ async fn cayenne_sync_all_columns_widens_live() -> Result<(), anyhow::Error> {
 
 /// Under `block` the registered `Int32` type stays: a value that type holds
 /// exactly is applied as it.
-#[cfg(not(target_os = "windows"))]
 #[tokio::test(flavor = "multi_thread")]
 async fn cayenne_block_keeps_the_registered_type() -> Result<(), anyhow::Error> {
     let _tracing = init_tracing(Some("integration=debug,info"));
@@ -229,108 +227,9 @@ async fn cayenne_block_keeps_the_registered_type() -> Result<(), anyhow::Error> 
         .await
 }
 
-/// `DuckDB` cannot evolve mid-stream, so under `sync_all_columns` a change is
-/// cast to the table's current `Int32` type until a restart applies the
-/// evolution. A value the cast holds exactly is applied; one it would round
-/// is refused, never stored rounded.
-#[tokio::test(flavor = "multi_thread")]
-async fn duckdb_sync_all_columns_never_stores_a_rounded_value() -> Result<(), anyhow::Error> {
-    let _tracing = init_tracing(Some("integration=debug,info"));
-    register_test_connectors().await;
-    test_request_context()
-        .scope(async {
-            let container = common::start_postgres_docker_container_with_logical_wal().await?;
-            let port = container.host_port(5432)?;
-            let (source, rt) = start(
-                port,
-                "type_change_duckdb_sync",
-                "duckdb",
-                OnSchemaChange::SyncAllColumns,
-            )
-            .await?;
-            alter_to_double(&source, "type_change_duckdb_sync").await?;
-            source
-                .simple_query("INSERT INTO public.type_change_duckdb_sync VALUES (4, 2.0)")
-                .await?;
-            wait_for(
-                &rt,
-                "SELECT id, k FROM type_change_duckdb_sync WHERE id = 4",
-                "+----+---+\n\
-                 | id | k |\n\
-                 +----+---+\n\
-                 | 4  | 2 |\n\
-                 +----+---+",
-            )
-            .await?;
-
-            source
-                .simple_query("INSERT INTO public.type_change_duckdb_sync VALUES (5, 2.5)")
-                .await?;
-            // The refusal leaves nothing to poll for, so watch for the bound
-            // the other changes in this file arrive within; the truncated row
-            // arrived in under a second before the refusal existed.
-            let deadline = std::time::Instant::now() + Duration::from_secs(10);
-            while std::time::Instant::now() < deadline {
-                let rows = run_query(
-                    &rt,
-                    "SELECT count(*) AS c FROM type_change_duckdb_sync WHERE id = 5",
-                )
-                .await?;
-                assert_eq!(
-                    rows, "+---+\n| c |\n+---+\n| 0 |\n+---+",
-                    "2.5 must not be stored as an Int32"
-                );
-                tokio::time::sleep(Duration::from_millis(250)).await;
-            }
-            Ok(())
-        })
-        .await
-}
-
-/// A delete carries the old row, which under `REPLICA IDENTITY FULL` holds every
-/// column. A keyed delete uses only the primary key, so an old value the
-/// acceleration's narrower column type cannot hold does not refuse it.
-#[tokio::test(flavor = "multi_thread")]
-async fn duckdb_sync_all_columns_applies_a_delete_whose_old_row_no_longer_fits()
--> Result<(), anyhow::Error> {
-    let _tracing = init_tracing(Some("integration=debug,info"));
-    register_test_connectors().await;
-    test_request_context()
-        .scope(async {
-            let container = common::start_postgres_docker_container_with_logical_wal().await?;
-            let port = container.host_port(5432)?;
-            let table = "type_change_duckdb_delete";
-            let (source, rt) = start(port, table, "duckdb", OnSchemaChange::SyncAllColumns).await?;
-            source
-                .simple_query(&format!("ALTER TABLE public.{table} REPLICA IDENTITY FULL"))
-                .await?;
-            source
-                .simple_query(&format!(
-                    "ALTER TABLE public.{table} ALTER COLUMN k TYPE double precision USING k + 0.5"
-                ))
-                .await?;
-            source
-                .simple_query(&format!("DELETE FROM public.{table} WHERE id = 1"))
-                .await?;
-            wait_for(
-                &rt,
-                &format!("SELECT id FROM {table} ORDER BY id"),
-                "+----+\n\
-                 | id |\n\
-                 +----+\n\
-                 | 2  |\n\
-                 | 3  |\n\
-                 +----+",
-            )
-            .await
-        })
-        .await
-}
-
 /// Under `block`, a delete's old row is decoded with the registered types. With
 /// `REPLICA IDENTITY FULL` it carries every column, and after a type change its
 /// non-key values may not fit them; the delete applies by key regardless.
-#[cfg(not(target_os = "windows"))]
 #[tokio::test(flavor = "multi_thread")]
 async fn cayenne_block_applies_a_delete_whose_old_row_no_longer_fits() -> Result<(), anyhow::Error>
 {

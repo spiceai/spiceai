@@ -17,6 +17,7 @@ limitations under the License.
 //! Compatible CDC burst preparation for the table owner. Source acknowledgement
 //! and source control remain outside this module.
 
+use std::collections::HashSet;
 use std::ops::ControlFlow;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -28,14 +29,15 @@ use arrow::compute::{cast, filter_record_batch};
 use arrow::datatypes::{DataType, Float64Type, SchemaRef};
 use arrow::util::display::array_value_to_string;
 use data_components::cdc::{self, ChangeOperation};
-use datafusion::common::TableReference;
+use datafusion::common::{ScalarValue, TableReference};
 use datafusion::error::{DataFusionError, Result};
 use opentelemetry::KeyValue;
 use runtime_metrics::acceleration as metrics;
 
 use super::source_policy::{CdcPolicy, SchemaDecision};
 use super::{
-    ChangeBatch, ChangeCapabilities, ChangePayload, Recovery, SchemaEvolutionSupport, WriteOptions,
+    ChangeBatch, ChangeCapabilities, ChangePayload, Recovery, SchemaEvolutionSupport, ScopedInput,
+    SetKey, WriteOptions,
 };
 
 /// Refuse a change whose numeric values the accelerated table's column types
@@ -133,6 +135,84 @@ pub(crate) struct AppendBurst {
     ingress: Arc<AppendIngress>,
     count: usize,
     bytes: usize,
+    scopes: BurstScopes,
+}
+
+/// The scopes of one coalesced Rows burst. The backend deletes every replaced
+/// scope before it appends any row, which equals applying the members in
+/// arrival order only while no replaced scope can hold another member's rows.
+/// A member that could overlap a replaced scope starts the next burst instead.
+#[derive(Default)]
+struct BurstScopes {
+    /// The column set shared by every indexed scope.
+    columns: Option<Vec<usize>>,
+    appended: HashSet<Vec<ScalarValue>>,
+    replaced: HashSet<Vec<ScalarValue>>,
+    /// An append scope that cannot be indexed may overlap a later replacement.
+    unindexed_append: bool,
+    /// A replacement that cannot be indexed admits no later member.
+    closed: bool,
+}
+
+impl BurstScopes {
+    /// Admit all scoped inputs of `batch`, or none of them.
+    fn admit(&mut self, batch: &ChangeBatch) -> bool {
+        let inputs = batch.scoped_inputs();
+        if self.closed
+            || (inputs.len() > 1
+                && (!self.replaced.is_empty() || inputs.iter().any(ScopedInput::replaces)))
+            || !inputs.iter().all(|input| self.permits(input))
+        {
+            return false;
+        }
+        for input in inputs {
+            self.record(input);
+        }
+        true
+    }
+
+    fn permits(&self, input: &ScopedInput) -> bool {
+        let values = self.indexed_values(input.scope());
+        if input.replaces() {
+            values.is_some_and(|values| {
+                !self.unindexed_append
+                    && !self.appended.contains(&values)
+                    && !self.replaced.contains(&values)
+            })
+        } else {
+            self.replaced.is_empty()
+                || values.is_some_and(|values| !self.replaced.contains(&values))
+        }
+    }
+
+    /// The scope's values when it hashes exactly and shares the burst's columns.
+    fn indexed_values(&self, scope: &SetKey) -> Option<Vec<ScalarValue>> {
+        let (columns, values) = scope.hash_identity()?;
+        self.columns
+            .as_ref()
+            .is_none_or(|shared| *shared == columns)
+            .then_some(values)
+    }
+
+    fn record(&mut self, input: &ScopedInput) {
+        match input.scope().hash_identity() {
+            Some((columns, values))
+                if self
+                    .columns
+                    .as_ref()
+                    .is_none_or(|shared| *shared == columns) =>
+            {
+                self.columns.get_or_insert(columns);
+                if input.replaces() {
+                    self.replaced.insert(values);
+                } else {
+                    self.appended.insert(values);
+                }
+            }
+            _ if input.replaces() => self.closed = true,
+            _ => self.unindexed_append = true,
+        }
+    }
 }
 
 impl AppendBurst {
@@ -146,12 +226,17 @@ impl AppendBurst {
             ));
         }
         let bytes = batch.estimated_bytes();
+        let mut scopes = BurstScopes::default();
+        for input in batch.scoped_inputs() {
+            scopes.record(input);
+        }
         Ok(Self {
             batch,
             options,
             ingress,
             count: 1,
             bytes,
+            scopes,
         })
     }
 
@@ -191,6 +276,8 @@ impl CoalescingBurst for AppendBurst {
                 .append_ingress()
                 .is_some_and(|ingress| Arc::ptr_eq(&self.ingress, ingress))
             || self.bytes.saturating_add(bytes) > self.ingress.limits.max_bytes.max(1)
+            || !self.batch.can_merge_append(&next)
+            || !self.scopes.admit(&next)
         {
             return ControlFlow::Break(next);
         }
@@ -471,7 +558,7 @@ impl CdcBurst {
             inputs
                 .into_iter()
                 .map(|batch| {
-                    let (ChangePayload::Cdc(rows), None) = batch.into_parts() else {
+                    let ChangePayload::Cdc(rows) = batch.into_payload() else {
                         return Err(DataFusionError::Internal(
                             "Non-CDC input in a CDC burst".into(),
                         ));

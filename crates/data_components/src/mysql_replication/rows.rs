@@ -293,9 +293,9 @@ pub fn build_change_batch(
 
 /// A dataset's schema with the two schemas every one of its change batches is
 /// built with: its fields all made nullable (see [`build_change_batch`]), and
-/// the `op` / `primary_keys` / `data` wrapper around them. A dataset's schema is
-/// fixed for the life of its replication member, so these are derived once per
-/// member rather than once per batch — the streaming path builds a batch for
+/// the `op` / `primary_keys` / `data` wrapper around them. A member's schema
+/// changes only when an `ALTER` widens a column, so these are derived once per
+/// schema rather than once per batch — the streaming path builds a batch for
 /// every committed source transaction that touches the table.
 pub(super) struct ChangeBatchSchemas {
     dataset: SchemaRef,
@@ -801,7 +801,7 @@ fn value_to_bool(value: &Value) -> Result<bool> {
 
 fn value_to_signed<T>(value: &Value, target: &str) -> Result<T>
 where
-    T: TryFrom<i64> + TryFrom<u64> + std::str::FromStr,
+    T: TryFrom<i64> + TryFrom<u64> + TryFrom<i128> + std::str::FromStr,
 {
     let out_of_range = |v: &dyn std::fmt::Debug| Error::Decode {
         message: format!(
@@ -818,6 +818,9 @@ where
             .ok()
             .and_then(|s| s.trim().parse::<T>().ok())
             .ok_or_else(|| out_of_range(&String::from_utf8_lossy(b).into_owned())),
+        Value::Float(_) | Value::Double(_) => {
+            exact_integer(value).ok_or_else(|| not_exact(value, target))
+        }
         other => DecodeSnafu {
             message: format!("cannot interpret {other:?} as {target}"),
         }
@@ -825,9 +828,45 @@ where
     }
 }
 
+/// The integer a `FLOAT` or `DOUBLE` value equals exactly, as `T`, or `None`
+/// when it has a fraction, is not finite, or is outside `T`'s range. `-0.0`
+/// becomes `0`, as every SQL cast to an integer does.
+///
+/// An integer column receives a float value when the source column's type
+/// changed and the column kept its type (a primary key, or a policy that does
+/// not evolve). A value it holds exactly is stored as that integer; any other
+/// is refused, never rounded.
+#[expect(
+    clippy::cast_possible_truncation,
+    reason = "the float is integral and below 2^127 in magnitude, so `as i128` is exact"
+)]
+fn exact_integer<T: TryFrom<i128>>(value: &Value) -> Option<T> {
+    let v = match value {
+        Value::Float(v) => f64::from(*v),
+        Value::Double(v) => *v,
+        _ => return None,
+    };
+    if !(v.is_finite() && v.fract() == 0.0 && v.abs() < 2f64.powi(127)) {
+        return None;
+    }
+    T::try_from(v as i128).ok()
+}
+
+fn not_exact(value: &Value, target: &str) -> Error {
+    Error::Decode {
+        message: format!(
+            "value {value:?} cannot be stored exactly in dataset column type {target}, so the \
+             change is refused rather than rounded. The source column's type changed to one \
+             this column cannot hold: set `on_schema_change: sync_all_columns` and restart \
+             Spice to register the new type. See: \
+             https://spiceai.org/docs/features/data-acceleration"
+        ),
+    }
+}
+
 fn value_to_unsigned<T>(value: &Value, target: &str) -> Result<T>
 where
-    T: TryFrom<u64> + std::fmt::Debug,
+    T: TryFrom<u64> + TryFrom<i128> + std::fmt::Debug,
 {
     let out_of_range = |v: &dyn std::fmt::Debug| Error::Decode {
         message: format!("value {v:?} does not fit dataset column type {target}"),
@@ -851,6 +890,9 @@ where
                 acc = (acc << 8) | u64::from(*b);
             }
             T::try_from(acc).map_err(|_| out_of_range(&acc))
+        }
+        Value::Float(_) | Value::Double(_) => {
+            exact_integer(value).ok_or_else(|| not_exact(value, target))
         }
         other => DecodeSnafu {
             message: format!("cannot interpret {other:?} as {target}"),
@@ -1129,6 +1171,58 @@ mod tests {
             set_variants: None,
             is_primary_key: false,
         }
+    }
+
+    #[test]
+    fn an_integer_column_takes_a_float_value_only_when_it_is_exact() {
+        assert_eq!(
+            value_to_signed::<i32>(&Value::Double(2.0), "Int32").ok(),
+            Some(2)
+        );
+        assert_eq!(
+            value_to_signed::<i32>(&Value::Double(-0.0), "Int32").ok(),
+            Some(0)
+        );
+        assert_eq!(
+            value_to_signed::<i8>(&Value::Float(-128.0), "Int8").ok(),
+            Some(-128)
+        );
+        assert_eq!(
+            value_to_signed::<i64>(&Value::Double(-9_223_372_036_854_775_808.0), "Int64").ok(),
+            Some(i64::MIN)
+        );
+        assert_eq!(
+            value_to_unsigned::<u16>(&Value::Double(65_535.0), "UInt16").ok(),
+            Some(65_535)
+        );
+        for refused in [
+            Value::Double(1.5),
+            Value::Double(f64::NAN),
+            Value::Double(f64::INFINITY),
+            Value::Double(3e9),
+            Value::Double(9_223_372_036_854_775_808.0),
+        ] {
+            let error = value_to_signed::<i32>(&refused, "Int32")
+                .expect_err("a value Int32 cannot hold exactly is refused");
+            assert_eq!(
+                error.to_string(),
+                format!(
+                    "binlog decode error: value {refused:?} cannot be stored exactly in dataset \
+                     column type Int32, so the change is refused rather than rounded. The source \
+                     column's type changed to one this column cannot hold: set `on_schema_change: \
+                     sync_all_columns` and restart Spice to register the new type. See: \
+                     https://spiceai.org/docs/features/data-acceleration"
+                )
+            );
+        }
+        assert_eq!(
+            value_to_unsigned::<u32>(&Value::Double(-1.0), "UInt32").ok(),
+            None
+        );
+        assert_eq!(
+            value_to_unsigned::<u64>(&Value::Double(9_223_372_036_854_775_808.0), "UInt64").ok(),
+            Some(1 << 63)
+        );
     }
 
     #[test]

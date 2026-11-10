@@ -1,0 +1,31 @@
+name: cluster-scheduler-failover-empty
+description: >
+  A cluster scheduler killed and started again after its registration has
+  expired takes back the executor that kept running: the executor's
+  partitions are assigned again, queries answer every row, and
+  `/v1/ready?min_ready_executors=1` reports the executor ready.
+sources:
+  src: { kind: postgres }
+spicepod:
+  version: v1
+  kind: Spicepod
+  name: cluster-scheduler-failover-empty
+  datasets:
+    - { from: postgres:public.t, name: t, params: '${sources.src.params}', acceleration: { enabled: true, engine: cayenne, mode: file } }
+defaults:
+  cluster: { executors: 1 }
+  cluster-partition-by: { '*': id }
+  expect: { oracle: src }
+steps:
+  - source-exec: { src: "CREATE TABLE t (id int PRIMARY KEY); INSERT INTO t SELECT generate_series(1, 100)" }
+  - start: {}
+  - query: SELECT * FROM t
+  - kill-spiced: {}
+  - sleep: 35s
+  - start: { ready: false }
+  - query: SELECT count(*) AS n FROM t
+    eventually: 120s
+  - query: SELECT * FROM t
+  - http: { path: '/v1/ready?min_ready_executors=1&verbose=true' }
+    expect: { status: 200 }
+    eventually: 120s

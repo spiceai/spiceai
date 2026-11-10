@@ -20,6 +20,7 @@ edition.workspace = true
 version.workspace = true
 rust-version.workspace = true
 license-file.workspace = true
+repository.workspace = true
 description = "ODBC data connector for Spice.ai runtime"
 
 [dependencies]
@@ -53,6 +54,7 @@ default = []
 
 [dev-dependencies]
 runtime = { path = "../../runtime" }
+data-accelerator-api = { path = "../../data-accelerator-api" }
 
 [lints]
 workspace = true

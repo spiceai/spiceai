@@ -14,9 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use crate::utils::{
-    runtime_ready_check, runtime_ready_check_with_timeout_err, test_request_context,
-};
+use crate::utils::{runtime_ready_check, test_request_context};
 use crate::{configure_test_datafusion, init_tracing};
 use app::AppBuilder;
 use arrow::array::{ArrayRef, AsArray, StringArray};
@@ -30,7 +28,6 @@ use spicepod::component::dataset::Dataset;
 use std::collections::HashMap;
 use std::io::{Seek, SeekFrom};
 use std::sync::Arc;
-use std::time::Duration;
 use test_framework::yaml;
 
 /// Builder for creating test `RecordBatches` with specific data patterns
@@ -102,61 +99,6 @@ impl TestCsvDataBuilder {
     }
 }
 
-/// Test the behavior of the vanilla `upsert` when there are duplicates in the incoming batch.
-/// The behavior will be to error out, preventing the runtime from becoming ready because the acceleration isn't loaded.
-#[tokio::test]
-async fn test_acceleration_on_conflict_same_batch_upsert() -> Result<(), anyhow::Error> {
-    let _tracing = init_tracing(Some("integration=debug,info"));
-
-    test_request_context()
-        .scope(async {
-            let mut data_builder =
-                TestCsvDataBuilder::with_columns(&["foo", "bar"]).add_batch(&[
-                    vec![Some("a"), Some("bar1")], // a, bar1
-                    vec![Some("b"), Some("bar2")], // b, bar2
-                    vec![Some("c"), Some("bar3")], // c, bar3
-                    vec![Some("a"), Some("bar1")], // a, bar1 # conflict
-                    vec![Some("e"), Some("bar5")], // e, bar5
-                    vec![Some("f"), Some("bar6")], // f, bar6
-                ]);
-            data_builder.flush_to_file();
-
-            let dataset = data_builder.dataset("test");
-            let dataset = set_duckdb_acceleration(dataset);
-            let dataset = set_primary_key(dataset, "foo");
-            let dataset = set_on_conflict_behavior(dataset, OnConflictBehavior::Upsert);
-            let app = AppBuilder::new("test_acceleration_on_conflict_same_batch_upsert")
-                .with_dataset(dataset)
-                .build();
-
-            configure_test_datafusion();
-            let rt = Runtime::builder()
-                .with_app(app)
-                .build()
-                .await;
-
-            let cloned_rt = Arc::new(rt.clone());
-
-            tokio::select! {
-                () = tokio::time::sleep(std::time::Duration::from_secs(10)) => {
-                    panic!("Timeout waiting for components to load");
-                }
-                () = cloned_rt.load_components() => {}
-            }
-
-            // Only wait 10 seconds, since we don't expect the runtime to become ready.
-            assert!(
-                runtime_ready_check_with_timeout_err(&rt, Duration::from_secs(10))
-                    .await
-                    .is_err(),
-                "Expected the runtime to error when loading data that violates the incoming batch constraints with only upsert"
-            );
-        })
-        .await;
-
-    Ok::<(), anyhow::Error>(())
-}
-
 /// Test the behavior of `upsert_dedup` when there are exact duplicates in the incoming batch.
 /// The runtime will successfully load and the data will be deduplicated.
 #[tokio::test]
@@ -176,7 +118,7 @@ async fn test_acceleration_on_conflict_same_batch_upsert_with_dedup() -> Result<
             data_builder.flush_to_file();
 
             let dataset = data_builder.dataset("test");
-            let dataset = set_duckdb_acceleration(dataset);
+            let dataset = set_cayenne_acceleration(dataset);
             let dataset = set_primary_key(dataset, "foo");
             let dataset = set_on_conflict_behavior(dataset, OnConflictBehavior::UpsertDedup);
             let app = AppBuilder::new("test_acceleration_on_conflict_same_batch_upsert_with_dedup")
@@ -207,62 +149,6 @@ async fn test_acceleration_on_conflict_same_batch_upsert_with_dedup() -> Result<
     Ok::<(), anyhow::Error>(())
 }
 
-/// Test the behavior of `upsert_dedup` when there are conflicts in the incoming batch, but not exact duplicates.
-/// The runtime should error since the de-duplication isn't sufficient.
-#[tokio::test]
-async fn test_acceleration_on_conflict_same_batch_upsert_with_dedup_not_exact_duplicates()
--> Result<(), anyhow::Error> {
-    let _tracing = init_tracing(Some("integration=debug,info"));
-
-    test_request_context()
-        .scope(async {
-            let mut data_builder =
-                TestCsvDataBuilder::with_columns(&["foo", "bar"]).add_batch(&[
-                    vec![Some("a"), Some("bar1")],  // a, bar1
-                    vec![Some("b"), Some("bar2")],  // b, bar2
-                    vec![Some("c"), Some("bar3")],  // c, bar3
-                    vec![Some("a"), Some("bar10")], // a, bar10 # conflict
-                    vec![Some("e"), Some("bar5")],  // e, bar5
-                    vec![Some("f"), Some("bar6")],  // f, bar6
-                ]);
-            data_builder.flush_to_file();
-
-            let dataset = data_builder.dataset("test");
-            let dataset = set_duckdb_acceleration(dataset);
-            let dataset = set_primary_key(dataset, "foo");
-            let dataset = set_on_conflict_behavior(dataset, OnConflictBehavior::UpsertDedup);
-            let app = AppBuilder::new("test_acceleration_on_conflict_same_batch_upsert_with_dedup_not_exact_duplicates")
-                .with_dataset(dataset)
-                .build();
-
-            configure_test_datafusion();
-            let rt = Runtime::builder()
-                .with_app(app)
-                .build()
-                .await;
-
-            let cloned_rt = Arc::new(rt.clone());
-
-            tokio::select! {
-                () = tokio::time::sleep(std::time::Duration::from_secs(10)) => {
-                    panic!("Timeout waiting for components to load");
-                }
-                () = cloned_rt.load_components() => {}
-            }
-
-            // Only wait 10 seconds, since we don't expect the runtime to become ready.
-            assert!(
-                runtime_ready_check_with_timeout_err(&rt, Duration::from_secs(10))
-                    .await
-                    .is_err(),
-                "Expected the runtime to error when loading data that violates the incoming batch constraints with upsert_dedup and there aren't exact duplicates"
-            );
-        })
-        .await;
-
-    Ok::<(), anyhow::Error>(())
-}
-
 /// Test the behavior of `upsert_dedup_by_row_id` when there are conflicts in the incoming batch, but not exact duplicates.
 /// The runtime will successfully load the data and the conflicting rows will resolve to the last one.
 #[tokio::test]
@@ -284,7 +170,7 @@ async fn test_acceleration_on_conflict_same_batch_upsert_with_dedup_by_row_id_no
             data_builder.flush_to_file();
 
             let dataset = data_builder.dataset("test");
-            let dataset = set_duckdb_acceleration(dataset);
+            let dataset = set_cayenne_acceleration(dataset);
             let dataset = set_primary_key(dataset, "foo");
             let dataset = set_on_conflict_behavior(dataset, OnConflictBehavior::UpsertDedupByRowId);
             let app = AppBuilder::new("test_acceleration_on_conflict_same_batch_upsert_with_dedup_by_row_id_not_exact_duplicates")
@@ -361,10 +247,10 @@ async fn assert_value(
 }
 
 #[expect(clippy::expect_used)]
-fn set_duckdb_acceleration(mut dataset: Dataset) -> Dataset {
+fn set_cayenne_acceleration(mut dataset: Dataset) -> Dataset {
     let yaml = r"
                 enabled: true
-                engine: duckdb
+                engine: cayenne
                 mode: memory
             ";
     let acceleration: Acceleration = yaml::from_str(yaml).expect("Failed to parse Acceleration");

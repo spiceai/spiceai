@@ -1,13 +1,18 @@
 version: v1
 kind: Spicepod
 name: hf[all-minilm-l6-v2]-arrow
+
+metadata:
+  benchmark_dataset: stackoverflow_qa_retrieval
+
 datasets:
 
-  # MTEB StackOverflowQA Retrieval dataset files (*.parquet) are automatically downloaded by the test operator.
-  # https://huggingface.co/datasets/mteb/stackoverflow-qa
+  # MTEB StackOverflowQA Retrieval, read straight from Hugging Face: https://huggingface.co/datasets/mteb/stackoverflow-qa
 
-  - from: file:./corpus.parquet
+  - from: https://huggingface.co/api/datasets/mteb/stackoverflow-qa/parquet/corpus/corpus/0.parquet
     name: corpus
+    params:
+      file_format: parquet
     acceleration:
       enabled: true
       engine: arrow
@@ -18,14 +23,18 @@ datasets:
             row_id:
               - _id
 
-  - from: file:./queries.parquet
+  - from: https://huggingface.co/api/datasets/mteb/stackoverflow-qa/parquet/queries/queries/0.parquet
     name: test_queries
+    params:
+      file_format: parquet
     acceleration:
       enabled: true
       engine: arrow
 
-  - from: file:./data.parquet
+  - from: https://huggingface.co/api/datasets/mteb/stackoverflow-qa/parquet/default/test/0.parquet
     name: relevance_data
+    params:
+      file_format: parquet
     acceleration:
       enabled: true
       engine: arrow

@@ -20,8 +20,13 @@ use secrecy::{ExposeSecret, SecretString};
 use serde::Deserialize;
 use snafu::prelude::*;
 use std::hash::{DefaultHasher, Hash, Hasher};
+use std::path::PathBuf;
 use std::time::Duration;
 use std::{fmt, sync::Arc};
+use token_provider::registry::TokenProviderRegistry;
+use token_provider::workload_identity::{
+    Exchange, SubjectTokenSource, WorkloadIdentityError, WorkloadIdentityTokenProvider,
+};
 use token_provider::{Result, TokenProvider};
 use tokio::{sync::watch, task::JoinHandle, time::sleep};
 use util::fibonacci_backoff::{Backoff as _, FibonacciBackoffBuilder};
@@ -32,6 +37,8 @@ use runtime_request_context::RequestContext;
 const TOKEN_REFRESH_BUFFER_SECS: u64 = 300;
 const MIN_TOKEN_REFRESH_WAIT_SECS: u64 = 1;
 
+const MODEL_DOCS: &str = "https://spiceai.org/docs/components/models/databricks";
+
 #[derive(Debug, Snafu)]
 pub enum Error {
     #[snafu(display(
@@ -40,6 +47,23 @@ pub enum Error {
     UnableToGetToken {
         source: Box<dyn std::error::Error + Send + Sync>,
     },
+
+    /// A mistake in the parameters of workload identity federation: `parameter` is the one to
+    /// change.
+    #[snafu(display("{message}"))]
+    InvalidWorkloadIdentity {
+        parameter: &'static str,
+        message: String,
+    },
+
+    #[snafu(display("{source}"))]
+    WorkloadIdentityExchange { source: WorkloadIdentityError },
+
+    /// No source answered with an identity token: no file, no GitHub Actions job, and no cloud
+    /// identity that issues one. Not a mistake in the parameters: a cloud identity can answer
+    /// later, as when a metadata server is not ready at startup.
+    #[snafu(display("{message}"))]
+    NoIdentityToken { message: String },
 }
 
 #[derive(Clone)]
@@ -224,6 +248,7 @@ async fn get_m2m_access_token(
             .form(&[("grant_type", "client_credentials"), ("scope", "all-apis")])
     })
     .await?;
+    let response = http_body_limit::buffer(response, http_body_limit::Limit::METADATA).await?;
 
     if !response.status().is_success() {
         let status = response.status();
@@ -242,7 +267,9 @@ async fn get_m2m_access_token(
 }
 
 fn build_m2m_token_client() -> Result<reqwest::Client, reqwest::Error> {
-    configure_client_builder(reqwest::Client::builder())
+    // Token responses are read through `http_body_limit`, which decodes them while
+    // refusing decompression amplification.
+    http_body_limit::decode_manually(configure_client_builder(reqwest::Client::builder()))
         .user_agent(util::spiceai_user_agent())
         .build()
 }
@@ -290,6 +317,295 @@ pub enum AuthCredentials<'a> {
     Token(&'a SecretString),
     ServicePrincipal(&'a str, &'a SecretString),
     U2M(&'a str),
+    WorkloadIdentity(WorkloadIdentity<'a>),
+}
+
+/// A service principal that authenticates with workload identity federation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct WorkloadIdentity<'a> {
+    pub client_id: &'a str,
+    pub identity_token: IdentityToken<'a>,
+}
+
+/// Where the identity token of a [`WorkloadIdentity`] comes from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IdentityToken<'a> {
+    /// A file the platform keeps current.
+    File(&'a str),
+    /// The OIDC token of the GitHub Actions job, requested for `audience`, or for the workspace's
+    /// token endpoint, which Databricks accepts by default, when it is `None`.
+    GitHubActions { audience: Option<&'a str> },
+    /// An identity token from the workload's cloud identity (AWS, Google Cloud or Azure),
+    /// requested for `audience`.
+    Cloud { audience: &'a str },
+}
+
+/// A Databricks parameter's value, and whether the Spicepod sets it, as opposed to an
+/// environment variable or secret store supplying it unasked (`DATABRICKS_CLIENT_ID`, ...): a
+/// value the Spicepod sets always wins.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct Setting<'a> {
+    pub value: Option<&'a str>,
+    pub in_spicepod: bool,
+}
+
+impl<'a> Setting<'a> {
+    /// A value the Spicepod sets.
+    #[must_use]
+    pub fn spicepod(value: Option<&'a str>) -> Self {
+        Self {
+            value,
+            in_spicepod: true,
+        }
+    }
+
+    fn get(self) -> Option<&'a str> {
+        self.value.filter(|value| !value.trim().is_empty())
+    }
+
+    fn spicepod_value(self) -> Option<&'a str> {
+        self.get().filter(|_| self.in_spicepod)
+    }
+}
+
+/// Whether this process runs in a GitHub Actions job that can request an OIDC token: one with
+/// `permissions: id-token: write`, for which GitHub sets `ACTIONS_ID_TOKEN_REQUEST_URL` and
+/// `ACTIONS_ID_TOKEN_REQUEST_TOKEN`.
+#[must_use]
+pub fn in_github_actions() -> bool {
+    SubjectTokenSource::github_actions_from_env("").is_ok()
+}
+
+/// The federation parameters of a Databricks model or embedding: its `databricks_client_id`,
+/// `databricks_oidc_token_filepath` and `databricks_token_audience`, autoloaded when the Spicepod
+/// does not set them, and `raw_params`, the ones the Spicepod sets.
+#[must_use]
+pub fn component_federation<'a, S: std::hash::BuildHasher>(
+    raw_params: &std::collections::HashMap<String, SecretString, S>,
+    [client_id, oidc_token_filepath, token_audience]: [Option<&'a SecretString>; 3],
+    github_actions: bool,
+) -> FederationParams<'a> {
+    let setting = |name: &str, value: Option<&'a SecretString>| Setting {
+        value: value.map(ExposeSecret::expose_secret),
+        in_spicepod: raw_params.contains_key(name),
+    };
+    FederationParams {
+        client_id: setting("databricks_client_id", client_id),
+        oidc_token_filepath: setting("databricks_oidc_token_filepath", oidc_token_filepath),
+        token_audience: setting("databricks_token_audience", token_audience),
+        github_actions,
+    }
+}
+
+/// The client ID a Databricks model or embedding uses outside workload identity federation: one
+/// from the environment counts only beside a client secret, so an ambient `DATABRICKS_CLIENT_ID`
+/// neither makes a token configuration ambiguous nor selects user-to-machine OAuth.
+#[must_use]
+pub fn component_client_id<'a, S: std::hash::BuildHasher>(
+    raw_params: &std::collections::HashMap<String, SecretString, S>,
+    client_id: Option<&'a SecretString>,
+    client_secret: Option<&SecretString>,
+) -> Option<&'a str> {
+    client_id
+        .filter(|_| raw_params.contains_key("databricks_client_id") || client_secret.is_some())
+        .map(ExposeSecret::expose_secret)
+        .filter(|client_id| !client_id.trim().is_empty())
+}
+
+/// The workload identity federation parameters of a Databricks component.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct FederationParams<'a> {
+    pub client_id: Setting<'a>,
+    pub oidc_token_filepath: Setting<'a>,
+    pub token_audience: Setting<'a>,
+    /// Whether this process runs in a GitHub Actions job that can request an OIDC token.
+    pub github_actions: bool,
+}
+
+impl<'a> FederationParams<'a> {
+    /// The identity these parameters configure, or `None` when they configure none.
+    ///
+    /// - A token file or an audience selects federation. So does a client ID on its own, with no
+    ///   token or client secret, in a GitHub Actions job, where user-to-machine OAuth cannot run.
+    /// - `key_param` names a token or client secret the Spicepod also sets. Federation the
+    ///   Spicepod sets cannot be combined with it, and federation from the environment yields to
+    ///   it. `has_key` counts a token or secret from anywhere.
+    /// - The identity token comes from the file, else the GitHub Actions job, else the
+    ///   workload's cloud identity, for the audience.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::InvalidWorkloadIdentity`] for parameters that conflict or are missing.
+    pub fn workload_identity(
+        self,
+        key_param: Option<&str>,
+        has_key: bool,
+    ) -> Result<Option<WorkloadIdentity<'a>>, Error> {
+        let file = self.oidc_token_filepath.get();
+        let audience = self.token_audience.get();
+        let client_id = self.client_id.get();
+        if file.is_none() && audience.is_none() {
+            return Ok(match client_id {
+                Some(client_id) if self.github_actions && !has_key => Some(WorkloadIdentity {
+                    client_id,
+                    identity_token: IdentityToken::GitHubActions { audience: None },
+                }),
+                _ => None,
+            });
+        }
+        if self.oidc_token_filepath.spicepod_value().is_some()
+            && self.token_audience.spicepod_value().is_some()
+        {
+            return InvalidWorkloadIdentitySnafu {
+                parameter: "databricks_token_audience",
+                message: "`databricks_token_audience` applies only to an identity token Spice requests, from GitHub Actions or the workload's cloud identity, but the identity token comes from `databricks_oidc_token_filepath`, whose audience is set where it is issued. Remove one of them",
+            }
+            .fail();
+        }
+        // A file and an audience, not both from the Spicepod: the one the Spicepod sets wins, and
+        // between two from the environment, the file does.
+        let use_file = match (file, audience) {
+            (Some(_), Some(_)) => {
+                self.oidc_token_filepath.in_spicepod || !self.token_audience.in_spicepod
+            }
+            (file, _) => file.is_some(),
+        };
+        let (federation_param, in_spicepod) = if use_file {
+            (
+                "databricks_oidc_token_filepath",
+                self.oidc_token_filepath.in_spicepod,
+            )
+        } else {
+            ("databricks_token_audience", self.token_audience.in_spicepod)
+        };
+        if let Some(key_param) = key_param {
+            if !in_spicepod {
+                return Ok(None);
+            }
+            return InvalidWorkloadIdentitySnafu {
+                parameter: federation_param,
+                message: format!(
+                    "A Databricks component authenticates with either `{key_param}` or workload identity federation (`{federation_param}`), and both are set. Remove one of them"
+                ),
+            }
+            .fail();
+        }
+        let Some(client_id) = client_id else {
+            return InvalidWorkloadIdentitySnafu {
+                parameter: "databricks_client_id",
+                message: "Workload identity federation needs `databricks_client_id`, the application ID of the service principal, and `databricks_client_id` is not set",
+            }
+            .fail();
+        };
+        let identity_token = match (use_file, file, audience) {
+            (true, Some(file), _) | (_, Some(file), None) => IdentityToken::File(file),
+            (_, _, Some(audience)) if self.github_actions => IdentityToken::GitHubActions {
+                audience: Some(audience),
+            },
+            (_, _, Some(audience)) => IdentityToken::Cloud { audience },
+            (_, None, None) => return Ok(None),
+        };
+        Ok(Some(WorkloadIdentity {
+            client_id,
+            identity_token,
+        }))
+    }
+}
+
+/// The model loading error `error` is: a configuration error for a mistake in the parameters.
+#[must_use]
+pub fn model_error(error: Error) -> llms::chat::Error {
+    match error {
+        Error::InvalidWorkloadIdentity { parameter, message } => {
+            llms::chat::Error::InvalidParamValueError {
+                param: parameter.to_string(),
+                message: format!("{message}. See: {MODEL_DOCS}"),
+            }
+        }
+        Error::NoIdentityToken { message } => llms::chat::Error::FailedToAuthenticate {
+            source: format!("{message}. See: {MODEL_DOCS}").into(),
+        },
+        other => llms::chat::Error::FailedToAuthenticate {
+            source: Box::new(other),
+        },
+    }
+}
+
+/// Get or create the refreshing token provider of a service principal that authenticates with
+/// workload identity federation. Components that name the same service principal and identity
+/// source share one provider, so its logs name the workspace. `component` names what the token
+/// authenticates in the load line, such as `model 'llm' (databricks)`.
+///
+/// # Errors
+///
+/// [`Error::InvalidWorkloadIdentity`] when there is no identity token to request or `endpoint`
+/// cannot receive one, and [`Error::WorkloadIdentityExchange`] when the first exchange fails.
+pub async fn get_workload_identity_token_provider(
+    component: &str,
+    endpoint: &str,
+    identity: WorkloadIdentity<'_>,
+    token_provider_registry: &Arc<TokenProviderRegistry>,
+) -> Result<Arc<dyn TokenProvider>, Error> {
+    let WorkloadIdentity {
+        client_id,
+        identity_token,
+    } = identity;
+    let token_url = databricks_token_endpoint_url(endpoint).map_err(|error| {
+        Error::InvalidWorkloadIdentity {
+            parameter: "databricks_endpoint",
+            message: error.to_string(),
+        }
+    })?;
+
+    let (source, source_key) = match identity_token {
+        IdentityToken::File(path) => (
+            SubjectTokenSource::File(PathBuf::from(path)),
+            format!("file_{path}"),
+        ),
+        IdentityToken::GitHubActions { audience } => {
+            // Databricks accepts the workspace's token endpoint as the audience by default.
+            let audience = audience.unwrap_or(token_url.as_str());
+            (
+                SubjectTokenSource::github_actions_from_env(audience).map_err(|_| {
+                    Error::InvalidWorkloadIdentity {
+                        parameter: "databricks_oidc_token_filepath",
+                        message: "Workload identity federation has no identity token: set `databricks_oidc_token_filepath` to the file the platform keeps it in, such as a Kubernetes projected service account token, or run in a GitHub Actions job with `permissions: id-token: write`".to_string(),
+                    }
+                })?,
+                format!("audience_{audience}"),
+            )
+        }
+        IdentityToken::Cloud { audience } => (
+            llms::workload_identity::cloud_identity(component, audience)
+                .await
+                .map_err(|tried| Error::NoIdentityToken {
+                    message: llms::workload_identity::no_identity_token_message(
+                        "databricks_oidc_token_filepath",
+                        &tried,
+                    ),
+                })?,
+            format!("cloud_{audience}"),
+        ),
+    };
+    let origin = source.describe();
+
+    let provider = token_provider_registry
+        .get_or_create_provider(
+            format!("databricks_oidc_{endpoint}_{client_id}_{source_key}"),
+            || {
+                WorkloadIdentityTokenProvider::try_new(
+                    format!("Databricks workspace '{endpoint}'"),
+                    source,
+                    Exchange::databricks(token_url, client_id),
+                )
+            },
+        )
+        .await
+        .map_err(|source| Error::WorkloadIdentityExchange { source })?;
+    tracing::info!(
+        "Authenticated {component} as a Databricks service principal, with the identity token from {origin}."
+    );
+    Ok(provider)
 }
 
 //
@@ -369,8 +685,6 @@ impl DatabricksU2MTokenProvider {
 use crate::parameters::Parameters;
 #[cfg(feature = "databricks")]
 use token_provider::StaticTokenProvider;
-#[cfg(feature = "databricks")]
-use token_provider::registry::TokenProviderRegistry;
 
 /// The accepted values of the `databricks_auth_mode` parameter, in the order they are documented.
 ///
@@ -405,6 +719,16 @@ pub enum AuthMode {
 
 #[cfg(feature = "databricks")]
 impl AuthMode {
+    /// The mode as `databricks_auth_mode` spells it.
+    fn name(self) -> &'static str {
+        match self {
+            Self::Auto => "auto",
+            Self::Token => "token",
+            Self::M2M => "m2m",
+            Self::U2M => "u2m",
+        }
+    }
+
     /// Parses the `databricks_auth_mode` parameter, ASCII-case-insensitively so that the `M2M` and
     /// `U2M` spellings used in the documentation are accepted alongside `m2m` and `u2m`.
     fn from_params(params: &Parameters) -> Result<Self, AuthConfigError> {
@@ -436,17 +760,78 @@ fn missing_for_mode(mode: &str, parameter: &str) -> AuthConfigError {
     }
 }
 
-/// Build auth credentials from parameters.
+/// Build auth credentials from parameters, for a process that may run in a GitHub Actions job.
 #[cfg(feature = "databricks")]
 pub fn build_auth_credentials(params: &Parameters) -> Result<AuthCredentials<'_>, AuthConfigError> {
-    let token = params.get("token").ok();
-    let client_id = params.get("client_id").expose().ok();
-    let client_secret = params.get("client_secret").ok();
+    build_auth_credentials_in(params, in_github_actions())
+}
 
-    match AuthMode::from_params(params)? {
-        AuthMode::Token => token.map(AuthCredentials::Token).ok_or_else(|| {
-            missing_for_mode("token", "databricks_token")
-        }),
+/// Build auth credentials from parameters. `github_actions` says whether the process runs in a
+/// GitHub Actions job that can request an OIDC token.
+#[cfg(feature = "databricks")]
+pub fn build_auth_credentials_in(
+    params: &Parameters,
+    github_actions: bool,
+) -> Result<AuthCredentials<'_>, AuthConfigError> {
+    let setting = |name: &str| Setting {
+        value: params.get(name).expose().ok(),
+        in_spicepod: params.get(name).ok().is_some() && !params.is_autoloaded(name),
+    };
+    let token = params.get("token").ok();
+    let client_id_setting = setting("client_id");
+    let client_secret = params.get("client_secret").ok();
+    let mode = AuthMode::from_params(params)?;
+
+    if mode == AuthMode::Auto {
+        let key_param = [
+            ("token", "databricks_token"),
+            ("client_secret", "databricks_client_secret"),
+        ]
+        .into_iter()
+        .find(|(name, _)| params.get(name).ok().is_some() && !params.is_autoloaded(name))
+        .map(|(_, param)| param);
+        let federation = FederationParams {
+            client_id: client_id_setting,
+            oidc_token_filepath: setting("oidc_token_filepath"),
+            token_audience: setting("token_audience"),
+            github_actions,
+        };
+        if let Some(identity) = federation
+            .workload_identity(key_param, token.is_some() || client_secret.is_some())
+            .map_err(|error| AuthConfigError::InvalidConfiguration {
+                message: error.to_string(),
+            })?
+        {
+            return Ok(AuthCredentials::WorkloadIdentity(identity));
+        }
+    } else if let Some(param) = [
+        ("oidc_token_filepath", "databricks_oidc_token_filepath"),
+        ("token_audience", "databricks_token_audience"),
+    ]
+    .into_iter()
+    .find(|(name, _)| setting(name).spicepod_value().is_some())
+    .map(|(_, param)| param)
+    {
+        return Err(AuthConfigError::InvalidConfiguration {
+            message: format!(
+                "`databricks_auth_mode: {}` cannot be combined with workload identity federation (`{param}`), which it would ignore. Remove `{param}`, or remove `databricks_auth_mode` to authenticate with workload identity federation",
+                mode.name()
+            ),
+        });
+    }
+
+    // A client ID from the environment counts in `auto` only beside a client secret, so an
+    // ambient `DATABRICKS_CLIENT_ID` neither makes a token configuration ambiguous nor selects
+    // user-to-machine OAuth.
+    let client_id = match mode {
+        AuthMode::Auto if !client_id_setting.in_spicepod && client_secret.is_none() => None,
+        _ => client_id_setting.get(),
+    };
+
+    match mode {
+        AuthMode::Token => token
+            .map(AuthCredentials::Token)
+            .ok_or_else(|| missing_for_mode("token", "databricks_token")),
         AuthMode::M2M => match (client_id, client_secret) {
             (Some(client_id), Some(client_secret)) => {
                 Ok(AuthCredentials::ServicePrincipal(client_id, client_secret))
@@ -470,7 +855,7 @@ pub fn build_auth_credentials(params: &Parameters) -> Result<AuthCredentials<'_>
                 Ok(AuthCredentials::ServicePrincipal(client_id, client_secret))
             }
             (None, None, None) => Err(AuthConfigError::InvalidConfiguration {
-                message: "Missing `databricks_token` or `databricks_client_id` and `databricks_client_secret` parameters".to_string(),
+                message: NO_CREDENTIAL_MESSAGE.to_string(),
             }),
             (None, None, Some(_)) => Err(AuthConfigError::MissingParameter {
                 parameter: "databricks_client_id".to_string(),
@@ -483,6 +868,13 @@ pub fn build_auth_credentials(params: &Parameters) -> Result<AuthCredentials<'_>
         },
     }
 }
+
+/// No credential is set.
+///
+/// Not gated on the `databricks` feature: the Databricks model and embedding loaders in
+/// `model/chat.rs` and `model/embed.rs` use it too, and they build under `models` without
+/// `databricks` (as `tools/spiceschema` does).
+pub const NO_CREDENTIAL_MESSAGE: &str = "Missing credentials: set `databricks_token`, `databricks_client_id` with `databricks_client_secret`, or workload identity federation (`databricks_client_id` with `databricks_oidc_token_filepath`, or `databricks_client_id` alone in a GitHub Actions job with `permissions: id-token: write`)";
 
 /// Both a token and service-principal credentials are set. Parameters absent from the Spicepod are
 /// auto-loaded from the secret stores and the environment, so this is reachable without the
@@ -501,9 +893,11 @@ pub enum AuthConfigError {
     InvalidConfiguration { message: String },
 }
 
-/// Get a token provider based on auth credentials.
+/// Get a token provider based on auth credentials. `component` names what the token authenticates
+/// in the logs, such as `dataset 'orders' (databricks)`.
 #[cfg(feature = "databricks")]
 pub async fn get_token_provider(
+    component: &str,
     endpoint: &str,
     auth_credentials: AuthCredentials<'_>,
     token_provider_registry: Arc<TokenProviderRegistry>,
@@ -516,6 +910,15 @@ pub async fn get_token_provider(
         }
         AuthCredentials::U2M(client_id) => {
             get_u2m_token_provider(endpoint, client_id, &token_provider_registry).await?
+        }
+        AuthCredentials::WorkloadIdentity(identity) => {
+            get_workload_identity_token_provider(
+                component,
+                endpoint,
+                identity,
+                &token_provider_registry,
+            )
+            .await?
         }
     })
 }
@@ -570,6 +973,11 @@ pub async fn get_u2m_token_provider(
 mod auth_mode_tests {
     use super::*;
     use crate::catalogconnector::databricks::PARAMETERS;
+
+    /// `build_auth_credentials` outside a GitHub Actions job, whatever the job running the test.
+    fn build(params: &Parameters) -> Result<AuthCredentials<'_>, AuthConfigError> {
+        build_auth_credentials_in(params, false)
+    }
 
     fn parameters(params: &[(&str, &str)]) -> Parameters {
         Parameters::new(
@@ -647,7 +1055,7 @@ mod auth_mode_tests {
             ("client_secret", "ambient-secret"),
         ]);
 
-        match build_auth_credentials(&params).expect("u2m should be selected") {
+        match build(&params).expect("u2m should be selected") {
             AuthCredentials::U2M(client_id) => assert_eq!(client_id, "client-id"),
             other => panic!("expected U2M, got {other:?}"),
         }
@@ -659,7 +1067,7 @@ mod auth_mode_tests {
     fn u2m_mode_ignores_autoloaded_token() {
         let credentials = [("client_id", "client-id"), ("token", "ambient-token")];
 
-        let auto = build_auth_credentials(&parameters(&credentials))
+        let auto = build(&parameters(&credentials))
             .expect_err("auto cannot choose between a token and a client id");
         assert!(
             auto.to_string().contains("databricks_auth_mode"),
@@ -668,7 +1076,7 @@ mod auth_mode_tests {
 
         let mut with_mode = credentials.to_vec();
         with_mode.push(("auth_mode", "u2m"));
-        match build_auth_credentials(&parameters(&with_mode)).expect("u2m should be selected") {
+        match build(&parameters(&with_mode)).expect("u2m should be selected") {
             AuthCredentials::U2M(client_id) => assert_eq!(client_id, "client-id"),
             other => panic!("expected U2M, got {other:?}"),
         }
@@ -683,7 +1091,7 @@ mod auth_mode_tests {
             ("client_secret", "ambient-secret"),
         ]);
 
-        match build_auth_credentials(&params).expect("token should be selected") {
+        match build(&params).expect("token should be selected") {
             AuthCredentials::Token(token) => assert_eq!(token.expose_secret(), "pat"),
             other => panic!("expected Token, got {other:?}"),
         }
@@ -698,7 +1106,7 @@ mod auth_mode_tests {
             ("client_secret", "secret"),
         ]);
 
-        match build_auth_credentials(&params).expect("m2m should be selected") {
+        match build(&params).expect("m2m should be selected") {
             AuthCredentials::ServicePrincipal(client_id, secret) => {
                 assert_eq!(client_id, "client-id");
                 assert_eq!(secret.expose_secret(), "secret");
@@ -721,8 +1129,8 @@ mod auth_mode_tests {
         ] {
             let mut params = credentials;
             params.push(("auth_mode", mode));
-            let error = build_auth_credentials(&parameters(&params))
-                .expect_err("the credential the mode needs is missing");
+            let error =
+                build(&parameters(&params)).expect_err("the credential the mode needs is missing");
             let message = error.to_string();
             assert!(
                 message.contains(expected_parameter) && message.contains(mode),
@@ -731,23 +1139,285 @@ mod auth_mode_tests {
         }
     }
 
+    fn workload_identity(params: &[(&str, &str)]) -> Result<String, String> {
+        match build(&parameters(params)) {
+            Ok(AuthCredentials::WorkloadIdentity(identity)) => Ok(format!("{identity:?}")),
+            Ok(other) => panic!("expected workload identity federation, got {other:?}"),
+            Err(error) => Err(error.to_string()),
+        }
+    }
+
+    #[test]
+    fn a_federation_param_selects_federation() {
+        let expected = |identity_token| {
+            Ok(format!(
+                "{:?}",
+                WorkloadIdentity {
+                    client_id: "id",
+                    identity_token,
+                }
+            ))
+        };
+        assert_eq!(
+            workload_identity(&[("client_id", "id"), ("oidc_token_filepath", "/token")]),
+            expected(IdentityToken::File("/token"))
+        );
+        // Outside GitHub Actions, the audience is requested from the workload's cloud identity.
+        assert_eq!(
+            workload_identity(&[("client_id", "id"), ("token_audience", "account")]),
+            expected(IdentityToken::Cloud {
+                audience: "account"
+            })
+        );
+        match build_auth_credentials_in(
+            &parameters(&[("client_id", "id"), ("token_audience", "account")]),
+            true,
+        ) {
+            Ok(AuthCredentials::WorkloadIdentity(identity)) => assert_eq!(
+                identity.identity_token,
+                IdentityToken::GitHubActions {
+                    audience: Some("account")
+                }
+            ),
+            other => panic!("expected workload identity federation, got {other:?}"),
+        }
+    }
+
+    /// A store holding `databricks_token`, as the environment store holds an ambient token.
+    struct AmbientToken;
+
+    #[async_trait::async_trait]
+    impl runtime_secrets::SecretStore for AmbientToken {
+        async fn get_secret(
+            &self,
+            key: &str,
+        ) -> std::result::Result<Option<SecretString>, Box<dyn std::error::Error + Send + Sync>>
+        {
+            Ok((key == "databricks_token").then(|| SecretString::from("ambient-token")))
+        }
+    }
+
+    /// A token the Spicepod never set must not stop a component that names federation params.
+    #[tokio::test]
+    async fn federation_wins_over_a_token_autoloaded_from_a_secret_store() {
+        let mut registry = runtime_secrets::Secrets::new();
+        registry.register_store("env", Arc::new(AmbientToken));
+        let params = Parameters::try_new(
+            "test component",
+            vec![
+                (
+                    "databricks_endpoint".to_string(),
+                    SecretString::from("dbc-example.cloud.databricks.com"),
+                ),
+                ("databricks_client_id".to_string(), SecretString::from("id")),
+                (
+                    "databricks_token_audience".to_string(),
+                    SecretString::from("account"),
+                ),
+            ],
+            "databricks",
+            Arc::new(tokio::sync::RwLock::new(registry)),
+            PARAMETERS,
+        )
+        .await
+        .expect("parameters should build");
+
+        assert!(params.is_autoloaded("token"));
+        match build_auth_credentials_in(&params, true).expect("federation should be selected") {
+            AuthCredentials::WorkloadIdentity(identity) => assert_eq!(
+                identity,
+                WorkloadIdentity {
+                    client_id: "id",
+                    identity_token: IdentityToken::GitHubActions {
+                        audience: Some("account")
+                    },
+                }
+            ),
+            other => panic!("expected workload identity federation, got {other:?}"),
+        }
+    }
+
+    /// A store holding `databricks_*` values, as the environment store holds
+    /// `DATABRICKS_CLIENT_ID` and the like.
+    struct Ambient(&'static [(&'static str, &'static str)]);
+
+    #[async_trait::async_trait]
+    impl runtime_secrets::SecretStore for Ambient {
+        async fn get_secret(
+            &self,
+            key: &str,
+        ) -> std::result::Result<Option<SecretString>, Box<dyn std::error::Error + Send + Sync>>
+        {
+            Ok(self
+                .0
+                .iter()
+                .find(|(name, _)| *name == key)
+                .map(|(_, value)| SecretString::from(*value)))
+        }
+    }
+
+    /// Parameters the Spicepod sets (`spicepod`, unprefixed), with `ambient` autoloaded.
+    async fn with_ambient(
+        spicepod: &[(&str, &str)],
+        ambient: &'static [(&'static str, &'static str)],
+    ) -> Parameters {
+        let mut registry = runtime_secrets::Secrets::new();
+        registry.register_store("env", Arc::new(Ambient(ambient)));
+        match Parameters::try_new(
+            "test component",
+            spicepod
+                .iter()
+                .map(|(key, value)| (format!("databricks_{key}"), SecretString::from(*value)))
+                .collect(),
+            "databricks",
+            Arc::new(tokio::sync::RwLock::new(registry)),
+            PARAMETERS,
+        )
+        .await
+        {
+            Ok(params) => params,
+            Err(error) => panic!("parameters should build: {error}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn an_ambient_client_id_counts_only_for_federation_or_beside_a_secret() {
+        let params = with_ambient(
+            &[
+                ("endpoint", "dbc-example.cloud.databricks.com"),
+                ("token", "pat"),
+            ],
+            &[("databricks_client_id", "env-id")],
+        )
+        .await;
+        assert!(params.is_autoloaded("client_id"));
+        assert!(
+            matches!(build(&params), Ok(AuthCredentials::Token(_))),
+            "a token with `DATABRICKS_CLIENT_ID` in the environment is not ambiguous"
+        );
+
+        let params = with_ambient(
+            &[("endpoint", "dbc-example.cloud.databricks.com")],
+            &[("databricks_client_id", "env-id")],
+        )
+        .await;
+        assert_eq!(
+            build(&params)
+                .map(|_| ())
+                .map_err(|error| error.to_string()),
+            Err(format!("Invalid configuration: {NO_CREDENTIAL_MESSAGE}")),
+            "`DATABRICKS_CLIENT_ID` alone does not select user-to-machine OAuth"
+        );
+
+        let params = with_ambient(
+            &[("endpoint", "dbc-example.cloud.databricks.com")],
+            &[
+                ("databricks_client_id", "env-id"),
+                ("databricks_oidc_token_filepath", "/env-token"),
+            ],
+        )
+        .await;
+        match build(&params) {
+            Ok(AuthCredentials::WorkloadIdentity(identity)) => assert_eq!(
+                identity,
+                WorkloadIdentity {
+                    client_id: "env-id",
+                    identity_token: IdentityToken::File("/env-token"),
+                }
+            ),
+            other => panic!("expected workload identity federation, got {other:?}"),
+        }
+    }
+
+    /// A client ID on its own stays user-to-machine outside GitHub Actions; in a job, where
+    /// user-to-machine OAuth cannot run, it is federation with the workspace's default audience.
+    #[test]
+    fn a_client_id_alone_is_federation_only_in_github_actions() {
+        match build(&parameters(&[("client_id", "id")])).expect("a client id alone selects U2M") {
+            AuthCredentials::U2M(client_id) => assert_eq!(client_id, "id"),
+            other => panic!("expected U2M, got {other:?}"),
+        }
+        match build_auth_credentials_in(&parameters(&[("client_id", "id")]), true) {
+            Ok(AuthCredentials::WorkloadIdentity(identity)) => assert_eq!(
+                identity,
+                WorkloadIdentity {
+                    client_id: "id",
+                    identity_token: IdentityToken::GitHubActions { audience: None },
+                }
+            ),
+            other => panic!("expected workload identity federation, got {other:?}"),
+        }
+        // A client secret beside it is machine-to-machine, in a job or not.
+        match build_auth_credentials_in(
+            &parameters(&[("client_id", "id"), ("client_secret", "secret")]),
+            true,
+        ) {
+            Ok(AuthCredentials::ServicePrincipal(client_id, _)) => assert_eq!(client_id, "id"),
+            other => panic!("expected M2M, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn an_explicit_mode_beside_a_federation_param_is_an_error() {
+        assert_eq!(
+            build(&parameters(&[
+                ("auth_mode", "token"),
+                ("token", "pat"),
+                ("oidc_token_filepath", "/token"),
+            ]))
+            .map(|_| ())
+            .map_err(|error| error.to_string()),
+            Err("Invalid configuration: `databricks_auth_mode: token` cannot be combined with workload identity federation (`databricks_oidc_token_filepath`), which it would ignore. Remove `databricks_oidc_token_filepath`, or remove `databricks_auth_mode` to authenticate with workload identity federation".to_string())
+        );
+    }
+
+    #[test]
+    fn a_federation_mistake_names_the_param_to_fix() {
+        assert_eq!(
+            workload_identity(&[("oidc_token_filepath", "/token")]),
+            Err("Invalid configuration: Workload identity federation needs `databricks_client_id`, the application ID of the service principal, and `databricks_client_id` is not set".to_string())
+        );
+        assert_eq!(
+            workload_identity(&[
+                ("client_id", "id"),
+                ("oidc_token_filepath", "/token"),
+                ("token", "pat"),
+            ]),
+            Err("Invalid configuration: A Databricks component authenticates with either `databricks_token` or workload identity federation (`databricks_oidc_token_filepath`), and both are set. Remove one of them".to_string())
+        );
+        assert_eq!(
+            workload_identity(&[
+                ("client_id", "id"),
+                ("token_audience", "account"),
+                ("client_secret", "secret"),
+            ]),
+            Err("Invalid configuration: A Databricks component authenticates with either `databricks_client_secret` or workload identity federation (`databricks_token_audience`), and both are set. Remove one of them".to_string())
+        );
+        assert_eq!(
+            workload_identity(&[
+                ("client_id", "id"),
+                ("oidc_token_filepath", "/token"),
+                ("token_audience", "account"),
+            ]),
+            Err("Invalid configuration: `databricks_token_audience` applies only to an identity token Spice requests, from GitHub Actions or the workload's cloud identity, but the identity token comes from `databricks_oidc_token_filepath`, whose audience is set where it is issued. Remove one of them".to_string())
+        );
+    }
+
     #[test]
     fn auto_mode_selection_is_unchanged() {
-        match build_auth_credentials(&parameters(&[("token", "pat")]))
+        match build(&parameters(&[("token", "pat")]))
             .expect("a token alone selects token authentication")
         {
             AuthCredentials::Token(token) => assert_eq!(token.expose_secret(), "pat"),
             other => panic!("expected Token, got {other:?}"),
         }
 
-        match build_auth_credentials(&parameters(&[("client_id", "id")]))
-            .expect("a client id alone selects U2M")
-        {
+        match build(&parameters(&[("client_id", "id")])).expect("a client id alone selects U2M") {
             AuthCredentials::U2M(client_id) => assert_eq!(client_id, "id"),
             other => panic!("expected U2M, got {other:?}"),
         }
 
-        match build_auth_credentials(&parameters(&[
+        match build(&parameters(&[
             ("client_id", "id"),
             ("client_secret", "secret"),
         ]))
@@ -760,16 +1430,13 @@ mod auth_mode_tests {
             other => panic!("expected ServicePrincipal, got {other:?}"),
         }
 
-        let missing = build_auth_credentials(&parameters(&[]))
-            .expect_err("no credentials at all is an error");
-        assert!(
-            missing.to_string().contains(
-                "Missing `databricks_token` or `databricks_client_id` and `databricks_client_secret` parameters"
-            ),
-            "got: {missing}"
+        let missing = build(&parameters(&[])).expect_err("no credentials at all is an error");
+        assert_eq!(
+            missing.to_string(),
+            format!("Invalid configuration: {NO_CREDENTIAL_MESSAGE}")
         );
 
-        let no_client_id = build_auth_credentials(&parameters(&[("client_secret", "secret")]))
+        let no_client_id = build(&parameters(&[("client_secret", "secret")]))
             .expect_err("a client secret without a client id is an error");
         assert!(
             no_client_id.to_string().contains("databricks_client_id"),
@@ -787,7 +1454,7 @@ mod auth_mode_tests {
                 ("client_secret", "secret"),
             ],
         ] {
-            let error = build_auth_credentials(&parameters(&ambiguous))
+            let error = build(&parameters(&ambiguous))
                 .expect_err("a token beside service principal credentials is ambiguous");
             assert!(
                 error.to_string().contains("databricks_auth_mode"),
@@ -948,6 +1615,170 @@ mod tests {
             "expires_in": 3600,
             "scope": "all-apis"
         })
+    }
+
+    #[test]
+    fn federation_wins_over_a_key_only_the_spicepod_can_conflict_with() {
+        let federation = FederationParams {
+            client_id: Setting::spicepod(Some("id")),
+            oidc_token_filepath: Setting::spicepod(Some("/token")),
+            ..FederationParams::default()
+        };
+        assert_eq!(
+            federation
+                .workload_identity(None, true)
+                .expect("no conflict"),
+            Some(WorkloadIdentity {
+                client_id: "id",
+                identity_token: IdentityToken::File("/token"),
+            })
+        );
+        let error = federation
+            .workload_identity(Some("databricks_token"), true)
+            .expect_err("a key the Spicepod sets conflicts");
+        assert_eq!(
+            model_error(error).to_string(),
+            "Invalid value for parameter databricks_oidc_token_filepath. A Databricks component authenticates with either `databricks_token` or workload identity federation (`databricks_oidc_token_filepath`), and both are set. Remove one of them. See: https://spiceai.org/docs/components/models/databricks"
+        );
+    }
+
+    #[test]
+    fn no_identity_token_is_not_a_configuration_error() {
+        // A cloud identity can answer later, so the model is loaded again.
+        let error = model_error(Error::NoIdentityToken {
+            message: "Workload identity federation has no identity token".to_string(),
+        });
+        assert_eq!(
+            (error.is_configuration_error(), error.to_string()),
+            (
+                false,
+                "Workload identity federation has no identity token. See: https://spiceai.org/docs/components/models/databricks".to_string()
+            )
+        );
+    }
+
+    #[test]
+    fn no_federation_param_leaves_the_other_modes_to_decide() {
+        assert_eq!(
+            FederationParams {
+                client_id: Setting::spicepod(Some("id")),
+                oidc_token_filepath: Setting::spicepod(Some("")),
+                ..FederationParams::default()
+            }
+            .workload_identity(Some("databricks_token"), true)
+            .expect("no federation param is set"),
+            None
+        );
+    }
+
+    /// Federation settings from the environment (`DATABRICKS_OIDC_TOKEN_FILEPATH`, ...) yield to a
+    /// key the Spicepod sets, and a value the Spicepod sets wins over one from the environment.
+    #[test]
+    fn a_spicepod_value_wins_over_one_from_the_environment() {
+        let from_env = |value| Setting {
+            value: Some(value),
+            in_spicepod: false,
+        };
+        let env_file = FederationParams {
+            client_id: from_env("env-id"),
+            oidc_token_filepath: from_env("/env-token"),
+            ..FederationParams::default()
+        };
+        assert_eq!(
+            env_file
+                .workload_identity(Some("databricks_token"), true)
+                .expect("the Spicepod's token wins"),
+            None
+        );
+        assert_eq!(
+            env_file
+                .workload_identity(None, true)
+                .expect("federation from the environment")
+                .map(|identity| identity.identity_token),
+            Some(IdentityToken::File("/env-token"))
+        );
+        // An audience the Spicepod sets wins over a token file from the environment.
+        let spicepod_audience = FederationParams {
+            client_id: Setting::spicepod(Some("id")),
+            oidc_token_filepath: from_env("/env-token"),
+            token_audience: Setting::spicepod(Some("account")),
+            github_actions: false,
+        };
+        assert_eq!(
+            spicepod_audience
+                .workload_identity(None, false)
+                .expect("federation")
+                .map(|identity| identity.identity_token),
+            Some(IdentityToken::Cloud {
+                audience: "account"
+            })
+        );
+    }
+
+    #[tokio::test]
+    async fn components_naming_the_same_identity_share_one_token_provider() {
+        let (endpoint, requests, captured_requests) = start_mock_server(vec![
+            MockHttpResponse::json("200 OK", &token_response_body()),
+            MockHttpResponse::json("200 OK", &token_response_body()),
+        ])
+        .await;
+        let dir = tempfile::tempdir().expect("a temporary directory");
+        let file = |name: &str| {
+            let path = dir.path().join(name);
+            std::fs::write(&path, format!("{name}-jwt\n")).expect("write the token file");
+            path.to_string_lossy().into_owned()
+        };
+        let (first, second) = (file("first"), file("second"));
+        let registry = Arc::new(TokenProviderRegistry::new());
+
+        for path in [&first, &first, &second] {
+            let provider = get_workload_identity_token_provider(
+                "dataset 'orders' (databricks)",
+                &endpoint,
+                WorkloadIdentity {
+                    client_id: "client-1",
+                    identity_token: IdentityToken::File(path),
+                },
+                &registry,
+            )
+            .await
+            .expect("the first exchange");
+            assert_eq!(provider.get_token(), "test-access-token");
+        }
+
+        assert_eq!(
+            requests.load(Ordering::SeqCst),
+            2,
+            "one exchange per identity source, not per component"
+        );
+        let request = captured_requests.lock().await.remove(0);
+        assert!(
+            request.starts_with("POST /oidc/v1/token "),
+            "the exchange goes to the workspace's token endpoint: {request}"
+        );
+        assert!(
+            request.contains("subject_token=first-jwt") && request.contains("client_id=client-1"),
+            "{request}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_token_endpoint_that_is_not_https_receives_no_identity_token() {
+        let error = get_workload_identity_token_provider(
+            "dataset 'orders' (databricks)",
+            "http://dbc.example.databricks.com",
+            WorkloadIdentity {
+                client_id: "client-1",
+                identity_token: IdentityToken::File("/nonexistent"),
+            },
+            &Arc::new(TokenProviderRegistry::new()),
+        )
+        .await
+        .expect_err("an insecure endpoint is refused");
+        assert_eq!(
+            error.to_string(),
+            "Databricks token endpoint must use HTTPS for non-localhost hosts, got: http://dbc.example.databricks.com"
+        );
     }
 
     #[test]

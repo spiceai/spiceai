@@ -20,7 +20,8 @@ use crate::{
 };
 use runtime_auth::{FlightBasicAuth, GrpcAuth, HttpAuth, IdentitySource, api_key::ApiKeyAuth};
 use secrecy::ExposeSecret;
-use spicepod::component::runtime::{ApiKey, ApiKeyAuth as SpicepodApiKeyAuth};
+use spicepod::component::access::AccessMode;
+use spicepod::component::runtime::{ApiKey, ApiKeyAuth as SpicepodApiKeyAuth, ClientAuthMode};
 use std::sync::Arc;
 use tokio::sync::RwLock;
 
@@ -115,6 +116,55 @@ impl EndpointAuth {
         self.grpc_auth = Some(auth);
         self
     }
+
+    /// The startup warning for an `app` whose data any caller can change, or `None` when this
+    /// runtime authenticates callers or nothing in `app` is writable. A dataset or catalog with
+    /// write access is writable, and so is an accelerated dataset, through its refresh and CDC
+    /// endpoints.
+    #[must_use]
+    pub fn unauthenticated_writes_warning(
+        &self,
+        app: &App,
+        client_auth_mode: ClientAuthMode,
+    ) -> Option<String> {
+        if self.http_auth.is_some() || client_auth_mode == ClientAuthMode::Required {
+            return None;
+        }
+
+        let datasets = app.datasets.iter().filter_map(|dataset| {
+            if dataset.access != AccessMode::Read {
+                Some(format!(
+                    "dataset '{}' (`access: {}`)",
+                    dataset.name,
+                    dataset.access.as_str()
+                ))
+            } else if dataset.acceleration.as_ref().is_some_and(|a| a.enabled) {
+                Some(format!("dataset '{}' (accelerated)", dataset.name))
+            } else {
+                None
+            }
+        });
+        let catalogs = app
+            .catalogs
+            .iter()
+            .filter(|catalog| catalog.access != AccessMode::Read)
+            .map(|catalog| {
+                format!(
+                    "catalog '{}' (`access: {}`)",
+                    catalog.name,
+                    catalog.access.as_str()
+                )
+            });
+        let writable: Vec<String> = datasets.chain(catalogs).collect();
+        if writable.is_empty() {
+            return None;
+        }
+
+        Some(format!(
+            "`runtime.auth` is not configured, so any caller who can reach this runtime can modify {}. Configure `runtime.auth` with a read-write API key, or restrict network access to authorized callers. See https://spiceai.org/docs/api/auth",
+            writable.join(", ")
+        ))
+    }
 }
 
 impl Default for EndpointAuth {
@@ -173,8 +223,13 @@ impl std::fmt::Debug for EndpointAuth {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use app::AppBuilder;
     use axum::http::request::Builder;
     use runtime_auth::AuthVerdict;
+    use spicepod::acceleration::Acceleration;
+    use spicepod::component::catalog::Catalog;
+    use spicepod::component::dataset::Dataset;
+    use spicepod::component::runtime::{Auth, Runtime as SpicepodRuntime};
 
     fn create_request_parts(api_key: Option<&str>) -> axum::http::request::Parts {
         let mut builder = Builder::new().uri("https://example.com");
@@ -313,5 +368,94 @@ mod tests {
             std::env::remove_var(&secret_key_1);
             std::env::remove_var(&secret_key_2);
         };
+    }
+
+    fn dataset(name: &str, access: AccessMode, accelerated: bool) -> Dataset {
+        let mut dataset = Dataset::new(format!("duckdb:{name}"), name);
+        dataset.access = access;
+        dataset.acceleration = accelerated.then(Acceleration::default);
+        dataset
+    }
+
+    fn catalog(name: &str, access: AccessMode) -> Catalog {
+        let mut catalog = Catalog::new(format!("unity_catalog:{name}"), name.to_string());
+        catalog.access = access;
+        catalog
+    }
+
+    /// One writable dataset, one accelerated dataset, one writable catalog, and a read-only
+    /// dataset and catalog.
+    fn writable_app() -> AppBuilder {
+        AppBuilder::new("test")
+            .with_dataset(dataset("orders", AccessMode::ReadWrite, false))
+            .with_dataset(dataset("trips", AccessMode::Read, true))
+            .with_dataset(dataset("lookup", AccessMode::Read, false))
+            .with_catalog(catalog("lake", AccessMode::ReadWriteCreate))
+            .with_catalog(catalog("reference", AccessMode::Read))
+    }
+
+    fn with_api_key_auth(app: AppBuilder) -> App {
+        app.with_runtime(SpicepodRuntime {
+            auth: Some(Auth {
+                api_key: Some(SpicepodApiKeyAuth {
+                    enabled: true,
+                    keys: vec![ApiKey::parse_str("rw-key:rw")],
+                }),
+            }),
+            ..SpicepodRuntime::default()
+        })
+        .build()
+    }
+
+    async fn warning_for(app: &App, client_auth_mode: ClientAuthMode) -> Option<String> {
+        let secrets = Arc::new(RwLock::new(Secrets::new()));
+        EndpointAuth::new(secrets, app)
+            .await
+            .unauthenticated_writes_warning(app, client_auth_mode)
+    }
+
+    #[tokio::test]
+    async fn warns_when_callers_can_write_without_auth() {
+        let app = writable_app().build();
+        assert_eq!(
+            warning_for(&app, ClientAuthMode::None).await.as_deref(),
+            Some(
+                "`runtime.auth` is not configured, so any caller who can reach this runtime can modify dataset 'orders' (`access: read_write`), dataset 'trips' (accelerated), catalog 'lake' (`access: read_write_create`). Configure `runtime.auth` with a read-write API key, or restrict network access to authorized callers. See https://spiceai.org/docs/api/auth"
+            )
+        );
+    }
+
+    #[tokio::test]
+    async fn warns_for_an_accelerated_dataset_alone() {
+        let app = AppBuilder::new("test")
+            .with_dataset(dataset("trips", AccessMode::Read, true))
+            .build();
+        assert_eq!(
+            warning_for(&app, ClientAuthMode::Request).await.as_deref(),
+            Some(
+                "`runtime.auth` is not configured, so any caller who can reach this runtime can modify dataset 'trips' (accelerated). Configure `runtime.auth` with a read-write API key, or restrict network access to authorized callers. See https://spiceai.org/docs/api/auth"
+            )
+        );
+    }
+
+    #[tokio::test]
+    async fn no_warning_when_auth_is_configured() {
+        let app = with_api_key_auth(writable_app());
+        assert_eq!(warning_for(&app, ClientAuthMode::None).await, None);
+    }
+
+    #[tokio::test]
+    async fn no_warning_when_client_certificates_are_required() {
+        let app = writable_app().build();
+        assert_eq!(warning_for(&app, ClientAuthMode::Required).await, None);
+    }
+
+    #[tokio::test]
+    async fn no_warning_when_nothing_is_writable() {
+        let app = AppBuilder::new("test")
+            .with_dataset(dataset("lookup", AccessMode::Read, false))
+            .with_catalog(catalog("reference", AccessMode::Read))
+            .build();
+        assert_eq!(warning_for(&app, ClientAuthMode::None).await, None);
     }
 }

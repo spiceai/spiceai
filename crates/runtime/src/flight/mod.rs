@@ -24,6 +24,7 @@ use crate::datafusion::sql_validator::validate_sql_query_read_only;
 use crate::dataupdate::DataUpdateBroadcaster;
 use crate::egress::EgressAccount;
 use crate::opentelemetry::create_metrics_service;
+use crate::opentelemetry_logs::create_logs_service;
 use app::{App, spicepod::component::runtime::FlightIpcCompression};
 use arrow::array::RecordBatch;
 use arrow::datatypes::{DataType, Schema};
@@ -38,6 +39,7 @@ use arrow_flight::{
     Ticket, flight_service_server::FlightServiceServer,
 };
 use arrow_ipc::{CompressionType, writer::IpcWriteOptions};
+use arrow_tools::ipc::{FLIGHT_TARGET_MESSAGE_BYTES, split_batch_for_flight};
 use bytes::Bytes;
 use cache::result::{
     CacheStatus,
@@ -98,7 +100,9 @@ pub use session::SessionStore;
 /// keepalive heartbeat. Write-through forwarding tasks send these periodically
 /// to prevent the executor's `DoPut` idle timeout from firing on streams that
 /// receive data in bursts with long idle gaps between them.
-pub use runtime_cluster::flight_config::{KEEPALIVE_APP_METADATA, do_put_idle_timeout, keepalive};
+pub use runtime_cluster::flight_config::{
+    ABANDON_APP_METADATA, KEEPALIVE_APP_METADATA, do_put_idle_timeout, keepalive,
+};
 
 pub struct Service {
     data_update_broadcaster: DataUpdateBroadcaster,
@@ -626,11 +630,10 @@ impl Stream for InlineFlightStream {
                         &args.options,
                         &mut args.compression_context,
                     ) {
-                        Ok((dicts, batch_data)) => {
-                            for dict in dicts {
-                                this.queue_encoded(dict);
+                        Ok(messages) => {
+                            for message in messages {
+                                this.queue_encoded(message);
                             }
-                            this.queue_encoded(batch_data);
                         }
                         Err(status) => {
                             // Drop the source so a later poll cannot encode the
@@ -720,16 +723,12 @@ fn spawn_flight_encode_stream(
                         &options,
                         &mut compression_context,
                     ) {
-                        Ok((dicts, batch_data)) => {
-                            for dict in dicts {
-                                account.reserve(flight_data_size(&dict)).await;
-                                if tx.send(Ok(dict)).await.is_err() {
+                        Ok(messages) => {
+                            for message in messages {
+                                account.reserve(flight_data_size(&message)).await;
+                                if tx.send(Ok(message)).await.is_err() {
                                     return;
                                 }
-                            }
-                            account.reserve(flight_data_size(&batch_data)).await;
-                            if tx.send(Ok(batch_data)).await.is_err() {
-                                return;
                             }
                         }
                         Err(status) => {
@@ -757,8 +756,14 @@ fn spawn_flight_encode_stream(
 }
 
 /// Encode one served batch into its Flight dictionary + record-batch
-/// messages, applying the `Utf8View`/`BinaryView` → `Large*` cast when the
-/// advertised schema was expanded.
+/// messages, in send order, applying the `Utf8View`/`BinaryView` → `Large*`
+/// cast when the advertised schema was expanded.
+///
+/// A batch over [`FLIGHT_TARGET_MESSAGE_BYTES`] is split into zero-copy row
+/// slices first, each its own record-batch message, so one large batch (an
+/// accelerator scan, a coalesced sort, an engine that returns its whole
+/// result at once) never becomes a message over a client's gRPC receive
+/// limit — 4 MiB by default in tonic, grpc-go and grpc-java.
 ///
 /// [`ServedFlightBatch::Owned`] is moved into the cast so a non-cache Flight
 /// query does not pay `RecordBatch::clone` before `cast_view_columns`.
@@ -771,7 +776,7 @@ fn encode_flight_batch(
     dict_tracker: &mut DictionaryTracker,
     options: &IpcWriteOptions,
     compression_context: &mut IpcWriteContext,
-) -> Result<(Vec<FlightData>, FlightData), Status> {
+) -> Result<Vec<FlightData>, Status> {
     let cast;
     let batch = if needs_view_cast {
         let owned = match batch {
@@ -785,14 +790,18 @@ fn encode_flight_batch(
         batch.as_record_batch()
     };
 
-    let (dicts, batch_data) = encoder
-        .encode(batch, dict_tracker, options, compression_context)
-        .map_err(|e| Status::internal(e.to_string()))?;
-
-    Ok((
-        dicts.into_iter().map(Into::into).collect(),
-        batch_data.into(),
-    ))
+    // `RecordBatch::clone` is a handful of `Arc` bumps; the slices share the
+    // batch's buffers.
+    let slices = split_batch_for_flight(batch.clone(), FLIGHT_TARGET_MESSAGE_BYTES);
+    let mut messages = Vec::with_capacity(slices.len());
+    for slice in &slices {
+        let (dicts, batch_data) = encoder
+            .encode(slice, dict_tracker, options, compression_context)
+            .map_err(|e| Status::internal(e.to_string()))?;
+        messages.extend(dicts.into_iter().map(Into::into));
+        messages.push(batch_data.into());
+    }
+    Ok(messages)
 }
 
 /// Heap/wire bytes a single [`FlightData`] message occupies while buffered for
@@ -887,6 +896,22 @@ pub(crate) fn record_batches_to_flight_stream(
         .map_err(to_tonic_err)
 }
 
+/// Streams a committed transaction's final result, holding its memory
+/// reservation until the stream is dropped.
+pub(crate) fn transaction_outcome_to_flight_stream(
+    outcome: query::TransactionOutcome,
+) -> impl Stream<Item = Result<FlightData, Status>> {
+    let query::TransactionOutcome {
+        result,
+        reservation,
+    } = outcome;
+    let batches = result.map(|(batches, _)| batches).unwrap_or_default();
+    record_batches_to_flight_stream(batches).map(move |item| {
+        let _held = &reservation;
+        item
+    })
+}
+
 /// Returns `true` when the request has an authenticated principal that
 /// lacks write permission (`"write"` or `"read_write"` group).
 /// Returns `false` when there is no principal (auth not configured)
@@ -924,8 +949,8 @@ pub(crate) async fn check_read_only_sql(
         return Ok(None);
     }
     let session = datafusion.ctx.state();
-    let plan = datafusion
-        .create_logical_plan(&session, sql)
+    let (plan, _) = datafusion
+        .create_logical_plan(&session, sql, parameters)
         .await
         .map_err(|e| Status::invalid_argument(format!("Failed to parse SQL: {e}")))?;
     // Bind parameters to the plan so the returned plan is fully resolved.
@@ -966,6 +991,7 @@ fn handle_query_error(e: query::Error) -> Status {
         | query::Error::UnableToExecuteQuery { source } => handle_datafusion_error(&source),
         query::Error::QueryCancelled { .. } => Status::cancelled(e.to_string()),
         query::Error::QueryTimedOut { .. } => Status::deadline_exceeded(e.to_string()),
+        query::Error::NotCached => Status::failed_precondition(e.to_string()),
         _ => to_tonic_err(e),
     }
 }
@@ -1020,6 +1046,9 @@ pub(crate) fn handle_datafusion_error(e: &DataFusionError) -> Status {
                         Status::unavailable(format!(
                             "Acceleration not ready; loading initial data for {dataset_name}"
                         ))
+                    }
+                    SpiceExternalError::PartitionsUnavailable { message } => {
+                        Status::unavailable(message)
                     }
                 }
             } else if let Some(err) = e.downcast_ref::<FlightClientError>() {
@@ -1216,6 +1245,8 @@ pub async fn start(
     // Create the OpenTelemetry MetricsService. Pass a weak runtime handle so ingest can
     // evolve an accelerated metric table's schema in place when new dimensions arrive.
     let query_engine: Arc<dyn runtime_query_engine::query_engine::QueryEngine> = rt.datafusion();
+    let otel_logs_service =
+        create_logs_service(Arc::clone(&query_engine), Some(Arc::downgrade(&rt)));
     let otel_service = create_metrics_service(query_engine, Some(Arc::downgrade(&rt)));
 
     // Get job executor if available (cluster mode)
@@ -1245,7 +1276,8 @@ pub async fn start(
 
     let server = server
         .add_service(spice_flight_service)
-        .add_service(otel_service);
+        .add_service(otel_service)
+        .add_service(otel_logs_service);
 
     let serve_result = if let Some(ref tls_config) = tls_config {
         // TLS path: bind a TCP listener ourselves, run tokio-rustls per
@@ -1386,7 +1418,7 @@ impl Default for RateLimits {
 mod tests {
     use super::*;
     use arrow::array::{
-        ArrayRef, DictionaryArray, Int64Array, StringArray, StringViewArray, StructArray,
+        Array, ArrayRef, DictionaryArray, Int64Array, StringArray, StringViewArray, StructArray,
     };
     use arrow::datatypes::{Field, Fields, Int32Type, SchemaRef};
     use datafusion::execution::SendableRecordBatchStream;
@@ -1469,6 +1501,80 @@ mod tests {
 
     fn batch(schema: &SchemaRef, columns: Vec<ArrayRef>) -> RecordBatch {
         RecordBatch::try_new(Arc::clone(schema), columns).expect("record batch")
+    }
+
+    /// One batch whose single message would be over a gRPC client's default 4 MiB
+    /// receive limit — the ~7.6 MB message an accelerated `SELECT *` sent — must go
+    /// out as several messages under it, on the inline, encode-task and cached-raw
+    /// paths alike, with every row arriving in order.
+    #[tokio::test]
+    async fn a_large_batch_is_sent_as_messages_under_the_client_receive_limit() {
+        const CLIENT_DEFAULT_DECODE_LIMIT: usize = 4 * 1024 * 1024;
+        let schema: SchemaRef = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("js", DataType::Utf8View, false),
+        ]));
+        let rows = 32_768_i64;
+        let pad = "x".repeat(231);
+        let ids: Vec<i64> = (0..rows).collect();
+        let large = batch(
+            &schema,
+            vec![
+                Arc::new(Int64Array::from(ids.clone())) as ArrayRef,
+                Arc::new(StringViewArray::from_iter_values(
+                    ids.iter().map(|i| format!("{i:09}{pad}")),
+                )) as ArrayRef,
+            ],
+        );
+        assert!(large.get_array_memory_size() > CLIENT_DEFAULT_DECODE_LIMIT);
+
+        for (path, response) in [
+            ("inline", respond(&schema, vec![Ok(large.clone())], true)),
+            (
+                "encode task",
+                respond(&schema, vec![Ok(large.clone())], false),
+            ),
+            (
+                "cached raw",
+                respond_cached_raw(&schema, vec![large.clone()]),
+            ),
+        ] {
+            let (messages, failure) = sent(response).await;
+            assert_eq!(failure, None, "{path}");
+            for message in &messages {
+                let bytes = message.data_header.len() + message.data_body.len();
+                assert!(
+                    bytes <= CLIENT_DEFAULT_DECODE_LIMIT,
+                    "{path}: a {bytes}-byte message exceeds the client limit"
+                );
+            }
+            let decoded =
+                arrow_flight::utils::flight_data_to_batches(&messages).expect("decode messages");
+            assert!(decoded.len() > 1, "{path}: the batch was not split");
+            let decoded_ids: Vec<i64> = decoded
+                .iter()
+                .flat_map(|b| {
+                    b.column(0)
+                        .as_any()
+                        .downcast_ref::<Int64Array>()
+                        .expect("id column")
+                        .values()
+                        .to_vec()
+                })
+                .collect();
+            assert_eq!(decoded_ids, ids, "{path}");
+            let last = decoded.last().expect("a batch");
+            let js = arrow::compute::cast(last.column(1), &DataType::Utf8).expect("cast js");
+            let js = js
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .expect("js column");
+            assert_eq!(
+                js.value(js.len() - 1),
+                format!("{:09}{pad}", rows - 1),
+                "{path}"
+            );
+        }
     }
 
     /// A result encoded on the request's task must send exactly the messages the
@@ -2115,6 +2221,24 @@ mod tests {
         );
     }
 
+    /// A query a cluster scheduler cannot route yet is `Unavailable`, which
+    /// clients retry, also when the planner wraps the error.
+    #[test]
+    fn unavailable_partitions_are_unavailable() {
+        let message =
+            "Cannot query t: no ready executor serves 1 of its 2 partitions; retry the query";
+        let status = handle_datafusion_error(&DataFusionError::Context(
+            "partitioned_table_scan_rewrite".to_string(),
+            Box::new(DataFusionError::External(
+                SpiceExternalError::partitions_unavailable(message.to_string()),
+            )),
+        ));
+        assert_eq!(
+            (status.code(), status.message()),
+            (tonic::Code::Unavailable, message)
+        );
+    }
+
     /// Only an Arrow failure on the values the query computes is the client's; one
     /// raised by the runtime's own buffers stays `Internal`.
     #[test]
@@ -2144,5 +2268,34 @@ mod tests {
                 "Arrow error: Memory error: buffer too small"
             )
         );
+    }
+
+    /// A transaction result's reservation is held until its Flight stream is
+    /// dropped, not released when the stream is built.
+    #[tokio::test]
+    async fn transaction_stream_holds_its_reservation() {
+        use datafusion::execution::memory_pool::MemoryConsumer;
+
+        let pool: Arc<dyn MemoryPool> = Arc::new(UnboundedMemoryPool::default());
+        let reservation = MemoryConsumer::new("transaction_result").register(&pool);
+        reservation.grow(1024);
+        let batch = RecordBatch::try_new(
+            Arc::new(Schema::new(vec![Field::new("v", DataType::Int64, false)])),
+            vec![Arc::new(Int64Array::from(vec![1, 2])) as ArrayRef],
+        )
+        .expect("record batch");
+        let outcome = query::TransactionOutcome {
+            result: Some((vec![batch], cache::result::CacheStatus::CacheMiss)),
+            reservation,
+        };
+
+        let mut stream = Box::pin(transaction_outcome_to_flight_stream(outcome));
+        assert_eq!(pool.reserved(), 1024);
+        while let Some(item) = stream.next().await {
+            item.expect("flight data");
+            assert_eq!(pool.reserved(), 1024);
+        }
+        drop(stream);
+        assert_eq!(pool.reserved(), 0);
     }
 }

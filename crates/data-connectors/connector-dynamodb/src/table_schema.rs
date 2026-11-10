@@ -13,7 +13,7 @@ WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 See the License for the specific language governing permissions and
 limitations under the License.
 */
-use crate::filter::{KeyReading, Translator};
+use crate::filter::Translator;
 use aws_sdk_dynamodb::types::ScalarAttributeType;
 use datafusion::arrow::datatypes::SchemaRef;
 use datafusion::logical_expr::{Expr, TableProviderFilterPushDown};
@@ -132,16 +132,6 @@ impl DynamoDBTableSchema {
 
     pub fn sort_key(&self) -> Option<&str> {
         self.sort_key.as_deref()
-    }
-
-    /// How the sort key's column reads the key's values.
-    pub(crate) fn sort_key_reading(&self) -> KeyReading {
-        self.sort_key
-            .as_deref()
-            .and_then(|sort_key| self.table_schema.field_with_name(sort_key).ok())
-            .map_or(KeyReading::Stored, |field| {
-                KeyReading::of(field.data_type())
-            })
     }
 
     pub fn is_flattened_field(&self, field_name: &str) -> bool {

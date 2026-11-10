@@ -568,6 +568,16 @@ impl IndexedMemTable {
         self
     }
 
+    /// Configures how `on_conflict` upsert resolves duplicate primary keys within one write.
+    #[must_use]
+    pub fn with_upsert_options(
+        mut self,
+        upsert_options: datafusion_table_providers::util::constraints::UpsertOptions,
+    ) -> Self {
+        self.inner = self.inner.with_upsert_options(upsert_options);
+        self
+    }
+
     /// Configures sort columns.
     #[must_use]
     pub fn with_sort_columns(mut self, sort_columns: Vec<String>) -> Self {

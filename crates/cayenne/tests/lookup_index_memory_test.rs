@@ -17,8 +17,6 @@ limitations under the License.
 //! Measures Rust allocator live bytes while Cayenne reopens persisted indexes.
 //! Native allocations and memory-mapped pages are outside this measurement.
 
-#![expect(clippy::expect_used, reason = "test setup and assertions")]
-
 use crate::common;
 
 use crate::live_bytes;

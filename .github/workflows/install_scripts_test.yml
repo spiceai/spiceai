@@ -32,6 +32,7 @@ concurrency:
 jobs:
   # Unit tests for install script logic
   test-install-scripts:
+    environment: secret-free
     name: Test Install Scripts (${{ matrix.os }}, ${{ matrix.shell }})
     runs-on: ${{ matrix.runner }}
     defaults:
@@ -85,6 +86,7 @@ jobs:
 
   # Test shell detection and PATH configuration
   test-shell-detection:
+    environment: secret-free
     name: Shell Detection (${{ matrix.os }}, ${{ matrix.shell }})
     runs-on: ${{ matrix.runner }}
     defaults:
@@ -180,6 +182,7 @@ jobs:
 
   # Test custom install directories
   test-custom-install-dir:
+    environment: secret-free
     name: Custom Install Dir (${{ matrix.os }})
     runs-on: ${{ matrix.runner }}
     strategy:
@@ -238,6 +241,7 @@ jobs:
 
   # Test all spiced variants across architectures
   test-spiced-variants:
+    environment: secret-free
     name: Spiced Variant (${{ matrix.os }}, ${{ matrix.variant }})
     runs-on: ${{ matrix.runner }}
     strategy:
@@ -279,6 +283,7 @@ jobs:
 
   # Test specific version installation
   test-specific-version:
+    environment: secret-free
     name: Specific Version Install (${{ matrix.os }})
     runs-on: ${{ matrix.runner }}
     strategy:
@@ -335,6 +340,7 @@ jobs:
 
   # Test HTTP client fallback (curl vs wget)
   test-http-clients:
+    environment: secret-free
     name: HTTP Client (${{ matrix.client }})
     runs-on: ubuntu-24.04
     strategy:
@@ -424,6 +430,7 @@ jobs:
 
   # Test error handling
   test-error-handling:
+    environment: secret-free
     name: Error Handling (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
     strategy:
@@ -471,6 +478,7 @@ jobs:
 
   # Test on Windows with WSL
   test-windows-wsl:
+    environment: secret-free
     name: Windows WSL (${{ matrix.distro }})
     runs-on: windows-latest
     env:
@@ -486,7 +494,7 @@ jobs:
           persist-credentials: false
 
       - name: Setup WSL
-        uses: Vampire/setup-wsl@d1da7f2c0322a5ee4f24975344f67fc0f5baf364 # v7
+        uses: Vampire/setup-wsl@4c48163d9f981914dd8caa0fc335fe19cca5bff4 # v7
         with:
           distribution: ${{ matrix.distro }}
           additional-packages: curl wget python3
@@ -536,6 +544,7 @@ jobs:
 
   # Test native Windows with PowerShell
   test-windows-native:
+    environment: secret-free
     name: Windows Native (PowerShell)
     runs-on: windows-latest
     steps:
@@ -578,6 +587,7 @@ jobs:
 
   # Test Windows PowerShell with custom directory
   test-windows-custom-dir:
+    environment: secret-free
     name: Windows Custom Dir (PowerShell)
     runs-on: windows-latest
     steps:
@@ -617,6 +627,7 @@ jobs:
 
   # Test Windows PowerShell error handling
   test-windows-errors:
+    environment: secret-free
     name: Windows Error Handling (PowerShell)
     runs-on: windows-latest
     steps:
@@ -661,6 +672,7 @@ jobs:
 
   # Validate scripts with shellcheck
   shellcheck:
+    environment: secret-free
     name: Shellcheck
     runs-on: ubuntu-latest
     steps:

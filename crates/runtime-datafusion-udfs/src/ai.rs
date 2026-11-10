@@ -2270,4 +2270,80 @@ mod tests {
             observed_max
         );
     }
+
+    /// `ai()` as a GROUP BY or ORDER BY key, with [`AsyncCallPlacement`] registered as the
+    /// runtime does.
+    ///
+    /// [`AsyncCallPlacement`]: crate::async_placement::AsyncCallPlacement
+    #[tokio::test]
+    async fn ai_in_group_by_and_order_by() {
+        use arrow::array::{Int32Array, StringArray};
+        use arrow::record_batch::RecordBatch;
+        use arrow::util::pretty::pretty_format_batches;
+        use arrow_schema::Schema;
+        use datafusion::prelude::SessionContext;
+
+        let ctx = SessionContext::new();
+        ctx.register_udf(
+            Ai::new(
+                create_test_model_store(),
+                Arc::default(),
+                empty_rate_controllers(),
+                RuntimeStatus::new(),
+            )
+            .into_async_udf()
+            .into_scalar_udf(),
+        );
+        ctx.add_optimizer_rule(Arc::new(crate::async_placement::AsyncCallPlacement));
+        let batch = RecordBatch::try_new(
+            Arc::new(Schema::new(vec![
+                Field::new("id", DataType::Int32, false),
+                Field::new("category", DataType::Utf8, false),
+            ])),
+            vec![
+                Arc::new(Int32Array::from(vec![1, 2, 3, 4])),
+                Arc::new(StringArray::from(vec!["toys", "books", "toys", "games"])),
+            ],
+        )
+        .expect("should create RecordBatch");
+        ctx.register_batch("t", batch)
+            .expect("should register table");
+
+        let query = async |sql: &str| {
+            let batches = ctx
+                .sql(sql)
+                .await
+                .expect("should plan")
+                .collect()
+                .await
+                .expect("should execute");
+            pretty_format_batches(&batches)
+                .expect("should format")
+                .to_string()
+        };
+
+        assert_eq!(
+            query("SELECT ai(category) AS c, count(*) AS n FROM t GROUP BY c ORDER BY c").await,
+            "\
++---------------------------------+---+
+| c                               | n |
++---------------------------------+---+
+| Response from test-model: books | 1 |
+| Response from test-model: games | 1 |
+| Response from test-model: toys  | 2 |
++---------------------------------+---+"
+        );
+        assert_eq!(
+            query("SELECT id FROM t ORDER BY ai(category) DESC, id").await,
+            "\
++----+
+| id |
++----+
+| 1  |
+| 3  |
+| 4  |
+| 2  |
++----+"
+        );
+    }
 }

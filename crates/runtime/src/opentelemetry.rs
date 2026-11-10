@@ -39,6 +39,7 @@ use arrow::array::new_null_array;
 use arrow::datatypes::DataType;
 use arrow::datatypes::Field;
 use arrow::datatypes::Schema;
+use arrow::error::ArrowError;
 use arrow::record_batch::RecordBatch;
 use datafusion::common::TableReference;
 use indexmap::IndexMap;
@@ -63,7 +64,8 @@ use tonic::codec::CompressionEncoding;
 
 use crate::Runtime;
 use crate::opentelemetry_store::{
-    MAX_STORE_BATCH_ROWS, OTLP_METRICS_PARAM, StoreExport, is_otlp_metrics_store_param,
+    MAX_STORE_BATCH_ROWS, MAX_STORE_BATCH_STRING_BYTES, MAX_STORE_EXPORT_STRING_BYTES,
+    OTLP_METRICS_PARAM, StoreExport, is_otlp_metrics_store_param,
 };
 use runtime_query_engine::query_engine::{QueryEngine, UpdateType};
 use util::tracers::OnceTracer;
@@ -181,6 +183,7 @@ impl MetricsService for Service {
         &self,
         request: Request<ExportMetricsServiceRequest>,
     ) -> std::result::Result<Response<ExportMetricsServiceResponse>, Status> {
+        crate::http::v1::ensure_otlp_grpc_write_access().await?;
         let mut rejected_data_points = 0;
         let mut total_data_points = 0;
         let request = request.into_inner();
@@ -188,6 +191,9 @@ impl MetricsService for Service {
         // succeeds every data point is stored, so a metric without its own dataset is not
         // rejected, and its per-metric dataset, if any, still receives it below.
         let store_outcome = self.write_to_metrics_store(&request).await;
+        if let StoreOutcome::Rejected(message) = &store_outcome {
+            return Err(Status::invalid_argument(message.clone()));
+        }
         let stored_in_metrics_store = store_outcome == StoreOutcome::Stored;
         let resource_metrics = request.resource_metrics;
         tracing::debug!(
@@ -275,7 +281,7 @@ impl MetricsService for Service {
 }
 
 /// Outcome of writing an export to the metrics store tables.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 enum StoreOutcome {
     /// No writable metrics store table, or nothing to write.
     NotConfigured,
@@ -283,6 +289,8 @@ enum StoreOutcome {
     Stored,
     /// A table failed to store a batch.
     Failed,
+    /// The export is too large to store, so it is rejected without being retried.
+    Rejected(String),
 }
 
 /// Outcome of one attempt to build and write a metric's batch.
@@ -358,8 +366,22 @@ impl Service {
         if export.rows() == 0 {
             return StoreOutcome::NotConfigured;
         }
+        let batches = match export.batches(
+            MAX_STORE_BATCH_ROWS,
+            MAX_STORE_BATCH_STRING_BYTES,
+            MAX_STORE_EXPORT_STRING_BYTES,
+        ) {
+            Ok(batches) => batches,
+            Err(ArrowError::InvalidArgumentError(message)) => {
+                return StoreOutcome::Rejected(message);
+            }
+            Err(e) => {
+                tracing::error!("Failed to build an OpenTelemetry metrics store batch: {e}");
+                return StoreOutcome::Failed;
+            }
+        };
         let mut failed = false;
-        for batch in export.batches(MAX_STORE_BATCH_ROWS) {
+        for batch in batches {
             let batch = match batch {
                 Ok(batch) => batch,
                 Err(e) => {
@@ -1635,6 +1657,7 @@ pub fn create_metrics_service(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use app::spicepod::component::runtime::ApiKey;
     use arrow::array::Array;
     use arrow::array::AsArray;
     use arrow::array::Float64Array;
@@ -1659,9 +1682,11 @@ mod tests {
     use opentelemetry_proto::tonic::metrics::v1::SummaryDataPoint;
     use opentelemetry_proto::tonic::resource::v1::Resource;
     use parking_lot::Mutex;
+    use runtime_auth::{AuthPrincipalRef, AuthRequestContext};
     use runtime_query_engine::query_engine::Error as QueryEngineError;
     use runtime_query_engine::query_engine::QueryRequest;
     use runtime_query_engine::query_engine::Result as QueryEngineResult;
+    use runtime_request_context::{Protocol, RequestContext, RequestContextBuilder};
     use std::sync::atomic::AtomicU64;
     use std::sync::atomic::Ordering;
 
@@ -3514,6 +3539,56 @@ mod tests {
         );
         assert_eq!(engine.rows_written(), 0);
     }
+
+    fn context_with_api_key(key: ApiKey) -> Arc<RequestContext> {
+        let context = Arc::new(RequestContextBuilder::new(Protocol::Flight).build());
+        context
+            .set_auth_principal(Arc::new(key) as AuthPrincipalRef)
+            .expect("auth principal should be set");
+        context
+    }
+
+    /// A read-only API key must not persist an OTLP metrics export. The metrics store table is
+    /// writable, so a missing principal check would store the row and return success.
+    #[tokio::test]
+    async fn otlp_grpc_read_only_api_key_is_denied_and_writes_nothing() {
+        let engine = Arc::new(FakeQueryEngine::unregistered().writable_only(&["otel_metrics"]));
+        let service = store_service(&engine, &["otel_metrics"]);
+        let request = otlp_request(vec![otlp_metric("checkout_requests", Some(gauge(1.0)))]);
+
+        let status = context_with_api_key(ApiKey::ReadOnly {
+            key: "read-only".to_string(),
+        })
+        .scope(service.export(Request::new(request)))
+        .await
+        .expect_err("a read-only API key must not export metrics");
+
+        assert_eq!(status.code(), tonic::Code::PermissionDenied);
+        assert_eq!(status.message(), "API key does not allow write access");
+        assert_eq!(engine.rows_written(), 0);
+        assert!(engine.tables_written().is_empty());
+    }
+
+    /// A read-write API key still stores the export.
+    #[tokio::test]
+    async fn otlp_grpc_read_write_api_key_exports_metrics() {
+        let engine = Arc::new(FakeQueryEngine::unregistered().writable_only(&["otel_metrics"]));
+        let service = store_service(&engine, &["otel_metrics"]);
+        let request = otlp_request(vec![otlp_metric("svc_requests", Some(gauge(1.0)))]);
+
+        let response = context_with_api_key(ApiKey::ReadWrite {
+            key: "read-write".to_string(),
+        })
+        .scope(service.export(Request::new(request)))
+        .await
+        .expect("a read-write API key exports metrics")
+        .into_inner();
+
+        assert!(response.partial_success.is_none());
+        assert_eq!(engine.tables_written(), vec!["otel_metrics".to_string()]);
+        assert_eq!(engine.rows_written(), 1);
+    }
+
     /// Resource attributes identify the process that produced a measurement, so they must land
     /// as dimension columns on every data point of the export rather than being dropped.
     #[test]

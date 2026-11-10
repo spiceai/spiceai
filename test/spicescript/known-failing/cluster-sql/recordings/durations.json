@@ -1,0 +1,8 @@
+{
+  "cluster-limit-offset": 26,
+  "cluster-literals": 39,
+  "cluster-nan-literal": 42,
+  "cluster-text-search": 25,
+  "cluster-timestamp-boundary": 27,
+  "cluster-tpch-joins": 29
+}

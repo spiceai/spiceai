@@ -24,7 +24,7 @@ use datafusion::{
     error::DataFusionError,
     prelude::SessionContext,
 };
-use datafusion_expr::{Expr, ExprSchemable, lit};
+use datafusion_expr::{Expr, lit};
 use datafusion_proto::bytes::Serializeable;
 use datafusion_proto_common::protobuf_common::Statistics as ProtoStatistics;
 use prost::Message;
@@ -45,6 +45,17 @@ use crate::context::PartitionExprResolver;
 /// {"date": "2024-01-02", "region": "us-east"}
 /// ```
 pub type PartitionValue = HashMap<String, Option<String>>;
+
+/// A [`PartitionValue`] in a canonical, hashable form: its entries sorted by key.
+pub type PartitionKey = Vec<(String, Option<String>)>;
+
+/// Returns the [`PartitionKey`] of `value`.
+#[must_use]
+pub fn partition_key(value: &PartitionValue) -> PartitionKey {
+    let mut key: PartitionKey = value.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
+    key.sort();
+    key
+}
 
 /// Encodes `DataFusion` [`Statistics`] to the `datafusion-proto` prost bytes
 /// carried on the `PartitionsLoaded` wire. This is the executor → scheduler
@@ -162,6 +173,12 @@ pub struct TablePartitionMetadata {
     /// Stored so that auto-generated labels like `"expr0"` can be resolved back to the
     /// original SQL expression for query routing.
     pub partition_expressions: Vec<String>,
+    /// When a scheduler first found the table not registered (milliseconds since
+    /// UNIX epoch). A scheduler that has the table registered clears it; the entry
+    /// is removed once it has stayed set for
+    /// [`UNREGISTERED_TABLE_RETENTION`](crate::cluster_state::UNREGISTERED_TABLE_RETENTION).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub unregistered_at_ms: Option<u64>,
 }
 
 impl TablePartitionMetadata {
@@ -177,6 +194,7 @@ impl TablePartitionMetadata {
             schema_version: 1,
             updated_at,
             partition_expressions,
+            unregistered_at_ms: None,
         }
     }
 
@@ -211,29 +229,12 @@ impl TablePartitionMetadata {
             ..
         } in &self.partitions
         {
-            // Build a single AND-combined predicate for this partition:
-            //   key1 = val1 AND key2 = val2 AND ...
-            let partition_predicate = partition_value
-                .iter()
-                .map(|(proj, val)| {
-                    let col = ctx.parse_sql_expr(proj, &df_schema)?;
-                    let Some(val) = val else {
-                        // NULL partition values need IS NULL, not = NULL
-                        // (SQL: `col = NULL` is always UNKNOWN, never TRUE)
-                        return Ok(col.is_null());
-                    };
-                    let col_type = col.get_type(&df_schema)?;
-                    let mut lit_expr = ctx.parse_sql_expr(val, &df_schema)?;
-                    if let Expr::Literal(ref s, None) = lit_expr
-                        && s.data_type() != col_type
-                    {
-                        lit_expr = lit_expr.cast_to(&col_type, &df_schema)?;
-                    }
-                    Ok(col.eq(lit_expr))
-                })
-                .collect::<Result<Vec<Expr>, DataFusionError>>()?
-                .into_iter()
-                .reduce(Expr::and);
+            // The same predicate the scheduler filters each executor's scan with.
+            let partition_predicate = runtime_datafusion::analyzer_rule::partition_predicate(
+                partition_value,
+                &df_schema,
+                |sql| ctx.parse_sql_expr(sql, &df_schema),
+            )?;
 
             let Some(partition_predicate) = partition_predicate else {
                 continue;

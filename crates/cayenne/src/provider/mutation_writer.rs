@@ -302,6 +302,42 @@ enum WriteKind {
     ChangeStream,
 }
 
+/// The per-table write lock and the mem-tier checkpoint lock, held by a durable
+/// write until its rows are published and accounted for.
+pub(super) struct HeldWriteGuards {
+    _write: OwnedMutexGuard<()>,
+    _checkpoint: OwnedMutexGuard<()>,
+    /// When the caller already held `write_lock` (autocommit `UPDATE`), `_write`
+    /// is a dummy, because the mutex is not reentrant, and this is the real hold
+    /// ([`super::write_lock_held`]). A publish that outlives a cancelled caller
+    /// keeps it, so cancellation cannot release the lock mid-publish.
+    outer_write: Option<Arc<OwnedMutexGuard<()>>>,
+}
+
+impl HeldWriteGuards {
+    pub(super) fn new(write: OwnedMutexGuard<()>, checkpoint: OwnedMutexGuard<()>) -> Self {
+        Self {
+            _write: write,
+            _checkpoint: checkpoint,
+            outer_write: super::write_lock_held::held_guard(),
+        }
+    }
+
+    /// The caller's outer `write_lock` hold, if it had one; see `outer_write`.
+    fn outer_write(&self) -> Option<Arc<OwnedMutexGuard<()>>> {
+        self.outer_write.as_ref().map(Arc::clone)
+    }
+}
+
+/// A plain append's rows, written to a private staging directory and not yet
+/// published.
+struct StagedPlainAppend {
+    staging_snapshot_id: String,
+    rows: u64,
+    writer_ops: usize,
+    stats_acc: Arc<ColumnStatsAccumulator>,
+}
+
 pub(super) struct AppendMutationWriter<'a> {
     table: &'a CayenneTableProvider,
     context: &'a Arc<CayenneContext>,
@@ -310,6 +346,25 @@ pub(super) struct AppendMutationWriter<'a> {
     /// (`CayenneTableProvider::holds_no_rows`), so a streaming append has no
     /// stored key to check its own against.
     into_empty_table: bool,
+}
+
+/// What a write whose rows are already visible hands to
+/// [`AppendMutationWriter::finish_published_write`].
+struct PublishedWrite {
+    /// Rows the write stored.
+    rows: u64,
+    /// Column statistics of the stored rows, for post-write maintenance.
+    stats: Arc<ColumnStatsAccumulator>,
+    /// Primary-key digests the write validated, recorded in the keyset.
+    validated_keys: PkDigestSet,
+    /// Existing rows the write replaced; the live-row delta is
+    /// `rows - superseded`.
+    superseded: usize,
+    /// The sequence the write drew for its primary-key OCC stamp; `None` when it
+    /// drew none, in which case the stamp falls back to the high water.
+    append_sequence: Option<i64>,
+    /// The write published a new snapshot, so maintenance refreshes the listing.
+    wrote_new_snapshot: bool,
 }
 
 impl<'a> AppendMutationWriter<'a> {
@@ -402,7 +457,10 @@ impl<'a> AppendMutationWriter<'a> {
                         // `prepare_stream_for_insert` so the durable path re-runs
                         // on-conflict validation against the single index — keeping
                         // conflict semantics intact without a second sharded apply.
-                        let _write_guard = write_guard;
+                        let checkpoint_guard = self
+                            .table
+                            .lock_mem_tier_checkpoint_for_durable_write()
+                            .await;
                         let raw = MemorySourceConfig::try_new_exec(&[batches], schema, None)
                             .and_then(|exec| execute_stream(exec, Arc::clone(self.task_context)))?;
                         let prepared = self.table.prepare_stream_for_insert(raw).await?;
@@ -415,6 +473,7 @@ impl<'a> AppendMutationWriter<'a> {
                                 post_validation,
                                 pending_pk_deletions,
                                 may_have_on_conflict_deletions,
+                                HeldWriteGuards::new(write_guard, checkpoint_guard),
                             )
                             .await?;
                         record_cayenne_write_phase(
@@ -472,6 +531,14 @@ impl<'a> AppendMutationWriter<'a> {
         } else {
             (data, write_guard)
         };
+        // Held from the validation's primary-key index checkout until this write's
+        // decisions about where replaced rows live are published (the synchronous
+        // and inline paths) or staged (the pipelined path, which then releases it
+        // with `write_lock`).
+        let checkpoint_guard = self
+            .table
+            .lock_mem_tier_checkpoint_for_durable_write()
+            .await;
         let prepared = self.table.prepare_stream_for_insert(data).await?;
         let post_validation = prepared.post_validation();
         let may_have_on_conflict_deletions = prepared.may_have_on_conflict_deletions();
@@ -514,13 +581,13 @@ impl<'a> AppendMutationWriter<'a> {
         let can_stage_for_pipeline = self.table.metadata().partition_column.is_none();
 
         if !can_stage_for_pipeline {
-            let _write_guard = write_guard;
             let rows = self
                 .write_prepared_stream(
                     prepared_stream,
                     post_validation,
                     pending_pk_deletions,
                     may_have_on_conflict_deletions,
+                    HeldWriteGuards::new(write_guard, checkpoint_guard),
                 )
                 .await?;
             tracing::debug!(
@@ -572,6 +639,7 @@ impl<'a> AppendMutationWriter<'a> {
                     self.table
                         .record_inlined_pk_keys(&post_validation.validated_keys, record_seq);
                 }
+                drop(checkpoint_guard);
                 tracing::debug!(
                     table = self.table.table_name(),
                     rows,
@@ -776,6 +844,7 @@ impl<'a> AppendMutationWriter<'a> {
                     &validated_keys,
                 );
                 drop(held_write_guard);
+                drop(checkpoint_guard);
 
                 tracing::debug!(
                     table = self.table.table_name(),
@@ -1180,6 +1249,14 @@ impl<'a> AppendMutationWriter<'a> {
         write_guard: OwnedMutexGuard<()>,
     ) -> Result<u64> {
         self.table.ensure_no_incomplete_write().await?;
+        // Held for the whole write: its validation decides from the primary-key
+        // index whether each replaced row is inline or in a file, and its
+        // publication acts on those decisions. A streaming append hands it to
+        // that publication, which outlives a cancelled caller.
+        let checkpoint_guard = self
+            .table
+            .lock_mem_tier_checkpoint_for_durable_write()
+            .await;
 
         let pending_pk_deletions = !self.table.pk_deletion_strategy().is_position_based()
             && self.table.has_pending_deletions();
@@ -1207,10 +1284,12 @@ impl<'a> AppendMutationWriter<'a> {
             && let Some(resolver) = self.table.key_resolver()?
         {
             return self
-                .write_resolving_repeats_after(data, resolver, write_guard)
+                .write_resolving_repeats_after(data, resolver, write_guard, checkpoint_guard)
                 .await;
         }
         let prepared = self.table.prepare_stream_for_insert(data).await?;
+        #[cfg(test)]
+        self.table.run_test_post_prepare_hook().await;
         let post_validation = prepared.post_validation();
         let may_have_on_conflict_deletions = prepared.may_have_on_conflict_deletions();
         let prepared_stream = prepared.stream;
@@ -1220,6 +1299,7 @@ impl<'a> AppendMutationWriter<'a> {
             post_validation,
             pending_pk_deletions,
             may_have_on_conflict_deletions,
+            HeldWriteGuards::new(write_guard, checkpoint_guard),
         )
         .await
     }
@@ -1240,6 +1320,7 @@ impl<'a> AppendMutationWriter<'a> {
         data: SendableRecordBatchStream,
         resolver: super::key_conflicts::KeyResolver,
         write_guard: OwnedMutexGuard<()>,
+        checkpoint_guard: OwnedMutexGuard<()>,
     ) -> Result<u64> {
         // A writer's row versions order a key's copies only against the copies this
         // write holds, which are all of them only in a load into an empty table.
@@ -1289,6 +1370,8 @@ impl<'a> AppendMutationWriter<'a> {
             table: self.table.clone_for_write(),
             context: Arc::clone(self.context),
             _write_guard: write_guard,
+            _held_write_lock: super::write_lock_held::held_guard(),
+            _checkpoint_guard: Some(checkpoint_guard),
             snapshot_id,
             rows,
             stats,
@@ -1327,6 +1410,7 @@ impl<'a> AppendMutationWriter<'a> {
         post_validation: Arc<ParkingMutex<Option<PostValidationState>>>,
         pending_pk_deletions: bool,
         may_have_on_conflict_deletions: bool,
+        held: HeldWriteGuards,
     ) -> Result<u64> {
         let has_on_conflict_deletions = may_have_on_conflict_deletions;
 
@@ -1363,6 +1447,8 @@ impl<'a> AppendMutationWriter<'a> {
                     rows,
                     post_validation,
                 } => {
+                    #[cfg(test)]
+                    self.table.run_test_post_inline_publish_hook().await;
                     let record_seq = self.table.sequence_high_water().await;
                     self.table
                         .record_inlined_pk_keys(&post_validation.validated_keys, record_seq);
@@ -1397,69 +1483,151 @@ impl<'a> AppendMutationWriter<'a> {
         // nothing was published.
         let reserved_live_rows_delta = self.table.reserve_live_rows_delta();
 
+        if !needs_new_snapshot {
+            let target_size_bytes = self.context.target_file_size_bytes();
+            let write_start = Instant::now();
+            let staged = self
+                .stage_plain_append(prepared_stream, target_size_bytes, estimated_bytes)
+                .await?;
+            // Once staged, the append commits: its staging WAL is rolled forward by
+            // recovery. So its publish and accounting run to completion in their own
+            // task, holding the write and checkpoint locks, even when this future is
+            // dropped (an exporter timing out). Dropping the locks mid-publish lets
+            // compaction move the snapshot the WAL targets, and recovery then refuses
+            // that WAL on every later write.
+            let table = self.table.clone_for_write_operations();
+            let context = Arc::clone(self.context);
+            let task_context = Arc::clone(self.task_context);
+            let into_empty_table = self.into_empty_table;
+            let table_name = self.table.table_name().to_string();
+            // The outer hold is task-local and does not cross `tokio::spawn`, so
+            // the publish re-enters it: a nested write then shares the lock instead
+            // of waiting on it.
+            let outer_write = held.outer_write();
+            return tokio::spawn(async move {
+                let _held = held;
+                let writer = AppendMutationWriter {
+                    table: &table,
+                    context: &context,
+                    task_context: &task_context,
+                    into_empty_table,
+                };
+                let publish = writer.publish_plain_append(
+                    staged,
+                    write_start,
+                    &post_validation,
+                    reserved_live_rows_delta,
+                );
+                match outer_write {
+                    Some(guard) => super::write_lock_held::scope(guard, publish).await,
+                    None => publish.await,
+                }
+            })
+            .await
+            .map_err(|source| super::Error::TaskPanicked {
+                table: table_name,
+                source,
+            })?;
+        }
+
+        let _held = held;
+        let new_snapshot_start = Instant::now();
+        let (rows, stats_acc, validated_keys, superseded) = self
+            .write_new_snapshot_after_validation(prepared_stream, &post_validation, estimated_bytes)
+            .await?;
+        tracing::debug!(
+            table = self.table.table_name(),
+            rows,
+            superseded,
+            duration_ms = new_snapshot_start.elapsed().as_millis(),
+            "New snapshot write and publish completed"
+        );
+        // This arm draws its own sequence while writing its snapshot (and none when
+        // it writes no rows), so the primary-key OCC stamp falls back to the high water.
+        self.finish_published_write(
+            PublishedWrite {
+                rows,
+                stats: stats_acc,
+                validated_keys,
+                superseded,
+                append_sequence: None,
+                wrote_new_snapshot: true,
+            },
+            reserved_live_rows_delta,
+        )
+        .await
+    }
+
+    /// Publish a staged plain append and account for it: draw its sequence,
+    /// finalize the staging WAL, apply conflict deletions, then hand the live-row
+    /// delta and stats to maintenance.
+    async fn publish_plain_append(
+        &self,
+        staged: StagedPlainAppend,
+        write_start: Instant,
+        post_validation: &Arc<ParkingMutex<Option<PostValidationState>>>,
+        reserved_live_rows_delta: super::maintenance::OutstandingLiveRowsDelta,
+    ) -> Result<u64> {
+        let (rows, writer_ops, stats_acc, append_sequence) =
+            self.publish_staged_plain_append(staged).await?;
+
+        tracing::debug!(
+            table = self.table.table_name(),
+            rows,
+            writer_ops,
+            duration_ms = write_start.elapsed().as_millis(),
+            "Insert completed"
+        );
+
+        let PostValidationState {
+            on_conflict_deletions,
+            validated_keys,
+        } = take_post_validation(post_validation);
+
+        let superseded = on_conflict_deletions.total_superseded();
+        let update = self
+            .table
+            .apply_on_conflict_deletions(on_conflict_deletions)
+            .await?;
+        // Publish any deletion-cache update under the consistency lock. This path writes no protected snapshot
+        self.table.commit_on_conflict_publish(update, None).await;
+
+        self.finish_published_write(
+            PublishedWrite {
+                rows,
+                stats: stats_acc,
+                validated_keys,
+                superseded,
+                append_sequence,
+                wrote_new_snapshot: false,
+            },
+            reserved_live_rows_delta,
+        )
+        .await
+    }
+
+    /// Account for a write whose rows are already visible: the live-row delta,
+    /// post-write maintenance and the primary-key keyset.
+    async fn finish_published_write(
+        &self,
+        write: PublishedWrite,
+        reserved_live_rows_delta: super::maintenance::OutstandingLiveRowsDelta,
+    ) -> Result<u64> {
+        let PublishedWrite {
+            rows: total_rows,
+            stats: write_stats_acc,
+            validated_keys,
+            superseded,
+            append_sequence,
+            wrote_new_snapshot,
+        } = write;
         // `superseded` = existing rows replaced by this upsert (deleted as part
         // of the conflict resolution). The live-row delta is `inserted -
         // superseded`, which keeps the metastore `num_rows` tracking COUNT(*)
         // under CDC upsert instead of summing every insert.
-        // This write's own sequence for the primary-key OCC stamp below, `None`
-        // when it drew none: `write_staged_append` draws it for the plain-append
-        // arm and returns it, the `needs_new_snapshot` arm draws its own while
-        // writing its snapshot (and nothing at all when it writes no rows, for the
-        // same reason `write_staged_append` does not), and the stamp falls back to
-        // the high water in both of those cases.
-        let mut append_sequence: Option<i64> = None;
-        let (total_rows, write_stats_acc, validated_keys, superseded) = if needs_new_snapshot {
-            let new_snapshot_start = Instant::now();
-            let (rows, stats_acc, validated_keys, superseded) = self
-                .write_new_snapshot_after_validation(
-                    prepared_stream,
-                    &post_validation,
-                    estimated_bytes,
-                )
-                .await?;
-            tracing::debug!(
-                table = self.table.table_name(),
-                rows,
-                superseded,
-                duration_ms = new_snapshot_start.elapsed().as_millis(),
-                "New snapshot write and publish completed"
-            );
-            (rows, stats_acc, validated_keys, superseded)
-        } else {
-            let target_size_bytes = self.context.target_file_size_bytes();
-            let write_start = Instant::now();
-            let (rows, writer_ops, stats_acc, drawn_sequence) = self
-                .write_staged_append(prepared_stream, target_size_bytes, estimated_bytes)
-                .await?;
-            append_sequence = drawn_sequence;
-
-            tracing::debug!(
-                table = self.table.table_name(),
-                rows,
-                writer_ops,
-                duration_ms = write_start.elapsed().as_millis(),
-                "Insert completed"
-            );
-
-            let PostValidationState {
-                on_conflict_deletions,
-                validated_keys,
-            } = take_post_validation(&post_validation);
-
-            let superseded = on_conflict_deletions.total_superseded();
-            let update = self
-                .table
-                .apply_on_conflict_deletions(on_conflict_deletions)
-                .await?;
-            // Publish any deletion-cache update under the consistency lock. This path writes no protected snapshot
-            self.table.commit_on_conflict_publish(update, None).await;
-
-            (rows, stats_acc, validated_keys, superseded)
-        };
-
-        // Both branches above have made this commit's rows visible, so from here
-        // the claim survives a cancellation or a failure: a commit that dies
-        // after publishing has left rows it will never queue a delta for.
+        // The caller has made this commit's rows visible, so from here the claim
+        // survives a cancellation or a failure: a commit that dies after
+        // publishing has left rows it will never queue a delta for.
         let published_live_rows_delta = reserved_live_rows_delta.published();
 
         let retention_requested = self.table.has_retention_delete_filters();
@@ -1469,7 +1637,7 @@ impl<'a> AppendMutationWriter<'a> {
             .saturating_sub(i64::try_from(superseded).unwrap_or(i64::MAX));
         self.table.schedule_post_write_maintenance(
             Some(write_stats_acc),
-            needs_new_snapshot,
+            wrote_new_snapshot,
             retention_requested,
             live_rows_delta,
             published_live_rows_delta,
@@ -1541,6 +1709,8 @@ impl<'a> AppendMutationWriter<'a> {
         } = take_post_validation(post_validation);
 
         let superseded = on_conflict_deletions.total_superseded();
+        #[cfg(test)]
+        self.table.run_test_pre_staged_publish_hook().await;
         self.publish_written_snapshot(&new_snapshot_id, rows, on_conflict_deletions)
             .await?;
         Ok((rows, stats_acc, validated_keys, superseded))
@@ -1770,20 +1940,14 @@ impl<'a> AppendMutationWriter<'a> {
         })
     }
 
-    /// Write a batch into the current snapshot and publish it.
-    ///
-    /// The fourth element of the result is the sequence this append drew for its
-    /// primary-key OCC stamp, `None` when it wrote no rows. It is drawn here, in
-    /// the one place that knows the row count while the rows are still invisible:
-    /// `finalize_staged_write` below publishes them, and a stamp that does not
-    /// sit above every transaction begin token issued before that publish lets a
-    /// transaction commit over this append (#13685).
-    async fn write_staged_append(
+    /// Write a batch into a private staging directory, invisible to readers.
+    /// [`Self::publish_staged_plain_append`] publishes it.
+    async fn stage_plain_append(
         &self,
         stream: SendableRecordBatchStream,
         target_size_bytes: usize,
         estimated_bytes: Option<u64>,
-    ) -> Result<(u64, usize, Arc<ColumnStatsAccumulator>, Option<i64>)> {
+    ) -> Result<StagedPlainAppend> {
         let staging_snapshot_id = CayenneTableProvider::new_staging_snapshot_id();
         self.table
             .clear_staging_snapshot_dir(&staging_snapshot_id)
@@ -1829,6 +1993,32 @@ impl<'a> AppendMutationWriter<'a> {
         // Fold the encode + object-store/disk upload latency into the adaptive
         // tuner's I/O-bound signal (CDC-apply path only; compaction is excluded).
         self.context.record_io_latency(write_start.elapsed());
+        Ok(StagedPlainAppend {
+            staging_snapshot_id,
+            rows,
+            writer_ops,
+            stats_acc,
+        })
+    }
+
+    /// Publish a staged plain append into the current snapshot.
+    ///
+    /// The fourth element of the result is the sequence this append drew for its
+    /// primary-key OCC stamp, `None` when it wrote no rows. It is drawn here, in
+    /// the one place that knows the row count while the rows are still invisible:
+    /// `finalize_staged_write` below publishes them, and a stamp that does not
+    /// sit above every transaction begin token issued before that publish lets a
+    /// transaction commit over this append (#13685).
+    async fn publish_staged_plain_append(
+        &self,
+        staged: StagedPlainAppend,
+    ) -> Result<(u64, usize, Arc<ColumnStatsAccumulator>, Option<i64>)> {
+        let StagedPlainAppend {
+            staging_snapshot_id,
+            rows,
+            writer_ops,
+            stats_acc,
+        } = staged;
 
         // Zero rows publishes nothing, so there is nothing for a transaction to
         // race and no sequence to draw (see the fn doc). A draw that fails on a

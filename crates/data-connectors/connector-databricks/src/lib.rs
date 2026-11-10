@@ -43,7 +43,8 @@ use datafusion::execution::runtime_env::RuntimeEnv;
 use opentelemetry::KeyValue;
 use runtime::token_providers::databricks::{
     AUTH_MODE_DESCRIPTION, AUTH_MODES, AuthConfigError, AuthCredentials,
-    DatabricksM2MTokenProvider, DatabricksU2MTokenProvider,
+    DatabricksM2MTokenProvider, DatabricksU2MTokenProvider, Error as DatabricksAuthError,
+    WorkloadIdentity,
 };
 use runtime_api_types::v1::ComponentType;
 use runtime_component::ComponentInitialization;
@@ -193,8 +194,10 @@ pub const PARAMETERS: &[ParameterSpec] = &[
         .help_link(DATABRICKS_DOCS),
 
     // Databricks M2M Service Principal credentials
-    ParameterSpec::component("client_id").description("The client ID of the Databricks service principal."),
+    ParameterSpec::component("client_id").secret().description("The client ID of the Databricks service principal. Defaults to `DATABRICKS_CLIENT_ID` for workload identity federation or beside a client secret."),
     ParameterSpec::component("client_secret").secret().description("The client secret of the Databricks service principal."),
+    ParameterSpec::component("oidc_token_filepath").secret().description("A file that holds the workload's identity token, read again for every exchange, such as a Kubernetes projected service account token. With `databricks_client_id`, it authenticates with workload identity federation. Defaults to `DATABRICKS_OIDC_TOKEN_FILEPATH`."),
+    ParameterSpec::component("token_audience").secret().description("The audience of the identity token Spice requests from a GitHub Actions job or the workload's cloud identity, such as the Databricks account ID. With `databricks_client_id`, it authenticates with workload identity federation. Defaults to `DATABRICKS_TOKEN_AUDIENCE`."),
 
     // S3 storage options
     ParameterSpec::component("aws_region")
@@ -297,6 +300,7 @@ impl Databricks {
     /// Returns an error if required parameters are missing or invalid,
     /// or if the connection to Databricks fails.
     pub async fn new(
+        component: &str,
         params: Parameters,
         io_runtime: Handle,
         token_provider_registry: Arc<TokenProviderRegistry>,
@@ -343,9 +347,13 @@ impl Databricks {
                     .expose()
                     .ok_or_else(|p| MissingParameterSnafu { parameter: p.0 }.build())?;
 
-                let token_provider =
-                    Self::get_token_provider(endpoint, auth_credentials, token_provider_registry)
-                        .await?;
+                let token_provider = Self::get_token_provider(
+                    component,
+                    endpoint,
+                    auth_credentials,
+                    token_provider_registry,
+                )
+                .await?;
 
                 let uc_client = match UnityCatalogClient::new_with_rate_controller(
                     Endpoint(endpoint.to_string()),
@@ -423,6 +431,15 @@ impl Databricks {
                         Self::get_u2m_token_provider(endpoint, client_id, &token_provider_registry)
                             .await?
                     }
+                    AuthCredentials::WorkloadIdentity(identity) => {
+                        Self::get_workload_identity_token_provider(
+                            component,
+                            endpoint,
+                            identity,
+                            &token_provider_registry,
+                        )
+                        .await?
+                    }
                 };
 
                 let uc_client = match UnityCatalogClient::new_with_rate_controller(
@@ -485,6 +502,7 @@ impl Databricks {
                 };
 
                 Self::build_spark_connect_connector(
+                    component,
                     endpoint,
                     auth_credentials,
                     token_provider_registry,
@@ -511,6 +529,7 @@ impl Databricks {
     ///
     /// Returns an error if token provider creation fails.
     pub async fn get_token_provider(
+        component: &str,
         endpoint: &str,
         auth_credentials: AuthCredentials<'_>,
         token_provider_registry: Arc<TokenProviderRegistry>,
@@ -528,6 +547,15 @@ impl Databricks {
             }
             AuthCredentials::U2M(client_id) => {
                 Self::get_u2m_token_provider(endpoint, client_id, &token_provider_registry).await?
+            }
+            AuthCredentials::WorkloadIdentity(identity) => {
+                Self::get_workload_identity_token_provider(
+                    component,
+                    endpoint,
+                    identity,
+                    &token_provider_registry,
+                )
+                .await?
             }
         })
     }
@@ -555,6 +583,7 @@ impl Databricks {
 
     #[cfg(feature = "spark")]
     async fn build_spark_connect_connector(
+        component: &str,
         endpoint: &str,
         auth_credentials: AuthCredentials<'_>,
         token_provider_registry: Arc<TokenProviderRegistry>,
@@ -601,6 +630,28 @@ impl Databricks {
                 let token_provider =
                     Self::get_u2m_token_provider(endpoint, client_id, &token_provider_registry)
                         .await?;
+
+                Arc::new(
+                    DatabricksSparkConnect::from_token_provider_with_rate_controller(
+                        endpoint.to_string(),
+                        cluster_id.expose_secret().to_string(),
+                        databricks_use_ssl,
+                        token_provider,
+                        rate_controller.clone(),
+                    )
+                    .await
+                    .context(UnableToConstructDatabricksSparkSnafu)?,
+                )
+            }
+
+            AuthCredentials::WorkloadIdentity(identity) => {
+                let token_provider = Self::get_workload_identity_token_provider(
+                    component,
+                    endpoint,
+                    identity,
+                    &token_provider_registry,
+                )
+                .await?;
 
                 Arc::new(
                     DatabricksSparkConnect::from_token_provider_with_rate_controller(
@@ -681,6 +732,37 @@ impl Databricks {
             })
     }
 
+    /// Gets the refreshing token provider of a service principal that authenticates with workload
+    /// identity federation.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if there is no identity token to request or the first exchange fails.
+    pub async fn get_workload_identity_token_provider(
+        component: &str,
+        endpoint: &str,
+        identity: WorkloadIdentity<'_>,
+        token_provider_registry: &Arc<TokenProviderRegistry>,
+    ) -> Result<Arc<dyn TokenProvider>> {
+        runtime::token_providers::databricks::get_workload_identity_token_provider(
+            component,
+            endpoint,
+            identity,
+            token_provider_registry,
+        )
+        .await
+        .map_err(|error| match error {
+            // Both read as what to set, and a dataset load is retried after either.
+            DatabricksAuthError::InvalidWorkloadIdentity { message, .. }
+            | DatabricksAuthError::NoIdentityToken { message } => {
+                InvalidConfigurationSnafu { message }.build()
+            }
+            other => Error::UnableToGetToken {
+                source: Box::new(other),
+            },
+        })
+    }
+
     /// Validates that a Unity Catalog table is of a supported type and that
     /// the current principal has read access.
     ///
@@ -710,6 +792,13 @@ impl Databricks {
                             "Unsupported Unity Catalog table type '{}' for table '{}'. Only MANAGED, EXTERNAL, FOREIGN, VIEW, MATERIALIZED_VIEW, and STREAMING_TABLE tables can be queried.",
                             uc_table.table_type, full_name
                         ),
+                    });
+                }
+                if self.delta_provider.is_some() && uc_table.is_catalog_managed() {
+                    return Err(DataConnectorError::InvalidConfigurationNoSource {
+                        dataconnector: "databricks".to_string(),
+                        connector_component: ConnectorComponent::from(dataset),
+                        message: catalog_managed_delta_lake_message(&full_name),
                     });
                 }
                 tracing::debug!(
@@ -975,7 +1064,16 @@ impl DataConnectorFactory for DatabricksFactory {
                     .as_ref()
                     .and_then(|reservation| reservation.shared().controller.clone());
 
+                let component = match &params.component {
+                    ConnectorComponent::Catalog(catalog) => {
+                        format!("catalog '{}' (databricks)", catalog.name)
+                    }
+                    ConnectorComponent::Dataset(dataset) => {
+                        format!("dataset '{}' (databricks)", dataset.name)
+                    }
+                };
                 let databricks_result = Databricks::new(
+                    &component,
                     params.parameters,
                     params.io_runtime,
                     context.token_provider_registry(),
@@ -1140,6 +1238,13 @@ impl DataConnector for Databricks {
 /// configuration failures (e.g. foreign tables on Classic SQL warehouses)
 /// into permanent, non-retriable errors so the runtime surfaces them
 /// immediately instead of retrying indefinitely.
+/// Error for a catalog-managed Delta table requested in `delta_lake` mode.
+fn catalog_managed_delta_lake_message(full_name: &str) -> String {
+    format!(
+        "Table '{full_name}' is a catalog-managed Delta table, and Databricks does not allow reading it directly from storage. Set `mode` to `sql_warehouse` or `spark_connect`. See: https://spiceai.org/docs/components/data-connectors/databricks#parameters"
+    )
+}
+
 fn classify_table_provider_error(
     dataset: &DatasetSpec,
     source: Box<dyn std::error::Error + Send + Sync>,
@@ -1406,6 +1511,16 @@ pub fn factory() -> Arc<dyn DataConnectorFactory> {
 
 #[cfg(test)]
 mod tests {
+    use super::catalog_managed_delta_lake_message;
+
+    #[test]
+    fn catalog_managed_delta_lake_message_text() {
+        assert_eq!(
+            catalog_managed_delta_lake_message("c.s.t"),
+            "Table 'c.s.t' is a catalog-managed Delta table, and Databricks does not allow reading it directly from storage. Set `mode` to `sql_warehouse` or `spark_connect`. See: https://spiceai.org/docs/components/data-connectors/databricks#parameters"
+        );
+    }
+
     use super::*;
     use app::App;
     use datafusion::{
@@ -1967,7 +2082,12 @@ mod tests {
             "Databricks::build_auth_credentials should return an error"
         );
         if let Err(error) = result {
-            assert!(error.to_string().contains("Missing `databricks_token` or `databricks_client_id` and `databricks_client_secret` parameters"));
+            assert!(
+                error
+                    .to_string()
+                    .contains(runtime::token_providers::databricks::NO_CREDENTIAL_MESSAGE),
+                "{error}"
+            );
         }
     }
 
@@ -1977,7 +2097,10 @@ mod tests {
         let params_vec = vec![("client_id".to_string(), SecretString::from(client_id))];
         let parameters = Parameters::new(params_vec, "databricks", PARAMETERS);
 
-        let result = Databricks::build_auth_credentials(&parameters);
+        // Outside a GitHub Actions job, whatever the job running the test: in one, a client ID
+        // alone is workload identity federation.
+        let result =
+            runtime::token_providers::databricks::build_auth_credentials_in(&parameters, false);
 
         assert!(
             result.is_ok(),

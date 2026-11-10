@@ -82,6 +82,14 @@ on:
         required: false
         type: boolean
         default: false
+      runs_on:
+        description: 'The type of runner to use for the sign-off job'
+        required: false
+        type: choice
+        default: spiceai-macos
+        options:
+          - spiceai-macos
+          - signoff
 
 # Coarse, pre-resolution guard: it only collapses re-dispatches that used the
 # *same* input form, because `concurrency` is evaluated before any step runs and
@@ -105,6 +113,14 @@ env:
   CARGO_HTTP_TIMEOUT: 60
   CARGO_INCREMENTAL: 0
   CARGO_NET_GIT_FETCH_WITH_CLI: true
+  # Lets sccache cache clippy on workspace crates. Under `cargo clippy`, cargo
+  # runs `sccache clippy-driver <rustc> ...`, and sccache only ignores that
+  # leading argument when it is the bare name `rustc`. Cargo otherwise passes
+  # the toolchain's full rustc path, which sccache reads as a second input file
+  # and refuses to cache (`multiple input files`), so every workspace crate is
+  # re-linted on every run. `rustc` resolves through the rustup proxy to the
+  # same toolchain.
+  RUSTC: rustc
 
 jobs:
   # Its own job purely so `sign-off` can key `concurrency` on the commit this
@@ -115,6 +131,7 @@ jobs:
   # GitHub-hosted on purpose. It is two API calls and must not queue behind the
   # saturated self-hosted pool — every sign-off now waits on it.
   resolve:
+    environment: secret-free
     name: "Resolve sign-off target"
     runs-on: ubuntu-24.04
     timeout-minutes: 5
@@ -260,7 +277,8 @@ jobs:
       cancel-in-progress: true
     # Standard pool, not `spiceai-macos-large`. A dispatched sign-off takes a
     # `spiceai-macos` runner instead of waiting on the large pool.
-    runs-on: spiceai-macos
+    runs-on: ${{ inputs.runs_on }}
+    environment: ci-build
     # This pool terminates a job at ~360 minutes, and that arrives
     # as `cancelled` with no failed step — the same shape as the
     # cancel-in-progress eviction above, and with no chance for the steps below
@@ -283,7 +301,7 @@ jobs:
       # Needed so scripts/signoff can find the PR and its Attestation run.
       pull-requests: read
     env:
-      HAS_SPICEIO_SECRET: ${{ secrets.UNAS_SMB_PASS != '' }}
+      HAS_SPICEIO_SECRET: ${{ secrets.SMB_PASSWORD != '' }}
       GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
       # Drive remote-specific behavior in scripts/signoff (pending status,
       # "via remote" description, GitHub compare fallback, step summary).
@@ -446,11 +464,11 @@ jobs:
         uses: spiceai/spiceio/.github/actions/setup@dd13a600d4af72fb179563000674f76812208534 # v0.11.0 assets; no gh; strips Authorization on cross-host redirect
         with:
           smb-url: smb://runner@192.168.3.148/ai_platform_dev
-          smb-pass: ${{ secrets.UNAS_SMB_PASS }}
+          smb-pass: ${{ secrets.SMB_PASSWORD }}
           token: ${{ github.token }}
           bucket: sccache
           region: us-west-1
-          immutable-objects: "true"
+          immutable-objects: 'true'
           otel-endpoint: spicehq/spiceio
           otel-api-key: ${{ secrets.SCP_SPICEHQ_SPICEIO_API_KEY }}
           otel-region: us-west-2
@@ -460,10 +478,8 @@ jobs:
       - name: Set up sccache
         uses: ./.trusted-ci/actions/setup-sccache
         with:
-          minio_endpoint: ${{ secrets.TEST_MINIO_ENDPOINT }}
+          minio_endpoint: ${{ vars.TEST_MINIO_ENDPOINT }}
           spiceio_endpoint: ${{ steps.setup-spiceio.outputs.endpoint }}
-          minio_access_key: ${{ secrets.TEST_MINIO_ACCESS_KEY }}
-          minio_secret_key: ${{ secrets.TEST_MINIO_SECRET_KEY }}
 
       - name: Install Protoc
         uses: ./.trusted-ci/actions/install-protoc
@@ -486,8 +502,6 @@ jobs:
         timeout-minutes: ${{ fromJSON(env.SIGNOFF_STEP_BUDGET_MINUTES) }}
         env:
           RUSTC_WRAPPER: ${{ env.RUSTC_WRAPPER }}
-          AWS_ACCESS_KEY_ID: ${{ secrets.TEST_MINIO_ACCESS_KEY }}
-          AWS_SECRET_ACCESS_KEY: ${{ secrets.TEST_MINIO_SECRET_KEY }}
           SIGNOFF_SKIP_TARGETED_LINT: "${{ inputs.run_targeted_prechecks && '' || '1' }}"
           SIGNOFF_SKIP_TARGETED_TESTS: "${{ inputs.run_targeted_prechecks && '' || '1' }}"
 

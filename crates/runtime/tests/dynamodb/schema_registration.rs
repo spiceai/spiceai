@@ -163,10 +163,7 @@ async fn no_accel_no_schema_table_not_found_then_created_with_rows() -> anyhow::
             )
             .await?;
 
-            running_container.remove().await.map_err(|e| {
-                tracing::error!("running_container.remove: {e}");
-                anyhow::Error::msg(e.to_string())
-            })?;
+            running_container.cleanup().await;
             Ok(())
         })
         .await
@@ -224,10 +221,7 @@ async fn no_accel_no_schema_empty_table_then_rows_added() -> anyhow::Result<()> 
             )
             .await?;
 
-            running_container.remove().await.map_err(|e| {
-                tracing::error!("running_container.remove: {e}");
-                anyhow::Error::msg(e.to_string())
-            })?;
+            running_container.cleanup().await;
             Ok(())
         })
         .await
@@ -290,10 +284,7 @@ async fn no_accel_declared_schema_table_not_found_then_created_empty() -> anyhow
             )
             .await?;
 
-            running_container.remove().await.map_err(|e| {
-                tracing::error!("running_container.remove: {e}");
-                anyhow::Error::msg(e.to_string())
-            })?;
+            running_container.cleanup().await;
             Ok(())
         })
         .await
@@ -359,10 +350,7 @@ async fn no_accel_declared_schema_table_not_found_then_created_with_rows() -> an
             )
             .await?;
 
-            running_container.remove().await.map_err(|e| {
-                tracing::error!("running_container.remove: {e}");
-                anyhow::Error::msg(e.to_string())
-            })?;
+            running_container.cleanup().await;
             Ok(())
         })
         .await
@@ -426,10 +414,7 @@ async fn no_accel_declared_schema_empty_table_registers_immediately() -> anyhow:
             )
             .await?;
 
-            running_container.remove().await.map_err(|e| {
-                tracing::error!("running_container.remove: {e}");
-                anyhow::Error::msg(e.to_string())
-            })?;
+            running_container.cleanup().await;
             Ok(())
         })
         .await
@@ -493,10 +478,7 @@ async fn streams_no_schema_table_not_found_then_created() -> anyhow::Result<()> 
             )
             .await?;
 
-            running_container.remove().await.map_err(|e| {
-                tracing::error!("running_container.remove: {e}");
-                anyhow::Error::msg(e.to_string())
-            })?;
+            running_container.cleanup().await;
             Ok(())
         })
         .await
@@ -558,10 +540,7 @@ async fn streams_no_schema_streams_not_enabled_then_enabled() -> anyhow::Result<
             )
             .await?;
 
-            running_container.remove().await.map_err(|e| {
-                tracing::error!("running_container.remove: {e}");
-                anyhow::Error::msg(e.to_string())
-            })?;
+            running_container.cleanup().await;
             Ok(())
         })
         .await
@@ -619,10 +598,7 @@ async fn streams_no_schema_empty_table_then_rows_added() -> anyhow::Result<()> {
             )
             .await?;
 
-            running_container.remove().await.map_err(|e| {
-                tracing::error!("running_container.remove: {e}");
-                anyhow::Error::msg(e.to_string())
-            })?;
+            running_container.cleanup().await;
             Ok(())
         })
         .await
@@ -691,10 +667,7 @@ async fn streams_declared_schema_table_not_found_then_created() -> anyhow::Resul
             )
             .await?;
 
-            running_container.remove().await.map_err(|e| {
-                tracing::error!("running_container.remove: {e}");
-                anyhow::Error::msg(e.to_string())
-            })?;
+            running_container.cleanup().await;
             Ok(())
         })
         .await
@@ -765,10 +738,7 @@ async fn streams_declared_schema_streams_not_enabled_then_enabled() -> anyhow::R
             )
             .await?;
 
-            running_container.remove().await.map_err(|e| {
-                tracing::error!("running_container.remove: {e}");
-                anyhow::Error::msg(e.to_string())
-            })?;
+            running_container.cleanup().await;
             Ok(())
         })
         .await
@@ -835,10 +805,7 @@ async fn streams_declared_schema_empty_table_registers_immediately() -> anyhow::
             )
             .await?;
 
-            running_container.remove().await.map_err(|e| {
-                tracing::error!("running_container.remove: {e}");
-                anyhow::Error::msg(e.to_string())
-            })?;
+            running_container.cleanup().await;
             Ok(())
         })
         .await

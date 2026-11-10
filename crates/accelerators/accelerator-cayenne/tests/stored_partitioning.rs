@@ -18,6 +18,11 @@ limitations under the License.
 //! different partitioning than its `partition_by`. Cayenne does not
 //! re-partition stored data, so opening it would serve none of its rows.
 
+#![expect(
+    clippy::expect_used,
+    reason = "set-up and helpers outside `#[test]` functions fail fast with `expect`"
+)]
+
 use std::{path::Path, sync::Arc};
 
 use accelerator_cayenne::CayenneAccelerator;

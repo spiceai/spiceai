@@ -14,6 +14,11 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
+//! The `postgres` data accelerator.
+//!
+//! Deprecated in v2.4 and scheduled for removal in v2.5: migrate accelerations to
+//! Cayenne (`engine: cayenne`).
+
 use async_trait::async_trait;
 use data_components::poly::PolyTableProvider;
 use datafusion::execution::runtime_env::RuntimeEnv;
@@ -28,8 +33,7 @@ use snafu::prelude::*;
 use std::{any::Any, sync::Arc};
 
 use data_accelerator_api::{
-    AccelerationSource, AcceleratorEngineRegistry, DataAccelerator, acceleration_parameters,
-    upsert_dedup,
+    AccelerationSource, DataAccelerator, acceleration_parameters, upsert_dedup,
 };
 use datafusion_table_providers::sql::db_connection_pool::postgrespool::PostgresConnectionPool;
 use runtime_acceleration::Engine;
@@ -187,6 +191,9 @@ impl DataAccelerator for PostgresAccelerator {
             &cmd.options,
             cmd.constraints.clone(),
         );
+        // PostgreSQL evaluates the `UPDATE` and `DELETE` the writer renders.
+        let write_provider =
+            runtime_datafusion::checked_arithmetic::with_plain_arithmetic_writes(write_provider);
 
         let table_provider =
             Arc::new(PolyTableProvider::new(write_provider, read_provider)).into_table();
@@ -197,7 +204,6 @@ impl DataAccelerator for PostgresAccelerator {
     async fn sidecar(
         &self,
         source: &dyn AccelerationSource,
-        _registry: Arc<AcceleratorEngineRegistry>,
         _open_option: OpenOption,
     ) -> Result<Arc<dyn AcceleratorSidecar>, CheckpointError> {
         // Unlike the file engines there is nothing to "open existing": the sidecar
@@ -258,7 +264,7 @@ data_accelerator_api::register_data_accelerator!(Engine::PostgreSQL, PostgresAcc
 mod tests {
     use super::PostgresAccelerator;
     use async_trait::async_trait;
-    use data_accelerator_api::{AcceleratorEngineRegistry, DataAccelerator};
+    use data_accelerator_api::DataAccelerator;
     use runtime_acceleration::Engine;
     use runtime_acceleration::acceleration::Acceleration;
     use runtime_acceleration::sidecar::OpenOption;
@@ -305,11 +311,7 @@ mod tests {
 
         // `Arc<dyn AcceleratorSidecar>` is not `Debug`, so match rather than `expect_err`.
         let Err(error) = PostgresAccelerator::new()
-            .sidecar(
-                &source,
-                Arc::new(AcceleratorEngineRegistry::new()),
-                OpenOption::CreateIfNotExists,
-            )
+            .sidecar(&source, OpenOption::CreateIfNotExists)
             .await
         else {
             panic!("a root certificate that does not exist must fail the sidecar");

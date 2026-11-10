@@ -16,6 +16,13 @@ limitations under the License.
 #![allow(clippy::missing_errors_doc)]
 #![recursion_limit = "256"]
 
+// Windows users run `spiced` under WSL or in Docker, and the Windows `spice` CLI
+// connects to it.
+#[cfg(windows)]
+compile_error!(
+    "spiced does not build for native Windows. Run it under WSL or in Docker. See: https://spiceai.org/docs/installation"
+);
+
 use ::tools::SpiceModelTool;
 use ::tools::naming::{decode_tool_name, encode_tool_name};
 use ::tools::rename::with_name;
@@ -45,6 +52,7 @@ use crate::datafusion::DataFusion;
 use crate::datafusion::DeferredRefreshOutcome;
 use crate::datafusion::error::format_datafusion_error;
 use crate::datafusion::{SPICE_DEFAULT_CATALOG, SPICE_DEFAULT_SCHEMA};
+use crate::model::LLMMessagesModelStore;
 use crate::model::LLMResponsesModelStore;
 use crate::{auth::EndpointAuth, dataconnector::DataConnector};
 
@@ -75,9 +83,9 @@ use model::{EmbeddingModelStore, LLMChatCompletionsModelStore};
 
 use crate::tools::{Tooling, factory::default_available_catalogs};
 pub use notify::Error as NotifyError;
+use runtime_status::ComponentStatus;
 use runtime_tls::TlsConfig;
 use snafu::prelude::*;
-use status::ComponentStatus;
 
 use tokio::sync::{RwLock, oneshot::error::RecvError};
 use tokio_util::sync::CancellationToken;
@@ -124,8 +132,10 @@ mod management;
 mod metrics_server;
 pub mod model;
 pub mod opentelemetry;
+pub mod opentelemetry_logs;
 pub mod opentelemetry_store;
-pub mod otel_push_exporter;
+// Moved to `runtime-otel-push`; re-exported so `runtime::otel_push_exporter` still resolves.
+pub use runtime_otel_push as otel_push_exporter;
 // Host/container resource introspection lives in `runtime-resources`; it names
 // nothing from the runtime. Re-exported so `crate::resource_monitor::…` resolves.
 pub mod resource_monitor {
@@ -149,11 +159,12 @@ pub(crate) mod secrets {
     pub use runtime_secrets::*;
 }
 pub mod cluster;
-mod secrets_preflight;
 mod server_timing;
 pub mod spice_metrics;
+// The status tracker lives in `runtime-status`. Aliased so `runtime::status::…`
+// (used by tests, `spiced` and grouped `crate::{status, …}` imports) still resolves.
+pub use runtime_status as status;
 mod state_location;
-pub mod status;
 pub mod task_history;
 pub mod token_providers;
 pub mod tools;
@@ -320,6 +331,45 @@ pub enum Error {
 
     #[snafu(display("Unable to create view: {reason}"))]
     UnableToCreateView { reason: String },
+
+    /// A dataset selects the `duckdb` vector engine, removed in v2.5. Only that dataset
+    /// fails to load.
+    #[snafu(display(
+        "Failed to load dataset '{}': {}",
+        dataset.escape_debug(),
+        runtime_component::vector_engine::removed_vector_engine_message()
+    ))]
+    DatasetVectorEngineRemoved { dataset: String },
+
+    /// A view selects the `duckdb` vector engine, removed in v2.5. Only that view fails
+    /// to load.
+    #[snafu(display(
+        "Failed to load view '{}': {}",
+        view_name.escape_debug(),
+        runtime_component::vector_engine::removed_vector_engine_message()
+    ))]
+    ViewVectorEngineRemoved { view_name: String },
+
+    /// A dataset's acceleration sets an engine removed in v2.5. Only that dataset fails to
+    /// load: Spice never switches it to Cayenne on its own.
+    #[snafu(display(
+        "Failed to load dataset '{dataset}': {}",
+        runtime_acceleration::removed_engine_message(engine)
+    ))]
+    AcceleratedDatasetEngineRemoved {
+        dataset: String,
+        engine: &'static str,
+    },
+
+    /// A view's acceleration sets an engine removed in v2.5.
+    #[snafu(display(
+        "Failed to load view '{view_name}': {}",
+        runtime_acceleration::removed_engine_message(engine)
+    ))]
+    AcceleratedViewEngineRemoved {
+        view_name: String,
+        engine: &'static str,
+    },
 
     #[snafu(display(
         "Specify the SQL string for view {name} using either `sql: SELECT * FROM...` inline or as a file reference with `sql_ref: my_view.sql`"
@@ -609,6 +659,14 @@ pub enum Error {
     ))]
     FullTextSearchRequiresAcceleration { dataset_name: String },
 
+    #[snafu(display(
+        "Dataset '{dataset_name}' sets `{setting}`, which keeps its data on object storage, but a sidecar serves data only from memory and local disk; the cluster it reads from serves object-storage tiers. Remove `{setting}` from the sidecar's Spicepod, or start Spice without `--role sidecar`."
+    ))]
+    SidecarColdTier {
+        dataset_name: String,
+        setting: &'static str,
+    },
+
     #[snafu(display("{reason}"))]
     StateLocationRefused { reason: String },
 
@@ -746,6 +804,16 @@ pub struct Runtime {
     /// The dataset loads still retrying, so a Spicepod change can stop the load
     /// of a configuration it replaces or removes.
     dataset_loads: Arc<init::dataset_loads::DatasetLoads>,
+    /// The model loads in progress, so a Spicepod change can stop the load of a
+    /// configuration it replaces or removes.
+    model_loads: Arc<init::model::LoadTasks>,
+    /// The Spicepod tool loads in progress, so a Spicepod change can stop the load of a
+    /// configuration it replaces or removes.
+    tool_loads: Arc<init::model::LoadTasks>,
+    /// Names of the SQL functions registered for `as_sql` tools.
+    tool_udfs: Arc<parking_lot::Mutex<HashSet<String>>>,
+    /// The installed app's `row_id` keys, read by `/v1/search` and `vector_search`.
+    search_primary_keys: runtime_search::search_engine::ExplicitPrimaryKeys,
     /// Startup view registrations still waiting, cancelled when a Spicepod change replaces or removes the view.
     view_loads: Arc<init::view_loads::ViewLoads>,
 
@@ -784,6 +852,12 @@ impl Runtime {
     #[must_use]
     pub fn datafusion(&self) -> Arc<DataFusion> {
         Arc::clone(&self.df)
+    }
+
+    /// The `--role` this runtime started with. A Spicepod reload cannot change it.
+    #[must_use]
+    pub fn role(&self) -> config::Role {
+        self.df.role()
     }
 
     #[must_use]
@@ -842,24 +916,59 @@ impl Runtime {
         self.llm_runtime_stores.capabilities()
     }
 
-    pub async fn responses_supported_model_names(&self) -> HashSet<String> {
+    /// What answers `/v1/responses` for model `name`: its own Responses API, or, for a chat
+    /// model whose provider has none, its chat completions, by translation.
+    ///
+    /// # Errors
+    ///
+    /// Returns why `name` cannot answer when it serves neither.
+    pub async fn responses_model(
+        &self,
+        name: &str,
+    ) -> Result<Arc<dyn llms::responses::Responses>, model_capabilities::Refusal> {
+        use model_capabilities::{Capability, Refusal, require};
+
         let capabilities = self.llm_runtime_stores.capabilities();
         let capabilities = capabilities.read().await;
         let responses = self.llm_runtime_stores.responses_llms();
-        let responses = responses.read().await;
-        capabilities
-            .keys()
-            .filter(|name| {
-                model_capabilities::require(
-                    &capabilities,
-                    &responses,
-                    name,
-                    model_capabilities::Capability::Responses,
-                )
-                .is_ok()
-            })
-            .cloned()
-            .collect()
+        let own = require(
+            &capabilities,
+            &*responses.read().await,
+            name,
+            Capability::Responses,
+        );
+        let through_chat = match &own {
+            Err(Refusal::Unsupported(found)) => found.has(Capability::Chat),
+            // A worker router serves chat completions without a capability entry of its own.
+            Err(Refusal::NotFound) => true,
+            Ok(_) | Err(Refusal::Unavailable) => false,
+        };
+        if !through_chat {
+            return own;
+        }
+        let chat = self.llm_runtime_stores.completion_llms();
+        require(&capabilities, &*chat.read().await, name, Capability::Chat).map(|chat| {
+            Arc::new(model::ResponsesViaChat::new(chat)) as Arc<dyn llms::responses::Responses>
+        })
+    }
+
+    /// The models `/v1/responses` serves: those [`Self::responses_model`] answers for, of the
+    /// models and the worker routers that serve chat completions.
+    pub async fn responses_supported_model_names(&self) -> HashSet<String> {
+        let names: HashSet<String> = {
+            let capabilities = self.llm_runtime_stores.capabilities();
+            let capabilities = capabilities.read().await;
+            let chat = self.llm_runtime_stores.completion_llms();
+            let chat = chat.read().await;
+            capabilities.keys().chain(chat.keys()).cloned().collect()
+        };
+        let mut served = HashSet::with_capacity(names.len());
+        for name in names {
+            if self.responses_model(&name).await.is_ok() {
+                served.insert(name);
+            }
+        }
+        served
     }
 
     #[must_use]
@@ -872,6 +981,11 @@ impl Runtime {
     #[must_use]
     pub fn responses_llms(&self) -> Arc<RwLock<LLMResponsesModelStore>> {
         self.llm_runtime_stores.responses_llms()
+    }
+
+    #[must_use]
+    pub fn messages_llms(&self) -> Arc<RwLock<LLMMessagesModelStore>> {
+        self.llm_runtime_stores.messages_llms()
     }
 
     #[must_use]
@@ -965,22 +1079,39 @@ impl Runtime {
         }
     }
 
+    /// Adds `assignments` to the partitions this executor holds and loads the
+    /// tables whose partitions change. Partitions the scheduler pushed earlier
+    /// are kept: the scheduler removes a partition by an explicit update.
     pub async fn set_partition_assignments(&self, assignments: PartitionAssignments) {
         if let Some(DistributedNode::Executor {
             partition_assignments,
+            assignment_updates,
             ..
         }) = self.distributed.as_ref()
         {
+            let _applying = assignment_updates.lock().await;
             let mut guard = partition_assignments.write().await;
-            guard.clone_from(&assignments);
+            let mut changed = Vec::new();
+            for (table, partitions) in assignments {
+                let held = guard.entry(table.clone()).or_default();
+                let before = held.len();
+                for partition in partitions {
+                    if !held.contains(&partition) {
+                        held.push(partition);
+                    }
+                }
+                if held.len() != before {
+                    changed.push(table);
+                }
+            }
+            let merged = guard.clone();
             drop(guard); // drop lock before updating tables
 
-            self.record_executor_assigned_partitions(&assignments);
+            self.record_executor_assigned_partitions(&merged);
 
-            // Update all assigned tables
-            for table in assignments.keys() {
+            for table in changed {
                 if let Err(e) = self
-                    .update_partition_refresh_sql(table.clone(), &assignments)
+                    .update_partition_refresh_sql(table.clone(), &merged)
                     .await
                 {
                     tracing::warn!("Failed to update partition refresh SQL for {table}: {e}");
@@ -1019,6 +1150,7 @@ impl Runtime {
     ) -> Result<()> {
         let Some(DistributedNode::Executor {
             partition_assignments,
+            assignment_updates,
             ..
         }) = self.distributed.as_ref()
         else {
@@ -1030,6 +1162,7 @@ impl Runtime {
             // misconfigured here.
             return Ok(());
         };
+        let _applying = assignment_updates.lock().await;
 
         // Compute the prospective post-update state from a snapshot of the
         // current map. We apply the DataFusion filter updates against this
@@ -1077,19 +1210,29 @@ impl Runtime {
             }
         }
 
-        let affected_tables: HashSet<_> = new_partitions
-            .keys()
-            .chain(removed_partitions.keys())
-            .collect();
+        // Tables whose partitions this update changes load them. An update
+        // that repeats what the executor already holds (the scheduler re-sends
+        // partitions it has no load report for) repairs that report instead.
+        let (affected_tables, repeated_tables): (
+            HashSet<ResolvedTableReference>,
+            HashSet<ResolvedTableReference>,
+        ) = {
+            let current = partition_assignments.read().await;
+            new_partitions
+                .keys()
+                .chain(removed_partitions.keys())
+                .map(|table_name| {
+                    TableReference::parse_str(table_name)
+                        .resolve(SPICE_DEFAULT_CATALOG, SPICE_DEFAULT_SCHEMA)
+                })
+                .partition(|table| current.get(table) != prospective.get(table))
+        };
 
         // Apply DataFusion filter updates against the prospective state. If any
         // fails, the shared partition_assignments map is not modified — the
         // scheduler retries the update and we'll re-attempt all tables.
-        for table_name in affected_tables {
-            let resolved = TableReference::parse_str(table_name)
-                .resolve(SPICE_DEFAULT_CATALOG, SPICE_DEFAULT_SCHEMA);
-
-            self.update_partition_refresh_sql(resolved.clone(), &prospective)
+        for resolved in affected_tables {
+            self.update_partition_refresh_sql(resolved, &prospective)
                 .await?;
         }
 
@@ -1098,8 +1241,75 @@ impl Runtime {
         // All filter updates succeeded — commit the new routing state. Last
         // step so the planner's view of executor partitions never gets ahead
         // of what the AcceleratedTables actually know about.
-        *partition_assignments.write().await = prospective;
+        *partition_assignments.write().await = prospective.clone();
+
+        for resolved in repeated_tables {
+            self.repair_partition_load(resolved, &prospective).await?;
+        }
         Ok(())
+    }
+
+    /// Answers a scheduler that re-sent partitions of `table` this executor
+    /// already holds because it has no report of them loaded: replays the
+    /// report of the load of the current partitions, or loads them again when
+    /// no load of them finished (it failed) and none is running. Does nothing
+    /// before the table's initial load reports, which reports on its own.
+    async fn repair_partition_load(
+        &self,
+        table: ResolvedTableReference,
+        assignments: &PartitionAssignments,
+    ) -> Result<()> {
+        let Some(broadcaster) = self.executor_outbound_broadcaster() else {
+            return Ok(());
+        };
+        let table_name = table.to_string();
+        if broadcaster.is_loading(&table_name) {
+            return Ok(());
+        }
+        let Some(loaded) = broadcaster.loaded_partitions(&table_name).await else {
+            return Ok(());
+        };
+        let assigned: HashSet<Vec<u8>> = assignments
+            .get(&table)
+            .map(|exprs| runtime_cluster::encode_partition_exprs(exprs, &table_name))
+            .unwrap_or_default()
+            .into_iter()
+            .collect();
+        if loaded.into_iter().collect::<HashSet<_>>() == assigned {
+            let sent = broadcaster.rebroadcast_partitions_loaded(&table_name).await;
+            tracing::debug!("Re-sent PartitionsLoaded for {table_name} to {sent} scheduler(s)");
+            return Ok(());
+        }
+        tracing::info!("Loading the assigned partitions of {table_name} again");
+        self.update_partition_refresh_sql(table, assignments).await
+    }
+
+    /// Loads the partitions of `table` assigned while its initial load read
+    /// `loaded`, the partitions that load filtered to.
+    pub(crate) async fn load_partitions_assigned_during_initial_load(
+        &self,
+        table: ResolvedTableReference,
+        loaded: &[Expr],
+    ) -> Result<()> {
+        let Some(DistributedNode::Executor {
+            partition_assignments,
+            assignment_updates,
+            ..
+        }) = self.distributed.as_ref()
+        else {
+            return Ok(());
+        };
+        let _applying = assignment_updates.lock().await;
+        let current = partition_assignments.read().await.clone();
+        let loaded: HashSet<&Expr> = loaded.iter().collect();
+        let assigned: HashSet<&Expr> = current
+            .get(&table)
+            .map(|exprs| exprs.iter().collect())
+            .unwrap_or_default();
+        if loaded == assigned {
+            return Ok(());
+        }
+        self.update_partition_refresh_sql(table, &current).await
     }
 
     pub(crate) async fn update_partition_refresh_sql(
@@ -1142,75 +1352,80 @@ impl Runtime {
         // Capturing later would tie the ack to whatever the name resolves to by
         // then, which is a different table if a rebuild has landed in between.
         let instance = self.datafusion().capture_table_instance(&table_ref).await;
+        let table_name = table.to_string();
+        let broadcaster = self.executor_outbound_broadcaster();
+        // Dropping the guard ends the load, including when this future is
+        // cancelled before the completion task below takes it over.
+        let load = broadcaster
+            .as_ref()
+            .map(|broadcaster| broadcaster.start_load(&table_name));
 
         // Propagate the filter-update error so the caller (and the executor's
         // ack to the scheduler) sees the failure rather than just logging it.
-        self.datafusion()
-            .update_partition_filters(table_ref.clone(), partition_filters)
-            .await
-            .map_err(|source| Error::UnableToUpdateClusterPartitionFilters {
-                table: table.to_string(),
-                source: Box::new(source),
-            })?;
-
-        tracing::info!("Updated partition assignments for {table}");
-
         // Trigger a refresh to load the data for the new partitions, capturing
         // the completion notifier so we can ack the scheduler with a
         // `PartitionsLoaded` once the accelerated table has actually finished
-        // loading. Refresh failures are non-fatal — the assignment is still
-        // valid; data just hasn't been pulled yet, so we skip the ack.
-        let notifier = match self.datafusion().refresh_table(&table_ref, None).await {
-            Ok(notifier) => notifier,
-            Err(e) => {
-                tracing::warn!(
-                    "Failed to trigger refresh for {table} after updating partitions: {e}"
-                );
-                return Ok(());
-            }
-        };
+        // loading. A refresh that cannot start fails the update, so the
+        // scheduler sends it again rather than count it delivered.
+        let started = async {
+            self.datafusion()
+                .update_partition_filters(table_ref.clone(), partition_filters)
+                .await
+                .map_err(|source| Error::UnableToUpdateClusterPartitionFilters {
+                    table: table_name.clone(),
+                    source: Box::new(source),
+                })?;
+            tracing::info!("Updated partition assignments for {table}");
+            self.datafusion()
+                .refresh_table(&table_ref, None)
+                .await
+                .map_err(|source| Error::UnableToUpdateClusterPartitionFilters {
+                    table: table_name.clone(),
+                    source: Box::new(source),
+                })
+        }
+        .await;
+        let notifier = started?;
 
         // Snapshot the partition exprs assigned to us for this table, encoded
         // the same way the scheduler encodes them when sending UpdatePartitions
         // (`Expr::to_bytes()`). `partition_value_to_bytes` sorts entries by
         // key so the encoding is deterministic across re-serialization.
-        let table_str = table.to_string();
         let partition_expr_bytes: Vec<Vec<u8>> = assignments
             .get(&table)
-            .map(|exprs| runtime_cluster::encode_partition_exprs(exprs, &table_str))
+            .map(|exprs| runtime_cluster::encode_partition_exprs(exprs, &table_name))
             .unwrap_or_default();
 
-        if let Some(broadcaster) = self.executor_outbound_broadcaster() {
+        if let (Some(broadcaster), Some(load)) = (broadcaster, load) {
             // Send the ack even when `partition_expr_bytes` is empty — a
             // legitimately empty assignment (e.g. zero-partition source, or
             // partitions that all failed to serialize) still needs to flip
             // the scheduler-side readiness gate via the
             // `is_table_loaded`/`updated_at` shortcut. Suppressing the empty
             // case here would leave the dataset stuck in `Refreshing`.
-            let table_name = table.to_string();
             let df = self.datafusion();
             tokio::spawn(async move {
                 // Acking readiness for a table that did not load this partition
                 // set tells the scheduler a lie it then caches, so wait for the
                 // refresh *and* re-resolve the table before broadcasting.
-                match df.await_refresh_completion(instance, notifier).await {
-                    DeferredRefreshOutcome::Apply => {}
+                let loaded = match df.await_refresh_completion(instance, notifier).await {
+                    DeferredRefreshOutcome::Apply => true,
                     DeferredRefreshOutcome::Abandoned => {
                         // The table was removed before the refresh we triggered
                         // landed, so the partition set was never loaded.
                         tracing::debug!(
                             "{table_name} was removed before its partition refresh completed; not broadcasting PartitionsLoaded."
                         );
-                        return;
+                        false
                     }
                     DeferredRefreshOutcome::Failed => {
                         // A one-shot refresh failed. Advertising those
                         // partitions as queryable would tell the scheduler a
                         // lie it then caches.
-                        tracing::debug!(
+                        tracing::warn!(
                             "{table_name} partition refresh failed terminally; not broadcasting PartitionsLoaded."
                         );
-                        return;
+                        false
                     }
                     DeferredRefreshOutcome::TableChanged => {
                         // A refresh did land, but not on the table this ack is
@@ -1219,17 +1434,24 @@ impl Runtime {
                         tracing::debug!(
                             "{table_name} was removed or rebuilt after its partition refresh completed; not broadcasting PartitionsLoaded."
                         );
-                        return;
+                        false
                     }
+                };
+                if loaded {
+                    // Statistics flow via the periodic ExecutorStatistics
+                    // reporter, not this readiness ack.
+                    let sent = broadcaster
+                        .broadcast_partitions_loaded(
+                            table_name.clone(),
+                            partition_expr_bytes,
+                            load.load_sequence(),
+                        )
+                        .await;
+                    tracing::debug!(
+                        "Broadcast PartitionsLoaded for {table_name} to {sent} scheduler(s)"
+                    );
                 }
-                // Statistics flow via the periodic ExecutorStatistics reporter, not
-                // this readiness ack.
-                let sent = broadcaster
-                    .broadcast_partitions_loaded(table_name.clone(), partition_expr_bytes)
-                    .await;
-                tracing::debug!(
-                    "Broadcast PartitionsLoaded for {table_name} to {sent} scheduler(s)"
-                );
+                drop(load);
             });
         }
 
@@ -1303,11 +1525,8 @@ impl Runtime {
             // are cayenne *catalog* tables (not spice.public datasets), so the
             // dataset partition-assignment map doesn't cover them; enumerate the
             // cayenne catalog directly. Also include any dataset assignments.
-            let mut tables: Vec<TableReference> = Vec::new();
-            #[cfg(not(windows))]
-            {
-                tables.extend(crate::cluster::discover_cayenne_tables(&df).await);
-            }
+            let mut tables: Vec<TableReference> =
+                crate::cluster::discover_cayenne_tables(&df).await;
             if let Some(assignments_lock) = self.partition_assignments() {
                 for resolved in assignments_lock.read().await.keys() {
                     tables.push(TableReference::full(
@@ -1475,6 +1694,7 @@ impl Runtime {
     /// [`Runtime::init_cache_metrics`].
     pub fn init_component_metrics(&self) {
         runtime_metrics::publish_component_counters_at_zero();
+        runtime_state_location::metrics::init();
     }
 
     /// Requests a loaded extension, or will attempt to load it if part of the autoloaded extensions.
@@ -1982,7 +2202,7 @@ impl Runtime {
         // round trip, and holding the guard across it stalls a writer (and
         // risks the write-preferring deadlock `Secrets::snapshot` documents).
         let secrets = secrets::Secrets::snapshot(&self.secrets).await;
-        secrets_preflight::run(&app, &secrets).await;
+        runtime_secrets::preflight::run(&app, &secrets).await;
     }
 
     /// Will load all of the components of the Runtime, including `secret_stores`, `catalogs`, `datasets`, `models`, and `embeddings`.
@@ -2058,13 +2278,14 @@ impl Runtime {
             }
         });
 
-        if let Some(cfg) = self
+        let management_cfg = self
             .app
             .read()
             .await
             .as_ref()
-            .and_then(|app| app.management.as_ref())
-            && let Err(err) = management::init_management(Arc::clone(&self), cfg).await
+            .and_then(|app| app.management.clone());
+        if let Some(cfg) = management_cfg
+            && let Err(err) = management::init_management(Arc::clone(&self), &cfg).await
         {
             tracing::error!("Failed to initialize management of the Spice runtime: {err}");
         }
@@ -2226,10 +2447,19 @@ impl Runtime {
         // milliseconds. Waited on alongside the connection drain, under the same
         // timeout: a source that cannot finish in it costs a rebuild on the next
         // start, never a hung shutdown.
-        let (unfinished_sources, _) = tokio::join!(
+        //
+        // Snapshot writer leases are resigned alongside, so a replacement instance
+        // need not wait for them to lapse.
+        let (unfinished_sources, _, leases_released) = tokio::join!(
             data_components::cdc::drain_shutdown(shutdown_timeout),
             join_all(shutdown_futures),
+            tokio::time::timeout(shutdown_timeout, self.df.resign_snapshot_writer_leases()),
         );
+        if leases_released.is_err() {
+            tracing::warn!(
+                "Shutdown waited {shutdown_timeout:?} to release snapshot writer leases and gave up; another instance takes over those datasets' snapshots only after the leases lapse"
+            );
+        }
         if unfinished_sources > 0 {
             tracing::warn!(
                 "Shutdown waited {shutdown_timeout:?} for {unfinished_sources} change-data-capture source(s) to record how far their accelerations were advanced, and gave up; each dataset on those sources will be rebuilt from its source on the next start rather than resumed"

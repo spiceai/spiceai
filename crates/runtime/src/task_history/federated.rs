@@ -22,6 +22,7 @@ limitations under the License.
 
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::time::Duration;
 
 use arrow::array::RecordBatch;
 use arrow::compute::{SortOptions, sort_to_indices, take};
@@ -33,12 +34,13 @@ use datafusion::catalog::Session;
 use datafusion::common::Result as DataFusionResult;
 use datafusion::datasource::TableProvider;
 use datafusion::error::DataFusionError;
+use datafusion::execution::{SendableRecordBatchStream, TaskContext};
 use datafusion::logical_expr::dml::InsertOp;
 use datafusion::logical_expr::{Expr, TableType};
-use datafusion::physical_plan::ExecutionPlan;
-use datafusion::physical_plan::execution_plan::execute_stream;
-use datafusion_datasource::memory::MemorySourceConfig;
-use datafusion_datasource::source::DataSourceExec;
+use datafusion::physical_expr::{EquivalenceProperties, Partitioning};
+use datafusion::physical_plan::execution_plan::{Boundedness, EmissionType, execute_stream};
+use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
+use datafusion::physical_plan::{DisplayAs, DisplayFormatType, ExecutionPlan, PlanProperties};
 use flight_client::cookie::CookieStore;
 use futures::TryStreamExt;
 use futures::future::join_all;
@@ -51,16 +53,36 @@ use crate::cluster::SchedulerPeers;
 use crate::datafusion::SPICE_RUNTIME_SCHEMA;
 use crate::task_history::DEFAULT_TASK_HISTORY_TABLE;
 
+/// How long a scan waits for one peer scheduler or executor, connection included.
+/// The scan runs while its query holds a query admission permit, so a node that
+/// accepts the request and never replies must not keep that permit.
+const NODE_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Fails `request` to `node` if it has not finished within [`NODE_REQUEST_TIMEOUT`].
+async fn within_node_timeout(
+    node: String,
+    request: impl Future<Output = Result<Vec<RecordBatch>, (String, String)>>,
+) -> Result<Vec<RecordBatch>, (String, String)> {
+    tokio::time::timeout(NODE_REQUEST_TIMEOUT, request)
+        .await
+        .unwrap_or_else(|_| {
+            Err((
+                node,
+                format!("no reply within {}s", NODE_REQUEST_TIMEOUT.as_secs()),
+            ))
+        })
+}
+
 /// A federated table provider that queries task history across all nodes in a cluster.
 ///
-/// When `scan()` is called, this provider:
+/// `scan()` contacts no other node. The plan it returns, when executed:
 /// 1. Queries the local `task_history` table directly (via stored reference)
 /// 2. Fans out to all peer schedulers via the `GetTaskHistory` RPC
 /// 3. Fans out to all connected executors via `FlightSQL`
 /// 4. Combines all results into a single result set sorted by `start_time`
 ///
-/// If any peer or executor fails, the entire query fails with an error containing
-/// the identifiers of the failed nodes.
+/// If any peer or executor fails, or does not reply within [`NODE_REQUEST_TIMEOUT`],
+/// the entire query fails with an error containing the identifiers of the failed nodes.
 pub struct FederatedTaskHistoryTable {
     /// Schema for the `task_history` table (with `node_id` column)
     schema: SchemaRef,
@@ -180,31 +202,6 @@ impl FederatedTaskHistoryTable {
                 .map_err(|e| (executor_id, format!("FlightSQL query failed: {e}")))?;
         Ok(batches)
     }
-
-    /// Executes a scan directly on the local table provider.
-    async fn query_local(
-        local_table: Arc<dyn TableProvider>,
-        state: &dyn Session,
-        projection: Option<&Vec<usize>>,
-        filters: &[Expr],
-        limit: Option<usize>,
-    ) -> Result<Vec<RecordBatch>, (String, String)> {
-        let plan = local_table
-            .scan(state, projection, filters, limit)
-            .await
-            .map_err(|e| ("local".to_string(), format!("scan failed: {e}")))?;
-
-        let task_ctx = state.task_ctx();
-        let stream = execute_stream(plan, task_ctx)
-            .map_err(|e| ("local".to_string(), format!("execution failed: {e}")))?;
-
-        let batches: Vec<RecordBatch> = stream
-            .try_collect()
-            .await
-            .map_err(|e| ("local".to_string(), format!("collect failed: {e}")))?;
-
-        Ok(batches)
-    }
 }
 
 #[async_trait]
@@ -224,111 +221,34 @@ impl TableProvider for FederatedTaskHistoryTable {
         filters: &[Expr],
         limit: Option<usize>,
     ) -> DataFusionResult<Arc<dyn ExecutionPlan>> {
-        // Get the list of peer schedulers
-        let peers = self.scheduler_peers.read().await;
-        let peer_addresses =
-            crate::cluster::remote_scheduler_addresses(&peers, &self.local_node_id);
-        drop(peers);
-
-        // Get the list of connected executors' FlightSQL clients
-        let executor_clients: Vec<(String, FlightSqlClient)> = {
-            let clients = self.executor_flight_clients.read().await;
-            clients
-                .iter()
-                .map(|(id, client)| (id.clone(), client.clone()))
-                .collect()
-        };
-
-        // Build the SQL query to send to peers and executors
         let table_ref = format!("\"{SPICE_RUNTIME_SCHEMA}\".\"{DEFAULT_TASK_HISTORY_TABLE}\"");
         let sql = build_peer_sql(&table_ref, filters, limit)?;
-
-        tracing::debug!(
-            "FederatedTaskHistoryTable executing federated query to {} peers and {} executors: {sql}",
-            peer_addresses.len(),
-            executor_clients.len(),
-        );
-
-        // Fan out to all peer schedulers in parallel
-        let peer_futures: Vec<_> = peer_addresses
-            .into_iter()
-            .map(|addr| {
-                let sql = sql.clone();
-                let tls_config = self.client_tls_config.clone();
-                async move { Self::query_peer(addr, sql, tls_config).await }
-            })
-            .collect();
-
-        // Fan out to all executors via FlightSQL in parallel
-        let executor_futures: Vec<_> = executor_clients
-            .into_iter()
-            .map(|(executor_id, client)| {
-                let sql = sql.clone();
-                let table_ref = table_ref.clone();
-                async move { Self::query_executor(executor_id, client, sql, table_ref).await }
-            })
-            .collect();
-
-        // Execute local query directly on the stored table provider
-        let local_table = Arc::clone(&self.local_table);
-        let local_filters: Vec<Expr> = filters.to_vec();
-        let local_limit = limit;
-
-        // Query local batches with the full schema and apply projection once after
-        // federating local + peer + executor results.
-        let local_result =
-            Self::query_local(local_table, state, None, &local_filters, local_limit).await;
-
-        // Wait for all peer and executor results
-        let (peer_results, executor_results) =
-            futures::join!(join_all(peer_futures), join_all(executor_futures));
-
-        // Collect all results, tracking failures
-        let mut all_batches = Vec::new();
-        let mut failures = Vec::new();
-
-        match local_result {
-            Ok(batches) => all_batches.extend(batches),
-            Err((node, error)) => failures.push(format!("{node}: {error}")),
-        }
-
-        for result in peer_results {
-            match result {
-                Ok(batches) => all_batches.extend(batches),
-                Err((node, error)) => failures.push(format!("{node}: {error}")),
-            }
-        }
-
-        for result in executor_results {
-            match result {
-                Ok(batches) => all_batches.extend(batches),
-                Err((node, error)) => failures.push(format!("{node}: {error}")),
-            }
-        }
-
-        // If any node failed, return an error
-        if !failures.is_empty() {
-            return Err(DataFusionError::Execution(format!(
-                "Failed to collect cluster task history: nodes failed: [{}]",
-                failures.join(", ")
-            )));
-        }
-
-        // Sort combined results by start_time
-        let all_batches = sort_batches_by_start_time(&all_batches, &self.schema)?;
-
-        // Build the execution plan from the collected batches. Keep the source
-        // schema unprojected and let MemorySourceConfig apply projection once.
-        let schema = Arc::clone(&self.schema);
-
-        let memory_source = if all_batches.is_empty() {
-            MemorySourceConfig::try_new(&[], Arc::clone(&schema), projection.cloned())?
-        } else {
-            MemorySourceConfig::try_new(&[all_batches], schema, projection.cloned())?
+        // Keep the full schema here; the projection applies once the rows of every
+        // node are combined.
+        let local_plan = self.local_table.scan(state, None, filters, limit).await?;
+        let projected_schema = match projection {
+            Some(indices) => Arc::new(self.schema.project(indices)?),
+            None => Arc::clone(&self.schema),
         };
-
-        let exec = DataSourceExec::new(Arc::new(memory_source));
-        Ok(Arc::new(exec))
+        Ok(Arc::new(FederatedTaskHistoryExec {
+            read: FederatedRead {
+                schema: Arc::clone(&self.schema),
+                projection: projection.cloned(),
+                local_plan,
+                scheduler_peers: Arc::clone(&self.scheduler_peers),
+                executor_flight_clients: Arc::clone(&self.executor_flight_clients),
+                client_tls_config: self.client_tls_config.clone(),
+                local_node_id: self.local_node_id.clone(),
+                sql,
+                table_ref,
+            },
+            properties: Arc::new(PlanProperties::new(
+                EquivalenceProperties::new(projected_schema),
+                Partitioning::UnknownPartitioning(1),
+                EmissionType::Final,
+                Boundedness::Bounded,
+            )),
+        }))
     }
 
     /// Delegate inserts to the local task history table.
@@ -342,6 +262,190 @@ impl TableProvider for FederatedTaskHistoryTable {
         insert_op: InsertOp,
     ) -> DataFusionResult<Arc<dyn ExecutionPlan>> {
         self.local_table.insert_into(state, input, insert_op).await
+    }
+}
+
+/// What a [`FederatedTaskHistoryExec`] reads: this scheduler's rows through
+/// `local_plan`, and `sql` from every peer scheduler and connected executor.
+#[derive(Clone)]
+struct FederatedRead {
+    /// The full table schema; `projection` applies after the rows are combined.
+    schema: SchemaRef,
+    projection: Option<Vec<usize>>,
+    local_plan: Arc<dyn ExecutionPlan>,
+    scheduler_peers: Arc<RwLock<SchedulerPeers>>,
+    executor_flight_clients: Arc<RwLock<HashMap<String, FlightSqlClient>>>,
+    client_tls_config: Option<ClientTlsConfig>,
+    local_node_id: String,
+    sql: String,
+    table_ref: String,
+}
+
+impl FederatedRead {
+    /// Reads every node and returns the combined rows sorted by `start_time`.
+    async fn rows(self, context: Arc<TaskContext>) -> DataFusionResult<Vec<RecordBatch>> {
+        let peers = self.scheduler_peers.read().await;
+        let peer_addresses =
+            crate::cluster::remote_scheduler_addresses(&peers, &self.local_node_id);
+        drop(peers);
+
+        let executor_clients: Vec<(String, FlightSqlClient)> = {
+            let clients = self.executor_flight_clients.read().await;
+            clients
+                .iter()
+                .map(|(id, client)| (id.clone(), client.clone()))
+                .collect()
+        };
+
+        tracing::debug!(
+            "FederatedTaskHistoryTable executing federated query to {} peers and {} executors: {}",
+            peer_addresses.len(),
+            executor_clients.len(),
+            self.sql,
+        );
+
+        let peer_futures: Vec<_> = peer_addresses
+            .into_iter()
+            .map(|addr| {
+                within_node_timeout(
+                    addr.clone(),
+                    FederatedTaskHistoryTable::query_peer(
+                        addr,
+                        self.sql.clone(),
+                        self.client_tls_config.clone(),
+                    ),
+                )
+            })
+            .collect();
+
+        let executor_futures: Vec<_> = executor_clients
+            .into_iter()
+            .map(|(executor_id, client)| {
+                within_node_timeout(
+                    executor_id.clone(),
+                    FederatedTaskHistoryTable::query_executor(
+                        executor_id,
+                        client,
+                        self.sql.clone(),
+                        self.table_ref.clone(),
+                    ),
+                )
+            })
+            .collect();
+
+        let local_future = async {
+            execute_stream(Arc::clone(&self.local_plan), context)
+                .map_err(|e| ("local".to_string(), format!("execution failed: {e}")))?
+                .try_collect::<Vec<_>>()
+                .await
+                .map_err(|e| ("local".to_string(), format!("collect failed: {e}")))
+        };
+
+        let (local_result, peer_results, executor_results) = futures::join!(
+            local_future,
+            join_all(peer_futures),
+            join_all(executor_futures)
+        );
+
+        let mut all_batches = Vec::new();
+        let mut failures = Vec::new();
+        for result in std::iter::once(local_result)
+            .chain(peer_results)
+            .chain(executor_results)
+        {
+            match result {
+                Ok(batches) => all_batches.extend(batches),
+                Err((node, error)) => failures.push(format!("{node}: {error}")),
+            }
+        }
+
+        if !failures.is_empty() {
+            return Err(DataFusionError::Execution(format!(
+                "Failed to collect cluster task history: nodes failed: [{}]",
+                failures.join(", ")
+            )));
+        }
+
+        let sorted = sort_batches_by_start_time(&all_batches, &self.schema)?;
+        match &self.projection {
+            Some(indices) => sorted
+                .iter()
+                .map(|batch| {
+                    batch
+                        .project(indices)
+                        .map_err(|e| DataFusionError::ArrowError(Box::new(e), None))
+                })
+                .collect(),
+            None => Ok(sorted),
+        }
+    }
+}
+
+/// Reads `runtime.task_history` from every cluster node when it executes, so
+/// that planning a query waits on no other node.
+struct FederatedTaskHistoryExec {
+    read: FederatedRead,
+    properties: Arc<PlanProperties>,
+}
+
+impl std::fmt::Debug for FederatedTaskHistoryExec {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("FederatedTaskHistoryExec")
+            .field("sql", &self.read.sql)
+            .finish_non_exhaustive()
+    }
+}
+
+impl DisplayAs for FederatedTaskHistoryExec {
+    fn fmt_as(&self, _t: DisplayFormatType, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        write!(f, "FederatedTaskHistoryExec: sql={}", self.read.sql)
+    }
+}
+
+impl ExecutionPlan for FederatedTaskHistoryExec {
+    fn name(&self) -> &'static str {
+        "FederatedTaskHistoryExec"
+    }
+
+    fn properties(&self) -> &Arc<PlanProperties> {
+        &self.properties
+    }
+
+    fn apply_expressions(
+        &self,
+        _f: &mut dyn FnMut(
+            &Arc<dyn datafusion::physical_plan::PhysicalExpr>,
+        )
+            -> DataFusionResult<datafusion::common::tree_node::TreeNodeRecursion>,
+    ) -> DataFusionResult<datafusion::common::tree_node::TreeNodeRecursion> {
+        Ok(datafusion::common::tree_node::TreeNodeRecursion::Continue)
+    }
+
+    fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> {
+        vec![]
+    }
+
+    fn with_new_children(
+        self: Arc<Self>,
+        _children: Vec<Arc<dyn ExecutionPlan>>,
+    ) -> DataFusionResult<Arc<dyn ExecutionPlan>> {
+        Ok(self)
+    }
+
+    fn execute(
+        &self,
+        partition: usize,
+        context: Arc<TaskContext>,
+    ) -> DataFusionResult<SendableRecordBatchStream> {
+        if partition != 0 {
+            return Err(DataFusionError::Internal(format!(
+                "FederatedTaskHistoryExec has one partition; got {partition}"
+            )));
+        }
+        let rows = futures::stream::once(self.read.clone().rows(context))
+            .map_ok(|batches| futures::stream::iter(batches.into_iter().map(Ok)))
+            .try_flatten();
+        Ok(Box::pin(RecordBatchStreamAdapter::new(self.schema(), rows)))
     }
 }
 
@@ -630,6 +734,77 @@ mod tests {
             .await
             .expect("collecting the local rows should succeed");
         assert_eq!(results.iter().map(RecordBatch::num_rows).sum::<usize>(), 1);
+    }
+
+    /// Planning contacts no peer. A peer that accepts the connection and never
+    /// replies fails the read at `NODE_REQUEST_TIMEOUT` instead of holding it,
+    /// and its query's admission permit, for as long as the peer stays stuck.
+    #[tokio::test(start_paused = true)]
+    async fn a_peer_that_never_replies_fails_the_read_not_the_plan() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("listener should bind");
+        let address = listener
+            .local_addr()
+            .expect("listener should have an address")
+            .to_string();
+        let _stuck_peer = tokio::spawn(async move {
+            let mut connections = Vec::new();
+            while let Ok((connection, _)) = listener.accept().await {
+                connections.push(connection);
+            }
+        });
+        let schema = Arc::new(Schema::new(vec![Field::new("col0", DataType::Utf8, false)]));
+        let local_table = MemTable::try_new(Arc::clone(&schema), vec![vec![]])
+            .expect("local memtable should build");
+        let peers = SchedulerPeers::from([(
+            "sched-b".to_string(),
+            crate::cluster::SchedulerEntry {
+                scheduler_id: "sched-b".to_string(),
+                instance_id: uuid::Uuid::new_v4(),
+                advertise_address: address.clone(),
+                grpc_address: "127.0.0.1:50051".to_string(),
+                http_address: "127.0.0.1:8090".to_string(),
+                started_at_ms: 0,
+                ttl_ms: 30_000,
+                build_version: "test".to_string(),
+                labels: HashMap::new(),
+            },
+        )]);
+        let table = FederatedTaskHistoryTable::new(
+            Arc::clone(&schema),
+            Arc::new(local_table),
+            Arc::new(RwLock::new(peers)),
+            Arc::new(RwLock::new(HashMap::new())),
+            None,
+            "127.0.0.1:50052".to_string(),
+        );
+
+        let ctx = SessionContext::new();
+        let planned_at = tokio::time::Instant::now();
+        let plan = tokio::time::timeout(
+            NODE_REQUEST_TIMEOUT,
+            table.scan(&ctx.state(), None, &[], None),
+        )
+        .await
+        .expect("planning should not wait on the peer")
+        .expect("planning should succeed without the peer");
+        assert_eq!(
+            planned_at.elapsed(),
+            Duration::ZERO,
+            "planning should not wait on the peer"
+        );
+
+        let error = tokio::time::timeout(NODE_REQUEST_TIMEOUT * 10, collect(plan, ctx.task_ctx()))
+            .await
+            .expect("the read should end at the peer deadline, not wait for the peer")
+            .expect_err("a peer that never replies should fail the read");
+        assert!(
+            error
+                .to_string()
+                .contains(&format!("{address}: no reply within 30s")),
+            "unexpected error: {error}"
+        );
     }
 
     #[test]

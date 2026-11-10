@@ -45,7 +45,9 @@ use tracing_futures::Instrument;
 
 use crate::streaming_utils::generate_stream_id;
 
+pub mod model_info;
 pub mod streaming_utils;
+pub mod wire;
 
 #[derive(Debug, Snafu)]
 // Selectors are `pub`: provider crates construct e.g. `FailedToRunModelSnafu` across the
@@ -88,12 +90,34 @@ pub enum Error {
         source: Box<dyn std::error::Error + Send + Sync>,
     },
 
+    /// The model's provider refused, or could not be reached for, the exchange that gives the
+    /// model its access token. The source names the provider, its reason and where to look, so it
+    /// is the whole message.
+    #[snafu(display("{source}"))]
+    FailedToAuthenticate {
+        source: Box<dyn std::error::Error + Send + Sync>,
+    },
+
+    /// Downloading the model's files failed. The source names the file, the repository, the
+    /// cause and the fix, so it is the whole message.
+    #[snafu(display("{source}"))]
+    FailedToDownloadModel {
+        source: Box<dyn std::error::Error + Send + Sync>,
+        /// Whether only a Spicepod change clears it (see [`Error::is_configuration_error`]).
+        configuration: bool,
+    },
+
     #[snafu(display(
         "Unsupported value for `model_type` parameter. {source}  Verify the `model_type` parameter, and try again"
     ))]
     UnsupportedModelType {
         source: Box<dyn std::error::Error + Send + Sync>,
     },
+
+    #[snafu(display(
+        "Architecture '{architecture}' in {file} is not supported by this Spice release. Upgrade Spice, or use a GGUF of a supported architecture: https://spiceai.org/docs/components/models#gguf-architectures"
+    ))]
+    UnsupportedArchitecture { architecture: String, file: String },
 
     #[snafu(display(
         "The specified model identifier '{model}' is not valid for the source '{model_source}'. Verify the model exists, and try again."
@@ -168,9 +192,54 @@ pub enum Error {
         "The tool '{tool}' was not found. Verify the Spicepod configuration, and view the tools documentation at https://spiceai.org/docs/components/tools"
     ))]
     ToolNotFound { tool: String },
+
+    #[snafu(display(
+        "Model '{model}' is split across nodes over connections that are neither authenticated nor encrypted, so it loads only when spiced runs with `--allow-insecure-connections`. Start spiced with `--allow-insecure-connections` on every node in `nodes`, and only on a trusted private network: any host that reaches a node's GPU server can use that GPU."
+    ))]
+    InsecureConnectionsNotAllowed { model: String },
 }
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
+
+impl Error {
+    /// Whether the error is a mistake in the model's Spicepod configuration, or in how spiced
+    /// was started, which only a change to either can clear. A refusal from the provider is not
+    /// one: a missing model, a bad key or an exhausted quota can be fixed on the provider's side.
+    #[must_use]
+    pub fn is_configuration_error(&self) -> bool {
+        match self {
+            Self::LocalModelNotFound { .. }
+            | Self::LocalModelConfigNotFound { .. }
+            | Self::LocalTokenizerNotFound { .. }
+            | Self::UnsupportedModelType { .. }
+            | Self::UnsupportedArchitecture { .. }
+            | Self::ModelNotProvided { .. }
+            | Self::UnknownModelSource { .. }
+            | Self::UnsupportedTaskForModel { .. }
+            | Self::EvaluateOnlyModel { .. }
+            | Self::InvalidParamValueError { .. }
+            | Self::MissingParamError { .. }
+            | Self::ModelMissingWeights { .. }
+            | Self::UnsafePickleWeight { .. }
+            | Self::ModelParameterFailed { .. }
+            | Self::ResponsesNotSupported { .. }
+            // Only restarting spiced with `--allow-insecure-connections` clears it.
+            | Self::InsecureConnectionsNotAllowed { .. } => true,
+            Self::FailedToDownloadModel { configuration, .. } => *configuration,
+            // A loader can wrap a configuration error, such as rejected pickle weights.
+            Self::FailedToLoadModel { source } => source
+                .downcast_ref::<Self>()
+                .is_some_and(Self::is_configuration_error),
+            Self::HealthCheckError { .. }
+            | Self::FailedToRunModel { .. }
+            | Self::ModelNotFound { .. }
+            | Self::FailedToLoadTokenizer { .. }
+            | Self::ModelFileMissing { .. }
+            | Self::FailedToAuthenticate { .. }
+            | Self::ToolNotFound { .. } => false,
+        }
+    }
+}
 
 /// The kind of failure a provider's [`ApiError`] reports.
 ///
@@ -186,6 +255,8 @@ pub enum ApiErrorKind {
     Authentication,
     /// The credentials were accepted but may not do what was asked.
     PermissionDenied,
+    /// The requested resource, for example a model or a stored response, does not exist.
+    NotFound,
     /// The provider is throttling requests.
     RateLimited,
     /// The account has no quota left.
@@ -199,11 +270,26 @@ impl ApiErrorKind {
         Self::named(error.code.as_deref()).or_else(|| Self::named(error.r#type.as_deref()))
     }
 
+    /// The error `type` that [`Self::of`] reads back as `self`, for a provider whose own
+    /// errors do not have the `OpenAI` shape.
+    #[must_use]
+    pub fn error_type(self) -> &'static str {
+        match self {
+            Self::InvalidRequest => "invalid_request_error",
+            Self::Authentication => "authentication_error",
+            Self::PermissionDenied => "permission_error",
+            Self::NotFound => "not_found_error",
+            Self::RateLimited => "rate_limit_error",
+            Self::InsufficientQuota => "insufficient_quota",
+        }
+    }
+
     fn named(name: Option<&str>) -> Option<Self> {
         match name? {
             "invalid_request_error" => Some(Self::InvalidRequest),
             "invalid_api_key" | "authentication_error" => Some(Self::Authentication),
             "permission_error" => Some(Self::PermissionDenied),
+            "not_found_error" => Some(Self::NotFound),
             "rate_limit_exceeded" | "rate_limit_error" => Some(Self::RateLimited),
             "insufficient_quota" => Some(Self::InsufficientQuota),
             _ => None,
@@ -528,6 +614,31 @@ pub trait Chat: Sync + Send {
             service_tier: None,
         })
     }
+
+    /// The model's token limits, as far as it reports them: a local model's context size,
+    /// or what a hosted model's provider reports in its model metadata. Each limit is `None`
+    /// when it is not known — never an estimate, since a client sizes its context management
+    /// and its answers by them.
+    ///
+    /// Asked when the model loads and each time `/v1/models` lists it. A hosted model reads
+    /// its provider's model metadata once per endpoint and keeps it, so only the first call
+    /// may wait on the provider.
+    ///
+    /// A type that wraps another `Chat` must forward this to the model it wraps: the default
+    /// answers no limits, which would hide the inner model's.
+    async fn token_limits(&self) -> TokenLimits {
+        TokenLimits::default()
+    }
+}
+
+/// A model's token limits. Each is `None` when the model or its provider does not report it.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct TokenLimits {
+    /// The most tokens one request can hold, prompt and answer together.
+    pub context_window: Option<u64>,
+    /// The most tokens one answer can hold, where the provider or engine enforces such a
+    /// cap. Never derived from the context window.
+    pub max_output_tokens: Option<u64>,
 }
 
 #[cfg(test)]
@@ -539,7 +650,28 @@ mod tests {
         ChatCompletionRequestUserMessageContent, CreateChatCompletionRequest, FunctionCall,
     };
 
-    use super::{Chat, Error, Result, SqlGeneration, message_to_content};
+    use super::{ApiErrorKind, Chat, Error, Result, SqlGeneration, message_to_content};
+    use async_openai::error::ApiError;
+
+    #[test]
+    fn each_error_type_reads_back_as_its_kind() {
+        for kind in [
+            ApiErrorKind::InvalidRequest,
+            ApiErrorKind::Authentication,
+            ApiErrorKind::PermissionDenied,
+            ApiErrorKind::NotFound,
+            ApiErrorKind::RateLimited,
+            ApiErrorKind::InsufficientQuota,
+        ] {
+            let error = ApiError {
+                message: String::new(),
+                r#type: Some(kind.error_type().to_string()),
+                param: None,
+                code: None,
+            };
+            assert_eq!(ApiErrorKind::of(&error), Some(kind));
+        }
+    }
 
     /// A tool-call-only assistant turn, in the shape a client replays one.
     #[expect(deprecated)]

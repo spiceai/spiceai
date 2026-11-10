@@ -40,11 +40,23 @@ release coordination channel. Secondary DRI should positively acknowledge the ha
 
 ## Release Publication Steps
 
-- [ ] Cherry-pick release notes onto the release branch.
-- [ ] Create a **pre-release** [GitHub Release](https://github.com/spiceai/spiceai/releases/new) with a tag (e.g. `v1.0.1`). Leave the body empty so automation can populate it from the checked-in notes.
+For release lines 2.4 and earlier, follow the release steps in that branch's copy of this template instead.
+
+In these steps, `{version}` is the version in `version.txt` on the release branch, without a leading `v` (for example `1.0.1`).
+
+- [ ] Cherry-pick the release notes (`docs/release_notes/v{version}.md`) onto the release branch. Without them, `publish_release` publishes a stable version as a pre-release.
+- [ ] Run [build_release](https://github.com/spiceai/spiceai/actions/workflows/build_release.yml) on the release branch with `release_version` set to `{version}`. Don't create or push the release tag: `publish_release` creates it.
+  - [ ] Wait for the [build_release run](https://github.com/spiceai/spiceai/actions/workflows/build_release.yml) to finish successfully.
+- [ ] Create a [draft GitHub Release](https://github.com/spiceai/spiceai/releases/new) with the new tag `v{version}`, targeting the release branch. Leave the description empty to use the checked-in release notes, or paste the notes. Don't set the pre-release or latest options: `publish_release` sets them when it publishes.
+- [ ] Run [publish_release](https://github.com/spiceai/spiceai/actions/workflows/publish_release.yml) on the release branch with `release_version` set to `{version}`. If commits that don't change the release were merged to the release branch after the build, set `commit` to the full SHA that `build_release` built.
+  - [ ] Have a release approver other than the person who started the run approve the `publish` job. It publishes the release and marks it automatically: an RC as a pre-release, and a stable version as the latest release when it's the highest stable version released.
+  - [ ] Check the [GitHub Release](https://github.com/spiceai/spiceai/releases) has its binaries and is marked as described above. There is nothing to mark by hand.
+  - [ ] Monitor the [publish_release run](https://github.com/spiceai/spiceai/actions/workflows/publish_release.yml) for the Docker image builds. When they finish, approve the two Docker image publish jobs. They push the `{version}` and `{version}-cuda` image tags, and move `latest` and `latest-cuda` automatically when the release is the latest release.
+  - [ ] Check the [Docker Hub](https://hub.docker.com/r/spiceai/spiceai/tags) and [GHCR](https://github.com/spiceai/spiceai/pkgs/container/spiceai) image tags.
+  - If a job fails, re-run the failed jobs of the same run.
 - [ ] Perform a final test pass on the released binaries and Docker images.
 - [ ] Notify that the OSS release is complete and ready for communications in the release coordination channel.
 
 ## Post-Release Housekeeping
 
-- [ ] Update the supported version in `SECURITY.md` if necessary.
+- [ ] Update `SECURITY.md`: the latest open-source release, and the versions Spice.ai Enterprise currently supports (pre-release, latest, previous minor release line, LTS).

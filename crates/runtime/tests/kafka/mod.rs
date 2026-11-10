@@ -139,11 +139,7 @@ async fn kafka_sasl_connect_test() -> anyhow::Result<()> {
             rt.shutdown().await;
             drop(rt);
 
-            // Clean up container after test
-            running_container.remove().await.map_err(|e| {
-                tracing::error!("running_container.remove: {e}");
-                anyhow::Error::msg(e.to_string())
-            })?;
+            running_container.cleanup().await;
 
             Ok(())
         })
@@ -186,6 +182,7 @@ async fn kafka_fetch_latest_message_with_tombstone_test() -> anyhow::Result<()> 
             };
 
             let result = KafkaConsumer::fetch_latest_message::<String, serde_json::Value>(
+                "fetch_latest_tombstone_test",
                 "fetch_latest_tombstone_test",
                 &kafka_config,
                 Duration::from_secs(10),
@@ -260,6 +257,7 @@ async fn kafka_fetch_latest_message_many_tombstones_test() -> anyhow::Result<()>
             };
 
             let result = KafkaConsumer::fetch_latest_message::<String, serde_json::Value>(
+                "fetch_latest_many_tombstones_test",
                 "fetch_latest_many_tombstones_test",
                 &kafka_config,
                 Duration::from_secs(10),
@@ -349,6 +347,7 @@ async fn kafka_fetch_latest_message_multi_partition_test() -> anyhow::Result<()>
             };
 
             let result = KafkaConsumer::fetch_latest_message::<String, serde_json::Value>(
+                "fetch_latest_multi_partition_test",
                 "fetch_latest_multi_partition_test",
                 &kafka_config,
                 Duration::from_secs(10),

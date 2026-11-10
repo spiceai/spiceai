@@ -37,7 +37,9 @@ dashmap = "6.1"
 dataformat-json = { path = "../dataformat-json" }
 datafusion.workspace = true
 datafusion-datasource.workspace = true
+datafusion-datasource-csv.workspace = true
 datafusion-federation = { workspace = true }
+datafusion-substrait.workspace = true
 # `federation` is always on: `crate::federation` needs the `impl SQLExecutor for
 # SqlTable` it gates, and the unparser guards in `src/federation.rs` must run in a
 # plain `cargo test -p data_components` (#13625). It adds no crate, since
@@ -47,18 +49,13 @@ db_connection_pool = { path = "../db_connection_pool" }
 delta_kernel = { workspace = true, optional = true }
 delta_kernel_default_engine = { workspace = true, optional = true }
 document_parse = { path = "../document_parse" }
-duckdb = { workspace = true, features = [
-    "bundled",
-    "r2d2",
-    "vtab",
-    "vtab-arrow",
-    "appender-arrow",
-], optional = true }
+duration-parse = { path = "../duration-parse" }
 flight_client = { path = "../flight_client" }
 futures.workspace = true
 moka.workspace = true
 globset.workspace = true
 hash-index = { path = "../hash-index", features = ["metrics"] }
+http-body-limit = { path = "../http-body-limit" }
 http.workspace = true
 httpdate.workspace = true
 iceberg.workspace = true
@@ -71,17 +68,20 @@ mysql_async = { workspace = true, optional = true }
 # Value-only row-image parsing (mysql_replication::binlog::TableMapRowDecoder):
 # `ParseBuf` is not re-exported by mysql_async; the version matches the
 # mysql_async pin so this adds no extra compilation unit.
-mysql_common = { version = "0.35.5", default-features = false, features = ["binlog"], optional = true }
+mysql_common = { version = "0.37.1", default-features = false, features = ["binlog"], optional = true }
 # Included-column bitmaps in mysql_common's rows-event API are bitvec slices.
 bitvec = { version = "1", optional = true }
 num_cpus = "1.16"
 object_store = { workspace = true }
+object_store_spawn = { path = "../object_store_spawn" }
 opendal.workspace = true
 parking_lot.workspace = true
 rustc-hash = "2"
 oracle = { version = "0.6", optional = true }
 native-tls = { workspace = true, optional = true }
 percent-encoding.workspace = true
+pbjson-types = "0.8.0"
+prost.workspace = true
 pgwire-replication = { workspace = true, optional = true }
 postgres-native-tls = { workspace = true, optional = true }
 postgres-protocol = { workspace = true, optional = true }
@@ -92,7 +92,9 @@ reqwest.workspace = true
 runtime-checkpoint-api = { path = "../runtime-checkpoint-api" }
 runtime-rate-control = { path = "../runtime-rate-control" }
 runtime-udfs-api = { path = "../runtime-udfs-api" }
-runtime-request-context = { path = "../runtime-request-context" }
+runtime-request-context = { path = "../runtime-request-context", features = [
+  "datafusion",
+] }
 rusqlite = { workspace = true, optional = true }
 elasticsearch = { path = "../elasticsearch", optional = true }
 s3_vectors = { path = "../s3_vectors", optional = true }
@@ -117,13 +119,11 @@ tokio-postgres = { workspace = true, features = [
 tokio-util = { workspace = true, optional = true }
 tonic = { workspace = true }
 tracing.workspace = true
-turso = { workspace = true, optional = true }
-turso-shared = { workspace = true, optional = true }
 twox-hash.workspace = true
 url.workspace = true
 util = { path = "../util", features = ["datafusion"] }
 uuid.workspace = true
-zip = "8.3.0"
+zip = "9.1"
 tokio-stream.workspace = true
 
 # Align on 0.21 (already pulled in via iceberg) so the binary carries one
@@ -135,9 +135,6 @@ apache-avro = { version = "0.21", optional = true, default-features = false, fea
     "zstandard",
 ] }
 
-[target.'cfg(windows)'.dependencies]
-rdkafka = { workspace = true, features = ["cmake-build"], optional = true }
-
 [features]
 bench = [] # Feature for benchmarking that exposes internal functions
 adbc = ["dep:adbc_core", "dep:adbc_driver_manager", "datafusion-table-providers/adbc-federation"]
@@ -146,12 +143,6 @@ debezium = ["dep:rdkafka", "dep:apache-avro"]
 default = []
 delta_lake = ["dep:delta_kernel", "dep:delta_kernel_default_engine"]
 elasticsearch = ["dep:elasticsearch"]
-duckdb = [
-    "dep:duckdb",
-    "db_connection_pool/duckdb",
-    "datafusion-table-providers/duckdb",
-    "datafusion-table-providers/duckdb-federation",
-]
 flightsql = []
 kafka = ["dep:rdkafka"]
 mssql = ["dep:tiberius", "dep:tokio-util", "dep:bb8"]
@@ -185,7 +176,6 @@ sqlite = [
     "datafusion-table-providers/sqlite",
     "datafusion-table-providers/sqlite-federation",
 ]
-turso = ["dep:turso", "dep:turso-shared", "datafusion-table-providers/sqlite-federation"]
 
 [dev-dependencies]
 arrow = { workspace = true, features = ["prettyprint"] }

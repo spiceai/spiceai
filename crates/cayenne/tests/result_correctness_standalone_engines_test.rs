@@ -16,7 +16,7 @@
 //!
 //! Proves that **out-of-Spice** DuckDB and SQLite return equivalent results for
 //! the same SQL on identical data. This is the external-oracle baseline used
-//! when comparing Spice accelerators (Cayenne, DuckDB accel, SQLite accel).
+//! when comparing Spice accelerators (Cayenne, SQLite accel).
 //!
 //! Requires `--features result-correctness-duckdb` (DuckDB side). SQLite uses
 //! always-on `rusqlite`.
@@ -66,7 +66,7 @@ fn env_i64(name: &str, default: i64) -> i64 {
 
 fn compare_standalone(
     query: &Query,
-    duck: &duckdb::Connection,
+    duck: &duckdb_oracle::Connection,
     sqlite: &rusqlite::Connection,
 ) -> ParityOutcome {
     let sql = query.sql.as_ref();

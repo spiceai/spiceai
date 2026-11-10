@@ -20,6 +20,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use arrow_tools::schema_evolution::WideningPlan;
+use datafusion::common::TableReference;
 use datafusion::error::{DataFusionError, Result};
 use datafusion::execution::context::SessionContext;
 use tokio::runtime::Handle;
@@ -679,9 +680,113 @@ impl Owner {
             dataset = %burst.dataset(), inputs = burst.len(), bytes = burst.bytes(),
             close_reason = reason, "Applying coalesced Rows append"
         );
+        let burst_dataset = burst.dataset().clone();
         let (batch, options) = burst.finish();
-        self.apply(batch, options, replies.into_iter().collect())
+        let replies = replies.into_iter().collect::<Vec<_>>();
+        // Each member's own batch, kept to retry one at a time if the backend
+        // refuses the coalesced write before changing anything.
+        let members = (replies.len() > 1)
+            .then(|| batch.scoped_members())
+            .flatten()
+            .filter(|members| members.len() == replies.len());
+        let Some(members) = members else {
+            self.apply(batch, options, replies).await;
+            return;
+        };
+        self.apply_members(&burst_dataset, batch, members, options, replies)
             .await;
+    }
+
+    /// Apply a coalesced Rows burst so that one member's refusal refuses only
+    /// that member. When the backend refuses the burst before mutation and names
+    /// the first member that would be refused on its own, the members before it
+    /// are applied together, that member is refused, and the rest coalesce
+    /// again. In arrival order, every member meets exactly the state it would
+    /// have met had the burst never coalesced.
+    async fn apply_members(
+        &mut self,
+        dataset: &TableReference,
+        mut batch: ChangeBatch,
+        mut members: Vec<ChangeBatch>,
+        options: WriteOptions,
+        mut replies: Vec<Reply>,
+    ) {
+        loop {
+            let Err((error, returned)) = self.apply_unless_refused(batch, options, replies).await
+            else {
+                return;
+            };
+            replies = returned;
+            if !super::provider::refusal::is_before_mutation(&error) {
+                self.refuse(error, options, replies);
+                return;
+            }
+            let Some(position) = super::provider::refusal::refused_member(&error)
+                .filter(|&position| position < members.len())
+            else {
+                tracing::debug!(
+                    dataset = %dataset, members = replies.len(), %error,
+                    "Retrying a refused coalesced Rows burst one member at a time"
+                );
+                self.apply_one_by_one(members, options, replies).await;
+                return;
+            };
+            let mut rest_members = members.split_off(position);
+            let mut rest_replies = replies.split_off(position);
+            rest_members.remove(0);
+            let refused = rest_replies.remove(0);
+            if !members.is_empty() {
+                self.apply_together(members, options, replies).await;
+            }
+            self.refuse(error, options, vec![refused]);
+            if let Some(failure) = &self.failure {
+                for reply in rest_replies {
+                    reply.refuse(failure);
+                }
+                return;
+            }
+            if rest_members.is_empty() {
+                return;
+            }
+            let Some(rest) = ChangeBatch::coalesce_members(&rest_members) else {
+                self.apply_one_by_one(rest_members, options, rest_replies)
+                    .await;
+                return;
+            };
+            batch = rest;
+            members = rest_members;
+            replies = rest_replies;
+        }
+    }
+
+    /// Apply members already known to pass in order as one write.
+    async fn apply_together(
+        &mut self,
+        members: Vec<ChangeBatch>,
+        options: WriteOptions,
+        replies: Vec<Reply>,
+    ) {
+        match ChangeBatch::coalesce_members(&members) {
+            Some(batch) => {
+                self.apply(batch, options, replies).await;
+            }
+            None => self.apply_one_by_one(members, options, replies).await,
+        }
+    }
+
+    async fn apply_one_by_one(
+        &mut self,
+        members: Vec<ChangeBatch>,
+        options: WriteOptions,
+        replies: Vec<Reply>,
+    ) {
+        for (member, reply) in members.into_iter().zip(replies) {
+            if let Some(failure) = &self.failure {
+                reply.refuse(failure);
+            } else {
+                self.apply(member, options, vec![reply]).await;
+            }
+        }
     }
 
     async fn apply_cdc(&mut self, input: ApplyCommand) {
@@ -809,8 +914,22 @@ impl Owner {
         &mut self,
         batch: ChangeBatch,
         options: WriteOptions,
-        mut replies: Vec<Reply>,
+        replies: Vec<Reply>,
     ) -> bool {
+        match self.apply_unless_refused(batch, options, replies).await {
+            Ok(applied) => applied,
+            Err((error, replies)) => self.refuse(error, options, replies),
+        }
+    }
+
+    /// Apply one write. A backend error returns the observers unrefused so the
+    /// caller can decide whether the write is retried in parts.
+    async fn apply_unless_refused(
+        &mut self,
+        batch: ChangeBatch,
+        options: WriteOptions,
+        mut replies: Vec<Reply>,
+    ) -> std::result::Result<bool, (DataFusionError, Vec<Reply>)> {
         // Only decoded, preflighted CDC upserts may overlap a previous finalizer.
         let must_settle = self
             .pending
@@ -820,7 +939,7 @@ impl Owner {
             for reply in replies {
                 reply.refuse(&error);
             }
-            return false;
+            return Ok(false);
         }
         match self.backend.apply(batch, options, &self.context).await {
             Ok(write) => {
@@ -831,7 +950,7 @@ impl Owner {
                     for reply in replies {
                         reply.refuse(&error);
                     }
-                    return false;
+                    return Ok(false);
                 }
                 let completions = replies
                     .iter_mut()
@@ -849,22 +968,31 @@ impl Owner {
                         let _ = result.send(Ok(member));
                     }
                 }
-                true
+                Ok(true)
             }
-            Err(error) => {
-                let can_continue = options.recovery == Recovery::Rebuildable
-                    && super::provider::refusal::is_before_mutation(&error);
-                let error = if can_continue {
-                    Arc::new(error)
-                } else {
-                    self.fail(error)
-                };
-                for reply in replies {
-                    reply.refuse(&error);
-                }
-                false
-            }
+            Err(error) => Err((error, replies)),
         }
+    }
+
+    /// Refuse every observer of a failed write. Only a rebuildable write
+    /// refused before mutation leaves the owner accepting work.
+    fn refuse(
+        &mut self,
+        error: DataFusionError,
+        options: WriteOptions,
+        replies: Vec<Reply>,
+    ) -> bool {
+        let can_continue = options.recovery == Recovery::Rebuildable
+            && super::provider::refusal::is_before_mutation(&error);
+        let error = if can_continue {
+            Arc::new(error)
+        } else {
+            self.fail(error)
+        };
+        for reply in replies {
+            reply.refuse(&error);
+        }
+        false
     }
 }
 

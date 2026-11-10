@@ -15,7 +15,7 @@ snafu.workspace = true
 serde.workspace = true
 yaml = { path = "../yaml" }
 spicepod = { path = "../spicepod" }
-zip = "7.2.0"
+zip = "9.1"
 bytes.workspace = true
 futures.workspace = true
 

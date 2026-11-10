@@ -24,10 +24,17 @@ limitations under the License.
 //! under plain `cargo test` that call fails the test before it changes anything
 //! its neighbours would see.
 
+#![expect(
+    clippy::expect_used,
+    reason = "set-up and helpers outside `#[test]` functions fail fast with `expect`"
+)]
+
 mod build_logging;
 mod cloud_connect_bootstrap;
 mod cpu_budget;
 mod dependency_logging;
+#[cfg(unix)]
+mod open_file_limit;
 mod otel_logs;
 
 /// Fails the calling test unless it runs in a process of its own.

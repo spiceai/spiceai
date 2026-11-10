@@ -34,20 +34,26 @@ limitations under the License.
 //!
 //! ## Accelerator Support
 //!
-//! All accelerators (`DuckDB`, Cayenne, Arrow/MemTable) support caching mode with
+//! All accelerators (`Cayenne`, Cayenne, Arrow/MemTable) support caching mode with
 //! the same behavior - data is cached per unique filter combination.
 //!
 //! ## Tests
 //!
 //! - `test_caching_mode_filter_propagation`: Basic cache miss and hit workflow
 //! - `test_caching_mode_multi_filter_limitation`: Verifies overwrite behavior (for Arrow)
-//! - `test_caching_mode_multi_filter_ideal`: Multi-filter caching with `DuckDB`
+//! - `test_caching_mode_multi_filter_ideal`: Multi-filter caching with `Cayenne`
 //! - `test_caching_mode_multi_filter_cayenne`: Multi-filter caching with Cayenne (SQLite+Vortex)
 //! - `test_caching_mode_background_refresh_on_miss`: Background refresh triggered on cache miss
 //! - `test_caching_mode_background_refresh_on_stale`: Background refresh triggered when data becomes stale (TTL expiration)
 
 use app::AppBuilder;
 use arrow::array::{Array, StringArray, TimestampNanosecondArray, UInt16Array};
+use axum::{
+    Router,
+    extract::Query,
+    http::{StatusCode, header},
+    routing::get,
+};
 use datafusion::prelude::*;
 use runtime::Runtime;
 use spicepod::{
@@ -55,12 +61,88 @@ use spicepod::{
     component::dataset::Dataset,
     param::Params,
 };
-use std::sync::Arc;
+use std::{collections::HashMap, sync::Arc};
+use tokio::{net::TcpListener, sync::oneshot};
 
 use crate::{
     configure_test_datafusion, init_tracing,
     utils::{register_test_connectors, runtime_ready_check, test_request_context},
 };
+
+/// A search term the local origin answers with an empty result list.
+const NO_MATCH_QUERY_TERM: &str = "xyznonexistent123456";
+
+/// A local stand-in for the `TVmaze` people-search API (`/search/people?q=...`)
+/// these tests were written against, so they exercise caching without reaching
+/// a public service whose outages failed every test in this file at once.
+///
+/// It answers a search for `NO_MATCH_QUERY_TERM` with `[]`, every other search
+/// with one match named after the query, the root path (fetched by a query that
+/// filters on `request_query` alone) with an HTML page as `TVmaze` does, and any
+/// other path with the 404 body `TVmaze` sends. The server stops when the
+/// returned value is dropped.
+struct PeopleSearchOrigin {
+    url: String,
+    _shutdown: oneshot::Sender<()>,
+}
+
+async fn start_people_search_origin() -> PeopleSearchOrigin {
+    let app = Router::new()
+        .route(
+            "/",
+            get(|| async {
+                (
+                    [(header::CONTENT_TYPE, "text/html; charset=UTF-8")],
+                    "<!DOCTYPE html><html><head><title>TVmaze</title></head><body></body></html>",
+                )
+            }),
+        )
+        .route(
+            "/search/people",
+            get(|Query(params): Query<HashMap<String, String>>| async move {
+                let term = params.get("q").cloned().unwrap_or_default();
+                let body = if term == NO_MATCH_QUERY_TERM {
+                    serde_json::json!([])
+                } else {
+                    serde_json::json!([{
+                        "score": 0.9,
+                        "person": { "id": 1, "name": term },
+                    }])
+                };
+                (
+                    [(header::CONTENT_TYPE, "application/json")],
+                    body.to_string(),
+                )
+            }),
+        )
+        .fallback(|| async {
+            (
+                StatusCode::NOT_FOUND,
+                [(header::CONTENT_TYPE, "application/json")],
+                r#"{"name":"Not Found","message":"Page not found.","code":0,"status":404}"#,
+            )
+        });
+
+    let listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind people-search origin listener");
+    let addr = listener
+        .local_addr()
+        .expect("people-search origin local_addr");
+    let (shutdown, rx) = oneshot::channel::<()>();
+    tokio::spawn(async move {
+        axum::serve(listener, app)
+            .with_graceful_shutdown(async {
+                rx.await.ok();
+            })
+            .await
+            .unwrap_or_default();
+    });
+    PeopleSearchOrigin {
+        url: format!("http://{addr}"),
+        _shutdown: shutdown,
+    }
+}
 
 /// Test that caching mode properly propagates filters to the HTTP connector on cache miss.
 /// This verifies that when a query with filters hits an empty cache, the filters are
@@ -77,7 +159,8 @@ async fn test_caching_mode_filter_propagation() -> Result<(), anyhow::Error> {
     test_request_context()
         .scope(async {
             // Create HTTP dataset with caching mode
-            let mut dataset = Dataset::new("https://api.tvmaze.com", "tvmaze");
+            let origin = start_people_search_origin().await;
+            let mut dataset = Dataset::new(&origin.url, "tvmaze");
             dataset.params = Some(Params::from_string_map(
                 vec![
                     (
@@ -198,7 +281,7 @@ async fn test_caching_mode_filter_propagation() -> Result<(), anyhow::Error> {
 /// due to the `ColumnReference` sorting limitation in datafusion-table-providers.
 /// This is expected and acceptable since Arrow is primarily for testing.
 ///
-/// For production use with `DuckDB` or Cayenne accelerators, multi-filter caching
+/// For production use with `Cayenne` or Cayenne accelerators, multi-filter caching
 /// works correctly with upsert behavior.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_caching_mode_multi_filter_limitation() -> Result<(), anyhow::Error> {
@@ -209,7 +292,8 @@ async fn test_caching_mode_multi_filter_limitation() -> Result<(), anyhow::Error
     test_request_context()
         .scope(async {
             // Create HTTP dataset with caching mode
-            let mut dataset = Dataset::new("https://api.tvmaze.com", "tvmaze");
+            let origin = start_people_search_origin().await;
+            let mut dataset = Dataset::new(&origin.url, "tvmaze");
             dataset.params = Some(Params::from_string_map(
                 vec![
                     (
@@ -404,7 +488,7 @@ async fn test_caching_mode_multi_filter_limitation() -> Result<(), anyhow::Error
         .await
 }
 
-/// Test verifying ideal multi-filter caching behavior with `DuckDB`.
+/// Test verifying ideal multi-filter caching behavior with `Cayenne`.
 ///
 /// This test verifies that multiple filter combinations can be cached simultaneously:
 /// 1. Query with filter A → cache miss → fetch → cache stores A
@@ -412,7 +496,7 @@ async fn test_caching_mode_multi_filter_limitation() -> Result<(), anyhow::Error
 /// 3. Query with filter A → cache hit → served from cache (no HTTP fetch)
 /// 4. Query with filter B → cache hit → served from cache (no HTTP fetch)
 ///
-/// Uses `DuckDB` accelerator which supports upsert-based multi-filter caching.
+/// Uses `Cayenne` accelerator which supports upsert-based multi-filter caching.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_caching_mode_multi_filter_ideal() -> Result<(), anyhow::Error> {
     let _tracing = init_tracing(Some(
@@ -423,7 +507,8 @@ async fn test_caching_mode_multi_filter_ideal() -> Result<(), anyhow::Error> {
     test_request_context()
         .scope(async {
             // Create HTTP dataset with caching mode
-            let mut dataset = Dataset::new("https://api.tvmaze.com", "tvmaze");
+            let origin = start_people_search_origin().await;
+            let mut dataset = Dataset::new(&origin.url, "tvmaze");
             dataset.params = Some(Params::from_string_map(
                 vec![
                     (
@@ -437,7 +522,7 @@ async fn test_caching_mode_multi_filter_ideal() -> Result<(), anyhow::Error> {
             ));
             dataset.acceleration = Some(Acceleration {
                 enabled: true,
-                engine: Some("duckdb".to_string()),
+                engine: Some("cayenne".to_string()),
                 mode: Mode::File,
                 refresh_mode: Some(RefreshMode::Caching),
                 refresh_check_interval: Some("30s".to_string()),
@@ -628,7 +713,7 @@ async fn test_caching_mode_multi_filter_ideal() -> Result<(), anyhow::Error> {
 ///
 /// Uses Cayenne accelerator which supports upsert-based multi-filter caching.
 ///
-/// NOTE: Currently SQLite/Cayenne caching mode has similar issues to `DuckDB` - queries return empty results.
+/// NOTE: Currently SQLite/Cayenne caching mode has similar issues to `Cayenne` - queries return empty results.
 /// Investigation needed. Test runs when sqlite feature is enabled but is currently failing.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[cfg(feature = "sqlite")]
@@ -641,7 +726,8 @@ async fn test_caching_mode_multi_filter_cayenne() -> Result<(), anyhow::Error> {
     test_request_context()
         .scope(async {
             // Create HTTP dataset with caching mode using Cayenne
-            let mut dataset = Dataset::new("https://api.tvmaze.com", "tvmaze");
+            let origin = start_people_search_origin().await;
+            let mut dataset = Dataset::new(&origin.url, "tvmaze");
             dataset.params = Some(Params::from_string_map(
                 vec![
                     (
@@ -794,7 +880,8 @@ async fn test_caching_mode_with_sql_results_cache() -> Result<(), anyhow::Error>
 
     test_request_context()
         .scope(async {
-            let mut dataset = Dataset::new("https://api.tvmaze.com", "tvmaze");
+            let origin = start_people_search_origin().await;
+            let mut dataset = Dataset::new(&origin.url, "tvmaze");
             dataset.params = Some(Params::from_string_map(
                 vec![
                     (
@@ -867,7 +954,8 @@ async fn test_caching_mode_no_filters() -> Result<(), anyhow::Error> {
 
     test_request_context()
         .scope(async {
-            let mut dataset = Dataset::new("https://api.tvmaze.com", "tvmaze");
+            let origin = start_people_search_origin().await;
+            let mut dataset = Dataset::new(&origin.url, "tvmaze");
             dataset.params = Some(Params::from_string_map(
                 vec![(
                     "allowed_request_paths".to_string(),
@@ -984,7 +1072,8 @@ async fn test_caching_mode_duplicate_queries() -> Result<(), anyhow::Error> {
 
     test_request_context()
         .scope(async {
-            let mut dataset = Dataset::new("https://api.tvmaze.com", "tvmaze");
+            let origin = start_people_search_origin().await;
+            let mut dataset = Dataset::new(&origin.url, "tvmaze");
             dataset.params = Some(Params::from_string_map(
                 vec![
                     (
@@ -1060,7 +1149,8 @@ async fn test_caching_mode_different_projections() -> Result<(), anyhow::Error> 
 
     test_request_context()
         .scope(async {
-            let mut dataset = Dataset::new("https://api.tvmaze.com", "tvmaze");
+            let origin = start_people_search_origin().await;
+            let mut dataset = Dataset::new(&origin.url, "tvmaze");
             dataset.params = Some(Params::from_string_map(
                 vec![
                     (
@@ -1200,7 +1290,8 @@ async fn test_caching_mode_sql_cache_interaction() -> Result<(), anyhow::Error> 
 
     test_request_context()
         .scope(async {
-            let mut dataset = Dataset::new("https://api.tvmaze.com", "tvmaze");
+            let origin = start_people_search_origin().await;
+            let mut dataset = Dataset::new(&origin.url, "tvmaze");
             dataset.params = Some(Params::from_string_map(
                 vec![
                     (
@@ -1274,7 +1365,8 @@ async fn test_caching_mode_empty_results() -> Result<(), anyhow::Error> {
 
     test_request_context()
         .scope(async {
-            let mut dataset = Dataset::new("https://api.tvmaze.com", "tvmaze");
+            let origin = start_people_search_origin().await;
+            let mut dataset = Dataset::new(&origin.url, "tvmaze");
             dataset.params = Some(Params::from_string_map(
                 vec![
                     (
@@ -1325,7 +1417,7 @@ async fn test_caching_mode_empty_results() -> Result<(), anyhow::Error> {
                 .table("tvmaze")
                 .await?
                 .filter(col("request_path").eq(lit("/search/people")))?
-                .filter(col("request_query").eq(lit("q=xyznonexistent123456")))?
+                .filter(col("request_query").eq(lit(format!("q={NO_MATCH_QUERY_TERM}"))))?
                 .limit(0, Some(1))?;
 
             // HTTP connector may return error for empty results, which is acceptable
@@ -1363,7 +1455,8 @@ async fn test_caching_mode_background_refresh_on_miss() -> Result<(), anyhow::Er
 
     test_request_context()
         .scope(async {
-            let mut dataset = Dataset::new("https://api.tvmaze.com", "tvmaze");
+            let origin = start_people_search_origin().await;
+            let mut dataset = Dataset::new(&origin.url, "tvmaze");
             dataset.params = Some(Params::from_string_map(
                 vec![
                     (
@@ -1514,7 +1607,8 @@ async fn test_caching_mode_background_refresh_on_stale() -> Result<(), anyhow::E
 
     test_request_context()
         .scope(async {
-            let mut dataset = Dataset::new("https://api.tvmaze.com", "tvmaze");
+            let origin = start_people_search_origin().await;
+            let mut dataset = Dataset::new(&origin.url, "tvmaze");
             dataset.params = Some(Params::from_string_map(
                 vec![
                     (
@@ -1706,7 +1800,8 @@ async fn test_caching_mode_interval_refresh_with_retention() -> Result<(), anyho
     test_request_context()
         .scope(async {
             // Create HTTP dataset with caching mode, short TTL, short refresh interval, and retention
-            let mut dataset = Dataset::new("https://api.tvmaze.com", "tvmaze");
+            let origin = start_people_search_origin().await;
+            let mut dataset = Dataset::new(&origin.url, "tvmaze");
             dataset.params = Some(Params::from_string_map(
                 vec![
                     (
@@ -1855,7 +1950,6 @@ async fn test_caching_mode_interval_refresh_with_retention() -> Result<(), anyho
 /// 1. Parent HTTP dataset fetches from source and stores in parent accelerator
 /// 2. Localpod child accelerator automatically receives the same data
 /// 3. Queries to localpod are served from the in-memory child accelerator
-#[cfg(feature = "duckdb")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_localpod_caching_synchronization() -> Result<(), anyhow::Error> {
     let _tracing = init_tracing(Some(
@@ -1864,8 +1958,9 @@ async fn test_localpod_caching_synchronization() -> Result<(), anyhow::Error> {
 
     test_request_context()
         .scope(async {
-            // Create parent HTTP dataset with file-mode DuckDB caching
-            let mut parent_dataset = Dataset::new("https://api.tvmaze.com", "tvmaze_file");
+            // Create parent HTTP dataset with file-mode Cayenne caching
+            let origin = start_people_search_origin().await;
+            let mut parent_dataset = Dataset::new(&origin.url, "tvmaze_file");
             parent_dataset.params = Some(Params::from_string_map(
                 vec![
                     (
@@ -1879,18 +1974,18 @@ async fn test_localpod_caching_synchronization() -> Result<(), anyhow::Error> {
             ));
             parent_dataset.acceleration = Some(Acceleration {
                 enabled: true,
-                engine: Some("duckdb".to_string()),
+                engine: Some("cayenne".to_string()),
                 mode: Mode::Memory, // Using memory mode for test simplicity
                 refresh_mode: Some(RefreshMode::Caching),
                 refresh_check_interval: Some("30s".to_string()),
                 ..Acceleration::default()
             });
 
-            // Create localpod dataset pointing to the parent, with in-memory DuckDB caching
+            // Create localpod dataset pointing to the parent, with in-memory Cayenne caching
             let mut localpod_dataset = Dataset::new("localpod:tvmaze_file", "tvmaze");
             localpod_dataset.acceleration = Some(Acceleration {
                 enabled: true,
-                engine: Some("duckdb".to_string()),
+                engine: Some("cayenne".to_string()),
                 mode: Mode::Memory,
                 refresh_mode: Some(RefreshMode::Caching),
                 refresh_check_interval: Some("30s".to_string()),
@@ -2001,7 +2096,6 @@ async fn test_localpod_caching_synchronization() -> Result<(), anyhow::Error> {
 ///
 /// This test verifies the `initialize_child_from_parent` functionality that copies existing
 /// parent data to the child accelerator during registration.
-#[cfg(feature = "duckdb")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_localpod_caching_initialization_from_existing_parent_data()
 -> Result<(), anyhow::Error> {
@@ -2014,8 +2108,9 @@ async fn test_localpod_caching_initialization_from_existing_parent_data()
             // PHASE 1: Set up parent dataset and populate it with data
             eprintln!("PHASE 1: Setting up parent dataset and populating with data...");
 
-            // Create parent HTTP dataset with DuckDB caching (memory mode for test)
-            let mut parent_dataset = Dataset::new("https://api.tvmaze.com", "tvmaze_parent");
+            // Create parent HTTP dataset with Cayenne caching (memory mode for test)
+            let origin = start_people_search_origin().await;
+            let mut parent_dataset = Dataset::new(&origin.url, "tvmaze_parent");
             parent_dataset.params = Some(Params::from_string_map(
                 vec![
                     (
@@ -2029,7 +2124,7 @@ async fn test_localpod_caching_initialization_from_existing_parent_data()
             ));
             parent_dataset.acceleration = Some(Acceleration {
                 enabled: true,
-                engine: Some("duckdb".to_string()),
+                engine: Some("cayenne".to_string()),
                 mode: Mode::Memory,
                 refresh_mode: Some(RefreshMode::Caching),
                 refresh_check_interval: Some("30s".to_string()),
@@ -2110,7 +2205,7 @@ async fn test_localpod_caching_initialization_from_existing_parent_data()
             let mut localpod_dataset = Dataset::new("localpod:tvmaze_parent", "tvmaze_child");
             localpod_dataset.acceleration = Some(Acceleration {
                 enabled: true,
-                engine: Some("duckdb".to_string()),
+                engine: Some("cayenne".to_string()),
                 mode: Mode::Memory,
                 refresh_mode: Some(RefreshMode::Caching),
                 refresh_check_interval: Some("30s".to_string()),
@@ -2229,7 +2324,8 @@ async fn test_caching_mode_query_specific_columns() -> Result<(), anyhow::Error>
     test_request_context()
         .scope(async {
             // Create HTTP dataset with caching mode
-            let mut dataset = Dataset::new("https://api.tvmaze.com", "tvmaze");
+            let origin = start_people_search_origin().await;
+            let mut dataset = Dataset::new(&origin.url, "tvmaze");
             dataset.params = Some(Params::from_string_map(
                 vec![
                     (
@@ -2359,7 +2455,8 @@ async fn test_caching_mode_query_param_order() -> Result<(), anyhow::Error> {
     test_request_context()
         .scope(async {
             // Create HTTP dataset with caching mode
-            let mut dataset = Dataset::new("https://api.tvmaze.com", "tvmaze");
+            let origin = start_people_search_origin().await;
+            let mut dataset = Dataset::new(&origin.url, "tvmaze");
             dataset.params = Some(Params::from_string_map(
                 vec![
                     (
@@ -2454,7 +2551,8 @@ async fn test_caching_mode_http_404_responses_cached() -> Result<(), anyhow::Err
     test_request_context()
         .scope(async {
             // Create HTTP dataset with caching mode
-            let mut dataset = Dataset::new("https://api.tvmaze.com", "tvmaze");
+            let origin = start_people_search_origin().await;
+            let mut dataset = Dataset::new(&origin.url, "tvmaze");
             dataset.params = Some(Params::from_string_map(
                 vec![
                     (

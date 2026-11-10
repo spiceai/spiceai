@@ -42,7 +42,6 @@ use runtime_search::full_text_udtf::TextSearchTableFunc;
 use runtime_search::rerank::{RERANK_UDTF_NAME, RerankModelStores, RerankTableFunc};
 use runtime_search::rrf;
 use runtime_search::rrf::RRF_UDF_NAME;
-use runtime_search::search_engine::parse_explicit_primary_keys;
 use runtime_search::udtf::{TEXT_SEARCH_UDTF_NAME, VECTOR_SEARCH_UDTF_NAME};
 use runtime_secrets::{ExposeSecret, get_params_with_secrets};
 #[cfg(not(feature = "models"))]
@@ -89,7 +88,8 @@ pub async fn register_udfs(runtime: &crate::Runtime) {
         Arc::new(ExecutorTableFunc::new(Arc::downgrade(&runtime.df))),
     );
 
-    let explicit_pks = parse_explicit_primary_keys(runtime.app()).await;
+    let explicit_pks = runtime.search_primary_keys.clone();
+    explicit_pks.update(runtime.app()).await;
     ctx.register_udf(
         VectorSearchTableFunc::new(Arc::downgrade(&runtime.df), explicit_pks.clone()).into(),
     );
@@ -176,6 +176,12 @@ pub async fn register_udfs(runtime: &crate::Runtime) {
     )
     .register(ctx);
 
+    // Places the remaining async calls (`ai`, async user functions). Runs after the
+    // decision rule, which places decision calls itself.
+    ctx.add_optimizer_rule(Arc::new(
+        runtime_datafusion_udfs::async_placement::AsyncCallPlacement,
+    ));
+
     in_tracing_context_async(register_user_functions(runtime, ctx)).await;
 }
 
@@ -211,7 +217,8 @@ async fn register_user_functions(runtime: &crate::Runtime, ctx: &SessionContext)
 
     warn_beta_once();
 
-    let enabled_functions = enabled_function_declarations(&app.functions);
+    let enabled_functions =
+        refuse_sidecar_code_functions(runtime, enabled_function_declarations(&app.functions));
     if enabled_functions.is_empty() {
         return;
     }
@@ -360,13 +367,51 @@ pub fn registered_table_udf_name(ctx: &SessionContext, name: &str) -> Option<Str
         .cloned()
 }
 
-fn function_executes_code(decl: &Function) -> bool {
-    let scheme = decl
-        .from
+/// The `from` scheme of a function declaration, lowercased: `sql`, `http`, `wasm`, ...
+fn function_scheme(decl: &Function) -> String {
+    decl.from
         .split_once(':')
         .map_or(decl.from.as_str(), |(scheme, _)| scheme)
-        .to_ascii_lowercase();
-    matches!(scheme.as_str(), "http" | "https")
+        .to_ascii_lowercase()
+}
+
+fn function_executes_code(decl: &Function) -> bool {
+    matches!(function_scheme(decl).as_str(), "http" | "https")
+}
+
+/// Whether a sidecar refuses this declaration. HTTP and WebAssembly functions
+/// run code or make requests from inside the sidecar, which guards its
+/// application's access to the cluster. SQL functions are queries over the
+/// sidecar's own catalog and are kept.
+fn sidecar_refuses_function(decl: &Function) -> bool {
+    matches!(function_scheme(decl).as_str(), "http" | "https" | "wasm")
+}
+
+/// The error logged for each function a sidecar refuses to register.
+fn sidecar_refused_function_message(name: &str) -> String {
+    format!(
+        "Function '{name}' was not registered, so queries that call it fail: a sidecar does not run \
+         HTTP or WebAssembly functions. Remove it from the sidecar's Spicepod, or start Spice \
+         without `--role sidecar`."
+    )
+}
+
+/// On a sidecar, drops the declarations [`sidecar_refuses_function`] refuses,
+/// logging each; on any other role, returns `functions` unchanged.
+fn refuse_sidecar_code_functions(
+    runtime: &crate::Runtime,
+    mut functions: Vec<Function>,
+) -> Vec<Function> {
+    if runtime.role() == crate::config::Role::Sidecar {
+        functions.retain(|decl| {
+            let refused = sidecar_refuses_function(decl);
+            if refused {
+                tracing::error!("{}", sidecar_refused_function_message(&decl.name));
+            }
+            !refused
+        });
+    }
+    functions
 }
 
 fn enabled_function_declarations(functions: &[Function]) -> Vec<Function> {
@@ -441,10 +486,7 @@ pub async fn apply_function_diff(
     new_app: &Arc<app::App>,
 ) {
     if apply_function_diff_inner(runtime, current_app, new_app).await {
-        runtime.df.clear_cached_plans().await;
-        if let Some(results) = runtime.df.results_cache_provider() {
-            results.invalidate_all().await;
-        }
+        runtime.df.clear_cached_plans_and_results().await;
     }
 }
 
@@ -528,6 +570,7 @@ async fn apply_function_diff_inner(
         })
         .cloned()
         .collect::<Vec<_>>();
+    let functions_to_register = refuse_sidecar_code_functions(runtime, functions_to_register);
     let functions_to_register =
         resolve_function_params(runtime.secrets(), &functions_to_register).await;
     let (built, errors) =
@@ -753,6 +796,11 @@ mod deny_list_registration_tests {
             runtime_decide::AI_CLASSIFY_NAME,
             runtime_decide::AI_SCORE_NAME,
             runtime_decide::AI_DECIDE_NAME,
+            runtime_datafusion::checked_arithmetic::CHECKED_ADD_UDF_NAME,
+            runtime_datafusion::checked_arithmetic::CHECKED_SUB_UDF_NAME,
+            runtime_datafusion::checked_arithmetic::CHECKED_MUL_UDF_NAME,
+            runtime_datafusion::checked_arithmetic::CHECKED_SUM_PLUS_COUNT_UDF_NAME,
+            runtime_datafusion::checked_arithmetic::CHECKED_SUM_WIDEN_UDF_NAME,
         ]
         .iter()
         .map(ToString::to_string)
@@ -878,6 +926,31 @@ mod tests {
             metrics: None,
             as_tool: true,
         }
+    }
+
+    /// A sidecar refuses the function schemes that run code or make requests,
+    /// and keeps SQL functions. The message names the function and the fix.
+    #[test]
+    fn sidecar_refuses_http_and_wasm_functions() {
+        for (from, refused) in [
+            ("sql", false),
+            ("SQL", false),
+            ("http://functions.internal/score", true),
+            ("https://functions.internal/score", true),
+            ("HTTPS://functions.internal/score", true),
+            ("wasm", true),
+            ("wasm:module", true),
+        ] {
+            let mut decl = test_user_function("f", true);
+            decl.from = from.to_string();
+            assert_eq!(sidecar_refuses_function(&decl), refused, "{from}");
+        }
+        assert_eq!(
+            sidecar_refused_function_message("score"),
+            "Function 'score' was not registered, so queries that call it fail: a sidecar does not \
+             run HTTP or WebAssembly functions. Remove it from the sidecar's Spicepod, or start \
+             Spice without `--role sidecar`."
+        );
     }
 
     #[test]
@@ -1028,6 +1101,23 @@ mod tests {
     /// The no-arg probe, for a name answered by name alone.
     fn make_named_expr(name: &str) -> Expr {
         make_named_call(name, vec![])
+    }
+
+    #[test]
+    fn deny_list_blocks_checked_integer_helpers() {
+        let support = deny_spice_specific_functions();
+        for name in [
+            runtime_datafusion::checked_arithmetic::CHECKED_ADD_UDF_NAME,
+            runtime_datafusion::checked_arithmetic::CHECKED_SUB_UDF_NAME,
+            runtime_datafusion::checked_arithmetic::CHECKED_MUL_UDF_NAME,
+            runtime_datafusion::checked_arithmetic::CHECKED_SUM_PLUS_COUNT_UDF_NAME,
+            runtime_datafusion::checked_arithmetic::CHECKED_SUM_WIDEN_UDF_NAME,
+        ] {
+            assert!(
+                !support.supports(&make_named_expr(name), None),
+                "{name} must stay local; remotes do not implement the checked kernels"
+            );
+        }
     }
 
     #[test]
@@ -1484,7 +1574,7 @@ body: \"{body}\"
         // Any hasher works — the key only has to be the same on every lookup.
         let key = cache::key::CacheKey::Query(sql, None)
             .as_raw_key(Box::new(std::hash::DefaultHasher::new()));
-        df.get_or_create_logical_plan(&df.ctx.state(), Some(&key), sql)
+        df.get_or_create_logical_plan(&df.ctx.state(), Some(&key), sql, None)
             .await
             .expect("the query over myscale should plan");
         plans.checkpoint().await;
@@ -1514,7 +1604,7 @@ body: \"{body}\"
         let (runtime, df, plans, key) = runtime_with_cached_plan(&doubling, SQL).await;
 
         let cached = df
-            .get_or_create_logical_plan(&df.ctx.state(), Some(&key), SQL)
+            .get_or_create_logical_plan(&df.ctx.state(), Some(&key), SQL, None)
             .await
             .expect("the cached plan should come back");
         assert_eq!(
@@ -1536,7 +1626,7 @@ body: \"{body}\"
         );
 
         let replanned = df
-            .get_or_create_logical_plan(&df.ctx.state(), Some(&key), SQL)
+            .get_or_create_logical_plan(&df.ctx.state(), Some(&key), SQL, None)
             .await
             .expect("the same SQL should re-plan after the reload");
         assert_eq!(
@@ -1576,7 +1666,7 @@ body: \"{body}\"
         // outcome: the user removed the function. The point is that the query
         // no longer silently answers from the copy the cached plan held.
         let err = df
-            .get_or_create_logical_plan(&df.ctx.state(), Some(&key), SQL)
+            .get_or_create_logical_plan(&df.ctx.state(), Some(&key), SQL, None)
             .await
             .expect_err("the removed function must not resolve after the reload");
         assert!(

@@ -54,14 +54,15 @@ pub(super) struct MemberLayout {
     pub(super) column_map: Vec<usize>,
     /// Source row-image indexes of the declared primary keys.
     pub(super) pk_source_indexes: Vec<usize>,
+    /// The schema the rows decode into and its derived change-batch schemas
+    /// (see [`ChangeBatchSchemas`]). It starts as the dataset's schema and is
+    /// swapped with the layout when an ALTER widens a column's source type.
+    pub(super) change_schemas: Arc<ChangeBatchSchemas>,
 }
 
 /// Deferred [`ChangeRows`] for one member's rows within one committed source
 /// transaction. Carries owned wire payloads; the decode runs in [`Self::build`].
 pub(crate) struct MysqlChangeRows {
-    /// The member's dataset schema and its derived change-batch schemas (see
-    /// [`ChangeBatchSchemas`]).
-    change_schemas: Arc<ChangeBatchSchemas>,
     primary_keys: Vec<String>,
     /// Decode-time layout snapshot (see [`MemberLayout`]).
     layout: Arc<MemberLayout>,
@@ -83,7 +84,6 @@ pub(crate) struct MysqlChangeRows {
 
 impl MysqlChangeRows {
     pub(super) fn new(
-        change_schemas: Arc<ChangeBatchSchemas>,
         primary_keys: Vec<String>,
         layout: Arc<MemberLayout>,
         tme: Arc<TableMapEvent<'static>>,
@@ -94,7 +94,7 @@ impl MysqlChangeRows {
         // Both metadata figures are computed WITHOUT decoding, from the buffered
         // wire size (`rows_data()` is a byte-slice accessor, no row parse).
         let wire_bytes: usize = events.iter().map(|e| e.rows_data().len()).sum();
-        let per_row_fixed = change_schemas.per_row_fixed();
+        let per_row_fixed = layout.change_schemas.per_row_fixed();
         // Row count can't be known without decoding a MySQL rows event, so this
         // is an estimate: wire bytes over a per-row floor, never below one row
         // per event. Over/under-estimating only affects builder pre-allocation;
@@ -105,7 +105,6 @@ impl MysqlChangeRows {
         // allocation), matching `PgChangeRows`.
         let byte_len = wire_bytes.max(row_hint.saturating_mul(per_row_fixed));
         Self {
-            change_schemas,
             primary_keys,
             layout,
             tme,
@@ -180,7 +179,7 @@ impl ChangeRows for MysqlChangeRows {
             })?;
         }
         build_change_batch_with(
-            &self.change_schemas,
+            &self.layout.change_schemas,
             &self.primary_keys,
             &self.layout.column_map,
             &buffer.changes,

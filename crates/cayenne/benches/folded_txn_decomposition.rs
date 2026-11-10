@@ -59,7 +59,6 @@
 //! `cargo bench --bench folded_txn_decomposition -p cayenne`.
 
 #![expect(clippy::expect_used)]
-#![expect(clippy::too_many_lines)]
 
 use std::fmt::Write as _;
 use std::hint::black_box;

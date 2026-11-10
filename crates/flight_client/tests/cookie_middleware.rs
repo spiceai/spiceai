@@ -81,6 +81,8 @@ impl TestServer {
 struct CookieFlightService {
     cookie_required: Arc<AtomicBool>,
     cookie_seen: Arc<AtomicBool>,
+    authorization_seen: Arc<parking_lot::Mutex<Vec<String>>>,
+    do_get_reply: Vec<arrow_flight::FlightData>,
 }
 
 impl CookieFlightService {
@@ -88,6 +90,8 @@ impl CookieFlightService {
         Self {
             cookie_required: Arc::new(AtomicBool::new(false)),
             cookie_seen,
+            authorization_seen: Arc::default(),
+            do_get_reply: Vec::new(),
         }
     }
 }
@@ -98,7 +102,8 @@ type EmptyResponseStream<T> = EmptyStream<Result<T, Status>>;
 impl FlightService for CookieFlightService {
     type HandshakeStream = EmptyResponseStream<arrow_flight::HandshakeResponse>;
     type ListFlightsStream = EmptyResponseStream<FlightInfo>;
-    type DoGetStream = EmptyResponseStream<arrow_flight::FlightData>;
+    type DoGetStream =
+        tokio_stream::Iter<std::vec::IntoIter<Result<arrow_flight::FlightData, Status>>>;
     type DoPutStream = EmptyResponseStream<arrow_flight::PutResult>;
     type DoExchangeStream = EmptyResponseStream<arrow_flight::FlightData>;
     type DoActionStream = EmptyResponseStream<arrow_flight::Result>;
@@ -176,9 +181,23 @@ impl FlightService for CookieFlightService {
 
     async fn do_get(
         &self,
-        _request: Request<Ticket>,
+        request: Request<Ticket>,
     ) -> Result<Response<Self::DoGetStream>, Status> {
-        Ok(Response::new(tokio_stream::empty()))
+        if let Some(value) = request.metadata().get("authorization") {
+            self.authorization_seen.lock().push(
+                value
+                    .to_str()
+                    .map_err(|_| Status::invalid_argument("invalid authorization"))?
+                    .to_owned(),
+            );
+        }
+        Ok(Response::new(tokio_stream::iter(
+            self.do_get_reply
+                .iter()
+                .cloned()
+                .map(Ok)
+                .collect::<Vec<_>>(),
+        )))
     }
 
     async fn do_put(
@@ -288,4 +307,128 @@ async fn username_password_without_handshake_token_returns_unauthorized() {
     );
 
     server.shutdown().await;
+}
+
+#[tokio::test]
+async fn federation_context_preserves_repeated_authorization_order()
+-> Result<(), Box<dyn std::error::Error>> {
+    let service = CookieFlightService::new(Arc::new(AtomicBool::new(false)));
+    let observed = Arc::clone(&service.authorization_seen);
+    let server = TestServer::start(service).await;
+    let endpoint: Arc<str> = format!("http://{}", server.addr).into();
+    let mut clients = Vec::new();
+    for values in [
+        ["Bearer alice", "Bearer bob"],
+        ["Bearer bob", "Bearer alice"],
+    ] {
+        let mut metadata = tonic::metadata::MetadataMap::new();
+        for value in values {
+            metadata.append("authorization", value.parse()?);
+        }
+        clients.push(
+            FlightClient::try_new(
+                Arc::clone(&endpoint),
+                Credentials::anonymous(),
+                Some(metadata),
+                None,
+            )
+            .await?,
+        );
+    }
+    assert_ne!(
+        clients[0].federation_context(),
+        clients[1].federation_context(),
+        "different wire identities must not share a federation context"
+    );
+    for client in &clients {
+        drop(
+            client
+                .query_substrait(bytes::Bytes::from_static(b"identity probe"), None, None)
+                .await?,
+        );
+    }
+    let actual = observed.lock().clone();
+    drop(clients);
+    server.shutdown().await;
+    assert_eq!(actual, ["Bearer bob", "Bearer alice"]);
+    Ok(())
+}
+
+/// A Substrait `DoGet` stream is held to the same compressed-message bound as every other
+/// Flight stream the client decodes.
+#[tokio::test]
+async fn substrait_do_get_refuses_an_implausible_decompressed_size()
+-> Result<(), Box<dyn std::error::Error>> {
+    use arrow::array::{ArrayRef, Int32Array, RecordBatch};
+    use arrow::datatypes::{DataType, Field, Schema};
+    use arrow_ipc::writer::{
+        DictionaryTracker, IpcDataGenerator, IpcWriteContext, IpcWriteOptions,
+    };
+    use futures::TryStreamExt;
+
+    let batch = RecordBatch::try_new(
+        Arc::new(Schema::new(vec![Field::new("id", DataType::Int32, false)])),
+        vec![Arc::new(Int32Array::from(vec![7; 4096])) as ArrayRef],
+    )?;
+    let options =
+        IpcWriteOptions::default().try_with_compression(Some(arrow_ipc::CompressionType::ZSTD))?;
+    let generator = IpcDataGenerator::default();
+    let mut tracker = DictionaryTracker::new(false);
+    let schema =
+        generator.schema_to_bytes_with_dictionary_tracker(&batch.schema(), &mut tracker, &options);
+    let (_, encoded) = generator.encode(
+        &batch,
+        &mut tracker,
+        &options,
+        &mut IpcWriteContext::default(),
+    )?;
+
+    // Rewrite the length prefixes so the values buffer declares one byte over the 64 MiB floor
+    // and every other buffer declares nothing.
+    let declared = arrow_tools::ipc::DECOMPRESSED_SIZE_FLOOR + 1;
+    let mut body = encoded.arrow_data;
+    let buffers = arrow_ipc::root_as_message(&encoded.ipc_message)?
+        .header_as_record_batch()
+        .and_then(|batch| batch.buffers())
+        .expect("the batch declares its buffers");
+    for (index, buffer) in buffers.iter().enumerate() {
+        if buffer.length() < 8 {
+            continue;
+        }
+        let offset = usize::try_from(buffer.offset())?;
+        let length: u64 = if index == 1 { declared } else { 0 };
+        body[offset..offset + 8].copy_from_slice(&length.to_le_bytes());
+    }
+
+    let mut service = CookieFlightService::new(Arc::new(AtomicBool::new(false)));
+    service.do_get_reply = vec![
+        arrow_flight::FlightData::new().with_data_header(schema.ipc_message),
+        arrow_flight::FlightData::new()
+            .with_data_header(encoded.ipc_message)
+            .with_data_body(body),
+    ];
+    let server = TestServer::start(service).await;
+    let client = FlightClient::try_new(
+        format!("http://{}", server.addr).into(),
+        Credentials::anonymous(),
+        None,
+        None,
+    )
+    .await?;
+    let result = client
+        .query_substrait(bytes::Bytes::from_static(b"plan"), None, None)
+        .await?
+        .try_collect::<Vec<_>>()
+        .await;
+    drop(client);
+    server.shutdown().await;
+
+    let error = result
+        .expect_err("the oversized message is refused")
+        .to_string();
+    assert!(
+        error.contains(&format!("declares {declared} decompressed bytes")),
+        "{error}"
+    );
+    Ok(())
 }

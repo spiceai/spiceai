@@ -54,18 +54,19 @@ pub mod debezium;
 pub mod debezium_kafka;
 #[cfg(feature = "delta_lake")]
 pub mod delta_lake;
-#[cfg(feature = "duckdb")]
-pub mod duckdb;
-#[cfg(feature = "duckdb")]
+#[cfg(feature = "adbc")]
 pub mod ducklake;
 #[cfg(feature = "elasticsearch")]
 pub mod elasticsearch;
 pub mod federation;
+pub mod file_schema_drift;
 pub mod flight;
 #[cfg(feature = "flightsql")]
 pub mod flightsql;
+pub mod fresh_file_listing;
 pub mod function_support;
 pub mod iceberg;
+pub mod incremental_append;
 pub mod inferred_schema;
 #[cfg(any(feature = "debezium", feature = "kafka"))]
 pub mod kafka;
@@ -100,8 +101,6 @@ pub mod spark_connect;
 pub mod spice_cloud;
 #[cfg(feature = "sqlite")]
 pub mod sqlite;
-#[cfg(feature = "turso")]
-pub mod turso;
 pub mod unity_catalog;
 
 pub mod catalog_filter;
@@ -110,6 +109,7 @@ pub mod pk_filter_expr;
 pub mod rate_limit;
 
 pub mod cdc;
+pub mod csv_header_projection;
 pub mod delete;
 pub mod http;
 pub mod index_maintenance;

@@ -41,6 +41,7 @@ use datafusion_table_providers::util::retriable_error::check_and_mark_retriable_
 use futures::TryStreamExt;
 use tracing::Level;
 
+use crate::analyzer_rule::exact_float_decimal_cast::FloatLiteralSpellings;
 use crate::error::find_datafusion_root;
 
 /// Gets data from a table provider and returns it as a stream of `RecordBatch`es.
@@ -84,9 +85,21 @@ pub async fn get_data(
         }
         Some(sql) => {
             let session = ctx.state();
-            let mut plan = session
-                .create_logical_plan(&sql)
-                .await
+            // Keep the spellings of float tokens the planned `f64` literals lose,
+            // as the query planner does, so a refresh filtering a decimal column
+            // on such a literal loads the rows its SQL says (#14970).
+            let dialect = session.config().options().sql_parser.dialect;
+            let statement = session
+                .sql_to_statement(&sql, &dialect)
+                .map_err(find_datafusion_root)?;
+            let spellings = FloatLiteralSpellings::collect(&statement);
+            let mut plan = spellings
+                .retain(
+                    session
+                        .statement_to_plan(statement)
+                        .await
+                        .map_err(find_datafusion_root)?,
+                )
                 .map_err(find_datafusion_root)?;
 
             // If the refresh SQL defines a subset of columns to fetch, computed columns such as embeddings
@@ -179,13 +192,16 @@ fn include_computed_columns(
 mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
 
-    use arrow::array::{Int64Array, RecordBatch};
+    use arrow::array::{Decimal128Array, Int64Array, RecordBatch};
     use arrow_schema::{DataType, Field, Schema};
     use datafusion::catalog::streaming::StreamingTable;
+    use datafusion::datasource::MemTable;
+    use datafusion::execution::SessionStateBuilder;
     use datafusion::physical_plan::memory::MemoryStream;
     use datafusion::physical_plan::streaming::PartitionStream;
 
     use super::*;
+    use crate::analyzer_rule::AnalyzerRulesBuilder;
 
     const PARTITIONS: usize = 2;
 
@@ -260,5 +276,78 @@ mod tests {
         let rows: usize = batches.iter().map(RecordBatch::num_rows).sum();
         assert_eq!(rows, PARTITIONS, "every partition's row is read");
         assert_eq!(executed.load(Ordering::SeqCst), PARTITIONS);
+    }
+
+    /// A refresh SQL filtering a decimal column on a float literal loads the
+    /// rows its SQL spells, as a query does (#14970): `4.0700000000000003`
+    /// reads as the same `f64` as `4.07`, so only its retained token spelling
+    /// selects id 2, and `173665.47` selects id 3 only through its decimal
+    /// spelling.
+    #[tokio::test]
+    async fn refresh_sql_float_literals_load_the_decimals_they_spell() {
+        let schema: SchemaRef = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("amount", DataType::Decimal128(38, 17), false),
+        ]));
+        let amounts = Decimal128Array::from(vec![
+            407_000_000_000_000_000_i128,
+            407_000_000_000_000_030,
+            17_366_547_000_000_000_000_000,
+        ])
+        .with_precision_and_scale(38, 17)
+        .expect("valid decimal");
+        let batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![Arc::new(Int64Array::from(vec![1, 2, 3])), Arc::new(amounts)],
+        )
+        .expect("build the source batch");
+        let table: Arc<dyn TableProvider> = Arc::new(
+            MemTable::try_new(Arc::clone(&schema), vec![vec![batch]]).expect("build the source"),
+        );
+
+        for (sql, expected) in [
+            ("SELECT id FROM t WHERE amount = 4.07", vec![1]),
+            (
+                "SELECT id FROM t WHERE amount = 4.0700000000000003",
+                vec![2],
+            ),
+            ("SELECT id FROM t WHERE amount = 173665.47", vec![3]),
+        ] {
+            // The analyzer rules the refresh task's session runs.
+            let state = SessionStateBuilder::new()
+                .with_default_features()
+                .with_analyzer_rules(
+                    AnalyzerRulesBuilder::default()
+                        .include_federation(false)
+                        .build(),
+                )
+                .build();
+            let mut ctx = SessionContext::new_with_state(state);
+            ctx.register_table("t", Arc::clone(&table))
+                .expect("register the source");
+            let stream = get_data(
+                &mut ctx,
+                TableReference::bare("t"),
+                Arc::clone(&table),
+                Some(sql.to_string()),
+                vec![],
+            )
+            .await
+            .expect("plan the refresh scan");
+            let batches: Vec<RecordBatch> = stream.try_collect().await.expect("read the scan");
+            let ids: Vec<i64> = batches
+                .iter()
+                .flat_map(|batch| {
+                    batch
+                        .column(0)
+                        .as_any()
+                        .downcast_ref::<Int64Array>()
+                        .expect("ids")
+                        .values()
+                        .to_vec()
+                })
+                .collect();
+            assert_eq!(ids, expected, "{sql}");
+        }
     }
 }

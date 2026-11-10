@@ -11,8 +11,8 @@ description: "Query: tpcds_q89"
 | Music      | classical | edu packscholar #2 | ought        | Unknown        | 3     | 3473.83   | 7453.667500       |
 | Music      | classical | edu packscholar #2 | ese          | Unknown        | 7     | 3934.84   | 7672.410833       |
 | Children   | infants   | importoexporti #2  | ought        | Unknown        | 6     | 2856.15   | 6572.165833       |
-| Music      | classical | edu packscholar #2 | ation        | Unknown        | 5     | 3737.74   | 7415.289167       |
-| Music      | classical | edu packscholar #2 | ation        | Unknown        | 3     | 3737.86   | 7415.289167       |
+| Music      | classical | edu packscholar #2 | ation        | Unknown        | 5     | 3737.74   | 7415.289166       |
+| Music      | classical | edu packscholar #2 | ation        | Unknown        | 3     | 3737.86   | 7415.289166       |
 | Children   | infants   | importoexporti #2  | able         | Unknown        | 2     | 3209.98   | 6870.858333       |
 | Children   | infants   | importoexporti #2  | ation        | Unknown        | 2     | 3145.09   | 6789.123333       |
 +------------+-----------+--------------------+--------------+----------------+-------+-----------+-------------------+

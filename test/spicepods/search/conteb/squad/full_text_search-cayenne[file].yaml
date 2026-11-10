@@ -1,0 +1,44 @@
+version: v1
+kind: Spicepod
+name: full_text_search-cayenne[file]
+
+metadata:
+  benchmark_dataset: conteb_squad
+
+datasets:
+
+  # ConTEB squad-conteb-eval (`validation` split), read straight from Hugging Face:
+  # https://huggingface.co/datasets/illuin-conteb/squad-conteb-eval
+
+  - from: https://huggingface.co/api/datasets/illuin-conteb/squad-conteb-eval/parquet/documents/validation/0.parquet
+    name: corpus
+    params:
+      file_format: parquet
+    acceleration:
+      enabled: true
+      engine: cayenne
+      mode: file
+    columns:
+      - name: chunk
+        full_text_search:
+          enabled: true
+          row_id:
+            - chunk_id
+
+  - from: https://huggingface.co/api/datasets/illuin-conteb/squad-conteb-eval/parquet/queries/validation/0.parquet
+    name: conteb_queries
+    params:
+      file_format: parquet
+    acceleration:
+      enabled: true
+
+views:
+  # Each query row is one query with one gold chunk, as in ConTEB's DataFormatter. The id hashes the
+  # query text and its gold chunk, because the same question text can appear on several rows.
+  - name: test_queries
+    sql: SELECT DISTINCT md5(query || '|' || chunk_id) AS _id, query AS text FROM conteb_queries
+
+  - name: relevance_data
+    sql: |
+      SELECT DISTINCT md5(query || '|' || chunk_id) AS "query-id", chunk_id AS "corpus-id", 1 AS score
+      FROM conteb_queries

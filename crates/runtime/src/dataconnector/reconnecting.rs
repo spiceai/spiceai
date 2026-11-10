@@ -253,6 +253,11 @@ impl DataConnector for ReconnectingConnector {
             .is_some_and(|inner| inner.supports_changes_stream())
     }
 
+    fn supports_partitioned_changes(&self) -> bool {
+        self.built()
+            .is_some_and(|inner| inner.supports_partitioned_changes())
+    }
+
     async fn changes_stream(
         &self,
         context: &dyn ConnectorContext,

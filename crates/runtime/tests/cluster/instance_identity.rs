@@ -55,3 +55,42 @@ async fn executors_register_under_their_instance_identity() -> Result<(), anyhow
         })
         .await
 }
+
+/// An executor whose configured cluster port is taken listens on another port,
+/// and the scheduler reaches its Flight service at the port it listens on.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_executor_on_a_taken_port_is_reached_at_the_port_it_listens_on()
+-> Result<(), anyhow::Error> {
+    let _tracing = init_tracing(Some("integration=debug,info"));
+
+    test_request_context()
+        .scope(async move {
+            configure_test_datafusion();
+            let mut harness = ClusterHarness::builder().executors(1).start().await?;
+            let result = async {
+                harness.wait_for_executors(Duration::from_secs(30)).await?;
+                let taken = harness.executors[0]
+                    .datafusion()
+                    .cluster_config
+                    .node_bind_address()
+                    .port();
+                harness.add_executor_with_cluster_port(taken).await?;
+                harness.wait_for_executors(Duration::from_secs(30)).await?;
+
+                let mut listening: Vec<String> = harness
+                    .registered_executors()
+                    .await?
+                    .into_iter()
+                    .map(|(_, address)| address)
+                    .collect();
+                listening.sort();
+                assert_ne!(listening[0], listening[1]);
+                assert_eq!(harness.executor_flight_endpoints(), listening);
+                Ok::<(), anyhow::Error>(())
+            }
+            .await;
+            harness.shutdown().await;
+            result
+        })
+        .await
+}

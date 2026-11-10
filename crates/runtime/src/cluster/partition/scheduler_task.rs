@@ -30,7 +30,7 @@ use tokio_util::sync::CancellationToken;
 
 use crate::CLUSTER_PARTITION_ASSIGNMENT_TASK;
 use crate::datafusion::DataFusion;
-use crate::status::{ComponentStatus, RuntimeStatus};
+use runtime_status::{ComponentStatus, RuntimeStatus};
 
 pub use runtime_cluster::scheduler_task_config::{ConfigError, PartitionAssignmentConfig};
 use runtime_cluster::service::ReconcileOutcome;
@@ -78,6 +78,16 @@ impl PartitionAssignmentTask {
 
     pub async fn run(self) -> Result<()> {
         tracing::debug!("Starting {CLUSTER_PARTITION_ASSIGNMENT_TASK} in background");
+
+        // Other schedulers judge which executors are still in the cluster from
+        // this view, so it is published on its own schedule: a slow
+        // discovery or assignment cycle must not make this scheduler's
+        // executors look gone.
+        tokio::spawn(publish_connected_executors(
+            Arc::clone(&self.df),
+            self.interval,
+            self.cancel.clone(),
+        ));
 
         // Seed partition metadata for tables that don't have it yet.
         // This runs once before the periodic loop and is cancellation-aware
@@ -198,10 +208,26 @@ impl PartitionAssignmentTask {
             return Ok(());
         }
 
+        // Give the partitions of executors that left the cluster to the ones
+        // still in it: unassigned here, assigned by `reconcile_all` below.
+        if let Some(live) = service.live_executors(self.interval).await
+            && let Err(err) = service.reassign_departed(&live).await
+        {
+            tracing::warn!("Failed to reassign the partitions of departed executors: {err}");
+        }
+
         let outcome = service
             .reconcile_all(self.df.as_ref())
             .await
             .map_err(|e| Error::AssignmentCycle { source: e })?;
+
+        // Re-send assignment changes an executor has not applied, e.g. one
+        // whose notification was lost.
+        if let Some(tracker) = self.df.partition_load_tracker.as_ref()
+            && let Err(err) = service.resync_executors(self.df.as_ref(), tracker).await
+        {
+            tracing::warn!("Failed to re-send partition assignments to executors: {err}");
+        }
 
         // Only open the gate once a cycle has run its assignment pass with the
         // executors connected during the startup window. `reconcile_all` returns
@@ -236,5 +262,25 @@ impl PartitionAssignmentTask {
         };
 
         super::initialize_partition_metadata(service, &self.df, &app).await
+    }
+}
+
+/// Publishes the executors this scheduler has connected every `interval` until
+/// `cancel` fires.
+async fn publish_connected_executors(
+    df: Arc<DataFusion>,
+    interval: Duration,
+    cancel: CancellationToken,
+) {
+    let Some(service) = df.partition_service.as_ref() else {
+        return;
+    };
+    let mut ticks = tokio::time::interval(interval);
+    ticks.set_missed_tick_behavior(MissedTickBehavior::Delay);
+    loop {
+        tokio::select! {
+            () = cancel.cancelled() => return,
+            _ = ticks.tick() => service.publish_connected_executors().await,
+        }
     }
 }

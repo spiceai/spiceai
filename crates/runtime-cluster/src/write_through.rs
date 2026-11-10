@@ -157,6 +157,9 @@ pub enum Error {
     #[snafu(display("Failed to encode forwarded Flight stream: {message}"))]
     Encode { message: String },
 
+    #[snafu(display("Rows written to table {table} do not match its schema: {message}"))]
+    ConformBatch { table: String, message: String },
+
     #[snafu(display("No executors available for new partition assignment"))]
     NoExecutorsAvailable,
 
@@ -194,6 +197,14 @@ pub enum Error {
 
     #[snafu(display("No sender for assigned executor {executor_id} for table {table}"))]
     NoSenderForExecutor { executor_id: String, table: String },
+
+    #[snafu(display(
+        "Cannot write to table {table}: executor {executor_id}, which holds rows of the written partitions, is not connected; retry the write"
+    ))]
+    OwnerNotConnected { executor_id: String, table: String },
+
+    #[snafu(display("The write to executor {executor_id} was abandoned because the write failed"))]
+    Aborted { executor_id: String },
 }
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
@@ -211,11 +222,20 @@ impl From<Error> for tonic::Status {
             Error::MapEntriesNotNormalizable { .. }
             | Error::UnreadableMessageHeader { .. }
             | Error::NonBatchMessage { .. }
-            | Error::FirstMessageBodyWithoutBatch { .. } => {
-                tonic::Status::invalid_argument(err.to_string())
-            }
+            | Error::FirstMessageBodyWithoutBatch { .. }
+            | Error::ConformBatch { .. } => tonic::Status::invalid_argument(err.to_string()),
+            Error::OwnerNotConnected { .. } => tonic::Status::unavailable(err.to_string()),
             _ => tonic::Status::internal(err.to_string()),
         }
+    }
+}
+
+/// Abandons the executors' writes when dropped before the write completed.
+struct AbortOnDrop(tokio::sync::watch::Sender<bool>);
+
+impl Drop for AbortOnDrop {
+    fn drop(&mut self) {
+        self.0.send_replace(true);
     }
 }
 
@@ -257,7 +277,6 @@ pub async fn forward_federated_partitioned_write(
     // refused rather than routed under a declaration that says it holds none. One stream carries
     // one schema, so what its batches need is resolved once.
     let normalizer = MapEntriesNormalizer::for_schema(&declared);
-    let schema = Arc::clone(normalizer.schema());
 
     // Decode the first message and build a streaming iterator that yields
     // each subsequent FlightData message as a RecordBatch without buffering.
@@ -274,7 +293,6 @@ pub async fn forward_federated_partitioned_write(
         ctx,
         io_runtime,
         path,
-        &schema,
         Box::pin(batch_stream),
         raw_partition_by,
     )
@@ -424,7 +442,6 @@ pub async fn forward_partitioned_batches(
     ctx: Arc<datafusion::prelude::SessionContext>,
     io_runtime: tokio::runtime::Handle,
     path: &TableReference,
-    schema: &SchemaRef,
     mut batches: Pin<Box<dyn Stream<Item = Result<RecordBatch>> + Send>>,
     raw_partition_by: &[String],
 ) -> Result<()> {
@@ -468,10 +485,10 @@ pub async fn forward_partitioned_batches(
         .all_executor_partitions(&ctx, &target_schema)
         .context(ResolvePartitionsSnafu)?;
 
-    let mut executor_filters = build_executor_filters(&partitions_by_executor, schema)?;
+    let mut executor_filters = build_executor_filters(&partitions_by_executor, &target_schema)?;
 
     // Parse partition_by expressions into physical exprs for splitting unmatched rows.
-    let partition_phys_exprs = build_partition_physical_exprs(&partition_by, schema)?;
+    let partition_phys_exprs = build_partition_physical_exprs(&partition_by, &target_schema)?;
 
     let tbl = path
         .clone()
@@ -485,21 +502,38 @@ pub async fn forward_partitioned_batches(
         .into_keys()
         .collect();
 
+    // Set when the write fails, here or in any executor's forwarding task: each
+    // executor then abandons its write instead of committing the batches it
+    // already received.
+    let (abort_tx, _) = tokio::sync::watch::channel(false);
     let (senders, join_handles) = spawn_executor_forwarding_tasks(
         executor_registry,
         &all_executor_ids,
         &target_schema,
         tbl,
         &io_runtime,
+        &abort_tx,
     )
     .await?;
+    // Declared after `senders`, so a write dropped midway (a cancelled query)
+    // abandons the executors' writes before their channels close.
+    let abort = AbortOnDrop(abort_tx);
 
     let partition_store = executor_registry.federated_partition_store();
 
     // Route each batch through partition filters to the appropriate executor.
     let mut routing_error: Option<Error> = None;
     while let Some(batch_result) = StreamExt::next(&mut batches).await {
-        let batch = match batch_result {
+        // Rows take the table's types before routing, so a batch that cannot fails
+        // the write while every executor's stream is still open.
+        let batch = match batch_result.and_then(|batch| {
+            arrow_tools::record_batch::try_cast_to(batch, Arc::clone(&target_schema)).map_err(|e| {
+                Error::ConformBatch {
+                    table: path.to_string(),
+                    message: e.to_string(),
+                }
+            })
+        }) {
             Ok(b) => b,
             Err(e) => {
                 routing_error = Some(e);
@@ -523,11 +557,17 @@ pub async fn forward_partitioned_batches(
         }
     }
 
-    // Signal completion by dropping senders, then await all forwarding tasks.
+    // On success, closing the channels ends each executor's stream and it commits.
+    // On failure, the executors abandon their writes first; a channel closed while
+    // an executor's write is still open would end its stream as a success.
     // Collect executor-side errors even when routing failed — the forwarding
     // tasks may hold the real error (e.g. DoPut rejection from the executor)
     // that caused the channel to close and triggered a SendBatch error.
-    drop(senders);
+    if routing_error.is_some() {
+        abort.0.send_replace(true);
+    } else {
+        drop(senders);
+    }
     let metrics_node_id = executor_registry.node_id().map(str::to_string);
     let mut executor_error: Option<Error> = None;
     for (executor_id, handle) in join_handles {
@@ -540,7 +580,7 @@ pub async fn forward_partitioned_batches(
             crate::metrics::record_partitioned_write_forward(node_id, &executor_id, status);
         }
         match outcome {
-            Ok(Ok(())) => {}
+            Ok(Ok(()) | Err(Error::Aborted { .. })) => {}
             Ok(Err(e)) => {
                 if executor_error.is_none() {
                     executor_error = Some(e);
@@ -621,7 +661,7 @@ async fn route_batch_and_assign_unseen(
                     let val = if scalar.is_null() {
                         None
                     } else {
-                        Some(scalar_to_sql_literal(scalar))
+                        Some(partition_value_sql(scalar))
                     };
                     (expr_key.clone(), val)
                 })
@@ -646,23 +686,30 @@ async fn route_batch_and_assign_unseen(
         return Ok(());
     }
 
-    // Assign an executor for each new partition value up front.
-    let executor_ids =
-        select_least_loaded_executors(partitions_by_executor, senders, entries.len())?;
+    // Pick an executor for each new partition value up front.
+    let candidates = select_least_loaded_executors(partitions_by_executor, senders, entries.len())?;
 
-    // Persist all assignments in a single OCC write.
+    // Persist all assignments in a single OCC write. A value another writer
+    // assigned first, or one whose executor is not connected, keeps its
+    // executor: its rows go there, so each value's rows stay on one executor.
     let assignments: Vec<(&PartitionValue, &str)> = entries
         .iter()
-        .zip(executor_ids.iter())
+        .zip(candidates.iter())
         .map(|((_, pv, _), eid)| (pv, eid.as_str()))
         .collect();
 
-    partition_store
+    let executor_ids = partition_store
         .add_and_assign_partitions(path, &assignments)
         .await
         .map_err(|source| Error::PersistAssignment {
             source: Box::new(source),
         })?;
+    if let Some(executor_id) = executor_ids.iter().find(|id| !senders.contains_key(*id)) {
+        return Err(Error::OwnerNotConnected {
+            executor_id: executor_id.clone(),
+            table: path.to_string(),
+        });
+    }
 
     // Update in-memory filters and forward rows for each partition.
     for ((scalar_values, _partition_value, sub_batch), executor_id) in
@@ -743,16 +790,27 @@ async fn route_batch_and_assign_unseen(
     Ok(())
 }
 
-fn scalar_to_sql_literal(scalar: &ScalarValue) -> String {
+/// The SQL for a partition value, as the partition store records it: strings and
+/// dates as quoted text, every other type as it prints (a timestamp as its integer
+/// value). The partition predicate casts it to the expression's type. A partition is
+/// identified by this text, so the form recorded for a type does not change.
+#[must_use]
+pub fn partition_value_sql(scalar: &ScalarValue) -> String {
     if scalar.is_null() {
         return "NULL".to_string();
     }
     match scalar.data_type() {
-        DataType::Utf8 | DataType::LargeUtf8 => {
-            // For string types, produce a properly quoted and escaped SQL literal.
-            let value = scalar.to_string();
-            let escaped = value.replace('\'', "''");
-            format!("'{escaped}'")
+        DataType::Utf8
+        | DataType::LargeUtf8
+        | DataType::Utf8View
+        | DataType::Date32
+        | DataType::Date64 => {
+            let text = scalar
+                .to_array()
+                .ok()
+                .and_then(|array| arrow::util::display::array_value_to_string(&array, 0).ok())
+                .unwrap_or_else(|| scalar.to_string());
+            format!("'{}'", text.replace('\'', "''"))
         }
         _ => scalar.to_string(),
     }
@@ -836,26 +894,33 @@ fn partition_matched_rows(
                     "Filter did not produce boolean array".to_string(),
                 ),
             })?;
+        // A NULL result (a NULL partition value against `=`) does not match, so the
+        // row stays in `remaining`: filtering on its negation would drop it too.
+        let mask = if mask.null_count() > 0 {
+            arrow::compute::prep_null_mask_filter(mask)
+        } else {
+            mask.clone()
+        };
 
         let matched_count = mask.true_count();
         if matched_count == 0 {
             continue;
         }
 
-        // If there is no active sender for this executor (e.g. it disconnected),
-        // leave the matched rows in `remaining` so they are treated as unmatched
-        // and re-assigned to a connected executor. This prevents silent data loss.
+        // Rows for an executor with no active sender (e.g. it disconnected) stay in
+        // `remaining`; their partitions keep that executor, so assigning them fails
+        // the write rather than moving the partition away from its earlier rows.
         if !senders.contains_key(executor_id) {
             tracing::warn!(
                 executor_id,
                 rows = matched_count,
-                "Skipping send to disconnected executor; rows will be re-assigned"
+                "Rows belong to a disconnected executor; the write fails"
             );
             continue;
         }
 
         let filtered =
-            arrow::compute::filter_record_batch(&remaining, mask).context(FilterBatchSnafu)?;
+            arrow::compute::filter_record_batch(&remaining, &mask).context(FilterBatchSnafu)?;
 
         pending_sends.push((executor_id.clone(), filtered));
 
@@ -865,7 +930,7 @@ fn partition_matched_rows(
         }
 
         // Shrink remaining to only unmatched rows for subsequent executors.
-        let negated = arrow::compute::not(mask).context(FilterBatchSnafu)?;
+        let negated = arrow::compute::not(&mask).context(FilterBatchSnafu)?;
         remaining =
             arrow::compute::filter_record_batch(&remaining, &negated).context(FilterBatchSnafu)?;
     }
@@ -973,6 +1038,7 @@ async fn spawn_executor_forwarding_tasks(
     schema: &SchemaRef,
     tbl: ResolvedTableReference,
     io_runtime: &tokio::runtime::Handle,
+    abort: &tokio::sync::watch::Sender<bool>,
 ) -> Result<(
     HashMap<String, Sender<RecordBatch>>,
     Vec<(ExecutorId, tokio::task::JoinHandle<Result<()>>)>,
@@ -1013,6 +1079,7 @@ async fn spawn_executor_forwarding_tasks(
                 auth_header.clone(),
                 io_runtime.clone(),
                 executor_id_for_task,
+                abort.clone(),
             )),
         ));
     }
@@ -1022,6 +1089,7 @@ async fn spawn_executor_forwarding_tasks(
 
 /// Encodes `RecordBatch`es from `rx` as `FlightData` and sends them via `DoPut`
 /// to a specific executor.
+#[expect(clippy::too_many_arguments)]
 async fn forward_batches_to_executor(
     client: data_components::flightsql::FlightSqlClient,
     rx: mpsc::Receiver<RecordBatch>,
@@ -1030,6 +1098,7 @@ async fn forward_batches_to_executor(
     auth_header: Option<String>,
     io_runtime: tokio::runtime::Handle,
     executor_id: String,
+    abort_tx: tokio::sync::watch::Sender<bool>,
 ) -> Result<()> {
     let forward_start = std::time::Instant::now();
     let batches_forwarded = Arc::new(AtomicU64::new(0));
@@ -1041,11 +1110,10 @@ async fn forward_batches_to_executor(
         "Executor forwarding task started",
     );
     let (tx, flight_rx) = mpsc::channel::<arrow_flight::FlightData>(64);
-    let (encode_result_tx, encode_result_rx) =
+    let (encode_result_tx, mut encode_result_rx) =
         tokio::sync::oneshot::channel::<std::result::Result<(), String>>();
 
     let encoder_schema = Arc::clone(&schema);
-    let adapt_schema = Arc::clone(&schema);
 
     // Keepalive interval: send a heartbeat at 1/3 of the executor idle timeout
     // so the executor never reaches its deadline while a write-through is active.
@@ -1055,20 +1123,19 @@ async fn forward_batches_to_executor(
 
     let encoder_batches = Arc::clone(&batches_forwarded);
     let encoder_keepalives = Arc::clone(&keepalives_sent);
+    let mut abort = abort_tx.subscribe();
+    let mut encoder_abort = abort_tx.subscribe();
     let encoder_handle = io_runtime.spawn(async move {
+        let aborted = async move {
+            if encoder_abort.wait_for(|aborted| *aborted).await.is_err() {
+                std::future::pending::<()>().await;
+            }
+        };
+        tokio::pin!(aborted);
         let mut flight_data_encoder = Box::pin(
             arrow_flight::encode::FlightDataEncoderBuilder::new()
                 .with_schema(encoder_schema)
-                .build(ReceiverStream::new(rx).map(
-                    move |b| -> std::result::Result<RecordBatch, arrow_flight::error::FlightError> {
-                        arrow_tools::record_batch::try_cast_to(b, Arc::clone(&adapt_schema))
-                            .map_err(|e| {
-                                arrow_flight::error::FlightError::Arrow(
-                                    arrow::error::ArrowError::SchemaError(e.to_string()),
-                                )
-                            })
-                    },
-                )),
+                .build(ReceiverStream::new(rx).map(Ok)),
         );
 
         let mut is_first = true;
@@ -1084,6 +1151,15 @@ async fn forward_batches_to_executor(
         loop {
             tokio::select! {
                 biased;
+                // Ending the stream tells the executor to commit, so a failed or
+                // abandoned write sends it the abandon message first. An abort is
+                // checked before the input, whose end follows it.
+                () = &mut aborted => {
+                    if !is_first {
+                        let _ = tx.send(flight_config::abandon()).await;
+                    }
+                    return;
+                }
                 data = flight_data_encoder.next() => {
                     match data {
                         Some(Ok(mut fdata)) => {
@@ -1101,6 +1177,9 @@ async fn forward_batches_to_executor(
                         }
                         Some(Err(e)) => {
                             let _ = encode_result_tx.send(Err(e.to_string()));
+                            if !is_first {
+                                let _ = tx.send(flight_config::abandon()).await;
+                            }
                             return;
                         }
                         None => {
@@ -1141,53 +1220,61 @@ async fn forward_batches_to_executor(
     let elapsed_ms = || u64::try_from(forward_start.elapsed().as_millis()).unwrap_or(u64::MAX);
 
     let mut inner_client = client.into_inner();
-    let response = match inner_client.do_put(request).await {
-        Ok(r) => r,
-        Err(e) => {
-            // Abort the encoder task so its `rx` is dropped promptly.
-            // This prevents the routing loop from queuing data into a dead
-            // channel and eventually stalling.
-            encoder_handle.abort();
-            tracing::error!(
-                executor = %executor_id,
-                table = %table_label,
-                elapsed_ms = elapsed_ms(),
-                batches = batches_forwarded.load(Ordering::Relaxed),
-                keepalives = keepalives_sent.load(Ordering::Relaxed),
-                error = %e,
-                "`DoPut` to executor failed",
-            );
-            return Err(Error::DoPut { source: e });
-        }
+    let mut exchange = Box::pin(async move {
+        let response = inner_client
+            .do_put(request)
+            .await
+            .map_err(|source| Error::DoPut { source })?;
+        response
+            .into_inner()
+            .try_collect::<Vec<_>>()
+            .await
+            .map_err(|source| Error::DoPutAck { source })?;
+        Ok::<(), Error>(())
+    });
+    let outcome = tokio::select! {
+        biased;
+        Ok(_) = abort.wait_for(|aborted| *aborted) => Err(Error::Aborted {
+            executor_id: executor_id.clone(),
+        }),
+        Ok(Err(message)) = &mut encode_result_rx => Err(Error::Encode { message }),
+        result = &mut exchange => result,
     };
-
-    if let Err(e) = response.into_inner().try_collect::<Vec<_>>().await {
+    if let Err(error) = &outcome
+        && !matches!(error, Error::Aborted { .. })
+    {
+        // A failed write abandons the other executors' writes too.
+        abort_tx.send_replace(true);
+    }
+    if matches!(outcome, Err(Error::Aborted { .. } | Error::Encode { .. })) {
+        // The encoder ends the stream with the abandon message, since stopping it here
+        // would end the stream as a complete write. The executor answers once it has
+        // abandoned the write.
+        let _ = exchange.await;
+    } else {
         encoder_handle.abort();
-        tracing::error!(
+    }
+
+    match &outcome {
+        Ok(()) => tracing::info!(
             executor = %executor_id,
             table = %table_label,
             elapsed_ms = elapsed_ms(),
             batches = batches_forwarded.load(Ordering::Relaxed),
             keepalives = keepalives_sent.load(Ordering::Relaxed),
-            error = %e,
-            "Executor `DoPut` acknowledgement failed",
-        );
-        return Err(Error::DoPutAck { source: e });
+            "Executor forwarding task completed successfully",
+        ),
+        Err(error) => tracing::error!(
+            executor = %executor_id,
+            table = %table_label,
+            elapsed_ms = elapsed_ms(),
+            batches = batches_forwarded.load(Ordering::Relaxed),
+            keepalives = keepalives_sent.load(Ordering::Relaxed),
+            error = %error,
+            "Executor forwarding task failed",
+        ),
     }
-
-    tracing::info!(
-        executor = %executor_id,
-        table = %table_label,
-        elapsed_ms = elapsed_ms(),
-        batches = batches_forwarded.load(Ordering::Relaxed),
-        keepalives = keepalives_sent.load(Ordering::Relaxed),
-        "Executor forwarding task completed successfully",
-    );
-
-    match encode_result_rx.await {
-        Ok(Ok(())) | Err(_) => Ok(()),
-        Ok(Err(message)) => Err(Error::Encode { message }),
-    }
+    outcome
 }
 
 #[cfg(test)]
@@ -1201,7 +1288,7 @@ mod tests {
     use arrow::datatypes::{DataType, Field, Fields, Int32Type, Schema};
     use arrow_flight::utils::batches_to_flight_data;
 
-    use crate::flight_config::{KEEPALIVE_APP_METADATA, keepalive};
+    use crate::flight_config::{ABANDON_APP_METADATA, KEEPALIVE_APP_METADATA, keepalive};
 
     fn test_schema() -> SchemaRef {
         Arc::new(Schema::new(vec![Field::new("a", DataType::Int32, false)]))
@@ -1908,5 +1995,569 @@ mod tests {
             tonic::Code::InvalidArgument,
             "the client sent it, so no retry of the same stream can succeed"
         );
+    }
+
+    async fn catalog_store(table: &TableReference) -> Arc<PartitionStore> {
+        let objects: Arc<dyn object_store::ObjectStore> =
+            Arc::new(object_store::memory::InMemory::new());
+        let cluster = Arc::new(crate::cluster_state::ClusterStateStore::new(objects, ""));
+        cluster.bootstrap().await.expect("bootstrap");
+        let store = Arc::new(PartitionStore::catalog(cluster));
+        store
+            .initialize_metadata(table, vec!["region".to_string()])
+            .await
+            .expect("initialize");
+        store
+    }
+
+    fn region_batch(regions: Vec<Option<&str>>) -> RecordBatch {
+        let ids: Vec<i32> = (0..).take(regions.len()).collect();
+        RecordBatch::try_new(
+            Arc::new(Schema::new(vec![
+                Field::new("region", DataType::Utf8, true),
+                Field::new("id", DataType::Int32, false),
+            ])),
+            vec![
+                Arc::new(StringArray::from(regions)),
+                Arc::new(Int32Array::from(ids)),
+            ],
+        )
+        .expect("batch")
+    }
+
+    async fn route(
+        batch: &RecordBatch,
+        store: &Arc<PartitionStore>,
+        table: &TableReference,
+        senders: &HashMap<ExecutorId, Sender<RecordBatch>>,
+        partitions_by_executor: &mut HashMap<String, Vec<Expr>>,
+    ) -> Result<()> {
+        let region = datafusion_expr::col("region");
+        let expressions = build_partition_physical_exprs(&[region], &batch.schema())
+            .expect("partition expressions");
+        let mut filters = build_executor_filters(partitions_by_executor, &batch.schema())
+            .expect("executor filters");
+        route_batch_and_assign_unseen(
+            batch,
+            &mut filters,
+            senders,
+            &expressions,
+            &["region".to_string()],
+            partitions_by_executor,
+            store,
+            table,
+        )
+        .await
+    }
+
+    /// The regions each executor received.
+    fn received(
+        receivers: &mut HashMap<&str, mpsc::Receiver<RecordBatch>>,
+    ) -> Vec<(String, String)> {
+        let mut rows = Vec::new();
+        for (executor, receiver) in &mut *receivers {
+            while let Ok(batch) = receiver.try_recv() {
+                let regions = batch
+                    .column(0)
+                    .as_any()
+                    .downcast_ref::<StringArray>()
+                    .expect("regions");
+                for region in regions {
+                    rows.push((
+                        (*executor).to_string(),
+                        region.unwrap_or("NULL").to_string(),
+                    ));
+                }
+            }
+        }
+        rows.sort();
+        rows
+    }
+
+    /// Rows of a new partition another writer assigned first go to that
+    /// writer's executor, though this writer would pick another one.
+    #[tokio::test]
+    async fn rows_of_a_partition_another_writer_assigned_go_to_its_executor() {
+        let table = TableReference::full("ice", "ns", "t");
+        let store = catalog_store(&table).await;
+        let east = HashMap::from([("region".to_string(), Some("'east'".to_string()))]);
+        store
+            .add_and_assign_partitions(&table, &[(&east, "executor-2")])
+            .await
+            .expect("the other writer assigns east");
+
+        let (tx1, rx1) = mpsc::channel(8);
+        let (tx2, rx2) = mpsc::channel(8);
+        let senders = HashMap::from([
+            ("executor-1".to_string(), tx1),
+            ("executor-2".to_string(), tx2),
+        ]);
+        // This writer has not seen east, and executor-2 holds more of its
+        // partitions, so it would pick executor-1 for east.
+        let mut partitions_by_executor = HashMap::from([(
+            "executor-2".to_string(),
+            vec![datafusion_expr::col("region").eq(datafusion_expr::lit("north"))],
+        )]);
+        route(
+            &region_batch(vec![Some("east"), Some("east")]),
+            &store,
+            &table,
+            &senders,
+            &mut partitions_by_executor,
+        )
+        .await
+        .expect("route");
+
+        let mut receivers = HashMap::from([("executor-1", rx1), ("executor-2", rx2)]);
+        assert_eq!(
+            received(&mut receivers),
+            [
+                ("executor-2".to_string(), "east".to_string()),
+                ("executor-2".to_string(), "east".to_string()),
+            ]
+        );
+    }
+
+    /// A row with a NULL partition value, in a batch whose other rows match an
+    /// executor's partitions, is routed with them, not dropped.
+    #[tokio::test]
+    async fn rows_with_a_null_partition_value_are_routed() {
+        let table = TableReference::full("ice", "ns", "t");
+        let store = catalog_store(&table).await;
+        let east = HashMap::from([("region".to_string(), Some("'east'".to_string()))]);
+        store
+            .add_and_assign_partitions(&table, &[(&east, "executor-1")])
+            .await
+            .expect("assign east");
+
+        let (tx1, rx1) = mpsc::channel(8);
+        let senders = HashMap::from([("executor-1".to_string(), tx1)]);
+        let mut partitions_by_executor = HashMap::from([(
+            "executor-1".to_string(),
+            vec![datafusion_expr::col("region").eq(datafusion_expr::lit("east"))],
+        )]);
+        route(
+            &region_batch(vec![Some("east"), None]),
+            &store,
+            &table,
+            &senders,
+            &mut partitions_by_executor,
+        )
+        .await
+        .expect("route");
+
+        let mut receivers = HashMap::from([("executor-1", rx1)]);
+        assert_eq!(
+            received(&mut receivers),
+            [
+                ("executor-1".to_string(), "NULL".to_string()),
+                ("executor-1".to_string(), "east".to_string()),
+            ]
+        );
+    }
+
+    /// A partition whose executor is not connected fails the write instead of
+    /// moving to a connected executor, which lacks its earlier rows.
+    #[tokio::test]
+    async fn rows_for_a_disconnected_executor_fail_the_write() {
+        let table = TableReference::full("ice", "ns", "t");
+        let store = catalog_store(&table).await;
+        let east = HashMap::from([("region".to_string(), Some("'east'".to_string()))]);
+        store
+            .add_and_assign_partitions(&table, &[(&east, "executor-3")])
+            .await
+            .expect("assign east");
+
+        let (tx1, rx1) = mpsc::channel(8);
+        let senders = HashMap::from([("executor-1".to_string(), tx1)]);
+        let mut partitions_by_executor = HashMap::from([(
+            "executor-3".to_string(),
+            vec![datafusion_expr::col("region").eq(datafusion_expr::lit("east"))],
+        )]);
+        let error = route(
+            &region_batch(vec![Some("east"), Some("west")]),
+            &store,
+            &table,
+            &senders,
+            &mut partitions_by_executor,
+        )
+        .await
+        .expect_err("east's executor is not connected");
+
+        assert!(
+            matches!(&error, Error::OwnerNotConnected { executor_id, .. } if executor_id == "executor-3"),
+            "unexpected error: {error}"
+        );
+        assert_eq!(tonic::Status::from(error).code(), tonic::Code::Unavailable);
+        let mut receivers = HashMap::from([("executor-1", rx1)]);
+        assert!(received(&mut receivers).is_empty());
+    }
+
+    /// The SQL recorded for a partition value keeps the form earlier versions
+    /// recorded, and selects exactly the rows that carry it, for each type a
+    /// partition expression can produce.
+    #[tokio::test]
+    async fn a_recorded_partition_value_selects_its_rows() {
+        use arrow::array::{Date32Array, StringViewArray, TimestampMicrosecondArray};
+        use datafusion::datasource::MemTable;
+        use datafusion::prelude::SessionContext;
+
+        let micros = vec![
+            1_704_164_400_000_000,
+            1_704_164_400_000_000,
+            1_704_250_800_000_000,
+        ];
+        let cases: Vec<(ArrayRef, &str)> = vec![
+            (
+                Arc::new(StringArray::from(vec!["it's", "it's", "x"])),
+                "'it''s'",
+            ),
+            (
+                Arc::new(StringViewArray::from(vec!["it's", "it's", "x"])),
+                "'it''s'",
+            ),
+            (Arc::new(Int32Array::from(vec![-5, -5, 3])), "-5"),
+            (
+                Arc::new(Date32Array::from(vec![19_724, 19_724, 19_725])),
+                "'2024-01-02'",
+            ),
+            (
+                Arc::new(TimestampMicrosecondArray::from(micros.clone())),
+                "1704164400000000",
+            ),
+            (
+                Arc::new(TimestampMicrosecondArray::from(micros).with_timezone("+00:00")),
+                "1704164400000000",
+            ),
+        ];
+        for (column, expected) in cases {
+            let schema = Arc::new(Schema::new(vec![Field::new(
+                "k",
+                column.data_type().clone(),
+                false,
+            )]));
+            let df_schema = DFSchema::try_from(Arc::clone(&schema)).expect("schema");
+            let value = ScalarValue::try_from_array(&column, 0).expect("value");
+            let recorded = partition_value_sql(&value);
+            assert_eq!(recorded, expected, "{value:?}");
+            let batch = RecordBatch::try_new(Arc::clone(&schema), vec![column]).expect("batch");
+            let ctx = SessionContext::new();
+            let predicate = runtime_datafusion::analyzer_rule::partition_predicate(
+                &HashMap::from([("k".to_string(), Some(recorded.clone()))]),
+                &df_schema,
+                |sql| ctx.parse_sql_expr(sql, &df_schema),
+            )
+            .expect("predicate")
+            .expect("one predicate");
+            let rows = ctx
+                .read_table(Arc::new(
+                    MemTable::try_new(schema, vec![vec![batch]]).expect("table"),
+                ))
+                .expect("read")
+                .filter(predicate)
+                .expect("filter")
+                .count()
+                .await
+                .expect("count");
+            assert_eq!(rows, 2, "{value:?} recorded as {recorded}");
+        }
+    }
+
+    /// Forwarding to a stub executor that reports how each write stream ended.
+    mod executor_stream {
+        use std::pin::Pin;
+
+        use arrow_flight::flight_service_client::FlightServiceClient;
+        use arrow_flight::flight_service_server::{FlightService, FlightServiceServer};
+        use arrow_flight::sql::client::FlightSqlServiceClient;
+        use arrow_flight::{
+            Action, ActionType, Criteria, Empty, FlightInfo, HandshakeRequest, HandshakeResponse,
+            PollInfo, SchemaResult, Ticket,
+        };
+        use flight_client::cookie::{CookieService, CookieStore};
+        use futures::Stream;
+        use tonic::{Request, Status};
+
+        use super::*;
+
+        type Messages<T> = Pin<Box<dyn Stream<Item = std::result::Result<T, Status>> + Send>>;
+
+        /// How a write stream ended: complete, so the executor commits it; abandoned by
+        /// the writer; or broken off.
+        #[derive(Debug, PartialEq)]
+        enum StreamEnd {
+            Complete,
+            Abandoned,
+            Broken,
+            /// The executor failed the write itself.
+            Failed,
+        }
+
+        /// Whether a stub executor writes the rows it receives or fails the write
+        /// on its first rows.
+        #[derive(Clone, Copy)]
+        enum Behavior {
+            Writes,
+            Fails,
+        }
+
+        #[derive(Clone)]
+        struct StubExecutor {
+            behavior: Behavior,
+            received: mpsc::UnboundedSender<()>,
+            ended: mpsc::UnboundedSender<StreamEnd>,
+        }
+
+        #[tonic::async_trait]
+        impl FlightService for StubExecutor {
+            type HandshakeStream = Messages<HandshakeResponse>;
+            type ListFlightsStream = Messages<FlightInfo>;
+            type DoGetStream = Messages<FlightData>;
+            type DoPutStream = Messages<PutResult>;
+            type DoActionStream = Messages<arrow_flight::Result>;
+            type ListActionsStream = Messages<ActionType>;
+            type DoExchangeStream = Messages<FlightData>;
+
+            async fn handshake(
+                &self,
+                _: Request<Streaming<HandshakeRequest>>,
+            ) -> std::result::Result<Response<Self::HandshakeStream>, Status> {
+                Err(Status::unimplemented(""))
+            }
+            async fn list_flights(
+                &self,
+                _: Request<Criteria>,
+            ) -> std::result::Result<Response<Self::ListFlightsStream>, Status> {
+                Err(Status::unimplemented(""))
+            }
+            async fn get_flight_info(
+                &self,
+                _: Request<FlightDescriptor>,
+            ) -> std::result::Result<Response<FlightInfo>, Status> {
+                Err(Status::unimplemented(""))
+            }
+            async fn poll_flight_info(
+                &self,
+                _: Request<FlightDescriptor>,
+            ) -> std::result::Result<Response<PollInfo>, Status> {
+                Err(Status::unimplemented(""))
+            }
+            async fn get_schema(
+                &self,
+                _: Request<FlightDescriptor>,
+            ) -> std::result::Result<Response<SchemaResult>, Status> {
+                Err(Status::unimplemented(""))
+            }
+            async fn do_get(
+                &self,
+                _: Request<Ticket>,
+            ) -> std::result::Result<Response<Self::DoGetStream>, Status> {
+                Err(Status::unimplemented(""))
+            }
+            async fn do_put(
+                &self,
+                request: Request<Streaming<FlightData>>,
+            ) -> std::result::Result<Response<Self::DoPutStream>, Status> {
+                let mut stream = request.into_inner();
+                // Like an executor, answer once the stream declares its schema, before
+                // its rows arrive.
+                stream.message().await?;
+                let behavior = self.behavior;
+                let received = self.received.clone();
+                let ended = self.ended.clone();
+                let (done_tx, done_rx) = tokio::sync::oneshot::channel();
+                tokio::spawn(async move {
+                    let end = loop {
+                        match stream.message().await {
+                            Ok(Some(message))
+                                if message.app_metadata.as_ref() == ABANDON_APP_METADATA =>
+                            {
+                                break StreamEnd::Abandoned;
+                            }
+                            Ok(Some(_)) => {
+                                let _ = received.send(());
+                                if matches!(behavior, Behavior::Fails) {
+                                    break StreamEnd::Failed;
+                                }
+                            }
+                            Ok(None) => break StreamEnd::Complete,
+                            Err(_) => break StreamEnd::Broken,
+                        }
+                    };
+                    let failed = end == StreamEnd::Failed;
+                    let _ = ended.send(end);
+                    let _ = done_tx.send(failed);
+                });
+                let acknowledgement = futures::stream::once(async move {
+                    match done_rx.await {
+                        Ok(true) => Err(Status::internal("the write failed")),
+                        _ => Ok(PutResult::default()),
+                    }
+                });
+                Ok(Response::new(Box::pin(acknowledgement)))
+            }
+            async fn do_action(
+                &self,
+                _: Request<Action>,
+            ) -> std::result::Result<Response<Self::DoActionStream>, Status> {
+                Err(Status::unimplemented(""))
+            }
+            async fn list_actions(
+                &self,
+                _: Request<Empty>,
+            ) -> std::result::Result<Response<Self::ListActionsStream>, Status> {
+                Err(Status::unimplemented(""))
+            }
+            async fn do_exchange(
+                &self,
+                _: Request<Streaming<FlightData>>,
+            ) -> std::result::Result<Response<Self::DoExchangeStream>, Status> {
+                Err(Status::unimplemented(""))
+            }
+        }
+
+        struct Forward {
+            batches: mpsc::Sender<RecordBatch>,
+            task: tokio::task::JoinHandle<Result<()>>,
+            received: mpsc::UnboundedReceiver<()>,
+            ended: mpsc::UnboundedReceiver<StreamEnd>,
+        }
+
+        /// Starts a stub executor and a forwarding task writing to it, which shares
+        /// `abort` with the other executors' forwarding tasks of the write.
+        async fn start(behavior: Behavior, abort: &tokio::sync::watch::Sender<bool>) -> Forward {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+                .await
+                .expect("bind");
+            let address = listener.local_addr().expect("address");
+            let (received_tx, received) = mpsc::unbounded_channel();
+            let (ended_tx, ended) = mpsc::unbounded_channel();
+            let incoming = futures::stream::unfold(listener, |listener| async move {
+                let connection = listener.accept().await.map(|(stream, _)| stream);
+                Some((connection, listener))
+            });
+            tokio::spawn(
+                tonic::transport::Server::builder()
+                    .add_service(FlightServiceServer::new(StubExecutor {
+                        behavior,
+                        received: received_tx,
+                        ended: ended_tx,
+                    }))
+                    .serve_with_incoming(incoming),
+            );
+            let channel = tonic::transport::Endpoint::from_shared(format!("http://{address}"))
+                .expect("endpoint")
+                .connect_lazy();
+            let client = FlightSqlServiceClient::new_from_inner(FlightServiceClient::new(
+                CookieService::new(channel, Arc::new(CookieStore::new())),
+            ));
+
+            let (batches, rx) = mpsc::channel(8);
+            let task = tokio::spawn(forward_batches_to_executor(
+                client,
+                rx,
+                region_batch(Vec::new()).schema(),
+                TableReference::full("ice", "ns", "t")
+                    .resolve(SPICE_DEFAULT_CATALOG, SPICE_DEFAULT_SCHEMA),
+                None,
+                tokio::runtime::Handle::current(),
+                "executor-1".to_string(),
+                abort.clone(),
+            ));
+            Forward {
+                batches,
+                task,
+                received,
+                ended,
+            }
+        }
+
+        /// A write abandoned after the executor received rows never reaches the
+        /// end of its stream, where the executor would commit those rows, even
+        /// when its batches end at the same time, though the executor answered the
+        /// request before the rows arrived.
+        #[tokio::test]
+        async fn an_abandoned_write_breaks_off_the_executors_stream() {
+            let (abort, _) = tokio::sync::watch::channel(false);
+            let mut forward = start(Behavior::Writes, &abort).await;
+            forward
+                .batches
+                .send(region_batch(vec![Some("east")]))
+                .await
+                .expect("send");
+            forward
+                .received
+                .recv()
+                .await
+                .expect("the executor received rows");
+
+            abort.send_replace(true);
+            drop(forward.batches);
+
+            let outcome = forward.task.await.expect("join");
+            assert!(
+                matches!(outcome, Err(Error::Aborted { .. })),
+                "unexpected outcome: {outcome:?}"
+            );
+            assert_eq!(forward.ended.recv().await, Some(StreamEnd::Abandoned));
+        }
+
+        /// An executor that fails the write while the input is still open abandons
+        /// the other executors' writes, even when their input then ends normally.
+        #[tokio::test]
+        async fn a_failed_executor_write_abandons_the_others() {
+            let (abort, _) = tokio::sync::watch::channel(false);
+            let failing = start(Behavior::Fails, &abort).await;
+            let mut other = start(Behavior::Writes, &abort).await;
+            other
+                .batches
+                .send(region_batch(vec![Some("west")]))
+                .await
+                .expect("send");
+            other
+                .received
+                .recv()
+                .await
+                .expect("the other executor received rows");
+
+            failing
+                .batches
+                .send(region_batch(vec![Some("east")]))
+                .await
+                .expect("send");
+            let failed = failing.task.await.expect("join");
+            assert!(
+                matches!(failed, Err(Error::DoPutAck { .. })),
+                "unexpected outcome: {failed:?}"
+            );
+
+            let _ = other.batches.send(region_batch(vec![Some("west")])).await;
+            drop(other.batches);
+            let outcome = other.task.await.expect("join");
+            assert!(
+                matches!(outcome, Err(Error::Aborted { .. })),
+                "unexpected outcome: {outcome:?}"
+            );
+            assert_eq!(other.ended.recv().await, Some(StreamEnd::Abandoned));
+        }
+
+        #[tokio::test]
+        async fn a_finished_write_completes_the_executors_stream() {
+            let (abort, _) = tokio::sync::watch::channel(false);
+            let mut forward = start(Behavior::Writes, &abort).await;
+            forward
+                .batches
+                .send(region_batch(vec![Some("east")]))
+                .await
+                .expect("send");
+            drop(forward.batches);
+
+            forward
+                .task
+                .await
+                .expect("join")
+                .expect("the write completes");
+            assert_eq!(forward.ended.recv().await, Some(StreamEnd::Complete));
+        }
     }
 }

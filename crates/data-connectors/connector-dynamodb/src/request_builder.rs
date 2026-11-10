@@ -14,8 +14,8 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 use crate::filter::{
-    Condition, KeyPredicate, KeyReading, MAX_EXPRESSION_BYTES, Placeholders, SortPredicate,
-    Translator, compare, prefix_end, satisfies,
+    Condition, KeyPredicate, MAX_EXPRESSION_BYTES, Placeholders, SortPredicate, Translator,
+    compare, prefix_end, satisfies,
 };
 use crate::request_plan::{DynamoDBRequestPlan, QueryParams, ScanParams};
 use crate::table_schema::DynamoDBTableSchema;
@@ -221,7 +221,6 @@ impl DynamoDBRequestPlanBuilder {
                             scan_index_forward: None,
                             residual,
                             sort_key: self.schema.sort_key().map(ToString::to_string),
-                            sort_key_reading: self.schema.sort_key_reading(),
                         }
                     })
                     .collect();
@@ -439,8 +438,7 @@ fn choose_sort(exact: &[(usize, SortPredicate)], inexact: &[SortPredicate]) -> S
     }) {
         let mut residual = Vec::new();
         for (_, p) in &exact {
-            // Both are literals, so neither is read through the column.
-            match satisfies(&v, p, KeyReading::Stored) {
+            match satisfies(&v, p) {
                 Some(true) => {}
                 Some(false) => return SortChoice::Empty,
                 None => residual.push(p.clone()),

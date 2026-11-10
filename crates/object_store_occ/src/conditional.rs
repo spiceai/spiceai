@@ -112,28 +112,41 @@ pub async fn conditional_put(
         Expected::Version(version) => PutMode::Update(version.clone()),
     };
 
-    match store.put_opts(path, payload, PutOptions::from(mode)).await {
+    match store
+        .put_opts(path, payload, PutOptions::from(mode.clone()))
+        .await
+    {
         Ok(result) => Ok(result),
-        Err(err) => Err(classify(path, expected, err)),
+        Err(err) => Err(classify(path, &mode, err)),
     }
 }
 
+/// Whether a write with `mode` that failed with `err` was refused because
+/// another writer created or changed the object first.
+#[must_use]
+pub fn refused_as_conflict(mode: &PutMode, err: &ObjectStoreError) -> bool {
+    matches!(
+        (mode, err),
+        (PutMode::Create, ObjectStoreError::AlreadyExists { .. })
+            | (_, ObjectStoreError::Precondition { .. })
+            // An `If-Match` write to an object deleted since it was read: the
+            // version the writer read no longer exists.
+            | (PutMode::Update(_), ObjectStoreError::NotFound { .. })
+    )
+}
+
 /// Classifies the error a conditional write returned.
-fn classify(path: &Path, expected: &Expected, err: ObjectStoreError) -> ConditionalWriteError {
+fn classify(path: &Path, mode: &PutMode, err: ObjectStoreError) -> ConditionalWriteError {
     let path = path.to_string();
-    match (expected, err) {
-        (Expected::Absent, ObjectStoreError::AlreadyExists { .. })
-        | (_, ObjectStoreError::Precondition { .. })
-        // An `If-Match` write to an object deleted since it was read: the
-        // version the writer read no longer exists.
-        | (Expected::Version(_), ObjectStoreError::NotFound { .. }) => {
-            ConditionalWriteError::Conflict { path }
-        }
-        (_, source @ (ObjectStoreError::NotSupported { .. }
-        | ObjectStoreError::NotImplemented { .. })) => {
+    if refused_as_conflict(mode, &err) {
+        return ConditionalWriteError::Conflict { path };
+    }
+    match err {
+        source @ (ObjectStoreError::NotSupported { .. }
+        | ObjectStoreError::NotImplemented { .. }) => {
             ConditionalWriteError::Unsupported { path, source }
         }
-        (_, source) => ConditionalWriteError::Store { path, source },
+        source => ConditionalWriteError::Store { path, source },
     }
 }
 

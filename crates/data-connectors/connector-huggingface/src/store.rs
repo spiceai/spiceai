@@ -132,7 +132,7 @@ fn target(location: &Path) -> object_store::Result<Target<'_>> {
     if !hub::is_commit_sha(commit) {
         return Err(invalid());
     }
-    let repo = RepoId::new(owner, name).map_err(|_| invalid())?;
+    let repo = RepoId::dataset(owner, name).map_err(|_| invalid())?;
     Ok(Target {
         repo,
         commit,
@@ -165,6 +165,29 @@ fn object_meta(
         e_tag: Some(entry.content_id().to_string()),
         version: Some(commit.to_string()),
     })
+}
+
+/// The file at `path`, or [`object_store::Error::NotFound`] when it is missing or a folder.
+async fn file_entry(
+    hub: &Hub,
+    repo: &RepoId,
+    commit: &str,
+    path: &str,
+    location: &Path,
+) -> object_store::Result<TreeEntry> {
+    hub.entry(repo, commit, path)
+        .await
+        .map_err(|e| store_error(location, e))?
+        .filter(|entry| entry.kind == EntryKind::File)
+        .ok_or_else(|| {
+            store_error(
+                location,
+                hub::Error::EntryNotFound {
+                    repo: repo.clone(),
+                    path: path.to_string(),
+                },
+            )
+        })
 }
 
 /// Maps a Hub error to the `object_store` error a reader acts on: a missing path is
@@ -247,20 +270,7 @@ impl ObjectStore for HuggingFaceStore {
         let empty_range =
             matches!(&options.range, Some(GetRange::Bounded(range)) if range.is_empty());
         if options.head || empty_range {
-            let entry = hub
-                .entry(&repo, commit, path)
-                .await
-                .map_err(|e| store_error(location, e))?
-                .filter(|entry| entry.kind == EntryKind::File)
-                .ok_or_else(|| {
-                    store_error(
-                        location,
-                        hub::Error::EntryNotFound {
-                            repo: repo.clone(),
-                            path: path.to_string(),
-                        },
-                    )
-                })?;
+            let entry = file_entry(hub, &repo, commit, path, location).await?;
             let meta = object_meta(&repo, commit, last_modified, &entry)?;
             options.check_preconditions(&meta)?;
             let start = match &options.range {
@@ -279,11 +289,23 @@ impl ObjectStore for HuggingFaceStore {
             .read(&repo, commit, path, options.range.clone())
             .await
             .map_err(|e| store_error(location, e))?;
+        // `list` advertises `TreeEntry::content_id` (the git oid, or the LFS
+        // SHA-256). The download `ETag` is Hub `x-linked-etag`, a different
+        // identifier, so a read reports the listed one: a precondition on the
+        // `ETag` of any earlier `list`, `head`, or `get` then matches. A read
+        // without a precondition still returns its bytes when the description
+        // cannot be fetched, with no `ETag` rather than one that would not match.
+        let e_tag = if options.if_match.is_some() || options.if_none_match.is_some() {
+            Some(file_entry(hub, &repo, commit, path, location).await?)
+        } else {
+            file_entry(hub, &repo, commit, path, location).await.ok()
+        }
+        .map(|entry| entry.content_id().to_string());
         let meta = ObjectMeta {
             location: location.clone(),
             last_modified,
             size: read.size,
-            e_tag: read.e_tag,
+            e_tag,
             version: Some(commit.to_string()),
         };
         options.check_preconditions(&meta)?;
@@ -418,7 +440,7 @@ mod tests {
 
     #[test]
     fn listed_objects_keep_their_literal_name() {
-        let repo = RepoId::new("o", "d").expect("a valid repository");
+        let repo = RepoId::dataset("o", "d").expect("a valid repository");
         let entry: TreeEntry = serde_json::from_value(serde_json::json!({
             "type": "file",
             "path": "data~v2/part [1].parquet",

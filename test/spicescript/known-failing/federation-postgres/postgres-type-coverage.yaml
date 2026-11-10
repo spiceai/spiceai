@@ -1,0 +1,108 @@
+# Known failing (#15545): many PostgreSQL types register but
+# cannot be read, an array with a NULL element cannot be read, a NULL
+# composite value panics the query, and some types keep their table out of the
+# catalog altogether. Move this script to test/spicescript/ once it passes.
+name: postgres-type-coverage
+description: >
+  Every PostgreSQL column type is readable through a catalog: a type Spice maps
+  natively answers as its value, any other as the text PostgreSQL renders for
+  it (the documented `unsupported_type_action: string` default), and a NULL
+  stays NULL. One table per type, so one type cannot hide another.
+
+sources: { src: { kind: postgres } }
+
+spicepod:
+  version: v1
+  kind: Spicepod
+  name: postgres-type-coverage
+  catalogs:
+    - from: pg:postgres
+      name: pg
+      include: ['public.*']
+      params: ${sources.src.params}
+
+defaults:
+  expect: { oracle: src }
+
+steps:
+  - source-exec:
+      src: |
+        CREATE TYPE mood AS ENUM ('sad', 'happy');
+        CREATE DOMAIN posint AS int CHECK (VALUE > 0);
+        CREATE TYPE pair AS (n int, s text);
+        CREATE TABLE t_tsvector (id int PRIMARY KEY, v tsvector); INSERT INTO t_tsvector VALUES (1, to_tsvector('simple','spice data')), (2, NULL);
+        CREATE TABLE t_tsquery (id int PRIMARY KEY, v tsquery); INSERT INTO t_tsquery VALUES (1, to_tsquery('simple','spice & data')), (2, NULL);
+        CREATE TABLE t_xml (id int PRIMARY KEY, v xml); INSERT INTO t_xml VALUES (1, '<a>1</a>'::xml), (2, NULL);
+        CREATE TABLE t_inet (id int PRIMARY KEY, v inet); INSERT INTO t_inet VALUES (1, '10.1.2.3/24'), (2, NULL);
+        CREATE TABLE t_cidr (id int PRIMARY KEY, v cidr); INSERT INTO t_cidr VALUES (1, '10.1.0.0/16'), (2, NULL);
+        CREATE TABLE t_macaddr (id int PRIMARY KEY, v macaddr); INSERT INTO t_macaddr VALUES (1, '08:00:2b:01:02:03'), (2, NULL);
+        CREATE TABLE t_bit_4 (id int PRIMARY KEY, v bit(4)); INSERT INTO t_bit_4 VALUES (1, B'1010'), (2, NULL);
+        CREATE TABLE t_varbit (id int PRIMARY KEY, v varbit); INSERT INTO t_varbit VALUES (1, B'101'), (2, NULL);
+        CREATE TABLE t_int4range (id int PRIMARY KEY, v int4range); INSERT INTO t_int4range VALUES (1, '[1,5)'), (2, NULL);
+        CREATE TABLE t_daterange (id int PRIMARY KEY, v daterange); INSERT INTO t_daterange VALUES (1, '[2024-01-01,2024-02-01)'), (2, NULL);
+        CREATE TABLE t_box (id int PRIMARY KEY, v box); INSERT INTO t_box VALUES (1, '((0,0),(1,1))'), (2, NULL);
+        CREATE TABLE t_circle (id int PRIMARY KEY, v circle); INSERT INTO t_circle VALUES (1, '<(0,0),1>'), (2, NULL);
+        CREATE TABLE t_pg_lsn (id int PRIMARY KEY, v pg_lsn); INSERT INTO t_pg_lsn VALUES (1, '0/16B3748'), (2, NULL);
+        CREATE TABLE t_timetz (id int PRIMARY KEY, v timetz); INSERT INTO t_timetz VALUES (1, '10:00:00+02'), (2, NULL);
+        CREATE TABLE t_mood (id int PRIMARY KEY, v mood); INSERT INTO t_mood VALUES (1, 'happy'), (2, NULL);
+        CREATE TABLE t_posint (id int PRIMARY KEY, v posint); INSERT INTO t_posint VALUES (1, 5), (2, NULL);
+        CREATE TABLE t_pair (id int PRIMARY KEY, v pair); INSERT INTO t_pair VALUES (1, ROW(1,'a')), (2, NULL);
+        CREATE TABLE t_int_array (id int PRIMARY KEY, v int[]); INSERT INTO t_int_array VALUES (1, ARRAY[1, NULL, 3]), (2, NULL);
+        CREATE TABLE t_text_array (id int PRIMARY KEY, v text[]); INSERT INTO t_text_array VALUES (1, ARRAY['a', NULL]), (2, NULL);
+        CREATE TABLE t_uuid (id int PRIMARY KEY, v uuid); INSERT INTO t_uuid VALUES (1, 'a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11'), (2, NULL);
+        CREATE TABLE t_jsonb (id int PRIMARY KEY, v jsonb); INSERT INTO t_jsonb VALUES (1, '{"k": [1, null]}'), (2, NULL);
+        CREATE TABLE t_json (id int PRIMARY KEY, v json); INSERT INTO t_json VALUES (1, '{"k": 1}'), (2, NULL);
+        CREATE TABLE t_oid (id int PRIMARY KEY, v oid); INSERT INTO t_oid VALUES (1, 42), (2, NULL);
+        CREATE TABLE t_char_3 (id int PRIMARY KEY, v char(3)); INSERT INTO t_char_3 VALUES (1, 'ab'), (2, NULL);
+        CREATE TABLE t_bytea (id int PRIMARY KEY, v bytea); INSERT INTO t_bytea VALUES (1, '\x0102'), (2, NULL);
+  - start: {}
+  - query: SELECT id, v FROM pg.public.t_tsvector
+    oracle-sql: SELECT id, v::text FROM t_tsvector
+  - query: SELECT id, v FROM pg.public.t_tsquery
+    oracle-sql: SELECT id, v::text FROM t_tsquery
+  - query: SELECT id, v FROM pg.public.t_xml
+    oracle-sql: SELECT id, v::text FROM t_xml
+  - query: SELECT id, v FROM pg.public.t_inet
+    oracle-sql: SELECT id, v::text FROM t_inet
+  - query: SELECT id, v FROM pg.public.t_cidr
+    oracle-sql: SELECT id, v::text FROM t_cidr
+  - query: SELECT id, v FROM pg.public.t_macaddr
+    oracle-sql: SELECT id, v::text FROM t_macaddr
+  - query: SELECT id, v FROM pg.public.t_bit_4
+    oracle-sql: SELECT id, v::text FROM t_bit_4
+  - query: SELECT id, v FROM pg.public.t_varbit
+    oracle-sql: SELECT id, v::text FROM t_varbit
+  - query: SELECT id, v FROM pg.public.t_int4range
+    oracle-sql: SELECT id, v::text FROM t_int4range
+  - query: SELECT id, v FROM pg.public.t_daterange
+    oracle-sql: SELECT id, v::text FROM t_daterange
+  - query: SELECT id, v FROM pg.public.t_box
+    oracle-sql: SELECT id, v::text FROM t_box
+  - query: SELECT id, v FROM pg.public.t_circle
+    oracle-sql: SELECT id, v::text FROM t_circle
+  - query: SELECT id, v FROM pg.public.t_pg_lsn
+    oracle-sql: SELECT id, v::text FROM t_pg_lsn
+  - query: SELECT id, v FROM pg.public.t_timetz
+    oracle-sql: SELECT id, v::text FROM t_timetz
+  - query: SELECT id, v FROM pg.public.t_mood
+    oracle-sql: SELECT id, v FROM t_mood
+  - query: SELECT id, v FROM pg.public.t_posint
+    oracle-sql: SELECT id, v FROM t_posint
+  - query: SELECT id, v FROM pg.public.t_pair
+    oracle-sql: SELECT id, v::text FROM t_pair
+  - query: SELECT id, v FROM pg.public.t_int_array
+    oracle-sql: SELECT id, v FROM t_int_array
+  - query: SELECT id, v FROM pg.public.t_text_array
+    oracle-sql: SELECT id, v FROM t_text_array
+  - query: SELECT id, v FROM pg.public.t_uuid
+    oracle-sql: SELECT id, v FROM t_uuid
+  - query: SELECT id, v FROM pg.public.t_jsonb
+    oracle-sql: SELECT id, v::text FROM t_jsonb
+  - query: SELECT id, v FROM pg.public.t_json
+    oracle-sql: SELECT id, v::text FROM t_json
+  - query: SELECT id, v FROM pg.public.t_oid
+    oracle-sql: SELECT id, v FROM t_oid
+  - query: SELECT id, v FROM pg.public.t_char_3
+    oracle-sql: SELECT id, v::text FROM t_char_3
+  - query: SELECT id, v FROM pg.public.t_bytea
+    oracle-sql: SELECT id, v FROM t_bytea
