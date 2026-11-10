@@ -373,6 +373,21 @@ impl<'m> Context<'m> {
         unsafe { sys::llama_memory_seq_rm(sys::llama_get_memory(self.raw.as_ptr()), seq, from, -1) }
     }
 
+    /// Makes sequence `dst` a copy of sequence `src`, so both continue from the same prefix:
+    /// the attention cache is shared, and a recurrent layer's state is copied when `dst` is
+    /// next decoded. Returns false when either sequence is not one the context holds.
+    pub fn copy_seq(&mut self, src: i32, dst: i32) -> bool {
+        if !self.holds(src) || !self.holds(dst) {
+            return false;
+        }
+        // SAFETY: the context is live, and both sequences are among its sequences; -1, -1 means
+        // every position.
+        unsafe {
+            sys::llama_memory_seq_cp(sys::llama_get_memory(self.raw.as_ptr()), src, dst, -1, -1);
+        }
+        true
+    }
+
     /// How far this context's cache can be cut back, found as llama.cpp's server finds it: a
     /// context that keeps rollback snapshots rolls back only over them; otherwise two tokens are
     /// decoded into the emptied cache, and the second removed. Leaves the cache empty.

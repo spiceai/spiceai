@@ -69,6 +69,9 @@ struct Args {
     /// CPU threads per decode; llama.cpp's default when unset.
     #[arg(long)]
     threads: Option<std::num::NonZeroU32>,
+    /// The most questions decoded together after the state; more are decoded in groups.
+    #[arg(long, default_value = "8")]
+    parallel: std::num::NonZeroU32,
     /// Unmeasured evaluations before the measured ones.
     #[arg(long, default_value_t = 0)]
     warmup: usize,
@@ -151,8 +154,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         Some(path) => Some(Arc::new(LoraAdapter::load(&model, path)?)),
         None => None,
     };
-    let n_ctx = u32::try_from(decider.config().max_length)?;
-    let mut hidden = LlamaHiddenStates::new(backend, &model, adapter, n_ctx, 512, args.threads)?;
+    let max_length = u32::try_from(decider.config().max_length)?;
+    let mut hidden = LlamaHiddenStates::new(
+        backend,
+        &model,
+        adapter,
+        max_length,
+        args.parallel,
+        512,
+        args.threads,
+    )?;
 
     let state = Content::from(args.state.as_str());
     for _ in 0..args.warmup {
