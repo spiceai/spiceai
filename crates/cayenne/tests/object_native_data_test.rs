@@ -303,6 +303,21 @@ async fn create_with_config(
     Arc<CayenneTableProvider>,
     SessionContext,
 ) {
+    create_keyed_with_config(name, &[], None, vortex_config).await
+}
+
+/// [`create_with_config`] with a primary key and an `on_conflict`.
+async fn create_keyed_with_config(
+    name: &str,
+    primary_key: &[&str],
+    on_conflict: Option<OnConflict>,
+    vortex_config: VortexConfig,
+) -> (
+    Setup,
+    Arc<dyn MetadataCatalog>,
+    Arc<CayenneTableProvider>,
+    SessionContext,
+) {
     let counting = Arc::new(CountingStore::new());
     let faults = Arc::new(FaultStore::new(
         Arc::clone(&counting) as Arc<dyn ObjectStore>
@@ -325,8 +340,8 @@ async fn create_with_config(
             .create(CreateTableOptions {
                 table_name: name.to_string(),
                 schema: schema(),
-                primary_key: vec![],
-                on_conflict: None,
+                primary_key: primary_key.iter().map(ToString::to_string).collect(),
+                on_conflict,
                 base_path: setup.data_url.clone(),
                 partition_column: None,
                 vortex_config,
@@ -3177,6 +3192,244 @@ async fn a_filtered_delete_during_an_append_leaves_the_appended_rows() {
 #[tokio::test]
 async fn a_filtered_delete_during_an_abandoned_append_names_none_of_its_files() {
     a_filtered_delete_acts_only_on_committed_rows(false).await;
+}
+
+/// `(id, v)` rows.
+type Rows = Vec<(i64, i64)>;
+
+/// How a key delete reaches a keyed table.
+#[derive(Clone, Copy, Debug)]
+enum KeyDelete {
+    /// A SQL `DELETE` whose filter is a list of keys.
+    Sql,
+    /// The change sink's key delete.
+    ChangeStream,
+    /// A SQL `UPDATE` of a list of keys, which deletes their rows by key and
+    /// writes their new versions.
+    Update,
+}
+
+/// Where a keyed table's change-stream append stages its rows.
+#[derive(Clone, Copy, Debug)]
+enum AppendTarget {
+    /// No `on_conflict` and no key deleted yet: the current snapshot. The
+    /// append holds new keys only.
+    Current,
+    /// No `on_conflict`, after key 700 was deleted: a protected snapshot. The
+    /// append inserts key 700 again.
+    ProtectedAfterDelete,
+    /// `on_conflict: upsert`: a protected snapshot. The append supersedes
+    /// committed key 700.
+    ProtectedUpsert,
+}
+
+/// A key delete issued while a change-stream append has uploaded its files and
+/// not committed them, live and after a reopen from the store:
+///
+/// - on a table without `on_conflict`, whose appends hold only keys it does
+///   not, the delete acts on the rows committed when it takes the write lock
+///   and does not wait for the append, which then commits every one of its
+///   rows: the serial order delete, then append;
+/// - on an upserting table, whose append can hold a new version of a committed
+///   key, the delete waits for the append to commit and then acts on its rows
+///   too: no key it names keeps a row, the serial order append, then delete.
+///   An `UPDATE` is ordered the same way.
+async fn a_key_delete_during_an_append(how: KeyDelete, target: AppendTarget) {
+    let config = VortexConfig {
+        deletion_mode: DeletionMode::Key,
+        compaction_trigger_files: 1_000_000,
+        compaction_trigger_protected_snapshots: 1_000_000,
+        compaction_trigger_snapshot_age_ms: 0,
+        compaction_background_interval_ms: 0,
+        ..vortex_config()
+    };
+    let upserts = matches!(target, AppendTarget::ProtectedUpsert);
+    let on_conflict =
+        upserts.then(|| OnConflict::Upsert(ColumnReference::new(vec!["id".to_string()])));
+    let (setup, _catalog, table, ctx) =
+        create_keyed_with_config("events", &["id"], on_conflict, config).await;
+    run(
+        &ctx,
+        "INSERT INTO events SELECT value AS id, value * 10 AS v FROM generate_series(1, 1000)",
+    )
+    .await;
+    if matches!(target, AppendTarget::ProtectedAfterDelete) {
+        run(&ctx, "DELETE FROM events WHERE id IN (700)").await;
+    }
+    table.drain_in_flight_maintenance().await.expect("drain");
+
+    // A change-stream append of keys 1001..=2000 and, unless the table would
+    // then hold key 700 twice, of key 700 again: its files are uploaded when
+    // this returns, and it commits them only in `finish`. Key 500 is committed,
+    // key 700 is in the append, key 1500 only there.
+    let mut appended: Vec<(i64, i64)> = (1001..=2000).map(|id| (id, id * 10)).collect();
+    let named: Vec<i64> = if matches!(target, AppendTarget::Current) {
+        vec![500, 1500]
+    } else {
+        appended.push((700, 7001));
+        vec![500, 700, 1500]
+    };
+    let batch = rows_batch(&appended);
+    let stream: datafusion::execution::SendableRecordBatchStream = Box::pin(
+        datafusion::physical_plan::stream::RecordBatchStreamAdapter::new(
+            batch.schema(),
+            futures::stream::iter([Ok(batch)]),
+        ),
+    );
+    let write = table
+        .write_cdc_append_stream(stream, &SessionContext::new().task_ctx())
+        .await
+        .expect("stage the append");
+    assert!(
+        write.has_pending_finalize(),
+        "the append is uploaded and not committed"
+    );
+
+    let keys = named
+        .iter()
+        .map(ToString::to_string)
+        .collect::<Vec<_>>()
+        .join(", ");
+    let delete = {
+        let (ctx, table, named) = (ctx.clone(), Arc::clone(&table), named.clone());
+        tokio::spawn(async move {
+            match how {
+                KeyDelete::Sql => Some(
+                    deleted_by(&ctx, &format!("DELETE FROM events WHERE id IN ({keys})")).await,
+                ),
+                KeyDelete::ChangeStream => {
+                    cdc_delete(&table, &named).await;
+                    None
+                }
+                KeyDelete::Update => Some(
+                    deleted_by(
+                        &ctx,
+                        &format!("UPDATE events SET v = -1 WHERE id IN ({keys})"),
+                    )
+                    .await,
+                ),
+            }
+        })
+    };
+    let (waited_for_the_append, reported) = if upserts {
+        // What is under test is that the delete does NOT finish while the
+        // append is uncommitted, so there is no condition to poll: give it time.
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        let waited = !delete.is_finished();
+        write.finish().await.expect("the append commits");
+        let reported = tokio::time::timeout(Duration::from_secs(30), delete)
+            .await
+            .expect("the delete finishes once the append committed")
+            .expect("join the delete");
+        (waited, reported)
+    } else {
+        // The append commits only after the delete finishes, so a delete that
+        // waited for it would time out here.
+        let reported = tokio::time::timeout(Duration::from_secs(30), delete)
+            .await
+            .expect("the delete finishes while the append is uncommitted")
+            .expect("join the delete");
+        write.finish().await.expect("the append commits");
+        (false, reported)
+    };
+    table.drain_in_flight_maintenance().await.expect("drain");
+
+    // Without `on_conflict` the delete acts on the committed key 500 alone;
+    // after an upsert in flight it acts on every key it names.
+    let acted_on: Vec<i64> = if upserts { named.clone() } else { vec![500] };
+    let gone: &[i64] = if matches!(how, KeyDelete::Update) {
+        &[]
+    } else {
+        &acted_on
+    };
+    let expected: Vec<(i64, i64)> = (1..=2000)
+        .filter(|id| !gone.contains(id))
+        .map(|id| match id {
+            _ if matches!(how, KeyDelete::Update) && acted_on.contains(&id) => (id, -1),
+            700 if !matches!(target, AppendTarget::Current) => (id, 7001),
+            _ => (id, id * 10),
+        })
+        .collect();
+    // The rows a SQL `DELETE` reports, checked where they are all in the
+    // current snapshot. The change stream's count is not exact.
+    let expected_reported = match (how, target) {
+        (KeyDelete::Sql, AppendTarget::Current) => Some(1),
+        _ => None,
+    };
+    let reported = expected_reported.and(reported);
+    let live = sorted_rows(&ctx, "events").await;
+    drop((table, ctx));
+    let (_catalog, _table, reopened_ctx) = reopen_in(&setup.store, &setup.data_url, "events").await;
+    let reopened = sorted_rows(&reopened_ctx, "events").await;
+    // (expected rows missing, rows not expected)
+    let differs = |rows: &[(i64, i64)]| -> [Rows; 2] {
+        [
+            expected
+                .iter()
+                .filter(|row| !rows.contains(row))
+                .copied()
+                .collect(),
+            rows.iter()
+                .filter(|row| !expected.contains(row))
+                .copied()
+                .collect(),
+        ]
+    };
+    assert_eq!(
+        (
+            waited_for_the_append,
+            reported,
+            differs(&live),
+            live == expected,
+            differs(&reopened),
+            reopened == expected
+        ),
+        (
+            upserts,
+            expected_reported,
+            [Vec::new(), Vec::new()],
+            true,
+            [Vec::new(), Vec::new()],
+            true
+        ),
+        "the delete waited for the append, rows it reported, rows (missing, unexpected) and exact multiset live and after a reopen ({how:?}, append into {target:?})"
+    );
+}
+
+#[tokio::test]
+async fn a_sql_key_delete_during_an_append_leaves_the_appended_rows() {
+    a_key_delete_during_an_append(KeyDelete::Sql, AppendTarget::Current).await;
+}
+
+#[tokio::test]
+async fn a_change_stream_key_delete_during_an_append_leaves_the_appended_rows() {
+    a_key_delete_during_an_append(KeyDelete::ChangeStream, AppendTarget::Current).await;
+}
+
+#[tokio::test]
+async fn a_sql_key_delete_during_an_append_after_a_delete_leaves_the_appended_rows() {
+    a_key_delete_during_an_append(KeyDelete::Sql, AppendTarget::ProtectedAfterDelete).await;
+}
+
+#[tokio::test]
+async fn a_change_stream_key_delete_during_an_append_after_a_delete_leaves_the_appended_rows() {
+    a_key_delete_during_an_append(KeyDelete::ChangeStream, AppendTarget::ProtectedAfterDelete)
+        .await;
+}
+
+#[tokio::test]
+async fn a_sql_key_delete_waits_for_an_upsert_in_flight() {
+    a_key_delete_during_an_append(KeyDelete::Sql, AppendTarget::ProtectedUpsert).await;
+}
+
+#[tokio::test]
+async fn a_change_stream_key_delete_waits_for_an_upsert_in_flight() {
+    a_key_delete_during_an_append(KeyDelete::ChangeStream, AppendTarget::ProtectedUpsert).await;
+}
+
+#[tokio::test]
+async fn an_update_waits_for_an_upsert_in_flight() {
+    a_key_delete_during_an_append(KeyDelete::Update, AppendTarget::ProtectedUpsert).await;
 }
 
 /// Retention of a dataset whose data is in the location lists nothing: it finds

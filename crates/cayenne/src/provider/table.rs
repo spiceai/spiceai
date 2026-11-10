@@ -3161,6 +3161,12 @@ pub struct CayenneTableProvider {
     /// Empty for an inline append, which records after publishing, so the scan
     /// sees its rows.
     inflight_staging_appends: Arc<ParkingMutex<HashMap<String, Arc<PkDigestSet>>>>,
+    /// Admission of change-stream appends to staging: each holds it shared while
+    /// it stages, and a write that tombstones keys holds it exclusively while it
+    /// waits for the appends staged before it to commit
+    /// ([`Self::lock_write_after_staged_appends`]), so no new append stages ahead
+    /// of it meanwhile.
+    append_admission: Arc<tokio::sync::RwLock<()>>,
     /// Snapshot dirs the catalog no longer references (merged away by a
     /// protected-snapshot subset compaction), awaiting physical deletion:
     /// snapshot id → the instant it was retired. Deletion is deferred
@@ -6740,6 +6746,52 @@ impl CayenneTableProvider {
         !self.inflight_staging_appends.lock().is_empty()
     }
 
+    /// Whether a write that tombstones keys waits for the appends staged before
+    /// it to commit ([`Self::lock_write_after_staged_appends`]): the table
+    /// deletes by key and upserts, so an append still staging can hold a new
+    /// version of a committed key. A key tombstone hides every row of its key
+    /// whose sequence is below its own, and a staging append reserved its
+    /// sequences when it staged, so the tombstone of a delete in between would
+    /// hide the new version along with the committed one, while the delete,
+    /// reading committed rows, finds none of the keys only the append holds: an
+    /// outcome of neither order. A table without `on_conflict` appends only keys
+    /// it does not hold, so no key has rows both committed and staging for one
+    /// tombstone to hide together, and a position delete names committed files
+    /// only: neither waits.
+    pub(crate) fn key_tombstones_wait_for_staged_appends(&self) -> bool {
+        !self.pk_deletion_strategy.is_position_based() && self.upsert_bloom_eligible()
+    }
+
+    /// `write_lock`, for a write that tombstones keys, taken once every append
+    /// staged before this call has committed or been abandoned, so the write
+    /// acts on the appended rows like on every other committed row (see
+    /// [`Self::key_tombstones_wait_for_staged_appends`]). The wait holds
+    /// [`Self::append_admission`] so no append stages meanwhile, and not
+    /// `write_lock`, which an append into the current snapshot takes to commit.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the appends staged before this call have not
+    /// committed within the drain timeout.
+    pub(crate) async fn lock_write_after_staged_appends(
+        &self,
+    ) -> Result<tokio::sync::OwnedMutexGuard<()>> {
+        let _admission = self.append_admission.write().await;
+        if !self
+            .drain_inflight_staged_writes(STAGED_WRITE_DRAIN_TIMEOUT)
+            .await
+        {
+            return Err(Error::Internal {
+                table: self.table_metadata.table_name.clone(),
+                message: format!(
+                    "A change-stream write did not commit within {} s, so the delete or update was not applied; retry it",
+                    STAGED_WRITE_DRAIN_TIMEOUT.as_secs()
+                ),
+            });
+        }
+        Ok(self.write_lock_arc().lock_owned().await)
+    }
+
     /// Wait for in-flight pipelined Stage-B publishes (staged WALs + staged
     /// inline tombstones) to drain, up to `timeout`. Returns `false` on
     /// timeout — the caller turns that into its own structured error (a
@@ -6853,6 +6905,15 @@ impl CayenneTableProvider {
         ));
 
         let lock_wait_start = Instant::now();
+        // Held while this append stages: a key delete waiting for the appends
+        // staged before it holds it exclusively
+        // (`lock_write_after_staged_appends`). Not taken under an outer
+        // `write_lock` hold, which already excludes that delete.
+        let _admission = if super::write_lock_held::is_held() {
+            None
+        } else {
+            Some(self.append_admission.read().await)
+        };
         // Autocommit UPDATE already holds `write_lock`. A second acquire
         // deadlocks. `acquire_or_share` reuses that hold; spawned commit
         // keeps a clone of it (task-locals do not cross `tokio::spawn`).
@@ -11548,6 +11609,7 @@ impl CayenneTableProvider {
             )),
             last_orphan_sweep: Arc::new(ParkingMutex::new(Instant::now())),
             inflight_staging_appends: Arc::new(ParkingMutex::new(HashMap::new())),
+            append_admission: Arc::new(tokio::sync::RwLock::new(())),
             retired_snapshot_dirs: snapshot_dir_pins.retired,
             snapshot_last_listed: snapshot_dir_pins.last_listed,
             snapshot_scan_refs: snapshot_dir_pins.scan_refs,
@@ -14013,6 +14075,7 @@ impl CayenneTableProvider {
             orphan_age_floor_ms: Arc::clone(&self.orphan_age_floor_ms),
             last_orphan_sweep: Arc::clone(&self.last_orphan_sweep),
             inflight_staging_appends: Arc::clone(&self.inflight_staging_appends),
+            append_admission: Arc::clone(&self.append_admission),
             retired_snapshot_dirs: Arc::clone(&self.retired_snapshot_dirs),
             snapshot_last_listed: Arc::clone(&self.snapshot_last_listed),
             snapshot_scan_refs: Arc::clone(&self.snapshot_scan_refs),
