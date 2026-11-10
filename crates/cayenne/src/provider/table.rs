@@ -730,7 +730,8 @@ impl CayenneCdcWrite {
                 // Remove this protected-snapshot append's staging WAL now that
                 // the move has made its replacement files durable in the target
                 // snapshot (`apply_under_held_barrier` removes the WAL only for
-                // `CurrentSnapshot` targets). Best-effort: the append is already
+                // `CurrentSnapshot` targets). Inside a same-record scope the
+                // removal waits for the scope's commit instead. Best-effort: the append is already
                 // durably committed (its `snapshot_sequence` is durable from Stage
                 // A), so a failed unlink must NOT fail the write — the leftover WAL
                 // is rolled forward idempotently by the next write's
@@ -3161,6 +3162,11 @@ pub struct CayenneTableProvider {
     /// Empty for an inline append, which records after publishing, so the scan
     /// sees its rows.
     inflight_staging_appends: Arc<ParkingMutex<HashMap<String, Arc<PkDigestSet>>>>,
+    /// Staged appends whose staged files or staging WAL wait to be deleted until
+    /// the record holding their changes commits (see
+    /// [`crate::catalog::DeletesAfterCommit`]). Recovery leaves their WALs alone,
+    /// as it does an in-flight append's.
+    staging_deletes_after_commit: Arc<ParkingMutex<HashSet<String>>>,
     /// Snapshot dirs the catalog no longer references (merged away by a
     /// protected-snapshot subset compaction), awaiting physical deletion:
     /// snapshot id → the instant it was retired. Deletion is deferred
@@ -6734,6 +6740,41 @@ impl CayenneTableProvider {
         self.inflight_staging_appends
             .lock()
             .contains_key(staging_snapshot_id)
+            || self
+                .staging_deletes_after_commit
+                .lock()
+                .contains(staging_snapshot_id)
+    }
+
+    /// Leave a delete of `staging_snapshot_id`'s staging objects for the owner of
+    /// the enclosing same-record scope, or return it to send now outside one.
+    /// Until the delete is sent, recovery skips the append's WAL; if it is never
+    /// sent, the next write's recovery finishes the append from that WAL.
+    pub(crate) fn delete_staging_after_commit(
+        &self,
+        staging_snapshot_id: &str,
+        delete: futures::future::BoxFuture<'static, std::result::Result<(), String>>,
+    ) -> Option<futures::future::BoxFuture<'static, std::result::Result<(), String>>> {
+        let id = staging_snapshot_id.to_string();
+        self.staging_deletes_after_commit.lock().insert(id.clone());
+        let pending = Arc::clone(&self.staging_deletes_after_commit);
+        let sent = {
+            let pending = Arc::clone(&pending);
+            let id = id.clone();
+            Box::pin(async move {
+                let result = delete.await;
+                pending.lock().remove(&id);
+                result
+            })
+        };
+        let staging_wal_present = Arc::clone(&self.staging_wal_present);
+        let staging_may_have_files = Arc::clone(&self.staging_may_have_files);
+        let abandon = Box::new(move || {
+            pending.lock().remove(&id);
+            staging_wal_present.store(true, Ordering::Release);
+            staging_may_have_files.store(true, Ordering::Release);
+        });
+        crate::catalog::delete_after_commit(sent, abandon)
     }
 
     pub(crate) fn has_inflight_staging_appends(&self) -> bool {
@@ -10427,33 +10468,66 @@ impl CayenneTableProvider {
         }
         self.uncommitted_files.forget(staging_snapshot_id);
 
-        // Phase 2: delete staging originals, in batched requests.
-        let store = Arc::clone(&config.store);
-        let outcome = crate::dataset_storage::delete_in_batches(
-            &store,
-            file_moves
+        // Phase 2: delete staging originals, in batched requests. Inside a
+        // same-record scope the files were only buffered above, so the delete
+        // waits for the scope's commit: until then the staging WAL and these
+        // originals are what recovery finishes the append from.
+        if crate::catalog::deletes_wait_for_commit() {
+            let store = Arc::clone(&config.store);
+            let table_name = self.table_metadata.table_name.clone();
+            let originals: Vec<ObjectStorePath> = file_moves
                 .iter()
                 .map(|(source, _)| source.clone())
-                .collect(),
-        )
-        .await;
-        if let Some(source) = outcome.first_error {
-            return Err(Error::ObjectStore {
-                operation: "delete staging file after copy",
-                table: self.table_metadata.table_name.clone(),
-                source,
+                .collect();
+            let delete = Box::pin(async move {
+                let outcome = crate::dataset_storage::delete_in_batches(&store, originals).await;
+                if let Some(source) = outcome.first_error {
+                    return Err(format!(
+                        "Failed to delete a staging file of table {table_name} after its copy: {source}"
+                    ));
+                }
+                if outcome.failed > 0 {
+                    return Err(format!(
+                        "{} staging file(s) of table {table_name} were neither deleted nor reported absent after their copy",
+                        outcome.failed
+                    ));
+                }
+                Ok(())
             });
-        }
-        ensure!(
-            outcome.failed == 0,
-            InternalSnafu {
-                table: self.table_metadata.table_name.clone(),
-                message: format!(
-                    "{} staging file(s) were neither deleted nor reported absent after their copy",
-                    outcome.failed
-                ),
+            if let Some(delete) = self.delete_staging_after_commit(staging_snapshot_id, delete) {
+                delete.await.map_err(|message| Error::Internal {
+                    table: self.table_metadata.table_name.clone(),
+                    message,
+                })?;
             }
-        );
+        } else {
+            let store = Arc::clone(&config.store);
+            let outcome = crate::dataset_storage::delete_in_batches(
+                &store,
+                file_moves
+                    .iter()
+                    .map(|(source, _)| source.clone())
+                    .collect(),
+            )
+            .await;
+            if let Some(source) = outcome.first_error {
+                return Err(Error::ObjectStore {
+                    operation: "delete staging file after copy",
+                    table: self.table_metadata.table_name.clone(),
+                    source,
+                });
+            }
+            ensure!(
+                outcome.failed == 0,
+                InternalSnafu {
+                    table: self.table_metadata.table_name.clone(),
+                    message: format!(
+                        "{} staging file(s) were neither deleted nor reported absent after their copy",
+                        outcome.failed
+                    ),
+                }
+            );
+        }
 
         tracing::debug!(
             "Moved {} file(s) from staging to snapshot {current_snapshot} (S3) for table {}",
@@ -11548,6 +11622,7 @@ impl CayenneTableProvider {
             )),
             last_orphan_sweep: Arc::new(ParkingMutex::new(Instant::now())),
             inflight_staging_appends: Arc::new(ParkingMutex::new(HashMap::new())),
+            staging_deletes_after_commit: Arc::new(ParkingMutex::new(HashSet::new())),
             retired_snapshot_dirs: snapshot_dir_pins.retired,
             snapshot_last_listed: snapshot_dir_pins.last_listed,
             snapshot_scan_refs: snapshot_dir_pins.scan_refs,
@@ -14013,6 +14088,7 @@ impl CayenneTableProvider {
             orphan_age_floor_ms: Arc::clone(&self.orphan_age_floor_ms),
             last_orphan_sweep: Arc::clone(&self.last_orphan_sweep),
             inflight_staging_appends: Arc::clone(&self.inflight_staging_appends),
+            staging_deletes_after_commit: Arc::clone(&self.staging_deletes_after_commit),
             retired_snapshot_dirs: Arc::clone(&self.retired_snapshot_dirs),
             snapshot_last_listed: Arc::clone(&self.snapshot_last_listed),
             snapshot_scan_refs: Arc::clone(&self.snapshot_scan_refs),
@@ -40572,15 +40648,17 @@ impl CayenneTableProvider {
             if flushed_into_current.is_empty() {
                 self.clear_inlined_metadata_after_checkpoint().await?;
             } else {
-                crate::catalog::with_same_record_commits(async {
+                let (recorded, deletes) = crate::catalog::with_same_record_commits(async {
                     self.record_files_in_manifest(&current_snapshot_id, &flushed_into_current)
                         .await?;
                     self.clear_inlined_metadata_after_checkpoint().await
                 })
-                .await?;
+                .await;
+                recorded?;
                 self.catalog
                     .commit_pending_for(&self.table_metadata.table_id)
                     .await?;
+                deletes.run().await;
                 self.uncommitted_files.forget(&current_snapshot_id);
             }
             self.refresh_listing_table_under_held_fence().await?;

@@ -1774,6 +1774,30 @@ impl CayenneTableProvider {
                 .end_final_key_write(staging_snapshot_id);
             return Ok(());
         }
+        // Inside a same-record scope the write's changes are only buffered, so
+        // the WAL that lets recovery finish it stays until they commit.
+        if crate::catalog::deletes_wait_for_commit() {
+            let table = self.clone_for_write();
+            let id = staging_snapshot_id.to_string();
+            let delete = Box::pin(async move {
+                table
+                    .remove_staging_wal_now(&id)
+                    .await
+                    .map_err(|error| error.to_string())
+            });
+            if let Some(delete) = self.delete_staging_after_commit(staging_snapshot_id, delete) {
+                delete.await.map_err(|message| Error::Internal {
+                    table: self.table_name().to_string(),
+                    message,
+                })?;
+            }
+            return Ok(());
+        }
+        self.remove_staging_wal_now(staging_snapshot_id).await
+    }
+
+    /// [`Self::remove_staging_wal_for`], sent now.
+    async fn remove_staging_wal_now(&self, staging_snapshot_id: &str) -> Result<()> {
         if self.data_in_store() {
             let config = self.require_object_store()?;
             if let Some(staging_prefix) = self.snapshot_object_store_prefix(staging_snapshot_id)? {
