@@ -35958,9 +35958,7 @@ impl CayenneTableProvider {
         // the tombstone exactly when the replacement is in the listing.
         let inlined_deletes: Vec<InlinedDelete> = {
             let awaiting = self.inlined_tombstones_awaiting_publish.lock();
-            if awaiting.is_empty() || true
-            /* MUTANT: no deny-list */
-            {
+            if awaiting.is_empty() {
                 inlined_deletes
             } else {
                 inlined_deletes
