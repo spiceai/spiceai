@@ -80,9 +80,10 @@ pub struct Spiced {
 }
 
 /// A container `spiced` runs in: on the host's network, so it serves on the
-/// same local ports a process would, with the binary and `volumes` mounted
-/// and its working directory at the same path as on the host. Everything
-/// else, the temporary directory included, is its own.
+/// same local ports a process would, or, with `bridge`, on Docker's default
+/// bridge network with those ports published; with the binary and `volumes`
+/// mounted and its working directory at the same path as on the host.
+/// Everything else, the temporary directory included, is its own.
 #[derive(Debug, Clone)]
 pub struct ContainerRun {
     pub image: String,
@@ -92,6 +93,39 @@ pub struct ContainerRun {
     /// Whether the daemon runs rootless, so its containers live in a user
     /// namespace where the daemon's own user is root.
     pub rootless: bool,
+    /// Runs the container on Docker's default bridge network instead of the
+    /// host's, serving on every interface inside it, and publishes each port
+    /// `spiced` serves where it is reached on loopback and at this address,
+    /// the one its cluster peers reach it at.
+    ///
+    /// A rootless daemon's `host` network is `RootlessKit`'s namespace, not
+    /// this machine's, so nothing here reaches a listener in a host-network
+    /// container: a scheduler running here never hears from its executors.
+    /// A published port is forwarded from this machine's namespace, and a
+    /// bridge container reaches this machine's routable address.
+    pub bridge: Option<std::net::IpAddr>,
+}
+
+/// The ports a container [`ContainerRun::bridge`] publishes, `-p` by `-p`:
+/// each of `ports` at the same number inside, on every interface, which is
+/// loopback and the routable address. A rootless daemon cannot publish one
+/// port on both: it binds each at its own loopback, and the second fails
+/// with "address already in use".
+fn publish_args(ports: &[u16]) -> Vec<String> {
+    ports
+        .iter()
+        .flat_map(|port| ["-p".to_string(), format!("0.0.0.0:{port}:{port}")])
+        .collect()
+}
+
+/// The port of the `--node-bind-address` among `args`, the one a cluster node
+/// serves its peers on, if it has one.
+fn node_bind_port(args: &[String]) -> Option<u16> {
+    args.iter()
+        .position(|a| a == "--node-bind-address")
+        .and_then(|i| args.get(i + 1))
+        .and_then(|address| address.rsplit_once(':'))
+        .and_then(|(_, port)| port.parse().ok())
 }
 
 /// The `docker run --user` a container runs as, so that it may write in, and
@@ -174,8 +208,24 @@ impl Spiced {
     }
 
     /// Runs `spiced` in this container on every start.
-    pub fn set_container(&mut self, run: ContainerRun) {
+    /// The container this instance runs in, if it runs in one.
+    pub fn container_name(&self) -> Option<&str> {
+        self.container.as_ref().map(|run| run.name.as_str())
+    }
+
+    /// Runs `spiced` in `run`'s container. A bridged one publishes its ports
+    /// on every interface, so they are given out again from those free on
+    /// every interface: a loopback probe misses a listener on another address.
+    pub fn set_container(&mut self, run: ContainerRun) -> Result<()> {
+        if run.bridge.is_some() {
+            let every = std::net::Ipv4Addr::UNSPECIFIED.into();
+            self.http = crate::docker::free_port_on(every)?;
+            self.flight = crate::docker::free_port_on(every)?;
+            self.metrics = crate::docker::free_port_on(every)?;
+            self.otel = crate::docker::free_port_on(every)?;
+        }
         self.container = Some(run);
+        Ok(())
     }
 
     /// Serves HTTP on `port`, one a script was told in advance
@@ -325,15 +375,22 @@ impl Spiced {
                 self.container_command(&run, &binary)?
             }
         };
+        // In a bridge container, loopback is the container's own, so `spiced`
+        // serves on every interface there and its published ports reach it.
+        let bridged = self
+            .container
+            .as_ref()
+            .is_some_and(|run| run.bridge.is_some());
+        let host = if bridged { "0.0.0.0" } else { "127.0.0.1" };
         let child = command
             .arg("--telemetry-enabled=false")
             .args([
                 "--http",
-                &http_listen(self.http_on_every_interface, self.http),
+                &http_listen(self.http_on_every_interface || bridged, self.http),
             ])
-            .args(["--flight", &format!("127.0.0.1:{}", self.flight)])
-            .args(["--metrics", &format!("127.0.0.1:{}", self.metrics)])
-            .args(["--open_telemetry", &format!("127.0.0.1:{}", self.otel)])
+            .args(["--flight", &format!("{host}:{}", self.flight)])
+            .args(["--metrics", &format!("{host}:{}", self.metrics)])
+            .args(["--open_telemetry", &format!("{host}:{}", self.otel)])
             .args(&self.extra_args)
             .stdout(log.try_clone()?)
             .stderr(log)
@@ -393,8 +450,15 @@ impl Spiced {
         let dir = std::path::absolute(&self.dir)?;
         let owner = std::fs::metadata(&dir)?;
         let mut command = Command::new("docker");
+        command.args(["run", "--rm", "--init"]);
+        if run.bridge.is_some() {
+            let mut ports = vec![self.http, self.flight, self.metrics, self.otel];
+            ports.extend(node_bind_port(&self.extra_args));
+            command.args(publish_args(&ports));
+        } else {
+            command.args(["--network", "host"]);
+        }
         command
-            .args(["run", "--rm", "--init", "--network", "host"])
             .args(["--name", &run.name])
             .arg("--label")
             .arg(format!(
@@ -1234,5 +1298,40 @@ mod http_listen_tests {
             "spiced --http 127.0.0.1:1 --flight 127.0.0.1:29142",
             29142
         ));
+    }
+}
+
+#[cfg(test)]
+mod bridge_tests {
+    use super::{node_bind_port, publish_args};
+
+    #[test]
+    fn publishes_each_port_once_on_every_interface() {
+        assert_eq!(
+            publish_args(&[29141, 29150]),
+            ["-p", "0.0.0.0:29141:29141", "-p", "0.0.0.0:29150:29150"]
+        );
+    }
+
+    #[test]
+    fn finds_the_node_port_only_after_its_flag() {
+        let args = |a: &[&str]| a.iter().map(ToString::to_string).collect::<Vec<_>>();
+        assert_eq!(
+            node_bind_port(&args(&[
+                "--role",
+                "executor",
+                "--node-bind-address",
+                "0.0.0.0:29160",
+                "--node-mtls-ca-certificate-file",
+                "ca.crt",
+            ])),
+            Some(29160)
+        );
+        // A scheduler address carries a port too, but is not the node's own.
+        assert_eq!(
+            node_bind_port(&args(&["--scheduler-address", "https://127.0.0.1:29170"])),
+            None
+        );
+        assert_eq!(node_bind_port(&args(&["--node-bind-address"])), None);
     }
 }
