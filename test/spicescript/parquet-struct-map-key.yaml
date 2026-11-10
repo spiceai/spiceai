@@ -1,0 +1,94 @@
+name: parquet-struct-map-key
+description: >
+  A key lookup into a map that sits inside a struct column of a Parquet file
+  (`som['mm']['k']`, which DataFusion folds into one
+  `get_field(som, 'mm', 'k')`) answers the same as it does from an
+  accelerated copy: in the projection, through `get_field(som, 'mm')['k']`,
+  and in a `WHERE` clause that is pushed into the Parquet row filter, rather
+  than failing with an internal error because the scan pruned the struct
+  column away. The federated plan shows the lookup pushed into the Parquet
+  scan, so the path that used to fail is the one under test. A second
+  dataset reads files whose structs differ, so the scan casts one file's
+  struct before the lookup; the `WHERE` must still filter that file.
+
+sources:
+  src: { kind: duckdb }
+
+variants:
+  arrow: arrow-memory
+  cayenne: cayenne-file
+  federated: {}
+
+spicepod:
+  version: v1
+  kind: Spicepod
+  name: parquet-struct-map-key
+  runtime:
+    caching: { sql_results: { enabled: false } }
+  datasets:
+    - from: 'file:${instance.dir}/som.parquet'
+      name: t
+      params: { file_format: parquet }
+    # Files whose `som` structs differ: `data_0.parquet` lacks `n`. The
+    # table schema comes from `z.parquet`, written last, so it keeps `n` and
+    # the scan casts `data_0.parquet`'s struct to it before the lookup.
+    - from: 'file:${instance.dir}/evo/'
+      name: evo
+      params: { file_format: parquet }
+
+steps:
+  # Row 0 holds the key, row 1 a NULL map, row 2 a map without the key.
+  - source-exec:
+      src: |
+        COPY (
+          SELECT * FROM (VALUES
+            (0, {'mm': MAP {'k': 1}, 'n': 5}),
+            (1, {'mm': NULL::MAP(VARCHAR, BIGINT), 'n': 6}),
+            (2, {'mm': MAP {'j': 2}, 'n': 7})
+          ) AS v(id, som)
+        ) TO '${instance.dir}/som.parquet' (FORMAT parquet);
+  - source-exec:
+      src: |
+        COPY (
+          SELECT * FROM (VALUES
+            (2, {'mm': MAP {'k': 1}}),
+            (3, {'mm': MAP {'k': 3}})
+          ) AS v(id, som)
+        ) TO '${instance.dir}/evo' (FORMAT parquet, PER_THREAD_OUTPUT true);
+  - source-exec:
+      src: |
+        COPY (
+          SELECT * FROM (VALUES
+            (0, {'mm': MAP {'k': 1}, 'n': 5}),
+            (1, {'mm': MAP {'j': 2}, 'n': 6})
+          ) AS v(id, som)
+        ) TO '${instance.dir}/evo/z.parquet' (FORMAT parquet);
+  - start: {}
+
+  # Pin the lookup inside the Parquet scan's projection: a lookup evaluated
+  # by a ProjectionExec above a scan reading `[id, som]` would not exercise
+  # the pruning fix.
+  - explain: SELECT id, som['mm']['k'] AS v FROM t
+    only: federated
+    contains: ['projection=[id, get_field(som@1, mm, k) as v], file_type=parquet']
+  - query: SELECT id, som['mm']['k'] AS v FROM t ORDER BY id
+    expect: { rows: [['0', '1'], ['1', null], ['2', null]] }
+  - query: SELECT som['mm']['k'] AS v FROM t
+    expect: { rows: [['1'], [null], [null]] }
+  - query: SELECT id, get_field(som, 'mm')['k'] AS v FROM t ORDER BY id
+    expect: { rows: [['0', '1'], ['1', null], ['2', null]] }
+  - query: SELECT id FROM t WHERE som['mm']['k'] = 1
+    expect: { rows: [['0']] }
+  - query: SELECT id, som['n'] AS n FROM t WHERE som['mm']['k'] IS NULL ORDER BY id
+    expect: { rows: [['1', '6'], ['2', '7']] }
+  - query: SELECT id, map_extract(som['mm'], 'k') AS v FROM t ORDER BY id
+    expect: {}
+
+  # The lookup still filters the file whose struct is cast, rather than the
+  # predicate being dropped for it and every row of that file returned.
+  - query: SELECT id, som['mm']['k'] AS v FROM evo ORDER BY id
+    expect: { rows: [['0', '1'], ['1', null], ['2', '1'], ['3', '3']] }
+  - query: SELECT id FROM evo WHERE som['mm']['k'] = 1 ORDER BY id
+    expect: { rows: [['0'], ['2']] }
+  - query: SELECT id, som['n'] AS n FROM evo WHERE som['mm']['k'] = 1 ORDER BY id
+    expect: { rows: [['0', '5'], ['2', null]] }

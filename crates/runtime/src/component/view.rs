@@ -241,18 +241,6 @@ impl AccelerationSource for View {
                     .into_iter()
                     .map(|ds| ds as Arc<dyn runtime_acceleration::AccelerationSource>)
                     .collect();
-            #[cfg(feature = "duckdb")]
-            {
-                let views: Vec<Arc<dyn runtime_acceleration::AccelerationSource>> =
-                    Arc::clone(&runtime)
-                        .get_initialized_views(&app, crate::LogErrors(false))
-                        .await
-                        .into_iter()
-                        .map(|v| v as Arc<dyn runtime_acceleration::AccelerationSource>)
-                        .collect();
-                datasets.into_iter().chain(views).collect()
-            }
-            #[cfg(not(feature = "duckdb"))]
             datasets
         })
     }

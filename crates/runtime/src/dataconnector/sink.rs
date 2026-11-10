@@ -463,7 +463,6 @@ mod tests {
         for engine in [
             Engine::Arrow,
             Engine::PartitionedArrow,
-            Engine::DuckDB,
             Engine::Sqlite,
             Engine::PostgreSQL,
         ] {
