@@ -41,6 +41,7 @@ runtime-object-store = { path = "../runtime-object-store" }
 runtime-parameters = { path = "../runtime-parameters" }
 serde_json.workspace = true
 snafu.workspace = true
+spice-table = { path = "../spice-table" }
 token_provider = { path = "../token_provider" }
 tokio.workspace = true
 tonic.workspace = true

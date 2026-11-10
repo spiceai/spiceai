@@ -6363,6 +6363,7 @@ dependencies = [
  "runtime-parameters",
  "serde_json",
  "snafu",
+ "spice-table",
  "tempfile",
  "token_provider",
  "tokio",
