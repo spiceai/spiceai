@@ -94,12 +94,8 @@ pub struct PreparedOnConflictDeletionPublish {
     /// and the later durable flip target precisely THIS tombstone — never a
     /// later-staged tombstone for the same PK.
     pub(crate) inlined_delete_id: Option<String>,
-    /// The inline tombstone commits active, in the record that makes the
-    /// replacement live (a keyed write into a new protected snapshot at final
-    /// keys), and its id is in the table's `inlined_tombstones_awaiting_publish`
-    /// until the publish. The publish then neither activates it in memory nor
-    /// queues a durable flip for it.
-    pub(crate) tombstone_committed_active: bool,
+    /// How the inline tombstone, if any, becomes active.
+    pub(crate) tombstone_activation: TombstoneActivation,
     /// Count of existing rows superseded by this upsert, captured from
     /// [`OnConflictDeletions::total_superseded`] at validation time. This is the
     /// authoritative live-row-delta input: it must NOT be recomputed from the
@@ -107,6 +103,19 @@ pub struct PreparedOnConflictDeletionPublish {
     /// SAME `Int64Pk` deletions in two encodings (i64 + committed byte keys), so
     /// summing their lengths double-counts, and neither captures `position_deletions`.
     pub(crate) superseded: usize,
+}
+
+/// How a staged upsert's inline tombstone becomes active.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum TombstoneActivation {
+    /// It commits inactive; the publish activates it in memory and queues its
+    /// durable flip.
+    AtPublish,
+    /// It commits active, in the record that makes the replacement live (a
+    /// keyed write into a new protected snapshot at final keys), and its id is
+    /// in the table's `inlined_tombstones_awaiting_publish` until the publish,
+    /// which then neither activates it in memory nor queues a flip.
+    Committed,
 }
 
 pub(crate) struct PreparedOnConflictDurablePayload {

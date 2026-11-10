@@ -60,7 +60,7 @@ use super::on_conflict::{
     PreparedInsertStream, PreparedOnConflictDeletionPublish, PreparedOnConflictDurablePayload,
     PreparedProtectedSnapshotUpdate, PreparedShardedInsertStream, ProtectedSnapshotScan,
     RowCountExactnessTaintingDeletionSink, RowKeyDeletionDelta, ShardedApplyBatches,
-    ShardedApplyResult, pk_deletion_snapshot_for_strategy,
+    ShardedApplyResult, TombstoneActivation, pk_deletion_snapshot_for_strategy,
 };
 use super::pk_deletion_mode::{AutoDeletionMode, AutoKeyTableKind, PkDeletionMode, TableStorage};
 use super::pk_index::{
@@ -876,7 +876,7 @@ impl CayenneCdcWrite {
                 .and_then(|payload| payload.inline_tombstone.as_mut())
         {
             tombstone.published = true;
-            prepared.tombstone_committed_active = true;
+            prepared.tombstone_activation = TombstoneActivation::Committed;
             table
                 .inlined_tombstones_awaiting_publish
                 .lock()
@@ -20593,7 +20593,7 @@ impl CayenneTableProvider {
             deleted_inlined_row_keys,
             position_deletions,
             inlined_delete_id,
-            tombstone_committed_active: false,
+            tombstone_activation: TombstoneActivation::AtPublish,
             superseded,
         })
     }
@@ -20801,7 +20801,7 @@ impl CayenneTableProvider {
         //     tombstone row and its in-memory entries, see
         //     `clear_inlined_metadata_after_checkpoint`).
         if let Some(inlined_id) = prepared.inlined_delete_id.clone() {
-            if prepared.tombstone_committed_active {
+            if prepared.tombstone_activation == TombstoneActivation::Committed {
                 // Committed active in the record that made the replacement
                 // live: it applies from now on, and nothing is left to flip.
                 self.inlined_tombstones_awaiting_publish
