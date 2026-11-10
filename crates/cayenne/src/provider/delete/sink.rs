@@ -215,6 +215,27 @@ impl PreparedDeletionPublish {
         self.deleted_count
     }
 
+    /// The keys this delete tombstones; none for a position delete.
+    pub(crate) fn tombstoned_keys(&self) -> crate::provider::table::UnpublishedKeyDeletes {
+        match &self.publish {
+            PreparedDeletionCache::Int64 { pks, .. } => {
+                crate::provider::table::UnpublishedKeyDeletes {
+                    pk_i64: pks.clone(),
+                    ..Default::default()
+                }
+            }
+            PreparedDeletionCache::RowKeys { keys, .. } => {
+                crate::provider::table::UnpublishedKeyDeletes {
+                    row_keys: keys.clone(),
+                    ..Default::default()
+                }
+            }
+            PreparedDeletionCache::Positions { .. } => {
+                crate::provider::table::UnpublishedKeyDeletes::default()
+            }
+        }
+    }
+
     /// Replace the computed count with the non-authoritative sentinel `0`. Used
     /// by the CDC `pk IN (...)` fast path: its extracted keys are an upper bound
     /// (not verified live rows), so returning a real count would require the

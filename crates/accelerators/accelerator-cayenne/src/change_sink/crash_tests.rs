@@ -2246,7 +2246,7 @@ async fn a_multi_group_inline_burst_holds_exactly_its_outcome() {
 /// acknowledgement on, exactly its outcome, also after a reopen.
 #[tokio::test(flavor = "multi_thread")]
 async fn every_multi_group_burst_is_invisible_until_its_record_commits() {
-    let shapes: [(&str, &[(&str, i64)]); 9] = [
+    let shapes: [(&str, &[(&str, i64)]); 10] = [
         (
             "upsert, delete inline key, upsert new",
             &[("c", 700), ("d", 700), ("c", 5_000)],
@@ -2273,6 +2273,16 @@ async fn every_multi_group_burst_is_invisible_until_its_record_commits() {
         (
             "delete, upsert, delete inline key",
             &[("d", 700), ("c", 700), ("d", 700)],
+        ),
+        (
+            "a new key upserted before and after another key's delete",
+            &[
+                ("c", 5_000),
+                ("c", 6_000),
+                ("d", 6_000),
+                ("c", 6_000),
+                ("c", 5_000),
+            ],
         ),
     ];
     let mut failures = Vec::new();

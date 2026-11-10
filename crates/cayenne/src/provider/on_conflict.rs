@@ -770,8 +770,13 @@ impl DeletionSink for InlineAwareDeletionSink {
             if crate::catalog::commit_left_to_scope_owner() {
                 // Buffered: the scope's owner commits the record, then runs this
                 // publish, so no reader sees the delete before it is durable.
-                // The vectors it replaces go only after that commit.
+                // The vectors it replaces go only after that commit. Until the
+                // publish, a later upsert treats the deleted keys as tombstoned.
                 let table = self.table.clone_for_write();
+                let unpublished_deletes = prepared_file_delete.as_ref().and_then(|prepared| {
+                    self.table
+                        .hold_unpublished_key_deletes(prepared.tombstoned_keys())
+                });
                 self.table
                     .publish_when_committed(async move {
                         table
@@ -781,6 +786,7 @@ impl DeletionSink for InlineAwareDeletionSink {
                                 &awaiting_publish,
                             )
                             .await;
+                        drop(unpublished_deletes);
                         table.remove_dropped_deletion_vector_files(replaced_vectors);
                     })
                     .await;
