@@ -59,3 +59,42 @@ steps:
   - query: SELECT * FROM a
     expect-empty: true
   - query: SELECT * FROM b
+  # Restarts with the source busy with writes to a table no dataset reads: a
+  # dataset is ready only once its rows can be read, never on a keepalive
+  # that overtakes its snapshot (in memory mode every restart loads one).
+  - source-exec: { src: "INSERT INTO a SELECT i, 'refill' || i FROM generate_series(1, 1000) i; CREATE TABLE unrelated (id serial PRIMARY KEY)" }
+  - query: SELECT * FROM a
+    eventually: 30s
+  - background:
+      id: unrelated-writes
+      source-exec: { src: "INSERT INTO unrelated DEFAULT VALUES" }
+      every: 50ms
+  - restart: {}
+  - query: SELECT * FROM a
+  - query: SELECT * FROM b
+  - restart: {}
+  - query: SELECT * FROM a
+  - query: SELECT * FROM b
+  - restart: {}
+  - query: SELECT * FROM a
+  - query: SELECT * FROM b
+  - restart: {}
+  - query: SELECT * FROM a
+  - query: SELECT * FROM b
+  - restart: {}
+  - query: SELECT * FROM a
+  - query: SELECT * FROM b
+  - stop-background: { id: unrelated-writes }
+  # Restarts with the source idle: a dataset whose stream has caught up is
+  # ready in seconds, without waiting for unrelated writes on the server to
+  # move its WAL (#15038).
+  - restart: { ready-timeout: 10s }
+  - restart: { ready-timeout: 10s }
+  - restart: { ready-timeout: 10s }
+  - restart: { ready-timeout: 10s }
+  - restart: { ready-timeout: 10s }
+  - restart: { ready-timeout: 10s }
+  - restart: { ready-timeout: 10s }
+  - restart: { ready-timeout: 10s }
+  - restart: { ready-timeout: 10s }
+  - restart: { ready-timeout: 10s }

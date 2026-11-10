@@ -175,7 +175,10 @@ This is normal.
 `idle_wakeup_interval` does not indicate failure. It bounds how long the client may block
 waiting for server messages before waking up to send a standby status update and continue waiting.
 While the system is idle, the effective feedback cadence is bounded by
-`idle_wakeup_interval`, not `status_interval`.
+`idle_wakeup_interval`, not `status_interval`. An idle-wakeup update also asks
+the server to reply once `status_interval` has passed since the last update that
+asked, so a silent connection still gets a server keepalive about every
+`status_interval`, rounded up to the next idle wakeup.
 
 ## Logical Decoding Messages
 
