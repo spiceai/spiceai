@@ -228,7 +228,7 @@ impl TableLayer for FreshFileListingLayer {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use arrow::array::{Int64Array, RecordBatch};
+    use arrow::array::{Array, Int64Array, RecordBatch};
     use arrow_schema::{DataType, Field, Schema};
     use datafusion::datasource::file_format::parquet::ParquetFormat;
     use datafusion::datasource::listing::{ListingOptions, ListingTable, ListingTableConfig};
@@ -249,7 +249,8 @@ mod tests {
         writer.close().expect("close parquet file");
     }
 
-    async fn count_and_max(ctx: &SessionContext) -> (i64, i64) {
+    /// `count(*)` and `max(id)`, the maximum `None` when it is NULL (no rows).
+    async fn count_and_max(ctx: &SessionContext) -> (i64, Option<i64>) {
         let batches = ctx
             .sql("SELECT count(*), max(id) FROM t")
             .await
@@ -258,14 +259,18 @@ mod tests {
             .await
             .expect("execute");
         let column = |i: usize| {
-            batches[0]
+            let column = batches[0]
                 .column(i)
                 .as_any()
                 .downcast_ref::<Int64Array>()
-                .expect("Int64 column")
-                .value(0)
+                .expect("Int64 column");
+            if column.is_null(0) {
+                None
+            } else {
+                Some(column.value(0))
+            }
         };
-        (column(0), column(1))
+        (column(0).expect("count is never NULL"), column(1))
     }
 
     /// Files added and replaced after the first query are read by the next one. Without
@@ -289,12 +294,12 @@ mod tests {
         ctx.register_table("t", FreshFileListingLayer::over(table, vec![url]))
             .expect("register");
 
-        assert_eq!(count_and_max(&ctx).await, (100, 100));
+        assert_eq!(count_and_max(&ctx).await, (100, Some(100)));
 
         write_ids(&dir.path().join("part-0.parquet"), 1..=1000);
         write_ids(&dir.path().join("part-1.parquet"), 1001..=3000);
 
-        assert_eq!(count_and_max(&ctx).await, (3000, 3000));
+        assert_eq!(count_and_max(&ctx).await, (3000, Some(3000)));
     }
 
     fn parquet_is_data_file(meta: &object_store::ObjectMeta) -> bool {
@@ -344,7 +349,7 @@ mod tests {
 
         let ctx = SessionContext::new();
         register_rejecting(&ctx, dir.path()).await;
-        assert_eq!(count_and_max(&ctx).await, (100, 100));
+        assert_eq!(count_and_max(&ctx).await, (100, Some(100)));
 
         std::fs::remove_file(&part0).expect("remove listed file");
         let err = query_err(&ctx).await;
@@ -354,10 +359,10 @@ mod tests {
         );
 
         write_ids(&part0, std::iter::empty());
-        assert_eq!(count_and_max(&ctx).await, (0, 0));
+        assert_eq!(count_and_max(&ctx).await, (0, None));
 
         write_ids(&part0, 1..=50);
-        assert_eq!(count_and_max(&ctx).await, (50, 50));
+        assert_eq!(count_and_max(&ctx).await, (50, Some(50)));
     }
 
     #[test]
