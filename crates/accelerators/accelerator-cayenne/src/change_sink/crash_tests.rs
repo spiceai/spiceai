@@ -2029,33 +2029,98 @@ async fn an_inline_burst_on_the_sqlite_catalog_is_committed_before_it_is_visible
     table.quiesce().await;
 }
 
-/// A keyed CDC burst whose changes split into several groups, each written
-/// inline: an upsert of an inline key, a delete of that key, and an upsert of a
-/// new key. A later group reads the rows of an earlier one, so the earlier
-/// groups' rows are published before the burst's record commits; the final
-/// group's are not. Once acknowledged, and after a reopen from the committed
-/// state, the table holds exactly the burst's outcome.
-#[tokio::test(flavor = "multi_thread")]
-async fn a_multi_group_inline_burst_holds_exactly_its_outcome() {
-    const KEY: i64 = 700;
-    const NEW_KEY: i64 = 5_000;
-    let (location, process) = Location::seeded_with(&[KEY]).await;
-    process.table.quiesce().await;
-    drop(process);
-    let inline = VortexConfig {
+/// [`cdc_config`], with a write of up to 1,024 rows inlined.
+fn inline_config() -> VortexConfig {
+    VortexConfig {
         inline_max_rows: 1_024,
         inline_max_bytes: 1 << 20,
         ..cdc_config()
-    };
-    let process = location.open_with(&inline).await;
-    let rows_before = process.rows().await;
+    }
+}
+
+/// What readers saw of one multi-group burst, and what the table held after it.
+struct MultiGroupOutcome {
+    before: Vec<(i64, i64)>,
+    expected: Vec<(i64, i64)>,
+    /// Held after the record is buffered, before its head write: the rows a
+    /// reader sees with what it already holds, then with views rebuilt from the
+    /// catalog, then of each key the burst names.
+    held_cached: Vec<(i64, i64)>,
+    held_rebuilt: Vec<(i64, i64)>,
+    held_keys: Vec<(i64, i64)>,
+    /// After the head write, before the burst's publish.
+    committed_rebuilt: Vec<(i64, i64)>,
+    committed_keys: Vec<(i64, i64)>,
+    head_held: u64,
+    head_before: u64,
+    acknowledged: Vec<(i64, i64)>,
+    rebuilt: Vec<(i64, i64)>,
+    reopened: Vec<(i64, i64)>,
+    position_reopened: Option<String>,
+}
+
+impl MultiGroupOutcome {
+    fn report(&self, label: &str) -> String {
+        format!(
+            "{label}: held (head {}, before {}): cached rows {} (equal to before: {}), rebuilt rows {} (equal to before: {}), keys {:?}; committed: rebuilt rows {} (equal to before: {}), keys {:?}; acknowledged rows {} (equal to expected: {}), rebuilt {} ({}), reopened {} ({}), position {:?}",
+            self.head_held,
+            self.head_before,
+            self.held_cached.len(),
+            self.held_cached == self.before,
+            self.held_rebuilt.len(),
+            self.held_rebuilt == self.before,
+            self.held_keys,
+            self.committed_rebuilt.len(),
+            self.committed_rebuilt == self.before,
+            self.committed_keys,
+            self.acknowledged.len(),
+            self.acknowledged == self.expected,
+            self.rebuilt.len(),
+            self.rebuilt == self.expected,
+            self.reopened.len(),
+            self.reopened == self.expected,
+            self.position_reopened,
+        )
+    }
+
+    /// The rows of the keys `ops` names, from `rows`.
+    fn keys_of(rows: &[(i64, i64)], ops: &[(&str, i64)]) -> Vec<(i64, i64)> {
+        rows.iter()
+            .copied()
+            .filter(|(id, _)| ops.iter().any(|(_, key)| key == id))
+            .collect()
+    }
+}
+
+/// Apply `ops` as one CDC burst to a table seeded with the file keys and the
+/// inline key 700, opened with `config`, and record what a reader sees while
+/// the burst's record is buffered (before its head write), after the head write
+/// and before the publish, once acknowledged, and after a reopen.
+async fn multi_group_burst(config: &VortexConfig, ops: &[(&str, i64)]) -> MultiGroupOutcome {
+    let (location, process) = Location::seeded_with(&[700]).await;
+    process.table.quiesce().await;
+    drop(process);
+    let process = location.open_with(config).await;
+    let before = process.rows().await;
+    let (rebuilt_before, _, _) = process.rebuilt_view(700).await;
+    assert_eq!(rebuilt_before, before, "a rebuilt view of the seed");
     let bottom = Arc::clone(&location.bottom) as Arc<dyn ObjectStore>;
     let head_before = head_commit(&bottom).await;
+    let mut expected: BTreeMap<i64, i64> = before.iter().copied().collect();
+    for &(op, id) in ops {
+        if op == "d" {
+            expected.remove(&id);
+        } else {
+            expected.insert(id, value(id, 1));
+        }
+    }
+    let expected: Vec<(i64, i64)> = expected.into_iter().collect();
 
     let (sink, options) = durable_sink(&process.table);
     let (held, mut holding) = tokio::sync::oneshot::channel::<()>();
     let (release, released) = tokio::sync::oneshot::channel::<()>();
     let save = save_position(&process.catalog, 1);
+    // Polled once the burst's record is in the catalog's buffer: held there.
     let position: PositionWrite = Box::pin(async move {
         let _ = held.send(());
         released
@@ -2063,14 +2128,9 @@ async fn a_multi_group_inline_burst_holds_exactly_its_outcome() {
             .map_err(|error| Box::new(error) as Box<dyn std::error::Error + Send + Sync>)?;
         save.await
     });
+    let batch = mixed_changes(ops, 1);
     let burst = tokio::spawn(async move {
-        let outcome = apply_burst(
-            &sink,
-            options,
-            mixed_changes(&[("c", KEY), ("d", KEY), ("c", NEW_KEY)], 1),
-            position,
-        )
-        .await;
+        let outcome = apply_burst(&sink, options, batch, position).await;
         drop(sink);
         outcome
     });
@@ -2078,41 +2138,544 @@ async fn a_multi_group_inline_burst_holds_exactly_its_outcome() {
         .await
         .expect("the burst reaches its position write within 60 s")
         .expect("the burst reaches its position write");
+
     let head_held = head_commit(&bottom).await;
-    let (rows_held, key_held, _) = process.rebuilt_view(KEY).await;
-    let (_, new_key_held, _) = process.rebuilt_view(NEW_KEY).await;
+    let held_cached = process.rows().await;
+    let mut held_keys = Vec::new();
+    for &(_, id) in ops {
+        if !held_keys.iter().any(|(key, _)| *key == id) {
+            held_keys.extend(process.key_rows(id).await);
+        }
+    }
+    let (held_rebuilt, _, _) = process.rebuilt_view(700).await;
+
+    let publications = process.table.hold_publications().await;
     release.send(()).expect("release the burst");
+    wait_for_head_past(&bottom, head_before).await;
+    let (committed_rebuilt, _, _) = process.rebuilt_view(700).await;
+    let committed_keys = MultiGroupOutcome::keys_of(&committed_rebuilt, ops);
+    drop(publications);
+
     burst
         .await
         .expect("the burst does not panic")
         .expect("the burst commits");
-    let rows_after = process.rows().await;
-    let (rows_rebuilt, _, _) = process.rebuilt_view(KEY).await;
+    let acknowledged = process.rows().await;
+    let (rebuilt, _, _) = process.rebuilt_view(700).await;
     process.table.quiesce().await;
     drop(process);
-    let reopened = location.open_with(&inline).await;
-    let rows_reopened = reopened.rows().await;
-    eprintln!(
-        "multi-group inline burst: held (head {head_held}, before {head_before}): key {KEY} {key_held:?}, key {NEW_KEY} {new_key_held:?}, rows {} (before {}); acknowledged: rows {}, rebuilt {}, reopened {}",
-        rows_held.len(),
-        rows_before.len(),
-        rows_after.len(),
-        rows_rebuilt.len(),
-        rows_reopened.len()
+    let reopened_process = location.open_with(config).await;
+    let reopened = reopened_process.rows().await;
+    let position_reopened = reopened_process.saved_position().await;
+    reopened_process.table.quiesce().await;
+    MultiGroupOutcome {
+        before,
+        expected,
+        held_cached,
+        held_rebuilt,
+        held_keys,
+        committed_rebuilt,
+        committed_keys,
+        head_held,
+        head_before,
+        acknowledged,
+        rebuilt,
+        reopened,
+        position_reopened,
+    }
+}
+
+/// Assert that a reader saw exactly the rows from before the burst until its
+/// publish, and exactly the burst's outcome from its acknowledgement on.
+fn assert_multi_group_outcome(label: &str, outcome: &MultiGroupOutcome, ops: &[(&str, i64)]) {
+    assert_eq!(
+        outcome.head_held, outcome.head_before,
+        "{label}: the held record is not committed"
     );
-    let mut expected: BTreeMap<i64, i64> = rows_before.into_iter().collect();
-    expected.remove(&KEY);
-    expected.insert(NEW_KEY, value(NEW_KEY, 1));
-    let expected: Vec<(i64, i64)> = expected.into_iter().collect();
-    assert_eq!(head_held, head_before, "the held record is not committed");
     assert_eq!(
         (
-            rows_after == expected,
-            rows_rebuilt == expected,
-            rows_reopened == expected
+            outcome.held_cached == outcome.before,
+            outcome.held_rebuilt == outcome.before,
+            outcome.held_keys.clone(),
         ),
-        (true, true, true),
-        "the burst's outcome, exactly: acknowledged {rows_after:?}, reopened {rows_reopened:?}"
+        (true, true, MultiGroupOutcome::keys_of(&outcome.before, ops)),
+        "{label}: before its head write, a reader sees exactly the rows from before the burst: held {:?}",
+        MultiGroupOutcome::keys_of(&outcome.held_rebuilt, ops)
     );
+    assert_eq!(
+        (
+            outcome.committed_rebuilt == outcome.before,
+            outcome.committed_keys.clone()
+        ),
+        (true, MultiGroupOutcome::keys_of(&outcome.before, ops)),
+        "{label}: after its head write and before its publish, a reader sees the rows from before the burst"
+    );
+    assert_eq!(
+        (
+            outcome.acknowledged == outcome.expected,
+            outcome.rebuilt == outcome.expected,
+            outcome.reopened == outcome.expected,
+            outcome.position_reopened.clone(),
+        ),
+        (true, true, true, Some("lsn 1".to_string())),
+        "{label}: the burst's outcome, exactly: acknowledged {:?}, reopened {:?}, expected {:?}",
+        MultiGroupOutcome::keys_of(&outcome.acknowledged, ops),
+        MultiGroupOutcome::keys_of(&outcome.reopened, ops),
+        MultiGroupOutcome::keys_of(&outcome.expected, ops),
+    );
+}
+
+/// A keyed CDC burst whose changes split into several groups, each written
+/// inline: an upsert of an inline key, a delete of that key, and an upsert of a
+/// new key. Until the burst's record commits and the burst publishes, a reader
+/// (with what it holds, and with views rebuilt from the catalog) sees exactly
+/// the rows from before the burst. Once acknowledged, and after a reopen from
+/// the committed state, the table holds exactly the burst's outcome.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_multi_group_inline_burst_holds_exactly_its_outcome() {
+    let ops = [("c", 700), ("d", 700), ("c", 5_000)];
+    let outcome = multi_group_burst(&inline_config(), &ops).await;
+    eprintln!("{}", outcome.report("multi-group inline burst"));
+    assert_multi_group_outcome("multi-group inline burst", &outcome, &ops);
+}
+
+/// Every multi-group burst shape (a key upserted then deleted, deleted then
+/// upserted, or upserted in two groups), for an inline key, a file key and a
+/// new key, written inline and written to data files: until the burst
+/// publishes, a reader sees exactly the rows from before it, and from its
+/// acknowledgement on, exactly its outcome, also after a reopen.
+#[tokio::test(flavor = "multi_thread")]
+async fn every_multi_group_burst_is_invisible_until_its_record_commits() {
+    let shapes: [(&str, &[(&str, i64)]); 9] = [
+        (
+            "upsert, delete inline key, upsert new",
+            &[("c", 700), ("d", 700), ("c", 5_000)],
+        ),
+        ("delete, upsert inline key", &[("d", 700), ("c", 700)]),
+        ("upsert, delete file key", &[("c", 7), ("d", 7)]),
+        ("delete, upsert file key", &[("d", 7), ("c", 7)]),
+        (
+            "upsert, delete, upsert new key",
+            &[("c", 5_000), ("d", 5_000), ("c", 5_000)],
+        ),
+        (
+            "two upsert groups of an inline key",
+            &[("c", 700), ("c", 5_000), ("d", 5_000), ("c", 700)],
+        ),
+        (
+            "two upsert groups of a file key",
+            &[("c", 7), ("c", 5_000), ("d", 5_000), ("c", 7)],
+        ),
+        (
+            "two upsert groups of a new key",
+            &[("c", 5_000), ("c", 6_000), ("d", 6_000), ("c", 5_000)],
+        ),
+        (
+            "delete, upsert, delete inline key",
+            &[("d", 700), ("c", 700), ("d", 700)],
+        ),
+    ];
+    let mut failures = Vec::new();
+    for (path, config) in [("inline", inline_config()), ("data files", cdc_config())] {
+        for (shape, ops) in shapes {
+            let label = format!("{path}: {shape}");
+            let outcome = multi_group_burst(&config, ops).await;
+            eprintln!("{}", outcome.report(&label));
+            if let Err(panic) = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                assert_multi_group_outcome(&label, &outcome, ops);
+            })) {
+                failures.push(
+                    panic
+                        .downcast_ref::<String>()
+                        .cloned()
+                        .unwrap_or_else(|| label.clone()),
+                );
+            }
+        }
+    }
+    assert!(
+        failures.is_empty(),
+        "{} shapes failed:\n{}",
+        failures.len(),
+        failures.join("\n")
+    );
+}
+
+// ---------------------------------------------------------------------------
+// A burst written to data files followed by an inline burst, pipelined
+// ---------------------------------------------------------------------------
+
+/// [`cdc_config`], with a write of up to 50 rows inlined: a burst of every file
+/// key goes to a data file, a burst of two keys inline.
+fn staged_then_inline_config() -> VortexConfig {
+    VortexConfig {
+        inline_max_rows: 50,
+        inline_max_bytes: 1 << 20,
+        ..cdc_config()
+    }
+}
+
+/// The inline burst: an upsert of the seeded inline key and of a new key. Only
+/// a burst of upserts prepares while the burst before it is still committing
+/// (the change sink settles that burst first for one that deletes).
+const STAGED_THEN_INLINE_SECOND: [(&str, i64); 2] = [("c", 700), ("c", 5_000)];
+
+/// The rows after the staged burst (every file key) and then the inline burst,
+/// up to `round`, over the seed of [`Location::seeded_with`] `[700]`.
+fn staged_then_inline_expected(round: i64) -> Vec<(i64, i64)> {
+    let mut rows: BTreeMap<i64, i64> = FILE_KEYS
+        .chain([700])
+        .map(|id| (id, value(id, 0)))
+        .collect();
+    if round >= 1 {
+        for id in FILE_KEYS {
+            rows.insert(id, value(id, 1));
+        }
+    }
+    if round >= 2 {
+        for (op, id) in STAGED_THEN_INLINE_SECOND {
+            if op == "d" {
+                rows.remove(&id);
+            } else {
+                rows.insert(id, value(id, 2));
+            }
+        }
+    }
+    rows.into_iter().collect()
+}
+
+/// Gates of [`run_staged_then_inline_pair`] a test holds to look at the table.
+#[derive(Default)]
+struct PairGates {
+    /// Signalled when the inline burst's position write is polled: its record
+    /// is buffered and its head write not sent.
+    second_held: Option<tokio::sync::oneshot::Sender<()>>,
+    /// Released by the test to let the inline burst's position write go on.
+    second_release: Option<tokio::sync::oneshot::Receiver<()>>,
+}
+
+/// Whether the catalog's readable state holds an inline entry of `rows` rows,
+/// polled for up to a second. The catalog applies a buffered change to it at
+/// once, so this sees burst 2's inline write as soon as it is buffered; a
+/// write that waits for burst 1's commit never appears here first, which the
+/// bounded poll lets burst 1 go on without.
+async fn inline_entry_buffered(catalog: &ObjectNativeCatalog, table_id: &str, rows: i64) -> bool {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(1);
+    loop {
+        let buffered = catalog
+            .get_inlined_data(table_id)
+            .await
+            .is_ok_and(|entries| entries.iter().any(|entry| entry.record_count == rows));
+        if buffered || tokio::time::Instant::now() >= deadline {
+            return buffered;
+        }
+        tokio::time::sleep(Duration::from_millis(2)).await;
+    }
+}
+
+/// Submit a burst of every file key (written to a data file), then an inline
+/// burst, through one change sink, pipelined:
+/// the first burst's finalizer waits (in its source position write) for the
+/// second burst's inline write to be buffered, up to a second, so the second
+/// burst prepares while the first burst's record is still open. Then both
+/// publish.
+async fn run_staged_then_inline_pair(
+    table: Arc<CayenneTableProvider>,
+    catalog: Arc<ObjectNativeCatalog>,
+    acknowledged: Arc<Acknowledged>,
+    gates: PairGates,
+) -> std::result::Result<(), String> {
+    let backend = CayenneChangeSinkBackend::try_new(ChangeSinkContext::new(
+        TableReference::bare(NAME),
+        Arc::clone(&table) as Arc<dyn TableProvider>,
+    ))
+    .expect("native backend");
+    let sink = ChangeSink::new(backend, SessionContext::new(), &Handle::current(), 2);
+    let options = WriteOptions {
+        recovery: Recovery::Durable,
+        ..WriteOptions::default()
+    };
+
+    let (first_finalized, first_waiting) = tokio::sync::oneshot::channel::<()>();
+    let save_first = save_position(&catalog, 1);
+    let watched = Arc::clone(&catalog);
+    let table_id = table.table_id().to_string();
+    let first_position: PositionWrite = Box::pin(async move {
+        let _ = first_finalized.send(());
+        let seen = inline_entry_buffered(&watched, &table_id, 2).await;
+        eprintln!("burst 1's position write: burst 2's inline write buffered before it: {seen}");
+        save_first.await
+    });
+    let first = sink
+        .reserve()
+        .await
+        .map_err(|error| error.to_string())?
+        .submit_with_position(
+            changes(&FILE_KEYS.collect::<Vec<_>>(), 1),
+            options,
+            Some(first_position),
+        )
+        .map_err(|error| error.to_string())?
+        .wait()
+        .await
+        .map_err(|error| format!("burst 1: {error}"))?;
+    first_waiting
+        .await
+        .map_err(|_| "burst 1's finalizer stopped before its position write".to_string())?;
+    let save_second = save_position(&catalog, 2);
+    let PairGates {
+        second_held,
+        second_release,
+    } = gates;
+    let second_position: PositionWrite = Box::pin(async move {
+        if let Some(held) = second_held {
+            let _ = held.send(());
+        }
+        if let Some(release) = second_release {
+            release
+                .await
+                .map_err(|error| Box::new(error) as Box<dyn std::error::Error + Send + Sync>)?;
+        }
+        save_second.await
+    });
+    let second = sink
+        .reserve()
+        .await
+        .map_err(|error| error.to_string())?
+        .submit_with_position(
+            mixed_changes(&STAGED_THEN_INLINE_SECOND, 2),
+            options,
+            Some(second_position),
+        )
+        .map_err(|error| error.to_string())?
+        .wait()
+        .await
+        .map_err(|error| format!("burst 2: {error}"))?;
+    first
+        .published()
+        .await
+        .map_err(|error| format!("burst 1 publish: {error}"))?;
+    acknowledged.first.store(true, Ordering::SeqCst);
+    second
+        .published()
+        .await
+        .map_err(|error| format!("burst 2 publish: {error}"))?;
+    acknowledged.second.store(true, Ordering::SeqCst);
+    Ok(())
+}
+
+/// A burst written to a data file (burst 1), then an inline burst (burst 2)
+/// that prepares while burst 1's record is still open, so burst 2's inline
+/// write can be buffered before burst 1's record commits, and that record then
+/// carries it. Burst 2's rows still commit whole, in one record that is not
+/// before burst 1's; until burst 2's own record (its position) commits, a
+/// reader sees the rows after burst 1 and none of burst 2; the saved position
+/// never runs ahead of the rows; and a kill at any storage request leaves the
+/// rows from before both bursts, after burst 1, or after both.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_inline_burst_buffered_while_a_staged_burst_commits_is_all_or_nothing() {
+    let config = staged_then_inline_config();
+    let seeded = || async {
+        let (location, process) = Location::seeded_with(&[700]).await;
+        process.table.quiesce().await;
+        drop(process);
+        let process = location.open_with(&config).await;
+        (location, process)
+    };
+
+    // A clean run, held before burst 2's head write.
+    let (location, process) = seeded().await;
+    let bottom = Arc::clone(&location.bottom) as Arc<dyn ObjectStore>;
+    let before = head_commit(&bottom).await;
+    process.instance.clear_steps();
+    let acknowledged = Arc::new(Acknowledged::default());
+    let (held, holding) = tokio::sync::oneshot::channel::<()>();
+    let (release, released) = tokio::sync::oneshot::channel::<()>();
+    let task = tokio::spawn(run_staged_then_inline_pair(
+        Arc::clone(&process.table),
+        Arc::clone(&process.catalog),
+        Arc::clone(&acknowledged),
+        PairGates {
+            second_held: Some(held),
+            second_release: Some(released),
+        },
+    ));
+    tokio::time::timeout(Duration::from_secs(60), holding)
+        .await
+        .expect("burst 2 reaches its position write within 60 s")
+        .expect("burst 2 reaches its position write");
+    let held_records = records_after(&bottom, before).await;
+    let held_position = process.saved_position().await;
+    let held_cached = process.rows().await;
+    let (held_rebuilt, _, _) = process.rebuilt_view(700).await;
+    release.send(()).expect("release burst 2");
+    assert_eq!(
+        task.await.expect("the pair does not panic"),
+        Ok(()),
+        "the pair commits"
+    );
+    let steps = process.instance.steps();
+    let acknowledged_rows = process.rows().await;
+    wait_until_idle(&process).await;
+    process.table.quiesce().await;
+    drop(process);
+    let records = records_after(&bottom, before).await;
+    eprintln!("clean run: {} storage requests", steps.len());
+    eprintln!("clean run records: {records:?}");
+    eprintln!(
+        "held before burst 2's head write: records {held_records:?}, position {held_position:?}, cached rows equal after burst 1 {} (after burst 2 {}), rebuilt equal after burst 1 {}; keys {:?}",
+        held_cached == staged_then_inline_expected(1),
+        held_cached == staged_then_inline_expected(2),
+        held_rebuilt == staged_then_inline_expected(1),
+        MultiGroupOutcome::keys_of(&held_rebuilt, &STAGED_THEN_INLINE_SECOND),
+    );
+    let first_record = records
+        .iter()
+        .position(|record| {
+            record
+                .iter()
+                .any(|action| action == "AdvanceSourcePosition(lsn 1)")
+        })
+        .expect("a record saves burst 1's position");
+    let second_record = records
+        .iter()
+        .position(|record| {
+            record
+                .iter()
+                .any(|action| action == "AdvanceSourcePosition(lsn 2)")
+        })
+        .expect("a record saves burst 2's position");
+    let mut failures = Vec::new();
+    // Burst 2's inline rows commit in one record: burst 1's, when they were
+    // buffered before it committed, or burst 2's own.
+    let inline_records: Vec<usize> = records
+        .iter()
+        .enumerate()
+        .filter(|(_, record)| count(record, "AddInlinedData") > 0)
+        .map(|(index, _)| index)
+        .collect();
+    eprintln!(
+        "burst 2's inline rows commit in record(s) {inline_records:?}; burst 1's position in {first_record}, burst 2's in {second_record}"
+    );
+    if !(first_record < second_record
+        && inline_records.len() == 1
+        && (inline_records[0] == first_record || inline_records[0] == second_record))
+    {
+        failures.push(format!(
+            "burst 2's inline rows must commit whole in burst 1's record or its own, after burst 1's position: records {records:?}"
+        ));
+    }
+    let held = (
+        held_position.as_deref(),
+        held_cached == staged_then_inline_expected(1),
+        held_rebuilt == staged_then_inline_expected(1),
+        acknowledged_rows == staged_then_inline_expected(2),
+    );
+    if held != (Some("lsn 1"), true, true, true) {
+        failures.push(format!(
+            "before burst 2's head write a reader must see the rows after burst 1 with its position, and once acknowledged, after burst 2: (position, cached, rebuilt, acknowledged) {held:?}"
+        ));
+    }
+    let reopened = location.open_with(&config).await;
+    let clean = (
+        reopened.rows().await == staged_then_inline_expected(2),
+        reopened.saved_position().await,
+    );
+    if clean != (true, Some("lsn 2".to_string())) {
+        failures.push(format!(
+            "the clean run's rows and position after a reopen: {clean:?}"
+        ));
+    }
     reopened.table.quiesce().await;
+    drop(reopened);
+
+    // A kill before each storage request of the pair.
+    let mut outcomes: BTreeMap<String, Vec<usize>> = BTreeMap::new();
+    for kill_before in 0..steps.len() {
+        let (location, process) = seeded().await;
+        process.instance.clear_steps();
+        process.instance.die_after(kill_before);
+        let acknowledged = Arc::new(Acknowledged::default());
+        let task = tokio::spawn(run_staged_then_inline_pair(
+            Arc::clone(&process.table),
+            Arc::clone(&process.catalog),
+            Arc::clone(&acknowledged),
+            PairGates::default(),
+        ));
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
+        let outcome = loop {
+            if task.is_finished() {
+                break Some(task.await.expect("the pair does not panic"));
+            }
+            if process.instance.is_dead() {
+                task.abort();
+                break None;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "the pair neither finished nor was killed within 60 s"
+            );
+            tokio::time::sleep(Duration::from_millis(2)).await;
+        };
+        process.instance.kill();
+        process.table.quiesce().await;
+        drop(process);
+        let next = location.open_with(&config).await;
+        let rows = next.rows().await;
+        let position = next.saved_position().await;
+        let reached = (0..=2).find(|round| rows == staged_then_inline_expected(*round));
+        let state = reached.map_or_else(|| "neither".to_string(), |round| format!("after {round}"));
+        outcomes
+            .entry(format!("{state}, position {position:?}"))
+            .or_default()
+            .push(kill_before);
+        let floor = match position.as_deref() {
+            None => 0,
+            Some("lsn 1") => 1,
+            Some("lsn 2") => 2,
+            Some(_) => 3,
+        };
+        let mut problems = Vec::new();
+        if reached.is_none() {
+            problems.push(format!(
+                "the rows are from neither before, after burst 1, nor after burst 2: keys {:?}",
+                MultiGroupOutcome::keys_of(&rows, &[("c", 0), ("c", 7), ("c", 700), ("c", 5_000)])
+            ));
+        }
+        if reached.is_some_and(|reached| reached < floor) {
+            problems.push(format!(
+                "the saved position {position:?} runs ahead of the rows ({state})"
+            ));
+        }
+        if acknowledged.second.load(Ordering::SeqCst) && reached != Some(2) {
+            problems.push(format!(
+                "burst 2 was acknowledged, but the rows are {state}"
+            ));
+        } else if acknowledged.first.load(Ordering::SeqCst) && reached.is_none_or(|r| r < 1) {
+            problems.push(format!(
+                "burst 1 was acknowledged, but the rows are {state}"
+            ));
+        }
+        next.table.quiesce().await;
+        if !problems.is_empty() {
+            failures.push(format!(
+                "killed before request {kill_before} ({}), outcome {outcome:?}: {}",
+                steps
+                    .get(kill_before)
+                    .map_or("past the end", String::as_str),
+                problems.join("; ")
+            ));
+        }
+    }
+    eprintln!(
+        "{} kill points; outcomes by kill point: {outcomes:?}",
+        steps.len()
+    );
+    assert!(
+        failures.is_empty(),
+        "{} problems ({} kill points):\n{}",
+        failures.len(),
+        steps.len(),
+        failures.join("\n")
+    );
 }
