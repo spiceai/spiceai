@@ -24,8 +24,8 @@ limitations under the License.
 //! The dataset's store follows `CAYENNE_TEST_DATA_STORE`: `local` is a local
 //! directory (through `LocalConditionalPut`), `memory` an in-memory store, and
 //! `fault` the in-memory store under `FaultStore` with no faults armed. A
-//! control on the fixture's trunk path (SQLite metastore, data not in the
-//! location) shows the planted file is valid data that a listing does adopt.
+//! control on the trunk path (SQLite metastore, data files in a local
+//! directory) shows the planted file is valid data that a listing does adopt.
 
 use std::fmt::{self, Display, Formatter};
 use std::ops::Range;
@@ -320,7 +320,9 @@ impl Rig {
         ctx: &SessionContext,
         data_url: &str,
     ) -> CayenneTableProviderBuilder {
-        CayenneTableProviderBuilder::new(catalog, ctx.runtime_env()).with_object_store(
+        crate::common::table_builder_on_store(
+            catalog,
+            ctx.runtime_env(),
             ObjectStoreConfig {
                 url: url::Url::parse(data_url).expect("data url"),
                 store: Arc::clone(&self.store),
@@ -838,7 +840,7 @@ async fn a_planted_file_is_not_adopted_by_the_sweeps() {
     sweeps(&Rig::new().await).await;
 }
 
-/// Control on the trunk path (SQLite metastore, data not in the location): the
+/// Control on the trunk path (SQLite metastore, data files in a local directory): the
 /// post-write rebuild lists the snapshot directory and adopts the planted file,
 /// so the planted file is valid data and the placed tests above are not vacuous.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -852,16 +854,19 @@ async fn control_the_listing_path_adopts_a_planted_file() {
     let provider = Arc::new(
         fixture
             .data_store
-            .builder(Arc::clone(&catalog), ctx.runtime_env())
-            .create(CreateTableOptions {
-                table_name: "control".to_string(),
-                schema: schema(),
-                primary_key: vec![],
-                on_conflict: None,
-                base_path: fixture.data_store.base_path.clone(),
-                partition_column: None,
-                vortex_config: vortex_config(1_000),
-            })
+            .create(
+                Arc::clone(&catalog),
+                ctx.runtime_env(),
+                CreateTableOptions {
+                    table_name: "control".to_string(),
+                    schema: schema(),
+                    primary_key: vec![],
+                    on_conflict: None,
+                    base_path: fixture.data_store.base_path("control"),
+                    partition_column: None,
+                    vortex_config: vortex_config(1_000),
+                },
+            )
             .await
             .expect("create"),
     );
@@ -881,16 +886,19 @@ async fn control_the_listing_path_adopts_a_planted_file() {
     let donor = Arc::new(
         fixture
             .data_store
-            .builder(Arc::clone(&catalog), donor_ctx.runtime_env())
-            .create(CreateTableOptions {
-                table_name: "control_donor".to_string(),
-                schema: schema(),
-                primary_key: vec![],
-                on_conflict: None,
-                base_path: fixture.data_store.base_path.clone(),
-                partition_column: None,
-                vortex_config: vortex_config(1_000),
-            })
+            .create(
+                Arc::clone(&catalog),
+                donor_ctx.runtime_env(),
+                CreateTableOptions {
+                    table_name: "control_donor".to_string(),
+                    schema: schema(),
+                    primary_key: vec![],
+                    on_conflict: None,
+                    base_path: fixture.data_store.base_path("control_donor"),
+                    partition_column: None,
+                    vortex_config: vortex_config(1_000),
+                },
+            )
             .await
             .expect("create the donor"),
     );
@@ -910,46 +918,18 @@ async fn control_the_listing_path_adopts_a_planted_file() {
         .expect("donor files");
     let meta = catalog.get_table("control").await.expect("table");
     let orphan = format!("orphan-{}.vortex", uuid::Uuid::now_v7().simple());
-    match &fixture.data_store.config {
-        None => {
-            let from = fixture
-                .data_path
-                .join(&donor_meta.table_id)
-                .join(&donor_meta.current_snapshot_id)
-                .join(&donor_files[0].0);
-            let to = fixture
-                .data_path
-                .join(&meta.table_id)
-                .join(&meta.current_snapshot_id)
-                .join(&orphan);
-            tokio::fs::copy(&from, &to).await.expect("plant");
-        }
-        Some(config) => {
-            let prefix = config.url.path().trim_matches('/').to_string();
-            let bytes = config
-                .store
-                .get(&Path::from(format!(
-                    "{prefix}/{}/{}/{}",
-                    donor_meta.table_id, donor_meta.current_snapshot_id, donor_files[0].0
-                )))
-                .await
-                .expect("read the donor file")
-                .bytes()
-                .await
-                .expect("bytes");
-            config
-                .store
-                .put(
-                    &Path::from(format!(
-                        "{prefix}/{}/{}/{orphan}",
-                        meta.table_id, meta.current_snapshot_id
-                    )),
-                    bytes.into(),
-                )
-                .await
-                .expect("plant");
-        }
-    }
+    // A SQLite fixture's data files are in its local data directory.
+    let from = fixture
+        .data_path
+        .join(&donor_meta.table_id)
+        .join(&donor_meta.current_snapshot_id)
+        .join(&donor_files[0].0);
+    let to = fixture
+        .data_path
+        .join(&meta.table_id)
+        .join(&meta.current_snapshot_id)
+        .join(&orphan);
+    tokio::fs::copy(&from, &to).await.expect("plant");
     table.insert(1001, 1200).await;
     let deadline = Instant::now() + Duration::from_secs(15);
     while table.orphan_rows_visible().await == 0 && Instant::now() < deadline {

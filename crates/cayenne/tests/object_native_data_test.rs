@@ -274,7 +274,9 @@ fn builder(
     ctx: &SessionContext,
 ) -> CayenneTableProviderBuilder {
     let url = url::Url::parse(&setup.data_url).expect("data url");
-    CayenneTableProviderBuilder::new(catalog, ctx.runtime_env()).with_object_store(
+    crate::common::table_builder_on_store(
+        catalog,
+        ctx.runtime_env(),
         ObjectStoreConfig {
             url,
             store: Arc::clone(&setup.store),
@@ -468,29 +470,32 @@ async fn add_dataset_with_retention(
     let ctx = SessionContext::new();
     let keys: Vec<String> = primary_key.iter().map(ToString::to_string).collect();
     let table = Arc::new(
-        CayenneTableProviderBuilder::new(Arc::clone(catalog), ctx.runtime_env())
-            .with_object_store(ObjectStoreConfig {
+        crate::common::table_builder_on_store(
+            Arc::clone(catalog),
+            ctx.runtime_env(),
+            ObjectStoreConfig {
                 url: url::Url::parse(&data_url).expect("data url"),
                 store: Arc::clone(&setup.store),
-            })
-            .with_retention_filters(retention)
-            .create(CreateTableOptions {
-                table_name: name.to_string(),
-                schema: schema(),
-                primary_key: keys.clone(),
-                on_conflict: (!keys.is_empty()).then(|| {
-                    datafusion_table_providers::util::on_conflict::OnConflict::Upsert(
-                        datafusion_table_providers::util::column_reference::ColumnReference::new(
-                            keys.clone(),
-                        ),
-                    )
-                }),
-                base_path: data_url.clone(),
-                partition_column: None,
-                vortex_config: config,
-            })
-            .await
-            .expect("create the table"),
+            },
+        )
+        .with_retention_filters(retention)
+        .create(CreateTableOptions {
+            table_name: name.to_string(),
+            schema: schema(),
+            primary_key: keys.clone(),
+            on_conflict: (!keys.is_empty()).then(|| {
+                datafusion_table_providers::util::on_conflict::OnConflict::Upsert(
+                    datafusion_table_providers::util::column_reference::ColumnReference::new(
+                        keys.clone(),
+                    ),
+                )
+            }),
+            base_path: data_url.clone(),
+            partition_column: None,
+            vortex_config: config,
+        })
+        .await
+        .expect("create the table"),
     );
     ctx.register_table(name, Arc::clone(&table) as Arc<dyn TableProvider>)
         .expect("register");
@@ -519,14 +524,17 @@ async fn reopen_in(
     let catalog: Arc<dyn MetadataCatalog> = Arc::new(open_catalog(store).await);
     let ctx = SessionContext::new();
     let table = Arc::new(
-        CayenneTableProviderBuilder::new(Arc::clone(&catalog), ctx.runtime_env())
-            .with_object_store(ObjectStoreConfig {
+        crate::common::table_builder_on_store(
+            Arc::clone(&catalog),
+            ctx.runtime_env(),
+            ObjectStoreConfig {
                 url: url::Url::parse(data_url).expect("data url"),
                 store: Arc::clone(store),
-            })
-            .open(name)
-            .await
-            .expect("reopen the table"),
+            },
+        )
+        .open(name)
+        .await
+        .expect("reopen the table"),
     );
     // The orphan sweep an open runs lists the data path; wait for it, so the
     // caller counts only its own requests.
@@ -853,13 +861,16 @@ async fn a_missing_deletion_vector_of_a_placed_dataset_is_an_error() {
     drop((table, ctx, catalog));
     let catalog: Arc<dyn MetadataCatalog> = Arc::new(open_catalog(&setup.store).await);
     let ctx = SessionContext::new();
-    let opened = CayenneTableProviderBuilder::new(Arc::clone(&catalog), ctx.runtime_env())
-        .with_object_store(ObjectStoreConfig {
+    let opened = crate::common::table_builder_on_store(
+        Arc::clone(&catalog),
+        ctx.runtime_env(),
+        ObjectStoreConfig {
             url: url::Url::parse(&data_url).expect("data url"),
             store: Arc::clone(&setup.store),
-        })
-        .open("keyed")
-        .await;
+        },
+    )
+    .open("keyed")
+    .await;
     let message = match opened {
         Err(error) => error.to_string(),
         Ok(table) => {
@@ -962,14 +973,17 @@ async fn a_copied_location_serves_the_same_rows_from_its_own_objects() {
     let catalog: Arc<dyn MetadataCatalog> = Arc::new(moved);
     let ctx = SessionContext::new();
     let table = Arc::new(
-        CayenneTableProviderBuilder::new(catalog, ctx.runtime_env())
-            .with_object_store(ObjectStoreConfig {
+        crate::common::table_builder_on_store(
+            catalog,
+            ctx.runtime_env(),
+            ObjectStoreConfig {
                 url: url::Url::parse(&moved_url).expect("data url"),
                 store: Arc::clone(&setup.store),
-            })
-            .open("orders")
-            .await
-            .expect("open the copied table"),
+            },
+        )
+        .open("orders")
+        .await
+        .expect("open the copied table"),
     );
     ctx.register_table("orders", table as Arc<dyn TableProvider>)
         .expect("register");
@@ -1230,25 +1244,28 @@ async fn sweep_with_failing_deletes(
         store: Arc::clone(&store),
     };
     let ctx = SessionContext::new();
-    let table = CayenneTableProviderBuilder::new(Arc::clone(&catalog), ctx.runtime_env())
-        .with_object_store(config.clone())
-        .create(CreateTableOptions {
-            table_name: name.to_string(),
-            schema: schema(),
-            primary_key: vec!["id".to_string()],
-            on_conflict: Some(
-                datafusion_table_providers::util::on_conflict::OnConflict::Upsert(
-                    datafusion_table_providers::util::column_reference::ColumnReference::new(vec![
-                        "id".to_string(),
-                    ]),
-                ),
+    let table = crate::common::table_builder_on_store(
+        Arc::clone(&catalog),
+        ctx.runtime_env(),
+        config.clone(),
+    )
+    .create(CreateTableOptions {
+        table_name: name.to_string(),
+        schema: schema(),
+        primary_key: vec!["id".to_string()],
+        on_conflict: Some(
+            datafusion_table_providers::util::on_conflict::OnConflict::Upsert(
+                datafusion_table_providers::util::column_reference::ColumnReference::new(vec![
+                    "id".to_string(),
+                ]),
             ),
-            base_path: base_path.to_string(),
-            partition_column: None,
-            vortex_config: parked.clone(),
-        })
-        .await
-        .expect("create the table");
+        ),
+        base_path: base_path.to_string(),
+        partition_column: None,
+        vortex_config: parked.clone(),
+    })
+    .await
+    .expect("create the table");
     let table = Arc::new(table);
     ctx.register_table(name, Arc::clone(&table) as Arc<dyn TableProvider>)
         .expect("register");
@@ -1270,8 +1287,7 @@ async fn sweep_with_failing_deletes(
     };
     let ctx = SessionContext::new();
     let table = Arc::new(
-        CayenneTableProviderBuilder::new(Arc::clone(&catalog), ctx.runtime_env())
-            .with_object_store(config)
+        crate::common::table_builder_on_store(Arc::clone(&catalog), ctx.runtime_env(), config)
             .with_context(CayenneContext::new(&merging, ctx.runtime_env(), name))
             .open(name)
             .await
@@ -1375,22 +1391,15 @@ async fn a_placed_dataset_reclaims_orphaned_deletion_vectors_rows_first() {
 async fn an_unplaced_dataset_reclaims_orphaned_deletion_vectors_objects_first() {
     let faults = Arc::new(FaultStore::new(Arc::new(InMemory::new())));
     let store: Arc<dyn ObjectStore> = Arc::clone(&faults) as Arc<dyn ObjectStore>;
-    let fixture = crate::common::TestFixture::with_data_store(
-        crate::common::BackendType::Sqlite,
-        Some(Arc::clone(&store)),
-    )
-    .await
-    .expect("fixture");
+    // An object-native catalog with the dataset's data path outside its location
+    // (`cayenne_file_path: s3://…` under `runtime.params.cayenne_vnext`).
+    let fixture = crate::common::TestFixture::new(crate::common::BackendType::ObjectNative)
+        .await
+        .expect("fixture");
     let catalog: Arc<dyn MetadataCatalog> =
         Arc::clone(&fixture.catalog) as Arc<dyn MetadataCatalog>;
-    let outcome = sweep_with_failing_deletes(
-        catalog,
-        &faults,
-        store,
-        &fixture.data_store.base_path,
-        "swept",
-    )
-    .await;
+    let data_url = format!("s3://lake/{}/data", uuid::Uuid::now_v7().simple());
+    let outcome = sweep_with_failing_deletes(catalog, &faults, store, &data_url, "swept").await;
     assert!(
         outcome.rows_before >= 25,
         "the upserts wrote deletion vectors: {}",
@@ -1424,29 +1433,32 @@ async fn an_inline_flush_of_a_placed_dataset_keeps_its_rows() {
             Vec::new()
         };
         let table = Arc::new(
-            CayenneTableProviderBuilder::new(Arc::clone(&catalog), ctx.runtime_env())
-                .with_object_store(ObjectStoreConfig {
+            crate::common::table_builder_on_store(
+                Arc::clone(&catalog),
+                ctx.runtime_env(),
+                ObjectStoreConfig {
                     url: url::Url::parse(&data_url).expect("data url"),
                     store: Arc::clone(&setup.store),
-                })
-                .create(CreateTableOptions {
-                    table_name: name.to_string(),
-                    schema: schema(),
-                    primary_key: keys.clone(),
-                    on_conflict: keyed.then(|| {
-                        datafusion_table_providers::util::on_conflict::OnConflict::Upsert(
-                            datafusion_table_providers::util::column_reference::ColumnReference::new(
-                                keys.clone(),
-                            ),
-                        )
-                    }),
-                    base_path: data_url.clone(),
-                    partition_column: None,
-                    // Small writes stay inline in the metastore until a flush.
-                    vortex_config: VortexConfig::default(),
-                })
-                .await
-                .expect("create the table"),
+                },
+            )
+            .create(CreateTableOptions {
+                table_name: name.to_string(),
+                schema: schema(),
+                primary_key: keys.clone(),
+                on_conflict: keyed.then(|| {
+                    datafusion_table_providers::util::on_conflict::OnConflict::Upsert(
+                        datafusion_table_providers::util::column_reference::ColumnReference::new(
+                            keys.clone(),
+                        ),
+                    )
+                }),
+                base_path: data_url.clone(),
+                partition_column: None,
+                // Small writes stay inline in the metastore until a flush.
+                vortex_config: VortexConfig::default(),
+            })
+            .await
+            .expect("create the table"),
         );
         ctx.register_table(name, Arc::clone(&table) as Arc<dyn TableProvider>)
             .expect("register");
@@ -1541,7 +1553,9 @@ impl KeyedSetup {
         catalog: Arc<dyn MetadataCatalog>,
         ctx: &SessionContext,
     ) -> CayenneTableProviderBuilder {
-        CayenneTableProviderBuilder::new(catalog, ctx.runtime_env()).with_object_store(
+        crate::common::table_builder_on_store(
+            catalog,
+            ctx.runtime_env(),
             ObjectStoreConfig {
                 url: url::Url::parse(&self.data_url).expect("data url"),
                 store: Arc::clone(store),
