@@ -120,7 +120,7 @@ jobs:
             ),
             [
                 f"job '{job}' selects environment '{env}', which is not one of "
-                "`ci`, `ci-integration`, `github-publish`, `github-publish-autoapprove`, `secret-free`; "
+                "`ci`, `github-publish`, `github-publish-autoapprove`, `secret-free`; "
                 "GitHub would create it with no protection rules (see docs/dev/github_actions_environments.md)"
                 for job, env in (("a", "ci-staging"), ("b", "publsh"))
             ],
