@@ -24,7 +24,7 @@ use anyhow::{Context, Result};
 use serde_json::{Value, json};
 
 use super::{CLUSTER_ASSIGNMENT_INTERVAL, Instance, Options, executors_in_containers};
-use crate::script::{Action, Script};
+use crate::script::Script;
 
 /// The address a script's executors and sources meet at when its executors
 /// run in containers behind a rootless Docker daemon, which then run on the
@@ -59,29 +59,24 @@ pub(super) fn published_to_bridge(kind: &str) -> bool {
     kind == "rustfs"
 }
 
-/// Refuses a run with bridged executors whose spicepod, a variant of it, or a
-/// `start` or `restart` patch names a source of a kind not in
+/// Refuses a run with bridged executors whose script names, by a
+/// `${sources.<name>…}` placeholder anywhere, a source of a kind not in
 /// [`BRIDGEABLE_KINDS`]: the executors could not reach it, and the run would
-/// fail later and less clearly. A source the spicepod does not name, such as
-/// a script's oracle, stays on loopback.
+/// fail later and less clearly. The whole script is read, not only its
+/// spicepod and variants, because every patch a step applies (`start`,
+/// `restart`, `edit-spicepod`, a fault's restart) can name a source too; a
+/// placeholder in a step the executors never see is refused as well, which
+/// errs on the side of the clear error. A source only named bare, such as a
+/// script's oracle, stays on loopback.
 pub(super) fn check_bridged_sources<'a>(
     script: &Script,
     sources: impl IntoIterator<Item = (&'a str, &'a str)>,
 ) -> Result<()> {
-    let patches = script.steps.iter().filter_map(|step| match &step.action {
-        Action::Start { patch, .. } | Action::Restart { patch, .. } => patch.as_ref(),
-        _ => None,
-    });
-    let mut texts = vec![script.spicepod.to_string()];
-    for variant in script.variants.values().chain(patches) {
-        texts.extend(variant.spicepod.iter().map(ToString::to_string));
-        texts.extend(variant.datasets.values().map(ToString::to_string));
-        texts.extend(variant.catalogs.values().map(ToString::to_string));
-    }
+    let text = format!("{script:?}");
     for (name, kind) in sources {
         let named = [format!("sources.{name}."), format!("sources.{name}}}")]
             .iter()
-            .any(|needle| texts.iter().any(|text| text.contains(needle.as_str())));
+            .any(|needle| text.contains(needle.as_str()));
         if named && !BRIDGEABLE_KINDS.contains(&kind) {
             anyhow::bail!(
                 "executors in containers behind a rootless Docker daemon reach only {} sources, \
@@ -466,6 +461,17 @@ mod tests {
         let error = check_bridged_sources(&patched, [("lake", "rustfs"), ("feed", "kafka")])
             .expect_err("a source named by a patch is refused");
         assert!(error.to_string().contains("'feed' (kafka)"), "{error}");
+        // And one only an `edit-spicepod` step names.
+        let edited = crate::script::Script::parse(
+            "name: s\n\
+             sources: { lake: { kind: rustfs }, db: { kind: postgres } }\n\
+             spicepod: { datasets: [{ from: 's3://${sources.lake.bucket}/t/', name: t }] }\n\
+             steps:\n  - start: {}\n  - edit-spicepod:\n      spicepod:\n        datasets:\n          - { from: 'postgres:t', name: added, params: '${sources.db.params}' }",
+        )
+        .expect("script parses");
+        let error = check_bridged_sources(&edited, [("lake", "rustfs"), ("db", "postgres")])
+            .expect_err("a source named by edit-spicepod is refused");
+        assert!(error.to_string().contains("'db' (postgres)"), "{error}");
         assert!(published_to_bridge("rustfs"));
         assert!(!published_to_bridge("postgres"));
         assert!(!published_to_bridge("mock-http"));
