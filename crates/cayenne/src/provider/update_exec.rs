@@ -190,7 +190,17 @@ impl ExecutionPlan for CayenneUpdateExec {
         )]));
 
         let stream = futures::stream::once(async move {
-            let write_guard = Arc::new(table.write_lock_arc().lock_owned().await);
+            // The delete half writes key tombstones, so on an upserting table it
+            // is ordered after the appends staged before it
+            // (`key_tombstones_wait_for_staged_appends`).
+            let write_guard = Arc::new(if table.key_tombstones_wait_for_staged_appends() {
+                table
+                    .lock_write_after_staged_appends()
+                    .await
+                    .map_err(DataFusionError::from)?
+            } else {
+                table.write_lock_arc().lock_owned().await
+            });
             table
                 .ensure_publication_outcome_known()
                 .map_err(DataFusionError::from)?;

@@ -659,14 +659,18 @@ impl DeletionSink for InlineAwareDeletionSink {
         &self,
         _context: Arc<TaskContext>,
     ) -> std::result::Result<u64, Box<dyn std::error::Error + Send + Sync>> {
+        let position_based = self.table.pk_deletion_strategy.is_position_based();
+        // A key delete of an upserting table is ordered after the appends staged
+        // before it (`key_tombstones_wait_for_staged_appends`).
         let _write_guard = if super::write_lock_held::is_held() {
             None
+        } else if self.table.key_tombstones_wait_for_staged_appends() {
+            Some(self.table.lock_write_after_staged_appends().await?)
         } else {
-            Some(self.table.write_lock.lock().await)
+            Some(self.table.write_lock_arc().lock_owned().await)
         };
         self.table.ensure_publication_outcome_known()?;
         self.table.mark_maintained_aggregates_stale();
-        let position_based = self.table.pk_deletion_strategy.is_position_based();
         if position_based {
             // As `PkKeysetInvalidatingDeletionSink` does before a delete it cannot
             // enumerate by key: a filter delete leaves no per-key stamps to trust.

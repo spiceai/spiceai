@@ -3140,6 +3140,10 @@ pub struct CayenneTableProvider {
     orphan_age_floor_ms: Arc<AtomicU64>,
     /// When the orphan sweep last ran, or the table opened.
     last_orphan_sweep: Arc<ParkingMutex<Instant>>,
+    /// Held by the orphan sweep while it runs, from when it is scheduled: one
+    /// runs at a time, and [`Self::sweep_orphan_files_now`] and
+    /// [`Self::drain_in_flight_maintenance`] wait for a scheduled one.
+    orphan_sweep_running: Arc<tokio::sync::Mutex<()>>,
     /// Staging snapshot IDs whose WALs belong to prepared appends in this
     /// process. `ensure_no_incomplete_write` ignores these WALs so CDC Stage A
     /// can continue while a previous Stage B is pending; after restart the set
@@ -3167,6 +3171,12 @@ pub struct CayenneTableProvider {
     /// [`crate::catalog::DeletesAfterCommit`]). Recovery leaves their WALs alone,
     /// as it does an in-flight append's.
     staging_deletes_after_commit: Arc<ParkingMutex<HashSet<String>>>,
+    /// Admission of change-stream appends to staging: each holds it shared while
+    /// it stages, and a write that tombstones keys holds it exclusively while it
+    /// waits for the appends staged before it to commit
+    /// ([`Self::lock_write_after_staged_appends`]), so no new append stages ahead
+    /// of it meanwhile.
+    append_admission: Arc<tokio::sync::RwLock<()>>,
     /// Snapshot dirs the catalog no longer references (merged away by a
     /// protected-snapshot subset compaction), awaiting physical deletion:
     /// snapshot id → the instant it was retired. Deletion is deferred
@@ -3630,6 +3640,9 @@ struct CayenneTableProviderOpenOptions {
     /// resolving a key repeated within one write. A partition is never given the check
     /// this way, since one written without it may hold more than one row per key.
     partitioned_table_conflict_detection: Option<PkConflictDetection>,
+    /// Whether the table existed before this open, so the orphan sweep runs as it
+    /// opens: a table created now has nothing to sweep.
+    existed: bool,
 }
 
 /// What a sweep consults before deleting a snapshot directory: in-flight scan
@@ -3856,6 +3869,7 @@ impl CayenneTableProviderBuilder {
             snapshot_dir_pins: self.snapshot_dir_pins,
             unfinished_uploads: self.unfinished_uploads,
             partitioned_table_conflict_detection: self.partitioned_table_conflict_detection,
+            existed: true,
         };
 
         CayenneTableProvider::new_internal(table_name, self.catalog, self.runtime_env, options)
@@ -3877,6 +3891,10 @@ impl CayenneTableProviderBuilder {
             &self.secondary_indexes,
             options.vortex_config.memory_mode,
         )?;
+        // A create of a table the catalog holds opens it (a restart creates
+        // every table again); an error reading it counts as a new table, which
+        // only skips the orphan sweep at open.
+        let existed = self.catalog.get_table(&table_name).await.is_ok();
         let _table_id = self.catalog.create_table(options).await?;
         let options = CayenneTableProviderOpenOptions {
             retention_filters: self.retention_filters,
@@ -3894,6 +3912,7 @@ impl CayenneTableProviderBuilder {
             snapshot_dir_pins: self.snapshot_dir_pins,
             unfinished_uploads: self.unfinished_uploads,
             partitioned_table_conflict_detection: self.partitioned_table_conflict_detection,
+            existed,
         };
 
         CayenneTableProvider::new_internal(&table_name, self.catalog, self.runtime_env, options)
@@ -6781,6 +6800,52 @@ impl CayenneTableProvider {
         !self.inflight_staging_appends.lock().is_empty()
     }
 
+    /// Whether a write that tombstones keys waits for the appends staged before
+    /// it to commit ([`Self::lock_write_after_staged_appends`]): the table
+    /// deletes by key and upserts, so an append still staging can hold a new
+    /// version of a committed key. A key tombstone hides every row of its key
+    /// whose sequence is below its own, and a staging append reserved its
+    /// sequences when it staged, so the tombstone of a delete in between would
+    /// hide the new version along with the committed one, while the delete,
+    /// reading committed rows, finds none of the keys only the append holds: an
+    /// outcome of neither order. A table without `on_conflict` appends only keys
+    /// it does not hold, so no key has rows both committed and staging for one
+    /// tombstone to hide together, and a position delete names committed files
+    /// only: neither waits.
+    pub(crate) fn key_tombstones_wait_for_staged_appends(&self) -> bool {
+        !self.pk_deletion_strategy.is_position_based() && self.upsert_bloom_eligible()
+    }
+
+    /// `write_lock`, for a write that tombstones keys, taken once every append
+    /// staged before this call has committed or been abandoned, so the write
+    /// acts on the appended rows like on every other committed row (see
+    /// [`Self::key_tombstones_wait_for_staged_appends`]). The wait holds
+    /// [`Self::append_admission`] so no append stages meanwhile, and not
+    /// `write_lock`, which an append into the current snapshot takes to commit.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the appends staged before this call have not
+    /// committed within the drain timeout.
+    pub(crate) async fn lock_write_after_staged_appends(
+        &self,
+    ) -> Result<tokio::sync::OwnedMutexGuard<()>> {
+        let _admission = self.append_admission.write().await;
+        if !self
+            .drain_inflight_staged_writes(STAGED_WRITE_DRAIN_TIMEOUT)
+            .await
+        {
+            return Err(Error::Internal {
+                table: self.table_metadata.table_name.clone(),
+                message: format!(
+                    "A change-stream write did not commit within {} s, so the delete or update was not applied; retry it",
+                    STAGED_WRITE_DRAIN_TIMEOUT.as_secs()
+                ),
+            });
+        }
+        Ok(self.write_lock_arc().lock_owned().await)
+    }
+
     /// Wait for in-flight pipelined Stage-B publishes (staged WALs + staged
     /// inline tombstones) to drain, up to `timeout`. Returns `false` on
     /// timeout — the caller turns that into its own structured error (a
@@ -6894,6 +6959,15 @@ impl CayenneTableProvider {
         ));
 
         let lock_wait_start = Instant::now();
+        // Held while this append stages: a key delete waiting for the appends
+        // staged before it holds it exclusively
+        // (`lock_write_after_staged_appends`). Not taken under an outer
+        // `write_lock` hold, which already excludes that delete.
+        let _admission = if super::write_lock_held::is_held() {
+            None
+        } else {
+            Some(self.append_admission.read().await)
+        };
         // Autocommit UPDATE already holds `write_lock`. A second acquire
         // deadlocks. `acquire_or_share` reuses that hold; spawned commit
         // keeps a clone of it (task-locals do not cross `tokio::spawn`).
@@ -11113,6 +11187,7 @@ impl CayenneTableProvider {
             snapshot_dir_pins,
             unfinished_uploads,
             partitioned_table_conflict_detection,
+            existed,
         } = options;
 
         let mut table_metadata = catalog.get_table(table_name).await?;
@@ -11621,8 +11696,10 @@ impl CayenneTableProvider {
                     .unwrap_or(u64::MAX),
             )),
             last_orphan_sweep: Arc::new(ParkingMutex::new(Instant::now())),
+            orphan_sweep_running: Arc::new(tokio::sync::Mutex::new(())),
             inflight_staging_appends: Arc::new(ParkingMutex::new(HashMap::new())),
             staging_deletes_after_commit: Arc::new(ParkingMutex::new(HashSet::new())),
+            append_admission: Arc::new(tokio::sync::RwLock::new(())),
             retired_snapshot_dirs: snapshot_dir_pins.retired,
             snapshot_last_listed: snapshot_dir_pins.last_listed,
             snapshot_scan_refs: snapshot_dir_pins.scan_refs,
@@ -11759,6 +11836,14 @@ impl CayenneTableProvider {
         // snapshots a commit retired before a restart, or during a sweep a crash
         // stopped, are deleted by this instance's sweep once their grace passes.
         provider.schedule_durable_retirement_adoption();
+
+        // The orphan sweep at open: the objects a write that crashed or was
+        // fenced left behind are reclaimed even if the table is never written
+        // again. Recovery above has run, so the state it reads is the committed
+        // one. A table created now has none.
+        if existed {
+            provider.schedule_orphan_sweep_at_open();
+        }
 
         // Dropping this table's dataset deletes its folder once this process no
         // longer reads it: the catalog asks these pins first.
@@ -14087,8 +14172,10 @@ impl CayenneTableProvider {
             unfinished_uploads: self.unfinished_uploads.clone(),
             orphan_age_floor_ms: Arc::clone(&self.orphan_age_floor_ms),
             last_orphan_sweep: Arc::clone(&self.last_orphan_sweep),
+            orphan_sweep_running: Arc::clone(&self.orphan_sweep_running),
             inflight_staging_appends: Arc::clone(&self.inflight_staging_appends),
             staging_deletes_after_commit: Arc::clone(&self.staging_deletes_after_commit),
+            append_admission: Arc::clone(&self.append_admission),
             retired_snapshot_dirs: Arc::clone(&self.retired_snapshot_dirs),
             snapshot_last_listed: Arc::clone(&self.snapshot_last_listed),
             snapshot_scan_refs: Arc::clone(&self.snapshot_scan_refs),
@@ -24099,10 +24186,12 @@ impl CayenneTableProvider {
         );
     }
 
-    /// Run the orphan sweep now ([`super::orphan_sweep`]): delete what a listing
-    /// of the table finds that no snapshot names, no write of this process holds,
-    /// and the store dates older than the floor, and abort unfinished multipart
-    /// uploads older than it. Nothing listed is ever adopted.
+    /// The orphan sweep's age floor.
+    fn orphan_age_floor(&self) -> std::time::Duration {
+        std::time::Duration::from_millis(self.orphan_age_floor_ms.load(Ordering::Acquire))
+    }
+
+    /// Run the orphan sweep now, after any scheduled one finishes.
     ///
     /// # Errors
     ///
@@ -24110,6 +24199,57 @@ impl CayenneTableProvider {
     /// sweep then deletes nothing.
     #[doc(hidden)]
     pub async fn sweep_orphan_files_now(&self) -> Result<super::orphan_sweep::OrphanSweep> {
+        let floor = self.orphan_age_floor();
+        let _running = self.orphan_sweep_running.lock().await;
+        self.run_orphan_sweep(floor).await
+    }
+
+    /// Wait for a scheduled orphan sweep to finish, such as the one an open of
+    /// an existing table runs.
+    #[doc(hidden)]
+    pub async fn wait_for_orphan_sweep(&self) {
+        drop(self.orphan_sweep_running.lock().await);
+    }
+
+    /// [`Self::sweep_orphan_files`], recording how a pass that ran ended.
+    async fn run_orphan_sweep(
+        &self,
+        floor: std::time::Duration,
+    ) -> Result<super::orphan_sweep::OrphanSweep> {
+        let result = self.sweep_orphan_files(floor).await;
+        let outcome = match &result {
+            Ok(report) if report.skipped.is_some() => None,
+            Ok(report) if report.failed > 0 => Some(MaintenanceOutcome::Failed),
+            Ok(report) if !report.deleted.is_empty() || !report.aborted_uploads.is_empty() => {
+                Some(MaintenanceOutcome::Reclaimed)
+            }
+            Ok(_) => Some(MaintenanceOutcome::NoOp),
+            Err(_) => Some(MaintenanceOutcome::Failed),
+        };
+        if let Some(outcome) = outcome {
+            maintenance_metrics::track_maintenance(
+                self.table_name(),
+                MaintenanceOp::OrphanFileSweep,
+                outcome,
+            );
+        }
+        result
+    }
+
+    /// Run the orphan sweep ([`super::orphan_sweep`]) with the age floor
+    /// `floor`: delete what a listing of the table finds that no snapshot names,
+    /// no write of this process holds, and the store dates older than the floor,
+    /// in batched requests, and abort unfinished multipart uploads older than it.
+    /// Nothing listed is ever adopted. The caller holds `orphan_sweep_running`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the table's state or its store cannot be read; the
+    /// sweep then deletes nothing.
+    async fn sweep_orphan_files(
+        &self,
+        floor: std::time::Duration,
+    ) -> Result<super::orphan_sweep::OrphanSweep> {
         use super::orphan_sweep::{
             OrphanSweep, Placement, STORE_CLOCK_OBJECT, older_than_floor, placement,
         };
@@ -24181,8 +24321,6 @@ impl CayenneTableProvider {
             .await
             .map_err(store_error("read the orphan sweep's clock object"))?
             .last_modified;
-        let floor =
-            std::time::Duration::from_millis(self.orphan_age_floor_ms.load(Ordering::Acquire));
 
         let live = self.live_snapshot_ids_for_sweep().await?;
         // Snapshots the committed retirement record names belong to the
@@ -24324,7 +24462,7 @@ impl CayenneTableProvider {
                 report.kept_young += 1;
                 continue;
             }
-            doomed.push(meta.location.clone());
+            doomed.push((meta.location.clone(), meta.size));
         }
         for (name, meta) in deletion_candidates {
             if named_deletion_files.contains(name) {
@@ -24338,26 +24476,50 @@ impl CayenneTableProvider {
                 report.kept_young += 1;
                 continue;
             }
-            doomed.push(meta.location.clone());
+            doomed.push((meta.location.clone(), meta.size));
         }
-        for location in doomed {
-            match store.delete(&location).await {
-                Ok(()) | Err(object_store::Error::NotFound { .. }) => {
-                    report.deleted.push(
-                        crate::object_relative(&table_prefix, &location)
-                            .or_else(|| crate::object_relative(&data_prefix, &location))
-                            .unwrap_or(location.as_ref())
-                            .to_string(),
-                    );
-                }
-                Err(error) => tracing::debug!(
-                    table = self.table_name(),
-                    object = %location,
-                    %error,
-                    "The orphan sweep could not delete an unreferenced object; the next sweep retries it"
-                ),
-            }
+        let sizes: HashMap<ObjectStorePath, u64> = doomed.iter().cloned().collect();
+        let outcome = crate::dataset_storage::delete_in_batches(
+            &store,
+            doomed.into_iter().map(|(location, _)| location).collect(),
+        )
+        .await;
+        report.failed = outcome.failed;
+        if outcome.failed > 0 {
+            tracing::debug!(
+                table = self.table_name(),
+                failed = outcome.failed,
+                error = ?outcome.first_error,
+                "The orphan sweep could not delete some unreferenced objects; the next sweep retries them"
+            );
         }
+        let reclaimed_bytes = outcome
+            .deleted
+            .iter()
+            .map(|location| sizes.get(location).copied().unwrap_or(0))
+            .fold(0_u64, u64::saturating_add);
+        if !outcome.deleted.is_empty() {
+            maintenance_metrics::track_reclaimed(
+                self.table_name(),
+                MaintenanceOp::OrphanFileSweep,
+                u64::try_from(outcome.deleted.len()).unwrap_or(u64::MAX),
+                reclaimed_bytes,
+                0,
+            );
+        }
+        // An object already gone is reported deleted, and reclaims nothing.
+        report.deleted = outcome
+            .deleted
+            .iter()
+            .chain(&outcome.missing)
+            .map(|location| {
+                crate::object_relative(&table_prefix, location)
+                    .or_else(|| crate::object_relative(&data_prefix, location))
+                    .unwrap_or(location.as_ref())
+                    .to_string()
+            })
+            .collect();
+        report.deleted.sort();
 
         if let Some(uploads) = &self.unfinished_uploads {
             let unfinished = uploads
@@ -24422,9 +24584,10 @@ impl CayenneTableProvider {
         Ok(live)
     }
 
-    /// Run the orphan sweep in the background when it is due, at most once per
-    /// [`super::orphan_sweep::ORPHAN_SWEEP_INTERVAL`] and never in the first
-    /// interval after the table opened.
+    /// Run the orphan sweep in the background when it is due: after a commit or
+    /// on the background maintenance tick, at most once per
+    /// [`super::orphan_sweep::ORPHAN_SWEEP_INTERVAL`] after the last one, which
+    /// ran when the table opened.
     fn maybe_schedule_orphan_sweep(&self) {
         if !self.data_in_object_native_location() || self.is_maintenance_closed() {
             return;
@@ -24436,9 +24599,30 @@ impl CayenneTableProvider {
             }
             *last = Instant::now();
         }
+        self.spawn_orphan_sweep();
+    }
+
+    /// Run the orphan sweep in the background now, as the table opens.
+    fn schedule_orphan_sweep_at_open(&self) {
+        if !self.data_in_object_native_location() || self.is_maintenance_closed() {
+            return;
+        }
+        *self.last_orphan_sweep.lock() = Instant::now();
+        self.spawn_orphan_sweep();
+    }
+
+    /// Spawn one orphan sweep with the current age floor, unless one is running.
+    fn spawn_orphan_sweep(&self) {
+        // Taken before the spawn so a caller that waits for the sweep after this
+        // returns waits for this one.
+        let Ok(running) = Arc::clone(&self.orphan_sweep_running).try_lock_owned() else {
+            return;
+        };
+        let floor = self.orphan_age_floor();
         let table = self.clone_for_write();
         tokio::spawn(async move {
-            if let Err(error) = table.sweep_orphan_files_now().await {
+            let _running = running;
+            if let Err(error) = table.run_orphan_sweep(floor).await {
                 tracing::debug!(
                     table = table.table_name(),
                     %error,
@@ -24579,6 +24763,8 @@ impl CayenneTableProvider {
         // lock without one of the flags above; once held, nothing is mid-flight.
         // Released immediately — the caller is about to drop/replace this instance.
         drop(self.compaction_lock.write().await);
+        // And behind a scheduled orphan sweep.
+        drop(self.orphan_sweep_running.lock().await);
         // And behind a snapshot-directory sweep still deleting files: its
         // detached unlinks hold the deletion fence and none of the flags above.
         drop(self.file_deletion_fence.read().await);
@@ -46509,6 +46695,10 @@ impl super::compaction::CompactionRunner for CayenneTableProvider {
     }
 
     fn on_background_tick(&self) {
+        // An idle table's orphans are reclaimed on this tick as well as after
+        // its commits.
+        self.maybe_schedule_orphan_sweep();
+
         // Observe the query-health signal — protected-snapshot runs a scan must
         // merge (read amplification, the ingest→query coupling) — and cgroup
         // memory pressure, so the controller's snapshot reflects fresh data.

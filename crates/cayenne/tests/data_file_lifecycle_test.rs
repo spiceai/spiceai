@@ -633,6 +633,9 @@ impl Location {
                 .await
                 .expect("open the table"),
         );
+        // The orphan sweep an open runs lists the dataset; wait for it, so a
+        // test counts only the requests of what it does next.
+        table.wait_for_orphan_sweep().await;
         // As the runtime does: a cached scan view pins the snapshots it read
         // until a later scan replaces it or it goes idle.
         table.init_scan_view_cache();
