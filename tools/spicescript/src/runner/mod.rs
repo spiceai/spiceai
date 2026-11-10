@@ -86,8 +86,8 @@ use api::{http_step, refresh, source_query, spice_cli};
 use background::{start_background, stop_background};
 use checks::{assert_files, assert_log, assert_status, metric_value, wait_metric};
 use cluster::{
-    bridge_address, cluster_args, make_cluster_ready, spicepod_for_bridge, start_executors,
-    undistributed_engine, unpartitionable_acceleration,
+    bridge_address, check_bridged_sources, cluster_args, make_cluster_ready, published_to_bridge,
+    spicepod_for_bridge, start_executors, undistributed_engine, unpartitionable_acceleration,
 };
 use generators::{random_queries, run_slt, tlp};
 use query::{check_error_text, explain, run_query};
@@ -803,9 +803,17 @@ async fn run_combination(
     let result = async {
         // Bridged executors reach the sources at this address, not loopback.
         let bridge = bridge_address(script, options).await?;
+        if bridge.is_some() {
+            check_bridged_sources(
+                script,
+                resolved
+                    .iter()
+                    .map(|(name, _, kind, _)| (name.as_str(), kind.as_str())),
+            )?;
+        }
         for (name, spec, kind, version) in resolved {
             let src = crate::docker::publishing_also_on(
-                bridge,
+                bridge.filter(|_| published_to_bridge(&kind)),
                 source::start(
                     name,
                     run_id,

@@ -105,15 +105,7 @@ pub struct MockHttp {
 
 impl MockHttp {
     pub async fn start() -> Result<Self> {
-        // Bridged cluster executors reach it at the address its URL is
-        // rewritten to (see `crate::docker::publishing_also_on`), so it then
-        // listens on every interface, loopback included.
-        let host = if crate::docker::also_publish_on().is_some() {
-            "0.0.0.0"
-        } else {
-            "127.0.0.1"
-        };
-        let listener = tokio::net::TcpListener::bind((host, 0))
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
             .await
             .context("Failed to bind the mock HTTP server")?;
         let port = listener.local_addr()?.port();

@@ -45,6 +45,49 @@ pub(super) async fn bridge_address(
         .context("executors in containers behind a rootless Docker daemon")
 }
 
+/// The source kinds a spicepod may name when its executors run in bridge
+/// containers: an object store, which [`published_to_bridge`] puts where they
+/// reach it, behind a secret of the run's own; and files and `DuckDB`
+/// databases, which they read from the mounted work directory. Every other
+/// source serves on loopback, out of the executors' reach, so as not to
+/// publish a database with fixed or no credentials on every interface.
+const BRIDGEABLE_KINDS: [&str; 3] = ["rustfs", "files", "duckdb"];
+
+/// Whether a source of `kind` publishes its ports at the bridge address too,
+/// not only on loopback (see [`BRIDGEABLE_KINDS`]).
+pub(super) fn published_to_bridge(kind: &str) -> bool {
+    kind == "rustfs"
+}
+
+/// Refuses a run with bridged executors whose spicepod, or a variant of it,
+/// names a source of a kind not in [`BRIDGEABLE_KINDS`]: the executors could
+/// not reach it, and the run would fail later and less clearly. A source the
+/// spicepod does not name, such as a script's oracle, stays on loopback.
+pub(super) fn check_bridged_sources<'a>(
+    script: &Script,
+    sources: impl IntoIterator<Item = (&'a str, &'a str)>,
+) -> Result<()> {
+    let mut texts = vec![script.spicepod.to_string()];
+    for variant in script.variants.values() {
+        texts.extend(variant.spicepod.iter().map(ToString::to_string));
+        texts.extend(variant.datasets.values().map(ToString::to_string));
+        texts.extend(variant.catalogs.values().map(ToString::to_string));
+    }
+    for (name, kind) in sources {
+        let named = [format!("sources.{name}."), format!("sources.{name}}}")]
+            .iter()
+            .any(|needle| texts.iter().any(|text| text.contains(needle.as_str())));
+        if named && !BRIDGEABLE_KINDS.contains(&kind) {
+            anyhow::bail!(
+                "executors in containers behind a rootless Docker daemon reach only {} sources, \
+                 and the spicepod names source '{name}' ({kind})",
+                BRIDGEABLE_KINDS.join(", ")
+            );
+        }
+    }
+    Ok(())
+}
+
 /// Starts every executor of the instance that is not running, and waits for
 /// the scheduler to report all the running ones ready to take work.
 /// Starts the instance's executors and waits for them: until they are ready
@@ -338,8 +381,8 @@ mod tests {
     use serde_json::json;
 
     use super::{
-        cluster_args, make_cluster_ready, spicepod_for_bridge, undistributed_engine,
-        unpartitionable_acceleration,
+        check_bridged_sources, cluster_args, make_cluster_ready, published_to_bridge,
+        spicepod_for_bridge, undistributed_engine, unpartitionable_acceleration,
     };
 
     /// The value after `flag` in `args`.
@@ -385,6 +428,31 @@ mod tests {
             assert!(after(executor, "--node-bind-address").starts_with("0.0.0.0:"));
         }
         assert_eq!(after(&executors[0], "--node-bind-address"), "0.0.0.0:29160");
+    }
+
+    #[test]
+    fn bridged_executors_reach_only_vetted_sources_the_spicepod_names() {
+        let script = crate::script::Script::parse(
+            "name: s\n\
+             sources: { lake: { kind: rustfs }, db: { kind: postgres }, oracle: { kind: postgres } }\n\
+             spicepod:\n  datasets:\n    - from: s3://${sources.lake.bucket}/orders/\n      name: orders\n      params: { $merge: '${sources.lake.params}', file_format: parquet }\n\
+             variants:\n  pg: { datasets: { '*': { params: { pg_port: '${sources.db.port}' } } } }\n\
+             steps: [{ start: {} }]",
+        )
+        .expect("script parses");
+        // The object store the spicepod names, and an oracle it does not.
+        check_bridged_sources(&script, [("lake", "rustfs"), ("oracle", "postgres")])
+            .expect("an object store and an unnamed oracle are allowed");
+        // A database named only by a variant would be published with fixed
+        // credentials: refused.
+        let error = check_bridged_sources(&script, [("lake", "rustfs"), ("db", "postgres")])
+            .expect_err("a named database is refused");
+        assert!(error.to_string().contains("'db' (postgres)"), "{error}");
+        // A source whose name only extends a named one's is not named.
+        check_bridged_sources(&script, [("lak", "kafka")]).expect("not named");
+        assert!(published_to_bridge("rustfs"));
+        assert!(!published_to_bridge("postgres"));
+        assert!(!published_to_bridge("mock-http"));
     }
 
     #[test]
