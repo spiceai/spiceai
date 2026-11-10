@@ -363,6 +363,7 @@ impl std::fmt::Debug for AfterCommit {
         f.debug_struct("AfterCommit")
             .field("publishes", &self.publishes.lock().len())
             .field("deletes", &self.deletes.lock().len())
+            .field("published_early", &self.published_early.lock().len())
             .finish()
     }
 }

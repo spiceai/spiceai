@@ -35298,7 +35298,10 @@ impl CayenneTableProvider {
 
     /// Serve `replaced` to inline-view rebuilds in place of the catalog's
     /// versions until [`Self::release_replaced_inlined_entries`]. Returns their ids.
-    pub(crate) fn hold_replaced_inlined_entries(&self, replaced: &[Arc<InlinedData>]) -> Vec<String> {
+    pub(crate) fn hold_replaced_inlined_entries(
+        &self,
+        replaced: &[Arc<InlinedData>],
+    ) -> Vec<String> {
         if replaced.is_empty() {
             return Vec::new();
         }

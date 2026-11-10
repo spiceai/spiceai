@@ -775,7 +775,11 @@ impl DeletionSink for InlineAwareDeletionSink {
                 self.table
                     .publish_when_committed(async move {
                         table
-                            .publish_delete(prepared_file_delete, &inline_rewrite, &awaiting_publish)
+                            .publish_delete(
+                                prepared_file_delete,
+                                &inline_rewrite,
+                                &awaiting_publish,
+                            )
                             .await;
                         table.remove_dropped_deletion_vector_files(replaced_vectors);
                     })

@@ -1648,7 +1648,11 @@ async fn a_reader_sees_no_row_of_an_inline_burst_whose_record_is_not_committed()
     let process = location.open_with(&inline).await;
     let bottom = Arc::clone(&location.bottom) as Arc<dyn ObjectStore>;
     let (rows_before, key_before, aggregates_before) = process.rebuilt_view(KEY).await;
-    assert_eq!(key_before, vec![(KEY, value(KEY, 0))], "the seeded inline key");
+    assert_eq!(
+        key_before,
+        vec![(KEY, value(KEY, 0))],
+        "the seeded inline key"
+    );
     let head_before = head_commit(&bottom).await;
 
     let (sink, options) = durable_sink(&process.table);
@@ -1987,8 +1991,7 @@ async fn an_inline_burst_on_the_sqlite_catalog_is_committed_before_it_is_visible
     let publications = table.hold_publications().await;
     let no_position: PositionWrite = Box::pin(async { Ok(()) });
     let burst = tokio::spawn(async move {
-        let outcome =
-            apply_burst(&sink, options, changes(&[KEY, NEW_KEY], 1), no_position).await;
+        let outcome = apply_burst(&sink, options, changes(&[KEY, NEW_KEY], 1), no_position).await;
         drop(sink);
         outcome
     });
