@@ -183,6 +183,91 @@ steps:
     expect: { rows: [['2']] }
     eventually: 10s
 
+  # A zero TTL asks the origin on every lookup even right after the previous
+  # one, while that lookup's write is still waiting to land: the lookup must
+  # not replay the earlier fetch (#16148). Back to back, so each second lookup
+  # falls inside the earlier one's write window.
+  - source-exec: { api: "{ path: /v1/again-zero-0, headers: { content-type: application/json }, body: '[{\"v\": 1}]' }" }
+  - query: SELECT content FROM zero WHERE request_path = '/again-zero-0'
+    expect: { rows: [['{"v":1}']] }
+  - source-exec: { api: "{ path: /v1/again-zero-0, headers: { content-type: application/json }, body: '[{\"v\": 2}]' }" }
+  - query: SELECT content FROM zero WHERE request_path = '/again-zero-0'
+    expect: { rows: [['{"v":2}']] }
+  - source-query: { api: count /v1/again-zero-0 }
+    expect: { rows: [['2']] }
+  - source-exec: { api: "{ path: /v1/again-zero_strict-0, headers: { content-type: application/json }, body: '[{\"v\": 1}]' }" }
+  - query: SELECT content FROM zero_strict WHERE request_path = '/again-zero_strict-0'
+    expect: { rows: [['{"v":1}']] }
+  - source-exec: { api: "{ path: /v1/again-zero_strict-0, headers: { content-type: application/json }, body: '[{\"v\": 2}]' }" }
+  - query: SELECT content FROM zero_strict WHERE request_path = '/again-zero_strict-0'
+    expect: { rows: [['{"v":2}']] }
+  - source-query: { api: count /v1/again-zero_strict-0 }
+    expect: { rows: [['2']] }
+  - source-exec: { api: "{ path: /v1/again-zero-1, headers: { content-type: application/json }, body: '[{\"v\": 1}]' }" }
+  - query: SELECT content FROM zero WHERE request_path = '/again-zero-1'
+    expect: { rows: [['{"v":1}']] }
+  - source-exec: { api: "{ path: /v1/again-zero-1, headers: { content-type: application/json }, body: '[{\"v\": 2}]' }" }
+  - query: SELECT content FROM zero WHERE request_path = '/again-zero-1'
+    expect: { rows: [['{"v":2}']] }
+  - source-query: { api: count /v1/again-zero-1 }
+    expect: { rows: [['2']] }
+  - source-exec: { api: "{ path: /v1/again-zero_strict-1, headers: { content-type: application/json }, body: '[{\"v\": 1}]' }" }
+  - query: SELECT content FROM zero_strict WHERE request_path = '/again-zero_strict-1'
+    expect: { rows: [['{"v":1}']] }
+  - source-exec: { api: "{ path: /v1/again-zero_strict-1, headers: { content-type: application/json }, body: '[{\"v\": 2}]' }" }
+  - query: SELECT content FROM zero_strict WHERE request_path = '/again-zero_strict-1'
+    expect: { rows: [['{"v":2}']] }
+  - source-query: { api: count /v1/again-zero_strict-1 }
+    expect: { rows: [['2']] }
+  - source-exec: { api: "{ path: /v1/again-zero-2, headers: { content-type: application/json }, body: '[{\"v\": 1}]' }" }
+  - query: SELECT content FROM zero WHERE request_path = '/again-zero-2'
+    expect: { rows: [['{"v":1}']] }
+  - source-exec: { api: "{ path: /v1/again-zero-2, headers: { content-type: application/json }, body: '[{\"v\": 2}]' }" }
+  - query: SELECT content FROM zero WHERE request_path = '/again-zero-2'
+    expect: { rows: [['{"v":2}']] }
+  - source-query: { api: count /v1/again-zero-2 }
+    expect: { rows: [['2']] }
+  - source-exec: { api: "{ path: /v1/again-zero_strict-2, headers: { content-type: application/json }, body: '[{\"v\": 1}]' }" }
+  - query: SELECT content FROM zero_strict WHERE request_path = '/again-zero_strict-2'
+    expect: { rows: [['{"v":1}']] }
+  - source-exec: { api: "{ path: /v1/again-zero_strict-2, headers: { content-type: application/json }, body: '[{\"v\": 2}]' }" }
+  - query: SELECT content FROM zero_strict WHERE request_path = '/again-zero_strict-2'
+    expect: { rows: [['{"v":2}']] }
+  - source-query: { api: count /v1/again-zero_strict-2 }
+    expect: { rows: [['2']] }
+  - source-exec: { api: "{ path: /v1/again-zero-3, headers: { content-type: application/json }, body: '[{\"v\": 1}]' }" }
+  - query: SELECT content FROM zero WHERE request_path = '/again-zero-3'
+    expect: { rows: [['{"v":1}']] }
+  - source-exec: { api: "{ path: /v1/again-zero-3, headers: { content-type: application/json }, body: '[{\"v\": 2}]' }" }
+  - query: SELECT content FROM zero WHERE request_path = '/again-zero-3'
+    expect: { rows: [['{"v":2}']] }
+  - source-query: { api: count /v1/again-zero-3 }
+    expect: { rows: [['2']] }
+  - source-exec: { api: "{ path: /v1/again-zero_strict-3, headers: { content-type: application/json }, body: '[{\"v\": 1}]' }" }
+  - query: SELECT content FROM zero_strict WHERE request_path = '/again-zero_strict-3'
+    expect: { rows: [['{"v":1}']] }
+  - source-exec: { api: "{ path: /v1/again-zero_strict-3, headers: { content-type: application/json }, body: '[{\"v\": 2}]' }" }
+  - query: SELECT content FROM zero_strict WHERE request_path = '/again-zero_strict-3'
+    expect: { rows: [['{"v":2}']] }
+  - source-query: { api: count /v1/again-zero_strict-3 }
+    expect: { rows: [['2']] }
+  - source-exec: { api: "{ path: /v1/again-zero-4, headers: { content-type: application/json }, body: '[{\"v\": 1}]' }" }
+  - query: SELECT content FROM zero WHERE request_path = '/again-zero-4'
+    expect: { rows: [['{"v":1}']] }
+  - source-exec: { api: "{ path: /v1/again-zero-4, headers: { content-type: application/json }, body: '[{\"v\": 2}]' }" }
+  - query: SELECT content FROM zero WHERE request_path = '/again-zero-4'
+    expect: { rows: [['{"v":2}']] }
+  - source-query: { api: count /v1/again-zero-4 }
+    expect: { rows: [['2']] }
+  - source-exec: { api: "{ path: /v1/again-zero_strict-4, headers: { content-type: application/json }, body: '[{\"v\": 1}]' }" }
+  - query: SELECT content FROM zero_strict WHERE request_path = '/again-zero_strict-4'
+    expect: { rows: [['{"v":1}']] }
+  - source-exec: { api: "{ path: /v1/again-zero_strict-4, headers: { content-type: application/json }, body: '[{\"v\": 2}]' }" }
+  - query: SELECT content FROM zero_strict WHERE request_path = '/again-zero_strict-4'
+    expect: { rows: [['{"v":2}']] }
+  - source-query: { api: count /v1/again-zero_strict-4 }
+    expect: { rows: [['2']] }
+
   # A zero TTL asks the origin on every lookup; when the origin fails, the
   # stored entry answers inside the stale-if-error window, and without one
   # the failure reaches the client.

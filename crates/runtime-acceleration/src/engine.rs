@@ -41,7 +41,6 @@ pub fn removed_engine_message(engine: &str) -> String {
 pub enum Engine {
     Arrow,
     PartitionedArrow,
-    DuckDB,
     Sqlite,
     PostgreSQL,
     #[default]
@@ -63,7 +62,6 @@ impl Display for Engine {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Engine::Arrow | Engine::PartitionedArrow => write!(f, "arrow"),
-            Engine::DuckDB => write!(f, "duckdb"),
             Engine::Sqlite => write!(f, "sqlite"),
             Engine::PostgreSQL => write!(f, "postgres"),
             Engine::Cayenne => write!(f, "cayenne"),

@@ -32,8 +32,6 @@ use datafusion::{
     common::{ResolvedTableReference, TableReference},
     sql::{parser::DFParser, sqlparser::dialect::PostgreSqlDialect},
 };
-#[cfg(feature = "duckdb")]
-use futures::stream::StreamExt;
 use itertools::Itertools;
 use runtime_metrics as metrics;
 use snafu::prelude::*;
@@ -587,34 +585,6 @@ impl Runtime {
                 }
             })
             .collect()
-    }
-
-    #[cfg(feature = "duckdb")]
-    pub(crate) async fn get_initialized_views(
-        self: Arc<Self>,
-        app: &Arc<App>,
-        log_errors: LogErrors,
-    ) -> Vec<Arc<View>> {
-        let valid_views = Arc::clone(&self).get_valid_views(app, log_errors);
-        futures::stream::iter(valid_views)
-            .filter_map(|validated_view| async move {
-                let view = &validated_view.view;
-                match (view.is_accelerated(), view.is_accelerator_initialized().await) {
-                    (true, true) | (false, _) => Some(Arc::clone(view)),
-                    (true, false) => {
-                        if log_errors.0 {
-                            metrics::views::LOAD_ERROR.add(1, &[]);
-                            tracing::error!(
-                                "View {view_name} is accelerated but the accelerator failed to initialize.",
-                                view_name = &view.name.to_string(),
-                            );
-                        }
-                        None
-                    }
-                }
-            })
-            .collect()
-            .await
     }
 
     /// Initialize views configured with accelerators before registering the datasets.
