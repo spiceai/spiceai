@@ -34,9 +34,9 @@ mod keyquota;
 mod ledger;
 mod pki;
 mod reap;
+mod relay;
 mod release;
 mod results;
-mod rootlesskit;
 mod rqg;
 mod runner;
 mod script;
@@ -179,6 +179,17 @@ struct Cli {
 
 #[tokio::main]
 async fn main() -> ExitCode {
+    let args: Vec<String> = std::env::args().collect();
+    if args.get(1).map(String::as_str) == Some(relay::ARG) {
+        // This binary, run in a container as a relay; see `relay`.
+        return match relay::run(&args[2..]).await {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(e) => {
+                eprintln!("error: {e:#}");
+                ExitCode::from(2)
+            }
+        };
+    }
     match run(Cli::parse()).await {
         Ok(true) => ExitCode::SUCCESS,
         Ok(false) => ExitCode::FAILURE,

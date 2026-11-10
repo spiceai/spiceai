@@ -77,9 +77,11 @@ pub struct Spiced {
     container: Option<ContainerRun>,
     /// The `binary` last copied into `dir` for a container to run.
     staged_from: Option<PathBuf>,
-    /// Port forwards into a rootless daemon's network namespace, so this
-    /// machine reaches a container instance at the ports it serves.
-    forwards: Vec<crate::rootlesskit::Forward>,
+    /// The relay container that makes this container instance reachable
+    /// behind a rootless daemon (see [`crate::relay`]), once started. It
+    /// outlives restarts of the instance, whose ports do not change, and is
+    /// removed when the instance is dropped.
+    relay_container: Option<String>,
 }
 
 /// A container `spiced` runs in: on the host's network, so it serves on the
@@ -93,14 +95,23 @@ pub struct ContainerRun {
     /// `docker run -v` specifications.
     pub volumes: Vec<String>,
     /// Whether the daemon runs rootless, so its containers live in a user
-    /// namespace where the daemon's own user is root, and its `host` network
-    /// is a namespace of its own, which this machine reaches only through
-    /// port forwards.
+    /// namespace where the daemon's own user is root.
     pub rootless: bool,
-    /// Ports beyond the instance's own HTTP, Flight, metrics and `OpenTelemetry` ports
-    /// to forward from this machine into the daemon's namespace when
-    /// `rootless`, such as a cluster executor's node port.
-    pub forward_ports: Vec<u16>,
+    /// How this machine reaches the container when the daemon's `host`
+    /// network is a namespace of its own, as a rootless daemon's is.
+    pub relay: Option<Relay>,
+}
+
+/// A relay container (see [`crate::relay`]) that publishes a host-network
+/// container's ports, which the container then serves on `gateway` instead
+/// of loopback.
+#[derive(Debug, Clone)]
+pub struct Relay {
+    /// The bridge network's gateway address in the daemon's namespace.
+    pub gateway: std::net::IpAddr,
+    /// Ports beyond the instance's own HTTP, Flight, metrics and
+    /// `OpenTelemetry` ports to relay, such as a cluster executor's node port.
+    pub extra_ports: Vec<u16>,
 }
 
 /// The `docker run --user` a container runs as, so that it may write in, and
@@ -179,7 +190,7 @@ impl Spiced {
             sessions: std::collections::HashMap::new(),
             container: None,
             staged_from: None,
-            forwards: Vec::new(),
+            relay_container: None,
         })
     }
 
@@ -337,21 +348,31 @@ impl Spiced {
             }
             Some(run) => {
                 let binary = self.stage_binary()?;
-                if run.rootless && self.forwards.is_empty() {
-                    self.forwards = self.forward_into_daemon(&run)?;
+                if let Some(relay) = &run.relay
+                    && self.relay_container.is_none()
+                {
+                    self.relay_container = Some(self.start_relay(&run, relay)?);
                 }
                 self.container_command(&run, &binary)?
             }
         };
+        // A relayed container serves where its relay passes connections on to.
+        let relayed = self
+            .container
+            .as_ref()
+            .and_then(|run| run.relay.as_ref())
+            .map(|relay| relay.gateway.to_string());
+        let http = match &relayed {
+            Some(gateway) => format!("{gateway}:{}", self.http),
+            None => http_listen(self.http_on_every_interface, self.http),
+        };
+        let host = relayed.unwrap_or_else(|| "127.0.0.1".to_string());
         let child = command
             .arg("--telemetry-enabled=false")
-            .args([
-                "--http",
-                &http_listen(self.http_on_every_interface, self.http),
-            ])
-            .args(["--flight", &format!("127.0.0.1:{}", self.flight)])
-            .args(["--metrics", &format!("127.0.0.1:{}", self.metrics)])
-            .args(["--open_telemetry", &format!("127.0.0.1:{}", self.otel)])
+            .args(["--http", &http])
+            .args(["--flight", &format!("{host}:{}", self.flight)])
+            .args(["--metrics", &format!("{host}:{}", self.metrics)])
+            .args(["--open_telemetry", &format!("{host}:{}", self.otel)])
             .args(&self.extra_args)
             .stdout(log.try_clone()?)
             .stderr(log)
@@ -374,22 +395,63 @@ impl Spiced {
         Ok(())
     }
 
-    /// Forwards this instance's ports from this machine's loopback into a
-    /// rootless daemon's network namespace, where a host-network container
-    /// serves them. The ports stay the same across restarts, so the forwards
-    /// are made once and kept until the instance is dropped.
-    fn forward_into_daemon(&self, run: &ContainerRun) -> Result<Vec<crate::rootlesskit::Forward>> {
-        let socket = crate::rootlesskit::api_socket().with_context(|| {
+    /// Starts the relay container that publishes this container instance's
+    /// ports on this machine's loopback and on the daemon namespace's, and
+    /// passes each connection on to the instance at `relay.gateway`. Returns
+    /// its name.
+    fn start_relay(&self, run: &ContainerRun, relay: &Relay) -> Result<String> {
+        let name = format!("{}-relay", run.name);
+        // A relay left behind by an interrupted run would hold the name.
+        let _ = std::process::Command::new("docker")
+            .args(["rm", "-f", &name])
+            .output();
+        // The relay is this binary, copied where the daemon can mount it
+        // from (see `stage_binary`).
+        let exe = std::env::current_exe().context("Failed to find the spicescript binary")?;
+        let copy = std::path::absolute(self.dir.join("spicescript.bin"))?;
+        std::fs::copy(&exe, &copy).with_context(|| {
             format!(
-                "Failed to start container {}: under a rootless Docker daemon this machine reaches a host-network container only through RootlessKit's port API, and no `dockerd-rootless/api.sock` was found beside the daemon's socket (`DOCKER_HOST`), or in `$XDG_RUNTIME_DIR`",
+                "Failed to copy {} to {} for the relay of container {}",
+                exe.display(),
+                copy.display(),
                 run.name
             )
         })?;
-        [self.http, self.flight, self.metrics, self.otel]
+        let ports: Vec<u16> = [self.http, self.flight, self.metrics, self.otel]
             .into_iter()
-            .chain(run.forward_ports.iter().copied())
-            .map(|port| crate::rootlesskit::Forward::add(&socket, port))
-            .collect()
+            .chain(relay.extra_ports.iter().copied())
+            .collect();
+        let mut command = std::process::Command::new("docker");
+        command
+            .args(["run", "-d", "--rm", "--init", "--network", "bridge"])
+            .args(["--name", &name])
+            .arg("--label")
+            .arg(format!(
+                "{}={}",
+                crate::docker::RUNNER_LABEL,
+                std::process::id()
+            ))
+            .arg("-v")
+            .arg(format!("{}:/usr/local/bin/spicescript:ro", copy.display()));
+        for port in &ports {
+            command.args(["-p", &format!("127.0.0.1:{port}:{port}")]);
+        }
+        command
+            .arg(&run.image)
+            .arg("/usr/local/bin/spicescript")
+            .args(crate::relay::relay_args(relay.gateway, &ports));
+        let output = command
+            .output()
+            .with_context(|| format!("Failed to run docker to start the relay {name}"))?;
+        if !output.status.success() {
+            bail!(
+                "Failed to start the relay {name} that makes container {} reachable behind the rootless Docker daemon: {}",
+                run.name,
+                String::from_utf8_lossy(&output.stderr).trim()
+            );
+        }
+        crate::cleanup::track_container(&name, &name, None);
+        Ok(name)
     }
 
     /// The binary a container runs: a copy of `binary` in this instance's
@@ -1134,6 +1196,9 @@ impl Drop for Spiced {
     fn drop(&mut self) {
         if let Some(run) = &self.container {
             crate::cleanup::remove_if_tracked(&run.name);
+        }
+        if let Some(relay) = &self.relay_container {
+            crate::cleanup::remove_if_tracked(relay);
         }
     }
 }

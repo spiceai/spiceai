@@ -86,7 +86,7 @@ use api::{http_step, refresh, source_query, spice_cli};
 use background::{start_background, stop_background};
 use checks::{assert_files, assert_log, assert_status, metric_value, wait_metric};
 use cluster::{
-    cluster_args, make_cluster_ready, start_executors, undistributed_engine,
+    RootlessAddresses, cluster_args, make_cluster_ready, start_executors, undistributed_engine,
     unpartitionable_acceleration,
 };
 use generators::{random_queries, run_slt, tlp};
@@ -258,6 +258,25 @@ fn runs_executors(script: &Script, options: &Options) -> bool {
 fn runs_cluster(script: &Script, options: &Options) -> bool {
     (options.cluster || script.defaults.cluster.is_some())
         && script.defaults.executor_args.is_none()
+}
+
+/// Whether the cluster's executors run in containers behind a rootless
+/// Docker daemon, where each also has a relay container (see
+/// [`crate::relay`]).
+async fn executors_behind_rootless(script: &Script, options: &Options) -> bool {
+    cfg!(target_os = "linux")
+        && executors_in_containers(script, options)
+        && crate::docker::daemon_is_rootless().await
+}
+
+/// The containers each executor runs in: its own, and its relay's behind a
+/// rootless daemon.
+async fn containers_per_executor(script: &Script, options: &Options) -> u64 {
+    if executors_behind_rootless(script, options).await {
+        2
+    } else {
+        1
+    }
 }
 
 /// Whether the cluster's executors run in containers of their own.
@@ -774,7 +793,9 @@ async fn run_combination(
         .iter()
         .map(|(_, _, kind, _)| source::containers(kind))
         .sum();
-    let executor_containers = executor_containers_bound(script, options, combo);
+    let per_executor = containers_per_executor(script, options).await;
+    let executor_containers =
+        executor_containers_bound(script, options, combo).saturating_mul(per_executor);
     let key_room = Arc::new(
         crate::keyquota::reserve_room(
             source_containers + executor_containers,
@@ -823,7 +844,7 @@ async fn run_combination(
             .count()
             .try_into()
             .unwrap_or(u64::MAX);
-        key_room.release(executor_containers.saturating_sub(created));
+        key_room.release(executor_containers.saturating_sub(created.saturating_mul(per_executor)));
         for instance in &mut instances {
             let unstarted = instance
                 .executors
@@ -833,6 +854,7 @@ async fn run_combination(
             instance.key_room = Some(KeyRoom {
                 reservation: Arc::clone(&key_room),
                 unstarted,
+                per_executor,
             });
         }
         match schedule {
@@ -1100,13 +1122,14 @@ async fn create_instances(
         "host.docker.internal".to_string()
     };
     // Container executors behind a rootless daemon cannot reach this
-    // machine's loopback either, so the scheduler then listens on, and the
-    // executors dial it at, the routable address (see `cluster_args`).
-    let executors_behind_rootless = cfg!(target_os = "linux")
-        && executors_in_containers(script, options)
-        && crate::docker::daemon_is_rootless().await;
-    let scheduler_reached_at = if executors_behind_rootless {
-        Some(crate::docker::routable_address()?)
+    // machine's loopback either, nor be reached at their own; see
+    // `cluster_args`.
+    let executors_behind_rootless = executors_behind_rootless(script, options).await;
+    let rootless_cluster = if executors_behind_rootless {
+        Some(RootlessAddresses {
+            routable: crate::docker::routable_address()?,
+            gateway: crate::docker::bridge_gateway().await?,
+        })
     } else {
         None
     };
@@ -1262,7 +1285,7 @@ async fn create_instances(
                     &options.pki,
                     &context,
                     executor_count + spare_count,
-                    scheduler_reached_at,
+                    rootless_cluster,
                 )?)
             } else {
                 None
@@ -1310,14 +1333,16 @@ async fn create_instances(
                             "/etc/ssl/certs:/etc/ssl/certs:ro".to_string(),
                         ],
                         rootless: crate::docker::daemon_is_rootless().await,
-                        // The scheduler fetches results from the executor's
-                        // node port, which lives in the daemon's namespace.
-                        forward_ports: cluster_args
-                            .as_ref()
-                            .filter(|_| executors_behind_rootless)
-                            .and_then(|args| args.executors.get(n))
-                            .map(|(_, port)| vec![*port])
-                            .unwrap_or_default(),
+                        // The scheduler and the other executors reach the
+                        // executor's node port through the relay too.
+                        relay: rootless_cluster.map(|addresses| crate::spiced::Relay {
+                            gateway: addresses.gateway,
+                            extra_ports: cluster_args
+                                .as_ref()
+                                .and_then(|args| args.executors.get(n))
+                                .map(|(_, port)| vec![*port])
+                                .unwrap_or_default(),
+                        }),
                     });
                 }
                 executors.push(executor);
@@ -1570,9 +1595,23 @@ struct KeyRoom {
     /// By executor index: whether it runs in a container that has not yet
     /// started, and so still holds a share.
     unstarted: Vec<bool>,
+    /// The containers an executor's first start creates, each holding a key:
+    /// its own, and its relay's behind a rootless daemon.
+    per_executor: u64,
 }
 
 impl KeyRoom {
+    /// The containers starting executor `index` creates: its own and, the
+    /// first time behind a rootless daemon, its relay's, which outlives
+    /// restarts.
+    fn containers_to_start(&self, index: usize) -> u64 {
+        if self.unstarted.get(index).copied().unwrap_or(false) {
+            self.per_executor
+        } else {
+            1
+        }
+    }
+
     /// Gives back executor `index`'s share once, the first time it starts
     /// healthy; a restart takes a key of its own and gives back nothing, so it
     /// cannot spend a share held for another executor.
@@ -1580,7 +1619,7 @@ impl KeyRoom {
         if let Some(unstarted) = self.unstarted.get_mut(index)
             && std::mem::take(unstarted)
         {
-            self.reservation.release(1);
+            self.reservation.release(self.per_executor);
         }
     }
 }
@@ -1948,6 +1987,28 @@ mod tests {
 
     use super::*;
 
+    /// Behind a rootless daemon an executor's first start also creates its
+    /// relay container, so it needs, and gives back, two keys; a restart
+    /// creates only the executor's own container again.
+    #[test]
+    fn a_relayed_executor_takes_and_gives_back_two_keys_on_its_first_start_only() {
+        let pool: &'static crate::keyquota::Reservations =
+            Box::leak(Box::new(crate::keyquota::Reservations::new()));
+        let reservation = Arc::new(crate::keyquota::Reservation::held_in(pool, 4));
+        let mut room = KeyRoom {
+            reservation: Arc::clone(&reservation),
+            unstarted: vec![true, true],
+            per_executor: 2,
+        };
+        assert_eq!(room.containers_to_start(0), 2);
+        room.executor_started(0);
+        assert_eq!(reservation.remaining(), 2);
+        assert_eq!(room.containers_to_start(0), 1);
+        room.executor_started(0);
+        assert_eq!(reservation.remaining(), 2);
+        assert_eq!(room.containers_to_start(1), 2);
+    }
+
     /// An executor gives back its share of the combination's reservation the
     /// first time it starts, and only then: a restart (after `kill-executor`)
     /// must not spend a share still held for a spare that has not started.
@@ -1960,6 +2021,7 @@ mod tests {
         let mut room = KeyRoom {
             reservation: Arc::clone(&reservation),
             unstarted: vec![true, true, false],
+            per_executor: 1,
         };
         room.executor_started(0);
         assert_eq!(reservation.remaining(), 1);

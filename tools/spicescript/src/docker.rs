@@ -906,6 +906,29 @@ pub async fn daemon_is_rootless() -> bool {
         .await
 }
 
+/// The gateway of the daemon's default `bridge` network: an address of the
+/// daemon's own network namespace, where a host-network container can
+/// listen and a bridge-network container can reach it. Behind a rootless
+/// daemon it is how a relay container reaches a host-network executor (see
+/// `crate::relay`).
+pub async fn bridge_gateway() -> Result<std::net::IpAddr> {
+    let docker = Docker::connect_with_local_defaults()
+        .context("Failed to connect to Docker; is it running?")?;
+    let network = docker
+        .inspect_network::<String>("bridge", None)
+        .await
+        .context("Failed to inspect Docker's bridge network")?;
+    let gateway = network
+        .ipam
+        .and_then(|ipam| ipam.config)
+        .into_iter()
+        .flatten()
+        .filter_map(|config| config.gateway)
+        .find_map(|gateway| gateway.parse::<std::net::Ipv4Addr>().ok())
+        .context("Docker's bridge network has no IPv4 gateway")?;
+    Ok(gateway.into())
+}
+
 /// This machine's address on the interface its default route leaves by. A
 /// rootless daemon's containers reach a listener on it through the daemon's
 /// outbound NAT, which never leads to this machine's loopback.

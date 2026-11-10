@@ -46,7 +46,12 @@ pub(super) async fn start_executors(
                 // The combination reserved this room before it took its
                 // `--jobs` slots; this waits only if something outside the
                 // run took it meanwhile, or for a restart.
-                crate::keyquota::wait_for_room(1, &format!("executor container {name}")).await?;
+                let containers = instance
+                    .key_room
+                    .as_ref()
+                    .map_or(1, |room| room.containers_to_start(index));
+                crate::keyquota::wait_for_room(containers, &format!("executor container {name}"))
+                    .await?;
             }
             executor.start(&instance.spicepod_yaml)?;
             executor.wait_health(timeout).await?;
@@ -79,6 +84,16 @@ pub(super) async fn start_executors(
         })
 }
 
+/// Where a cluster's nodes reach each other when its executors are
+/// containers behind a rootless Docker daemon.
+#[derive(Debug, Clone, Copy)]
+pub(super) struct RootlessAddresses {
+    /// This machine's routable address, which the daemon's containers reach.
+    pub routable: std::net::IpAddr,
+    /// The bridge network's gateway in the daemon's namespace.
+    pub gateway: std::net::IpAddr,
+}
+
 /// What [`cluster_args`] returns: the scheduler's arguments and each
 /// executor's.
 pub(super) struct ClusterArgs {
@@ -90,18 +105,19 @@ pub(super) struct ClusterArgs {
 /// `--cluster`: the scheduler and executor arguments, with node mTLS from the
 /// run's generated CA and certificates.
 ///
-/// Every node listens and advertises on `127.0.0.1`, except when
-/// `scheduler_reached_at` is set: container executors behind a rootless
-/// Docker daemon live in its network namespace, where this machine's
-/// loopback is out of reach, so the scheduler then listens on every
-/// interface and executors dial it at that routable address. They still
-/// reach each other on their namespace's loopback, and the scheduler reaches
-/// them through the port forwards [`crate::spiced::Spiced`] adds.
+/// Every node listens and advertises on `127.0.0.1`, unless the executors
+/// are containers behind a rootless Docker daemon (`rootless`): they then
+/// live in the daemon's network namespace, which cannot reach this machine's
+/// loopback. The scheduler then listens on every interface and executors
+/// dial it at this machine's routable address. Each executor listens on the
+/// bridge gateway, where its relay container (see [`crate::relay`]) passes on
+/// connections to the `127.0.0.1` port it advertises, from this machine and
+/// from the other executors alike.
 pub(super) fn cluster_args(
     pki: &std::path::Path,
     context: &Value,
     executors: usize,
-    scheduler_reached_at: Option<std::net::IpAddr>,
+    rootless: Option<RootlessAddresses>,
 ) -> Result<ClusterArgs> {
     let file = |name: &str| pki.join(name).display().to_string();
     let scheduler_port = context["instance"]["port"].to_string();
@@ -115,9 +131,17 @@ pub(super) fn cluster_args(
             file(&format!("{node}.key")),
         ]
     };
-    let (scheduler_host, scheduler_bind) = match scheduler_reached_at {
-        Some(ip) => (ip.to_string(), "0.0.0.0".to_string()),
-        None => ("127.0.0.1".to_string(), "127.0.0.1".to_string()),
+    let (scheduler_host, scheduler_bind, executor_bind) = match rootless {
+        Some(addresses) => (
+            addresses.routable.to_string(),
+            "0.0.0.0".to_string(),
+            addresses.gateway.to_string(),
+        ),
+        None => (
+            "127.0.0.1".to_string(),
+            "127.0.0.1".to_string(),
+            "127.0.0.1".to_string(),
+        ),
     };
     let mut scheduler: Vec<String> = vec![
         "--role".to_string(),
@@ -146,7 +170,7 @@ pub(super) fn cluster_args(
             "--node-advertise-address".to_string(),
             "127.0.0.1".to_string(),
             "--node-bind-address".to_string(),
-            format!("127.0.0.1:{port}"),
+            format!("{executor_bind}:{port}"),
         ];
         executor.extend(mtls("executor"));
         all.push((executor, port));
@@ -296,21 +320,15 @@ mod tests {
     use serde_json::json;
 
     use super::{
-        cluster_args, make_cluster_ready, undistributed_engine, unpartitionable_acceleration,
+        RootlessAddresses, cluster_args, make_cluster_ready, undistributed_engine,
+        unpartitionable_acceleration,
     };
 
     /// The node addresses of a one-executor cluster, without the mTLS files.
-    fn addresses(
-        scheduler_reached_at: Option<std::net::IpAddr>,
-    ) -> (Vec<String>, Vec<String>, u16) {
+    fn addresses(rootless: Option<RootlessAddresses>) -> (Vec<String>, Vec<String>, u16) {
         let context = json!({ "instance": { "port": 41001, "executor_port": 41002 } });
-        let args = cluster_args(
-            std::path::Path::new("/pki"),
-            &context,
-            1,
-            scheduler_reached_at,
-        )
-        .expect("cluster args");
+        let args = cluster_args(std::path::Path::new("/pki"), &context, 1, rootless)
+            .expect("cluster args");
         let strip = |args: &[String]| -> Vec<String> {
             args.iter()
                 .take_while(|a| !a.starts_with("--node-mtls"))
@@ -353,8 +371,10 @@ mod tests {
 
     #[test]
     fn executors_behind_a_rootless_daemon_dial_the_scheduler_at_the_routable_address() {
-        let routable: std::net::IpAddr = "10.1.2.3".parse().expect("address");
-        let (scheduler, executor, port) = addresses(Some(routable));
+        let (scheduler, executor, port) = addresses(Some(RootlessAddresses {
+            routable: "10.1.2.3".parse().expect("address"),
+            gateway: "172.17.0.1".parse().expect("address"),
+        }));
         assert_eq!(
             scheduler,
             [
@@ -366,9 +386,8 @@ mod tests {
                 "0.0.0.0:41001"
             ]
         );
-        // Executors still listen on, and advertise, their namespace's loopback,
-        // where their peers reach them directly and the scheduler through a
-        // port forward.
+        // Each executor listens on the bridge gateway, where its relay passes
+        // on connections to the loopback port it advertises.
         assert_eq!(
             executor,
             [
@@ -379,7 +398,7 @@ mod tests {
                 "--node-advertise-address",
                 "127.0.0.1",
                 "--node-bind-address",
-                "127.0.0.1:41002"
+                "172.17.0.1:41002"
             ]
         );
         assert_eq!(port, 41002);
