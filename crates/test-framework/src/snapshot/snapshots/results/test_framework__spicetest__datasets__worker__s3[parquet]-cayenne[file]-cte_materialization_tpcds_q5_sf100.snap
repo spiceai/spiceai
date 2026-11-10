@@ -2,17 +2,17 @@
 source: crates/test-framework/src/spicetest/datasets/worker.rs
 description: "Query: tpcds_q5"
 ---
-+-----------------+------------------------------+-------------+-----------+-------------+
-| channel         | id                           | sales       | returns   | profit      |
-+-----------------+------------------------------+-------------+-----------+-------------+
-| catalog channel | catalog_pageAAAAAAAAAACCAAAA | 0.00        | 7878.74   | -3907.83    |
-| catalog channel | catalog_pageAAAAAAAAAADCAAAA | 0.00        | 16706.92  | -13651.79   |
-| catalog channel | catalog_pageAAAAAAAAAAICAAAA | 0.00        | 223442.85 | -166203.72  |
-| catalog channel | catalog_pageAAAAAAAAAAJCAAAA | 10274310.27 | 96155.84  | -1097071.46 |
-| catalog channel | catalog_pageAAAAAAAAAAKCAAAA | 0.00        | 24567.22  | -12232.25   |
-| catalog channel | catalog_pageAAAAAAAAAALCAAAA | 0.00        | 28492.09  | -11855.85   |
-| catalog channel | catalog_pageAAAAAAAAAAMCAAAA | 0.00        | 12999.48  | -2794.01    |
-| catalog channel | catalog_pageAAAAAAAAAANBAAAA | 0.00        | 48599.52  | -14509.15   |
-| catalog channel | catalog_pageAAAAAAAAAANCAAAA | 4452087.05  | 0.00      | -627973.65  |
-| catalog channel | catalog_pageAAAAAAAAABCCAAAA | 0.00        | 29272.01  | -17343.11   |
-+-----------------+------------------------------+-------------+-----------+-------------+
++-----------------+------------------------------+-------------+-----------+------------+
+| channel         | id                           | sales       | returns   | profit     |
++-----------------+------------------------------+-------------+-----------+------------+
+| catalog channel | catalog_pageAAAAAAAAAACCAAAA | 0.00        | 2757.14   | -4725.73   |
+| catalog channel | catalog_pageAAAAAAAAAADCAAAA | 0.00        | 21523.18  | -14122.30  |
+| catalog channel | catalog_pageAAAAAAAAAAICAAAA | 0.00        | 253449.63 | -155627.48 |
+| catalog channel | catalog_pageAAAAAAAAAAJCAAAA | 11063360.76 | 67945.91  | -817199.22 |
+| catalog channel | catalog_pageAAAAAAAAAAKCAAAA | 0.00        | 5267.53   | -3000.59   |
+| catalog channel | catalog_pageAAAAAAAAAALCAAAA | 0.00        | 19377.43  | -10958.76  |
+| catalog channel | catalog_pageAAAAAAAAAAMCAAAA | 0.00        | 10518.80  | -6613.29   |
+| catalog channel | catalog_pageAAAAAAAAAANBAAAA | 0.00        | 25916.72  | -21478.84  |
+| catalog channel | catalog_pageAAAAAAAAAANCAAAA | 4315509.53  | 0.00      | -440585.07 |
+| catalog channel | catalog_pageAAAAAAAAAAOBAAAA | 0.00        | 2006.22   | -2944.43   |
++-----------------+------------------------------+-------------+-----------+------------+
