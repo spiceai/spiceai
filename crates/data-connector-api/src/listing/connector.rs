@@ -304,6 +304,24 @@ impl ListingTableTemplate {
     }
 }
 
+/// Stacks the empty-listing guard over a single-object table that does not go
+/// through [`ListingTableTemplate::wrap`] (the S3 single-file version cache). A
+/// deleted object (`404 NoSuchKey`) lists nothing, so the scan fails rather than
+/// refreshing the acceleration to zero rows.
+fn reject_empty_single_object(
+    below: Arc<dyn TableProvider>,
+    table_path: ListingTableUrl,
+    dataset_name: String,
+    extension: String,
+) -> Arc<dyn TableProvider> {
+    FreshFileListingLayer::over_rejecting_empty(
+        below,
+        vec![table_path],
+        dataset_name,
+        move |meta: &ObjectMeta| listed_object_is_data_file(meta, &extension),
+    )
+}
+
 /// Stacks the empty-listing guard over `table`, or over `pruning` when the dataset
 /// has `_location` metadata. A scan the pruning table answers by `head()`ing the
 /// named objects skips the guard's listing, so it needs no list call (or list
@@ -1837,7 +1855,14 @@ pub trait ListingTableConnector: DataConnector {
                 Some(guard) => cached_table.with_schema_drift_guard(guard),
                 None => cached_table,
             };
-            return Ok(Arc::new(cached_table));
+            // This table skips `template.wrap`, so it needs the same guard: a deleted
+            // object must fail the refresh, not replace the acceleration with zero rows.
+            return Ok(reject_empty_single_object(
+                Arc::new(cached_table),
+                table_path,
+                dataset.name.to_string(),
+                template.extension.clone(),
+            ));
         }
 
         Ok(template.wrap(table_arc, table_path))
@@ -7206,6 +7231,110 @@ mod tests {
         ) -> object_store::Result<()> {
             unimplemented!()
         }
+    }
+
+    /// The S3 single-object table (`S3SingleFileCached`) does not go through `wrap`,
+    /// so it gets the guard from `reject_empty_single_object`: a deleted key
+    /// (`404 NoSuchKey`, which lists nothing) fails the scan instead of answering
+    /// zero rows, and the refresh-skip check still reaches the cached table beneath.
+    #[tokio::test]
+    async fn reject_empty_single_object_errors_on_a_deleted_s3_key() {
+        let store = Arc::new(object_store::memory::InMemory::new());
+        let ctx = SessionContext::new();
+        ctx.runtime_env().register_object_store(
+            &Url::parse("s3://bucket").expect("store url"),
+            Arc::clone(&store) as Arc<dyn ObjectStore>,
+        );
+        let key = Path::from("one/orders.parquet");
+        let parquet = |ids: &[i64]| {
+            let schema = Arc::new(Schema::new(vec![Field::new(
+                "id",
+                arrow_schema::DataType::Int64,
+                false,
+            )]));
+            let batch = RecordBatch::try_new(
+                Arc::clone(&schema),
+                vec![Arc::new(arrow::array::Int64Array::from(ids.to_vec()))],
+            )
+            .expect("batch");
+            let mut buffer = Vec::new();
+            let mut writer =
+                datafusion::parquet::arrow::ArrowWriter::try_new(&mut buffer, schema, None)
+                    .expect("parquet writer");
+            writer.write(&batch).expect("write batch");
+            writer.close().expect("close parquet writer");
+            object_store::PutPayload::from(buffer)
+        };
+        let id_rows = |ctx: SessionContext| async move {
+            let batches = ctx.sql("SELECT id FROM facts").await?.collect().await?;
+            DFResult::Ok(batches.iter().map(RecordBatch::num_rows).sum::<usize>())
+        };
+        store
+            .put(&key, parquet(&[1, 2, 3]))
+            .await
+            .expect("put object");
+
+        let table_path =
+            ListingTableUrl::parse("s3://bucket/one/orders.parquet").expect("listing table url");
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "id",
+            arrow_schema::DataType::Int64,
+            false,
+        )]));
+        let listing = Arc::new(
+            ListingTable::try_new(
+                ListingTableConfig::new(table_path.clone())
+                    .with_listing_options(
+                        ListingOptions::new(Arc::new(ParquetFormat::default()))
+                            .with_file_extension(".parquet"),
+                    )
+                    .with_schema(schema),
+            )
+            .expect("create listing table"),
+        );
+        let cached = data_components::s3_single_file_cached::S3SingleFileCached::try_new(
+            listing,
+            Arc::clone(&store) as Arc<dyn ObjectStore>,
+            "facts".to_string(),
+        )
+        .expect("a single object is cached");
+        let provider = reject_empty_single_object(
+            Arc::new(cached),
+            table_path,
+            "facts".to_string(),
+            ".parquet".to_string(),
+        );
+        assert!(
+            data_components::refresh_skip::should_skip_refresh_for_table_provider(
+                provider.as_ref()
+            )
+            .await
+            .expect("skip check")
+            .is_some(),
+            "the refresh-skip check must still reach the cached table under the guard"
+        );
+        ctx.register_table("facts", provider)
+            .expect("register table");
+        assert_eq!(id_rows(ctx.clone()).await.expect("initial scan"), 3);
+
+        store.delete(&key).await.expect("delete object");
+        let err = id_rows(ctx.clone())
+            .await
+            .expect_err("a deleted key is an error, not zero rows")
+            .to_string();
+        assert!(
+            err.contains("No data files are yet available for dataset facts"),
+            "{err}"
+        );
+
+        store
+            .put(&key, parquet(&[1, 2, 3, 4]))
+            .await
+            .expect("restore object");
+        assert_eq!(
+            id_rows(ctx.clone()).await.expect("a restored key is read"),
+            4
+        );
     }
 
     #[tokio::test]
