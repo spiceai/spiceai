@@ -132,6 +132,15 @@ impl Model {
         unsafe { sys::llama_model_n_layer_nextn(self.raw.as_ptr()) }
     }
 
+    /// The width of the hidden states [`Context::hidden_state`] returns: the model's
+    /// embedding width, unless a projection after its final norm changes it.
+    #[must_use]
+    pub fn n_embd_out(&self) -> usize {
+        // SAFETY: reads the loaded model's hyperparameters.
+        let n = unsafe { sys::llama_model_n_embd_out(self.raw.as_ptr()) };
+        usize::try_from(n).unwrap_or(0)
+    }
+
     /// Whether the model has an encoder, as an encoder-decoder model such as T5 does: its
     /// decoder reads the encoder's output, so it cannot decode a prompt on its own.
     #[must_use]
@@ -195,7 +204,7 @@ impl Model {
         let raw = NonNull::new(raw).with_context(|| CreateContextSnafu {
             reason: crate::log::last_error(),
         })?;
-        Ok(Context::from_raw(raw))
+        Ok(Context::from_raw(raw, params))
     }
 }
 
