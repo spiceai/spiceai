@@ -1625,3 +1625,174 @@ async fn an_inline_burst_read_while_its_record_is_buffered_is_visible_once_ackno
     );
     process.table.quiesce().await;
 }
+
+/// A keyed CDC burst small enough to be written inline, which replaces an
+/// inline key and inserts a new key, is held twice: first after its record is
+/// in the catalog's buffer and before the record's head write, then after the
+/// head write and before its publish. While held, a reader (with the inline
+/// view and scan views it holds, and with both rebuilt from the catalog) sees
+/// exactly the rows from before the burst. Once the burst is acknowledged, a
+/// reader sees each of its rows exactly once.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_reader_sees_no_row_of_an_inline_burst_whose_record_is_not_committed() {
+    const KEY: i64 = 700;
+    const NEW_KEY: i64 = 5_000;
+    let (location, process) = Location::seeded_with(&[KEY]).await;
+    process.table.quiesce().await;
+    drop(process);
+    let inline = VortexConfig {
+        inline_max_rows: 1_024,
+        inline_max_bytes: 1 << 20,
+        ..cdc_config()
+    };
+    let process = location.open_with(&inline).await;
+    let bottom = Arc::clone(&location.bottom) as Arc<dyn ObjectStore>;
+    let (rows_before, key_before, aggregates_before) = process.rebuilt_view(KEY).await;
+    assert_eq!(key_before, vec![(KEY, value(KEY, 0))], "the seeded inline key");
+    let head_before = head_commit(&bottom).await;
+
+    let (sink, options) = durable_sink(&process.table);
+    let (held, mut holding) = tokio::sync::oneshot::channel::<()>();
+    let (release, released) = tokio::sync::oneshot::channel::<()>();
+    let save = save_position(&process.catalog, 1);
+    // Polled once the burst's record is in the catalog's buffer: held there.
+    let position: PositionWrite = Box::pin(async move {
+        let _ = held.send(());
+        released
+            .await
+            .map_err(|error| Box::new(error) as Box<dyn std::error::Error + Send + Sync>)?;
+        save.await
+    });
+    let burst = tokio::spawn(async move {
+        let outcome = apply_burst(&sink, options, changes(&[KEY, NEW_KEY], 1), position).await;
+        drop(sink);
+        outcome
+    });
+    tokio::time::timeout(Duration::from_secs(60), &mut holding)
+        .await
+        .expect("the burst reaches its position write within 60 s")
+        .expect("the burst reaches its position write");
+
+    // Held before the head write: first what the reader already holds, then
+    // views rebuilt from the catalog.
+    let head_held = head_commit(&bottom).await;
+    let cached_held = (
+        process.rows().await,
+        process.key_rows(KEY).await,
+        process.key_rows(NEW_KEY).await,
+    );
+    let (rows_held, key_held, aggregates_held) = process.rebuilt_view(KEY).await;
+    let (_, new_key_held, _) = process.rebuilt_view(NEW_KEY).await;
+
+    // Held after the head write, before the publish.
+    let publications = process.table.hold_publications().await;
+    release.send(()).expect("release the burst");
+    let head_committed = wait_for_head_past(&bottom, head_before).await;
+    let (rows_committed, key_committed, aggregates_committed) = process.rebuilt_view(KEY).await;
+    let (_, new_key_committed, _) = process.rebuilt_view(NEW_KEY).await;
+    drop(publications);
+
+    burst
+        .await
+        .expect("the burst does not panic")
+        .expect("the burst commits");
+    let cached_after = (
+        process.rows().await,
+        process.key_rows(KEY).await,
+        process.key_rows(NEW_KEY).await,
+    );
+    let (rows_after, key_after, aggregates_after) = process.rebuilt_view(KEY).await;
+    let (_, new_key_after, _) = process.rebuilt_view(NEW_KEY).await;
+
+    eprintln!(
+        "inline burst: before: head {head_before}, key {KEY} {key_before:?}, (count, sum) {aggregates_before:?}, rows {}",
+        rows_before.len()
+    );
+    eprintln!(
+        "inline burst: held (head {head_held}): cached key {KEY} {:?}, key {NEW_KEY} {:?}, rows {}; rebuilt key {KEY} {key_held:?}, key {NEW_KEY} {new_key_held:?}, (count, sum) {aggregates_held:?}, rows {} (equal to before: {})",
+        cached_held.1,
+        cached_held.2,
+        cached_held.0.len(),
+        rows_held.len(),
+        rows_held == rows_before
+    );
+    eprintln!(
+        "inline burst: committed (head {head_committed}): rebuilt key {KEY} {key_committed:?}, key {NEW_KEY} {new_key_committed:?}, (count, sum) {aggregates_committed:?}, rows {} (equal to before: {})",
+        rows_committed.len(),
+        rows_committed == rows_before
+    );
+    eprintln!(
+        "inline burst: acknowledged: cached key {KEY} {:?}, key {NEW_KEY} {:?}, rows {}; rebuilt key {KEY} {key_after:?}, key {NEW_KEY} {new_key_after:?}, (count, sum) {aggregates_after:?}, rows {}",
+        cached_after.1,
+        cached_after.2,
+        cached_after.0.len(),
+        rows_after.len()
+    );
+
+    let mut expected_after: BTreeMap<i64, i64> = rows_before.iter().copied().collect();
+    expected_after.insert(KEY, value(KEY, 1));
+    expected_after.insert(NEW_KEY, value(NEW_KEY, 1));
+    let expected_after: Vec<(i64, i64)> = expected_after.into_iter().collect();
+    let sum_after: i64 = expected_after.iter().map(|(_, v)| v).sum();
+    assert_eq!(head_held, head_before, "the held record is not committed");
+    assert_eq!(
+        (
+            cached_held,
+            (
+                key_held,
+                new_key_held,
+                aggregates_held,
+                rows_held == rows_before
+            )
+        ),
+        (
+            (rows_before.clone(), key_before.clone(), Vec::new()),
+            (
+                key_before.clone(),
+                Vec::new(),
+                aggregates_before.clone(),
+                true
+            )
+        ),
+        "before its head write, a reader sees exactly the committed rows"
+    );
+    assert_eq!(
+        (
+            key_committed,
+            new_key_committed,
+            aggregates_committed,
+            rows_committed == rows_before
+        ),
+        (key_before, Vec::new(), aggregates_before, true),
+        "after its head write and before its publish, a reader sees the rows from before the burst"
+    );
+    assert_eq!(
+        (
+            cached_after,
+            (
+                key_after,
+                new_key_after,
+                aggregates_after,
+                rows_after == expected_after
+            )
+        ),
+        (
+            (
+                expected_after.clone(),
+                vec![(KEY, value(KEY, 1))],
+                vec![(NEW_KEY, value(NEW_KEY, 1))]
+            ),
+            (
+                vec![(KEY, value(KEY, 1))],
+                vec![(NEW_KEY, value(NEW_KEY, 1))],
+                vec![(
+                    i64::try_from(expected_after.len()).expect("count"),
+                    sum_after
+                )],
+                true
+            )
+        ),
+        "once acknowledged, a reader sees each of the burst's rows exactly once"
+    );
+    process.table.quiesce().await;
+}
