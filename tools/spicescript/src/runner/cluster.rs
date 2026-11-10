@@ -23,7 +23,27 @@ use std::time::Duration;
 use anyhow::{Context, Result};
 use serde_json::{Value, json};
 
-use super::{CLUSTER_ASSIGNMENT_INTERVAL, Instance};
+use super::{CLUSTER_ASSIGNMENT_INTERVAL, Instance, Options, executors_in_containers};
+use crate::script::Script;
+
+/// The address a script's executors and sources meet at when its executors
+/// run in containers behind a rootless Docker daemon, which then run on the
+/// bridge network (see [`crate::spiced::ContainerRun::bridge`]): this
+/// machine's routable one. `None` for every other script.
+pub(super) async fn bridge_address(
+    script: &Script,
+    options: &Options,
+) -> Result<Option<std::net::IpAddr>> {
+    if !cfg!(target_os = "linux")
+        || !executors_in_containers(script, options)
+        || !crate::docker::daemon_is_rootless().await
+    {
+        return Ok(None);
+    }
+    crate::docker::routable_address()
+        .map(Some)
+        .context("executors in containers behind a rootless Docker daemon")
+}
 
 /// Starts every executor of the instance that is not running, and waits for
 /// the scheduler to report all the running ones ready to take work.
@@ -86,10 +106,16 @@ pub(super) async fn start_executors(
 /// is down, would compare against the cache instead.
 /// `--cluster`: the scheduler and executor arguments, with node mTLS from the
 /// run's generated CA and certificates.
+///
+/// Every node advertises, and the scheduler binds, loopback, unless the
+/// executors run in bridge containers (`bridge`): then that address, the one
+/// they reach this machine and each other's published ports at, while each
+/// executor binds every interface inside its container.
 pub(super) fn cluster_args(
     pki: &std::path::Path,
     context: &Value,
     executors: usize,
+    bridge: Option<std::net::IpAddr>,
 ) -> Result<(Vec<String>, Vec<Vec<String>>)> {
     let file = |name: &str| pki.join(name).display().to_string();
     let scheduler_port = context["instance"]["port"].to_string();
@@ -103,22 +129,33 @@ pub(super) fn cluster_args(
             file(&format!("{node}.key")),
         ]
     };
+    let advertise = bridge
+        .unwrap_or(std::net::Ipv4Addr::LOCALHOST.into())
+        .to_string();
+    let executor_bind = if bridge.is_some() {
+        "0.0.0.0"
+    } else {
+        "127.0.0.1"
+    };
     let mut scheduler: Vec<String> = [
         "--role",
         "scheduler",
         "--node-advertise-address",
-        "127.0.0.1",
+        &advertise,
         "--node-bind-address",
     ]
     .iter()
     .map(ToString::to_string)
     .collect();
-    scheduler.push(format!("127.0.0.1:{scheduler_port}"));
+    scheduler.push(format!("{advertise}:{scheduler_port}"));
     scheduler.extend(mtls("scheduler"));
     let mut all = Vec::new();
     for n in 0..executors {
         let port = if n == 0 {
             context["instance"]["executor_port"].to_string()
+        } else if bridge.is_some() {
+            // Published on `bridge` as well as loopback, so free on both.
+            crate::docker::free_port_on(std::net::Ipv4Addr::UNSPECIFIED.into())?.to_string()
         } else {
             crate::docker::free_port()?.to_string()
         };
@@ -126,17 +163,40 @@ pub(super) fn cluster_args(
             .iter()
             .map(ToString::to_string)
             .collect();
-        executor.push(format!("https://127.0.0.1:{scheduler_port}"));
+        executor.push(format!("https://{advertise}:{scheduler_port}"));
         executor.extend([
             "--node-advertise-address".to_string(),
-            "127.0.0.1".to_string(),
+            advertise.clone(),
             "--node-bind-address".to_string(),
         ]);
-        executor.push(format!("127.0.0.1:{port}"));
+        executor.push(format!("{executor_bind}:{port}"));
         executor.extend(mtls("executor"));
         all.push(executor);
     }
     Ok((scheduler, all))
+}
+
+/// Executors in bridge containers (see [`crate::spiced::ContainerRun::bridge`])
+/// reach a source at this machine's routable address, not at loopback, which
+/// is their own: so every loopback address in the spicepod becomes `address`.
+/// The sources of such a run also publish their ports there.
+pub(super) fn spicepod_for_bridge(spicepod: &mut Value, address: std::net::IpAddr) {
+    match spicepod {
+        Value::String(text) if text.contains("127.0.0.1") => {
+            *text = text.replace("127.0.0.1", &address.to_string());
+        }
+        Value::Array(items) => {
+            for item in items {
+                spicepod_for_bridge(item, address);
+            }
+        }
+        Value::Object(map) => {
+            for value in map.values_mut() {
+                spicepod_for_bridge(value, address);
+            }
+        }
+        _ => {}
+    }
 }
 
 /// The engine an acceleration block runs, or `None` when it is disabled,
@@ -277,7 +337,80 @@ pub(super) fn make_cluster_ready(
 mod tests {
     use serde_json::json;
 
-    use super::{make_cluster_ready, undistributed_engine, unpartitionable_acceleration};
+    use super::{
+        cluster_args, make_cluster_ready, spicepod_for_bridge, undistributed_engine,
+        unpartitionable_acceleration,
+    };
+
+    /// The value after `flag` in `args`.
+    fn after<'a>(args: &'a [String], flag: &str) -> &'a str {
+        let i = args.iter().position(|a| a == flag).expect(flag);
+        &args[i + 1]
+    }
+
+    #[test]
+    fn nodes_meet_on_loopback_unless_the_executors_are_bridged() {
+        let context = json!({ "instance": { "port": 29170, "executor_port": 29160 } });
+        let pki = std::path::Path::new("pki");
+        let (scheduler, executors) =
+            cluster_args(pki, &context, 1, None).expect("cluster arguments");
+        assert_eq!(after(&scheduler, "--node-bind-address"), "127.0.0.1:29170");
+        assert_eq!(after(&scheduler, "--node-advertise-address"), "127.0.0.1");
+        let executor = &executors[0];
+        assert_eq!(
+            after(executor, "--scheduler-address"),
+            "https://127.0.0.1:29170"
+        );
+        assert_eq!(after(executor, "--node-advertise-address"), "127.0.0.1");
+        assert_eq!(after(executor, "--node-bind-address"), "127.0.0.1:29160");
+
+        let address = std::net::Ipv4Addr::new(10, 244, 0, 183).into();
+        let (scheduler, executors) =
+            cluster_args(pki, &context, 2, Some(address)).expect("cluster arguments");
+        assert_eq!(
+            after(&scheduler, "--node-bind-address"),
+            "10.244.0.183:29170"
+        );
+        assert_eq!(
+            after(&scheduler, "--node-advertise-address"),
+            "10.244.0.183"
+        );
+        assert_eq!(executors.len(), 2);
+        for executor in &executors {
+            assert_eq!(
+                after(executor, "--scheduler-address"),
+                "https://10.244.0.183:29170"
+            );
+            assert_eq!(after(executor, "--node-advertise-address"), "10.244.0.183");
+            assert!(after(executor, "--node-bind-address").starts_with("0.0.0.0:"));
+        }
+        assert_eq!(after(&executors[0], "--node-bind-address"), "0.0.0.0:29160");
+    }
+
+    #[test]
+    fn a_bridged_spicepod_names_sources_at_the_peer_address() {
+        let mut spicepod = json!({
+            "datasets": [{
+                "from": "s3://i0-default/orders/",
+                "params": { "s3_endpoint": "http://127.0.0.1:29150", "s3_region": "us-east-1" },
+                "acceleration": { "refresh_check_interval": 10 }
+            }]
+        });
+        spicepod_for_bridge(
+            &mut spicepod,
+            std::net::Ipv4Addr::new(10, 244, 0, 183).into(),
+        );
+        assert_eq!(
+            spicepod,
+            json!({
+                "datasets": [{
+                    "from": "s3://i0-default/orders/",
+                    "params": { "s3_endpoint": "http://10.244.0.183:29150", "s3_region": "us-east-1" },
+                    "acceleration": { "refresh_check_interval": 10 }
+                }]
+            })
+        );
+    }
 
     fn pod(acceleration: &serde_json::Value) -> serde_json::Value {
         json!({ "datasets": [{ "name": "t", "acceleration": acceleration }] })

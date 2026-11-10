@@ -149,10 +149,13 @@ impl Container {
                 .with_context(|| format!("Failed to create network {network}"))?;
         }
 
+        let also = also_publish_on();
         let mut ports = HashMap::new();
         for port in &spec.ports {
             let host = match host_ports.get(port) {
                 Some(host) => *host,
+                // Published on `also` too, so it must be free there as well.
+                None if also.is_some() => free_port_on(std::net::Ipv4Addr::UNSPECIFIED.into())?,
                 None => free_port()?,
             };
             ports.insert(*port, host);
@@ -162,10 +165,15 @@ impl Container {
             .map(|(container, host)| {
                 (
                     format!("{container}/tcp"),
-                    Some(vec![PortBinding {
-                        host_ip: Some("127.0.0.1".into()),
-                        host_port: Some(host.to_string()),
-                    }]),
+                    Some(
+                        binding_addresses(also)
+                            .into_iter()
+                            .map(|ip| PortBinding {
+                                host_ip: Some(ip),
+                                host_port: Some(host.to_string()),
+                            })
+                            .collect(),
+                    ),
                 )
             })
             .collect::<HashMap<_, _>>();
@@ -880,6 +888,35 @@ fn conflict_holder(message: &str) -> Option<String> {
 /// which the reaper reads to tell a live run's resources from a dead one's.
 pub const RUNNER_LABEL: &str = "spicescript.runner";
 
+tokio::task_local! {
+    /// An address the containers started within [`publishing_also_on`]
+    /// publish their ports on, besides loopback.
+    static ALSO_PUBLISH_ON: Option<std::net::IpAddr>;
+}
+
+/// Runs `work`, in which every container started publishes its ports on
+/// `address` as well as on loopback, where one is given: for peers that reach
+/// this machine at that address, such as cluster executors in bridge
+/// containers behind a rootless daemon (see [`crate::spiced::ContainerRun`]).
+pub async fn publishing_also_on<F: std::future::Future>(
+    address: Option<std::net::IpAddr>,
+    work: F,
+) -> F::Output {
+    ALSO_PUBLISH_ON.scope(address, work).await
+}
+
+fn also_publish_on() -> Option<std::net::IpAddr> {
+    ALSO_PUBLISH_ON.try_with(|address| *address).ok().flatten()
+}
+
+/// The host addresses a container's port is published on: loopback, and
+/// `also` when given.
+fn binding_addresses(also: Option<std::net::IpAddr>) -> Vec<String> {
+    std::iter::once("127.0.0.1".to_string())
+        .chain(also.map(|ip| ip.to_string()))
+        .collect()
+}
+
 fn runner_label() -> HashMap<&'static str, String> {
     HashMap::from([(RUNNER_LABEL, std::process::id().to_string())])
 }
@@ -1476,5 +1513,27 @@ mod pull_tests {
             "{got:?}"
         );
         assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
+}
+
+#[cfg(test)]
+mod also_publish_tests {
+    use super::{also_publish_on, binding_addresses, publishing_also_on};
+
+    #[tokio::test]
+    async fn publishes_on_the_extra_address_only_within_its_scope() {
+        let address: std::net::IpAddr = std::net::Ipv4Addr::new(10, 244, 0, 183).into();
+        assert_eq!(also_publish_on(), None);
+        assert_eq!(binding_addresses(also_publish_on()), ["127.0.0.1"]);
+        let inside = publishing_also_on(Some(address), async {
+            binding_addresses(also_publish_on())
+        })
+        .await;
+        assert_eq!(inside, ["127.0.0.1", "10.244.0.183"]);
+        assert_eq!(
+            publishing_also_on(None, async { also_publish_on() }).await,
+            None
+        );
+        assert_eq!(also_publish_on(), None);
     }
 }

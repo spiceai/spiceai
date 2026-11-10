@@ -86,8 +86,8 @@ use api::{http_step, refresh, source_query, spice_cli};
 use background::{start_background, stop_background};
 use checks::{assert_files, assert_log, assert_status, metric_value, wait_metric};
 use cluster::{
-    cluster_args, make_cluster_ready, start_executors, undistributed_engine,
-    unpartitionable_acceleration,
+    bridge_address, cluster_args, make_cluster_ready, spicepod_for_bridge, start_executors,
+    undistributed_engine, unpartitionable_acceleration,
 };
 use generators::{random_queries, run_slt, tlp};
 use query::{check_error_text, explain, run_query};
@@ -797,14 +797,19 @@ async fn run_combination(
         kinds: BTreeMap::new(),
     };
     let result = async {
+        // Bridged executors reach the sources at this address, not loopback.
+        let bridge = bridge_address(script, options).await?;
         for (name, spec, kind, version) in resolved {
-            let src = source::start(
-                name,
-                run_id,
-                &kind,
-                version.as_deref(),
-                &options.work_dir.join(run_id).join("sources"),
-                spec,
+            let src = crate::docker::publishing_also_on(
+                bridge,
+                source::start(
+                    name,
+                    run_id,
+                    &kind,
+                    version.as_deref(),
+                    &options.work_dir.join(run_id).join("sources"),
+                    spec,
+                ),
             )
             .await
             .with_context(|| format!("Failed to start source '{name}' ({kind})"))?;
@@ -1094,6 +1099,7 @@ async fn create_instances(
     let rootless_reach = cfg!(target_os = "linux")
         && script.sources.values().any(|s| s.host_network)
         && crate::docker::daemon_is_rootless().await;
+    let bridge = bridge_address(script, options).await?;
     let host_from_container = if rootless_reach {
         crate::docker::routable_address()?.to_string()
     } else {
@@ -1186,6 +1192,9 @@ async fn create_instances(
                     continue;
                 }
                 make_cluster_ready(&mut spicepod, &dir, &script.defaults.cluster_partition_by);
+                if let Some(address) = bridge {
+                    spicepod_for_bridge(&mut spicepod, address);
+                }
             }
             let context_for_steps = context.clone();
             let spicepod_yaml = yaml::to_string(&spicepod)?;
@@ -1244,6 +1253,7 @@ async fn create_instances(
                     &options.pki,
                     &context,
                     executor_count + spare_count,
+                    bridge,
                 )?)
             } else {
                 None
@@ -1291,6 +1301,7 @@ async fn create_instances(
                             "/etc/ssl/certs:/etc/ssl/certs:ro".to_string(),
                         ],
                         rootless: crate::docker::daemon_is_rootless().await,
+                        bridge,
                     });
                 }
                 executors.push(executor);
