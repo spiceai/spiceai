@@ -129,7 +129,7 @@ jobs:
     # 2026-09-29..10-13). The `test` legs follow it there through
     # `setup-matrix`. The standard pool on every other event.
     runs-on: ${{ github.event_name == 'merge_group' && 'spiceai-macos-large' || 'spiceai-macos' }}
-    environment: ci-build
+    environment: ci
     # Slowest observed success in the 2026-07-25..08-08 window: 17 min, but
     # every sample had a warm sccache. Sized against the other macOS workspace
     # builds (pr.yml peaks at 117 min) so a cold cache cannot turn a passing
