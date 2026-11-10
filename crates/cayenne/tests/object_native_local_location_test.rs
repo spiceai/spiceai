@@ -40,38 +40,62 @@ use datafusion_table_providers::util::{
     column_reference::ColumnReference, on_conflict::OnConflict,
 };
 use object_store::ObjectStore;
+use object_store::memory::InMemory;
 use object_store::path::Path;
 use object_store_occ::LocalConditionalPut;
 use object_store_occ::sim::Op;
 use object_store_occ::sim::fault::FaultStore;
 
-const NAME: &str = "orders";
-
-/// The location's store as the runtime builds it, under a `FaultStore` with no
-/// faults armed, whose log records every request the catalog and table make.
-fn location_store(state: &std::path::Path) -> Arc<FaultStore> {
-    std::fs::create_dir_all(state).expect("state directory");
-    let local = LocalConditionalPut::new_durable_keyed_by_absolute_path(state)
-        .expect("durable local store");
-    Arc::new(FaultStore::new(Arc::new(local)))
+/// A `runtime.state.location` and the store the runtime builds for it.
+enum Location {
+    /// A local directory: a durable `LocalConditionalPut` keyed by absolute paths.
+    Local(std::path::PathBuf),
+    /// An `s3://` bucket, in memory.
+    Bucket(Arc<InMemory>),
 }
 
-/// `state` as the store keys it: its absolute path without the leading `/`.
-fn state_key(state: &std::path::Path) -> String {
-    state.to_string_lossy().trim_matches('/').to_string()
-}
+impl Location {
+    /// The location's store, under a `FaultStore` with no faults armed, whose
+    /// log records every request the catalog and table make. Each call is a new
+    /// client over the same objects, as a restart builds.
+    fn store(&self) -> Arc<FaultStore> {
+        let inner: Arc<dyn ObjectStore> = match self {
+            Self::Local(state) => {
+                std::fs::create_dir_all(state).expect("state directory");
+                Arc::new(
+                    LocalConditionalPut::new_durable_keyed_by_absolute_path(state)
+                        .expect("durable local store"),
+                )
+            }
+            Self::Bucket(objects) => Arc::clone(objects) as Arc<dyn ObjectStore>,
+        };
+        Arc::new(FaultStore::new(inner))
+    }
 
-async fn open_catalog(store: &Arc<FaultStore>, state: &std::path::Path) -> ObjectNativeCatalog {
-    let key = state_key(state);
-    let catalog = ObjectNativeCatalog::open_or_create_at(
-        Arc::clone(store) as Arc<dyn ObjectStore>,
-        Path::from(format!("{key}/cayenne/v1/catalog")),
-        &format!("file:///{key}/cayenne/v1"),
-    )
-    .await
-    .expect("open the object-native catalog");
-    catalog.init().await.expect("init");
-    catalog
+    /// The location's key prefix in its store, and the URL the store's keys are
+    /// relative to.
+    fn prefix_and_root(&self) -> (String, &'static str) {
+        match self {
+            Self::Local(state) => (
+                state.to_string_lossy().trim_matches('/').to_string(),
+                "file://",
+            ),
+            Self::Bucket(_) => ("state".to_string(), "s3://bucket"),
+        }
+    }
+
+    async fn open_catalog(&self, store: &Arc<FaultStore>) -> ObjectNativeCatalog {
+        let (prefix, root) = self.prefix_and_root();
+        let catalog = ObjectNativeCatalog::open_or_create_at(
+            Arc::clone(store) as Arc<dyn ObjectStore>,
+            Path::from(format!("{prefix}/cayenne/v1/catalog")),
+            &format!("{root}/{prefix}/cayenne/v1"),
+        )
+        .await
+        .expect("open the object-native catalog");
+        catalog.init().await.expect("init");
+        catalog
+    }
 }
 
 fn schema() -> Arc<Schema> {
@@ -88,9 +112,9 @@ fn object_store_config(store: &Arc<FaultStore>, data_url: &str) -> ObjectStoreCo
     }
 }
 
-async fn rows(ctx: &SessionContext) -> BTreeMap<i64, i64> {
+async fn rows(ctx: &SessionContext, name: &str) -> BTreeMap<i64, i64> {
     let batches = ctx
-        .sql(&format!("SELECT id, v FROM {NAME}"))
+        .sql(&format!("SELECT id, v FROM {name}"))
         .await
         .expect("plan")
         .collect()
@@ -111,7 +135,7 @@ async fn rows(ctx: &SessionContext) -> BTreeMap<i64, i64> {
         for row in 0..batch.num_rows() {
             assert!(
                 rows.insert(ids.value(row), values.value(row)).is_none(),
-                "id {} scanned twice",
+                "{name}: id {} scanned twice",
                 ids.value(row)
             );
         }
@@ -135,7 +159,10 @@ fn vortex_files(directory: &std::path::Path) -> Vec<String> {
             let path = entry.expect("entry").path();
             if path.is_dir() {
                 walk(root, &path, found);
-            } else if path.extension().is_some_and(|extension| extension == "vortex") {
+            } else if path
+                .extension()
+                .is_some_and(|extension| extension == "vortex")
+            {
                 found.push(
                     path.strip_prefix(root)
                         .expect("under the root")
@@ -154,99 +181,134 @@ fn vortex_files(directory: &std::path::Path) -> Vec<String> {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_local_location_places_data_and_takes_the_object_store_path() {
     let directory = tempfile::tempdir().expect("temp dir");
-    let state = directory.path().join("state");
-    let store = location_store(&state);
-    let catalog = open_catalog(&store, &state).await;
-    let folder = new_dataset_folder(NAME);
-    let data_url = format!("file:///{}/{folder}/data", catalog.datasets_prefix());
-    let catalog: Arc<dyn MetadataCatalog> = Arc::new(catalog);
-    let ctx = SessionContext::new();
+    placed_writes_and_reopen(&Location::Local(directory.path().join("state"))).await;
+    // On disk the data files are in the datasets' folders in the location, and
+    // nowhere else in the directory.
+    let files = vortex_files(directory.path());
+    assert!(!files.is_empty(), "no data file on disk");
+    let outside: Vec<&String> = files
+        .iter()
+        .filter(|file| {
+            !((file.starts_with("state/cayenne/v1/datasets/events-")
+                || file.starts_with("state/cayenne/v1/datasets/orders-"))
+                && file.contains("/data/"))
+        })
+        .collect();
+    assert!(
+        outside.is_empty(),
+        "data files outside the dataset folders: {outside:?}"
+    );
+}
+
+/// The same scenario in an `s3://` location, the path a local one must match.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_bucket_location_places_data_and_takes_the_object_store_path() {
+    placed_writes_and_reopen(&Location::Bucket(Arc::new(InMemory::new()))).await;
+}
+
+/// A dataset placed in a location: its table and the URL of its data folder.
+struct Placed {
+    name: &'static str,
+    data_url: String,
+    table: Arc<CayenneTableProvider>,
+}
+
+/// Create `name` in `catalog`, placed in a new dataset folder of `location`,
+/// with `id` as its primary key (upserting) when `keyed`.
+async fn create_placed(
+    location: &Location,
+    store: &Arc<FaultStore>,
+    catalog: &Arc<dyn MetadataCatalog>,
+    datasets_prefix: &str,
+    ctx: &SessionContext,
+    name: &'static str,
+    keyed: bool,
+) -> Placed {
+    let (_, root) = location.prefix_and_root();
+    let data_url = format!("{root}/{datasets_prefix}/{}/data", new_dataset_folder(name));
     let table = Arc::new(
         crate::common::table_builder_on_store(
-            Arc::clone(&catalog),
+            Arc::clone(catalog),
             ctx.runtime_env(),
-            object_store_config(&store, &data_url),
+            object_store_config(store, &data_url),
         )
         .create(CreateTableOptions {
-            table_name: NAME.to_string(),
+            table_name: name.to_string(),
             schema: schema(),
-            primary_key: vec!["id".to_string()],
-            on_conflict: Some(OnConflict::Upsert(ColumnReference::new(vec![
-                "id".to_string(),
-            ]))),
+            primary_key: if keyed {
+                vec!["id".to_string()]
+            } else {
+                Vec::new()
+            },
+            on_conflict: keyed
+                .then(|| OnConflict::Upsert(ColumnReference::new(vec!["id".to_string()]))),
             base_path: data_url.clone(),
             partition_column: None,
-            // Every write becomes data files, not rows inlined into the metastore.
+            // Every write is data files, not rows inlined into the metastore,
+            // and each is a small file, three of which qualify for compaction.
             vortex_config: VortexConfig {
                 inline_max_rows: 0,
                 inline_max_bytes: 0,
+                target_vortex_file_size_mb: 1,
+                compaction_trigger_files: 3,
+                compaction_max_levels: 3,
+                compaction_max_files_per_pick: 3,
+                compaction_background_interval_ms: 0,
                 ..VortexConfig::default()
             },
         })
         .await
         .expect("create the table"),
     );
-    ctx.register_table(NAME, Arc::clone(&table) as Arc<dyn TableProvider>)
+    ctx.register_table(name, Arc::clone(&table) as Arc<dyn TableProvider>)
         .expect("register");
-
     // Placed: the table path the metastore records is the dataset folder's
     // `data` prefix in the location, the test the table makes for
     // `data_in_object_native_location`.
-    let recorded = catalog.get_table(NAME).await.expect("stored table").path;
-    assert_eq!(recorded, data_url, "the recorded table path is the placement");
+    let recorded = catalog.get_table(name).await.expect("stored table").path;
+    assert_eq!(
+        recorded, data_url,
+        "{name}: the recorded table path is the placement"
+    );
     assert!(
         cayenne::metastore_layout::is_object_native_data_path(&recorded),
-        "'{recorded}' is not a dataset folder's data prefix in the location"
+        "{name}: '{recorded}' is not a dataset folder's data prefix in the location"
     );
+    Placed {
+        name,
+        data_url,
+        table,
+    }
+}
 
-    // Appends, upserts and deletes, each checked against a model.
-    let mut expected = BTreeMap::new();
-    run(
-        &ctx,
-        &format!(
-            "INSERT INTO {NAME} SELECT value AS id, value * 10 AS v FROM generate_series(1, 1000)"
-        ),
-    )
-    .await;
-    expected.extend((1..=1000).map(|id| (id, id * 10)));
-    assert_eq!(rows(&ctx).await, expected, "after the first append");
-    run(
-        &ctx,
-        &format!(
-            "INSERT INTO {NAME} SELECT value AS id, value * 10 AS v FROM generate_series(1001, 2000)"
-        ),
-    )
-    .await;
-    expected.extend((1001..=2000).map(|id| (id, id * 10)));
-    assert_eq!(rows(&ctx).await, expected, "after the second append");
-    run(
-        &ctx,
-        &format!(
-            "INSERT INTO {NAME} SELECT value AS id, value * 100 AS v FROM generate_series(1500, 2500)"
-        ),
-    )
-    .await;
-    expected.extend((1500..=2500).map(|id| (id, id * 100)));
-    assert_eq!(rows(&ctx).await, expected, "after the upsert");
-    run(&ctx, &format!("DELETE FROM {NAME} WHERE id % 7 = 0")).await;
-    expected.retain(|id, _| id % 7 != 0);
-    assert_eq!(rows(&ctx).await, expected, "after the delete");
-
-    // A compaction of the snapshot's small files keeps the exact rows.
-    let compacted = table
-        .compact_current_snapshot_small_files()
+/// Run `sql` on `placed`, check the exact rows against `expected`, and check
+/// that the write took the object-store data path: it staged no file, wrote no
+/// staging WAL and renamed nothing into place, and listed nothing.
+async fn write(
+    store: &Arc<FaultStore>,
+    ctx: &SessionContext,
+    placed: &Placed,
+    step: &str,
+    sql: &str,
+    expected: &BTreeMap<i64, i64>,
+) {
+    let seen = store.log().len();
+    run(ctx, sql).await;
+    placed
+        .table
+        .drain_in_flight_maintenance()
         .await
-        .expect("compact");
-    assert!(compacted, "the compaction had small files to merge");
-    assert_eq!(rows(&ctx).await, expected, "after the compaction");
-
-    // The object-store data path: no request staged a file, wrote a staging
-    // WAL, or copied or renamed one.
-    let log = store.log();
-    let staged: Vec<String> = log
+        .expect("drain");
+    assert_eq!(
+        &rows(ctx, placed.name).await,
+        expected,
+        "{}: rows after {step}",
+        placed.name
+    );
+    let staged: Vec<String> = store.log()[seen..]
         .iter()
         .filter(|applied| {
-            matches!(applied.op, Op::Copy)
+            matches!(applied.op, Op::Rename | Op::List)
                 || applied.path.as_ref().contains("_staging")
                 || applied.path.as_ref().ends_with("_wal.json")
         })
@@ -254,54 +316,175 @@ async fn a_local_location_places_data_and_takes_the_object_store_path() {
         .collect();
     assert!(
         staged.is_empty(),
-        "writes at final keys stage, copy and rename nothing: {staged:?}"
+        "{}: {step} wrote at final keys, but staged, renamed or listed: {staged:?}",
+        placed.name
     );
-    let data_puts = log
-        .iter()
-        .filter(|applied| {
-            applied.path.as_ref().ends_with(".vortex")
-                && applied.path.as_ref().contains(&format!("/{folder}/data/"))
-        })
-        .count();
-    assert!(data_puts > 0, "the writes put data files in the dataset folder");
+}
 
-    // On disk the data files are in the dataset folder in the location, and
-    // nowhere else in the directory.
-    let files = vortex_files(directory.path());
-    assert!(!files.is_empty(), "no data file on disk");
-    let outside: Vec<&String> = files
-        .iter()
-        .filter(|file| !file.starts_with(&format!("state/cayenne/v1/datasets/{folder}/data/")))
-        .collect();
-    assert!(
-        outside.is_empty(),
-        "data files outside the dataset folder: {outside:?}"
-    );
-
-    // Reopen from the directory alone: a new store, catalog and table.
-    drop(ctx);
-    drop(table);
-    drop(catalog);
-    let store = location_store(&state);
-    let catalog: Arc<dyn MetadataCatalog> = Arc::new(open_catalog(&store, &state).await);
+/// Two datasets placed in `location`, one keyed, one not: placement, writes at
+/// final keys, and exact rows after appends, an upsert, deletes, a compaction
+/// and a reopen from the location alone.
+async fn placed_writes_and_reopen(location: &Location) {
+    let store = location.store();
+    let native = location.open_catalog(&store).await;
+    let datasets_prefix = native.datasets_prefix().to_string();
+    let catalog: Arc<dyn MetadataCatalog> = Arc::new(native);
     let ctx = SessionContext::new();
-    let table: Arc<CayenneTableProvider> = Arc::new(
-        crate::common::table_builder_on_store(
-            Arc::clone(&catalog),
-            ctx.runtime_env(),
-            object_store_config(&store, &data_url),
+    let events = create_placed(
+        location,
+        &store,
+        &catalog,
+        &datasets_prefix,
+        &ctx,
+        "events",
+        false,
+    )
+    .await;
+    let orders = create_placed(
+        location,
+        &store,
+        &catalog,
+        &datasets_prefix,
+        &ctx,
+        "orders",
+        true,
+    )
+    .await;
+
+    // Appends, then a compaction of the current snapshot's small files (after a
+    // write, or the pass below), which rewrites it under a new snapshot id, then
+    // a delete.
+    let current = || async {
+        catalog
+            .get_table("events")
+            .await
+            .expect("stored table")
+            .current_snapshot_id
+    };
+    let before_compaction = current().await;
+    let mut events_rows = BTreeMap::new();
+    for append in 0..5_i64 {
+        let (first, last) = (append * 1000 + 1, append * 1000 + 1000);
+        events_rows.extend((first..=last).map(|id| (id, id * 10)));
+        write(
+            &store,
+            &ctx,
+            &events,
+            &format!("append {append}"),
+            &format!("INSERT INTO events SELECT value AS id, value * 10 AS v FROM generate_series({first}, {last})"),
+            &events_rows,
         )
-        .open(NAME)
+        .await;
+    }
+    for _ in 0..40 {
+        if current().await != before_compaction
+            || events
+                .table
+                .compact_current_snapshot_small_files()
+                .await
+                .expect("compact")
+        {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+    events
+        .table
+        .drain_in_flight_maintenance()
         .await
-        .expect("reopen the table"),
+        .expect("drain");
+    assert_ne!(
+        current().await,
+        before_compaction,
+        "the small files were compacted into a new snapshot"
     );
-    table.wait_for_orphan_sweep().await;
-    ctx.register_table(NAME, Arc::clone(&table) as Arc<dyn TableProvider>)
-        .expect("register");
-    assert_eq!(rows(&ctx).await, expected, "after the reopen");
     assert_eq!(
-        catalog.get_table(NAME).await.expect("stored table").path,
-        data_url,
-        "the reopened table is still placed"
+        rows(&ctx, "events").await,
+        events_rows,
+        "events: rows after the compaction"
     );
+    events_rows.retain(|id, _| !(1001..=1500).contains(id));
+    write(
+        &store,
+        &ctx,
+        &events,
+        "delete",
+        "DELETE FROM events WHERE id >= 1001 AND id <= 1500",
+        &events_rows,
+    )
+    .await;
+
+    // A keyed dataset: appends, an upsert over part of them and new keys, a delete.
+    let mut orders_rows = BTreeMap::new();
+    for append in 0..2_i64 {
+        let (first, last) = (append * 1000 + 1, append * 1000 + 1000);
+        orders_rows.extend((first..=last).map(|id| (id, id * 10)));
+        write(
+            &store,
+            &ctx,
+            &orders,
+            &format!("append {append}"),
+            &format!("INSERT INTO orders SELECT value AS id, value * 10 AS v FROM generate_series({first}, {last})"),
+            &orders_rows,
+        )
+        .await;
+    }
+    orders_rows.extend((1500..=2500).map(|id| (id, id * 100)));
+    write(
+        &store,
+        &ctx,
+        &orders,
+        "upsert",
+        "INSERT INTO orders SELECT value AS id, value * 100 AS v FROM generate_series(1500, 2500)",
+        &orders_rows,
+    )
+    .await;
+    orders_rows.retain(|id, _| id % 7 != 0);
+    write(
+        &store,
+        &ctx,
+        &orders,
+        "delete",
+        "DELETE FROM orders WHERE id % 7 = 0",
+        &orders_rows,
+    )
+    .await;
+
+    // Reopen from the location alone: a new client, catalog and tables.
+    let urls = [
+        (events.name, events.data_url.clone(), events_rows),
+        (orders.name, orders.data_url.clone(), orders_rows),
+    ];
+    drop(events);
+    drop(orders);
+    drop(ctx);
+    drop(catalog);
+    let store = location.store();
+    let catalog: Arc<dyn MetadataCatalog> = Arc::new(location.open_catalog(&store).await);
+    let ctx = SessionContext::new();
+    for (name, data_url, expected) in urls {
+        let table = Arc::new(
+            crate::common::table_builder_on_store(
+                Arc::clone(&catalog),
+                ctx.runtime_env(),
+                object_store_config(&store, &data_url),
+            )
+            .open(name)
+            .await
+            .expect("reopen the table"),
+        );
+        table.wait_for_orphan_sweep().await;
+        ctx.register_table(name, Arc::clone(&table) as Arc<dyn TableProvider>)
+            .expect("register");
+        assert_eq!(
+            rows(&ctx, name).await,
+            expected,
+            "{name}: rows after the reopen"
+        );
+        assert_eq!(
+            catalog.get_table(name).await.expect("stored table").path,
+            data_url,
+            "{name}: the reopened table is still placed"
+        );
+    }
 }
