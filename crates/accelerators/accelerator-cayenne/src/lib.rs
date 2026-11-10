@@ -7281,8 +7281,10 @@ mod tests {
     /// With `runtime.params.cayenne_vnext` on and a local-directory
     /// `runtime.state.location`, a new file-mode dataset is placed in its dataset
     /// folder there, as in an `s3://` location: its data files are under
-    /// `<location>/cayenne/v1/datasets/<name>-<id>/data`, and a new accelerator
-    /// over the location serves the same rows.
+    /// `<location>/cayenne/v1/datasets/<name>-<id>/data`. Reopening from the
+    /// location alone is `object_native_local_location_test` in `cayenne`: here
+    /// the first instance's background work outlives its handles, and a second
+    /// instance in the same process would be a second live writer.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_local_state_location_places_a_new_dataset_in_its_folder() {
         use data_accelerator_api::AcceleratorEngineRegistry;
@@ -7303,7 +7305,7 @@ mod tests {
             params: None,
         });
         let app = Arc::new(app);
-        let open = |ctx: SessionContext| {
+        let open = |ctx: SessionContext, label: &'static str| {
             let app = Arc::clone(&app);
             let directory = directory.path().to_path_buf();
             async move {
@@ -7346,9 +7348,10 @@ mod tests {
                         Arc::new(ctx.clone()),
                     )
                     .await
-                    .expect("create the acceleration");
-                ctx.register_table("orders", table).expect("register");
-                ctx
+                    .unwrap_or_else(|error| panic!("{label}: create the acceleration: {error}"));
+                ctx.register_table("orders", Arc::clone(&table))
+                    .expect("register");
+                (ctx, table)
             }
         };
         // Every row, as (id, v) pairs in id order.
@@ -7379,7 +7382,7 @@ mod tests {
             rows
         };
 
-        let ctx = open(SessionContext::new()).await;
+        let (ctx, _table) = open(SessionContext::new(), "first open").await;
         for first in [1, 1001] {
             ctx.sql(&format!(
                 "INSERT INTO orders SELECT value AS id, value * 10 AS v FROM generate_series({first}, {})",
@@ -7425,10 +7428,6 @@ mod tests {
             outside.is_empty(),
             "data files outside the dataset folder in the location: {outside:?}"
         );
-
-        drop(ctx);
-        let reopened = open(SessionContext::new()).await;
-        assert_eq!(count_and_sum(reopened).await, expected, "after reopening");
     }
 
     /// With `runtime.params.cayenne_vnext` off, an object-store data path fails to
