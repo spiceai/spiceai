@@ -1796,3 +1796,232 @@ async fn a_reader_sees_no_row_of_an_inline_burst_whose_record_is_not_committed()
     );
     process.table.quiesce().await;
 }
+
+/// The source changes that apply `ops` (`(op, id)`, with `op` one of `c` and
+/// `d`) in order, with values after `round`.
+fn mixed_changes(ops: &[(&str, i64)], round: i64) -> ChangeBatch {
+    let count = ops.len();
+    let ids: Vec<i64> = ops.iter().map(|(_, id)| *id).collect();
+    let offsets: Vec<i32> = (0..=i32::try_from(count).expect("count")).collect();
+    let keys = ListArray::try_new(
+        Arc::new(Field::new("item", DataType::Utf8, false)),
+        OffsetBuffer::new(offsets.into()),
+        Arc::new(StringArray::from(vec!["id"; count])),
+        None,
+    )
+    .expect("keys");
+    let record = RecordBatch::try_new(
+        Arc::new(data_components::cdc::changes_schema(&schema())),
+        vec![
+            Arc::new(StringArray::from(
+                ops.iter().map(|(op, _)| *op).collect::<Vec<_>>(),
+            )),
+            Arc::new(keys),
+            Arc::new(StructArray::from(rows_batch(&ids, round))),
+        ],
+    )
+    .expect("source changes");
+    ChangeBatch::cdc(CdcBatch::try_new(record).expect("CDC batch"))
+}
+
+/// A keyed CDC burst that deletes a file key and an inline key, held after its
+/// record is in the catalog's buffer and before the record's head write: a
+/// reader (with what it holds, and with views rebuilt from the catalog) still
+/// sees both rows. Once acknowledged, neither row is visible.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_reader_sees_no_delete_of_a_burst_whose_record_is_not_committed() {
+    const INLINE_KEY: i64 = 700;
+    const FILE_KEY: i64 = 7;
+    let (location, process) = Location::seeded_with(&[INLINE_KEY]).await;
+    let bottom = Arc::clone(&location.bottom) as Arc<dyn ObjectStore>;
+    let (rows_before, inline_before, aggregates_before) = process.rebuilt_view(INLINE_KEY).await;
+    let head_before = head_commit(&bottom).await;
+
+    let (sink, options) = durable_sink(&process.table);
+    let (held, mut holding) = tokio::sync::oneshot::channel::<()>();
+    let (release, released) = tokio::sync::oneshot::channel::<()>();
+    let save = save_position(&process.catalog, 1);
+    let position: PositionWrite = Box::pin(async move {
+        let _ = held.send(());
+        released
+            .await
+            .map_err(|error| Box::new(error) as Box<dyn std::error::Error + Send + Sync>)?;
+        save.await
+    });
+    let burst = tokio::spawn(async move {
+        let outcome = apply_burst(
+            &sink,
+            options,
+            mixed_changes(&[("d", FILE_KEY), ("d", INLINE_KEY)], 1),
+            position,
+        )
+        .await;
+        drop(sink);
+        outcome
+    });
+    tokio::time::timeout(Duration::from_secs(60), &mut holding)
+        .await
+        .expect("the burst reaches its position write within 60 s")
+        .expect("the burst reaches its position write");
+    let head_held = head_commit(&bottom).await;
+    let cached_held = (
+        process.rows().await,
+        process.key_rows(FILE_KEY).await,
+        process.key_rows(INLINE_KEY).await,
+    );
+    let (rows_held, inline_held, aggregates_held) = process.rebuilt_view(INLINE_KEY).await;
+    let (_, file_held, _) = process.rebuilt_view(FILE_KEY).await;
+    release.send(()).expect("release the burst");
+    burst
+        .await
+        .expect("the burst does not panic")
+        .expect("the burst commits");
+    let (rows_after, inline_after, _) = process.rebuilt_view(INLINE_KEY).await;
+    let (_, file_after, _) = process.rebuilt_view(FILE_KEY).await;
+    eprintln!(
+        "delete burst: before: head {head_before}, rows {}, (count, sum) {aggregates_before:?}; held (head {head_held}): cached rows {}, key {FILE_KEY} {:?}, key {INLINE_KEY} {:?}; rebuilt rows {}, key {FILE_KEY} {file_held:?}, key {INLINE_KEY} {inline_held:?}, (count, sum) {aggregates_held:?}; acknowledged: rows {}, key {FILE_KEY} {file_after:?}, key {INLINE_KEY} {inline_after:?}",
+        rows_before.len(),
+        cached_held.0.len(),
+        cached_held.1,
+        cached_held.2,
+        rows_held.len(),
+        rows_after.len()
+    );
+    let expected_after: Vec<(i64, i64)> = rows_before
+        .iter()
+        .copied()
+        .filter(|(id, _)| *id != FILE_KEY && *id != INLINE_KEY)
+        .collect();
+    assert_eq!(head_held, head_before, "the held record is not committed");
+    assert_eq!(
+        (
+            cached_held,
+            (rows_held == rows_before, file_held, inline_held.clone())
+        ),
+        (
+            (
+                rows_before.clone(),
+                vec![(FILE_KEY, value(FILE_KEY, 0))],
+                inline_before.clone()
+            ),
+            (true, vec![(FILE_KEY, value(FILE_KEY, 0))], inline_before)
+        ),
+        "before its head write, a reader sees the rows the burst deletes"
+    );
+    assert_eq!(
+        (rows_after == expected_after, file_after, inline_after),
+        (true, Vec::new(), Vec::new()),
+        "once acknowledged, the deleted rows are gone"
+    );
+    process.table.quiesce().await;
+}
+
+/// The same inline CDC burst on a dataset whose metastore is the embedded
+/// `SQLite` catalog: the burst's catalog change is committed to the catalog
+/// file before its publish makes its rows visible. With every publish held, a
+/// second connection to that file already reads the burst's inline rows while
+/// a reader does not see them; once the publish runs, the reader does.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_inline_burst_on_the_sqlite_catalog_is_committed_before_it_is_visible() {
+    const KEY: i64 = 700;
+    const NEW_KEY: i64 = 5_000;
+    let dir = tempfile::tempdir().expect("table directory");
+    let catalog_url = format!("sqlite://{}", dir.path().join("catalog.db").display());
+    let catalog: Arc<dyn MetadataCatalog> =
+        Arc::new(cayenne::CayenneCatalog::new(catalog_url.clone()).expect("catalog"));
+    catalog.init().await.expect("init");
+    let config = VortexConfig {
+        inline_max_rows: 1_024,
+        inline_max_bytes: 1 << 20,
+        ..cdc_config()
+    };
+    let ctx = SessionContext::new();
+    let table = Arc::new(
+        CayenneTableProviderBuilder::new(Arc::clone(&catalog), ctx.runtime_env())
+            .with_context(CayenneContext::new(&config, ctx.runtime_env(), NAME))
+            .create(CreateTableOptions {
+                table_name: NAME.to_string(),
+                schema: schema(),
+                primary_key: vec!["id".to_string()],
+                on_conflict: Some(OnConflict::Upsert(ColumnReference::new(vec![
+                    "id".to_string(),
+                ]))),
+                base_path: dir.path().join("data").to_string_lossy().into_owned(),
+                partition_column: None,
+                vortex_config: config.clone(),
+            })
+            .await
+            .expect("create the table"),
+    );
+    ctx.register_table(NAME, Arc::clone(&table) as Arc<dyn TableProvider>)
+        .expect("register");
+    insert(&table, &ctx, rows_batch(&[KEY], 0)).await;
+    let table_id = table.table_id().to_string();
+    let inline_rows = |catalog: Arc<dyn MetadataCatalog>| {
+        let table_id = table_id.clone();
+        async move {
+            catalog
+                .get_inlined_data(&table_id)
+                .await
+                .expect("read the inline rows")
+                .iter()
+                .map(|entry| entry.record_count)
+                .sum::<i64>()
+        }
+    };
+    let count = |ctx: SessionContext| async move {
+        ctx.sql(&format!("SELECT id, v FROM {NAME} ORDER BY id"))
+            .await
+            .expect("plan")
+            .collect()
+            .await
+            .expect("scan")
+            .iter()
+            .map(RecordBatch::num_rows)
+            .sum::<usize>()
+    };
+    let rows_before = count(ctx.clone()).await;
+    let committed_before = inline_rows(Arc::clone(&catalog)).await;
+
+    let (sink, options) = durable_sink(&table);
+    let publications = table.hold_publications().await;
+    let no_position: PositionWrite = Box::pin(async { Ok(()) });
+    let burst = tokio::spawn(async move {
+        let outcome =
+            apply_burst(&sink, options, changes(&[KEY, NEW_KEY], 1), no_position).await;
+        drop(sink);
+        outcome
+    });
+    // Poll a second connection until the burst's rows are in the catalog file.
+    let second: Arc<dyn MetadataCatalog> =
+        Arc::new(cayenne::CayenneCatalog::new(catalog_url).expect("second connection"));
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
+    let committed_held = loop {
+        let committed = inline_rows(Arc::clone(&second)).await;
+        if committed != committed_before {
+            break committed;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the burst's rows are not in the catalog file within 60 s"
+        );
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    };
+    let rows_held = count(ctx.clone()).await;
+    let published_early = burst.is_finished();
+    drop(publications);
+    burst
+        .await
+        .expect("the burst does not panic")
+        .expect("the burst commits");
+    let rows_after = count(ctx.clone()).await;
+    eprintln!(
+        "sqlite inline burst: before: rows {rows_before}, inline rows in the catalog file {committed_before}; publish held: inline rows in the catalog file {committed_held}, rows a reader sees {rows_held}, burst finished {published_early}; published: rows {rows_after}"
+    );
+    assert_eq!(
+        (committed_held, rows_held, published_early, rows_after),
+        (2, rows_before, false, rows_before + 1),
+        "the burst's rows are in the catalog file before a reader sees them"
+    );
+    table.quiesce().await;
+}
