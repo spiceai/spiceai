@@ -7318,10 +7318,10 @@ mod tests {
         assert_eq!(id_rows(ctx.clone()).await.expect("initial scan"), 3);
 
         store.delete(&key).await.expect("delete object");
-        let err = id_rows(ctx.clone())
+        let err: DataFusionError = id_rows(ctx.clone())
             .await
-            .expect_err("a deleted key is an error, not zero rows")
-            .to_string();
+            .expect_err("a deleted key is an error, not zero rows");
+        let err = err.to_string();
         assert!(
             err.contains("No data files are yet available for dataset facts"),
             "{err}"
