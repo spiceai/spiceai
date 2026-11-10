@@ -495,6 +495,10 @@ struct Instance {
     spicepod_yaml: String,
     /// The rendered spicepod, which `patch:` on a start changes.
     spicepod: Value,
+    /// Where its bridged executors reach this machine (see
+    /// [`crate::spiced::ContainerRun::bridge`]); every rendering of the
+    /// spicepod names sources there.
+    bridge: Option<std::net::IpAddr>,
     /// The namespace this instance owns in each source.
     namespaces: BTreeMap<String, String>,
     /// Set when a lifecycle step failed; later steps are skipped.
@@ -1349,6 +1353,7 @@ async fn create_instances(
                 executors,
                 spicepod_yaml,
                 spicepod,
+                bridge,
                 namespaces,
                 broken: None,
                 answers: BTreeMap::new(),
@@ -1837,6 +1842,10 @@ fn apply_patch(instance: &mut Instance, patch: Option<&VariantSpec>) -> Result<(
         when: Map::new(),
     };
     template::apply_variant(&mut instance.spicepod, &resolved)?;
+    // A patch renders source parameters from the context, at loopback again.
+    if let Some(address) = instance.bridge {
+        spicepod_for_bridge(&mut instance.spicepod, address);
+    }
     instance.spicepod_yaml = yaml::to_string(&instance.spicepod)?;
     Ok(())
 }
