@@ -180,6 +180,12 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
+      # Several steps below call apt-get directly (GH CLI, postgresql-client,
+      # git, unzip); without this they fetch from one archive and one security
+      # host with no fallback.
+      - name: Configure apt mirrors
+        uses: ./.github/actions/configure-apt
+
       - name: Set up Rust toolchain
         uses: ./.github/actions/setup-rust
 
@@ -819,8 +825,8 @@ jobs:
             # branch, so the push can lose in two ways that say nothing about
             # the benchmark:
             # - another run pushed first ("fetch first", or any rejection after
-            #   which the branch tip has moved): rebase onto the new tip and
-            #   push again;
+            #   which the branch tip has moved): move this run's snapshot
+            #   commit onto the new tip and push again;
             # - the branch's PR is already in the merge queue (GH006: queued
             #   branches cannot be updated): carry on in the next branch,
             #   <base>-2, <base>-3, ..., which gets its own PR.
@@ -832,7 +838,16 @@ jobs:
               git checkout -B "${BRANCH_NAME}" "${SNAPSHOT_COMMIT}"
               tip_before="$(remote_tip "${BRANCH_NAME}")"
               if [ -n "${tip_before}" ]; then
-                git pull --rebase origin "${BRANCH_NAME}"
+                # Move only the snapshot commit. Runs for one spiced commit can
+                # check out different trunk heads, and `git pull --rebase` would
+                # also replay every trunk commit between them onto the branch
+                # as new commits, putting unrelated source changes in the PR.
+                git fetch origin "refs/heads/${BRANCH_NAME}"
+                if ! git rebase --onto FETCH_HEAD "${SNAPSHOT_COMMIT}^"; then
+                  git rebase --abort || true
+                  echo "::error::This run's snapshots conflict with snapshots another run already pushed to ${BRANCH_NAME}; resolve the .snap conflict on that branch by hand."
+                  exit 1
+                fi
               fi
               # Non-interactive: a credential helper on the runner can otherwise intercept
               # this push and block on a prompt forever. See
