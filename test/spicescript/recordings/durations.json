@@ -165,7 +165,7 @@
   "tls": 3,
   "tpch-coverage": 89,
   "tpch-oracles": 26,
-  "unparse-aggregate-scopes": 4,
+  "unparse-aggregate-scopes": 11,
   "unparse-nullable-having": 12,
   "unparse-projected-exists": 4,
   "unparse-pruned-aggregate": 15,
