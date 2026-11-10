@@ -34,7 +34,7 @@ use crate::{qwen3_gguf, request};
 
 /// Prompts whose replies a small model gives with wide margins at every token, so serving them
 /// in a batch of another shape cannot flip a near tie: a difference is the scheduler's.
-const PROMPTS: [&str; 4] = [
+pub(crate) const PROMPTS: [&str; 4] = [
     "Count from 1 to 40, separated by commas. Reply with only the numbers.",
     "List the letters of the English alphabet in order, separated by spaces. Reply with only the letters.",
     "List the days of the week starting from Monday, one per line. Reply with only the days.",
@@ -64,7 +64,7 @@ async fn load(gguf: &Path, name: &'static str, concurrent: u32, context: usize) 
     .expect("the model loads")
 }
 
-fn body(name: &str, prompt: &str, max_tokens: u32) -> Value {
+pub(crate) fn body(name: &str, prompt: &str, max_tokens: u32) -> Value {
     json!({
         "model": name,
         "messages": [{ "role": "user", "content": prompt }],
@@ -74,22 +74,22 @@ fn body(name: &str, prompt: &str, max_tokens: u32) -> Value {
     })
 }
 
-async fn reply(model: &Arc<dyn Chat>, body: Value) -> String {
+pub(crate) async fn reply(model: &Arc<dyn Chat>, body: Value) -> String {
     let reply = model.chat_request(request(body)).await.expect("a reply");
     reply.choices[0].message.content.clone().expect("content")
 }
 
 /// How long a request beside another may take to stream: a request that cannot be served
 /// until the other's client reads would never finish.
-const SERVED_WITHIN: Duration = Duration::from_secs(60);
+pub(crate) const SERVED_WITHIN: Duration = Duration::from_secs(60);
 
 /// A streamed reply's content, and how many chunks carried it.
-struct Streamed {
-    text: String,
-    chunks: usize,
+pub(crate) struct Streamed {
+    pub(crate) text: String,
+    pub(crate) chunks: usize,
 }
 
-async fn streamed(model: &Arc<dyn Chat>, body: Value) -> Streamed {
+pub(crate) async fn streamed(model: &Arc<dyn Chat>, body: Value) -> Streamed {
     let mut stream = model.chat_stream(request(body)).await.expect("a stream");
     let mut reply = Streamed {
         text: String::new(),
@@ -107,7 +107,7 @@ async fn streamed(model: &Arc<dyn Chat>, body: Value) -> Streamed {
 }
 
 /// Reads `stream` up to its first chunk of content, and returns the content read.
-async fn first_content(stream: &mut ChatCompletionResponseStream) -> String {
+pub(crate) async fn first_content(stream: &mut ChatCompletionResponseStream) -> String {
     let mut text = String::new();
     while text.is_empty() {
         let chunk = stream
@@ -143,7 +143,7 @@ async fn content_chunks(stream: &mut ChatCompletionResponseStream, chunks: usize
 }
 
 /// The content left in `stream`.
-async fn rest(mut stream: ChatCompletionResponseStream) -> String {
+pub(crate) async fn rest(mut stream: ChatCompletionResponseStream) -> String {
     let mut text = String::new();
     while let Some(chunk) = stream.next().await {
         for choice in chunk.expect("a chunk").choices {
