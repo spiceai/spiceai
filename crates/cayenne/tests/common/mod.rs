@@ -193,9 +193,8 @@ impl ObjectNativeLocation {
     /// paths (`runtime_state_location::build_object_store`).
     fn local(directory: &std::path::Path) -> Result<Self, Box<dyn std::error::Error>> {
         std::fs::create_dir_all(directory)?;
-        let store = object_store_occ::LocalConditionalPut::new_durable_keyed_by_absolute_path(
-            directory,
-        )?;
+        let store =
+            object_store_occ::LocalConditionalPut::new_durable_keyed_by_absolute_path(directory)?;
         let state_prefix = directory.to_string_lossy().trim_matches('/').to_string();
         Ok(Self {
             store: Arc::new(store),
@@ -223,11 +222,7 @@ impl ObjectNativeLocation {
         &self,
         catalog: &ObjectNativeCatalog,
     ) -> Result<FixtureDataStore, url::ParseError> {
-        let url = url::Url::parse(&format!(
-            "{}/{}",
-            self.root_url,
-            catalog.datasets_prefix()
-        ))?;
+        let url = url::Url::parse(&format!("{}/{}", self.root_url, catalog.datasets_prefix()))?;
         Ok(FixtureDataStore {
             root: url.as_str().trim_end_matches('/').to_string(),
             config: Some(ObjectStoreConfig {

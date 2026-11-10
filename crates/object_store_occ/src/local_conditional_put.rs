@@ -277,12 +277,7 @@ fn publication_lock_path(root: &std::path::Path, location: &Path) -> PathBuf {
 /// Runs on its own thread with blocking filesystem calls. The lock and
 /// publication have one owner, even when the caller drops its future or shuts
 /// its runtime down. Closing the queue drains accepted writes and exits.
-fn write_worker(
-    root: &std::path::Path,
-    base: &std::path::Path,
-    durable: bool,
-    queue: &WriteQueue,
-) {
+fn write_worker(root: &std::path::Path, base: &std::path::Path, durable: bool, queue: &WriteQueue) {
     while let Some((directory, request)) = queue.take() {
         let result = publish(
             root,

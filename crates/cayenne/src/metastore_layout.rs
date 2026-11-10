@@ -457,6 +457,8 @@ mod object_native_data_path_tests {
         assert!(is_object_native_data_path(
             "file:///var/spice/state/cayenne/v1/datasets/orders-x/data"
         ));
-        assert!(!is_object_native_data_path("file:///var/spice/data/orders/"));
+        assert!(!is_object_native_data_path(
+            "file:///var/spice/data/orders/"
+        ));
     }
 }
