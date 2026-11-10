@@ -33776,6 +33776,31 @@ impl CayenneTableProvider {
         }));
     }
 
+    /// Discard the materialized inline view and the scan views built on it, so
+    /// the next scan rebuilds both from the metastore — as a freshly opened
+    /// provider does, or one whose scan views a concurrent write invalidated.
+    /// Exposed for tests of what a reader sees while a commit is in flight.
+    #[doc(hidden)]
+    pub fn rebuild_scan_inputs_on_next_read(&self) {
+        self.inlined_cache.store(Arc::new(InlinedCache {
+            generation: u64::MAX,
+            structural_epoch: u64::MAX,
+            materialized_through_sequence: i64::MIN,
+            tombstone_delta_seq: 0,
+            batches: Arc::new(Vec::new()),
+            view: Arc::new(Vec::new()),
+        }));
+        self.notify_scan_input_change();
+    }
+
+    /// Hold every write's publish (the step that makes its committed rows
+    /// visible) until the returned guard drops. Exposed for tests of what a
+    /// reader sees between a commit and its publish.
+    #[doc(hidden)]
+    pub async fn hold_publications(&self) -> tokio::sync::OwnedMutexGuard<()> {
+        self.visibility_lock_arc().lock_owned().await
+    }
+
     /// Get the current snapshot ID.
     ///
     /// This returns the live snapshot ID which may differ from `table_metadata.current_snapshot_id`

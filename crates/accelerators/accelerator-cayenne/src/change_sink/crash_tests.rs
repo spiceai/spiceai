@@ -408,7 +408,11 @@ fn burst_keys(round: i64) -> Vec<i64> {
 
 /// The source changes of burst `round`: an insert of each of its keys.
 fn burst(round: i64) -> ChangeBatch {
-    let ids = burst_keys(round);
+    changes(&burst_keys(round), round)
+}
+
+/// The source changes that insert `ids` with their values after `round`.
+fn changes(ids: &[i64], round: i64) -> ChangeBatch {
     let count = ids.len();
     let offsets: Vec<i32> = (0..=i32::try_from(count).expect("count")).collect();
     let keys = ListArray::try_new(
@@ -423,7 +427,7 @@ fn burst(round: i64) -> ChangeBatch {
         vec![
             Arc::new(StringArray::from(vec!["c"; count])),
             Arc::new(keys),
-            Arc::new(StructArray::from(rows_batch(&ids, round))),
+            Arc::new(StructArray::from(rows_batch(ids, round))),
         ],
     )
     .expect("source changes");
@@ -488,6 +492,11 @@ impl Location {
     /// The seeded table, opened by a new process with [`cdc_config`]: two inline
     /// keys and the file keys, each at round 0.
     async fn seeded() -> (Self, Process) {
+        Self::seeded_with(&INLINE_KEYS).await
+    }
+
+    /// [`Self::seeded`], with `inline_keys` as the inline keys.
+    async fn seeded_with(inline_keys: &[i64]) -> (Self, Process) {
         let bottom = Arc::new(InMemory::new());
         let (instance, store) = stack(&bottom);
         let catalog = Arc::new(
@@ -528,7 +537,7 @@ impl Location {
                 .await
                 .expect("create the table"),
         );
-        for id in INLINE_KEYS {
+        for &id in inline_keys {
             insert(&table, &ctx, rows_batch(&[id], 0)).await;
         }
         insert(&table, &ctx, rows_batch(&FILE_KEYS.collect::<Vec<_>>(), 0)).await;
@@ -539,12 +548,25 @@ impl Location {
         table.quiesce().await;
         drop((table, catalog, instance));
         let process = location.open().await;
-        assert_eq!(process.rows().await, expected(0), "the seed's rows");
+        let seed: BTreeMap<i64, i64> = FILE_KEYS
+            .chain(inline_keys.iter().copied())
+            .map(|id| (id, value(id, 0)))
+            .collect();
+        assert_eq!(
+            process.rows().await,
+            seed.into_iter().collect::<Vec<_>>(),
+            "the seed's rows"
+        );
         (location, process)
     }
 
     /// A new process over this location, as a restart opens it.
     async fn open(&self) -> Process {
+        self.open_with(&cdc_config()).await
+    }
+
+    /// [`Self::open`], with the table configured by `config`.
+    async fn open_with(&self, config: &VortexConfig) -> Process {
         let (instance, store) = stack(&self.bottom);
         let catalog = Arc::new(
             ObjectNativeCatalog::open_or_create_at(
@@ -558,7 +580,7 @@ impl Location {
         catalog.init().await.expect("init");
         let ctx = SessionContext::new();
         let table = Arc::new(
-            self.builder(store, &catalog, &ctx, &cdc_config())
+            self.builder(store, &catalog, &ctx, config)
                 .open(NAME)
                 .await
                 .expect("open the table"),
@@ -880,7 +902,15 @@ async fn a_kill_at_any_storage_request_of_two_pipelined_cdc_bursts_is_all_or_not
         "the pair commits"
     );
     let steps = process.instance.steps();
+    // Every head write the pair causes, its background maintenance included.
+    wait_until_idle(&process).await;
     process.table.quiesce().await;
+    let heads_once_idle = process
+        .instance
+        .steps()
+        .iter()
+        .filter(|step| is_head_write(step))
+        .count();
     drop(process);
     let records = records_after(&bottom, before).await;
     eprintln!("clean run: {} storage requests", steps.len());
@@ -909,21 +939,17 @@ async fn a_kill_at_any_storage_request_of_two_pipelined_cdc_bursts_is_all_or_not
         second_record,
         "one record per burst: {records:?}"
     );
-    // Later records are the bursts' background maintenance (table statistics,
-    // the deferred tombstone flips): no data, no deletes, no position.
+    // Later records are the table statistics' background record: no data, no
+    // deletes, no position, and no tombstone flip.
     for record in &records[second_record + 1..] {
         assert!(
-            record.iter().all(|action| matches!(
-                action.as_str(),
-                "SetTableStats" | "SetInlinedDeletesPublished"
-            )),
-            "a later record changes data: {records:?}"
+            record.as_slice() == ["SetTableStats"],
+            "a later record changes more than statistics: {records:?}"
         );
     }
     // Each burst writes one key deletion vector and one inline tombstone, and
     // its record holds them with its files and its sequence: nothing burst 2
-    // prepares rides in burst 1's record. The tombstone commits inactive and is
-    // applied in memory when the burst's rows are published.
+    // prepares rides in burst 1's record. The tombstone commits active.
     for (burst, record) in [(1, first_record), (2, second_record)] {
         assert_eq!(
             (
@@ -933,7 +959,7 @@ async fn a_kill_at_any_storage_request_of_two_pipelined_cdc_bursts_is_all_or_not
                 count(&records[record], "AddFiles"),
                 count(&records[record], "SetGroup"),
             ),
-            (1, 0, 1, 1, 1),
+            (1, 1, 0, 1, 1),
             "burst {burst}'s record holds its own files, deletes, tombstone and sequence: {:?}",
             records[record]
         );
@@ -949,6 +975,15 @@ async fn a_kill_at_any_storage_request_of_two_pipelined_cdc_bursts_is_all_or_not
     assert!(
         staged_or_copied.is_empty(),
         "requests that stage, copy or list: {staged_or_copied:?}"
+    );
+    let statistics_records = records[second_record + 1..].len();
+    eprintln!(
+        "clean run: {heads_once_idle} head writes once idle, {statistics_records} of them statistics records"
+    );
+    assert_eq!(
+        heads_once_idle,
+        2 + statistics_records,
+        "one head write per burst once idle, besides the statistics records: {records:?}"
     );
     let reopened = location.open().await;
     assert_eq!(reopened.rows().await, expected(2), "the clean run's rows");
@@ -1101,4 +1136,484 @@ async fn a_kill_at_any_storage_request_of_two_pipelined_cdc_bursts_is_all_or_not
         steps.len(),
         failures.join("\n")
     );
+}
+
+// ---------------------------------------------------------------------------
+// Head writes per burst, and what a reader sees while a burst's record is held
+// ---------------------------------------------------------------------------
+
+/// A change sink over `table` that commits durably.
+fn durable_sink(table: &Arc<CayenneTableProvider>) -> (ChangeSink, WriteOptions) {
+    let backend = CayenneChangeSinkBackend::try_new(ChangeSinkContext::new(
+        TableReference::bare(NAME),
+        Arc::clone(table) as Arc<dyn TableProvider>,
+    ))
+    .expect("native backend");
+    let sink = ChangeSink::new(backend, SessionContext::new(), &Handle::current(), 2);
+    let options = WriteOptions {
+        recovery: Recovery::Durable,
+        ..WriteOptions::default()
+    };
+    (sink, options)
+}
+
+/// Submit `batch` with `position` and wait until its rows are published.
+async fn apply_burst(
+    sink: &ChangeSink,
+    options: WriteOptions,
+    batch: ChangeBatch,
+    position: PositionWrite,
+) -> std::result::Result<(), String> {
+    sink.reserve()
+        .await
+        .map_err(|error| error.to_string())?
+        .submit_with_position(batch, options, Some(position))
+        .map_err(|error| error.to_string())?
+        .wait()
+        .await
+        .map_err(|error| error.to_string())?
+        .published()
+        .await
+        .map_err(|error| error.to_string())
+}
+
+fn is_head_write(step: &str) -> bool {
+    step.starts_with("put ") && step.ends_with("/head")
+}
+
+/// Wait until the table is idle: no inline tombstone waits for its durable
+/// activation and no storage request was sent for a while.
+async fn wait_until_idle(process: &Process) {
+    let table_id = process.table.table_id().to_string();
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+    loop {
+        process
+            .table
+            .drain_in_flight_maintenance()
+            .await
+            .expect("drain maintenance");
+        let sent = process.instance.steps().len();
+        // Polls for idleness: any background request in this interval restarts it.
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        let inactive = process
+            .catalog
+            .get_unpublished_inlined_delete_ids(&table_id)
+            .await
+            .expect("read the inactive tombstones");
+        if inactive.is_empty() && process.instance.steps().len() == sent {
+            return;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the table is not idle within 30 s: inactive tombstones {inactive:?}, {} requests sent",
+            process.instance.steps().len()
+        );
+    }
+}
+
+/// Keyed CDC bursts through the change sink, one after another, each
+/// replacing every file key and one inline key. Once the table is idle (every
+/// inline tombstone durably active), each burst has written the dataset head
+/// once: its record carries its tombstone active, and no later record flips
+/// it. The only other head write is the table statistics' background record.
+#[tokio::test(flavor = "multi_thread")]
+async fn each_keyed_cdc_burst_writes_the_dataset_head_once() {
+    const BURST_INLINE_KEYS: [i64; 3] = [2_000, 2_001, 2_002];
+    let (location, process) = Location::seeded_with(&BURST_INLINE_KEYS).await;
+    let bottom = Arc::clone(&location.bottom) as Arc<dyn ObjectStore>;
+    let before = head_commit(&bottom).await;
+    process.instance.clear_steps();
+    let (sink, options) = durable_sink(&process.table);
+    let mut heads_per_burst = Vec::new();
+    for (round, inline_key) in (1_i64..).zip(BURST_INLINE_KEYS) {
+        let sent = process.instance.steps().len();
+        let mut ids: Vec<i64> = FILE_KEYS.collect();
+        ids.push(inline_key);
+        apply_burst(
+            &sink,
+            options,
+            changes(&ids, round),
+            save_position(&process.catalog, round),
+        )
+        .await
+        .unwrap_or_else(|error| panic!("burst {round}: {error}"));
+        heads_per_burst.push(
+            process.instance.steps()[sent..]
+                .iter()
+                .filter(|step| is_head_write(step))
+                .count(),
+        );
+    }
+    wait_until_idle(&process).await;
+    let steps = process.instance.steps();
+    process.table.quiesce().await;
+    drop(sink);
+    let records = records_after(&bottom, before).await;
+    let heads = steps.iter().filter(|step| is_head_write(step)).count();
+    eprintln!(
+        "{} bursts: {heads} head writes once idle ({} storage requests); head writes while each burst ran: {heads_per_burst:?}",
+        BURST_INLINE_KEYS.len(),
+        steps.len()
+    );
+    for (index, record) in records.iter().enumerate() {
+        eprintln!("  record {index}: {record:?}");
+    }
+    let mut rows: BTreeMap<i64, i64> = FILE_KEYS
+        .chain(BURST_INLINE_KEYS)
+        .map(|id| (id, value(id, 0)))
+        .collect();
+    for (round, inline_key) in (1_i64..).zip(BURST_INLINE_KEYS) {
+        for id in FILE_KEYS.chain([inline_key]) {
+            rows.insert(id, value(id, round));
+        }
+    }
+    let reopened = location.open().await;
+    assert_eq!(
+        reopened.rows().await,
+        rows.into_iter().collect::<Vec<_>>(),
+        "the bursts' rows after a reopen"
+    );
+    reopened.table.quiesce().await;
+    let (burst_records, other_records): (Vec<&Vec<String>>, Vec<&Vec<String>>) =
+        records.iter().partition(|record| {
+            record
+                .iter()
+                .any(|action| action.starts_with("AdvanceSourcePosition"))
+        });
+    assert_eq!(
+        (
+            burst_records.len(),
+            burst_records
+                .iter()
+                .map(|record| count(record, "AddInlinedDelete"))
+                .collect::<Vec<_>>(),
+            records
+                .iter()
+                .flatten()
+                .filter(|action| action.as_str() == "SetInlinedDeletesPublished"
+                    || action.as_str() == "AddInlinedDelete(inactive)")
+                .count(),
+        ),
+        (BURST_INLINE_KEYS.len(), vec![1; BURST_INLINE_KEYS.len()], 0),
+        "one record per burst, each with its tombstone active, and nothing to flip later: {records:?}"
+    );
+    // Every other record is the table statistics' background record.
+    assert!(
+        other_records
+            .iter()
+            .all(|record| record.as_slice() == ["SetTableStats"]),
+        "a record other than a burst's changes more than statistics: {records:?}"
+    );
+    assert_eq!(
+        (heads_per_burst, heads),
+        (
+            vec![1; BURST_INLINE_KEYS.len()],
+            BURST_INLINE_KEYS.len() + other_records.len()
+        ),
+        "one head write per burst once idle, besides the statistics record: {records:?}"
+    );
+}
+
+/// What the catalog serves a reader of the table: inline tombstones (active
+/// and all), deletion vectors, data files, the table sequence and the saved
+/// source position.
+async fn catalog_view(process: &Process) -> String {
+    let table_id = process.table.table_id().to_string();
+    let catalog = &process.catalog;
+    format!(
+        "active tombstones {}, tombstones {}, deletion vectors {}, data files {}, sequence {}, position {:?}",
+        catalog
+            .get_published_inlined_deletes(&table_id)
+            .await
+            .expect("tombstones")
+            .len(),
+        catalog
+            .get_inlined_deletes(&table_id)
+            .await
+            .expect("tombstones")
+            .len(),
+        catalog
+            .get_table_delete_files(&table_id)
+            .await
+            .expect("deletion vectors")
+            .len(),
+        catalog
+            .get_all_snapshot_files(&table_id)
+            .await
+            .expect("data files")
+            .len(),
+        catalog
+            .get_sequence_number(&table_id)
+            .await
+            .expect("sequence"),
+        process.saved_position().await,
+    )
+}
+
+impl Process {
+    async fn query(&self, sql: &str) -> Vec<(i64, i64)> {
+        let batches = self
+            .ctx
+            .sql(sql)
+            .await
+            .expect("plan")
+            .collect()
+            .await
+            .expect("query");
+        let mut rows = Vec::new();
+        for batch in batches {
+            let first = batch
+                .column(0)
+                .as_primitive::<arrow::datatypes::Int64Type>();
+            let second = batch
+                .column(1)
+                .as_primitive::<arrow::datatypes::Int64Type>();
+            rows.extend((0..batch.num_rows()).map(|i| (first.value(i), second.value(i))));
+        }
+        rows
+    }
+
+    /// The rows of `id`, by a point lookup.
+    async fn key_rows(&self, id: i64) -> Vec<(i64, i64)> {
+        self.query(&format!("SELECT id, v FROM {NAME} WHERE id = {id}"))
+            .await
+    }
+
+    /// `(count(*), sum(v))`.
+    async fn aggregates(&self) -> Vec<(i64, i64)> {
+        self.query(&format!(
+            "SELECT count(*), CAST(sum(v) AS BIGINT) FROM {NAME}"
+        ))
+        .await
+    }
+
+    /// Every row, the rows of `id` and the aggregates, after the inline view is
+    /// rebuilt from the catalog.
+    async fn rebuilt_view(&self, id: i64) -> (Vec<(i64, i64)>, Vec<(i64, i64)>, Vec<(i64, i64)>) {
+        self.table.rebuild_scan_inputs_on_next_read();
+        let rows = self.rows().await;
+        self.table.rebuild_scan_inputs_on_next_read();
+        let key = self.key_rows(id).await;
+        self.table.rebuild_scan_inputs_on_next_read();
+        let aggregates = self.aggregates().await;
+        (rows, key, aggregates)
+    }
+}
+
+/// Poll until the dataset head is past `commit`.
+async fn wait_for_head_past(store: &Arc<dyn ObjectStore>, commit: u64) -> u64 {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
+    loop {
+        let head = head_commit(store).await;
+        if head > commit {
+            return head;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the head stays at {head} for 60 s, expected past {commit}"
+        );
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+}
+
+/// A keyed CDC burst that replaces an inline key, upserts every file key and
+/// inserts a new key is held twice: first after its record is in the catalog's
+/// buffer and before the record's head write, then after the head write and
+/// before its publish. While held, a reader (with the inline view and scan
+/// views rebuilt from the catalog) sees exactly the rows from before the
+/// burst: one row for the key, with its old value, and the old aggregates.
+/// Once the burst publishes, a reader sees its rows. The burst's record carries
+/// its inline tombstone active; the tombstone must not hide the old inline row
+/// before the publish adds the replacement to the scanned snapshots.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_reader_sees_no_row_of_a_burst_whose_record_is_not_committed() {
+    const KEY: i64 = 700;
+    /// A key the burst inserts.
+    const NEW_KEY: i64 = 900;
+    let (location, process) = Location::seeded_with(&[KEY]).await;
+    let bottom = Arc::clone(&location.bottom) as Arc<dyn ObjectStore>;
+    let (rows_before, key_before, aggregates_before) = process.rebuilt_view(KEY).await;
+    assert_eq!(key_before, vec![(KEY, value(KEY, 0))], "the seeded key");
+    let catalog_before = catalog_view(&process).await;
+    let head_before = head_commit(&bottom).await;
+
+    let mut ids: Vec<i64> = FILE_KEYS.collect();
+    ids.extend([KEY, NEW_KEY]);
+    let (sink, options) = durable_sink(&process.table);
+    let (held, mut holding) = tokio::sync::oneshot::channel::<()>();
+    let (release, released) = tokio::sync::oneshot::channel::<()>();
+    let save = save_position(&process.catalog, 1);
+    // Polled once the burst's record is in the catalog's buffer: held there.
+    let position: PositionWrite = Box::pin(async move {
+        let _ = held.send(());
+        released
+            .await
+            .map_err(|error| Box::new(error) as Box<dyn std::error::Error + Send + Sync>)?;
+        save.await
+    });
+    let burst = tokio::spawn(async move {
+        let outcome = apply_burst(&sink, options, changes(&ids, 1), position).await;
+        drop(sink);
+        outcome
+    });
+    tokio::time::timeout(Duration::from_secs(60), &mut holding)
+        .await
+        .expect("the burst reaches its position write within 60 s")
+        .expect("the burst reaches its position write");
+
+    // Held before the head write.
+    let head_held = head_commit(&bottom).await;
+    let catalog_held = catalog_view(&process).await;
+    let cached_key_held = process.key_rows(KEY).await;
+    let (rows_held, key_held, aggregates_held) = process.rebuilt_view(KEY).await;
+
+    // Held after the head write, before the publish.
+    let publications = process.table.hold_publications().await;
+    release.send(()).expect("release the burst");
+    let head_committed = wait_for_head_past(&bottom, head_before).await;
+    let catalog_committed = catalog_view(&process).await;
+    let (rows_committed, key_committed, aggregates_committed) = process.rebuilt_view(KEY).await;
+    drop(publications);
+
+    burst
+        .await
+        .expect("the burst does not panic")
+        .expect("the burst commits");
+    let head_after = head_commit(&bottom).await;
+    let catalog_after = catalog_view(&process).await;
+    let (rows_after, key_after, aggregates_after) = process.rebuilt_view(KEY).await;
+
+    eprintln!("before:    head {head_before}, catalog [{catalog_before}]");
+    eprintln!("before:    key {KEY} {key_before:?}, (count, sum) {aggregates_before:?}");
+    eprintln!("held:      head {head_held}, catalog [{catalog_held}]");
+    eprintln!(
+        "held:      key {KEY} cached {cached_key_held:?}, rebuilt {key_held:?}, (count, sum) {aggregates_held:?}, rows {} (equal to before: {})",
+        rows_held.len(),
+        rows_held == rows_before
+    );
+    eprintln!("committed: head {head_committed}, catalog [{catalog_committed}]");
+    eprintln!(
+        "committed: key {KEY} rebuilt {key_committed:?}, (count, sum) {aggregates_committed:?}, rows {} (equal to before: {})",
+        rows_committed.len(),
+        rows_committed == rows_before
+    );
+    eprintln!("after:     head {head_after}, catalog [{catalog_after}]");
+    eprintln!(
+        "after:     key {KEY} {key_after:?}, (count, sum) {aggregates_after:?}, rows {}",
+        rows_after.len()
+    );
+
+    let mut expected_after: BTreeMap<i64, i64> = rows_before.iter().copied().collect();
+    for id in FILE_KEYS.chain([KEY, NEW_KEY]) {
+        expected_after.insert(id, value(id, 1));
+    }
+    let expected_after: Vec<(i64, i64)> = expected_after.into_iter().collect();
+    let sum_after: i64 = expected_after.iter().map(|(_, v)| v).sum();
+    assert_eq!(head_held, head_before, "the held record is not committed");
+    assert_eq!(
+        (
+            cached_key_held,
+            key_held,
+            aggregates_held,
+            rows_held == rows_before
+        ),
+        (
+            key_before.clone(),
+            key_before.clone(),
+            aggregates_before.clone(),
+            true
+        ),
+        "before its head write, a reader sees exactly the committed rows"
+    );
+    assert_eq!(
+        (key_committed, aggregates_committed, rows_committed == rows_before),
+        (key_before, aggregates_before, true),
+        "after its head write and before its publish, a reader sees the rows from before the burst"
+    );
+    assert_eq!(
+        (key_after, aggregates_after, rows_after == expected_after),
+        (
+            vec![(KEY, value(KEY, 1))],
+            vec![(
+                i64::try_from(expected_after.len()).expect("count"),
+                sum_after
+            )],
+            true
+        ),
+        "once the burst publishes, a reader sees its rows"
+    );
+    process.table.quiesce().await;
+}
+
+/// A keyed CDC burst small enough to be written inline, read while its record
+/// is buffered (before its head write): once it is acknowledged, a reader sees
+/// its row, both from the inline view it already holds and from one rebuilt
+/// from the catalog. The inline write publishes its row in memory before the
+/// record commits, and the inline view's incremental refresh reads the rows
+/// above its watermark from the catalog, so a catalog that served readers only
+/// committed records would leave the refreshed view without the row for good.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_inline_burst_read_while_its_record_is_buffered_is_visible_once_acknowledged() {
+    const KEY: i64 = 700;
+    const NEW_KEY: i64 = 5_000;
+    let (location, process) = Location::seeded_with(&[KEY]).await;
+    process.table.quiesce().await;
+    drop(process);
+    let inline = VortexConfig {
+        inline_max_rows: 1_024,
+        inline_max_bytes: 1 << 20,
+        ..cdc_config()
+    };
+    let process = location.open_with(&inline).await;
+    let rows_before = process.rows().await;
+    let bottom = Arc::clone(&location.bottom) as Arc<dyn ObjectStore>;
+    let head_before = head_commit(&bottom).await;
+
+    let (sink, options) = durable_sink(&process.table);
+    let (held, mut holding) = tokio::sync::oneshot::channel::<()>();
+    let (release, released) = tokio::sync::oneshot::channel::<()>();
+    let save = save_position(&process.catalog, 1);
+    let position: PositionWrite = Box::pin(async move {
+        let _ = held.send(());
+        released
+            .await
+            .map_err(|error| Box::new(error) as Box<dyn std::error::Error + Send + Sync>)?;
+        save.await
+    });
+    let burst = tokio::spawn(async move {
+        let outcome = apply_burst(&sink, options, changes(&[NEW_KEY], 1), position).await;
+        drop(sink);
+        outcome
+    });
+    tokio::time::timeout(Duration::from_secs(60), &mut holding)
+        .await
+        .expect("the burst reaches its position write within 60 s")
+        .expect("the burst reaches its position write");
+    let head_held = head_commit(&bottom).await;
+    let new_key_held = process.key_rows(NEW_KEY).await;
+    let rows_held = process.rows().await;
+    release.send(()).expect("release the burst");
+    burst
+        .await
+        .expect("the burst does not panic")
+        .expect("the burst commits");
+    let new_key_after = process.key_rows(NEW_KEY).await;
+    let rows_after = process.rows().await;
+    let (rows_rebuilt, new_key_rebuilt, _) = process.rebuilt_view(NEW_KEY).await;
+    eprintln!(
+        "inline burst: held (head {head_held}, before {head_before}): key {NEW_KEY} {new_key_held:?}, rows {} (before {}); acknowledged: key {NEW_KEY} {new_key_after:?}, rows {}; rebuilt: key {NEW_KEY} {new_key_rebuilt:?}, rows {}",
+        rows_held.len(),
+        rows_before.len(),
+        rows_after.len(),
+        rows_rebuilt.len()
+    );
+    let mut expected: BTreeMap<i64, i64> = rows_before.into_iter().collect();
+    expected.insert(NEW_KEY, value(NEW_KEY, 1));
+    let expected: Vec<(i64, i64)> = expected.into_iter().collect();
+    assert_eq!(
+        (new_key_after, rows_after == expected, rows_rebuilt == expected),
+        (vec![(NEW_KEY, value(NEW_KEY, 1))], true, true),
+        "once acknowledged, the inline burst's row is visible"
+    );
+    process.table.quiesce().await;
 }
