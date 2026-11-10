@@ -132,6 +132,16 @@
       "varies": true,
       "group": "streaming-sources",
       "may-pass": true
+    },
+    {
+      "run": "mongodb-cdc-source-restart",
+      "who": "object-native",
+      "key": "query: SELECT _id, v FROM t ORDER BY _id",
+      "kind": "wrong-answer",
+      "signature": "still failing after <n> attempts over <duration>: answer differs from the expected one: RowCountMismatch { expected: 3, actual: 2 }",
+      "varies": true,
+      "group": "streaming-sources",
+      "may-pass": true
     }
   ]
 }

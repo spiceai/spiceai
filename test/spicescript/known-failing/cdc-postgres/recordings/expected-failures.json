@@ -487,6 +487,16 @@
       "group": "cdc-postgres",
       "may-pass": true,
       "varies": true
+    },
+    {
+      "run": "postgres-cdc-unchanged-toast",
+      "who": "object-native",
+      "key": "restart: {}",
+      "kind": "status",
+      "signature": "spiced not ready: a dataset is in Error: .*received Value::Unchang",
+      "pattern": "spiced not ready: a dataset is in Error: .*received Value::Unchang",
+      "group": "cdc-postgres",
+      "may-pass": true
     }
   ],
   "postgres-cdc-upgrade": [

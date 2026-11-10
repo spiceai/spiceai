@@ -103,6 +103,33 @@
       "signature": "expected a message containing 'mysql_replication_invalid_checkpoint_behavior', saw status=Error ready=false message=External error: shared mysql binlog stream terminated",
       "group": "cdc-mysql",
       "may-pass": true
+    },
+    {
+      "run": "mysql-cdc-shared-binlog-purged-status[engine=cayenne]",
+      "who": "object-native",
+      "key": "assert-status: {\"dataset\":\"a\",\"message-contains\":\"mysql_replication_invalid_checkpoint_behavior\",\"status\":\"Error\"}",
+      "kind": "error",
+      "signature": "expected a message containing 'mysql_replication_invalid_checkpoint_behavior', saw status=Error ready=false message=External error: shared mysql binlog stream terminated",
+      "group": "cdc-mysql",
+      "may-pass": true
+    },
+    {
+      "run": "mysql-cdc-shared-binlog-purged-status[engine=cayenne]",
+      "who": "object-native",
+      "key": "assert-status: {\"dataset\":\"b\",\"message-contains\":\"mysql_replication_invalid_checkpoint_behavior\",\"status\":\"Error\"}",
+      "kind": "error",
+      "signature": "expected a message containing 'mysql_replication_invalid_checkpoint_behavior', saw status=Error ready=false message=External error: shared mysql binlog stream terminated",
+      "group": "cdc-mysql",
+      "may-pass": true
+    },
+    {
+      "run": "mysql-cdc-shared-binlog-purged-status[engine=cayenne]",
+      "who": "object-native",
+      "key": "assert-status: {\"dataset\":\"c\",\"message-contains\":\"mysql_replication_invalid_checkpoint_behavior\",\"status\":\"Error\"}",
+      "kind": "error",
+      "signature": "expected a message containing 'mysql_replication_invalid_checkpoint_behavior', saw status=Error ready=false message=External error: shared mysql binlog stream terminated",
+      "group": "cdc-mysql",
+      "may-pass": true
     }
   ]
 }

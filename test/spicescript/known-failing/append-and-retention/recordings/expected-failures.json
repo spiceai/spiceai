@@ -243,12 +243,30 @@
       "kind": "wrong-answer",
       "signature": "answer differs from the expected one: RowCountMismatch { expected: 2, actual: 3 }",
       "group": "append-and-retention"
+    },
+    {
+      "run": "retention-sql-after-append-refresh",
+      "who": "object-native",
+      "key": "query: SELECT id, deleted FROM widgets WHERE id > 0 ORDER BY id",
+      "kind": "wrong-answer",
+      "signature": "answer differs from the expected one: RowCountMismatch { expected: 2, actual: 3 }",
+      "group": "append-and-retention",
+      "may-pass": true
     }
   ],
   "retention-sql-filtered-read": [
     {
       "run": "retention-sql-filtered-read",
       "who": "cayenne",
+      "key": "query: SELECT id, deleted FROM appended WHERE deleted = true",
+      "kind": "wrong-answer",
+      "signature": "answer differs from the expected one: expected an empty answer, got 1 rows from Spice and 0 expected",
+      "group": "append-and-retention",
+      "may-pass": true
+    },
+    {
+      "run": "retention-sql-filtered-read",
+      "who": "object-native",
       "key": "query: SELECT id, deleted FROM appended WHERE deleted = true",
       "kind": "wrong-answer",
       "signature": "answer differs from the expected one: expected an empty answer, got 1 rows from Spice and 0 expected",

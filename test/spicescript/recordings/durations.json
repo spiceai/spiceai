@@ -11,6 +11,7 @@
   "builtins": 4,
   "case-mixed-widths": 5,
   "cayenne-delete-signed-zero": 4,
+  "cayenne-file-create-reload": 6,
   "cayenne-transactions": 12,
   "cayenne-upgrade": 8,
   "cayenne-vnext": 8,

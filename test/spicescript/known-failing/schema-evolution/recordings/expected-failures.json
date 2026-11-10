@@ -201,6 +201,16 @@
       "pattern": "Acceleration not ready; loading initial data for t",
       "group": "schema-evolution",
       "may-pass": true
+    },
+    {
+      "run": "schema-widen[refresh_mode=changes]",
+      "who": "object-native",
+      "key": "query: SELECT * FROM t #4",
+      "kind": "error",
+      "signature": "Acceleration not ready; loading initial data for t",
+      "pattern": "Acceleration not ready; loading initial data for t",
+      "group": "schema-evolution",
+      "may-pass": true
     }
   ],
   "view-redefined-after-restart": [
