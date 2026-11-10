@@ -73,7 +73,7 @@ jobs:
         acceleration:
           [
             { engine: arrow, mode: memory },
-            { engine: duckdb, mode: memory },
+            { engine: cayenne, mode: memory },
             { engine: sqlite, mode: memory },
             { engine: postgres },
           ]

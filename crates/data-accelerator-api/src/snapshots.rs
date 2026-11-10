@@ -417,7 +417,7 @@ pub async fn validate_snapshot_paths(
     }
 
     if let Some((path, datasets)) = paths.into_iter().find(|(_, ds)| ds.len() > 1) {
-        return Err(SharedAccelerationSnapshotError::DuckDbSharedFile {
+        return Err(SharedAccelerationSnapshotError::SharedFile {
             datasets: datasets.join(", "),
             path: path.display().to_string(),
         });
@@ -429,9 +429,9 @@ pub async fn validate_snapshot_paths(
 #[derive(Debug, Snafu)]
 pub enum SharedAccelerationSnapshotError {
     #[snafu(display(
-        "DuckDB doesn't support snapshots for shared acceleration. \
+        "Snapshots are not supported for datasets that share an acceleration file. \
         Datasets [{datasets}] share the same file '{path}'. \
-        Configure datasets to point to different location using duckdb_file"
+        Configure each dataset to use its own acceleration file."
     ))]
-    DuckDbSharedFile { datasets: String, path: String },
+    SharedFile { datasets: String, path: String },
 }

@@ -18,7 +18,6 @@ limitations under the License.
 
 use std::{fs, path::PathBuf, sync::Arc};
 
-use duckdb::Connection;
 use snafu::prelude::*;
 
 use async_trait::async_trait;
@@ -29,8 +28,19 @@ use runtime::{
 
 #[derive(Debug, Snafu)]
 pub enum Error {
-    #[snafu(display("Unable to setup DuckDB connection: {}", source))]
-    UnableToSetupDuckDBConnection { source: duckdb::Error },
+    #[snafu(display("{source}"))]
+    OpenDuckDb {
+        source: data_components::adbc_helpers::ManagedDuckDbError,
+    },
+
+    #[snafu(display("Failed to generate the {benchmark} data with DuckDB: {source}"))]
+    Generate {
+        benchmark: String,
+        source: adbc_core::error::Error,
+    },
+
+    #[snafu(display("The TPC data generation task failed: {source}"))]
+    Join { source: tokio::task::JoinError },
 
     #[snafu(display(
         "Invalid benchmark type. Must be either 'tpch' or 'tpcds', got: {}",
@@ -106,18 +116,13 @@ impl Extension for TpcExtension {
             .unwrap_or(1);
 
         tracing::info!("TPC extension is loading");
-
-        let connection = Connection::open(path.clone())
-            .boxed()
-            .map_err(|source| ExtensionError::UnableToStartExtension { source })?;
-
         tracing::info!(
             "Setting up {benchmark} benchmark datasets with scale factor {scale_factor}, using file {path}"
         );
 
         let gen_func = match benchmark.as_str() {
-            "tpch" => String::from("dbgen"),
-            "tpcds" => String::from("dsdgen"),
+            "tpch" => "dbgen",
+            "tpcds" => "dsdgen",
             _ => {
                 return Err(ExtensionError::UnableToStartExtension {
                     source: Box::new(Error::InvalidBenchmark {
@@ -126,7 +131,6 @@ impl Extension for TpcExtension {
                 });
             }
         };
-
         let query = format!(
             r"
             INSTALL {benchmark};
@@ -134,21 +138,51 @@ impl Extension for TpcExtension {
             CALL {gen_func}(sf = {scale_factor});"
         );
 
-        connection
-            .execute_batch(query.as_str())
+        // Generating the data runs inside the installed DuckDB library and can take
+        // minutes, so it runs on a blocking thread.
+        let generate_benchmark = benchmark.clone();
+        tokio::task::spawn_blocking(move || generate(&path, &query, generate_benchmark))
+            .await
+            .context(JoinSnafu)
+            .and_then(|result| result)
             .boxed()
             .map_err(|source| ExtensionError::UnableToStartExtension { source })?;
-
-        connection
-            .close()
-            .map_err(|(_, err)| ExtensionError::UnableToStartExtension {
-                source: Box::new(err),
-            })?;
 
         tracing::info!("{benchmark} data loaded");
 
         Ok(())
     }
+}
+
+/// Writes the benchmark's tables into the `DuckDB` database at `path`, through the
+/// installed `DuckDB` library.
+fn generate(path: &str, query: &str, benchmark: String) -> Result<(), Error> {
+    use adbc_core::{Connection as _, Database as _, Statement as _};
+    use data_components::adbc_helpers::{
+        DUCKDB_ADBC_ENTRYPOINT, DUCKDB_DRIVER, ManagedDuckDbError, check_duckdb_version,
+        load_adbc_database, managed_duckdb_options,
+    };
+
+    let database = load_adbc_database(
+        DUCKDB_DRIVER,
+        Some(DUCKDB_ADBC_ENTRYPOINT),
+        managed_duckdb_options(path, false),
+    )
+    .map_err(|source| ManagedDuckDbError::MissingLibrary {
+        connector: "duckdb",
+        source,
+    })
+    .context(OpenDuckDbSnafu)?;
+    check_duckdb_version(&database, "duckdb").context(OpenDuckDbSnafu)?;
+
+    let generate = || -> Result<(), adbc_core::error::Error> {
+        let mut connection = database.new_connection()?;
+        let mut statement = connection.new_statement()?;
+        statement.set_sql_query(query)?;
+        statement.execute_update()?;
+        Ok(())
+    };
+    generate().context(GenerateSnafu { benchmark })
 }
 
 #[derive(Clone, Default)]

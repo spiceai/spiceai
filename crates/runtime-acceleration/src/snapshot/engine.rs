@@ -21,11 +21,6 @@ use std::sync::Arc;
 
 use super::AccelerationEngine;
 
-#[cfg(feature = "duckdb")]
-mod duckdb;
-#[cfg(feature = "duckdb")]
-pub use duckdb::DuckDBSnapshotEngine;
-
 #[cfg(feature = "sqlite")]
 mod sqlite;
 #[cfg(feature = "sqlite")]
@@ -41,25 +36,9 @@ pub use sqlite::wait_for_sqlite_restore;
 
 #[derive(Debug, Snafu)]
 pub enum SnapshotEngineError {
-    #[snafu(display("DuckDB snapshot error: {source}"))]
-    /// Boxed: the checkpoint variants carry a dataset, a path and a `duckdb::Error`,
-    /// which would otherwise make every `Result<_, SnapshotEngineError>` carry them too.
-    #[cfg(feature = "duckdb")]
-    DuckDB {
-        source: Box<duckdb::DuckDBSnapshotError>,
-    },
-
     #[snafu(display("SQLite snapshot error: {source}"))]
     #[cfg(feature = "sqlite")]
     Sqlite { source: sqlite::SqliteSnapshotError },
-
-    /// Placeholder variant for when no snapshot-capable feature is enabled.
-    #[snafu(display(
-        "No snapshot engine is available. Enable a snapshot engine feature \
-         (e.g., 'duckdb' or 'sqlite')."
-    ))]
-    #[cfg(not(any(feature = "duckdb", feature = "sqlite")))]
-    Generic,
 
     /// A downloaded snapshot file that the engine cannot open, so it must not replace
     /// the accelerator's file.
@@ -382,19 +361,8 @@ async fn verify_sqlite_header(
 
 /// Creates a snapshot engine for the given acceleration engine.
 #[must_use]
-pub fn create_snapshot_engine(
-    engine: &AccelerationEngine,
-    #[cfg(feature = "duckdb")] compaction_enabled: bool,
-    #[cfg(not(feature = "duckdb"))] _compaction_enabled: bool,
-) -> Arc<dyn SnapshotEngine> {
+pub fn create_snapshot_engine(engine: &AccelerationEngine) -> Arc<dyn SnapshotEngine> {
     match engine {
-        #[cfg(feature = "duckdb")]
-        AccelerationEngine::DuckDB => {
-            if compaction_enabled {
-                tracing::debug!("Creating DuckDB snapshot engine with compaction enabled");
-            }
-            Arc::new(DuckDBSnapshotEngine::new(compaction_enabled))
-        }
         #[cfg(feature = "sqlite")]
         AccelerationEngine::Sqlite => Arc::new(SqliteSnapshotEngine::new()),
         AccelerationEngine::Cayenne => Arc::new(DefaultSnapshotEngine),

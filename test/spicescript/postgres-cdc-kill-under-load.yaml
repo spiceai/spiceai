@@ -1,0 +1,103 @@
+name: postgres-cdc-kill-under-load
+description: >
+  Repeated SIGKILLs of spiced during PostgreSQL CDC load leave a file-mode
+  Cayenne acceleration (refresh_mode: changes) with exactly the source's rows,
+  one per key (#16141).
+
+sources:
+  src: { kind: postgres }
+
+matrix:
+  run: [1, 2]
+
+spicepod:
+  version: v1
+  kind: Spicepod
+  name: postgres-cdc-kill-under-load
+  runtime:
+    caching:
+      sql_results: { enabled: false }
+  datasets:
+    - from: postgres:public.cdc_t
+      name: cdc_t
+      params: ${sources.src.params}
+      acceleration:
+        enabled: true
+        engine: cayenne
+        mode: file
+        refresh_mode: changes
+        primary_key: id
+
+defaults:
+  expect: { oracle: src }
+
+steps:
+  # Checkpoint often so acknowledged WAL is recycled.
+  - source-exec:
+      src:
+        - ALTER SYSTEM SET max_wal_size = '96MB'
+        - SELECT pg_reload_conf()
+  - source-exec:
+      src: |
+        CREATE TABLE cdc_t (id bigint PRIMARY KEY, k int NOT NULL, v bigint NOT NULL, seq bigint NOT NULL);
+        INSERT INTO cdc_t SELECT g, g % 1000, g, g FROM generate_series(1, 200000) g;
+  - start: {}
+  - query: SELECT count(*), sum(v), sum(seq) FROM cdc_t
+    eventually: 120s
+
+  # Each round: one transaction of 60 inserts, 25 updates and 15 deletes.
+  # Overlapping rounds may deadlock; PostgreSQL rolls the loser back.
+  - background:
+      id: writes
+      concurrency: 4
+      source-exec:
+        src: >
+          BEGIN;
+          INSERT INTO cdc_t SELECT 1000000 + ${round}::bigint * 100 + g, g % 1000, g, ${round} FROM generate_series(0, 59) g;
+          UPDATE cdc_t SET v = v + 1, seq = ${round} WHERE id IN (SELECT ((${round}::bigint * 25 + g) * 7919 + ${matrix.run}) % 200000 + 1 FROM generate_series(0, 14) g);
+          UPDATE cdc_t SET v = v + 1, seq = ${round} WHERE id IN (SELECT 1000000 + (${round}::bigint - 1 - g % 20) * 100 + (g * 7 + ${round}) % 60 FROM generate_series(0, 9) g);
+          DELETE FROM cdc_t WHERE id IN (SELECT ((${round}::bigint * 15 + g) * 104729 + ${matrix.run} * 31) % 200000 + 1 FROM generate_series(0, 9) g);
+          DELETE FROM cdc_t WHERE id IN (SELECT 1000000 + (${round}::bigint - 2 - g * 3) * 100 + (g * 11 + ${round} * 3) % 60 FROM generate_series(0, 4) g);
+          COMMIT;
+
+  # Kill at uneven intervals during the load.
+  - sleep: 6s
+  - restart: { kill: KILL }
+  - sleep: 3s
+  - restart: { kill: KILL }
+  - sleep: 8s
+  - restart: { kill: KILL }
+  - sleep: 5s
+  - restart: { kill: KILL }
+  - sleep: 11s
+  - restart: { kill: KILL }
+  - sleep: 4s
+  - restart: { kill: KILL }
+  - sleep: 9s
+  - restart: { kill: KILL }
+  - sleep: 6s
+  - restart: { kill: KILL }
+  - sleep: 13s
+  - restart: { kill: KILL }
+  - sleep: 3s
+  - restart: { kill: KILL }
+  - sleep: 7s
+  - restart: { kill: KILL }
+  - sleep: 10s
+  - restart: { kill: KILL }
+  - sleep: 5s
+  - stop-background: { id: writes, allow: deadlock detected }
+
+  # Every row matches the source, once per key.
+  - query: SELECT id, k, v, seq FROM cdc_t
+    oracle-sql: SELECT id, k, v, seq FROM cdc_t
+    eventually: 120s
+  - query: SELECT count(*) AS n, count(DISTINCT id) AS ids, sum(v) AS sv, sum(seq) AS ss FROM cdc_t
+    oracle-sql: SELECT count(*) AS n, count(DISTINCT id) AS ids, sum(v) AS sv, sum(seq) AS ss FROM cdc_t
+    eventually: 10s
+
+  # The same after a clean restart.
+  - restart: {}
+  - query: SELECT id, k, v, seq FROM cdc_t
+    oracle-sql: SELECT id, k, v, seq FROM cdc_t
+    eventually: 60s

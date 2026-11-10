@@ -392,4 +392,4 @@ jobs:
           # See `https://github.com/EricLBuehler/mistral.rs/pull/1311`
           MISTRALRS_METAL_PRECOMPILE: 0
         run: |
-          cargo test -p llms-llamacpp --features metal --test integration -- model:: content_parts:: differential:: distributed:: greedy:: harmony:: mtp:: prefix_reuse:: hf_resolution:: unsupported::
+          cargo test -p llms-llamacpp --features metal --test integration -- model:: batching:: content_parts:: differential:: distributed:: greedy:: harmony:: mtp:: prefix_reuse:: sequences:: hf_resolution:: unsupported::

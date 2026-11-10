@@ -9,7 +9,7 @@ sources:
 variants:
   arrow: arrow
   cayenne: cayenne-file
-  duckdb: duckdb
+  cayenne-memory: cayenne-memory
   federated: {}
 
 spicepod:
