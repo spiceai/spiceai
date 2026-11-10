@@ -3047,13 +3047,21 @@ impl CayenneAccelerator {
         if !vnext && !in_native {
             return Ok("sqlite");
         }
+        let partitioned = source
+            .acceleration()
+            .is_some_and(|acceleration| !acceleration.partition_by.is_empty());
         let in_sqlite = path_exists(format!("{metadata_dir}/cayenne.db")).await
             && self
                 .catalog_holds(metadata_dir, "sqlite", source, &table_name)
                 .await?;
         if in_sqlite {
+            // A partitioned dataset stays on SQLite under the flag (below), so
+            // finding it there is where it belongs, not an acceleration to move.
+            if partitioned && vnext {
+                self.vnext_notice(&table_name, "uses the SQLite Cayenne metastore although `runtime.params.cayenne_vnext` is enabled, because the new metastore does not support `partition_by` yet.");
+            }
             ensure!(
-                !vnext || recreated,
+                !vnext || recreated || partitioned,
                 InvalidConfigurationSnafu {
                     detail: Arc::from(format!(
                         "Dataset '{table_name}' is accelerated in the SQLite Cayenne metastore, but `runtime.params.{CAYENNE_VNEXT_PARAM}` is enabled, and an existing acceleration is not moved to the object-native metastore. Set `runtime.params.{CAYENNE_VNEXT_PARAM}: disabled` to keep serving it, or start it once with `acceleration.mode: file_create` to reload it from its source into the object-native metastore."
@@ -3074,10 +3082,7 @@ impl CayenneAccelerator {
                 }
             );
         }
-        if source
-            .acceleration()
-            .is_some_and(|acceleration| !acceleration.partition_by.is_empty())
-        {
+        if partitioned {
             // The object-native metastore does not hold partitioned tables yet.
             // One already in it is refused rather than moved to a new, empty
             // SQLite table that would strand its rows.

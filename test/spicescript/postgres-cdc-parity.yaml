@@ -54,6 +54,13 @@ variants:
     datasets:
       orders: { acceleration: { partition_by: [{ bucket: 'bucket(4, o_id)' }] } }
       customers: { acceleration: { partition_by: [{ bucket: 'bucket(4, c_id)' }] } }
+  # `partitioned` with the flag: a partitioned table stays on the SQLite
+  # metastore, and keeps serving its rows across the kill and restart below.
+  partitioned-object-native:
+    spicepod: { runtime: { params: { cayenne_vnext: enabled } } }
+    datasets:
+      orders: { acceleration: { partition_by: [{ bucket: 'bucket(4, o_id)' }] } }
+      customers: { acceleration: { partition_by: [{ bucket: 'bucket(4, c_id)' }] } }
   cayenne-memory:
     datasets: { '*': { acceleration: { mode: memory } } }
 

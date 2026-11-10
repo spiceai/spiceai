@@ -10914,6 +10914,14 @@ impl CayenneTableProvider {
     /// encodings — feed them back to [`Self::decode_pk_keys`] /
     /// [`Self::clear_dirty_keys`].
     ///
+    /// Every marker returned belongs to a commit whose rows a scan started
+    /// afterwards reads. A commit holds the visibility lock from its durable
+    /// metastore write, which records its markers, until its rows are published
+    /// in memory, and the listing takes the same lock. Without it, a delivery
+    /// could claim a marker whose rows are not readable yet, send the key's
+    /// previous value, and clear the marker at the newer sequence, so the newer
+    /// value would never reach the source.
+    ///
     /// # Errors
     /// Propagates the underlying metastore error.
     pub async fn list_dirty_keys(
@@ -10921,6 +10929,7 @@ impl CayenneTableProvider {
         limit: usize,
         after: Option<&(i64, Vec<u8>)>,
     ) -> Result<Vec<(Vec<u8>, i64)>> {
+        let _visibility = self.visibility_lock_arc().lock_owned().await;
         let catalog = self.catalog.as_ref();
         Ok(catalog
             .list_pending_write_back(self.table_id(), limit, after)
