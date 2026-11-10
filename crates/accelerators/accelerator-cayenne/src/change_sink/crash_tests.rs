@@ -87,13 +87,24 @@ struct InstanceState {
     /// Requests left before the instance dies.
     budget: AtomicI64,
     dead: AtomicBool,
+    /// Whether only requests that write count against the budget: reads run
+    /// concurrently in an order that varies between runs, writes do not.
+    writes_only: AtomicBool,
     /// Every request sent, as `<op> <path>`.
     steps: parking_lot::Mutex<Vec<String>>,
 }
 
+/// Whether a request only reads.
+fn is_read(op: &str) -> bool {
+    matches!(op, "get" | "list")
+}
+
 impl InstanceState {
     fn admit(&self, op: &str, path: &str) -> object_store::Result<()> {
-        if self.dead.load(Ordering::SeqCst) || self.budget.fetch_sub(1, Ordering::SeqCst) <= 0 {
+        let counted = !(is_read(op) && self.writes_only.load(Ordering::SeqCst));
+        if self.dead.load(Ordering::SeqCst)
+            || (counted && self.budget.fetch_sub(1, Ordering::SeqCst) <= 0)
+        {
             self.dead.store(true, Ordering::SeqCst);
             return Err(object_store::Error::Generic {
                 store: "Instance",
@@ -118,9 +129,16 @@ impl Instance {
             state: Arc::new(InstanceState {
                 budget: AtomicI64::new(i64::MAX),
                 dead: AtomicBool::new(false),
+                writes_only: AtomicBool::new(false),
                 steps: parking_lot::Mutex::new(Vec::new()),
             }),
         }
+    }
+
+    /// Die after `writes` more requests that write; reads pass until then.
+    fn die_after_writes(&self, writes: usize) {
+        self.state.writes_only.store(true, Ordering::SeqCst);
+        self.die_after(writes);
     }
 
     /// Die after `requests` more requests.
@@ -497,6 +515,17 @@ impl Location {
 
     /// [`Self::seeded`], with `inline_keys` as the inline keys.
     async fn seeded_with(inline_keys: &[i64]) -> (Self, Process) {
+        Self::seeded_as(inline_keys, &seed_config()).await
+    }
+
+    /// [`Self::seeded_with`], with the table created with `created` (which
+    /// fixes its CDC durability) and seeded with a one-row write inlined.
+    async fn seeded_as(inline_keys: &[i64], created: &VortexConfig) -> (Self, Process) {
+        let created = VortexConfig {
+            inline_max_rows: 1,
+            inline_max_bytes: 1 << 20,
+            ..created.clone()
+        };
         let bottom = Arc::new(InMemory::new());
         let (instance, store) = stack(&bottom);
         let catalog = Arc::new(
@@ -522,7 +551,7 @@ impl Location {
         let ctx = SessionContext::new();
         let table = Arc::new(
             location
-                .builder(store, &catalog, &ctx, &seed_config())
+                .builder(store, &catalog, &ctx, &created)
                 .create(CreateTableOptions {
                     table_name: NAME.to_string(),
                     schema: schema(),
@@ -532,7 +561,7 @@ impl Location {
                     ]))),
                     base_path: location.data_url.clone(),
                     partition_column: None,
-                    vortex_config: seed_config(),
+                    vortex_config: created,
                 })
                 .await
                 .expect("create the table"),
@@ -634,14 +663,19 @@ async fn insert(table: &Arc<CayenneTableProvider>, ctx: &SessionContext, rows: R
 
 impl Process {
     async fn rows(&self) -> Vec<(i64, i64)> {
+        self.try_rows().await.expect("scan")
+    }
+
+    /// The table's rows, or why the query was refused.
+    async fn try_rows(&self) -> std::result::Result<Vec<(i64, i64)>, String> {
         let batches = self
             .ctx
             .sql(&format!("SELECT id, v FROM {NAME} ORDER BY id"))
             .await
-            .expect("plan")
+            .map_err(|error| error.to_string())?
             .collect()
             .await
-            .expect("scan");
+            .map_err(|error| error.to_string())?;
         let mut rows = Vec::new();
         for batch in batches {
             let ids = batch
@@ -652,7 +686,7 @@ impl Process {
                 .as_primitive::<arrow::datatypes::Int64Type>();
             rows.extend((0..batch.num_rows()).map(|i| (ids.value(i), values.value(i))));
         }
-        rows
+        Ok(rows)
     }
 
     async fn saved_position(&self) -> Option<String> {
@@ -2730,6 +2764,544 @@ async fn an_inline_burst_buffered_while_a_staged_burst_commits_is_all_or_nothing
         "{} problems ({} kill points):\n{}",
         failures.len(),
         steps.len(),
+        failures.join("\n")
+    );
+}
+
+// ---------------------------------------------------------------------------
+// `cdc_durability: memory`: bursts kept in the in-memory tier, checkpoints
+// inside a burst, and what the source is told
+// ---------------------------------------------------------------------------
+
+/// Held for writing by a test that installs the process-wide in-memory tier
+/// budget, and for reading by every other test whose CDC writes reserve from
+/// it, so that no test's writes are refused by another's budget.
+pub(super) static MEM_TIER_BUDGET: std::sync::LazyLock<tokio::sync::RwLock<()>> =
+    std::sync::LazyLock::new(|| tokio::sync::RwLock::new(()));
+
+/// Bytes the in-memory tier budget admits: an upsert of a few rows fits, a
+/// delete that names [`OVERFLOW_KEYS`] keys (16 bytes a key) does not, so it
+/// takes the durable path.
+const BUDGET_BYTES: u64 = 8_192;
+/// Keys a delete names besides the ones it deletes, none of them stored.
+const OVERFLOW_KEYS: i64 = 1_000;
+
+/// [`cdc_config`] with `cdc_durability: memory`: CDC rows wait in the
+/// in-memory tier until a checkpoint, and only the runtime's checkpoint (the
+/// change sink's flush) runs on its own.
+fn memory_config() -> VortexConfig {
+    VortexConfig {
+        cdc_durability: CdcDurability::Memory,
+        cdc_mem_tier_checkpoint_interval_ms: 0,
+        ..cdc_config()
+    }
+}
+
+/// A delete of `id` that also names [`OVERFLOW_KEYS`] absent keys from
+/// `absent`, so that it overflows the in-memory tier budget.
+fn overflowing_delete(id: i64, absent: i64) -> Vec<(&'static str, i64)> {
+    std::iter::once(("d", id))
+        .chain((absent..absent + OVERFLOW_KEYS).map(|key| ("d", key)))
+        .collect()
+}
+
+/// The source, as the runtime drives it for a dataset whose writes wait in the
+/// in-memory tier: a burst kept there is acknowledged only once a checkpoint
+/// reports its fence durable, after the checkpoint has recorded the newest
+/// position at or below that fence; a burst written durably is acknowledged
+/// after the runtime's flush, with its position saved.
+struct SourceModel {
+    catalog: Arc<ObjectNativeCatalog>,
+    /// `(fence, round)` of every burst not yet acknowledged, oldest first.
+    queued: parking_lot::Mutex<Vec<(u64, i64)>>,
+    durable_fence: parking_lot::Mutex<Option<u64>>,
+    /// The newest round the source was told it need not send again.
+    acknowledged: AtomicI64,
+}
+
+impl SourceModel {
+    fn new(catalog: &Arc<ObjectNativeCatalog>) -> Arc<Self> {
+        Arc::new(Self {
+            catalog: Arc::clone(catalog),
+            queued: parking_lot::Mutex::new(Vec::new()),
+            durable_fence: parking_lot::Mutex::new(None),
+            acknowledged: AtomicI64::new(0),
+        })
+    }
+
+    /// Queue `round`, kept in the tier until `fence` is durable. A checkpoint
+    /// may have reported that fence before the round was queued.
+    async fn enqueue(&self, fence: u64, round: i64) {
+        self.queued.lock().push((fence, round));
+        let known = *self.durable_fence.lock();
+        if let Some(known) = known {
+            self.on_durable(known).await;
+        }
+    }
+
+    fn acknowledge(&self, round: i64) {
+        self.acknowledged.fetch_max(round, Ordering::SeqCst);
+    }
+}
+
+#[async_trait]
+impl DurabilityObserver for SourceModel {
+    async fn on_durable(&self, fence: u64) {
+        {
+            let mut known = self.durable_fence.lock();
+            *known = Some(known.map_or(fence, |known| known.max(fence)));
+        }
+        let ready: Vec<i64> = {
+            let mut queued = self.queued.lock();
+            let split = queued.partition_point(|(queued_fence, _)| *queued_fence <= fence);
+            queued.drain(..split).map(|(_, round)| round).collect()
+        };
+        if let Some(&round) = ready.last() {
+            self.acknowledge(round);
+        }
+    }
+
+    async fn record_position(
+        &self,
+        fence: u64,
+    ) -> std::result::Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        let round = self
+            .queued
+            .lock()
+            .iter()
+            .take_while(|(queued_fence, _)| *queued_fence <= fence)
+            .map(|(_, round)| *round)
+            .last();
+        match round {
+            Some(round) => save_position(&self.catalog, round).await,
+            None => Ok(()),
+        }
+    }
+}
+
+/// Submit each `(round, ops)` burst through one change sink, two in flight at
+/// a time as the runtime's ingress pipelines them, and tell the source what
+/// the runtime would; then flush, as the runtime's checkpoint does.
+async fn run_memory_bursts(
+    table: Arc<CayenneTableProvider>,
+    catalog: Arc<ObjectNativeCatalog>,
+    source: Arc<SourceModel>,
+    rounds: Vec<(i64, Vec<(&'static str, i64)>)>,
+) -> std::result::Result<(), String> {
+    let backend = CayenneChangeSinkBackend::try_new(ChangeSinkContext::new(
+        TableReference::bare(NAME),
+        Arc::clone(&table) as Arc<dyn TableProvider>,
+    ))
+    .expect("native backend");
+    let sink = ChangeSink::new(backend, SessionContext::new(), &Handle::current(), 2);
+    sink.set_durability_observer(Arc::clone(&source) as Arc<dyn DurabilityObserver>);
+    let options = WriteOptions {
+        recovery: Recovery::Replayable,
+        ..WriteOptions::default()
+    };
+    let settle = |round: i64, mut submission: runtime_acceleration::change_sink::Submission| {
+        let sink = &sink;
+        let catalog = &catalog;
+        let source = &source;
+        async move {
+            let receipt = submission
+                .wait()
+                .await
+                .map_err(|error| format!("burst {round}: {error}"))?;
+            receipt
+                .published()
+                .await
+                .map_err(|error| format!("burst {round} publish: {error}"))?;
+            eprintln!("burst {round}: {:?}", receipt.durability);
+            match receipt.durability {
+                StorageDurability::Deferred(fence) => source.enqueue(fence, round).await,
+                StorageDurability::Durable => {
+                    sink.flush()
+                        .await
+                        .map_err(|error| format!("flush after burst {round}: {error}"))?;
+                    save_position(catalog, round)
+                        .await
+                        .map_err(|error| format!("burst {round}'s position: {error}"))?;
+                    source.acknowledge(round);
+                }
+                StorageDurability::NotPromised => {
+                    return Err(format!("burst {round} promised no durability"));
+                }
+            }
+            Ok::<(), String>(())
+        }
+    };
+    let mut in_flight = std::collections::VecDeque::new();
+    for (round, ops) in rounds {
+        let submission = sink
+            .reserve()
+            .await
+            .map_err(|error| error.to_string())?
+            .submit_with_position(
+                mixed_changes(&ops, round),
+                options,
+                Some(save_position(&catalog, round)),
+            )
+            .map_err(|error| error.to_string())?;
+        in_flight.push_back((round, submission));
+        if in_flight.len() == 2
+            && let Some((round, submission)) = in_flight.pop_front()
+        {
+            settle(round, submission).await?;
+        }
+    }
+    while let Some((round, submission)) = in_flight.pop_front() {
+        settle(round, submission).await?;
+    }
+    sink.flush()
+        .await
+        .map_err(|error| format!("final flush: {error}"))?;
+    sink.begin_close()
+        .wait()
+        .await
+        .map_err(|error| format!("close: {error}"))
+}
+
+/// `before` with each burst of `rounds` applied in order.
+fn rows_after(
+    before: &[(i64, i64)],
+    rounds: &[(i64, Vec<(&'static str, i64)>)],
+) -> Vec<(i64, i64)> {
+    let mut rows: BTreeMap<i64, i64> = before.iter().copied().collect();
+    for (round, ops) in rounds {
+        for &(op, id) in ops {
+            if op == "d" {
+                rows.remove(&id);
+            } else {
+                rows.insert(id, value(id, *round));
+            }
+        }
+    }
+    rows.into_iter().collect()
+}
+
+/// The bursts of the memory-mode tests. An upsert group's rows are not
+/// adjacent in its burst, so the group is copied out of the burst's rows and
+/// is charged its own few bytes against the budget, while each delete group
+/// overflows it.
+/// 1. upserts, kept in the tier;
+/// 2. upserts kept in the tier, then a delete that overflows the budget: its
+///    spill checkpoints the tier inside the burst, recording burst 1's
+///    position, and the delete is written durably;
+/// 3. a delete that overflows the budget (written durably), an upsert of the
+///    same key and of a new key (kept in the tier), and a second overflowing
+///    delete of that key, whose spill checkpoints the tier inside a burst with
+///    an unpublished durable change of its own;
+/// 4. an upsert, kept in the tier.
+fn memory_rounds() -> Vec<(i64, Vec<(&'static str, i64)>)> {
+    let mut second = vec![("c", 202), ("d", 9_002), ("c", 203)];
+    second.extend(overflowing_delete(7, 10_000));
+    let mut third = overflowing_delete(5, 11_000);
+    third.extend([("c", 5), ("d", 9_003), ("c", 300)]);
+    third.extend(overflowing_delete(5, 12_000));
+    vec![
+        (1, vec![("c", 200), ("c", 201)]),
+        (2, second),
+        (3, third),
+        (4, vec![("c", 204)]),
+    ]
+}
+
+/// The saved position as a round: `None` is 0.
+fn saved_round(position: Option<&str>) -> std::result::Result<i64, String> {
+    match position {
+        None => Ok(0),
+        Some(position) => position
+            .strip_prefix("lsn ")
+            .and_then(|round| round.parse().ok())
+            .ok_or_else(|| format!("an unknown saved position {position:?}")),
+    }
+}
+
+/// `cdc_durability: memory` bursts whose deletes overflow the in-memory tier
+/// budget, so their spills checkpoint the tier inside a burst, one of them in
+/// a burst whose earlier delete was written durably and is not yet published.
+/// Every burst commits, and the table, after the runtime's checkpoint and after
+/// a reopen, holds exactly the bursts' outcome, with the last burst's position
+/// saved and acknowledged.
+#[tokio::test(flavor = "multi_thread")]
+async fn memory_mode_bursts_whose_deletes_overflow_the_tier_budget_commit_exactly() {
+    let _budget = MEM_TIER_BUDGET.write().await;
+    let (location, process) = memory_location().await;
+    assert!(
+        process.table.is_cdc_memory_mode(),
+        "the table keeps CDC rows in the in-memory tier"
+    );
+    let before = process.rows().await;
+    let rounds = memory_rounds();
+    let expected = rows_after(&before, &rounds);
+    let bottom = Arc::clone(&location.bottom) as Arc<dyn ObjectStore>;
+    let head_before = head_commit(&bottom).await;
+    cayenne::set_global_mem_tier_bytes(BUDGET_BYTES);
+    let source = SourceModel::new(&process.catalog);
+    let outcome = run_memory_bursts(
+        Arc::clone(&process.table),
+        Arc::clone(&process.catalog),
+        Arc::clone(&source),
+        rounds,
+    )
+    .await;
+    cayenne::set_global_mem_tier_bytes(0);
+    let rows = process.try_rows().await;
+    let acknowledged = source.acknowledged.load(Ordering::SeqCst);
+    process.table.quiesce().await;
+    drop(process);
+    let records = records_after(&bottom, head_before).await;
+    let reopened = location.open_with(&memory_config()).await;
+    let reopened_rows = reopened.rows().await;
+    let position = reopened.saved_position().await;
+    reopened.table.quiesce().await;
+    eprintln!("memory-mode bursts: records {records:?}");
+    eprintln!(
+        "memory-mode bursts: outcome {outcome:?}, rows {}, reopened equal expected: {}, position {position:?}, acknowledged round {acknowledged}",
+        match &rows {
+            Ok(rows) => format!("equal expected: {}", *rows == expected),
+            Err(error) => format!("refused: {error}"),
+        },
+        reopened_rows == expected
+    );
+    // Non-vacuous: the overflowing deletes were written durably (each record of
+    // a durable delete adds a deletion vector), and burst 3's second delete ran
+    // after its first was buffered.
+    let durable_deletes = records
+        .iter()
+        .map(|record| count(record, "AddDeleteFiles"))
+        .sum::<usize>();
+    assert_eq!(outcome, Ok(()), "every burst commits");
+    assert_eq!(
+        (
+            rows.as_ref().ok() == Some(&expected),
+            reopened_rows == expected,
+            position.as_deref(),
+            acknowledged
+        ),
+        (true, true, Some("lsn 4"), 4),
+        "the bursts' exact outcome, before and after a reopen, with the last position saved and acknowledged"
+    );
+    assert!(
+        durable_deletes >= 3,
+        "the three overflowing deletes are written durably: {records:?}"
+    );
+}
+
+/// A process with the memory-mode table: seeded with the inline and file keys,
+/// then opened by a new process.
+async fn memory_location() -> (Location, Process) {
+    let (location, process) = Location::seeded_as(&INLINE_KEYS, &memory_config()).await;
+    process.table.quiesce().await;
+    drop(process);
+    let process = location.open_with(&memory_config()).await;
+    (location, process)
+}
+
+/// Run `rounds` in `process`, with the budget installed, until they return or
+/// its store refuses a request, as a killed process stops there. `None` when
+/// it was killed first.
+async fn run_memory_until_killed(
+    process: &Process,
+    source: &Arc<SourceModel>,
+    rounds: Vec<(i64, Vec<(&'static str, i64)>)>,
+) -> Option<std::result::Result<(), String>> {
+    cayenne::set_global_mem_tier_bytes(BUDGET_BYTES);
+    let task = tokio::spawn(run_memory_bursts(
+        Arc::clone(&process.table),
+        Arc::clone(&process.catalog),
+        Arc::clone(source),
+        rounds,
+    ));
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
+    let outcome = loop {
+        if task.is_finished() {
+            break Some(task.await.expect("the bursts do not panic"));
+        }
+        if process.instance.is_dead() {
+            task.abort();
+            break None;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the bursts neither finished nor were killed within 60 s"
+        );
+        tokio::time::sleep(Duration::from_millis(2)).await;
+    };
+    cayenne::set_global_mem_tier_bytes(0);
+    outcome
+}
+
+/// The `cdc_durability: memory` bursts of [`memory_rounds`] through the change
+/// sink, killed before each storage write in turn (reads, whose order varies between runs, pass until then), with the source told what
+/// the runtime tells it. Two of the bursts checkpoint the in-memory tier
+/// inside the burst (a delete's spill), which records an earlier burst's
+/// position and acknowledges the source. After each kill, a new process
+/// resumes from the newer of the saved position and the source's acknowledged
+/// one (the source sends nothing it was acknowledged for) and replays the rest:
+/// its rows must then equal every burst's outcome, so neither position ever ran
+/// ahead of the durable rows.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_kill_at_any_storage_request_of_memory_mode_bursts_loses_no_acknowledged_change() {
+    let _budget = MEM_TIER_BUDGET.write().await;
+    let rounds = memory_rounds();
+    let (_location, process) = memory_location().await;
+    let before = process.rows().await;
+    let expected = rows_after(&before, &rounds);
+    process.instance.clear_steps();
+    let source = SourceModel::new(&process.catalog);
+    let clean = run_memory_until_killed(&process, &source, rounds.clone()).await;
+    let steps: Vec<String> = process
+        .instance
+        .steps()
+        .into_iter()
+        .filter(|step| !is_read(step.split(' ').next().unwrap_or_default()))
+        .collect();
+    let clean_rows = process.try_rows().await;
+    process.table.quiesce().await;
+    drop(process);
+    eprintln!(
+        "clean run: {} storage writes, outcome {clean:?}, acknowledged round {}",
+        steps.len(),
+        source.acknowledged.load(Ordering::SeqCst)
+    );
+    for (index, step) in steps.iter().enumerate() {
+        eprintln!("  {index:3} {step}");
+    }
+    assert_eq!(clean, Some(Ok(())), "the clean run commits every burst");
+    assert!(
+        clean_rows.as_ref().ok() == Some(&expected),
+        "the clean run's rows: {clean_rows:?}"
+    );
+
+    let states: Vec<(String, Vec<(i64, i64)>)> = (0..=rounds.len())
+        .map(|applied| {
+            (
+                format!("after burst {applied}"),
+                rows_after(&before, &rounds[..applied]),
+            )
+        })
+        .collect();
+    let mut outcomes: BTreeMap<String, Vec<usize>> = BTreeMap::new();
+    let mut failures = Vec::new();
+    for kill_before in 0..=steps.len() {
+        let (location, process) = memory_location().await;
+        process.instance.clear_steps();
+        process.instance.die_after_writes(kill_before);
+        let source = SourceModel::new(&process.catalog);
+        let outcome = run_memory_until_killed(&process, &source, rounds.clone()).await;
+        process.instance.kill();
+        let sent: Vec<String> = process
+            .instance
+            .steps()
+            .into_iter()
+            .filter(|step| !is_read(step.split(' ').next().unwrap_or_default()))
+            .collect();
+        eprintln!(
+            "kill before write {kill_before}: {} writes sent, head writes at {:?}, outcome {outcome:?}",
+            sent.len(),
+            sent.iter()
+                .enumerate()
+                .filter(|(_, step)| is_head_write(step))
+                .map(|(index, _)| index)
+                .collect::<Vec<_>>()
+        );
+        process.table.quiesce().await;
+        drop(process);
+        let acknowledged = source.acknowledged.load(Ordering::SeqCst);
+
+        let next = location.open_with(&memory_config()).await;
+        let reopened = next.try_rows().await;
+        let position = next.saved_position().await;
+        let mut problems = Vec::new();
+        let saved = saved_round(position.as_deref()).unwrap_or_else(|error| {
+            problems.push(error);
+            0
+        });
+        let state = match &reopened {
+            Ok(rows) => states.iter().find(|(_, state)| state == rows).map_or_else(
+                || {
+                    // The burst prefix it is closest to, and how it differs.
+                    let (name, nearest) = states
+                        .iter()
+                        .min_by_key(|(_, state)| {
+                            state.iter().filter(|row| !rows.contains(row)).count()
+                                + rows.iter().filter(|row| !state.contains(row)).count()
+                        })
+                        .expect("states");
+                    let missing: Vec<_> =
+                        nearest.iter().filter(|row| !rows.contains(row)).collect();
+                    let extra: Vec<_> = rows.iter().filter(|row| !nearest.contains(row)).collect();
+                    format!("between bursts ({name}, without {missing:?}, with {extra:?})")
+                },
+                |(name, _)| name.clone(),
+            ),
+            Err(error) => format!("refused: {error}"),
+        };
+        let resume = saved.max(acknowledged);
+        let replay: Vec<_> = rounds
+            .iter()
+            .filter(|(round, _)| *round > resume)
+            .cloned()
+            .collect();
+        let replayed = run_memory_bursts(
+            Arc::clone(&next.table),
+            Arc::clone(&next.catalog),
+            SourceModel::new(&next.catalog),
+            replay,
+        )
+        .await;
+        let rows = next.try_rows().await;
+        next.table.quiesce().await;
+        outcomes
+            .entry(format!(
+                "{state}, saved {saved}, acknowledged {acknowledged}"
+            ))
+            .or_default()
+            .push(kill_before);
+        if let Err(error) = &replayed {
+            problems.push(format!("the replay failed: {error}"));
+        }
+        match rows {
+            Ok(rows) if rows == expected => {}
+            Ok(rows) => {
+                let missing: Vec<_> = expected
+                    .iter()
+                    .filter(|row| !rows.contains(row))
+                    .take(5)
+                    .collect();
+                let extra: Vec<_> = rows
+                    .iter()
+                    .filter(|row| !expected.contains(row))
+                    .take(5)
+                    .collect();
+                problems.push(format!(
+                    "after the replay from burst {} the rows differ from every burst's outcome: missing {missing:?}, extra {extra:?}",
+                    resume + 1
+                ));
+            }
+            Err(error) => problems.push(format!("the replayed table refuses queries: {error}")),
+        }
+        if !problems.is_empty() {
+            failures.push(format!(
+                "killed before write {kill_before} ({}), outcome {outcome:?}, reopened {state}, saved {saved}, acknowledged {acknowledged}: {}",
+                steps
+                    .get(kill_before)
+                    .map_or("past the end", String::as_str),
+                problems.join("; ")
+            ));
+        }
+    }
+    eprintln!(
+        "{} kill points; outcomes by kill point: {outcomes:?}",
+        steps.len() + 1
+    );
+    assert!(
+        failures.is_empty(),
+        "{} problems ({} kill points):\n{}",
+        failures.len(),
+        steps.len() + 1,
         failures.join("\n")
     );
 }
