@@ -118,7 +118,7 @@ own section below — a count here would be one more thing to keep true by hand.
 | [datafusion](#datafusion) | `59a3510f01992a0fe486c5c4bf337422a7533403` | `spiceai-55` |
 | [datafusion-ballista](#datafusion-ballista) | `6e7a8775a6deb99c2ebf924f1ff5b3111d38e615` | `spiceai-55` |
 | [datafusion-federation](#datafusion-federation-and-datafusion-table-providers) | `c5f1094e4f5aa7bc0cb5d3bf0f7753a33e5fc39d` | `spiceai-55` |
-| [datafusion-table-providers](#datafusion-federation-and-datafusion-table-providers) | `8cdbc835d10407e4615432a869bb1dea1b717ff9` | `viktor/federation-pin-c5f1094` (TEMPORARY: spiceai/datafusion-table-providers#120) |
+| [datafusion-table-providers](#datafusion-federation-and-datafusion-table-providers) | `9d30d58cbdb4d9f7e511738bedd896603a5a256f` | `spiceai-55` |
 | [delta-kernel-rs](#delta-kernel-rs) | `16ac28606464d742b6837de4a51f41011c3f6dc0` | `spiceai-0.27` |
 | [docx-rs](#docx-rs) | `81faaf2187185b097710b9ee589bf039efdd74de` | `jeadie/render-zip-upgrade` |
 | [graph-rs-sdk](#graph-rs-sdk) | `25bc483efc3200df7a4f5426c176cddb18a84ad9` | `spiceai` |
@@ -509,7 +509,7 @@ squash-merged), it quotes primary-key column names in `DuckDB` `CREATE TABLE`
 version this workspace pins, rewrites the new-connection observer row below and adds the
 test-connection row after it, with their tests (`mysqlpool.rs`, `core/tests/mysql/`,
 `core/tests/docker/`).
-Between `d323656` and `8cdbc83` (spiceai/datafusion-table-providers#105 and #120), it adds
+Between `d323656` and `9d30d58` (spiceai/datafusion-table-providers#105 and #120, squash-merged), it adds
 only the `SQLite` `UNNEST` row below and its tests (`core/src/sqlite/federation.rs`), and
 moves its own federation pin to match this workspace's.
 
