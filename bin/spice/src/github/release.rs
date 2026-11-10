@@ -529,14 +529,19 @@ fn get_cuda_version() -> Option<String> {
 
 /// Parse the compute capability reported by `nvidia-smi`.
 ///
-/// `nvidia-smi` emits one compute capability per line. The runtime release is
-/// selected for the first GPU reported by the command.
+/// `nvidia-smi` emits one compute capability per line, one line per GPU. A
+/// runtime built for one capability cannot run kernels on a GPU of another, so
+/// a host whose GPUs report different capabilities gets `None`.
 #[cfg(any(target_os = "linux", test))]
 fn parse_cuda_version(output: &str) -> Option<String> {
-    let value = output
+    let mut values = output
         .lines()
         .map(str::trim)
-        .find(|line| !line.is_empty() && *line != "compute_cap")?;
+        .filter(|line| !line.is_empty() && *line != "compute_cap");
+    let value = values.next()?;
+    if values.any(|other| other != value) {
+        return None;
+    }
     let (major, minor) = value.split_once('.')?;
 
     if major.is_empty()
@@ -796,6 +801,8 @@ mod tests {
     #[case("compute_cap\n", None)]
     #[case("8.\n", None)]
     #[case("8.6, other\n", None)]
+    #[case("9.0\n8.0\n", None)]
+    #[case("8.6\n8.9\n", None)]
     fn test_parse_cuda_version(#[case] output: &str, #[case] expected: Option<&str>) {
         assert_eq!(parse_cuda_version(output).as_deref(), expected);
     }

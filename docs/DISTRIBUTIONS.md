@@ -137,7 +137,7 @@ For Linux systems with NVIDIA GPUs, CUDA distributions enable GPU-accelerated AI
 - 89 (RTX 40xx, L40, L4)
 - 90 (H100, H200)
 
-When `spice install` automatically detects CUDA, it reads the compute capability reported by `nvidia-smi`. The command reports one value per GPU; on systems with multiple GPUs, the first reported capability is used to select the matching CUDA runtime distribution.
+When `spice install` automatically detects CUDA, it reads the compute capability reported by `nvidia-smi`. The command reports one value per GPU. When every GPU reports the same capability, it selects the matching CUDA runtime distribution. When the GPUs report different capabilities, it installs the CPU runtime.
 
 **Docker (Nightly):**
 
