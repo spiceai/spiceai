@@ -11,7 +11,7 @@ sources:
 # Cayenne metastore (`runtime.params.cayenne_vnext`) enabled. A cluster keeps
 # the SQLite metastore under the flag, since its executors share one state
 # location and the object-native metastore has one writer per dataset log; the
-# variant checks that the cluster still serves every row once (#15996). The
+# variant checks that the cluster still serves every row once (#16205). The
 # other cluster scripts run without it.
 variants:
   as-written: federated
