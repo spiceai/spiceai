@@ -903,6 +903,11 @@ impl CayenneCdcWrite {
         if let Some(scope) = crate::catalog::same_record_scope_id()
             .filter(|_| crate::catalog::commit_left_to_scope_owner())
         {
+            // Read before the record is buffered: from there until the step is
+            // left for the scope's owner below, nothing may suspend, or a
+            // cancelled caller would drop the prepared deletes the buffered
+            // record names.
+            let record_seq = table.sequence_high_water().await;
             // Buffered; the scope's owner commits it.
             if let Err(source) = catalog
                 .commit_publications(std::slice::from_ref(&publication))
@@ -914,7 +919,6 @@ impl CayenneCdcWrite {
             // A later write of the scope reads this one from the writer view:
             // its keys are in the keyset now, the keys it tombstones count as
             // tombstoned, and a delete need not wait for its publish.
-            let record_seq = table.sequence_high_water().await;
             if table.has_retention_delete_filters() {
                 table.clear_cached_pk_keyset();
             } else {
@@ -17038,7 +17042,7 @@ impl CayenneTableProvider {
             // the WRITE fence, so read after the scans below, the rows of a checkpoint
             // landing in between would be in neither this snapshot list nor the
             // inline corpus — and their keys missing from the rebuilt index.
-            let inlined_batches = self.read_inlined_batches_if_present().await?;
+            let inlined_batches = self.keyset_inlined_batches().await?;
             // Wait-free Arc::clone — the inner HashMap is shared, not cloned.
             let protected_snapshots = self.protected_snapshots.load_full();
             let current_snapshot_id = self.get_current_snapshot_id();
@@ -17655,7 +17659,7 @@ impl CayenneTableProvider {
             // full rebuild captures them in, and for the same reasons — see
             // `load_existing_pk_index`.
             let staged_keys = self.snapshot_inflight_staged_pk_keys();
-            let inlined_batches = self.read_inlined_batches_if_present().await?;
+            let inlined_batches = self.keyset_inlined_batches().await?;
             let protected_snapshots = self.protected_snapshots.load_full();
             // Pin the snapshot dirs this path reads (the protected snapshots folded
             // by `extend_bloom_with_protected_and_inline` below) against the
@@ -35815,6 +35819,22 @@ impl CayenneTableProvider {
         // Cache miss: populate both `batches` and `view` together.
         self.populate_inlined_cache(current_gen).await?;
         Ok((*self.inlined_cache.load().batches).clone())
+    }
+
+    /// The inline rows a key-set rebuild folds in: inside a same-record scope
+    /// with changes of its own not yet published, the writer view, so the
+    /// scope's unpublished inline rows are in the key set its later writes
+    /// check; elsewhere the rows readers see.
+    async fn keyset_inlined_batches(&self) -> Result<Vec<RecordBatch>> {
+        if !self.scope_has_unpublished_changes() {
+            return self.read_inlined_batches_if_present().await;
+        }
+        Ok(self
+            .writer_inlined_view()
+            .await?
+            .iter()
+            .flat_map(|entry| entry.batches.iter().cloned())
+            .collect())
     }
 
     /// [`Self::read_inlined_batches`], skipped when the table holds no inline rows.

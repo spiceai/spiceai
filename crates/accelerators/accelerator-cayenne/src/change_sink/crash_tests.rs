@@ -567,6 +567,15 @@ impl Location {
 
     /// [`Self::open`], with the table configured by `config`.
     async fn open_with(&self, config: &VortexConfig) -> Process {
+        self.open_with_retention(config, Vec::new()).await
+    }
+
+    /// [`Self::open_with`], with `retention` as the table's retention filters.
+    async fn open_with_retention(
+        &self,
+        config: &VortexConfig,
+        retention: Vec<datafusion::logical_expr::Expr>,
+    ) -> Process {
         let (instance, store) = stack(&self.bottom);
         let catalog = Arc::new(
             ObjectNativeCatalog::open_or_create_at(
@@ -581,6 +590,7 @@ impl Location {
         let ctx = SessionContext::new();
         let table = Arc::new(
             self.builder(store, &catalog, &ctx, config)
+                .with_retention_filters(retention)
                 .open(NAME)
                 .await
                 .expect("open the table"),
@@ -2097,10 +2107,22 @@ impl MultiGroupOutcome {
 /// the burst's record is buffered (before its head write), after the head write
 /// and before the publish, once acknowledged, and after a reopen.
 async fn multi_group_burst(config: &VortexConfig, ops: &[(&str, i64)]) -> MultiGroupOutcome {
+    multi_group_burst_with_retention(config, &[], ops).await
+}
+
+/// [`multi_group_burst`] on a table opened with `retention` as its retention
+/// filters.
+async fn multi_group_burst_with_retention(
+    config: &VortexConfig,
+    retention: &[datafusion::logical_expr::Expr],
+    ops: &[(&str, i64)],
+) -> MultiGroupOutcome {
     let (location, process) = Location::seeded_with(&[700]).await;
     process.table.quiesce().await;
     drop(process);
-    let process = location.open_with(config).await;
+    let process = location
+        .open_with_retention(config, retention.to_vec())
+        .await;
     let before = process.rows().await;
     let (rebuilt_before, _, _) = process.rebuilt_view(700).await;
     assert_eq!(rebuilt_before, before, "a rebuilt view of the seed");
@@ -2164,7 +2186,9 @@ async fn multi_group_burst(config: &VortexConfig, ops: &[(&str, i64)]) -> MultiG
     let (rebuilt, _, _) = process.rebuilt_view(700).await;
     process.table.quiesce().await;
     drop(process);
-    let reopened_process = location.open_with(config).await;
+    let reopened_process = location
+        .open_with_retention(config, retention.to_vec())
+        .await;
     let reopened = reopened_process.rows().await;
     let position_reopened = reopened_process.saved_position().await;
     reopened_process.table.quiesce().await;
@@ -2309,6 +2333,26 @@ async fn every_multi_group_burst_is_invisible_until_its_record_commits() {
         failures.len(),
         failures.join("\n")
     );
+}
+
+/// A multi-group burst on a table with retention filters, whose staged write
+/// clears the key set when its record is buffered: an inline upsert of a new
+/// key, a staged upsert of many file keys, and a second inline upsert of the
+/// new key. The second upsert must replace the first, though the key set it
+/// rebuilds is read while the first is unpublished.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_multi_group_burst_on_a_table_with_retention_filters_holds_exactly_its_outcome() {
+    use datafusion::prelude::{col, lit};
+    let mut ops = vec![("c", 5_000), ("c", 6_000), ("d", 6_000)];
+    ops.extend((10..70).map(|id| ("c", id)));
+    ops.extend([("d", 20), ("c", 5_000)]);
+    // Matches no row, so the retention pass deletes nothing.
+    let retention = [col("v").lt(lit(-1_000_000_i64))];
+    let outcome =
+        multi_group_burst_with_retention(&staged_then_inline_config(), &retention, &ops).await;
+    let label = "retention: inline, staged, inline";
+    eprintln!("{}", outcome.report(label));
+    assert_multi_group_outcome(label, &outcome, &ops);
 }
 
 // ---------------------------------------------------------------------------
