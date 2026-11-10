@@ -2990,20 +2990,26 @@ fn rows_after(
 ///    position, and the delete is written durably;
 /// 3. a delete that overflows the budget (written durably), an upsert of the
 ///    same key and of a new key (kept in the tier), and a second overflowing
-///    delete of that key, whose spill checkpoints the tier inside a burst with
-///    an unpublished durable change of its own;
-/// 4. an upsert, kept in the tier.
+///    delete of that key, whose spill checkpoints the tier after the burst's
+///    first delete;
+/// 4. the same, with the second overflowing delete naming other keys, so the
+///    re-inserted key the checkpoint makes durable survives the first delete;
+/// 5. an upsert, kept in the tier.
 fn memory_rounds() -> Vec<(i64, Vec<(&'static str, i64)>)> {
     let mut second = vec![("c", 202), ("d", 9_002), ("c", 203)];
     second.extend(overflowing_delete(7, 10_000));
     let mut third = overflowing_delete(5, 11_000);
     third.extend([("c", 5), ("d", 9_003), ("c", 300)]);
     third.extend(overflowing_delete(5, 12_000));
+    let mut fourth = overflowing_delete(6, 13_000);
+    fourth.extend([("c", 6), ("d", 9_004), ("c", 301)]);
+    fourth.extend(overflowing_delete(9_005, 14_000));
     vec![
         (1, vec![("c", 200), ("c", 201)]),
         (2, second),
         (3, third),
-        (4, vec![("c", 204)]),
+        (4, fourth),
+        (5, vec![("c", 204)]),
     ]
 }
 
@@ -3019,9 +3025,9 @@ fn saved_round(position: Option<&str>) -> std::result::Result<i64, String> {
 }
 
 /// `cdc_durability: memory` bursts whose deletes overflow the in-memory tier
-/// budget, so their spills checkpoint the tier inside a burst, one of them in
-/// a burst whose earlier delete was written durably and is not yet published.
-/// Every burst commits, and the table, after the runtime's checkpoint and after
+/// budget, so their spills checkpoint the tier between a burst's groups, two of
+/// them after an earlier delete of the same burst was written durably. Every
+/// burst commits, and the table, after the runtime's checkpoint and after
 /// a reopen, holds exactly the bursts' outcome, with the last burst's position
 /// saved and acknowledged.
 #[tokio::test(flavor = "multi_thread")]
@@ -3065,9 +3071,8 @@ async fn memory_mode_bursts_whose_deletes_overflow_the_tier_budget_commit_exactl
         },
         reopened_rows == expected
     );
-    // Non-vacuous: the overflowing deletes were written durably (each record of
-    // a durable delete adds a deletion vector), and burst 3's second delete ran
-    // after its first was buffered.
+    // Non-vacuous: the five overflowing deletes were written durably (each
+    // record of a durable delete adds a deletion vector).
     let durable_deletes = records
         .iter()
         .map(|record| count(record, "AddDeleteFiles"))
@@ -3080,12 +3085,12 @@ async fn memory_mode_bursts_whose_deletes_overflow_the_tier_budget_commit_exactl
             position.as_deref(),
             acknowledged
         ),
-        (true, true, Some("lsn 4"), 4),
+        (true, true, Some("lsn 5"), 5),
         "the bursts' exact outcome, before and after a reopen, with the last position saved and acknowledged"
     );
     assert!(
-        durable_deletes >= 3,
-        "the three overflowing deletes are written durably: {records:?}"
+        durable_deletes >= 5,
+        "the five overflowing deletes are written durably: {records:?}"
     );
 }
 
@@ -3134,10 +3139,11 @@ async fn run_memory_until_killed(
 }
 
 /// The `cdc_durability: memory` bursts of [`memory_rounds`] through the change
-/// sink, killed before each storage write in turn (reads, whose order varies between runs, pass until then), with the source told what
-/// the runtime tells it. Two of the bursts checkpoint the in-memory tier
-/// inside the burst (a delete's spill), which records an earlier burst's
-/// position and acknowledges the source. After each kill, a new process
+/// sink, killed before each storage write in turn (reads, whose order varies
+/// between runs, pass until then), with the source told what the runtime tells
+/// it. Overflowing deletes' spills checkpoint the in-memory tier between a
+/// burst's groups, which records an earlier burst's position and acknowledges
+/// the source. After each kill, a new process
 /// resumes from the newer of the saved position and the source's acknowledged
 /// one (the source sends nothing it was acknowledged for) and replays the rest:
 /// its rows must then equal every burst's outcome, so neither position ever ran
