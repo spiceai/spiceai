@@ -8,7 +8,11 @@ sources:
   src: { kind: postgres }
 
 # The spicepod as written, and the same with the prototype object-native
-# Cayenne metastore (`runtime.params.cayenne_vnext`) in place of SQLite.
+# Cayenne metastore (`runtime.params.cayenne_vnext`) enabled. A cluster keeps
+# the SQLite metastore under the flag, since its executors share one state
+# location and the object-native metastore has one writer per dataset log; the
+# variant checks that the cluster still serves every row once (#15996). The
+# other cluster scripts run without it.
 variants:
   as-written: federated
   object-native: object-native
@@ -38,3 +42,5 @@ steps:
   - source-exec: { src: "UPDATE acct SET bal = 0 WHERE id <= 10; INSERT INTO acct VALUES (1000, 5)" }
   - query: SELECT id, bal FROM acct
     eventually: 30s
+  - assert-log: { contains: 'uses the SQLite Cayenne metastore although `runtime.params.cayenne_vnext` is enabled, because the new metastore does not support cluster mode yet' }
+    only: object-native

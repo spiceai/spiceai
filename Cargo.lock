@@ -51,6 +51,7 @@ dependencies = [
  "runtime-acceleration",
  "runtime-checkpoint-api",
  "runtime-checkpoint-sqlite",
+ "runtime-component",
  "runtime-datafusion",
  "runtime-object-store",
  "runtime-parameters",

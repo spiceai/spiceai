@@ -7,30 +7,12 @@
       "kind": "status",
       "signature": "spiced not ready after <duration>; dataset status: [{\"acceleration_enabled\":true,\"from\":\"postgres:t\",\"name\":\"t\",\"properties\":{\"search\":\"unsupported\",\"vector_search\":\"unsupported\"},\"replication_enabled\":false,\"status\":\"Refreshing\"},{\"acceleration_enabled\":true,\"from\":\"postgres:u\",\"name\":\"u\",\"properti",
       "group": "cluster-sql"
-    },
-    {
-      "run": "cluster-limit-offset[backend=postgres]",
-      "who": "cayenne-object-native",
-      "key": "start: {}",
-      "kind": "status",
-      "signature": "spiced not ready after <duration>; dataset status: [{\"acceleration_enabled\":true,\"from\":\"postgres:t\",\"name\":\"t\",\"properties\":{\"search\":\"unsupported\",\"vector_search\":\"unsupported\"},\"replication_enabled\":false,\"status\":\"Refreshing\"},{\"acceleration_enabled\":true,\"from\":\"postgres:u\",\"name\":\"u\",\"properti",
-      "group": "cluster-sql"
     }
   ],
   "cluster-literals": [
     {
       "run": "cluster-literals",
-      "who": "as-written",
-      "key": "start: {}",
-      "kind": "status",
-      "signature": "spiced not ready after <duration>; dataset status: [{\"acceleration_enabled\":true,\"from\":\"postgres:public.e\",\"name\":\"e\",\"properties\":{\"search\":\"unsupported\",\"vector_search\":\"unsupported\"},\"replication_enabled\":false,\"status\":\"Refreshing\"}]; see <path>",
-      "varies": true,
-      "group": "cluster-sql",
-      "may-pass": true
-    },
-    {
-      "run": "cluster-literals",
-      "who": "object-native",
+      "who": "default",
       "key": "start: {}",
       "kind": "status",
       "signature": "spiced not ready after <duration>; dataset status: [{\"acceleration_enabled\":true,\"from\":\"postgres:public.e\",\"name\":\"e\",\"properties\":{\"search\":\"unsupported\",\"vector_search\":\"unsupported\"},\"replication_enabled\":false,\"status\":\"Refreshing\"}]; see <path>",
@@ -42,15 +24,7 @@
   "cluster-nan-literal": [
     {
       "run": "cluster-nan-literal",
-      "who": "as-written",
-      "key": "start: {}",
-      "kind": "status",
-      "signature": "spiced not ready after <duration>; dataset status: [{\"acceleration_enabled\":true,\"from\":\"postgres:public.e\",\"name\":\"e\",\"properties\":{\"search\":\"unsupported\",\"vector_search\":\"unsupported\"},\"replication_enabled\":false,\"status\":\"Refreshing\"}]; see <path>",
-      "group": "cluster-sql"
-    },
-    {
-      "run": "cluster-nan-literal",
-      "who": "object-native",
+      "who": "default",
       "key": "start: {}",
       "kind": "status",
       "signature": "spiced not ready after <duration>; dataset status: [{\"acceleration_enabled\":true,\"from\":\"postgres:public.e\",\"name\":\"e\",\"properties\":{\"search\":\"unsupported\",\"vector_search\":\"unsupported\"},\"replication_enabled\":false,\"status\":\"Refreshing\"}]; see <path>",
@@ -60,15 +34,7 @@
   "cluster-text-search": [
     {
       "run": "cluster-text-search",
-      "who": "as-written",
-      "key": "start: {}",
-      "kind": "status",
-      "signature": "spiced not ready after <duration>; dataset status: [{\"acceleration_enabled\":true,\"from\":\"postgres:public.docs\",\"name\":\"docs\",\"properties\":{\"search\":\"supported\",\"vector_search\":\"unsupported\"},\"replication_enabled\":false,\"status\":\"Refreshing\"}]; see <path>",
-      "group": "cluster-sql"
-    },
-    {
-      "run": "cluster-text-search",
-      "who": "object-native",
+      "who": "default",
       "key": "start: {}",
       "kind": "status",
       "signature": "spiced not ready after <duration>; dataset status: [{\"acceleration_enabled\":true,\"from\":\"postgres:public.docs\",\"name\":\"docs\",\"properties\":{\"search\":\"supported\",\"vector_search\":\"unsupported\"},\"replication_enabled\":false,\"status\":\"Refreshing\"}]; see <path>",
@@ -78,15 +44,7 @@
   "cluster-timestamp-boundary": [
     {
       "run": "cluster-timestamp-boundary",
-      "who": "as-written",
-      "key": "start: {}",
-      "kind": "status",
-      "signature": "spiced not ready after <duration>; dataset status: [{\"acceleration_enabled\":true,\"from\":\"dynamodb:t_i0_default\",\"name\":\"t\",\"properties\":{\"search\":\"unsupported\",\"vector_search\":\"unsupported\"},\"replication_enabled\":false,\"status\":\"Refreshing\"}]; see <path>",
-      "group": "cluster-sql"
-    },
-    {
-      "run": "cluster-timestamp-boundary",
-      "who": "object-native",
+      "who": "default",
       "key": "start: {}",
       "kind": "status",
       "signature": "spiced not ready after <duration>; dataset status: [{\"acceleration_enabled\":true,\"from\":\"dynamodb:t_i0_default\",\"name\":\"t\",\"properties\":{\"search\":\"unsupported\",\"vector_search\":\"unsupported\"},\"replication_enabled\":false,\"status\":\"Refreshing\"}]; see <path>",
@@ -97,14 +55,6 @@
     {
       "run": "cluster-tpch-joins[backend=postgres]",
       "who": "cayenne",
-      "key": "start: {}",
-      "kind": "status",
-      "signature": "spiced not ready after <duration>; dataset status: [{\"acceleration_enabled\":true,\"from\":\"postgres:region\",\"name\":\"region\",\"properties\":{\"search\":\"unsupported\",\"vector_search\":\"unsupported\"},\"replication_enabled\":false,\"status\":\"Refreshing\"},{\"acceleration_enabled\":true,\"from\":\"postgres:nation\",\"name",
-      "group": "cluster-sql"
-    },
-    {
-      "run": "cluster-tpch-joins[backend=postgres]",
-      "who": "cayenne-object-native",
       "key": "start: {}",
       "kind": "status",
       "signature": "spiced not ready after <duration>; dataset status: [{\"acceleration_enabled\":true,\"from\":\"postgres:region\",\"name\":\"region\",\"properties\":{\"search\":\"unsupported\",\"vector_search\":\"unsupported\"},\"replication_enabled\":false,\"status\":\"Refreshing\"},{\"acceleration_enabled\":true,\"from\":\"postgres:nation\",\"name",

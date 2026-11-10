@@ -520,6 +520,9 @@ pub struct CayenneAccelerator {
     /// one in-memory database.
     instance_id: u64,
     footer_cache_mb: Option<usize>,
+    /// The cluster membership of this process. A scheduler or executor keeps the
+    /// SQLite metastore under `cayenne_vnext` (see [`Self::metastore_type_for`]).
+    cluster_role: Option<runtime_component::ClusterRole>,
     /// The process-wide semaphore that bounds concurrent per-table background
     /// compactions, held here so the registration path can hand it to each
     /// table. Sized at `cpu_budget().cayenne_compaction_permits()` so a fleet of
@@ -1684,7 +1687,10 @@ impl CayenneAccelerator {
     /// by the time they reach here there is nothing left to reject.
     #[must_use]
     pub fn from_runtime_config(config: &data_accelerator_api::CayenneRuntimeConfig) -> Self {
-        Self::with_footer_cache_mb(config.footer_cache_mb)
+        Self {
+            cluster_role: config.cluster_role.clone(),
+            ..Self::with_footer_cache_mb(config.footer_cache_mb)
+        }
     }
 
     /// The footer-cache size this engine was configured with.
@@ -1704,6 +1710,7 @@ impl CayenneAccelerator {
             instance_id: CAYENNE_ACCELERATOR_INSTANCE_COUNTER
                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed),
             footer_cache_mb,
+            cluster_role: None,
             compaction_semaphore: cayenne::compaction_budget(),
             inherited_snapshot_dir_pins: parking_lot::Mutex::new(HashMap::new()),
             serving_snapshot_providers: Arc::default(),
@@ -3030,7 +3037,13 @@ impl CayenneAccelerator {
         if !source.is_file_accelerated() {
             return Ok("sqlite");
         }
-        let vnext = Self::vnext_enabled(source)?;
+        let requested = Self::vnext_enabled(source)?;
+        // A cluster scheduler or executor keeps SQLite under the flag. The
+        // executors of a cluster share `runtime.state.location`, while the
+        // object-native metastore allows one writer per dataset log, so each
+        // executor would fence the others' commits.
+        let clustered = self.cluster_role.is_some();
+        let vnext = requested && !clustered;
         let recreated = source
             .acceleration()
             .is_some_and(|acceleration| acceleration.mode == Mode::FileCreate);
@@ -3045,6 +3058,9 @@ impl CayenneAccelerator {
         // Without the flag, an instance that never used the object-native metastore
         // keeps SQLite after one local check.
         if !vnext && !in_native {
+            if requested {
+                self.vnext_notice(&table_name, "uses the SQLite Cayenne metastore although `runtime.params.cayenne_vnext` is enabled, because the new metastore does not support cluster mode yet.");
+            }
             return Ok("sqlite");
         }
         let partitioned = source
@@ -3073,6 +3089,14 @@ impl CayenneAccelerator {
             return Ok("sqlite");
         }
         if in_native {
+            ensure!(
+                !clustered || recreated,
+                InvalidConfigurationSnafu {
+                    detail: Arc::from(format!(
+                        "Dataset '{table_name}' is accelerated in the object-native Cayenne metastore, which does not support cluster mode yet. Run it outside a cluster to keep serving it, or start it once with `acceleration.mode: file_create` to reload it from its source into the SQLite metastore."
+                    )),
+                }
+            );
             ensure!(
                 vnext || recreated,
                 InvalidConfigurationSnafu {
@@ -6479,6 +6503,7 @@ mod tests {
         let configured = |mb| {
             CayenneAccelerator::from_runtime_config(&CayenneRuntimeConfig {
                 footer_cache_mb: mb,
+                cluster_role: None,
             })
             .footer_cache_mb
         };
@@ -6522,6 +6547,7 @@ mod tests {
         let built =
             (registration.constructor)(&AcceleratorRuntimeConfig::Cayenne(CayenneRuntimeConfig {
                 footer_cache_mb: Some(321),
+                cluster_role: None,
             }))
             .expect("the Cayenne registration accepts Cayenne configuration");
         let cayenne = built

@@ -30,6 +30,7 @@ cayenne = { path = "../../cayenne", features = ["partition-table-provider"] }
 data_components = { path = "../../data_components" }
 runtime-acceleration = { path = "../../runtime-acceleration", features = ["sqlite"] }
 runtime-checkpoint-api = { path = "../../runtime-checkpoint-api" }
+runtime-component = { path = "../../runtime-component" }
 runtime-checkpoint-sqlite = { path = "../../runtime-checkpoint-sqlite" }
 runtime-object-store = { path = "../../runtime-object-store" }
 runtime-resources = { path = "../../runtime-resources" }

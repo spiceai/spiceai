@@ -364,9 +364,16 @@ impl RuntimeBuilder {
         // afterwards instead would mean naming the concrete accelerator from here.
         let cayenne_footer_cache_mb =
             parse_usize_runtime_param(&spicepod_rt.params, CAYENNE_FOOTER_CACHE_MB_PARAM);
+        // A resolved cluster configuration carries the `--role` it was resolved
+        // from; a runtime built without one takes the role from its config.
+        let role = self.resolved_cluster_config.as_ref().map_or_else(
+            || self.runtime_config.cluster.effective_role(),
+            ResolvedClusterConfig::role,
+        );
         let accelerator_configs = [data_accelerator_api::AcceleratorRuntimeConfig::Cayenne(
             data_accelerator_api::CayenneRuntimeConfig {
                 footer_cache_mb: cayenne_footer_cache_mb,
+                cluster_role: role.cluster_role(),
             },
         )];
 
@@ -378,12 +385,6 @@ impl RuntimeBuilder {
         document_parse::register_all().await;
 
         let query = spicepod_rt.query.clone().unwrap_or_default();
-        // A resolved cluster configuration carries the `--role` it was resolved
-        // from; a runtime built without one takes the role from its config.
-        let role = self.resolved_cluster_config.as_ref().map_or_else(
-            || self.runtime_config.cluster.effective_role(),
-            ResolvedClusterConfig::role,
-        );
         if role == Role::Sidecar {
             tracing::info!(
                 "Starting as a sidecar. Remote Spice reads use Substrait plans created locally."
