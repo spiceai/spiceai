@@ -39206,6 +39206,14 @@ impl CayenneTableProvider {
         Ok(CheckpointAttempt::Completed(rows))
     }
 
+    /// Run one periodic in-memory tier checkpoint tick now, as the background
+    /// task does every `cdc_mem_tier_checkpoint_interval_ms`.
+    #[doc(hidden)]
+    pub async fn run_mem_tier_checkpoint_tick_now(&self) {
+        <Self as super::compaction::MemTierCheckpointRunner>::run_mem_tier_checkpoint_tick(self)
+            .await;
+    }
+
     /// Checkpoint for a caller that already holds `write_lock`, but does not hold
     /// `mem_checkpoint_lock` (cold promotion). Serializing here prevents promotion
     /// from recapturing a tier whose background checkpoint is still encoding.

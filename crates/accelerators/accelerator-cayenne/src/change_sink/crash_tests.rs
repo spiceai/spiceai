@@ -856,6 +856,15 @@ async fn run_until_killed(
 /// first; a source position shows its value, and an inline tombstone written
 /// inactive says so.
 async fn records_after(store: &Arc<dyn ObjectStore>, after: u64) -> Vec<Vec<String>> {
+    records_between(store, after, u64::MAX).await
+}
+
+/// [`records_after`], up to and including commit `through`.
+async fn records_between(
+    store: &Arc<dyn ObjectStore>,
+    after: u64,
+    through: u64,
+) -> Vec<Vec<String>> {
     use prost::Message;
     let log = cayenne::metastore::object_native::dataset_log_at(
         Arc::clone(store),
@@ -871,7 +880,7 @@ async fn records_after(store: &Arc<dyn ObjectStore>, after: u64) -> Vec<Vec<Stri
     opened
         .records
         .into_iter()
-        .filter(|entry| entry.commit > after)
+        .filter(|entry| entry.commit > after && entry.commit <= through)
         .map(|entry| {
             object_store_occ::headlog::Group::decode(entry.record.payload)
                 .expect("group")
@@ -3308,6 +3317,427 @@ async fn a_kill_at_any_storage_request_of_memory_mode_bursts_loses_no_acknowledg
                 steps
                     .get(kill_before)
                     .map_or("past the end", String::as_str),
+                problems.join("; ")
+            ));
+        }
+    }
+    eprintln!(
+        "{} kill points; outcomes by kill point: {outcomes:?}",
+        steps.len() + 1
+    );
+    assert!(
+        failures.is_empty(),
+        "{} problems ({} kill points):\n{}",
+        failures.len(),
+        steps.len() + 1,
+        failures.join("\n")
+    );
+}
+
+// ---------------------------------------------------------------------------
+// `cdc_durability: memory`: the periodic in-memory tier checkpoint
+// ---------------------------------------------------------------------------
+
+/// [`memory_config`] where any non-empty in-memory tier is worth a periodic
+/// checkpoint well before its age deadline, so the periodic tick takes its
+/// best-effort path, and no seal advances the source in its place.
+fn tick_config() -> VortexConfig {
+    VortexConfig {
+        cdc_mem_tier_min_flush_bytes: 1,
+        cdc_mem_tier_max_age_ms: 3_600_000,
+        cdc_mem_tier_seal_age_ms: 0,
+        ..memory_config()
+    }
+}
+
+/// The bursts of the periodic-checkpoint tests, each kept in the in-memory
+/// tier and checkpointed by the tick that follows it: upserts of new keys, of
+/// a file key and of an inline key; deletes of a file key and of a key a
+/// checkpoint made durable; a re-insert of a deleted key.
+fn tick_rounds() -> Vec<(i64, Vec<(&'static str, i64)>)> {
+    vec![
+        (1, vec![("c", 200), ("c", INLINE_KEYS[0]), ("c", 5)]),
+        (
+            2,
+            vec![("d", 7), ("c", 201), ("c", INLINE_KEYS[1]), ("d", 200)],
+        ),
+        (3, vec![("c", 7), ("c", 202), ("c", 5)]),
+        (4, vec![("c", 203), ("d", 201)]),
+    ]
+}
+
+/// What one periodic tick wrote: the round it followed, the dataset head
+/// before and after it, and the indices of the storage writes it sent.
+#[derive(Debug, Clone)]
+struct TickSpan {
+    round: i64,
+    head: (u64, u64),
+    writes: Range<usize>,
+}
+
+fn writes_sent(instance: &Instance) -> usize {
+    instance
+        .steps()
+        .iter()
+        .filter(|step| !is_read(step.split(' ').next().unwrap_or_default()))
+        .count()
+}
+
+/// Submit each `(round, ops)` burst through one change sink, one at a time,
+/// tell the source what the runtime would, and run the periodic in-memory tier
+/// checkpoint tick after each, noting what it wrote in `spans`; then flush, as
+/// the runtime's checkpoint does.
+async fn run_ticked_bursts(
+    table: Arc<CayenneTableProvider>,
+    catalog: Arc<ObjectNativeCatalog>,
+    instance: Arc<Instance>,
+    bottom: Arc<dyn ObjectStore>,
+    source: Arc<SourceModel>,
+    rounds: Vec<(i64, Vec<(&'static str, i64)>)>,
+    spans: Arc<parking_lot::Mutex<Vec<TickSpan>>>,
+) -> std::result::Result<(), String> {
+    let backend = CayenneChangeSinkBackend::try_new(ChangeSinkContext::new(
+        TableReference::bare(NAME),
+        Arc::clone(&table) as Arc<dyn TableProvider>,
+    ))
+    .expect("native backend");
+    let sink = ChangeSink::new(backend, SessionContext::new(), &Handle::current(), 2);
+    sink.set_durability_observer(Arc::clone(&source) as Arc<dyn DurabilityObserver>);
+    let options = WriteOptions {
+        recovery: Recovery::Replayable,
+        ..WriteOptions::default()
+    };
+    for (round, ops) in rounds {
+        let receipt = sink
+            .reserve()
+            .await
+            .map_err(|error| error.to_string())?
+            .submit_with_position(
+                mixed_changes(&ops, round),
+                options,
+                Some(save_position(&catalog, round)),
+            )
+            .map_err(|error| error.to_string())?
+            .wait()
+            .await
+            .map_err(|error| format!("burst {round}: {error}"))?;
+        receipt
+            .published()
+            .await
+            .map_err(|error| format!("burst {round} publish: {error}"))?;
+        match receipt.durability {
+            StorageDurability::Deferred(fence) => source.enqueue(fence, round).await,
+            other => return Err(format!("burst {round} was not kept in the tier: {other:?}")),
+        }
+        let head_before = head_commit(&bottom).await;
+        let writes_before = writes_sent(&instance);
+        table.run_mem_tier_checkpoint_tick_now().await;
+        let span = TickSpan {
+            round,
+            head: (head_before, head_commit(&bottom).await),
+            writes: writes_before..writes_sent(&instance),
+        };
+        spans.lock().push(span);
+    }
+    sink.flush()
+        .await
+        .map_err(|error| format!("final flush: {error}"))?;
+    sink.begin_close()
+        .wait()
+        .await
+        .map_err(|error| format!("close: {error}"))
+}
+
+/// A process with the periodic-checkpoint table: seeded with the inline and
+/// file keys, then opened by a new process.
+async fn tick_location() -> (Location, Process) {
+    let (location, process) = Location::seeded_as(&INLINE_KEYS, &tick_config()).await;
+    process.table.quiesce().await;
+    drop(process);
+    let process = location.open_with(&tick_config()).await;
+    (location, process)
+}
+
+/// Run [`run_ticked_bursts`] in `process` until it returns or its store
+/// refuses a request, as a killed process stops there. `None` when it was
+/// killed first.
+async fn run_ticked_until_killed(
+    process: &Process,
+    bottom: &Arc<dyn ObjectStore>,
+    source: &Arc<SourceModel>,
+    rounds: Vec<(i64, Vec<(&'static str, i64)>)>,
+    spans: &Arc<parking_lot::Mutex<Vec<TickSpan>>>,
+) -> Option<std::result::Result<(), String>> {
+    let task = tokio::spawn(run_ticked_bursts(
+        Arc::clone(&process.table),
+        Arc::clone(&process.catalog),
+        Arc::clone(&process.instance),
+        Arc::clone(bottom),
+        Arc::clone(source),
+        rounds,
+        Arc::clone(spans),
+    ));
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
+    loop {
+        if task.is_finished() {
+            return Some(task.await.expect("the bursts do not panic"));
+        }
+        if process.instance.is_dead() {
+            task.abort();
+            return None;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the bursts neither finished nor were killed within 60 s"
+        );
+        tokio::time::sleep(Duration::from_millis(2)).await;
+    }
+}
+
+/// `cdc_durability: memory` bursts, each kept in the in-memory tier and then
+/// checkpointed by the periodic tick (its best-effort, size-triggered path).
+/// Each tick commits its checkpoint as one record: the snapshot's files, its
+/// sequence, and the source position it covers. The table holds exactly the
+/// bursts' outcome, before and after a reopen.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_periodic_checkpoint_of_the_in_memory_tier_commits_as_one_record() {
+    let _budget = MEM_TIER_BUDGET.read().await;
+    let (location, process) = tick_location().await;
+    let before = process.rows().await;
+    let rounds = tick_rounds();
+    let expected = rows_after(&before, &rounds);
+    let bottom = Arc::clone(&location.bottom) as Arc<dyn ObjectStore>;
+    let source = SourceModel::new(&process.catalog);
+    let spans = Arc::new(parking_lot::Mutex::new(Vec::new()));
+    let outcome = run_ticked_until_killed(&process, &bottom, &source, rounds, &spans).await;
+    let rows = process.try_rows().await;
+    let acknowledged = source.acknowledged.load(Ordering::SeqCst);
+    process.table.quiesce().await;
+    drop(process);
+    let spans = spans.lock().clone();
+    let mut ticks = Vec::new();
+    for span in &spans {
+        let records = records_between(&bottom, span.head.0, span.head.1).await;
+        eprintln!(
+            "tick after burst {}: head {} -> {}, records {records:?}",
+            span.round, span.head.0, span.head.1
+        );
+        ticks.push((span.round, records));
+    }
+    let reopened = location.open_with(&tick_config()).await;
+    let reopened_rows = reopened.rows().await;
+    let position = reopened.saved_position().await;
+    reopened.table.quiesce().await;
+    eprintln!(
+        "periodic checkpoints: outcome {outcome:?}, rows equal expected: {}, reopened equal expected: {}, position {position:?}, acknowledged round {acknowledged}",
+        rows.as_ref().ok() == Some(&expected),
+        reopened_rows == expected
+    );
+    assert_eq!(outcome, Some(Ok(())), "every burst commits");
+    assert_eq!(
+        (
+            rows.as_ref().ok() == Some(&expected),
+            reopened_rows == expected,
+            position.as_deref(),
+            acknowledged
+        ),
+        (true, true, Some("lsn 4"), 4),
+        "the bursts' exact outcome, before and after a reopen, with the last position saved and acknowledged"
+    );
+    // Each tick checkpointed the burst before it (non-vacuous: its record adds
+    // the snapshot's files), in one record that also advances its sequence and
+    // records the burst's source position.
+    let shapes: Vec<(i64, usize, bool)> = ticks
+        .iter()
+        .map(|(round, records)| {
+            let position = format!("AdvanceSourcePosition(lsn {round})");
+            (
+                *round,
+                records.len(),
+                records.iter().any(|record| {
+                    count(record, "AddFiles") > 0
+                        && count(record, "SetGroup") > 0
+                        && count(record, &position) == 1
+                }),
+            )
+        })
+        .collect();
+    assert_eq!(
+        shapes,
+        vec![(1, 1, true), (2, 1, true), (3, 1, true), (4, 1, true)],
+        "each periodic checkpoint commits its files, sequence and source position in one record: {ticks:?}"
+    );
+}
+
+/// The bursts of [`tick_rounds`], each checkpointed by the periodic tick,
+/// killed before each storage write in turn (reads, whose order varies between
+/// runs, pass until then), with the source told what the runtime tells it.
+/// After each kill, a new process holds the rows of a whole number of bursts
+/// (no burst, and no checkpoint, half applied), at least every burst the saved
+/// or acknowledged position covers; it resumes from the newer of those and
+/// replays the rest, and then holds exactly every burst's outcome.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_kill_at_any_storage_write_of_a_periodic_checkpoint_loses_no_change() {
+    let _budget = MEM_TIER_BUDGET.read().await;
+    let rounds = tick_rounds();
+    let (location, process) = tick_location().await;
+    let before = process.rows().await;
+    let expected = rows_after(&before, &rounds);
+    process.instance.clear_steps();
+    let bottom = Arc::clone(&location.bottom) as Arc<dyn ObjectStore>;
+    let source = SourceModel::new(&process.catalog);
+    let spans = Arc::new(parking_lot::Mutex::new(Vec::new()));
+    let clean = run_ticked_until_killed(&process, &bottom, &source, rounds.clone(), &spans).await;
+    let steps: Vec<String> = process
+        .instance
+        .steps()
+        .into_iter()
+        .filter(|step| !is_read(step.split(' ').next().unwrap_or_default()))
+        .collect();
+    let clean_rows = process.try_rows().await;
+    process.table.quiesce().await;
+    drop(process);
+    let spans = spans.lock().clone();
+    eprintln!(
+        "clean run: {} storage writes, outcome {clean:?}, acknowledged round {}, ticks {spans:?}",
+        steps.len(),
+        source.acknowledged.load(Ordering::SeqCst)
+    );
+    for (index, step) in steps.iter().enumerate() {
+        eprintln!("  {index:3} {step}");
+    }
+    assert_eq!(clean, Some(Ok(())), "the clean run commits every burst");
+    assert!(
+        clean_rows.as_ref().ok() == Some(&expected),
+        "the clean run's rows: {clean_rows:?}"
+    );
+    // Non-vacuous: every tick wrote.
+    assert!(
+        spans.len() == rounds.len() && spans.iter().all(|span| !span.writes.is_empty()),
+        "every tick checkpoints the burst before it: {spans:?}"
+    );
+    let in_tick = |index: usize| {
+        spans
+            .iter()
+            .find(|span| span.writes.contains(&index))
+            .map_or_else(String::new, |span| {
+                format!(", in the tick after burst {}", span.round)
+            })
+    };
+
+    let states: Vec<Vec<(i64, i64)>> = (0..=rounds.len())
+        .map(|applied| rows_after(&before, &rounds[..applied]))
+        .collect();
+    let mut outcomes: BTreeMap<String, Vec<usize>> = BTreeMap::new();
+    let mut failures = Vec::new();
+    for kill_before in 0..=steps.len() {
+        let (location, process) = tick_location().await;
+        process.instance.clear_steps();
+        process.instance.die_after_writes(kill_before);
+        let bottom = Arc::clone(&location.bottom) as Arc<dyn ObjectStore>;
+        let source = SourceModel::new(&process.catalog);
+        let spans = Arc::new(parking_lot::Mutex::new(Vec::new()));
+        let outcome =
+            run_ticked_until_killed(&process, &bottom, &source, rounds.clone(), &spans).await;
+        process.instance.kill();
+        process.table.quiesce().await;
+        drop(process);
+        let acknowledged = source.acknowledged.load(Ordering::SeqCst);
+
+        let next = location.open_with(&tick_config()).await;
+        let reopened = next.try_rows().await;
+        let position = next.saved_position().await;
+        let mut problems = Vec::new();
+        let saved = saved_round(position.as_deref()).unwrap_or_else(|error| {
+            problems.push(error);
+            0
+        });
+        let resume = saved.max(acknowledged);
+        let state = match &reopened {
+            Ok(rows) => match states.iter().position(|state| state == rows) {
+                Some(applied) => {
+                    if i64::try_from(applied).expect("round") < resume {
+                        problems.push(format!(
+                            "the rows hold {applied} bursts, but the source resumes after burst {resume}"
+                        ));
+                    }
+                    format!("after burst {applied}")
+                }
+                None => {
+                    let (applied, nearest) = states
+                        .iter()
+                        .enumerate()
+                        .min_by_key(|(_, state)| {
+                            state.iter().filter(|row| !rows.contains(row)).count()
+                                + rows.iter().filter(|row| !state.contains(row)).count()
+                        })
+                        .expect("states");
+                    let missing: Vec<_> =
+                        nearest.iter().filter(|row| !rows.contains(row)).collect();
+                    let extra: Vec<_> = rows.iter().filter(|row| !nearest.contains(row)).collect();
+                    let duplicated = rows.len()
+                        - rows.iter().map(|(id, _)| id).collect::<BTreeSet<_>>().len();
+                    problems.push(format!(
+                        "the rows are no whole number of bursts (nearest: after burst {applied}, without {missing:?}, with {extra:?}, {duplicated} duplicated keys)"
+                    ));
+                    format!("between bursts (near burst {applied})")
+                }
+            },
+            Err(error) => {
+                problems.push(format!("the reopened table refuses queries: {error}"));
+                "refused".to_string()
+            }
+        };
+        let replay: Vec<_> = rounds
+            .iter()
+            .filter(|(round, _)| *round > resume)
+            .cloned()
+            .collect();
+        let replayed = run_memory_bursts(
+            Arc::clone(&next.table),
+            Arc::clone(&next.catalog),
+            SourceModel::new(&next.catalog),
+            replay,
+        )
+        .await;
+        let rows = next.try_rows().await;
+        next.table.quiesce().await;
+        outcomes
+            .entry(format!(
+                "{state}, saved {saved}, acknowledged {acknowledged}"
+            ))
+            .or_default()
+            .push(kill_before);
+        if let Err(error) = &replayed {
+            problems.push(format!("the replay failed: {error}"));
+        }
+        match rows {
+            Ok(rows) if rows == expected => {}
+            Ok(rows) => {
+                let missing: Vec<_> = expected
+                    .iter()
+                    .filter(|row| !rows.contains(row))
+                    .take(5)
+                    .collect();
+                let extra: Vec<_> = rows
+                    .iter()
+                    .filter(|row| !expected.contains(row))
+                    .take(5)
+                    .collect();
+                problems.push(format!(
+                    "after the replay from burst {} the rows differ from every burst's outcome: missing {missing:?}, extra {extra:?}",
+                    resume + 1
+                ));
+            }
+            Err(error) => problems.push(format!("the replayed table refuses queries: {error}")),
+        }
+        if !problems.is_empty() {
+            failures.push(format!(
+                "killed before write {kill_before} ({}{}), outcome {outcome:?}, reopened {state}, saved {saved}, acknowledged {acknowledged}: {}",
+                steps
+                    .get(kill_before)
+                    .map_or("past the end", String::as_str),
+                in_tick(kill_before),
                 problems.join("; ")
             ));
         }
