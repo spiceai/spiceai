@@ -74,6 +74,13 @@ def dockerfile(
     return "\n".join(lines) + "\n"
 
 
+UNUSED_STAGE = (
+    "{} copies libduckdb only into a build stage the final image does not include: copy it to "
+    "/usr/lib/libduckdb.so in the final stage, or to /spice_sandbox/usr/lib/libduckdb.so in the stage "
+    "whose /spice_sandbox/ the final stage copies onto /"
+)
+
+
 class CheckTest(unittest.TestCase):
     def run_check(self, files: dict[str, str]) -> list[str]:
         with tempfile.TemporaryDirectory() as tmp:
@@ -100,9 +107,9 @@ class CheckTest(unittest.TestCase):
                     "Dockerfile": dockerfile(),
                     # An amd64-only image needs no arm64 checksum, and a sandboxed
                     # image may copy into the sandbox root it copies onto /.
-                    "Dockerfile-cuda-release": dockerfile(arm64=None, platforms=("linux-amd64",)).replace(
-                        "/usr/lib/", "/spice_sandbox/usr/lib/"
-                    )
+                    "Dockerfile-cuda-release": dockerfile(arm64=None, platforms=("linux-amd64",))
+                    .replace("/usr/lib/", "/spice_sandbox/usr/lib/")
+                    .replace("FROM ubuntu:26.04\n", "FROM ubuntu:26.04 AS sandbox-setup\n")
                     + "FROM scratch\nCOPY --from=sandbox-setup /spice_sandbox/ /\n",
                 }
             ),
@@ -172,15 +179,24 @@ class CheckTest(unittest.TestCase):
         sandboxed = dockerfile().replace(" /usr/lib/", " /spice_sandbox/usr/lib/")
         self.assertEqual(
             self.run_check({"Dockerfile": sandboxed}),
-            [
-                "Dockerfile copies libduckdb to /spice_sandbox/usr/lib/libduckdb.so but never copies "
-                "/spice_sandbox/ onto / in the final image, so spiced cannot find the library"
-            ],
+            [UNUSED_STAGE.format("Dockerfile")],
+        )
+        # The final stage must copy the sandbox root of the stage that holds the library.
+        sandboxed = sandboxed.replace("FROM ubuntu:26.04\n", "FROM ubuntu:26.04 AS sandbox-setup\n")
+        self.assertEqual(
+            self.run_check({"Dockerfile": sandboxed + "FROM scratch\nCOPY --from=libduckdb /spice_sandbox/ /\n"}),
+            [UNUSED_STAGE.format("Dockerfile")],
         )
         self.assertEqual(
             self.run_check({"Dockerfile": sandboxed + "FROM scratch\nCOPY --from=sandbox-setup /spice_sandbox/ /\n"}),
             [],
         )
+
+    def test_copy_into_a_stage_the_image_does_not_include_fails(self):
+        unused = dockerfile().replace("FROM ubuntu:26.04\n", "FROM ubuntu:26.04 AS unused\n") + "FROM ubuntu:26.04\n"
+        self.assertEqual(self.run_check({"Dockerfile": unused}), [UNUSED_STAGE.format("Dockerfile")])
+        # A final stage built FROM the stage that copied the library includes it.
+        self.assertEqual(self.run_check({"Dockerfile": unused.replace("FROM ubuntu:26.04\n", "FROM unused\n")}), [])
 
     def test_commented_out_verification_fails(self):
         # Docker drops the commented line from the continued RUN, so nothing

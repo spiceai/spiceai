@@ -37,14 +37,15 @@ ARGS = {
     "DUCKDB_SHA256_AMD64": "linux-amd64",
     "DUCKDB_SHA256_ARM64": "linux-arm64",
 }
-# The library must land on the default library path of the image, or of the
-# sandbox root a scratch-based image is assembled from.
+# The library must land on the default library path of the final image: copied
+# there by the final stage (or a stage it is built `FROM`), or copied into the
+# sandbox root of a stage whose whole `/spice_sandbox/` the final stage copies
+# onto `/`. A copy in any other stage never reaches the image.
+FROM_RE = re.compile(r"^FROM\s+(?:--\S+\s+)*(\S+)(?:\s+AS\s+(\S+))?\s*$", re.M | re.I)
 COPY_RE = re.compile(
     r"^COPY\s+--from=\S+\s+/root/libduckdb\.so\s+(/spice_sandbox)?/usr/lib/libduckdb\.so\s*$", re.M
 )
-# A sandbox destination reaches the library path only when the final image
-# copies the whole sandbox root onto `/`.
-SANDBOX_ROOT_RE = re.compile(r"^COPY\s+--from=\S+\s+/spice_sandbox/?\s+/\s*$", re.M)
+SANDBOX_ROOT_RE = re.compile(r"^COPY\s+--from=(\S+)\s+/spice_sandbox/?\s+/\s*$", re.M)
 # Docker drops a line whose first non-blank character is `#`, even inside a
 # continued RUN, so a commented-out step must not count.
 COMMENT_RE = re.compile(r"^\s*#.*\n?", re.M)
@@ -83,6 +84,54 @@ def download_errors(name: str, text: str) -> list[str]:
             f"{name} verifies the DuckDB archive against {checksum}: use ${{DUCKDB_SHA256_AMD64}} or ${{DUCKDB_SHA256_ARM64}}"
         )
     return errors
+
+
+def stages(text: str) -> list[tuple[str, str | None, str]]:
+    """Each build stage as (base image or stage, name, body)."""
+    matches = list(FROM_RE.finditer(text))
+    return [
+        (m.group(1), m.group(2), text[m.end() : matches[i + 1].start() if i + 1 < len(matches) else len(text)])
+        for i, m in enumerate(matches)
+    ]
+
+
+def lineage(all_stages: list[tuple[str, str | None, str]], index: int) -> list[str]:
+    """The bodies of a stage and of every stage it is built `FROM`."""
+    by_name = {name.lower(): i for i, (_, name, _) in enumerate(all_stages[:index]) if name}
+    bodies = []
+    while index is not None:
+        base, _, body = all_stages[index]
+        bodies.append(body)
+        index = by_name.get(base.lower())
+    return bodies
+
+
+def copy_errors(name: str, text: str) -> list[str]:
+    all_stages = stages(text)
+    if not all_stages:
+        return [f"{name} has no FROM"]
+    names = {stage_name.lower(): i for i, (_, stage_name, _) in enumerate(all_stages) if stage_name}
+    final = lineage(all_stages, len(all_stages) - 1)
+    # An empty group is a copy straight to /usr/lib in the image itself.
+    if any("" in COPY_RE.findall(body) for body in final):
+        return []
+    for body in final:
+        for source in SANDBOX_ROOT_RE.findall(body):
+            index = names.get(source.lower())
+            if index is not None and any(
+                "/spice_sandbox" in COPY_RE.findall(b) for b in lineage(all_stages, index)
+            ):
+                return []
+    if COPY_RE.search(text):
+        return [
+            f"{name} copies libduckdb only into a build stage the final image does not include: copy it to "
+            "/usr/lib/libduckdb.so in the final stage, or to /spice_sandbox/usr/lib/libduckdb.so in the stage "
+            "whose /spice_sandbox/ the final stage copies onto /"
+        ]
+    return [
+        f"{name} downloads libduckdb but never copies it to /usr/lib/libduckdb.so "
+        "(or /spice_sandbox/usr/lib/libduckdb.so in a sandboxed image)"
+    ]
 
 
 def dockerfiles(root: Path) -> list[Path]:
@@ -132,17 +181,7 @@ def check(root: Path) -> list[str]:
                     f"{arg}={expected[arg]}"
                 )
         errors.extend(download_errors(path.name, text))
-        copies = COPY_RE.findall(text)
-        if not copies:
-            errors.append(
-                f"{path.name} downloads libduckdb but never copies it to /usr/lib/libduckdb.so "
-                "(or /spice_sandbox/usr/lib/libduckdb.so in a sandboxed image)"
-            )
-        elif all(copies) and not SANDBOX_ROOT_RE.search(text):
-            errors.append(
-                f"{path.name} copies libduckdb to /spice_sandbox/usr/lib/libduckdb.so but never copies "
-                "/spice_sandbox/ onto / in the final image, so spiced cannot find the library"
-            )
+        errors.extend(copy_errors(path.name, text))
     return errors
 
 
