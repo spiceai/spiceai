@@ -232,7 +232,7 @@ impl CayenneChangeSinkBackend {
             && !groups
                 .iter()
                 .any(|(op, _)| matches!(op, ChangeOperationType::Truncate))
-            && !(self.buffers_cdc_in_memory() && self.is_replayable(&batch, &groups, options));
+            && (!self.buffers_cdc_in_memory() || !self.is_replayable(&batch, &groups, options));
         if !same_record {
             return self.apply_cdc_groups(batch, options, ctx).await;
         }

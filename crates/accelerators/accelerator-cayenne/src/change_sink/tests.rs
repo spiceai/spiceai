@@ -203,7 +203,6 @@ async fn write_opaque_metadata_preserves_provider_fallback() {
 
 #[tokio::test]
 async fn rebuildable_transition_preserves_replayable_cdc_durability_fence() {
-    let _budget = super::crash_tests::MEM_TIER_BUDGET.read().await;
     use arrow::{
         array::{ListArray, StringArray, StructArray},
         buffer::OffsetBuffer,
@@ -224,6 +223,7 @@ async fn rebuildable_transition_preserves_replayable_cdc_durability_fence() {
             Ok(())
         }
     }
+    let _budget = super::crash_tests::MEM_TIER_BUDGET.read().await;
     let ctx = SessionContext::new();
     let (table, _dir) = table(&ctx, 1).await;
     let backend = CayenneChangeSinkBackend::try_new(ChangeSinkContext::new(
@@ -487,11 +487,11 @@ impl Xorshift {
 /// own body.
 #[tokio::test]
 async fn cache_replacements_by_key_match_the_scope_delete() {
-    let _budget = super::crash_tests::MEM_TIER_BUDGET.read().await;
     const PATHS: [&str; 3] = ["/v1/devices", "/v1/sites", "/v1/users"];
     const QUERIES: [&str; 6] = ["a=1", "a=2", "a=3", "a=4", "a=5", "a=6"];
     const BODIES: [Option<&str>; 2] = [None, Some("{\"page\":2}")];
     const WRITES: usize = 200;
+    let _budget = super::crash_tests::MEM_TIER_BUDGET.read().await;
     // Replaced a stored key, replaced an absent key, refused, empty kept, empty deleted.
     let mut seen = [0_usize; 5];
     for seed in 1..=4_u64 {
