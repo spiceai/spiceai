@@ -149,8 +149,8 @@ pub enum ManagedDuckDbError {
 ///
 /// - 1.4 cannot stage `DuckLake` writes: its ADBC ingest creates the
 ///   "temporary" stage as a regular table in the default database, and one
-///   transaction cannot then write the lake. 1.4 LTS also reaches end of
-///   community support on 2026-11-17.
+///   transaction cannot then write the lake. For 1.4's support status, see
+///   <https://duckdb.org/release_calendar>.
 /// - 1.5.0 and 1.5.1 return no rows for `WHERE b = true` or `WHERE b = false`
 ///   on a boolean column of a `DuckLake` table, so their reads are wrong.
 pub const MINIMUM_DUCKDB_VERSION: &str = "1.5.2";
