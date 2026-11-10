@@ -34,6 +34,9 @@ spicepod:
 
 defaults:
   expect: { oracle: src }
+  # Either writer may win the race for row 5, so instances can hold different
+  # owners; every instance is checked against its own source instead.
+  compare-variants: false
 
 steps:
   - source-exec:
