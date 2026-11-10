@@ -4357,6 +4357,7 @@ impl ExecutionPlan for CachingAccelerationScanExec {
                             batch_write_tx.clone(),
                             namespace.clone(),
                             Arc::clone(&in_flight_revalidations),
+                            lookup_started_at,
                         )
                         .await;
                         combined = Box::pin(RecordBatchStreamAdapter::new(
