@@ -403,6 +403,14 @@ async fn placed_writes_and_reopen(location: &Location) {
         events_rows,
         "events: rows after the compaction"
     );
+    eprintln!(
+        "copies after the compaction: {}",
+        store
+            .log()
+            .iter()
+            .filter(|applied| matches!(applied.op, Op::Copy))
+            .count()
+    );
     events_rows.retain(|id, _| !(1001..=1500).contains(id));
     write(
         &store,

@@ -405,7 +405,14 @@ pub async fn build_unmetered_object_store(
             })?);
 
         let prefix = if cayenne {
-            feature_prefix(url.path().trim_matches('/'))
+            // The directory's own key, decoded from the URL: `my dir`, not `my%20dir`.
+            let key = object_store::path::Path::from_absolute_path(&local_path).map_err(|_| {
+                Error::InvalidFileLocation {
+                    usage,
+                    location: state_location.to_string(),
+                }
+            })?;
+            feature_prefix(key.as_ref())
         } else {
             feature_prefix("")
         };
@@ -755,12 +762,13 @@ mod tests {
     /// Cayenne's store for a `file://` location is keyed by absolute paths, as
     /// an S3 store is keyed from its bucket's root: its prefix is the location's
     /// path and the `cayenne` folder, and an object under it is the file the
-    /// `file://` URL of the same path names.
+    /// `file://` URL of the same path names, with the URL's percent-encoding
+    /// decoded.
     #[tokio::test]
     async fn runtime_state_file_location_keys_cayenne_by_absolute_path() {
         let temp_dir = tempfile::tempdir().expect("create temp dir");
-        let state_dir = temp_dir.path().join("state");
-        let state_location = format!("file://{}/", state_dir.display());
+        let state_dir = temp_dir.path().join("nested state");
+        let state_location = format!("file://{}/", state_dir.display()).replace(' ', "%20");
         for feature in [StateFeature::CayenneMetastore, StateFeature::CayenneData] {
             let (store, prefix) = build_object_store(
                 secrets(),
