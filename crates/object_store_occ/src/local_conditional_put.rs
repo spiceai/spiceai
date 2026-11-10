@@ -38,7 +38,8 @@ limitations under the License.
 //!
 //! Copies, renames, and multipart uploads are delegated and publish without
 //! the lock, so write a key that conditional updates guard through `put_opts`
-//! alone.
+//! alone. A durable store syncs a multipart upload's file and directories when
+//! it completes.
 //!
 //! **Concurrency model**: each put takes an advisory lock for the object's
 //! directory. Two clients whose roots and keys name the same file
@@ -588,6 +589,52 @@ fn publish(
     })
 }
 
+/// A multipart upload of a durable store: the upload is `LocalFileSystem`'s,
+/// which writes a staged `{path}#{n}` file and renames it into place on
+/// completion without syncing, so completion then syncs the file, its
+/// directory, and each directory the upload created into its parent, up to the
+/// nearest directory that existed when it started.
+#[derive(Debug)]
+struct DurableUpload {
+    inner: Box<dyn MultipartUpload>,
+    path: PathBuf,
+    existing: Option<PathBuf>,
+}
+
+#[async_trait]
+impl MultipartUpload for DurableUpload {
+    fn put_part(&mut self, data: PutPayload) -> object_store::UploadPart {
+        self.inner.put_part(data)
+    }
+
+    async fn complete(&mut self) -> Result<PutResult, ObjectStoreError> {
+        let result = self.inner.complete().await?;
+        let path = self.path.clone();
+        let existing = self.existing.clone();
+        tokio::task::spawn_blocking(move || -> Result<(), ObjectStoreError> {
+            std::fs::File::open(&path)
+                .and_then(|file| file.sync_all())
+                .map_err(worker_error)?;
+            for directory in path.ancestors().skip(1) {
+                std::fs::File::open(directory)
+                    .and_then(|handle| handle.sync_all())
+                    .map_err(worker_error)?;
+                if existing.as_deref().is_none_or(|stop| directory == stop) {
+                    break;
+                }
+            }
+            Ok(())
+        })
+        .await
+        .map_err(worker_error)??;
+        Ok(result)
+    }
+
+    async fn abort(&mut self) -> Result<(), ObjectStoreError> {
+        self.inner.abort().await
+    }
+}
+
 impl std::fmt::Debug for LocalConditionalPut {
     fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
         f.debug_struct("LocalConditionalPut")
@@ -747,7 +794,30 @@ impl ObjectStore for LocalConditionalPut {
         if is_publication_lock(location) {
             return Err(reserved_lock_error(location));
         }
-        self.inner.put_multipart_opts(location, opts).await
+        if !self.durable {
+            return self.inner.put_multipart_opts(location, opts).await;
+        }
+        // The upload creates the directories it needs when it starts; the ones
+        // below the nearest that exists now are synced into their parents when
+        // it completes.
+        let path = self.inner.path_to_filesystem(location)?;
+        let base = self.base.clone();
+        let (path, existing) = tokio::task::spawn_blocking(move || {
+            let existing = path
+                .ancestors()
+                .skip(1)
+                .find(|ancestor| ancestor.is_dir() || *ancestor == base)
+                .map(std::path::Path::to_path_buf);
+            (path, existing)
+        })
+        .await
+        .map_err(worker_error)?;
+        let inner = self.inner.put_multipart_opts(location, opts).await?;
+        Ok(Box::new(DurableUpload {
+            inner,
+            path,
+            existing,
+        }))
     }
 
     async fn get_opts(
