@@ -1367,10 +1367,25 @@ impl<'a> AppendMutationWriter<'a> {
                 WriteKind::Statement => self.table.collapse_buffered_write(batches)?,
                 WriteKind::ChangeStream => self.table.collapse_buffered_changes(batches)?,
             };
-            Box::pin(RecordBatchStreamAdapter::new(
+            let collapsed = Box::pin(RecordBatchStreamAdapter::new(
                 schema,
                 futures::stream::iter(batches.into_iter().map(Ok)),
-            )) as SendableRecordBatchStream
+            )) as SendableRecordBatchStream;
+            // Collapsed, the write repeats no key, so it publishes through the
+            // resolved append: one transaction carries its rows, the versions it
+            // supersedes and the `retention_sql` delete over the resident rows
+            // it keeps, published together.
+            if streaming && let Some(resolver) = self.table.key_resolver()? {
+                return self
+                    .write_resolving_repeats_after(
+                        collapsed,
+                        resolver,
+                        write_guard,
+                        checkpoint_guard,
+                    )
+                    .await;
+            }
+            collapsed
         } else {
             data
         };
