@@ -1634,6 +1634,12 @@ impl<'a> AppendMutationWriter<'a> {
     /// complete new current snapshot (`begin_retention_append_generation`): its
     /// rows, the previous generation's files carried over, and the deletes of
     /// both, committed by the overwrite's atomic `current_snapshot_id` flip.
+    ///
+    /// Before the flip commits the catalog names the previous generation, after
+    /// it the new one; nothing in between is durable. An append to a table
+    /// without a primary key is NOT idempotent: a source that redelivers an
+    /// append whose flip committed but whose acknowledgement was lost appends
+    /// its rows again (the at-least-once delivery such tables already have).
     async fn write_unkeyed_retention_generation(
         &self,
         data: SendableRecordBatchStream,
