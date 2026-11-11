@@ -125,6 +125,7 @@
   "postgres-write-back-concurrency": 39,
   "postgres-write-back-outage": 8,
   "postgres-write-back-roundtrip": 30,
+  "probe-zero-ttl-count": 40,
   "projected-subquery-differential": 53,
   "pushdown-shapes": 15,
   "query-coverage": 22,
