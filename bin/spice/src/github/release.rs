@@ -255,9 +255,20 @@ pub fn replace_current_exe(binary: &[u8]) -> Result<std::path::PathBuf, GitHubEr
     Ok(current_exe)
 }
 
-/// Move `new_binary`, a file in `current_exe`'s directory, to `current_exe` and make it
-/// executable.
+/// Make `new_binary`, a file in `current_exe`'s directory, executable, then move it to
+/// `current_exe`.
 fn swap_into_current_exe(new_binary: &Path, current_exe: &Path) -> Result<(), GitHubError> {
+    // Executable before it takes the path, so that a `spice` started right after the rename
+    // can run it, and an interrupted upgrade cannot leave the CLI without its execute bit.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let permissions = std::fs::Permissions::from_mode(0o755);
+        std::fs::set_permissions(new_binary, permissions).map_err(|e| GitHubError::Io {
+            message: format!("Failed to set executable permissions: {e}"),
+        })?;
+    }
+
     // We cannot overwrite a running executable directly — Linux returns ETXTBSY and
     // Windows locks the file. Use rename to atomically swap the directory entry: the
     // old inode stays alive (referenced by the running process) while the new binary
@@ -278,16 +289,6 @@ fn swap_into_current_exe(new_binary: &Path, current_exe: &Path) -> Result<(), Gi
     std::fs::rename(new_binary, current_exe).map_err(|e| GitHubError::Io {
         message: format!("Failed to replace CLI binary: {e}"),
     })?;
-
-    // Make the binary executable on Unix
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let permissions = std::fs::Permissions::from_mode(0o755);
-        std::fs::set_permissions(current_exe, permissions).map_err(|e| GitHubError::Io {
-            message: format!("Failed to set executable permissions: {e}"),
-        })?;
-    }
 
     Ok(())
 }
