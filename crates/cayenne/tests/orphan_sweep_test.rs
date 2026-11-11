@@ -1210,7 +1210,11 @@ async fn a_flat_orphan_is_reclaimed_after_the_floor_and_live_and_retired_keys_ar
         .filter(|key| !remaining.contains(key))
         .collect();
     lost.sort();
-    assert_eq!(lost, Vec::<&String>::new(), "live and retired keys are kept");
+    assert_eq!(
+        lost,
+        Vec::<&String>::new(),
+        "live and retired keys are kept"
+    );
     assert_eq!(placed.count().await.expect("count"), (3200, 3200));
 }
 

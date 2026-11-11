@@ -127,9 +127,14 @@ enum Payload {
 #[serde(tag = "record", rename_all = "snake_case")]
 enum Record {
     /// The uploaded files join the live set.
-    AddFiles { files: Vec<File> },
+    AddFiles {
+        files: Vec<File>,
+    },
     /// The files leave the live set.
-    RemoveFiles { files: Vec<File>, retire: Vec<File> },
+    RemoveFiles {
+        files: Vec<File>,
+        retire: Vec<File>,
+    },
     /// `remove` leave the live set, `add` join it, and `carry` stay in place.
     ReplaceFiles {
         remove: Vec<File>,
@@ -144,9 +149,13 @@ enum Record {
         add: Vec<File>,
         retire: Vec<File>,
     },
-    Resolve { commit: bool },
+    Resolve {
+        commit: bool,
+    },
     /// Retired files whose deletes returned.
-    ForgetRetired { files: Vec<File> },
+    ForgetRetired {
+        files: Vec<File>,
+    },
 }
 impl Record {
     /// The live files this record removes.
@@ -553,11 +562,14 @@ impl Replay {
         // The safe writer retires only the files a record removes: a trace
         // that retires a file its record keeps live cannot be followed.
         for f in model_retired.keys() {
-            require(head.retired.contains_key(f) || !head.live.contains(f), || {
-                format!(
-                    "the trace retires {f:?}, which stays live: a record retires only the files it removes"
-                )
-            })?;
+            require(
+                head.retired.contains_key(f) || !head.live.contains(f),
+                || {
+                    format!(
+                        "the trace retires {f:?}, which stays live: a record retires only the files it removes"
+                    )
+                },
+            )?;
         }
         require(head.retired == model_retired, || {
             format!(
@@ -650,7 +662,9 @@ impl Replay {
             DataFileCommitKind::Append => (vec![], vec![]),
             DataFileCommitKind::Compact | DataFileCommitKind::Prepare => (vec![], live.clone()),
             DataFileCommitKind::CompactCarry => (
-                live.get(..1).ok_or("carry from an empty live set")?.to_vec(),
+                live.get(..1)
+                    .ok_or("carry from an empty live set")?
+                    .to_vec(),
                 live[1..].to_vec(),
             ),
             DataFileCommitKind::Remove => (
@@ -869,9 +883,10 @@ impl Replay {
                     self.attempts[wire.attempt].applied = true;
                     let covered: &[&'static str] = match &self.attempts[wire.attempt].record {
                         Some(Record::AddFiles { .. }) => &["AddFiles committed"],
-                        Some(Record::RemoveFiles { .. }) => {
-                            &["RemoveFiles committed", "file retired by the record that removed it"]
-                        }
+                        Some(Record::RemoveFiles { .. }) => &[
+                            "RemoveFiles committed",
+                            "file retired by the record that removed it",
+                        ],
                         Some(Record::ReplaceFiles { carry, .. }) if !carry.is_empty() => &[
                             "ReplaceFiles committed",
                             "file carried in place",
@@ -1207,10 +1222,11 @@ impl Replay {
                 let real = if head.prepared.is_some() {
                     false
                 } else {
-                    let payload =
-                        result(serde_json::to_vec(&Payload::Record(Record::ForgetRetired {
+                    let payload = result(serde_json::to_vec(&Payload::Record(
+                        Record::ForgetRetired {
                             files: sweep.files.clone(),
-                        })))?;
+                        },
+                    )))?;
                     let mut log = self.writer(generation).await?;
                     match log.prepare(Bytes::from(payload)).await {
                         Ok(receipt) => matches!(
@@ -1303,9 +1319,14 @@ impl Replay {
             }
             // The query's start sends nothing; the reader records the tick.
             DataFileOp::RemoteStarted { at } => {
-                let remote = self.remote.as_mut().ok_or("remote start without a confirm")?;
+                let remote = self
+                    .remote
+                    .as_mut()
+                    .ok_or("remote start without a confirm")?;
                 require(
-                    remote.started.is_none() && at == self.now && self.now <= remote.confirmed + STALENESS,
+                    remote.started.is_none()
+                        && at == self.now
+                        && self.now <= remote.confirmed + STALENESS,
                     || {
                         format!(
                             "remote start at {at} (clock {}), confirmed at {} for v{}",
@@ -1322,7 +1343,10 @@ impl Replay {
             } => {
                 let (f, started, last) = {
                     let remote = self.remote.as_ref().ok_or("remote fetch without a query")?;
-                    let f = *remote.files.get(remote.next).ok_or("remote fetch past its files")?;
+                    let f = *remote
+                        .files
+                        .get(remote.next)
+                        .ok_or("remote fetch past its files")?;
                     let started = remote.started.ok_or("remote fetch before its start")?;
                     (f, started, remote.next + 1 == remote.files.len())
                 };

@@ -3109,7 +3109,12 @@ async fn unnamed_current_files(
         .await
         .expect("manifest")
         .into_iter()
-        .map(|file| format!("{}/{}/{}", setup.data_prefix, stored.table_id, file.file_path))
+        .map(|file| {
+            format!(
+                "{}/{}/{}",
+                setup.data_prefix, stored.table_id, file.file_path
+            )
+        })
         .collect();
     let current = format!("{}/{}/", setup.data_prefix, stored.table_id);
     objects_under(setup, &current, ".vortex")
@@ -3812,8 +3817,12 @@ async fn a_subset_compaction_copies_nothing() {
             // The picked files are retired, and the rest are carried under their keys.
             !retired.is_empty(),
             source_files.difference(&retired).count() > 0,
-            source_files.difference(&retired).all(|key| named.contains(key)),
-            retired.iter().all(|key| !key.contains('/') && source_files.contains(key)),
+            source_files
+                .difference(&retired)
+                .all(|key| named.contains(key)),
+            retired
+                .iter()
+                .all(|key| !key.contains('/') && source_files.contains(key)),
             (reader_rows, reader_sum),
             count_and_sum(&ctx, "events").await,
         ),
@@ -3869,7 +3878,11 @@ async fn failed_operation_fixture(
         )
         .await;
         table.install_slot_advancer(Arc::new(NoopSlotAdvancer));
-        cdc_upsert(&table, &(1..=500).map(|id| (id, id * 10)).collect::<Vec<_>>()).await;
+        cdc_upsert(
+            &table,
+            &(1..=500).map(|id| (id, id * 10)).collect::<Vec<_>>(),
+        )
+        .await;
         table.drain_in_flight_maintenance().await.expect("drain");
         return (setup, catalog, table, ctx, None);
     }
@@ -4023,8 +4036,8 @@ async fn a_failed_request_of_a_placed_write_deletes_only_its_own_uploads() {
                     .collect();
                 for applied in &setup.faults.log()[seen..] {
                     let path = applied.path.as_ref();
-                    let in_data = path.starts_with(&setup.data_prefix)
-                        || setup.data_prefix.starts_with(path);
+                    let in_data =
+                        path.starts_with(&setup.data_prefix) || setup.data_prefix.starts_with(path);
                     if !in_data {
                         continue;
                     }

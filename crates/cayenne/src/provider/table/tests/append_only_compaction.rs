@@ -1050,14 +1050,12 @@ async fn a_late_append_during_compaction_is_carried_without_a_copy() {
 
     provider.quiesce().await;
     let reopen_ctx = SessionContext::new();
-    let reopened = CayenneTableProviderBuilder::new(
-        Arc::new(open_catalog().await),
-        reopen_ctx.runtime_env(),
-    )
-    .with_object_store(store_config())
-    .open(NAME)
-    .await
-    .expect("reopen the placed table");
+    let reopened =
+        CayenneTableProviderBuilder::new(Arc::new(open_catalog().await), reopen_ctx.runtime_env())
+            .with_object_store(store_config())
+            .open(NAME)
+            .await
+            .expect("reopen the placed table");
     assert_eq!(
         (
             committed,

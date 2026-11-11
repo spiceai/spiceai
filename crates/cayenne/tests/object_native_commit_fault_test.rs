@@ -1467,7 +1467,6 @@ fn protected_snapshot<'a>(
     }
 }
 
-
 /// One data file of `snapshot`, so retiring the snapshot retires a file.
 fn one_file(table_id: &str, snapshot: &str) -> [cayenne::metadata::SnapshotFile; 1] {
     [cayenne::metadata::SnapshotFile {

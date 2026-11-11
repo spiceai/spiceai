@@ -183,7 +183,11 @@ impl TableState {
             .keys()
             .filter(|(snapshot, _)| live.contains(snapshot.as_str()))
             .map(|(snapshot, path)| self.file_key(snapshot, path))
-            .chain(self.delete_files.values().map(|dv| self.delete_file_key(dv)))
+            .chain(
+                self.delete_files
+                    .values()
+                    .map(|dv| self.delete_file_key(dv)),
+            )
             .collect()
     }
 
@@ -191,8 +195,10 @@ impl TableState {
     fn is_live_key(&self, key: &str) -> bool {
         let live = self.live_snapshots();
         let in_live_snapshot = if self.flat {
-            live.iter()
-                .any(|snapshot| self.files.contains_key(&((*snapshot).to_string(), key.to_string())))
+            live.iter().any(|snapshot| {
+                self.files
+                    .contains_key(&((*snapshot).to_string(), key.to_string()))
+            })
         } else {
             key.split_once('/').is_some_and(|(snapshot, path)| {
                 live.contains(snapshot)
@@ -201,7 +207,11 @@ impl TableState {
                         .contains_key(&(snapshot.to_string(), path.to_string()))
             })
         };
-        in_live_snapshot || self.delete_files.values().any(|dv| self.delete_file_key(dv) == key)
+        in_live_snapshot
+            || self
+                .delete_files
+                .values()
+                .any(|dv| self.delete_file_key(dv) == key)
     }
 
     /// The live data files by path, with the snapshot that holds each. This is
@@ -872,7 +882,9 @@ impl DatasetState {
                         !live.contains(snapshot)
                             && forgotten.contains(file_key(flat, snapshot, path).as_str())
                     };
-                    table.files.retain(|(snapshot, path), _| !gone(snapshot, path));
+                    table
+                        .files
+                        .retain(|(snapshot, path), _| !gone(snapshot, path));
                     table
                         .file_stats
                         .retain(|(snapshot, path), _| !gone(snapshot, path));
@@ -1275,7 +1287,9 @@ mod tests {
         // A deletion vector, keyed relative to the table's path, retires when
         // it is removed.
         state.apply(&one(add_dv("t", "d1", "g3"))).expect("add dv");
-        state.apply(&one(remove_dvs("t", &["d1"]))).expect("drop dv");
+        state
+            .apply(&one(remove_dvs("t", &["d1"])))
+            .expect("drop dv");
         assert_eq!(
             retired(&state, "t"),
             ["g1/x", "g2/y", "g3/deletions/d1.arrow", "s/a"]
@@ -1347,7 +1361,10 @@ mod tests {
             .expect("compact, carrying a.vortex");
         assert_eq!(retired(&state, "t"), ["b.vortex"]);
         assert_eq!(
-            state.tables["t"].live_keys().into_iter().collect::<Vec<_>>(),
+            state.tables["t"]
+                .live_keys()
+                .into_iter()
+                .collect::<Vec<_>>(),
             ["a.vortex", "c.vortex"]
         );
 
@@ -1380,7 +1397,9 @@ mod tests {
             })
             .expect("replace s");
         state.apply(&one(add_dv("t", "d1", "s2"))).expect("add dv");
-        state.apply(&one(remove_dvs("t", &["d1"]))).expect("drop dv");
+        state
+            .apply(&one(remove_dvs("t", &["d1"])))
+            .expect("drop dv");
         assert_eq!(retired(&state, "t"), ["s/a", "s2/deletions/d1.arrow"]);
         let settled = state.clone();
 
@@ -1404,10 +1423,7 @@ mod tests {
             state.clone()
         };
         let readd = state.apply(&Record {
-            actions: vec![
-                remove_groups("t", &[]),
-                files("t", "s2", &["a"]),
-            ],
+            actions: vec![remove_groups("t", &[]), files("t", "s2", &["a"])],
         });
         assert!(readd.is_ok(), "s2/a is a new key: {readd:?}");
         let carry_back = state.apply(&one(set_group("t", "s")));
@@ -1434,7 +1450,9 @@ mod tests {
         assert!(state.tables["t"].groups.is_empty());
 
         // In a flat table a compaction cannot carry a file it retired.
-        state.apply(&one(create_at("u", true))).expect("create flat");
+        state
+            .apply(&one(create_at("u", true)))
+            .expect("create flat");
         state.apply(&one(files("u", "s", &["a"]))).expect("append");
         state
             .apply(&Record {

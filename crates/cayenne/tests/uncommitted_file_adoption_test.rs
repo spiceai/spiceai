@@ -490,10 +490,7 @@ impl Rig {
         let orphan = format!("orphan-{}.vortex", uuid::Uuid::now_v7().simple());
         self.raw
             .put(
-                &Path::from(format!(
-                    "{}/{table_id}/{orphan}",
-                    table.data_prefix
-                )),
+                &Path::from(format!("{}/{table_id}/{orphan}", table.data_prefix)),
                 bytes.into(),
             )
             .await

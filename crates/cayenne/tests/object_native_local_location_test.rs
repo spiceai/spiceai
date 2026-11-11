@@ -638,17 +638,17 @@ async fn a_compacted_and_key_deleted_local_dataset_reopens_without_a_rebuild() {
     // On disk each table's directory holds no folder but `deletions`.
     let mut folders = Vec::new();
     for (name, _, data_url, table) in &placed {
-        let table_dir = std::path::PathBuf::from(
-            data_url
-                .strip_prefix("file://")
-                .expect("a local data url"),
-        )
-        .join(table.table_id());
+        let table_dir =
+            std::path::PathBuf::from(data_url.strip_prefix("file://").expect("a local data url"))
+                .join(table.table_id());
         let mut found: Vec<String> = std::fs::read_dir(&table_dir)
             .expect("table directory")
             .map(|entry| entry.expect("entry").path())
             .filter(|path| path.is_dir())
-            .filter_map(|path| path.file_name().map(|name| name.to_string_lossy().to_string()))
+            .filter_map(|path| {
+                path.file_name()
+                    .map(|name| name.to_string_lossy().to_string())
+            })
             .collect();
         found.sort();
         folders.push((*name, found));

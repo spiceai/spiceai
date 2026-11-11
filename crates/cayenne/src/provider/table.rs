@@ -9836,8 +9836,11 @@ impl CayenneTableProvider {
     /// names, and stops holding them. A file a live snapshot also names (one a
     /// compaction carries) is kept.
     pub(crate) async fn discard_uncommitted_snapshot(&self, snapshot_id: &str) -> Result<()> {
-        let mut written: BTreeMap<String, u64> =
-            self.uncommitted_files.files(snapshot_id).into_iter().collect();
+        let mut written: BTreeMap<String, u64> = self
+            .uncommitted_files
+            .files(snapshot_id)
+            .into_iter()
+            .collect();
         self.uncommitted_files.forget(snapshot_id);
         if uuid::Uuid::parse_str(snapshot_id).is_ok() {
             for row in self
@@ -10266,14 +10269,16 @@ impl CayenneTableProvider {
             );
             return;
         }
-        let (table_root, store) =
-            match (self.snapshot_root_key_prefix(), self.require_object_store()) {
-                (Ok(root), Ok(config)) => (root, Arc::clone(&config.store)),
-                (Err(error), _) | (_, Err(error)) => {
-                    tracing::warn!(target: "cayenne::compaction", table = table_name, %error, "Retired-file sweep skipped");
-                    return;
-                }
-            };
+        let (table_root, store) = match (
+            self.snapshot_root_key_prefix(),
+            self.require_object_store(),
+        ) {
+            (Ok(root), Ok(config)) => (root, Arc::clone(&config.store)),
+            (Err(error), _) | (_, Err(error)) => {
+                tracing::warn!(target: "cayenne::compaction", table = table_name, %error, "Retired-file sweep skipped");
+                return;
+            }
+        };
         // Sizes for the reclaim metric, from the entries retired files keep
         // until they are forgotten; a deletion vector's entry is gone already.
         let sizes: HashMap<String, u64> = self
@@ -11476,18 +11481,18 @@ impl CayenneTableProvider {
         };
         if self.data_in_store() {
             let config = self.require_object_store()?;
-            let source_prefix = self
-                .data_files_prefix(source_snapshot_id)?
-                .ok_or_else(|| Error::Internal {
-                    table: self.table_name().to_string(),
-                    message: "Missing source snapshot object-store prefix".to_string(),
-                })?;
-            let target_prefix = self
-                .data_files_prefix(target_snapshot_id)?
-                .ok_or_else(|| Error::Internal {
-                    table: self.table_name().to_string(),
-                    message: "Missing target snapshot object-store prefix".to_string(),
-                })?;
+            let source_prefix =
+                self.data_files_prefix(source_snapshot_id)?
+                    .ok_or_else(|| Error::Internal {
+                        table: self.table_name().to_string(),
+                        message: "Missing source snapshot object-store prefix".to_string(),
+                    })?;
+            let target_prefix =
+                self.data_files_prefix(target_snapshot_id)?
+                    .ok_or_else(|| Error::Internal {
+                        table: self.table_name().to_string(),
+                        message: "Missing target snapshot object-store prefix".to_string(),
+                    })?;
             let store = Arc::clone(&config.store);
             let table_name = self.table_name().to_string();
             config
@@ -24275,11 +24280,7 @@ impl CayenneTableProvider {
         } else {
             // 1. Stage candidate files alone (hardlink/copy) for a tight scan.
             if let Err(e) = self
-                .link_or_copy_snapshot_files(
-                    source_snapshot_id,
-                    &staging_snapshot_id,
-                    &picked_list,
-                )
+                .link_or_copy_snapshot_files(source_snapshot_id, &staging_snapshot_id, &picked_list)
                 .await
             {
                 cleanup_all.await;
@@ -24875,18 +24876,18 @@ impl CayenneTableProvider {
         );
         if self.data_in_store() {
             let config = self.require_object_store()?;
-            let source_prefix = self
-                .data_files_prefix(source_snapshot_id)?
-                .ok_or_else(|| Error::Internal {
-                    table: self.table_name().to_string(),
-                    message: "Missing source snapshot object-store prefix".to_string(),
-                })?;
-            let target_prefix = self
-                .data_files_prefix(target_snapshot_id)?
-                .ok_or_else(|| Error::Internal {
-                    table: self.table_name().to_string(),
-                    message: "Missing target snapshot object-store prefix".to_string(),
-                })?;
+            let source_prefix =
+                self.data_files_prefix(source_snapshot_id)?
+                    .ok_or_else(|| Error::Internal {
+                        table: self.table_name().to_string(),
+                        message: "Missing source snapshot object-store prefix".to_string(),
+                    })?;
+            let target_prefix =
+                self.data_files_prefix(target_snapshot_id)?
+                    .ok_or_else(|| Error::Internal {
+                        table: self.table_name().to_string(),
+                        message: "Missing target snapshot object-store prefix".to_string(),
+                    })?;
             let store = Arc::clone(&config.store);
             let table_name = self.table_name().to_string();
             for basename in basenames {
@@ -25568,7 +25569,10 @@ impl CayenneTableProvider {
     fn retired_file_snapshots(keys: &HashSet<String>) -> impl Iterator<Item = String> + '_ {
         keys.iter()
             .filter(|key| super::orphan_sweep::deletion_vector_name(key).is_none())
-            .filter_map(|key| key.split_once('/').map(|(snapshot, _)| snapshot.to_string()))
+            .filter_map(|key| {
+                key.split_once('/')
+                    .map(|(snapshot, _)| snapshot.to_string())
+            })
     }
 
     /// The table's current and protected snapshot ids, from this instance's
@@ -48070,9 +48074,7 @@ impl CayenneTableProvider {
         .with_capture_locks(capture_locks)
         .with_file_deletion_fence(Arc::clone(&self.file_deletion_fence))
         .with_exact_count(source.requires_exact_count())
-        .with_committed_files(
-            committed_files.then(|| Arc::clone(&self.current_snapshot_id)),
-        );
+        .with_committed_files(committed_files.then(|| Arc::clone(&self.current_snapshot_id)));
 
         Ok(sink)
     }
@@ -48179,7 +48181,10 @@ impl CayenneTableProvider {
         // the listing fence.
         let (listing_table, snapshot_id) = {
             let _fence = self.listing_fence.read().await;
-            (self.listing_table.load_full(), self.get_current_snapshot_id())
+            (
+                self.listing_table.load_full(),
+                self.get_current_snapshot_id(),
+            )
         };
 
         // PositionBased tables have no protected snapshots, so we only scan the main listing table.

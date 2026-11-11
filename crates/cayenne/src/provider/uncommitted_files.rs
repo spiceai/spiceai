@@ -259,11 +259,7 @@ impl UncommittedFiles {
     /// a flat table a data file's name is its key relative to the table, so a
     /// retired key held here is still some write's upload.
     pub(crate) fn held_keys(&self) -> HashSet<String> {
-        let mut held: HashSet<String> = self
-            .held()
-            .into_iter()
-            .map(|(_, name)| name)
-            .collect();
+        let mut held: HashSet<String> = self.held().into_iter().map(|(_, name)| name).collect();
         held.extend(self.held_deletion_files());
         held
     }

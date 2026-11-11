@@ -286,7 +286,10 @@ mod tests {
         );
         // The lookup index, a deeper key, another file under `deletions/`, and
         // a reserved name at the top are ignored.
-        assert_eq!(placement("_lookup_index/k/run.arrow", &live), Placement::Other);
+        assert_eq!(
+            placement("_lookup_index/k/run.arrow", &live),
+            Placement::Other
+        );
         assert_eq!(placement("_lookup_index/x", &live), Placement::Other);
         assert_eq!(placement("deletions/e.vortex", &live), Placement::Other);
         assert_eq!(placement("cur/sub/f.vortex", &live), Placement::Other);
