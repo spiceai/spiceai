@@ -384,12 +384,16 @@ pub async fn build_unmetered_object_store(
 
         // The Cayenne metastore acknowledges a source once its commit is
         // published, so its puts, and those of the data files the commit names,
-        // must be on disk when they return.
-        let local = if matches!(
+        // must be on disk when they return. Its store is keyed by absolute
+        // paths, as an S3 store is keyed from its bucket's root, so the
+        // `file://` URL of a dataset's data folder in the location names its
+        // objects the way an `s3://` URL does.
+        let cayenne = matches!(
             feature,
             StateFeature::CayenneMetastore | StateFeature::CayenneData
-        ) {
-            object_store_occ::LocalConditionalPut::new_durable(&local_path)
+        );
+        let local = if cayenne {
+            object_store_occ::LocalConditionalPut::new_durable_keyed_by_absolute_path(&local_path)
         } else {
             object_store_occ::LocalConditionalPut::new(&local_path)
         };
@@ -400,7 +404,19 @@ pub async fn build_unmetered_object_store(
                 source: Box::new(source),
             })?);
 
-        return Ok((store, feature_prefix("")));
+        let prefix = if cayenne {
+            // The directory's own key, decoded from the URL: `my dir`, not `my%20dir`.
+            let key = object_store::path::Path::from_absolute_path(&local_path).map_err(|_| {
+                Error::InvalidFileLocation {
+                    usage,
+                    location: state_location.to_string(),
+                }
+            })?;
+            feature_prefix(key.as_ref())
+        } else {
+            feature_prefix("")
+        };
+        return Ok((store, prefix));
     }
 
     let base_prefix = if matches!(url.scheme(), "abfs" | "abfss")
@@ -743,6 +759,39 @@ mod tests {
         );
     }
 
+    /// Cayenne's store for a `file://` location is keyed by absolute paths, as
+    /// an S3 store is keyed from its bucket's root: its prefix is the location's
+    /// path and the `cayenne` folder, and an object under it is the file the
+    /// `file://` URL of the same path names, with the URL's percent-encoding
+    /// decoded.
+    #[tokio::test]
+    async fn runtime_state_file_location_keys_cayenne_by_absolute_path() {
+        let temp_dir = tempfile::tempdir().expect("create temp dir");
+        let state_dir = temp_dir.path().join("nested state");
+        let state_location = format!("file://{}/", state_dir.display()).replace(' ', "%20");
+        for feature in [StateFeature::CayenneMetastore, StateFeature::CayenneData] {
+            let (store, prefix) = build_object_store(
+                secrets(),
+                Handle::current(),
+                &runtime_state(&state_location, &[]),
+                feature,
+            )
+            .await
+            .expect("file state store should build");
+            let expected = format!("{}/cayenne", state_dir.display());
+            assert_eq!(format!("/{prefix}"), expected, "{feature:?}");
+            object_store::ObjectStoreExt::put(
+                store.as_ref(),
+                &object_store::path::Path::from(format!("{prefix}/v1/{feature:?}")),
+                bytes::Bytes::from_static(b"x").into(),
+            )
+            .await
+            .expect("put");
+            let written = state_dir.join("cayenne/v1").join(format!("{feature:?}"));
+            assert_eq!(std::fs::read(&written).expect("read"), b"x");
+        }
+    }
+
     const S3_KEY_PARAMS: &[(&str, &str)] = &[
         ("s3_endpoint", "http://localhost:9000"),
         ("s3_key", "AKID"),
@@ -874,7 +923,11 @@ mod tests {
         )
         .await
         .expect("file state store should build");
-        assert_eq!(prefix, "cayenne");
+        // Keyed by absolute paths: see `runtime_state_file_location_keys_cayenne_by_absolute_path`.
+        assert_eq!(
+            format!("/{prefix}"),
+            format!("{}/cayenne", temp_dir.path().display())
+        );
         assert!(
             store.to_string().ends_with(", durable)"),
             "the Cayenne metastore's local store does not sync its puts: {store}"

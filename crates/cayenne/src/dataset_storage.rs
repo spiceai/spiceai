@@ -209,7 +209,8 @@ pub struct DatasetStorage {
     store: Arc<dyn ObjectStore>,
     /// The object path the dataset's data lives under.
     prefix: Path,
-    /// The local directory the data lives in, when it is local. Only host features
+    /// The local directory the data lives in, when it is local and not in the
+    /// object-native location (whose store serves it alone). Only host features
     /// that need a filesystem path use it (free-space probe, storage class,
     /// snapshot export, `file_create` safety checks, page-cache hints); no data
     /// file is read, written, copied, renamed, deleted or listed through it.
@@ -253,7 +254,11 @@ impl DatasetStorage {
             .map_err(|error| format!("data path '{table_path}' is not a URL: {error}"))?;
         let prefix = Path::from_url_path(recorded.path())
             .map_err(|error| format!("data path '{table_path}' has no object path: {error}"))?;
-        let local_root = (recorded.scheme() == "file")
+        let in_location = crate::metastore_layout::is_object_native_data_path(table_path);
+        // A dataset in the object-native location is served by its location's
+        // store alone, in a local directory as in a bucket, so it takes no host
+        // feature of a local data directory.
+        let local_root = (recorded.scheme() == "file" && !in_location)
             .then(|| recorded.to_file_path().ok())
             .flatten();
         let url = url::Url::parse(&format!("{DATASET_STORE_SCHEME}://{dataset_id}/"))
@@ -279,7 +284,7 @@ impl DatasetStorage {
         });
         Ok(Self {
             store: scoped,
-            in_location: crate::metastore_layout::is_object_native_data_path(&table_path),
+            in_location,
             prefix,
             local_root,
             url,

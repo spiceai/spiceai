@@ -3493,7 +3493,8 @@ impl CayenneAccelerator {
     }
 
     /// Where `table_name`'s data files live when its metastore is the object-native
-    /// one in an object-store `runtime.state.location`: in its dataset folder there,
+    /// one in `runtime.state.location` (an `s3://` bucket or a local directory): in
+    /// its dataset folder there,
     /// `…/cayenne/v1/datasets/<name>-<id>/data`, the table path the metastore records.
     ///
     /// Placement is decided once, when the dataset is created, and the recorded table
@@ -3519,11 +3520,9 @@ impl CayenneAccelerator {
         let Ok(location) = url::Url::parse(&state.location) else {
             return Ok(None);
         };
-        // Local directories keep today's data path until they move onto the store.
-        let (true, Some(bucket)) = (location.scheme() == "s3", location.host_str()) else {
+        let Some(datasets_url) = location_datasets_url(&location, native.datasets_prefix()) else {
             return Ok(None);
         };
-        let datasets_url = format!("s3://{bucket}/{}", native.datasets_prefix());
         let store = cayenne::metadata::ObjectStoreConfig {
             url: url::Url::parse(&datasets_url)
                 .boxed()
@@ -3595,7 +3594,9 @@ impl CayenneAccelerator {
             .state
             .as_ref()
             .and_then(|state| url::Url::parse(&state.location).ok())
-            .is_some_and(|location| location.scheme() == "s3" && location.host_str().is_some());
+            .is_some_and(|location| {
+                location_datasets_url(&location, &object_store::path::Path::default()).is_some()
+            });
         if !in_object_store {
             return Ok(LocationPlacement::Elsewhere);
         }
@@ -4247,6 +4248,22 @@ impl CayenneAccelerator {
 }
 
 /// A dataset's data files in its dataset folder in the object-native location.
+/// The URL of the location's dataset folders, `datasets_prefix` in the
+/// location's store, when the location holds data files: an `s3://` bucket,
+/// whose store is keyed from the bucket's root, or a local directory, whose
+/// store is keyed by absolute paths (`runtime_state_location`), so the
+/// `file://` URL of the same path names the same objects.
+fn location_datasets_url(
+    location: &url::Url,
+    datasets_prefix: &object_store::path::Path,
+) -> Option<String> {
+    match (location.scheme(), location.host_str()) {
+        ("s3", Some(bucket)) => Some(format!("s3://{bucket}/{datasets_prefix}")),
+        ("file", None | Some("" | "localhost")) => Some(format!("file:///{datasets_prefix}")),
+        _ => None,
+    }
+}
+
 struct ObjectNativeDataPlacement {
     /// The table path: `…/cayenne/v1/datasets/<name>-<id>/data`.
     base_path: String,
@@ -7224,6 +7241,193 @@ mod tests {
             ..Default::default()
         });
         dataset
+    }
+
+    /// The location's dataset folders are addressed by the URL its store's keys
+    /// are relative to: a bucket's root, or the filesystem root for a local
+    /// directory. Other schemes hold no data files yet.
+    #[test]
+    fn the_dataset_folders_url_follows_the_location_store_keys() {
+        let prefix = object_store::path::Path::from("var/spice/state/cayenne/v1/datasets");
+        for (location, expected) in [
+            (
+                "s3://bucket/state/",
+                Some("s3://bucket/var/spice/state/cayenne/v1/datasets"),
+            ),
+            (
+                "file:///var/spice/state/",
+                Some("file:///var/spice/state/cayenne/v1/datasets"),
+            ),
+            (
+                "file://localhost/var/spice/state/",
+                Some("file:///var/spice/state/cayenne/v1/datasets"),
+            ),
+            ("file://otherhost/var/spice/state/", None),
+            ("gs://bucket/state/", None),
+            (
+                "abfss://container@account.dfs.core.windows.net/state/",
+                None,
+            ),
+        ] {
+            let url = url::Url::parse(location).expect("location URL");
+            assert_eq!(
+                location_datasets_url(&url, &prefix).as_deref(),
+                expected,
+                "{location}"
+            );
+        }
+    }
+
+    /// With `runtime.params.cayenne_vnext` on and a local-directory
+    /// `runtime.state.location`, a new file-mode dataset is placed in its dataset
+    /// folder there, as in an `s3://` location: its data files are under
+    /// `<location>/cayenne/v1/datasets/<name>-<id>/data`. Reopening from the
+    /// location alone is `object_native_local_location_test` in `cayenne`: here
+    /// the first instance's background work outlives its handles, and a second
+    /// instance in the same process would be a second live writer.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_local_state_location_places_a_new_dataset_in_its_folder() {
+        use data_accelerator_api::AcceleratorEngineRegistry;
+        use datafusion::common::TableReference;
+        use datafusion::prelude::SessionContext;
+
+        let directory = tempfile::tempdir().expect("temp dir");
+        let state = directory.path().join("state");
+        let mut app = AppBuilder::new("test")
+            .with_runtime_params(
+                [(CAYENNE_VNEXT_PARAM.to_string(), "enabled".to_string())]
+                    .into_iter()
+                    .collect(),
+            )
+            .build();
+        app.runtime.state = Some(spicepod::component::runtime::RuntimeState {
+            location: format!("file://{}/", state.display()),
+            params: None,
+        });
+        let app = Arc::new(app);
+        let open = |ctx: SessionContext, label: &'static str| {
+            let app = Arc::clone(&app);
+            let directory = directory.path().to_path_buf();
+            async move {
+                let source = TestAccelerationSource::new("orders")
+                    .with_app(app)
+                    .with_acceleration(Acceleration {
+                        enabled: true,
+                        engine: Engine::Cayenne,
+                        mode: Mode::File,
+                        refresh_mode: Some(RefreshMode::Append),
+                        // No `cayenne_file_path`: a dataset that sets one keeps its
+                        // data path.
+                        params: [(
+                            "cayenne_metadata_dir".to_string(),
+                            directory.join("metadata").to_string_lossy().into_owned(),
+                        )]
+                        .into_iter()
+                        .collect(),
+                        ..Default::default()
+                    });
+                let registry = AcceleratorEngineRegistry::new();
+                registry
+                    .register_accelerator_engine(
+                        Engine::Cayenne,
+                        Arc::new(CayenneAccelerator::new()),
+                    )
+                    .await;
+                let acceleration = source.acceleration().expect("acceleration").clone();
+                let table = registry
+                    .create_accelerator_table(
+                        TableReference::bare("orders"),
+                        Arc::new(Schema::new(vec![
+                            Field::new("id", DataType::Int64, false),
+                            Field::new("v", DataType::Int64, false),
+                        ])),
+                        None,
+                        &acceleration,
+                        source.secrets(),
+                        Some(&source),
+                        Arc::new(ctx.clone()),
+                    )
+                    .await
+                    .unwrap_or_else(|error| panic!("{label}: create the acceleration: {error}"));
+                ctx.register_table("orders", Arc::clone(&table))
+                    .expect("register");
+                (ctx, table)
+            }
+        };
+        // Every row, as (id, v) pairs in id order.
+        let count_and_sum = |ctx: SessionContext| async move {
+            let batches = ctx
+                .sql("SELECT id, v FROM orders")
+                .await
+                .expect("plan")
+                .collect()
+                .await
+                .expect("query");
+            let mut rows: Vec<(i64, i64)> = batches
+                .iter()
+                .flat_map(|batch| {
+                    let column = |index: usize| {
+                        batch
+                            .column(index)
+                            .as_any()
+                            .downcast_ref::<arrow::array::Int64Array>()
+                            .expect("Int64 column")
+                            .values()
+                            .to_vec()
+                    };
+                    column(0).into_iter().zip(column(1))
+                })
+                .collect();
+            rows.sort_unstable();
+            rows
+        };
+
+        let (ctx, _table) = open(SessionContext::new(), "first open").await;
+        for first in [1, 1001] {
+            ctx.sql(&format!(
+                "INSERT INTO orders SELECT value AS id, value * 10 AS v FROM generate_series({first}, {})",
+                first + 999
+            ))
+            .await
+            .expect("plan")
+            .collect()
+            .await
+            .expect("insert");
+        }
+        let expected: Vec<(i64, i64)> = (1..=2000).map(|id| (id, id * 10)).collect();
+        assert_eq!(count_and_sum(ctx.clone()).await, expected);
+
+        let mut files = Vec::new();
+        let mut pending = vec![directory.path().to_path_buf()];
+        while let Some(current) = pending.pop() {
+            for entry in std::fs::read_dir(&current).expect("read directory") {
+                let path = entry.expect("entry").path();
+                if path.is_dir() {
+                    pending.push(path);
+                } else if path
+                    .extension()
+                    .is_some_and(|extension| extension == "vortex")
+                {
+                    files.push(
+                        path.strip_prefix(directory.path())
+                            .expect("under the directory")
+                            .to_string_lossy()
+                            .into_owned(),
+                    );
+                }
+            }
+        }
+        assert!(!files.is_empty(), "no data file was written");
+        let outside: Vec<&String> = files
+            .iter()
+            .filter(|file| {
+                !(file.starts_with("state/cayenne/v1/datasets/orders-") && file.contains("/data/"))
+            })
+            .collect();
+        assert!(
+            outside.is_empty(),
+            "data files outside the dataset folder in the location: {outside:?}"
+        );
     }
 
     /// With `runtime.params.cayenne_vnext` off, an object-store data path fails to

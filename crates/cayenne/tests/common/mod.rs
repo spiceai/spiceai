@@ -162,10 +162,14 @@ pub async fn fixture_catalog(
 #[derive(Clone)]
 struct ObjectNativeLocation {
     store: Arc<dyn object_store::ObjectStore>,
-    /// `s3://<bucket>[/<fixture prefix>]/state`, the runtime's `runtime.state.location`.
+    /// `s3://<bucket>[/<fixture prefix>]/state`, or `file:///<directory>`, the
+    /// runtime's `runtime.state.location`.
     state_url: String,
     /// The same location as a key prefix in `store`.
     state_prefix: String,
+    /// The URL `store`'s keys are relative to: `s3://<bucket>`, or `file://` for
+    /// a local directory, whose store is keyed by absolute paths.
+    root_url: String,
 }
 
 impl ObjectNativeLocation {
@@ -180,7 +184,24 @@ impl ObjectNativeLocation {
             store,
             state_url: format!("s3://{bucket}/{state_prefix}"),
             state_prefix,
+            root_url: format!("s3://{bucket}"),
         }
+    }
+
+    /// A location in local directory `directory`, in the store the runtime builds
+    /// for a `file://` `runtime.state.location`: durable, and keyed by absolute
+    /// paths (`runtime_state_location::build_object_store`).
+    fn local(directory: &std::path::Path) -> Result<Self, Box<dyn std::error::Error>> {
+        std::fs::create_dir_all(directory)?;
+        let store =
+            object_store_occ::LocalConditionalPut::new_durable_keyed_by_absolute_path(directory)?;
+        let state_prefix = directory.to_string_lossy().trim_matches('/').to_string();
+        Ok(Self {
+            store: Arc::new(store),
+            state_url: format!("file:///{state_prefix}"),
+            state_prefix,
+            root_url: "file://".to_string(),
+        })
     }
 
     /// Open the catalog, creating it on first use, as the runtime opens it.
@@ -201,9 +222,7 @@ impl ObjectNativeLocation {
         &self,
         catalog: &ObjectNativeCatalog,
     ) -> Result<FixtureDataStore, url::ParseError> {
-        let bucket_url = url::Url::parse(&self.state_url)?;
-        let bucket = bucket_url.host_str().unwrap_or_default();
-        let url = url::Url::parse(&format!("s3://{bucket}/{}", catalog.datasets_prefix()))?;
+        let url = url::Url::parse(&format!("{}/{}", self.root_url, catalog.datasets_prefix()))?;
         Ok(FixtureDataStore {
             root: url.as_str().trim_end_matches('/').to_string(),
             config: Some(ObjectStoreConfig {
@@ -274,6 +293,9 @@ pub struct TestFixture {
 /// - unset, `local` or `memory`: an in-memory object store;
 /// - `fault`: the same, wrapped in `object_store_occ`'s `FaultStore` with no faults
 ///   armed, so every operation goes through the fault store's wrapper;
+/// - `local-location`: a local directory in the fixture's temporary directory,
+///   in the durable store the runtime builds for a `file://`
+///   `runtime.state.location`, keyed by absolute paths;
 /// - `rustfs`: an S3-compatible server (`RustFS`) named by
 ///   `CAYENNE_TEST_RUSTFS_ENDPOINT`, `CAYENNE_TEST_RUSTFS_BUCKET`,
 ///   `CAYENNE_TEST_RUSTFS_ACCESS_KEY` and `CAYENNE_TEST_RUSTFS_SECRET_KEY`, under
@@ -302,9 +324,12 @@ impl FixtureDataStore {
 
     /// The location of an object-native fixture, in the store
     /// `CAYENNE_TEST_DATA_STORE` names.
-    fn location_from_env() -> Result<ObjectNativeLocation, Box<dyn std::error::Error>> {
+    fn location_from_env(
+        directory: &std::path::Path,
+    ) -> Result<ObjectNativeLocation, Box<dyn std::error::Error>> {
         let kind = std::env::var("CAYENNE_TEST_DATA_STORE").unwrap_or_default();
         Ok(match kind.as_str() {
+            "local-location" => ObjectNativeLocation::local(&directory.join("state"))?,
             "" | "local" | "memory" => ObjectNativeLocation::new(
                 Arc::new(object_store::memory::InMemory::new()),
                 "cayenne-test",
@@ -320,7 +345,7 @@ impl FixtureDataStore {
             "rustfs" => Self::rustfs()?,
             other => {
                 return Err(format!(
-                    "CAYENNE_TEST_DATA_STORE is '{other}'; use 'local', 'memory', 'fault' or 'rustfs'"
+                    "CAYENNE_TEST_DATA_STORE is '{other}'; use 'local', 'memory', 'fault', 'local-location' or 'rustfs'"
                 )
                 .into());
             }
@@ -499,7 +524,7 @@ impl TestFixture {
             (BackendType::ObjectNative, store) => {
                 let location = match store {
                     Some(store) => ObjectNativeLocation::new(store, "cayenne-test", ""),
-                    None => FixtureDataStore::location_from_env()?,
+                    None => FixtureDataStore::location_from_env(temp_dir.path())?,
                 };
                 let catalog = location.open().await?;
                 let data_store = location.data_store(&catalog)?;

@@ -111,6 +111,7 @@ mod mutation_roundtrip_test;
 mod null_equal_join_dynamic_filter_test;
 mod object_native_commit_fault_test;
 mod object_native_data_test;
+mod object_native_local_location_test;
 mod object_native_source_replay_test;
 mod object_native_transaction_test;
 mod object_store_reclaim_test;

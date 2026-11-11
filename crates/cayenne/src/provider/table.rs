@@ -6921,9 +6921,9 @@ impl CayenneTableProvider {
     /// Whether this table's appends write each data file once, at its final key
     /// in the snapshot directory they commit to, and commit by naming the files
     /// in the snapshot's manifest: no staging prefix, staging WAL, copy or
-    /// listing. True for a table whose data is in the object-native location on
-    /// an object store; a local directory keeps the staged write and its
-    /// rename.
+    /// listing. True for a table whose data is in the object-native location, in
+    /// a bucket or a local directory; a local data directory outside it keeps
+    /// the staged write and its rename.
     pub(crate) fn writes_at_final_keys(&self) -> bool {
         self.data_in_object_native_location()
             && self
