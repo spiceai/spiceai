@@ -613,6 +613,23 @@ async fn hybrid_replay_after_staged_uncommitted_and_committed_unacked_crashes() 
     }
 }
 
+/// [`seed`], with the retention pass held from before the tier write so the
+/// newer versions of keys 2 and 3 stay in the RAM tier (the pass forces a
+/// tier checkpoint, and [`settle`] runs it). Returns the hold.
+async fn seed_keeping_tier(f: &Fixture) -> tokio::sync::OwnedRwLockWriteGuard<()> {
+    let p = &f.provider;
+    f.set(OFF);
+    apply(p, &[(1, -1), (2, 2), (3, -3)]).await.expect("seed a");
+    p.checkpoint_mem_tier().await.expect("checkpoint a");
+    apply(p, &[(4, 4), (5, -5)]).await.expect("seed b");
+    p.checkpoint_mem_tier().await.expect("checkpoint b");
+    settle(p).await;
+    let hold = Arc::clone(&p.test_retention_pass_gate).write_owned().await;
+    apply(p, &[(2, -2), (3, 3)]).await.expect("seed tier");
+    assert_eq!(rows(p).await, SEEDED.to_vec(), "{}: seeded", f.name);
+    hold
+}
+
 /// The durable write routes that reach an armed `cdc_durability: memory` table
 /// besides the CDC apply: a transaction commit and an SQL insert.
 #[derive(Clone, Copy, Debug)]
@@ -654,14 +671,28 @@ async fn durable_write(provider: &CayenneTableProvider, route: DurableRoute, row
 async fn armed_tier_durable_writes_retain_the_whole_logical_view() {
     for route in [DurableRoute::Transaction, DurableRoute::SqlInsert] {
         let f = hybrid(&format!("hyb_durable_{route:?}").to_lowercase(), 1).await;
-        seed(&f).await;
+        let hold = seed_keeping_tier(&f).await;
+        assert!(
+            !f.provider.mem_tier.tier().load().is_empty(),
+            "{route:?}: precondition: keys 2 and 3 have newer versions in the tier"
+        );
+        let acks_before = f.acks.lock().len();
         f.set(ON);
         durable_write(&f.provider, route, &[(6, 6)]).await;
+        // How the write treated the tier: drained (its rows made durable and
+        // acknowledged by the write) or left in place.
+        eprintln!(
+            "{route:?}: tier empty after write = {}, acks {} -> {}",
+            f.provider.mem_tier.tier().load().is_empty(),
+            acks_before,
+            f.acks.lock().len()
+        );
         assert_eq!(
             rows(&f.provider).await,
             RETAINED.to_vec(),
             "{route:?}: published view"
         );
+        drop(hold);
         f.provider.checkpoint_mem_tier().await.expect("checkpoint");
         assert_eq!(
             rows(&f.provider).await,

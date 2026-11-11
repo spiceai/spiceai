@@ -2541,6 +2541,11 @@ pub struct CayenneTableProvider {
     /// the two. Consumed on first fire.
     #[cfg(test)]
     test_post_catalog_commit_hook: Arc<ParkingMutex<Option<TestPrePublishHook>>>,
+    /// Test-only gate the `retention_sql` maintenance pass reads at entry: a test
+    /// holding its write side keeps that pass (and the mem-tier checkpoint it
+    /// forces) from running, so rows it put in the RAM tier stay there.
+    #[cfg(test)]
+    pub(crate) test_retention_pass_gate: Arc<tokio::sync::RwLock<()>>,
     /// Test-only seam fired after the orphaned-DV sweep captures its eligibility
     /// view (and released the listing fence) but before it unlinks anything, so a
     /// test can advance the floor and re-signal inside the exact window a running
@@ -10500,6 +10505,8 @@ impl CayenneTableProvider {
             #[cfg(test)]
             test_post_catalog_commit_hook: Arc::new(ParkingMutex::new(None)),
             #[cfg(test)]
+            test_retention_pass_gate: Arc::new(tokio::sync::RwLock::new(())),
+            #[cfg(test)]
             test_post_capture_hook: Arc::new(ParkingMutex::new(None)),
             #[cfg(test)]
             test_pre_maintenance_statistics_hook: Arc::new(ParkingMutex::new(None)),
@@ -12962,6 +12969,8 @@ impl CayenneTableProvider {
             ),
             #[cfg(test)]
             test_post_catalog_commit_hook: Arc::clone(&self.test_post_catalog_commit_hook),
+            #[cfg(test)]
+            test_retention_pass_gate: Arc::clone(&self.test_retention_pass_gate),
             #[cfg(test)]
             test_post_capture_hook: Arc::clone(&self.test_post_capture_hook),
             #[cfg(test)]
@@ -30554,6 +30563,8 @@ impl CayenneTableProvider {
     /// or listing refresh lands between what the sink scans and what it deletes, or
     /// between the two halves of one pass.
     pub(crate) async fn apply_retention_filters(&self) -> CatalogResult<RetentionPass> {
+        #[cfg(test)]
+        let _retention_pass_gate = self.test_retention_pass_gate.read().await;
         let table_name = self.table_metadata.table_name.as_str();
         if self.retention_filters.is_empty() {
             maintenance_metrics::track_maintenance(
