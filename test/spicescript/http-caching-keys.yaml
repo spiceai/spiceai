@@ -266,8 +266,11 @@ steps:
     expect: { rows: [['2']] }
   # Once the writes and any refresh have landed, a failing origin is answered
   # from the stored entry, which must be the newer response, not the one the
-  # earlier write stored.
-  - sleep: 2s
+  # earlier write stored. The refresh fetches the origin, so it must land
+  # before the origin starts failing: writes are batched for up to 500 ms, and
+  # in a 10-dataset probe every refresh had landed within 2s, so 5s leaves room
+  # on a loaded runner.
+  - sleep: 5s
   - source-exec:
       api:
         - "{ path: /v1/again-zero-0, status: 503, body: down }"
