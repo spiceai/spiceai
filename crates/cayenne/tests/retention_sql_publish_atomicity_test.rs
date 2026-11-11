@@ -1498,3 +1498,128 @@ async fn resident_retention_skips_hidden_versions_before_its_predicate_impl(
     }
     Ok(())
 }
+
+/// Every evaluation of `retention_sql` in one publication (incoming rows and
+/// the resident rows it keeps) sees the same `now()`; the next publication sees
+/// a later one. Run for each implemented file route.
+#[test]
+fn retention_now_is_fixed_once_per_publication_sqlite() -> Result<(), String> {
+    common::run_with_backend_blocking(
+        common::BackendType::Sqlite,
+        retention_now_is_fixed_once_per_publication_impl,
+    )
+}
+
+async fn retention_now_is_fixed_once_per_publication_impl(
+    fixture: common::TestFixture,
+) -> Result<(), Box<dyn std::error::Error>> {
+    use arrow::array::TimestampNanosecondArray;
+    use datafusion::logical_expr::{ColumnarValue, Volatility, create_udf};
+    use std::sync::Mutex;
+    for (name, keyed, upsert, mode) in [
+        ("rsql_now_keyed", true, true, None),
+        ("rsql_now_unkeyed", false, false, None),
+        (
+            "rsql_now_key_no_conflict",
+            true,
+            false,
+            Some(DeletionMode::Key),
+        ),
+        (
+            "rsql_now_key_no_conflict_position",
+            true,
+            false,
+            Some(DeletionMode::Position),
+        ),
+    ] {
+        let seen: Arc<Mutex<std::collections::BTreeSet<i64>>> = Arc::default();
+        let calls = Arc::new(AtomicU64::new(0));
+        let (s, c) = (Arc::clone(&seen), Arc::clone(&calls));
+        let udf = create_udf(
+            "seen",
+            vec![DataType::Timestamp(
+                arrow::datatypes::TimeUnit::Nanosecond,
+                Some("+00:00".into()),
+            )],
+            DataType::Boolean,
+            Volatility::Volatile,
+            Arc::new(move |args: &[ColumnarValue]| {
+                let rows = match &args[0] {
+                    ColumnarValue::Array(a) => a.len(),
+                    ColumnarValue::Scalar(_) => 1,
+                };
+                let array = args[0].clone().into_array(rows)?;
+                let ts = array
+                    .as_any()
+                    .downcast_ref::<TimestampNanosecondArray>()
+                    .expect("timestamp");
+                c.fetch_add(1, Ordering::SeqCst);
+                let mut set = s.lock().expect("lock");
+                set.extend(ts.iter().flatten());
+                Ok(ColumnarValue::Array(Arc::new(
+                    arrow::array::BooleanArray::from(vec![Some(false); rows]),
+                )))
+            }),
+        );
+        let dir = fixture.data_path.join(name);
+        std::fs::create_dir_all(&dir)?;
+        let options = CreateTableOptions {
+            table_name: name.to_string(),
+            schema: schema(),
+            primary_key: if keyed {
+                vec!["id".to_string()]
+            } else {
+                vec![]
+            },
+            on_conflict: upsert
+                .then(|| OnConflict::Upsert(ColumnReference::new(vec!["id".to_string()]))),
+            base_path: dir.to_string_lossy().to_string(),
+            partition_column: None,
+            vortex_config: VortexConfig {
+                deletion_mode: mode.unwrap_or(file_tier_config().deletion_mode),
+                ..file_tier_config()
+            },
+        };
+        let t = Arc::new(
+            CayenneTableProvider::create_table_with_retention(
+                Arc::clone(&fixture.catalog) as Arc<dyn MetadataCatalog>,
+                options,
+                vec![udf.call(vec![now()])],
+                SessionContext::new().runtime_env(),
+            )
+            .await?,
+        );
+        common::insert_batch(t.as_ref(), rows(&[(1, Some("a")), (2, Some("b"))])).await?;
+        t.flush_pending_maintenance().await?;
+        let mut previous = None;
+        for id in [3_i64, 4] {
+            seen.lock().expect("lock").clear();
+            let before = calls.load(Ordering::SeqCst);
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            common::insert_batch(t.as_ref(), rows(&[(id, Some("c"))])).await?;
+            let set = seen.lock().expect("lock").clone();
+            let evaluations = calls.load(Ordering::SeqCst) - before;
+            t.flush_pending_maintenance().await?;
+            let after_maintenance = seen.lock().expect("lock").clone();
+            eprintln!("{name} id={id}: publication {set:?} incl. maintenance {after_maintenance:?}");
+            assert!(
+                evaluations >= 2,
+                "{name}: incoming and resident rows were both evaluated ({evaluations})"
+            );
+            assert_eq!(
+                set.len(),
+                1,
+                "{name}: one now() per publication, saw {set:?}"
+            );
+            let value = *set.iter().next().expect("one");
+            if let Some(previous) = previous {
+                assert!(
+                    value > previous,
+                    "{name}: the next publication sees a later now()"
+                );
+            }
+            previous = Some(value);
+        }
+    }
+    Ok(())
+}
