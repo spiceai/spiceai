@@ -975,8 +975,14 @@ impl CayenneTableProvider {
                     .to_string(),
             ));
         }
-        // The flip clears the inline corpus; a table holding inline rows cannot
-        // carry them into files here, so it does not take this path.
+        // The flip clears the inline corpus. A corpus that predates the
+        // `retention_sql` (such a table never inlines its own writes) is moved
+        // into the current snapshot first — a table without a primary key flushes
+        // its inline rows into the current snapshot directory, which is carried
+        // below — in this write's `write_lock` + `mem_checkpoint_lock` hold, as
+        // the retention pass does. The move changes where rows are stored, not
+        // which are visible. When the move could duplicate rows the write fails
+        // and nothing is published.
         if self
             .catalog()
             .get_inlined_data_count(self.table_id())
@@ -984,8 +990,39 @@ impl CayenneTableProvider {
             .map_err(|source| super::Error::Catalog { source })?
             > 0
         {
+            if self.inline_materialization_blocked() {
+                return Err(internal(
+                    "retention_sql append: the inline rows cannot be moved to files while append \
+                     finalization or a staged inline tombstone is in flight; retry the write"
+                        .to_string(),
+                ));
+            }
+            self.checkpoint_inlined_data_if_present_for_delete()
+                .await
+                .map_err(|source| super::Error::DataFusion { source })?;
+            if self
+                .catalog()
+                .get_inlined_data_count(self.table_id())
+                .await
+                .map_err(|source| super::Error::Catalog { source })?
+                > 0
+            {
+                return Err(internal(
+                    "retention_sql append: inline rows remained after moving them to files"
+                        .to_string(),
+                ));
+            }
+        }
+        // The new generation carries the current snapshot only. Rows published
+        // as protected snapshots (a transactional write to a table without a
+        // primary key publishes one) would not be carried, and the flip clears
+        // their catalog entries, so the append is refused rather than dropping
+        // them. Nothing is published.
+        if !self.protected_snapshots.load().is_empty() {
             return Err(internal(
-                "retention_sql append over inline rows on a table without a primary key is not supported"
+                "retention_sql append to a table without a primary key whose rows include \
+                 protected snapshots (a transactional write) is not supported: carrying only \
+                 the current snapshot would drop them"
                     .to_string(),
             ));
         }

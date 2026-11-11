@@ -60,6 +60,8 @@ test_with_backends!(memory_cdc_apply_hides_matching_rows_at_publish_impl);
 test_with_backends!(durable_cdc_apply_hides_and_failed_batch_replays_impl);
 test_with_backends!(partitioned_upsert_hides_matching_rows_at_publish_impl);
 test_with_backends!(durable_retention_reaches_a_preexisting_inline_corpus_impl);
+test_with_backends!(failing_retention_over_a_preexisting_inline_corpus_publishes_nothing_impl);
+test_with_backends!(unkeyed_retention_append_carries_a_preexisting_inline_corpus_impl);
 
 fn schema() -> SchemaRef {
     Arc::new(Schema::new(vec![
@@ -2984,5 +2986,139 @@ async fn durable_retention_reaches_a_preexisting_inline_corpus_impl(
         let reopened = open(vec![]).await?;
         assert_eq!(ids(&reopened).await?, vec![2, 4], "{name}: durable");
     }
+    Ok(())
+}
+
+/// Seed `seed` into a table's inline corpus with no `retention_sql`, then reopen
+/// it with `retention`.
+async fn reopen_inline_seeded(
+    fixture: &common::TestFixture,
+    name: &str,
+    keyed: bool,
+    seed: RecordBatch,
+    retention: Vec<Expr>,
+) -> Result<Arc<CayenneTableProvider>, Box<dyn std::error::Error>> {
+    let dir = fixture.data_path.join(name);
+    std::fs::create_dir_all(&dir)?;
+    let key = if keyed {
+        vec!["id".to_string()]
+    } else {
+        vec![]
+    };
+    let options = CreateTableOptions {
+        table_name: name.to_string(),
+        schema: schema(),
+        primary_key: key.clone(),
+        on_conflict: keyed.then(|| OnConflict::Upsert(ColumnReference::new(key))),
+        base_path: dir.to_string_lossy().to_string(),
+        partition_column: None,
+        vortex_config: VortexConfig::default(),
+    };
+    let plain = CayenneTableProvider::create_table_with_retention(
+        Arc::clone(&fixture.catalog) as Arc<dyn MetadataCatalog>,
+        options,
+        vec![],
+        SessionContext::new().runtime_env(),
+    )
+    .await?;
+    let before = plain.inlined_generation();
+    common::insert_batch(&plain, seed).await?;
+    assert!(
+        plain.inlined_generation() > before,
+        "{name}: precondition: the seed is in the inline corpus"
+    );
+    drop(plain);
+    Ok(Arc::new(
+        CayenneTableProviderBuilder::new(
+            Arc::clone(&fixture.catalog) as Arc<dyn MetadataCatalog>,
+            SessionContext::new().runtime_env(),
+        )
+        .with_retention_filters(retention)
+        .open(name)
+        .await?,
+    ))
+}
+
+async fn reopen_plain(
+    fixture: &common::TestFixture,
+    name: &str,
+) -> Result<Arc<CayenneTableProvider>, Box<dyn std::error::Error>> {
+    Ok(Arc::new(
+        CayenneTableProviderBuilder::new(
+            Arc::clone(&fixture.catalog) as Arc<dyn MetadataCatalog>,
+            SessionContext::new().runtime_env(),
+        )
+        .open(name)
+        .await?,
+    ))
+}
+
+/// A predicate error over a preexisting inline corpus fails the write and
+/// publishes nothing: the logical rows are the old ones, immediately and after
+/// a reopen, whatever storage the corpus was moved to; the next evaluable write
+/// applies.
+async fn failing_retention_over_a_preexisting_inline_corpus_publishes_nothing_impl(
+    fixture: common::TestFixture,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let name = "rsql_pub_inline_corpus_fails";
+    // Non-integer statuses make this predicate fail.
+    let failing = cast(col("status"), DataType::Int32).eq(lit(1_i32));
+    let t = reopen_inline_seeded(
+        &fixture,
+        name,
+        true,
+        rows(&[(1, Some("x")), (2, Some("2"))]),
+        vec![failing],
+    )
+    .await?;
+    for attempt in 0..2 {
+        assert!(
+            cdc_apply(&t, rows(&[(3, Some("3"))])).await.is_err(),
+            "attempt {attempt}: retention cannot evaluate the inline row"
+        );
+        assert_eq!(
+            ids(&t).await?,
+            vec![1, 2],
+            "attempt {attempt}: nothing published"
+        );
+        assert_eq!(count_star(&t).await?, 2, "attempt {attempt}: COUNT(*)");
+    }
+    drop(t);
+    assert_eq!(
+        ids(&reopen_plain(&fixture, name).await?).await?,
+        vec![1, 2],
+        "durable"
+    );
+    Ok(())
+}
+
+/// A table without a primary key whose rows were inlined before `retention_sql`
+/// was configured: its next append moves the corpus into files and carries it,
+/// with the retention delete over it, in one generation (previously refused).
+async fn unkeyed_retention_append_carries_a_preexisting_inline_corpus_impl(
+    fixture: common::TestFixture,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let name = "rsql_pub_unkeyed_inline_corpus";
+    let t = reopen_inline_seeded(
+        &fixture,
+        name,
+        false,
+        rows(&[(1, Some("archived")), (2, Some("active"))]),
+        vec![archived()],
+    )
+    .await?;
+    common::insert_batch(
+        t.as_ref(),
+        rows(&[(3, Some("active")), (4, Some("archived"))]),
+    )
+    .await?;
+    assert_eq!(ids(&t).await?, vec![2, 3], "retained at publication");
+    assert_eq!(count_star(&t).await?, 2);
+    drop(t);
+    assert_eq!(
+        ids(&reopen_plain(&fixture, name).await?).await?,
+        vec![2, 3],
+        "durable"
+    );
     Ok(())
 }

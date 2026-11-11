@@ -30598,10 +30598,7 @@ impl CayenneTableProvider {
             // Deferring costs only latency: the in-flight finalize publishes within
             // milliseconds, and re-arming brings the loop back on the next debounce.
             let shadow_present = self.mem_tier_shadow_present.load(Ordering::Acquire);
-            if self.pending_inline_tombstones.load(Ordering::Acquire) > 0
-                || shadow_present
-                || self.has_inflight_staging_appends()
-            {
+            if self.inline_materialization_blocked() {
                 drop(checkpoint_guard);
                 drop(guard);
                 tracing::debug!(
@@ -31612,7 +31609,7 @@ impl CayenneTableProvider {
     /// Fire (and consume) the test-only post-catalog-commit hook, if one is
     /// installed. See [`Self::test_post_catalog_commit_hook`].
     #[cfg(test)]
-    async fn run_test_post_catalog_commit_hook(&self) {
+    pub(crate) async fn run_test_post_catalog_commit_hook(&self) {
         let hook = self.test_post_catalog_commit_hook.lock().take();
         if let Some(hook) = hook {
             hook().await;
@@ -39457,6 +39454,16 @@ impl CayenneTableProvider {
                     self.table_metadata.table_name
                 ))
             })
+    }
+
+    /// Whether moving the inline corpus to files now would duplicate rows: a
+    /// staged inline-conflict tombstone is unpublished, a mem-tier seal shadow is
+    /// held, or an append is finalizing. Read under `write_lock` and
+    /// `mem_checkpoint_lock` (see `apply_retention_filters`).
+    pub(crate) fn inline_materialization_blocked(&self) -> bool {
+        self.pending_inline_tombstones.load(Ordering::Acquire) > 0
+            || self.mem_tier_shadow_present.load(Ordering::Acquire)
+            || self.has_inflight_staging_appends()
     }
 
     /// Flush inlined rows to Vortex files when pending inline data exists.
@@ -74069,6 +74076,79 @@ mod tests {
     /// and that buffer is what absorbs an empty batch on an ordinary table — so the
     /// batch goes to the plain-append arm and writes zero rows. Partitioned tables
     /// take the same route. An empty refresh tick is the steady state for both.
+    /// A retention append to a table without a primary key publishes a carried
+    /// generation. A caller cancelled after its catalog commit must not leave
+    /// the provider serving the replaced generation: the commit and the publish
+    /// run on one owned task, so the committed rows are served, and a later
+    /// append (which copies the served generation) keeps them, also across a
+    /// reopen (Codex adversarial review F1).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_cancelled_carried_retention_append_still_publishes_its_commit() {
+        let ctx = SessionContext::new();
+        let (provider, catalog, _tmp) =
+            create_retention_table("carried_cancel", ctx.runtime_env(), 0).await;
+        let schema = Arc::clone(&provider.table_metadata.schema);
+        insert_batch_with_context(
+            &ctx,
+            &provider,
+            id_value_batch(Arc::clone(&schema), &[1], &[60]),
+        )
+        .await;
+        let (entered_tx, entered_rx) = tokio::sync::oneshot::channel::<()>();
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel::<()>();
+        *provider.test_post_catalog_commit_hook.lock() = Some(Box::new(move || {
+            Box::pin(async move {
+                let _ = entered_tx.send(());
+                let _ = release_rx.await;
+            })
+        }));
+        let writer = provider.clone_for_write();
+        let (writer_ctx, writer_schema) = (ctx.clone(), Arc::clone(&schema));
+        let append = tokio::spawn(async move {
+            insert_batch_with_context(
+                &writer_ctx,
+                &writer,
+                id_value_batch(writer_schema, &[2], &[70]),
+            )
+            .await;
+        });
+        entered_rx
+            .await
+            .expect("the append reached its post-commit point");
+        append.abort();
+        assert!(
+            append.await.is_err_and(|e| e.is_cancelled()),
+            "the caller was cancelled"
+        );
+        release_tx.send(()).expect("release the publish");
+        // The owned task publishes under `write_lock`; taking it waits for that.
+        drop(provider.write_lock.lock().await);
+        assert_eq!(
+            scan_id_values(&provider).await,
+            vec![(1, 60), (2, 70)],
+            "the committed generation is served after its caller was cancelled"
+        );
+        insert_batch_with_context(
+            &ctx,
+            &provider,
+            id_value_batch(Arc::clone(&schema), &[3], &[80]),
+        )
+        .await;
+        assert_eq!(
+            scan_id_values(&provider).await,
+            vec![(1, 60), (2, 70), (3, 80)]
+        );
+        let reopened = CayenneTableProviderBuilder::new(catalog, ctx.runtime_env())
+            .open("carried_cancel")
+            .await
+            .expect("reopen");
+        assert_eq!(
+            scan_id_values(&reopened).await,
+            vec![(1, 60), (2, 70), (3, 80)],
+            "durable: no committed append was overwritten"
+        );
+    }
+
     #[tokio::test]
     async fn an_append_that_writes_no_rows_leaves_the_sequence_high_water_alone() {
         let ctx = SessionContext::new();
