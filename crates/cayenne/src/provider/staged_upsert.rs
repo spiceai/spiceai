@@ -201,6 +201,10 @@ impl CayenneStagedUpsert {
             .sync_local_snapshot_dir(&self.new_snapshot_id)
             .await?;
 
+        if self.publishes_carried_generation()? {
+            return self.prepare_generation_commit().await;
+        }
+
         let (checkpoint_guard, resident_retention) =
             self.prepare_resident_retention_for_commit().await?;
         let on_conflict_deletions = std::mem::take(&mut self.on_conflict_deletions);
@@ -244,9 +248,61 @@ impl CayenneStagedUpsert {
             stats: self.stats,
             row_count: self.row_count,
             superseded: self.superseded,
-            publish,
-            resident_retention,
+            publication: TxnPublication::Protected {
+                publish,
+                resident_retention,
+            },
             _checkpoint_guard: checkpoint_guard,
+        })
+    }
+
+    /// Whether this table's transactional write publishes a carried generation
+    /// rather than a protected snapshot: a table without a primary key whose
+    /// deletes are per file. Its protected snapshots are not reloaded on open
+    /// (`load_protected_snapshots` loads none for that shape), so a committed
+    /// transaction's rows published as one would be lost on reopen.
+    fn publishes_carried_generation(&self) -> Result<bool> {
+        Ok(self.table.key_resolver()?.is_none()
+            && self.table.pk_deletion_strategy.is_position_based())
+    }
+
+    /// [`Self::prepare_commit`] for [`Self::publishes_carried_generation`]: under
+    /// the transaction's held `write_lock` (after its optimistic check), take
+    /// the mem-tier checkpoint lock as a durable write does, then carry every
+    /// committed published run into the staged snapshot, with the run's deletes
+    /// and, under `retention_sql`, the resident rows the publication's retention
+    /// matches. The shared commit flips `current_snapshot_id` to the staged
+    /// snapshot, so the complete current generation holds the transaction's
+    /// rows; no recovery or load path changes. An error publishes nothing and
+    /// removes the staged snapshot.
+    async fn prepare_generation_commit(self) -> Result<PreparedTxnCommit> {
+        let checkpoint_guard = self
+            .table
+            .lock_mem_tier_checkpoint_for_durable_write()
+            .await;
+        let prepare = self.table.prepare_transaction_generation(
+            self.new_snapshot_id.clone(),
+            self.row_count,
+            Arc::clone(&self.stats),
+        );
+        let generation = match self.publication_filters.clone() {
+            Some(filters) => {
+                super::overwrite_retention::with_publication_retention(filters, prepare).await?
+            }
+            None => prepare.await?,
+        };
+        Ok(PreparedTxnCommit {
+            table: self.table,
+            new_snapshot_id: self.new_snapshot_id,
+            validated_keys: self.validated_keys,
+            stats: self.stats,
+            row_count: self.row_count,
+            superseded: self.superseded,
+            publication: TxnPublication::Generation {
+                generation: Some(generation),
+                committed: false,
+            },
+            _checkpoint_guard: Some(checkpoint_guard),
         })
     }
 
@@ -352,19 +408,38 @@ pub struct PreparedTxnCommit {
     stats: Arc<ColumnStatsAccumulator>,
     row_count: u64,
     superseded: usize,
-    /// The deferred on-conflict publish (trunk's `durable_payload` model): its
-    /// `durable_payload` carries the delete-vector files, protected-snapshot
-    /// sequence, inline tombstone, and deferred flips, applied in the shared
-    /// transaction by [`Self::apply_in_txn`]. Its `Drop` cleans up the staged
-    /// deletion-vector files unless [`Self::mark_committed`] disarms it.
-    publish: super::on_conflict::PreparedOnConflictDeletionPublish,
-    /// The `retention_sql` delete over the resident rows this publication
-    /// keeps; its files are in the publish's durable payload. Its `Drop` removes
-    /// them unless the shared commit may reference them.
-    resident_retention: Option<super::delete::PreparedDeletionPublish>,
+    /// What the shared commit publishes for this table.
+    publication: TxnPublication,
     /// Held with `write_lock` from preparation through `finish`, as a durable
     /// write holds it, so a checkpoint cannot move rows the delete was decided on.
     _checkpoint_guard: Option<tokio::sync::OwnedMutexGuard<()>>,
+}
+
+/// How a transaction publishes one table's staged snapshot.
+enum TxnPublication {
+    /// A keyed table, or one whose deletes are by key: the staged snapshot
+    /// becomes a protected snapshot.
+    Protected {
+        /// The deferred on-conflict publish (trunk's `durable_payload` model):
+        /// its `durable_payload` carries the delete-vector files,
+        /// protected-snapshot sequence, inline tombstone, and deferred flips,
+        /// applied in the shared transaction by [`PreparedTxnCommit::apply_in_txn`].
+        /// Its `Drop` cleans up the staged deletion-vector files unless
+        /// [`PreparedTxnCommit::mark_committed`] disarms it.
+        publish: super::on_conflict::PreparedOnConflictDeletionPublish,
+        /// The `retention_sql` delete over the resident rows this publication
+        /// keeps; its files are in the publish's durable payload. Its `Drop`
+        /// removes them unless the shared commit may reference them.
+        resident_retention: Option<super::delete::PreparedDeletionPublish>,
+    },
+    /// A table without a primary key whose deletes are per file: the staged
+    /// snapshot, carrying every committed run, becomes the current snapshot.
+    /// `None` once published or rolled back, so each runs exactly once.
+    Generation {
+        generation: Option<super::overwrite::PreparedOverwrite>,
+        /// The shared commit is (or may be) durable: rollback keeps the files.
+        committed: bool,
+    },
 }
 
 impl PreparedTxnCommit {
@@ -399,9 +474,24 @@ impl PreparedTxnCommit {
         catalog: &crate::CayenneCatalog,
         txn: &mut dyn crate::metastore::MetastoreTransaction,
     ) -> crate::catalog::CatalogResult<()> {
-        catalog
-            .apply_prepared_on_conflict_in_txn(txn, &mut self.publish)
-            .await?;
+        let sequence = match &mut self.publication {
+            TxnPublication::Protected { publish, .. } => {
+                catalog
+                    .apply_prepared_on_conflict_in_txn(txn, publish)
+                    .await?;
+                publish.snapshot_sequence
+            }
+            TxnPublication::Generation { generation, .. } => {
+                let Some(generation) = generation.as_ref() else {
+                    return Err(crate::catalog::CatalogError::InvalidOperationNoSource {
+                        message: "a transaction generation was applied after it was released"
+                            .to_string(),
+                    });
+                };
+                generation.apply_in_txn(catalog, txn).await?;
+                self.table.sequence_high_water().await
+            }
+        };
         // Durable federated write-back (#11838): on a durable-write-back table,
         // durably mark the written PKs (their `OwnedRow` encodings) in the SAME
         // commit transaction so the delivery worker reconciles them to the
@@ -414,34 +504,54 @@ impl PreparedTxnCommit {
                 .collect();
             if !dirty_pk_bytes.is_empty() {
                 catalog
-                    .mark_dirty_keys_in_txn(
-                        txn,
-                        self.table.table_id(),
-                        &dirty_pk_bytes,
-                        self.publish.snapshot_sequence,
-                    )
+                    .mark_dirty_keys_in_txn(txn, self.table.table_id(), &dirty_pk_bytes, sequence)
                     .await?;
             }
         }
         Ok(())
     }
 
-    /// The staged snapshot this commit publishes.
-    pub(crate) fn snapshot_id(&self) -> &str {
-        &self.new_snapshot_id
-    }
-
-    /// The sequence the staged snapshot commits under.
-    pub(crate) fn snapshot_sequence(&self) -> i64 {
-        self.publish.snapshot_sequence
+    /// Read back whether the shared commit published this table, after a
+    /// COMMIT that reported a failure: a protected snapshot by its staged
+    /// snapshot-sequence row, a carried generation by `current_snapshot_id`
+    /// (its commit removes every snapshot-sequence row instead).
+    pub(crate) async fn read_back_committed(
+        &self,
+        catalog: &crate::CayenneCatalog,
+    ) -> crate::catalog::CatalogResult<bool> {
+        match &self.publication {
+            TxnPublication::Protected { publish, .. } => {
+                Ok(super::append_commit::snapshot_sequence(
+                    catalog,
+                    self.table.table_id(),
+                    &self.new_snapshot_id,
+                )
+                .await?
+                    == Some(publish.snapshot_sequence))
+            }
+            TxnPublication::Generation { .. } => Ok(super::append_commit::current_snapshot_id(
+                catalog,
+                self.table.table_id(),
+            )
+            .await?
+                == self.new_snapshot_id),
+        }
     }
 
     /// Keep this table's staged files and refuse its writes until it is
     /// reloaded, after a shared commit whose outcome could not be read back.
     pub(crate) fn retain_after_unknown_outcome(&mut self) {
-        self.publish.retain_files_for_wal_recovery();
-        if let Some(resident) = self.resident_retention.as_mut() {
-            resident.mark_catalog_committed();
+        match &mut self.publication {
+            TxnPublication::Protected {
+                publish,
+                resident_retention,
+            } => {
+                publish.retain_files_for_wal_recovery();
+                if let Some(resident) = resident_retention.as_mut() {
+                    resident.mark_catalog_committed();
+                }
+            }
+            TxnPublication::Generation { committed, .. } => *committed = true,
         }
         self.table
             .publication_outcome_unknown()
@@ -452,9 +562,17 @@ impl PreparedTxnCommit {
     /// transaction has durably committed (mirrors the sync path's
     /// post-commit `mark_catalog_committed`).
     pub(crate) fn mark_committed(&mut self) {
-        self.publish.mark_catalog_committed();
-        if let Some(resident) = self.resident_retention.as_mut() {
-            resident.mark_catalog_committed();
+        match &mut self.publication {
+            TxnPublication::Protected {
+                publish,
+                resident_retention,
+            } => {
+                publish.mark_catalog_committed();
+                if let Some(resident) = resident_retention.as_mut() {
+                    resident.mark_catalog_committed();
+                }
+            }
+            TxnPublication::Generation { committed, .. } => *committed = true,
         }
     }
 
@@ -467,14 +585,27 @@ impl PreparedTxnCommit {
     ///
     /// Returns an error only if swapping the in-memory deletion caches fails.
     pub fn finish(mut self) -> Result<u64> {
-        let sequence = self.publish.snapshot_sequence;
-        let resident_retention = self.resident_retention.take();
+        let (publish, resident_retention) = match std::mem::replace(
+            &mut self.publication,
+            TxnPublication::Generation {
+                generation: None,
+                committed: true,
+            },
+        ) {
+            TxnPublication::Protected {
+                publish,
+                resident_retention,
+            } => (publish, resident_retention),
+            TxnPublication::Generation { generation, .. } => {
+                return self.finish_generation(generation);
+            }
+        };
+        let sequence = publish.snapshot_sequence;
         // Taken before the publish below, which makes this transaction's staged
         // rows visible while the `num_rows` delta describing them only reaches
         // the maintenance queue afterwards.
         let reserved_live_rows_delta = self.table.reserve_live_rows_delta();
-        self.table
-            .publish_prepared_on_conflict_deletions(self.publish);
+        self.table.publish_prepared_on_conflict_deletions(publish);
         // The resident rows this publication's retention delete removes become
         // invisible in the same held-fence flip as the staged rows appear.
         if let Some(resident) = resident_retention {
@@ -521,11 +652,54 @@ impl PreparedTxnCommit {
         Ok(self.row_count)
     }
 
+    /// [`Self::finish`] for a carried generation. Lock ownership and order: the
+    /// transaction holds this table's `write_lock`, then its visibility lock,
+    /// then its `listing_fence` write guard (canonical participant order), and
+    /// this flips visibility synchronously under them without re-acquiring
+    /// any; the steps that await (statistics, cleanup scheduling, the manifest
+    /// prune) start on their own task, which takes what it needs after the
+    /// transaction releases them and runs once even if the caller is cancelled.
+    fn finish_generation(
+        self,
+        generation: Option<super::overwrite::PreparedOverwrite>,
+    ) -> Result<u64> {
+        let Some(generation) = generation else {
+            return Err(Error::Internal {
+                table: self.table.table_name().to_string(),
+                message: "a transaction generation was published twice".to_string(),
+            });
+        };
+        generation.publish_under_held_fence()?;
+        // The flip replaced the visible rows: maintained aggregates and the
+        // cached keyset describe the previous generation.
+        self.table.mark_maintained_aggregates_stale();
+        self.table.feed_staged_ivm_under_fence(None);
+        Ok(self.row_count)
+    }
+
     /// Discard a prepared-but-uncommitted table (the shared transaction was not
     /// committed): the publish's `Drop` removes its staged deletion-vector files
     /// (still armed — `mark_committed` was never called); this also removes the
-    /// unreferenced staged replacement-snapshot directory.
-    pub async fn rollback(self) {
+    /// unreferenced staged replacement-snapshot directory. A carried generation
+    /// whose commit is or may be durable keeps its files.
+    pub async fn rollback(mut self) {
+        if let TxnPublication::Generation {
+            generation,
+            committed,
+        } = &mut self.publication
+        {
+            if let Some(generation) = generation.take()
+                && !*committed
+                && let Err(error) = generation.rollback().await
+            {
+                tracing::warn!(
+                    table = %self.table.table_name(),
+                    %error,
+                    "failed to remove an uncommitted transaction generation"
+                );
+            }
+            return;
+        }
         cleanup_orphan_snapshot_dir(&self.table, &self.new_snapshot_id).await;
     }
 }

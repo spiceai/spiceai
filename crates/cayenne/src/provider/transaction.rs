@@ -516,11 +516,9 @@ async fn resolve_failed_fused_commit(
     let mut committed = 0;
     let mut unreadable = None;
     for pc in prepared.iter() {
-        match super::append_commit::snapshot_sequence(catalog, pc.table_id(), pc.snapshot_id())
-            .await
-        {
-            Ok(Some(sequence)) if sequence == pc.snapshot_sequence() => committed += 1,
-            Ok(_) => {}
+        match pc.read_back_committed(catalog).await {
+            Ok(true) => committed += 1,
+            Ok(false) => {}
             Err(read_error) => {
                 unreadable = Some(read_error);
                 break;

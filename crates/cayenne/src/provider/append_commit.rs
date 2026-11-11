@@ -321,6 +321,29 @@ pub(super) async fn snapshot_sequence(
     catalog.get_snapshot_sequence(table_id, snapshot_id).await
 }
 
+/// The table's durable `current_snapshot_id`, read back after a COMMIT that
+/// reported a failure.
+#[cfg(not(test))]
+pub(super) async fn current_snapshot_id(
+    catalog: &CayenneCatalog,
+    table_id: &str,
+) -> CatalogResult<String> {
+    catalog.current_snapshot_id_for_table(table_id).await
+}
+
+#[cfg(test)]
+pub(super) async fn current_snapshot_id(
+    catalog: &CayenneCatalog,
+    table_id: &str,
+) -> CatalogResult<String> {
+    if test_seams::read_back_fails(table_id) {
+        return Err(crate::catalog::CatalogError::InvalidOperationNoSource {
+            message: "injected read-back failure".to_string(),
+        });
+    }
+    catalog.current_snapshot_id_for_table(table_id).await
+}
+
 #[cfg(test)]
 pub(super) async fn commit_transaction(
     txn: Box<dyn MetastoreTransaction>,

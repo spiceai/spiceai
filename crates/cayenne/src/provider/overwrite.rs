@@ -318,7 +318,32 @@ impl PreparedOverwrite {
                 &self.position_deletions,
             )
             .await?;
+        self.after_flip(discarded_epoch).await
+    }
 
+    /// Flip in-memory visibility for a transaction's carried generation under
+    /// the fences the transaction already holds (its `listing_fence` write
+    /// guard among them, never re-acquired here), then start the remaining
+    /// steps of [`Self::finish`] on their own task, which runs them exactly once
+    /// whether or not the caller keeps waiting. The table has no in-memory tier
+    /// to discard (a table without a primary key never uses one).
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if building the new listing table fails; the catalog
+    /// already holds the generation, so reopening rebuilds it.
+    pub(crate) fn publish_under_held_fence(self) -> Result<u64> {
+        self.table.publish_carried_generation_under_held_fence(
+            &self.new_snapshot_id,
+            &self.position_deletions,
+        )?;
+        let row_count = self.row_count;
+        drop(tokio::spawn(self.after_flip(None)));
+        Ok(row_count)
+    }
+
+    /// The steps of [`Self::finish`] after the visibility flip.
+    async fn after_flip(self, discarded_epoch: Option<u64>) -> Result<u64> {
         // Arm retention the moment the flip commits, the same way an append does (see
         // `AppendMutationWriter::write_prepared_stream`). An overwrite reloads every
         // source row, so a `retention_sql` predicate has to run again over the new
@@ -1013,55 +1038,15 @@ impl CayenneTableProvider {
                 ));
             }
         }
-        // The new generation carries every published run: the current snapshot
-        // and each protected snapshot (a committed transactional write to a
-        // table without a primary key publishes its rows as one). Captured
-        // together under the listing fence, as a scan captures them. A staged
-        // transaction that has not committed owns an unregistered directory that
-        // is neither in this set nor touched here; its commit then fails the
-        // optimistic check this flip trips. The flip clears the protected
-        // entries only because their rows are carried, with their deletes.
-        let (source_snapshot_id, protected_runs) = self.published_runs().await;
         let new_snapshot_id = uuid::Uuid::now_v7().to_string();
         let is_s3 = self.table_path().starts_with("s3://");
         if !is_s3 {
             Self::ensure_snapshot_dir_exists(&self.snapshot_dir_path_for(&new_snapshot_id)).await?;
         }
         let staged: Result<(u64, HashMap<String, Vec<u32>>, Arc<ColumnStatsAccumulator>)> = async {
-            // `retention_sql` over the previous generation as it is visible, in
-            // place: its deleted rows are skipped before the predicate runs and
-            // its matches join them. The appended rows were already filtered by
-            // the same predicate context (`drop_retention_matches_from_stream`),
-            // so no row is evaluated twice.
-            let mut visible_deletes: HashMap<String, Vec<u32>> = self
-                .pk_deletion_strategy
-                .position_cache()
-                .load()
-                .iter()
-                .filter(|(_, vector)| !vector.is_empty())
-                .map(|(path, vector)| (path.clone(), vector.to_bitmap().iter().collect()))
-                .collect();
-            // Each carried run's deletes, and every row the predicate matches
-            // among the rows they leave visible, evaluated in the publication's
-            // one retention context. A delete on no carried run is refused.
-            let mut carried_runs: Vec<String> = vec![source_snapshot_id.clone()];
-            carried_runs.extend(protected_runs.iter().cloned());
-            let mut run_deletes: Vec<(String, HashMap<String, Vec<u32>>)> =
-                Vec::with_capacity(carried_runs.len());
-            for run in &carried_runs {
-                let marker = format!("/{run}/");
-                let (mine, rest): (HashMap<_, _>, HashMap<_, _>) = visible_deletes
-                    .into_iter()
-                    .partition(|(path, _)| path.contains(&marker));
-                visible_deletes = rest;
-                let hidden = self.hide_retention_matches_in_snapshot(run, mine).await?;
-                run_deletes.push((run.clone(), hidden));
-            }
-            if let Some(path) = visible_deletes.keys().next() {
-                return Err(internal(format!(
-                    "a delete on {path} addresses no published run of the table"
-                )));
-            }
+            // The appended rows were already filtered by the publication's
+            // retention context (`drop_retention_matches_from_stream`), so the
+            // carry below evaluates only the previous generation's rows.
             let (row_count, _files, stats) = self
                 .write_to_snapshot_with_schema(
                     data,
@@ -1075,37 +1060,7 @@ impl CayenneTableProvider {
                     self.table_schema(),
                 )
                 .await?;
-            // Carry the previous generation's files. Names are unique per write,
-            // but a collision would overwrite a file, so it is refused.
-            let appended: std::collections::HashSet<String> = self
-                .list_snapshot_files_with_sizes(&new_snapshot_id)
-                .await?
-                .into_iter()
-                .map(|(name, _)| name)
-                .collect();
-            let mut carried_names: std::collections::HashSet<String> = appended;
-            let to = format!("/{new_snapshot_id}/");
-            let mut deletions = HashMap::new();
-            for (run, hidden) in run_deletes {
-                let resident = self.list_snapshot_files_with_sizes(&run).await?;
-                if let Some((name, _)) = resident.iter().find(|(name, _)| carried_names.contains(name)) {
-                    return Err(internal(format!(
-                        "carried file {name} of run {run} collides with another file of the new generation"
-                    )));
-                }
-                carried_names.extend(resident.iter().map(|(name, _)| name.clone()));
-                let names: Vec<&str> = resident.iter().map(|(name, _)| name.as_str()).collect();
-                self.link_or_copy_snapshot_files(&run, &new_snapshot_id, &names)
-                    .await?;
-                // Re-key the run's deletes to the carried paths.
-                let from = format!("/{run}/");
-                for (path, rows) in hidden {
-                    deletions.insert(path.replacen(&from, &to, 1), rows);
-                }
-            }
-            self.sync_local_snapshot_dir(&new_snapshot_id)
-                .await
-                .map_err(|source| super::Error::Catalog { source })?;
+            let deletions = self.carry_published_runs_into(&new_snapshot_id).await?;
             Ok((row_count, deletions, stats))
         }
         .await;
@@ -1155,6 +1110,192 @@ impl CayenneTableProvider {
             delete_files,
             position_deletions,
         })
+    }
+
+    /// Carry every published run of a table without a primary key into the
+    /// unpublished snapshot `new_snapshot_id`, whose own files are already
+    /// written, and return the position deletes the new generation needs: each
+    /// run's visible deletes re-keyed to the carried paths, plus, when the table
+    /// has `retention_sql`, every row the predicate matches among the rows they
+    /// leave visible, evaluated in the caller's publication retention context.
+    ///
+    /// The runs are the current snapshot and each protected snapshot (a
+    /// committed transactional write publishes its rows as one), captured
+    /// together under the listing fence, as a scan captures them. A staged
+    /// transaction that has not committed owns an unregistered directory that is
+    /// neither in this set nor touched here. The caller holds `write_lock` and
+    /// flips `current_snapshot_id` to `new_snapshot_id` with
+    /// `commit_overwrite_in_txn`, which retires the protected entries only
+    /// because their rows are carried, with their deletes. A delete on no carried
+    /// run, or a file-name collision, is refused.
+    pub(crate) async fn carry_published_runs_into(
+        &self,
+        new_snapshot_id: &str,
+    ) -> Result<HashMap<String, Vec<u32>>> {
+        let internal = |message: String| super::Error::Internal {
+            table: self.table_name().to_string(),
+            message,
+        };
+        let (source_snapshot_id, protected_runs) = self.published_runs().await;
+        let mut visible_deletes: HashMap<String, Vec<u32>> = self
+            .pk_deletion_strategy
+            .position_cache()
+            .load()
+            .iter()
+            .filter(|(_, vector)| !vector.is_empty())
+            .map(|(path, vector)| (path.clone(), vector.to_bitmap().iter().collect()))
+            .collect();
+        let mut carried_runs: Vec<String> = vec![source_snapshot_id];
+        carried_runs.extend(protected_runs);
+        let mut run_deletes: Vec<(String, HashMap<String, Vec<u32>>)> =
+            Vec::with_capacity(carried_runs.len());
+        for run in &carried_runs {
+            let marker = format!("/{run}/");
+            let (mine, rest): (HashMap<_, _>, HashMap<_, _>) = visible_deletes
+                .into_iter()
+                .partition(|(path, _)| path.contains(&marker));
+            visible_deletes = rest;
+            let hidden = self.hide_retention_matches_in_snapshot(run, mine).await?;
+            run_deletes.push((run.clone(), hidden));
+        }
+        if let Some(path) = visible_deletes.keys().next() {
+            return Err(internal(format!(
+                "a delete on {path} addresses no published run of the table"
+            )));
+        }
+        // Names are unique per write, but a collision would overwrite a file,
+        // so it is refused.
+        let mut carried_names: std::collections::HashSet<String> = self
+            .list_snapshot_files_with_sizes(new_snapshot_id)
+            .await?
+            .into_iter()
+            .map(|(name, _)| name)
+            .collect();
+        let to = format!("/{new_snapshot_id}/");
+        let mut deletions = HashMap::new();
+        for (run, hidden) in run_deletes {
+            let resident = self.list_snapshot_files_with_sizes(&run).await?;
+            if let Some((name, _)) = resident
+                .iter()
+                .find(|(name, _)| carried_names.contains(name))
+            {
+                return Err(internal(format!(
+                    "carried file {name} of run {run} collides with another file of the new generation"
+                )));
+            }
+            carried_names.extend(resident.iter().map(|(name, _)| name.clone()));
+            let names: Vec<&str> = resident.iter().map(|(name, _)| name.as_str()).collect();
+            self.link_or_copy_snapshot_files(&run, new_snapshot_id, &names)
+                .await?;
+            let from = format!("/{run}/");
+            for (path, rows) in hidden {
+                deletions.insert(path.replacen(&from, &to, 1), rows);
+            }
+        }
+        self.sync_local_snapshot_dir(new_snapshot_id)
+            .await
+            .map_err(|source| super::Error::Catalog { source })?;
+        Ok(deletions)
+    }
+
+    /// The carried generation a committed transactional write to a table
+    /// without a primary key publishes: its staged snapshot `new_snapshot_id`,
+    /// holding the staged rows and every carried run, flipped to the current
+    /// snapshot in the transaction's shared catalog commit. Prepared under the
+    /// transaction's held `write_lock`, so the deletion vectors draw the
+    /// sequence that moves the high water (or one is drawn for them). Holds no
+    /// lock of its own: the transaction owns `write_lock` and the fences.
+    /// Abandons the snapshot on error.
+    pub(crate) async fn prepare_transaction_generation(
+        &self,
+        new_snapshot_id: String,
+        row_count: u64,
+        write_stats_acc: Arc<ColumnStatsAccumulator>,
+    ) -> Result<PreparedOverwrite> {
+        let carried = async {
+            self.materialize_inline_rows_for_carry().await?;
+            self.carry_published_runs_into(&new_snapshot_id).await
+        }
+        .await;
+        let position_deletions = match carried {
+            Ok(deletions) => deletions,
+            Err(error) => {
+                self.abandon_overwrite_snapshot(&new_snapshot_id).await;
+                return Err(error);
+            }
+        };
+        let delete_files = if position_deletions.is_empty() {
+            Vec::new()
+        } else {
+            match self
+                .write_position_deletion_vectors(&new_snapshot_id, &position_deletions)
+                .await
+            {
+                Ok(files) => files,
+                Err(error) => {
+                    self.abandon_overwrite_snapshot(&new_snapshot_id).await;
+                    return Err(error);
+                }
+            }
+        };
+        // The transaction's OCC token is the sequence high water: a write that
+        // publishes rows moves it, as every other write route does.
+        if delete_files.is_empty()
+            && let Err(error) = self.reserve_sequences_local(1).await
+        {
+            self.abandon_overwrite_snapshot(&new_snapshot_id).await;
+            return Err(error.into());
+        }
+        Ok(PreparedOverwrite {
+            table: self.clone_for_write(),
+            write_guard: None,
+            checkpoint_guard: None,
+            new_snapshot_id,
+            row_count,
+            write_stats_acc,
+            carries_resident_files: true,
+            inlined: None,
+            _inline_admission: None,
+            delete_files,
+            position_deletions,
+        })
+    }
+
+    /// Move the inline corpus of a table without a primary key into its current
+    /// snapshot (which is then carried), under the caller's `write_lock`, as a
+    /// carried retention append does: the generation flip clears the inline
+    /// corpus. Changes where rows are stored, not which are visible; refuses
+    /// when the move could duplicate rows.
+    async fn materialize_inline_rows_for_carry(&self) -> Result<()> {
+        let internal = |message: String| super::Error::Internal {
+            table: self.table_name().to_string(),
+            message,
+        };
+        let inlined = || async {
+            self.catalog()
+                .get_inlined_data_count(self.table_id())
+                .await
+                .map_err(|source| super::Error::Catalog { source })
+        };
+        if inlined().await? == 0 {
+            return Ok(());
+        }
+        if self.inline_materialization_blocked() {
+            return Err(internal(
+                "the inline rows cannot be moved to files while append finalization or a staged \
+                 inline tombstone is in flight; retry the write"
+                    .to_string(),
+            ));
+        }
+        self.checkpoint_inlined_data_if_present_for_delete()
+            .await
+            .map_err(|source| super::Error::DataFusion { source })?;
+        if inlined().await? > 0 {
+            return Err(internal(
+                "inline rows remained after moving them to files".to_string(),
+            ));
+        }
+        Ok(())
     }
 
     /// Write position deletion vectors for `position_deletions`, at a fresh

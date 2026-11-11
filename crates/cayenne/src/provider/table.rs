@@ -6992,6 +6992,48 @@ impl CayenneTableProvider {
         Ok(discarded_epoch)
     }
 
+    /// [`Self::publish_overwrite_snapshot`] for a transaction's carried
+    /// generation, whose caller already holds `listing_fence.write()` (taken in
+    /// the transaction's canonical lock order) and must not have it re-acquired.
+    /// A table without a primary key never holds rows in the in-memory tier, so
+    /// there is nothing to discard; a non-empty tier is refused.
+    pub(crate) fn publish_carried_generation_under_held_fence(
+        &self,
+        new_snapshot_id: &str,
+        position_deletions: &HashMap<String, Vec<u32>>,
+    ) -> Result<()> {
+        if !self.mem_tier.is_empty() {
+            return Err(Error::Internal {
+                table: self.table_name().to_string(),
+                message: "a carried transaction generation cannot discard in-memory tier rows"
+                    .to_string(),
+            });
+        }
+        let new_listing_table = self.build_overwrite_listing_table(new_snapshot_id)?;
+        let position_deletions: Option<PositionBitmap> =
+            (!position_deletions.is_empty()).then(|| {
+                position_deletions
+                    .iter()
+                    .map(|(file, rows)| {
+                        (
+                            file.clone(),
+                            Arc::new(PositionDeletionVector::new(rows.iter().copied().collect())),
+                        )
+                    })
+                    .collect()
+            });
+        // The generation's catalog commit deleted every inline row of this
+        // table, any seal shadow included.
+        self.mem_tier_shadow_present.store(false, Ordering::Release);
+        self.publish_overwrite_snapshot_fenced(
+            new_snapshot_id,
+            new_listing_table,
+            None,
+            position_deletions,
+        );
+        Ok(())
+    }
+
     /// Make an inlined overwrite's replacement rows readable BEFORE its catalog
     /// transaction runs. Called from [`Self::begin_overwrite`], under the
     /// per-table write lock, once the payload is built and its sequence reserved.
@@ -84317,5 +84359,6 @@ mod tests {
     mod hybrid_retention;
     mod layered_upsert_state;
     mod repeated_keys;
+    mod unkeyed_transaction_generation;
     mod update_visibility;
 }
