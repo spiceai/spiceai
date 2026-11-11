@@ -72015,17 +72015,27 @@ mod tests {
         );
     }
 
-    /// The pipelined CDC path reaches its inline commit without consulting
-    /// `InlineMutationPolicy`, so unlike the staged path it can inline on a table that
-    /// has retention delete filters — and that commit is the only place on the route
-    /// that can arm retention, because an inlined outcome returns
-    /// `CayenneCdcWrite::completed`, whose `finish` schedules nothing.
+    /// A durable CDC apply to a `retention_sql` table publishes each batch with its
+    /// retention delete, by the synchronous staged route (`write_as`), even where
+    /// the pipelined route would have inlined it.
     ///
-    /// Drives that outcome for real rather than seeding a corpus, so the branch cannot
-    /// quietly return to `false` and stay green: the write must inline, and the pass it
-    /// schedules must remove the matching row.
+    /// This replaces the earlier contract of this test, under which the pipelined
+    /// route inlined the batch without consulting `InlineMutationPolicy` and armed a
+    /// later retention pass that removed the matching row, leaving it visible until
+    /// that pass ran. Retention is now owed at publication: the matching row is
+    /// never published. The cost is deliberate and is a performance and storage-path
+    /// change, not a behavioral no-op: such a table no longer pipelines its CDC
+    /// applies or inlines them into the metastore corpus, as every other producer
+    /// already refused for retention tables (`inline_overwrite_admissible`,
+    /// `InlineMutationPolicy::from_blocking_conditions`).
+    ///
+    /// Asserted: the write completes synchronously (nothing left to finalize); the
+    /// retained rows are visible immediately, before any maintenance; nothing was
+    /// inlined (intentional); no key cache drops a later write of a removed key; a
+    /// batch whose retention cannot evaluate publishes nothing and the next batch
+    /// applies; a reopen reads exactly the published rows.
     #[tokio::test]
-    async fn pipelined_inline_cdc_write_arms_the_retention_it_schedules() {
+    async fn durable_cdc_retention_publishes_retained_rows_without_inlining() {
         let ctx = SessionContext::new();
         let temp_dir = tempfile::tempdir().expect("temp dir");
         let metadata_dir = format!("{}/metadata", temp_dir.path().to_str().expect("str path"));
@@ -72041,72 +72051,122 @@ mod tests {
             Field::new("id", DataType::Int64, false),
             Field::new("value", DataType::Int64, false),
         ]));
-        let provider = CayenneTableProviderBuilder::new(catalog, ctx.runtime_env())
-            .with_retention_filters(vec![retention_predicate()])
-            .create(CreateTableOptions {
-                table_name: "pipelined_inline_retention".to_string(),
-                schema: Arc::clone(&schema),
-                primary_key: vec!["id".to_string()],
-                on_conflict: Some(OnConflict::Upsert(
-                    datafusion_table_providers::util::column_reference::ColumnReference::new(vec![
-                        "id".to_string(),
-                    ]),
-                )),
-                base_path: data_dir,
-                partition_column: None,
-                vortex_config: VortexConfig {
-                    // Room to inline: the batch must be absorbed into the metastore
-                    // corpus rather than spilling to a Vortex file.
-                    inline_max_rows: 1024,
-                    compaction_background_interval_ms: 3_600_000,
-                    ..VortexConfig::default()
-                },
-            })
+        // `100 / (value - 13) < 0` is `value < 13` for every other value, and fails
+        // to evaluate (division by zero) on `value = 13`.
+        let fails_on_13 = (datafusion_expr::lit(100_i64)
+            / (datafusion_expr::col("value") - datafusion_expr::lit(13_i64)))
+        .lt(datafusion_expr::lit(0_i64));
+        let config = VortexConfig {
+            // Room to inline: the pipelined route would have absorbed these
+            // batches into the metastore corpus.
+            inline_max_rows: 1024,
+            compaction_background_interval_ms: 3_600_000,
+            ..VortexConfig::default()
+        };
+        let create = |name: &str, filter: Expr| {
+            let catalog = Arc::clone(&catalog);
+            let schema = Arc::clone(&schema);
+            let config = config.clone();
+            let data_dir = format!("{data_dir}/{name}");
+            let name = name.to_string();
+            let runtime_env = ctx.runtime_env();
+            async move {
+                CayenneTableProviderBuilder::new(catalog, runtime_env)
+                    .with_retention_filters(vec![filter])
+                    .create(CreateTableOptions {
+                        table_name: name,
+                        schema,
+                        primary_key: vec!["id".to_string()],
+                        on_conflict: Some(OnConflict::Upsert(
+                            datafusion_table_providers::util::column_reference::ColumnReference::new(
+                                vec!["id".to_string()],
+                            ),
+                        )),
+                        base_path: data_dir,
+                        partition_column: None,
+                        vortex_config: config,
+                    })
+                    .await
+                    .expect("retention table created")
+            }
+        };
+        let apply = |provider: &CayenneTableProvider, ids: &[i64], values: &[i64]| {
+            let batch = id_value_batch(Arc::clone(&schema), ids, values);
+            let batch_schema = batch.schema();
+            let stream = Box::pin(RecordBatchStreamAdapter::new(
+                batch_schema,
+                futures::stream::iter(vec![Ok(batch)]),
+            ));
+            let task_ctx = ctx.task_ctx();
+            let provider = provider.clone_for_write();
+            async move {
+                let write = provider.write_cdc_append_stream(stream, &task_ctx).await?;
+                Ok::<_, Error>(write.has_pending_finalize())
+            }
+        };
+
+        let provider = create("durable_cdc_retention", retention_predicate()).await;
+        let pending = apply(&provider, &[1, 2], &[10, 60])
             .await
-            .expect("pipelined inline retention table created");
-
-        let batch = id_value_batch(schema, &[1, 2], &[10, 60]);
-        let batch_schema = batch.schema();
-        let write = provider
-            .write_cdc_append_stream(
-                Box::pin(RecordBatchStreamAdapter::new(
-                    batch_schema,
-                    futures::stream::iter(vec![Ok(batch)]),
-                )),
-                &ctx.task_ctx(),
-            )
-            .await
-            .expect("pipelined CDC append");
+            .expect("durable CDC apply");
         assert!(
-            !write.has_pending_finalize(),
-            "precondition: the write must have INLINED — a staged outcome would arm \
-             retention through a different path and this would prove nothing"
+            !pending,
+            "the apply publishes synchronously: nothing is left to finalize or ack later"
         );
-        assert!(
-            provider.cached_inlined_row_count() > 0,
-            "precondition: the rows must be in the metastore inline corpus"
-        );
-
-        // Recording the inlined keys here would leave the cache naming rows retention is
-        // about to delete, and a later `DoNothing` insert validating against one of them
-        // would be dropped as a duplicate of a row that no longer exists. The durable and
-        // staged paths clear instead of record for exactly this reason.
-        assert!(
-            provider.sharded_pk_keyset_cache.lock().is_none(),
-            "arming retention must clear the PK keyset rather than record keys the \
-             pass may remove"
-        );
-
-        provider
-            .flush_pending_maintenance()
-            .await
-            .expect("the retention the inline commit armed");
-
         assert_eq!(
             scan_id_values(&provider).await,
             vec![(2, 60)],
-            "the inline commit must arm retention, and that pass must remove the row \
-             below the floor"
+            "retention is applied at publication: the row below the floor is never visible"
+        );
+        assert_eq!(
+            provider.cached_inlined_row_count(),
+            0,
+            "intentional: a retention table's CDC apply is not inlined"
+        );
+        provider
+            .flush_pending_maintenance()
+            .await
+            .expect("maintenance");
+        assert_eq!(
+            scan_id_values(&provider).await,
+            vec![(2, 60)],
+            "maintenance has nothing left to remove"
+        );
+        // The removed key is not remembered as present: its next write lands.
+        apply(&provider, &[1], &[70]).await.expect("rewrite key 1");
+        assert_eq!(scan_id_values(&provider).await, vec![(1, 70), (2, 60)]);
+        let reopened = CayenneTableProviderBuilder::new(Arc::clone(&catalog), ctx.runtime_env())
+            .open("durable_cdc_retention")
+            .await
+            .expect("reopen");
+        assert_eq!(
+            scan_id_values(&reopened).await,
+            vec![(1, 70), (2, 60)],
+            "durable when the apply returned"
+        );
+
+        let failing = create("durable_cdc_retention_fails", fails_on_13).await;
+        apply(&failing, &[1, 2], &[5, 60])
+            .await
+            .expect("evaluable batch");
+        assert_eq!(scan_id_values(&failing).await, vec![(2, 60)]);
+        for attempt in 0..2 {
+            assert!(
+                apply(&failing, &[2, 3], &[13, 80]).await.is_err(),
+                "attempt {attempt}: a batch retention cannot evaluate fails"
+            );
+            assert_eq!(
+                scan_id_values(&failing).await,
+                vec![(2, 60)],
+                "attempt {attempt}: nothing of it is published"
+            );
+        }
+        apply(&failing, &[3], &[80]).await.expect("next batch");
+        assert_eq!(scan_id_values(&failing).await, vec![(2, 60), (3, 80)]);
+        assert_eq!(
+            failing.cached_inlined_row_count(),
+            0,
+            "intentional: not inlined"
         );
     }
 
