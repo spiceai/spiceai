@@ -52286,9 +52286,9 @@ mod tests {
         // barrier the non-transactional publish takes, so it must accept the
         // zero-row staged snapshot too.
         let prepared = staged
-            .prepare_commit()
+            .prepare_commit_for_test()
             .await
-            .expect("prepare_commit must accept a zero-row staged snapshot");
+            .expect("the guarded prepare must accept a zero-row staged snapshot");
         assert_eq!(prepared.row_count(), 0);
     }
 

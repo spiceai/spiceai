@@ -481,6 +481,16 @@ impl CayenneTransaction {
             rollback_stages(staged_with_rows).await;
             return Err(Error::WriteConflict { table });
         }
+        #[cfg(test)]
+        for stage in &staged_with_rows {
+            if let Some(pause) =
+                super::append_commit::test_seams::take_pause_under_publication_guards(
+                    stage.table().table_id(),
+                )
+            {
+                pause().await;
+            }
+        }
         // The read-only participants are validated; only their held write_locks
         // matter now.
         drop(participants);

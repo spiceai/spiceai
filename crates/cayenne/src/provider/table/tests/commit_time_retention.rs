@@ -903,15 +903,21 @@ async fn a_no_conflict_key_transaction_keeps_the_first_copy_and_never_evaluates_
     }
 }
 
-/// T4 (F2 order): a protected-run compaction started at a deterministic point
+/// T4 (F2 order): a protected-run compaction attempted at a deterministic point
 /// inside a transaction commit (after its resident retention delete is
-/// prepared over the runs it captured). The commit holds `write_lock`, the
-/// mem-tier checkpoint lock, the visibility lock and the listing fence there,
-/// so the compaction cannot flip until the commit has published: the hook
-/// records the held guards and spawns the compaction, which completes after
-/// the commit. A key-delete table must actually merge (acceptance gate); a
-/// position-serialized table may decline (try-locked writer). Either way the
-/// commit's rows are exact, live and reopened.
+/// prepared over the runs it captured), while the commit holds `write_lock`,
+/// the mem-tier checkpoint lock, the visibility lock and the listing fence.
+///
+/// Each shape has exactly one required outcome, from the source:
+/// - position-serialized (`KeyedPosition`: `position_rewrites_exclude_writers`):
+///   the attempt's first lock operation is `write_lock.try_lock_owned()`
+///   (`compact_protected_snapshots_subset_inner`, before any await), which the
+///   commit holds from its first step to its return, so it declines, inline,
+///   with `Ok(false)` and nothing merged;
+/// - key-delete (`KeyedFold`): it takes no writer gate, queues on the held
+///   listing fence (so it cannot run inline here: it is spawned), and merges
+///   after the publication with `Ok(true)` (acceptance gate).
+/// Either way the commit's rows are exact, live and reopened.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_protected_run_compaction_started_inside_the_commit_flips_after_it() {
     for shape in [Shape::KeyedPosition, Shape::KeyedFold] {
@@ -955,12 +961,20 @@ async fn a_protected_run_compaction_started_inside_the_commit_flips_after_it() {
                         probe.visibility_lock.try_lock().is_err(),
                         probe.listing_fence.try_read().is_err(),
                     ));
-                    *spawned.lock() = Some(tokio::spawn(async move {
+                    let attempt = async move {
                         let before = probe.protected_snapshots.load().len();
                         let merged = probe.compact_protected_snapshots_subset(usize::MAX).await;
                         let after = probe.protected_snapshots.load().len();
                         format!("{merged:?} runs {before}->{after}")
-                    }));
+                    };
+                    if shape == Shape::KeyedPosition {
+                        // Declines without awaiting any lock: run inline, under
+                        // the held guards, and record it as already finished.
+                        let outcome = attempt.await;
+                        *spawned.lock() = Some(tokio::spawn(async move { outcome }));
+                    } else {
+                        *spawned.lock() = Some(tokio::spawn(attempt));
+                    }
                 })
             }),
         );
@@ -984,20 +998,19 @@ async fn a_protected_run_compaction_started_inside_the_commit_flips_after_it() {
             .expect("the compaction completes after the commit (bounded)")
             .expect("join");
         println!("{shape:?}: {outcome}");
-        // A key-delete table's compaction queues on the held fence and merges
-        // after the publication (acceptance gate). A position-serialized
-        // table's try-locks the writer: it declines if it runs while the
-        // commit still holds `write_lock`, or merges once the commit released
-        // it; which one is scheduling, so either is accepted, never an error.
-        if shape == Shape::KeyedFold {
-            assert!(
-                outcome.starts_with("Ok(true)"),
-                "{shape:?}: compaction started inside the commit: {outcome}"
-            );
+        let required = if shape == Shape::KeyedFold {
+            "Ok(true)"
         } else {
+            "Ok(false)"
+        };
+        assert!(
+            outcome.starts_with(required),
+            "{shape:?}: compaction attempted inside the commit: {outcome}"
+        );
+        if shape == Shape::KeyedPosition {
             assert!(
-                outcome.starts_with("Ok(false)") || outcome.starts_with("Ok(true)"),
-                "{shape:?}: compaction started inside the commit: {outcome}"
+                outcome.ends_with(&format!("runs {runs}->{runs}")),
+                "{shape:?}: the declined attempt merged nothing: {outcome}"
             );
         }
         let want = vec![(1, 1), (3, 3), (4, 4)];

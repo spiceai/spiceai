@@ -498,17 +498,23 @@ impl CayenneStagedUpsert {
         })
     }
 
-    /// Both steps for ONE table, for callers outside a [`super::transaction::CayenneTransaction`]
-    /// (tests): prerequisites, then this table's visibility lock and listing
-    /// fence, one post-wait instant, the guarded prepare. The guards are
-    /// released on return, so the returned commit is NOT published under them;
-    /// a transaction holds them through its fused commit instead.
+    /// TEST-ONLY: the guarded prepare for ONE table outside a
+    /// [`super::transaction::CayenneTransaction`], in the production order:
+    /// `write_lock`, prerequisites (checkpoint lock, inline move), visibility
+    /// lock, listing fence, one post-wait instant, the guarded prepare, the
+    /// lease revoke. It takes `write_lock` itself (it does not bypass the
+    /// writer) but performs NO optimistic check, and every guard is released on
+    /// return, so the returned commit must not be applied: it is for asserting
+    /// what a prepare produces. A real commit is
+    /// [`super::transaction::CayenneTransaction::commit`] or [`Self::commit`].
     ///
     /// # Errors
     ///
     /// See [`Self::acquire_commit_prerequisites`] and
     /// [`Self::prepare_commit_under_guards`].
-    pub async fn prepare_commit(self) -> Result<PreparedTxnCommit> {
+    #[cfg(test)]
+    pub(crate) async fn prepare_commit_for_test(self) -> Result<PreparedTxnCommit> {
+        let _write = self.table.write_lock_arc().lock_owned().await;
         let prerequisites = self.acquire_commit_prerequisites().await?;
         let _visibility = self.table.visibility_lock_arc().lock_owned().await;
         let fence =
@@ -727,7 +733,7 @@ impl CayenneStagedUpsert {
 
 /// A staged upsert prepared for atomic commit inside a caller-owned
 /// `MetastoreTransaction` (multi-table fusion). Sequences are reserved and
-/// deletion-vector files written at [`CayenneStagedUpsert::prepare_commit`]; the
+/// deletion-vector files written at [`CayenneStagedUpsert::prepare_commit_under_guards`]; the
 /// durable catalog write happens in [`Self::apply_in_txn`] and the in-memory
 /// visibility flip in [`Self::finish`], after the shared transaction commits.
 pub struct PreparedTxnCommit {

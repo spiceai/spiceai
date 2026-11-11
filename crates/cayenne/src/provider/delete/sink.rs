@@ -1658,15 +1658,40 @@ impl CayenneDeletionSink {
     pub(crate) async fn prepare_delete(
         &self,
     ) -> super::super::Result<Option<PreparedDeletionPublish>> {
-        // A leased sink holds its commit's fence for this whole execution: the
-        // captures below and the scan of the files they list. Dropped on every
-        // exit, cancellation included.
-        let _execution_pin = match &self.capture_locks {
+        // A leased sink (a commit's retention scan) pins its commit's fence for
+        // the whole execution: the captures and the scan of the files they list.
+        // The pin is taken here, before the execution starts, and moved into the
+        // task that runs it, so it is dropped only when that task's future has
+        // completed: a caller that stops waiting (its commit cancelled) cannot
+        // drop the scan mid-flight, and the fence stays held until the scan has
+        // run to its end (success or error). The commit's pre-durable idle check
+        // sees the pin; after its revoke no new pin can be taken.
+        //
+        // Not covered by this pin (an open gap): a scan that exits early on an
+        // error drops its DataFusion / vortex reader tasks, which abort without
+        // join, and a file read already running on the blocking pool under
+        // them cannot be aborted or joined; it can outlive the pin, holding
+        // only its open file descriptor, its result discarded.
+        let pin = match &self.capture_locks {
             Some(locks) => locks
                 .pin_for_execution()
                 .map_err(|source| super::super::Error::DataFusion { source })?,
             None => None,
         };
+        let Some(pin) = pin else {
+            return self.prepare_delete_body().await;
+        };
+        let this = self.clone();
+        let table = self.table_metadata.table_name.clone();
+        tokio::spawn(async move {
+            let _execution_pin = pin;
+            this.prepare_delete_body().await
+        })
+        .await
+        .map_err(|source| super::super::Error::TaskPanicked { table, source })?
+    }
+
+    async fn prepare_delete_body(&self) -> super::super::Result<Option<PreparedDeletionPublish>> {
         let ctx = SessionContext::new_with_config_rt(
             util::session_state::session_config(),
             Arc::clone(&self.runtime_env),

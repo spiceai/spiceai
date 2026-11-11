@@ -120,11 +120,30 @@ impl Shared {
     /// A table seeded with `(1, 1)`; `trigger`: its
     /// `compaction_trigger_protected_snapshots`.
     async fn table(&mut self, name: &str, trigger: Option<usize>) -> CayenneTableProvider {
+        self.table_with(name, trigger, true).await
+    }
+
+    /// [`Self::table`] without `retention_sql`, so a CDC upsert takes the
+    /// pipelined staged path (a `retention_sql` table publishes it inline).
+    async fn table_plain(&mut self, name: &str) -> CayenneTableProvider {
+        self.table_with(name, None, false).await
+    }
+
+    async fn table_with(
+        &mut self,
+        name: &str,
+        trigger: Option<usize>,
+        retention: bool,
+    ) -> CayenneTableProvider {
         let p = CayenneTableProviderBuilder::new(
             Arc::clone(&self.catalog),
             SessionContext::new().runtime_env(),
         )
-        .with_retention_filters(self.retention.clone())
+        .with_retention_filters(if retention {
+            self.retention.clone()
+        } else {
+            Vec::new()
+        })
         .create(CreateTableOptions {
             table_name: name.to_string(),
             schema: schema(),
@@ -162,6 +181,16 @@ impl Shared {
             SessionContext::new().runtime_env(),
         )
         .with_retention_filters(self.retention.clone())
+        .open(name)
+        .await
+        .expect("reopen")
+    }
+
+    async fn reopen_plain(&self, name: &str) -> CayenneTableProvider {
+        CayenneTableProviderBuilder::new(
+            Arc::clone(&self.catalog),
+            SessionContext::new().runtime_env(),
+        )
         .open(name)
         .await
         .expect("reopen")
@@ -741,6 +770,251 @@ async fn a_compaction_started_under_a_multi_table_commit_flips_after_it() {
             let rb = shared.reopen(&format!("f2_compact_b_{tag}")).await;
             assert_eq!(rows(&ra).await, want_a, "{tag}: a reopened");
             assert_eq!(rows(&rb).await, want_b, "{tag}: b reopened");
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// write_lock-free publishers against a commit holding its guards; the
+// post-wait optimistic check. Both registration orders, exact rows, reopen.
+// ---------------------------------------------------------------------------
+
+/// A CDC upsert of an existing key staged on `p` (Stage-A done: keys
+/// recorded, `write_lock` released), its staged-tombstone finalize pending.
+async fn staged_cdc_upsert(p: &CayenneTableProvider, row: (i64, i64)) -> CayenneCdcWrite {
+    let ctx = SessionContext::new();
+    let write = p
+        .write_cdc_append_stream(
+            single_batch_stream(id_value_batch(schema(), &[row.0], &[row.1])),
+            &ctx.task_ctx(),
+        )
+        .await
+        .expect("the CDC upsert stages");
+    assert!(
+        write.has_pending_finalize(),
+        "precondition: the CDC upsert must still be staged (Stage-B pending), or no \
+         write_lock-free publisher is under test"
+    );
+    write
+}
+
+/// Whether `p`'s optimistic check trusts per-key stamps (Exact, not degraded)
+/// rather than the conservative per-table high-water fallback.
+fn stamps_trusted(p: &CayenneTableProvider) -> bool {
+    matches!(
+        p.pk_keyset_cache.lock().as_ref(),
+        Some(crate::provider::pk_index::CachedPkIndex::Exact(_))
+    ) && !p.pk_keyset_occ_degraded.load(Ordering::Acquire)
+}
+
+/// A staged-tombstone finalize (CDC Stage-B: visibility lock + listing fence,
+/// no `write_lock`) on one participant, either finished before the commit or
+/// attempted while the commit holds every guard. While the commit holds them
+/// the finalize cannot complete; it completes after the publication. Both
+/// registration orders, either participant: exact rows on both tables, live
+/// and reopened.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_staged_tombstone_finalize_cannot_publish_inside_a_multi_table_commit() {
+    for register_b_first in [false, true] {
+        for finalize_on_a in [true, false] {
+            for finalize_during_commit in [false, true] {
+                let mut shared = Shared::new().await;
+                let tag = format!("{register_b_first}_{finalize_on_a}_{finalize_during_commit}");
+                let na = format!("f2_fin_a_{tag}");
+                let nb = format!("f2_fin_b_{tag}");
+                let a = shared.table_plain(&na).await;
+                let b = shared.table_plain(&nb).await;
+                // The transaction begins (tokens) before the CDC write stages.
+                let txn = two_table_txn(&a, &b, register_b_first).await;
+                let target = if finalize_on_a { &a } else { &b };
+                let cdc = staged_cdc_upsert(target, (1, 100)).await;
+                // Precondition that makes the commit's admission the one
+                // required outcome: the transaction read nothing and writes
+                // keys 2 / 3, and the target's per-key stamps are trusted, so
+                // the CDC write of key 1 is no conflict.
+                assert!(
+                    stamps_trusted(target),
+                    "{tag}: precondition: the target's keyset is Exact"
+                );
+
+                if finalize_during_commit {
+                    let cdc = Arc::new(ParkingMutex::new(Some(cdc)));
+                    let finalize: Arc<ParkingMutex<Option<tokio::task::JoinHandle<Result<u64>>>>> =
+                        Arc::default();
+                    let (cdc_in, finalize_in) = (Arc::clone(&cdc), Arc::clone(&finalize));
+                    let probe = target.clone_for_write();
+                    test_seams::pause_under_publication_guards(
+                        target.table_id(),
+                        Box::new(move || {
+                            Box::pin(async move {
+                                assert!(probe.listing_fence.try_read().is_err(), "fence held");
+                                let write = cdc_in.lock().take().expect("cdc write");
+                                let handle = tokio::spawn(async move { write.finish().await });
+                                // Give the finalize every chance to run: it must
+                                // still be waiting on the held guards.
+                                for _ in 0..64 {
+                                    tokio::task::yield_now().await;
+                                }
+                                assert!(
+                                    !handle.is_finished(),
+                                    "a staged-tombstone finalize published inside the commit"
+                                );
+                                *finalize_in.lock() = Some(handle);
+                            })
+                        }),
+                    );
+                    tokio::time::timeout(BOUND, txn.commit())
+                        .await
+                        .unwrap_or_else(|_| panic!("{tag}: commit bounded"))
+                        .unwrap_or_else(|e| panic!("{tag}: commit: {e}"));
+                    let handle = finalize.lock().take().expect("the finalize was attempted");
+                    tokio::time::timeout(BOUND, handle)
+                        .await
+                        .unwrap_or_else(|_| panic!("{tag}: finalize bounded"))
+                        .expect("join")
+                        .unwrap_or_else(|e| panic!("{tag}: finalize: {e}"));
+                } else {
+                    cdc.finish().await.expect("finalize before the commit");
+                    tokio::time::timeout(BOUND, txn.commit())
+                        .await
+                        .unwrap_or_else(|_| panic!("{tag}: commit bounded"))
+                        .unwrap_or_else(|e| panic!("{tag}: commit: {e}"));
+                }
+
+                let (want_a, want_b) = if finalize_on_a {
+                    (vec![(1, 100), (2, 20)], vec![(1, 1), (3, 30)])
+                } else {
+                    (vec![(1, 1), (2, 20)], vec![(1, 100), (3, 30)])
+                };
+                assert_eq!(rows(&a).await, want_a, "{tag}: a live");
+                assert_eq!(rows(&b).await, want_b, "{tag}: b live");
+                assert_eq!(
+                    rows(&shared.reopen_plain(&na).await).await,
+                    want_a,
+                    "{tag}: a reopened"
+                );
+                assert_eq!(
+                    rows(&shared.reopen_plain(&nb).await).await,
+                    want_b,
+                    "{tag}: b reopened"
+                );
+                assert_all_guards_free(&a, &tag);
+                assert_all_guards_free(&b, &tag);
+            }
+        }
+    }
+}
+
+/// The post-wait optimistic check, both registration orders:
+/// - a disjoint staged-tombstone finalize that lands BETWEEN the pre-wait
+///   check and the guards (while the commit waits on a participant's
+///   checkpoint lock, holding every `write_lock`) is not a conflict: the
+///   commit publishes, exact rows;
+/// - a committed write of a key the transaction read, after its begin, is a
+///   conflict: the commit is refused and publishes nothing on either table.
+///   (Decided by the pre-wait check; the post-wait re-run cannot observe a
+///   newer registration, because every key registration happens under
+///   `write_lock`, held by the commit from its first step. The test asserts
+///   the outcome, not which check produced it.)
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_post_wait_occ_admits_disjoint_activity_and_refuses_a_read_key_commit() {
+    for register_b_first in [false, true] {
+        // Disjoint: finalize lands while the commit waits on a checkpoint lock.
+        {
+            let mut shared = Shared::new().await;
+            let tag = format!("disjoint_{register_b_first}");
+            let na = format!("f2_occ_a_{tag}");
+            let nb = format!("f2_occ_b_{tag}");
+            let a = shared.table_plain(&na).await;
+            let b = shared.table_plain(&nb).await;
+            let txn = two_table_txn(&a, &b, register_b_first).await;
+            txn.record_read_keys(a.table_id(), [int64_pk_digest(2)]);
+            let cdc = staged_cdc_upsert(&a, (1, 100)).await;
+            // Precondition that makes admission the one required outcome: `a`'s
+            // per-key stamps are trusted (Exact, not degraded), so the check
+            // reads the footprint `{2}` and the write set `{2}`, never key 1.
+            assert!(
+                stamps_trusted(&a),
+                "{tag}: precondition: a's keyset is Exact"
+            );
+            let later = if a.table_id() > b.table_id() { &a } else { &b };
+            let hold = later.lock_mem_tier_checkpoint_for_durable_write().await;
+            let (reached_tx, reached_rx) = tokio::sync::oneshot::channel::<()>();
+            test_seams::pause_at_checkpoint_wait(
+                later.table_id(),
+                Box::new(move || Box::pin(async move { reached_tx.send(()).expect("test waits") })),
+            );
+            let commit = tokio::spawn(async move { txn.commit().await.map(|_| ()) });
+            tokio::time::timeout(BOUND, reached_rx)
+                .await
+                .unwrap_or_else(|_| panic!("{tag}: reached the checkpoint wait"))
+                .expect("seam");
+            // Between the two checks: the commit holds every write_lock and
+            // waits on `later`'s checkpoint lock; Stage-B needs neither.
+            tokio::time::timeout(BOUND, cdc.finish())
+                .await
+                .unwrap_or_else(|_| panic!("{tag}: finalize bounded"))
+                .expect("finalize between the checks");
+            assert!(!commit.is_finished(), "{tag}: the commit still waits");
+            assert!(
+                stamps_trusted(&a),
+                "{tag}: precondition holds after the finalize"
+            );
+            drop(hold);
+            tokio::time::timeout(BOUND, commit)
+                .await
+                .unwrap_or_else(|_| panic!("{tag}: commit bounded"))
+                .expect("join")
+                .unwrap_or_else(|e| panic!("{tag}: a disjoint finalize is no conflict: {e}"));
+            let want_a = vec![(1, 100), (2, 20)];
+            let want_b = vec![(1, 1), (3, 30)];
+            assert_eq!(rows(&a).await, want_a, "{tag}: a live");
+            assert_eq!(rows(&b).await, want_b, "{tag}: b live");
+            assert_eq!(
+                rows(&shared.reopen_plain(&na).await).await,
+                want_a,
+                "{tag}: a reopened"
+            );
+            assert_eq!(
+                rows(&shared.reopen_plain(&nb).await).await,
+                want_b,
+                "{tag}: b reopened"
+            );
+        }
+        // Overlap: a committed write of the read key after the begin.
+        {
+            let mut shared = Shared::new().await;
+            let tag = format!("overlap_{register_b_first}");
+            let na = format!("f2_occx_a_{tag}");
+            let nb = format!("f2_occx_b_{tag}");
+            let a = shared.table_plain(&na).await;
+            let b = shared.table_plain(&nb).await;
+            let txn = two_table_txn(&a, &b, register_b_first).await;
+            txn.record_read_keys(a.table_id(), [int64_pk_digest(7)]);
+            insert_batch(&a, id_value_batch(schema(), &[7], &[70])).await;
+            let outcome = tokio::time::timeout(BOUND, txn.commit())
+                .await
+                .unwrap_or_else(|_| panic!("{tag}: commit bounded"));
+            assert!(
+                matches!(outcome, Err(crate::provider::Error::WriteConflict { .. })),
+                "{tag}: refused, got {outcome:?}"
+            );
+            let want_a = vec![(1, 1), (7, 70)];
+            let want_b = vec![(1, 1)];
+            assert_eq!(rows(&a).await, want_a, "{tag}: a live");
+            assert_eq!(rows(&b).await, want_b, "{tag}: b live");
+            assert_eq!(
+                rows(&shared.reopen_plain(&na).await).await,
+                want_a,
+                "{tag}: a reopened"
+            );
+            assert_eq!(
+                rows(&shared.reopen_plain(&nb).await).await,
+                want_b,
+                "{tag}: b reopened"
+            );
+            assert_all_guards_free(&a, &tag);
+            assert_all_guards_free(&b, &tag);
         }
     }
 }
