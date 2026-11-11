@@ -150,6 +150,15 @@ async fn openai_decisions(
     Ok(Arc::new(metered) as Arc<dyn Evaluate>)
 }
 
+/// `model`, the evaluator of the model `name`, recorded in the LLM metrics as [`Metered`].
+#[cfg(feature = "models")]
+pub(crate) fn metered(name: &str, model: Arc<dyn Evaluate>) -> Arc<dyn Evaluate> {
+    Arc::new(Metered {
+        name: name.to_string(),
+        model,
+    })
+}
+
 /// A System One model recorded in the LLM request, failure, duration and token metrics.
 ///
 /// Evaluations are inference, so they belong in the same series as chat and responses.

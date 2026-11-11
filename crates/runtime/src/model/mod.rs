@@ -18,6 +18,7 @@ use std::{collections::HashMap, sync::Arc};
 use tokio::sync::RwLock;
 
 mod chat;
+pub(crate) mod decider;
 mod embed;
 pub mod evaluate;
 pub(crate) mod messages;

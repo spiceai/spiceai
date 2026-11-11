@@ -94,7 +94,14 @@ impl Decider {
     /// `head.safetensors`, `tokenizer.json` and `tokenizer_config.json`. The adapter in `lora/`
     /// is the backend's.
     pub fn from_checkpoint_dir(dir: &Path) -> Result<Self> {
-        let config = DeciderConfig::from_checkpoint_dir(dir)?;
+        Self::from_config_file(&crate::config::config_path(dir))
+    }
+
+    /// Loads the readout whose config is at `config`, under any of its names, with
+    /// `head.safetensors`, `tokenizer.json` and an optional `tokenizer_config.json` beside it.
+    pub fn from_config_file(config: &Path) -> Result<Self> {
+        let dir = config.parent().unwrap_or_else(|| Path::new("."));
+        let config = DeciderConfig::from_file(config)?;
         let head_path = dir.join("head.safetensors");
         let head_bytes = std::fs::read(&head_path).context(ReadFileSnafu { path: head_path })?;
         let head = PointerHead::from_safetensors(&head_bytes, config.pointer_dim)?;

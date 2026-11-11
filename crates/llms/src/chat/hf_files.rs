@@ -131,7 +131,11 @@ fn repo_of(model_id: &str) -> &str {
 }
 
 /// Opens the model `model_id` (`org/name[:revision]`), named `name` in the Spicepod.
-async fn open(model_id: &str, hub: HubParams<'_>, name: &str) -> Result<Snapshot, DownloadError> {
+pub(crate) async fn open(
+    model_id: &str,
+    hub: HubParams<'_>,
+    name: &str,
+) -> Result<Snapshot, DownloadError> {
     let requester = Requester {
         kind: "model",
         name: name.to_string(),

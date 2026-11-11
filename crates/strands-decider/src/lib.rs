@@ -49,7 +49,7 @@ use std::path::PathBuf;
 
 use snafu::Snafu;
 
-pub use config::{CONFIG_NAME, DeciderConfig, LEGACY_CONFIG_NAME};
+pub use config::{CONFIG_NAME, DeciderConfig, HEAD_CONFIG_NAME, LEGACY_CONFIG_NAME};
 pub use engine::{BoxError, Decider, Evaluation, HiddenRows, HiddenStates};
 pub use head::{PointerHead, softmax};
 pub use prompting::{

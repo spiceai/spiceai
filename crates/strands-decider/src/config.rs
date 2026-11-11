@@ -13,7 +13,8 @@ WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 See the License for the specific language governing permissions and
 limitations under the License.
 */
-//! A checkpoint's `strands_decider_config.json`: what the readout needs from it.
+//! A checkpoint's config (`strands_decider_config.json`): what the readout needs from it, and
+//! how to tell a decider config from any other JSON file.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -28,6 +29,8 @@ use crate::{ConfigSnafu, ReadFileSnafu, Result};
 pub const CONFIG_NAME: &str = "strands_decider_config.json";
 /// Its name in checkpoints saved before the rename.
 pub const LEGACY_CONFIG_NAME: &str = "hobson_config.json";
+/// Its name where upstream's `save_assets` writes the head beside a converted model.
+pub const HEAD_CONFIG_NAME: &str = "head_config.json";
 
 /// The settings of a checkpoint that the readout uses. Keys it does not use are ignored.
 #[derive(Debug, Clone, PartialEq, Deserialize)]
@@ -52,6 +55,8 @@ pub struct DeciderConfig {
     /// Start every prompt with the tokenizer's BOS token even when it adds none itself.
     pub force_bos: bool,
     head_type: Option<String>,
+    /// The readout a config written by `save_assets` names, where others name `head_type`.
+    readout: Option<String>,
     full_weight_targets: Vec<String>,
 }
 
@@ -69,6 +74,7 @@ impl Default for DeciderConfig {
             use_lora: true,
             force_bos: false,
             head_type: None,
+            readout: None,
             full_weight_targets: Vec::new(),
         }
     }
@@ -94,6 +100,15 @@ impl DeciderConfig {
             }
         );
         ensure!(
+            config.readout.as_deref().is_none_or(|r| r == "pointer"),
+            ConfigSnafu {
+                message: format!(
+                    "readout is {:?}; only pointer-head checkpoints are supported",
+                    config.readout
+                ),
+            }
+        );
+        ensure!(
             config.full_weight_targets.is_empty(),
             ConfigSnafu {
                 message: "full_weight_targets is set; only LoRA checkpoints are supported",
@@ -108,16 +123,41 @@ impl DeciderConfig {
         Ok(config)
     }
 
-    /// Reads the config of the checkpoint in `dir` ([`CONFIG_NAME`], or [`LEGACY_CONFIG_NAME`]
-    /// when only it exists), filling in the base revision from `provenance.json` when the config
-    /// has none and the provenance names the same base model.
-    pub fn from_checkpoint_dir(dir: &Path) -> Result<Self> {
-        let mut path = dir.join(CONFIG_NAME);
-        if !path.exists() && dir.join(LEGACY_CONFIG_NAME).exists() {
-            path = dir.join(LEGACY_CONFIG_NAME);
+    /// Tells a decider config from any other JSON by its content, as a file's name differs
+    /// between upstream's writers ([`CONFIG_NAME`], [`LEGACY_CONFIG_NAME`], [`HEAD_CONFIG_NAME`]).
+    ///
+    /// A decider config is a JSON object with an integer `pointer_dim` that names its head, by
+    /// `head_type` or by `readout`. `Ok(None)` for any other text. A decider config that the
+    /// pointer readout cannot serve (another head, or a full-weight checkpoint) is an error, not
+    /// `None`, so such a checkpoint is refused rather than taken for something else.
+    pub fn detect(text: &str) -> Result<Option<Self>> {
+        let Ok(serde_json::Value::Object(map)) = serde_json::from_str(text) else {
+            return Ok(None);
+        };
+        let has_pointer_dim = map
+            .get("pointer_dim")
+            .is_some_and(|dim| dim.is_u64() || dim.is_i64());
+        let names_head = map.contains_key("head_type") || map.contains_key("readout");
+        if !(has_pointer_dim && names_head) {
+            return Ok(None);
         }
-        let mut config = Self::from_json(&read(&path)?)?;
-        let provenance = dir.join("provenance.json");
+        Self::from_json(text).map(Some)
+    }
+
+    /// Reads the config of the checkpoint in `dir` ([`CONFIG_NAME`], or [`LEGACY_CONFIG_NAME`]
+    /// when only it exists), filling in the base revision as [`DeciderConfig::from_file`] does.
+    pub fn from_checkpoint_dir(dir: &Path) -> Result<Self> {
+        Self::from_file(&config_path(dir))
+    }
+
+    /// Reads the config at `path`, filling in the base revision from the `provenance.json`
+    /// beside it when the config has none and the provenance names the same base model.
+    pub fn from_file(path: &Path) -> Result<Self> {
+        let mut config = Self::from_json(&read(path)?)?;
+        let provenance = path
+            .parent()
+            .unwrap_or_else(|| Path::new("."))
+            .join("provenance.json");
         if config.base_revision.is_none() && provenance.exists() {
             let meta: serde_json::Value =
                 serde_json::from_str(&read(&provenance)?).map_err(|e| {
@@ -144,6 +184,16 @@ impl DeciderConfig {
             .copied()
             .unwrap_or(self.temperature)
     }
+}
+
+/// The config file of the checkpoint in `dir`: [`CONFIG_NAME`], or [`LEGACY_CONFIG_NAME`] when
+/// only it exists.
+pub(crate) fn config_path(dir: &Path) -> PathBuf {
+    let path = dir.join(CONFIG_NAME);
+    if !path.exists() && dir.join(LEGACY_CONFIG_NAME).exists() {
+        return dir.join(LEGACY_CONFIG_NAME);
+    }
+    path
 }
 
 fn read(path: &Path) -> Result<String> {
@@ -182,5 +232,74 @@ mod tests {
         let config =
             DeciderConfig::from_json(r#"{"temperature": 2.0}"#).unwrap_or_else(|e| panic!("{e}"));
         assert!((config.temperature(Kind::Noul) - 2.0).abs() < 1e-15);
+    }
+
+    #[test]
+    fn detects_every_config_shape_by_content() {
+        let detected = |text: &str| {
+            DeciderConfig::detect(text)
+                .unwrap_or_else(|e| panic!("{text}: {e}"))
+                .map(|config| config.pointer_dim)
+        };
+        // `strands_decider_config.json` and the legacy `hobson_config.json` name `head_type`.
+        assert_eq!(
+            detected(
+                r#"{"base_model": "Qwen/Qwen3.5-2B-Base", "head_type": "pointer", "pointer_dim": 768}"#
+            ),
+            Some(768)
+        );
+        // `head_config.json` from `save_assets` names `readout`.
+        assert_eq!(
+            detected(r#"{"readout": "pointer", "pointer_dim": 256, "max_length": 4096}"#),
+            Some(256)
+        );
+    }
+
+    #[test]
+    fn other_json_is_not_a_decider_config() {
+        for text in [
+            // A model's config.json, a tokenizer config, and not JSON at all.
+            r#"{"architectures": ["Qwen3_5ForCausalLM"], "hidden_size": 2048}"#,
+            r#"{"bos_token": null, "eos_token": "<|endoftext|>"}"#,
+            "not json",
+            "[1, 2, 3]",
+            // `pointer_dim` without a head named, or not an integer.
+            r#"{"pointer_dim": 768}"#,
+            r#"{"head_type": "pointer", "pointer_dim": "768"}"#,
+            r#"{"head_type": "pointer", "pointer_dim": 76.8}"#,
+            // A head named without `pointer_dim`.
+            r#"{"head_type": "pointer"}"#,
+        ] {
+            assert!(
+                matches!(DeciderConfig::detect(text), Ok(None)),
+                "{text} is not a decider config"
+            );
+        }
+    }
+
+    #[test]
+    fn a_decider_config_the_readout_cannot_serve_is_refused() {
+        for (text, why) in [
+            (r#"{"head_type": "slot", "pointer_dim": 768}"#, "head_type"),
+            (r#"{"readout": "slot", "pointer_dim": 768}"#, "readout"),
+            (
+                r#"{"head_type": "pointer", "pointer_dim": 768, "full_weight_targets": ["q_proj"]}"#,
+                "full_weight_targets",
+            ),
+        ] {
+            match DeciderConfig::detect(text) {
+                Err(crate::Error::Config { message }) => {
+                    assert!(message.contains(why), "{text}: {message}");
+                }
+                other => panic!("{text}: {other:?}"),
+            }
+        }
+        // An empty list of full-weight targets is a LoRA checkpoint.
+        assert!(matches!(
+            DeciderConfig::detect(
+                r#"{"head_type": "pointer", "pointer_dim": 768, "full_weight_targets": []}"#
+            ),
+            Ok(Some(_))
+        ));
     }
 }

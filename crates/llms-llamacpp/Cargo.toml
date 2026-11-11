@@ -1,5 +1,5 @@
 [package]
-description = "Serves single-node GGUF models with llama.cpp; spiced links it behind its llamacpp feature"
+description = "Serves single-node GGUF models and Strands deciders with llama.cpp; spiced links it behind its llamacpp feature"
 edition.workspace = true
 homepage.workspace = true
 license-file.workspace = true
@@ -21,8 +21,10 @@ llms = { path = "../llms", default-features = false, features = ["local_llm"] }
 runtime-resources = { path = "../runtime-resources" }
 mistralrs-core = { git = "https://github.com/spiceai/mistral.rs", rev = "d7ddf3bb84ad753e6da385c02e9f8e16bc9a39ec", package = "mistralrs-core" } # branch: spiceai (spiceai/mistral.rs#58: Mistral [THINK] reasoning; on #55, which includes #52, #53, #54)
 rand.workspace = true
+runtime-rate-control = { path = "../runtime-rate-control" }
 runtime-request-context = { path = "../runtime-request-context" }
 serde_json.workspace = true
+strands-decider = { path = "../strands-decider", features = ["llama"] }
 tokio = { workspace = true, features = ["fs", "rt", "time"] }
 tracing.workspace = true
 uuid = { workspace = true, features = ["v4"] }
