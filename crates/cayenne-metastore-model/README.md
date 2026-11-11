@@ -56,13 +56,10 @@ WALK=42:20:40 TRACE_JSON=crates/cayenne/tests/traces/data-files-walk.jsonl targe
 
 Delete both files first: `TRACE_JSON` appends. The retirement traces in
 `crates/object_store_occ/tests/traces/` are generated the same way; see that
-directory's README. Those traces and `data_file_replay.rs` still encode
-retirement by snapshot (records that retire snapshot ids, a forget of
-snapshots, `CompactKeep`), which the `data-files-retire*` runs no longer use:
-the replay needs the per-file records (`AddFiles`, `RemoveFiles`,
-`ReplaceFiles` with carried files, `ForgetRetired{files}`), the retired set as
-files with the record that removed each, the `Tick` and `Remote*` actions of
-the `remote` runs, and regenerated traces before it replays them again.
+directory's README. `data_file_replay.rs` replays them with per-file records
+(`AddFiles`, `RemoveFiles`, `ReplaceFiles` with carried files,
+`ForgetRetired{files}`), the retired set as files with the record that removed
+each, and the `Tick` and `Remote*` actions of the `remote` runs.
 
 ## Compositions and bounds
 
