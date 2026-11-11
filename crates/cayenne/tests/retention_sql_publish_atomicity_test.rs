@@ -1885,3 +1885,37 @@ async fn memory_mode_cdc_resident_retention_in_the_apply_swap_impl(
     );
     Ok(())
 }
+
+/// A NULL primary key is refused by the existing write validation on a
+/// retention table (keyed upsert, file tier), before any retention runs; the
+/// table keeps its rows. Pins existing behaviour; no new NULL-key semantics.
+#[test]
+fn null_primary_key_is_refused_on_a_retention_table_sqlite() -> Result<(), String> {
+    common::run_with_backend_blocking(
+        common::BackendType::Sqlite,
+        null_primary_key_is_refused_on_a_retention_table_impl,
+    )
+}
+
+async fn null_primary_key_is_refused_on_a_retention_table_impl(
+    fixture: common::TestFixture,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let nullable_id: SchemaRef = Arc::new(Schema::new(vec![
+        Field::new("id", DataType::Int64, true),
+        Field::new("status", DataType::Utf8, true),
+    ]));
+    let t = table(&fixture, "rsql_null_pk", true, archived()).await?;
+    common::insert_batch(t.as_ref(), rows(&[(1, Some("active"))])).await?;
+    let batch = RecordBatch::try_new(
+        nullable_id,
+        vec![
+            Arc::new(Int64Array::from(vec![None, Some(2)])),
+            Arc::new(StringArray::from(vec![Some("active"), Some("active")])),
+        ],
+    )?;
+    let result = common::insert_batch(t.as_ref(), batch).await;
+    eprintln!("null primary key write: {result:?}");
+    assert!(result.is_err(), "a NULL primary key is refused");
+    assert_eq!(ids(&t).await?, vec![1], "the table keeps its rows");
+    Ok(())
+}
