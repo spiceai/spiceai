@@ -335,9 +335,10 @@ concurrency Milestones 2 and 3 can use.
   would depend on declared layout.
 
 **1.4 Data out of the log; checkpoints chunked and incremental.** Records carry
-small typed actions. Manifests, deletion-vector lists, statistics and cold-tier
-manifests are immutable objects with fresh names; each reference carries the
-object's BLAKE3 digest, which checks its bytes. A checkpoint is a small root
+small typed actions. Manifests, deletion-vector lists, table statistics and
+cold-tier manifests are immutable objects with fresh names; each reference
+carries the object's BLAKE3 digest, which checks its bytes. Per-file statistics
+are part of each file's entry, not objects of their own. A checkpoint is a small root
 plus sorted, size-bounded pages and rewrites only the pages that changed. The
 PK index is one of its collections, so it never needs history GC has removed.
 Opening a dataset reads the latest checkpoint plus the records after it.

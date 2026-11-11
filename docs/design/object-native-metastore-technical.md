@@ -533,7 +533,7 @@ Per dataset, a **dataset entry** (name, partitions), and per table:
   prefix read. `MarkDirty{pks, seq}` is in **the same record** as the write it
   tracks; `ClearDelivered{pk, seq_le}` removes a marker only if no newer one
   exists for that key ("latest wins").
-- **Statistics:** an object referenced with the commit it is valid as of. Changed
+- **Table statistics:** an object referenced with the commit it is valid as of. Changed
   by `SetTableStats{ref, as_of}`; a schema change that invalidates statistics
   clears the reference in the same record. `apply` drops "exact" on any later
   data-changing record, and each checkpoint stores that, so exactness never needs
@@ -1094,8 +1094,9 @@ hint (`statistics_to_inexact`).
 **What exists.** Per file: row count, byte size, and per column the min and
 max, null count, NaN handling, sum and uncompressed size, all from the Vortex
 footer; there is no per-file distinct count. Per table: the aggregated min and
-max, the live row count with an exact flag, and NDV sketches (HyperLogLog). The
-PK index is under [What the state holds](#what-the-state-holds).
+max, the live row count with an exact flag, and NDV sketches (HyperLogLog),
+which the writer builds from the rows it writes; a footer holds no distinct
+counts. The PK index is under [What the state holds](#what-the-state-holds).
 
 **What changes.** Today Cayenne's readers create and maintain per-file
 statistics, and a table's statistics record no state they describe. The target
@@ -1105,8 +1106,9 @@ makes statistics part of the data they describe.
 |---|---|---|---|
 | **Who writes per-file statistics, and when** | A scan, on a cache miss: it reads the footer, and a background task saves a statistics row for the next process | The writer, in the `AddFiles` or `ReplaceFiles` record that adds the file, from the footer it has just written | Readers write nothing (decision 1.10). In an object-native metastore a reader's save would be an object upload and a log commit; with the writer recording statistics, a reader needs only read access and makes no commit that competes with ingest |
 | **What they describe** | The file with the position deletes known at that moment folded in | The file as written, with no deletes applied | A file never changes, so its statistics never go stale. Today a later process reuses a row that misses newer deletes |
-| **Where they live** | A separate statistics row keyed by (table, snapshot, path), apart from the file's manifest row (`cayenne_snapshot_file_statistics`) | Part of the file's entry | One record and one lifecycle. With [flat files](#placement-and-the-data-path) the entry keeps its key across compactions, so nothing is recomputed |
-| **How a scan applies deletes** | From a live in-memory cache of position deletes | From the scan's own captured snapshot: row counts are lowered by its position deletes, and bounds become inexact when any delete applies | A compaction that commits between a scan's capture and its plan cannot change that scan's answer |
+| **Where they live** | A separate statistics row keyed by (table, snapshot, path), apart from the file's manifest row (`cayenne_snapshot_file_statistics`) | Part of the file's entry, inline in the checkpoint pages of live files, so planning reads no footer | Planning needs statistics before it opens any file, and a footer read is one ranged GET per file whose cache does not survive a restart. One record and one lifecycle; with [flat files](#placement-and-the-data-path) the entry keeps its key across compactions, so nothing is recomputed |
+| **How a scan applies position deletes** | From a live in-memory cache, and the saved per-file row already has them folded in | From the scan's own captured snapshot: each file's row count is lowered by its position deletes, its bounds become inexact and its sum is dropped | A compaction that commits between a scan's capture and its plan cannot change that scan's answer |
+| **How a scan applies key deletes** | Per-file statistics are not changed; the delete filter above the scan marks its output inexact and subtracts an estimate from the table's row count | The same, from the scan's own captured snapshot | A key delete hides rows by key, not by position, so no per-file count can know which rows it hides |
 | **When they leave** | By a prune that keeps only the current snapshot's rows, run after a listing refresh or a partial compaction, separately from the files' removal | Only with the file's entry, in the `ForgetRetired` record that forgets the file; there is no separate statistics action | One rule for a file and everything about it, and no late write can bring back a forgotten file's statistics |
 | **Table statistics** | One row per table (`cayenne_table_statistics`): a statistics blob, the row count, NDV sketches and an exact flag that the writer sets when it saves them; nothing records which state they describe | `SetTableStats{ref, as_of}`; `apply` drops "exact" on any later data-changing record, and each checkpoint stores that; a replaced object is deleted T later, and has a fresh name like every object | Exactness is tied to the commit it describes, so an exact count cannot outlive the data it counted |
 
@@ -1119,6 +1121,9 @@ makes statistics part of the data they describe.
   of an older snapshot uses per-file statistics.
 - **A schema change** that invalidates statistics clears them in the same
   record.
+- **No statistic per snapshot or file group.** Pruning is per file; nothing
+  skips a snapshot as a whole, so the [flat layout](#placement-and-the-data-path)
+  loses nothing.
 
 The problems under "Today" are from reading Cayenne's code, not from a run,
 and are tracked in [#16237](https://github.com/spiceai/spiceai/issues/16237). Model invariants
