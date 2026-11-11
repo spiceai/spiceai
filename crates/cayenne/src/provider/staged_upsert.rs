@@ -96,6 +96,9 @@ pub struct CayenneStagedUpsert {
     /// The superseded copies a folding table has not yet folded out of the
     /// staged files (see [`super::append_stage::StagedAppend::fold`]).
     fold: Option<super::append_stage::PendingFold>,
+    /// Staged rows the commit's `retention_sql` folded out of the staged files:
+    /// not stored, but still reported accepted, as the insert count always was.
+    retention_folded: u64,
 }
 
 impl std::fmt::Debug for CayenneStagedUpsert {
@@ -127,6 +130,7 @@ impl CayenneStagedUpsert {
             superseded: staged.superseded,
             retention_deferred,
             fold: staged.fold,
+            retention_folded: 0,
         }
     }
 
@@ -240,6 +244,8 @@ impl CayenneStagedUpsert {
                     return Ok(());
                 }
                 let dropped: u64 = hidden.values().map(|rows| rows.len() as u64).sum();
+                let repeats: u64 = fold.superseded.values().map(|rows| rows.len() as u64).sum();
+                self.retention_folded = dropped.saturating_sub(repeats);
                 self.stats = self
                     .table
                     .fold_superseded_copies(
@@ -358,6 +364,7 @@ impl CayenneStagedUpsert {
                 publish,
                 resident_retention,
             },
+            retention_folded: self.retention_folded,
             _checkpoint_guard: checkpoint_guard,
         })
     }
@@ -400,8 +407,9 @@ impl CayenneStagedUpsert {
             }
             None => prepare.await?,
         };
-        // Accepted rows, as when staging dropped the matches from the stream.
-        let row_count = self.row_count.saturating_sub(staged_matches);
+        // The accepted insert count includes the staged rows retention hides.
+        let _ = staged_matches;
+        let row_count = self.row_count;
         Ok(PreparedTxnCommit {
             table: self.table,
             new_snapshot_id: self.new_snapshot_id,
@@ -412,6 +420,7 @@ impl CayenneStagedUpsert {
                 generation: Some(generation),
                 committed: false,
             },
+            retention_folded: 0,
             row_count,
             _checkpoint_guard: Some(checkpoint_guard),
         })
@@ -481,6 +490,7 @@ impl CayenneStagedUpsert {
                     return Err(error);
                 }
             };
+        let retention_folded = self.retention_folded;
         super::append_commit::PreparedResolvedAppend {
             context: Arc::clone(self.table.context()),
             table: self.table,
@@ -499,6 +509,7 @@ impl CayenneStagedUpsert {
         }
         .commit()
         .await
+        .map(|rows| rows.saturating_add(retention_folded))
     }
 
     /// Discard the staged upsert and remove its staged snapshot directory.
@@ -533,6 +544,8 @@ pub struct PreparedTxnCommit {
     superseded: usize,
     /// What the shared commit publishes for this table.
     publication: TxnPublication,
+    /// See [`CayenneStagedUpsert::retention_folded`].
+    retention_folded: u64,
     /// Held with `write_lock` from preparation through `finish`, as a durable
     /// write holds it, so a checkpoint cannot move rows the delete was decided on.
     _checkpoint_guard: Option<tokio::sync::OwnedMutexGuard<()>>,
@@ -578,10 +591,11 @@ impl PreparedTxnCommit {
         &self.table
     }
 
-    /// Rows to be published on commit.
+    /// Rows accepted on commit: the rows published plus the staged rows the
+    /// commit's `retention_sql` folded out (an insert count, as before).
     #[must_use]
     pub fn row_count(&self) -> u64 {
-        self.row_count
+        self.row_count.saturating_add(self.retention_folded)
     }
 
     /// Append this table's deferred on-conflict payload (delete files + snapshot
@@ -917,9 +931,30 @@ impl CayenneTableProvider {
 
         let new_snapshot_id = uuid::Uuid::now_v7().to_string();
         let target_size_bytes = self.target_file_size_bytes();
+        // A keyed table that deletes by key cannot hide a staged row by
+        // position: with `retention_sql` deferred to the commit, record per-file
+        // statistics so the commit folds its matches out of the staged files,
+        // as a resolved upsert does (`StagedAppend::fold`).
+        let write = super::overwrite::WriteShape {
+            target_size_bytes,
+            target_partitions,
+            write_policy: WritePolicy::DELTA,
+        };
+        let file_stats = if super::overwrite_retention::staged_retention_deferred()
+            && self.primary_key_indices()?.is_some()
+            && !self.hides_repeated_keys_with_position_deletes()
+        {
+            Some(Arc::new(super::overwrite::FileStatsObserver::new(
+                self.table_name(),
+                &self.table_schema(),
+                None,
+            )?))
+        } else {
+            None
+        };
 
         let (row_count, _writer_ops, stats) = match self
-            .write_to_snapshot(
+            .write_to_snapshot_with_schema(
                 prepared.stream,
                 target_size_bytes,
                 &new_snapshot_id,
@@ -928,6 +963,11 @@ impl CayenneTableProvider {
                 // across the full write concurrency, matching `begin_staged_append`.
                 None,
                 WritePolicy::DELTA,
+                None,
+                file_stats.as_ref().map(|observer| {
+                    Arc::clone(observer) as Arc<dyn vortex_datafusion::VortexWriteObserver>
+                }),
+                self.table_schema(),
             )
             .await
         {
@@ -957,7 +997,11 @@ impl CayenneTableProvider {
             superseded,
             first_load_pk_bloom: None,
             retention_folded: 0,
-            fold: None,
+            fold: file_stats.map(|file_stats| super::append_stage::PendingFold {
+                write,
+                file_stats,
+                superseded: std::collections::HashMap::new(),
+            }),
         })
     }
 }

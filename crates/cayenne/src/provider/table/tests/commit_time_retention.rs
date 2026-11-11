@@ -82,10 +82,26 @@ fn aged(mode: Arc<AtomicU8>, seen: Seen) -> ScalarUDF {
 enum Shape {
     KeyedFold,
     KeyedPosition,
+    /// A primary key without `on_conflict` (no key resolver), key deletes.
+    PkNoConflictKey,
+    /// A primary key without `on_conflict`, position deletes.
+    PkNoConflictPosition,
     Unkeyed,
 }
 
-const SHAPES: [Shape; 3] = [Shape::KeyedFold, Shape::KeyedPosition, Shape::Unkeyed];
+impl Shape {
+    fn upserts(self) -> bool {
+        matches!(self, Self::KeyedFold | Self::KeyedPosition)
+    }
+}
+
+const SHAPES: [Shape; 5] = [
+    Shape::KeyedFold,
+    Shape::KeyedPosition,
+    Shape::PkNoConflictKey,
+    Shape::PkNoConflictPosition,
+    Shape::Unkeyed,
+];
 
 struct Fixture {
     provider: CayenneTableProvider,
@@ -145,7 +161,7 @@ async fn table(name: &str, shape: Shape) -> Fixture {
             } else {
                 vec![]
             },
-            on_conflict: keyed.then(|| {
+            on_conflict: shape.upserts().then(|| {
                 OnConflict::Upsert(
                     datafusion_table_providers::util::column_reference::ColumnReference::new(vec![
                         "id".to_string(),
@@ -155,7 +171,7 @@ async fn table(name: &str, shape: Shape) -> Fixture {
             base_path: format!("{}/data", dir.path().to_str().expect("path")),
             partition_column: None,
             vortex_config: VortexConfig {
-                deletion_mode: if shape == Shape::KeyedFold {
+                deletion_mode: if matches!(shape, Shape::KeyedFold | Shape::PkNoConflictKey) {
                     DeletionMode::Key
                 } else {
                     DeletionMode::Position
@@ -256,11 +272,10 @@ async fn the_commit_context_decides_rows_that_change_between_stage_and_commit() 
             vec![(1, 1), (8, 8)],
             "{shape:?}: aged at commit"
         );
-        // Counts as when staging decided: a folding table and a table without a
-        // primary key report the rows kept; a table hiding by position reports
-        // the rows written, the hidden one counted superseded.
-        let reported = if shape == Shape::KeyedPosition { 2 } else { 1 };
-        assert_eq!(committed.row_count, reported, "{shape:?}: reported rows");
+        // The accepted insert count includes the row retention removed, as
+        // upstream (9aa41988c) reported for every shape: its transactions did
+        // not evaluate `retention_sql` at all.
+        assert_eq!(committed.row_count, 2, "{shape:?}: accepted rows");
 
         let txn = stage(&f, &[(9, -9)]).await;
         f.set(OFF);
@@ -286,7 +301,14 @@ async fn each_candidate_is_evaluated_exactly_once_after_dedup() {
     for shape in SHAPES {
         let f = table(&format!("ctr_once_{shape:?}").to_lowercase(), shape).await;
         f.set(ON);
-        let txn = stage(&f, &[(5, -50), (5, 5), (6, -6)]).await;
+        // A repeated key only where the table resolves it (an upsert) or has
+        // no key at all.
+        let staged: &[(i64, i64)] = if shape == Shape::Unkeyed || shape.upserts() {
+            &[(5, -50), (5, 5), (6, -6)]
+        } else {
+            &[(5, 5), (6, -6)]
+        };
+        let txn = stage(&f, staged).await;
         assert!(
             f.take_seen().is_empty(),
             "{shape:?}: staging evaluated nothing"
