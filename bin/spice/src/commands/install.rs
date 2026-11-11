@@ -18,10 +18,15 @@ limitations under the License.
 
 use crate::context::RuntimeContext;
 use crate::error::Result;
+use crate::github::nightly::{self, NightlyError};
 use crate::github::{
-    GitHubClient, SystemType, download_release_asset_with_fallback, get_latest_release, get_release,
+    GitHubClient, SystemType, download_release_asset_with_fallback, get_latest_release,
+    get_release, replace_current_exe,
 };
+use chrono::{NaiveDate, Utc};
 use clap::Args;
+use std::io::Write as _;
+use std::path::Path;
 
 /// Arguments for the install command.
 #[derive(Args, Debug, Default)]
@@ -33,11 +38,18 @@ Examples:
   spice install              # Install latest version (auto-detects Metal/CUDA)
   spice install v1.8.3       # Install specific version
   spice install cuda         # Install with CUDA support (Linux only)
+  spice install nightly             # Install the latest nightly build of spice and spiced
+  spice install nightly 2026-11-10  # Install the nightly build that ran on that date (UTC)
+
+A nightly build is the CLI and runtime the build_nightly workflow builds from trunk
+each day. GitHub serves them only to signed-in users: sign in with `gh auth login`,
+or set GITHUB_TOKEN.
 
 See more at: https://spiceai.org/docs/"#
 )]
 pub struct InstallArgs {
-    /// Version to install (e.g., v1.8.3) and/or flavor (cuda)
+    /// Version to install (e.g., v1.8.3) and/or flavor (cuda), or `nightly` and optionally
+    /// the date of a nightly build (e.g., `nightly 2026-11-10`)
     #[arg(num_args = 0..=2)]
     args: Vec<String>,
 
@@ -50,6 +62,8 @@ pub struct InstallArgs {
 struct ParsedArgs {
     version: Option<String>,
     flavor: Flavor,
+    /// `Some` for `nightly`, holding the date when one is given.
+    nightly: Option<Option<NaiveDate>>,
 }
 
 /// Runtime flavor.
@@ -79,6 +93,9 @@ pub async fn execute(ctx: &RuntimeContext, args: &InstallArgs) -> Result<()> {
 
     // Prepare installation directory
     ctx.prepare_install_dir()?;
+    if let Some(date) = parsed.nightly {
+        return install_nightly(ctx, date, args.force).await;
+    }
     let client = GitHubClient::new_runtime_client();
 
     // Get the release
@@ -156,8 +173,118 @@ pub async fn execute(ctx: &RuntimeContext, args: &InstallArgs) -> Result<()> {
     Ok(())
 }
 
+/// Install the nightly build that ran on `date`, or the newest one: `spiced` where `spice
+/// install` puts it, and the CLI over the running one, as `spice upgrade` does.
+async fn install_nightly(ctx: &RuntimeContext, date: Option<NaiveDate>, force: bool) -> Result<()> {
+    let failed = |e: NightlyError| crate::error::Error::NightlyInstall {
+        message: e.to_string(),
+    };
+    let platform =
+        nightly::platform(std::env::consts::OS, std::env::consts::ARCH).map_err(failed)?;
+    let mut client = GitHubClient::new_runtime_client();
+    if !client.has_token() {
+        let token = gh_token()
+            .await
+            .ok_or_else(|| failed(NightlyError::NeedsToken))?;
+        client = client.with_token(token);
+    }
+    match date {
+        Some(date) => tracing::info!("Finding the Spice nightly build of {date}..."),
+        None => tracing::info!("Finding the latest Spice nightly build..."),
+    }
+    let build = nightly::find(&client, date, platform, Utc::now())
+        .await
+        .map_err(failed)?;
+
+    if !force
+        && let Ok(installed_version) = ctx.managed_runtime_version()
+        && installed_version.contains(&build.version_marker())
+    {
+        tracing::info!("Spice nightly {} already installed", build.describe());
+        crate::context::warn_if_install_will_not_run(ctx);
+        return Ok(());
+    }
+
+    tracing::info!("Installing Spice nightly {}...", build.describe());
+    let spiced = nightly::download_binary(&client, &build.runtime, "spiced")
+        .await
+        .map_err(failed)?;
+    let spiced_path = ctx.spiced_path();
+    install_binary(&spiced, &spiced_path).map_err(|e| crate::error::Error::NightlyInstall {
+        message: format!("Failed to write {}: {e}", spiced_path.display()),
+    })?;
+    let cli = nightly::download_binary(&client, &build.cli, "spice")
+        .await
+        .map_err(failed)?;
+    let cli_path = replace_current_exe(&cli).map_err(|e| failed(NightlyError::GitHub(e)))?;
+
+    let version_file = ctx.spice_runtime_dir().join("runtime_version.txt");
+    std::fs::write(&version_file, format!("{}\n", build.version_marker())).ok();
+    tracing::info!(
+        "Spice nightly {} installed: the runtime at {} and the CLI at {}",
+        build.describe(),
+        spiced_path.display(),
+        cli_path.display()
+    );
+    crate::context::warn_if_install_will_not_run(ctx);
+    Ok(())
+}
+
+/// The token `gh` holds for github.com, when `gh` is installed and signed in.
+async fn gh_token() -> Option<String> {
+    let output = tokio::process::Command::new("gh")
+        .args(["auth", "token", "--hostname", "github.com"])
+        .output()
+        .await
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let token = String::from_utf8(output.stdout).ok()?.trim().to_string();
+    (!token.is_empty()).then_some(token)
+}
+
+/// Put `binary` at `path`, executable, replacing what is there in one rename, so a runtime
+/// that is running keeps its file and the next start finds the new one.
+fn install_binary(binary: &[u8], path: &Path) -> std::io::Result<()> {
+    let dir = path.parent().unwrap_or_else(|| Path::new("."));
+    let mut file = tempfile::NamedTempFile::new_in(dir)?;
+    file.write_all(binary)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(file.path(), std::fs::Permissions::from_mode(0o755))?;
+    }
+    file.persist(path).map_err(|e| e.error)?;
+    Ok(())
+}
+
 /// Parse the command arguments into version and flavor.
 fn parse_args(args: &[String]) -> Result<ParsedArgs> {
+    if args
+        .first()
+        .is_some_and(|arg| arg.eq_ignore_ascii_case("nightly"))
+    {
+        let date = match args.get(1) {
+            None => None,
+            Some(flavor) if flavor.eq_ignore_ascii_case("cuda") => {
+                return Err(crate::error::Error::InvalidArgument {
+                    message: "Nightly builds have no CUDA flavor. Run `spice install nightly` for this machine's nightly build, or `spice install cuda` for the latest release with CUDA.".to_string(),
+                });
+            }
+            Some(date) => Some(nightly::parse_date(date).map_err(|e| {
+                crate::error::Error::InvalidArgument {
+                    message: e.to_string(),
+                }
+            })?),
+        };
+        return Ok(ParsedArgs {
+            version: None,
+            flavor: Flavor::Default,
+            nightly: Some(date),
+        });
+    }
+
     let mut version = None;
     let mut flavor = Flavor::Default;
 
@@ -170,11 +297,11 @@ fn parse_args(args: &[String]) -> Result<ParsedArgs> {
                 "default" => flavor = Flavor::Default,
                 _ => {
                     tracing::error!(
-                        "Invalid argument: {arg}. Expected version (e.g., v1.8.3) or flavor (cuda)"
+                        "Invalid argument: {arg}. Expected version (e.g., v1.8.3), flavor (cuda), or nightly"
                     );
                     return Err(crate::error::Error::InvalidArgument {
                         message: format!(
-                            "Invalid argument: {arg}. Expected version (e.g., v1.8.3) or flavor (cuda)"
+                            "Invalid argument: {arg}. Expected version (e.g., v1.8.3), flavor (cuda), or nightly"
                         ),
                     });
                 }
@@ -182,7 +309,11 @@ fn parse_args(args: &[String]) -> Result<ParsedArgs> {
         }
     }
 
-    Ok(ParsedArgs { version, flavor })
+    Ok(ParsedArgs {
+        version,
+        flavor,
+        nightly: None,
+    })
 }
 
 /// Check if a string is a valid semver version.

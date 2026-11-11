@@ -225,6 +225,39 @@ pub async fn upgrade_cli_in_place(
         });
     }
 
+    swap_into_current_exe(&extracted_binary, &current_exe)
+}
+
+/// Replace the running CLI with `binary`, returning the path it now has.
+///
+/// # Errors
+///
+/// Returns an error if the executable's path cannot be read or the file cannot be written or
+/// moved into place.
+pub fn replace_current_exe(binary: &[u8]) -> Result<std::path::PathBuf, GitHubError> {
+    let current_exe = std::env::current_exe().map_err(|e| GitHubError::Io {
+        message: format!("Failed to get current executable path: {e}"),
+    })?;
+    let exe_dir = current_exe.parent().ok_or_else(|| GitHubError::Io {
+        message: "Failed to get executable parent directory".to_string(),
+    })?;
+    // Next to the executable, so the rename stays on one filesystem.
+    let temp_dir = tempfile::tempdir_in(exe_dir).map_err(|e| GitHubError::Io {
+        message: format!("Failed to create temporary directory: {e}"),
+    })?;
+    let new_binary = temp_dir
+        .path()
+        .join(if cfg!(windows) { "spice.exe" } else { "spice" });
+    std::fs::write(&new_binary, binary).map_err(|e| GitHubError::Io {
+        message: format!("Failed to write {}: {e}", new_binary.display()),
+    })?;
+    swap_into_current_exe(&new_binary, &current_exe)?;
+    Ok(current_exe)
+}
+
+/// Move `new_binary`, a file in `current_exe`'s directory, to `current_exe` and make it
+/// executable.
+fn swap_into_current_exe(new_binary: &Path, current_exe: &Path) -> Result<(), GitHubError> {
     // We cannot overwrite a running executable directly — Linux returns ETXTBSY and
     // Windows locks the file. Use rename to atomically swap the directory entry: the
     // old inode stays alive (referenced by the running process) while the new binary
@@ -236,13 +269,13 @@ pub async fn upgrade_cli_in_place(
         // Try to remove old backup if it exists
         let _ = std::fs::remove_file(&backup_path);
         // Rename current executable to backup
-        std::fs::rename(&current_exe, &backup_path).map_err(|e| GitHubError::Io {
+        std::fs::rename(current_exe, &backup_path).map_err(|e| GitHubError::Io {
             message: format!("Failed to backup current executable: {e}"),
         })?;
     }
 
     // Atomically move the new binary into place.
-    std::fs::rename(&extracted_binary, &current_exe).map_err(|e| GitHubError::Io {
+    std::fs::rename(new_binary, current_exe).map_err(|e| GitHubError::Io {
         message: format!("Failed to replace CLI binary: {e}"),
     })?;
 
@@ -251,7 +284,7 @@ pub async fn upgrade_cli_in_place(
     {
         use std::os::unix::fs::PermissionsExt;
         let permissions = std::fs::Permissions::from_mode(0o755);
-        std::fs::set_permissions(&current_exe, permissions).map_err(|e| GitHubError::Io {
+        std::fs::set_permissions(current_exe, permissions).map_err(|e| GitHubError::Io {
             message: format!("Failed to set executable permissions: {e}"),
         })?;
     }
