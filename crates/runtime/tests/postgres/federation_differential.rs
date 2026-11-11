@@ -16,12 +16,14 @@ limitations under the License.
 
 //! Differential test of `PostgreSQL` federation against `PostgreSQL` itself.
 //!
-//! Each query runs five ways over the same committed rows: sent straight to
+//! Each query runs six ways over the same committed rows: sent straight to
 //! `PostgreSQL` (the oracle, which shares no code with Spice), against the
 //! federated datasets, whose plans Spice rewrites and sends to `PostgreSQL`,
-//! and against three accelerations of the same tables, loaded with
+//! and against four accelerations of the same tables, loaded with
 //! `refresh_mode: full` after the connector converts the rows: Arrow, Cayenne
-//! `mode: memory`, and Cayenne `mode: file`. The Cayenne sides read the rows
+//! `mode: memory`, Cayenne `mode: file` with its defaults, which keeps a load
+//! this small as rows inlined in its metastore, and Cayenne `mode: file` with
+//! inlining turned off, which writes and reads Vortex files. The Cayenne sides read the rows
 //! back through Cayenne's own scan, with filters and projections pushed into
 //! it, so a value Cayenne stores, encodes, or prunes wrongly shows up as a row
 //! that differs from `PostgreSQL`'s. The fixture holds the values
@@ -311,9 +313,13 @@ enum Kind {
     /// A Cayenne acceleration held in memory, loaded once with
     /// `refresh_mode: full`.
     CayenneMemory,
-    /// A Cayenne acceleration in Vortex files with a metastore on disk, loaded
-    /// once with `refresh_mode: full`.
+    /// A Cayenne acceleration with a metastore on disk, loaded once with
+    /// `refresh_mode: full`, with its default inlining: a load under
+    /// `inline_max_rows` is kept as rows in the metastore, not a Vortex file.
     CayenneFile,
+    /// [`Kind::CayenneFile`] with `inline_max_rows: 0`, so the load is written
+    /// to Vortex files and every scan reads them.
+    CayenneVortex,
 }
 
 /// `dir` holds a `mode: file` acceleration's data and metastore, one
@@ -341,12 +347,8 @@ fn dataset(port: usize, table: &str, name: &str, kind: Kind, dir: &Path) -> Data
             refresh_mode: Some(RefreshMode::Full),
             ..Acceleration::default()
         }),
-        Kind::CayenneFile => Some(Acceleration {
-            enabled: true,
-            engine: Some("cayenne".to_string()),
-            mode: Mode::File,
-            refresh_mode: Some(RefreshMode::Full),
-            params: Some(Params::from_string_map(HashMap::from([
+        Kind::CayenneFile | Kind::CayenneVortex => {
+            let mut params = HashMap::from([
                 (
                     "cayenne_file_path".to_string(),
                     dir.join(name).join("data").display().to_string(),
@@ -355,9 +357,19 @@ fn dataset(port: usize, table: &str, name: &str, kind: Kind, dir: &Path) -> Data
                     "cayenne_metadata_dir".to_string(),
                     dir.join(name).join("metadata").display().to_string(),
                 ),
-            ]))),
-            ..Acceleration::default()
-        }),
+            ]);
+            if kind == Kind::CayenneVortex {
+                params.insert("cayenne_inline_max_rows".to_string(), "0".to_string());
+            }
+            Some(Acceleration {
+                enabled: true,
+                engine: Some("cayenne".to_string()),
+                mode: Mode::File,
+                refresh_mode: Some(RefreshMode::Full),
+                params: Some(Params::from_string_map(params)),
+                ..Acceleration::default()
+            })
+        }
     };
     ds
 }
@@ -431,7 +443,7 @@ struct Subject {
     kind: Kind,
 }
 
-const SUBJECTS: [Subject; 4] = [
+const SUBJECTS: [Subject; 5] = [
     Subject {
         name: "federated",
         items: "fed_items",
@@ -455,6 +467,12 @@ const SUBJECTS: [Subject; 4] = [
         items: "cfile_items",
         regions: "cfile_regions",
         kind: Kind::CayenneFile,
+    },
+    Subject {
+        name: "cayenne vortex",
+        items: "cvortex_items",
+        regions: "cvortex_regions",
+        kind: Kind::CayenneVortex,
     },
 ];
 
@@ -492,6 +510,23 @@ fn check_cayenne_scan(plan: &[Row]) -> Result<(), String> {
             "the plan does not read the Cayenne acceleration ({CAYENNE_SCAN}):\n{physical}"
         ))
     }
+}
+
+/// Counts the `.vortex` files anywhere under `dir`.
+fn vortex_files(dir: &Path) -> Result<usize, anyhow::Error> {
+    let mut count = 0;
+    let mut pending = vec![dir.to_path_buf()];
+    while let Some(next) = pending.pop() {
+        for entry in std::fs::read_dir(&next)? {
+            let path = entry?.path();
+            if path.is_dir() {
+                pending.push(path);
+            } else if path.extension().is_some_and(|ext| ext == "vortex") {
+                count += 1;
+            }
+        }
+    }
+    Ok(count)
 }
 
 async fn compare_case(
@@ -545,7 +580,7 @@ async fn compare_case(
                     all_remote = false;
                 }
             }
-            Kind::CayenneMemory | Kind::CayenneFile => {
+            Kind::CayenneMemory | Kind::CayenneFile | Kind::CayenneVortex => {
                 // A Cayenne side must read through Cayenne's scan, or its
                 // agreement says nothing about what Cayenne stored.
                 let plan = spice_rows(rt, &format!("EXPLAIN {sql}"))
@@ -609,6 +644,18 @@ async fn federated_and_accelerated_postgres_answers_match_postgres() -> Result<(
                     expected,
                     "{table} must hold every fixture row"
                 );
+            }
+            // The Vortex side must serve its rows from Vortex files on disk,
+            // not from rows inlined in its metastore.
+            for subject in SUBJECTS.iter().filter(|s| s.kind == Kind::CayenneVortex) {
+                for table in [subject.items, subject.regions] {
+                    let files = vortex_files(&dir.path().join(table).join("data"))?;
+                    anyhow::ensure!(
+                        files > 0,
+                        "{table} turns inlining off but wrote no Vortex file under {}",
+                        dir.path().join(table).display()
+                    );
+                }
             }
 
             let cases = cases();
