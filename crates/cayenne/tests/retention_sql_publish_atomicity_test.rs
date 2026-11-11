@@ -46,6 +46,7 @@ test_with_backends!(upsert_to_matching_version_removes_key_at_publish_impl);
 test_with_backends!(duplicate_key_upsert_last_matching_removes_key_impl);
 test_with_backends!(failing_retention_keeps_previous_generation_impl);
 test_with_backends!(concurrent_reader_never_sees_matching_rows_impl);
+test_with_backends!(keyed_overwrite_last_copy_decides_at_publish_impl);
 
 fn schema() -> SchemaRef {
     Arc::new(Schema::new(vec![
@@ -293,5 +294,35 @@ async fn concurrent_reader_never_sees_matching_rows_impl(
     }
     assert!(reads.load(Ordering::Relaxed) > 0, "readers ran");
     assert_eq!(hits.load(Ordering::Relaxed), 0, "reads that saw archived rows");
+    Ok(())
+}
+
+/// A keyed overwrite resolves repeated keys first, then retention: key 1's last
+/// copy is archived, so key 1 is absent; key 2's last copy is active, so it stays,
+/// though an earlier copy of it matched.
+async fn keyed_overwrite_last_copy_decides_at_publish_impl(
+    fixture: common::TestFixture,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let t = table(&fixture, "rsql_pub_keyed_overwrite", true, archived()).await?;
+    common::write_batches(t.as_ref(), vec![rows(&[(1, Some("active")), (2, Some("active"))])], InsertOp::Overwrite)
+        .await?;
+    t.flush_pending_maintenance().await?;
+    for round in 0..3 {
+        common::write_batches(
+            t.as_ref(),
+            vec![rows(&[
+                (1, Some("active")),
+                (2, Some("archived")),
+                (3, None),
+                (1, Some("archived")),
+                (2, Some("active")),
+            ])],
+            InsertOp::Overwrite,
+        )
+        .await?;
+        assert_eq!(ids(&t).await?, vec![2, 3], "right after keyed overwrite {round}");
+    }
+    t.flush_pending_maintenance().await?;
+    assert_eq!(ids(&t).await?, vec![2, 3], "after maintenance");
     Ok(())
 }
