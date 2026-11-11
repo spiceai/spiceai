@@ -1342,3 +1342,159 @@ async fn old_reader_survives_carried_generation_flip_and_cleanup_impl(
     );
     Ok(())
 }
+
+/// The resident `retention_sql` delete never evaluates a hidden version: a row
+/// an earlier upsert superseded, a row a `DELETE` removed, and a row the
+/// current write supersedes are all skipped before the predicate, so a
+/// predicate that errors on them does not fail the write. A live resident row
+/// the predicate errors on still fails it and keeps the previous state. Run for
+/// an Int64 key and a composite (Int64, Utf8) key.
+#[test]
+fn resident_retention_skips_hidden_versions_before_its_predicate_sqlite() -> Result<(), String> {
+    common::run_with_backend_blocking(
+        common::BackendType::Sqlite,
+        resident_retention_skips_hidden_versions_before_its_predicate_impl,
+    )
+}
+
+async fn resident_retention_skips_hidden_versions_before_its_predicate_impl(
+    fixture: common::TestFixture,
+) -> Result<(), Box<dyn std::error::Error>> {
+    use datafusion::logical_expr::{ColumnarValue, Volatility, create_udf};
+    let schema3: SchemaRef = Arc::new(Schema::new(vec![
+        Field::new("id", DataType::Int64, false),
+        Field::new("tag", DataType::Utf8, false),
+        Field::new("status", DataType::Utf8, true),
+    ]));
+    let batch = |rows: &[(i64, &str)]| -> RecordBatch {
+        RecordBatch::try_new(
+            Arc::clone(&schema3),
+            vec![
+                Arc::new(Int64Array::from(
+                    rows.iter().map(|(id, _)| *id).collect::<Vec<_>>(),
+                )),
+                Arc::new(StringArray::from(vec!["a"; rows.len()])),
+                Arc::new(StringArray::from(
+                    rows.iter().map(|(_, s)| Some(*s)).collect::<Vec<_>>(),
+                )),
+            ],
+        )
+        .expect("batch")
+    };
+    for (name, key) in [
+        ("rsql_skip_int64", vec!["id"]),
+        ("rsql_skip_composite", vec!["id", "tag"]),
+    ] {
+        let broken = Arc::new(AtomicBool::new(false));
+        let b = Arc::clone(&broken);
+        let udf = create_udf(
+            "boom",
+            vec![DataType::Utf8],
+            DataType::Boolean,
+            Volatility::Volatile,
+            Arc::new(move |args: &[ColumnarValue]| {
+                let array = args[0].clone().into_array(1)?;
+                let values = array.as_any().downcast_ref::<StringArray>().expect("utf8");
+                if b.load(Ordering::SeqCst) && values.iter().any(|v| v == Some("boom")) {
+                    return Err(datafusion::error::DataFusionError::Execution(
+                        "boom() cannot evaluate this row".to_string(),
+                    ));
+                }
+                Ok(ColumnarValue::Array(Arc::new(
+                    arrow::array::BooleanArray::from(vec![Some(false); values.len()]),
+                )))
+            }),
+        );
+        let key: Vec<String> = key.into_iter().map(String::from).collect();
+        let dir = fixture.data_path.join(name);
+        std::fs::create_dir_all(&dir)?;
+        let options = CreateTableOptions {
+            table_name: name.to_string(),
+            schema: Arc::clone(&schema3),
+            primary_key: key.clone(),
+            on_conflict: Some(OnConflict::Upsert(ColumnReference::new(key))),
+            base_path: dir.to_string_lossy().to_string(),
+            partition_column: None,
+            vortex_config: file_tier_config(),
+        };
+        let t = Arc::new(
+            CayenneTableProvider::create_table_with_retention(
+                Arc::clone(&fixture.catalog) as Arc<dyn MetadataCatalog>,
+                options,
+                vec![udf.call(vec![col("status")])],
+                SessionContext::new().runtime_env(),
+            )
+            .await?,
+        );
+        let ctx = SessionContext::new();
+        ctx.register_table("t", Arc::clone(&t) as Arc<dyn TableProvider>)?;
+        let contents = || async {
+            let batches = ctx
+                .sql("SELECT id, status FROM t ORDER BY id")
+                .await?
+                .collect()
+                .await?;
+            let mut out = Vec::new();
+            for b in &batches {
+                let ids = b
+                    .column(0)
+                    .as_any()
+                    .downcast_ref::<Int64Array>()
+                    .expect("id");
+                let st = b
+                    .column(1)
+                    .as_any()
+                    .downcast_ref::<StringArray>()
+                    .expect("s");
+                for i in 0..b.num_rows() {
+                    out.push((ids.value(i), st.value(i).to_string()));
+                }
+            }
+            Ok::<_, Box<dyn std::error::Error>>(out)
+        };
+        let pairs = |v: &[(i64, &str)]| -> Vec<(i64, String)> {
+            v.iter().map(|(i, s)| (*i, (*s).to_string())).collect()
+        };
+
+        common::insert_batch(t.as_ref(), batch(&[(1, "boom"), (2, "boom"), (3, "boom")])).await?;
+        t.flush_pending_maintenance().await?;
+        common::insert_batch(t.as_ref(), batch(&[(1, "ok")])).await?;
+        t.flush_pending_maintenance().await?;
+        ctx.sql("DELETE FROM t WHERE id = 3")
+            .await?
+            .collect()
+            .await?;
+        assert_eq!(
+            contents().await?,
+            pairs(&[(1, "ok"), (2, "boom")]),
+            "{name}: setup"
+        );
+
+        // Row 1's first version is superseded, row 3 is deleted, and row 2 is
+        // superseded by this very write: none may reach the predicate.
+        broken.store(true, Ordering::SeqCst);
+        common::insert_batch(t.as_ref(), batch(&[(2, "ok"), (4, "new")])).await?;
+        assert_eq!(
+            contents().await?,
+            pairs(&[(1, "ok"), (2, "ok"), (4, "new")]),
+            "{name}: hidden versions skipped"
+        );
+
+        // Control: a LIVE resident row the predicate errors on fails the write
+        // and keeps the previous state.
+        broken.store(false, Ordering::SeqCst);
+        common::insert_batch(t.as_ref(), batch(&[(6, "boom")])).await?;
+        broken.store(true, Ordering::SeqCst);
+        let failed = common::insert_batch(t.as_ref(), batch(&[(7, "new")])).await;
+        assert!(
+            failed.is_err(),
+            "{name}: a live erroring row fails the write"
+        );
+        assert_eq!(
+            contents().await?,
+            pairs(&[(1, "ok"), (2, "ok"), (4, "new"), (6, "boom")]),
+            "{name}: previous state kept"
+        );
+    }
+    Ok(())
+}
