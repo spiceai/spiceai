@@ -2637,6 +2637,17 @@ async fn hybrid_cdc_composite_retention_across_versions_shards_and_compaction_im
         } else {
             file_tier_config()
         };
+        let vortex_config = VortexConfig {
+            cdc_durability: CdcDurability::Memory,
+            cdc_mem_tier_shards: shards,
+            cdc_mem_tier_checkpoint_interval_ms: 0,
+            cdc_mem_tier_max_age_ms: 0,
+            cdc_mem_tier_seal_age_ms: 0,
+            compaction_background_interval_ms: 3_600_000,
+            compaction_trigger_files: 2,
+            compaction_trigger_protected_snapshots: 2,
+            ..base
+        };
         let options = CreateTableOptions {
             table_name: name.clone(),
             schema: Arc::clone(&schema3),
@@ -2644,31 +2655,61 @@ async fn hybrid_cdc_composite_retention_across_versions_shards_and_compaction_im
             on_conflict: Some(OnConflict::Upsert(ColumnReference::new(key))),
             base_path: dir.to_string_lossy().to_string(),
             partition_column: None,
-            vortex_config: VortexConfig {
-                cdc_durability: CdcDurability::Memory,
-                cdc_mem_tier_shards: shards,
-                cdc_mem_tier_checkpoint_interval_ms: 0,
-                cdc_mem_tier_max_age_ms: 0,
-                cdc_mem_tier_seal_age_ms: 0,
-                compaction_background_interval_ms: 3_600_000,
-                ..base
-            },
+            vortex_config: vortex_config.clone(),
         };
-        let t = Arc::new(
-            CayenneTableProvider::create_table_with_retention(
+        let seed = batch(&[(1, 1, "old"), (1, 2, "new"), (2, 1, "old"), (2, 2, "new")]);
+        // Inline on: retention tables never inline their own writes, so the
+        // inlined corpus is the one a table carries from before `retention_sql`
+        // was configured: seed it without retention, then reopen with it.
+        let mut inline_gen_before = 0;
+        let mut inline_gen_after = 0;
+        let t = if inline {
+            let plain = CayenneTableProvider::create_table_with_retention(
                 Arc::clone(&fixture.catalog) as Arc<dyn MetadataCatalog>,
                 options,
-                vec![udf.call(vec![col("status")])],
+                vec![],
                 SessionContext::new().runtime_env(),
             )
-            .await?,
-        );
+            .await?;
+            inline_gen_before = plain.inlined_generation();
+            common::insert_batch(&plain, seed.clone()).await?;
+            inline_gen_after = plain.inlined_generation();
+            assert!(
+                inline_gen_after > inline_gen_before,
+                "{label}: the seed is in the inlined corpus"
+            );
+            drop(plain);
+            let runtime_env = SessionContext::new().runtime_env();
+            Arc::new(
+                CayenneTableProviderBuilder::new(
+                    Arc::clone(&fixture.catalog) as Arc<dyn MetadataCatalog>,
+                    Arc::clone(&runtime_env),
+                )
+                .with_context(cayenne::CayenneContext::new(
+                    &vortex_config,
+                    runtime_env,
+                    &name,
+                ))
+                .with_retention_filters(vec![udf.call(vec![col("status")])])
+                .open(&name)
+                .await?,
+            )
+        } else {
+            Arc::new(
+                CayenneTableProvider::create_table_with_retention(
+                    Arc::clone(&fixture.catalog) as Arc<dyn MetadataCatalog>,
+                    options,
+                    vec![udf.call(vec![col("status")])],
+                    SessionContext::new().runtime_env(),
+                )
+                .await?,
+            )
+        };
         assert!(
             t.is_cdc_memory_mode() && !t.is_memory_resident_mode(),
             "{label}"
         );
         let acks = Arc::new(AtomicU64::new(0));
-        t.install_slot_advancer(Arc::new(CountingSlotAdvancer(Arc::clone(&acks))));
         let apply = |rows: Vec<(i64, i64, &'static str)>| {
             let t = Arc::clone(&t);
             let b = batch(&rows);
@@ -2697,14 +2738,18 @@ async fn hybrid_cdc_composite_retention_across_versions_shards_and_compaction_im
         };
 
         // Durable generation.
-        apply(vec![
-            (1, 1, "old"),
-            (1, 2, "new"),
-            (2, 1, "old"),
-            (2, 2, "new"),
-        ])
-        .await?;
-        t.checkpoint_mem_tier().await?;
+        if !inline {
+            t.install_slot_advancer(Arc::new(CountingSlotAdvancer(Arc::clone(&acks))));
+            apply(vec![
+                (1, 1, "old"),
+                (1, 2, "new"),
+                (2, 1, "old"),
+                (2, 2, "new"),
+            ])
+            .await?;
+            t.checkpoint_mem_tier().await?;
+        }
+        t.install_slot_advancer(Arc::new(CountingSlotAdvancer(Arc::clone(&acks))));
         // Two tier versions per key; the newest decides.
         apply(vec![(1, 1, "new"), (1, 2, "old")]).await?;
         apply(vec![(1, 1, "old"), (1, 2, "new"), (2, 2, "new")]).await?;
@@ -2774,16 +2819,14 @@ async fn hybrid_cdc_composite_retention_across_versions_shards_and_compaction_im
             "{label}: reinserted"
         );
         t.checkpoint_mem_tier().await?;
-        let compacted_1 = t.compact_current_snapshot_small_files().await?;
-        assert_eq!(
-            keys(Arc::clone(&t)).await?,
-            reinserted,
-            "{label}: after compaction 1"
-        );
-        // Delete (2,2) by retention after compaction, then compact again: the
-        // compaction that drops the tombstone must not resurrect it.
+        // Before compacting: (2,2) deleted through its incoming archived version,
+        // and a resident tier row (4,1) deleted by a later apply's retention.
         aged.store(true, Ordering::SeqCst);
         apply(vec![(2, 2, "old")]).await?;
+        aged.store(false, Ordering::SeqCst);
+        apply(vec![(4, 1, "old")]).await?;
+        aged.store(true, Ordering::SeqCst);
+        apply(vec![(4, 2, "new")]).await?;
         aged.store(false, Ordering::SeqCst);
         let final_rows = k(&[
             (1, 1, "new"),
@@ -2791,25 +2834,52 @@ async fn hybrid_cdc_composite_retention_across_versions_shards_and_compaction_im
             (2, 1, "new"),
             (3, 1, "new"),
             (3, 2, "new"),
+            (4, 2, "new"),
         ]);
         assert_eq!(
             keys(Arc::clone(&t)).await?,
             final_rows,
-            "{label}: (2,2) gone"
+            "{label}: (2,2), (4,1) gone"
         );
         t.checkpoint_mem_tier().await?;
-        let compacted_2 = t.compact_current_snapshot_small_files().await?;
+        // The merge folds the snapshots holding the deleted rows together with
+        // their tombstones: rows physically dropped, tombstones at or below the
+        // merged fence no longer applied. Nothing may come back.
+        let compacted = t.compact_protected_snapshots_subset(usize::MAX).await?;
         assert_eq!(
             keys(Arc::clone(&t)).await?,
             final_rows,
-            "{label}: after compaction 2"
+            "{label}: after compaction"
         );
         assert_eq!(
             keys(reopen().await?).await?,
             final_rows,
-            "{label}: reopened"
+            "{label}: compacted, reopened"
         );
-        eprintln!("{label}: compacted_1={compacted_1} compacted_2={compacted_2}");
+        // An old tombstone never hides a reinsert, across the compaction too.
+        apply(vec![(2, 2, "new"), (4, 1, "new")]).await?;
+        t.checkpoint_mem_tier().await?;
+        let mut again = final_rows.clone();
+        again.extend(k(&[(2, 2, "new"), (4, 1, "new")]));
+        again.sort();
+        assert_eq!(
+            keys(Arc::clone(&t)).await?,
+            again,
+            "{label}: reinserted after compaction"
+        );
+        assert_eq!(
+            keys(reopen().await?).await?,
+            again,
+            "{label}: reinsert durable"
+        );
+        eprintln!(
+            "{label}: compacted={compacted} inlined_generation {inline_gen_before}->{inline_gen_after}"
+        );
+        // With the inline corpus folded in, the snapshot sizes need not share a
+        // size tier, so the merge may decline there; the file-only runs must merge.
+        if !inline {
+            assert!(compacted, "{label}: the compaction ran");
+        }
     }
     Ok(())
 }
