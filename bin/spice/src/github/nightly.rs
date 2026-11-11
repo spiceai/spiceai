@@ -23,6 +23,7 @@ use std::fmt::Write as _;
 use std::io::Read;
 
 use chrono::{DateTime, NaiveDate, Utc};
+use futures::StreamExt;
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
 
@@ -174,7 +175,7 @@ impl std::fmt::Display for NightlyError {
             } => {
                 write!(
                     f,
-                    "The Spice nightly build of {date} has no {platform} binaries, because that build did not finish: {url}."
+                    "The Spice nightly run of {date} has no {platform} binaries, because it skipped or did not finish that build: {url}."
                 )?;
                 write_available(f, available)
             }
@@ -297,18 +298,22 @@ enum Found {
     Missing,
 }
 
+/// Reads run `run`'s artifacts for this platform's CLI and runtime. An artifact counts as
+/// expired once GitHub marks it so or its `expires_at` has passed.
 async fn look(
     source: &impl NightlySource,
     run: &WorkflowRun,
     platform: &str,
+    now: DateTime<Utc>,
 ) -> Result<Found, GitHubError> {
     let artifacts = source.artifacts(run.id).await?;
     let named = |prefix: &str| {
         let name = format!("{prefix}_{platform}");
         artifacts.iter().find(|a| a.name == name).cloned()
     };
+    let kept = |a: &Artifact| !a.expired && a.expires_at.is_none_or(|expires| expires > now);
     Ok(match (named("spice"), named("spiced")) {
-        (Some(cli), Some(runtime)) if !cli.expired && !runtime.expired => {
+        (Some(cli), Some(runtime)) if kept(&cli) && kept(&runtime) => {
             Found::Build(Box::new(NightlyBuild {
                 run: run.clone(),
                 cli,
@@ -320,33 +325,35 @@ async fn look(
     })
 }
 
-/// The dates of the successful runs whose artifacts GitHub still keeps, newest first. How long
-/// it keeps them is read off the newest successful run's artifacts.
+/// Runs whose artifacts are read at once when listing the dates there are builds for.
+const ARTIFACT_READS_IN_FLIGHT: usize = 8;
+
+/// The dates of the runs that hold this platform's CLI and runtime, neither expired, newest
+/// first. A run's conclusion does not say this: the workflow skips its build jobs on a night
+/// with no new commits and still succeeds, and a run that failed may have finished this
+/// platform's build.
 async fn available(
     source: &impl NightlySource,
     runs: &[WorkflowRun],
+    platform: &str,
     now: DateTime<Utc>,
 ) -> Result<Vec<NaiveDate>, GitHubError> {
-    let succeeded: Vec<&WorkflowRun> = runs
-        .iter()
-        .filter(|run| run.conclusion.as_deref() == Some("success"))
-        .collect();
-    let Some(newest) = succeeded.first() else {
-        return Ok(Vec::new());
-    };
-    let retention = source
-        .artifacts(newest.id)
-        .await?
-        .iter()
-        .find_map(|a| a.expires_at)
-        .map(|expires| expires - newest.created_at);
-    let mut dates: Vec<NaiveDate> = succeeded
-        .iter()
-        .filter(|run| retention.is_none_or(|kept| run.created_at + kept > now))
-        .map(|run| run.created_at.date_naive())
-        .collect();
-    dates.dedup();
-    dates.truncate(DATES_LISTED);
+    let mut found =
+        futures::stream::iter(runs)
+            .map(|run| async move {
+                Ok::<_, GitHubError>((run, look(source, run, platform, now).await?))
+            })
+            .buffered(ARTIFACT_READS_IN_FLIGHT);
+    let mut dates: Vec<NaiveDate> = Vec::new();
+    while dates.len() < DATES_LISTED
+        && let Some(result) = found.next().await
+    {
+        let (run, found) = result?;
+        let date = run.created_at.date_naive();
+        if matches!(found, Found::Build(_)) && !dates.contains(&date) {
+            dates.push(date);
+        }
+    }
     Ok(dates)
 }
 
@@ -365,7 +372,7 @@ pub(crate) async fn find(
     let runs = source.runs().await?;
     let Some(date) = date else {
         for run in runs.iter().take(RUNS_SEARCHED) {
-            if let Found::Build(build) = look(source, run, platform).await? {
+            if let Found::Build(build) = look(source, run, platform, now).await? {
                 return Ok(*build);
             }
         }
@@ -377,13 +384,13 @@ pub(crate) async fn find(
         .collect();
     let mut expired = false;
     for run in &on_date {
-        match look(source, run, platform).await? {
+        match look(source, run, platform, now).await? {
             Found::Build(build) => return Ok(*build),
             Found::Expired => expired = true,
             Found::Missing => {}
         }
     }
-    let available = available(source, &runs, now).await?;
+    let available = available(source, &runs, platform, now).await?;
     Err(match on_date.first() {
         None => NightlyError::NoBuildOn { date, available },
         Some(_) if expired => NightlyError::Expired { date, available },
@@ -524,7 +531,7 @@ mod tests {
     }
 
     /// Nightly runs as GitHub lists them on 2026-11-11: 11-10 succeeded, 11-09 succeeded,
-    /// 11-08 failed after the Linux builds, and 10-08's binaries have expired.
+    /// 11-08 failed after the Linux builds, and the other run of 11-08 has expired binaries.
     fn november() -> Recorded {
         let mut failed = both("linux_aarch64", 8, false);
         failed.extend(both("linux_x86_64", 8, false));
@@ -575,7 +582,7 @@ mod tests {
             .expect_err("no build ran on 11-12");
         assert_eq!(
             error.to_string(),
-            "No Spice nightly build ran on 2026-11-12. Complete nightly builds: 2026-11-10, 2026-11-09, 2026-11-08. Install one with `spice install nightly <date>`."
+            "No Spice nightly build ran on 2026-11-12. Complete nightly builds: 2026-11-10, 2026-11-09. Install one with `spice install nightly <date>`."
         );
     }
 
@@ -588,7 +595,7 @@ mod tests {
             .expect_err("11-08's macOS build failed");
         assert_eq!(
             error.to_string(),
-            "The Spice nightly build of 2026-11-08 has no darwin_aarch64 binaries, because that build did not finish: https://github.com/spiceai/spiceai/actions/runs/8. Complete nightly builds: 2026-11-10, 2026-11-09. Install one with `spice install nightly <date>`."
+            "The Spice nightly run of 2026-11-08 has no darwin_aarch64 binaries, because it skipped or did not finish that build: https://github.com/spiceai/spiceai/actions/runs/8. Complete nightly builds: 2026-11-10, 2026-11-09. Install one with `spice install nightly <date>`."
         );
         let build = find(&source, date(8), "linux_aarch64", at(11))
             .await
@@ -605,8 +612,131 @@ mod tests {
             .expect_err("1008's binaries expired");
         assert_eq!(
             error.to_string(),
-            "The Spice nightly build of 2026-11-08 has expired: GitHub deletes a nightly build's binaries after the workflow's retention period. Complete nightly builds: 2026-11-10, 2026-11-09, 2026-11-08. Install one with `spice install nightly <date>`."
+            "The Spice nightly build of 2026-11-08 has expired: GitHub deletes a nightly build's binaries after the workflow's retention period. Complete nightly builds: 2026-11-10, 2026-11-09. Install one with `spice install nightly <date>`."
         );
+    }
+
+    fn named(name: &str, day: u32) -> Artifact {
+        artifact(name, day, false)
+    }
+
+    /// Runs as GitHub lists them on 2026-11-21, one of each kind of run, newest first.
+    fn every_kind_of_run() -> Recorded {
+        let mut past_expiry = both("linux_x86_64", 14, false);
+        for a in &mut past_expiry {
+            a.expires_at = Some(at(20));
+        }
+        Recorded {
+            runs: vec![
+                // No new commits: the build jobs were skipped, and the run succeeded.
+                run(20, 20, "success"),
+                run(19, 19, "success"),
+                run(18, 18, "success"),
+                run(17, 17, "success"),
+                // Failed after this platform's build finished.
+                run(16, 16, "failure"),
+                run(15, 15, "success"),
+                run(14, 14, "success"),
+                run(13, 13, "success"),
+            ],
+            artifacts: [
+                (20, vec![named("images-amd64", 20)]),
+                (19, both("linux_x86_64", 19, false)),
+                (18, vec![named("spice_linux_x86_64", 18)]),
+                (17, vec![named("spiced_linux_x86_64", 17)]),
+                (16, both("linux_x86_64", 16, false)),
+                (15, both("linux_x86_64", 15, true)),
+                (14, past_expiry),
+                (13, both("linux_aarch64", 13, false)),
+            ]
+            .into_iter()
+            .collect(),
+        }
+    }
+
+    #[tokio::test]
+    async fn only_runs_with_this_platforms_unexpired_cli_and_runtime_are_listed() {
+        let error = find(&every_kind_of_run(), date(22), "linux_x86_64", at(21))
+            .await
+            .expect_err("no build ran on 11-22");
+        // Not 11-20 (built nothing), 11-18 (CLI only), 11-17 (runtime only), 11-15 (expired),
+        // 11-14 (past its expiry) or 11-13 (another platform's binaries).
+        assert_eq!(
+            error.to_string(),
+            "No Spice nightly build ran on 2026-11-22. Complete nightly builds: 2026-11-19, 2026-11-16. Install one with `spice install nightly <date>`."
+        );
+    }
+
+    #[tokio::test]
+    async fn every_listed_date_installs() {
+        let source = every_kind_of_run();
+        let error = find(&source, date(22), "linux_x86_64", at(21))
+            .await
+            .expect_err("no build ran on 11-22");
+        let NightlyError::NoBuildOn { available, .. } = error else {
+            panic!("expected NoBuildOn, got {error}");
+        };
+        assert!(!available.is_empty());
+        for day in available {
+            let build = find(&source, Some(day), "linux_x86_64", at(21))
+                .await
+                .expect("a listed date installs");
+            assert_eq!(build.date(), day);
+        }
+    }
+
+    #[tokio::test]
+    async fn a_run_that_skipped_its_build_says_so_and_the_newest_build_is_the_one_before() {
+        let source = every_kind_of_run();
+        let error = find(&source, date(20), "linux_x86_64", at(21))
+            .await
+            .expect_err("11-20 built nothing");
+        assert_eq!(
+            error.to_string(),
+            "The Spice nightly run of 2026-11-20 has no linux_x86_64 binaries, because it skipped or did not finish that build: https://github.com/spiceai/spiceai/actions/runs/20. Complete nightly builds: 2026-11-19, 2026-11-16. Install one with `spice install nightly <date>`."
+        );
+        let newest = find(&source, None, "linux_x86_64", at(21))
+            .await
+            .expect("a build");
+        assert_eq!(newest.run.id, 19);
+    }
+
+    #[tokio::test]
+    async fn a_build_past_its_expiry_is_expired_before_github_marks_it() {
+        let error = find(&every_kind_of_run(), date(14), "linux_x86_64", at(21))
+            .await
+            .expect_err("11-14 expired on 11-20");
+        assert!(
+            error
+                .to_string()
+                .starts_with("The Spice nightly build of 2026-11-14 has expired"),
+            "{error}"
+        );
+    }
+
+    #[tokio::test]
+    async fn at_most_ten_dates_are_listed_one_per_day() {
+        let mut runs = Vec::new();
+        let mut artifacts = std::collections::HashMap::new();
+        for day in (1..=14).rev() {
+            for id in [u64::from(day) * 2, u64::from(day) * 2 + 1] {
+                runs.push(run(id, day, "success"));
+                artifacts.insert(id, both("linux_x86_64", day, false));
+            }
+        }
+        let error = find(
+            &Recorded { runs, artifacts },
+            date(20),
+            "linux_x86_64",
+            at(15),
+        )
+        .await
+        .expect_err("no build ran on 11-20");
+        let NightlyError::NoBuildOn { available, .. } = error else {
+            panic!("expected NoBuildOn, got {error}");
+        };
+        let expected: Vec<NaiveDate> = (5..=14).rev().filter_map(date).collect();
+        assert_eq!(available, expected);
     }
 
     #[test]
