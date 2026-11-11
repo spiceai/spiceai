@@ -186,15 +186,20 @@ steps:
   # A zero TTL asks the origin on every lookup even right after the previous
   # one, while that lookup's write is still waiting to land: the lookup must
   # not replay the earlier fetch (#16148). Back to back, so each second lookup
-  # falls inside the earlier one's write window.
+  # falls inside the earlier one's write window. The second answer ({"v":2})
+  # can only come from the origin, which proves it was asked. `zero_strict`
+  # passes every lookup through, so the origin sees exactly two requests. For
+  # `zero` the count is not fixed: a second lookup that lands inside the write
+  # window also refreshes the stored entry from the origin once that write
+  # lands, a third request whose timing the script cannot control. What the
+  # refresh guarantees is checked after the loop instead: the stored entry
+  # holds the newer answer.
   - source-exec: { api: "{ path: /v1/again-zero-0, headers: { content-type: application/json }, body: '[{\"v\": 1}]' }" }
   - query: SELECT content FROM zero WHERE request_path = '/again-zero-0'
     expect: { rows: [['{"v":1}']] }
   - source-exec: { api: "{ path: /v1/again-zero-0, headers: { content-type: application/json }, body: '[{\"v\": 2}]' }" }
   - query: SELECT content FROM zero WHERE request_path = '/again-zero-0'
     expect: { rows: [['{"v":2}']] }
-  - source-query: { api: count /v1/again-zero-0 }
-    expect: { rows: [['2']] }
   - source-exec: { api: "{ path: /v1/again-zero_strict-0, headers: { content-type: application/json }, body: '[{\"v\": 1}]' }" }
   - query: SELECT content FROM zero_strict WHERE request_path = '/again-zero_strict-0'
     expect: { rows: [['{"v":1}']] }
@@ -209,8 +214,6 @@ steps:
   - source-exec: { api: "{ path: /v1/again-zero-1, headers: { content-type: application/json }, body: '[{\"v\": 2}]' }" }
   - query: SELECT content FROM zero WHERE request_path = '/again-zero-1'
     expect: { rows: [['{"v":2}']] }
-  - source-query: { api: count /v1/again-zero-1 }
-    expect: { rows: [['2']] }
   - source-exec: { api: "{ path: /v1/again-zero_strict-1, headers: { content-type: application/json }, body: '[{\"v\": 1}]' }" }
   - query: SELECT content FROM zero_strict WHERE request_path = '/again-zero_strict-1'
     expect: { rows: [['{"v":1}']] }
@@ -225,8 +228,6 @@ steps:
   - source-exec: { api: "{ path: /v1/again-zero-2, headers: { content-type: application/json }, body: '[{\"v\": 2}]' }" }
   - query: SELECT content FROM zero WHERE request_path = '/again-zero-2'
     expect: { rows: [['{"v":2}']] }
-  - source-query: { api: count /v1/again-zero-2 }
-    expect: { rows: [['2']] }
   - source-exec: { api: "{ path: /v1/again-zero_strict-2, headers: { content-type: application/json }, body: '[{\"v\": 1}]' }" }
   - query: SELECT content FROM zero_strict WHERE request_path = '/again-zero_strict-2'
     expect: { rows: [['{"v":1}']] }
@@ -241,8 +242,6 @@ steps:
   - source-exec: { api: "{ path: /v1/again-zero-3, headers: { content-type: application/json }, body: '[{\"v\": 2}]' }" }
   - query: SELECT content FROM zero WHERE request_path = '/again-zero-3'
     expect: { rows: [['{"v":2}']] }
-  - source-query: { api: count /v1/again-zero-3 }
-    expect: { rows: [['2']] }
   - source-exec: { api: "{ path: /v1/again-zero_strict-3, headers: { content-type: application/json }, body: '[{\"v\": 1}]' }" }
   - query: SELECT content FROM zero_strict WHERE request_path = '/again-zero_strict-3'
     expect: { rows: [['{"v":1}']] }
@@ -257,8 +256,6 @@ steps:
   - source-exec: { api: "{ path: /v1/again-zero-4, headers: { content-type: application/json }, body: '[{\"v\": 2}]' }" }
   - query: SELECT content FROM zero WHERE request_path = '/again-zero-4'
     expect: { rows: [['{"v":2}']] }
-  - source-query: { api: count /v1/again-zero-4 }
-    expect: { rows: [['2']] }
   - source-exec: { api: "{ path: /v1/again-zero_strict-4, headers: { content-type: application/json }, body: '[{\"v\": 1}]' }" }
   - query: SELECT content FROM zero_strict WHERE request_path = '/again-zero_strict-4'
     expect: { rows: [['{"v":1}']] }
@@ -267,22 +264,50 @@ steps:
     expect: { rows: [['{"v":2}']] }
   - source-query: { api: count /v1/again-zero_strict-4 }
     expect: { rows: [['2']] }
+  # Once the writes and any refresh have landed, a failing origin is answered
+  # from the stored entry, which must be the newer response, not the one the
+  # earlier write stored.
+  - sleep: 2s
+  - source-exec:
+      api:
+        - "{ path: /v1/again-zero-0, status: 503, body: down }"
+        - "{ path: /v1/again-zero-1, status: 503, body: down }"
+        - "{ path: /v1/again-zero-2, status: 503, body: down }"
+        - "{ path: /v1/again-zero-3, status: 503, body: down }"
+        - "{ path: /v1/again-zero-4, status: 503, body: down }"
+  - query: SELECT content FROM zero WHERE request_path = '/again-zero-0'
+    expect: { rows: [['{"v":2}']] }
+    eventually: 10s
+  - query: SELECT content FROM zero WHERE request_path = '/again-zero-1'
+    expect: { rows: [['{"v":2}']] }
+    eventually: 10s
+  - query: SELECT content FROM zero WHERE request_path = '/again-zero-2'
+    expect: { rows: [['{"v":2}']] }
+    eventually: 10s
+  - query: SELECT content FROM zero WHERE request_path = '/again-zero-3'
+    expect: { rows: [['{"v":2}']] }
+    eventually: 10s
+  - query: SELECT content FROM zero WHERE request_path = '/again-zero-4'
+    expect: { rows: [['{"v":2}']] }
+    eventually: 10s
 
   # A zero TTL asks the origin on every lookup; when the origin fails, the
   # stored entry answers inside the stale-if-error window, and without one
-  # the failure reaches the client.
+  # the failure reaches the client. The origin's count is read before
+  # `zero`'s second lookup, which may also refresh its stored entry from the
+  # origin (see the back-to-back lookups above).
   - source-exec: { api: "{ path: /v1/z, headers: { content-type: application/json }, body: '[{\"z\": 1}]' }" }
   - query: SELECT content FROM zero WHERE request_path = '/z'
     expect: { rows: [['{"z":1}']] }
   - query: SELECT content FROM zero_strict WHERE request_path = '/z'
     expect: { rows: [['{"z":1}']] }
   - source-exec: { api: "{ path: /v1/z, headers: { content-type: application/json }, body: '[{\"z\": 2}]' }" }
-  - query: SELECT content FROM zero WHERE request_path = '/z'
-    expect: { rows: [['{"z":2}']] }
   - query: SELECT content FROM zero_strict WHERE request_path = '/z'
     expect: { rows: [['{"z":2}']] }
   - source-query: { api: count /v1/z }
-    expect: { rows: [['4']] }
+    expect: { rows: [['3']] }
+  - query: SELECT content FROM zero WHERE request_path = '/z'
+    expect: { rows: [['{"z":2}']] }
   - sleep: 2s
   - source-exec: { api: "{ path: /v1/z, status: 503, body: down }" }
   - query: SELECT content FROM zero WHERE request_path = '/z'
