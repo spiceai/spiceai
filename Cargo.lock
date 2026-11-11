@@ -11902,6 +11902,7 @@ dependencies = [
  "either",
  "embed-api",
  "evaluate-api",
+ "evaluate-chat",
  "futures",
  "google-genai",
  "governor",

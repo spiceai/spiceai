@@ -39,11 +39,23 @@ use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll};
 
 /// Wraps [`Responses`] models with additional handling specifically for the spice runtime (e.g. telemetry, injecting system prompts).
+///
+/// It handles each request that Spice sends the provider, so each round of the Spice tool loop.
+/// The Spicepod's request defaults are applied once, above the loop, by
+/// [`ResponsesRequestDefaults`].
 pub struct ResponsesWrapper {
     pub public_name: String,
     pub responses: Arc<dyn Responses>,
     pub system_prompt: Option<String>,
-    pub defaults: Vec<(String, serde_json::Value)>,
+}
+
+/// Fills each field that a Responses request leaves unset with the Spicepod model's default for
+/// it, once for each client request: above the Spice tool loop, so the loop sees the request
+/// that the client and the Spicepod asked for together.
+pub struct ResponsesRequestDefaults {
+    responses: Arc<dyn Responses>,
+    public_name: String,
+    defaults: Vec<(String, serde_json::Value)>,
 }
 
 macro_rules! set_default_w_warning {
@@ -66,25 +78,24 @@ macro_rules! set_default_w_warning {
 }
 
 impl ResponsesWrapper {
+    #[must_use]
     pub fn new(
         responses: Arc<dyn Responses>,
         public_name: &str,
         system_prompt: Option<&str>,
-        defaults: Vec<(String, serde_json::Value)>,
     ) -> Self {
         Self {
             public_name: public_name.to_string(),
             responses,
             system_prompt: system_prompt.map(ToString::to_string),
-            defaults,
         }
     }
 
-    /// `req` as the provider receives it: with the Spicepod's system prompt and request defaults,
-    /// and with the Spice tool calls of earlier turns given back as the model saw them.
+    /// `req` as the provider receives it: with the Spicepod's system prompt, and with the Spice
+    /// tool calls of earlier turns given back as the model saw them.
     fn prepare_req(&self, mut req: CreateResponse) -> CreateResponse {
         req.input = replay_spice_tool_calls(req.input);
-        self.with_model_defaults(self.with_system_prompt(req))
+        self.with_system_prompt(req)
     }
 
     /// Injects a system prompt into the instructions field in the request, if it exists.
@@ -97,6 +108,21 @@ impl ResponsesWrapper {
             });
         }
         req
+    }
+}
+
+impl ResponsesRequestDefaults {
+    #[must_use]
+    pub fn new(
+        responses: Arc<dyn Responses>,
+        public_name: &str,
+        defaults: Vec<(String, serde_json::Value)>,
+    ) -> Self {
+        Self {
+            responses,
+            public_name: public_name.to_string(),
+            defaults,
+        }
     }
 
     fn with_model_defaults(&self, mut req: CreateResponse) -> CreateResponse {
@@ -112,6 +138,34 @@ impl ResponsesWrapper {
             }
         }
         req
+    }
+}
+
+#[deny(clippy::missing_trait_methods)]
+#[async_trait]
+impl Responses for ResponsesRequestDefaults {
+    async fn responses_stream(&self, req: CreateResponse) -> Result<ResponseStream, OpenAIError> {
+        self.responses
+            .responses_stream(self.with_model_defaults(req))
+            .await
+    }
+
+    async fn responses_request(&self, req: CreateResponse) -> Result<Response, OpenAIError> {
+        self.responses
+            .responses_request(self.with_model_defaults(req))
+            .await
+    }
+
+    async fn health(&self) -> ResponsesResult<()> {
+        self.responses.health().await
+    }
+
+    async fn run(&self, prompt: String) -> ResponsesResult<Option<String>> {
+        self.responses.run(prompt).await
+    }
+
+    fn as_sql(&self) -> Option<&dyn SqlGeneration> {
+        self.responses.as_sql()
     }
 }
 
@@ -349,7 +403,6 @@ mod tests {
             public_name: "test-model".to_string(),
             responses: Arc::new(NoopResponses),
             system_prompt: prompt.map(ToString::to_string),
-            defaults: Vec::new(),
         }
     }
 
@@ -443,11 +496,10 @@ mod tests {
 
     #[test]
     fn test_prompt_cache_defaults_preserve_request_values() {
-        let wrapper = ResponsesWrapper {
-            public_name: "test-model".to_string(),
-            responses: Arc::new(NoopResponses),
-            system_prompt: None,
-            defaults: vec![
+        let wrapper = ResponsesRequestDefaults::new(
+            Arc::new(NoopResponses),
+            "test-model",
+            vec![
                 (
                     "prompt_cache_key".to_string(),
                     serde_json::Value::String("default-key".to_string()),
@@ -457,7 +509,7 @@ mod tests {
                     serde_json::Value::String("24h".to_string()),
                 ),
             ],
-        };
+        );
 
         let req = CreateResponse {
             prompt_cache_key: Some("request-key".to_string()),
