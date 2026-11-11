@@ -16,11 +16,15 @@ limitations under the License.
 
 //! Differential test of `PostgreSQL` federation against `PostgreSQL` itself.
 //!
-//! Each query runs three ways over the same committed rows: sent straight to
+//! Each query runs five ways over the same committed rows: sent straight to
 //! `PostgreSQL` (the oracle, which shares no code with Spice), against the
-//! federated datasets, whose plans Spice rewrites and sends to `PostgreSQL`, and
-//! against an Arrow acceleration of the same tables, which `DataFusion`
-//! evaluates after the connector converts the rows. The fixture holds the values
+//! federated datasets, whose plans Spice rewrites and sends to `PostgreSQL`,
+//! and against three accelerations of the same tables, loaded with
+//! `refresh_mode: full` after the connector converts the rows: Arrow, Cayenne
+//! `mode: memory`, and Cayenne `mode: file`. The Cayenne sides read the rows
+//! back through Cayenne's own scan, with filters and projections pushed into
+//! it, so a value Cayenne stores, encodes, or prunes wrongly shows up as a row
+//! that differs from `PostgreSQL`'s. The fixture holds the values
 //! a translation gets wrong: NULLs in every column, `bigint` and `numeric`
 //! boundaries, `LIKE` wildcards as literal characters, non-ASCII and padded
 //! text, fractional-second timestamps, and duplicate join keys.
@@ -33,7 +37,7 @@ limitations under the License.
 //! integers, text, and `numeric` and `date` cast to `VARCHAR`, whose text forms
 //! the two engines share.
 
-use std::{collections::HashMap, sync::Arc, time::Duration};
+use std::{collections::HashMap, path::Path, sync::Arc, time::Duration};
 
 use app::AppBuilder;
 use arrow::array::RecordBatch;
@@ -41,7 +45,7 @@ use arrow::util::display::{ArrayFormatter, FormatOptions};
 use runtime::Runtime;
 use secrecy::ExposeSecret;
 use spicepod::{
-    acceleration::{Acceleration, RefreshMode},
+    acceleration::{Acceleration, Mode, RefreshMode},
     component::dataset::Dataset,
     param::Params,
 };
@@ -297,7 +301,24 @@ fn cases() -> Vec<Case> {
 /// A row as its cells, each rendered, or `None` for NULL.
 type Row = Vec<Option<String>>;
 
-fn dataset(port: usize, table: &str, name: &str, accelerated: bool) -> Dataset {
+/// How a dataset reads `PostgreSQL`.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Kind {
+    /// No acceleration: Spice sends each query to `PostgreSQL`.
+    Federated,
+    /// An Arrow acceleration loaded once with `refresh_mode: full`.
+    Accelerated,
+    /// A Cayenne acceleration held in memory, loaded once with
+    /// `refresh_mode: full`.
+    CayenneMemory,
+    /// A Cayenne acceleration in Vortex files with a metastore on disk, loaded
+    /// once with `refresh_mode: full`.
+    CayenneFile,
+}
+
+/// `dir` holds a `mode: file` acceleration's data and metastore, one
+/// directory per dataset `name`.
+fn dataset(port: usize, table: &str, name: &str, kind: Kind, dir: &Path) -> Dataset {
     let mut ds = Dataset::new(format!("postgres:{table}"), name.to_string());
     ds.params = Some(Params::from_string_map(
         get_pg_params(port)
@@ -305,14 +326,39 @@ fn dataset(port: usize, table: &str, name: &str, accelerated: bool) -> Dataset {
             .map(|(k, v)| (k, v.expose_secret().to_string()))
             .collect::<HashMap<String, String>>(),
     ));
-    if accelerated {
-        ds.acceleration = Some(Acceleration {
+    ds.acceleration = match kind {
+        Kind::Federated => None,
+        Kind::Accelerated => Some(Acceleration {
             enabled: true,
             engine: Some("arrow".to_string()),
             refresh_mode: Some(RefreshMode::Full),
             ..Acceleration::default()
-        });
-    }
+        }),
+        Kind::CayenneMemory => Some(Acceleration {
+            enabled: true,
+            engine: Some("cayenne".to_string()),
+            mode: Mode::Memory,
+            refresh_mode: Some(RefreshMode::Full),
+            ..Acceleration::default()
+        }),
+        Kind::CayenneFile => Some(Acceleration {
+            enabled: true,
+            engine: Some("cayenne".to_string()),
+            mode: Mode::File,
+            refresh_mode: Some(RefreshMode::Full),
+            params: Some(Params::from_string_map(HashMap::from([
+                (
+                    "cayenne_file_path".to_string(),
+                    dir.join(name).join("data").display().to_string(),
+                ),
+                (
+                    "cayenne_metadata_dir".to_string(),
+                    dir.join(name).join("metadata").display().to_string(),
+                ),
+            ]))),
+            ..Acceleration::default()
+        }),
+    };
     ds
 }
 
@@ -376,29 +422,77 @@ fn agreement(subject: &[Row], oracle: &[Row], ordered: bool) -> Result<(), &'sta
     (subject == oracle).then_some(()).ok_or("rows differ")
 }
 
-/// One Spice side of the comparison: the datasets it reads, and whether its
-/// plan must send the whole query to `PostgreSQL`.
+/// One Spice side of the comparison: the datasets it reads, and how they read
+/// `PostgreSQL`, which decides what its plan must show.
 struct Subject {
     name: &'static str,
     items: &'static str,
     regions: &'static str,
-    federated: bool,
+    kind: Kind,
 }
 
-const SUBJECTS: [Subject; 2] = [
+const SUBJECTS: [Subject; 4] = [
     Subject {
         name: "federated",
         items: "fed_items",
         regions: "fed_regions",
-        federated: true,
+        kind: Kind::Federated,
     },
     Subject {
         name: "accelerated",
         items: "acc_items",
         regions: "acc_regions",
-        federated: false,
+        kind: Kind::Accelerated,
+    },
+    Subject {
+        name: "cayenne memory",
+        items: "cmem_items",
+        regions: "cmem_regions",
+        kind: Kind::CayenneMemory,
+    },
+    Subject {
+        name: "cayenne file",
+        items: "cfile_items",
+        regions: "cfile_regions",
+        kind: Kind::CayenneFile,
     },
 ];
+
+/// The operator that scans a Cayenne acceleration. A Cayenne side whose plan
+/// lacks it answered from somewhere else, and its agreement says nothing about
+/// Cayenne.
+const CAYENNE_SCAN: &str = "CayenneAccelerationExec";
+
+/// The operators of a plan that `DataFusion` answered from the table's
+/// statistics without a scan: an aggregate whose filter the column bounds rule
+/// out, such as `count(*) ... WHERE grp > 100` when Cayenne reports `grp` at
+/// most 6, folds to a constant over one placeholder row. The constant comes
+/// from Cayenne's statistics, so the answer is still Cayenne's to get right.
+const STATISTICS_ANSWER: [&str; 3] = ["ProjectionExec", "BytesProcessedExec", "PlaceholderRowExec"];
+
+/// Checks that the physical plan in `plan`, an `EXPLAIN` answer, reads the
+/// Cayenne acceleration through [`CAYENNE_SCAN`], or is a
+/// [`STATISTICS_ANSWER`] built from Cayenne's statistics.
+fn check_cayenne_scan(plan: &[Row]) -> Result<(), String> {
+    let physical = plan
+        .iter()
+        .find(|row| row.first().and_then(Option::as_deref) == Some("physical_plan"))
+        .and_then(|row| row.get(1).cloned().flatten())
+        .ok_or_else(|| format!("the plan has no physical plan: {plan:?}"))?;
+    let operators: Vec<&str> = physical
+        .lines()
+        .filter_map(|line| line.split([':', ' ']).find(|token| !token.is_empty()))
+        .collect();
+    let from_statistics = operators.contains(&"PlaceholderRowExec")
+        && operators.iter().all(|op| STATISTICS_ANSWER.contains(op));
+    if physical.contains(CAYENNE_SCAN) || from_statistics {
+        Ok(())
+    } else {
+        Err(format!(
+            "the plan does not read the Cayenne acceleration ({CAYENNE_SCAN}):\n{physical}"
+        ))
+    }
+}
 
 async fn compare_case(
     rt: &Arc<Runtime>,
@@ -438,17 +532,30 @@ async fn compare_case(
             }
             Err(e) => failures.push(format!("{name}: {sql}\n    failed: {e}")),
         }
-        if subject.federated {
-            // The federated side must send the whole query to PostgreSQL, or
-            // it is DataFusion over a wider scan and compares nothing the
-            // accelerated side does not.
-            let plan = spice_rows(rt, &format!("EXPLAIN {sql}"))
-                .await
-                .map_err(|e| anyhow::anyhow!("EXPLAIN {sql}: {e}"))?;
-            if let Err(reason) = check_nothing_local(&plan) {
-                failures.push(format!("{name}: {sql}\n    {reason}"));
-                all_remote = false;
+        match subject.kind {
+            Kind::Federated => {
+                // The federated side must send the whole query to PostgreSQL,
+                // or it is DataFusion over a wider scan and compares nothing
+                // the accelerated side does not.
+                let plan = spice_rows(rt, &format!("EXPLAIN {sql}"))
+                    .await
+                    .map_err(|e| anyhow::anyhow!("EXPLAIN {sql}: {e}"))?;
+                if let Err(reason) = check_nothing_local(&plan) {
+                    failures.push(format!("{name}: {sql}\n    {reason}"));
+                    all_remote = false;
+                }
             }
+            Kind::CayenneMemory | Kind::CayenneFile => {
+                // A Cayenne side must read through Cayenne's scan, or its
+                // agreement says nothing about what Cayenne stored.
+                let plan = spice_rows(rt, &format!("EXPLAIN {sql}"))
+                    .await
+                    .map_err(|e| anyhow::anyhow!("EXPLAIN {sql}: {e}"))?;
+                if let Err(reason) = check_cayenne_scan(&plan) {
+                    failures.push(format!("{name}: {sql}\n    {reason}"));
+                }
+            }
+            Kind::Accelerated => {}
         }
     }
     Ok(all_remote)
@@ -461,18 +568,20 @@ async fn federated_and_accelerated_postgres_answers_match_postgres() -> Result<(
     test_request_context()
         .scope(async {
             let (port, container) = common::test_database().await?;
+            let dir = tempfile::tempdir()?;
             let client = common::connect(u16::try_from(port)?).await?;
             for statement in SEED {
                 client.batch_execute(statement).await?;
             }
 
             register_test_connectors().await;
-            let app = AppBuilder::new("postgres_federation_differential")
-                .with_dataset(dataset(port, "diff_items", "fed_items", false))
-                .with_dataset(dataset(port, "diff_regions", "fed_regions", false))
-                .with_dataset(dataset(port, "diff_items", "acc_items", true))
-                .with_dataset(dataset(port, "diff_regions", "acc_regions", true))
-                .build();
+            let mut app = AppBuilder::new("postgres_federation_differential");
+            for subject in &SUBJECTS {
+                app = app
+                    .with_dataset(dataset(port, "diff_items", subject.items, subject.kind, dir.path()))
+                    .with_dataset(dataset(port, "diff_regions", subject.regions, subject.kind, dir.path()));
+            }
+            let app = app.build();
             configure_test_datafusion();
             let rt = Arc::new(Runtime::builder().with_app(app).build().await);
             tokio::select! {
@@ -491,7 +600,8 @@ async fn federated_and_accelerated_postgres_answers_match_postgres() -> Result<(
                     .map_err(|e| anyhow::anyhow!(e))?,
                 expected
             );
-            for table in ["fed_items", "acc_items"] {
+            for subject in &SUBJECTS {
+                let table = subject.items;
                 assert_eq!(
                     spice_rows(&rt, &format!("SELECT count(*) FROM {table}"))
                         .await
