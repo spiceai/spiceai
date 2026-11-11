@@ -450,6 +450,21 @@ pub(crate) mod test_seams {
         LazyLock::new(|| Mutex::new(HashMap::new()));
     static PAUSES_AFTER_COMMIT_TIME_RETENTION: LazyLock<Mutex<HashMap<String, Pause>>> =
         LazyLock::new(|| Mutex::new(HashMap::new()));
+    static PAUSES_IN_LEASED_SCAN: LazyLock<Mutex<HashMap<String, Pause>>> =
+        LazyLock::new(|| Mutex::new(HashMap::new()));
+
+    /// Run `pause` in the next leased retention scan on `table_id`, once it holds
+    /// its execution pin and before it captures or scans anything.
+    pub(crate) fn pause_in_leased_scan(table_id: &str, pause: Pause) {
+        PAUSES_IN_LEASED_SCAN
+            .lock()
+            .insert(table_id.to_string(), pause);
+    }
+
+    pub(crate) fn take_pause_in_leased_scan(table_id: &str) -> Option<Pause> {
+        PAUSES_IN_LEASED_SCAN.lock().remove(table_id)
+    }
+
     static PAUSES_UNDER_PUBLICATION_GUARDS: LazyLock<Mutex<HashMap<String, Pause>>> =
         LazyLock::new(|| Mutex::new(HashMap::new()));
 

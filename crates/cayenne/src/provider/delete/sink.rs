@@ -1659,36 +1659,37 @@ impl CayenneDeletionSink {
         &self,
     ) -> super::super::Result<Option<PreparedDeletionPublish>> {
         // A leased sink (a commit's retention scan) pins its commit's fence for
-        // the whole execution: the captures and the scan of the files they list.
-        // The pin is taken here, before the execution starts, and moved into the
-        // task that runs it, so it is dropped only when that task's future has
-        // completed: a caller that stops waiting (its commit cancelled) cannot
-        // drop the scan mid-flight, and the fence stays held until the scan has
-        // run to its end (success or error). The commit's pre-durable idle check
-        // sees the pin; after its revoke no new pin can be taken.
+        // the whole execution, inline in the caller's future: the captures and
+        // the scan of the files they list. The pin is dropped on every exit of
+        // this future: completion, error, or cancellation. Cancellation is
+        // the commit future being dropped, which drops its write_lock,
+        // checkpoint, and visibility guards at the same time, so the fence is
+        // never kept while the protections it was taken under are gone, and no
+        // scan work outlives the commit. On success every result-producing scan
+        // has completed before this returns; the commit's pre-durable idle check
+        // sees any pin still held, and after its revoke no new pin can be taken.
         //
-        // Not covered by this pin (an open gap): a scan that exits early on an
-        // error drops its DataFusion / vortex reader tasks, which abort without
-        // join, and a file read already running on the blocking pool under
-        // them cannot be aborted or joined; it can outlive the pin, holding
-        // only its open file descriptor, its result discarded.
-        let pin = match &self.capture_locks {
+        // Leftover after an error or cancellation (static classification, see
+        // the F2 lock-graph notes): DataFusion/vortex reader tasks abort without
+        // join; a blocking-pool `File::open` or `pread` already queued under
+        // them, or a remote GET already sent, may still complete. These are
+        // read-only by an already-captured path, and their results reach no one.
+        let _execution_pin = match &self.capture_locks {
             Some(locks) => locks
                 .pin_for_execution()
                 .map_err(|source| super::super::Error::DataFusion { source })?,
             None => None,
         };
-        let Some(pin) = pin else {
-            return self.prepare_delete_body().await;
-        };
-        let this = self.clone();
-        let table = self.table_metadata.table_name.clone();
-        tokio::spawn(async move {
-            let _execution_pin = pin;
-            this.prepare_delete_body().await
-        })
-        .await
-        .map_err(|source| super::super::Error::TaskPanicked { table, source })?
+        #[cfg(test)]
+        if _execution_pin.is_some()
+            && let Some(pause) =
+                crate::provider::append_commit::test_seams::take_pause_in_leased_scan(
+                    &self.table_metadata.table_id,
+                )
+        {
+            pause().await;
+        }
+        self.prepare_delete_body().await
     }
 
     async fn prepare_delete_body(&self) -> super::super::Result<Option<PreparedDeletionPublish>> {

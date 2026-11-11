@@ -467,6 +467,7 @@ async fn a_commit_cancelled_under_its_guards_releases_them_and_publishes_nothing
             .table(&format!("f2_cancel_b_{route}_{register_b_first}"), None)
             .await;
         let label = format!("{route} register_b_first={register_b_first}");
+        let (snap_a, snap_b) = (a.get_current_snapshot_id(), b.get_current_snapshot_id());
         let (reached_tx, reached_rx) = tokio::sync::oneshot::channel::<()>();
         // Pause on whichever table the commit prepares (a for single).
         let paused = if route == "single" || a.table_id() < b.table_id() {
@@ -513,6 +514,16 @@ async fn a_commit_cancelled_under_its_guards_releases_them_and_publishes_nothing
         assert_all_guards_free(&b, &label);
         assert_eq!(rows(&a).await, vec![(1, 1)], "{label}: a unchanged");
         assert_eq!(rows(&b).await, vec![(1, 1)], "{label}: b unchanged");
+        assert_eq!(
+            a.get_current_snapshot_id(),
+            snap_a,
+            "{label}: a snapshot unchanged"
+        );
+        assert_eq!(
+            b.get_current_snapshot_id(),
+            snap_b,
+            "{label}: b snapshot unchanged"
+        );
         // The tables accept the next commit.
         two_table_txn(&a, &b, false)
             .await
@@ -1016,5 +1027,120 @@ async fn the_post_wait_occ_admits_disjoint_activity_and_refuses_a_read_key_commi
             assert_all_guards_free(&a, &tag);
             assert_all_guards_free(&b, &tag);
         }
+    }
+}
+
+/// A commit cancelled while its leased retention scan runs (paused inside the
+/// scan, its execution pin held) leaves nothing running: the scan executes
+/// inline in the commit future, so dropping the commit drops the scan and its
+/// pin together with the write_lock, checkpoint, and visibility guards. Every
+/// guard is free as soon as the cancellation is observed (no detached task
+/// keeps the fence), no snapshot changes (live and reopened), and the tables
+/// accept the next commit. Both commit routes; both registration orders.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_commit_cancelled_inside_its_leased_scan_leaves_no_scan_running_and_changes_nothing() {
+    for (route, register_b_first) in [("txn", false), ("txn", true), ("single", false)] {
+        let mut shared = Shared::new().await;
+        let na = format!("f2_scancancel_a_{route}_{register_b_first}");
+        let nb = format!("f2_scancancel_b_{route}_{register_b_first}");
+        let a = shared.table(&na, None).await;
+        let b = shared.table(&nb, None).await;
+        let label = format!("{route} register_b_first={register_b_first}");
+        let paused = if route == "single" || a.table_id() < b.table_id() {
+            &a
+        } else {
+            &b
+        };
+        let (snap_a, snap_b) = (a.get_current_snapshot_id(), b.get_current_snapshot_id());
+        let (reached_tx, reached_rx) = tokio::sync::oneshot::channel::<()>();
+        test_seams::pause_in_leased_scan(
+            paused.table_id(),
+            Box::new(move || {
+                Box::pin(async move {
+                    let _ = reached_tx.send(());
+                    std::future::pending::<()>().await;
+                })
+            }),
+        );
+        let commit = if route == "single" {
+            let token = a.transaction_write_token().await;
+            let stage = staged(&a, token, (2, 20)).await;
+            tokio::spawn(async move {
+                stage
+                    .commit(std::collections::HashSet::new(), true)
+                    .await
+                    .map(|_| ())
+            })
+        } else {
+            let txn = two_table_txn(&a, &b, register_b_first).await;
+            tokio::spawn(async move { txn.commit().await.map(|_| ()) })
+        };
+        tokio::time::timeout(BOUND, reached_rx)
+            .await
+            .unwrap_or_else(|_| panic!("{label}: reached the leased scan"))
+            .expect("seam");
+        assert!(
+            paused.write_lock.try_lock().is_err() && paused.listing_fence.try_read().is_err(),
+            "{label}: the commit holds write_lock and the fence while its scan runs"
+        );
+        commit.abort();
+        assert!(
+            commit.await.expect_err("aborted").is_cancelled(),
+            "{label}: cancelled"
+        );
+        // Immediately: no detached scan keeps the fence (or anything else).
+        assert_all_guards_free(&a, &label);
+        assert_all_guards_free(&b, &label);
+        assert_eq!(
+            a.get_current_snapshot_id(),
+            snap_a,
+            "{label}: a snapshot unchanged"
+        );
+        assert_eq!(
+            b.get_current_snapshot_id(),
+            snap_b,
+            "{label}: b snapshot unchanged"
+        );
+        assert_eq!(rows(&a).await, vec![(1, 1)], "{label}: a unchanged");
+        assert_eq!(rows(&b).await, vec![(1, 1)], "{label}: b unchanged");
+        {
+            let ra = shared.reopen(&na).await;
+            let rb = shared.reopen(&nb).await;
+            assert_eq!(
+                ra.get_current_snapshot_id(),
+                snap_a,
+                "{label}: a catalog unchanged"
+            );
+            assert_eq!(
+                rb.get_current_snapshot_id(),
+                snap_b,
+                "{label}: b catalog unchanged"
+            );
+            assert_eq!(
+                rows(&ra).await,
+                vec![(1, 1)],
+                "{label}: a reopened unchanged"
+            );
+            assert_eq!(
+                rows(&rb).await,
+                vec![(1, 1)],
+                "{label}: b reopened unchanged"
+            );
+        }
+        two_table_txn(&a, &b, false)
+            .await
+            .commit()
+            .await
+            .unwrap_or_else(|e| panic!("{label}: next commit: {e}"));
+        assert_eq!(
+            rows(&shared.reopen(&na).await).await,
+            vec![(1, 1), (2, 20)],
+            "{label}: a next"
+        );
+        assert_eq!(
+            rows(&shared.reopen(&nb).await).await,
+            vec![(1, 1), (3, 30)],
+            "{label}: b next"
+        );
     }
 }
