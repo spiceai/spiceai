@@ -90,16 +90,34 @@ jobs:
               issue.body?.includes(marker)
             );
 
-            // The owner is assigned only if GitHub will accept them. An account that
-            // was deleted, renamed or removed from the repository makes the
-            // assignment call return 404, which used to throw after the issue body
-            // was written: the step went red in place of "Fail on advisory
-            // violations", and the issue was left with no owner. Ask first, and
-            // warn instead of throwing, so the issue is always filed and updated.
-            // Only a 404 from this check means "not assignable"; any other error
-            // still fails the step.
+            // Write the advisory first and assign its owner second, so a failure to
+            // assign can never leave the issue stale or unfiled. The owner is added
+            // only if GitHub says they can be assigned: an account that was deleted,
+            // renamed or removed from the repository makes the assignment call return
+            // 404, which used to throw, turning this step red in place of "Fail on
+            // advisory violations" and leaving the issue with no owner. A 404 from the
+            // check now logs a warning; any other error still fails the step, after
+            // the issue has been written.
+            let issueNumber;
+            if (existingIssue) {
+              await github.rest.issues.update({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: existingIssue.number,
+                body,
+              });
+              issueNumber = existingIssue.number;
+            } else {
+              const { data: created } = await github.rest.issues.create({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                title,
+                body,
+              });
+              issueNumber = created.number;
+            }
+
             const issueOwner = 'claudespice';
-            let assignees = [issueOwner];
             try {
               await github.rest.issues.checkUserCanBeAssigned({
                 owner: context.repo.owner,
@@ -110,38 +128,19 @@ jobs:
               if (error.status !== 404) {
                 throw error;
               }
-              assignees = [];
               core.warning(
                 `${issueOwner} cannot be assigned issues in ${context.repo.owner}/${context.repo.repo} ` +
-                '(GitHub returned 404), so the advisory issue is left unassigned. ' +
+                `(GitHub returned 404), so advisory issue #${issueNumber} is left unassigned. ` +
                 'Change issueOwner in .github/workflows/cargo_deny_advisories.yml to an account that can be assigned.'
               );
-            }
-
-            if (existingIssue) {
-              await github.rest.issues.update({
-                owner: context.repo.owner,
-                repo: context.repo.repo,
-                issue_number: existingIssue.number,
-                body,
-              });
-              if (assignees.length > 0) {
-                await github.rest.issues.addAssignees({
-                  owner: context.repo.owner,
-                  repo: context.repo.repo,
-                  issue_number: existingIssue.number,
-                  assignees,
-                });
-              }
               return;
             }
 
-            await github.rest.issues.create({
+            await github.rest.issues.addAssignees({
               owner: context.repo.owner,
               repo: context.repo.repo,
-              title,
-              body,
-              assignees,
+              issue_number: issueNumber,
+              assignees: [issueOwner],
             });
 
       - name: Fail on advisory violations
