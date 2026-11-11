@@ -33614,12 +33614,38 @@ impl CayenneTableProvider {
         inlined_deletions: &InlinedDeletionMaps,
         captured: Option<&PkDeletionSnapshot>,
     ) -> Result<Option<RecordBatch>> {
+        if batch.num_rows() == 0 {
+            return Ok(None);
+        }
+        let Some(keep_mask) =
+            self.inlined_visibility_mask(&batch, data_sequence, inlined_deletions, captured)?
+        else {
+            return Ok(Some(batch));
+        };
+        if keep_mask.iter().all(|keep| !*keep) {
+            return Ok(None);
+        }
+        let filter = arrow::array::BooleanArray::from(keep_mask);
+        Ok(Some(arrow::compute::filter_record_batch(&batch, &filter)?))
+    }
+
+    /// Which rows of `batch` (written at `data_sequence`) are visible against
+    /// `inlined_deletions` and the file-side deletion snapshot (`captured`, or
+    /// the live one). `None` when every row is visible. Errors on a NULL key,
+    /// as [`Self::filter_inlined_batch_against`] does.
+    fn inlined_visibility_mask(
+        &self,
+        batch: &RecordBatch,
+        data_sequence: i64,
+        inlined_deletions: &InlinedDeletionMaps,
+        captured: Option<&PkDeletionSnapshot>,
+    ) -> Result<Option<Vec<bool>>> {
         if batch.num_rows() == 0 || self.pk_deletion_strategy.is_position_based() {
-            return Ok((batch.num_rows() > 0).then_some(batch));
+            return Ok(None);
         }
 
         let Some(pk_indices) = self.primary_key_indices()? else {
-            return Ok(Some(batch));
+            return Ok(None);
         };
 
         let mut keep_mask = Vec::with_capacity(batch.num_rows());
@@ -33671,7 +33697,7 @@ impl CayenneTableProvider {
                         .int64_deleted_key_range()
                         .is_none_or(|(del_lo, del_hi)| batch_hi < del_lo || batch_lo > del_hi);
                     if file_disjoint && inline_disjoint {
-                        return Ok(Some(batch));
+                        return Ok(None);
                     }
                 }
 
@@ -33742,7 +33768,7 @@ impl CayenneTableProvider {
                     && !deleted_row_keys.has_deletions()
                     && inlined_deletions.row_keys.is_empty()
                 {
-                    return Ok(Some(batch));
+                    return Ok(None);
                 }
 
                 if pk_has_nulls {
@@ -33786,14 +33812,9 @@ impl CayenneTableProvider {
         }
 
         if keep_mask.iter().all(|keep| *keep) {
-            return Ok(Some(batch));
-        }
-        if keep_mask.iter().all(|keep| !*keep) {
             return Ok(None);
         }
-
-        let filter = arrow::array::BooleanArray::from(keep_mask);
-        Ok(Some(arrow::compute::filter_record_batch(&batch, &filter)?))
+        Ok(Some(keep_mask))
     }
 
     /// Merge the file-side `PkDeletionSnapshot` with the UNION of every captured
@@ -35849,6 +35870,89 @@ impl CayenneTableProvider {
     /// in parallel. The shared monotonic allocator keeps one flat sequence domain,
     /// so the merge-on-read filter + durable encoder are unchanged (§2.3d).
     #[expect(clippy::too_many_arguments)]
+    /// The publication's `retention_sql` filters to apply to the resident rows of
+    /// a `mode: memory` tier inside its append swap, or `None` when this is not a
+    /// memory-resident table or no publication context is in scope.
+    fn memory_resident_retention_filters(
+        &self,
+    ) -> datafusion_common::Result<Option<Vec<Arc<dyn PhysicalExpr>>>> {
+        if !self.is_memory_resident_mode() {
+            return Ok(None);
+        }
+        let Some(filters) = super::overwrite_retention::publication_retention_filters() else {
+            return Ok(None);
+        };
+        if filters.is_empty() {
+            return Ok(None);
+        }
+        let coerced = self.coerce_filters_for_inlined_delete(&filters)?;
+        let physical = self.build_physical_filters_for_inlined_delete(&coerced)?;
+        Ok((!physical.is_empty()).then_some(physical))
+    }
+
+    /// `tier` (which already holds the incoming segment written at
+    /// `incoming_sequence`) with the resident rows matching `physical` removed.
+    /// The incoming segment is not re-evaluated: its rows were filtered once by
+    /// the same predicate context. Every other row is first checked for
+    /// visibility against the tier's tombstones, including the ones this append
+    /// stamps, so a superseded or deleted version never reaches the predicate.
+    /// NULL is "did not match"; an evaluation error fails the append.
+    fn retain_mem_tier_rows_for_retention(
+        &self,
+        tier: &crate::provider::mem_tier::MemTier,
+        incoming_sequence: i64,
+        physical: &[Arc<dyn PhysicalExpr>],
+    ) -> datafusion_common::Result<(crate::provider::mem_tier::MemTier, u64)> {
+        let deletion_maps = Self::mem_tier_deletion_maps(tier);
+        tier.retain_rows(
+            |batch, data_sequence| {
+                if data_sequence == incoming_sequence || batch.num_rows() == 0 {
+                    return Ok(batch.clone());
+                }
+                let visible = self
+                    .inlined_visibility_mask(batch, data_sequence, &deletion_maps, None)
+                    .map_err(|error| {
+                        datafusion_common::DataFusionError::Execution(error.to_string())
+                    })?
+                    .map(arrow::array::BooleanArray::from);
+                let candidates = match &visible {
+                    Some(mask) => arrow::compute::filter_record_batch(batch, mask)?,
+                    None => batch.clone(),
+                };
+                let Some(matched) = self.delete_match_mask(&candidates, physical)? else {
+                    return Ok(batch.clone());
+                };
+                if matched.true_count() == 0 {
+                    return Ok(batch.clone());
+                }
+                let remove: arrow::array::BooleanArray = match &visible {
+                    None => matched,
+                    Some(mask) => {
+                        let mut next = 0;
+                        mask.iter()
+                            .map(|visible| {
+                                Some(if visible == Some(true) {
+                                    let hit = matched.value(next);
+                                    next += 1;
+                                    hit
+                                } else {
+                                    false
+                                })
+                            })
+                            .collect()
+                    }
+                };
+                let keep = arrow::compute::not(&remove)?;
+                Ok(arrow::compute::filter_record_batch(batch, &keep)?)
+            },
+            |batch| {
+                self.mem_tier_index
+                    .as_ref()
+                    .and_then(|indexer| indexer.index_batch(batch))
+            },
+        )
+    }
+
     pub(crate) async fn append_to_shard(
         &self,
         shard_id: usize,
@@ -35916,6 +36020,8 @@ impl CayenneTableProvider {
             .iter()
             .map(|b| b.num_rows() as u64)
             .fold(0, u64::saturating_add);
+        let resident_retention = self.memory_resident_retention_filters()?;
+        let mut resident_retention_removed: u64 = 0;
 
         let arc_batches = Arc::new(batches);
 
@@ -36013,6 +36119,24 @@ impl CayenneTableProvider {
                 source_position,
                 segment_index.clone(),
             );
+            // `mode: memory`: the publication's retention delete over the rows
+            // the tier keeps lands in this same swap. A failure returns before
+            // the store, so the previous tier stays.
+            let next = match &resident_retention {
+                Some(physical) => {
+                    let (retained, removed) = self
+                        .retain_mem_tier_rows_for_retention(&next, data_sequence, physical)
+                        .map_err(|error| Error::DataFusion {
+                            source: datafusion_common::DataFusionError::Execution(format!(
+                                "{} The write was not published. {error}",
+                                self.retention_failed_message()
+                            )),
+                        })?;
+                    resident_retention_removed = removed;
+                    if removed > 0 { retained } else { next }
+                }
+                None => next,
+            };
             let epoch = next.epoch;
             // N=1 publishes the tier swap and IVM epoch under this shard lock. Use
             // the same scan seqlock as N>1 so a reader cannot capture the new tier
@@ -36130,6 +36254,15 @@ impl CayenneTableProvider {
                     };
                     (maintained_aggregate_insert, maintained_aggregate_delete)
                 };
+            // Resident rows removed by retention are not in the insert feed: the
+            // maintained aggregates are stale, not incrementally maintained.
+            let (maintained_aggregate_insert, maintained_aggregate_delete) =
+                if resident_retention_removed > 0 {
+                    self.mark_maintained_aggregates_stale();
+                    (None, None)
+                } else {
+                    (maintained_aggregate_insert, maintained_aggregate_delete)
+                };
             drop(ivm_visibility_guard);
             (
                 epoch,
@@ -36143,6 +36276,15 @@ impl CayenneTableProvider {
         let net = i64::try_from(incoming_rows).unwrap_or(i64::MAX)
             - i64::try_from(superseded).unwrap_or(i64::MAX);
         self.inlined_row_count.fetch_add(net, Ordering::Relaxed);
+        if resident_retention_removed > 0 {
+            // As `delete_mem_tier_rows_matching`: in memory-resident mode the tier
+            // is the table, so re-sync from it.
+            self.inlined_row_count.store(
+                i64::try_from(self.mem_tier.total_rows()).unwrap_or(i64::MAX),
+                Ordering::Relaxed,
+            );
+            self.clear_scan_file_statistics_cache();
+        }
 
         // Accumulate the durable (file+inline) supersedes this append hid, so the
         // next mem-tier checkpoint can net them out of its persisted `Delta`

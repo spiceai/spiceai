@@ -241,6 +241,18 @@ impl DataSink for CayenneDataSink {
                 .collapse_buffered_write(batches)
                 .map_err(datafusion_common::DataFusionError::from)?;
             let retention_dropped: usize;
+            // One predicate context (one `now()`) for the incoming rows and the
+            // resident rows the append swap evaluates.
+            let publication: Option<Arc<Vec<datafusion::logical_expr::Expr>>> =
+                if !overwrite && self.table.has_retention_delete_filters() {
+                    Some(Arc::new(
+                        self.table
+                            .coerced_retention_filters()
+                            .map_err(datafusion_common::DataFusionError::from)?,
+                    ))
+                } else {
+                    None
+                };
             let (batches, post_validation) = if overwrite {
                 // An overwrite replaces the tier in one swap: apply `retention_sql` to
                 // the replacement first, so the swap publishes the write and its
@@ -279,10 +291,14 @@ impl DataSink for CayenneDataSink {
                     .iter()
                     .map(arrow::record_batch::RecordBatch::num_rows)
                     .sum();
-                let validated = self
-                    .table
-                    .drop_retention_matches(validated)
-                    .map_err(datafusion_common::DataFusionError::from)?;
+                let validated = match &publication {
+                    Some(filters) => super::overwrite_retention::with_publication_retention_sync(
+                        Arc::clone(filters),
+                        || self.table.drop_retention_matches(validated),
+                    ),
+                    None => self.table.drop_retention_matches(validated),
+                }
+                .map_err(datafusion_common::DataFusionError::from)?;
                 retention_dropped = validated_rows
                     - validated
                         .iter()
@@ -301,11 +317,23 @@ impl DataSink for CayenneDataSink {
                 })
                 .unwrap_or_default();
 
-            let rows = self
-                .table
-                .write_batches_memory_mode(batches, incoming_bytes, overwrite, &deletions)
-                .await
-                .map_err(datafusion_common::DataFusionError::from)?;
+            let write = self.table.write_batches_memory_mode(
+                batches,
+                incoming_bytes,
+                overwrite,
+                &deletions,
+            );
+            let rows = match &publication {
+                Some(filters) => {
+                    super::overwrite_retention::with_publication_retention(
+                        Arc::clone(filters),
+                        write,
+                    )
+                    .await
+                }
+                None => write.await,
+            }
+            .map_err(datafusion_common::DataFusionError::from)?;
 
             // Record this write's keys as resident so a LATER write to the same
             // table sees them as present and supersedes them in turn — the same

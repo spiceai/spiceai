@@ -1601,7 +1601,9 @@ async fn retention_now_is_fixed_once_per_publication_impl(
             let evaluations = calls.load(Ordering::SeqCst) - before;
             t.flush_pending_maintenance().await?;
             let after_maintenance = seen.lock().expect("lock").clone();
-            eprintln!("{name} id={id}: publication {set:?} incl. maintenance {after_maintenance:?}");
+            eprintln!(
+                "{name} id={id}: publication {set:?} incl. maintenance {after_maintenance:?}"
+            );
             assert!(
                 evaluations >= 2,
                 "{name}: incoming and resident rows were both evaluated ({evaluations})"
