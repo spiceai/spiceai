@@ -31,7 +31,9 @@ use arrow_schema::SchemaRef;
 use async_trait::async_trait;
 use cayenne_metastore_actions::{Action, DatasetState, Kind, ObjRef, Record, proto};
 use object_store::{ObjectStore, ObjectStoreExt, path::Path};
-use object_store_occ::headlog::{Group, HeadLog, HeadLogConfig, Opened, Outcome, Reader, Writer};
+use object_store_occ::headlog::{
+    Collector, Group, HeadLog, HeadLogConfig, Opened, Outcome, Reader, Writer,
+};
 use parking_lot::Mutex;
 use prost::Message;
 use std::{collections::HashMap, sync::Arc};
@@ -75,6 +77,9 @@ struct Inner {
     pending: Vec<Pending>,
     /// Commit every change when it is made, even inside a deferred scope.
     immediate: bool,
+    /// Deletes the log's objects below its floor, off the commit path: at
+    /// most one collection runs at a time, started after a checkpoint.
+    collector: Arc<tokio::sync::Mutex<Collector>>,
 }
 
 /// Buffered changes for a set of tables. Actions on different tables commute,
@@ -97,6 +102,10 @@ pub struct NativeCatalogConfig {
     pub checkpoint_after_batches: usize,
     /// How long checkpoints keep the evidence that resolves an uncertain commit.
     pub attempt_horizon: std::time::Duration,
+    /// How long a log's batches, spilled records and checkpoints stay after a
+    /// newer checkpoint's floor passes them, so a reader of an older head can
+    /// finish; a reader that takes longer opens again from the newer head.
+    pub retain_below_floor: std::time::Duration,
     /// How long a transaction's records, a dataset log no name refers to, or a
     /// dropped dataset's log are kept before a catalog that opens may remove
     /// them: anything newer may belong to a process still writing it.
@@ -114,6 +123,7 @@ impl Default for NativeCatalogConfig {
             // Small for the prototype, so short CDC runs checkpoint.
             checkpoint_after_batches: 1,
             attempt_horizon: object_store_occ::headlog::DEFAULT_ATTEMPT_HORIZON,
+            retain_below_floor: object_store_occ::headlog::DEFAULT_RETENTION,
             reclaim_after: std::time::Duration::from_hours(1),
             transaction_deadline: std::time::Duration::from_secs(60),
         }
@@ -444,6 +454,11 @@ impl Domain {
                 available: Notify::new(),
                 reserved: std::sync::atomic::AtomicBool::new(false),
                 inner: Mutex::new(Some(Inner {
+                    collector: Arc::new(tokio::sync::Mutex::new(Collector::new(
+                        Arc::clone(&store),
+                        prefix.clone(),
+                        config.retain_below_floor,
+                    ))),
                     reader: DatasetStateReader::from_state(state, store, prefix),
                     writer,
                     poisoned: false,
@@ -529,7 +544,30 @@ impl Inner {
             .await
             .map_err(invalid)?;
         self.staged_checkpoint = at;
+        self.collect();
         Ok(())
+    }
+
+    /// Delete the objects below the floor that no reader can still need, on a
+    /// background task, unless a collection of this log is already running.
+    /// A failed collection leaves them for the next one.
+    fn collect(&self) {
+        let Ok(mut collector) = Arc::clone(&self.collector).try_lock_owned() else {
+            return;
+        };
+        tokio::spawn(async move {
+            match collector.collect().await {
+                Ok(Some(collected)) => tracing::trace!(
+                    "Cayenne object-native metastore deleted {} log objects below commit {}",
+                    collected.deleted,
+                    collected.floor
+                ),
+                Ok(None) => {}
+                Err(error) => tracing::debug!(
+                    "Cayenne object-native metastore left log objects below the floor for the next collection: {error}"
+                ),
+            }
+        });
     }
 
     fn table(&self, id: &str) -> CatalogResult<&cayenne_metastore_actions::TableState> {

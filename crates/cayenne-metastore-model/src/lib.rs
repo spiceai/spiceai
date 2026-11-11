@@ -1171,6 +1171,14 @@ pub fn runs() -> Vec<Run> {
             failure: "I8 recovery replay equality including payload bytes",
         },
         Run {
+            name: "window-storage-gc-early-5-exhaust",
+            family: "window",
+            mode: "storage-gc-early",
+            bound: 5,
+            seed: None,
+            failure: "I7 query within retention reads its snapshot",
+        },
+        Run {
             name: "window-storage-no-final-5-exhaust",
             family: "window",
             mode: "storage-no-final",
@@ -2805,7 +2813,21 @@ fn required_witness(run: &Run, name: &str, expectation: &Expectation) -> bool {
             "handoff drained before the new owner ingests" => run.mode.contains("handoff"),
             _ => false,
         };
-    intent_required
+    // The positive window graph must delete below the floor, collect while a
+    // reader of an older head is still within its retention, and collect again
+    // after the collector restarts.
+    let window_required = run.family == "window"
+        && run.failure.is_empty()
+        && run.seed.is_none()
+        && matches!(
+            name,
+            "batches and a checkpoint collected"
+                | "collection while a reader of an older head is within retention"
+                | "expired reader of an older head finds an object collected"
+                | "restarted collector collects"
+        );
+    window_required
+        || intent_required
         || added_required
         || standby_required
         || remote_retention_required
@@ -3046,12 +3068,13 @@ pub fn run(name: &str) -> Result<(), String> {
 /// `None` for an unknown run, a run of another family, or an action the run does
 /// not enable at that point.
 #[must_use]
-pub fn window_head_after(run: &str, actions: &[String]) -> Option<(Vec<usize>, Vec<usize>)> {
+pub fn window_outcome_after(run: &str, actions: &[String]) -> Option<WindowOutcome> {
     let run = runs()
         .into_iter()
         .find(|r| r.name == run && r.family == "window")?;
-    window::head_after(run.mode, run.bound, actions)
+    window::outcome_after(run.mode, run.bound, actions)
 }
+pub use window::Outcome as WindowOutcome;
 
 pub use transactions::Step as TransactionStep;
 

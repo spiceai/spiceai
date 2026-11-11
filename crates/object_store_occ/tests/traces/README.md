@@ -5,20 +5,23 @@ driver's witness choice is not deterministic between runs, so regenerating
 changes the files; every set must still replay.
 
 The fault-store, commit, source and window replays run against InMemory and
-LocalConditionalPut::new_durable. The window replay maps every model action except
-Gc and Query: each Checkpoint(c) writes the prototype checkpoint at commit c, and
-the next accepted commit publishes the floor, as in the model.
+LocalConditionalPut::new_durable. The window replay maps every model action:
+each Checkpoint(c) writes the prototype checkpoint at commit c and the next
+accepted commit publishes the floor, Gc runs the head log's `Collector`, Tick
+runs the store's clock one retention ahead, Restart starts a new collector, and
+Query reads the head and holds the reads of what it lists at a read gate.
 
 ## Files
 
 - `object_store_sim::fault` (crates/object_store_sim/src/fault.rs): path/operation-selected hold, fail, lost-response,
-  repeated identical delivery, async before-hook, ordered applied-operation log.
-  Canceled caller futures do not erase captured requests.
+  repeated identical delivery, async before-hook, ordered applied-operation log,
+  a read gate that holds plain GETs of selected paths, and a store clock offset
+  added to every `LastModified`. Canceled caller futures do not erase captured requests.
 - ../fault.rs: two integration tests, each on both backends; every fault, caller
   cancellation, real before-hook I/O, forwarding and operation-log order.
-- ../headlog_replay.rs: three positive replay tests, five negative-control tests,
+- ../headlog_replay.rs: three positive replay tests, six negative-control tests,
   and listed-but-missing batch checks for cold open and lagging poll.
-- *.jsonl: eight driver-generated trace sets; positive sets include walks.
+- *.jsonl: nine driver-generated trace sets; positive sets include walks.
 
 These tests exercise the
 real head-log API and real stores directly. The replay cancels tasks, drops
@@ -34,19 +37,20 @@ initial_index=0. Walks use seed 42, count 20, max_steps 40.
 | Trace set / family | Witnesses | Walks | Counterexample witnesses in file |
 |---|---:|---:|---:|
 | commits-restart-turnover / commits | 4 | 20 | 0 |
-| window-storage / window | 3 | 20 | 0 |
+| window-storage / window | 7 | 20 | 0 |
 | source-positions | 3 | 20 | 0 |
 | commits-no-persist / commits | 6 | 0 | 2 |
-| window-no-exists / window | 4 | 0 | 3 |
+| window-no-exists / window | 5 | 0 | 3 |
+| window-gc-early / window | 5 | 0 | 1 |
 | source-ack-early / source-positions | 7 | 0 | 4 |
 | source-no-skip / source-positions | 6 | 0 | 4 |
 | source-position-before-data / source-positions | 4 | 0 | 2 |
 
-The window set holds 21 Checkpoint actions (Checkpoint(1) ×3, (2) ×12, (3) ×5,
-(4) ×1), 17 Gc and 20 Query.
+The window set holds 20 Gc, 11 Query, 15 Tick and 6 Restart actions.
 
 Control tests select FAIL witnesses for the named invariant: I2 for persistence
-and early acknowledgement, I4 for batch existence, the I10 witnesses for source
+and early acknowledgement, I4 for batch existence, I7 for a collection that
+does not wait a retention (the collector's retention set to zero), the I10 witnesses for source
 redelivery and for a position published before its rows. Other control-file witnesses remain exactly as emitted by
 the driver but are not replayed. Each selected trace first runs with its
 safeguard enabled, then with only its matching replay-harness safeguard removed.
@@ -94,7 +98,10 @@ batch and verifies the failed-poll cursor stays unchanged.
 | window | Observe | Refresh pending-copy list from inline sealing attempts. |
 | window | Create(j) | Apply pending immutable copy j with gate temporarily open. |
 | window | Checkpoint(c) | publish_checkpoint(c, serialized serial prefix [..c]) on the current writer, which is kept for the next prepare so the next accepted commit publishes the floor. Model `c` is a listed batch end or the record before the window; commits number from 1, so model `c` is prototype commit `c`. A refusal fails the replay. |
-| window | Gc / Query | Skip and count. The head log has no GC yet; the retention family will cover removal and running queries. |
+| window | Gc | `Collector::collect` on a collector kept across the trace, with a one-hour retention (zero under the `GcEarly` control). |
+| window | Tick | Let a running query finish (below), then run the store's clock ahead by exactly the retention, so a floor stamped before the Tick is due after it and not before. |
+| window | Restart | Replace the collector with a new one, which knows no stamps. |
+| window | Query | Record the serial prefix, then open a `Reader` through a second FaultStore that holds every GET except the head's: the open reads the head now and fetches what it lists when the query finishes, at the next Tick or the end of the trace. It must return exactly that prefix (I7). After a Tick the model allows a missing object, which the replay does not exercise: its query has finished by then. |
 | source | Receive | Consume next numbered change, skipping logged positions unless no-skip control is active. |
 | source | Issue | Filter logged positions again; prepare (rows, position), serialize receipt and spawn held commit. |
 | source | Deliver(i,q) | Deliver original/identical retry for model attempt i. Safe control replays retain no-op index slots for removed redundant Issues. |
@@ -124,8 +131,7 @@ window, with the same count and oldest-prefix batch cuts.
 
 Each replay prints the actions it skipped, per trace set (`--no-capture`).
 A positive-trace Append that the writer refuses fails the replay, as does a
-refused Checkpoint. Gc and Query are not replayed, so no claim is made about
-removal or about a running query's batches.
+refused Checkpoint.
 
 **Head alignment with the model.** After every positive window trace (witnesses
 and walks), the head's listed batch ends and inline record sizes must equal
@@ -133,6 +139,9 @@ those of the model stepped through the same actions
 (`cayenne_metastore_model::window_head_after`, with the trace's own run), at
 10,000 bytes per symbolic byte. The expectation comes from the model, never from
 the head log. The replay prints a `CUTS` line for each trace (`--no-capture`).
+After every positive window trace the batch objects (`wal/`, by first commit)
+and checkpoint objects in storage must also equal those the model's collector
+left; the replay prints an `OBJECTS` line with the count it deleted.
 A changed spill threshold fails this check alone; a changed batch record or
 byte budget is caught earlier, as a refused positive append. Gap: no positive
 trace fills the inline window by bytes alone, so the traces do not distinguish
@@ -158,6 +167,7 @@ same file.
     EXHAUST=1 TRACE_JSON=$R/replay-source.jsonl target/release/cayenne-metastore-model run source-positions
     EXHAUST=1 TRACE_JSON=$R/replay-commits-control.jsonl target/release/cayenne-metastore-model run commits-restart-no-persist-before-send
     EXHAUST=1 TRACE_JSON=$R/replay-window-control.jsonl target/release/cayenne-metastore-model run window-storage-no-exists-5-exhaust
+    EXHAUST=1 TRACE_JSON=$R/replay-window-gc-control.jsonl target/release/cayenne-metastore-model run window-storage-gc-early-5-exhaust
     EXHAUST=1 TRACE_JSON=$R/replay-source-ack-control.jsonl target/release/cayenne-metastore-model run source-ack-before-acceptance
     EXHAUST=1 TRACE_JSON=$R/replay-source-skip-control.jsonl target/release/cayenne-metastore-model run source-no-redelivery-skip
     EXHAUST=1 TRACE_JSON=$R/replay-source-before-data-control.jsonl target/release/cayenne-metastore-model run source-position-before-data
@@ -174,6 +184,7 @@ Each walk run must print `good=true` on its `WALKS` line.
 | replay-source.jsonl | source-positions.jsonl |
 | replay-commits-control.jsonl | commits-no-persist.jsonl |
 | replay-window-control.jsonl | window-no-exists.jsonl |
+| replay-window-gc-control.jsonl | window-gc-early.jsonl |
 | replay-source-ack-control.jsonl | source-ack-early.jsonl |
 | replay-source-skip-control.jsonl | source-no-skip.jsonl |
 | replay-source-before-data-control.jsonl | source-position-before-data.jsonl |

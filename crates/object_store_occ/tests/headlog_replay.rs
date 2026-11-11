@@ -8,7 +8,10 @@ use bytes::Bytes;
 use object_store::{ObjectStore, ObjectStoreExt, PutOptions, PutPayload, path::Path};
 use object_store_occ::{
     Expected, LocalConditionalPut, conditional_put,
-    headlog::{HeadLog, HeadLogConfig, Outcome, Poll, PreparedAttempt, Reader, Record, Writer},
+    headlog::{
+        Collector, HeadLog, HeadLogConfig, Opened, Outcome, Poll, PreparedAttempt, Reader, Record,
+        Writer,
+    },
 };
 use object_store_sim::{
     Op,
@@ -16,6 +19,7 @@ use object_store_sim::{
 };
 use prost::Message;
 use serde::Deserialize;
+use futures::TryStreamExt;
 use std::{collections::BTreeMap, sync::Arc, time::Duration};
 use tokio::task::JoinHandle;
 
@@ -61,6 +65,34 @@ enum Control {
     NoSkip,
     NoExists,
     PositionFirst,
+    /// The collector deletes below a floor as soon as it sees it, without
+    /// waiting a retention.
+    GcEarly,
+}
+/// The collector's retention in the window replay. `Tick` runs the store
+/// clock ahead by exactly this much, so a stamp is due after one `Tick` and
+/// not before, whatever the wall clock does during a replay.
+const RETENTION: Duration = Duration::from_secs(3600);
+/// A reader that read the head and waits at the read gate before fetching
+/// what it lists, with the serial prefix that head committed.
+type OpenResult = object_store_occ::headlog::Result<(Reader, Opened)>;
+struct Query {
+    call: JoinHandle<OpenResult>,
+    /// The open's answer, when it finished without reaching the gate.
+    finished: Option<OpenResult>,
+    store: Arc<FaultStore>,
+    expected: Vec<Bytes>,
+}
+/// The payloads a cold open returns: the checkpoint root's serial prefix, then
+/// the records after the floor.
+fn payloads(opened: Opened) -> TestResult<Vec<Bytes>> {
+    let mut payloads: Vec<Bytes> = if let Some(root) = opened.checkpoint_root {
+        result(serde_json::from_slice(&root))?
+    } else {
+        vec![]
+    };
+    payloads.extend(opened.records.into_iter().map(|r| r.record.payload));
+    Ok(payloads)
 }
 type Call = JoinHandle<(Writer, object_store_occ::headlog::Result<Outcome>)>;
 struct Attempt {
@@ -107,6 +139,11 @@ struct Replay {
     position_half: bool,
     logical_ack: bool,
     skipped: BTreeMap<String, usize>,
+    collector: Collector,
+    /// A running reader, while it is within its retention.
+    query: Option<Query>,
+    /// Objects the collector deleted over the replay.
+    collected: usize,
 }
 impl Replay {
     fn object_store(&self) -> Arc<dyn ObjectStore> {
@@ -150,6 +187,7 @@ impl Replay {
             .await
             .expect("initial reader");
         store.fail_while(Op::Create, wal_path);
+        let collector = Self::collector(Arc::clone(&store), control);
         Self {
             store,
             config,
@@ -171,7 +209,69 @@ impl Replay {
             position_half: false,
             logical_ack: false,
             skipped: BTreeMap::new(),
+            collector,
+            query: None,
+            collected: 0,
         }
+    }
+    fn collector(store: Arc<FaultStore>, control: Control) -> Collector {
+        let retention = if control == Control::GcEarly {
+            Duration::ZERO
+        } else {
+            RETENTION
+        };
+        Collector::new(store, Path::from("replay"), retention)
+    }
+    /// Read the head now and fetch what it lists only when the gate opens.
+    async fn start_query(&mut self) -> TestResult {
+        let (expected, _) = self.serial()?;
+        let store = Arc::new(FaultStore::new(self.object_store()));
+        store.gate_reads(|path| !head_path(path));
+        let reader_store: Arc<dyn ObjectStore> = Arc::clone(&store) as Arc<dyn ObjectStore>;
+        let mut call =
+            tokio::spawn(async move { Reader::open(reader_store, Path::from("replay")).await });
+        // An empty log lists nothing, so its open finishes without a gated read.
+        let finished = tokio::select! {
+            () = store.wait_gated(1) => None,
+            answer = &mut call => Some(result(answer)?),
+        };
+        self.query = Some(Query {
+            call,
+            finished,
+            store,
+            expected,
+        });
+        Ok(())
+    }
+    /// Let a reader within its retention fetch what its head lists: it must
+    /// return exactly the prefix that head committed.
+    async fn finish_query(&mut self) -> TestResult {
+        let Some(query) = self.query.take() else {
+            return Ok(());
+        };
+        query.store.open_reads();
+        let opened = match query.finished {
+            Some(opened) => opened,
+            None => result(result(
+                tokio::time::timeout(Duration::from_secs(10), query.call).await,
+            )?)?,
+        };
+        let actual = match opened {
+            Ok((_, opened)) => payloads(opened)?,
+            Err(error) => {
+                return Err(format!(
+                    "I7 query within retention expected {} records; actual error {error}",
+                    query.expected.len()
+                ));
+            }
+        };
+        require(actual == query.expected, || {
+            format!(
+                "I7 query within retention expected {} records; actual {} records",
+                query.expected.len(),
+                actual.len()
+            )
+        })
     }
     fn skip(&mut self, reason: &str) {
         *self.skipped.entry(reason.into()).or_default() += 1;
@@ -400,12 +500,7 @@ impl Replay {
         let (expected, _) = self.serial()?;
         let (_, opened) = result(Reader::open(self.object_store(), Path::from("replay")).await)
             .map_err(|e| format!("I4 expected readable committed prefix; actual {e}"))?;
-        let mut actual: Vec<Bytes> = if let Some(root) = opened.checkpoint_root {
-            result(serde_json::from_slice(&root))?
-        } else {
-            vec![]
-        };
-        actual.extend(opened.records.into_iter().map(|r| r.record.payload));
+        let actual = payloads(opened)?;
         require(actual == expected, || {
             format!("I1/I6 expected {expected:?}; actual {actual:?}")
         })?;
@@ -805,7 +900,19 @@ impl Replay {
                     .map_err(|e| format!("model checkpoint at {c} refused: {e}"))?;
                 self.staged_writer = Some(writer);
             }
-            "Gc" | "Query" => self.skip(action),
+            "Gc" => {
+                if let Some(collected) = result(self.collector.collect().await)? {
+                    self.collected += collected.deleted;
+                }
+            }
+            "Query" => self.start_query().await?,
+            "Tick" => {
+                // The reader must finish before its retention runs out; after
+                // it, the model allows an object it lists to be gone.
+                self.finish_query().await?;
+                self.store.advance_clock(RETENTION);
+            }
+            "Restart" => self.collector = Self::collector(Arc::clone(&self.store), self.control),
             other => return Err(format!("unmapped window action {other}")),
         }
         Ok(())
@@ -877,15 +984,63 @@ async fn replay(
             )
         })?;
     }
+    if window {
+        result(
+            tokio::time::timeout(Duration::from_secs(20), replay.finish_query())
+                .await
+                .map_err(|e| format!("I7 query did not finish: {e}"))
+                .and_then(std::convert::identity),
+        )
+        .map_err(|e| {
+            format!(
+                "trace={} {:?} after the last action expected invariants hold; actual={e} actions={:?}",
+                trace.run, trace.property, trace.actions
+            )
+        })?;
+    }
     if window && trace.status != "FAIL" {
-        // The expected head comes from stepping the model through the same
-        // actions, never from the head log under test: listed batch ends match
-        // the model's index, and inline records its window at 10,000 bytes per
-        // symbolic byte.
-        let (ends, symbolic) =
-            cayenne_metastore_model::window_head_after(&trace.run, &trace.actions)
-                .ok_or_else(|| format!("trace={} does not replay in the model", trace.run))?;
-        let expected_sizes: Vec<_> = symbolic.iter().map(|b| b * 10_000).collect();
+        // The expected head and objects come from stepping the model through
+        // the same actions, never from the head log under test: listed batch
+        // ends match the model's index, inline records its window at 10,000
+        // bytes per symbolic byte, and the batch and checkpoint objects in
+        // storage the ones the model's collector left.
+        let model = cayenne_metastore_model::window_outcome_after(&trace.run, &trace.actions)
+            .ok_or_else(|| format!("trace={} does not replay in the model", trace.run))?;
+        let ends = model.batch_ends.clone();
+        let expected_sizes: Vec<_> = model.window.iter().map(|b| b * 10_000).collect();
+        let objects = |directory: &'static str| {
+            let store = replay.object_store();
+            async move {
+                let listed: Vec<_> = result(
+                    store
+                        .list(Some(&Path::from(format!("replay/{directory}"))))
+                        .try_collect()
+                        .await,
+                )?;
+                let mut numbers: Vec<usize> = listed
+                    .iter()
+                    .filter_map(|meta| meta.location.filename()?.parse().ok())
+                    .collect();
+                numbers.sort_unstable();
+                TestResult::Ok(numbers)
+            }
+        };
+        let (batches, checkpoints) = (objects("wal").await?, objects("checkpoints").await?);
+        require(
+            batches == model.batch_objects && checkpoints == model.checkpoint_objects,
+            || {
+                format!(
+                    "trace={} {:?} expected batch objects {:?} and checkpoints {:?}; actual {batches:?} and {checkpoints:?}",
+                    trace.run, trace.property, model.batch_objects, model.checkpoint_objects
+                )
+            },
+        )?;
+        println!(
+            "OBJECTS backend={} property={:?} batch_objects={batches:?} checkpoint_objects={checkpoints:?} deleted={}",
+            if local { "durable-local" } else { "memory" },
+            trace.property,
+            replay.collected
+        );
         let head = &replay.reader.state().head;
         let sizes: Vec<_> = head.window.iter().map(|r| r.encoded.len()).collect();
         let batches: Vec<_> = head
@@ -1004,6 +1159,16 @@ async fn control_batch_exists() {
         include_str!("traces/window-no-exists.jsonl"),
         Control::NoExists,
         "I4",
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn control_collect_after_retention() {
+    negative(
+        include_str!("traces/window-gc-early.jsonl"),
+        Control::GcEarly,
+        "I7",
     )
     .await;
 }

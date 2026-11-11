@@ -5,11 +5,13 @@
 //!
 //! Persist [`PreparedAttempt`] before calling [`Writer::commit`]. After an error,
 //! retain it and call [`Writer::resolve`]; never replace an undecided logical write.
-//! This prototype retains all immutable history. It deliberately implements no GC:
-//! opaque actions do not provide enough information to establish reachability.
+//! A [`Collector`] deletes the batches, spilled payloads and checkpoints below
+//! the floor once no reader can still need them; it never reads payloads, so
+//! objects a caller's payloads refer to are the caller's to collect.
 //! Checkpoints keep attempt evidence only for [`Writer::set_attempt_horizon`]:
 //! past it, resolution reports `Unresolved`, never `Rejected`.
 
+mod collect;
 mod format;
 mod reader;
 
@@ -24,6 +26,7 @@ use snafu::Snafu;
 use crate::{Expected, conditional_put, probe_conditional_writes};
 use format::{Batch, Checkpoint, decode_record};
 pub use format::{Group, Head, HeadLogConfig, Record, Spilled, WindowRecord};
+pub use collect::{Collected, Collector, DEFAULT_RETENTION};
 pub use reader::{DEFAULT_READ_CONCURRENCY, Opened, Poll, Reader, RecordWithCommit};
 
 /// A protocol, transport, or encoding error. An error never implies rejection.
@@ -305,7 +308,7 @@ impl Writer {
             return;
         }
         let store = Arc::clone(&self.store);
-        let path = numbered(&self.prefix, "wal", start);
+        let path = numbered(&self.prefix, BATCHES, start);
         self.sealing = Some((
             start,
             tokio::spawn(async move { immutable(store.as_ref(), &path, bytes).await }),
@@ -342,9 +345,10 @@ impl Writer {
                 digest: digest.as_bytes().to_vec(),
                 len: record.payload.len() as u64,
             };
+            let commit = self.state.head.commit + 1;
             immutable(
                 self.store.as_ref(),
-                &spilled_path(&self.prefix, self.generation, &spilled.digest)?,
+                &spilled_path(&self.prefix, commit, &attempt_id),
                 std::mem::take(&mut record.payload),
             )
             .await?;
@@ -590,7 +594,7 @@ impl Writer {
         if self.sealed != Some(start) {
             immutable(
                 self.store.as_ref(),
-                &numbered(&self.prefix, "wal", start),
+                &numbered(&self.prefix, BATCHES, start),
                 bytes,
             )
             .await?;
@@ -726,7 +730,7 @@ impl Writer {
         };
         immutable(
             self.store.as_ref(),
-            &numbered(&self.prefix, "checkpoints", at),
+            &numbered(&self.prefix, CHECKPOINTS, at),
             checkpoint.encode_to_vec().into(),
         )
         .await?;
@@ -759,23 +763,32 @@ fn ensure_version(version: &UpdateVersion) -> Result<()> {
     }
     Ok(())
 }
-fn spilled_path(prefix: &Path, generation: u64, digest: &[u8]) -> Result<Path> {
-    let digest = <[u8; 32]>::try_from(digest).map_err(|_| Error::Invalid {
-        reason: "spilled payload digest is not 32 bytes".into(),
-    })?;
-    Ok(prefix
+/// A spilled payload is named by the commit its record proposes and the
+/// attempt that proposed it, so every record has its own object and the
+/// collector can tell from the name alone whether it is below a floor.
+fn spilled_path(prefix: &Path, commit: u64, attempt_id: &[u8]) -> Path {
+    let attempt: String = attempt_id.iter().map(|b| format!("{b:02x}")).collect();
+    prefix
         .clone()
-        .join("objects")
-        .join(format!("{generation:020}"))
-        .join("records")
-        .join(blake3::Hash::from_bytes(digest).to_hex().as_str()))
+        .join(SPILLED)
+        .join(format!("{commit:020}-{attempt}"))
 }
+/// The directories of a log's immutable objects, below its head.
+const BATCHES: &str = "wal";
+const CHECKPOINTS: &str = "checkpoints";
+const SPILLED: &str = "records";
 fn numbered(prefix: &Path, directory: &str, number: u64) -> Path {
     prefix.clone().join(directory).join(format!("{number:020}"))
 }
 async fn read_head(store: &dyn ObjectStore, prefix: &Path) -> Result<HeadState> {
     let result = store.get(&prefix.clone().join("head")).await?;
     decode_head(result).await
+}
+/// The head and its store time (`LastModified`, Unix milliseconds).
+async fn read_head_at(store: &dyn ObjectStore, prefix: &Path) -> Result<(HeadState, u64)> {
+    let result = store.get(&prefix.clone().join("head")).await?;
+    let modified = u64::try_from(result.meta.last_modified.timestamp_millis()).unwrap_or_default();
+    Ok((decode_head(result).await?, modified))
 }
 async fn decode_head(result: object_store::GetResult) -> Result<HeadState> {
     let version = UpdateVersion {
@@ -812,7 +825,7 @@ async fn load_checkpoint(
     head: &Head,
 ) -> Result<Checkpoint> {
     let bytes = store
-        .get(&numbered(prefix, "checkpoints", head.floor))
+        .get(&numbered(prefix, CHECKPOINTS, head.floor))
         .await?
         .bytes()
         .await?;

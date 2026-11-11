@@ -1,7 +1,9 @@
 // Copyright 2026 The Spice.ai OSS Authors
 // SPDX-License-Identifier: Apache-2.0
 
-//! Deterministic request delivery and response faults for protocol experiments.
+//! Deterministic request delivery and response faults for protocol experiments,
+//! a read gate that holds a reader between its head and the objects it lists,
+//! and a store clock that tests can run ahead.
 use std::{collections::BTreeMap, fmt, sync::Arc};
 
 use async_trait::async_trait;
@@ -60,6 +62,12 @@ struct State {
     next: u64,
     log: Vec<Applied>,
     blocked: Vec<(Path, PutPayload, PutOptions)>,
+    /// Plain GETs of matching paths wait here until the gate opens.
+    read_gate: Option<Predicate>,
+    /// GETs waiting at the gate now.
+    gated: usize,
+    /// Milliseconds added to every `LastModified` a GET, HEAD or LIST returns.
+    clock_offset_ms: i64,
 }
 
 /// Faults remain independent of caller futures: dropping a caller does not cancel
@@ -69,6 +77,7 @@ pub struct FaultStore {
     state: Arc<Mutex<State>>,
     applied: Arc<AsyncMutex<()>>,
     captured: Notify,
+    reads_opened: Notify,
 }
 
 fn injected(reason: impl Into<String>) -> object_store::Error {
@@ -86,6 +95,66 @@ impl FaultStore {
             state: Arc::new(Mutex::new(State::default())),
             applied: Arc::new(AsyncMutex::new(())),
             captured: Notify::new(),
+            reads_opened: Notify::new(),
+        }
+    }
+
+    /// Hold plain GETs of matching paths before I/O until [`Self::open_reads`],
+    /// so a reader can read a head and fetch what it lists later.
+    pub fn gate_reads(&self, predicate: impl Fn(&Path) -> bool + Send + Sync + 'static) {
+        self.state.lock().read_gate = Some(Arc::new(predicate));
+    }
+
+    /// Release every GET held at the gate, and stop holding new ones.
+    pub fn open_reads(&self) {
+        self.state.lock().read_gate = None;
+        self.reads_opened.notify_waiters();
+    }
+
+    /// Wait until at least `count` GETs are held at the gate.
+    pub async fn wait_gated(&self, count: usize) {
+        loop {
+            let notified = self.captured.notified();
+            if self.state.lock().gated >= count {
+                return;
+            }
+            notified.await;
+        }
+    }
+
+    /// Run the store's clock ahead: every `LastModified` it returns from now
+    /// on is `by` later, as if that much time had passed for every object.
+    pub fn advance_clock(&self, by: std::time::Duration) {
+        let by = i64::try_from(by.as_millis()).unwrap_or(i64::MAX);
+        let mut state = self.state.lock();
+        state.clock_offset_ms = state.clock_offset_ms.saturating_add(by);
+    }
+
+    fn clock_offset(&self) -> chrono::TimeDelta {
+        chrono::TimeDelta::milliseconds(self.state.lock().clock_offset_ms)
+    }
+
+    /// Wait at the read gate while it holds `path`.
+    async fn wait_at_gate(&self, path: &Path) {
+        let mut counted = false;
+        loop {
+            let notified = self.reads_opened.notified();
+            {
+                let mut state = self.state.lock();
+                let held = state.read_gate.as_ref().is_some_and(|gate| gate(path));
+                if !held {
+                    if counted {
+                        state.gated -= 1;
+                    }
+                    return;
+                }
+                if !counted {
+                    state.gated += 1;
+                    counted = true;
+                }
+            }
+            self.captured.notify_waiters();
+            notified.await;
         }
     }
 
@@ -338,12 +407,18 @@ impl ObjectStore for FaultStore {
         } else {
             Op::Get
         };
+        if op == Op::Get {
+            self.wait_at_gate(path).await;
+        }
         if self.fault(op, path).is_some() {
             return Err(injected("get failed before I/O"));
         }
         let _guard = self.applied.lock().await;
         let mode = format!("{options:?}");
-        let result = self.inner.get_opts(path, options).await;
+        let mut result = self.inner.get_opts(path, options).await;
+        if let Ok(answer) = &mut result {
+            answer.meta.last_modified += self.clock_offset();
+        }
         self.state.lock().log.push(Applied {
             path: path.clone(),
             op,
@@ -399,6 +474,7 @@ impl ObjectStore for FaultStore {
         let state = Arc::clone(&self.state);
         let applied = Arc::clone(&self.applied);
         let prefix = prefix.cloned();
+        let offset = self.clock_offset();
         futures::stream::once(async move {
             let _guard = applied.lock().await;
             let answer = inner.list(prefix.as_ref()).try_collect::<Vec<_>>().await;
@@ -411,7 +487,11 @@ impl ObjectStore for FaultStore {
                 &answer,
             );
             match answer {
-                Ok(objects) => futures::stream::iter(objects.into_iter().map(Ok)).boxed(),
+                Ok(objects) => futures::stream::iter(objects.into_iter().map(move |mut meta| {
+                    meta.last_modified += offset;
+                    Ok(meta)
+                }))
+                .boxed(),
                 Err(error) => futures::stream::iter([Err(error)]).boxed(),
             }
         })
@@ -420,7 +500,13 @@ impl ObjectStore for FaultStore {
     }
     async fn list_with_delimiter(&self, prefix: Option<&Path>) -> object_store::Result<ListResult> {
         let _guard = self.applied.lock().await;
-        let answer = self.inner.list_with_delimiter(prefix).await;
+        let mut answer = self.inner.list_with_delimiter(prefix).await;
+        if let Ok(listed) = &mut answer {
+            let offset = self.clock_offset();
+            for meta in &mut listed.objects {
+                meta.last_modified += offset;
+            }
+        }
         record(
             &self.state,
             &prefix.cloned().unwrap_or_default(),

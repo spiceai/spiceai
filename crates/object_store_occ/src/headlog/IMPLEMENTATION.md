@@ -16,12 +16,15 @@ there is currently no engine entry point through which a Spicepod can invoke it.
 - Caller checkpoints, evidence retention, floor publication on the next commit.
 - Conditional-write enforcement probes for creation and writer construction.
 
-**Not implemented:** GC, pins, removal tracking, retirement interlocks,
-predecessor sweeping, reference admission, reference reachability reconstruction,
-or deletion of old batches/checkpoints. No immutable history is deleted. Callers
-are responsible for interpreting opaque actions, applying guards, and checking
-referenced data/page objects. This prototype alone does not implement those
-Cayenne state-machine responsibilities.
+- Deletion of batches, spilled payloads and checkpoints below the floor
+  (`Collector`, `collect.rs`): each floor is stamped with the store time of the
+  first collection that sees it, and its objects go a retention later.
+
+**Not implemented:** pins, reference admission, or reachability of the
+objects callers' payloads reference; those are the caller's to collect.
+Callers are responsible for interpreting opaque actions, applying guards, and
+checking referenced data/page objects. This prototype alone does not implement
+those Cayenne state-machine responsibilities.
 
 ## Public API
 
@@ -51,7 +54,11 @@ All operations that access storage are async.
 - `Writer::publish_checkpoint(at, root) -> Result<()>` stages a boundary-aligned
   root. Only the next accepted record publishes its floor.
 - `Reader::open(store, prefix) -> Result<(Reader, Opened)>`, `poll() -> Result<Poll>`,
-  and `state() -> &HeadState`.
+  and `state() -> &HeadState`. An open that finds a listed object collected
+  under a newer floor starts over from the newer head.
+- `Collector::new(store, prefix, retention)` and `collect() -> Result<Option<Collected>>`:
+  one head GET; when a floor is due, a LIST of `wal/`, `records/` and
+  `checkpoints/` and a bulk delete below it.
 - Public data types: `HeadLogConfig`, prost `Head`, `WindowRecord`, `Record`, `Group`,
   serde `PreparedAttempt` with `attempt_id()` accessor, `Outcome`, `HeadState`,
   `ObjectRef`, `RecordWithCommit`, `Opened`, `Poll`, `Error`, and `Result<T>`.
@@ -105,10 +112,12 @@ advance the reader: the caller must cold-open again. Errors never imply rejectio
 13. Batch indices contain ends, as specified by both head schemas. No batch digest
     field is invented. ObjectRef includes the caller upload's BLAKE3 digest;
     callers must encode and verify their opaque payload references themselves.
-14. GC and pin behavior have not been approximated. Opaque payloads and the
-    requested refs/removal API do not by themselves specify a restartable state
-    projection for reachability at every protected commit. That contract needs
-    an explicit caller/state-machine interface before safe predecessor deletion.
+14. Only the log's own objects are collected. Opaque payloads do not say
+    which caller objects they reference, so reachability of those needs an
+    explicit caller/state-machine interface.
+15. A spilled payload is named `records/<commit>-<attempt id>`, not by its
+    digest, so no two records share an object and the collector can tell from
+    the name whether it is below a floor. Its digest still verifies the read.
 
 ## Design issue exercised by the tests
 
