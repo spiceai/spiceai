@@ -49,7 +49,7 @@ use object_store::{
     CopyOptions, GetOptions, GetResult, ListResult, MultipartUpload, ObjectMeta, ObjectStore,
     ObjectStoreExt, PutMultipartOptions, PutOptions, PutPayload, PutResult, RenameOptions,
 };
-use object_store_occ::sim::fault::FaultStore;
+use object_store_sim::fault::FaultStore;
 
 use crate::common;
 

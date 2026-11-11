@@ -20,7 +20,7 @@
   "postgres-write-back-pending-across-rebuild": [
     {
       "run": "postgres-write-back-pending-across-rebuild",
-      "who": "default",
+      "who": "as-written",
       "key": "query: SELECT sum(balance) AS total FROM accounts #2",
       "kind": "wrong-answer",
       "signature": "answer differs from the expected one: DataMismatch { column: \"total\", row_number: 1, expected: \"\\\"17750.00\\\"\", actual: \"\\\"12750.00\\\"\" }",
@@ -28,7 +28,23 @@
     },
     {
       "run": "postgres-write-back-pending-across-rebuild",
-      "who": "default",
+      "who": "as-written",
+      "key": "source-query: {\"src\":\"SELECT sum(balance) FROM accounts\"}",
+      "kind": "other",
+      "signature": "the source answered [[Some(\"12750.00\")]], expected [[Some(\"17750.00\")]]",
+      "group": "write-back"
+    },
+    {
+      "run": "postgres-write-back-pending-across-rebuild",
+      "who": "object-native",
+      "key": "query: SELECT sum(balance) AS total FROM accounts #2",
+      "kind": "wrong-answer",
+      "signature": "answer differs from the expected one: DataMismatch { column: \"total\", row_number: 1, expected: \"\\\"17750.00\\\"\", actual: \"\\\"12750.00\\\"\" }",
+      "group": "write-back"
+    },
+    {
+      "run": "postgres-write-back-pending-across-rebuild",
+      "who": "object-native",
       "key": "source-query: {\"src\":\"SELECT sum(balance) FROM accounts\"}",
       "kind": "other",
       "signature": "the source answered [[Some(\"12750.00\")]], expected [[Some(\"17750.00\")]]",
@@ -38,23 +54,23 @@
   "postgres-write-through-arithmetic": [
     {
       "run": "postgres-write-through-arithmetic",
-      "who": "default",
+      "who": "as-written",
       "key": "spice-exec: UPDATE a SET i = i + 1 WHERE id = 2",
       "kind": "error",
-      "signature": "Spice rejected the statement: 400 Bad Request: Failed to execute query: External error: Expression not supported CAST(__spice_checked_add(CAST(i AS Int64), Int64(1)) AS Int32)",
+      "signature": "Spice rejected the statement: 400 Bad Request: Failed to execute query: External error: Expression not supported CAST(CAST(i AS Int64) + Int64(1) AS Int32)",
       "group": "write-back"
     },
     {
       "run": "postgres-write-through-arithmetic",
-      "who": "default",
+      "who": "as-written",
       "key": "spice-exec: UPDATE a SET s = s + 1 WHERE id = 3",
       "kind": "error",
-      "signature": "Spice rejected the statement: 400 Bad Request: Failed to execute query: External error: Expression not supported CAST(__spice_checked_add(CAST(s AS Int64), Int64(1)) AS Int16)",
+      "signature": "Spice rejected the statement: 400 Bad Request: Failed to execute query: External error: Expression not supported CAST(CAST(s AS Int64) + Int64(1) AS Int16)",
       "group": "write-back"
     },
     {
       "run": "postgres-write-through-arithmetic",
-      "who": "default",
+      "who": "as-written",
       "key": "spice-exec: UPDATE a SET d = d + 1 WHERE id = 4",
       "kind": "error",
       "signature": "Spice rejected the statement: 400 Bad Request: Failed to execute query: External error: Expression not supported CAST(d + Decimal128(1,20,0) AS Decimal128(10, 2))",
@@ -62,7 +78,39 @@
     },
     {
       "run": "postgres-write-through-arithmetic",
-      "who": "default",
+      "who": "as-written",
+      "key": "query: SELECT i, s, d FROM a WHERE id IN (2, 3, 4) ORDER BY id",
+      "kind": "wrong-answer",
+      "signature": "answer differs from the expected one: DataMismatch { column: \"i\", row_number: 1, expected: \"\\\"3\\\"\", actual: \"\\\"2\\\"\" }",
+      "group": "write-back"
+    },
+    {
+      "run": "postgres-write-through-arithmetic",
+      "who": "object-native",
+      "key": "spice-exec: UPDATE a SET i = i + 1 WHERE id = 2",
+      "kind": "error",
+      "signature": "Spice rejected the statement: 400 Bad Request: Failed to execute query: External error: Expression not supported CAST(CAST(i AS Int64) + Int64(1) AS Int32)",
+      "group": "write-back"
+    },
+    {
+      "run": "postgres-write-through-arithmetic",
+      "who": "object-native",
+      "key": "spice-exec: UPDATE a SET s = s + 1 WHERE id = 3",
+      "kind": "error",
+      "signature": "Spice rejected the statement: 400 Bad Request: Failed to execute query: External error: Expression not supported CAST(CAST(s AS Int64) + Int64(1) AS Int16)",
+      "group": "write-back"
+    },
+    {
+      "run": "postgres-write-through-arithmetic",
+      "who": "object-native",
+      "key": "spice-exec: UPDATE a SET d = d + 1 WHERE id = 4",
+      "kind": "error",
+      "signature": "Spice rejected the statement: 400 Bad Request: Failed to execute query: External error: Expression not supported CAST(d + Decimal128(1,20,0) AS Decimal128(10, 2))",
+      "group": "write-back"
+    },
+    {
+      "run": "postgres-write-through-arithmetic",
+      "who": "object-native",
       "key": "query: SELECT i, s, d FROM a WHERE id IN (2, 3, 4) ORDER BY id",
       "kind": "wrong-answer",
       "signature": "answer differs from the expected one: DataMismatch { column: \"i\", row_number: 1, expected: \"\\\"3\\\"\", actual: \"\\\"2\\\"\" }",
@@ -75,7 +123,7 @@
       "who": "default",
       "key": "spice-exec: UPDATE t SET i4 = i4 + 1 WHERE id = 1",
       "kind": "error",
-      "signature": "Spice rejected the statement: 400 Bad Request: Failed to execute query: External error: Expression not supported CAST(__spice_checked_add(CAST(i4 AS Int64), Int64(1)) AS Int32)",
+      "signature": "Spice rejected the statement: 400 Bad Request: Failed to execute query: External error: Expression not supported CAST(CAST(i4 AS Int64) + Int64(1) AS Int32)",
       "group": "write-back"
     },
     {
@@ -83,7 +131,7 @@
       "who": "default",
       "key": "spice-exec: UPDATE t SET i2 = i2 + 1 WHERE id = 1",
       "kind": "error",
-      "signature": "Spice rejected the statement: 400 Bad Request: Failed to execute query: External error: Expression not supported CAST(__spice_checked_add(CAST(i2 AS Int64), Int64(1)) AS Int16)",
+      "signature": "Spice rejected the statement: 400 Bad Request: Failed to execute query: External error: Expression not supported CAST(CAST(i2 AS Int64) + Int64(1) AS Int16)",
       "group": "write-back"
     },
     {

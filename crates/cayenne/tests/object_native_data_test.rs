@@ -47,9 +47,9 @@ use object_store::{
     CopyOptions, GetOptions, GetResult, ListResult, MultipartUpload, ObjectMeta, ObjectStore,
     ObjectStoreExt, PutMultipartOptions, PutOptions, PutPayload, PutResult, RenameOptions,
 };
-use object_store_occ::sim::Op;
-use object_store_occ::sim::fault::{Fault, FaultStore};
-use object_store_occ::sim::latency::{Delay, LatencyProfile, LatencyStore};
+use object_store_sim::Op;
+use object_store_sim::fault::{Fault, FaultStore};
+use object_store_sim::latency::{Delay, LatencyProfile, LatencyStore};
 
 const CATALOG: &str = "state/cayenne/v1/catalog";
 

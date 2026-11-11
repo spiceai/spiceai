@@ -51,7 +51,7 @@ limitations under the License.
 //! # Where each shape is implemented
 //!
 //! Every shape is implemented **per storage engine**, in the sibling
-//! `runtime-checkpoint-{duckdb,sqlite,postgres,turso}` crates — one crate per engine, so
+//! `runtime-checkpoint-{duckdb,sqlite,postgres}` crates — one crate per engine, so
 //! the stitch binary links only the engines it enables. Each of those crates bundles its
 //! stores behind `runtime_acceleration::sidecar::AcceleratorSidecar`, which the engine's
 //! accelerator returns from `DataAccelerator::sidecar`.

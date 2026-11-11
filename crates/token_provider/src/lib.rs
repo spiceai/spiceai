@@ -24,7 +24,10 @@ use tokio::sync::watch;
 
 pub mod gcp_service_account_token;
 pub mod github_app_token;
+pub mod google_metadata;
+pub mod jwt_signer;
 pub mod registry;
+pub mod workload_identity;
 
 // Ensure the aws-lc-rs crypto provider is installed for jsonwebtoken before the first JWT
 // operation. This is required because Cargo feature unification can activate both `aws_lc_rs`

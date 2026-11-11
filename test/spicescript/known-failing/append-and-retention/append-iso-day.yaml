@@ -19,6 +19,8 @@ variants:
   day-text-time-column:
     datasets:
       events: { time_column: day_text, time_format: ISO8601, time_partition_column: null, time_partition_format: null }
+  # The spicepod as written, with the prototype object-native Cayenne metastore.
+  object-native: object-native
 
 spicepod:
   version: v1

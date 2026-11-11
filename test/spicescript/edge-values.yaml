@@ -14,7 +14,8 @@ sources:
 variants:
   federated: {}
   cayenne: cayenne-file
-  duckdb: duckdb-file
+  # `cayenne` with the prototype object-native Cayenne metastore.
+  cayenne-object-native: cayenne-file-object-native
   sqlite: sqlite-file
   arrow: arrow
 

@@ -9,10 +9,10 @@ use object_store::{ObjectStore, ObjectStoreExt, PutOptions, PutPayload, path::Pa
 use object_store_occ::{
     Expected, LocalConditionalPut, conditional_put,
     headlog::{HeadLog, HeadLogConfig, Outcome, Poll, PreparedAttempt, Reader, Record, Writer},
-    sim::{
-        Op,
-        fault::{Fault, FaultStore},
-    },
+};
+use object_store_sim::{
+    Op,
+    fault::{Fault, FaultStore},
 };
 use prost::Message;
 use serde::Deserialize;

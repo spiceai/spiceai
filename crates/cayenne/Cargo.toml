@@ -63,7 +63,7 @@ serde_json = { workspace = true }
 snafu = { workspace = true }
 tokio = { workspace = true, features = ["rt-multi-thread", "fs"] }
 tracing = { workspace = true }
-turso-shared = { workspace = true }
+write-retry = { workspace = true }
 url = { workspace = true }
 util = { path = "../util", features = ["datafusion"] }
 uuid = { workspace = true, features = ["v7"] }
@@ -127,6 +127,7 @@ aws-sdk-credential-bridge = { path = "../aws-sdk-credential-bridge" }
 aws-sdk-sts = { workspace = true }
 # Steps the model's transactions traces for the object-native catalog's replay.
 cayenne-metastore-model = { path = "../cayenne-metastore-model" }
+object_store_sim = { path = "../object_store_sim" }
 duckdb-oracle = { path = "../duckdb-oracle" }
 # getrusage for the `wide_column_point_lookup` bench, and the allocators it can run under: the
 # two `spiced` can be built with (`snmalloc-rs` is its default).

@@ -3,8 +3,7 @@ description: >
   DataFusion's built-in functions (trims, hex, digests, regular expressions,
   ordered aggregates, windows ignoring NULLs, approximate and statistical
   aggregates, date parts) answer the same on every acceleration engine and
-  federated to PostgreSQL as DataFusion answers them locally, and reach DuckDB
-  and SQLite only in renderings those engines answer the same.
+  federated to PostgreSQL as DataFusion answers them locally, and reach SQLite only in renderings those engines answer the same.
 
 sources:
   src: { kind: postgres }
@@ -12,9 +11,11 @@ sources:
 variants:
   # DataFusion evaluates everything: the answer every other place must match.
   arrow: arrow
-  duckdb: duckdb
   sqlite: sqlite
   cayenne: cayenne-file
+  # `cayenne` with the prototype object-native Cayenne metastore.
+  cayenne-object-native: cayenne-file-object-native
+  cayenne-memory: cayenne-memory
   federated: {}
 
 spicepod:

@@ -727,6 +727,12 @@ async fn an_object_native_checkpoint_commits_its_position_with_its_data() -> Tes
             .any(|kind| *kind != "AdvanceSourcePosition"),
         "the position must commit with the data it covers, records: {records:?}"
     );
+    // The checkpoint's snapshot sequence protects the snapshot it wrote, and is
+    // part of the data the position covers.
+    assert!(
+        with_position[0].contains(&"SetGroup"),
+        "the position must commit with the checkpoint's snapshot sequence, records: {records:?}"
+    );
     assert_eq!(
         catalog
             .sidecar_value(&format!("spice_sys_applied_lsn/{NAME}"))

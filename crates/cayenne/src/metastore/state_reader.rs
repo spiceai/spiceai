@@ -25,7 +25,9 @@ limitations under the License.
 //! available at the paths the state records.
 
 use crate::{
-    catalog::{CatalogError, CatalogResult, MetadataCatalog, SnapshotSequenceCommit},
+    catalog::{
+        CatalogError, CatalogResult, MemTierDurableCommit, MetadataCatalog, SnapshotSequenceCommit,
+    },
     metadata::{
         ColdTierFile, CreateTableOptions, DeleteFile, DeletionType, IndexRunRecord, InlinedData,
         InlinedDataStats, InlinedDelete, PartitionMetadata, SnapshotFile, SnapshotFileStatistics,
@@ -156,13 +158,18 @@ impl MetadataCatalog for DatasetStateReader {
         Ok(())
     }
 
+    fn commits_source_positions(&self) -> bool {
+        // Read-only: it commits nothing, positions included.
+        false
+    }
+
     fn as_any(&self) -> &dyn std::any::Any {
         self
     }
 
     async fn commit_publications(
         &self,
-        _publications: &[crate::catalog::CatalogPublication],
+        _publications: &[crate::catalog::CatalogPublication<'_>],
     ) -> CatalogResult<()> {
         Err(invalid("the dataset state reader is read-only"))
     }
@@ -792,6 +799,24 @@ impl MetadataCatalog for DatasetStateReader {
     ) -> CatalogResult<()> {
         Err(invalid("the dataset state reader is read-only"))
     }
+    async fn remove_snapshot_files(
+        &self,
+        _table_id: &str,
+        _snapshot_id: &str,
+        _file_names: &[String],
+    ) -> CatalogResult<()> {
+        Err(invalid("the dataset state reader is read-only"))
+    }
+    async fn verify_existing_stored_data_files(&self, table_name: &str) -> CatalogResult<()> {
+        let table = self.get_table(table_name).await?;
+        crate::cayenne_catalog::verify_stored_data_files_in(
+            self,
+            &table,
+            table.vortex_config.memory_mode,
+            crate::metadata::SettingsChangeAction::KeepStored,
+        )
+        .await
+    }
     async fn clear_snapshot_files(&self, _table_id: &str) -> CatalogResult<()> {
         Err(invalid("the dataset state reader is read-only"))
     }
@@ -823,6 +848,9 @@ impl MetadataCatalog for DatasetStateReader {
         _index_key: &str,
         _run_name: &str,
     ) -> CatalogResult<()> {
+        Err(invalid("the dataset state reader is read-only"))
+    }
+    async fn commit_mem_tier_durable(&self, _commit: MemTierDurableCommit) -> CatalogResult<()> {
         Err(invalid("the dataset state reader is read-only"))
     }
     async fn add_inlined_data(&self, _data: InlinedData) -> CatalogResult<String> {

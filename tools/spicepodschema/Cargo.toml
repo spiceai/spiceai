@@ -10,10 +10,8 @@ version.workspace = true
 
 [dependencies]
 accelerator-cayenne = { path = "../../crates/accelerators/accelerator-cayenne" }
-accelerator-duckdb = { path = "../../crates/accelerators/accelerator-duckdb" }
 accelerator-postgres = { path = "../../crates/accelerators/accelerator-postgres" }
 accelerator-sqlite = { path = "../../crates/accelerators/accelerator-sqlite" }
-accelerator-turso = { path = "../../crates/accelerators/accelerator-turso" }
 data-connector-api = { path = "../../crates/data-connector-api" }
 schemars.workspace = true
 serde.workspace = true
@@ -25,11 +23,11 @@ spicepod = { path = "../../crates/spicepod", features = ["schemars"] }
 # Enable all data connector features for complete schema generation
 runtime = { path = "../../crates/runtime", features = [
     # All data connectors
+    "adbc",
     "databricks",
     "debezium",
     "delta_lake",
     "dremio",
-    "duckdb",
     "flightsql",
     "ftp",
     "imap",
@@ -48,7 +46,6 @@ runtime = { path = "../../crates/runtime", features = [
     "snowflake",
     "spark",
     "sqlite",
-    "turso",
     # Models for model source parameters
     "models",
 ] }

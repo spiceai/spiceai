@@ -11,7 +11,8 @@ sources:
 
 variants:
   cayenne: {}
-  duckdb: { datasets: { '*': { acceleration: { engine: duckdb } } } }
+  # The spicepod as written, with the prototype object-native Cayenne metastore.
+  object-native: object-native
 
 spicepod:
   version: v1

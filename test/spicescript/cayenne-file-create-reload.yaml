@@ -18,8 +18,12 @@ sources:
   lake: { kind: rustfs }
   slow-lake: { kind: rustfs, latency: 20ms }
 
+# The spicepod as written, the same with the prototype object-native Cayenne
+# metastore (`runtime.params.cayenne_vnext`) in place of SQLite, and with
+# object-native data in an S3-compatible state location.
 variants:
-  local: {}
+  as-written: federated
+  object-native: object-native
   object-native-data-rustfs: object-native-data-rustfs
   object-native-data-rustfs-latency: object-native-data-rustfs-latency
 

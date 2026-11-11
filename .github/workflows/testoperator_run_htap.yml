@@ -108,8 +108,12 @@ concurrency:
 
 jobs:
   run-htap:
+    environment: ci
     name: Run CH-BenCHmark
     runs-on: ${{ github.event.inputs.runner_type }}
+    permissions:
+      contents: read
+      id-token: write  # RustFS credentials
     # 30-minute HTAP window plus ready_wait (up to 30 min on cold SF1000), template
     # restore, analytical gate, and teardown. SF1000 jobs typically land around 65-90 min
     # at this duration, so 150 min keeps ~1h of headroom without silently eating a
@@ -176,12 +180,21 @@ jobs:
           fi
           grep -n 'cayenne_datalake_location:' "${SPICEPOD}"
 
+      - name: Get RustFS credentials
+        id: rustfs
+        uses: ./.github/actions/rustfs-credentials
+        with:
+          endpoint: ${{ vars.TEST_MINIO_ENDPOINT }}
+          duration-seconds: '9000'
+          export-env: 'false'
+
       - name: Install MinIO
         uses: ./.github/actions/setup-minio
         with:
-          minio_endpoint: ${{ secrets.TEST_MINIO_ENDPOINT }}
-          minio_access_key: ${{ secrets.TEST_MINIO_ACCESS_KEY }}
-          minio_secret_key: ${{ secrets.TEST_MINIO_SECRET_KEY }}
+          minio_endpoint: ${{ vars.TEST_MINIO_ENDPOINT }}
+          minio_access_key: ${{ steps.rustfs.outputs.access-key-id }}
+          minio_secret_key: ${{ steps.rustfs.outputs.secret-access-key }}
+          minio_session_token: ${{ steps.rustfs.outputs.session-token }}
 
       - name: Resolve the spiced source
         id: spiced_source
@@ -456,9 +469,10 @@ jobs:
           # MinIO credentials for spiced, mirroring testoperator_run_bench.yml. Consumed only by
           # configs that reference the local S3 (`${secrets:S3_ENDPOINT}` etc.) — e.g. the Cayenne
           # cold-object-store-tier chbench config; harmless/unused for every other HTAP config.
-          S3_ENDPOINT: ${{ secrets.TEST_MINIO_ENDPOINT }}
-          S3_KEY: ${{ secrets.TEST_MINIO_ACCESS_KEY }}
-          S3_SECRET: ${{ secrets.TEST_MINIO_SECRET_KEY }}
+          S3_ENDPOINT: ${{ vars.TEST_MINIO_ENDPOINT }}
+          S3_KEY: ${{ steps.rustfs.outputs.access-key-id }}
+          S3_SECRET: ${{ steps.rustfs.outputs.secret-access-key }}
+          S3_SESSION_TOKEN: ${{ steps.rustfs.outputs.session-token }}
 
       # Upload the under-load diagnostics dir
       - name: Upload HTAP diagnostics

@@ -83,10 +83,12 @@ steps:
         INSERT INTO events SELECT i, TIMESTAMPTZ '2100-01-01 00:00Z' + i * INTERVAL '1 second', i FROM generate_series(1, 1000) i;
   - start: {}
   - query: SELECT * FROM events
-  - assert-log: { contains: 'cdc_durability=memory' }
-    only: memory-durability
-  - assert-log: { contains: 'cdc_durability=file' }
-    only: file-durability
+  # The `events` line: the runtime's own Cayenne tables log `cdc_durability=file`
+  # in every variant.
+  - assert-log: { contains: 'cdc_durability=memory,.* table=events ' }
+    only: [memory-durability, object-native-memory-durability]
+  - assert-log: { contains: 'cdc_durability=file,.* table=events ' }
+    only: [file-durability, object-native-file-durability]
 
   # Appended, served, then killed before anything else happens.
   - source-exec: { src: "INSERT INTO events SELECT i, TIMESTAMPTZ '2100-01-01 00:00Z' + i * INTERVAL '1 second', i FROM generate_series(1001, 1500) i" }

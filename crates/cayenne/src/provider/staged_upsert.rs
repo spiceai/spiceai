@@ -304,7 +304,7 @@ pub struct PreparedTxnCommit {
 }
 
 impl PreparedTxnCommit {
-    pub(crate) fn catalog_publication(&self) -> Option<crate::catalog::CatalogPublication> {
+    pub(crate) fn catalog_publication(&self) -> Option<crate::catalog::CatalogPublication<'_>> {
         self.publish.catalog_publication().map(|mut publication| {
             if self.table.is_durable_write_back() {
                 publication.dirty_pk_bytes = self

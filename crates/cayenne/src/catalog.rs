@@ -240,6 +240,28 @@ pub enum CatalogError {
     ))]
     SettingsChangeRequiresRebuild { table_name: String, changes: String },
 
+    /// The data files of the table's current snapshot do not match the files the
+    /// metastore records for it (a file is missing, has a different size, or the
+    /// snapshot directory is gone), and the caller asked for such a table to be
+    /// rebuilt from the source ([`crate::metadata::SettingsChangeAction::Rebuild`]).
+    /// Worded as the cause clause the caller's message embeds.
+    #[snafu(display(
+        "the existing acceleration of dataset '{table_name}' does not match its Cayenne metastore ({damage})"
+    ))]
+    StoredDataFilesRequireRebuild { table_name: String, damage: String },
+
+    /// The data files of the table's current snapshot do not match the files the
+    /// metastore records for it, and the table cannot be rebuilt from the source
+    /// now, so serving it would answer queries with missing rows or fail them.
+    #[snafu(display(
+        "Failed to load table '{table_name}': its acceleration does not match its Cayenne metastore ({damage}), so it cannot be served. {remedy}"
+    ))]
+    StoredDataFilesDamaged {
+        table_name: String,
+        damage: String,
+        remedy: String,
+    },
+
     #[snafu(display(
         "Failed to load table {table_name}: the datalake location changed from '{stored}' to '{configured}' while published datalake files exist. Revert 'cayenne_datalake_location' to '{stored}', or delete the acceleration and re-register the dataset to publish to the new location."
     ))]
@@ -284,30 +306,54 @@ pub struct SnapshotSequenceCommit {
     pub sequence_number: i64,
 }
 
-/// One table's durable append publication. A slice is one atomic transaction.
-#[derive(Clone, Debug)]
-pub struct CatalogPublication {
-    /// Table whose state changes.
+/// The durable effects of one mem-tier seal or checkpoint.
+#[derive(Debug, Default)]
+pub struct MemTierDurableCommit {
+    /// Table receiving the mutation.
     pub table_id: String,
+    /// Delete-only vectors, without a reinsert stamp.
+    pub pure_delete_files: Vec<DeleteFile>,
+    /// Vectors whose keys are reinserted at `sequence_number`.
+    pub reinsert_delete_files: Vec<DeleteFile>,
+    /// Reinsert keys (used to gate the per-vector reinsert stamp).
+    pub insert_pk_bytes: Vec<Vec<u8>>,
+    /// Reserved shadow/reinsert sequence, above every tombstone sequence.
+    pub sequence_number: i64,
+    /// Protected snapshot registration for a data-bearing checkpoint.
+    pub snapshot_sequence: Option<SnapshotSequenceCommit>,
+    /// Unpublished seal shadow rows, stamped with `sequence_number`.
+    pub inline_data: Vec<InlinedData>,
+    /// Clear the superseded inline corpus AND its deletion markers.
+    pub clear_inlined: bool,
+}
+
+/// One table's durable append publication. A slice is one atomic transaction.
+///
+/// It borrows from the prepared write it publishes: a commit runs once per CDC
+/// batch, and the replaced keys alone are one entry per changed row.
+#[derive(Clone, Debug)]
+pub struct CatalogPublication<'a> {
+    /// Table whose state changes.
+    pub table_id: &'a str,
     /// Replacement files registered as a protected snapshot.
-    pub snapshot_id: String,
+    pub snapshot_id: &'a str,
     /// Visibility sequence of the protected snapshot.
     pub snapshot_sequence: i64,
     /// Sequence of replacement primary keys, if present.
     pub insert_sequence: Option<i64>,
     /// Durable deletion vectors.
-    pub delete_files: Vec<DeleteFile>,
+    pub delete_files: &'a [DeleteFile],
     /// Primary keys replaced by the publication.
-    pub insert_pk_bytes: Vec<Vec<u8>>,
+    pub insert_pk_bytes: &'a [Vec<u8>],
     /// Inline deletion marker committed with the replacement snapshot.
-    pub inline_tombstone: Option<InlinedDelete>,
+    pub inline_tombstone: Option<&'a InlinedDelete>,
     /// Existing inline deletion markers to activate.
-    pub pending_durable_flips: Vec<String>,
+    pub pending_durable_flips: &'a [String],
     /// Primary keys requiring federated write-back.
-    pub dirty_pk_bytes: Vec<Vec<u8>>,
+    pub dirty_pk_bytes: std::borrow::Cow<'a, [Vec<u8>]>,
     /// The protected snapshot's data files, named in the same commit that makes
     /// it live. Empty when the writer names them in a commit of its own.
-    pub files: Vec<SnapshotFile>,
+    pub files: &'a [SnapshotFile],
 }
 
 /// How the metastore changes of the current task commit.
@@ -586,7 +632,10 @@ pub trait MetadataCatalog: Send + Sync {
     fn as_any(&self) -> &dyn std::any::Any;
 
     /// Commit every table publication together, or leave all tables unchanged.
-    async fn commit_publications(&self, publications: &[CatalogPublication]) -> CatalogResult<()>;
+    async fn commit_publications(
+        &self,
+        publications: &[CatalogPublication<'_>],
+    ) -> CatalogResult<()>;
 
     /// Make every change accepted so far durable, before something that depends
     /// on it is acknowledged: a source position, a returned write. A catalog that
@@ -598,6 +647,15 @@ pub trait MetadataCatalog: Send + Sync {
     /// single dataset's acknowledgement depends on. Changes to other tables may
     /// stay pending. No default, as for [`Self::commit_pending`].
     async fn commit_pending_for(&self, table_id: &str) -> CatalogResult<()>;
+
+    /// Whether this catalog commits a dataset's source position in the same
+    /// record as the data it covers. When it does, a CDC write stages its
+    /// position with its changes, and a checkpoint records the position before
+    /// [`Self::commit_pending_for`], so the source is acknowledged only once both
+    /// are durable together. Otherwise the source's own checkpoint store saves
+    /// the position after the data commits. No default, as for
+    /// [`Self::commit_pending`].
+    fn commits_source_positions(&self) -> bool;
 
     /// Page undelivered write-back markers by sequence and primary key.
     async fn list_pending_write_back(
@@ -726,6 +784,10 @@ pub trait MetadataCatalog: Send + Sync {
         deleted_inlined_ids: Vec<String>,
         replaced_delete_file_ids: Vec<String>,
     ) -> CatalogResult<()>;
+
+    /// Atomically persist all metadata effects of one mem-tier seal or checkpoint.
+    /// Failure leaves the catalog unchanged; visibility publication remains the caller's job.
+    async fn commit_mem_tier_durable(&self, commit: MemTierDurableCommit) -> CatalogResult<()>;
 
     /// Get all active delete files for a table (across all virtual files).
     async fn get_table_delete_files(&self, table_id: &str) -> CatalogResult<Vec<DeleteFile>>;
@@ -1211,6 +1273,24 @@ pub trait MetadataCatalog: Send + Sync {
 
     /// Clear all manifest rows for a table.
     async fn clear_snapshot_files(&self, table_id: &str) -> CatalogResult<()>;
+
+    /// Drop the manifest rows of `file_names` (snapshot-relative file names) from
+    /// one snapshot's manifest, for files removed from the snapshot in place (for
+    /// example by file-based retention), so the manifest keeps naming only files
+    /// the snapshot still holds.
+    async fn remove_snapshot_files(
+        &self,
+        table_id: &str,
+        snapshot_id: &str,
+        file_names: &[String],
+    ) -> CatalogResult<()>;
+
+    /// Check, when reopening an existing table outside `create_table` (as
+    /// partition children are), that the data files its live snapshots record
+    /// are still on disk, with the non-rebuildable (`KeepStored`) handling:
+    /// a missing snapshot directory or a resized file is an error, and files
+    /// that are only missing are logged at WARN.
+    async fn verify_existing_stored_data_files(&self, table_name: &str) -> CatalogResult<()>;
 
     /// List every cold-tier file for a table (the cold scan's file source).
     /// Read under the scan's listing fence so the cold file set is captured

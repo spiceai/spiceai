@@ -43,8 +43,8 @@ use object_store::ObjectStore;
 use object_store::memory::InMemory;
 use object_store::path::Path;
 use object_store_occ::LocalConditionalPut;
-use object_store_occ::sim::Op;
-use object_store_occ::sim::fault::FaultStore;
+use object_store_sim::Op;
+use object_store_sim::fault::FaultStore;
 
 /// A `runtime.state.location` and the store the runtime builds for it.
 enum Location {

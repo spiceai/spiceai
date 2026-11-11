@@ -23,7 +23,9 @@ use super::{
     replay_state,
 };
 use crate::{
-    catalog::{CatalogError, CatalogResult, MetadataCatalog, SnapshotSequenceCommit},
+    catalog::{
+        CatalogError, CatalogResult, MemTierDurableCommit, MetadataCatalog, SnapshotSequenceCommit,
+    },
     metadata::{
         ColdTierFile, CreateTableOptions, DeleteFile, IndexRunRecord, InlinedData,
         InlinedDataStats, InlinedDelete, PartitionMetadata, SnapshotFile, SnapshotFileStatistics,
@@ -1310,7 +1312,7 @@ impl ObjectNativeCatalog {
     /// wait on each other.
     async fn commit_across(
         &self,
-        mut groups: Vec<(Arc<Domain>, Vec<crate::catalog::CatalogPublication>)>,
+        mut groups: Vec<(Arc<Domain>, Vec<crate::catalog::CatalogPublication<'_>>)>,
     ) -> CatalogResult<()> {
         groups.sort_by(|(a, _), (b, _)| a.folder.cmp(&b.folder));
         let mut reservations = Vec::with_capacity(groups.len());
@@ -1656,11 +1658,12 @@ impl MetadataCatalog for ObjectNativeCatalog {
 
     async fn commit_publications(
         &self,
-        publications: &[crate::catalog::CatalogPublication],
+        publications: &[crate::catalog::CatalogPublication<'_>],
     ) -> CatalogResult<()> {
-        let mut groups: Vec<(Arc<Domain>, Vec<crate::catalog::CatalogPublication>)> = Vec::new();
+        let mut groups: Vec<(Arc<Domain>, Vec<crate::catalog::CatalogPublication<'_>>)> =
+            Vec::new();
         for publication in publications {
-            let domain = self.for_table(&publication.table_id);
+            let domain = self.for_table(publication.table_id);
             match groups
                 .iter_mut()
                 .find(|(grouped, _)| Arc::ptr_eq(grouped, &domain))
@@ -1763,6 +1766,10 @@ impl MetadataCatalog for ObjectNativeCatalog {
 
     async fn commit_pending_for(&self, table_id: &str) -> CatalogResult<()> {
         self.for_table(table_id).commit_pending_for(table_id).await
+    }
+
+    fn commits_source_positions(&self) -> bool {
+        true
     }
     async fn list_pending_write_back(
         &self,
@@ -2225,6 +2232,21 @@ impl MetadataCatalog for ObjectNativeCatalog {
             .clear_snapshot_files_except(table_id, snapshot_id)
             .await
     }
+    async fn remove_snapshot_files(
+        &self,
+        table_id: &str,
+        snapshot_id: &str,
+        file_names: &[String],
+    ) -> CatalogResult<()> {
+        self.for_table(table_id)
+            .remove_snapshot_files(table_id, snapshot_id, file_names)
+            .await
+    }
+    async fn verify_existing_stored_data_files(&self, table_name: &str) -> CatalogResult<()> {
+        self.for_name(table_name)
+            .verify_existing_stored_data_files(table_name)
+            .await
+    }
     async fn clear_snapshot_files(&self, table_id: &str) -> CatalogResult<()> {
         self.for_table(table_id)
             .clear_snapshot_files(table_id)
@@ -2302,6 +2324,11 @@ impl MetadataCatalog for ObjectNativeCatalog {
                 insert_sequence,
                 snapshot_sequence,
             )
+            .await
+    }
+    async fn commit_mem_tier_durable(&self, commit: MemTierDurableCommit) -> CatalogResult<()> {
+        self.for_table(&commit.table_id)
+            .commit_mem_tier_durable(commit)
             .await
     }
     async fn add_inlined_delete(&self, delete: InlinedDelete) -> CatalogResult<String> {

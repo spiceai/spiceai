@@ -95,6 +95,18 @@ impl Model {
         if !devices.is_empty() {
             if devices.len() > 1 {
                 raw_params.split_mode = sys::llama_split_mode_LLAMA_SPLIT_MODE_TENSOR;
+                // The node that serves a split model reads every weight to send each device its
+                // share. By default llama.cpp maps the files for that, as its RPC devices report
+                // that they load from a mapping, so the page cache fills with the whole model,
+                // more than this node's share. A GPU that shares the system's memory, such as
+                // DGX Spark's GB10, allocates its share out of what that leaves: the load
+                // thrashes, and that GPU then decodes slower than the other nodes', whose shares
+                // arrived over the network. Direct I/O reads each weight into its buffer without
+                // the page cache. llama.cpp reads directly only on Linux, and elsewhere would
+                // read the files without mapping them, so other platforms keep its default.
+                if cfg!(target_os = "linux") {
+                    raw_params.load_mode = sys::llama_load_mode_LLAMA_LOAD_MODE_DIRECT_IO;
+                }
             }
             devices.push(std::ptr::null_mut());
             raw_params.devices = devices.as_mut_ptr();

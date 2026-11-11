@@ -336,7 +336,7 @@ impl FixtureDataStore {
                 "",
             ),
             "fault" => ObjectNativeLocation::new(
-                Arc::new(object_store_occ::sim::fault::FaultStore::new(Arc::new(
+                Arc::new(object_store_sim::fault::FaultStore::new(Arc::new(
                     object_store::memory::InMemory::new(),
                 ))),
                 "cayenne-test",

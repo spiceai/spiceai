@@ -24,6 +24,7 @@ concurrency:
 
 jobs:
   test-macos-toolchain-script:
+    environment: secret-free
     name: Unit tests for macos_toolchain.sh
     # The script is bash over a fake Homebrew prefix, so it needs no macOS to
     # test; a Linux runner is both cheaper and not part of the pool the script

@@ -555,9 +555,7 @@ pub enum Error {
     #[snafu(display("Caching refresh mode only supports 'time_interval' for snapshots_trigger"))]
     UnsupportedSnapshotTriggerForCaching,
 
-    #[snafu(display(
-        "Invalid snapshot configuration: Only DuckDB, Turso and SQlite support snapshots"
-    ))]
+    #[snafu(display("Invalid snapshot configuration: Only DuckDB and SQlite support snapshots"))]
     UnsupportedAccelerationEngineForSnapshots,
 
     #[snafu(display(
@@ -570,7 +568,7 @@ pub enum Error {
 
     #[snafu(display(
         "refresh_mode: snapshot requires a snapshot-capable file-based engine \
-         (DuckDB, SQLite, Cayenne, or Turso); engine '{engine}' is not supported."
+         (Cayenne or SQLite); engine '{engine}' is not supported."
     ))]
     SnapshotRefreshModeUnsupportedEngine { engine: String },
 
@@ -801,16 +799,16 @@ async fn read_one_row(
     Ok(())
 }
 
-/// The line an operator reads when an acceleration is rebuilt for changed settings.
-/// `cause` is the engine's account of the settings its stored table cannot adopt, worded
-/// as a clause.
+/// The line an operator reads when an acceleration is rebuilt: for changed settings its
+/// stored table cannot adopt, or for stored data that no longer matches the engine's
+/// metadata. `cause` is the engine's account of why, worded as a clause.
 fn acceleration_rebuilt_message(cause: &str) -> String {
     let mut chars = cause.chars();
     let cause: String = chars
         .next()
         .map(|first| first.to_uppercase().chain(chars).collect())
         .unwrap_or_default();
-    format!("{cause}, so it is dropped and reloaded from the source with the new settings.")
+    format!("{cause}, so it is dropped and reloaded from the source.")
 }
 
 /// Validates that the acceleration engine is supported in distributed mode.
@@ -842,12 +840,8 @@ fn validate_distributed_engine(
 /// Returns `None` for engines that don't support file-based snapshots (e.g. Arrow, `PostgreSQL`).
 pub(crate) fn engine_to_acceleration_engine(engine: Engine) -> Option<AccelerationEngine> {
     match engine {
-        #[cfg(feature = "duckdb")]
-        Engine::DuckDB => Some(AccelerationEngine::DuckDB),
         #[cfg(feature = "sqlite")]
         Engine::Sqlite => Some(AccelerationEngine::Sqlite),
-        #[cfg(feature = "turso")]
-        Engine::Turso => Some(AccelerationEngine::Turso),
         Engine::Cayenne => Some(AccelerationEngine::Cayenne),
         _ => None,
     }
@@ -1557,6 +1551,9 @@ pub struct DataFusion {
     // Cayenne acceleration is configured and dedicated thread pools are enabled; compaction
     // executes against it so its memory is accounted separately and cannot starve queries.
     compaction_runtime_env: Option<Arc<RuntimeEnv>>,
+    // The session context internal tables (`runtime.task_history`, `runtime.metrics`)
+    // are created with, built on first use by `internal_table_context`.
+    internal_table_ctx: OnceLock<Arc<SessionContext>>,
     // Size in bytes of the carved compaction memory pool, retained for the
     // startup confirmation log + the `cayenne_compaction_memory_pool_bytes` gauge.
     compaction_memory_bytes: Option<u64>,
@@ -1586,6 +1583,8 @@ pub struct DataFusion {
 
     pub temp_directory: Option<String>,
     pub cluster_config: Arc<ResolvedClusterConfig>,
+    /// The `--role` this runtime started with.
+    role: crate::config::Role,
     pub scheduler_server: RwLock<Option<Arc<SchedulerServer<LogicalPlanNode, PhysicalPlanNode>>>>,
     pub executor: RwLock<Option<Arc<Executor>>>,
     /// Registry of connected executor control streams for `PollNow` broadcasts.
@@ -2209,6 +2208,12 @@ impl DataFusion {
         Ok(())
     }
 
+    /// The `--role` this runtime started with.
+    #[must_use]
+    pub fn role(&self) -> crate::config::Role {
+        self.role
+    }
+
     /// Returns true if the catalog allows DDL operations (CREATE TABLE, DROP TABLE, etc.).
     #[must_use]
     pub fn is_catalog_ddl_enabled(&self, catalog_name: &str) -> bool {
@@ -2613,6 +2618,28 @@ impl DataFusion {
         );
     }
 
+    /// The session context internal tables (`runtime.task_history`, `runtime.metrics`)
+    /// are created with: the query context's state over a runtime environment that
+    /// shares its object stores, caches and disk manager but has a memory pool of its
+    /// own. What an internal table holds resident, such as Cayenne's primary-key
+    /// keyset, is charged there rather than to `runtime.query.memory_limit`, so the
+    /// runtime's own bookkeeping never takes memory from user queries. Queries that
+    /// read these tables still run under the query pool.
+    pub fn internal_table_context(&self) -> Arc<SessionContext> {
+        Arc::clone(self.internal_table_ctx.get_or_init(|| {
+            let mut runtime_env = (*self.ctx.runtime_env()).clone();
+            runtime_env.memory_pool =
+                crate::internal_table::internal_table_memory_pool(self.total_memory);
+            let state =
+                datafusion::execution::session_state::SessionStateBuilder::new_from_existing(
+                    self.ctx.state(),
+                )
+                .with_runtime_env(Arc::new(runtime_env))
+                .build();
+            Arc::new(SessionContext::new_with_state(state))
+        }))
+    }
+
     /// Set the dedicated compaction runtime for background Cayenne compaction
     /// (size-tiered protected-snapshot merge + full snapshot rewrite).
     ///
@@ -2708,7 +2735,6 @@ impl DataFusion {
                         total_memory,
                         pool_used,
                         compaction_used,
-                        runtime_acceleration::memory_budget::duckdb_total_reservation_bytes(),
                     )
                     .min(ceiling);
                     cayenne::update_global_mem_tier_total(dynamic);
@@ -2914,6 +2940,19 @@ impl DataFusion {
             .update_dataset(&dataset.name, status::ComponentStatus::Ready);
 
         Ok(())
+    }
+
+    /// Whether `dataset_name` is registered with its loaded provider: registered,
+    /// and not a placeholder still awaiting its first-reference initialization
+    /// (which stays registered when that initialization fails).
+    pub async fn serves_loaded_dataset(&self, dataset_name: &TableReference) -> bool {
+        self.table_exists(dataset_name)
+            && (!self.has_pending_initializations()
+                || !self
+                    .pending_initializations
+                    .read()
+                    .await
+                    .contains_key(dataset_name))
     }
 
     /// Steady-state hot-path probe: returns `true` iff at least one
@@ -4073,8 +4112,8 @@ impl DataFusion {
         // planning, projection indices, and federation) continues to see only
         // the original columns. This is a breaking change: existing caching
         // accelerator storage from earlier Spice versions does not have the
-        // column and must be deleted (e.g. remove the duckdb_file or drop the
-        // SQLite/Postgres/Cayenne backing table) before upgrading.
+        // column and must be deleted (e.g. drop the SQLite/Postgres/Cayenne
+        // backing table) before upgrading.
         let storage_schema = if matches!(refresh_mode, RefreshMode::Caching) {
             Arc::new(
                 crate::accelerated::caching::extend_schema_with_cache_namespace(
@@ -4283,10 +4322,13 @@ impl DataFusion {
         }
 
         // we must not fetch data older than the explicitly set refresh data window or retention period
-        let refresh_data_window = dataset.refresh_data_window().or(dataset.retention_period());
+        let explicit_refresh_data_window = dataset.refresh_data_window();
+        let refresh_data_window = explicit_refresh_data_window.or(dataset.retention_period());
 
         if let Some(refresh_data_window) = refresh_data_window {
-            refresh = refresh.period(refresh_data_window);
+            refresh = refresh
+                .period(refresh_data_window)
+                .period_keeps_null_time(explicit_refresh_data_window.is_none());
         }
         refresh
             .validate_time_format(&dataset.name.to_string(), &refresh_schema)
@@ -4451,6 +4493,20 @@ impl DataFusion {
                     });
                 }
             }
+        } else if let Some(delete_expr) = retention_delete_expr.as_ref()
+            && let Err(err) = crate::accelerated::ensure_no_fallible_implicit_cast(
+                delete_expr,
+                &source_table_provider.schema(),
+            )
+        {
+            // Without a source fallback nothing reads evicted rows back, so this
+            // is not refused. The retention pass will still fail on every row
+            // the cast cannot convert, so say so once here instead of leaving
+            // only the per-pass retention errors.
+            tracing::warn!(
+                "Dataset {}: `retention_sql` will fail when retention runs on rows it cannot convert: {err}",
+                dataset.name
+            );
         }
 
         accelerated_table_builder.retention(retention);
@@ -4924,7 +4980,7 @@ impl DataFusion {
 
         let needs_dict_normalization = matches!(
             acceleration_settings.engine.to_unpartitioned(),
-            Engine::DuckDB | Engine::Sqlite | Engine::Turso
+            Engine::Sqlite
         );
         let normalized_refresh_schema = if needs_dict_normalization
             && arrow_tools::schema::has_dictionary_types(refresh_schema)
@@ -5136,7 +5192,7 @@ impl DataFusion {
                             dataset = %dataset.name,
                             "Schema change detected that cannot be evolved under `on_schema_change: {policy}`: {reason}.{fallback}",
                             fallback = if policy_recreates_on_incompatible(policy) {
-                                " `drop_and_recreate` recreates the table only with `refresh_mode: full` on a supported engine (DuckDB, SQLite, Turso, Cayenne); the new schema is not applied. Use `refresh_mode: full`, or revert the source schema change, to recover"
+                                " `drop_and_recreate` recreates the table only with `refresh_mode: full` on a supported engine (DuckDB, SQLite, Cayenne); the new schema is not applied. Use `refresh_mode: full`, or revert the source schema change, to recover"
                             } else {
                                 " The new schema is not applied; revert the source schema change to recover"
                             },
@@ -6835,21 +6891,6 @@ impl DataFusion {
             builder.refresh_semaphore(Arc::clone(semaphore));
         }
 
-        // Wrap the DuckDB accelerator with HNSW vector indexes (if applicable).
-        // This mirrors the dataset path in `EmbeddingConnector::on_accelerator_setup`.
-        #[cfg(feature = "duckdb")]
-        {
-            crate::embeddings::connector::try_wrap_view_accelerator_with_hnsw(
-                view,
-                table,
-                &mut builder,
-            )
-            .await
-            .map_err(|e| Error::UnableToCreateView {
-                reason: format!("Failed to create HNSW vector indexes for view: {e}"),
-            })?;
-        }
-
         let accelerated_table =
             builder
                 .build()
@@ -7748,12 +7789,8 @@ async fn build_snapshot_creation_config(
     };
 
     let acceleration_engine = match acceleration_settings.engine {
-        #[cfg(feature = "duckdb")]
-        Engine::DuckDB => AccelerationEngine::DuckDB,
         #[cfg(feature = "sqlite")]
         Engine::Sqlite => AccelerationEngine::Sqlite,
-        #[cfg(feature = "turso")]
-        Engine::Turso => AccelerationEngine::Turso,
         Engine::Cayenne => AccelerationEngine::Cayenne,
         _ => {
             // This code is unreachable since build_snapshot_creation_config is
@@ -7993,7 +8030,7 @@ mod tests {
         let cause = "the existing acceleration of dataset 'trips' was built with settings it cannot adopt in place (`primary_key`: none -> ['id'])";
         assert_eq!(
             acceleration_rebuilt_message(cause),
-            "The existing acceleration of dataset 'trips' was built with settings it cannot adopt in place (`primary_key`: none -> ['id']), so it is dropped and reloaded from the source with the new settings."
+            "The existing acceleration of dataset 'trips' was built with settings it cannot adopt in place (`primary_key`: none -> ['id']), so it is dropped and reloaded from the source."
         );
         let checkpoint = Error::AccelerationRebuildCheckpoint {
             dataset_name: "trips".to_string(),
@@ -8645,7 +8682,7 @@ mod tests {
         }
     }
 
-    #[cfg(all(feature = "duckdb", feature = "snapshots",))]
+    #[cfg(all(feature = "sqlite", feature = "snapshots"))]
     mod build_snapshot_creation_config_tests {
         use super::*;
         use crate::component::dataset::Dataset;
@@ -8727,7 +8764,7 @@ mod tests {
             let dataset = create_test_dataset(None).await;
             let acceleration = create_acceleration_with_trigger(
                 None,
-                Engine::DuckDB,
+                Engine::Sqlite,
                 None,
                 None,
                 &dataset.runtime().secrets(),
@@ -8806,7 +8843,7 @@ mod tests {
             let dataset = create_test_dataset(None).await;
             let acceleration = create_acceleration_with_trigger(
                 Some("file:///tmp".to_string()),
-                Engine::DuckDB,
+                Engine::Sqlite,
                 Some(SnapshotsTrigger::RefreshComplete),
                 None,
                 &dataset.runtime().secrets(),
@@ -8834,7 +8871,7 @@ mod tests {
             let dataset = create_test_dataset(None).await;
             let acceleration = create_acceleration_with_trigger(
                 Some("file:///tmp".to_string()),
-                Engine::DuckDB,
+                Engine::Sqlite,
                 Some(SnapshotsTrigger::StreamBatches),
                 Some("not-a-valid-batch-count".to_string()),
                 &dataset.runtime().secrets(),
@@ -8864,7 +8901,7 @@ mod tests {
             let dataset = create_test_dataset(None).await;
             let acceleration = create_acceleration_with_trigger(
                 Some("file:///tmp".to_string()),
-                Engine::DuckDB,
+                Engine::Sqlite,
                 Some(SnapshotsTrigger::StreamBatches),
                 Some("25".to_string()),
                 &dataset.runtime().secrets(),
@@ -8902,7 +8939,7 @@ mod tests {
             let dataset = create_test_dataset(None).await;
             let acceleration = create_acceleration_with_trigger(
                 Some("file:///tmp".to_string()),
-                Engine::DuckDB,
+                Engine::Sqlite,
                 Some(SnapshotsTrigger::StreamBatches),
                 Some("25".to_string()),
                 &dataset.runtime().secrets(),
@@ -8940,7 +8977,7 @@ mod tests {
             let dataset = create_test_dataset(None).await;
             let acceleration = create_acceleration_with_trigger(
                 Some("file:///tmp".to_string()),
-                Engine::DuckDB,
+                Engine::Sqlite,
                 Some(SnapshotsTrigger::StreamBatches),
                 None,
                 &dataset.runtime().secrets(),
@@ -8973,7 +9010,7 @@ mod tests {
             let dataset = create_test_dataset(Some("created_at".to_string())).await;
             let acceleration = create_acceleration_with_trigger(
                 Some("file:///tmp".to_string()),
-                Engine::DuckDB,
+                Engine::Sqlite,
                 Some(SnapshotsTrigger::StreamBatches),
                 None,
                 &dataset.runtime().secrets(),
@@ -9006,7 +9043,7 @@ mod tests {
             let dataset = create_test_dataset(None).await;
             let acceleration = create_acceleration_with_trigger(
                 Some("file:///tmp".to_string()),
-                Engine::DuckDB,
+                Engine::Sqlite,
                 Some(SnapshotsTrigger::StreamBatches),
                 None,
                 &dataset.runtime().secrets(),
@@ -9039,7 +9076,7 @@ mod tests {
             let dataset = create_test_dataset(None).await;
             let acceleration = create_acceleration_with_trigger(
                 None,
-                Engine::DuckDB,
+                Engine::Sqlite,
                 Some(SnapshotsTrigger::StreamBatches),
                 Some("-10".to_string()),
                 &dataset.runtime().secrets(),
@@ -9068,7 +9105,7 @@ mod tests {
             let dataset = create_test_dataset(None).await;
             let acceleration = create_acceleration_with_trigger(
                 None,
-                Engine::DuckDB,
+                Engine::Sqlite,
                 Some(SnapshotsTrigger::StreamBatches),
                 Some("0".to_string()),
                 &dataset.runtime().secrets(),
@@ -9097,7 +9134,7 @@ mod tests {
             let dataset = create_test_dataset(Some("ts".to_string())).await;
             let acceleration = create_acceleration_with_trigger(
                 None,
-                Engine::DuckDB,
+                Engine::Sqlite,
                 Some(SnapshotsTrigger::TimeInterval),
                 Some(String::new()),
                 &dataset.runtime().secrets(),
@@ -9129,7 +9166,7 @@ mod tests {
             let dataset = create_test_dataset(None).await;
             let acceleration = create_acceleration_with_trigger(
                 None,
-                Engine::DuckDB,
+                Engine::Sqlite,
                 Some(SnapshotsTrigger::StreamBatches),
                 Some(String::new()),
                 &dataset.runtime().secrets(),
@@ -9159,9 +9196,9 @@ mod tests {
 
     mod validate_distributed_engine_tests {
         use super::super::*;
-        use crate::config::{ClusterConfig, ClusterRole};
+        use crate::config::{ClusterConfig, Role};
 
-        fn make_cluster_config(role: ClusterRole) -> ResolvedClusterConfig {
+        fn make_cluster_config(role: Role) -> ResolvedClusterConfig {
             let config = ClusterConfig {
                 role: Some(role),
                 allow_insecure_connections: true,
@@ -9178,47 +9215,28 @@ mod tests {
 
         #[test]
         fn arrow_allowed_in_distributed_mode() {
-            let config = make_cluster_config(ClusterRole::Scheduler);
+            let config = make_cluster_config(Role::Scheduler);
             validate_distributed_engine(&config, Engine::Arrow, "ds")
                 .expect("arrow engine should be allowed in distributed mode");
         }
 
         #[test]
         fn partitioned_arrow_allowed_in_distributed_mode() {
-            let config = make_cluster_config(ClusterRole::Scheduler);
+            let config = make_cluster_config(Role::Scheduler);
             validate_distributed_engine(&config, Engine::PartitionedArrow, "ds")
                 .expect("partitioned_arrow engine should be allowed in distributed mode");
         }
 
         #[test]
         fn cayenne_allowed_in_distributed_mode() {
-            let config = make_cluster_config(ClusterRole::Scheduler);
+            let config = make_cluster_config(Role::Scheduler);
             validate_distributed_engine(&config, Engine::Cayenne, "ds")
                 .expect("cayenne engine should be allowed in distributed mode");
         }
 
         #[test]
-        fn duckdb_rejected_in_distributed_mode() {
-            let config = make_cluster_config(ClusterRole::Scheduler);
-            let result = validate_distributed_engine(&config, Engine::DuckDB, "my_dataset");
-            assert!(
-                matches!(
-                    result,
-                    Err(Error::UnsupportedDistributedAccelerationEngine { .. })
-                ),
-                "Expected UnsupportedDistributedAccelerationEngine, got: {result:?}",
-            );
-            // The fix it names is the engine that stays: `arrow` is deprecated, and
-            // Cayenne partitions only in file mode.
-            assert_eq!(
-                result.expect_err("duckdb is rejected").to_string(),
-                "Failed to create an accelerated table for dataset my_dataset: the 'duckdb' engine is not supported for distributed acceleration. Use `engine: cayenne` instead, with `mode: file` to partition it with `partition_by`."
-            );
-        }
-
-        #[test]
         fn sqlite_rejected_in_distributed_mode() {
-            let config = make_cluster_config(ClusterRole::Executor);
+            let config = make_cluster_config(Role::Executor);
             let result = validate_distributed_engine(&config, Engine::Sqlite, "my_dataset");
             assert!(
                 matches!(
@@ -9227,25 +9245,18 @@ mod tests {
                 ),
                 "Expected UnsupportedDistributedAccelerationEngine, got: {result:?}",
             );
-        }
-
-        #[test]
-        fn postgresql_rejected_in_distributed_mode() {
-            let config = make_cluster_config(ClusterRole::Scheduler);
-            let result = validate_distributed_engine(&config, Engine::PostgreSQL, "my_dataset");
-            assert!(
-                matches!(
-                    result,
-                    Err(Error::UnsupportedDistributedAccelerationEngine { .. })
-                ),
-                "Expected UnsupportedDistributedAccelerationEngine, got: {result:?}",
+            // The fix it names is the engine that stays: Cayenne partitions only in
+            // file mode.
+            assert_eq!(
+                result.expect_err("sqlite is rejected").to_string(),
+                "Failed to create an accelerated table for dataset my_dataset: the 'sqlite' engine is not supported for distributed acceleration. Use `engine: cayenne` instead, with `mode: file` to partition it with `partition_by`."
             );
         }
 
         #[test]
-        fn turso_rejected_in_distributed_mode() {
-            let config = make_cluster_config(ClusterRole::Scheduler);
-            let result = validate_distributed_engine(&config, Engine::Turso, "my_dataset");
+        fn postgresql_rejected_in_distributed_mode() {
+            let config = make_cluster_config(Role::Scheduler);
+            let result = validate_distributed_engine(&config, Engine::PostgreSQL, "my_dataset");
             assert!(
                 matches!(
                     result,
@@ -9258,14 +9269,12 @@ mod tests {
         #[test]
         fn any_engine_allowed_in_non_distributed_mode() {
             let config = make_non_distributed_config();
-            validate_distributed_engine(&config, Engine::DuckDB, "ds")
+            validate_distributed_engine(&config, Engine::Sqlite, "ds")
                 .expect("duckdb should be allowed when not in distributed mode");
             validate_distributed_engine(&config, Engine::Sqlite, "ds")
                 .expect("sqlite should be allowed when not in distributed mode");
             validate_distributed_engine(&config, Engine::PostgreSQL, "ds")
                 .expect("postgresql should be allowed when not in distributed mode");
-            validate_distributed_engine(&config, Engine::Turso, "ds")
-                .expect("turso should be allowed when not in distributed mode");
             validate_distributed_engine(&config, Engine::Arrow, "ds")
                 .expect("arrow should be allowed when not in distributed mode");
             validate_distributed_engine(&config, Engine::Cayenne, "ds")

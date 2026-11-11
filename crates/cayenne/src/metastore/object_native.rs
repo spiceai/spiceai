@@ -13,14 +13,17 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-//! SQL-free catalog backed by a catalog-wide conditional-write head log.
+//! SQL-free catalog backed by conditional-write head logs: one for the name
+//! registry and one per dataset.
 
 use super::{
     actions,
     state_reader::{self, DatasetStateReader},
 };
 use crate::{
-    catalog::{CatalogError, CatalogResult, MetadataCatalog, SnapshotSequenceCommit},
+    catalog::{
+        CatalogError, CatalogResult, MemTierDurableCommit, MetadataCatalog, SnapshotSequenceCommit,
+    },
     metadata::{
         ColdTierFile, CreateTableOptions, DeleteFile, IndexRunRecord, InlinedData,
         InlinedDataStats, InlinedDelete, PartitionMetadata, SnapshotFile, SnapshotFileStatistics,
@@ -407,7 +410,7 @@ impl Domain {
     async fn prepare(
         &self,
         txn: &str,
-        publications: &[crate::catalog::CatalogPublication],
+        publications: &[crate::catalog::CatalogPublication<'_>],
     ) -> CatalogResult<Vec<String>> {
         let mut inner = self.inner.take_reserved().await;
         let mut batch = inner.publication_actions(publications)?;
@@ -1138,7 +1141,7 @@ impl Inner {
     /// The actions that publish `publications` in one record.
     fn publication_actions(
         &self,
-        publications: &[crate::catalog::CatalogPublication],
+        publications: &[crate::catalog::CatalogPublication<'_>],
     ) -> CatalogResult<Vec<Action>> {
         let mut batch = Vec::new();
         for publication in publications {
@@ -1152,23 +1155,23 @@ impl Inner {
                     ));
                 }
                 batch.push(actions::add_files(
-                    &publication.table_id,
-                    &publication.snapshot_id,
-                    &publication.files,
+                    publication.table_id,
+                    publication.snapshot_id,
+                    publication.files,
                     true,
                 ));
             }
             batch.extend(self.conflict_batch(
-                publication.delete_files.clone(),
-                &publication.table_id,
-                &publication.insert_pk_bytes,
+                publication.delete_files.to_vec(),
+                publication.table_id,
+                publication.insert_pk_bytes,
                 publication.insert_sequence,
                 Some(SnapshotSequenceCommit {
-                    snapshot_id: publication.snapshot_id.clone(),
+                    snapshot_id: publication.snapshot_id.to_string(),
                     sequence_number: publication.snapshot_sequence,
                 }),
             )?);
-            if let Some(tombstone) = &publication.inline_tombstone {
+            if let Some(tombstone) = publication.inline_tombstone {
                 batch.push(actions::inlined_delete(
                     tombstone,
                     &tombstone.inlined_id,
@@ -1177,15 +1180,15 @@ impl Inner {
             }
             if !publication.pending_durable_flips.is_empty() {
                 batch.push(actions::set_published(
-                    &publication.table_id,
+                    publication.table_id,
                     proto::Select::Listed,
-                    &publication.pending_durable_flips,
+                    publication.pending_durable_flips,
                     true,
                 ));
             }
             if !publication.dirty_pk_bytes.is_empty() {
                 batch.push(Action::new(Kind::MarkDirty(proto::AddKeys {
-                    table_id: publication.table_id.clone(),
+                    table_id: publication.table_id.to_string(),
                     keys: publication
                         .dirty_pk_bytes
                         .iter()
@@ -1244,9 +1247,13 @@ impl MetadataCatalog for Domain {
         self.inner.take().await.flush_table(table_id).await
     }
 
+    fn commits_source_positions(&self) -> bool {
+        true
+    }
+
     async fn commit_publications(
         &self,
-        publications: &[crate::catalog::CatalogPublication],
+        publications: &[crate::catalog::CatalogPublication<'_>],
     ) -> CatalogResult<()> {
         let mut inner = self.inner.take().await;
         let batch = inner.publication_actions(publications)?;
@@ -2116,6 +2123,51 @@ impl MetadataCatalog for Domain {
             )])
             .await
     }
+    async fn remove_snapshot_files(
+        &self,
+        table_id: &str,
+        snapshot_id: &str,
+        file_names: &[String],
+    ) -> CatalogResult<()> {
+        if file_names.is_empty() {
+            return Ok(());
+        }
+        // The log removes a snapshot's files by snapshot, so one record removes
+        // the snapshot's manifest and adds back the files it still holds.
+        let mut inner = self.inner.take().await;
+        let kept: Vec<proto::FileEntry> = inner
+            .table(table_id)?
+            .files
+            .iter()
+            .filter(|((snapshot, path), _)| snapshot == snapshot_id && !file_names.contains(path))
+            .map(|(_, file)| file.clone())
+            .collect();
+        let mut batch = vec![actions::remove_files(
+            table_id,
+            proto::Select::Listed,
+            &[snapshot_id.to_string()],
+        )];
+        if !kept.is_empty() {
+            batch.push(Action::new(Kind::AddFiles(proto::AddFiles {
+                table_id: table_id.to_string(),
+                snapshot_id: snapshot_id.to_string(),
+                files: kept,
+                upsert: false,
+            })));
+        }
+        inner.commit(batch).await
+    }
+    async fn verify_existing_stored_data_files(&self, table_name: &str) -> CatalogResult<()> {
+        let inner = self.read().await?;
+        let table = inner.reader.get_table(table_name).await?;
+        crate::cayenne_catalog::verify_stored_data_files_in(
+            &inner.reader,
+            &table,
+            table.vortex_config.memory_mode,
+            crate::metadata::SettingsChangeAction::KeepStored,
+        )
+        .await
+    }
     async fn clear_snapshot_files(&self, table_id: &str) -> CatalogResult<()> {
         self.inner
             .take()
@@ -2274,6 +2326,83 @@ impl MetadataCatalog for Domain {
             proto::Select::All,
             &[],
         ));
+        inner.commit(batch).await
+    }
+    /// One record holding the seal's or checkpoint's inline rows, delete files,
+    /// snapshot sequence and inline clear, in the order the SQLite metastore
+    /// applies them in one transaction.
+    async fn commit_mem_tier_durable(&self, commit: MemTierDurableCommit) -> CatalogResult<()> {
+        let MemTierDurableCommit {
+            table_id,
+            mut pure_delete_files,
+            mut reinsert_delete_files,
+            insert_pk_bytes,
+            sequence_number,
+            snapshot_sequence,
+            inline_data,
+            clear_inlined,
+        } = commit;
+        if !insert_pk_bytes.is_empty()
+            && !reinsert_delete_files
+                .iter()
+                .any(|f| f.deletion_type == crate::metadata::DeletionType::KeyBased)
+        {
+            return Err(invalid("reinsert keys require a key-based delete file"));
+        }
+        // Pure deletes stay delete-only; only the reinsert group is stamped.
+        let reinsert_sequence = (!insert_pk_bytes.is_empty()).then_some(sequence_number);
+        for file in &mut pure_delete_files {
+            file.reinsert_sequence = None;
+        }
+        for file in &mut reinsert_delete_files {
+            if reinsert_sequence.is_some_and(|sequence| sequence <= file.sequence_number) {
+                return Err(invalid("insert sequence must exceed delete sequence"));
+            }
+            file.reinsert_sequence = (file.deletion_type
+                == crate::metadata::DeletionType::KeyBased)
+                .then_some(reinsert_sequence)
+                .flatten();
+        }
+        pure_delete_files.append(&mut reinsert_delete_files);
+        if pure_delete_files.iter().any(|f| f.table_id != table_id)
+            || inline_data.iter().any(|d| d.table_id != table_id)
+        {
+            return Err(invalid(format!(
+                "Mem-tier commit rows must belong to table '{table_id}'"
+            )));
+        }
+        let mut inner = self.inner.take().await;
+        let mut batch: Vec<Action> = inline_data
+            .iter()
+            .map(|data| {
+                let id = if data.inlined_id.is_empty() {
+                    uuid::Uuid::now_v7().to_string()
+                } else {
+                    data.inlined_id.clone()
+                };
+                actions::add_inlined(&table_id, data, &id, sequence_number)
+            })
+            .collect();
+        let (_, deletes) = inner.delete_batch(&pure_delete_files)?;
+        batch.extend(deletes);
+        if let Some(snapshot) = snapshot_sequence {
+            batch.push(actions::set_group(
+                &table_id,
+                &snapshot.snapshot_id,
+                snapshot.sequence_number,
+            ));
+        }
+        if clear_inlined {
+            batch.push(actions::remove_inlined(&table_id, proto::Select::All, &[]));
+            batch.push(actions::remove_inlined_deletes(
+                &table_id,
+                proto::Select::All,
+                &[],
+            ));
+        }
+        if batch.is_empty() {
+            return Ok(());
+        }
         inner.commit(batch).await
     }
     async fn add_inlined_delete(&self, delete: InlinedDelete) -> CatalogResult<String> {
@@ -2801,7 +2930,25 @@ fn validate_uuid(name: &str, value: &str) -> CatalogResult<()> {
 }
 
 impl Inner {
+    /// Reopen an existing table under `options`, then check its live snapshots'
+    /// data files on disk, as the SQLite catalog does.
     async fn reopen_table(&mut self, options: &CreateTableOptions) -> CatalogResult<String> {
+        let table_id = self.reopen_table_settings(options).await?;
+        let table = self.reader.get_table(&options.table_name).await?;
+        crate::cayenne_catalog::verify_stored_data_files_in(
+            &self.reader,
+            &table,
+            options.vortex_config.memory_mode,
+            options.vortex_config.settings_change,
+        )
+        .await?;
+        Ok(table_id)
+    }
+
+    async fn reopen_table_settings(
+        &mut self,
+        options: &CreateTableOptions,
+    ) -> CatalogResult<String> {
         use crate::cayenne_catalog::{
             describe_setting_changes, enables_pk_conflict_detection, identity_setting_changes,
         };

@@ -3,10 +3,10 @@ description: >
   Postgres CDC converges to the source after inserts, updates, deletes, key
   changes and large transactions, across a clean restart and a kill: Cayenne
   under each deletion mode, with file CDC durability, and
-  partitioned on its key, and DuckDB. With object-native data, the datasets'
-  files are in the state location, and an instance that loses its directory
-  serves the same rows from the location while the source is down, then
-  resumes CDC once it is back.
+  partitioned on its key, and in memory. With object-native data, the
+  datasets' files are in the state location, and an instance that loses its
+  directory serves the same rows from the location while the source is down,
+  then resumes CDC once it is back.
 
 sources:
   src: { kind: postgres }
@@ -60,8 +60,15 @@ variants:
     datasets:
       orders: { acceleration: { partition_by: [{ bucket: 'bucket(4, o_id)' }] } }
       customers: { acceleration: { partition_by: [{ bucket: 'bucket(4, c_id)' }] } }
-  duckdb:
-    datasets: { '*': { acceleration: { engine: duckdb, mode: memory } } }
+  # `partitioned` with the flag: a partitioned table stays on the SQLite
+  # metastore, and keeps serving its rows across the kill and restart below.
+  partitioned-object-native:
+    spicepod: { runtime: { params: { cayenne_vnext: enabled } } }
+    datasets:
+      orders: { acceleration: { partition_by: [{ bucket: 'bucket(4, o_id)' }] } }
+      customers: { acceleration: { partition_by: [{ bucket: 'bucket(4, c_id)' }] } }
+  cayenne-memory:
+    datasets: { '*': { acceleration: { mode: memory } } }
   # Object-native data (#16131): data files in the state location, which an
   # instance that loses its directory serves again without the source.
   object-native-data-local: object-native-data-local

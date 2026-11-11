@@ -21,12 +21,10 @@ use std::sync::Arc;
 
 use cayenne::metastore::object_native::ObjectNativeCatalog;
 use object_store::{ObjectStore, memory::InMemory, path::Path};
-use object_store_occ::{
-    headlog::Reader,
-    sim::{
-        Op,
-        fault::{Fault, FaultStore},
-    },
+use object_store_occ::headlog::Reader;
+use object_store_sim::{
+    Op,
+    fault::{Fault, FaultStore},
 };
 
 fn is_head(path: &Path) -> bool {
@@ -1451,22 +1449,22 @@ mod data_path {
 }
 
 /// Publish snapshot `snapshot` of `table_id` as a protected snapshot at `sequence`.
-fn protected_snapshot(
-    table_id: &str,
-    snapshot: &str,
+fn protected_snapshot<'a>(
+    table_id: &'a str,
+    snapshot: &'a str,
     sequence: i64,
-) -> cayenne::catalog::CatalogPublication {
+) -> cayenne::catalog::CatalogPublication<'a> {
     cayenne::catalog::CatalogPublication {
-        table_id: table_id.to_string(),
-        snapshot_id: snapshot.to_string(),
+        table_id,
+        snapshot_id: snapshot,
         snapshot_sequence: sequence,
         insert_sequence: None,
-        delete_files: Vec::new(),
-        insert_pk_bytes: Vec::new(),
+        delete_files: &[],
+        insert_pk_bytes: &[],
         inline_tombstone: None,
-        pending_durable_flips: Vec::new(),
-        dirty_pk_bytes: Vec::new(),
-        files: Vec::new(),
+        pending_durable_flips: &[],
+        dirty_pk_bytes: std::borrow::Cow::Borrowed(&[]),
+        files: &[],
     }
 }
 

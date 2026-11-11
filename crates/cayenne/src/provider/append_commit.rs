@@ -21,7 +21,7 @@ use std::sync::atomic::Ordering;
 use std::time::Instant;
 
 use tokio::sync::OwnedMutexGuard;
-use turso_shared::{DEFAULT_CONCURRENT_WRITE_MAX_ATTEMPTS, retry_backoff_delay};
+use write_retry::{DEFAULT_CONCURRENT_WRITE_MAX_ATTEMPTS, retry_backoff_delay};
 
 use super::column_stats::ColumnStatsAccumulator;
 use super::context::CayenneContext;
@@ -183,10 +183,10 @@ impl PreparedResolvedAppend {
 /// Commit the publications' tables at the append's acknowledgement point.
 async fn commit_tables_at_acknowledgement(
     catalog: &dyn MetadataCatalog,
-    publications: &[crate::catalog::CatalogPublication],
+    publications: &[crate::catalog::CatalogPublication<'_>],
 ) -> crate::catalog::CatalogResult<()> {
     for publication in publications {
-        crate::catalog::commit_at_acknowledgement_for(catalog, &publication.table_id).await?;
+        crate::catalog::commit_at_acknowledgement_for(catalog, publication.table_id).await?;
     }
     Ok(())
 }

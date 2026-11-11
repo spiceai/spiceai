@@ -39,9 +39,9 @@ use super::{DOTENV, OPENAI_MODEL, WeatherArgs, XAI_MODEL, create, retry_transien
 use crate::{TEST_ARGS, init_tracing};
 
 /// The model that tests select by `model_name`.
-fn create_model(model_name: &str) -> Result<Arc<dyn Responses>, anyhow::Error> {
+async fn create_model(model_name: &str) -> Result<Arc<dyn Responses>, anyhow::Error> {
     match model_name {
-        "openai" => Ok(create::create_openai_responses(OPENAI_MODEL)),
+        "openai" => create::create_openai_responses(OPENAI_MODEL).await,
         "xai" => create::create_xai_responses(XAI_MODEL),
         _ => Err(anyhow::anyhow!("no Responses model is named {model_name}")),
     }
@@ -68,8 +68,9 @@ async fn run_test(
     }
 
     let label = format!("{test_name}/{model_name} (stream: {as_stream})");
-    let model =
-        create_model(model_name).unwrap_or_else(|e| panic!("{label}: failed to create model: {e}"));
+    let model = create_model(model_name)
+        .await
+        .unwrap_or_else(|e| panic!("{label}: failed to create model: {e}"));
     let mut req: CreateResponse =
         serde_json::from_value(req).unwrap_or_else(|e| panic!("{label}: invalid request: {e}"));
     tracing::info!("Running test {label} with {req:?}");

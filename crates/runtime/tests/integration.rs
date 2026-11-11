@@ -58,16 +58,6 @@ fn accelerator_crates_register_their_engines() {
         engines.iter().any(|engine| engine == "sqlite"),
         "the sqlite accelerator is not registered in this test binary; linked engines: {engines:?}"
     );
-    #[cfg(feature = "turso")]
-    assert!(
-        engines.iter().any(|engine| engine == "turso"),
-        "the turso accelerator is not registered in this test binary; linked engines: {engines:?}"
-    );
-    #[cfg(feature = "duckdb")]
-    assert!(
-        engines.iter().any(|engine| engine == "duckdb"),
-        "the duckdb accelerator is not registered in this test binary; linked engines: {engines:?}"
-    );
     assert!(
         engines.iter().any(|engine| engine == "cayenne"),
         "the cayenne accelerator is not registered in this test binary; linked engines: {engines:?}"
@@ -83,7 +73,6 @@ mod cache;
 mod catalog;
 mod cayenne;
 mod cayenne_catalog_ddl;
-#[cfg(feature = "duckdb")]
 mod clickbench;
 mod clickhouse;
 mod cluster;
@@ -94,32 +83,20 @@ mod cosmosdb;
 mod databricks_delta;
 #[cfg(all(feature = "delta_lake", feature = "databricks"))]
 mod databricks_delta_catalog;
-#[cfg(all(feature = "delta_lake", feature = "databricks"))]
-mod databricks_delta_catalog_m2m;
-#[cfg(all(feature = "delta_lake", feature = "databricks"))]
-mod databricks_delta_m2m;
 #[cfg(all(feature = "spark", feature = "databricks"))]
 mod databricks_spark;
 #[cfg(all(feature = "spark", feature = "databricks"))]
 mod databricks_spark_catalog;
-#[cfg(all(feature = "spark", feature = "databricks"))]
-mod databricks_spark_catalog_m2m;
-#[cfg(all(feature = "spark", feature = "databricks"))]
-mod databricks_spark_m2m;
 #[cfg(feature = "databricks")]
 mod databricks_sql_warehouse;
-#[cfg(feature = "databricks")]
-mod databricks_sql_warehouse_m2m;
-#[cfg(feature = "databricks")]
-mod databricks_sql_warehouse_permissions;
 mod dataset_availability;
 mod datasets_api;
 #[cfg(feature = "delta_lake")]
 mod delta_lake;
 mod docker;
-#[cfg(feature = "duckdb")]
+#[cfg(feature = "adbc")]
 mod duckdb;
-#[cfg(feature = "duckdb")]
+#[cfg(feature = "adbc")]
 mod ducklake;
 #[cfg(feature = "dynamodb")]
 pub mod dynamodb;
@@ -175,28 +152,24 @@ mod refresh_retry;
 mod refresh_sql;
 mod refresh_worker_panic;
 mod reload_start_time_only;
-#[cfg(all(feature = "duckdb", feature = "sqlite"))]
+#[cfg(feature = "sqlite")]
 mod result_correctness;
 mod results_cache;
 mod results_cache_warmup;
-#[cfg(all(unix, feature = "duckdb", feature = "postgres"))]
+#[cfg(all(unix, feature = "postgres"))]
 mod retention;
+mod rustfs;
 mod s3;
 mod s3_folder_marker;
 mod s3_location_pruning;
 mod s3_parquet_overwrite;
-#[cfg(any(
-    feature = "postgres",
-    feature = "duckdb",
-    feature = "sqlite",
-    feature = "turso"
-))]
+#[cfg(any(feature = "postgres", feature = "sqlite"))]
 mod schema_evolution;
 #[cfg(feature = "sharepoint")]
 mod sharepoint;
 #[cfg(feature = "snapshots")]
 mod snapshot_integration;
-#[cfg(all(feature = "snapshots", feature = "duckdb"))]
+#[cfg(feature = "snapshots")]
 mod snapshot_source;
 #[cfg(feature = "snowflake")]
 mod snowflake;
@@ -216,10 +189,10 @@ mod utils;
 mod view;
 
 mod management;
-// MySQL is required for the rehydration tests (source container); the
-// local-db verification covers whichever persistent engines are enabled.
 mod podswatcher;
-#[cfg(all(feature = "mysql", any(feature = "duckdb", feature = "sqlite")))]
+// MySQL is required for the rehydration tests (source container); they cover Cayenne,
+// and SQLite when that feature is enabled.
+#[cfg(feature = "mysql")]
 mod rehydration;
 mod shutdown;
 

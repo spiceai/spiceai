@@ -35,10 +35,10 @@ use object_store::{ObjectStore, ObjectStoreExt, PutMode, PutOptions, path::Path}
 use object_store_occ::{
     LocalConditionalPut,
     headlog::{HeadLog, HeadLogConfig, Outcome, PreparedAttempt, Reader, Writer},
-    sim::{
-        Op,
-        fault::{Fault, FaultStore},
-    },
+};
+use object_store_sim::{
+    Op,
+    fault::{Fault, FaultStore},
 };
 use serde::{Deserialize, Serialize};
 use std::{

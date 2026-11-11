@@ -27,8 +27,15 @@ on:
 
 jobs:
   run-schema:
+    # The service principal's federation policy trusts this environment's subject.
+    environment: ci
     name: Run schema tests
     runs-on: ${{ github.event.inputs.runner_type }}
+    permissions:
+      actions: write  # approves the held runs of its snapshot PR
+      contents: write  # pushes a snapshot branch
+      pull-requests: write  # and opens its PR
+      id-token: write  # RustFS credentials and Databricks access tokens
     timeout-minutes: 600
     services:
       mssql_tpch:
@@ -76,19 +83,29 @@ jobs:
           fi
           echo "Spicepod file found at ${{ steps.set_spicepod_path.outputs.SPICEPOD_PATH }}"
 
+      - name: Get RustFS credentials
+        id: rustfs
+        uses: ./.github/actions/rustfs-credentials
+        with:
+          endpoint: ${{ vars.TEST_MINIO_ENDPOINT }}
+          duration-seconds: '36000'
+          export-env: 'false'
+
       - name: Install MinIO
         uses: ./.github/actions/setup-minio
         with:
-          minio_endpoint: ${{ secrets.TEST_MINIO_ENDPOINT }}
-          minio_access_key: ${{ secrets.TEST_MINIO_ACCESS_KEY }}
-          minio_secret_key: ${{ secrets.TEST_MINIO_SECRET_KEY }}
+          minio_endpoint: ${{ vars.TEST_MINIO_ENDPOINT }}
+          minio_access_key: ${{ steps.rustfs.outputs.access-key-id }}
+          minio_secret_key: ${{ steps.rustfs.outputs.secret-access-key }}
+          minio_session_token: ${{ steps.rustfs.outputs.session-token }}
 
       - name: Build spicepod validator
         uses: ./.github/actions/build-spicepod-validator
         with:
-          minio_endpoint: ${{ secrets.TEST_MINIO_ENDPOINT }}
-          minio_access_key: ${{ secrets.TEST_MINIO_ACCESS_KEY }}
-          minio_secret_key: ${{ secrets.TEST_MINIO_SECRET_KEY }}
+          minio_endpoint: ${{ vars.TEST_MINIO_ENDPOINT }}
+          minio_access_key: ${{ steps.rustfs.outputs.access-key-id }}
+          minio_secret_key: ${{ steps.rustfs.outputs.secret-access-key }}
+          minio_session_token: ${{ steps.rustfs.outputs.session-token }}
 
       - name: Validate spicepod
         run: |
@@ -106,9 +123,10 @@ jobs:
       - name: Build Testoperator
         uses: ./.github/actions/build-testoperator
         with:
-          minio_endpoint: ${{ secrets.TEST_MINIO_ENDPOINT }}
-          minio_access_key: ${{ secrets.TEST_MINIO_ACCESS_KEY }}
-          minio_secret_key: ${{ secrets.TEST_MINIO_SECRET_KEY }}
+          minio_endpoint: ${{ vars.TEST_MINIO_ENDPOINT }}
+          minio_access_key: ${{ steps.rustfs.outputs.access-key-id }}
+          minio_secret_key: ${{ steps.rustfs.outputs.secret-access-key }}
+          minio_session_token: ${{ steps.rustfs.outputs.session-token }}
 
       - name: Install Oracle ODPI-C
         if: ${{ contains(github.event.inputs.spicepod_path, 'oracle') }}
@@ -153,6 +171,12 @@ jobs:
           docker logs minio
           exit 1
 
+      # duckdb: and ducklake: datasets load the installed DuckDB through ADBC, matching
+      # testoperator_run_bench.yml. Without it spiced never becomes ready.
+      - name: Install libduckdb
+        if: ${{ contains(github.event.inputs.spicepod_path, 'duckdb') || contains(github.event.inputs.spicepod_path, 'ducklake') }}
+        uses: ./.github/actions/setup-libduckdb
+
       # The dev runner image has python3 but no pip, which the bootstrap below needs.
       - name: Set up Python
         if: ${{ contains(github.event.inputs.spicepod_path, 'ducklake') }}
@@ -164,10 +188,11 @@ jobs:
         if: ${{ contains(github.event.inputs.spicepod_path, 'ducklake') }}
         run: |
           # DuckLake stamps its catalog with the version of the extension that wrote it, and spiced reads it
-          # with the DuckDB version the `duckdb` crate pins in Cargo.toml. A newer duckdb writes a catalog the
-          # runtime's extension rejects: "Only DuckLake versions 0.1, 0.2, 0.3-dev1 and 0.3 are supported".
-          duckdb_version=$(awk -F'"' '/^duckdb = "/ { print $2; exit }' Cargo.toml)
-          [ -n "$duckdb_version" ] || { echo 'could not read the duckdb version from Cargo.toml'; exit 1; }
+          # with the installed DuckDB, which setup-libduckdb takes from the newest release in
+          # test/duckdb_versions.json. A newer duckdb writes a catalog an older one rejects, so write it with
+          # that same release.
+          duckdb_version=$(jq -r '.versions[-1].version' test/duckdb_versions.json)
+          [ -n "$duckdb_version" ] || { echo 'could not read the duckdb version from test/duckdb_versions.json'; exit 1; }
           python3 -m pip install --upgrade "duckdb==$duckdb_version" minio
 
           python3 <<'PY'
@@ -261,6 +286,29 @@ jobs:
           MSSQL_SA_PASSWORD: S3cretP@ssw0rd
         run: bash .github/scripts/mssql_tpch_restore.sh "${{ job.services.mssql_tpch.id }}" tpch_sf1
 
+      # Short-lived AWS credentials, kept out of the job's environment and passed to the step below.
+      - name: Assume the Databricks Delta role
+        id: aws-databricks-delta
+        uses: aws-actions/configure-aws-credentials@e1253824e5c10ff9df46874f81ed3ec929e19cfd # v6.3.0
+        with:
+          role-to-assume: ${{ secrets.NEW_AWS_DATABRICKS_DELTA_ROLE_ARN }}
+          role-session-name: gha-databricks-delta-${{ github.run_id }}
+          role-duration-seconds: 36000
+          aws-region: us-east-1
+          output-env-credentials: false
+          output-credentials: true
+
+      - name: Assume the S3 and Glue role
+        id: aws-s3-athena
+        uses: aws-actions/configure-aws-credentials@e1253824e5c10ff9df46874f81ed3ec929e19cfd # v6.3.0
+        with:
+          role-to-assume: ${{ secrets.AWS_S3_ATHENA_ROLE_ARN }}
+          role-session-name: gha-s3-athena-${{ github.run_id }}
+          role-duration-seconds: 36000
+          aws-region: us-east-1
+          output-env-credentials: false
+          output-credentials: true
+
       - name: Run the schema test - ${{ github.event.inputs.spicepod_path }}
         run: |
           # A variable set to "" is not unset. `AWS_ENDPOINT_URL=""` is an endpoint
@@ -281,23 +329,27 @@ jobs:
             --ready-wait 120 \
             ${{ github.event.inputs.min_tables != '' && format('--min-tables {0}', github.event.inputs.min_tables) || '' }}
         env:
-          S3_ENDPOINT: ${{ secrets.TEST_MINIO_ENDPOINT }}
-          S3_KEY: ${{ secrets.TEST_MINIO_ACCESS_KEY }}
-          S3_SECRET: ${{ secrets.TEST_MINIO_SECRET_KEY }}
-          DATABRICKS_HOST: ${{ vars.DATABRICKS_HOST }}
-          DATABRICKS_TOKEN: ${{ secrets.DATABRICKS_TOKEN }}
-          DATABRICKS_ENDPOINT: ${{ vars.DATABRICKS_ENDPOINT }}
-          DATABRICKS_CLUSTER_ID: ${{ vars.DATABRICKS_CLUSTER_ID }}
-          DATABRICKS_SQL_WAREHOUSE_ID: ${{ vars.DATABRICKS_SQL_WAREHOUSE_ID }}
-          AWS_DATABRICKS_DELTA_ACCESS_KEY_ID: ${{ secrets.AWS_DATABRICKS_DELTA_ACCESS_KEY_ID }}
-          AWS_DATABRICKS_DELTA_SECRET_ACCESS_KEY: ${{ secrets.AWS_DATABRICKS_DELTA_SECRET_ACCESS_KEY }}
-          AWS_ACCESS_KEY_ID: ${{ contains(github.event.inputs.spicepod_path, 'ducklake') && 'minioadmin' || secrets.AWS_S3_ATHENA_ACCESS_KEY_ID }}
-          AWS_SECRET_ACCESS_KEY: ${{ contains(github.event.inputs.spicepod_path, 'ducklake') && 'minioadmin' || secrets.AWS_S3_ATHENA_SECRET_ACCESS_KEY }}
+          S3_ENDPOINT: ${{ vars.TEST_MINIO_ENDPOINT }}
+          S3_KEY: ${{ steps.rustfs.outputs.access-key-id }}
+          S3_SECRET: ${{ steps.rustfs.outputs.secret-access-key }}
+          S3_SESSION_TOKEN: ${{ steps.rustfs.outputs.session-token }}
+          DATABRICKS_HOST: ${{ vars.NEW_DATABRICKS_HOST }}
+          DATABRICKS_OIDC_CLIENT_ID: ${{ vars.DATABRICKS_OIDC_CLIENT_ID }}
+          DATABRICKS_OIDC_AUDIENCE: ${{ vars.DATABRICKS_OIDC_AUDIENCE }}
+          DATABRICKS_CLUSTER_ID: ${{ vars.NEW_DATABRICKS_CLUSTER_ID }}
+          AWS_DATABRICKS_DELTA_ACCESS_KEY_ID: ${{ steps.aws-databricks-delta.outputs.aws-access-key-id }}
+          AWS_DATABRICKS_DELTA_SECRET_ACCESS_KEY: ${{ steps.aws-databricks-delta.outputs.aws-secret-access-key }}
+          AWS_DATABRICKS_DELTA_SESSION_TOKEN: ${{ steps.aws-databricks-delta.outputs.aws-session-token }}
+          AWS_ACCESS_KEY_ID: ${{ contains(github.event.inputs.spicepod_path, 'ducklake') && 'minioadmin' || steps.aws-s3-athena.outputs.aws-access-key-id }}
+          AWS_SECRET_ACCESS_KEY: ${{ contains(github.event.inputs.spicepod_path, 'ducklake') && 'minioadmin' || steps.aws-s3-athena.outputs.aws-secret-access-key }}
+          # MinIO takes no session token. The negated form is needed: `a && '' || b` yields b.
+          AWS_SESSION_TOKEN: ${{ !contains(github.event.inputs.spicepod_path, 'ducklake') && steps.aws-s3-athena.outputs.aws-session-token || '' }}
           AWS_ENDPOINT_URL: ${{ contains(github.event.inputs.spicepod_path, 'ducklake') && 'http://127.0.0.1:9000' || '' }}
           AWS_ALLOW_HTTP: ${{ contains(github.event.inputs.spicepod_path, 'ducklake') && 'true' || '' }}
           DUCKLAKE_CONNECTION_STRING: ${{ contains(github.event.inputs.spicepod_path, 'ducklake') && 'postgres:dbname=ducklake_catalog host=localhost user=postgres password=postgres' || '' }}
-          GLUE_AWS_KEY: ${{ secrets.AWS_S3_ATHENA_ACCESS_KEY_ID }}
-          GLUE_AWS_SECRET: ${{ secrets.AWS_S3_ATHENA_SECRET_ACCESS_KEY }}
+          GLUE_AWS_KEY: ${{ steps.aws-s3-athena.outputs.aws-access-key-id }}
+          GLUE_AWS_SECRET: ${{ steps.aws-s3-athena.outputs.aws-secret-access-key }}
+          GLUE_AWS_SESSION_TOKEN: ${{ steps.aws-s3-athena.outputs.aws-session-token }}
           SNOWFLAKE_ACCOUNT: ${{ secrets.SNOWFLAKE_ACCOUNT }}
           SNOWFLAKE_PASSWORD: ${{ secrets.SNOWFLAKE_PASSWORD }}
           SNOWFLAKE_USERNAME: ${{ secrets.SNOWFLAKE_USERNAME }}
@@ -373,8 +425,18 @@ jobs:
           # (self-hosted) runner as well, so git uses the URL-embedded token only:
           # otherwise a helper (osxkeychain / git-credential-manager) can intercept
           # the push and block on an interactive credential prompt, hanging the job.
-          git -c credential.helper='' -c credential.interactive=false \
-            push "https://x-access-token:${GH_TOKEN}@github.com/${{ github.repository }}" "HEAD:${BRANCH_NAME}"
+          if ! push_log="$(git -c credential.helper='' -c credential.interactive=false \
+            push "https://x-access-token:${GH_TOKEN}@github.com/${{ github.repository }}" "HEAD:${BRANCH_NAME}" 2>&1)"; then
+            echo "${push_log}"
+            # A new branch from a release-branch commit is refused on every run
+            # (GitHub times out checking it for workflow changes); keep the
+            # snapshots as an artifact and say so.
+            printf '%s\n' "${push_log}" >"${RUNNER_TEMP}/snapshot-push.log"
+            bash .github/scripts/save_unpushable_snapshots.sh \
+              "${RUNNER_TEMP}/snapshot-push.log" "${BRANCH_NAME}" "${{ github.ref_name }}" || true
+            exit 1
+          fi
+          echo "${push_log}"
 
           PR_URL="$(gh pr list --head "${BRANCH_NAME}" --state open --json url --jq .[].url)"
           if [[ -n "${PR_URL}" ]]; then
@@ -398,3 +460,14 @@ jobs:
           # Never fall back to an interactive prompt; fail fast if auth is rejected.
           GIT_TERMINAL_PROMPT: '0'
           GCM_INTERACTIVE: 'never'
+
+      - name: Upload snapshots GitHub refused to push
+        # save_unpushable_snapshots.sh leaves the snapshot commit here when
+        # GitHub will not let GITHUB_TOKEN create the snapshot branch.
+        if: ${{ failure() }}
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
+        with:
+          name: unpushed-snapshots
+          path: ${{ runner.temp }}/unpushed-snapshots/
+          if-no-files-found: ignore
+          retention-days: 14

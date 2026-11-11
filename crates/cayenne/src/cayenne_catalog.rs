@@ -16,7 +16,9 @@ limitations under the License.
 
 //! Metadata catalog implementation for Cayenne.
 
-use super::catalog::{CatalogError, CatalogResult, MetadataCatalog, SnapshotSequenceCommit};
+use super::catalog::{
+    CatalogError, CatalogResult, MemTierDurableCommit, MetadataCatalog, SnapshotSequenceCommit,
+};
 use super::metadata::{
     ColdTierFile, CompressionStrategy, CreateTableOptions, DeleteFile, DeletionType,
     IndexRunRecord, InlinedData, InlinedDataStats, InlinedDelete, PartitionMetadata,
@@ -35,7 +37,7 @@ use std::collections::HashMap;
 use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
-use turso_shared::{
+use write_retry::{
     DEFAULT_CONCURRENT_WRITE_MAX_ATTEMPTS, is_retryable_write_conflict_message, retry_backoff_delay,
 };
 
@@ -99,6 +101,37 @@ fn ensure_reinsert_keys_have_key_based_delete_file(
         });
     }
 
+    Ok(())
+}
+
+/// Validate an on-conflict publication's delete files and stamp its key-based
+/// ones with the sequence its `reinsert_key_count` replaced keys are written at.
+fn stamp_on_conflict_delete_files(
+    table_id: &str,
+    delete_files: &mut [DeleteFile],
+    reinsert_key_count: usize,
+    insert_sequence: Option<i64>,
+) -> CatalogResult<()> {
+    let reinsert_sequence = insert_sequence.filter(|_| reinsert_key_count > 0);
+    ensure_reinsert_keys_have_key_based_delete_file(table_id, delete_files, reinsert_key_count)?;
+    for file in delete_files {
+        if file.table_id != table_id {
+            return Err(CatalogError::InvalidOperationNoSource {
+                message: "Deferred on-conflict payload spans multiple tables".to_string(),
+            });
+        }
+        if file.deletion_type == DeletionType::KeyBased {
+            file.reinsert_sequence = reinsert_sequence;
+        }
+        if reinsert_sequence.is_some_and(|sequence| sequence <= file.sequence_number) {
+            return Err(CatalogError::InvalidOperationNoSource {
+                message: format!(
+                    "Deferred upsert reinsert sequence must exceed delete sequence {}",
+                    file.sequence_number
+                ),
+            });
+        }
+    }
     Ok(())
 }
 
@@ -489,34 +522,38 @@ impl CayenneCatalog {
         snapshot_sequence: i64,
         insert_sequence: Option<i64>,
     ) -> CatalogResult<()> {
+        stamp_on_conflict_delete_files(
+            &payload.table_id,
+            &mut payload.delete_files,
+            payload.insert_pk_bytes.len(),
+            insert_sequence,
+        )?;
+        Self::write_on_conflict_rows_in_txn(
+            txn,
+            &payload.table_id,
+            &payload.delete_files,
+            payload.inline_tombstone.as_ref(),
+            &payload.pending_durable_flips,
+            target_snapshot_id,
+            snapshot_sequence,
+        )
+        .await
+    }
+
+    /// Write an on-conflict publication's rows, its delete files already
+    /// stamped by [`stamp_on_conflict_delete_files`].
+    async fn write_on_conflict_rows_in_txn(
+        txn: &mut dyn MetastoreTransaction,
+        table_id: &str,
+        delete_files: &[DeleteFile],
+        inline_tombstone: Option<&InlinedDelete>,
+        pending_durable_flips: &[String],
+        target_snapshot_id: &str,
+        snapshot_sequence: i64,
+    ) -> CatalogResult<()> {
         const MAX_PARAMS: usize = 32_000;
 
-        let table_id = payload.table_id.as_str();
-        let reinsert_sequence = insert_sequence.filter(|_| !payload.insert_pk_bytes.is_empty());
-        ensure_reinsert_keys_have_key_based_delete_file(
-            table_id,
-            &payload.delete_files,
-            payload.insert_pk_bytes.len(),
-        )?;
-        for file in &mut payload.delete_files {
-            if file.table_id != table_id {
-                return Err(CatalogError::InvalidOperationNoSource {
-                    message: "Deferred on-conflict payload spans multiple tables".to_string(),
-                });
-            }
-            if file.deletion_type == DeletionType::KeyBased {
-                file.reinsert_sequence = reinsert_sequence;
-            }
-            if reinsert_sequence.is_some_and(|sequence| sequence <= file.sequence_number) {
-                return Err(CatalogError::InvalidOperationNoSource {
-                    message: format!(
-                        "Deferred upsert reinsert sequence must exceed delete sequence {}",
-                        file.sequence_number
-                    ),
-                });
-            }
-        }
-        for chunk in payload.delete_files.chunks(MAX_PARAMS / 10) {
+        for chunk in delete_files.chunks(MAX_PARAMS / 10) {
             let (sql, params) = Self::build_insert_delete_files_chunk_sql(chunk);
             txn.execute(ExecuteParams { sql: &sql, params }).await?;
         }
@@ -529,7 +566,7 @@ impl CayenneCatalog {
             ],
         })
         .await?;
-        if let Some(tombstone) = &payload.inline_tombstone {
+        if let Some(tombstone) = inline_tombstone {
             txn.execute(ExecuteParams {
                 // An exact replay is a no-op, including an ambiguous-commit
                 // retry after the first transaction actually committed. A
@@ -548,7 +585,7 @@ impl CayenneCatalog {
             })
             .await?;
         }
-        for inlined_id in &payload.pending_durable_flips {
+        for inlined_id in pending_durable_flips {
             txn.execute(ExecuteParams {
                 sql: "UPDATE cayenne_inlined_delete SET published = 1 WHERE table_id = ?1 AND inlined_id = ?2",
                 params: vec![
@@ -1441,6 +1478,53 @@ impl CayenneCatalog {
         Ok(applied)
     }
 
+    /// Check that the data files the metastore records for `table`'s current
+    /// snapshot are on disk, as the metastore recorded them, before the table is
+    /// opened. A scan lists the snapshot directory, so a file removed or truncated
+    /// outside Spice would otherwise be served as missing rows, or fail every query
+    /// that reads it, with the table reported ready.
+    ///
+    /// What a mismatch does follows `options.vortex_config.settings_change`, the
+    /// same rule a settings change that the stored rows cannot adopt follows:
+    /// - [`SettingsChangeAction::Rebuild`] (a reload from the source restores every
+    ///   row): refuse the open with
+    ///   [`CatalogError::StoredDataFilesRequireRebuild`], so the caller drops the
+    ///   table and reloads it.
+    /// - [`SettingsChangeAction::HoldUntilSourceReadable`] (it would be rebuilt, but
+    ///   its source cannot be read yet): refuse the open with
+    ///   [`CatalogError::StoredDataFilesDamaged`], so it is not served short and the
+    ///   next load can rebuild it.
+    /// - [`SettingsChangeAction::KeepStored`] (the table can hold rows a reload would
+    ///   not bring back): a truncated or resized file, or a missing snapshot
+    ///   directory, refuses the open, since the stored rows cannot be read; files
+    ///   that are only missing are warned about and the rest served. The manifest
+    ///   is maintained best-effort beside the directory listing, so a missing file
+    ///   alone is not proof of damage for a table that cannot be rebuilt.
+    ///
+    /// Only local data directories are checked; S3 and `mode: memory` tables keep
+    /// their data elsewhere.
+    async fn verify_stored_data_files(
+        &self,
+        table: &TableMetadata,
+        options: &CreateTableOptions,
+    ) -> CatalogResult<()> {
+        self.verify_stored_data_files_with(
+            table,
+            options.vortex_config.memory_mode,
+            options.vortex_config.settings_change,
+        )
+        .await
+    }
+
+    async fn verify_stored_data_files_with(
+        &self,
+        table: &TableMetadata,
+        memory_mode: bool,
+        settings_change: SettingsChangeAction,
+    ) -> CatalogResult<()> {
+        verify_stored_data_files_in(self, table, memory_mode, settings_change).await
+    }
+
     async fn validate_existing_table_configuration(
         &self,
         table_name: &str,
@@ -2259,6 +2343,11 @@ impl MetadataCatalog for CayenneCatalog {
         Ok(())
     }
 
+    fn commits_source_positions(&self) -> bool {
+        // Positions are saved by the `SQLite` sidecar, after the data commits.
+        false
+    }
+
     fn as_any(&self) -> &dyn std::any::Any {
         self
     }
@@ -2334,49 +2423,57 @@ impl MetadataCatalog for CayenneCatalog {
     }
     async fn commit_publications(
         &self,
-        publications: &[crate::catalog::CatalogPublication],
+        publications: &[crate::catalog::CatalogPublication<'_>],
     ) -> CatalogResult<()> {
         if publications.is_empty() {
             return Ok(());
         }
         let mut txn = self.begin_transaction().await?;
         for publication in publications {
-            let mut payload = crate::provider::on_conflict::PreparedOnConflictDurablePayload {
-                table_id: publication.table_id.clone(),
-                delete_files: publication.delete_files.clone(),
-                insert_pk_bytes: publication.insert_pk_bytes.clone(),
-                inline_tombstone: publication.inline_tombstone.clone(),
-                pending_durable_flips: publication.pending_durable_flips.clone(),
-            };
             if !publication.files.is_empty()
                 && let Err(error) = self
                     .replace_snapshot_files_in_txn(
                         txn.as_mut(),
-                        &publication.table_id,
-                        &publication.snapshot_id,
-                        &publication.files,
+                        publication.table_id,
+                        publication.snapshot_id,
+                        publication.files,
                     )
                     .await
             {
                 let _ = txn.rollback().await;
                 return Err(error);
             }
-            if let Err(error) = Self::apply_prepared_on_conflict_payload_in_txn(
-                txn.as_mut(),
-                &mut payload,
-                &publication.snapshot_id,
-                publication.snapshot_sequence,
+            // Only the delete files are stamped, so only they are copied; the
+            // replaced keys, one per changed row, are only counted.
+            let mut delete_files = publication.delete_files.to_vec();
+            let applied = match stamp_on_conflict_delete_files(
+                publication.table_id,
+                &mut delete_files,
+                publication.insert_pk_bytes.len(),
                 publication.insert_sequence,
-            )
-            .await
-            {
+            ) {
+                Ok(()) => {
+                    Self::write_on_conflict_rows_in_txn(
+                        txn.as_mut(),
+                        publication.table_id,
+                        &delete_files,
+                        publication.inline_tombstone,
+                        publication.pending_durable_flips,
+                        publication.snapshot_id,
+                        publication.snapshot_sequence,
+                    )
+                    .await
+                }
+                Err(error) => Err(error),
+            };
+            if let Err(error) = applied {
                 let _ = txn.rollback().await;
                 return Err(error);
             }
             if let Err(error) = self
                 .mark_dirty_keys_in_txn(
                     txn.as_mut(),
-                    &publication.table_id,
+                    publication.table_id,
                     &publication.dirty_pk_bytes,
                     publication.snapshot_sequence,
                 )
@@ -2386,7 +2483,7 @@ impl MetadataCatalog for CayenneCatalog {
                 return Err(error);
             }
         }
-        crate::provider::append_commit::commit_transaction(txn, &publications[0].table_id).await
+        crate::provider::append_commit::commit_transaction(txn, publications[0].table_id).await
     }
 
     async fn init(&self) -> CatalogResult<()> {
@@ -2522,19 +2619,22 @@ impl MetadataCatalog for CayenneCatalog {
             .into_iter()
             .next();
 
-        if let Some(ref existing_id) = existing_table_id {
-            return match self
+        if existing_table_id.is_some() {
+            let stored_metadata = match self
                 .validate_existing_table_configuration(table_name.as_str(), &options)
                 .await
             {
-                Ok(stored_metadata) => Ok(stored_metadata.table_id),
+                Ok(stored_metadata) => stored_metadata,
                 Err(CatalogError::ChangedConfiguration { .. }) => {
                     // Fall back to stored config — the warning was already logged by
                     // validate_existing_table_configuration.
-                    Ok(existing_id.clone())
+                    self.get_table(&table_name).await?
                 }
-                Err(e) => Err(e),
+                Err(e) => return Err(e),
             };
+            self.verify_stored_data_files(&stored_metadata, &options)
+                .await?;
+            return Ok(stored_metadata.table_id);
         }
 
         // Serialize schema using Arrow IPC format (supports all Arrow types)
@@ -3026,6 +3126,124 @@ impl MetadataCatalog for CayenneCatalog {
             .await?;
         }
         txn.commit().await
+    }
+
+    async fn commit_mem_tier_durable(&self, mut commit: MemTierDurableCommit) -> CatalogResult<()> {
+        let table_id = &commit.table_id;
+        ensure_reinsert_keys_have_key_based_delete_file(
+            table_id,
+            &commit.reinsert_delete_files,
+            commit.insert_pk_bytes.len(),
+        )?;
+        // Reinsert metadata lives on the key-vector rows, not in per-key
+        // insert records. Stamp only the reinsert group: pure deletes must
+        // remain delete-only even when the same commit also appends rows.
+        let reinsert_sequence =
+            (!commit.insert_pk_bytes.is_empty()).then_some(commit.sequence_number);
+        for file in &mut commit.pure_delete_files {
+            file.reinsert_sequence = None;
+        }
+        for file in &mut commit.reinsert_delete_files {
+            if reinsert_sequence.is_some_and(|seq| seq <= file.sequence_number) {
+                return Err(CatalogError::InvalidOperationNoSource {
+                    message: format!(
+                        "Insert sequence {} must exceed delete sequence {}",
+                        commit.sequence_number, file.sequence_number
+                    ),
+                });
+            }
+            file.reinsert_sequence = if file.deletion_type == DeletionType::KeyBased {
+                reinsert_sequence
+            } else {
+                None
+            };
+        }
+        commit
+            .pure_delete_files
+            .append(&mut commit.reinsert_delete_files);
+        if commit
+            .pure_delete_files
+            .iter()
+            .any(|file| file.table_id != *table_id)
+            || commit
+                .inline_data
+                .iter()
+                .any(|data| data.table_id != *table_id)
+        {
+            return Err(CatalogError::InvalidOperationNoSource {
+                message: format!("Mem-tier commit rows must belong to table '{table_id}'"),
+            });
+        }
+        let max_attempts = DEFAULT_CONCURRENT_WRITE_MAX_ATTEMPTS;
+        for attempt in 1..=max_attempts {
+            let result = async {
+                let tx = self.begin_transaction().await?;
+                let applied = async {
+                    Self::apply_inlined_mutation_in_txn(
+                        tx.as_ref(),
+                        table_id,
+                        &[],
+                        &[],
+                        &commit.inline_data,
+                        commit.sequence_number,
+                    )
+                    .await?;
+                    for chunk in commit.pure_delete_files.chunks(32_000 / 10) {
+                        let (sql, params) = Self::build_insert_delete_files_chunk_sql(chunk);
+                        tx.execute(ExecuteParams { sql: &sql, params }).await?;
+                    }
+                    if let Some(snapshot) = &commit.snapshot_sequence {
+                        tx.execute(ExecuteParams {
+                            sql: SNAPSHOT_SEQUENCE_UPSERT_SQL,
+                            params: vec![
+                                MetastoreValue::Text(table_id.clone()),
+                                MetastoreValue::Text(snapshot.snapshot_id.clone()),
+                                MetastoreValue::Integer(snapshot.sequence_number),
+                            ],
+                        })
+                        .await?;
+                    }
+                    if commit.clear_inlined {
+                        for sql in [
+                            "DELETE FROM cayenne_inlined_data WHERE table_id = ?1",
+                            "DELETE FROM cayenne_inlined_delete WHERE table_id = ?1",
+                        ] {
+                            tx.execute(ExecuteParams {
+                                sql,
+                                params: vec![MetastoreValue::Text(table_id.clone())],
+                            })
+                            .await?;
+                        }
+                    }
+                    CatalogResult::Ok(())
+                }
+                .await;
+                if let Err(error) = applied {
+                    tx.rollback().await?;
+                    return Err(error);
+                }
+                tx.commit().await
+            }
+            .await;
+            match result {
+                Ok(()) => return Ok(()),
+                Err(error) => {
+                    if !retry_on_metastore_write_conflict(
+                        &error,
+                        attempt,
+                        max_attempts,
+                        "commit mem-tier metadata",
+                    )
+                    .await
+                    {
+                        return Err(error);
+                    }
+                }
+            }
+        }
+        Err(CatalogError::InvalidOperationNoSource {
+            message: "Mem-tier commit exhausted write attempts".to_string(),
+        })
     }
 
     async fn get_table_delete_files(&self, table_id: &str) -> CatalogResult<Vec<DeleteFile>> {
@@ -4303,6 +4521,44 @@ impl MetadataCatalog for CayenneCatalog {
                 params: vec![MetastoreValue::Text(table_id.to_string())],
             })
             .await
+    }
+
+    async fn verify_existing_stored_data_files(&self, table_name: &str) -> CatalogResult<()> {
+        let table = self.get_table(table_name).await?;
+        self.verify_stored_data_files_with(
+            &table,
+            table.vortex_config.memory_mode,
+            SettingsChangeAction::KeepStored,
+        )
+        .await
+    }
+
+    async fn remove_snapshot_files(
+        &self,
+        table_id: &str,
+        snapshot_id: &str,
+        file_names: &[String],
+    ) -> CatalogResult<()> {
+        if file_names.is_empty() {
+            return Ok(());
+        }
+        let txn = self.begin_transaction().await?;
+        txn.execute_many(
+            "DELETE FROM cayenne_snapshot_file \
+             WHERE table_id = ?1 AND snapshot_id = ?2 AND file_path = ?3",
+            file_names
+                .iter()
+                .map(|file_name| {
+                    vec![
+                        MetastoreValue::Text(table_id.to_string()),
+                        MetastoreValue::Text(snapshot_id.to_string()),
+                        MetastoreValue::Text(file_name.clone()),
+                    ]
+                })
+                .collect(),
+        )
+        .await?;
+        txn.commit().await
     }
 
     async fn list_cold_tier_files(&self, table_id: &str) -> CatalogResult<Vec<ColdTierFile>> {
@@ -5942,6 +6198,242 @@ fn inlined_data_insert(
             params,
         },
     )
+}
+
+/// How many file names a [`StoredFileDamage`] message lists before eliding the rest.
+const STORED_FILE_DAMAGE_LISTED_FILES: usize = 5;
+
+/// The ways a table's current snapshot on disk differs from the data files the
+/// metastore records for it. See [`CayenneCatalog::verify_stored_data_files`].
+#[derive(Debug, Default, PartialEq, Eq)]
+struct StoredFileDamage {
+    /// The snapshot directory the metastore points at.
+    snapshot_dir: std::path::PathBuf,
+    /// How many data files the metastore records for the snapshot.
+    recorded_files: usize,
+    /// The snapshot directory itself is gone.
+    snapshot_dir_missing: bool,
+    /// Recorded files that are not on disk.
+    missing: Vec<String>,
+    /// Recorded files on disk with a size other than the recorded one:
+    /// `(file name, size on disk, recorded size)`.
+    resized: Vec<(String, u64, u64)>,
+}
+
+impl StoredFileDamage {
+    /// Whether the stored rows cannot be read at all, as opposed to some files
+    /// being absent from the listing a scan reads.
+    fn leaves_rows_unreadable(&self) -> bool {
+        self.snapshot_dir_missing || !self.resized.is_empty()
+    }
+}
+
+impl std::fmt::Display for StoredFileDamage {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        fn list<T>(
+            f: &mut std::fmt::Formatter<'_>,
+            items: &[T],
+            item: impl Fn(&mut std::fmt::Formatter<'_>, &T) -> std::fmt::Result,
+        ) -> std::fmt::Result {
+            for (index, value) in items
+                .iter()
+                .take(STORED_FILE_DAMAGE_LISTED_FILES)
+                .enumerate()
+            {
+                if index > 0 {
+                    f.write_str(", ")?;
+                }
+                item(f, value)?;
+            }
+            if items.len() > STORED_FILE_DAMAGE_LISTED_FILES {
+                write!(
+                    f,
+                    ", and {} more",
+                    items.len() - STORED_FILE_DAMAGE_LISTED_FILES
+                )?;
+            }
+            Ok(())
+        }
+
+        let dir = self.snapshot_dir.display();
+        if self.snapshot_dir_missing {
+            return write!(
+                f,
+                "its snapshot directory '{dir}' is missing, with the {} data files the metastore records for it",
+                self.recorded_files
+            );
+        }
+        if !self.missing.is_empty() {
+            write!(
+                f,
+                "{} of the {} data files the metastore records in '{dir}' are missing: ",
+                self.missing.len(),
+                self.recorded_files
+            )?;
+            list(f, &self.missing, |f, name| f.write_str(name))?;
+        }
+        if !self.resized.is_empty() {
+            if !self.missing.is_empty() {
+                f.write_str("; ")?;
+            }
+            write!(
+                f,
+                "{} of the {} data files the metastore records in '{dir}' differ in size from the metastore's record, so they are truncated or overwritten: ",
+                self.resized.len(),
+                self.recorded_files
+            )?;
+            list(f, &self.resized, |f, (name, actual, recorded)| {
+                write!(f, "{name} ({actual} bytes, recorded {recorded})")
+            })?;
+        }
+        Ok(())
+    }
+}
+
+/// Compare the data files the metastore records for `table`'s current snapshot
+/// (`manifest`) with the snapshot directory on disk. `None` when they match, or
+/// when the metastore records no files for the snapshot (an empty table, or one
+/// written before the manifest was kept), which leaves nothing to compare.
+/// The local directory holding one snapshot's data files. A table path may be
+/// spelled as a `file:` URI, which is not a filesystem path as written.
+fn stored_snapshot_dir(table_path: &str, table_id: &str, snapshot_id: &str) -> std::path::PathBuf {
+    std::path::PathBuf::from(crate::metastore_layout::fs_probe_path(table_path))
+        .join(table_id)
+        .join(snapshot_id)
+}
+
+/// Check a table's live snapshots against the data files on disk, through any
+/// catalog's reads, and decide by `settings_change` whether a mismatch rebuilds
+/// the table, holds it, refuses it, or is served with a warning. See
+/// [`CayenneCatalog::verify_stored_data_files`] for the rules.
+pub(crate) async fn verify_stored_data_files_in<C: MetadataCatalog + ?Sized>(
+    catalog: &C,
+    table: &TableMetadata,
+    memory_mode: bool,
+    settings_change: SettingsChangeAction,
+) -> CatalogResult<()> {
+    if table.path.starts_with("s3://") || memory_mode {
+        return Ok(());
+    }
+    // Scans read the current snapshot and every protected one (rows staged
+    // by CDC upserts and checkpoints live in their own snapshots), so every
+    // live snapshot is checked before deciding: a tolerated mismatch in one
+    // must not hide unreadable rows in another.
+    let mut protected: Vec<String> = catalog
+        .get_all_snapshot_sequences(&table.table_id)
+        .await?
+        .into_keys()
+        .filter(|snapshot_id| *snapshot_id != table.current_snapshot_id)
+        .collect();
+    protected.sort();
+    let mut damages = Vec::new();
+    for snapshot_id in std::iter::once(table.current_snapshot_id.clone()).chain(protected) {
+        let manifest = catalog
+            .get_snapshot_files(&table.table_id, &snapshot_id)
+            .await?;
+        if let Some(damage) = inspect_stored_data_files(table, &snapshot_id, manifest).await? {
+            damages.push(damage);
+        }
+    }
+    if damages.is_empty() {
+        return Ok(());
+    }
+    let leaves_rows_unreadable = damages.iter().any(StoredFileDamage::leaves_rows_unreadable);
+    let damage = damages
+        .iter()
+        .map(ToString::to_string)
+        .collect::<Vec<_>>()
+        .join("; ");
+    let table_name = table.table_name.as_str();
+    match settings_change {
+        SettingsChangeAction::Rebuild => {
+            tracing::warn!(
+                "Dataset '{table_name}': the acceleration's data files do not match the Cayenne metastore ({damage}). Dropping it and reloading it from the source."
+            );
+            Err(CatalogError::StoredDataFilesRequireRebuild {
+                table_name: table_name.to_string(),
+                damage,
+            })
+        }
+        SettingsChangeAction::HoldUntilSourceReadable => {
+            Err(CatalogError::StoredDataFilesDamaged {
+                table_name: table_name.to_string(),
+                damage,
+                remedy: "It is reloaded from the source once the source can be read."
+                    .to_string(),
+            })
+        }
+        SettingsChangeAction::KeepStored if leaves_rows_unreadable => {
+            Err(CatalogError::StoredDataFilesDamaged {
+                table_name: table_name.to_string(),
+                damage,
+                remedy: "It is not reloaded automatically, because its settings can keep rows a reload from the source would not bring back. Restore the files, or reload it from the source by restarting once with `mode: file_create` and then setting the mode back; rows that exist only in the acceleration are not kept. See: https://spiceai.org/docs/components/data-accelerators/cayenne".to_string(),
+            })
+        }
+        SettingsChangeAction::KeepStored => {
+            tracing::warn!(
+                "Dataset '{table_name}': the acceleration's data files do not match the Cayenne metastore ({damage}). It is not reloaded automatically, because its settings can keep rows a reload from the source would not bring back, so queries do not return the rows those files held. To reload it from the source, restart once with `mode: file_create`, then set the mode back. See: https://spiceai.org/docs/components/data-accelerators/cayenne"
+            );
+            Ok(())
+        }
+    }
+}
+
+async fn inspect_stored_data_files(
+    table: &TableMetadata,
+    snapshot_id: &str,
+    manifest: Vec<SnapshotFile>,
+) -> CatalogResult<Option<StoredFileDamage>> {
+    if manifest.is_empty() {
+        return Ok(None);
+    }
+    let snapshot_dir = stored_snapshot_dir(&table.path, &table.table_id, snapshot_id);
+    tokio::task::spawn_blocking(move || {
+        let mut damage = StoredFileDamage {
+            recorded_files: manifest.len(),
+            ..StoredFileDamage::default()
+        };
+        match std::fs::metadata(&snapshot_dir) {
+            Ok(_) => {}
+            Err(source) if source.kind() == std::io::ErrorKind::NotFound => {
+                damage.snapshot_dir_missing = true;
+                damage.snapshot_dir = snapshot_dir;
+                return Ok(Some(damage));
+            }
+            Err(source) => return Err(CatalogError::Io { source }),
+        }
+        for file in manifest {
+            match std::fs::metadata(snapshot_dir.join(&file.file_path)) {
+                Ok(metadata) => {
+                    // A size of 0 is never recorded for a written file; treat it as
+                    // "not recorded" rather than as a mismatch.
+                    if let Ok(recorded) = u64::try_from(file.file_size_bytes)
+                        && recorded > 0
+                        && metadata.len() != recorded
+                    {
+                        damage
+                            .resized
+                            .push((file.file_path, metadata.len(), recorded));
+                    }
+                }
+                Err(source) if source.kind() == std::io::ErrorKind::NotFound => {
+                    damage.missing.push(file.file_path);
+                }
+                Err(source) => return Err(CatalogError::Io { source }),
+            }
+        }
+        if damage.missing.is_empty() && damage.resized.is_empty() {
+            return Ok(None);
+        }
+        damage.missing.sort();
+        damage.resized.sort();
+        damage.snapshot_dir = snapshot_dir;
+        Ok(Some(damage))
+    })
+    .await
+    .map_err(|join_error| CatalogError::InvalidOperationNoSource {
+        message: format!("Checking the stored data files panicked or was cancelled: {join_error}"),
+    })?
 }
 
 async fn ensure_snapshot_directory_exists(table: &TableMetadata) -> CatalogResult<()> {
@@ -12397,5 +12889,403 @@ mod tests {
         );
 
         remove_test_db(&test_db);
+    }
+
+    /// Options that reopen the table [`catalog_with_table`] created, unchanged
+    /// but for what a mismatch may do.
+    fn reopen_options(
+        table_name: &str,
+        base_path: &str,
+        settings_change: SettingsChangeAction,
+    ) -> CreateTableOptions {
+        CreateTableOptions {
+            table_name: table_name.to_string(),
+            schema: Arc::new(arrow_schema::Schema::new(vec![arrow_schema::Field::new(
+                "id",
+                arrow_schema::DataType::Int64,
+                false,
+            )])),
+            primary_key: vec![],
+            on_conflict: None,
+            base_path: base_path.to_string(),
+            partition_column: None,
+            vortex_config: crate::metadata::VortexConfig {
+                settings_change,
+                ..crate::metadata::VortexConfig::default()
+            },
+        }
+    }
+
+    /// A table whose current snapshot holds `a.vortex` (10 bytes) and
+    /// `b.vortex` (20 bytes), both recorded in the metastore's manifest. Returns
+    /// the catalog, the table root's base path, the snapshot directory, and the
+    /// guards that keep the database and table root alive.
+    async fn table_with_stored_files(
+        table_name: &str,
+    ) -> (
+        CayenneCatalog,
+        String,
+        std::path::PathBuf,
+        tempfile::TempDir,
+        tempfile::TempDir,
+    ) {
+        let (catalog, table_id, snapshot_id, db_dir, table_root) =
+            catalog_with_table(table_name).await;
+        let base_path = table_root
+            .path()
+            .to_str()
+            .expect("the temporary table root is a UTF-8 path")
+            .to_owned();
+        let table = catalog.get_table(table_name).await.expect("get table");
+        let snapshot_dir = std::path::PathBuf::from(&table.path)
+            .join(&table_id)
+            .join(&snapshot_id);
+        std::fs::create_dir_all(&snapshot_dir).expect("create the snapshot directory");
+        let mut manifest = Vec::new();
+        for (name, size) in [("a.vortex", 10_usize), ("b.vortex", 20)] {
+            std::fs::write(snapshot_dir.join(name), vec![0_u8; size]).expect("write a data file");
+            manifest.push(SnapshotFile {
+                table_id: table_id.clone(),
+                snapshot_id: snapshot_id.clone(),
+                file_path: name.to_string(),
+                row_count: 1,
+                file_size_bytes: i64::try_from(size).expect("small size"),
+                min_sequence: 0,
+                max_sequence: 0,
+                digest: None,
+            });
+        }
+        catalog
+            .replace_snapshot_files(&table_id, &snapshot_id, &manifest)
+            .await
+            .expect("record the manifest");
+        (catalog, base_path, snapshot_dir, db_dir, table_root)
+    }
+
+    const EVERY_SETTINGS_CHANGE: [SettingsChangeAction; 3] = [
+        SettingsChangeAction::KeepStored,
+        SettingsChangeAction::HoldUntilSourceReadable,
+        SettingsChangeAction::Rebuild,
+    ];
+
+    /// A restart that finds every recorded file in place opens the table as it
+    /// was, whatever a mismatch would have done.
+    #[tokio::test]
+    async fn reopening_a_table_whose_files_match_its_manifest_keeps_it() {
+        let (catalog, base_path, _snapshot_dir, _db, _root) =
+            table_with_stored_files("healthy").await;
+        let table_id = catalog
+            .get_table("healthy")
+            .await
+            .expect("get table")
+            .table_id;
+        for settings_change in EVERY_SETTINGS_CHANGE {
+            let reopened = catalog
+                .create_table(reopen_options("healthy", &base_path, settings_change))
+                .await
+                .unwrap_or_else(|error| {
+                    panic!("a healthy reopen with {settings_change:?} failed: {error}")
+                });
+            assert_eq!(reopened, table_id, "{settings_change:?}");
+        }
+    }
+
+    /// Regression test: a data file deleted between restarts used to leave the
+    /// table serving the rows the other files hold, with nothing logged.
+    #[tokio::test]
+    async fn reopening_a_table_missing_a_data_file_rebuilds_it_when_it_can() {
+        let (catalog, base_path, snapshot_dir, _db, _root) =
+            table_with_stored_files("one_missing").await;
+        std::fs::remove_file(snapshot_dir.join("b.vortex")).expect("delete a data file");
+
+        let error = catalog
+            .create_table(reopen_options(
+                "one_missing",
+                &base_path,
+                SettingsChangeAction::Rebuild,
+            ))
+            .await
+            .expect_err("a table missing a data file is rebuilt");
+        let CatalogError::StoredDataFilesRequireRebuild { table_name, damage } = &error else {
+            panic!("expected StoredDataFilesRequireRebuild, got {error:?}");
+        };
+        assert_eq!(table_name, "one_missing");
+        assert!(
+            damage.starts_with("1 of the 2 data files the metastore records in '")
+                && damage.ends_with("' are missing: b.vortex"),
+            "{damage}"
+        );
+
+        let error = catalog
+            .create_table(reopen_options(
+                "one_missing",
+                &base_path,
+                SettingsChangeAction::HoldUntilSourceReadable,
+            ))
+            .await
+            .expect_err("a held table missing a data file is not served");
+        assert!(
+            matches!(error, CatalogError::StoredDataFilesDamaged { .. }),
+            "{error:?}"
+        );
+
+        // The manifest may name a file the table no longer holds, so a table that
+        // cannot be rebuilt keeps serving, with a warning.
+        catalog
+            .create_table(reopen_options(
+                "one_missing",
+                &base_path,
+                SettingsChangeAction::KeepStored,
+            ))
+            .await
+            .expect("a table that cannot be rebuilt still opens");
+    }
+
+    /// Regression test: a deleted data directory used to leave the table
+    /// serving no rows, with nothing logged.
+    #[tokio::test]
+    async fn reopening_a_table_whose_snapshot_directory_is_gone_does_not_serve_it() {
+        let (catalog, base_path, snapshot_dir, _db, _root) =
+            table_with_stored_files("dir_missing").await;
+        std::fs::remove_dir_all(&snapshot_dir).expect("delete the snapshot directory");
+
+        let error = catalog
+            .create_table(reopen_options(
+                "dir_missing",
+                &base_path,
+                SettingsChangeAction::Rebuild,
+            ))
+            .await
+            .expect_err("a table without its snapshot directory is rebuilt");
+        let CatalogError::StoredDataFilesRequireRebuild { damage, .. } = &error else {
+            panic!("expected StoredDataFilesRequireRebuild, got {error:?}");
+        };
+        assert!(
+            damage.starts_with("its snapshot directory '")
+                && damage
+                    .ends_with("' is missing, with the 2 data files the metastore records for it"),
+            "{damage}"
+        );
+
+        for settings_change in [
+            SettingsChangeAction::HoldUntilSourceReadable,
+            SettingsChangeAction::KeepStored,
+        ] {
+            let error = catalog
+                .create_table(reopen_options("dir_missing", &base_path, settings_change))
+                .await
+                .expect_err("a table without its snapshot directory is not served");
+            assert!(
+                matches!(error, CatalogError::StoredDataFilesDamaged { .. }),
+                "{settings_change:?}: {error:?}"
+            );
+        }
+    }
+
+    /// Regression test: a truncated data file used to open, and fail only the
+    /// queries that read it.
+    #[tokio::test]
+    async fn reopening_a_table_with_a_truncated_data_file_does_not_serve_it() {
+        let (catalog, base_path, snapshot_dir, _db, _root) =
+            table_with_stored_files("truncated").await;
+        std::fs::write(snapshot_dir.join("a.vortex"), vec![0_u8; 4]).expect("truncate a file");
+
+        let error = catalog
+            .create_table(reopen_options(
+                "truncated",
+                &base_path,
+                SettingsChangeAction::Rebuild,
+            ))
+            .await
+            .expect_err("a table with a truncated file is rebuilt");
+        let CatalogError::StoredDataFilesRequireRebuild { damage, .. } = &error else {
+            panic!("expected StoredDataFilesRequireRebuild, got {error:?}");
+        };
+        assert!(
+            damage.ends_with(
+                "' differ in size from the metastore's record, so they are truncated or overwritten: a.vortex (4 bytes, recorded 10)"
+            ),
+            "{damage}"
+        );
+
+        let error = catalog
+            .create_table(reopen_options(
+                "truncated",
+                &base_path,
+                SettingsChangeAction::KeepStored,
+            ))
+            .await
+            .expect_err("a table with a truncated file is not served");
+        let message = error.to_string();
+        assert!(
+            message.starts_with("Failed to load table 'truncated': its acceleration does not match its Cayenne metastore (")
+                && message.contains("restarting once with `mode: file_create`"),
+            "{message}"
+        );
+    }
+
+    /// Rows staged by CDC upserts and checkpoints live in protected snapshots
+    /// that scans read alongside the current one, so losing a protected
+    /// snapshot's directory is caught even when the current one is intact.
+    #[tokio::test]
+    async fn reopening_a_table_whose_protected_snapshot_is_gone_does_not_serve_it() {
+        let (catalog, base_path, snapshot_dir, _db, _root) =
+            table_with_stored_files("protected").await;
+        let table = catalog.get_table("protected").await.expect("get table");
+        let protected_id = "protected-snapshot";
+        catalog
+            .set_snapshot_sequence(&table.table_id, protected_id, 7)
+            .await
+            .expect("register the protected snapshot");
+        catalog
+            .replace_snapshot_files(
+                &table.table_id,
+                protected_id,
+                &[SnapshotFile {
+                    table_id: table.table_id.clone(),
+                    snapshot_id: protected_id.to_string(),
+                    file_path: "staged.vortex".to_string(),
+                    row_count: 1,
+                    file_size_bytes: 5,
+                    min_sequence: 7,
+                    max_sequence: 7,
+                    digest: None,
+                }],
+            )
+            .await
+            .expect("record the protected manifest");
+        let protected_dir = snapshot_dir
+            .parent()
+            .expect("the snapshot directory has a table directory")
+            .join(protected_id);
+        assert!(!protected_dir.exists());
+        // A missing-only mismatch in the current snapshot is tolerated on its own
+        // (legacy retention left such rows), but must not hide the protected one.
+        std::fs::remove_file(snapshot_dir.join("b.vortex")).expect("remove a current file");
+
+        let error = catalog
+            .create_table(reopen_options(
+                "protected",
+                &base_path,
+                SettingsChangeAction::KeepStored,
+            ))
+            .await
+            .expect_err("a table missing a protected snapshot is not served");
+        let message = error.to_string();
+        assert!(
+            message.contains(protected_id)
+                && message
+                    .contains("is missing, with the 1 data files the metastore records for it")
+                && message.contains("1 of the 2 data files the metastore records in")
+                && message.contains("b.vortex"),
+            "{message}"
+        );
+
+        std::fs::create_dir_all(&protected_dir).expect("restore the protected snapshot");
+        std::fs::write(protected_dir.join("staged.vortex"), vec![0_u8; 5])
+            .expect("restore the staged file");
+        catalog
+            .create_table(reopen_options(
+                "protected",
+                &base_path,
+                SettingsChangeAction::KeepStored,
+            ))
+            .await
+            .expect("a table whose protected snapshot is back reopens, warning about the missing current file");
+    }
+
+    /// A table path spelled as a `file:` URI names the same directory as the
+    /// plain path, so its files are not reported missing.
+    #[test]
+    fn stored_snapshot_dir_reads_a_file_uri_table_path_as_a_local_path() {
+        for table_path in [
+            "/data/orders",
+            "file:///data/orders",
+            "file://localhost/data/orders",
+        ] {
+            assert_eq!(
+                stored_snapshot_dir(table_path, "t", "s"),
+                std::path::PathBuf::from("/data/orders/t/s"),
+                "{table_path}"
+            );
+        }
+    }
+
+    /// Partition children reopen through `open`, not `create_table`, so they
+    /// are checked on their own, as tables that are not rebuilt.
+    #[tokio::test]
+    async fn verifying_an_existing_table_refuses_unreadable_rows_and_tolerates_missing_files() {
+        let (catalog, _base_path, snapshot_dir, _db, _root) =
+            table_with_stored_files("child").await;
+        catalog
+            .verify_existing_stored_data_files("child")
+            .await
+            .expect("a table whose files are in place passes");
+
+        std::fs::remove_file(snapshot_dir.join("b.vortex")).expect("remove a data file");
+        catalog
+            .verify_existing_stored_data_files("child")
+            .await
+            .expect("a table only missing files is kept, with a WARN");
+
+        std::fs::write(snapshot_dir.join("a.vortex"), vec![0_u8; 3]).expect("truncate a file");
+        let error = catalog
+            .verify_existing_stored_data_files("child")
+            .await
+            .expect_err("a table with a truncated file is refused");
+        assert!(
+            matches!(error, CatalogError::StoredDataFilesDamaged { .. }),
+            "{error:?}"
+        );
+    }
+
+    /// Retention drops the manifest rows of the files it deletes, so a restart
+    /// after it does not read them as lost.
+    #[tokio::test]
+    async fn removing_snapshot_files_drops_only_the_named_manifest_rows() {
+        let (catalog, base_path, snapshot_dir, _db, _root) =
+            table_with_stored_files("retained").await;
+        let table = catalog.get_table("retained").await.expect("get table");
+        std::fs::remove_file(snapshot_dir.join("a.vortex")).expect("retention deletes a file");
+        catalog
+            .remove_snapshot_files(
+                &table.table_id,
+                &table.current_snapshot_id,
+                &["a.vortex".to_string(), "never-recorded.vortex".to_string()],
+            )
+            .await
+            .expect("drop the manifest rows");
+        let remaining: Vec<_> = catalog
+            .get_snapshot_files(&table.table_id, &table.current_snapshot_id)
+            .await
+            .expect("read the manifest")
+            .into_iter()
+            .map(|file| file.file_path)
+            .collect();
+        assert_eq!(remaining, vec!["b.vortex".to_string()]);
+        catalog
+            .create_table(reopen_options(
+                "retained",
+                &base_path,
+                SettingsChangeAction::Rebuild,
+            ))
+            .await
+            .expect("a table retention trimmed opens as it is");
+    }
+
+    #[test]
+    fn stored_file_damage_lists_a_bounded_number_of_files() {
+        let damage = StoredFileDamage {
+            snapshot_dir: std::path::PathBuf::from("/data/t/s"),
+            recorded_files: 9,
+            snapshot_dir_missing: false,
+            missing: (0..7).map(|i| format!("{i}.vortex")).collect(),
+            resized: vec![],
+        };
+        assert_eq!(
+            damage.to_string(),
+            "7 of the 9 data files the metastore records in '/data/t/s' are missing: 0.vortex, 1.vortex, 2.vortex, 3.vortex, 4.vortex, and 2 more"
+        );
+        assert!(!damage.leaves_rows_unreadable());
     }
 }

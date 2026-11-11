@@ -24,6 +24,8 @@ sources:
 
 variants:
   cayenne: { datasets: { '*': { acceleration: { engine: cayenne, mode: file } } } }
+  # `cayenne` with the prototype object-native Cayenne metastore.
+  cayenne-object-native: { datasets: { '*': { acceleration: { engine: cayenne, mode: file } } }, spicepod: { runtime: { params: { cayenne_vnext: enabled } } } }
   arrow: { datasets: { '*': { acceleration: { engine: arrow, mode: memory, on_conflict: { id: upsert } } } } }
 
 spicepod:
@@ -54,7 +56,7 @@ steps:
         mkdir -p /tmp/${sources.src.namespace};
         cd /debezium;
         DEBEZIUM_SINK_TYPE=http
-        DEBEZIUM_SINK_HTTP_URL=http://${sources.dbz.host_from_container}:${instance.http_port}/v1/datasets/t/cdc
+        DEBEZIUM_SINK_HTTP_URL=http://${instance.host_from_container}:${instance.http_port}/v1/datasets/t/cdc
         DEBEZIUM_SOURCE_CONNECTOR_CLASS=io.debezium.connector.postgresql.PostgresConnector
         DEBEZIUM_SOURCE_OFFSET_STORAGE_FILE_FILENAME=/tmp/${sources.src.namespace}/offsets.dat
         DEBEZIUM_SOURCE_OFFSET_FLUSH_INTERVAL_MS=0
@@ -97,12 +99,12 @@ steps:
   # a durable acceleration survives this: a push source cannot be re-read, so
   # an in-memory one restarts empty and holds only what arrives afterwards.
   - restart: {}
-    only: cayenne
+    only: [cayenne, cayenne-object-native]
   - source-exec:
       src: |
         UPDATE t SET v = 'after restart' WHERE id <= 20;
         DELETE FROM t WHERE id > 590;
-    only: cayenne
+    only: [cayenne, cayenne-object-native]
   - query: SELECT * FROM t
     eventually: 60s
-    only: cayenne
+    only: [cayenne, cayenne-object-native]

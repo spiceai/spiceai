@@ -45,8 +45,9 @@ use crate::StateFeature;
 static METRICS: OnceLock<StateStoreMetrics> = OnceLock::new();
 
 /// Creates the state-store instruments from the global meter provider and
-/// publishes both counters at zero for every feature. Requests made before
-/// this runs are not recorded, so call it once the provider is installed.
+/// publishes both counters at zero for every feature an instance always has.
+/// Requests made before this runs are not recorded, so call it once the
+/// provider is installed.
 pub fn init() {
     METRICS
         .get_or_init(|| StateStoreMetrics::new(&opentelemetry::global::meter("state_store")))
@@ -60,8 +61,6 @@ pub fn record_cleanup_deleted(feature: StateFeature, objects: usize) {
     }
 }
 
-/// Wraps `store` so that every request `feature` makes through it is measured.
-/// Returns `store` itself for a feature without a metric label.
 /// `store` with its requests counted in the `state_store_*` metrics under `feature`.
 ///
 /// A feature whose conflict and cleanup counters wait until it is used

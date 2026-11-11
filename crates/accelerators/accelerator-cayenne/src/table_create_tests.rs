@@ -275,10 +275,7 @@ async fn placed_accelerator(store: &Arc<dyn ObjectStore>) -> Arc<CayenneAccelera
         .expect("init the catalog");
     let accelerator = Arc::new(CayenneAccelerator::new());
     assert!(
-        accelerator
-            .native_catalog
-            .set(Arc::new(catalog) as Arc<dyn cayenne::MetadataCatalog>)
-            .is_ok(),
+        accelerator.native_catalog.set(Arc::new(catalog)).is_ok(),
         "the location's catalog is the accelerator's"
     );
     accelerator

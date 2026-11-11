@@ -8,12 +8,10 @@
 use bytes::Bytes;
 use futures::StreamExt;
 use object_store::{ObjectStore, ObjectStoreExt, PutMode, PutOptions, UpdateVersion, path::Path};
-use object_store_occ::{
-    LocalConditionalPut,
-    sim::{
-        Op,
-        fault::{Fault, FaultStore},
-    },
+use object_store_occ::LocalConditionalPut;
+use object_store_sim::{
+    Op,
+    fault::{Fault, FaultStore},
 };
 use std::sync::{
     Arc,
@@ -148,7 +146,7 @@ async fn faults_memory_and_durable_local() {
 async fn canceled_call_still_delivers_and_forwarded_operations_are_logged() {
     use futures::TryStreamExt;
     use object_store::{CopyOptions, PutMultipartOptions};
-    use object_store_occ::sim::fault::BeforeHook;
+    use object_store_sim::fault::BeforeHook;
     let directory = tempfile::tempdir().expect("directory");
     let backends: Vec<Arc<dyn ObjectStore>> = vec![
         Arc::new(object_store::memory::InMemory::new()),

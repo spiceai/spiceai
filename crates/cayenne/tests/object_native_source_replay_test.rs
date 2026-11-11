@@ -34,12 +34,10 @@ use cayenne::metadata::{CreateTableOptions, InlinedData, VortexConfig};
 use cayenne::metastore::object_native::ObjectNativeCatalog;
 use cayenne_metastore_actions::DatasetState;
 use object_store::{ObjectStore, memory::InMemory, path::Path};
-use object_store_occ::{
-    headlog::Reader,
-    sim::{
-        Op,
-        fault::{Fault, FaultStore},
-    },
+use object_store_occ::headlog::Reader;
+use object_store_sim::{
+    Op,
+    fault::{Fault, FaultStore},
 };
 use prost::Message;
 use serde::Deserialize;

@@ -61,8 +61,8 @@ use object_store::{
     CopyOptions, GetOptions, GetResult, ListResult, MultipartUpload, ObjectMeta, ObjectStore,
     PutMultipartOptions, PutOptions, PutPayload, PutResult, RenameOptions, UploadPart,
 };
-use object_store_occ::sim::Op;
-use object_store_occ::sim::fault::FaultStore;
+use object_store_sim::Op;
+use object_store_sim::fault::FaultStore;
 
 use crate::common;
 

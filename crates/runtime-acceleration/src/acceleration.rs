@@ -55,6 +55,9 @@ pub enum ParseError {
     #[snafu(display("Unknown acceleration engine '{name}'"))]
     AcceleratorEngineNotAvailable { name: String },
 
+    #[snafu(display("{}", crate::removed_engine_message(name)))]
+    AcceleratorEngineRemoved { name: &'static str },
+
     #[snafu(display("Invalid acceleration configuration: {detail}"))]
     InvalidAccelerationConfiguration { detail: String },
 
@@ -589,8 +592,6 @@ pub struct Acceleration {
 
     pub snapshots_compaction: SnapshotsCompaction,
 
-    pub snapshots_reset_expiry_on_load_enabled: bool,
-
     pub snapshots_creation_policy: SnapshotsCreationPolicy,
 
     /// Whether this registration may rebuild the existing acceleration for changed
@@ -1067,9 +1068,14 @@ impl TryFrom<spicepod_acceleration::Acceleration> for Acceleration {
             .engine
             .as_deref()
             .unwrap_or(spicepod_acceleration::DEFAULT_ENGINE);
-        let engine = match Engine::try_from(engine_str).map_err(|_| {
-            ParseError::AcceleratorEngineNotAvailable {
-                name: engine_str.to_string(),
+        let engine = match Engine::try_from(engine_str).map_err(|err| match err {
+            crate::Error::AcceleratorEngineRemoved { name } => {
+                ParseError::AcceleratorEngineRemoved { name }
+            }
+            crate::Error::AcceleratorEngineNotAvailable { .. } => {
+                ParseError::AcceleratorEngineNotAvailable {
+                    name: engine_str.to_string(),
+                }
             }
         })? {
             Engine::Arrow if !acceleration.partition_by.is_empty() => Engine::PartitionedArrow,
@@ -1098,14 +1104,9 @@ impl TryFrom<spicepod_acceleration::Acceleration> for Acceleration {
         if matches!(
             acceleration.snapshots_reset_expiry_on_load,
             spicepod_acceleration::SnapshotsResetExpiryOnLoad::Enabled
-        ) && (engine != Engine::DuckDB
-            || !matches!(
-                acceleration.refresh_mode,
-                Some(spicepod_acceleration::RefreshMode::Caching)
-            ))
-        {
+        ) {
             tracing::warn!(
-                "Resetting expiry on load is only supported for DuckDB engine acceleration with caching refresh mode. Ignoring snapshots_reset_expiry_on_load."
+                "Resetting expiry on load is not supported by the `{engine}` acceleration engine. Ignoring snapshots_reset_expiry_on_load."
             );
         }
 
@@ -1180,10 +1181,6 @@ impl TryFrom<spicepod_acceleration::Acceleration> for Acceleration {
             snapshots_trigger: acceleration.snapshots_trigger,
             snapshots_trigger_threshold: acceleration.snapshots_trigger_threshold,
             snapshots_compaction: acceleration.snapshots_compaction,
-            snapshots_reset_expiry_on_load_enabled: matches!(
-                acceleration.snapshots_reset_expiry_on_load,
-                spicepod_acceleration::SnapshotsResetExpiryOnLoad::Enabled
-            ),
             snapshots_creation_policy: acceleration.snapshots_creation_policy,
             settings_rebuild: SettingsRebuild::default(),
         })
@@ -1230,7 +1227,6 @@ impl Default for Acceleration {
             snapshots_trigger: None,
             snapshots_trigger_threshold: None,
             snapshots_compaction: SnapshotsCompaction::Disabled,
-            snapshots_reset_expiry_on_load_enabled: false,
             snapshots_creation_policy: SnapshotsCreationPolicy::default(),
             settings_rebuild: SettingsRebuild::default(),
         }
@@ -2228,7 +2224,7 @@ mod tests {
     #[test]
     fn every_condition_is_required_for_durable_write_back() {
         let not_cayenne = Acceleration {
-            engine: Engine::DuckDB,
+            engine: Engine::Arrow,
             ..durable_write_back_acceleration()
         };
         assert!(

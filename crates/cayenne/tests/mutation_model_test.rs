@@ -685,25 +685,27 @@ test_on_data_store!(test_sequence_reservation_guard_impl);
 async fn test_publication_tombstone_replay_impl(fixture: TestFixture) -> TestResult<()> {
     use cayenne::{catalog::CatalogPublication, metadata::InlinedDelete};
     let (table, _, _) = setup_int64_upsert_table(&fixture, "publication_replay").await?;
-    let publication = CatalogPublication {
+    let snapshot_id = uuid::Uuid::now_v7().to_string();
+    let tombstone = InlinedDelete {
+        inlined_id: uuid::Uuid::now_v7().to_string(),
         table_id: table.table_id().to_string(),
-        snapshot_id: uuid::Uuid::now_v7().to_string(),
+        delete_ipc: vec![1, 2, 3],
+        delete_count: 1,
+        sequence_number: 1,
+        published: false,
+        created_at: String::new(),
+    };
+    let publication = CatalogPublication {
+        table_id: table.table_id(),
+        snapshot_id: &snapshot_id,
         snapshot_sequence: 1,
         insert_sequence: None,
-        delete_files: vec![],
-        insert_pk_bytes: vec![],
-        inline_tombstone: Some(InlinedDelete {
-            inlined_id: uuid::Uuid::now_v7().to_string(),
-            table_id: table.table_id().to_string(),
-            delete_ipc: vec![1, 2, 3],
-            delete_count: 1,
-            sequence_number: 1,
-            published: false,
-            created_at: String::new(),
-        }),
-        pending_durable_flips: vec![],
-        dirty_pk_bytes: vec![],
-        files: vec![],
+        delete_files: &[],
+        insert_pk_bytes: &[],
+        inline_tombstone: Some(&tombstone),
+        pending_durable_flips: &[],
+        dirty_pk_bytes: std::borrow::Cow::Borrowed(&[]),
+        files: &[],
     };
     fixture
         .catalog
@@ -782,33 +784,36 @@ async fn test_publication_without_reinsert_sequence_impl(fixture: TestFixture) -
         metadata::{DeleteFile, DeletionType},
     };
     let (table, _, _) = setup_int64_upsert_table(&fixture, "optional_reinsert").await?;
-    let publication = CatalogPublication {
+    let snapshot_id = uuid::Uuid::now_v7().to_string();
+    let delete_files = vec![DeleteFile {
+        delete_file_id: uuid::Uuid::now_v7().to_string(),
         table_id: table.table_id().to_string(),
-        snapshot_id: uuid::Uuid::now_v7().to_string(),
+        source_data_file_path: None,
+        path: fixture
+            .data_path
+            .join("delete.arrow")
+            .to_string_lossy()
+            .to_string(),
+        path_is_relative: false,
+        format: "arrow".to_string(),
+        delete_count: 1,
+        file_size_bytes: 64,
+        deletion_type: DeletionType::KeyBased,
+        sequence_number: 1,
+        reinsert_sequence: None,
+    }];
+    let insert_pk_bytes = vec![vec![1]];
+    let publication = CatalogPublication {
+        table_id: table.table_id(),
+        snapshot_id: &snapshot_id,
         snapshot_sequence: 1,
         insert_sequence: None,
-        delete_files: vec![DeleteFile {
-            delete_file_id: uuid::Uuid::now_v7().to_string(),
-            table_id: table.table_id().to_string(),
-            source_data_file_path: None,
-            path: fixture
-                .data_path
-                .join("delete.arrow")
-                .to_string_lossy()
-                .to_string(),
-            path_is_relative: false,
-            format: "arrow".to_string(),
-            delete_count: 1,
-            file_size_bytes: 64,
-            deletion_type: DeletionType::KeyBased,
-            sequence_number: 1,
-            reinsert_sequence: None,
-        }],
-        insert_pk_bytes: vec![vec![1]],
+        delete_files: &delete_files,
+        insert_pk_bytes: &insert_pk_bytes,
         inline_tombstone: None,
-        pending_durable_flips: vec![],
-        dirty_pk_bytes: vec![],
-        files: vec![],
+        pending_durable_flips: &[],
+        dirty_pk_bytes: std::borrow::Cow::Borrowed(&[]),
+        files: &[],
     };
     fixture.catalog.commit_publications(&[publication]).await?;
     let files = fixture

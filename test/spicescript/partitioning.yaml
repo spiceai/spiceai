@@ -20,6 +20,8 @@ variants:
   cayenne-name: { datasets: { t: { acceleration: { partition_by: ['bucket(3, name)'] } } } }
   cayenne-date: { datasets: { t: { acceleration: { partition_by: ["date_part('month', order_date)"] } } } }
   cayenne-plain: {}
+  # The spicepod as written, with the prototype object-native Cayenne metastore.
+  object-native: object-native
 
 spicepod:
   version: v1

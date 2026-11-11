@@ -51,8 +51,8 @@ use object_store::{
     ObjectStoreExt, PutMultipartOptions, PutOptions, PutPayload, PutResult, RenameOptions,
     UploadPart,
 };
-use object_store_occ::sim::Op;
-use object_store_occ::sim::fault::{Fault, FaultStore};
+use object_store_sim::Op;
+use object_store_sim::fault::{Fault, FaultStore};
 use parking_lot::Mutex;
 
 const CATALOG: &str = "state/cayenne/v1/catalog";

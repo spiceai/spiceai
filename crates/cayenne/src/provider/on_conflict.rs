@@ -127,20 +127,20 @@ pub(crate) struct PreparedOnConflictDurablePayload {
 }
 
 impl PreparedOnConflictDeletionPublish {
-    pub(crate) fn catalog_publication(&self) -> Option<crate::catalog::CatalogPublication> {
+    pub(crate) fn catalog_publication(&self) -> Option<crate::catalog::CatalogPublication<'_>> {
         self.durable_payload
             .as_ref()
             .map(|payload| crate::catalog::CatalogPublication {
-                table_id: payload.table_id.clone(),
-                snapshot_id: self.target_snapshot_id.clone(),
+                table_id: &payload.table_id,
+                snapshot_id: &self.target_snapshot_id,
                 snapshot_sequence: self.snapshot_sequence,
                 insert_sequence: self.insert_sequence,
-                delete_files: payload.delete_files.clone(),
-                insert_pk_bytes: payload.insert_pk_bytes.clone(),
-                inline_tombstone: payload.inline_tombstone.clone(),
-                pending_durable_flips: payload.pending_durable_flips.clone(),
-                dirty_pk_bytes: Vec::new(),
-                files: Vec::new(),
+                delete_files: &payload.delete_files,
+                insert_pk_bytes: &payload.insert_pk_bytes,
+                inline_tombstone: payload.inline_tombstone.as_ref(),
+                pending_durable_flips: &payload.pending_durable_flips,
+                dirty_pk_bytes: std::borrow::Cow::Borrowed(&[]),
+                files: &[],
             })
     }
 

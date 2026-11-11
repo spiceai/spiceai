@@ -189,9 +189,9 @@ async fn test_distributed_acceleration_with_bucket_partitioning() -> Result<(), 
 /// federation wrapper must not hide the inner `AcceleratedTable` from `should_partition`;
 /// the query must still distribute (`FlightSqlExec`).
 #[tokio::test(flavor = "multi_thread")]
-// Builds a DuckDB file to federate over, so it needs the optional `duckdb`
-// dependency this crate only carries under its own feature.
-#[cfg(feature = "duckdb")]
+// Reads the source through the installed DuckDB library, which the `duckdb:`
+// connector loads over ADBC.
+#[cfg(feature = "adbc")]
 async fn cluster_distributes_accelerated_table_with_federated_source() -> Result<(), anyhow::Error>
 {
     let _ = tracing_subscriber::fmt()
@@ -203,7 +203,7 @@ async fn cluster_distributes_accelerated_table_with_federated_source() -> Result
     let duck_tempdir = tempfile::tempdir().expect("duckdb tempdir");
     let db_path = duck_tempdir.path().join("source.duckdb");
     {
-        let conn = duckdb::Connection::open(&db_path).expect("open duckdb");
+        let conn = duckdb_oracle::Connection::open(&db_path).expect("open duckdb");
         conn.execute_batch(
             "CREATE TABLE test_data (id BIGINT, name VARCHAR, age BIGINT, city VARCHAR, score BIGINT);
              INSERT INTO test_data VALUES
@@ -1363,24 +1363,27 @@ fn make_named_scheduler_config_with_max_partitions_per_executor(
     max_partitions_per_executor: usize,
 ) -> SchedulerConfig {
     let run_id = uuid::Uuid::new_v4();
+    let mut params = std::collections::HashMap::from([
+        ("s3_region".to_string(), "us-east-1".to_string()),
+        (
+            "s3_key".to_string(),
+            "${env:AWS_S3_VECTORS_KEY}".to_string(),
+        ),
+        (
+            "s3_secret".to_string(),
+            "${env:AWS_S3_VECTORS_SECRET}".to_string(),
+        ),
+        ("s3_auth".to_string(), "key".to_string()),
+    ]);
+    params.extend(crate::utils::aws_session_token_param(
+        "s3_session_token",
+        "AWS_S3_VECTORS_SESSION_TOKEN",
+    ));
     SchedulerConfig {
         state_location: Some(format!(
             "s3://spiceai-integration-tests/cluster-state/{test_name}/{run_id}/"
         )),
-        params: Some(spicepod::param::Params::from_string_map(
-            std::collections::HashMap::from([
-                ("s3_region".to_string(), "us-east-1".to_string()),
-                (
-                    "s3_key".to_string(),
-                    "${env:AWS_S3_VECTORS_KEY}".to_string(),
-                ),
-                (
-                    "s3_secret".to_string(),
-                    "${env:AWS_S3_VECTORS_SECRET}".to_string(),
-                ),
-                ("s3_auth".to_string(), "key".to_string()),
-            ]),
-        )),
+        params: Some(spicepod::param::Params::from_string_map(params)),
         partition_assignment_interval: "1s".to_string(),
         max_partition_assignments_per_interval:
             spicepod::component::runtime::default_max_partition_assignments_per_interval(),

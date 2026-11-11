@@ -222,6 +222,7 @@ env:
 
 jobs:
   run-cluster-bench:
+    environment: ci
     name: Run cluster benchmark
     runs-on: ${{ github.event.inputs.runner_type || 'spiceai-dev-runners' }}
     timeout-minutes: 600
@@ -266,19 +267,29 @@ jobs:
           fi
           echo "Spicepod file found at ${{ steps.set_spicepod_path.outputs.SPICEPOD_PATH }}"
 
+      - name: Get RustFS credentials
+        id: rustfs
+        uses: ./.github/actions/rustfs-credentials
+        with:
+          endpoint: ${{ vars.TEST_MINIO_ENDPOINT }}
+          duration-seconds: '36000'
+          export-env: 'false'
+
       - name: Install MinIO
         uses: ./.github/actions/setup-minio
         with:
-          minio_endpoint: ${{ secrets.TEST_MINIO_ENDPOINT }}
-          minio_access_key: ${{ secrets.TEST_MINIO_ACCESS_KEY }}
-          minio_secret_key: ${{ secrets.TEST_MINIO_SECRET_KEY }}
+          minio_endpoint: ${{ vars.TEST_MINIO_ENDPOINT }}
+          minio_access_key: ${{ steps.rustfs.outputs.access-key-id }}
+          minio_secret_key: ${{ steps.rustfs.outputs.secret-access-key }}
+          minio_session_token: ${{ steps.rustfs.outputs.session-token }}
 
       - name: Build spicepod validator
         uses: ./.github/actions/build-spicepod-validator
         with:
-          minio_endpoint: ${{ secrets.TEST_MINIO_ENDPOINT }}
-          minio_access_key: ${{ secrets.TEST_MINIO_ACCESS_KEY }}
-          minio_secret_key: ${{ secrets.TEST_MINIO_SECRET_KEY }}
+          minio_endpoint: ${{ vars.TEST_MINIO_ENDPOINT }}
+          minio_access_key: ${{ steps.rustfs.outputs.access-key-id }}
+          minio_secret_key: ${{ steps.rustfs.outputs.secret-access-key }}
+          minio_session_token: ${{ steps.rustfs.outputs.session-token }}
 
       - name: Validate spicepod
         run: |
@@ -287,9 +298,10 @@ jobs:
       - name: Build Testoperator
         uses: ./.github/actions/build-testoperator
         with:
-          minio_endpoint: ${{ secrets.TEST_MINIO_ENDPOINT }}
-          minio_access_key: ${{ secrets.TEST_MINIO_ACCESS_KEY }}
-          minio_secret_key: ${{ secrets.TEST_MINIO_SECRET_KEY }}
+          minio_endpoint: ${{ vars.TEST_MINIO_ENDPOINT }}
+          minio_access_key: ${{ steps.rustfs.outputs.access-key-id }}
+          minio_secret_key: ${{ steps.rustfs.outputs.secret-access-key }}
+          minio_session_token: ${{ steps.rustfs.outputs.session-token }}
 
       - name: Setup Testoperator
         uses: ./.github/actions/setup-testoperator-data
@@ -299,9 +311,10 @@ jobs:
       - name: Build Spidapter
         uses: ./.github/actions/build-spidapter
         with:
-          minio_endpoint: ${{ secrets.TEST_MINIO_ENDPOINT }}
-          minio_access_key: ${{ secrets.TEST_MINIO_ACCESS_KEY }}
-          minio_secret_key: ${{ secrets.TEST_MINIO_SECRET_KEY }}
+          minio_endpoint: ${{ vars.TEST_MINIO_ENDPOINT }}
+          minio_access_key: ${{ steps.rustfs.outputs.access-key-id }}
+          minio_secret_key: ${{ steps.rustfs.outputs.secret-access-key }}
+          minio_session_token: ${{ steps.rustfs.outputs.session-token }}
 
       - name: Management login (prod)
         if: env.CB_COMPUTE == 'scp'
@@ -360,15 +373,31 @@ jobs:
             echo "SPIDAPTER_EC2_EXECUTOR_COUNT=${CB_EXECUTOR_REPLICAS}"
           } >> "${GITHUB_ENV}"
 
+      # Off EC2 the benchmark reads S3 with the Iceberg role. On EC2 it keeps the benchmark role
+      # assumed above, which is in the job's environment.
+      - name: Assume the Iceberg role
+        id: aws-iceberg
+        if: env.CB_COMPUTE != 'ec2'
+        uses: aws-actions/configure-aws-credentials@e1253824e5c10ff9df46874f81ed3ec929e19cfd # v6.3.0
+        with:
+          role-to-assume: ${{ secrets.AWS_ICEBERG_ROLE_ARN }}
+          role-session-name: gha-iceberg-${{ github.run_id }}
+          role-duration-seconds: 36000
+          aws-region: us-east-1
+          output-env-credentials: false
+          output-credentials: true
+
       - name: Run the cluster benchmark - ${{ env.CB_SPICEPOD_PATH }}
         env:
           SPICEAI_API_KEY: ${{ env.SPICEAI_API_KEY }}
           SPICE_CLOUD_API_URL: https://api.spice.ai
-          S3_ENDPOINT: ${{ secrets.TEST_MINIO_ENDPOINT }}
-          S3_KEY: ${{ secrets.TEST_MINIO_ACCESS_KEY }}
-          S3_SECRET: ${{ secrets.TEST_MINIO_SECRET_KEY }}
-          AWS_ACCESS_KEY_ID: ${{ env.CB_COMPUTE == 'ec2' && env.AWS_ACCESS_KEY_ID || secrets.AWS_ICEBERG_ACCESS_KEY_ID }}
-          AWS_SECRET_ACCESS_KEY: ${{ env.CB_COMPUTE == 'ec2' && env.AWS_SECRET_ACCESS_KEY || secrets.AWS_ICEBERG_SECRET_ACCESS_KEY }}
+          S3_ENDPOINT: ${{ vars.TEST_MINIO_ENDPOINT }}
+          S3_KEY: ${{ steps.rustfs.outputs.access-key-id }}
+          S3_SECRET: ${{ steps.rustfs.outputs.secret-access-key }}
+          S3_SESSION_TOKEN: ${{ steps.rustfs.outputs.session-token }}
+          AWS_ACCESS_KEY_ID: ${{ env.CB_COMPUTE == 'ec2' && env.AWS_ACCESS_KEY_ID || steps.aws-iceberg.outputs.aws-access-key-id }}
+          AWS_SECRET_ACCESS_KEY: ${{ env.CB_COMPUTE == 'ec2' && env.AWS_SECRET_ACCESS_KEY || steps.aws-iceberg.outputs.aws-secret-access-key }}
+          AWS_SESSION_TOKEN: ${{ env.CB_COMPUTE == 'ec2' && env.AWS_SESSION_TOKEN || steps.aws-iceberg.outputs.aws-session-token }}
           AWS_REGION: ${{ env.CB_COMPUTE == 'ec2' && env.CB_EC2_REGION || 'us-east-1' }}
           AWS_DEFAULT_REGION: ${{ env.CB_COMPUTE == 'ec2' && env.CB_EC2_REGION || 'us-east-1' }}
           # Select the nodegroup for the spidapter cluster app via tags.organization.
@@ -641,7 +670,16 @@ jobs:
 
           git commit -m "fix(cluster-bench): ${commit_summary}"
           if git ls-remote --exit-code --heads origin "${BRANCH_NAME}" >/dev/null 2>&1; then
-            git pull --rebase origin "${BRANCH_NAME}"
+            # Move only the snapshot commit. Runs against one image can check
+            # out different trunk heads, and `git pull --rebase` would also
+            # replay every trunk commit between them onto the branch as new
+            # commits, putting unrelated source changes in the PR.
+            git fetch origin "refs/heads/${BRANCH_NAME}"
+            if ! git rebase --onto FETCH_HEAD HEAD^; then
+              git rebase --abort || true
+              echo "::error::This run's snapshots conflict with snapshots another run already pushed to ${BRANCH_NAME}; resolve the .snap conflict on that branch by hand."
+              exit 1
+            fi
           fi
           # Non-interactive: a credential helper on the runner can otherwise intercept
           # this push and block on a prompt forever. See

@@ -71,11 +71,12 @@ use telemetry::timing::TimedStream;
 /// is safe to push down. This would be the proper upstream fix, but until then we avoid
 /// the CAST for string types entirely.
 ///
-/// Float and time-zone-aware timestamp types are also omitted. A CAST sets the type the
-/// parameter is compared in: `TIMESTAMP` has no time zone, so a zoned instant would be
-/// compared as a wall-clock time, and `DOUBLE` would compare a DECIMAL column as an
-/// inexact float. Without the CAST, `DataFusion` takes the type from the column the
-/// parameter is compared with, or from the bound value.
+/// Float, `Date64` and time-zone-aware timestamp types are also omitted. A CAST sets the
+/// type the parameter is compared in: `TIMESTAMP` has no time zone, so a zoned instant
+/// would be compared as a wall-clock time; `DATE` is `Date32`, so a `Date64` would lose
+/// its time of day; and `DOUBLE` would compare a DECIMAL column as an inexact float.
+/// Without the CAST, `DataFusion` takes the type from the column the parameter is
+/// compared with, or from the bound value.
 fn arrow_type_to_sql_type(dt: &arrow::datatypes::DataType) -> Option<&'static str> {
     use arrow::datatypes::DataType;
     match dt {
@@ -90,7 +91,7 @@ fn arrow_type_to_sql_type(dt: &arrow::datatypes::DataType) -> Option<&'static st
         // String types intentionally omitted - CASTs break filter pushdown optimization
         // DataType::Utf8 | DataType::LargeUtf8 => Some("VARCHAR"),
         DataType::Boolean => Some("BOOLEAN"),
-        DataType::Date32 | DataType::Date64 => Some("DATE"),
+        DataType::Date32 => Some("DATE"),
         DataType::Timestamp(_, None) => Some("TIMESTAMP"),
         _ => None,
     }
@@ -1968,7 +1969,7 @@ mod tests {
     /// Tests mixed parameter types - only types whose CAST keeps the comparison exact get one.
     #[test]
     fn test_rewrite_sql_mixed_types() {
-        let sql = r"SELECT * FROM users WHERE name = $1 AND age > $2 AND score < $3 AND created > $4 AND seen > $5";
+        let sql = r"SELECT * FROM users WHERE name = $1 AND age > $2 AND score < $3 AND created > $4 AND seen > $5 AND born = $6 AND logged = $7";
 
         let schema = Arc::new(Schema::new(vec![
             Field::new("$1", DataType::Utf8, true),
@@ -1987,6 +1988,8 @@ mod tests {
                 ),
                 true,
             ),
+            Field::new("$6", DataType::Date32, true),
+            Field::new("$7", DataType::Date64, true),
         ]));
 
         let rewritten = rewrite_sql_with_type_casts(sql, &schema);
@@ -2018,6 +2021,14 @@ mod tests {
         assert!(
             !rewritten.contains("CAST($5 AS"),
             "Zoned timestamp parameter $5 should NOT be wrapped in CAST: {rewritten}"
+        );
+        assert!(
+            rewritten.contains("CAST($6 AS DATE)"),
+            "Date32 parameter $6 should be wrapped in CAST AS DATE: {rewritten}"
+        );
+        assert!(
+            !rewritten.contains("CAST($7 AS"),
+            "Date64 parameter $7 should NOT be wrapped in CAST: {rewritten}"
         );
     }
 

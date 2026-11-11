@@ -95,6 +95,9 @@ pub struct CayenneRuntimeConfig {
     /// Vortex footer-metadata cache. `None` when the operator set none, which is distinct
     /// from `Some(0)` — no footer cache at all.
     pub footer_cache_mb: Option<usize>,
+    /// The cluster membership of the `spiced` process, from `--role`: `None` for a
+    /// server or sidecar.
+    pub cluster_role: Option<runtime_component::ClusterRole>,
 }
 
 /// Runtime-level (not per-dataset) settings for one engine, at construction.
@@ -117,9 +120,7 @@ pub struct CayenneRuntimeConfig {
 pub enum AcceleratorRuntimeConfig {
     Arrow,
     PartitionedArrow,
-    DuckDB,
     Sqlite,
-    Turso,
     PostgreSQL,
     Cayenne(CayenneRuntimeConfig),
 }
@@ -131,9 +132,7 @@ impl AcceleratorRuntimeConfig {
         match self {
             Self::Arrow => Engine::Arrow,
             Self::PartitionedArrow => Engine::PartitionedArrow,
-            Self::DuckDB => Engine::DuckDB,
             Self::Sqlite => Engine::Sqlite,
-            Self::Turso => Engine::Turso,
             Self::PostgreSQL => Engine::PostgreSQL,
             Self::Cayenne(_) => Engine::Cayenne,
         }
@@ -149,9 +148,7 @@ impl AcceleratorRuntimeConfig {
         match engine {
             Engine::Arrow => Self::Arrow,
             Engine::PartitionedArrow => Self::PartitionedArrow,
-            Engine::DuckDB => Self::DuckDB,
             Engine::Sqlite => Self::Sqlite,
-            Engine::Turso => Self::Turso,
             Engine::PostgreSQL => Self::PostgreSQL,
             Engine::Cayenne => Self::Cayenne(CayenneRuntimeConfig::default()),
         }
@@ -354,7 +351,7 @@ pub enum Error {
     InvalidConfiguration { msg: String },
 
     #[snafu(display(
-        "Unknown acceleration engine '{engine}'. Valid engines are: arrow, duckdb, sqlite, turso, postgres/postgresql, cayenne/vortex. Docs: https://spiceai.org/docs/components/data-accelerators"
+        "Unknown acceleration engine '{engine}'. Valid engines are: arrow, sqlite, postgres/postgresql, cayenne/vortex. Docs: https://spiceai.org/docs/components/data-accelerators"
     ))]
     UnknownEngine { engine: Arc<str> },
 
@@ -438,13 +435,10 @@ impl AcceleratorEngineRegistry {
 
         // Normalize Dictionary-encoded types to their value types only for
         // accelerator engines that do not natively support Arrow Dictionary
-        // encoding (DuckDB, SQLite, Turso).  Other engines (Arrow, Cayenne,
+        // encoding (SQLite).  Other engines (Arrow, Cayenne,
         // PostgreSQL) handle Dictionary types natively and benefit from the
         // compact encoding.
-        let needs_dictionary_normalization = matches!(
-            engine.to_unpartitioned(),
-            Engine::DuckDB | Engine::Sqlite | Engine::Turso
-        );
+        let needs_dictionary_normalization = matches!(engine.to_unpartitioned(), Engine::Sqlite);
         let schema = if needs_dictionary_normalization
             && arrow_tools::schema::has_dictionary_types(&schema)
         {
@@ -685,7 +679,7 @@ pub trait DataAccelerator: Send + Sync {
     /// Returns the storage layout configuration for this accelerator.
     ///
     /// Returns the appropriate `AccelerationLayout` for this engine type:
-    /// - File-based accelerators (`DuckDB`, `SQLite`) return `AccelerationLayout::file`
+    /// - File-based accelerators (`SQLite`) return `AccelerationLayout::file`
     /// - Directory-based accelerators (Cayenne) return `AccelerationLayout::cayenne`
     ///
     /// This is used for snapshots and size metrics.
@@ -773,25 +767,6 @@ pub trait DataAccelerator: Send + Sync {
         _unset_refresh_mode: runtime_acceleration::acceleration::RefreshMode,
     ) -> Option<SpicepodWriteProfile> {
         None
-    }
-
-    /// This engine's contribution to the coordinated memory budget, summarised from the
-    /// pod's configuration *before* initialization.
-    ///
-    /// The runtime plans that budget (see
-    /// [`runtime_acceleration::memory_budget::plan`]) and must know how many distinct
-    /// engine instances a pod declares, which only the engine can say: instance identity
-    /// follows its own path-resolution rules. Answering here keeps that rule in one
-    /// place — a second implementation in the planner could key instances differently
-    /// and mis-size every cap.
-    ///
-    /// Defaults to no contribution, which is correct for an engine whose instances do
-    /// not compete for a shared memory ceiling.
-    fn memory_budget_inputs(
-        &self,
-        _app: Option<&Arc<app::App>>,
-    ) -> runtime_acceleration::memory_budget::DuckDbBudgetInputs {
-        runtime_acceleration::memory_budget::DuckDbBudgetInputs::default()
     }
 
     /// Drops an existing table from the acceleration engine.
@@ -939,7 +914,7 @@ pub trait DataAccelerator: Send + Sync {
     /// Engines that need to customise the on-disk archive contents (e.g.
     /// Cayenne, which ships a per-dataset metastore-slice JSON instead of
     /// the raw `cayenne.db` file) override this to return their engine.
-    /// File-based accelerators (`DuckDB` / `SQLite` / `Turso`) return `None` and
+    /// File-based accelerators (`SQLite`) return `None` and
     /// the default `SnapshotManager` engine selection applies.
     async fn snapshot_engine_for_source(
         &self,
@@ -974,7 +949,7 @@ pub type ReloadProviderFactory = Arc<
 #[snafu(display(
     "Acceleration engine '{engine}' does not support reloading from a snapshot. \
      `refresh_mode: snapshot` requires a snapshot-capable file-based engine \
-     (DuckDB, SQLite, Cayenne, or Turso)."
+     (Cayenne or SQLite)."
 ))]
 pub struct SnapshotReloadUnsupported {
     pub engine: &'static str,
@@ -1220,7 +1195,7 @@ pub async fn acceleration_file_path(
 /// This function retrieves the registered accelerator for the source's engine
 /// and returns the engine-specific layout. Different engines use
 /// different layout types:
-/// - File-based engines (`DuckDB`, `SQLite`): `AccelerationLayout::file`
+/// - File-based engines (`SQLite`): `AccelerationLayout::file`
 /// - Directory-based engines (Cayenne): `AccelerationLayout::cayenne`
 ///
 /// This is used for snapshots and size metrics.
@@ -1419,7 +1394,7 @@ mod tests {
                 .with_remove_duplicates(true)
                 .with_last_write_wins(true),
         ] {
-            let table = builder(Engine::DuckDB)
+            let table = builder(Engine::Sqlite)
                 .upsert_options(options.clone())
                 .build()
                 .expect("build succeeds");
@@ -1440,7 +1415,7 @@ mod tests {
     /// on the same "no deduplication" answer.
     #[test]
     fn no_upsert_options_means_no_keys_written_and_none_read_back() {
-        let table = builder(Engine::DuckDB).build().expect("build succeeds");
+        let table = builder(Engine::Sqlite).build().expect("build succeeds");
 
         assert!(!table.options.contains_key("upsert_remove_duplicates"));
         assert!(!table.options.contains_key("upsert_last_write_wins"));
@@ -1454,7 +1429,7 @@ mod tests {
     /// upserts on. Dropping them turns every upsert into a blind append.
     #[test]
     fn constraints_reach_the_created_table() {
-        let table = builder(Engine::DuckDB)
+        let table = builder(Engine::Sqlite)
             .constraints(pk(vec![0, 1]))
             .build()
             .expect("build succeeds");
@@ -1464,13 +1439,13 @@ mod tests {
 
     #[test]
     fn a_table_built_without_constraints_has_none_rather_than_a_stale_key() {
-        let table = builder(Engine::DuckDB).build().expect("build succeeds");
+        let table = builder(Engine::Sqlite).build().expect("build succeeds");
         assert!(table.constraints.is_empty());
     }
 
     #[test]
     fn the_on_conflict_behavior_reaches_the_created_table() {
-        let table = builder(Engine::DuckDB)
+        let table = builder(Engine::Sqlite)
             .on_conflict(OnConflict::Upsert(
                 datafusion_table_providers::util::column_reference::ColumnReference::try_from("id")
                     .expect("column reference"),
@@ -1486,7 +1461,7 @@ mod tests {
 
     #[test]
     fn the_write_mode_reaches_the_created_table() {
-        let table = builder(Engine::DuckDB)
+        let table = builder(Engine::Sqlite)
             .mode(Mode::File)
             .build()
             .expect("build succeeds");
@@ -1553,7 +1528,7 @@ mod tests {
                 );
 
                 let other_engine = Acceleration {
-                    engine: Engine::DuckDB,
+                    engine: Engine::Sqlite,
                     params: acceleration.params.clone(),
                     ..Acceleration::default()
                 };
@@ -1665,9 +1640,7 @@ mod tests {
         for engine in [
             Engine::Arrow,
             Engine::PartitionedArrow,
-            Engine::DuckDB,
             Engine::Sqlite,
-            Engine::Turso,
             Engine::PostgreSQL,
             Engine::Cayenne,
         ] {

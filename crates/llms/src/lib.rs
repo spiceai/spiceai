@@ -36,6 +36,7 @@ pub mod responses;
 pub mod spiceai;
 pub mod streaming_utils;
 pub mod typesafe;
+pub mod workload_identity;
 pub mod xai;
 
 // Engine crates register through `register_local_chat_engine!`, which names `linkme` through

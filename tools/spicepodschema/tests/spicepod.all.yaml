@@ -394,7 +394,7 @@ datasets:
         vector_size: 1536
     vectors:
       enabled: true
-      engine: duckdb
+      engine: s3_vectors
       partition_by:
         - name: category
           expression: category
@@ -410,7 +410,7 @@ datasets:
         index: articles_index
     acceleration:
       enabled: true
-      engine: duckdb
+      engine: cayenne
       mode: file # memory, file, file_create
       refresh_on_startup: auto # always, auto
       refresh_mode: full # full, append, changes, caching
@@ -436,11 +436,7 @@ datasets:
         id: upsert # drop, upsert, upsert_dedup, upsert_dedup_by_row_id
       snapshots: enabled # disabled, enabled, bootstrap_only, create_only
       params:
-        duckdb_file: ./data/postgres.duckdb
-        file_watcher: 'true'
-        connection_pool_size: '5'
-        on_refresh_recompute_statistics: 'true'
-        optimizer_duckdb_aggregate_pushdown: 'true'
+        cayenne_file_path: ./data/postgres.cayenne
       metrics:
         metrics:
           - name: acceleration.refresh_duration_ms
@@ -537,25 +533,6 @@ datasets:
         pg_connection_pool_min: '2'
         file_watcher: 'false'
         connection_pool_size: '15'
-
-  # ---------------------------------------------------------------------------
-  # Turso accelerator test
-  # ---------------------------------------------------------------------------
-  - name: turso_accel
-    from: postgres:public.data
-    params:
-      pg_host: localhost
-      pg_port: '5432'
-      pg_db: db
-      pg_user: user
-      pg_pass: pass
-    acceleration:
-      enabled: true
-      engine: turso
-      mode: file
-      params:
-        turso_turso_file: ./data/accel.turso
-        turso_internal_timestamp_format: integer_millis # rfc3339, integer_millis
 
   # ---------------------------------------------------------------------------
   # Cayenne accelerator test
@@ -826,6 +803,13 @@ datasets:
       github_workflow_logs: 'true'
       max_concurrent_requests: '6'
       include: '*.md'
+
+  - name: github_pulls_key_service
+    from: github:github.com/spiceai/spiceai/pulls
+    params:
+      github_client_id: client-id
+      github_installation_id: '123456'
+      github_private_key_kms: https://spice-vault.vault.azure.net/keys/github-app # or arn:aws:kms:<region>:<account>:alias/<name>
 
   # ---------------------------------------------------------------------------
   # Git connector
@@ -1156,7 +1140,7 @@ views:
       GROUP BY 1
     acceleration:
       enabled: true
-      engine: duckdb
+      engine: cayenne
       mode: memory
       refresh_mode: full
       refresh_check_interval: 5m
@@ -1166,9 +1150,9 @@ views:
     sql: SELECT id, content FROM postgres_full
     vectors:
       enabled: true
-      engine: duckdb
+      engine: s3_vectors
       params:
-        duckdb_file: ./vectors/view.duckdb
+        s3_vectors_bucket: my-vectors
 
 # =============================================================================
 # MODELS

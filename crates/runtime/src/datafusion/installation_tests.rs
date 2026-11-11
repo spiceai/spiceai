@@ -420,7 +420,7 @@ struct InitializationCase {
     expected_error: &'static str,
 }
 
-fn invalid_initializations(storage: &std::path::Path) -> [InitializationCase; 4] {
+fn invalid_initializations(storage: &std::path::Path) -> [InitializationCase; 2] {
     use crate::component::dataset::acceleration::Engine;
 
     let invalid_file = storage
@@ -444,21 +444,9 @@ fn invalid_initializations(storage: &std::path::Path) -> [InitializationCase; 4]
             expected_error: "contains the Cayenne metastore directory",
         },
         InitializationCase {
-            engine: Engine::DuckDB,
-            accelerator: Arc::new(accelerator_duckdb::DuckDBAccelerator::new()),
-            params: vec![("duckdb_file", invalid_file.clone())],
-            expected_error: "extension",
-        },
-        InitializationCase {
             engine: Engine::Sqlite,
             accelerator: Arc::new(accelerator_sqlite::SqliteAccelerator::new()),
-            params: vec![("sqlite_file", invalid_file.clone())],
-            expected_error: "extension",
-        },
-        InitializationCase {
-            engine: Engine::Turso,
-            accelerator: Arc::new(accelerator_turso::TursoAccelerator::new()),
-            params: vec![("turso_file", invalid_file)],
+            params: vec![("sqlite_file", invalid_file)],
             expected_error: "extension",
         },
     ]

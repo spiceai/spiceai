@@ -1,11 +1,11 @@
 name: mysql-cdc-parity
 description: >
   MySQL binlog CDC converges to the source after inserts, updates, deletes, key
-  changes and large transactions, across a clean stop and a kill: Cayenne under
-  each deletion mode, and DuckDB. With object-native data, the datasets' files
-  are in the state location, and an instance that loses its directory serves
-  the same rows from the location while the source is down, then resumes from
-  the binlog position the location holds once it is back.
+  changes and large transactions, across a clean stop and a kill: Cayenne
+  under each deletion mode, and in memory. With object-native data, the
+  datasets' files are in the state location, and an instance that loses its
+  directory serves the same rows from the location while the source is down,
+  then resumes from the binlog position the location holds once it is back.
 
 sources:
   src: { kind: mysql }
@@ -27,10 +27,8 @@ variants:
   object-native-position:
     spicepod: { runtime: { params: { cayenne_vnext: enabled } } }
     datasets: { '*': { acceleration: { params: { cayenne_deletion_mode: position } } } }
-  duckdb:
-    datasets:
-      orders: { acceleration: { engine: duckdb, mode: memory, on_conflict: { o_id: upsert } } }
-      customers: { acceleration: { engine: duckdb, mode: memory, on_conflict: { c_id: upsert } } }
+  cayenne-memory:
+    datasets: { '*': { acceleration: { mode: memory } } }
   # Object-native data (#16131): data files in the state location, which an
   # instance that loses its directory serves again without the source.
   object-native-data-local: object-native-data-local

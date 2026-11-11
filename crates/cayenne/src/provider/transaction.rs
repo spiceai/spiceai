@@ -446,7 +446,7 @@ async fn commit_fused(
     catalog: &dyn crate::catalog::MetadataCatalog,
     prepared: &mut [PreparedTxnCommit],
 ) -> std::result::Result<(), FusedFailure> {
-    use turso_shared::{DEFAULT_CONCURRENT_WRITE_MAX_ATTEMPTS, retry_backoff_delay};
+    use write_retry::{DEFAULT_CONCURRENT_WRITE_MAX_ATTEMPTS, retry_backoff_delay};
 
     for attempt in 1..=DEFAULT_CONCURRENT_WRITE_MAX_ATTEMPTS {
         let publications: Vec<_> = prepared
