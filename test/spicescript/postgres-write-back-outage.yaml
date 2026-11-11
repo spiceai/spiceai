@@ -8,6 +8,12 @@ description: >
 sources:
   src: { kind: postgres }
 
+# The spicepod as written, and the same with the prototype object-native
+# Cayenne metastore (`runtime.params.cayenne_vnext`) in place of SQLite.
+variants:
+  as-written: federated
+  object-native: object-native
+
 spicepod:
   version: v1
   kind: Spicepod
@@ -28,6 +34,9 @@ spicepod:
 
 defaults:
   expect: { oracle: src }
+  # Either writer may win the race for row 5, so instances can hold different
+  # owners; every instance is checked against its own source instead.
+  compare-variants: false
 
 steps:
   - source-exec:

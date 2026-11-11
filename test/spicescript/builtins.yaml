@@ -10,6 +10,8 @@ sources:
 
 variants:
   cayenne: cayenne-file
+  # `cayenne` with the prototype object-native Cayenne metastore.
+  cayenne-object-native: cayenne-file-object-native
   # DataFusion evaluates everything: the answer every other place must match.
   cayenne-memory: cayenne-memory
   federated: {}

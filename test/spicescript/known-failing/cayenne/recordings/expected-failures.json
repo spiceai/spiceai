@@ -34,24 +34,6 @@
       ]
     }
   ],
-  "cayenne-file-create-reload": [
-    {
-      "run": "cayenne-file-create-reload",
-      "who": "default",
-      "key": "query: SELECT id, v FROM file_create_reload #2",
-      "kind": "empty",
-      "signature": "still failing after <n> attempts over <duration>: Spice returned no rows, expected 16",
-      "group": "cayenne"
-    },
-    {
-      "run": "cayenne-file-create-reload",
-      "who": "default",
-      "key": "query: SELECT id, v FROM file_create_reload #3",
-      "kind": "empty",
-      "signature": "still failing after <n> attempts over <duration>: Spice returned no rows, expected 24",
-      "group": "cayenne"
-    }
-  ],
   "cayenne-file-durability-date-key": [
     {
       "run": "cayenne-file-durability-date-key",
@@ -216,6 +198,16 @@
       "kind": "wrong-answer",
       "signature": "stopped matching after <duration> (3 attempts): answer differs from the expected one: DataMismatch { column: \"n\", row_number: 1, expected: \"\\\"1000\\\"\", actual: \"\\\"1002\\\"\" }",
       "pattern": "answer differs from the expected one: DataMismatch \\{ column: \"n\"",
+      "group": "cayenne",
+      "may-pass": true
+    },
+    {
+      "run": "cayenne-torn-reads",
+      "who": "object-native",
+      "key": "stop-background: read-join",
+      "kind": "other",
+      "signature": "<n> of <m> iterations failed; first: invariant broken: n = below expected Some(\"1000\")",
+      "pattern": "iterations failed; first: invariant broken: (n|total) = (above|below) expected",
       "group": "cayenne",
       "may-pass": true
     }
@@ -884,12 +876,72 @@
       "pattern": "code: 'Some resource has been exhausted'",
       "group": "cayenne",
       "may-pass": true
+    },
+    {
+      "run": "memory-limit-spill",
+      "who": "object-native",
+      "key": "query: SELECT s, id FROM (SELECT s, id, row_number() OVER (ORDER BY s, id) AS r FROM big) t WHERE r % 200000 = 0 ORDER BY r",
+      "kind": "error",
+      "signature": "Spice rejected the query: Tonic error: code: 'Some resource has been exhausted', message: \"Additional allocation failed for ExternalSorterMerge[<n>]",
+      "pattern": "code: 'Some resource has been exhausted'",
+      "group": "cayenne",
+      "may-pass": true
+    },
+    {
+      "run": "memory-limit-spill",
+      "who": "object-native",
+      "key": "query: SELECT count(DISTINCT k) AS dk, count(DISTINCT s) AS ds FROM big",
+      "kind": "error",
+      "signature": "Spice rejected the query: Tonic error: code: 'Some resource has been exhausted', message: \"Additional allocation failed for AggregateStream[<n>]",
+      "pattern": "code: 'Some resource has been exhausted'",
+      "group": "cayenne",
+      "may-pass": true
+    },
+    {
+      "run": "memory-limit-spill",
+      "who": "object-native",
+      "key": "query: SELECT g, count(DISTINCT k) AS dk, max(s) AS ms FROM big GROUP BY g ORDER BY g",
+      "kind": "error",
+      "signature": "Spice rejected the query: Tonic error: code: 'Some resource has been exhausted', message: \"Failed to scan dataset big (cayenne): Out of query memory. Reading one batch of it needs 1.19 MiB, which fits the 64.00 MiB query memory pool on its own but not alongside the 62.85 MiB other queries are holdin",
+      "pattern": "code: 'Some resource has been exhausted'",
+      "group": "cayenne",
+      "may-pass": true
+    },
+    {
+      "run": "memory-limit-spill",
+      "who": "object-native",
+      "key": "query: SELECT count(*) AS n, count(DISTINCT d.label) AS labels FROM big b JOIN dim d ON b.k = d.id",
+      "kind": "error",
+      "signature": "Spice rejected the query: Tonic error: code: 'Some resource has been exhausted', message: \"Failed to scan dataset big (cayenne): Out of query memory. Reading one batch of it needs 1.00 MiB, which fits the 64.00 MiB query memory pool on its own but not alongside the 63.07 MiB other queries are holdin",
+      "pattern": "code: 'Some resource has been exhausted'",
+      "group": "cayenne",
+      "may-pass": true
+    },
+    {
+      "run": "memory-limit-spill",
+      "who": "object-native",
+      "key": "query: SELECT d.id, count(*) AS n FROM dim d JOIN big b ON b.k = d.id GROUP BY d.id ORDER BY n DESC, d.id LIMIT 10",
+      "kind": "error",
+      "signature": "Spice rejected the query: Tonic error: code: 'Some resource has been exhausted', message: \"Additional allocation failed for ExternalSorterMerge[<n>]",
+      "pattern": "code: 'Some resource has been exhausted'",
+      "group": "cayenne",
+      "may-pass": true
+    },
+    {
+      "run": "memory-limit-spill",
+      "who": "object-native",
+      "key": "query: SELECT g, max(rk) AS top FROM (SELECT g, rank() OVER (PARTITION BY g ORDER BY v DESC, id) AS rk FROM big) t GROUP BY g ORDER BY g",
+      "kind": "error",
+      "signature": "Spice rejected the query: Tonic error: code: 'Some resource has been exhausted', message: \"Additional allocation failed for ExternalSorterMerge[<n>]",
+      "pattern": "code: 'Some resource has been exhausted'",
+      "group": "cayenne",
+      "may-pass": true
     }
   ],
   "postgres-cdc-kill-during-compaction": [
     {
       "run": "postgres-cdc-kill-during-compaction[run=1]",
-      "who": "default",
+      "who": "as-written",
       "key": "query: SELECT count(*), count(DISTINCT o_id), sum(v), sum(grp), count(note) FROM orders",
       "kind": "wrong-answer",
       "signature": "answer differs from the expected one: (DataMismatch|RowCountMismatch) \\{",
@@ -899,7 +951,7 @@
     },
     {
       "run": "postgres-cdc-kill-during-compaction[run=1]",
-      "who": "default",
+      "who": "as-written",
       "key": "query: SELECT * FROM orders WHERE o_id % 997 = 0",
       "kind": "wrong-answer",
       "signature": "answer differs from the expected one: (DataMismatch|RowCountMismatch) \\{",
@@ -909,7 +961,7 @@
     },
     {
       "run": "postgres-cdc-kill-during-compaction[run=1]",
-      "who": "default",
+      "who": "as-written",
       "key": "query: SELECT grp, count(*), sum(v) FROM orders GROUP BY grp",
       "kind": "wrong-answer",
       "signature": "answer differs from the expected one: (DataMismatch|RowCountMismatch) \\{",
@@ -919,7 +971,7 @@
     },
     {
       "run": "postgres-cdc-kill-during-compaction[run=1]",
-      "who": "default",
+      "who": "as-written",
       "key": "query: SELECT count(*), sum(v), sum(grp) FROM orders #2",
       "kind": "wrong-answer",
       "signature": "answer differs from the expected one: (DataMismatch|RowCountMismatch) \\{",
@@ -929,7 +981,7 @@
     },
     {
       "run": "postgres-cdc-kill-during-compaction[run=2]",
-      "who": "default",
+      "who": "as-written",
       "key": "query: SELECT count(*), count(DISTINCT o_id), sum(v), sum(grp), count(note) FROM orders",
       "kind": "wrong-answer",
       "signature": "answer differs from the expected one: (DataMismatch|RowCountMismatch) \\{",
@@ -939,7 +991,7 @@
     },
     {
       "run": "postgres-cdc-kill-during-compaction[run=2]",
-      "who": "default",
+      "who": "as-written",
       "key": "query: SELECT * FROM orders WHERE o_id % 997 = 0",
       "kind": "wrong-answer",
       "signature": "answer differs from the expected one: (DataMismatch|RowCountMismatch) \\{",
@@ -949,7 +1001,7 @@
     },
     {
       "run": "postgres-cdc-kill-during-compaction[run=2]",
-      "who": "default",
+      "who": "as-written",
       "key": "query: SELECT grp, count(*), sum(v) FROM orders GROUP BY grp",
       "kind": "wrong-answer",
       "signature": "answer differs from the expected one: (DataMismatch|RowCountMismatch) \\{",
@@ -959,7 +1011,7 @@
     },
     {
       "run": "postgres-cdc-kill-during-compaction[run=2]",
-      "who": "default",
+      "who": "as-written",
       "key": "query: SELECT count(*), sum(v), sum(grp) FROM orders #2",
       "kind": "wrong-answer",
       "signature": "answer differs from the expected one: (DataMismatch|RowCountMismatch) \\{",
@@ -969,7 +1021,7 @@
     },
     {
       "run": "postgres-cdc-kill-during-compaction[run=3]",
-      "who": "default",
+      "who": "as-written",
       "key": "query: SELECT count(*), count(DISTINCT o_id), sum(v), sum(grp), count(note) FROM orders",
       "kind": "wrong-answer",
       "signature": "answer differs from the expected one: (DataMismatch|RowCountMismatch) \\{",
@@ -979,7 +1031,7 @@
     },
     {
       "run": "postgres-cdc-kill-during-compaction[run=3]",
-      "who": "default",
+      "who": "as-written",
       "key": "query: SELECT * FROM orders WHERE o_id % 997 = 0",
       "kind": "wrong-answer",
       "signature": "answer differs from the expected one: (DataMismatch|RowCountMismatch) \\{",
@@ -989,7 +1041,7 @@
     },
     {
       "run": "postgres-cdc-kill-during-compaction[run=3]",
-      "who": "default",
+      "who": "as-written",
       "key": "query: SELECT grp, count(*), sum(v) FROM orders GROUP BY grp",
       "kind": "wrong-answer",
       "signature": "answer differs from the expected one: (DataMismatch|RowCountMismatch) \\{",
@@ -999,7 +1051,7 @@
     },
     {
       "run": "postgres-cdc-kill-during-compaction[run=3]",
-      "who": "default",
+      "who": "as-written",
       "key": "query: SELECT count(*), sum(v), sum(grp) FROM orders #2",
       "kind": "wrong-answer",
       "signature": "answer differs from the expected one: (DataMismatch|RowCountMismatch) \\{",
@@ -1009,7 +1061,7 @@
     },
     {
       "run": "postgres-cdc-kill-during-compaction[run=4]",
-      "who": "default",
+      "who": "as-written",
       "key": "query: SELECT count(*), count(DISTINCT o_id), sum(v), sum(grp), count(note) FROM orders",
       "kind": "wrong-answer",
       "signature": "answer differs from the expected one: (DataMismatch|RowCountMismatch) \\{",
@@ -1019,7 +1071,7 @@
     },
     {
       "run": "postgres-cdc-kill-during-compaction[run=4]",
-      "who": "default",
+      "who": "as-written",
       "key": "query: SELECT * FROM orders WHERE o_id % 997 = 0",
       "kind": "wrong-answer",
       "signature": "answer differs from the expected one: (DataMismatch|RowCountMismatch) \\{",
@@ -1029,7 +1081,7 @@
     },
     {
       "run": "postgres-cdc-kill-during-compaction[run=4]",
-      "who": "default",
+      "who": "as-written",
       "key": "query: SELECT grp, count(*), sum(v) FROM orders GROUP BY grp",
       "kind": "wrong-answer",
       "signature": "answer differs from the expected one: (DataMismatch|RowCountMismatch) \\{",
@@ -1039,7 +1091,7 @@
     },
     {
       "run": "postgres-cdc-kill-during-compaction[run=4]",
-      "who": "default",
+      "who": "as-written",
       "key": "query: SELECT count(*), sum(v), sum(grp) FROM orders #2",
       "kind": "wrong-answer",
       "signature": "answer differs from the expected one: (DataMismatch|RowCountMismatch) \\{",
@@ -1049,7 +1101,7 @@
     },
     {
       "run": "postgres-cdc-kill-during-compaction[run=5]",
-      "who": "default",
+      "who": "as-written",
       "key": "query: SELECT count(*), count(DISTINCT o_id), sum(v), sum(grp), count(note) FROM orders",
       "kind": "wrong-answer",
       "signature": "answer differs from the expected one: (DataMismatch|RowCountMismatch) \\{",
@@ -1059,7 +1111,7 @@
     },
     {
       "run": "postgres-cdc-kill-during-compaction[run=5]",
-      "who": "default",
+      "who": "as-written",
       "key": "query: SELECT * FROM orders WHERE o_id % 997 = 0",
       "kind": "wrong-answer",
       "signature": "answer differs from the expected one: (DataMismatch|RowCountMismatch) \\{",
@@ -1069,7 +1121,7 @@
     },
     {
       "run": "postgres-cdc-kill-during-compaction[run=5]",
-      "who": "default",
+      "who": "as-written",
       "key": "query: SELECT grp, count(*), sum(v) FROM orders GROUP BY grp",
       "kind": "wrong-answer",
       "signature": "answer differs from the expected one: (DataMismatch|RowCountMismatch) \\{",
@@ -1079,7 +1131,7 @@
     },
     {
       "run": "postgres-cdc-kill-during-compaction[run=5]",
-      "who": "default",
+      "who": "as-written",
       "key": "query: SELECT count(*), sum(v), sum(grp) FROM orders #2",
       "kind": "wrong-answer",
       "signature": "answer differs from the expected one: (DataMismatch|RowCountMismatch) \\{",

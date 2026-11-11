@@ -14,6 +14,8 @@ variants:
   federated: {}
   cayenne-memory: cayenne-memory
   cayenne: cayenne-file
+  # `cayenne` with the prototype object-native Cayenne metastore.
+  cayenne-object-native: cayenne-file-object-native
   adbc:
     when: { backend: duckdb }
     datasets:
@@ -129,7 +131,7 @@ steps:
   - query: SELECT count(*) AS n FROM p WHERE c NOT IN (SELECT x + y FROM b WHERE id < 0)
   - explain: SELECT id FROM p WHERE c IN (SELECT x + y FROM b)
     contains: CayenneAccelerationExec
-    only: cayenne
+    only: [cayenne, cayenne-object-native]
   # All-NULL builds differ from empty builds for both ANY and ALL.
   - query: SELECT count(*) AS n FROM p WHERE c < ANY (SELECT x + y FROM b WHERE x IS NULL)
   - query: SELECT count(*) AS n FROM p WHERE c < ALL (SELECT x + y FROM b WHERE x IS NULL)

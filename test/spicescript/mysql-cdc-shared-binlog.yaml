@@ -20,6 +20,8 @@ variants:
   fail-loud: {}
   restart:
     datasets: { '*': { params: { mysql_replication_invalid_checkpoint_behavior: restart } } }
+  # The spicepod as written, with the prototype object-native Cayenne metastore.
+  object-native: object-native
 
 spicepod:
   version: v1
@@ -162,10 +164,10 @@ steps:
   # (known-failing/cdc-mysql/mysql-cdc-shared-binlog-purged-status.yaml); the log always does.
   - assert-status: { dataset: a, status: Error }
     eventually: 60s
-    only: fail-loud
+    only: [fail-loud, object-native]
   - assert-log: { contains: 'mysql_replication_invalid_checkpoint_behavior' }
     eventually: 30s
-    only: fail-loud
+    only: [fail-loud, object-native]
   - query: SELECT * FROM a
     oracle-sql: SELECT * FROM ta
     eventually: 90s

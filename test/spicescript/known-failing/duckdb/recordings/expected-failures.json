@@ -55,6 +55,30 @@
       "kind": "error",
       "signature": "still failing after <n> attempts over <duration>: Spice rejected the query: could not decode the HTTP JSON answer as Flight's schema; body: [{\"id\":1,\"t_interval\":\"1.000000000 secs\"},{\"id\":2,\"t_interval\":\"2.000000000 secs\"},{\"id\":3,\"t_interval\":\"0 secs\"},{\"id\":4,\"t_interval\":null}]: Not yet implement",
       "group": "duckdb"
+    },
+    {
+      "run": "duckdb-types-known",
+      "who": "cayenne-object-native",
+      "key": "query: SELECT table_name, column_name, data_type FROM information_schema.columns WHERE table_name = 'iv' ORDER BY ordinal_position",
+      "kind": "empty",
+      "signature": "still failing after <n> attempts over <duration>: Spice returned no rows, expected 2",
+      "group": "duckdb"
+    },
+    {
+      "run": "duckdb-types-known",
+      "who": "cayenne-object-native",
+      "key": "query: SELECT id, t_interval FROM iv ORDER BY id",
+      "kind": "error",
+      "signature": "still failing after <n> attempts over <duration>: Spice rejected the query: Flight rejected the query: Query execution failed. table 'spice.public.iv' not found: table 'spice.public.iv' not found",
+      "group": "duckdb"
+    },
+    {
+      "run": "duckdb-types-known",
+      "who": "cayenne-object-native",
+      "key": "query: SELECT id, t_interval FROM iv ORDER BY id #2",
+      "kind": "error",
+      "signature": "still failing after <n> attempts over <duration>: Spice rejected the query: Flight rejected the query: Query execution failed. table 'spice.public.iv' not found: table 'spice.public.iv' not found",
+      "group": "duckdb"
     }
   ],
   "vector-search-score-duckdb": [

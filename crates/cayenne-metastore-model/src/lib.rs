@@ -1067,6 +1067,38 @@ pub fn runs() -> Vec<Run> {
             failure: "I8 visible replay equality",
         },
         Run {
+            name: "transactions-txn-no-fence-check-0-exhaust",
+            family: "transactions",
+            mode: "resolution-txn-no-fence-check",
+            bound: 0,
+            seed: None,
+            failure: "a prepared participant keeps its transaction's records",
+        },
+        Run {
+            name: "transactions-txn-no-prepared-check-1-exhaust",
+            family: "transactions",
+            mode: "resolution-txn-no-prepared-check",
+            bound: 1,
+            seed: None,
+            failure: "a prepared participant keeps its transaction's records",
+        },
+        Run {
+            name: "transactions-txn-no-intent-check-1-exhaust",
+            family: "transactions",
+            mode: "resolution-txn-no-intent-check",
+            bound: 1,
+            seed: None,
+            failure: "the coordinator reports the transaction's decision",
+        },
+        Run {
+            name: "transactions-txn-no-coordinator-wait-0-exhaust",
+            family: "transactions",
+            mode: "resolution-txn-no-coordinator-wait",
+            bound: 0,
+            seed: None,
+            failure: "a prepared participant keeps its transaction's records",
+        },
+        Run {
             name: "transactions-txn-no-roots-0-exhaust",
             family: "transactions",
             mode: "resolution-txn-no-roots",
@@ -2310,6 +2342,115 @@ fn additional_runs() -> Vec<Run> {
     runs
 }
 
+/// Appends one JSON line to the file named by `TRACE_JSON`, if set: the
+/// action sequences that trace replay maps onto real storage code.
+fn trace_json(line: &str) {
+    use std::io::Write as _;
+    let Ok(path) = std::env::var("TRACE_JSON") else {
+        return;
+    };
+    if let Ok(mut file) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+    {
+        let _ = writeln!(file, "{line}");
+    }
+}
+
+fn json_string(value: &str) -> String {
+    use std::fmt::Write as _;
+    let mut out = String::with_capacity(value.len() + 2);
+    out.push('"');
+    for c in value.chars() {
+        match c {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            '\n' => out.push_str("\\n"),
+            c if u32::from(c) < 0x20 => {
+                let _ = write!(out, "\\u{:04x}", u32::from(c));
+            }
+            c => out.push(c),
+        }
+    }
+    out.push('"');
+    out
+}
+
+fn json_actions<A: std::fmt::Debug>(actions: &[A]) -> String {
+    let items: Vec<String> = actions
+        .iter()
+        .map(|action| json_string(&format!("{action:?}")))
+        .collect();
+    format!("[{}]", items.join(","))
+}
+
+/// Seeded random walks over `model` (`WALK=<seed>:<count>:<max_steps>`), each
+/// written as a JSON line with the properties that failed along it, if any.
+fn walk<M>(model: &M, run: &Run, spec: &str) -> bool
+where
+    M: Model,
+    M::State: Clone + std::fmt::Debug,
+    M::Action: Clone + PartialEq + std::fmt::Debug,
+{
+    let mut parts = spec.split(':').map(|part| part.parse::<u64>().unwrap_or(0));
+    let seed = parts.next().unwrap_or(1).max(1);
+    let count = parts.next().unwrap_or(100);
+    let max_steps = parts.next().unwrap_or(50);
+    let mut rng = seed;
+    let mut next = move |bound: usize| {
+        rng ^= rng << 13;
+        rng ^= rng >> 7;
+        rng ^= rng << 17;
+        usize::try_from(rng % (bound as u64).max(1)).unwrap_or(0)
+    };
+    let properties = model.properties();
+    let initials = model.init_states();
+    let mut good = true;
+    for walk_index in 0..count {
+        let initial_index = next(initials.len());
+        let mut state = initials[initial_index].clone();
+        let mut actions = Vec::new();
+        let mut failed: Vec<&str> = Vec::new();
+        for _ in 0..max_steps {
+            let mut enabled = vec![];
+            model.actions(&state, &mut enabled);
+            if enabled.is_empty() {
+                break;
+            }
+            let action = enabled[next(enabled.len())].clone();
+            let Some(after) = model.next_state(&state, action.clone()) else {
+                break;
+            };
+            state = after;
+            actions.push(action);
+            for p in &properties {
+                if p.expectation == Expectation::Always
+                    && !(p.condition)(model, &state)
+                    && !failed.contains(&p.name)
+                {
+                    failed.push(p.name);
+                }
+            }
+        }
+        good &= failed.is_empty() || !run.failure.is_empty();
+        let failed: Vec<String> = failed.iter().map(|name| json_string(name)).collect();
+        trace_json(&format!(
+            "{{\"kind\":\"walk\",\"run\":{},\"family\":{},\"mode\":{},\"seed\":{seed},\"walk\":{walk_index},\"initial_index\":{initial_index},\"failed\":[{}],\"actions\":{}}}",
+            json_string(run.name),
+            json_string(run.family),
+            json_string(run.mode),
+            failed.join(","),
+            json_actions(&actions)
+        ));
+    }
+    println!(
+        "WALKS {} seed={seed} count={count} max_steps={max_steps} good={good}",
+        run.name
+    );
+    good
+}
+
 fn replay<M: Model>(model: &M, initial: &M::State, actions: &[M::Action]) -> Option<M::State>
 where
     M::Action: Clone + PartialEq,
@@ -2419,6 +2560,9 @@ where
     M::State: Clone + std::fmt::Debug + Send + Sync + std::hash::Hash + PartialEq,
     M::Action: Clone + PartialEq + std::fmt::Debug + Send + Sync,
 {
+    if let Ok(spec) = std::env::var("WALK") {
+        return walk(&model, &run, &spec);
+    }
     println!("START {}", run.name);
     let _simulating = Simulating::start(run.seed.is_some());
     let start = Instant::now();
@@ -2598,6 +2742,13 @@ fn required_witness(run: &Run, name: &str, expectation: &Expectation) -> bool {
         && run.seed.is_none()
         && match (run.family, name) {
             (
+                "transactions",
+                "the coordinator removes the records"
+                | "another process removes the records after a takeover"
+                | "a decision object recreated after removal"
+                | "the coordinator aborts at its deadline and reports it",
+            ) => run.mode == "resolution-txn" && run.bound >= 1,
+            (
                 "remote-maintenance",
                 "writer retries original stamps then commits" | "maintenance retries guards",
             )
@@ -2764,6 +2915,16 @@ where
                 "MINIMIZED enabled={valid} steps={} {action:?}",
                 action.len()
             );
+            trace_json(&format!(
+                "{{\"kind\":\"witness\",\"run\":{},\"family\":{},\"mode\":{},\"property\":{},\"status\":{},\"valid\":{valid},\"initial_index\":{},\"actions\":{}}}",
+                json_string(run.name),
+                json_string(run.family),
+                json_string(run.mode),
+                json_string(p.name),
+                json_string(status),
+                initial_index.map_or_else(|| "null".to_string(), |i| i.to_string()),
+                json_actions(&action)
+            ));
             if (run.family.ends_with("-progress")
                 || run.family == "read-programs"
                 || run.family == "read-delivery"
@@ -2878,6 +3039,32 @@ pub fn run(name: &str) -> Result<(), String> {
     } else {
         Err(format!("Unexpected outcome for {name}"))
     }
+}
+
+/// The head the window run named `run` leaves after `actions`: each listed batch's
+/// end (commit numbers count from 1) and each inline record's symbolic size.
+/// `None` for an unknown run, a run of another family, or an action the run does
+/// not enable at that point.
+#[must_use]
+pub fn window_head_after(run: &str, actions: &[String]) -> Option<(Vec<usize>, Vec<usize>)> {
+    let run = runs()
+        .into_iter()
+        .find(|r| r.name == run && r.family == "window")?;
+    window::head_after(run.mode, run.bound, actions)
+}
+
+pub use transactions::Step as TransactionStep;
+
+/// What each action of a `transactions` trace from `run` does in the model:
+/// the record that lands or the delivery refused, the decision and every
+/// participant's log after it. `None` for an unknown run, a run of another
+/// family, or an action the run does not enable at that point.
+#[must_use]
+pub fn transaction_steps(run: &str, actions: &[String]) -> Option<Vec<TransactionStep>> {
+    let run = runs()
+        .into_iter()
+        .find(|r| r.name == run && r.family == "transactions")?;
+    transactions::steps(run.mode, run.bound, actions)
 }
 
 /// Problems with the model citations in design documents: a cited run that does

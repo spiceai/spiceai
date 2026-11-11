@@ -184,17 +184,20 @@ pub enum StateFeature {
     RateControl,
     ResultsCacheWarmup,
     Snapshots,
+    /// The Cayenne object-native metastore's head logs.
+    CayenneMetastore,
     /// The startup check of a `runtime.state` location, which keeps
     /// `format.json` and its probe object in the location's `_spice/` folder.
     StartupCheck,
 }
 
 impl StateFeature {
-    pub const ALL: [Self; 5] = [
+    pub const ALL: [Self; 6] = [
         Self::Scheduler,
         Self::RateControl,
         Self::ResultsCacheWarmup,
         Self::Snapshots,
+        Self::CayenneMetastore,
         Self::StartupCheck,
     ];
 
@@ -207,6 +210,7 @@ impl StateFeature {
             Self::RateControl => Some("rate_control"),
             Self::ResultsCacheWarmup => Some("results_cache_warmup"),
             Self::Snapshots => Some("snapshots"),
+            Self::CayenneMetastore => Some("cayenne_metastore"),
             Self::StartupCheck => None,
         }
     }
@@ -218,6 +222,7 @@ impl StateFeature {
             Self::RateControl => "rate-control",
             Self::ResultsCacheWarmup => "results-cache",
             Self::Snapshots => SNAPSHOTS_STATE_FOLDER,
+            Self::CayenneMetastore => "cayenne",
             Self::StartupCheck => "_spice",
         }
     }
@@ -228,6 +233,7 @@ impl StateFeature {
             Self::RateControl => "rate-control state",
             Self::ResultsCacheWarmup => "SQL results cache warmup state",
             Self::Snapshots => "snapshot",
+            Self::CayenneMetastore => "Cayenne metastore",
             Self::StartupCheck => "shared state location check",
         }
     }
@@ -240,6 +246,7 @@ impl StateFeature {
             Self::RateControl => "source rate control",
             Self::ResultsCacheWarmup => "SQL results cache warmup",
             Self::Snapshots => "acceleration snapshots",
+            Self::CayenneMetastore => "the Cayenne metastore",
             Self::StartupCheck => "the startup check",
         }
     }
@@ -251,7 +258,11 @@ impl StateFeature {
         match (self, source) {
             (Self::Snapshots, _) | (_, StateSource::RuntimeState) => &SNAPSHOT_S3_PARAMETERS,
             (
-                Self::Scheduler | Self::RateControl | Self::ResultsCacheWarmup | Self::StartupCheck,
+                Self::Scheduler
+                | Self::RateControl
+                | Self::ResultsCacheWarmup
+                | Self::CayenneMetastore
+                | Self::StartupCheck,
                 _,
             ) => &S3_PARAMETERS,
         }
@@ -337,15 +348,19 @@ async fn build_unmetered_object_store(
                 location: local_path.display().to_string(),
             })?;
 
-        let store: Arc<dyn ObjectStore> = Arc::new(
-            object_store_occ::LocalConditionalPut::new(&local_path).map_err(|source| {
-                Error::LocalFileSystemInit {
-                    usage,
-                    location: local_path.display().to_string(),
-                    source: Box::new(source),
-                }
-            })?,
-        );
+        // The Cayenne metastore acknowledges a source once its commit is
+        // published, so its puts must be on disk when they return.
+        let local = if feature == StateFeature::CayenneMetastore {
+            object_store_occ::LocalConditionalPut::new_durable(&local_path)
+        } else {
+            object_store_occ::LocalConditionalPut::new(&local_path)
+        };
+        let store: Arc<dyn ObjectStore> =
+            Arc::new(local.map_err(|source| Error::LocalFileSystemInit {
+                usage,
+                location: local_path.display().to_string(),
+                source: Box::new(source),
+            })?);
 
         return Ok((store, feature_prefix("")));
     }
@@ -764,6 +779,29 @@ mod tests {
             UpdateResult::Conflict { current } => assert_eq!(current, remote_update),
             other => panic!("expected Conflict, got {other:?}"),
         }
+    }
+
+    /// The Cayenne metastore acknowledges a source only once its commit is
+    /// durable, so on a local directory every put must be synced: a store that
+    /// returns before the bytes reach the disk loses acknowledged commits on
+    /// power loss.
+    #[tokio::test]
+    async fn a_file_location_keeps_the_cayenne_metastore_on_synced_puts() {
+        let temp_dir = tempfile::tempdir().expect("create temp dir");
+        let state_location = format!("file://{}", temp_dir.path().display());
+        let (store, prefix) = build_object_store(
+            secrets(),
+            Handle::current(),
+            &runtime_state(&state_location, &[]),
+            StateFeature::CayenneMetastore,
+        )
+        .await
+        .expect("file state store should build");
+        assert_eq!(prefix, "cayenne");
+        assert!(
+            store.to_string().ends_with(", durable)"),
+            "the Cayenne metastore's local store does not sync its puts: {store}"
+        );
     }
 
     #[tokio::test]

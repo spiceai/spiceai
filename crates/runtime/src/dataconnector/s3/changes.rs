@@ -307,6 +307,12 @@ impl CommitChange for AppliedKeysCommitter {
         self.applied.lock().commit(self.generation, &self.keys);
         self.inner.commit().await
     }
+
+    fn record_position(
+        &self,
+    ) -> Option<futures::future::BoxFuture<'static, std::result::Result<(), CommitError>>> {
+        self.inner.record_position()
+    }
 }
 
 impl Drop for AppliedKeysCommitter {
