@@ -47,7 +47,8 @@ pub(crate) mod vector_io;
 // Public API - re-exported in provider/mod.rs
 pub use sink::CayenneDeletionSink;
 pub(crate) use sink::{
-    CaptureLocks, DeleteScanSource, PreparedDeletionPublish, file_based::FileBasedDeletionSink,
+    CaptureLocks, DeleteScanSource, PreparedDeletionPublish, SkipKeys,
+    file_based::FileBasedDeletionSink,
 };
 
 // Crate-internal types used by table.rs

@@ -567,8 +567,54 @@ pub struct CayenneDeletionSink {
 /// encoding. Bounded by the write, not the table.
 #[derive(Debug, Default)]
 pub(crate) struct SkipKeys {
-    int64: std::collections::HashSet<i64>,
-    rows: std::collections::HashSet<Box<[u8]>>,
+    pub(crate) int64: std::collections::HashSet<i64>,
+    pub(crate) rows: std::collections::HashSet<Box<[u8]>>,
+}
+
+/// One row's key in a sink's encoding.
+pub(crate) enum RowKey {
+    Int64(i64),
+    Bytes(Box<[u8]>),
+}
+
+impl RowKey {
+    /// Whether `keys` holds this key.
+    pub(crate) fn is_in(&self, keys: &SkipKeys) -> bool {
+        match self {
+            Self::Int64(key) => keys.int64.contains(key),
+            Self::Bytes(key) => keys.rows.contains(key),
+        }
+    }
+
+    /// Adds this key to `keys`.
+    pub(crate) fn insert_into(self, keys: &mut SkipKeys) {
+        match self {
+            Self::Int64(key) => {
+                keys.int64.insert(key);
+            }
+            Self::Bytes(key) => {
+                keys.rows.insert(key);
+            }
+        }
+    }
+}
+
+impl SkipKeys {
+    /// Adds `other`'s keys.
+    pub(crate) fn absorb(&mut self, other: SkipKeys) {
+        self.int64.extend(other.int64);
+        self.rows.extend(other.rows);
+    }
+
+    /// Whether no key is held.
+    pub(crate) fn is_empty(&self) -> bool {
+        self.int64.is_empty() && self.rows.is_empty()
+    }
+
+    /// How many keys are held.
+    pub(crate) fn len(&self) -> usize {
+        self.int64.len() + self.rows.len()
+    }
 }
 
 /// The locks a coherent (listing, deletion index) capture holds, outer first.
@@ -682,6 +728,98 @@ impl CayenneDeletionSink {
             }
         }
         Ok(keys)
+    }
+
+    /// The keys of the LIVE rows the filters match across every scan source,
+    /// with the skip set and visibility applied BEFORE the filters (wire one
+    /// with [`Self::with_skip_before_filters`]). Writes nothing: the caller
+    /// publishes the keys as it publishes its own deletes.
+    pub(crate) async fn matching_live_keys(&self) -> super::super::Result<SkipKeys> {
+        let table_name = &self.table_metadata.table_name;
+        if self.filters.is_empty() || self.pk_deletion_strategy.is_position_based() {
+            return Err(Error::Internal {
+                table: table_name.clone(),
+                message: "matching live keys needs a predicate and a key strategy".to_string(),
+            });
+        }
+        let ctx = SessionContext::new_with_config_rt(
+            util::session_state::session_config(),
+            Arc::clone(&self.runtime_env),
+        );
+        let mut tables = vec![self.capture_main_scan_source().await];
+        tables.extend(self.additional_scan_tables.iter().cloned());
+        let coerced_filters = self.coerce_filters_for_schema()?;
+        let (scan_projection, scan_schema) = self.filtered_delete_projection(&coerced_filters)?;
+        let physical_filters = Self::build_physical_filters(&coerced_filters, &scan_schema)?;
+        let pk: Vec<usize> = (0..self.pk_column_indices.len()).collect();
+        let mut keys = SkipKeys::default();
+        for source in &tables {
+            let scan_plan = source
+                .table
+                .scan(&ctx.state(), Some(&scan_projection), &coerced_filters, None)
+                .await?;
+            let mut stream = execute_stream(scan_plan, ctx.task_ctx())?;
+            while let Some(batch_result) = stream.next().await {
+                let batch = self.drop_skipped_rows(batch_result?, &pk, source)?;
+                let batch = self.apply_physical_filters_to_batch(batch, &physical_filters)?;
+                if batch.num_rows() == 0 {
+                    continue;
+                }
+                match &self.pk_deletion_strategy {
+                    PkDeletionStrategyWithCache::Int64Pk { .. } => keys.int64.extend(
+                        self.extract_int64_pk_values(&batch, &pk)?
+                            .into_iter()
+                            .filter(|key| self.is_live_int64_pk(*key, source)),
+                    ),
+                    PkDeletionStrategyWithCache::RowConverterBased { .. } => {
+                        let Some(converter) = self.pk_row_converter.as_ref() else {
+                            return Err(Error::Internal {
+                                table: table_name.clone(),
+                                message: "RowConverter not available".to_string(),
+                            });
+                        };
+                        keys.rows.extend(
+                            Self::extract_row_keys(&batch, &pk, converter)?
+                                .into_iter()
+                                .filter(|key| self.is_live_row_key(key, source)),
+                        );
+                    }
+                    PkDeletionStrategyWithCache::PositionBased { .. } => {}
+                }
+            }
+        }
+        Ok(keys)
+    }
+
+    /// Each row's key of `batch` (the key columns, in key order).
+    pub(crate) fn row_keys_of(
+        &self,
+        batch: &arrow::array::RecordBatch,
+    ) -> super::super::Result<Vec<RowKey>> {
+        let pk: Vec<usize> = (0..self.pk_column_indices.len()).collect();
+        match &self.pk_deletion_strategy {
+            PkDeletionStrategyWithCache::Int64Pk { .. } => Ok(self
+                .extract_int64_pk_values(batch, &pk)?
+                .into_iter()
+                .map(RowKey::Int64)
+                .collect()),
+            PkDeletionStrategyWithCache::RowConverterBased { .. } => {
+                let Some(converter) = self.pk_row_converter.as_ref() else {
+                    return Err(Error::Internal {
+                        table: self.table_metadata.table_name.clone(),
+                        message: "RowConverter not available".to_string(),
+                    });
+                };
+                Ok(Self::extract_row_keys(batch, &pk, converter)?
+                    .into_iter()
+                    .map(RowKey::Bytes)
+                    .collect())
+            }
+            PkDeletionStrategyWithCache::PositionBased { .. } => Err(Error::Internal {
+                table: self.table_metadata.table_name.clone(),
+                message: "a position-based table has no row keys".to_string(),
+            }),
+        }
     }
 
     /// Drops the rows of `batch` (key columns at `pk_indices`) that are skipped

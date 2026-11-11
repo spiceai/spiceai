@@ -17734,14 +17734,81 @@ impl CayenneTableProvider {
         // apply before anything is published; the
         // checked-out index is dropped, as on a validation error. The dropped rows'
         // keys stay in the existence filter, which only costs a false positive.
+        //
+        // `cdc_durability: memory`: the same predicate context then evaluates the
+        // resident rows (durable files, inlined corpus and every shard's tier) over
+        // the view this apply publishes, and each matched key joins its owning
+        // shard's tombstones, so the retention delete lands in this apply's shard
+        // swaps. The caller holds `write_lock`, which the N>1 checkpoint capture
+        // also takes, so no checkpoint or other write moves rows in between.
+        let mut hybrid_retained = false;
         if self.has_retention_delete_filters() {
+            let publication = Arc::new(
+                self.coerced_retention_filters()
+                    .map_err(|source| Error::DataFusion { source })?,
+            );
             let groups = per_shard_validated
                 .iter_mut()
                 .map(|(filtered_batches, _, _)| std::mem::take(filtered_batches))
                 .collect();
-            let kept = self.drop_retention_matches_in_groups(groups)?;
+            let kept = super::overwrite_retention::with_publication_retention_sync(
+                Arc::clone(&publication),
+                || self.drop_retention_matches_in_groups(groups),
+            )?;
             for ((filtered_batches, _, _), kept) in per_shard_validated.iter_mut().zip(kept) {
                 *filtered_batches = kept;
+            }
+            if self.is_cdc_memory_mode() && !self.is_memory_resident_mode() {
+                let incoming: Vec<RecordBatch> = per_shard_validated
+                    .iter()
+                    .flat_map(|(batches, _, _)| batches.iter().cloned())
+                    .collect();
+                let mut all_deletions = OnConflictDeletions::default();
+                for (_, deletions, _) in &per_shard_validated {
+                    all_deletions
+                        .deleted_pk_i64
+                        .extend(deletions.deleted_pk_i64.iter().copied());
+                    all_deletions
+                        .deleted_row_keys
+                        .extend(deletions.deleted_row_keys.iter().cloned());
+                    all_deletions
+                        .deleted_inlined_pk_i64
+                        .extend(deletions.deleted_inlined_pk_i64.iter().copied());
+                    all_deletions
+                        .deleted_inlined_row_keys
+                        .extend(deletions.deleted_inlined_row_keys.iter().cloned());
+                }
+                let keys = super::overwrite_retention::with_publication_retention(
+                    Arc::clone(&publication),
+                    self.hybrid_resident_retention_keys(&incoming, &all_deletions),
+                )
+                .await
+                .map_err(|error| Error::DataFusion {
+                    source: datafusion_common::DataFusionError::Execution(format!(
+                        "{} The write was not published. {error}",
+                        self.retention_failed_message()
+                    )),
+                })?;
+                if let Some(keys) = keys
+                    && !keys.is_empty()
+                {
+                    let n = per_shard_validated.len();
+                    for key in keys.int64 {
+                        let row = converter
+                            .convert_columns(&[Arc::new(arrow::array::Int64Array::from(vec![key]))])
+                            .map_err(|e| Error::Arrow { source: e })?;
+                        let shard = shard_of_pk(row.row(0).as_ref(), n);
+                        per_shard_validated[shard].1.deleted_pk_i64.push(key);
+                    }
+                    for key in keys.rows {
+                        let shard = shard_of_pk(&key, n);
+                        per_shard_validated[shard].1.deleted_row_keys.push(key);
+                    }
+                    // Maintained aggregates cannot retract a retention delete:
+                    // stale before the swaps, and at this apply's epoch below.
+                    self.mark_maintained_aggregates_stale();
+                    hybrid_retained = true;
+                }
             }
         }
         let validated_capacity: usize = per_shard_validated
@@ -17860,7 +17927,9 @@ impl CayenneTableProvider {
             let any_supersede = per_shard_validated
                 .iter()
                 .any(|(_, deletions, _)| deletions.total_superseded() > 0);
-            if self.maintained_aggregates.supports_retraction() || !any_supersede {
+            if !hybrid_retained
+                && (self.maintained_aggregates.supports_retraction() || !any_supersede)
+            {
                 let mut combined_batches: Vec<RecordBatch> = Vec::new();
                 for (filtered_batches, _, _) in &per_shard_validated {
                     for batch in filtered_batches {
@@ -35870,6 +35939,191 @@ impl CayenneTableProvider {
     /// in parallel. The shared monotonic allocator keeps one flat sequence domain,
     /// so the merge-on-read filter + durable encoder are unchanged (§2.3d).
     #[expect(clippy::too_many_arguments)]
+    /// `cdc_durability: memory` (durable files + RAM tier): the keys of the
+    /// resident rows the publication's `retention_sql` matches, over the logical
+    /// view this CDC apply publishes. Returned as key tombstones for the apply's
+    /// own segment, the mechanism that already hides durable rows a tier upsert
+    /// or CDC delete supersedes — so the retention delete lands in the one tier
+    /// swap, is made durable by the checkpoint before the source is acked, and
+    /// replays with the batch when it is not. Nothing durable is written here.
+    ///
+    /// Hidden versions never reach the predicate: the incoming keys, the keys
+    /// this apply deletes, every key the tier holds a row or tombstone for (its
+    /// durable versions are superseded), and durable rows already deleted are
+    /// skipped first. A tier row is evaluated only while visible and not
+    /// superseded by this apply.
+    ///
+    /// The caller must hold `write_lock` and `mem_checkpoint_lock` until the
+    /// apply's swap, so no write, checkpoint or seal moves rows between the files,
+    /// the catalog-inlined corpus and the tier in between. Durable rows are read
+    /// from both the files (deletion sink) and the inlined corpus.
+    pub(crate) async fn hybrid_resident_retention_keys(
+        &self,
+        incoming: &[RecordBatch],
+        deletions: &crate::provider::on_conflict::OnConflictDeletions,
+    ) -> Result<Option<super::delete::SkipKeys>> {
+        if !self.is_cdc_memory_mode() || self.is_memory_resident_mode() {
+            return Ok(None);
+        }
+        let Some(filters) = super::overwrite_retention::publication_retention_filters() else {
+            return Ok(None);
+        };
+        if filters.is_empty() {
+            return Ok(None);
+        }
+        let df = |source: datafusion_common::DataFusionError| Error::DataFusion { source };
+        let Some(pk_indices) = self.primary_key_indices()? else {
+            return Ok(None);
+        };
+        let sink = self
+            .build_deletion_vector_sink(&filters, None, DeletionRequestSource::User)
+            .await
+            .map_err(df)?;
+
+        // Keys superseded within this apply: never evaluated anywhere.
+        let mut apply_keys = super::delete::SkipKeys::default();
+        let incoming_keys: Vec<RecordBatch> = incoming
+            .iter()
+            .map(|batch| batch.project(&pk_indices))
+            .collect::<std::result::Result<_, _>>()
+            .map_err(|e| df(e.into()))?;
+        apply_keys.absorb(sink.skip_keys_from(&incoming_keys)?);
+        apply_keys
+            .int64
+            .extend(deletions.deleted_pk_i64.iter().copied());
+        apply_keys
+            .int64
+            .extend(deletions.deleted_inlined_pk_i64.iter().copied());
+        apply_keys
+            .rows
+            .extend(deletions.deleted_row_keys.iter().cloned());
+        apply_keys
+            .rows
+            .extend(deletions.deleted_inlined_row_keys.iter().cloned());
+
+        // Tier rows: visible, not superseded by this apply, then the predicate.
+        let physical = self
+            .build_physical_filters_for_inlined_delete(
+                &self
+                    .coerce_filters_for_inlined_delete(&filters)
+                    .map_err(df)?,
+            )
+            .map_err(df)?;
+        let mut matched = super::delete::SkipKeys::default();
+        let mut tier_keys = super::delete::SkipKeys::default();
+        let mut tier_rows: Vec<(RecordBatch, i64, InlinedDeletionMaps)> = Vec::new();
+        for shard in self.mem_tier.shards() {
+            let tier = shard.load_full();
+            let maps = Self::mem_tier_deletion_maps(&tier);
+            tier_keys.int64.extend(maps.int64_pk.keys().copied());
+            tier_keys.rows.extend(maps.row_keys.keys().cloned());
+            for segment in tier.segments.iter() {
+                for batch in segment.batches.iter() {
+                    if batch.num_rows() == 0 {
+                        continue;
+                    }
+                    let key_columns = batch.project(&pk_indices).map_err(|e| df(e.into()))?;
+                    tier_keys.absorb(sink.skip_keys_from(std::slice::from_ref(&key_columns))?);
+                    tier_rows.push((batch.clone(), segment.data_sequence, maps.clone()));
+                }
+            }
+        }
+        for (batch, data_sequence, maps) in &tier_rows {
+            self.collect_retention_matches(
+                &sink,
+                batch,
+                *data_sequence,
+                maps,
+                &apply_keys,
+                &pk_indices,
+                &physical,
+                &mut matched,
+            )?;
+        }
+
+        // Catalog-inlined durable rows: the tier's keys and this apply's supersede
+        // them; the rest are evaluated while visible against the inline and file
+        // deletions. A seal shadow's rows are tier rows, skipped by key here.
+        let mut skip = apply_keys;
+        skip.absorb(tier_keys);
+        if self.durable_inlined_row_count.load(Ordering::Relaxed) != 0 {
+            let inlined_deletions = self.load_inlined_deletion_maps().await?;
+            let view = self.cached_inlined_view().await?;
+            for entry in view.iter() {
+                for batch in &entry.batches {
+                    self.collect_retention_matches(
+                        &sink,
+                        batch,
+                        entry.envelope.sequence_number,
+                        &inlined_deletions,
+                        &skip,
+                        &pk_indices,
+                        &physical,
+                        &mut matched,
+                    )?;
+                }
+            }
+        }
+
+        // Durable file rows: the tier's keys and this apply's are superseded there.
+        let durable = sink
+            .with_skip_before_filters(skip)
+            .matching_live_keys()
+            .await?;
+        matched.absorb(durable);
+        Ok(Some(matched))
+    }
+
+    /// Add to `matched` the keys of `batch` (written at `data_sequence`) that are
+    /// visible against `maps` and the file deletions, not in `skip`, and matched
+    /// by `physical`. NULL is "did not match"; an evaluation error is returned.
+    #[expect(clippy::too_many_arguments)]
+    fn collect_retention_matches(
+        &self,
+        sink: &CayenneDeletionSink,
+        batch: &RecordBatch,
+        data_sequence: i64,
+        maps: &InlinedDeletionMaps,
+        skip: &super::delete::SkipKeys,
+        pk_indices: &[usize],
+        physical: &[Arc<dyn PhysicalExpr>],
+        matched: &mut super::delete::SkipKeys,
+    ) -> Result<()> {
+        let df = |source: datafusion_common::DataFusionError| Error::DataFusion { source };
+        if batch.num_rows() == 0 {
+            return Ok(());
+        }
+        let key_columns = batch.project(pk_indices).map_err(|e| df(e.into()))?;
+        let visible = self.inlined_visibility_mask(batch, data_sequence, maps, None)?;
+        let row_keys = sink.row_keys_of(&key_columns)?;
+        let candidate: arrow::array::BooleanArray = row_keys
+            .iter()
+            .enumerate()
+            .map(|(row, key)| {
+                Some(visible.as_ref().is_none_or(|mask| mask[row]) && !key.is_in(skip))
+            })
+            .collect();
+        if candidate.true_count() == 0 {
+            return Ok(());
+        }
+        let candidates =
+            arrow::compute::filter_record_batch(batch, &candidate).map_err(|e| df(e.into()))?;
+        let candidate_keys: Vec<_> = row_keys
+            .into_iter()
+            .zip(candidate.iter())
+            .filter_map(|(key, keep)| (keep == Some(true)).then_some(key))
+            .collect();
+        let Some(hit) = self.delete_match_mask(&candidates, physical).map_err(df)? else {
+            return Ok(());
+        };
+        for (key, hit) in candidate_keys.into_iter().zip(hit.iter()) {
+            if hit == Some(true) {
+                key.insert_into(matched);
+            }
+        }
+        Ok(())
+    }
+
     /// The publication's `retention_sql` filters to apply to the resident rows of
     /// a `mode: memory` tier inside its append swap, or `None` when this is not a
     /// memory-resident table or no publication context is in scope.

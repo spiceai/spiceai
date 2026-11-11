@@ -1005,7 +1005,9 @@ impl<'a> AppendMutationWriter<'a> {
         // `mode: memory`: one predicate context (one `now()`) for these rows and
         // the resident tier rows the append swap below evaluates.
         let publication: Option<Arc<Vec<datafusion::logical_expr::Expr>>> =
-            if self.table.is_memory_resident_mode() && self.table.has_retention_delete_filters() {
+            if (self.table.is_memory_resident_mode() || self.table.is_cdc_memory_mode())
+                && self.table.has_retention_delete_filters()
+            {
                 Some(Arc::new(self.table.coerced_retention_filters()?))
             } else {
                 None
@@ -1091,9 +1093,60 @@ impl<'a> AppendMutationWriter<'a> {
         }
 
         let PostValidationState {
-            on_conflict_deletions,
+            mut on_conflict_deletions,
             validated_keys,
         } = take_post_validation(&post_validation);
+
+        // `cdc_durability: memory`: the retention delete over the resident rows
+        // (durable files and RAM tier) joins this apply's own tombstones, so it
+        // lands in the one tier swap below. `mem_checkpoint_lock` is taken AFTER
+        // the spill/budget steps above (which take it themselves) and held across
+        // the scan and the swap: with `write_lock`, no write, checkpoint or seal
+        // can move rows between the files and the tier in between.
+        let hybrid_hold = if publication.is_some()
+            && self.table.is_cdc_memory_mode()
+            && !self.table.is_memory_resident_mode()
+        {
+            Some(
+                self.table
+                    .mem_checkpoint_lock_for_writer()
+                    .lock_owned()
+                    .await,
+            )
+        } else {
+            None
+        };
+        let mut hybrid_retention_keys = 0_usize;
+        if let (Some(filters), Some(_)) = (&publication, &hybrid_hold) {
+            let keys = super::overwrite_retention::with_publication_retention(
+                Arc::clone(filters),
+                self.table
+                    .hybrid_resident_retention_keys(&batches, &on_conflict_deletions),
+            )
+            .await;
+            let keys = match keys {
+                Ok(keys) => keys,
+                Err(error) => {
+                    mem_tier_budget::release_bytes(incoming_bytes);
+                    return Err(super::Error::DataFusion {
+                        source: datafusion_common::DataFusionError::Execution(format!(
+                            "{} The write was not published. {error}",
+                            self.table.retention_failed_message()
+                        )),
+                    });
+                }
+            };
+            if let Some(keys) = keys
+                && !keys.is_empty()
+            {
+                hybrid_retention_keys = keys.len();
+                on_conflict_deletions.deleted_pk_i64.extend(keys.int64);
+                on_conflict_deletions.deleted_row_keys.extend(keys.rows);
+                // Maintained aggregates cannot retract rows they never saw
+                // inserted: stale, before and after the swap.
+                self.table.mark_maintained_aggregates_stale();
+            }
+        }
         let superseded =
             u64::try_from(on_conflict_deletions.total_superseded()).unwrap_or(u64::MAX);
 
@@ -1113,6 +1166,10 @@ impl<'a> AppendMutationWriter<'a> {
             }
             None => append.await,
         };
+        if hybrid_retention_keys > 0 {
+            self.table.mark_maintained_aggregates_stale();
+        }
+        drop(hybrid_hold);
         let epoch = match appended {
             Ok(epoch) => epoch,
             Err(e) => {
@@ -1126,7 +1183,7 @@ impl<'a> AppendMutationWriter<'a> {
         // Record the PK keys so a subsequent same-table upsert sees this batch's
         // rows as present. Not when retention dropped some: their keys are among
         // the validated ones but not resident, so the cache rebuilds instead.
-        if retention_dropped > 0 {
+        if retention_dropped > 0 || hybrid_retention_keys > 0 {
             self.table.clear_cached_pk_keyset();
         } else {
             let record_seq = self.table.sequence_high_water().await;

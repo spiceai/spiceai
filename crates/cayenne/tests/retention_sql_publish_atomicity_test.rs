@@ -2304,3 +2304,512 @@ async fn maintenance_pass_and_append_are_serialized_impl(
     }
     Ok(())
 }
+
+struct CountingSlotAdvancer(Arc<AtomicU64>);
+
+#[async_trait::async_trait]
+impl cayenne::SlotAdvancer for CountingSlotAdvancer {
+    async fn on_checkpoint_durable(&self, _durable_epoch: u64) {
+        self.0.fetch_add(1, Ordering::SeqCst);
+    }
+}
+
+/// `cdc_durability: memory` (durable files + RAM tier): each CDC apply applies
+/// `retention_sql` over the logical post-batch view of BOTH tiers in its one
+/// tier swap, with no maintenance pass:
+/// - a durable row matching is gone at the apply (durable archived -> deleted);
+/// - a durable version superseded by a tier row is neither evaluated nor
+///   allowed to delete the live tier row (durable archived -> memory retained);
+/// - a tier row matching is gone (durable retained -> memory archived);
+/// - hidden versions (superseded, tombstoned) never reach an erroring predicate,
+///   a live erroring row fails the apply and keeps the previous view;
+/// - the checkpoint persists the deletion state before the source ack, a later
+///   reinsert of a retention-deleted key survives the old tombstone through a
+///   checkpoint, and replaying an applied batch leaves the same rows.
+#[test]
+fn hybrid_cdc_resident_retention_in_the_apply_swap_sqlite() -> Result<(), String> {
+    common::run_with_backend_blocking(
+        common::BackendType::Sqlite,
+        hybrid_cdc_resident_retention_in_the_apply_swap_impl,
+    )
+}
+
+async fn hybrid_cdc_resident_retention_in_the_apply_swap_impl(
+    fixture: common::TestFixture,
+) -> Result<(), Box<dyn std::error::Error>> {
+    use datafusion::logical_expr::{ColumnarValue, Volatility, create_udf};
+    use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
+    let aged = Arc::new(AtomicBool::new(false));
+    let broken = Arc::new(AtomicBool::new(false));
+    let (a, b) = (Arc::clone(&aged), Arc::clone(&broken));
+    let udf = create_udf(
+        "aged",
+        vec![DataType::Utf8],
+        DataType::Boolean,
+        Volatility::Volatile,
+        Arc::new(move |args: &[ColumnarValue]| {
+            let array = args[0].clone().into_array(1)?;
+            let values = array.as_any().downcast_ref::<StringArray>().expect("utf8");
+            let mut out = Vec::with_capacity(values.len());
+            for v in values.iter() {
+                let old = v == Some("old");
+                if old && b.load(Ordering::SeqCst) {
+                    return Err(datafusion::error::DataFusionError::Execution(
+                        "aged() cannot evaluate this row".to_string(),
+                    ));
+                }
+                out.push(Some(old && a.load(Ordering::SeqCst)));
+            }
+            Ok(ColumnarValue::Array(Arc::new(
+                arrow::array::BooleanArray::from(out),
+            )))
+        }),
+    );
+    let name = "rsql_hybrid_cdc";
+    let dir = fixture.data_path.join(name);
+    std::fs::create_dir_all(&dir)?;
+    let options = CreateTableOptions {
+        table_name: name.to_string(),
+        schema: schema(),
+        primary_key: vec!["id".to_string()],
+        on_conflict: Some(OnConflict::Upsert(ColumnReference::new(vec![
+            "id".to_string(),
+        ]))),
+        base_path: dir.to_string_lossy().to_string(),
+        partition_column: None,
+        vortex_config: VortexConfig {
+            cdc_durability: CdcDurability::Memory,
+            cdc_mem_tier_checkpoint_interval_ms: 0,
+            cdc_mem_tier_max_age_ms: 0,
+            cdc_mem_tier_seal_age_ms: 0,
+            compaction_background_interval_ms: 3_600_000,
+            ..file_tier_config()
+        },
+    };
+    let t = Arc::new(
+        CayenneTableProvider::create_table_with_retention(
+            Arc::clone(&fixture.catalog) as Arc<dyn MetadataCatalog>,
+            options,
+            vec![udf.call(vec![col("status")])],
+            SessionContext::new().runtime_env(),
+        )
+        .await?,
+    );
+    assert!(t.is_cdc_memory_mode() && !t.is_memory_resident_mode());
+    let acks = Arc::new(AtomicU64::new(0));
+    t.install_slot_advancer(Arc::new(CountingSlotAdvancer(Arc::clone(&acks))));
+    let apply = |pairs: Vec<(i64, Option<&'static str>)>| {
+        let t = Arc::clone(&t);
+        async move {
+            let batch = rows(&pairs);
+            let stream = Box::pin(RecordBatchStreamAdapter::new(
+                batch.schema(),
+                futures::stream::iter([Ok(batch)]),
+            ));
+            let ctx = SessionContext::new();
+            let write = t.write_cdc_append_stream(stream, &ctx.task_ctx()).await?;
+            if write.has_pending_finalize() {
+                write.finish().await?;
+            }
+            Ok::<_, Box<dyn std::error::Error>>(())
+        }
+    };
+
+    // Durable: 1 old, 2 new, 3 new, 5 old.
+    apply(vec![
+        (1, Some("old")),
+        (2, Some("new")),
+        (3, Some("new")),
+        (5, Some("old")),
+    ])
+    .await?;
+    assert!(
+        t.checkpoint_mem_tier().await? > 0,
+        "precondition: rows are durable"
+    );
+    // Tier: 2 old (supersedes durable 2 new), 4 old, 5 new (supersedes durable 5 old).
+    apply(vec![(2, Some("old")), (4, Some("old")), (5, Some("new"))]).await?;
+    assert_eq!(ids(&t).await?, vec![1, 2, 3, 4, 5]);
+
+    // A live erroring row (durable 1, tier 2 and 4) fails the apply; nothing moves.
+    broken.store(true, Ordering::SeqCst);
+    assert!(
+        apply(vec![(6, Some("new"))]).await.is_err(),
+        "live erroring row fails"
+    );
+    assert_eq!(ids(&t).await?, vec![1, 2, 3, 4, 5], "previous view kept");
+    broken.store(false, Ordering::SeqCst);
+
+    aged.store(true, Ordering::SeqCst);
+    apply(vec![(6, Some("new"))]).await?;
+    assert_eq!(
+        ids(&t).await?,
+        vec![3, 5, 6],
+        "durable 1 and tier 2, 4 gone at the apply; 5's tier row kept"
+    );
+
+    // Every remaining "old" version is hidden: none may reach the predicate.
+    broken.store(true, Ordering::SeqCst);
+    apply(vec![(7, Some("new"))]).await?;
+    assert_eq!(
+        ids(&t).await?,
+        vec![3, 5, 6, 7],
+        "hidden versions not evaluated"
+    );
+    broken.store(false, Ordering::SeqCst);
+
+    // Crash before the checkpoint: nothing the applies did (retention included)
+    // is durable and nothing was acked, so the source replays them.
+    let reopen = || async {
+        Ok::<_, Box<dyn std::error::Error>>(Arc::new(
+            CayenneTableProviderBuilder::new(
+                Arc::clone(&fixture.catalog) as Arc<dyn MetadataCatalog>,
+                SessionContext::new().runtime_env(),
+            )
+            .open(name)
+            .await?,
+        ))
+    };
+    let before = acks.load(Ordering::SeqCst);
+    assert_eq!(
+        ids(&reopen().await?).await?,
+        vec![1, 2, 3, 5],
+        "crash before checkpoint: only the first checkpoint is durable"
+    );
+
+    // Checkpoint: deletion state durable, then the ack.
+    t.checkpoint_mem_tier().await?;
+    assert!(
+        acks.load(Ordering::SeqCst) > before,
+        "source acked after the checkpoint"
+    );
+    assert_eq!(ids(&t).await?, vec![3, 5, 6, 7], "after the checkpoint");
+    assert_eq!(
+        ids(&reopen().await?).await?,
+        vec![3, 5, 6, 7],
+        "crash after checkpoint: the retention deletes were durable before the ack"
+    );
+
+    // Reinsert of a retention-deleted key survives the old tombstone.
+    aged.store(false, Ordering::SeqCst);
+    apply(vec![(1, Some("new"))]).await?;
+    assert_eq!(ids(&t).await?, vec![1, 3, 5, 6, 7], "reinsert visible");
+    t.checkpoint_mem_tier().await?;
+    assert_eq!(
+        ids(&t).await?,
+        vec![1, 3, 5, 6, 7],
+        "reinsert survives checkpoint"
+    );
+    assert_eq!(
+        ids(&reopen().await?).await?,
+        vec![1, 3, 5, 6, 7],
+        "reinsert durable"
+    );
+
+    // Replay of an applied batch leaves the same rows.
+    apply(vec![(7, Some("new"))]).await?;
+    assert_eq!(ids(&t).await?, vec![1, 3, 5, 6, 7], "replay");
+    let ctx = SessionContext::new();
+    ctx.register_table("t", Arc::clone(&t) as Arc<dyn TableProvider>)?;
+    let count = ctx.sql("SELECT COUNT(*) FROM t").await?.collect().await?;
+    assert_eq!(
+        arrow::util::display::array_value_to_string(count[0].column(0), 0)?,
+        "5",
+        "COUNT(*)"
+    );
+    Ok(())
+}
+
+/// `cdc_durability: memory` with a composite `(tenant, id)` key: the retention
+/// delete in the apply sees the newest version of every key across the durable
+/// files, the inlined corpus and the RAM tier (several tier versions per key),
+/// in both directions (durable archived row superseded by a retained tier row is
+/// kept; durable retained row superseded by an archived tier row is deleted).
+/// Run unsharded and with 4 PK shards (the sharded apply path), with the inline
+/// corpus off and on. Then checkpoint, compaction and reinsertion: an old
+/// tombstone never hides a later reinsert, and a compaction that drops
+/// tombstones never brings a deleted row back, including after reopening.
+#[test]
+fn hybrid_cdc_composite_retention_across_versions_shards_and_compaction_sqlite()
+-> Result<(), String> {
+    common::run_with_backend_blocking(
+        common::BackendType::Sqlite,
+        hybrid_cdc_composite_retention_across_versions_shards_and_compaction_impl,
+    )
+}
+
+async fn hybrid_cdc_composite_retention_across_versions_shards_and_compaction_impl(
+    fixture: common::TestFixture,
+) -> Result<(), Box<dyn std::error::Error>> {
+    use datafusion::logical_expr::{ColumnarValue, Volatility, create_udf};
+    use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
+    let schema3: SchemaRef = Arc::new(Schema::new(vec![
+        Field::new("tenant", DataType::Int64, false),
+        Field::new("id", DataType::Int64, false),
+        Field::new("status", DataType::Utf8, true),
+    ]));
+    let batch = |rows: &[(i64, i64, &str)]| -> RecordBatch {
+        RecordBatch::try_new(
+            Arc::clone(&schema3),
+            vec![
+                Arc::new(Int64Array::from(
+                    rows.iter().map(|(t, _, _)| *t).collect::<Vec<_>>(),
+                )),
+                Arc::new(Int64Array::from(
+                    rows.iter().map(|(_, i, _)| *i).collect::<Vec<_>>(),
+                )),
+                Arc::new(StringArray::from(
+                    rows.iter().map(|(_, _, s)| Some(*s)).collect::<Vec<_>>(),
+                )),
+            ],
+        )
+        .expect("batch")
+    };
+    let keys = |provider: Arc<CayenneTableProvider>| async move {
+        let ctx = SessionContext::new();
+        ctx.register_table("t", provider as Arc<dyn TableProvider>)?;
+        let batches = ctx
+            .sql("SELECT tenant, id, status FROM t ORDER BY tenant, id")
+            .await?
+            .collect()
+            .await?;
+        let mut out = Vec::new();
+        for b in &batches {
+            let t = b
+                .column(0)
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .expect("t");
+            let i = b
+                .column(1)
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .expect("i");
+            let s = b
+                .column(2)
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .expect("s");
+            out.extend((0..b.num_rows()).map(|r| (t.value(r), i.value(r), s.value(r).to_string())));
+        }
+        Ok::<_, Box<dyn std::error::Error>>(out)
+    };
+    let k = |rows: &[(i64, i64, &str)]| -> Vec<(i64, i64, String)> {
+        rows.iter()
+            .map(|(t, i, s)| (*t, *i, (*s).to_string()))
+            .collect()
+    };
+
+    for (shards, inline) in [(1_usize, false), (1, true), (4, false), (4, true)] {
+        let label = format!("shards={shards} inline={inline}");
+        let aged = Arc::new(AtomicBool::new(false));
+        let broken = Arc::new(AtomicBool::new(false));
+        let (a, b) = (Arc::clone(&aged), Arc::clone(&broken));
+        let udf = create_udf(
+            "aged",
+            vec![DataType::Utf8],
+            DataType::Boolean,
+            Volatility::Volatile,
+            Arc::new(move |args: &[ColumnarValue]| {
+                let array = args[0].clone().into_array(1)?;
+                let values = array.as_any().downcast_ref::<StringArray>().expect("utf8");
+                let mut out = Vec::with_capacity(values.len());
+                for v in values.iter() {
+                    let old = v == Some("old");
+                    if old && b.load(Ordering::SeqCst) {
+                        return Err(datafusion::error::DataFusionError::Execution(
+                            "aged() cannot evaluate this row".to_string(),
+                        ));
+                    }
+                    out.push(Some(old && a.load(Ordering::SeqCst)));
+                }
+                Ok(ColumnarValue::Array(Arc::new(
+                    arrow::array::BooleanArray::from(out),
+                )))
+            }),
+        );
+        let name = format!("rsql_hybrid_comp_{shards}_{inline}");
+        let dir = fixture.data_path.join(&name);
+        std::fs::create_dir_all(&dir)?;
+        let key = vec!["tenant".to_string(), "id".to_string()];
+        let base = if inline {
+            VortexConfig::default()
+        } else {
+            file_tier_config()
+        };
+        let options = CreateTableOptions {
+            table_name: name.clone(),
+            schema: Arc::clone(&schema3),
+            primary_key: key.clone(),
+            on_conflict: Some(OnConflict::Upsert(ColumnReference::new(key))),
+            base_path: dir.to_string_lossy().to_string(),
+            partition_column: None,
+            vortex_config: VortexConfig {
+                cdc_durability: CdcDurability::Memory,
+                cdc_mem_tier_shards: shards,
+                cdc_mem_tier_checkpoint_interval_ms: 0,
+                cdc_mem_tier_max_age_ms: 0,
+                cdc_mem_tier_seal_age_ms: 0,
+                compaction_background_interval_ms: 3_600_000,
+                ..base
+            },
+        };
+        let t = Arc::new(
+            CayenneTableProvider::create_table_with_retention(
+                Arc::clone(&fixture.catalog) as Arc<dyn MetadataCatalog>,
+                options,
+                vec![udf.call(vec![col("status")])],
+                SessionContext::new().runtime_env(),
+            )
+            .await?,
+        );
+        assert!(
+            t.is_cdc_memory_mode() && !t.is_memory_resident_mode(),
+            "{label}"
+        );
+        let acks = Arc::new(AtomicU64::new(0));
+        t.install_slot_advancer(Arc::new(CountingSlotAdvancer(Arc::clone(&acks))));
+        let apply = |rows: Vec<(i64, i64, &'static str)>| {
+            let t = Arc::clone(&t);
+            let b = batch(&rows);
+            async move {
+                let stream = Box::pin(RecordBatchStreamAdapter::new(
+                    b.schema(),
+                    futures::stream::iter([Ok(b)]),
+                ));
+                let ctx = SessionContext::new();
+                let write = t.write_cdc_append_stream(stream, &ctx.task_ctx()).await?;
+                if write.has_pending_finalize() {
+                    write.finish().await?;
+                }
+                Ok::<_, Box<dyn std::error::Error>>(())
+            }
+        };
+        let reopen = || async {
+            Ok::<_, Box<dyn std::error::Error>>(Arc::new(
+                CayenneTableProviderBuilder::new(
+                    Arc::clone(&fixture.catalog) as Arc<dyn MetadataCatalog>,
+                    SessionContext::new().runtime_env(),
+                )
+                .open(&name)
+                .await?,
+            ))
+        };
+
+        // Durable generation.
+        apply(vec![
+            (1, 1, "old"),
+            (1, 2, "new"),
+            (2, 1, "old"),
+            (2, 2, "new"),
+        ])
+        .await?;
+        t.checkpoint_mem_tier().await?;
+        // Two tier versions per key; the newest decides.
+        apply(vec![(1, 1, "new"), (1, 2, "old")]).await?;
+        apply(vec![(1, 1, "old"), (1, 2, "new"), (2, 2, "new")]).await?;
+        let all = k(&[(1, 1, "old"), (1, 2, "new"), (2, 1, "old"), (2, 2, "new")]);
+        assert_eq!(
+            keys(Arc::clone(&t)).await?,
+            all,
+            "{label}: before retention"
+        );
+
+        // A live erroring row (durable (2,1), tier (1,1)) fails the apply.
+        broken.store(true, Ordering::SeqCst);
+        assert!(
+            apply(vec![(3, 1, "new")]).await.is_err(),
+            "{label}: live erroring row fails"
+        );
+        assert_eq!(keys(Arc::clone(&t)).await?, all, "{label}: view kept");
+        broken.store(false, Ordering::SeqCst);
+
+        aged.store(true, Ordering::SeqCst);
+        apply(vec![(3, 1, "new")]).await?;
+        let retained = k(&[(1, 2, "new"), (2, 2, "new"), (3, 1, "new")]);
+        assert_eq!(
+            keys(Arc::clone(&t)).await?,
+            retained,
+            "{label}: tier (1,1) and durable (2,1) deleted in the apply; (1,2) kept"
+        );
+        // Every remaining "old" version is hidden: none may reach the predicate.
+        broken.store(true, Ordering::SeqCst);
+        apply(vec![(3, 2, "new")]).await?;
+        broken.store(false, Ordering::SeqCst);
+        aged.store(false, Ordering::SeqCst);
+        let retained = k(&[(1, 2, "new"), (2, 2, "new"), (3, 1, "new"), (3, 2, "new")]);
+        assert_eq!(
+            keys(Arc::clone(&t)).await?,
+            retained,
+            "{label}: hidden skipped"
+        );
+
+        let before = acks.load(Ordering::SeqCst);
+        assert_eq!(
+            keys(reopen().await?).await?,
+            all,
+            "{label}: crash before checkpoint keeps the durable generation"
+        );
+        t.checkpoint_mem_tier().await?;
+        assert!(acks.load(Ordering::SeqCst) > before, "{label}: acked");
+        assert_eq!(
+            keys(reopen().await?).await?,
+            retained,
+            "{label}: durable before ack"
+        );
+
+        // Reinsert both deleted keys, then checkpoint and compact twice.
+        apply(vec![(2, 1, "new"), (1, 1, "new")]).await?;
+        let reinserted = k(&[
+            (1, 1, "new"),
+            (1, 2, "new"),
+            (2, 1, "new"),
+            (2, 2, "new"),
+            (3, 1, "new"),
+            (3, 2, "new"),
+        ]);
+        assert_eq!(
+            keys(Arc::clone(&t)).await?,
+            reinserted,
+            "{label}: reinserted"
+        );
+        t.checkpoint_mem_tier().await?;
+        let compacted_1 = t.compact_current_snapshot_small_files().await?;
+        assert_eq!(
+            keys(Arc::clone(&t)).await?,
+            reinserted,
+            "{label}: after compaction 1"
+        );
+        // Delete (2,2) by retention after compaction, then compact again: the
+        // compaction that drops the tombstone must not resurrect it.
+        aged.store(true, Ordering::SeqCst);
+        apply(vec![(2, 2, "old")]).await?;
+        aged.store(false, Ordering::SeqCst);
+        let final_rows = k(&[
+            (1, 1, "new"),
+            (1, 2, "new"),
+            (2, 1, "new"),
+            (3, 1, "new"),
+            (3, 2, "new"),
+        ]);
+        assert_eq!(
+            keys(Arc::clone(&t)).await?,
+            final_rows,
+            "{label}: (2,2) gone"
+        );
+        t.checkpoint_mem_tier().await?;
+        let compacted_2 = t.compact_current_snapshot_small_files().await?;
+        assert_eq!(
+            keys(Arc::clone(&t)).await?,
+            final_rows,
+            "{label}: after compaction 2"
+        );
+        assert_eq!(
+            keys(reopen().await?).await?,
+            final_rows,
+            "{label}: reopened"
+        );
+        eprintln!("{label}: compacted_1={compacted_1} compacted_2={compacted_2}");
+    }
+    Ok(())
+}
