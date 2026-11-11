@@ -19,6 +19,7 @@ use futures::TryStreamExt;
 use runtime::Runtime;
 use snafu::ResultExt;
 use spicepod::component::model::Model;
+use spicepod::component::runtime::{Runtime as SpicepodRuntime, TaskHistory};
 use spicepod::component::worker::{LoadBalanceParams, RouterConfig, Worker};
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -151,7 +152,16 @@ async fn test_sql_worker_with_cron() -> Result<(), anyhow::Error> {
 
             let ds_tpcds_item = get_tpcds_dataset("item", None, None);
 
+            // The snapshot asserts the query's result preview, which the query only
+            // builds when `captured_output` is not `none` (the default).
             let app = AppBuilder::new("test_worker_with_cron")
+                .with_runtime(SpicepodRuntime {
+                    task_history: TaskHistory {
+                        captured_output: "truncated".into(),
+                        ..Default::default()
+                    },
+                    ..Default::default()
+                })
                 .with_dataset(ds_tpcds_item)
                 .with_worker(create_sql_worker(
                     "sql_scheduled",
