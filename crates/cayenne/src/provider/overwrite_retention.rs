@@ -656,3 +656,11 @@ fn incoming_key_predicate(
     });
     Ok(datafusion::logical_expr::utils::disjunction(disjuncts))
 }
+
+/// [`with_publication_retention`] for synchronous work.
+pub(crate) fn with_publication_retention_sync<R>(
+    filters: Arc<Vec<Expr>>,
+    work: impl FnOnce() -> R,
+) -> R {
+    PUBLICATION_RETENTION.sync_scope(filters, work)
+}

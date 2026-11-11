@@ -113,6 +113,9 @@ pub(crate) struct PreparedOnConflictDurablePayload {
     /// this publication keeps, committed in the same transaction. Unlike
     /// `delete_files`, their keys are not reinserted by the publication.
     pub(crate) retention_delete_files: Vec<crate::metadata::DeleteFile>,
+    /// The deletion vectors `retention_delete_files` replace (a table without a
+    /// primary key writes each file's whole vector), removed in the same commit.
+    pub(crate) retention_replaced_delete_file_ids: Vec<String>,
 }
 
 impl PreparedOnConflictDeletionPublish {

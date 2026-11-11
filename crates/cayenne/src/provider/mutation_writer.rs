@@ -1402,23 +1402,65 @@ impl<'a> AppendMutationWriter<'a> {
         // violation still fails the append even on a row retention would delete.
         // A partitioned upsert also lands here but resolves repeats, so it keeps
         // the pass after the publish.
+        // One predicate context for the publication: the incoming rows and the
+        // resident rows (`write_unkeyed_retention_generation`) share its `now()`.
+        let publication_filters = if self.table.has_retention_delete_filters() {
+            Some(Arc::new(
+                self.table
+                    .coerced_retention_filters()
+                    .map_err(|source| super::Error::DataFusion { source })?,
+            ))
+        } else {
+            None
+        };
         let (prepared_stream, retention_dropped) =
             if collapsed_for_retention || self.table.key_resolver()?.is_none() {
-                self.table
-                    .drop_retention_matches_from_stream(prepared.stream)?
+                match &publication_filters {
+                    Some(filters) => super::overwrite_retention::with_publication_retention_sync(
+                        Arc::clone(filters),
+                        || {
+                            self.table
+                                .drop_retention_matches_from_stream(prepared.stream)
+                        },
+                    )?,
+                    None => self
+                        .table
+                        .drop_retention_matches_from_stream(prepared.stream)?,
+                }
             } else {
                 (prepared.stream, Arc::default())
             };
 
-        let written = self
-            .write_prepared_stream(
+        // A table without a primary key whose `retention_sql` reaches resident
+        // rows: the append publishes as its own generation (a protected
+        // snapshot) whose catalog transaction also carries the retention delete
+        // over the resident rows. The resident files are reused as they are.
+        let written = if self.table.has_retention_delete_filters()
+            && self.table.key_resolver()?.is_none()
+            && !self.table.is_memory_resident_mode()
+            && !self.into_empty_table
+        {
+            let write = self.write_unkeyed_retention_generation(
+                prepared_stream,
+                write_guard,
+                checkpoint_guard,
+            );
+            match publication_filters {
+                Some(filters) => {
+                    super::overwrite_retention::with_publication_retention(filters, write).await?
+                }
+                None => write.await?,
+            }
+        } else {
+            self.write_prepared_stream(
                 prepared_stream,
                 post_validation,
                 pending_pk_deletions,
                 may_have_on_conflict_deletions,
                 HeldWriteGuards::new(write_guard, checkpoint_guard),
             )
-            .await?;
+            .await?
+        };
         // Report the rows inserted, including those its retention delete removed
         // in the same publication, as when that delete ran after it. Their keys
         // were validated, and may have been cached as present, but are not stored:
@@ -1554,10 +1596,120 @@ impl<'a> AppendMutationWriter<'a> {
             into_empty_table: self.into_empty_table,
             first_load_pk_bloom,
             resident_retention,
+            resident_replaced: Vec::new(),
+            resident_sink: None,
         }
         .commit()
         .await
         .map(|written| written.saturating_add(retention_folded))
+    }
+
+    /// Publish a primary-key-less append on a `retention_sql` table as one
+    /// generation: its rows in a staged snapshot of their own, and the retention
+    /// delete over the resident rows, committed in one metastore transaction
+    /// (`PreparedResolvedAppend`) and published under one fence. No staging WAL:
+    /// before the commit the catalog holds the previous generation, after it
+    /// the appended one with retention applied.
+    async fn write_unkeyed_retention_generation(
+        &self,
+        data: SendableRecordBatchStream,
+        write_guard: OwnedMutexGuard<()>,
+        checkpoint_guard: OwnedMutexGuard<()>,
+    ) -> Result<u64> {
+        let filters = match super::overwrite_retention::publication_retention_filters() {
+            Some(filters) => filters,
+            None => self
+                .table
+                .coerced_retention_filters()
+                .map_err(|source| super::Error::DataFusion { source })?,
+        };
+        let snapshot_id = uuid::Uuid::now_v7().to_string();
+        let staged = self
+            .table
+            .write_to_snapshot(
+                data,
+                self.context.target_file_size_bytes(),
+                &snapshot_id,
+                self.task_context.session_config().target_partitions(),
+                None,
+                crate::provider::delta_encoding::WritePolicy::DELTA,
+            )
+            .await;
+        let (rows, _writer_ops, stats) = match staged {
+            Ok(staged) => staged,
+            Err(error) => {
+                self.cleanup_layered_append_dirs(std::slice::from_ref(&snapshot_id))
+                    .await;
+                return Err(error.into());
+            }
+        };
+        let resident = self.prepare_unkeyed_resident_retention(&filters).await;
+        let (prepared, replaced, sink) = match resident {
+            Ok(resident) => resident,
+            Err(error) => {
+                self.cleanup_layered_append_dirs(std::slice::from_ref(&snapshot_id))
+                    .await;
+                return Err(error);
+            }
+        };
+        if rows == 0 && prepared.is_none() {
+            self.cleanup_layered_append_dirs(std::slice::from_ref(&snapshot_id))
+                .await;
+            return Ok(0);
+        }
+        super::append_commit::PreparedResolvedAppend {
+            table: self.table.clone_for_write(),
+            context: Arc::clone(self.context),
+            _write_guard: write_guard,
+            _held_write_lock: super::write_lock_held::held_guard(),
+            _checkpoint_guard: Some(checkpoint_guard),
+            snapshot_id,
+            rows,
+            stats,
+            deletions: super::on_conflict::OnConflictDeletions::default(),
+            validated_keys: PkDigestSet::default(),
+            superseded: 0,
+            into_empty_table: false,
+            first_load_pk_bloom: None,
+            resident_retention: prepared,
+            resident_replaced: replaced,
+            resident_sink: Some(sink),
+        }
+        .commit()
+        .await
+    }
+
+    async fn prepare_unkeyed_resident_retention(
+        &self,
+        filters: &[datafusion::logical_expr::Expr],
+    ) -> Result<(
+        Option<super::delete::PreparedDeletionPublish>,
+        Vec<crate::metadata::DeleteFile>,
+        super::delete::CayenneDeletionSink,
+    )> {
+        let failed = |error: datafusion_common::DataFusionError| super::Error::DataFusion {
+            source: datafusion_common::DataFusionError::Execution(format!(
+                "{} The write was not published. {error}",
+                self.table.retention_failed_message()
+            )),
+        };
+        let sink = self
+            .table
+            .build_deletion_vector_sink(filters, None, super::table::DeletionRequestSource::User)
+            .await
+            .map_err(failed)?;
+        let prepared = sink
+            .prepare_delete()
+            .await?
+            .filter(|prepared| !prepared.delete_files().is_empty());
+        let replaced = match &prepared {
+            Some(prepared) if prepared.replaces_earlier_deletion_vectors() => {
+                sink.position_deletion_vectors_replaced_by(prepared.delete_files())
+                    .await?
+            }
+            _ => Vec::new(),
+        };
+        Ok((prepared, replaced, sink))
     }
 
     async fn cleanup_layered_append_dirs(&self, snapshot_ids: &[String]) {

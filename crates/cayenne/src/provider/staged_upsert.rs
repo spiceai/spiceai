@@ -258,6 +258,8 @@ impl CayenneStagedUpsert {
             into_empty_table: false,
             first_load_pk_bloom: None,
             resident_retention: None,
+            resident_replaced: Vec::new(),
+            resident_sink: None,
         }
         .commit()
         .await
