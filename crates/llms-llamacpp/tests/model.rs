@@ -331,6 +331,11 @@ async fn a_streamed_reply_is_the_non_streamed_one() {
 
 /// A streamed reply carries the model's reasoning as it is generated, in `reasoning_content`,
 /// and the fragments add up to the non-streamed reply's reasoning and answer exactly.
+///
+/// The reply stops at 64 tokens, all of them reasoning: the case where a client used to receive
+/// nothing at all. It is kept short because two greedy runs can take different tokens at a
+/// near-tie: at 1024 tokens they wrote "30 + 12, which is 42" and "30 + 12 = 42" 1739
+/// characters in.
 #[tokio::test]
 async fn a_streamed_reply_carries_the_non_streamed_reasoning() {
     let model = qwen3().await;
@@ -338,7 +343,7 @@ async fn a_streamed_reply_carries_the_non_streamed_reasoning() {
         "model": "qwen3",
         "messages": [{ "role": "user", "content": "What is 17 + 25? Reply with only the number." }],
         "temperature": 0,
-        "max_tokens": 1024,
+        "max_tokens": 64,
     });
     let whole = model
         .chat_request(request(body.clone()))
