@@ -36,7 +36,7 @@ fn main() -> Result<(), String> {
                 "object-names",
                 "data-files",
                 "data-files-retire",
-                "data-files-retire-prepared",
+                "data-files-retire-remote",
                 "reads-linearizable",
                 "reads-bounded",
                 "table-seq",

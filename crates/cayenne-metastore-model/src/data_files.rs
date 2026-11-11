@@ -29,34 +29,48 @@
 //! out of every commit. (Cayenne's orphan sweep adds an age floor on the store's
 //! clock as a backstop; the `retention` runs model age.)
 //!
-//! In the `retire` runs (on top of `intent`) the head holds snapshots: each
-//! accepted commit is a snapshot named by its attempt, and the live set is the
-//! snapshots no commit has retired. A compaction is a commit that, in the same
-//! record, adds a new snapshot and retires every snapshot live at its base; it
-//! may keep a file of a retired snapshot in place (the new snapshot references
-//! it). The head records each accepted attempt, so an unknown outcome resolves
-//! by attempt, as the head log does, rather than by files a later compaction
-//! may retire. Reclamation runs in the lease holder's process: a sweep reads
-//! the committed retired set, and declines while the holder has a commit whose
-//! outcome it does not know (its local view would include a change that may not
-//! land), while a prepared transaction reserves the table, and while a restore
-//! point holds deletions. It skips each retired snapshot a scan pins, plans the
-//! deletes of the files of the rest that no live or pinned snapshot references
-//! (a compaction can keep a retired snapshot's file in place), and, only
-//! after every delete has returned, commits one record that forgets those
-//! snapshots (the retired entries and their files' rows together). Deletes are
-//! requests that can land late (after a crash or a takeover of the sweeping
-//! process) or fail; a sweep with a failed delete or a crash before its forget
-//! leaves the snapshots retired, and a later sweep deletes again (a delete of a
-//! missing key is a no-op) and forgets them. A scan reads the head and pins its
-//! live snapshots in one step and fetches their files; a restore point reads
-//! the head and copies the live files while it holds deletions. In the
-//! `prepared` runs a commit can instead record a prepared transaction: a new
-//! snapshot and the snapshots it retires, applied only by a later resolve
-//! commit (`CommitTx`) or discarded (`AbortTx`), and while it is unresolved the
-//! table refuses other changes and both sweeps decline. The orphan sweep treats
-//! a retired snapshot's files as named until its forget. `lean` runs have no
-//! scans or restore points, so a larger upload bound stays exhaustive.
+//! In the `retire` runs (on top of `intent`) data files sit flat per table and
+//! retire per file. The head's live set is a set of files, and a record
+//! changes it by name: an append adds its uploads (`AddFiles`); a removal
+//! (`RemoveFiles`) takes the oldest live file out; a compaction
+//! (`ReplaceFiles`) removes its inputs and adds its outputs, and
+//! `CompactCarry` carries the oldest live file in place (it names it and does
+//! not remove it). So several commits can name one file. The record that
+//! removes a file retires it in the same record: the head's retired set gains
+//! the file with that record's version, and a carried file, never removed, is
+//! never retired. The head records each accepted attempt, so an unknown
+//! outcome resolves by attempt. Time is a logical clock: the retention T is
+//! `RETENTION` ticks and a remote reader's staleness bound S is `STALENESS`.
+//! Reclamation runs in the lease holder's process. A sweep pass reads the
+//! committed retired set and starts an in-memory timer for each file it sees
+//! for the first time (a crash or takeover loses the timers, and the next
+//! holder restarts them, which only delays a delete). It deletes a retired
+//! file by name, never by listing, once T has passed on its timer and no
+//! local scan pins a commit older than the record that removed the file (the
+//! sweep keeps every file removed after the oldest pinned commit). It declines
+//! while the holder has a commit whose outcome it does not know, while a
+//! prepared transaction reserves the table, and while a restore point holds
+//! deletions. Only after every delete has returned does it commit one record,
+//! `ForgetRetired`, that takes those files out of the retired set. Deletes can
+//! land late (after a crash or a takeover of the sweeping process) or fail; a
+//! sweep with a failed delete or a crash before its forget leaves the files
+//! retired, and a later pass deletes again (a delete of a missing key is a
+//! no-op) and forgets them. A local scan reads the head and pins the commit it
+//! captured in one step, then fetches its files; a restore point reads the head
+//! and copies the live files while it holds deletions. A remote reader on
+//! another instance writes nothing and pins nothing: it confirms the head with a
+//! GET, starts a query within S of the confirmation, and fetches the files; the
+//! retention guarantees it its files for T − S after it starts. In the
+//! `prepared` runs a commit can instead record a prepared transaction, a
+//! compaction of every live file applied only by a later resolve commit
+//! (`CommitTx`) or discarded (`AbortTx`); while it is unresolved the table
+//! refuses other changes and both sweeps decline. The orphan sweep treats a
+//! retired file as named until its forget. `lean` runs have no scans, restore
+//! points or remote readers, so a larger upload bound stays exhaustive.
+//!
+//! The clock advances only while a holder timer is running or the remote reader
+//! is in a query: every time comparison is between two ticks of one of those, so
+//! a tick with neither only shifts every later time and reaches no new outcome.
 //!
 //! Controls: `no-upload-before-commit` lets a commit name a file whose upload
 //! has not returned; `no-committed-read` makes the reader list the store
@@ -66,16 +80,16 @@
 //! holder's sweep delete a file its own write in flight still holds (reclaiming
 //! too early); `adopt-by-listing` lets a commit name every unnamed file the
 //! store lists, as a maintenance pass that derives its file set from a listing
-//! would. In the `retire` runs: `sweep-uncommitted` plans from the holder's
-//! local view, with its compaction applied before the record commits;
-//! `ignores-pins` deletes a snapshot a scan pins; `forget-early` forgets the
-//! snapshots before their deletes return; `ignores-live-references` deletes a
-//! retired file a live snapshot keeps in place; `ignores-pinned-references`
-//! keeps only files live snapshots reference, so a file a pinned retired
-//! snapshot references in place goes with another retired snapshot's sweep;
-//! `ignores-restore-hold` sweeps
-//! while a restore point copies; `orphan-ignores-reservation` lets the orphan
-//! sweep run while a prepared transaction reserves the table, and
+//! would. In the `retire` runs: `whole-snapshot` retires every file live at a
+//! removing record's base, as a snapshot-level rule would, and its sweep keeps
+//! the files the live set names; `retires-carried` also retires the file a
+//! compaction carries; `ignores-pins` deletes a file a local scan's commit
+//! needs; `ignores-retention` deletes as soon as the sweep observes the
+//! removal; `forget-early` forgets the files before their deletes return;
+//! `ignores-restore-hold` sweeps while a restore point copies;
+//! `sweep-uncommitted` plans from the holder's local view, with its removal
+//! applied before the record commits; `orphan-ignores-reservation` lets the
+//! orphan sweep run while a prepared transaction reserves the table, and
 //! `retire-ignores-reservation` lets the retirement sweep do so.
 use stateright::{Model, Property};
 
@@ -91,12 +105,22 @@ const ATTEMPTS: u8 = 3;
 const RETRIES: u8 = 1;
 /// Head reads by the reader.
 const READS: u8 = 2;
-/// In the `retire` runs: lease takeovers, scans, restore points and failed
-/// deletes, smaller so the added reclamation stays exhaustive.
+/// In the `retire` runs: lease takeovers, local scans, restore points, remote
+/// queries and failed deletes, smaller so the added reclamation stays
+/// exhaustive.
 const RETIRE_TAKES: u8 = 1;
 const RETIRE_READS: u8 = 1;
 const RESTORES: u8 = 1;
+const REMOTE_READS: u8 = 1;
 const DELETE_FAILURES: u8 = 1;
+/// The retention T and the remote reader's staleness bound S, in clock ticks.
+const RETENTION: u8 = 2;
+const STALENESS: u8 = 1;
+/// Clock ticks, and at three uploads in the `remote` runs, where those runs
+/// also have no crash (a takeover still restarts the sweep's timers), so the
+/// graph stays within the checker's time limit.
+const TICKS: u8 = 3;
+const TICKS_3: u8 = 2;
 
 #[derive(Clone, Debug)]
 pub(crate) struct Protocol {
@@ -115,22 +139,33 @@ pub struct Key {
 /// A key and the bytes stored under it, as the uploading writer's index: keys
 /// are unique, so the bytes are fixed by the upload that created the key.
 pub type File = (Key, u8);
-/// A committed snapshot: the attempt that committed it and its files.
-pub type Snapshot = (u8, Vec<File>);
+/// The record that retired a file: its head version, and the clock tick at
+/// which the file actually left the live set, `None` while it is still live
+/// (only a control retires a live file). The tick is a ghost for the I15
+/// timing check; the sweep times the retention from when it observes the
+/// removal.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct Removal {
+    pub version: u8,
+    pub tick: Option<u8>,
+}
+/// A retired file and the record that removed it.
+pub type Retired = (File, Removal);
 
 /// What a commit request publishes.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum CommitKind {
-    /// A new snapshot of the uploaded files.
+    /// `AddFiles`: the uploaded files join the live set.
     Append,
-    /// A new snapshot of the uploaded files that retires every snapshot live
-    /// at the base, in the same record.
+    /// `ReplaceFiles` of every live file by the uploaded files.
     Compact,
-    /// As `Compact`, and the new snapshot keeps the first file of the first
-    /// retired snapshot in place.
-    CompactKeep,
-    /// A prepared transaction: a new snapshot that retires every snapshot live
-    /// at the base, applied only when a later resolve commits it.
+    /// `ReplaceFiles` of every live file but the oldest, which it carries in
+    /// place, by the uploaded files.
+    CompactCarry,
+    /// `RemoveFiles` of the oldest live file; the rest stay live.
+    Remove,
+    /// A prepared transaction: a compaction of every live file, applied only
+    /// when a later resolve commits it.
     Prepare,
 }
 
@@ -139,7 +174,7 @@ pub enum CommitKind {
 pub struct Prepared {
     pub id: u8,
     pub files: Vec<File>,
-    pub retire: Vec<u8>,
+    pub remove: Vec<File>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
@@ -151,10 +186,10 @@ struct Request {
     /// New uploads the request names.
     files: Vec<File>,
     kind: CommitKind,
-    /// Committed files the new snapshot keeps in place.
-    keep: Vec<File>,
-    /// Snapshots it retires.
-    retire: Vec<u8>,
+    /// Live files a compaction carries in place.
+    carry: Vec<File>,
+    /// Live files it removes, and so retires.
+    remove: Vec<File>,
 }
 #[derive(Clone, Debug, Default, PartialEq, Eq, Hash)]
 struct Writer {
@@ -166,19 +201,40 @@ struct Writer {
     finished: Vec<File>,
     /// The outstanding commit attempt, and whether its response was lost.
     pending: Option<(Request, bool)>,
+    /// In the `retire` runs: each retired file this process's sweep has seen,
+    /// with the tick it first saw it (its retention timer).
+    timers: Vec<(File, u8)>,
 }
-/// A reclamation pass in one process: the snapshots it will forget, the
+/// A reclamation pass in one process: the files it will forget, the
 /// generation it runs under, and whether one of its deletes failed.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 struct Sweep {
     writer: usize,
     generation: u8,
-    snapshots: Vec<u8>,
+    files: Vec<File>,
     failed: bool,
 }
 /// A delete request in flight: the file, the sweeping process's generation, and
 /// whether the sweep that sent it still waits for it.
 type Delete = (File, u8, bool);
+/// A query on another instance: the head version and files its confirming GET
+/// read, the tick the GET was sent, the tick the query started, and the next
+/// file to fetch.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+struct Remote {
+    version: u8,
+    keys: Vec<Key>,
+    confirmed: u8,
+    started: Option<u8>,
+    next: usize,
+}
+/// What a sweep pass would do now: its process, the retired files it sees for
+/// the first time, and the deletes it sends.
+struct Pass {
+    writer: usize,
+    observe: Vec<File>,
+    delete: Vec<File>,
+}
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 #[expect(
@@ -188,8 +244,8 @@ type Delete = (File, u8, bool);
 pub(crate) struct State {
     version: u8,
     lease: u8,
-    /// The committed file set the head names (in the `retire` runs: the files
-    /// of the live snapshots).
+    /// The committed file set the head names (in the `retire` runs: the live
+    /// set).
     head: Vec<File>,
     /// The committed file set at every head version (a ghost for the checks).
     history: Vec<Vec<File>>,
@@ -222,33 +278,52 @@ pub(crate) struct State {
     /// A fenced writer, still running, had an upload land after the takeover.
     fenced_landed: bool,
     reclaimed: bool,
-    // The `retire` runs; empty or false otherwise.
-    /// Committed live snapshots, by id.
-    live: Vec<Snapshot>,
-    /// Committed retired snapshots whose forget has not committed.
-    retired: Vec<Snapshot>,
+    // The `retire` runs; empty, zero or false otherwise.
+    /// The logical clock, in ticks.
+    now: u8,
+    /// Removed files whose forget has not committed, by file, with the record
+    /// that retired each.
+    retired: Vec<Retired>,
     /// Attempts the head records as accepted.
     applied: Vec<u8>,
     /// The unresolved prepared transaction the head records.
     prepared: Option<Prepared>,
     sweep: Option<Sweep>,
     deletes: Vec<Delete>,
-    /// Snapshots the scan pins.
-    pins: Vec<u8>,
+    /// The commit the local scan pinned.
+    pin: Option<u8>,
     /// A restore point in progress: head version, the keys it copies, the next.
     restore: Option<(u8, Vec<Key>, usize)>,
     /// Every copy: key and whether the store returned it.
     copied: Vec<(Key, bool)>,
-    /// Snapshots whose forget committed, with their files (a ghost).
-    forgotten: Vec<Snapshot>,
-    /// Snapshots a sweep planned and ended without forgetting (a ghost).
-    interrupted: Vec<u8>,
+    remote: Option<Remote>,
+    remote_reads: u8,
+    /// Files that stayed live through a record that removed other files: a
+    /// compaction's carried file, or a file a removal kept (a ghost).
+    shared: Vec<File>,
+    /// Files whose forget committed, with the record that had retired each
+    /// (a ghost).
+    forgotten: Vec<Retired>,
+    /// Files a sweep planned and ended without forgetting (a ghost).
+    interrupted: Vec<File>,
     /// Each resolved unknown outcome, by attempt, and whether it resolved committed.
     attempt_resolutions: Vec<(u8, bool)>,
     restores: u8,
     delete_failures: u8,
+    /// A committed file was deleted before T had passed since the record that
+    /// removed it, or with no such record (a ghost).
+    early_delete: bool,
+    /// A file was deleted while the live set named it (a ghost).
+    deleted_live: bool,
+    /// A remote query, within T − S of its start, found a file missing (a ghost).
+    remote_missed: bool,
+    remote_read_removed: bool,
+    remote_late_missed: bool,
     fetched_retired: bool,
-    kept_in_place: bool,
+    /// Files a compaction carried in place (a ghost).
+    carried: Vec<File>,
+    forgot_shared: bool,
+    forgot_carried: bool,
     landed_after_takeover: bool,
     resumed: bool,
     copied_retired: bool,
@@ -272,7 +347,8 @@ pub(crate) enum Action {
     Fetch,
     Sweep(usize),
     Compact(usize),
-    CompactKeep(usize),
+    CompactCarry(usize),
+    Remove(usize),
     Prepare(usize),
     CommitTx(usize),
     AbortTx(usize),
@@ -284,6 +360,10 @@ pub(crate) enum Action {
     RestoreStart,
     RestoreCopy,
     RestoreEnd,
+    Tick,
+    RemoteConfirm,
+    RemoteStart,
+    RemoteFetch,
 }
 
 fn keys(files: &[File]) -> impl Iterator<Item = Key> + '_ {
@@ -296,20 +376,16 @@ fn insert_sorted<T: Ord>(set: &mut Vec<T>, items: impl IntoIterator<Item = T>) {
         }
     }
 }
-/// The union of the snapshots' files, sorted.
-fn files_of(snapshots: &[Snapshot]) -> Vec<File> {
-    let mut files = Vec::new();
-    for (_, named) in snapshots {
-        insert_sorted(&mut files, named.iter().copied());
+/// Add `file` to a set keyed by file, keeping an entry already there.
+fn insert_first<T: Ord + Copy>(set: &mut Vec<(File, T)>, file: File, value: T) {
+    if let Err(at) = set.binary_search_by(|(f, _)| f.cmp(&file)) {
+        set.insert(at, (file, value));
     }
-    files
 }
-/// Move the snapshots `ids` from `live` to `retired`.
-fn retire(live: &mut Vec<Snapshot>, retired: &mut Vec<Snapshot>, ids: &[u8]) {
-    let (gone, kept): (Vec<Snapshot>, Vec<Snapshot>) =
-        live.drain(..).partition(|(id, _)| ids.contains(id));
-    *live = kept;
-    insert_sorted(retired, gone);
+fn entry<T: Copy>(set: &[(File, T)], file: File) -> Option<T> {
+    set.binary_search_by(|(f, _)| f.cmp(&file))
+        .ok()
+        .map(|at| set[at].1)
 }
 
 impl Protocol {
@@ -328,8 +404,28 @@ impl Protocol {
     fn takes(&self) -> u8 {
         if self.retiring() { RETIRE_TAKES } else { TAKES }
     }
+    /// Whether this graph has the remote reader and the clock: the `remote`
+    /// runs. The other `retire` runs have local scans and restore points and
+    /// no clock: there T protects no reader, so they take T as zero and the
+    /// sweep deletes a retired file once it observes it.
+    fn remote(&self) -> bool {
+        self.retiring() && self.has("remote")
+    }
+    fn retention(&self) -> u8 {
+        if self.remote() { RETENTION } else { 0 }
+    }
+    fn ticks(&self) -> u8 {
+        if self.uploads >= 3 { TICKS_3 } else { TICKS }
+    }
+    fn crashes(&self) -> u8 {
+        if self.remote() && self.uploads >= 3 {
+            0
+        } else {
+            CRASHES
+        }
+    }
     fn reads(&self) -> u8 {
-        if self.has("lean") {
+        if self.has("lean") || self.remote() {
             0
         } else if self.retiring() {
             RETIRE_READS
@@ -337,8 +433,17 @@ impl Protocol {
             READS
         }
     }
+    /// Restore points are in the two-upload local graphs; at three uploads
+    /// they would push the graph past the checker's time limit.
     fn restores(&self) -> u8 {
-        if self.has("lean") { 0 } else { RESTORES }
+        if self.has("lean") || self.remote() || self.uploads >= 3 {
+            0
+        } else {
+            RESTORES
+        }
+    }
+    fn remote_reads(&self) -> u8 {
+        if self.remote() { REMOTE_READS } else { 0 }
     }
     /// The store's files the committed head does not name, sorted.
     fn unnamed(s: &State) -> Vec<File> {
@@ -377,35 +482,37 @@ impl Protocol {
             Self::named(s, &request.files) == request.files.len()
         }
     }
-    /// Whether the orphan sweep counts `file` as named: by a live snapshot, by
-    /// a retired snapshot until its forget, or, while a prepared transaction
+    /// Whether the orphan sweep counts `file` as named: by the live set, by
+    /// the retired set until its forget, or, while a prepared transaction
     /// reserves the table, by anything at all (the sweep declines).
     fn named_for_orphans(&self, s: &State, file: File) -> bool {
         s.head.contains(&file)
-            || s.retired.iter().any(|(_, files)| files.contains(&file))
+            || entry(&s.retired, file).is_some()
             || s.prepared.is_some() && !self.has("orphan-ignores-reservation")
     }
-    /// The live and retired snapshots the sweeping process reads: the committed
-    /// head, and in `sweep-uncommitted` its own compaction in flight applied
-    /// as if it had landed.
-    fn local_view(&self, s: &State, holder: &Writer) -> (Vec<Snapshot>, Vec<Snapshot>) {
-        let (mut live, mut retired) = (s.live.clone(), s.retired.clone());
+    /// The retired set the sweeping process reads: the committed one, and in
+    /// `sweep-uncommitted` its own removal in flight applied as if it had
+    /// landed.
+    fn local_view(&self, s: &State, holder: &Writer) -> Vec<Retired> {
+        let mut retired = s.retired.clone();
         if self.has("sweep-uncommitted")
             && let Some((request, _)) = &holder.pending
-            && matches!(request.kind, CommitKind::Compact | CommitKind::CompactKeep)
+            && request.kind != CommitKind::Prepare
             && !s.applied.contains(&request.attempt)
         {
-            let mut files = request.files.clone();
-            insert_sorted(&mut files, request.keep.iter().copied());
-            retire(&mut live, &mut retired, &request.retire);
-            insert_sorted(&mut live, [(request.attempt, files)]);
+            for f in &request.remove {
+                let removal = Removal {
+                    version: request.base + 1,
+                    tick: Some(s.now),
+                };
+                insert_first(&mut retired, *f, removal);
+            }
         }
-        (live, retired)
+        retired
     }
-    /// The sweep the lease holder would plan now: its process, the snapshots
-    /// it will forget, the deletes it sends, and whether a live snapshot kept
-    /// a file in place.
-    fn plan(&self, s: &State) -> Option<(usize, Vec<u8>, Vec<File>, bool)> {
+    /// The sweep pass the lease holder would run now, if it would change
+    /// anything.
+    fn pass(&self, s: &State) -> Option<Pass> {
         let h = Self::holder_index(s)?;
         let holder = &s.writers[h];
         if s.sweep.is_some()
@@ -415,49 +522,48 @@ impl Protocol {
         {
             return None;
         }
-        let (live, retired) = self.local_view(s, holder);
-        let candidates: Vec<&Snapshot> = retired
-            .iter()
-            .filter(|(id, _)| self.has("ignores-pins") || !s.pins.contains(id))
-            .collect();
-        if candidates.is_empty() {
-            return None;
-        }
-        // Files a live snapshot, or a snapshot a scan pins, references (in
-        // place, from a retired snapshot's files) stay.
-        let mut referenced = files_of(&live);
-        if !self.has("ignores-pinned-references") && !self.has("ignores-pins") {
-            for (_, files) in retired.iter().filter(|(id, _)| s.pins.contains(id)) {
-                insert_sorted(&mut referenced, files.iter().copied());
+        let mut observe = Vec::new();
+        let mut delete = Vec::new();
+        for (file, by) in self.local_view(s, holder) {
+            let waited = self.waited(s, holder, file);
+            if self.retention() > 0 && entry(&holder.timers, file).is_none() {
+                observe.push(file);
+            }
+            // A scan pinned at commit `p` reads files live at `p`; a file the
+            // record at version `by` removed was live at `p` when `by > p`.
+            let pinned = !self.has("ignores-pins") && s.pin.is_some_and(|p| by.version > p);
+            // A snapshot-level rule keeps the files the live set names.
+            let live = self.has("whole-snapshot") && s.head.contains(&file);
+            if waited && !pinned && !live {
+                delete.push(file);
             }
         }
-        let mut doomed = Vec::new();
-        let mut kept = false;
-        for (_, files) in &candidates {
-            for f in files {
-                if self.has("ignores-live-references") || !referenced.contains(f) {
-                    insert_sorted(&mut doomed, [*f]);
-                } else {
-                    kept = true;
-                }
-            }
-        }
-        let ids = candidates.iter().map(|(id, _)| *id).collect();
-        Some((h, ids, doomed, kept))
+        (!observe.is_empty() || !delete.is_empty()).then_some(Pass {
+            writer: h,
+            observe,
+            delete,
+        })
+    }
+    /// Whether `holder`'s sweep may delete the retired `file` now: T has
+    /// passed on its timer (with no clock, T is zero).
+    fn waited(&self, s: &State, holder: &Writer, file: File) -> bool {
+        self.retention() == 0
+            || self.has("ignores-retention")
+            || entry(&holder.timers, file).is_some_and(|since| s.now >= since + self.retention())
     }
     /// Deletes in flight the running sweep still waits for.
     fn outstanding(s: &State) -> usize {
         s.deletes.iter().filter(|d| d.2).count()
     }
     /// End the running sweep without a forget: its deletes no longer report,
-    /// and its snapshots stay retired for a later sweep.
+    /// and its files stay retired for a later pass.
     fn end_sweep(next: &mut State) {
         if let Some(sweep) = next.sweep.take() {
             for delete in &mut next.deletes {
                 delete.2 = false;
             }
             next.deletes.sort_unstable();
-            insert_sorted(&mut next.interrupted, sweep.snapshots);
+            insert_sorted(&mut next.interrupted, sweep.files);
         }
     }
     /// After a delete of the running sweep returned: a sweep with a failed
@@ -467,8 +573,29 @@ impl Protocol {
             Self::end_sweep(next);
         }
     }
-    fn refresh_head(next: &mut State) {
-        next.head = files_of(&next.live);
+    /// Whether time can matter: a holder timer is running, or the remote reader
+    /// is in a query.
+    fn timed(&self, s: &State) -> bool {
+        Self::holder(s).is_some_and(|holder| {
+            holder
+                .timers
+                .iter()
+                .any(|(_, since)| s.now < since + self.retention())
+        }) || s.remote.is_some()
+    }
+    /// Record a delete of `file` landing in the store (for the I15 checks).
+    fn deleting(&self, s: &State, next: &mut State, file: File) {
+        if !self.retiring() || !s.store.contains(&file) {
+            return;
+        }
+        next.deleted_live |= s.head.contains(&file);
+        if s.history.iter().any(|set| set.contains(&file)) {
+            // Only a control lets a delete land after the forget.
+            next.early_delete |= entry(&s.retired, file)
+                .or_else(|| entry(&s.forgotten, file))
+                .and_then(|by| by.tick)
+                .is_none_or(|at| s.now < at + self.retention());
+        }
     }
     fn commit_enabled(&self, s: &State, w: usize, kind: CommitKind) -> bool {
         let writer = &s.writers[w];
@@ -483,9 +610,13 @@ impl Protocol {
                         || self.has("no-upload-before-commit") && !writer.started.is_empty()
                         || self.has("adopt-by-listing") && !Self::unnamed(s).is_empty()
                 }
-                CommitKind::Compact | CommitKind::CompactKeep => {
-                    self.retiring() && !writer.finished.is_empty() && !s.live.is_empty()
+                CommitKind::Compact => {
+                    self.retiring() && !writer.finished.is_empty() && !s.head.is_empty()
                 }
+                CommitKind::CompactCarry => {
+                    self.retiring() && !writer.finished.is_empty() && s.head.len() >= 2
+                }
+                CommitKind::Remove => self.retiring() && !s.head.is_empty(),
                 CommitKind::Prepare => self.has("prepared") && !writer.finished.is_empty(),
             }
     }
@@ -503,7 +634,8 @@ impl Protocol {
             Action::FinishUpload(i) => i < s.puts.len(),
             Action::Commit(w) => self.commit_enabled(s, w, CommitKind::Append),
             Action::Compact(w) => self.commit_enabled(s, w, CommitKind::Compact),
-            Action::CompactKeep(w) => self.commit_enabled(s, w, CommitKind::CompactKeep),
+            Action::CompactCarry(w) => self.commit_enabled(s, w, CommitKind::CompactCarry),
+            Action::Remove(w) => self.commit_enabled(s, w, CommitKind::Remove),
             Action::Prepare(w) => self.commit_enabled(s, w, CommitKind::Prepare),
             Action::Deliver(i) | Action::Drop(i) => i < s.net.len(),
             Action::Timeout(w) => matches!(writer(w).pending, Some((_, false))),
@@ -524,8 +656,11 @@ impl Protocol {
                 _ => false,
             },
             Action::Takeover(w) => s.takes < self.takes() && writer(w).generation != Some(s.lease),
-            Action::Crash(w) => s.crashes < CRASHES && *writer(w) != Writer::default(),
-            Action::Read => s.reads < self.reads() && (!self.retiring() || s.pins.is_empty()),
+            Action::Crash(w) => s.crashes < self.crashes() && *writer(w) != Writer::default(),
+            Action::Read => {
+                s.reads < self.reads()
+                    && (!self.retiring() || s.pin.is_none() && !s.head.is_empty())
+            }
             Action::Fetch => s
                 .snapshot
                 .as_ref()
@@ -548,17 +683,18 @@ impl Protocol {
                     && Self::holder_index(s) == Some(w)
                     && writer(w).pending.is_none()
             }
-            Action::Plan => self.retiring() && self.plan(s).is_some(),
+            Action::Plan => self.retiring() && self.pass(s).is_some(),
             Action::DeleteLand(i) => i < s.deletes.len(),
             Action::DeleteFail(i) => i < s.deletes.len() && s.delete_failures < DELETE_FAILURES,
             Action::Forget => s.sweep.as_ref().is_some_and(|sweep| {
                 self.has("forget-early") || !sweep.failed && Self::outstanding(s) == 0
             }),
-            Action::Unpin => !s.pins.is_empty(),
+            Action::Unpin => s.pin.is_some(),
             Action::RestoreStart => {
                 self.retiring()
                     && s.restores < self.restores()
                     && s.restore.is_none()
+                    && !s.head.is_empty()
                     && (s.sweep.is_none() || self.has("ignores-restore-hold"))
             }
             Action::RestoreCopy => s
@@ -566,18 +702,32 @@ impl Protocol {
                 .as_ref()
                 .is_some_and(|(_, listed, next)| *next < listed.len()),
             Action::RestoreEnd => s.restore.is_some(),
+            Action::Tick => self.remote() && s.now < self.ticks() && self.timed(s),
+            Action::RemoteConfirm => {
+                s.remote_reads < self.remote_reads() && s.remote.is_none() && !s.head.is_empty()
+            }
+            Action::RemoteStart => s
+                .remote
+                .as_ref()
+                .is_some_and(|r| r.started.is_none() && s.now <= r.confirmed + STALENESS),
+            Action::RemoteFetch => s
+                .remote
+                .as_ref()
+                .is_some_and(|r| r.started.is_some() && r.next < r.keys.len()),
         }
     }
     /// Quiescence for the reclamation check: a lease holder runs with no
-    /// commit in flight, no scan or restore point holds anything, no
-    /// transaction is prepared, and only new work or faults remain enabled.
+    /// commit in flight, no scan, restore point or remote query holds
+    /// anything, no transaction is prepared, and only new work, faults or
+    /// the clock remain enabled.
     fn quiescent(&self, s: &State) -> bool {
         let Some(holder) = Self::holder(s) else {
             return false;
         };
         if holder.pending.is_some()
-            || !s.pins.is_empty()
+            || s.pin.is_some()
             || s.restore.is_some()
+            || s.remote.is_some()
             || s.prepared.is_some()
         {
             return false;
@@ -590,23 +740,32 @@ impl Protocol {
                 Action::StartUpload(_)
                     | Action::Commit(_)
                     | Action::Compact(_)
-                    | Action::CompactKeep(_)
+                    | Action::CompactCarry(_)
+                    | Action::Remove(_)
                     | Action::Prepare(_)
                     | Action::Read
                     | Action::RestoreStart
+                    | Action::RemoteConfirm
                     | Action::Crash(_)
                     | Action::Takeover(_)
                     | Action::Timeout(_)
                     | Action::Retry(_)
                     | Action::Drop(_)
                     | Action::DeleteFail(_)
+                    | Action::Tick
             )
         })
     }
     fn send(&self, s: &State, next: &mut State, w: usize, kind: CommitKind) -> Option<()> {
         let writer = &s.writers[w];
         let generation = writer.generation?;
-        let mut files = writer.finished.clone();
+        // A removal names no uploads; the writer keeps them for a later commit.
+        let uploads = kind != CommitKind::Remove;
+        let mut files = if uploads {
+            writer.finished.clone()
+        } else {
+            vec![]
+        };
         if self.has("no-upload-before-commit") {
             files.extend(writer.started.iter().copied());
         }
@@ -618,20 +777,13 @@ impl Protocol {
             files.extend(adopted);
         }
         files.sort_unstable();
-        // The writer reads the head it commits on.
-        let retire: Vec<u8> = match kind {
-            CommitKind::Append => vec![],
-            _ => s.live.iter().map(|(id, _)| *id).collect(),
-        };
-        let keep: Vec<File> = match kind {
-            CommitKind::CompactKeep => s
-                .live
-                .first()
-                .and_then(|(_, files)| files.first())
-                .copied()
-                .into_iter()
-                .collect(),
-            _ => vec![],
+        // The writer reads the head it commits on; the head is sorted, so the
+        // oldest file is first.
+        let (carry, remove): (Vec<File>, Vec<File>) = match kind {
+            CommitKind::Append => (vec![], vec![]),
+            CommitKind::Compact | CommitKind::Prepare => (vec![], s.head.clone()),
+            CommitKind::CompactCarry => (s.head[..1].to_vec(), s.head[1..].to_vec()),
+            CommitKind::Remove => (vec![], s.head[..1].to_vec()),
         };
         let request = Request {
             attempt: s.attempts,
@@ -640,12 +792,14 @@ impl Protocol {
             base: s.version,
             files,
             kind,
-            keep,
-            retire,
+            carry,
+            remove,
         };
         next.attempts += 1;
         let writer = &mut next.writers[w];
-        writer.finished.clear();
+        if uploads {
+            writer.finished.clear();
+        }
         if self.has("no-upload-before-commit") {
             writer.started.clear();
         }
@@ -653,28 +807,53 @@ impl Protocol {
         next.net.push(request);
         Some(())
     }
-    /// Apply an accepted request to the `retire` head.
-    fn publish(next: &mut State, request: &Request) {
-        insert_sorted(&mut next.applied, [request.attempt]);
-        match request.kind {
-            CommitKind::Append => {
-                insert_sorted(&mut next.live, [(request.attempt, request.files.clone())]);
-            }
-            CommitKind::Compact | CommitKind::CompactKeep => {
-                let mut files = request.files.clone();
-                insert_sorted(&mut files, request.keep.iter().copied());
-                retire(&mut next.live, &mut next.retired, &request.retire);
-                insert_sorted(&mut next.live, [(request.attempt, files)]);
-            }
-            CommitKind::Prepare => {
-                next.prepared = Some(Prepared {
-                    id: request.attempt,
-                    files: request.files.clone(),
-                    retire: request.retire.clone(),
-                });
+    /// Apply a record at the new head version that removes `remove` from the
+    /// live set, carries `carry` and adds `add`; it retires what it removes.
+    fn replace(&self, next: &mut State, remove: &[File], carry: &[File], add: &[File]) {
+        let base = next.head.clone();
+        next.head.retain(|f| !remove.contains(f));
+        insert_sorted(&mut next.head, add.iter().copied());
+        if !remove.is_empty() {
+            insert_sorted(
+                &mut next.shared,
+                base.iter().filter(|f| !remove.contains(f)).copied(),
+            );
+        }
+        insert_sorted(&mut next.carried, carry.iter().copied());
+        let retiring: Vec<File> = if self.has("whole-snapshot") && !remove.is_empty() {
+            base
+        } else if self.has("retires-carried") {
+            remove.iter().chain(carry).copied().collect()
+        } else {
+            remove.to_vec()
+        };
+        for f in retiring {
+            let removal = Removal {
+                version: next.version,
+                tick: None,
+            };
+            insert_first(&mut next.retired, f, removal);
+        }
+        // The ghost tick records when each file actually left the live set,
+        // whichever record retired it.
+        for (f, by) in &mut next.retired {
+            if by.tick.is_none() && !next.head.contains(f) {
+                by.tick = Some(next.now);
             }
         }
-        Self::refresh_head(next);
+    }
+    /// Apply an accepted request to the `retire` head.
+    fn publish(&self, next: &mut State, request: &Request) {
+        insert_sorted(&mut next.applied, [request.attempt]);
+        if request.kind == CommitKind::Prepare {
+            next.prepared = Some(Prepared {
+                id: request.attempt,
+                files: request.files.clone(),
+                remove: request.remove.clone(),
+            });
+        } else {
+            self.replace(next, &request.remove, &request.carry, &request.files);
+        }
     }
 }
 
@@ -709,22 +888,32 @@ impl Model for Protocol {
             fenced_refused: false,
             fenced_landed: false,
             reclaimed: false,
-            live: vec![],
+            now: 0,
             retired: vec![],
             applied: vec![],
             prepared: None,
             sweep: None,
             deletes: vec![],
-            pins: vec![],
+            pin: None,
             restore: None,
             copied: vec![],
+            remote: None,
+            remote_reads: 0,
+            shared: vec![],
             forgotten: vec![],
             interrupted: vec![],
             attempt_resolutions: vec![],
             restores: 0,
             delete_failures: 0,
+            early_delete: false,
+            deleted_live: false,
+            remote_missed: false,
+            remote_read_removed: false,
+            remote_late_missed: false,
             fetched_retired: false,
-            kept_in_place: false,
+            carried: vec![],
+            forgot_shared: false,
+            forgot_carried: false,
             landed_after_takeover: false,
             resumed: false,
             copied_retired: false,
@@ -747,7 +936,8 @@ impl Model for Protocol {
             if self.retiring() {
                 a.extend([
                     Action::Compact(w),
-                    Action::CompactKeep(w),
+                    Action::CompactCarry(w),
+                    Action::Remove(w),
                     Action::Prepare(w),
                     Action::CommitTx(w),
                     Action::AbortTx(w),
@@ -768,6 +958,10 @@ impl Model for Protocol {
                 Action::RestoreStart,
                 Action::RestoreCopy,
                 Action::RestoreEnd,
+                Action::Tick,
+                Action::RemoteConfirm,
+                Action::RemoteStart,
+                Action::RemoteFetch,
             ]);
             for i in 0..s.deletes.len() {
                 a.extend([Action::DeleteLand(i), Action::DeleteFail(i)]);
@@ -813,7 +1007,8 @@ impl Model for Protocol {
             }
             Action::Commit(w) => self.send(s, &mut next, w, CommitKind::Append)?,
             Action::Compact(w) => self.send(s, &mut next, w, CommitKind::Compact)?,
-            Action::CompactKeep(w) => self.send(s, &mut next, w, CommitKind::CompactKeep)?,
+            Action::CompactCarry(w) => self.send(s, &mut next, w, CommitKind::CompactCarry)?,
+            Action::Remove(w) => self.send(s, &mut next, w, CommitKind::Remove)?,
             Action::Prepare(w) => self.send(s, &mut next, w, CommitKind::Prepare)?,
             Action::Deliver(i) => {
                 // The store evaluates the conditional publication: the exact
@@ -824,7 +1019,7 @@ impl Model for Protocol {
                 if accepted {
                     next.version += 1;
                     if self.retiring() {
-                        Self::publish(&mut next, &request);
+                        self.publish(&mut next, &request);
                     } else {
                         insert_sorted(&mut next.head, request.files.iter().copied());
                     }
@@ -887,7 +1082,8 @@ impl Model for Protocol {
             }
             Action::Takeover(w) => {
                 // A head commit raising the generation; the new holder starts
-                // with nothing of its own, and its earlier sends stay in flight.
+                // with nothing of its own (no timers either), and its earlier
+                // sends stay in flight.
                 next.takes += 1;
                 next.lease += 1;
                 next.version += 1;
@@ -927,8 +1123,8 @@ impl Model for Protocol {
                 next.snapshot = Some((s.version, listed));
                 next.fetched = 0;
                 if self.retiring() {
-                    // The scan pins the snapshots it reads, in the same step.
-                    next.pins = s.live.iter().map(|(id, _)| *id).collect();
+                    // The scan pins the commit it captured, in the same step.
+                    next.pin = Some(s.version);
                 }
             }
             Action::Fetch => {
@@ -940,11 +1136,13 @@ impl Model for Protocol {
                 next.fetched_retired |= bytes.is_some() && !s.head.iter().any(|(k, _)| *k == key);
             }
             Action::Unpin => {
-                next.pins.clear();
+                next.pin = None;
                 next.snapshot = None;
                 next.fetched = 0;
             }
             Action::Sweep(i) => {
+                let file = *s.store.get(i)?;
+                self.deleting(s, &mut next, file);
                 next.store.remove(i);
                 next.reclaimed = true;
             }
@@ -953,9 +1151,7 @@ impl Model for Protocol {
                 next.prepared = None;
                 next.version += 1;
                 if matches!(action, Action::CommitTx(_)) {
-                    retire(&mut next.live, &mut next.retired, &tx.retire);
-                    insert_sorted(&mut next.live, [(tx.id, tx.files)]);
-                    Self::refresh_head(&mut next);
+                    self.replace(&mut next, &tx.remove, &[], &tx.files);
                     next.tx_committed = true;
                 } else {
                     insert_sorted(&mut next.aborted, keys(&tx.files));
@@ -964,24 +1160,31 @@ impl Model for Protocol {
                 next.history.push(next.head.clone());
             }
             Action::Plan => {
-                let (writer, snapshots, doomed, kept) = self.plan(s)?;
-                let generation = s.writers[writer].generation?;
-                insert_sorted(
-                    &mut next.deletes,
-                    doomed.into_iter().map(|f| (f, generation, true)),
-                );
-                next.sweep = Some(Sweep {
-                    writer,
-                    generation,
-                    snapshots,
-                    failed: false,
-                });
-                next.kept_in_place |= kept;
-                next.planned_while_reserved |= s.prepared.is_some();
+                let pass = self.pass(s)?;
+                let generation = s.writers[pass.writer].generation?;
+                let now = s.now;
+                let writer = &mut next.writers[pass.writer];
+                for f in pass.observe {
+                    insert_first(&mut writer.timers, f, now);
+                }
+                if !pass.delete.is_empty() {
+                    insert_sorted(
+                        &mut next.deletes,
+                        pass.delete.iter().map(|f| (*f, generation, true)),
+                    );
+                    next.sweep = Some(Sweep {
+                        writer: pass.writer,
+                        generation,
+                        files: pass.delete,
+                        failed: false,
+                    });
+                    next.planned_while_reserved |= s.prepared.is_some();
+                }
             }
             Action::DeleteLand(i) => {
                 let (file, generation, _) = *s.deletes.get(i)?;
                 next.deletes.remove(i);
+                self.deleting(s, &mut next, file);
                 if let Ok(at) = next.store.binary_search(&file) {
                     next.store.remove(at);
                 }
@@ -1004,26 +1207,38 @@ impl Model for Protocol {
                     delete.2 = false;
                 }
                 next.deletes.sort_unstable();
-                // One record, through the sweeping process's serial writer: a
-                // fenced process's commit is refused, and a reserved table
-                // refuses it before any request.
+                // One `ForgetRetired` record, through the sweeping process's
+                // serial writer: a fenced process's commit is refused, and a
+                // reserved table refuses it before any request.
                 let committed = s.writers[sweep.writer].generation == Some(sweep.generation)
                     && sweep.generation == s.lease
                     && s.prepared.is_none();
                 if committed {
                     next.version += 1;
-                    let (gone, kept): (Vec<Snapshot>, Vec<Snapshot>) = next
+                    let (gone, kept): (Vec<Retired>, Vec<Retired>) = next
                         .retired
                         .drain(..)
-                        .partition(|(id, _)| sweep.snapshots.contains(id));
+                        .partition(|(f, _)| sweep.files.contains(f));
                     next.retired = kept;
-                    next.resumed |= gone
+                    next.writers[sweep.writer]
+                        .timers
+                        .retain(|(f, _)| !sweep.files.contains(f));
+                    next.resumed |= sweep
+                        .files
                         .iter()
-                        .any(|(id, _)| s.interrupted.binary_search(id).is_ok());
+                        .any(|f| s.interrupted.binary_search(f).is_ok());
+                    next.forgot_shared |= sweep
+                        .files
+                        .iter()
+                        .any(|f| s.shared.binary_search(f).is_ok());
+                    next.forgot_carried |= sweep
+                        .files
+                        .iter()
+                        .any(|f| s.carried.binary_search(f).is_ok());
                     insert_sorted(&mut next.forgotten, gone);
                     next.history.push(next.head.clone());
                 } else {
-                    insert_sorted(&mut next.interrupted, sweep.snapshots);
+                    insert_sorted(&mut next.interrupted, sweep.files);
                 }
             }
             Action::RestoreStart => {
@@ -1041,9 +1256,41 @@ impl Model for Protocol {
                 }
             }
             Action::RestoreEnd => next.restore = None,
+            Action::Tick => next.now += 1,
+            Action::RemoteConfirm => {
+                next.remote_reads += 1;
+                next.remote = Some(Remote {
+                    version: s.version,
+                    keys: keys(&s.head).collect(),
+                    confirmed: s.now,
+                    started: None,
+                    next: 0,
+                });
+            }
+            Action::RemoteStart => {
+                if let Some(remote) = &mut next.remote {
+                    remote.started = Some(s.now);
+                }
+            }
+            Action::RemoteFetch => {
+                let remote = s.remote.as_ref()?;
+                let key = *remote.keys.get(remote.next)?;
+                let found = s.store.iter().any(|(k, _)| *k == key);
+                let within = s.now < remote.started? + RETENTION - STALENESS;
+                next.remote_missed |= within && !found;
+                next.remote_read_removed |= found && !s.head.iter().any(|(k, _)| *k == key);
+                next.remote_late_missed |= !within && !found;
+                if remote.next + 1 == remote.keys.len() {
+                    // The query ends.
+                    next.remote = None;
+                } else if let Some(remote) = &mut next.remote {
+                    remote.next += 1;
+                }
+            }
         }
         (next != *s).then_some(next)
     }
+    #[expect(clippy::too_many_lines, reason = "one entry per property")]
     fn properties(&self) -> Vec<Property<Self>> {
         let mut properties = vec![
             Property::always("committed files exist", |_, s: &State| {
@@ -1133,63 +1380,104 @@ impl Model for Protocol {
             return properties;
         }
         properties.extend([
-            Property::always("pinned reader finds every file", |_, s: &State| {
-                s.observed.iter().all(|(_, _, bytes)| bytes.is_some())
-            }),
+            // I15, per file.
+            Property::always(
+                "data file deleted only T after the record that removed it",
+                |_, s: &State| !s.early_delete,
+            ),
+            Property::always(
+                "carried or shared file never deleted while live",
+                |_, s: &State| !s.deleted_live,
+            ),
+            Property::always(
+                "pinned scan finds every file of its commit",
+                |_, s: &State| s.observed.iter().all(|(_, _, bytes)| bytes.is_some()),
+            ),
+            Property::always(
+                "remote reader within T - S finds every file",
+                |_, s: &State| !s.remote_missed,
+            ),
             Property::always("restore point copies every file", |_, s: &State| {
                 s.copied.iter().all(|(_, found)| *found)
             }),
-            // Unless a live snapshot or another retired one (whose own sweep
-            // deletes it) still names it.
-            Property::always("forgotten snapshot leaves no file", |_, s: &State| {
-                s.forgotten.iter().all(|(_, files)| {
-                    files.iter().all(|f| {
-                        s.head.contains(f)
-                            || s.retired.iter().any(|(_, named)| named.contains(f))
-                            || !s.store.contains(f)
-                    })
-                })
+            Property::always("forgotten file leaves nothing behind", |_, s: &State| {
+                s.forgotten.iter().all(|(f, _)| !s.store.contains(f))
             }),
+            // Bounded: at quiescence each retired file waits out T on the
+            // holder's timer, so nothing reclaimable is left behind.
             Property::always(
-                "retired snapshots reclaimed at quiescence",
-                |model: &Self, s: &State| !model.quiescent(s) || s.retired.is_empty(),
+                "retired files reclaimed at quiescence once T has passed",
+                |model: &Self, s: &State| {
+                    !model.quiescent(s)
+                        || Self::holder(s).is_some_and(|holder| {
+                            s.retired.iter().all(|(f, _)| {
+                                model.retention() > 0
+                                    && entry(&holder.timers, *f)
+                                        .is_some_and(|since| s.now < since + model.retention())
+                            })
+                        })
+                },
             ),
-            Property::sometimes("snapshot retired by a commit", |_, s: &State| {
-                !s.retired.is_empty() || !s.forgotten.is_empty()
-            }),
-            Property::sometimes("retired snapshot deleted and forgotten", |_, s: &State| {
-                s.forgotten
-                    .iter()
-                    .any(|(_, files)| files.iter().any(|f| !s.head.contains(f)))
-            }),
-            // The holder could sweep but for a scan's pin on a retired snapshot.
-            Property::sometimes("sweep waits for a snapshot a scan pins", |_, s: &State| {
-                s.retired.iter().any(|(id, _)| s.pins.contains(id))
-                    && s.sweep.is_none()
-                    && s.restore.is_none()
-                    && s.prepared.is_none()
-                    && Self::holder(s).is_some_and(|holder| holder.pending.is_none())
+            Property::sometimes(
+                "file retired by the record that removed it",
+                |_, s: &State| !s.retired.is_empty() || !s.forgotten.is_empty(),
+            ),
+            Property::sometimes("retired file deleted and forgotten", |_, s: &State| {
+                !s.forgotten.is_empty()
             }),
             Property::sometimes(
-                "scan reads a file of its snapshot after the snapshot retired",
+                "file shared across a removal later deleted and forgotten",
+                |_, s: &State| s.forgot_shared,
+            ),
+            // The holder could delete a file once T has passed but for a
+            // scan's pin on an older commit.
+            Property::sometimes(
+                "sweep waits for a file a scan's commit needs",
+                |model: &Self, s: &State| {
+                    let Some(pin) = s.pin else {
+                        return false;
+                    };
+                    s.sweep.is_none()
+                        && s.restore.is_none()
+                        && s.prepared.is_none()
+                        && Self::holder(s).is_some_and(|holder| {
+                            holder.pending.is_none()
+                                && s.retired
+                                    .iter()
+                                    .any(|(f, by)| by.version > pin && model.waited(s, holder, *f))
+                        })
+                },
+            ),
+            Property::sometimes(
+                "scan reads a file of its commit after the file was removed",
                 |_, s: &State| s.fetched_retired,
             ),
             Property::sometimes(
-                "live snapshot keeps a retired snapshot's file in place",
-                |_, s: &State| s.kept_in_place && !s.forgotten.is_empty(),
+                "remote reader reads a file removed after its confirmation",
+                |_, s: &State| s.remote_read_removed,
+            ),
+            Property::sometimes(
+                "remote reader past T - S finds a file deleted",
+                |_, s: &State| s.remote_late_missed,
             ),
             Property::sometimes("delete lands after a takeover", |_, s: &State| {
                 s.landed_after_takeover
             }),
             Property::sometimes(
-                "interrupted sweep's snapshots forgotten by a later sweep",
+                "interrupted sweep's files forgotten by a later sweep",
                 |_, s: &State| s.resumed,
             ),
             Property::sometimes(
-                "restore point copies a file retired after it started",
+                "restore point copies a file removed after it started",
                 |_, s: &State| s.copied_retired,
             ),
         ]);
+        if self.uploads >= 3 {
+            properties.push(Property::sometimes(
+                "file a compaction carried in place later deleted and forgotten",
+                |_, s: &State| s.forgot_carried,
+            ));
+        }
         if self.has("prepared") {
             properties.extend([
                 Property::sometimes("prepared transaction committed", |_, s: &State| {
@@ -1204,18 +1492,23 @@ impl Model for Protocol {
                 |_, s: &State| s.planned_while_reserved,
             ));
         }
-        if self.has("lean") {
-            // No scans or restore points: their witnesses cannot be reached.
-            properties.retain(|p| {
-                !matches!(
-                    p.name,
-                    "reader fetches a committed file"
-                        | "sweep waits for a snapshot a scan pins"
-                        | "scan reads a file of its snapshot after the snapshot retired"
-                        | "restore point copies a file retired after it started"
-                )
-            });
-        }
+        // A graph checks only the readers it has: the others would hold
+        // vacuously, and their witnesses cannot be reached.
+        let local = self.reads() > 0;
+        let restore = self.restores() > 0;
+        let remote = self.remote_reads() > 0;
+        properties.retain(|p| match p.name {
+            "reader fetches a committed file"
+            | "pinned scan finds every file of its commit"
+            | "sweep waits for a file a scan's commit needs"
+            | "scan reads a file of its commit after the file was removed" => local,
+            "restore point copies every file"
+            | "restore point copies a file removed after it started" => restore,
+            "remote reader within T - S finds every file"
+            | "remote reader reads a file removed after its confirmation"
+            | "remote reader past T - S finds a file deleted" => remote,
+            _ => true,
+        });
         properties
     }
 }
@@ -1233,10 +1526,11 @@ pub enum Op {
         key: Key,
         acknowledged: bool,
     },
-    /// `Commit(w)`, `Compact(w)`, `CompactKeep(w)`, `Prepare(w)`: writer `w`
-    /// sends a conditional head publication on `base_version` and
-    /// `generation` that adds `files` (new uploads) and `keep` (committed files
-    /// kept in place) as snapshot `attempt` and retires `retire`.
+    /// `Commit(w)`, `Compact(w)`, `CompactCarry(w)`, `Remove(w)`,
+    /// `Prepare(w)`: writer `w` sends a conditional head publication on
+    /// `base_version` and `generation` that adds `files` (new uploads),
+    /// carries `carry` in place and removes (so retires) `remove`, as attempt
+    /// `attempt`.
     CommitSent {
         writer: usize,
         attempt: u8,
@@ -1244,8 +1538,8 @@ pub enum Op {
         base_version: u8,
         files: Vec<Key>,
         kind: CommitKind,
-        keep: Vec<Key>,
-        retire: Vec<u8>,
+        carry: Vec<Key>,
+        remove: Vec<Key>,
     },
     /// `Deliver(i)`: the store evaluates a commit request; `accepted` when it
     /// published, `fenced` when the lease generation refused it, `answered`
@@ -1275,28 +1569,29 @@ pub enum Op {
     /// `Crash(w)`: the writer process restarts and forgets its state.
     Crash { writer: usize },
     /// `Read`: the reader reads the head (`version`, `files`), and in the
-    /// `retire` runs pins the live snapshots `pins` in the same step.
+    /// `retire` runs pins commit `version` in the same step (`pinned`).
     ReadHead {
         version: u8,
         files: Vec<Key>,
-        pins: Vec<u8>,
+        pinned: bool,
     },
     /// `Fetch`: the reader GETs the next file of its snapshot; `found` when the
     /// store returned it.
     Fetch { key: Key, found: bool },
-    /// `Unpin`: the scan ends and releases its pins.
+    /// `Unpin`: the scan ends and releases its pin.
     Unpinned,
     /// `Sweep(i)`: the orphan sweep deletes an unnamed file.
     Swept { key: Key },
     /// `CommitTx(w)` / `AbortTx(w)`: the lease holder commits the resolve
     /// record of the prepared transaction `id`.
     TxResolved { writer: usize, id: u8, commit: bool },
-    /// `Plan`: the holder's sweep reads the committed retired set and sends
-    /// the deletes of `deletes` for the snapshots `snapshots`.
+    /// `Plan`: the holder's sweep pass reads the committed retired set, starts
+    /// a retention timer for each file in `observed`, and sends the deletes of
+    /// `deletes` (none when no file is due).
     SweepPlanned {
         writer: usize,
         generation: u8,
-        snapshots: Vec<u8>,
+        observed: Vec<Key>,
         deletes: Vec<Key>,
     },
     /// `DeleteLand(i)`: a delete request lands; `acknowledged` when the sweep
@@ -1304,12 +1599,12 @@ pub enum Op {
     DeleteLanded { key: Key, acknowledged: bool },
     /// `DeleteFail(i)`: a delete request fails and the object stays.
     DeleteFailed { key: Key, acknowledged: bool },
-    /// `Forget`: the sweep commits the record forgetting `snapshots`;
+    /// `Forget`: the sweep commits the `ForgetRetired` record for `files`;
     /// `committed` when the head accepted it.
     Forgotten {
         writer: usize,
         generation: u8,
-        snapshots: Vec<u8>,
+        files: Vec<Key>,
         committed: bool,
     },
     /// `RestoreStart`: a restore point reads the head and holds deletions.
@@ -1318,6 +1613,24 @@ pub enum Op {
     RestoreCopied { key: Key, found: bool },
     /// `RestoreEnd`: the restore point releases its hold.
     RestoreEnded,
+    /// `Tick`: the logical clock advances to `now`.
+    Ticked { now: u8 },
+    /// `RemoteConfirm`: a reader on another instance confirms the head
+    /// (`version`, `files`) with a GET sent at tick `at`.
+    RemoteConfirmed {
+        version: u8,
+        files: Vec<Key>,
+        at: u8,
+    },
+    /// `RemoteStart`: its query starts at tick `at`, within S of the GET.
+    RemoteStarted { at: u8 },
+    /// `RemoteFetch`: it GETs its next file; `within_bound` when less than
+    /// T − S has passed since the query started.
+    RemoteFetched {
+        key: Key,
+        found: bool,
+        within_bound: bool,
+    },
 }
 
 /// What one action of a `data-files` trace does, as the model takes it.
@@ -1325,17 +1638,19 @@ pub enum Op {
 pub struct Step {
     pub action: String,
     pub op: Op,
-    /// The head after the action: version, lease generation and file set.
+    /// The head after the action: version, lease generation and file set
+    /// (in the `retire` runs, the live set).
     pub version: u8,
     pub lease: u8,
     pub head: Vec<File>,
     /// The store's data files after the action.
     pub store: Vec<File>,
-    /// In the `retire` runs: the live and retired snapshots and the prepared
-    /// transaction after the action.
-    pub live: Vec<Snapshot>,
-    pub retired: Vec<Snapshot>,
+    /// In the `retire` runs: the retired files with the record that removed
+    /// each, the prepared transaction, and the clock
+    /// after the action.
+    pub retired: Vec<Retired>,
     pub prepared: Option<Prepared>,
+    pub now: u8,
 }
 
 fn parse(text: &str) -> Option<Action> {
@@ -1354,7 +1669,8 @@ fn parse(text: &str) -> Option<Action> {
         ("FinishUpload", &[i]) => Action::FinishUpload(i),
         ("Commit", &[w]) => Action::Commit(w),
         ("Compact", &[w]) => Action::Compact(w),
-        ("CompactKeep", &[w]) => Action::CompactKeep(w),
+        ("CompactCarry", &[w]) => Action::CompactCarry(w),
+        ("Remove", &[w]) => Action::Remove(w),
         ("Prepare", &[w]) => Action::Prepare(w),
         ("CommitTx", &[w]) => Action::CommitTx(w),
         ("AbortTx", &[w]) => Action::AbortTx(w),
@@ -1376,6 +1692,10 @@ fn parse(text: &str) -> Option<Action> {
         ("RestoreStart", &[]) => Action::RestoreStart,
         ("RestoreCopy", &[]) => Action::RestoreCopy,
         ("RestoreEnd", &[]) => Action::RestoreEnd,
+        ("Tick", &[]) => Action::Tick,
+        ("RemoteConfirm", &[]) => Action::RemoteConfirm,
+        ("RemoteStart", &[]) => Action::RemoteStart,
+        ("RemoteFetch", &[]) => Action::RemoteFetch,
         _ => return None,
     })
 }
@@ -1411,7 +1731,8 @@ pub fn steps(mode: &str, bound: usize, actions: &[String]) -> Option<Vec<Step>> 
             }
             Action::Commit(w)
             | Action::Compact(w)
-            | Action::CompactKeep(w)
+            | Action::CompactCarry(w)
+            | Action::Remove(w)
             | Action::Prepare(w) => {
                 let request = next.net.last()?;
                 Op::CommitSent {
@@ -1421,8 +1742,8 @@ pub fn steps(mode: &str, bound: usize, actions: &[String]) -> Option<Vec<Step>> 
                     base_version: request.base,
                     files: keys(&request.files).collect(),
                     kind: request.kind,
-                    keep: keys(&request.keep).collect(),
-                    retire: request.retire.clone(),
+                    carry: keys(&request.carry).collect(),
+                    remove: keys(&request.remove).collect(),
                 }
             }
             Action::Deliver(i) => {
@@ -1469,7 +1790,7 @@ pub fn steps(mode: &str, bound: usize, actions: &[String]) -> Option<Vec<Step>> 
                 Op::ReadHead {
                     version,
                     files,
-                    pins: next.pins.clone(),
+                    pinned: next.pin.is_some(),
                 }
             }
             Action::Fetch => {
@@ -1489,12 +1810,12 @@ pub fn steps(mode: &str, bound: usize, actions: &[String]) -> Option<Vec<Step>> 
                 commit: matches!(action, Action::CommitTx(_)),
             },
             Action::Plan => {
-                let sweep = next.sweep.as_ref()?;
+                let pass = protocol.pass(&state)?;
                 Op::SweepPlanned {
-                    writer: sweep.writer,
-                    generation: sweep.generation,
-                    snapshots: sweep.snapshots.clone(),
-                    deletes: next.deletes.iter().filter(|d| d.2).map(|d| d.0.0).collect(),
+                    writer: pass.writer,
+                    generation: state.writers[pass.writer].generation?,
+                    observed: keys(&pass.observe).collect(),
+                    deletes: keys(&pass.delete).collect(),
                 }
             }
             Action::DeleteLand(i) => Op::DeleteLanded {
@@ -1510,7 +1831,7 @@ pub fn steps(mode: &str, bound: usize, actions: &[String]) -> Option<Vec<Step>> 
                 Op::Forgotten {
                     writer: sweep.writer,
                     generation: sweep.generation,
-                    snapshots: sweep.snapshots.clone(),
+                    files: keys(&sweep.files).collect(),
                     committed: next.version > state.version,
                 }
             }
@@ -1523,6 +1844,25 @@ pub fn steps(mode: &str, bound: usize, actions: &[String]) -> Option<Vec<Step>> 
                 Op::RestoreCopied { key, found }
             }
             Action::RestoreEnd => Op::RestoreEnded,
+            Action::Tick => Op::Ticked { now: next.now },
+            Action::RemoteConfirm => {
+                let remote = next.remote.as_ref()?;
+                Op::RemoteConfirmed {
+                    version: remote.version,
+                    files: remote.keys.clone(),
+                    at: remote.confirmed,
+                }
+            }
+            Action::RemoteStart => Op::RemoteStarted { at: state.now },
+            Action::RemoteFetch => {
+                let remote = state.remote.as_ref()?;
+                let key = *remote.keys.get(remote.next)?;
+                Op::RemoteFetched {
+                    key,
+                    found: state.store.iter().any(|(k, _)| *k == key),
+                    within_bound: state.now < remote.started? + RETENTION - STALENESS,
+                }
+            }
         };
         out.push(Step {
             action: text.clone(),
@@ -1531,9 +1871,9 @@ pub fn steps(mode: &str, bound: usize, actions: &[String]) -> Option<Vec<Step>> 
             lease: next.lease,
             head: next.head.clone(),
             store: next.store.clone(),
-            live: next.live.clone(),
             retired: next.retired.clone(),
             prepared: next.prepared.clone(),
+            now: next.now,
         });
         state = next;
     }

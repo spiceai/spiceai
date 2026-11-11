@@ -2375,44 +2375,63 @@ fn additional_runs() -> Vec<Run> {
             2,
             "aborted or abandoned upload never visible to a reader",
         ),
-        // Retirement of committed snapshots and reader protection.
+        // Per-file retirement of committed data files and reader protection.
         ("data-files-retire", "data-files-intent-retire", 2, ""),
         ("data-files-retire-3", "data-files-intent-retire", 3, ""),
+        // The clock, the retention T and a reader on another instance.
         (
-            "data-files-retire-sweep-uncommitted",
-            "data-files-intent-retire-sweep-uncommitted",
+            "data-files-retire-remote",
+            "data-files-intent-retire-remote",
             2,
-            "committed files exist",
+            "",
+        ),
+        (
+            "data-files-retire-remote-3",
+            "data-files-intent-retire-remote",
+            3,
+            "",
+        ),
+        (
+            "data-files-retire-whole-snapshot",
+            "data-files-intent-retire-whole-snapshot",
+            2,
+            "pinned scan finds every file of its commit",
+        ),
+        (
+            "data-files-retire-3-retires-carried",
+            "data-files-intent-retire-retires-carried",
+            3,
+            "carried or shared file never deleted while live",
         ),
         (
             "data-files-retire-ignores-pins",
             "data-files-intent-retire-ignores-pins",
             2,
-            "pinned reader finds every file",
+            "pinned scan finds every file of its commit",
+        ),
+        (
+            "data-files-retire-remote-ignores-retention",
+            "data-files-intent-retire-remote-ignores-retention",
+            2,
+            "remote reader within T - S finds every file",
         ),
         (
             "data-files-retire-forget-early",
             "data-files-intent-retire-forget-early",
             2,
-            "forgotten snapshot leaves no file",
-        ),
-        (
-            "data-files-retire-ignores-live-references",
-            "data-files-intent-retire-ignores-live-references",
-            2,
-            "committed files exist",
-        ),
-        (
-            "data-files-retire-3-ignores-pinned-references",
-            "data-files-intent-retire-ignores-pinned-references",
-            3,
-            "pinned reader finds every file",
+            "forgotten file leaves nothing behind",
         ),
         (
             "data-files-retire-ignores-restore-hold",
             "data-files-intent-retire-ignores-restore-hold",
             2,
             "restore point copies every file",
+        ),
+        (
+            "data-files-retire-sweep-uncommitted",
+            "data-files-intent-retire-sweep-uncommitted",
+            2,
+            "committed files exist",
         ),
         (
             "data-files-retire-prepared",
@@ -3184,7 +3203,7 @@ pub fn transaction_steps(run: &str, actions: &[String]) -> Option<Vec<Transactio
 
 pub use data_files::{
     CommitKind as DataFileCommitKind, File as DataFile, Key as DataFileKey, Op as DataFileOp,
-    Prepared as DataFilePrepared, Snapshot as DataFileSnapshot, Step as DataFileStep,
+    Prepared as DataFilePrepared, Retired as DataFileRetired, Step as DataFileStep,
 };
 
 /// What each action of a `data-files` trace from `run` does in the model, for a
@@ -3205,9 +3224,15 @@ pub use data_files::{
 /// is the head commit that raises the lease generation; `Crash(w)` restarts the
 /// writer process. `Read` reads the head's committed file set; `Fetch` GETs the
 /// next file of it. `Sweep(i)` deletes the `i`-th stored file, which no
-/// committed head names and whose generation is fenced. Each step also carries
-/// the head (version, lease, files) and the store's files after the action, the
-/// state a replay checks after every operation.
+/// committed head names and whose generation is fenced. The `retire` runs add
+/// records that remove files by name and retire them (`Compact`,
+/// `CompactCarry`, `Remove`, `Prepare` with `CommitTx`/`AbortTx`), the
+/// holder's sweep (`Plan`, `DeleteLand`, `DeleteFail`, `Forget`), a logical
+/// clock (`Tick`), local scan pins (`Unpin`), restore points and a reader on
+/// another instance (`RemoteConfirm`, `RemoteStart`, `RemoteFetch`). Each step
+/// also carries the head (version, lease, files), the store's files, and in
+/// the `retire` runs the retired set and the clock after the action, the state
+/// a replay checks after every operation.
 #[must_use]
 pub fn data_file_steps(run: &str, actions: &[String]) -> Option<Vec<DataFileStep>> {
     let run = runs()
