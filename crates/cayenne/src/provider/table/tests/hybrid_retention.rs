@@ -612,3 +612,68 @@ async fn hybrid_replay_after_staged_uncommitted_and_committed_unacked_crashes() 
         .await;
     }
 }
+
+/// The durable write routes that reach an armed `cdc_durability: memory` table
+/// besides the CDC apply: a transaction commit and an SQL insert.
+#[derive(Clone, Copy, Debug)]
+enum DurableRoute {
+    Transaction,
+    SqlInsert,
+}
+
+async fn durable_write(provider: &CayenneTableProvider, route: DurableRoute, rows: &[(i64, i64)]) {
+    let ids: Vec<i64> = rows.iter().map(|(id, _)| *id).collect();
+    let values: Vec<i64> = rows.iter().map(|(_, v)| *v).collect();
+    let batch = id_value_batch(schema(), &ids, &values);
+    match route {
+        DurableRoute::Transaction => {
+            let txn = crate::CayenneTransaction::new();
+            let token = provider.transaction_write_token().await;
+            txn.register(
+                provider.table_id().to_string(),
+                token,
+                provider.clone_for_write_operations(),
+            );
+            let staged = provider
+                .begin_staged_upsert_occ(token, single_batch_stream(batch), 1)
+                .await
+                .expect("staged");
+            txn.set_staged(provider.table_id(), staged);
+            txn.commit().await.expect("transaction commit");
+        }
+        DurableRoute::SqlInsert => insert_batch(provider, batch).await,
+    }
+}
+
+/// A durable write (transaction or SQL insert) to an armed hybrid table applies
+/// `retention_sql` to the whole logical view it publishes, tier rows included:
+/// key 2's tier version (retained -> archived) is retired, key 3's tier version
+/// (archived -> retained) stays and its archived durable version neither fails
+/// nor resurrects. The view holds through the next checkpoint and a restart.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn armed_tier_durable_writes_retain_the_whole_logical_view() {
+    for route in [DurableRoute::Transaction, DurableRoute::SqlInsert] {
+        let f = hybrid(&format!("hyb_durable_{route:?}").to_lowercase(), 1).await;
+        seed(&f).await;
+        f.set(ON);
+        durable_write(&f.provider, route, &[(6, 6)]).await;
+        assert_eq!(
+            rows(&f.provider).await,
+            RETAINED.to_vec(),
+            "{route:?}: published view"
+        );
+        f.provider.checkpoint_mem_tier().await.expect("checkpoint");
+        assert_eq!(
+            rows(&f.provider).await,
+            RETAINED.to_vec(),
+            "{route:?}: after the tier checkpoint"
+        );
+        settle(&f.provider).await;
+        let restarted = f.restart().await;
+        assert_eq!(
+            rows(&restarted).await,
+            RETAINED.to_vec(),
+            "{route:?}: after a restart"
+        );
+    }
+}
