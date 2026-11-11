@@ -298,26 +298,10 @@ async fn seed_durable(f: &Fixture) {
 /// barrier, so it is safe while the test holds [`CayenneTableProvider::hold_compaction`]
 /// (a compaction pass declines a busy lock with `try_write` and clears its flag).
 async fn settle(provider: &CayenneTableProvider) {
-    loop {
-        provider
-            .flush_pending_maintenance()
-            .await
-            .expect("maintenance flushed");
-        while provider.post_write_compaction_state.load(Ordering::Acquire) != COALESCED_TASK_IDLE
-            || provider.orphan_dv_sweep_state.load(Ordering::Acquire) != COALESCED_TASK_IDLE
-            || provider.snapshot_cleanup_scheduled.load(Ordering::Acquire)
-            || provider.inline_checkpoint_scheduled.load(Ordering::Acquire)
-        {
-            tokio::time::sleep(std::time::Duration::from_millis(1)).await;
-        }
-        if !provider
-            .post_write_maintenance
-            .scheduled
-            .load(Ordering::Acquire)
-        {
-            return;
-        }
-    }
+    provider
+        .drain_in_flight_maintenance_holding_compaction()
+        .await
+        .expect("maintenance settled");
 }
 
 /// Let the post-checkpoint maintenance and post-write compaction the seeding

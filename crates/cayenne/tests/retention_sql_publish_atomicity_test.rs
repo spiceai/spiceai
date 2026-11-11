@@ -2290,11 +2290,10 @@ async fn maintenance_pass_and_append_are_serialized_impl(
             !append.is_finished(),
             "{name}: the append waits while the maintenance pass holds its generation"
         );
-        assert_eq!(
-            ids(&t).await?,
-            vec![1, 2],
-            "{name}: nothing published while the pass is parked"
-        );
+        // No scan here: parked inside its predicate the pass is mid-delete and
+        // a reader waits on the listing fence it holds (a scan here deadlocked
+        // against the handshake). The library test reads the rows while its pass
+        // is parked at entry, before the fence.
         release_tx.send(())?;
         let pass = racer.join().expect("racer thread");
         assert_eq!(
@@ -2759,6 +2758,10 @@ async fn hybrid_cdc_composite_retention_across_versions_shards_and_compaction_im
             ])
             .await?;
             t.checkpoint_mem_tier().await?;
+            // The checkpoint armed a background retention pass, which checkpoints
+            // the tier itself; let it finish so the "crash before checkpoint"
+            // reopen below sees only this durable generation.
+            t.drain_in_flight_maintenance().await?;
         }
         t.install_slot_advancer(Arc::new(CountingSlotAdvancer(Arc::clone(&acks))));
         // Two tier versions per key; the newest decides.
@@ -2814,7 +2817,9 @@ async fn hybrid_cdc_composite_retention_across_versions_shards_and_compaction_im
             "{label}: durable before ack"
         );
 
-        // Reinsert both deleted keys, then checkpoint and compact twice.
+        // Reinsert both deleted keys, then checkpoint and compact twice. No
+        // post-write compaction may merge the runs before the explicit one.
+        let held = t.hold_compaction().await;
         apply(vec![(2, 1, "new"), (1, 1, "new")]).await?;
         let reinserted = k(&[
             (1, 1, "new"),
@@ -2853,6 +2858,8 @@ async fn hybrid_cdc_composite_retention_across_versions_shards_and_compaction_im
             "{label}: (2,2), (4,1) gone"
         );
         t.checkpoint_mem_tier().await?;
+        t.drain_in_flight_maintenance_holding_compaction().await?;
+        drop(held);
         // Compaction variants (inline off): the merge folds the snapshots holding
         // the deleted rows together with their tombstones: rows physically
         // dropped, tombstones at or below the merged fence no longer applied.

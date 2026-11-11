@@ -23073,6 +23073,23 @@ impl CayenneTableProvider {
     /// in-process reopen behave like a clean restart.
     #[doc(hidden)]
     pub async fn drain_in_flight_maintenance(&self) -> CatalogResult<()> {
+        self.drain_in_flight_maintenance_inner(true).await
+    }
+
+    /// [`Self::drain_in_flight_maintenance`] for a caller holding
+    /// [`Self::hold_compaction`]: the same waits without the final
+    /// `compaction_lock` barrier, which would wait on the caller's own guard.
+    /// While the guard is held every compaction pass declines the busy lock and
+    /// clears its scheduled flag, so the flag waits alone see no pass running.
+    #[doc(hidden)]
+    pub async fn drain_in_flight_maintenance_holding_compaction(&self) -> CatalogResult<()> {
+        self.drain_in_flight_maintenance_inner(false).await
+    }
+
+    async fn drain_in_flight_maintenance_inner(
+        &self,
+        compaction_barrier: bool,
+    ) -> CatalogResult<()> {
         // A failed flush is reported only after every wait below: returning
         // early would leave a detached pass running behind a caller that
         // believes the instance is quiet — the overlap `quiesce` exists to stop.
@@ -23107,7 +23124,9 @@ impl CayenneTableProvider {
         // Final barrier: serialize behind any compaction pass that grabbed the
         // lock without one of the flags above; once held, nothing is mid-flight.
         // Released immediately — the caller is about to drop/replace this instance.
-        drop(self.compaction_lock.write().await);
+        if compaction_barrier {
+            drop(self.compaction_lock.write().await);
+        }
         // And behind a snapshot-directory sweep still deleting files: its
         // detached unlinks hold the deletion fence and none of the flags above.
         drop(self.file_deletion_fence.read().await);
