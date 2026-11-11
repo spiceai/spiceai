@@ -28,6 +28,48 @@ expression: "normalize_search_response(resp, round_scores)"
       "primary_key": {
         "i_item_sk": 7
       }
+    },
+    {
+      "_score": "0.63",
+      "dataset": "spice.public.catalog_page_with_chunking",
+      "matches": {
+        "cp_description": [
+          "In general basic characters welcome. Clearly lively friends conv"
+        ]
+      },
+      "primary_key": {
+        "cp_catalog_page_sk": 1
+      }
+    },
+    {
+      "_score": "0.63",
+      "dataset": "spice.public.catalog_page_with_chunking_no_pk",
+      "matches": {
+        "cp_description": [
+          "In general basic characters welcome. Clearly lively friends conv"
+        ]
+      }
+    },
+    {
+      "_score": "0.62",
+      "dataset": "spice.public.catalog_page_with_chunking",
+      "matches": {
+        "cp_description": [
+          "Heavily direct problems try eventually on a nurses. Courses may make a"
+        ]
+      },
+      "primary_key": {
+        "cp_catalog_page_sk": 8
+      }
+    },
+    {
+      "_score": "0.62",
+      "dataset": "spice.public.catalog_page_with_chunking_no_pk",
+      "matches": {
+        "cp_description": [
+          "Heavily direct problems try eventually on a nurses. Courses may make a"
+        ]
+      }
     }
   ]
 }
