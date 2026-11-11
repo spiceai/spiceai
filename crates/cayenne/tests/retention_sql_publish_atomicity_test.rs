@@ -1625,3 +1625,107 @@ async fn retention_now_is_fixed_once_per_publication_impl(
     }
     Ok(())
 }
+
+/// `mode: memory`: an append's retention delete over the resident tier rows
+/// lands in the same tier swap as the incoming rows, with no maintenance pass.
+/// A resident row whose predicate errors fails the append and keeps the
+/// previous tier; a version an upsert superseded is never evaluated.
+#[test]
+fn memory_mode_resident_retention_in_the_append_swap_sqlite() -> Result<(), String> {
+    common::run_with_backend_blocking(
+        common::BackendType::Sqlite,
+        memory_mode_resident_retention_in_the_append_swap_impl,
+    )
+}
+
+async fn memory_mode_resident_retention_in_the_append_swap_impl(
+    fixture: common::TestFixture,
+) -> Result<(), Box<dyn std::error::Error>> {
+    use datafusion::logical_expr::{ColumnarValue, Volatility, create_udf};
+    for (name, keyed) in [("rsql_mem_keyed", true), ("rsql_mem_unkeyed", false)] {
+        let aged = Arc::new(AtomicBool::new(false));
+        let broken = Arc::new(AtomicBool::new(false));
+        let (a, b) = (Arc::clone(&aged), Arc::clone(&broken));
+        let udf = create_udf(
+            "aged",
+            vec![DataType::Utf8],
+            DataType::Boolean,
+            Volatility::Volatile,
+            Arc::new(move |args: &[ColumnarValue]| {
+                let array = args[0].clone().into_array(1)?;
+                let values = array.as_any().downcast_ref::<StringArray>().expect("utf8");
+                let mut out = Vec::with_capacity(values.len());
+                for v in values.iter() {
+                    let old = v == Some("old");
+                    if old && b.load(Ordering::SeqCst) {
+                        return Err(datafusion::error::DataFusionError::Execution(
+                            "aged() cannot evaluate this row".to_string(),
+                        ));
+                    }
+                    out.push(Some(old && a.load(Ordering::SeqCst)));
+                }
+                Ok(ColumnarValue::Array(Arc::new(
+                    arrow::array::BooleanArray::from(out),
+                )))
+            }),
+        );
+        let dir = fixture.data_path.join(name);
+        std::fs::create_dir_all(&dir)?;
+        let options = CreateTableOptions {
+            table_name: name.to_string(),
+            schema: schema(),
+            primary_key: if keyed {
+                vec!["id".to_string()]
+            } else {
+                vec![]
+            },
+            on_conflict: keyed
+                .then(|| OnConflict::Upsert(ColumnReference::new(vec!["id".to_string()]))),
+            base_path: dir.to_string_lossy().to_string(),
+            partition_column: None,
+            vortex_config: common::lookup_index::memory_mode_config(),
+        };
+        let t = Arc::new(
+            CayenneTableProvider::create_table_with_retention(
+                Arc::clone(&fixture.catalog) as Arc<dyn MetadataCatalog>,
+                options,
+                vec![udf.call(vec![col("status")])],
+                SessionContext::new().runtime_env(),
+            )
+            .await?,
+        );
+        assert!(t.is_memory_resident_mode(), "{name}: memory mode");
+        common::insert_batch(t.as_ref(), rows(&[(1, Some("old")), (2, Some("new"))])).await?;
+
+        broken.store(true, Ordering::SeqCst);
+        let failed = common::insert_batch(t.as_ref(), rows(&[(3, Some("new"))])).await;
+        assert!(
+            failed.is_err(),
+            "{name}: an erroring resident row fails the append"
+        );
+        assert_eq!(ids(&t).await?, vec![1, 2], "{name}: previous tier kept");
+
+        broken.store(false, Ordering::SeqCst);
+        aged.store(true, Ordering::SeqCst);
+        common::insert_batch(t.as_ref(), rows(&[(3, Some("new"))])).await?;
+        assert_eq!(
+            ids(&t).await?,
+            vec![2, 3],
+            "{name}: the aged resident row is gone in the append's own swap"
+        );
+
+        if keyed {
+            aged.store(false, Ordering::SeqCst);
+            common::insert_batch(t.as_ref(), rows(&[(4, Some("old"))])).await?;
+            common::insert_batch(t.as_ref(), rows(&[(4, Some("new"))])).await?;
+            broken.store(true, Ordering::SeqCst);
+            common::insert_batch(t.as_ref(), rows(&[(5, Some("new"))])).await?;
+            assert_eq!(
+                ids(&t).await?,
+                vec![2, 3, 4, 5],
+                "{name}: the superseded version is never evaluated"
+            );
+        }
+    }
+    Ok(())
+}
