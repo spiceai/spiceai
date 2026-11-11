@@ -169,6 +169,9 @@ impl DebeziumKafka {
             let batches = consumer
                 .stream_json::<ChangeEventKey, ChangeEvent>()
                 .chunks_timeout(batching.0, batching.1);
+            // The consumer's fetch position has moved past every message in a batch,
+            // so each one is delivered here or never again; an error goes out between
+            // the envelopes on either side of it, in order.
             futures::StreamExt::flat_map(batches, move |msgs| {
                 if msgs.is_empty() {
                     return futures::stream::iter(vec![Err(cdc::StreamError::Kafka(
@@ -176,8 +179,8 @@ impl DebeziumKafka {
                     ))]);
                 }
 
-                let mut messages = Vec::with_capacity(msgs.len());
-                let mut error = None;
+                let mut items = Vec::new();
+                let mut messages = Vec::new();
                 for msg in msgs {
                     match msg {
                         Ok(message) => {
@@ -188,16 +191,15 @@ impl DebeziumKafka {
                             source: KafkaError::PartitionEOF(partition),
                         }) => catch_up.observe_partition_end(partition),
                         Err(e) => {
-                            error.get_or_insert(e);
+                            if !messages.is_empty() {
+                                items.push(to_envelope(&messages, &mut catch_up));
+                                messages.clear();
+                            }
+                            items.push(Err(cdc::StreamError::Kafka(e)));
                         }
                     }
                 }
-
-                let mut items = Vec::with_capacity(2);
-                // An error fails the whole batch.
-                if let Some(e) = error {
-                    items.push(Err(cdc::StreamError::Kafka(e)));
-                } else if !messages.is_empty() {
+                if !messages.is_empty() {
                     items.push(to_envelope(&messages, &mut catch_up));
                 }
                 items.extend(catch_up.ready_signal(&signal_schema));

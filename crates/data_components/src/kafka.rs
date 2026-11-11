@@ -2234,6 +2234,13 @@ mod tests {
     /// A one-broker mock cluster holding one message, `{"id": 1}`, on topic `t`.
     fn cluster_holding_one_message()
     -> rdkafka::mocking::MockCluster<'static, rdkafka::producer::DefaultProducerContext> {
+        cluster_holding(r#"{"id": 1}"#)
+    }
+
+    /// A one-broker mock cluster holding one message, `payload`, on topic `t`.
+    fn cluster_holding(
+        payload: &str,
+    ) -> rdkafka::mocking::MockCluster<'static, rdkafka::producer::DefaultProducerContext> {
         use rdkafka::mocking::MockCluster;
         use rdkafka::producer::{BaseProducer, BaseRecord, Producer};
 
@@ -2244,7 +2251,7 @@ mod tests {
             .create()
             .expect("producer");
         producer
-            .send(BaseRecord::<(), str>::to("t").payload(r#"{"id": 1}"#))
+            .send(BaseRecord::<(), str>::to("t").payload(payload))
             .map_err(|(e, _)| e)
             .expect("enqueue message");
         producer
@@ -2508,6 +2515,71 @@ mod tests {
             "the error and the message arrived {:?} apart, so they were not batched together \
              and the test did not exercise a mixed batch",
             rows_at.duration_since(*last_error_at)
+        );
+    }
+
+    /// A Debezium change fetched in one batching window with a transient consumption
+    /// error is handed over, and the dataset is not reported ready before it.
+    #[cfg(feature = "debezium")]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn debezium_hands_over_the_change_batched_with_a_transient_error() {
+        use rdkafka::types::{RDKafkaApiKey, RDKafkaRespErr};
+
+        // Long enough that the disconnect's error and the message fetched after
+        // the reconnect land in one batch.
+        const BATCH_WINDOW: Duration = Duration::from_secs(5);
+        let cluster = cluster_holding(r#"{"payload": {"after": {"id": 1}, "op": "c"}}"#);
+        cluster.request_errors(
+            RDKafkaApiKey::Fetch,
+            &[RDKafkaRespErr::RD_KAFKA_RESP_ERR__TRANSPORT],
+        );
+        let debezium = crate::debezium_kafka::DebeziumKafka::new(
+            id_schema(),
+            vec!["id".to_string()],
+            consumer_subscribed_to_t(&cluster),
+            (10_000, BATCH_WINDOW),
+            None,
+        );
+        let mut stream = debezium.stream_changes();
+
+        let mut last_error_at = None;
+        let mut ready_before_the_change = false;
+        let deadline = tokio::time::Instant::now() + BATCH_WINDOW * 3;
+        let change = loop {
+            match tokio::time::timeout_at(deadline, stream.next()).await {
+                Err(_) | Ok(None) => panic!(
+                    "the change fetched after the reconnect was never handed over; \
+                     it was dropped with the transient error in its batch"
+                ),
+                Ok(Some(Err(cdc::StreamError::Kafka(Error::UnableToReceiveMessage {
+                    source,
+                }))))
+                    if is_transient_kafka_consumption_error(&source) =>
+                {
+                    last_error_at = Some(Instant::now());
+                }
+                Ok(Some(Err(e))) => panic!("unexpected stream error: {e}"),
+                Ok(Some(Ok(envelope))) if envelope.num_rows_hint() > 0 => break envelope,
+                Ok(Some(Ok(signal))) => ready_before_the_change |= signal.is_dataset_ready(),
+            }
+        };
+
+        let last_error_at = last_error_at
+            .expect("the broker dropped the first fetch, so the stream reports a transient error");
+        assert!(
+            last_error_at.elapsed() < BATCH_WINDOW / 2,
+            "the error and the change arrived {:?} apart, so they were not batched together \
+             and the test did not exercise a mixed batch",
+            last_error_at.elapsed()
+        );
+        assert!(
+            !ready_before_the_change,
+            "the dataset was reported ready before the change on the topic at start was handed over"
+        );
+        assert_eq!(
+            (change.num_rows_hint(), change.is_dataset_ready()),
+            (1, true),
+            "the one change on the topic at start, handed over with the readiness it completes"
         );
     }
 }
