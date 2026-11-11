@@ -5,6 +5,7 @@ on:
 
 jobs:
   build:
+    environment: secret-free
     name: Build ${{ matrix.name }} binaries
     runs-on: ${{ matrix.runner }}
     strategy:
@@ -60,6 +61,7 @@ jobs:
           fi
 
   test_acceleration:
+    environment: secret-free
     name: '${{ matrix.acceleration.engine }} acceleration on ${{ matrix.target.name }}'
     runs-on: ${{ matrix.target.runner }}
     needs:
@@ -71,7 +73,7 @@ jobs:
         acceleration:
           [
             { engine: arrow, mode: memory },
-            { engine: duckdb, mode: memory },
+            { engine: cayenne, mode: memory },
             { engine: sqlite, mode: memory },
             { engine: postgres },
           ]

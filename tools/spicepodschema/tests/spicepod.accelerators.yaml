@@ -32,47 +32,6 @@ datasets:
         file_watcher: "true"
 
   # ===========================================================================
-  # DuckDB Accelerator
-  # Runtime params: file_watcher, connection_pool_size,
-  #                 on_refresh_recompute_statistics,
-  #                 optimizer_duckdb_aggregate_pushdown
-  # ===========================================================================
-  - name: accel_duckdb
-    from: postgres:public.medium_table
-    params:
-      pg_host: localhost
-      pg_port: "5432"
-      pg_db: testdb
-      pg_user: postgres
-      pg_pass: secret
-    acceleration:
-      enabled: true
-      engine: duckdb
-      mode: file
-      refresh_mode: full
-      params:
-        duckdb_file: ./data/accel.duckdb
-        file_watcher: "true"
-        connection_pool_size: "5"
-        on_refresh_recompute_statistics: "true"
-        optimizer_duckdb_aggregate_pushdown: "true"
-
-  # DuckDB in memory mode
-  - name: accel_duckdb_memory
-    from: postgres:public.small_table_2
-    params:
-      pg_host: localhost
-      pg_port: "5432"
-      pg_db: testdb
-      pg_user: postgres
-      pg_pass: secret
-    acceleration:
-      enabled: true
-      engine: duckdb
-      mode: memory
-      refresh_mode: full
-
-  # ===========================================================================
   # SQLite Accelerator
   # Runtime params: busy_timeout, file_watcher
   # ===========================================================================

@@ -13,6 +13,7 @@ jobs:
   # merge_group can't path-filter, so gate the lint on a changed-files check
   # instead of running it for every merge-queue entry.
   changes:
+    environment: secret-free
     runs-on: ubuntu-latest
     # A full-history checkout (`fetch-depth: 0`) and a path diff. Sized for a
     # cold runner having to clone from scratch, not the ~1 min a warm
@@ -33,6 +34,7 @@ jobs:
               - 'deploy/chart/**'
 
   lint-helm:
+    environment: secret-free
     name: Helm Lint
     needs: changes
     # A helm template/lint over one chart.

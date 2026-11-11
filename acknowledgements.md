@@ -1179,9 +1179,6 @@ Spice.ai acknowledges the following open source projects for making this project
 - ttf-parser 0.25.1, Apache-2.0 OR MIT 
   <br/>https://github.com/harfbuzz/ttf-parser
 
-- turso 0.8.2, MIT 
-  <br/>https://github.com/tursodatabase/turso
-
 - twox-hash 2.1.2, MIT 
   <br/>https://github.com/shepmaster/twox-hash
 

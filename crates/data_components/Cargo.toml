@@ -49,13 +49,6 @@ db_connection_pool = { path = "../db_connection_pool" }
 delta_kernel = { workspace = true, optional = true }
 delta_kernel_default_engine = { workspace = true, optional = true }
 document_parse = { path = "../document_parse" }
-duckdb = { workspace = true, features = [
-    "bundled",
-    "r2d2",
-    "vtab",
-    "vtab-arrow",
-    "appender-arrow",
-], optional = true }
 duration-parse = { path = "../duration-parse" }
 flight_client = { path = "../flight_client" }
 futures.workspace = true
@@ -87,6 +80,7 @@ rustc-hash = "2"
 oracle = { version = "0.6", optional = true }
 native-tls = { workspace = true, optional = true }
 percent-encoding.workspace = true
+pbjson-types = "0.8.0"
 prost.workspace = true
 pgwire-replication = { workspace = true, optional = true }
 postgres-native-tls = { workspace = true, optional = true }
@@ -125,8 +119,6 @@ tokio-postgres = { workspace = true, features = [
 tokio-util = { workspace = true, optional = true }
 tonic = { workspace = true }
 tracing.workspace = true
-turso = { workspace = true, optional = true }
-turso-shared = { workspace = true, optional = true }
 twox-hash.workspace = true
 url.workspace = true
 util = { path = "../util", features = ["datafusion"] }
@@ -151,13 +143,6 @@ debezium = ["dep:rdkafka", "dep:apache-avro"]
 default = []
 delta_lake = ["dep:delta_kernel", "dep:delta_kernel_default_engine"]
 elasticsearch = ["dep:elasticsearch"]
-duckdb = [
-    "adbc",
-    "dep:duckdb",
-    "db_connection_pool/duckdb",
-    "datafusion-table-providers/duckdb",
-    "datafusion-table-providers/duckdb-federation",
-]
 flightsql = []
 kafka = ["dep:rdkafka"]
 mssql = ["dep:tiberius", "dep:tokio-util", "dep:bb8"]
@@ -191,7 +176,6 @@ sqlite = [
     "datafusion-table-providers/sqlite",
     "datafusion-table-providers/sqlite-federation",
 ]
-turso = ["dep:turso", "dep:turso-shared", "datafusion-table-providers/sqlite-federation"]
 
 [dev-dependencies]
 arrow = { workspace = true, features = ["prettyprint"] }

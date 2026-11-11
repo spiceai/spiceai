@@ -58,9 +58,7 @@ use spicepod::{
 };
 
 use crate::docker::{ContainerRunnerBuilder, RunningContainer, wait_for_tcp_port};
-use crate::iceberg::metadata_file::{
-    S3_ACCESS_KEY, S3_BUCKET, S3_SECRET_KEY, create_bucket, start_object_store,
-};
+use crate::rustfs::{S3_ACCESS_KEY, S3_BUCKET, S3_SECRET_KEY, create_bucket, start_object_store};
 pub const NAMESPACE: &str = "ns";
 pub const TABLE: &str = "events";
 /// The primary key an accelerated dataset declares.
@@ -297,10 +295,9 @@ impl Lab {
             TimeKind::Timestamp => TimeFormat::Timestamp,
             TimeKind::Text => TimeFormat::ISO8601,
         });
-        // Cayenne takes a directory; DuckDB and SQLite take a `.db` file.
+        // Cayenne takes a directory; SQLite takes a `.db` file.
         let (file_param, file_name) = match accel.engine {
             "cayenne" => ("cayenne_file_path", format!("accelerator-{name}")),
-            "duckdb" => ("duckdb_file", format!("accelerator-{name}.db")),
             "sqlite" => ("sqlite_file", format!("accelerator-{name}.db")),
             other => panic!("the lab has no file parameter for engine {other}"),
         };

@@ -49,7 +49,7 @@ use futures::TryStreamExt;
 use runtime::Runtime;
 use runtime::cluster::ExecutorRegistry;
 use runtime::cluster::ResolvedClusterConfig;
-use runtime::config::{ClusterConfig, ClusterRole, Config};
+use runtime::config::{ClusterConfig, Config, Role};
 use runtime::datafusion::query::QueryBuilder;
 use runtime::{Result as RuntimeResult, auth::EndpointAuth};
 use rustls::crypto::{CryptoProvider, aws_lc_rs};
@@ -439,7 +439,7 @@ impl ClusterHarnessBuilder {
             http_bind_address: scheduler_ports.http_addr(),
             flight_bind_address: scheduler_ports.flight_addr(),
             cluster: ClusterConfig {
-                role: Some(ClusterRole::Scheduler),
+                role: Some(Role::Scheduler),
                 node_bind_address: scheduler_ports.cluster_addr(),
                 node_advertise_address: Some("127.0.0.1".to_string()),
                 ..node_tls_config(pki.as_ref(), "scheduler")?
@@ -586,7 +586,7 @@ async fn start_executor(
         http_bind_address: executor_ports.http_addr(),
         flight_bind_address: executor_ports.flight_addr(),
         cluster: ClusterConfig {
-            role: Some(ClusterRole::Executor),
+            role: Some(Role::Executor),
             node_bind_address: executor_ports.cluster_addr(),
             scheduler_address: Some(scheduler_cluster_addr.to_string()),
             node_advertise_address: Some("127.0.0.1".to_string()),

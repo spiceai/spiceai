@@ -11,7 +11,7 @@ sources:
   src: { kind: postgres }
 
 matrix:
-  engine: [cayenne, duckdb]
+  engine: [cayenne]
 
 spicepod:
   version: v1

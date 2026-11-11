@@ -28,10 +28,11 @@ use spicepod::{
     component::{dataset::Dataset, view::View},
     param::Params,
 };
-use std::sync::Arc;
+use std::sync::{Arc, LazyLock, Mutex};
 use std::{
-    collections::HashMap,
+    collections::{HashMap, hash_map::Entry},
     net::{IpAddr, Ipv4Addr, SocketAddr},
+    time::{Duration, Instant},
 };
 
 use serde_json::{Value, json};
@@ -40,13 +41,9 @@ mod anthropic;
 mod bedrock;
 mod embedding;
 mod embedding_filter_limit;
-#[cfg(feature = "duckdb")]
 mod fts_caching_restart;
-#[cfg(feature = "duckdb")]
 mod fts_restart;
 pub(crate) mod hf;
-#[cfg(feature = "duckdb")]
-mod hnsw_index;
 mod local;
 mod messages;
 mod models_http_endpoint;
@@ -152,11 +149,50 @@ mod nsql {
     }
 }
 
-pub(crate) fn create_api_bindings_config() -> Config {
+/// How long a port [`reserve_local_port`] handed out stays off-limits to later calls:
+/// long enough for the runtime it was promised to to build and bind it, short enough
+/// that a full test run cannot use up the range it picks from.
+const PORT_RESERVATION_TTL: Duration = Duration::from_mins(5);
+
+/// The ports [`reserve_local_port`] handed out in this process, and when.
+static RESERVED_PORTS: LazyLock<Mutex<HashMap<u16, Instant>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+
+/// Returns a loopback port in `50000..60000` that no call in this process returned
+/// within [`PORT_RESERVATION_TTL`] and that nothing was listening on when checked.
+///
+/// `cargo test` runs this binary's tests as threads of one process, so two runtimes
+/// started together must never be given the same port. A port stays free from when
+/// it is handed out until its runtime has finished building and binds it, so only
+/// [`RESERVED_PORTS`] keeps another test from picking it in the meantime; a reserved
+/// port is skipped without being bound, so the check never occupies it either.
+fn reserve_local_port() -> u16 {
+    const MAX_ATTEMPTS: usize = 1024;
+
+    let mut reserved = RESERVED_PORTS
+        .lock()
+        .expect("the reserved-port map is not poisoned");
+    let now = Instant::now();
+    reserved.retain(|_, reserved_at| now.duration_since(*reserved_at) < PORT_RESERVATION_TTL);
     let mut rng = rand::rng();
-    let http_port: u16 = rng.random_range(50000..60000);
-    let flight_port: u16 = http_port + 1;
-    let metrics_port: u16 = http_port + 2;
+    for _ in 0..MAX_ATTEMPTS {
+        let port: u16 = rng.random_range(50000..60000);
+        let Entry::Vacant(entry) = reserved.entry(port) else {
+            continue;
+        };
+        // Another process listening on the port would fail the runtime's bind.
+        if std::net::TcpListener::bind((Ipv4Addr::LOCALHOST, port)).is_ok() {
+            entry.insert(now);
+            return port;
+        }
+    }
+    panic!("found no free loopback port in 50000..60000 after {MAX_ATTEMPTS} attempts")
+}
+
+pub(crate) fn create_api_bindings_config() -> Config {
+    let http_port = reserve_local_port();
+    let flight_port = reserve_local_port();
+    let metrics_port = reserve_local_port();
 
     let localhost: IpAddr = IpAddr::V4(Ipv4Addr::LOCALHOST);
 
@@ -626,10 +662,9 @@ pub(crate) fn get_anthropic_model(
 ) -> spicepod::component::model::Model {
     let mut model =
         spicepod::component::model::Model::new(format!("anthropic:{}", model.into()), name);
-    model.params.insert(
-        "anthropic_api_key".to_string(),
-        "${ secrets:SPICE_ANTHROPIC_API_KEY }".into(),
-    );
+    model
+        .params
+        .extend(crate::utils::anthropic_credential_params());
     model
 }
 

@@ -49,6 +49,7 @@ use tokio::{
     sync::RwLock,
     time::{MissedTickBehavior, interval},
 };
+use tokio_util::sync::CancellationToken;
 
 use crate::catalog::SpiceToolCatalog;
 use tools::SpiceModelTool;
@@ -538,6 +539,20 @@ impl McpToolCatalog {
     }
 
     async fn create_client(cfg: &MCPConfig, tool_name: &str) -> Result<McpClient> {
+        // An attempt that ends without a client (its handshake timed out or failed, or the load
+        // was stopped) cancels `abandoned`, which ends the requests its handshake left open.
+        let abandoned = CancellationToken::new();
+        let release_on_drop = abandoned.clone().drop_guard();
+        let client = Self::connect_client(cfg, tool_name, &abandoned).await?;
+        release_on_drop.disarm();
+        Ok(client)
+    }
+
+    async fn connect_client(
+        cfg: &MCPConfig,
+        tool_name: &str,
+        abandoned: &CancellationToken,
+    ) -> Result<McpClient> {
         match cfg {
             MCPConfig::Stdio { command, args, env } => {
                 // Security constants
@@ -635,12 +650,13 @@ impl McpToolCatalog {
                     );
                 }
 
-                let http_client = BoundedHttpClient::new(tool_name).map_err(|e| {
-                    Error::CouldNotConstructTool {
-                        name: "mcp_streamable_http".to_string(),
-                        e: format!("Failed to create the HTTP client for '{url}': {e}"),
-                    }
-                })?;
+                let http_client =
+                    BoundedHttpClient::new(tool_name, abandoned.clone()).map_err(|e| {
+                        Error::CouldNotConstructTool {
+                            name: "mcp_streamable_http".to_string(),
+                            e: format!("Failed to create the HTTP client for '{url}': {e}"),
+                        }
+                    })?;
                 let mut transport_config =
                     StreamableHttpClientTransportConfig::with_uri(url.to_string())
                         .custom_headers(headers.clone())
@@ -1227,6 +1243,49 @@ impl SpiceToolCatalog for McpToolCatalog {
 mod tests {
     use super::*;
     use serde_json::{Value, json};
+
+    /// A connection attempt that is given up on closes its connection. `handshake()` gives up at
+    /// `MCP_HANDSHAKE_TIMEOUT` by dropping the attempt; this drops it the same way at 500 ms.
+    /// rmcp sends the first handshake request outside its own cancellation, so without that each
+    /// retry against a server that never answers would leave one more connection, and the task
+    /// waiting on it, open.
+    #[tokio::test]
+    async fn test_abandoned_handshake_closes_its_connection() {
+        use tokio::io::AsyncReadExt;
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind a listener");
+        let addr = listener.local_addr().expect("listener address");
+        let (closed_tx, closed_rx) = tokio::sync::oneshot::channel();
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.expect("accept the handshake");
+            // Read the request and never answer. A read of 0 bytes is the client closing.
+            let mut buf = [0_u8; 4096];
+            while socket.read(&mut buf).await.is_ok_and(|read| read > 0) {}
+            let _ = closed_tx.send(());
+        });
+        let cfg = MCPConfig::StreamableHttp {
+            url: url::Url::parse(&format!("http://{addr}/mcp")).expect("valid url"),
+            auth_token: None,
+            headers: HashMap::new(),
+        };
+
+        let attempt = tokio::time::timeout(
+            Duration::from_millis(500),
+            McpToolCatalog::create_client(&cfg, "silent"),
+        )
+        .await;
+        assert!(attempt.is_err(), "an unresponsive server must not connect");
+        drop(attempt);
+
+        let closed = tokio::time::timeout(Duration::from_secs(5), closed_rx).await;
+        server.abort();
+        assert!(
+            matches!(closed, Ok(Ok(()))),
+            "the abandoned handshake left its connection open"
+        );
+    }
 
     #[test]
     fn test_dangerous_patterns_reject_parent_traversal() {

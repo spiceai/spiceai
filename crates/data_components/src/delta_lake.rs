@@ -24,7 +24,7 @@ use chrono::TimeZone;
 use datafusion::catalog::Session;
 use datafusion::catalog::memory::DataSourceExec;
 use datafusion::common::TableReference;
-use datafusion::common::tree_node::TreeNode;
+use datafusion::common::tree_node::{Transformed, TreeNode, TreeNodeRecursion};
 use datafusion::common::{DFSchema, exec_err};
 use datafusion::config::TableParquetOptions;
 use datafusion::datasource::listing::PartitionedFile;
@@ -37,7 +37,8 @@ use datafusion::datasource::physical_plan::{
 use datafusion::datasource::{TableProvider, TableType};
 use datafusion::error::DataFusionError;
 use datafusion::execution::object_store::ObjectStoreUrl;
-use datafusion::logical_expr::utils::conjunction;
+use datafusion::logical_expr::expr::ScalarFunction;
+use datafusion::logical_expr::utils::{conjunction, split_conjunction_owned};
 use datafusion::logical_expr::{ColumnarValue, Expr, Operator, TableProviderFilterPushDown, lit};
 use datafusion::parquet::arrow::arrow_reader::RowSelection;
 use datafusion::parquet::file::metadata::RowGroupMetaData;
@@ -194,6 +195,8 @@ impl DeltaTable {
         for (key, value) in options {
             match key.as_ref() {
                 "token" | "endpoint" | "credential_vending" => {}
+                // An unset session-token secret resolves to an empty string; static keys need no token.
+                "aws_session_token" if value.expose_secret().is_empty() => {}
                 "client_timeout" => {
                     storage_options.insert("timeout".into(), value.expose_secret().to_string());
                 }
@@ -506,6 +509,7 @@ fn build_physical_schema_mapping(
 
     PhysicalSchemaMapping {
         schema: Schema::new(fields),
+        column_mapping_mode,
         physical_to_logical,
         logical_to_physical,
     }
@@ -516,33 +520,171 @@ fn build_physical_schema_mapping(
 #[derive(Debug)]
 struct PhysicalSchemaMapping {
     schema: Schema,
+    /// The mode the physical names were resolved in, for rewriting nested field names.
+    column_mapping_mode: ColumnMappingMode,
     physical_to_logical: HashMap<String, String>,
     logical_to_physical: HashMap<String, String>,
 }
 
-/// Rewrites column references in a `DataFusion` [`Expr`] from logical to physical names.
+/// Rewrites a pushed-down filter from logical to physical names so [`ParquetSource`] can match it
+/// against the physical parquet schema.
 ///
-/// This is needed so that predicates pushed down to [`ParquetExec`] reference the physical
-/// column names actually present in the parquet files.
-fn rewrite_column_names(
+/// Column mapping renames nested fields too: in `name` and `id` mode every struct child is stored
+/// under its own physical name (`col-<uuid>`), whether or not it was ever renamed. So a filter on
+/// `st['a']` reaches the scan as `get_field(st, 'a')`, and rewriting only the column to its
+/// physical name leaves a field name the physical struct does not have. This walks the access
+/// path — `get_field` over structs and maps, `array_element` over lists, nested to any depth —
+/// through the Delta schema and swaps every struct field name for its physical one.
+///
+/// An access path the walk cannot follow is left alone below its column, which is still renamed;
+/// [`physical_filter`] then drops the conjunct if it does not plan.
+fn rewrite_to_physical_names(
     expr: Expr,
-    logical_to_physical: &HashMap<String, String>,
+    delta_schema: &delta_kernel::schema::StructType,
+    column_mapping_mode: ColumnMappingMode,
 ) -> Result<Expr, DataFusionError> {
     Ok(expr
-        .transform(|e| {
-            if let Expr::Column(col) = &e
-                && let Some(physical_name) = logical_to_physical.get(col.name())
-            {
-                return Ok(datafusion::common::tree_node::Transformed::yes(
-                    Expr::Column(datafusion::common::Column::new(
-                        col.relation.clone(),
-                        physical_name,
-                    )),
-                ));
-            }
-            Ok(datafusion::common::tree_node::Transformed::no(e))
-        })?
+        .transform_down(
+            |e| match physical_access_path(&e, delta_schema, column_mapping_mode)? {
+                Some((physical, _)) => {
+                    Ok(Transformed::new(physical, true, TreeNodeRecursion::Jump))
+                }
+                None => Ok(Transformed::no(e)),
+            },
+        )?
         .data)
+}
+
+/// Resolves `expr` as an access path into the table (a column, or `get_field` / `array_element`
+/// over one) and returns it rewritten to physical names along with the Delta type it yields.
+/// Returns `None` when `expr` is not such a path or names something the schema does not have.
+fn physical_access_path<'a>(
+    expr: &Expr,
+    delta_schema: &'a delta_kernel::schema::StructType,
+    column_mapping_mode: ColumnMappingMode,
+) -> Result<Option<(Expr, &'a delta_kernel::schema::DataType)>, DataFusionError> {
+    use delta_kernel::schema::DataType as DeltaType;
+
+    match expr {
+        Expr::Column(col) => Ok(delta_schema.field(col.name()).map(|field| {
+            (
+                Expr::Column(datafusion::common::Column::new(
+                    col.relation.clone(),
+                    field.physical_name(column_mapping_mode),
+                )),
+                field.data_type(),
+            )
+        })),
+        Expr::ScalarFunction(function)
+            if function.name() == "get_field" && function.args.len() >= 2 =>
+        {
+            let Some((base, mut data_type)) =
+                physical_access_path(&function.args[0], delta_schema, column_mapping_mode)?
+            else {
+                return Ok(None);
+            };
+            let mut args = Vec::with_capacity(function.args.len());
+            args.push(base);
+            for arg in &function.args[1..] {
+                match data_type {
+                    DeltaType::Struct(struct_type) => {
+                        let Some((name, rename)) = string_literal(arg) else {
+                            return Ok(None);
+                        };
+                        let Some(field) = struct_type.field(name) else {
+                            return Ok(None);
+                        };
+                        args.push(rename(field.physical_name(column_mapping_mode)));
+                        data_type = field.data_type();
+                    }
+                    DeltaType::Map(map_type) => {
+                        // A map is indexed by key value, not by field name: keep the key as is.
+                        args.push(rewrite_to_physical_names(
+                            arg.clone(),
+                            delta_schema,
+                            column_mapping_mode,
+                        )?);
+                        data_type = map_type.value_type();
+                    }
+                    _ => return Ok(None),
+                }
+            }
+            Ok(Some((
+                Expr::ScalarFunction(ScalarFunction::new_udf(Arc::clone(&function.func), args)),
+                data_type,
+            )))
+        }
+        Expr::ScalarFunction(function)
+            if function.name() == "array_element" && function.args.len() == 2 =>
+        {
+            let Some((base, DeltaType::Array(array_type))) =
+                physical_access_path(&function.args[0], delta_schema, column_mapping_mode)?
+            else {
+                return Ok(None);
+            };
+            let index = rewrite_to_physical_names(
+                function.args[1].clone(),
+                delta_schema,
+                column_mapping_mode,
+            )?;
+            Ok(Some((
+                Expr::ScalarFunction(ScalarFunction::new_udf(
+                    Arc::clone(&function.func),
+                    vec![base, index],
+                )),
+                array_type.element_type(),
+            )))
+        }
+        _ => Ok(None),
+    }
+}
+
+/// A field-name literal and a way to build the same kind of literal for another name, so a
+/// `Utf8View` field name stays a `Utf8View` after the rewrite.
+fn string_literal(expr: &Expr) -> Option<(&str, impl Fn(&str) -> Expr + '_)> {
+    let Expr::Literal(value, metadata) = expr else {
+        return None;
+    };
+    let name = match value {
+        ScalarValue::Utf8(Some(name))
+        | ScalarValue::Utf8View(Some(name))
+        | ScalarValue::LargeUtf8(Some(name)) => name.as_str(),
+        _ => return None,
+    };
+    let rename = move |physical: &str| {
+        let physical = Some(physical.to_string());
+        let value = match value {
+            ScalarValue::Utf8View(_) => ScalarValue::Utf8View(physical),
+            ScalarValue::LargeUtf8(_) => ScalarValue::LargeUtf8(physical),
+            _ => ScalarValue::Utf8(physical),
+        };
+        Expr::Literal(value, metadata.clone())
+    };
+    Some((name, rename))
+}
+
+/// Plans the pushed-down filters against `schema`, one conjunct at a time.
+///
+/// Every filter is pushed down [`TableProviderFilterPushDown::Inexact`], so `DataFusion` applies
+/// it again above the scan and the scan's copy only prunes. A conjunct that does not plan against
+/// the scan's schema is therefore dropped from the pushdown rather than failing the query.
+fn physical_filter(
+    state: &dyn Session,
+    filters: Vec<Expr>,
+    schema: &DFSchema,
+    to_physical: impl Fn(Expr) -> Result<Expr, DataFusionError>,
+) -> Result<Arc<dyn PhysicalExpr>, DataFusionError> {
+    let mut planned = Vec::with_capacity(filters.len());
+    for filter in filters.into_iter().flat_map(split_conjunction_owned) {
+        let rewritten = to_physical(filter.clone())?;
+        match state.create_physical_expr(rewritten.clone(), schema) {
+            Ok(_) => planned.push(rewritten),
+            Err(e) => tracing::debug!(
+                "Not pushing filter `{filter}` into the Delta Lake parquet scan; it re-applies above the scan: {e}"
+            ),
+        }
+    }
+    state.create_physical_expr(conjunction(planned).unwrap_or_else(|| lit(true)), schema)
 }
 
 /// How much of one refusal's rendered text is kept before it is truncated. Long enough to carry
@@ -1210,8 +1352,6 @@ impl TableProvider for DeltaTable {
             filtered_partitioned_files.len(),
         );
 
-        let filter = conjunction(filters).unwrap_or_else(|| lit(true));
-
         let non_partition_indices = self
             .arrow_schema
             .fields
@@ -1221,11 +1361,12 @@ impl TableProvider for DeltaTable {
             .collect::<Vec<_>>();
 
         if let Some(mapping) = &self.physical_schema_mapping {
-            // Rewrite filter column references from logical to physical names
-            // so ParquetExec can match them against the physical parquet schema.
-            let physical_filter = rewrite_column_names(filter, &mapping.logical_to_physical)?;
+            // Rewrite filter references, nested field names included, from logical to physical
+            // names so ParquetSource can match them against the physical parquet schema.
             let physical_df_schema = DFSchema::try_from(Arc::new(mapping.schema.clone()))?;
-            let physical_expr = state.create_physical_expr(physical_filter, &physical_df_schema)?;
+            let physical_expr = physical_filter(state, filters, &physical_df_schema, |filter| {
+                rewrite_to_physical_names(filter, &self.delta_schema, mapping.column_mapping_mode)
+            })?;
 
             let physical_non_partition_schema =
                 Arc::new(mapping.schema.project(&non_partition_indices)?);
@@ -1245,7 +1386,7 @@ impl TableProvider for DeltaTable {
 
             build_column_mapping_projection(exec, mapping, &self.arrow_schema, &self.table_url)
         } else {
-            let physical_expr = state.create_physical_expr(filter, &df_schema)?;
+            let physical_expr = physical_filter(state, filters, &df_schema, Ok)?;
             let schema = self.arrow_schema.project(&non_partition_indices)?;
 
             Ok(self
@@ -2805,5 +2946,244 @@ mod tests {
             ensure_folder_location("s3://my_bucket/data/table".to_string()),
             "s3://my_bucket/data/table/"
         );
+    }
+}
+
+#[cfg(test)]
+mod column_mapping_filter_tests {
+    //! Pushed-down filters on column-mapped tables must name nested fields by their physical
+    //! names, which every struct child has in `name` and `id` mode whether or not it was renamed.
+    use super::*;
+    use datafusion::execution::context::SessionContext;
+    use datafusion::functions::core::get_field as get_field_udf;
+    use datafusion::functions_nested::extract::array_element_udf;
+    use datafusion::logical_expr::col;
+    use delta_kernel::schema::{
+        ArrayType, ColumnMetadataKey, DataType as DeltaType, MapType, MetadataValue, StructField,
+        StructType,
+    };
+
+    fn mapped(name: &str, physical: &str, id: i64, data_type: impl Into<DeltaType>) -> StructField {
+        StructField::new(name, data_type, true).with_metadata([
+            (
+                ColumnMetadataKey::ColumnMappingPhysicalName.as_ref(),
+                MetadataValue::String(physical.to_string()),
+            ),
+            (
+                ColumnMetadataKey::ColumnMappingId.as_ref(),
+                MetadataValue::Number(id),
+            ),
+        ])
+    }
+
+    fn struct_of(fields: Vec<StructField>) -> StructType {
+        StructType::try_new(fields).expect("a valid test struct")
+    }
+
+    /// `id INT`, `st STRUCT<a INT, label STRING>` where `label` was renamed from `b`,
+    /// `outer STRUCT<inner STRUCT<x INT>>`, `l ARRAY<STRUCT<a INT>>`, and
+    /// `m MAP<STRING, STRUCT<a INT>>`. Every field carries a physical name, as Spark writes them.
+    fn table_schema() -> StructType {
+        let st = struct_of(vec![
+            mapped("a", "col-st-a", 3, DeltaType::INTEGER),
+            mapped("label", "col-st-b", 4, DeltaType::STRING),
+        ]);
+        let inner = struct_of(vec![mapped("x", "col-x", 7, DeltaType::INTEGER)]);
+        let outer = struct_of(vec![mapped("inner", "col-inner", 6, inner)]);
+        let element = struct_of(vec![mapped("a", "col-l-a", 9, DeltaType::INTEGER)]);
+        let value = struct_of(vec![mapped("a", "col-m-a", 11, DeltaType::INTEGER)]);
+        struct_of(vec![
+            mapped("id", "col-id", 1, DeltaType::INTEGER),
+            mapped("st", "col-st", 2, st),
+            mapped("outer", "col-outer", 5, outer),
+            mapped("l", "col-l", 8, ArrayType::new(element, true)),
+            mapped(
+                "m",
+                "col-m",
+                10,
+                MapType::new(DeltaType::STRING, value, true),
+            ),
+        ])
+    }
+
+    fn get_field(args: Vec<Expr>) -> Expr {
+        Expr::ScalarFunction(ScalarFunction::new_udf(get_field_udf(), args))
+    }
+
+    fn array_element(list: Expr, index: Expr) -> Expr {
+        Expr::ScalarFunction(ScalarFunction::new_udf(
+            array_element_udf(),
+            vec![list, index],
+        ))
+    }
+
+    const MODES: [ColumnMappingMode; 2] = [ColumnMappingMode::Name, ColumnMappingMode::Id];
+
+    fn rewrite(expr: Expr, mode: ColumnMappingMode) -> Expr {
+        rewrite_to_physical_names(expr, &table_schema(), mode).expect("rewrite should succeed")
+    }
+
+    /// Plans `expr` against the physical parquet schema, as the scan does.
+    fn plans_physically(expr: Expr, mode: ColumnMappingMode) -> Result<(), DataFusionError> {
+        let mapping = build_physical_schema_mapping(&table_schema(), mode);
+        let schema = DFSchema::try_from(Arc::new(mapping.schema))?;
+        SessionContext::new()
+            .state()
+            .create_physical_expr(expr, &schema)
+            .map(|_| ())
+    }
+
+    #[test]
+    fn an_unrenamed_struct_field_is_rewritten_to_its_physical_name() {
+        for mode in MODES {
+            let filter = get_field(vec![col("st"), lit("a")]).eq(lit(1));
+            let physical = rewrite(filter, mode);
+            assert_eq!(
+                physical,
+                get_field(vec![col("col-st"), lit("col-st-a")]).eq(lit(1)),
+                "{mode:?}"
+            );
+            plans_physically(physical, mode).expect("the rewritten filter should plan");
+        }
+    }
+
+    #[test]
+    fn a_renamed_struct_field_is_rewritten_to_its_physical_name() {
+        for mode in MODES {
+            let filter = get_field(vec![col("st"), lit("label")]).eq(lit("y"));
+            let physical = rewrite(filter, mode);
+            assert_eq!(
+                physical,
+                get_field(vec![col("col-st"), lit("col-st-b")]).eq(lit("y")),
+                "{mode:?}"
+            );
+            plans_physically(physical, mode).expect("the rewritten filter should plan");
+        }
+    }
+
+    #[test]
+    fn the_logical_filter_does_not_plan_against_the_physical_schema() {
+        // The bug: renaming only the column leaves `'a'`, which the physical struct lacks.
+        for mode in MODES {
+            let half_rewritten = get_field(vec![col("col-st"), lit("a")]).eq(lit(1));
+            let err = plans_physically(half_rewritten, mode).expect_err("should not plan");
+            assert!(
+                err.to_string().contains("Field a not found in struct"),
+                "{err}"
+            );
+        }
+    }
+
+    #[test]
+    fn nested_struct_fields_are_rewritten_at_every_level() {
+        for mode in MODES {
+            // `outer['inner']['x']` as nested calls and as one multi-step path.
+            let nested = get_field(vec![get_field(vec![col("outer"), lit("inner")]), lit("x")]);
+            let path = get_field(vec![col("outer"), lit("inner"), lit("x")]);
+            assert_eq!(
+                rewrite(nested.clone().gt(lit(1)), mode),
+                get_field(vec![
+                    get_field(vec![col("col-outer"), lit("col-inner")]),
+                    lit("col-x")
+                ])
+                .gt(lit(1)),
+            );
+            assert_eq!(
+                rewrite(path.clone(), mode),
+                get_field(vec![col("col-outer"), lit("col-inner"), lit("col-x")]),
+            );
+            plans_physically(rewrite(nested.gt(lit(1)), mode), mode).expect("nested should plan");
+            plans_physically(rewrite(path.gt(lit(1)), mode), mode).expect("path should plan");
+        }
+    }
+
+    #[test]
+    fn a_struct_inside_a_list_is_rewritten_and_the_index_is_kept() {
+        for mode in MODES {
+            let filter = get_field(vec![array_element(col("l"), lit(1_i64)), lit("a")]).eq(lit(1));
+            let physical = rewrite(filter, mode);
+            assert_eq!(
+                physical,
+                get_field(vec![
+                    array_element(col("col-l"), lit(1_i64)),
+                    lit("col-l-a")
+                ])
+                .eq(lit(1)),
+            );
+            plans_physically(physical, mode).expect("the list filter should plan");
+        }
+    }
+
+    #[test]
+    fn a_struct_inside_a_map_value_is_rewritten_and_the_key_is_kept() {
+        for mode in MODES {
+            let filter = get_field(vec![col("m"), lit("a"), lit("a")]).eq(lit(1));
+            let physical = rewrite(filter, mode);
+            assert_eq!(
+                physical,
+                get_field(vec![col("col-m"), lit("a"), lit("col-m-a")]).eq(lit(1)),
+                "the map key `a` is a value, not a field name"
+            );
+            plans_physically(physical, mode).expect("the map filter should plan");
+        }
+    }
+
+    #[test]
+    fn a_utf8_view_field_name_stays_a_utf8_view() {
+        let name = Expr::Literal(ScalarValue::Utf8View(Some("a".to_string())), None);
+        let physical = rewrite(get_field(vec![col("st"), name]), ColumnMappingMode::Name);
+        assert_eq!(
+            physical,
+            get_field(vec![
+                col("col-st"),
+                Expr::Literal(ScalarValue::Utf8View(Some("col-st-a".to_string())), None)
+            ]),
+        );
+    }
+
+    #[test]
+    fn an_unknown_field_keeps_its_name_and_only_the_column_is_rewritten() {
+        let filter = get_field(vec![col("st"), lit("missing")]).eq(lit(1));
+        assert_eq!(
+            rewrite(filter, ColumnMappingMode::Name),
+            get_field(vec![col("col-st"), lit("missing")]).eq(lit(1)),
+        );
+    }
+
+    #[test]
+    fn a_conjunct_that_does_not_plan_is_dropped_and_the_rest_is_kept() {
+        let mode = ColumnMappingMode::Name;
+        let mapping = build_physical_schema_mapping(&table_schema(), mode);
+        let schema = DFSchema::try_from(Arc::new(mapping.schema)).expect("schema");
+        let state = SessionContext::new().state();
+        let filters = vec![
+            get_field(vec![col("st"), lit("missing")])
+                .eq(lit(1))
+                .and(col("id").eq(lit(2))),
+        ];
+
+        let planned = physical_filter(&state, filters, &schema, |filter| {
+            rewrite_to_physical_names(filter, &table_schema(), mode)
+        })
+        .expect("an unplannable conjunct must not fail the scan");
+
+        let rendered = planned.to_string();
+        assert!(rendered.contains("col-id"), "{rendered}");
+        assert!(!rendered.contains("missing"), "{rendered}");
+    }
+
+    #[test]
+    fn no_plannable_conjunct_leaves_a_true_predicate() {
+        let mode = ColumnMappingMode::Id;
+        let mapping = build_physical_schema_mapping(&table_schema(), mode);
+        let schema = DFSchema::try_from(Arc::new(mapping.schema)).expect("schema");
+        let state = SessionContext::new().state();
+        let filters = vec![get_field(vec![col("st"), lit("missing")]).eq(lit(1))];
+
+        let planned = physical_filter(&state, filters, &schema, |filter| {
+            rewrite_to_physical_names(filter, &table_schema(), mode)
+        })
+        .expect("an unplannable filter must not fail the scan");
+        assert_eq!(planned.to_string(), "true");
     }
 }

@@ -22,8 +22,6 @@ limitations under the License.
 //! hand-rolled `ParameterSpec` lists and per-key string parsing with typed
 //! fields, real enums for `one_of` values, and typo-suggestion warnings.
 
-#[cfg(feature = "duckdb")]
-pub mod duckdb;
 #[cfg(feature = "elasticsearch")]
 pub mod elasticsearch;
 #[cfg(feature = "s3_vectors")]

@@ -19,7 +19,9 @@ use evaluate_chat::ChatEvaluator;
 use llms::bedrock::chat::{BedrockConverse, guardrail::GuardRail};
 #[cfg(feature = "models")]
 use llms::chat::DistributedBackendSetting;
+
 use llms::evaluate::Evaluate;
+use llms::workload_identity;
 use llms::{
     HealthCheck,
     anthropic::Anthropic,
@@ -55,7 +57,10 @@ use super::params::xai::XaiModelParams;
 use super::wrapper::OPENAI_DEFAULT_PARAM_KEYS;
 use super::wrapper::defaults::{RequestDefaults, ToolOffer};
 use super::{tool_use::ToolUsingChat, wrapper::ChatWrapper};
-use crate::token_providers::databricks::{DatabricksM2MTokenProvider, DatabricksU2MTokenProvider};
+use crate::token_providers::databricks::{
+    DatabricksM2MTokenProvider, DatabricksU2MTokenProvider, get_workload_identity_token_provider,
+    model_error,
+};
 use crate::{
     Runtime,
     tools::{
@@ -269,7 +274,7 @@ pub async fn construct_model(
             let p =
                 typed_params::<AnthropicModelParams>(component, params, source.clone(), secrets)
                     .await?;
-            anthropic(model_id.as_deref(), &p)
+            anthropic(&component.name, model_id.as_deref(), params, &p).await
         }
         ModelSource::Google => {
             let p = typed_params::<GoogleModelParams>(component, params, source.clone(), secrets)
@@ -279,7 +284,7 @@ pub async fn construct_model(
         ModelSource::Azure => {
             let p = typed_params::<AzureModelParams>(component, params, source.clone(), secrets)
                 .await?;
-            azure(model_id, component.name.as_str(), &p)
+            azure(model_id, component.name.as_str(), &p).await
         }
         ModelSource::Xai => {
             let p =
@@ -289,19 +294,31 @@ pub async fn construct_model(
         ModelSource::OpenAi => {
             let p = typed_params::<OpenAiModelParams>(component, params, source.clone(), secrets)
                 .await?;
-            openai(model_id, params, &p)
+            openai(&component.name, model_id, params, &p).await
         }
         ModelSource::Databricks => {
             let p =
                 typed_params::<DatabricksModelParams>(component, params, source.clone(), secrets)
                     .await?;
-            databricks(model_id, &p, Arc::clone(&token_registry)).await
+            let key_in_spicepod = workload_identity::key_in_spicepod(
+                params,
+                &["databricks_token", "databricks_client_secret"],
+            );
+            databricks(
+                &component.name,
+                model_id,
+                params,
+                &p,
+                key_in_spicepod,
+                Arc::clone(&token_registry),
+            )
+            .await
         }
         #[cfg(feature = "bedrock")]
         ModelSource::Bedrock => {
             let p = typed_params::<BedrockModelParams>(component, params, source.clone(), secrets)
                 .await?;
-            bedrock(model_id, &p).await
+            bedrock(&component.name, model_id, &p).await
         }
         #[cfg(not(feature = "bedrock"))]
         ModelSource::Bedrock => Err(LlmError::UnknownModelSource {
@@ -337,6 +354,7 @@ pub async fn construct_model(
 
 #[cfg(feature = "bedrock")]
 async fn bedrock(
+    model_name: &str,
     model_id: Option<String>,
     params: &BedrockModelParams,
 ) -> Result<Arc<dyn Chat>, LlmError> {
@@ -346,9 +364,13 @@ async fn bedrock(
         });
     };
 
-    let client = super::util::create_bedrock_client(&params.runtime_params(), "bedrock-chat")
-        .await
-        .map_err(|e| LlmError::FailedToLoadModel { source: e })?;
+    let client = super::util::create_bedrock_client(
+        &format!("model '{model_name}' (bedrock)"),
+        &params.runtime_params(),
+        "bedrock-chat",
+    )
+    .await
+    .map_err(super::util::bedrock_client_error)?;
 
     let id = params.guardrail_identifier.as_deref();
     let version = params.guardrail_version.as_deref();
@@ -375,30 +397,65 @@ fn xai(model_id: Option<&str>, params: &XaiModelParams) -> Result<Arc<dyn Chat>,
     Ok(Arc::new(Xai::new(model_id, api_key)) as Arc<dyn Chat>)
 }
 
-fn anthropic(
+async fn anthropic(
+    model_name: &str,
     model_id: Option<&str>,
+    raw_params: &HashMap<String, SecretString>,
     params: &AnthropicModelParams,
 ) -> Result<Arc<dyn Chat>, LlmError> {
-    Ok(Arc::new(anthropic_client(model_id, params)?) as Arc<dyn Chat>)
+    Ok(
+        Arc::new(anthropic_client(model_name, model_id, raw_params, params).await?)
+            as Arc<dyn Chat>,
+    )
 }
 
 /// The Anthropic client of a `from: anthropic` model, which serves both its chat completions
 /// and, natively, the Messages API.
-pub(crate) fn anthropic_client(
+pub(crate) async fn anthropic_client(
+    model_name: &str,
     model_id: Option<&str>,
+    raw_params: &HashMap<String, SecretString>,
     params: &AnthropicModelParams,
 ) -> Result<Anthropic, LlmError> {
     let api_base = params.endpoint.as_deref();
     let api_key = params.api_key.as_ref().map(ExposeSecret::expose_secret);
     let auth_token = params.auth_token.as_ref().map(ExposeSecret::expose_secret);
 
-    let auth = match (api_key, auth_token) {
-        (Some(s), None) => GenericAuthMechanism::from_api_key(s),
-        (None, Some(s)) => GenericAuthMechanism::from_bearer_token(s),
-        (None, None) => return Err(LlmError::FailedToLoadModel {
-            source: "One of following `model.params` is required: `anthropic_api_key` or `anthropic_auth_token`.".into(),
+    let key_param = match (api_key, auth_token) {
+        (Some(_), _) => Some("anthropic_api_key"),
+        (None, Some(_)) => Some("anthropic_auth_token"),
+        (None, None) => None,
+    };
+    // `ANTHROPIC_WORKSPACE_ID`, as the Anthropic SDKs read it, names the workspace of a federation
+    // rule enabled for more than one; it never applies to an API key.
+    let workspace_from_env = std::env::var("ANTHROPIC_WORKSPACE_ID")
+        .ok()
+        .filter(|workspace| !workspace.trim().is_empty());
+    let federated = workload_identity::anthropic_token_provider(
+        &format!("model '{model_name}' (anthropic)"),
+        &params.federation(
+            raw_params,
+            key_param.is_some(),
+            workspace_from_env.as_deref(),
+        ),
+        key_param,
+    )
+    .await
+    .map_err(workload_identity::FederationError::into_llm_error)?;
+
+    let auth = match (federated, api_key, auth_token) {
+        (Some(token), _, _) => GenericAuthMechanism::from_bearer_token_provider(token),
+        (None, Some(s), None) => GenericAuthMechanism::from_api_key(s),
+        (None, None, Some(s)) => GenericAuthMechanism::from_bearer_token(s),
+        // Not `FailedToLoadModel`, which presents the cause as a bug to report: this is a
+        // credential the configuration does not give.
+        (None, None, None) => return Err(LlmError::FailedToAuthenticate {
+            source: workload_identity::anthropic_no_credential_message(&format!(
+                "model '{model_name}' (anthropic)"
+            ))
+            .into(),
         }),
-        (Some(_), Some(_)) => return Err(LlmError::FailedToLoadModel {
+        (None, Some(_), Some(_)) => return Err(LlmError::FailedToLoadModel {
             source: "Only one of following `model.params` is allowed: `anthropic_api_key` or `anthropic_auth_token`.".into(),
         }),
     };
@@ -583,8 +640,11 @@ fn parse_distributed_config(
 }
 
 async fn databricks(
+    model_name: &str,
     model_id: Option<String>,
+    raw_params: &HashMap<String, SecretString>,
     params: &DatabricksModelParams,
+    key_in_spicepod: Option<&str>,
     token_provider_registry: Arc<TokenProviderRegistry>,
 ) -> Result<Arc<dyn Chat>, LlmError> {
     // Required parameters
@@ -601,7 +661,11 @@ async fn databricks(
 
     // Optional parameters.
     let token_opt = params.token.as_ref().map(ExposeSecret::expose_secret);
-    let client_id = params.client_id.as_deref();
+    let client_id = crate::token_providers::databricks::component_client_id(
+        raw_params,
+        params.client_id.as_ref(),
+        params.client_secret.as_ref(),
+    );
     let client_secret = params
         .client_secret
         .as_ref()
@@ -612,17 +676,53 @@ async fn databricks(
     #[cfg(not(feature = "databricks"))]
     let user_agent: Option<&'static str> = None;
 
+    if let Some(identity) = params
+        .federation(
+            raw_params,
+            crate::token_providers::databricks::in_github_actions(),
+        )
+        .workload_identity(
+            key_in_spicepod,
+            params.token.is_some() || params.client_secret.is_some(),
+        )
+        .map_err(model_error)?
+    {
+        let token_provider = get_workload_identity_token_provider(
+            &format!("model '{model_name}' (databricks)"),
+            endpoint,
+            identity,
+            &token_provider_registry,
+        )
+        .await
+        .map_err(model_error)?;
+        return Ok(Arc::new(llms::databricks::from_token_provider(
+            endpoint,
+            model_id.as_str(),
+            token_provider,
+            user_agent,
+            HealthCheck::Required,
+        )) as Arc<dyn Chat>);
+    }
+
     match (token_opt, client_id, client_secret) {
         (Some(_), Some(_) | None, Some(_)) => {
             Err(LlmError::FailedToLoadModel {
                 source: "Either `databricks_token` or `databricks_client_id` and `databricks_client_secret` should be provided, not both.".into(),
             })
         }
-        (Some(_), Some(_), None) | (None, None, None) => {
+        (Some(_), Some(_), None) => {
             Err(LlmError::FailedToLoadModel {
                 source: "Either `databricks_token` or `databricks_client_id` and `databricks_client_secret` should be provided.".into(),
             })
         }
+        // Not `FailedToLoadModel`, which presents the cause as a bug to report.
+        (None, None, None) => Err(LlmError::FailedToAuthenticate {
+            source: format!(
+                "Found no credential for model '{model_name}' (databricks). {}. See: https://spiceai.org/docs/components/models/databricks",
+                crate::token_providers::databricks::NO_CREDENTIAL_MESSAGE
+            )
+            .into(),
+        }),
         (None, None, Some(_client_secret)) => {
             Err(LlmError::FailedToLoadModel {
                 source: "If `databricks_client_secret` is provided, `databricks_client_id` must also be provided.".into(),
@@ -721,7 +821,8 @@ fn spiceai(
     )) as Arc<dyn Chat>)
 }
 
-fn openai(
+async fn openai(
+    model_name: &str,
     model_id: Option<String>,
     raw_params: &HashMap<String, SecretString>,
     params: &OpenAiModelParams,
@@ -735,8 +836,30 @@ fn openai(
 
     validate_temperature(raw_params, "openai")?;
 
+    let model = model_id.unwrap_or(DEFAULT_LLM_MODEL.to_string());
+    let label = format!("model '{model_name}' (openai)");
+    if let Some(client) = workload_identity::openai_federated_client(
+        &label,
+        &model,
+        &params.federation(),
+        workload_identity::openai_api_key_in_spicepod(raw_params),
+        chat_backend,
+    )
+    .await
+    .map_err(workload_identity::FederationError::into_llm_error)?
+    {
+        return Ok(Arc::new(client) as Arc<dyn Chat>);
+    }
+    if let Some(message) =
+        workload_identity::openai_missing_credential(&label, api_key, params.endpoint.as_str())
+    {
+        return Err(LlmError::FailedToAuthenticate {
+            source: message.into(),
+        });
+    }
+
     Ok(Arc::new(llms::openai::new_openai_client_with_chat_backend(
-        model_id.unwrap_or(DEFAULT_LLM_MODEL.to_string()),
+        model,
         api_base,
         api_key,
         org_id,
@@ -771,24 +894,29 @@ fn validate_temperature(
     Ok(())
 }
 
-fn azure(
+/// An Azure model's client, for chat or responses: the one workload identity federation builds
+/// when the model is configured for it, or else the one its `azure_api_key` or
+/// `azure_entra_token` builds. `component_name` is the model's name in the Spicepod.
+pub(crate) enum AzureClient {
+    Federated(llms::openai::Openai<llms::openai::AzureTokenConfig>),
+    Key(llms::openai::Openai<llms::openai::AzureConfig>),
+}
+
+pub(crate) async fn azure_client(
     model_id: Option<String>,
-    model_name: &str,
+    component_name: &str,
     params: &AzureModelParams,
-) -> Result<Arc<dyn Chat>, LlmError> {
+) -> Result<AzureClient, LlmError> {
     let Some(model_name) = model_id else {
         return Err(LlmError::FailedToLoadModel {
             source: format!(
-    "Azure model '{model_name}' requires a model ID in the format `from:azure:<model_id>`. See https://spiceai.org/docs/components/models/azure for details."
+    "Azure model '{component_name}' requires a model ID in the format `from:azure:<model_id>`. See https://spiceai.org/docs/components/models/azure for details."
 ).into(),
         });
     };
     let api_base = params.endpoint.as_deref();
-    let api_version = params.api_version.as_deref();
-    let deployment_name = params.deployment_name.as_deref();
     let api_key = params.api_key.as_ref().map(ExposeSecret::expose_secret);
     let entra_token = params.entra_token.as_ref().map(ExposeSecret::expose_secret);
-    let chat_backend = params.responses_api;
 
     if api_base.is_none() {
         return Err(LlmError::FailedToLoadModel {
@@ -807,24 +935,46 @@ fn azure(
         });
     }
 
-    if api_key.is_none() && entra_token.is_none() {
-        return Err(LlmError::FailedToLoadModel {
-            source: format!(
-                "Azure model '{model_name}' requires either 'azure_api_key' or 'azure_entra_token'. See https://spiceai.org/docs/components/models/azure for details."
-            )
-            .into(),
-        });
+    let key_param = params.key_param();
+    if let Some(client) = workload_identity::azure_federated_client(
+        &format!("model '{component_name}' (azure)"),
+        &model_name,
+        &params.federation(),
+        key_param,
+        key_param.is_some(),
+        &workload_identity::AzureEnvironment::from_process(),
+        params.responses_api,
+    )
+    .await
+    .map_err(workload_identity::FederationError::into_llm_error)?
+    {
+        return Ok(AzureClient::Federated(client));
     }
 
-    Ok(Arc::new(llms::openai::new_azure_client_with_chat_backend(
-        model_name,
-        api_base,
-        api_version,
-        deployment_name,
-        entra_token,
-        api_key,
-        chat_backend,
-    )) as Arc<dyn Chat>)
+    Ok(AzureClient::Key(
+        llms::openai::new_azure_client_with_chat_backend(
+            model_name,
+            api_base,
+            params.api_version.as_deref(),
+            params.deployment_name.as_deref(),
+            entra_token,
+            api_key,
+            params.responses_api,
+        ),
+    ))
+}
+
+async fn azure(
+    model_id: Option<String>,
+    component_name: &str,
+    params: &AzureModelParams,
+) -> Result<Arc<dyn Chat>, LlmError> {
+    Ok(
+        match azure_client(model_id, component_name, params).await? {
+            AzureClient::Federated(client) => Arc::new(client) as Arc<dyn Chat>,
+            AzureClient::Key(client) => Arc::new(client) as Arc<dyn Chat>,
+        },
+    )
 }
 
 #[cfg(feature = "models")]

@@ -332,6 +332,45 @@ pub enum Error {
     #[snafu(display("Unable to create view: {reason}"))]
     UnableToCreateView { reason: String },
 
+    /// A dataset selects the `duckdb` vector engine, removed in v2.5. Only that dataset
+    /// fails to load.
+    #[snafu(display(
+        "Failed to load dataset '{}': {}",
+        dataset.escape_debug(),
+        runtime_component::vector_engine::removed_vector_engine_message()
+    ))]
+    DatasetVectorEngineRemoved { dataset: String },
+
+    /// A view selects the `duckdb` vector engine, removed in v2.5. Only that view fails
+    /// to load.
+    #[snafu(display(
+        "Failed to load view '{}': {}",
+        view_name.escape_debug(),
+        runtime_component::vector_engine::removed_vector_engine_message()
+    ))]
+    ViewVectorEngineRemoved { view_name: String },
+
+    /// A dataset's acceleration sets an engine removed in v2.5. Only that dataset fails to
+    /// load: Spice never switches it to Cayenne on its own.
+    #[snafu(display(
+        "Failed to load dataset '{dataset}': {}",
+        runtime_acceleration::removed_engine_message(engine)
+    ))]
+    AcceleratedDatasetEngineRemoved {
+        dataset: String,
+        engine: &'static str,
+    },
+
+    /// A view's acceleration sets an engine removed in v2.5.
+    #[snafu(display(
+        "Failed to load view '{view_name}': {}",
+        runtime_acceleration::removed_engine_message(engine)
+    ))]
+    AcceleratedViewEngineRemoved {
+        view_name: String,
+        engine: &'static str,
+    },
+
     #[snafu(display(
         "Specify the SQL string for view {name} using either `sql: SELECT * FROM...` inline or as a file reference with `sql_ref: my_view.sql`"
     ))]
@@ -620,6 +659,14 @@ pub enum Error {
     ))]
     FullTextSearchRequiresAcceleration { dataset_name: String },
 
+    #[snafu(display(
+        "Dataset '{dataset_name}' sets `{setting}`, which keeps its data on object storage, but a sidecar serves data only from memory and local disk; the cluster it reads from serves object-storage tiers. Remove `{setting}` from the sidecar's Spicepod, or start Spice without `--role sidecar`."
+    ))]
+    SidecarColdTier {
+        dataset_name: String,
+        setting: &'static str,
+    },
+
     #[snafu(display("{reason}"))]
     StateLocationRefused { reason: String },
 
@@ -688,8 +735,6 @@ impl Default for InitialLoad {
 #[derive(Clone)]
 #[expect(clippy::struct_field_names)]
 pub struct Runtime {
-    /// Fixed at startup, including across app reloads and connector recreation.
-    mode: spicepod::component::runtime::RuntimeMode,
     app: Arc<RwLock<Option<Arc<App>>>>,
     /// Serializes [`Runtime::apply_app`] so that concurrent callers cannot
     /// interleave their diff-and-swap. `apply_app` computes diffs under a read
@@ -761,7 +806,14 @@ pub struct Runtime {
     dataset_loads: Arc<init::dataset_loads::DatasetLoads>,
     /// The model loads in progress, so a Spicepod change can stop the load of a
     /// configuration it replaces or removes.
-    model_loads: Arc<init::model::ModelLoads>,
+    model_loads: Arc<init::model::LoadTasks>,
+    /// The Spicepod tool loads in progress, so a Spicepod change can stop the load of a
+    /// configuration it replaces or removes.
+    tool_loads: Arc<init::model::LoadTasks>,
+    /// Names of the SQL functions registered for `as_sql` tools.
+    tool_udfs: Arc<parking_lot::Mutex<HashSet<String>>>,
+    /// The installed app's `row_id` keys, read by `/v1/search` and `vector_search`.
+    search_primary_keys: runtime_search::search_engine::ExplicitPrimaryKeys,
     /// Startup view registrations still waiting, cancelled when a Spicepod change replaces or removes the view.
     view_loads: Arc<init::view_loads::ViewLoads>,
 
@@ -800,6 +852,12 @@ impl Runtime {
     #[must_use]
     pub fn datafusion(&self) -> Arc<DataFusion> {
         Arc::clone(&self.df)
+    }
+
+    /// The `--role` this runtime started with. A Spicepod reload cannot change it.
+    #[must_use]
+    pub fn role(&self) -> config::Role {
+        self.df.role()
     }
 
     #[must_use]

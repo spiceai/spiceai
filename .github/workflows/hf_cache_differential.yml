@@ -24,6 +24,7 @@ concurrency:
 
 jobs:
   differential:
+    environment: ci
     name: Spice's Hugging Face cache against the hf CLI
     # The check builds and runs the change's code on persistent self-hosted runners in a public
     # repository, so a pull request from a fork or from Dependabot runs it only once a maintainer

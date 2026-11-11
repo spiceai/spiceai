@@ -32,7 +32,7 @@ mod moved_tests;
 // (`crate::component::dataset::{DatasetSpec, Acceleration, acceleration, ...}`).
 pub use runtime_component::dataset::{
     CheckAvailability, DatasetSpec, Error, FullTextSearchDatasetConfig, InvalidColumnTypeSnafu,
-    InvalidConfigurationSnafu, OnSchemaChange, ReadyState, Result, TimeFormat,
+    InvalidConfigurationSnafu, OnSchemaChange, ReadyState, ResolvedTimeColumns, Result, TimeFormat,
     UnsupportedTypeAction, acceleration, declared_schema, declared_type, metadata, replication,
     schema_inference,
 };
@@ -247,18 +247,6 @@ impl AccelerationSource for Dataset {
                     .into_iter()
                     .map(|ds| ds as Arc<dyn runtime_acceleration::AccelerationSource>)
                     .collect();
-            #[cfg(feature = "duckdb")]
-            {
-                let views: Vec<Arc<dyn runtime_acceleration::AccelerationSource>> =
-                    Arc::clone(&runtime)
-                        .get_initialized_views(&app, crate::LogErrors(false))
-                        .await
-                        .into_iter()
-                        .map(|v| v as Arc<dyn runtime_acceleration::AccelerationSource>)
-                        .collect();
-                datasets.into_iter().chain(views).collect()
-            }
-            #[cfg(not(feature = "duckdb"))]
             datasets
         })
     }
@@ -403,6 +391,28 @@ mod tests {
             .with_app(Arc::new(app))
             .with_runtime(Arc::new(runtime))
             .build()
+    }
+
+    /// A dataset that still selects the removed `duckdb` vector engine fails to load with
+    /// the line the runtime logs for it, naming the dataset and the Cayenne fix.
+    #[test]
+    fn a_dataset_selecting_the_duckdb_vector_engine_fails_to_load() {
+        let mut spicepod_dataset =
+            spicepod::component::dataset::Dataset::new("file:data.csv", "docs");
+        spicepod_dataset.vectors = Some(VectorStore {
+            enabled: true,
+            engine: Some("duckdb".to_string()),
+            ..Default::default()
+        });
+
+        let Err(err) = DatasetBuilder::try_from(spicepod_dataset) else {
+            panic!("a dataset selecting the duckdb vector engine must fail to load");
+        };
+        assert!(
+            matches!(err, crate::Error::DatasetVectorEngineRemoved { .. }),
+            "unexpected error: {err}"
+        );
+        insta::assert_snapshot!("dataset_duckdb_vector_engine_removed", err.to_string());
     }
 
     #[tokio::test]

@@ -16,7 +16,7 @@ limitations under the License.
 
 use super::{ConnectorParams, DataConnector, DataConnectorFactory, ParameterSpec, Parameters};
 use crate::accelerated::refresh_task::changes::{CdcSchemaEvolution, install_cdc_schema_evolution};
-use crate::component::dataset::acceleration::{Engine, RefreshMode};
+use crate::component::dataset::acceleration::RefreshMode;
 use crate::component::dataset::{DatasetSpec, OnSchemaChange};
 use crate::dataconnector::parameters::ConnectorContext;
 use crate::dataconnector::schema_projection::{ProjectionPolicy, parse_schema_projection};
@@ -512,21 +512,13 @@ impl DataConnector for Debezium {
         };
 
         ensure!(
-            !metadata.primary_keys.is_empty()
-                || matches!(acceleration.engine.to_unpartitioned(), Engine::Arrow),
+            !metadata.primary_keys.is_empty(),
             super::InvalidConfigurationNoSourceSnafu {
                 dataconnector: "debezium",
                 message: keyless_messages_message(),
                 connector_component: ConnectorComponent::from(dataset),
             }
         );
-
-        if metadata.primary_keys.is_empty() {
-            tracing::warn!(
-                dataset = %dataset_name,
-                "Debezium messages do not include primary keys; Arrow acceleration will apply deletes and updates by matching full row values, which requires Debezium full before images for keyless updates and deletes"
-            );
-        }
 
         // Make the dataset's policy + key columns available to the CDC apply
         // loop for stream-time schema classification. The dataset registration
@@ -1113,9 +1105,8 @@ fn primary_keys_from_acceleration(dataset: &DatasetSpec) -> Vec<String> {
         .unwrap_or_default()
 }
 
-/// The configuration error for a topic whose messages carry no Kafka key, on an
-/// acceleration that needs one. It names the fix at the source rather than the
-/// `arrow` engine, the only one that accepts keyless messages, which is deprecated.
+/// The configuration error for a topic whose messages carry no Kafka key. Every
+/// acceleration applies updates and deletes by key, so the fix is at the source.
 fn keyless_messages_message() -> String {
     "The Debezium messages for this dataset carry no Kafka message key, so updates and deletes cannot be applied to its acceleration. Give the source table a primary key, or set `message.key.columns` in the Debezium connector, so that each message carries a key. For details, visit: https://spiceai.org/docs/components/data-connectors/debezium".to_string()
 }

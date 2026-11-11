@@ -29,6 +29,8 @@ mod cleanup;
 mod compare;
 mod docker;
 mod generate;
+mod json_assert;
+mod keyquota;
 mod ledger;
 mod pki;
 mod reap;

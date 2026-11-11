@@ -306,10 +306,24 @@ pub async fn fetch(version: &str) -> Result<PathBuf> {
     Ok(binary)
 }
 
+/// curl flags for a GitHub release download. GitHub's release downloads answer
+/// 504 in bursts, so a single attempt fails a whole script partition. With no
+/// `--retry-delay`, curl waits 1s and doubles each time, so 8 retries span
+/// about 4 minutes; `--retry-max-time 300` bounds that. `-f` still fails a 404
+/// after the retries, so a missing asset is reported, not hidden.
+pub const CURL_RELEASE_RETRY: [&str; 5] = [
+    "--retry",
+    "8",
+    "--retry-all-errors",
+    "--retry-max-time",
+    "300",
+];
+
 async fn download(version: &str, asset: &str, partial: &Path, dir: &Path) -> Result<()> {
     let archive = partial.join("spiced.tar.gz");
     let url = format!("https://github.com/spiceai/spiceai/releases/download/v{version}/{asset}");
     let status = tokio::process::Command::new("curl")
+        .args(CURL_RELEASE_RETRY)
         .args(["-fsSL", "-o"])
         .arg(&archive)
         .arg(&url)

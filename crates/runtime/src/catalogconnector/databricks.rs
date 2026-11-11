@@ -25,7 +25,7 @@ use crate::dataconnector::http_rate_control;
 use crate::dataconnector::parameters::ConnectorParams;
 use crate::token_providers::databricks::{
     AUTH_MODE_DESCRIPTION, AUTH_MODES, AuthCredentials, build_auth_credentials,
-    get_m2m_token_provider, get_u2m_token_provider,
+    get_m2m_token_provider, get_u2m_token_provider, get_workload_identity_token_provider,
 };
 use async_trait::async_trait;
 use data_components::Read;
@@ -133,8 +133,10 @@ pub const PARAMETERS: &[ParameterSpec] = &[
         .default("auto"),
 
     // Databricks M2M Service Principal credentials
-    ParameterSpec::component("client_id").description("The client ID of the Databricks service principal."),
+    ParameterSpec::component("client_id").secret().description("The client ID of the Databricks service principal. Defaults to `DATABRICKS_CLIENT_ID` for workload identity federation or beside a client secret."),
     ParameterSpec::component("client_secret").secret().description("The client secret of the Databricks service principal."),
+    ParameterSpec::component("oidc_token_filepath").secret().description("A file that holds the workload's identity token, read again for every exchange, such as a Kubernetes projected service account token. With `databricks_client_id`, it authenticates with workload identity federation. Defaults to `DATABRICKS_OIDC_TOKEN_FILEPATH`."),
+    ParameterSpec::component("token_audience").secret().description("The audience of the identity token Spice requests from a GitHub Actions job or the workload's cloud identity, such as the Databricks account ID. With `databricks_client_id`, it authenticates with workload identity federation. Defaults to `DATABRICKS_TOKEN_AUDIENCE`."),
 
     // S3 storage options
     ParameterSpec::component("aws_region")
@@ -303,6 +305,18 @@ impl CatalogConnector for Databricks {
                         connector_component: ConnectorComponent::from(catalog),
                     })?
             }
+            AuthCredentials::WorkloadIdentity(identity) => get_workload_identity_token_provider(
+                &format!("catalog '{}' (databricks)", catalog.name),
+                endpoint,
+                identity,
+                &runtime.token_provider_registry,
+            )
+            .await
+            .map_err(|source| super::Error::UnableToGetCatalogProvider {
+                connector: "databricks".to_string(),
+                source: source.into(),
+                connector_component: ConnectorComponent::from(catalog),
+            })?,
         };
 
         // Copy the catalog params into the dataset params, and allow user to override
@@ -564,6 +578,18 @@ async fn create_token_provider_for_catalog(
                     connector_component: ConnectorComponent::from(catalog),
                 })
         }
+        AuthCredentials::WorkloadIdentity(identity) => get_workload_identity_token_provider(
+            &format!("catalog '{}' (databricks)", catalog.name),
+            endpoint,
+            identity,
+            &token_provider_registry,
+        )
+        .await
+        .map_err(|source| super::Error::UnableToGetCatalogProvider {
+            connector: "databricks".to_string(),
+            source: source.into(),
+            connector_component: ConnectorComponent::from(catalog),
+        }),
     }
 }
 

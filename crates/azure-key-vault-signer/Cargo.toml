@@ -1,0 +1,33 @@
+[package]
+description = "A JWT signer whose RSA private key Azure Key Vault holds and never reveals"
+edition.workspace = true
+exclude.workspace = true
+homepage.workspace = true
+license-file.workspace = true
+name = "azure-key-vault-signer"
+repository.workspace = true
+rust-version.workspace = true
+version.workspace = true
+
+[dependencies]
+async-trait.workspace = true
+azure-credential = { path = "../azure-credential" }
+base64.workspace = true
+http-body-limit = { path = "../http-body-limit" }
+reqwest.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+snafu.workspace = true
+token_provider = { path = "../token_provider" }
+tokio = { workspace = true, features = ["time"] }
+util = { path = "../util" }
+
+[dev-dependencies]
+aws-lc-rs = "1.19"
+# The 1.x line, as runtime-secrets' Key Vault store pins it, so one azure_core ships.
+azure_core = "1.1.0"
+axum.workspace = true
+tokio = { workspace = true, features = ["macros", "net", "rt-multi-thread", "time"] }
+
+[lints]
+workspace = true
