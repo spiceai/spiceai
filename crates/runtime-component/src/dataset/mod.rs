@@ -36,6 +36,7 @@ pub mod acceleration;
 pub mod declared_schema;
 pub mod declared_type;
 pub mod metadata;
+pub use metadata::ResolvedTimeColumns;
 pub mod replication;
 pub mod schema_inference;
 

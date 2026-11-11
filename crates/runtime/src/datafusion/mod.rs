@@ -35,7 +35,7 @@ use crate::component::access::AccessMode;
 use crate::component::dataset::acceleration::{
     Acceleration, Engine, Mode, RefreshMode, ZeroResultsAction,
 };
-use crate::component::dataset::{Dataset, OnSchemaChange, ReadyState};
+use crate::component::dataset::{Dataset, OnSchemaChange, ReadyState, ResolvedTimeColumns};
 use crate::component::view::View;
 use crate::dataaccelerator::ReloadProviderFactory;
 use crate::dataaccelerator::spice_sys::dataset_checkpointer;
@@ -1264,6 +1264,23 @@ struct AccelerationSetup {
     refresh_schema: SchemaRef,
     refresh_mode: RefreshMode,
     constraint_columns: Vec<String>,
+    resolved_time: ResolvedTimeColumns,
+}
+
+fn refresh_with_resolved_time(mut refresh: Refresh, time: &ResolvedTimeColumns) -> Refresh {
+    if let Some(format) = time.time_format {
+        refresh = refresh.time_format(format);
+    }
+    if let Some(column) = &time.time_column {
+        refresh = refresh.time_column(column.clone());
+    }
+    if let Some(column) = &time.time_partition_column {
+        refresh = refresh.time_partition_column(column.clone());
+    }
+    if let Some(format) = time.time_partition_format {
+        refresh = refresh.time_partition_format(format);
+    }
+    refresh
 }
 
 struct SchemaRebind {
@@ -3925,19 +3942,9 @@ impl DataFusion {
                 from: dataset.from.clone(),
             });
         }
-        let mut validation_refresh = Refresh::new(refresh_mode);
-        if let Some(format) = dataset.time_format {
-            validation_refresh = validation_refresh.time_format(format);
-        }
-        if let Some(column) = &dataset.time_column {
-            validation_refresh = validation_refresh.time_column(column.clone());
-        }
-        if let Some(column) = &dataset.time_partition_column {
-            validation_refresh = validation_refresh.time_partition_column(column.clone());
-        }
-        if let Some(format) = dataset.time_partition_format {
-            validation_refresh = validation_refresh.time_partition_format(format);
-        }
+        let resolved_time = dataset.resolve_time_columns(source_schema.as_ref());
+        let validation_refresh =
+            refresh_with_resolved_time(Refresh::new(refresh_mode), &resolved_time);
         validation_refresh
             .validate_time_format(&dataset.name.to_string(), &refresh_schema)
             .context(InvalidTimeColumnTimeFormatSnafu)?;
@@ -3953,6 +3960,7 @@ impl DataFusion {
             refresh_schema,
             refresh_mode,
             constraint_columns,
+            resolved_time,
         })
     }
 
@@ -3973,7 +3981,20 @@ impl DataFusion {
             refresh_schema,
             refresh_mode,
             constraint_columns,
+            resolved_time,
         } = setup;
+        // Retention and later builders read `dataset.time_column`; keep them on the
+        // resolved names so a legacy `last_modified` alias is visible everywhere.
+        let mut resolved_dataset = dataset.clone();
+        resolved_dataset
+            .time_column
+            .clone_from(&resolved_time.time_column);
+        resolved_dataset.time_format = resolved_time.time_format;
+        resolved_dataset
+            .time_partition_column
+            .clone_from(&resolved_time.time_partition_column);
+        resolved_dataset.time_partition_format = resolved_time.time_partition_format;
+        let dataset = &resolved_dataset;
         // A deferred provider reports the primary key the checkpoint recorded, so an
         // acceleration registered while its source is down keeps its existing key.
         let source_constraints = source_table_provider.constraints();
@@ -4173,24 +4194,15 @@ impl DataFusion {
             }
         }
 
-        let mut refresh = Refresh::new(refresh_mode).with_retry(
-            dataset.refresh_retry_enabled(),
-            dataset.refresh_retry_max_attempts(),
+        let mut refresh = refresh_with_resolved_time(
+            Refresh::new(refresh_mode).with_retry(
+                dataset.refresh_retry_enabled(),
+                dataset.refresh_retry_max_attempts(),
+            ),
+            &resolved_time,
         );
         if let Some(sql) = parsed_refresh_sql {
             refresh = refresh.refresh_sql(sql);
-        }
-        if let Some(format) = dataset.time_format {
-            refresh = refresh.time_format(format);
-        }
-        if let Some(time_col) = &dataset.time_column {
-            refresh = refresh.time_column(time_col.clone());
-        }
-        if let Some(time_partition_column) = &dataset.time_partition_column {
-            refresh = refresh.time_partition_column(time_partition_column.clone());
-        }
-        if let Some(time_partition_format) = dataset.time_partition_format {
-            refresh = refresh.time_partition_format(time_partition_format);
         }
         if let Some(check_interval) = dataset.refresh_check_interval() {
             refresh = refresh.check_interval(check_interval);
@@ -4213,7 +4225,7 @@ impl DataFusion {
         }
         refresh = refresh.versions_by_time(
             acceleration_settings
-                .orders_versions_by_time(dataset.time_column.as_deref(), refresh_mode)
+                .orders_versions_by_time(resolved_time.time_column.as_deref(), refresh_mode)
                 .then(|| VersionsByTime {
                     // An unpartitioned Cayenne table resolves a full refresh's repeated
                     // keys as it writes them, ordered by the row versions the refresh
