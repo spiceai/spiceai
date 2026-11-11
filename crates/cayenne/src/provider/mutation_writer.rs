@@ -1413,6 +1413,13 @@ impl<'a> AppendMutationWriter<'a> {
         } else {
             None
         };
+        // A table without a primary key whose `retention_sql` must also reach
+        // its resident rows publishes a carried generation
+        // (`write_unkeyed_retention_generation`).
+        let carried_generation = self.table.has_retention_delete_filters()
+            && self.table.primary_key_indices()?.is_none()
+            && self.table.metadata().partition_column.is_none()
+            && !self.table.is_memory_resident_mode();
         let (prepared_stream, retention_dropped) =
             if collapsed_for_retention || self.table.key_resolver()?.is_none() {
                 match &publication_filters {
@@ -1435,11 +1442,7 @@ impl<'a> AppendMutationWriter<'a> {
         // rows: the append publishes as its own generation (a protected
         // snapshot) whose catalog transaction also carries the retention delete
         // over the resident rows. The resident files are reused as they are.
-        let written = if self.table.has_retention_delete_filters()
-            && self.table.key_resolver()?.is_none()
-            && !self.table.is_memory_resident_mode()
-            && !self.into_empty_table
-        {
+        let written = if carried_generation {
             let write = self.write_unkeyed_retention_generation(
                 prepared_stream,
                 write_guard,
@@ -1604,112 +1607,38 @@ impl<'a> AppendMutationWriter<'a> {
         .map(|written| written.saturating_add(retention_folded))
     }
 
-    /// Publish a primary-key-less append on a `retention_sql` table as one
-    /// generation: its rows in a staged snapshot of their own, and the retention
-    /// delete over the resident rows, committed in one metastore transaction
-    /// (`PreparedResolvedAppend`) and published under one fence. No staging WAL:
-    /// before the commit the catalog holds the previous generation, after it
-    /// the appended one with retention applied.
+    /// Publish a primary-key-less append on a `retention_sql` table as a
+    /// complete new current snapshot (`begin_retention_append_generation`): its
+    /// rows, the previous generation's files carried over, and the deletes of
+    /// both, committed by the overwrite's atomic `current_snapshot_id` flip.
     async fn write_unkeyed_retention_generation(
         &self,
         data: SendableRecordBatchStream,
         write_guard: OwnedMutexGuard<()>,
         checkpoint_guard: OwnedMutexGuard<()>,
     ) -> Result<u64> {
-        let filters = match super::overwrite_retention::publication_retention_filters() {
-            Some(filters) => filters,
-            None => self
-                .table
-                .coerced_retention_filters()
-                .map_err(|source| super::Error::DataFusion { source })?,
-        };
-        let snapshot_id = uuid::Uuid::now_v7().to_string();
-        let staged = self
+        let prepared = self
             .table
-            .write_to_snapshot(
+            .begin_retention_append_generation(
                 data,
-                self.context.target_file_size_bytes(),
-                &snapshot_id,
                 self.task_context.session_config().target_partitions(),
-                None,
-                crate::provider::delta_encoding::WritePolicy::DELTA,
+                write_guard,
+                checkpoint_guard,
             )
-            .await;
-        let (rows, _writer_ops, stats) = match staged {
-            Ok(staged) => staged,
-            Err(error) => {
-                self.cleanup_layered_append_dirs(std::slice::from_ref(&snapshot_id))
-                    .await;
-                return Err(error.into());
+            .await?;
+        #[cfg(test)]
+        self.table.run_test_pre_staged_publish_hook().await;
+        if let Err(source) = prepared.apply_owned_txn().await {
+            if let Err(rollback) = prepared.rollback().await {
+                tracing::warn!(
+                    table = self.table.table_name(),
+                    %rollback,
+                    "Failed to roll back a retention append generation after its commit failed"
+                );
             }
-        };
-        let resident = self.prepare_unkeyed_resident_retention(&filters).await;
-        let (prepared, replaced, sink) = match resident {
-            Ok(resident) => resident,
-            Err(error) => {
-                self.cleanup_layered_append_dirs(std::slice::from_ref(&snapshot_id))
-                    .await;
-                return Err(error);
-            }
-        };
-        if rows == 0 && prepared.is_none() {
-            self.cleanup_layered_append_dirs(std::slice::from_ref(&snapshot_id))
-                .await;
-            return Ok(0);
+            return Err(super::Error::Catalog { source });
         }
-        super::append_commit::PreparedResolvedAppend {
-            table: self.table.clone_for_write(),
-            context: Arc::clone(self.context),
-            _write_guard: write_guard,
-            _held_write_lock: super::write_lock_held::held_guard(),
-            _checkpoint_guard: Some(checkpoint_guard),
-            snapshot_id,
-            rows,
-            stats,
-            deletions: super::on_conflict::OnConflictDeletions::default(),
-            validated_keys: PkDigestSet::default(),
-            superseded: 0,
-            into_empty_table: false,
-            first_load_pk_bloom: None,
-            resident_retention: prepared,
-            resident_replaced: replaced,
-            resident_sink: Some(sink),
-        }
-        .commit()
-        .await
-    }
-
-    async fn prepare_unkeyed_resident_retention(
-        &self,
-        filters: &[datafusion::logical_expr::Expr],
-    ) -> Result<(
-        Option<super::delete::PreparedDeletionPublish>,
-        Vec<crate::metadata::DeleteFile>,
-        super::delete::CayenneDeletionSink,
-    )> {
-        let failed = |error: datafusion_common::DataFusionError| super::Error::DataFusion {
-            source: datafusion_common::DataFusionError::Execution(format!(
-                "{} The write was not published. {error}",
-                self.table.retention_failed_message()
-            )),
-        };
-        let sink = self
-            .table
-            .build_deletion_vector_sink(filters, None, super::table::DeletionRequestSource::User)
-            .await
-            .map_err(failed)?;
-        let prepared = sink
-            .prepare_delete()
-            .await?
-            .filter(|prepared| !prepared.delete_files().is_empty());
-        let replaced = match &prepared {
-            Some(prepared) if prepared.replaces_earlier_deletion_vectors() => {
-                sink.position_deletion_vectors_replaced_by(prepared.delete_files())
-                    .await?
-            }
-            _ => Vec::new(),
-        };
-        Ok((prepared, replaced, sink))
+        prepared.finish().await
     }
 
     async fn cleanup_layered_append_dirs(&self, snapshot_ids: &[String]) {

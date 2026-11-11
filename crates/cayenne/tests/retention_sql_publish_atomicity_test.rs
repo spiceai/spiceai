@@ -1230,7 +1230,11 @@ async fn resident_row_newly_matching_is_gone_at_next_publish_impl(
             .await?,
         );
         assert_eq!(ids(&reopened).await?, vec![2, 3], "{name}: after reopening");
-        assert_eq!(count_star(&reopened).await?, 2, "{name}: COUNT(*) after reopening");
+        assert_eq!(
+            count_star(&reopened).await?,
+            2,
+            "{name}: COUNT(*) after reopening"
+        );
     }
     Ok(())
 }

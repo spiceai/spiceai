@@ -32276,6 +32276,15 @@ impl CayenneTableProvider {
     /// Replace the aggregate entirely with the overwrite's accumulator and reset
     /// the live count to the rewritten row count (the prior data is gone, so the
     /// old min/max/NDV must not survive — see [`RowCountUpdate`]).
+    /// Drop the cached statistics after a flip to a snapshot that carries the
+    /// previous generation's files. The commit already cleared the catalog's
+    /// row; nothing measured covers the whole new snapshot, so nothing exact is
+    /// recorded and the next statistics pass rebuilds them.
+    pub(crate) async fn clear_table_stats_after_carried_generation(&self) {
+        let _stats_persistence_guard = self.table_statistics_persistence_lock.lock().await;
+        self.clear_cached_table_statistics_unlocked();
+    }
+
     pub(crate) async fn reset_table_stats_after_overwrite(
         &self,
         accumulator: &ColumnStatsAccumulator,

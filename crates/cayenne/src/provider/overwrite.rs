@@ -102,6 +102,11 @@ pub struct PreparedOverwrite {
     new_snapshot_id: String,
     row_count: u64,
     write_stats_acc: Arc<ColumnStatsAccumulator>,
+    /// The new snapshot also carries the previous generation's files (a
+    /// `retention_sql` append on a table without a primary key), so
+    /// `write_stats_acc` covers only part of it: the statistics are cleared
+    /// rather than re-baselined from it.
+    carries_resident_files: bool,
     /// `Some` when the overwrite's rows live in the metastore rather than in
     /// Vortex files under `new_snapshot_id` (whose directory is then empty): the
     /// row to insert, atomically with the snapshot flip that clears its
@@ -389,19 +394,27 @@ impl PreparedOverwrite {
         // already cleared atomically with the snapshot pointer flip.
         // The accumulator counts every written row, including those the position
         // deletes hide.
-        let hidden: u64 = self
-            .position_deletions
-            .values()
-            .map(|rows| rows.len() as u64)
-            .sum();
-        let live_rows = (hidden > 0).then(|| {
-            u64::try_from(self.write_stats_acc.row_count())
-                .unwrap_or(0)
-                .saturating_sub(hidden)
-        });
-        self.table
-            .reset_table_stats_after_overwrite(&self.write_stats_acc, live_rows)
-            .await;
+        if self.carries_resident_files {
+            // The flip cleared the catalog's statistics row; the accumulator saw
+            // only the appended rows, so nothing exact can be recorded from it.
+            self.table
+                .clear_table_stats_after_carried_generation()
+                .await;
+        } else {
+            let hidden: u64 = self
+                .position_deletions
+                .values()
+                .map(|rows| rows.len() as u64)
+                .sum();
+            let live_rows = (hidden > 0).then(|| {
+                u64::try_from(self.write_stats_acc.row_count())
+                    .unwrap_or(0)
+                    .saturating_sub(hidden)
+            });
+            self.table
+                .reset_table_stats_after_overwrite(&self.write_stats_acc, live_rows)
+                .await;
+        }
 
         // All visibility-related updates above happen under exclusive table access; the
         // retention pass takes this same lock, so it can only proceed once this drops.
@@ -652,6 +665,7 @@ impl CayenneTableProvider {
                     new_snapshot_id,
                     row_count: inlined.row_count,
                     write_stats_acc: inlined.stats,
+                    carries_resident_files: false,
                     inlined: Some(inlined.data),
                     _inline_admission: Some(inlined.admission),
                     delete_files: Vec::new(),
@@ -921,6 +935,160 @@ impl CayenneTableProvider {
             new_snapshot_id,
             row_count,
             write_stats_acc,
+            carries_resident_files: false,
+            inlined: None,
+            _inline_admission: None,
+            delete_files,
+            position_deletions,
+        })
+    }
+
+    /// Stage a `retention_sql` append on a table without a primary key as a
+    /// complete new current snapshot, published by the same atomic
+    /// `current_snapshot_id` flip an overwrite commits.
+    ///
+    /// The snapshot holds the appended rows, the previous generation's files
+    /// carried over by hard link (copy where links are unavailable, as subset
+    /// compaction does), and position deletes for both: the carried files'
+    /// existing deletes re-keyed to their new paths, and every row the retention
+    /// predicate matches among the rows those deletes leave visible. Readers of
+    /// the previous snapshot keep its directory until the post-commit cleanup;
+    /// a failure removes only the staged snapshot.
+    ///
+    /// The caller holds `write_lock` and the mem-tier checkpoint lock, which
+    /// pass into the returned [`PreparedOverwrite`].
+    pub(crate) async fn begin_retention_append_generation(
+        &self,
+        data: SendableRecordBatchStream,
+        target_partitions: usize,
+        write_guard: OwnedMutexGuard<()>,
+        checkpoint_guard: OwnedMutexGuard<()>,
+    ) -> Result<PreparedOverwrite> {
+        let internal = |message: String| super::Error::Internal {
+            table: self.table_name().to_string(),
+            message,
+        };
+        if self.primary_key_indices()?.is_some() || !self.pk_deletion_strategy.is_position_based() {
+            return Err(internal(
+                "a carried retention generation is only for tables without a primary key"
+                    .to_string(),
+            ));
+        }
+        // The flip clears the inline corpus; a table holding inline rows cannot
+        // carry them into files here, so it does not take this path.
+        if self
+            .catalog()
+            .get_inlined_data_count(self.table_id())
+            .await
+            .map_err(|source| super::Error::Catalog { source })?
+            > 0
+        {
+            return Err(internal(
+                "retention_sql append over inline rows on a table without a primary key is not supported"
+                    .to_string(),
+            ));
+        }
+        let source_snapshot_id = self.get_current_snapshot_id();
+        let new_snapshot_id = uuid::Uuid::now_v7().to_string();
+        let is_s3 = self.table_path().starts_with("s3://");
+        if !is_s3 {
+            Self::ensure_snapshot_dir_exists(&self.snapshot_dir_path_for(&new_snapshot_id)).await?;
+        }
+        let staged: Result<(u64, HashMap<String, Vec<u32>>, Arc<ColumnStatsAccumulator>)> = async {
+            // `retention_sql` over the previous generation as it is visible, in
+            // place: its deleted rows are skipped before the predicate runs and
+            // its matches join them. The appended rows were already filtered by
+            // the same predicate context (`drop_retention_matches_from_stream`),
+            // so no row is evaluated twice.
+            let visible_deletes: HashMap<String, Vec<u32>> = self
+                .pk_deletion_strategy
+                .position_cache()
+                .load()
+                .iter()
+                .filter(|(_, vector)| !vector.is_empty())
+                .map(|(path, vector)| (path.clone(), vector.to_bitmap().iter().collect()))
+                .collect();
+            let resident_deletes = self
+                .hide_retention_matches_in_snapshot(&source_snapshot_id, visible_deletes)
+                .await?;
+            let (row_count, _files, stats) = self
+                .write_to_snapshot_with_schema(
+                    data,
+                    self.target_file_size_bytes(),
+                    &new_snapshot_id,
+                    target_partitions,
+                    None,
+                    super::delta_encoding::WritePolicy::DELTA,
+                    None,
+                    None,
+                    self.table_schema(),
+                )
+                .await?;
+            // Carry the previous generation's files. Names are unique per write,
+            // but a collision would overwrite a file, so it is refused.
+            let appended: std::collections::HashSet<String> = self
+                .list_snapshot_files_with_sizes(&new_snapshot_id)
+                .await?
+                .into_iter()
+                .map(|(name, _)| name)
+                .collect();
+            let resident = self.list_snapshot_files_with_sizes(&source_snapshot_id).await?;
+            if let Some((name, _)) = resident.iter().find(|(name, _)| appended.contains(name)) {
+                return Err(internal(format!(
+                    "carried file {name} collides with an appended file"
+                )));
+            }
+            let names: Vec<&str> = resident.iter().map(|(name, _)| name.as_str()).collect();
+            self.link_or_copy_snapshot_files(&source_snapshot_id, &new_snapshot_id, &names)
+                .await?;
+            self.sync_local_snapshot_dir(&new_snapshot_id)
+                .await
+                .map_err(|source| super::Error::Catalog { source })?;
+            // Re-key the carried files' deletes to their new paths. Every one of
+            // them must land on a carried file.
+            let from = format!("/{source_snapshot_id}/");
+            let to = format!("/{new_snapshot_id}/");
+            let mut deletions = HashMap::with_capacity(resident_deletes.len());
+            for (path, rows) in resident_deletes {
+                if !path.contains(&from) {
+                    return Err(internal(format!(
+                        "a delete on {path} does not address the current snapshot {source_snapshot_id}"
+                    )));
+                }
+                deletions.insert(path.replacen(&from, &to, 1), rows);
+            }
+            Ok((row_count, deletions, stats))
+        }
+        .await;
+        let (row_count, position_deletions, write_stats_acc) = match staged {
+            Ok(staged) => staged,
+            Err(error) => {
+                self.abandon_overwrite_snapshot(&new_snapshot_id).await;
+                return Err(error);
+            }
+        };
+        let delete_files = if position_deletions.is_empty() {
+            Vec::new()
+        } else {
+            match self
+                .write_position_deletion_vectors(&new_snapshot_id, &position_deletions)
+                .await
+            {
+                Ok(files) => files,
+                Err(error) => {
+                    self.abandon_overwrite_snapshot(&new_snapshot_id).await;
+                    return Err(error);
+                }
+            }
+        };
+        Ok(PreparedOverwrite {
+            table: self.clone_for_write(),
+            write_guard: Some(write_guard),
+            checkpoint_guard: Some(checkpoint_guard),
+            new_snapshot_id,
+            row_count,
+            write_stats_acc,
+            carries_resident_files: true,
             inlined: None,
             _inline_admission: None,
             delete_files,
