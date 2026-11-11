@@ -59,6 +59,7 @@ test_with_backends!(retention_deletes_are_durable_with_the_append_impl);
 test_with_backends!(memory_cdc_apply_hides_matching_rows_at_publish_impl);
 test_with_backends!(durable_cdc_apply_hides_and_failed_batch_replays_impl);
 test_with_backends!(partitioned_upsert_hides_matching_rows_at_publish_impl);
+test_with_backends!(durable_retention_reaches_a_preexisting_inline_corpus_impl);
 
 fn schema() -> SchemaRef {
     Arc::new(Schema::new(vec![
@@ -2903,6 +2904,85 @@ async fn hybrid_cdc_composite_retention_across_versions_shards_and_compaction_im
             "{label}: reinsert durable"
         );
         eprintln!("{label}: inlined_generation {inline_gen_before}->{inline_gen_after}");
+    }
+    Ok(())
+}
+
+/// A keyed table whose rows were inlined before `retention_sql` was configured:
+/// the first durable write after it is (a CDC apply, then a SQL insert, each of
+/// a distinct key) publishes the retention delete over those inline rows with
+/// it. Read immediately and after a reopen, no matching row survives
+/// (Codex adversarial review F3: the durable resident scan covered files and
+/// protected/cold snapshots but not the catalog's inline corpus).
+async fn durable_retention_reaches_a_preexisting_inline_corpus_impl(
+    fixture: common::TestFixture,
+) -> Result<(), Box<dyn std::error::Error>> {
+    for (name, via_cdc) in [
+        ("rsql_pub_inline_corpus_cdc", true),
+        ("rsql_pub_inline_corpus_sql", false),
+    ] {
+        let dir = fixture.data_path.join(name);
+        std::fs::create_dir_all(&dir)?;
+        let options = CreateTableOptions {
+            table_name: name.to_string(),
+            schema: schema(),
+            primary_key: vec!["id".to_string()],
+            on_conflict: Some(OnConflict::Upsert(ColumnReference::new(vec![
+                "id".to_string(),
+            ]))),
+            base_path: dir.to_string_lossy().to_string(),
+            partition_column: None,
+            vortex_config: VortexConfig::default(),
+        };
+        let plain = CayenneTableProvider::create_table_with_retention(
+            Arc::clone(&fixture.catalog) as Arc<dyn MetadataCatalog>,
+            options,
+            vec![],
+            SessionContext::new().runtime_env(),
+        )
+        .await?;
+        let before = plain.inlined_generation();
+        common::insert_batch(
+            &plain,
+            rows(&[
+                (1, Some("archived")),
+                (2, Some("active")),
+                (3, Some("archived")),
+            ]),
+        )
+        .await?;
+        assert!(
+            plain.inlined_generation() > before,
+            "{name}: precondition: the seed is in the inline corpus"
+        );
+        drop(plain);
+        let open = |retention: Vec<Expr>| {
+            let catalog = Arc::clone(&fixture.catalog) as Arc<dyn MetadataCatalog>;
+            async move {
+                Ok::<_, Box<dyn std::error::Error>>(Arc::new(
+                    CayenneTableProviderBuilder::new(catalog, SessionContext::new().runtime_env())
+                        .with_retention_filters(retention)
+                        .open(name)
+                        .await?,
+                ))
+            }
+        };
+        let t = open(vec![archived()]).await?;
+        let batch = rows(&[(4, Some("active"))]);
+        if via_cdc {
+            cdc_apply(&t, batch).await?;
+        } else {
+            common::insert_batch(t.as_ref(), batch).await?;
+        }
+        assert_eq!(
+            ids(&t).await?,
+            vec![2, 4],
+            "{name}: the write published the delete of the matching inline rows with it"
+        );
+        assert_eq!(count_star(&t).await?, 2, "{name}: COUNT(*)");
+        drop(t);
+        let reopened = open(vec![]).await?;
+        assert_eq!(ids(&reopened).await?, vec![2, 4], "{name}: durable");
     }
     Ok(())
 }
