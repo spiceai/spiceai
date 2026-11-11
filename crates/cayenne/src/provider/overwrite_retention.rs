@@ -496,7 +496,6 @@ impl CayenneTableProvider {
         &self,
         snapshot_id: &str,
         filters: &[Expr],
-        superseded_positions: &std::collections::HashMap<std::sync::Arc<str>, Vec<u64>>,
     ) -> super::Result<Option<super::delete::PreparedDeletionPublish>> {
         let failed = |error: datafusion_common::DataFusionError| super::Error::DataFusion {
             source: datafusion_common::DataFusionError::Execution(format!(
@@ -518,33 +517,12 @@ impl CayenneTableProvider {
                     .to_string(),
             });
         }
-        if self.is_position_based() {
-            // A position delete addresses (file, row): the write's superseded
-            // positions are excluded from each file's scan with its deletion
-            // vector, so neither they nor deleted rows reach the predicate.
-            let mut positions: std::collections::HashMap<String, roaring::RoaringBitmap> =
-                std::collections::HashMap::new();
-            for (file, rows) in superseded_positions {
-                let bitmap = positions.entry(file.to_string()).or_default();
-                for row in rows {
-                    bitmap.insert(u32::try_from(*row).map_err(|_| super::Error::Internal {
-                        table: self.table_name().to_string(),
-                        message: format!("superseded position {row} exceeds u32 in '{file}'"),
-                    })?);
-                }
-            }
-            let sink = self
-                .build_deletion_vector_sink(
-                    filters,
-                    None,
-                    super::table::DeletionRequestSource::User,
-                )
-                .await
-                .map_err(failed)?
-                .with_skip_positions(positions);
-            let prepared = sink.prepare_delete().await?;
-            return Ok(prepared.filter(|prepared| !prepared.delete_files().is_empty()));
-        }
+        // A table with a primary key never has the position-based deletion
+        // strategy (`PkDeletionStrategy::PositionBased` is chosen only without
+        // one); `deletion_mode: position` on a keyed table keeps a key strategy
+        // and records positions beside it. So the sink below always deletes by
+        // key, and the write's superseded keys are what it skips.
+        debug_assert!(!self.is_position_based());
         let incoming = self
             .read_staged_columns(snapshot_id, &keys)
             .await
