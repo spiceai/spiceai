@@ -351,6 +351,9 @@ fn cases() -> Vec<Case> {
 /// A row as its cells, each rendered, or `None` for NULL.
 type Row = Vec<Option<String>>;
 
+/// A check of an `EXPLAIN` answer, which says what the plan does wrong.
+type PlanCheck = fn(&[Row]) -> Result<(), String>;
+
 /// How a dataset reads `PostgreSQL`.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Kind {
@@ -604,7 +607,7 @@ async fn compare_case(
         // DataFusion over a wider scan and compares nothing the accelerated side
         // does not. A Cayenne side must read only Cayenne, or its agreement says
         // nothing about what Cayenne stored.
-        let check: Option<fn(&[Row]) -> Result<(), String>> = match subject.kind {
+        let check: Option<PlanCheck> = match subject.kind {
             Kind::Federated => Some(check_nothing_local),
             Kind::CayenneMemory | Kind::CayenneFile | Kind::CayenneVortex => {
                 Some(check_cayenne_sources)
