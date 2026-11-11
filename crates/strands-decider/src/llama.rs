@@ -27,7 +27,11 @@ use crate::{LlamaSnafu, Result};
 
 /// Decodes the state once into sequence 0, copies it to one sequence per question, and
 /// decodes the questions together, as upstream reuses one prefix cache for every question.
-/// Each question sees the state and itself, never another question.
+/// Each question sees the state and itself, never another question. A single question is
+/// decoded with the state in one pass.
+///
+/// On a CPU with no native bf16 (Apple M1), llama.cpp decodes a BF16 model very slowly in
+/// batches of fewer than 32 tokens, as a short state is; an F16 or quantized base avoids it.
 ///
 /// Copying a sequence shares its attention cache and copies its recurrent state, so this holds
 /// for hybrid models (Qwen3.5) too.
@@ -113,24 +117,30 @@ impl HiddenStates for LlamaHiddenStates<'_> {
     ) -> Result<Vec<HiddenRows>, BoxError> {
         let token = |id: u32| -> Result<Token, BoxError> { Ok(Token(i32::try_from(id)?)) };
         self.context.clear();
-        let prefix = state
+        let mut prefix = state
             .iter()
             .enumerate()
             .map(|(pos, &id)| Ok((token(id)?, pos, 0, false)))
             .collect::<Result<Vec<_>, BoxError>>()?;
-        self.decode(&prefix)?;
+        // One question needs no copy: it follows the state in sequence 0, in the same decode,
+        // which saves a pass over the model.
+        let single = questions.len() == 1;
+        if !single {
+            self.decode(&prefix)?;
+            prefix.clear();
+        }
 
         let mut out = Vec::with_capacity(questions.len());
         let groups = questions
             .chunks(self.n_parallel)
             .zip(rows.chunks(self.n_parallel));
         for (group, group_rows) in groups {
-            let mut tokens = Vec::new();
+            let mut tokens = std::mem::take(&mut prefix);
             // Each question's output positions, ascending: the order llama.cpp returns them in.
             let mut outputs = Vec::with_capacity(group.len());
             for (i, (question, rows)) in group.iter().zip(group_rows).enumerate() {
-                let seq = i32::try_from(i + 1)?;
-                if !self.context.copy_seq(0, seq) {
+                let seq = if single { 0 } else { i32::try_from(i + 1)? };
+                if !single && !self.context.copy_seq(0, seq) {
                     return Err("the context holds too few sequences".into());
                 }
                 let mut positions = rows.clone();
@@ -164,8 +174,10 @@ impl HiddenStates for LlamaHiddenStates<'_> {
                     data,
                 });
             }
-            for i in 0..group.len() {
-                self.context.truncate_seq(i32::try_from(i + 1)?, 0);
+            if !single {
+                for i in 0..group.len() {
+                    self.context.truncate_seq(i32::try_from(i + 1)?, 0);
+                }
             }
         }
         Ok(out)
