@@ -148,7 +148,7 @@ impl Runtime {
         // A node other than the first of a distributed model never reads the weights: the first
         // reads them and sends each node its share, so the files need exist only there.
         if matches!(source, Some(ModelSource::File))
-            && !distributed_node_rank(&params).is_some_and(|rank| rank > 0)
+            && distributed_node_rank(&params).is_none_or(|rank| rank == 0)
         {
             // Verify all referenced local files exist before attempting to load the model and determine its type.
             // Otherwise, we will fail to determine the model type and the error will be confusing.
