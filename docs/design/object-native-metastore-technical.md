@@ -144,7 +144,7 @@ Internal constants, not head fields and not user settings:
 | R | Largest record; a record above about R/2 is stored as an object | Set in step 1 |
 | M | Head content outside the inline records (fields, envelopes, the batch index at its largest) | Derived |
 | T | Retention of removed objects | About an hour |
-| S | Staleness bound for a head confirmation | About 10 s, the head-poll interval ([#16238](https://github.com/spiceai/spiceai/issues/16238)) |
+| S | Staleness bound for a head confirmation | Per dataset, from its freshness need |
 | T_O | Age limit for uncommitted uploads | About a day |
 | Margin | Allowance in the writer's age check for one-second timestamps and skew between the store's servers | Set in step 1 |
 | Evidence horizon | Retention of attempt ids in checkpoint roots, measured as the head's store time | T_O |
