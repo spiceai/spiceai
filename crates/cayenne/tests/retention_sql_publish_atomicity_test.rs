@@ -31,7 +31,7 @@ use arrow::array::{Array, Int64Array, RecordBatch, StringArray};
 use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 
 use cayenne::metadata::{CdcDurability, CreateTableOptions, DeletionMode, VortexConfig};
-use cayenne::{CayenneTableProvider, MetadataCatalog};
+use cayenne::{CayenneTableProvider, CayenneTableProviderBuilder, MetadataCatalog};
 
 use datafusion::datasource::TableProvider;
 use datafusion::logical_expr::dml::InsertOp;
@@ -54,6 +54,8 @@ test_with_backends!(failing_retention_fails_append_and_keeps_rows_impl);
 test_with_backends!(keyed_append_superseded_copy_is_never_evaluated_impl);
 test_with_backends!(memory_append_hides_matching_rows_at_publish_impl);
 test_with_backends!(volatile_predicate_sees_only_winning_copies_impl);
+test_with_backends!(key_without_on_conflict_append_hides_at_publish_impl);
+test_with_backends!(retention_deletes_are_durable_with_the_append_impl);
 
 fn schema() -> SchemaRef {
     Arc::new(Schema::new(vec![
@@ -564,5 +566,73 @@ async fn volatile_predicate_sees_only_winning_copies_impl(
             assert!(seen.iter().any(|v| v.as_deref() == Some(winner)), "{name}: {winner} never evaluated: {seen:?}");
         }
     }
+    Ok(())
+}
+
+/// A primary key without `on_conflict` resolves no repeats, so the append drops
+/// retention's matches from the validated rows before the write. Their keys were
+/// validated but are not stored: inserting one again later is not refused.
+async fn key_without_on_conflict_append_hides_at_publish_impl(
+    fixture: common::TestFixture,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let name = "rsql_pub_key_no_conflict";
+    let dir = fixture.data_path.join(name);
+    std::fs::create_dir_all(&dir)?;
+    let options = CreateTableOptions {
+        table_name: name.to_string(),
+        schema: schema(),
+        primary_key: vec!["id".to_string()],
+        on_conflict: None,
+        base_path: dir.to_string_lossy().to_string(),
+        partition_column: None,
+        vortex_config: file_tier_config(),
+    };
+    let t = Arc::new(
+        CayenneTableProvider::create_table_with_retention(
+            Arc::clone(&fixture.catalog) as Arc<dyn MetadataCatalog>,
+            options,
+            vec![archived()],
+            SessionContext::new().runtime_env(),
+        )
+        .await?,
+    );
+    assert_eq!(common::insert_batch(t.as_ref(), batch(0..70)).await?, 70);
+    assert_eq!(counts(&t).await?, (60, 0, 10), "right after the append");
+    common::insert_batch(t.as_ref(), rows(&[(1000, Some("archived"))])).await?;
+    assert!(!ids(&t).await?.contains(&1000), "archived key hidden at publish");
+    common::insert_batch(t.as_ref(), rows(&[(1000, Some("active"))])).await?;
+    assert!(ids(&t).await?.contains(&1000), "a dropped key can be inserted again");
+    assert_eq!(counts(&t).await?, (61, 0, 10));
+    Ok(())
+}
+
+/// The retention deletes commit with the append, not in a later pass: a provider
+/// opened afresh from the catalog, with no retention of its own to apply, never
+/// sees the matching rows or the superseded version.
+async fn retention_deletes_are_durable_with_the_append_impl(
+    fixture: common::TestFixture,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let name = "rsql_pub_durable";
+    {
+        let t = table(&fixture, name, true, archived()).await?;
+        common::insert_batch(t.as_ref(), rows(&[(1, Some("active")), (2, Some("active"))])).await?;
+        t.flush_pending_maintenance().await?;
+        common::insert_batch(
+            t.as_ref(),
+            rows(&[(1, Some("archived")), (3, Some("archived")), (4, Some("active"))]),
+        )
+        .await?;
+        assert_eq!(ids(&t).await?, vec![2, 4], "right after the upsert");
+    }
+    let reopened = Arc::new(
+        CayenneTableProviderBuilder::new(
+            Arc::clone(&fixture.catalog) as Arc<dyn MetadataCatalog>,
+            SessionContext::new().runtime_env(),
+        )
+        .open(name)
+        .await?,
+    );
+    assert_eq!(ids(&reopened).await?, vec![2, 4], "after reopening");
+    assert_eq!(count_star(&reopened).await?, 2, "COUNT(*) after reopening");
     Ok(())
 }

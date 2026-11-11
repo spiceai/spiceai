@@ -1305,17 +1305,24 @@ impl<'a> AppendMutationWriter<'a> {
         // A table without a primary key: an append supersedes nothing, so
         // `retention_sql` is applied by not writing the rows it deletes (see
         // `drop_retention_matches_from_stream`), and no publication carries them.
-        let (data, retention_dropped) = if self.table.primary_key_indices()?.is_none() {
-            self.table.drop_retention_matches_from_stream(data)?
-        } else {
-            (data, Arc::default())
-        };
         let prepared = self.table.prepare_stream_for_insert(data).await?;
         #[cfg(test)]
         self.table.run_test_post_prepare_hook().await;
         let post_validation = prepared.post_validation();
         let may_have_on_conflict_deletions = prepared.may_have_on_conflict_deletions();
-        let prepared_stream = prepared.stream;
+        // `retention_sql` over the rows validation passes, before the write: what
+        // reaches here resolves no repeated keys against the rows it writes (no
+        // primary key, or a key without `on_conflict`, whose repeats fail
+        // validation), so the rows a `DELETE ... WHERE` after the append would
+        // remove are exactly the validated rows the predicate is TRUE for. A key
+        // violation still fails the append even on a row retention would delete.
+        // A partitioned upsert also lands here but resolves repeats, so it keeps
+        // the pass after the publish.
+        let (prepared_stream, retention_dropped) = if self.table.key_resolver()?.is_none() {
+            self.table.drop_retention_matches_from_stream(prepared.stream)?
+        } else {
+            (prepared.stream, Arc::default())
+        };
 
         let written = self
             .write_prepared_stream(
@@ -1327,8 +1334,14 @@ impl<'a> AppendMutationWriter<'a> {
             )
             .await?;
         // Report the rows inserted, including those its retention delete removed
-        // in the same publication, as when that delete ran after it.
-        Ok(written.saturating_add(retention_dropped.load(std::sync::atomic::Ordering::Relaxed)))
+        // in the same publication, as when that delete ran after it. Their keys
+        // were validated, and may have been cached as present, but are not stored:
+        // drop the key cache so a later insert of one is not refused.
+        let retention_dropped = retention_dropped.load(Ordering::Relaxed);
+        if retention_dropped > 0 && self.table.primary_key_indices()?.is_some() {
+            self.table.clear_cached_pk_keyset();
+        }
+        Ok(written.saturating_add(retention_dropped))
     }
 
     /// Write a streaming append once, then resolve the keys it repeats across
