@@ -1,0 +1,105 @@
+name: stddev-variance
+description: >
+  Sample and population standard deviation and variance, as aggregates and as
+  window functions, answer through Spice as the source's STDDEV_SAMP,
+  STDDEV_POP, VAR_SAMP and VAR_POP answer over the same rows, for groups of one
+  row and of several, federated and accelerated. A DISTINCT form the source
+  cannot parse is computed by Spice.
+
+sources:
+  src: { kind: '${matrix.src}' }
+
+matrix:
+  src: [mysql, postgres]
+
+variants:
+  federated: {}
+  cayenne: cayenne-file
+
+spicepod:
+  version: v1
+  kind: Spicepod
+  name: stddev-variance
+  datasets:
+    - from: '${sources.src.from_prefix}m${sources.src.from_suffix}'
+      name: m
+      params: ${sources.src.params}
+
+defaults:
+  expect: { oracle: src }
+
+steps:
+  - source-exec:
+      src: |
+        CREATE TABLE m (id INT PRIMARY KEY, g INT NOT NULL, x DOUBLE PRECISION, i INT);
+        INSERT INTO m VALUES
+          (1, 1, 4.0, 4),
+          (2, 2, 1.0, 1), (3, 2, 3.0, 3),
+          (4, 3, 1.0, 1), (5, 3, 2.0, 2), (6, 3, 3.0, 3), (7, 3, 4.0, 4), (8, 3, 10.0, 10),
+          (9, 4, NULL, NULL), (10, 4, 7.0, 7),
+          (11, 5, 2.0, 2), (12, 5, 2.0, 2), (13, 5, 5.0, 5);
+  - start: {}
+
+  - query: SELECT g, stddev(x) AS a, stddev_samp(x) AS b, stddev(i) AS c FROM m GROUP BY g ORDER BY g
+    oracle-sql: SELECT g, STDDEV_SAMP(x), STDDEV_SAMP(x), STDDEV_SAMP(i) FROM m GROUP BY g ORDER BY g
+  - query: SELECT g, stddev_pop(x) AS a, stddev_pop(i) AS b FROM m GROUP BY g ORDER BY g
+    oracle-sql: SELECT g, STDDEV_POP(x), STDDEV_POP(i) FROM m GROUP BY g ORDER BY g
+  - query: SELECT g, var_samp(x) AS a, var_sample(x) AS b, var(i) AS c FROM m GROUP BY g ORDER BY g
+    oracle-sql: SELECT g, VAR_SAMP(x), VAR_SAMP(x), VAR_SAMP(i) FROM m GROUP BY g ORDER BY g
+  - query: SELECT g, var_pop(x) AS a, var_population(i) AS b FROM m GROUP BY g ORDER BY g
+    oracle-sql: SELECT g, VAR_POP(x), VAR_POP(i) FROM m GROUP BY g ORDER BY g
+  - query: SELECT stddev(x), stddev_pop(x), var_samp(x), var_pop(x) FROM m
+    oracle-sql: SELECT STDDEV_SAMP(x), STDDEV_POP(x), VAR_SAMP(x), VAR_POP(x) FROM m
+  - query: SELECT stddev(x), stddev_pop(x), var_samp(x), var_pop(x) FROM m WHERE id = 1
+    oracle-sql: SELECT STDDEV_SAMP(x), STDDEV_POP(x), VAR_SAMP(x), VAR_POP(x) FROM m WHERE id = 1
+  - query: SELECT id, stddev(x) OVER (PARTITION BY g) AS s, var_samp(x) OVER (PARTITION BY g) AS v FROM m ORDER BY id
+    oracle-sql: SELECT id, STDDEV_SAMP(x) OVER (PARTITION BY g), VAR_SAMP(x) OVER (PARTITION BY g) FROM m ORDER BY id
+  - query: SELECT id, stddev(x) OVER (PARTITION BY g) AS s FROM m ORDER BY id
+    oracle-sql: SELECT id, STDDEV_SAMP(x) OVER (PARTITION BY g) FROM m ORDER BY id
+  - query: SELECT id, stddev_pop(x) OVER (PARTITION BY g) AS s, var_pop(x) OVER (PARTITION BY g) AS v FROM m ORDER BY id
+    oracle-sql: SELECT id, STDDEV_POP(x) OVER (PARTITION BY g), VAR_POP(x) OVER (PARTITION BY g) FROM m ORDER BY id
+
+  # MySQL takes DISTINCT in none of these, and neither MySQL nor PostgreSQL
+  # in a window function.
+  - query: SELECT g, stddev_pop(DISTINCT x) AS s FROM m GROUP BY g ORDER BY g
+    expect:
+      rows:
+        - ["1", "0.0"]
+        - ["2", "1.0"]
+        - ["3", "3.1622776601683795"]
+        - ["4", "0.0"]
+        - ["5", "1.5"]
+  - query: SELECT g, stddev(DISTINCT x) AS s, var_samp(DISTINCT x) AS v FROM m GROUP BY g ORDER BY g
+    expect:
+      rows:
+        - ["1", null, null]
+        - ["2", "1.4142135623730951", "2.0"]
+        - ["3", "3.5355339059327378", "12.5"]
+        - ["4", null, null]
+        - ["5", "2.1213203435596424", "4.5"]
+  - query: SELECT g, bit_xor(DISTINCT i) AS b FROM m GROUP BY g ORDER BY g
+    oracle-sql: SELECT g, BIT_XOR(i) FROM (SELECT DISTINCT g, i FROM m) AS d GROUP BY g ORDER BY g
+  - query: SELECT id, count(DISTINCT x) OVER (PARTITION BY g) AS n FROM m ORDER BY id
+    oracle-sql: SELECT m.id, d.n FROM m JOIN (SELECT g, COUNT(DISTINCT x) AS n FROM m GROUP BY g) AS d ON m.g = d.g ORDER BY m.id
+
+  # Sample figures are sent under their standard names, which the source
+  # reads as the sample figures.
+  - explain: SELECT g, stddev(x) AS s, var_samp(x) AS v FROM m GROUP BY g
+    contains: [VirtualExecutionPlan, "stddev_samp(", "var_samp("]
+    only: federated
+  - explain: SELECT id, stddev(x) OVER (PARTITION BY g) AS s, var_samp(x) OVER (PARTITION BY g) AS v FROM m
+    contains: [VirtualExecutionPlan, "stddev_samp(", "var_samp(", ") OVER ("]
+    only: federated
+  - explain: SELECT g, stddev(DISTINCT x) AS s FROM m GROUP BY g
+    contains: [VirtualExecutionPlan]
+    omits: ["(DISTINCT `"]
+    only: federated
+    when: { src: mysql }
+  - explain: SELECT g, stddev(DISTINCT x) AS s FROM m GROUP BY g
+    contains: [VirtualExecutionPlan, "stddev_samp(DISTINCT "]
+    only: federated
+    when: { src: postgres }
+  - explain: SELECT id, count(DISTINCT x) OVER (PARTITION BY g) AS n FROM m
+    contains: [VirtualExecutionPlan]
+    omits: [") OVER ("]
+    only: federated

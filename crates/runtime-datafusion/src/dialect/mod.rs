@@ -346,18 +346,20 @@ fn substr_positions_agree_in_duckdb(args: &[Expr]) -> bool {
 }
 
 /// Whether `expr` is a `/` or `%` whose divisor might be zero, which `DuckDB`
-/// and `DataFusion` answer differently.
+/// and `MySQL` answer differently from `DataFusion`.
 ///
 /// `DataFusion` fails an integer `x / 0` and `x % 0` with a divide-by-zero
-/// error and answers a float `x / 0.0` with an infinity; `DuckDB` answers
-/// `NULL` for all of them. A filter `x / 0 > 1` then keeps no row where the
-/// local engine keeps every positive `x`, and `n / (k - 3)` returns rows
-/// where `DataFusion` fails the query (measured on `DuckDB` v1.4.4). Whether a
-/// divisor is zero is known only for a literal, so a `/` or `%` federates
-/// only when its divisor is a non-zero, finite integer or float literal. A
-/// signed `-1` is refused too: `i64::MIN / -1` overflows, and the two engines
-/// need not report it the same way. Truncation agrees, measured: `DuckDB`
-/// answers `-7 // 2 = -3` and `-7 % 2 = -1` as `DataFusion` does.
+/// error and answers a float `x / 0.0` with an infinity; `DuckDB` and `MySQL`
+/// answer `NULL` for all of them, `MySQL`'s `DIV` included. A filter
+/// `x / 0 > 1` then keeps no row where the local engine keeps every positive
+/// `x`, and `n / (k - 3)` returns rows where `DataFusion` fails the query
+/// (measured on `DuckDB` v1.4.4 and `MySQL` 9.7). Whether a divisor is zero is
+/// known only for a literal, so a `/` or `%` federates only when its divisor
+/// is a non-zero, finite integer or float literal. A signed `-1` is refused
+/// too: `i64::MIN / -1` overflows, and the engines need not report it the same
+/// way. Truncation agrees, measured: `DuckDB` answers `-7 // 2 = -3` and
+/// `-7 % 2 = -1`, and `MySQL` `-7 DIV 2 = -3` and `MOD(-7, 2) = -1`, as
+/// `DataFusion` does.
 #[must_use]
 pub(crate) fn divides_by_a_possible_zero(expr: &Expr) -> bool {
     let Expr::BinaryExpr(binary) = expr else {
@@ -441,7 +443,8 @@ fn integer_value(value: &ScalarValue) -> Option<i128> {
 /// integer `/` stays integer division (#3155). On a `DECIMAL`, both `//` and
 /// `/` answer a `DOUBLE` (~16 significant digits). Federation then casts that
 /// double back to a decimal, so digits past the mantissa look exact and are
-/// wrong. `SQLite` has no decimal type and computes `/` in `REAL`.
+/// wrong. `SQLite` has no decimal type and computes `/` in `REAL`. `MySQL`
+/// rounds the last digit of a decimal quotient where `DataFusion` truncates it.
 ///
 /// Either operand being a decimal is enough: `amt / 3` is decimal division
 /// after type coercion. An operand whose type cannot be read is refused rather
@@ -461,20 +464,63 @@ pub(crate) fn divides_a_decimal(expr: &Expr, scope: Option<&DFSchema>) -> bool {
         .any(|operand| operand_type(operand, scope).is_none_or(|data_type| data_type.is_decimal()))
 }
 
-/// Whether `PostgreSQL` evaluates this non-function expression node the way
-/// `DataFusion` does — today, a cast from a fractional value into an integer is
-/// the one shape it does not (see [`integer_cast_is_renderable`]).
+/// Whether `PostgreSQL` evaluates this expression node the way `DataFusion`
+/// does. [`integer_cast_is_renderable`] refuses a cast from a fractional value
+/// into an integer, which `PostgreSQL` rounds where `DataFusion` truncates;
+/// [`string_timestamp_cast_is_renderable`] refuses a string read as a
+/// timestamp; and [`window_distinct_is_renderable`] refuses a window function
+/// with `DISTINCT`.
 #[must_use]
 pub fn postgres_can_evaluate_expression(expr: &Expr, scope: Option<&DFSchema>) -> bool {
-    integer_cast_is_renderable(expr, scope) && string_timestamp_cast_is_renderable(expr, scope)
+    integer_cast_is_renderable(expr, scope)
+        && string_timestamp_cast_is_renderable(expr, scope)
+        && window_distinct_is_renderable(expr)
+}
+
+/// Whether this is anything but a window function with `DISTINCT`, such as
+/// `count(DISTINCT x) OVER (PARTITION BY g)`. `DataFusion` evaluates one;
+/// `MySQL` refuses it (1235) and `PostgreSQL` fails it with `DISTINCT is not
+/// implemented for window functions` (measured on `MySQL` 9.7 and
+/// `PostgreSQL` 17).
+fn window_distinct_is_renderable(expr: &Expr) -> bool {
+    !matches!(expr, Expr::WindowFunction(window) if window.params.distinct)
 }
 
 /// Whether `MySQL` evaluates this non-function expression node the way
-/// `DataFusion` does — today, a cast from a fractional value into an integer is
-/// the one shape it does not (see [`integer_cast_is_renderable`]).
+/// `DataFusion` does. [`integer_cast_is_renderable`] refuses a cast from a
+/// fractional value into an integer, which `MySQL` rounds where `DataFusion`
+/// truncates; [`string_timestamp_cast_is_renderable`] refuses a string read as
+/// a timestamp; [`divides_a_decimal`] refuses a decimal `/`, whose last digit
+/// `MySQL` rounds where `DataFusion` truncates (`-1.00 / 6.00` is `-0.166667`
+/// against `-0.166666`), and a `/` whose operand types cannot be read, which
+/// the unparser writes as `MySQL`'s exact `/` rather than the integer `DIV`
+/// it needs if the quotient is an integer; [`divides_by_a_possible_zero`]
+/// refuses a `/` or `%` whose divisor could be zero, which `MySQL` answers as
+/// `NULL`; and [`distinct_is_renderable_in_mysql`] refuses a `DISTINCT`
+/// aggregate `MySQL` cannot parse.
 #[must_use]
 pub fn mysql_can_evaluate_expression(expr: &Expr, scope: Option<&DFSchema>) -> bool {
-    integer_cast_is_renderable(expr, scope) && string_timestamp_cast_is_renderable(expr, scope)
+    integer_cast_is_renderable(expr, scope)
+        && string_timestamp_cast_is_renderable(expr, scope)
+        && !divides_a_decimal(expr, scope)
+        && !divides_by_a_possible_zero(expr)
+        && distinct_is_renderable_in_mysql(expr)
+}
+
+/// Whether `MySQL` accepts this aggregate's `DISTINCT`.
+///
+/// It does for `COUNT`, `SUM`, `AVG`, `MIN` and `MAX`. Any other aggregate
+/// with `DISTINCT` — `STDDEV_SAMP(DISTINCT x)`, `VAR_POP(DISTINCT x)`,
+/// `BIT_XOR(DISTINCT x)` — is a syntax error (1064), so a federated query
+/// fails where `DataFusion` answers it (measured on `MySQL` 9.7). A window
+/// function takes no `DISTINCT` at all ([`window_distinct_is_renderable`]).
+fn distinct_is_renderable_in_mysql(expr: &Expr) -> bool {
+    match expr {
+        Expr::AggregateFunction(AggregateFunction { func, params }) => {
+            !params.distinct || matches!(func.name(), "count" | "sum" | "avg" | "min" | "max")
+        }
+        _ => window_distinct_is_renderable(expr),
+    }
 }
 
 /// Whether an engine parses the string this cast reads into the instant

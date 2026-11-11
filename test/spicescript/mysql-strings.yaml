@@ -1,8 +1,10 @@
-name: mysql-string-length
+name: mysql-strings
 description: >
   String length counts Unicode characters, including through aliases and
-  filters. Binary length counts bytes. Federated results agree with MySQL's
-  explicit character and byte functions and with Cayenne over the same rows.
+  filters. Binary length counts bytes. `||` concatenates, and is NULL when
+  either operand is NULL, in projections and filters. Federated results agree
+  with MySQL's explicit character, byte and CONCAT functions and with Cayenne
+  over the same rows.
 
 sources:
   src: { kind: mysql }
@@ -14,7 +16,7 @@ variants:
 spicepod:
   version: v1
   kind: Spicepod
-  name: mysql-string-length
+  name: mysql-strings
   datasets:
     - from: mysql:lengths
       name: lengths
@@ -52,3 +54,17 @@ steps:
     oracle-sql: SELECT id, CASE WHEN id = 1 THEN 0 ELSE LENGTH(b) END AS n FROM lengths ORDER BY id
   - query: SELECT id, CASE WHEN length(s) > 1 THEN length(s) END AS n FROM lengths ORDER BY id
     oracle-sql: SELECT id, CASE WHEN CHAR_LENGTH(s) > 1 THEN CHAR_LENGTH(s) END AS n FROM lengths ORDER BY id
+  # MySQL reads `||` as logical OR under its default sql_mode (#16225).
+  - query: SELECT id, coalesce(s, '') || ', ' || coalesce(s, '') AS v FROM lengths ORDER BY id
+    oracle-sql: SELECT id, CONCAT(coalesce(s, ''), ', ', coalesce(s, '')) AS v FROM lengths ORDER BY id
+  - query: SELECT id, 'a' || s AS v FROM lengths ORDER BY id
+    oracle-sql: SELECT id, CONCAT('a', s) AS v FROM lengths ORDER BY id
+  - query: SELECT id, 'n' || id AS v FROM lengths ORDER BY id
+    oracle-sql: SELECT id, CONCAT('n', id) AS v FROM lengths ORDER BY id
+  - query: SELECT id FROM lengths WHERE s || 'x' = 'naïvex' ORDER BY id
+    oracle-sql: SELECT id FROM lengths WHERE CONCAT(s, 'x') = 'naïvex' ORDER BY id
+  - query: SELECT id FROM lengths WHERE char_length(s || s) = 4 ORDER BY id
+    oracle-sql: SELECT id FROM lengths WHERE CHAR_LENGTH(CONCAT(s, s)) = 4 ORDER BY id
+  - explain: SELECT id FROM lengths WHERE s || 'x' = 'naïvex'
+    contains: [VirtualExecutionPlan, "CONCAT(`lengths`.`s`, 'x')"]
+    only: federated

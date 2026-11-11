@@ -125,8 +125,9 @@ fn supports_expression(expr: &Expr, schema: Option<&DFSchema>) -> bool {
             .iter()
             .all(|arg| non_decimal(arg, scope)),
         // Native decimal SUM widens to a precision the driver cannot decode;
-        // decimal AVG returns a rounded Float64. Windows have the same result
-        // types as their corresponding ordinary aggregate.
+        // decimal AVG returns a rounded Float64, and the standard deviation and
+        // variance answer `nan` for NULL. Windows have the same result types as
+        // their corresponding ordinary aggregate.
         Expr::AggregateFunction(aggregate) => {
             aggregate_args_supported(aggregate.func.name(), &aggregate.params.args, scope)
         }
@@ -158,6 +159,12 @@ fn non_decimal(expr: &Expr, scope: &DFSchema) -> bool {
 }
 
 fn aggregate_args_supported(name: &str, args: &[Expr], scope: &DFSchema) -> bool {
+    // ClickHouse answers `nan` where DataFusion answers NULL: for the sample
+    // standard deviation and variance of one row, and for all four over no rows
+    // of a non-`Nullable` column.
+    if matches!(name, "stddev" | "stddev_pop" | "var" | "var_pop") {
+        return false;
+    }
     if !name.eq_ignore_ascii_case("sum") && !name.eq_ignore_ascii_case("avg") {
         return true;
     }

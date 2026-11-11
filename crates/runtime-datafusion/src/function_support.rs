@@ -574,9 +574,12 @@ fn sqlite_cast_is_faithful(from: &DataType, to: &DataType) -> bool {
 /// strips repetitions of `chars` as a *string*, where `btrim` strips any
 /// character in it — so a rewrite would trade a failed query for wrong rows.
 ///
-/// A cast from a fractional value into an integer stays local too, because
-/// `MySQL` rounds it where `DataFusion` truncates
-/// ([`crate::dialect::mysql_can_evaluate_expression`]).
+/// Arithmetic `MySQL` evaluates differently stays local too
+/// ([`crate::dialect::mysql_can_evaluate_expression`]): a cast from a
+/// fractional value into an integer and a decimal `/`, which `MySQL` rounds
+/// where `DataFusion` truncates, a `/` or `%` whose divisor might be zero,
+/// which `MySQL` answers with `NULL` where `DataFusion` fails the query, and a
+/// `DISTINCT` aggregate `MySQL` cannot parse, such as `stddev(DISTINCT x)`.
 #[must_use]
 pub fn deny_spice_functions_for_mysql_table_providers() -> FunctionSupport {
     FunctionSupportBuilder::new()
@@ -612,7 +615,8 @@ pub const POSTGRES_PUSHABLE_ARRAY_FUNCTIONS: &[&str] = &[
 /// `PostgreSQL` connector's federation deny-list. See issue #10703.
 ///
 /// A cast from a fractional value into an integer stays local too, because
-/// `PostgreSQL` rounds it where `DataFusion` truncates
+/// `PostgreSQL` rounds it where `DataFusion` truncates, and so does a window
+/// function with `DISTINCT`, which `PostgreSQL` does not implement
 /// ([`crate::dialect::postgres_can_evaluate_expression`]).
 #[must_use]
 pub fn deny_spice_functions_for_postgres_table_providers() -> FunctionSupport {
