@@ -203,36 +203,56 @@ async fn install_nightly(ctx: &RuntimeContext, date: Option<NaiveDate>, force: b
         .await
         .map_err(failed)?;
 
-    if !force
-        && let Ok(installed_version) = ctx.managed_runtime_version()
-        && installed_version.contains(&build.version_marker())
-    {
+    // Each binary is checked on its own: a run that installed the runtime and then failed on
+    // the CLI leaves only the CLI to install.
+    let marker = build.version_marker();
+    let runtime_current = !force
+        && ctx
+            .managed_runtime_version()
+            .is_ok_and(|installed| installed.contains(&marker));
+    let cli_current = !force && super::version::cli_version().contains(&marker);
+    if runtime_current && cli_current {
         tracing::info!("Spice nightly {} already installed", build.describe());
         crate::context::warn_if_install_will_not_run(ctx);
         return Ok(());
     }
 
     tracing::info!("Installing Spice nightly {}...", build.describe());
-    let spiced = nightly::download_binary(&client, &build.runtime, "spiced")
-        .await
-        .map_err(failed)?;
     let spiced_path = ctx.spiced_path();
-    install_binary(&spiced, &spiced_path).map_err(|e| crate::error::Error::NightlyInstall {
-        message: format!("Failed to write {}: {e}", spiced_path.display()),
-    })?;
-    let cli = nightly::download_binary(&client, &build.cli, "spice")
-        .await
-        .map_err(failed)?;
-    let cli_path = replace_current_exe(&cli).map_err(|e| failed(NightlyError::GitHub(e)))?;
+    if !runtime_current {
+        let spiced = nightly::download_binary(&client, &build.runtime, "spiced")
+            .await
+            .map_err(failed)?;
+        install_binary(&spiced, &spiced_path).map_err(|e| crate::error::Error::NightlyInstall {
+            message: format!("Failed to write {}: {e}", spiced_path.display()),
+        })?;
+    }
+    let cli_path = if cli_current {
+        std::env::current_exe().unwrap_or_default()
+    } else {
+        let cli = nightly::download_binary(&client, &build.cli, "spice")
+            .await
+            .map_err(failed)?;
+        replace_current_exe(&cli).map_err(|e| failed(NightlyError::GitHub(e)))?
+    };
 
     let version_file = ctx.spice_runtime_dir().join("runtime_version.txt");
     std::fs::write(&version_file, format!("{}\n", build.version_marker())).ok();
-    tracing::info!(
-        "Spice nightly {} installed: the runtime at {} and the CLI at {}",
-        build.describe(),
-        spiced_path.display(),
-        cli_path.display()
-    );
+    let (runtime, cli) = (spiced_path.display(), cli_path.display());
+    match (runtime_current, cli_current) {
+        (true, _) => tracing::info!(
+            "Spice nightly {} installed: the CLI at {cli}; the runtime at {runtime} already was this build",
+            build.describe()
+        ),
+        (_, true) => tracing::info!(
+            "Spice nightly {} installed: the runtime at {runtime}; the CLI at {cli} already was this build",
+            build.describe()
+        ),
+        _ => tracing::info!(
+            "Spice nightly {} installed: the runtime at {runtime} and the CLI at {cli}",
+            build.describe()
+        ),
+    }
     crate::context::warn_if_install_will_not_run(ctx);
     Ok(())
 }
