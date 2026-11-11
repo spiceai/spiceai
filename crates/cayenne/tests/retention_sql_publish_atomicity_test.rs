@@ -2058,7 +2058,6 @@ async fn maintained_aggregate_is_not_served_stale_after_resident_retention_impl(
 /// defers them while it lives, the plan reads the previous generation, and
 /// once it is dropped cleanup removes them.
 #[test]
-#[ignore = "RED, open: the previous generation's file survives reader drop + next commit + sweep (green35-old_reader_pins.out)"]
 fn old_reader_pins_its_generation_until_dropped_sqlite() -> Result<(), String> {
     common::run_with_backend_blocking(
         common::BackendType::Sqlite,
@@ -2089,6 +2088,10 @@ async fn old_reader_pins_its_generation_until_dropped_impl(
     fixture: common::TestFixture,
 ) -> Result<(), Box<dyn std::error::Error>> {
     use datafusion::logical_expr::{ColumnarValue, Volatility, create_udf};
+    // The sweep keeps a snapshot dir for `SNAPSHOT_CLEANUP_GRACE` (5 s) measured
+    // from the dir's uuid7 creation time, which no test hook moves; waiting past
+    // it is what separates "pinned by the reader" from "still inside its grace".
+    const PAST_GRACE: std::time::Duration = std::time::Duration::from_millis(5_600);
     let gone = Arc::new(AtomicBool::new(false));
     let flag = Arc::clone(&gone);
     let udf = create_udf(
@@ -2132,25 +2135,24 @@ async fn old_reader_pins_its_generation_until_dropped_impl(
 
     gone.store(true, Ordering::SeqCst);
     common::insert_batch(t.as_ref(), rows(&[(3, Some("active"))])).await?;
-    let cleanup = || async {
-        for _ in 0..3 {
-            t.elapse_snapshot_cleanup_grace();
-            t.sweep_retired_snapshot_dirs_now().await;
-            t.flush_pending_maintenance().await?;
-            tokio::time::sleep(std::time::Duration::from_millis(250)).await;
-        }
-        Ok::<_, Box<dyn std::error::Error>>(())
-    };
-    cleanup().await?;
-    let now_files = vortex_files(&dir);
-    let kept_while_pinned = old_files.iter().all(|f| now_files.contains(f));
-    eprintln!(
-        "old files {} kept while the plan lives: {kept_while_pinned}",
-        old_files.len()
+    let new_files = vortex_files(&dir);
+    assert!(
+        old_files.iter().all(|f| new_files.contains(f)),
+        "precondition: inside the grace nothing is swept"
     );
+
+    // Past the grace, with the plan alive: a sweep (forced, plus the re-arm
+    // timer's) must keep the previous generation for the reader.
+    tokio::time::sleep(PAST_GRACE).await;
+    t.elapse_snapshot_cleanup_grace();
+    t.sweep_retired_snapshot_dirs_now().await;
+    t.flush_pending_maintenance().await?;
+    let pinned_files = vortex_files(&dir);
+    let kept_while_pinned = old_files.iter().all(|f| pinned_files.contains(f));
+    eprintln!("past grace, plan alive: previous generation kept = {kept_while_pinned}");
     assert!(
         kept_while_pinned,
-        "cleanup defers the previous generation while a reader holds it"
+        "the reader pins its generation past the grace"
     );
 
     let old = datafusion::physical_plan::collect(old_plan, ctx.task_ctx()).await?;
@@ -2173,13 +2175,18 @@ async fn old_reader_pins_its_generation_until_dropped_impl(
         "a new reader reads the new generation"
     );
 
-    drop(old);
-    // The next commit's sweep reclaims what the reader deferred.
+    // Reader gone (its plan was consumed by `collect`). Past the grace of the
+    // listing that read just made, the next commit's sweep reclaims it.
+    tokio::time::sleep(PAST_GRACE).await;
+    gone.store(false, Ordering::SeqCst);
     common::insert_batch(t.as_ref(), rows(&[(4, Some("active"))])).await?;
-    cleanup().await?;
+    t.flush_pending_maintenance().await?;
+    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
     let after = vortex_files(&dir);
     let remaining: Vec<_> = old_files.iter().filter(|f| after.contains(*f)).collect();
-    eprintln!("old files remaining after the reader is dropped: {remaining:?}");
+    eprintln!(
+        "after reader drop + grace + commit: remaining previous-generation files {remaining:?}"
+    );
     assert!(
         remaining.is_empty(),
         "the previous generation is removed once unpinned"
