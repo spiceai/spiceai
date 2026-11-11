@@ -451,6 +451,15 @@ pub trait MetadataCatalog: Send + Sync {
     /// stay pending. No default, as for [`Self::commit_pending`].
     async fn commit_pending_for(&self, table_id: &str) -> CatalogResult<()>;
 
+    /// Whether this catalog commits a dataset's source position in the same
+    /// record as the data it covers. When it does, a CDC write stages its
+    /// position with its changes, and a checkpoint records the position before
+    /// [`Self::commit_pending_for`], so the source is acknowledged only once both
+    /// are durable together. Otherwise the source's own checkpoint store saves
+    /// the position after the data commits. No default, as for
+    /// [`Self::commit_pending`].
+    fn commits_source_positions(&self) -> bool;
+
     /// Page undelivered write-back markers by sequence and primary key.
     async fn list_pending_write_back(
         &self,

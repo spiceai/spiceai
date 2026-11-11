@@ -14,12 +14,11 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-//! Prototype of the object-native Cayenne metastore's record format: typed
-//! actions in Protocol Buffers, the dataset state, a deterministic `apply`,
-//! and the sizes the design's decisions depend on.
+//! The object-native Cayenne metastore's record format: typed actions in
+//! Protocol Buffers, the dataset state, a deterministic `apply`, and the
+//! checkpoint that encodes a state as one record.
 
 pub mod proto;
-pub mod size;
 pub mod state;
 
 pub use proto::{Action, ObjRef, Record, action::Kind};

@@ -504,7 +504,7 @@ pub struct CayenneAccelerator {
     /// The object-native catalog, beside [`Self::catalog`]: with
     /// `runtime.params.cayenne_vnext: enabled`, new datasets go here while
     /// datasets already in the SQL metastore stay there.
-    native_catalog: Arc<OnceCell<Arc<dyn cayenne::MetadataCatalog>>>,
+    native_catalog: Arc<OnceCell<Arc<cayenne::metastore::object_native::ObjectNativeCatalog>>>,
     /// Datasets already told that they stay on SQLite under `cayenne_vnext`, so
     /// the line is logged once per dataset, not on every metastore lookup.
     vnext_notices: parking_lot::Mutex<HashSet<String>>,
@@ -3218,7 +3218,8 @@ impl CayenneAccelerator {
                     metadata_dir,
                     source,
                 )
-                .await;
+                .await
+                .map(|catalog| catalog as Arc<dyn cayenne::MetadataCatalog>);
             }
             _ => format!("sqlite://{metadata_dir}/{METASTORE_DB_FILE}"),
         };
@@ -3279,10 +3280,10 @@ impl CayenneAccelerator {
     /// `runtime.state.location` set, its head log is kept in the location's
     /// `cayenne/v1/` folder; otherwise in `{metadata_dir}/object_native`.
     async fn init_object_native_catalog(
-        cell: &OnceCell<Arc<dyn cayenne::MetadataCatalog>>,
+        cell: &OnceCell<Arc<cayenne::metastore::object_native::ObjectNativeCatalog>>,
         metadata_dir: &str,
         source: &dyn AccelerationSource,
-    ) -> Result<Arc<dyn cayenne::MetadataCatalog>> {
+    ) -> Result<Arc<cayenne::metastore::object_native::ObjectNativeCatalog>> {
         let directory = PathBuf::from(metadata_dir).join("object_native");
         let state = source.app().runtime.state.clone();
         let secrets = source.secrets();
@@ -3338,13 +3339,12 @@ impl CayenneAccelerator {
                 native
                     .boxed()
                     .context(AccelerationInitializationFailedSnafu)?,
-            ) as Arc<dyn cayenne::MetadataCatalog>;
-            catalog
-                .init()
+            );
+            cayenne::MetadataCatalog::init(catalog.as_ref())
                 .await
                 .boxed()
                 .context(AccelerationInitializationFailedSnafu)?;
-            Ok::<Arc<dyn cayenne::MetadataCatalog>, Error>(catalog)
+            Ok::<_, Error>(catalog)
         })
         .await
         .map(Arc::clone)
@@ -4379,12 +4379,12 @@ impl DataAccelerator for CayenneAccelerator {
                             .into(),
                     });
                 }
-                let catalog = self
-                    .get_or_create_catalog(&metadata_dir, "object_native", source)
-                    .await
-                    .map_err(|source| CheckpointError::Store {
-                        source: Box::new(source),
-                    })?;
+                let catalog =
+                    Self::init_object_native_catalog(&self.native_catalog, &metadata_dir, source)
+                        .await
+                        .map_err(|source| CheckpointError::Store {
+                            source: Box::new(source),
+                        })?;
                 return Ok(Arc::new(native_sidecar::NativeSidecar::new(
                     catalog,
                     source.name().to_string(),

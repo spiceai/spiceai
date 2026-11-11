@@ -126,6 +126,11 @@ impl MetadataCatalog for DatasetStateReader {
         Ok(())
     }
 
+    fn commits_source_positions(&self) -> bool {
+        // Read-only: it commits nothing, positions included.
+        false
+    }
+
     fn as_any(&self) -> &dyn std::any::Any {
         self
     }

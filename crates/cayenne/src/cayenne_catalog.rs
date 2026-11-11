@@ -2343,6 +2343,11 @@ impl MetadataCatalog for CayenneCatalog {
         Ok(())
     }
 
+    fn commits_source_positions(&self) -> bool {
+        // Positions are saved by the `SQLite` sidecar, after the data commits.
+        false
+    }
+
     fn as_any(&self) -> &dyn std::any::Any {
         self
     }

@@ -37742,14 +37742,11 @@ impl CayenneTableProvider {
     /// a handle.
     pub(crate) async fn fire_slot_advancer(&self, durable_epoch: u64) {
         let advancer = self.slot_advancer.lock().clone();
-        // The object-native metastore commits the source position in the same
-        // record as the data it covers: staged here, committed just below, and
-        // only then acknowledged at the source.
+        // A metastore that commits the source position in the same record as the
+        // data it covers stages it here; it commits just below, and only then is
+        // the source acknowledged.
         if let Some(advancer) = &advancer
-            && self
-                .catalog()
-                .as_any()
-                .is::<crate::metastore::object_native::ObjectNativeCatalog>()
+            && self.catalog().commits_source_positions()
             && let Err(error) =
                 crate::catalog::with_deferred_commits(advancer.record_position(durable_epoch)).await
         {

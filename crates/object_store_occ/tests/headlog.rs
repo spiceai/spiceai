@@ -507,7 +507,7 @@ async fn headlog_missing_listed_batch_is_an_error_for_open_and_poll() {
 #[tokio::test]
 async fn headlog_creates_each_sealed_batch_once() {
     for backend in backends() {
-        let store = Arc::new(object_store_occ::sim::fault::FaultStore::new(Arc::clone(
+        let store = Arc::new(object_store_sim::fault::FaultStore::new(Arc::clone(
             &backend.store,
         )));
         let shared: Arc<dyn ObjectStore> = Arc::clone(&store) as Arc<dyn ObjectStore>;
@@ -530,7 +530,7 @@ async fn headlog_creates_each_sealed_batch_once() {
             .log()
             .into_iter()
             .filter(|applied| {
-                applied.op == object_store_occ::sim::Op::Create
+                applied.op == object_store_sim::Op::Create
                     && applied.path.as_ref().contains("/wal/")
             })
             .map(|applied| applied.path.to_string())

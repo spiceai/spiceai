@@ -3730,6 +3730,7 @@ dependencies = [
  "loom",
  "object_store 0.13.2",
  "object_store_occ",
+ "object_store_sim",
  "opentelemetry 0.32.0",
  "opentelemetry_sdk 0.32.1",
  "parking_lot",
@@ -14043,6 +14044,7 @@ dependencies = [
  "cayenne-metastore-model",
  "futures",
  "object_store 0.13.2",
+ "object_store_sim",
  "parking_lot",
  "prost 0.14.3",
  "rand 0.10.1",
@@ -14054,6 +14056,19 @@ dependencies = [
  "tokio",
  "tracing",
  "uuid 1.23.2",
+]
+
+[[package]]
+name = "object_store_sim"
+version = "2.5.0-unstable"
+dependencies = [
+ "async-trait",
+ "bytes",
+ "futures",
+ "object_store 0.13.2",
+ "parking_lot",
+ "rand 0.10.1",
+ "tokio",
 ]
 
 [[package]]

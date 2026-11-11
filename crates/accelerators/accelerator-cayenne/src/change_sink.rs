@@ -186,11 +186,7 @@ impl CayenneChangeSinkBackend {
         positions: Vec<PositionWrite>,
     ) -> Result<BackendWrite> {
         let same_record = !positions.is_empty()
-            && self
-                .table
-                .catalog()
-                .as_any()
-                .is::<cayenne::metastore::object_native::ObjectNativeCatalog>()
+            && self.table.catalog().commits_source_positions()
             && !group_into_sub_batches(&batch)
                 .iter()
                 .any(|(op, _)| matches!(op, ChangeOperationType::Truncate));

@@ -14,11 +14,17 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-//! Store wrappers for experiments and tests: injected latency, and (in
-//! a sibling module) injected faults. Results measured through [`LatencyStore`] are
-//! simulated latency, never an object store's own numbers.
+//! `object_store_occ` integration tests, linked once.
+//!
+//! Each `tests/<name>.rs` is a module here rather than its own test target, so
+//! the crate's dependencies are linked once instead of once per file.
 
-pub mod fault;
-pub mod latency;
-
-pub use latency::{LatencyProfile, LatencyStore, Op};
+mod fault;
+mod headlog;
+mod headlog_replay;
+mod local_cancellation;
+mod local_root_overlap;
+mod prefix_listing;
+mod s3_integration;
+mod state_store;
+mod transactional_wal;

@@ -14,7 +14,8 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-//! The sidecar stores of a dataset under `cayenne_metastore: object_native`.
+//! The sidecar stores of a dataset in the object-native metastore, which
+//! `runtime.params.cayenne_vnext: enabled` selects.
 //!
 //! The runtime's bookkeeping for a dataset (a CDC connector's applied position, the
 //! dataset schema checkpoint) is committed through the same head log as the
@@ -30,7 +31,7 @@ use std::{
 
 use arrow::datatypes::SchemaRef;
 use async_trait::async_trait;
-use cayenne::{MetadataCatalog, metastore::object_native::ObjectNativeCatalog};
+use cayenne::metastore::object_native::ObjectNativeCatalog;
 use runtime_acceleration::{
     dataset_checkpoint::{DatasetCheckpointer, deserialize_schema, serialize_schema},
     sidecar::AcceleratorSidecar,
@@ -56,21 +57,14 @@ fn store_error(source: impl Into<Box<dyn std::error::Error + Send + Sync>>) -> C
 /// The keyed-value view of the native catalog both stores write through.
 #[derive(Clone)]
 struct Values {
-    catalog: Arc<dyn MetadataCatalog>,
+    catalog: Arc<ObjectNativeCatalog>,
     key: String,
 }
 
 impl Values {
-    fn native(&self) -> Result<&ObjectNativeCatalog, CheckpointError> {
-        self.catalog
-            .as_any()
-            .downcast_ref::<ObjectNativeCatalog>()
-            .ok_or_else(|| store_error("the dataset's catalog is not object-native"))
-    }
-
     async fn get(&self) -> Result<Option<Value>, CheckpointError> {
         match self
-            .native()?
+            .catalog
             .sidecar_value(&self.key)
             .await
             .map_err(store_error)?
@@ -87,21 +81,21 @@ impl Values {
         offsets: &[KafkaOffset],
     ) -> Result<(), CheckpointError> {
         let bytes = serde_json::to_vec(value).map_err(store_error)?;
-        self.native()?
+        self.catalog
             .set_sidecar_value_and_counters(&self.key, Some(Some(bytes)), &offset_counters(offsets))
             .await
             .map_err(store_error)
     }
 
     async fn advance_offsets(&self, offsets: &[KafkaOffset]) -> Result<(), CheckpointError> {
-        self.native()?
+        self.catalog
             .advance_sidecar_counters(&self.key, &offset_counters(offsets))
             .await
             .map_err(store_error)
     }
 
     async fn offsets(&self) -> Result<Vec<KafkaOffset>, CheckpointError> {
-        self.native()?
+        self.catalog
             .sidecar_counters(&self.key)
             .await
             .map_err(store_error)?
@@ -124,7 +118,7 @@ impl Values {
             .map(serde_json::to_vec)
             .transpose()
             .map_err(store_error)?;
-        self.native()?
+        self.catalog
             .set_sidecar_value(&self.key, bytes)
             .await
             .map_err(store_error)
@@ -156,12 +150,12 @@ fn time_of(value: &Value, field: &str) -> Option<SystemTime> {
 
 /// One dataset's sidecar in the native catalog.
 pub(crate) struct NativeSidecar {
-    catalog: Arc<dyn MetadataCatalog>,
+    catalog: Arc<ObjectNativeCatalog>,
     dataset_name: String,
 }
 
 impl NativeSidecar {
-    pub(crate) fn new(catalog: Arc<dyn MetadataCatalog>, dataset_name: String) -> Self {
+    pub(crate) fn new(catalog: Arc<ObjectNativeCatalog>, dataset_name: String) -> Self {
         Self {
             catalog,
             dataset_name,

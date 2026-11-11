@@ -1336,6 +1336,10 @@ impl MetadataCatalog for ObjectNativeCatalog {
     async fn commit_pending_for(&self, table_id: &str) -> CatalogResult<()> {
         self.for_table(table_id).commit_pending_for(table_id).await
     }
+
+    fn commits_source_positions(&self) -> bool {
+        true
+    }
     async fn list_pending_write_back(
         &self,
         table_id: &str,

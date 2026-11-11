@@ -29,12 +29,10 @@ use cayenne::{
     metastore::object_native::{NativeCatalogConfig, ObjectNativeCatalog, dataset_log_at},
 };
 use object_store::{ObjectStore, memory::InMemory, path::Path};
-use object_store_occ::{
-    headlog::Reader,
-    sim::{
-        Op,
-        fault::{Fault, FaultStore},
-    },
+use object_store_occ::headlog::Reader;
+use object_store_sim::{
+    Op,
+    fault::{Fault, FaultStore},
 };
 
 type Setup = (

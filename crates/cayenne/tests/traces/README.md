@@ -29,18 +29,13 @@ The `no-reader-log` control has no counterpart: the prototype's readers never
 read the decision object. `no-owner-resolve` removes a capability rather than
 breaking an invariant, and the positive set already reaches a non-owner
 `Resolve` after turnover. `no-roots` removes a participant's staged objects
-while it is prepared; that is the head log's own GC, which the replay counts
-rather than drives.
+while it is prepared; the head log keeps all history and collects nothing, so
+the replay counts it rather than drives it.
 
 ## Coverage
 
 Every trace replays to its end on both backends: the model writes a `Prepare`
-only under the coordinator's lease, as the prototype does. On 2026-11-01 the
-positive set replayed 58 trace-backend pairs: 166 records landed, 22 fenced
-deliveries refused, 92 takeovers, 84 decisions (including the coordinator's
-abort at its deadline), 22 reports of the outcome by the coordinator, 22
-removals by the coordinator and 32 by another process (including decisions
-recreated after a removal).
+only under the coordinator's lease, as the prototype does.
 
 A `Report` is the prototype's `confirmed_outcome`, which `commit_across` reports
 by. The coordinator's retries until the deadline, the switch to an abort and the
@@ -61,15 +56,11 @@ requires every guarantee to hold; where the breaking step is a record, a
 decision or a removal, the prototype refuses it. With the matching safeguard
 removed from the prototype, each reports the broken guarantee instead:
 
-| Safeguard removed | Test | Reported | Date |
-|---|---|---|---|
-| reservation guard in `DatasetState::apply` | control_reservation | `step 5 Deliver(1, 1): reservation: a write landed on a prepared table` | 2026-11-01 |
-| `Resolve` matching guard | control_matching | `step 4 Deliver(1, 1): matching: a Resolve landed without its Prepare` | 2026-11-01 |
-| decision create-if-absent (overwrite instead) | control_create_once | `step 10 Decide(1): create-once: the recorded decision changed` | 2026-11-01 |
-| lease check in `remove_if_finished` | control_fence_check | `step 4 Deliver(1, 0): records: participant 1 holds the transaction prepared and its records are gone` | 2026-11-01 |
-| prepared check in `remove_if_finished` | control_prepared_check | `step 5 Forget(1): records: participant 0 holds the transaction prepared and its records are gone` | 2026-11-01 |
-| intent check in `confirmed_outcome` | control_intent_check | `step 15 Report: report: the coordinator reports true where the decision is false` | 2026-11-01 |
-
-The first three were run against an earlier trace set (commit a592a4c3f3),
-the next two against the trace set before the coordinator's deadline, and the
-last against this one.
+| Safeguard removed | Test | Reported |
+|---|---|---|
+| reservation guard in `DatasetState::apply` | control_reservation | `step 5 Deliver(1, 1): reservation: a write landed on a prepared table` |
+| `Resolve` matching guard | control_matching | `step 4 Deliver(1, 1): matching: a Resolve landed without its Prepare` |
+| decision create-if-absent (overwrite instead) | control_create_once | `step 10 Decide(1): create-once: the recorded decision changed` |
+| lease check in `remove_if_finished` | control_fence_check | `step 4 Deliver(1, 0): records: participant 1 holds the transaction prepared and its records are gone` |
+| prepared check in `remove_if_finished` | control_prepared_check | `step 5 Forget(1): records: participant 0 holds the transaction prepared and its records are gone` |
+| intent check in `confirmed_outcome` | control_intent_check | `step 15 Report: report: the coordinator reports true where the decision is false` |

@@ -13,7 +13,8 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-//! SQL-free catalog backed by a catalog-wide conditional-write head log.
+//! SQL-free catalog backed by conditional-write head logs: one for the name
+//! registry and one per dataset.
 
 use super::{actions, state_reader::DatasetStateReader};
 use crate::{
@@ -865,6 +866,10 @@ impl MetadataCatalog for Domain {
 
     async fn commit_pending_for(&self, table_id: &str) -> CatalogResult<()> {
         self.inner.take().await.flush_table(table_id).await
+    }
+
+    fn commits_source_positions(&self) -> bool {
+        true
     }
 
     async fn commit_publications(

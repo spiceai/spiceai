@@ -189,7 +189,12 @@ jobs:
           echo "$RUNNER_TEMP/wal-oracle/bin" >> "$GITHUB_PATH"
       - name: Test state protocol and cancellation
         if: matrix.store == 'disk'
-        run: cargo test --locked --profile dev -p object_store_occ --lib --test state_store --test transactional_wal --test local_cancellation -- --nocapture
+        # The test-name filters select integration modules; the library's own
+        # tests run unfiltered in the first command.
+        run: |
+          set -euo pipefail
+          cargo test --locked --profile dev -p object_store_occ --lib -- --nocapture
+          cargo test --locked --profile dev -p object_store_occ --test integration -- --nocapture state_store:: transactional_wal:: local_cancellation::
       - name: Build the process worker
         run: cargo build --locked --profile dev -p object_store_occ --example wal_test_driver
 
@@ -376,7 +381,7 @@ jobs:
         env:
           AWS_S3_BUCKET: ${{ env.WAL_BUCKET }}
           AWS_S3_PREFIX: ${{ env.WAL_PREFIX }}/s3_integration
-        run: cargo test --locked --profile dev -p object_store_occ --test s3_integration -- --nocapture
+        run: cargo test --locked --profile dev -p object_store_occ --test integration -- --nocapture s3_integration::
       - name: Run process histories against ${{ matrix.store }}
         timeout-minutes: 30
         env:

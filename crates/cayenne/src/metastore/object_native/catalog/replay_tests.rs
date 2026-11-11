@@ -34,7 +34,8 @@ limitations under the License.
 //! them, which `commit_across` does only after every `Prepare` it sent has
 //! returned: the replay refuses it while the model's coordinator has one in
 //! flight, and otherwise removes the records. `Gc` collects a participant's
-//! staged objects, which the head log's own GC does, so it is counted.
+//! staged objects; the head log keeps all history and collects nothing, so it
+//! is counted, not driven.
 //!
 //! Each `Check`, identical retry and lost response of one write is the head
 //! log's own protocol, which the `commits` and `source-positions` replays in
