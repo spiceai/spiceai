@@ -1018,7 +1018,7 @@ impl CayenneTableProvider {
         // primary key publishes one) would not be carried, and the flip clears
         // their catalog entries, so the append is refused rather than dropping
         // them. Nothing is published.
-        if !self.protected_snapshots.load().is_empty() {
+        if self.has_protected_snapshots() {
             return Err(internal(
                 "retention_sql append to a table without a primary key whose rows include \
                  protected snapshots (a transactional write) is not supported: carrying only \
