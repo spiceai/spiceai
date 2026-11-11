@@ -2198,3 +2198,109 @@ async fn old_reader_pins_its_generation_until_dropped_impl(
     );
     Ok(())
 }
+
+/// A post-write retention maintenance pass and a publication cannot interleave:
+/// the pass is held inside its predicate (on its own thread) while an append is
+/// started; the append does not publish until the pass finishes, and the final
+/// generation is the same whichever completes first — no resurrected row, no
+/// deletion applied to the wrong generation. Run with the pass succeeding and
+/// with the pass failing (its failure leaves the append's publication intact).
+#[test]
+fn maintenance_pass_and_append_are_serialized_sqlite() -> Result<(), String> {
+    common::run_with_backend_blocking(
+        common::BackendType::Sqlite,
+        maintenance_pass_and_append_are_serialized_impl,
+    )
+}
+
+async fn maintenance_pass_and_append_are_serialized_impl(
+    fixture: common::TestFixture,
+) -> Result<(), Box<dyn std::error::Error>> {
+    use datafusion::logical_expr::{ColumnarValue, Volatility, create_udf};
+    use std::sync::Mutex;
+    use std::sync::mpsc;
+    const RACER: &str = "rsql-maintenance-racer";
+    for (name, fail_pass) in [("rsql_race_ok", false), ("rsql_race_fail", true)] {
+        let aged = Arc::new(AtomicBool::new(false));
+        let (entered_tx, entered_rx) = mpsc::channel::<()>();
+        let (release_tx, release_rx) = mpsc::channel::<()>();
+        let gate = Arc::new(Mutex::new(Some((entered_tx, release_rx))));
+        let (a, g) = (Arc::clone(&aged), Arc::clone(&gate));
+        let udf = create_udf(
+            "aged",
+            vec![DataType::Utf8],
+            DataType::Boolean,
+            Volatility::Volatile,
+            Arc::new(move |args: &[ColumnarValue]| {
+                let on_racer = std::thread::current().name() == Some(RACER);
+                if on_racer && let Some((entered, release)) = g.lock().expect("gate").take() {
+                    entered.send(()).expect("entered");
+                    release.recv().expect("release");
+                    if fail_pass {
+                        return Err(datafusion::error::DataFusionError::Execution(
+                            "maintenance pass fails".to_string(),
+                        ));
+                    }
+                }
+                let array = args[0].clone().into_array(1)?;
+                let values = array.as_any().downcast_ref::<StringArray>().expect("utf8");
+                let on = a.load(Ordering::SeqCst);
+                Ok(ColumnarValue::Array(Arc::new(
+                    values
+                        .iter()
+                        .map(|v| Some(on && v == Some("old")))
+                        .collect::<arrow::array::BooleanArray>(),
+                )))
+            }),
+        );
+        let t = table(&fixture, name, false, udf.call(vec![col("status")])).await?;
+        // This write arms a post-write retention pass; the racer drains it.
+        common::insert_batch(t.as_ref(), rows(&[(1, Some("old")), (2, Some("new"))])).await?;
+        aged.store(true, Ordering::SeqCst);
+
+        let racer_table = Arc::clone(&t);
+        let racer = std::thread::Builder::new()
+            .name(RACER.to_string())
+            .spawn(move || {
+                tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .expect("runtime")
+                    .block_on(racer_table.flush_pending_maintenance())
+                    .map_err(|e| e.to_string())
+            })?;
+        entered_rx
+            .recv_timeout(std::time::Duration::from_secs(10))
+            .map_err(|_| format!("{name}: the maintenance pass never evaluated retention"))?;
+
+        let appender = Arc::clone(&t);
+        let append = tokio::spawn(async move {
+            common::insert_batch(appender.as_ref(), rows(&[(3, Some("new"))]))
+                .await
+                .map_err(|e| e.to_string())
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+        assert!(
+            !append.is_finished(),
+            "{name}: the append waits while the maintenance pass holds its generation"
+        );
+        release_tx.send(())?;
+        let pass = racer.join().expect("racer thread");
+        assert_eq!(
+            pass.is_err(),
+            fail_pass,
+            "{name}: maintenance outcome {pass:?}"
+        );
+        append.await??;
+        assert_eq!(ids(&t).await?, vec![2, 3], "{name}: final generation");
+        let ctx = SessionContext::new();
+        ctx.register_table("t", Arc::clone(&t) as Arc<dyn TableProvider>)?;
+        let count = ctx.sql("SELECT COUNT(*) FROM t").await?.collect().await?;
+        assert_eq!(
+            arrow::util::display::array_value_to_string(count[0].column(0), 0)?,
+            "2",
+            "{name}: COUNT(*)"
+        );
+    }
+    Ok(())
+}
