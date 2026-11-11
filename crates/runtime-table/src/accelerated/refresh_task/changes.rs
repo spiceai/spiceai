@@ -5087,8 +5087,12 @@ mod tests {
 
         // The write must land far inside the 60s linger window. A 5s deadline is
         // generous for the immediate write yet nowhere near the buggy 60s wait.
+        // Wait for the envelope's commit, not the write counter: `CountingExec`
+        // counts when the insert plan starts executing, and the commit follows
+        // only once that write has finished, so asserting the commit log as soon
+        // as the counter moves races the write.
         let deadline = std::time::Instant::now() + Duration::from_secs(5);
-        while insert_execution_calls.load(AtomicOrdering::SeqCst) == 0 {
+        while log.ids().await.is_empty() {
             assert!(
                 std::time::Instant::now() <= deadline,
                 "over-budget burst was held by the linger window instead of writing immediately",
