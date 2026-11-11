@@ -530,7 +530,7 @@ impl CayenneTableProvider {
     /// [`Self::materialize_inline_corpus_for_retention`] for any table shape: a
     /// table without a primary key flushes its inline rows into the current
     /// snapshot, a keyed table publishes them as a protected snapshot.
-    async fn move_inline_corpus_to_files_for_retention(&self) -> super::Result<()> {
+    pub(crate) async fn move_inline_corpus_to_files_for_retention(&self) -> super::Result<()> {
         if !self.has_retention_delete_filters()
             || self.is_memory_resident_mode()
             || self.cached_inlined_row_count() == 0
@@ -561,16 +561,22 @@ impl CayenneTableProvider {
     /// ([`Self::prepare_resident_retention`]); a table without a primary key
     /// supersedes nothing, so every visible resident row is evaluated. The
     /// transaction commits the returned files with its snapshot.
+    ///
+    /// The caller first moves the inline corpus to files
+    /// ([`Self::move_inline_corpus_to_files_for_retention`], which takes the
+    /// fence itself), before taking any publication guard. `fence`: this
+    /// table's own listing-fence write guard when the caller (a transaction
+    /// commit) holds it, so the scan leases it rather than re-taking the fence.
     pub(crate) async fn prepare_transaction_resident_retention(
         &self,
         snapshot_id: &str,
         filters: &[Expr],
         superseding: Option<Vec<RecordBatch>>,
+        fence: Option<&super::delete::HeldListingFence>,
     ) -> super::Result<Option<super::delete::PreparedDeletionPublish>> {
-        self.move_inline_corpus_to_files_for_retention().await?;
         if self.primary_key_indices()?.is_some() {
             return self
-                .prepare_resident_retention(snapshot_id, filters, superseding)
+                .prepare_resident_retention(snapshot_id, filters, superseding, fence)
                 .await;
         }
         let failed = |error: datafusion_common::DataFusionError| super::Error::DataFusion {
@@ -579,10 +585,25 @@ impl CayenneTableProvider {
                 self.retention_failed_message()
             )),
         };
-        let sink = self
-            .build_deletion_vector_sink(filters, None, super::table::DeletionRequestSource::User)
-            .await
-            .map_err(failed)?;
+        let sink = match fence {
+            Some(fence) => {
+                self.build_deletion_vector_sink_under_fence(
+                    filters,
+                    super::table::DeletionRequestSource::User,
+                    fence,
+                )
+                .await
+            }
+            None => {
+                self.build_deletion_vector_sink(
+                    filters,
+                    None,
+                    super::table::DeletionRequestSource::User,
+                )
+                .await
+            }
+        }
+        .map_err(failed)?;
         let prepared = sink.prepare_delete().await?;
         Ok(prepared.filter(|prepared| !prepared.delete_files().is_empty()))
     }
@@ -626,6 +647,7 @@ impl CayenneTableProvider {
         snapshot_id: &str,
         filters: &[Expr],
         superseding: Option<Vec<RecordBatch>>,
+        fence: Option<&super::delete::HeldListingFence>,
     ) -> super::Result<Option<super::delete::PreparedDeletionPublish>> {
         let failed = |error: datafusion_common::DataFusionError| super::Error::DataFusion {
             source: datafusion_common::DataFusionError::Execution(format!(
@@ -660,10 +682,25 @@ impl CayenneTableProvider {
                 .await
                 .map_err(failed)?,
         };
-        let sink = self
-            .build_deletion_vector_sink(filters, None, super::table::DeletionRequestSource::User)
-            .await
-            .map_err(failed)?;
+        let sink = match fence {
+            Some(fence) => {
+                self.build_deletion_vector_sink_under_fence(
+                    filters,
+                    super::table::DeletionRequestSource::User,
+                    fence,
+                )
+                .await
+            }
+            None => {
+                self.build_deletion_vector_sink(
+                    filters,
+                    None,
+                    super::table::DeletionRequestSource::User,
+                )
+                .await
+            }
+        }
+        .map_err(failed)?;
         // The staged keys and every row already retired are dropped by key
         // before the predicate runs: bounded by the write, never a predicate
         // whose size grows with it.

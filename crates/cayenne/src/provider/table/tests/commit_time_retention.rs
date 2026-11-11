@@ -903,14 +903,17 @@ async fn a_no_conflict_key_transaction_keeps_the_first_copy_and_never_evaluates_
     }
 }
 
-/// T4: a protected-run compaction run INLINE at a deterministic point inside a
-/// transaction commit (after its resident retention delete is prepared over
-/// the runs it captured; the commit holds `write_lock` only, its visibility
-/// lock and listing fence come later). A position-serialized table declines
-/// (try-locked writer); a key-delete table must actually merge there
-/// (acceptance gate). Either way the commit's rows are exact, live and reopened.
+/// T4 (F2 order): a protected-run compaction started at a deterministic point
+/// inside a transaction commit (after its resident retention delete is
+/// prepared over the runs it captured). The commit holds `write_lock`, the
+/// mem-tier checkpoint lock, the visibility lock and the listing fence there,
+/// so the compaction cannot flip until the commit has published: the hook
+/// records the held guards and spawns the compaction, which completes after
+/// the commit. A key-delete table must actually merge (acceptance gate); a
+/// position-serialized table may decline (try-locked writer). Either way the
+/// commit's rows are exact, live and reopened.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn a_protected_run_compaction_inside_the_commit_keeps_it_exact() {
+async fn a_protected_run_compaction_started_inside_the_commit_flips_after_it() {
     for shape in [Shape::KeyedPosition, Shape::KeyedFold] {
         let f = table_with(
             &format!("ctr_compact_{shape:?}").to_lowercase(),
@@ -938,24 +941,26 @@ async fn a_protected_run_compaction_inside_the_commit_keeps_it_exact() {
             "{shape:?}: seeded"
         );
 
-        let outcome: Arc<ParkingMutex<Option<String>>> = Arc::new(ParkingMutex::new(None));
+        let locks: Arc<ParkingMutex<Option<(bool, bool, bool, bool)>>> = Arc::default();
+        let compaction: Arc<ParkingMutex<Option<tokio::task::JoinHandle<String>>>> = Arc::default();
         let probe = p.clone_for_write();
-        let recorded = Arc::clone(&outcome);
+        let (seen_locks, spawned) = (Arc::clone(&locks), Arc::clone(&compaction));
         crate::provider::append_commit::test_seams::pause_after_commit_time_retention(
             p.table_id(),
             Box::new(move || {
                 Box::pin(async move {
-                    let locks = format!(
-                        "write_lock free {}, visibility free {}, listing_fence readable {}, compaction_lock readable {}",
-                        probe.write_lock.try_lock().is_ok(),
-                        probe.visibility_lock.try_lock().is_ok(),
-                        probe.listing_fence.try_read().is_ok(),
-                        probe.compaction_lock.try_read().is_ok(),
-                    );
-                    let before = probe.protected_snapshots.load().len();
-                    let merged = probe.compact_protected_snapshots_subset(usize::MAX).await;
-                    let after = probe.protected_snapshots.load().len();
-                    *recorded.lock() = Some(format!("{merged:?} runs {before}->{after}; {locks}"));
+                    *seen_locks.lock() = Some((
+                        probe.write_lock.try_lock().is_err(),
+                        probe.mem_checkpoint_lock.try_lock().is_err(),
+                        probe.visibility_lock.try_lock().is_err(),
+                        probe.listing_fence.try_read().is_err(),
+                    ));
+                    *spawned.lock() = Some(tokio::spawn(async move {
+                        let before = probe.protected_snapshots.load().len();
+                        let merged = probe.compact_protected_snapshots_subset(usize::MAX).await;
+                        let after = probe.protected_snapshots.load().len();
+                        format!("{merged:?} runs {before}->{after}")
+                    }));
                 })
             }),
         );
@@ -963,27 +968,38 @@ async fn a_protected_run_compaction_inside_the_commit_keeps_it_exact() {
         let commit = stage(&f, &[(4, 4)]).await.commit();
         tokio::time::timeout(std::time::Duration::from_secs(60), commit)
             .await
-            .unwrap_or_else(|_| {
-                panic!(
-                    "{shape:?}: commit did not finish (hook: {:?})",
-                    outcome.lock()
-                )
-            })
+            .unwrap_or_else(|_| panic!("{shape:?}: commit did not finish (bounded)"))
             .expect("commit");
-        let outcome = outcome
+        assert_eq!(
+            locks.lock().take(),
+            Some((true, true, true, true)),
+            "{shape:?}: all four guards held at the hook"
+        );
+        let handle = compaction
             .lock()
             .take()
-            .expect("the compaction ran inside the commit");
+            .expect("the compaction was started inside the commit");
+        let outcome = tokio::time::timeout(std::time::Duration::from_secs(60), handle)
+            .await
+            .expect("the compaction completes after the commit (bounded)")
+            .expect("join");
         println!("{shape:?}: {outcome}");
-        let gate = if shape == Shape::KeyedFold {
-            "Ok(true)"
+        // A key-delete table's compaction queues on the held fence and merges
+        // after the publication (acceptance gate). A position-serialized
+        // table's try-locks the writer: it declines if it runs while the
+        // commit still holds `write_lock`, or merges once the commit released
+        // it; which one is scheduling, so either is accepted, never an error.
+        if shape == Shape::KeyedFold {
+            assert!(
+                outcome.starts_with("Ok(true)"),
+                "{shape:?}: compaction started inside the commit: {outcome}"
+            );
         } else {
-            "Ok(false)"
-        };
-        assert!(
-            outcome.starts_with(gate),
-            "{shape:?}: compaction inside the commit: {outcome}"
-        );
+            assert!(
+                outcome.starts_with("Ok(false)") || outcome.starts_with("Ok(true)"),
+                "{shape:?}: compaction started inside the commit: {outcome}"
+            );
+        }
         let want = vec![(1, 1), (3, 3), (4, 4)];
         assert_eq!(rows(p).await, want, "{shape:?}: exact after the commit");
         f.set(OFF);

@@ -1668,7 +1668,7 @@ impl<'a> AppendMutationWriter<'a> {
         let resident_retention = match (&publication_filters, self.into_empty_table) {
             (Some(filters), false) => match self
                 .table
-                .prepare_resident_retention(&snapshot_id, filters, superseding_keys)
+                .prepare_resident_retention(&snapshot_id, filters, superseding_keys, None)
                 .await
             {
                 Ok(prepared) => prepared,
@@ -1699,6 +1699,7 @@ impl<'a> AppendMutationWriter<'a> {
             _write_guard: write_guard,
             _held_write_lock: super::write_lock_held::held_guard(),
             _checkpoint_guard: Some(checkpoint_guard),
+            publication_guards: None,
             snapshot_id,
             rows,
             stats,
@@ -1859,6 +1860,7 @@ impl<'a> AppendMutationWriter<'a> {
             _write_guard: write_guard,
             _held_write_lock: super::write_lock_held::held_guard(),
             _checkpoint_guard: Some(checkpoint_guard),
+            publication_guards: None,
             snapshot_id,
             rows,
             stats,

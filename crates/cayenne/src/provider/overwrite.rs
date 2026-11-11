@@ -1060,7 +1060,9 @@ impl CayenneTableProvider {
                     self.table_schema(),
                 )
                 .await?;
-            let deletions = self.carry_published_runs_into(&new_snapshot_id).await?;
+            let deletions = self
+                .carry_published_runs_into(&new_snapshot_id, None)
+                .await?;
             Ok((row_count, deletions, stats))
         }
         .await;
@@ -1128,15 +1130,25 @@ impl CayenneTableProvider {
     /// `commit_overwrite_in_txn`, which retires the protected entries only
     /// because their rows are carried, with their deletes. A delete on no carried
     /// run, or a file-name collision, is refused.
+    ///
+    /// `fence`: this table's own listing-fence write guard when the caller (a
+    /// transaction commit) holds it; the runs are then read under it instead of
+    /// re-taking the fence, which would self-deadlock.
     pub(crate) async fn carry_published_runs_into(
         &self,
         new_snapshot_id: &str,
+        fence: Option<&super::delete::HeldListingFence>,
     ) -> Result<HashMap<String, Vec<u32>>> {
         let internal = |message: String| super::Error::Internal {
             table: self.table_name().to_string(),
             message,
         };
-        let (source_snapshot_id, protected_runs) = self.published_runs().await;
+        let (source_snapshot_id, protected_runs) = match fence {
+            Some(fence) => self.published_runs_under_fence(fence).ok_or_else(|| {
+                internal("carried generation given another table's listing fence".to_string())
+            })?,
+            None => self.published_runs().await,
+        };
         let mut visible_deletes: HashMap<String, Vec<u32>> = self
             .pk_deletion_strategy
             .position_cache()
@@ -1215,11 +1227,17 @@ impl CayenneTableProvider {
     /// Under `retention_sql` (the caller's publication context) the staged
     /// rows and the carried rows are evaluated in it; returns the generation
     /// and how many staged rows it hides. Abandons the snapshot on error.
+    ///
+    /// Runs under the transaction's held publication guards (`fence` is this
+    /// table's listing-fence write guard). The caller moved the inline rows to
+    /// files first, before any guard ([`Self::materialize_inline_rows_for_carry`]
+    /// takes the fence itself).
     pub(crate) async fn prepare_transaction_generation(
         &self,
         new_snapshot_id: String,
         row_count: u64,
         write_stats_acc: Arc<ColumnStatsAccumulator>,
+        fence: &super::delete::HeldListingFence,
     ) -> Result<(PreparedOverwrite, u64)> {
         // The staged rows first, while they are the only files of the staged
         // snapshot, then the carried runs: one retention context (the
@@ -1229,8 +1247,9 @@ impl CayenneTableProvider {
                 .hide_retention_matches_in_snapshot(&new_snapshot_id, HashMap::new())
                 .await?;
             let staged_matches: u64 = staged.values().map(|rows| rows.len() as u64).sum();
-            self.materialize_inline_rows_for_carry().await?;
-            let mut deletions = self.carry_published_runs_into(&new_snapshot_id).await?;
+            let mut deletions = self
+                .carry_published_runs_into(&new_snapshot_id, Some(fence))
+                .await?;
             deletions.extend(staged);
             Ok::<_, super::Error>((deletions, staged_matches))
         }
@@ -1287,7 +1306,7 @@ impl CayenneTableProvider {
     /// carried retention append does: the generation flip clears the inline
     /// corpus. Changes where rows are stored, not which are visible; refuses
     /// when the move could duplicate rows.
-    async fn materialize_inline_rows_for_carry(&self) -> Result<()> {
+    pub(crate) async fn materialize_inline_rows_for_carry(&self) -> Result<()> {
         let internal = |message: String| super::Error::Internal {
             table: self.table_name().to_string(),
             message,

@@ -622,20 +622,156 @@ impl SkipKeys {
 pub(crate) struct CaptureLocks {
     pub(crate) listing_fence: Arc<tokio::sync::RwLock<()>>,
     pub(crate) scan_state_lock: Arc<tokio::sync::RwLock<()>>,
+    pub(crate) fence: FenceAccess,
+}
+
+/// How a capture holds `listing_fence`.
+#[derive(Clone)]
+pub(crate) enum FenceAccess {
+    /// Take the fence for read around each capture (every existing caller).
+    Acquire,
+    /// A commit owns the fence's write guard and lends a lease on it. A capture
+    /// upgrades the lease for exactly its own duration, so the fence is held
+    /// through every lazy or spawned capture step; once the commit drops its
+    /// guard, an escaped sink's capture fails instead of running unfenced, and it
+    /// can never keep the fence held past its current capture.
+    Leased(FenceLease),
+}
+
+/// The commit's OWN write guard of one table's `listing_fence`. Not `Clone`:
+/// exactly one owner. Work the commit starts gets [`FenceLease`]s.
+pub(crate) struct HeldListingFence {
+    guard: Arc<tokio::sync::OwnedRwLockWriteGuard<()>>,
+    revoked: Arc<std::sync::atomic::AtomicBool>,
+}
+
+/// A non-owning lease on a [`HeldListingFence`].
+#[derive(Clone)]
+pub(crate) struct FenceLease {
+    guard: std::sync::Weak<tokio::sync::OwnedRwLockWriteGuard<()>>,
+    revoked: Arc<std::sync::atomic::AtomicBool>,
+}
+
+impl HeldListingFence {
+    pub(crate) fn new(guard: tokio::sync::OwnedRwLockWriteGuard<()>) -> Self {
+        Self {
+            guard: Arc::new(guard),
+            revoked: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        }
+    }
+
+    /// Whether this guard locks `fence`.
+    pub(crate) fn locks(&self, fence: &Arc<tokio::sync::RwLock<()>>) -> bool {
+        Arc::ptr_eq(
+            tokio::sync::OwnedRwLockWriteGuard::rwlock(&self.guard),
+            fence,
+        )
+    }
+
+    pub(crate) fn lease(&self) -> FenceLease {
+        FenceLease {
+            guard: Arc::downgrade(&self.guard),
+            revoked: Arc::clone(&self.revoked),
+        }
+    }
+
+    /// Revoke every lease, then report whether any work still runs on one.
+    ///
+    /// Called BEFORE the commit's durable point: a lease work holds then is an
+    /// ordinary abort (nothing committed). After the revoke no lease can be
+    /// taken again (see [`FenceLease::pin`]), so once this returns `true` no
+    /// lease-holding work runs for the rest of the commit. Both sides use
+    /// `SeqCst` (a pin upgrades, then reads the flag; the revoke stores the
+    /// flag, then reads the count), so either the revoke sees the pin or the
+    /// pin sees the revoke.
+    pub(crate) fn revoke_leases_and_check_idle(&self) -> bool {
+        self.revoked
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        Arc::strong_count(&self.guard) == 1
+    }
+}
+
+impl FenceLease {
+    /// The guard, held by the caller for the duration of one piece of work.
+    /// `None` once the commit revoked its leases or released the guard: the work
+    /// must fail, never run unfenced.
+    pub(crate) fn pin(&self) -> Option<Arc<tokio::sync::OwnedRwLockWriteGuard<()>>> {
+        let guard = self.guard.upgrade()?;
+        if self.revoked.load(std::sync::atomic::Ordering::SeqCst) {
+            return None;
+        }
+        Some(guard)
+    }
+}
+
+/// The fence one capture holds: its own read guard, or the commit's write
+/// guard pinned from a lease.
+pub(crate) enum CaptureFence<'a> {
+    Read(tokio::sync::RwLockReadGuard<'a, ()>),
+    Leased(Arc<tokio::sync::OwnedRwLockWriteGuard<()>>),
 }
 
 impl CaptureLocks {
+    /// For a leased fence: pin the commit's guard for the WHOLE of one sink
+    /// execution (every capture and the lazy scan that reads the captured
+    /// files), so no file it lists can be retired while it runs. `Ok(None)` for
+    /// [`FenceAccess::Acquire`]. Fails once the commit revoked its leases.
+    pub(crate) fn pin_for_execution(
+        &self,
+    ) -> datafusion_common::Result<Option<Arc<tokio::sync::OwnedRwLockWriteGuard<()>>>> {
+        match &self.fence {
+            FenceAccess::Acquire => Ok(None),
+            FenceAccess::Leased(lease) => match lease.pin() {
+                Some(guard)
+                    if Arc::ptr_eq(
+                        tokio::sync::OwnedRwLockWriteGuard::rwlock(&guard),
+                        &self.listing_fence,
+                    ) =>
+                {
+                    Ok(Some(guard))
+                }
+                Some(_) => Err(datafusion_common::DataFusionError::Internal(
+                    "sink leased another table's listing fence".to_string(),
+                )),
+                None => Err(datafusion_common::DataFusionError::Internal(
+                    "sink ran after its commit revoked or released the listing fence".to_string(),
+                )),
+            },
+        }
+    }
+
     /// Both read guards, taken in `scan`'s order: `listing_fence`, then
     /// `scan_state_lock`.
     pub(crate) async fn read(
         &self,
-    ) -> (
-        tokio::sync::RwLockReadGuard<'_, ()>,
-        tokio::sync::RwLockReadGuard<'_, ()>,
-    ) {
-        let fence = self.listing_fence.read().await;
+    ) -> datafusion_common::Result<(CaptureFence<'_>, tokio::sync::RwLockReadGuard<'_, ()>)> {
+        let fence = match &self.fence {
+            FenceAccess::Acquire => CaptureFence::Read(self.listing_fence.read().await),
+            FenceAccess::Leased(lease) => match lease.pin() {
+                // Checked at every capture, not only at construction.
+                Some(guard)
+                    if Arc::ptr_eq(
+                        tokio::sync::OwnedRwLockWriteGuard::rwlock(&guard),
+                        &self.listing_fence,
+                    ) =>
+                {
+                    CaptureFence::Leased(guard)
+                }
+                Some(_) => {
+                    return Err(datafusion_common::DataFusionError::Internal(
+                        "capture leased another table's listing fence".to_string(),
+                    ));
+                }
+                None => {
+                    return Err(datafusion_common::DataFusionError::Internal(
+                        "capture ran after its commit revoked or released the listing fence"
+                            .to_string(),
+                    ));
+                }
+            },
+        };
         let state = self.scan_state_lock.read().await;
-        (fence, state)
+        Ok((fence, state))
     }
 }
 
@@ -939,7 +1075,7 @@ impl CayenneDeletionSink {
     /// under the same read guards `scan` captures the same rows under.
     async fn capture_main_scan_source(&self) -> DeleteScanSource {
         let _guards = match &self.capture_locks {
-            Some(locks) => Some(locks.read().await),
+            Some(locks) => Some(locks.read().await?),
             None => None,
         };
         let table = self.listing_table.load_full();
@@ -1522,6 +1658,15 @@ impl CayenneDeletionSink {
     pub(crate) async fn prepare_delete(
         &self,
     ) -> super::super::Result<Option<PreparedDeletionPublish>> {
+        // A leased sink holds its commit's fence for this whole execution: the
+        // captures below and the scan of the files they list. Dropped on every
+        // exit, cancellation included.
+        let _execution_pin = match &self.capture_locks {
+            Some(locks) => locks
+                .pin_for_execution()
+                .map_err(|source| super::super::Error::DataFusion { source })?,
+            None => None,
+        };
         let ctx = SessionContext::new_with_config_rt(
             util::session_state::session_config(),
             Arc::clone(&self.runtime_env),

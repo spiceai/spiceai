@@ -40,6 +40,15 @@ use super::on_conflict::{OnConflictDeletions, PostValidationState};
 use super::pk_index::PkDigestSet;
 use super::table::CayenneTableProvider;
 
+/// What [`CayenneStagedUpsert::acquire_commit_prerequisites`] took for one
+/// table, handed to [`CayenneStagedUpsert::prepare_commit_under_guards`].
+pub(crate) struct CommitPrerequisites {
+    /// The mem-tier checkpoint lock, held to the end of the commit.
+    checkpoint_guard: Option<tokio::sync::OwnedMutexGuard<()>>,
+    /// The staged keys, read before any fold.
+    superseding: Option<Vec<arrow::record_batch::RecordBatch>>,
+}
+
 /// Optimistic-concurrency token for an off-lock transaction write.
 ///
 /// Captured at transaction **begin** (before the gate read) under a brief
@@ -146,6 +155,17 @@ impl CayenneStagedUpsert {
         &self.validated_keys
     }
 
+    /// The table this upsert was staged for.
+    pub(crate) fn table(&self) -> &CayenneTableProvider {
+        &self.table
+    }
+
+    /// The staged snapshot's id (its unregistered directory until committed).
+    #[cfg(test)]
+    pub(crate) fn staged_snapshot_id(&self) -> &str {
+        &self.new_snapshot_id
+    }
+
     /// Whether committing publishes nothing: no row was staged, so no stored
     /// row is superseded either.
     pub(crate) fn publishes_nothing(&self) -> bool {
@@ -155,61 +175,25 @@ impl CayenneStagedUpsert {
             && self.on_conflict_deletions.reinserted_over_tombstone == 0
     }
 
-    /// The commit's one `retention_sql` context: the conjuncts coerced now,
-    /// after the commit's lock waits and optimistic check (one `now()` for the
-    /// whole publication: staged candidates, resident rows). `None` without
-    /// `retention_sql`.
-    fn commit_retention_context(&self) -> Result<Option<Arc<Vec<datafusion::logical_expr::Expr>>>> {
-        if !self.retention_deferred {
-            return Ok(None);
-        }
-        Ok(Some(Arc::new(
-            self.table
-                .coerced_retention_filters()
-                .map_err(|source| Error::DataFusion { source })?,
-        )))
-    }
-
-    /// Under the commit's held `write_lock` (the optimistic check passed): take
-    /// the mem-tier checkpoint lock, as a durable write does, then, in the
-    /// commit's one retention context, evaluate the staged candidates (each
-    /// winning copy once; superseded copies never) and prepare the delete over
-    /// the resident rows this publication keeps. Prepared before the snapshot
-    /// sequence is reserved, so resident key deletes precede the staged rows.
-    /// An error publishes nothing.
-    async fn prepare_commit_time_retention(
+    /// Under every held publication guard of the commit (its `write_lock`,
+    /// mem-tier checkpoint lock, visibility lock and `fence`, this table's own
+    /// listing-fence write guard), in the commit's one retention context
+    /// `filters` (folded at an instant taken after every lock wait): evaluate
+    /// the staged candidates (each winning copy once; superseded copies never)
+    /// and prepare the delete over the resident rows this publication keeps.
+    /// Every scan leases `fence` and finishes before this returns. Prepared
+    /// before the snapshot sequence is reserved, so resident key deletes
+    /// precede the staged rows. `None` without `retention_sql`. An error
+    /// publishes nothing.
+    async fn prepare_retention_under_guards(
         &mut self,
-    ) -> Result<(
-        Option<tokio::sync::OwnedMutexGuard<()>>,
-        Option<super::delete::PreparedDeletionPublish>,
-    )> {
-        if !self.retention_deferred {
-            return Ok((None, None));
-        }
-        #[cfg(test)]
-        if let Some(pause) =
-            super::append_commit::test_seams::take_pause_at_checkpoint_wait(self.table.table_id())
-        {
-            pause().await;
-        }
-        let checkpoint_guard = self
-            .table
-            .lock_mem_tier_checkpoint_for_durable_write()
-            .await;
-        // The publication's one `now()`, taken after this table's write lock,
-        // optimistic check and checkpoint-lock wait. NOT after every wait: a
-        // multi-table transaction prepares its tables one by one (a later
-        // table's checkpoint wait follows this `now()`), and the visibility
-        // locks and listing fences are taken after every prepare
-        // (`CayenneTransaction::commit`). Known gap, not yet fixed.
-        let Some(filters) = self.commit_retention_context()? else {
-            return Ok((Some(checkpoint_guard), None));
+        superseding: Option<Vec<arrow::record_batch::RecordBatch>>,
+        fence: &super::delete::HeldListingFence,
+        filters: Option<Arc<Vec<datafusion::logical_expr::Expr>>>,
+    ) -> Result<Option<super::delete::PreparedDeletionPublish>> {
+        let Some(filters) = filters else {
+            return Ok(None);
         };
-        // Every staged key supersedes its resident version, a replacement the
-        // predicate is about to fold out of the staged files included: capture
-        // them before the fold, so resident retention still skips (never
-        // evaluates) that superseded version.
-        let superseding = self.table.staged_key_columns(&self.new_snapshot_id).await?;
         super::overwrite_retention::with_publication_retention(
             Arc::clone(&filters),
             self.retain_staged_candidates(),
@@ -221,6 +205,7 @@ impl CayenneStagedUpsert {
                 &self.new_snapshot_id,
                 &filters,
                 superseding,
+                Some(fence),
             ),
         )
         .await?;
@@ -232,7 +217,7 @@ impl CayenneStagedUpsert {
         {
             pause().await;
         }
-        Ok((Some(checkpoint_guard), prepared))
+        Ok(prepared)
     }
 
     /// Evaluate `retention_sql` (the caller's context) over the staged rows the
@@ -315,28 +300,141 @@ impl CayenneStagedUpsert {
         Ok(())
     }
 
-    /// Prepare this staged upsert's durable payload for an atomic multi-table
-    /// commit: reserve sequences + write deletion-vector files (no metastore
-    /// commit). The caller holds the table `write_lock`; it applies the payload
-    /// via [`PreparedTxnCommit::apply_in_txn`] inside a shared transaction that
-    /// fuses all written tables, then publishes with [`PreparedTxnCommit::finish`].
+    /// Step 1 of a commit for this table (transactional or single-table),
+    /// under the commit's held `write_lock` (after its optimistic check) and
+    /// BEFORE any visibility lock or listing fence: wait for the mem-tier
+    /// checkpoint lock, always (held to the end of the commit, as a durable
+    /// write holds it, so every commit publishes under all four guards), then,
+    /// under `retention_sql`, move the inline corpus into files and capture the
+    /// staged keys before any fold. The inline move takes the listing fence
+    /// itself (`checkpoint_inlined_data`), and neither `write_lock` nor the
+    /// checkpoint lock, which is why it runs here, under the two locks this
+    /// commit already holds, and never under the commit's held fence.
     ///
     /// # Errors
     ///
-    /// Returns an error if the table needs the non-composable inline-tombstone or
-    /// position-deletion publish path (rejected for multi-table), if the staged
-    /// snapshot directory cannot be synced, or if reserving sequences / writing
-    /// deletion vectors fails.
-    pub async fn prepare_commit(mut self) -> Result<PreparedTxnCommit> {
+    /// Returns an error if the inline corpus cannot be moved or the staged keys
+    /// cannot be read. Nothing is published.
+    pub(crate) async fn acquire_commit_prerequisites(&self) -> Result<CommitPrerequisites> {
+        let generation = self.publishes_carried_generation()?;
+        #[cfg(test)]
+        if let Some(pause) =
+            super::append_commit::test_seams::take_pause_at_checkpoint_wait(self.table.table_id())
+        {
+            pause().await;
+        }
+        let checkpoint_guard = self
+            .table
+            .lock_mem_tier_checkpoint_for_durable_write()
+            .await;
+        if generation {
+            self.table.materialize_inline_rows_for_carry().await?;
+            return Ok(CommitPrerequisites {
+                checkpoint_guard: Some(checkpoint_guard),
+                superseding: None,
+            });
+        }
+        if !self.retention_deferred {
+            return Ok(CommitPrerequisites {
+                checkpoint_guard: Some(checkpoint_guard),
+                superseding: None,
+            });
+        }
+        // Every staged key supersedes its resident version, a replacement the
+        // predicate is about to fold out of the staged files included: capture
+        // them before the fold, so resident retention still skips (never
+        // evaluates) that superseded version.
+        let superseding = self.table.staged_key_columns(&self.new_snapshot_id).await?;
+        self.table
+            .move_inline_corpus_to_files_for_retention()
+            .await?;
+        Ok(CommitPrerequisites {
+            checkpoint_guard: Some(checkpoint_guard),
+            superseding,
+        })
+    }
+
+    /// This table's `retention_sql` context for a commit, with `now()` folded
+    /// at `at`: the one instant the transaction takes after every
+    /// participant's lock waits. `None` without deferred retention.
+    pub(crate) fn commit_retention_context_at(
+        &self,
+        at: chrono::DateTime<chrono::Utc>,
+    ) -> Result<Option<Arc<Vec<datafusion::logical_expr::Expr>>>> {
+        if !self.retention_deferred {
+            return Ok(None);
+        }
+        Ok(Some(Arc::new(
+            self.table
+                .coerced_retention_filters_at(at)
+                .map_err(|source| Error::DataFusion { source })?,
+        )))
+    }
+
+    /// Step 2 of a transaction commit for this table: prepare the durable
+    /// payload (reserve sequences, write deletion-vector files, no metastore
+    /// commit) under every held publication guard of the transaction. `fence`
+    /// is this table's own listing-fence write guard; every scan here leases it
+    /// and finishes before this returns. `filters` is this table's context
+    /// from the transaction's one post-wait instant. The caller applies the
+    /// payload via [`PreparedTxnCommit::apply_in_txn`] inside the shared
+    /// transaction and publishes with [`PreparedTxnCommit::finish`].
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if retention cannot be evaluated, the staged snapshot
+    /// directory cannot be synced, or reserving sequences / writing deletion
+    /// vectors fails. Nothing is published.
+    pub(crate) async fn prepare_commit_under_guards(
+        self,
+        prerequisites: CommitPrerequisites,
+        fence: &super::delete::HeldListingFence,
+        filters: Option<Arc<Vec<datafusion::logical_expr::Expr>>>,
+    ) -> Result<PreparedTxnCommit> {
+        // Nothing is durable before the shared commit, so a failed prepare
+        // removes its own staged directory (the existing rollback step) rather
+        // than leave it to the orphan sweep; the stage is consumed here, so the
+        // transaction cannot roll it back itself.
+        let table = self.table.clone_for_write();
+        let snapshot_id = self.new_snapshot_id.clone();
+        let prepared = self
+            .prepare_commit_under_guards_inner(prerequisites, fence, filters)
+            .await;
+        if prepared.is_err() {
+            cleanup_orphan_snapshot_dir(&table, &snapshot_id).await;
+        }
+        prepared
+    }
+
+    async fn prepare_commit_under_guards_inner(
+        mut self,
+        prerequisites: CommitPrerequisites,
+        fence: &super::delete::HeldListingFence,
+        filters: Option<Arc<Vec<datafusion::logical_expr::Expr>>>,
+    ) -> Result<PreparedTxnCommit> {
+        if !fence.locks(self.table.listing_fence_arc()) {
+            return Err(Error::Internal {
+                table: self.table.table_name().to_string(),
+                message: "transaction prepare given another table's listing fence".to_string(),
+            });
+        }
+        let CommitPrerequisites {
+            checkpoint_guard,
+            superseding,
+        } = prerequisites;
         if self.publishes_carried_generation()? {
             self.table
                 .sync_local_snapshot_dir(&self.new_snapshot_id)
                 .await?;
-            return self.prepare_generation_commit().await;
+            return self
+                .prepare_generation_commit(checkpoint_guard, fence, filters)
+                .await;
         }
         // The commit's retention context first: a fold rewrites staged files,
         // so the directory barrier below follows it.
-        let (checkpoint_guard, resident_retention) = self.prepare_commit_time_retention().await?;
+        let resident_retention = self
+            .prepare_retention_under_guards(superseding, fence, filters)
+            .await?;
         // Directory barrier for the staged rows, before the shared transaction
         // makes them visible. The non-transactional publish takes this barrier
         // in `record_written_snapshot_sequence`; the fused path commits the
@@ -400,6 +498,38 @@ impl CayenneStagedUpsert {
         })
     }
 
+    /// Both steps for ONE table, for callers outside a [`super::transaction::CayenneTransaction`]
+    /// (tests): prerequisites, then this table's visibility lock and listing
+    /// fence, one post-wait instant, the guarded prepare. The guards are
+    /// released on return, so the returned commit is NOT published under them;
+    /// a transaction holds them through its fused commit instead.
+    ///
+    /// # Errors
+    ///
+    /// See [`Self::acquire_commit_prerequisites`] and
+    /// [`Self::prepare_commit_under_guards`].
+    pub async fn prepare_commit(self) -> Result<PreparedTxnCommit> {
+        let prerequisites = self.acquire_commit_prerequisites().await?;
+        let _visibility = self.table.visibility_lock_arc().lock_owned().await;
+        let fence =
+            super::delete::HeldListingFence::new(self.table.lock_listing_fence_write_owned().await);
+        let filters = self.commit_retention_context_at(chrono::Utc::now())?;
+        let table = self.table.table_name().to_string();
+        let prepared = self
+            .prepare_commit_under_guards(prerequisites, &fence, filters)
+            .await?;
+        if !fence.revoke_leases_and_check_idle() {
+            prepared.rollback().await;
+            return Err(Error::Internal {
+                table,
+                message: "a retention scan was still running on the listing fence; nothing \
+                          was committed"
+                    .to_string(),
+            });
+        }
+        Ok(prepared)
+    }
+
     /// Whether this table's transactional write publishes a carried generation
     /// rather than a protected snapshot: a table without a primary key whose
     /// deletes are per file. Its protected snapshots are not reloaded on open
@@ -410,25 +540,25 @@ impl CayenneStagedUpsert {
             && self.table.pk_deletion_strategy.is_position_based())
     }
 
-    /// [`Self::prepare_commit`] for [`Self::publishes_carried_generation`]: under
-    /// the transaction's held `write_lock` (after its optimistic check), take
-    /// the mem-tier checkpoint lock as a durable write does, then carry every
-    /// committed published run into the staged snapshot, with the run's deletes
-    /// and, under `retention_sql`, the resident rows the publication's retention
-    /// matches. The shared commit flips `current_snapshot_id` to the staged
-    /// snapshot, so the complete current generation holds the transaction's
-    /// rows; no recovery or load path changes. An error publishes nothing and
-    /// removes the staged snapshot.
-    async fn prepare_generation_commit(self) -> Result<PreparedTxnCommit> {
-        let checkpoint_guard = self
-            .table
-            .lock_mem_tier_checkpoint_for_durable_write()
-            .await;
-        let filters = self.commit_retention_context()?;
+    /// The carried-generation half of [`Self::prepare_commit_under_guards`]:
+    /// carry every committed published run into the staged snapshot, with the
+    /// run's deletes and, under `retention_sql`, the resident rows the
+    /// publication's retention matches. The inline rows were materialized in
+    /// the prerequisites. The shared commit flips `current_snapshot_id` to the
+    /// staged snapshot, so the complete current generation holds the
+    /// transaction's rows; no recovery or load path changes. An error publishes
+    /// nothing and removes the staged snapshot.
+    async fn prepare_generation_commit(
+        self,
+        checkpoint_guard: Option<tokio::sync::OwnedMutexGuard<()>>,
+        fence: &super::delete::HeldListingFence,
+        filters: Option<Arc<Vec<datafusion::logical_expr::Expr>>>,
+    ) -> Result<PreparedTxnCommit> {
         let prepare = self.table.prepare_transaction_generation(
             self.new_snapshot_id.clone(),
             self.row_count,
             Arc::clone(&self.stats),
+            fence,
         );
         // The staged candidates and every carried resident row are evaluated
         // in this one context.
@@ -453,7 +583,7 @@ impl CayenneStagedUpsert {
             },
             retention_folded: 0,
             row_count,
-            _checkpoint_guard: Some(checkpoint_guard),
+            _checkpoint_guard: checkpoint_guard,
         })
     }
 
@@ -463,8 +593,11 @@ impl CayenneStagedUpsert {
     /// transaction's per-key read footprint + write-set first, aborting with
     /// [`Error::WriteConflict`] (staged dir cleaned up) if any of those keys was
     /// committed after the transaction began (or, when per-key state is
-    /// unavailable, if the table's high-water moved at all). An owned commit task
-    /// retains that lock through atomic catalog publication and cache updates.
+    /// unavailable, if the table's high-water moved at all). It then takes the
+    /// mem-tier checkpoint lock, the visibility lock and the listing fence, in
+    /// that order, binds the `retention_sql` context at one instant after every
+    /// wait, and prepares retention under all four; an owned commit task
+    /// retains all four through atomic catalog publication and cache updates.
     ///
     /// # Errors
     ///
@@ -476,11 +609,11 @@ impl CayenneStagedUpsert {
         footprint: std::collections::HashSet<u128>,
         footprint_complete: bool,
     ) -> Result<u64> {
-        // A table without a primary key publishes a carried generation, whose
-        // in-memory flip must run under the listing fence the fused
-        // `CayenneTransaction::commit` holds; this single-table path holds no
-        // fence, so it refuses rather than publish a protected snapshot that a
-        // reopen does not load.
+        // A table without a primary key publishes a carried generation
+        // (`prepare_transaction_generation` + `commit_overwrite_in_txn`), which
+        // only the fused `CayenneTransaction::commit` composes; this
+        // single-table path publishes a protected snapshot, which a reopen of
+        // such a table does not load, so it refuses.
         if self.publishes_carried_generation()? {
             cleanup_orphan_snapshot_dir(&self.table, &self.new_snapshot_id).await;
             return Err(Error::Unsupported {
@@ -512,15 +645,45 @@ impl CayenneStagedUpsert {
             });
         }
 
-        let (checkpoint_guard, resident_retention) =
-            match self.prepare_commit_time_retention().await {
-                Ok(prepared) => prepared,
-                Err(error) => {
-                    drop(write_guard);
-                    cleanup_orphan_snapshot_dir(&self.table, &self.new_snapshot_id).await;
-                    return Err(error);
-                }
-            };
+        // The same contract as a transaction commit (`CayenneTransaction::commit`),
+        // for one table: prerequisites (checkpoint lock, inline move) before any
+        // publication guard, then the visibility lock and listing fence, ONE
+        // `now()` after every wait, the retention prepare under all four guards
+        // (its scans lease the held fence), and the publication under the same
+        // guards, which the publish task owns until it has published.
+        let prerequisites = match self.acquire_commit_prerequisites().await {
+            Ok(taken) => taken,
+            Err(error) => {
+                drop(write_guard);
+                cleanup_orphan_snapshot_dir(&self.table, &self.new_snapshot_id).await;
+                return Err(error);
+            }
+        };
+        let CommitPrerequisites {
+            checkpoint_guard,
+            superseding,
+        } = prerequisites;
+        let visibility = self.table.visibility_lock_arc().lock_owned().await;
+        let fence =
+            super::delete::HeldListingFence::new(self.table.lock_listing_fence_write_owned().await);
+        let resident_retention = match self.commit_retention_context_at(chrono::Utc::now()) {
+            Ok(filters) => {
+                self.prepare_retention_under_guards(superseding, &fence, filters)
+                    .await
+            }
+            Err(error) => Err(error),
+        };
+        let resident_retention = match resident_retention {
+            Ok(prepared) => prepared,
+            Err(error) => {
+                drop(fence);
+                drop(visibility);
+                drop(checkpoint_guard);
+                drop(write_guard);
+                cleanup_orphan_snapshot_dir(&self.table, &self.new_snapshot_id).await;
+                return Err(error);
+            }
+        };
         let retention_folded = self.retention_folded;
         super::append_commit::PreparedResolvedAppend {
             context: Arc::clone(self.table.context()),
@@ -528,6 +691,7 @@ impl CayenneStagedUpsert {
             _write_guard: write_guard,
             _held_write_lock: super::write_lock_held::held_guard(),
             _checkpoint_guard: checkpoint_guard,
+            publication_guards: Some(super::append_commit::PublicationGuards { visibility, fence }),
             snapshot_id: self.new_snapshot_id,
             rows: self.row_count,
             stats: self.stats,

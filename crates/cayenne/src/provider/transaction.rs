@@ -237,19 +237,47 @@ impl CayenneTransaction {
     ///    read footprint, written tables by footprint ∪ write-set. Any table
     ///    committed to since the transaction began aborts with a retryable
     ///    [`Error::WriteConflict`].
-    /// 3. `prepare_commit` each written table (reserve sequences + write
-    ///    deletion-vector files) **before** opening the shared metastore
-    ///    transaction — the sequence allocator autocommits, which would deadlock
-    ///    against an open `BEGIN IMMEDIATE`.
-    /// 4. Hold each written table's visibility + listing-fence locks (canonical
-    ///    order), then fuse every table's durable publish into one
-    ///    `MetastoreTransaction` on the shared catalog and commit it (bounded
-    ///    retry on a busy backend). All tables become durable together or none do.
-    /// 5. Flip each written table's in-memory visibility under its held fence.
+    /// 3. Take each written table's commit prerequisites (canonical order):
+    ///    the mem-tier checkpoint lock, and the inline move / materialization,
+    ///    which take the listing fence themselves and so run before any fence is
+    ///    held here.
+    /// 4. Take every written table's visibility lock, then its listing fence
+    ///    (canonical order), owning each fence guard (`HeldListingFence`).
+    ///    `write_lock` alone does NOT exclude every publisher: a CDC Stage-B
+    ///    publish, a staged position-vector publish and a compaction flip run
+    ///    without it and are excluded only by the visibility lock / listing
+    ///    fence. With all of them held, re-run the per-key OCC (activity that
+    ///    registered before the waits) — the one post-wait validation point.
+    /// 5. Take ONE `now()` for the whole publication, after every wait, and
+    ///    `prepare_commit_under_guards` each written table (reserve sequences,
+    ///    write deletion-vector files; retention scans lease the table's own
+    ///    held fence and complete inside the prepare) **before** opening the
+    ///    shared metastore transaction — the sequence allocator autocommits,
+    ///    which would deadlock against an open `BEGIN IMMEDIATE`.
+    /// 6. Before the durable point, revoke every fence lease and require that
+    ///    no leased scan still runs (else an ordinary abort, nothing committed).
+    /// 7. Fuse every table's durable publish into one `MetastoreTransaction` on
+    ///    the shared catalog and commit it (bounded retry on a busy backend).
+    ///    All tables become durable together or none do.
+    /// 8. Flip each written table's in-memory visibility under its held fence;
+    ///    after the durable commit nothing returns an ordinary error.
     ///
     /// On any conflict or error before the shared transaction commits, every
     /// staged/prepared write is rolled back (staged snapshot directories removed)
     /// and nothing is published.
+    ///
+    /// Cancellation (the caller drops this future): before the shared COMMIT
+    /// starts, the guards unwind, every leased scan was awaited inside its
+    /// prepare (its pin dropped with it), each prepared publish's `Drop`
+    /// removes only its own uncommitted deletion-vector files, and the staged
+    /// snapshot directories, never registered in the catalog, are left to the
+    /// orphan sweep (no `Drop` removes them: there is no synchronous removal,
+    /// and none is needed for correctness). While the COMMIT's outcome is
+    /// unresolved, `OutcomeUnknownOnDrop` keeps every file and fails the
+    /// tables closed. After it, `mark_committed` runs before any await and the
+    /// in-memory switch is synchronous, so no cancellation point separates the
+    /// durable commit from its publication, and no cleanup can remove a file
+    /// the catalog references.
     ///
     /// # Errors
     ///
@@ -328,15 +356,11 @@ impl CayenneTransaction {
             return Err(Error::WriteConflict { table });
         }
 
-        // 3. Prepare each written table (reserve sequences + write DV files)
-        //    before opening the shared transaction.
+        // 3. Every written table with rows, in the canonical order.
         let staged: Vec<CayenneStagedUpsert> = participants
             .iter_mut()
             .filter_map(|p| p.stage.take())
             .collect();
-        // The read-only participants are validated; only their held write_locks
-        // matter now, so drop the `TxnTable`s and keep the guards.
-        drop(participants);
         // A statement that staged no rows has nothing to publish: no snapshot,
         // and no deletions, which only incoming rows make.
         let mut staged_with_rows = Vec::with_capacity(staged.len());
@@ -353,30 +377,16 @@ impl CayenneTransaction {
             drop(write_guards);
             return Ok(TransactionCommit::empty());
         }
-        let mut staged_iter = staged_with_rows.into_iter();
-        let mut prepared: Vec<PreparedTxnCommit> = Vec::new();
-        while let Some(stage) = staged_iter.next() {
-            match stage.prepare_commit().await {
-                Ok(pc) => prepared.push(pc),
-                Err(e) => {
-                    drop(write_guards);
-                    rollback_prepared(prepared).await;
-                    for remaining in staged_iter {
-                        let _ = remaining.rollback().await;
-                    }
-                    return Err(e);
-                }
-            }
-        }
 
-        // 4. All written tables must share one metastore database.
-        let shared_catalog = Arc::clone(prepared[0].provider().catalog());
-        if prepared[1..]
+        // 4. All written tables must share one metastore database (checked
+        //    before any further lock is taken).
+        let shared_catalog = Arc::clone(staged_with_rows[0].table().catalog());
+        if staged_with_rows[1..]
             .iter()
-            .any(|pc| !Arc::ptr_eq(pc.provider().catalog(), &shared_catalog))
+            .any(|stage| !Arc::ptr_eq(stage.table().catalog(), &shared_catalog))
         {
             drop(write_guards);
-            rollback_prepared(prepared).await;
+            rollback_stages(staged_with_rows).await;
             return Err(Error::Internal {
                 table: "<transaction>".to_string(),
                 message: "multi-table transaction spans more than one metastore database"
@@ -385,25 +395,166 @@ impl CayenneTransaction {
         }
         let Some(catalog) = shared_catalog.as_any().downcast_ref::<CayenneCatalog>() else {
             drop(write_guards);
-            rollback_prepared(prepared).await;
+            rollback_stages(staged_with_rows).await;
             return Err(Error::Internal {
                 table: "<transaction>".to_string(),
                 message: "transaction participant is not backed by a Cayenne catalog".to_string(),
             });
         };
 
-        // Hold visibility + listing-fence locks (canonical order) across the fused
-        // durable commit and the in-memory publish.
-        let mut visibility_guards = Vec::with_capacity(prepared.len());
-        for pc in &prepared {
-            visibility_guards.push(pc.provider().visibility_lock_arc().lock_owned().await);
-        }
-        let mut fence_guards = Vec::with_capacity(prepared.len());
-        for pc in &prepared {
-            fence_guards.push(pc.provider().lock_listing_fence_write_owned().await);
+        // 5. Prerequisites, canonical order, before any publication guard:
+        //    every written table's mem-tier checkpoint lock (always; held in its
+        //    `PreparedTxnCommit` through `finish`), and the inline move, which
+        //    takes that table's listing fence itself (never `write_lock` or the
+        //    checkpoint lock, both already held here) and so must never run
+        //    under the fences held below. Cross-table order: all `write_lock`s,
+        //    then each table's checkpoint lock in `table_id` order, then all
+        //    visibility locks, then all fences; no holder of a checkpoint lock
+        //    blocks on `write_lock` (`acquire_capture_locks_blocking` drops it
+        //    first), and no holder of a visibility lock or fence waits on a
+        //    checkpoint lock.
+        let mut prerequisites = Vec::with_capacity(staged_with_rows.len());
+        for stage in &staged_with_rows {
+            match stage.acquire_commit_prerequisites().await {
+                Ok(taken) => prerequisites.push(taken),
+                Err(e) => {
+                    drop(prerequisites);
+                    drop(write_guards);
+                    rollback_stages(staged_with_rows).await;
+                    return Err(e);
+                }
+            }
         }
 
-        // Fuse every table's durable publish into one transaction; commit or none.
+        // 6. Every publication guard, canonical order: visibility, then listing
+        //    fence (the order every other holder of both takes). Held across the
+        //    prepare, the fused durable commit and the in-memory publish, so no
+        //    publisher that bypasses `write_lock` (a CDC Stage-B publish, a
+        //    staged position-vector publish, a compaction flip) lands between
+        //    this commit's retention scan and its publication.
+        let mut visibility_guards = Vec::with_capacity(staged_with_rows.len());
+        for stage in &staged_with_rows {
+            visibility_guards.push(stage.table().visibility_lock_arc().lock_owned().await);
+        }
+        let mut fence_guards: Vec<super::delete::HeldListingFence> =
+            Vec::with_capacity(staged_with_rows.len());
+        for stage in &staged_with_rows {
+            fence_guards.push(super::delete::HeldListingFence::new(
+                stage.table().lock_listing_fence_write_owned().await,
+            ));
+        }
+
+        // 7. Re-validate after every wait. `write_lock` (held since step 1)
+        //    does not exclude a CDC Stage-B publish, which runs under the
+        //    visibility lock and listing fence only; its keys were recorded at
+        //    its reserved sequence under `write_lock` before that was released,
+        //    so this check sees any such activity that registered before the
+        //    waits, and nothing further can publish while these guards are held.
+        let mut conflict: Option<String> = None;
+        {
+            let empty = PkDigestSet::with_capacity(0);
+            for p in &participants {
+                let current = p.provider.sequence_high_water().await;
+                let write_set = staged_with_rows
+                    .iter()
+                    .find(|stage| stage.table().table_id() == p.provider.table_id())
+                    .map_or(&empty, CayenneStagedUpsert::validated_keys);
+                if !p.token.staging_clean()
+                    || p.provider.transaction_has_conflict(
+                        p.token.stage_seq(),
+                        &p.footprint,
+                        !p.footprint_incomplete,
+                        write_set,
+                        current,
+                    )
+                {
+                    conflict = Some(p.provider.table_name().to_string());
+                    break;
+                }
+            }
+        }
+        if let Some(table) = conflict {
+            drop(fence_guards);
+            drop(visibility_guards);
+            drop(prerequisites);
+            drop(write_guards);
+            rollback_stages(staged_with_rows).await;
+            return Err(Error::WriteConflict { table });
+        }
+        // The read-only participants are validated; only their held write_locks
+        // matter now.
+        drop(participants);
+
+        // 8. ONE instant for the whole publication, after every wait above;
+        //    every participant's `retention_sql` context folds `now()` at it.
+        let commit_now = chrono::Utc::now();
+        let mut contexts = Vec::with_capacity(staged_with_rows.len());
+        for stage in &staged_with_rows {
+            match stage.commit_retention_context_at(commit_now) {
+                Ok(context) => contexts.push(context),
+                Err(e) => {
+                    drop(fence_guards);
+                    drop(visibility_guards);
+                    drop(prerequisites);
+                    drop(write_guards);
+                    rollback_stages(staged_with_rows).await;
+                    return Err(e);
+                }
+            }
+        }
+
+        // 9. Prepare each table under the held guards (retention scans lease
+        //    the table's own fence and complete before the prepare returns).
+        let mut prepared: Vec<PreparedTxnCommit> = Vec::with_capacity(staged_with_rows.len());
+        {
+            let mut inputs = staged_with_rows
+                .into_iter()
+                .zip(prerequisites)
+                .zip(contexts)
+                .zip(fence_guards.iter());
+            while let Some((((stage, taken), context), fence)) = inputs.next() {
+                match stage
+                    .prepare_commit_under_guards(taken, fence, context)
+                    .await
+                {
+                    Ok(pc) => prepared.push(pc),
+                    Err(e) => {
+                        let remaining: Vec<CayenneStagedUpsert> =
+                            inputs.map(|(((stage, _), _), _)| stage).collect();
+                        drop(fence_guards);
+                        drop(visibility_guards);
+                        drop(write_guards);
+                        rollback_prepared(prepared).await;
+                        rollback_stages(remaining).await;
+                        return Err(e);
+                    }
+                }
+            }
+        }
+
+        // 10. Before the durable point: revoke every lease and require that no
+        //     scan the prepare started still runs. A violation here is an
+        //     ordinary abort (nothing committed); after the revoke no lease can be
+        //     pinned again, so nothing leased runs past this point.
+        if let Some(busy) = fence_guards
+            .iter()
+            .zip(&prepared)
+            .find(|(fence, _)| !fence.revoke_leases_and_check_idle())
+            .map(|(_, pc)| pc.table_id().to_string())
+        {
+            drop(fence_guards);
+            drop(visibility_guards);
+            drop(write_guards);
+            rollback_prepared(prepared).await;
+            return Err(Error::Internal {
+                table: busy,
+                message: "a retention scan was still running on the transaction's listing fence \
+                          before its commit; nothing was committed"
+                    .to_string(),
+            });
+        }
+
+        // 11. Fuse every table's durable publish into one transaction; commit or none.
         match commit_fused(catalog, &mut prepared).await {
             Ok(()) => {}
             Err(FusedFailure::Uncommitted(e)) => {
@@ -417,9 +568,12 @@ impl CayenneTransaction {
             Err(FusedFailure::Unknown(e)) => return Err(e),
         }
 
-        // 5. Flip in-memory visibility under the held fences. The durable write
-        //    already committed, so a finish failure is logged, not fatal (reopen
-        //    reconstructs the same state from the catalog).
+        // 12. Flip in-memory visibility under the held fences. The durable write
+        //     already committed, so a finish failure is logged, not fatal (reopen
+        //     reconstructs the same state from the catalog), and nothing below can
+        //     turn the committed outcome into an error: releasing the guards has
+        //     no error path, and the leases were revoked (and found idle) before
+        //     the durable point, so no capture can still run on a fence.
         let mut summary = TransactionCommit::empty();
         for pc in prepared {
             let table_id = pc.table_id().to_string();
@@ -606,6 +760,15 @@ async fn rollback_staged(participants: Vec<TxnTable>) {
         if let Some(stage) = p.stage.take()
             && let Err(e) = stage.rollback().await
         {
+            tracing::warn!("transaction: staged rollback cleanup failed: {e}");
+        }
+    }
+}
+
+/// Discard staged upserts that never reached a prepare.
+async fn rollback_stages(stages: Vec<CayenneStagedUpsert>) {
+    for stage in stages {
+        if let Err(e) = stage.rollback().await {
             tracing::warn!("transaction: staged rollback cleanup failed: {e}");
         }
     }

@@ -78,6 +78,31 @@ pub fn coerce_and_simplify_exprs(
         .collect()
 }
 
+/// [`coerce_and_simplify_exprs`] with `now()` and the other time-dependent functions
+/// folded at `start` instead of the current time: callers that evaluate several
+/// expression sets in one execution context pass the same instant to each.
+///
+/// # Errors
+///
+/// Returns an error if schema conversion, type coercion, or simplification fails.
+pub fn coerce_and_simplify_exprs_at(
+    exprs: impl IntoIterator<Item = Expr>,
+    schema: &SchemaRef,
+    start: chrono::DateTime<chrono::Utc>,
+) -> Result<Vec<Expr>, DataFusionError> {
+    let df_schema = Arc::new(DFSchema::try_from(schema.as_ref().clone())?);
+    let simplifier = ExprSimplifier::new(
+        SimplifyContext::builder()
+            .with_query_execution_start_time(Some(start))
+            .with_schema(Arc::clone(&df_schema))
+            .build(),
+    );
+    exprs
+        .into_iter()
+        .map(|expr| simplifier.simplify(simplifier.coerce(expr, &df_schema)?))
+        .collect()
+}
+
 /// Build the simplification context for `schema`.
 ///
 /// `query_execution_start_time` is set so that `now()` and the other time-dependent functions

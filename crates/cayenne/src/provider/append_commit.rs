@@ -51,8 +51,11 @@ pub(super) struct PreparedResolvedAppend {
     /// Holds the mem-tier checkpoint off until publication has acted on what
     /// validation decided about where each replaced row lives
     /// ([`CayenneTableProvider::lock_mem_tier_checkpoint_for_durable_write`]).
-    /// `None` for a transaction's staged upsert, which does not take it.
+    /// A staged upsert's commit always takes it (`acquire_commit_prerequisites`).
     pub _checkpoint_guard: Option<OwnedMutexGuard<()>>,
+    /// The publication guards, when the caller already holds them; `None`: the
+    /// commit takes them itself, after its prepare.
+    pub publication_guards: Option<PublicationGuards>,
     pub snapshot_id: String,
     pub rows: u64,
     pub stats: Arc<ColumnStatsAccumulator>,
@@ -64,6 +67,15 @@ pub(super) struct PreparedResolvedAppend {
     /// The `retention_sql` delete over the resident rows this publication
     /// keeps, committed in its transaction and published under its fence.
     pub resident_retention: Option<super::delete::PreparedDeletionPublish>,
+}
+
+/// The visibility lock and listing fence a caller already holds for this
+/// publication (a staged upsert's commit, which prepared its `retention_sql`
+/// delete under them, leasing `fence`). The publish task owns them until it has
+/// published.
+pub(super) struct PublicationGuards {
+    pub visibility: OwnedMutexGuard<()>,
+    pub fence: super::delete::HeldListingFence,
 }
 
 /// A failed publication, and whether its snapshot's files must be kept because
@@ -128,14 +140,38 @@ impl PreparedResolvedAppend {
             .sync_local_snapshot_dir(&self.snapshot_id)
             .await
             .map_err(Failure::discard)?;
-        #[cfg(test)]
-        if let Some(pause) = test_seams::take_pause(self.table.table_id()) {
-            pause().await;
+        let (_visibility, fence) = match self.publication_guards.take() {
+            Some(PublicationGuards { visibility, fence }) => (visibility, fence),
+            None => {
+                #[cfg(test)]
+                if let Some(pause) = test_seams::take_pause(self.table.table_id()) {
+                    pause().await;
+                }
+                let lock_start = Instant::now();
+                let visibility = self.table.visibility_lock_arc().lock_owned().await;
+                let fence = super::delete::HeldListingFence::new(
+                    self.table.lock_listing_fence_write_owned().await,
+                );
+                record_cayenne_write_phase(
+                    self.table.table_name(),
+                    "publish_lock_wait",
+                    lock_start,
+                );
+                (visibility, fence)
+            }
+        };
+        // Before anything durable: no scan the caller's prepare started may
+        // still run on the fence, and none can pin it from here on. A violation
+        // is an ordinary failure (nothing committed); after the commit below,
+        // releasing the guards has no error path.
+        if !fence.revoke_leases_and_check_idle() {
+            return Err(Failure::discard(Error::Internal {
+                table: self.table.table_name().to_string(),
+                message: "a retention scan was still running on the listing fence before the \
+                          commit; nothing was committed"
+                    .to_string(),
+            }));
         }
-        let lock_start = Instant::now();
-        let _visibility = self.table.visibility_lock_arc().lock_owned().await;
-        let _fence = self.table.lock_listing_fence_write_owned().await;
-        record_cayenne_write_phase(self.table.table_name(), "publish_lock_wait", lock_start);
 
         let publish_start = Instant::now();
         let mut prepared = self
@@ -415,9 +451,11 @@ pub(crate) mod test_seams {
     static PAUSES_AFTER_COMMIT_TIME_RETENTION: LazyLock<Mutex<HashMap<String, Pause>>> =
         LazyLock::new(|| Mutex::new(HashMap::new()));
 
-    /// Run `pause` in the next transaction commit on `table_id` with
-    /// `retention_sql`, after its resident retention delete is prepared and
-    /// before anything is published (the commit holds `write_lock` only).
+    /// Run `pause` in the next commit (transaction or single-table staged
+    /// upsert) on `table_id` with `retention_sql`, after its resident retention
+    /// delete is prepared and before anything is durable (the commit holds
+    /// `write_lock`, the mem-tier checkpoint lock, the visibility lock and the
+    /// listing fence).
     pub(crate) fn pause_after_commit_time_retention(table_id: &str, pause: Pause) {
         PAUSES_AFTER_COMMIT_TIME_RETENTION
             .lock()
@@ -428,9 +466,9 @@ pub(crate) mod test_seams {
         PAUSES_AFTER_COMMIT_TIME_RETENTION.lock().remove(table_id)
     }
 
-    /// Run `pause` in the next transaction commit on `table_id` with
-    /// `retention_sql`, immediately before it waits for the mem-tier
-    /// checkpoint lock.
+    /// Run `pause` in the next commit (transaction or single-table staged
+    /// upsert) on `table_id`, immediately before it waits for the mem-tier
+    /// checkpoint lock (holding `write_lock` only).
     pub(crate) fn pause_at_checkpoint_wait(table_id: &str, pause: Pause) {
         PAUSES_AT_CHECKPOINT_WAIT
             .lock()

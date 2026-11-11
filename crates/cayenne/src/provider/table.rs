@@ -36,7 +36,8 @@ use super::constants::{
     LOOKUP_INDEX_DIR_NAME, STAGING_DIR_NAME, STAGING_WAL_FILENAME, STAGING_WAL_TMP_FILENAME,
 };
 use super::delete::{
-    CaptureLocks, CayenneDeletionSink, DeleteScanSource, DeletionIdentifier,
+    CaptureLocks, CayenneDeletionSink, DeleteScanSource, DeletionIdentifier, FenceAccess,
+    HeldListingFence,
     DeletionVectorWriteResult, DeletionVectorWriteSpec, DeletionVectorWriter,
     FileBasedDeletionSink, InsertRecordHandling, Int64PkDeletionFilterExec,
     KeyBasedDeletionFilterExec,
@@ -6811,6 +6812,20 @@ impl CayenneTableProvider {
         util::expr::coerce_and_simplify_exprs(
             self.retention_filters.iter().cloned(),
             &self.table_schema(),
+        )
+    }
+
+    /// [`Self::coerced_retention_filters`] with `now()` folded at `at`: a
+    /// multi-table commit builds every participant's context from ONE instant,
+    /// taken after all of its lock waits.
+    pub(crate) fn coerced_retention_filters_at(
+        &self,
+        at: chrono::DateTime<chrono::Utc>,
+    ) -> datafusion_common::Result<Vec<Expr>> {
+        util::expr::coerce_and_simplify_exprs_at(
+            self.retention_filters.iter().cloned(),
+            &self.table_schema(),
+            at,
         )
     }
 
@@ -32399,6 +32414,12 @@ impl CayenneTableProvider {
     /// Used by the cross-partition append coordinator (#10125 step 6) so it
     /// can hold fences across every participating partition for the duration
     /// of one barrier window.
+    /// The listing fence itself, so a holder of one of its guards can be
+    /// checked against it (`HeldListingFence::locks`).
+    pub(crate) fn listing_fence_arc(&self) -> &Arc<tokio::sync::RwLock<()>> {
+        &self.listing_fence
+    }
+
     pub async fn lock_listing_fence_write_owned(&self) -> tokio::sync::OwnedRwLockWriteGuard<()> {
         Arc::clone(&self.listing_fence).write_owned().await
     }
@@ -39524,6 +39545,22 @@ impl CayenneTableProvider {
     /// published run a generation that replaces the table must carry.
     pub(crate) async fn published_runs(&self) -> (String, Vec<String>) {
         let _fence = self.listing_fence.read().await;
+        self.published_runs_locked()
+    }
+
+    /// [`Self::published_runs`] for a commit holding `listing_fence` for write.
+    /// Synchronous and borrow-scoped: the result is read while `fence` is held.
+    /// `None` when `fence` is another table's guard.
+    pub(crate) fn published_runs_under_fence(
+        &self,
+        fence: &HeldListingFence,
+    ) -> Option<(String, Vec<String>)> {
+        fence
+            .locks(&self.listing_fence)
+            .then(|| self.published_runs_locked())
+    }
+
+    fn published_runs_locked(&self) -> (String, Vec<String>) {
         let mut runs: Vec<String> = self.protected_snapshots.load().keys().cloned().collect();
         runs.sort();
         (self.get_current_snapshot_id(), runs)
@@ -44460,6 +44497,43 @@ impl CayenneTableProvider {
         write_lock: Option<Arc<tokio::sync::Mutex<()>>>,
         source: DeletionRequestSource,
     ) -> datafusion_common::Result<CayenneDeletionSink> {
+        self.build_deletion_vector_sink_with(filters, write_lock, source, FenceAccess::Acquire)
+            .await
+    }
+
+    /// [`Self::build_deletion_vector_sink`] for a commit that owns this table's
+    /// `listing_fence` write guard. The sink gets a lease (see
+    /// [`FenceAccess::Leased`]): it holds the fence only while a capture runs,
+    /// fails once the commit released it, and another table's guard is refused
+    /// here and at every capture.
+    pub(crate) async fn build_deletion_vector_sink_under_fence(
+        &self,
+        filters: &[Expr],
+        source: DeletionRequestSource,
+        fence: &HeldListingFence,
+    ) -> datafusion_common::Result<CayenneDeletionSink> {
+        if !fence.locks(&self.listing_fence) {
+            return Err(datafusion_common::DataFusionError::Internal(format!(
+                "held-fence deletion sink for table {} given another table's fence",
+                self.table_metadata.table_name
+            )));
+        }
+        self.build_deletion_vector_sink_with(
+            filters,
+            None,
+            source,
+            FenceAccess::Leased(fence.lease()),
+        )
+        .await
+    }
+
+    async fn build_deletion_vector_sink_with(
+        &self,
+        filters: &[Expr],
+        write_lock: Option<Arc<tokio::sync::Mutex<()>>>,
+        source: DeletionRequestSource,
+        fence: FenceAccess,
+    ) -> datafusion_common::Result<CayenneDeletionSink> {
         // Each protected snapshot keeps its `max_delete_seq_at_creation`: only deletes
         // NEWER than that apply to its rows, which is what tells a version an upsert has
         // superseded from the row that replaced it. Dropping the sequence here is what
@@ -44473,9 +44547,10 @@ impl CayenneTableProvider {
         let capture_locks = CaptureLocks {
             listing_fence: Arc::clone(&self.listing_fence),
             scan_state_lock: Arc::clone(&self.scan_state_lock),
+            fence,
         };
         let (protected_tables, tombstones_at_capture) = {
-            let _guards = capture_locks.read().await;
+            let _guards = capture_locks.read().await?;
             (
                 self.build_protected_snapshot_listing_tables()?,
                 self.pk_deletion_snapshot(),
@@ -84357,6 +84432,7 @@ mod tests {
     }
 
     mod commit_time_retention;
+    mod f2_publication_guards;
     mod hybrid_retention;
     mod layered_upsert_state;
     mod repeated_keys;
