@@ -39,7 +39,12 @@ limitations under the License.
 //! integers, text, and `numeric` and `date` cast to `VARCHAR`, whose text forms
 //! the two engines share.
 
-use std::{collections::HashMap, path::Path, sync::Arc, time::Duration};
+use std::{
+    collections::HashMap,
+    path::{Path, PathBuf},
+    sync::Arc,
+    time::Duration,
+};
 
 use app::AppBuilder;
 use arrow::array::RecordBatch;
@@ -54,6 +59,7 @@ use spicepod::{
 use tokio_postgres::SimpleQueryMessage;
 
 use crate::{
+    acceleration::has_vortex_file,
     configure_test_datafusion, init_tracing,
     postgres::common::{self, get_pg_params},
     utils::{register_test_connectors, run_query, runtime_ready_check, test_request_context},
@@ -141,18 +147,60 @@ const PASS_THROUGH: [&str; 3] = [
 ];
 const REMOTE_SCANS: [&str; 2] = ["VirtualExecutionPlan", "SqlExec"];
 
+/// One operator of a physical plan: its name, and its depth in the tree.
+struct Operator<'a> {
+    name: &'a str,
+    depth: usize,
+}
+
+/// The physical plan text in `plan`, an `EXPLAIN` answer.
+fn physical_plan(plan: &[Row]) -> Result<String, String> {
+    plan.iter()
+        .find(|row| row.first().and_then(Option::as_deref) == Some("physical_plan"))
+        .and_then(|row| row.get(1).cloned().flatten())
+        .ok_or_else(|| format!("the plan has no physical plan: {plan:?}"))
+}
+
+/// The operators of `physical`, in plan order, each with its indentation as
+/// its depth.
+fn operators(physical: &str) -> Vec<Operator<'_>> {
+    physical
+        .lines()
+        .filter_map(|line| {
+            let name = line.split([':', ' ']).find(|token| !token.is_empty())?;
+            Some(Operator {
+                name,
+                depth: line.len() - line.trim_start().len(),
+            })
+        })
+        .collect()
+}
+
+/// Each operator of `operators` with no child, a source its rows come from,
+/// with the names of the operators above it.
+fn leaves<'a>(operators: &[Operator<'a>]) -> Vec<(&'a str, Vec<&'a str>)> {
+    let mut above: Vec<&Operator<'a>> = Vec::new();
+    let mut leaves = Vec::new();
+    for (i, op) in operators.iter().enumerate() {
+        while above.last().is_some_and(|parent| parent.depth >= op.depth) {
+            above.pop();
+        }
+        if operators
+            .get(i + 1)
+            .is_none_or(|next| next.depth <= op.depth)
+        {
+            leaves.push((op.name, above.iter().map(|parent| parent.name).collect()));
+        }
+        above.push(op);
+    }
+    leaves
+}
+
 /// Checks that the physical plan in `plan`, an `EXPLAIN` answer, runs nothing
 /// in Spice but [`PASS_THROUGH`] operators over one of [`REMOTE_SCANS`].
 fn check_nothing_local(plan: &[Row]) -> Result<(), String> {
-    let physical = plan
-        .iter()
-        .find(|row| row.first().and_then(Option::as_deref) == Some("physical_plan"))
-        .and_then(|row| row.get(1).cloned().flatten())
-        .ok_or_else(|| format!("the plan has no physical plan: {plan:?}"))?;
-    let operators: Vec<&str> = physical
-        .lines()
-        .filter_map(|line| line.split([':', ' ']).find(|token| !token.is_empty()))
-        .collect();
+    let physical = physical_plan(plan)?;
+    let operators: Vec<&str> = operators(&physical).iter().map(|op| op.name).collect();
     let local: Vec<&str> = operators
         .iter()
         .copied()
@@ -322,6 +370,11 @@ enum Kind {
     CayenneVortex,
 }
 
+/// Where a `mode: file` acceleration of dataset `name` keeps its data.
+fn data_dir(dir: &Path, name: &str) -> PathBuf {
+    dir.join(name).join("data")
+}
+
 /// `dir` holds a `mode: file` acceleration's data and metastore, one
 /// directory per dataset `name`.
 fn dataset(port: usize, table: &str, name: &str, kind: Kind, dir: &Path) -> Dataset {
@@ -332,26 +385,27 @@ fn dataset(port: usize, table: &str, name: &str, kind: Kind, dir: &Path) -> Data
             .map(|(k, v)| (k, v.expose_secret().to_string()))
             .collect::<HashMap<String, String>>(),
     ));
+    let full = Acceleration {
+        enabled: true,
+        refresh_mode: Some(RefreshMode::Full),
+        ..Acceleration::default()
+    };
     ds.acceleration = match kind {
         Kind::Federated => None,
         Kind::Accelerated => Some(Acceleration {
-            enabled: true,
             engine: Some("arrow".to_string()),
-            refresh_mode: Some(RefreshMode::Full),
-            ..Acceleration::default()
+            ..full
         }),
         Kind::CayenneMemory => Some(Acceleration {
-            enabled: true,
             engine: Some("cayenne".to_string()),
             mode: Mode::Memory,
-            refresh_mode: Some(RefreshMode::Full),
-            ..Acceleration::default()
+            ..full
         }),
         Kind::CayenneFile | Kind::CayenneVortex => {
             let mut params = HashMap::from([
                 (
                     "cayenne_file_path".to_string(),
-                    dir.join(name).join("data").display().to_string(),
+                    data_dir(dir, name).display().to_string(),
                 ),
                 (
                     "cayenne_metadata_dir".to_string(),
@@ -362,12 +416,10 @@ fn dataset(port: usize, table: &str, name: &str, kind: Kind, dir: &Path) -> Data
                 params.insert("cayenne_inline_max_rows".to_string(), "0".to_string());
             }
             Some(Acceleration {
-                enabled: true,
                 engine: Some("cayenne".to_string()),
                 mode: Mode::File,
-                refresh_mode: Some(RefreshMode::Full),
                 params: Some(Params::from_string_map(params)),
-                ..Acceleration::default()
+                ..full
             })
         }
     };
@@ -476,57 +528,38 @@ const SUBJECTS: [Subject; 5] = [
     },
 ];
 
-/// The operator that scans a Cayenne acceleration. A Cayenne side whose plan
-/// lacks it answered from somewhere else, and its agreement says nothing about
-/// Cayenne.
+/// The operator that scans a Cayenne acceleration.
 const CAYENNE_SCAN: &str = "CayenneAccelerationExec";
 
-/// The operators of a plan that `DataFusion` answered from the table's
-/// statistics without a scan: an aggregate whose filter the column bounds rule
-/// out, such as `count(*) ... WHERE grp > 100` when Cayenne reports `grp` at
-/// most 6, folds to a constant over one placeholder row. The constant comes
-/// from Cayenne's statistics, so the answer is still Cayenne's to get right.
-const STATISTICS_ANSWER: [&str; 3] = ["ProjectionExec", "BytesProcessedExec", "PlaceholderRowExec"];
+/// Sources that read no table: `DataFusion` plans one when it answers from the
+/// table's statistics, such as `count(*) ... WHERE grp > 100` folded to `0`
+/// over one placeholder row because Cayenne reports `grp` at most 6. The
+/// constant then comes from Cayenne's statistics, so it is still Cayenne's
+/// answer to get right.
+const CONSTANT_SOURCES: [&str; 2] = ["PlaceholderRowExec", "EmptyExec"];
 
-/// Checks that the physical plan in `plan`, an `EXPLAIN` answer, reads the
-/// Cayenne acceleration through [`CAYENNE_SCAN`], or is a
-/// [`STATISTICS_ANSWER`] built from Cayenne's statistics.
-fn check_cayenne_scan(plan: &[Row]) -> Result<(), String> {
-    let physical = plan
-        .iter()
-        .find(|row| row.first().and_then(Option::as_deref) == Some("physical_plan"))
-        .and_then(|row| row.get(1).cloned().flatten())
-        .ok_or_else(|| format!("the plan has no physical plan: {plan:?}"))?;
-    let operators: Vec<&str> = physical
-        .lines()
-        .filter_map(|line| line.split([':', ' ']).find(|token| !token.is_empty()))
+/// Checks that every source of the physical plan in `plan`, an `EXPLAIN`
+/// answer, is read through a [`CAYENNE_SCAN`] or is one of
+/// [`CONSTANT_SOURCES`]. A Cayenne side with any other source answered from
+/// somewhere else, and its agreement says nothing about Cayenne.
+fn check_cayenne_sources(plan: &[Row]) -> Result<(), String> {
+    let physical = physical_plan(plan)?;
+    let other: Vec<&str> = leaves(&operators(&physical))
+        .into_iter()
+        .filter(|(leaf, above)| {
+            *leaf != CAYENNE_SCAN
+                && !above.contains(&CAYENNE_SCAN)
+                && !CONSTANT_SOURCES.contains(leaf)
+        })
+        .map(|(leaf, _)| leaf)
         .collect();
-    let from_statistics = operators.contains(&"PlaceholderRowExec")
-        && operators.iter().all(|op| STATISTICS_ANSWER.contains(op));
-    if physical.contains(CAYENNE_SCAN) || from_statistics {
+    if other.is_empty() {
         Ok(())
     } else {
         Err(format!(
-            "the plan does not read the Cayenne acceleration ({CAYENNE_SCAN}):\n{physical}"
+            "the plan reads {other:?}, not only the Cayenne acceleration ({CAYENNE_SCAN}):\n{physical}"
         ))
     }
-}
-
-/// Counts the `.vortex` files anywhere under `dir`.
-fn vortex_files(dir: &Path) -> Result<usize, anyhow::Error> {
-    let mut count = 0;
-    let mut pending = vec![dir.to_path_buf()];
-    while let Some(next) = pending.pop() {
-        for entry in std::fs::read_dir(&next)? {
-            let path = entry?.path();
-            if path.is_dir() {
-                pending.push(path);
-            } else if path.extension().is_some_and(|ext| ext == "vortex") {
-                count += 1;
-            }
-        }
-    }
-    Ok(count)
 }
 
 async fn compare_case(
@@ -567,30 +600,25 @@ async fn compare_case(
             }
             Err(e) => failures.push(format!("{name}: {sql}\n    failed: {e}")),
         }
-        match subject.kind {
-            Kind::Federated => {
-                // The federated side must send the whole query to PostgreSQL,
-                // or it is DataFusion over a wider scan and compares nothing
-                // the accelerated side does not.
-                let plan = spice_rows(rt, &format!("EXPLAIN {sql}"))
-                    .await
-                    .map_err(|e| anyhow::anyhow!("EXPLAIN {sql}: {e}"))?;
-                if let Err(reason) = check_nothing_local(&plan) {
-                    failures.push(format!("{name}: {sql}\n    {reason}"));
-                    all_remote = false;
-                }
-            }
+        // The federated side must send the whole query to PostgreSQL, or it is
+        // DataFusion over a wider scan and compares nothing the accelerated side
+        // does not. A Cayenne side must read only Cayenne, or its agreement says
+        // nothing about what Cayenne stored.
+        let check: Option<fn(&[Row]) -> Result<(), String>> = match subject.kind {
+            Kind::Federated => Some(check_nothing_local),
             Kind::CayenneMemory | Kind::CayenneFile | Kind::CayenneVortex => {
-                // A Cayenne side must read through Cayenne's scan, or its
-                // agreement says nothing about what Cayenne stored.
-                let plan = spice_rows(rt, &format!("EXPLAIN {sql}"))
-                    .await
-                    .map_err(|e| anyhow::anyhow!("EXPLAIN {sql}: {e}"))?;
-                if let Err(reason) = check_cayenne_scan(&plan) {
-                    failures.push(format!("{name}: {sql}\n    {reason}"));
-                }
+                Some(check_cayenne_sources)
             }
-            Kind::Accelerated => {}
+            Kind::Accelerated => None,
+        };
+        if let Some(check) = check {
+            let plan = spice_rows(rt, &format!("EXPLAIN {sql}"))
+                .await
+                .map_err(|e| anyhow::anyhow!("EXPLAIN {sql}: {e}"))?;
+            if let Err(reason) = check(&plan) {
+                failures.push(format!("{name}: {sql}\n    {reason}"));
+                all_remote &= subject.kind != Kind::Federated;
+            }
         }
     }
     Ok(all_remote)
@@ -636,24 +664,24 @@ async fn federated_and_accelerated_postgres_answers_match_postgres() -> Result<(
                 expected
             );
             for subject in &SUBJECTS {
-                let table = subject.items;
                 assert_eq!(
-                    spice_rows(&rt, &format!("SELECT count(*) FROM {table}"))
+                    spice_rows(&rt, &format!("SELECT count(*) FROM {}", subject.items))
                         .await
                         .map_err(|e| anyhow::anyhow!(e))?,
                     expected,
-                    "{table} must hold every fixture row"
+                    "{} must hold every fixture row",
+                    subject.items
                 );
             }
             // The Vortex side must serve its rows from Vortex files on disk,
             // not from rows inlined in its metastore.
             for subject in SUBJECTS.iter().filter(|s| s.kind == Kind::CayenneVortex) {
                 for table in [subject.items, subject.regions] {
-                    let files = vortex_files(&dir.path().join(table).join("data"))?;
+                    let data = data_dir(dir.path(), table);
                     anyhow::ensure!(
-                        files > 0,
+                        has_vortex_file(&data),
                         "{table} turns inlining off but wrote no Vortex file under {}",
-                        dir.path().join(table).display()
+                        data.display()
                     );
                 }
             }
