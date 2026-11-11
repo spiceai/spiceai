@@ -964,6 +964,16 @@ impl<'a> AppendMutationWriter<'a> {
         let prepared = self.table.prepare_stream_for_insert(raw).await?;
         let post_validation = prepared.post_validation();
         let batches: Vec<RecordBatch> = prepared.stream.try_collect().await?;
+        // `retention_sql` over the rows validation kept, before this batch is
+        // published: the rows their keys supersede are already among the
+        // deletions, so the RAM-tier append below publishes the change and its
+        // retention delete together. Measured before the budget reservation, so it
+        // reserves only the rows kept. An error fails the batch before anything is
+        // published or reserved.
+        let validated_rows: usize = batches.iter().map(RecordBatch::num_rows).sum();
+        let batches = self.table.drop_retention_matches(batches)?;
+        let retention_dropped =
+            validated_rows - batches.iter().map(RecordBatch::num_rows).sum::<usize>();
         let incoming_bytes = arrow_tools::batch_bytes::RetainedBytes::of(&batches);
         incoming_rows = batches
             .iter()
@@ -1059,10 +1069,15 @@ impl<'a> AppendMutationWriter<'a> {
             }
         };
         // Record the PK keys so a subsequent same-table upsert sees this batch's
-        // rows as present.
-        let record_seq = self.table.sequence_high_water().await;
-        self.table
-            .record_mem_tier_pk_keys(&validated_keys, record_seq);
+        // rows as present. Not when retention dropped some: their keys are among
+        // the validated ones but not resident, so the cache rebuilds instead.
+        if retention_dropped > 0 {
+            self.table.clear_cached_pk_keyset();
+        } else {
+            let record_seq = self.table.sequence_high_water().await;
+            self.table
+                .record_mem_tier_pk_keys(&validated_keys, record_seq);
+        }
 
         drop(write_guard);
         // Memory mode arms retention here — see the method's own doc. A no-op for the
@@ -1287,6 +1302,14 @@ impl<'a> AppendMutationWriter<'a> {
                 .write_resolving_repeats_after(data, resolver, write_guard, checkpoint_guard)
                 .await;
         }
+        // A table without a primary key: an append supersedes nothing, so
+        // `retention_sql` is applied by not writing the rows it deletes (see
+        // `drop_retention_matches_from_stream`), and no publication carries them.
+        let data = if self.table.primary_key_indices()?.is_none() {
+            self.table.drop_retention_matches_from_stream(data)?
+        } else {
+            data
+        };
         let prepared = self.table.prepare_stream_for_insert(data).await?;
         #[cfg(test)]
         self.table.run_test_post_prepare_hook().await;

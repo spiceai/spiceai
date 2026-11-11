@@ -105,6 +105,7 @@ pub(crate) mod mutation_writer;
 pub(crate) mod on_conflict;
 pub(crate) mod overwrite;
 pub(crate) mod overwrite_postpass;
+pub(crate) mod overwrite_retention;
 pub mod partitioned_wal;
 pub(crate) mod pk_deletion_mode;
 pub(crate) mod pk_index;

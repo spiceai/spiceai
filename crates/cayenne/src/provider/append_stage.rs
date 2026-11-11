@@ -241,6 +241,18 @@ impl CayenneTableProvider {
                 .await?;
             self.sync_local_snapshot_dir(&new_snapshot_id).await?;
             let superseded = resolution.superseded(self, &new_snapshot_id, rows).await?;
+            // `retention_sql` over the rows this append adds, once its repeated keys
+            // are resolved: the superseded copies are excluded before the predicate
+            // runs, and its matches join them, so they are folded out of the files
+            // (keeping their statistics exact) or hidden by the position deletes the
+            // one catalog transaction commits with the snapshot. A reader, or a
+            // restart, sees the table before the append or after both the append and
+            // its retention delete, never the matching rows. It used to run as a pass
+            // after the publish, which served them until it committed. A predicate
+            // that fails fails the append, which discards the snapshot.
+            let superseded = self
+                .hide_retention_matches_in_snapshot(&new_snapshot_id, superseded)
+                .await?;
             match file_stats.as_deref() {
                 Some(file_stats) if !superseded.is_empty() => {
                     let dropped: u64 = superseded.values().map(|rows| rows.len() as u64).sum();

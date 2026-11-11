@@ -240,7 +240,15 @@ impl DataSink for CayenneDataSink {
                 .table
                 .collapse_buffered_write(batches)
                 .map_err(datafusion_common::DataFusionError::from)?;
+            let mut retention_dropped = 0_usize;
             let (batches, post_validation) = if overwrite {
+                // An overwrite replaces the tier in one swap: apply `retention_sql` to
+                // the replacement first, so the swap publishes the write and its
+                // retention delete together.
+                let batches = self
+                    .table
+                    .drop_retention_matches(batches)
+                    .map_err(datafusion_common::DataFusionError::from)?;
                 (batches, None)
             } else {
                 let raw: SendableRecordBatchStream = Box::pin(RecordBatchStreamAdapter::new(
@@ -254,6 +262,17 @@ impl DataSink for CayenneDataSink {
                     .map_err(datafusion_common::DataFusionError::from)?;
                 let state = prepared.post_validation();
                 let validated = prepared.stream.try_collect::<Vec<_>>().await?;
+                // `retention_sql` over the rows validation kept: the resident rows
+                // their keys supersede are already among the deletions, so dropping
+                // the matching incoming rows here leaves what the upsert followed by
+                // `DELETE ... WHERE` would, published by the one tier append below.
+                let validated_rows: usize = validated.iter().map(arrow::record_batch::RecordBatch::num_rows).sum();
+                let validated = self
+                    .table
+                    .drop_retention_matches(validated)
+                    .map_err(datafusion_common::DataFusionError::from)?;
+                retention_dropped = validated_rows
+                    - validated.iter().map(arrow::record_batch::RecordBatch::num_rows).sum::<usize>();
                 (validated, Some(state))
             };
             let incoming_bytes = arrow_tools::batch_bytes::RetainedBytes::of(&batches);
@@ -276,7 +295,13 @@ impl DataSink for CayenneDataSink {
             // Record this write's keys as resident so a LATER write to the same
             // table sees them as present and supersedes them in turn — the same
             // bookkeeping the in-memory CDC append does after its append.
-            if let Some(keys) = validated_keys {
+            //
+            // Not when retention dropped some of them: the validated keys include
+            // the dropped rows', which are not resident, and a later `drop` write of
+            // one would be refused as a duplicate. The cache rebuilds from the tier.
+            if retention_dropped > 0 {
+                self.table.clear_cached_pk_keyset();
+            } else if let Some(keys) = validated_keys {
                 let record_seq = self.table.sequence_high_water().await;
                 self.table.record_mem_tier_pk_keys(&keys, record_seq);
             }

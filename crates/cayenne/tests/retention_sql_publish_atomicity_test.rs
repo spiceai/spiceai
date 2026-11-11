@@ -30,7 +30,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use arrow::array::{Array, Int64Array, RecordBatch, StringArray};
 use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 
-use cayenne::metadata::{CreateTableOptions, VortexConfig};
+use cayenne::metadata::{CdcDurability, CreateTableOptions, DeletionMode, VortexConfig};
 use cayenne::{CayenneTableProvider, MetadataCatalog};
 
 use datafusion::datasource::TableProvider;
@@ -47,6 +47,13 @@ test_with_backends!(duplicate_key_upsert_last_matching_removes_key_impl);
 test_with_backends!(failing_retention_keeps_previous_generation_impl);
 test_with_backends!(concurrent_reader_never_sees_matching_rows_impl);
 test_with_backends!(keyed_overwrite_last_copy_decides_at_publish_impl);
+test_with_backends!(superseded_copy_is_never_evaluated_impl);
+test_with_backends!(memory_overwrite_hides_matching_rows_at_publish_impl);
+test_with_backends!(memory_failing_retention_keeps_previous_tier_impl);
+test_with_backends!(failing_retention_fails_append_and_keeps_rows_impl);
+test_with_backends!(keyed_append_superseded_copy_is_never_evaluated_impl);
+test_with_backends!(memory_append_hides_matching_rows_at_publish_impl);
+test_with_backends!(volatile_predicate_sees_only_winning_copies_impl);
 
 fn schema() -> SchemaRef {
     Arc::new(Schema::new(vec![
@@ -321,8 +328,235 @@ async fn keyed_overwrite_last_copy_decides_at_publish_impl(
         )
         .await?;
         assert_eq!(ids(&t).await?, vec![2, 3], "right after keyed overwrite {round}");
+        assert_eq!(count_star(&t).await?, 2, "COUNT(*) after keyed overwrite {round}");
     }
     t.flush_pending_maintenance().await?;
     assert_eq!(ids(&t).await?, vec![2, 3], "after maintenance");
+    Ok(())
+}
+
+/// Plain `COUNT(*)`, the shape statistics can answer without reading rows.
+async fn count_star(provider: &Arc<CayenneTableProvider>) -> Result<i64, Box<dyn std::error::Error>> {
+    let ctx = SessionContext::new();
+    ctx.register_table("t", Arc::clone(provider) as Arc<dyn TableProvider>)?;
+    let batches = ctx.sql("SELECT count(*) FROM t").await?.collect().await?;
+    Ok(batches[0]
+        .column(0)
+        .as_any()
+        .downcast_ref::<Int64Array>()
+        .expect("count")
+        .value(0))
+}
+
+/// Retention runs on the generation the keys resolved to. A superseded copy whose
+/// value the predicate cannot cast must not fail the write: `DELETE` after the
+/// publish never sees it. Key 1's winner casts to 1 (deleted), key 2's to 2 (kept).
+async fn superseded_copy_is_never_evaluated_impl(
+    fixture: common::TestFixture,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let predicate = cast(col("status"), DataType::Int32).eq(lit(1_i32));
+    let t = table(&fixture, "rsql_pub_superseded_eval", true, predicate).await?;
+    common::write_batches(t.as_ref(), vec![rows(&[(5, Some("5"))])], InsertOp::Overwrite).await?;
+    t.flush_pending_maintenance().await?;
+    common::write_batches(
+        t.as_ref(),
+        vec![rows(&[
+            (1, Some("not a number")),
+            (2, Some("not a number")),
+            (1, Some("1")),
+            (2, Some("2")),
+        ])],
+        InsertOp::Overwrite,
+    )
+    .await?;
+    assert_eq!(ids(&t).await?, vec![2], "right after the overwrite");
+    assert_eq!(count_star(&t).await?, 1);
+    Ok(())
+}
+
+async fn memory_table(
+    fixture: &common::TestFixture,
+    name: &str,
+    retention: Expr,
+) -> Result<Arc<CayenneTableProvider>, Box<dyn std::error::Error>> {
+    let options = CreateTableOptions {
+        table_name: name.to_string(),
+        schema: schema(),
+        primary_key: vec!["id".to_string()],
+        on_conflict: Some(OnConflict::Upsert(ColumnReference::new(vec!["id".to_string()]))),
+        base_path: fixture.data_path.to_string_lossy().to_string(),
+        partition_column: None,
+        vortex_config: VortexConfig {
+            memory_mode: true,
+            cdc_mem_tier_shards: 1,
+            cdc_mem_tier_checkpoint_interval_ms: 0,
+            compaction_background_interval_ms: 0,
+            inline_max_rows: 0,
+            inline_max_bytes: 0,
+            cdc_durability: CdcDurability::Memory,
+            deletion_mode: DeletionMode::Key,
+            ..VortexConfig::default()
+        },
+    };
+    let catalog = Arc::clone(&fixture.catalog) as Arc<dyn MetadataCatalog>;
+    Ok(Arc::new(
+        CayenneTableProvider::create_table_with_retention(
+            catalog,
+            options,
+            vec![retention],
+            SessionContext::new().runtime_env(),
+        )
+        .await?,
+    ))
+}
+
+async fn memory_overwrite_hides_matching_rows_at_publish_impl(
+    fixture: common::TestFixture,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let t = memory_table(&fixture, "rsql_pub_mem_overwrite", archived()).await?;
+    for round in 0..5 {
+        common::write_batches(t.as_ref(), vec![batch(0..70)], InsertOp::Overwrite).await?;
+        assert_eq!(counts(&t).await?, (60, 0, 10), "right after memory overwrite {round}");
+    }
+    // Repeats resolve first: key 1's last copy matches, key 2's does not.
+    common::write_batches(
+        t.as_ref(),
+        vec![rows(&[(1, Some("active")), (2, Some("archived")), (1, Some("archived")), (2, Some("active"))])],
+        InsertOp::Overwrite,
+    )
+    .await?;
+    assert_eq!(ids(&t).await?, vec![2]);
+    Ok(())
+}
+
+async fn memory_failing_retention_keeps_previous_tier_impl(
+    fixture: common::TestFixture,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let failing = cast(col("status"), DataType::Int32).eq(lit(1_i32));
+    let t = memory_table(&fixture, "rsql_pub_mem_fail", failing).await?;
+    common::write_batches(t.as_ref(), vec![rows(&[(1, Some("1")), (2, Some("2"))])], InsertOp::Overwrite)
+        .await?;
+    t.flush_pending_maintenance().await?;
+    assert_eq!(ids(&t).await?, vec![2]);
+    let result = common::write_batches(t.as_ref(), vec![batch(0..14)], InsertOp::Overwrite).await;
+    assert!(result.is_err(), "the overwrite retention cannot apply to fails");
+    assert_eq!(ids(&t).await?, vec![2], "previous tier still served");
+    Ok(())
+}
+
+/// An append whose rows the predicate cannot evaluate fails, publishing nothing,
+/// with or without a primary key.
+async fn failing_retention_fails_append_and_keeps_rows_impl(
+    fixture: common::TestFixture,
+) -> Result<(), Box<dyn std::error::Error>> {
+    for keyed in [false, true] {
+        let failing = cast(col("status"), DataType::Int32).eq(lit(1_i32));
+        let name = format!("rsql_pub_append_fail_{keyed}");
+        let t = table(&fixture, &name, keyed, failing).await?;
+        common::insert_batch(t.as_ref(), rows(&[(1, Some("1")), (2, Some("2"))])).await?;
+        t.flush_pending_maintenance().await?;
+        assert_eq!(ids(&t).await?, vec![2], "keyed={keyed}");
+        let result = common::insert_batch(t.as_ref(), rows(&[(3, Some("3")), (4, Some("bad"))])).await;
+        assert!(result.is_err(), "keyed={keyed}: the append retention cannot apply to fails");
+        assert_eq!(ids(&t).await?, vec![2], "keyed={keyed}: nothing of the failed append is visible");
+        common::insert_batch(t.as_ref(), rows(&[(5, Some("5"))])).await?;
+        assert_eq!(ids(&t).await?, vec![2, 5], "keyed={keyed}: the table still takes writes");
+    }
+    Ok(())
+}
+
+/// A keyed append resolves its repeats before retention: the losing copy holds a
+/// value the predicate cannot cast, and is never evaluated.
+async fn keyed_append_superseded_copy_is_never_evaluated_impl(
+    fixture: common::TestFixture,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let predicate = cast(col("status"), DataType::Int32).eq(lit(1_i32));
+    let t = table(&fixture, "rsql_pub_append_superseded_eval", true, predicate).await?;
+    common::insert_batch(t.as_ref(), rows(&[(9, Some("9"))])).await?;
+    t.flush_pending_maintenance().await?;
+    common::insert_batch(
+        t.as_ref(),
+        rows(&[(1, Some("bad")), (2, Some("bad")), (1, Some("1")), (2, Some("2"))]),
+    )
+    .await?;
+    assert_eq!(ids(&t).await?, vec![2, 9], "right after the append");
+    assert_eq!(count_star(&t).await?, 2);
+    Ok(())
+}
+
+async fn memory_append_hides_matching_rows_at_publish_impl(
+    fixture: common::TestFixture,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let t = memory_table(&fixture, "rsql_pub_mem_append", archived()).await?;
+    common::insert_batch(t.as_ref(), batch(0..70)).await?;
+    assert_eq!(counts(&t).await?, (60, 0, 10), "right after the first append");
+    // Key 1 active -> archived: gone at publish; later re-insert is not refused.
+    common::insert_batch(t.as_ref(), rows(&[(1, Some("archived"))])).await?;
+    assert_eq!(counts(&t).await?, (59, 0, 10), "right after the upsert to archived");
+    common::insert_batch(t.as_ref(), rows(&[(1, Some("active"))])).await?;
+    assert_eq!(counts(&t).await?, (60, 0, 10), "key 1 back once it no longer matches");
+    Ok(())
+}
+
+/// A volatile predicate (an instrumented UDF standing in for `random()`) is called
+/// on the rows a `DELETE` after the publish would see, and never on a copy the
+/// write's repeated keys superseded. Losing copies carry a `loser-` status; the
+/// UDF records every value it is called on, so one call on a loser fails this.
+async fn volatile_predicate_sees_only_winning_copies_impl(
+    fixture: common::TestFixture,
+) -> Result<(), Box<dyn std::error::Error>> {
+    use datafusion::logical_expr::{ColumnarValue, Volatility, create_udf};
+    use std::sync::Mutex;
+
+    let seen: Arc<Mutex<Vec<Option<String>>>> = Arc::new(Mutex::new(Vec::new()));
+    let recorder = Arc::clone(&seen);
+    let probe = create_udf(
+        "retention_probe",
+        vec![DataType::Utf8],
+        DataType::Boolean,
+        Volatility::Volatile,
+        Arc::new(move |args: &[ColumnarValue]| {
+            let array = args[0].clone().into_array(1)?;
+            let values = array
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .expect("utf8 argument");
+            let mut seen = recorder.lock().expect("lock");
+            let out: arrow::array::BooleanArray = values
+                .iter()
+                .map(|v| {
+                    seen.push(v.map(str::to_string));
+                    Some(v == Some("archived"))
+                })
+                .collect();
+            Ok(ColumnarValue::Array(Arc::new(out)))
+        }),
+    );
+    let predicate = probe.call(vec![col("status")]);
+    for (name, op) in [("ow", InsertOp::Overwrite), ("ap", InsertOp::Append)] {
+        seen.lock().expect("lock").clear();
+        let t = table(&fixture, &format!("rsql_pub_volatile_{name}"), true, predicate.clone()).await?;
+        common::write_batches(
+            t.as_ref(),
+            vec![rows(&[
+                (1, Some("loser-1")),
+                (2, Some("loser-2")),
+                (1, Some("active")),
+                (2, Some("archived")),
+                (3, Some("active")),
+            ])],
+            op,
+        )
+        .await?;
+        assert_eq!(ids(&t).await?, vec![1, 3], "{name}: right after the write");
+        let seen = seen.lock().expect("lock").clone();
+        assert!(
+            seen.iter().all(|v| !v.as_deref().unwrap_or("").starts_with("loser-")),
+            "{name}: predicate called on a superseded copy: {seen:?}"
+        );
+        for winner in ["active", "archived"] {
+            assert!(seen.iter().any(|v| v.as_deref() == Some(winner)), "{name}: {winner} never evaluated: {seen:?}");
+        }
+    }
     Ok(())
 }

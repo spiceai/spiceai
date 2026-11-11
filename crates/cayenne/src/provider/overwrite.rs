@@ -785,8 +785,25 @@ impl CayenneTableProvider {
         // must list the final files: a table that deletes by position hides them
         // with position deletes, one that deletes by key rewrites the files that
         // hold them without them and so publishes no deletes at all.
+        //
+        // `retention_sql` is owed by every row the overwrite wrote, and is applied
+        // here, to the unpublished snapshot after its keys are resolved, so the
+        // rows it deletes are hidden by the same flip that publishes the rest: a
+        // reader sees the table before this overwrite or after both, never the
+        // rows in between. (It used to run as a pass after the publish, which
+        // served them until it committed.) A predicate that fails abandons the
+        // snapshot, keeping the table on the data it already had.
         let (position_deletions, write_stats_acc) = match postpass.take() {
-            None => (HashMap::new(), write_stats_acc),
+            None => match self
+                .hide_retention_matches_in_snapshot(&new_snapshot_id, HashMap::new())
+                .await
+            {
+                Ok(hidden) => (hidden, write_stats_acc),
+                Err(error) => {
+                    self.abandon_overwrite_snapshot(&new_snapshot_id).await;
+                    return Err(error);
+                }
+            },
             Some((order, key_columns)) => {
                 let resolved: Result<_> = async {
                     let superseded = self
@@ -796,6 +813,14 @@ impl CayenneTableProvider {
                             &key_columns,
                             row_count,
                         )
+                        .await?;
+                    // `retention_sql` over the generation the keys resolved to: the
+                    // superseded copies are excluded before the predicate runs, and
+                    // its matches join them, so the fold below (or the position
+                    // deletes) removes both and the folded files' statistics count
+                    // only the rows left.
+                    let superseded = self
+                        .hide_retention_matches_in_snapshot(&new_snapshot_id, superseded)
                         .await?;
                     match file_stats.as_deref() {
                         Some(file_stats) if !superseded.is_empty() => {

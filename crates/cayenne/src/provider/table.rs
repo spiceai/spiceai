@@ -6763,6 +6763,16 @@ impl CayenneTableProvider {
         !self.retention_filters.is_empty()
     }
 
+    /// The `retention_sql` predicates, coerced to the table schema with `now()` folded
+    /// once for the whole set, the way a retention pass prepares them. One call is one
+    /// execution context: every row a publication evaluates sees the same `now()`.
+    pub(crate) fn coerced_retention_filters(&self) -> datafusion_common::Result<Vec<Expr>> {
+        util::expr::coerce_and_simplify_exprs(
+            self.retention_filters.iter().cloned(),
+            &self.table_schema(),
+        )
+    }
+
     /// Returns the path to a snapshot directory for this table.
     #[must_use]
     pub(crate) fn snapshot_dir_path_for(&self, snapshot_id: &str) -> std::path::PathBuf {
@@ -30368,7 +30378,7 @@ impl CayenneTableProvider {
     /// them: whichever step of the pass fails, a user reading the error is owed the same
     /// three things — which dataset, what is still queryable because of it, and where to
     /// look next.
-    fn retention_failed_message(&self) -> String {
+    pub(crate) fn retention_failed_message(&self) -> String {
         format!(
             "Failed to apply the retention policy to accelerated dataset '{}', so rows matching `retention_sql` are still queryable. See: https://spiceai.org/docs/components/data-accelerators",
             self.table_metadata.table_name
