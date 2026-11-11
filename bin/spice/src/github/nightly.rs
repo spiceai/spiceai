@@ -218,7 +218,7 @@ impl From<GitHubError> for NightlyError {
 
 fn write_available(f: &mut std::fmt::Formatter<'_>, available: &[NaiveDate]) -> std::fmt::Result {
     if available.is_empty() {
-        return write!(f, " No other nightly build is available.");
+        return write!(f, " No complete nightly build is available.");
     }
     let mut dates = String::new();
     for (i, date) in available.iter().enumerate() {
@@ -229,7 +229,7 @@ fn write_available(f: &mut std::fmt::Formatter<'_>, available: &[NaiveDate]) -> 
     }
     write!(
         f,
-        " Nightly builds available: {dates}. Install one with `spice install nightly <date>`."
+        " Complete nightly builds: {dates}. Install one with `spice install nightly <date>`."
     )
 }
 
@@ -481,11 +481,11 @@ mod tests {
     }
 
     impl NightlySource for Recorded {
-        async fn runs(&self) -> Result<Vec<WorkflowRun>, GitHubError> {
-            Ok(self.runs.clone())
+        fn runs(&self) -> impl Future<Output = Result<Vec<WorkflowRun>, GitHubError>> {
+            std::future::ready(Ok(self.runs.clone()))
         }
-        async fn artifacts(&self, id: u64) -> Result<Vec<Artifact>, GitHubError> {
-            Ok(self.artifacts.get(&id).cloned().unwrap_or_default())
+        fn artifacts(&self, id: u64) -> impl Future<Output = Result<Vec<Artifact>, GitHubError>> {
+            std::future::ready(Ok(self.artifacts.get(&id).cloned().unwrap_or_default()))
         }
     }
 
@@ -575,7 +575,7 @@ mod tests {
             .expect_err("no build ran on 11-12");
         assert_eq!(
             error.to_string(),
-            "No Spice nightly build ran on 2026-11-12. Nightly builds available: 2026-11-10, 2026-11-09, 2026-11-08. Install one with `spice install nightly <date>`."
+            "No Spice nightly build ran on 2026-11-12. Complete nightly builds: 2026-11-10, 2026-11-09, 2026-11-08. Install one with `spice install nightly <date>`."
         );
     }
 
@@ -588,7 +588,7 @@ mod tests {
             .expect_err("11-08's macOS build failed");
         assert_eq!(
             error.to_string(),
-            "The Spice nightly build of 2026-11-08 has no darwin_aarch64 binaries, because that build did not finish: https://github.com/spiceai/spiceai/actions/runs/8. Nightly builds available: 2026-11-10, 2026-11-09. Install one with `spice install nightly <date>`."
+            "The Spice nightly build of 2026-11-08 has no darwin_aarch64 binaries, because that build did not finish: https://github.com/spiceai/spiceai/actions/runs/8. Complete nightly builds: 2026-11-10, 2026-11-09. Install one with `spice install nightly <date>`."
         );
         let build = find(&source, date(8), "linux_aarch64", at(11))
             .await
@@ -605,7 +605,7 @@ mod tests {
             .expect_err("1008's binaries expired");
         assert_eq!(
             error.to_string(),
-            "The Spice nightly build of 2026-11-08 has expired: GitHub deletes a nightly build's binaries after the workflow's retention period. Nightly builds available: 2026-11-10, 2026-11-09, 2026-11-08. Install one with `spice install nightly <date>`."
+            "The Spice nightly build of 2026-11-08 has expired: GitHub deletes a nightly build's binaries after the workflow's retention period. Complete nightly builds: 2026-11-10, 2026-11-09, 2026-11-08. Install one with `spice install nightly <date>`."
         );
     }
 

@@ -35,9 +35,9 @@ use std::path::Path;
     long_about = r#"Install or reinstall the Spice.ai runtime
 
 Examples:
-  spice install              # Install latest version (auto-detects Metal/CUDA)
-  spice install v1.8.3       # Install specific version
-  spice install cuda         # Install with CUDA support (Linux only)
+  spice install                     # Install latest version (auto-detects Metal/CUDA)
+  spice install v1.8.3              # Install specific version
+  spice install cuda                # Install with CUDA support (Linux only)
   spice install nightly             # Install the latest nightly build of spice and spiced
   spice install nightly 2026-11-10  # Install the nightly build that ran on that date (UTC)
 
@@ -62,8 +62,14 @@ pub struct InstallArgs {
 struct ParsedArgs {
     version: Option<String>,
     flavor: Flavor,
-    /// `Some` for `nightly`, holding the date when one is given.
-    nightly: Option<Option<NaiveDate>>,
+    /// `Some` for `nightly`.
+    nightly: Option<NightlyRequest>,
+}
+
+/// `spice install nightly [<date>]`: the build that ran on `date`, or the newest one.
+#[derive(Debug, Clone, Copy)]
+struct NightlyRequest {
+    date: Option<NaiveDate>,
 }
 
 /// Runtime flavor.
@@ -93,7 +99,7 @@ pub async fn execute(ctx: &RuntimeContext, args: &InstallArgs) -> Result<()> {
 
     // Prepare installation directory
     ctx.prepare_install_dir()?;
-    if let Some(date) = parsed.nightly {
+    if let Some(NightlyRequest { date }) = parsed.nightly {
         return install_nightly(ctx, date, args.force).await;
     }
     let client = GitHubClient::new_runtime_client();
@@ -188,9 +194,10 @@ async fn install_nightly(ctx: &RuntimeContext, date: Option<NaiveDate>, force: b
             .ok_or_else(|| failed(NightlyError::NeedsToken))?;
         client = client.with_token(token);
     }
-    match date {
-        Some(date) => tracing::info!("Finding the Spice nightly build of {date}..."),
-        None => tracing::info!("Finding the latest Spice nightly build..."),
+    if let Some(date) = date {
+        tracing::info!("Finding the Spice nightly build of {date}...");
+    } else {
+        tracing::info!("Finding the latest Spice nightly build...");
     }
     let build = nightly::find(&client, date, platform, Utc::now())
         .await
@@ -281,7 +288,7 @@ fn parse_args(args: &[String]) -> Result<ParsedArgs> {
         return Ok(ParsedArgs {
             version: None,
             flavor: Flavor::Default,
-            nightly: Some(date),
+            nightly: Some(NightlyRequest { date }),
         });
     }
 
