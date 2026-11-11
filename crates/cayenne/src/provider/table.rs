@@ -39466,6 +39466,16 @@ impl CayenneTableProvider {
             || self.has_inflight_staging_appends()
     }
 
+    /// The current snapshot and the protected snapshots (sorted), captured
+    /// together under the listing fence, as a scan captures them: every
+    /// published run a generation that replaces the table must carry.
+    pub(crate) async fn published_runs(&self) -> (String, Vec<String>) {
+        let _fence = self.listing_fence.read().await;
+        let mut runs: Vec<String> = self.protected_snapshots.load().keys().cloned().collect();
+        runs.sort();
+        (self.get_current_snapshot_id(), runs)
+    }
+
     /// Flush inlined rows to Vortex files when pending inline data exists.
     ///
     /// Callers must hold `write_lock` while calling this helper.

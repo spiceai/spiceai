@@ -1021,12 +1021,7 @@ impl CayenneTableProvider {
         // is neither in this set nor touched here; its commit then fails the
         // optimistic check this flip trips. The flip clears the protected
         // entries only because their rows are carried, with their deletes.
-        let (source_snapshot_id, protected_runs) = {
-            let _fence = self.listing_fence.read().await;
-            let mut runs: Vec<String> = self.protected_snapshots.load().keys().cloned().collect();
-            runs.sort();
-            (self.get_current_snapshot_id(), runs)
-        };
+        let (source_snapshot_id, protected_runs) = self.published_runs().await;
         let new_snapshot_id = uuid::Uuid::now_v7().to_string();
         let is_s3 = self.table_path().starts_with("s3://");
         if !is_s3 {
