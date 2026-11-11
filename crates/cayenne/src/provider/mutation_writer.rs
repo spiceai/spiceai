@@ -1386,45 +1386,6 @@ impl<'a> AppendMutationWriter<'a> {
         self.table.has_retention_delete_filters() && self.table.row_versions.is_none()
     }
 
-    /// A keyed durable write to a `retention_sql` table publishes the retention
-    /// delete over the resident rows it keeps, and that delete is evaluated by a
-    /// file-based sink (`prepare_resident_retention`) that cannot see the
-    /// catalog's inline corpus. Such a table never inlines its own writes, but a
-    /// corpus can predate the `retention_sql` added to an existing dataset. Move
-    /// it to files first, in this write's `write_lock` + `mem_checkpoint_lock`
-    /// hold and before validation reads the primary-key index, exactly as the
-    /// retention pass (`apply_retention_filters`) and `delete_from` do. The move
-    /// changes where rows are stored, not which rows are visible, so it is not a
-    /// separate visible commit; the retention delete still publishes with the
-    /// write. The conditions the retention pass defers on (a staged inline-conflict
-    /// tombstone, a mem-tier seal shadow, append finalization in flight) would
-    /// make the move duplicate rows, so the write fails instead of publishing a
-    /// retention delete that misses rows; the source replays it.
-    async fn materialize_inline_corpus_for_retention(&self) -> Result<()> {
-        if !self.table.has_retention_delete_filters()
-            || self.table.is_memory_resident_mode()
-            || self.table.primary_key_indices()?.is_none()
-            || self.table.cached_inlined_row_count() == 0
-        {
-            return Ok(());
-        }
-        if self.table.inline_materialization_blocked() {
-            return Err(super::Error::Internal {
-                table: self.table.table_name().to_string(),
-                message: format!(
-                    "{} The write was not published: the table's inline rows cannot be \
-                     moved to files while an inline-conflict tombstone, a mem-tier seal \
-                     shadow, or append finalization is in flight; retry the write.",
-                    self.table.retention_failed_message()
-                ),
-            });
-        }
-        self.table
-            .checkpoint_inlined_data_if_present_for_delete()
-            .await
-            .map_err(|source| super::Error::DataFusion { source })
-    }
-
     async fn write_as(
         &self,
         data: SendableRecordBatchStream,
@@ -1440,7 +1401,7 @@ impl<'a> AppendMutationWriter<'a> {
             .table
             .lock_mem_tier_checkpoint_for_durable_write()
             .await;
-        self.materialize_inline_corpus_for_retention().await?;
+        self.table.materialize_inline_corpus_for_retention().await?;
 
         let pending_pk_deletions = !self.table.pk_deletion_strategy().is_position_based()
             && self.table.has_pending_deletions();

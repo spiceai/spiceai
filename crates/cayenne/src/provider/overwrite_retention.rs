@@ -486,6 +486,84 @@ pub(crate) fn publication_retention_filters() -> Option<Vec<Expr>> {
 }
 
 impl CayenneTableProvider {
+    /// A keyed durable write to a `retention_sql` table publishes the retention
+    /// delete over the resident rows it keeps, and that delete is evaluated by a
+    /// file-based sink (`prepare_resident_retention`) that cannot see the
+    /// catalog's inline corpus. Such a table never inlines its own writes, but a
+    /// corpus can predate the `retention_sql` added to an existing dataset. Move
+    /// it to files first, in this write's `write_lock` + `mem_checkpoint_lock`
+    /// hold and before validation reads the primary-key index, exactly as the
+    /// retention pass (`apply_retention_filters`) and `delete_from` do. The move
+    /// changes where rows are stored, not which rows are visible, so it is not a
+    /// separate visible commit; the retention delete still publishes with the
+    /// write. The conditions the retention pass defers on (a staged inline-conflict
+    /// tombstone, a mem-tier seal shadow, append finalization in flight) would
+    /// make the move duplicate rows, so the write fails instead of publishing a
+    /// retention delete that misses rows; the source replays it.
+    pub(crate) async fn materialize_inline_corpus_for_retention(&self) -> super::Result<()> {
+        if self.primary_key_indices()?.is_none() {
+            return Ok(());
+        }
+        self.move_inline_corpus_to_files_for_retention().await
+    }
+
+    /// [`Self::materialize_inline_corpus_for_retention`] for any table shape: a
+    /// table without a primary key flushes its inline rows into the current
+    /// snapshot, a keyed table publishes them as a protected snapshot.
+    async fn move_inline_corpus_to_files_for_retention(&self) -> super::Result<()> {
+        if !self.has_retention_delete_filters()
+            || self.is_memory_resident_mode()
+            || self.cached_inlined_row_count() == 0
+        {
+            return Ok(());
+        }
+        if self.inline_materialization_blocked() {
+            return Err(super::Error::Internal {
+                table: self.table_name().to_string(),
+                message: format!(
+                    "{} The write was not published: the table's inline rows cannot be \
+                     moved to files while an inline-conflict tombstone, a mem-tier seal \
+                     shadow, or append finalization is in flight; retry the write.",
+                    self.retention_failed_message()
+                ),
+            });
+        }
+        self.checkpoint_inlined_data_if_present_for_delete()
+            .await
+            .map_err(|source| super::Error::DataFusion { source })
+    }
+
+    /// The `retention_sql` delete over the resident rows a transaction's
+    /// publication keeps, prepared (not committed) under the transaction's held
+    /// `write_lock` and mem-tier checkpoint lock, against the generation it
+    /// replaces. A keyed table skips the keys the staged snapshot rewrites and
+    /// the rows already retired before the predicate runs
+    /// ([`Self::prepare_resident_retention`]); a table without a primary key
+    /// supersedes nothing, so every visible resident row is evaluated. The
+    /// transaction commits the returned files with its snapshot.
+    pub(crate) async fn prepare_transaction_resident_retention(
+        &self,
+        snapshot_id: &str,
+        filters: &[Expr],
+    ) -> super::Result<Option<super::delete::PreparedDeletionPublish>> {
+        self.move_inline_corpus_to_files_for_retention().await?;
+        if self.primary_key_indices()?.is_some() {
+            return self.prepare_resident_retention(snapshot_id, filters).await;
+        }
+        let failed = |error: datafusion_common::DataFusionError| super::Error::DataFusion {
+            source: datafusion_common::DataFusionError::Execution(format!(
+                "{} The write was not published. {error}",
+                self.retention_failed_message()
+            )),
+        };
+        let sink = self
+            .build_deletion_vector_sink(filters, None, super::table::DeletionRequestSource::User)
+            .await
+            .map_err(failed)?;
+        let prepared = sink.prepare_delete().await?;
+        Ok(prepared.filter(|prepared| !prepared.delete_files().is_empty()))
+    }
+
     /// Prepares the `retention_sql` delete over the resident rows a keyed
     /// append keeps, against the generation it replaces. The rows whose keys
     /// the staged snapshot rewrites, and the rows already deleted, are skipped

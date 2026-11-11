@@ -89,6 +89,10 @@ pub struct CayenneStagedUpsert {
     stats: Arc<ColumnStatsAccumulator>,
     row_count: u64,
     superseded: usize,
+    /// The publication's `retention_sql` conjuncts, coerced once at staging (one
+    /// `now()`): staging drops the incoming matches with them, and the commit
+    /// evaluates the resident rows it keeps with the same ones.
+    publication_filters: Option<Arc<Vec<datafusion::logical_expr::Expr>>>,
 }
 
 impl std::fmt::Debug for CayenneStagedUpsert {
@@ -107,6 +111,7 @@ impl CayenneStagedUpsert {
         table: CayenneTableProvider,
         token: TransactionWriteToken,
         staged: StagedAppend,
+        publication_filters: Option<Arc<Vec<datafusion::logical_expr::Expr>>>,
     ) -> Self {
         Self {
             table,
@@ -117,6 +122,7 @@ impl CayenneStagedUpsert {
             stats: staged.stats,
             row_count: staged.row_count,
             superseded: staged.superseded,
+            publication_filters,
         }
     }
 
@@ -153,6 +159,34 @@ impl CayenneStagedUpsert {
     /// position-deletion publish path (rejected for multi-table), if the staged
     /// snapshot directory cannot be synced, or if reserving sequences / writing
     /// deletion vectors fails.
+    /// Under the commit's held `write_lock` (the optimistic check passed): take
+    /// the mem-tier checkpoint lock, as a durable write does, and prepare the
+    /// `retention_sql` delete over the resident rows this publication keeps,
+    /// with the conjuncts staging used. Prepared before the snapshot sequence is
+    /// reserved, so its key deletes precede the staged rows. An error publishes
+    /// nothing.
+    async fn prepare_resident_retention_for_commit(
+        &self,
+    ) -> Result<(
+        Option<tokio::sync::OwnedMutexGuard<()>>,
+        Option<super::delete::PreparedDeletionPublish>,
+    )> {
+        let Some(filters) = self.publication_filters.clone() else {
+            return Ok((None, None));
+        };
+        let checkpoint_guard = self
+            .table
+            .lock_mem_tier_checkpoint_for_durable_write()
+            .await;
+        let prepared = super::overwrite_retention::with_publication_retention(
+            Arc::clone(&filters),
+            self.table
+                .prepare_transaction_resident_retention(&self.new_snapshot_id, &filters),
+        )
+        .await?;
+        Ok((Some(checkpoint_guard), prepared))
+    }
+
     pub async fn prepare_commit(mut self) -> Result<PreparedTxnCommit> {
         // Directory barrier for the staged rows, before the shared transaction
         // makes them visible. The non-transactional publish takes this barrier
@@ -167,6 +201,8 @@ impl CayenneStagedUpsert {
             .sync_local_snapshot_dir(&self.new_snapshot_id)
             .await?;
 
+        let (checkpoint_guard, resident_retention) =
+            self.prepare_resident_retention_for_commit().await?;
         let on_conflict_deletions = std::mem::take(&mut self.on_conflict_deletions);
         // Reserve sequences + write deletion-vector files + build the inline
         // tombstone, WITHOUT committing the catalog metadata — `defer_catalog_commit`
@@ -189,6 +225,18 @@ impl CayenneStagedUpsert {
         // `apply_prepared_on_conflict_in_txn` — so re-enable just the in-memory
         // promotion, which `finish` performs via `publish_prepared_on_conflict_deletions`.
         publish.publish_as_protected_snapshot = true;
+        // The resident retention delete commits in the same shared transaction
+        // as the snapshot; until then its files are cleaned up with the publish.
+        if let Some(resident) = resident_retention.as_ref() {
+            let Some(payload) = publish.durable_payload.as_mut() else {
+                return Err(Error::Internal {
+                    table: self.table.table_name().to_string(),
+                    message: "a retention delete reached a transaction without a deferred catalog payload"
+                        .to_string(),
+                });
+            };
+            payload.retention_delete_files = resident.delete_files().to_vec();
+        }
         Ok(PreparedTxnCommit {
             table: self.table,
             new_snapshot_id: self.new_snapshot_id,
@@ -197,6 +245,8 @@ impl CayenneStagedUpsert {
             row_count: self.row_count,
             superseded: self.superseded,
             publish,
+            resident_retention,
+            _checkpoint_guard: checkpoint_guard,
         })
     }
 
@@ -243,12 +293,21 @@ impl CayenneStagedUpsert {
             });
         }
 
+        let (checkpoint_guard, resident_retention) =
+            match self.prepare_resident_retention_for_commit().await {
+                Ok(prepared) => prepared,
+                Err(error) => {
+                    drop(write_guard);
+                    cleanup_orphan_snapshot_dir(&self.table, &self.new_snapshot_id).await;
+                    return Err(error);
+                }
+            };
         super::append_commit::PreparedResolvedAppend {
             context: Arc::clone(self.table.context()),
             table: self.table,
             _write_guard: write_guard,
             _held_write_lock: super::write_lock_held::held_guard(),
-            _checkpoint_guard: None,
+            _checkpoint_guard: checkpoint_guard,
             snapshot_id: self.new_snapshot_id,
             rows: self.row_count,
             stats: self.stats,
@@ -257,7 +316,7 @@ impl CayenneStagedUpsert {
             superseded: self.superseded,
             into_empty_table: false,
             first_load_pk_bloom: None,
-            resident_retention: None,
+            resident_retention,
         }
         .commit()
         .await
@@ -299,6 +358,13 @@ pub struct PreparedTxnCommit {
     /// transaction by [`Self::apply_in_txn`]. Its `Drop` cleans up the staged
     /// deletion-vector files unless [`Self::mark_committed`] disarms it.
     publish: super::on_conflict::PreparedOnConflictDeletionPublish,
+    /// The `retention_sql` delete over the resident rows this publication
+    /// keeps; its files are in the publish's durable payload. Its `Drop` removes
+    /// them unless the shared commit may reference them.
+    resident_retention: Option<super::delete::PreparedDeletionPublish>,
+    /// Held with `write_lock` from preparation through `finish`, as a durable
+    /// write holds it, so a checkpoint cannot move rows the delete was decided on.
+    _checkpoint_guard: Option<tokio::sync::OwnedMutexGuard<()>>,
 }
 
 impl PreparedTxnCommit {
@@ -374,6 +440,9 @@ impl PreparedTxnCommit {
     /// reloaded, after a shared commit whose outcome could not be read back.
     pub(crate) fn retain_after_unknown_outcome(&mut self) {
         self.publish.retain_files_for_wal_recovery();
+        if let Some(resident) = self.resident_retention.as_mut() {
+            resident.mark_catalog_committed();
+        }
         self.table
             .publication_outcome_unknown()
             .store(true, std::sync::atomic::Ordering::Release);
@@ -384,6 +453,9 @@ impl PreparedTxnCommit {
     /// post-commit `mark_catalog_committed`).
     pub(crate) fn mark_committed(&mut self) {
         self.publish.mark_catalog_committed();
+        if let Some(resident) = self.resident_retention.as_mut() {
+            resident.mark_catalog_committed();
+        }
     }
 
     /// Flip in-memory visibility after the shared transaction committed. Must run
@@ -394,14 +466,29 @@ impl PreparedTxnCommit {
     /// # Errors
     ///
     /// Returns an error only if swapping the in-memory deletion caches fails.
-    pub fn finish(self) -> Result<u64> {
+    pub fn finish(mut self) -> Result<u64> {
         let sequence = self.publish.snapshot_sequence;
+        let resident_retention = self.resident_retention.take();
         // Taken before the publish below, which makes this transaction's staged
         // rows visible while the `num_rows` delta describing them only reaches
         // the maintenance queue afterwards.
         let reserved_live_rows_delta = self.table.reserve_live_rows_delta();
         self.table
             .publish_prepared_on_conflict_deletions(self.publish);
+        // The resident rows this publication's retention delete removes become
+        // invisible in the same held-fence flip as the staged rows appear.
+        if let Some(resident) = resident_retention {
+            // Maintained aggregates are not fed the removed resident rows.
+            self.table.mark_maintained_aggregates_stale();
+            if let Err(error) = resident.publish() {
+                // The catalog already holds the delete; reopening rebuilds it.
+                tracing::error!(
+                    table = %self.table.table_name(),
+                    %error,
+                    "failed to publish the committed retention delete to the in-memory caches"
+                );
+            }
+        }
         // The fused transaction publish just made this transaction's staged rows
         // visible; mark maintained aggregates stale under the same held listing
         // fence so an IVM query cannot serve a Fresh aggregate that omits them.
@@ -478,11 +565,27 @@ impl CayenneTableProvider {
         data: SendableRecordBatchStream,
         target_partitions: usize,
     ) -> Result<CayenneStagedUpsert> {
-        let staged = self.stage_upsert_data(data, target_partitions).await?;
+        let publication_filters = if self.has_retention_delete_filters() {
+            Some(Arc::new(
+                self.coerced_retention_filters()
+                    .map_err(|source| Error::DataFusion { source })?,
+            ))
+        } else {
+            None
+        };
+        let stage = self.stage_upsert_data(data, target_partitions);
+        let staged = match &publication_filters {
+            Some(filters) => {
+                super::overwrite_retention::with_publication_retention(Arc::clone(filters), stage)
+                    .await?
+            }
+            None => stage.await?,
+        };
         Ok(CayenneStagedUpsert::new(
             self.clone_for_write(),
             token,
             staged,
+            publication_filters,
         ))
     }
 
