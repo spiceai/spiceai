@@ -269,7 +269,11 @@ jobs:
         run: |
           set -e
           sudo apt-get update -y
-          sudo apt-get install -y postgresql-client git make
+          # --no-upgrade: GitHub's Ubuntu images already ship git from the git-core
+          # PPA, so a plain install upgrades it from ppa.launchpadcontent.net, which
+          # configure-apt has no fallback for; a PPA outage then exits 100 here. The
+          # flag still installs a missing package, so a runner without git gets it.
+          sudo apt-get install -y --no-upgrade postgresql-client git make
           cd test/tpc-bench
           make tpch-clone
           DB_HOST=$PGHOST DB_PORT=5432 DB_USER=postgres DB_NAME=tpch_sf1 make pg-init
