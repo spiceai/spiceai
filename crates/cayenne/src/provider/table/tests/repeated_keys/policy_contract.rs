@@ -969,3 +969,112 @@ async fn retention_deletes_commit_with_the_append_through_a_crash_before_publish
         }
     }
 }
+
+/// A primary-key-less `retention_sql` append publishes a whole new current
+/// snapshot (the previous generation's files carried, their deletes re-keyed,
+/// retention applied to resident and appended rows) by the atomic
+/// `current_snapshot_id` flip. A crash before that commit recovers the previous
+/// generation exactly, and replaying the append then publishes it; a crash
+/// after the commit and before the in-memory publish recovers the new
+/// generation exactly.
+#[tokio::test(flavor = "multi_thread")]
+async fn unkeyed_retention_generation_recovers_old_before_and_new_after_its_flip() {
+    use datafusion::physical_plan::memory::MemoryStream;
+
+    for crash_after_commit in [false, true] {
+        let label = if crash_after_commit {
+            "crash after the durable flip"
+        } else {
+            "crash before the durable flip"
+        };
+        let runtime_env = SessionContext::new().runtime_env();
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let metadata_dir = format!("{}/metadata", temp_dir.path().to_str().expect("path"));
+        let data_dir = format!("{}/data", temp_dir.path().to_str().expect("path"));
+        std::fs::create_dir_all(&metadata_dir).expect("metadata dir");
+        let catalog = Arc::new(
+            CayenneCatalog::new(format!("sqlite://{metadata_dir}/cayenne.db")).expect("catalog"),
+        ) as Arc<dyn MetadataCatalog>;
+        catalog.init().await.expect("init");
+        let mut provider =
+            CayenneTableProviderBuilder::new(Arc::clone(&catalog), Arc::clone(&runtime_env))
+                .create(CreateTableOptions {
+                    table_name: "t".to_string(),
+                    schema: schema(),
+                    primary_key: vec![],
+                    on_conflict: None,
+                    base_path: data_dir,
+                    partition_column: None,
+                    vortex_config: VortexConfig {
+                        inline_max_rows: 0,
+                        stream_publish_interval_ms: 0,
+                        compaction_background_interval_ms: 3_600_000,
+                        ..VortexConfig::default()
+                    },
+                })
+                .await
+                .expect("create");
+        write(
+            &provider,
+            InsertOp::Append,
+            vec![batch(&[(1, "old"), (2, "new"), (3, "gone-by-delete")])],
+        )
+        .await
+        .expect("seed");
+        // An existing position delete the carried generation must re-key.
+        let ctx = SessionContext::new();
+        ctx.register_table("t", Arc::new(provider.clone_for_write()))
+            .expect("register");
+        ctx.sql("DELETE FROM t WHERE id = 3")
+            .await
+            .expect("delete plan")
+            .collect()
+            .await
+            .expect("delete");
+        drop(ctx);
+        let old = (owned(&[(1, "old"), (2, "new")]), 2);
+        let new = (owned(&[(2, "new"), (4, "new")]), 2);
+        assert_eq!(visible(&provider).await, old, "{label}: seeded");
+
+        // Row 1 comes to match retention between writes.
+        provider.retention_filters =
+            vec![datafusion_expr::col("value").eq(datafusion_expr::lit("old"))];
+        let write_guard = provider.write_lock_arc().lock_owned().await;
+        let checkpoint_guard = provider.lock_mem_tier_checkpoint_for_durable_write().await;
+        let incoming = Box::pin(
+            MemoryStream::try_new(vec![batch(&[(4, "new")])], schema(), None).expect("stream"),
+        );
+        let prepared = provider
+            .begin_retention_append_generation(incoming, 1, write_guard, checkpoint_guard)
+            .await
+            .expect("stage");
+        if crash_after_commit {
+            prepared.apply_owned_txn().await.expect("durable flip");
+        }
+        // The process dies here: nothing is published in memory.
+        drop(prepared);
+        assert_eq!(
+            visible(&provider).await,
+            old,
+            "{label}: nothing published before the in-memory publish"
+        );
+        drop(provider);
+
+        let mut reopened = reopen(&catalog, &runtime_env).await;
+        if crash_after_commit {
+            assert_eq!(visible(&reopened).await, new, "{label}: recovered");
+        } else {
+            assert_eq!(visible(&reopened).await, old, "{label}: recovered");
+            // The append was never acknowledged, so its source replays it.
+            reopened.retention_filters =
+                vec![datafusion_expr::col("value").eq(datafusion_expr::lit("old"))];
+            write(&reopened, InsertOp::Append, vec![batch(&[(4, "new")])])
+                .await
+                .expect("replay");
+            assert_eq!(visible(&reopened).await, new, "{label}: replayed");
+            drop(reopened);
+            let again = reopen(&catalog, &runtime_env).await;
+            assert_eq!(visible(&again).await, new, "{label}: replay is durable");
+        }
+    }
+}
