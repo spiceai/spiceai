@@ -17722,6 +17722,19 @@ impl CayenneTableProvider {
         // merge does not re-hash keys the per-shard sets already keyed. Pre-sized
         // to the summed shard totals (an upper bound; keys are disjoint across
         // shards) so the merge does not rehash/reserve.
+        // `retention_sql` over each shard's validated rows, before any shard is
+        // appended: the buffered changes were collapsed to one row per key, and
+        // the stored versions those rows supersede are already among the shard's
+        // deletions, so the append publishes the upsert and its retention delete
+        // together. An error fails the apply before anything is published; the
+        // checked-out index is dropped, as on a validation error. The dropped rows'
+        // keys stay in the existence filter, which only costs a false positive.
+        if self.has_retention_delete_filters() {
+            for (filtered_batches, _, _) in &mut per_shard_validated {
+                *filtered_batches =
+                    self.drop_retention_matches(std::mem::take(filtered_batches))?;
+            }
+        }
         let validated_capacity: usize = per_shard_validated
             .iter()
             .map(|(_, _, kept)| kept.len())

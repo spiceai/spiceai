@@ -56,6 +56,7 @@ test_with_backends!(memory_append_hides_matching_rows_at_publish_impl);
 test_with_backends!(volatile_predicate_sees_only_winning_copies_impl);
 test_with_backends!(key_without_on_conflict_append_hides_at_publish_impl);
 test_with_backends!(retention_deletes_are_durable_with_the_append_impl);
+test_with_backends!(memory_cdc_apply_hides_matching_rows_at_publish_impl);
 
 fn schema() -> SchemaRef {
     Arc::new(Schema::new(vec![
@@ -634,5 +635,88 @@ async fn retention_deletes_are_durable_with_the_append_impl(
     );
     assert_eq!(ids(&reopened).await?, vec![2, 4], "after reopening");
     assert_eq!(count_star(&reopened).await?, 2, "COUNT(*) after reopening");
+    Ok(())
+}
+
+struct NoopSlotAdvancer;
+#[async_trait::async_trait]
+impl cayenne::SlotAdvancer for NoopSlotAdvancer {
+    async fn on_checkpoint_durable(&self, _durable_epoch: u64) {}
+}
+
+/// A `cdc_durability: memory` CDC apply, unsharded and sharded, publishes each
+/// batch with its retention delete: an upsert to a matching version removes the
+/// key, a matching new key never appears, and neither waits for a later pass.
+async fn memory_cdc_apply_hides_matching_rows_at_publish_impl(
+    fixture: common::TestFixture,
+) -> Result<(), Box<dyn std::error::Error>> {
+    for shards in [1_usize, 4] {
+        let name = format!("rsql_pub_cdc_{shards}");
+        let dir = fixture.data_path.join(&name);
+        std::fs::create_dir_all(&dir)?;
+        let options = CreateTableOptions {
+            table_name: name.clone(),
+            schema: schema(),
+            primary_key: vec!["id".to_string()],
+            on_conflict: Some(OnConflict::Upsert(ColumnReference::new(vec!["id".to_string()]))),
+            base_path: dir.to_string_lossy().to_string(),
+            partition_column: None,
+            vortex_config: VortexConfig {
+                cdc_durability: CdcDurability::Memory,
+                deletion_mode: DeletionMode::Key,
+                cdc_mem_tier_shards: shards,
+                cdc_mem_tier_max_age_ms: 0,
+                cdc_mem_tier_checkpoint_interval_ms: 0,
+                cdc_mem_tier_seal_age_ms: 0,
+                cdc_mem_tier_max_bytes: 0,
+                inline_max_rows: 0,
+                inline_max_bytes: 0,
+                compaction_background_interval_ms: 0,
+                ..VortexConfig::default()
+            },
+        };
+        let t = Arc::new(
+            CayenneTableProvider::create_table_with_retention(
+                Arc::clone(&fixture.catalog) as Arc<dyn MetadataCatalog>,
+                options,
+                vec![archived()],
+                SessionContext::new().runtime_env(),
+            )
+            .await?,
+        );
+        t.install_slot_advancer(Arc::new(NoopSlotAdvancer));
+        let apply = |batch: RecordBatch| {
+            let t = Arc::clone(&t);
+            async move {
+                let ctx = SessionContext::new();
+                let schema = batch.schema();
+                let stream: datafusion::execution::SendableRecordBatchStream = Box::pin(
+                    datafusion::physical_plan::stream::RecordBatchStreamAdapter::new(
+                        schema,
+                        futures::stream::iter([Ok(batch)]),
+                    ),
+                );
+                let write = t.write_cdc_append_stream(stream, &ctx.task_ctx()).await?;
+                if write.has_pending_finalize() {
+                    write.finish().await?;
+                }
+                Ok::<_, Box<dyn std::error::Error>>(())
+            }
+        };
+        apply(rows(&[(1, Some("active")), (2, Some("active")), (3, Some("active"))])).await?;
+        assert_eq!(ids(&t).await?, vec![1, 2, 3], "{shards} shards: first apply");
+        apply(rows(&[
+            (1, Some("archived")),
+            (2, Some("active")),
+            (4, Some("archived")),
+            (5, Some("active")),
+            (6, None),
+        ]))
+        .await?;
+        assert_eq!(ids(&t).await?, vec![2, 3, 5, 6], "{shards} shards: right after the apply");
+        assert_eq!(count_star(&t).await?, 4, "{shards} shards: COUNT(*)");
+        apply(rows(&[(1, Some("active"))])).await?;
+        assert_eq!(ids(&t).await?, vec![1, 2, 3, 5, 6], "{shards} shards: removed key returns");
+    }
     Ok(())
 }
