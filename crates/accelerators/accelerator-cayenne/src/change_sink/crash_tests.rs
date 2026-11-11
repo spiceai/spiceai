@@ -697,15 +697,15 @@ impl Process {
             .map(|bytes| String::from_utf8(bytes).expect("a text position"))
     }
 
-    /// Every file the committed state names: the data files of every snapshot
-    /// not retired, and every deletion vector.
+    /// Every file the committed state names: the data files not retired, and
+    /// every deletion vector.
     async fn named_files(&self, location: &Location) -> BTreeSet<String> {
         let table_id = self.table.table_id().to_string();
         let retired: BTreeSet<String> = self
             .catalog
-            .retired_snapshots(&table_id)
+            .retired_files(&table_id)
             .await
-            .expect("read the retired snapshots")
+            .expect("read the retired files")
             .unwrap_or_default()
             .into_iter()
             .collect();
@@ -715,7 +715,7 @@ impl Process {
             .await
             .expect("read the manifest")
             .into_iter()
-            .filter(|file| !retired.contains(&file.snapshot_id))
+            .filter(|file| !retired.contains(&format!("{}/{}", file.snapshot_id, file.file_path)))
             .map(|file| {
                 format!(
                     "{}/{table_id}/{}/{}",

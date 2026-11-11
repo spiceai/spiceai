@@ -50,6 +50,13 @@ use util::spice_paths::{absolute_dir as absolute_fs_dir, is_local_path};
 /// shared with the Spicepod validation in `app` through `util`.
 pub use util::spice_paths::fs_probe_path;
 
+/// How long a data file of a dataset in the object-native location stays in
+/// storage after the commit that removed it, counted from when the sweep first
+/// observes the removal: a query on another instance that confirmed its head
+/// before the removal finds every file for this long. A dropped dataset's
+/// folder, and the folder `file_create` replaces, stay as long.
+pub const DATA_FILE_RETENTION: std::time::Duration = std::time::Duration::from_hours(1);
+
 /// How a configured directory string becomes the filesystem path it names.
 ///
 /// This is not a formatting preference — it decides *which directory* the overlap

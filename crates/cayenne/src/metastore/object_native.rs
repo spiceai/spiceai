@@ -151,7 +151,7 @@ impl Default for NativeCatalogConfig {
             checkpoint_after_batches: 1,
             attempt_horizon: object_store_occ::headlog::DEFAULT_ATTEMPT_HORIZON,
             reclaim_after: std::time::Duration::from_hours(1),
-            dropped_grace: std::time::Duration::from_secs(5),
+            dropped_grace: crate::metastore_layout::DATA_FILE_RETENTION,
             transaction_deadline: std::time::Duration::from_secs(60),
             publish_attempts: 8,
             retry_delay: std::time::Duration::from_millis(100),
@@ -1400,7 +1400,7 @@ impl MetadataCatalog for Domain {
     fn keeps_retirement_record(&self) -> bool {
         true
     }
-    async fn retired_snapshots(&self, table_id: &str) -> CatalogResult<Option<Vec<String>>> {
+    async fn retired_files(&self, table_id: &str) -> CatalogResult<Option<Vec<String>>> {
         let inner = self.inner.take().await;
         // Only committed state may license a delete: a buffered change is applied
         // here but may never commit, and a stopped log's last commit may not
@@ -1412,12 +1412,8 @@ impl MetadataCatalog for Domain {
             inner.table(table_id)?.retired.iter().cloned().collect(),
         ))
     }
-    async fn forget_retired_snapshots(
-        &self,
-        table_id: &str,
-        snapshot_ids: &[String],
-    ) -> CatalogResult<bool> {
-        if snapshot_ids.is_empty() {
+    async fn forget_retired_files(&self, table_id: &str, keys: &[String]) -> CatalogResult<bool> {
+        if keys.is_empty() {
             return Ok(true);
         }
         let mut inner = self.inner.take().await;
@@ -1427,20 +1423,17 @@ impl MetadataCatalog for Domain {
             return Ok(false);
         }
         let retired = &inner.table(table_id)?.retired;
-        let ids: Vec<String> = snapshot_ids
+        let keys: Vec<String> = keys
             .iter()
-            .filter(|id| retired.contains(*id))
+            .filter(|key| retired.contains(*key))
             .cloned()
             .collect();
-        if ids.is_empty() {
+        if keys.is_empty() {
             return Ok(true);
         }
+        // The forget drops the manifest rows and statistics of its keys too.
         inner
-            .commit(vec![
-                actions::remove_files(table_id, proto::Select::Listed, &ids),
-                actions::remove_file_stats(table_id, proto::Select::Listed, &ids),
-                actions::forget_retired(table_id, &ids),
-            ])
+            .commit(vec![actions::forget_retired(table_id, &keys)])
             .await?;
         Ok(true)
     }
@@ -1900,10 +1893,10 @@ impl MetadataCatalog for Domain {
         {
             return Ok(false);
         }
-        // The inputs leave the live set and are retired, but keep their manifest
-        // rows: a scan that captured them as live before the in-memory swap
-        // still reads their files from those rows. The retired-snapshot sweep
-        // forgets the rows together with the files, once no scan holds them.
+        // The inputs' files leave the live set and are retired, but keep their
+        // manifest rows: a scan that captured them as live before the in-memory
+        // swap still reads them from those rows. The retirement sweep forgets
+        // the rows together with the files, once no scan holds them.
         inner
             .commit(vec![
                 actions::remove_groups(table_id, proto::Select::Listed, old_snapshot_ids, true),
@@ -2788,6 +2781,8 @@ impl Domain {
                 vortex_config_json,
                 current_snapshot_id: snapshot,
                 seq: 0,
+                // Data files stay in their snapshot's directory.
+                flat_layout: false,
             }))])
             .await?;
         Ok(id)

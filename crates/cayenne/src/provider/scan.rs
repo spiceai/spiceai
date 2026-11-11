@@ -74,15 +74,50 @@ pub(crate) struct SnapshotScanRef {
     snapshot_ids: Vec<String>,
 }
 
+/// The next scan generation: every [`SnapshotScanRef`] takes one, in creation
+/// order across the process.
+static SCAN_GENERATION: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+
+/// The prefix of the entry a [`SnapshotScanRef`] adds to its table's ref-count
+/// map for its generation, beside its snapshot ids. No snapshot id starts with
+/// it.
+const SCAN_PIN_PREFIX: &str = "#scan-generation/";
+
+/// The generation the next scan takes, read under the ref-count map's lock so
+/// it orders with every scan registered in it: a scan registered before this
+/// read has a lower generation, one registered after has this or a higher one.
+pub(crate) fn next_scan_generation(refs: &HashMap<String, usize>) -> u64 {
+    let _ = refs;
+    SCAN_GENERATION.load(std::sync::atomic::Ordering::SeqCst)
+}
+
+/// The generation of the oldest scan in `refs` that has not ended.
+pub(crate) fn oldest_scan_generation(refs: &HashMap<String, usize>) -> Option<u64> {
+    refs.keys()
+        .filter_map(|key| key.strip_prefix(SCAN_PIN_PREFIX))
+        .filter_map(|generation| generation.parse().ok())
+        .min()
+}
+
+/// Whether `key` of the ref-count map is a snapshot id, not a scan's generation.
+pub(crate) fn is_snapshot_ref(key: &str) -> bool {
+    !key.starts_with(SCAN_PIN_PREFIX)
+}
+
 impl SnapshotScanRef {
-    /// Increment the in-flight-scan ref-count for each snapshot id and return a
-    /// guard that decrements them on drop.
+    /// Increment the in-flight-scan ref-count for each snapshot id, and pin
+    /// this scan's generation, and return a guard that releases both on drop.
     pub(crate) fn new(
         refs: Arc<Mutex<HashMap<String, usize>>>,
-        snapshot_ids: Vec<String>,
+        mut snapshot_ids: Vec<String>,
     ) -> Arc<Self> {
         {
             let mut map = refs.lock();
+            // Taken under the lock, so the retirement sweep, which reads the
+            // next generation under it too, orders every scan against its
+            // first observation of a removed file.
+            let generation = SCAN_GENERATION.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            snapshot_ids.push(format!("{SCAN_PIN_PREFIX}{generation}"));
             for id in &snapshot_ids {
                 *map.entry(id.clone()).or_insert(0) += 1;
             }

@@ -111,6 +111,20 @@ fn across<'a>(orders: &'a str, audit: &'a str) -> Vec<CatalogPublication<'a>> {
     ]
 }
 
+/// One data file of `snapshot`, so retiring the snapshot retires a file.
+fn one_file(table_id: &str, snapshot: &str) -> [cayenne::metadata::SnapshotFile; 1] {
+    [cayenne::metadata::SnapshotFile {
+        table_id: table_id.to_string(),
+        snapshot_id: snapshot.to_string(),
+        file_path: "part-0.vortex".to_string(),
+        row_count: 1,
+        file_size_bytes: 1,
+        min_sequence: 0,
+        max_sequence: 0,
+        digest: None,
+    }]
+}
+
 /// Each table's sequence for its transaction snapshot.
 async fn published(catalog: &ObjectNativeCatalog, orders: &str, audit: &str) -> [Option<i64>; 2] {
     [
@@ -378,8 +392,13 @@ async fn a_sweep_waits_for_a_transaction_that_reserves_the_dataset() {
     let (faults, _store, catalog, orders, audit) = setup().await;
     let first = uuid::Uuid::now_v7().to_string();
     let merged = uuid::Uuid::now_v7().to_string();
+    let first_files = one_file(&orders, &first);
+    let first_key = format!("{first}/part-0.vortex");
     catalog
-        .commit_publications(&[publication(&orders, &first, 3)])
+        .commit_publications(&[CatalogPublication {
+            files: &first_files,
+            ..publication(&orders, &first, 3)
+        }])
         .await
         .expect("publish a protected snapshot");
     assert!(
@@ -389,8 +408,8 @@ async fn a_sweep_waits_for_a_transaction_that_reserves_the_dataset() {
             .expect("merge")
     );
     assert_eq!(
-        catalog.retired_snapshots(&orders).await.expect("read"),
-        Some(vec![first.clone()])
+        catalog.retired_files(&orders).await.expect("read"),
+        Some(vec![first_key.clone()])
     );
 
     faults.arm(Op::Create, is_decision, Fault::Hold);
@@ -403,14 +422,14 @@ async fn a_sweep_waits_for_a_transaction_that_reserves_the_dataset() {
     let read = tokio::spawn({
         let catalog = Arc::clone(&catalog);
         let orders = orders.clone();
-        async move { catalog.retired_snapshots(&orders).await }
+        async move { catalog.retired_files(&orders).await }
     });
     let forget = tokio::spawn({
         let catalog = Arc::clone(&catalog);
-        let (orders, first) = (orders.clone(), first.clone());
+        let (orders, first_key) = (orders.clone(), first_key.clone());
         async move {
             catalog
-                .forget_retired_snapshots(&orders, std::slice::from_ref(&first))
+                .forget_retired_files(&orders, std::slice::from_ref(&first_key))
                 .await
         }
     });
@@ -431,12 +450,12 @@ async fn a_sweep_waits_for_a_transaction_that_reserves_the_dataset() {
         .expect("the transaction commits");
     let read = read.await.expect("read task").expect("read");
     assert!(
-        read == Some(vec![first.clone()]) || read == Some(vec![]),
+        read == Some(vec![first_key.clone()]) || read == Some(vec![]),
         "the retired set after the transaction: {read:?}"
     );
     assert!(forget.await.expect("forget task").expect("forget"));
     assert_eq!(
-        catalog.retired_snapshots(&orders).await.expect("read"),
+        catalog.retired_files(&orders).await.expect("read"),
         Some(vec![])
     );
     assert_eq!(

@@ -132,19 +132,14 @@ steps:
   - query: SELECT batch, count(*) AS n FROM snap_full GROUP BY batch
     oracle-sql: SELECT batch, count(*) AS n FROM snap GROUP BY batch
 
-  # What the compactions and the overwrite retired is deleted after the grace:
-  # no dataset folder is left marked dropped, and the overwritten table holds
-  # about one generation of files. (Files an interrupted write left that no
-  # commit names are the orphan rules' to reclaim.)
-  - assert-objects: { source: lake, prefix: state/cayenne/v1/datasets/, contains: /dropped, max: 0 }
+  # What the compactions and the overwrite retired stays for the data-file
+  # retention (an hour), so a query on another instance still finds it: the
+  # overwritten table holds the files of the batch it replaced beside the
+  # current one, and none is deleted early. (Deletion once the retention has
+  # passed is covered by the engine's tests, which elapse it.)
+  - assert-objects: { source: lake, prefix: state/cayenne/v1/datasets/snap_full-, contains: .vortex, min: 2 }
     eventually: 60s
     only: object-native-data-rustfs
-  - assert-objects: { source: lake, prefix: state/cayenne/v1/datasets/snap_full-, contains: .vortex, min: 1, max: 32 }
-    eventually: 60s
-    only: object-native-data-rustfs
-  - assert-objects: { source: slow-lake, prefix: state/cayenne/v1/datasets/, contains: /dropped, max: 0 }
-    eventually: 60s
-    only: object-native-data-rustfs-latency
-  - assert-objects: { source: slow-lake, prefix: state/cayenne/v1/datasets/snap_full-, contains: .vortex, min: 1, max: 32 }
+  - assert-objects: { source: slow-lake, prefix: state/cayenne/v1/datasets/snap_full-, contains: .vortex, min: 2 }
     eventually: 60s
     only: object-native-data-rustfs-latency

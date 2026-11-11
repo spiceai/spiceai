@@ -2739,10 +2739,11 @@ async fn deletion_vectors_stay_bounded_under_a_steady_change_stream() {
     );
 }
 
-/// The retired-snapshot sweep of a dataset whose data is in the location deletes
-/// what the committed state names and lists nothing: the snapshot an initial load
-/// replaces holds no committed file, so its sweep has nothing to delete and no
-/// reason to list it. Anything an unfinished write left there is the orphan sweep's.
+/// The retirement sweep of a dataset whose data is in the location deletes what
+/// the committed state names and lists nothing: the snapshot an initial load
+/// replaces holds no committed file, so the load retires no file and the sweep
+/// has nothing to delete and no reason to list it. Anything an unfinished write
+/// left there is the orphan sweep's.
 #[tokio::test]
 async fn retiring_a_snapshot_with_no_committed_files_lists_nothing() {
     let (setup, catalog, table, ctx) = create("facts").await;
@@ -2758,7 +2759,7 @@ async fn retiring_a_snapshot_with_no_committed_files_lists_nothing() {
     .await;
     let table_id = table.metadata().table_id.clone();
     let retired_before = catalog
-        .retired_snapshots(&table_id)
+        .retired_files(&table_id)
         .await
         .expect("read the retirement record")
         .unwrap_or_default();
@@ -2767,7 +2768,7 @@ async fn retiring_a_snapshot_with_no_committed_files_lists_nothing() {
     table.reclaim_retired_snapshots_now().await;
     let lists = setup.counting.lists();
     let retired_after = catalog
-        .retired_snapshots(&table_id)
+        .retired_files(&table_id)
         .await
         .expect("read the retirement record")
         .unwrap_or_default();
@@ -2779,8 +2780,8 @@ async fn retiring_a_snapshot_with_no_committed_files_lists_nothing() {
             lists,
             count_and_sum(&ctx, "facts").await
         ),
-        (1, 0, 0, (2500, expected_sum(1, 2500))),
-        "the replaced snapshot is retired, then forgotten without a listing"
+        (0, 0, 0, (2500, expected_sum(1, 2500))),
+        "the replaced snapshot held no file to retire, and the sweep lists nothing"
     );
 }
 
@@ -2893,7 +2894,7 @@ async fn writes_and_maintenance_of_a_placed_dataset_list_nothing() {
     .await;
     settle(&tables).await;
     let retired_after_refresh = catalog
-        .retired_snapshots(&events_id)
+        .retired_files(&events_id)
         .await
         .expect("read the retirement record")
         .unwrap_or_default()
@@ -3023,7 +3024,7 @@ async fn writes_and_maintenance_of_a_placed_dataset_list_nothing() {
     let events_rows = count_and_sum(&ctx, "events").await;
     let changes_rows = sorted_rows(&changes_ctx, "changes").await;
     let retired_at_end = catalog
-        .retired_snapshots(&events_id)
+        .retired_files(&events_id)
         .await
         .expect("read the retirement record")
         .unwrap_or_default()

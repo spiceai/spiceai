@@ -81,6 +81,9 @@ pub struct ObjectNativeCatalog {
     ddl: Arc<tokio::sync::Mutex<()>>,
     /// Folders of datasets dropped in this process whose deletion is pending.
     dropping: Arc<parking_lot::Mutex<HashSet<String>>>,
+    /// Ends the wait of every pending folder deletion as if `dropped_grace` had
+    /// passed (tests).
+    drop_grace_elapsed: Arc<tokio::sync::watch::Sender<bool>>,
     /// What tells whether this process still reads each table's files, by table
     /// id: a dropped dataset's folder is deleted once none of its tables is read.
     readers: parking_lot::Mutex<HashMap<String, Vec<TableReaders>>>,
@@ -901,6 +904,7 @@ impl ObjectNativeCatalog {
             routes: RwLock::new(routes),
             ddl: Arc::new(tokio::sync::Mutex::new(())),
             dropping: Arc::new(parking_lot::Mutex::new(HashSet::new())),
+            drop_grace_elapsed: Arc::new(tokio::sync::watch::Sender::new(false)),
             readers: parking_lot::Mutex::new(HashMap::new()),
             anchor,
             unfinished_uploads: None,
@@ -1065,6 +1069,14 @@ impl ObjectNativeCatalog {
             })
     }
 
+    /// Test-only: end the wait of every pending and later deletion of a dropped
+    /// dataset's folder as if `dropped_grace` had passed; scans and restore
+    /// points still hold it.
+    #[doc(hidden)]
+    pub fn elapse_dropped_grace(&self) {
+        self.drop_grace_elapsed.send_replace(true);
+    }
+
     /// Delete a dropped dataset's folder, its log and its data, once this process
     /// no longer reads it: `dropped_grace` after the drop, and then once every
     /// scan of its tables has ended and no restore point is being taken from
@@ -1079,9 +1091,19 @@ impl ObjectNativeCatalog {
         let folder = folder.to_string();
         let ddl = Arc::clone(&self.ddl);
         let dropping = Arc::clone(&self.dropping);
+        let mut elapsed = self.drop_grace_elapsed.subscribe();
         dropping.lock().insert(folder.clone());
         tokio::spawn(async move {
-            tokio::time::sleep(grace).await;
+            tokio::select! {
+                () = tokio::time::sleep(grace) => {}
+                () = async {
+                    // A catalog that is gone ends no wait early.
+                    if elapsed.wait_for(|elapsed| *elapsed).await.is_err() {
+                        std::future::pending::<()>().await;
+                    }
+                } => {}
+            }
+            let grace = grace.min(std::time::Duration::from_secs(1));
             while readers.iter().any(TableReaders::reading) {
                 tokio::time::sleep(grace.max(std::time::Duration::from_millis(100))).await;
             }
@@ -1862,16 +1884,12 @@ impl MetadataCatalog for ObjectNativeCatalog {
     fn keeps_retirement_record(&self) -> bool {
         true
     }
-    async fn retired_snapshots(&self, table_id: &str) -> CatalogResult<Option<Vec<String>>> {
-        self.for_table(table_id).retired_snapshots(table_id).await
+    async fn retired_files(&self, table_id: &str) -> CatalogResult<Option<Vec<String>>> {
+        self.for_table(table_id).retired_files(table_id).await
     }
-    async fn forget_retired_snapshots(
-        &self,
-        table_id: &str,
-        snapshot_ids: &[String],
-    ) -> CatalogResult<bool> {
+    async fn forget_retired_files(&self, table_id: &str, keys: &[String]) -> CatalogResult<bool> {
         self.for_table(table_id)
-            .forget_retired_snapshots(table_id, snapshot_ids)
+            .forget_retired_files(table_id, keys)
             .await
     }
     async fn get_snapshot_files(

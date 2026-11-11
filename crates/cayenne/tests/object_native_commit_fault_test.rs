@@ -1468,24 +1468,44 @@ fn protected_snapshot<'a>(
     }
 }
 
+
+/// One data file of `snapshot`, so retiring the snapshot retires a file.
+fn one_file(table_id: &str, snapshot: &str) -> [cayenne::metadata::SnapshotFile; 1] {
+    [cayenne::metadata::SnapshotFile {
+        table_id: table_id.to_string(),
+        snapshot_id: snapshot.to_string(),
+        file_path: "part-0.vortex".to_string(),
+        row_count: 1,
+        file_size_bytes: 1,
+        min_sequence: 0,
+        max_sequence: 0,
+        digest: None,
+    }]
+}
+
 /// A retirement licenses deleting files only once it is committed. While the
-/// change that takes a protected snapshot out of the live set is buffered, the
-/// retired set is not answered; once committed it is, from storage alone after
-/// a reopen too; forgetting it is one commit; and a dataset log a successor
-/// fenced answers nothing once a commit to it was refused.
+/// change that takes a protected snapshot's file out of the live set is
+/// buffered, the retired set is not answered; once committed it is, from
+/// storage alone after a reopen too; forgetting it is one commit; and a dataset
+/// log a successor fenced answers nothing once a commit to it was refused.
 #[tokio::test]
-async fn retired_snapshots_are_answered_from_committed_state_only() {
+async fn retired_files_are_answered_from_committed_state_only() {
     use cayenne::MetadataCatalog;
     let (_faults, store, catalog) = setup().await;
     let orders = create(&catalog, "orders").await;
     let first = uuid::Uuid::now_v7().to_string();
     let merged = uuid::Uuid::now_v7().to_string();
+    let first_files = one_file(&orders, &first);
+    let first_key = format!("{first}/part-0.vortex");
     catalog
-        .commit_publications(&[protected_snapshot(&orders, &first, 5)])
+        .commit_publications(&[cayenne::catalog::CatalogPublication {
+            files: &first_files,
+            ..protected_snapshot(&orders, &first, 5)
+        }])
         .await
         .expect("publish a protected snapshot");
     assert_eq!(
-        catalog.retired_snapshots(&orders).await.expect("read"),
+        catalog.retired_files(&orders).await.expect("read"),
         Some(vec![])
     );
 
@@ -1498,14 +1518,14 @@ async fn retired_snapshots_are_answered_from_committed_state_only() {
             "the merge replaces the protected snapshot"
         );
         assert_eq!(
-            catalog.retired_snapshots(&orders).await.expect("read"),
+            catalog.retired_files(&orders).await.expect("read"),
             None,
             "a buffered retirement licenses no delete"
         );
     })
     .await;
     assert_eq!(
-        catalog.retired_snapshots(&orders).await.expect("read"),
+        catalog.retired_files(&orders).await.expect("read"),
         None,
         "a retirement still buffered after its scope licenses no delete"
     );
@@ -1514,8 +1534,8 @@ async fn retired_snapshots_are_answered_from_committed_state_only() {
         .await
         .expect("the acknowledgement point commits the merge");
     assert_eq!(
-        catalog.retired_snapshots(&orders).await.expect("read"),
-        Some(vec![first.clone()])
+        catalog.retired_files(&orders).await.expect("read"),
+        Some(vec![first_key.clone()])
     );
 
     // A successor reads the record from storage alone, and fences this catalog.
@@ -1523,8 +1543,8 @@ async fn retired_snapshots_are_answered_from_committed_state_only() {
         .await
         .expect("take over");
     assert_eq!(
-        successor.retired_snapshots(&orders).await.expect("read"),
-        Some(vec![first.clone()]),
+        successor.retired_files(&orders).await.expect("read"),
+        Some(vec![first_key.clone()]),
         "the retirement record survives a restart"
     );
     catalog
@@ -1536,26 +1556,26 @@ async fn retired_snapshots_are_answered_from_committed_state_only() {
         .await
         .expect_err("a fenced commit to the dataset's log is refused");
     assert_eq!(
-        catalog.retired_snapshots(&orders).await.expect("read"),
+        catalog.retired_files(&orders).await.expect("read"),
         None,
         "a fenced catalog licenses no delete"
     );
 
     assert!(
         successor
-            .forget_retired_snapshots(&orders, std::slice::from_ref(&first))
+            .forget_retired_files(&orders, std::slice::from_ref(&first_key))
             .await
             .expect("forget")
     );
     assert_eq!(
-        successor.retired_snapshots(&orders).await.expect("read"),
+        successor.retired_files(&orders).await.expect("read"),
         Some(vec![])
     );
     let reopened = ObjectNativeCatalog::open(Arc::clone(&store), Path::from("catalog"))
         .await
         .expect("reopen");
     assert_eq!(
-        reopened.retired_snapshots(&orders).await.expect("read"),
+        reopened.retired_files(&orders).await.expect("read"),
         Some(vec![]),
         "the forget is committed"
     );

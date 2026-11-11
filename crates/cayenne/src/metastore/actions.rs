@@ -62,10 +62,10 @@ pub(crate) fn remove_files(table_id: &str, select: Select, snapshot_ids: &[Strin
     }))
 }
 
-pub(crate) fn forget_retired(table_id: &str, snapshot_ids: &[String]) -> Action {
-    Action::new(Kind::ForgetRetired(proto::SnapshotIds {
+pub(crate) fn forget_retired(table_id: &str, keys: &[String]) -> Action {
+    Action::new(Kind::ForgetRetired(proto::FileKeys {
         table_id: table_id.to_string(),
-        snapshot_ids: snapshot_ids.to_vec(),
+        keys: keys.to_vec(),
     }))
 }
 

@@ -3571,6 +3571,15 @@ pub struct CayenneTableProvider {
     /// consulted by `sweep_retired_snapshot_dirs` so a long-running query
     /// (executing past the grace period) keeps its input dirs alive.
     snapshot_last_listed: Arc<ParkingMutex<HashMap<String, Instant>>>,
+    /// For a table whose catalog keeps the durable retirement record, its
+    /// retention timers in place of `retired_snapshot_dirs`: retired file key
+    /// → when this process's sweep first observed it retired, and the scan
+    /// generation then ([`super::scan::next_scan_generation`]). The sweep
+    /// deletes a file once [`crate::metastore_layout::DATA_FILE_RETENTION`]
+    /// has passed since and no scan older than that generation still runs. In
+    /// memory: a restart or a takeover observes every file again, which only
+    /// delays its deletion.
+    retired_file_timers: Arc<ParkingMutex<HashMap<String, (Instant, u64)>>>,
     /// Bumped by every retirement into `retired_snapshot_dirs`, so the follow-up
     /// sweep knows to keep going for directories retired while it runs.
     retired_snapshot_generation: Arc<AtomicU64>,
@@ -4031,6 +4040,7 @@ pub struct SnapshotDirPins {
     scan_refs: Arc<ParkingMutex<HashMap<String, usize>>>,
     last_listed: Arc<ParkingMutex<HashMap<String, Instant>>>,
     retired: Arc<ParkingMutex<HashMap<String, Instant>>>,
+    retired_files: Arc<ParkingMutex<HashMap<String, (Instant, u64)>>>,
 }
 
 impl SnapshotDirPins {
@@ -4040,6 +4050,7 @@ impl SnapshotDirPins {
         Arc::ptr_eq(&self.scan_refs, &other.scan_refs)
             && Arc::ptr_eq(&self.last_listed, &other.last_listed)
             && Arc::ptr_eq(&self.retired, &other.retired)
+            && Arc::ptr_eq(&self.retired_files, &other.retired_files)
     }
 }
 
@@ -8491,6 +8502,13 @@ impl CayenneTableProvider {
     /// back after the grace. Without it a table that takes no further write after
     /// a compaction would keep the merged-away directories until its next commit.
     pub(crate) fn retire_snapshot_dirs<'a>(&self, ids: impl IntoIterator<Item = &'a str>) {
+        if self.reclaims_retired_files() {
+            // The committed record names the retired files: a pass observes
+            // them and starts their retention.
+            self.sweep_retired_snapshot_dirs();
+            self.follow_up_retired_files(Self::SNAPSHOT_CLEANUP_GRACE);
+            return;
+        }
         let now = Instant::now();
         let retired = {
             let mut ledger = self.retired_snapshot_dirs.lock();
@@ -8522,30 +8540,22 @@ impl CayenneTableProvider {
         });
     }
 
-    /// Put every snapshot the catalog's durable retirement record names into the
-    /// retired ledger, so the retired-directory sweep deletes their files once
-    /// their grace passes: snapshots retired before a restart, and those a commit
-    /// retired without naming them here (an overwrite or a full rewrite moves the
-    /// current snapshot). A snapshot this instance still reads as current or
-    /// protected is left for a later pass.
+    /// Start the retention of every file the catalog's durable retirement record
+    /// names that this process has not observed yet: files retired before a
+    /// restart, and those a commit retired without naming them here. The
+    /// retention starts now, so a restart only delays a deletion.
     async fn adopt_durable_retirements(&self) {
-        if !self.catalog.keeps_retirement_record() || !self.data_in_store() {
+        if !self.reclaims_retired_files() {
             return;
         }
         let table_name = self.table_metadata.table_name.as_str();
         match self
             .catalog
-            .retired_snapshots(&self.table_metadata.table_id)
+            .retired_files(&self.table_metadata.table_id)
             .await
         {
-            Ok(Some(ids)) => {
-                let current = self.get_current_snapshot_id();
-                let protected = self.protected_snapshots.load();
-                self.retire_snapshot_dirs(
-                    ids.iter()
-                        .map(String::as_str)
-                        .filter(|id| *id != current && !protected.contains_key(*id)),
-                );
+            Ok(Some(keys)) => {
+                self.observe_retired_files(&keys);
             }
             Ok(None) => {}
             Err(error) => {
@@ -8570,6 +8580,7 @@ impl CayenneTableProvider {
             scan_refs: Arc::clone(&self.snapshot_scan_refs),
             last_listed: Arc::clone(&self.snapshot_last_listed),
             retired: Arc::clone(&self.retired_snapshot_dirs),
+            retired_files: Arc::clone(&self.retired_file_timers),
         }
     }
 
@@ -8717,7 +8728,12 @@ impl CayenneTableProvider {
     /// keys ARE the in-flight set. Snapshot GC/cleanup unions these into its skip
     /// set so a long-running query's Vortex files are not deleted mid-read.
     fn in_flight_scan_snapshot_ids(&self) -> HashSet<String> {
-        self.snapshot_scan_refs.lock().keys().cloned().collect()
+        self.snapshot_scan_refs
+            .lock()
+            .keys()
+            .filter(|key| super::scan::is_snapshot_ref(key))
+            .cloned()
+            .collect()
     }
 
     /// Whether a retired dir's grace has fully elapsed: `grace` past both
@@ -9058,6 +9074,17 @@ impl CayenneTableProvider {
         // A closed instance's ledger and scan pins do not cover the scans of the
         // instance that replaced it, so it must not judge any directory unused.
         if self.is_maintenance_closed() {
+            return;
+        }
+        if self.reclaims_retired_files() {
+            let Some(deleting) = self.claim_file_deletions() else {
+                return;
+            };
+            let table = self.clone_for_write();
+            tokio::spawn(async move {
+                let _deleting = deleting;
+                table.sweep_retired_files().await;
+            });
             return;
         }
         // Lock order everywhere in this file: ledger, then last-listed.
@@ -9797,20 +9824,11 @@ impl CayenneTableProvider {
     }
 
     /// Object-store mirror of the detached deletion in
-    /// [`Self::sweep_retired_snapshot_dirs`]: delete each due retired snapshot's
-    /// files, keeping files a live snapshot references in place, and drop the
-    /// ledger entry once they are gone.
-    ///
-    /// With a catalog that keeps the durable retirement record
-    /// ([`MetadataCatalog::retired_snapshots`]), only snapshots a committed change
-    /// retired are touched, their files are the ones their manifest rows name (a
-    /// snapshot with none is listed, unless the dataset is in the object-native
-    /// location, whose committed state names every file it keeps), deletes go out
-    /// in batches of at most
-    /// [`crate::dataset_storage::DELETE_BATCH`] keys, and each batch's snapshots
-    /// are forgotten in one commit once their files are gone. A crash between the
-    /// deletes and that commit leaves the snapshots retired, and the next pass,
-    /// in this process or after a restart, deletes what is left and forgets them.
+    /// [`Self::sweep_retired_snapshot_dirs`], for a catalog that keeps no
+    /// retirement record: delete each due retired snapshot's files, keeping
+    /// files a live snapshot references in place, and drop the ledger entry once
+    /// the prefix is empty. Tables whose catalog keeps the record sweep by file
+    /// instead ([`Self::sweep_retired_files`]).
     async fn sweep_retired_snapshot_prefixes(
         &self,
         due: Vec<String>,
@@ -9818,37 +9836,6 @@ impl CayenneTableProvider {
     ) {
         let table_name = self.table_metadata.table_name.as_str();
         let table_id = self.table_metadata.table_id.as_str();
-        let durable: Option<HashSet<String>> = if self.catalog.keeps_retirement_record() {
-            match self.catalog.retired_snapshots(table_id).await {
-                Ok(Some(ids)) => Some(ids.into_iter().collect()),
-                // A change to the table is applied but not committed, its last
-                // commit's outcome is unknown, or a transaction reserves it: no
-                // committed record licenses a delete yet, so come back later.
-                Ok(None) => {
-                    maintenance_metrics::track_maintenance(
-                        table_name,
-                        MaintenanceOp::RetiredDirSweep,
-                        MaintenanceOutcome::DeclinedNotDue,
-                    );
-                    return;
-                }
-                Err(error) => {
-                    tracing::warn!(
-                        target: "cayenne::compaction",
-                        table = table_name,
-                        "Failed to read which snapshots of table '{table_name}' are retired, so their files keep using storage until a later sweep retries; no data is lost. Cause: {error}"
-                    );
-                    maintenance_metrics::track_maintenance(
-                        table_name,
-                        MaintenanceOp::RetiredDirSweep,
-                        MaintenanceOutcome::Failed,
-                    );
-                    return;
-                }
-            }
-        } else {
-            None
-        };
         let all_rows = match self.catalog.get_all_snapshot_files(table_id).await {
             Ok(rows) => rows,
             Err(error) => {
@@ -9878,44 +9865,13 @@ impl CayenneTableProvider {
         let (mut reclaimed_dirs, mut failed_dirs) = (0_u64, 0_u64);
         let mut planned: Vec<(String, Vec<(ObjectStorePath, u64)>)> = Vec::with_capacity(due.len());
         for id in due {
-            if let Some(durable) = &durable
-                && !durable.contains(&id)
-            {
-                // Forgotten by an earlier pass once its files were gone: nothing
-                // committed licenses another delete under it.
-                self.retired_snapshot_dirs.lock().remove(&id);
-                self.snapshot_last_listed.lock().remove(&id);
-                continue;
-            }
-            let named: Vec<(ObjectStorePath, u64)> = if durable.is_some() {
-                all_rows
-                    .iter()
-                    .filter(|row| row.snapshot_id == id && !keeps(&id, &row.file_path))
-                    .map(|row| {
-                        (
-                            ObjectStorePath::from(format!("{root}{id}/{}", row.file_path)),
-                            u64::try_from(row.file_size_bytes).unwrap_or(0),
-                        )
-                    })
-                    .collect()
-            } else {
-                Vec::new()
-            };
-            let has_rows = all_rows.iter().any(|row| row.snapshot_id == id);
             // A write of this process still building files under the snapshot
             // (one that began before the commit retired it) keeps it until the
             // write ends: a listing below would find files nothing names yet.
             if self.uncommitted_files.holds_snapshot(&id) {
                 continue;
             }
-            // A dataset in the object-native location keeps no file its committed
-            // state does not name: a retired snapshot with no manifest rows holds
-            // no committed file, so there is nothing to delete by listing it.
-            // Whatever an unfinished write left under it is the orphan sweep's.
-            let doomed = if durable.is_some() && (has_rows || self.data_in_object_native_location())
-            {
-                named
-            } else {
+            let doomed = {
                 let prefix = ObjectStorePath::from(format!("{root}{id}/"));
                 let listed: Vec<ObjectMeta> = match store.list(Some(&prefix)).try_collect().await {
                     Ok(listed) => listed,
@@ -9961,25 +9917,7 @@ impl CayenneTableProvider {
                 );
                 continue;
             }
-            let gone: Vec<String> = if durable.is_some() {
-                match self.catalog.forget_retired_snapshots(table_id, &ids).await {
-                    Ok(true) => ids,
-                    // A transaction reserves the table: the files are gone, and a
-                    // later pass forgets the snapshots.
-                    Ok(false) => continue,
-                    Err(error) => {
-                        failed_dirs = failed_dirs
-                            .saturating_add(u64::try_from(ids.len()).unwrap_or(u64::MAX));
-                        tracing::warn!(
-                            target: "cayenne::compaction",
-                            table = table_name,
-                            "Deleted the files of {} retired snapshot(s) of table '{table_name}' but failed to record it, so a later sweep records it again; no data is lost. Cause: {error}",
-                            ids.len()
-                        );
-                        continue;
-                    }
-                }
-            } else {
+            let gone: Vec<String> = {
                 let mut gone = Vec::with_capacity(ids.len());
                 for id in ids {
                     let prefix = ObjectStorePath::from(format!("{root}{id}/"));
@@ -10016,6 +9954,276 @@ impl CayenneTableProvider {
                 reclaimed.bytes,
                 0,
             );
+        }
+    }
+
+    /// Whether this table reclaims the files its catalog's durable retirement
+    /// record names, by file and after
+    /// [`crate::metastore_layout::DATA_FILE_RETENTION`], instead of whole
+    /// snapshot directories after [`Self::SNAPSHOT_CLEANUP_GRACE`].
+    fn reclaims_retired_files(&self) -> bool {
+        self.data_in_store() && self.catalog.keeps_retirement_record()
+    }
+
+    /// Start the retention of each of `keys` (the committed retired set) this
+    /// process has not observed yet, and stop timing the files the record no
+    /// longer names: forgotten, by this process or another.
+    fn observe_retired_files(&self, keys: &[String]) {
+        let generation = super::scan::next_scan_generation(&self.snapshot_scan_refs.lock());
+        let now = Instant::now();
+        let observed = {
+            let mut timers = self.retired_file_timers.lock();
+            let named: HashSet<&str> = keys.iter().map(String::as_str).collect();
+            timers.retain(|key, _| named.contains(key.as_str()));
+            let before = timers.len();
+            for key in keys {
+                timers.entry(key.clone()).or_insert((now, generation));
+            }
+            timers.len() > before
+        };
+        if observed {
+            self.retired_snapshot_generation
+                .fetch_add(1, Ordering::AcqRel);
+        }
+    }
+
+    /// The object a retired file's key names: a deletion vector
+    /// (`<snapshot>/deletions/<file>.arrow`) beside the table's directory, any
+    /// other file under it.
+    fn retired_file_location(table_root: &str, key: &str) -> ObjectStorePath {
+        if super::orphan_sweep::deletion_vector_name(key).is_some() {
+            let data_root = table_root
+                .trim_end_matches('/')
+                .rsplit_once('/')
+                .map_or("", |(parent, _)| parent);
+            if data_root.is_empty() {
+                ObjectStorePath::from(key)
+            } else {
+                ObjectStorePath::from(format!("{data_root}/{key}"))
+            }
+        } else {
+            ObjectStorePath::from(format!("{table_root}{key}"))
+        }
+    }
+
+    /// Delete the retired files of this table whose retention has passed, by
+    /// name, in batches of at most [`crate::dataset_storage::DELETE_BATCH`], and
+    /// forget each batch in one commit once its deletes returned.
+    ///
+    /// The retired set is read from committed state only
+    /// ([`MetadataCatalog::retired_files`]); the pass does nothing while it is
+    /// not settled. A file is due once
+    /// [`crate::metastore_layout::DATA_FILE_RETENTION`] has passed since this
+    /// process first observed it retired, and no scan that started before that
+    /// observation still runs (its generation pin is older). A write of this
+    /// process still building files in the file's snapshot keeps it too. A
+    /// crash between the deletes and the forget leaves the files retired: the
+    /// next pass deletes what is left (an object already gone counts as
+    /// deleted) and forgets them.
+    async fn sweep_retired_files(&self) {
+        let table_name = self.table_metadata.table_name.as_str();
+        let table_id = self.table_metadata.table_id.as_str();
+        let keys = match self.catalog.retired_files(table_id).await {
+            Ok(Some(keys)) => keys,
+            // A change to the table is applied but not committed, its last
+            // commit's outcome is unknown, or a transaction reserves it: no
+            // committed record licenses a delete yet, so come back later.
+            Ok(None) => {
+                maintenance_metrics::track_maintenance(
+                    table_name,
+                    MaintenanceOp::RetiredDirSweep,
+                    MaintenanceOutcome::DeclinedNotDue,
+                );
+                self.follow_up_retired_files(Self::SNAPSHOT_CLEANUP_GRACE);
+                return;
+            }
+            Err(error) => {
+                tracing::warn!(
+                    target: "cayenne::compaction",
+                    table = table_name,
+                    "Failed to read which files of table '{table_name}' are retired, so they keep using storage until a later sweep retries; no data is lost. Cause: {error}"
+                );
+                maintenance_metrics::track_maintenance(
+                    table_name,
+                    MaintenanceOp::RetiredDirSweep,
+                    MaintenanceOutcome::Failed,
+                );
+                return;
+            }
+        };
+        self.observe_retired_files(&keys);
+        if keys.is_empty() {
+            maintenance_metrics::track_maintenance(
+                table_name,
+                MaintenanceOp::RetiredDirSweep,
+                MaintenanceOutcome::NoOp,
+            );
+            return;
+        }
+        let now = Instant::now();
+        let oldest_scan = super::scan::oldest_scan_generation(&self.snapshot_scan_refs.lock());
+        let mut next_due: Option<std::time::Duration> = None;
+        let due: Vec<String> = {
+            let timers = self.retired_file_timers.lock();
+            keys.iter()
+                .filter(|key| {
+                    let Some(&(observed, generation)) = timers.get(key.as_str()) else {
+                        return false;
+                    };
+                    let waited = now.duration_since(observed);
+                    if waited < crate::metastore_layout::DATA_FILE_RETENTION {
+                        let left = crate::metastore_layout::DATA_FILE_RETENTION - waited;
+                        next_due = Some(next_due.map_or(left, |due| due.min(left)));
+                        return false;
+                    }
+                    // A scan that started before the removal was observed may
+                    // still read the file.
+                    if oldest_scan.is_some_and(|oldest| oldest < generation) {
+                        next_due = Some(Self::SNAPSHOT_CLEANUP_GRACE);
+                        return false;
+                    }
+                    let held = key
+                        .split_once('/')
+                        .is_some_and(|(snapshot, _)| self.uncommitted_files.holds_snapshot(snapshot));
+                    if held {
+                        next_due = Some(Self::SNAPSHOT_CLEANUP_GRACE);
+                    }
+                    !held
+                })
+                .cloned()
+                .collect()
+        };
+        if let Some(wait) = next_due {
+            self.follow_up_retired_files(wait);
+        }
+        if due.is_empty() {
+            maintenance_metrics::track_maintenance(
+                table_name,
+                MaintenanceOp::RetiredDirSweep,
+                MaintenanceOutcome::DeclinedNotDue,
+            );
+            return;
+        }
+        let (table_root, store) =
+            match (self.snapshot_root_key_prefix(), self.require_object_store()) {
+                (Ok(root), Ok(config)) => (root, Arc::clone(&config.store)),
+                (Err(error), _) | (_, Err(error)) => {
+                    tracing::warn!(target: "cayenne::compaction", table = table_name, %error, "Retired-file sweep skipped");
+                    return;
+                }
+            };
+        // Sizes for the reclaim metric, from the entries retired files keep
+        // until they are forgotten; a deletion vector's entry is gone already.
+        let sizes: HashMap<String, u64> = self
+            .catalog
+            .get_all_snapshot_files(table_id)
+            .await
+            .unwrap_or_default()
+            .into_iter()
+            .map(|row| {
+                (
+                    Self::manifest_file_relative_path(&row.snapshot_id, &row.file_path),
+                    u64::try_from(row.file_size_bytes).unwrap_or(0),
+                )
+            })
+            .collect();
+        let mut reclaimed = RetiredDirReclaim::default();
+        let mut failed = 0_u64;
+        for batch in due.chunks(crate::dataset_storage::DELETE_BATCH) {
+            let objects: Vec<(ObjectStorePath, u64)> = batch
+                .iter()
+                .map(|key| {
+                    (
+                        Self::retired_file_location(&table_root, key),
+                        sizes.get(key).copied().unwrap_or(0),
+                    )
+                })
+                .collect();
+            let (deleted, outcome) = self
+                .delete_sized_counted(&store, objects, "delete a retired file")
+                .await;
+            reclaimed.files = reclaimed.files.saturating_add(deleted.files);
+            reclaimed.bytes = reclaimed.bytes.saturating_add(deleted.bytes);
+            if let Err(error) = outcome {
+                failed = failed.saturating_add(1);
+                tracing::warn!(
+                    target: "cayenne::compaction",
+                    table = table_name,
+                    "Failed to delete {} file(s) of table '{table_name}' that no query reads any more, so they keep using storage until a later sweep retries; no data is lost. Cause: {error}",
+                    batch.len()
+                );
+                continue;
+            }
+            match self.catalog.forget_retired_files(table_id, batch).await {
+                Ok(true) => {
+                    let mut timers = self.retired_file_timers.lock();
+                    for key in batch {
+                        timers.remove(key);
+                    }
+                }
+                // A transaction reserves the table: the files are gone, and a
+                // later pass forgets them.
+                Ok(false) => {}
+                Err(error) => {
+                    failed = failed.saturating_add(1);
+                    tracing::warn!(
+                        target: "cayenne::compaction",
+                        table = table_name,
+                        "Deleted {} retired file(s) of table '{table_name}' but failed to record it, so a later sweep records it again; no data is lost. Cause: {error}",
+                        batch.len()
+                    );
+                }
+            }
+        }
+        maintenance_metrics::track_maintenance(
+            table_name,
+            MaintenanceOp::RetiredDirSweep,
+            retired_dir_sweep_outcome(reclaimed.files, 0, failed),
+        );
+        if reclaimed.files > 0 {
+            maintenance_metrics::track_reclaimed(
+                table_name,
+                MaintenanceOp::RetiredDirSweep,
+                reclaimed.files,
+                reclaimed.bytes,
+                0,
+            );
+        }
+    }
+
+    /// Run the retired-file sweep again after `wait`, once: at most one
+    /// follow-up waits per table, and each pass that leaves a file to wait for
+    /// arms the next.
+    fn follow_up_retired_files(&self, wait: std::time::Duration) {
+        if !self.maintenance_still_admitted()
+            || self.retired_snapshot_follow_up.swap(true, Ordering::AcqRel)
+        {
+            return;
+        }
+        let table = self.clone_for_write();
+        tokio::spawn(async move {
+            tokio::time::sleep(wait.max(Self::SNAPSHOT_CLEANUP_GRACE)).await;
+            table
+                .retired_snapshot_follow_up
+                .store(false, Ordering::Release);
+            if !table.is_maintenance_closed() {
+                table.sweep_retired_snapshot_dirs();
+            }
+        });
+    }
+
+    /// Test-only: end the retention of every retired file this process has
+    /// observed, as if [`crate::metastore_layout::DATA_FILE_RETENTION`] had
+    /// passed. Scans still hold the files they may read.
+    #[doc(hidden)]
+    pub fn elapse_data_file_retention(&self) {
+        let Some(past) =
+            Instant::now().checked_sub(crate::metastore_layout::DATA_FILE_RETENTION * 2)
+        else {
+            return;
+        };
+        for (observed, _) in self.retired_file_timers.lock().values_mut() {
+            *observed = past;
         }
     }
 
@@ -12089,6 +12297,7 @@ impl CayenneTableProvider {
             staging_deletes_after_commit: Arc::new(ParkingMutex::new(HashSet::new())),
             append_admission: Arc::new(tokio::sync::RwLock::new(())),
             retired_snapshot_dirs: snapshot_dir_pins.retired,
+            retired_file_timers: snapshot_dir_pins.retired_files,
             snapshot_last_listed: snapshot_dir_pins.last_listed,
             snapshot_scan_refs: snapshot_dir_pins.scan_refs,
             position_compaction_skip_streak: Arc::new(ParkingMutex::new(
@@ -14586,6 +14795,7 @@ impl CayenneTableProvider {
             staging_deletes_after_commit: Arc::clone(&self.staging_deletes_after_commit),
             append_admission: Arc::clone(&self.append_admission),
             retired_snapshot_dirs: Arc::clone(&self.retired_snapshot_dirs),
+            retired_file_timers: Arc::clone(&self.retired_file_timers),
             snapshot_last_listed: Arc::clone(&self.snapshot_last_listed),
             snapshot_scan_refs: Arc::clone(&self.snapshot_scan_refs),
             position_compaction_skip_streak: Arc::clone(&self.position_compaction_skip_streak),
@@ -24787,11 +24997,12 @@ impl CayenneTableProvider {
             .last_modified;
 
         let live = self.live_snapshot_ids_for_sweep().await?;
-        // Snapshots the committed retirement record names belong to the
-        // retired-snapshot sweep until it forgets them; without a settled record
-        // (a change not committed yet, an unknown outcome, a reservation) the
-        // sweep cannot tell which they are, so it does not run.
-        let Some(durably_retired) = self.durably_retired_snapshots().await? else {
+        // Files the committed retirement record names belong to the retirement
+        // sweep until it forgets them, and so do their snapshots' directories;
+        // without a settled record (a change not committed yet, an unknown
+        // outcome, a reservation) the sweep cannot tell which they are, so it
+        // does not run.
+        let Some(durably_retired) = self.durably_retired_files().await? else {
             report.skipped = Some("the table's retired snapshots are not settled");
             return Ok(report);
         };
@@ -24801,7 +25012,7 @@ impl CayenneTableProvider {
             let (_, in_use) = self.snapshot_cleanup_pins();
             let mut untouchable = in_use;
             untouchable.extend(self.retired_snapshot_dirs.lock().keys().cloned());
-            untouchable.extend(durably_retired.iter().cloned());
+            untouchable.extend(Self::retired_file_snapshots(&durably_retired));
             untouchable
         };
         let objects: Vec<ObjectMeta> = store
@@ -24888,20 +25099,28 @@ impl CayenneTableProvider {
         // A directory that left the live set since the listing (a compaction
         // retired it) belongs to the retired-directory sweep now.
         let live_now = self.live_snapshot_ids_for_sweep().await?;
-        let Some(durably_retired_now) = self.durably_retired_snapshots().await? else {
+        let Some(durably_retired_now) = self.durably_retired_files().await? else {
             report.skipped = Some("the table's retired snapshots are not settled");
             return Ok(report);
         };
+        let retired_deletion_files: HashSet<String> = durably_retired
+            .iter()
+            .chain(&durably_retired_now)
+            .filter_map(|key| super::orphan_sweep::deletion_vector_name(key))
+            .map(str::to_string)
+            .collect();
         let (_, in_use_now) = self.snapshot_cleanup_pins();
         let retired_now: HashSet<String> = {
             let mut retired: HashSet<String> =
                 self.retired_snapshot_dirs.lock().keys().cloned().collect();
-            retired.extend(durably_retired_now);
+            retired.extend(Self::retired_file_snapshots(&durably_retired_now));
             retired
         };
         let mut doomed = Vec::new();
         for (snapshot, file, live_dir, meta) in candidates {
-            if named.contains(&(snapshot.clone(), file.clone())) {
+            if named.contains(&(snapshot.clone(), file.clone()))
+                || durably_retired_now.contains(&Self::manifest_file_relative_path(&snapshot, &file))
+            {
                 continue;
             }
             // A scan reads a live snapshot's files from its committed manifest
@@ -24929,7 +25148,9 @@ impl CayenneTableProvider {
             doomed.push((meta.location.clone(), meta.size));
         }
         for (name, meta) in deletion_candidates {
-            if named_deletion_files.contains(name) {
+            // A retired deletion vector is the retirement sweep's until it is
+            // forgotten.
+            if named_deletion_files.contains(name) || retired_deletion_files.contains(name) {
                 continue;
             }
             if held_deletion_files.contains(name) {
@@ -25021,18 +25242,25 @@ impl CayenneTableProvider {
         Ok(report)
     }
 
-    /// The snapshots the catalog's committed retirement record names, for the
-    /// orphan sweep: `Some(empty)` for a catalog that keeps no record, `None`
-    /// while the record is not settled.
-    async fn durably_retired_snapshots(&self) -> Result<Option<HashSet<String>>> {
+    /// The keys of the files the catalog's committed retirement record names,
+    /// for the orphan sweep: `Some(empty)` for a catalog that keeps no record,
+    /// `None` while the record is not settled.
+    async fn durably_retired_files(&self) -> Result<Option<HashSet<String>>> {
         if !self.catalog.keeps_retirement_record() {
             return Ok(Some(HashSet::new()));
         }
         Ok(self
             .catalog
-            .retired_snapshots(&self.table_metadata.table_id)
+            .retired_files(&self.table_metadata.table_id)
             .await?
-            .map(|ids| ids.into_iter().collect()))
+            .map(|keys| keys.into_iter().collect()))
+    }
+
+    /// The snapshots whose directories hold retired data files (`<snapshot>/<file>`).
+    fn retired_file_snapshots(keys: &HashSet<String>) -> impl Iterator<Item = String> + '_ {
+        keys.iter()
+            .filter(|key| super::orphan_sweep::deletion_vector_name(key).is_none())
+            .filter_map(|key| key.split_once('/').map(|(snapshot, _)| snapshot.to_string()))
     }
 
     /// The table's current and protected snapshot ids, from this instance's
@@ -25097,10 +25325,23 @@ impl CayenneTableProvider {
     }
 
     /// Test-only: adopt the catalog's durable retirement record, then run the
-    /// retired-directory sweep as if the grace had elapsed, and every cached scan
-    /// view no scan holds had gone idle, and wait for its deletions.
+    /// retired-file sweep as if the grace and the retention had elapsed, and
+    /// every cached scan view no scan holds had gone idle, and wait for its
+    /// deletions.
     #[doc(hidden)]
     pub async fn reclaim_retired_snapshots_now(&self) {
+        self.evict_stale_scan_view(Instant::now() + Self::SCAN_VIEW_EVICTION_INTERVAL * 4);
+        self.adopt_durable_retirements().await;
+        self.elapse_data_file_retention();
+        self.sweep_retired_snapshot_dirs_now().await;
+    }
+
+    /// Test-only: [`Self::reclaim_retired_snapshots_now`] with the retention
+    /// running on its own clock: a file is deleted only once
+    /// [`crate::metastore_layout::DATA_FILE_RETENTION`] has passed since this
+    /// process first observed it retired.
+    #[doc(hidden)]
+    pub async fn sweep_retired_files_now(&self) {
         self.evict_stale_scan_view(Instant::now() + Self::SCAN_VIEW_EVICTION_INTERVAL * 4);
         self.adopt_durable_retirements().await;
         self.sweep_retired_snapshot_dirs_now().await;

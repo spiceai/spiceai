@@ -117,12 +117,26 @@ pub struct TableState {
     pub insert_records: BTreeMap<Vec<u8>, i64>,
     pub pending_write_back: BTreeMap<Vec<u8>, i64>,
     pub partitions: BTreeMap<String, Partition>,
-    /// Snapshots that left the live set and whose files are not yet deleted: the
-    /// durable retirement record. A commit that moves the current snapshot away
-    /// from one, or removes it from the protected set, retires it in the same
-    /// record; a sweep deletes its files only after that commit, and then
-    /// forgets it (`ForgetRetired`). A snapshot made live again leaves the set.
+    /// Data files are keyed by their path alone ([`Self::file_key`]).
+    pub flat: bool,
+    /// Keys of the files that left the live set and are not yet deleted: the
+    /// durable retirement record. The record that takes a file out of the live
+    /// set retires it: [`DatasetState::apply`] adds the keys live before the
+    /// record and not after it. A file a record carries stays live and is never
+    /// retired. A sweep deletes a retired file only after that record, then
+    /// forgets it (`ForgetRetired`), and no record may make a retired key live
+    /// again. A retired data file keeps its entry and statistics until it is
+    /// forgotten, so a scan that captured it before the record still reads it.
     pub retired: BTreeSet<String>,
+}
+
+/// The key of the data file at `path` in `snapshot`: see [`TableState::file_key`].
+fn file_key(flat: bool, snapshot: &str, path: &str) -> String {
+    if flat {
+        path.to_string()
+    } else {
+        format!("{snapshot}/{path}")
+    }
 }
 
 impl TableState {
@@ -132,6 +146,62 @@ impl TableState {
         let mut live: BTreeSet<&str> = self.groups.keys().map(String::as_str).collect();
         live.insert(self.current_snapshot_id.as_str());
         live
+    }
+
+    /// The key of the data file at `path` in `snapshot`: its path relative to
+    /// the table. In a flat table that is `path` itself; otherwise the file
+    /// lies in its snapshot's directory, `<snapshot>/<path>`, so two snapshots
+    /// never share a key.
+    #[must_use]
+    pub fn file_key(&self, snapshot: &str, path: &str) -> String {
+        file_key(self.flat, snapshot, path)
+    }
+
+    /// The key of a deletion vector: its path relative to the table's path when
+    /// it lies under it (`<snapshot>/deletions/<file>` beside the table's
+    /// snapshot directories), and otherwise the path as recorded.
+    #[must_use]
+    pub fn delete_file_key(&self, dv: &DvEntry) -> String {
+        if dv.relative == self.path_is_relative
+            && !self.path.is_empty()
+            && let Some(rest) = dv
+                .path
+                .strip_prefix(self.path.as_str())
+                .and_then(|rest| rest.strip_prefix('/'))
+        {
+            return rest.to_string();
+        }
+        dv.path.clone()
+    }
+
+    /// The keys of every file a scan of the table can read: the data files of
+    /// the live snapshots and every deletion vector.
+    #[must_use]
+    pub fn live_keys(&self) -> BTreeSet<String> {
+        let live = self.live_snapshots();
+        self.files
+            .keys()
+            .filter(|(snapshot, _)| live.contains(snapshot.as_str()))
+            .map(|(snapshot, path)| self.file_key(snapshot, path))
+            .chain(self.delete_files.values().map(|dv| self.delete_file_key(dv)))
+            .collect()
+    }
+
+    /// Whether `key` names a file a scan of the table can read.
+    fn is_live_key(&self, key: &str) -> bool {
+        let live = self.live_snapshots();
+        let in_live_snapshot = if self.flat {
+            live.iter()
+                .any(|snapshot| self.files.contains_key(&((*snapshot).to_string(), key.to_string())))
+        } else {
+            key.split_once('/').is_some_and(|(snapshot, path)| {
+                live.contains(snapshot)
+                    && self
+                        .files
+                        .contains_key(&(snapshot.to_string(), path.to_string()))
+            })
+        };
+        in_live_snapshot || self.delete_files.values().any(|dv| self.delete_file_key(dv) == key)
     }
 
     /// The live data files by path, with the snapshot that holds each. This is
@@ -248,28 +318,26 @@ impl DatasetState {
         }
         let unknown = creates.then(|| self.unknown.clone());
         let prepared = transactions.then(|| self.prepared.clone());
-        for action in &record.actions {
-            if let Err(error) = self.apply_action(action) {
-                for (table_id, prior) in tables {
-                    match prior {
-                        Some(table) => self.tables.insert(table_id, table),
-                        None => self.tables.remove(&table_id),
-                    };
-                }
-                for (key, prior) in positions {
-                    match prior {
-                        Some(position) => self.positions.insert(key, position),
-                        None => self.positions.remove(&key),
-                    };
-                }
-                if let Some(unknown) = unknown {
-                    self.unknown = unknown;
-                }
-                if let Some(prepared) = prepared {
-                    self.prepared = prepared;
-                }
-                return Err(error);
+        if let Err(error) = self.apply_actions(&record.actions) {
+            for (table_id, prior) in tables {
+                match prior {
+                    Some(table) => self.tables.insert(table_id, table),
+                    None => self.tables.remove(&table_id),
+                };
             }
+            for (key, prior) in positions {
+                match prior {
+                    Some(position) => self.positions.insert(key, position),
+                    None => self.positions.remove(&key),
+                };
+            }
+            if let Some(unknown) = unknown {
+                self.unknown = unknown;
+            }
+            if let Some(prepared) = prepared {
+                self.prepared = prepared;
+            }
+            return Err(error);
         }
         Ok(())
     }
@@ -283,10 +351,84 @@ impl DatasetState {
     /// actions before the failing one and no longer matches any committed
     /// state: the caller must discard it and rebuild from the log.
     pub fn apply_in_place(&mut self, record: &Record) -> Result<()> {
-        record
-            .actions
-            .iter()
-            .try_for_each(|action| self.apply_action(action))
+        self.apply_actions(&record.actions)
+    }
+
+    /// Applies `actions` as one record: each in order, then retires every key
+    /// that was live before the record and is not after it, in each table whose
+    /// live set the record can shrink. A record that makes a retired key live
+    /// again is refused.
+    fn apply_actions(&mut self, actions: &[Action]) -> Result<()> {
+        let before = self.live_keys_before(actions);
+        for action in actions {
+            self.apply_action(action)?;
+        }
+        for (table_id, (action, live_before)) in before {
+            if self.unknown.contains(&table_id) {
+                continue;
+            }
+            let Some(table) = self.tables.get_mut(&table_id) else {
+                continue;
+            };
+            let live_after = table.live_keys();
+            if let Some(key) = live_after.iter().find(|key| table.retired.contains(*key)) {
+                return GuardSnafu {
+                    action,
+                    table_id,
+                    guard: format!("retired file {key} is not made live again"),
+                }
+                .fail();
+            }
+            table
+                .retired
+                .extend(live_before.difference(&live_after).cloned());
+        }
+        Ok(())
+    }
+
+    /// The live keys, before `actions` apply, of every table one of them can
+    /// take a file out of the live set of, or bring a whole snapshot into it,
+    /// with the first such action's name. The actions of a `Resolve` that
+    /// commits count as the record's own.
+    fn live_keys_before(
+        &self,
+        actions: &[Action],
+    ) -> BTreeMap<String, (&'static str, BTreeSet<String>)> {
+        let mut resolved = Vec::new();
+        for action in actions {
+            if let Some(Kind::Resolve(a)) = &action.kind
+                && a.commit
+                && let Some(prepared) = self.prepared.get(&a.txn)
+                && let Ok(inner) = prepared.record(&a.txn)
+            {
+                resolved.extend(inner.actions);
+            }
+        }
+        let mut before = BTreeMap::new();
+        for action in actions.iter().chain(&resolved) {
+            let changes_live = matches!(
+                action.kind,
+                Some(
+                    Kind::SetCurrentSnapshot(_)
+                        | Kind::SetGroup(_)
+                        | Kind::RemoveGroups(_)
+                        | Kind::RemoveFiles(_)
+                        | Kind::RemoveDeleteFiles(_)
+                )
+            );
+            if let (true, Some(table_id)) = (changes_live, action.table_id()) {
+                before.entry(table_id.to_string()).or_insert_with(|| {
+                    (
+                        action.name(),
+                        self.tables
+                            .get(table_id)
+                            .map(TableState::live_keys)
+                            .unwrap_or_default(),
+                    )
+                });
+            }
+        }
+        before
     }
 
     #[expect(clippy::too_many_lines, reason = "one arm per action")]
@@ -340,6 +482,7 @@ impl DatasetState {
                         vortex_config_json: a.vortex_config_json.clone(),
                         current_snapshot_id: a.current_snapshot_id.clone(),
                         seq: a.seq,
+                        flat: a.flat_layout,
                         ..TableState::default()
                     },
                 );
@@ -369,15 +512,7 @@ impl DatasetState {
                         }
                     );
                 }
-                let previous =
-                    std::mem::replace(&mut table.current_snapshot_id, a.snapshot_id.clone());
-                if previous != a.snapshot_id
-                    && !previous.is_empty()
-                    && !table.groups.contains_key(&previous)
-                {
-                    table.retired.insert(previous);
-                }
-                table.retired.remove(&a.snapshot_id);
+                table.current_snapshot_id.clone_from(&a.snapshot_id);
             }
             Kind::AdvanceSeq(a) => {
                 let table = self.table(name, &a.table_id)?;
@@ -393,6 +528,7 @@ impl DatasetState {
             }
             Kind::AddFiles(a) => {
                 let table = self.table(name, &a.table_id)?;
+                let live = table.live_snapshots().contains(a.snapshot_id.as_str());
                 for file in &a.files {
                     let key = (a.snapshot_id.clone(), file.path.clone());
                     ensure!(
@@ -403,6 +539,19 @@ impl DatasetState {
                             guard: format!("file {} of snapshot {} is new", key.1, key.0),
                         }
                     );
+                    // A snapshot made live later is checked by the record that
+                    // makes it live.
+                    if live {
+                        let file_key = table.file_key(&key.0, &key.1);
+                        ensure!(
+                            !table.retired.contains(&file_key),
+                            GuardSnafu {
+                                action: name,
+                                table_id: a.table_id.clone(),
+                                guard: format!("retired file {file_key} is not made live again"),
+                            }
+                        );
+                    }
                     table.files.insert(key, file.clone());
                 }
             }
@@ -431,7 +580,6 @@ impl DatasetState {
             Kind::SetGroup(a) => {
                 let table = self.table(name, &a.table_id)?;
                 table.groups.insert(a.snapshot_id.clone(), a.seq);
-                table.retired.remove(&a.snapshot_id);
             }
             Kind::RemoveGroups(a) => {
                 let table = self.table(name, &a.table_id)?;
@@ -449,16 +597,9 @@ impl DatasetState {
                     );
                 }
                 let kind = select(a.select);
-                let current = table.current_snapshot_id.clone();
-                let mut removed = Vec::new();
-                table.groups.retain(|snapshot, _| {
-                    let keep = !selects(kind, &a.snapshot_ids, snapshot);
-                    if !keep && *snapshot != current {
-                        removed.push(snapshot.clone());
-                    }
-                    keep
-                });
-                table.retired.extend(removed);
+                table
+                    .groups
+                    .retain(|snapshot, _| !selects(kind, &a.snapshot_ids, snapshot));
             }
             Kind::AddDeleteFiles(a) => {
                 let table = self.table(name, &a.table_id)?;
@@ -491,6 +632,15 @@ impl DatasetState {
                             action: name,
                             table_id: a.table_id.clone(),
                             guard: format!("deletion vector id {} is new", file.id),
+                        }
+                    );
+                    let key = table.delete_file_key(file);
+                    ensure!(
+                        !table.retired.contains(&key),
+                        GuardSnafu {
+                            action: name,
+                            table_id: a.table_id.clone(),
+                            guard: format!("retired file {key} is not made live again"),
                         }
                     );
                     table.delete_files.insert(file.id.clone(), file.clone());
@@ -686,24 +836,46 @@ impl DatasetState {
             Kind::Unconverted(a) => {
                 self.unknown.insert(a.table_id.clone());
             }
-            Kind::RetireSnapshots(a) => {
+            Kind::RetireFiles(a) => {
                 let table = self.table(name, &a.table_id)?;
-                for id in &a.snapshot_ids {
+                for key in &a.keys {
                     ensure!(
-                        !table.live_snapshots().contains(id.as_str()),
+                        !table.is_live_key(key),
                         GuardSnafu {
                             action: name,
                             table_id: a.table_id.clone(),
-                            guard: format!("snapshot {id} is not live"),
+                            guard: format!("file {key} is not live"),
                         }
                     );
                 }
-                table.retired.extend(a.snapshot_ids.iter().cloned());
+                table.retired.extend(a.keys.iter().cloned());
             }
             Kind::ForgetRetired(a) => {
                 let table = self.table(name, &a.table_id)?;
-                for id in &a.snapshot_ids {
-                    table.retired.remove(id);
+                let forgotten: BTreeSet<&str> = a
+                    .keys
+                    .iter()
+                    .filter(|key| table.retired.remove(key.as_str()))
+                    .map(String::as_str)
+                    .collect();
+                if !forgotten.is_empty() {
+                    // A retired key is live nowhere, so every entry that names
+                    // it goes; the live check only keeps that true if a key
+                    // were somehow both.
+                    let live: BTreeSet<String> = table
+                        .live_snapshots()
+                        .into_iter()
+                        .map(str::to_string)
+                        .collect();
+                    let flat = table.flat;
+                    let gone = |snapshot: &String, path: &String| {
+                        !live.contains(snapshot)
+                            && forgotten.contains(file_key(flat, snapshot, path).as_str())
+                    };
+                    table.files.retain(|(snapshot, path), _| !gone(snapshot, path));
+                    table
+                        .file_stats
+                        .retain(|(snapshot, path), _| !gone(snapshot, path));
                 }
             }
             Kind::Prepare(a) => self.prepare(a)?,
@@ -794,8 +966,8 @@ impl DatasetState {
                     action.name()
                 )));
             }
-            scratch.apply_action(action)?;
         }
+        scratch.apply_actions(&record.actions)?;
         self.prepared.insert(
             a.txn.clone(),
             Prepared {
@@ -818,9 +990,7 @@ mod tests {
     /// The obviously atomic apply: every action on a copy, kept only if all apply.
     fn reference_apply(state: &mut DatasetState, record: &Record) -> Result<()> {
         let mut next = state.clone();
-        for action in &record.actions {
-            next.apply_action(action)?;
-        }
+        next.apply_actions(&record.actions)?;
         *state = next;
         Ok(())
     }
@@ -980,40 +1150,136 @@ mod tests {
         }))
     }
 
-    fn retired(state: &DatasetState) -> Vec<&str> {
-        state.tables["t"]
+    fn retired<'a>(state: &'a DatasetState, table_id: &str) -> Vec<&'a str> {
+        state.tables[table_id]
             .retired
             .iter()
             .map(String::as_str)
             .collect()
     }
 
-    /// Every snapshot that leaves the live set is retired by the commit that
-    /// takes it out, and only those: a protected snapshot the current one moves
-    /// to, or a snapshot made live again, is not retired.
+    fn files(table_id: &str, snapshot: &str, paths: &[&str]) -> Action {
+        Action::new(Kind::AddFiles(AddFiles {
+            table_id: table_id.into(),
+            snapshot_id: snapshot.into(),
+            files: paths
+                .iter()
+                .map(|path| FileEntry {
+                    path: (*path).into(),
+                    rows: 1,
+                    ..FileEntry::default()
+                })
+                .collect(),
+            upsert: false,
+        }))
+    }
+
+    fn stat(table_id: &str, snapshot: &str, path: &str) -> Action {
+        Action::new(Kind::SetFileStats(crate::proto::SetFileStats {
+            table_id: table_id.into(),
+            stat: Some(FileStat {
+                snapshot_id: snapshot.into(),
+                path: path.into(),
+                rows: 1,
+                ..FileStat::default()
+            }),
+        }))
+    }
+
+    /// A table whose files lie under `data/<table_id>/<snapshot>/` and whose
+    /// deletion vectors under `data/<snapshot>/deletions/`, as Cayenne places
+    /// them; `flat` keys data files by their path alone.
+    fn create_at(table_id: &str, flat: bool) -> Action {
+        Action::new(Kind::CreateTable(CreateTable {
+            table_id: table_id.into(),
+            name: table_id.into(),
+            path: "data".into(),
+            current_snapshot_id: "s".into(),
+            flat_layout: flat,
+            ..CreateTable::default()
+        }))
+    }
+
+    fn add_dv(table_id: &str, id: &str, snapshot: &str) -> Action {
+        Action::new(Kind::AddDeleteFiles(crate::proto::AddDeleteFiles {
+            table_id: table_id.into(),
+            files: vec![DvEntry {
+                id: id.into(),
+                path: format!("data/{snapshot}/deletions/{id}.arrow"),
+                seq: 1,
+                ..DvEntry::default()
+            }],
+        }))
+    }
+
+    fn remove_dvs(table_id: &str, ids: &[&str]) -> Action {
+        Action::new(Kind::RemoveDeleteFiles(crate::proto::RemoveDeleteFiles {
+            table_id: table_id.into(),
+            select: crate::proto::Select::Listed as i32,
+            ids: ids.iter().map(ToString::to_string).collect(),
+            seq_le: None,
+        }))
+    }
+
+    fn forget(table_id: &str, keys: &[&str]) -> Action {
+        Action::new(Kind::ForgetRetired(crate::proto::FileKeys {
+            table_id: table_id.into(),
+            keys: keys.iter().map(ToString::to_string).collect(),
+        }))
+    }
+
+    fn refused_as(outcome: &Result<()>, expected: &str) -> bool {
+        matches!(outcome, Err(ApplyError::Guard { guard, .. }) if guard == expected)
+    }
+
+    /// Every file that leaves the live set is retired by the record that takes
+    /// it out, and only those: the files of the snapshots a protected merge
+    /// replaces, of the current snapshot the current pointer moves away from
+    /// (not those of the protected snapshot it moves to), of a full rewrite,
+    /// and a removed deletion vector. A forget takes keys out once and for all,
+    /// and a live file cannot be stated retired.
     #[test]
-    fn a_snapshot_that_leaves_the_live_set_is_retired_by_that_commit() {
+    fn a_file_that_leaves_the_live_set_is_retired_by_that_record() {
         let mut state = DatasetState::default();
-        state.apply(&one(create("t"))).expect("create");
+        state.apply(&one(create_at("t", false))).expect("create");
         state
             .apply(&Record {
-                actions: vec![set_group("t", "g1"), set_group("t", "g2")],
+                actions: vec![
+                    files("t", "s", &["a"]),
+                    files("t", "g1", &["x"]),
+                    set_group("t", "g1"),
+                    files("t", "g2", &["y"]),
+                    set_group("t", "g2"),
+                ],
             })
             .expect("protect");
-        assert!(retired(&state).is_empty());
+        assert!(retired(&state, "t").is_empty());
 
         // A protected merge: g1 and g2 out, g3 in.
         state
             .apply(&Record {
-                actions: vec![remove_groups("t", &["g1", "g2"]), set_group("t", "g3")],
+                actions: vec![
+                    remove_groups("t", &["g1", "g2"]),
+                    files("t", "g3", &["z"]),
+                    set_group("t", "g3"),
+                ],
             })
             .expect("merge");
-        assert_eq!(retired(&state), ["g1", "g2"]);
+        assert_eq!(retired(&state, "t"), ["g1/x", "g2/y"]);
 
-        // The current snapshot moves to a protected one: the old current is
-        // retired, the protected one stays live.
+        // The current snapshot moves to a protected one: the old current's
+        // files retire, the protected one's stay live.
         state.apply(&one(set_current("t", "g3"))).expect("move");
-        assert_eq!(retired(&state), ["g1", "g2", "s"]);
+        assert_eq!(retired(&state, "t"), ["g1/x", "g2/y", "s/a"]);
+
+        // A deletion vector, keyed relative to the table's path, retires when
+        // it is removed.
+        state.apply(&one(add_dv("t", "d1", "g3"))).expect("add dv");
+        state.apply(&one(remove_dvs("t", &["d1"]))).expect("drop dv");
+        assert_eq!(
+            retired(&state, "t"),
+            ["g1/x", "g2/y", "g3/deletions/d1.arrow", "s/a"]
+        );
 
         // A full rewrite: every protected snapshot and the current one retire.
         state
@@ -1024,40 +1290,223 @@ mod tests {
                         select: crate::proto::Select::All as i32,
                         ..Default::default()
                     })),
+                    files("t", "c2", &["w"]),
                     set_current("t", "c2"),
                 ],
             })
             .expect("rewrite");
-        assert_eq!(retired(&state), ["g1", "g2", "g3", "s"]);
+        assert_eq!(
+            retired(&state, "t"),
+            ["g1/x", "g2/y", "g3/deletions/d1.arrow", "g3/z", "s/a"]
+        );
 
-        // Made live again: no longer retired.
-        state.apply(&one(set_group("t", "g1"))).expect("restore");
-        assert_eq!(retired(&state), ["g2", "g3", "s"]);
+        // Forgotten after deletion; forgetting twice changes nothing more.
+        state
+            .apply(&one(forget("t", &["g2/y", "s/a"])))
+            .expect("forget");
+        state
+            .apply(&one(forget("t", &["g2/y", "s/a"])))
+            .expect("forget again");
+        assert_eq!(
+            retired(&state, "t"),
+            ["g1/x", "g3/deletions/d1.arrow", "g3/z"]
+        );
 
-        // Forgotten after deletion, and a forgotten id is not retired again by
-        // forgetting it twice.
-        let forget = || {
-            Action::new(Kind::ForgetRetired(crate::proto::SnapshotIds {
+        // A live file cannot be stated retired.
+        let refused = state.apply(&one(Action::new(Kind::RetireFiles(
+            crate::proto::FileKeys {
                 table_id: "t".into(),
-                snapshot_ids: vec!["g2".into(), "s".into()],
-            }))
-        };
-        state.apply(&one(forget())).expect("forget");
-        state.apply(&one(forget())).expect("forget again");
-        assert_eq!(retired(&state), ["g3"]);
-
-        // A live snapshot cannot be stated retired.
-        let refused = state.apply(&one(Action::new(Kind::RetireSnapshots(
-            crate::proto::SnapshotIds {
-                table_id: "t".into(),
-                snapshot_ids: vec!["c2".into()],
+                keys: vec!["c2/w".into()],
             },
         ))));
-        assert!(
-            matches!(&refused, Err(ApplyError::Guard { guard, .. }) if guard == "snapshot c2 is not live"),
-            "{refused:?}"
+        assert!(refused_as(&refused, "file c2/w is not live"), "{refused:?}");
+        assert_eq!(
+            retired(&state, "t"),
+            ["g1/x", "g3/deletions/d1.arrow", "g3/z"]
         );
-        assert_eq!(retired(&state), ["g3"]);
+    }
+
+    /// A compaction that carries a file in place names it in its new snapshot
+    /// under the same key: the record retires only the files it removes, never
+    /// the carried one, even though the snapshot that held it leaves the live
+    /// set.
+    #[test]
+    fn a_carried_file_is_never_retired() {
+        let mut state = DatasetState::default();
+        state.apply(&one(create_at("t", true))).expect("create");
+        state
+            .apply(&one(files("t", "s", &["a.vortex", "b.vortex"])))
+            .expect("append");
+        state
+            .apply(&Record {
+                actions: vec![
+                    files("t", "s2", &["a.vortex", "c.vortex"]),
+                    set_current("t", "s2"),
+                ],
+            })
+            .expect("compact, carrying a.vortex");
+        assert_eq!(retired(&state, "t"), ["b.vortex"]);
+        assert_eq!(
+            state.tables["t"].live_keys().into_iter().collect::<Vec<_>>(),
+            ["a.vortex", "c.vortex"]
+        );
+
+        // Carried again by a protected merge, and still never retired.
+        state
+            .apply(&Record {
+                actions: vec![
+                    files("t", "g1", &["a.vortex"]),
+                    set_group("t", "g1"),
+                    files("t", "s3", &["c.vortex"]),
+                    set_current("t", "s3"),
+                ],
+            })
+            .expect("move the current snapshot, carrying both files");
+        assert_eq!(retired(&state, "t"), ["b.vortex"]);
+    }
+
+    /// No record makes a retired file live again: not moving the current
+    /// snapshot back to the one that held it, not protecting that snapshot, not
+    /// adding the file to a live snapshot, and not adding a removed deletion
+    /// vector back. Each refusal leaves the state as it was.
+    #[test]
+    fn a_retired_key_cannot_become_live_again() {
+        let mut state = DatasetState::default();
+        state.apply(&one(create_at("t", false))).expect("create");
+        state.apply(&one(files("t", "s", &["a"]))).expect("append");
+        state
+            .apply(&Record {
+                actions: vec![files("t", "s2", &["b"]), set_current("t", "s2")],
+            })
+            .expect("replace s");
+        state.apply(&one(add_dv("t", "d1", "s2"))).expect("add dv");
+        state.apply(&one(remove_dvs("t", &["d1"]))).expect("drop dv");
+        assert_eq!(retired(&state, "t"), ["s/a", "s2/deletions/d1.arrow"]);
+        let settled = state.clone();
+
+        let back = state.apply(&one(set_current("t", "s")));
+        assert!(
+            refused_as(&back, "retired file s/a is not made live again"),
+            "{back:?}"
+        );
+        let protect = state.apply(&one(set_group("t", "s")));
+        assert!(
+            refused_as(&protect, "retired file s/a is not made live again"),
+            "{protect:?}"
+        );
+        state
+            .apply(&Record {
+                actions: vec![files("t", "s3", &["a"])],
+            })
+            .expect("a snapshot that is not live may name any file");
+        let settled = {
+            assert_eq!(state.tables["t"].retired, settled.tables["t"].retired);
+            state.clone()
+        };
+        let readd = state.apply(&Record {
+            actions: vec![
+                remove_groups("t", &[]),
+                files("t", "s2", &["a"]),
+            ],
+        });
+        assert!(readd.is_ok(), "s2/a is a new key: {readd:?}");
+        let carry_back = state.apply(&one(set_group("t", "s")));
+        assert!(
+            refused_as(&carry_back, "retired file s/a is not made live again"),
+            "{carry_back:?}"
+        );
+        let dv_back = state.apply(&one(add_dv("t", "d1-again", "s2")));
+        assert!(dv_back.is_ok(), "another deletion vector: {dv_back:?}");
+        let mut same_path = add_dv("t", "d2", "s2");
+        if let Some(Kind::AddDeleteFiles(a)) = &mut same_path.kind {
+            a.files[0].path = "data/s2/deletions/d1.arrow".into();
+        }
+        let dv_again = state.apply(&one(same_path));
+        assert!(
+            refused_as(
+                &dv_again,
+                "retired file s2/deletions/d1.arrow is not made live again"
+            ),
+            "{dv_again:?}"
+        );
+        assert_eq!(state.tables["t"].retired, settled.tables["t"].retired);
+        assert_eq!(state.tables["t"].current_snapshot_id, "s2");
+        assert!(state.tables["t"].groups.is_empty());
+
+        // In a flat table a compaction cannot carry a file it retired.
+        state.apply(&one(create_at("u", true))).expect("create flat");
+        state.apply(&one(files("u", "s", &["a"]))).expect("append");
+        state
+            .apply(&Record {
+                actions: vec![files("u", "s2", &["b"]), set_current("u", "s2")],
+            })
+            .expect("replace a");
+        let carried = state.apply(&Record {
+            actions: vec![files("u", "s3", &["a", "b"]), set_current("u", "s3")],
+        });
+        assert!(
+            refused_as(&carried, "retired file a is not made live again"),
+            "{carried:?}"
+        );
+        assert_eq!(state.tables["u"].current_snapshot_id, "s2");
+        assert_eq!(retired(&state, "u"), ["a"]);
+    }
+
+    /// `ForgetRetired` removes exactly its keys from the retired set, with the
+    /// entries and statistics that name them; another retired file keeps both,
+    /// and so does a live file, even one whose key a forget lists.
+    #[test]
+    fn forget_drops_rows_and_stats_of_its_keys_only() {
+        let mut state = DatasetState::default();
+        state.apply(&one(create_at("t", false))).expect("create");
+        state
+            .apply(&Record {
+                actions: vec![
+                    files("t", "s", &["a", "b"]),
+                    stat("t", "s", "a"),
+                    stat("t", "s", "b"),
+                ],
+            })
+            .expect("append");
+        state
+            .apply(&Record {
+                actions: vec![
+                    files("t", "s2", &["c"]),
+                    stat("t", "s2", "c"),
+                    set_current("t", "s2"),
+                ],
+            })
+            .expect("replace s");
+        assert_eq!(retired(&state, "t"), ["s/a", "s/b"]);
+
+        state
+            .apply(&one(forget("t", &["s/a", "s2/c", "nothing/here"])))
+            .expect("forget");
+        let table = &state.tables["t"];
+        assert_eq!(retired(&state, "t"), ["s/b"]);
+        let entries: Vec<(&str, &str)> = table
+            .files
+            .keys()
+            .map(|(snapshot, path)| (snapshot.as_str(), path.as_str()))
+            .collect();
+        assert_eq!(entries, [("s", "b"), ("s2", "c")]);
+        let stats: Vec<(&str, &str)> = table
+            .file_stats
+            .keys()
+            .map(|(snapshot, path)| (snapshot.as_str(), path.as_str()))
+            .collect();
+        assert_eq!(stats, [("s", "b"), ("s2", "c")]);
+
+        // A checkpoint carries the retired set, and the forget after it too.
+        let mut rebuilt = DatasetState::default();
+        rebuilt
+            .apply(&crate::checkpoint::state_as_root(&state))
+            .expect("root");
+        assert_eq!(rebuilt, state);
+        rebuilt.apply(&one(forget("t", &["s/b"]))).expect("forget");
+        assert!(rebuilt.tables["t"].retired.is_empty());
+        assert_eq!(rebuilt.tables["t"].files.len(), 1);
+        assert_eq!(rebuilt.tables["t"].file_stats.len(), 1);
     }
 
     #[test]

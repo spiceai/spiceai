@@ -677,16 +677,25 @@ impl Location {
     }
 }
 
+/// The process's catalog as the object-native catalog it is.
+fn native(process: &Process) -> &ObjectNativeCatalog {
+    process
+        .catalog
+        .as_any()
+        .downcast_ref::<ObjectNativeCatalog>()
+        .expect("an object-native catalog")
+}
+
 impl Process {
     /// Every file this process's committed state names that a scan reads: the
-    /// data files of every snapshot not retired, and every deletion vector.
+    /// data files not retired, and every deletion vector.
     async fn named_files(&self, location: &Location) -> BTreeSet<String> {
         let table_id = self.table.table_id().to_string();
         let retired: BTreeSet<String> = self
             .catalog
-            .retired_snapshots(&table_id)
+            .retired_files(&table_id)
             .await
-            .expect("read the retired snapshots")
+            .expect("read the retired files")
             .unwrap_or_default()
             .into_iter()
             .collect();
@@ -696,7 +705,7 @@ impl Process {
             .await
             .expect("read the manifest")
             .into_iter()
-            .filter(|file| !retired.contains(&file.snapshot_id))
+            .filter(|file| !retired.contains(&format!("{}/{}", file.snapshot_id, file.file_path)))
             .map(|file| {
                 format!(
                     "{}/{table_id}/{}/{}",
@@ -730,11 +739,20 @@ impl Process {
         );
     }
 
+    /// The snapshots whose data files are retired (deletion vectors aside).
     async fn retired(&self) -> Option<Vec<String>> {
         self.catalog
-            .retired_snapshots(self.table.table_id())
+            .retired_files(self.table.table_id())
             .await
-            .expect("read the retired snapshots")
+            .expect("read the retired files")
+            .map(|keys| {
+                keys.iter()
+                    .filter(|key| !key.contains("/deletions/"))
+                    .filter_map(|key| key.split_once('/').map(|(snapshot, _)| snapshot.to_string()))
+                    .collect::<BTreeSet<String>>()
+                    .into_iter()
+                    .collect()
+            })
     }
 
     async fn rows(&self, name: &str) -> Vec<(i64, i64)> {
@@ -1196,6 +1214,160 @@ async fn a_delete_that_lands_after_a_takeover_removes_no_live_file() {
     assert_eq!(second.retired().await, Some(vec![]));
 }
 
+/// A file a merge retires stays in storage for the retention, counted from the
+/// sweep's first observation of the removal, even with no scan holding it; once
+/// the retention has passed, the sweep deletes it and forgets it.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_retired_file_is_kept_until_the_retention_elapses() {
+    let (location, process) = keyed_with_protected_snapshots("orders", UPSERTS).await;
+    let table_id = process.table.table_id().to_string();
+    assert!(
+        process
+            .table
+            .compact_protected_snapshots_subset(usize::MAX)
+            .await
+            .expect("merge"),
+        "the merge commits"
+    );
+    let retired = process.retired().await.expect("the merge committed");
+    assert_eq!(process.rows("orders").await, upserted(UPSERTS));
+    let retired_files = location.files_of(&table_id, &retired).await;
+    assert!(retired_files.len() >= 2, "{retired_files:?}");
+
+    // No scan holds them, and the sweep keeps them: the retention has not passed.
+    process.table.sweep_retired_files_now().await;
+    assert_eq!(location.files_of(&table_id, &retired).await, retired_files);
+    assert_eq!(process.retired().await, Some(retired.clone()));
+
+    process.table.elapse_data_file_retention();
+    process.table.sweep_retired_files_now().await;
+    assert_eq!(
+        location.files_of(&table_id, &retired).await,
+        BTreeSet::new(),
+        "the retired files are deleted once the retention has passed"
+    );
+    assert_eq!(process.retired().await, Some(vec![]));
+    assert_eq!(process.rows("orders").await, upserted(UPSERTS));
+    process
+        .assert_named_files_stored(&location, "after the sweep")
+        .await;
+}
+
+/// A scan that started before a merge removed the files it reads keeps them
+/// past the retention, and finishes with every row; a scan that started after
+/// the sweep observed the removal reads only live files and holds nothing back.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_scan_pinned_before_a_removal_keeps_its_files_past_the_retention() {
+    const READER_KEYS: i64 = 3_000;
+    let reader_config = SessionConfig::new()
+        .with_target_partitions(1)
+        .with_batch_size(256);
+    let (location, process) = keyed_table("events", UPSERTS, READER_KEYS, reader_config).await;
+    let table_id = process.table.table_id().to_string();
+    let expected = upserted_keys(UPSERTS, READER_KEYS);
+    let mut before = process
+        .ctx
+        .sql("SELECT id, v FROM events")
+        .await
+        .expect("plan")
+        .execute_stream()
+        .await
+        .expect("start the scan before the merge");
+    assert!(
+        process
+            .table
+            .compact_protected_snapshots_subset(usize::MAX)
+            .await
+            .expect("merge"),
+        "the merge commits"
+    );
+    let retired = process.retired().await.expect("the merge committed");
+    let retired_files = location.files_of(&table_id, &retired).await;
+    assert!(retired_files.len() >= 2, "{retired_files:?}");
+
+    // Observed, and the retention passed: the earlier scan still holds them.
+    process.table.reclaim_retired_snapshots_now().await;
+    assert_eq!(
+        location.files_of(&table_id, &retired).await,
+        retired_files,
+        "a scan pinned before the removal keeps its files past the retention"
+    );
+    let mut read = Vec::new();
+    while let Some(next) = before.next().await {
+        read.extend(collect_rows(vec![next.expect("the earlier scan reads on")]));
+    }
+    read.sort_unstable();
+    assert_eq!(read, expected, "the earlier scan returns every row");
+    drop(before);
+
+    // A scan that starts after the observation does not hold the retired files.
+    let mut after = process
+        .ctx
+        .sql("SELECT id, v FROM events")
+        .await
+        .expect("plan")
+        .execute_stream()
+        .await
+        .expect("start the scan after the merge");
+    process.table.reclaim_retired_snapshots_now().await;
+    assert_eq!(
+        location.files_of(&table_id, &retired).await,
+        BTreeSet::new(),
+        "a scan that started after the removal holds no retired file"
+    );
+    let mut read = Vec::new();
+    while let Some(next) = after.next().await {
+        read.extend(collect_rows(vec![next.expect("the later scan reads on")]));
+    }
+    read.sort_unstable();
+    assert_eq!(read, expected, "the later scan returns every row");
+    assert_eq!(process.retired().await, Some(vec![]));
+}
+
+/// The retention is kept in memory: a process that observed a removal and then
+/// stops leaves the next process to observe it again, and that process keeps the
+/// files for a whole retention of its own before it deletes them.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_reopen_restarts_the_retention() {
+    let (location, first) = keyed_with_protected_snapshots("orders", UPSERTS).await;
+    let table_id = first.table.table_id().to_string();
+    assert!(
+        first
+            .table
+            .compact_protected_snapshots_subset(usize::MAX)
+            .await
+            .expect("merge")
+    );
+    let retired = first.retired().await.expect("the merge committed");
+    assert_eq!(first.rows("orders").await, upserted(UPSERTS));
+    let retired_files = location.files_of(&table_id, &retired).await;
+    assert!(retired_files.len() >= 2, "{retired_files:?}");
+    first.table.sweep_retired_files_now().await;
+    first.table.elapse_data_file_retention();
+    first.instance.kill();
+    drop(first);
+
+    let second = location
+        .open("orders", &parked(), SessionConfig::new())
+        .await;
+    second.table.sweep_retired_files_now().await;
+    assert_eq!(
+        location.files_of(&table_id, &retired).await,
+        retired_files,
+        "the next process keeps the files for a retention of its own"
+    );
+    assert_eq!(second.retired().await, Some(retired.clone()));
+    second.table.elapse_data_file_retention();
+    second.table.sweep_retired_files_now().await;
+    assert_eq!(
+        location.files_of(&table_id, &retired).await,
+        BTreeSet::new(),
+        "deleted once its own retention has passed"
+    );
+    assert_eq!(second.retired().await, Some(vec![]));
+    assert_eq!(second.rows("orders").await, upserted(UPSERTS));
+}
+
 /// An overwrite rolled back before its commit leaves nothing behind in the
 /// store: neither the data files of its snapshot nor the deletion vectors it
 /// wrote for the copies its input repeated. The rows are the ones before it.
@@ -1283,9 +1455,9 @@ impl Location {
 }
 
 /// A dataset dropped while one of its scans has not finished keeps its folder,
-/// past the grace, until that scan is done; the scan returns every row; then the
-/// instance that dropped it deletes the whole folder, log and data, with no
-/// restart. (The previous rule deleted it at a start at least an hour later.)
+/// past the retention, until that scan is done; the scan returns every row; then
+/// the instance that dropped it deletes the whole folder, log and data, with no
+/// restart.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_dropped_dataset_is_deleted_once_no_scan_reads_it() {
     let (location, process) = Location::create(
@@ -1323,8 +1495,9 @@ async fn a_dropped_dataset_is_deleted_once_no_scan_reads_it() {
         .expect("start the scan");
     assert!(process.catalog.drop_table("orders").await.expect("drop"));
 
-    // Past the grace the folder is still there: the scan holds it.
-    tokio::time::sleep(Duration::from_secs(7)).await;
+    // Past the retention the folder is still there: the scan holds it.
+    native(&process).elapse_dropped_grace();
+    tokio::time::sleep(Duration::from_secs(3)).await;
     assert!(
         location
             .probe
@@ -1355,8 +1528,9 @@ async fn a_dropped_dataset_is_deleted_once_no_scan_reads_it() {
     .await;
 }
 
-/// A dataset dropped with nothing reading it has its folder deleted by the
-/// running instance after the grace; the location's other datasets keep theirs.
+/// A dataset dropped with nothing reading it keeps its folder for the
+/// retention, which outlasts the old 5-second grace, and the running instance
+/// deletes it once the retention has passed; the catalog's own log stays.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_dropped_dataset_with_no_reader_is_deleted_after_the_grace() {
     let (location, process) = Location::create("orders", false, SessionConfig::new()).await;
@@ -1369,8 +1543,13 @@ async fn a_dropped_dataset_with_no_reader_is_deleted_after_the_grace() {
         .await
         .expect("drain");
     let folder = location.folder();
-    let started = Instant::now();
     assert!(process.catalog.drop_table("orders").await.expect("drop"));
+    tokio::time::sleep(Duration::from_secs(7)).await;
+    assert!(
+        !location.probe.objects(&folder).await.is_empty(),
+        "a dropped dataset's folder is kept for the retention"
+    );
+    native(&process).elapse_dropped_grace();
     eventually(
         Duration::from_secs(30),
         "the dropped dataset's folder is deleted",
@@ -1380,11 +1559,6 @@ async fn a_dropped_dataset_with_no_reader_is_deleted_after_the_grace() {
         },
     )
     .await;
-    assert!(
-        started.elapsed() >= Duration::from_secs(5),
-        "the folder outlived the grace: deleted after {:?}",
-        started.elapsed()
-    );
     // The catalog itself is untouched: a new dataset under the same name works.
     let catalog_objects = location.probe.objects(CATALOG).await;
     assert!(!catalog_objects.is_empty(), "the catalog's own log is kept");

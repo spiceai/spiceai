@@ -23,6 +23,7 @@ pub fn state_as_record(s: &TableState, table_id: &str) -> Record {
         vortex_config_json: s.vortex_config_json.clone(),
         current_snapshot_id: s.current_snapshot_id.clone(),
         seq: s.seq,
+        flat_layout: s.flat,
     }))];
     let mut snapshots = std::collections::BTreeMap::<&str, Vec<p::FileEntry>>::new();
     for ((snapshot, _), file) in &s.files {
@@ -52,16 +53,17 @@ pub fn state_as_record(s: &TableState, table_id: &str) -> Record {
             seq: *seq,
         })));
     }
-    if !s.retired.is_empty() {
-        actions.push(Action::new(Kind::RetireSnapshots(p::SnapshotIds {
-            table_id: t(),
-            snapshot_ids: s.retired.iter().cloned().collect(),
-        })));
-    }
     actions.push(Action::new(Kind::AddDeleteFiles(p::AddDeleteFiles {
         table_id: t(),
         files: s.delete_files.values().cloned().collect(),
     })));
+    // After every entry that makes a file live: a retired key is live nowhere.
+    if !s.retired.is_empty() {
+        actions.push(Action::new(Kind::RetireFiles(p::FileKeys {
+            table_id: t(),
+            keys: s.retired.iter().cloned().collect(),
+        })));
+    }
     if let Some(stat) = &s.stats {
         actions.push(Action::new(Kind::SetTableStats(p::SetTableStats {
             table_id: t(),
@@ -264,7 +266,7 @@ mod tests {
                 published: true,
             },
         );
-        s.retired.insert("merged".into());
+        s.retired.insert("merged/file".into());
         s.insert_records.insert(vec![1], 12);
         s.pending_write_back.insert(vec![2], 13);
         s.partitions.insert(

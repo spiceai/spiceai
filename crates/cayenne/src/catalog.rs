@@ -1229,29 +1229,27 @@ pub trait MetadataCatalog: Send + Sync {
     /// the live set and reconstructs the referenced physical paths.
     async fn get_all_snapshot_files(&self, table_id: &str) -> CatalogResult<Vec<SnapshotFile>>;
 
-    /// The snapshots of `table_id` that durably left the live set and whose files
+    /// The keys of the files of `table_id` that durably left the live set and
     /// are not yet deleted, or `None` when this catalog keeps no such record (the
     /// `SQLite` metastore) or cannot answer from committed state alone right now:
     /// a change to the table is applied here but not yet committed, its log's
     /// last commit has an unknown outcome, or an unresolved transaction reserves
-    /// it. A sweep deletes only the files of what this returns, so it never
-    /// deletes a file that a commit which may not have landed took out of the
-    /// live set.
-    async fn retired_snapshots(&self, table_id: &str) -> CatalogResult<Option<Vec<String>>>;
+    /// it. A key is the file's path relative to the table: `<snapshot>/<file>`
+    /// for a data file, `<snapshot>/deletions/<file>` for a deletion vector,
+    /// beside the table's directory. A sweep deletes only what this returns, so
+    /// it never deletes a file that a commit which may not have landed took out
+    /// of the live set.
+    async fn retired_files(&self, table_id: &str) -> CatalogResult<Option<Vec<String>>>;
 
     /// Whether this catalog keeps the durable retirement record that
-    /// [`Self::retired_snapshots`] reads.
+    /// [`Self::retired_files`] reads.
     fn keeps_retirement_record(&self) -> bool;
 
-    /// Forget retired snapshots of `table_id` whose files are deleted, with their
+    /// Forget retired files of `table_id` that are deleted, by key, with their
     /// manifest rows and file statistics, in one commit. Returns `false` and
     /// commits nothing when the catalog keeps no retirement record or an
     /// unresolved transaction reserves the table; a later sweep forgets them.
-    async fn forget_retired_snapshots(
-        &self,
-        table_id: &str,
-        snapshot_ids: &[String],
-    ) -> CatalogResult<bool>;
+    async fn forget_retired_files(&self, table_id: &str, keys: &[String]) -> CatalogResult<bool>;
 
     /// Drop all non-authoritative cached metadata rows for one snapshot that has
     /// left the live set — both its `cayenne_snapshot_file` manifest rows and its
