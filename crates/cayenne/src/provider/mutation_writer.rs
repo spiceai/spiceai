@@ -336,6 +336,9 @@ struct StagedPlainAppend {
     rows: u64,
     writer_ops: usize,
     stats_acc: Arc<ColumnStatsAccumulator>,
+    /// The committed `retention_sql` delete over a primary-key-less table's
+    /// resident rows, published with these files.
+    resident_retention: Option<super::overwrite_retention::CommittedResidentRetention>,
 }
 
 pub(super) struct AppendMutationWriter<'a> {
@@ -1402,23 +1405,48 @@ impl<'a> AppendMutationWriter<'a> {
         // violation still fails the append even on a row retention would delete.
         // A partitioned upsert also lands here but resolves repeats, so it keeps
         // the pass after the publish.
+        // One predicate context for the publication: the incoming rows and the
+        // resident rows (`commit_unkeyed_resident_retention`) share its `now()`.
+        let publication_filters = if self.table.has_retention_delete_filters() {
+            Some(Arc::new(
+                self.table
+                    .coerced_retention_filters()
+                    .map_err(|source| super::Error::DataFusion { source })?,
+            ))
+        } else {
+            None
+        };
         let (prepared_stream, retention_dropped) =
             if collapsed_for_retention || self.table.key_resolver()?.is_none() {
-                self.table
-                    .drop_retention_matches_from_stream(prepared.stream)?
+                match &publication_filters {
+                    Some(filters) => super::overwrite_retention::with_publication_retention_sync(
+                        Arc::clone(filters),
+                        || {
+                            self.table
+                                .drop_retention_matches_from_stream(prepared.stream)
+                        },
+                    )?,
+                    None => self
+                        .table
+                        .drop_retention_matches_from_stream(prepared.stream)?,
+                }
             } else {
                 (prepared.stream, Arc::default())
             };
 
-        let written = self
-            .write_prepared_stream(
-                prepared_stream,
-                post_validation,
-                pending_pk_deletions,
-                may_have_on_conflict_deletions,
-                HeldWriteGuards::new(write_guard, checkpoint_guard),
-            )
-            .await?;
+        let write = self.write_prepared_stream(
+            prepared_stream,
+            post_validation,
+            pending_pk_deletions,
+            may_have_on_conflict_deletions,
+            HeldWriteGuards::new(write_guard, checkpoint_guard),
+        );
+        let written = match publication_filters {
+            Some(filters) => {
+                super::overwrite_retention::with_publication_retention(filters, write).await?
+            }
+            None => write.await?,
+        };
         // Report the rows inserted, including those its retention delete removed
         // in the same publication, as when that delete ran after it. Their keys
         // were validated, and may have been cached as present, but are not stored:
@@ -1661,9 +1689,41 @@ impl<'a> AppendMutationWriter<'a> {
         if !needs_new_snapshot {
             let target_size_bytes = self.context.target_file_size_bytes();
             let write_start = Instant::now();
-            let staged = self
+            let mut staged = self
                 .stage_plain_append(prepared_stream, target_size_bytes, estimated_bytes)
                 .await?;
+            // A table without a primary key: its resident rows go through this
+            // publication's `retention_sql` delete too. Prepared here, in the
+            // writer's task, so it shares the publication's predicate context
+            // (task-local, which does not cross the `spawn` below).
+            if self.table.has_retention_delete_filters()
+                && self.table.key_resolver()?.is_none()
+                && !self.table.is_memory_resident_mode()
+            {
+                let filters = match super::overwrite_retention::publication_retention_filters() {
+                    Some(filters) => filters,
+                    None => self
+                        .table
+                        .coerced_retention_filters()
+                        .map_err(|source| super::Error::DataFusion { source })?,
+                };
+                match self.table.commit_unkeyed_resident_retention(&filters).await {
+                    Ok(retention) => staged.resident_retention = retention,
+                    Err(error) => {
+                        if let Err(cleanup_err) = self
+                            .table
+                            .clear_staging_snapshot_dir(&staged.staging_snapshot_id)
+                            .await
+                        {
+                            tracing::warn!(
+                                "Failed to clean staging dir after retention error for table {}: {cleanup_err}",
+                                self.table.table_name(),
+                            );
+                        }
+                        return Err(error);
+                    }
+                }
+            }
             // Once staged, the append commits: its staging WAL is rolled forward by
             // recovery. So its publish and accounting run to completion in their own
             // task, holding the write and checkpoint locks, even when this future is
@@ -1743,6 +1803,10 @@ impl<'a> AppendMutationWriter<'a> {
         post_validation: &Arc<ParkingMutex<Option<PostValidationState>>>,
         reserved_live_rows_delta: super::maintenance::OutstandingLiveRowsDelta,
     ) -> Result<u64> {
+        let resident_deleted = staged.resident_retention.as_ref().map_or(
+            0,
+            super::overwrite_retention::CommittedResidentRetention::deleted,
+        );
         let (rows, writer_ops, stats_acc, append_sequence) =
             self.publish_staged_plain_append(staged).await?;
 
@@ -1759,7 +1823,9 @@ impl<'a> AppendMutationWriter<'a> {
             validated_keys,
         } = take_post_validation(post_validation);
 
-        let superseded = on_conflict_deletions.total_superseded();
+        let superseded = on_conflict_deletions
+            .total_superseded()
+            .saturating_add(usize::try_from(resident_deleted).unwrap_or(usize::MAX));
         let update = self
             .table
             .apply_on_conflict_deletions(on_conflict_deletions)
@@ -2173,6 +2239,7 @@ impl<'a> AppendMutationWriter<'a> {
             rows,
             writer_ops,
             stats_acc,
+            resident_retention: None,
         })
     }
 
@@ -2193,6 +2260,7 @@ impl<'a> AppendMutationWriter<'a> {
             rows,
             writer_ops,
             stats_acc,
+            resident_retention,
         } = staged;
 
         // Zero rows publishes nothing, so there is nothing for a transaction to
@@ -2225,7 +2293,8 @@ impl<'a> AppendMutationWriter<'a> {
             None,
             staging_snapshot_id,
             rows,
-        );
+        )
+        .with_resident_retention(resident_retention);
         let publish_start = Instant::now();
         staged_append.finalize_staged_write().await?;
         record_cayenne_write_phase(self.table.table_name(), "publish", publish_start);

@@ -179,6 +179,11 @@ impl PreparedResolvedAppend {
 
         let cas_start = Instant::now();
         self.table.publish_prepared_on_conflict_deletions(prepared);
+        if self.resident_retention.is_some() {
+            // Maintained aggregates are fed the appended rows below but not the
+            // resident rows this delete removes: recompute them instead.
+            self.table.mark_maintained_aggregates_stale();
+        }
         if let Some(resident) = self.resident_retention.take()
             && let Err(error) = resident.publish()
         {
