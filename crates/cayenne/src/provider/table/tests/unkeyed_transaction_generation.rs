@@ -244,3 +244,68 @@ async fn unkeyed_transaction_failed_commit_is_resolved_by_the_durable_pointer() 
         );
     }
 }
+
+fn data_files(root: &std::path::Path) -> usize {
+    let Ok(entries) = std::fs::read_dir(root) else {
+        return 0;
+    };
+    entries
+        .flatten()
+        .map(|e| {
+            let path = e.path();
+            if path.is_dir() { data_files(&path) } else { 1 }
+        })
+        .sum()
+}
+
+/// The single-table `CayenneStagedUpsert::commit` (no `CayenneTransaction`)
+/// is refused on a table without a primary key: at 9aa41988c it published a
+/// protected snapshot that a reopen does not load (the pre-existing unkeyed
+/// reopen loss, `unkeyed_transaction_reopen_test`), and the carried generation
+/// that fixes it must flip under the listing fence only the fused commit
+/// holds. The refusal is explicit, publishes nothing, and leaves no staged
+/// files behind; the table stays writable. In-repo callers of this API are
+/// tests only (`grep staged.commit(`); it remains `pub` via `cayenne::CayenneStagedUpsert`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_single_table_staged_commit_without_a_primary_key_is_refused() {
+    let f = unkeyed("ut_gen_single_table_refused");
+    let f = f.await;
+    let p = &f.provider;
+    insert_batch(p, id_value_batch(schema(), &[1, 2], &[1, 2])).await;
+    let root = std::path::PathBuf::from(&p.metadata().path);
+    let files_before = data_files(&root);
+
+    let token = p.transaction_write_token().await;
+    let staged = p
+        .begin_staged_upsert_occ(
+            token,
+            single_batch_stream(id_value_batch(schema(), &[10], &[10])),
+            1,
+        )
+        .await
+        .expect("staged");
+    let error = staged
+        .commit(std::collections::HashSet::new(), true)
+        .await
+        .expect_err("refused");
+    assert!(
+        matches!(error, Error::Unsupported { .. }),
+        "an explicit unsupported-operation error: {error}"
+    );
+    assert_eq!(ids(p).await, vec![1, 2], "nothing published");
+    assert_eq!(
+        data_files(&root),
+        files_before,
+        "no staged files left behind"
+    );
+    assert_eq!(ids(&f.reopen().await).await, vec![1, 2], "reopened");
+
+    transaction(p, &[11])
+        .await
+        .expect("the fused route still commits");
+    assert_eq!(
+        ids(&f.reopen().await).await,
+        vec![1, 2, 11],
+        "reopened after txn"
+    );
+}

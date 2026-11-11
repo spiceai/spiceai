@@ -458,6 +458,12 @@ enum FusedFailure {
 /// reloaded — rather than letting each publish's abort cleanup delete files a
 /// committed catalog references, or letting later writes build on an
 /// in-memory view the catalog has moved past.
+///
+/// This is fail-closed, not a completed finish: the in-memory switch and the
+/// post-publish steps do not run, and the outcome (committed or not) is
+/// resolved only by reloading the table. Cancellation before the shared
+/// COMMIT begins is not handled here: the catalog transaction is dropped
+/// uncommitted and each publish's abort cleanup runs.
 struct OutcomeUnknownOnDrop<'a>(Option<&'a mut [PreparedTxnCommit]>);
 
 impl<'a> OutcomeUnknownOnDrop<'a> {

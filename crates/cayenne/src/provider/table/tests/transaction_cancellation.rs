@@ -21,6 +21,13 @@ limitations under the License.
 //! removed) and the table refuses writes until it is reloaded, so nothing is
 //! written against an in-memory view the catalog has moved past; a reopen
 //! reads exactly the committed rows.
+//!
+//! Contract (fail-closed, NOT a normal finish): the in-memory switch does not
+//! run, so the live instance never serves the commit; it refuses writes until
+//! the table is reloaded, and the reload serves the durable outcome. Locks are
+//! released by unwinding the cancelled future (asserted below). A fused
+//! transaction acknowledges no source position, so there is no source ack to
+//! leak. Cancellation before the shared COMMIT starts is not covered here.
 
 use super::*;
 use crate::provider::append_commit::test_seams;
@@ -143,6 +150,20 @@ async fn a_caller_cancelled_after_the_durable_commit_keeps_the_outcome_and_refus
             .expect("the commit reached its durable point");
         task.abort();
         assert!(task.await.expect_err("aborted").is_cancelled(), "{label}");
+
+        // The cancelled commit released every lock it held: write lock,
+        // visibility lock and listing fence are all acquirable.
+        let free = std::time::Duration::from_secs(5);
+        let _w = tokio::time::timeout(free, p.write_lock_arc().lock_owned())
+            .await
+            .unwrap_or_else(|_| panic!("{label}: write lock released"));
+        let _v = tokio::time::timeout(free, p.visibility_lock_arc().lock_owned())
+            .await
+            .unwrap_or_else(|_| panic!("{label}: visibility lock released"));
+        let _l = tokio::time::timeout(free, p.lock_listing_fence_write_owned())
+            .await
+            .unwrap_or_else(|_| panic!("{label}: listing fence released"));
+        drop((_l, _v, _w));
 
         let committed = if keyed {
             vec![(1, 1), (2, 20), (10, 10)]

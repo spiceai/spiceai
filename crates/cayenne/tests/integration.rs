@@ -150,6 +150,7 @@ mod timestamp_unit_roundtrip_test;
 mod unkeyed_transaction_reopen_test;
 mod update_test;
 mod upsert_with_pending_deletions_test;
+mod user_write_redelivery_probe;
 mod vortex_compressible_test;
 mod vortex_task_cancellation;
 mod write_back_pk_shapes_test;
