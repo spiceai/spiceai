@@ -542,7 +542,10 @@ fn distributed_node_rank(params: &HashMap<String, SecretString>) -> Option<usize
     if !ring {
         return None;
     }
-    match params.get("node_rank").map(|rank| rank.expose_secret().trim()) {
+    match params
+        .get("node_rank")
+        .map(|rank| rank.expose_secret().trim())
+    {
         None | Some("") => Some(0),
         Some(rank) => rank.parse::<usize>().ok(),
     }
@@ -875,12 +878,27 @@ mod tests {
                 .collect()
         };
         for (pairs, expected) in [
-            (&[("distributed_backend", "ring"), ("node_rank", "2")][..], Some(2)),
-            (&[("distributed_backend", "Ring"), ("node_rank", " 1 ")][..], Some(1)),
+            (
+                &[("distributed_backend", "ring"), ("node_rank", "2")][..],
+                Some(2),
+            ),
+            (
+                &[("distributed_backend", "Ring"), ("node_rank", " 1 ")][..],
+                Some(1),
+            ),
             (&[("distributed_backend", "ring")][..], Some(0)),
-            (&[("distributed_backend", "ring"), ("node_rank", "")][..], Some(0)),
-            (&[("distributed_backend", "ring"), ("node_rank", "first")][..], None),
-            (&[("distributed_backend", "none"), ("node_rank", "1")][..], None),
+            (
+                &[("distributed_backend", "ring"), ("node_rank", "")][..],
+                Some(0),
+            ),
+            (
+                &[("distributed_backend", "ring"), ("node_rank", "first")][..],
+                None,
+            ),
+            (
+                &[("distributed_backend", "none"), ("node_rank", "1")][..],
+                None,
+            ),
             (&[("node_rank", "1")][..], None),
             (&[][..], None),
         ] {
