@@ -304,7 +304,7 @@ attempt, while a **new attempt** has a fresh id and may carry re-planned bytes.
 - **An unresolved attempt is reported at once; it is final only past the evidence
   horizon.** While an attempt is unresolved, for example because the destination
   did not respond, Spice logs **commit outcome unknown** ([#15760](https://github.com/spiceai/spiceai/issues/15760)) and resolves it
-  again in the background or on restart; the source is not acknowledged
+  again on the next commit or on restart; the source is not acknowledged
   meanwhile. An attempt still unresolved past the evidence horizon is *final
   unresolved*: it is never retried, as a database reports a connection dropped
   during `COMMIT`. Nothing is lost: it was never acknowledged, and a CDC position
@@ -317,19 +317,6 @@ attempt, while a **new attempt** has a fresh id and may carry re-planned bytes.
 - **A lost upload response is resolved by reading the object back.** The
   writer's upload, present at its fresh name with the expected digest, counts as
   uploaded; its age counts from the first attempt.
-
-**Commit outcomes.** A log stops for one of three reasons, and each stop
-applies to one log, so to one dataset; when the name registry's log stops,
-creates, drops and transactions across datasets stop (`Stop`,
-`metastore/object_native.rs`).
-
-| Outcome | What the dataset does | Why |
-|---|---|---|
-| **Unknown**: still unresolved after 8 resolve-and-retry rounds, the first 100 ms apart and each wait doubled | Accepts no change, and reads of its state return an error that says to retry shortly. A background task reopens the log, resolves the attempt from what committed and resumes, with a doubling wait up to 64 times the first. Buffered changes that did not commit are dropped. A warning names the dataset and says to check whether the rows are visible before retrying; an info line says when it accepts changes again. | Its state holds changes that may not be in the log, so neither a new change nor a read may build on them. Nothing dropped was acknowledged, and the source is not acknowledged meanwhile, so it re-delivers them. Retrying a new attempt instead could apply an acknowledged write twice. |
-| **Fenced**: the head carries another instance's newer lease, or the attempt was rejected | Stops writing, reloads the committed state, and keeps serving reads from it. The change that found the fence returns an error that says it was not saved. An info line says another instance now writes the dataset. | A takeover is normal with several instances ([#16136](https://github.com/spiceai/spiceai/issues/16136)), so it is not reported as an error, and the committed state is still correct to read. |
-| **Refused**: `apply` refused a change this catalog made | Stops until the process restarts; queries return an error until then. An error line names the dataset, says to restart, and asks for a report. | A refused change is a bug, and the state may be partly changed. A restart, which replays the log, is the simplest correct recovery; a narrower one can come later. |
-
-A reopen that finds a newer lease turns an unknown outcome into fenced.
 
 Model: `commits-retry`, `commits-no-resolve-before-retry`, `commits-restart-turnover`, `commits-restart-no-persist-before-send`, `commit-no-identical`, `commits-failed-resend-rejects` (a failed resend read as rejection applies a write twice); evidence expiring at the horizon: `commits-retry-expiry` (reading missing evidence as rejection applies a write twice: `commits-retry-expiry-no-horizon`).
 
