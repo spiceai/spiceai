@@ -1,0 +1,81 @@
+name: probe cdc over-budget commit race
+
+# Temporary probe for a flaky unit test; lives only on its probe branch.
+on:
+  push:
+    branches:
+      - grokspice/probe-cdc-over-budget
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: never
+  CARGO_NET_RETRY: 10
+  CARGO_INCREMENTAL: 0
+  CARGO_NET_GIT_FETCH_WITH_CLI: true
+
+jobs:
+  probe:
+    environment: secret-free
+    runs-on: spiceai-dev-runners
+    timeout-minutes: 150
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Set up Rust
+        uses: ./.github/actions/setup-rust
+
+      - name: Set up cc
+        uses: ./.github/actions/setup-cc
+
+      - name: Install protoc
+        uses: ./.github/actions/install-protoc
+
+      - name: Probe
+        shell: bash
+        run: |
+          set -uo pipefail
+          F=crates/runtime-table/src/accelerated/refresh_task/changes.rs
+          T=accelerated::refresh_task::changes::tests::test_over_byte_budget_burst_does_not_linger
+          echo "HEAD $(git rev-parse HEAD); nproc $(nproc)"
+
+          build() { cargo test -p runtime-table --lib --no-run --message-format=json 2>/dev/null \
+            | jq -r 'select(.reason=="compiler-artifact" and .target.name=="runtime_table" and .profile.test==true) | .executable' | tail -1; }
+
+          # run <label> <binary> <iterations> <stress 0|1>
+          run() {
+            local label=$1 bin=$2 n=$3 stress=$4 pass=0 fail=0 pids=()
+            if [ "$stress" = 1 ]; then
+              for _ in $(seq "$(nproc)"); do ( while :; do :; done ) & pids+=($!); done
+            fi
+            for _ in $(seq "$n"); do
+              if out=$("$bin" --exact "$T" --test-threads 1 2>&1); then pass=$((pass+1)); else
+                fail=$((fail+1)); [ "$fail" -eq 1 ] && echo "$out" | grep -A3 'panicked at'; fi
+            done
+            [ ${#pids[@]} -gt 0 ] && kill "${pids[@]}" 2>/dev/null
+            echo "RESULT label=$label iterations=$n pass=$pass fail=$fail"
+          }
+
+          # 1. Base, unmodified, under CPU contention.
+          BIN=$(build); [ -x "$BIN" ] || { echo "::error::base build failed"; cargo test -p runtime-table --lib --no-run 2>&1 | tail -30; exit 1; }
+          run base-natural "$BIN" 400 1
+
+          # 2. Widen the window: delay the tracked commit by 200ms, as a slow commit task would.
+          awk 'BEGIN{d=0} {print} !d && /async fn commit\(&self\) -> Result<\(\), CommitError> \{/ {print "            tokio::time::sleep(Duration::from_millis(200)).await;"; d=1}' "$F" > /tmp/w.rs && mv /tmp/w.rs "$F"
+          git diff --stat
+          BIN=$(build); [ -x "$BIN" ] || { echo "::error::widened build failed"; exit 1; }
+          run base-widened "$BIN" 20 0
+
+          # 3. Apply the fix on top of the widened window.
+          git apply .github/probe/fix.patch || { echo "::error::fix patch did not apply"; exit 1; }
+          BIN=$(build); [ -x "$BIN" ] || { echo "::error::fix build failed"; exit 1; }
+          run fix-widened "$BIN" 20 0
+
+          # 4. Fix without the widening, under the same contention as step 1.
+          awk '!/tokio::time::sleep\(Duration::from_millis\(200\)\)\.await;/' "$F" > /tmp/w.rs && mv /tmp/w.rs "$F"
+          git diff --stat
+          BIN=$(build); [ -x "$BIN" ] || { echo "::error::fix build failed"; exit 1; }
+          run fix-natural "$BIN" 400 1
