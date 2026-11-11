@@ -548,8 +548,10 @@ async fn check_query_results(
             }
         };
 
+        // The file source generates its data with the bundled DuckDB 1.x `tpch`
+        // extension, whose free-text columns differ from the official dbgen data.
         if let QueryValidationResult::Fail(reason) =
-            validation::validate_tpch_query(query, &batches)?
+            validation::validate_tpch_query_on_duckdb1_data(query, &batches)?
         {
             eprintln!("\nQuery '{}' returned unexpected results", query.name);
             eprintln!("Query SQL: {}", query.sql);
