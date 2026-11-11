@@ -1013,20 +1013,20 @@ impl CayenneTableProvider {
                 ));
             }
         }
-        // The new generation carries the current snapshot only. Rows published
-        // as protected snapshots (a transactional write to a table without a
-        // primary key publishes one) would not be carried, and the flip clears
-        // their catalog entries, so the append is refused rather than dropping
-        // them. Nothing is published.
-        if self.has_protected_snapshots() {
-            return Err(internal(
-                "retention_sql append to a table without a primary key whose rows include \
-                 protected snapshots (a transactional write) is not supported: carrying only \
-                 the current snapshot would drop them"
-                    .to_string(),
-            ));
-        }
-        let source_snapshot_id = self.get_current_snapshot_id();
+        // The new generation carries every published run: the current snapshot
+        // and each protected snapshot (a committed transactional write to a
+        // table without a primary key publishes its rows as one). Captured
+        // together under the listing fence, as a scan captures them. A staged
+        // transaction that has not committed owns an unregistered directory that
+        // is neither in this set nor touched here; its commit then fails the
+        // optimistic check this flip trips. The flip clears the protected
+        // entries only because their rows are carried, with their deletes.
+        let (source_snapshot_id, protected_runs) = {
+            let _fence = self.listing_fence.read().await;
+            let mut runs: Vec<String> = self.protected_snapshots.load().keys().cloned().collect();
+            runs.sort();
+            (self.get_current_snapshot_id(), runs)
+        };
         let new_snapshot_id = uuid::Uuid::now_v7().to_string();
         let is_s3 = self.table_path().starts_with("s3://");
         if !is_s3 {
@@ -1038,7 +1038,7 @@ impl CayenneTableProvider {
             // its matches join them. The appended rows were already filtered by
             // the same predicate context (`drop_retention_matches_from_stream`),
             // so no row is evaluated twice.
-            let visible_deletes: HashMap<String, Vec<u32>> = self
+            let mut visible_deletes: HashMap<String, Vec<u32>> = self
                 .pk_deletion_strategy
                 .position_cache()
                 .load()
@@ -1046,9 +1046,27 @@ impl CayenneTableProvider {
                 .filter(|(_, vector)| !vector.is_empty())
                 .map(|(path, vector)| (path.clone(), vector.to_bitmap().iter().collect()))
                 .collect();
-            let resident_deletes = self
-                .hide_retention_matches_in_snapshot(&source_snapshot_id, visible_deletes)
-                .await?;
+            // Each carried run's deletes, and every row the predicate matches
+            // among the rows they leave visible, evaluated in the publication's
+            // one retention context. A delete on no carried run is refused.
+            let mut carried_runs: Vec<String> = vec![source_snapshot_id.clone()];
+            carried_runs.extend(protected_runs.iter().cloned());
+            let mut run_deletes: Vec<(String, HashMap<String, Vec<u32>>)> =
+                Vec::with_capacity(carried_runs.len());
+            for run in &carried_runs {
+                let marker = format!("/{run}/");
+                let (mine, rest): (HashMap<_, _>, HashMap<_, _>) = visible_deletes
+                    .into_iter()
+                    .partition(|(path, _)| path.contains(&marker));
+                visible_deletes = rest;
+                let hidden = self.hide_retention_matches_in_snapshot(run, mine).await?;
+                run_deletes.push((run.clone(), hidden));
+            }
+            if let Some(path) = visible_deletes.keys().next() {
+                return Err(internal(format!(
+                    "a delete on {path} addresses no published run of the table"
+                )));
+            }
             let (row_count, _files, stats) = self
                 .write_to_snapshot_with_schema(
                     data,
@@ -1070,31 +1088,29 @@ impl CayenneTableProvider {
                 .into_iter()
                 .map(|(name, _)| name)
                 .collect();
-            let resident = self.list_snapshot_files_with_sizes(&source_snapshot_id).await?;
-            if let Some((name, _)) = resident.iter().find(|(name, _)| appended.contains(name)) {
-                return Err(internal(format!(
-                    "carried file {name} collides with an appended file"
-                )));
+            let mut carried_names: std::collections::HashSet<String> = appended;
+            let to = format!("/{new_snapshot_id}/");
+            let mut deletions = HashMap::new();
+            for (run, hidden) in run_deletes {
+                let resident = self.list_snapshot_files_with_sizes(&run).await?;
+                if let Some((name, _)) = resident.iter().find(|(name, _)| carried_names.contains(name)) {
+                    return Err(internal(format!(
+                        "carried file {name} of run {run} collides with another file of the new generation"
+                    )));
+                }
+                carried_names.extend(resident.iter().map(|(name, _)| name.clone()));
+                let names: Vec<&str> = resident.iter().map(|(name, _)| name.as_str()).collect();
+                self.link_or_copy_snapshot_files(&run, &new_snapshot_id, &names)
+                    .await?;
+                // Re-key the run's deletes to the carried paths.
+                let from = format!("/{run}/");
+                for (path, rows) in hidden {
+                    deletions.insert(path.replacen(&from, &to, 1), rows);
+                }
             }
-            let names: Vec<&str> = resident.iter().map(|(name, _)| name.as_str()).collect();
-            self.link_or_copy_snapshot_files(&source_snapshot_id, &new_snapshot_id, &names)
-                .await?;
             self.sync_local_snapshot_dir(&new_snapshot_id)
                 .await
                 .map_err(|source| super::Error::Catalog { source })?;
-            // Re-key the carried files' deletes to their new paths. Every one of
-            // them must land on a carried file.
-            let from = format!("/{source_snapshot_id}/");
-            let to = format!("/{new_snapshot_id}/");
-            let mut deletions = HashMap::with_capacity(resident_deletes.len());
-            for (path, rows) in resident_deletes {
-                if !path.contains(&from) {
-                    return Err(internal(format!(
-                        "a delete on {path} does not address the current snapshot {source_snapshot_id}"
-                    )));
-                }
-                deletions.insert(path.replacen(&from, &to, 1), rows);
-            }
             Ok((row_count, deletions, stats))
         }
         .await;

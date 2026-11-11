@@ -39460,11 +39460,6 @@ impl CayenneTableProvider {
     /// staged inline-conflict tombstone is unpublished, a mem-tier seal shadow is
     /// held, or an append is finalizing. Read under `write_lock` and
     /// `mem_checkpoint_lock` (see `apply_retention_filters`).
-    /// Whether any rows are published as protected snapshots.
-    pub(crate) fn has_protected_snapshots(&self) -> bool {
-        !self.protected_snapshots.load().is_empty()
-    }
-
     pub(crate) fn inline_materialization_blocked(&self) -> bool {
         self.pending_inline_tombstones.load(Ordering::Acquire) > 0
             || self.mem_tier_shadow_present.load(Ordering::Acquire)
