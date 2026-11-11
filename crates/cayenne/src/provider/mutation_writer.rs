@@ -457,6 +457,19 @@ impl<'a> AppendMutationWriter<'a> {
                         // `prepare_stream_for_insert` so the durable path re-runs
                         // on-conflict validation against the single index — keeping
                         // conflict semantics intact without a second sharded apply.
+                        if self.cdc_applies_retention_at_publish() {
+                            let raw = MemorySourceConfig::try_new_exec(&[batches], schema, None)
+                                .and_then(|exec| {
+                                    execute_stream(exec, Arc::clone(self.task_context))
+                                })?;
+                            let rows = self
+                                .write_as(raw, write_guard, WriteKind::ChangeStream)
+                                .await?;
+                            return Ok(CayenneCdcWrite::completed(
+                                self.table.clone_for_write_operations(),
+                                rows,
+                            ));
+                        }
                         let checkpoint_guard = self
                             .table
                             .lock_mem_tier_checkpoint_for_durable_write()
@@ -531,6 +544,24 @@ impl<'a> AppendMutationWriter<'a> {
         } else {
             (data, write_guard)
         };
+        // A durable apply to a `retention_sql` table publishes synchronously, with
+        // its retention delete in the same commit; the returned write is complete,
+        // so the change source acknowledges the batch only after both are durable,
+        // and a failed batch is never acknowledged.
+        if self.cdc_applies_retention_at_publish() {
+            let rows = self
+                .write_as(data, write_guard, WriteKind::ChangeStream)
+                .await?;
+            record_cayenne_write_phase(
+                self.table.table_name(),
+                "cdc_path_retention_at_publish",
+                write_start,
+            );
+            return Ok(CayenneCdcWrite::completed(
+                self.table.clone_for_write_operations(),
+                rows,
+            ));
+        }
         // Held from the validation's primary-key index checkout until this write's
         // decisions about where replaced rows live are published (the synchronous
         // and inline paths) or staged (the pipelined path, which then releases it
@@ -1263,6 +1294,23 @@ impl<'a> AppendMutationWriter<'a> {
         data: SendableRecordBatchStream,
         write_guard: OwnedMutexGuard<()>,
     ) -> Result<u64> {
+        self.write_as(data, write_guard, WriteKind::Statement).await
+    }
+
+    /// Whether a durable change-stream apply takes [`Self::write_as`] instead of
+    /// the pipelined staging: a `retention_sql` table must publish each batch
+    /// with its retention delete, which that path's writes do and the pipelined
+    /// staging (publish first, delete in a later pass) does not.
+    fn cdc_applies_retention_at_publish(&self) -> bool {
+        self.table.has_retention_delete_filters() && self.table.row_versions.is_none()
+    }
+
+    async fn write_as(
+        &self,
+        data: SendableRecordBatchStream,
+        write_guard: OwnedMutexGuard<()>,
+        kind: WriteKind,
+    ) -> Result<u64> {
         self.table.ensure_no_incomplete_write().await?;
         // Held for the whole write: its validation decides from the primary-key
         // index whether each replaced row is inline or in a file, and its
@@ -1305,6 +1353,27 @@ impl<'a> AppendMutationWriter<'a> {
         // A table without a primary key: an append supersedes nothing, so
         // `retention_sql` is applied by not writing the rows it deletes (see
         // `drop_retention_matches_from_stream`), and no publication carries them.
+        // A partitioned upsert table resolves no repeats while it writes, so for
+        // `retention_sql` it collapses the write to each key's last copy first
+        // (buffering it, as a memory-mode write does) and retention then runs on
+        // the rows that survive, before the write publishes them.
+        let collapsed_for_retention = self.table.metadata().partition_column.is_some()
+            && self.table.has_retention_delete_filters()
+            && self.table.key_resolver()?.is_some();
+        let data = if collapsed_for_retention {
+            let schema = data.schema();
+            let batches: Vec<RecordBatch> = data.try_collect().await?;
+            let batches = match kind {
+                WriteKind::Statement => self.table.collapse_buffered_write(batches)?,
+                WriteKind::ChangeStream => self.table.collapse_buffered_changes(batches)?,
+            };
+            Box::pin(RecordBatchStreamAdapter::new(
+                schema,
+                futures::stream::iter(batches.into_iter().map(Ok)),
+            )) as SendableRecordBatchStream
+        } else {
+            data
+        };
         let prepared = self.table.prepare_stream_for_insert(data).await?;
         #[cfg(test)]
         self.table.run_test_post_prepare_hook().await;
@@ -1318,7 +1387,9 @@ impl<'a> AppendMutationWriter<'a> {
         // violation still fails the append even on a row retention would delete.
         // A partitioned upsert also lands here but resolves repeats, so it keeps
         // the pass after the publish.
-        let (prepared_stream, retention_dropped) = if self.table.key_resolver()?.is_none() {
+        let (prepared_stream, retention_dropped) = if collapsed_for_retention
+            || self.table.key_resolver()?.is_none()
+        {
             self.table.drop_retention_matches_from_stream(prepared.stream)?
         } else {
             (prepared.stream, Arc::default())

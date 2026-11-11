@@ -57,6 +57,8 @@ test_with_backends!(volatile_predicate_sees_only_winning_copies_impl);
 test_with_backends!(key_without_on_conflict_append_hides_at_publish_impl);
 test_with_backends!(retention_deletes_are_durable_with_the_append_impl);
 test_with_backends!(memory_cdc_apply_hides_matching_rows_at_publish_impl);
+test_with_backends!(durable_cdc_apply_hides_and_failed_batch_replays_impl);
+test_with_backends!(partitioned_upsert_hides_matching_rows_at_publish_impl);
 
 fn schema() -> SchemaRef {
     Arc::new(Schema::new(vec![
@@ -718,5 +720,187 @@ async fn memory_cdc_apply_hides_matching_rows_at_publish_impl(
         apply(rows(&[(1, Some("active"))])).await?;
         assert_eq!(ids(&t).await?, vec![1, 2, 3, 5, 6], "{shards} shards: removed key returns");
     }
+    Ok(())
+}
+
+async fn cdc_apply(
+    t: &Arc<CayenneTableProvider>,
+    batch: RecordBatch,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let ctx = SessionContext::new();
+    let schema = batch.schema();
+    let stream: datafusion::execution::SendableRecordBatchStream = Box::pin(
+        datafusion::physical_plan::stream::RecordBatchStreamAdapter::new(
+            schema,
+            futures::stream::iter([Ok(batch)]),
+        ),
+    );
+    let write = t.write_cdc_append_stream(stream, &ctx.task_ctx()).await?;
+    if write.has_pending_finalize() {
+        write.finish().await?;
+    }
+    Ok(())
+}
+
+async fn durable_cdc_table(
+    fixture: &common::TestFixture,
+    name: &str,
+    retention: Expr,
+) -> Result<Arc<CayenneTableProvider>, Box<dyn std::error::Error>> {
+    let dir = fixture.data_path.join(name);
+    std::fs::create_dir_all(&dir)?;
+    let options = CreateTableOptions {
+        table_name: name.to_string(),
+        schema: schema(),
+        primary_key: vec!["id".to_string()],
+        on_conflict: Some(OnConflict::Upsert(ColumnReference::new(vec!["id".to_string()]))),
+        base_path: dir.to_string_lossy().to_string(),
+        partition_column: None,
+        vortex_config: file_tier_config(),
+    };
+    Ok(Arc::new(
+        CayenneTableProvider::create_table_with_retention(
+            Arc::clone(&fixture.catalog) as Arc<dyn MetadataCatalog>,
+            options,
+            vec![retention],
+            SessionContext::new().runtime_env(),
+        )
+        .await?,
+    ))
+}
+
+/// A durable CDC apply publishes each batch with its retention delete. A batch
+/// retention cannot evaluate fails without publishing anything, so the source
+/// never acknowledges it; replaying it fails the same way and leaves the table
+/// unchanged, and the next batch the source sends applies normally.
+async fn durable_cdc_apply_hides_and_failed_batch_replays_impl(
+    fixture: common::TestFixture,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let t = durable_cdc_table(&fixture, "rsql_pub_cdc_durable", archived()).await?;
+    cdc_apply(&t, rows(&[(1, Some("active")), (2, Some("active")), (3, Some("active"))])).await?;
+    cdc_apply(
+        &t,
+        rows(&[
+            (1, Some("archived")),
+            (4, Some("active")),
+            (4, Some("archived")),
+            (5, Some("archived")),
+            (5, Some("active")),
+            (6, None),
+        ]),
+    )
+    .await?;
+    assert_eq!(ids(&t).await?, vec![2, 3, 5, 6], "right after the apply");
+    assert_eq!(count_star(&t).await?, 4);
+
+    // `status` values that are not integers make this predicate fail.
+    let failing = cast(col("status"), DataType::Int32).eq(lit(1_i32));
+    let f = durable_cdc_table(&fixture, "rsql_pub_cdc_durable_fail", failing).await?;
+    cdc_apply(&f, rows(&[(1, Some("1")), (2, Some("2"))])).await?;
+    assert_eq!(ids(&f).await?, vec![2], "integer statuses apply");
+    for attempt in 0..2 {
+        let bad = cdc_apply(&f, rows(&[(2, Some("x")), (3, Some("y"))])).await;
+        assert!(bad.is_err(), "attempt {attempt}: the batch retention cannot evaluate fails");
+        assert_eq!(ids(&f).await?, vec![2], "attempt {attempt}: nothing of it published");
+        assert_eq!(count_star(&f).await?, 1, "attempt {attempt}: COUNT(*) unchanged");
+    }
+    cdc_apply(&f, rows(&[(3, Some("3")), (4, Some("1"))])).await?;
+    assert_eq!(ids(&f).await?, vec![2, 3], "the next batch applies");
+    Ok(())
+}
+
+/// A partitioned upsert table (whose writes do not resolve repeats while they
+/// write) still publishes the upsert and its retention delete together, with the
+/// last copy of a repeated key deciding.
+async fn partitioned_upsert_hides_matching_rows_at_publish_impl(
+    fixture: common::TestFixture,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let name = "rsql_pub_partitioned";
+    let dir = fixture.data_path.join(name);
+    std::fs::create_dir_all(&dir)?;
+    let options = CreateTableOptions {
+        table_name: name.to_string(),
+        schema: schema(),
+        primary_key: vec!["id".to_string()],
+        on_conflict: Some(OnConflict::Upsert(ColumnReference::new(vec!["id".to_string()]))),
+        base_path: dir.to_string_lossy().to_string(),
+        partition_column: Some("status".to_string()),
+        vortex_config: file_tier_config(),
+    };
+    let t = Arc::new(
+        CayenneTableProvider::create_table_with_retention(
+            Arc::clone(&fixture.catalog) as Arc<dyn MetadataCatalog>,
+            options,
+            vec![archived()],
+            SessionContext::new().runtime_env(),
+        )
+        .await?,
+    );
+    common::insert_batch(t.as_ref(), rows(&[(1, Some("active")), (2, Some("active")), (3, Some("active"))]))
+        .await?;
+    t.flush_pending_maintenance().await?;
+    let upsert = || {
+        rows(&[
+            (1, Some("archived")),
+            (4, Some("active")),
+            (4, Some("archived")),
+            (5, Some("archived")),
+            (5, Some("active")),
+        ])
+    };
+    // The same table without retention: what the upsert reported before.
+    let twin_dir = fixture.data_path.join("rsql_pub_partitioned_twin");
+    std::fs::create_dir_all(&twin_dir)?;
+    let twin = Arc::new(
+        CayenneTableProvider::create_table(
+            Arc::clone(&fixture.catalog) as Arc<dyn MetadataCatalog>,
+            CreateTableOptions {
+                table_name: "rsql_pub_partitioned_twin".to_string(),
+                schema: schema(),
+                primary_key: vec!["id".to_string()],
+                on_conflict: Some(OnConflict::Upsert(ColumnReference::new(vec!["id".to_string()]))),
+                base_path: twin_dir.to_string_lossy().to_string(),
+                partition_column: Some("status".to_string()),
+                vortex_config: file_tier_config(),
+            },
+            SessionContext::new().runtime_env(),
+        )
+        .await?,
+    );
+    common::insert_batch(twin.as_ref(), rows(&[(1, Some("active")), (2, Some("active")), (3, Some("active"))]))
+        .await?;
+    let reported_without_retention = common::insert_batch(twin.as_ref(), upsert()).await?;
+    let twin_rows: Vec<(i64, Option<String>)> = {
+        let ctx = SessionContext::new();
+        ctx.register_table("w", Arc::clone(&twin) as Arc<dyn TableProvider>)?;
+        let batches = ctx.sql("SELECT id, status FROM w ORDER BY id").await?.collect().await?;
+        let mut out = Vec::new();
+        for b in &batches {
+            let i = b.column(0).as_any().downcast_ref::<Int64Array>().expect("id");
+            let st = b.column(1).as_any().downcast_ref::<StringArray>().expect("status");
+            for r in 0..b.num_rows() {
+                out.push((i.value(r), st.is_valid(r).then(|| st.value(r).to_string())));
+            }
+        }
+        out
+    };
+    assert_eq!(
+        twin_rows,
+        vec![
+            (1, Some("archived".to_string())),
+            (2, Some("active".to_string())),
+            (3, Some("active".to_string())),
+            (4, Some("archived".to_string())),
+            (5, Some("active".to_string())),
+        ],
+        "without retention the last copy of each key wins"
+    );
+    assert_eq!(
+        common::insert_batch(t.as_ref(), upsert()).await?,
+        reported_without_retention,
+        "the upsert reports what it reported without retention"
+    );
+    assert_eq!(ids(&t).await?, vec![2, 3, 5], "right after the upsert");
+    assert_eq!(count_star(&t).await?, 3);
     Ok(())
 }
