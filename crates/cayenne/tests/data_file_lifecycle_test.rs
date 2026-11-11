@@ -663,16 +663,17 @@ impl Location {
             .collect()
     }
 
-    /// The data files of `snapshots`, by key.
-    async fn files_of(&self, table_id: &str, snapshots: &[String]) -> BTreeSet<String> {
+    /// The stored data files of table `table_id` that `keys` (paths relative to
+    /// the table) name, by object key.
+    async fn files_of(&self, table_id: &str, keys: &[String]) -> BTreeSet<String> {
+        let wanted: BTreeSet<String> = keys
+            .iter()
+            .map(|key| format!("{}/{table_id}/{key}", self.data_prefix))
+            .collect();
         self.data_files()
             .await
             .into_keys()
-            .filter(|key| {
-                snapshots
-                    .iter()
-                    .any(|id| key.contains(&format!("/{table_id}/{id}/")))
-            })
+            .filter(|key| wanted.contains(key))
             .collect()
     }
 }
@@ -705,13 +706,9 @@ impl Process {
             .await
             .expect("read the manifest")
             .into_iter()
-            .filter(|file| !retired.contains(&format!("{}/{}", file.snapshot_id, file.file_path)))
-            .map(|file| {
-                format!(
-                    "{}/{table_id}/{}/{}",
-                    location.data_prefix, file.snapshot_id, file.file_path
-                )
-            })
+            // A placed table is flat: a data file's key is its path.
+            .filter(|file| !retired.contains(&file.file_path))
+            .map(|file| format!("{}/{table_id}/{}", location.data_prefix, file.file_path))
             .collect();
         for dv in self
             .catalog
@@ -739,7 +736,7 @@ impl Process {
         );
     }
 
-    /// The snapshots whose data files are retired (deletion vectors aside).
+    /// The keys of the retired data files (deletion vectors aside), sorted.
     async fn retired(&self) -> Option<Vec<String>> {
         self.catalog
             .retired_files(self.table.table_id())
@@ -747,8 +744,8 @@ impl Process {
             .expect("read the retired files")
             .map(|keys| {
                 keys.iter()
-                    .filter(|key| !key.contains("/deletions/"))
-                    .filter_map(|key| key.split_once('/').map(|(snapshot, _)| snapshot.to_string()))
+                    .filter(|key| !key.contains("deletions/"))
+                    .cloned()
                     .collect::<BTreeSet<String>>()
                     .into_iter()
                     .collect()
@@ -1405,7 +1402,6 @@ async fn a_rolled_back_overwrite_deletes_its_files_and_deletion_vectors() {
         .begin_overwrite(repeated, 1)
         .await
         .expect("prepare the overwrite");
-    let snapshot = prepared.new_snapshot_id().to_string();
     let written: Vec<String> = location
         .probe
         .objects(&location.data_prefix)
@@ -1414,9 +1410,7 @@ async fn a_rolled_back_overwrite_deletes_its_files_and_deletion_vectors() {
         .filter(|key| !before.contains_key(key))
         .collect();
     assert!(
-        written
-            .iter()
-            .any(|key| key.contains(&snapshot) && has_extension(key, "vortex")),
+        written.iter().any(|key| has_extension(key, "vortex")),
         "the overwrite wrote its snapshot's files: {written:?}"
     );
     assert!(

@@ -422,15 +422,18 @@ impl DeleteScanTable {
         }
     }
 
-    /// Read the files `catalog` names for the snapshot `listing` reads, a
-    /// snapshot of table `table_id` whose committed state is the only record of
-    /// its files.
+    /// Read the files `catalog` names for `snapshot_id`, the snapshot of table
+    /// `table_id` that `listing` reads, whose committed state is the only
+    /// record of its files. A row's path is relative to `listing`'s directory:
+    /// the table's own directory in a flat table, the snapshot's folder
+    /// otherwise.
     ///
     /// A partitioned table keeps the listing, as its scans do: the committed
     /// state does not record partition values, which the listing derives from
     /// each path.
     pub(crate) async fn committed(
         listing: Arc<ListingTable>,
+        snapshot_id: &str,
         catalog: &dyn MetadataCatalog,
         table_id: &str,
     ) -> datafusion_common::Result<Self> {
@@ -443,21 +446,13 @@ impl DeleteScanTable {
             )));
         };
         let prefix = url.prefix();
-        let mut parts = prefix.parts();
-        let snapshot_id = parts.next_back();
-        let owner = parts.next_back();
-        let (Some(snapshot_id), Some(owner)) = (snapshot_id, owner) else {
+        if !prefix.parts().any(|part| part.as_ref() == table_id) {
             return Err(datafusion_common::DataFusionError::Internal(format!(
-                "the snapshot directory '{prefix}' a delete of table {table_id} reads names no snapshot"
-            )));
-        };
-        if owner.as_ref() != table_id {
-            return Err(datafusion_common::DataFusionError::Internal(format!(
-                "the snapshot directory '{prefix}' a delete of table {table_id} reads belongs to another table"
+                "the directory '{prefix}' a delete of table {table_id} reads belongs to another table"
             )));
         }
         let manifest = catalog
-            .get_snapshot_files(table_id, snapshot_id.as_ref())
+            .get_snapshot_files(table_id, snapshot_id)
             .await
             .map_err(|error| datafusion_common::DataFusionError::External(Box::new(error)))?;
         let files = super::super::table::CayenneTableProvider::manifest_files_as_partitioned_files(
@@ -734,7 +729,9 @@ pub struct CayenneDeletionSink {
     dataset_storage: Option<Arc<DatasetStorage>>,
     /// Whether the main source reads the current snapshot's committed files
     /// instead of listing its directory (see [`DeleteScanTable`]).
-    reads_committed_files: bool,
+    /// The owning table's current snapshot id, when the main source is read from
+    /// its committed files; `None` lists the directory.
+    committed_snapshot: Option<Arc<parking_lot::RwLock<String>>>,
 }
 
 /// The locks a coherent (listing, deletion index) capture holds, outer first.
@@ -802,15 +799,19 @@ impl CayenneDeletionSink {
             capture_locks: None,
             file_deletion_fence: None,
             dataset_storage,
-            reads_committed_files: false,
+            committed_snapshot: None,
         }
     }
 
-    /// Read the main source from the current snapshot's committed files, for a
-    /// table whose committed state is the only record of its files.
+    /// Read the main source from the committed files of the current snapshot
+    /// `current_snapshot` names, for a table whose committed state is the only
+    /// record of its files; `None` lists the main directory.
     #[must_use]
-    pub(crate) fn with_committed_files(mut self, committed: bool) -> Self {
-        self.reads_committed_files = committed;
+    pub(crate) fn with_committed_files(
+        mut self,
+        current_snapshot: Option<Arc<parking_lot::RwLock<String>>>,
+    ) -> Self {
+        self.committed_snapshot = current_snapshot;
         self
     }
 
@@ -904,9 +905,13 @@ impl CayenneDeletionSink {
         };
         let listing = self.listing_table.load_full();
         let tombstones_at_capture = pk_deletion_snapshot_for_strategy(&self.pk_deletion_strategy);
-        let table = if self.reads_committed_files {
+        let table = if let Some(current) = &self.committed_snapshot {
+            // Read under the same guards as the listing, which the owning table
+            // publishes together with the snapshot id.
+            let snapshot_id = current.read().clone();
             DeleteScanTable::committed(
                 listing,
+                &snapshot_id,
                 self.catalog.as_ref(),
                 &self.table_metadata.table_id,
             )

@@ -9448,6 +9448,14 @@ impl CayenneTableProvider {
         crate::metastore_layout::is_object_native_data_path(&self.table_metadata.path)
     }
 
+    /// Whether a table at `table_path` (its recorded data path, or the data
+    /// root its store serves it under) keeps its data files flat under its own
+    /// directory, with no folder per snapshot: a table whose data is in the
+    /// object-native location (see [`Self::snapshot_dir_url`]).
+    fn is_flat_data_path(table_path: &str) -> bool {
+        crate::metastore_layout::is_object_native_data_path(table_path)
+    }
+
     /// Whether the cleanup a commit schedules takes the snapshots it reclaims
     /// from the committed state instead of listing the table's prefix: a table
     /// whose data is in the object-native location on a store, in a catalog
@@ -9731,9 +9739,15 @@ impl CayenneTableProvider {
 
     /// The key of data file `name` of `snapshot_id`: its path relative to the
     /// table, as the committed state keys it
-    /// (`cayenne_metastore_actions::state::TableState::file_key`).
-    fn data_file_key(snapshot_id: &str, name: &str) -> String {
-        Self::manifest_file_relative_path(snapshot_id, name)
+    /// (`cayenne_metastore_actions::state::TableState::file_key`): the name
+    /// itself for a snapshot of a flat table, `<folder>/<name>` for a file in a
+    /// folder of its own (any snapshot of another table, a staging write's).
+    fn data_file_key(&self, snapshot_id: &str, name: &str) -> String {
+        if self.data_in_object_native_location() && uuid::Uuid::parse_str(snapshot_id).is_ok() {
+            name.to_string()
+        } else {
+            Self::manifest_file_relative_path(snapshot_id, name)
+        }
     }
 
     /// The keys of every data file and deletion vector the committed state
@@ -9747,7 +9761,7 @@ impl CayenneTableProvider {
         let table_id = self.table_metadata.table_id.as_str();
         for row in self.catalog.get_all_snapshot_files(table_id).await? {
             if live.contains(&row.snapshot_id) {
-                keys.insert(Self::data_file_key(&row.snapshot_id, &row.file_path));
+                keys.insert(self.data_file_key(&row.snapshot_id, &row.file_path));
             }
         }
         let table_path = self.table_metadata.path.trim_end_matches('/');
@@ -9793,7 +9807,7 @@ impl CayenneTableProvider {
         let objects: Vec<(ObjectStorePath, u64)> = files
             .into_iter()
             .filter(|(name, _)| {
-                let key = Self::data_file_key(snapshot_id, name);
+                let key = self.data_file_key(snapshot_id, name);
                 let keep = named.contains(&key);
                 if keep {
                     tracing::debug!(
@@ -9816,13 +9830,29 @@ impl CayenneTableProvider {
     }
 
     /// Discards `snapshot_id`, a snapshot this process wrote and no commit made
-    /// live, of a table whose data is in the object-native location: deletes the
-    /// files its writer's record holds by name
-    /// ([`Self::delete_uncommitted_uploads`]) and stops holding them.
+    /// live, of a table whose data is in the object-native location: deletes by
+    /// name ([`Self::delete_uncommitted_uploads`]) the files its writer's record
+    /// holds and the files the manifest its writer recorded before the commit
+    /// names, and stops holding them. A file a live snapshot also names (one a
+    /// compaction carries) is kept.
     pub(crate) async fn discard_uncommitted_snapshot(&self, snapshot_id: &str) -> Result<()> {
-        let written = self.uncommitted_files.files(snapshot_id);
+        let mut written: BTreeMap<String, u64> =
+            self.uncommitted_files.files(snapshot_id).into_iter().collect();
         self.uncommitted_files.forget(snapshot_id);
-        self.delete_uncommitted_uploads(snapshot_id, written).await
+        if !Self::is_staging_snapshot_id(snapshot_id) {
+            for row in self
+                .catalog
+                .get_snapshot_files(&self.table_metadata.table_id, snapshot_id)
+                .await
+                .map_err(|source| Error::Catalog { source })?
+            {
+                written
+                    .entry(row.file_path)
+                    .or_insert_with(|| u64::try_from(row.file_size_bytes).unwrap_or(0));
+            }
+        }
+        self.delete_uncommitted_uploads(snapshot_id, written.into_iter().collect())
+            .await
     }
 
     async fn cleanup_old_snapshots_s3(&self, pins: &SnapshotSweepPins) -> Result<bool> {
@@ -10179,6 +10209,12 @@ impl CayenneTableProvider {
         }
         let now = Instant::now();
         let oldest_scan = super::scan::oldest_scan_generation(&self.snapshot_scan_refs.lock());
+        let flat = self.data_in_object_native_location();
+        let held_names: HashSet<String> = if flat {
+            self.uncommitted_files.held_keys()
+        } else {
+            HashSet::new()
+        };
         let mut next_due: Option<std::time::Duration> = None;
         let due: Vec<String> = {
             let timers = self.retired_file_timers.lock();
@@ -10199,9 +10235,18 @@ impl CayenneTableProvider {
                         next_due = Some(Self::SNAPSHOT_CLEANUP_GRACE);
                         return false;
                     }
-                    let held = key
-                        .split_once('/')
-                        .is_some_and(|(snapshot, _)| self.uncommitted_files.holds_snapshot(snapshot));
+                    // A write of this process still holds the file: by name in a
+                    // flat table, whose files share the table's directory, and
+                    // by its snapshot's folder otherwise.
+                    let held = if flat {
+                        held_names.contains(key.as_str())
+                            || super::orphan_sweep::deletion_vector_name(key)
+                                .is_some_and(|name| held_names.contains(name))
+                    } else {
+                        key.split_once('/').is_some_and(|(snapshot, _)| {
+                            self.uncommitted_files.holds_snapshot(snapshot)
+                        })
+                    };
                     if held {
                         next_due = Some(Self::SNAPSHOT_CLEANUP_GRACE);
                     }
@@ -10239,7 +10284,7 @@ impl CayenneTableProvider {
             .into_iter()
             .map(|row| {
                 (
-                    Self::manifest_file_relative_path(&row.snapshot_id, &row.file_path),
+                    self.data_file_key(&row.snapshot_id, &row.file_path),
                     u64::try_from(row.file_size_bytes).unwrap_or(0),
                 )
             })
@@ -10509,20 +10554,24 @@ impl CayenneTableProvider {
         )))
     }
 
-    /// Construct the snapshot directory URL string.
+    /// The URL of the directory that holds `snapshot_id`'s data files: the
+    /// data-file resolver every write, scan and named delete goes through.
     ///
-    /// For local paths, returns a file:// URL or path string.
-    /// For S3 paths, returns the S3 URL with proper path components.
-    ///
-    /// # Arguments
-    ///
-    /// * `table_path` - The base path for the table (local path or S3 URL)
-    /// * `table_id` - The unique identifier for the table
-    /// * `snapshot_id` - The snapshot identifier
+    /// A table whose data is in the object-native location
+    /// ([`crate::metastore_layout::is_object_native_data_path`]) is flat: a
+    /// snapshot (a UUID) has no folder, and its files are under the table's own
+    /// directory, `<table_path>/<table_id>/`, where a manifest row's path is
+    /// relative to (so a row written as `<snapshot>/<name>` still resolves).
+    /// Any other name, a staging write's or the lookup index's, stays a folder
+    /// of its own. Every other table keeps a folder per snapshot:
+    /// `<table_path>/<table_id>/<snapshot_id>/`, a local path or an object URL.
     fn snapshot_dir_url(table_path: &str, table_id: &str, snapshot_id: &str) -> String {
         if crate::is_object_store_path(table_path) {
             // S3 URL: join path components with /
             let base = table_path.trim_end_matches('/');
+            if Self::is_flat_data_path(table_path) && uuid::Uuid::parse_str(snapshot_id).is_ok() {
+                return format!("{base}/{table_id}/");
+            }
             format!("{base}/{table_id}/{snapshot_id}/")
         } else {
             // Local path: use PathBuf and convert to URL string
@@ -44282,12 +44331,19 @@ impl CayenneTableProvider {
             .into_iter()
             .filter(|file| file.file_size_bytes > 0)
             .map(|file| {
+                // A row's path is relative to `prefix`, and may name a folder
+                // under it (`<snapshot>/<name>` in a flat table): join each part.
+                let location = file
+                    .file_path
+                    .split('/')
+                    .filter(|part| !part.is_empty())
+                    .fold(prefix.clone(), |location, part| location.join(part));
                 // `synthetic_object_meta` stamps the epoch mtime the Vortex
                 // write path also stamps on its footer-cache entries, so
                 // `is_valid_for` matches and post-write scans reuse the
                 // just-written footers instead of re-reading them cold.
                 let object_meta = vortex_datafusion::synthetic_object_meta(
-                    prefix.clone().join(file.file_path.as_str()),
+                    location,
                     u64::try_from(file.file_size_bytes).unwrap_or(0),
                 );
                 // Same conversion `pruned_partition_list` uses for the
@@ -47813,13 +47869,15 @@ impl CayenneTableProvider {
             let _guards = capture_locks.read().await;
             let tombstones_at_capture = self.pk_deletion_snapshot();
             let mut tables = Vec::new();
-            for (_, max_delete_seq_at_creation, listing) in
+            for (snapshot_id, max_delete_seq_at_creation, listing) in
                 self.build_protected_snapshot_listing_tables()?
             {
                 tables.push(DeleteScanSource {
                     min_delete_seq: Some(max_delete_seq_at_creation),
                     insert_records: InsertRecordHandling::Ignore,
-                    table: self.delete_scan_table(listing, committed_files).await?,
+                    table: self
+                        .delete_scan_table(listing, &snapshot_id, committed_files)
+                        .await?,
                     tombstones_at_capture: Some(tombstones_at_capture.clone()),
                 });
             }
@@ -47884,21 +47942,26 @@ impl CayenneTableProvider {
         .with_capture_locks(capture_locks)
         .with_file_deletion_fence(Arc::clone(&self.file_deletion_fence))
         .with_exact_count(source.requires_exact_count())
-        .with_committed_files(committed_files);
+        .with_committed_files(
+            committed_files.then(|| Arc::clone(&self.current_snapshot_id)),
+        );
 
         Ok(sink)
     }
 
-    /// How a delete reads the snapshot `listing` reads: from the files its
-    /// committed state names when `committed_files`, else by listing it.
+    /// How a delete reads `snapshot_id`, the snapshot `listing` reads: from the
+    /// files its committed state names when `committed_files`, else by listing
+    /// it.
     async fn delete_scan_table(
         &self,
         listing: Arc<ListingTable>,
+        snapshot_id: &str,
         committed_files: bool,
     ) -> datafusion_common::Result<DeleteScanTable> {
         if committed_files {
             DeleteScanTable::committed(
                 listing,
+                snapshot_id,
                 self.catalog.as_ref(),
                 &self.table_metadata.table_id,
             )
@@ -47984,12 +48047,21 @@ impl CayenneTableProvider {
         let ctx = self.create_session_context();
         // Wait-free ArcSwap snapshot. Refreshes are serialized against this
         // path by `self.write_lock`, held above.
-        let listing_table = self.listing_table.load_full();
+        // The listing and the snapshot id it reads, published together under
+        // the listing fence.
+        let (listing_table, snapshot_id) = {
+            let _fence = self.listing_fence.read().await;
+            (self.listing_table.load_full(), self.get_current_snapshot_id())
+        };
 
         // PositionBased tables have no protected snapshots, so we only scan the main listing table.
         let all_tables = vec![
-            self.delete_scan_table(listing_table, self.data_in_object_native_location())
-                .await?,
+            self.delete_scan_table(
+                listing_table,
+                &snapshot_id,
+                self.data_in_object_native_location(),
+            )
+            .await?,
         ];
 
         // Build the deletion sink with write_lock=None (we already hold it).

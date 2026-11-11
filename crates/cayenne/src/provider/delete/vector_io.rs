@@ -719,11 +719,18 @@ impl<'a> DeletionVectorWriter<'a> {
         Ok(results)
     }
 
+    /// Where new deletion vectors go: `<table path>/<table id>/deletions/` for a
+    /// table whose data is in the object-native location, which keeps its files
+    /// flat with no folder per snapshot, and the current snapshot's
+    /// `deletions/` folder otherwise.
     fn table_snapshot_deletion_dir(&self) -> PathBuf {
         let base = Path::new(&self.table.path);
-        let snapshot_path = base.join(&self.table.current_snapshot_id);
-
-        snapshot_path.join(DELETION_DIR_NAME)
+        let parent = if crate::metastore_layout::is_object_native_data_path(&self.table.path) {
+            base.join(&self.table.table_id)
+        } else {
+            base.join(&self.table.current_snapshot_id)
+        };
+        parent.join(DELETION_DIR_NAME)
     }
 
     fn deletion_file_path(deletion_dir: &Path) -> PathBuf {

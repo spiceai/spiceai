@@ -3034,12 +3034,8 @@ async fn writes_and_maintenance_of_a_placed_dataset_list_nothing() {
         .await
         .expect("manifest")
         .into_iter()
-        .map(|file| {
-            format!(
-                "{}/{events_id}/{}/{}",
-                setup.data_prefix, file.snapshot_id, file.file_path
-            )
-        })
+        // A placed table is flat: a row's path is relative to the table.
+        .map(|file| format!("{}/{events_id}/{}", setup.data_prefix, file.file_path))
         .collect();
     let unnamed: Vec<String> = objects_under(&setup, &setup.data_prefix, ".vortex")
         .await
@@ -3621,5 +3617,90 @@ async fn retention_of_a_placed_dataset_lists_nothing() {
             ("keyed", Vec::<String>::new(), true, kept),
         ],
         "per dataset: LIST prefixes during its writes and retention, a deletion vector written, rows"
+    );
+}
+
+/// A placed table keeps its files flat under its own directory: data files at
+/// `data/<table_id>/<write_id>_<n>.vortex` and deletion vectors at
+/// `data/<table_id>/deletions/delete_<uuidv7>.arrow`, with no folder per
+/// snapshot, and its manifest rows name them by their path relative to the
+/// table.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_placed_table_writes_flat_keys() {
+    let (setup, catalog, table, ctx) = create("flat").await;
+    for first in [1, 1001] {
+        run(
+            &ctx,
+            &format!(
+                "INSERT INTO flat SELECT value AS id, value * 10 AS v FROM generate_series({first}, {})",
+                first + 999
+            ),
+        )
+        .await;
+    }
+    // A position delete writes a deletion vector.
+    run(&ctx, "DELETE FROM flat WHERE id >= 100 AND id <= 199").await;
+    table.drain_in_flight_maintenance().await.expect("drain");
+
+    let table_id = table.metadata().table_id.clone();
+    let table_prefix = format!("{}/{table_id}/", setup.data_prefix);
+    let mut data = std::collections::BTreeSet::new();
+    let mut deletions = std::collections::BTreeSet::new();
+    let mut other = Vec::new();
+    for key in data_objects(&setup).await {
+        match key.strip_prefix(&table_prefix) {
+            // The orphan sweep's clock object, not a data file.
+            Some("_store_clock") => {}
+            Some(name) if !name.contains('/') && name.ends_with(".vortex") => {
+                data.insert(name.to_string());
+            }
+            Some(name)
+                if name.starts_with("deletions/delete_")
+                    && name.ends_with(".arrow")
+                    && name.matches('/').count() == 1 =>
+            {
+                deletions.insert(name.to_string());
+            }
+            _ => other.push(key),
+        }
+    }
+    let stored = catalog.get_table("flat").await.expect("stored table");
+    let named: std::collections::BTreeSet<String> = catalog
+        .get_snapshot_files(&table_id, &stored.current_snapshot_id)
+        .await
+        .expect("manifest")
+        .into_iter()
+        .map(|file| file.file_path)
+        .collect();
+    let named_deletions: std::collections::BTreeSet<String> = catalog
+        .get_table_delete_files(&table_id)
+        .await
+        .expect("deletion vectors")
+        .into_iter()
+        .map(|dv| {
+            dv.path
+                .strip_prefix(&format!("{}/{table_id}/", setup.data_url))
+                .unwrap_or(&dv.path)
+                .to_string()
+        })
+        .collect();
+    assert_eq!(
+        (
+            other,
+            data.len() >= 2,
+            deletions.len(),
+            named == data,
+            named_deletions == deletions,
+            count_and_sum(&ctx, "flat").await,
+        ),
+        (
+            Vec::<String>::new(),
+            true,
+            1,
+            true,
+            true,
+            (1900, expected_sum(1, 2000) - expected_sum(100, 199)),
+        ),
+        "no object outside the table's flat keys; data {data:?} vs manifest {named:?}, deletion vectors {deletions:?} vs committed {named_deletions:?}"
     );
 }

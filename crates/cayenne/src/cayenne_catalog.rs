@@ -6308,7 +6308,12 @@ pub(crate) async fn verify_stored_data_files_in<C: MetadataCatalog + ?Sized>(
     memory_mode: bool,
     settings_change: SettingsChangeAction,
 ) -> CatalogResult<()> {
-    if table.path.starts_with("s3://") || memory_mode {
+    // A table whose data is in the object-native location has no folder per
+    // snapshot to compare, and its committed state is its only file record.
+    if table.path.starts_with("s3://")
+        || memory_mode
+        || crate::metastore_layout::is_object_native_data_path(&table.path)
+    {
         return Ok(());
     }
     // Scans read the current snapshot and every protected one (rows staged

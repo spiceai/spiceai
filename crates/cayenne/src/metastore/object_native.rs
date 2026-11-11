@@ -2781,8 +2781,11 @@ impl Domain {
                 vortex_config_json,
                 current_snapshot_id: snapshot,
                 seq: 0,
-                // Data files stay in their snapshot's directory.
-                flat_layout: false,
+                // A table whose data is in the object-native location keeps its
+                // files flat under its own directory, keyed by path alone.
+                flat_layout: crate::metastore_layout::is_object_native_data_path(
+                    &options.base_path,
+                ),
             }))])
             .await?;
         Ok(id)
