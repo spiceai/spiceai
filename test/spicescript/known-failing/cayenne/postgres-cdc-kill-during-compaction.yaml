@@ -11,7 +11,7 @@ description: >
   offset into it each run, leaves it with every row from before or every row
   from after, never part of either or a mix, and it then matches the source.
   With object-native data (#16133), the files the compactions and the
-  overwrite retired are deleted from the state location after the grace.
+  overwrite retired stay in the state location for the data-file retention.
 
 sources:
   src: { kind: postgres }
