@@ -370,6 +370,23 @@ def baselines_to_check(config: dict) -> dict[str, float]:
     return baselines
 
 
+def zero_retry_sets_to_check(config: dict) -> list[str]:
+    """Return every test set that must keep retries = 0 and an explicit ceiling.
+
+    That is each key of ZERO_RETRY_BINARIES, plus each narrower set an override
+    names inside one of them, such as an exact test of a zero-retry module. An
+    override for that test placed ahead of the module's own one is the first
+    match nextest gives it, so it could set retries or drop the ceiling while
+    the module key still resolves to the module's settings.
+    """
+    sets = set(ZERO_RETRY_BINARIES)
+    for override in config.get("profile", {}).get("default", {}).get("overrides", []):
+        for selector in selectors_matched(override.get("filter", "")):
+            if any(contained_in(selector, key) for key in ZERO_RETRY_BINARIES):
+                sets.add(selector)
+    return sorted(sets)
+
+
 def resolve(config: dict, binary: str, setting: str) -> object | None:
     """Resolve `setting` for the test set `binary` the way nextest does.
 
@@ -446,7 +463,7 @@ def check_config(config_path: Path, repo_root: Path | None = None) -> list[str]:
                 "configured, pool load decides whether unrelated PRs pass. See #12336 / #12811."
             )
 
-    for binary in sorted(ZERO_RETRY_BINARIES):
+    for binary in zero_retry_sets_to_check(config):
         if resolve(config, binary, "retries") != 0:
             problems.append(
                 f"{name}: {binary} no longer has retries = 0. These tests assert the "

@@ -578,6 +578,72 @@ class CheckConfigTest(unittest.TestCase):
         self.assertEqual(len(never_terminates), len(check_nextest_config.ZERO_RETRY_BINARIES))
         self.assertTrue(all("Set terminate-after" in p for p in never_terminates))
 
+    def _with_override_first(self, override: str) -> str:
+        head, _, tail = FIXED_CONFIG.partition("[[profile.default.overrides]]")
+        return head + override.lstrip("\n") + "\n[[profile.default.overrides]]" + tail
+
+    def test_rejects_an_exact_test_override_that_retries_a_zero_retry_test(self):
+        """An exact test ahead of its zero-retry module's override is held to retries = 0.
+
+        nextest gives the test the first override that sets `retries`, so a
+        `retries = 1` exact-test override placed first retries that test while
+        the module key still resolves to the module's `retries = 0`.
+        """
+        config = self._with_override_first(
+            "[[profile.default.overrides]]\n"
+            "filter = '(binary_id(=cayenne::integration) & "
+            "test(=mutation_property_test::prop_concurrent_mixed_position_sqlite))'\n"
+            "retries = 1\n"
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            problems = check_nextest_config.check_config(write(tmp, config))
+        self.assertEqual(len(problems), 1, problems)
+        self.assertIn(
+            "cayenne::integration#mutation_property_test::prop_concurrent_mixed_position_sqlite "
+            "no longer has retries = 0",
+            problems[0],
+        )
+
+    def test_rejects_an_exact_test_override_that_drops_a_zero_retry_ceiling(self):
+        """An exact test ahead of its zero-retry module's override keeps a real ceiling."""
+        config = self._with_override_first(
+            "[[profile.default.overrides]]\n"
+            "filter = '(binary_id(=cayenne::integration) & "
+            "test(=mutation_property_test::prop_concurrent_mixed_position_sqlite))'\n"
+            'slow-timeout = "120s"\n'
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            problems = check_nextest_config.check_config(write(tmp, config))
+        self.assertEqual(len(problems), 1, problems)
+        self.assertIn(
+            "cayenne::integration#mutation_property_test::prop_concurrent_mixed_position_sqlite "
+            "has retries = 0 and a slow-timeout that never terminates",
+            problems[0],
+        )
+
+    def test_accepts_an_exact_test_override_that_keeps_the_zero_retry_rules(self):
+        """The negative case: an exact override with no retries and a real ceiling passes."""
+        config = self._with_override_first(
+            "[[profile.default.overrides]]\n"
+            "filter = '(binary_id(=cayenne::integration) & "
+            "test(=mutation_property_test::prop_concurrent_mixed_position_sqlite))'\n"
+            "retries = 0\n"
+            'slow-timeout = { period = "120s", terminate-after = 12 }\n'
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            self.assertEqual(check_nextest_config.check_config(write(tmp, config)), [])
+
+    def test_an_exact_test_outside_the_zero_retry_modules_may_retry(self):
+        """The sibling that must not match: retries on a test of another module are allowed."""
+        config = self._with_override_first(
+            "[[profile.default.overrides]]\n"
+            "filter = '(binary_id(=cayenne::integration) & "
+            "test(=some_other_module::a_test))'\n"
+            "retries = 2\n"
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            self.assertEqual(check_nextest_config.check_config(write(tmp, config)), [])
+
     def test_reports_a_slow_timeout_missing_its_period(self):
         """A `terminate-after` with no `period` is a config problem, not a crash."""
         config = FIXED_CONFIG.replace(
