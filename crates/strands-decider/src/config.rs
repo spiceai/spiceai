@@ -127,7 +127,10 @@ impl DeciderConfig {
     /// between upstream's writers ([`CONFIG_NAME`], [`LEGACY_CONFIG_NAME`], [`HEAD_CONFIG_NAME`]).
     ///
     /// A decider config is a JSON object with an integer `pointer_dim` that names its head, by
-    /// `head_type` or by `readout`. `Ok(None)` for any other text. A decider config that the
+    /// `head_type` or by `readout`. `Ok(None)` for any other text, and for a training recipe
+    /// (`train_config.json`, which names `train_files`): it has the same keys, but they are the
+    /// settings training started from, not those of the exported head (a soup of heads has a
+    /// wider `pointer_dim`). A decider config that the
     /// pointer readout cannot serve (another head, or a full-weight checkpoint) is an error, not
     /// `None`, so such a checkpoint is refused rather than taken for something else.
     pub fn detect(text: &str) -> Result<Option<Self>> {
@@ -138,7 +141,8 @@ impl DeciderConfig {
             .get("pointer_dim")
             .is_some_and(|dim| dim.is_u64() || dim.is_i64());
         let names_head = map.contains_key("head_type") || map.contains_key("readout");
-        if !(has_pointer_dim && names_head) {
+        let is_training_recipe = map.contains_key("train_files");
+        if !(has_pointer_dim && names_head) || is_training_recipe {
             return Ok(None);
         }
         Self::from_json(text).map(Some)
@@ -269,6 +273,9 @@ mod tests {
             r#"{"head_type": "pointer", "pointer_dim": 76.8}"#,
             // A head named without `pointer_dim`.
             r#"{"head_type": "pointer"}"#,
+            // The training recipe published beside the checkpoint, abridged.
+            r#"{"base_model": "Qwen/Qwen3.5-2B-Base", "head_type": "pointer", "pointer_dim": 256,
+                "epochs": 1, "lr": 0.0002, "train_files": ["train.jsonl"]}"#,
         ] {
             assert!(
                 matches!(DeciderConfig::detect(text), Ok(None)),

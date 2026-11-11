@@ -892,6 +892,26 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_training_recipe_beside_the_config_is_passed_over() {
+        let (dir, mut files) = decider_dir("strands_decider_config.json", CONFIG);
+        let recipe = dir.path().join("decider/train_config.json");
+        std::fs::write(
+            &recipe,
+            r#"{"head_type": "pointer", "pointer_dim": 256, "train_files": ["train.jsonl"]}"#,
+        )
+        .expect("written");
+        files.push(recipe);
+        let found = detect_local("triage", &files)
+            .await
+            .expect("one decider config")
+            .expect("a decider");
+        assert_eq!(
+            found.config,
+            dir.path().join("decider/strands_decider_config.json")
+        );
+    }
+
+    #[tokio::test]
     async fn a_chat_model_is_not_a_decider() {
         // A GGUF chat model with a tokenizer config, and one with only its GGUF.
         let (_dir, mut files) = decider_dir("tokenizer_config.json", r#"{"bos_token": null}"#);
