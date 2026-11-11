@@ -522,6 +522,21 @@ impl CayenneCatalog {
             let (sql, params) = Self::build_insert_delete_files_chunk_sql(chunk);
             txn.execute(ExecuteParams { sql: &sql, params }).await?;
         }
+        // The retention delete over the resident rows the publication keeps:
+        // the same rows a later DELETE would insert, committed with the snapshot.
+        if payload
+            .retention_delete_files
+            .iter()
+            .any(|file| file.table_id != table_id)
+        {
+            return Err(CatalogError::InvalidOperationNoSource {
+                message: "Deferred retention delete spans multiple tables".to_string(),
+            });
+        }
+        for chunk in payload.retention_delete_files.chunks(MAX_PARAMS / 10) {
+            let (sql, params) = Self::build_insert_delete_files_chunk_sql(chunk);
+            txn.execute(ExecuteParams { sql: &sql, params }).await?;
+        }
         txn.execute(ExecuteParams {
             sql: SNAPSHOT_SEQUENCE_UPSERT_SQL,
             params: vec![
@@ -8402,6 +8417,7 @@ mod tests {
                 published: false,
             }),
             pending_durable_flips: Vec::new(),
+            retention_delete_files: Vec::new(),
         };
 
         for _ in 0..2 {

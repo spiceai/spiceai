@@ -123,7 +123,11 @@ async fn table(
     let options = CreateTableOptions {
         table_name: name.to_string(),
         schema: schema(),
-        primary_key: if upsert { vec!["id".to_string()] } else { vec![] },
+        primary_key: if upsert {
+            vec!["id".to_string()]
+        } else {
+            vec![]
+        },
         on_conflict: upsert
             .then(|| OnConflict::Upsert(ColumnReference::new(vec!["id".to_string()]))),
         base_path: dir.to_string_lossy().to_string(),
@@ -174,10 +178,18 @@ async fn counts(
 async fn ids(provider: &Arc<CayenneTableProvider>) -> Result<Vec<i64>, Box<dyn std::error::Error>> {
     let ctx = SessionContext::new();
     ctx.register_table("t", Arc::clone(provider) as Arc<dyn TableProvider>)?;
-    let batches = ctx.sql("SELECT id FROM t ORDER BY id").await?.collect().await?;
+    let batches = ctx
+        .sql("SELECT id FROM t ORDER BY id")
+        .await?
+        .collect()
+        .await?;
     let mut out = Vec::new();
     for b in &batches {
-        let c = b.column(0).as_any().downcast_ref::<Int64Array>().expect("id");
+        let c = b
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .expect("id");
         out.extend((0..c.len()).map(|i| c.value(i)));
     }
     Ok(out)
@@ -194,7 +206,11 @@ async fn append_hides_matching_rows_at_publish_impl(
     assert_eq!(common::insert_batch(t.as_ref(), batch(0..70)).await?, 70);
     assert_eq!(counts(&t).await?, (60, 0, 10), "right after the append");
     common::insert_batch(t.as_ref(), batch(70..140)).await?;
-    assert_eq!(counts(&t).await?, (120, 0, 20), "right after a second append");
+    assert_eq!(
+        counts(&t).await?,
+        (120, 0, 20),
+        "right after a second append"
+    );
     t.flush_pending_maintenance().await?;
     assert_eq!(counts(&t).await?, (120, 0, 20), "after maintenance");
     Ok(())
@@ -209,7 +225,11 @@ async fn overwrite_hides_matching_rows_at_publish_impl(
     assert_eq!(counts(&t).await?, (60, 0, 10), "after the first load");
     for round in 0..5 {
         common::write_batches(t.as_ref(), vec![batch(0..70)], InsertOp::Overwrite).await?;
-        assert_eq!(counts(&t).await?, (60, 0, 10), "right after overwrite {round}");
+        assert_eq!(
+            counts(&t).await?,
+            (60, 0, 10),
+            "right after overwrite {round}"
+        );
     }
     Ok(())
 }
@@ -235,7 +255,11 @@ async fn upsert_to_matching_version_removes_key_at_publish_impl(
     assert_eq!(ids(&t).await?, vec![2, 3], "right after the upsert");
     // A later insert of the removed key is not dropped as a duplicate.
     common::insert_batch(t.as_ref(), rows(&[(1, Some("active"))])).await?;
-    assert_eq!(ids(&t).await?, vec![1, 2, 3], "key comes back once it no longer matches");
+    assert_eq!(
+        ids(&t).await?,
+        vec![1, 2, 3],
+        "key comes back once it no longer matches"
+    );
     Ok(())
 }
 
@@ -243,11 +267,20 @@ async fn duplicate_key_upsert_last_matching_removes_key_impl(
     fixture: common::TestFixture,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let t = table(&fixture, "rsql_pub_dup", true, archived()).await?;
-    common::insert_batch(t.as_ref(), rows(&[(1, Some("active")), (2, Some("active"))])).await?;
+    common::insert_batch(
+        t.as_ref(),
+        rows(&[(1, Some("active")), (2, Some("active"))]),
+    )
+    .await?;
     t.flush_pending_maintenance().await?;
     common::insert_batch(
         t.as_ref(),
-        rows(&[(1, Some("active")), (1, Some("archived")), (2, Some("archived")), (2, Some("active"))]),
+        rows(&[
+            (1, Some("active")),
+            (1, Some("archived")),
+            (2, Some("archived")),
+            (2, Some("active")),
+        ]),
     )
     .await?;
     assert_eq!(ids(&t).await?, vec![2], "last version per key decides");
@@ -262,13 +295,19 @@ async fn failing_retention_keeps_previous_generation_impl(
     // `CAST('archived' AS INT)` errors only on the batch that holds an archived row.
     let failing = cast(col("status"), DataType::Int32).eq(lit(1_i32));
     let t = table(&fixture, "rsql_pub_fail", false, failing).await?;
-    common::write_batches(t.as_ref(), vec![rows(&[(1, Some("1")), (2, Some("2"))])], InsertOp::Overwrite)
-        .await?;
+    common::write_batches(
+        t.as_ref(),
+        vec![rows(&[(1, Some("1")), (2, Some("2"))])],
+        InsertOp::Overwrite,
+    )
+    .await?;
     t.flush_pending_maintenance().await?;
     assert_eq!(ids(&t).await?, vec![2]);
-    let result =
-        common::write_batches(t.as_ref(), vec![batch(0..14)], InsertOp::Overwrite).await;
-    assert!(result.is_err(), "the write that retention cannot apply to fails");
+    let result = common::write_batches(t.as_ref(), vec![batch(0..14)], InsertOp::Overwrite).await;
+    assert!(
+        result.is_err(),
+        "the write that retention cannot apply to fails"
+    );
     assert_eq!(ids(&t).await?, vec![2], "previous generation still served");
     Ok(())
 }
@@ -287,7 +326,12 @@ async fn concurrent_reader_never_sees_matching_rows_impl(
     let reads = Arc::new(AtomicU64::new(0));
     let mut readers = Vec::new();
     for _ in 0..4 {
-        let (t, stop, hits, reads) = (Arc::clone(&t), Arc::clone(&stop), Arc::clone(&hits), Arc::clone(&reads));
+        let (t, stop, hits, reads) = (
+            Arc::clone(&t),
+            Arc::clone(&stop),
+            Arc::clone(&hits),
+            Arc::clone(&reads),
+        );
         readers.push(tokio::spawn(async move {
             while !stop.load(Ordering::Relaxed) {
                 let (_, archived, _) = counts(&t).await.expect("read");
@@ -311,7 +355,11 @@ async fn concurrent_reader_never_sees_matching_rows_impl(
         r.await?;
     }
     assert!(reads.load(Ordering::Relaxed) > 0, "readers ran");
-    assert_eq!(hits.load(Ordering::Relaxed), 0, "reads that saw archived rows");
+    assert_eq!(
+        hits.load(Ordering::Relaxed),
+        0,
+        "reads that saw archived rows"
+    );
     Ok(())
 }
 
@@ -322,8 +370,12 @@ async fn keyed_overwrite_last_copy_decides_at_publish_impl(
     fixture: common::TestFixture,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let t = table(&fixture, "rsql_pub_keyed_overwrite", true, archived()).await?;
-    common::write_batches(t.as_ref(), vec![rows(&[(1, Some("active")), (2, Some("active"))])], InsertOp::Overwrite)
-        .await?;
+    common::write_batches(
+        t.as_ref(),
+        vec![rows(&[(1, Some("active")), (2, Some("active"))])],
+        InsertOp::Overwrite,
+    )
+    .await?;
     t.flush_pending_maintenance().await?;
     for round in 0..3 {
         common::write_batches(
@@ -338,8 +390,16 @@ async fn keyed_overwrite_last_copy_decides_at_publish_impl(
             InsertOp::Overwrite,
         )
         .await?;
-        assert_eq!(ids(&t).await?, vec![2, 3], "right after keyed overwrite {round}");
-        assert_eq!(count_star(&t).await?, 2, "COUNT(*) after keyed overwrite {round}");
+        assert_eq!(
+            ids(&t).await?,
+            vec![2, 3],
+            "right after keyed overwrite {round}"
+        );
+        assert_eq!(
+            count_star(&t).await?,
+            2,
+            "COUNT(*) after keyed overwrite {round}"
+        );
     }
     t.flush_pending_maintenance().await?;
     assert_eq!(ids(&t).await?, vec![2, 3], "after maintenance");
@@ -347,7 +407,9 @@ async fn keyed_overwrite_last_copy_decides_at_publish_impl(
 }
 
 /// Plain `COUNT(*)`, the shape statistics can answer without reading rows.
-async fn count_star(provider: &Arc<CayenneTableProvider>) -> Result<i64, Box<dyn std::error::Error>> {
+async fn count_star(
+    provider: &Arc<CayenneTableProvider>,
+) -> Result<i64, Box<dyn std::error::Error>> {
     let ctx = SessionContext::new();
     ctx.register_table("t", Arc::clone(provider) as Arc<dyn TableProvider>)?;
     let batches = ctx.sql("SELECT count(*) FROM t").await?.collect().await?;
@@ -367,7 +429,12 @@ async fn superseded_copy_is_never_evaluated_impl(
 ) -> Result<(), Box<dyn std::error::Error>> {
     let predicate = cast(col("status"), DataType::Int32).eq(lit(1_i32));
     let t = table(&fixture, "rsql_pub_superseded_eval", true, predicate).await?;
-    common::write_batches(t.as_ref(), vec![rows(&[(5, Some("5"))])], InsertOp::Overwrite).await?;
+    common::write_batches(
+        t.as_ref(),
+        vec![rows(&[(5, Some("5"))])],
+        InsertOp::Overwrite,
+    )
+    .await?;
     t.flush_pending_maintenance().await?;
     common::write_batches(
         t.as_ref(),
@@ -394,7 +461,9 @@ async fn memory_table(
         table_name: name.to_string(),
         schema: schema(),
         primary_key: vec!["id".to_string()],
-        on_conflict: Some(OnConflict::Upsert(ColumnReference::new(vec!["id".to_string()]))),
+        on_conflict: Some(OnConflict::Upsert(ColumnReference::new(vec![
+            "id".to_string(),
+        ]))),
         base_path: fixture.data_path.to_string_lossy().to_string(),
         partition_column: None,
         vortex_config: VortexConfig {
@@ -427,12 +496,21 @@ async fn memory_overwrite_hides_matching_rows_at_publish_impl(
     let t = memory_table(&fixture, "rsql_pub_mem_overwrite", archived()).await?;
     for round in 0..5 {
         common::write_batches(t.as_ref(), vec![batch(0..70)], InsertOp::Overwrite).await?;
-        assert_eq!(counts(&t).await?, (60, 0, 10), "right after memory overwrite {round}");
+        assert_eq!(
+            counts(&t).await?,
+            (60, 0, 10),
+            "right after memory overwrite {round}"
+        );
     }
     // Repeats resolve first: key 1's last copy matches, key 2's does not.
     common::write_batches(
         t.as_ref(),
-        vec![rows(&[(1, Some("active")), (2, Some("archived")), (1, Some("archived")), (2, Some("active"))])],
+        vec![rows(&[
+            (1, Some("active")),
+            (2, Some("archived")),
+            (1, Some("archived")),
+            (2, Some("active")),
+        ])],
         InsertOp::Overwrite,
     )
     .await?;
@@ -445,12 +523,19 @@ async fn memory_failing_retention_keeps_previous_tier_impl(
 ) -> Result<(), Box<dyn std::error::Error>> {
     let failing = cast(col("status"), DataType::Int32).eq(lit(1_i32));
     let t = memory_table(&fixture, "rsql_pub_mem_fail", failing).await?;
-    common::write_batches(t.as_ref(), vec![rows(&[(1, Some("1")), (2, Some("2"))])], InsertOp::Overwrite)
-        .await?;
+    common::write_batches(
+        t.as_ref(),
+        vec![rows(&[(1, Some("1")), (2, Some("2"))])],
+        InsertOp::Overwrite,
+    )
+    .await?;
     t.flush_pending_maintenance().await?;
     assert_eq!(ids(&t).await?, vec![2]);
     let result = common::write_batches(t.as_ref(), vec![batch(0..14)], InsertOp::Overwrite).await;
-    assert!(result.is_err(), "the overwrite retention cannot apply to fails");
+    assert!(
+        result.is_err(),
+        "the overwrite retention cannot apply to fails"
+    );
     assert_eq!(ids(&t).await?, vec![2], "previous tier still served");
     Ok(())
 }
@@ -467,11 +552,23 @@ async fn failing_retention_fails_append_and_keeps_rows_impl(
         common::insert_batch(t.as_ref(), rows(&[(1, Some("1")), (2, Some("2"))])).await?;
         t.flush_pending_maintenance().await?;
         assert_eq!(ids(&t).await?, vec![2], "keyed={keyed}");
-        let result = common::insert_batch(t.as_ref(), rows(&[(3, Some("3")), (4, Some("bad"))])).await;
-        assert!(result.is_err(), "keyed={keyed}: the append retention cannot apply to fails");
-        assert_eq!(ids(&t).await?, vec![2], "keyed={keyed}: nothing of the failed append is visible");
+        let result =
+            common::insert_batch(t.as_ref(), rows(&[(3, Some("3")), (4, Some("bad"))])).await;
+        assert!(
+            result.is_err(),
+            "keyed={keyed}: the append retention cannot apply to fails"
+        );
+        assert_eq!(
+            ids(&t).await?,
+            vec![2],
+            "keyed={keyed}: nothing of the failed append is visible"
+        );
         common::insert_batch(t.as_ref(), rows(&[(5, Some("5"))])).await?;
-        assert_eq!(ids(&t).await?, vec![2, 5], "keyed={keyed}: the table still takes writes");
+        assert_eq!(
+            ids(&t).await?,
+            vec![2, 5],
+            "keyed={keyed}: the table still takes writes"
+        );
     }
     Ok(())
 }
@@ -487,7 +584,12 @@ async fn keyed_append_superseded_copy_is_never_evaluated_impl(
     t.flush_pending_maintenance().await?;
     common::insert_batch(
         t.as_ref(),
-        rows(&[(1, Some("bad")), (2, Some("bad")), (1, Some("1")), (2, Some("2"))]),
+        rows(&[
+            (1, Some("bad")),
+            (2, Some("bad")),
+            (1, Some("1")),
+            (2, Some("2")),
+        ]),
     )
     .await?;
     assert_eq!(ids(&t).await?, vec![2, 9], "right after the append");
@@ -500,12 +602,24 @@ async fn memory_append_hides_matching_rows_at_publish_impl(
 ) -> Result<(), Box<dyn std::error::Error>> {
     let t = memory_table(&fixture, "rsql_pub_mem_append", archived()).await?;
     assert_eq!(common::insert_batch(t.as_ref(), batch(0..70)).await?, 70);
-    assert_eq!(counts(&t).await?, (60, 0, 10), "right after the first append");
+    assert_eq!(
+        counts(&t).await?,
+        (60, 0, 10),
+        "right after the first append"
+    );
     // Key 1 active -> archived: gone at publish; later re-insert is not refused.
     common::insert_batch(t.as_ref(), rows(&[(1, Some("archived"))])).await?;
-    assert_eq!(counts(&t).await?, (59, 0, 10), "right after the upsert to archived");
+    assert_eq!(
+        counts(&t).await?,
+        (59, 0, 10),
+        "right after the upsert to archived"
+    );
     common::insert_batch(t.as_ref(), rows(&[(1, Some("active"))])).await?;
-    assert_eq!(counts(&t).await?, (60, 0, 10), "key 1 back once it no longer matches");
+    assert_eq!(
+        counts(&t).await?,
+        (60, 0, 10),
+        "key 1 back once it no longer matches"
+    );
     Ok(())
 }
 
@@ -546,7 +660,13 @@ async fn volatile_predicate_sees_only_winning_copies_impl(
     let predicate = probe.call(vec![col("status")]);
     for (name, op) in [("ow", InsertOp::Overwrite), ("ap", InsertOp::Append)] {
         seen.lock().expect("lock").clear();
-        let t = table(&fixture, &format!("rsql_pub_volatile_{name}"), true, predicate.clone()).await?;
+        let t = table(
+            &fixture,
+            &format!("rsql_pub_volatile_{name}"),
+            true,
+            predicate.clone(),
+        )
+        .await?;
         common::write_batches(
             t.as_ref(),
             vec![rows(&[
@@ -562,11 +682,15 @@ async fn volatile_predicate_sees_only_winning_copies_impl(
         assert_eq!(ids(&t).await?, vec![1, 3], "{name}: right after the write");
         let seen = seen.lock().expect("lock").clone();
         assert!(
-            seen.iter().all(|v| !v.as_deref().unwrap_or("").starts_with("loser-")),
+            seen.iter()
+                .all(|v| !v.as_deref().unwrap_or("").starts_with("loser-")),
             "{name}: predicate called on a superseded copy: {seen:?}"
         );
         for winner in ["active", "archived"] {
-            assert!(seen.iter().any(|v| v.as_deref() == Some(winner)), "{name}: {winner} never evaluated: {seen:?}");
+            assert!(
+                seen.iter().any(|v| v.as_deref() == Some(winner)),
+                "{name}: {winner} never evaluated: {seen:?}"
+            );
         }
     }
     Ok(())
@@ -602,9 +726,15 @@ async fn key_without_on_conflict_append_hides_at_publish_impl(
     assert_eq!(common::insert_batch(t.as_ref(), batch(0..70)).await?, 70);
     assert_eq!(counts(&t).await?, (60, 0, 10), "right after the append");
     common::insert_batch(t.as_ref(), rows(&[(1000, Some("archived"))])).await?;
-    assert!(!ids(&t).await?.contains(&1000), "archived key hidden at publish");
+    assert!(
+        !ids(&t).await?.contains(&1000),
+        "archived key hidden at publish"
+    );
     common::insert_batch(t.as_ref(), rows(&[(1000, Some("active"))])).await?;
-    assert!(ids(&t).await?.contains(&1000), "a dropped key can be inserted again");
+    assert!(
+        ids(&t).await?.contains(&1000),
+        "a dropped key can be inserted again"
+    );
     assert_eq!(counts(&t).await?, (61, 0, 10));
     Ok(())
 }
@@ -618,11 +748,19 @@ async fn retention_deletes_are_durable_with_the_append_impl(
     let name = "rsql_pub_durable";
     {
         let t = table(&fixture, name, true, archived()).await?;
-        common::insert_batch(t.as_ref(), rows(&[(1, Some("active")), (2, Some("active"))])).await?;
+        common::insert_batch(
+            t.as_ref(),
+            rows(&[(1, Some("active")), (2, Some("active"))]),
+        )
+        .await?;
         t.flush_pending_maintenance().await?;
         common::insert_batch(
             t.as_ref(),
-            rows(&[(1, Some("archived")), (3, Some("archived")), (4, Some("active"))]),
+            rows(&[
+                (1, Some("archived")),
+                (3, Some("archived")),
+                (4, Some("active")),
+            ]),
         )
         .await?;
         assert_eq!(ids(&t).await?, vec![2, 4], "right after the upsert");
@@ -660,7 +798,9 @@ async fn memory_cdc_apply_hides_matching_rows_at_publish_impl(
             table_name: name.clone(),
             schema: schema(),
             primary_key: vec!["id".to_string()],
-            on_conflict: Some(OnConflict::Upsert(ColumnReference::new(vec!["id".to_string()]))),
+            on_conflict: Some(OnConflict::Upsert(ColumnReference::new(vec![
+                "id".to_string(),
+            ]))),
             base_path: dir.to_string_lossy().to_string(),
             partition_column: None,
             vortex_config: VortexConfig {
@@ -705,8 +845,17 @@ async fn memory_cdc_apply_hides_matching_rows_at_publish_impl(
                 Ok::<_, Box<dyn std::error::Error>>(())
             }
         };
-        apply(rows(&[(1, Some("active")), (2, Some("active")), (3, Some("active"))])).await?;
-        assert_eq!(ids(&t).await?, vec![1, 2, 3], "{shards} shards: first apply");
+        apply(rows(&[
+            (1, Some("active")),
+            (2, Some("active")),
+            (3, Some("active")),
+        ]))
+        .await?;
+        assert_eq!(
+            ids(&t).await?,
+            vec![1, 2, 3],
+            "{shards} shards: first apply"
+        );
         apply(rows(&[
             (1, Some("archived")),
             (2, Some("active")),
@@ -715,10 +864,18 @@ async fn memory_cdc_apply_hides_matching_rows_at_publish_impl(
             (6, None),
         ]))
         .await?;
-        assert_eq!(ids(&t).await?, vec![2, 3, 5, 6], "{shards} shards: right after the apply");
+        assert_eq!(
+            ids(&t).await?,
+            vec![2, 3, 5, 6],
+            "{shards} shards: right after the apply"
+        );
         assert_eq!(count_star(&t).await?, 4, "{shards} shards: COUNT(*)");
         apply(rows(&[(1, Some("active"))])).await?;
-        assert_eq!(ids(&t).await?, vec![1, 2, 3, 5, 6], "{shards} shards: removed key returns");
+        assert_eq!(
+            ids(&t).await?,
+            vec![1, 2, 3, 5, 6],
+            "{shards} shards: removed key returns"
+        );
     }
     Ok(())
 }
@@ -753,7 +910,9 @@ async fn durable_cdc_table(
         table_name: name.to_string(),
         schema: schema(),
         primary_key: vec!["id".to_string()],
-        on_conflict: Some(OnConflict::Upsert(ColumnReference::new(vec!["id".to_string()]))),
+        on_conflict: Some(OnConflict::Upsert(ColumnReference::new(vec![
+            "id".to_string(),
+        ]))),
         base_path: dir.to_string_lossy().to_string(),
         partition_column: None,
         vortex_config: file_tier_config(),
@@ -777,7 +936,15 @@ async fn durable_cdc_apply_hides_and_failed_batch_replays_impl(
     fixture: common::TestFixture,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let t = durable_cdc_table(&fixture, "rsql_pub_cdc_durable", archived()).await?;
-    cdc_apply(&t, rows(&[(1, Some("active")), (2, Some("active")), (3, Some("active"))])).await?;
+    cdc_apply(
+        &t,
+        rows(&[
+            (1, Some("active")),
+            (2, Some("active")),
+            (3, Some("active")),
+        ]),
+    )
+    .await?;
     cdc_apply(
         &t,
         rows(&[
@@ -800,9 +967,20 @@ async fn durable_cdc_apply_hides_and_failed_batch_replays_impl(
     assert_eq!(ids(&f).await?, vec![2], "integer statuses apply");
     for attempt in 0..2 {
         let bad = cdc_apply(&f, rows(&[(2, Some("x")), (3, Some("y"))])).await;
-        assert!(bad.is_err(), "attempt {attempt}: the batch retention cannot evaluate fails");
-        assert_eq!(ids(&f).await?, vec![2], "attempt {attempt}: nothing of it published");
-        assert_eq!(count_star(&f).await?, 1, "attempt {attempt}: COUNT(*) unchanged");
+        assert!(
+            bad.is_err(),
+            "attempt {attempt}: the batch retention cannot evaluate fails"
+        );
+        assert_eq!(
+            ids(&f).await?,
+            vec![2],
+            "attempt {attempt}: nothing of it published"
+        );
+        assert_eq!(
+            count_star(&f).await?,
+            1,
+            "attempt {attempt}: COUNT(*) unchanged"
+        );
     }
     cdc_apply(&f, rows(&[(3, Some("3")), (4, Some("1"))])).await?;
     assert_eq!(ids(&f).await?, vec![2, 3], "the next batch applies");
@@ -822,7 +1000,9 @@ async fn partitioned_upsert_hides_matching_rows_at_publish_impl(
         table_name: name.to_string(),
         schema: schema(),
         primary_key: vec!["id".to_string()],
-        on_conflict: Some(OnConflict::Upsert(ColumnReference::new(vec!["id".to_string()]))),
+        on_conflict: Some(OnConflict::Upsert(ColumnReference::new(vec![
+            "id".to_string(),
+        ]))),
         base_path: dir.to_string_lossy().to_string(),
         partition_column: Some("status".to_string()),
         vortex_config: file_tier_config(),
@@ -836,8 +1016,15 @@ async fn partitioned_upsert_hides_matching_rows_at_publish_impl(
         )
         .await?,
     );
-    common::insert_batch(t.as_ref(), rows(&[(1, Some("active")), (2, Some("active")), (3, Some("active"))]))
-        .await?;
+    common::insert_batch(
+        t.as_ref(),
+        rows(&[
+            (1, Some("active")),
+            (2, Some("active")),
+            (3, Some("active")),
+        ]),
+    )
+    .await?;
     t.flush_pending_maintenance().await?;
     let upsert = || {
         rows(&[
@@ -858,7 +1045,9 @@ async fn partitioned_upsert_hides_matching_rows_at_publish_impl(
                 table_name: "rsql_pub_partitioned_twin".to_string(),
                 schema: schema(),
                 primary_key: vec!["id".to_string()],
-                on_conflict: Some(OnConflict::Upsert(ColumnReference::new(vec!["id".to_string()]))),
+                on_conflict: Some(OnConflict::Upsert(ColumnReference::new(vec![
+                    "id".to_string(),
+                ]))),
                 base_path: twin_dir.to_string_lossy().to_string(),
                 partition_column: Some("status".to_string()),
                 vortex_config: file_tier_config(),
@@ -867,17 +1056,36 @@ async fn partitioned_upsert_hides_matching_rows_at_publish_impl(
         )
         .await?,
     );
-    common::insert_batch(twin.as_ref(), rows(&[(1, Some("active")), (2, Some("active")), (3, Some("active"))]))
-        .await?;
+    common::insert_batch(
+        twin.as_ref(),
+        rows(&[
+            (1, Some("active")),
+            (2, Some("active")),
+            (3, Some("active")),
+        ]),
+    )
+    .await?;
     let reported_without_retention = common::insert_batch(twin.as_ref(), upsert()).await?;
     let twin_rows: Vec<(i64, Option<String>)> = {
         let ctx = SessionContext::new();
         ctx.register_table("w", Arc::clone(&twin) as Arc<dyn TableProvider>)?;
-        let batches = ctx.sql("SELECT id, status FROM w ORDER BY id").await?.collect().await?;
+        let batches = ctx
+            .sql("SELECT id, status FROM w ORDER BY id")
+            .await?
+            .collect()
+            .await?;
         let mut out = Vec::new();
         for b in &batches {
-            let i = b.column(0).as_any().downcast_ref::<Int64Array>().expect("id");
-            let st = b.column(1).as_any().downcast_ref::<StringArray>().expect("status");
+            let i = b
+                .column(0)
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .expect("id");
+            let st = b
+                .column(1)
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .expect("status");
             for r in 0..b.num_rows() {
                 out.push((i.value(r), st.is_valid(r).then(|| st.value(r).to_string())));
             }
@@ -905,15 +1113,12 @@ async fn partitioned_upsert_hides_matching_rows_at_publish_impl(
     Ok(())
 }
 
-/// Pending (reported as a constraint): CTO C's `DELETE` runs over the whole
-/// post-conflict generation once per publication, so a resident row that comes
-/// to match between writes (a time cutoff passing, `random()`) must be gone when
-/// the next append publishes, and a predicate that fails on a resident row must
-/// fail that append. Appends evaluate only their own rows today and leave
-/// resident rows to the pass after the publish; these record that gap and are
-/// run with `--ignored`.
+/// CTO C's `DELETE` runs over the whole post-conflict generation once per
+/// publication, so a resident row that comes to match between writes (a time
+/// cutoff passing, `random()`) must be gone when the next append publishes, and
+/// a predicate that fails on a resident row must fail that append and keep the
+/// old generation.
 #[test]
-#[ignore = "pending: resident rows are not evaluated at an append's publish"]
 fn resident_row_newly_matching_is_gone_at_next_publish_sqlite() -> Result<(), String> {
     common::run_with_backend_blocking(
         common::BackendType::Sqlite,
@@ -954,7 +1159,9 @@ async fn resident_row_newly_matching_is_gone_at_next_publish_impl(
                     }
                     out.push(Some(old && a.load(Ordering::SeqCst)));
                 }
-                Ok(ColumnarValue::Array(Arc::new(arrow::array::BooleanArray::from(out))))
+                Ok(ColumnarValue::Array(Arc::new(
+                    arrow::array::BooleanArray::from(out),
+                )))
             }),
         );
         let dir = fixture.data_path.join(name);
@@ -962,7 +1169,11 @@ async fn resident_row_newly_matching_is_gone_at_next_publish_impl(
         let options = CreateTableOptions {
             table_name: name.to_string(),
             schema: schema(),
-            primary_key: if keyed { vec!["id".to_string()] } else { vec![] },
+            primary_key: if keyed {
+                vec!["id".to_string()]
+            } else {
+                vec![]
+            },
             on_conflict: keyed
                 .then(|| OnConflict::Upsert(ColumnReference::new(vec!["id".to_string()]))),
             base_path: dir.to_string_lossy().to_string(),
@@ -986,14 +1197,25 @@ async fn resident_row_newly_matching_is_gone_at_next_publish_impl(
         // fails and the previous generation stays.
         broken.store(true, Ordering::SeqCst);
         let failed = common::insert_batch(t.as_ref(), rows(&[(3, Some("new"))])).await;
-        assert!(failed.is_err(), "{name}: a predicate failing on a resident row fails the append");
-        assert_eq!(ids(&t).await?, vec![1, 2], "{name}: previous generation kept");
+        assert!(
+            failed.is_err(),
+            "{name}: a predicate failing on a resident row fails the append"
+        );
+        assert_eq!(
+            ids(&t).await?,
+            vec![1, 2],
+            "{name}: previous generation kept"
+        );
         broken.store(false, Ordering::SeqCst);
 
         // Row 1 ages into retention; the next append's publication removes it.
         aged.store(true, Ordering::SeqCst);
         common::insert_batch(t.as_ref(), rows(&[(3, Some("new"))])).await?;
-        assert_eq!(ids(&t).await?, vec![2, 3], "{name}: resident row gone at the publish");
+        assert_eq!(
+            ids(&t).await?,
+            vec![2, 3],
+            "{name}: resident row gone at the publish"
+        );
     }
     Ok(())
 }

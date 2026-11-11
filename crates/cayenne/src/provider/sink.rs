@@ -245,14 +245,19 @@ impl DataSink for CayenneDataSink {
                 // An overwrite replaces the tier in one swap: apply `retention_sql` to
                 // the replacement first, so the swap publishes the write and its
                 // retention delete together.
-                let collapsed_rows: usize =
-                    batches.iter().map(arrow::record_batch::RecordBatch::num_rows).sum();
+                let collapsed_rows: usize = batches
+                    .iter()
+                    .map(arrow::record_batch::RecordBatch::num_rows)
+                    .sum();
                 let batches = self
                     .table
                     .drop_retention_matches(batches)
                     .map_err(datafusion_common::DataFusionError::from)?;
                 retention_dropped = collapsed_rows
-                    - batches.iter().map(arrow::record_batch::RecordBatch::num_rows).sum::<usize>();
+                    - batches
+                        .iter()
+                        .map(arrow::record_batch::RecordBatch::num_rows)
+                        .sum::<usize>();
                 (batches, None)
             } else {
                 let raw: SendableRecordBatchStream = Box::pin(RecordBatchStreamAdapter::new(
@@ -270,13 +275,19 @@ impl DataSink for CayenneDataSink {
                 // their keys supersede are already among the deletions, so dropping
                 // the matching incoming rows here leaves what the upsert followed by
                 // `DELETE ... WHERE` would, published by the one tier append below.
-                let validated_rows: usize = validated.iter().map(arrow::record_batch::RecordBatch::num_rows).sum();
+                let validated_rows: usize = validated
+                    .iter()
+                    .map(arrow::record_batch::RecordBatch::num_rows)
+                    .sum();
                 let validated = self
                     .table
                     .drop_retention_matches(validated)
                     .map_err(datafusion_common::DataFusionError::from)?;
                 retention_dropped = validated_rows
-                    - validated.iter().map(arrow::record_batch::RecordBatch::num_rows).sum::<usize>();
+                    - validated
+                        .iter()
+                        .map(arrow::record_batch::RecordBatch::num_rows)
+                        .sum::<usize>();
                 (validated, Some(state))
             };
             let incoming_bytes = arrow_tools::batch_bytes::RetainedBytes::of(&batches);

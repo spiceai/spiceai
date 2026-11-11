@@ -948,7 +948,10 @@ async fn retention_deletes_commit_with_the_append_through_a_crash_before_publish
                 vec![batch(&[(9, "gone"), (10, "gone"), (11, "kept")])],
             )
             .await;
-            assert!(result.is_err(), "{label}: the injected fault fails the write");
+            assert!(
+                result.is_err(),
+                "{label}: the injected fault fails the write"
+            );
             let durable = match fault {
                 CommitFault::CommittedUnreadable => (owned(&[(11, "kept")]), 1),
                 _ => {

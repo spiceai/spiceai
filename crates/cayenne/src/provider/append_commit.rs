@@ -61,6 +61,9 @@ pub(super) struct PreparedResolvedAppend {
     pub superseded: usize,
     pub into_empty_table: bool,
     pub first_load_pk_bloom: Option<FirstLoadPkFilter>,
+    /// The `retention_sql` delete over the resident rows this publication
+    /// keeps, committed in its transaction and published under its fence.
+    pub resident_retention: Option<super::delete::PreparedDeletionPublish>,
 }
 
 /// A failed publication, and whether its snapshot's files must be kept because
@@ -106,7 +109,10 @@ impl PreparedResolvedAppend {
     }
 
     async fn commit_inner(&mut self) -> std::result::Result<u64, Failure> {
-        if self.rows == 0 && self.deletions.total_superseded() == 0 {
+        if self.rows == 0
+            && self.deletions.total_superseded() == 0
+            && self.resident_retention.is_none()
+        {
             super::staged_upsert::cleanup_orphan_snapshot_dir(&self.table, &self.snapshot_id).await;
             return Ok(0);
         }
@@ -149,18 +155,47 @@ impl PreparedResolvedAppend {
         {
             tombstone.published = true;
         }
+        if let Some(resident) = self.resident_retention.as_mut() {
+            let Some(payload) = prepared.durable_payload.as_mut() else {
+                return Err(Failure::discard(Error::Internal {
+                    table: self.table.table_name().to_string(),
+                    message:
+                        "a retention delete reached an append without a deferred catalog payload"
+                            .to_string(),
+                }));
+            };
+            payload.retention_delete_files = resident.delete_files().to_vec();
+            // From here the catalog may reference these files whatever the
+            // commit reports; a rolled-back commit leaves them unreferenced.
+            resident.mark_catalog_committed();
+        }
+        let resident_deleted = self
+            .resident_retention
+            .as_ref()
+            .map_or(0, super::delete::PreparedDeletionPublish::deleted_count);
         let sequence = prepared.snapshot_sequence;
         let reserved_delta = self.table.reserve_live_rows_delta();
         commit_metadata(catalog, &mut prepared).await?;
 
         let cas_start = Instant::now();
         self.table.publish_prepared_on_conflict_deletions(prepared);
+        if let Some(resident) = self.resident_retention.take()
+            && let Err(error) = resident.publish()
+        {
+            // The catalog already holds the delete; reopening rebuilds it.
+            tracing::error!(
+                table = %self.table.table_name(),
+                %error,
+                "failed to publish the committed retention delete to the in-memory caches"
+            );
+        }
         self.table.feed_staged_ivm_under_fence(None);
         let published_delta = reserved_delta.published();
         let retention = self.table.has_retention_delete_filters();
         let delta = i64::try_from(self.rows)
             .unwrap_or(i64::MAX)
-            .saturating_sub(i64::try_from(self.superseded).unwrap_or(i64::MAX));
+            .saturating_sub(i64::try_from(self.superseded).unwrap_or(i64::MAX))
+            .saturating_sub(i64::try_from(resident_deleted).unwrap_or(i64::MAX));
         self.table.schedule_post_write_maintenance(
             Some(Arc::clone(&self.stats)),
             true,

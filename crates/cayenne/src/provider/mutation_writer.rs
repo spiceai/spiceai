@@ -1387,13 +1387,13 @@ impl<'a> AppendMutationWriter<'a> {
         // violation still fails the append even on a row retention would delete.
         // A partitioned upsert also lands here but resolves repeats, so it keeps
         // the pass after the publish.
-        let (prepared_stream, retention_dropped) = if collapsed_for_retention
-            || self.table.key_resolver()?.is_none()
-        {
-            self.table.drop_retention_matches_from_stream(prepared.stream)?
-        } else {
-            (prepared.stream, Arc::default())
-        };
+        let (prepared_stream, retention_dropped) =
+            if collapsed_for_retention || self.table.key_resolver()?.is_none() {
+                self.table
+                    .drop_retention_matches_from_stream(prepared.stream)?
+            } else {
+                (prepared.stream, Arc::default())
+            };
 
         let written = self
             .write_prepared_stream(
@@ -1459,6 +1459,20 @@ impl<'a> AppendMutationWriter<'a> {
             target_partitions: self.task_context.session_config().target_partitions(),
             write_policy,
         };
+        // One `retention_sql` evaluation context for the whole publication: the
+        // incoming rows and the resident rows it keeps see the same `now()`.
+        let publication_filters = if self.table.has_retention_delete_filters() {
+            Some(std::sync::Arc::new(
+                self.table
+                    .coerced_retention_filters()
+                    .map_err(|source| super::Error::DataFusion { source })?,
+            ))
+        } else {
+            None
+        };
+        let stage = self
+            .table
+            .stage_resolved_append(data, resolver, write, scope);
         let super::append_stage::StagedAppend {
             new_snapshot_id: snapshot_id,
             on_conflict_deletions,
@@ -1468,15 +1482,44 @@ impl<'a> AppendMutationWriter<'a> {
             superseded: superseded_rows,
             first_load_pk_bloom,
             retention_folded,
-        } = self
-            .table
-            .stage_resolved_append(data, resolver, write, scope)
-            .await?;
+        } = match &publication_filters {
+            Some(filters) => {
+                super::overwrite_retention::with_publication_retention(
+                    std::sync::Arc::clone(filters),
+                    stage,
+                )
+                .await?
+            }
+            None => stage.await?,
+        };
+
+        // The resident rows this publication keeps go through the same
+        // `retention_sql` delete, committed in the append's own transaction. A
+        // failure abandons the whole publication and keeps the old generation.
+        let resident_retention = match (&publication_filters, self.into_empty_table) {
+            (Some(filters), false) => match self
+                .table
+                .prepare_resident_retention(&snapshot_id, filters)
+                .await
+            {
+                Ok(prepared) => prepared,
+                Err(error) => {
+                    self.table.clear_cached_pk_keyset();
+                    self.cleanup_layered_append_dirs(std::slice::from_ref(&snapshot_id))
+                        .await;
+                    return Err(error);
+                }
+            },
+            _ => None,
+        };
 
         // Nothing to publish only when no row was kept AND none is superseded:
         // `retention_sql` can drop every row an upsert adds while the old versions
         // of its keys still have to go in the same commit.
-        if rows == 0 && on_conflict_deletions.total_superseded() == 0 {
+        if rows == 0
+            && on_conflict_deletions.total_superseded() == 0
+            && resident_retention.is_none()
+        {
             self.cleanup_layered_append_dirs(std::slice::from_ref(&snapshot_id))
                 .await;
             return Ok(retention_folded);
@@ -1495,6 +1538,7 @@ impl<'a> AppendMutationWriter<'a> {
             superseded: superseded_rows,
             into_empty_table: self.into_empty_table,
             first_load_pk_bloom,
+            resident_retention,
         }
         .commit()
         .await

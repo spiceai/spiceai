@@ -257,6 +257,7 @@ impl CayenneStagedUpsert {
             superseded: self.superseded,
             into_empty_table: false,
             first_load_pk_bloom: None,
+            resident_retention: None,
         }
         .commit()
         .await

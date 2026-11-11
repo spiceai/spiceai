@@ -196,12 +196,11 @@ impl CayenneTableProvider {
             ))
         };
         let schema = stream.schema();
-        let filters = self.coerced_retention_filters().map_err(|e| super::Error::DataFusion {
-            source: failed(e),
-        })?;
-        let physical = physical_filters(&filters, &schema).map_err(|e| super::Error::DataFusion {
-            source: failed(e),
-        })?;
+        let filters = self
+            .coerced_retention_filters()
+            .map_err(|e| super::Error::DataFusion { source: failed(e) })?;
+        let physical = physical_filters(&filters, &schema)
+            .map_err(|e| super::Error::DataFusion { source: failed(e) })?;
         let filtered = stream.map(move |batch| {
             let batch = batch?;
             let deleted = deleted_rows(&physical, &batch).map_err(&failed)?;
@@ -240,11 +239,19 @@ impl CayenneTableProvider {
         }
         let mut fields: Vec<FieldRef> = names
             .iter()
-            .map(|name| table_schema.field_with_name(name).map(|f| Arc::new(f.clone())))
+            .map(|name| {
+                table_schema
+                    .field_with_name(name)
+                    .map(|f| Arc::new(f.clone()))
+            })
             .collect::<Result<_, _>>()?;
         let data_schema: SchemaRef = Arc::new(Schema::new(fields.clone()));
         let physical = physical_filters(&filters, &data_schema)?;
-        fields.push(Arc::new(Field::new(POSITION_COLUMN, DataType::UInt64, false)));
+        fields.push(Arc::new(Field::new(
+            POSITION_COLUMN,
+            DataType::UInt64,
+            false,
+        )));
         let stored = Arc::new(Field::new_struct("", fields, false));
 
         let ctx = datafusion::prelude::SessionContext::new_with_config_rt(
@@ -327,7 +334,9 @@ impl CayenneTableProvider {
                 if batch.num_rows() == 0 {
                     continue;
                 }
-                let rows = batch.column(batch.num_columns() - 1).as_primitive::<UInt64Type>();
+                let rows = batch
+                    .column(batch.num_columns() - 1)
+                    .as_primitive::<UInt64Type>();
                 let data = batch.project(&(0..batch.num_columns() - 1).collect::<Vec<_>>())?;
                 let data = RecordBatch::try_new_with_options(
                     Arc::clone(&data_schema),
@@ -428,7 +437,11 @@ mod tests {
             Arc::clone(&schema),
             vec![
                 Arc::new(Int64Array::from(vec![1, 2, 3])),
-                Arc::new(StringArray::from(vec![Some("archived"), None, Some("active")])),
+                Arc::new(StringArray::from(vec![
+                    Some("archived"),
+                    None,
+                    Some("active"),
+                ])),
             ],
         )?;
         let filters = physical_filters(&[col("status").eq(lit("archived"))], &schema)?;
@@ -448,4 +461,198 @@ mod tests {
         );
         Ok(())
     }
+}
+
+tokio::task_local! {
+    /// The coerced `retention_sql` conjuncts of the publication in progress, so
+    /// every evaluation inside it (incoming rows, resident rows) shares one
+    /// `now()` instead of re-simplifying per call.
+    static PUBLICATION_RETENTION: Arc<Vec<Expr>>;
+}
+
+/// Run `work` with `filters` as the publication's `retention_sql` context.
+pub(crate) async fn with_publication_retention<F: std::future::Future>(
+    filters: Arc<Vec<Expr>>,
+    work: F,
+) -> F::Output {
+    PUBLICATION_RETENTION.scope(filters, work).await
+}
+
+/// The publication's `retention_sql` conjuncts, when one is in progress.
+pub(crate) fn publication_retention_filters() -> Option<Vec<Expr>> {
+    PUBLICATION_RETENTION
+        .try_with(|filters| filters.as_ref().clone())
+        .ok()
+}
+
+impl CayenneTableProvider {
+    /// Prepares the `retention_sql` delete over the resident rows a keyed
+    /// append keeps, against the generation it replaces. The rows whose keys
+    /// the staged snapshot rewrites are superseded first: the predicate never
+    /// sees them, so a superseded version cannot fail or be counted. Nothing is
+    /// committed; the append's transaction takes the returned delete files.
+    pub(crate) async fn prepare_resident_retention(
+        &self,
+        snapshot_id: &str,
+        filters: &[Expr],
+    ) -> super::Result<Option<super::delete::PreparedDeletionPublish>> {
+        let failed = |error: datafusion_common::DataFusionError| super::Error::DataFusion {
+            source: datafusion_common::DataFusionError::Execution(format!(
+                "{} The write was not published. {error}",
+                self.retention_failed_message()
+            )),
+        };
+        let schema = self.table_schema();
+        let keys: Vec<String> = self
+            .primary_key_indices()?
+            .unwrap_or_default()
+            .into_iter()
+            .map(|index| schema.field(index).name().clone())
+            .collect();
+        if keys.is_empty() {
+            return Err(super::Error::Internal {
+                table: self.table_name().to_string(),
+                message: "resident retention needs a primary key to exclude superseded rows"
+                    .to_string(),
+            });
+        }
+        let incoming = self
+            .read_staged_columns(snapshot_id, &keys)
+            .await
+            .map_err(failed)?;
+        let superseded = incoming_key_predicate(&keys, &incoming).map_err(failed)?;
+        let guarded: Vec<Expr> = filters
+            .iter()
+            .map(|filter| match &superseded {
+                Some(superseded) => datafusion::logical_expr::when(
+                    superseded.clone(),
+                    datafusion::logical_expr::lit(false),
+                )
+                .otherwise(filter.clone()),
+                None => Ok(filter.clone()),
+            })
+            .collect::<datafusion_common::Result<_>>()
+            .map_err(failed)?;
+        let sink = self
+            .build_deletion_vector_sink(&guarded, None, super::table::DeletionRequestSource::User)
+            .await
+            .map_err(failed)?;
+        let prepared = sink.prepare_delete().await?;
+        Ok(prepared.filter(|prepared| !prepared.delete_files().is_empty()))
+    }
+
+    /// The named columns of every row a staged snapshot wrote.
+    async fn read_staged_columns(
+        &self,
+        snapshot_id: &str,
+        names: &[String],
+    ) -> datafusion_common::Result<Vec<RecordBatch>> {
+        let table_schema = self.table_schema();
+        let fields: Vec<FieldRef> = names
+            .iter()
+            .map(|name| {
+                table_schema
+                    .field_with_name(name)
+                    .map(|f| Arc::new(f.clone()))
+            })
+            .collect::<Result<_, _>>()?;
+        let schema: SchemaRef = Arc::new(Schema::new(fields.clone()));
+        let stored = Arc::new(Field::new_struct("", fields, false));
+        let ctx = datafusion::prelude::SessionContext::new_with_config_rt(
+            util::session_state::session_config(),
+            self.runtime_env(),
+        );
+        let state = ctx.state();
+        let Some((store, files)) = self
+            .snapshot_file_metadata(&state, snapshot_id, &self.read_schema())
+            .await
+        else {
+            return Err(datafusion_common::DataFusionError::Internal(
+                "failed to list the write's staged files".to_string(),
+            ));
+        };
+        let external = |e| datafusion_common::DataFusionError::External(Box::new(e));
+        let mut batches = Vec::new();
+        for file in files {
+            let session = VortexSession::default();
+            let vxf = session
+                .open_options()
+                .open_object_store(&store, file.location.clone())
+                .await
+                .map_err(external)?;
+            let projection = pack(
+                names
+                    .iter()
+                    .map(|name| (name.clone(), get_item(name.as_str(), root()))),
+                Nullability::NonNullable,
+            );
+            let mut chunks = vxf
+                .scan()
+                .map_err(external)?
+                .with_projection(projection.bind(vxf.dtype()).map_err(external)?)
+                .into_stream()
+                .map_err(external)?;
+            while let Some(chunk) = chunks.try_next().await.map_err(external)? {
+                if chunk.is_empty() {
+                    continue;
+                }
+                let mut exec = session.create_execution_ctx();
+                let array = session
+                    .arrow()
+                    .execute_arrow(chunk, Some(&stored), &mut exec)
+                    .map_err(external)?;
+                let batch = RecordBatch::from(array.as_struct_opt().ok_or_else(|| {
+                    datafusion_common::DataFusionError::Internal(
+                        "staged read back did not return a struct".to_string(),
+                    )
+                })?);
+                batches.push(RecordBatch::try_new(
+                    Arc::clone(&schema),
+                    batch.columns().to_vec(),
+                )?);
+            }
+        }
+        Ok(batches)
+    }
+}
+
+/// `key IN (incoming keys)`; for a composite key, the disjunction of each
+/// incoming key's column equalities. `None` when nothing was staged.
+fn incoming_key_predicate(
+    keys: &[String],
+    incoming: &[RecordBatch],
+) -> datafusion_common::Result<Option<Expr>> {
+    use datafusion::logical_expr::{col, lit};
+    use datafusion::scalar::ScalarValue;
+    let mut seen = std::collections::HashSet::new();
+    let mut tuples: Vec<Vec<ScalarValue>> = Vec::new();
+    for batch in incoming {
+        for row in 0..batch.num_rows() {
+            let tuple = (0..keys.len())
+                .map(|column| ScalarValue::try_from_array(batch.column(column), row))
+                .collect::<datafusion_common::Result<Vec<_>>>()?;
+            if seen.insert(tuple.clone()) {
+                tuples.push(tuple);
+            }
+        }
+    }
+    if tuples.is_empty() {
+        return Ok(None);
+    }
+    let column = |name: &String| col(datafusion::common::Column::new_unqualified(name));
+    if let [key] = keys {
+        let list = tuples
+            .into_iter()
+            .map(|mut tuple| lit(tuple.swap_remove(0)))
+            .collect();
+        return Ok(Some(column(key).in_list(list, false)));
+    }
+    let disjuncts = tuples.into_iter().map(|tuple| {
+        keys.iter()
+            .zip(tuple)
+            .map(|(key, value)| column(key).eq(lit(value)))
+            .reduce(Expr::and)
+            .unwrap_or_else(|| lit(false))
+    });
+    Ok(datafusion::logical_expr::utils::disjunction(disjuncts))
 }

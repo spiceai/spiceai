@@ -6767,6 +6767,9 @@ impl CayenneTableProvider {
     /// once for the whole set, the way a retention pass prepares them. One call is one
     /// execution context: every row a publication evaluates sees the same `now()`.
     pub(crate) fn coerced_retention_filters(&self) -> datafusion_common::Result<Vec<Expr>> {
+        if let Some(filters) = super::overwrite_retention::publication_retention_filters() {
+            return Ok(filters);
+        }
         util::expr::coerce_and_simplify_exprs(
             self.retention_filters.iter().cloned(),
             &self.table_schema(),
@@ -19047,6 +19050,7 @@ impl CayenneTableProvider {
                 insert_pk_bytes: insert_pk_bytes.clone(),
                 inline_tombstone: inline_tombstone.take(),
                 pending_durable_flips: drained_flips.clone(),
+                retention_delete_files: Vec::new(),
             })
         } else {
             None

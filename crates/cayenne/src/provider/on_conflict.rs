@@ -109,6 +109,10 @@ pub(crate) struct PreparedOnConflictDurablePayload {
     pub(crate) insert_pk_bytes: Vec<Vec<u8>>,
     pub(crate) inline_tombstone: Option<crate::metadata::InlinedDelete>,
     pub(crate) pending_durable_flips: Vec<String>,
+    /// Deletion vectors of the `retention_sql` delete over the resident rows
+    /// this publication keeps, committed in the same transaction. Unlike
+    /// `delete_files`, their keys are not reinserted by the publication.
+    pub(crate) retention_delete_files: Vec<crate::metadata::DeleteFile>,
 }
 
 impl PreparedOnConflictDeletionPublish {
