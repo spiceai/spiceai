@@ -131,6 +131,7 @@ mod result_correctness_standalone_engines_test;
 #[cfg(feature = "result-correctness-duckdb")]
 mod result_correctness_vs_duckdb_test;
 mod result_correctness_vs_sqlite_test;
+mod retention_sql_publish_atomicity_test;
 mod retention_test;
 mod scalar_function_pushdown_test;
 mod scan_view_retention_test;
