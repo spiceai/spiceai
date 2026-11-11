@@ -2368,7 +2368,9 @@ impl CayenneTableProvider {
                         }
                     }
                 }
-                if reachable.len() != expected.len() {
+                // The lookups by name above answer for every file of such a
+                // table, whose target is its whole flat directory.
+                if reachable.len() != expected.len() && !self.data_in_object_native_location() {
                     let mut target_objects = config.store.list(Some(&target_prefix));
                     while let Some(meta) = target_objects.next().await {
                         let meta = meta.map_err(|error| Error::IncompleteWrite {

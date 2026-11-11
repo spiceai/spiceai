@@ -17,26 +17,34 @@ limitations under the License.
 //! The orphan sweep of a table in the object-native location: the one place a
 //! listing of the table's data is used, and only to find garbage.
 //!
+//! The table's data is flat: its data files sit directly under the table's
+//! directory (`<write_id>_<n>.vortex`), its deletion vectors under
+//! `deletions/`, a staged write in `_staging/<id>/`, and the lookup index in
+//! `_lookup_index/`, which this sweep never touches. Keys in a folder per
+//! snapshot (`<snapshot>/<file>`), which earlier builds wrote, are still
+//! classified by that folder.
+//!
 //! A listed object is deleted only when all of these hold:
 //!
-//! - no snapshot the table's state names it (every manifest row of the table),
-//!   or, for a deletion vector (`<snapshot>/deletions/<file>.arrow` beside the
-//!   table's prefix), no committed deletion names it,
-//!   and a data file sits in a live (current or protected) snapshot directory, a staging
-//!   directory without a staging WAL, a compaction's scratch directory, or a
-//!   snapshot directory nothing refers to. A retired directory (the
-//!   retired-directory sweep's: one this process retired, or one the committed
-//!   retirement record names until that sweep forgets it) and a directory that
-//!   is not live and an open reader holds or listed recently are skipped whole.
-//!   A live directory is not skipped for its readers: a scan reads a live
-//!   snapshot's files from its committed manifest, never an unnamed file;
+//! - no committed entry of the table names it, live or retired: a flat data
+//!   file by its key (the manifest rows of every snapshot, and the retirement
+//!   record, whose files belong to the retirement sweep until it forgets them),
+//!   a deletion vector by its name. A key in a snapshot folder must also sit in
+//!   a live (current or protected) snapshot directory, a staging directory
+//!   without a staging WAL, a compaction's scratch directory, or a snapshot
+//!   directory nothing refers to; a retired directory, and one that is not
+//!   live and an open reader holds or listed recently, are skipped whole. A
+//!   scan reads a live snapshot's files from its committed manifest, never an
+//!   unnamed file;
 //! - no write of this process still holds it ([`super::uncommitted_files`]),
 //!   whatever its age, so an upload or a commit still in flight keeps its files
 //!   (a deletion vector is held from before its upload until a commit names it,
 //!   its writer deletes it, or a commit drops it);
 //! - it is older than the age floor, measured on the store's clock: its
-//!   `last_modified` against the time the store stamps on an object this sweep
-//!   writes, never the writer's clock or the time in its name.
+//!   `last_modified` against the time the store stamped on the dataset's head
+//!   when it was last written, never the writer's clock or the time in its
+//!   name. An object stamped after the head is young, so an object no commit
+//!   since names waits for the next commit or the next open.
 //!
 //! The sweep does not run while the table's state cannot be read (a commit whose
 //! outcome is unknown stops the dataset's log until it reads its state back),
@@ -72,9 +80,6 @@ pub(crate) const ORPHAN_AGE_FLOOR: Duration = Duration::from_hours(1);
 
 /// The least time between two orphan sweeps of one table.
 pub(crate) const ORPHAN_SWEEP_INTERVAL: Duration = Duration::from_mins(15);
-
-/// The object the sweep writes to read the store's clock, at the table's prefix.
-pub(crate) const STORE_CLOCK_OBJECT: &str = "_store_clock";
 
 /// A multipart upload a store has started and neither completed nor aborted.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -121,6 +126,11 @@ pub struct OrphanSweep {
 /// Where a listed object sits, relative to the table's prefix.
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) enum Placement<'a> {
+    /// `<file>` directly under the table's directory: a data file of a flat
+    /// table, keyed by its name.
+    Flat { file: &'a str },
+    /// `deletions/<file>.arrow`: a deletion vector of a flat table.
+    Deletion { file: &'a str },
     /// `<snapshot>/<file>` in a current or protected snapshot directory.
     Live { snapshot: &'a str, file: &'a str },
     /// `_staging/<id>/<file>`: `snapshot` is `_staging/<id>`.
@@ -130,7 +140,7 @@ pub(crate) enum Placement<'a> {
     /// `<snapshot>/<file>` in a snapshot directory that is not live: an
     /// abandoned compaction or overwrite output, or a retired one.
     NotLive { snapshot: &'a str, file: &'a str },
-    /// Anything else: another sweep's, or not a data file.
+    /// Anything else: the lookup index's, another sweep's, or not a data file.
     Other,
 }
 
@@ -143,6 +153,24 @@ const SCRATCH_PREFIXES: [&str; 1] = ["subset-src-"];
 pub(crate) fn placement<'a>(relative: &'a str, live: &HashSet<String>) -> Placement<'a> {
     let mut parts = relative.split('/');
     match (parts.next(), parts.next(), parts.next(), parts.next()) {
+        (Some(dir), ..) if dir == super::constants::LOOKUP_INDEX_DIR_NAME => Placement::Other,
+        (Some(file), None, None, None)
+            if !file.is_empty() && !file.starts_with('_') && !file.starts_with('.') =>
+        {
+            Placement::Flat { file }
+        }
+        (Some(dir), Some(file), None, None)
+            if dir == super::delete::vector_io::DELETION_DIR_NAME =>
+        {
+            if std::path::Path::new(file)
+                .extension()
+                .is_some_and(|extension| extension == "arrow")
+            {
+                Placement::Deletion { file }
+            } else {
+                Placement::Other
+            }
+        }
         (Some(staging), Some(id), Some(file), None)
             if staging == super::constants::STAGING_DIR_NAME =>
         {
@@ -186,8 +214,9 @@ pub(crate) fn deletion_vector_name(relative: &str) -> Option<&str> {
 }
 
 /// Whether an unnamed object last modified at `last_modified` is old enough to
-/// delete when the store's clock reads `store_now`. An object stamped after
-/// `store_now` (clock steps, a later write) is young.
+/// delete when the store's clock reads `store_now` (the time it stamped on the
+/// dataset's head). An object stamped after `store_now` (clock steps, a write
+/// after the head's) is young.
 pub(crate) fn older_than_floor(
     last_modified: DateTime<Utc>,
     store_now: DateTime<Utc>,
@@ -242,11 +271,26 @@ mod tests {
                 file: "e.vortex"
             }
         );
-        // A directory that is not a snapshot's, a deeper key, and the clock
-        // object are ignored.
-        assert_eq!(placement("deletions/e.arrow", &live), Placement::Other);
+        // A flat table's data files and deletion vectors.
+        assert_eq!(
+            placement("01a1_0.vortex", &live),
+            Placement::Flat {
+                file: "01a1_0.vortex"
+            }
+        );
+        assert_eq!(
+            placement("deletions/delete_01a1.arrow", &live),
+            Placement::Deletion {
+                file: "delete_01a1.arrow"
+            }
+        );
+        // The lookup index, a deeper key, another file under `deletions/`, and
+        // a reserved name at the top are ignored.
+        assert_eq!(placement("_lookup_index/k/run.arrow", &live), Placement::Other);
+        assert_eq!(placement("_lookup_index/x", &live), Placement::Other);
+        assert_eq!(placement("deletions/e.vortex", &live), Placement::Other);
         assert_eq!(placement("cur/sub/f.vortex", &live), Placement::Other);
-        assert_eq!(placement(STORE_CLOCK_OBJECT, &live), Placement::Other);
+        assert_eq!(placement("_store_clock", &live), Placement::Other);
     }
 
     #[test]
@@ -261,11 +305,11 @@ mod tests {
         assert_eq!(deletion_vector_name("snap/deletions/sub/d.arrow"), None);
         assert_eq!(deletion_vector_name("snap/other/d.arrow"), None);
         assert_eq!(deletion_vector_name("snap/deletions/d.vortex"), None);
-        assert_eq!(deletion_vector_name(STORE_CLOCK_OBJECT), None);
+        assert_eq!(deletion_vector_name("_store_clock"), None);
     }
 
     #[test]
-    fn the_floor_is_measured_on_the_store_clock_and_a_future_stamp_is_young() {
+    fn the_floor_is_measured_on_the_store_clock_and_a_stamp_after_the_head_is_young() {
         let now = DateTime::parse_from_rfc3339("2026-11-08T12:00:00Z")
             .expect("time")
             .with_timezone(&Utc);

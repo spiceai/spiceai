@@ -2572,10 +2572,7 @@ async fn a_first_keyed_load_with_repeated_keys_names_only_the_files_it_keeps() {
         .expect("manifest");
     assert!(!named.is_empty(), "the load committed data files");
     for file in &named {
-        let key = format!(
-            "{data_prefix}/{}/{}/{}",
-            metadata.table_id, file.snapshot_id, file.file_path
-        );
+        let key = format!("{data_prefix}/{}/{}", metadata.table_id, file.file_path);
         assert!(
             stored.contains(&key),
             "the committed state names '{key}', which the store lacks; stored: {stored:?}"
@@ -3099,8 +3096,8 @@ async fn deleted_by(ctx: &SessionContext, sql: &str) -> u64 {
         .value(0)
 }
 
-/// The keys of the `.vortex` objects in the current snapshot of `name` that no
-/// commit names.
+/// The keys of the `.vortex` objects directly in `name`'s flat directory, where
+/// a placed table's current snapshot writes, that no commit names.
 async fn unnamed_current_files(
     setup: &Setup,
     catalog: &Arc<dyn MetadataCatalog>,
@@ -3112,21 +3109,13 @@ async fn unnamed_current_files(
         .await
         .expect("manifest")
         .into_iter()
-        .map(|file| {
-            format!(
-                "{}/{}/{}/{}",
-                setup.data_prefix, stored.table_id, file.snapshot_id, file.file_path
-            )
-        })
+        .map(|file| format!("{}/{}/{}", setup.data_prefix, stored.table_id, file.file_path))
         .collect();
-    let current = format!(
-        "{}/{}/{}/",
-        setup.data_prefix, stored.table_id, stored.current_snapshot_id
-    );
+    let current = format!("{}/{}/", setup.data_prefix, stored.table_id);
     objects_under(setup, &current, ".vortex")
         .await
         .into_iter()
-        .filter(|key| !named.contains(key))
+        .filter(|key| !key[current.len()..].contains('/') && !named.contains(key))
         .collect()
 }
 

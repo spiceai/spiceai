@@ -437,8 +437,10 @@ impl Rig {
     }
 
     /// `.vortex` names directly under one snapshot directory of `table`.
-    async fn listed(&self, table: &Table, table_id: &str, snapshot_id: &str) -> Vec<String> {
-        let dir = format!("{}/{table_id}/{snapshot_id}", table.data_prefix);
+    /// The data files stored directly in `table`'s flat directory, where every
+    /// snapshot's files sit (a placed table has no folder per snapshot).
+    async fn listed(&self, table: &Table, table_id: &str, _snapshot_id: &str) -> Vec<String> {
+        let dir = format!("{}/{table_id}", table.data_prefix);
         let mut names: Vec<String> = self
             .raw
             .list(Some(&Path::from(dir.as_str())))
@@ -457,7 +459,7 @@ impl Rig {
     }
 
     /// Writes the orphan ids through a donor table, then copies its data file
-    /// into `table`'s current snapshot directory under a name no commit names.
+    /// into `table`'s directory, beside its live files, under a name no commit names.
     async fn plant_orphan(&self, table: &Table) -> String {
         let donor = self.create(&format!("{}_donor", table.name), 1_000).await;
         donor.insert(ORPHAN_FIRST, ORPHAN_LAST).await;
@@ -476,7 +478,7 @@ impl Rig {
         let bytes = self
             .raw
             .get(&Path::from(format!(
-                "{}/{donor_id}/{donor_snapshot}/{}",
+                "{}/{donor_id}/{}",
                 donor.data_prefix, donor_files[0]
             )))
             .await
@@ -489,7 +491,7 @@ impl Rig {
         self.raw
             .put(
                 &Path::from(format!(
-                    "{}/{table_id}/{snapshot}/{orphan}",
+                    "{}/{table_id}/{orphan}",
                     table.data_prefix
                 )),
                 bytes.into(),
@@ -500,7 +502,7 @@ impl Rig {
             self.listed(table, &table_id, &snapshot)
                 .await
                 .contains(&orphan),
-            "the planted file is in the live snapshot directory"
+            "the planted file is in the table's directory"
         );
         orphan
     }

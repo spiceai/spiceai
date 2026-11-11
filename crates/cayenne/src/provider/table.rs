@@ -25214,9 +25214,7 @@ impl CayenneTableProvider {
         &self,
         floor: std::time::Duration,
     ) -> Result<super::orphan_sweep::OrphanSweep> {
-        use super::orphan_sweep::{
-            OrphanSweep, Placement, STORE_CLOCK_OBJECT, older_than_floor, placement,
-        };
+        use super::orphan_sweep::{OrphanSweep, Placement, older_than_floor, placement};
 
         let mut report = OrphanSweep::default();
         if !self.data_in_object_native_location() {
@@ -25228,16 +25226,15 @@ impl CayenneTableProvider {
             return Ok(report);
         }
         let table_id = self.table_metadata.table_id.clone();
-        let prepared = match self
+        let Some(native) = self
             .catalog
             .as_any()
             .downcast_ref::<crate::metastore::object_native::ObjectNativeCatalog>()
-        {
-            Some(catalog) => catalog.has_prepared_transaction(&table_id).await,
-            // A catalog that cannot say is treated as one that has one.
-            None => true,
+        else {
+            report.skipped = Some("the table's state is not kept in the object-native location");
+            return Ok(report);
         };
-        if prepared {
+        if native.has_prepared_transaction(&table_id).await {
             report.skipped = Some("a transaction across datasets is prepared on the table");
             return Ok(report);
         }
@@ -25254,14 +25251,6 @@ impl CayenneTableProvider {
                 table: self.table_name().to_string(),
                 message: "Missing the table's object-store prefix".to_string(),
             })?;
-        let clock = crate::object_child(&table_prefix, STORE_CLOCK_OBJECT);
-        // The dataset's data path: the table's prefix, and the deletion vectors
-        // beside it (`<snapshot>/deletions/<file>.arrow`).
-        let data_prefix: ObjectStorePath = {
-            let mut parts: Vec<_> = table_prefix.parts().collect();
-            parts.pop();
-            parts.into_iter().collect()
-        };
         let store_error = |operation: &'static str| {
             let table = self.table_name().to_string();
             move |source| Error::ObjectStore {
@@ -25271,16 +25260,10 @@ impl CayenneTableProvider {
             }
         };
 
-        // The store's clock: the time it stamps on an object written now.
-        store
-            .put(&clock, object_store::PutPayload::from_static(b""))
-            .await
-            .map_err(store_error("write the orphan sweep's clock object"))?;
-        let store_now = store
-            .head(&clock)
-            .await
-            .map_err(store_error("read the orphan sweep's clock object"))?
-            .last_modified;
+        // The store's clock: the time it stamped on the dataset's head when the
+        // table last committed or was taken over. Read before the listing, so
+        // an object written since is dated after it and kept as young.
+        let store_now = native.head_store_time(&table_id).await?;
 
         let live = self.live_snapshot_ids_for_sweep().await?;
         // Files the committed retirement record names belong to the retirement
@@ -25301,19 +25284,13 @@ impl CayenneTableProvider {
             untouchable.extend(Self::retired_file_snapshots(&durably_retired));
             untouchable
         };
+        // The table's own directory only: its data files, its deletion vectors
+        // (`deletions/`), staged writes and the lookup index are all under it.
         let objects: Vec<ObjectMeta> = store
-            .list(Some(&data_prefix))
+            .list(Some(&table_prefix))
             .try_collect()
             .await
             .map_err(store_error("list the table's objects for the orphan sweep"))?;
-        // Deletion vectors no commit names: `(name, object)`.
-        let deletion_candidates: Vec<(&str, &ObjectMeta)> = objects
-            .iter()
-            .filter_map(|meta| {
-                let relative = crate::object_relative(&data_prefix, &meta.location)?;
-                super::orphan_sweep::deletion_vector_name(relative).map(|name| (name, meta))
-            })
-            .collect();
         // A staging directory with a staging WAL belongs to recovery.
         let staged_with_wal: HashSet<String> = objects
             .iter()
@@ -25324,12 +25301,24 @@ impl CayenneTableProvider {
                     .then(|| dir.to_string())
             })
             .collect();
+        // Keys in a folder per snapshot, as earlier builds wrote them.
         let mut candidates = Vec::new();
+        // Flat data files by key, and deletion vectors by name.
+        let mut flat_candidates: Vec<(&str, &ObjectMeta)> = Vec::new();
+        let mut deletion_candidates: Vec<(&str, &ObjectMeta)> = Vec::new();
         for meta in &objects {
             let Some(relative) = crate::object_relative(&table_prefix, &meta.location) else {
                 continue;
             };
             let (snapshot, file, live_dir) = match placement(relative, &live) {
+                Placement::Flat { file } => {
+                    flat_candidates.push((file, meta));
+                    continue;
+                }
+                Placement::Deletion { file } => {
+                    deletion_candidates.push((file, meta));
+                    continue;
+                }
                 Placement::Live { snapshot, file } => (snapshot.to_string(), file, true),
                 Placement::Scratch { snapshot, file } => (snapshot.to_string(), file, false),
                 Placement::NotLive { snapshot, file } if !untouchable.contains(snapshot) => {
@@ -25353,12 +25342,17 @@ impl CayenneTableProvider {
         // records its files in the state before it stops holding them, so a file
         // held at the first read is named by the second if it committed since.
         let held = self.uncommitted_files.held();
+        let held_keys = self.uncommitted_files.held_keys();
         let held_snapshots = self.uncommitted_files.snapshots();
         let held_deletion_files = self.uncommitted_files.held_deletion_files();
-        let named: HashSet<(String, String)> = self
-            .catalog
-            .get_all_snapshot_files(&table_id)
-            .await?
+        let rows = self.catalog.get_all_snapshot_files(&table_id).await?;
+        // Every snapshot's rows, retired or not: a retired file keeps its row
+        // until the retirement sweep forgets it.
+        let named_keys: HashSet<String> = rows
+            .iter()
+            .map(|file| self.data_file_key(&file.snapshot_id, &file.file_path))
+            .collect();
+        let named: HashSet<(String, String)> = rows
             .into_iter()
             .map(|file| (file.snapshot_id, file.file_path))
             .collect();
@@ -25389,11 +25383,18 @@ impl CayenneTableProvider {
             report.skipped = Some("the table's retired snapshots are not settled");
             return Ok(report);
         };
-        let retired_deletion_files: HashSet<String> = durably_retired
+        // Every retired key, committed or observed by this process's
+        // retirement sweep: the retirement sweep deletes them after the
+        // retention, never this one.
+        let retired_keys: HashSet<String> = durably_retired
             .iter()
             .chain(&durably_retired_now)
+            .cloned()
+            .chain(self.retired_file_timers.lock().keys().cloned())
+            .collect();
+        let retired_deletion_files: HashSet<&str> = retired_keys
+            .iter()
             .filter_map(|key| super::orphan_sweep::deletion_vector_name(key))
-            .map(str::to_string)
             .collect();
         let (_, in_use_now) = self.snapshot_cleanup_pins();
         let retired_now: HashSet<String> = {
@@ -25405,7 +25406,7 @@ impl CayenneTableProvider {
         let mut doomed = Vec::new();
         for (snapshot, file, live_dir, meta) in candidates {
             if named.contains(&(snapshot.clone(), file.clone()))
-                || durably_retired_now.contains(&Self::manifest_file_relative_path(&snapshot, &file))
+                || retired_keys.contains(&Self::manifest_file_relative_path(&snapshot, &file))
             {
                 continue;
             }
@@ -25424,6 +25425,23 @@ impl CayenneTableProvider {
                 continue;
             }
             if held_snapshots.contains(&snapshot) || held.contains(&(snapshot, file)) {
+                report.kept_in_flight += 1;
+                continue;
+            }
+            if !older_than_floor(meta.last_modified, store_now, floor) {
+                report.kept_young += 1;
+                continue;
+            }
+            doomed.push((meta.location.clone(), meta.size));
+        }
+        // A flat data file is named by its key alone: a scan, pinned or not,
+        // reads only files a committed row names, and a row stays until the
+        // retirement sweep forgets its key.
+        for (key, meta) in flat_candidates {
+            if named_keys.contains(key) || retired_keys.contains(key) {
+                continue;
+            }
+            if held_keys.contains(key) {
                 report.kept_in_flight += 1;
                 continue;
             }
@@ -25485,7 +25503,6 @@ impl CayenneTableProvider {
             .chain(&outcome.missing)
             .map(|location| {
                 crate::object_relative(&table_prefix, location)
-                    .or_else(|| crate::object_relative(&data_prefix, location))
                     .unwrap_or(location.as_ref())
                     .to_string()
             })
@@ -25504,10 +25521,15 @@ impl CayenneTableProvider {
                 let relative = crate::object_relative(&table_prefix, &upload.location)
                     .unwrap_or(upload.location.as_ref())
                     .to_string();
-                if relative.rsplit_once('/').is_some_and(|(snapshot, file)| {
-                    held_snapshots.contains(snapshot)
-                        || held.contains(&(snapshot.to_string(), file.to_string()))
-                }) {
+                let held_upload = match relative.rsplit_once('/') {
+                    Some((snapshot, file)) => {
+                        held_snapshots.contains(snapshot)
+                            || held.contains(&(snapshot.to_string(), file.to_string()))
+                            || held_keys.contains(file)
+                    }
+                    None => held_keys.contains(relative.as_str()),
+                };
+                if held_upload {
                     continue;
                 }
                 uploads
@@ -25984,9 +26006,14 @@ impl CayenneTableProvider {
         let _reclaim = self.file_deletion_fence.write().await;
 
         if self.data_in_object_native_location() {
-            return self
+            let pass = self
                 .reclaim_orphaned_deletion_vectors_record_first(&orphaned, max_batch, floor)
                 .await;
+            drop(_reclaim);
+            // The retirement sweep starts the removed files' retention and
+            // deletes them once it has passed.
+            self.sweep_retired_snapshot_dirs();
+            return pass;
         }
 
         // Unlink the `.arrow` file FIRST, then remove its catalog row. A crash in
@@ -26167,11 +26194,14 @@ impl CayenneTableProvider {
     }
 
     /// The orphaned-deletion-vector reclaim of a dataset in the object-native
-    /// location: the rows are removed first, in one commit, and the objects
-    /// deleted after. Its committed state is the only record of its files, so a
-    /// deletion vector it still names must exist (a missing one fails the load,
-    /// see `detect_deletion_type_and_read`); a crash after the commit leaves only
-    /// objects nothing names. The caller holds `file_deletion_fence`.
+    /// location: the rows are removed in one commit, which retires their files,
+    /// and nothing is deleted here. The retirement sweep deletes them by name
+    /// once [`crate::metastore_layout::DATA_FILE_RETENTION`] has passed, as it
+    /// does a data file, so a query on another instance that loaded the
+    /// deletion vectors before the commit still finds them. Its committed state
+    /// is the only record of its files, so a deletion vector it still names
+    /// must exist (a missing one fails the load, see
+    /// `detect_deletion_type_and_read`). The caller holds `file_deletion_fence`.
     async fn reclaim_orphaned_deletion_vectors_record_first(
         &self,
         orphaned: &[crate::metadata::DeleteFile],
@@ -26204,69 +26234,25 @@ impl CayenneTableProvider {
         let reclaimed_tombstones = orphaned.iter().fold(0_u64, |total, df| {
             total.saturating_add(u64::try_from(df.delete_count).unwrap_or(0))
         });
-        let mut unlinked_files = 0_u64;
-        let mut unlinked_bytes = 0_u64;
-        let mut failed_unlinks = 0_usize;
-        let mut deleted = self.delete_deletion_vector_objects(orphaned).await;
-        for df in orphaned {
-            let outcome = match self
-                .dataset_storage
-                .as_ref()
-                .map(|storage| storage.resolve(&df.path))
-            {
-                Some(Ok(Some(_))) => deleted
-                    .remove(&df.path)
-                    .unwrap_or_else(|| Err("the delete was not attempted".to_string())),
-                Some(Err(error)) => Err(error.to_string()),
-                // Not an object of the dataset's store: nothing to delete.
-                Some(Ok(None)) | None => Ok(false),
-            };
-            match outcome {
-                Ok(true) => {
-                    unlinked_files = unlinked_files.saturating_add(1);
-                    unlinked_bytes = unlinked_bytes
-                        .saturating_add(u64::try_from(df.file_size_bytes).unwrap_or(0));
-                }
-                // Removed by an earlier pass that stopped before counting it.
-                Ok(false) => {}
-                Err(e) => {
-                    failed_unlinks += 1;
-                    tracing::warn!(
-                        table = table_name,
-                        path = %df.path,
-                        "Failed to delete the deletion vector '{}' of table '{table_name}', which \
-                         the table no longer uses, so it keeps using storage; it is safe to delete. \
-                         Cause: {e}",
-                        df.path,
-                    );
-                }
-            }
-        }
+        // The files are counted when the retirement sweep deletes them.
         maintenance_metrics::track_reclaimed(
             table_name,
             MaintenanceOp::OrphanDvSweep,
-            unlinked_files,
-            unlinked_bytes,
+            0,
+            0,
             reclaimed_tombstones,
         );
         maintenance_metrics::track_maintenance(
             table_name,
             MaintenanceOp::OrphanDvSweep,
-            if failed_unlinks > 0 {
-                MaintenanceOutcome::Failed
-            } else {
-                MaintenanceOutcome::Reclaimed
-            },
+            MaintenanceOutcome::Reclaimed,
         );
         tracing::debug!(
             table = table_name,
             floor,
             catalog_rows_removed = removed_ids.len(),
-            unlinked_files,
-            unlinked_bytes,
             reclaimed_tombstones,
-            failed_unlinks,
-            "Reclaimed {} orphaned deletion vector(s) of table '{table_name}', rows first",
+            "Retired {} orphaned deletion vector(s) of table '{table_name}'",
             removed_ids.len(),
         );
         if removed_ids.len() == max_batch {

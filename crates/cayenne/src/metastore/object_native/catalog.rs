@@ -1606,6 +1606,29 @@ impl ObjectNativeCatalog {
             .any(|(_, footprint)| footprint.iter().any(|table| table == table_id))
     }
 
+    /// The time the store stamped on the head of the log that holds `table_id`
+    /// when it was last written: the store's clock as of the table's latest
+    /// commit or takeover, which the orphan sweep measures object ages against.
+    /// # Errors
+    /// Returns an error when the head cannot be read.
+    pub async fn head_store_time(
+        &self,
+        table_id: &str,
+    ) -> CatalogResult<chrono::DateTime<chrono::Utc>> {
+        let domain = self.for_table(table_id);
+        let prefix = if domain.folder.is_empty() {
+            self.prefix.clone()
+        } else {
+            self.datasets.clone().join(domain.folder.as_str())
+        };
+        Ok(self
+            .store
+            .head(&prefix.join("head"))
+            .await
+            .map_err(invalid)?
+            .last_modified)
+    }
+
     /// The runtime's bookkeeping value under `key` (a CDC position, a dataset
     /// checkpoint), kept in the log of the dataset it names.
     /// # Errors

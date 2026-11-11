@@ -73,6 +73,8 @@ struct TrackingStore {
     aged: Mutex<BTreeMap<String, Duration>>,
     /// The keys of each `delete_stream` call, in order.
     deletes: Arc<Mutex<Vec<Vec<String>>>>,
+    /// The key of each `put_opts` call, in order.
+    puts: Mutex<Vec<String>>,
 }
 
 impl TrackingStore {
@@ -140,6 +142,7 @@ impl ObjectStore for TrackingStore {
         payload: PutPayload,
         opts: PutOptions,
     ) -> object_store::Result<PutResult> {
+        self.puts.lock().push(location.to_string());
         self.inner.put_opts(location, payload, opts).await
     }
     async fn put_multipart_opts(
@@ -421,6 +424,18 @@ impl Rig {
     }
 }
 
+impl Rig {
+    /// The stored keys that start with `prefix` (not a folder: a key prefix).
+    async fn planted(&self, prefix: &str) -> Vec<String> {
+        let folder = prefix.rsplit_once('/').map_or("", |(folder, _)| folder);
+        self.data_files(folder)
+            .await
+            .into_iter()
+            .filter(|key| key.starts_with(prefix))
+            .collect()
+    }
+}
+
 impl Placed {
     async fn insert(&self, first: i64, last: i64) -> datafusion::error::Result<()> {
         self.ctx
@@ -455,7 +470,8 @@ impl Placed {
         Ok((column(0), column(1)))
     }
 
-    /// Every `(snapshot, file)` key the table's state names, as full keys.
+    /// Every file the table's state names, as full keys: a row's path is
+    /// relative to the table's flat directory.
     async fn named_keys(&self) -> HashSet<String> {
         let stored = self
             .native
@@ -469,8 +485,8 @@ impl Placed {
             .into_iter()
             .map(|file| {
                 format!(
-                    "{}/{}/{}/{}",
-                    self.data_prefix, stored.table_id, file.snapshot_id, file.file_path
+                    "{}/{}/{}",
+                    self.data_prefix, stored.table_id, file.file_path
                 )
             })
             .collect()
@@ -547,8 +563,13 @@ async fn an_orphan_of_a_fenced_writer_is_reclaimed_after_the_floor_and_never_ado
         "the orphans are kept as young: {young:?}"
     );
 
-    // The floor is time under test: wait it out on the store's clock.
+    // The floor is time under test: wait it out on the store's clock, which
+    // the sweep reads from the dataset's head, so the new writer commits.
     tokio::time::sleep(FLOOR + Duration::from_millis(200)).await;
+    second
+        .insert(2001, 2500)
+        .await
+        .expect("the new writer writes");
     let swept = second.table.sweep_orphan_files_now().await.expect("sweep");
     let remaining = rig.data_files(&second.data_prefix).await;
     for orphan in &orphans {
@@ -565,14 +586,9 @@ async fn an_orphan_of_a_fenced_writer_is_reclaimed_after_the_floor_and_never_ado
     }
     assert_eq!(
         second.count().await.expect("count"),
-        (1000, 1000),
+        (1500, 1500),
         "never adopted"
     );
-    second
-        .insert(2001, 2500)
-        .await
-        .expect("the new writer writes");
-    assert_eq!(second.count().await.expect("count"), (1500, 1500));
     // A restart from the store serves the same rows.
     let data_url = second.data_url.clone();
     drop((first, second));
@@ -777,8 +793,8 @@ async fn an_unfinished_multipart_upload_is_aborted_after_the_floor() {
     placed.insert(1, 1000).await.expect("first write");
     let stored = placed.native.get_table("orders").await.expect("table");
     let key = Path::from(format!(
-        "{}/{}/{}/abandoned.vortex",
-        placed.data_prefix, stored.table_id, stored.current_snapshot_id
+        "{}/{}/abandoned.vortex",
+        placed.data_prefix, stored.table_id
     ));
     let mut upload = rig
         .store
@@ -800,15 +816,17 @@ async fn an_unfinished_multipart_upload_is_aborted_after_the_floor() {
         "aborted inside the floor: {young:?}"
     );
     assert_eq!(pending(&rig), 1);
+    // Past the floor on the store's clock, which a commit stamps on the head.
     tokio::time::sleep(FLOOR + Duration::from_millis(200)).await;
+    placed.insert(1001, 1100).await.expect("a later write");
     let swept = placed.table.sweep_orphan_files_now().await.expect("sweep");
     assert_eq!(
         swept.aborted_uploads,
-        vec![format!("{}/abandoned.vortex", stored.current_snapshot_id)],
+        vec!["abandoned.vortex".to_string()],
         "the upload is aborted after the floor"
     );
     assert_eq!(pending(&rig), 0);
-    assert_eq!(placed.count().await.expect("count"), (1000, 1000));
+    assert_eq!(placed.count().await.expect("count"), (1100, 1100));
 }
 
 /// A committed file that the store's listings do not return is still read,
@@ -876,20 +894,21 @@ async fn a_committed_file_the_listing_misses_is_not_dropped() {
     assert_eq!(reopened.count().await.expect("count"), (5000, 5000));
 }
 
-/// A snapshot directory nothing refers to under `placed`'s table, holding one
-/// planted object of `size` bytes per entry of `sizes`; returns the directory
-/// and the planted keys.
+/// Objects no commit names directly under `placed`'s table directory, as a
+/// crashed write leaves its data files, one of `size` bytes per entry of
+/// `sizes`, listed as written a second before the dataset's head; returns
+/// their common key prefix and the planted keys.
 async fn plant_orphans(rig: &Rig, placed: &Placed, sizes: &[usize]) -> (String, Vec<String>) {
     let stored = placed.native.get_table("orders").await.expect("table");
     let dir = format!(
-        "{}/{}/{}",
+        "{}/{}/orphan-{}",
         placed.data_prefix,
         stored.table_id,
-        uuid::Uuid::now_v7()
+        uuid::Uuid::now_v7().simple()
     );
     let mut keys = Vec::with_capacity(sizes.len());
     for (i, size) in sizes.iter().enumerate() {
-        let key = format!("{dir}/orphan-{i:05}.vortex");
+        let key = format!("{dir}_{i:05}.vortex");
         rig.store
             .put(
                 &Path::from(key.as_str()),
@@ -897,6 +916,10 @@ async fn plant_orphans(rig: &Rig, placed: &Placed, sizes: &[usize]) -> (String, 
             )
             .await
             .expect("plant an orphan");
+        rig.tracking
+            .aged
+            .lock()
+            .insert(key.clone(), Duration::from_secs(1));
         keys.push(key);
     }
     (dir, keys)
@@ -917,10 +940,7 @@ async fn an_orphan_of_a_table_that_is_not_written_again_is_reclaimed_at_open() {
         .await
         .expect("drain");
     let stored = placed.native.get_table("orders").await.expect("table");
-    let dir = format!(
-        "{}/{}/{}",
-        placed.data_prefix, stored.table_id, stored.current_snapshot_id
-    );
+    let dir = format!("{}/{}", placed.data_prefix, stored.table_id);
     let old = format!("{dir}/crashed-old.vortex");
     let young = format!("{dir}/crashed-young.vortex");
     for key in [&old, &young] {
@@ -986,14 +1006,14 @@ async fn the_orphan_sweep_deletes_in_batched_requests() {
         .await
         .expect("drain");
     let (dir, keys) = plant_orphans(&rig, &placed, &[8; ORPHANS]).await;
-    assert_eq!(rig.data_files(&dir).await, keys, "the orphans are stored");
+    assert_eq!(rig.planted(&dir).await, keys, "the orphans are stored");
     placed.table.set_orphan_age_floor(Duration::ZERO);
     let swept = placed.table.sweep_orphan_files_now().await.expect("sweep");
     assert_eq!(
         (
             swept.deleted.len(),
             rig.tracking.delete_requests_under(&dir).len(),
-            rig.data_files(&dir).await.len(),
+            rig.planted(&dir).await.len(),
             placed.count().await.expect("count"),
         ),
         (ORPHANS, ORPHANS.div_ceil(1000), 0, (1000, 1000)),
@@ -1076,4 +1096,237 @@ fn reclaimed(reader: &telemetry::metrics_reader::MetricsReader, name: &str) -> u
         }
     }
     total
+}
+
+/// `placed`'s table directory, `<data path>/<table id>`.
+async fn table_dir(placed: &Placed) -> String {
+    let stored = placed.native.get_table("orders").await.expect("table");
+    format!("{}/{}", placed.data_prefix, stored.table_id)
+}
+
+/// Put `key` in the store with a few bytes.
+async fn plant(rig: &Rig, key: &str) {
+    rig.store
+        .put(&Path::from(key), PutPayload::from_static(b"orphan"))
+        .await
+        .expect("plant an object");
+}
+
+/// Every stored key under `prefix`, of any kind.
+async fn stored_under(rig: &Rig, prefix: &str) -> Vec<String> {
+    let mut keys: Vec<String> = rig
+        .tracking
+        .inner
+        .list(Some(&Path::from(prefix)))
+        .map_ok(|meta| meta.location.to_string())
+        .try_collect()
+        .await
+        .expect("list");
+    keys.sort();
+    keys
+}
+
+/// A flat data file no commit names, directly under the table's directory, is
+/// kept while the store dates it younger than the floor and deleted after it.
+/// The live files and the files a compaction retired, also flat keys in that
+/// directory, are never deleted, and the rows are unchanged.
+#[tokio::test]
+async fn a_flat_orphan_is_reclaimed_after_the_floor_and_live_and_retired_keys_are_kept() {
+    let rig = Rig::new();
+    let placed = rig.place(rig.catalog().await, "orders", None).await;
+    for i in 0..3 {
+        placed
+            .insert(i * 1000 + 1, (i + 1) * 1000)
+            .await
+            .expect("append");
+    }
+    placed
+        .table
+        .drain_in_flight_maintenance()
+        .await
+        .expect("drain");
+    for _ in 0..40 {
+        if placed
+            .table
+            .compact_current_snapshot_small_files()
+            .await
+            .expect("compaction")
+        {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    placed
+        .table
+        .drain_in_flight_maintenance()
+        .await
+        .expect("drain");
+    let dir = table_dir(&placed).await;
+    let stored = placed.native.get_table("orders").await.expect("table");
+    let retired: Vec<String> = placed
+        .native
+        .retired_files(&stored.table_id)
+        .await
+        .expect("retired files")
+        .expect("settled")
+        .into_iter()
+        .filter(|key| !key.contains('/'))
+        .map(|key| format!("{dir}/{key}"))
+        .collect();
+    assert!(
+        retired.len() >= 2,
+        "the compaction retired its inputs: {retired:?}"
+    );
+    let live = placed.named_keys().await;
+    assert!(
+        live.iter().all(|key| !key[dir.len() + 1..].contains('/')),
+        "the live files are flat keys: {live:?}"
+    );
+
+    let orphan = format!("{dir}/{}_00000.vortex", uuid::Uuid::now_v7().simple());
+    plant(&rig, &orphan).await;
+    // A commit after the orphan, so the store's clock is past it.
+    placed.insert(3001, 3100).await.expect("append");
+    let young = placed.table.sweep_orphan_files_now().await.expect("sweep");
+    assert!(
+        young.deleted.is_empty() && young.kept_young >= 1,
+        "the orphan is younger than the floor: {young:?}"
+    );
+    assert!(rig.data_files(&dir).await.contains(&orphan));
+
+    tokio::time::sleep(FLOOR + Duration::from_millis(200)).await;
+    placed.insert(3101, 3200).await.expect("append");
+    let swept = placed.table.sweep_orphan_files_now().await.expect("sweep");
+    assert_eq!(
+        swept.deleted,
+        vec![orphan[dir.len() + 1..].to_string()],
+        "the flat orphan, and only it, is deleted after the floor"
+    );
+    let remaining = rig.data_files(&dir).await;
+    assert!(!remaining.contains(&orphan));
+    let mut lost: Vec<&String> = live
+        .iter()
+        .chain(&retired)
+        .filter(|key| !remaining.contains(key))
+        .collect();
+    lost.sort();
+    assert_eq!(lost, Vec::<&String>::new(), "live and retired keys are kept");
+    assert_eq!(placed.count().await.expect("count"), (3200, 3200));
+}
+
+/// The sweep reads the store's clock from the dataset's head and writes
+/// nothing: no `_store_clock` object is put, and none is stored.
+#[tokio::test]
+async fn the_orphan_sweep_writes_no_clock_object() {
+    let rig = Rig::new();
+    let placed = rig.place(rig.catalog().await, "orders", None).await;
+    placed.insert(1, 1000).await.expect("write");
+    placed
+        .table
+        .drain_in_flight_maintenance()
+        .await
+        .expect("drain");
+    placed.table.wait_for_orphan_sweep().await;
+    let puts_before = rig.tracking.puts.lock().len();
+    let swept = placed.table.sweep_orphan_files_now().await.expect("sweep");
+    assert_eq!(swept.skipped, None, "the sweep ran: {swept:?}");
+    let puts: Vec<String> = rig.tracking.puts.lock()[puts_before..].to_vec();
+    assert_eq!(puts, Vec::<String>::new(), "the sweep puts nothing");
+    let clocks: Vec<String> = rig
+        .tracking
+        .puts
+        .lock()
+        .iter()
+        .filter(|key| key.ends_with("_store_clock"))
+        .cloned()
+        .collect();
+    assert_eq!(clocks, Vec::<String>::new(), "no clock object is ever put");
+    let dir = table_dir(&placed).await;
+    assert!(
+        stored_under(&rig, &dir)
+            .await
+            .iter()
+            .all(|key| !key.ends_with("_store_clock")),
+        "no clock object is stored"
+    );
+}
+
+/// An object the store dates after the dataset's head is young, however old
+/// the floor would make it: it is kept with no floor at all until a commit
+/// moves the head past it, and deleted then.
+#[tokio::test]
+async fn an_object_newer_than_the_head_is_kept() {
+    let rig = Rig::new();
+    let placed = rig.place(rig.catalog().await, "orders", None).await;
+    placed.insert(1, 1000).await.expect("write");
+    placed
+        .table
+        .drain_in_flight_maintenance()
+        .await
+        .expect("drain");
+    placed.table.set_orphan_age_floor(Duration::ZERO);
+    let dir = table_dir(&placed).await;
+    let orphan = format!("{dir}/{}_00000.vortex", uuid::Uuid::now_v7().simple());
+    // Stamped after the head: the last commit was before it.
+    tokio::time::sleep(Duration::from_millis(20)).await;
+    plant(&rig, &orphan).await;
+    let kept = placed.table.sweep_orphan_files_now().await.expect("sweep");
+    assert_eq!(
+        (kept.deleted.clone(), kept.kept_young),
+        (Vec::<String>::new(), 1),
+        "the object newer than the head is kept: {kept:?}"
+    );
+    assert!(rig.data_files(&dir).await.contains(&orphan));
+
+    tokio::time::sleep(Duration::from_millis(20)).await;
+    placed.insert(1001, 1100).await.expect("a later write");
+    let swept = placed.table.sweep_orphan_files_now().await.expect("sweep");
+    assert_eq!(
+        swept.deleted,
+        vec![orphan[dir.len() + 1..].to_string()],
+        "deleted once the head is past it"
+    );
+    assert_eq!(placed.count().await.expect("count"), (1100, 1100));
+}
+
+/// The lookup index keeps its runs under `_lookup_index/` in the table's
+/// directory; the orphan sweep never deletes one, whatever its age.
+#[tokio::test]
+async fn the_orphan_sweep_leaves_the_lookup_index_alone() {
+    let rig = Rig::new();
+    let placed = rig.place(rig.catalog().await, "orders", None).await;
+    placed.insert(1, 1000).await.expect("write");
+    placed
+        .table
+        .drain_in_flight_maintenance()
+        .await
+        .expect("drain");
+    let dir = table_dir(&placed).await;
+    let runs = [
+        format!("{dir}/_lookup_index/key/run-0001.arrow"),
+        format!("{dir}/_lookup_index/run-0002.vortex"),
+    ];
+    for run in &runs {
+        plant(&rig, run).await;
+        rig.tracking
+            .aged
+            .lock()
+            .insert(run.clone(), Duration::from_hours(2));
+    }
+    // A flat orphan beside them, dated the same, shows the sweep ran.
+    let orphan = format!("{dir}/{}_00000.vortex", uuid::Uuid::now_v7().simple());
+    plant(&rig, &orphan).await;
+    rig.tracking
+        .aged
+        .lock()
+        .insert(orphan.clone(), Duration::from_hours(2));
+    placed.table.set_orphan_age_floor(Duration::ZERO);
+    let swept = placed.table.sweep_orphan_files_now().await.expect("sweep");
+    assert_eq!(
+        swept.deleted,
+        vec![orphan[dir.len() + 1..].to_string()],
+        "only the flat orphan is deleted"
+    );
+    let index = stored_under(&rig, &format!("{dir}/_lookup_index")).await;
+    assert_eq!(index, runs.to_vec(), "the lookup index is untouched");
 }

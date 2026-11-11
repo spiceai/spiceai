@@ -1123,10 +1123,9 @@ mod data_path {
             .expect("the manifest")
             .into_iter()
             .map(|file| {
-                format!(
-                    "{data_prefix}/{table_id}/{}/{}",
-                    file.snapshot_id, file.file_path
-                )
+                // A placed table's rows name their files relative to its flat
+                // directory.
+                format!("{data_prefix}/{table_id}/{}", file.file_path)
             })
             .collect();
         let stored: std::collections::BTreeSet<String> =

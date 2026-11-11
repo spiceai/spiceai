@@ -887,8 +887,9 @@ async fn eventually<T: fmt::Debug>(
 /// A merge retires its input snapshots in its own commit. Their files are kept
 /// while a restore point is being taken, then deleted in one batched request
 /// once it is done, and the deletion is recorded: the retired set is empty and
-/// the rows are unchanged. The merge's orphaned deletion vectors go out in one
-/// batched request too.
+/// the rows are unchanged. The merge's orphaned deletion vectors are retired by
+/// their reclaim, kept for the retention, then go out in one batched request
+/// too.
 #[tokio::test(flavor = "multi_thread")]
 async fn retired_files_are_deleted_in_batched_requests_after_the_retiring_commit() {
     let (location, process) = keyed_with_protected_snapshots("orders", UPSERTS).await;
@@ -953,30 +954,78 @@ async fn retired_files_are_deleted_in_batched_requests_after_the_retiring_commit
             .all(|file| data_requests[0].contains(file))
     );
 
-    // The merge orphaned one key deletion vector per merged upsert.
-    let dvs_before: Vec<String> = location
-        .probe
-        .objects(&location.data_prefix)
-        .await
-        .into_keys()
-        .filter(|key| has_extension(key, "arrow"))
-        .collect();
+    // The merge orphaned one key deletion vector per merged upsert. Their
+    // reclaim only commits their removal, which retires them: each stays
+    // stored for the retention, like a data file, so a query that loaded them
+    // before still finds them.
+    let arrow_objects = async || -> BTreeSet<String> {
+        location
+            .probe
+            .objects(&location.data_prefix)
+            .await
+            .into_keys()
+            .filter(|key| has_extension(key, "arrow"))
+            .collect()
+    };
+    let retired_dvs = async || -> Vec<String> {
+        process
+            .catalog
+            .retired_files(process.table.table_id())
+            .await
+            .expect("read the retired files")
+            .expect("the retired files are settled")
+            .into_iter()
+            .filter(|key| key.contains("deletions/"))
+            .collect()
+    };
+    let dvs_before = arrow_objects().await;
     process.table.drain_orphan_dv_sweep(1).await;
-    let dvs_after: BTreeSet<String> = location
-        .probe
-        .objects(&location.data_prefix)
-        .await
-        .into_keys()
-        .filter(|key| has_extension(key, "arrow"))
-        .collect();
-    let removed_dvs: Vec<&String> = dvs_before
-        .iter()
-        .filter(|key| !dvs_after.contains(*key))
-        .collect();
+    let removed_dvs = retired_dvs().await;
     assert!(
         removed_dvs.len() >= 2,
-        "the orphaned deletion vectors are reclaimed: before {dvs_before:?}, after {dvs_after:?}"
+        "the orphaned deletion vectors are removed and retired: {removed_dvs:?}"
     );
+    let removed_objects: BTreeSet<String> = dvs_before
+        .iter()
+        .filter(|key| {
+            removed_dvs
+                .iter()
+                .any(|removed| key.ends_with(&format!("/{removed}")))
+        })
+        .cloned()
+        .collect();
+    assert_eq!(
+        removed_objects.len(),
+        removed_dvs.len(),
+        "each retired deletion vector is a stored object: {removed_dvs:?} in {dvs_before:?}"
+    );
+    process.table.sweep_retired_files_now().await;
+    assert_eq!(
+        arrow_objects().await,
+        dvs_before,
+        "a removed deletion vector is kept until the retention has passed"
+    );
+    assert!(
+        process
+            .instance
+            .take_deletes()
+            .iter()
+            .all(|paths| paths.iter().all(|path| !has_extension(path, "arrow"))),
+        "nothing deletes a deletion vector inside the retention"
+    );
+
+    process.table.elapse_data_file_retention();
+    process.table.sweep_retired_files_now().await;
+    let dvs_after = arrow_objects().await;
+    assert_eq!(
+        dvs_after,
+        dvs_before
+            .difference(&removed_objects)
+            .cloned()
+            .collect::<BTreeSet<String>>(),
+        "the retired deletion vectors, and only they, are deleted once the retention has passed"
+    );
+    assert_eq!(retired_dvs().await, Vec::<String>::new(), "and forgotten");
     let dv_requests: Vec<Vec<String>> = process
         .instance
         .take_deletes()
@@ -986,7 +1035,7 @@ async fn retired_files_are_deleted_in_batched_requests_after_the_retiring_commit
     assert_eq!(
         dv_requests.len(),
         1,
-        "{} orphaned deletion vectors go out in one delete request: {dv_requests:?}",
+        "{} retired deletion vectors go out in one delete request: {dv_requests:?}",
         removed_dvs.len()
     );
 
@@ -1120,10 +1169,22 @@ async fn a_restart_in_the_middle_of_a_sweep_finishes_it_from_the_retirement_reco
     let second = location
         .open("orders", &armed(), SessionConfig::new())
         .await;
+    // The next process knows the retired files only from the committed
+    // record, and their retention starts again when it first reads it: a pass
+    // before the retention has passed deletes nothing.
+    second.table.sweep_retired_files_now().await;
+    assert_eq!(
+        location.files_of(&table_id, &retired).await,
+        failing,
+        "the reopened process keeps the retired files for the retention"
+    );
+    assert_eq!(second.retired().await, Some(retired.clone()));
+    second.table.elapse_data_file_retention();
     eventually(
         Duration::from_secs(30),
         "the next process finishes the sweep",
         async || {
+            second.table.sweep_retired_files_now().await;
             let left = location.files_of(&table_id, &retired).await;
             let recorded = second.retired().await;
             (
