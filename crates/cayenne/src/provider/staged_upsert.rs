@@ -147,18 +147,6 @@ impl CayenneStagedUpsert {
             && self.on_conflict_deletions.reinserted_over_tombstone == 0
     }
 
-    /// Prepare this staged upsert's durable payload for an atomic multi-table
-    /// commit: reserve sequences + write deletion-vector files (no metastore
-    /// commit). The caller holds the table `write_lock`; it applies the payload
-    /// via [`PreparedTxnCommit::apply_in_txn`] inside a shared transaction that
-    /// fuses all written tables, then publishes with [`PreparedTxnCommit::finish`].
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if the table needs the non-composable inline-tombstone or
-    /// position-deletion publish path (rejected for multi-table), if the staged
-    /// snapshot directory cannot be synced, or if reserving sequences / writing
-    /// deletion vectors fails.
     /// Under the commit's held `write_lock` (the optimistic check passed): take
     /// the mem-tier checkpoint lock, as a durable write does, and prepare the
     /// `retention_sql` delete over the resident rows this publication keeps,
@@ -187,6 +175,18 @@ impl CayenneStagedUpsert {
         Ok((Some(checkpoint_guard), prepared))
     }
 
+    /// Prepare this staged upsert's durable payload for an atomic multi-table
+    /// commit: reserve sequences + write deletion-vector files (no metastore
+    /// commit). The caller holds the table `write_lock`; it applies the payload
+    /// via [`PreparedTxnCommit::apply_in_txn`] inside a shared transaction that
+    /// fuses all written tables, then publishes with [`PreparedTxnCommit::finish`].
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the table needs the non-composable inline-tombstone or
+    /// position-deletion publish path (rejected for multi-table), if the staged
+    /// snapshot directory cannot be synced, or if reserving sequences / writing
+    /// deletion vectors fails.
     pub async fn prepare_commit(mut self) -> Result<PreparedTxnCommit> {
         // Directory barrier for the staged rows, before the shared transaction
         // makes them visible. The non-transactional publish takes this barrier
