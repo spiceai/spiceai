@@ -66,6 +66,14 @@ jobs:
         with:
           persist-credentials: false
 
+      # The schema and GH CLI steps below call apt-get directly
+      # (postgresql-client, git, make, gh). This removes the runner image's
+      # git-core PPA, whose outages otherwise fail `apt-get install git` with
+      # exit 100, and gives the Ubuntu archives mirror failover, as
+      # testoperator_run_bench.yml does.
+      - name: Configure apt mirrors
+        uses: ./.github/actions/configure-apt
+
       - name: Set up Rust toolchain
         uses: ./.github/actions/setup-rust
 
@@ -269,11 +277,7 @@ jobs:
         run: |
           set -e
           sudo apt-get update -y
-          # --no-upgrade: GitHub's Ubuntu images already ship git from the git-core
-          # PPA, so a plain install upgrades it from ppa.launchpadcontent.net, which
-          # configure-apt has no fallback for; a PPA outage then exits 100 here. The
-          # flag still installs a missing package, so a runner without git gets it.
-          sudo apt-get install -y --no-upgrade postgresql-client git make
+          sudo apt-get install -y postgresql-client git make
           cd test/tpc-bench
           make tpch-clone
           DB_HOST=$PGHOST DB_PORT=5432 DB_USER=postgres DB_NAME=tpch_sf1 make pg-init

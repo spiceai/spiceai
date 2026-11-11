@@ -121,6 +121,13 @@ jobs:
         with:
           persist-credentials: false
 
+      # The data-seeding step below calls apt-get directly (postgresql-client,
+      # make, git, unzip). This removes the runner image's git-core PPA, whose
+      # outages otherwise fail `apt-get install git` with exit 100, and gives
+      # the Ubuntu archives mirror failover, as testoperator_run_bench.yml does.
+      - name: Configure apt mirrors
+        uses: ./.github/actions/configure-apt
+
       - name: Set spicepod path
         id: set_spicepod_path
         run: |
@@ -211,7 +218,7 @@ jobs:
           # exits 127 before the later install line is ever reached. Only a
           # pre-provisioned target takes that branch, so it surfaced solely on
           # SF100 while the always-empty SF1/SF10 containers stayed green.
-          sudo apt-get install -y --no-upgrade postgresql-client make
+          sudo apt-get install -y postgresql-client make
 
           echo "Checking whether $DB_NAME already has data on $PGHOST..."
           set +e
@@ -260,17 +267,13 @@ jobs:
           fi
 
           echo "$DB_NAME is missing or empty on $PGHOST - seeding it now."
-          # --no-upgrade: GitHub's Ubuntu images already ship git from the git-core
-          # PPA, so a plain install upgrades it from ppa.launchpadcontent.net, which
-          # configure-apt has no fallback for; a PPA outage then exits 100 here. The
-          # flag still installs a missing package, so a runner without git gets it.
-          sudo apt-get install -y --no-upgrade git
+          sudo apt-get install -y git
           # Both query sets seed from the pinned DuckDB CLI (tpch-fleet-gen /
           # tpcds-fleet-gen), so nothing is compiled here - the kits are only
           # cloned for their DDL (dss.ddl / tpcds.sql, tpcds_ri.sql). Seeding
           # from any other generator produces data the recorded expected
           # answers don't match (see the fleet-gen comments in the Makefile).
-          sudo apt-get install -y --no-upgrade unzip
+          sudo apt-get install -y unzip
 
           if [ "$QUERY_SET" = "tpcds" ]; then
             make tpcds-clone
@@ -304,7 +307,7 @@ jobs:
             exit 0
           fi
           if ! command -v psql >/dev/null; then
-            sudo apt-get update -y && sudo apt-get install -y --no-upgrade postgresql-client
+            sudo apt-get update -y && sudo apt-get install -y postgresql-client
           fi
           for db in $ACCEL_DBS; do
             if psql -U postgres -d postgres -tAc "SELECT 1 FROM pg_database WHERE datname='$db'" | grep -q 1; then
