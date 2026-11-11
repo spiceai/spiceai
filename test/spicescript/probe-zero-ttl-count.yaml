@@ -1,0 +1,204 @@
+name: probe-zero-ttl-count
+description: >
+  Probe (not for merge). Ten zero-TTL datasets with a stale-if-error window,
+  each looked up twice back to back right after it starts. Counts how often
+  the origin is asked more than twice, and checks that the stored entry ends
+  up holding the newer answer.
+
+sources:
+  api: { kind: mock-http }
+
+spicepod:
+  version: v1
+  kind: Spicepod
+  name: probe-zero-ttl-count
+  runtime:
+    caching: { sql_results: { enabled: false } }
+  datasets:
+    - from: ${sources.api.url}/v1
+      name: zero_0
+      params: { file_format: json, allowed_request_paths: '/*', request_query_filters: enabled, max_retries: '0', response_cache_max_size_bytes: '0' }
+      acceleration: { enabled: true, engine: cayenne, mode: file, refresh_mode: caching, params: { caching_ttl: 0s, caching_stale_if_error: 1h } }
+    - from: ${sources.api.url}/v1
+      name: zero_1
+      params: { file_format: json, allowed_request_paths: '/*', request_query_filters: enabled, max_retries: '0', response_cache_max_size_bytes: '0' }
+      acceleration: { enabled: true, engine: cayenne, mode: file, refresh_mode: caching, params: { caching_ttl: 0s, caching_stale_if_error: 1h } }
+    - from: ${sources.api.url}/v1
+      name: zero_2
+      params: { file_format: json, allowed_request_paths: '/*', request_query_filters: enabled, max_retries: '0', response_cache_max_size_bytes: '0' }
+      acceleration: { enabled: true, engine: cayenne, mode: file, refresh_mode: caching, params: { caching_ttl: 0s, caching_stale_if_error: 1h } }
+    - from: ${sources.api.url}/v1
+      name: zero_3
+      params: { file_format: json, allowed_request_paths: '/*', request_query_filters: enabled, max_retries: '0', response_cache_max_size_bytes: '0' }
+      acceleration: { enabled: true, engine: cayenne, mode: file, refresh_mode: caching, params: { caching_ttl: 0s, caching_stale_if_error: 1h } }
+    - from: ${sources.api.url}/v1
+      name: zero_4
+      params: { file_format: json, allowed_request_paths: '/*', request_query_filters: enabled, max_retries: '0', response_cache_max_size_bytes: '0' }
+      acceleration: { enabled: true, engine: cayenne, mode: file, refresh_mode: caching, params: { caching_ttl: 0s, caching_stale_if_error: 1h } }
+    - from: ${sources.api.url}/v1
+      name: zero_5
+      params: { file_format: json, allowed_request_paths: '/*', request_query_filters: enabled, max_retries: '0', response_cache_max_size_bytes: '0' }
+      acceleration: { enabled: true, engine: cayenne, mode: file, refresh_mode: caching, params: { caching_ttl: 0s, caching_stale_if_error: 1h } }
+    - from: ${sources.api.url}/v1
+      name: zero_6
+      params: { file_format: json, allowed_request_paths: '/*', request_query_filters: enabled, max_retries: '0', response_cache_max_size_bytes: '0' }
+      acceleration: { enabled: true, engine: cayenne, mode: file, refresh_mode: caching, params: { caching_ttl: 0s, caching_stale_if_error: 1h } }
+    - from: ${sources.api.url}/v1
+      name: zero_7
+      params: { file_format: json, allowed_request_paths: '/*', request_query_filters: enabled, max_retries: '0', response_cache_max_size_bytes: '0' }
+      acceleration: { enabled: true, engine: cayenne, mode: file, refresh_mode: caching, params: { caching_ttl: 0s, caching_stale_if_error: 1h } }
+    - from: ${sources.api.url}/v1
+      name: zero_8
+      params: { file_format: json, allowed_request_paths: '/*', request_query_filters: enabled, max_retries: '0', response_cache_max_size_bytes: '0' }
+      acceleration: { enabled: true, engine: cayenne, mode: file, refresh_mode: caching, params: { caching_ttl: 0s, caching_stale_if_error: 1h } }
+    - from: ${sources.api.url}/v1
+      name: zero_9
+      params: { file_format: json, allowed_request_paths: '/*', request_query_filters: enabled, max_retries: '0', response_cache_max_size_bytes: '0' }
+      acceleration: { enabled: true, engine: cayenne, mode: file, refresh_mode: caching, params: { caching_ttl: 0s, caching_stale_if_error: 1h } }
+
+defaults:
+  spiced-args: [-v]
+
+steps:
+  - start: {}
+  - source-exec: { api: "{ path: /v1/p0, headers: { content-type: application/json }, body: '[{\"v\": 1}]' }" }
+  - query: SELECT content FROM zero_0 WHERE request_path = '/p0'
+    expect: { rows: [['{"v":1}']] }
+  - source-exec: { api: "{ path: /v1/p0, headers: { content-type: application/json }, body: '[{\"v\": 2}]' }" }
+  - query: SELECT content FROM zero_0 WHERE request_path = '/p0'
+    expect: { rows: [['{"v":2}']] }
+  - source-query: { api: count /v1/p0 }
+    expect: { rows: [['2']] }
+  - source-exec: { api: "{ path: /v1/p1, headers: { content-type: application/json }, body: '[{\"v\": 1}]' }" }
+  - query: SELECT content FROM zero_1 WHERE request_path = '/p1'
+    expect: { rows: [['{"v":1}']] }
+  - source-exec: { api: "{ path: /v1/p1, headers: { content-type: application/json }, body: '[{\"v\": 2}]' }" }
+  - query: SELECT content FROM zero_1 WHERE request_path = '/p1'
+    expect: { rows: [['{"v":2}']] }
+  - source-query: { api: count /v1/p1 }
+    expect: { rows: [['2']] }
+  - source-exec: { api: "{ path: /v1/p2, headers: { content-type: application/json }, body: '[{\"v\": 1}]' }" }
+  - query: SELECT content FROM zero_2 WHERE request_path = '/p2'
+    expect: { rows: [['{"v":1}']] }
+  - source-exec: { api: "{ path: /v1/p2, headers: { content-type: application/json }, body: '[{\"v\": 2}]' }" }
+  - query: SELECT content FROM zero_2 WHERE request_path = '/p2'
+    expect: { rows: [['{"v":2}']] }
+  - source-query: { api: count /v1/p2 }
+    expect: { rows: [['2']] }
+  - source-exec: { api: "{ path: /v1/p3, headers: { content-type: application/json }, body: '[{\"v\": 1}]' }" }
+  - query: SELECT content FROM zero_3 WHERE request_path = '/p3'
+    expect: { rows: [['{"v":1}']] }
+  - source-exec: { api: "{ path: /v1/p3, headers: { content-type: application/json }, body: '[{\"v\": 2}]' }" }
+  - query: SELECT content FROM zero_3 WHERE request_path = '/p3'
+    expect: { rows: [['{"v":2}']] }
+  - source-query: { api: count /v1/p3 }
+    expect: { rows: [['2']] }
+  - source-exec: { api: "{ path: /v1/p4, headers: { content-type: application/json }, body: '[{\"v\": 1}]' }" }
+  - query: SELECT content FROM zero_4 WHERE request_path = '/p4'
+    expect: { rows: [['{"v":1}']] }
+  - source-exec: { api: "{ path: /v1/p4, headers: { content-type: application/json }, body: '[{\"v\": 2}]' }" }
+  - query: SELECT content FROM zero_4 WHERE request_path = '/p4'
+    expect: { rows: [['{"v":2}']] }
+  - source-query: { api: count /v1/p4 }
+    expect: { rows: [['2']] }
+  - source-exec: { api: "{ path: /v1/p5, headers: { content-type: application/json }, body: '[{\"v\": 1}]' }" }
+  - query: SELECT content FROM zero_5 WHERE request_path = '/p5'
+    expect: { rows: [['{"v":1}']] }
+  - source-exec: { api: "{ path: /v1/p5, headers: { content-type: application/json }, body: '[{\"v\": 2}]' }" }
+  - query: SELECT content FROM zero_5 WHERE request_path = '/p5'
+    expect: { rows: [['{"v":2}']] }
+  - source-query: { api: count /v1/p5 }
+    expect: { rows: [['2']] }
+  - source-exec: { api: "{ path: /v1/p6, headers: { content-type: application/json }, body: '[{\"v\": 1}]' }" }
+  - query: SELECT content FROM zero_6 WHERE request_path = '/p6'
+    expect: { rows: [['{"v":1}']] }
+  - source-exec: { api: "{ path: /v1/p6, headers: { content-type: application/json }, body: '[{\"v\": 2}]' }" }
+  - query: SELECT content FROM zero_6 WHERE request_path = '/p6'
+    expect: { rows: [['{"v":2}']] }
+  - source-query: { api: count /v1/p6 }
+    expect: { rows: [['2']] }
+  - source-exec: { api: "{ path: /v1/p7, headers: { content-type: application/json }, body: '[{\"v\": 1}]' }" }
+  - query: SELECT content FROM zero_7 WHERE request_path = '/p7'
+    expect: { rows: [['{"v":1}']] }
+  - source-exec: { api: "{ path: /v1/p7, headers: { content-type: application/json }, body: '[{\"v\": 2}]' }" }
+  - query: SELECT content FROM zero_7 WHERE request_path = '/p7'
+    expect: { rows: [['{"v":2}']] }
+  - source-query: { api: count /v1/p7 }
+    expect: { rows: [['2']] }
+  - source-exec: { api: "{ path: /v1/p8, headers: { content-type: application/json }, body: '[{\"v\": 1}]' }" }
+  - query: SELECT content FROM zero_8 WHERE request_path = '/p8'
+    expect: { rows: [['{"v":1}']] }
+  - source-exec: { api: "{ path: /v1/p8, headers: { content-type: application/json }, body: '[{\"v\": 2}]' }" }
+  - query: SELECT content FROM zero_8 WHERE request_path = '/p8'
+    expect: { rows: [['{"v":2}']] }
+  - source-query: { api: count /v1/p8 }
+    expect: { rows: [['2']] }
+  - source-exec: { api: "{ path: /v1/p9, headers: { content-type: application/json }, body: '[{\"v\": 1}]' }" }
+  - query: SELECT content FROM zero_9 WHERE request_path = '/p9'
+    expect: { rows: [['{"v":1}']] }
+  - source-exec: { api: "{ path: /v1/p9, headers: { content-type: application/json }, body: '[{\"v\": 2}]' }" }
+  - query: SELECT content FROM zero_9 WHERE request_path = '/p9'
+    expect: { rows: [['{"v":2}']] }
+  - source-query: { api: count /v1/p9 }
+    expect: { rows: [['2']] }
+  - sleep: 2s
+  - source-query: { api: count /v1/p0 }
+    expect: { rows: [['2']] }
+  - source-exec: { api: "{ path: /v1/p0, status: 503, body: down }" }
+  - query: SELECT content FROM zero_0 WHERE request_path = '/p0'
+    expect: { rows: [['{"v":2}']] }
+    eventually: 5s
+  - source-query: { api: count /v1/p1 }
+    expect: { rows: [['2']] }
+  - source-exec: { api: "{ path: /v1/p1, status: 503, body: down }" }
+  - query: SELECT content FROM zero_1 WHERE request_path = '/p1'
+    expect: { rows: [['{"v":2}']] }
+    eventually: 5s
+  - source-query: { api: count /v1/p2 }
+    expect: { rows: [['2']] }
+  - source-exec: { api: "{ path: /v1/p2, status: 503, body: down }" }
+  - query: SELECT content FROM zero_2 WHERE request_path = '/p2'
+    expect: { rows: [['{"v":2}']] }
+    eventually: 5s
+  - source-query: { api: count /v1/p3 }
+    expect: { rows: [['2']] }
+  - source-exec: { api: "{ path: /v1/p3, status: 503, body: down }" }
+  - query: SELECT content FROM zero_3 WHERE request_path = '/p3'
+    expect: { rows: [['{"v":2}']] }
+    eventually: 5s
+  - source-query: { api: count /v1/p4 }
+    expect: { rows: [['2']] }
+  - source-exec: { api: "{ path: /v1/p4, status: 503, body: down }" }
+  - query: SELECT content FROM zero_4 WHERE request_path = '/p4'
+    expect: { rows: [['{"v":2}']] }
+    eventually: 5s
+  - source-query: { api: count /v1/p5 }
+    expect: { rows: [['2']] }
+  - source-exec: { api: "{ path: /v1/p5, status: 503, body: down }" }
+  - query: SELECT content FROM zero_5 WHERE request_path = '/p5'
+    expect: { rows: [['{"v":2}']] }
+    eventually: 5s
+  - source-query: { api: count /v1/p6 }
+    expect: { rows: [['2']] }
+  - source-exec: { api: "{ path: /v1/p6, status: 503, body: down }" }
+  - query: SELECT content FROM zero_6 WHERE request_path = '/p6'
+    expect: { rows: [['{"v":2}']] }
+    eventually: 5s
+  - source-query: { api: count /v1/p7 }
+    expect: { rows: [['2']] }
+  - source-exec: { api: "{ path: /v1/p7, status: 503, body: down }" }
+  - query: SELECT content FROM zero_7 WHERE request_path = '/p7'
+    expect: { rows: [['{"v":2}']] }
+    eventually: 5s
+  - source-query: { api: count /v1/p8 }
+    expect: { rows: [['2']] }
+  - source-exec: { api: "{ path: /v1/p8, status: 503, body: down }" }
+  - query: SELECT content FROM zero_8 WHERE request_path = '/p8'
+    expect: { rows: [['{"v":2}']] }
+    eventually: 5s
+  - source-query: { api: count /v1/p9 }
+    expect: { rows: [['2']] }
+  - source-exec: { api: "{ path: /v1/p9, status: 503, body: down }" }
+  - query: SELECT content FROM zero_9 WHERE request_path = '/p9'
+    expect: { rows: [['{"v":2}']] }
+    eventually: 5s
