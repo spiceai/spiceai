@@ -307,6 +307,15 @@ fn retry_reason_from_status(status: StatusCode) -> Option<RetryReason> {
     }
 }
 
+/// Whether `status` is a retryable failure (408/429/5xx) for the purposes of
+/// adaptive rate control. Shares the classification with the retry logic so a
+/// status the connector retries and a status the adaptive controller counts as
+/// a failure never drift apart.
+#[must_use]
+pub fn status_is_retryable(status: StatusCode) -> bool {
+    retry_reason_from_status(status).is_some()
+}
+
 fn retry_after_duration(headers: &HeaderMap) -> Option<Duration> {
     crate::rate_limit::retry_after_duration(headers, SystemTime::now())
 }
@@ -332,28 +341,13 @@ pub const TRUNCATED_BODY_MARKER: &str = "…<truncated>";
 /// message. The returned string is already passed through
 /// [`sanitize_error_body`] and is capped at `max_bytes` bytes *including*
 /// the truncation marker.
-pub async fn read_bounded_error_body(mut response: Response, max_bytes: usize) -> String {
+pub async fn read_bounded_error_body(response: Response, max_bytes: usize) -> String {
     // Cap the raw read at a small multiple of the sanitized cap to allow for
     // UTF-8 completion and whitespace expansion, while still bounding memory.
-    let read_cap_bytes = max_bytes.saturating_mul(2);
-    let mut raw: Vec<u8> = Vec::new();
-    while raw.len() < read_cap_bytes {
-        match response.chunk().await {
-            Ok(Some(chunk)) => {
-                let remaining = read_cap_bytes - raw.len();
-                if chunk.len() <= remaining {
-                    raw.extend_from_slice(&chunk);
-                } else {
-                    raw.extend_from_slice(&chunk[..remaining]);
-                    break;
-                }
-            }
-            // End of body (Ok(None)) or a network error mid-stream (Err(_))
-            // both stop the read with whatever we have so far — an error
-            // diagnostic is best-effort by design.
-            Ok(None) | Err(_) => break,
-        }
-    }
+    // The read decodes a compressed body, so it also works on a client built with
+    // `http_body_limit::decode_manually`; a read or decode failure stops it with what
+    // was read so far — an error diagnostic is best-effort by design.
+    let raw = http_body_limit::read_prefix(response, max_bytes.saturating_mul(2)).await;
     let text = String::from_utf8_lossy(&raw);
     sanitize_error_body(&text, max_bytes)
 }

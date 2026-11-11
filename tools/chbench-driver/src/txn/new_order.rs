@@ -87,6 +87,7 @@ pub async fn run(
         let ol_quantity = rng.random_range(1..=10);
         items.push((ol_i_id, ol_supply_w_id, ol_quantity, remote));
     }
+    super::sort_lines_in_lock_order(&mut items);
 
     let tx = client
         .transaction()

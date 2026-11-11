@@ -1,0 +1,12 @@
+{
+  "debezium-kafka-arrow": [
+    {
+      "run": "debezium-kafka-arrow",
+      "who": "default",
+      "key": "start: {}",
+      "kind": "error",
+      "signature": "spiced not ready: a dataset is in Error: [{\"acceleration_enabled\":true,\"error\":{\"category\":\"dataset\",\"code\":\"dataset.unknown\",\"type\":\"unknown\"},\"error_message\":\"Failed to load the dataset t (debezium). Unable to restart Kafka offsets Failed to set partition in list: Set partition offset error: Unkno",
+      "group": "debezium"
+    }
+  ]
+}

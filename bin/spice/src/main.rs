@@ -20,20 +20,20 @@ use clap::{CommandFactory, Parser, Subcommand};
 use spice::commands::acceleration::{AccelerationArgs, SnapshotArgs, SnapshotsArgs};
 use spice::commands::component::{ComponentSection, SingletonSection};
 use spice::commands::{
-    acceleration, add, catalogs, chat, cloud, cluster, completions, component, connect, dataset,
-    datasets, feedback, init, install, login, models, nsql, pods, query, refresh, run, search, sql,
-    status, trace, upgrade, validate, version, workers,
+    acceleration, add, catalogs, chat, cloud, cluster, coding_agent, completions, component,
+    connect, dataset, datasets, feedback, init, install, login, models, nsql, pods, query, refresh,
+    run, search, sql, status, trace, upgrade, validate, version, workers,
 };
 use spice::output::OutputFormat;
 use spice::{Result, RuntimeContext};
 use spice_cloud_client::endpoints::{
-    is_valid_region as is_valid_cloud_region, normalize_data_region,
+    DEFAULT_REGION as DEFAULT_CLOUD_REGION, is_valid_region as is_valid_cloud_region,
+    normalize_data_region,
 };
 use std::ffi::{OsStr, OsString};
 use std::sync::LazyLock;
 use tracing_subscriber::EnvFilter;
 
-const DEFAULT_CLOUD_REGION: &str = "us-east-1";
 const MACHINE_ERROR_SERIALIZATION_FAILED: &str = r#"{"status":"error","error":{"code":"error_serialization_failed","message":"Failed to serialize CLI error"}}"#;
 const SQL_DIRECT_SHORTCUT_VALUE_FLAGS: &[&str] = &[
     "--endpoint",
@@ -106,6 +106,7 @@ Common workflows:
   Manage data:    spice dataset add ...  |  spice catalog add ...  |  spice refresh ...
   Models & AI:    spice model add ...    |  spice chat   |  spice search  |  spice nsql
   Inspect:        spice status  |  spice datasets  |  spice models  |  spice pods
+  Coding agents:  spice claude  |  spice codex  |  spice opencode  |  ... (Spice as the model backend)
   Deploy:         spice cloud login  |  spice cloud deploy
 
 Run `spice <command> --help` for details on any command.
@@ -260,6 +261,79 @@ enum Commands {
 
     Acceleration(acceleration::AccelerationArgs),
 
+    // ── Coding agents (Spice as the model backend) ───────────────────────────
+    #[command(
+        about = coding_agent::about(coding_agent::Agent::Antigravity),
+        long_about = coding_agent::long_about(coding_agent::Agent::Antigravity),
+        disable_help_flag = true,
+        disable_version_flag = true
+    )]
+    Agy(coding_agent::CodingAgentArgs),
+
+    #[command(
+        about = coding_agent::about(coding_agent::Agent::ClaudeCode),
+        long_about = coding_agent::long_about(coding_agent::Agent::ClaudeCode),
+        disable_help_flag = true,
+        disable_version_flag = true
+    )]
+    Claude(coding_agent::CodingAgentArgs),
+
+    #[command(
+        about = coding_agent::about(coding_agent::Agent::Codex),
+        long_about = coding_agent::long_about(coding_agent::Agent::Codex),
+        disable_help_flag = true,
+        disable_version_flag = true
+    )]
+    Codex(coding_agent::CodingAgentArgs),
+
+    #[command(
+        about = coding_agent::about(coding_agent::Agent::CopilotCli),
+        long_about = coding_agent::long_about(coding_agent::Agent::CopilotCli),
+        disable_help_flag = true,
+        disable_version_flag = true
+    )]
+    Copilot(coding_agent::CodingAgentArgs),
+
+    #[command(
+        about = coding_agent::about(coding_agent::Agent::Cursor),
+        long_about = coding_agent::long_about(coding_agent::Agent::Cursor),
+        disable_help_flag = true,
+        disable_version_flag = true
+    )]
+    Cursor(coding_agent::CodingAgentArgs),
+
+    #[command(
+        about = coding_agent::about(coding_agent::Agent::Grok),
+        long_about = coding_agent::long_about(coding_agent::Agent::Grok),
+        disable_help_flag = true,
+        disable_version_flag = true
+    )]
+    Grok(coding_agent::CodingAgentArgs),
+
+    #[command(
+        about = coding_agent::about(coding_agent::Agent::OpenCode),
+        long_about = coding_agent::long_about(coding_agent::Agent::OpenCode),
+        disable_help_flag = true,
+        disable_version_flag = true
+    )]
+    Opencode(coding_agent::CodingAgentArgs),
+
+    #[command(
+        about = coding_agent::about(coding_agent::Agent::Pi),
+        long_about = coding_agent::long_about(coding_agent::Agent::Pi),
+        disable_help_flag = true,
+        disable_version_flag = true
+    )]
+    Pi(coding_agent::CodingAgentArgs),
+
+    #[command(
+        about = coding_agent::orca::about(),
+        long_about = coding_agent::orca::long_about(),
+        disable_help_flag = true,
+        disable_version_flag = true
+    )]
+    Orca(coding_agent::CodingAgentArgs),
+
     // ── Auth, cluster, and Spice Cloud ───────────────────────────────────────
     Login(login::LoginArgs),
 
@@ -272,6 +346,25 @@ enum Commands {
 
     /// Open the Spice.ai community Slack to share feedback
     Feedback(feedback::FeedbackArgs),
+}
+
+impl Commands {
+    /// The arguments of a coding agent's command, or of `orca`: all of them are
+    /// the program's own.
+    fn coding_agent_args(&self) -> Option<&coding_agent::CodingAgentArgs> {
+        match self {
+            Self::Agy(args)
+            | Self::Claude(args)
+            | Self::Codex(args)
+            | Self::Copilot(args)
+            | Self::Cursor(args)
+            | Self::Grok(args)
+            | Self::Opencode(args)
+            | Self::Pi(args)
+            | Self::Orca(args) => Some(args),
+            _ => None,
+        }
+    }
 }
 
 fn main() {
@@ -317,11 +410,15 @@ fn main() {
     // subscriber writes to stdout, so stdout's terminal-ness decides colour:
     // the builder default would honour `NO_COLOR` but still paint a redirected
     // stdout, and this is the same decision the CLI's own painted output uses.
+    //
+    // A coding agent's stdout is the agent's own — `spice claude -p … | jq` reads
+    // what Claude Code printed — so spice's messages go to stderr there too.
+    let agent_stdout = cli.command.coding_agent_args().is_some();
     let subscriber = tracing_subscriber::fmt()
         .with_env_filter(filter)
         .with_target(false)
         .without_time();
-    if json_stdout {
+    if json_stdout || agent_stdout {
         subscriber
             .with_ansi(ansi_colors::colors_enabled_for(ansi_colors::Target::Stderr))
             .with_writer(std::io::stderr)
@@ -431,6 +528,7 @@ fn normalize_direct_command_args(args: impl IntoIterator<Item = OsString>) -> Ve
         let arg_text = arg.to_string_lossy();
         let consumes_value = global_value_flag_consumes_value(&arg_text);
         let is_subcommand = !arg_text.starts_with('-');
+        let is_coding_agent = is_subcommand && is_coding_agent_command(&arg_text);
         normalized.push(arg);
 
         if consumes_value {
@@ -440,6 +538,15 @@ fn normalize_direct_command_args(args: impl IntoIterator<Item = OsString>) -> Ve
             continue;
         }
 
+        if is_coding_agent {
+            // Every argument after a coding agent's name is the agent's, byte
+            // for byte — including ones spelled like a global `spice` option,
+            // which clap would otherwise claim. `--` makes them all positional.
+            normalized.push(OsString::from("--"));
+            normalized.extend(args);
+            break;
+        }
+
         if is_subcommand {
             normalized.extend(normalize_cloud_region_flags(args));
             break;
@@ -447,6 +554,15 @@ fn normalize_direct_command_args(args: impl IntoIterator<Item = OsString>) -> Ve
     }
 
     normalized
+}
+
+/// Whether `name` is a coding agent's subcommand or alias, or `orca`, whose
+/// arguments are all Orca's in the same way.
+fn is_coding_agent_command(name: &str) -> bool {
+    name == "orca"
+        || coding_agent::Agent::ALL
+            .iter()
+            .any(|agent| agent.command() == name)
 }
 
 fn normalize_direct_shortcut_args(
@@ -557,15 +673,25 @@ fn normalize_cloud_region_flags(args: impl IntoIterator<Item = OsString>) -> Vec
 ///
 /// This is kept outside clap's `requires = "cloud"` relationship so the CLI
 /// can explain what the region selects and how to correct the invocation.
+/// `spice connect` never takes `--cloud`: it only retains the deprecated
+/// `spice connect <org>/<pod>` alias of `spice add`, which adds a Spicepod to
+/// this directory rather than querying a runtime, so advising `--cloud` there
+/// would send the user to a flag that does nothing for them.
 fn validate_cloud_region_usage(cli: &Cli) -> Result<()> {
     if cli.cloud_region.is_none() || cli.cloud {
         return Ok(());
     }
+    let message = if matches!(cli.command, Commands::Connect(_)) {
+        "--cloud-region does not apply to spice connect: it selects the Spice.ai Cloud region \
+         that --cloud queries, and spice connect only retains the deprecated <org>/<pod> alias \
+         of spice add, which adds a Spicepod to this directory rather than querying a runtime. \
+         Drop it."
+    } else {
+        "--cloud-region requires --cloud: it selects which Spice.ai Cloud region to query. Pass \
+         --cloud alongside it to target Spice.ai Cloud, or drop it to use the local runtime."
+    };
     Err(spice::error::Error::InvalidArgument {
-        message: "--cloud-region requires --cloud: it selects which Spice.ai Cloud region to \
-                  query. Pass --cloud alongside it to target Spice.ai Cloud, or drop it to use \
-                  the local runtime."
-            .to_string(),
+        message: message.to_string(),
     })
 }
 
@@ -708,6 +834,15 @@ fn apply_machine_mode(command: &mut Commands) {
         | Commands::Metadata(_)
         | Commands::Cluster(_)
         | Commands::Completions(_)
+        | Commands::Agy(_)
+        | Commands::Claude(_)
+        | Commands::Codex(_)
+        | Commands::Copilot(_)
+        | Commands::Cursor(_)
+        | Commands::Grok(_)
+        | Commands::Opencode(_)
+        | Commands::Pi(_)
+        | Commands::Orca(_)
         | Commands::Feedback(_) => {}
     }
 }
@@ -800,10 +935,16 @@ fn write_machine_error(error: &spice::error::Error) {
 fn machine_error_code(error: &spice::error::Error) -> &'static str {
     match error {
         spice::error::Error::RuntimeNotInstalled => "runtime_not_installed",
+        spice::error::Error::SpicedPathOverrideNotRunnable { .. } => {
+            "spiced_path_override_not_runnable"
+        }
+        spice::error::Error::SpicedPathNotAnchorable { .. } => "spiced_path_not_anchorable",
         spice::error::Error::WindowsNativeRuntimeUnsupported => {
             "windows_native_runtime_unsupported"
         }
         spice::error::Error::RuntimeUnavailable { .. } => "runtime_unavailable",
+        spice::error::Error::TlsVerificationFailed { .. } => "tls_verification_failed",
+        spice::error::Error::TlsRootCertificate { .. } => "tls_root_certificate",
         spice::error::Error::Unauthorized => "unauthorized",
         spice::error::Error::PermissionDenied => "permission_denied",
         spice::error::Error::RuntimeHttp { .. } => "runtime_http_error",
@@ -828,8 +969,11 @@ fn machine_error_code(error: &spice::error::Error) -> &'static str {
         spice::error::Error::Repl { .. } => "repl",
         spice::error::Error::ChildProcessId => "child_process_id",
         spice::error::Error::SignalHandler { .. } => "signal_handler",
-        spice::error::Error::ModelNotFound { .. } => "model_not_found",
-        spice::error::Error::NoModelsConfigured => "no_models_configured",
+        spice::error::Error::ModelNotFound { .. }
+        | spice::error::Error::CodingAgentModelNotFound { .. } => "model_not_found",
+        spice::error::Error::NoModelsConfigured | spice::error::Error::CodingAgentNoModels => {
+            "no_models_configured"
+        }
         spice::error::Error::CloudConnectIo { .. } => "cloud_connect_io",
         spice::error::Error::CloudConnectEnroll { .. } => "cloud_connect_enroll",
         spice::error::Error::CloudConnectProject { .. } => "cloud_connect_project",
@@ -837,12 +981,33 @@ fn machine_error_code(error: &spice::error::Error) -> &'static str {
         spice::error::Error::ServiceUnavailable { .. } => "service_unavailable",
         spice::error::Error::Interrupted => "interrupted",
         spice::error::Error::NotImplemented { .. } => "not_implemented",
+        spice::error::Error::CodingAgentNotInstalled { .. } => "coding_agent_not_installed",
+        spice::error::Error::CodingAgentUnsupportedBuild { .. } => "coding_agent_unsupported_build",
+        spice::error::Error::CodingAgentCloudUnsupported { .. } => "coding_agent_cloud_unsupported",
+        spice::error::Error::CodingAgentLaunch { .. } => "coding_agent_launch_failed",
+        spice::error::Error::CodingAgentPrepare { .. } => "coding_agent_prepare_failed",
+        spice::error::Error::CodingAgentFile { .. } => "coding_agent_file",
+        spice::error::Error::CodingAgentConfigConflict { .. } => "coding_agent_config_conflict",
+        spice::error::Error::CodingAgentRuntimeStart { .. } => "runtime_start_failed",
+        spice::error::Error::CodingAgentRuntimeElsewhere { .. } => "runtime_endpoint_mismatch",
+        spice::error::Error::CodingAgentNoSpicepod { .. } => "no_spicepod",
+        spice::error::Error::CodingAgentOtherSpicepod { .. } => "runtime_spicepod_mismatch",
+        spice::error::Error::CodingAgentRuntimeLock { .. } => "runtime_lock",
+        spice::error::Error::CodingAgentRuntimeState { .. } => "runtime_state",
+        spice::error::Error::CodingAgentModelFailed { .. } => "model_load_failed",
+        spice::error::Error::CodingAgentModelTimeout { .. } => "model_load_timeout",
     }
 }
 
 /// Returns true if the command will output JSON, so the banner should be suppressed.
 fn is_json_output(cmd: &mut Commands) -> bool {
+    // Explicit for the same reason `apply_machine_mode` is: the two answer for
+    // the same command tree, and a wildcard here lets them disagree silently.
+    // `version` is where that bit us: it reports a runtime it cannot resolve, and
+    // a command absent from this list writes that report into the document its
+    // caller is parsing.
     match cmd {
+        Commands::Version(a) => a.output == OutputFormat::Json,
         Commands::Status(a) => a.output == OutputFormat::Json,
         Commands::Datasets(a) => a.output == OutputFormat::Json,
         Commands::Catalogs(a) => a.output == OutputFormat::Json,
@@ -867,7 +1032,43 @@ fn is_json_output(cmd: &mut Commands) -> bool {
         // Cloud commands answer for themselves, from the one match in cloud::mod.
         Commands::Cloud(a) => a.command.produces_json(),
         Commands::Login(a) => a.output == login::LoginOutput::Json,
-        _ => false,
+        // The commands with no structured output to reserve stdout for; the
+        // same set `apply_machine_mode` has nothing to apply to.
+        Commands::Nsql(_)
+        | Commands::Init(_)
+        | Commands::Install(_)
+        | Commands::Upgrade(_)
+        | Commands::Run(_)
+        | Commands::Add(_)
+        | Commands::Connect(_)
+        | Commands::Validate(_)
+        | Commands::Dataset(_)
+        | Commands::Catalog(_)
+        | Commands::Model(_)
+        | Commands::View(_)
+        | Commands::Embedding(_)
+        | Commands::Reranker(_)
+        | Commands::Tool(_)
+        | Commands::Worker(_)
+        | Commands::Function(_)
+        | Commands::Secret(_)
+        | Commands::Runtime(_)
+        | Commands::Management(_)
+        | Commands::Snapshots(_)
+        | Commands::Extension(_)
+        | Commands::Metadata(_)
+        | Commands::Cluster(_)
+        | Commands::Completions(_)
+        | Commands::Agy(_)
+        | Commands::Claude(_)
+        | Commands::Codex(_)
+        | Commands::Copilot(_)
+        | Commands::Cursor(_)
+        | Commands::Grok(_)
+        | Commands::Opencode(_)
+        | Commands::Pi(_)
+        | Commands::Orca(_)
+        | Commands::Feedback(_) => false,
     }
 }
 
@@ -922,8 +1123,7 @@ fn run_cli(cli: Cli) -> Result<()> {
                 .map_err(|e| spice::error::Error::RuntimeExecution { source: e })?;
             rt.block_on(add::execute(&ctx, args))?;
         }
-        Commands::Connect(mut args) => {
-            args.cloud_region.clone_from(&cli.cloud_region);
+        Commands::Connect(args) => {
             let rt = tokio::runtime::Runtime::new()
                 .map_err(|e| spice::error::Error::RuntimeExecution { source: e })?;
             rt.block_on(connect::execute(&ctx, args))?;
@@ -1051,6 +1251,15 @@ fn run_cli(cli: Cli) -> Result<()> {
                 .map_err(|e| spice::error::Error::RuntimeExecution { source: e })?;
             rt.block_on(chat::execute(&ctx, &args))?;
         }
+        Commands::Agy(args) => run_coding_agent(&ctx, coding_agent::Agent::Antigravity, &args)?,
+        Commands::Claude(args) => run_coding_agent(&ctx, coding_agent::Agent::ClaudeCode, &args)?,
+        Commands::Codex(args) => run_coding_agent(&ctx, coding_agent::Agent::Codex, &args)?,
+        Commands::Copilot(args) => run_coding_agent(&ctx, coding_agent::Agent::CopilotCli, &args)?,
+        Commands::Cursor(args) => run_coding_agent(&ctx, coding_agent::Agent::Cursor, &args)?,
+        Commands::Grok(args) => run_coding_agent(&ctx, coding_agent::Agent::Grok, &args)?,
+        Commands::Opencode(args) => run_coding_agent(&ctx, coding_agent::Agent::OpenCode, &args)?,
+        Commands::Pi(args) => run_coding_agent(&ctx, coding_agent::Agent::Pi, &args)?,
+        Commands::Orca(args) => exit_with(coding_agent::orca::execute(&ctx, &args))?,
         Commands::Completions(args) => {
             completions::execute(&args, &mut Cli::command());
         }
@@ -1064,6 +1273,30 @@ fn run_cli(cli: Cli) -> Result<()> {
         }
     }
 
+    Ok(())
+}
+
+/// Run a coding agent, and exit with its code when it fails.
+fn run_coding_agent(
+    ctx: &RuntimeContext,
+    agent: coding_agent::Agent,
+    args: &coding_agent::CodingAgentArgs,
+) -> Result<()> {
+    exit_with(coding_agent::execute(ctx, agent, args))
+}
+
+/// Run a coding agent or Orca, and exit with its code when it fails.
+///
+/// The program's code is this command's code, the way a wrapper such as
+/// `time` or `sudo` reports it: a script sees what the program reported.
+fn exit_with(run: impl std::future::Future<Output = Result<i32>>) -> Result<()> {
+    let rt = tokio::runtime::Runtime::new()
+        .map_err(|e| spice::error::Error::RuntimeExecution { source: e })?;
+    let code = rt.block_on(run)?;
+    if code != 0 {
+        drop(rt);
+        std::process::exit(code);
+    }
     Ok(())
 }
 
@@ -1343,17 +1576,21 @@ mod tests {
         assert!(message.contains("--cloud-region"), "{message}");
     }
 
-    /// `connect` is exempt from the `--cloud` requirement here so it can
-    /// diagnose the flag itself: clap's "missing --cloud" would be the wrong
-    /// answer for what is really a confusion with `--region`/`--endpoint`. The
-    /// command's own refusal is covered in `cli_integration`.
+    /// `connect` has no `--cloud` to add, so its refusal names the command
+    /// and tells the user to drop the flag instead of advising `--cloud`.
     #[test]
-    fn cloud_region_is_left_to_connect_to_diagnose() {
-        let cli = parse_normalized(&["spice", "connect", "status", "--cloud-region", "us-west-2"]);
+    fn cloud_region_on_connect_is_refused_without_cloud_advice() {
+        let cli = parse_normalized(&["spice", "connect", "org/pod", "--cloud-region", "us-west-2"]);
         assert!(!cli.cloud);
         assert_eq!(cli.cloud_region.as_deref(), Some("us-west-2"));
-        validate_cloud_region_usage(&cli)
-            .expect("connect refuses the flag itself, with a better message");
+        let Err(error) = validate_cloud_region_usage(&cli) else {
+            panic!("cloud-region on connect should be rejected");
+        };
+
+        let message = error.to_string();
+        assert!(message.contains("spice connect"), "{message}");
+        assert!(message.contains("Drop it"), "{message}");
+        assert!(!message.contains("Pass --cloud"), "{message}");
     }
 
     #[test]
@@ -1576,6 +1813,34 @@ mod tests {
         };
         assert!(args.direct_prompt);
         assert_eq!(args.message.as_deref(), Some("Summarize loaded datasets"));
+    }
+
+    /// `--temperature -1` must reach `chat::execute`'s range check; read as a flag, it fails
+    /// with clap's "unexpected argument '-1'" and the user never learns the valid range.
+    #[test]
+    fn chat_temperature_accepts_a_negative_value() {
+        for argv in [
+            &["spice", "chat", "--temperature", "-1", "-m", "llm"][..],
+            &["spice", "-p", "--temperature", "-1", "-m", "llm", "hello"][..],
+        ] {
+            let cli = parse_normalized(argv);
+            let Commands::Chat(args) = cli.command else {
+                panic!("expected chat command for {argv:?}");
+            };
+            assert_eq!(args.temperature, Some(-1.0), "{argv:?}");
+            assert_eq!(args.model.as_deref(), Some("llm"), "{argv:?}");
+        }
+    }
+
+    /// Only numbers are taken as negative values: a flag after `--temperature` is still a flag.
+    #[test]
+    fn chat_temperature_does_not_swallow_a_following_flag() {
+        let args = normalize_direct_command_args(
+            ["spice", "chat", "--temperature", "-m", "llm"]
+                .into_iter()
+                .map(OsString::from),
+        );
+        assert!(Cli::try_parse_from(args).is_err());
     }
 
     #[test]
@@ -1812,5 +2077,154 @@ mod tests {
         assert!(is_json(&["spice", "datasets", "--output", "json"]));
         assert!(is_json(&["spice", "pods", "--output", "json"]));
         assert!(is_json(&["spice", "status", "--output", "json"]));
+    }
+
+    /// `version` reserves stdout like any other JSON producer, which is what
+    /// sends a runtime it cannot resolve to stderr rather than into the
+    /// document being parsed.
+    #[test]
+    fn json_version_reserves_stdout() {
+        assert!(is_json(&["spice", "version", "--output", "json"]));
+        assert!(is_json(&["spice", "version", "-o", "json"]));
+
+        assert!(
+            !is_json(&["spice", "version"]),
+            "the table form still writes its report to stdout"
+        );
+    }
+
+    fn agent_args(command: &Commands) -> Vec<String> {
+        command
+            .coding_agent_args()
+            .expect("a coding agent command")
+            .args
+            .iter()
+            .map(|arg| arg.to_str().expect("UTF-8 argument").to_string())
+            .collect()
+    }
+
+    #[test]
+    fn every_argument_after_a_coding_agent_is_the_agents() {
+        // Spelled like the agent's options, like spice's own global options,
+        // and like the separator: all of them must reach the agent unchanged.
+        let cli = parse_normalized(&[
+            "spice",
+            "codex",
+            "--yolo",
+            "-v",
+            "--help",
+            "--http-endpoint",
+            "http://x",
+            "--cloud",
+            "--",
+            "-m",
+        ]);
+        assert_eq!(cli.verbose, 0, "-v after `codex` is Codex's");
+        assert_eq!(cli.http_endpoint, None);
+        assert!(!cli.cloud);
+
+        // First is where clap would claim them for spice: a global option, and
+        // the separator, before any argument it has read as the agent's.
+        let cli = parse_normalized(&["spice", "grok", "-v", "--resume"]);
+        assert_eq!(cli.verbose, 0, "-v right after `grok` is Grok's");
+        assert_eq!(agent_args(&cli.command), ["-v", "--resume"]);
+        let cli = parse_normalized(&["spice", "pi", "--", "--help"]);
+        assert_eq!(agent_args(&cli.command), ["--", "--help"]);
+        let cli = parse_normalized(&["spice", "claude", "--version"]);
+        assert_eq!(agent_args(&cli.command), ["--version"]);
+
+        let cli = parse_normalized(&[
+            "spice",
+            "codex",
+            "--yolo",
+            "-v",
+            "--help",
+            "--http-endpoint",
+            "http://x",
+            "--cloud",
+            "--",
+            "-m",
+        ]);
+        assert_eq!(
+            agent_args(&cli.command),
+            [
+                "--yolo",
+                "-v",
+                "--help",
+                "--http-endpoint",
+                "http://x",
+                "--cloud",
+                "--",
+                "-m"
+            ]
+        );
+    }
+
+    #[test]
+    fn options_before_a_coding_agent_are_spices() {
+        let cli = parse_normalized(&[
+            "spice",
+            "-v",
+            "--http-endpoint",
+            "http://127.0.0.1:9000",
+            "claude",
+            "--continue",
+        ]);
+        assert_eq!(cli.verbose, 1);
+        assert_eq!(cli.http_endpoint.as_deref(), Some("http://127.0.0.1:9000"));
+        assert_eq!(agent_args(&cli.command), ["--continue"]);
+    }
+
+    #[test]
+    fn every_coding_agent_is_a_command_named_after_its_cli() {
+        for (name, expected) in [
+            ("agy", coding_agent::Agent::Antigravity),
+            ("claude", coding_agent::Agent::ClaudeCode),
+            ("codex", coding_agent::Agent::Codex),
+            ("copilot", coding_agent::Agent::CopilotCli),
+            ("cursor", coding_agent::Agent::Cursor),
+            ("grok", coding_agent::Agent::Grok),
+            ("opencode", coding_agent::Agent::OpenCode),
+            ("pi", coding_agent::Agent::Pi),
+        ] {
+            assert_eq!(expected.command(), name);
+            let cli = parse_normalized(&["spice", name]);
+            assert!(
+                agent_args(&cli.command).is_empty(),
+                "`spice {name}` passes no arguments"
+            );
+        }
+        assert_eq!(
+            coding_agent::Agent::ALL.len(),
+            8,
+            "a new agent needs a row above"
+        );
+    }
+
+    /// `spice orca serve --port 6768` is `orca serve --port 6768`, options
+    /// spelled like spice's own included.
+    #[test]
+    fn every_argument_after_orca_is_orcas() {
+        let cli = parse_normalized(&["spice", "orca"]);
+        assert!(agent_args(&cli.command).is_empty());
+        let cli = parse_normalized(&[
+            "spice",
+            "--http-endpoint",
+            "http://127.0.0.1:9000",
+            "orca",
+            "serve",
+            "--port",
+            "6768",
+            "-v",
+            "--help",
+            "--api-key",
+            "x",
+        ]);
+        assert_eq!(cli.http_endpoint.as_deref(), Some("http://127.0.0.1:9000"));
+        assert_eq!(cli.verbose, 0, "-v after `orca` is Orca's");
+        assert_eq!(
+            agent_args(&cli.command),
+            ["serve", "--port", "6768", "-v", "--help", "--api-key", "x"]
+        );
     }
 }

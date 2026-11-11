@@ -1,0 +1,290 @@
+---
+name: spicescript dispatch
+
+# Runs this ref's spicescript and scripts against another run's Linux spiced, such as a
+# release branch's build_and_release. Scripts for features that build predates fail; triage by hand.
+
+run-name: spicescript dispatch - spiced from run ${{ inputs.run_id }}
+
+on:
+  workflow_dispatch:
+    inputs:
+      run_id:
+        description: 'Run whose Linux x86_64 spiced to test: E2E Test CI, build_release, build_and_release or build_nightly'
+        required: true
+        type: string
+      scripts:
+        description: 'Scripts or directories to run, space-separated'
+        required: false
+        type: string
+        default: 'test/spicescript'
+
+permissions:
+  actions: read
+  contents: read
+
+jobs:
+  resolve:
+    name: Find the build
+    runs-on: spiceai-dev-runners
+    environment: secret-free
+    timeout-minutes: 10
+    outputs:
+      spiced_artifact: ${{ steps.find.outputs.spiced_artifact }}
+      spice_artifact: ${{ steps.find.outputs.spice_artifact }}
+      sha: ${{ steps.find.outputs.sha }}
+      branch: ${{ steps.find.outputs.branch }}
+      workflow: ${{ steps.find.outputs.workflow }}
+    steps:
+      - name: Find the build's artifacts
+        id: find
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          RUN_ID: ${{ inputs.run_id }}
+        run: |
+          set -euo pipefail
+          [[ "$RUN_ID" =~ ^[0-9]+$ ]] || { echo "::error::run_id must be a numeric run ID, got '$RUN_ID'"; exit 1; }
+          names=$(gh api "repos/$GITHUB_REPOSITORY/actions/runs/$RUN_ID/artifacts?per_page=100" \
+            -q '.artifacts[] | select(.expired | not) | .name')
+          has() { grep -qx "$1" <<<"$names"; }
+          # An E2E Test CI run holds spice and spiced in one artifact; a release
+          # or nightly build holds each in its own tarball.
+          if has build_linux_x86_64; then
+            spiced=build_linux_x86_64; spice=build_linux_x86_64
+          elif has spiced_linux_x86_64; then
+            spiced=spiced_linux_x86_64
+            spice=$(has spice_linux_x86_64 && echo spice_linux_x86_64 || true)
+          else
+            echo "::error::Run $RUN_ID holds no unexpired build_linux_x86_64 or spiced_linux_x86_64 artifact"
+            exit 1
+          fi
+          read -r sha branch workflow < <(gh run view "$RUN_ID" -R "$GITHUB_REPOSITORY" \
+            --json headSha,headBranch,workflowName -q '"\(.headSha) \(.headBranch) \(.workflowName | gsub(" "; "_"))"')
+          echo "Testing spiced from run $RUN_ID ($workflow on $branch @ $sha), artifact $spiced, spice CLI ${spice:-none}"
+          {
+            echo "spiced_artifact=$spiced"
+            echo "spice_artifact=$spice"
+            echo "sha=$sha"
+            echo "branch=$branch"
+            echo "workflow=$workflow"
+          } >> "$GITHUB_OUTPUT"
+
+  build_spicescript:
+    environment: ci
+    name: Build spicescript
+    runs-on: spiceai-dev-runners
+    permissions:
+      contents: read
+      id-token: write  # RustFS credentials
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Get RustFS credentials
+        id: rustfs
+        uses: ./.github/actions/rustfs-credentials
+        with:
+          endpoint: ${{ vars.TEST_MINIO_ENDPOINT }}
+          duration-seconds: '1800'
+          export-env: 'false'
+
+      - name: Install MinIO
+        uses: ./.github/actions/setup-minio
+        with:
+          minio_endpoint: ${{ vars.TEST_MINIO_ENDPOINT }}
+          minio_access_key: ${{ steps.rustfs.outputs.access-key-id }}
+          minio_secret_key: ${{ steps.rustfs.outputs.secret-access-key }}
+          minio_session_token: ${{ steps.rustfs.outputs.session-token }}
+
+      - name: Build spicescript
+        uses: ./.github/actions/build-tool
+        with:
+          package: spicescript
+
+  test:
+    name: 'spicescript (${{ matrix.partition }})'
+    needs: [resolve, build_spicescript]
+    runs-on: spiceai-dev-runners
+    environment: ci
+    permissions:
+      actions: read     # download the other run's build
+      contents: read
+      id-token: write   # RustFS and Docker Hub credentials
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { partition: 1/4, shard: 1 }
+          - { partition: 2/4, shard: 2 }
+          - { partition: 3/4, shard: 3 }
+          - { partition: 4/4, shard: 4 }
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Download spiced and spice
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          RUN_ID: ${{ inputs.run_id }}
+          SPICED_ARTIFACT: ${{ needs.resolve.outputs.spiced_artifact }}
+          SPICE_ARTIFACT: ${{ needs.resolve.outputs.spice_artifact }}
+        run: |
+          set -euo pipefail
+          build="$RUNNER_TEMP/build"
+          gh run download "$RUN_ID" -R "$GITHUB_REPOSITORY" -n "$SPICED_ARTIFACT" -D "$build"
+          if [ -n "$SPICE_ARTIFACT" ] && [ "$SPICE_ARTIFACT" != "$SPICED_ARTIFACT" ]; then
+            gh run download "$RUN_ID" -R "$GITHUB_REPOSITORY" -n "$SPICE_ARTIFACT" -D "$build"
+          fi
+          cd "$build"
+          for t in *.tar.gz; do [ -e "$t" ] && tar xzf "$t"; done
+          chmod +x spiced
+          ./spiced --version
+          if [ -f spice ]; then
+            chmod +x spice
+            echo "SPICE_CLI=$build/spice" >> "$GITHUB_ENV"
+          else
+            echo "::warning::Run $RUN_ID has no spice CLI artifact, so scripts with spice steps fail"
+            echo "SPICE_CLI=spice" >> "$GITHUB_ENV"
+          fi
+          echo "SPICED=$build/spiced" >> "$GITHUB_ENV"
+
+      - name: Get RustFS credentials
+        id: rustfs
+        uses: ./.github/actions/rustfs-credentials
+        with:
+          endpoint: ${{ vars.TEST_MINIO_ENDPOINT }}
+          duration-seconds: '3600'
+          export-env: 'false'
+
+      - name: Install MinIO
+        uses: ./.github/actions/setup-minio
+        with:
+          minio_endpoint: ${{ vars.TEST_MINIO_ENDPOINT }}
+          minio_access_key: ${{ steps.rustfs.outputs.access-key-id }}
+          minio_secret_key: ${{ steps.rustfs.outputs.secret-access-key }}
+          minio_session_token: ${{ steps.rustfs.outputs.session-token }}
+
+      - name: Download spicescript
+        id: spicescript
+        uses: ./.github/actions/build-tool
+        with:
+          package: spicescript
+
+      # Scripts pull images as they start, so the login has to last the whole job.
+      - name: Login to DockerHub
+        if: github.repository == 'spiceai/spiceai'
+        uses: docker/login-action@81c6f93d4bc991e510b342a00b419b3bb4efc5c6 # v4.7.0
+        env:
+          DOCKERHUB_OIDC_CONNECTIONID: ${{ vars.DOCKERHUB_OIDC_CONNECTIONID }}
+          DOCKERHUB_OIDC_EXPIREIN: '21600'
+        with:
+          username: ${{ vars.DOCKERHUB_ORGANIZATION }}
+
+      - name: Install the AWS CLI
+        run: |
+          command -v unzip >/dev/null || { sudo apt-get update && sudo apt-get install -y unzip; }
+          if ! command -v aws >/dev/null; then
+            curl -fsSL -o "$RUNNER_TEMP/awscliv2.zip" https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip
+            unzip -q "$RUNNER_TEMP/awscliv2.zip" -d "$RUNNER_TEMP"
+            sudo "$RUNNER_TEMP/aws/install"
+          fi
+
+      - name: Install DuckDB CLI
+        run: |
+          curl -fsSL -o "$RUNNER_TEMP/duckdb.zip" \
+            https://github.com/duckdb/duckdb/releases/download/v1.5.5/duckdb_cli-linux-amd64.zip
+          unzip -o "$RUNNER_TEMP/duckdb.zip" -d "$RUNNER_TEMP/duckdb"
+          echo "$RUNNER_TEMP/duckdb" >> "$GITHUB_PATH"
+
+      - name: Authenticate the Hugging Face cache
+        uses: ./.github/actions/hf-cache-auth
+        with:
+          token: ${{ secrets.SPICE_SECRET_HF_TOKEN }}
+
+      # The token is for the releases API, which upgrade scripts use to fetch their `from:` release.
+      - name: Run scenario scripts
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          SCRIPTS: ${{ inputs.scripts }}
+        run: |
+          # shellcheck disable=SC2086 # SCRIPTS is a space-separated list
+          "${{ steps.spicescript.outputs.path }}" --jobs 4 \
+            --partition ${{ matrix.partition }} \
+            --spiced "$SPICED" \
+            --spice-cli "$SPICE_CLI" \
+            --work-dir "$RUNNER_TEMP/spicescript" \
+            --results "$RUNNER_TEMP/spicescript-results.json" \
+            --log-capture "$RUNNER_TEMP/spicescript-logs" \
+            $SCRIPTS
+
+      - name: Upload script results
+        if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
+        with:
+          name: spicescript-results-${{ matrix.shard }}
+          path: ${{ runner.temp }}/spicescript-results.json
+          if-no-files-found: warn
+          retention-days: 30
+
+      - name: Upload captured logs
+        if: failure()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
+        with:
+          name: spicescript-logs-${{ matrix.shard }}
+          path: ${{ runner.temp }}/spicescript-logs
+          if-no-files-found: warn
+          retention-days: 30
+
+  summary:
+    name: Summary
+    needs: [resolve, test]
+    if: ${{ !cancelled() && needs.resolve.result == 'success' }}
+    runs-on: spiceai-dev-runners
+    environment: secret-free
+    timeout-minutes: 10
+    steps:
+      - name: Download script results
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
+        with:
+          pattern: spicescript-results-*
+          path: ${{ runner.temp }}/results
+
+      - name: Write the summary
+        env:
+          RESULTS: ${{ runner.temp }}/results
+          RUN_ID: ${{ inputs.run_id }}
+          SHA: ${{ needs.resolve.outputs.sha }}
+          BRANCH: ${{ needs.resolve.outputs.branch }}
+          WORKFLOW: ${{ needs.resolve.outputs.workflow }}
+        run: |
+          python3 - <<'EOF' >> "$GITHUB_STEP_SUMMARY"
+          import json, os
+          # A shard that failed before writing its report has no file; count it unfinished.
+          scripts, unfinished = [], []
+          for shard in range(1, 5):
+              path = os.path.join(os.environ["RESULTS"], f"spicescript-results-{shard}", "spicescript-results.json")
+              if not os.path.exists(path):
+                  unfinished.append(shard)
+                  continue
+              with open(path) as f:
+                  data = json.load(f)
+              if not data["complete"]:
+                  unfinished.append(shard)
+              scripts += data["scripts"]
+          failed = sorted((s for s in scripts if s["outcome"] == "failed"), key=lambda s: s["name"])
+          run = f"{os.environ['GITHUB_SERVER_URL']}/{os.environ['GITHUB_REPOSITORY']}/actions/runs/{os.environ['RUN_ID']}"
+          print(f"### spicescript against [{os.environ['WORKFLOW']} run {os.environ['RUN_ID']}]({run})")
+          print(f"`{os.environ['BRANCH']}` @ `{os.environ['SHA'][:10]}`\n")
+          print(f"{len(scripts) - len(failed)} of {len(scripts)} scripts passed, {len(failed)} failed.")
+          if unfinished:
+              print(f"\n**{len(unfinished)} of 4 shards did not finish** (shard {', '.join(map(str, unfinished))}), so scripts are missing from this count.")
+          if failed:
+              print("\n| Script | Checks passed | First problem |\n|---|---|---|")
+              for s in failed:
+                  problem = (s["problems"] or ["(no problem recorded)"])[0].replace("|", "\\|").replace("\n", " ")[:300]
+                  print(f"| `{s['file']}` | {s['checks_passed']} | {problem} |")
+          EOF

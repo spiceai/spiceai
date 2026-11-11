@@ -165,11 +165,10 @@ pub fn parse_declared_type(input: &str) -> Result<DataType, ParseTypeError> {
 /// Reject a `DataType` whose decimal width Arrow cannot represent, at any
 /// nesting depth.
 ///
-/// `Field::new` and `Schema::new` accept `Decimal128(50, 2)`, and Arrow's own
-/// `DataType::from_str` builds one, so an over-wide decimal is admitted into a
-/// dataset's declared schema and only fails once a kernel tries to put data in
-/// it — at refresh or query time, with a message that names neither the dataset
-/// nor the column. The width is fully decidable while parsing the declaration,
+/// `Field::new` and `Schema::new` accept `Decimal128(50, 2)`, so an over-wide
+/// decimal is admitted into a dataset's declared schema and only fails once a
+/// kernel tries to put data in it — at refresh or query time, with a message
+/// that names neither the dataset nor the column. The width is fully decidable while parsing the declaration,
 /// so it is decided here.
 fn ensure_representable(input: &str, ty: &DataType) -> Result<(), ParseTypeError> {
     match ty {
@@ -518,6 +517,9 @@ fn leaf_lookup(s: &str) -> Result<DataType, ParseTypeError> {
     if let Some(dt) = parse_arrow_timestamp_display(s) {
         return Ok(dt);
     }
+    if let Some(dt) = parse_arrow_decimal_display(s) {
+        return Ok(dt);
+    }
     if let Ok(dt) = DataType::from_str(s) {
         return Ok(dt);
     }
@@ -554,6 +556,27 @@ fn parse_arrow_timestamp_display(s: &str) -> Option<DataType> {
         }
         "time32" => Some(DataType::Time32(parse_time_unit(args.trim())?)),
         "time64" => Some(DataType::Time64(parse_time_unit(args.trim())?)),
+        _ => None,
+    }
+}
+
+/// Parse Arrow's `Display` form for a decimal, `Decimal32/64/128/256(<precision>,
+/// <scale>)`, without checking the width against the type.
+///
+/// Arrow's `DataType::from_str` refuses a precision or scale its type cannot hold,
+/// and the refusal would reach the user as an unrecognised type. Built here
+/// unchecked, the declaration reaches `ensure_representable`, which says what is out
+/// of range and which decimal type can represent it.
+fn parse_arrow_decimal_display(s: &str) -> Option<DataType> {
+    let (head, args) = split_call(s.trim())?;
+    let (precision, scale) = args.split_once(',')?;
+    let precision = precision.trim().parse::<u8>().ok()?;
+    let scale = scale.trim().parse::<i8>().ok()?;
+    match head.trim() {
+        "Decimal32" => Some(DataType::Decimal32(precision, scale)),
+        "Decimal64" => Some(DataType::Decimal64(precision, scale)),
+        "Decimal128" => Some(DataType::Decimal128(precision, scale)),
+        "Decimal256" => Some(DataType::Decimal256(precision, scale)),
         _ => None,
     }
 }
@@ -1254,9 +1277,8 @@ mod tests {
         }
     }
 
-    /// Arrow's own `DataType::from_str` builds `Decimal128(50, 2)` without
-    /// complaint, so the Arrow display form needs the same range check as the
-    /// SQL form.
+    /// The Arrow display form gets the same range check, and the same
+    /// actionable reason, as the SQL form.
     #[test]
     fn arrow_display_decimal_out_of_range_is_rejected() {
         assert_eq!(parse("Decimal128(38, 2)"), DataType::Decimal128(38, 2));
@@ -1273,8 +1295,8 @@ mod tests {
         fail_out_of_range("Decimal128(0, 0)");
     }
 
-    /// `Decimal32` and `Decimal64` reach the same parser through the same
-    /// unbounded `u8`/`i8` conversion, at a much lower limit.
+    /// `Decimal32` and `Decimal64` reach the same range check, at a much lower
+    /// limit.
     #[test]
     fn narrow_arrow_decimals_are_range_checked_too() {
         assert_eq!(parse("Decimal32(9, 2)"), DataType::Decimal32(9, 2));

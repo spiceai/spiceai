@@ -1,0 +1,13 @@
+{
+  "tenant_id": "north",
+  "question": "shipping",
+  "evidence": [
+    {
+      "citation_id": "policy-3",
+      "article_id": 3,
+      "title": "Shipping delays",
+      "source_version": "fixture-2026-08",
+      "text": "Check the tracking number before opening a shipping delay ticket. Contact support after five business days."
+    }
+  ]
+}

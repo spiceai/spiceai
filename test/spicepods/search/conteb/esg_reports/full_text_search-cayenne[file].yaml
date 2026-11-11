@@ -1,0 +1,44 @@
+version: v1
+kind: Spicepod
+name: full_text_search-cayenne[file]
+
+metadata:
+  benchmark_dataset: conteb_esg_reports
+
+datasets:
+
+  # ConTEB esg-reports (`test` split), read straight from Hugging Face:
+  # https://huggingface.co/datasets/illuin-conteb/esg-reports
+
+  - from: https://huggingface.co/api/datasets/illuin-conteb/esg-reports/parquet/documents/test/0.parquet
+    name: corpus
+    params:
+      file_format: parquet
+    acceleration:
+      enabled: true
+      engine: cayenne
+      mode: file
+    columns:
+      - name: chunk
+        full_text_search:
+          enabled: true
+          row_id:
+            - chunk_id
+
+  - from: https://huggingface.co/api/datasets/illuin-conteb/esg-reports/parquet/queries/test/0.parquet
+    name: conteb_queries
+    params:
+      file_format: parquet
+    acceleration:
+      enabled: true
+
+views:
+  # Each query row lists all of its gold chunks in `chunk_ids`, so the query text is the id and
+  # every listed chunk is relevant.
+  - name: test_queries
+    sql: SELECT DISTINCT md5(query) AS _id, query AS text FROM conteb_queries
+
+  - name: relevance_data
+    sql: |
+      SELECT DISTINCT md5(query) AS "query-id", gold AS "corpus-id", 1 AS score
+      FROM (SELECT query, unnest(chunk_ids) AS gold FROM conteb_queries)

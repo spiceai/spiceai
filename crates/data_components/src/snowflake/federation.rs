@@ -14,10 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-//! Snowflake federation re-exports.
-//!
-//! The deny-list `SQLExecutor` wrapper started Snowflake-specific and was
-//! generalized for every `SqlTable`-backed connector; the shared
-//! implementation lives in [`crate::federation`].
+//! Snowflake federation re-exports. The implementation, shared by every
+//! `SqlTable`-backed connector, lives in [`crate::federation`].
 
-pub use crate::federation::{DenyFunctionsSqlExecutor, create_spice_federated_table_provider};
+pub use crate::federation::create_spice_federated_table_provider;

@@ -105,27 +105,33 @@ impl SqliteDatasetCheckpointer {
 
         conn.conn
             .call(move |conn| {
-                // Check if schema_json column exists
-                let columns: Vec<String> = conn
+                // Several datasets can share one database file, each migrating it over its
+                // own connection at the same time. `BEGIN IMMEDIATE` takes the write lock
+                // before the columns are read, so a second migrator waits (up to the busy
+                // timeout) and then sees the columns the first one added, instead of
+                // adding them again and failing with "duplicate column name".
+                let txn =
+                    conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+                let columns: Vec<String> = txn
                     .prepare(&format!("PRAGMA table_info({CHECKPOINT_TABLE_NAME})"))?
                     .query_map([], |row| row.get::<_, String>(1))?
                     .collect::<std::result::Result<Vec<_>, _>>()?;
 
                 if !columns.contains(&"schema_json".to_string()) {
-                    conn.execute(
+                    txn.execute(
                         &format!("ALTER TABLE {CHECKPOINT_TABLE_NAME} ADD COLUMN schema_json TEXT"),
                         [],
                     )?;
                 }
 
                 if !columns.contains(&"refresh_sql".to_string()) {
-                    conn.execute(
+                    txn.execute(
                         &format!("ALTER TABLE {CHECKPOINT_TABLE_NAME} ADD COLUMN refresh_sql TEXT"),
                         [],
                     )?;
                 }
 
-                Ok::<(), rusqlite::Error>(())
+                txn.commit()
             })
             .await
             .map_err(store_error)
@@ -206,6 +212,31 @@ impl SqliteDatasetCheckpointer {
                      SET schema_json = ?2, refresh_sql = ?3, updated_at = CURRENT_TIMESTAMP"
                 );
                 conn.execute(&upsert, rusqlite::params![&dataset_name, &schema_json, &refresh_sql_owned])?;
+
+                Ok::<(), rusqlite::Error>(())
+            })
+            .await
+            .map_err(store_error)
+    }
+
+    async fn set_schema_inner(&self, schema: &SchemaRef) -> Result<(), CheckpointError> {
+        let pool = &self.pool;
+        let dataset_name = self.dataset_name.clone();
+        let schema_json = serialize_schema(schema).map_err(store_error)?;
+
+        let conn_sync = pool.connect_sync();
+        let Some(conn) = conn_sync.as_any().downcast_ref::<SqliteConnection>() else {
+            return Err(downcast_failed());
+        };
+
+        conn.conn
+            .call(move |conn| {
+                // Not an upsert: an absent row must stay absent rather than gain a fresh
+                // `updated_at`, which is the deferral this exists to avoid.
+                let update = format!(
+                    "UPDATE {CHECKPOINT_TABLE_NAME} SET schema_json = ?2 WHERE dataset_name = ?1"
+                );
+                conn.execute(&update, rusqlite::params![&dataset_name, &schema_json])?;
 
                 Ok::<(), rusqlite::Error>(())
             })
@@ -325,6 +356,13 @@ impl DatasetCheckpointer for SqliteDatasetCheckpointer {
         &self,
     ) -> runtime_acceleration::dataset_checkpoint::Result<Option<String>> {
         self.get_refresh_sql_inner().await.map_err(Into::into)
+    }
+
+    async fn set_schema(
+        &self,
+        schema: &SchemaRef,
+    ) -> runtime_acceleration::dataset_checkpoint::Result<()> {
+        self.set_schema_inner(schema).await.map_err(Into::into)
     }
 
     async fn delete(&self) -> runtime_acceleration::dataset_checkpoint::Result<()> {
@@ -507,8 +545,15 @@ mod tests {
             .await
             .expect("Failed to create initial checkpoint");
 
-        // Sleep for a short time to ensure the timestamp changes
-        tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
+        // Age the row by a week, so the update below provably moves `updated_at`
+        // forward despite SQLite's one-second timestamp resolution, and so any
+        // rewrite of `created_at` shows.
+        backdate_both_timestamps_by_seven_days(&checkpoint).await;
+        let (created_before, updated_before) = stored_timestamps(&checkpoint).await;
+        assert_eq!(
+            created_before, updated_before,
+            "both timestamps were backdated to the same instant"
+        );
 
         // Create updated schema
         let schema2 = Schema::new(vec![
@@ -531,35 +576,16 @@ mod tests {
             .expect("Schema should exist");
         assert_eq!(&schema2, retrieved_schema.as_ref());
 
-        // Verify that the updated_at timestamp has changed
-        let conn_sync = checkpoint.pool.connect_sync();
-        let conn = conn_sync
-            .as_any()
-            .downcast_ref::<SqliteConnection>()
-            .expect("sqlite connection");
-        let result = conn.conn
-            .call(move |conn| {
-                let query = format!(
-                    "SELECT created_at, updated_at FROM {CHECKPOINT_TABLE_NAME} WHERE dataset_name = ?",
-                );
-                let mut stmt = conn.prepare(&query)?;
-                let mut rows = stmt.query([&checkpoint.dataset_name])?;
-
-                if let Some(row) = rows.next()? {
-                    let created_at: String = row.get(0)?;
-                    let updated_at: String = row.get(1)?;
-                    Ok((created_at, updated_at))
-                } else {
-                    Err(rusqlite::Error::QueryReturnedNoRows)
-                }
-            })
-            .await
-            .expect("Failed to fetch checkpoint data");
-
-        let (created_at, updated_at) = result;
-        assert_ne!(
-            created_at, updated_at,
-            "created_at and updated_at should be different"
+        // The update refreshes `updated_at` and leaves `created_at` as it was. Both
+        // are `YYYY-MM-DD HH:MM:SS` text, so string order is time order.
+        let (created_after, updated_after) = stored_timestamps(&checkpoint).await;
+        assert_eq!(
+            created_after, created_before,
+            "an update must not rewrite created_at"
+        );
+        assert!(
+            updated_after > updated_before,
+            "an update must move updated_at forward: {updated_before} -> {updated_after}"
         );
     }
 
@@ -648,15 +674,24 @@ mod tests {
             .expect("Failed to get checkpoint time")
             .expect("Checkpoint time should exist");
 
-        // Verify the checkpoint time is recent
+        // Verify the checkpoint time is recent. SQLite stamps it from the same wall
+        // clock at one-second resolution, so a few seconds is the tolerance.
         let now = SystemTime::now();
         let time_diff = now
             .duration_since(checkpoint_time)
             .expect("Time difference should be positive");
         assert!(time_diff.as_secs() < 5, "Checkpoint time should be recent");
 
-        // Sleep for a short time to ensure the timestamp changes
-        tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
+        // Backdate the recorded refresh by a week: the clock reports exactly that,
+        // and the next checkpoint must move it forward again, with no wait on
+        // SQLite's one-second timestamp resolution.
+        backdate_checkpoint_by_seven_days(&checkpoint).await;
+        let backdated = checkpoint
+            .last_checkpoint_time()
+            .await
+            .expect("Failed to get backdated checkpoint time")
+            .expect("Backdated checkpoint time should exist");
+        assert_a_week_apart(backdated, checkpoint_time);
 
         // Update the checkpoint
         checkpoint
@@ -671,10 +706,239 @@ mod tests {
             .expect("Failed to get new checkpoint time")
             .expect("New checkpoint time should exist");
 
-        // Verify the new checkpoint time is more recent than the old one
+        // The update stamps the current time over the backdated one.
+        assert_a_week_apart(backdated, new_checkpoint_time);
+    }
+
+    /// `later` is seven days after `earlier`, within the few seconds that
+    /// one-second timestamps and the statements between them account for.
+    fn assert_a_week_apart(earlier: SystemTime, later: SystemTime) {
+        const WEEK: std::time::Duration = std::time::Duration::from_hours(7 * 24);
+        let gap = later
+            .duration_since(earlier)
+            .expect("the later time is after the earlier one");
         assert!(
-            new_checkpoint_time > checkpoint_time,
-            "New checkpoint time should be more recent"
+            gap.abs_diff(WEEK) <= std::time::Duration::from_secs(5),
+            "expected the times a week apart, got {gap:?}"
         );
+    }
+
+    /// A schema repair must correct the recorded schema without telling the refresh
+    /// scheduler the data was just refreshed. Regression test for #13817.
+    #[tokio::test]
+    async fn set_schema_rewrites_the_schema_without_touching_the_freshness_clock() {
+        let checkpoint = create_in_memory_sqlite_checkpoint().await;
+
+        let original = std::sync::Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("name", DataType::Utf8, true),
+        ]));
+        // What a repair writes back: the same columns, `name` no longer nullable.
+        let repaired = std::sync::Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("name", DataType::Utf8, false),
+        ]));
+
+        checkpoint
+            .checkpoint(&original, Some("SELECT 1"))
+            .await
+            .expect("seed checkpoint");
+
+        backdate_checkpoint_by_seven_days(&checkpoint).await;
+
+        let before = checkpoint
+            .last_checkpoint_time()
+            .await
+            .expect("read checkpoint time")
+            .expect("checkpoint time present");
+
+        checkpoint
+            .set_schema(&repaired)
+            .await
+            .expect("schema-only write");
+
+        // Read back through a fresh checkpointer over the same store: acceptance is what
+        // the row holds, not what the call returned.
+        let reader = SqliteDatasetCheckpointer::new(
+            Arc::clone(&checkpoint.pool),
+            checkpoint.dataset_name.clone(),
+        );
+
+        let after = reader
+            .last_checkpoint_time()
+            .await
+            .expect("read checkpoint time")
+            .expect("checkpoint time present");
+        assert_eq!(
+            after, before,
+            "a schema-only write must leave the freshness clock alone"
+        );
+
+        assert_eq!(
+            reader
+                .get_schema()
+                .await
+                .expect("read schema")
+                .expect("schema present"),
+            repaired,
+            "the repaired schema must be the one stored"
+        );
+
+        assert_eq!(
+            reader.get_refresh_sql().await.expect("read refresh sql"),
+            Some("SELECT 1".to_string()),
+            "a schema-only write must preserve the stored refresh SQL"
+        );
+    }
+
+    /// A dataset with no checkpoint must not gain one — a row created here would carry a
+    /// fresh `updated_at`, which is the deferral the schema-only write exists to avoid.
+    #[tokio::test]
+    async fn set_schema_leaves_an_absent_checkpoint_absent() {
+        let checkpoint = create_in_memory_sqlite_checkpoint().await;
+
+        let schema =
+            std::sync::Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)]));
+
+        checkpoint
+            .set_schema(&schema)
+            .await
+            .expect("schema-only write on an absent checkpoint");
+
+        assert!(
+            !checkpoint.exists().await,
+            "a schema-only write must not create a checkpoint row"
+        );
+        assert!(
+            checkpoint
+                .last_checkpoint_time()
+                .await
+                .expect("read checkpoint time")
+                .is_none(),
+            "an absent checkpoint must not gain a freshness timestamp"
+        );
+    }
+
+    /// Backdates the checkpoint's recorded refresh by seven days, as a dataset
+    /// bootstrapping from a legacy snapshot would be.
+    async fn backdate_checkpoint_by_seven_days(checkpoint: &SqliteDatasetCheckpointer) {
+        let conn_sync = checkpoint.pool.connect_sync();
+        let conn = conn_sync
+            .as_any()
+            .downcast_ref::<SqliteConnection>()
+            .expect("sqlite connection");
+        conn.conn
+            .call(move |conn| {
+                conn.execute(
+                    &format!(
+                        "UPDATE {CHECKPOINT_TABLE_NAME} SET updated_at = datetime('now', '-7 days')"
+                    ),
+                    [],
+                )?;
+                Ok::<(), rusqlite::Error>(())
+            })
+            .await
+            .expect("backdate updated_at");
+    }
+
+    /// Backdates both of the checkpoint's timestamps by seven days, as a row first
+    /// written a week ago would read.
+    async fn backdate_both_timestamps_by_seven_days(checkpoint: &SqliteDatasetCheckpointer) {
+        let conn_sync = checkpoint.pool.connect_sync();
+        let conn = conn_sync
+            .as_any()
+            .downcast_ref::<SqliteConnection>()
+            .expect("sqlite connection");
+        conn.conn
+            .call(move |conn| {
+                // One statement, so both read the same 'now'.
+                conn.execute(
+                    &format!(
+                        "UPDATE {CHECKPOINT_TABLE_NAME} SET created_at = datetime('now', '-7 days'), updated_at = datetime('now', '-7 days')"
+                    ),
+                    [],
+                )?;
+                Ok::<(), rusqlite::Error>(())
+            })
+            .await
+            .expect("backdate created_at and updated_at");
+    }
+
+    /// The checkpoint row's `created_at` and `updated_at`, as `SQLite` stores them.
+    async fn stored_timestamps(checkpoint: &SqliteDatasetCheckpointer) -> (String, String) {
+        let dataset_name = checkpoint.dataset_name.clone();
+        let conn_sync = checkpoint.pool.connect_sync();
+        let conn = conn_sync
+            .as_any()
+            .downcast_ref::<SqliteConnection>()
+            .expect("sqlite connection");
+        conn.conn
+            .call(move |conn| {
+                let query = format!(
+                    "SELECT created_at, updated_at FROM {CHECKPOINT_TABLE_NAME} WHERE dataset_name = ?",
+                );
+                let mut stmt = conn.prepare(&query)?;
+                let mut rows = stmt.query([&dataset_name])?;
+
+                if let Some(row) = rows.next()? {
+                    let created_at: String = row.get(0)?;
+                    let updated_at: String = row.get(1)?;
+                    Ok((created_at, updated_at))
+                } else {
+                    Err(rusqlite::Error::QueryReturnedNoRows)
+                }
+            })
+            .await
+            .expect("read the checkpoint timestamps")
+    }
+
+    /// Datasets sharing one database file (Cayenne's metastore) each open the checkpoint
+    /// table over their own connection, and they do so concurrently when they bootstrap
+    /// from snapshots together. Every one of them must come up, not only the first to
+    /// add the migrated columns.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn concurrent_migrations_of_one_file_all_succeed() {
+        const CONNECTIONS: usize = 8;
+        const ROUNDS: usize = 20;
+
+        for round in 0..ROUNDS {
+            let dir = tempfile::tempdir().expect("create temp dir");
+            let path: Arc<str> = Arc::from(dir.path().join("cayenne.db").to_string_lossy());
+
+            let mut pools = Vec::with_capacity(CONNECTIONS);
+            for _ in 0..CONNECTIONS {
+                pools.push(Arc::new(
+                    SqliteConnectionPoolFactory::new(
+                        &path,
+                        Mode::File,
+                        std::time::Duration::from_secs(5),
+                    )
+                    .build()
+                    .await
+                    .expect("to build file sqlite connection pool"),
+                ));
+            }
+
+            let mut migrations = tokio::task::JoinSet::new();
+            for (i, pool) in pools.into_iter().enumerate() {
+                migrations.spawn(async move {
+                    SqliteDatasetCheckpointer::try_new(pool, format!("dataset_{i}"))
+                        .await
+                        .map(|_| ())
+                });
+            }
+            let failures = migrations
+                .join_all()
+                .await
+                .into_iter()
+                .filter_map(Result::err)
+                .map(|err| err.to_string())
+                .collect::<Vec<_>>();
+            assert!(
+                failures.is_empty(),
+                "round {round}: {} of {CONNECTIONS} concurrent checkpoint openings failed: {failures:?}",
+                failures.len()
+            );
+        }
     }
 }

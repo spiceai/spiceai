@@ -98,6 +98,10 @@ impl DataConnector for DeferredConnector {
         false
     }
 
+    fn supports_partitioned_changes(&self) -> bool {
+        false
+    }
+
     // Unlike the stream capabilities above, this is a static property of the
     // source the deferred dataset will eventually load from, not of the
     // placeholder — so it forwards, matching `resolve_refresh_mode`. Answering
@@ -105,6 +109,16 @@ impl DataConnector for DeferredConnector {
     // is perfectly safe.
     fn supports_durable_write_back_delivery(&self) -> bool {
         self.inner.supports_durable_write_back_delivery()
+    }
+
+    async fn write_back_deliverer(
+        &self,
+        context: &dyn ConnectorContext,
+        dataset: &DatasetSpec,
+    ) -> Option<
+        data_connector_api::DataConnectorResult<Arc<dyn data_connector_api::WriteBackDeliverer>>,
+    > {
+        self.inner.write_back_deliverer(context, dataset).await
     }
 
     async fn changes_stream(

@@ -17,8 +17,9 @@ limitations under the License.
 use data_connector_api::ConnectorComponent;
 
 use super::{GitHubTableArgs, GitHubTableGraphQLParams};
+use crate::identity::{identity_unnest, push_identity_fields};
 use arrow_schema::{DataType, Field, Schema, SchemaRef};
-use connector_graphql::graphql::{GraphQLContext, client::UnnestBehavior};
+use connector_graphql::graphql::GraphQLContext;
 use std::sync::Arc;
 
 // https://docs.github.com/en/graphql/reference/objects#repository
@@ -31,9 +32,7 @@ pub struct StargazersTableArgs {
 
 impl GraphQLContext for StargazersTableArgs {
     fn query_cost(&self) -> Option<u32> {
-        // stargazers(first: 100) is 1 point
-        // https://docs.github.com/en/graphql/overview/rate-limits-and-query-limits-for-the-graphql-api#primary-rate-limit
-        Some(1)
+        Some(crate::rate_limit::graphql_secondary_query_cost())
     }
 }
 
@@ -74,14 +73,14 @@ impl GitHubTableArgs for StargazersTableArgs {
         GitHubTableGraphQLParams::new(
             query.into(),
             None,
-            UnnestBehavior::Depth(1),
+            identity_unnest(1, self.owner.clone(), Some(self.repo.clone())),
             Some(gql_schema()),
         )
     }
 }
 
 fn gql_schema() -> SchemaRef {
-    Arc::new(Schema::new(vec![
+    let mut fields = vec![
         Field::new(
             "starred_at",
             DataType::Timestamp(arrow::datatypes::TimeUnit::Millisecond, None),
@@ -95,5 +94,9 @@ fn gql_schema() -> SchemaRef {
         Field::new("location", DataType::Utf8, true),
         Field::new("avatar_url", DataType::Utf8, true),
         Field::new("bio", DataType::Utf8, true),
-    ]))
+    ];
+
+    push_identity_fields(&mut fields, true);
+
+    Arc::new(Schema::new(fields))
 }

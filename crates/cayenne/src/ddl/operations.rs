@@ -26,24 +26,28 @@ use std::sync::Arc;
 
 use arrow::datatypes::Schema;
 use datafusion::catalog::SchemaProvider;
+use datafusion::common::TableReference;
 use datafusion::common::ToDFSchema;
 use datafusion::error::{DataFusionError, Result as DFResult};
 use datafusion::execution::runtime_env::RuntimeEnv;
 use datafusion::logical_expr::ExprSchemable;
 use datafusion::prelude::{Expr, SessionContext};
-use datafusion::sql::TableReference;
+use datafusion::sql::planner::IdentNormalizer;
+use datafusion::sql::sqlparser::ast::Expr as SqlExpr;
 use datafusion_table_providers::UnsupportedTypeAction;
 use datafusion_table_providers::util::column_reference::ColumnReference;
 use datafusion_table_providers::util::on_conflict::OnConflict;
 use runtime_table_partition::expression::PartitionedBy;
 use runtime_table_partition::provider::PartitionTableProvider;
 
+use crate::MetadataCatalog;
 use crate::catalog::CatalogError;
-use crate::catalog_provider::{CayenneCatalogProvider, CayenneSchemaProvider};
+use crate::catalog_provider::{
+    CayenneCatalogProvider, CayenneSchemaProvider, catalog_table_builder,
+};
 use crate::metadata::CreateTableOptions;
 use crate::partition_creator::CayennePartitionCreator;
 use crate::schema::transform_schema_for_vortex;
-use crate::{CayenneTableProviderBuilder, MetadataCatalog};
 
 // ── Output types ──────────────────────────────────────────────────────────────
 
@@ -78,12 +82,47 @@ pub struct CreateTableParams {
     /// Raw SQL text for the `PARTITION BY` expression.
     /// Parsed and validated at execution time inside [`CayenneCreateTableExec`].
     pub partition_expr_sql: Option<String>,
+    /// Hilbert-clustering columns from `CLUSTER BY`.
+    pub cluster_by: Vec<String>,
     /// If `true`, do not error when the table already exists.
     pub if_not_exists: bool,
     /// Source table for `CREATE TABLE … (LIKE …)`.
     pub like_source_table: Option<TableReference>,
     /// `SessionContext` used to parse the partition expression at execution time.
     pub ctx: Option<Arc<SessionContext>>,
+}
+
+/// Validate a Cayenne `CLUSTER BY` clause and return its column names,
+/// normalized by `normalizer` the way the statement's column definitions were.
+///
+/// A parenthesized column, `CLUSTER BY (id)`, parses as a nested expression and
+/// names that column.
+///
+/// # Errors
+///
+/// Returns a planning error when an expression is not a simple column
+/// identifier. Column existence and data-type support are validated against
+/// the transformed table schema during creation.
+pub fn cluster_by_column_names(
+    table_name: &str,
+    expressions: &[SqlExpr],
+    normalizer: &IdentNormalizer,
+) -> DFResult<Vec<String>> {
+    expressions
+        .iter()
+        .map(|expression| {
+            let mut column = expression;
+            while let SqlExpr::Nested(inner) = column {
+                column = inner;
+            }
+            match column {
+                SqlExpr::Identifier(identifier) => Ok(normalizer.normalize(identifier.clone())),
+                _ => Err(DataFusionError::Plan(format!(
+                    "Failed to create table '{table_name}' (cayenne): unsupported clustering expression '{expression}'. `CLUSTER BY` accepts column names only. See: https://spiceai.org/docs/components/data-accelerators/cayenne"
+                ))),
+            }
+        })
+        .collect()
 }
 
 // ── Operations ────────────────────────────────────────────────────────────────
@@ -105,17 +144,20 @@ pub async fn create_table(
 ) -> DFResult<CreateTableOutcome> {
     let metadata_catalog = Arc::clone(cayenne_provider.metadata_catalog());
     let data_base_path = cayenne_provider.data_base_path().to_string();
-    let vortex_config = cayenne_provider.vortex_config().clone();
+    let mut vortex_config = cayenne_provider.vortex_config().clone();
+    if !params.cluster_by.is_empty() {
+        vortex_config.cluster_by.clone_from(&params.cluster_by);
+    }
 
     let metadata_table_name = format!("{}/{}", params.schema_name, params.table_name);
 
     // ── Existence check ───────────────────────────────────────────────────────
-    let exists = match metadata_catalog.get_table(&metadata_table_name).await {
-        Ok(_) => true,
-        Err(CatalogError::TableNotFound { .. }) => false,
+    let existing = match metadata_catalog.get_table(&metadata_table_name).await {
+        Ok(metadata) => Some(metadata),
+        Err(CatalogError::TableNotFound { .. }) => None,
         Err(e) => return Err(DataFusionError::External(Box::new(e))),
     };
-    if exists {
+    if let Some(existing) = existing {
         if params.if_not_exists {
             // Re-register in the in-memory schema provider if absent (e.g. after restart).
             let schema_provider = ensure_schema_provider(
@@ -125,9 +167,11 @@ pub async fn create_table(
                 &runtime_env,
             )?;
             if !schema_provider.table_exist(&params.table_name) {
-                let builder = CayenneTableProviderBuilder::new(
-                    Arc::clone(&metadata_catalog),
-                    Arc::clone(&runtime_env),
+                let builder = catalog_table_builder(
+                    &metadata_catalog,
+                    &runtime_env,
+                    &metadata_table_name,
+                    &existing.vortex_config,
                 );
                 if let Ok(provider) = builder.open(&metadata_table_name).await {
                     let wrapped: Arc<dyn datafusion::catalog::TableProvider> = Arc::new(provider);
@@ -239,9 +283,11 @@ pub async fn create_table(
         )
         .await?
     } else {
-        let builder = CayenneTableProviderBuilder::new(
-            Arc::clone(&metadata_catalog),
-            Arc::clone(&runtime_env),
+        let builder = catalog_table_builder(
+            &metadata_catalog,
+            &runtime_env,
+            &metadata_table_name,
+            &vortex_config,
         );
         let provider = builder.open(&metadata_table_name).await.map_err(|e| {
             DataFusionError::Execution(format!(

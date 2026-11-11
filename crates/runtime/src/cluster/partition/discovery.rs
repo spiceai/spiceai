@@ -33,7 +33,7 @@ use datafusion::sql::sqlparser::{
     dialect::GenericDialect,
     parser::Parser,
 };
-use datafusion::{prelude::SessionContext, sql::TableReference};
+use datafusion::{common::TableReference, prelude::SessionContext};
 use snafu::prelude::*;
 use spicepod::partitioning::PartitionedBy;
 use util::session_state::builder_from_existing;
@@ -142,7 +142,7 @@ async fn execute_partition_discovery_query(
     // and PartitionsLoaded acks can't happen until discovery completes —
     // waiting for `Ready` would deadlock.
     if df.runtime_status().wait_for_dataset_registered(table).await
-        == crate::status::WaitOutcome::ShuttingDown
+        == runtime_status::WaitOutcome::ShuttingDown
     {
         return Err(Error::ShutdownBeforeTableRegistered {
             table: table_name.clone(),

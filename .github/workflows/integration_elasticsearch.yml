@@ -10,6 +10,9 @@ on:
       - 'crates/data_components/src/elasticsearch/**'
       - 'crates/data-connectors/connector-elasticsearch/**'
       - 'crates/search/src/index/elasticsearch/**'
+      - 'crates/search/tests/elasticsearch_full_refresh.rs'
+      - 'crates/search/tests/integration.rs'
+      - 'crates/search/Cargo.toml'
       - 'crates/runtime/src/embeddings/index/elasticsearch/**'
   merge_group:
     branches:
@@ -35,6 +38,7 @@ jobs:
   # merge_group can't path-filter, so gate the (container-spinning) test job on a
   # changed-files check instead of running Elasticsearch for every merge entry.
   changes:
+    environment: secret-free
     runs-on: ubuntu-latest
     # A full-history checkout (`fetch-depth: 0`) and a path diff. Sized for a
     # cold runner having to clone from scratch, not the ~1 min a warm
@@ -56,9 +60,13 @@ jobs:
               - 'crates/data_components/src/elasticsearch/**'
               - 'crates/data-connectors/connector-elasticsearch/**'
               - 'crates/search/src/index/elasticsearch/**'
+              - 'crates/search/tests/elasticsearch_full_refresh.rs'
+              - 'crates/search/tests/integration.rs'
+              - 'crates/search/Cargo.toml'
               - 'crates/runtime/src/embeddings/index/elasticsearch/**'
 
   test-elasticsearch:
+    environment: secret-free
     name: Elasticsearch Integration Tests
     needs: changes
     # Slowest observed success in the 2026-07-25..08-08 window: 15 min.
@@ -116,4 +124,10 @@ jobs:
         env:
           ELASTICSEARCH_URL: http://localhost:9200
         run: |
-          RUSTC_WRAPPER="" cargo test -p data_components --features elasticsearch --test elasticsearch_test -- --nocapture
+          RUSTC_WRAPPER="" cargo test -p data_components --features elasticsearch --test integration -- elasticsearch_test:: --nocapture
+
+      - name: Run elasticsearch search index tests
+        env:
+          ELASTICSEARCH_URL: http://localhost:9200
+        run: |
+          RUSTC_WRAPPER="" cargo test -p search --features elasticsearch --test integration -- elasticsearch_full_refresh:: --nocapture

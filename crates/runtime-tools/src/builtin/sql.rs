@@ -13,13 +13,11 @@ WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 See the License for the specific language governing permissions and
 limitations under the License.
 */
-use arrow::array::RecordBatch;
 use async_trait::async_trait;
 use std::{borrow::Cow, sync::Arc};
 
-use crate::builtin::function_tool::current_principal_requires_read_only;
-use crate::utils::{parameters, write_to_json_string};
-use futures::TryStreamExt;
+use crate::builtin::function_tool::current_principal_allows_write;
+use crate::utils::{MAX_TOOL_RESULT_BYTES, parameters, stream_to_json_string};
 use runtime_query_engine::allowlist::ResolvedTableAwareAllowlist;
 use runtime_query_engine::query_engine::{QueryEngine, QueryRequest};
 use schemars::JsonSchema;
@@ -86,16 +84,10 @@ impl SpiceModelTool for SqlTool {
         let tool_use_result: Result<Value, Box<dyn std::error::Error + Send + Sync>> = async {
             let SqlToolParams { query } = serde_json::from_str(arg)?;
 
-            // Defer the read-only gate to the calling principal. The strict
-            // read-only validator still fires for ReadOnly / anonymous
-            // callers (and for deployments that haven't configured
-            // `runtime.auth` at all, where `current_principal_requires_read_only`
-            // returns `false` only because there is no authenticated
-            // principal — but on the tools surface those requests are
-            // rejected upstream by `require_auth_configured`). ReadWrite
-            // callers fall through to the regular validator, which still
-            // checks per-table writability and `access: read_write`.
-            let read_only = current_principal_requires_read_only().await;
+            // Only a principal with write access may write; with no principal (no
+            // `runtime.auth`) the query is read-only. Writes still need the target
+            // to be writable (`access: read_write`).
+            let read_only = !current_principal_allows_write().await;
 
             let mut query_request = QueryRequest::new(&query).read_only(read_only);
 
@@ -103,15 +95,10 @@ impl SpiceModelTool for SqlTool {
                 query_request = query_request.allow_tables(allowlist.clone());
             }
 
-            let batches = self
-                .df
-                .execute_query(query_request)
-                .await?
-                .try_collect::<Vec<RecordBatch>>()
-                .await
-                .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> { Box::new(e) })?;
-
-            Ok(Value::String(write_to_json_string(&batches)?))
+            let stream = self.df.execute_query(query_request).await?;
+            Ok(Value::String(
+                stream_to_json_string(stream, MAX_TOOL_RESULT_BYTES).await?,
+            ))
         }
         .instrument(span.clone())
         .await;

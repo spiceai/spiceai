@@ -23,5 +23,7 @@ pub mod rule;
 
 #[cfg(test)]
 mod chbench_tests;
+#[cfg(test)]
+mod null_aware_tests;
 
 pub use rule::ReorderJoinRule;

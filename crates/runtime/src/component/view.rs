@@ -15,26 +15,44 @@ limitations under the License.
 */
 
 use app::App;
-use datafusion::sql::TableReference;
-use snafu::prelude::*;
-use spicepod::{component::view as spicepod_view, vector::VectorStore};
+use datafusion::common::TableReference;
 use std::ops::{Deref, DerefMut};
-use std::{collections::HashMap, fs, sync::Arc};
+use std::sync::Arc;
 
 use crate::{Runtime, dataaccelerator::AccelerationSource};
 
-use super::{
-    dataset::{
-        Dataset, ReadyState,
-        acceleration::{self, Acceleration},
-    },
-    validate_identifier,
-};
-use spicepod::semantic::Column;
+use super::dataset::acceleration::{self, Acceleration};
 
-// Config-only spec lives in `runtime-component`; re-export for path
-// compatibility (`crate::component::view::ViewSpec`).
-pub use runtime_component::view::ViewSpec;
+// Config-only spec and its builder live in `runtime-component`; re-export for
+// path compatibility (`crate::component::view::{ViewBuilder, ViewSpec}`).
+pub use runtime_component::view::{Error, ViewBuilder, ViewSpec};
+
+impl From<Error> for crate::Error {
+    /// Maps each view parse error to the runtime error that reported it before the
+    /// builder moved, so the user-facing messages do not change.
+    fn from(err: Error) -> Self {
+        match err {
+            Error::InvalidViewName { source } => crate::Error::ComponentError { source },
+            Error::ViewNameIncludesCatalog { catalog, name } => {
+                crate::Error::DatasetNameIncludesCatalog { catalog, name }
+            }
+            Error::UnableToLoadSqlFile { file, source } => {
+                crate::Error::UnableToLoadSqlFile { file, source }
+            }
+            Error::NeedToSpecifySQLView { name } => crate::Error::NeedToSpecifySQLView { name },
+            Error::InvalidAccelerationConfiguration { source } => source.into(),
+            Error::VectorEngineRemoved { view_name } => {
+                crate::Error::ViewVectorEngineRemoved { view_name }
+            }
+            Error::AccelerationEngineRemoved { view_name, engine } => {
+                crate::Error::AcceleratedViewEngineRemoved { view_name, engine }
+            }
+            Error::AcceleratedViewInvalidConfiguration { view_name, reason } => {
+                crate::Error::AcceleratedViewInvalidConfiguration { view_name, reason }
+            }
+        }
+    }
+}
 
 /// `Arc<Runtime>`-bound wrapper over a [`ViewSpec`]. Derefs to the spec so
 /// `view.acceleration`, `view.columns`, `view.is_accelerated()`, etc. keep
@@ -82,11 +100,10 @@ impl std::fmt::Debug for View {
 }
 
 impl View {
-    #[expect(clippy::result_large_err)]
-    fn load_sql_ref(sql_ref: &str) -> crate::Result<String> {
-        let sql = fs::read_to_string(sql_ref)
-            .context(crate::UnableToLoadSqlFileSnafu { file: sql_ref })?;
-        Ok(sql)
+    /// Attaches the runtime handles to a parsed [`ViewSpec`].
+    #[must_use]
+    pub fn new(spec: ViewSpec, runtime: Arc<Runtime>, app: Arc<App>) -> Self {
+        Self { spec, runtime, app }
     }
 
     #[must_use]
@@ -106,77 +123,32 @@ impl View {
 
         false
     }
-}
 
-pub struct ViewBuilder {
-    pub name: TableReference,
-    pub sql: String,
-    pub metadata: HashMap<String, String>,
-    pub columns: Vec<Column>,
-    pub acceleration: Option<acceleration::Acceleration>,
-    pub ready_state: ReadyState,
-    pub vectors: Option<VectorStore>,
-    pub params: HashMap<String, String>,
-}
-
-impl TryFrom<spicepod_view::View> for ViewBuilder {
-    type Error = crate::Error;
-
-    fn try_from(view: spicepod_view::View) -> Result<Self, Self::Error> {
-        validate_identifier(&view.name).context(crate::ComponentSnafu)?;
-
-        let table_reference = Dataset::parse_table_reference(&view.name)?;
-
-        let sql = if let Some(view_sql) = &view.sql {
-            view_sql.clone()
-        } else if let Some(sql_ref) = &view.sql_ref {
-            View::load_sql_ref(sql_ref)?
-        } else {
-            return Err(crate::Error::NeedToSpecifySQLView {
-                name: table_reference.to_string(),
-            });
-        };
-
-        let metadata = view.metadata();
-
-        let acceleration = view
-            .acceleration
-            .map(acceleration::Acceleration::try_from)
-            .transpose()?;
-
-        // verify that the acceleration configuration is fully supported
-        if let Some(acc) = &acceleration {
-            if acc.refresh_mode.is_some()
-                && acc.refresh_mode != Some(acceleration::RefreshMode::Full)
-            {
-                return Err(crate::Error::AcceleratedViewInvalidConfiguration {
-                    view_name: view.name,
-                    reason: "Only 'refresh_mode: full' is supported".to_string(),
-                });
-            }
-
-            if acc.refresh_sql.is_some() {
-                return Err(crate::Error::AcceleratedViewInvalidConfiguration {
-                    view_name: view.name,
-                    reason: "'refresh_sql' is not supported".to_string(),
-                });
-            }
+    /// The schema this view's acceleration was checkpointed with, when the view can
+    /// be served from that acceleration before the tables it reads have loaded, as an
+    /// accelerated dataset is served before its source answers.
+    ///
+    /// Only `mode: file` qualifies (`file_create` starts empty by design), and not a
+    /// view with embedding or full-text search columns, whose indexes wrap the view's
+    /// own plan. A checkpoint that does not record the acceleration's primary key
+    /// (written by an earlier version) does not count either.
+    pub(crate) async fn existing_acceleration_schema(&self) -> Option<arrow_schema::SchemaRef> {
+        let acceleration = self.acceleration.as_ref().filter(|a| a.enabled)?;
+        if !matches!(acceleration.mode, acceleration::Mode::File)
+            || self.has_embeddings()
+            || self.has_full_text_column()
+        {
+            return None;
         }
-
-        Ok(ViewBuilder {
-            name: table_reference,
-            sql,
-            metadata,
-            columns: view.columns,
-            acceleration,
-            ready_state: ReadyState::from(view.ready_state),
-            vectors: view.vectors,
-            params: view
-                .params
-                .as_ref()
-                .map(spicepod::param::Params::as_string_map)
-                .unwrap_or_default(),
-        })
+        let schema = crate::dataconnector::sink::recorded_acceleration_checkpoint_schema(
+            self,
+            self.runtime.accelerator_engine_registry(),
+        )
+        .await?;
+        runtime_table::accelerated::checkpoint_primary_key::records_acceleration_primary_key(
+            &schema,
+        )
+        .then_some(schema)
     }
 }
 
@@ -205,6 +177,12 @@ impl AccelerationSource for View {
 
     fn secrets(&self) -> Arc<tokio::sync::RwLock<crate::secrets::Secrets>> {
         self.runtime.secrets()
+    }
+
+    fn snapshot_notifications(
+        &self,
+    ) -> Option<Arc<runtime_acceleration::snapshot::notifications::SnapshotNotifications>> {
+        self.runtime.datafusion().snapshot_notifications()
     }
 
     fn acceleration(&self) -> Option<&Acceleration> {
@@ -263,18 +241,6 @@ impl AccelerationSource for View {
                     .into_iter()
                     .map(|ds| ds as Arc<dyn runtime_acceleration::AccelerationSource>)
                     .collect();
-            #[cfg(feature = "duckdb")]
-            {
-                let views: Vec<Arc<dyn runtime_acceleration::AccelerationSource>> =
-                    Arc::clone(&runtime)
-                        .get_initialized_views(&app, crate::LogErrors(false))
-                        .await
-                        .into_iter()
-                        .map(|v| v as Arc<dyn runtime_acceleration::AccelerationSource>)
-                        .collect();
-                datasets.into_iter().chain(views).collect()
-            }
-            #[cfg(not(feature = "duckdb"))]
             datasets
         })
     }
@@ -291,36 +257,60 @@ impl AccelerationSource for View {
     }
 }
 
-impl ViewBuilder {
-    #[must_use]
-    pub fn new(name: TableReference, sql: String) -> Self {
-        Self {
-            name,
-            sql,
-            metadata: HashMap::default(),
-            columns: vec![],
-            acceleration: None,
-            ready_state: ReadyState::default(),
-            vectors: None,
-            params: HashMap::default(),
-        }
+#[cfg(test)]
+mod tests {
+    use super::ViewBuilder;
+    use crate::component::{AcceleratedComponent, deprecated_ready_state_warning};
+    use spicepod::component::view as spicepod_view;
+
+    /// A view that still selects the removed `duckdb` vector engine fails to load with the
+    /// line the runtime logs for it, naming the view and the Cayenne fix.
+    #[test]
+    fn a_view_selecting_the_duckdb_vector_engine_fails_to_load() {
+        let view: spicepod_view::View = yaml::from_str(
+            "name: daily_docs\nsql: SELECT 1\nvectors:\n  enabled: true\n  engine: duckdb\n",
+        )
+        .expect("yaml parses");
+
+        let Err(err) = ViewBuilder::try_from(view) else {
+            panic!("a view selecting the duckdb vector engine must fail to load");
+        };
+        let err = crate::Error::from(err);
+        assert!(
+            matches!(err, crate::Error::ViewVectorEngineRemoved { .. }),
+            "unexpected error: {err}"
+        );
+        insta::assert_snapshot!("view_duckdb_vector_engine_removed", err.to_string());
     }
 
-    #[must_use]
-    pub fn build_with(self, runtime: Arc<Runtime>, app: Arc<App>) -> View {
-        View {
-            spec: ViewSpec {
-                name: self.name,
-                sql: Arc::from(self.sql),
-                metadata: self.metadata,
-                columns: self.columns,
-                acceleration: self.acceleration,
-                ready_state: self.ready_state,
-                vectors: self.vectors,
-                params: self.params,
-            },
-            runtime,
-            app,
-        }
+    /// The wording itself is asserted beside the shared builder in `component::tests`. What is
+    /// specific to the view — and what makes that escaping load-bearing rather than decorative — is
+    /// that a name carrying a newline gets through `ViewBuilder::try_from` at all: a *quoted*
+    /// identifier may legally contain a newline, and `validate_identifier` accepts one, so a name
+    /// that passes validation could otherwise break the line in two and forge a second record.
+    /// `disabled_acceleration_warning` escapes for exactly this reason.
+    #[test]
+    fn a_view_name_carrying_a_newline_cannot_forge_a_second_log_line() {
+        let hostile = "\"api\nWARN forged\"";
+
+        // The escaping only matters if such a name reaches the warning at all, so assert that
+        // the builder accepts it rather than assuming it does.
+        let view: spicepod_view::View =
+            yaml::from_str(&format!("name: {hostile:?}\nsql: SELECT 1\n")).expect("yaml parses");
+        assert!(
+            ViewBuilder::try_from(view).is_ok(),
+            "a quoted identifier containing a newline is accepted by the builder, which is what \
+             makes escaping load-bearing rather than decorative"
+        );
+
+        let message = deprecated_ready_state_warning(AcceleratedComponent::View, hostile);
+        assert!(
+            !message.contains('\n'),
+            "an embedded newline must not survive into the log line: {message:?}"
+        );
+        assert!(
+            message.contains("WARN forged"),
+            "the name is still reported in full, only escaped: {message:?}"
+        );
     }
 }

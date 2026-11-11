@@ -31,14 +31,27 @@ use tokio_util::sync::CancellationToken;
 
 use crate::{Runtime, config};
 use runtime_search::search_engine::SearchEngine;
-use runtime_search::search_engine::parse_explicit_primary_keys;
 use runtime_tls::TlsConfig;
 
 #[cfg(feature = "openapi")]
 pub use routes::get_api_doc;
+#[cfg(test)]
+#[cfg(feature = "models")]
+mod gemini_tests;
+#[cfg(feature = "mcp")]
+mod mcp_transport;
+#[cfg(test)]
+#[cfg(feature = "models")]
+mod messages_tests;
+#[cfg(test)]
+#[cfg(feature = "models")]
+mod model_capability_tests;
 mod mtls;
 mod response_outcome;
 mod routes;
+mod server_timing;
+#[cfg(test)]
+mod write_access_tests;
 
 pub mod v1;
 
@@ -126,7 +139,7 @@ where
     let vsearch = Arc::new(
         SearchEngine::new(
             Arc::clone(&rt.df) as Arc<dyn runtime_query_engine::query_engine::QueryEngine>,
-            parse_explicit_primary_keys(Arc::clone(&rt.app)).await,
+            rt.search_primary_keys.clone(),
             crate::search::util::RuntimeTableProviderExplorer,
         )
         .with_search_cache(rt.df.search_cache_provider()),
@@ -136,11 +149,12 @@ where
         Some(app) => Cow::Borrowed(&app.runtime.cors),
         None => Cow::Owned(CorsConfig::default()),
     };
-    // Resolve effective MCP config following the same pattern as builder.rs (L208-212):
+    // Resolve effective MCP config following the same pattern as builder.rs:
     // Config.runtime, if present, replaces the whole runtime — read .mcp from that.
-    // Otherwise fall back to the app's runtime .mcp. This mirrors how all other runtime
-    // fields are resolved: one effective SpicepodRuntime is chosen, then fields are read
-    // from it, rather than merging individual fields from both sources.
+    // Otherwise fall back to the app's runtime .mcp. MCP Origin CORS is resolved
+    // from the same override in `routes::mcp_origin_cors` so hosts and origins
+    // cannot diverge. HTTP CORS stays on the app spicepod (a cache-only
+    // Config.runtime override must not disable browser CORS).
     #[cfg(feature = "mcp")]
     let mcp_config: Option<spicepod::component::runtime::McpConfig> =
         config.runtime.as_ref().map_or_else(
@@ -221,6 +235,26 @@ where
     Ok(())
 }
 
+/// Disables Nagle's algorithm on an accepted connection.
+///
+/// hyper emits a response as several small writes (head, then body or chunk
+/// frames). With Nagle enabled, every write after the first is held until the
+/// client acknowledges the previous one, and a client in delayed-ACK mode
+/// withholds that acknowledgement for tens of milliseconds — so a small query
+/// result lands ~40ms after the query finished, while a large one that fills a
+/// full segment arrives immediately. The Flight server gets the same treatment
+/// from tonic's transport defaults.
+///
+/// Failing to set the option costs latency but not correctness, so the
+/// connection is still served.
+fn set_tcp_nodelay(stream: &TcpStream) {
+    if let Err(e) = stream.set_nodelay(true) {
+        tracing::debug!(
+            "Unable to disable Nagle's algorithm on an HTTP connection, so small responses on it may be delayed by tens of milliseconds: {e}"
+        );
+    }
+}
+
 fn process_tls_tcp_stream(
     stream: TcpStream,
     acceptor: TlsAcceptor,
@@ -229,6 +263,7 @@ fn process_tls_tcp_stream(
     client_auth: runtime_tls::ClientAuthEnforcement,
     on_shutdown: Receiver<()>,
 ) {
+    set_tcp_nodelay(&stream);
     tokio::spawn(async move {
         match acceptor.accept(stream).await {
             Ok(tls_stream) => {
@@ -255,6 +290,7 @@ fn process_tls_tcp_stream(
 }
 
 fn process_tcp_stream(stream: TcpStream, routes: Router, on_shutdown: Receiver<()>) {
+    set_tcp_nodelay(&stream);
     tokio::spawn({
         let conn = serve_connection(stream, routes);
         async move { handle_connection(conn, on_shutdown).await }
@@ -318,11 +354,7 @@ mod tests {
     use futures::future;
     use http::StatusCode;
     use std::time::Duration;
-    use tokio::{
-        net::TcpListener,
-        sync::watch,
-        time::{sleep, timeout},
-    };
+    use tokio::{net::TcpListener, sync::watch, time::timeout};
 
     // Router that immediately responds with "ok"
     fn ok_router() -> Router {
@@ -365,8 +397,16 @@ mod tests {
         assert_eq!(resp.status(), StatusCode::OK);
 
         drop(client);
-        // Add extra delay to ensure enough time for the connection to be closed
-        sleep(Duration::from_millis(500)).await;
+        // The connection task holds a shutdown receiver for as long as the
+        // connection is open, so `closed()` resolves exactly when it has ended.
+        timeout(Duration::from_secs(2), shutdown_notify.closed())
+            .await
+            .unwrap_or_else(|_| {
+                panic!(
+                    "the connection should close once the client is dropped; {} connection(s) still open",
+                    shutdown_notify.receiver_count()
+                )
+            });
 
         assert_eq!(
             shutdown_notify.receiver_count(),
@@ -419,6 +459,59 @@ mod tests {
         timeout(Duration::from_secs(1), shutdown_notify.closed())
             .await
             .expect("should complete shutdown notification");
+    }
+
+    /// A small `/v1/sql` result leaves the server as several short writes (the
+    /// head, a chunk per record batch, the chunked terminator). With Nagle's
+    /// algorithm enabled, every write after the first waits for the client to
+    /// acknowledge the previous one, and a client in delayed-ACK mode withholds
+    /// that acknowledgement for tens of milliseconds.
+    ///
+    /// regression test for #13867
+    #[tokio::test]
+    async fn test_process_tcp_stream_disables_nagle() {
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("to create listener");
+        let addr = listener.local_addr().expect("to get local addr");
+        let (_shutdown_notify, shutdown_rx) = watch::channel(());
+
+        let accepted = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.expect("to accept connection");
+            // Duplicate the accepted socket, so its options stay readable after
+            // the connection itself is handed to the server. Both refer to the
+            // same socket, so they report the same option values.
+            let stream = stream.into_std().expect("to unwrap accepted stream");
+            let observer = stream.try_clone().expect("to duplicate accepted stream");
+            assert!(
+                !observer
+                    .nodelay()
+                    .expect("to read the accepted socket options"),
+                "a freshly accepted connection must still have Nagle's algorithm enabled, otherwise this test cannot tell whether the server disables it"
+            );
+            let stream = TcpStream::from_std(stream).expect("to rewrap accepted stream");
+
+            process_tcp_stream(stream, ok_router(), shutdown_rx);
+            observer
+        });
+
+        let client = build_test_http_client();
+        let resp = timeout(
+            Duration::from_secs(2),
+            client.get(format!("http://{addr}/")).send(),
+        )
+        .await
+        .expect("to complete request before timeout")
+        .expect("to get response");
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let observer = accepted.await.expect("to finish accepting the connection");
+        assert!(
+            observer
+                .nodelay()
+                .expect("to read the accepted socket options"),
+            "the server must disable Nagle's algorithm on connections it accepts"
+        );
     }
 
     fn build_test_http_client() -> reqwest::Client {

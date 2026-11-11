@@ -27,23 +27,38 @@ use std::sync::Arc;
 /// to immediately wrap the returned `String` before doing anything else,
 /// which is exactly the kind of implicit contract secret-handling APIs
 /// should avoid.
+///
+/// `Ok(None)` means the scheduler has no value it will share for `key`;
+/// `Err` is reserved for failures to get an answer at all.
 #[async_trait]
 pub trait ClusterSecretExpander: Send + Sync {
-    async fn expand_secret(&self, executor_id: &str, key: &str) -> Result<SecretString, String>;
+    async fn expand_secret(
+        &self,
+        executor_id: &str,
+        store: &str,
+        key: &str,
+    ) -> Result<Option<SecretString>, String>;
 }
 
 /// Used by cluster mode to resolve secrets declared in the scheduler
-/// via the internal cluster gRPC service.
+/// via the internal cluster gRPC service. Each instance stands for one store
+/// of the scheduler, which it names in every request.
 pub struct SchedulerRPCSecretStore {
     executor_id: String,
+    store: String,
     expander: Arc<dyn ClusterSecretExpander>,
 }
 
 impl SchedulerRPCSecretStore {
     #[must_use]
-    pub fn new(expander: Arc<dyn ClusterSecretExpander>, executor_id: String) -> Self {
+    pub fn new(
+        expander: Arc<dyn ClusterSecretExpander>,
+        executor_id: String,
+        store: String,
+    ) -> Self {
         Self {
             executor_id,
+            store,
             expander,
         }
     }
@@ -52,14 +67,15 @@ impl SchedulerRPCSecretStore {
 #[async_trait]
 impl SecretStore for SchedulerRPCSecretStore {
     async fn get_secret(&self, key: &str) -> AnyErrorResult<Option<SecretString>> {
-        tracing::trace!("SchedulerRPCSecretStore: Requesting secret {}", key);
+        tracing::trace!(
+            "SchedulerRPCSecretStore: Requesting secret {} from store {}",
+            key,
+            self.store
+        );
 
-        let value = self
-            .expander
-            .expand_secret(&self.executor_id, key)
+        self.expander
+            .expand_secret(&self.executor_id, &self.store, key)
             .await
-            .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> { e.into() })?;
-
-        Ok(Some(value))
+            .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> { e.into() })
     }
 }

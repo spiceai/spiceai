@@ -17,8 +17,9 @@ limitations under the License.
 use data_connector_api::ConnectorComponent;
 
 use super::{GitHubTableArgs, GitHubTableGraphQLParams};
+use crate::identity::{identity_unnest, push_identity_fields};
 use arrow_schema::{DataType, Field, Schema, SchemaRef};
-use connector_graphql::graphql::{ErrorChecker, GraphQLContext, client::UnnestBehavior};
+use connector_graphql::graphql::{ErrorChecker, GraphQLContext, RefusalKind};
 use http::{HeaderMap, HeaderValue};
 use serde_json::Value;
 use std::sync::Arc;
@@ -59,8 +60,10 @@ impl GraphQLContext for ProjectsTableArgs {
 
                 // GitHub bug: When the app doesn't have access to Projects v2, GitHub sometimes
                 // returns "Something went wrong while executing your query" instead of a proper
-                // permission error. This appears to be a GitHub API bug where lack of permissions
-                // triggers an internal error rather than returning a proper authorization error.
+                // permission error. GitHub sends the same message when its backend times out, so
+                // the cause is not certain from the message. The error is reported as an inferred
+                // refusal (`RefusalKind::Inferred`) and is retried: a few retries on a real
+                // permission failure cost less than a permanent failure on a transient timeout.
                 if let Some(errors) = response.get("errors") {
                     tracing::debug!(
                         "GitHub projects query for {target} returned errors: {:?}",
@@ -72,11 +75,12 @@ impl GraphQLContext for ProjectsTableArgs {
                                 && message
                                     .contains("Something went wrong while executing your query")
                             {
-                                tracing::error!(
-                                    "GitHub returned a misleading projects error for {target}; treating it as a permissions failure"
+                                tracing::warn!(
+                                    "GitHub returned an internal query error for {target}; retrying"
                                 );
                                 return Err(connector_graphql::graphql::Error::InvalidCredentialsOrPermissions {
-                                message: format!("Failed to access {target_kind} for {target}: GitHub reported an internal query error, which usually means the GitHub App lacks project read permissions. Verify the app has the required project access."),
+                                message: format!("Failed to access {target_kind} for {target}: GitHub reported an internal query error. This is either a transient GitHub backend failure or a GitHub App that lacks project read permissions. If the error persists, verify the app has the required project access."),
+                                kind: RefusalKind::Inferred,
                             });
                             }
                         }
@@ -89,8 +93,7 @@ impl GraphQLContext for ProjectsTableArgs {
     }
 
     fn query_cost(&self) -> Option<u32> {
-        // https://docs.github.com/en/graphql/overview/rate-limits-and-query-limits-for-the-graphql-api#secondary-rate-limits
-        Some(1)
+        Some(crate::rate_limit::graphql_secondary_query_cost())
     }
 }
 
@@ -200,14 +203,14 @@ impl GitHubTableArgs for ProjectsTableArgs {
         GitHubTableGraphQLParams::new(
             query.into(),
             None,
-            UnnestBehavior::Depth(2),
-            Some(gql_schema()),
+            identity_unnest(2, self.owner.clone(), self.repo.clone()),
+            Some(gql_schema(self.repo.is_some())),
         )
     }
 }
 
-fn gql_schema() -> SchemaRef {
-    Arc::new(Schema::new(vec![
+fn gql_schema(repo_scoped: bool) -> SchemaRef {
+    let mut fields = vec![
         Field::new("id", DataType::Utf8, true),
         Field::new("number", DataType::Int64, true),
         Field::new("title", DataType::Utf8, true),
@@ -232,36 +235,36 @@ fn gql_schema() -> SchemaRef {
             true,
         ),
         Field::new("creator", DataType::Utf8, true),
-    ]))
+    ];
+
+    // A repository-scoped projects dataset carries `repo`; an organization-scoped
+    // one carries only `owner`.
+    push_identity_fields(&mut fields, repo_scoped);
+
+    Arc::new(Schema::new(fields))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use app::AppBuilder;
-    use runtime::builder::RuntimeBuilder;
-    use runtime::component::dataset::builder::DatasetBuilder;
-
-    fn create_mock_component(name: &str) -> ConnectorComponent {
-        let app = AppBuilder::new("test").build();
-        let runtime = tokio::runtime::Runtime::new().expect("to create tokio runtime");
-        let spice_runtime = runtime.block_on(async { RuntimeBuilder::new().build().await });
-
-        let dataset = DatasetBuilder::try_new("github".to_string(), name)
-            .expect("to create dataset builder")
-            .with_app(Arc::new(app))
-            .with_runtime(Arc::new(spice_runtime))
-            .build()
-            .expect("to create dataset");
-        ConnectorComponent::from(&dataset)
-    }
+    use crate::test_util::shared_component as create_mock_component;
+    use connector_graphql::graphql::client::UnnestBehavior;
+    use serde_json::json;
 
     #[test]
     fn test_projects_schema() {
-        let schema = gql_schema();
+        let schema = gql_schema(true);
 
-        // Verify all expected fields are present with correct types
-        assert_eq!(schema.fields().len(), 12);
+        // Verify all expected fields are present with correct types, plus the
+        // `owner` / `repo` identity columns.
+        assert_eq!(schema.fields().len(), 14);
+        assert_eq!(schema.field(12).name(), "owner");
+        assert_eq!(schema.field(13).name(), "repo");
+
+        // An organization-scoped projects dataset has no repository to name.
+        let org_schema = gql_schema(false);
+        assert_eq!(org_schema.fields().len(), 13);
+        assert_eq!(org_schema.field(12).name(), "owner");
 
         // Check critical fields
         assert_eq!(schema.field(0).name(), "id");
@@ -366,14 +369,44 @@ mod tests {
 
         // Verify GraphQL parameters are set correctly
         assert!(graphql_params.json_pointer.is_none());
-        assert!(matches!(
-            graphql_params.unnest_behavior,
-            UnnestBehavior::Depth(2)
-        ));
         assert!(graphql_params.schema.is_some());
 
-        // Verify the schema matches what we expect
+        // Verify the schema matches what we expect, including the `owner` /
+        // `repo` identity columns the custom unnest stamps onto each row.
         let schema = graphql_params.schema.expect("schema should be present");
-        assert_eq!(schema.fields().len(), 12);
+        assert_eq!(schema.fields().len(), 14);
+
+        let UnnestBehavior::Custom(unnest) = &graphql_params.unnest_behavior else {
+            panic!("projects must stamp identity with a custom unnest");
+        };
+        let rows = unnest(&json!({
+            "id": "PVT_1",
+            "title": "Roadmap",
+            "creator": {"creator": "lukekim"}
+        }))
+        .expect("unnest to succeed");
+
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0]["creator"], json!("lukekim"));
+        assert_eq!(rows[0]["owner"], json!("spiceai"));
+        assert_eq!(rows[0]["repo"], json!("spiceai"));
+    }
+
+    #[test]
+    fn test_projects_org_scope_carries_only_owner() {
+        let args = ProjectsTableArgs {
+            owner: "spiceai".to_string(),
+            repo: None,
+            component: create_mock_component("github.com/spiceai/projects"),
+        };
+
+        let graphql_params = args.get_graphql_values();
+        let UnnestBehavior::Custom(unnest) = &graphql_params.unnest_behavior else {
+            panic!("projects must stamp identity with a custom unnest");
+        };
+        let rows = unnest(&json!({"id": "PVT_1", "title": "Roadmap"})).expect("unnest to succeed");
+
+        assert_eq!(rows[0]["owner"], json!("spiceai"));
+        assert!(rows[0].get("repo").is_none());
     }
 }

@@ -24,6 +24,7 @@ pub mod alias;
 /// structured error when it is not registered).
 pub static EMBED_UDF_NAME: &str = "embed";
 pub mod assert;
+pub mod async_placement;
 pub mod bucket;
 pub mod cosine_distance;
 pub mod digest_many;
@@ -36,6 +37,7 @@ pub mod json_tree;
 pub mod l2_distance;
 pub mod l2_norm;
 pub mod primitive_json_codec;
+pub mod timeseries;
 pub mod truncate;
 pub mod user_functions;
 pub(crate) mod vector_simd;

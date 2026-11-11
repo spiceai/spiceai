@@ -24,11 +24,11 @@ use snafu::{ResultExt, Snafu};
 use spicepod::component::tool::Tool;
 use std::{collections::HashMap, sync::Arc};
 
-use crate::status;
 use app::App;
 use cache::TabledCacheProvider;
 use cache::result::search::CachedSearchResult;
 use runtime_datafusion::{SPICE_DEFAULT_CATALOG, SPICE_DEFAULT_SCHEMA};
+use runtime_status as status;
 use runtime_tools::catalog::SpiceToolCatalog;
 use runtime_tools::options::SpiceToolsOptions;
 use tokio::sync::RwLock;
@@ -245,6 +245,19 @@ impl SpiceToolCatalog for BuiltinToolCatalog {
     async fn get(&self, name: &str) -> Option<Arc<dyn SpiceModelTool>> {
         self.construct_builtin(name, None, None, &HashMap::new())
             .ok()
+    }
+
+    fn try_get(&self, name: &str) -> Option<Arc<dyn SpiceModelTool>> {
+        self.construct_builtin(name, None, None, &HashMap::new())
+            .ok()
+    }
+
+    fn try_all(&self) -> Vec<Arc<dyn SpiceModelTool>> {
+        SpiceToolsOptions::All
+            .tools_by_name()
+            .iter()
+            .filter_map(|t| self.construct_builtin(t, None, None, &HashMap::new()).ok())
+            .collect()
     }
 
     fn name(&self) -> &str {

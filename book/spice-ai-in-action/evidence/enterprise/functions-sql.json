@@ -1,0 +1,41 @@
+[
+  {
+    "sql": "SELECT net_cents(22200,11200) AS net_cents",
+    "actual": [
+      {
+        "net_cents": 11000
+      }
+    ],
+    "expected": [
+      {
+        "net_cents": 11000
+      }
+    ]
+  },
+  {
+    "sql": "SELECT net_cents(CAST(NULL AS BIGINT),0) AS net_cents",
+    "actual": [
+      {
+        "net_cents": null
+      }
+    ],
+    "expected": [
+      {
+        "net_cents": null
+      }
+    ]
+  },
+  {
+    "sql": "SELECT net_cents(0,0) AS net_cents",
+    "actual": [
+      {
+        "net_cents": 0
+      }
+    ],
+    "expected": [
+      {
+        "net_cents": 0
+      }
+    ]
+  }
+]

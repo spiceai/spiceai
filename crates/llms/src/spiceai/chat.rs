@@ -69,7 +69,11 @@ pub fn new_spiceai_client(
 
 #[cfg(test)]
 mod tests {
+    use std::time::Duration;
+
     use super::*;
+    use crate::chat::Chat as _;
+    use crate::openai::authorization_header_tests::capture_one_request;
 
     #[test]
     fn api_base_defaults_to_the_cloud_platform() {
@@ -114,6 +118,31 @@ mod tests {
         assert!(is_cloud_platform(Some(DEFAULT_ENDPOINT)));
         assert!(is_cloud_platform(Some("https://data.spiceai.io/")));
         assert!(is_cloud_platform(Some("https://data.spiceai.io/v1")));
+    }
+
+    /// `HostedModelConfig` carries `Content-Type` in its default headers, and the client sets
+    /// it again for every JSON body. It must reach the endpoint once: a server that reads two
+    /// `Content-Type` headers can refuse the request as an unsupported content type.
+    #[tokio::test]
+    async fn a_hosted_model_request_carries_one_content_type() {
+        let (api_base, rx) = capture_one_request();
+        let client = new_spiceai_client("m".to_string(), Some(&api_base), None);
+        // The reply is not a chat completion, so this fails; the request it sent first is
+        // what the assertion reads.
+        let _ = tokio::time::timeout(Duration::from_secs(20), client.health()).await;
+        let headers = rx
+            .recv_timeout(Duration::from_secs(20))
+            .expect("the endpoint received a request");
+
+        let content_types: Vec<_> = headers
+            .lines()
+            .filter(|line| line.to_ascii_lowercase().starts_with("content-type:"))
+            .collect();
+        assert_eq!(
+            content_types,
+            ["content-type: application/json"],
+            "a hosted model request must carry exactly one Content-Type:\n{headers}"
+        );
     }
 
     #[test]

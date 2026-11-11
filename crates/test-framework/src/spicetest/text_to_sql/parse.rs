@@ -16,10 +16,8 @@ limitations under the License.
 use arrow::datatypes::{DataType, Field, Schema};
 use datafusion::{
     common::Column,
-    sql::{
-        ResolvedTableReference, TableReference,
-        sqlparser::{ast::Statement, dialect::PostgreSqlDialect, parser::Parser},
-    },
+    common::{ResolvedTableReference, TableReference},
+    sql::sqlparser::{ast::Statement, dialect::PostgreSqlDialect, parser::Parser},
 };
 use reqwest::Client;
 use serde_json::Value;
@@ -578,7 +576,6 @@ async fn sql_schema_fallback(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use insta::assert_snapshot;
 
     /// Formats the parse result for snapshot testing.
     fn format_result(
@@ -619,27 +616,14 @@ mod tests {
         let (tables, projections) =
             attempt_parse_table_and_projection("SELECT id, name FROM users")
                 .expect("Failed to parse SQL");
-        assert_snapshot!(format_result(&tables, &projections), @r"
-        Tables:
-          spice.public.users
-
-        Projections:
-          spice.public.users.id
-          spice.public.users.name
-        ");
+        insta::assert_snapshot!("simple_select", format_result(&tables, &projections));
     }
 
     #[test]
     fn select_star() {
         let (tables, projections) = attempt_parse_table_and_projection("SELECT * FROM orders")
             .expect("Failed to parse SQL");
-        assert_snapshot!(format_result(&tables, &projections), @r#"
-        Tables:
-          spice.public.orders
-
-        Projections:
-          *
-        "#);
+        insta::assert_snapshot!("select_star", format_result(&tables, &projections));
     }
 
     #[test]
@@ -648,16 +632,7 @@ mod tests {
             "SELECT u.id, u.name, o.total FROM users u JOIN orders o ON u.id = o.user_id",
         )
         .expect("Failed to parse SQL");
-        assert_snapshot!(format_result(&tables, &projections), @r#"
-        Tables:
-          spice.public.orders
-          spice.public.users
-
-        Projections:
-          spice.public.orders.total
-          spice.public.users.id
-          spice.public.users.name
-        "#);
+        insta::assert_snapshot!("join_query", format_result(&tables, &projections));
     }
 
     #[test]
@@ -666,13 +641,7 @@ mod tests {
             "SELECT * FROM (SELECT id, amount FROM transactions WHERE amount > 100) AS t",
         )
         .expect("Failed to parse SQL");
-        assert_snapshot!(format_result(&tables, &projections), @r"
-        Tables:
-          spice.public.transactions
-
-        Projections:
-          *
-        ");
+        insta::assert_snapshot!("subquery", format_result(&tables, &projections));
     }
 
     #[test]
@@ -681,13 +650,7 @@ mod tests {
             "WITH active_users AS (SELECT id, name FROM users WHERE active = true) SELECT * FROM active_users",
         )
         .expect("Failed to parse SQL");
-        assert_snapshot!(format_result(&tables, &projections), @r#"
-        Tables:
-          spice.public.users
-
-        Projections:
-          *
-        "#);
+        insta::assert_snapshot!("cte_query", format_result(&tables, &projections));
     }
 
     #[test]
@@ -696,17 +659,7 @@ mod tests {
             "SELECT id, name FROM customers UNION SELECT id, name FROM vendors",
         )
         .expect("Failed to parse SQL");
-        assert_snapshot!(format_result(&tables, &projections), @r"
-        Tables:
-          spice.public.customers
-          spice.public.vendors
-
-        Projections:
-          spice.public.customers.id
-          spice.public.customers.name
-          spice.public.vendors.id
-          spice.public.vendors.name
-        ");
+        insta::assert_snapshot!("union_query", format_result(&tables, &projections));
     }
 
     #[test]
@@ -715,16 +668,7 @@ mod tests {
             "SELECT customers.id, customers.name, orders.total FROM customers, orders",
         )
         .expect("Failed to parse SQL");
-        assert_snapshot!(format_result(&tables, &projections), @r#"
-        Tables:
-          spice.public.customers
-          spice.public.orders
-
-        Projections:
-          spice.public.customers.id
-          spice.public.customers.name
-          spice.public.orders.total
-        "#);
+        insta::assert_snapshot!("qualified_columns", format_result(&tables, &projections));
     }
 
     #[test]
@@ -732,14 +676,7 @@ mod tests {
         let (tables, projections) =
             attempt_parse_table_and_projection("SELECT COUNT(id), SUM(amount) FROM transactions")
                 .expect("Failed to parse SQL");
-        assert_snapshot!(format_result(&tables, &projections), @r"
-        Tables:
-          spice.public.transactions
-
-        Projections:
-          spice.public.transactions.amount
-          spice.public.transactions.id
-        ");
+        insta::assert_snapshot!("function_in_select", format_result(&tables, &projections));
     }
 
     #[test]
@@ -748,14 +685,7 @@ mod tests {
             "SELECT id, CASE WHEN status = 1 THEN 'active' ELSE 'inactive' END FROM users",
         )
         .expect("Failed to parse SQL");
-        assert_snapshot!(format_result(&tables, &projections), @r"
-        Tables:
-          spice.public.users
-
-        Projections:
-          spice.public.users.id
-          spice.public.users.status
-        ");
+        insta::assert_snapshot!("case_expression", format_result(&tables, &projections));
     }
 
     #[test]
@@ -764,15 +694,7 @@ mod tests {
             "SELECT users.*, orders.id FROM users JOIN orders ON users.id = orders.user_id",
         )
         .expect("Failed to parse SQL");
-        assert_snapshot!(format_result(&tables, &projections), @r"
-        Tables:
-          spice.public.orders
-          spice.public.users
-
-        Projections:
-          spice.public.orders.id
-          spice.public.users.*.*
-        ");
+        insta::assert_snapshot!("qualified_wildcard", format_result(&tables, &projections));
     }
 
     #[test]
@@ -781,17 +703,7 @@ mod tests {
             "SELECT a.id, b.name, c.value FROM table_a a LEFT JOIN table_b b ON a.id = b.a_id INNER JOIN table_c c ON b.id = c.b_id",
         )
         .expect("Failed to parse SQL");
-        assert_snapshot!(format_result(&tables, &projections), @r#"
-        Tables:
-          spice.public.table_a
-          spice.public.table_b
-          spice.public.table_c
-
-        Projections:
-          spice.public.table_a.id
-          spice.public.table_b.name
-          spice.public.table_c.value
-        "#);
+        insta::assert_snapshot!("multiple_joins", format_result(&tables, &projections));
     }
 
     #[test]
@@ -801,14 +713,10 @@ mod tests {
             "SELECT T2.School FROM satscores AS T1 INNER JOIN schools AS T2 ON T1.cds = T2.CDSCode WHERE T2.Magnet = 1 AND T1.NumTstTakr > 500",
         )
         .expect("Failed to parse SQL");
-        assert_snapshot!(format_result(&tables, &projections), @r"
-        Tables:
-          spice.public.satscores
-          spice.public.schools
-
-        Projections:
-          spice.public.schools.School
-        ");
+        insta::assert_snapshot!(
+            "join_with_alias_resolution",
+            format_result(&tables, &projections)
+        );
     }
 
     #[test]
@@ -817,13 +725,7 @@ mod tests {
             "SELECT id FROM users WHERE id IN (SELECT user_id FROM orders WHERE total > (SELECT AVG(total) FROM orders))",
         )
         .expect("Failed to parse SQL");
-        assert_snapshot!(format_result(&tables, &projections), @r"
-        Tables:
-          spice.public.users
-
-        Projections:
-          spice.public.users.id
-        ");
+        insta::assert_snapshot!("nested_subquery", format_result(&tables, &projections));
     }
 
     #[test]
@@ -831,14 +733,10 @@ mod tests {
         let (tables, projections) =
             attempt_parse_table_and_projection("SELECT id, name FROM myschema.users")
                 .expect("Failed to parse SQL");
-        assert_snapshot!(format_result(&tables, &projections), @r"
-        Tables:
-          spice.myschema.users
-
-        Projections:
-          spice.myschema.users.id
-          spice.myschema.users.name
-        ");
+        insta::assert_snapshot!(
+            "schema_qualified_table",
+            format_result(&tables, &projections)
+        );
     }
 
     #[test]
@@ -847,14 +745,7 @@ mod tests {
             "SELECT CAST(id AS VARCHAR), amount::numeric FROM transactions",
         )
         .expect("Failed to parse SQL");
-        assert_snapshot!(format_result(&tables, &projections), @r"
-        Tables:
-          spice.public.transactions
-
-        Projections:
-          spice.public.transactions.amount
-          spice.public.transactions.id
-        ");
+        insta::assert_snapshot!("cast_expression", format_result(&tables, &projections));
     }
 
     #[test]
@@ -863,14 +754,7 @@ mod tests {
             "SELECT id AS user_id, name AS user_name FROM users",
         )
         .expect("Failed to parse SQL");
-        assert_snapshot!(format_result(&tables, &projections), @r"
-        Tables:
-          spice.public.users
-
-        Projections:
-          spice.public.users.id
-          spice.public.users.name
-        ");
+        insta::assert_snapshot!("alias_expression", format_result(&tables, &projections));
     }
 
     #[test]
@@ -881,14 +765,7 @@ mod tests {
             r#"SELECT MAX("Free Meal Count (K-12)" / "Enrollment (K-12)") AS highest_eligible_free_rate FROM "spice.public.frpm" WHERE "County Name" = 'Alameda'"#,
         )
         .expect("Failed to parse SQL");
-        assert_snapshot!(format_result(&tables, &projections), @r"
-        Tables:
-          spice.public.spice.public.frpm
-
-        Projections:
-          spice.public.spice.public.frpm.Enrollment (K-12)
-          spice.public.spice.public.frpm.Free Meal Count (K-12)
-        ");
+        insta::assert_snapshot!("quoted_identifiers", format_result(&tables, &projections));
     }
 
     #[test]
@@ -897,18 +774,15 @@ mod tests {
         let (tables, projections) =
             attempt_parse_table_and_projection(r#"SELECT "col1" FROM "spice"."public"."frpm""#)
                 .expect("Failed to parse SQL");
-        assert_snapshot!(format_result(&tables, &projections), @r"
-        Tables:
-          spice.public.frpm
-
-        Projections:
-          spice.public.frpm.col1
-        ");
+        insta::assert_snapshot!(
+            "properly_qualified_quoted_table",
+            format_result(&tables, &projections)
+        );
     }
 
     #[test]
     fn properly_extra_text() {
-        let _ = attempt_parse_table_and_projection(r#"Looking at the schema and previous errors, I need to provide only the raw SQL without any explanations, markdown, or extra text. The errors indicate the SQL parser is failing because of the additional content.
+        let err = attempt_parse_table_and_projection(r#"Looking at the schema and previous errors, I need to provide only the raw SQL without any explanations, markdown, or extra text. The errors indicate the SQL parser is failing because of the additional content.
 
             Based on the tables:
             - `frpm` has `"FRPM Count (K-12)"` column
@@ -918,5 +792,15 @@ mod tests {
             SELECT "MailStreet" FROM schools JOIN frpm ON schools."CDSCode" = frpm."CDSCode" WHERE frpm."FRPM Count (K-12)" IS NOT NULL ORDER BY frpm."FRPM Count (K-12)" DESC LIMIT 1"#).expect_err(
                 "Invalid SQL should return an error"
             );
+        // The scorer must see the reply as invalid SQL from its first prose word, as
+        // sqlparser's own parse error rather than some other failure.
+        assert!(
+            matches!(
+                err.downcast_ref::<datafusion::sql::sqlparser::parser::ParserError>(),
+                Some(datafusion::sql::sqlparser::parser::ParserError::ParserError(message))
+                    if message == "Expected: an SQL statement, found: Looking at Line: 1, Column: 1"
+            ),
+            "expected sqlparser to reject the leading prose, got: {err}"
+        );
     }
 }

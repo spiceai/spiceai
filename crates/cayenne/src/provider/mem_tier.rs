@@ -263,15 +263,22 @@ impl SegmentTombstones {
     }
 
     /// The deleted `Int64Pk` keys in this segment (empty for the row-key strategy).
-    /// Test-only since the merged-scan-deletions lockstep that consumed it in
-    /// production was retired when the per-scan merge memos gave way to the
-    /// demand-driven scan-view cache.
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "used only by mem-tier tombstone tests")
-    )]
+    /// A scan-view build hides exactly these keys in the segments it reuses from
+    /// its previous build.
     pub(crate) fn int64_keys(&self) -> impl Iterator<Item = i64> + '_ {
         self.int64_pk.keys().copied()
+    }
+
+    /// The deleted row keys in this segment, in the encoding the visibility
+    /// filter compares (empty for the `Int64Pk` strategy).
+    pub(crate) fn row_keys(&self) -> impl Iterator<Item = &[u8]> + '_ {
+        self.row_keys.keys().map(AsRef::as_ref)
+    }
+
+    /// The delete sequence stamped on every key of this segment. Meaningful only
+    /// when the segment carries keys (an empty set is never stamped).
+    pub(crate) fn delete_sequence(&self) -> i64 {
+        self.delete_sequence
     }
 
     /// Whether this segment carries no `Int64Pk` tombstone keys.
@@ -282,6 +289,15 @@ impl SegmentTombstones {
     /// Whether this segment carries no row-key tombstone keys.
     pub(crate) fn is_row_keys_empty(&self) -> bool {
         self.row_keys.is_empty()
+    }
+
+    /// Whether `other` is this same set of tombstones: a clone of it, sharing its
+    /// key sets, at the same delete sequence. Two equal sets built separately are
+    /// not the same.
+    fn is_same(&self, other: &Self) -> bool {
+        self.delete_sequence == other.delete_sequence
+            && self.int64_pk.ptr_eq(&other.int64_pk)
+            && self.row_keys.ptr_eq(&other.row_keys)
     }
 }
 
@@ -306,8 +322,10 @@ pub(crate) struct MemSegment {
     /// set separate from the scalar lets the key SET be built off the publish
     /// lock. Cheap to carry: the sets are `im::HashMap` (O(1) structural clone).
     pub(crate) tombstones: SegmentTombstones,
-    /// This segment's measured byte cost (`get_array_memory_size`), for budget
-    /// release accounting on a partial clear.
+    /// This segment's resident byte cost ([`RetainedBytes`]), for budget release
+    /// accounting on a partial clear.
+    ///
+    /// [`RetainedBytes`]: arrow_tools::batch_bytes::RetainedBytes
     pub(crate) bytes: u64,
     /// This segment's row count.
     pub(crate) rows: u64,
@@ -321,6 +339,63 @@ pub(crate) struct MemSegment {
     /// single-shard path keeps using `MemTier::epoch` as the slot-ack currency, so
     /// behavior is byte-identical) and for the position-based / non-sharded append.
     pub(crate) source_position: Option<u64>,
+    /// The segment's secondary indexes, one per batch, when the table declares
+    /// `indexes` in memory mode. Carried with the segment into every tier version
+    /// that keeps it, so a scan's captured tier always has the index matching
+    /// its batches.
+    pub(crate) index: Option<Arc<crate::provider::mem_tier_index::SegmentIndex>>,
+}
+
+/// Exact per-column min/max over a segment's batches, for predicate pruning.
+/// An empty batch list has nothing to describe, so it reports unknown.
+fn segment_statistics(batches: &[RecordBatch]) -> Arc<Statistics> {
+    batches.first().map_or_else(
+        || Arc::new(Statistics::new_unknown(&Schema::empty())),
+        |first| {
+            Arc::new(
+                crate::provider::file_pruning::statistics_from_record_batches(
+                    first.schema_ref(),
+                    batches,
+                ),
+            )
+        },
+    )
+}
+
+impl MemSegment {
+    /// Whether `other` is this same segment — a clone of it, as every tier
+    /// version an append builds carries — rather than one rebuilt from it.
+    fn is_same(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.batches, &other.batches)
+            && self.data_sequence == other.data_sequence
+            && self.tombstones.is_same(&other.tombstones)
+    }
+}
+
+/// A checkpoint's fold of its survivors' tombstones, built ahead of the
+/// listing fence by [`MemTier::prepare_retain`].
+pub(crate) struct PreparedRetain {
+    /// The tier version the fold was built from.
+    base: Arc<MemTier>,
+    flushed_segment_count: usize,
+    /// `base.segments[flushed_segment_count..]` folded.
+    tombstones: InMemTombstones,
+}
+
+impl PreparedRetain {
+    /// Whether `tier` is this fold's base plus segments appended since, for a
+    /// checkpoint that flushed `flushed_segment_count` segments: the fold then
+    /// covers exactly `tier`'s survivors up to the base's length.
+    fn extends_to(&self, tier: &MemTier, flushed_segment_count: usize) -> bool {
+        let covered = self.base.segments.len();
+        self.flushed_segment_count == flushed_segment_count
+            && flushed_segment_count <= covered
+            && covered <= tier.segments.len()
+            && self.base.segments[flushed_segment_count..]
+                .iter()
+                .zip(&tier.segments[flushed_segment_count..covered])
+                .all(|(folded, live)| folded.is_same(live))
+    }
 }
 
 /// The in-memory CDC tier for one table. Immutable once constructed: every
@@ -339,7 +414,7 @@ pub(crate) struct MemTier {
     /// an O(1) `Arc` bump of the HAMT root — the accumulated corpus is never
     /// deep-copied per append (the prior O(tier) write tax).
     pub(crate) tombstones: InMemTombstones,
-    /// Sum of `get_array_memory_size()` across all retained batches — the cap
+    /// Sum of the segments' resident bytes ([`MemSegment::bytes`]) — the cap
     /// dimension checked against the per-table + global byte budget.
     pub(crate) bytes: u64,
     /// Total retained rows (observability + the row cap).
@@ -429,6 +504,7 @@ impl MemTier {
             incoming_rows,
             superseded,
             None,
+            None,
         )
     }
 
@@ -437,6 +513,7 @@ impl MemTier {
     /// `None` (the single-shard path keeps `MemTier::epoch` as the slot-ack axis,
     /// byte-identical). At N>1 every shard append of one apply passes the SAME
     /// value so the checkpoint reconciles cross-shard durable coverage on one axis.
+    /// `index` is the new segment's secondary index, built off the publish lock.
     #[must_use]
     #[expect(clippy::too_many_arguments)]
     pub(crate) fn append_segment_with_source_position(
@@ -448,18 +525,9 @@ impl MemTier {
         incoming_rows: u64,
         superseded: u64,
         source_position: Option<u64>,
+        index: Option<Arc<crate::provider::mem_tier_index::SegmentIndex>>,
     ) -> Self {
-        let statistics = batches.first().map_or_else(
-            || Arc::new(Statistics::new_unknown(&Schema::empty())),
-            |first| {
-                Arc::new(
-                    crate::provider::file_pruning::statistics_from_record_batches(
-                        first.schema_ref(),
-                        batches.as_ref(),
-                    ),
-                )
-            },
-        );
+        let statistics = segment_statistics(batches.as_ref());
 
         // O(1): clones the persistent maps' HAMT roots (Arc bumps), NOT the
         // accumulated corpus. `merge_segment` then applies only the incoming
@@ -480,6 +548,7 @@ impl MemTier {
             rows: incoming_rows,
             superseded,
             source_position,
+            index,
         });
 
         Self {
@@ -495,6 +564,138 @@ impl MemTier {
             // piece (never retroactively sealed): the seal boundary is unchanged.
             sealed_segments: self.sealed_segments,
         }
+    }
+
+    /// Rebuild this tier keeping, per batch, only the rows `keep_batch` returns —
+    /// the in-RAM equivalent of a deletion vector for a `mode: memory` table,
+    /// where the mem-tier is the permanent store and there is no durable tier for
+    /// a deletion sink to write into (#12008).
+    ///
+    /// Returns the rebuilt tier and the number of RAW rows it dropped — a physical
+    /// figure. A caller reporting `rows affected` to a user must resolve visibility
+    /// itself, which is why the closure is handed the segment's `data_sequence`:
+    /// that is the watermark a tombstone is compared against, so it is what lets a
+    /// caller ask which of the rows it is about to drop a scan would have served.
+    /// See `delete_mem_tier_rows_matching`, which does exactly that.
+    ///
+    /// EVERY SEGMENT IS PRESERVED, even one whose rows are all removed, so the
+    /// per-segment tombstones stay consistent with the tier-level aggregate carried
+    /// over below. Scans do not read the per-segment copies — `mem_tier_deletion_maps`
+    /// serves the aggregate — so dropping an emptied segment would not change what a
+    /// query returns today. What it would corrupt is any consumer that RE-FOLDS the
+    /// aggregate from the segments: `retain_after` and `unsealed_view` both rebuild
+    /// it that way, and a tombstone missing from that fold stops hiding the older
+    /// version it was written for. Neither runs in memory mode, which is the only
+    /// caller today — this keeps the two representations in agreement rather than
+    /// relying on that staying true.
+    ///
+    /// A segment left with no batches is skipped by the scan
+    /// (`visible_mem_tier_segments_unpruned` pushes only non-empty batch lists), so
+    /// keeping it costs one empty `Vec` and no data. The tier-level `tombstones`
+    /// aggregate is carried over untouched rather than re-folded for the same
+    /// reason the segments are kept: its inputs are exactly the per-segment
+    /// tombstones, and this rebuild changes none of them.
+    ///
+    /// `superseded` is likewise carried per segment: it counts rows this segment's
+    /// upsert superseded in OLDER segments, which removing this segment's own rows
+    /// does not change.
+    ///
+    /// A segment that loses no row keeps its `Arc`s verbatim — no statistics
+    /// recompute and no batch copy — so a predicate matching a few segments costs
+    /// nothing on the rest. Within a segment that does, a batch that loses no row
+    /// keeps its secondary index, and `reindex` indexes each batch that does.
+    ///
+    /// A segment that does lose rows has its statistics RECOMPUTED rather than
+    /// inherited, and neither way of inheriting them works. Kept `Exact`, an
+    /// inherited min/max advertises a bound no surviving row satisfies, and these
+    /// statistics answer `MIN`/`MAX` as well as pruning. Downgraded to `Inexact`,
+    /// it stops pruning altogether — `DataFusion`'s `PrunableStatistics` reads only
+    /// `Exact` bounds and treats anything else as unknown — so the segments a
+    /// delete touched would be the ones that lost their pruning.
+    ///
+    /// `epoch` is preserved (a content change, not a checkpoint) and `version` is
+    /// bumped so every scan-view cache keyed on it re-keys.
+    pub(crate) fn retain_rows(
+        &self,
+        mut keep_batch: impl FnMut(&RecordBatch, i64) -> datafusion_common::Result<RecordBatch>,
+        mut reindex: impl FnMut(
+            &RecordBatch,
+        ) -> Option<Arc<crate::provider::mem_tier_index::BatchIndex>>,
+    ) -> datafusion_common::Result<(Self, u64)> {
+        let mut segments: Vec<MemSegment> = Vec::with_capacity(self.segments.len());
+        let mut removed_rows: u64 = 0;
+        let mut bytes = 0u64;
+        let mut rows = 0u64;
+
+        for segment in self.segments.iter() {
+            let mut kept: Vec<RecordBatch> = Vec::with_capacity(segment.batches.len());
+            let mut kept_indexes = Vec::with_capacity(segment.batches.len());
+            let mut segment_removed = 0u64;
+            for (position, batch) in segment.batches.iter().enumerate() {
+                let before = batch.num_rows() as u64;
+                let batch = keep_batch(batch, segment.data_sequence)?;
+                let batch_removed = before - batch.num_rows() as u64;
+                segment_removed = segment_removed.saturating_add(batch_removed);
+                if batch.num_rows() > 0 {
+                    if let Some(index) = &segment.index {
+                        kept_indexes.push(if batch_removed == 0 {
+                            index.batch(position)
+                        } else {
+                            reindex(&batch)
+                        });
+                    }
+                    kept.push(batch);
+                }
+            }
+
+            if segment_removed == 0 {
+                // Untouched: reuse the segment wholesale, statistics included.
+                bytes = bytes.saturating_add(segment.bytes);
+                rows = rows.saturating_add(segment.rows);
+                segments.push(segment.clone());
+                continue;
+            }
+
+            removed_rows = removed_rows.saturating_add(segment_removed);
+            let segment_bytes = arrow_tools::batch_bytes::RetainedBytes::of(&kept);
+            let segment_rows: u64 = kept
+                .iter()
+                .map(|b| b.num_rows() as u64)
+                .fold(0, u64::saturating_add);
+            let statistics = segment_statistics(&kept);
+            bytes = bytes.saturating_add(segment_bytes);
+            rows = rows.saturating_add(segment_rows);
+            segments.push(MemSegment {
+                batches: Arc::new(kept),
+                data_sequence: segment.data_sequence,
+                statistics,
+                tombstones: segment.tombstones.clone(),
+                bytes: segment_bytes,
+                rows: segment_rows,
+                superseded: segment.superseded,
+                source_position: segment.source_position,
+                index: segment.index.as_ref().map(|_| {
+                    Arc::new(crate::provider::mem_tier_index::SegmentIndex::from_batches(
+                        kept_indexes,
+                    ))
+                }),
+            });
+        }
+
+        Ok((
+            Self {
+                segments: Arc::new(segments),
+                tombstones: self.tombstones.clone(),
+                bytes,
+                rows,
+                superseded: self.superseded,
+                epoch: self.epoch,
+                oldest_append: self.oldest_append,
+                version: self.version + 1,
+                sealed_segments: self.sealed_segments,
+            },
+            removed_rows,
+        ))
     }
 
     /// The tier that REMAINS after a checkpoint durably flushed the first
@@ -517,20 +718,74 @@ impl MemTier {
             empty.version = self.version + 1;
             return empty;
         }
-        let survivors: Vec<MemSegment> = self.segments[flushed_segment_count..].to_vec();
         // Rebuild the survivor aggregate by folding each survivor's per-segment
         // tombstones (key set + its own stamped delete sequence) onto an empty
-        // aggregate map — this runs at checkpoint time under the phase-2 listing
-        // fence (NOT per-append), and the common interleaved-append case has
-        // exactly one survivor, so it is one `merge_segment` of a small key set.
-        // Each survivor folds at its OWN `delete_sequence` (segments do not share
-        // a sequence), preserving per-key max-sequence semantics exactly.
+        // aggregate map. Each survivor folds at its OWN `delete_sequence`
+        // (segments do not share a sequence), preserving per-key max-sequence
+        // semantics exactly. A checkpoint folds most of them ahead of its listing
+        // fence instead ([`Self::prepare_retain`]).
         let mut tombstones = InMemTombstones::default();
+        for segment in &self.segments[flushed_segment_count..] {
+            tombstones.merge_segment(&segment.tombstones);
+        }
+        self.retain_with(flushed_segment_count, tombstones)
+    }
+
+    /// Fold the tombstones of the segments a checkpoint of the first
+    /// `flushed_segment_count` segments leaves behind, ahead of the swap that
+    /// drops the rest. The fold is the costly part of [`Self::retain_after`] — it
+    /// grows with every segment appended while the checkpoint encoded and
+    /// committed — and the swap runs under the listing fence, so a checkpoint
+    /// builds it first and [`Self::retain_after_prepared`] folds only the segments
+    /// appended in between.
+    #[must_use]
+    pub(crate) fn prepare_retain(self: Arc<Self>, flushed_segment_count: usize) -> PreparedRetain {
+        let mut tombstones = InMemTombstones::default();
+        for segment in self.segments.iter().skip(flushed_segment_count) {
+            tombstones.merge_segment(&segment.tombstones);
+        }
+        PreparedRetain {
+            base: self,
+            flushed_segment_count,
+            tombstones,
+        }
+    }
+
+    /// [`Self::retain_after`], reusing the fold `prepared` built when this tier is
+    /// that fold's base plus segments appended since: every survivor the fold
+    /// covered is still here at its index, the same segment. Only the appended
+    /// segments are folded then. Otherwise — no preparation, a different flushed
+    /// count, or a tier that changed in any way but appends — every survivor is
+    /// folded, as `retain_after` does.
+    #[must_use]
+    pub(crate) fn retain_after_prepared(
+        &self,
+        flushed_segment_count: usize,
+        prepared: Option<PreparedRetain>,
+    ) -> Self {
+        let Some(prepared) = prepared.filter(|prepared| {
+            flushed_segment_count < self.segments.len()
+                && prepared.extends_to(self, flushed_segment_count)
+        }) else {
+            return self.retain_after(flushed_segment_count);
+        };
+        let covered = prepared.base.segments.len();
+        let mut tombstones = prepared.tombstones;
+        for segment in &self.segments[covered..] {
+            tombstones.merge_segment(&segment.tombstones);
+        }
+        self.retain_with(flushed_segment_count, tombstones)
+    }
+
+    /// The tier left after dropping the first `flushed_segment_count` segments,
+    /// with `tombstones` as the survivors' fold. `flushed_segment_count` must be
+    /// below the segment count.
+    fn retain_with(&self, flushed_segment_count: usize, tombstones: InMemTombstones) -> Self {
+        let survivors: Vec<MemSegment> = self.segments[flushed_segment_count..].to_vec();
         let mut bytes = 0u64;
         let mut rows = 0u64;
         let mut superseded = 0u64;
         for segment in &survivors {
-            tombstones.merge_segment(&segment.tombstones);
             bytes = bytes.saturating_add(segment.bytes);
             rows = rows.saturating_add(segment.rows);
             superseded = superseded.saturating_add(segment.superseded);
@@ -1311,6 +1566,149 @@ mod tests {
         let clamped = grown.mark_sealed_through(999);
         assert_eq!(clamped.sealed_segments, grown.segments.len());
         assert!(!clamped.has_unsealed_segments());
+    }
+
+    /// A segment deleting `keys` at `sequence`.
+    fn deleting(
+        tier: &MemTier,
+        value: i64,
+        keys: &[i64],
+        sequence: i64,
+        superseded: u64,
+    ) -> MemTier {
+        let mut tombstones = SegmentTombstones::from_int64_keys(keys.iter().copied());
+        tombstones.stamp(sequence);
+        tier.append_segment(
+            Arc::new(vec![batch(&[value])]),
+            sequence + 1,
+            tombstones,
+            16,
+            1,
+            superseded,
+        )
+    }
+
+    fn deleted(tier: &MemTier) -> std::collections::BTreeMap<i64, i64> {
+        tier.tombstones
+            .int64_pk
+            .iter()
+            .map(|(&key, &sequence)| (key, sequence))
+            .collect()
+    }
+
+    /// The fold a checkpoint builds before its listing fence, extended by the
+    /// segments appended before its swap, is the fold `retain_after` computes in
+    /// the swap: over seeded histories whose segments delete overlapping keys at
+    /// rising sequences, for every flushed count.
+    #[test]
+    fn a_prepared_retain_matches_retain_after_over_random_appends() {
+        let mut extended = 0;
+        for seed in 0..300_u64 {
+            let mut state = seed.wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1;
+            let mut next = |bound: u64| {
+                state ^= state << 13;
+                state ^= state >> 7;
+                state ^= state << 17;
+                state % bound
+            };
+            let mut sequence = 0_i64;
+            let mut append = |tier: &MemTier, next: &mut dyn FnMut(u64) -> u64| {
+                sequence += 2;
+                let keys: Vec<i64> = (0..next(12))
+                    .map(|_| i64::try_from(next(40)).expect("key"))
+                    .collect();
+                deleting(tier, sequence, &keys, sequence, next(3))
+            };
+            let mut tier = MemTier::empty();
+            let before = 1 + next(10);
+            for _ in 0..before {
+                tier = append(&tier, &mut next);
+            }
+            let flushed = usize::try_from(next(before + 1)).expect("count");
+            let tier = Arc::new(tier);
+            let prepared = Arc::clone(&tier).prepare_retain(flushed);
+            let mut live = (*tier).clone();
+            let after = next(6);
+            for _ in 0..after {
+                live = append(&live, &mut next);
+            }
+            assert!(
+                prepared.extends_to(&live, flushed),
+                "seed {seed}: appends keep the preparation usable"
+            );
+            if after > 0 && flushed < usize::try_from(before).expect("count") {
+                extended += 1;
+            }
+            let expected = live.retain_after(flushed);
+            let got = live.retain_after_prepared(flushed, Some(prepared));
+            assert_eq!(deleted(&got), deleted(&expected), "seed {seed}");
+            assert_eq!(
+                (
+                    got.segments.len(),
+                    got.bytes,
+                    got.rows,
+                    got.superseded,
+                    got.epoch,
+                    got.sealed_segments
+                ),
+                (
+                    expected.segments.len(),
+                    expected.bytes,
+                    expected.rows,
+                    expected.superseded,
+                    expected.epoch,
+                    expected.sealed_segments
+                ),
+                "seed {seed}"
+            );
+        }
+        assert!(
+            extended >= 100,
+            "most histories must fold appended segments onto a prepared survivor fold: {extended}"
+        );
+    }
+
+    /// A tier that changed other than by appends since the fold was prepared — a
+    /// survivor rebuilt, a different flushed count — must not reuse the fold,
+    /// which no longer describes its survivors.
+    #[test]
+    fn a_prepared_retain_is_not_reused_once_a_survivor_changed() {
+        let mut tier = MemTier::empty();
+        tier = deleting(&tier, 0, &[1, 2], 2, 0);
+        tier = deleting(&tier, 1, &[3], 4, 0);
+        tier = deleting(&tier, 2, &[4], 6, 0);
+        let tier = Arc::new(tier);
+        let stale = deleted(&tier.retain_after(1));
+
+        // The middle survivor rebuilt with different deletes.
+        let mut rebuilt_tombstones = SegmentTombstones::from_int64_keys([5]);
+        rebuilt_tombstones.stamp(4);
+        let mut segments: Vec<MemSegment> = tier.segments.as_ref().clone();
+        segments[1] = MemSegment {
+            tombstones: rebuilt_tombstones,
+            ..segments[1].clone()
+        };
+        let changed = MemTier {
+            segments: Arc::new(segments),
+            ..(*tier).clone()
+        };
+        let prepared = Arc::clone(&tier).prepare_retain(1);
+        assert!(!prepared.extends_to(&changed, 1));
+        let got = changed.retain_after_prepared(1, Some(prepared));
+        assert_eq!(deleted(&got), deleted(&changed.retain_after(1)));
+        assert_ne!(
+            deleted(&got),
+            stale,
+            "the prepared fold would have kept the rebuilt segment's old deletes"
+        );
+
+        // A different flushed count describes different survivors.
+        let prepared = Arc::clone(&tier).prepare_retain(0);
+        assert!(!prepared.extends_to(&tier, 1));
+        assert_eq!(
+            deleted(&tier.retain_after_prepared(1, Some(prepared))),
+            stale
+        );
     }
 
     /// A checkpoint's `retain_after` drops the flushed prefix and lowers the seal

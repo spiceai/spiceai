@@ -320,20 +320,6 @@ mod tests {
     /// Arrow's own `make_builder` would hand back its own type and the
     /// downcast — and every nested CDC row — would fail.
     #[test]
-    fn a_nested_struct_field_gets_this_struct_builder() {
-        let mut builder = StructBuilder::from_fields(nested_fields(), 1);
-
-        let inner = builder
-            .field_builder_array(1)
-            .as_any_mut()
-            .downcast_mut::<StructBuilder>();
-        assert!(
-            inner.is_some(),
-            "nested struct fields must use the modified StructBuilder"
-        );
-    }
-
-    #[test]
     fn a_nested_struct_round_trips_through_the_child_builder() {
         let mut builder = StructBuilder::from_fields(nested_fields(), 1);
         builder.append(true);

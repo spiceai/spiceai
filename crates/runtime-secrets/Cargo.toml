@@ -9,6 +9,8 @@ rust-version.workspace = true
 version.workspace = true
 
 [dependencies]
+# The startup preflight walks the loaded `App`'s component params.
+app = { path = "../app" }
 async-trait.workspace = true
 base64.workspace = true
 dotenv.workspace = true
@@ -38,13 +40,13 @@ aws-credential-types = { workspace = true, optional = true }
 aws-sdk-credential-bridge = { path = "../aws-sdk-credential-bridge", optional = true }
 aws-sdk-secretsmanager = { workspace = true, optional = true }
 aws-sdk-sts = { workspace = true, optional = true }
-# Azure KeyVault. Pinned to the 0.31.x / 0.10.x line so azure_core stays in
-# lockstep with the version already used by the cosmosdb connector
-# (data_components) — mixing azure_core majors blows up the dependency tree
-# and, more importantly, produces two incompatible `TokenCredential` traits.
-azure_core = { version = "0.31.0", optional = true }
-azure_identity = { version = "0.31.0", optional = true }
-azure_security_keyvault_secrets = { version = "0.10.0", optional = true }
+# Azure KeyVault. On the azure_core 1.x / keyvault 1.0.1+ line (RUSTSEC-2026-0438),
+# in lockstep with azure-key-vault-signer. The cosmosdb connector stays on
+# azure_core 0.31 until it moves to azure_data_cosmos 1.x; no azure_core type
+# (e.g. `TokenCredential`) crosses between the two.
+azure_core = { version = "1.1.0", optional = true }
+azure_identity = { version = "1.0.0", optional = true }
+azure_security_keyvault_secrets = { version = "1.0.1", optional = true }
 # `url` is used by `resolve_vault_url` (Azure KeyVault) and `build_base_url`
 # (HashiCorp Vault) to enforce a well-formed URL with a host, and by the
 # `aws_secrets_manager` `endpoint_url` param. Pulled in only under those

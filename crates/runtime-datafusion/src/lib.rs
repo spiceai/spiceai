@@ -1,5 +1,5 @@
 /*
-Copyright 2024-2025 The Spice.ai OSS Authors
+Copyright 2024-2026 The Spice.ai OSS Authors
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -15,13 +15,17 @@ limitations under the License.
 */
 
 pub mod analyzer_rule;
+pub mod checked_arithmetic;
 pub mod composed_catalog;
 pub mod config;
+pub mod dependent_tables;
 pub mod dialect;
 pub mod dml_guard;
 pub mod error;
 pub mod execution_plan;
 pub mod extension;
+#[cfg(test)]
+mod fork_backport_guards;
 pub mod function_support;
 pub mod join_accumulator;
 pub mod managed_runtime;
@@ -31,6 +35,7 @@ pub mod pg_catalog;
 pub mod query_cancel_registry;
 pub mod refresh_scan;
 pub mod refresh_sql;
+pub mod retention_keep;
 pub mod retention_sql;
 pub mod schema_provider;
 pub mod session_config;
@@ -38,6 +43,7 @@ pub mod session_config;
 pub use runtime_query_engine::allowlist;
 pub use runtime_query_engine::query_engine;
 pub mod sort_columns;
+pub mod table_function_params;
 pub mod udf;
 pub mod url_table;
 use snafu::prelude::*;
@@ -64,7 +70,7 @@ pub fn is_spice_internal_schema(catalog: &str, schema: &str) -> bool {
 /// Whether `dataset` names a table in one of Spice's reserved schemas. A
 /// reference with no catalog is resolved against [`SPICE_DEFAULT_CATALOG`].
 #[must_use]
-pub fn is_spice_internal_dataset(dataset: &datafusion::sql::TableReference) -> bool {
+pub fn is_spice_internal_dataset(dataset: &datafusion::common::TableReference) -> bool {
     match (dataset.catalog(), dataset.schema()) {
         (Some(catalog), Some(schema)) => is_spice_internal_schema(catalog, schema),
         (None, Some(schema)) => is_spice_internal_schema(SPICE_DEFAULT_CATALOG, schema),
@@ -72,6 +78,15 @@ pub fn is_spice_internal_dataset(dataset: &datafusion::sql::TableReference) -> b
     }
 }
 pub const SPICE_DEFAULT_SCHEMA: &str = "public";
+
+/// Normalizes a table reference to a full table reference with catalog, schema, and table name
+/// so it can be used for comparison.
+#[must_use]
+pub fn resolve_table_reference(
+    table: datafusion::common::TableReference,
+) -> datafusion::common::ResolvedTableReference {
+    table.resolve(SPICE_DEFAULT_CATALOG, SPICE_DEFAULT_SCHEMA)
+}
 
 #[derive(Debug, Snafu)]
 pub enum Error {

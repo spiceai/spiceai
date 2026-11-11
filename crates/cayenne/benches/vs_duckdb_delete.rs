@@ -6,20 +6,20 @@
 //
 //     https://www.apache.org/licenses/LICENSE-2.0
 
-//! Delete + re-scan throughput: Cayenne vs DuckDB.
+//! Delete + re-scan throughput: Cayenne vs `DuckDB`.
 //!
 //! Cayenne's deletion-vector path is one of its biggest architectural
-//! wins over DuckDB — DuckDB rewrites the affected blocks; Cayenne
+//! wins over `DuckDB` — `DuckDB` rewrites the affected blocks; Cayenne
 //! writes an Arrow IPC deletion vector and applies it transparently at
 //! read time. This bench measures the delta on the two halves of that
 //! tradeoff:
 //!
 //! 1. `delete`            — wall time to execute a `DELETE FROM t WHERE …`
-//!                          touching ~10% of rows.
+//!    touching ~10% of rows.
 //! 2. `scan_after_delete` — full-table `SELECT SUM(value) FROM t` immediately
-//!                          after the delete, exercising the read-time
-//!                          deletion-vector filter on Cayenne and DuckDB's
-//!                          rewritten blocks.
+//!    after the delete, exercising the read-time
+//!    deletion-vector filter on Cayenne and `DuckDB`'s
+//!    rewritten blocks.
 
 #![allow(clippy::expect_used)]
 #![allow(clippy::cast_possible_wrap)]

@@ -30,7 +30,7 @@ use datafusion_expr::{
 
 use super::{
     cost::JoinCostEstimator,
-    left_deep_join_plan::{ReorderOutcome, optimal_left_deep_join_plan},
+    left_deep_join_plan::{ReorderOutcome, is_wide_join_island, optimal_left_deep_join_plan},
 };
 
 /// Reorder the inner-join island(s) inside the inputs of a node that is about to
@@ -70,6 +70,11 @@ fn reorder_opaque_inputs(
     cost_estimator: &dyn JoinCostEstimator,
 ) -> Result<Transformed<LogicalPlan>> {
     plan.map_children(|child| {
+        // Same bound as `ReorderJoinRule`: a wide island behind a semi/anti
+        // boundary (or `MaterializedCte`) must not enter the enumerator.
+        if is_wide_join_island(&child) {
+            return Ok(Transformed::no(child));
+        }
         // Capture the child's original output schema before reordering.
         let original_schema = Arc::clone(child.schema());
         Ok(match optimal_left_deep_join_plan(child, cost_estimator) {
@@ -1104,13 +1109,16 @@ fn flatten_joins_recursive(
                 JoinType::LeftSemi | JoinType::LeftAnti | JoinType::RightSemi | JoinType::RightAnti
             ) =>
         {
-            // An `Edge` carries only equi-keys (`on`), not a join `filter`. A
-            // semi/anti join with a correlation filter (e.g. a `NOT EXISTS` with
-            // an inequality between the inner and outer rows) cannot be an edge
-            // without dropping that filter and corrupting the plan, so treat it
-            // as opaque (one un-reordered node). Such joins cost their build
-            // side, not inner-join ordering, so little is lost.
-            if join.filter.is_some() {
+            // An `Edge` carries only equi-keys (`on`), not a join `filter` or the
+            // `null_aware` flag. A semi/anti join with a correlation filter (e.g.
+            // a `NOT EXISTS` with an inequality between the inner and outer rows)
+            // cannot be an edge without dropping that filter and corrupting the
+            // plan. A null-aware anti join (`x NOT IN (subquery)`) would be
+            // rebuilt as the plain anti join `NOT EXISTS` plans, which keeps the
+            // rows a NULL among the subquery's values must remove, and a NULL `x`.
+            // So treat either as opaque (one un-reordered node). Such joins cost
+            // their build side, not inner-join ordering, so little is lost.
+            if join.filter.is_some() || join.null_aware {
                 // Seal as opaque, but first reorder any inner-join island inside
                 // its inputs — both the preserved (LHS) side and the RHS blob
                 // (`reorder_opaque_inputs` maps over every child). E.g. the 5-way

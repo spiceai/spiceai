@@ -61,7 +61,7 @@ limitations under the License.
 #![allow(clippy::expect_used)]
 #![allow(clippy::clone_on_ref_ptr)]
 
-mod common;
+use crate::common;
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -93,10 +93,8 @@ fn schema() -> Arc<Schema> {
 /// snapshot file so the snapshot is file-rich and a full rewrite has real work
 /// to do (a wide race window). Background scheduler disabled; we drive it.
 ///
-/// `deletion_mode: Key` is pinned explicitly: the default `Auto` resolves to
-/// `position` for PK tables (see `metadata.rs`), which would make this test a
-/// duplicate of the position-mode variant below. We want this case to exercise
-/// the key-delete sequence-fence compaction path described in the header docs.
+/// `deletion_mode: Key` is pinned explicitly so this test exercises the
+/// key-delete sequence-fence compaction path described in the header docs.
 fn config() -> VortexConfig {
     VortexConfig {
         deletion_mode: DeletionMode::Key,

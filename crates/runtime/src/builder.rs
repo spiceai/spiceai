@@ -21,11 +21,9 @@ use crate::cluster::PartitionStore;
 use crate::cluster::ResolvedClusterConfig;
 use crate::cluster::SchedulerHeartbeatStore;
 use crate::cluster::partition::service::PartitionService;
-#[cfg(not(windows))]
-use crate::config::ClusterRole;
 use crate::config::Config;
-#[cfg(not(windows))]
-use crate::datafusion::builder::CayenneOptimizerRules;
+use crate::config::{ClusterRole, Role};
+use crate::datafusion::builder::{CayenneOptimizerRules, OutputPreview};
 use crate::datafusion::udf::register_udfs;
 use crate::{
     Runtime, catalogconnector,
@@ -39,19 +37,24 @@ use crate::{
     status,
 };
 use app::App;
+use runtime_acceleration::CayenneAccelerationDemand;
 use runtime_acceleration::acceleration::{RefreshMode, unset_refresh_mode_for_connector};
 use runtime_metrics as metrics;
+use spicepod::component::caching::CacheKeyType;
 use spicepod::component::runtime::Runtime as SpicepodRuntime;
 use spicepod::component::runtime::RuntimeReadyState as SpicepodRuntimeReadyState;
 use spicepod::component::runtime::SourceRateControl as SpicepodSourceRateControl;
 use spicepod::component::runtime::TelemetryConfig;
+use spicepod::component::runtime::{RENAMED_RUNTIME_TUNING_PARAMS, renamed_runtime_param_warning};
 use std::{collections::HashMap, net::SocketAddr, str::FromStr, sync::Arc, time::Duration};
 use telemetry::metrics_reader::MetricsReader;
 use telemetry::timing::TimeMeasurement;
 use token_provider::registry::TokenProviderRegistry;
 use tokio::runtime::Handle;
 use tokio::sync::{Mutex, RwLock};
-use util::{in_tracing_context, in_tracing_context_async};
+
+// Re-exported so `runtime::builder::CayenneWorkload` keeps resolving for downstream users.
+pub use runtime_acceleration::CayenneWorkload;
 
 type DatafusionConfigurationCallback = fn(&mut DataFusion);
 
@@ -62,21 +65,6 @@ const CAYENNE_SORT_MERGE_MEMORY_POOL_FRACTION_PARAM: &str =
     "cayenne_sort_merge_memory_pool_fraction";
 const CAYENNE_FILTER_PROPAGATION_PARAM: &str = "cayenne_filter_propagation";
 const CAYENNE_OPTIMIZER_RULES_PARAM: &str = "cayenne_optimizer_rules";
-
-/// Goal-driven adaptive-tuning SLO setpoints, settable GLOBALLY here at
-/// `runtime.params` and overridden per-dataset via the matching
-/// `acceleration.params` key (see `accelerator_cayenne`). `cayenne_goal_qph`
-/// is the exception: QPH is a system-wide metric (a join spans datasets), so it
-/// is global-only and a per-dataset value is ignored. Declared here so the keys
-/// are part of the recognized `runtime.params` vocabulary and don't false-warn as
-/// unknown; the values are resolved (and validated) where the per-dataset Cayenne
-/// config is built. NOTE: `cayenne_goal_convergence_window` is deliberately NOT
-/// here — it paces HOW the loop chases these SLOs (a control-cadence/benchmarking
-/// knob), not a target outcome, so it stays a per-dataset advanced override.
-const CAYENNE_GOAL_REPLICATION_LAG_PARAM: &str = "cayenne_goal_replication_lag";
-const CAYENNE_GOAL_FRESHNESS_PARAM: &str = "cayenne_goal_freshness";
-const CAYENNE_GOAL_QUERY_LATENCY_PARAM: &str = "cayenne_goal_query_latency";
-const CAYENNE_GOAL_QPH_PARAM: &str = "cayenne_goal_qph";
 
 /// Process-global `SQLite` metastore pragma tuning keys (cache, mmap, busy
 /// timeout, WAL autocheckpoint, `auto_vacuum`). Consumed once at startup in
@@ -102,6 +90,11 @@ const CAYENNE_COMPACTION_MEMORY_FRACTION_PARAM: &str = "cayenne_compaction_memor
 const DEFAULT_COMPACTION_MEMORY_FRACTION: f64 = 0.2;
 const MIN_COMPACTION_MEMORY_FRACTION: f64 = 0.05;
 const MAX_COMPACTION_MEMORY_FRACTION: f64 = 0.9;
+/// Largest sort-merge memory-pool fraction the planner can act on: a gate above
+/// the whole pool would admit a build side larger than the pool itself. `0` is a
+/// supported setting at the low end — it disables the memory gate — so only this
+/// upper bound is enforced on admission.
+const MAX_SORT_MERGE_MEMORY_POOL_FRACTION: f64 = 1.0;
 
 /// `runtime.params` keys with a `cayenne_` prefix that the runtime recognizes.
 const KNOWN_CAYENNE_RUNTIME_PARAMS: &[&str] = &[
@@ -119,10 +112,6 @@ const KNOWN_CAYENNE_RUNTIME_PARAMS: &[&str] = &[
     CAYENNE_METASTORE_WAL_TRUNCATE_THRESHOLD_MB_PARAM,
     CAYENNE_METASTORE_AUTO_VACUUM_PARAM,
     CAYENNE_METASTORE_INCREMENTAL_VACUUM_PAGES_PARAM,
-    CAYENNE_GOAL_REPLICATION_LAG_PARAM,
-    CAYENNE_GOAL_FRESHNESS_PARAM,
-    CAYENNE_GOAL_QUERY_LATENCY_PARAM,
-    CAYENNE_GOAL_QPH_PARAM,
 ];
 
 /// Recognized `runtime.params` keys that don't belong to a larger prefix
@@ -154,9 +143,11 @@ fn known_runtime_params() -> Vec<&'static str> {
             + crate::accelerated::refresh_task::changes::CDC_RUNTIME_PARAMS.len()
             + dataconnector::http_rate_control::HTTP_RATE_CONTROL_RUNTIME_PARAMS.len()
             + crate::cluster::CLUSTER_GRPC_RUNTIME_PARAMS.len()
+            + spicepod::component::runtime::TUNING_TARGET_PARAMS.len()
             + MISC_RUNTIME_PARAMS.len(),
     );
     known.extend_from_slice(KNOWN_CAYENNE_RUNTIME_PARAMS);
+    known.extend_from_slice(spicepod::component::runtime::TUNING_TARGET_PARAMS);
     known.extend_from_slice(crate::accelerated::refresh_task::changes::CDC_RUNTIME_PARAMS);
     known.extend_from_slice(dataconnector::http_rate_control::HTTP_RATE_CONTROL_RUNTIME_PARAMS);
     known.extend_from_slice(crate::cluster::CLUSTER_GRPC_RUNTIME_PARAMS);
@@ -182,6 +173,20 @@ pub struct RuntimeBuilder {
     runtime_config: Arc<Config>,
     resolved_cluster_config: Option<ResolvedClusterConfig>,
     telemetry_config: Option<Arc<tokio::sync::SetOnce<TelemetryConfig>>>,
+}
+
+/// Whether SQL results-cache warmup should be armed for this config.
+///
+/// Spicepod deserialization already rejects `warmup` + `cache_key_type: sql`.
+/// Programmatic `AppBuilder::with_sql_cache` can still set that combination, so
+/// callers must pass `CacheKeyType::Plan` (the default) for warmup to enable.
+#[must_use]
+pub(crate) fn sql_results_cache_warmup_enabled(
+    sql_results: &spicepod::component::caching::SQLResultsCacheConfig,
+) -> bool {
+    sql_results.enabled
+        && sql_results.warmup.is_enabled()
+        && matches!(sql_results.cache_key_type, CacheKeyType::Plan)
 }
 
 impl RuntimeBuilder {
@@ -328,6 +333,14 @@ impl RuntimeBuilder {
             );
         }
 
+        // A cluster executor lends a task's slot while all of the task waits on
+        // remote I/O marked with `io_wait()`. Outside an executor task the hook
+        // does nothing. Process-wide, so a runtime built later in the same
+        // process keeps the hook the first one set.
+        match datafusion::common::runtime::set_io_wait_hook(&ballista_executor::VcoreHook) {
+            Ok(()) | Err(datafusion::common::runtime::IoWaitHookError::AlreadySet) => {}
+        }
+
         // Cayenne compaction shutdown state is process-global. Reset it when a
         // fresh Runtime is built so embedded/test runtimes created after a prior
         // shutdown can start maintenance passes again, including when dedicated
@@ -341,32 +354,37 @@ impl RuntimeBuilder {
                 .map_or(SpicepodRuntime::default(), |app| app.runtime.clone())
         });
 
-        // Published before the engines are registered, because an engine is built by its
-        // registration constructor, which takes no arguments: a setting resolved from the
-        // Spicepod can only reach it this way. Registering a configured engine afterwards
-        // instead would mean naming the concrete accelerator from here.
-        //
-        // The publish and the registration pass are one operation: the published value is
-        // process-global while the registry it fills belongs to this `Runtime`, so two
-        // concurrent builds must not interleave between them. The guard is dropped as soon
-        // as the engines exist, each holding its own copy of the setting.
-        let engine_construction = runtime_acceleration::memory_budget::engine_construction_lock()
-            .lock()
-            .await;
+        // Resolved before the engines are registered and handed to each constructor: an
+        // engine is built by the registration slice, which knows nothing of its type, so
+        // this is how a Spicepod setting reaches one. Registering a configured engine
+        // afterwards instead would mean naming the concrete accelerator from here.
         let cayenne_footer_cache_mb =
             parse_usize_runtime_param(&spicepod_rt.params, CAYENNE_FOOTER_CACHE_MB_PARAM);
-        #[cfg(not(windows))]
-        runtime_acceleration::memory_budget::publish_cayenne_footer_cache_mb(
-            cayenne_footer_cache_mb,
-        );
+        let accelerator_configs = [data_accelerator_api::AcceleratorRuntimeConfig::Cayenne(
+            data_accelerator_api::CayenneRuntimeConfig {
+                footer_cache_mb: cayenne_footer_cache_mb,
+            },
+        )];
 
-        self.accelerator_engine_registry.register_all().await;
-        drop(engine_construction);
+        self.accelerator_engine_registry
+            .register_all(&accelerator_configs)
+            .await;
         dataconnector::register_all().await;
         catalogconnector::register_all().await;
         document_parse::register_all().await;
 
         let query = spicepod_rt.query.clone().unwrap_or_default();
+        // A resolved cluster configuration carries the `--role` it was resolved
+        // from; a runtime built without one takes the role from its config.
+        let role = self.resolved_cluster_config.as_ref().map_or_else(
+            || self.runtime_config.cluster.effective_role(),
+            ResolvedClusterConfig::role,
+        );
+        if role == Role::Sidecar {
+            tracing::info!(
+                "Starting as a sidecar. Remote Spice reads use Substrait plans created locally."
+            );
+        }
 
         let memory_limit = parse_memory_limit(query.memory_limit.clone());
         let target_partitions = query.target_partitions;
@@ -384,6 +402,7 @@ impl RuntimeBuilder {
         let dataset_parallelism = spicepod_rt.dataset_load_parallelism;
 
         let task_history = spicepod_rt.task_history.enabled;
+        let output_preview = task_history_output_preview(&spicepod_rt.task_history);
 
         let runtime_ready_state = spicepod_rt.ready_state;
 
@@ -405,10 +424,8 @@ impl RuntimeBuilder {
             CAYENNE_SORT_MERGE_MIN_ROWS_PARAM,
             cayenne_sort_merge_min_rows,
         );
-        let cayenne_sort_merge_memory_pool_fraction = parse_f64_runtime_param(
-            &spicepod_rt.params,
-            CAYENNE_SORT_MERGE_MEMORY_POOL_FRACTION_PARAM,
-        );
+        let cayenne_sort_merge_memory_pool_fraction =
+            resolve_cayenne_sort_merge_memory_pool_fraction(&spicepod_rt.params);
         log_applied_cayenne_param(
             CAYENNE_SORT_MERGE_MEMORY_POOL_FRACTION_PARAM,
             cayenne_sort_merge_memory_pool_fraction,
@@ -417,7 +434,11 @@ impl RuntimeBuilder {
         let cayenne_segment_cache_mb =
             parse_usize_runtime_param(&spicepod_rt.params, CAYENNE_SEGMENT_CACHE_MB_PARAM);
         log_applied_cayenne_param(CAYENNE_SEGMENT_CACHE_MB_PARAM, cayenne_segment_cache_mb);
-        install_segment_cache(cayenne_segment_cache_mb);
+        // The cache decision must exist before a Cayenne table added through DDL can
+        // initialize, but an initially non-Cayenne Spicepod has no user-visible
+        // Cayenne cache to report at startup.
+        let cayenne_configured = cayenne_configured_for_startup_log(self.app.as_ref());
+        install_segment_cache(cayenne_segment_cache_mb, cayenne_configured);
         let cayenne_filter_propagation = parse_cayenne_filter_propagation(&spicepod_rt.params);
 
         // Process-global SQLite metastore pragma tuning (cache, mmap, busy
@@ -460,17 +481,27 @@ impl RuntimeBuilder {
                         .unwrap_or(metastore_cfg.wal_truncate_threshold_bytes);
             }
             if let Some(av) = spicepod_rt.params.get(CAYENNE_METASTORE_AUTO_VACUUM_PARAM) {
-                metastore_cfg.auto_vacuum = match av.to_lowercase().as_str() {
-                    "none" => cayenne::SqliteAutoVacuum::None,
-                    "incremental" => cayenne::SqliteAutoVacuum::Incremental,
-                    "full" => cayenne::SqliteAutoVacuum::Full,
+                let mode = match av.to_lowercase().as_str() {
+                    "none" => Some(cayenne::SqliteAutoVacuum::None),
+                    "incremental" => Some(cayenne::SqliteAutoVacuum::Incremental),
+                    "full" => Some(cayenne::SqliteAutoVacuum::Full),
                     other => {
                         tracing::warn!(
-                            "Invalid cayenne_metastore_auto_vacuum value `{other}`; expected none|incremental|full, using none."
+                            "Invalid `cayenne_metastore_auto_vacuum` value '{other}'; expected none|incremental|full. Keeping the default, so metastore page reclamation is unchanged. See: https://spiceai.org/docs/components/data-accelerators/cayenne"
                         );
-                        cayenne::SqliteAutoVacuum::None
+                        None
                     }
                 };
+                // Like every sibling tunable in this block, an unusable value
+                // leaves `metastore_cfg` on the value it already holds — one
+                // source for the default, which cannot drift when it moves.
+                if let Some(mode) = mode {
+                    metastore_cfg.auto_vacuum = mode;
+                }
+                log_applied_cayenne_param(
+                    CAYENNE_METASTORE_AUTO_VACUUM_PARAM,
+                    mode.map(|_| av.to_lowercase()),
+                );
             }
             if let Some(v) = parse_usize_runtime_param(
                 &spicepod_rt.params,
@@ -514,67 +545,17 @@ impl RuntimeBuilder {
         let cayenne_reservation_bytes =
             estimate_cayenne_reservation_bytes(self.app.as_ref(), &spicepod_rt.params);
 
-        // ---- Coordinated cgroup-aware memory budget for DuckDB accelerators ----
-        // The DataFusion query pool defaults to 90% of RAM and EACH distinct DuckDB
-        // instance defaults to DuckDB's own ~80%-of-RAM `memory_limit`; stacked they
-        // over-commit host memory (N datasets on N separate DuckDB files ⇒ N×80%).
-        // Compute a cgroup-aware split that fits, publish the per-instance cap for
-        // the DuckDB accelerator to apply, and warn with what was applied /
-        // recommended. An explicit `runtime.query.memory_limit` / per-dataset
-        // `duckdb_memory_limit` always overrides. See `runtime_acceleration::memory_budget`.
-        let duckdb_budget_inputs = duckdb_budget_inputs(self.app.as_ref());
-        let has_duckdb_instances = duckdb_budget_inputs.num_unset_instances > 0
-            || duckdb_budget_inputs.num_explicit_instances > 0;
-        let duckdb_query_pool_cap = if has_duckdb_instances {
-            // Only a CDC pod pays the reduced query-pool default (it leaves room for
-            // the in-memory tier); a bulk-only Cayenne pod keeps the standard default
-            // minus its measured cache reservation. Same expression the DataFusion
-            // builder applies, so the projected base matches the pool it will build.
-            let cayenne_cdc_active =
-                dedicated_thread_pools_enabled && cayenne_workload.uses_cdc_tier();
-            let total_memory = crate::resource_monitor::get_total_memory();
-            // DuckDB's own default memory_limit is ~80% of HOST RAM (not the cgroup
-            // limit), so project the un-coordinated ceiling from host memory —
-            // otherwise a container (host RAM > cgroup) would under-estimate it and
-            // skip coordination exactly where the OOM risk is highest.
-            let duckdb_default_per_instance =
-                runtime_acceleration::memory_budget::duckdb_default_per_instance_bytes(
-                    crate::resource_monitor::get_host_memory(),
-                );
-            let base_query_budget = crate::datafusion::builder::effective_query_memory_limit(
-                None,
-                cayenne_cdc_active,
-                cayenne_reservation_bytes,
-                None,
-            );
-            let plan = runtime_acceleration::memory_budget::plan(
-                total_memory,
-                duckdb_default_per_instance,
-                base_query_budget,
-                memory_limit,
-                &duckdb_budget_inputs,
-            );
-            runtime_acceleration::memory_budget::publish_duckdb_budget(
-                plan.per_instance_cap_bytes,
-                plan.duckdb_reservation_bytes,
-            );
-            emit_duckdb_memory_budget_warning(
-                &plan,
-                total_memory,
-                duckdb_default_per_instance,
-                &duckdb_budget_inputs,
-            );
-            plan.query_pool_cap_bytes
-        } else {
-            // No DuckDB accelerators (or the duckdb feature isn't compiled in): skip
-            // the cgroup/host memory probes and the planner entirely — the plan would
-            // NoOp anyway. Clear any previously-published budget so a hot-reload that
-            // removed all DuckDB accelerators doesn't leave a stale reservation.
-            runtime_acceleration::memory_budget::publish_duckdb_budget(0, 0);
-            None
-        };
-
         let caching = Runtime::init_caching(Some(&spicepod_rt.caching));
+        // Invalid `warmup` + `cache_key_type: sql` is rejected when the spicepod
+        // deserializes (`validate_sql_results_warmup_config`), so `spiced` never
+        // reaches build with that combination. Programmatic `AppBuilder::with_sql_cache`
+        // bypasses that check, so also require `CacheKeyType::Plan` here — warmup
+        // replays parameterized templates that only match plan-keyed live queries.
+        let results_cache_warmup_enabled = spicepod_rt
+            .caching
+            .sql_results
+            .as_ref()
+            .is_some_and(sql_results_cache_warmup_enabled);
         let io_runtime = self.io_runtime.clone().unwrap_or_else(|| Handle::current());
 
         // Resolve CDC tunables once at startup so the per-envelope hot path
@@ -607,11 +588,37 @@ impl RuntimeBuilder {
             Some(ClusterRole::Executor)
         );
 
+        // Every instance with `runtime.state` checks its location at startup. The
+        // features that keep state there write only once the check has passed.
+        let state_location_check = spicepod_rt
+            .state
+            .as_ref()
+            .map(|state| runtime_state_location::StateLocationCheck::new(&state.location));
+        if let Some(check) = &state_location_check
+            && self
+                .app
+                .as_deref()
+                .is_some_and(crate::state_location::snapshots_use_runtime_state)
+        {
+            check.record_feature(runtime_state_location::StateFeature::Snapshots);
+        }
+
         // Create the shared app reference early so DataFusion, Runtime, and PartitionService share it.
         let shared_app: Arc<RwLock<Option<Arc<App>>>> = Arc::new(RwLock::new(self.app));
 
         let http_rate_control_registry = build_http_rate_control_registry(
             spicepod_rt.source_rate_control.as_ref(),
+            spicepod_rt.state.as_ref(),
+            state_location_check.as_ref(),
+            Arc::clone(&secrets),
+            io_runtime.clone(),
+        )
+        .await;
+
+        let results_cache_warmer = crate::datafusion::query::build_results_cache_warmer(
+            results_cache_warmup_enabled,
+            spicepod_rt.state.as_ref(),
+            state_location_check.as_ref(),
             Arc::clone(&secrets),
             io_runtime.clone(),
         )
@@ -629,17 +636,17 @@ impl RuntimeBuilder {
         {
             Some(ClusterRole::Scheduler) => {
                 // For a real object store, cluster_state.bootstrap() is called by start_scheduler_registry.
-                if let Some(scheduler_config) = shared_app
+                if let Some(scheduler_state) = shared_app
                     .read()
                     .await
                     .as_ref()
-                    .and_then(|app| app.runtime.scheduler.clone())
+                    .and_then(|app| app.runtime.scheduler_state())
                 {
                     match crate::cluster::scheduler_registry::build_object_store_internal(
                         Arc::clone(&secrets),
                         io_runtime.clone(),
-                        &scheduler_config.state_location,
-                        &scheduler_config,
+                        &scheduler_state,
+                        state_location_check.as_ref(),
                     )
                     .await
                     {
@@ -687,7 +694,7 @@ impl RuntimeBuilder {
                     }
                 } else {
                     tracing::warn!(
-                        "'--role scheduler' was specified but no `runtime.scheduler` field was found in spicepod.yaml. Using in-memory cluster state."
+                        "'--role scheduler' was specified but no resolved `runtime.scheduler.state_location` / `runtime.state.location` was found in spicepod.yaml. Using in-memory cluster state."
                     );
                     let store: Arc<dyn object_store::ObjectStore> =
                         Arc::new(object_store::memory::InMemory::new());
@@ -729,6 +736,7 @@ impl RuntimeBuilder {
             }
             Some(ClusterRole::Executor) => Some(DistributedNode::Executor {
                 partition_assignments: Arc::new(RwLock::new(HashMap::new())),
+                assignment_updates: Arc::default(),
                 outbound_broadcaster: crate::cluster::ExecutorOutboundBroadcaster::default(),
             }),
             None => None, // No cluster config means we're running in standalone mode
@@ -741,15 +749,27 @@ impl RuntimeBuilder {
         )
         .memory_limit(memory_limit)
         .target_partitions(target_partitions)
+        .role(role)
         .max_concurrent_queries(max_concurrent_queries)
         .prefer_hash_join(query.prefer_hash_join)
         .eager_aggregation(query.eager_aggregation)
         .eager_aggregation_min_reduction_factor(query.eager_aggregation_min_reduction_factor)
         .eager_aggregation_max_pushed_groups(query.eager_aggregation_max_pushed_groups)
+        .cte_materialization(query.cte_materialization)
         .temp_directory(query.temp_directory)
         .spill_compression(query.spill_compression)
         .with_task_history(task_history)
+        .with_query_error_logging(query.log_errors)
+        .with_output_preview(output_preview)
         .with_caching(caching)
+        .with_results_cache_warmup_enabled(results_cache_warmup_enabled)
+        .with_results_cache_warmer(results_cache_warmer)
+        .with_runtime_state_location(
+            spicepod_rt
+                .state
+                .as_ref()
+                .map(|state| state.location.clone()),
+        )
         .with_metrics(metrics)
         .with_resource_monitor(resource_monitor.clone())
         .with_url_tables(url_tables_enabled)
@@ -760,7 +780,6 @@ impl RuntimeBuilder {
         .cayenne_workload(cayenne_workload)
         .dedicated_thread_pools_enabled(dedicated_thread_pools_enabled)
         .cayenne_reservation_bytes(cayenne_reservation_bytes)
-        .duckdb_query_pool_cap(duckdb_query_pool_cap)
         .cayenne_optimizer_rules(cayenne_optimizer_rules);
 
         if let Some(DistributedNode::Scheduler {
@@ -814,6 +833,8 @@ impl RuntimeBuilder {
             embeds: Arc::new(RwLock::new(HashMap::new())),
             rerankers: Arc::new(RwLock::new(HashMap::new())),
             tools: Arc::new(RwLock::new(HashMap::new())),
+            #[cfg(feature = "mcp")]
+            mcp_schemas: runtime_tools::mcp::server::McpSchemaSnapshot::new(),
             tool_factories: Arc::new(Mutex::new(HashMap::new())),
             pods_watcher: Arc::new(RwLock::new(self.pods_watcher)),
             secrets,
@@ -837,8 +858,20 @@ impl RuntimeBuilder {
             dataset_load_semaphore: Arc::new(tokio::sync::Semaphore::new(
                 dataset_parallelism.unwrap_or(tokio::sync::Semaphore::MAX_PERMITS),
             )),
+            dataset_loads: Arc::default(),
+            model_loads: Arc::default(),
+            tool_loads: Arc::default(),
+            tool_udfs: Arc::default(),
+            search_primary_keys: runtime_search::search_engine::ExplicitPrimaryKeys::default(),
+            view_loads: Arc::default(),
             telemetry_config: self.telemetry_config,
+            snapshot_sources: Arc::default(),
+            state_location_check: state_location_check.clone(),
         };
+
+        if let (Some(state), Some(check)) = (spicepod_rt.state.clone(), state_location_check) {
+            crate::state_location::spawn_check(&rt, state, check);
+        }
 
         // Executors: register cluster status before any concurrent
         // `load_components` / `start_servers` race so readiness cannot pass on
@@ -853,7 +886,11 @@ impl RuntimeBuilder {
             let mut extension = factory.create();
             let extension_name = extension.name();
             if let Err(err) = extension.initialize(&rt).await {
-                eprintln!("Failed to initialize extension {extension_name}: {err}");
+                tracing::error!(
+                    "Failed to initialize extension '{extension_name}', so the features it \
+                     provides are unavailable: {cause} See: https://spiceai.org/docs",
+                    cause = util::single_line(&err.to_string())
+                );
             } else {
                 extensions.insert(extension_name.into(), extension.into());
             }
@@ -869,18 +906,15 @@ impl RuntimeBuilder {
         let _guard = TimeMeasurement::new(&metrics::secrets::STORES_LOAD_DURATION_MS, &[]);
         let mut secrets = secrets::Secrets::new();
 
-        if let Some(app) = app {
-            // `load_secrets` runs before `spiced::init_tracing` installs the
-            // global subscriber, so any `tracing::*` events emitted by
-            // `Secrets::load_from` and the per-store `init()` paths would
-            // otherwise be dropped on the floor. That hides actionable errors
-            // like "Vault address unreachable" or "AWS credentials missing"
-            // and leaves the operator with only the downstream
-            // "undefined store" message at lookup time. Wrap the await in a
-            // temporary subscriber so those diagnostics surface.
-            if let Err(e) = in_tracing_context_async(secrets.load_from(&app.secrets)).await {
-                eprintln!("Error loading secret stores: {e}");
-            }
+        if let Some(app) = app
+            && let Err(e) = secrets.load_from(&app.secrets).await
+        {
+            tracing::error!(
+                "Failed to load the secret stores declared in the spicepod, so components \
+                 resolving a secret reference will not start: {cause} \
+                 See: https://spiceai.org/docs/components/secret-stores",
+                cause = util::single_line(&e.to_string())
+            );
         }
 
         secrets
@@ -906,60 +940,64 @@ impl Default for RuntimeBuilder {
 )]
 async fn build_http_rate_control_registry(
     source_rate_control: Option<&SpicepodSourceRateControl>,
+    runtime_state: Option<&spicepod::component::runtime::RuntimeState>,
+    state_location_check: Option<&Arc<runtime_state_location::StateLocationCheck>>,
     secrets: Arc<RwLock<Secrets>>,
     io_runtime: Handle,
 ) -> Arc<dataconnector::http_rate_control::HttpRateControlRegistry> {
-    let _ = (&secrets, &io_runtime);
-    if source_rate_control
-        .and_then(|config| config.state_location.as_ref())
-        .is_some()
-    {
-        tracing::warn!(
-            "Persisted HTTP governor rate-control state requires a Spice.ai Enterprise build. Falling back to in-memory HTTP rate-control state."
+    let _ = (
+        source_rate_control,
+        state_location_check,
+        &secrets,
+        &io_runtime,
+    );
+    // `runtime.state` also serves the scheduler and results-cache warmup, so
+    // setting it is not a request for cluster rate control: no warning.
+    if runtime_state.is_some() {
+        tracing::debug!(
+            "Cluster HTTP rate control requires a Spice.ai Enterprise build. HTTP rate limits apply to each instance on its own."
         );
     }
     Arc::new(dataconnector::http_rate_control::HttpRateControlRegistry::default())
 }
 
+/// Persists HTTP rate-control state at `runtime.state.location`, so instances
+/// that share that location share each origin's request budget. Without
+/// `runtime.state`, rate control stays in memory.
 #[cfg(feature = "rate-control")]
 async fn build_http_rate_control_registry(
     source_rate_control: Option<&SpicepodSourceRateControl>,
+    runtime_state: Option<&spicepod::component::runtime::RuntimeState>,
+    state_location_check: Option<&Arc<runtime_state_location::StateLocationCheck>>,
     secrets: Arc<RwLock<Secrets>>,
     io_runtime: Handle,
 ) -> Arc<dataconnector::http_rate_control::HttpRateControlRegistry> {
-    let Some((state_location, params, refresh_interval, config_path)) = source_rate_control
-        .and_then(|config| {
-            config.state_location.as_deref().map(|state_location| {
-                (
-                    state_location,
-                    config.params.as_ref(),
-                    config.refresh_interval.as_str(),
-                    "runtime.source_rate_control",
-                )
-            })
-        })
-    else {
+    let Some(state) = runtime_state else {
         return Arc::new(dataconnector::http_rate_control::HttpRateControlRegistry::default());
     };
 
-    let Some(refresh_interval) = parse_rate_control_refresh_interval(refresh_interval, config_path)
-    else {
+    let Some(refresh_interval) = rate_control_refresh_interval(source_rate_control) else {
         return Arc::new(dataconnector::http_rate_control::HttpRateControlRegistry::default());
     };
 
-    match crate::object_store_state::build_object_store(
+    match runtime_state_location::build_object_store(
         secrets,
         io_runtime,
-        state_location,
-        params,
-        "rate-control state",
+        &state.into(),
+        runtime_state_location::StateFeature::RateControl,
     )
     .await
     {
         Ok((store, base_prefix)) => {
+            let store = match state_location_check {
+                Some(check) => {
+                    check.guard(runtime_state_location::StateFeature::RateControl, store)
+                }
+                None => store,
+            };
             tracing::info!(
                 "Initialized persisted HTTP governor rate-control state with location: {}",
-                state_location
+                state.location
             );
             let registry = Arc::new(dataconnector::http_rate_control::HttpRateControlRegistry::with_persisted_governor_state(
                 store,
@@ -978,21 +1016,29 @@ async fn build_http_rate_control_registry(
     }
 }
 
+/// `runtime.source_rate_control.refresh_interval`, or its default when the
+/// section is absent. Logs and returns `None` when the value is not a positive
+/// duration.
 #[cfg(feature = "rate-control")]
-fn parse_rate_control_refresh_interval(
-    refresh_interval: &str,
-    config_path: &str,
+fn rate_control_refresh_interval(
+    source_rate_control: Option<&SpicepodSourceRateControl>,
 ) -> Option<Duration> {
-    match fundu::parse_duration(refresh_interval) {
+    let refresh_interval = source_rate_control.map_or_else(
+        spicepod::component::runtime::default_rate_control_refresh_interval,
+        |config| config.refresh_interval.clone(),
+    );
+    match fundu::parse_duration(&refresh_interval) {
         Ok(parsed_refresh_interval) if parsed_refresh_interval.is_zero() => {
             tracing::error!(
-                "Invalid {config_path}.refresh_interval '{refresh_interval}': value must be greater than 0"
+                "Invalid runtime.source_rate_control.refresh_interval '{refresh_interval}': value must be greater than 0"
             );
             None
         }
         Ok(parsed_refresh_interval) => Some(parsed_refresh_interval),
         Err(error) => {
-            tracing::error!("Invalid {config_path}.refresh_interval '{refresh_interval}': {error}");
+            tracing::error!(
+                "Invalid runtime.source_rate_control.refresh_interval '{refresh_interval}': {error}"
+            );
             None
         }
     }
@@ -1009,19 +1055,15 @@ fn parse_memory_limit(memory_limit: Option<String>) -> Option<u64> {
         .map(|v| v.get_adjusted_unit(byte_unit::Unit::B).get_value() as u64);
 
     if memory_limit.is_none() {
-        in_tracing_context(|| {
-            tracing::warn!(
-                "An invalid Runtime memory limit was specified: {original_memory_limit} A memory limit must be specified as an integer in GB, MB, or KB size."
-            );
-        });
+        tracing::warn!(
+            "An invalid Runtime memory limit was specified: {original_memory_limit} A memory limit must be specified as an integer in GB, MB, or KB size."
+        );
     }
 
     if memory_limit == Some(0) {
-        in_tracing_context(|| {
-            tracing::warn!(
-                "A Runtime memory limit of 0 was specified: {original_memory_limit} A memory limit must be greater than 0."
-            );
-        });
+        tracing::warn!(
+            "A Runtime memory limit of 0 was specified: {original_memory_limit} A memory limit must be greater than 0."
+        );
         None
     } else {
         memory_limit
@@ -1081,7 +1123,7 @@ fn segment_cache_budget_bytes(configured_mb: Option<usize>) -> u64 {
 /// nothing until something inserts into it, so installing costs nothing, while
 /// reserving against the query pool for a cache no table can read would shrink
 /// every other query's budget for nothing.
-fn install_segment_cache(configured_mb: Option<usize>) {
+fn install_segment_cache(configured_mb: Option<usize>, cayenne_configured: bool) {
     // `runtime.params.cayenne_segment_cache_mb` is the only input. Per-table values
     // sized a per-table cache; there is no conversion from them to a shared budget
     // that is not invented, and a single dataset's setting must not decide the
@@ -1096,10 +1138,12 @@ fn install_segment_cache(configured_mb: Option<usize>) {
         return;
     }
     if vortex_datafusion::install_process_segment_cache(bytes) {
-        tracing::info!(
-            "Vortex segment cache installed: {} MB shared across all Cayenne tables",
-            bytes / (1024 * 1024)
-        );
+        if cayenne_configured {
+            tracing::info!(
+                "Vortex segment cache installed: {} MB shared across all Cayenne tables",
+                bytes / (1024 * 1024)
+            );
+        }
     } else {
         // A second runtime in one process (tests, embedded hosts) keeps the cache
         // the first one installed; the budget is process-wide by construction.
@@ -1129,6 +1173,15 @@ fn warn_on_unknown_runtime_params(params: &HashMap<String, String>) {
         if known.contains(&key.as_str()) {
             continue;
         }
+        // A renamed key gets one message naming its replacement, not a second
+        // "not recognized" one.
+        if let Some((old, new)) = RENAMED_RUNTIME_TUNING_PARAMS
+            .iter()
+            .find(|(old, _)| *old == key.as_str())
+        {
+            tracing::warn!("{}", renamed_runtime_param_warning(old, new));
+            continue;
+        }
         if let Some(suggestion) = util::levenshtein::closest_match(key, &known) {
             tracing::warn!(
                 "runtime.params.{key} is not a recognized runtime parameter; did you mean '{suggestion}'? Ignoring."
@@ -1153,60 +1206,6 @@ fn parse_usize_runtime_param(params: &HashMap<String, String>, key: &str) -> Opt
             );
             None
         }
-    }
-}
-
-/// What the Cayenne accelerations configured in a Spicepod will demand of the host,
-/// aggregated over every enabled one. Decides how much memory the runtime reserves
-/// outside the query pool and which dedicated thread pools it brings up.
-///
-/// Both flags are unions, so one CDC table in a pod of full-refresh tables still
-/// gets the full CDC-shaped reservation.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub struct CayenneWorkload {
-    /// Any enabled Cayenne acceleration at all.
-    configured: bool,
-    /// Any table on a profile that can hold rows in the off-pool in-memory CDC
-    /// tier. Gates the coordinated host-memory partition — the reduced query-pool
-    /// default and the global mem-tier byte budget — which exists solely to leave
-    /// room for that tier. A pod without one cannot fill it
-    /// (`cdc_durability` is forced to `file` off the small-write profile), so
-    /// fencing ~20% of host for it would shrink the query pool for nothing.
-    ///
-    /// Deliberately NOT narrowed to a file acceleration mode, unlike
-    /// `needs_compaction`: a `mode: memory` table holds its whole dataset in that
-    /// tier permanently, so it is the case that most needs the room reserved.
-    uses_cdc_tier: bool,
-    /// Any table that accumulates Vortex files for compaction to consolidate — a
-    /// file acceleration mode on a profile that is not a whole-table replace (see
-    /// `compacts_into_carved_pool`). Gates the dedicated compaction runtime and its
-    /// carved memory pool.
-    needs_compaction: bool,
-}
-
-impl CayenneWorkload {
-    #[must_use]
-    pub const fn is_configured(self) -> bool {
-        self.configured
-    }
-
-    #[must_use]
-    pub const fn uses_cdc_tier(self) -> bool {
-        self.uses_cdc_tier
-    }
-
-    #[must_use]
-    pub const fn needs_compaction(self) -> bool {
-        self.needs_compaction
-    }
-
-    /// Whether bringing up the dedicated compaction runtime is worthwhile. True
-    /// unless no configured Cayenne acceleration can produce files to compact — a
-    /// pod with no Cayenne at all still gets one, because a table created later by
-    /// DDL may compact and would otherwise fall back to the ambient runtime.
-    #[must_use]
-    pub const fn may_compact(self) -> bool {
-        !self.configured || self.needs_compaction
     }
 }
 
@@ -1302,26 +1301,16 @@ pub fn streams_cdc_changes(app: Option<&Arc<app::App>>) -> bool {
 /// This enumerates component kinds by hand because it runs *before* initialization,
 /// against the Spicepod — the pre-init counterpart of the `AccelerationSource`
 /// trait that datasets and views both implement once components exist.
-#[cfg(not(windows))]
 fn cayenne_workload(app: Option<&Arc<app::App>>) -> CayenneWorkload {
     let Some(app) = app else {
         return CayenneWorkload::default();
     };
     cayenne_accelerations(app).fold(CayenneWorkload::default(), |workload, (accel, profile)| {
-        CayenneWorkload {
-            configured: true,
-            uses_cdc_tier: workload.uses_cdc_tier || profile.uses_cdc_tier,
-            needs_compaction: workload.needs_compaction
-                || compacts_into_carved_pool(&accel, profile),
-        }
+        workload.with_acceleration(CayenneAccelerationDemand {
+            uses_cdc_tier: profile.uses_cdc_tier,
+            needs_compaction: compacts_into_carved_pool(&accel, profile),
+        })
     })
-}
-
-/// Cayenne is not compiled on Windows (`accelerator-cayenne` is a `cfg(not(windows))`
-/// dependency), so no acceleration there can demand anything of the host.
-#[cfg(windows)]
-fn cayenne_workload(_app: Option<&Arc<app::App>>) -> CayenneWorkload {
-    CayenneWorkload::default()
 }
 
 /// Whether an enabled Cayenne acceleration can compact into the carved compaction
@@ -1335,7 +1324,6 @@ fn cayenne_workload(_app: Option<&Arc<app::App>>) -> CayenneWorkload {
 /// - **A profile that accumulates files.** A whole-table replace discards what the
 ///   previous refresh wrote, leaving nothing to consolidate; every other profile
 ///   builds files up across writes.
-#[cfg(not(windows))]
 fn compacts_into_carved_pool(
     accel: &spicepod::acceleration::Acceleration,
     profile: data_accelerator_api::SpicepodWriteProfile,
@@ -1353,18 +1341,12 @@ fn compacts_into_carved_pool(
 /// An accelerated catalog counts once, not once per table: how many tables it
 /// discovers is unknowable before the connector connects. The count is a log line
 /// about which configuration earned the carve, not a table census.
-#[cfg(not(windows))]
 fn count_compaction_eligible_accelerations(app: Option<&Arc<app::App>>) -> usize {
     app.map_or(0, |app| {
         cayenne_accelerations(app)
             .filter(|(accel, profile)| compacts_into_carved_pool(accel, *profile))
             .count()
     })
-}
-
-#[cfg(windows)]
-fn count_compaction_eligible_accelerations(_app: Option<&Arc<app::App>>) -> usize {
-    0
 }
 
 /// The Cayenne memory decisions the Runtime builder makes at startup.
@@ -1441,7 +1423,6 @@ fn plan_cayenne_memory_budgets(
 /// at all — [`cayenne_accelerations`] converts a catalog's `CatalogAcceleration`
 /// and drops the catalogs that have none, which is every catalog of this shape.
 /// It is the one way a pod hosts Cayenne tables that no acceleration block names.
-#[cfg(not(windows))]
 fn reads_from_cayenne_catalog(app: &Arc<app::App>) -> bool {
     app.catalogs.iter().any(|catalog| {
         catalog
@@ -1450,6 +1431,16 @@ fn reads_from_cayenne_catalog(app: &Arc<app::App>) -> bool {
             .next()
             .is_some_and(|prefix| prefix.eq_ignore_ascii_case("cayenne"))
     })
+}
+
+/// Whether the pod has anything a user would call "Cayenne" at startup — the
+/// same union [`estimate_cayenne_reservation_bytes`] uses to decide whether the
+/// pod draws on the shared segment cache. A `from: cayenne` catalog declares no
+/// acceleration of its own (see [`reads_from_cayenne_catalog`]), so gating the
+/// startup log on [`CayenneWorkload::is_configured`] alone would suppress it for
+/// a catalog-only pod even though that pod installs and uses the cache.
+fn cayenne_configured_for_startup_log(app: Option<&Arc<app::App>>) -> bool {
+    cayenne_workload(app).is_configured() || app.is_some_and(reads_from_cayenne_catalog)
 }
 
 /// Every enabled Cayenne acceleration in `app`, paired with its RESOLVED write
@@ -1475,7 +1466,6 @@ fn reads_from_cayenne_catalog(app: &Arc<app::App>) -> bool {
 ///
 /// The yielded acceleration is therefore owned for a catalog and borrowed for the
 /// two component kinds that declare one directly.
-#[cfg(not(windows))]
 fn cayenne_accelerations(
     app: &Arc<app::App>,
 ) -> impl Iterator<
@@ -1512,13 +1502,7 @@ fn cayenne_accelerations(
             (converted, RefreshMode::Changes)
         }))
         .filter_map(|(accel, unset)| accel.map(|accel| (accel, unset)))
-        .filter(|(accel, _)| {
-            accel.enabled
-                && accel
-                    .engine
-                    .as_deref()
-                    .is_some_and(|engine| engine.eq_ignore_ascii_case("cayenne"))
-        })
+        .filter(|(accel, _)| accel.enabled && accel.engine_name().eq_ignore_ascii_case("cayenne"))
         .filter_map(|(accel, unset)| {
             // The engine classifies; this only enumerates. Filtered rather than
             // defaulted: a build with no Cayenne engine linked declares no Cayenne
@@ -1532,7 +1516,6 @@ fn cayenne_accelerations(
 ///
 /// Reached through the registration slice rather than by naming the engine crate, which
 /// the runtime must not depend on.
-#[cfg(not(windows))]
 pub(crate) fn cayenne_write_profile(
     acceleration: &spicepod::acceleration::Acceleration,
     unset_refresh_mode: RefreshMode,
@@ -1541,7 +1524,9 @@ pub(crate) fn cayenne_write_profile(
         .iter()
         .find(|registration| registration.engine == runtime_acceleration::Engine::Cayenne)
         .and_then(|registration| {
-            (registration.constructor)().spicepod_write_profile(acceleration, unset_refresh_mode)
+            registration
+                .build_with_defaults()?
+                .spicepod_write_profile(acceleration, unset_refresh_mode)
         })
 }
 
@@ -1584,7 +1569,6 @@ pub(crate) fn cayenne_write_profile(
 /// before the connector connects. Under-counting a catalog leaves the query pool
 /// larger than the tables warrant, but counting it as zero — which is what excluding
 /// catalogs did — reserves nothing at all for a pod built entirely on one.
-#[cfg(not(windows))]
 fn estimate_cayenne_reservation_bytes(
     app: Option<&Arc<app::App>>,
     runtime_params: &HashMap<String, String>,
@@ -1698,137 +1682,6 @@ fn estimate_cayenne_reservation_bytes(
     total
 }
 
-/// Cayenne is not compiled on Windows (`accelerator-cayenne` is a `cfg(not(windows))`
-/// dependency), so nothing there holds an off-pool Cayenne cache.
-#[cfg(windows)]
-fn estimate_cayenne_reservation_bytes(
-    _app: Option<&Arc<app::App>>,
-    _runtime_params: &HashMap<String, String>,
-) -> u64 {
-    0
-}
-
-/// Deduped-by-instance summary of the `DuckDB` accelerators in `app`, for the
-/// coordinated memory budget ([`runtime_acceleration::memory_budget::plan`]).
-///
-/// Groups accelerations by `DuckDB` instance identity — one per distinct resolved
-/// file path, plus a single shared key for all memory-mode accelerations (mirroring
-/// the fork's `DbInstanceKey`) — and classifies each instance as explicit (something
-/// on it sets `duckdb_memory_limit`, taking the max) or un-limited. Imperfect path
-/// canonicalization only ever OVER-counts instances, yielding smaller, safer caps.
-///
-/// Covers both `app.datasets` and `app.views`: a view carries its own `acceleration`
-/// block and creates a `DuckDB` instance exactly as a dataset does, so an instance
-/// the budget cannot see is an instance left at `DuckDB`'s own ~80%-of-RAM default —
-/// the over-commit this budget exists to prevent. Catalogs are excluded because they
-/// cannot create a `DuckDB` instance at all: `CatalogAcceleration`'s engine enum
-/// admits only Cayenne. That is a statement about this engine, not about whether a
-/// catalog demands memory — the Cayenne classification counts catalogs (see
-/// `cayenne_accelerations`).
-///
-/// This enumerates component kinds by hand because it runs *before* initialization,
-/// against the Spicepod. It is the pre-init mirror of the `AccelerationSource` trait,
-/// which datasets and views both implement and which is therefore already
-/// kind-agnostic once components exist — the authority after init, but unavailable
-/// to the builder here.
-#[cfg(feature = "duckdb")]
-fn duckdb_budget_inputs(
-    app: Option<&Arc<app::App>>,
-) -> runtime_acceleration::memory_budget::DuckDbBudgetInputs {
-    use runtime_acceleration::memory_budget::DuckDbBudgetInputs;
-
-    // The instance-identity rule is `DuckDB`'s own — it resolves `duckdb_file`,
-    // `duckdb_data_dir` and the default filename through the same factory the engine
-    // opens databases with — so the engine answers, and the two cannot disagree about
-    // which accelerations share an instance. Asked through the registration slice
-    // rather than by naming the engine crate, which the runtime must not depend on.
-    data_accelerator_api::DATA_ACCELERATOR_REGISTRATIONS
-        .iter()
-        .find(|registration| registration.engine == runtime_acceleration::Engine::DuckDB)
-        .map_or_else(DuckDbBudgetInputs::default, |registration| {
-            (registration.constructor)().memory_budget_inputs(app)
-        })
-}
-
-/// Without the `duckdb` feature no `DuckDB` accelerators can be configured, so the
-/// coordinated budget has nothing to do.
-#[cfg(not(feature = "duckdb"))]
-fn duckdb_budget_inputs(
-    _app: Option<&Arc<app::App>>,
-) -> runtime_acceleration::memory_budget::DuckDbBudgetInputs {
-    runtime_acceleration::memory_budget::DuckDbBudgetInputs::default()
-}
-
-/// Emits the "auto-limit with warning" guidance when the coordinated `DuckDB`
-/// budget engaged. `NoOp` (no `DuckDB` accelerators, or the naive ceilings already
-/// fit) stays silent.
-fn emit_duckdb_memory_budget_warning(
-    plan: &runtime_acceleration::memory_budget::AcceleratorMemoryPlan,
-    total_memory: u64,
-    duckdb_default_per_instance: u64,
-    inputs: &runtime_acceleration::memory_budget::DuckDbBudgetInputs,
-) {
-    use runtime_acceleration::memory_budget::PlanOutcome;
-
-    if plan.outcome != PlanOutcome::Applied {
-        return;
-    }
-
-    let hb = |bytes: u64| util::human_readable_bytes(usize::try_from(bytes).unwrap_or(usize::MAX));
-    let n = inputs.num_unset_instances;
-    let total_h = hb(total_memory);
-    let query_h = hb(plan.effective_query_pool_bytes);
-    let per_instance_h = hb(plan.per_instance_cap_bytes);
-    // DuckDB's own default is ~80% of HOST RAM (not the cgroup total) — the value the
-    // projection/decision used.
-    let duckdb_default_h = hb(duckdb_default_per_instance);
-    let mixed = if inputs.has_mixed_instance {
-        " One or more DuckDB instances have inconsistent duckdb_memory_limit across the datasets that share them (mixed set/unset, or different explicit values); because DuckDB's memory_limit is per-instance the last dataset created wins, so set it consistently on all datasets sharing an instance."
-    } else {
-        ""
-    };
-
-    if n == 0 {
-        // Every DuckDB instance set an explicit duckdb_memory_limit — there are no
-        // un-limited instances to auto-cap, only the query pool was reduced to fit
-        // those explicit ceilings. (Describe just that, not a "0 instances capped".)
-        if plan.residual_overcommit {
-            tracing::warn!(
-                total_memory_bytes = total_memory,
-                query_pool_bytes = plan.effective_query_pool_bytes,
-                duckdb_explicit_bytes = inputs.sum_explicit_bytes,
-                "The explicit DuckDB accelerator memory limits plus the query memory limit exceed the coordinated memory budget and cut into the safety headroom below the {total_h} available to this process; combined ceilings may approach or exceed it and risk an OOM kill under load. Lower the per-dataset duckdb_memory_limit values and/or runtime.query.memory_limit so combined ceilings fit.{mixed} For details, visit: https://spiceai.org/docs/reference/memory"
-            );
-        } else {
-            tracing::warn!(
-                total_memory_bytes = total_memory,
-                query_pool_bytes = plan.effective_query_pool_bytes,
-                duckdb_explicit_bytes = inputs.sum_explicit_bytes,
-                "Reduced the DataFusion query memory limit to {query_h} so it plus the explicit DuckDB accelerator memory limits fit the {total_h} available to this process. To customize, set runtime.query.memory_limit.{mixed} For details, visit: https://spiceai.org/docs/reference/memory"
-            );
-        }
-    } else if plan.residual_overcommit {
-        tracing::warn!(
-            total_memory_bytes = total_memory,
-            projected_ceiling_bytes = plan.projected_ceiling_bytes,
-            query_pool_bytes = plan.effective_query_pool_bytes,
-            duckdb_unset_instances = n,
-            recommended_duckdb_memory_limit_bytes = plan.per_instance_cap_bytes,
-            recommended_query_memory_limit_bytes = plan.effective_query_pool_bytes,
-            "Even after auto-capping, the {n} DuckDB instance(s) without an explicit duckdb_memory_limit plus the query memory limit exceed the coordinated memory budget and cut into the safety headroom below the {total_h} available to this process; combined ceilings may approach or exceed it and risk an OOM kill under load. Reduce the number of distinct DuckDB files, or set runtime.query.memory_limit: \"{query_h}\" and duckdb_memory_limit: \"{per_instance_h}\" on each DuckDB-accelerated dataset so combined ceilings fit.{mixed} For details, visit: https://spiceai.org/docs/reference/memory"
-        );
-    } else {
-        tracing::warn!(
-            total_memory_bytes = total_memory,
-            query_pool_bytes = plan.effective_query_pool_bytes,
-            duckdb_unset_instances = n,
-            duckdb_per_instance_bytes = plan.per_instance_cap_bytes,
-            duckdb_unset_instance_paths = ?inputs.unset_instance_labels,
-            "Detected potential memory over-commit from DuckDB accelerators and automatically capped memory to fit the {total_h} available to this process: {n} DuckDB instance(s) without an explicit duckdb_memory_limit — each would otherwise default to ~80% of host RAM (about {duckdb_default_h} here, or more in a container where DuckDB sees the host's RAM rather than this process's cgroup limit) — are capped at {per_instance_h} each, and the query memory limit at {query_h}. To customize, set runtime.query.memory_limit and/or per-dataset duckdb_memory_limit.{mixed} For details, visit: https://spiceai.org/docs/reference/memory"
-        );
-    }
-}
-
 fn parse_f64_runtime_param(params: &HashMap<String, String>, key: &str) -> Option<f64> {
     let raw = params.get(key)?;
     match raw.parse::<f64>() {
@@ -1859,6 +1712,42 @@ fn clamp_cayenne_compaction_memory_fraction(value: f64) -> f64 {
         );
     }
     clamped
+}
+
+/// Resolve the sort-merge memory-pool fraction a spicepod requested into the
+/// one the planner will act on. Composed as a single function so the value
+/// [`log_applied_cayenne_param`] reports and the value that reaches the planner
+/// cannot drift apart at the call site.
+fn resolve_cayenne_sort_merge_memory_pool_fraction(
+    params: &HashMap<String, String>,
+) -> Option<f64> {
+    parse_f64_runtime_param(params, CAYENNE_SORT_MERGE_MEMORY_POOL_FRACTION_PARAM)
+        .map(clamp_cayenne_sort_merge_memory_pool_fraction)
+}
+
+/// Clamp the sort-merge memory-pool fraction to the range the planner acts on,
+/// so [`log_applied_cayenne_param`] reports the threshold actually in force
+/// rather than the requested one.
+///
+/// Only the upper bound is enforced. `0` disables the memory gate and is a
+/// supported setting, so it must not be raised, and
+/// [`parse_f64_runtime_param`] has already rejected negative values before one
+/// reaches here. Any other value passes through untouched — including `NaN`,
+/// which the parser also rejects but which the planner treats as "no gate":
+/// clamping it to the pool here would contradict that, so this returns it
+/// unchanged and leaves the decision where it already lives.
+///
+/// The planner keeps its own clamp on this fraction for callers that build a
+/// `CayenneOptimizerConfig` directly and so never pass through this admission
+/// point; this is an addition to that, not a replacement for it.
+fn clamp_cayenne_sort_merge_memory_pool_fraction(value: f64) -> f64 {
+    if value > MAX_SORT_MERGE_MEMORY_POOL_FRACTION {
+        tracing::warn!(
+            "runtime.params.{CAYENNE_SORT_MERGE_MEMORY_POOL_FRACTION_PARAM}={value} is outside the supported range [0, {MAX_SORT_MERGE_MEMORY_POOL_FRACTION}]; using {MAX_SORT_MERGE_MEMORY_POOL_FRACTION}"
+        );
+        return MAX_SORT_MERGE_MEMORY_POOL_FRACTION;
+    }
+    value
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1992,11 +1881,97 @@ fn parse_cayenne_optimizer_rules(
     }
 }
 
+/// Whether queries build the output preview. Only the `captured_output` column of
+/// `runtime.task_history` records it, so it is built when task history is enabled and
+/// `captured_output` is not `none`. A Zipkin export of the task spans never carries it:
+/// the Zipkin exporter turns each span event into an annotation holding only the event's
+/// name, and the preview is a field of its event.
+///
+/// A `captured_output` the runtime cannot read counts as recorded, so a misconfigured
+/// value costs a preview rather than losing one.
+fn task_history_output_preview(
+    task_history: &spicepod::component::runtime::TaskHistory,
+) -> OutputPreview {
+    let recorded = task_history.enabled
+        && !matches!(
+            task_history.get_captured_output(),
+            Ok(spicepod::component::runtime::TaskHistoryCapturedOutput::None)
+        );
+    if recorded {
+        OutputPreview::Build
+    } else {
+        OutputPreview::Skip
+    }
+}
+
 #[cfg(test)]
 mod test {
+
+    #[test]
+    fn sql_results_cache_warmup_requires_plan_key_type() {
+        use spicepod::component::caching::{
+            CacheKeyType, ResultsCacheWarmup, SQLResultsCacheConfig,
+        };
+
+        let plan = SQLResultsCacheConfig {
+            enabled: true,
+            warmup: ResultsCacheWarmup::OnFirstRefresh,
+            cache_key_type: CacheKeyType::Plan,
+            ..Default::default()
+        };
+        assert!(
+            super::sql_results_cache_warmup_enabled(&plan),
+            "plan key type must allow warmup"
+        );
+
+        let sql = SQLResultsCacheConfig {
+            enabled: true,
+            warmup: ResultsCacheWarmup::OnFirstRefresh,
+            cache_key_type: CacheKeyType::Sql,
+            ..Default::default()
+        };
+        assert!(
+            !super::sql_results_cache_warmup_enabled(&sql),
+            "sql key type must not enable warmup for programmatic AppBuilder configs"
+        );
+    }
+
     use super::*;
 
-    #[cfg(not(windows))]
+    /// A query's output preview is built only when something records it.
+    #[test]
+    fn a_query_output_preview_is_built_only_when_it_is_recorded() {
+        use spicepod::component::runtime::TaskHistory;
+
+        let captured = |captured_output: &str| TaskHistory {
+            captured_output: captured_output.into(),
+            ..TaskHistory::default()
+        };
+
+        assert_eq!(
+            task_history_output_preview(&TaskHistory::default()),
+            OutputPreview::Skip,
+            "the default `captured_output: none` records no preview"
+        );
+        assert_eq!(
+            task_history_output_preview(&captured("truncated")),
+            OutputPreview::Build
+        );
+        assert_eq!(
+            task_history_output_preview(&TaskHistory {
+                enabled: false,
+                ..captured("truncated")
+            }),
+            OutputPreview::Skip,
+            "with task history disabled nothing records the preview"
+        );
+        assert_eq!(
+            task_history_output_preview(&captured("everything")),
+            OutputPreview::Build,
+            "a value the runtime cannot read keeps the preview"
+        );
+    }
+
     fn dataset_with_cayenne(
         name: &str,
         segment_cache_mb: Option<&str>,
@@ -2021,7 +1996,6 @@ mod test {
     /// A pod with no Cayenne acceleration must reserve nothing. The reservation is
     /// subtracted from the query memory limit, so counting a cache that is never
     /// installed would shrink every query's budget for memory nothing allocates.
-    #[cfg(not(windows))]
     #[test]
     fn no_cayenne_acceleration_reserves_nothing() {
         let app = Arc::new(
@@ -2042,24 +2016,59 @@ mod test {
     /// The counterpart to the no-Cayenne case: a pod that does have a Cayenne
     /// table reserves its write-path state, so the gate above is what decides,
     /// not an empty estimator.
-    #[cfg(not(windows))]
     #[test]
     fn a_cayenne_acceleration_reserves_its_write_path_state() {
-        let app = Arc::new(
+        const MIB: u64 = 1024 * 1024;
+        let inline_admission = u64::try_from(cayenne::metadata::DEFAULT_INLINE_MAX_BYTES)
+            .expect("the inline entry cap fits in u64")
+            + u64::try_from(cayenne::metadata::DEFAULT_INLINE_MAX_BUFFER_BYTES)
+                .expect("the inline buffer cap fits in u64");
+
+        // A full-refresh table (postgres leaves `refresh_mode` unset, which is
+        // `full`) is a whole-table replace: it reserves the inline-admission pair
+        // and no CDC write path.
+        let full = Arc::new(
             app::AppBuilder::new("test")
                 .with_dataset(dataset_with_cayenne("accelerated", None))
                 .build(),
         );
+        assert_cayenne_reservation(&full, inline_admission);
+
+        // A `changes` table also holds the CDC write path: the keyset cache (set
+        // explicitly to 64 MiB so the figure does not depend on the host), the
+        // default 128 MiB coalesce buffer and the default 8 MiB inline memtable.
+        let mut changes = dataset_with_cayenne("changes", None);
+        let acceleration = changes
+            .acceleration
+            .as_mut()
+            .expect("the dataset has a Cayenne acceleration");
+        acceleration.refresh_mode = Some(spicepod::acceleration::RefreshMode::Changes);
+        acceleration.params = Some(spicepod::param::Params::from_string_map(
+            [("cayenne_pk_keyset_cache_mb".to_string(), "64".to_string())]
+                .into_iter()
+                .collect(),
+        ));
+        let changes = Arc::new(app::AppBuilder::new("test").with_dataset(changes).build());
+        assert_cayenne_reservation(&changes, inline_admission + 64 * MIB + 128 * MIB + 8 * MIB);
+    }
+
+    /// Asserts the reservation for `app` is `write_path` plus the process-wide
+    /// segment cache. That cache is installed at most once per process, so the
+    /// estimate, which reads it between the two reads here, matches one of them.
+    fn assert_cayenne_reservation(app: &Arc<app::App>, write_path: u64) {
+        let cache_before = vortex_datafusion::process_segment_cache_capacity_bytes().unwrap_or(0);
+        let estimate = estimate_cayenne_reservation_bytes(Some(app), &HashMap::new());
+        let cache_after = vortex_datafusion::process_segment_cache_capacity_bytes().unwrap_or(0);
         assert!(
-            estimate_cayenne_reservation_bytes(Some(&app), &HashMap::new()) > 0,
-            "a Cayenne table reserves against the query pool"
+            estimate == write_path + cache_before || estimate == write_path + cache_after,
+            "expected {write_path} bytes of write-path state plus the segment cache \
+             ({cache_before} or {cache_after} bytes), got {estimate}"
         );
     }
 
     /// A catalog-only pod hosts Cayenne tables with no dataset acceleration block,
     /// so the reservation has to see it or the shared cache grows beside a query
     /// pool that never accounted for it.
-    #[cfg(not(windows))]
     #[test]
     fn a_cayenne_catalog_reserves_even_without_a_dataset_acceleration() {
         let catalog =
@@ -2146,168 +2155,6 @@ mod test {
         }
     }
 
-    /// Builds the `duckdb` acceleration block shared by the budget-adapter tests.
-    #[cfg(feature = "duckdb")]
-    fn duckdb_acceleration(
-        mode: spicepod::acceleration::Mode,
-        params: &[(&str, &str)],
-    ) -> spicepod::acceleration::Acceleration {
-        spicepod::acceleration::Acceleration {
-            enabled: true,
-            engine: Some("duckdb".to_string()),
-            mode,
-            params: Some(spicepod::param::Params::from_string_map(
-                params
-                    .iter()
-                    .map(|(k, v)| ((*k).to_string(), (*v).to_string()))
-                    .collect::<HashMap<String, String>>(),
-            )),
-            ..spicepod::acceleration::Acceleration::default()
-        }
-    }
-
-    #[cfg(feature = "duckdb")]
-    fn duckdb_ds(
-        name: &str,
-        mode: spicepod::acceleration::Mode,
-        params: &[(&str, &str)],
-    ) -> spicepod::component::dataset::Dataset {
-        let mut ds = spicepod::component::dataset::Dataset::new("dummy:source", name);
-        ds.acceleration = Some(duckdb_acceleration(mode, params));
-        ds
-    }
-
-    #[cfg(feature = "duckdb")]
-    fn duckdb_view(
-        name: &str,
-        mode: spicepod::acceleration::Mode,
-        params: &[(&str, &str)],
-    ) -> spicepod::component::view::View {
-        duckdb_view_with(name, duckdb_acceleration(mode, params))
-    }
-
-    #[cfg(feature = "duckdb")]
-    fn duckdb_view_with(
-        name: &str,
-        acceleration: spicepod::acceleration::Acceleration,
-    ) -> spicepod::component::view::View {
-        spicepod::component::view::View::new(name.to_string())
-            .with_sql("SELECT 1")
-            .with_acceleration(acceleration)
-    }
-
-    /// Runs the budget adapter over an app built from `datasets` and `views`.
-    #[cfg(feature = "duckdb")]
-    fn budget_inputs_for(
-        datasets: Vec<spicepod::component::dataset::Dataset>,
-        views: Vec<spicepod::component::view::View>,
-    ) -> runtime_acceleration::memory_budget::DuckDbBudgetInputs {
-        let mut builder = app::AppBuilder::new("mem-budget-test");
-        for dataset in datasets {
-            builder = builder.with_dataset(dataset);
-        }
-        for view in views {
-            builder = builder.with_view(view);
-        }
-        duckdb_budget_inputs(Some(&std::sync::Arc::new(builder.build())))
-    }
-
-    /// The `DuckDB` budget adapter groups datasets by instance identity (distinct
-    /// file paths → distinct instances; a shared file or all memory-mode datasets →
-    /// one), classifies explicit vs un-limited, and ignores non-DuckDB engines.
-    #[cfg(feature = "duckdb")]
-    #[test]
-    fn test_duckdb_budget_inputs_groups_by_instance() {
-        use spicepod::acceleration::{Acceleration, Mode};
-        use spicepod::component::dataset::Dataset;
-
-        let inputs_for = |datasets: Vec<Dataset>| budget_inputs_for(datasets, vec![]);
-
-        // Two file-mode datasets on DISTINCT files → two un-limited instances.
-        let inputs = inputs_for(vec![
-            duckdb_ds("a", Mode::File, &[("duckdb_file", "/tmp/spice-mbt-a.db")]),
-            duckdb_ds("b", Mode::File, &[("duckdb_file", "/tmp/spice-mbt-b.db")]),
-        ]);
-        assert_eq!(inputs.num_unset_instances, 2);
-        assert_eq!(inputs.num_explicit_instances, 0);
-
-        // Two file-mode datasets on the SAME file share ONE instance.
-        let inputs = inputs_for(vec![
-            duckdb_ds(
-                "a",
-                Mode::File,
-                &[("duckdb_file", "/tmp/spice-mbt-shared.db")],
-            ),
-            duckdb_ds(
-                "b",
-                Mode::File,
-                &[("duckdb_file", "/tmp/spice-mbt-shared.db")],
-            ),
-        ]);
-        assert_eq!(inputs.num_unset_instances, 1);
-
-        // One explicit + one un-limited instance.
-        let inputs = inputs_for(vec![
-            duckdb_ds(
-                "a",
-                Mode::File,
-                &[
-                    ("duckdb_file", "/tmp/spice-mbt-x.db"),
-                    ("duckdb_memory_limit", "2GiB"),
-                ],
-            ),
-            duckdb_ds("b", Mode::File, &[("duckdb_file", "/tmp/spice-mbt-y.db")]),
-        ]);
-        assert_eq!(inputs.num_unset_instances, 1);
-        assert_eq!(inputs.num_explicit_instances, 1);
-        assert_eq!(inputs.sum_explicit_bytes, 2 * 1024 * 1024 * 1024);
-
-        // All memory-mode datasets collapse to ONE in-memory instance.
-        let inputs = inputs_for(vec![
-            duckdb_ds("a", Mode::Memory, &[]),
-            duckdb_ds("b", Mode::Memory, &[]),
-        ]);
-        assert_eq!(inputs.num_unset_instances, 1);
-
-        // A non-DuckDB (Arrow) accelerated dataset is ignored.
-        let mut arrow_ds = Dataset::new("dummy:source", "arrow");
-        arrow_ds.acceleration = Some(Acceleration {
-            enabled: true,
-            engine: None,
-            mode: Mode::Memory,
-            ..Acceleration::default()
-        });
-        let inputs = inputs_for(vec![arrow_ds]);
-        assert_eq!(inputs.num_unset_instances, 0);
-        assert_eq!(inputs.num_explicit_instances, 0);
-
-        // Two datasets on the SAME file with DIFFERENT explicit limits → one
-        // explicit instance flagged as inconsistent (per-instance limit is ambiguous).
-        let inputs = inputs_for(vec![
-            duckdb_ds(
-                "a",
-                Mode::File,
-                &[
-                    ("duckdb_file", "/tmp/spice-mbt-conflict.db"),
-                    ("duckdb_memory_limit", "2GiB"),
-                ],
-            ),
-            duckdb_ds(
-                "b",
-                Mode::File,
-                &[
-                    ("duckdb_file", "/tmp/spice-mbt-conflict.db"),
-                    ("duckdb_memory_limit", "4GiB"),
-                ],
-            ),
-        ]);
-        assert_eq!(inputs.num_explicit_instances, 1);
-        assert_eq!(inputs.num_unset_instances, 0);
-        assert!(inputs.has_mixed_instance, "conflicting per-instance limits");
-        // The instance's ceiling uses the max of the conflicting values.
-        assert_eq!(inputs.sum_explicit_bytes, 4 * 1024 * 1024 * 1024);
-    }
-
     /// A file-mode Cayenne acceleration. `mode` is set explicitly because the
     /// Spicepod default is `mode: memory`, which never compacts whatever its refresh
     /// mode — that would mask the refresh-mode classification these tests exercise.
@@ -2337,7 +2184,6 @@ mod test {
         ds
     }
 
-    #[cfg(not(windows))]
     fn cayenne_test_view(
         name: &str,
         accel: spicepod::acceleration::Acceleration,
@@ -2368,7 +2214,6 @@ mod test {
     /// `DataAccelerator::init` path as a dataset, so Cayenne on a view must count
     /// toward the compaction-pool gate — otherwise a view-only Cayenne pod carves no
     /// compaction pool and sizes its query pool as if no Cayenne tier existed.
-    #[cfg(not(windows))]
     #[test]
     fn cayenne_workload_counts_views_and_datasets() {
         use spicepod::component::dataset::Dataset;
@@ -2402,6 +2247,17 @@ mod test {
         // Engine matching stays case-insensitive on the view arm too.
         assert!(configured(vec![], vec![view_with("Cayenne", true)]));
 
+        // An acceleration that names no engine uses Cayenne, the default engine.
+        let unnamed = spicepod::acceleration::Acceleration {
+            engine: None,
+            ..cayenne_test_accel("cayenne", true)
+        };
+        assert!(configured(
+            vec![cayenne_test_dataset("ds", unnamed.clone())],
+            vec![]
+        ));
+        assert!(configured(vec![], vec![cayenne_test_view("v", unnamed)]));
+
         // A disabled Cayenne acceleration is not configured — on either kind.
         assert!(!configured(vec![], vec![view_with("cayenne", false)]));
         assert!(!configured(vec![dataset_with("cayenne", false)], vec![]));
@@ -2419,7 +2275,6 @@ mod test {
     /// mode, not merely on Cayenne being present: a full-refresh-only pod has no
     /// reachable in-memory CDC tier to reserve host RAM for, and nothing for
     /// compaction to consolidate.
-    #[cfg(not(windows))]
     #[test]
     fn cayenne_workload_separates_cdc_tier_from_compaction() {
         use spicepod::acceleration::RefreshMode;
@@ -2504,7 +2359,6 @@ mod test {
     /// default, so the pre-init classifier must apply the same connector defaults.
     /// Assuming `full` for an unannotated `debezium:`/`cdc:` dataset would classify
     /// a genuine CDC pod as a whole-table replace and under-provision its memory.
-    #[cfg(not(windows))]
     #[test]
     fn cayenne_workload_honors_connector_unset_refresh_defaults() {
         let workload_for = |from: &str| {
@@ -2634,7 +2488,6 @@ mod test {
 
     /// One accelerated dataset for [`cayenne_budget_app`], as
     /// `(engine, enabled, mode, refresh_mode, refresh_check_interval)`.
-    #[cfg(not(windows))]
     type DatasetSpec<'a> = (
         &'a str,
         bool,
@@ -2645,7 +2498,6 @@ mod test {
 
     /// Build a Spicepod app from `datasets`, plus `cayenne_views` Cayenne-accelerated
     /// file-mode views.
-    #[cfg(not(windows))]
     fn cayenne_budget_app(datasets: Vec<DatasetSpec<'_>>, cayenne_views: usize) -> Arc<app::App> {
         use spicepod::acceleration::{Acceleration, Mode};
         use spicepod::component::{dataset::Dataset, view::View};
@@ -2684,7 +2536,6 @@ mod test {
     /// file-mode and on a write profile that accumulates files, so only those are
     /// counted. Views never qualify today: `ViewBuilder::try_from` rejects every view
     /// refresh mode except `full`, a whole-table replace.
-    #[cfg(not(windows))]
     #[test]
     fn count_compaction_eligible_accelerations_counts_only_eligible_accelerations() {
         use spicepod::acceleration::{Mode, RefreshMode};
@@ -2947,7 +2798,6 @@ mod test {
     ///
     /// Asserted against an equivalent dataset rather than against literals, so the
     /// two component kinds cannot drift apart as the classification evolves.
-    #[cfg(not(windows))]
     #[test]
     fn cayenne_workload_counts_accelerated_catalogs() {
         use spicepod::acceleration::{Acceleration, Mode, RefreshMode};
@@ -3052,7 +2902,6 @@ mod test {
     /// REACHABLE (`uses_cdc_tier`) rather than on the carve: the query-pool default
     /// is itself reduced to leave room for that tier, so a pod that cannot reach it
     /// would otherwise pay that haircut for nothing.
-    #[cfg(not(windows))]
     #[test]
     fn cayenne_memory_budgets_are_reserved_only_for_an_eligible_dataset() {
         use spicepod::acceleration::{Mode, RefreshMode};
@@ -3189,7 +3038,6 @@ mod test {
     /// with no ceiling installed every mem-tier reserve succeeds unconditionally —
     /// the coordinated host partition would hold on paper while the tier grew
     /// unbounded, which is the shape of the SF1000 process OOM it exists to prevent.
-    #[cfg(not(windows))]
     #[tokio::test]
     async fn memory_mode_cdc_pod_installs_the_mem_tier_budget_without_a_compaction_runtime() {
         use spicepod::acceleration::{Mode, RefreshMode};
@@ -3227,135 +3075,6 @@ mod test {
             cayenne::global_mem_tier_total().is_some_and(|bytes| bytes > 0),
             "the aggregate in-memory CDC tier ceiling must be installed for a pod that has no compaction runtime"
         );
-    }
-
-    /// A view carrying its own `acceleration` block creates a `DuckDB` instance just
-    /// as a dataset does, so the budget must count it: a view-only pod is coordinated
-    /// at all, a mixed pod divides by every instance, and a view shares instance
-    /// identity (and the explicit/un-limited classification) with a dataset on the
-    /// same file.
-    #[cfg(feature = "duckdb")]
-    #[test]
-    fn test_duckdb_budget_inputs_counts_accelerated_views() {
-        use spicepod::acceleration::{Acceleration, Mode};
-        use spicepod::component::view::View;
-
-        // A pod whose only DuckDB accelerators are on views is still coordinated —
-        // before the fix this reported zero instances, so the builder took its
-        // early-out and every view instance kept DuckDB's ~80%-of-RAM default.
-        let inputs = budget_inputs_for(
-            vec![],
-            vec![duckdb_view(
-                "sales_summary",
-                Mode::File,
-                &[("duckdb_file", "/tmp/spice-mbt-view-only.db")],
-            )],
-        );
-        assert_eq!(inputs.num_unset_instances, 1);
-        assert_eq!(inputs.num_explicit_instances, 0);
-        assert_eq!(
-            inputs.unset_instance_labels,
-            vec!["/tmp/spice-mbt-view-only.db".to_string()]
-        );
-
-        // A mixed pod divides the DuckDB pool by every instance, dataset or view.
-        let inputs = budget_inputs_for(
-            vec![duckdb_ds(
-                "orders",
-                Mode::File,
-                &[("duckdb_file", "/tmp/spice-mbt-view-ds.db")],
-            )],
-            vec![duckdb_view(
-                "orders_summary",
-                Mode::File,
-                &[("duckdb_file", "/tmp/spice-mbt-view-v.db")],
-            )],
-        );
-        assert_eq!(inputs.num_unset_instances, 2);
-
-        // A view on the SAME file as a dataset is the SAME instance, not a second one.
-        let inputs = budget_inputs_for(
-            vec![duckdb_ds(
-                "orders",
-                Mode::File,
-                &[("duckdb_file", "/tmp/spice-mbt-view-shared.db")],
-            )],
-            vec![duckdb_view(
-                "orders_summary",
-                Mode::File,
-                &[("duckdb_file", "/tmp/spice-mbt-view-shared.db")],
-            )],
-        );
-        assert_eq!(inputs.num_unset_instances, 1);
-        assert_eq!(inputs.num_explicit_instances, 0);
-
-        // A memory-mode view joins the one shared in-memory instance.
-        let inputs = budget_inputs_for(
-            vec![duckdb_ds("orders", Mode::Memory, &[])],
-            vec![duckdb_view("orders_summary", Mode::Memory, &[])],
-        );
-        assert_eq!(inputs.num_unset_instances, 1);
-
-        // A view's explicit `duckdb_memory_limit` counts toward the explicit sum.
-        let inputs = budget_inputs_for(
-            vec![],
-            vec![duckdb_view(
-                "sales_summary",
-                Mode::File,
-                &[
-                    ("duckdb_file", "/tmp/spice-mbt-view-explicit.db"),
-                    ("duckdb_memory_limit", "2GiB"),
-                ],
-            )],
-        );
-        assert_eq!(inputs.num_explicit_instances, 1);
-        assert_eq!(inputs.num_unset_instances, 0);
-        assert_eq!(inputs.sum_explicit_bytes, 2 * 1024 * 1024 * 1024);
-
-        // An un-limited view sharing a dataset's instance makes that instance mixed:
-        // DuckDB's `memory_limit` is per-instance, so the effective limit is ambiguous.
-        let inputs = budget_inputs_for(
-            vec![duckdb_ds(
-                "orders",
-                Mode::File,
-                &[
-                    ("duckdb_file", "/tmp/spice-mbt-view-mixed.db"),
-                    ("duckdb_memory_limit", "2GiB"),
-                ],
-            )],
-            vec![duckdb_view(
-                "orders_summary",
-                Mode::File,
-                &[("duckdb_file", "/tmp/spice-mbt-view-mixed.db")],
-            )],
-        );
-        assert_eq!(inputs.num_explicit_instances, 1);
-        assert_eq!(inputs.num_unset_instances, 0);
-        assert!(
-            inputs.has_mixed_instance,
-            "an un-limited view on an explicitly-limited instance is a mixed instance"
-        );
-
-        // A disabled or non-DuckDB view creates no instance.
-        let arrow_view = duckdb_view_with(
-            "arrow_summary",
-            Acceleration {
-                enabled: true,
-                engine: None,
-                mode: Mode::Memory,
-                ..Acceleration::default()
-            },
-        );
-        let mut disabled = duckdb_acceleration(
-            Mode::File,
-            &[("duckdb_file", "/tmp/spice-mbt-view-disabled.db")],
-        );
-        disabled.enabled = false;
-        let disabled_view = duckdb_view_with("disabled_summary", disabled);
-        let unaccelerated_view = View::new("plain_summary".to_string()).with_sql("SELECT 1");
-        let inputs = budget_inputs_for(vec![], vec![arrow_view, disabled_view, unaccelerated_view]);
-        assert_eq!(inputs.num_unset_instances, 0);
-        assert_eq!(inputs.num_explicit_instances, 0);
     }
 
     #[test]
@@ -3414,6 +3133,7 @@ mod test {
             .iter()
             .chain(crate::accelerated::refresh_task::changes::CDC_RUNTIME_PARAMS)
             .chain(dataconnector::http_rate_control::HTTP_RATE_CONTROL_RUNTIME_PARAMS)
+            .chain(spicepod::component::runtime::TUNING_TARGET_PARAMS)
             .chain(MISC_RUNTIME_PARAMS);
         for key in family_keys {
             assert!(
@@ -3433,6 +3153,18 @@ mod test {
     }
 
     #[test]
+    fn renamed_tuning_params_are_not_known_runtime_params() {
+        let known = known_runtime_params();
+        for (old, new) in RENAMED_RUNTIME_TUNING_PARAMS {
+            assert!(
+                !known.contains(old),
+                "`{old}` is no longer read, so it must not be recognized"
+            );
+            assert!(known.contains(new), "`{new}` must be recognized");
+        }
+    }
+
+    #[test]
     fn runtime_param_typos_suggest_within_section() {
         // A typo resolves to the intended key, and the suggestion is drawn from
         // the whole `runtime.params` section vocabulary — across families.
@@ -3449,6 +3181,143 @@ mod test {
         assert_eq!(
             util::levenshtein::closest_match("totally_unrelated_key", &known),
             None,
+        );
+    }
+
+    /// The value reported as applied must be the one the planner acts on. The
+    /// planner gates at `sort_merge_memory_pool_fraction.min(1.0)`, so a
+    /// requested fraction above 1.0 has to be clamped before it is logged —
+    /// otherwise startup diagnostics name a threshold that is not in force and
+    /// an operator has no way to read the effective one. Regression test for
+    /// spiceai/spiceai#13157.
+    #[test]
+    fn resolve_cayenne_sort_merge_memory_pool_fraction_reports_the_effective_value() {
+        let resolve = |raw: &str| {
+            resolve_cayenne_sort_merge_memory_pool_fraction(&HashMap::from([(
+                CAYENNE_SORT_MERGE_MEMORY_POOL_FRACTION_PARAM.to_string(),
+                raw.to_string(),
+            )]))
+        };
+
+        assert_eq!(
+            resolve("4.0"),
+            Some(1.0),
+            "a fraction above the pool must resolve to the whole pool, which is what the planner gates on"
+        );
+        assert_eq!(
+            resolve("0.125"),
+            Some(0.125),
+            "a fraction inside the supported range must pass through untouched"
+        );
+        assert_eq!(
+            resolve("0"),
+            Some(0.0),
+            "0 disables the memory gate and is a supported setting, so it must not be clamped up"
+        );
+        assert_eq!(
+            resolve("-1"),
+            None,
+            "a negative fraction is rejected on parse and leaves the default in force"
+        );
+        assert_eq!(
+            resolve("inf"),
+            None,
+            "a non-finite fraction is rejected on parse; the planner keeps its own clamp for direct callers"
+        );
+        assert_eq!(
+            resolve_cayenne_sort_merge_memory_pool_fraction(&HashMap::new()),
+            None,
+            "an unset param must not log an applied value"
+        );
+    }
+
+    /// Observe the line an operator actually reads. Captures the `tracing`
+    /// output of the admission path for a requested fraction of 4.0: the
+    /// "applied" line must name 1, and the out-of-range value must be called
+    /// out rather than silently swallowed.
+    #[test]
+    fn an_out_of_range_sort_merge_fraction_is_logged_as_clamped() {
+        #[derive(Clone, Default)]
+        struct Capture(Arc<std::sync::Mutex<Vec<u8>>>);
+        impl std::io::Write for Capture {
+            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+                if let Ok(mut g) = self.0.lock() {
+                    g.extend_from_slice(buf);
+                }
+                Ok(buf.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for Capture {
+            type Writer = Self;
+            fn make_writer(&'a self) -> Self::Writer {
+                self.clone()
+            }
+        }
+
+        let sink = Capture::default();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(sink.clone())
+            .with_ansi(false)
+            .with_max_level(tracing::Level::INFO)
+            .finish();
+
+        let params = HashMap::from([(
+            CAYENNE_SORT_MERGE_MEMORY_POOL_FRACTION_PARAM.to_string(),
+            "4.0".to_string(),
+        )]);
+        tracing::subscriber::with_default(subscriber, || {
+            let resolved = resolve_cayenne_sort_merge_memory_pool_fraction(&params);
+            log_applied_cayenne_param(CAYENNE_SORT_MERGE_MEMORY_POOL_FRACTION_PARAM, resolved);
+        });
+
+        let logged = String::from_utf8(sink.0.lock().expect("capture buffer poisoned").clone())
+            .expect("captured log is not valid UTF-8");
+
+        assert!(
+            logged.contains(
+                "Cayenne runtime tunable applied: runtime.params.cayenne_sort_merge_memory_pool_fraction=1"
+            ),
+            "the applied line must name the effective fraction; got: {logged}"
+        );
+        // Scoped to the "applied" line on purpose: the range warning legitimately
+        // quotes the requested `…fraction=4`, and a WARN is captured by an
+        // INFO-level subscriber, so a bare substring check here would contradict
+        // the assertion below.
+        assert!(
+            !logged.contains(
+                "Cayenne runtime tunable applied: runtime.params.cayenne_sort_merge_memory_pool_fraction=4"
+            ),
+            "the requested-but-unused fraction must not be reported as applied; got: {logged}"
+        );
+        assert!(
+            logged.contains("is outside the supported range [0, 1]"),
+            "an out-of-range fraction must be called out; got: {logged}"
+        );
+    }
+
+    /// The clamp is also reachable directly, so pin the edges it is documented
+    /// to leave alone — in particular `NaN`, which the planner reads as "no
+    /// gate" and which must therefore not be clamped up to the whole pool.
+    #[test]
+    fn test_clamp_cayenne_sort_merge_memory_pool_fraction() {
+        for (input, expected) in [(0.0, 0.0), (0.125, 0.125), (1.0, 1.0), (4.0, 1.0)] {
+            let actual = clamp_cayenne_sort_merge_memory_pool_fraction(input);
+            assert!(
+                (actual - expected).abs() < f64::EPSILON,
+                "expected {input} to clamp to {expected}, got {actual}"
+            );
+        }
+        assert!(
+            clamp_cayenne_sort_merge_memory_pool_fraction(f64::NAN).is_nan(),
+            "NaN must pass through so the planner's own 'no gate' handling still applies"
+        );
+        assert!(
+            (clamp_cayenne_sort_merge_memory_pool_fraction(f64::INFINITY) - 1.0).abs()
+                < f64::EPSILON,
+            "an infinite fraction must clamp to the whole pool"
         );
     }
 

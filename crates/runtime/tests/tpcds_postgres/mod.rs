@@ -28,6 +28,7 @@ limitations under the License.
 //! - `MINIO_ENDPOINT`: The `MinIO`/S3 endpoint URL
 //! - `MINIO_ACCESS_KEY_ID`: The `MinIO`/S3 access key
 //! - `MINIO_SECRET_ACCESS_KEY`: The `MinIO`/S3 secret key
+//! - `MINIO_SESSION_TOKEN`: The session token of temporary credentials, when set
 //!
 //! # Running Tests Locally
 //!
@@ -100,9 +101,7 @@ use crate::docker::RunningContainer;
 use crate::utils::runtime_ready_check_with_timeout;
 use crate::{
     configure_test_datafusion, init_tracing,
-    postgres::common::{
-        PG_PASSWORD, get_pg_params, get_random_port, start_postgres_docker_container,
-    },
+    postgres::common::{PG_PASSWORD, get_pg_params, start_postgres_docker_container},
     utils::test_request_context,
 };
 
@@ -114,7 +113,7 @@ mod q86;
 /// Initialized once and reused across all TPC-DS query tests.
 struct SharedTestEnv {
     rt: Arc<Runtime>,
-    running_container: RunningContainer<'static>,
+    running_container: RunningContainer,
 }
 
 /// Global shared test environment, initialized lazily on first use.
@@ -125,8 +124,8 @@ static SHARED_ENV: OnceCell<SharedTestEnv> = OnceCell::const_new();
 async fn init_shared_env() -> Result<SharedTestEnv, anyhow::Error> {
     let _tracing = init_tracing(Some("integration=debug,info"));
 
-    let port = get_random_port()?;
-    let running_container = start_postgres_docker_container(port).await?;
+    let running_container = start_postgres_docker_container().await?;
+    let port = usize::from(running_container.host_port(5432)?);
 
     let pg_db = "tpcds_test";
 
@@ -190,6 +189,9 @@ fn get_tpcds_spicepod_yaml(pg_port: usize, pg_db: &str) -> String {
         .expect("MINIO_ACCESS_KEY_ID environment variable must be set");
     let minio_secret_key = std::env::var("MINIO_SECRET_ACCESS_KEY")
         .expect("MINIO_SECRET_ACCESS_KEY environment variable must be set");
+    let minio_session_token = std::env::var("MINIO_SESSION_TOKEN")
+        .map(|token| format!("\n      s3_session_token: {token}"))
+        .unwrap_or_default();
 
     let pg_password = PG_PASSWORD;
 
@@ -207,7 +209,7 @@ datasets:
       s3_auth: key
       s3_endpoint: {minio_endpoint}
       s3_key: {minio_access_key}
-      s3_secret: {minio_secret_key}
+      s3_secret: {minio_secret_key}{minio_session_token}
     acceleration:
       enabled: true
       engine: postgres

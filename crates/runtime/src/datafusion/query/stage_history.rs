@@ -199,9 +199,9 @@ fn task_executor_id(task: &TaskInfo) -> Option<&str> {
 fn iter_task_infos(stage: &ExecutionStage) -> Box<dyn Iterator<Item = &TaskInfo> + '_> {
     match stage {
         ExecutionStage::UnResolved(_) | ExecutionStage::Resolved(_) => Box::new(std::iter::empty()),
-        ExecutionStage::Running(s) => Box::new(s.task_infos.iter().filter_map(Option::as_ref)),
+        ExecutionStage::Running(s) => Box::new(s.task_infos.iter()),
         ExecutionStage::Successful(s) => Box::new(s.task_infos.iter()),
-        ExecutionStage::Failed(s) => Box::new(s.task_infos.iter().filter_map(Option::as_ref)),
+        ExecutionStage::Failed(s) => Box::new(s.task_infos.iter()),
     }
 }
 

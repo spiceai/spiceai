@@ -7,9 +7,11 @@ name = "runtime"
 repository.workspace = true
 rust-version.workspace = true
 version.workspace = true
+autotests = false
 
 [dependencies]
 cpu-budget = { path = "../cpu-budget" }
+http-body-limit = { path = "../http-body-limit" }
 podswatcher = { path = "../podswatcher" }
 runtime-udfs-api = { path = "../runtime-udfs-api" }
 adbc_core = { workspace = true, optional = true }
@@ -31,6 +33,7 @@ aws-credential-types.workspace = true
 aws-sdk-credential-bridge = { path = "../aws-sdk-credential-bridge" }
 aws-sdk-glue.workspace = true
 aws-sdk-s3.workspace = true
+aws-sdk-sqs.workspace = true
 aws-sdk-sts = { workspace = true, optional = true }
 axum.workspace = true
 axum-extra = { version = "0.12.5", features = ["typed-header", "query"] }
@@ -38,9 +41,12 @@ ballista-core = { workspace = true }
 ballista-executor = { workspace = true }
 ballista-scheduler = { workspace = true }
 base64.workspace = true
+flate2 = "1.1"
 byte-unit.workspace = true
 bytes.workspace = true
+ctor.workspace = true
 cache = { path = "../cache" }
+cayenne = { path = "../cayenne", features = ["partition-table-provider"] }
 chrono.workspace = true
 chunking = { path = "../chunking" }
 clap.workspace = true
@@ -66,11 +72,6 @@ datafusion-table-providers = { workspace = true }
 db_connection_pool = { path = "../db_connection_pool" }
 spice-table = { path = "../spice-table" }
 document_parse = { path = "../document_parse" }
-duckdb = { workspace = true, features = [
-    "bundled",
-    "r2d2",
-    "extensions-full",
-], optional = true }
 event_stream = { path = "../event_stream" }
 flight_client = { path = "../flight_client" }
 fundu = { workspace = true }
@@ -93,9 +94,19 @@ indexmap.workspace = true
 itertools.workspace = true
 logos.workspace = true
 opendal.workspace = true
+opendal-http-transport-reqwest = "0.58.2"
 jsonwebtoken = { version = "10.3.0", features = ["aws_lc_rs"] }
 linkme.workspace = true
 llms = { path = "../llms", default-features = false }
+evaluate-api = { path = "../evaluate-api" }
+evaluate-chat = { path = "../evaluate-chat" }
+gemini-api = { path = "../gemini-api" }
+gemini-chat = { path = "../gemini-chat" }
+messages-api = { path = "../messages-api" }
+messages-chat = { path = "../messages-chat" }
+responses-chat = { path = "../responses-chat" }
+model-capabilities = { path = "../model-capabilities" }
+runtime-decide = { path = "../runtime-decide" }
 mediatype = "0.21.0"
 moka.workspace = true
 mysql_async = { workspace = true, optional = true }
@@ -111,7 +122,16 @@ opentelemetry-prometheus.workspace = true
 opentelemetry-proto = { version = "0.32", default-features = false, features = [
     "gen-tonic-messages",
     "gen-tonic",
+    "logs",
     "metrics",
+] }
+# OTLP/HTTP JSON bodies only (`POST /v1/metrics`, `POST /v1/logs`). 0.33.1 fixed JSON decoding
+# that silently dropped fields; decoded requests are re-encoded and read with the 0.32 types above.
+opentelemetry-proto-json = { package = "opentelemetry-proto", version = "0.33.1", default-features = false, features = [
+    "gen-tonic-messages",
+    "logs",
+    "metrics",
+    "with-serde",
 ] }
 opentelemetry_sdk.workspace = true
 otel-arrow = { path = "../otel-arrow" }
@@ -139,7 +159,6 @@ runtime-acceleration = { path = "../runtime-acceleration" }
 runtime-api-types = { path = "../runtime-api-types" }
 runtime-async = { path = "../runtime-async" }
 runtime-checkpoint-api = { path = "../runtime-checkpoint-api" }
-runtime-checkpoint-duckdb = { path = "../runtime-checkpoint-duckdb", optional = true }
 runtime-checkpoint-sqlite = { path = "../runtime-checkpoint-sqlite", optional = true }
 runtime-component = { path = "../runtime-component" }
 runtime-metrics = { path = "../runtime-metrics" }
@@ -157,18 +176,21 @@ runtime-execution-plans = { path = "../runtime-execution-plans" }
 runtime-table = { path = "../runtime-table" }
 runtime-resources = { path = "../runtime-resources" }
 runtime-object-store = { path = "../runtime-object-store" }
+runtime-otel-push = { path = "../runtime-otel-push" }
 runtime-parameters = { path = "../runtime-parameters" }
 runtime-parameters-typed = { path = "../runtime-parameters-typed" }
 runtime-proto = { path = "../runtime-proto" }
 runtime-rate-control = { path = "../runtime-rate-control" }
 runtime-request-context = { path = "../runtime-request-context" }
 runtime-secrets = { path = "../runtime-secrets", default-features = false }
+runtime-state-location = { path = "../runtime-state-location" }
 runtime-status = { path = "../runtime-status" }
 runtime-table-partition = { path = "../runtime-table-partition" }
 rusqlite = { workspace = true, optional = true }
 rustls.workspace = true
 elasticsearch = { path = "../elasticsearch", optional = true }
 duration-parse = { workspace = true, optional = true }
+s3-event-notifications = { path = "../s3-event-notifications" }
 s3_vectors = { path = "../s3_vectors", optional = true }
 scheduler = { path = "../scheduler" }
 schemars.workspace = true
@@ -177,8 +199,9 @@ search = { path = "../search", default-features = false, features = [
     "text_search",
 ], optional = false }
 secrecy.workspace = true
-serde = { workspace = true, features = ["derive"] }
-blake3 = { workspace = true, optional = true }
+serde = { workspace = true, features = ["derive", "rc"] }
+serde_bytes.workspace = true
+blake3.workspace = true
 serde_json.workspace = true
 snafu.workspace = true
 snowflake-api = { workspace = true, optional = true }
@@ -198,18 +221,18 @@ tokio-util.workspace = true
 tonic.workspace = true
 tonic-health.workspace = true
 tools = { path = "../tools" }
-tower.workspace = true
+tower = { workspace = true, features = ["util"] }
 tower-http.workspace = true
 tracing.workspace = true
 tracing-futures.workspace = true
 tracing-opentelemetry.workspace = true
 tracing-subscriber.workspace = true
-turso-shared = { workspace = true }
 twox-hash.workspace = true
+typetag = "0.2.22"
 url.workspace = true
 util = { path = "../util", features = ["datafusion", "http"] }
 utoipa = { workspace = true, features = ["axum_extras"], optional = true }
-utoipa-swagger-ui = { version = "9", features = [
+utoipa-swagger-ui = { version = "10", features = [
     "axum",
     "vendored",
 ], optional = true }
@@ -218,12 +241,15 @@ gethostname.workspace = true
 uuid = { workspace = true, features = ["v4", "v7", "serde"] }
 workers = { path = "../workers" }
 x509-certificate.workspace = true
+vortex.workspace = true
+vortex-datafusion.workspace = true
 
 [build-dependencies]
 yaml = { path = "../yaml" }
 
 [dev-dependencies]
 anyhow.workspace = true
+runtime-drasi = { path = "../runtime-drasi", features = ["test-util"] }
 async-graphql = "7.0.17"
 async-graphql-axum = "7.0.16"
 rcgen = { version = "0.14", default-features = false, features = ["pem", "aws_lc_rs"] }
@@ -234,9 +260,13 @@ aws-credential-types = { workspace = true, features = [
 # SDK). A dev-dependency, so it stays out of the shipped runtime and is exempt from
 # the `restricted_deps` driver-confinement guard.
 aws-sdk-dynamodb.workspace = true
+# Used directly by the `tests/cosmosdb` integration suite to create the emulator's
+# database and container; the same version and features as `connector-cosmosdb`.
 azure_core = "0.31.0"
-azure_storage = "0.21.0"
-azure_storage_blobs = "0.21.0"
+azure_data_cosmos = { version = "0.30.0", default-features = false, features = [
+    "hmac_rust",
+    "key_auth",
+] }
 ballista-core.workspace = true
 bcder = "0.7.4"
 bollard = "0.18.1"
@@ -252,6 +282,7 @@ connector-databricks = { path = "../data-connectors/connector-databricks" }
 connector-delta-lake = { path = "../data-connectors/connector-delta-lake" }
 connector-dremio = { path = "../data-connectors/connector-dremio" }
 connector-duckdb = { path = "../data-connectors/connector-duckdb" }
+duckdb-oracle = { path = "../duckdb-oracle" }
 connector-ducklake = { path = "../data-connectors/connector-ducklake" }
 connector-flightsql = { path = "../data-connectors/connector-flightsql" }
 connector-ftp = { path = "../data-connectors/connector-ftp" }
@@ -267,10 +298,9 @@ connector-mssql = { path = "../data-connectors/connector-mssql" }
 connector-mysql = { path = "../data-connectors/connector-mysql" }
 connector-oracle = { path = "../data-connectors/connector-oracle" }
 accelerator-postgres = { path = "../accelerators/accelerator-postgres" }
+runtime-checkpoint-postgres = { path = "../runtime-checkpoint-postgres" }
 accelerator-sqlite = { path = "../accelerators/accelerator-sqlite" }
-accelerator-turso = { path = "../accelerators/accelerator-turso" }
-accelerator-duckdb = { path = "../accelerators/accelerator-duckdb" }
-turso.workspace = true
+accelerator-cayenne = { path = "../accelerators/accelerator-cayenne" }
 connector-postgres = { path = "../data-connectors/connector-postgres" }
 connector-scylladb = { path = "../data-connectors/connector-scylladb" }
 tokio-postgres = { workspace = true }
@@ -281,7 +311,6 @@ connector-snowflake = { path = "../data-connectors/connector-snowflake" }
 connector-spark = { path = "../data-connectors/connector-spark" }
 connector-spiceai = { path = "../data-connectors/connector-spiceai" }
 criterion = { version = "0.7", features = ["async_tokio", "html_reports"] }
-hf-hub = { workspace = true }
 insta = { workspace = true, features = ["json", "redactions"] }
 jsonpath-rust = "0.7.3"
 mongodb.workspace = true
@@ -306,7 +335,7 @@ tracing-subscriber.workspace = true
 yaml = { path = "../yaml" }
 
 [features]
-adbc = ["dep:adbc_core", "dep:adbc_driver_manager", "dep:blake3", "data_components/adbc", "datafusion-table-providers/adbc-federation"]
+adbc = ["dep:adbc_core", "dep:adbc_driver_manager", "data_components/adbc", "datafusion-table-providers/adbc-federation"]
 aws-secrets-manager = ["dep:aws-sdk-sts", "runtime-secrets/aws-secrets-manager"]
 azure-keyvault = ["runtime-secrets/azure-keyvault"]
 hashicorp_vault = ["runtime-secrets/hashicorp_vault"]
@@ -324,16 +353,6 @@ elasticsearch = [
     "dep:duration-parse",
     "search/elasticsearch",
     "runtime-search/elasticsearch",
-]
-duckdb = [
-    "dep:duckdb",
-    "dep:runtime-checkpoint-duckdb",
-    "db_connection_pool/duckdb",
-    "data_components/duckdb",
-    "datafusion-optimizer-rules/duckdb",
-    "runtime-acceleration/duckdb",
-    "search/duckdb",
-    "runtime-search/duckdb",
 ]
 # Test-only marker: the DynamoDB connector now lives in `connector-dynamodb` (a
 # dev-dependency, registered unconditionally by `do_register_test_connectors`).
@@ -373,6 +392,7 @@ openapi = [
     "dep:utoipa-swagger-ui",
     "dep:utoipa",
     "mcp",
+    "evaluate-api/openapi",
     "runtime-acceleration/openapi",
     "runtime-table/openapi",
     "runtime-api-types/openapi",
@@ -420,24 +440,7 @@ sqlite = [
     "dep:rusqlite",
     "runtime-acceleration/sqlite",
 ]
-turso = [
-    "dep:tokio-rusqlite",
-    "db_connection_pool/sqlite",
-    "data_components/sqlite",
-    "data_components/turso",
-    "dep:rusqlite",
-    "runtime-acceleration/turso",
-]
 vortex = []
-[target.'cfg(not(windows))'.dev-dependencies]
-# The engine itself is not built on Windows, so neither is the test code that
-# exercises it or force-links its registration.
-accelerator-cayenne = { path = "../accelerators/accelerator-cayenne" }
-
-[target.'cfg(not(windows))'.dependencies]
-cayenne = { path = "../cayenne", features = ["turso", "partition-table-provider"] }
-vortex.workspace = true
-vortex-datafusion.workspace = true
 
 [[bench]]
 harness = false
@@ -458,9 +461,57 @@ name = "cdc_delete_burst"
 [lints]
 workspace = true
 
-# Spice accelerators vs out-of-Spice standalone DuckDB/SQLite — exact SQL results.
-# Separate binary so we do not rebuild the full integration suite.
+# Integration tests are modules of the `integration` binary
+# (`tests/integration.rs`). The targets below need a process, a workflow step, or
+# a feature set of their own; each says which.
 [[test]]
-name = "result_correctness"
-path = "tests/result_correctness.rs"
-required-features = ["duckdb", "sqlite"]
+name = "integration"
+path = "tests/integration.rs"
+
+# A binary of its own so `make nextest` can run it without loading `integration`,
+# which on macOS is too large for dyld to map the shared cache beside it.
+[[test]]
+name = "rate_control"
+path = "tests/rate_control.rs"
+required-features = ["rate-control"]
+
+# Runs in `make nextest`, which must not load `integration` (see `rate_control`).
+[[test]]
+name = "metrics"
+path = "tests/metrics.rs"
+
+# Runs in `make nextest`, which must not load `integration` (see `rate_control`).
+[[test]]
+name = "cayenne_runtime_tuning"
+path = "tests/cayenne_runtime_tuning.rs"
+
+# Installs a counting `#[global_allocator]` to compare the results cache's
+# reported size with the heap it holds.
+[[test]]
+name = "results_cache_growth"
+path = "tests/results_cache_growth.rs"
+
+# Runs in `make nextest`, which must not load `integration` (see `rate_control`).
+[[test]]
+name = "chat_tool_use"
+path = "tests/chat_tool_use.rs"
+required-features = ["models"]
+
+# Runs as its own step in `integration.yml`, with a retry budget sized to fit it.
+[[test]]
+name = "retention_oom"
+path = "tests/retention_oom.rs"
+
+# Each runs as its own step in `integration.yml`, with credentials of its own.
+[[test]]
+name = "integration_aws_sdk"
+path = "tests/integration_aws_sdk.rs"
+
+[[test]]
+name = "integration_snapshot_refresh"
+path = "tests/integration_snapshot_refresh.rs"
+
+# Built with the `models` feature set by `integration_models.yml`.
+[[test]]
+name = "integration_models"
+path = "tests/integration_models.rs"

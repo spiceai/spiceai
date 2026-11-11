@@ -290,6 +290,19 @@ mod tests {
     }
 
     #[test]
+    fn eligible_uses_the_sql_query_span_clock() {
+        // Plan capture is gated on the same clock as the parent `sql_query`
+        // span: after the results-cache probe, and after a hop onto the query
+        // runtime. Including lookup (or hop-wait) would emit a plan row whose
+        // parent is then dropped by `min_sql_duration_ms` (span ≈ exec only).
+        // 120ms lookup + 1ms exec at min_sql=100 is therefore ineligible;
+        // 121ms of span time is eligible.
+        let config = cfg(TaskHistoryCapturedPlan::ExplainAnalyze, None, Some(100.0));
+        assert!(!plan_capture_eligible(1.0, &config));
+        assert!(plan_capture_eligible(121.0, &config));
+    }
+
+    #[test]
     fn should_capture_explain_plan_matches_exporter_predicate() {
         assert!(should_capture_explain_plan(
             "sql_query",
@@ -361,6 +374,17 @@ mod tests {
 
         fn properties(&self) -> &Arc<PlanProperties> {
             &self.properties
+        }
+
+        fn apply_expressions(
+            &self,
+            _f: &mut dyn FnMut(
+                &Arc<dyn datafusion::physical_plan::PhysicalExpr>,
+            ) -> datafusion::error::Result<
+                datafusion::common::tree_node::TreeNodeRecursion,
+            >,
+        ) -> datafusion::error::Result<datafusion::common::tree_node::TreeNodeRecursion> {
+            Ok(datafusion::common::tree_node::TreeNodeRecursion::Continue)
         }
 
         fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> {

@@ -25,7 +25,7 @@ use datafusion::{
     logical_expr::{DdlStatement, Expr, LogicalPlan, Statement},
 };
 
-use crate::datafusion::DataFusion;
+use crate::{config::Role, datafusion::DataFusion};
 
 // Re-export the single-source-of-truth list of write-capable extension node
 // names. The `cache` crate owns this list so that both the read-only validator
@@ -39,7 +39,8 @@ pub(super) use cache::WRITE_CAPABLE_EXTENSION_NAMES;
 /// INSERT and DELETE operations are only allowed on datasets that are configured as writable,
 /// and are not allowed on internal Spice tables.
 /// UPDATE operations are only allowed on writable Cayenne catalog tables.
-/// DDL operations are only allowed on catalogs configured with `access: read_write_create`.
+/// DDL operations are only allowed on catalogs configured with `access: read_write_create`,
+/// and never on a sidecar (`--role sidecar`), which serves an application's reads.
 /// DML (other than allowed INSERT/DELETE/UPDATE), COPY, and Statement operations are not permitted.
 ///
 /// # Returns
@@ -50,8 +51,17 @@ pub fn validate_sql_query_operations(
     plan: &LogicalPlan,
     df: &Arc<DataFusion>,
 ) -> Result<(), DataFusionError> {
+    let sidecar = df.role() == Role::Sidecar;
     plan.apply_with_subqueries(|node| match node {
         // Data Definition Language (DDL): CREATE / DROP TABLES / VIEWS / SCHEMAS
+        LogicalPlan::Ddl(_) if sidecar => Err(sidecar_ddl_error()),
+        // Spice's planner can also represent DDL as an extension node, for
+        // example `CREATE TABLE ... LIKE`.
+        LogicalPlan::Extension(extension)
+            if sidecar && extension.node.as_any().is::<datafusion_ddl::DdlExtensionNode>() =>
+        {
+            Err(sidecar_ddl_error())
+        }
         LogicalPlan::Ddl(ddl) => {
             validate_ddl_operation(ddl, df)
         }
@@ -156,6 +166,17 @@ pub fn validate_sql_query_operations(
         _ => Ok(TreeNodeRecursion::Continue),
     })?;
     Ok(())
+}
+
+/// The error for DDL sent to a sidecar. A sidecar's catalog is its
+/// application's view of data the cluster owns, so tables and schemas are
+/// created and dropped on the cluster instead.
+fn sidecar_ddl_error() -> DataFusionError {
+    DataFusionError::Plan(
+        "DDL is not allowed on a sidecar. Run CREATE and DROP statements on the Spice runtime \
+         the sidecar reads from, or start Spice without `--role sidecar`."
+            .to_string(),
+    )
 }
 
 /// Validates DDL operations. DDL is only allowed on catalogs with `access: read_write_create`.
@@ -304,7 +325,7 @@ mod tests {
     use super::*;
     use arrow::datatypes::{DataType, Field, Schema};
     use data_components::arrow::write::MemTable;
-    use datafusion::{catalog::MemoryCatalogProvider, sql::TableReference};
+    use datafusion::{catalog::MemoryCatalogProvider, common::TableReference};
     use runtime_datafusion::schema_provider::SpiceSchemaProvider;
     use std::sync::Arc;
     use tokio::runtime::Handle;
@@ -318,12 +339,17 @@ mod tests {
     }
 
     fn create_test_datafusion() -> Arc<DataFusion> {
+        create_test_datafusion_with_role(Role::Server)
+    }
+
+    fn create_test_datafusion_with_role(role: Role) -> Arc<DataFusion> {
         let df = Arc::new(
             DataFusionBuilder::new(
                 RuntimeStatus::new(),
                 Arc::new(AcceleratorEngineRegistry::new()),
                 Handle::current(),
             )
+            .role(role)
             .build(),
         );
 
@@ -605,6 +631,51 @@ mod tests {
 
         let result = validate_sql_query_operations(&plan, &df);
         assert!(result.is_err(), "CREATE TABLE should be blocked");
+    }
+
+    /// A sidecar refuses every DDL statement, even on a catalog configured with
+    /// `access: read_write_create` where a server runs it. Reads and permitted
+    /// writes are unaffected.
+    #[tokio::test]
+    async fn sidecar_refuses_ddl_on_every_catalog() {
+        let server = create_test_datafusion();
+        let sidecar = create_test_datafusion_with_role(Role::Sidecar);
+        assert_eq!(sidecar.role(), Role::Sidecar);
+        let plan = |df: &Arc<DataFusion>, sql: &'static str| {
+            let df = Arc::clone(df);
+            async move {
+                df.ctx
+                    .state()
+                    .create_logical_plan(sql)
+                    .await
+                    .expect("plan should be created")
+            }
+        };
+        for sql in [
+            "CREATE TABLE ddl_enabled_catalog.public.new_table (id INT, name VARCHAR(50))",
+            "DROP TABLE IF EXISTS ddl_enabled_catalog.public.some_table",
+            "CREATE SCHEMA ddl_enabled_catalog.new_schema",
+            "CREATE VIEW ddl_enabled_catalog.public.v AS SELECT 1 AS one",
+        ] {
+            validate_sql_query_operations(&plan(&server, sql).await, &server)
+                .unwrap_or_else(|e| panic!("a server runs {sql}: {e}"));
+            let error = validate_sql_query_operations(&plan(&sidecar, sql).await, &sidecar)
+                .expect_err("a sidecar refuses DDL");
+            assert_eq!(
+                error.strip_backtrace(),
+                "Error during planning: DDL is not allowed on a sidecar. Run CREATE and DROP \
+                 statements on the Spice runtime the sidecar reads from, or start Spice without \
+                 `--role sidecar`.",
+                "{sql}"
+            );
+        }
+        for sql in [
+            "SELECT * FROM tbl_read_only",
+            "INSERT INTO writable_catalog.public.test_table VALUES (1, 'a', 1.0)",
+        ] {
+            validate_sql_query_operations(&plan(&sidecar, sql).await, &sidecar)
+                .unwrap_or_else(|e| panic!("a sidecar runs {sql}: {e}"));
+        }
     }
 
     #[tokio::test]
@@ -1214,8 +1285,8 @@ mod tests {
         }
 
         // A benign (non-write) extension name must still be allowed so
-        // read-only optimizer extensions such as `IndexTableScanNode` and
-        // `DuckDBAggregatePushdownNode` are not blocked.
+        // read-only optimizer extensions such as `IndexTableScanNode` are not
+        // blocked.
         let plan = LogicalPlan::Extension(Extension {
             node: Arc::new(StubWriteExtension {
                 schema,
@@ -1231,7 +1302,6 @@ mod tests {
     /// planner — must still be rejected. This covers the statement-level
     /// rewrites (`plan_distributed_dml`, `plan_create_table`, etc.) that can
     /// emit `LogicalPlan::Extension` instead of `LogicalPlan::{Ddl,Dml}`.
-    #[cfg(not(windows))]
     #[tokio::test]
     async fn test_read_only_validator_rejects_dml_via_spice_planner() {
         let df = create_test_datafusion();
@@ -1241,8 +1311,12 @@ mod tests {
         // distributed cluster it returns a standard `LogicalPlan::Dml`, still
         // covered by the read-only arm — but this exercises the Spice wrapper
         // rather than `SessionState::create_logical_plan` directly.
-        let plan = df
-            .create_logical_plan(&session, "INSERT INTO tbl_writable VALUES (1, 'foo', 42.0)")
+        let (plan, _) = df
+            .create_logical_plan(
+                &session,
+                "INSERT INTO tbl_writable VALUES (1, 'foo', 42.0)",
+                None,
+            )
             .await
             .expect("plan should be created via Spice planner");
 

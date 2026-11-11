@@ -16,14 +16,14 @@ limitations under the License.
 use std::path::{Path, PathBuf};
 
 use anyhow::Result;
-use duckdb::Connection;
+use duckdb_oracle::Connection;
 use std::fmt::Write;
 use tokio::fs;
 use tonic::async_trait;
 
 use crate::{
     queries::{QuerySet, TableWithTimeColumn},
-    spicetest::append::worker::AppendConfig,
+    spicetest::append::{tpch_conflict_marker, worker::AppendConfig},
 };
 
 use super::AppendableSource;
@@ -175,9 +175,26 @@ fn generate_tpch_sql(
 
         // Conflict data: same primary keys, will be handled by ON CONFLICT
         if generate_conflict_data {
-            write!(&mut sql, "ALTER TABLE {name}_conflict ADD COLUMN {column} TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP;
-                             INSERT INTO {name} SELECT * FROM {name}_conflict;
-                             DROP TABLE {name}_conflict;\n").ok();
+            writeln!(&mut sql, "ALTER TABLE {name}_conflict ADD COLUMN {column} TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP;").ok();
+
+            // The next step appends these same keys with their real values, so
+            // this copy is the one an upsert must discard. Mark a queried column
+            // to make keeping it change the query results.
+            if let Some(marker) = tpch_conflict_marker(name) {
+                writeln!(
+                    &mut sql,
+                    "UPDATE {name}_conflict SET {};",
+                    marker.assignment()
+                )
+                .ok();
+            }
+
+            write!(
+                &mut sql,
+                "INSERT INTO {name} SELECT * FROM {name}_conflict;
+                             DROP TABLE {name}_conflict;\n"
+            )
+            .ok();
         }
 
         writeln!(
@@ -378,5 +395,55 @@ impl AppendableSource for FileAppendableSource {
 
     async fn teardown(&self, _worker: &AppendConfig) -> Result<()> {
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{TableWithTimeColumn, generate_tpch_sql};
+    use std::path::Path;
+
+    fn tpch_sql(generate_conflict_data: bool, table: &'static str, column: &'static str) -> String {
+        generate_tpch_sql(
+            10,
+            1,
+            generate_conflict_data,
+            &[TableWithTimeColumn {
+                name: table,
+                column,
+            }],
+            Path::new("/tmp"),
+        )
+    }
+
+    #[test]
+    fn a_conflicting_copy_marks_a_queried_column_before_it_is_appended() {
+        let sql = tpch_sql(true, "lineitem", "l_created_at");
+        let update = sql
+            .find("UPDATE lineitem_conflict SET l_extendedprice = -ABS(l_extendedprice) - 1000000;")
+            .expect("the conflicting copy should have its marker column set");
+        let insert = sql
+            .find("INSERT INTO lineitem SELECT * FROM lineitem_conflict")
+            .expect("the conflicting copy should be appended");
+
+        assert!(
+            update < insert,
+            "the marker column must be set before the copy is appended"
+        );
+    }
+
+    #[test]
+    fn a_table_without_a_marker_column_is_appended_unchanged() {
+        let sql = tpch_sql(true, "nation", "n_created_at");
+        assert!(
+            !sql.contains("UPDATE nation_conflict"),
+            "nation has no marker column, so its conflicting copy is left alone"
+        );
+    }
+
+    #[test]
+    fn no_conflicting_copy_is_generated_without_conflict_data() {
+        let sql = tpch_sql(false, "lineitem", "l_created_at");
+        assert!(!sql.contains("_conflict"));
     }
 }

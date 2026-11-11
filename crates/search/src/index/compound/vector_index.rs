@@ -24,16 +24,16 @@ use datafusion::{
     logical_expr::{LogicalPlan, LogicalPlanBuilder},
 };
 use futures::future::try_join_all;
-use spice_table::{Index, WriteWindow};
+use spice_table::{GroupPruning, Index, WriteWindow};
 
 use crate::index::{SearchIndex, VectorIndex, primary_key_projection};
 
 use super::{
     COMPOUND_WRITE_COMPLETE_FAILURE_IS_FATAL, COMPOUND_WRITE_START_FAILURE_IS_FATAL,
     CompoundReadMode, Error, compound_delete_by_keys, compound_delete_by_predicate,
-    compound_on_write_complete, compound_on_write_start, compound_required_columns,
-    compound_resolve_delete_keys, compound_write, fallback::fallback_on_empty_plan,
-    validate_compatibility,
+    compound_delete_group_remainder, compound_group_pruning, compound_on_write_complete,
+    compound_on_write_start, compound_required_columns, compound_resolve_delete_keys,
+    compound_truncate, compound_write, fallback::fallback_on_empty_plan, validate_compatibility,
 };
 use datafusion::catalog::{Session, TableProvider};
 use datafusion::prelude::Expr;
@@ -189,8 +189,26 @@ impl Index for CompoundVectorIndex {
         compound_on_write_complete(self.primary.as_ref(), self.secondary.as_ref()).await
     }
 
+    async fn truncate(&self) -> DataFusionResult<()> {
+        compound_truncate(self.primary.as_ref(), self.secondary.as_ref()).await
+    }
+
     async fn delete_by_keys(&self, keys: RecordBatch) -> DataFusionResult<()> {
         compound_delete_by_keys(self.primary.as_ref(), self.secondary.as_ref(), keys).await
+    }
+
+    async fn delete_group_remainder(
+        &self,
+        group_columns: &[String],
+        members: RecordBatch,
+    ) -> DataFusionResult<()> {
+        compound_delete_group_remainder(
+            self.primary.as_ref(),
+            self.secondary.as_ref(),
+            group_columns,
+            members,
+        )
+        .await
     }
 
     async fn resolve_delete_keys(
@@ -224,12 +242,22 @@ impl Index for CompoundVectorIndex {
         self.primary.deletes_by_partial_key() && self.secondary.deletes_by_partial_key()
     }
 
+    fn group_pruning(&self) -> GroupPruning {
+        compound_group_pruning(self.primary.as_ref(), self.secondary.as_ref())
+    }
+
     fn write_start_failure_is_fatal(&self) -> bool {
         COMPOUND_WRITE_START_FAILURE_IS_FATAL
     }
 
     fn write_complete_failure_is_fatal(&self) -> bool {
         COMPOUND_WRITE_COMPLETE_FAILURE_IS_FATAL
+    }
+
+    fn requires_rebuild(&self) -> bool {
+        // A rebuild replays rows through `compute_index`, which writes both halves, so the
+        // compound needs one whenever either half does.
+        self.primary.requires_rebuild() || self.secondary.requires_rebuild()
     }
 
     fn as_any(&self) -> &dyn Any {

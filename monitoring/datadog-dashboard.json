@@ -5,7 +5,7 @@
     {
       "id": 1,
       "definition": {
-        "title": "\ud83c\udfe0 System Overview",
+        "title": "🏠 System Overview",
         "background_color": "vivid_blue",
         "type": "group",
         "layout_type": "ordered",
@@ -206,7 +206,7 @@
     {
       "id": 2,
       "definition": {
-        "title": "\ud83d\udcca Query Performance",
+        "title": "📊 Query Performance",
         "background_color": "vivid_green",
         "type": "group",
         "layout_type": "ordered",
@@ -293,7 +293,7 @@
                     {
                       "data_source": "metrics",
                       "name": "query1",
-                      "query": "sum:spiceai.query_executions.count{$instance,$env,$kube_namespace,$kube_cluster_name,$pod_name} by {protocol}.as_count()"
+                      "query": "sum:spiceai.query_executions.count{$instance,$env,$kube_namespace,$kube_cluster_name,$pod_name} by {protocol,service_instance_id}.as_count()"
                     }
                   ],
                   "response_format": "timeseries",
@@ -438,7 +438,7 @@
                     {
                       "data_source": "metrics",
                       "name": "query1",
-                      "query": "avg:spiceai.query_returned_rows_summary.quantile{$instance,$percentile,$env,$kube_namespace,$kube_cluster_name,$pod_name} by {protocol}"
+                      "query": "max:spiceai.query_returned_rows_summary.quantile{$instance,$percentile,$env,$kube_namespace,$kube_cluster_name,$pod_name} by {protocol}"
                     }
                   ],
                   "response_format": "timeseries",
@@ -474,7 +474,7 @@
     {
       "id": 3,
       "definition": {
-        "title": "\ud83d\udcc8 Data Throughput",
+        "title": "📈 Data Throughput",
         "background_color": "vivid_purple",
         "type": "group",
         "layout_type": "ordered",
@@ -618,7 +618,7 @@
     {
       "id": 4,
       "definition": {
-        "title": "\u26a1 Accelerated Datasets",
+        "title": "⚡ Accelerated Datasets",
         "background_color": "vivid_orange",
         "type": "group",
         "layout_type": "ordered",
@@ -723,7 +723,7 @@
                     {
                       "data_source": "metrics",
                       "name": "query1",
-                      "query": "avg:spiceai.dataset_acceleration_refresh_duration_ms_summary.quantile{$instance,!dataset:runtime.*,$percentile,$env,$kube_namespace,$kube_cluster_name,$pod_name} by {dataset}"
+                      "query": "max:spiceai.dataset_acceleration_refresh_duration_ms_summary.quantile{$instance,!dataset:runtime.*,$percentile,$env,$kube_namespace,$kube_cluster_name,$pod_name} by {dataset}"
                     }
                   ],
                   "response_format": "timeseries",
@@ -934,7 +934,7 @@
     {
       "id": 5,
       "definition": {
-        "title": "\ud83d\udcbe Results Cache",
+        "title": "💾 Results Cache",
         "background_color": "vivid_pink",
         "type": "group",
         "layout_type": "ordered",
@@ -1308,16 +1308,402 @@
       }
     },
     {
+      "definition": {
+        "title": "🧊 Cayenne Segment Cache",
+        "background_color": "vivid_purple",
+        "show_title": true,
+        "type": "group",
+        "layout_type": "ordered",
+        "widgets": [
+          {
+            "id": 1201,
+            "definition": {
+              "title": "Segment Cache Hit Rate",
+              "title_size": "16",
+              "title_align": "left",
+              "show_legend": true,
+              "legend_layout": "vertical",
+              "legend_columns": [
+                "avg",
+                "min",
+                "value"
+              ],
+              "type": "timeseries",
+              "requests": [
+                {
+                  "formulas": [
+                    {
+                      "alias": "Hit %",
+                      "formula": "(query1 / query2) * 100",
+                      "number_format": {
+                        "unit": {
+                          "type": "canonical_unit",
+                          "unit_name": "percent"
+                        }
+                      }
+                    }
+                  ],
+                  "queries": [
+                    {
+                      "data_source": "metrics",
+                      "name": "query1",
+                      "query": "sum:spiceai.cayenne_segment_cache_hits.count{$instance,$env,$kube_namespace,$kube_cluster_name,$pod_name} by {service_instance_id,cache}.as_count()"
+                    },
+                    {
+                      "data_source": "metrics",
+                      "name": "query2",
+                      "query": "sum:spiceai.cayenne_segment_cache_accesses.count{$instance,$env,$kube_namespace,$kube_cluster_name,$pod_name} by {service_instance_id,cache}.as_count()"
+                    }
+                  ],
+                  "response_format": "timeseries",
+                  "style": {
+                    "palette": "green",
+                    "line_type": "solid",
+                    "line_width": "normal"
+                  },
+                  "display_type": "line"
+                }
+              ],
+              "yaxis": {
+                "include_zero": true,
+                "scale": "linear",
+                "max": "100"
+              }
+            },
+            "layout": {
+              "x": 0,
+              "y": 0,
+              "width": 4,
+              "height": 3
+            }
+          },
+          {
+            "id": 1202,
+            "definition": {
+              "title": "Segment Cache Hits and Misses",
+              "title_size": "16",
+              "title_align": "left",
+              "show_legend": true,
+              "legend_layout": "auto",
+              "legend_columns": [
+                "avg",
+                "max",
+                "value"
+              ],
+              "type": "timeseries",
+              "requests": [
+                {
+                  "formulas": [
+                    {
+                      "alias": "Hits",
+                      "formula": "query1"
+                    },
+                    {
+                      "alias": "Misses",
+                      "style": {
+                        "palette": "warm",
+                        "palette_index": 4
+                      },
+                      "formula": "query2 - query1"
+                    }
+                  ],
+                  "queries": [
+                    {
+                      "data_source": "metrics",
+                      "name": "query1",
+                      "query": "sum:spiceai.cayenne_segment_cache_hits.count{$instance,$env,$kube_namespace,$kube_cluster_name,$pod_name} by {service_instance_id,cache}.as_rate()"
+                    },
+                    {
+                      "data_source": "metrics",
+                      "name": "query2",
+                      "query": "sum:spiceai.cayenne_segment_cache_accesses.count{$instance,$env,$kube_namespace,$kube_cluster_name,$pod_name} by {service_instance_id,cache}.as_rate()"
+                    }
+                  ],
+                  "response_format": "timeseries",
+                  "style": {
+                    "palette": "green",
+                    "line_type": "solid",
+                    "line_width": "normal"
+                  },
+                  "display_type": "area"
+                }
+              ],
+              "yaxis": {
+                "include_zero": true,
+                "scale": "linear",
+                "max": "auto"
+              }
+            },
+            "layout": {
+              "x": 4,
+              "y": 0,
+              "width": 4,
+              "height": 3
+            }
+          },
+          {
+            "id": 1203,
+            "definition": {
+              "title": "Segment Cache Memory Usage",
+              "title_size": "16",
+              "title_align": "left",
+              "show_legend": true,
+              "legend_layout": "auto",
+              "legend_columns": [
+                "value"
+              ],
+              "type": "timeseries",
+              "requests": [
+                {
+                  "formulas": [
+                    {
+                      "alias": "Used",
+                      "formula": "query1",
+                      "number_format": {
+                        "unit": {
+                          "type": "canonical_unit",
+                          "unit_name": "byte"
+                        }
+                      }
+                    },
+                    {
+                      "alias": "Max Capacity",
+                      "formula": "query2",
+                      "number_format": {
+                        "unit": {
+                          "type": "canonical_unit",
+                          "unit_name": "byte"
+                        }
+                      }
+                    }
+                  ],
+                  "queries": [
+                    {
+                      "data_source": "metrics",
+                      "name": "query1",
+                      "query": "sum:spiceai.cayenne_segment_cache_weighted_bytes{$instance,$env,$kube_namespace,$kube_cluster_name,$pod_name} by {service_instance_id,cache}.rollup(avg)"
+                    },
+                    {
+                      "data_source": "metrics",
+                      "name": "query2",
+                      "query": "sum:spiceai.cayenne_segment_cache_capacity_bytes{$instance,$env,$kube_namespace,$kube_cluster_name,$pod_name} by {service_instance_id,cache}.rollup(avg)"
+                    }
+                  ],
+                  "response_format": "timeseries",
+                  "style": {
+                    "palette": "dog_classic",
+                    "line_type": "solid",
+                    "line_width": "normal"
+                  },
+                  "display_type": "line"
+                }
+              ],
+              "yaxis": {
+                "include_zero": true,
+                "scale": "linear"
+              }
+            },
+            "layout": {
+              "x": 8,
+              "y": 0,
+              "width": 4,
+              "height": 3
+            }
+          },
+          {
+            "id": 1204,
+            "definition": {
+              "title": "Cached Segments Count",
+              "title_size": "16",
+              "title_align": "left",
+              "show_legend": false,
+              "type": "timeseries",
+              "requests": [
+                {
+                  "formulas": [
+                    {
+                      "alias": "Segments",
+                      "formula": "query1"
+                    }
+                  ],
+                  "queries": [
+                    {
+                      "data_source": "metrics",
+                      "name": "query1",
+                      "query": "sum:spiceai.cayenne_segment_cache_entries{$instance,$env,$kube_namespace,$kube_cluster_name,$pod_name} by {service_instance_id,cache}.rollup(avg)"
+                    }
+                  ],
+                  "response_format": "timeseries",
+                  "style": {
+                    "palette": "dog_classic",
+                    "line_type": "solid",
+                    "line_width": "normal"
+                  },
+                  "display_type": "line"
+                }
+              ],
+              "yaxis": {
+                "include_zero": true,
+                "scale": "linear"
+              }
+            },
+            "layout": {
+              "x": 0,
+              "y": 3,
+              "width": 4,
+              "height": 2
+            }
+          }
+        ]
+      },
+      "layout": {
+        "x": 0,
+        "y": 27,
+        "width": 12,
+        "height": 6
+      },
+      "id": 12
+    },
+    {
       "id": 6025761671556420,
       "definition": {
-        "title": "\ud83d\udce6 Acceleration Snapshots",
+        "title": "📦 Acceleration Snapshots",
         "background_color": "vivid_orange",
         "show_title": true,
         "type": "group",
         "layout_type": "ordered",
         "widgets": [
           {
-            "id": 6999096650525327,
+            "definition": {
+              "title": "Snapshot Age (time since last publish)",
+              "title_size": "16",
+              "title_align": "left",
+              "type": "toplist",
+              "requests": [
+                {
+                  "queries": [
+                    {
+                      "data_source": "metrics",
+                      "name": "query1",
+                      "query": "max:spiceai.dataset_acceleration_snapshot_write_timestamp{$instance,$env,$kube_namespace,$kube_cluster_name,$pod_name} by {dataset,service_instance_id}",
+                      "aggregator": "last"
+                    }
+                  ],
+                  "response_format": "scalar",
+                  "style": {
+                    "palette": "gray"
+                  },
+                  "formulas": [
+                    {
+                      "number_format": {
+                        "unit": {
+                          "type": "canonical_unit",
+                          "unit_name": "second"
+                        }
+                      },
+                      "formula": "(time() - query1) * (query1 / query1)"
+                    }
+                  ],
+                  "sort": {
+                    "count": 15,
+                    "order_by": [
+                      {
+                        "type": "formula",
+                        "index": 0,
+                        "order": "desc"
+                      }
+                    ]
+                  }
+                }
+              ],
+              "style": {
+                "display": {
+                  "type": "flat"
+                }
+              },
+              "time": {
+                "live_span": "5m"
+              }
+            },
+            "layout": {
+              "x": 0,
+              "y": 0,
+              "width": 4,
+              "height": 3
+            }
+          },
+          {
+            "definition": {
+              "title": "Creation Failures and Skips",
+              "title_size": "16",
+              "title_align": "left",
+              "show_legend": true,
+              "legend_layout": "auto",
+              "legend_columns": [
+                "avg",
+                "min",
+                "max",
+                "value",
+                "sum"
+              ],
+              "type": "timeseries",
+              "requests": [
+                {
+                  "response_format": "timeseries",
+                  "queries": [
+                    {
+                      "name": "query1",
+                      "data_source": "metrics",
+                      "query": "sum:spiceai.dataset_acceleration_snapshot_failure_count.count{$instance,$env,$kube_namespace,$kube_cluster_name,$pod_name} by {dataset,service_instance_id}.as_count()"
+                    }
+                  ],
+                  "formulas": [
+                    {
+                      "formula": "default_zero(query1)",
+                      "alias": "failed"
+                    }
+                  ],
+                  "style": {
+                    "palette": "red",
+                    "order_by": "values",
+                    "line_type": "solid",
+                    "line_width": "normal"
+                  },
+                  "display_type": "bars"
+                },
+                {
+                  "response_format": "timeseries",
+                  "queries": [
+                    {
+                      "name": "query1",
+                      "data_source": "metrics",
+                      "query": "sum:spiceai.dataset_acceleration_snapshot_skipped_count.count{$instance,$env,$kube_namespace,$kube_cluster_name,$pod_name} by {dataset,service_instance_id}.as_count()"
+                    }
+                  ],
+                  "formulas": [
+                    {
+                      "formula": "default_zero(query1)",
+                      "alias": "skipped"
+                    }
+                  ],
+                  "style": {
+                    "palette": "grey",
+                    "order_by": "values",
+                    "line_type": "solid",
+                    "line_width": "normal"
+                  },
+                  "display_type": "bars"
+                }
+              ]
+            },
+            "layout": {
+              "x": 4,
+              "y": 0,
+              "width": 4,
+              "height": 3
+            }
+          },
+          {
             "definition": {
               "title": "Creation Duration",
               "title_size": "16",
@@ -1339,7 +1725,7 @@
                     {
                       "name": "query1",
                       "data_source": "metrics",
-                      "query": "avg:spiceai.dataset_acceleration_snapshot_write_duration_ms_summary.quantile{$instance,$percentile,$env,$kube_namespace,$kube_cluster_name,$pod_name} by {dataset}"
+                      "query": "max:spiceai.dataset_acceleration_snapshot_write_duration_ms_summary.quantile{$instance,$percentile,$env,$kube_namespace,$kube_cluster_name,$pod_name} by {dataset}"
                     }
                   ],
                   "formulas": [
@@ -1364,16 +1750,16 @@
               ]
             },
             "layout": {
-              "x": 0,
+              "x": 8,
               "y": 0,
               "width": 4,
               "height": 3
-            }
+            },
+            "id": 6999096650525327
           },
           {
-            "id": 1548831823273523,
             "definition": {
-              "title": "File Size",
+              "title": "Snapshot Size",
               "title_size": "16",
               "title_align": "left",
               "show_legend": true,
@@ -1418,62 +1804,59 @@
               ]
             },
             "layout": {
-              "x": 4,
-              "y": 0,
+              "x": 0,
+              "y": 3,
               "width": 4,
               "height": 3
-            }
+            },
+            "id": 1548831823273523
           },
           {
-            "id": 783195861224473,
             "definition": {
-              "title": "Bootstrap Duration",
+              "title": "Bootstrap Duration, seconds (slowest initial load in window)",
               "title_size": "16",
               "title_align": "left",
-              "show_legend": true,
-              "legend_layout": "auto",
-              "legend_columns": [
-                "avg",
-                "min",
-                "max",
-                "value",
-                "sum"
-              ],
-              "type": "timeseries",
+              "type": "toplist",
               "requests": [
                 {
-                  "response_format": "timeseries",
                   "queries": [
                     {
-                      "name": "query1",
                       "data_source": "metrics",
-                      "query": "sum:spiceai.dataset_acceleration_snapshot_bootstrap_duration_ms.count{$instance,$env,$kube_namespace,$kube_cluster_name,$pod_name} by {dataset,service_instance_id}.as_count()"
+                      "name": "query1",
+                      "query": "sum:spiceai.dataset_acceleration_snapshot_bootstrap_duration_ms.count{$instance,$env,$kube_namespace,$kube_cluster_name,$pod_name} by {dataset,service_instance_id}",
+                      "aggregator": "max"
                     }
                   ],
+                  "response_format": "scalar",
+                  "style": {
+                    "palette": "gray"
+                  },
                   "formulas": [
                     {
-                      "formula": "query1",
-                      "number_format": {
-                        "unit": {
-                          "type": "canonical_unit",
-                          "unit_name": "millisecond"
-                        }
-                      }
+                      "formula": "query1 / 1000"
                     }
                   ],
-                  "style": {
-                    "palette": "dog_classic",
-                    "order_by": "values",
-                    "line_type": "solid",
-                    "line_width": "normal"
-                  },
-                  "display_type": "bars"
+                  "sort": {
+                    "count": 15,
+                    "order_by": [
+                      {
+                        "type": "formula",
+                        "index": 0,
+                        "order": "desc"
+                      }
+                    ]
+                  }
                 }
-              ]
+              ],
+              "style": {
+                "display": {
+                  "type": "flat"
+                }
+              }
             },
             "layout": {
-              "x": 8,
-              "y": 0,
+              "x": 4,
+              "y": 3,
               "width": 4,
               "height": 3
             }
@@ -1482,15 +1865,15 @@
       },
       "layout": {
         "x": 0,
-        "y": 27,
+        "y": 33,
         "width": 12,
-        "height": 4
+        "height": 7
       }
     },
     {
       "id": 6,
       "definition": {
-        "title": "\ud83c\udf10 HTTP API",
+        "title": "🌐 HTTP API",
         "background_color": "vivid_yellow",
         "type": "group",
         "layout_type": "ordered",
@@ -1602,7 +1985,7 @@
       },
       "layout": {
         "x": 0,
-        "y": 31,
+        "y": 40,
         "width": 12,
         "height": 1
       }
@@ -1610,7 +1993,7 @@
     {
       "id": 7,
       "definition": {
-        "title": "\u2708\ufe0f Arrow Flight Operations",
+        "title": "✈️ Arrow Flight Operations",
         "background_color": "gray",
         "type": "group",
         "layout_type": "ordered",
@@ -1646,7 +2029,7 @@
                     {
                       "data_source": "metrics",
                       "name": "query1",
-                      "query": "avg:spiceai.flight_request_duration_ms_summary.quantile{$instance,method:do_get,$percentile,$env,$kube_namespace,$kube_cluster_name,$pod_name} by {command}"
+                      "query": "max:spiceai.flight_request_duration_ms_summary.quantile{$instance,method:do_get,$percentile,$env,$kube_namespace,$kube_cluster_name,$pod_name} by {command}"
                     }
                   ],
                   "response_format": "timeseries",
@@ -1701,7 +2084,7 @@
                     {
                       "data_source": "metrics",
                       "name": "query1",
-                      "query": "avg:spiceai.flight_request_duration_ms_summary.quantile{$instance,method:do_put,$percentile,$env,$kube_namespace,$kube_cluster_name,$pod_name} by {command}"
+                      "query": "max:spiceai.flight_request_duration_ms_summary.quantile{$instance,method:do_put,$percentile,$env,$kube_namespace,$kube_cluster_name,$pod_name} by {command}"
                     }
                   ],
                   "response_format": "timeseries",
@@ -1756,7 +2139,7 @@
                     {
                       "data_source": "metrics",
                       "name": "query1",
-                      "query": "avg:spiceai.flight_request_duration_ms_summary.quantile{$instance,method:get_flight_info,$percentile,$env,$kube_namespace,$kube_cluster_name,$pod_name} by {command}"
+                      "query": "max:spiceai.flight_request_duration_ms_summary.quantile{$instance,method:get_flight_info,$percentile,$env,$kube_namespace,$kube_cluster_name,$pod_name} by {command}"
                     }
                   ],
                   "response_format": "timeseries",
@@ -1881,7 +2264,7 @@
       },
       "layout": {
         "x": 0,
-        "y": 32,
+        "y": 41,
         "width": 12,
         "height": 1
       }
@@ -1889,7 +2272,7 @@
     {
       "id": 8,
       "definition": {
-        "title": "\u23e9 Debezium Ingestion",
+        "title": "⏩ Debezium Ingestion",
         "background_color": "white",
         "show_title": true,
         "type": "group",
@@ -1993,7 +2376,7 @@
       },
       "layout": {
         "x": 0,
-        "y": 33,
+        "y": 42,
         "width": 12,
         "height": 1
       }
@@ -2001,7 +2384,7 @@
     {
       "id": 9,
       "definition": {
-        "title": "\u23e9 DynamoDB Streams Ingestion",
+        "title": "⏩ DynamoDB Streams Ingestion",
         "background_color": "blue",
         "show_title": true,
         "type": "group",
@@ -2203,7 +2586,7 @@
       },
       "layout": {
         "x": 0,
-        "y": 34,
+        "y": 43,
         "width": 12,
         "height": 1
       }
@@ -2211,7 +2594,7 @@
     {
       "id": 11,
       "definition": {
-        "title": "\u2699\ufe0f Runtime Resources",
+        "title": "⚙️ Runtime Resources",
         "background_color": "vivid_yellow",
         "show_title": true,
         "type": "group",
@@ -2679,76 +3062,20 @@
               "width": 4,
               "height": 3
             }
-          },
-          {
-            "id": 1009,
-            "definition": {
-              "title": "Cayenne Segment Cache Memory",
-              "title_size": "16",
-              "title_align": "left",
-              "show_legend": true,
-              "legend_layout": "auto",
-              "legend_columns": [
-                "avg",
-                "max",
-                "value"
-              ],
-              "type": "timeseries",
-              "requests": [
-                {
-                  "formulas": [
-                    {
-                      "alias": "used",
-                      "formula": "query1",
-                      "number_format": {
-                        "unit": {
-                          "type": "canonical_unit",
-                          "unit_name": "byte"
-                        }
-                      }
-                    }
-                  ],
-                  "queries": [
-                    {
-                      "data_source": "metrics",
-                      "name": "query1",
-                      "query": "sum:spiceai.cayenne_segment_cache_weighted_bytes{$instance,$env,$kube_namespace,$kube_cluster_name,$pod_name} by {service_instance_id}"
-                    }
-                  ],
-                  "response_format": "timeseries",
-                  "style": {
-                    "palette": "dog_classic",
-                    "line_type": "solid",
-                    "line_width": "normal"
-                  },
-                  "display_type": "line"
-                }
-              ],
-              "yaxis": {
-                "include_zero": true,
-                "scale": "linear"
-              }
-            },
-            "layout": {
-              "x": 0,
-              "y": 9,
-              "width": 4,
-              "height": 3
-            }
           }
         ]
       },
       "layout": {
         "x": 0,
-        "y": 35,
+        "y": 44,
         "width": 12,
-        "height": 10
+        "height": 9
       }
     },
     {
       "id": 10,
       "definition": {
-        "title": "\ud83d\udd27 Kubernetes Resource Utilization",
+        "title": "🔧 Kubernetes Resource Utilization",
         "background_color": "vivid_green",
         "show_title": true,
         "type": "group",
@@ -3104,12 +3431,156 @@
               "width": 6,
               "height": 3
             }
+          },
+          {
+            "definition": {
+              "title": "Pods OOM Killed",
+              "title_size": "16",
+              "title_align": "left",
+              "show_legend": true,
+              "legend_layout": "auto",
+              "legend_columns": [
+                "avg",
+                "min",
+                "max",
+                "value",
+                "sum"
+              ],
+              "type": "timeseries",
+              "requests": [
+                {
+                  "formulas": [
+                    {
+                      "formula": "query1"
+                    }
+                  ],
+                  "queries": [
+                    {
+                      "data_source": "metrics",
+                      "name": "query1",
+                      "query": "sum:kubernetes_state.container.status_report.count.terminated{$kube_cluster_name,$kube_namespace,reason:oomkilled,$env,$pod_name} by {pod_name,reason,kube_cluster_name}"
+                    }
+                  ],
+                  "response_format": "timeseries",
+                  "style": {
+                    "palette": "warm",
+                    "order_by": "tags",
+                    "line_type": "solid",
+                    "line_width": "normal"
+                  },
+                  "display_type": "bars"
+                }
+              ],
+              "markers": []
+            },
+            "layout": {
+              "x": 0,
+              "y": 9,
+              "width": 4,
+              "height": 2
+            }
+          },
+          {
+            "definition": {
+              "title": "Pods CrashLoopBackOff",
+              "title_size": "16",
+              "title_align": "left",
+              "show_legend": true,
+              "legend_layout": "auto",
+              "legend_columns": [
+                "avg",
+                "min",
+                "max",
+                "value",
+                "sum"
+              ],
+              "type": "timeseries",
+              "requests": [
+                {
+                  "formulas": [
+                    {
+                      "formula": "query1"
+                    }
+                  ],
+                  "queries": [
+                    {
+                      "data_source": "metrics",
+                      "name": "query1",
+                      "query": "sum:kubernetes_state.container.status_report.count.waiting{$kube_cluster_name,$kube_namespace,$env,$pod_name,reason:crashloopbackoff} by {pod_name,reason,kube_cluster_name}"
+                    }
+                  ],
+                  "response_format": "timeseries",
+                  "style": {
+                    "palette": "warm",
+                    "order_by": "tags",
+                    "line_type": "solid",
+                    "line_width": "normal"
+                  },
+                  "display_type": "bars"
+                }
+              ],
+              "markers": []
+            },
+            "layout": {
+              "x": 4,
+              "y": 9,
+              "width": 4,
+              "height": 2
+            }
+          },
+          {
+            "definition": {
+              "title": "Pods Restarts",
+              "title_size": "16",
+              "title_align": "left",
+              "show_legend": true,
+              "legend_layout": "auto",
+              "legend_columns": [
+                "avg",
+                "min",
+                "max",
+                "value",
+                "sum"
+              ],
+              "type": "timeseries",
+              "requests": [
+                {
+                  "formulas": [
+                    {
+                      "formula": "query1"
+                    }
+                  ],
+                  "queries": [
+                    {
+                      "data_source": "metrics",
+                      "name": "query1",
+                      "query": "max:kubernetes_state.container.restarts{$kube_cluster_name,$kube_namespace,$env,!kube_container_name:istio-proxy,$pod_name} by {pod_name,reason,kube_cluster_name,kube_container_name}"
+                    }
+                  ],
+                  "response_format": "timeseries",
+                  "style": {
+                    "palette": "dog_classic",
+                    "order_by": "tags",
+                    "line_type": "solid",
+                    "line_width": "normal"
+                  },
+                  "display_type": "bars"
+                }
+              ],
+              "markers": []
+            },
+            "layout": {
+              "x": 8,
+              "y": 9,
+              "width": 4,
+              "height": 2
+            }
           }
         ]
       },
       "layout": {
         "x": 0,
-        "y": 45,
+        "y": 53,
         "width": 12,
         "height": 1
       }

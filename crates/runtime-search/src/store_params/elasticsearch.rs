@@ -55,9 +55,9 @@ impl FromStr for EsDistanceMetric {
             "l2_norm" | "l2" | "euclidean" => Ok(EsDistanceMetric::L2Norm),
             "dot_product" | "dot" => Ok(EsDistanceMetric::DotProduct),
             "max_inner_product" | "mip" => Ok(EsDistanceMetric::MaxInnerProduct),
-            other => Err(format!(
-                "Expected one of: cosine | l2_norm | dot_product | max_inner_product. Found {other}."
-            )),
+            _ => Err(
+                "Expected one of: cosine | l2_norm | dot_product | max_inner_product.".to_string(),
+            ),
         }
     }
 }
@@ -239,9 +239,9 @@ pub struct ElasticsearchFtsConfig {
 /// (`elasticsearch_endpoint`) keys; normalize bare keys to the prefixed form
 /// [`ElasticsearchFtsParams`] declares so both keep working.
 #[must_use]
-pub fn normalize_elasticsearch_prefix<S: std::hash::BuildHasher>(
-    resolved: HashMap<String, SecretString, S>,
-) -> HashMap<String, SecretString> {
+pub fn normalize_elasticsearch_prefix<V, S: std::hash::BuildHasher>(
+    resolved: HashMap<String, V, S>,
+) -> HashMap<String, V> {
     resolved
         .into_iter()
         .map(|(k, v)| {
@@ -430,9 +430,12 @@ mod tests {
 
     #[tokio::test]
     async fn vector_params_accept_distance_metric_aliases() {
-        let typed = try_es_params(&[("elasticsearch_distance_metric", "mip")])
-            .await
-            .expect("distance metric alias should be accepted");
+        let typed = try_es_params(&[
+            ("elasticsearch_endpoint", "http://localhost:9200"),
+            ("elasticsearch_distance_metric", "mip"),
+        ])
+        .await
+        .expect("distance metric alias should be accepted");
         assert_eq!(
             typed.distance_metric,
             Some(EsDistanceMetric::MaxInnerProduct)
@@ -444,10 +447,136 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn vector_params_partial_secret_interpolation_does_not_echo_duration_exponent() {
+        const SECRET_TAIL: &str = "1234";
+        const RAW: &str = "1e1234";
+        const SOURCE: &str = "${ env:SECRET }";
+
+        let templates = HashMap::from([
+            (
+                "elasticsearch_endpoint".to_string(),
+                "http://localhost:9200".to_string(),
+            ),
+            ("client_timeout".to_string(), format!("1e{SOURCE}")),
+        ]);
+        let sources = runtime_secrets::secret_sources_from_templates(&templates);
+        assert_eq!(
+            sources.get("client_timeout").map(String::as_str),
+            Some(SOURCE)
+        );
+
+        let leaked = try_es_params(&[
+            ("elasticsearch_endpoint", "http://localhost:9200"),
+            ("client_timeout", RAW),
+        ])
+        .await
+        .expect_err("1e1234 is not a valid duration");
+        eprintln!("empty-sources duration parse error: {leaked}");
+
+        let err = ElasticsearchVectorParams::try_from_params_with_secret_sources(
+            "Elasticsearch vector store",
+            HashMap::from([
+                (
+                    "elasticsearch_endpoint".to_string(),
+                    SecretString::from("http://localhost:9200".to_string()),
+                ),
+                (
+                    "client_timeout".to_string(),
+                    SecretString::from(RAW.to_string()),
+                ),
+            ]),
+            &Arc::new(RwLock::new(Secrets::default())),
+            &sources,
+        )
+        .await
+        .expect_err("1e1234 is not a valid duration");
+
+        let message = err.to_string();
+        assert!(
+            !message.contains(SECRET_TAIL),
+            "secret-derived parse errors must not echo a secret substring: {message}"
+        );
+        assert!(
+            !message.contains(RAW),
+            "secret-derived parse errors must not echo the resolved input: {message}"
+        );
+        assert!(
+            !message.contains("Exponent"),
+            "secret-derived parse errors must not surface parser text: {message}"
+        );
+        assert_eq!(
+            message,
+            format!("invalid value for `client_timeout` from {SOURCE}; expected a valid value")
+        );
+    }
+
+    #[tokio::test]
+    async fn fts_params_partial_secret_interpolation_does_not_echo_duration_exponent() {
+        const SECRET_TAIL: &str = "1234";
+        const RAW: &str = "1e1234";
+        const SOURCE: &str = "${ env:SECRET }";
+
+        let templates = HashMap::from([
+            ("endpoint".to_string(), "http://localhost:9200".to_string()),
+            ("client_timeout".to_string(), format!("1e{SOURCE}")),
+        ]);
+        let sources = normalize_elasticsearch_prefix(
+            runtime_secrets::secret_sources_from_templates(&templates),
+        );
+        assert_eq!(
+            sources
+                .get("elasticsearch_client_timeout")
+                .map(String::as_str),
+            Some(SOURCE)
+        );
+
+        let err = ElasticsearchFtsParams::try_from_params_with_secret_sources(
+            "Elasticsearch full-text search test",
+            normalize_elasticsearch_prefix(HashMap::from([
+                (
+                    "endpoint".to_string(),
+                    SecretString::from("http://localhost:9200".to_string()),
+                ),
+                (
+                    "client_timeout".to_string(),
+                    SecretString::from(RAW.to_string()),
+                ),
+            ])),
+            &Arc::new(RwLock::new(Secrets::default())),
+            &sources,
+        )
+        .await
+        .expect_err("1e1234 is not a valid duration");
+
+        let message = err.to_string();
+        assert!(
+            !message.contains(SECRET_TAIL),
+            "secret-derived parse errors must not echo a secret substring: {message}"
+        );
+        assert!(
+            !message.contains(RAW),
+            "secret-derived parse errors must not echo the resolved input: {message}"
+        );
+        assert!(
+            !message.contains("Exponent"),
+            "secret-derived parse errors must not surface parser text: {message}"
+        );
+        assert_eq!(
+            message,
+            format!(
+                "invalid value for `elasticsearch_client_timeout` from {SOURCE}; expected a valid value"
+            )
+        );
+    }
+
+    #[tokio::test]
     async fn vector_params_reject_invalid_distance_metric() {
-        let err = try_es_params(&[("elasticsearch_distance_metric", "manhattan")])
-            .await
-            .expect_err("invalid distance metric should be rejected");
+        let err = try_es_params(&[
+            ("elasticsearch_endpoint", "http://localhost:9200"),
+            ("elasticsearch_distance_metric", "manhattan"),
+        ])
+        .await
+        .expect_err("invalid distance metric should be rejected");
         assert!(
             err.to_string()
                 .contains("Invalid value for parameter 'elasticsearch_distance_metric'"),
@@ -457,9 +586,12 @@ mod tests {
 
     #[tokio::test]
     async fn vector_params_reject_non_object_index_settings() {
-        let err = try_es_params(&[("elasticsearch_index_settings", "[1, 2]")])
-            .await
-            .expect_err("non-object index_settings should be rejected");
+        let err = try_es_params(&[
+            ("elasticsearch_endpoint", "http://localhost:9200"),
+            ("elasticsearch_index_settings", "[1, 2]"),
+        ])
+        .await
+        .expect_err("non-object index_settings should be rejected");
         assert!(
             err.to_string()
                 .contains("Invalid value for parameter 'elasticsearch_index_settings'"),
@@ -501,14 +633,20 @@ mod tests {
 
     #[tokio::test]
     async fn bool_params_accept_lenient_forms() {
-        let typed = try_es_params(&[("elasticsearch_force_merge_after_write", "1")])
-            .await
-            .expect("lenient boolean forms should be accepted");
+        let typed = try_es_params(&[
+            ("elasticsearch_endpoint", "http://localhost:9200"),
+            ("elasticsearch_force_merge_after_write", "1"),
+        ])
+        .await
+        .expect("lenient boolean forms should be accepted");
         assert!(typed.force_merge_after_write);
 
-        let typed = try_es_params(&[("elasticsearch_spill_writes", "No")])
-            .await
-            .expect("lenient boolean forms should be accepted");
+        let typed = try_es_params(&[
+            ("elasticsearch_endpoint", "http://localhost:9200"),
+            ("elasticsearch_spill_writes", "No"),
+        ])
+        .await
+        .expect("lenient boolean forms should be accepted");
         assert_eq!(typed.spill_writes, Some(false));
 
         let typed = try_fts_params(&[("force_merge_after_write", "Yes")])

@@ -17,6 +17,7 @@ limitations under the License.
 use arrow_schema::{DataType, Field, Schema, SchemaRef};
 use datafusion::arrow::array::{Array, UInt64Array};
 use datafusion::arrow::compute;
+use datafusion::catalog::TableProvider;
 use datafusion::common::DFSchema;
 use datafusion::execution::context::ExecutionProps;
 use datafusion::logical_expr::ColumnarValue;
@@ -129,6 +130,17 @@ impl DisplayAs for PartitionerExec {
 impl ExecutionPlan for PartitionerExec {
     fn schema(&self) -> SchemaRef {
         Arc::clone(&self.output_schema)
+    }
+
+    fn apply_expressions(
+        &self,
+        _f: &mut dyn FnMut(
+            &Arc<dyn datafusion::physical_plan::PhysicalExpr>,
+        ) -> datafusion::error::Result<
+            datafusion::common::tree_node::TreeNodeRecursion,
+        >,
+    ) -> datafusion::error::Result<datafusion::common::tree_node::TreeNodeRecursion> {
+        Ok(datafusion::common::tree_node::TreeNodeRecursion::Continue)
     }
 
     fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> {
@@ -262,6 +274,37 @@ impl ExecutionPlan for PartitionerExec {
                     }
                 }
 
+                // An overwrite replaces the whole table, so a partition the input
+                // never reached is overwritten with nothing — otherwise its
+                // previous rows stay visible. With an empty input, that is every
+                // partition.
+                if insert_op == InsertOp::Overwrite {
+                    let unreached: Vec<Arc<dyn TableProvider>> = partition_providers
+                        .read()
+                        .await
+                        .iter()
+                        .filter(|(key, _)| !partition_senders.contains_key(key.as_str()))
+                        .map(|(_, partition)| Arc::clone(&partition.table_provider))
+                        .collect();
+                    for provider in unreached {
+                        // Closing the only sender ends the partition's input at once.
+                        let (_, rx) = channel(1);
+                        let state = ctx.state();
+                        let context = Arc::clone(&context);
+                        let exec = PartitionInputExec::new(rx, Arc::clone(&schema));
+                        handles.push(tokio::spawn(async move {
+                            let plan = provider
+                                .insert_into(&state, Arc::new(exec), InsertOp::Overwrite)
+                                .await?;
+                            let mut stream = execute_stream(plan, context)?;
+                            while let Some(batch) = stream.next().await {
+                                batch?;
+                            }
+                            Result::<(), DataFusionError>::Ok(())
+                        }));
+                    }
+                }
+
                 // Must drop the sending channels so that the receiving streams
                 // can terminate
                 drop(partition_senders);
@@ -313,7 +356,12 @@ fn create_physical_expr(
 ) -> Result<Arc<dyn PhysicalExpr>, DataFusionError> {
     let input_dfschema = DFSchema::try_from(schema)?;
     let execution_props = ExecutionProps::new();
-    datafusion::physical_expr::create_physical_expr(expr, &input_dfschema, &execution_props)
+    datafusion::physical_expr::create_physical_expr(
+        expr,
+        &input_dfschema,
+        &execution_props,
+        &datafusion::logical_expr::physical_planning_context::PhysicalPlanningContext::default(),
+    )
 }
 
 fn filter_batch_by_indices(
@@ -372,6 +420,17 @@ impl ExecutionPlan for PartitionInputExec {
 
     fn properties(&self) -> &Arc<PlanProperties> {
         &self.properties
+    }
+
+    fn apply_expressions(
+        &self,
+        _f: &mut dyn FnMut(
+            &Arc<dyn datafusion::physical_plan::PhysicalExpr>,
+        ) -> datafusion::error::Result<
+            datafusion::common::tree_node::TreeNodeRecursion,
+        >,
+    ) -> datafusion::error::Result<datafusion::common::tree_node::TreeNodeRecursion> {
+        Ok(datafusion::common::tree_node::TreeNodeRecursion::Continue)
     }
 
     fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> {

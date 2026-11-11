@@ -1,0 +1,42 @@
+---
+source: crates/evaluate-chat/src/schema.rs
+expression: "serde_json::to_string_pretty(&reply_schema(&sample_questions(),\nAnswerMode::Discrete)).expect(\"schema serializes\")"
+---
+{
+  "additionalProperties": false,
+  "properties": {
+    "answers": {
+      "additionalProperties": false,
+      "description": "Exactly one answer per property below. Use these property names verbatim and do not add, rename, or nest them under any other key.",
+      "properties": {
+        "is_urgent": {
+          "description": "Does this convey urgency?\nTrue criteria: Money or access is blocked now\nFalse criteria: No additional instructions.",
+          "type": "boolean"
+        },
+        "team": {
+          "description": "[\"Route the ticket\",\"Prefer technical when ambiguous\"]\nChoice labels, answer with one label:\nbilling = Payments and invoices\nsales = No additional instructions.\ntechnical = {\"area\":\"bugs\"}",
+          "enum": [
+            "billing",
+            "sales",
+            "technical"
+          ],
+          "type": "string"
+        },
+        "tone": {
+          "description": "No additional instructions.\nScore levels, answer with the integer:\n0 = calm\n1 = annoyed\n2 = furious",
+          "type": "integer"
+        }
+      },
+      "required": [
+        "is_urgent",
+        "team",
+        "tone"
+      ],
+      "type": "object"
+    }
+  },
+  "required": [
+    "answers"
+  ],
+  "type": "object"
+}

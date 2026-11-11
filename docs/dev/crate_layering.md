@@ -492,8 +492,8 @@ steps — **one seam per PR**:
   `DataConnectorError` → `ConnectorComponent` → `Arc<Dataset>`/`Arc<Catalog>`, which
   drags heavy runtime types along and must be decoupled before the error can move.)
 - **Interface traits are `dyn`-safe.** They are used as `Arc<dyn Trait>`, so keep
-  them object-safe and `#[async_trait]` (see CLAUDE.md → Async & blocking). The
-  *trait-evolution & wrapper-delegation* rule (CLAUDE.md) applies with force here: a
+  them object-safe and `#[async_trait]` (see AGENTS.md → Async & blocking). The
+  *trait-evolution & wrapper-delegation* rule (AGENTS.md) applies with force here: a
   new method on an interface trait must be **forwarded through every wrapper** impl
   (`AcceleratedTable`, `FederatedTable`, …), never left as a defaulted no-op.
 
@@ -569,8 +569,8 @@ depends on it** — else it is the upward edge the guard rejects.
   plus a trait per shape, so the typed, relationally-queryable offset table survives —
   the trade-off feared here (collapsing everything into a keyed blob and losing
   per-column queryability) was avoided by keeping a shape per connector.
-- Each engine implements every shape in `runtime-checkpoint-{duckdb,sqlite,postgres,
-  turso}`, and bundles them behind `runtime_acceleration::sidecar::AcceleratorSidecar`.
+- Each engine implements every shape in `runtime-checkpoint-{sqlite,postgres}`,
+  and bundles them behind `runtime_acceleration::sidecar::AcceleratorSidecar`.
 - `DataAccelerator::sidecar` hands that bundle back, so the runtime resolves a dataset
   to its stores without naming an engine — which is what lets the engine crates sit
   below `runtime` rather than inside it.
@@ -637,7 +637,7 @@ and only worth it if runtime plug-ability becomes a product requirement.
 - [`docs/EXTENSIBILITY.md`](../EXTENSIBILITY.md) — the extension points (Data
   Connector, Accelerator, Catalog, Secret Store, Model, Embedding). The `-api`
   interface crates *are* these extension points; keep the two aligned.
-- **CLAUDE.md** — the *trait evolution & wrapper delegation* rule (forward new trait
+- **AGENTS.md** — the *trait evolution & wrapper delegation* rule (forward new trait
   methods through every wrapper) and the async/`dyn`-safety rules that interface
   traits must satisfy.
 

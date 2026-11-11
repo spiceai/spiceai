@@ -6,7 +6,7 @@
 //
 //     https://www.apache.org/licenses/LICENSE-2.0
 
-//! PK conflict resolution throughput: Cayenne vs DuckDB.
+//! PK conflict resolution throughput: Cayenne vs `DuckDB`.
 //!
 //! Both engines start with the same N rows preloaded under a single-column
 //! `id` primary key. The timed region applies an incoming batch where a tunable
@@ -17,16 +17,16 @@
 //!   append path. Both ultimately commit through the metastore, so this bench
 //!   directly stresses the SQLite single-writer mutex that Finding 1 in the
 //!   CH-benCH retest hypothesized as a cross-dataset bottleneck.
-//! - DuckDB side: `INSERT INTO ... ON CONFLICT (id) DO UPDATE SET ...` from a
-//!   parquet source — DuckDB's documented upsert path.
+//! - `DuckDB` side: `INSERT INTO ... ON CONFLICT (id) DO UPDATE SET ...` from a
+//!   parquet source — `DuckDB`'s documented upsert path.
 //!
 //! Conflict fractions covered: 0 % (pure insert into a PK'd table), 50 %, and
 //! 100 % (every incoming row replaces an existing one).
 //!
 //! ## Iter 9 extension (parameterized large-N for keyset-cap validation)
 //! Add a `bench_upsert_keyset_cap` (or rename) that runs only under `#[cfg(feature="duckdb-bench")]`
-//! with TABLE_ROWS in {10_000, 100_000, 1_000_000, 3_000_000}, conflict_pct=100% fixed,
-//! sample_size(10), and throughput by elements. Expect DuckDB wall time ~flat (PK index O(log N));
+//! with `TABLE_ROWS` in {`10_000`, `100_000`, `1_000_000`, `3_000_000`}, `conflict_pct=100`% fixed,
+//! `sample_size(10)`, and throughput by elements. Expect `DuckDB` wall time ~flat (PK index O(log N));
 //! Cayenne time stays flat for tables that fit under the byte-budget cap
 //! (`PK_KEYSET_CACHE_MAX_BYTES = 256 MiB`, ~4 M narrow-PK rows) and grows with N
 //! once the budget is exceeded and `load_existing_keyset` must rebuild from scratch on every commit.
@@ -74,7 +74,7 @@ fn make_upsert_batch(
     let mut ids: Vec<i64> = Vec::with_capacity(incoming_rows);
     for i in 0..conflict_count {
         // Spread collisions across the existing keyspace.
-        ids.push(((i as u64).wrapping_mul(2654435761) % table_rows as u64) as i64);
+        ids.push(((i as u64).wrapping_mul(2_654_435_761) % table_rows as u64) as i64);
     }
     for i in 0..new_count {
         ids.push((table_rows + i) as i64);

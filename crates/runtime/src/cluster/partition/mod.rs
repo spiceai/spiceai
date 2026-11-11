@@ -20,7 +20,7 @@ mod startup;
 
 use std::collections::HashMap;
 
-use datafusion::sql::ResolvedTableReference;
+use datafusion::common::ResolvedTableReference;
 use datafusion_expr::Expr;
 use snafu::Snafu;
 
@@ -109,18 +109,24 @@ pub type Result<T, E = Error> = std::result::Result<T, E>;
 /// calling this function, so that bare, partial, and fully-qualified references
 /// all produce the same key and match correctly against the assignments map.
 #[expect(clippy::implicit_hasher)]
+#[must_use]
 pub fn get_partition_filter_exprs(
     tbl: &ResolvedTableReference,
     assignments: &HashMap<ResolvedTableReference, Vec<Expr>>,
 ) -> Vec<Expr> {
-    let partitions = assignments.get(tbl).cloned().unwrap_or_default();
+    combine_partition_exprs(assignments.get(tbl).cloned().unwrap_or_default())
+}
+
+/// Combines partition expressions with OR (union of partitions) into a
+/// single-element `Vec<Expr>`, so applying it via `.filter()` is correct.
+/// Returns an empty `Vec` for no partitions.
+#[must_use]
+pub fn combine_partition_exprs(partitions: Vec<Expr>) -> Vec<Expr> {
     if partitions.is_empty() {
         return vec![];
     }
-    // Combine multiple partition expressions with OR (union of partitions) using a
-    // balanced tree to avoid O(n)-depth nesting that can exceed recursion limits
-    // during expression traversal/serialization. Wrap in a single-element Vec so
-    // `.filter()` applies it as one predicate.
+    // Combine with a balanced tree to avoid O(n)-depth nesting that can exceed
+    // recursion limits during expression traversal/serialization.
     let combined = util::expr::combine_exprs_balanced(partitions, Expr::or)
         .unwrap_or_else(|| unreachable!("partitions is not empty"));
     vec![combined]
@@ -166,7 +172,7 @@ pub fn get_partition_filter_exprs(
 /// [`Statistics`]: datafusion::common::Statistics
 pub(crate) async fn local_executor_table_statistics(
     df: &crate::datafusion::DataFusion,
-    table: &datafusion::sql::TableReference,
+    table: &datafusion::common::TableReference,
 ) -> Option<(datafusion::common::Statistics, Vec<String>)> {
     let provider = df.get_table(table).await?;
     let schema = provider.schema();
@@ -192,7 +198,12 @@ pub(crate) async fn local_executor_table_statistics(
     // present AND at least one column carries a min/max bound.
     let session_state = df.ctx.state();
     let scan_stats = match provider.scan(&session_state, None, &[], None).await {
-        Ok(plan) => plan.partition_statistics(None).ok(),
+        Ok(plan) => datafusion::physical_plan::StatisticsContext::new()
+            .compute(
+                plan.as_ref(),
+                &datafusion::physical_plan::StatisticsArgs::new(),
+            )
+            .ok(),
         Err(_) => None,
     };
     if let Some(stats) = scan_stats

@@ -64,14 +64,14 @@ Run it from the host, against a published MinIO port:
 
 ```bash
 MINIO_ENDPOINT=http://127.0.0.1:9000 \
-  cargo nextest run -p data_components --test hadoop_catalog_test
+  cargo nextest run -p data_components --test integration -E 'test(/^hadoop_catalog_test::/)'
 ```
 
 Or from a container attached to the compose network:
 
 ```bash
 MINIO_ENDPOINT=http://minio:9000 \
-  cargo nextest run -p data_components --test hadoop_catalog_test
+  cargo nextest run -p data_components --test integration -E 'test(/^hadoop_catalog_test::/)'
 ```
 
 ## Importing TPCH

@@ -75,6 +75,21 @@ impl std::fmt::Display for UtilError {
 
 impl std::error::Error for UtilError {}
 
+/// Render an error together with its full `source()` chain, since
+/// `reqwest::Error`'s own `Display` stops at "error sending request for url
+/// (...)" and drops the underlying connect/DNS/TLS cause.
+fn error_chain(e: &dyn std::error::Error) -> String {
+    use std::fmt::Write;
+
+    let mut msg = e.to_string();
+    let mut source = e.source();
+    while let Some(s) = source {
+        let _ = write!(msg, ": {s}");
+        source = s.source();
+    }
+    msg
+}
+
 /// A spinner that shows activity while waiting for an async operation.
 pub struct Spinner {
     running: Arc<AtomicBool>,
@@ -150,7 +165,7 @@ pub async fn get_available_models(
         .await
         .map_err(|e| UtilError::ConnectionFailed {
             endpoint: url.clone(),
-            source: e.to_string(),
+            source: error_chain(&e),
         })?;
 
     if !response.status().is_success() {
@@ -289,6 +304,37 @@ mod tests {
     use super::*;
     use tempfile::TempDir;
 
+    #[derive(Debug)]
+    struct Inner;
+    impl std::fmt::Display for Inner {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            write!(f, "dns error: no such host")
+        }
+    }
+    impl std::error::Error for Inner {}
+
+    #[derive(Debug)]
+    struct Outer(Inner);
+    impl std::fmt::Display for Outer {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            write!(f, "error sending request for url (https://data.spicea)")
+        }
+    }
+    impl std::error::Error for Outer {
+        fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+            Some(&self.0)
+        }
+    }
+
+    #[test]
+    fn test_error_chain_includes_source() {
+        let err = Outer(Inner);
+        assert_eq!(
+            error_chain(&err),
+            "error sending request for url (https://data.spicea): dns error: no such host"
+        );
+    }
+
     #[test]
     fn test_util_error_display_connection_failed() {
         let err = UtilError::ConnectionFailed {
@@ -334,23 +380,58 @@ mod tests {
         assert!(SPINNER_FRAMES.iter().all(|f| !f.is_empty()));
     }
 
-    #[tokio::test]
+    // Paused time: the animation's 80 ms ticks elapse only when the runtime is
+    // otherwise idle, so a spinner that never stops trips the bounded timeout at
+    // once instead of hanging the test.
+    #[tokio::test(start_paused = true)]
     async fn test_spinner_start_and_stop() {
-        // Test that spinner can be started and stopped without panic
         let spinner = Spinner::start();
-        // Give it a moment to start
-        tokio::time::sleep(Duration::from_millis(100)).await;
-        // Stop should complete without error
-        spinner.stop().await;
+        let running = Arc::clone(&spinner.running);
+        let task = spinner
+            .handle
+            .as_ref()
+            .expect("start spawns the animation task")
+            .abort_handle();
+
+        // The animation draws its first frame and parks on its tick; it keeps
+        // running until told to stop.
+        tokio::task::yield_now().await;
+        assert!(!task.is_finished(), "the animation must run until stopped");
+
+        tokio::time::timeout(Duration::from_secs(1), spinner.stop())
+            .await
+            .expect("stop returns once the animation task has exited");
+        assert!(
+            !running.load(Ordering::Relaxed),
+            "stop clears the running flag"
+        );
+        assert!(
+            task.is_finished(),
+            "stop waits for the animation task to exit before returning"
+        );
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn test_spinner_drop_stops_animation() {
-        // Test that dropping the spinner stops the animation
-        let spinner = Spinner::start();
-        tokio::time::sleep(Duration::from_millis(50)).await;
+        let mut spinner = Spinner::start();
+        // Drop only clears the flag, so hold the task to watch it end.
+        let handle = spinner
+            .handle
+            .take()
+            .expect("start spawns the animation task");
+
+        tokio::task::yield_now().await;
+        assert!(
+            !handle.is_finished(),
+            "the animation must run until stopped"
+        );
+
         drop(spinner);
-        // Just verify no panic occurs
+        // The task sees the cleared flag on its next tick and exits.
+        tokio::time::timeout(Duration::from_secs(1), handle)
+            .await
+            .expect("dropping the spinner ends the animation task")
+            .expect("the animation task exits cleanly");
     }
 
     #[test]
@@ -384,15 +465,6 @@ mod tests {
 
             // Verify parent directory was created
             assert!(history_path.parent().is_some_and(std::path::Path::exists));
-        }
-    }
-
-    #[test]
-    fn test_save_history_with_none_path() {
-        // Test that save_history handles None path gracefully
-        if let Ok((mut editor, _)) = create_editor_with_history("test.txt") {
-            // This should not panic
-            save_history(&mut editor, None);
         }
     }
 

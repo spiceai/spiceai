@@ -1,0 +1,18 @@
+---
+source: crates/test-framework/src/spicetest/datasets/worker.rs
+description: "Query: tpcds_q4"
+---
++------------------+---------------------+--------------------+--------------------------------------+
+| customer_id      | customer_first_name | customer_last_name | customer_email_address               |
++------------------+---------------------+--------------------+--------------------------------------+
+| AAAAAAAAAAAALAAA | Cathy               | Salinas            | Cathy.Salinas@pcsIkF8IEmlAv.org      |
+| AAAAAAAAAAABMBAA | Jacqueline          | Carlson            | Jacqueline.Carlson@rZzg.edu          |
+| AAAAAAAAAAACCAAA | Terry               | Simmons            | Terry.Simmons@1r68pfc.com            |
+| AAAAAAAAAAACHBAA | Francis             | Thompson           | Francis.Thompson@5UUHX2hOD2rXmfG.org |
+| AAAAAAAAAAACJBAA | Kenneth             | Bragg              | Kenneth.Bragg@OSHvXAn4jZqOn4.org     |
+| AAAAAAAAAAAEABAA |                     |                    |                                      |
+| AAAAAAAAAAAFCAAA | Nathan              | Moore              | Nathan.Moore@HpBGiCZLnbnTe37M.edu    |
+| AAAAAAAAAAAFNBAA | Jeanette            | Burnett            | Jeanette.Burnett@6INK4v.edu          |
+| AAAAAAAAAAAGFBAA | Brenda              | Morris             | Brenda.Morris@jlhmu1BQlS7n.org       |
+| AAAAAAAAAAAIMAAA | Barbara             |                    |                                      |
++------------------+---------------------+--------------------+--------------------------------------+

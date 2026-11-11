@@ -14,6 +14,7 @@ async-openai.workspace = true
 async-trait.workspace = true
 futures.workspace = true
 llms = { path = "../llms", default-features = false }
+model-capabilities = { path = "../model-capabilities" }
 rand.workspace = true
 spicepod = { path = "../spicepod" }
 tokio.workspace = true

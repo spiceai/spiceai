@@ -1,0 +1,23 @@
+2026-09-08T02:54:26.582252Z  INFO spiced: Starting runtime v2.3.0-unstable-build.b286009302+models
+2026-09-08T02:54:26.647066Z  INFO cpu_budget: CPU budget: 16 cores (source: the CPUs available to this process; host reports 16, declared CPU request unset, cgroup share unset, cgroup limit unset) → 16 main worker threads, 15 per dedicated runtime pool, 16 target partitions
+2026-09-08T02:54:26.647248Z  INFO cpu_budget: CPU budget derived sizing: main_runtime_worker_threads=16, dedicated_runtime_worker_threads=15, target_partitions=16, scan_split_concurrency=16, vortex_parallelism=16, max_concurrent_queries=64, cayenne_encode_permits=12, cayenne_write_concurrency_ceiling=16, cayenne_compaction_permits=16, cayenne_upload_concurrency=16, cayenne_max_concurrent_file_scans=16, metastore_pool_connections=16, embedding_pool_threads=16, duckdb_threads=16, cluster_executor_concurrent_tasks=16
+2026-09-08T02:54:26.814386Z  INFO runtime::builder: Vortex segment cache installed: 2048 MB shared across all Cayenne tables
+2026-09-08T02:54:26.830501Z  INFO runtime::init::caching: Initialized sql results cache; max size: 128.00 MiB, item ttl: 1s, hashing algorithm: XXH3, encoding: none
+2026-09-08T02:54:26.842072Z  INFO runtime::init::caching: Initialized search results cache; max size: 128.00 MiB, item ttl: 1s, engine: Moka
+2026-09-08T02:54:26.843223Z  INFO runtime::init::caching: Initialized embeddings cache; max size: 128.00 MiB, item ttl: 1s, engine: Moka
+2026-09-08T02:54:26.852656Z  INFO runtime::datafusion::builder: runtime.query.max_concurrent_queries not set; sized from the CPU budget max_concurrent_queries=64
+2026-09-08T02:54:26.854947Z  INFO runtime::datafusion::builder: runtime.query.target_partitions not set; sized from the CPU budget target_partitions=16
+2026-09-08T02:54:26.854972Z  INFO runtime::datafusion::builder: runtime.query.eager_aggregation not set; defaulting to spiced default eager_aggregation=true
+2026-09-08T02:54:26.886081Z  WARN runtime::datafusion::udf: User-defined functions (spicepod `functions:` section) are in BETA. Supported sources in this build are `sql`; APIs and on-disk format may change before general availability. See: https://spiceai.org/docs/reference/spicepod/functions
+2026-09-08T02:54:26.922298Z  INFO runtime::datafusion::udf: Registered user function name=net_cents from=sql
+2026-09-08T02:54:26.930912Z  INFO runtime::datafusion: Cayenne global encode-concurrency budget active (caps aggregate write-encode shards across all tables) encode_budget=12
+2026-09-08T02:54:26.932077Z  INFO runtime::datafusion: Cayenne adaptive query-admission throttle active (controller sheds concurrent queries when CDC is behind its freshness/lag SLO under CPU contention) max_concurrent_queries=64
+2026-09-08T02:54:26.932233Z  INFO runtime::datafusion: Cayenne dynamic-tuning memory budget active (cgroup-aware) memory_budget=137438953472
+2026-09-08T02:54:26.932954Z  INFO runtime::datafusion: Cayenne global PK keyset byte budget active (bounds the SUM of per-table keyset caches, which are sized independently) pk_keyset_budget_bytes=8589934592 total_memory=137438953472
+2026-09-08T02:54:26.939219Z  INFO runtime::init::task_history: Task history enabled: retention_period=28800s, retention_check_interval=900s
+2026-09-08T02:54:27.077715Z  INFO runtime: No datasets or catalogs were configured. If this is unexpected, check the Spicepod configuration.
+2026-09-08T02:54:27.077780Z  INFO runtime: All components are loaded. Spice runtime is ready!
+2026-09-08T02:54:27.137943Z  INFO runtime::flight: Spice Runtime Flight listening on 127.0.0.1:15056
+2026-09-08T02:54:27.145401Z  INFO runtime::http: Spice Runtime HTTP listening on 127.0.0.1:18095
+2026-09-08T02:54:55.605130Z  INFO runtime: Shutdown initiated; waiting up to 30s for connections to drain
+2026-09-08T02:54:55.614692Z  INFO spiced: Goodbye!

@@ -53,10 +53,7 @@ pub(crate) fn emit_acceleration_size_if_applicable(
         ds.acceleration.as_ref().is_some_and(|accel| {
             matches!(accel.mode, Mode::File | Mode::FileCreate | Mode::FileUpdate)
                 && accel.enabled
-                && matches!(
-                    accel.engine.as_deref(),
-                    Some("sqlite" | "duckdb" | "cayenne")
-                )
+                && matches!(accel.engine_name(), "sqlite" | "cayenne")
         })
     }) {
         return Ok(());
@@ -75,6 +72,7 @@ pub(crate) fn emit_acceleration_size_if_applicable(
 
 pub(crate) async fn run(args: &DatasetTestArgs) -> anyhow::Result<RowCounts> {
     super::ensure_shared_client_connections(args, "bench")?;
+    super::ensure_layout_applies(args)?;
     // Two SUT acquisition paths: when a system adapter is configured, delegate
     // setup() to it over JSON-RPC; otherwise spawn a local `spiced` as before.
     // The rest of the benchmark flow is identical apart from a few
@@ -192,9 +190,17 @@ async fn run_inner(
 
     let benchmark_test = SpiceTest::new(app.name.clone(), test_builder)
         .with_spiced_instance(spiced_instance)
-        .with_results_snapshot(snapshot_predicate)
-        .with_progress_bars(!args.common.disable_progress_bars)
-        .with_explain_plan_snapshot();
+        .with_progress_bars(!args.common.disable_progress_bars);
+    // A layout run's answers are checked by `--validate` against the unaccelerated
+    // oracle, and its plans legitimately differ from the default layout's (index
+    // lookups, sorts), so it records no result or explain-plan snapshots.
+    let benchmark_test = if args.layout.is_some() || !args.snapshots {
+        benchmark_test
+    } else {
+        benchmark_test
+            .with_results_snapshot(snapshot_predicate)
+            .with_explain_plan_snapshot()
+    };
 
     let benchmark_test = benchmark_test.start()?;
 
@@ -596,7 +602,7 @@ mod tests {
         for scenario in [
             "dynamodb-arrow",
             "dynamodb-federated",
-            "dynamodb-duckdb[file]",
+            "dynamodb-cayenne[file]",
             "dynamodb-scylladb-alternator-federated",
             "glue[csv]-federated",
             "iceberg[hadoop]-federated",
@@ -623,8 +629,8 @@ mod tests {
             "glue[parquet]-federated",
             "glue[catalog]-federated",
             "iceberg[catalog]-federated",
-            "iceberg-duckdb[file]",
-            "s3[parquet]-duckdb[file]",
+            "iceberg-cayenne[file]",
+            "s3[parquet]-cayenne[file]",
         ] {
             assert_eq!(
                 snapshot_predicate(scenario, "tpch_q1"),

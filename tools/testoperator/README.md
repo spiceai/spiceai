@@ -40,9 +40,9 @@ Run standard benchmarks using the `testoperator run bench [OPTIONS]` command. In
 
 - `--query-set <QUERY_SET>`: The query set to use for the test. Possible values: `tpch`, `tpcds`, `clickbench`, `tpch[parameterized]`, `integration[http]`, `scenario`.
 - `--scenario-query-file <FILE_PATH>`: Path to a YAML file containing custom scenario queries. Required when `--query-set scenario` is specified.
-- `--query-overrides <QUERY_OVERRIDES>`: Optional query overrides. Possible values: `sqlite`, `postgresql`, `mysql`, `dremio`, `spark`, `odbcathena`, `duckdb`.
+- `--query-overrides <QUERY_OVERRIDES>`: Optional query overrides. Possible values: `sqlite`, `postgresql`, `mysql`, `spark`, `odbcathena`, `duckdb`.
 - `--scale-factor <SCALE_FACTOR>`: The expected scale factor for the test, used in metrics calculation.
-- `--validate`: A boolean flag to specify whether results should be validated against their expected results. Supported for `tpch`, `tpch[parameterized]` (scale factor 1 only), and `scenario` query sets (when expected results are defined in the scenario file).
+- `--validate`: Compare query results against an oracle. TPC-H / `tpch[parameterized]` at scale factor 1 use the spec answer files. TPC-DS (any scale) and TPC-H at other scale factors compare each query to the same SQL run against unaccelerated clones under a reference schema: when testoperator starts `spiced`, it injects `__test_reference.*` datasets automatically; against an already-running instance, add those clones to the spicepod (`scripts/add_test_reference_datasets.py`) and pass `--reference-schema __test_reference`. ClickBench validates the same way. Scenario query sets validate when expected results are defined in the scenario file. Numeric cells, and numeric `ORDER BY` keys, compare equal when they differ by at most 0.1%, or, when both are written to the same four or more decimal places, by one unit in the last of them and within 1% — where an engine that rounds a decimal result and one that truncates it part ways. Infinities and NaN match only themselves. The scale factor 1 TPC-H, TPC-DS and ClickBench benchmarks in `dispatch/` set `validate_results: true`, except 24 that keep `validate_results: false`. On `tpch/sf1/federated/glue[csv].yaml` and `tpch/sf1/federated/iceberg[hadoop].yaml`, TPC-H Q6 returns a wrong answer: both sources type `l_discount` as a double, and Spice types the literal `0.06 + 0.01` as a `Float64` just below 0.07, so Q6's `BETWEEN` drops the rows at 0.07. The TPC-H tables behind `tpch/sf1/federated/mssql.yaml`, `mssql[catalog].yaml` and `odbc[athena].yaml` hold different text columns than the parquet the answer files were computed from, so no answer file is their oracle. The TPC-H sources that hold `DuckDB` 1.x data — Databricks (four federated configs and `accelerated/databricks[delta_lake]-cayenne[file].yaml`), Glue (`glue[catalog]`, `glue[parquet]`), Oracle (`oracle`, `oracle[catalog]`), Spice Cloud (`spicecloud`, `spicecloud[catalog]`), `snowflake[catalog]`, `dynamodb` and `adbc[bigquery]` — cannot match Q2, Q10, Q13 or Q20: `DuckDB` 1.x writes different free-text columns than `dbgen`, whose answers the files hold. The four `ClickBench` arms whose acceleration holds only part of the source — `s3[parquet]-arrow`, `s3[parquet]-arrow-partitioned`, `s3[parquet]-sqlite[memory]` and `s3[parquet]-postgres` — have no oracle either: their `refresh_sql` keeps the rows a runner can hold, while the `__test_reference.*` clone drops acceleration and reads every row. Benchmarks at larger scale factors measure performance and leave `validate_results` unset.
 - `--metrics`: Whether to upload metrics to the Spice OSS benchmarks dashboards. By default, submits to the Production metrics endpoint using the API key specified in the `SPICEAI_BENCHMARK_METRICS_KEY` environment variable. If specified, the metrics delivery endpoint can be overridden with the `SPICEAI_TELEMETRY_ENDPOINT` environment variable.
 - `--disable-caching`: Whether to disable results cache by supplying a `Cache-Control: no-cache` header over the Flight request. Allows disabling results cache separately from spicepod configuration. A benchmark should almost always pass this: `runtime.caching.sql_results` is on by default with a one-second `item_ttl`, and a benchmark runs one warmup query followed by its timed iterations of the same SQL back-to-back, so without it the timed iterations read the cache the warmup filled. The `bench` workflow passes it by default; turn it off only for a spicepod that is benchmarking the cache itself, such as those under `test/spicepods/tpch/sf5/cache`.
 
@@ -82,6 +82,14 @@ or:
 
 ```sh
 cargo run -p testoperator -- run bench -p ./test/spicepods/tpch/sf1/federated/duckdb.yaml -s spiced --query-set tpch --query-overrides postgresql --validate
+```
+
+##### Run TPC-DS with result validation
+
+TPC-DS and ClickBench have no static answer files. `--validate` clones each unqualified dataset as an unaccelerated `__test_reference.*` table and compares every query's rows to that federated scan (multiset unless the row set depends on `ORDER BY` + `LIMIT`). A `GROUP BY` query with a top-level `LIMIT` and no `ORDER BY` that returns its group keys, such as ClickBench Q18, may return any of its groups, so when its rows differ from the reference's, each returned row is instead checked against the reference query's full, un-`LIMIT`ed result. Any other query with a top-level `LIMIT` and no `ORDER BY` keeps the direct comparison, because a row it returns can match the full result while being computed wrongly. A query whose `ORDER BY … LIMIT` sorts on something it does not return, such as ClickBench Q25, must match the reference row by row; when it does not, it is checked against the reference rows read back with their sort keys: rows tied on every sort key may come back in any order, rows the sort keys separate must keep their order, and the `LIMIT` may keep any of the rows tied at its cutoff. A query whose `ORDER BY … LIMIT` sorts only on columns it returns is compared one tie group at a time. A group of several rows that the `LIMIT` or `OFFSET` cuts must match on its sort key alone. A single row at either cutoff must match in full, and when it does not, it is checked the same way against the reference query's rows read past the `LIMIT` and before the `OFFSET`, because rows there may tie with it: two of ClickBench Q31's groups share the tenth count, 1058, so either one is a correct tenth row.
+
+```sh
+testoperator run bench -p ./test/spicepods/tpcds/sf1/accelerated/file\[parquet\]-cayenne\[file\].yaml -s spiced -d ./.data --query-set tpcds --validate
 ```
 
 ##### Run a custom scenario query set with validation
@@ -182,7 +190,7 @@ testoperator run load -p ./test/spicepods/tpch/sf1/federated/duckdb.yaml -s spic
 
 ### Running Data Consistency tests
 
-Data consistency tests support specifying two spicepods, and validating that the outputs of queries between the two match. This has been partially superseded by the functionality of `--validate`, but is still useful for testing between query sets that do not yet support the `--validate` option (like `tpcds` and `clickbench`).
+Data consistency tests support specifying two spicepods, and validating that the outputs of queries between the two match. This has been partially superseded by `--validate` (TPC-H gold files, TPC-DS / ClickBench / non-SF-1 TPC-H via a reference schema). It remains useful for comparing two spicepods rather than an accelerator against its unaccelerated source.
 
 A data consistency test supports the same options as a benchmark test, with the additional options:
 
@@ -301,11 +309,45 @@ Where `bodies.jsonl` might look like
 {"model": "claude-3-5-sonnet-20241022","max_tokens": 512,"messages": [{"role": "system", "content": "You are god"}, {"role": "user", "content": "Is god real?"}]}
 ```
 
-### Running Vector Search Tests
+### Running Search Tests
 
-Running search tests with the testoperator is still experimental, and uses statically defined tests within the command file. Vector search tests support the common options.
+Search tests send each query in the `test_queries` table to the runtime, then calculate NDCG, recall, MRR, and precision at each rank cutoff `k` against the `relevance_data` table. Search tests support the common options.
 
-`testoperator run search [OPTIONS]`
+`testoperator run search [OPTIONS] -p <SPICEPOD>`
+
+The spicepod loads its own data (for example, parquet files on Hugging Face) and must define the `corpus`, `test_queries`, and `relevance_data` tables. The `benchmark_dataset` metric attribute comes from the spicepod's top-level `metadata.benchmark_dataset` value, or is `custom` when the spicepod does not set it. Refer to [`test/spicepods/search/README.md`](../../test/spicepods/search/README.md) for the table schema.
+
+Where options are:
+
+- `--sql-pipeline <FILE_OR_SQL>`: A parameterized SQL search pipeline. When set, each query goes to `POST /v1/sql` with this SQL, not to `POST /v1/search`. The value is a path to a file that exists, or the SQL text. A value that ends with `.sql` or has no whitespace must be a file. Thus, a mistyped path fails with `SQL pipeline file not found`, and does not run as SQL.
+
+A SQL pipeline can use these named parameters:
+
+| Parameter | Value |
+|---|---|
+| `:query` | The query text from `test_queries.text`. |
+| `:limit` | The result limit (`10`). |
+
+A SQL pipeline must return these columns:
+
+| Column | Required | Description |
+|---|---|---|
+| `_id` | Yes | The corpus id. It must match `relevance_data."corpus-id"`. |
+| `_score` | No | A numeric score. It is recorded, but evaluation does not use it. |
+
+Rows must be in rank order: the first row is the best match. For example:
+
+```bash
+# SQL in a file
+testoperator run search -p spicepod.yaml --sql-pipeline pipelines/text_search.sql
+
+# SQL text
+testoperator run search -p spicepod.yaml \
+  --sql-pipeline "SELECT _id, _score FROM text_search(corpus, :query) ORDER BY _score DESC LIMIT :limit"
+```
+
+> [!NOTE]
+> Search table functions (`text_search`, `vector_search`, `rrf`) do not accept parameters as arguments yet (#15046). Until that is fixed, a pipeline can use parameters only in other positions, for example in `WHERE` and `LIMIT`.
 
 ### Running Text-to-SQL tests
 
@@ -336,6 +378,31 @@ Results validation, snapshotting and metrics are not supported with append tests
 
 Append tests are not built by default, as the File connector source generation relies on the `duckdb` crate to generate the source data. Because of this, the append test can significantly increase the testoperator build time. To build with append support, use the `append` feature flag: `cargo build -p testoperator --release --features append`.
 
+### Running Cold-Start Tests
+
+`testoperator run cold-start` starts `spiced` with an empty data directory and measures how long its accelerations take to load and report ready. With `--baseline-spiced-path` it alternates runs of the candidate and a baseline binary, such as the previous release, on the same host and fails when the candidate's median or slowest time to ready exceeds `--max-ready-ratio` times the baseline's median or slowest. `--max-full-compactions` fails a run that commits more full Cayenne compactions than that before it is ready, a bound that does not depend on the host's speed. Every run must load the same row count. Both binaries receive `--cpu-cores` (default 2).
+
+```bash
+testoperator run cold-start \
+  -p 'test/spicepods/cold_start/delta_lake-cayenne[file]-append_unkeyed_sorted.yaml' \
+  -s ./target/release/spiced --baseline-spiced-path ./spiced-v2.3.1 \
+  --runs 3 --max-full-compactions 0 --ready-wait 600
+```
+
+The spicepods in `test/spicepods/cold_start/` read a synthetic Delta Lake table that `test/scripts/cold_start_delta_fixture.py` generates; `.github/workflows/testoperator_run_cold_start.yml` seeds it in MinIO and runs every spicepod nightly.
+
+### Scheduled Runs
+
+`testoperator dispatch <dir> --workflow <workflow>` dispatches one GitHub Actions run per test in the configs under `dir`; `.github/workflows/testoperator_dispatch.yml` runs it on a schedule over the configs in `dispatch/`. A config runs daily unless it sets `schedule: weekly`, which the configs whose source is a hosted service (Databricks, Snowflake, Oracle Cloud, BigQuery, Athena, Glue, DynamoDB, Azure Blob Storage, Spice Cloud) do, as do the source-to-accelerator checks described below. The daily run passes `--schedule daily` and the weekly run `--schedule weekly`; without `--schedule`, as in a manual dispatch, every config is dispatched.
+
+Each source is benchmarked federated, and each accelerator configuration once, from the suite's canonical source: `file[parquet]` for TPC-H and TPC-DS, `s3[parquet]` for ClickBench. An accelerated benchmark measures the accelerator once the data is loaded, so re-running the same accelerator in front of another source repeats a measurement the canonical config already makes, while the source itself is covered by its federated config. An accelerated config from another source belongs in `dispatch/` only when it exercises something that source alone provides, such as `mongodb-cayenne[file]-changes`, which loads through MongoDB change streams. The one other exception is a load into an accelerator whose values no other automated test checks. `mysql-arrow`, `mysql-cayenne[file]` and `databricks[delta_lake]-cayenne[file]` in TPC-H and `spicecloud-cayenne[file]` in TPC-DS keep a validated `bench` for that, on the weekly schedule, without the throughput and load runs.
+
+A `bench` test can set `layout` (one) or `layouts` (a list, one run each) to run its spicepod under an acceleration layout: `testoperator --layout primary_key,indexes,sort` configures those features on every accelerated dataset before `spiced` starts, on each benchmark table's columns in `crates/test-framework/src/layout/` — its unique key, the columns the benchmark joins and filters on, a sort or clustering order other than the generated one, its date column, and a partition expression. The features are `primary_key`, `indexes`, `sort` (`cayenne_sort_columns`, `on_refresh_sort_columns` or `arrow_sort_columns`), `cluster` (`cayenne_cluster_by`), `time_column` and `partition` (`partition_by`). A layout is refused rather than weakened: on an engine (or, for partitioning, a mode) that cannot take a feature, on a spicepod that already sets what it would configure, for Cayenne's `sort` with `cluster`, or when a feature would end up configured on no dataset. The `__test_reference.*` clones carry no acceleration, so `--validate` compares each layout with the same unaccelerated oracle. A layout run reports under its own test name, `<spicepod name>-layout[<features>]`, so its timings stay out of the default layout's metric series, and records no result or explain-plan snapshots: its plans legitimately differ, and `--validate` checks its answers. `testoperator run htap --layout` checks each layout against the source database with the HTAP gates instead. The `*-layouts.yaml` configs under `dispatch/{tpch,tpcds,clickbench}/sf1/accelerated/` run each engine's features alone and in the combinations that interact, and `dispatch/chbench/sf1-layouts/` runs CH-benCH's HTAP and validated bench under layouts each week.
+
+A `bench` test can also set `postgres_version`, which runs the bench workflow's local `postgres_tpch` source (TPC-H and TPC-DS at scale factor 1 or 10, and ClickBench's `s3[parquet]-postgres`) on one of the PostgreSQL release lines in `test/source_versions.json`, or `postgres_version: all` for one run on each of them. That file lists the release lines Spice supports and tests for each federated source database: LTS lines only, oldest first, so the newest is the default. Unset, a run uses the workflow's default line. `tpch/sf1/federated/postgres[catalog]-source_versions.yaml` and `tpcds/sf1/federated/postgres-source_versions.yaml` run their benchmark on every listed line each week. A CH-benCH `bench` takes `postgres_version` for its PostgreSQL source too, and an `htap` test takes `source_version`, a line of its spicepod's source (MySQL for a `mysql*` spicepod, otherwise PostgreSQL) or `all`: `dispatch/chbench/sf1-source-versions/` runs the SF1 PostgreSQL and MySQL Cayenne configs on every listed line each week, on runners that start the source in Docker (the in-cluster sources of `spiceai-dev-xlarge-runners` have fixed versions). The integration suite (`.github/workflows/integration.yml`) reads the same file: its `source-versions` job runs the tests that start a PostgreSQL, MySQL or MongoDB container on every listed line but the newest, which the main run covers.
+
+The release branch the schedule also covers changes only when a fix is cherry-picked onto it, so it dispatches its whole suite once per `spiced` build: a daily run dispatches nothing for it when the build it selects, the newest commit on the branch with a built `spiced`, was already benchmarked by an earlier scheduled run. That record is a workflow artifact kept for 60 days, the repository's artifact-retention limit, so an unchanged build is benchmarked again once that long has passed since its last run. The first scheduled run that finds a build recorded re-runs, once, the failed jobs of every run that build's dispatch created, so a failure that does not reproduce on a second attempt does not stand until the next build. A run that was cancelled is not re-run. Until every first attempt has finished, the build stays unrecorded, and each scheduled run re-runs the first attempts that have failed since.
+
 ### Other Examples
 
 #### Using a Non-System Wide Spiced Binary Path
@@ -354,7 +421,7 @@ To run queries on an existing `spiced` instance, ensure your `spiced` instance i
 testoperator run query --query-set tpch --query-overrides duckdb
 ```
 
-Testoperator will run without explain plan or result snapshotting. Result validation is supported with `--validate`. Telemetry and metrics emission is not supported.
+Testoperator will run without explain plan or result snapshotting. Result validation is supported with `--validate`. For TPC-DS (and TPC-H at scale factors other than 1) that requires the running instance to already register a complete reference schema covering every query table — testoperator cannot inject `__test_reference.*` clones into a process it did not start. Add those clones with `scripts/add_test_reference_datasets.py` before starting `spiced`, then pass `--validate` (and `--reference-schema __test_reference` if the spicepod does not already qualify the clones under that schema). Telemetry and metrics emission is not supported.
 
 ### Driving a distributed cluster via a system adapter
 

@@ -90,31 +90,42 @@ tpch-gen: tpch-init
 
 	@echo "Test data and queries generated successfully."
 
-# tpch-fleet-gen generates the same TPC-H dataset the rest of the benchmark fleet
-# runs on - s3://spiceai-public-datasets/tpch and the hosted MySQL, Iceberg, Glue,
-# Databricks, Snowflake and Spice Cloud copies - which is what
-# crates/test-framework/src/queries/validation/tpch/*.csv holds the expected
-# answers for. That dataset comes from DuckDB's tpch extension, and DuckDB's
-# generator disagrees with tpch-kit's dbgen on the free-text columns (c_address,
-# s_address, and every *_comment): keys, numerics, dates and even the string
-# lengths are identical, but the characters differ. That changes 4 of the 22 TPC-H
-# answers - Q2 and Q20 (s_address), Q10 (c_address), and Q13, whose predicate reads
-# o_comment - so a Postgres database seeded with dbgen data fails result validation
-# on exactly those four queries no matter how correct the engine under test is.
-# dbgen is the officially correct generator (its output matches the TPC-supplied
-# answers in tpch-kit's dbgen/answers/); the fleet's dataset is the one that
-# diverges, tracked separately in #12137. Until that is resolved, seeding from the
-# same generator the answers were produced with is what makes a result mismatch
-# mean a real bug.
+# tpch-fleet-gen generates TPC-H data identical to tpch-kit's dbgen, the TPC's
+# reference generator, whose answers - the TPC-published ones in dbgen/answers/ -
+# are what crates/test-framework/src/queries/validation/tpch/*.csv holds. It runs
+# the tpch extension of a pinned DuckDB CLI instead of building dbgen.
 #
 # Data only - qgen/tpch_queries.sql still comes from tpch-gen.
 # Example: DBGEN_SCALE=1 make tpch-fleet-gen
 TPCH_FLEET_DIR ?= ./tmp/fleet
 
 # Pinned so the generated dataset cannot drift with whatever duckdb happens to be
-# on PATH. v1.5.4's output was verified row-for-row identical to the fleet dataset
-# across all 8 tables (0 rows differing in either direction, 6,001,215 lineitem
-# rows). Override DUCKDB to use an already-installed CLI.
+# on PATH. DuckDB 2.0.0's tpch extension writes dbgen's data: all 8 SF1 tables are
+# row-for-row identical (0 rows differing in either direction, 6,001,215 lineitem
+# rows). DuckDB 1.x writes different free-text columns (c_address, s_address and
+# every *_comment), which changes the answers to Q2, Q10, Q13, Q15 and Q20.
+# Override TPCH_DUCKDB to use an already-installed CLI.
+TPCH_DUCKDB_VERSION ?= v2.0.0
+TPCH_DUCKDB ?= ./tmp/bin-$(TPCH_DUCKDB_VERSION)/duckdb
+
+$(TPCH_DUCKDB):
+	@mkdir -p "$(dir $(TPCH_DUCKDB))"
+	@OS=`uname`; ARCH=`uname -m`; \
+	case "$$OS/$$ARCH" in \
+		Linux/x86_64) ASSET=duckdb-cli-linux-amd64.tar.gz ;; \
+		Linux/aarch64 | Linux/arm64) ASSET=duckdb-cli-linux-arm64.tar.gz ;; \
+		Darwin/*) ASSET=duckdb-cli-osx-universal.tar.gz ;; \
+		*) echo "No DuckDB CLI release asset for $$OS/$$ARCH - install duckdb $(TPCH_DUCKDB_VERSION) and re-run with TPCH_DUCKDB=\`command -v duckdb\`"; exit 1 ;; \
+	esac; \
+	echo "Downloading DuckDB CLI $(TPCH_DUCKDB_VERSION) ($$ASSET)..."; \
+	curl -fsSL --retry 3 -o "$(dir $(TPCH_DUCKDB))duckdb.tar.gz" "https://github.com/duckdb/duckdb/releases/download/$(TPCH_DUCKDB_VERSION)/$$ASSET"
+	@tar -xzf "$(dir $(TPCH_DUCKDB))duckdb.tar.gz" -C "$(dir $(TPCH_DUCKDB))"
+	@rm -f "$(dir $(TPCH_DUCKDB))duckdb.tar.gz"
+	@chmod +x "$(TPCH_DUCKDB)"
+	@"$(TPCH_DUCKDB)" --version
+
+# Pinned so tpcds-fleet-gen's dataset cannot drift with whatever duckdb happens to
+# be on PATH. Override DUCKDB to use an already-installed CLI.
 DUCKDB_VERSION ?= v1.5.4
 DUCKDB ?= ./tmp/bin/duckdb
 
@@ -134,20 +145,20 @@ $(DUCKDB):
 	@chmod +x "$(DUCKDB)"
 	@"$(DUCKDB)" --version
 
-tpch-fleet-gen: $(DUCKDB)
+tpch-fleet-gen: $(TPCH_DUCKDB)
 	@# Check if DBGEN_SCALE is set, else default to 1
 	$(eval DBGEN_SCALE ?= 1)
 	@mkdir -p "$(TPCH_FLEET_DIR)"
 	@rm -f "$(TPCH_FLEET_DIR)"/*.tbl "$(TPCH_FLEET_DIR)/gen.duckdb" "$(TPCH_FLEET_DIR)/gen.duckdb.wal"
 	@echo "Generating TPC-H scale factor $(DBGEN_SCALE)..."
-	@"$(DUCKDB)" "$(TPCH_FLEET_DIR)/gen.duckdb" -c "INSTALL tpch; LOAD tpch; CALL dbgen(sf=$(DBGEN_SCALE));" > /dev/null
+	@"$(TPCH_DUCKDB)" "$(TPCH_FLEET_DIR)/gen.duckdb" -c "INSTALL tpch; LOAD tpch; CALL dbgen(sf=$(DBGEN_SCALE));" > /dev/null
 	@# QUOTE '' disables CSV quoting so no field is ever wrapped, and the trailing
 	@# empty column reproduces dbgen's trailing '|'; the result is byte-compatible
 	@# with dbgen's .tbl format, so every *-load target reads it unchanged. Tables
 	@# are dropped as they are written to bound peak disk at the larger scales.
 	@for table in region nation customer supplier part partsupp orders lineitem; do \
 		echo "Writing $$table.tbl..."; \
-		"$(DUCKDB)" "$(TPCH_FLEET_DIR)/gen.duckdb" -c "\
+		"$(TPCH_DUCKDB)" "$(TPCH_FLEET_DIR)/gen.duckdb" -c "\
 			COPY (SELECT *, '' FROM $$table) TO '$(TPCH_FLEET_DIR)/$$table.tbl' (FORMAT CSV, DELIMITER '|', HEADER false, QUOTE ''); \
 			DROP TABLE $$table; \
 			CHECKPOINT;" > /dev/null || exit 1; \
@@ -311,13 +322,44 @@ mysql-init:
 
 	@echo "Database '$(DB_NAME)' has been successfully created or updated."
 
+# MySQL's LOAD DATA reads an empty field as the column type's zero value - an empty
+# integer field lands as 0, never NULL - while PostgreSQL's `\copy ... CSV` reads that
+# same empty field as NULL. dsdgen writes a NULL as an empty field (and the DuckDB
+# tpcds/tpch extensions export with QUOTE '', so they write one too), so loading these
+# files into MySQL unchanged replaces every NULL foreign key with 0. The MySQL arms then
+# benchmark different data from every other arm seeded from the same files, and nothing
+# downstream can tell: row counts still match, and only a query keying on NULL-ness
+# disagrees. tpcds_q76, whose three predicates are all `IS NULL`, is that query.
+#
+# The repair is type-directed rather than a rewrite of the data file, because the file
+# cannot distinguish a NULL from an empty string and a blanket rewrite would null the
+# empty strings too - `time_dim.t_meal_time` is 50,400 empty strings and zero NULLs.
+# `mysql-null-spec.awk` turns the table's own column types into a LOAD DATA spec that
+# NULLIFs only the columns where an empty field cannot be anything but NULL, and binds
+# text columns positionally so they keep their empty strings. The tables must already
+# exist, which `mysql-*-init` guarantees.
+#
+# TPC-H contains no NULLs and no empty strings, so `mysql-load` was never wrong; it uses
+# the same spec so the two loaders cannot drift.
+#
+# Each loader refuses an empty spec rather than loading without one. The generator
+# prints nothing for an empty column listing, and awk in a pipeline hides the exit
+# status of the `mysql` feeding it, so a server the recipe cannot reach would
+# otherwise load every table with no spec at all - reinstating the zero-for-NULL
+# corruption above, under a recipe that still reports success.
+MYSQL_NULL_SPEC = awk -f ./mysql-null-spec.awk
+MYSQL_COLUMN_TYPES = SELECT column_name, data_type FROM information_schema.columns WHERE table_schema='$(DB_NAME)' AND table_name=
+
 # Example: DB_HOST=localhost DB_PORT=3306 DB_USER=root DB_PASS=root DB_NAME=tpch make mysql-load
 mysql-load:
 	@mkdir -p ./tmp
 	@for table in region nation customer supplier part partsupp orders lineitem; do \
 		echo "Loading $$table..."; \
 		sed 's/|$$//' "$(TPCH_DATA_DIR)/$$table.tbl" > ./tmp/$$table.tbl; \
-		mysql -h$(DB_HOST) -u$(DB_USER) -p$(DB_PASS) -P$(DB_PORT) --local-infile=1 $(DB_NAME) -e "LOAD DATA LOCAL INFILE './tmp/$$table.tbl' INTO TABLE $$table FIELDS TERMINATED BY '|' LINES TERMINATED BY '\n';"; \
+		columns=$$(mysql -h$(DB_HOST) -u$(DB_USER) -p$(DB_PASS) -P$(DB_PORT) -N -B $(DB_NAME) -e "$(MYSQL_COLUMN_TYPES)'$$table' ORDER BY ordinal_position;") || columns=''; \
+		spec=$$(printf '%s' "$$columns" | $(MYSQL_NULL_SPEC)); \
+		[ -n "$$spec" ] || { echo "Failed to read the column types of table '$$table' from database '$(DB_NAME)'. Loading without a column spec reads every empty field as 0 instead of NULL, so the load is refused. Check DB_HOST/DB_PORT/DB_USER/DB_PASS, and run 'make mysql-init' first so the tables exist." >&2; exit 1; }; \
+		mysql -h$(DB_HOST) -u$(DB_USER) -p$(DB_PASS) -P$(DB_PORT) --local-infile=1 $(DB_NAME) -e "LOAD DATA LOCAL INFILE './tmp/$$table.tbl' INTO TABLE $$table FIELDS TERMINATED BY '|' LINES TERMINATED BY '\n' $$spec;" || { echo "Loading table '$$table' failed, so the benchmark dataset is incomplete." >&2; exit 1; }; \
 	done
 	@echo "Benchmark dataset has been successfully loaded to '$(DB_NAME)' database."
 
@@ -353,7 +395,10 @@ mysql-tpcds-load:
 	@for table in call_center catalog_page catalog_returns catalog_sales customer customer_address customer_demographics date_dim household_demographics income_band inventory item promotion reason ship_mode store store_returns store_sales time_dim warehouse web_page web_returns web_sales web_site; do \
 		echo "Loading $$table..."; \
 		sed 's/|$$//' "$(TPCDS_DATA_DIR)/$$table.dat" > ./tmp/$$table.dat; \
-		mysql -h$(DB_HOST) -u$(DB_USER) -p$(DB_PASS) -P$(DB_PORT) --local-infile=1 $(DB_NAME) -e "LOAD DATA LOCAL INFILE './tmp/$$table.dat' INTO TABLE $$table FIELDS TERMINATED BY '|' LINES TERMINATED BY '\n';"; \
+		columns=$$(mysql -h$(DB_HOST) -u$(DB_USER) -p$(DB_PASS) -P$(DB_PORT) -N -B $(DB_NAME) -e "$(MYSQL_COLUMN_TYPES)'$$table' ORDER BY ordinal_position;") || columns=''; \
+		spec=$$(printf '%s' "$$columns" | $(MYSQL_NULL_SPEC)); \
+		[ -n "$$spec" ] || { echo "Failed to read the column types of table '$$table' from database '$(DB_NAME)'. Loading without a column spec reads every empty field as 0 instead of NULL, so the load is refused. Check DB_HOST/DB_PORT/DB_USER/DB_PASS, and run 'make mysql-tpcds-init' first so the tables exist." >&2; exit 1; }; \
+		mysql -h$(DB_HOST) -u$(DB_USER) -p$(DB_PASS) -P$(DB_PORT) --local-infile=1 $(DB_NAME) -e "LOAD DATA LOCAL INFILE './tmp/$$table.dat' INTO TABLE $$table FIELDS TERMINATED BY '|' LINES TERMINATED BY '\n' $$spec;" || { echo "Loading table '$$table' failed, so the benchmark dataset is incomplete." >&2; exit 1; }; \
 	done
 	@echo "Benchmark dataset has been successfully loaded to '$(DB_NAME)' database."
 

@@ -28,6 +28,7 @@ use datafusion::error::Result as DFResult;
 use datafusion::execution::SessionState;
 use datafusion::physical_plan::ExecutionPlan;
 use datafusion::prelude::SessionContext;
+use datafusion::sql::planner::IdentNormalizer;
 use datafusion_ddl::{CatalogDdlHandler, CreateSchemaParams, CreateTableParams, DropTableParams};
 
 use super::get_cayenne_provider;
@@ -86,6 +87,17 @@ impl CatalogDdlHandler for DistributedCayenneDdlHandler {
                 "Failed to create table {table_ref} (cayenne): PARTITION BY is required in distributed mode"
             )));
         };
+        let cluster_by = operations::cluster_by_column_names(
+            &table_ref,
+            &params.extension.cluster_by,
+            &IdentNormalizer::new(
+                session_state
+                    .config()
+                    .options()
+                    .sql_parser
+                    .enable_ident_normalization,
+            ),
+        )?;
 
         Ok(Arc::new(DistributedCayenneCreateTableExec::new(
             operations::CreateTableParams {
@@ -95,6 +107,7 @@ impl CatalogDdlHandler for DistributedCayenneDdlHandler {
                 arrow_schema: params.arrow_schema,
                 primary_key: params.primary_key,
                 partition_expr_sql: Some(partition_expr_sql.to_string()),
+                cluster_by,
                 if_not_exists: params.if_not_exists,
                 like_source_table: params.like_source_table,
                 ctx: Some(Arc::new(SessionContext::new_with_state(

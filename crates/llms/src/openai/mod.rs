@@ -19,12 +19,14 @@ use std::num::NonZeroU32;
 use std::str::FromStr;
 use std::sync::Arc;
 
-use async_openai::config::{AzureConfig, Config, OPENAI_API_BASE};
+pub use async_openai::config::AzureConfig;
+use async_openai::config::{Config, OPENAI_API_BASE};
 use async_openai::{Client, config::OpenAIConfig};
 use governor::Quota;
 use runtime_rate_control::{JitterConfig, RateController};
 
 pub mod chat;
+pub mod decisions;
 pub mod embed;
 pub mod list_models;
 pub mod responses;
@@ -60,10 +62,7 @@ impl FromStr for ChatBackend {
         match s.trim().to_ascii_lowercase().as_str() {
             "disabled" => Ok(Self::ChatCompletions),
             "enabled" => Ok(Self::Responses),
-            other => Err(format!(
-                "must be one of: {}. Found {other}",
-                Self::VALUES.join(", ")
-            )),
+            _ => Err(format!("must be one of: {}", Self::VALUES.join(", "))),
         }
     }
 }
@@ -175,15 +174,7 @@ pub fn new_azure_client_with_chat_backend(
     api_key: Option<&str>,
     chat_backend: ChatBackend,
 ) -> Openai<AzureConfig> {
-    let mut cfg = AzureConfig::new().with_deployment_id(deployment_name.unwrap_or(model.as_str()));
-
-    if let Some(api_base) = api_base {
-        cfg = cfg.with_api_base(api_base);
-    }
-
-    if let Some(api_version) = api_version {
-        cfg = cfg.with_api_version(api_version);
-    }
+    let mut cfg = azure_config(&model, api_base, api_version, deployment_name);
 
     if let Some(api_key) = api_key {
         cfg = cfg.with_api_key(api_key);
@@ -194,7 +185,91 @@ pub fn new_azure_client_with_chat_backend(
     }
 
     Openai {
-        client: Client::with_config(cfg),
+        client: crate::provider::client_without_retry(cfg),
+        model,
+        rate_controller: default_rate_controller(),
+        chat_backend,
+    }
+}
+
+/// The deployment URL and `api-version` of an Azure `OpenAI` model, without credentials.
+fn azure_config(
+    model: &str,
+    api_base: Option<&str>,
+    api_version: Option<&str>,
+    deployment_name: Option<&str>,
+) -> AzureConfig {
+    let mut cfg = AzureConfig::new().with_deployment_id(deployment_name.unwrap_or(model));
+    if let Some(api_base) = api_base {
+        cfg = cfg.with_api_base(api_base);
+    }
+    if let Some(api_version) = api_version {
+        cfg = cfg.with_api_version(api_version);
+    }
+    cfg
+}
+
+/// The config of an Azure `OpenAI` client that authenticates every request with the current
+/// Microsoft Entra token of `token`, a provider that refreshes it, such as a workload identity
+/// federation token provider. The URL and `api-version` are the ones [`AzureConfig`] builds.
+#[derive(Clone, Debug)]
+pub struct AzureTokenConfig {
+    azure: AzureConfig,
+    token: Arc<dyn token_provider::TokenProvider>,
+}
+
+impl Config for AzureTokenConfig {
+    fn headers(&self) -> reqwest::header::HeaderMap {
+        let mut headers = reqwest::header::HeaderMap::new();
+        match reqwest::header::HeaderValue::from_str(&format!("Bearer {}", self.token.get_token()))
+        {
+            Ok(mut value) => {
+                value.set_sensitive(true);
+                headers.insert(reqwest::header::AUTHORIZATION, value);
+            }
+            Err(_) => {
+                tracing::warn!(
+                    "The Microsoft Entra token of an Azure model is not a valid 'Authorization' header value, so requests are sent without it"
+                );
+            }
+        }
+        headers
+    }
+
+    fn url(&self, path: &str) -> String {
+        self.azure.url(path)
+    }
+
+    fn query(&self) -> Vec<(&str, &str)> {
+        self.azure.query()
+    }
+
+    fn api_base(&self) -> &str {
+        self.azure.api_base()
+    }
+
+    fn api_key(&self) -> Arc<secrecy::SecretString> {
+        Arc::new(secrecy::SecretString::from(self.token.get_token()))
+    }
+}
+
+/// An Azure `OpenAI` client that authenticates with the current Microsoft Entra token of
+/// `token` on every request.
+#[must_use]
+pub fn new_azure_client_with_token_provider(
+    model: String,
+    api_base: &str,
+    api_version: Option<&str>,
+    deployment_name: Option<&str>,
+    token: Arc<dyn token_provider::TokenProvider>,
+    chat_backend: ChatBackend,
+) -> Openai<AzureTokenConfig> {
+    // The empty Entra token replaces the default credential `AzureConfig` reads from
+    // `OPENAI_API_KEY`; `AzureTokenConfig` sends the provider's token instead.
+    let azure = azure_config(&model, Some(api_base), api_version, deployment_name)
+        .with_entra_token(String::new());
+    Openai {
+        client: crate::provider::client_without_retry(AzureTokenConfig { azure, token }),
         model,
         rate_controller: default_rate_controller(),
         chat_backend,
@@ -250,11 +325,48 @@ pub fn new_openai_client_with_chat_backend(
     }
 
     Openai {
-        client: Client::with_config(cfg),
+        client: crate::provider::client_without_retry(cfg),
         model,
         rate_controller: usage_tier.map_or_else(default_rate_controller, Into::into),
         chat_backend,
     }
+}
+
+/// An `OpenAI` client that authenticates every request with the current token of `token`, a
+/// provider that refreshes it, such as a workload identity federation token provider. The
+/// organization and project headers are the ones [`OpenAIConfig`] would send.
+///
+/// # Errors
+///
+/// When `org_id` or `project_id` is not a valid header value.
+pub fn new_openai_client_with_token_provider(
+    model: String,
+    api_base: &str,
+    token: Arc<dyn token_provider::TokenProvider>,
+    org_id: Option<&str>,
+    project_id: Option<&str>,
+    usage_tier: Option<UsageTier>,
+    chat_backend: ChatBackend,
+) -> Result<Openai<crate::config::HostedModelConfig>, async_openai::error::OpenAIError> {
+    let mut cfg = crate::config::HostedModelConfig::from_url(api_base)
+        .with_auth(crate::config::GenericAuthMechanism::from_bearer_token_provider(token));
+    for (header, value) in [
+        ("openai-organization", org_id),
+        ("openai-project", project_id),
+    ] {
+        if let Some(value) = value {
+            let value = reqwest::header::HeaderValue::from_str(value).map_err(|e| {
+                async_openai::error::OpenAIError::InvalidArgument(format!("{header}: {e}"))
+            })?;
+            cfg = cfg.with_header_value(header, value);
+        }
+    }
+    Ok(Openai {
+        client: crate::provider::client_without_retry(cfg),
+        model,
+        rate_controller: usage_tier.map_or_else(default_rate_controller, Into::into),
+        chat_backend,
+    })
 }
 
 #[must_use]
@@ -263,7 +375,7 @@ pub fn new_openai_client_with_config<C: async_openai::config::Config + Clone>(
     cfg: C,
 ) -> Openai<C> {
     Openai {
-        client: Client::with_config(cfg),
+        client: crate::provider::client_without_retry(cfg),
         model,
         rate_controller: default_rate_controller(),
         chat_backend: ChatBackend::ChatCompletions,
@@ -320,8 +432,9 @@ mod chat_backend_tests {
     #[test]
     fn rejects_values_outside_the_spec() {
         for raw in ["", "legacy", "true", "false"] {
-            assert!(
-                raw.parse::<ChatBackend>().is_err(),
+            assert_eq!(
+                raw.parse::<ChatBackend>(),
+                Err("must be one of: enabled, disabled".to_string()),
                 "{raw:?} should be rejected"
             );
         }
@@ -336,5 +449,283 @@ mod chat_backend_tests {
                 .parse::<ChatBackend>()
                 .unwrap_or_else(|e| panic!("{value:?} is advertised but does not parse: {e}"));
         }
+    }
+}
+
+/// Guards the `async-openai` fork patch that only sends `Authorization` when there
+/// is a key to send.
+///
+/// Upstream inserts the header unconditionally. Spice builds every `OpenAI` client
+/// through [`new_openai_client_with_chat_backend`], which starts from
+/// `with_api_key("")` on purpose — so the downstream library cannot pick a key up
+/// from the environment — and overrides it only when a key was configured. Without
+/// the patch, a dataset or model with no `api_key` therefore sends
+/// `Authorization: Bearer ` with an empty value to every request, and an
+/// OpenAI-compatible endpoint that needs no key rejects the malformed credential
+/// instead of serving the request.
+///
+/// Both halves are asserted, because the first alone would pass on a client that
+/// had stopped sending the header at all: with no key there must be no
+/// `Authorization` header, and with a key it must carry it as a bearer token.
+#[cfg(test)]
+pub(crate) mod authorization_header_tests {
+    use std::io::{Read as _, Write as _};
+    use std::net::TcpListener;
+    use std::sync::mpsc;
+    use std::time::Duration;
+
+    use super::{ChatBackend, new_openai_client_with_chat_backend};
+    use crate::chat::Chat as _;
+
+    /// Stand a one-shot HTTP server up and hand back its base URL together with a
+    /// channel carrying the request headers it receives.
+    pub(crate) fn capture_one_request() -> (String, mpsc::Receiver<String>) {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind a local port");
+        let port = listener
+            .local_addr()
+            .expect("read the bound address")
+            .port();
+        let (tx, rx) = mpsc::channel();
+
+        std::thread::spawn(move || {
+            let Ok((mut stream, _)) = listener.accept() else {
+                return;
+            };
+            // Read to the end of the headers, which is all that is under assertion.
+            let mut seen = Vec::new();
+            let mut byte = [0_u8; 1];
+            while stream.read(&mut byte).unwrap_or(0) == 1 {
+                seen.push(byte[0]);
+                if seen.ends_with(b"\r\n\r\n") {
+                    break;
+                }
+            }
+            let _ = tx.send(String::from_utf8_lossy(&seen).into_owned());
+
+            // Any answer will do: the request that arrived is the observation, not
+            // what the client makes of the reply.
+            let body = "{}";
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            let _ = stream.write_all(response.as_bytes());
+            let _ = stream.flush();
+        });
+
+        (format!("http://127.0.0.1:{port}/v1"), rx)
+    }
+
+    /// Drive a health check through a client built the way the runtime builds one,
+    /// and return the request headers the endpoint saw.
+    async fn request_headers_for(api_key: Option<&str>) -> String {
+        let (api_base, rx) = capture_one_request();
+        let client = new_openai_client_with_chat_backend(
+            "gpt-4o-mini".to_string(),
+            Some(&api_base),
+            api_key,
+            None,
+            None,
+            None,
+            ChatBackend::ChatCompletions,
+        );
+        // The reply is not a chat completion, so this fails; the request it sent
+        // first is what the assertions read.
+        let _ = tokio::time::timeout(Duration::from_secs(20), client.health()).await;
+        rx.recv_timeout(Duration::from_secs(20))
+            .expect("the endpoint received a request")
+    }
+
+    #[tokio::test]
+    async fn a_client_with_no_api_key_sends_no_authorization_header() {
+        let headers = request_headers_for(None).await;
+        assert!(
+            !headers.to_ascii_lowercase().contains("authorization:"),
+            "a model configured with no api_key sent an Authorization header, which carries an \
+             empty bearer token and is refused by an endpoint that needs no key:\n{headers}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_client_with_an_api_key_sends_it_as_a_bearer_token() {
+        let headers = request_headers_for(Some("sk-guard-token")).await;
+        assert!(
+            headers.contains("Bearer sk-guard-token"),
+            "the control: a configured api_key has to reach the endpoint as a bearer token, \
+             otherwise the assertion above passes on a client that sends no credential at \
+             all:\n{headers}"
+        );
+    }
+}
+
+/// Guards the `async-openai` fork patch that models `tool_choice` `allowed_tools` as
+/// the single `{mode, tools}` object the Chat Completions API defines.
+///
+/// Upstream models it as a list. A request in `OpenAI`'s shape then fails to
+/// deserialize, so `/v1/chat/completions` refuses it with a 422, and the list shape it
+/// does accept reaches `OpenAI` as a list, which `OpenAI` refuses with a 400. The
+/// request is read in `OpenAI`'s shape and sent through a client built the way the
+/// runtime builds one, and the body the endpoint receives must carry the same object.
+#[cfg(test)]
+mod allowed_tools_wire_tests {
+    use std::io::{Read as _, Write as _};
+    use std::net::TcpListener;
+    use std::sync::mpsc;
+    use std::time::Duration;
+
+    use async_openai::types::chat::CreateChatCompletionRequest;
+
+    use super::{ChatBackend, new_openai_client_with_chat_backend};
+    use crate::chat::Chat as _;
+
+    /// Stand a one-shot HTTP server up and hand back its base URL together with a
+    /// channel carrying the body of the request it receives.
+    fn capture_one_request_body() -> (String, mpsc::Receiver<Vec<u8>>) {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind a local port");
+        let port = listener
+            .local_addr()
+            .expect("read the bound address")
+            .port();
+        let (tx, rx) = mpsc::channel();
+
+        std::thread::spawn(move || {
+            let Ok((mut stream, _)) = listener.accept() else {
+                return;
+            };
+            let mut head = Vec::new();
+            let mut byte = [0_u8; 1];
+            while stream.read(&mut byte).unwrap_or(0) == 1 {
+                head.push(byte[0]);
+                if head.ends_with(b"\r\n\r\n") {
+                    break;
+                }
+            }
+            let content_length = String::from_utf8_lossy(&head)
+                .lines()
+                .find_map(|line| {
+                    let (name, value) = line.split_once(':')?;
+                    name.eq_ignore_ascii_case("content-length")
+                        .then(|| value.trim().parse::<usize>().ok())
+                        .flatten()
+                })
+                .unwrap_or(0);
+            let mut body = vec![0_u8; content_length];
+            let _ = stream.read_exact(&mut body);
+            let _ = tx.send(body);
+
+            // Any answer will do: the request that arrived is the observation.
+            let reply = "{}";
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{reply}",
+                reply.len()
+            );
+            let _ = stream.write_all(response.as_bytes());
+            let _ = stream.flush();
+        });
+
+        (format!("http://127.0.0.1:{port}/v1"), rx)
+    }
+
+    #[tokio::test]
+    async fn an_allowed_tools_choice_reaches_the_provider_as_one_object() {
+        let tool_choice = serde_json::json!({
+            "type": "allowed_tools",
+            "allowed_tools": {
+                "mode": "required",
+                "tools": [{ "type": "function", "function": { "name": "get_weather" } }]
+            }
+        });
+        let request: CreateChatCompletionRequest = serde_json::from_value(serde_json::json!({
+            "model": "gpt-4o-mini",
+            "messages": [{ "role": "user", "content": "What is the weather in Paris?" }],
+            "tools": [{
+                "type": "function",
+                "function": { "name": "get_weather", "parameters": { "type": "object" } }
+            }],
+            "tool_choice": tool_choice
+        }))
+        .expect("a request in OpenAI's allowed_tools shape deserializes");
+
+        let (api_base, rx) = capture_one_request_body();
+        let client = new_openai_client_with_chat_backend(
+            "gpt-4o-mini".to_string(),
+            Some(&api_base),
+            Some("sk-test"),
+            None,
+            None,
+            None,
+            ChatBackend::ChatCompletions,
+        );
+        // The reply is not a chat completion, so this fails; the request it sent
+        // first is what the assertion reads.
+        let _ = tokio::time::timeout(Duration::from_secs(20), client.chat_request(request)).await;
+        let body = rx
+            .recv_timeout(Duration::from_secs(20))
+            .expect("the endpoint received a request");
+        let sent: serde_json::Value =
+            serde_json::from_slice(&body).expect("the request body is JSON");
+
+        assert_eq!(sent["tool_choice"], tool_choice, "{sent}");
+    }
+}
+
+#[cfg(test)]
+mod azure_token_config_tests {
+    use super::*;
+    use reqwest::header::AUTHORIZATION;
+
+    /// A token provider whose token the test replaces, as a refresh does.
+    #[derive(Debug)]
+    struct Rotating(std::sync::Mutex<String>);
+
+    impl token_provider::TokenProvider for Rotating {
+        fn get_token(&self) -> String {
+            self.0.lock().expect("lock").clone()
+        }
+
+        fn dyn_hash(&self) -> String {
+            "rotating".to_string()
+        }
+    }
+
+    #[test]
+    fn an_azure_client_sends_the_current_token_to_the_deployment_url() {
+        let token = Arc::new(Rotating(std::sync::Mutex::new("tok-1".to_string())));
+        let client = new_azure_client_with_token_provider(
+            "gpt-4o-mini".to_string(),
+            "https://my-resource.openai.azure.com",
+            Some("2024-10-21"),
+            Some("chat"),
+            Arc::clone(&token) as Arc<dyn token_provider::TokenProvider>,
+            ChatBackend::ChatCompletions,
+        );
+        let config = client.client.config();
+        let authorization = |config: &AzureTokenConfig| {
+            let headers = config.headers();
+            assert_eq!(headers.len(), 1, "only the bearer token: {headers:?}");
+            headers
+                .get(AUTHORIZATION)
+                .map(|value| value.to_str().expect("ASCII").to_string())
+        };
+
+        assert_eq!(
+            (
+                config.url("/chat/completions"),
+                config.query(),
+                authorization(config)
+            ),
+            (
+                "https://my-resource.openai.azure.com/openai/deployments/chat/chat/completions"
+                    .to_string(),
+                vec![("api-version", "2024-10-21")],
+                Some("Bearer tok-1".to_string())
+            )
+        );
+        *token.0.lock().expect("lock") = "tok-2".to_string();
+        assert_eq!(
+            authorization(config),
+            Some("Bearer tok-2".to_string()),
+            "every request reads the provider's current token"
+        );
     }
 }

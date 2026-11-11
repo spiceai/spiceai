@@ -38,9 +38,23 @@ use runtime_table_partition::expression::PartitionedBy;
 use snafu::ResultExt as _;
 
 use crate::{
-    CayenneContext, CayenneTableProviderBuilder, MetadataCatalog, PartitionMetadata,
+    CayenneContext, CayenneTableProviderBuilder, MetadataCatalog, PartitionMetadata, ScanViewReuse,
     TimeRetentionFilterBuilder, metadata,
 };
+
+/// The partition column labels a Cayenne table records for each of its
+/// partitions: the column name for a plain column expression, otherwise the
+/// expression's `partition_by` name.
+#[must_use]
+pub fn partition_column_labels(partition_by: &[PartitionedBy]) -> Vec<String> {
+    partition_by
+        .iter()
+        .map(|p| match &p.expression {
+            Expr::Column(col) => col.name.clone(),
+            _ => p.name.clone(),
+        })
+        .collect()
+}
 
 /// Implements [`PartitionCreator`] for Cayenne-backed partitioned tables.
 ///
@@ -77,6 +91,10 @@ pub struct CayennePartitionCreator {
     compaction_semaphore: Option<Arc<tokio::sync::Semaphore>>,
     /// See [`PartitionCreator::accepts_direct_partition_writes`].
     accepts_direct_partition_writes: bool,
+    /// Scan-view reuse inherited from the parent dataset (read-only `changes` =
+    /// timed lag, otherwise invalidate on write).
+    scan_view_reuse: ScanViewReuse,
+    secondary_indexes: Vec<Vec<String>>,
 }
 
 impl std::fmt::Debug for CayennePartitionCreator {
@@ -150,6 +168,8 @@ impl CayennePartitionCreator {
             context,
             compaction_semaphore: None,
             accepts_direct_partition_writes: false,
+            scan_view_reuse: ScanViewReuse::UntilInvalidated,
+            secondary_indexes: Vec::new(),
         }
     }
 
@@ -170,8 +190,43 @@ impl CayennePartitionCreator {
         self
     }
 
+    /// Inherit the parent dataset's [`ScanViewReuse`].
+    #[must_use]
+    pub fn with_scan_view_reuse(mut self, reuse: ScanViewReuse) -> Self {
+        self.scan_view_reuse = reuse;
+        self
+    }
+
+    /// Maintain the parent dataset's secondary indexes in every partition. See
+    /// [`crate::CayenneTableProviderBuilder::with_secondary_indexes`].
+    #[must_use]
+    pub fn with_secondary_indexes(mut self, indexes: Vec<Vec<String>>) -> Self {
+        self.secondary_indexes = indexes;
+        self
+    }
+
     /// Wire a freshly opened partition provider into the shared caches and, when
     /// the creating engine runs one, the shared compaction budget.
+    fn partition_table_builder(&self) -> CayenneTableProviderBuilder {
+        let mut builder = CayenneTableProviderBuilder::new(
+            Arc::clone(&self.catalog),
+            Arc::clone(self.context.runtime_env()),
+        )
+        .with_context(Arc::clone(&self.context))
+        .with_retention_filters(self.retention_filters.clone())
+        .with_scan_view_reuse(self.scan_view_reuse)
+        .with_secondary_indexes(self.secondary_indexes.clone())
+        .with_dataset_name(&self.table_name)
+        .with_partitioned_table_conflict_detection(self.vortex_config.pk_conflict_detection);
+        if let Some(ref rb) = self.time_retention_filter_builder {
+            builder = builder.with_time_retention_filter_builder(rb.clone());
+        }
+        if let Some(ref os) = self.object_store_config {
+            builder = builder.with_object_store(os.clone());
+        }
+        builder
+    }
+
     fn init_partition_provider(&self, provider: &Arc<crate::CayenneTableProvider>) {
         if let Some(semaphore) = &self.compaction_semaphore {
             provider.spawn_background_compaction(Arc::clone(semaphore));
@@ -182,25 +237,8 @@ impl CayennePartitionCreator {
         provider.init_scan_view_cache();
     }
 
-    fn partition_column_labels(&self) -> Vec<String> {
-        self.partition_by
-            .iter()
-            .map(|p| match &p.expression {
-                Expr::Column(col) => col.name.clone(),
-                _ => p.name.clone(),
-            })
-            .collect()
-    }
-
     fn partition_table_name(&self, partition_key: &str) -> String {
         crate::partition_naming::partition_child_table_name(&self.table_name, partition_key)
-    }
-
-    fn legacy_partition_table_name(&self, partition_values: &[String]) -> String {
-        crate::partition_naming::legacy_partition_child_table_name(
-            &self.table_name,
-            partition_values,
-        )
     }
 
     fn partition_dir(&self, partition_values: &[ScalarValue]) -> Result<PathBuf, creator::Error> {
@@ -290,7 +328,7 @@ impl PartitionCreator for CayennePartitionCreator {
             }
         }
 
-        let partition_column_names = self.partition_column_labels();
+        let partition_column_names = partition_column_labels(&self.partition_by);
         let partition_key = encode_composite_key(&partition_values)
             .boxed()
             .context(creator::CreatePartitionSnafu)?;
@@ -318,19 +356,8 @@ impl PartitionCreator for CayennePartitionCreator {
             vortex_config: self.vortex_config.clone(),
         };
 
-        let mut builder = CayenneTableProviderBuilder::new(
-            Arc::clone(&self.catalog),
-            Arc::clone(self.context.runtime_env()),
-        )
-        .with_context(Arc::clone(&self.context))
-        .with_retention_filters(self.retention_filters.clone());
-        if let Some(ref rb) = self.time_retention_filter_builder {
-            builder = builder.with_time_retention_filter_builder(rb.clone());
-        }
-        if let Some(ref os) = self.object_store_config {
-            builder = builder.with_object_store(os.clone());
-        }
-        let cayenne_table = builder
+        let cayenne_table = self
+            .partition_table_builder()
             .create(table_options)
             .await
             .boxed()
@@ -356,7 +383,7 @@ impl PartitionCreator for CayennePartitionCreator {
         let df_schema = DFSchema::try_from(Arc::clone(&self.schema))
             .boxed()
             .context(creator::InferringPartitionsSnafu)?;
-        let expected_partition_columns = self.partition_column_labels();
+        let expected_partition_columns = partition_column_labels(&self.partition_by);
 
         for partition_meta in partitions {
             if partition_meta.partition_columns != expected_partition_columns {
@@ -376,53 +403,37 @@ impl PartitionCreator for CayennePartitionCreator {
                 partition_values.push(partition_value);
             }
 
-            let partition_key = partition_meta.composite_key();
-            let partition_table_name = self.partition_table_name(&partition_key);
+            let [current_name, legacy_name] =
+                crate::partition_naming::partition_child_candidate_names(
+                    &self.table_name,
+                    &partition_meta.partition_values,
+                );
 
-            let mut builder = CayenneTableProviderBuilder::new(
-                Arc::clone(&self.catalog),
-                Arc::clone(self.context.runtime_env()),
-            )
-            .with_context(Arc::clone(&self.context))
-            .with_retention_filters(self.retention_filters.clone());
-            if let Some(ref rb) = self.time_retention_filter_builder {
-                builder = builder.with_time_retention_filter_builder(rb.clone());
-            }
-            if let Some(ref os) = self.object_store_config {
-                builder = builder.with_object_store(os.clone());
-            }
-            let cayenne_table = match builder.open(&partition_table_name).await {
+            let cayenne_table = match self.partition_table_builder().open(&current_name).await {
                 Ok(table) => table,
                 Err(crate::provider::Error::Catalog {
                     source: crate::catalog::CatalogError::TableNotFound { .. },
-                }) => {
-                    let legacy_name =
-                        self.legacy_partition_table_name(&partition_meta.partition_values);
-                    let mut legacy_builder = CayenneTableProviderBuilder::new(
-                        Arc::clone(&self.catalog),
-                        Arc::clone(self.context.runtime_env()),
-                    )
-                    .with_context(Arc::clone(&self.context))
-                    .with_retention_filters(self.retention_filters.clone());
-                    if let Some(ref rb) = self.time_retention_filter_builder {
-                        legacy_builder =
-                            legacy_builder.with_time_retention_filter_builder(rb.clone());
-                    }
-                    if let Some(ref os) = self.object_store_config {
-                        legacy_builder = legacy_builder.with_object_store(os.clone());
-                    }
-                    legacy_builder
-                        .open(&legacy_name)
-                        .await
-                        .boxed()
-                        .context(creator::InferringPartitionsSnafu)?
-                }
+                }) => self
+                    .partition_table_builder()
+                    .open(&legacy_name)
+                    .await
+                    .boxed()
+                    .context(creator::InferringPartitionsSnafu)?,
                 Err(error) => {
                     return Err(creator::Error::InferringPartitions {
                         source: Box::new(error),
                     });
                 }
             };
+
+            // `open` does not go through `create_table`, so the child's stored
+            // data files are checked here, as a table that is not rebuilt.
+            self.catalog
+                .verify_existing_stored_data_files(cayenne_table.table_name())
+                .await
+                .map_err(|error| creator::Error::InferringPartitions {
+                    source: Box::new(error),
+                })?;
 
             let table_provider = Arc::new(cayenne_table);
             self.init_partition_provider(&table_provider);
@@ -435,31 +446,23 @@ impl PartitionCreator for CayennePartitionCreator {
         Ok(result)
     }
 
+    /// This creator reports every filter `Inexact`, so a filter it is asked about
+    /// stays available to `scan()`, where the partition providers use it to prune
+    /// files, prune the mem-tier, and detect primary-key point lookups.
+    /// `Unsupported` would withhold the filter from `scan()` entirely and buy no
+    /// extra safety.
+    ///
+    /// That result is this creator's alone, and it is not what the caller
+    /// necessarily sees. `PartitionTableProvider` promotes a filter comparing a
+    /// partition expression to a literal to `Exact`, and its `scan()` additionally
+    /// withholds from the partition scans any filter over a single simple
+    /// partition column — so `region IN ('us', 'eu')` under `partition_by:
+    /// [region]` stays `Inexact` here yet never reaches a child scan.
     fn supports_filters_pushdown(
         &self,
         filters: &[&Expr],
     ) -> Result<Vec<TableProviderFilterPushDown>, DataFusionError> {
-        let partition_columns: std::collections::HashSet<_> = self
-            .partition_by
-            .iter()
-            .flat_map(|p| p.expression.column_refs())
-            .collect();
-
-        Ok(filters
-            .iter()
-            .map(|filter| {
-                let filter_columns = filter.column_refs();
-                let matches = filter_columns.is_empty()
-                    || filter_columns
-                        .iter()
-                        .all(|fc| partition_columns.iter().any(|pc| fc.name == pc.name));
-                if matches {
-                    TableProviderFilterPushDown::Inexact
-                } else {
-                    TableProviderFilterPushDown::Unsupported
-                }
-            })
-            .collect())
+        Ok(vec![TableProviderFilterPushDown::Inexact; filters.len()])
     }
 }
 
@@ -472,7 +475,7 @@ mod tests {
     use datafusion::scalar::ScalarValue;
     use tempfile::TempDir;
 
-    use crate::metadata::{CreateTableOptions, VortexConfig};
+    use crate::metadata::{CreateTableOptions, PartitionMetadata, VortexConfig};
     use crate::{CayenneCatalog, CayenneTableProvider};
     use arrow::datatypes::{DataType, Field, Schema};
 
@@ -699,6 +702,241 @@ mod tests {
             .collect();
         values.sort();
         assert_eq!(values, vec!["alpha".to_string(), "beta".to_string()]);
+    }
+
+    /// The slice a real partitioned table exports must restore into a fresh
+    /// metastore that the runtime can then *open*: `infer_existing_partitions`
+    /// resolves each `cayenne_partition` row to its own child `cayenne_table`
+    /// row, and a restore that dropped those children leaves a table whose
+    /// every partition fails to open with `TableNotFound`.
+    ///
+    /// This drives the production surface end to end — the catalog's real
+    /// `create_partition`, `export_dataset_slice`, and `import_dataset_slice`,
+    /// the same three the snapshot engine calls — rather than hand-built
+    /// metastore rows, so the child's name, path, and `table_id` are whatever
+    /// the runtime actually writes.
+    #[tokio::test]
+    async fn a_restored_partitioned_table_opens_every_partition() {
+        let source = fixture().await;
+        let creator = creator_for(&source);
+        for value in ["alpha", "beta"] {
+            creator
+                .create_partition(vec![bucket(value)])
+                .await
+                .expect("partition is created");
+        }
+
+        let restored = restore_on_a_fresh_node(&source).await;
+
+        let mut values: Vec<String> = creator_for(&restored)
+            .infer_existing_partitions()
+            .await
+            .expect("every restored partition opens")
+            .iter()
+            .map(|partition| match partition.partition_values.as_slice() {
+                [ScalarValue::Utf8(Some(value))] => value.clone(),
+                other => panic!("expected one Utf8 partition value, got {other:?}"),
+            })
+            .collect();
+        values.sort();
+        assert_eq!(values, vec!["alpha".to_string(), "beta".to_string()]);
+    }
+
+    /// The directory `export_dataset_slice` anchors `fixture`'s paths to.
+    fn anchor_of(fixture: &Fixture) -> PathBuf {
+        fixture
+            .base_path
+            .parent()
+            .expect("the table directory has a parent")
+            .to_path_buf()
+    }
+
+    /// Export `source` and import it on a fresh node: its own metastore, its
+    /// own data directory. Nothing is copied across — the slice alone has to
+    /// describe the dataset well enough for every partition to open.
+    async fn restore_on_a_fresh_node(source: &Fixture) -> Fixture {
+        let slice = source
+            .catalog
+            .export_dataset_slice(TABLE, &anchor_of(source))
+            .await
+            .expect("the partitioned dataset exports");
+
+        let restored_tmp = TempDir::new().expect("tempdir");
+        let restored_anchor = restored_tmp.path().to_path_buf();
+        let restored_catalog: Arc<dyn MetadataCatalog> = Arc::new(
+            CayenneCatalog::new(format!(
+                "sqlite://{}",
+                restored_anchor.join("meta.db").display()
+            ))
+            .expect("catalog opens"),
+        );
+        restored_catalog
+            .init()
+            .await
+            .expect("catalog schema initializes");
+        restored_catalog
+            .import_dataset_slice(&slice, &restored_anchor)
+            .await
+            .expect("the slice imports into a fresh metastore");
+
+        let restored_table_id = restored_catalog
+            .get_table(TABLE)
+            .await
+            .expect("the restored parent is registered")
+            .table_id;
+        Fixture {
+            catalog: restored_catalog,
+            table_id: restored_table_id,
+            schema: Arc::clone(&source.schema),
+            base_path: restored_anchor.join(TABLE),
+            runtime_env: Arc::clone(&source.runtime_env),
+            _tmp: restored_tmp,
+        }
+    }
+
+    /// The child table name this build gives the partition holding `value`.
+    fn current_child(value: &str) -> String {
+        let [current, _legacy] =
+            crate::partition_naming::partition_child_candidate_names(TABLE, &[value.to_string()]);
+        current
+    }
+
+    /// The partition value whose legacy-scheme child name is `x`'s
+    /// current-scheme one: `x`'s child name with the parent's prefix removed.
+    fn value_colliding_with_x() -> String {
+        current_child("x")
+            .strip_prefix(&format!("{TABLE}_"))
+            .expect("a child name starts with its parent's")
+            .to_string()
+    }
+
+    /// Register a partition the way an older runtime wrote one — its value as
+    /// the raw string — rooted at `dir` under the table, with a child table
+    /// under each of `children`.
+    async fn legacy_partition(fixture: &Fixture, value: &str, dir: &str, children: &[&str]) {
+        let path = fixture.base_path.join(dir);
+        tokio::fs::create_dir_all(&path)
+            .await
+            .expect("the partition directory is created");
+        let path = path.to_string_lossy().to_string();
+        fixture
+            .catalog
+            .add_partition(PartitionMetadata::new_composite(
+                fixture.table_id.clone(),
+                vec!["bucket".to_string()],
+                vec![value.to_string()],
+                path.clone(),
+                false,
+            ))
+            .await
+            .unwrap_or_else(|error| panic!("the partition {value} is registered: {error}"));
+        for child in children {
+            creator_for(fixture)
+                .partition_table_builder()
+                .create(CreateTableOptions {
+                    table_name: (*child).to_string(),
+                    schema: Arc::clone(&fixture.schema),
+                    primary_key: vec![],
+                    on_conflict: None,
+                    base_path: path.clone(),
+                    partition_column: None,
+                    vortex_config: VortexConfig::default(),
+                })
+                .await
+                .unwrap_or_else(|error| panic!("the child {child} is created: {error}"));
+        }
+    }
+
+    /// Each partition's value and the name of the child table it opened,
+    /// sorted.
+    fn opened_children(partitions: &[Partition]) -> Vec<(String, String)> {
+        let mut opened: Vec<(String, String)> = partitions
+            .iter()
+            .map(|partition| {
+                let [ScalarValue::Utf8(Some(value))] = partition.partition_values.as_slice() else {
+                    panic!(
+                        "expected one Utf8 partition value, got {:?}",
+                        partition.partition_values
+                    );
+                };
+                let child = partition
+                    .table_provider
+                    .downcast_ref::<CayenneTableProvider>()
+                    .expect("a Cayenne partition")
+                    .table_name()
+                    .to_string();
+                (value.clone(), child)
+            })
+            .collect();
+        opened.sort();
+        opened
+    }
+
+    /// One partition's current-scheme child name can equal another's
+    /// legacy-scheme name. With each partition holding its own current-scheme
+    /// child, a restored partition still opens its own — which holds only
+    /// while the slice validator that accepts the restore and
+    /// `infer_existing_partitions` try a partition's names in the same order.
+    #[tokio::test]
+    async fn a_restored_partition_opens_its_own_child_when_child_names_collide() {
+        let source = fixture().await;
+        let colliding = value_colliding_with_x();
+        legacy_partition(&source, "x", "kx", &[&current_child("x")]).await;
+        legacy_partition(&source, &colliding, "kc", &[&current_child(&colliding)]).await;
+
+        let restored = restore_on_a_fresh_node(&source).await;
+        let partitions = creator_for(&restored)
+            .infer_existing_partitions()
+            .await
+            .expect("every restored partition opens");
+
+        assert_eq!(
+            opened_children(&partitions),
+            vec![
+                (colliding.clone(), current_child(&colliding)),
+                ("x".to_string(), current_child("x")),
+            ]
+        );
+    }
+
+    /// The other side of the same collision: `x`'s current-scheme child, which
+    /// is also the colliding partition's legacy-scheme name, and no child of
+    /// the colliding partition's own. The runtime opens `x`'s child for both
+    /// partitions, so the colliding one reads `x`'s rows — and the export that
+    /// would carry the dataset to another node is refused rather than
+    /// restoring that.
+    #[tokio::test]
+    async fn a_dataset_whose_partitions_open_one_child_does_not_export() {
+        let source = fixture().await;
+        let colliding = value_colliding_with_x();
+        let x_child = current_child("x");
+        legacy_partition(&source, "x", "shared", &[&x_child, &format!("{TABLE}_x")]).await;
+        legacy_partition(&source, &colliding, "shared", &[]).await;
+
+        let partitions = creator_for(&source)
+            .infer_existing_partitions()
+            .await
+            .expect("both partitions open");
+        assert_eq!(
+            opened_children(&partitions),
+            vec![
+                (colliding, x_child.clone()),
+                ("x".to_string(), x_child.clone())
+            ],
+            "the runtime resolves both partitions to one child"
+        );
+
+        let error = source
+            .catalog
+            .export_dataset_slice(TABLE, &anchor_of(&source))
+            .await
+            .expect_err("a dataset two of whose partitions open one child must not export");
+        assert!(
+            error
+                .to_string()
+                .contains(&format!("would both open the child table '{x_child}'")),
+            "{error}"
+        );
     }
 
     /// One value per `partition_by` expression, no more and no fewer.
@@ -931,5 +1169,97 @@ mod tests {
             vec![impostor],
             "the real partition child must go and the name-alike must stay"
         );
+    }
+
+    /// Regression test for #12959: a filter on a non-partition column must reach
+    /// every partition's `scan()`. Withheld, it is only re-applied above the
+    /// union, and each partition loses file pruning, mem-tier pruning, primary
+    /// key point-lookup detection, and its secondary indexes.
+    #[tokio::test]
+    async fn a_non_partition_filter_reaches_every_partition_scan() {
+        use datafusion::arrow::util::pretty::pretty_format_batches;
+        use datafusion::catalog::TableProvider as _;
+        use datafusion::prelude::lit;
+        use runtime_table_partition::provider::PartitionTableProvider;
+
+        let fixture = fixture().await;
+        let partition_by = vec![PartitionedBy {
+            name: "bucket".to_string(),
+            expression: col("bucket"),
+        }];
+        let provider = Arc::new(
+            PartitionTableProvider::new(
+                Arc::new(creator_for(&fixture)),
+                partition_by,
+                Arc::clone(&fixture.schema),
+            )
+            .await
+            .expect("the partitioned table opens"),
+        );
+
+        let data_filter = col("id").eq(lit(3_i64));
+        let partition_filter = col("bucket").eq(lit("a"));
+        let mixed_filter = col("bucket").eq(lit("a")).or(col("id").eq(lit(4_i64)));
+        assert_eq!(
+            provider
+                .supports_filters_pushdown(&[&data_filter, &partition_filter, &mixed_filter])
+                .expect("pushdown is classified"),
+            vec![
+                TableProviderFilterPushDown::Inexact,
+                TableProviderFilterPushDown::Exact,
+                TableProviderFilterPushDown::Inexact,
+            ],
+            "only a filter partition pruning fully resolves may be Exact"
+        );
+
+        let ctx = SessionContext::new();
+        ctx.register_table("t", Arc::clone(&provider) as _)
+            .expect("the table registers");
+        ctx.sql("INSERT INTO t VALUES (1, 'a'), (2, 'a'), (3, 'b'), (4, 'b'), (5, 'c')")
+            .await
+            .expect("the insert plans")
+            .collect()
+            .await
+            .expect("the insert runs");
+
+        let plan = ctx
+            .sql("SELECT id FROM t WHERE id = 3")
+            .await
+            .expect("the query plans")
+            .into_optimized_plan()
+            .expect("the plan optimizes");
+        let plan = plan.display_indent().to_string();
+        assert!(
+            plan.contains("partial_filters=[t.id = Int64(3)]"),
+            "the non-partition filter must be handed to scan():\n{plan}"
+        );
+
+        for (sql, expected) in [
+            (
+                "SELECT id FROM t WHERE id = 3",
+                "+----+\n| id |\n+----+\n| 3  |\n+----+",
+            ),
+            (
+                "SELECT id FROM t WHERE bucket = 'a' OR id = 4 ORDER BY id",
+                "+----+\n| id |\n+----+\n| 1  |\n| 2  |\n| 4  |\n+----+",
+            ),
+            (
+                "SELECT id FROM t WHERE bucket = 'b' AND id > 3",
+                "+----+\n| id |\n+----+\n| 4  |\n+----+",
+            ),
+            ("SELECT id FROM t WHERE id > 99", "++\n++"),
+        ] {
+            let batches = ctx
+                .sql(sql)
+                .await
+                .expect("the query plans")
+                .collect()
+                .await
+                .expect("the query runs");
+            let actual = pretty_format_batches(&batches)
+                .expect("batches format")
+                .to_string();
+            assert_eq!(actual, expected, "wrong rows for `{sql}`");
+        }
     }
 }

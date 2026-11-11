@@ -1,0 +1,10 @@
+{
+  "spicepod.arrow.yaml": "6279e516621d44f21b6efd13a93b1cc1719380f7b8ae7930a91e243d0069e427",
+  "spicepod.auth.yaml": "56701192747ccbcb92654bc0a74b03a690a202c970f95d26c23c13b36c769f8f",
+  "spicepod.cayenne.yaml": "b6b0d0999d47ad03c789af96c8ef9dd129a75ff66c3146e5ac862a568d6572c8",
+  "spicepod.duckdb.yaml": "27484a32b7ecb97ce11e66a61332825ab63f648106c29c84fdeadcc000fba1f8",
+  "spicepod.search.yaml": "542e5ec61504d2ee1ec904bf871689bc6df7a7147d1993c564fba5e40988b7bc",
+  "spicepod.sqlite.yaml": "8a24617a31f229109ad34107dec0bfae4e370fab07a7bbda6d54fb50fe8b6888",
+  "spicepod.vectors.yaml": "99c56c25855158453e5b2bc85e218ad54235dc02746eca027643efe216ab9c42",
+  "spicepod.yaml": "234dc2e5c28f9d0772163aebdfc84b005e0a1156d1818c92b4fd022175619bf2"
+}

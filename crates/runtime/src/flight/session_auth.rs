@@ -116,7 +116,7 @@ mod tests {
 
         // Create a session with the known API key
         let base_ctx = SessionContext::new();
-        let (session_id, _) = session_store.create_session(&base_ctx, Some("test-key"));
+        let (session_id, _) = session_store.create_session(&base_ctx, Some("test-key"), None);
 
         // Wrap in session-aware auth
         let session_auth = SessionAwareAuth::new(api_key_auth, session_store);

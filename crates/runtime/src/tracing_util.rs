@@ -14,7 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use datafusion::sql::TableReference;
+use datafusion::common::TableReference;
 
 use crate::{
     component::dataset::{
@@ -32,7 +32,7 @@ pub fn dataset_registered_trace(
     ds: &Dataset,
     results_cache_enabled: bool,
 ) -> String {
-    let mut info = format!("Dataset {} registered ({})", &ds.name, &ds.from);
+    let mut info = format!("Dataset {} registered ({})", ds.name, ds.from);
     if let Some(acceleration) = &ds.acceleration
         && acceleration.enabled
     {
@@ -121,6 +121,48 @@ fn acceleration_info(
     info
 }
 
+/// Every line `tracing` writes at `WARN` or above while `f` runs on this thread.
+///
+/// A thread-local subscriber: enough for synchronous code, and it keeps the capture from
+/// seeing other tests' output. Returns the lines rather than a joined string so a caller can
+/// *count* an emission — a duplicate-log regression is exactly what a presence check passes.
+#[cfg(test)]
+pub(crate) fn warn_lines_emitted_by(f: impl FnOnce()) -> Vec<String> {
+    use std::sync::Arc;
+
+    #[derive(Clone, Default)]
+    struct Capture(Arc<parking_lot::Mutex<Vec<u8>>>);
+    impl std::io::Write for Capture {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for Capture {
+        type Writer = Self;
+        fn make_writer(&'a self) -> Self::Writer {
+            self.clone()
+        }
+    }
+
+    let sink = Capture::default();
+    let subscriber = tracing_subscriber::fmt()
+        .with_writer(sink.clone())
+        .with_ansi(false)
+        .with_max_level(tracing::Level::WARN)
+        .finish();
+    tracing::subscriber::with_default(subscriber, f);
+
+    let captured = sink.0.lock();
+    String::from_utf8_lossy(&captured)
+        .lines()
+        .map(str::to_owned)
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -192,7 +234,7 @@ mod tests {
         let info = dataset_registered_trace(test_data_connector.as_ref(), &ds, true);
         assert_eq!(
             info,
-            "Dataset taxi_trips registered (s3://taxi_trips/2024/), acceleration (arrow), results cache enabled."
+            "Dataset taxi_trips registered (s3://taxi_trips/2024/), acceleration (cayenne), results cache enabled."
         );
     }
 
@@ -200,7 +242,7 @@ mod tests {
     async fn test_dataset_registered_trace_with_acceleration_complex() {
         let acceleration = Acceleration {
             enabled: true,
-            engine: Engine::DuckDB,
+            engine: Engine::Cayenne,
             mode: Mode::File,
             refresh_mode: Some(RefreshMode::Append),
             refresh_check_interval: Some(Duration::from_secs(30)),
@@ -225,7 +267,7 @@ mod tests {
         let info = dataset_registered_trace(test_data_connector.as_ref(), &ds, false);
         assert_eq!(
             info,
-            "Dataset taxi_trips registered (s3://taxi_trips/2024/), acceleration (duckdb:file, append, 30s refresh, 1hr retention, fallback on source on empty result)."
+            "Dataset taxi_trips registered (s3://taxi_trips/2024/), acceleration (cayenne:file, append, 30s refresh, 1hr retention, fallback on source on empty result)."
         );
     }
 
@@ -244,7 +286,10 @@ mod tests {
             ..Default::default()
         });
         let info = view_registered_trace(&table_ref, acceleration.as_ref());
-        assert_eq!(info, "View taxi_trips_vw registered, acceleration (arrow).");
+        assert_eq!(
+            info,
+            "View taxi_trips_vw registered, acceleration (cayenne)."
+        );
     }
 
     #[test]
@@ -252,7 +297,7 @@ mod tests {
         let table_ref = TableReference::from("taxi_trips_vw");
         let acceleration = Some(Acceleration {
             enabled: true,
-            engine: Engine::DuckDB,
+            engine: Engine::Cayenne,
             mode: Mode::File,
             refresh_check_interval: Some(Duration::from_secs(30)),
             ..Default::default()
@@ -260,7 +305,7 @@ mod tests {
         let info = view_registered_trace(&table_ref, acceleration.as_ref());
         assert_eq!(
             info,
-            "View taxi_trips_vw registered, acceleration (duckdb:file, 30s refresh)."
+            "View taxi_trips_vw registered, acceleration (cayenne:file, 30s refresh)."
         );
     }
 }

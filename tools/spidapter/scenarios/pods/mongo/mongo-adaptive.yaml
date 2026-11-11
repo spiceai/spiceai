@@ -8,6 +8,7 @@ name: mongo-adaptive
 # capacity-independent knobs (memory durability, key deletes, CDC coalescing) with
 # the hand-tuned pods so the comparison isolates the actuator tuning.
 runtime:
+  adaptive_tuning: enabled
   flight:
     ipc_compression: lz4_frame
   params:
@@ -38,7 +39,6 @@ datasets:
       on_conflict:
         _id: upsert
       params:
-        cayenne_tuning: adaptive
         cayenne_metastore: sqlite
         cayenne_force_view_types: "false"
         cayenne_deletion_mode: key
@@ -118,7 +118,6 @@ datasets:
       on_conflict:
         _id: upsert
       params:
-        cayenne_tuning: adaptive
         cayenne_metastore: sqlite
         cayenne_force_view_types: "false"
         cayenne_deletion_mode: key
@@ -177,7 +176,6 @@ datasets:
       on_conflict:
         _id: upsert
       params:
-        cayenne_tuning: adaptive
         cayenne_metastore: sqlite
         cayenne_force_view_types: "false"
         cayenne_deletion_mode: key
@@ -224,7 +222,6 @@ datasets:
       on_conflict:
         _id: upsert
       params:
-        cayenne_tuning: adaptive
         cayenne_metastore: sqlite
         cayenne_force_view_types: "false"
         cayenne_deletion_mode: key
@@ -280,7 +277,6 @@ datasets:
       on_conflict:
         _id: upsert
       params:
-        cayenne_tuning: adaptive
         cayenne_metastore: sqlite
         cayenne_force_view_types: "false"
         cayenne_deletion_mode: key
@@ -339,7 +335,6 @@ datasets:
       on_conflict:
         _id: upsert
       params:
-        cayenne_tuning: adaptive
         cayenne_metastore: sqlite
         cayenne_force_view_types: "false"
         cayenne_deletion_mode: key
@@ -392,7 +387,6 @@ datasets:
       on_conflict:
         _id: upsert
       params:
-        cayenne_tuning: adaptive
         cayenne_metastore: sqlite
         cayenne_force_view_types: "false"
         cayenne_deletion_mode: key
@@ -436,7 +430,6 @@ datasets:
       on_conflict:
         _id: upsert
       params:
-        cayenne_tuning: adaptive
         cayenne_metastore: sqlite
         cayenne_force_view_types: "false"
         cayenne_deletion_mode: key

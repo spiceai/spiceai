@@ -1,0 +1,418 @@
+/*
+Copyright 2024-2026 The Spice.ai OSS Authors
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+     https://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+*/
+
+//! Query-operator memory pool: greedy, with a reserved slice that spillable
+//! consumers (`ExternalSorter`, grouped hash aggregate) cannot take.
+//!
+//! `DataFusion`'s `GreedyMemoryPool` lets the first `try_grow` win. An
+//! `ExternalSorter` (`can_spill: true`) only spills when that grow *fails*, so
+//! a coalesced TPC-DS Q97 sort-merge held 103.6 GiB of a 107.50 GiB pool and
+//! `cayenne_scan[store_sales, partition=2]` could not get 1 MiB (lab SF-100
+//! `--validate`, 3d692f7d21). The cap is on *spillable* bytes, not total
+//! used: capping total used let Q78 `HashJoinInput`s (unspillable) fill
+//! `pool - headroom` and then starve `GroupedHashAggregateStream` (b51504b3bc).
+
+use std::fmt::{Display, Formatter};
+use std::num::NonZeroUsize;
+use std::sync::Arc;
+
+use datafusion::common::{Result, resources_datafusion_err};
+use datafusion::execution::memory_pool::{
+    MemoryLimit, MemoryPool, MemoryReservation, TrackConsumersPool, human_readable_size,
+};
+use parking_lot::Mutex;
+
+/// Spillable operators cannot consume this fraction of the pool, so a
+/// `cayenne_scan` batch (1 MiB) can still allocate after a large sort.
+const SPILLABLE_HEADROOM_DIVISOR: usize = 16;
+
+/// Query pool used by `RuntimeEnv`: tracked consumers, spillable headroom.
+#[must_use]
+pub(crate) fn tracked_query_memory_pool(
+    pool_size: usize,
+    topn: NonZeroUsize,
+) -> Arc<dyn MemoryPool> {
+    Arc::new(TrackConsumersPool::new(
+        GreedyPoolWithSpillHeadroom::new(pool_size),
+        topn,
+    ))
+}
+
+#[derive(Debug)]
+struct PoolState {
+    used: usize,
+    spillable_used: usize,
+}
+
+#[derive(Debug)]
+struct GreedyPoolWithSpillHeadroom {
+    pool_size: usize,
+    spillable_headroom: usize,
+    state: Mutex<PoolState>,
+}
+
+impl GreedyPoolWithSpillHeadroom {
+    fn new(pool_size: usize) -> Self {
+        Self {
+            pool_size,
+            spillable_headroom: spillable_headroom_bytes(pool_size),
+            state: Mutex::new(PoolState {
+                used: 0,
+                spillable_used: 0,
+            }),
+        }
+    }
+
+    fn spillable_cap(&self) -> usize {
+        self.pool_size.saturating_sub(self.spillable_headroom)
+    }
+}
+
+fn spillable_headroom_bytes(pool_size: usize) -> usize {
+    let headroom = pool_size / SPILLABLE_HEADROOM_DIVISOR;
+    if headroom == 0 && pool_size > 1 {
+        1
+    } else {
+        headroom.min(pool_size.saturating_sub(1))
+    }
+}
+
+impl MemoryPool for GreedyPoolWithSpillHeadroom {
+    fn name(&self) -> &'static str {
+        "greedy_spill_headroom"
+    }
+
+    fn grow(&self, reservation: &MemoryReservation, additional: usize) {
+        let mut state = self.state.lock();
+        state.used = state.used.saturating_add(additional);
+        if reservation.consumer().can_spill() {
+            state.spillable_used = state.spillable_used.saturating_add(additional);
+        }
+    }
+
+    fn shrink(&self, reservation: &MemoryReservation, shrink: usize) {
+        let mut state = self.state.lock();
+        state.used = state.used.saturating_sub(shrink);
+        if reservation.consumer().can_spill() {
+            state.spillable_used = state.spillable_used.saturating_sub(shrink);
+        }
+    }
+
+    fn try_grow(&self, reservation: &MemoryReservation, additional: usize) -> Result<()> {
+        let remaining = {
+            let mut state = self.state.lock();
+            let new_used = state.used.saturating_add(additional);
+            if new_used > self.pool_size {
+                Some(self.pool_size.saturating_sub(state.used))
+            } else if reservation.consumer().can_spill() {
+                let new_spillable = state.spillable_used.saturating_add(additional);
+                if new_spillable > self.spillable_cap() {
+                    Some(self.spillable_cap().saturating_sub(state.spillable_used))
+                } else {
+                    state.spillable_used = new_spillable;
+                    state.used = new_used;
+                    None
+                }
+            } else {
+                state.used = new_used;
+                None
+            }
+        };
+        // Format `self` only after dropping the state lock (`Display` re-locks).
+        let Some(remaining) = remaining else {
+            return Ok(());
+        };
+        Err(resources_datafusion_err!(
+            "Failed to allocate additional {} for {} with {} already allocated for this reservation - {} remain available for the total memory pool: {}",
+            human_readable_size(additional),
+            reservation.consumer().name(),
+            human_readable_size(reservation.size()),
+            human_readable_size(remaining),
+            self
+        ))
+    }
+
+    fn reserved(&self) -> usize {
+        self.state.lock().used
+    }
+
+    fn memory_limit(&self) -> MemoryLimit {
+        MemoryLimit::Finite(self.pool_size)
+    }
+}
+
+impl Display for GreedyPoolWithSpillHeadroom {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        let state = self.state.lock();
+        write!(
+            f,
+            "{}(used: {}, spillable_used: {}, pool_size: {}, spillable_cap: {})",
+            self.name(),
+            human_readable_size(state.used),
+            human_readable_size(state.spillable_used),
+            human_readable_size(self.pool_size),
+            human_readable_size(self.spillable_cap()),
+        )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use datafusion::arrow::array::{AsArray, Int64Array, RecordBatch};
+    use datafusion::arrow::datatypes::{DataType, Field, Int64Type, Schema};
+    use datafusion::datasource::MemTable;
+    use datafusion::execution::disk_manager::{DiskManagerBuilder, DiskManagerMode};
+    use datafusion::execution::memory_pool::MemoryConsumer;
+    use datafusion::execution::runtime_env::RuntimeEnvBuilder;
+    use datafusion::prelude::{SessionConfig, SessionContext};
+
+    fn pool(size: usize) -> Arc<dyn MemoryPool> {
+        Arc::new(GreedyPoolWithSpillHeadroom::new(size))
+    }
+
+    #[test]
+    fn spillable_cannot_consume_headroom() {
+        let pool_size = 16 * 1024;
+        let memory = pool(pool_size);
+        let headroom = spillable_headroom_bytes(pool_size);
+        let cap = pool_size - headroom;
+        let spillable = MemoryConsumer::new("ExternalSorter[0]")
+            .with_can_spill(true)
+            .register(&memory);
+
+        spillable
+            .try_grow(cap)
+            .expect("spillable should fill up to the cap");
+        spillable
+            .try_grow(1)
+            .expect_err("spillable must not take the headroom (TPC-DS Q97 ExternalSorter)");
+        assert_eq!(memory.reserved(), cap);
+    }
+
+    #[test]
+    fn unspillable_can_use_headroom_after_spillable_cap() {
+        // Lab SF-100 Q97: ExternalSorter at ~cap, cayenne_scan needs 1 MiB.
+        let pool_size = 16 * 1024;
+        let memory = pool(pool_size);
+        let cap = pool_size - spillable_headroom_bytes(pool_size);
+        let sorter = MemoryConsumer::new("ExternalSorter[0]")
+            .with_can_spill(true)
+            .register(&memory);
+        sorter
+            .try_grow(cap)
+            .expect("sorter should take the spillable cap");
+
+        let scan = MemoryConsumer::new("cayenne_scan[store_sales, partition=2]")
+            .with_can_spill(false)
+            .register(&memory);
+        scan.try_grow(1024)
+            .expect("cayenne scan must allocate from the spillable headroom");
+        assert_eq!(memory.reserved(), cap + 1024);
+    }
+
+    #[test]
+    fn unspillable_can_fill_the_pool() {
+        let pool_size = 4096;
+        let memory = pool(pool_size);
+        let scan = MemoryConsumer::new("cayenne_scan")
+            .with_can_spill(false)
+            .register(&memory);
+        scan.try_grow(pool_size)
+            .expect("unspillable consumers use the full pool");
+        let err = scan
+            .try_grow(1)
+            .expect_err("unspillable still cannot exceed the pool");
+        assert!(
+            matches!(
+                err,
+                datafusion::error::DataFusionError::ResourcesExhausted(_)
+            ),
+            "expected ResourcesExhausted, got {err:?}"
+        );
+        let message = err.to_string();
+        assert!(
+            message.starts_with(
+                "Resources exhausted: Failed to allocate additional 1.0 B for cayenne_scan \
+                 with 4.0 KB already allocated for this reservation - 0.0 B remain available \
+                 for the total memory pool: greedy_spill_headroom(used: 4.0 KB, \
+                 spillable_used: 0.0 B, pool_size: 4.0 KB, "
+            ),
+            "unexpected error: {message}"
+        );
+        // The rejected grow leaves both the pool and the reservation unchanged.
+        assert_eq!(memory.reserved(), pool_size);
+        assert_eq!(scan.size(), pool_size);
+    }
+
+    #[test]
+    fn unspillable_hash_joins_do_not_starve_spillable_aggregates() {
+        // Lab SF-100 Q78 on b51504b3bc: HashJoinInput (unspillable) filled
+        // total used to the spillable cap, then GroupedHashAggregateStream
+        // could not get 3.8 MiB. The cap is on spillable bytes only.
+        let pool_size = 16 * 1024;
+        let memory = pool(pool_size);
+        let cap = pool_size - spillable_headroom_bytes(pool_size);
+        let hash_join = MemoryConsumer::new("HashJoinInput[8]")
+            .with_can_spill(false)
+            .register(&memory);
+        hash_join
+            .try_grow(cap)
+            .expect("unspillable hash join may fill up to the spillable cap of total used");
+
+        let aggregate = MemoryConsumer::new("GroupedHashAggregateStream[12]")
+            .with_can_spill(true)
+            .register(&memory);
+        aggregate
+            .try_grow(1024)
+            .expect("spillable aggregate must still grow while unspillable holds the cap");
+        assert_eq!(memory.reserved(), cap + 1024);
+    }
+
+    /// A sort over a grouped aggregate's output fits a pool sized for its rows.
+    /// The aggregate hands its groups on as slices of one batch, and the sort
+    /// charged every slice for the whole batch until spiceai/datafusion#266, so
+    /// sorting a million groups needed many times their 16 MiB. At 1000
+    /// warehouses CH-benCHmark Q10 failed on every run that way, three of its
+    /// sorters holding 12.9, 12.4 and 7.1 GB. With spilling disabled, a sort
+    /// charged per batch runs out of this pool after a handful of slices.
+    #[tokio::test]
+    async fn a_sort_over_a_grouped_aggregate_is_charged_for_its_rows() {
+        let groups: i64 = 1 << 20;
+        let schema = Arc::new(Schema::new(vec![Field::new("v", DataType::Int64, false)]));
+        let batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![Arc::new(Int64Array::from_iter_values(0..2 * groups))],
+        )
+        .expect("build the input batch");
+        let table = MemTable::try_new(schema, vec![vec![batch]]).expect("build the table");
+        let runtime = RuntimeEnvBuilder::new()
+            .with_memory_pool(tracked_query_memory_pool(
+                160 * 1024 * 1024,
+                NonZeroUsize::new(5).expect("non-zero"),
+            ))
+            .with_disk_manager_builder(
+                DiskManagerBuilder::default().with_mode(DiskManagerMode::Disabled),
+            )
+            .build_arc()
+            .expect("build the runtime");
+        // One partition: one aggregate emitting one batch, and one sort.
+        let ctx = SessionContext::new_with_config_rt(
+            SessionConfig::new().with_target_partitions(1),
+            runtime,
+        );
+        ctx.register_table("t", Arc::new(table))
+            .expect("register the table");
+
+        let sorted = ctx
+            .sql(&format!(
+                "SELECT v % {groups} AS g, sum(v) AS s FROM t GROUP BY g ORDER BY s DESC"
+            ))
+            .await
+            .expect("plan the query")
+            .collect()
+            .await
+            .expect("sort the groups without running out of memory");
+
+        // Group g sums g and g + groups, so the sums run from 3·groups − 2
+        // (the last group) down to groups (group 0), one per group.
+        let mut expected = 3 * groups - 2;
+        for batch in &sorted {
+            for sum in batch.column(1).as_primitive::<Int64Type>().values() {
+                assert_eq!(*sum, expected);
+                expected -= 2;
+            }
+        }
+        assert_eq!(expected, groups - 2, "every group's sum, in order");
+    }
+
+    /// Streams one batch through the results cache with a query pool of
+    /// `pool_size`; returns whether the result was stored, the rows streamed
+    /// and the bytes still reserved.
+    async fn cache_one_batch(batch: RecordBatch, pool_size: usize) -> (bool, usize, usize) {
+        use cache::QueryResultsCacheProvider;
+        use cache::key::RawCacheKey;
+        use datafusion::common::TableReference;
+        use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
+        use futures::TryStreamExt;
+        use std::collections::HashSet;
+
+        let memory = pool(pool_size);
+        let provider = Arc::new(
+            QueryResultsCacheProvider::try_new(
+                &spicepod::component::caching::SQLResultsCacheConfig {
+                    item_ttl: Some("10m".to_string()),
+                    ..Default::default()
+                },
+                Box::new([]),
+            )
+            .expect("valid cache provider"),
+        );
+        let key = RawCacheKey::new(46);
+        let schema = batch.schema();
+        let rows = cache::to_cached_record_batch_stream(
+            Arc::clone(&provider),
+            Box::pin(RecordBatchStreamAdapter::new(
+                schema,
+                futures::stream::iter([Ok(batch)]),
+            )),
+            key,
+            Arc::new(HashSet::from([TableReference::bare("t")])),
+            std::time::Instant::now(),
+            None,
+            &memory,
+        )
+        .try_collect::<Vec<_>>()
+        .await
+        .expect("the stream yields no errors")
+        .iter()
+        .map(RecordBatch::num_rows)
+        .sum();
+        let stored = provider
+            .get_raw_key(&key)
+            .await
+            .expect("cache access should succeed")
+            .is_some();
+        (stored, rows, memory.reserved())
+    }
+
+    /// The results cache gives up a held result when refused, so it must not
+    /// take the headroom kept for consumers that fail the query when refused.
+    #[tokio::test]
+    async fn a_held_results_cache_copy_cannot_take_the_unspillable_headroom() {
+        let schema = Arc::new(Schema::new(vec![Field::new("v", DataType::Int64, false)]));
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![Arc::new(Int64Array::from_iter_values(0..100_000))],
+        )
+        .expect("build the batch");
+        let result_size = arrow_tools::record_batch::compacted_memory_size(&batch);
+        // The result fits in this pool, but not under its spillable cap.
+        let pool_size = result_size + spillable_headroom_bytes(result_size) / 2;
+        assert!(pool_size - spillable_headroom_bytes(pool_size) < result_size);
+
+        assert_eq!(
+            cache_one_batch(batch.clone(), 2 * result_size).await,
+            (true, 100_000, 0),
+            "a result under the spillable cap is cached"
+        );
+        assert_eq!(
+            cache_one_batch(batch, pool_size).await,
+            (false, 100_000, 0),
+            "a result over the spillable cap is not cached"
+        );
+    }
+}

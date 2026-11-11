@@ -15,6 +15,10 @@ limitations under the License.
 */
 
 #![recursion_limit = "256"]
+#![expect(
+    clippy::expect_used,
+    reason = "set-up and helpers outside `#[test]` functions fail fast with `expect`"
+)]
 
 #[cfg(all(feature = "databricks", feature = "delta_lake"))]
 use arrow::array::RecordBatch;

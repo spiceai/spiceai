@@ -1,0 +1,74 @@
+tests:
+  search:
+    - spicepod_path: test/spicepods/search/conteb/covid_qa/full_text_search-cayenne[file].yaml
+      runner_type: spiceai-dev-runners
+      ready_wait: 1800
+    - spicepod_path: test/spicepods/search/conteb/covid_qa/model2vec[potion-multilingual-128M]-cayenne[file].yaml
+      runner_type: spiceai-dev-runners
+      ready_wait: 1800
+    - spicepod_path: test/spicepods/search/conteb/covid_qa/hybrid[model2vec[potion-multilingual-128M]]-cayenne[file].yaml
+      runner_type: spiceai-dev-runners
+      ready_wait: 1800
+    - spicepod_path: test/spicepods/search/conteb/esg_reports/full_text_search-cayenne[file].yaml
+      runner_type: spiceai-dev-runners
+      ready_wait: 1800
+    - spicepod_path: test/spicepods/search/conteb/esg_reports/model2vec[potion-multilingual-128M]-cayenne[file].yaml
+      runner_type: spiceai-dev-runners
+      ready_wait: 1800
+    - spicepod_path: test/spicepods/search/conteb/esg_reports/hybrid[model2vec[potion-multilingual-128M]]-cayenne[file].yaml
+      runner_type: spiceai-dev-runners
+      ready_wait: 1800
+    - spicepod_path: test/spicepods/search/conteb/football/full_text_search-cayenne[file].yaml
+      runner_type: spiceai-dev-runners
+      ready_wait: 1800
+    - spicepod_path: test/spicepods/search/conteb/football/model2vec[potion-multilingual-128M]-cayenne[file].yaml
+      runner_type: spiceai-dev-runners
+      ready_wait: 1800
+    - spicepod_path: test/spicepods/search/conteb/football/hybrid[model2vec[potion-multilingual-128M]]-cayenne[file].yaml
+      runner_type: spiceai-dev-runners
+      ready_wait: 1800
+    - spicepod_path: test/spicepods/search/conteb/geography/full_text_search-cayenne[file].yaml
+      runner_type: spiceai-dev-runners
+      ready_wait: 1800
+    - spicepod_path: test/spicepods/search/conteb/geography/model2vec[potion-multilingual-128M]-cayenne[file].yaml
+      runner_type: spiceai-dev-runners
+      ready_wait: 1800
+    - spicepod_path: test/spicepods/search/conteb/geography/hybrid[model2vec[potion-multilingual-128M]]-cayenne[file].yaml
+      runner_type: spiceai-dev-runners
+      ready_wait: 1800
+    - spicepod_path: test/spicepods/search/conteb/insurance/full_text_search-cayenne[file].yaml
+      runner_type: spiceai-dev-runners
+      ready_wait: 1800
+    - spicepod_path: test/spicepods/search/conteb/insurance/model2vec[potion-multilingual-128M]-cayenne[file].yaml
+      runner_type: spiceai-dev-runners
+      ready_wait: 1800
+    - spicepod_path: test/spicepods/search/conteb/insurance/hybrid[model2vec[potion-multilingual-128M]]-cayenne[file].yaml
+      runner_type: spiceai-dev-runners
+      ready_wait: 1800
+    - spicepod_path: test/spicepods/search/conteb/mldr/full_text_search-cayenne[file].yaml
+      runner_type: spiceai-dev-runners
+      ready_wait: 1800
+    - spicepod_path: test/spicepods/search/conteb/mldr/model2vec[potion-multilingual-128M]-cayenne[file].yaml
+      runner_type: spiceai-dev-runners
+      ready_wait: 1800
+    - spicepod_path: test/spicepods/search/conteb/mldr/hybrid[model2vec[potion-multilingual-128M]]-cayenne[file].yaml
+      runner_type: spiceai-dev-runners
+      ready_wait: 1800
+    - spicepod_path: test/spicepods/search/conteb/narrative_qa/full_text_search-cayenne[file].yaml
+      runner_type: spiceai-dev-runners
+      ready_wait: 1800
+    - spicepod_path: test/spicepods/search/conteb/narrative_qa/model2vec[potion-multilingual-128M]-cayenne[file].yaml
+      runner_type: spiceai-dev-runners
+      ready_wait: 1800
+    - spicepod_path: test/spicepods/search/conteb/narrative_qa/hybrid[model2vec[potion-multilingual-128M]]-cayenne[file].yaml
+      runner_type: spiceai-dev-runners
+      ready_wait: 1800
+    - spicepod_path: test/spicepods/search/conteb/squad/full_text_search-cayenne[file].yaml
+      runner_type: spiceai-dev-runners
+      ready_wait: 1800
+    - spicepod_path: test/spicepods/search/conteb/squad/model2vec[potion-multilingual-128M]-cayenne[file].yaml
+      runner_type: spiceai-dev-runners
+      ready_wait: 1800
+    - spicepod_path: test/spicepods/search/conteb/squad/hybrid[model2vec[potion-multilingual-128M]]-cayenne[file].yaml
+      runner_type: spiceai-dev-runners
+      ready_wait: 1800

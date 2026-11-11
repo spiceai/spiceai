@@ -36,12 +36,15 @@ use arrow::array::{RecordBatch, StringArray, UInt64Array};
 use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use cayenne::ddl::operations::{self, create_schema, create_table, drop_table};
 use datafusion::catalog::CatalogProviderList;
+use datafusion::common::utils::quote_identifier;
 use datafusion::error::{DataFusionError, Result as DFResult};
 use datafusion::execution::TaskContext;
 use datafusion::physical_expr::{EquivalenceProperties, Partitioning};
 use datafusion::physical_plan::execution_plan::{Boundedness, EmissionType};
 use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
-use datafusion::physical_plan::{DisplayAs, DisplayFormatType, ExecutionPlan, PlanProperties};
+use datafusion::physical_plan::{
+    DisplayAs, DisplayFormatType, Distribution, ExecutionPlan, PlanProperties,
+};
 use datafusion_ddl::arrow_datatype_to_sql;
 use futures::StreamExt;
 
@@ -237,6 +240,17 @@ impl ExecutionPlan for DistributedCayenneCreateTableExec {
     fn properties(&self) -> &Arc<PlanProperties> {
         &self.properties
     }
+    fn apply_expressions(
+        &self,
+        _f: &mut dyn FnMut(
+            &Arc<dyn datafusion::physical_plan::PhysicalExpr>,
+        ) -> datafusion::error::Result<
+            datafusion::common::tree_node::TreeNodeRecursion,
+        >,
+    ) -> datafusion::error::Result<datafusion::common::tree_node::TreeNodeRecursion> {
+        Ok(datafusion::common::tree_node::TreeNodeRecursion::Continue)
+    }
+
     fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> {
         vec![]
     }
@@ -258,6 +272,7 @@ impl ExecutionPlan for DistributedCayenneCreateTableExec {
         let arrow_schema = Arc::clone(&self.params.arrow_schema);
         let primary_key = self.params.primary_key.clone();
         let partition_expr_sql = self.params.partition_expr_sql.clone();
+        let cluster_by = self.params.cluster_by.clone();
         let if_not_exists = self.params.if_not_exists;
         let like_source_table = self.params.like_source_table.clone();
         let ctx_opt = self.params.ctx.clone();
@@ -296,6 +311,7 @@ impl ExecutionPlan for DistributedCayenneCreateTableExec {
                     arrow_schema,
                     primary_key,
                     partition_expr_sql: partition_expr_sql.clone(),
+                    cluster_by: cluster_by.clone(),
                     if_not_exists,
                     like_source_table: like_source_table.clone(),
                     ctx: ctx_opt,
@@ -305,7 +321,7 @@ impl ExecutionPlan for DistributedCayenneCreateTableExec {
             )
             .await?;
 
-            let table_ref = datafusion::sql::TableReference::full(
+            let table_ref = datafusion::common::TableReference::full(
                 catalog_name.clone(),
                 schema_name.clone(),
                 table_name.clone(),
@@ -347,9 +363,21 @@ impl ExecutionPlan for DistributedCayenneCreateTableExec {
                         .join(", ");
                     table_elements.push(format!("PRIMARY KEY ({pk_cols})"));
                 }
+                let cluster_by_sql = if cluster_by.is_empty() {
+                    String::new()
+                } else {
+                    format!(
+                        " CLUSTER BY ({})",
+                        cluster_by
+                            .iter()
+                            .map(|column| quote_identifier(column).to_string())
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    )
+                };
                 let ddl_sql = format!(
                     "CREATE TABLE IF NOT EXISTS \
-                     \"{catalog_name}\".\"{schema_name}\".\"{table_name}\" ({})",
+                     \"{catalog_name}\".\"{schema_name}\".\"{table_name}\" ({}){cluster_by_sql}",
                     table_elements.join(", ")
                 );
 
@@ -491,6 +519,17 @@ impl ExecutionPlan for DistributedCayenneDropTableExec {
     fn properties(&self) -> &Arc<PlanProperties> {
         &self.properties
     }
+    fn apply_expressions(
+        &self,
+        _f: &mut dyn FnMut(
+            &Arc<dyn datafusion::physical_plan::PhysicalExpr>,
+        ) -> datafusion::error::Result<
+            datafusion::common::tree_node::TreeNodeRecursion,
+        >,
+    ) -> datafusion::error::Result<datafusion::common::tree_node::TreeNodeRecursion> {
+        Ok(datafusion::common::tree_node::TreeNodeRecursion::Continue)
+    }
+
     fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> {
         vec![]
     }
@@ -629,6 +668,17 @@ impl ExecutionPlan for DistributedCayenneCreateSchemaExec {
     fn properties(&self) -> &Arc<PlanProperties> {
         &self.properties
     }
+    fn apply_expressions(
+        &self,
+        _f: &mut dyn FnMut(
+            &Arc<dyn datafusion::physical_plan::PhysicalExpr>,
+        ) -> datafusion::error::Result<
+            datafusion::common::tree_node::TreeNodeRecursion,
+        >,
+    ) -> datafusion::error::Result<datafusion::common::tree_node::TreeNodeRecursion> {
+        Ok(datafusion::common::tree_node::TreeNodeRecursion::Continue)
+    }
+
     fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> {
         vec![]
     }
@@ -696,7 +746,7 @@ impl ExecutionPlan for DistributedCayenneCreateSchemaExec {
 // ── DistributedCayenneDeleteExec ──────────────────────────────────────────────
 
 pub struct DistributedCayenneDeleteExec {
-    table_name: datafusion::sql::TableReference,
+    table_name: datafusion::common::TableReference,
     executor_registry: Arc<ExecutorRegistry>,
     filter_sql: Option<String>,
     input: Arc<dyn ExecutionPlan>,
@@ -715,7 +765,7 @@ impl fmt::Debug for DistributedCayenneDeleteExec {
 impl DistributedCayenneDeleteExec {
     #[must_use]
     pub fn new(
-        table_name: datafusion::sql::TableReference,
+        table_name: datafusion::common::TableReference,
         executor_registry: Arc<ExecutorRegistry>,
         filter_sql: Option<String>,
         input: Arc<dyn ExecutionPlan>,
@@ -745,6 +795,17 @@ impl ExecutionPlan for DistributedCayenneDeleteExec {
     fn properties(&self) -> &Arc<PlanProperties> {
         &self.properties
     }
+    fn apply_expressions(
+        &self,
+        _f: &mut dyn FnMut(
+            &Arc<dyn datafusion::physical_plan::PhysicalExpr>,
+        ) -> datafusion::error::Result<
+            datafusion::common::tree_node::TreeNodeRecursion,
+        >,
+    ) -> datafusion::error::Result<datafusion::common::tree_node::TreeNodeRecursion> {
+        Ok(datafusion::common::tree_node::TreeNodeRecursion::Continue)
+    }
+
     fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> {
         vec![&self.input]
     }
@@ -792,7 +853,7 @@ impl ExecutionPlan for DistributedCayenneDeleteExec {
 // ── DistributedCayenneUpdateExec ──────────────────────────────────────────────
 
 pub struct DistributedCayenneUpdateExec {
-    table_name: datafusion::sql::TableReference,
+    table_name: datafusion::common::TableReference,
     executor_registry: Arc<ExecutorRegistry>,
     filter_sql: Option<String>,
     assignments_sql: Vec<(String, String)>,
@@ -811,7 +872,7 @@ impl fmt::Debug for DistributedCayenneUpdateExec {
 impl DistributedCayenneUpdateExec {
     #[must_use]
     pub fn new(
-        table_name: datafusion::sql::TableReference,
+        table_name: datafusion::common::TableReference,
         executor_registry: Arc<ExecutorRegistry>,
         filter_sql: Option<String>,
         assignments_sql: Vec<(String, String)>,
@@ -843,6 +904,17 @@ impl ExecutionPlan for DistributedCayenneUpdateExec {
     fn properties(&self) -> &Arc<PlanProperties> {
         &self.properties
     }
+    fn apply_expressions(
+        &self,
+        _f: &mut dyn FnMut(
+            &Arc<dyn datafusion::physical_plan::PhysicalExpr>,
+        ) -> datafusion::error::Result<
+            datafusion::common::tree_node::TreeNodeRecursion,
+        >,
+    ) -> datafusion::error::Result<datafusion::common::tree_node::TreeNodeRecursion> {
+        Ok(datafusion::common::tree_node::TreeNodeRecursion::Continue)
+    }
+
     fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> {
         vec![&self.input]
     }
@@ -902,7 +974,7 @@ impl ExecutionPlan for DistributedCayenneUpdateExec {
 // ── DistributedCayenneInsertExec ──────────────────────────────────────────────
 
 pub struct DistributedCayenneInsertExec {
-    table_name: datafusion::sql::TableReference,
+    table_name: datafusion::common::TableReference,
     executor_registry: Arc<ExecutorRegistry>,
     ctx: Arc<datafusion::prelude::SessionContext>,
     io_runtime: tokio::runtime::Handle,
@@ -921,7 +993,7 @@ impl fmt::Debug for DistributedCayenneInsertExec {
 impl DistributedCayenneInsertExec {
     #[must_use]
     pub fn new(
-        table_name: datafusion::sql::TableReference,
+        table_name: datafusion::common::TableReference,
         executor_registry: Arc<ExecutorRegistry>,
         ctx: Arc<datafusion::prelude::SessionContext>,
         io_runtime: tokio::runtime::Handle,
@@ -953,8 +1025,27 @@ impl ExecutionPlan for DistributedCayenneInsertExec {
     fn properties(&self) -> &Arc<PlanProperties> {
         &self.properties
     }
+    fn apply_expressions(
+        &self,
+        _f: &mut dyn FnMut(
+            &Arc<dyn datafusion::physical_plan::PhysicalExpr>,
+        ) -> datafusion::error::Result<
+            datafusion::common::tree_node::TreeNodeRecursion,
+        >,
+    ) -> datafusion::error::Result<datafusion::common::tree_node::TreeNodeRecursion> {
+        Ok(datafusion::common::tree_node::TreeNodeRecursion::Continue)
+    }
+
     fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> {
         vec![&self.input]
+    }
+    // One output partition forwards the whole input, so the input must arrive
+    // as one partition.
+    fn required_input_distribution(&self) -> Vec<Distribution> {
+        vec![Distribution::SinglePartition]
+    }
+    fn benefits_from_input_partitioning(&self) -> Vec<bool> {
+        vec![false]
     }
     fn with_new_children(
         self: Arc<Self>,
@@ -1007,7 +1098,6 @@ impl ExecutionPlan for DistributedCayenneInsertExec {
                     "INSERT on '{table_name}' cannot be forwarded: table has no partition expression"
                 )));
             };
-            let input_schema = input.schema();
             let child_stream = input.execute(partition, task_ctx)?;
             let row_count = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
             let row_counter = Arc::clone(&row_count);
@@ -1041,7 +1131,6 @@ impl ExecutionPlan for DistributedCayenneInsertExec {
                 Arc::clone(&ctx),
                 io_runtime,
                 &table_name,
-                &input_schema,
                 counting_stream,
                 &[partition_expr],
             )
@@ -1068,8 +1157,8 @@ impl ExecutionPlan for DistributedCayenneInsertExec {
 // ── DistributedCayenneMergeExec ───────────────────────────────────────────────
 
 pub struct DistributedCayenneMergeExec {
-    target_table: datafusion::sql::TableReference,
-    source_table: datafusion::sql::TableReference,
+    target_table: datafusion::common::TableReference,
+    source_table: datafusion::common::TableReference,
     on_keys: Vec<(String, String)>,
     original_sql: String,
     executor_registry: Arc<ExecutorRegistry>,
@@ -1089,8 +1178,8 @@ impl fmt::Debug for DistributedCayenneMergeExec {
 impl DistributedCayenneMergeExec {
     #[must_use]
     pub fn new(
-        target_table: datafusion::sql::TableReference,
-        source_table: datafusion::sql::TableReference,
+        target_table: datafusion::common::TableReference,
+        source_table: datafusion::common::TableReference,
         on_keys: Vec<(String, String)>,
         original_sql: String,
         executor_registry: Arc<ExecutorRegistry>,
@@ -1128,6 +1217,17 @@ impl ExecutionPlan for DistributedCayenneMergeExec {
     fn properties(&self) -> &Arc<PlanProperties> {
         &self.properties
     }
+    fn apply_expressions(
+        &self,
+        _f: &mut dyn FnMut(
+            &Arc<dyn datafusion::physical_plan::PhysicalExpr>,
+        ) -> datafusion::error::Result<
+            datafusion::common::tree_node::TreeNodeRecursion,
+        >,
+    ) -> datafusion::error::Result<datafusion::common::tree_node::TreeNodeRecursion> {
+        Ok(datafusion::common::tree_node::TreeNodeRecursion::Continue)
+    }
+
     fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> {
         vec![]
     }
@@ -1179,8 +1279,8 @@ impl ExecutionPlan for DistributedCayenneMergeExec {
 async fn validate_partition_compatibility(
     registry: &ExecutorRegistry,
     ctx: &datafusion::prelude::SessionContext,
-    target_table: &datafusion::sql::TableReference,
-    source_table: &datafusion::sql::TableReference,
+    target_table: &datafusion::common::TableReference,
+    source_table: &datafusion::common::TableReference,
     on_keys: &[(String, String)],
 ) -> DFResult<()> {
     use datafusion::sql::sqlparser::ast::{Expr as SqlExpr, Visit, Visitor};
@@ -1269,4 +1369,61 @@ async fn validate_partition_compatibility(
         )));
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    use arrow::array::Int64Array;
+    use datafusion::config::ConfigOptions;
+    use datafusion::datasource::memory::MemorySourceConfig;
+    use datafusion::physical_optimizer::PhysicalOptimizerRule;
+    use datafusion::physical_optimizer::ensure_requirements::EnsureRequirements;
+    use datafusion::physical_plan::ExecutionPlanProperties;
+    use datafusion::physical_plan::union::UnionExec;
+    use object_store::memory::InMemory;
+    use runtime_cluster::PartitionStore;
+    use runtime_cluster::cluster_state::ClusterStateStore;
+
+    /// An input of several partitions reaches the distributed insert as one,
+    /// so the insert forwards every row, not only its input's first partition.
+    #[tokio::test]
+    async fn a_distributed_insert_reads_its_whole_input() {
+        let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)]));
+        let source = |ids: Vec<i64>| {
+            let batch =
+                RecordBatch::try_new(Arc::clone(&schema), vec![Arc::new(Int64Array::from(ids))])
+                    .expect("batch");
+            MemorySourceConfig::try_new_exec(&[vec![batch]], Arc::clone(&schema), None)
+                .expect("source") as Arc<dyn ExecutionPlan>
+        };
+        let input = UnionExec::try_new(vec![source(vec![1, 2]), source(vec![3])]).expect("union");
+        assert_eq!(input.output_partitioning().partition_count(), 2);
+
+        let cluster = Arc::new(ClusterStateStore::new(Arc::new(InMemory::new()), ""));
+        let registry = Arc::new(ExecutorRegistry::new(
+            Arc::new(PartitionStore::accelerations(Arc::clone(&cluster))),
+            Arc::new(PartitionStore::catalog(cluster)),
+        ));
+        let insert: Arc<dyn ExecutionPlan> = Arc::new(DistributedCayenneInsertExec::new(
+            datafusion::common::TableReference::bare("t"),
+            registry,
+            Arc::new(datafusion::prelude::SessionContext::new()),
+            tokio::runtime::Handle::current(),
+            input,
+        ));
+        let mut config = ConfigOptions::new();
+        config.execution.target_partitions = 4;
+
+        let planned = EnsureRequirements::new()
+            .optimize(insert, &config)
+            .expect("plan");
+        assert_eq!(
+            planned.children()[0]
+                .output_partitioning()
+                .partition_count(),
+            1
+        );
+    }
 }

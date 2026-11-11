@@ -21,9 +21,12 @@ on:
   workflow_dispatch:
 
 concurrency:
-  # Allow only one workflow per any non-trunk branch.
-  group: ${{ github.workflow }}-${{ github.ref_name }}-${{ github.ref_name == 'trunk' && github.sha || 'any-sha' }}
-  cancel-in-progress: true
+  # A newer run cancels the one in progress for the same pull request, merge group, non-trunk
+  # branch or manually dispatched trunk commit. Trunk pushes share one group and never cancel
+  # the running check on `spiceai-macos-large`: a newer push replaces only the run still waiting.
+  # The trunk commit is the merge-group commit that already passed this workflow.
+  group: ${{ github.workflow }}-${{ github.ref_name }}-${{ (github.ref_name == 'trunk' && github.event_name != 'push') && github.sha || 'any-sha' }}
+  cancel-in-progress: ${{ github.ref_name != 'trunk' || github.event_name != 'push' }}
 
 env:
   CARGO_TERM_COLOR: always
@@ -44,9 +47,10 @@ jobs:
     # Emit the required context on pull requests without running the expensive
     # feature matrix; the real check runs on the merge-group commit.
     if: ${{ github.event_name != 'pull_request' }}
-    runs-on: spiceai-macos
+    runs-on: spiceai-macos-large
+    environment: ci-build
     env:
-      HAS_SPICEIO_SECRET: ${{ secrets.UNAS_SMB_PASS != '' }}
+      HAS_SPICEIO_SECRET: ${{ secrets.SMB_PASSWORD != '' }}
 
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -60,14 +64,19 @@ jobs:
       - name: Set up spiceio
         if: runner.os == 'macOS' && env.HAS_SPICEIO_SECRET == 'true'
         id: setup-spiceio
-        uses: spiceai/spiceio/.github/actions/setup@2ad4a874ff4813f8190117bc645af0dbb90b708c # v0.8.0
+        uses: spiceai/spiceio/.github/actions/setup@dd13a600d4af72fb179563000674f76812208534 # v0.11.0 assets; no gh; strips Authorization on cross-host redirect
         with:
           smb-url: smb://runner@192.168.3.148/ai_platform_dev
-          smb-pass: ${{ secrets.UNAS_SMB_PASS }}
+          smb-pass: ${{ secrets.SMB_PASSWORD }}
           token: ${{ github.token }}
           bucket: sccache
           region: us-west-1
           immutable-objects: "true"
+          otel-endpoint: spicehq/spiceio
+          otel-api-key: ${{ secrets.SCP_SPICEHQ_SPICEIO_API_KEY }}
+          otel-region: us-west-2
+          instance-id: ci-${{ github.run_id }}-${{ github.job }}
+          machine: ${{ runner.name }}
 
       - name: Set up make
         uses: ./.github/actions/setup-make
@@ -77,7 +86,7 @@ jobs:
 
       - name: Check if sccache can be set up
         run: |
-          if [ -z "${{ secrets.TEST_MINIO_ENDPOINT }}" ]; then
+          if [ -z "${{ vars.TEST_MINIO_ENDPOINT }}" ]; then
             echo "SCCACHE_SETUP=false" >> $GITHUB_ENV
             echo "RUSTC_WRAPPER=" >> $GITHUB_ENV
           else
@@ -89,10 +98,7 @@ jobs:
         if: runner.os == 'macOS' && env.SCCACHE_SETUP == 'true' && steps.setup-spiceio.outputs.endpoint != ''
         uses: ./.github/actions/setup-sccache
         with:
-          minio_endpoint: ${{ secrets.TEST_MINIO_ENDPOINT }}
           spiceio_endpoint: ${{ steps.setup-spiceio.outputs.endpoint }}
-          minio_access_key: ${{ secrets.TEST_MINIO_ACCESS_KEY }}
-          minio_secret_key: ${{ secrets.TEST_MINIO_SECRET_KEY }}
 
       - name: Cache cargo-hack binary
         id: cache-cargo-hack
@@ -116,22 +122,30 @@ jobs:
             --exclude-features default,extended_tests,models,cuda,metal,mcp,odbc,release,kafka,iceberg-write,snapshots,tpc-extension,spark,s3_vectors,bedrock,nfs
         env:
           RUSTC_WRAPPER: ${{ env.RUSTC_WRAPPER }}
-          AWS_ACCESS_KEY_ID: ${{ secrets.TEST_MINIO_ACCESS_KEY }}
-          AWS_SECRET_ACCESS_KEY: ${{ secrets.TEST_MINIO_SECRET_KEY }}
 
       - name: Check runtime/openapi feature
         run: cargo check --no-default-features --features runtime/openapi --profile lint
         env:
           RUSTC_WRAPPER: ${{ env.RUSTC_WRAPPER }}
-          AWS_ACCESS_KEY_ID: ${{ secrets.TEST_MINIO_ACCESS_KEY }}
-          AWS_SECRET_ACCESS_KEY: ${{ secrets.TEST_MINIO_SECRET_KEY }}
+
+      # `mcp` is excluded from the powerset above, so nothing else compiles
+      # `runtime-tools` under its own `mcp` feature: it is otherwise only ever built as
+      # part of a graph including `runtime`, which supplies the feature's real
+      # requirements and hides them from the declaration.
+      #
+      # `-p` is what makes this a guard rather than another workspace build. Without it
+      # Cargo selects the workspace `default-members` (`bin/spiced`) and checks that whole
+      # graph, which both costs far more and re-admits the feature unification the check
+      # exists to escape.
+      - name: Check runtime-tools/mcp feature
+        run: cargo check -p runtime-tools --features mcp --profile lint
+        env:
+          RUSTC_WRAPPER: ${{ env.RUSTC_WRAPPER }}
 
       - name: Check snapshots feature
         run: cargo check --no-default-features --features snapshots --profile lint
         env:
           RUSTC_WRAPPER: ${{ env.RUSTC_WRAPPER }}
-          AWS_ACCESS_KEY_ID: ${{ secrets.TEST_MINIO_ACCESS_KEY }}
-          AWS_SECRET_ACCESS_KEY: ${{ secrets.TEST_MINIO_SECRET_KEY }}
 
       - name: Show sccache stats
         if: always() && (runner.os == 'macOS' && env.SCCACHE_SETUP == 'true' && steps.setup-spiceio.outputs.endpoint != '')
@@ -146,9 +160,10 @@ jobs:
         if: always() && runner.os == 'macOS' && steps.setup-spiceio.outputs.pid != ''
         run: kill ${{ steps.setup-spiceio.outputs.pid }} || true
 
+      # Merge-queue checks keep no diagnostic artifacts.
       - name: Upload spiceio logs
-        if: always()
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        if: always() && github.event_name != 'merge_group'
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
         with:
           name: spiceio-features-logs
           path: ${{ runner.temp }}/spiceio.log

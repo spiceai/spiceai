@@ -24,7 +24,7 @@ use tonic::{Request, Response, Status};
 
 use crate::{
     datafusion::request_context_extension::get_current_datafusion,
-    flight::{metrics, traced_ticket, util::attach_cache_metadata},
+    flight::{metrics, server_timing, traced_ticket, util::attach_cache_metadata},
 };
 use runtime_request_context::{AsyncMarker, RequestContext};
 use telemetry::timing::TimedStream;
@@ -40,16 +40,18 @@ pub(crate) async fn handle(
     // planning call the client could not have correlated on. The response
     // carries it back from the request-context middleware, which also reaches
     // the failures.
+    //
+    // The digest is of the ticket as presented, still wrapped: that is the key
+    // `get_flight_info` filed its server time under.
+    let ticket = server_timing::ticket_digest(&request.get_ref().ticket);
     adopt_ticket_trace_id(
         &RequestContext::current(AsyncMarker::new().await),
         &mut request,
     );
 
-    let msg: Any = match Message::decode(&*request.get_ref().ticket) {
-        Ok(msg) => msg,
-        Err(_) => {
-            return Box::pin(do_get_simple(request)).await;
-        }
+    let Ok(msg) = Any::decode(&*request.get_ref().ticket) else {
+        server_timing::time_do_get(ticket).await;
+        return Box::pin(do_get_simple(request)).await;
     };
 
     // The arms below record per-command; a ticket that is not a `Command` reaches
@@ -64,9 +66,11 @@ pub(crate) async fn handle(
 
     match command {
         Command::CommandStatementQuery(command) => {
+            server_timing::time_do_get(ticket).await;
             Box::pin(flightsql::statement_query::do_get(command)).await
         }
         Command::CommandPreparedStatementQuery(command) => {
+            server_timing::time_do_get(ticket).await;
             Box::pin(flightsql::prepared_statement_query::do_get(command)).await
         }
         Command::CommandPreparedStatementUpdate(command) => {
@@ -98,6 +102,7 @@ pub(crate) async fn handle(
             ))
         }
         Command::CommandStatementSubstraitPlan(cmd) => {
+            server_timing::time_do_get(ticket).await;
             Box::pin(flightsql::statement_substrait_plan::do_get(cmd)).await
         }
         Command::CommandGetCrossReference(cmd) => {

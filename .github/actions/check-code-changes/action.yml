@@ -44,14 +44,15 @@ inputs:
         - 'install/**'
         - 'Cargo.toml'
         - 'Cargo.lock'
+        - 'version.txt'
+        - '**/*.snap'
+        - '**/*.proto'
         - 'go.mod'
         - 'go.sum'
         - 'Makefile'
         # Dot-prefixed directories are spelled out literally even though
         # dorny/paths-filter runs picomatch with `dot: true`, so `**` would
-        # reach them: `.ci/clippy.toml` is the config the lint gate actually
-        # reads, and naming it keeps that explicit rather than incidental.
-        - '.ci/**'
+        # reach them: naming them keeps that explicit rather than incidental.
         - '.config/**'
         - '.cargo/**'
         - '**/clippy.toml'
@@ -68,6 +69,18 @@ inputs:
         # The reachability guard's own regression harness runs in `lint-rust`,
         # so a change to it changes what the Rust gate enforces.
         - 'scripts/test_check_module_reachability.py'
+        - 'scripts/check_fork_patches.py'
+        - 'scripts/test_check_fork_patches.py'
+        - 'scripts/check_bench_mysql_load_nulls.py'
+        - 'scripts/test_check_bench_mysql_load_nulls.py'
+        # Imported by the guards above, so it changes what each of them enforces; its
+        # harness runs in `lint-rust` too.
+        - 'scripts/rust_guard_common.py'
+        - 'scripts/test_rust_guard_common.py'
+        # Decides which test binaries `make nextest` builds; its harness runs in `lint-rust`.
+        - 'scripts/nextest_build_targets.py'
+        - 'scripts/test_nextest_build_targets.py'
+        - 'docs/dev/fork_patches.md'
         - 'rust-toolchain'
         - 'rust-toolchain.toml'
 

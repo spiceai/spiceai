@@ -43,9 +43,14 @@ impl ScheduledTask for DatasetRefreshTask {
                 .refresh_table(&dataset.name, None)
                 .await
             {
-                Ok(notifier) => {
-                    if let Some(notifier) = notifier {
-                        notifier.notified().await;
+                Ok(completion) => {
+                    // Abandoned (removal/shutdown) stays Ok. A terminal
+                    // one-shot failure must fail the scheduled task.
+                    if let Some(completion) = completion {
+                        return super::scheduled_refresh_wait_result(
+                            completion.wait().await,
+                            &dataset.name,
+                        );
                     }
                     Ok(())
                 }

@@ -44,17 +44,57 @@ use datafusion::{
 ///
 /// Returns an error if schema conversion or expression simplification fails.
 pub fn simplify_expr(expr: Expr, schema: &SchemaRef) -> Result<Expr, DataFusionError> {
-    let df_schema = DFSchema::try_from(schema.as_ref().clone())?;
+    ExprSimplifier::new(simplify_context(schema)?).simplify(expr)
+}
 
-    // Set query_execution_start_time so that NOW() and other time-dependent
-    // functions can be evaluated during simplification
-    let simplify_context = SimplifyContext::builder()
+/// Type-coerce and then simplify a set of expressions for execution against `schema`.
+///
+/// For predicates that never went through the optimizer — a `retention_sql` filter parsed
+/// once at table open, say — this is what makes them executable:
+///
+/// - **One `now()` for the whole set.** [`simplify_expr`] builds its own context per call, so
+///   `now()` in two expressions folds to two different instants. SQL evaluates `now()` once per
+///   statement, so predicates applied together as one conjunction must resolve it together.
+/// - **Coercion first, then folding.** Simplifying `ts < now() - INTERVAL '1 hour'` as parsed
+///   folds it against `now()`'s own type, leaving a `Timestamp(ns)` literal with no timezone
+///   next to a `Timestamp(µs, "UTC")` column. Coercing first puts a cast around the constant
+///   sub-expression, which the simplifier then folds *into* a literal of the column's type —
+///   so the storage layer is handed a comparison it can evaluate directly instead of a cast it
+///   may not be able to reduce.
+///
+/// # Errors
+///
+/// Returns an error if schema conversion, type coercion, or simplification fails.
+pub fn coerce_and_simplify_exprs(
+    exprs: impl IntoIterator<Item = Expr>,
+    schema: &SchemaRef,
+) -> Result<Vec<Expr>, DataFusionError> {
+    let df_schema = Arc::new(DFSchema::try_from(schema.as_ref().clone())?);
+    let simplifier = ExprSimplifier::new(simplify_context_for(Arc::clone(&df_schema)));
+
+    exprs
+        .into_iter()
+        .map(|expr| simplifier.simplify(simplifier.coerce(expr, &df_schema)?))
+        .collect()
+}
+
+/// Build the simplification context for `schema`.
+///
+/// `query_execution_start_time` is set so that `now()` and the other time-dependent functions
+/// resolve during simplification — the only legal way to evaluate them, since
+/// `NowFunc::invoke` always errors.
+fn simplify_context(schema: &SchemaRef) -> Result<SimplifyContext, DataFusionError> {
+    Ok(simplify_context_for(Arc::new(DFSchema::try_from(
+        schema.as_ref().clone(),
+    )?)))
+}
+
+/// [`simplify_context`] for a schema that has already been converted.
+fn simplify_context_for(df_schema: Arc<DFSchema>) -> SimplifyContext {
+    SimplifyContext::builder()
         .with_current_time()
-        .with_schema(Arc::new(df_schema))
-        .build();
-    let simplifier = ExprSimplifier::new(simplify_context);
-
-    simplifier.simplify(expr)
+        .with_schema(df_schema)
+        .build()
 }
 
 /// Combine expressions using a balanced binary tree structure.
@@ -107,11 +147,85 @@ where
     exprs.into_iter().next()
 }
 
+/// Returns `true` if `expr` cannot be evaluated as a physical expression against
+/// a single scan's schema, and so must stay above the scan for the logical
+/// optimizer to rewrite.
+///
+/// A `TableProvider` reporting such a filter as pushed down (`Exact` or
+/// `Inexact`) lets `push_down_filter` write it into `TableScan::filters` before
+/// decorrelation has run. `create_physical_expr` has no arm for any of these
+/// variants, so the statement then fails at physical planning with
+/// "Physical plan does not support logical expression …". Reporting
+/// [`datafusion::logical_expr::TableProviderFilterPushDown::Unsupported`]
+/// instead leaves the expression above the scan, which is where decorrelation
+/// puts it anyway — a subquery becomes a semi-join over the scan, and the scan
+/// carries no such filter.
+///
+/// The variant set mirrors `DataFusion`'s own `can_evaluate_as_join_condition`
+/// in `datafusion-optimizer`'s `push_down_filter`, which is exhaustive over
+/// [`Expr`]. It is written as an exhaustive `match` here for the same reason: a
+/// `DataFusion` upgrade that adds a variant is a build failure rather than a
+/// silently mis-planned filter.
+#[must_use]
+pub fn cannot_be_evaluated_at_scan(expr: &Expr) -> bool {
+    use datafusion::common::tree_node::TreeNode;
+
+    #[expect(
+        deprecated,
+        reason = "Expr::Wildcard is deprecated upstream but still a variant this match must cover"
+    )]
+    expr.exists(|e| {
+        Ok(match e {
+            Expr::Exists(_)
+            | Expr::InSubquery(_)
+            | Expr::ScalarSubquery(_)
+            | Expr::SetComparison(_)
+            | Expr::OuterReferenceColumn(_, _)
+            | Expr::Unnest(_) => true,
+            Expr::Alias(_)
+            | Expr::Column(_)
+            | Expr::ScalarVariable(_, _)
+            | Expr::Literal(_, _)
+            | Expr::BinaryExpr(_)
+            | Expr::Like(_)
+            | Expr::SimilarTo(_)
+            | Expr::Not(_)
+            | Expr::IsNotNull(_)
+            | Expr::IsNull(_)
+            | Expr::IsTrue(_)
+            | Expr::IsFalse(_)
+            | Expr::IsUnknown(_)
+            | Expr::IsNotTrue(_)
+            | Expr::IsNotFalse(_)
+            | Expr::IsNotUnknown(_)
+            | Expr::Negative(_)
+            | Expr::Between(_)
+            | Expr::Case(_)
+            | Expr::Cast(_)
+            | Expr::TryCast(_)
+            | Expr::ScalarFunction(_)
+            | Expr::AggregateFunction(_)
+            | Expr::WindowFunction(_)
+            | Expr::InList(_)
+            | Expr::HigherOrderFunction(_)
+            | Expr::Lambda(_)
+            | Expr::LambdaVariable(_)
+            | Expr::Wildcard { .. }
+            | Expr::GroupingSet(_)
+            | Expr::Placeholder(_) => false,
+        })
+    })
+    // `exists` only fails when the closure fails, and this one cannot. Treating
+    // an expression we could not inspect as unevaluable is the safe direction.
+    .unwrap_or(true)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use arrow::datatypes::{DataType, Field, Schema, TimeUnit};
     use datafusion::logical_expr::{Operator, binary_expr, cast, col, lit};
+    use datafusion::prelude::now;
     use datafusion::scalar::ScalarValue;
 
     #[test]
@@ -231,5 +345,47 @@ mod tests {
             simplified.to_string(),
             r#"l_created_at < TimestampMicrosecond(1620000000000000, Some("UTC"))"#
         );
+    }
+
+    /// Every expression in one call must fold `now()` to the same instant: SQL evaluates
+    /// `now()` once per statement, and a conjunction whose halves resolved microseconds apart
+    /// can admit a row that no single instant admits. Building one [`SimplifyContext`] for the
+    /// whole set is what guarantees it — a per-expression context would let the two literals
+    /// drift whenever the clock ticks between them.
+    #[test]
+    fn coerce_and_simplify_exprs_folds_now_to_one_instant_across_expressions() {
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "ts",
+            DataType::Timestamp(TimeUnit::Nanosecond, Some("UTC".into())),
+            false,
+        )]));
+
+        let simplified =
+            coerce_and_simplify_exprs(vec![col("ts").lt(now()), col("ts").gt_eq(now())], &schema)
+                .expect("simplification should succeed");
+
+        let [lower, upper] = simplified.as_slice() else {
+            panic!("two expressions in, two expressions out, got: {simplified:?}");
+        };
+        assert_eq!(
+            literal_operand(lower),
+            literal_operand(upper),
+            "both filters must resolve now() to the same instant"
+        );
+        assert!(
+            !lower.to_string().contains("now()"),
+            "now() must be folded to a literal, got: {lower}"
+        );
+    }
+
+    /// The right-hand literal of a `col <op> literal` comparison.
+    fn literal_operand(expr: &Expr) -> ScalarValue {
+        let Expr::BinaryExpr(binary) = expr else {
+            panic!("expected a binary comparison, got: {expr:?}");
+        };
+        let Expr::Literal(value, _) = binary.right.as_ref() else {
+            panic!("expected a literal right operand, got: {}", binary.right);
+        };
+        value.clone()
     }
 }

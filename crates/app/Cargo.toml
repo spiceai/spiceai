@@ -9,6 +9,7 @@ rust-version.workspace = true
 version.workspace = true
 
 [dependencies]
+percent-encoding.workspace = true
 serde.workspace = true
 snafu.workspace = true
 spicepod = { path = "../spicepod" }
@@ -20,3 +21,6 @@ default = []
 
 [lints]
 workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

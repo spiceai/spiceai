@@ -1,0 +1,30 @@
+# String functions over non-ASCII text, recorded with the answers PostgreSQL
+# and MySQL both give (character counts, not byte counts).
+
+statement ok
+CREATE TABLE s1(id INTEGER PRIMARY KEY, v VARCHAR(32))
+
+statement ok
+INSERT INTO s1 VALUES (1, 'naïve'), (2, 'abc'), (3, ''), (4, NULL), (5, 'ümlaut ü')
+
+query II rowsort
+SELECT id, char_length(v) FROM s1
+----
+1
+5
+2
+3
+3
+0
+4
+NULL
+5
+8
+
+query IT rowsort
+SELECT id, upper(v) FROM s1 WHERE id IN (1, 5)
+----
+1
+NAÏVE
+5
+ÜMLAUT Ü

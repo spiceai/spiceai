@@ -8,7 +8,7 @@ description: "Query: tpcds_q47"
 | Children   | importoexporti #2 | bar          | Unknown        | 2001   | 578177.005000     | 305442.31 | 376300.71 | 339070.99 |
 | Children   | exportiexporti #2 | eing         | Unknown        | 2001   | 565946.785833     | 293446.12 | 359156.61 | 319131.35 |
 | Children   | importoexporti #2 | able         | Unknown        | 2001   | 579741.415833     | 308524.67 | 381218.20 | 328199.08 |
-| Men        | amalgimporto #2   | bar          | Unknown        | 2001   | 571837.581667     | 301201.15 | 368371.44 | 332784.27 |
+| Men        | amalgimporto #2   | bar          | Unknown        | 2001   | 571837.581666     | 301201.15 | 368371.44 | 332784.27 |
 | Women      | exportiamalg #2   | bar          | Unknown        | 2001   | 568817.547500     | 299151.62 | 357495.84 | 322972.37 |
 | Men        | importoimporto #2 | bar          | Unknown        | 2001   | 568587.790000     | 299138.92 | 372390.08 | 330915.28 |
 | Children   | exportiexporti #2 | bar          | Unknown        | 2001   | 564375.638333     | 295607.65 | 360757.08 | 323364.94 |

@@ -18,15 +18,19 @@ limitations under the License.
 // top-level future exceeds rustc's default 128-deep query limit. Matches the `recursion_limit`
 // the `runtime` crate itself and the sibling integration test crates set.
 #![recursion_limit = "256"]
+#![expect(
+    clippy::expect_used,
+    reason = "set-up and helpers outside `#[test]` functions fail fast with `expect`"
+)]
 
 use arrow::{array::RecordBatch, util::display::FormatOptions};
 #[cfg(feature = "mysql")]
 use datafusion::parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 use futures::TryStreamExt;
-#[cfg(feature = "postgres-accel")]
+#[cfg(feature = "postgres")]
 use std::sync::Arc;
 
-#[cfg(feature = "postgres-accel")]
+#[cfg(feature = "postgres")]
 use crate::utils::TEST_REQUEST_CONTEXT;
 
 use runtime::Runtime;
@@ -54,17 +58,6 @@ fn accelerator_crates_register_their_engines() {
         engines.iter().any(|engine| engine == "sqlite"),
         "the sqlite accelerator is not registered in this test binary; linked engines: {engines:?}"
     );
-    #[cfg(feature = "turso")]
-    assert!(
-        engines.iter().any(|engine| engine == "turso"),
-        "the turso accelerator is not registered in this test binary; linked engines: {engines:?}"
-    );
-    #[cfg(feature = "duckdb")]
-    assert!(
-        engines.iter().any(|engine| engine == "duckdb"),
-        "the duckdb accelerator is not registered in this test binary; linked engines: {engines:?}"
-    );
-    #[cfg(not(windows))]
     assert!(
         engines.iter().any(|engine| engine == "cayenne"),
         "the cayenne accelerator is not registered in this test binary; linked engines: {engines:?}"
@@ -78,12 +71,10 @@ mod acceleration;
 mod adbc;
 mod cache;
 mod catalog;
-#[cfg(not(windows))]
 mod cayenne;
-#[cfg(not(windows))]
 mod cayenne_catalog_ddl;
-#[cfg(feature = "duckdb")]
 mod clickbench;
+mod clickhouse;
 mod cluster;
 mod cors;
 #[cfg(feature = "cosmosdb")]
@@ -92,30 +83,20 @@ mod cosmosdb;
 mod databricks_delta;
 #[cfg(all(feature = "delta_lake", feature = "databricks"))]
 mod databricks_delta_catalog;
-#[cfg(all(feature = "delta_lake", feature = "databricks"))]
-mod databricks_delta_catalog_m2m;
-#[cfg(all(feature = "delta_lake", feature = "databricks"))]
-mod databricks_delta_m2m;
 #[cfg(all(feature = "spark", feature = "databricks"))]
 mod databricks_spark;
 #[cfg(all(feature = "spark", feature = "databricks"))]
 mod databricks_spark_catalog;
-#[cfg(all(feature = "spark", feature = "databricks"))]
-mod databricks_spark_catalog_m2m;
-#[cfg(all(feature = "spark", feature = "databricks"))]
-mod databricks_spark_m2m;
 #[cfg(feature = "databricks")]
 mod databricks_sql_warehouse;
-#[cfg(feature = "databricks")]
-mod databricks_sql_warehouse_permissions;
 mod dataset_availability;
 mod datasets_api;
 #[cfg(feature = "delta_lake")]
 mod delta_lake;
 mod docker;
-#[cfg(feature = "duckdb")]
+#[cfg(feature = "adbc")]
 mod duckdb;
-#[cfg(feature = "duckdb")]
+#[cfg(feature = "adbc")]
 mod ducklake;
 #[cfg(feature = "dynamodb")]
 pub mod dynamodb;
@@ -134,8 +115,11 @@ mod iceberg;
 mod iceberg_api;
 mod json;
 
+mod cayenne_catalog_tuning;
+mod cdc_cayenne;
 #[cfg(feature = "debezium")]
 mod cdc_ingest;
+mod cluster_task_history;
 mod cluster_tls_reload;
 #[cfg(feature = "kafka")]
 mod kafka;
@@ -152,38 +136,46 @@ mod mysql;
 mod odbc;
 #[cfg(feature = "oracle")]
 mod oracle;
-#[cfg(not(windows))]
+mod otel_ingest_races;
+mod otel_logs;
 mod otel_restart;
 mod plan_capture;
 #[cfg(feature = "postgres")]
 mod postgres;
 mod prepared_statements;
-#[cfg(feature = "rate-control")]
-mod rate_control;
+#[cfg(any(feature = "mongodb", feature = "dynamodb", feature = "cosmosdb"))]
+mod pushdown_roundtrip;
+mod query_active_count;
+mod query_panic_is_an_error;
 mod ready_state;
 mod refresh_retry;
 mod refresh_sql;
 mod refresh_worker_panic;
+mod reload_start_time_only;
+#[cfg(feature = "sqlite")]
+mod result_correctness;
 mod results_cache;
-#[cfg(all(unix, feature = "duckdb", feature = "postgres"))]
+mod results_cache_warmup;
+#[cfg(all(unix, feature = "postgres"))]
 mod retention;
+mod rustfs;
 mod s3;
+mod s3_folder_marker;
 mod s3_location_pruning;
-#[cfg(any(
-    feature = "postgres",
-    feature = "duckdb",
-    feature = "sqlite",
-    feature = "turso"
-))]
+mod s3_parquet_overwrite;
+#[cfg(any(feature = "postgres", feature = "sqlite"))]
 mod schema_evolution;
 #[cfg(feature = "sharepoint")]
 mod sharepoint;
 #[cfg(feature = "snapshots")]
 mod snapshot_integration;
+#[cfg(feature = "snapshots")]
+mod snapshot_source;
 #[cfg(feature = "snowflake")]
 mod snowflake;
 #[cfg(feature = "snowflake")]
 mod snowflake_catalog;
+mod source_unavailable;
 #[cfg(feature = "spark")]
 mod spark;
 mod spiceai;
@@ -197,10 +189,10 @@ mod utils;
 mod view;
 
 mod management;
-// MySQL is required for the rehydration tests (source container); the
-// local-db verification covers whichever persistent engines are enabled.
 mod podswatcher;
-#[cfg(all(feature = "mysql", any(feature = "duckdb", feature = "sqlite")))]
+// MySQL is required for the rehydration tests (source container); they cover Cayenne,
+// and SQLite when that feature is enabled.
+#[cfg(feature = "mysql")]
 mod rehydration;
 mod shutdown;
 
@@ -220,8 +212,6 @@ fn configure_test_datafusion() {
 
     match DEFAULT_DATAFUSION_CONFIG.write() {
         Ok(mut config) => {
-            config.options_mut().execution.target_partitions = TEST_CPU_CORES;
-
             config.options_mut().execution.coalesce_batches = false;
 
             config.options_mut().optimizer.repartition_joins = false;
@@ -232,10 +222,8 @@ fn configure_test_datafusion() {
 
 /// Pin the process-wide CPU budget to [`TEST_CPU_CORES`].
 ///
-/// Setting `target_partitions` on the default session config is not enough on its
-/// own: with `runtime.query.target_partitions` unset the session builder sizes
-/// partitions from the CPU budget, overwriting whatever the config carried. Both
-/// are pinned to the same constant so they cannot disagree.
+/// Every session sizes `target_partitions` from the CPU budget, so pinning the
+/// budget is what makes plans reproducible across machines.
 ///
 /// Installing is idempotent by intent — the budget is a process-wide `OnceLock`
 /// and all 300-odd callers ask for the same value, so every call after the first
@@ -247,7 +235,7 @@ fn pin_test_cpu_budget() {
         Err(e) => panic!("{TEST_CPU_CORES} must be a valid CPU quantity: {e}"),
     }
 }
-#[cfg(feature = "postgres-accel")]
+#[cfg(feature = "postgres")]
 fn configure_test_datafusion_request_context() {
     match DEFAULT_DATAFUSION_CONFIG.write() {
         Ok(mut config) => config.set_extension(Arc::clone(&TEST_REQUEST_CONTEXT)),
@@ -323,6 +311,11 @@ where
             filters => vec![
                 // Normalize HTTP server ports: http://127.0.0.1:12345 → http://127.0.0.1:<PORT>
                 (r"http://127\.0\.0\.1:\d+", "http://127.0.0.1:<PORT>"),
+                // Docker assigns fixture ports independently for each test instance.
+                (r"(compute_context=host=localhost,port=)\d+(,db=)", "$1<PORT>$2"),
+                // Spark Connect plans include Databricks connection details. Those identify
+                // the test fixture, not the plan being asserted.
+                (r"compute_context=sc://[^ ]+", "compute_context=<DATABRICKS_SPARK_CONNECT>"),
             ],
         }, {
             insta::assert_snapshot!(snapshot_name, explain_plan);

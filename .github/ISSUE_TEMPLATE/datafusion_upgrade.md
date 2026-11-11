@@ -64,46 +64,95 @@ Main Spice PR: _spiceai/spiceai#NNNN_
 
 ## Fork Branch Naming Convention
 
-For all forked dependencies, we use a two-branch strategy:
+For all forked dependencies, we use a two-branch strategy. Both branches are cut from **our own previous line**, and the upstream release is merged *into* the patch branch — the upgrade is a merge, not a replay.
 
-1. **Feature branch** (`spiceai-<version>`): Created directly from the upstream tag (e.g., `51.0.0`). This branch tracks the exact upstream release with no modifications.
-2. **Patch branch** (`spiceai-<version>-patches`): Created from the feature branch. All Spice-specific patches are cherry-picked and applied here.
+1. **Version branch** (`spiceai-<version>`): created from the previous version branch (`spiceai-<X-1>`), so it starts out carrying every Spice patch already on that line, with history intact. Nothing is committed here directly; it only ever moves by merging its `-patches` branch. This is the canonical branch `Cargo.toml` pins once the upgrade lands.
+2. **Patch branch** (`spiceai-<version>-patches`): created from the version branch. The upstream release is merged into it (`git merge <upstream-tag>`) and **every conflict is resolved here**.
+
+### What `<version>` is
+
+`<version>` is whichever upstream forces the re-cut, which is **not always DataFusion**:
+
+| Axis | Forks | Branch |
+| --- | --- | --- |
+| DataFusion major | `datafusion`, `datafusion-ballista`, `datafusion-federation`, `datafusion-table-providers`, `vortex` | `spiceai-55` |
+| Arrow major | `arrow-rs`, `snowflake-rs`, `spark-connect-rs`, `spice-rs` | `spiceai-59` |
+| The fork's own release | `delta-kernel-rs`, `duckdb-rs`, `sea-query` | `spiceai-0.28.0`, `spiceai-1.5.3`, … |
+
+Check the fork's `Cargo.toml` if unsure — a DataFusion-coupled crate keys on DataFusion even though its own version is unrelated (Vortex sits at `0.1.0` on `spiceai-54` → `spiceai-55`). Beware same-string collisions: `arrow-rs`'s `spiceai-55.x` branches are **Arrow 55**, nothing to do with DataFusion 55.
+
+### Why merge rather than cherry-pick
+
+Merging the upstream release into a branch that already carries our patches surfaces each conflict **once**, against the patch it actually conflicts with. A patch upstream did not touch comes across untouched and is never re-examined. `git blame` keeps pointing at the original author, and the diff `spiceai-<X-1>..spiceai-<X>` is exactly "what upstream changed", which is what the post-merge patch audit reads.
+
+Resolve conflicts on `-patches` in as few merge commits as the conflicts require, and record each non-obvious resolution in the merge commit message. Where upstream has **adopted** one of our patches, take upstream's side and note the patch as upstreamed — that is the signal to drop its row from `SPICE_PATCHES.md`.
 
 > **Before forking, check whether a fork is still needed.** If the new upstream release already contains our patches (merged upstream) or the crates.io release works without Spice modifications, depend on the upstream crates.io release directly and skip the `spiceai-<version>` fork for that crate — prefer upstream-direct to reduce fork-maintenance burden. (In the v53 cycle several DataFusion-stack crates — `datafusion`, `datafusion-federation`, `datafusion-table-providers` — were taken from crates.io directly rather than via a `[patch.crates-io]` fork.) If you go upstream-direct, make sure no stale fork `[patch.crates-io]` entry for that crate is left behind.
 
-**CRITICAL: All patches must be cherry-picked individually to the `-patches` branch**, resolving any merge conflicts in the cherry-pick commit itself. This ensures:
-
-- Each patch is a discrete commit that can be tracked and reviewed
-- Conflicts are resolved once and documented in commit history
-- Future upgrades can easily identify which patches need porting
-- Git blame accurately reflects patch authorship
-
-**Example workflow for DataFusion v51:**
+**Example workflow for DataFusion v55:**
 
 ```bash
 # In the spiceai/datafusion fork
+git fetch origin
 git fetch upstream --tags
-git checkout -b spiceai-51 51.0.0           # Create feature branch from upstream tag
-git push origin spiceai-51
 
-git checkout -b spiceai-51-patches spiceai-51  # Create patch branch
+# 1. Version branch, cut from OUR previous line
+git checkout -b spiceai-55 origin/spiceai-54
+git push origin spiceai-55
 
-# Cherry-pick each patch from previous version, resolving conflicts
-git cherry-pick <commit-hash-from-spiceai-50>
-# If conflicts, resolve them and: git cherry-pick --continue
-# Repeat for each patch...
+# 2. Patch branch, cut from the version branch
+git checkout -b spiceai-55-patches spiceai-55
 
-git push origin spiceai-51-patches
+# 3. Merge the upstream release in, resolving conflicts here
+git merge 55.1.0
+# resolve, then: git add -A && git commit
+git push origin spiceai-55-patches
+
+# 4. Open the PR
+gh pr create --repo spiceai/datafusion --base spiceai-55 --head spiceai-55-patches \
+  --title "Merge upstream DataFusion 55.1.0 into spiceai-55"
 ```
 
-**Do NOT squash or batch patches together** - each original patch should remain as a separate cherry-picked commit.
+Enable `git config rerere.enabled true` before starting: a long upgrade re-resolves the same conflicts when a merge is redone or an upstream patch release is taken, and `rerere` replays those resolutions for you.
 
-This allows:
+**Never rebase or force-push a version or patch branch once it is pushed** — other forks and the Spice PR pin commits on it. Move it forward with follow-up commits or another merge.
 
-- Clear tracking of which patches are applied on top of which upstream version
-- Easy rebasing when upstream releases patch versions (e.g., 51.0.1)
-- Individual review of each patch's conflict resolution
-- Simple diff comparison between patch branches across versions
+**Do not merge `-patches` into `spiceai-<version>` until the Spice PR is ready** (see *Merge Order* below). The PR exists from the start so the work is reviewable; it just stays open.
+
+## Merge Order
+
+The fork PRs and the Spice PR land in one sequence. Getting it wrong either strands the forks
+ahead of a Spice branch that cannot yet build, or leaves the Spice PR pinned to commits that
+move under it.
+
+1. **Cut the branches and open every fork PR** (`spiceai-X` ← `spiceai-X-patches`). They stay
+   open — opening early is what makes the work reviewable while it is still changing.
+2. **Pin the Spice `Cargo.toml` at the `-patches` heads** and get the Spice PR green: build,
+   unit tests, integration tests, lint, benchmarks. Every pin here is a `-patches` commit, and
+   it is expected to move as review lands more commits on those branches; re-pin and re-resolve
+   `Cargo.lock` each time.
+3. **Finalize the Spice PR** — approved, all checks green, no further fork changes expected.
+4. **Merge the fork PRs**, in dependency order (see the graph above): `arrow-rs` first, then
+   `datafusion`, then everything that pins through them.
+5. **Re-pin the Spice PR to the merged `spiceai-X` commits.** Never ship a pin to a `-patches`
+   or personal branch — those are working refs and may be deleted or rewritten.
+6. **Merge the Spice PR.** 🎉
+
+Two failure modes this ordering exists to prevent:
+
+- **Merging a fork PR early** moves `spiceai-X` while other forks still pin `-patches`, and can
+  block unrelated PRs on that fork's line.
+- **Shipping a `-patches` pin** leaves `Cargo.toml` referencing a branch nobody maintains once
+  the upgrade closes. `docs/dev/fork_patches.md` records the canonical `spiceai-X` revision, so
+  a `-patches` pin also makes `scripts/check_fork_patches.py` disagree with reality.
+
+### While the upgrade is in flight
+
+The previous line (`spiceai-<X-1>`) usually stays the active development branch, so anything
+merged there after the cut has to be forward-ported to `spiceai-X-patches` — and that queue
+grows the longer the upgrade runs. Decide up front whether to freeze `spiceai-<X-1>` to
+correctness-only fixes, and keep a list of what still needs porting. A fix landed on the old
+line and never ported is indistinguishable, later, from a patch that was never written.
 
 ## Pre-upgrade Tasks
 
@@ -115,30 +164,38 @@ This allows:
 ## Upgrade DataFusion Fork
 
 - [ ] Sync the forked main branch with the upstream repository.
-- [ ] Create a new feature branch named `spiceai-X` from the tagged release `X.Y.Z`:
+- [ ] Enumerate the patches the current line carries, before touching anything — this is the list the merge has to preserve:
 
   ```bash
-  git fetch upstream --tags
-  git checkout -b spiceai-X X.Y.Z
+  git log --oneline <upstream-base-of-X-1>..origin/spiceai-<X-1>
+  ```
+
+- [ ] Create the version branch `spiceai-X` **from the previous version branch**, not from the upstream tag:
+
+  ```bash
+  git checkout -b spiceai-X origin/spiceai-<X-1>
   git push origin spiceai-X
   ```
 
-- [ ] Create a patch branch named `spiceai-X-patches` from `spiceai-X`:
+- [ ] Create the patch branch `spiceai-X-patches` from `spiceai-X`:
 
   ```bash
   git checkout -b spiceai-X-patches spiceai-X
   ```
 
-- [ ] Run `cargo test` to confirm that all upstream tests pass, or make note of which tests fail for reference.
-- [ ] **Cherry-pick each patch individually** from the previous patch branch (`spiceai-<X-1>-patches` or `spiceai-<X-1>`). For every Spice-specific commit after the upstream release commit:
+- [ ] Merge the upstream release into `spiceai-X-patches` and resolve conflicts there:
 
-  1. **Check if merged upstream**: Search the new release for the PR number or commit message. Example: `git log X.Y.Z --oneline --grep="<PR-number-or-keyword>"`
-  2. **If NOT merged upstream**: Cherry-pick the commit individually. Resolve any conflicts and continue: `git cherry-pick <commit-hash>`
-  3. **After each cherry-pick**: Run `cargo test` to confirm no regressions. If tests fail, fix them and amend the cherry-picked commit: `git commit --amend --no-edit`
-  4. **Document skipped patches**: If a patch is no longer needed (merged upstream or obsolete), note it in the PR description
+  ```bash
+  git merge X.Y.Z
+  ```
 
+  For each conflict, decide whether upstream has **adopted** our patch (take upstream, mark the patch upstreamed) or merely moved the code around it (keep ours, adapted). Record the call in the merge commit message.
+
+- [ ] Run `cargo test`. Note any upstream tests that already failed before the merge so they are not mistaken for regressions.
+- [ ] Update the fork's `SPICE_PATCHES.md` on `-patches`: every patch marked **present**, **upstreamed** (cite the upstream code) or **consciously dropped** (with the rationale).
 - [ ] Push `spiceai-X-patches` and record the commit hash for `Cargo.toml`.
-- [ ] If there are no commits that need to be cherry-picked, the upstream repository tag can be used directly.
+- [ ] Open the `spiceai-X` ← `spiceai-X-patches` PR and add it to the *Current Upgrade PRs* table. The PR body carries the patch-survival table from the previous step, plus the test that proves each surviving patch still works. **Leave it open** — see *Merge Order*.
+- [ ] If upstream now contains every patch this line carried, the fork is no longer needed: depend on the crates.io release directly and remove the stale `[patch.crates-io]` entry.
 
 ## Forked Dependency Upgrades
 
@@ -147,33 +204,28 @@ The following forked dependencies use DataFusion and/or Arrow and need to be upg
 ### DataFusion Ecosystem Forks
 
 - [ ] **[datafusion-ballista](https://github.com/spiceai/datafusion-ballista)**: Distributed query execution.
-  - Create `spiceai-X` branch from upstream's DataFusion-compatible release/commit.
-  - Create `spiceai-X-patches` branch for Spice patches (TLS support, API key auth, UDF sync).
-  - Cherry-pick patches from `spiceai-<X-1>-patches`.
+  - Cut `spiceai-X` from `spiceai-<X-1>`, then `spiceai-X-patches` from it, and merge upstream's DataFusion-compatible release in (TLS support, API key auth, UDF sync ride along).
   - Update DataFusion dependencies in `ballista-core` and `ballista-scheduler`.
   - Run `cargo test` to confirm compatibility.
   - **Do not merge into the `spice` branch until the main Spice OSS PR is ready to be merged.** Merging sooner can block other PRs.
 
 - [ ] **[datafusion-federation](https://github.com/spiceai/datafusion-federation)**: Query federation support.
   - We maintain this fork separately as our changes are incompatible with upstream.
-  - Create `spiceai-X` branch from the previous `spiceai-<X-1>` branch (not upstream).
-  - Upgrade DataFusion dependencies and resolve breaking changes.
+  - Cut `spiceai-X` from `spiceai-<X-1>`. There is no upstream release to merge — upgrade the DataFusion dependency on `spiceai-X-patches` and resolve breaking changes there.
   - Run tests to confirm compatibility.
 
 - [ ] **[datafusion-table-providers](https://github.com/datafusion-contrib/datafusion-table-providers)**: SQL database table providers.
-  - Create `spiceai-X` branch from upstream's DataFusion-compatible release.
-  - Create `spiceai-X-patches` for Spice-specific features.
+  - Cut `spiceai-X` from `spiceai-<X-1>`, then `spiceai-X-patches`, and merge upstream's DataFusion-compatible release in.
   - **Do not merge into the `spiceai` branch until the main Spice OSS PR is ready to be merged.** Merging sooner can block other PRs.
 
 - [ ] **[vortex](https://github.com/spiceai/vortex)**: Compressed array format with DataFusion integration.
-  - Create `spiceai-X` branch from upstream's DataFusion-compatible release.
+  - Cut `spiceai-X` from `spiceai-<X-1>`, then `spiceai-X-patches`, and merge the upstream release in. Vortex keys on the **DataFusion** major even though its own version stays `0.1.0`.
   - The `vortex-datafusion` crate must be compatible with the new DataFusion version.
   - Note: Vortex uses `version = "0.1.0"` in their Cargo.toml regardless of release, so we cannot use `[patch.crates-io]` and must specify git dependencies directly.
 
 - [ ] **[iceberg-rust](https://github.com/spiceai/iceberg-rust)**: Apache Iceberg support.
-  - Create `spiceai-<iceberg-version>` branch from upstream's Iceberg release tag (e.g., `v0.8.0`).
+  - Cut `spiceai-<iceberg-version>` from the previous Iceberg line, then `-patches`, and merge the upstream Iceberg release tag (e.g., `v0.8.0`) in.
   - The `iceberg-datafusion` crate within this repository needs to be compatible with the new DataFusion version.
-  - Cherry-pick any Spice-specific patches.
 
 ### Arrow Ecosystem Forks
 
@@ -182,22 +234,17 @@ If DataFusion upgraded Arrow, the following crates should be upgraded:
 > Note: an Arrow-only fork (e.g. `duckdb-rs`) may temporarily lag one Arrow major behind the main stack during a transition. This is acceptable **only** if that crate's Arrow types stay isolated behind a conversion boundary and never cross into the new-Arrow stack — confirm the isolation rather than forcing a same-day bump. Watch for the inverse trap too: a `[patch.crates-io] arrow = ...` rev that still resolves to the *old* Arrow major is inert for the new stack (crates.io wins) and only patches the lagging fork — bump the fork branch to the new major and re-point, or drop the patch.
 
 - [ ] **[arrow-rs](https://github.com/spiceai/arrow-rs)**: Core Arrow implementation.
-  - Create `spiceai-<arrow-major>` branch from upstream tag (e.g., `spiceai-57` from `57.1.0`).
-  - Cherry-pick any Spice-specific patches from previous branch.
+  - Cut `spiceai-<arrow-major>` from the previous Arrow line (e.g. `spiceai-59` from `spiceai-58`), then `-patches`, and merge the upstream tag (e.g. `59.2.0`) in.
   - All arrow-* crates and parquet must use the same revision.
 
 - [ ] **[duckdb-rs](https://github.com/spiceai/duckdb-rs)**: DuckDB Rust bindings with Arrow support.
-  - Create `spiceai-<arrow-major>` branch (e.g., `spiceai-57`).
-  - Update arrow dependencies to match new version.
-  - Cherry-pick Spice patches (connection pool improvements, etc.).
+  - Cut from the previous line and merge upstream in; update arrow dependencies to match the new version. Note this fork keys on its **own** DuckDB release (`spiceai-1.5.3`), not the Arrow major.
 
 - [ ] **[delta-kernel-rs](https://github.com/spiceai/delta-kernel-rs)**: Delta Lake kernel.
-  - Create `spiceai-<delta-version>` branch from upstream tag.
-  - Update arrow dependencies to match new version.
+  - Cut `spiceai-<delta-version>` from the previous Delta line, then `-patches`, and merge the upstream tag in; update arrow dependencies to match the new version.
 
 - [ ] **[snowflake-rs](https://github.com/spiceai/snowflake-rs)**: Snowflake connector.
-  - Create `spiceai-<arrow-major>` branch.
-  - Update arrow dependencies to match new version.
+  - Cut from the previous Arrow line, then `-patches`, and merge upstream in; update arrow dependencies to match the new version.
 
 - [ ] **[spark-connect-rs](https://github.com/spiceai/spark-connect-rs)**: Spark Connect client.
   - Create or update branch with compatible arrow version.
@@ -237,9 +284,13 @@ These forks may not require changes for every DataFusion upgrade but should be v
     - Removed deprecated methods
 - [ ] Verify no duplicate major versions linger in `Cargo.lock`: `cargo tree -d -i datafusion` and `cargo tree -d -i arrow`. A transitive consumer can pin the previous major and silently pull a second DataFusion/Arrow tree (e.g. `geodatafusion` held DataFusion on the old major during the v53 cycle). Bump/pin or drop the offending crate until a single major remains.
 - [ ] Run all tests using `make build-cli nextest` to verify that all functionality is working as expected and snapshots have not changed.
-- [ ] Create a pull request with the changes.
+- [ ] Create a pull request with the changes, pinned at the `-patches` heads.
 - [ ] Ensure all CI checks pass.
 - [ ] Build the branch version and test with test operator, updating snapshots if needed.
+- [ ] Finalize the Spice PR — approved, green, no further fork changes expected (*Merge Order* step 3).
+- [ ] Merge the fork PRs in dependency order (*Merge Order* step 4).
+- [ ] **Re-pin `Cargo.toml` to the merged `spiceai-X` commits**, never a `-patches` or personal branch, and re-resolve `Cargo.lock`.
+- [ ] Update `docs/dev/fork_patches.md` with the merged revisions and confirm `scripts/check_fork_patches.py` exits 0 — it fails the build when a pin moves without the ledger following it, which is what catches a patch dropped in the merge.
 - [ ] Merge PR. 🎉
 
 ## Post-Merge Verification

@@ -266,9 +266,13 @@ mod tests {
                   mode: on_disk
             ",
         );
-        assert!(
-            result.is_err(),
-            "an unrecognized mode must fail rather than silently fall back to memory"
+        // An unrecognized mode must fail rather than silently fall back to memory,
+        // and the error must list the modes the user can choose from.
+        assert_eq!(
+            result
+                .expect_err("an unknown mode must be rejected")
+                .to_string(),
+            "unknown variant `on_disk`, expected one of `memory`, `file`, `file_create`, `file_update`"
         );
     }
 
@@ -281,9 +285,12 @@ mod tests {
                 acceleration: {}
             ",
         );
-        assert!(
-            result.is_err(),
-            "refresh_mode must be required, not defaulted"
+        // refresh_mode must be required, not defaulted.
+        assert_eq!(
+            result
+                .expect_err("an acceleration block without refresh_mode must be rejected")
+                .to_string(),
+            "missing field `refresh_mode`"
         );
     }
 
@@ -298,7 +305,13 @@ mod tests {
                   refresh_mode: changes
             ",
         );
-        assert!(result.is_err(), "only `cayenne` is a supported engine");
+        // Only `cayenne` is a supported engine.
+        assert_eq!(
+            result
+                .expect_err("an unsupported engine must be rejected")
+                .to_string(),
+            "unknown variant `duckdb`, expected `cayenne`"
+        );
     }
 
     #[test]
@@ -311,9 +324,12 @@ mod tests {
                   refresh_mode: full
             ",
         );
-        assert!(
-            result.is_err(),
-            "full refresh is out of scope for catalog-level acceleration"
+        // Full refresh is out of scope for catalog-level acceleration.
+        assert_eq!(
+            result
+                .expect_err("refresh_mode: full must be rejected for a catalog")
+                .to_string(),
+            "unknown variant `full`, expected `changes`"
         );
     }
 
@@ -328,9 +344,12 @@ mod tests {
                   on_missing_primary_key: skip
             ",
         );
-        assert!(
-            result.is_err(),
-            "on_missing_primary_key was removed; missing a primary key is always an error"
+        // on_missing_primary_key was removed; missing a primary key is always an error.
+        assert_eq!(
+            result
+                .expect_err("the removed on_missing_primary_key field must be rejected")
+                .to_string(),
+            "unknown field `on_missing_primary_key`, expected one of `engine`, `refresh_mode`, `mode`, `params`"
         );
     }
 

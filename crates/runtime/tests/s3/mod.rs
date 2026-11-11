@@ -27,7 +27,10 @@ use spicepod::{
     param::{ParamValue, Params},
 };
 
-use crate::{configure_test_datafusion, init_tracing, utils::test_request_context};
+use crate::{
+    configure_test_datafusion, init_tracing,
+    utils::{aws_session_token_param, test_request_context},
+};
 
 pub fn get_s3_dataset(s3_uri: &str, name: &str) -> Dataset {
     let mut dataset = Dataset::new(s3_uri, name);
@@ -415,6 +418,12 @@ async fn s3_schema_source_path_authenticated() -> Result<(), anyhow::Error> {
                     "s3_secret".to_string(),
                     ParamValue::String("${secrets:NEW_AWS_DATABRICKS_DELTA_SECRET_ACCESS_KEY}".to_string()),
                 );
+                if let Some((param, value)) = aws_session_token_param(
+                    "s3_session_token",
+                    "NEW_AWS_DATABRICKS_DELTA_SESSION_TOKEN",
+                ) {
+                    params.data.insert(param, ParamValue::String(value));
+                }
                 params.data.insert(
                     "s3_region".to_string(),
                     ParamValue::String("us-east-1".to_string()),
@@ -461,7 +470,7 @@ async fn s3_schema_source_path_authenticated() -> Result<(), anyhow::Error> {
 
             let schema = arrow::util::pretty::pretty_format_batches(&batches)
             .map_err(|e| anyhow::Error::msg(e.to_string()))?;
-            insta::assert_snapshot!(format!("s3_schema_source_path_authenticated_parts"), schema);
+            insta::assert_snapshot!("s3_schema_source_path_authenticated_parts", schema);
 
             Ok(())
         })

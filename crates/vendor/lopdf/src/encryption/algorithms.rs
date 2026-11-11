@@ -422,7 +422,7 @@ impl PasswordAlgorithm {
             let mut owner_encrypted = self.owner_encrypted.clone();
             let mut decryptor = Aes256CbcDec::new(&key.into(), &iv.into());
 
-            for block in owner_encrypted.chunks_exact_mut(16) {
+            for block in owner_encrypted.as_chunks_mut::<16>().0 {
                 decryptor.decrypt_block(aes_block_mut(block));
             }
 
@@ -452,7 +452,7 @@ impl PasswordAlgorithm {
             let mut user_encrypted = self.user_encrypted.clone();
             let mut decryptor = Aes256CbcDec::new(&key.into(), &iv.into());
 
-            for block in user_encrypted.chunks_exact_mut(16) {
+            for block in user_encrypted.as_chunks_mut::<16>().0 {
                 decryptor.decrypt_block(aes_block_mut(block));
             }
 
@@ -542,7 +542,7 @@ impl PasswordAlgorithm {
 
             let mut encryptor = Aes128CbcEnc::new(key.into(), iv.into());
 
-            for block in k1.chunks_exact_mut(16) {
+            for block in k1.as_chunks_mut::<16>().0 {
                 encryptor.encrypt_block(aes_block_mut(block));
             }
 
@@ -975,7 +975,7 @@ impl PasswordAlgorithm {
         let mut user_encrypted = file_encryption_key.to_vec();
         let mut encryptor = Aes256CbcEnc::new(&key.into(), &iv.into());
 
-        for block in user_encrypted.chunks_exact_mut(16) {
+        for block in user_encrypted.as_chunks_mut::<16>().0 {
             encryptor.encrypt_block(aes_block_mut(block));
         }
 
@@ -1035,7 +1035,7 @@ impl PasswordAlgorithm {
         let mut owner_encrypted = file_encryption_key.to_vec();
         let mut encryptor = Aes256CbcEnc::new(&key.into(), &iv.into());
 
-        for block in owner_encrypted.chunks_exact_mut(16) {
+        for block in owner_encrypted.as_chunks_mut::<16>().0 {
             encryptor.encrypt_block(aes_block_mut(block));
         }
 
@@ -1075,7 +1075,7 @@ impl PasswordAlgorithm {
 
         let mut encryptor = Aes256EbcEnc::new(&key.into());
 
-        for block in bytes.chunks_exact_mut(16) {
+        for block in bytes.as_chunks_mut::<16>().0 {
             encryptor.encrypt_block(aes_block_mut(block));
         }
 
@@ -1174,7 +1174,7 @@ impl PasswordAlgorithm {
 
         let mut decryptor = Aes256EbcDec::new(&key.into());
 
-        for block in bytes.chunks_exact_mut(16) {
+        for block in bytes.as_chunks_mut::<16>().0 {
             decryptor.decrypt_block(aes_block_mut(block));
         }
 

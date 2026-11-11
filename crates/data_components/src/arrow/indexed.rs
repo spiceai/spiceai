@@ -56,10 +56,17 @@ pub struct SecondaryIndex {
     pub name: String,
     /// Column names that form the index key.
     pub columns: Vec<String>,
-    /// Whether this index enforces uniqueness.
+    /// Whether the index was declared `unique`. Not enforced: the index serves
+    /// lookups the same way either, and a repeated key disables it (see
+    /// [`SecondaryIndex::is_usable`]) rather than being rejected.
     pub unique: bool,
-    /// The hash index itself.
+    /// The hash index itself. It holds one row per key, so it is only probed
+    /// while [`SecondaryIndex::is_usable`].
     pub index: Arc<HashIndex>,
+    /// Cleared when a rebuild finds a repeated key, so a lookup scans the table
+    /// instead of answering with one of the key's rows; set again by a rebuild
+    /// that finds the keys distinct.
+    usable: Arc<AtomicBool>,
 }
 
 impl SecondaryIndex {
@@ -71,7 +78,14 @@ impl SecondaryIndex {
             columns,
             unique,
             index,
+            usable: Arc::new(AtomicBool::new(true)),
         }
+    }
+
+    /// Whether lookups may use this index: the last rebuild found every key in one row.
+    #[must_use]
+    pub fn is_usable(&self) -> bool {
+        self.usable.load(Ordering::Acquire)
     }
 
     /// Returns the column names this index is built on.
@@ -79,6 +93,36 @@ impl SecondaryIndex {
     pub fn columns(&self) -> &[String] {
         &self.columns
     }
+}
+
+const HASH_INDEX_DOCS: &str = "https://spiceai.org/docs/features/data-acceleration/hash-index";
+
+/// The warning a dataset gets when a rebuild cannot use one of its secondary indexes.
+fn index_unusable_warning(dataset: &str, columns: &[String], cause: &dyn fmt::Display) -> String {
+    format!(
+        "Dataset '{dataset}' (arrow): the index on ({}) cannot be used, so lookups on it read the whole table until a refresh changes the data. Cause: {cause}. See: {HASH_INDEX_DOCS}",
+        columns.join(", ")
+    )
+}
+
+/// The warning an Arrow acceleration gets when it declares a `unique` index.
+///
+/// Arrow treats a `unique` index like `enabled`: it does not reject a repeated row on
+/// write, and an index over repeated values stops serving lookups. Said at registration,
+/// as Cayenne does, rather than left for a slow lookup to say.
+#[must_use]
+pub fn unique_index_warning(dataset: &str) -> String {
+    format!(
+        "Dataset '{dataset}' (arrow): a `unique` entry in `indexes` does not constrain writes, so duplicate rows are not rejected. A single-column entry speeds up lookups while its values are distinct, and while a value repeats, lookups on it read the whole table; a compound entry is not used for lookups. Set `primary_key` with `on_conflict` to deduplicate on a column set. See: {HASH_INDEX_DOCS}"
+    )
+}
+
+/// The notice a dataset gets when a rebuild makes a disabled secondary index usable again.
+fn index_usable_again_notice(dataset: &str, columns: &[String]) -> String {
+    format!(
+        "Dataset '{dataset}' (arrow): the index on ({}) serves lookups again",
+        columns.join(", ")
+    )
 }
 
 /// A `MemTable` enhanced with a SIMD-optimized hash index for fast point lookups.
@@ -97,6 +141,8 @@ pub struct IndexedMemTable {
     primary_key_columns: Vec<String>,
     /// Secondary indexes on non-primary key columns.
     secondary_indexes: Vec<SecondaryIndex>,
+    /// Names the table in log messages about its indexes.
+    table_name: Option<String>,
     /// Whether the hash index(es) may be stale relative to the underlying data.
     ///
     /// Set conservatively at plan time by any DML entry point
@@ -117,6 +163,7 @@ impl Debug for IndexedMemTable {
             .field("indexed", &self.index.is_some())
             .field("primary_key_columns", &self.primary_key_columns)
             .field("secondary_indexes_count", &self.secondary_indexes.len())
+            .field("table_name", &self.table_name)
             .field("dirty", &self.is_dirty())
             .finish()
     }
@@ -195,8 +242,16 @@ impl IndexedMemTable {
             index,
             primary_key_columns,
             secondary_indexes: Vec::new(),
+            table_name: None,
             dirty: AtomicBool::new(false),
         })
+    }
+
+    /// Names the table in log messages about its indexes.
+    #[must_use]
+    pub fn with_table_name(mut self, table_name: impl Into<String>) -> Self {
+        self.table_name = Some(table_name.into());
+        self
     }
 
     /// Returns true if the index may be stale relative to the underlying data.
@@ -365,14 +420,53 @@ impl IndexedMemTable {
             })?;
         }
 
-        // Rebuild secondary indexes
+        // A secondary index holds one row per key, so it is rebuilt strictly: data
+        // with a repeated key leaves it unusable, and lookups on it scan the table
+        // until a rebuild finds the keys distinct again. Logged on each change of
+        // state only, since the rebuild runs after every refresh.
+        let dataset = self.table_name.as_deref().unwrap_or("<unnamed>");
         for secondary in &self.secondary_indexes {
-            secondary.index.rebuild(&partitions).map_err(|e| {
-                DataFusionError::Execution(format!(
-                    "Failed to rebuild secondary index '{}': {e}",
-                    secondary.name
-                ))
-            })?;
+            // A compound index is built but never probed (see `find_secondary_index_match`),
+            // so a repeated key costs it nothing and warrants no warning.
+            if secondary.columns.len() != 1 {
+                secondary.index.rebuild(&partitions).map_err(|e| {
+                    DataFusionError::Execution(format!(
+                        "Failed to rebuild secondary index '{}': {e}",
+                        secondary.name
+                    ))
+                })?;
+                continue;
+            }
+            let was_usable = secondary.is_usable();
+            match secondary.index.rebuild_strict(&partitions) {
+                Ok(()) => {
+                    secondary.usable.store(true, Ordering::Release);
+                    if !was_usable {
+                        tracing::info!(
+                            "{}",
+                            index_usable_again_notice(dataset, &secondary.columns)
+                        );
+                    }
+                }
+                Err(
+                    cause @ (hash_index::Error::DuplicateKey
+                    | hash_index::Error::HashCollision { .. }),
+                ) => {
+                    secondary.usable.store(false, Ordering::Release);
+                    if was_usable {
+                        tracing::warn!(
+                            "{}",
+                            index_unusable_warning(dataset, &secondary.columns, &cause)
+                        );
+                    }
+                }
+                Err(e) => {
+                    return Err(DataFusionError::Execution(format!(
+                        "Failed to rebuild secondary index '{}': {e}",
+                        secondary.name
+                    )));
+                }
+            }
         }
 
         Ok(())
@@ -436,8 +530,9 @@ impl IndexedMemTable {
 
     /// Finds a secondary index that can be used for the given filters.
     ///
-    /// Returns the matching secondary index and the key value if a single-column
-    /// secondary index matches an equality predicate in the filters.
+    /// Returns the matching secondary index and the key value if a usable (see
+    /// [`SecondaryIndex::is_usable`]) single-column secondary index matches an
+    /// equality predicate in the filters.
     ///
     /// # Limitations
     ///
@@ -452,7 +547,7 @@ impl IndexedMemTable {
         for secondary in &self.secondary_indexes {
             // Only support single-column secondary indexes for now.
             // Multi-column secondary indexes are built but not used for optimization yet.
-            if secondary.columns.len() != 1 {
+            if secondary.columns.len() != 1 || !secondary.is_usable() {
                 continue;
             }
 
@@ -470,6 +565,16 @@ impl IndexedMemTable {
     #[must_use]
     pub fn with_on_conflict(mut self, on_conflict: OnConflict) -> Self {
         self.inner = self.inner.with_on_conflict(on_conflict);
+        self
+    }
+
+    /// Configures how `on_conflict` upsert resolves duplicate primary keys within one write.
+    #[must_use]
+    pub fn with_upsert_options(
+        mut self,
+        upsert_options: datafusion_table_providers::util::constraints::UpsertOptions,
+    ) -> Self {
+        self.inner = self.inner.with_upsert_options(upsert_options);
         self
     }
 
@@ -743,74 +848,67 @@ impl TableProvider for IndexedMemTable {
             )));
         }
 
-        // Check if we can use a secondary index for lookup
-        // Note: Secondary indexes with unique=true work like primary key lookups (single result)
-        // Non-unique secondary indexes still provide fast lookup but may have collisions
+        // A usable secondary index holds one row per key (a repeated key disables it
+        // at rebuild), so this is the same single-row probe as the primary key's.
+        // `find_secondary_index_match` returns only usable single-column indexes.
         if let (true, Some((secondary, key_value))) =
             (index_usable, self.find_secondary_index_match(filters))
         {
             tracing::debug!(
                 secondary_index_name = %secondary.name,
                 secondary_columns = ?secondary.columns,
-                secondary_unique = secondary.unique,
                 "Found secondary index match"
             );
-            // Only use indexed lookup for unique secondary indexes
-            // Non-unique indexes would need multi-value support which hash-index doesn't provide yet
-            // Also verify this is a single-column index since verification below only checks first column
-            if secondary.unique && secondary.columns.len() == 1 {
-                let hash = key_value.hash();
-                let index_columns = secondary.columns.clone();
+            let hash = key_value.hash();
+            let index_columns = secondary.columns.clone();
 
-                if let Some(location) = secondary.index.get_by_hash(hash) {
-                    if let Some(batch) = self.get_row_at_location(location).await? {
-                        // Verify the actual key matches (handle hash collisions)
-                        // SAFETY: We already verified secondary.columns.len() == 1 above
-                        let index_column = &secondary.columns[0];
-                        if key_value.matches_batch(&batch, index_column) {
-                            let result_batch = if let Some(proj) = projection {
-                                batch.project(proj)?
-                            } else {
-                                batch
-                            };
+            if let Some(location) = secondary.index.get_by_hash(hash) {
+                if let Some(batch) = self.get_row_at_location(location).await? {
+                    // Verify the actual key matches (handle hash collisions)
+                    // `find_secondary_index_match` returns only single-column indexes.
+                    let index_column = &secondary.columns[0];
+                    if key_value.matches_batch(&batch, index_column) {
+                        let result_batch = if let Some(proj) = projection {
+                            batch.project(proj)?
+                        } else {
+                            batch
+                        };
 
-                            let schema = result_batch.schema();
-                            let stream = futures::stream::once(async move { Ok(result_batch) });
-                            let stream = RecordBatchStreamAdapter::new(Arc::clone(&schema), stream);
+                        let schema = result_batch.schema();
+                        let stream = futures::stream::once(async move { Ok(result_batch) });
+                        let stream = RecordBatchStreamAdapter::new(Arc::clone(&schema), stream);
 
-                            return Ok(Arc::new(IndexedLookupExec::new(
-                                schema,
-                                Box::pin(stream),
-                                index_columns,
-                                true,
-                            )));
-                        }
-                        // Hash collision - fall through to return empty
-                        tracing::debug!(
-                            hash = hash,
-                            index_name = %secondary.name,
-                            "Hash collision detected during secondary index lookup"
-                        );
+                        return Ok(Arc::new(IndexedLookupExec::new(
+                            schema,
+                            Box::pin(stream),
+                            index_columns,
+                            true,
+                        )));
                     }
+                    // Hash collision - fall through to return empty
+                    tracing::debug!(
+                        hash = hash,
+                        index_name = %secondary.name,
+                        "Hash collision detected during secondary index lookup"
+                    );
                 }
-
-                // Key not found - return empty result
-                let schema = if let Some(proj) = projection {
-                    Arc::new(self.schema().project(proj)?)
-                } else {
-                    self.schema()
-                };
-                let stream = futures::stream::empty();
-                let stream = RecordBatchStreamAdapter::new(Arc::clone(&schema), stream);
-
-                return Ok(Arc::new(IndexedLookupExec::new(
-                    schema,
-                    Box::pin(stream),
-                    index_columns,
-                    false,
-                )));
             }
-            // Non-unique secondary indexes fall through to full table scan
+
+            // Key not found - return empty result
+            let schema = if let Some(proj) = projection {
+                Arc::new(self.schema().project(proj)?)
+            } else {
+                self.schema()
+            };
+            let stream = futures::stream::empty();
+            let stream = RecordBatchStreamAdapter::new(Arc::clone(&schema), stream);
+
+            return Ok(Arc::new(IndexedLookupExec::new(
+                schema,
+                Box::pin(stream),
+                index_columns,
+                false,
+            )));
         }
 
         // Fall back to regular MemTable scan
@@ -896,6 +994,20 @@ impl TableProvider for IndexedMemTable {
         // Truncate removes all rows; every stored RowLocation is now invalid.
         self.mark_dirty();
         self.inner.truncate(state).await
+    }
+
+    async fn merge_into(
+        &self,
+        state: &dyn Session,
+        source: Arc<dyn ExecutionPlan>,
+        merge_schema: datafusion::common::DFSchemaRef,
+        on: datafusion::prelude::Expr,
+        clauses: Vec<datafusion::logical_expr::dml::MergeIntoClause>,
+    ) -> datafusion::error::Result<Arc<dyn ExecutionPlan>> {
+        self.mark_dirty();
+        self.inner
+            .merge_into(state, source, merge_schema, on, clauses)
+            .await
     }
 }
 
@@ -1015,6 +1127,17 @@ impl ExecutionPlan for IndexedLookupExec {
         &self.properties
     }
 
+    fn apply_expressions(
+        &self,
+        _f: &mut dyn FnMut(
+            &Arc<dyn datafusion::physical_plan::PhysicalExpr>,
+        ) -> datafusion::error::Result<
+            datafusion::common::tree_node::TreeNodeRecursion,
+        >,
+    ) -> datafusion::error::Result<datafusion::common::tree_node::TreeNodeRecursion> {
+        Ok(datafusion::common::tree_node::TreeNodeRecursion::Continue)
+    }
+
     fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> {
         vec![]
     }
@@ -1063,6 +1186,35 @@ impl ExecutionPlan for IndexedLookupExec {
     fn metrics(&self) -> Option<datafusion::physical_plan::metrics::MetricsSet> {
         Some(self.metrics.clone_inner())
     }
+
+    /// An exact row count: a primary-key probe returns the one row it matched or
+    /// nothing at all, and `output_rows` is set from that outcome at
+    /// construction, so `Precision::Exact` is provable here rather than an
+    /// estimate.
+    ///
+    /// It has to be reported for the optimizer to act on it. `EnforceDistribution`
+    /// decides whether round-robin repartitioning is worthwhile from
+    /// `partition_statistics().num_rows`, and reads `Precision::Absent` as
+    /// "worthwhile" — so a plan that does not answer fans a single-row scan
+    /// across every partition, paying task spawns at execution and extra
+    /// planning time in each pass that walks the larger tree.
+    fn partition_statistics(
+        &self,
+        partition: Option<usize>,
+    ) -> Result<Arc<datafusion::common::Statistics>> {
+        if let Some(idx) = partition {
+            let partition_count = self.properties().partitioning.partition_count();
+            if idx >= partition_count {
+                return Err(DataFusionError::Internal(format!(
+                    "Invalid partition index {idx}, the partition count is {partition_count}"
+                )));
+            }
+        }
+
+        let mut statistics = datafusion::common::Statistics::new_unknown(&self.schema);
+        statistics.num_rows = datafusion::common::stats::Precision::Exact(self.output_rows);
+        Ok(Arc::new(statistics))
+    }
 }
 
 #[cfg(test)]
@@ -1070,6 +1222,7 @@ mod tests {
     use super::*;
     use arrow::array::{Int64Array, StringArray};
     use arrow::datatypes::{DataType, Field, Schema};
+    use datafusion::physical_plan::statistics::{StatisticsArgs, StatisticsContext};
     use datafusion::prelude::*;
 
     fn create_test_batch(ids: Vec<i64>, names: Vec<&str>) -> RecordBatch {
@@ -1159,6 +1312,7 @@ mod tests {
             index,
             primary_key_columns,
             secondary_indexes: Vec::new(),
+            table_name: None,
             dirty: AtomicBool::new(false),
         })
     }
@@ -1426,6 +1580,13 @@ mod tests {
         )
         .expect("failed to create table");
 
+        // A freshly built table carries no constraints; the primary key below is the only one.
+        assert_eq!(
+            table.constraints(),
+            Some(&Constraints::default()),
+            "a new table must start without constraints"
+        );
+
         // Add primary key constraint
         let constraints = Constraints::new_unverified(vec![Constraint::PrimaryKey(vec![0])]);
         let table = table
@@ -1433,7 +1594,18 @@ mod tests {
             .await
             .expect("failed to add constraints");
 
-        assert!(table.constraints().is_some());
+        assert_eq!(
+            table.constraints(),
+            Some(&Constraints::new_unverified(vec![Constraint::PrimaryKey(
+                vec![0]
+            )])),
+            "the primary key constraint must be applied to the table"
+        );
+        assert_eq!(
+            table.index().map(|index| index.len()),
+            Some(300),
+            "adding the constraint must keep the primary key index over every row"
+        );
     }
 
     /// Test that `Unique` constraints are filtered out and don't cause errors.
@@ -1492,8 +1664,14 @@ mod tests {
             .await
             .expect("failed to add constraints");
 
-        // The table should have constraints (the PrimaryKey was preserved)
-        assert!(table.constraints().is_some());
+        // Exactly the PrimaryKey reaches the table: it is preserved and the Unique is dropped.
+        assert_eq!(
+            table.constraints(),
+            Some(&Constraints::new_unverified(vec![Constraint::PrimaryKey(
+                vec![0]
+            )])),
+            "only the primary key constraint may be applied; the unique constraint must be filtered out"
+        );
     }
 
     #[tokio::test]
@@ -1735,6 +1913,64 @@ mod tests {
         SessionContext::new_with_config(
             datafusion::prelude::SessionConfig::new().with_target_partitions(4),
         )
+    }
+
+    /// A primary-key probe knows its own cardinality, and the optimizer relies
+    /// on it: see `partition_statistics` on `IndexedLookupExec`.
+    #[tokio::test]
+    async fn test_indexed_lookup_reports_exact_row_count() {
+        let batch = create_large_test_batch(300);
+        let table = create_test_indexed_table_force_index(
+            batch.schema(),
+            vec![vec![batch]],
+            vec!["id".to_string()],
+        )
+        .expect("failed to create table");
+        let ctx = SessionContext::new();
+        let session_state = ctx.state();
+
+        for (id, expected) in [(7_i64, 1_usize), (30_000_i64, 0_usize)] {
+            let filter = col("id").eq(lit(id));
+            let plan = table
+                .scan(&session_state, None, std::slice::from_ref(&filter), None)
+                .await
+                .expect("scan");
+            let stats = StatisticsContext::new()
+                .compute(plan.as_ref(), &StatisticsArgs::new())
+                .expect("statistics");
+            assert_eq!(
+                stats.num_rows,
+                datafusion::common::stats::Precision::Exact(expected),
+                "id = {id} should report exactly {expected} row(s)"
+            );
+        }
+    }
+
+    /// The reason the row count above is worth reporting: without it
+    /// `EnforceDistribution` repartitions a single-row scan across every
+    /// partition.
+    #[tokio::test]
+    async fn test_point_lookup_plan_has_no_repartition() {
+        let batch = create_large_test_batch(300);
+        let table = create_test_indexed_table_force_index(
+            batch.schema(),
+            vec![vec![batch]],
+            vec!["id".to_string()],
+        )
+        .expect("failed to create table");
+        let ctx = SessionContext::new_with_config(SessionConfig::new().with_target_partitions(8));
+        ctx.register_table("test_table", Arc::new(table))
+            .expect("failed to register");
+
+        let plan = explain_plan(&ctx, "SELECT * FROM test_table WHERE id = 7").await;
+        assert!(
+            plan.contains("IndexedLookupExec"),
+            "expected the primary-key probe to survive planning. Got:\n{plan}"
+        );
+        assert!(
+            !plan.contains("RepartitionExec"),
+            "a single-row probe should not be repartitioned across partitions. Got:\n{plan}"
+        );
     }
 
     async fn explain_plan(ctx: &SessionContext, sql: &str) -> String {
@@ -2196,15 +2432,34 @@ mod tests {
         )
         .expect("failed to create table");
 
-        // Test direct lookup for each key
-        for name in &names {
-            let result = table.get_by_key(&(*name).to_string()).await;
-            assert!(
-                result.is_ok(),
-                "Lookup should not error for unicode key: {name:?}"
+        // Each key must resolve to its own row: `get_by_key` does not re-check the key after the
+        // hash lookup, so the stored name and id are what prove no two keys were mixed up.
+        for (name, expected_id) in names.iter().zip(&ids) {
+            let batch = table
+                .get_by_key(&(*name).to_string())
+                .await
+                .unwrap_or_else(|e| panic!("lookup for unicode key {name:?} failed: {e}"))
+                .unwrap_or_else(|| panic!("unicode key {name:?} should be found"));
+            assert_eq!(
+                batch.num_rows(),
+                1,
+                "lookup for {name:?} must return exactly one row"
             );
-            let batch = result.expect("lookup failed");
-            assert!(batch.is_some(), "Unicode key {name:?} should be found");
+            let found_name = batch
+                .column(0)
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .expect("name column is Utf8");
+            let found_id = batch
+                .column(1)
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .expect("id column is Int64");
+            assert_eq!(
+                (found_name.value(0), found_id.value(0)),
+                (*name, *expected_id),
+                "lookup for {name:?} returned the wrong row"
+            );
         }
     }
 
@@ -2315,16 +2570,22 @@ mod tests {
         )
         .expect("failed to create batch");
 
-        // Creating indexed table with duplicates should fail
-        let result = create_test_indexed_table_force_index(
+        // The production constructor must refuse the repeated key 2 rather than index one of its
+        // two rows and hide the other from point lookups.
+        let err = IndexedMemTable::try_new_with_parallelism(
             schema,
             vec![vec![batch]],
             vec!["id".to_string()],
-        );
-
+            Some(1),
+        )
+        .expect_err("duplicate primary keys should be rejected for data integrity");
         assert!(
-            result.is_err(),
-            "Duplicate primary keys should be rejected for data integrity"
+            matches!(
+                &err,
+                DataFusionError::Execution(message)
+                    if message == "Failed to build hash index: Duplicate key detected"
+            ),
+            "the repeated key must be reported as a duplicate key, got: {err:?}"
         );
     }
 
@@ -2409,7 +2670,7 @@ mod tests {
     }
 
     /// Test concurrent reads don't cause data races.
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn test_data_correctness_concurrent_reads() {
         let batch = create_large_test_batch(1000);
         let schema = batch.schema();
@@ -2419,20 +2680,39 @@ mod tests {
                 .expect("failed to create table"),
         );
 
-        // Spawn multiple concurrent lookups
+        // Ten tasks on a multi-threaded runtime look up disjoint key ranges in parallel; every
+        // lookup must return that key's own row.
         let mut handles = Vec::new();
-        for i in 0..10 {
+        for task in 0..10_i64 {
             let table_clone = Arc::clone(&table);
             handles.push(tokio::spawn(async move {
-                for key in (i * 100)..(i * 100 + 100) {
-                    let result = table_clone
-                        .get_by_key(&i64::from(key))
+                for key in (task * 100)..(task * 100 + 100) {
+                    let row = table_clone
+                        .get_by_key(&key)
                         .await
-                        .expect("lookup failed");
-
-                    if key < 1000 {
-                        assert!(result.is_some(), "Key {key} should exist");
-                    }
+                        .expect("lookup failed")
+                        .unwrap_or_else(|| panic!("key {key} should exist"));
+                    assert_eq!(
+                        row.num_rows(),
+                        1,
+                        "key {key} must resolve to exactly one row"
+                    );
+                    let id = row
+                        .column(0)
+                        .as_any()
+                        .downcast_ref::<Int64Array>()
+                        .expect("id column is Int64");
+                    let name = row
+                        .column(1)
+                        .as_any()
+                        .downcast_ref::<StringArray>()
+                        .expect("name column is Utf8");
+                    let expected_name = format!("name_{key}");
+                    assert_eq!(
+                        (id.value(0), name.value(0)),
+                        (key, expected_name.as_str()),
+                        "key {key} returned the wrong row"
+                    );
                 }
             }));
         }
@@ -3618,5 +3898,29 @@ mod tests {
             .await
             .expect("maintenance failed");
         assert!(!table.is_dirty());
+    }
+
+    /// A log line a user acts on names the dataset, links the docs, and stays on one line.
+    #[test]
+    fn index_messages_name_the_dataset_and_link_the_docs() {
+        let columns = vec!["sender_id".to_string()];
+        let warning = index_unusable_warning("senders", &columns, &hash_index::Error::DuplicateKey);
+        assert!(warning.contains("'senders'"), "{warning}");
+        assert!(warning.contains("(sender_id)"), "{warning}");
+        assert!(warning.contains("Duplicate key"), "{warning}");
+        assert!(warning.contains("https://spiceai.org/docs"), "{warning}");
+        assert!(!warning.contains('\n'), "{warning}");
+
+        let notice = index_usable_again_notice("senders", &columns);
+        assert!(
+            notice.contains("'senders'") && notice.contains("(sender_id)"),
+            "{notice}"
+        );
+        assert!(!notice.contains('\n'), "{notice}");
+
+        let warning = unique_index_warning("senders");
+        assert!(warning.contains("'senders'"), "{warning}");
+        assert!(warning.contains("https://spiceai.org/docs"), "{warning}");
+        assert!(!warning.contains('\n'), "{warning}");
     }
 }

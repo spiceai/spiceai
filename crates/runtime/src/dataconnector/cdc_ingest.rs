@@ -413,7 +413,7 @@ impl DataConnector for CdcIngest {
                 || matches!(acceleration.engine.to_unpartitioned(), Engine::Arrow),
             super::InvalidConfigurationNoSourceSnafu {
                 dataconnector: "cdc",
-                message: "The CDC ingest connector requires acceleration.primary_key (except for the Arrow engine). Configure primary_key and on_conflict upsert for UPDATE/DELETE apply",
+                message: "The CDC ingest connector requires acceleration.primary_key (except for the Arrow engine). Configure primary_key so UPDATE and DELETE events can be applied",
                 connector_component: ConnectorComponent::from(dataset),
             }
         );

@@ -39,10 +39,9 @@ use runtime_datafusion_udfs::{ai::Ai, embed};
 use runtime_datafusion_udfs::{ai::AI_UDF_NAME, embed::EMBED_UDF_NAME};
 use runtime_query_engine::query_engine::QueryEngine;
 use runtime_search::full_text_udtf::TextSearchTableFunc;
-use runtime_search::rerank::{RERANK_UDTF_NAME, RerankTableFunc};
+use runtime_search::rerank::{RERANK_UDTF_NAME, RerankModelStores, RerankTableFunc};
 use runtime_search::rrf;
 use runtime_search::rrf::RRF_UDF_NAME;
-use runtime_search::search_engine::parse_explicit_primary_keys;
 use runtime_search::udtf::{TEXT_SEARCH_UDTF_NAME, VECTOR_SEARCH_UDTF_NAME};
 use runtime_secrets::{ExposeSecret, get_params_with_secrets};
 #[cfg(not(feature = "models"))]
@@ -89,7 +88,8 @@ pub async fn register_udfs(runtime: &crate::Runtime) {
         Arc::new(ExecutorTableFunc::new(Arc::downgrade(&runtime.df))),
     );
 
-    let explicit_pks = parse_explicit_primary_keys(runtime.app()).await;
+    let explicit_pks = runtime.search_primary_keys.clone();
+    explicit_pks.update(runtime.app()).await;
     ctx.register_udf(
         VectorSearchTableFunc::new(Arc::downgrade(&runtime.df), explicit_pks.clone()).into(),
     );
@@ -114,21 +114,18 @@ pub async fn register_udfs(runtime: &crate::Runtime) {
     // actual `FROM rerank(...)` implementation).
     let weak_df: std::sync::Weak<dyn runtime_query_engine::query_engine::QueryEngine> =
         Arc::downgrade(&runtime.df) as _;
+    let rerank_models = RerankModelStores {
+        rerankers: runtime.rerankers(),
+        chat_models: runtime.completion_llms(),
+        evaluate_models: runtime.evaluate_models(),
+        capabilities: runtime.model_capabilities(),
+    };
     ctx.register_udf(
-        RerankTableFunc::new(
-            std::sync::Weak::clone(&weak_df),
-            runtime.rerankers(),
-            runtime.completion_llms(),
-        )
-        .into(),
+        RerankTableFunc::new(std::sync::Weak::clone(&weak_df), rerank_models.clone()).into(),
     );
     ctx.register_udtf(
         RERANK_UDTF_NAME,
-        Arc::new(RerankTableFunc::new(
-            weak_df,
-            runtime.rerankers(),
-            runtime.completion_llms(),
-        )),
+        Arc::new(RerankTableFunc::new(weak_df, rerank_models)),
     );
 
     // `flatten_json_properties` / `flatten_json` / `json_tree` — JSON-Schema
@@ -148,15 +145,42 @@ pub async fn register_udfs(runtime: &crate::Runtime) {
     ctx.register_udtf(JSON_TREE_UDTF_NAME, Arc::new(JsonTreeTableFunc::new()));
     ctx.register_udf(JsonTreeScalar::new().into());
 
+    // OTLP metrics store time-series aggregates (#15060).
+    ctx.register_udaf(runtime_datafusion_udfs::timeseries::HistogramQuantile::new().into());
+    ctx.register_udaf(runtime_datafusion_udfs::timeseries::CounterGrowth::increase().into());
+    ctx.register_udaf(runtime_datafusion_udfs::timeseries::CounterGrowth::rate().into());
+
     #[cfg(feature = "models")]
     {
         ctx.register_udf(embed::Embed::new(runtime.embeds()).into());
         ctx.register_udf(
-            Ai::new(runtime.completion_llms(), runtime.model_rate_controllers())
-                .into_async_udf()
-                .into_scalar_udf(),
+            Ai::new(
+                runtime.completion_llms(),
+                runtime.model_capabilities(),
+                runtime.model_rate_controllers(),
+                runtime.status(),
+            )
+            .into_async_udf()
+            .into_scalar_udf(),
         );
     }
+
+    // `ai_if`, `ai_probability`, `ai_classify`, `ai_score` and `ai_decide`, answered by
+    // the decision and chat models in the evaluation store, with the planner rules that
+    // place their model calls. Registered once per runtime, so the rules are appended
+    // once.
+    runtime_decide::DecisionFunctions::new(
+        runtime.evaluate_models(),
+        runtime.model_capabilities(),
+        runtime.status(),
+    )
+    .register(ctx);
+
+    // Places the remaining async calls (`ai`, async user functions). Runs after the
+    // decision rule, which places decision calls itself.
+    ctx.add_optimizer_rule(Arc::new(
+        runtime_datafusion_udfs::async_placement::AsyncCallPlacement,
+    ));
 
     in_tracing_context_async(register_user_functions(runtime, ctx)).await;
 }
@@ -193,7 +217,8 @@ async fn register_user_functions(runtime: &crate::Runtime, ctx: &SessionContext)
 
     warn_beta_once();
 
-    let enabled_functions = enabled_function_declarations(&app.functions);
+    let enabled_functions =
+        refuse_sidecar_code_functions(runtime, enabled_function_declarations(&app.functions));
     if enabled_functions.is_empty() {
         return;
     }
@@ -292,6 +317,8 @@ async fn maybe_register_function_as_tool(runtime: &crate::Runtime, decl: &Functi
                 return;
             }
             tools_map.insert(name.clone(), crate::tools::Tooling::FunctionTool(tool));
+            #[cfg(feature = "mcp")]
+            runtime.refresh_mcp_tool_schemas(&tools_map);
             tracing::info!(name = %name, "Exposed user function as tool");
         }
         Err(e) => {
@@ -340,13 +367,51 @@ pub fn registered_table_udf_name(ctx: &SessionContext, name: &str) -> Option<Str
         .cloned()
 }
 
-fn function_executes_code(decl: &Function) -> bool {
-    let scheme = decl
-        .from
+/// The `from` scheme of a function declaration, lowercased: `sql`, `http`, `wasm`, ...
+fn function_scheme(decl: &Function) -> String {
+    decl.from
         .split_once(':')
         .map_or(decl.from.as_str(), |(scheme, _)| scheme)
-        .to_ascii_lowercase();
-    matches!(scheme.as_str(), "http" | "https")
+        .to_ascii_lowercase()
+}
+
+fn function_executes_code(decl: &Function) -> bool {
+    matches!(function_scheme(decl).as_str(), "http" | "https")
+}
+
+/// Whether a sidecar refuses this declaration. HTTP and WebAssembly functions
+/// run code or make requests from inside the sidecar, which guards its
+/// application's access to the cluster. SQL functions are queries over the
+/// sidecar's own catalog and are kept.
+fn sidecar_refuses_function(decl: &Function) -> bool {
+    matches!(function_scheme(decl).as_str(), "http" | "https" | "wasm")
+}
+
+/// The error logged for each function a sidecar refuses to register.
+fn sidecar_refused_function_message(name: &str) -> String {
+    format!(
+        "Function '{name}' was not registered, so queries that call it fail: a sidecar does not run \
+         HTTP or WebAssembly functions. Remove it from the sidecar's Spicepod, or start Spice \
+         without `--role sidecar`."
+    )
+}
+
+/// On a sidecar, drops the declarations [`sidecar_refuses_function`] refuses,
+/// logging each; on any other role, returns `functions` unchanged.
+fn refuse_sidecar_code_functions(
+    runtime: &crate::Runtime,
+    mut functions: Vec<Function>,
+) -> Vec<Function> {
+    if runtime.role() == crate::config::Role::Sidecar {
+        functions.retain(|decl| {
+            let refused = sidecar_refuses_function(decl);
+            if refused {
+                tracing::error!("{}", sidecar_refused_function_message(&decl.name));
+            }
+            !refused
+        });
+    }
+    functions
 }
 
 fn enabled_function_declarations(functions: &[Function]) -> Vec<Function> {
@@ -403,11 +468,35 @@ fn info_from_decl(decl: &Function) -> UserFunctionInfo {
 
 /// Rebuild + re-register user functions against `new_app`, removing any
 /// that are no longer declared. Called on spicepod hot-reload.
+///
+/// Discards the cached logical plans when the registered set changes: a
+/// cached plan embeds the `Arc<ScalarUDF>` it was planned against, so it
+/// keeps evaluating a dropped or redefined function's own body no matter
+/// what the session context now holds for that name. Dataset and view
+/// registration already discard them for the same reason.
+///
+/// Discards the cached query results too. A result is keyed by its query, not
+/// by the definitions of the functions it called, and a `cache_key_type: sql`
+/// hit is served before the query is planned, so a result computed with the
+/// old definition (or while a now-`volatile` function was `immutable`) would
+/// otherwise keep being served until it expires.
 pub async fn apply_function_diff(
     runtime: &crate::Runtime,
     current_app: &Arc<app::App>,
     new_app: &Arc<app::App>,
 ) {
+    if apply_function_diff_inner(runtime, current_app, new_app).await {
+        runtime.df.clear_cached_plans_and_results().await;
+    }
+}
+
+/// The body of [`apply_function_diff`]. Returns whether the registered set
+/// changed, which is what makes a cached plan over a user function stale.
+async fn apply_function_diff_inner(
+    runtime: &crate::Runtime,
+    current_app: &Arc<app::App>,
+    new_app: &Arc<app::App>,
+) -> bool {
     let ctx = &runtime.df.ctx;
     let current_enabled = current_app.runtime.functions.enabled;
     let new_enabled = new_app.runtime.functions.enabled;
@@ -454,16 +543,18 @@ pub async fn apply_function_diff(
                 tools_map.remove(name);
             }
         }
+        #[cfg(feature = "mcp")]
+        runtime.refresh_mcp_tool_schemas(&tools_map);
     }
 
     if new_app.functions.is_empty() {
-        return;
+        return !functions_to_drop.is_empty();
     }
     if !new_enabled {
         tracing::error!(
             "User-defined functions are declared but disabled. Set `runtime.functions.enabled: true` to register spicepod `functions:` entries."
         );
-        return;
+        return !functions_to_drop.is_empty();
     }
 
     let functions_to_register = new_app
@@ -479,6 +570,7 @@ pub async fn apply_function_diff(
         })
         .cloned()
         .collect::<Vec<_>>();
+    let functions_to_register = refuse_sidecar_code_functions(runtime, functions_to_register);
     let functions_to_register =
         resolve_function_params(runtime.secrets(), &functions_to_register).await;
     let (built, errors) =
@@ -533,10 +625,14 @@ pub async fn apply_function_diff(
             }
         }
     }
+    // Computed before `registered_function_names` is moved into the deny list.
+    let changed = !registered_function_names.is_empty() || !functions_to_drop.is_empty();
     add_user_functions_to_deny_list(registered_function_names);
     for next in functions_to_expose_as_tools {
         maybe_register_function_as_tool(runtime, &next).await;
     }
+
+    changed
 }
 
 /// Names of UDFs whose invocation can execute external code or make RPC/API
@@ -624,7 +720,9 @@ pub fn is_code_executing_function(name: &str) -> bool {
 
 pub use runtime_datafusion::function_support::{
     deny_spice_functions_for_duckdb, deny_spice_functions_for_duckdb_table_providers,
+    deny_spice_functions_for_mysql_table_providers,
     deny_spice_functions_for_postgres_table_providers,
+    deny_spice_functions_for_sqlite_table_providers,
 };
 pub use runtime_udfs_api::{
     deny_spice_functions_for_table_providers, deny_spice_specific_functions,
@@ -650,6 +748,7 @@ mod deny_list_registration_tests {
         inner_product::INNER_PRODUCT_UDF_NAME,
         l2_distance::{L2_DISTANCE_UDF_NAME, L2_SQUARED_DISTANCE_UDF_NAME},
         l2_norm::L2_NORM_UDF_NAME,
+        timeseries::{HISTOGRAM_QUANTILE_UDAF_NAME, INCREASE_UDAF_NAME, RATE_UDAF_NAME},
         truncate::TRUNCATE_SCALAR_UDF_NAME,
     };
     use runtime_datafusion_udfs::{
@@ -679,6 +778,9 @@ mod deny_list_registration_tests {
             L2_SQUARED_DISTANCE_UDF_NAME,
             L2_NORM_UDF_NAME,
             TRUNCATE_SCALAR_UDF_NAME,
+            HISTOGRAM_QUANTILE_UDAF_NAME,
+            INCREASE_UDAF_NAME,
+            RATE_UDAF_NAME,
             OBJ_DESCRIPTION_UDF_NAME,
             COL_DESCRIPTION_UDF_NAME,
             EMBED_UDF_NAME,
@@ -689,6 +791,16 @@ mod deny_list_registration_tests {
             FLATTEN_JSON_UDTF_NAME,
             JSON_TREE_UDTF_NAME,
             RERANK_UDTF_NAME,
+            runtime_decide::AI_IF_NAME,
+            runtime_decide::AI_PROBABILITY_NAME,
+            runtime_decide::AI_CLASSIFY_NAME,
+            runtime_decide::AI_SCORE_NAME,
+            runtime_decide::AI_DECIDE_NAME,
+            runtime_datafusion::checked_arithmetic::CHECKED_ADD_UDF_NAME,
+            runtime_datafusion::checked_arithmetic::CHECKED_SUB_UDF_NAME,
+            runtime_datafusion::checked_arithmetic::CHECKED_MUL_UDF_NAME,
+            runtime_datafusion::checked_arithmetic::CHECKED_SUM_PLUS_COUNT_UDF_NAME,
+            runtime_datafusion::checked_arithmetic::CHECKED_SUM_WIDEN_UDF_NAME,
         ]
         .iter()
         .map(ToString::to_string)
@@ -816,6 +928,31 @@ mod tests {
         }
     }
 
+    /// A sidecar refuses the function schemes that run code or make requests,
+    /// and keeps SQL functions. The message names the function and the fix.
+    #[test]
+    fn sidecar_refuses_http_and_wasm_functions() {
+        for (from, refused) in [
+            ("sql", false),
+            ("SQL", false),
+            ("http://functions.internal/score", true),
+            ("https://functions.internal/score", true),
+            ("HTTPS://functions.internal/score", true),
+            ("wasm", true),
+            ("wasm:module", true),
+        ] {
+            let mut decl = test_user_function("f", true);
+            decl.from = from.to_string();
+            assert_eq!(sidecar_refuses_function(&decl), refused, "{from}");
+        }
+        assert_eq!(
+            sidecar_refused_function_message("score"),
+            "Function 'score' was not registered, so queries that call it fail: a sidecar does not \
+             run HTTP or WebAssembly functions. Remove it from the sidecar's Spicepod, or start \
+             Spice without `--role sidecar`."
+        );
+    }
+
     #[test]
     fn enabled_function_declarations_filters_disabled_functions() {
         let functions = vec![
@@ -915,7 +1052,7 @@ mod tests {
             let name = udf.name().to_string();
             let expr = make_json_expr(udf);
             assert!(
-                !support.supports(&expr),
+                !support.supports(&expr, None),
                 "{name} should be denied by deny_spice_specific_functions"
             );
         }
@@ -939,37 +1076,66 @@ mod tests {
             let name = udf.name().to_string();
             let expr = make_json_expr(udf);
             assert!(
-                !support.supports(&expr),
+                !support.supports(&expr, None),
                 "{name} should be denied by deny_spice_specific_functions"
             );
         }
     }
 
-    /// Build a no-arg scalar-function expression with the given name so we can
-    /// probe a `FunctionSupport` by name regardless of the real UDF impl.
-    fn make_named_expr(name: &str) -> Expr {
+    /// Build a scalar-function expression with the given name and arguments so
+    /// we can probe a `FunctionSupport` by name regardless of the real UDF impl.
+    ///
+    /// A name whose backend answers per-call as well as per-name — a
+    /// `FunctionSupport` carrying a
+    /// [`ScalarCallSupport`](datafusion_table_providers::util::supported_functions::ScalarCallSupport)
+    /// asks its dialect to render the call — needs a call shape the dialect can
+    /// render: the no-arg probe is a call the planner cannot build and the
+    /// dialect refuses on arity alone, so it says nothing about the name.
+    fn make_named_call(name: &str, args: Vec<Expr>) -> Expr {
         Expr::ScalarFunction(ScalarFunction::new_udf(
             Arc::new(stub_scalar_udf(name)),
-            vec![],
+            args,
         ))
+    }
+
+    /// The no-arg probe, for a name answered by name alone.
+    fn make_named_expr(name: &str) -> Expr {
+        make_named_call(name, vec![])
+    }
+
+    #[test]
+    fn deny_list_blocks_checked_integer_helpers() {
+        let support = deny_spice_specific_functions();
+        for name in [
+            runtime_datafusion::checked_arithmetic::CHECKED_ADD_UDF_NAME,
+            runtime_datafusion::checked_arithmetic::CHECKED_SUB_UDF_NAME,
+            runtime_datafusion::checked_arithmetic::CHECKED_MUL_UDF_NAME,
+            runtime_datafusion::checked_arithmetic::CHECKED_SUM_PLUS_COUNT_UDF_NAME,
+            runtime_datafusion::checked_arithmetic::CHECKED_SUM_WIDEN_UDF_NAME,
+        ] {
+            assert!(
+                !support.supports(&make_named_expr(name), None),
+                "{name} must stay local; remotes do not implement the checked kernels"
+            );
+        }
     }
 
     #[test]
     fn table_providers_default_deny_list_denies_spice_functions() {
-        // The default table-providers-typed deny-list (wired into the SQLite
-        // and Postgres accelerator factories and the MySQL connector factory)
-        // has no dialect carve-out: every built-in Spice UDF must be denied
-        // while ordinary functions still federate.
+        // The default table-providers-typed deny-list (wired into the ADBC
+        // connector for every profile other than BigQuery) has no dialect
+        // carve-out: every built-in Spice UDF must be denied while ordinary
+        // functions still federate.
         let support = deny_spice_functions_for_table_providers();
         let json_name = json_get_str_udf().name().to_string();
         for name in [EMBED_UDF_NAME, COSINE_DISTANCE_UDF_NAME, json_name.as_str()] {
             assert!(
-                !support.supports(&make_named_expr(name)),
+                !support.supports(&make_named_expr(name), None),
                 "{name} is a Spice-only function and must be denied"
             );
         }
         assert!(
-            support.supports(&make_named_expr("upper")),
+            support.supports(&make_named_expr("upper"), None),
             "non-Spice functions must not be denied"
         );
     }
@@ -995,14 +1161,14 @@ mod tests {
             "flatten",
         ] {
             assert!(
-                !support.supports(&make_named_expr(name)),
+                !support.supports(&make_named_expr(name), None),
                 "{name} is incompatible with PostgreSQL and must be denied"
             );
         }
         // The exact PostgreSQL function names keep pushing down.
         for &name in POSTGRES_PUSHABLE_ARRAY_FUNCTIONS {
             assert!(
-                support.supports(&make_named_expr(name)),
+                support.supports(&make_named_expr(name), None),
                 "{name} matches PostgreSQL exactly and should still federate"
             );
         }
@@ -1015,24 +1181,25 @@ mod tests {
             "list_position",
         ] {
             assert!(
-                !support.supports(&make_named_expr(name)),
+                !support.supports(&make_named_expr(name), None),
                 "{name} is a DataFusion-only alias with no PostgreSQL equivalent and must be denied"
             );
         }
         // Spice-only functions stay denied too.
         assert!(
-            !support.supports(&make_named_expr(EMBED_UDF_NAME)),
+            !support.supports(&make_named_expr(EMBED_UDF_NAME), None),
             "Spice-only functions must remain denied for Postgres"
         );
         // Ordinary scalar functions still federate.
         assert!(
-            support.supports(&make_named_expr("upper")),
+            support.supports(&make_named_expr("upper"), None),
             "non-array, non-Spice functions must not be denied for Postgres"
         );
         // The generic table-providers deny-list does NOT touch array functions,
         // confirming this carve-out is Postgres-specific.
         assert!(
-            deny_spice_functions_for_table_providers().supports(&make_named_expr("array_has")),
+            deny_spice_functions_for_table_providers()
+                .supports(&make_named_expr("array_has"), None),
             "the generic deny-list must not deny array functions"
         );
     }
@@ -1055,6 +1222,80 @@ mod tests {
     }
 
     #[test]
+    fn btrim_is_denied_only_for_the_backends_that_lack_it() {
+        // `trim(col)` resolves to the `btrim` UDF and federates under that
+        // canonical name. Three of the four SQL backends we can reach have no
+        // `btrim` and answer a pushed-down `trim` with an error rather than a
+        // row (issue #13794): DuckDB `Catalog Error: Scalar Function with name
+        // btrim does not exist!`, SQLite `no such function: btrim`, MySQL
+        // `FUNCTION <db>.btrim does not exist`.
+        //
+        // DuckDB is handled in its dialect instead, which rewrites the call to
+        // `trim` and keeps the pushdown, so `btrim` must stay *allowed* there —
+        // denying it as well would silently give up a pushdown that works.
+        // PostgreSQL has `btrim` natively and must keep pushing it down too.
+        for (backend, support, denied) in [
+            (
+                "sqlite",
+                deny_spice_functions_for_sqlite_table_providers(),
+                true,
+            ),
+            (
+                "mysql",
+                deny_spice_functions_for_mysql_table_providers(),
+                true,
+            ),
+            (
+                "postgres",
+                deny_spice_functions_for_postgres_table_providers(),
+                false,
+            ),
+            (
+                "duckdb",
+                deny_spice_functions_for_duckdb_table_providers(),
+                false,
+            ),
+        ] {
+            assert_eq!(
+                support.supports(&make_named_call("btrim", vec![lit("  padded  ")]), None),
+                !denied,
+                "btrim pushdown for {backend} is wrong: expected denied={denied}"
+            );
+        }
+    }
+
+    #[test]
+    fn sqlite_and_mysql_deny_lists_still_deny_every_spice_function() {
+        // The invariant: a backend-specific list is the generic Spice deny-list
+        // *plus* that backend's extras, never a replacement for it. A Spice-only
+        // function reaching either backend is the unknown-function failure of
+        // issue #10703, so `btrim` must be additive to that set rather than the
+        // whole of it.
+        let json_name = json_get_str_udf().name().to_string();
+        for (backend, support) in [
+            ("sqlite", deny_spice_functions_for_sqlite_table_providers()),
+            ("mysql", deny_spice_functions_for_mysql_table_providers()),
+        ] {
+            for name in &builtin_denied_names() {
+                assert!(
+                    !support.supports(&make_named_expr(name), None),
+                    "{name} must stay denied for {backend}"
+                );
+            }
+            assert!(
+                !support.supports(&make_named_expr(json_name.as_str()), None),
+                "{json_name} must stay denied for {backend}"
+            );
+            // `upper` is a SQLite extra (ASCII-only case folding). `abs` is
+            // still a function both backends evaluate the same way.
+            assert!(
+                support.supports(&make_named_expr("abs"), None),
+                "an ordinary function must still federate to {backend}"
+            );
+        }
+    }
+
+    #[test]
     fn duckdb_deny_list_allows_dialect_native_functions() {
         // The DuckDB unparser dialect rewrites these into native DuckDB SQL
         // (cosine_distance -> array_cosine_distance, inner_product ->
@@ -1064,7 +1305,7 @@ mod tests {
         let support = deny_spice_functions_for_duckdb();
         for name in [COSINE_DISTANCE_UDF_NAME, INNER_PRODUCT_UDF_NAME, "rand"] {
             assert!(
-                support.supports(&make_named_expr(name)),
+                support.supports(&make_named_expr(name), None),
                 "{name} has a native DuckDB equivalent and should be pushed down"
             );
         }
@@ -1072,7 +1313,7 @@ mod tests {
         let json_name = json_get_str_udf().name().to_string();
         for name in [EMBED_UDF_NAME, json_name.as_str()] {
             assert!(
-                !support.supports(&make_named_expr(name)),
+                !support.supports(&make_named_expr(name), None),
                 "{name} has no native DuckDB equivalent and must stay denied"
             );
         }
@@ -1087,7 +1328,7 @@ mod tests {
         let support = deny_spice_specific_functions();
         for name in &builtin_denied_names() {
             assert!(
-                !support.supports(&make_named_expr(name)),
+                !support.supports(&make_named_expr(name), None),
                 "{name} must be denied by the default (backend-agnostic) deny-list"
             );
         }
@@ -1097,16 +1338,53 @@ mod tests {
     fn excluding_subtracts_only_listed_native_functions() {
         let support = deny_spice_specific_functions_excluding(&[COSINE_DISTANCE_UDF_NAME]);
         assert!(
-            support.supports(&make_named_expr(COSINE_DISTANCE_UDF_NAME)),
+            support.supports(&make_named_expr(COSINE_DISTANCE_UDF_NAME), None),
             "explicitly-excluded cosine_distance should be allowed"
         );
         assert!(
-            !support.supports(&make_named_expr("rand")),
+            !support.supports(&make_named_expr("rand"), None),
             "rand was not excluded and must stay denied"
         );
         // An empty exclusion behaves exactly like the default deny-list.
         let default_support = deny_spice_specific_functions_excluding(&[]);
-        assert!(!default_support.supports(&make_named_expr(COSINE_DISTANCE_UDF_NAME)));
+        assert!(!default_support.supports(&make_named_expr(COSINE_DISTANCE_UDF_NAME), None));
+    }
+
+    #[test]
+    fn duckdb_denies_two_regexp_builtins_and_federates_the_other_three() {
+        // Two of the five DataFusion regexp built-ins have no value-preserving
+        // DuckDB rendering: `regexp_extract` returns the whole match rather than
+        // the capture groups and the empty string rather than NULL for a
+        // non-match (#13809), and DuckDB has no `regexp_instr` at all. Both must
+        // stay local, while the three the dialect renders faithfully keep
+        // federating — `regexp_count` among them, whose rendering coalesces the
+        // NULL `len(regexp_extract_all(NULL, p))` to the kernel's 0 (#13870).
+        //
+        // All three are probed with the arguments of a real call, because all
+        // three are screened per call rather than by name: the dialect renders
+        // only a literal pattern built from syntax RE2 and the kernel's `regex`
+        // crate read alike (#14148), so a bare name carries no answer.
+        for support in [
+            deny_spice_functions_for_duckdb(),
+            Arc::new(deny_spice_functions_for_duckdb_table_providers()),
+        ] {
+            for name in ["regexp_match", "regexp_instr"] {
+                assert!(
+                    !support.supports(&make_named_expr(name), None),
+                    "{name} has no value-preserving DuckDB rendering and must not be pushed down"
+                );
+            }
+            for (name, args) in [
+                ("regexp_like", vec![lit("ab"), lit("a")]),
+                ("regexp_replace", vec![lit("ab"), lit("a"), lit("X")]),
+                ("regexp_count", vec![lit("ab"), lit("a")]),
+            ] {
+                assert!(
+                    support.supports(&make_named_call(name, args), None),
+                    "{name} with a literal pattern is rendered natively by the DuckDB dialect and must be pushed down"
+                );
+            }
+        }
     }
 
     #[test]
@@ -1121,7 +1399,7 @@ mod tests {
         for denied in &builtin_denied_names() {
             let expected_allowed = native.contains(denied.as_str());
             assert_eq!(
-                support.supports(&make_named_expr(denied)),
+                support.supports(&make_named_expr(denied), None),
                 expected_allowed,
                 "{denied}: DuckDB allow-state must match dialect native support"
             );
@@ -1144,7 +1422,7 @@ mod tests {
         let denied_names = builtin_denied_names();
         let pushable: BTreeSet<&str> = denied_names
             .iter()
-            .filter(|name| support.supports(&make_named_expr(name)))
+            .filter(|name| support.supports(&make_named_expr(name), None))
             .map(String::as_str)
             .collect();
         assert_eq!(
@@ -1228,5 +1506,327 @@ mod tests {
                 "{name}: expected a FixedSizeList coercion error from Spice's impl, got: {err}"
             );
         }
+    }
+
+    /// A one-function app: `myscale(x)` as a `from: sql` scalar with the given
+    /// body, parsed from YAML so the declaration is the shape a spicepod
+    /// produces. `functions:` is enabled, since registration is opt-in.
+    fn app_with_body(body: &str) -> Arc<app::App> {
+        let function: Function = yaml::from_str(&format!(
+            "
+name: myscale
+from: sql
+kind: scalar
+volatility: immutable
+signature:
+  args: [{{ name: x, type: int64 }}]
+  returns: int64
+body: \"{body}\"
+"
+        ))
+        .expect("the function declaration should parse");
+
+        Arc::new(
+            app::AppBuilder::new("plan_cache_function_diff")
+                .with_function(function)
+                .with_runtime(spicepod::component::runtime::Runtime {
+                    functions: spicepod::component::runtime::Functions::enabled(),
+                    ..Default::default()
+                })
+                .build(),
+        )
+    }
+
+    /// The same app with no `functions:` at all — what a hot reload that
+    /// removes the declaration produces.
+    fn app_with_no_functions() -> Arc<app::App> {
+        Arc::new(
+            app::AppBuilder::new("plan_cache_function_diff")
+                .with_runtime(spicepod::component::runtime::Runtime {
+                    functions: spicepod::component::runtime::Functions::enabled(),
+                    ..Default::default()
+                })
+                .build(),
+        )
+    }
+
+    /// A runtime built from `app`, with the plans cache `Runtime::init_caching`
+    /// installs unconditionally, plus a cached plan for `sql` and the key it
+    /// was cached under.
+    async fn runtime_with_cached_plan(
+        app: &Arc<app::App>,
+        sql: &'static str,
+    ) -> (
+        crate::Runtime,
+        Arc<crate::datafusion::DataFusion>,
+        Arc<dyn cache::TabledCacheProvider<datafusion::logical_expr::LogicalPlan> + Send + Sync>,
+        cache::key::RawCacheKey,
+    ) {
+        let runtime = crate::Runtime::builder()
+            .with_app_opt(Some(Arc::clone(app)))
+            .build()
+            .await;
+        let df = Arc::clone(&runtime.df);
+        let plans = df
+            .plans_cache_provider()
+            .expect("the plans cache is installed unconditionally");
+
+        // Any hasher works — the key only has to be the same on every lookup.
+        let key = cache::key::CacheKey::Query(sql, None)
+            .as_raw_key(Box::new(std::hash::DefaultHasher::new()));
+        df.get_or_create_logical_plan(&df.ctx.state(), Some(&key), sql, None)
+            .await
+            .expect("the query over myscale should plan");
+        plans.checkpoint().await;
+        assert_eq!(
+            plans.item_count().await,
+            1,
+            "precondition: the plan must be cached, or the test cannot observe staleness"
+        );
+
+        (runtime, df, plans, key)
+    }
+
+    /// A cached logical plan embeds the `Arc<ScalarUDF>` it was planned
+    /// against, so it keeps evaluating that UDF's own body regardless of what
+    /// the session context now holds for the name. The plan cache is installed
+    /// unconditionally with a one-hour TTL, so a hot reload that redefines a
+    /// `functions:` body must discard the cached plans or the old body keeps
+    /// answering the same SQL for up to an hour.
+    ///
+    /// Regression test for #13873.
+    #[tokio::test]
+    async fn function_diff_discards_cached_plans_so_a_redefined_body_answers() {
+        static SQL: &str = "SELECT myscale(21) AS v";
+
+        let doubling = app_with_body("x * 2");
+        let tripling = app_with_body("x * 3");
+        let (runtime, df, plans, key) = runtime_with_cached_plan(&doubling, SQL).await;
+
+        let cached = df
+            .get_or_create_logical_plan(&df.ctx.state(), Some(&key), SQL, None)
+            .await
+            .expect("the cached plan should come back");
+        assert_eq!(
+            eval_i64(&df.ctx, cached).await,
+            42,
+            "precondition: the first body must be the one that answers"
+        );
+
+        // The hot reload: `myscale` is redefined, which takes the same drop
+        // path as a removal (`next != current`) and then re-registers.
+        apply_function_diff(&runtime, &doubling, &tripling).await;
+
+        plans.checkpoint().await;
+        assert_eq!(
+            plans.item_count().await,
+            0,
+            "a function diff must discard the cached plans; a plan left in the cache still holds \
+             the pre-reload ScalarUDF"
+        );
+
+        let replanned = df
+            .get_or_create_logical_plan(&df.ctx.state(), Some(&key), SQL, None)
+            .await
+            .expect("the same SQL should re-plan after the reload");
+        assert_eq!(
+            eval_i64(&df.ctx, replanned).await,
+            63,
+            "the redefined body must answer; 42 means the cached plan's old ScalarUDF answered"
+        );
+    }
+
+    /// The removal path has its own exit from the diff: a reload that drops
+    /// every `functions:` entry returns through `new_app.functions.is_empty()`
+    /// before any registration runs, so that arm has to report the drop on its
+    /// own. A plan surviving it still holds the removed function and keeps
+    /// answering for a name the user has taken away.
+    ///
+    /// Regression test for #13873.
+    #[tokio::test]
+    async fn function_diff_discards_cached_plans_when_a_reload_removes_every_function() {
+        static SQL: &str = "SELECT myscale(21) AS v";
+
+        let doubling = app_with_body("x * 2");
+        let removed = app_with_no_functions();
+        let (runtime, df, plans, key) = runtime_with_cached_plan(&doubling, SQL).await;
+
+        // Exits through the `new_app.functions.is_empty()` arm, not the tail.
+        apply_function_diff(&runtime, &doubling, &removed).await;
+
+        plans.checkpoint().await;
+        assert_eq!(
+            plans.item_count().await,
+            0,
+            "removing every function must discard the cached plans; a plan left in the cache \
+             still holds the removed ScalarUDF"
+        );
+
+        // Re-planning now fails to resolve the name, which is the correct
+        // outcome: the user removed the function. The point is that the query
+        // no longer silently answers from the copy the cached plan held.
+        let err = df
+            .get_or_create_logical_plan(&df.ctx.state(), Some(&key), SQL, None)
+            .await
+            .expect_err("the removed function must not resolve after the reload");
+        assert!(
+            err.to_string().contains("myscale"),
+            "the planning error should name the removed function, got: {err}"
+        );
+    }
+
+    /// The signal is "the registered set changed", not "a reload happened":
+    /// a reload that leaves `functions:` untouched must keep the cached plans,
+    /// or every unrelated spicepod edit throws away the whole plan cache.
+    #[tokio::test]
+    async fn function_diff_keeps_cached_plans_when_the_function_set_is_unchanged() {
+        static SQL: &str = "SELECT myscale(21) AS v";
+
+        let doubling = app_with_body("x * 2");
+        let same = app_with_body("x * 2");
+        let (runtime, _df, plans, _key) = runtime_with_cached_plan(&doubling, SQL).await;
+
+        apply_function_diff(&runtime, &doubling, &same).await;
+
+        plans.checkpoint().await;
+        assert_eq!(
+            plans.item_count().await,
+            1,
+            "an unchanged function set must not discard cached plans"
+        );
+    }
+
+    /// [`app_with_body`]'s function, declared with `volatility`, in an app whose
+    /// SQL results cache is keyed by the query text (`cache_key_type: sql`):
+    /// such a hit is answered before the query is planned.
+    fn app_with_sql_keyed_results_cache(body: &str, volatility: &str) -> Arc<app::App> {
+        let function: Function = yaml::from_str(&format!(
+            "
+name: myscale
+from: sql
+kind: scalar
+volatility: {volatility}
+signature:
+  args: [{{ name: x, type: int64 }}]
+  returns: int64
+body: \"{body}\"
+"
+        ))
+        .expect("the function declaration should parse");
+
+        Arc::new(
+            app::AppBuilder::new("results_cache_function_diff")
+                .with_function(function)
+                .with_runtime(spicepod::component::runtime::Runtime {
+                    functions: spicepod::component::runtime::Functions::enabled(),
+                    caching: spicepod::component::caching::Caching {
+                        sql_results: Some(spicepod::component::caching::SQLResultsCacheConfig {
+                            item_ttl: Some("10m".to_string()),
+                            cache_key_type: spicepod::component::caching::CacheKeyType::Sql,
+                            ..Default::default()
+                        }),
+                        ..Default::default()
+                    },
+                    ..Default::default()
+                })
+                .build(),
+        )
+    }
+
+    /// Runs `sql` through the query path, results cache included, as a request
+    /// keyed by its SQL text (`cache_key_type: sql`), whose hit is answered before
+    /// the query is planned. Returns the cache status with the single `Int64`
+    /// value it answered.
+    async fn run_through_results_cache(
+        df: &Arc<crate::datafusion::DataFusion>,
+        sql: &str,
+    ) -> (cache::result::CacheStatus, i64) {
+        use runtime_request_context::{CacheControl, CacheKeyType, Protocol, RequestContext};
+
+        let request_context = Arc::new(
+            RequestContext::builder(Protocol::Internal)
+                .with_cache_control(CacheControl::Cache(CacheKeyType::Raw))
+                .build(),
+        );
+        let query = df.query_builder(sql).build();
+        request_context
+            .scope(async move {
+                let result = query.run().await.expect("the query should run");
+                let status = result.cache_status;
+                let batches = result
+                    .collect_batches()
+                    .await
+                    .expect("the query should return rows");
+                let value = batches[0]
+                    .column(0)
+                    .as_primitive::<datafusion::arrow::datatypes::Int64Type>()
+                    .value(0);
+                (status, value)
+            })
+            .await
+    }
+
+    /// A cached result is keyed by its query, not by the definitions of the
+    /// functions it called, and a `cache_key_type: sql` hit is answered before
+    /// planning, where the volatility check runs. So a reload that redefines a
+    /// function must discard the cached results, or the old definition's answer
+    /// is replayed until the entry expires, even after the function became
+    /// `volatile`.
+    #[tokio::test]
+    async fn function_diff_discards_cached_results_so_a_redefined_function_is_not_replayed() {
+        use cache::result::CacheStatus;
+        static SQL: &str = "SELECT myscale(21) AS v";
+
+        let doubling = app_with_sql_keyed_results_cache("x * 2", "immutable");
+        let runtime = crate::Runtime::builder()
+            .with_app_opt(Some(Arc::clone(&doubling)))
+            .build()
+            .await;
+        let df = Arc::clone(&runtime.df);
+        assert_eq!(
+            run_through_results_cache(&df, SQL).await,
+            (CacheStatus::CacheMiss, 42)
+        );
+        assert_eq!(
+            run_through_results_cache(&df, SQL).await,
+            (CacheStatus::CacheHit, 42),
+            "precondition: the result must be cached, or the test cannot observe a replay"
+        );
+
+        // Redefined, still `immutable`: the next run computes the new body.
+        let tripling = app_with_sql_keyed_results_cache("x * 3", "immutable");
+        apply_function_diff(&runtime, &doubling, &tripling).await;
+        assert_eq!(
+            run_through_results_cache(&df, SQL).await,
+            (CacheStatus::CacheMiss, 63),
+            "a HIT with 42 replays the result the replaced body computed"
+        );
+        assert_eq!(
+            run_through_results_cache(&df, SQL).await,
+            (CacheStatus::CacheHit, 63)
+        );
+
+        // Now `volatile`: no result may be served from the cache for it.
+        let volatile = app_with_sql_keyed_results_cache("x * 4", "volatile");
+        apply_function_diff(&runtime, &tripling, &volatile).await;
+        for run in 1..=2 {
+            assert_eq!(
+                run_through_results_cache(&df, SQL).await,
+                (CacheStatus::CacheDisabled, 84),
+                "run {run}: a volatile function's results must not be served from the cache"
+            );
+        }
+    }
+
+    /// Execute a planned query expected to yield a single `Int64` value.
+    async fn eval_i64(ctx: &SessionContext, plan: datafusion::logical_expr::LogicalPlan) -> i64 {
+        let batches = datafusion::dataframe::DataFrame::new(ctx.state(), plan)
+            .collect()
+            .await
+            .expect("the plan should execute");
+        batches[0]
+            .column(0)
+            .as_primitive::<datafusion::arrow::datatypes::Int64Type>()
+            .value(0)
     }
 }

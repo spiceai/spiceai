@@ -14,7 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 use async_trait::async_trait;
-use datafusion::sql::TableReference;
+use datafusion::common::TableReference;
 use serde_json::Value;
 use snafu::ResultExt;
 use std::{borrow::Cow, sync::Arc};
@@ -97,7 +97,9 @@ impl<E: TableProviderExplorer + Clone + 'static> SpiceModelTool for SearchTool<E
 
             let vs = SearchEngine::new(
                 Arc::clone(&self.df),
-                parse_explicit_primary_keys(Arc::clone(&self.app)).await,
+                parse_explicit_primary_keys(Arc::clone(&self.app))
+                    .await
+                    .into(),
                 self.explorer.clone(),
             );
 

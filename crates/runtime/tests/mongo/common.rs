@@ -17,19 +17,19 @@ limitations under the License.
 use std::{collections::HashMap, time::Duration};
 
 use bollard::secret::HealthConfig;
-#[cfg(feature = "duckdb")]
-use spicepod::acceleration::{Mode, OnConflictBehavior, RefreshMode};
-#[cfg(feature = "duckdb")]
+use spicepod::acceleration::RefreshMode;
+use spicepod::acceleration::{Mode, OnConflictBehavior};
 use spicepod::component::dataset::OnSchemaChange;
 use spicepod::{
     acceleration::Acceleration, component::dataset::Dataset, param::Params as DatasetParams,
 };
 use tracing::instrument;
 
+use test_framework::source_versions::{Source, source_image};
+
 use crate::docker::{ContainerRunnerBuilder, RunningContainer};
 
 const MONGODB_ROOT_PASSWORD: &str = "integration-test-pw";
-const MONGODB_IMAGE: &str = "docker.io/library/mongo:latest";
 const MONGODB_DOCKER_CONTAINER: &str = "runtime-integration-test-mongo";
 const MONGODB_CONTAINER_START_TIMEOUT: Duration = Duration::from_mins(3);
 const MONGODB_HOST_PORT_READY_TIMEOUT: Duration = Duration::from_mins(1);
@@ -50,52 +50,90 @@ pub fn make_mongodb_dataset(path: &str, name: &str, port: u16, accelerated: bool
     ]);
     dataset.params = Some(DatasetParams::from_string_map(params));
     if accelerated {
-        dataset.acceleration = Some(Acceleration::default());
+        dataset.acceleration = Some(Acceleration {
+            engine: Some("arrow".to_string()),
+            ..Acceleration::default()
+        });
     }
     dataset
 }
 
-/// Like [`make_mongodb_dataset`] (DuckDB-accelerated, full refresh) but with no
+/// Like [`make_mongodb_dataset`] (Cayenne-accelerated, full refresh) but with no
 /// explicit primary key, so always-on schema inference infers `_id` as the primary
 /// key and surfaces the collection's secondary indexes and sort order. The non-CDC
 /// counterpart to [`make_mongodb_change_stream_dataset_inferred`].
-#[cfg(feature = "duckdb")]
 pub fn make_mongodb_inference_dataset(path: &str, name: &str, port: u16) -> Dataset {
     let mut dataset = make_mongodb_dataset(path, name, port, false);
     dataset.acceleration = Some(Acceleration {
         enabled: true,
-        engine: Some("duckdb".to_string()),
+        engine: Some("cayenne".to_string()),
         refresh_mode: Some(RefreshMode::Full),
         ..Acceleration::default()
     });
     dataset
 }
 
-/// `MongoDB` source accelerated into a **file-backed** `DuckDB` table with
+/// `MongoDB` source accelerated into a **file-backed** `Cayenne` table with
 /// `on_schema_change: sync_all_columns`, for the restart-time widening test.
-/// File-backed (`duckdb_file`, `Mode::File`) so the accelerated table and its
+/// File-backed (`cayenne_file_path`, `Mode::File`) so the accelerated table and its
 /// checkpoint survive the restart that re-infers the (now wider) source schema and
 /// drives in-place evolution.
-#[cfg(feature = "duckdb")]
-pub fn make_mongodb_widen_dataset(path: &str, name: &str, port: u16, duckdb_file: &str) -> Dataset {
+pub fn make_mongodb_widen_dataset(
+    path: &str,
+    name: &str,
+    port: u16,
+    cayenne_path: &str,
+) -> Dataset {
     let mut dataset = make_mongodb_dataset(path, name, port, false);
     dataset.on_schema_change = OnSchemaChange::SyncAllColumns;
     dataset.acceleration = Some(Acceleration {
         enabled: true,
-        engine: Some("duckdb".to_string()),
+        engine: Some("cayenne".to_string()),
         mode: Mode::File,
         refresh_mode: Some(RefreshMode::Full),
         params: Some(DatasetParams::from_string_map(HashMap::from([(
-            "duckdb_file".to_string(),
-            duckdb_file.to_string(),
+            "cayenne_file_path".to_string(),
+            cayenne_path.to_string(),
         )]))),
         ..Acceleration::default()
     });
     dataset
 }
 
-#[cfg(feature = "duckdb")]
 pub fn make_mongodb_change_stream_dataset(path: &str, name: &str, port: u16) -> Dataset {
+    change_stream_dataset(
+        path,
+        name,
+        port,
+        Acceleration {
+            enabled: true,
+            engine: Some("cayenne".to_string()),
+            refresh_mode: Some(RefreshMode::Changes),
+            primary_key: Some("_id".to_string()),
+            on_conflict: HashMap::from([("_id".to_string(), OnConflictBehavior::Upsert)]),
+            ..Default::default()
+        },
+    )
+}
+
+/// A Change Streams dataset on Cayenne keyed by `_id` alone: Cayenne keeps one row
+/// per primary key without `on_conflict`.
+pub fn make_mongodb_cayenne_change_stream_dataset(path: &str, name: &str, port: u16) -> Dataset {
+    change_stream_dataset(
+        path,
+        name,
+        port,
+        Acceleration {
+            enabled: true,
+            engine: Some("cayenne".to_string()),
+            refresh_mode: Some(RefreshMode::Changes),
+            primary_key: Some("_id".to_string()),
+            ..Default::default()
+        },
+    )
+}
+
+fn change_stream_dataset(path: &str, name: &str, port: u16, acceleration: Acceleration) -> Dataset {
     let mut dataset = Dataset::new(format!("mongodb:{path}"), name.to_string());
     let connection_string =
         format!("mongodb://localhost:{port}/testdb?directConnection=true&replicaSet=rs0&tls=false");
@@ -112,14 +150,7 @@ pub fn make_mongodb_change_stream_dataset(path: &str, name: &str, port: u16) -> 
         ("change_stream_batch_size".to_string(), "10".to_string()),
     ]);
     dataset.params = Some(DatasetParams::from_string_map(params));
-    dataset.acceleration = Some(Acceleration {
-        enabled: true,
-        engine: Some("duckdb".to_string()),
-        refresh_mode: Some(RefreshMode::Changes),
-        primary_key: Some("_id".to_string()),
-        on_conflict: HashMap::from([("_id".to_string(), OnConflictBehavior::Upsert)]),
-        ..Default::default()
-    });
+    dataset.acceleration = Some(acceleration);
     dataset
 }
 
@@ -127,7 +158,6 @@ pub fn make_mongodb_change_stream_dataset(path: &str, name: &str, port: u16) -> 
 /// `on_conflict`, relying on always-on schema inference to infer `_id` as the
 /// primary key (and seed the matching upsert) so `MongoDB` Streams work without
 /// manual configuration.
-#[cfg(feature = "duckdb")]
 pub fn make_mongodb_change_stream_dataset_inferred(path: &str, name: &str, port: u16) -> Dataset {
     let mut dataset = Dataset::new(format!("mongodb:{path}"), name.to_string());
     let connection_string =
@@ -148,7 +178,7 @@ pub fn make_mongodb_change_stream_dataset_inferred(path: &str, name: &str, port:
     // No primary_key / on_conflict — schema inference supplies `_id` + upsert.
     dataset.acceleration = Some(Acceleration {
         enabled: true,
-        engine: Some("duckdb".to_string()),
+        engine: Some("cayenne".to_string()),
         refresh_mode: Some(RefreshMode::Changes),
         ..Default::default()
     });
@@ -156,14 +186,10 @@ pub fn make_mongodb_change_stream_dataset_inferred(path: &str, name: &str, port:
 }
 
 #[instrument]
-pub async fn start_mongodb_docker_container(
-    port: u16,
-) -> Result<RunningContainer<'static>, anyhow::Error> {
-    let container_name = format!("{MONGODB_DOCKER_CONTAINER}-{port}");
-    let container_name: &'static str = Box::leak(container_name.into_boxed_str());
-    let running_container = ContainerRunnerBuilder::new(container_name)
-        .image(MONGODB_IMAGE.to_string())
-        .add_port_binding(27017, port)
+pub async fn start_mongodb_docker_container() -> Result<RunningContainer, anyhow::Error> {
+    let running_container = ContainerRunnerBuilder::new(MONGODB_DOCKER_CONTAINER)
+        .image(source_image(Source::MongoDb)?)
+        .publish_port(27017)
         .add_env_var("MONGO_INITDB_ROOT_USERNAME", "root")
         .add_env_var("MONGO_INITDB_ROOT_PASSWORD", MONGODB_ROOT_PASSWORD)
         .add_env_var("MONGO_INITDB_DATABASE", "testdb")
@@ -185,20 +211,16 @@ pub async fn start_mongodb_docker_container(
         .run(Some(MONGODB_CONTAINER_START_TIMEOUT))
         .await?;
 
-    wait_for_mongodb_host_port(port).await?;
+    wait_for_mongodb_host_port(running_container.host_port(27017)?).await?;
     Ok(running_container)
 }
 
-#[cfg(feature = "duckdb")]
 #[instrument]
-pub async fn start_mongodb_replica_set_docker_container(
-    port: u16,
-) -> Result<RunningContainer<'static>, anyhow::Error> {
-    let container_name = format!("{MONGODB_DOCKER_CONTAINER}-rs-{port}");
-    let container_name: &'static str = Box::leak(container_name.into_boxed_str());
-    let running_container = ContainerRunnerBuilder::new(container_name)
-        .image(MONGODB_IMAGE.to_string())
-        .add_port_binding(27017, port)
+pub async fn start_mongodb_replica_set_docker_container() -> Result<RunningContainer, anyhow::Error>
+{
+    let running_container = ContainerRunnerBuilder::new(&format!("{MONGODB_DOCKER_CONTAINER}-rs"))
+        .image(source_image(Source::MongoDb)?)
+        .publish_port(27017)
         .command(["mongod", "--replSet", "rs0", "--bind_ip_all"])
         .healthcheck(HealthConfig {
             test: Some(vec![
@@ -218,19 +240,22 @@ pub async fn start_mongodb_replica_set_docker_container(
         .run(Some(MONGODB_CONTAINER_START_TIMEOUT))
         .await?;
 
-    wait_for_mongodb_rs_node_port(port).await?;
+    wait_for_mongodb_rs_node_port(running_container.host_port(27017)?).await?;
     initiate_mongodb_replica_set(&running_container).await?;
     Ok(running_container)
 }
 
-#[cfg(feature = "duckdb")]
 async fn initiate_mongodb_replica_set(
-    running_container: &RunningContainer<'_>,
+    running_container: &RunningContainer,
 ) -> Result<(), anyhow::Error> {
-    let initiate =
-        "mongosh --quiet --eval \"rs.initiate({_id:'rs0',members:[{_id:0,host:'localhost:27017'}]})\""
-            .to_string();
-    let _ = running_container.exec_cmd(&initiate).await?;
+    running_container
+        .exec([
+            "mongosh",
+            "--quiet",
+            "--eval",
+            "rs.initiate({_id:'rs0',members:[{_id:0,host:'localhost:27017'}]})",
+        ])
+        .await?;
 
     let start_time = std::time::Instant::now();
     let mut last_output = None;
@@ -253,7 +278,6 @@ async fn initiate_mongodb_replica_set(
     ))
 }
 
-#[cfg(feature = "duckdb")]
 async fn wait_for_mongodb_rs_node_port(port: u16) -> Result<(), anyhow::Error> {
     let start_time = std::time::Instant::now();
     let mut last_error = None;
@@ -318,7 +342,6 @@ pub async fn get_mongodb_client(port: u16) -> Result<mongodb::Client, anyhow::Er
     Ok(client)
 }
 
-#[cfg(feature = "duckdb")]
 #[instrument]
 pub async fn get_mongodb_replica_set_client(port: u16) -> Result<mongodb::Client, anyhow::Error> {
     let uri = format!("mongodb://localhost:{port}/testdb?directConnection=true&replicaSet=rs0");

@@ -16,10 +16,7 @@ limitations under the License.
 
 //! Common test utilities for Cayenne with multiple metastore backends
 
-#![expect(
-    dead_code,
-    reason = "Shared test helper module compiled into multiple test crates; not every item is used by every crate"
-)]
+pub mod lookup_index;
 
 use std::sync::Arc;
 
@@ -27,6 +24,8 @@ use arrow::record_batch::RecordBatch;
 use cayenne::{CayenneCatalog, CayenneTableProvider, MetadataCatalog};
 use datafusion::datasource::TableProvider;
 use datafusion::datasource::memory::MemorySourceConfig;
+use datafusion::execution::SendableRecordBatchStream;
+use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use datafusion::prelude::SessionContext;
 use datafusion_common::Result as DFResult;
 use datafusion_expr::dml::InsertOp;
@@ -36,16 +35,12 @@ use tempfile::TempDir;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BackendType {
     Sqlite,
-    #[cfg(feature = "turso")]
-    Turso,
 }
 
 impl BackendType {
     pub fn name(self) -> &'static str {
         match self {
             BackendType::Sqlite => "SQLite",
-            #[cfg(feature = "turso")]
-            BackendType::Turso => "Turso",
         }
     }
 }
@@ -70,11 +65,6 @@ impl TestFixture {
                 let db_path = temp_dir.path().join("test.db");
                 format!("sqlite://{}", db_path.to_string_lossy())
             }
-            #[cfg(feature = "turso")]
-            BackendType::Turso => {
-                let db_path = temp_dir.path().join("test.db");
-                format!("libsql://{}", db_path.to_string_lossy())
-            }
         };
 
         let catalog = Arc::new(CayenneCatalog::new(connection_string)?);
@@ -95,29 +85,48 @@ impl TestFixture {
 
     /// Connection string for this fixture's backend, matching the scheme used
     /// in [`TestFixture::new`]. Tests that simulate a restart (reopen the
-    /// catalog from disk) must use this rather than hardcoding `sqlite://`,
-    /// otherwise the Turso variant reopens a Turso-format file with the `SQLite`
-    /// backend and fails with "file is not a database".
+    /// catalog from disk) use this rather than building their own.
     pub fn connection_string(&self) -> String {
         let db_path = self.db_path();
         match self.backend_type {
             BackendType::Sqlite => format!("sqlite://{}", db_path.to_string_lossy()),
-            #[cfg(feature = "turso")]
-            BackendType::Turso => format!("libsql://{}", db_path.to_string_lossy()),
         }
     }
+}
+
+/// Wrap one record batch in a [`SendableRecordBatchStream`].
+pub fn single_batch_stream(batch: RecordBatch) -> SendableRecordBatchStream {
+    let schema = batch.schema();
+    Box::pin(RecordBatchStreamAdapter::new(
+        schema,
+        futures::stream::iter([Ok(batch)]),
+    ))
 }
 
 /// Stack size for the thread a backend-parameterized test body runs on.
 ///
 /// The mutation and cold-tier workloads plan and unparse deeply enough to need
-/// more than the 2 MiB std gives a thread, and how much more depends on the
-/// metastore backend: the Turso variants of four of them need above 2 MiB where
-/// their `SQLite` siblings fit (#12436). 16 MiB matches the headroom
+/// more than the 2 MiB std gives a thread (#12436). 16 MiB matches the headroom
 /// `runtime`'s own deep-plan tests reserve
 /// (`crates/runtime/tests/cayenne/transaction.rs`), and is address space
 /// reserved rather than memory committed.
 pub const TEST_STACK_SIZE: usize = 16 * 1024 * 1024;
+
+/// Fails the calling test unless it runs in a process of its own.
+///
+/// nextest runs every test in its own process; plain `cargo test` runs a
+/// binary's tests on threads of one process. A test that changes process-global
+/// state calls this before changing it, so under `cargo test` it fails with
+/// instructions instead of changing the state every neighbouring test runs under.
+/// `why` names that state.
+pub fn require_process_per_test(why: &str) {
+    assert!(
+        std::env::var("NEXTEST_EXECUTION_MODE").as_deref() == Ok("process-per-test"),
+        "{why}, so it must run in a process of its own. Run it with \
+         `cargo nextest run -p cayenne <test name>`: plain \
+         `cargo test` runs every test in the binary on threads of one process"
+    );
+}
 
 /// Run a test with all available backends
 #[macro_export]
@@ -130,12 +139,6 @@ macro_rules! test_with_backends {
                 common::run_with_backend_blocking(common::BackendType::Sqlite, $test_fn)
             }
 
-            #[cfg(feature = "turso")]
-            #[test]
-            fn [<$test_fn _turso>]() -> Result<(), String> {
-                tracing::debug!("\n🔧 Running {} with Turso backend", stringify!($test_fn));
-                common::run_with_backend_blocking(common::BackendType::Turso, $test_fn)
-            }
         }
     };
 }
@@ -216,6 +219,18 @@ pub async fn insert_batches(
     provider: &CayenneTableProvider,
     batches: Vec<RecordBatch>,
 ) -> DFResult<u64> {
+    write_batches(provider, batches, InsertOp::Append).await
+}
+
+/// Write record batches through the `insert_into()` API with `op`, in one
+/// write; returns the row count the write reports.
+///
+/// Creates a temporary `SessionContext` internally.
+pub async fn write_batches(
+    provider: &CayenneTableProvider,
+    batches: Vec<RecordBatch>,
+    op: InsertOp,
+) -> DFResult<u64> {
     use datafusion::physical_plan::collect;
 
     if batches.is_empty() {
@@ -227,9 +242,7 @@ pub async fn insert_batches(
     let ctx = SessionContext::new();
     let schema = Arc::clone(batches[0].schema_ref());
     let input_exec = MemorySourceConfig::try_new_exec(&[batches], schema, None)?;
-    let insert_plan = provider
-        .insert_into(&ctx.state(), input_exec, InsertOp::Append)
-        .await?;
+    let insert_plan = provider.insert_into(&ctx.state(), input_exec, op).await?;
     let results = collect(insert_plan, ctx.task_ctx()).await?;
 
     Ok(extract_row_count(&results))
@@ -258,6 +271,33 @@ pub async fn poll_inlined_data_count_zero(
     }
 }
 
+/// Poll `catalog.get_inlined_data_stats(table_id).tombstone_entry_count` until it
+/// is at or below `limit`, or the timeout elapses; returns the last count seen.
+///
+/// The tombstone sibling of [`poll_inlined_data_count_zero`], and it races the
+/// same background task: the reclamation that drains `cayenne_inlined_delete`
+/// runs in a `tokio::spawn` scheduled from the write path.
+pub async fn poll_inlined_delete_count_at_most(
+    catalog: &Arc<CayenneCatalog>,
+    table_id: &str,
+    limit: i64,
+) -> Result<i64, Box<dyn std::error::Error>> {
+    use cayenne::MetadataCatalog;
+    const TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+    const POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(50);
+    let started = std::time::Instant::now();
+    loop {
+        let count = catalog
+            .get_inlined_data_stats(table_id)
+            .await?
+            .tombstone_entry_count;
+        if count <= limit || started.elapsed() >= TIMEOUT {
+            return Ok(count);
+        }
+        tokio::time::sleep(POLL_INTERVAL).await;
+    }
+}
+
 /// Read `var` as a positive scale multiplier for fuzz/stress-test depth
 /// (iteration counts, attempt counts, deadlines). Accepts fractions below 1
 /// (e.g. `0.25` for a lighter per-PR pass); a missing, non-positive, or
@@ -270,6 +310,25 @@ pub fn env_scale(var: &str) -> f64 {
         .and_then(|v| v.parse::<f64>().ok())
         .filter(|&v| v > 0.0)
         .unwrap_or(1.0)
+}
+
+/// The key a per-file statistics row is stored under: the object-store location,
+/// which is the store-relative path. The manifest carries only the bare filename.
+pub fn statistics_row_key(
+    data_path: &std::path::Path,
+    table_id: &str,
+    file: &cayenne::metadata::SnapshotFile,
+) -> String {
+    format!(
+        "{}/{}/{}/{}",
+        data_path
+            .to_string_lossy()
+            .trim_start_matches('/')
+            .trim_end_matches('/'),
+        table_id,
+        file.snapshot_id,
+        file.file_path
+    )
 }
 
 /// Extract the row count from insert result batches.

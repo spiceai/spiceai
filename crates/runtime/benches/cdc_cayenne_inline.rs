@@ -23,7 +23,6 @@ limitations under the License.
 //! end to end. Throughput is reported in envelopes/sec via
 //! `criterion::Throughput::Elements`.
 
-#![cfg(not(windows))]
 #![allow(clippy::expect_used)]
 
 use std::hint::black_box;
@@ -41,9 +40,9 @@ use data_components::cdc::{
     ChangeBatch, ChangeEnvelope, ChangesStream, CommitChange, CommitError, StreamError,
     changes_schema,
 };
+use datafusion::common::TableReference;
 use datafusion::datasource::TableProvider;
 use datafusion::prelude::SessionContext;
-use datafusion::sql::TableReference;
 use futures::StreamExt;
 use futures::stream as fstream;
 use runtime::accelerated::refresh::Refresh;

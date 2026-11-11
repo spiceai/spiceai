@@ -32,7 +32,10 @@ use datafusion::execution::context::{ExecutionProps, SessionContext};
 use datafusion::logical_expr::expr::ScalarFunction;
 use datafusion::logical_expr::{ColumnarValue, ScalarUDF, TableProviderFilterPushDown};
 use datafusion::physical_expr::create_physical_expr;
-use datafusion::physical_plan::{DisplayAs, ExecutionPlan, PlanProperties, collect};
+use datafusion::physical_plan::{
+    ChildrenPropertiesMode, DisplayAs, ExecutionPlan, PlanProperties, ReplaceChildrenOptions,
+    collect,
+};
 use datafusion::scalar::ScalarValue;
 use datafusion::{arrow, prelude::*};
 use runtime_datafusion_udfs::{bucket, truncate};
@@ -114,6 +117,17 @@ impl ExecutionPlan for PartitionMemTableExec {
         self.mem_table_exec.properties()
     }
 
+    fn apply_expressions(
+        &self,
+        f: &mut dyn FnMut(
+            &Arc<dyn datafusion::physical_plan::PhysicalExpr>,
+        ) -> datafusion::error::Result<
+            datafusion::common::tree_node::TreeNodeRecursion,
+        >,
+    ) -> datafusion::error::Result<datafusion::common::tree_node::TreeNodeRecursion> {
+        self.mem_table_exec.apply_expressions(f)
+    }
+
     fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> {
         self.mem_table_exec.children()
     }
@@ -125,7 +139,10 @@ impl ExecutionPlan for PartitionMemTableExec {
         let partition_values = self.partition_values.clone();
         let filters = self.filters.clone();
         let limit = self.limit;
-        let new_mem_table_exec = Arc::clone(&self.mem_table_exec).with_new_children(children)?;
+        let new_mem_table_exec = Arc::clone(&self.mem_table_exec).replace_children(
+            children,
+            ReplaceChildrenOptions::new(ChildrenPropertiesMode::Recompute),
+        )?;
         Ok(Arc::new(PartitionMemTableExec {
             mem_table_exec: new_mem_table_exec,
             partition_values,
@@ -459,8 +476,12 @@ async fn test_bucket_in_list_plan_filtering() -> Result<(), Box<dyn std::error::
 
     let df_schema = DFSchema::try_from(Arc::clone(&schema))?;
     let execution_props = ExecutionProps::new();
-    let physical_expr =
-        create_physical_expr(&partition_by.expression, &df_schema, &execution_props)?;
+    let physical_expr = create_physical_expr(
+        &partition_by.expression,
+        &df_schema,
+        &execution_props,
+        &datafusion::logical_expr::physical_planning_context::PhysicalPlanningContext::default(),
+    )?;
     let batch_values = physical_expr.evaluate(&batch)?;
     let bucket_values = match batch_values {
         ColumnarValue::Array(array) => array
@@ -581,8 +602,12 @@ async fn test_truncate_in_list_plan_filtering() -> Result<(), Box<dyn std::error
 
     let df_schema = DFSchema::try_from(Arc::clone(&schema))?;
     let execution_props = ExecutionProps::new();
-    let physical_expr =
-        create_physical_expr(&partition_by.expression, &df_schema, &execution_props)?;
+    let physical_expr = create_physical_expr(
+        &partition_by.expression,
+        &df_schema,
+        &execution_props,
+        &datafusion::logical_expr::physical_planning_context::PhysicalPlanningContext::default(),
+    )?;
     let batch_values = physical_expr.evaluate(&batch)?;
     let truncated_values = match batch_values {
         ColumnarValue::Array(array) => array

@@ -17,49 +17,30 @@ limitations under the License.
 mod credential_provider;
 pub mod object_store_builder;
 
-use std::sync::{Arc, LazyLock};
+pub use aws_identity::{
+    AwsConfigLoader, apn_app_name, default_aws_config, identity_token, named_chain,
+};
+
+use std::sync::Arc;
 use std::time::Duration;
 
 use aws_config::Region;
+use aws_config::SdkConfig;
 use aws_config::ecs::EcsCredentialsProvider;
 use aws_config::environment::EnvironmentVariableCredentialsProvider;
 use aws_config::imds::credentials::ImdsCredentialsProvider;
 use aws_config::meta::credentials::CredentialsProviderChain;
 use aws_config::provider_config::ProviderConfig;
 use aws_config::web_identity_token::WebIdentityTokenCredentialsProvider;
-use aws_config::{AppName, BehaviorVersion, SdkConfig};
 use aws_credential_types::provider::error::CredentialsError;
 use aws_sdk_s3::{config::ProvideCredentials, error::ConnectorError};
 use aws_smithy_runtime_api::client::runtime_components::BuildError;
 pub use credential_provider::S3CredentialProvider;
-use object_store::{ObjectStore, aws::AmazonS3Builder, client::SpawnedReqwestConnector};
+use object_store::{ObjectStore, aws::AmazonS3Builder};
+use object_store_spawn::SpawnedReqwestConnector;
 use tokio::{runtime::Handle, sync::OnceCell, time::sleep};
 use url::Url;
 use util::fibonacci_backoff::FibonacciBackoffBuilder;
-
-/// The APN user-agent string for Spice.
-///
-/// This is set on all AWS SDK configurations to identify Spice as an AWS Partner Network (APN)
-/// application in the user-agent header of AWS API requests.
-///
-/// The `AppName::new` call is infallible for this input: the name contains only alphanumeric
-/// characters plus `.` and `-`, all of which are permitted. The name is truncated to 50
-/// characters to stay within the AWS SDK's recommended limit.
-static APN_APP_NAME: LazyLock<AppName> = LazyLock::new(|| {
-    let version = env!("CARGO_PKG_VERSION");
-    let mut name = format!("Spice-{version}");
-    name.truncate(50);
-    match AppName::new(name) {
-        Ok(name) => name,
-        Err(_) => unreachable!("Spice version string should always be a valid AppName"),
-    }
-});
-
-/// Returns the APN [`AppName`] for Spice, suitable for use in AWS SDK configurations.
-#[must_use]
-pub fn apn_app_name() -> &'static AppName {
-    &APN_APP_NAME
-}
 
 #[derive(Debug, snafu::Snafu)]
 pub enum Error {
@@ -97,18 +78,9 @@ pub enum LoadError {
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
 
-/// Returns a default AWS SDK configuration with the latest behavior version and
-/// the Spice APN user-agent.
-///
-/// This is a convenience function to ensure all AWS SDK configuration uses
-/// the same behavior version and APN identification consistently across the codebase.
-#[must_use]
-pub fn default_aws_config() -> aws_config::ConfigLoader {
-    aws_config::defaults(BehaviorVersion::v2026_01_12()).app_name(APN_APP_NAME.clone())
-}
-
-#[must_use]
-fn default_aws_config_for_region(region: Option<&str>) -> aws_config::ConfigLoader {
+/// The default configuration in `region`, or the region the environment or the AWS profile
+/// names, with the credential chain every AWS component uses ([`AwsConfigLoader`]).
+fn default_aws_config_for_region(region: Option<&str>) -> AwsConfigLoader {
     match region {
         Some(region) => default_aws_config().region(Region::new(region.to_string())),
         None => default_aws_config(),
@@ -505,6 +477,12 @@ pub fn should_use_sdk_credentials<V, S: std::hash::BuildHasher>(
     }
 }
 
+/// A session token parameter whose secret is not set resolves to an empty string. AWS signers
+/// still send an empty token, so treat it as absent: static keys need no token.
+fn non_empty_session_token(session_token: Option<String>) -> Option<String> {
+    session_token.filter(|token| !token.is_empty())
+}
+
 /// Initiates an AWS SDK configuration with the provided credentials.
 ///
 /// This is a convenience function for creating AWS SDK configurations with explicit credentials
@@ -518,7 +496,7 @@ pub fn should_use_sdk_credentials<V, S: std::hash::BuildHasher>(
 /// - `session_token`: Optional session token
 ///
 /// # Returns
-/// A `ConfigLoader` that can be further customized before loading.
+/// An [`AwsConfigLoader`] that can be further customized before loading.
 ///
 /// When `iam_role_source` is provided:
 /// - `"auto"` or `None`: Uses the default AWS credential chain (env vars, shared config, web identity, ECS, IMDS).
@@ -531,7 +509,7 @@ pub async fn initiate_config_with_credentials(
     secret_access_key: Option<String>,
     session_token: Option<String>,
     iam_role_source: Option<&str>,
-) -> aws_config::ConfigLoader {
+) -> AwsConfigLoader {
     use aws_config::Region;
     use aws_credential_types::Credentials;
 
@@ -539,7 +517,7 @@ pub async fn initiate_config_with_credentials(
         let credentials = Credentials::new(
             access_key_id,
             secret_access_key,
-            session_token,
+            non_empty_session_token(session_token),
             None,
             provider_name,
         );
@@ -577,9 +555,8 @@ pub async fn initiate_config_with_credentials(
 /// - `region`: AWS region
 ///
 /// # Returns
-/// A [`ConfigLoader`] that can be further customized before loading.
-#[must_use]
-pub async fn initiate_config_default_auth(region: String) -> aws_config::ConfigLoader {
+/// An [`AwsConfigLoader`] that can be further customized before loading.
+pub async fn initiate_config_default_auth(region: String) -> AwsConfigLoader {
     if let Err(err) = get_or_init_sdk_config_with_region(Some(region.as_str())).await {
         tracing::warn!("Unable to initialize AWS credentials: {err}");
     }
@@ -598,9 +575,8 @@ pub async fn initiate_config_default_auth(region: String) -> aws_config::ConfigL
 /// - `region`: AWS region
 ///
 /// # Returns
-/// A [`ConfigLoader`] that can be further customized before loading.
-#[must_use]
-pub fn initiate_config_auth_iam_metadata(region: String) -> aws_config::ConfigLoader {
+/// An [`AwsConfigLoader`] that can be further customized before loading.
+pub fn initiate_config_auth_iam_metadata(region: String) -> AwsConfigLoader {
     let provider_config = ProviderConfig::default().with_region(Some(Region::new(region.clone())));
 
     let web_identity_provider = WebIdentityTokenCredentialsProvider::builder()
@@ -634,9 +610,8 @@ pub fn initiate_config_auth_iam_metadata(region: String) -> aws_config::ConfigLo
 /// - `region`: AWS region
 ///
 /// # Returns
-/// A [`ConfigLoader`] that can be further customized before loading.
-#[must_use]
-pub fn initiate_config_auth_iam_env(region: String) -> aws_config::ConfigLoader {
+/// An [`AwsConfigLoader`] that can be further customized before loading.
+pub fn initiate_config_auth_iam_env(region: String) -> AwsConfigLoader {
     let env_provider = EnvironmentVariableCredentialsProvider::new();
 
     default_aws_config()
@@ -656,21 +631,20 @@ pub fn initiate_config_auth_iam_env(region: String) -> aws_config::ConfigLoader 
 /// - `session_token`: Optional AWS session token (for temporary credentials)
 ///
 /// # Returns
-/// A [`ConfigLoader`] that can be further customized before loading.
-#[must_use]
+/// An [`AwsConfigLoader`] that can be further customized before loading.
 pub fn initiate_config_auth_key(
     provider_name: &'static str,
     region: String,
     access_key_id: String,
     secret_access_key: String,
     session_token: Option<String>,
-) -> aws_config::ConfigLoader {
+) -> AwsConfigLoader {
     use aws_credential_types::Credentials;
 
     let credentials = Credentials::new(
         access_key_id,
         secret_access_key,
-        session_token,
+        non_empty_session_token(session_token),
         None,
         provider_name,
     );
@@ -760,7 +734,15 @@ mod tests {
     #[test]
     fn test_get_bucket_name_invalid() {
         let url = Url::parse("s3:///path/to/file").expect("Failed to parse URL");
-        get_bucket_name(&url).expect_err("Should fail to get bucket name");
+        let err = get_bucket_name(&url).expect_err("Should fail to get bucket name");
+        assert!(
+            matches!(&err, Error::ParseBucketName { url } if url == "s3:///path/to/file"),
+            "{err:?}"
+        );
+        assert_eq!(
+            err.to_string(),
+            "Not able to parse bucket name from s3 url: s3:///path/to/file"
+        );
     }
 
     // Tests for determine_s3_credential_config
@@ -962,16 +944,6 @@ mod tests {
         );
     }
 
-    #[test]
-    fn test_should_use_sdk_credentials_without_explicit() {
-        let params: std::collections::HashMap<String, &str> = std::collections::HashMap::new();
-
-        let result = should_use_sdk_credentials(&params, "key", "secret");
-        // Result depends on whether SDK config is initialized, so we just check it doesn't panic
-        // In a real scenario without SDK config, this would return None
-        let _ = result;
-    }
-
     #[tokio::test]
     async fn test_initiate_config_with_explicit_credentials() {
         let config_loader = initiate_config_with_credentials(
@@ -1013,7 +985,7 @@ mod tests {
 
     #[test]
     fn test_apn_app_name_is_valid() {
-        let name: &AppName = &APN_APP_NAME;
+        let name: &aws_config::AppName = apn_app_name();
         let name_str: &str = name.as_ref();
         assert!(
             name_str.starts_with("Spice-"),
@@ -1100,11 +1072,48 @@ mod tests {
             .load()
             .await;
 
-        let store = from_s3_url_and_config(&url, None, &sdk_config, Handle::current());
+        let store = from_s3_url_and_config(&url, None, &sdk_config, Handle::current())
+            .expect("object store should build when the SDK config provides the region");
 
+        assert_eq!(store.to_string(), "AmazonS3(my-bucket)");
+        // `AmazonS3Builder` falls back to `us-east-1` when no region is set, so a successful
+        // build alone does not show the SDK config's region was applied; the store's config does.
+        let described = format!("{store:?}");
         assert!(
-            store.is_ok(),
-            "object store should build when the SDK config provides the region"
+            described.contains(r#"region: "ap-south-1""#),
+            "the store must use the SDK config's region: {described}"
+        );
+    }
+
+    async fn provided_session_token(session_token: Option<&str>) -> Option<String> {
+        use aws_credential_types::provider::ProvideCredentials;
+
+        let config = initiate_config_auth_key(
+            "test",
+            "us-east-1".to_string(),
+            "AKIDEXAMPLE".to_string(),
+            "secret".to_string(),
+            session_token.map(ToString::to_string),
+        )
+        .load()
+        .await;
+        config
+            .credentials_provider()
+            .expect("static credentials are configured")
+            .provide_credentials()
+            .await
+            .expect("static credentials resolve")
+            .session_token()
+            .map(ToString::to_string)
+    }
+
+    #[tokio::test]
+    async fn empty_session_token_is_not_sent() {
+        assert_eq!(provided_session_token(Some("")).await, None);
+        assert_eq!(provided_session_token(None).await, None);
+        assert_eq!(
+            provided_session_token(Some("FwoToken")).await.as_deref(),
+            Some("FwoToken")
         );
     }
 }

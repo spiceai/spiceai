@@ -75,23 +75,6 @@ async fn setup_sqlite_fixture_async() -> BenchFixture {
     }
 }
 
-#[cfg(feature = "turso")]
-async fn setup_turso_fixture_async() -> BenchFixture {
-    let meta_dir = tempfile::tempdir().expect("Failed to create temp dir");
-    let data_dir = tempfile::tempdir().expect("Failed to create temp dir");
-    let db_path = meta_dir.path().join("meta.db");
-    let connection_string = format!("libsql://{}", db_path.display());
-
-    let catalog = CayenneCatalog::new(&connection_string).expect("create catalog");
-    catalog.init().await.expect("init catalog");
-
-    BenchFixture {
-        catalog: Arc::new(catalog),
-        data_dir,
-        _meta_dir: meta_dir,
-    }
-}
-
 fn create_int64_pk_schema() -> Arc<Schema> {
     Arc::new(Schema::new(vec![
         Field::new("id", DataType::Int64, false),
@@ -256,39 +239,6 @@ fn bench_int64pk_single_delete(c: &mut Criterion) {
                 });
             });
         });
-
-        #[cfg(feature = "turso")]
-        group.bench_with_input(BenchmarkId::new("turso", size), &size, |b, &size| {
-            b.iter(|| {
-                rt.block_on(async {
-                    let fixture = setup_turso_fixture_async().await;
-                    let schema = create_int64_pk_schema();
-                    let table = Arc::new(
-                        CayenneTableProvider::create_table(
-                            Arc::clone(&fixture.catalog) as Arc<dyn MetadataCatalog>,
-                            CreateTableOptions {
-                                table_name: "bench_table".to_string(),
-                                schema: Arc::clone(&schema),
-                                primary_key: vec!["id".to_string()],
-                                base_path: fixture.data_dir.path().to_string_lossy().to_string(),
-                                partition_column: None,
-                                vortex_config: cayenne::metadata::VortexConfig::default(),
-                                on_conflict: None,
-                            },
-                            Arc::new(RuntimeEnv::default()),
-                        )
-                        .await
-                        .expect("create table"),
-                    );
-
-                    let batch = generate_int64_pk_batch(Arc::clone(&schema), size);
-                    insert_batch(&table, batch).await;
-
-                    let deleted = delete_records(&table, col("id").eq(lit(size as i64 / 2))).await;
-                    black_box(deleted);
-                });
-            });
-        });
     }
 
     group.finish();
@@ -408,40 +358,6 @@ fn bench_stringpk_single_delete(c: &mut Criterion) {
             b.iter(|| {
                 rt.block_on(async {
                     let fixture = setup_sqlite_fixture_async().await;
-                    let schema = create_string_pk_schema();
-                    let table = Arc::new(
-                        CayenneTableProvider::create_table(
-                            Arc::clone(&fixture.catalog) as Arc<dyn MetadataCatalog>,
-                            CreateTableOptions {
-                                table_name: "bench_table".to_string(),
-                                schema: Arc::clone(&schema),
-                                primary_key: vec!["code".to_string()],
-                                base_path: fixture.data_dir.path().to_string_lossy().to_string(),
-                                partition_column: None,
-                                vortex_config: cayenne::metadata::VortexConfig::default(),
-                                on_conflict: None,
-                            },
-                            Arc::new(RuntimeEnv::default()),
-                        )
-                        .await
-                        .expect("create table"),
-                    );
-
-                    let batch = generate_string_pk_batch(Arc::clone(&schema), size);
-                    insert_batch(&table, batch).await;
-
-                    let target_code = format!("CODE_{:06}", size / 2);
-                    let deleted = delete_records(&table, col("code").eq(lit(target_code))).await;
-                    black_box(deleted);
-                });
-            });
-        });
-
-        #[cfg(feature = "turso")]
-        group.bench_with_input(BenchmarkId::new("turso", size), &size, |b, &size| {
-            b.iter(|| {
-                rt.block_on(async {
-                    let fixture = setup_turso_fixture_async().await;
                     let schema = create_string_pk_schema();
                     let table = Arc::new(
                         CayenneTableProvider::create_table(
@@ -607,40 +523,6 @@ fn bench_positionbased_single_delete(c: &mut Criterion) {
                     insert_batch(&table, batch).await;
 
                     // Delete middle row by value
-                    let deleted =
-                        delete_records(&table, col("value").eq(lit((size as i64 / 2) * 100))).await;
-                    black_box(deleted);
-                });
-            });
-        });
-
-        #[cfg(feature = "turso")]
-        group.bench_with_input(BenchmarkId::new("turso", size), &size, |b, &size| {
-            b.iter(|| {
-                rt.block_on(async {
-                    let fixture = setup_turso_fixture_async().await;
-                    let schema = create_no_pk_schema();
-                    let table = Arc::new(
-                        CayenneTableProvider::create_table(
-                            Arc::clone(&fixture.catalog) as Arc<dyn MetadataCatalog>,
-                            CreateTableOptions {
-                                table_name: "bench_table".to_string(),
-                                schema: Arc::clone(&schema),
-                                primary_key: vec![],
-                                base_path: fixture.data_dir.path().to_string_lossy().to_string(),
-                                partition_column: None,
-                                vortex_config: cayenne::metadata::VortexConfig::default(),
-                                on_conflict: None,
-                            },
-                            Arc::new(RuntimeEnv::default()),
-                        )
-                        .await
-                        .expect("create table"),
-                    );
-
-                    let batch = generate_no_pk_batch(Arc::clone(&schema), size);
-                    insert_batch(&table, batch).await;
-
                     let deleted =
                         delete_records(&table, col("value").eq(lit((size as i64 / 2) * 100))).await;
                     black_box(deleted);

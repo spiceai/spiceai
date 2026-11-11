@@ -1,5 +1,11 @@
 name: release_from_run
 
+# Recovery publish for release lines cut before build_release and
+# publish_release existed (2.4 and earlier), whose tag builds still publish
+# their own binaries. Newer releases are published only by publish_release.
+# workflow_dispatch needs the file on the default branch, so it stays here
+# until those lines are retired.
+
 on:
   workflow_dispatch:
     inputs:
@@ -18,6 +24,7 @@ permissions:
 
 jobs:
   publish:
+    environment: github-publish
     name: Publish binaries from existing run
     runs-on: ubuntu-24.04
     env:
@@ -36,7 +43,7 @@ jobs:
       # default token) so the recovery publishes whatever was successfully
       # built, gracefully skipping any that are absent.
       - name: Download all artifacts from run ${{ inputs.run_id }}
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
         with:
           path: ${{ env.ARTIFACT_DIR }}/raw
           github-token: ${{ secrets.GITHUB_TOKEN }}
@@ -49,7 +56,11 @@ jobs:
           mkdir -p "${ARTIFACT_DIR}"
 
           # Flatten downloaded artifacts to a single directory of .tar.gz release assets.
-          find "${ARTIFACT_DIR}/raw" -type f -name "*.tar.gz" -print -exec cp -f {} "${ARTIFACT_DIR}/" \;
+          # Match the asset set the tagged publish jobs attach: they download
+          # spice/spice.exe/spiced/spiced_metal by name, so spiced_odbc has
+          # never shipped on a release. Recovery must not be the path that
+          # adds it.
+          find "${ARTIFACT_DIR}/raw" -type f -name "*.tar.gz" ! -name "spiced_odbc_*" -print -exec cp -f {} "${ARTIFACT_DIR}/" \;
 
           # Keep only flattened archives at top-level release dir.
           rm -rf "${ARTIFACT_DIR}/raw"
@@ -64,12 +75,13 @@ jobs:
 
       - name: Publish binaries to GitHub release
         shell: bash
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           set -euo pipefail
 
           OWNER_NAME="${GITHUB_REPOSITORY%%/*}"
           REPO_NAME="${GITHUB_REPOSITORY#*/}"
-          export GITHUB_TOKEN="${{ secrets.GITHUB_TOKEN }}"
 
           shopt -s nullglob
           RELEASE_ARTIFACT=("${ARTIFACT_DIR}"/*.tar.gz)
@@ -86,10 +98,12 @@ jobs:
             "${RELEASE_ARTIFACT[@]}"
 
           RELEASE_NOTES_FILE="./docs/release_notes/v${REL_VERSION}.md"
+          # Pass the notes by path, not by value: a release body over 128 KiB
+          # exceeds MAX_ARG_STRLEN and the exec fails with E2BIG (exit 126).
           if [ -f "$RELEASE_NOTES_FILE" ]; then
-            export RELEASE_BODY="$(cat "$RELEASE_NOTES_FILE")"
+            BODY_ARGS=(--body-file "$RELEASE_NOTES_FILE")
           else
-            export RELEASE_BODY="Release ${REL_VERSION}"
+            BODY_ARGS=(--body "Release ${REL_VERSION}")
           fi
 
           PRE_RELEASE="false"
@@ -102,6 +116,6 @@ jobs:
             --owner "$OWNER_NAME" --repo "$REPO_NAME" \
             --tag "v${REL_VERSION}" \
             --release-name "v${REL_VERSION}" \
-            --body "${RELEASE_BODY}" \
+            "${BODY_ARGS[@]}" \
             --prerelease "$PRE_RELEASE" \
             "${RELEASE_ARTIFACT[@]}"

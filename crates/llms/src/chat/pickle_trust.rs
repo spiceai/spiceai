@@ -49,10 +49,7 @@ impl FromStr for PickleTrust {
         match s.trim().to_ascii_lowercase().as_str() {
             "true" | "yes" | "1" => Ok(Self::Trusted),
             "" | "false" | "no" | "0" => Ok(Self::Untrusted),
-            other => Err(format!(
-                "must be one of: {}. Found {other}",
-                Self::VALUES.join(", ")
-            )),
+            _ => Err(format!("must be one of: {}", Self::VALUES.join(", "))),
         }
     }
 }
@@ -87,8 +84,9 @@ mod tests {
     #[test]
     fn rejects_values_outside_the_spec() {
         for raw in ["truthy", "maybe", "2"] {
-            assert!(
-                raw.parse::<PickleTrust>().is_err(),
+            assert_eq!(
+                raw.parse::<PickleTrust>(),
+                Err("must be one of: true, false".to_string()),
                 "{raw:?} should be rejected"
             );
         }

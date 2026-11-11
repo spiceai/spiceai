@@ -1,0 +1,99 @@
+name: localpod
+description: >
+  `localpod:` datasets over a Cayenne parent load its rows at startup —
+  an accelerated child, a passthrough child, a sibling and a grandchild
+  declared before its parent — and the direct children follow each parent
+  refresh, with and without the SQL results cache (whose answers age out on
+  their TTL). With an Arrow parent the
+  children also follow a change to the parent's refresh SQL. (What they do
+  not follow: known-failing/other/localpod-follow.yaml.)
+
+sources:
+  src: { kind: postgres }
+
+variants:
+  results-cache: {}
+  no-results-cache: { spicepod: { runtime: { caching: { sql_results: { enabled: false } } } } }
+  arrow:
+    spicepod: { runtime: { caching: { sql_results: { enabled: false } } } }
+    datasets: { '*': { acceleration: { engine: arrow, mode: memory } } }
+
+spicepod:
+  version: v1
+  kind: Spicepod
+  name: localpod
+  runtime:
+    caching: { sql_results: { enabled: true, item_ttl: 3s } }
+  datasets:
+    - &grandchild
+      from: localpod:child
+      name: grandchild
+      acceleration: { enabled: true, engine: cayenne, mode: file, refresh_mode: full }
+    - &parent
+      from: postgres:public.t
+      name: parent
+      params: ${sources.src.params}
+      acceleration: { enabled: true, engine: cayenne, mode: file, refresh_mode: full, refresh_check_interval: 1h }
+    - &child
+      from: localpod:parent
+      name: child
+      acceleration: { enabled: true, engine: cayenne, mode: file, refresh_mode: full }
+    - &sibling
+      from: localpod:parent
+      name: sibling
+      acceleration: { enabled: true, engine: cayenne, mode: memory, refresh_mode: full }
+    - &passthrough
+      from: localpod:parent
+      name: passthrough
+
+defaults:
+  spiced-args: [--pods-watcher-enabled]
+  cluster-partition-by: { '*': id }
+  expect: { oracle: src }
+  compare-variants: false
+
+steps:
+  - source-exec: { src: "CREATE TABLE t (id int PRIMARY KEY, v text); INSERT INTO t SELECT i, 'v' || i FROM generate_series(1, 5) i" }
+  - start: {}
+  - query: SELECT id, v FROM parent
+    oracle-sql: SELECT id, v FROM t
+  - query: SELECT id, v FROM child
+    oracle-sql: SELECT id, v FROM t
+  - query: SELECT id, v FROM sibling
+    oracle-sql: SELECT id, v FROM t
+  - query: SELECT id, v FROM passthrough
+    oracle-sql: SELECT id, v FROM t
+  - query: SELECT id, v FROM grandchild
+    oracle-sql: SELECT id, v FROM t
+    eventually: 30s
+
+  # A parent refresh reaches every child; through the results cache, once the
+  # cached answers have aged out.
+  - source-exec: { src: "INSERT INTO t VALUES (6, 'v6'); UPDATE t SET v = 'changed' WHERE id = 1; DELETE FROM t WHERE id = 2" }
+  - refresh: parent
+  - query: SELECT id, v FROM parent
+    oracle-sql: SELECT id, v FROM t
+    eventually: 30s
+  - query: SELECT id, v FROM child
+    oracle-sql: SELECT id, v FROM t
+    eventually: 30s
+  - query: SELECT id, v FROM sibling
+    oracle-sql: SELECT id, v FROM t
+    eventually: 30s
+  - query: SELECT id, v FROM passthrough
+    oracle-sql: SELECT id, v FROM t
+    eventually: 30s
+
+  # The parent's entry changes: with an Arrow parent the children follow.
+  - edit-spicepod:
+      datasets:
+        parent: { acceleration: { refresh_sql: SELECT * FROM parent WHERE id <= 4 } }
+    only: arrow
+  - query: SELECT id, v FROM parent
+    oracle-sql: SELECT id, v FROM t WHERE id <= 4
+    eventually: 60s
+    only: arrow
+  - query: SELECT id, v FROM child
+    oracle-sql: SELECT id, v FROM t WHERE id <= 4
+    eventually: 60s
+    only: arrow

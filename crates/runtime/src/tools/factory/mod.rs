@@ -31,6 +31,7 @@ use runtime_tools::{
 
 use super::{Tooling, builtin::catalog::BuiltinToolCatalog};
 
+#[derive(Clone)]
 pub enum ToolFactory {
     Catalog(Arc<dyn ToolCatalogFactory>),
     Tool(Arc<dyn IndividualToolFactory>),
@@ -109,6 +110,8 @@ pub async fn unregister_all_factories(rt: &Runtime) {
 
     let mut tools = rt.tools.write().await;
     tools.clear();
+    #[cfg(feature = "mcp")]
+    rt.mcp_schemas.clear();
 }
 
 /// Get all catalogs available by default in the spice runtime.
@@ -141,11 +144,89 @@ pub async fn forge(
         .split_once(':')
         .map_or("builtin", |(a, _b)| a);
 
-    let tool_factories = rt.tool_factories();
-    let registry = tool_factories.lock().await;
+    // Not held across `construct`: one tool that is slow to construct must not block the others.
+    let factory = rt.tool_factories().lock().await.get(from_source).cloned();
 
-    match registry.get(from_source) {
+    match factory {
         Some(factory) => factory.construct(component, secrets, env).await,
-        None => Err(format!("Tool factory not found for source: {from_source}").into()),
+        None => Err(Box::new(ToolFactoryNotFound {
+            from_source: from_source.to_string(),
+        })),
+    }
+}
+
+/// A tool's `from` names a source no tool factory handles. No retry can clear it.
+#[derive(Debug)]
+pub struct ToolFactoryNotFound {
+    from_source: String,
+}
+
+impl std::fmt::Display for ToolFactoryNotFound {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "Tool factory not found for source: {}", self.from_source)
+    }
+}
+
+impl std::error::Error for ToolFactoryNotFound {}
+
+#[cfg(test)]
+mod tests {
+    use std::time::Duration;
+
+    use async_trait::async_trait;
+
+    use super::*;
+
+    struct Stalled;
+
+    #[async_trait]
+    impl ToolCatalogFactory for Stalled {
+        async fn construct(
+            &self,
+            _component: &Tool,
+            _params_with_secrets: HashMap<String, SecretString>,
+            _env: HashMap<String, SecretString>,
+        ) -> Result<Arc<dyn SpiceToolCatalog>, Box<dyn std::error::Error + Send + Sync>> {
+            std::future::pending().await
+        }
+    }
+
+    fn tool(from: &str) -> Tool {
+        serde_json::from_value(serde_json::json!({"from": from, "name": "t"}))
+            .expect("a valid tool")
+    }
+
+    #[tokio::test]
+    async fn a_tool_that_never_constructs_does_not_block_other_tools() {
+        let rt = Arc::new(Runtime::builder().build().await);
+        rt.tool_factories().lock().await.insert(
+            "stalled".to_string(),
+            ToolFactory::Catalog(Arc::new(Stalled)),
+        );
+        let stalled_rt = Arc::clone(&rt);
+        let stalled = tokio::spawn(async move {
+            forge(
+                &tool("stalled:x"),
+                HashMap::new(),
+                stalled_rt,
+                HashMap::new(),
+            )
+            .await
+        });
+        tokio::time::sleep(Duration::from_millis(200)).await;
+
+        let other = tokio::time::timeout(
+            Duration::from_secs(10),
+            forge(
+                &tool("missing:x"),
+                HashMap::new(),
+                Arc::clone(&rt),
+                HashMap::new(),
+            ),
+        )
+        .await
+        .expect("another tool's load is not blocked by the stalled one");
+        assert!(other.is_err_and(|e| e.to_string().contains("Tool factory not found")));
+        stalled.abort();
     }
 }

@@ -226,22 +226,26 @@ pub(crate) async fn evict_clean_files(paths: Vec<PathBuf>) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::io::Write;
 
-    /// `flush_and_evict` succeeds on a freshly written+closed file (exercises
-    /// the real `sync_file_range`+`posix_fadvise` syscalls on Linux; a no-op
-    /// elsewhere). It must never error on a valid, durable file.
+    /// `flush_and_evict` succeeds on a freshly written+closed file whose pages
+    /// are still dirty — a compaction output's state, since nothing fsyncs its
+    /// contents — and leaves every byte intact (exercises the real
+    /// `sync_file_range`+`posix_fadvise` syscalls on Linux; a no-op elsewhere).
     #[test]
     fn flush_and_evict_succeeds_on_written_file() {
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().join("probe.vortex");
-        {
-            let mut file = std::fs::File::create(&path).expect("create probe file");
-            file.write_all(&vec![0xA5_u8; 1 << 20])
-                .expect("write 1 MiB probe");
-            file.sync_all().expect("sync probe file");
-        }
-        flush_and_evict(&path).expect("flush_and_evict must succeed on a durable file");
+        let written = vec![0xA5_u8; 1 << 20];
+        std::fs::write(&path, &written).expect("write 1 MiB probe without syncing it");
+        flush_and_evict(&path).expect("flush_and_evict must succeed on a written file");
+
+        // The hint drops cached pages, never data.
+        let read_back = std::fs::read(&path).expect("read the probe back");
+        assert_eq!(read_back.len(), written.len(), "the probe's length changed");
+        assert!(
+            read_back == written,
+            "flush_and_evict changed the probe's contents"
+        );
     }
 
     /// The batch wrapper drains a mixed list without panicking and is a no-op on
@@ -261,19 +265,29 @@ mod tests {
     }
 
     /// `drop_clean` succeeds on a freshly written + synced (clean) file — the
-    /// compaction-input case (no dirty pages, hence no `sync_file_range`). A
-    /// no-op elsewhere; it must never error on a valid, clean file.
+    /// compaction-input case (no dirty pages, hence no `sync_file_range`) — and
+    /// leaves every byte intact. A no-op elsewhere.
     #[test]
     fn drop_clean_succeeds_on_clean_file() {
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().join("input.vortex");
-        {
-            let mut file = std::fs::File::create(&path).expect("create input file");
-            file.write_all(&vec![0x5A_u8; 1 << 20])
-                .expect("write 1 MiB input");
-            file.sync_all().expect("sync input file");
-        }
+        let written = vec![0x5A_u8; 1 << 20];
+        std::fs::write(&path, &written).expect("write 1 MiB input");
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(&path)
+            .expect("reopen the input")
+            .sync_all()
+            .expect("sync input file");
         drop_clean(&path).expect("drop_clean must succeed on a clean file");
+
+        // The hint drops cached pages, never data.
+        let read_back = std::fs::read(&path).expect("read the input back");
+        assert_eq!(read_back.len(), written.len(), "the input's length changed");
+        assert!(
+            read_back == written,
+            "drop_clean changed the input's contents"
+        );
     }
 
     /// The clean-input batch wrapper drains a mixed list without panicking and is

@@ -33,7 +33,7 @@ use arrow_schema::{DataType, Field, Schema};
 use aws_sdk_credential_bridge::{S3CredentialProvider, get_or_init_sdk_config};
 use data_components::RefreshableCatalogProvider;
 use datafusion::assert_batches_eq;
-use datafusion::sql::TableReference;
+use datafusion::common::TableReference;
 use futures::{StreamExt, TryStreamExt};
 use object_store::ObjectStoreExt;
 use object_store::{ClientOptions, ObjectStore, aws::AmazonS3Builder, path::Path as ObjectPath};
@@ -57,9 +57,7 @@ use tokio::time::sleep;
 use tonic::transport::Channel;
 
 /// Gated serializable transaction (`BEGIN … COMMIT`) regression tests + bench.
-/// Gated off Windows to match the other Cayenne provider-level tests.
-#[cfg(not(target_os = "windows"))]
-mod transaction;
+pub(crate) mod transaction;
 
 /// Append a single row to a Cayenne-accelerated table through the Runtime write path.
 ///
@@ -556,6 +554,7 @@ async fn test_cayenne_s3_express_multi_zone_live() -> Result<(), String> {
                 refresh_mode: Some(RefreshMode::Full),
                 primary_key: Some("VendorID".to_string()),
                 on_conflict,
+                write_mode: spicepod::acceleration::WriteMode::Acceleration,
                 params: Some(accel_params),
                 ..Acceleration::default()
             });
@@ -2030,6 +2029,9 @@ fn make_datalake_nation_dataset(
     params.insert("cayenne_datalake_s3_auth".to_string(), "key".to_string());
     params.insert("cayenne_datalake_s3_key".to_string(), key.to_string());
     params.insert("cayenne_datalake_s3_secret".to_string(), secret.to_string());
+    if let Some(token) = crate::utils::nonempty_env("AWS_SNAPSHOT_SESSION_TOKEN") {
+        params.insert("cayenne_datalake_s3_session_token".to_string(), token);
+    }
     params.insert(
         "cayenne_datalake_s3_region".to_string(),
         DATALAKE_TEST_REGION.to_string(),
@@ -2085,7 +2087,8 @@ async fn query_single_i64(rt: &Runtime, sql: &str) -> Result<i64, String> {
 /// Runs against real S3 (bucket [`DATALAKE_TEST_BUCKET`]) with a few KB of
 /// transfer per run. Credentials: `AWS_SNAPSHOT_KEY`/`AWS_SNAPSHOT_SECRET`
 /// (already provisioned in the integration-test CI environment; the same pair
-/// the snapshot-refresh tests use). FAILS when the credentials are missing —
+/// the snapshot-refresh tests use), plus `AWS_SNAPSHOT_SESSION_TOKEN` when the
+/// credentials are short-lived. FAILS when the credentials are missing —
 /// a silent skip would read as coverage that doesn't exist.
 #[tokio::test]
 async fn test_cayenne_datalake_tier_e2e() -> Result<(), String> {
@@ -2121,12 +2124,16 @@ async fn test_cayenne_datalake_tier_e2e() -> Result<(), String> {
 
             // Direct S3 client for listing/cleanup (validation only — all
             // acceleration operations go through the Runtime).
+            let mut store_builder = AmazonS3Builder::new()
+                .with_bucket_name(DATALAKE_TEST_BUCKET)
+                .with_region(DATALAKE_TEST_REGION)
+                .with_access_key_id(&key)
+                .with_secret_access_key(&secret);
+            if let Some(token) = crate::utils::nonempty_env("AWS_SNAPSHOT_SESSION_TOKEN") {
+                store_builder = store_builder.with_token(token);
+            }
             let store: Arc<dyn ObjectStore> = Arc::new(
-                AmazonS3Builder::new()
-                    .with_bucket_name(DATALAKE_TEST_BUCKET)
-                    .with_region(DATALAKE_TEST_REGION)
-                    .with_access_key_id(&key)
-                    .with_secret_access_key(&secret)
+                store_builder
                     .build()
                     .map_err(|e| format!("failed to build S3 client: {e}"))?,
             );

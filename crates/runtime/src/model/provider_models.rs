@@ -84,6 +84,13 @@ pub async fn get_available_models_hint(
                 }
             }
         }
+        ModelSource::TypeSafe => match llms::typesafe::TypeSafeModelLister::from_params(params) {
+            Ok(lister) => Box::new(lister),
+            Err(e) => {
+                tracing::debug!("Cannot create TypeSafe model lister: {e}");
+                return None;
+            }
+        },
         ModelSource::SpiceAI => match llms::spiceai::SpiceAiModelLister::from_params(params) {
             Ok(lister) => Box::new(lister),
             Err(e) => {

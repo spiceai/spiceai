@@ -106,9 +106,8 @@ impl Document {
         let page_id_to_page_numbers = self.setup_page_id_to_num();
         for (title, (page_id, _page_idx, level)) in outline_page_ids {
             if let Some(page_num) = page_id_to_page_numbers.get(&page_id) {
-                let s;
-                if title.len() < 2 {
-                    s = String::from_utf8_lossy(&title).to_string();
+                let s = if title.len() < 2 {
+                    String::from_utf8_lossy(&title).to_string()
                 } else if title[0] == 0xfe && title[1] == 0xff {
                     if title.len() & 1 != 0 {
                         toc.errors.push(format!(
@@ -121,7 +120,7 @@ impl Document {
                         .skip(1)
                         .map(|x| ((x[0] as u16) << 8) | x[1] as u16)
                         .collect();
-                    s = String::from_utf16_lossy(&t16);
+                    String::from_utf16_lossy(&t16)
                 } else if title[0] == 0xff && title[1] == 0xfe {
                     if title.len() & 1 != 0 {
                         toc.errors.push(format!(
@@ -134,10 +133,10 @@ impl Document {
                         .skip(1)
                         .map(|x| ((x[1] as u16) << 8) | x[0] as u16)
                         .collect();
-                    s = String::from_utf16_lossy(&t16);
+                    String::from_utf16_lossy(&t16)
                 } else {
-                    s = String::from_utf8_lossy(&title).to_string();
-                }
+                    String::from_utf8_lossy(&title).to_string()
+                };
                 toc.toc.push(TocType {
                     level,
                     title: s,

@@ -46,7 +46,7 @@ You may obtain a copy of the License at
 //! staged-append restart, `acid_compliance`, `data_inlining`, catalog
 //! concurrency with partitions, and `shared_metastore_concurrency_test`
 //! which exercises fresh catalog DB directory creation in both
-//! `CayenneCatalog::init` and the SQLite/Turso metastore backends with
+//! `CayenneCatalog::init` and the SQLite metastore backend with
 //! best-effort parent sync + warning),
 //! provide comprehensive regression coverage for this property,
 //! including the edge cases of the very first cross-partition write on a
@@ -358,7 +358,12 @@ async fn cross_partition_overwrite_aborts_on_apply_failure() {
         // coordinator's apply loop.
         let result = setup
             .catalog
-            .commit_compaction_in_txn(&mut *txn, "not-a-uuid", "also-not-a-uuid")
+            .commit_compaction_in_txn(
+                &mut *txn,
+                "not-a-uuid",
+                "also-not-a-uuid",
+                "also-not-a-uuid",
+            )
             .await;
         assert!(
             result.is_err(),
@@ -556,6 +561,7 @@ async fn cross_partition_append_commits_atomically_under_barrier() {
         .map(|p| cayenne::PartitionedWalEntry {
             table_id: p.table_id().to_string(),
             target_snapshot_id: None,
+            overlay: false,
             staging_wal_path: Some(p.staging_wal_path().to_string_lossy().to_string()),
         })
         .collect();
@@ -646,6 +652,7 @@ async fn mid_barrier_failure_leaves_top_level_wal() {
         .map(|p| cayenne::PartitionedWalEntry {
             table_id: p.table_id().to_string(),
             target_snapshot_id: None,
+            overlay: false,
             staging_wal_path: Some(p.staging_wal_path().to_string_lossy().to_string()),
         })
         .collect();

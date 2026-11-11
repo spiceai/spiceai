@@ -1,0 +1,114 @@
+# Known failing (#15543): Fails under REPLICA IDENTITY DEFAULT for the same reason as cdc-unchanged-
+# toast-default-identity.yaml; passes under FULL.
+# Move this script to test/spicescript/ once it passes.
+name: postgres-cdc-partial-row-images
+description: >
+  An UPDATE that leaves a large (out-of-line, TOASTed) column unchanged reaches
+  Spice without that column's value, as Postgres's "unchanged" marker. Spice
+  must keep the value it already has — including when the same UPDATE moves the
+  row to a new primary key, inside multi-statement transactions, and after a
+  restart — under both default and full replica identity.
+
+sources:
+  src: { kind: postgres }
+
+matrix:
+  replica_identity: [default, full]
+
+variants:
+  key:
+    datasets: { '*': { acceleration: { params: { cayenne_deletion_mode: key } } } }
+  position:
+    datasets: { '*': { acceleration: { params: { cayenne_deletion_mode: position } } } }
+
+spicepod:
+  version: v1
+  kind: Spicepod
+  name: postgres-cdc-partial-row-images
+  datasets:
+    - from: postgres:public.docs
+      name: docs
+      params: ${sources.src.params}
+      acceleration:
+        enabled: true
+        engine: cayenne
+        mode: file
+        refresh_mode: changes
+        primary_key: id
+        on_conflict: { id: upsert }
+
+defaults:
+  expect: { oracle: src }
+  eventually: 60s
+
+steps:
+  - source-exec:
+      src: |
+        CREATE TABLE docs (
+          id      integer PRIMARY KEY,
+          version integer NOT NULL,
+          note    text,
+          body    text,
+          blob    bytea
+        );
+        -- EXTERNAL keeps large values out of line and uncompressed, so every
+        -- body and blob below is TOASTed and an UPDATE that leaves it alone
+        -- sends the unchanged marker instead of the value.
+        ALTER TABLE docs ALTER COLUMN body SET STORAGE EXTERNAL;
+        ALTER TABLE docs ALTER COLUMN blob SET STORAGE EXTERNAL;
+        ALTER TABLE docs REPLICA IDENTITY ${matrix.replica_identity};
+        INSERT INTO docs
+          SELECT i, 1, 'note ' || i,
+                 (SELECT string_agg(md5(i::text || '-' || g::text), '') FROM generate_series(1, 120) AS g),
+                 (SELECT decode(string_agg(md5(g::text || '+' || i::text), ''), 'hex') FROM generate_series(1, 120) AS g)
+          FROM generate_series(1, 300) AS i;
+
+  - start: {}
+  - query: SELECT * FROM docs
+
+  # Only small columns change: body and blob arrive as "unchanged".
+  - source-exec:
+      src:
+        - UPDATE docs SET version = version + 1
+        - UPDATE docs SET note = NULL WHERE id % 5 = 0
+  - query: SELECT * FROM docs
+  - query: SELECT count(*), count(body), count(blob), sum(length(body)) FROM docs
+
+  # Some rows change the large columns themselves; others drop them.
+  - source-exec:
+      src:
+        - UPDATE docs SET body = repeat('x', 5000) WHERE id % 7 = 0
+        - UPDATE docs SET blob = NULL WHERE id % 11 = 0
+        - UPDATE docs SET version = version + 1 WHERE id % 7 = 0 OR id % 11 = 0
+  - query: SELECT * FROM docs
+
+  # A primary-key change that leaves the large columns alone: the new row's
+  # body and blob must come from the old row.
+  - source-exec:
+      src: UPDATE docs SET id = id + 1000 WHERE id <= 20
+  - query: SELECT * FROM docs
+  - query: SELECT * FROM docs WHERE id > 1000 ORDER BY id NULLS LAST
+
+  # Several changes to the same rows inside one transaction.
+  - source-exec:
+      src: |
+        BEGIN;
+        UPDATE docs SET version = version + 10 WHERE id BETWEEN 21 AND 40;
+        UPDATE docs SET note = 'twice' WHERE id BETWEEN 21 AND 40;
+        DELETE FROM docs WHERE id BETWEEN 41 AND 45;
+        INSERT INTO docs SELECT i, 99, 'reinserted', NULL, NULL FROM generate_series(41, 45) AS i;
+        UPDATE docs SET version = 100 WHERE id BETWEEN 41 AND 45;
+        COMMIT;
+  - query: SELECT * FROM docs
+
+  # Unchanged markers that arrive while spiced is down, then after a restart.
+  - stop: {}
+  - source-exec:
+      src: UPDATE docs SET version = version + 1 WHERE id % 2 = 0
+  - start: {}
+  - query: SELECT * FROM docs
+  - restart: {}
+  - source-exec:
+      src: UPDATE docs SET version = version + 1 WHERE id % 3 = 0
+  - query: SELECT * FROM docs
+  - query: SELECT count(*), count(body), count(blob), sum(length(body)), sum(version) FROM docs

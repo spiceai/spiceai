@@ -38,7 +38,7 @@ embeddings:
   - name: hf_embeddings
     from: huggingface:sentence-transformers/all-MiniLM-L6-v2
     params:
-      huggingface_token: hf_xxx
+      hf_token: hf_xxx
 
   # ---------------------------------------------------------------------------
   # File-based Embeddings

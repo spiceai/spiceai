@@ -2,14 +2,19 @@ version: v1
 kind: Spicepod
 name: custom-search-example
 
-# Example of a customer-supplied search spicepod for `testoperator run search` with no
-# `--benchmark-dataset`. The harness tests the three fixed tables it queries — `corpus`,
-# `test_queries`, and `relevance_data` — against whatever this spicepod defines. Point the `from:`
-# fields at your own sources; `views:` map real column names onto the names/types the harness needs.
+# Example of a search spicepod for `testoperator run search`. The harness tests the three fixed
+# tables it queries — `corpus`, `test_queries`, and `relevance_data` — against whatever this
+# spicepod defines. Point the `from:` fields at your own sources; `views:` map real column names
+# onto the names/types the harness needs.
 #
 #   testoperator run search -p test/spicepods/search/custom/example.yaml
 #
 # See https://github.com/spiceai/spiceai/issues/12935 for the required schema.
+
+# Optional. Sets the `benchmark_dataset` metric attribute, so that runs of different spicepods over
+# the same data share one series. Without it, the attribute is `custom`.
+metadata:
+  benchmark_dataset: my_dataset
 
 datasets:
   # The searchable corpus. `corpus`, `test_queries`, and `relevance_data` may each be a dataset or

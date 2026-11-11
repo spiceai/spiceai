@@ -22,7 +22,7 @@ limitations under the License.
 //! answer, not a bad plan. These tests pin `TableProvider::statistics` to the
 //! count a real scan returns, on both sides of a promotion.
 
-mod common;
+use crate::common;
 
 use std::sync::Arc;
 
@@ -147,7 +147,7 @@ async fn create_table(
         partition_column: None,
         vortex_config: VortexConfig {
             cold_tier_location: Some(format!("file://{}", cold_dir.to_string_lossy())),
-            cold_clustering_columns: vec!["id".to_string()],
+            cluster_by: vec!["id".to_string()],
             cold_tier_warm_max_files: 1,
             deletion_mode: DeletionMode::Key,
             ..VortexConfig::default()

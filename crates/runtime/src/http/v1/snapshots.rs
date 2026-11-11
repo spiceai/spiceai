@@ -33,8 +33,7 @@ use spicepod::component::snapshot::Snapshots;
 use tokio::sync::RwLock;
 
 use crate::Runtime;
-
-use super::require_write_access;
+use crate::component::dataset::snapshot_source::SnapshotSource;
 
 const DEFAULT_SNAPSHOTS_LIMIT: usize = 10;
 
@@ -107,6 +106,19 @@ pub async fn list_snapshots(
             .into_response();
     };
 
+    if let Some(manager) = snapshot_source_manager(dataset, &rt).await {
+        let snapshot_manager = match manager {
+            Ok(manager) => manager,
+            Err(response) => return response,
+        };
+        drop(app_lock);
+        let limit = query.limit.unwrap_or(DEFAULT_SNAPSHOTS_LIMIT);
+        return match snapshot_manager.get_snapshot_summary(limit).await {
+            Ok(summary) => (StatusCode::OK, Json(summary)).into_response(),
+            Err(e) => snapshot_api_error_to_response(&e),
+        };
+    }
+
     let Some(acceleration) = &dataset.acceleration else {
         return (
             StatusCode::BAD_REQUEST,
@@ -130,7 +142,7 @@ pub async fn list_snapshots(
     // Create a snapshot manager to query the metadata
     let Some(snapshot_manager) = create_snapshot_manager_for_query(
         &dataset_name,
-        readable_app.snapshots.clone(),
+        readable_app.dataset_snapshots(acceleration),
         acceleration,
         rt.secrets_weak(),
         rt.tokio_io_runtime(),
@@ -192,6 +204,18 @@ pub async fn get_snapshot(
             .into_response();
     };
 
+    if let Some(manager) = snapshot_source_manager(dataset, &rt).await {
+        let snapshot_manager = match manager {
+            Ok(manager) => manager,
+            Err(response) => return response,
+        };
+        drop(app_lock);
+        return match snapshot_manager.get_snapshot(snapshot_id).await {
+            Ok(snapshot) => (StatusCode::OK, Json(snapshot)).into_response(),
+            Err(e) => snapshot_api_error_to_response(&e),
+        };
+    }
+
     let Some(acceleration) = &dataset.acceleration else {
         return (
             StatusCode::BAD_REQUEST,
@@ -214,7 +238,7 @@ pub async fn get_snapshot(
 
     let Some(snapshot_manager) = create_snapshot_manager_for_query(
         &dataset_name,
-        readable_app.snapshots.clone(),
+        readable_app.dataset_snapshots(acceleration),
         acceleration,
         rt.secrets_weak(),
         rt.tokio_io_runtime(),
@@ -251,9 +275,6 @@ pub async fn set_current_snapshot(
     if let Some(resp) = snapshots_feature_response() {
         return resp;
     }
-    if let Some(response) = require_write_access().await {
-        return response;
-    }
 
     let app_lock = tokio::select! {
         lock = app.read() => lock,
@@ -280,6 +301,20 @@ pub async fn set_current_snapshot(
             .into_response();
     };
 
+    // A dataset reading snapshots never changes them: its current snapshot is the one
+    // the publishing instance names in the metadata this dataset reads.
+    if SnapshotSource::from_spicepod(dataset).is_ok_and(|source| source.is_some()) {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(MessageResponse {
+                message: format!(
+                    "Dataset {dataset_name} reads snapshots (`file_format: snapshot`) and never changes them. Set the current snapshot on the Spice instance that publishes them."
+                ),
+            }),
+        )
+            .into_response();
+    }
+
     let Some(acceleration) = &dataset.acceleration else {
         return (
             StatusCode::BAD_REQUEST,
@@ -302,7 +337,7 @@ pub async fn set_current_snapshot(
 
     let Some(snapshot_manager) = create_snapshot_manager_for_query(
         &dataset_name,
-        readable_app.snapshots.clone(),
+        readable_app.dataset_snapshots(acceleration),
         acceleration,
         rt.secrets_weak(),
         rt.tokio_io_runtime(),
@@ -336,21 +371,60 @@ pub async fn set_current_snapshot(
     }
 }
 
+/// A `SnapshotManager` over the snapshots `dataset` reads, when it reads snapshots
+/// (`file_format: snapshot`): its own `from` location and `s3_*` params, not the
+/// top-level `snapshots` section, which says where snapshotting datasets publish.
+/// `None` for any other dataset.
+async fn snapshot_source_manager(
+    dataset: &spicepod::component::dataset::Dataset,
+    rt: &Runtime,
+) -> Option<Result<SnapshotManager, Response>> {
+    let bad_request = |message: String| {
+        (StatusCode::BAD_REQUEST, Json(MessageResponse { message })).into_response()
+    };
+    let source = match SnapshotSource::from_spicepod(dataset) {
+        Ok(None) => return None,
+        Ok(Some(source)) => source,
+        Err(err) => return Some(Err(bad_request(err.to_string()))),
+    };
+    let params = dataset
+        .params
+        .as_ref()
+        .map(spicepod::param::Params::as_string_map)
+        .unwrap_or_default();
+    let behavior = SnapshotBehavior::bootstrap_only(
+        Arc::new(source.snapshots(&params)),
+        rt.secrets_weak(),
+        rt.tokio_io_runtime(),
+    );
+    Some(
+        SnapshotManager::try_new_for_metadata_queries(dataset.name.clone(), behavior)
+            .await
+            .ok_or_else(|| {
+                bad_request(format!(
+                    "Dataset {} reads snapshots from '{}', which could not be opened. Check the dataset's `s3_*` params.",
+                    dataset.name,
+                    source.location()
+                ))
+            }),
+    )
+}
+
 /// Creates a `SnapshotManager` for querying snapshot metadata.
 ///
 /// This creates a lightweight manager suitable for reading metadata. It doesn't
 /// require a full accelerator setup since we only need access to the object store.
 async fn create_snapshot_manager_for_query(
     dataset_name: &str,
-    app_snapshots: Option<Arc<Snapshots>>,
+    snapshots: Arc<Snapshots>,
     acceleration: &spicepod::acceleration::Acceleration,
     secrets: std::sync::Weak<RwLock<runtime_secrets::Secrets>>,
     io_runtime: tokio::runtime::Handle,
 ) -> Option<SnapshotManager> {
-    // Create the snapshot behavior using the app's global snapshots config
-    // and the dataset's per-acceleration snapshot settings
+    // Create the snapshot behavior using the dataset's resolved snapshot config
+    // and its per-acceleration snapshot settings
     let snapshot_behavior = SnapshotBehavior::from(
-        app_snapshots,
+        Some(snapshots),
         acceleration.snapshots,
         secrets,
         io_runtime,
@@ -372,6 +446,13 @@ fn snapshot_api_error_to_response(error: &SnapshotApiError) -> Response {
     match error {
         SnapshotApiError::SnapshotNotFound { .. } => (
             StatusCode::NOT_FOUND,
+            Json(MessageResponse {
+                message: error.to_string(),
+            }),
+        )
+            .into_response(),
+        SnapshotApiError::SnapshotFileMissing { .. } => (
+            StatusCode::CONFLICT,
             Json(MessageResponse {
                 message: error.to_string(),
             }),

@@ -20,7 +20,7 @@ source scan  →  EmbeddingTableExec  →  [CoalescePartitionsExec]  →  Indexe
 
 Each stage blocks the next:
 
-- **Embedding stage.** `EmbeddingTableExec::execute` (`crates/runtime-search/src/embeddings/execution_plan.rs:117`) wraps its input in `to_sendable_stream` (`:173`), which — inside a `stream!` macro (`:179`, itself flagged for removal by `CLAUDE.md`) — does `base_stream.next().await` then `compute_additional_embedding_columns(&batch, …).await` (`:183`) **before yielding**. Within a batch, columns embed serially: `for (col, cfg) in embedded_columns` (`:271`). So the source's next batch is not fetched while the current batch is embedding.
+- **Embedding stage.** `EmbeddingTableExec::execute` (`crates/runtime-search/src/embeddings/execution_plan.rs:117`) wraps its input in `to_sendable_stream` (`:173`), which — inside a `stream!` macro (`:179`, itself flagged for removal by `AGENTS.md`) — does `base_stream.next().await` then `compute_additional_embedding_columns(&batch, …).await` (`:183`) **before yielding**. Within a batch, columns embed serially: `for (col, cfg) in embedded_columns` (`:271`). So the source's next batch is not fetched while the current batch is embedding.
 - **Index stage.** `IndexerExec::execute` (`crates/runtime-datafusion-index/src/analyzer/index_table_scan.rs:472`) uses `input.and_then(|batch| async move { for idx in &indexes { idx.compute_index(vec![b]).await } })` (`:483`, `:511`). `Stream::and_then` polls each item's future to completion before pulling the next item — so batch N+1 is not fetched/embedded while batch N is being indexed. `IndexerExec` also requires `Distribution::SinglePartition` (`:410`) and `maintains_input_order = true` (`:414`), so the whole tail is one ordered partition.
 - **Write stage.** The sink write for batch N (`refresh_task.rs:1025`, under `accelerator_write_mutex` at `:1024`) completes before the `unfold` loop pulls batch N+1.
 
@@ -90,7 +90,7 @@ impl RecordBatchStream for PrefetchStream {
 }
 ```
 
-`handle` must be the CPU/refresh runtime handle (`self.cpu_runtime`, `refresh_task.rs:1622`), never the main runtime — per the separate-runtimes rule in `CLAUDE.md`. `AbortOnDropHandle` guarantees the producer task cannot outlive a cancelled/failed refresh.
+`handle` must be the CPU/refresh runtime handle (`self.cpu_runtime`, `refresh_task.rs:1622`), never the main runtime — per the separate-runtimes rule in `AGENTS.md`. `AbortOnDropHandle` guarantees the producer task cannot outlive a cancelled/failed refresh.
 
 ### 3b. Ordered concurrency inside the embedding stage
 
@@ -120,7 +120,7 @@ fn to_sendable_stream(base_stream: SendableRecordBatchStream, /* … */) -> impl
 
 ## 4. Ordering & correctness constraints
 
-Data correctness is the top priority (`CLAUDE.md`). Every mechanism above is **order-preserving**; the constraints below are why.
+Data correctness is the top priority (`AGENTS.md`). Every mechanism above is **order-preserving**; the constraints below are why.
 
 ### 4a. FTS/vector indexing is order-sensitive — never reorder
 
@@ -141,7 +141,7 @@ Streaming inserts already write batches incrementally; a mid-stream error can le
 
 ### 4d. Memory bounds
 
-Buffered depth `k` costs up to `k × (batch_size + embedded_columns × vector_bytes)`. Embedded batches are large — a `FixedSizeList<F32, 1536>` adds ~6 KiB/row, ~48 MiB per 8192-row batch per column. So depth must be **small (1–4)** and the channel **bounded** (never `try_collect`, never an unbounded queue — forbidden by `CLAUDE.md`). The existing per-batch `resource_monitor.check_memory_usage` (`refresh_task.rs:978`) continues to fire on the consumer side; the bounded channel is the primary guard.
+Buffered depth `k` costs up to `k × (batch_size + embedded_columns × vector_bytes)`. Embedded batches are large — a `FixedSizeList<F32, 1536>` adds ~6 KiB/row, ~48 MiB per 8192-row batch per column. So depth must be **small (1–4)** and the channel **bounded** (never `try_collect`, never an unbounded queue — forbidden by `AGENTS.md`). The existing per-batch `resource_monitor.check_memory_usage` (`refresh_task.rs:978`) continues to fire on the consumer side; the bounded channel is the primary guard.
 
 ## 5. Interaction with the other refresh-latency levers
 
@@ -152,7 +152,7 @@ Buffered depth `k` costs up to `k × (batch_size + embedded_columns × vector_by
 
 ## 6. Config surface
 
-One knob, following `CLAUDE.md` (no booleans in user-facing config; conservative default):
+One knob, following `AGENTS.md` (no booleans in user-facing config; conservative default):
 
 - `runtime.acceleration.refresh_prefetch_depth: Option<usize>` — batches a stage may run ahead. `None`/unset ⇒ default `1` (one batch ahead: overlaps adjacent stages at ~2× buffered memory, the safe default). `0` ⇒ disabled (today's behavior, an escape hatch) — at depth 0 no `PrefetchExec` is inserted at all, rather than one with a depth-1 channel. Larger values trade memory for deeper overlap. Mirrors the existing `Option<usize>` precedent of `runtime.dataset_load_parallelism` (`crates/spicepod/src/component/runtime.rs:43`).
 
@@ -171,7 +171,7 @@ The embedding `buffered(k)` depth should be driven by the same knob (or a fixed 
 
 **Measurement.**
 - The startup sampler already logs per-dataset load progress every 30s until all datasets settle (`crates/runtime/src/init/dataset.rs:214-265`) and the aggregate dispatch summary (`:198-212`) — use these plus `REFRESH_ROWS_WRITTEN`/`REFRESH_BYTES_WRITTEN` (`refresh_task.rs:973-975`) and `REFRESH_LAG_MS` (`:908`) as the primary time-to-materialized signals.
-- `testoperator` bench with an embeddings and an FTS spicepod (naming per `CLAUDE.md`: `{connector}-{accelerator}-{variant}`), comparing `refresh_prefetch_depth` 0 vs 1 vs 4, asserting equal row counts and identical FTS/vector results (correctness gate) alongside wall-clock.
+- `testoperator` bench with an embeddings and an FTS spicepod (naming per `AGENTS.md`: `{connector}-{accelerator}-{variant}`), comparing `refresh_prefetch_depth` 0 vs 1 vs 4, asserting equal row counts and identical FTS/vector results (correctness gate) alongside wall-clock.
 - A GitHub dataset bench measuring time-to-ready with prefetch on/off.
 
 **Rollout.** Land `PrefetchExec` + the `buffered` embed rewrite behind `refresh_prefetch_depth` defaulting to `0` (disabled). Validate correctness (FTS ordering, watermark, row counts) and memory on the benches above. Flip the default to `1` once green. Consider `2–4` as a later default only after the memory profile on wide embedded datasets is characterized. The FTS commit-once change (§5) should land first or together, since it is what makes deeper prefetch worthwhile.

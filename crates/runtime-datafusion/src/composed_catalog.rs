@@ -169,8 +169,26 @@ mod tests {
     #[test]
     fn test_register_user_schema() {
         let provider = make_test_provider();
-        let result = provider.register_schema("new_schema", Arc::new(MemorySchemaProvider::new()));
-        result.expect("register user schema should succeed");
-        assert!(provider.schema("new_schema").is_some());
+        let schema: Arc<dyn SchemaProvider> = Arc::new(MemorySchemaProvider::new());
+        let previous = provider
+            .register_schema("new_schema", Arc::clone(&schema))
+            .expect("register user schema should succeed");
+        assert!(
+            previous.is_none(),
+            "no schema named `new_schema` existed before, so none is replaced"
+        );
+
+        // Registration is delegated to the external catalog, and the composed
+        // catalog serves the very provider that was registered.
+        let mut external_names = provider.external().schema_names();
+        external_names.sort();
+        assert_eq!(external_names, vec!["new_schema", "public", "user_schema"]);
+        let resolved = provider
+            .schema("new_schema")
+            .expect("the registered schema resolves");
+        assert!(
+            Arc::ptr_eq(&resolved, &schema),
+            "the composed catalog must serve the registered schema provider"
+        );
     }
 }

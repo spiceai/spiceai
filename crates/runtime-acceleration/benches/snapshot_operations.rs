@@ -17,7 +17,7 @@ limitations under the License.
 //! real S3 storage with AWS SSO credentials. To run:
 //!
 //! 1. Authenticate with AWS SSO: `aws sso login`
-//! 2. Run benchmarks: `cargo bench -p runtime-acceleration --bench snapshot_operations --features "duckdb,sqlite,turso"`
+//! 2. Run benchmarks: `cargo bench -p runtime-acceleration --bench snapshot_operations --features "duckdb,sqlite"`
 //!
 //! Benchmarks include:
 //! - S3 upload/download operations
@@ -180,14 +180,8 @@ fn create_metadata_json(
 fn available_engines() -> Vec<(&'static str, AccelerationEngine)> {
     let mut engines = vec![("cayenne", AccelerationEngine::Cayenne)];
 
-    #[cfg(feature = "duckdb")]
-    engines.push(("duckdb", AccelerationEngine::DuckDB));
-
     #[cfg(feature = "sqlite")]
     engines.push(("sqlite", AccelerationEngine::Sqlite));
-
-    #[cfg(feature = "turso")]
-    engines.push(("turso", AccelerationEngine::Turso));
 
     engines
 }

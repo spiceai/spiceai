@@ -1,0 +1,35 @@
+name: feed-write-boundaries
+description: >
+  PostgreSQL RETURNING row images preserve unsigned integer boundaries,
+  exact decimals, NULL, empty strings and booleans through MongoDB and
+  DynamoDB CLIs. Wider positive integers must not wrap as BSON Long.
+spicepod: { version: v1, kind: Spicepod, name: feed-write-boundaries }
+sources:
+  src: { kind: '${matrix.src}' }
+  ref: { kind: postgres }
+matrix:
+  src: [mongodb, dynamodb]
+steps:
+  - source-exec: { ref: 'CREATE TABLE t (_id text PRIMARY KEY, n numeric(38,0), d numeric(30,9), s text, b boolean)' }
+  - write:
+      src: >-
+        INSERT INTO t VALUES
+        ('a', 18446744073709551615, 12345678901234567890.123456789, '', true),
+        ('b', 9223372036854775808, -0.000000001, NULL, false)
+    mirror: ref
+    key: _id
+  - source-query:
+      src: >-
+        mongosh --quiet ${sources.src.namespace} --eval 'db.t.find().sort({_id:1}).forEach(d => print(d._id + ":" + d.n.toString() + ":" + d.d.toString() + ":" + JSON.stringify(d.s) + ":" + d.b))'
+    expect: { rows: [['a:18446744073709551615:12345678901234567890.123456789:"":true'], ['b:9223372036854775808:-1E-9:null:false']] }
+    when: { src: mongodb }
+  - source-query:
+      src: |
+        python3 - <<'PY'
+        import boto3, json
+        t = boto3.resource('dynamodb', endpoint_url='http://localhost:4566', region_name='us-east-1', aws_access_key_id='test', aws_secret_access_key='test').Table('${sources.src.namespace}_t')
+        for d in sorted(t.scan()['Items'], key=lambda d: d['_id']):
+            print(d['_id'] + ':' + str(d['n']) + ':' + str(d['d']) + ':' + json.dumps(d['s']) + ':' + json.dumps(d['b']))
+        PY
+    expect: { rows: [['a:18446744073709551615:12345678901234567890.123456789:"":true'], ['b:9223372036854775808:-1E-9:null:false']] }
+    when: { src: dynamodb }

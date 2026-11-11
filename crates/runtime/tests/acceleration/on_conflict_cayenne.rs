@@ -22,15 +22,18 @@ limitations under the License.
 use std::fmt::Write as _;
 use std::{collections::HashMap, sync::Arc};
 
+use anyhow::ensure;
 use app::AppBuilder;
 use arrow::array::RecordBatch;
+use arrow::util::pretty::pretty_format_batches;
 use datafusion::{
-    assert_batches_eq, datasource::TableProvider, physical_plan::collect, prelude::*,
-    sql::TableReference,
+    assert_batches_eq, common::TableReference, datasource::TableProvider, physical_plan::collect,
+    prelude::*,
 };
 use futures::TryStreamExt;
 use runtime::{Runtime, accelerated::AcceleratedTable};
 use runtime_request_context::{CacheControl, Protocol, RequestContext, UserAgent};
+use spicepod::component::caching::SQLResultsCacheConfig;
 use spicepod::{
     acceleration::{Acceleration, Mode, OnConflictBehavior, RefreshMode},
     component::{access::AccessMode, dataset::Dataset},
@@ -38,7 +41,7 @@ use spicepod::{
     partitioning::PartitionedBy,
 };
 
-use crate::utils::{runtime_ready_check, test_request_context};
+use crate::utils::{runtime_ready_check, test_request_context, wait_until_true};
 
 /// Test Cayenne `on_conflict`: upsert behavior
 ///
@@ -48,7 +51,6 @@ use crate::utils::{runtime_ready_check, test_request_context};
 /// This test creates a Cayenne table directly using the `CayenneTableProvider` API
 /// to test `on_conflict` behavior without going through the file connector refresh path.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[cfg(not(target_os = "windows"))]
 async fn test_cayenne_on_conflict_upsert() -> Result<(), anyhow::Error> {
     use arrow::datatypes::{DataType, Field, Schema, TimeUnit};
     use cayenne::metadata::CreateTableOptions;
@@ -167,16 +169,14 @@ async fn test_cayenne_on_conflict_upsert() -> Result<(), anyhow::Error> {
         .await
 }
 
-/// Test Cayenne `on_conflict`: drop behavior
-///
-/// Verifies that when a row with the same primary key is inserted,
-/// the new row is dropped and the existing row is preserved.
+/// A table created with `on_conflict: drop` keeps the last version of a key like
+/// any table with a primary key (#14576): a row inserted for a stored key
+/// replaces it.
 ///
 /// This test creates a Cayenne table directly using the `CayenneTableProvider` API
 /// to test `on_conflict` behavior without going through the file connector refresh path.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[cfg(not(target_os = "windows"))]
-async fn test_cayenne_on_conflict_drop() -> Result<(), anyhow::Error> {
+async fn test_cayenne_on_conflict_drop_keeps_the_last_version() -> Result<(), anyhow::Error> {
     use arrow::datatypes::{DataType, Field, Schema, TimeUnit};
     use cayenne::metadata::CreateTableOptions;
     use cayenne::{CayenneCatalog, CayenneTableProvider, MetadataCatalog};
@@ -255,7 +255,7 @@ async fn test_cayenne_on_conflict_drop() -> Result<(), anyhow::Error> {
             assert_eq!(result.len(), 1);
             assert_eq!(result[0].num_rows(), 1);
 
-            // Insert data with duplicate primary key (event_id = 2) - should drop new row
+            // Insert a new version of a stored key (event_id = 2): it replaces the stored row.
             ctx.sql(
                 "INSERT INTO events_drop (event_id, event_name, event_timestamp) \
                  VALUES (2, 'Password Reset', '2024-01-15 09:00:00')",
@@ -264,7 +264,7 @@ async fn test_cayenne_on_conflict_drop() -> Result<(), anyhow::Error> {
             .collect()
             .await?;
 
-            // Verify drop happened - event_id 2 should have original values
+            // event_id 2 now holds the version that arrived last.
             let result = ctx
                 .sql("SELECT event_name FROM events_drop WHERE event_id = 2")
                 .await?
@@ -272,15 +272,15 @@ async fn test_cayenne_on_conflict_drop() -> Result<(), anyhow::Error> {
                 .await?;
 
             let expected = [
-                "+-----------------+",
-                "| event_name      |",
-                "+-----------------+",
-                "| Password Change |",
-                "+-----------------+",
+                "+----------------+",
+                "| event_name     |",
+                "+----------------+",
+                "| Password Reset |",
+                "+----------------+",
             ];
             assert_batches_eq!(expected, &result);
 
-            // Verify total count is still 3 (drop, not insert)
+            // Still one row per key.
             let result = ctx
                 .sql("SELECT COUNT(*) as cnt FROM events_drop")
                 .await?
@@ -305,7 +305,6 @@ async fn test_cayenne_on_conflict_drop() -> Result<(), anyhow::Error> {
 /// - Date32
 /// - Decimal128
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[cfg(not(target_os = "windows"))]
 async fn test_cayenne_core_arrow_data_types() -> Result<(), anyhow::Error> {
     let _tracing = crate::init_tracing(Some("integration=debug,info"));
 
@@ -419,7 +418,6 @@ async fn test_cayenne_core_arrow_data_types() -> Result<(), anyhow::Error> {
 
 /// Test Cayenne with primary key-based deletions
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[cfg(not(target_os = "windows"))]
 async fn test_cayenne_primary_key_delete() -> Result<(), anyhow::Error> {
     let _tracing = crate::init_tracing(Some("integration=debug,info"));
 
@@ -555,7 +553,6 @@ async fn execute_sql(rt: &Arc<Runtime>, sql: &str) -> Result<Vec<RecordBatch>, a
 /// Verifies that partitioned Cayenne tables correctly handle primary keys
 /// for deletion operations within each partition.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[cfg(not(target_os = "windows"))]
 async fn test_cayenne_partitioned_primary_key() -> Result<(), anyhow::Error> {
     let _tracing = crate::init_tracing(Some("integration=debug,info"));
 
@@ -670,7 +667,6 @@ async fn test_cayenne_partitioned_primary_key() -> Result<(), anyhow::Error> {
 /// This test creates a partitioned Cayenne table directly using the `CayenneTableProvider` API
 /// to test `on_conflict` behavior without going through the file connector refresh path.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[cfg(not(target_os = "windows"))]
 async fn test_cayenne_partitioned_on_conflict_upsert() -> Result<(), anyhow::Error> {
     use arrow::datatypes::{DataType, Field, Schema};
     use cayenne::metadata::CreateTableOptions;
@@ -791,7 +787,6 @@ async fn test_cayenne_partitioned_on_conflict_upsert() -> Result<(), anyhow::Err
 /// This test creates a Cayenne table directly using the `CayenneTableProvider` API
 /// to test `on_conflict` behavior without going through the file connector refresh path.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[cfg(not(target_os = "windows"))]
 async fn test_cayenne_composite_primary_key() -> Result<(), anyhow::Error> {
     use arrow::datatypes::{DataType, Field, Schema};
     use cayenne::metadata::CreateTableOptions;
@@ -933,7 +928,6 @@ async fn test_cayenne_composite_primary_key() -> Result<(), anyhow::Error> {
 /// This test creates a Cayenne table directly using the `CayenneTableProvider` API
 /// to test primary key behavior without going through the file connector refresh path.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[cfg(not(target_os = "windows"))]
 async fn test_cayenne_primary_key_no_on_conflict() -> Result<(), anyhow::Error> {
     use arrow::datatypes::{DataType, Field, Schema};
     use cayenne::metadata::CreateTableOptions;
@@ -1047,7 +1041,6 @@ async fn test_cayenne_primary_key_no_on_conflict() -> Result<(), anyhow::Error> 
 /// Integration test to verify `on_conflict` works through the runtime loading path
 /// This test uses the full runtime to load a dataset with `on_conflict` configuration
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
-#[cfg(not(target_os = "windows"))]
 async fn test_cayenne_on_conflict_runtime_integration() -> Result<(), anyhow::Error> {
     let _tracing = crate::init_tracing(Some("integration=debug,info"));
 
@@ -1098,6 +1091,7 @@ async fn test_cayenne_on_conflict_runtime_integration() -> Result<(), anyhow::Er
                 params: Some(Params::from_string_map(params)),
                 primary_key: Some("event_id".to_string()),
                 on_conflict,
+                write_mode: spicepod::acceleration::WriteMode::Acceleration,
                 ..Acceleration::default()
             });
 
@@ -1162,7 +1156,6 @@ async fn test_cayenne_on_conflict_runtime_integration() -> Result<(), anyhow::Er
 /// Verifies that Cayenne correctly handles large data insertions and queries
 /// with multiple iterations.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[cfg(not(target_os = "windows"))]
 async fn test_cayenne_large_batch_roundtrip() -> Result<(), anyhow::Error> {
     use arrow::datatypes::{DataType, Field, Schema};
     use cayenne::metadata::CreateTableOptions;
@@ -1271,7 +1264,6 @@ async fn test_cayenne_large_batch_roundtrip() -> Result<(), anyhow::Error> {
 
 /// Test Cayenne with special characters and edge case strings
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[cfg(not(target_os = "windows"))]
 async fn test_cayenne_special_characters() -> Result<(), anyhow::Error> {
     use arrow::datatypes::{DataType, Field, Schema};
     use cayenne::metadata::CreateTableOptions;
@@ -1364,7 +1356,6 @@ async fn test_cayenne_special_characters() -> Result<(), anyhow::Error> {
 
 /// Test Cayenne with NULL values across various data types
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[cfg(not(target_os = "windows"))]
 async fn test_cayenne_null_handling() -> Result<(), anyhow::Error> {
     use arrow::datatypes::{DataType, Field, Schema, TimeUnit};
     use cayenne::metadata::CreateTableOptions;
@@ -1480,7 +1471,6 @@ async fn test_cayenne_null_handling() -> Result<(), anyhow::Error> {
 
 /// Test Cayenne upsert with batch update (multiple rows at once)
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[cfg(not(target_os = "windows"))]
 async fn test_cayenne_upsert_batch_update() -> Result<(), anyhow::Error> {
     use arrow::datatypes::{DataType, Field, Schema};
     use cayenne::metadata::CreateTableOptions;
@@ -1607,7 +1597,6 @@ async fn test_cayenne_upsert_batch_update() -> Result<(), anyhow::Error> {
 
 /// Test Cayenne deletion followed by new insert (not re-insertion of same key)
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[cfg(not(target_os = "windows"))]
 async fn test_cayenne_delete_then_insert_new() -> Result<(), anyhow::Error> {
     use arrow::datatypes::{DataType, Field, Schema};
     use cayenne::metadata::CreateTableOptions;
@@ -1735,7 +1724,6 @@ async fn test_cayenne_delete_then_insert_new() -> Result<(), anyhow::Error> {
 
 /// Test Cayenne with boundary numeric values
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[cfg(not(target_os = "windows"))]
 async fn test_cayenne_boundary_values() -> Result<(), anyhow::Error> {
     use arrow::datatypes::{DataType, Field, Schema};
     use cayenne::metadata::CreateTableOptions;
@@ -1830,13 +1818,14 @@ async fn test_cayenne_boundary_values() -> Result<(), anyhow::Error> {
             assert_eq!(result.len(), 1);
             assert_eq!(result[0].num_rows(), 1);
 
-            // Verify zero handling
+            // Verify zero handling: SQL `=` compares floats by IEEE 754 value, so
+            // `-0.0 = 0.0` holds and row 7 matches alongside the three `0.0` rows.
             let result = ctx
                 .sql("SELECT COUNT(*) as cnt FROM boundary_test WHERE float_val = 0.0")
                 .await?
                 .collect()
                 .await?;
-            let expected = ["+-----+", "| cnt |", "+-----+", "| 3   |", "+-----+"];
+            let expected = ["+-----+", "| cnt |", "+-----+", "| 4   |", "+-----+"];
             assert_batches_eq!(expected, &result);
 
             Ok(())
@@ -1846,7 +1835,6 @@ async fn test_cayenne_boundary_values() -> Result<(), anyhow::Error> {
 
 /// Test Cayenne partitioned table with deletion across partitions
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[cfg(not(target_os = "windows"))]
 async fn test_cayenne_partitioned_deletion() -> Result<(), anyhow::Error> {
     let _tracing = crate::init_tracing(Some("integration=debug,info"));
 
@@ -1863,20 +1851,33 @@ async fn test_cayenne_partitioned_deletion() -> Result<(), anyhow::Error> {
 
     no_cache_context
         .scope(async {
+            const COUNT_SQL: &str = "SELECT COUNT(*) as cnt FROM partitioned_delete_test";
+            const BY_REGION_SQL: &str = "SELECT region, COUNT(*) as cnt FROM \
+                 partitioned_delete_test GROUP BY region ORDER BY region";
+
             let temp_dir = tempfile::tempdir()?;
             let data_dir = temp_dir.path().join("data");
             std::fs::create_dir_all(&data_dir)?;
 
+            // Two phases, because no single end state can prove the deletion happened: six rows
+            // minus three retention matches leaves exactly what loading only the other three
+            // would leave, so a row-loss regression satisfies an end-state assertion unchanged.
+            //
+            // Phase one loads a fixture retention cannot touch — every value is below the
+            // predicate — and asserts all six rows across all three partitions. Nothing about
+            // that assertion races: there is no row for retention to remove, whenever it runs.
+            // Phase two rewrites one row per partition above the predicate, so the three rows
+            // that then disappear are three that were provably there.
             let csv_file = data_dir.join("partitioned_delete_test.csv");
             std::fs::write(
                 &csv_file,
                 "id,region,name,value\n\
                  1,us,alpha,100\n\
-                 2,us,beta,200\n\
+                 2,us,beta,150\n\
                  3,eu,gamma,300\n\
-                 4,eu,delta,400\n\
-                 5,asia,epsilon,500\n\
-                 6,asia,zeta,600\n",
+                 4,eu,delta,350\n\
+                 5,asia,epsilon,200\n\
+                 6,asia,zeta,250\n",
             )?;
 
             let cayenne_dir = temp_dir.path().join("cayenne_partitioned_delete");
@@ -1918,8 +1919,13 @@ async fn test_cayenne_partitioned_deletion() -> Result<(), anyhow::Error> {
                 ..Acceleration::default()
             });
 
+            // Refresh leaves cached SQL results in place; reads after one must skip the cache.
             let app = AppBuilder::new("test_cayenne_partitioned_deletion")
                 .with_dataset(dataset)
+                .with_sql_cache(SQLResultsCacheConfig {
+                    enabled: false,
+                    ..Default::default()
+                })
                 .build();
 
             let rt = Arc::new(Runtime::builder().with_app(app).build().await);
@@ -1933,18 +1939,14 @@ async fn test_cayenne_partitioned_deletion() -> Result<(), anyhow::Error> {
 
             runtime_ready_check(&rt).await;
 
-            // Verify initial data
-            let result =
-                execute_sql(&rt, "SELECT COUNT(*) as cnt FROM partitioned_delete_test").await?;
+            // Phase one: the whole fixture, and it stays the whole fixture however often
+            // retention runs, because nothing in it matches `value > 400`. Asserting it here is
+            // what later lets the three missing rows mean "deleted" rather than "never loaded".
+            let result = execute_sql(&rt, COUNT_SQL).await?;
             let expected = ["+-----+", "| cnt |", "+-----+", "| 6   |", "+-----+"];
             assert_batches_eq!(expected, &result);
 
-            // Verify data per partition
-            let result = execute_sql(
-                &rt,
-                "SELECT region, COUNT(*) as cnt FROM partitioned_delete_test GROUP BY region ORDER BY region",
-            )
-            .await?;
+            let result = execute_sql(&rt, BY_REGION_SQL).await?;
             let expected = [
                 "+--------+-----+",
                 "| region | cnt |",
@@ -1956,28 +1958,70 @@ async fn test_cayenne_partitioned_deletion() -> Result<(), anyhow::Error> {
             ];
             assert_batches_eq!(expected, &result);
 
-            // Wait for retention to delete rows where value > 400
-            // Retention check interval is 1s, so wait a bit for it to run
-            tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+            // Phase two: lift one row per partition above the predicate, so every partition has
+            // something to delete and something to keep. A fixture whose deleted rows all sat in
+            // one partition could not tell "retention removed that partition" apart from "that
+            // partition never loaded".
+            std::fs::write(
+                &csv_file,
+                "id,region,name,value\n\
+                 1,us,alpha,100\n\
+                 2,us,beta,500\n\
+                 3,eu,gamma,300\n\
+                 4,eu,delta,600\n\
+                 5,asia,epsilon,200\n\
+                 6,asia,zeta,700\n",
+            )?;
 
-            // Verify data after retention deletion - should have 4 rows remaining
-            let result =
-                execute_sql(&rt, "SELECT COUNT(*) as cnt FROM partitioned_delete_test").await?;
-            let expected = ["+-----+", "| cnt |", "+-----+", "| 4   |", "+-----+"];
-            assert_batches_eq!(expected, &result);
+            let notifier = rt
+                .datafusion()
+                .refresh_table(&TableReference::from("partitioned_delete_test"), None)
+                .await?;
+            notifier
+                .ok_or_else(|| {
+                    anyhow::anyhow!("no refresh notifier for 'partitioned_delete_test'")
+                })?
+                .wait()
+                .await;
 
-            let result = execute_sql(
-                &rt,
-                "SELECT region, COUNT(*) as cnt FROM partitioned_delete_test GROUP BY region ORDER BY region",
-            )
-            .await?;
+            // Cayenne applies `retention_sql` on every write, so the deletion may land as part of
+            // the refresh itself or on a later interval check. Poll for it rather than assuming
+            // which (see #13800) — and never assert the state before it, which is unwinnable.
+            let converged = wait_until_true(std::time::Duration::from_secs(30), || async {
+                let Ok(result) = execute_sql(&rt, COUNT_SQL).await else {
+                    return false;
+                };
+                pretty_format_batches(&result)
+                    .is_ok_and(|table| table.to_string().contains("| 3   |"))
+            })
+            .await;
+
+            ensure!(
+                converged,
+                "retention did not delete the rows with value > 400 from \
+                 'partitioned_delete_test' within 30s; last count was {last}",
+                last = pretty_format_batches(&execute_sql(&rt, COUNT_SQL).await?)?
+            );
+
+            // Every partition must still be present with its one surviving row: a partition that
+            // failed to load, or one retention emptied wholesale, fails here.
+            let result = execute_sql(&rt, BY_REGION_SQL).await?;
             let expected = [
                 "+--------+-----+",
                 "| region | cnt |",
                 "+--------+-----+",
-                "| eu     | 2   |",
-                "| us     | 2   |",
+                "| asia   | 1   |",
+                "| eu     | 1   |",
+                "| us     | 1   |",
                 "+--------+-----+",
+            ];
+            assert_batches_eq!(expected, &result);
+
+            // And the survivors must be exactly the rows retention did not match.
+            let result =
+                execute_sql(&rt, "SELECT id FROM partitioned_delete_test ORDER BY id").await?;
+            let expected = [
+                "+----+", "| id |", "+----+", "| 1  |", "| 3  |", "| 5  |", "+----+",
             ];
             assert_batches_eq!(expected, &result);
 

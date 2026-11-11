@@ -14,8 +14,6 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-pub mod baggage;
-pub use baggage::*;
 pub mod cache_control;
 pub use cache_control::*;
 pub mod cache_namespace;
@@ -30,3 +28,11 @@ pub mod trace_id;
 pub use trace_id::*;
 pub mod traceparent;
 pub use traceparent::*;
+#[cfg(feature = "datafusion")]
+pub mod session_config;
+#[cfg(feature = "datafusion")]
+pub use session_config::*;
+#[cfg(feature = "datafusion")]
+pub mod task_context;
+#[cfg(feature = "datafusion")]
+pub use task_context::*;

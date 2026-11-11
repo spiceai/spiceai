@@ -18,6 +18,9 @@ use std::{cell::LazyCell, sync::Arc};
 
 use arrow::datatypes::{DataType, Field, Schema, TimeUnit};
 
+/// Scalar identity of a data point's attribute set. See [`crate::series_ids`].
+pub const SERIES_ID_COLUMN: &str = "series_id";
+
 #[must_use]
 pub fn schema() -> Arc<Schema> {
     METRICS_SCHEMA.with(|schema| Arc::clone(schema))
@@ -109,6 +112,12 @@ thread_local! {
             Field::new("is_monotonic", DataType::Boolean, true),
             Field::new("flags", DataType::UInt32, true),
             Field::new("attributes", attributes_list_type(), true),
+            // Derived from the data-point `attributes` list. Not a protobuf field:
+            // the conversion back to `OTel` drops it, and the attributes it was
+            // hashed from are still on the row, so that conversion stays lossless.
+            // A Drasi element id can key this scalar. The list itself cannot — two
+            // series that share `time_unix_nano` and `name` would collapse.
+            Field::new(SERIES_ID_COLUMN, DataType::Utf8, false),
 
             // Only one of these will be set, based on the metric_type.
             // Gauge and Sum will use data_number, Histogram will use data_histogram.

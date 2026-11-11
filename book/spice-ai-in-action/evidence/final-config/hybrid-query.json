@@ -1,0 +1,23 @@
+{
+  "sql": "SELECT article_id, tenant_id, title, _fused_score FROM rrf(vector_search(articles, 'return unused hiking boots', body), text_search(articles, 'trail boots return', body), join_key => 'article_id', k => 60.0) WHERE tenant_id = 'north' ORDER BY _fused_score DESC, article_id LIMIT 3",
+  "actual": [
+    {
+      "article_id": 1,
+      "tenant_id": "north",
+      "title": "Returning a trail boot",
+      "_fused_score": 0.03278688524590164
+    },
+    {
+      "article_id": 2,
+      "tenant_id": "north",
+      "title": "Waterproof care",
+      "_fused_score": 0.016129032258064516
+    },
+    {
+      "article_id": 3,
+      "tenant_id": "north",
+      "title": "Shipping delays",
+      "_fused_score": 0.015873015873015872
+    }
+  ]
+}

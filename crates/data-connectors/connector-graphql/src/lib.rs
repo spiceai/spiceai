@@ -26,8 +26,9 @@ use async_trait::async_trait;
 use data_components::rate_limit::RateLimiter;
 use data_connector_api::ConnectorContext;
 use data_connector_api::{
-    ConnectorComponent, ConnectorParams, DataConnector, DataConnectorError, DataConnectorFactory,
-    DataConnectorResult, NewDataConnectorResult, default_spice_client,
+    ConnectorComponent, ConnectorParams, DEFAULT_SPICE_CLIENT_TIMEOUT, DataConnector,
+    DataConnectorError, DataConnectorFactory, DataConnectorResult, NewDataConnectorResult,
+    default_spice_client,
 };
 use data_http_rate_control as http_rate_control;
 use data_http_rate_control::{
@@ -248,15 +249,18 @@ impl GraphQL {
                 source,
             })?;
 
-        let rate_control = http_rate_control::resolve_config_for_component(
+        let mut rate_control = http_rate_control::resolve_config_for_component(
             &self.params,
             self.runtime_rate_control_params.as_ref(),
             &ConnectorComponent::from(dataset),
             "graphql",
         )?;
+        // The GraphQL client is `default_spice_client`, so its request timeout
+        // is the `client_timeout` equivalent the acquire bound defaults to.
+        rate_control.apply_default_acquire_timeout(DEFAULT_SPICE_CLIENT_TIMEOUT);
         let rate_limiter = self
             .rate_control_registry
-            .shared_rate_limiter(&endpoint)
+            .shared_rate_limiter_for_config(&endpoint, &rate_control)
             .await;
         self.metrics.set_rate_limiter(&rate_limiter);
         let rate_limiter: Arc<dyn RateLimiter> = rate_limiter;

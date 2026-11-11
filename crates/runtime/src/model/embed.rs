@@ -16,7 +16,10 @@ limitations under the License.
 #![allow(clippy::implicit_hasher)]
 
 use crate::embeddings::params as embedding_params;
-use crate::token_providers::databricks::{DatabricksM2MTokenProvider, DatabricksU2MTokenProvider};
+use crate::token_providers::databricks::{
+    DatabricksM2MTokenProvider, DatabricksU2MTokenProvider, get_workload_identity_token_provider,
+    model_error,
+};
 use bytes::Bytes;
 use cache::CacheProvider;
 use cache::result::embeddings::CachedEmbeddingResult;
@@ -32,15 +35,15 @@ use llms::bedrock::{
     },
 };
 use runtime_parameters_typed::TypedParams;
-use runtime_secrets::{Secrets, get_params_with_secrets};
+use runtime_secrets::{Secrets, get_params_with_secrets, secret_sources_from_templates};
 
 use object_store::ObjectStoreExt;
 
 #[cfg(feature = "models")]
-use llms::embeddings::candle::{download_hf_file, tei::TeiEmbed};
+use llms::embeddings::candle::tei::TeiEmbed;
 use llms::embeddings::{Embed, Error as EmbedError};
 #[cfg(feature = "models")]
-use llms::model2vec::Model2Vec;
+use llms::model2vec::{Model2Vec, Model2VecOptions};
 use llms::openai::DEFAULT_EMBEDDING_MODEL;
 use llms::openai::embed::OpenaiEmbed;
 use secrecy::{ExposeSecret, SecretString};
@@ -97,29 +100,44 @@ pub async fn try_to_embedding(
             from: component.from.clone(),
         })?;
     let params = get_params_with_secrets(Arc::clone(&secrets), &string_params).await;
+    let secret_sources = secret_sources_from_templates(&string_params);
     let component_name = format!("embedding {}", component.name);
 
     match prefix {
         EmbeddingPrefix::Azure => {
-            let typed = embedding_params::azure::AzureEmbeddingParams::try_from_params(
-                &component_name,
-                params,
-                &secrets,
-            )
-            .await
-            .map_err(params_err)?;
+            // Read before `params` moves into the typed params: federation params win over a key
+            // autoloaded from a secret store, but not over one the Spicepod writes.
+            let key_in_spicepod = llms::workload_identity::key_in_spicepod(
+                &params,
+                &["azure_api_key", "azure_entra_token"],
+            );
+            let typed =
+                embedding_params::azure::AzureEmbeddingParams::try_from_params_with_secret_sources(
+                    &component_name,
+                    params,
+                    &secrets,
+                    &secret_sources,
+                )
+                .await
+                .map_err(params_err)?;
             azure(
                 model_id,
                 component.name.as_str(),
                 &typed,
+                key_in_spicepod,
                 embeddings_cache.clone(),
             )
+            .await
         }
         EmbeddingPrefix::OpenAi => {
-            let typed = embedding_params::openai::OpenAiEmbeddingParams::try_from_params(
+            // Read before `params` moves into the typed params: federation params win over an
+            // API key autoloaded from a secret store, but not over one the Spicepod writes.
+            let api_key_in_spicepod = llms::workload_identity::openai_api_key_in_spicepod(&params);
+            let typed = embedding_params::openai::OpenAiEmbeddingParams::try_from_params_with_secret_sources(
                 &component_name,
                 params,
                 &secrets,
+                &secret_sources,
             )
             .await
             .map_err(params_err)?;
@@ -127,6 +145,7 @@ pub async fn try_to_embedding(
                 model_id,
                 component,
                 &typed,
+                api_key_in_spicepod,
                 secrets,
                 embeddings_cache.clone(),
             )
@@ -134,13 +153,15 @@ pub async fn try_to_embedding(
         }
         #[cfg(feature = "models")]
         EmbeddingPrefix::File => {
-            let typed = embedding_params::file::FileEmbeddingParams::try_from_params(
-                &component_name,
-                params,
-                &secrets,
-            )
-            .await
-            .map_err(params_err)?;
+            let typed =
+                embedding_params::file::FileEmbeddingParams::try_from_params_with_secret_sources(
+                    &component_name,
+                    params,
+                    &secrets,
+                    &secret_sources,
+                )
+                .await
+                .map_err(params_err)?;
             file(
                 model_id.as_deref(),
                 component,
@@ -155,40 +176,68 @@ pub async fn try_to_embedding(
         }),
         #[cfg(feature = "models")]
         EmbeddingPrefix::HuggingFace => {
-            let typed = embedding_params::huggingface::HuggingFaceEmbeddingParams::try_from_params(
+            // Parsing loads an `hf_token` the Spicepod does not set from the secret stores.
+            let token_in_spicepod = params.contains_key("hf_token");
+            let typed = embedding_params::huggingface::HuggingFaceEmbeddingParams::try_from_params_with_secret_sources(
                 &component_name,
                 params,
                 &secrets,
+                &secret_sources,
             )
             .await
             .map_err(params_err)?;
-            huggingface(&component.name, model_id, &typed, embeddings_cache.clone()).await
+            huggingface(
+                &component.name,
+                model_id,
+                &typed,
+                token_in_spicepod,
+                embeddings_cache.clone(),
+            )
+            .await
         }
         #[cfg(not(feature = "models"))]
         EmbeddingPrefix::HuggingFace => Err(EmbedError::UnknownModelSource {
             from: "huggingface".to_string(),
         }),
         EmbeddingPrefix::Google => {
-            let typed = embedding_params::google::GoogleEmbeddingParams::try_from_params(
+            let typed = embedding_params::google::GoogleEmbeddingParams::try_from_params_with_secret_sources(
                 &component_name,
                 params,
                 &secrets,
+                &secret_sources,
             )
             .await
             .map_err(params_err)?;
-            google(model_id, &typed, embeddings_cache.clone())
+            google(model_id, &typed, embeddings_cache.clone()).await
         }
         EmbeddingPrefix::Databricks => {
-            let typed = embedding_params::databricks::DatabricksEmbeddingParams::try_from_params(
+            // Read before `params` moves into the typed params: federation params win over a key
+            // autoloaded from a secret store, but not over one the Spicepod writes.
+            let key_in_spicepod = llms::workload_identity::key_in_spicepod(
+                &params,
+                &["databricks_token", "databricks_client_secret"],
+            );
+            // The `databricks_*` params the Spicepod sets, as opposed to ones autoloaded from the
+            // environment (`DATABRICKS_CLIENT_ID`, ...): a value the Spicepod sets always wins.
+            let in_spicepod: HashMap<String, SecretString> = params
+                .iter()
+                .filter(|(key, _)| key.starts_with("databricks_"))
+                .map(|(key, value)| (key.clone(), value.clone()))
+                .collect();
+            let typed = embedding_params::databricks::DatabricksEmbeddingParams::try_from_params_with_secret_sources(
                 &component_name,
                 params,
                 &secrets,
+                &secret_sources,
             )
             .await
             .map_err(params_err)?;
             databricks(
+                &component.name,
                 model_id,
+                &in_spicepod,
                 &typed,
+                key_in_spicepod,
                 Arc::clone(&token_provider_registry),
                 embeddings_cache.clone(),
             )
@@ -196,14 +245,15 @@ pub async fn try_to_embedding(
         }
         #[cfg(feature = "bedrock")]
         EmbeddingPrefix::Bedrock => {
-            let typed = embedding_params::bedrock::BedrockEmbeddingParams::try_from_params(
+            let typed = embedding_params::bedrock::BedrockEmbeddingParams::try_from_params_with_secret_sources(
                 &component_name,
                 params,
                 &secrets,
+                &secret_sources,
             )
             .await
             .map_err(params_err)?;
-            bedrock(model_id, &typed, embeddings_cache.clone()).await
+            bedrock(&component.name, model_id, &typed, embeddings_cache.clone()).await
         }
         #[cfg(not(feature = "bedrock"))]
         EmbeddingPrefix::Bedrock => Err(EmbedError::UnknownModelSource {
@@ -211,26 +261,81 @@ pub async fn try_to_embedding(
         }),
         #[cfg(feature = "models")]
         EmbeddingPrefix::Model2Vec => {
-            let typed = embedding_params::model2vec::Model2VecEmbeddingParams::try_from_params(
+            // Parsing loads an `hf_token` the Spicepod does not set from the secret stores.
+            let token_in_spicepod = params.contains_key("hf_token");
+            let typed = embedding_params::model2vec::Model2VecEmbeddingParams::try_from_params_with_secret_sources(
                 &component_name,
                 params,
                 &secrets,
+                &secret_sources,
             )
             .await
             .map_err(params_err)?;
-            model2vec(model_id, &typed, embeddings_cache.clone())
+            model2vec(
+                &component.name,
+                model_id,
+                &typed,
+                token_in_spicepod,
+                embeddings_cache.clone(),
+            )
+            .await
         }
         #[cfg(not(feature = "models"))]
         EmbeddingPrefix::Model2Vec => Err(EmbedError::UnknownModelSource {
             from: "model2vec".to_string(),
         }),
+        EmbeddingPrefix::SpiceAi => {
+            let typed = embedding_params::spiceai::SpiceAiEmbeddingParams::try_from_params_with_secret_sources(
+                &component_name,
+                params,
+                &secrets,
+                &secret_sources,
+            )
+            .await
+            .map_err(params_err)?;
+            spiceai(model_id, &typed, embeddings_cache.clone())
+        }
     }
 }
 
+/// An embedding model served by the Spice.ai Cloud Platform, or by another Spice runtime, such as
+/// the cluster an application sidecar reads from. Both serve the `OpenAI`-compatible
+/// `/v1/embeddings`, so the model is driven through the same client as `from: spiceai` chat
+/// models.
+fn spiceai(
+    model_id: Option<String>,
+    params: &embedding_params::spiceai::SpiceAiEmbeddingParams,
+    embeddings_cache: Option<Arc<dyn CacheProvider<CachedEmbeddingResult> + Send + Sync>>,
+) -> Result<Arc<dyn Embed>, EmbedError> {
+    let Some(model_id) = model_id else {
+        return Err(EmbedError::ModelNotProvided {
+            model_source: "spiceai".to_string(),
+        });
+    };
+    let endpoint = params.endpoint.as_str();
+    let api_key = params.api_key.as_ref().map(ExposeSecret::expose_secret);
+    // A self-hosted Spice runtime may not require authentication, but the Spice.ai Cloud Platform
+    // always does, so an unset key there is a misconfiguration.
+    if api_key.is_none() && llms::spiceai::is_cloud_platform(Some(endpoint)) {
+        return Err(EmbedError::FailedToInstantiateEmbeddingModel {
+            source: "Missing `spiceai_api_key`. Embedding models served by the Spice.ai Cloud Platform require an API key. Set `spiceai_api_key`, or set `spiceai_endpoint` to the Spice runtime serving the model. See: https://spiceai.org/docs/components/embeddings".into(),
+        });
+    }
+    Ok(Arc::new(
+        OpenaiEmbed::new(
+            llms::spiceai::new_spiceai_client(model_id, Some(endpoint), api_key),
+            None,
+        )
+        .set_cache(embeddings_cache),
+    ))
+}
+
 #[cfg(feature = "models")]
-fn model2vec(
+async fn model2vec(
+    name: &str,
     model_id: Option<String>,
     params: &embedding_params::model2vec::Model2VecEmbeddingParams,
+    token_in_spicepod: bool,
     embeddings_cache: Option<Arc<dyn CacheProvider<CachedEmbeddingResult> + Send + Sync>>,
 ) -> Result<Arc<dyn Embed>, EmbedError> {
     let Some(model_id) = model_id else {
@@ -239,24 +344,24 @@ fn model2vec(
         });
     };
 
-    // `model2vec:` has no revision plumbing: `EmbeddingPrefix::Model2Vec` is a bare
-    // `strip_prefix`, so a trailing `:rev` stays glued to the model id, and
-    // `StaticModel::from_pretrained` takes no revision argument to hand it to. The id
-    // therefore reaches the Hub as part of the *repository name*, which 401s — a bare
-    // auth error for what is really an unsupported-configuration mistake (#12445).
+    // `model2vec:` takes no revision: `EmbeddingPrefix::Model2Vec` is a bare
+    // `strip_prefix`, so a trailing `:rev` stays glued to the model id, which then names
+    // a repository the Hub does not have — a bare not-found error for what is really an
+    // unsupported-configuration mistake (#12445).
     //
     // Say so instead. `pinned_revision` defers to the same regex the `huggingface:`
     // arm uses rather than splitting on the last ':', so the two agree about what a
     // revision is: only an `org/model:rev` shape has one, and a local path — the other
-    // thing `from_pretrained` accepts, including a Windows `C:/…` — passes through.
+    // thing `Model2Vec::load` accepts, including a Windows `C:/…` — passes through.
     //
-    // The `exists()` guard mirrors `from_pretrained`'s own precedence, which tries the
+    // The existence check mirrors `Model2Vec::load`'s own precedence, which tries the
     // id as a local path before treating it as a repo name. Without it, a directory
     // that happened to match the `org/model:rev` shape would be rejected here even
     // though the loader would have opened it — so this only ever rejects ids that
-    // really would have gone to the Hub and 401'd.
+    // really would have gone to the Hub.
+    let exists_locally = tokio::fs::try_exists(&model_id).await.unwrap_or(false);
     if let Some(revision) = pinned_revision(&model_id)
-        .filter(|_| !Path::new(&model_id).exists())
+        .filter(|_| !exists_locally)
         .map(ToString::to_string)
     {
         return Err(EmbedError::RevisionPinningUnsupported {
@@ -266,22 +371,31 @@ fn model2vec(
         });
     }
 
-    Model2Vec::from_params(
-        &model_id,
-        params.hf_token.as_ref().map(ExposeSecret::expose_secret),
-        params.normalize,
-        params.subfolder.as_deref(),
-        params.parallelism,
-        params.embed_max_token_length,
-        params.embed_custom_batch_size,
-    )
-    .map(|m| Arc::new(m.set_cache(embeddings_cache)) as Arc<dyn Embed>)
-    .map_err(|e| EmbedError::FailedToInstantiateEmbeddingModel {
-        source: Box::new(e),
-    })
+    let hub = llms::hf::HubParams {
+        token: params.hf_token.as_ref(),
+        token_in_spicepod,
+        endpoint: params.hf_endpoint.as_deref(),
+    };
+    let options = Model2VecOptions {
+        normalize: params.normalize,
+        subfolder: params.subfolder.clone(),
+        parallelism: params.parallelism,
+        embed_max_token_length: params.embed_max_token_length,
+        embed_custom_batch_size: params.embed_custom_batch_size,
+    };
+    Model2Vec::load(name, &model_id, hub, options)
+        .await
+        .map(|m| Arc::new(m.set_cache(embeddings_cache)) as Arc<dyn Embed>)
+        .map_err(|e| match e {
+            // It names the model, the cause and the fix already.
+            EmbedError::FailedToDownloadModel { .. } => e,
+            e => EmbedError::FailedToInstantiateEmbeddingModel {
+                source: Box::new(e),
+            },
+        })
 }
 
-fn google(
+async fn google(
     model_id: Option<String>,
     params: &embedding_params::google::GoogleEmbeddingParams,
     embeddings_cache: Option<Arc<dyn CacheProvider<CachedEmbeddingResult> + Send + Sync>>,
@@ -291,23 +405,33 @@ fn google(
             model_source: "google".to_string(),
         });
     };
-    let google = llms::google::Google::new_embeddings(
-        &params.api_key,
-        &model_id,
-        params.dimensions,
-        embeddings_cache,
+
+    let client = llms::google::auth::build_client(
+        llms::google::auth::VertexAuthParams {
+            project: params.project.as_deref(),
+            location: params.location.as_deref(),
+            service_account_path: params.service_account_path.as_deref(),
+            service_account_key: params.service_account_key.as_ref(),
+            application_default_credentials: params
+                .application_default_credentials
+                .unwrap_or(false),
+        },
+        "embeddings.params",
     )
+    .await
     .map_err(|e| EmbedError::FailedToInstantiateEmbeddingModel {
-        source: Box::new(std::io::Error::other(format!(
-            "Failed to create Google embeddings client: {e}"
-        ))),
+        source: Box::new(std::io::Error::other(e.to_string())),
     })?;
+
+    let google = llms::google::Google::from_client(client, model_id)
+        .into_embeddings(params.dimensions, embeddings_cache);
 
     Ok(Arc::new(google) as Arc<dyn Embed>)
 }
 
 #[cfg(feature = "bedrock")]
 async fn bedrock(
+    embedding_name: &str,
     model_id: Option<String>,
     params: &embedding_params::bedrock::BedrockEmbeddingParams,
     embeddings_cache: Option<Arc<dyn CacheProvider<CachedEmbeddingResult> + Send + Sync>>,
@@ -319,9 +443,18 @@ async fn bedrock(
     };
 
     let runtime_params = params.runtime_params();
-    let client = super::util::create_bedrock_client(&runtime_params, "bedrock-embed")
-        .await
-        .map_err(|e| EmbedError::FailedToInstantiateEmbeddingModel { source: e })?;
+    let client = super::util::create_bedrock_client(
+        &format!("embedding '{embedding_name}' (bedrock)"),
+        &runtime_params,
+        "bedrock-embed",
+    )
+    .await
+    .map_err(|error| EmbedError::FailedToInstantiateEmbeddingModel {
+        source: match error {
+            super::util::BedrockClientError::NoCredentials(message) => message.into(),
+            super::util::BedrockClientError::Other(source) => source,
+        },
+    })?;
 
     if model_id.starts_with("amazon.titan-embed") {
         let normalize = params.normalize.unwrap_or(true);
@@ -401,9 +534,14 @@ async fn huggingface(
     name: &String,
     model_id: Option<String>,
     params: &embedding_params::huggingface::HuggingFaceEmbeddingParams,
+    token_in_spicepod: bool,
     embeddings_cache: Option<Arc<dyn CacheProvider<CachedEmbeddingResult> + Send + Sync>>,
 ) -> Result<Arc<dyn Embed>, EmbedError> {
-    let hf_token = params.hf_token.as_ref().map(ExposeSecret::expose_secret);
+    let hub = llms::hf::HubParams {
+        token: params.hf_token.as_ref(),
+        token_in_spicepod,
+        endpoint: params.hf_endpoint.as_deref(),
+    };
     let pooling = params.pooling.map(embedding_params::Pooling::as_str);
     let truncation = params.truncate.unwrap_or_default().direction();
     if let Some(id) = model_id {
@@ -415,9 +553,10 @@ async fn huggingface(
         let (repo_id, revision) = spicepod::component::model::split_hf_model_id(&id);
         Ok(Arc::new(
             TeiEmbed::from_hf(
+                name,
                 repo_id,
                 revision,
-                hf_token,
+                hub,
                 pooling,
                 params.max_seq_length,
                 truncation,
@@ -434,8 +573,11 @@ async fn huggingface(
 }
 
 async fn databricks(
+    embedding_name: &str,
     model_id: Option<String>,
+    raw_params: &HashMap<String, SecretString>,
     params: &embedding_params::databricks::DatabricksEmbeddingParams,
+    key_in_spicepod: Option<&str>,
     token_provider_registry: Arc<TokenProviderRegistry>,
     embeddings_cache: Option<Arc<dyn CacheProvider<CachedEmbeddingResult> + Send + Sync>>,
 ) -> Result<Arc<dyn Embed>, EmbedError> {
@@ -447,7 +589,11 @@ async fn databricks(
     };
 
     let token_opt = params.token.as_ref().map(ExposeSecret::expose_secret);
-    let client_id = params.client_id.as_deref();
+    let client_id = crate::token_providers::databricks::component_client_id(
+        raw_params,
+        params.client_id.as_ref(),
+        params.client_secret.as_ref(),
+    );
     let client_secret = params
         .client_secret
         .as_ref()
@@ -458,17 +604,58 @@ async fn databricks(
     #[cfg(not(feature = "databricks"))]
     let user_agent: Option<&'static str> = None;
 
+    let embedding_error = |error| EmbedError::FailedToInstantiateEmbeddingModel {
+        source: Box::new(model_error(error)),
+    };
+    if let Some(identity) = params
+        .federation(
+            raw_params,
+            crate::token_providers::databricks::in_github_actions(),
+        )
+        .workload_identity(
+            key_in_spicepod,
+            params.token.is_some() || params.client_secret.is_some(),
+        )
+        .map_err(embedding_error)?
+    {
+        let token_provider = get_workload_identity_token_provider(
+            &format!("embedding '{embedding_name}' (databricks)"),
+            endpoint,
+            identity,
+            &token_provider_registry,
+        )
+        .await
+        .map_err(embedding_error)?;
+        return Ok(Arc::new(
+            llms::databricks::from_token_provider(
+                endpoint,
+                model_id.as_str(),
+                token_provider,
+                user_agent,
+                HealthCheck::Required,
+            )
+            .set_cache(embeddings_cache),
+        ) as Arc<dyn Embed>);
+    }
+
     match (token_opt, client_id, client_secret) {
         (Some(_), Some(_) | None, Some(_)) => {
             Err(EmbedError::FailedToInstantiateEmbeddingModel {
                 source: "Either `databricks_token` or `databricks_client_id` and `databricks_client_secret` should be provided, not both.".into(),
             })
         }
-        (Some(_), Some(_), None)|(None, None, None) => {
+        (Some(_), Some(_), None) => {
             Err(EmbedError::FailedToInstantiateEmbeddingModel {
                 source: "Either `databricks_token` or `databricks_client_id` and `databricks_client_secret` should be provided.".into(),
             })
         }
+        (None, None, None) => Err(EmbedError::FailedToInstantiateEmbeddingModel {
+            source: format!(
+                "Found no credential for embedding '{embedding_name}' (databricks). {}. See: https://spiceai.org/docs/components/embeddings/databricks",
+                crate::token_providers::databricks::NO_CREDENTIAL_MESSAGE
+            )
+            .into(),
+        }),
         (None, None, Some(_client_secret)) => {
             Err(EmbedError::FailedToInstantiateEmbeddingModel {
                 source: "If `databricks_client_secret` is provided, `databricks_client_id` must also be provided.".into(),
@@ -579,15 +766,16 @@ async fn file(
     ))
 }
 
-fn azure(
+async fn azure(
     model_id: Option<String>,
-    model_name: &str,
+    component_name: &str,
     params: &embedding_params::azure::AzureEmbeddingParams,
+    key_in_spicepod: Option<&'static str>,
     embeddings_cache: Option<Arc<dyn CacheProvider<CachedEmbeddingResult> + Send + Sync>>,
 ) -> Result<Arc<dyn Embed>, EmbedError> {
     let Some(model_name) = model_id else {
         return Err(EmbedError::FailedToInstantiateEmbeddingModel {
-            source: format!("For embedding model '{model_name}', model id must be specified in `from:azure:<model_id>`.").into(),
+            source: format!("For embedding model '{component_name}', model id must be specified in `from:azure:<model_id>`.").into(),
         });
     };
     let api_key = params.api_key.as_ref().map(ExposeSecret::expose_secret);
@@ -601,13 +789,21 @@ fn azure(
         });
     }
 
-    if api_key.is_none() && entra_token.is_none() {
-        return Err(EmbedError::FailedToInstantiateEmbeddingModel {
-            source: format!(
-                "Azure embedding model '{model_name}' requires 'azure_api_key' or 'azure_entra_token'."
-            )
-            .into(),
-        });
+    if let Some(client) = llms::workload_identity::azure_federated_client(
+        &format!("embedding '{component_name}' (azure)"),
+        &model_name,
+        &params.federation(),
+        key_in_spicepod,
+        api_key.is_some() || entra_token.is_some(),
+        &llms::workload_identity::AzureEnvironment::from_process(),
+        llms::openai::ChatBackend::ChatCompletions,
+    )
+    .await
+    .map_err(llms::workload_identity::FederationError::into_embed_error)?
+    {
+        return Ok(Arc::new(
+            OpenaiEmbed::new(client, None).set_cache(embeddings_cache),
+        ));
     }
 
     Ok(Arc::new(
@@ -630,14 +826,40 @@ async fn openai(
     model_id: Option<String>,
     component: &spicepod::component::embeddings::Embeddings,
     params: &embedding_params::openai::OpenAiEmbeddingParams,
+    api_key_in_spicepod: Option<&'static str>,
     secrets: Arc<RwLock<Secrets>>,
     embeddings_cache: Option<Arc<dyn CacheProvider<CachedEmbeddingResult> + Send + Sync>>,
 ) -> Result<Arc<dyn Embed>, EmbedError> {
     let usage_tier = params.usage_tier;
+    let model = model_id.unwrap_or(DEFAULT_EMBEDDING_MODEL.to_string());
 
-    let mut embed = OpenaiEmbed::new(
+    let label = format!("embedding '{}' (openai)", component.name);
+    if let Some(client) = llms::workload_identity::openai_federated_client(
+        &label,
+        &model,
+        &params.federation(),
+        api_key_in_spicepod,
+        llms::openai::ChatBackend::ChatCompletions,
+    )
+    .await
+    .map_err(llms::workload_identity::FederationError::into_embed_error)?
+    {
+        let embed = OpenaiEmbed::new(client, Some(usage_tier.into())).set_cache(embeddings_cache);
+        return with_tokenizer_file(embed, component, secrets).await;
+    }
+    if let Some(message) = llms::workload_identity::openai_missing_credential(
+        &label,
+        params.api_key.as_ref().map(ExposeSecret::expose_secret),
+        params.endpoint.as_str(),
+    ) {
+        return Err(EmbedError::FailedToInstantiateEmbeddingModel {
+            source: message.into(),
+        });
+    }
+
+    let embed = OpenaiEmbed::new(
         llms::openai::new_openai_client(
-            model_id.unwrap_or(DEFAULT_EMBEDDING_MODEL.to_string()),
+            model,
             Some(params.endpoint.as_str()),
             params.api_key.as_ref().map(ExposeSecret::expose_secret),
             params.org_id.as_deref(),
@@ -647,7 +869,18 @@ async fn openai(
         Some(usage_tier.into()),
     )
     .set_cache(embeddings_cache);
+    with_tokenizer_file(embed, component, secrets).await
+}
 
+/// `embed`, with the tokenizer the embedding names, if any.
+async fn with_tokenizer_file<C>(
+    mut embed: OpenaiEmbed<C>,
+    component: &spicepod::component::embeddings::Embeddings,
+    secrets: Arc<RwLock<Secrets>>,
+) -> Result<Arc<dyn Embed>, EmbedError>
+where
+    C: async_openai::config::Config + Clone + Send + Sync + std::fmt::Debug + 'static,
+{
     // For OpenAI compatible embedding models, we allow users to
     // specific the tokenizer being used, so that the model can chunk data properly.
     if let Some(tokenizer_file) = component.find_any_file(ModelFileType::Tokenizer) {
@@ -662,7 +895,7 @@ async fn openai(
             HashMap::default()
         };
 
-        let bytz = get_bytes_for_file(tokenizer_file.path.as_str(), &file_params)
+        let bytz = get_bytes_for_file(&component.name, tokenizer_file.path.as_str(), &file_params)
             .await
             .map_err(|source| EmbedError::FailedToCreateTokenizer { source })?;
 
@@ -678,15 +911,19 @@ async fn openai(
 ///   - Huggingface URLs, e.g. `<https://huggingface.co/sentence-transformers/all-MiniLM-L6-v2/blob/main/tokenizer.json>`.
 ///   - Huggingface `FssSpec`: `hf://[<repo_type_prefix>]<repo_id>[@<revision>]/<path/in/repo>`.
 async fn get_bytes_for_file(
+    component: &str,
     url: &str,
     params: &HashMap<String, SecretString>,
 ) -> Result<Bytes, Box<dyn std::error::Error + Send + Sync>> {
     #[cfg(not(feature = "models"))]
-    let _ = params;
+    let _ = (component, params);
 
     #[cfg(feature = "models")]
     {
-        match url.split('/').collect_vec().as_slice() {
+        use llms::hf::RepoType;
+        let hf_token = params.get("hf_token");
+        let segments = url.split('/').collect_vec();
+        let (kind, org_id, model_id_revision, file) = match segments.as_slice() {
             [
                 "https:",
                 "",
@@ -698,62 +935,38 @@ async fn get_bytes_for_file(
                 file @ ..,
             ] => {
                 return get_file_from_hf(
-                    None,
-                    org_id,
-                    model_id,
+                    component,
+                    RepoType::Model,
+                    &format!("{org_id}/{model_id}"),
                     Some(branch),
-                    file.join("/").as_str(),
-                    params
-                        .get("hf_token")
-                        .map(secrecy::ExposeSecret::expose_secret),
+                    &file.join("/"),
+                    hf_token,
                 )
                 .await;
             }
             ["hf:", "", "datasets", org_id, model_id_revision, file @ ..] => {
-                let (model_id, branch) = parse_model_id_w_revision(model_id_revision);
-
-                return get_file_from_hf(
-                    Some("datasets"),
-                    org_id,
-                    model_id,
-                    branch,
-                    file.join("/").as_str(),
-                    params
-                        .get("hf_token")
-                        .map(secrecy::ExposeSecret::expose_secret),
-                )
-                .await;
+                (RepoType::Dataset, *org_id, *model_id_revision, file)
             }
             ["hf:", "", "spaces", org_id, model_id_revision, file @ ..] => {
-                let (model_id, branch) = parse_model_id_w_revision(model_id_revision);
-                return get_file_from_hf(
-                    Some("spaces"),
-                    org_id,
-                    model_id,
-                    branch,
-                    file.join("/").as_str(),
-                    params
-                        .get("hf_token")
-                        .map(secrecy::ExposeSecret::expose_secret),
-                )
-                .await;
+                (RepoType::Space, *org_id, *model_id_revision, file)
             }
             ["hf:", "", "models", org_id, model_id_revision, file @ ..]
             | ["hf:", "", org_id, model_id_revision, file @ ..] => {
-                let (model_id, branch) = parse_model_id_w_revision(model_id_revision);
-                return get_file_from_hf(
-                    Some("models"),
-                    org_id,
-                    model_id,
-                    branch,
-                    file.join("/").as_str(),
-                    params
-                        .get("hf_token")
-                        .map(secrecy::ExposeSecret::expose_secret),
-                )
-                .await;
+                (RepoType::Model, *org_id, *model_id_revision, file)
             }
-            _ => {}
+            _ => (RepoType::Model, "", "", &[][..]),
+        };
+        if !org_id.is_empty() {
+            let (model_id, revision) = parse_model_id_w_revision(model_id_revision);
+            return get_file_from_hf(
+                component,
+                kind,
+                &format!("{org_id}/{model_id}"),
+                revision,
+                &file.join("/"),
+                hf_token,
+            )
+            .await;
         }
     }
 
@@ -784,28 +997,31 @@ fn parse_model_id_w_revision(model_w_revision: &str) -> (&str, Option<&str>) {
 
 #[cfg(feature = "models")]
 async fn get_file_from_hf(
-    repo_type: Option<&str>,
-    org_id: &str,
-    model_id: &str,
-    branch: Option<&str>,
+    component: &str,
+    kind: llms::hf::RepoType,
+    repo: &str,
+    revision: Option<&str>,
     file: &str,
-    hf_token: Option<&str>,
+    hf_token: Option<&SecretString>,
 ) -> Result<Bytes, Box<dyn std::error::Error + Send + Sync>> {
-    match download_hf_file(
-        format!("{org_id}/{model_id}").as_str(),
-        branch,
-        repo_type,
-        file,
-        hf_token,
-    )
-    .await
-    {
-        Ok(path) => {
-            let bytz = fs::read(path).await.boxed()?;
-            Ok(bytz.into())
-        }
-        Err(e) => Err(Box::<dyn std::error::Error + Send + Sync>::from(format!(
-            "Downloaded HF url, but failed to get local path. Error: {e:?}"
-        ))),
-    }
+    let requester = llms::hf::Requester {
+        kind: "embedding model",
+        name: component.to_string(),
+        docs_url: "https://spiceai.org/docs/components/embeddings",
+        // Spice loads an embedding model once.
+        retried: false,
+    };
+    let hub = llms::hf::HubParams {
+        token: hf_token,
+        // The file's own `hf_token`, never loaded from a secret store.
+        token_in_spicepod: true,
+        endpoint: None,
+    };
+    let snapshot = llms::hf::open_paths(requester, kind, repo, revision, hub, &[file]).await?;
+    let path = snapshot
+        .download(&[file])
+        .await?
+        .pop()
+        .ok_or("the download returned no file")?;
+    Ok(fs::read(path).await?.into())
 }

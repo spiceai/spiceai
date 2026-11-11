@@ -145,8 +145,24 @@ impl DataConnector for DrasiConnector {
         self.inner_connector.supports_durable_write_back_delivery()
     }
 
+    async fn write_back_deliverer(
+        &self,
+        context: &dyn ConnectorContext,
+        dataset: &DatasetSpec,
+    ) -> Option<
+        data_connector_api::DataConnectorResult<Arc<dyn data_connector_api::WriteBackDeliverer>>,
+    > {
+        self.inner_connector
+            .write_back_deliverer(context, dataset)
+            .await
+    }
+
     fn supports_changes_stream(&self) -> bool {
         self.inner_connector.supports_changes_stream()
+    }
+
+    fn supports_partitioned_changes(&self) -> bool {
+        self.inner_connector.supports_partitioned_changes()
     }
 
     async fn changes_stream(

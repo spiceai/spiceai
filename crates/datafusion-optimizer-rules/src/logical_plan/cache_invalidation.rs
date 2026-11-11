@@ -29,6 +29,7 @@ use async_stream::stream;
 use async_trait::async_trait;
 use cache::Caching;
 use datafusion::{
+    common::TableReference,
     common::{
         DFSchemaRef,
         tree_node::{Transformed, TreeNode, TreeNodeRecursion},
@@ -40,7 +41,6 @@ use datafusion::{
     physical_plan::{DisplayFormatType, ExecutionPlan, stream::RecordBatchStreamAdapter},
     physical_planner::{ExtensionPlanner, PhysicalPlanner},
     prelude::Expr,
-    sql::TableReference,
 };
 use futures::StreamExt;
 
@@ -306,7 +306,8 @@ impl ExtensionPlanner for CacheInvalidationExtensionPlanner {
         node: &dyn UserDefinedLogicalNode,
         logical_inputs: &[&LogicalPlan],
         physical_inputs: &[Arc<dyn ExecutionPlan>],
-        _session_state: &datafusion::execution::context::SessionState,
+        _session_state: &dyn datafusion::catalog::Session,
+        _planning_ctx: &datafusion::logical_expr::physical_planning_context::PhysicalPlanningContext,
     ) -> Result<Option<Arc<dyn ExecutionPlan>>> {
         let Some(cache_node) = node.as_any().downcast_ref::<CacheInvalidationNode>() else {
             return Ok(None);

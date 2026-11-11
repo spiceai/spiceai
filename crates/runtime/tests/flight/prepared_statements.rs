@@ -7,12 +7,13 @@ mod flight_prepared_statements {
     use arrow_flight::sql::client::{FlightSqlServiceClient, PreparedStatement};
     use futures::TryStreamExt as _;
     use runtime_auth::{FlightBasicAuth, api_key::ApiKeyAuth};
-    use spicepod::component::runtime::ApiKey;
+    use spicepod::component::{caching::SQLResultsCacheConfig, runtime::ApiKey};
     use tonic::transport::Channel;
 
     use crate::{
         flight::{
-            create_flight_client, start_spice_test_app, test_record_batch, write_record_batches,
+            create_flight_client, start_spice_test_app, start_spice_test_app_with_cache,
+            test_record_batch, write_record_batches,
         },
         init_tracing,
         utils::test_request_context,
@@ -42,6 +43,78 @@ mod flight_prepared_statements {
                 let results_str =
                     arrow::util::pretty::pretty_format_batches(&results).expect("pretty batches");
                 insta::assert_snapshot!("basic_binding_table_content", results_str);
+
+                Ok(())
+            })
+            .await
+    }
+
+    /// The schema `GetFlightInfo` advertises for a prepared statement with
+    /// bound parameters must match the `DoGet` stream, including for output
+    /// columns derived from a parameter (ADBC and arrow-go reject a mismatch
+    /// with "endpoint 0 returned inconsistent schema").
+    #[tokio::test]
+    async fn test_bound_param_flight_info_schema_matches_stream() -> Result<(), anyhow::Error> {
+        let _tracing = init_tracing(Some("integration=debug,info"));
+
+        test_request_context()
+            .scope(async {
+                let (channel, _df) = start_spice_test_app(None, None, None).await?;
+                let mut client = FlightSqlServiceClient::new(channel);
+
+                let int_param = || {
+                    create_param_batch(
+                        vec![("$1", arrow::datatypes::DataType::Int64, true)],
+                        vec![Arc::new(Int64Array::from(vec![1])) as ArrayRef],
+                    )
+                };
+                let cases = [
+                    ("SELECT $1 AS x", int_param()?),
+                    ("SELECT CAST($1 AS VARCHAR) AS x", int_param()?),
+                    (
+                        "SELECT $1 || 'x' AS x",
+                        create_param_batch(
+                            vec![("$1", arrow::datatypes::DataType::Utf8, true)],
+                            vec![Arc::new(StringArray::from(vec!["a"])) as ArrayRef],
+                        )?,
+                    ),
+                    ("SELECT 1 + $1 AS x", int_param()?),
+                    (
+                        "SELECT $1 AS x",
+                        create_param_batch(
+                            vec![("$1", arrow::datatypes::DataType::Date64, true)],
+                            vec![
+                                Arc::new(arrow::array::Date64Array::from(vec![1_768_498_200_000]))
+                                    as ArrayRef,
+                            ],
+                        )?,
+                    ),
+                ];
+
+                for (sql, params) in cases {
+                    let mut stmt = get_prepared_statement(&mut client, sql).await?;
+                    stmt.set_parameters(params)?;
+                    let flight_info = stmt.execute().await?;
+                    let advertised = flight_info.clone().try_decode_schema()?;
+
+                    let ticket = flight_info
+                        .endpoint
+                        .first()
+                        .and_then(|e| e.ticket.clone())
+                        .ok_or_else(|| anyhow::anyhow!("No ticket for {sql}"))?;
+                    let batches: Vec<RecordBatch> =
+                        client.do_get(ticket).await?.try_collect().await?;
+                    let streamed = batches
+                        .first()
+                        .ok_or_else(|| anyhow::anyhow!("No batch for {sql}"))?
+                        .schema();
+
+                    assert_eq!(advertised.fields().len(), streamed.fields().len(), "{sql}");
+                    for (a, s) in advertised.fields().iter().zip(streamed.fields()) {
+                        assert_eq!(a.data_type(), s.data_type(), "data type for {sql}");
+                        assert_eq!(a.is_nullable(), s.is_nullable(), "nullability for {sql}");
+                    }
+                }
 
                 Ok(())
             })
@@ -1139,5 +1212,374 @@ mod flight_prepared_statements {
                 Ok(())
             })
             .await
+    }
+
+    /// A bound parameter compared with a column takes the column's type, as it
+    /// does over HTTP. Comparing in the parameter's type instead loses the time
+    /// zone of a zoned timestamp, and compares a DECIMAL column as an inexact
+    /// float, so the matching row is not returned. A `Date64` parameter keeps
+    /// its time of day: as a `DATE` it would be truncated to midnight, which
+    /// misses the same instant and equals midnight of that day. A `Date64` at
+    /// midnight still matches a `DATE` column.
+    #[tokio::test]
+    async fn test_parameter_compared_with_column_matches() -> Result<(), anyhow::Error> {
+        let _tracing = init_tracing(Some("integration=debug,info"));
+
+        test_request_context()
+            .scope(async {
+                use arrow::array::{Date64Array, Float64Array, TimestampMicrosecondArray};
+                use arrow::datatypes::{DataType, TimeUnit};
+
+                let (channel, _df) = start_spice_test_app(None, None, None).await?;
+                let mut client = FlightSqlServiceClient::new(channel);
+
+                let zone = "America/Los_Angeles";
+                // 2026-01-15T09:30:00-08:00
+                let instant_us = 1_768_498_200_000_000_i64;
+                // The same instant as a `Date64` is 17:30 into 2026-01-15 UTC.
+                let instant_ms = instant_us / 1000;
+                let midnight_ms = 1_768_435_200_000_i64;
+                let date64 = |ms: i64| {
+                    create_param_batch(
+                        vec![("$1", DataType::Date64, false)],
+                        vec![Arc::new(Date64Array::from(vec![ms])) as ArrayRef],
+                    )
+                };
+                let cases = [
+                    (
+                        "WITH t(c) AS (SELECT arrow_cast('2026-01-15T09:30:00-08:00', 'Timestamp(µs, \"America/Los_Angeles\")')) \
+                         SELECT count(*) AS n FROM t WHERE c = $1",
+                        create_param_batch(
+                            vec![(
+                                "$1",
+                                DataType::Timestamp(TimeUnit::Microsecond, Some(zone.into())),
+                                false,
+                            )],
+                            vec![Arc::new(
+                                TimestampMicrosecondArray::from(vec![instant_us]).with_timezone(zone),
+                            ) as ArrayRef],
+                        )?,
+                    ),
+                    (
+                        "WITH t(c) AS (SELECT CAST('0.1' AS DECIMAL(38, 37))) \
+                         SELECT count(*) AS n FROM t WHERE c = $1",
+                        create_param_batch(
+                            vec![("$1", DataType::Float64, false)],
+                            vec![Arc::new(Float64Array::from(vec![0.1])) as ArrayRef],
+                        )?,
+                    ),
+                    (
+                        "WITH t(c) AS (SELECT arrow_cast(1768498200000, 'Date64')) \
+                         SELECT count(*) AS n FROM t WHERE c = $1",
+                        date64(instant_ms)?,
+                    ),
+                    (
+                        "WITH t(c) AS (SELECT arrow_cast(1768435200000, 'Date64')) \
+                         SELECT count(*) AS n FROM t WHERE c <> $1",
+                        date64(instant_ms)?,
+                    ),
+                    (
+                        "WITH t(c) AS (SELECT CAST('2026-01-15' AS DATE)) \
+                         SELECT count(*) AS n FROM t WHERE c = $1",
+                        date64(midnight_ms)?,
+                    ),
+                ];
+
+                for (sql, params) in cases {
+                    let results = execute_parameterized_query(&mut client, sql, params).await?;
+                    let n = results
+                        .first()
+                        .and_then(|batch| batch.column(0).as_any().downcast_ref::<Int64Array>())
+                        .map(|n| n.value(0));
+                    assert_eq!(n, Some(1), "{sql}");
+                }
+
+                Ok(())
+            })
+            .await
+    }
+
+    /// Matrix for timestamp parameters bound over Flight SQL (#15739).
+    ///
+    /// Each parameter (UTC, `America/Los_Angeles`, `Asia/Kolkata` and naive) is
+    /// compared with zoned columns of two units and with a naive column. A zoned
+    /// parameter must match the row for its instant, return the same rows as the
+    /// equivalent literal, and keep its zone in `arrow_typeof($1)`. Rows 2 and 3
+    /// hold the Los Angeles and Kolkata wall-clock times read as UTC, so a
+    /// parameter whose zone is dropped matches the wrong row.
+    #[tokio::test]
+    async fn test_timestamp_parameter_matrix() -> Result<(), anyhow::Error> {
+        let _tracing = init_tracing(Some("integration=debug,info"));
+
+        test_request_context()
+            .scope(async {
+                use arrow::array::TimestampMicrosecondArray;
+                use arrow::datatypes::{DataType, TimeUnit};
+
+                let (channel, _df) = start_spice_test_app(None, None, None).await?;
+                let mut client = FlightSqlServiceClient::new(channel);
+
+                // (id, instant, naive wall clock): 10:00Z is 03:00 in Los Angeles
+                // (DST starts that instant) and 15:30 in Kolkata.
+                let rows = [
+                    (1, "2026-03-08T10:00:00Z", "2026-03-08T10:00:00"),
+                    (2, "2026-03-08T03:00:00Z", "2026-03-08T03:00:00"),
+                    (3, "2026-03-08T15:30:00Z", "2026-03-08T15:30:00"),
+                ];
+                let values = rows
+                    .iter()
+                    .map(|(id, instant, naive)| {
+                        format!(
+                            "({id}, \
+                             arrow_cast('{instant}', 'Timestamp(ns, \"UTC\")'), \
+                             arrow_cast('{instant}', 'Timestamp(µs, \"America/Los_Angeles\")'), \
+                             arrow_cast('{instant}', 'Timestamp(µs, \"UTC\")'), \
+                             arrow_cast('{naive}', 'Timestamp(µs)'))"
+                        )
+                    })
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                let table =
+                    format!("WITH t(id, ts_utc, ts_la, ts_us, ts_naive) AS (VALUES {values})");
+
+                // 2026-03-08T10:00:00Z
+                let instant_us = 1_772_964_000_000_000_i64;
+                // (label, zone, literal text for the same value)
+                let params: [(&str, Option<&str>, &str); 4] = [
+                    ("utc", Some("UTC"), "2026-03-08T10:00:00Z"),
+                    ("la", Some("America/Los_Angeles"), "2026-03-08T10:00:00Z"),
+                    ("kolkata", Some("Asia/Kolkata"), "2026-03-08T10:00:00Z"),
+                    ("naive", None, "2026-03-08T10:00:00"),
+                ];
+
+                for (label, zone, literal_text) in params {
+                    let array = TimestampMicrosecondArray::from(vec![instant_us]);
+                    let array = match zone {
+                        Some(zone) => array.with_timezone(zone),
+                        None => array,
+                    };
+                    let param_type =
+                        DataType::Timestamp(TimeUnit::Microsecond, zone.map(Into::into));
+                    let batch = || {
+                        create_param_batch(
+                            vec![("$1", param_type.clone(), false)],
+                            vec![Arc::new(array.clone()) as ArrayRef],
+                        )
+                    };
+                    let literal = format!("arrow_cast('{literal_text}', '{param_type}')");
+
+                    // The bound type keeps its zone, as the literal's does.
+                    let typeof_sql =
+                        format!("SELECT arrow_typeof($1) AS p, arrow_typeof({literal}) AS l");
+                    let results =
+                        execute_parameterized_query(&mut client, &typeof_sql, batch()?).await?;
+                    let (bound, lit) = string_pair(&results)?;
+                    if let Some(zone) = zone {
+                        assert_eq!(bound, lit, "[{label}] arrow_typeof($1)");
+                        assert!(bound.contains(zone), "[{label}] zone dropped: {bound}");
+                    } else {
+                        // Naive parameters are still rewritten to CAST($N AS TIMESTAMP),
+                        // which may change the unit; only require that no zone appears.
+                        assert!(
+                            bound.starts_with("Timestamp(") && !bound.contains(','),
+                            "[{label}] naive parameter gained a zone: {bound}"
+                        );
+                    }
+
+                    for column in ["ts_utc", "ts_la", "ts_us", "ts_naive"] {
+                        let ids_sql = |rhs: &str| {
+                            format!("{table} SELECT id FROM t WHERE {column} = {rhs} ORDER BY id")
+                        };
+                        let bound = ids_of(
+                            &execute_parameterized_query(&mut client, &ids_sql("$1"), batch()?)
+                                .await?,
+                        );
+                        let lit = ids_of(
+                            &execute_parameterized_query(&mut client, &ids_sql(&literal), batch()?)
+                                .await?,
+                        );
+                        assert_eq!(bound, lit, "[{label}] {column} = $1 vs literal");
+
+                        let expected_instant = zone.is_some() && column != "ts_naive";
+                        let expected_naive = zone.is_none() && column == "ts_naive";
+                        if expected_instant || expected_naive {
+                            assert_eq!(bound, vec![1], "[{label}] {column} = $1");
+                        }
+                    }
+                }
+
+                Ok(())
+            })
+            .await
+    }
+
+    /// The first two Utf8 columns of the first row.
+    fn string_pair(batches: &[RecordBatch]) -> Result<(String, String), anyhow::Error> {
+        let batch = batches
+            .first()
+            .ok_or_else(|| anyhow::anyhow!("no batches"))?;
+        let col = |i: usize| -> Result<String, anyhow::Error> {
+            let array = arrow::compute::cast(batch.column(i), &arrow::datatypes::DataType::Utf8)?;
+            let array = array
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .ok_or_else(|| anyhow::anyhow!("column {i} is not Utf8"))?;
+            Ok(array.value(0).to_string())
+        };
+        Ok((col(0)?, col(1)?))
+    }
+
+    /// The `id` column of every returned batch, as i64.
+    fn ids_of(batches: &[RecordBatch]) -> Vec<i64> {
+        batches
+            .iter()
+            .flat_map(|batch| {
+                let ids = arrow::compute::cast(batch.column(0), &arrow::datatypes::DataType::Int64)
+                    .expect("id casts to Int64");
+                ids.as_any()
+                    .downcast_ref::<Int64Array>()
+                    .expect("Int64")
+                    .iter()
+                    .flatten()
+                    .collect::<Vec<_>>()
+            })
+            .collect()
+    }
+
+    /// A stale-while-revalidate revalidation of a Flight SQL prepared statement
+    /// must re-bind its parameter values.
+    ///
+    /// Flight SQL is where this matters most: a JDBC or ADBC client binds
+    /// parameters on every query, so the placeholder path is the normal one
+    /// rather than an edge case. The revalidation rebuilds the query from the
+    /// SQL text, which still holds its placeholders -- without the values it
+    /// fails with `Placeholder '$1' was not provided a value for execution`, the
+    /// stale entry is never replaced, and every later request inside the window
+    /// is served a result older than `item_ttl` asked for.
+    ///
+    /// The oracle is the ROWS, which is both the user-visible symptom and the
+    /// only signal that belongs to this test alone. A row is added after the
+    /// entry is populated, so the stale result and the revalidated one differ:
+    /// until the revalidation lands the query keeps returning the old set, and
+    /// when it lands the new row appears. A counter could not do this job --
+    /// `results_cache_swr_revalidations` is process-global with no per-test
+    /// label, so a sibling test's revalidation would satisfy it.
+    #[tokio::test]
+    async fn swr_revalidation_of_a_prepared_statement_rebinds_its_values()
+    -> Result<(), anyhow::Error> {
+        let _tracing = init_tracing(Some("integration=debug,info"));
+
+        test_request_context()
+            .scope(async {
+                // `>=` rather than `=` so the result set can grow: an equality
+                // predicate returns the same row whatever else the table holds,
+                // which would make a stale entry indistinguishable from a fresh
+                // one.
+                const SQL: &str = "SELECT a FROM my_table WHERE a >= $1 ORDER BY a";
+
+                let auth = Arc::new(ApiKeyAuth::new(vec![ApiKey::parse_str("valid:rw")]))
+                    as Arc<dyn FlightBasicAuth + Send + Sync>;
+                // `cache_key_type: sql` keys results on the SQL text and the
+                // bound values, so the stale hit lands before a plan exists --
+                // the route with no bound plan for the revalidation to re-run.
+                let (channel, _df) = start_spice_test_app_with_cache(
+                    Some(auth),
+                    SQLResultsCacheConfig {
+                        enabled: true,
+                        item_ttl: Some("1s".to_string()),
+                        stale_while_revalidate_ttl: Some("5m".to_string()),
+                        cache_key_type: spicepod::component::caching::CacheKeyType::Sql,
+                        ..Default::default()
+                    },
+                )
+                .await?;
+
+                // `public.my_table` is registered schema-only, so it holds no
+                // rows until something writes them.
+                let mut put_client = create_flight_client(channel.clone(), Some("valid"))?;
+                write_record_batches(&mut put_client, vec![test_record_batch()?]).await?;
+
+                let mut client = FlightSqlServiceClient::new(channel);
+                client.handshake("", "valid").await?;
+
+                let bind = || {
+                    create_param_batch(
+                        vec![("$1", arrow::datatypes::DataType::Int32, false)],
+                        vec![Arc::new(Int32Array::from(vec![2])) as ArrayRef],
+                    )
+                };
+
+                let populated = execute_parameterized_query(&mut client, SQL, bind()?).await?;
+                assert_eq!(
+                    rows_of(&populated),
+                    vec![2, 3],
+                    "binding 2 must select the rows at or above it"
+                );
+
+                // Change what a correct revalidation would return.
+                write_record_batches(&mut put_client, vec![extra_row_batch(4)?]).await?;
+
+                // Age the entry past `item_ttl` into the stale-while-revalidate
+                // window. The sleep is the behavior under test (TTL expiry), not
+                // a readiness wait.
+                tokio::time::sleep(std::time::Duration::from_millis(1_200)).await;
+
+                // Poll rather than sleeping a fixed interval: the revalidation
+                // runs on a background task, and each request inside the window
+                // both serves the stale entry and triggers one.
+                let mut rows = Vec::new();
+                for _ in 0..100 {
+                    rows = rows_of(&execute_parameterized_query(&mut client, SQL, bind()?).await?);
+                    if rows == vec![2, 3, 4] {
+                        break;
+                    }
+                    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                }
+
+                assert_eq!(
+                    rows,
+                    vec![2, 3, 4],
+                    "the stale entry was never replaced, so this prepared statement keeps being \
+                     served a result older than item_ttl asked for -- the revalidation could not \
+                     re-execute because its bound values were dropped when the query was rebuilt \
+                     from its SQL text"
+                );
+
+                Ok(())
+            })
+            .await
+    }
+
+    /// The `a` column of every returned batch.
+    fn rows_of(batches: &[RecordBatch]) -> Vec<i32> {
+        batches
+            .iter()
+            .flat_map(|batch| {
+                batch
+                    .column(0)
+                    .as_any()
+                    .downcast_ref::<Int32Array>()
+                    .expect("column `a` is Int32")
+                    .iter()
+                    .flatten()
+                    .collect::<Vec<_>>()
+            })
+            .collect()
+    }
+
+    /// One extra row for `public.my_table`, matching its `(a, b)` schema.
+    fn extra_row_batch(a: i32) -> Result<RecordBatch, anyhow::Error> {
+        let schema = arrow::datatypes::Schema::new(vec![
+            arrow::datatypes::Field::new("a", arrow::datatypes::DataType::Int32, false),
+            arrow::datatypes::Field::new("b", arrow::datatypes::DataType::Utf8, false),
+        ]);
+        RecordBatch::try_new(
+            Arc::new(schema),
+            vec![
+                Arc::new(Int32Array::from(vec![a])) as ArrayRef,
+                Arc::new(StringArray::from(vec![format!("row_{a}")])) as ArrayRef,
+            ],
+        )
+        .map_err(Into::into)
     }
 }

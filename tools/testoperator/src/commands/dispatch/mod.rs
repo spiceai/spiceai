@@ -36,6 +36,7 @@ pub async fn dispatch(args: DispatchArgs) -> Result<()> {
         update_snapshots,
         max_concurrent,
         max_concurrent_wait_timeout_mins,
+        schedule,
         ..
     } = args;
     if !path.is_dir() && !path.is_file() {
@@ -66,22 +67,36 @@ pub async fn dispatch(args: DispatchArgs) -> Result<()> {
     let mut tests_to_dispatch = Vec::new();
 
     for (path, test_file) in tests {
+        if !test_file.is_on_schedule(schedule) {
+            println!(
+                "Skipping {}: it runs on the {} schedule",
+                path.display(),
+                test_file.schedule
+            );
+            continue;
+        }
         match test_type {
             TestType::Benchmark => {
                 for bench in &test_file.tests.bench {
-                    tests_to_dispatch.push((
-                        path,
-                        serde_json::json!(WorkflowArgs {
-                            specific_args: bench
-                                .clone()
-                                .with_update_snapshots(update_snapshots.into()),
-                            spiced_commit: spiced_commit.clone(),
-                        }),
-                    ));
+                    let runs = bench
+                        .expand_runs()
+                        .map_err(|e| anyhow::anyhow!("Failed to read {}: {e}", path.display()))?;
+                    for run in runs {
+                        tests_to_dispatch.push((
+                            path,
+                            serde_json::json!(WorkflowArgs {
+                                specific_args: run.with_update_snapshots(update_snapshots.into()),
+                                spiced_commit: spiced_commit.clone(),
+                            }),
+                        ));
+                    }
                 }
             }
             TestType::Load => {
                 for load in &test_file.tests.load {
+                    load.bench_args
+                        .ensure_only_bench_settings_unset("load")
+                        .map_err(|e| anyhow::anyhow!("Failed to read {}: {e}", path.display()))?;
                     tests_to_dispatch.push((
                         path,
                         serde_json::json!(WorkflowArgs {
@@ -93,6 +108,9 @@ pub async fn dispatch(args: DispatchArgs) -> Result<()> {
             }
             TestType::Throughput => {
                 for throughput in &test_file.tests.throughput {
+                    throughput
+                        .ensure_only_bench_settings_unset("throughput")
+                        .map_err(|e| anyhow::anyhow!("Failed to read {}: {e}", path.display()))?;
                     tests_to_dispatch.push((
                         path,
                         serde_json::json!(WorkflowArgs {
@@ -159,13 +177,18 @@ pub async fn dispatch(args: DispatchArgs) -> Result<()> {
             }
             TestType::Htap => {
                 for htap in &test_file.tests.htap {
-                    tests_to_dispatch.push((
-                        path,
-                        serde_json::json!(WorkflowArgs {
-                            specific_args: htap.clone(),
-                            spiced_commit: spiced_commit.clone(),
-                        }),
-                    ));
+                    let runs = htap
+                        .expand_runs()
+                        .map_err(|e| anyhow::anyhow!("Failed to read {}: {e}", path.display()))?;
+                    for run in runs {
+                        tests_to_dispatch.push((
+                            path,
+                            serde_json::json!(WorkflowArgs {
+                                specific_args: run,
+                                spiced_commit: spiced_commit.clone(),
+                            }),
+                        ));
+                    }
                 }
             }
             TestType::Search => {

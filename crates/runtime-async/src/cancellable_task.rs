@@ -126,10 +126,22 @@ mod tests {
 
     #[tokio::test]
     async fn test_task_completes_successfully() {
-        let task_fn = async { Ok::<(), TestError>(()) };
-        let (task_future, _handle) = spawn_cancellable_task(None, task_fn, map_join_error);
-        let result = task_future.await;
-        result.expect("should complete successfully");
+        let (ran_tx, ran_rx) = oneshot::channel();
+        let task_fn = async move {
+            ran_tx
+                .send("the task body ran")
+                .expect("the test holds the receiver");
+            Ok::<(), TestError>(())
+        };
+        let (task_future, handle) = spawn_cancellable_task(None, task_fn, map_join_error);
+        assert_eq!(task_future.await, Ok(()));
+        // An abort and a cancelled join also report `Ok(())`, so show the body
+        // itself ran to completion.
+        assert_eq!(ran_rx.await, Ok("the task body ran"));
+        assert!(
+            handle.is_finished(),
+            "the handle reports the task as finished"
+        );
     }
 
     #[tokio::test]
@@ -143,123 +155,146 @@ mod tests {
     #[tokio::test]
     async fn test_task_is_cancelled_gracefully() {
         let cancellation_token = CancellationToken::new();
+        let task_token = cancellation_token.clone();
+        let (started_tx, started_rx) = oneshot::channel();
+        let (exit_tx, exit_rx) = oneshot::channel();
         let (task_future, handle) = spawn_cancellable_task(
-            Some(cancellation_token.clone()),
+            Some(cancellation_token),
             async move {
-                cancellation_token.cancelled().await;
+                started_tx
+                    .send(())
+                    .expect("the test awaits the start signal");
+                task_token.cancelled().await;
+                // Reached only through the token: an abort drops this future
+                // before it gets here.
+                exit_tx
+                    .send("observed the cancellation")
+                    .expect("the test holds the receiver");
                 Ok::<(), TestError>(())
             },
             map_join_error,
         );
 
-        let cancel_future = tokio::spawn(async move {
-            tokio::time::sleep(Duration::from_millis(100)).await;
-            tokio::select! {
-                () = handle.cancel(Duration::from_secs(5)) => {}
-                () = tokio::time::sleep(Duration::from_secs(1)) => {
-                    panic!("Timed out waiting for task to complete");
-                }
-            }
-        });
+        started_rx.await.expect("the task starts");
+        tokio::time::timeout(
+            Duration::from_secs(1),
+            handle.cancel(Duration::from_secs(5)),
+        )
+        .await
+        .expect("a graceful cancel returns as soon as the task exits");
 
-        let (task_result, cancel_result) = tokio::join!(task_future, cancel_future);
-        task_result.expect("should complete successfully");
-        cancel_result.expect("should complete successfully");
+        assert_eq!(exit_rx.await, Ok("observed the cancellation"));
+        assert_eq!(task_future.await, Ok(()));
     }
 
     #[tokio::test]
     async fn test_task_is_aborted() {
+        let (started_tx, started_rx) = oneshot::channel();
         let (task_future, handle) = spawn_cancellable_task(
             None,
             async move {
-                tokio::time::sleep(Duration::from_secs(10)).await;
+                started_tx
+                    .send(())
+                    .expect("the test awaits the start signal");
+                // Never finishes on its own: only the abort can end it.
+                std::future::pending::<()>().await;
                 Ok::<(), TestError>(())
             },
             map_join_error,
         );
 
-        let cancel_future = tokio::spawn(async move {
-            tokio::time::sleep(Duration::from_millis(100)).await;
-            tokio::select! {
-                () = handle.cancel(Duration::from_secs(5)) => {}
-                () = tokio::time::sleep(Duration::from_secs(1)) => {
-                    panic!("Timed out waiting for task to complete");
-                }
-            }
-        });
+        started_rx.await.expect("the task starts");
+        // Without a token, cancel aborts at once rather than waiting.
+        tokio::time::timeout(
+            Duration::from_secs(1),
+            handle.cancel(Duration::from_secs(5)),
+        )
+        .await
+        .expect("cancel without a token aborts immediately");
 
-        let (task_result, cancel_result) = tokio::join!(task_future, cancel_future);
-        task_result.expect("should complete successfully");
-        cancel_result.expect("should complete successfully");
+        // The abort is reported as a successful completion.
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(1), task_future)
+                .await
+                .expect("the aborted task's future resolves"),
+            Ok(())
+        );
     }
 
-    #[tokio::test]
+    // Paused time: the grace period elapses only when nothing else can run, so
+    // the force-abort fires at exactly the timeout, with no wall-clock wait.
+    #[tokio::test(start_paused = true)]
     async fn test_task_can_be_force_aborted() {
+        let (started_tx, started_rx) = oneshot::channel();
         let (task_future, handle) = spawn_cancellable_task(
             Some(CancellationToken::new()),
             async move {
-                tokio::time::sleep(Duration::from_secs(10)).await;
+                started_tx
+                    .send(())
+                    .expect("the test awaits the start signal");
+                // Ignores its token: only the forced abort can end it.
+                std::future::pending::<()>().await;
                 Ok::<(), TestError>(())
             },
             map_join_error,
         );
 
-        let cancel_future = tokio::spawn(async move {
-            tokio::time::sleep(Duration::from_millis(100)).await;
-            tokio::select! {
-                () = handle.cancel(Duration::from_millis(200)) => {}
-                () = tokio::time::sleep(Duration::from_secs(1)) => {
-                    panic!("Timed out waiting for task to complete");
-                }
-            }
-        });
+        started_rx.await.expect("the task starts");
+        let grace = Duration::from_millis(200);
+        let cancel_started = tokio::time::Instant::now();
+        handle.cancel(grace).await;
+        assert_eq!(
+            cancel_started.elapsed(),
+            grace,
+            "cancel waits out the whole grace period before aborting"
+        );
 
-        let (task_result, cancel_result) = tokio::join!(task_future, cancel_future);
-        task_result.expect("should complete successfully");
-        cancel_result.expect("should complete successfully");
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(1), task_future)
+                .await
+                .expect("the force-aborted task's future resolves"),
+            Ok(())
+        );
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn test_cancel_already_completed_task() {
-        let cancellation_token = CancellationToken::new();
         let (task_future, handle) = spawn_cancellable_task(
-            Some(cancellation_token),
+            Some(CancellationToken::new()),
             async move { Ok::<(), TestError>(()) },
             map_join_error,
         );
 
-        task_future.await.expect("should complete successfully");
+        assert_eq!(task_future.await, Ok(()));
+        assert!(handle.is_finished(), "the task finished before the cancel");
 
-        let cancel_result = tokio::spawn(async move {
-            tokio::time::sleep(Duration::from_millis(100)).await;
-            tokio::select! {
-                () = handle.cancel(Duration::from_secs(5)) => {}
-                () = tokio::time::sleep(Duration::from_secs(1)) => {
-                    panic!("Timed out waiting for task to complete");
-                }
-            }
-        })
-        .await;
-
-        cancel_result.expect("should complete successfully");
+        // The completion signal is already waiting, so cancelling spends none of
+        // the 5 s grace period (paused time would otherwise jump straight to it).
+        let cancel_started = tokio::time::Instant::now();
+        handle.cancel(Duration::from_secs(5)).await;
+        assert_eq!(cancel_started.elapsed(), Duration::ZERO);
     }
 
     #[tokio::test]
     async fn test_is_completed() {
+        let (release_tx, release_rx) = oneshot::channel::<()>();
         let (task_future, handle) = spawn_cancellable_task(
             None,
             async move {
-                tokio::time::sleep(Duration::from_millis(100)).await;
+                release_rx.await.expect("the test releases the task");
                 Ok::<(), TestError>(())
             },
             map_join_error,
         );
 
+        // The task starts and parks on its gate: running, not finished.
+        tokio::task::yield_now().await;
         assert!(!handle.is_finished());
 
-        task_future.await.expect("to complete successfully");
+        release_tx.send(()).expect("the task is parked on the gate");
+        assert_eq!(task_future.await, Ok(()));
 
         assert!(handle.is_finished());
-        assert!(handle.is_finished());
+        assert!(handle.is_finished(), "a finished task stays finished");
     }
 }

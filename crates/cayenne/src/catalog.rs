@@ -17,12 +17,13 @@ limitations under the License.
 //! Trait abstraction for metadata catalog operations.
 //!
 //! This trait defines the interface for managing table metadata
-//! and file references. It can be implemented by different RDBMS backends
-//! (`SQLite`, Turso, etc.).
+//! and file references. `CayenneCatalog` implements it over the `SQLite`
+//! metastore.
 
 use super::metadata::{
-    ColdTierFile, CreateTableOptions, DeleteFile, InlinedData, InlinedDataStats, InlinedDelete,
-    PartitionMetadata, SnapshotFile, SnapshotFileStatistics, TableMetadata, TableStatistics,
+    ColdTierFile, CreateTableOptions, DeleteFile, IndexRunRecord, InlinedData, InlinedDataStats,
+    InlinedDelete, PartitionMetadata, SnapshotFile, SnapshotFileStatistics, TableMetadata,
+    TableStatistics, TableStorageStats,
 };
 use arrow_schema::SchemaRef;
 use async_trait::async_trait;
@@ -68,6 +69,35 @@ pub enum CatalogError {
     InvalidOperationNoSource {
         /// Description of the invalid operation
         message: String,
+    },
+
+    /// A compaction's commit found the table on a snapshot other than the one
+    /// the compaction was built from.
+    #[snafu(display(
+        "Table {table_id} moved from snapshot {replaced} to {current} while it was compacted, so the compacted snapshot was not committed"
+    ))]
+    SnapshotReplaced {
+        /// The table the compaction ran on
+        table_id: String,
+        /// The snapshot the compaction was built from
+        replaced: String,
+        /// The snapshot the table points at instead
+        current: String,
+    },
+
+    /// A compaction's commit found that protected snapshots it folded into its
+    /// output are no longer registered: another writer merged or removed them
+    /// while it ran, so committing would register the folded rows twice.
+    #[snafu(display(
+        "Table {table_id} no longer registers {missing} of the {folded} protected snapshots it compacted, so the compacted snapshot was not committed"
+    ))]
+    ProtectedSnapshotsReplaced {
+        /// The table the compaction ran on
+        table_id: String,
+        /// How many protected snapshots the compaction folded
+        folded: usize,
+        /// How many of them the catalog no longer registers
+        missing: usize,
     },
 
     /// IO error
@@ -172,10 +202,13 @@ pub enum CatalogError {
     #[snafu(display("Failed to get partition data files. {source}"))]
     FailedToGetPartitionDataFiles { source: Box<CatalogError> },
 
+    /// The connection string names a scheme the metastore does not open. Only
+    /// `sqlite://` (or a bare path) is accepted, so a stray scheme fails here
+    /// rather than becoming part of a relative file path.
     #[snafu(display(
-        "Turso backend requested but 'turso' feature is not enabled. Enable with --features turso"
+        "Cayenne metastore connection strings must use 'sqlite://' or a bare path, but found '{scheme}://'"
     ))]
-    TursoNotEnabled,
+    UnsupportedMetastoreScheme { scheme: String },
 
     /// Constraint violation (e.g., unique constraint, foreign key constraint)
     /// Used for handling concurrent insert conflicts.
@@ -198,6 +231,37 @@ pub enum CatalogError {
     ))]
     ChangedConfiguration { table_name: String },
 
+    /// The table's stored rows were written under settings the requested ones change
+    /// the meaning of (see [`crate::metadata::SettingsChangeAction`]), and the caller
+    /// asked for such a table to be rebuilt rather than kept. Worded as the cause clause
+    /// the caller's message embeds.
+    #[snafu(display(
+        "the existing acceleration of dataset '{table_name}' was built with settings it cannot adopt in place ({changes})"
+    ))]
+    SettingsChangeRequiresRebuild { table_name: String, changes: String },
+
+    /// The data files of the table's current snapshot do not match the files the
+    /// metastore records for it (a file is missing, has a different size, or the
+    /// snapshot directory is gone), and the caller asked for such a table to be
+    /// rebuilt from the source ([`crate::metadata::SettingsChangeAction::Rebuild`]).
+    /// Worded as the cause clause the caller's message embeds.
+    #[snafu(display(
+        "the existing acceleration of dataset '{table_name}' does not match its Cayenne metastore ({damage})"
+    ))]
+    StoredDataFilesRequireRebuild { table_name: String, damage: String },
+
+    /// The data files of the table's current snapshot do not match the files the
+    /// metastore records for it, and the table cannot be rebuilt from the source
+    /// now, so serving it would answer queries with missing rows or fail them.
+    #[snafu(display(
+        "Failed to load table '{table_name}': its acceleration does not match its Cayenne metastore ({damage}), so it cannot be served. {remedy}"
+    ))]
+    StoredDataFilesDamaged {
+        table_name: String,
+        damage: String,
+        remedy: String,
+    },
+
     #[snafu(display(
         "Failed to load table {table_name}: the datalake location changed from '{stored}' to '{configured}' while published datalake files exist. Revert 'cayenne_datalake_location' to '{stored}', or delete the acceleration and re-register the dataset to publish to the new location."
     ))]
@@ -206,6 +270,20 @@ pub enum CatalogError {
         stored: String,
         configured: String,
     },
+
+    #[snafu(display(
+        "Failed to load table '{table_name}': it was created with 'cayenne_pk_conflict_detection: none', so it can hold more than one row per primary key, and the setting is now 'auto'. An existing table keeps the setting it was created with. To rebuild it from the source with one row per primary key, restart once with 'acceleration.mode: file_create', and with 'write_mode: write_through' if the dataset uses 'write_mode: write_back', then set both back. Rows that exist only in the acceleration are not kept."
+    ))]
+    PkConflictDetectionEnabledOnExistingTable { table_name: String },
+
+    /// [`Self::PkConflictDetectionEnabledOnExistingTable`] for a table the caller would
+    /// rebuild, but holds until its source can be read
+    /// (`SettingsChangeAction::HoldUntilSourceReadable`): the stored rows cannot be
+    /// served under the check meanwhile.
+    #[snafu(display(
+        "Failed to load table '{table_name}': it was created with 'cayenne_pk_conflict_detection: none', so it can hold more than one row per primary key, and the setting is now 'auto'. Applying 'auto' rebuilds the table from its source, which cannot be read on the table's schema yet. To keep using the existing data, set 'cayenne_pk_conflict_detection' back to 'none'. To apply 'auto', restart once the source is reachable and any change to its schema is resolved (revert it, or set 'on_schema_change' to adopt it). See: https://spiceai.org/docs/components/data-accelerators/cayenne"
+    ))]
+    PkConflictDetectionChangeHeld { table_name: String },
 
     #[snafu(display(
         "Table '{table_name}' metadata is invalid or corrupted. Delete the acceleration, and try again. {source}"
@@ -226,6 +304,27 @@ pub struct SnapshotSequenceCommit {
     pub snapshot_id: String,
     /// Sequence number assigned to the snapshot.
     pub sequence_number: i64,
+}
+
+/// The durable effects of one mem-tier seal or checkpoint.
+#[derive(Debug, Default)]
+pub struct MemTierDurableCommit {
+    /// Table receiving the mutation.
+    pub table_id: String,
+    /// Delete-only vectors, without a reinsert stamp.
+    pub pure_delete_files: Vec<DeleteFile>,
+    /// Vectors whose keys are reinserted at `sequence_number`.
+    pub reinsert_delete_files: Vec<DeleteFile>,
+    /// Reinsert keys (used to gate the per-vector reinsert stamp).
+    pub insert_pk_bytes: Vec<Vec<u8>>,
+    /// Reserved shadow/reinsert sequence, above every tombstone sequence.
+    pub sequence_number: i64,
+    /// Protected snapshot registration for a data-bearing checkpoint.
+    pub snapshot_sequence: Option<SnapshotSequenceCommit>,
+    /// Unpublished seal shadow rows, stamped with `sequence_number`.
+    pub inline_data: Vec<InlinedData>,
+    /// Clear the superseded inline corpus AND its deletion markers.
+    pub clear_inlined: bool,
 }
 
 // Transaction support is currently not exposed at the catalog level.
@@ -270,8 +369,36 @@ pub trait MetadataCatalog: Send + Sync {
     /// a plain single-row UPDATE to the same value.
     async fn update_table_schema(&self, table_id: &str, schema: &SchemaRef) -> CatalogResult<()>;
 
-    /// Set the current snapshot ID for a table (`UUIDv7` string).
-    async fn set_current_snapshot(&self, table_id: &str, snapshot_id: &str) -> CatalogResult<()>;
+    /// Persist `schema` and drop every persisted statistics blob for this table
+    /// in the same transaction: the table aggregate, the snapshot-file cache,
+    /// and `cayenne_cold_tier_file.statistics_blob`.
+    ///
+    /// Also used when schema evolution has an outstanding row-count delta,
+    /// whose process-local reservation cannot protect the count after reopening.
+    /// Used when a widening changes a decimal column's scale. Vortex stores
+    /// unscaled integers and decodes them with the current schema's scale, so
+    /// publishing the new schema while leaving those blobs in place would
+    /// prune matching rows (123.45 at scale 2 becomes 1.2345 at scale 4).
+    async fn update_table_schema_dropping_statistics(
+        &self,
+        table_id: &str,
+        schema: &SchemaRef,
+    ) -> CatalogResult<()>;
+
+    /// Point `table_id` at `new_snapshot_id` (`UUIDv7` string) if it still points
+    /// at `replaced_snapshot_id`. Only the pointer changes: unlike
+    /// [`Self::commit_compaction`], delete files, insert records and protected
+    /// snapshots are left as they are.
+    ///
+    /// Changes nothing and returns [`CatalogError::SnapshotReplaced`] when the
+    /// table no longer points at `replaced_snapshot_id`, as
+    /// [`Self::commit_compaction`] does.
+    async fn set_current_snapshot(
+        &self,
+        table_id: &str,
+        replaced_snapshot_id: &str,
+        new_snapshot_id: &str,
+    ) -> CatalogResult<()>;
 
     /// Increment the table's sequence number and return the new value.
     ///
@@ -313,13 +440,24 @@ pub trait MetadataCatalog: Send + Sync {
 
     /// Atomically commit deletion-vector rows and an inline-data rewrite for
     /// one logical delete. A failure leaves both catalog areas unchanged.
+    ///
+    /// `replaced_delete_file_ids` names delete-file rows that `delete_files`
+    /// supersede: a position deletion vector that holds every position deleted
+    /// from its data file replaces the earlier ones for that file. They are
+    /// removed in the same transaction, so no reader sees a file's deletions
+    /// missing or counted from two rows.
     async fn commit_delete_files_with_inlined_rewrite(
         &self,
         delete_files: Vec<DeleteFile>,
         table_id: &str,
         updated_data: Vec<InlinedData>,
         deleted_inlined_ids: Vec<String>,
+        replaced_delete_file_ids: Vec<String>,
     ) -> CatalogResult<()>;
+
+    /// Atomically persist all metadata effects of one mem-tier seal or checkpoint.
+    /// Failure leaves the catalog unchanged; visibility publication remains the caller's job.
+    async fn commit_mem_tier_durable(&self, commit: MemTierDurableCommit) -> CatalogResult<()>;
 
     /// Get all active delete files for a table (across all virtual files).
     async fn get_table_delete_files(&self, table_id: &str) -> CatalogResult<Vec<DeleteFile>>;
@@ -573,7 +711,17 @@ pub trait MetadataCatalog: Send + Sync {
     /// rows for the table. This is only correct when the rewrite excluded
     /// concurrent writers (it held `write_lock` throughout). For the concurrent
     /// key-delete path use [`Self::commit_compaction_fenced`] instead.
-    async fn commit_compaction(&self, table_id: &str, new_snapshot_id: &str) -> CatalogResult<()>;
+    ///
+    /// `replaced_snapshot_id` is the snapshot the compaction was built from. The
+    /// commit changes nothing and returns [`CatalogError::SnapshotReplaced`] when
+    /// the table no longer points at it: a replacement committed while the
+    /// compaction ran, and committing over it would bring the replaced rows back.
+    async fn commit_compaction(
+        &self,
+        table_id: &str,
+        replaced_snapshot_id: &str,
+        new_snapshot_id: &str,
+    ) -> CatalogResult<()>;
 
     /// Sequence-fenced variant of [`Self::commit_compaction`] for compactions
     /// that ran concurrently with writers.
@@ -592,9 +740,17 @@ pub trait MetadataCatalog: Send + Sync {
     /// Protected snapshots are cleared by explicit id rather than by sequence
     /// because their `sequence_number` column records the delete-fence at
     /// creation, not the snapshot's own creation sequence.
+    ///
+    /// `replaced_snapshot_id` is checked as in [`Self::commit_compaction`]. Every
+    /// id in `protected_snapshot_ids_to_clear` must also still be registered: the
+    /// commit changes nothing and returns
+    /// [`CatalogError::ProtectedSnapshotsReplaced`] when one is not, because a
+    /// writer that merged or removed it since the rewrite folded it would
+    /// otherwise leave the rewritten rows registered twice.
     async fn commit_compaction_fenced(
         &self,
         table_id: &str,
+        replaced_snapshot_id: &str,
         new_snapshot_id: &str,
         cutoff: i64,
         protected_snapshot_ids_to_clear: &[String],
@@ -647,11 +803,15 @@ pub trait MetadataCatalog: Send + Sync {
     /// # Errors
     ///
     /// Returns an error if the transaction cannot be committed.
+    ///
+    /// `delete_files` are position deletion vectors on the new snapshot, hiding
+    /// the copies of keys its incoming data repeated across record batches.
     async fn commit_overwrite(
         &self,
         table_id: &str,
         new_snapshot_id: &str,
         inlined: Option<&InlinedData>,
+        delete_files: &[crate::metadata::DeleteFile],
     ) -> CatalogResult<()>;
 
     /// Add a partition to a table.
@@ -727,6 +887,17 @@ pub trait MetadataCatalog: Send + Sync {
     /// the live set and reconstructs the referenced physical paths.
     async fn get_all_snapshot_files(&self, table_id: &str) -> CatalogResult<Vec<SnapshotFile>>;
 
+    /// Drop all non-authoritative cached metadata rows for one snapshot that has
+    /// left the live set — both its `cayenne_snapshot_file` manifest rows and its
+    /// `cayenne_snapshot_file_statistics` stats-cache rows. Coupling the two
+    /// deletions in one method keeps the sibling caches from drifting: a caller
+    /// can never delete the manifest rows and forget the stats rows, or the reverse.
+    async fn clear_snapshot_cached_metadata(
+        &self,
+        table_id: &str,
+        snapshot_id: &str,
+    ) -> CatalogResult<()>;
+
     /// Drop manifest rows for snapshots other than the given one (snapshot GC).
     async fn clear_snapshot_files_except(
         &self,
@@ -736,6 +907,24 @@ pub trait MetadataCatalog: Send + Sync {
 
     /// Clear all manifest rows for a table.
     async fn clear_snapshot_files(&self, table_id: &str) -> CatalogResult<()>;
+
+    /// Drop the manifest rows of `file_names` (snapshot-relative file names) from
+    /// one snapshot's manifest, for files removed from the snapshot in place (for
+    /// example by file-based retention), so the manifest keeps naming only files
+    /// the snapshot still holds.
+    async fn remove_snapshot_files(
+        &self,
+        table_id: &str,
+        snapshot_id: &str,
+        file_names: &[String],
+    ) -> CatalogResult<()>;
+
+    /// Check, when reopening an existing table outside `create_table` (as
+    /// partition children are), that the data files its live snapshots record
+    /// are still on disk, with the non-rebuildable (`KeepStored`) handling:
+    /// a missing snapshot directory or a resized file is an error, and files
+    /// that are only missing are logged at WARN.
+    async fn verify_existing_stored_data_files(&self, table_name: &str) -> CatalogResult<()>;
 
     /// List every cold-tier file for a table (the cold scan's file source).
     /// Read under the scan's listing fence so the cold file set is captured
@@ -777,6 +966,20 @@ pub trait MetadataCatalog: Send + Sync {
 
     /// Clear the persisted PK existence index for a table.
     async fn clear_pk_index(&self, table_id: &str) -> CatalogResult<()>;
+
+    /// Record a persisted secondary index run, after its file is written.
+    async fn register_index_run(&self, run: &IndexRunRecord) -> CatalogResult<()>;
+
+    /// Every persisted secondary index run of a table.
+    async fn list_index_runs(&self, table_id: &str) -> CatalogResult<Vec<IndexRunRecord>>;
+
+    /// Forget a persisted secondary index run, before its file is deleted.
+    async fn remove_index_run(
+        &self,
+        table_id: &str,
+        index_key: &str,
+        run_name: &str,
+    ) -> CatalogResult<()>;
 
     // ── Inlined data (data inlining for small writes) ──────────────────
 
@@ -825,8 +1028,23 @@ pub trait MetadataCatalog: Send + Sync {
     /// Get the total number of inlined rows for a table.
     async fn get_inlined_data_count(&self, table_id: &str) -> CatalogResult<i64>;
 
-    /// Get aggregate inline data size information for a table.
+    /// Get aggregate size information for a table's inline corpus AND its inline
+    /// tombstones, in one round trip. See [`InlinedDataStats`] for why the
+    /// checkpoint needs both.
     async fn get_inlined_data_stats(&self, table_id: &str) -> CatalogResult<InlinedDataStats>;
+
+    /// Aggregate the table's disk and metastore footprint from the metastore's
+    /// own file accounting.
+    ///
+    /// Answers "how large is this dataset, and which layer is growing" — the
+    /// live data files, the deletion vectors shadowing them, the cold tier, the
+    /// inline tier, and the metastore rows each of those costs — without
+    /// listing a single directory.
+    ///
+    /// Read-only aggregates intended for the background maintenance tick, never
+    /// a write path: a table with thousands of files scans thousands of index
+    /// rows here.
+    async fn table_storage_stats(&self, table_id: &str) -> CatalogResult<TableStorageStats>;
 
     /// Remove all inlined data for a table (called after checkpoint flushes to Vortex).
     async fn clear_inlined_data(&self, table_id: &str) -> CatalogResult<()>;

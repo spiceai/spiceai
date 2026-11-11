@@ -604,7 +604,18 @@ mod tests {
         // undeletable.
         std::fs::set_permissions(&holder, std::fs::Permissions::from_mode(0o755))
             .expect("restore the directory");
-        removed.expect_err("an absence that cannot be made durable is not a removal");
+        let err = removed.expect_err("an absence that cannot be made durable is not a removal");
+        // The unlink reports the file missing, so the failure must be the
+        // directory synchronization, which cannot open an unreadable directory.
+        assert!(
+            matches!(
+                &err,
+                Error::Write { path: failed, source }
+                    if *failed == path && source.kind() == std::io::ErrorKind::PermissionDenied
+            ),
+            "expected a write error for {} caused by PermissionDenied, got {err:?}",
+            path.display()
+        );
     }
     use super::*;
 

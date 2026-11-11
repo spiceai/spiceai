@@ -23,3 +23,6 @@ pub mod file_format;
 pub mod source;
 
 pub use file_format::*;
+
+#[cfg(test)]
+mod scan_tests;

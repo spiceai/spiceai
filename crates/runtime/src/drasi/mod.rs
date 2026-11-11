@@ -21,10 +21,11 @@ limitations under the License.
 //! applies is also published to Drasi.
 
 pub mod connector;
-pub(crate) mod dead_letter;
+#[cfg(test)]
+mod forward_metrics_tests;
 pub(crate) mod internal;
-pub(crate) mod queue;
 
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -36,7 +37,7 @@ use runtime_drasi::{
     DrasiChangeRows, DrasiSink, DrasiSinkConfig, ElementMapping, OnDeliveryError, TransportConfig,
 };
 
-use crate::drasi::dead_letter::{DEFAULT_MAX_BATCHES, DeadLetterStore, store_path};
+use runtime_drasi::dead_letter::{DEFAULT_MAX_BATCHES, DeadLetterStore};
 
 /// The policy every sink behind a [`DeliveryQueue`] is built with.
 ///
@@ -46,7 +47,7 @@ use crate::drasi::dead_letter::{DEFAULT_MAX_BATCHES, DeadLetterStore, store_path
 /// queue would then treat a lost batch as delivered and never retain it, which
 /// made the dead-letter store dead code on every path that used it.
 pub(crate) const QUEUED_SINK_POLICY: OnDeliveryError = OnDeliveryError::Fail;
-use crate::drasi::queue::{DEFAULT_QUEUE_DEPTH, DeliveryQueue, QueuedBatch};
+use runtime_drasi::queue::{DEFAULT_QUEUE_DEPTH, DeliveryQueue, QueuedBatch};
 use spicepod::drasi::{Drasi as DrasiSpec, DrasiTransport as DrasiTransportSpec};
 
 use crate::component::dataset::Dataset;
@@ -93,7 +94,7 @@ pub(crate) async fn sink_for_dataset(
     Ok(match spec.delivery {
         spicepod::drasi::DrasiDelivery::Acknowledged => DeliveryMode::Acknowledged(sink),
         spicepod::drasi::DrasiDelivery::Queued => {
-            let store = open_dead_letter_store(&name).await;
+            let store = open_dead_letter_store(&name, transport_name(spec.transport)).await;
             DeliveryMode::Queued(Arc::new(DeliveryQueue::spawn(
                 sink,
                 name,
@@ -104,16 +105,48 @@ pub(crate) async fn sink_for_dataset(
     })
 }
 
+/// The directory a component's dead-letter store lives in.
+fn store_path(component: &str) -> PathBuf {
+    // Component names are table references (`runtime.task_history`, `orders`),
+    // which can contain characters a path should not take verbatim.
+    let sanitized: String = component
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '-' || c == '_' || c == '.' {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect();
+
+    PathBuf::from(data_accelerator_api::spice_data_base_path())
+        .join("drasi")
+        .join(sanitized)
+}
+
 /// Opens the durable store that retains what Drasi will not accept.
 ///
 /// A store that cannot be opened is reported and skipped rather than failing the
 /// component: forwarding without durable retry is a degraded mode, but refusing
 /// to start the dataset over it would be worse.
-pub(crate) async fn open_dead_letter_store(component: &str) -> Option<Arc<DeadLetterStore>> {
-    match DeadLetterStore::open(
+pub(crate) fn transport_name(transport: DrasiTransportSpec) -> &'static str {
+    match transport {
+        DrasiTransportSpec::Http => "http",
+        DrasiTransportSpec::Redis => "redis",
+    }
+}
+
+pub(crate) async fn open_dead_letter_store(
+    component: &str,
+    transport: &'static str,
+) -> Option<Arc<DeadLetterStore>> {
+    match DeadLetterStore::open_with(
         store_path(component),
         component.to_string(),
         DEFAULT_MAX_BATCHES,
+        transport,
+        runtime_metrics::drasi::DrasiForwardMetrics::global(),
     )
     .await
     {
@@ -398,6 +431,7 @@ pub(crate) async fn forward_change_envelope(
                             .collect(),
                         data: data.clone(),
                         source_commit_ts_ms: batch.source_commit_ts_ms(),
+                        queued_at_ms: runtime_drasi::queue::now_ms(),
                     })
                     .await;
             }
@@ -442,8 +476,31 @@ mod tests {
     fn empty_required_param_is_treated_as_missing() {
         let params =
             std::collections::HashMap::from([(HTTP_ENDPOINT_PARAM.to_string(), String::new())]);
-        required_param("orders", &params, HTTP_ENDPOINT_PARAM)
+        let empty = required_param("orders", &params, HTTP_ENDPOINT_PARAM)
             .expect_err("an empty endpoint is not a usable endpoint");
+        assert!(
+            matches!(
+                &empty,
+                runtime_drasi::Error::MissingParameter { dataset, parameter }
+                    if dataset == "orders" && *parameter == HTTP_ENDPOINT_PARAM
+            ),
+            "expected MissingParameter, got {empty:?}"
+        );
+
+        // The user sees exactly what an absent parameter reports.
+        let absent = required_param(
+            "orders",
+            &std::collections::HashMap::new(),
+            HTTP_ENDPOINT_PARAM,
+        )
+        .expect_err("the endpoint is required for the http transport");
+        assert_eq!(empty.to_string(), absent.to_string());
+        assert_eq!(
+            empty.to_string(),
+            "Failed to configure Drasi forwarding for dataset orders (drasi): Missing required \
+             parameter 'drasi_http_endpoint'. Add it under 'drasi.params'. See: \
+             https://spiceai.org/docs/reference/spicepod/datasets#drasi"
+        );
     }
 
     #[test]
@@ -469,5 +526,17 @@ mod tests {
         )]);
         request_timeout_or("orders", &bad, DEFAULT_REQUEST_TIMEOUT)
             .expect_err("an unparseable duration is rejected");
+    }
+
+    #[test]
+    fn store_path_sanitizes_a_qualified_table_name() {
+        let path = store_path("runtime.task_history");
+        assert!(path.ends_with("drasi/runtime.task_history"), "{path:?}");
+
+        let path = store_path("weird/../name");
+        assert!(
+            path.ends_with("drasi/weird_.._name"),
+            "a path separator must not escape the store directory: {path:?}"
+        );
     }
 }

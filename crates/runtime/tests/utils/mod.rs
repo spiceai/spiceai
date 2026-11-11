@@ -22,16 +22,11 @@ limitations under the License.
 // exercises an engine needs its own reference. `integration.rs`'s
 // `accelerator_crates_register_their_engines` guards the mechanism; this is where the
 // binaries that share these helpers get it.
-#[cfg(not(windows))]
 use accelerator_cayenne as _;
-#[cfg(feature = "duckdb")]
-use accelerator_duckdb as _;
 #[cfg(feature = "postgres-accel")]
 use accelerator_postgres as _;
 #[cfg(feature = "sqlite")]
 use accelerator_sqlite as _;
-#[cfg(feature = "turso")]
-use accelerator_turso as _;
 
 use std::{
     fmt::Display,
@@ -40,8 +35,10 @@ use std::{
     time::Duration,
 };
 
-use opentelemetry::{InstrumentationScope, trace::TracerProvider as _};
+use opentelemetry::{InstrumentationScope, global, trace::TracerProvider as _};
 use opentelemetry_sdk::{
+    Resource,
+    metrics::SdkMeterProvider,
     runtime::TokioCurrentThread,
     trace::{SdkTracerProvider, span_processor_with_async_runtime::BatchSpanProcessor},
 };
@@ -56,6 +53,95 @@ use arrow::array::RecordBatch;
 use chrono::Timelike;
 use futures::StreamExt;
 use runtime_request_context::{Protocol, RequestContext, UserAgent};
+
+/// The one `MeterProvider` for the test process, installed before any instrument
+/// exists: instruments bind to the provider installed when they are first used, so
+/// force this before building a runtime whose metrics a test reads.
+pub(crate) static PROMETHEUS: LazyLock<prometheus::Registry> =
+    LazyLock::new(install_prometheus_meter_provider);
+
+/// Installs a `MeterProvider` backed by a scrapable Prometheus registry, as
+/// `spiced` does for the `--metrics` endpoint.
+fn install_prometheus_meter_provider() -> prometheus::Registry {
+    let registry = prometheus::Registry::new();
+
+    let exporter = opentelemetry_prometheus::exporter()
+        .with_registry(registry.clone())
+        .without_scope_info()
+        .without_units()
+        .without_counter_suffixes()
+        .without_target_info()
+        .build()
+        .expect("to build the prometheus exporter");
+
+    let provider = SdkMeterProvider::builder()
+        .with_resource(Resource::builder().build())
+        .with_reader(exporter)
+        .build();
+    global::set_meter_provider(provider);
+
+    registry
+}
+
+/// The summed value of counter `name` over the series whose `label` is `value`; `0`
+/// before any is recorded.
+pub(crate) fn counter_with_label(
+    registry: &prometheus::Registry,
+    name: &str,
+    label: &str,
+    value: &str,
+) -> f64 {
+    metric_value(registry, name, &[(label, value)])
+}
+
+/// The sum of `name` over the series that carry every label in `labels`; a histogram
+/// counts its samples. `0` before any is recorded.
+pub(crate) fn metric_value(
+    registry: &prometheus::Registry,
+    name: &str,
+    labels: &[(&str, &str)],
+) -> f64 {
+    metric_series(registry, name, labels)
+        .iter()
+        .map(|(_, value)| value)
+        .sum()
+}
+
+/// The series of `name` that carry every label in `labels`, as `(labels, value)`; a
+/// histogram's value is its sample count.
+pub(crate) fn metric_series(
+    registry: &prometheus::Registry,
+    name: &str,
+    labels: &[(&str, &str)],
+) -> Vec<(Vec<(String, String)>, f64)> {
+    registry
+        .gather()
+        .iter()
+        .filter(|family| family.name() == name)
+        .flat_map(prometheus::proto::MetricFamily::get_metric)
+        .map(|metric| {
+            let metric_labels: Vec<(String, String)> = metric
+                .get_label()
+                .iter()
+                .map(|pair| (pair.name().to_string(), pair.value().to_string()))
+                .collect();
+            let value = match metric.get_histogram().as_ref() {
+                // Exact: a sample count is a small integer.
+                #[expect(clippy::cast_precision_loss)]
+                Some(histogram) => histogram.get_sample_count() as f64,
+                None => metric.get_counter().value(),
+            };
+            (metric_labels, value)
+        })
+        .filter(|(metric_labels, _)| {
+            labels.iter().all(|(name, value)| {
+                metric_labels
+                    .iter()
+                    .any(|(metric_name, metric_value)| metric_name == name && metric_value == value)
+            })
+        })
+        .collect()
+}
 
 pub(crate) static TEST_REQUEST_CONTEXT: LazyLock<Arc<RequestContext>> = LazyLock::new(|| {
     Arc::new(
@@ -131,22 +217,92 @@ where
     false
 }
 
-/// Returns the duration until the next occurrence of the nearest second.
-/// Optionally, add an overhead to apply to wait for a bit longer after the nearest second is reached.
+/// Returns how long to sleep to land `wait` seconds after the next wall-clock second that
+/// is a multiple of `nearest_second`.
+///
+/// Most callers change something a cron-scheduled refresh should pick up, sleep here, then
+/// assert the refresh happened. That only holds when the boundary this targets is one whose
+/// tick has not fired yet, so the boundary is always strictly in the future. A reading that
+/// already sits on a boundary second therefore counts as a whole period away: that second's
+/// tick fired before the caller's change existed, so only the following tick can pick it up
+/// (#13759).
+///
+/// The reading is truncated to whole seconds, so the sleep can end up to a second past
+/// the boundary rather than before it. That direction spends none of the caller's grace.
 pub(crate) fn time_till_second(nearest_second: u32, wait: Option<u32>) -> Duration {
-    assert!(
-        nearest_second < 60,
-        "nearest_second must be between 0 and 59"
-    );
-    let now_second = chrono::Utc::now().second();
-    let modulus = now_second % nearest_second;
-    let time_until_nearest = if modulus == 0 {
-        0
-    } else {
-        nearest_second - modulus
-    };
+    time_till_second_at(chrono::Utc::now().second(), nearest_second, wait)
+}
 
-    Duration::from_secs(u64::from(time_until_nearest + wait.unwrap_or(0)))
+/// [`time_till_second`] against a supplied clock reading, so the boundary arithmetic can
+/// be checked without waiting for a boundary to come round.
+fn time_till_second_at(now_second: u32, nearest_second: u32, wait: Option<u32>) -> Duration {
+    // Cron restarts its `*/n` count every minute, so a period that does not divide 60 has
+    // a short final gap this arithmetic does not model: `*/7` runs at :56 and then :00,
+    // which it would place at :63. Every caller uses 10, 15 or 30; refuse the rest here
+    // rather than let a future one sleep through the tick it is waiting for.
+    assert!(
+        nearest_second > 0 && nearest_second < 60 && 60 % nearest_second == 0,
+        "nearest_second must divide 60"
+    );
+
+    // In `1..=nearest_second`.
+    let till_boundary = nearest_second - now_second % nearest_second;
+
+    Duration::from_secs(u64::from(till_boundary) + u64::from(wait.unwrap_or(0)))
+}
+
+#[cfg(test)]
+mod time_till_second_tests {
+    use super::{Duration, time_till_second_at};
+
+    #[test]
+    fn a_reading_between_boundaries_waits_out_the_remainder() {
+        assert_eq!(time_till_second_at(7, 15, None), Duration::from_secs(8));
+        assert_eq!(
+            time_till_second_at(7, 15, Some(5)),
+            Duration::from_secs(13),
+            "the grace is added to the wait for the boundary, not to the boundary"
+        );
+    }
+
+    #[test]
+    fn a_reading_inside_a_boundary_second_waits_for_the_next_boundary() {
+        // The tick at :15 has already run, so a sleep of only the grace ends before the
+        // tick that can see the caller's change (#13759, as seen by
+        // `acceleration::cron::test_append_cron_schedule`).
+        assert_eq!(
+            time_till_second_at(15, 15, Some(5)),
+            Duration::from_secs(20),
+            "a boundary second is behind us, not ahead"
+        );
+        assert_eq!(time_till_second_at(0, 30, None), Duration::from_secs(30));
+        assert_eq!(
+            time_till_second_at(30, 30, Some(20)),
+            Duration::from_secs(50)
+        );
+    }
+
+    #[test]
+    fn no_reading_waits_longer_than_one_period() {
+        // One period is the ceiling the callers' nextest slow-timeout is sized for. 60 is
+        // the second chrono reports during a leap second; every accepted period divides
+        // it, so it needs no case of its own.
+        for nearest in [10_u32, 15, 30] {
+            for second in 0..=60 {
+                let waited = time_till_second_at(second, nearest, None);
+                assert!(
+                    waited > Duration::ZERO && waited <= Duration::from_secs(u64::from(nearest)),
+                    "second {second} with period {nearest} waited {waited:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    #[should_panic(expected = "nearest_second must divide 60")]
+    fn a_period_that_does_not_divide_60_is_refused() {
+        let _ = time_till_second_at(59, 7, None);
+    }
 }
 
 pub(crate) async fn verify_env_secret_exists(secret_name: &str) -> Result<(), String> {
@@ -166,8 +322,34 @@ pub(crate) async fn verify_env_secret_exists(secret_name: &str) -> Result<(), St
     Ok(())
 }
 
+/// The value of `env_var`, or `None` when it is unset or empty.
+pub(crate) fn nonempty_env(env_var: &str) -> Option<String> {
+    std::env::var(env_var)
+        .ok()
+        .filter(|value| !value.is_empty())
+}
+
+/// A `(param, "${ env:<env_var> }")` pair for an AWS session token, or `None`
+/// when `env_var` is unset or empty.
+///
+/// CI uses short-lived AWS credentials, which need the token. Local runs use
+/// static keys without one, and there the parameter is left out so an
+/// unresolved `${ env:... }` does not log a missing-secret error.
+pub(crate) fn aws_session_token_param(param: &str, env_var: &str) -> Option<(String, String)> {
+    nonempty_env(env_var).map(|_| (param.to_string(), format!("${{ env:{env_var} }}")))
+}
+
 pub(crate) fn test_request_context() -> Arc<RequestContext> {
     Arc::clone(&TEST_REQUEST_CONTEXT)
+}
+
+/// `N` distinct free ports. Every listener stays bound until all `N` are picked, so the
+/// operating system cannot return the same port twice.
+pub(crate) fn free_ports<const N: usize>() -> [u16; N] {
+    let listeners: [std::net::TcpListener; N] = std::array::from_fn(|_| {
+        std::net::TcpListener::bind("127.0.0.1:0").expect("bind ephemeral port")
+    });
+    listeners.map(|listener| listener.local_addr().expect("local addr").port())
 }
 
 pub(crate) async fn run_query(
@@ -182,6 +364,35 @@ pub(crate) async fn run_query(
     }
 
     Ok(results)
+}
+
+/// The SQL each federated scan in an `EXPLAIN` sends to the remote engine, one
+/// per line, and empty when nothing federated.
+///
+/// `base_sql=` is the only part of a plan that says what the remote engine is
+/// asked to evaluate -- the logical plan above it names the `DataFusion`
+/// function whether or not it was pushed down -- so a test claiming a call did
+/// or did not reach the source reads this rather than the whole plan.
+///
+/// Returns an error rather than an empty string when the plan will not format:
+/// "nothing federated" and "the assertion could not be made" must not look the
+/// same to a caller asserting emptiness.
+pub(crate) fn pushed_down_sql(plan: &[RecordBatch]) -> Result<String, anyhow::Error> {
+    federated_sql(plan, "base_sql=")
+}
+
+/// The rest of each federated scan's line after `field` in an `EXPLAIN`, one
+/// per line. [`pushed_down_sql`] reads `base_sql=`; a test asserting what an
+/// executor's own rewrites send reads `rewritten_executor_sql=`, the last field
+/// on that line.
+pub(crate) fn federated_sql(plan: &[RecordBatch], field: &str) -> Result<String, anyhow::Error> {
+    let rendered = to_pretty_display(plan)?.to_string();
+    Ok(rendered
+        .split(field)
+        .skip(1)
+        .map(|tail| tail.split('\n').next().unwrap_or_default().to_string())
+        .collect::<Vec<_>>()
+        .join("\n"))
 }
 
 pub(crate) fn to_pretty_display(batches: &[RecordBatch]) -> Result<impl Display, anyhow::Error> {
@@ -392,10 +603,107 @@ pub(crate) async fn list_xai_models() -> Result<Vec<String>, String> {
     }
 }
 
+/// How the tests' Anthropic models authenticate. CI sets the workload identity federation IDs
+/// (secrets of the `ci` environment), so its models exchange the job's GitHub OIDC token and
+/// refresh it; a local run can use an auth token or an API key instead.
+#[derive(Clone, Copy)]
+enum AnthropicCredential {
+    WorkloadIdentity,
+    AuthToken,
+    ApiKey,
+}
+
+/// The audience CI's `OpenAI` workload identity provider expects, unless
+/// `OPENAI_WIF_AUDIENCE` names another.
+const OPENAI_DEFAULT_AUDIENCE: &str = "https://api.openai.com";
+
+fn env_set(name: &str) -> bool {
+    std::env::var_os(name).is_some_and(|value| !value.is_empty())
+}
+
+fn env_value(name: &str) -> Result<String, String> {
+    std::env::var(name).map_err(|_| format!("{name} environment variable not set"))
+}
+
+fn openai_audience() -> String {
+    std::env::var("OPENAI_WIF_AUDIENCE")
+        .ok()
+        .filter(|audience| !audience.is_empty())
+        .unwrap_or_else(|| OPENAI_DEFAULT_AUDIENCE.to_string())
+}
+
+/// Whether the tests' `OpenAI` models authenticate with workload identity federation: when
+/// `OPENAI_IDENTITY_PROVIDER_ID` is set, as in CI, and otherwise with `SPICE_OPENAI_API_KEY`.
+fn openai_uses_workload_identity() -> bool {
+    env_set("OPENAI_IDENTITY_PROVIDER_ID")
+}
+
+/// The secret a test checks for before it calls `OpenAI`.
+pub(crate) fn openai_credential_secret() -> &'static str {
+    if openai_uses_workload_identity() {
+        "OPENAI_IDENTITY_PROVIDER_ID"
+    } else {
+        "SPICE_OPENAI_API_KEY"
+    }
+}
+
+fn string_params(params: Vec<(&str, String)>) -> Vec<(String, serde_json::Value)> {
+    params
+        .into_iter()
+        .map(|(key, value)| (key.to_string(), serde_json::Value::String(value)))
+        .collect()
+}
+
+/// The params that authenticate an `OpenAI` model or embedding.
+pub(crate) fn openai_credential_params() -> Vec<(String, serde_json::Value)> {
+    string_params(if openai_uses_workload_identity() {
+        vec![
+            (
+                "openai_identity_provider_id",
+                "${ secrets:OPENAI_IDENTITY_PROVIDER_ID }".to_string(),
+            ),
+            (
+                "openai_service_account_id",
+                "${ secrets:OPENAI_SERVICE_ACCOUNT_ID }".to_string(),
+            ),
+            ("openai_identity_token_audience", openai_audience()),
+        ]
+    } else {
+        vec![(
+            "openai_api_key",
+            "${ secrets:SPICE_OPENAI_API_KEY }".to_string(),
+        )]
+    })
+}
+
+/// The bearer token a test sends to `OpenAI` itself: an exchanged workload identity token, or the
+/// API key.
+async fn openai_bearer() -> Result<String, String> {
+    use token_provider::TokenProvider as _;
+    use token_provider::workload_identity::{
+        Exchange, SubjectTokenSource, WorkloadIdentityTokenProvider,
+    };
+    if !openai_uses_workload_identity() {
+        return env_value("SPICE_OPENAI_API_KEY");
+    }
+    let source = SubjectTokenSource::github_actions_from_env(openai_audience())
+        .map_err(|e| e.to_string())?;
+    let provider = WorkloadIdentityTokenProvider::try_new(
+        "the tests' OpenAI availability check",
+        source,
+        Exchange::openai(
+            env_value("OPENAI_IDENTITY_PROVIDER_ID")?,
+            env_value("OPENAI_SERVICE_ACCOUNT_ID")?,
+        ),
+    )
+    .await
+    .map_err(|e| e.to_string())?;
+    Ok(provider.get_token())
+}
+
 /// Verify that a specific model is available from `OpenAI`.
 pub(crate) async fn verify_openai_model_available(model_id: &str) -> Result<(), String> {
-    let api_key = std::env::var("SPICE_OPENAI_API_KEY")
-        .map_err(|_| "SPICE_OPENAI_API_KEY environment variable not set".to_string())?;
+    let api_key = openai_bearer().await?;
 
     let client = reqwest::Client::new();
     let url = format!("https://api.openai.com/v1/models/{model_id}");
@@ -423,11 +731,102 @@ pub(crate) async fn verify_openai_model_available(model_id: &str) -> Result<(), 
     }
 }
 
+/// The secret holding a short-lived Anthropic access token, which Anthropic accepts only as a
+/// bearer token, so a model sends it as `anthropic_auth_token`.
+const ANTHROPIC_AUTH_TOKEN_SECRET: &str = "SPICE_ANTHROPIC_AUTH_TOKEN";
+
+/// The secret holding an Anthropic API key, sent as `anthropic_api_key`.
+const ANTHROPIC_API_KEY_SECRET: &str = "SPICE_ANTHROPIC_API_KEY";
+
+/// Workload identity federation when `ANTHROPIC_FEDERATION_RULE_ID` is set, as in CI; otherwise
+/// [`ANTHROPIC_AUTH_TOKEN_SECRET`] when it is set, and [`ANTHROPIC_API_KEY_SECRET`] last.
+fn anthropic_credential() -> AnthropicCredential {
+    if env_set("ANTHROPIC_FEDERATION_RULE_ID") {
+        AnthropicCredential::WorkloadIdentity
+    } else if env_set(ANTHROPIC_AUTH_TOKEN_SECRET) {
+        AnthropicCredential::AuthToken
+    } else {
+        AnthropicCredential::ApiKey
+    }
+}
+
+/// The secret a test checks for before it calls Anthropic.
+pub(crate) fn anthropic_credential_secret() -> &'static str {
+    match anthropic_credential() {
+        AnthropicCredential::WorkloadIdentity => "ANTHROPIC_FEDERATION_RULE_ID",
+        AnthropicCredential::AuthToken => ANTHROPIC_AUTH_TOKEN_SECRET,
+        AnthropicCredential::ApiKey => ANTHROPIC_API_KEY_SECRET,
+    }
+}
+
+/// The params that authenticate an Anthropic model.
+pub(crate) fn anthropic_credential_params() -> Vec<(String, serde_json::Value)> {
+    let secret = |name: &str| format!("${{ secrets:{name} }}");
+    string_params(match anthropic_credential() {
+        AnthropicCredential::WorkloadIdentity => {
+            let mut params = vec![
+                (
+                    "anthropic_federation_rule_id",
+                    secret("ANTHROPIC_FEDERATION_RULE_ID"),
+                ),
+                (
+                    "anthropic_organization_id",
+                    secret("ANTHROPIC_ORGANIZATION_ID"),
+                ),
+                (
+                    "anthropic_service_account_id",
+                    secret("ANTHROPIC_SERVICE_ACCOUNT_ID"),
+                ),
+            ];
+            if env_set("ANTHROPIC_WORKSPACE_ID") {
+                params.push(("anthropic_workspace_id", secret("ANTHROPIC_WORKSPACE_ID")));
+            }
+            params
+        }
+        AnthropicCredential::AuthToken => {
+            vec![("anthropic_auth_token", secret(ANTHROPIC_AUTH_TOKEN_SECRET))]
+        }
+        AnthropicCredential::ApiKey => {
+            vec![("anthropic_api_key", secret(ANTHROPIC_API_KEY_SECRET))]
+        }
+    })
+}
+
+/// The credential a test sends to Anthropic itself, and whether it goes as a bearer token.
+async fn anthropic_credential_value() -> Result<(String, bool), String> {
+    use token_provider::TokenProvider as _;
+    use token_provider::workload_identity::{
+        ANTHROPIC_AUDIENCE, Exchange, SubjectTokenSource, WorkloadIdentityTokenProvider,
+    };
+    match anthropic_credential() {
+        AnthropicCredential::WorkloadIdentity => {
+            let source = SubjectTokenSource::github_actions_from_env(ANTHROPIC_AUDIENCE)
+                .map_err(|e| e.to_string())?;
+            let provider = WorkloadIdentityTokenProvider::try_new(
+                "the tests' Anthropic availability check",
+                source,
+                Exchange::anthropic(
+                    env_value("ANTHROPIC_FEDERATION_RULE_ID")?,
+                    env_value("ANTHROPIC_ORGANIZATION_ID")?,
+                    env_value("ANTHROPIC_SERVICE_ACCOUNT_ID")?,
+                    std::env::var("ANTHROPIC_WORKSPACE_ID")
+                        .ok()
+                        .filter(|id| !id.is_empty()),
+                ),
+            )
+            .await
+            .map_err(|e| e.to_string())?;
+            Ok((provider.get_token(), true))
+        }
+        AnthropicCredential::AuthToken => Ok((env_value(ANTHROPIC_AUTH_TOKEN_SECRET)?, true)),
+        AnthropicCredential::ApiKey => Ok((env_value(ANTHROPIC_API_KEY_SECRET)?, false)),
+    }
+}
+
 /// Anthropic doesn't have a models list API, so we validate using a minimal messages request.
 /// This sends a minimal request to check if the model is accessible.
 pub(crate) async fn verify_anthropic_model_available(model_id: &str) -> Result<(), String> {
-    let api_key = std::env::var("SPICE_ANTHROPIC_API_KEY")
-        .map_err(|_| "SPICE_ANTHROPIC_API_KEY environment variable not set".to_string())?;
+    let (credential, bearer) = anthropic_credential_value().await?;
 
     let client = reqwest::Client::new();
 
@@ -438,9 +837,13 @@ pub(crate) async fn verify_anthropic_model_available(model_id: &str) -> Result<(
         "messages": [{"role": "user", "content": "hi"}]
     });
 
-    let response = client
-        .post("https://api.anthropic.com/v1/messages")
-        .header("x-api-key", &api_key)
+    let request = client.post("https://api.anthropic.com/v1/messages");
+    let request = if bearer {
+        request.bearer_auth(&credential)
+    } else {
+        request.header("x-api-key", &credential)
+    };
+    let response = request
         .header("anthropic-version", "2023-06-01")
         .header(CONTENT_TYPE, "application/json")
         .body(body.to_string())
@@ -467,98 +870,6 @@ pub(crate) async fn verify_anthropic_model_available(model_id: &str) -> Result<(
 
         Err(format!(
             "Anthropic model '{model_id}' not available (HTTP {status}): {body}"
-        ))
-    }
-}
-
-/// Response structure for Google Gemini models API
-#[derive(Debug, Deserialize)]
-struct GeminiModelResponse {
-    name: String,
-}
-
-/// Verify that a specific model is available from Google Gemini.
-/// This calls the Google Generative AI models API to check if the model exists.
-pub(crate) async fn verify_google_model_available(model_id: &str) -> Result<(), String> {
-    let api_key = std::env::var("SPICE_GOOGLE_API_KEY")
-        .map_err(|_| "SPICE_GOOGLE_API_KEY environment variable not set".to_string())?;
-
-    let client = reqwest::Client::new();
-    // Google Gemini models API uses the format: models/{model_id}
-    let url =
-        format!("https://generativelanguage.googleapis.com/v1beta/models/{model_id}?key={api_key}");
-
-    let response = client
-        .get(&url)
-        .header(CONTENT_TYPE, "application/json")
-        .send()
-        .await
-        .map_err(|e| format!("Failed to connect to Google Gemini API: {e}"))?;
-
-    let status = response.status();
-    let body = response
-        .text()
-        .await
-        .map_err(|e| format!("Failed to read Google Gemini API response: {e}"))?;
-
-    if status.is_success() {
-        // Verify the response contains model info
-        if serde_json::from_str::<GeminiModelResponse>(&body).is_ok() {
-            Ok(())
-        } else {
-            Err(format!(
-                "Google Gemini model '{model_id}' response was unexpected: {body}"
-            ))
-        }
-    } else {
-        Err(format!(
-            "Google Gemini model '{model_id}' not available (HTTP {status}): {body}"
-        ))
-    }
-}
-
-/// List available Google Gemini models
-pub(crate) async fn list_google_models() -> Result<Vec<String>, String> {
-    let api_key = std::env::var("SPICE_GOOGLE_API_KEY")
-        .map_err(|_| "SPICE_GOOGLE_API_KEY environment variable not set".to_string())?;
-
-    let client = reqwest::Client::new();
-    let url = format!("https://generativelanguage.googleapis.com/v1beta/models?key={api_key}");
-
-    let response = client
-        .get(&url)
-        .header(CONTENT_TYPE, "application/json")
-        .send()
-        .await
-        .map_err(|e| format!("Failed to connect to Google Gemini API: {e}"))?;
-
-    let status = response.status();
-    let body = response
-        .text()
-        .await
-        .map_err(|e| format!("Failed to read Google Gemini API response: {e}"))?;
-
-    if status.is_success() {
-        #[derive(Deserialize)]
-        struct ModelsResponse {
-            models: Vec<GeminiModelResponse>,
-        }
-        let models: ModelsResponse = serde_json::from_str(&body)
-            .map_err(|e| format!("Failed to parse Google Gemini models response: {e}"))?;
-        // Extract model names, stripping the "models/" prefix
-        Ok(models
-            .models
-            .into_iter()
-            .map(|m| {
-                m.name
-                    .strip_prefix("models/")
-                    .unwrap_or(&m.name)
-                    .to_string()
-            })
-            .collect())
-    } else {
-        Err(format!(
-            "Failed to list Google Gemini models (HTTP {status}): {body}"
         ))
     }
 }
@@ -611,7 +922,6 @@ pub(crate) async fn verify_models_available(
                 "openai" => verify_openai_model_available(model_id).await,
                 "anthropic" => verify_anthropic_model_available(model_id).await,
                 "xai" => verify_xai_model_available(model_id).await,
-                "google" | "gemini" => verify_google_model_available(model_id).await,
                 "bedrock" => verify_bedrock_model_available(model_id),
                 _ => Err(format!("Unknown provider: {provider}")),
             };
@@ -663,13 +973,6 @@ impl ModelVerificationBuilder {
     #[must_use]
     pub fn xai(mut self, model_id: &str) -> Self {
         self.models.push(("xai".to_string(), model_id.to_string()));
-        self
-    }
-
-    #[must_use]
-    pub fn google(mut self, model_id: &str) -> Self {
-        self.models
-            .push(("google".to_string(), model_id.to_string()));
         self
     }
 
@@ -848,4 +1151,20 @@ async fn do_register_test_connectors() {
     .await;
 
     tracing::debug!("Completed connector registration for tests");
+}
+
+/// Fails the calling test unless it runs in a process of its own.
+///
+/// nextest runs every test in its own process; plain `cargo test` runs a
+/// binary's tests on threads of one process. A test that changes process-global
+/// state calls this before changing it, so under `cargo test` it fails with
+/// instructions instead of changing the state every neighbouring test runs under.
+/// `why` names that state.
+pub fn require_process_per_test(why: &str) {
+    assert!(
+        std::env::var("NEXTEST_EXECUTION_MODE").as_deref() == Ok("process-per-test"),
+        "{why}, so it must run in a process of its own. Run it with \
+         `cargo nextest run -p runtime --test integration <test name>`: plain \
+         `cargo test` runs every test in the binary on threads of one process"
+    );
 }

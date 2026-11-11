@@ -896,12 +896,42 @@ mod tests {
                 .await?;
         }
 
+        // Every write up to the boundary landed exactly once: one vector in the
+        // main index and one in each of the 99 spill indexes, none dropped.
+        assert_eq!(mock_client.get_vector_count("test-index"), 1);
+        for i in 1..=99 {
+            let index_name = format!("test-index.{i:02}");
+            assert_eq!(
+                mock_client.get_vector_count(&index_name),
+                1,
+                "spill index {index_name} must hold exactly the one vector written to it"
+            );
+        }
+        assert_eq!(
+            spill_index.load(std::sync::atomic::Ordering::SeqCst),
+            99,
+            "the hundredth write must land in the last spill index"
+        );
+
         let vectors = create_test_vectors(1);
         let result = table
             .write_chunk_with_spilling(&vectors, Some(Arc::clone(&spill_index)))
             .await;
 
-        assert!(result.is_err());
+        assert!(
+            matches!(result, Err(Error::MaxSpillAttemptsReached)),
+            "a write past the last spill index must fail with MaxSpillAttemptsReached, got {result:?}"
+        );
+        assert_eq!(
+            mock_client.get_vector_count("test-index.99"),
+            1,
+            "the rejected write must not land in the full last spill index"
+        );
+        assert_eq!(
+            spill_index.load(std::sync::atomic::Ordering::SeqCst),
+            99,
+            "an exhausted spill sequence must not advance past 99"
+        );
 
         Ok(())
     }

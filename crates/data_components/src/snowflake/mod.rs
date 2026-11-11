@@ -23,9 +23,9 @@ use arrow::array::Array;
 use arrow::datatypes::{DataType, Field, Schema, SchemaRef, TimeUnit, i256};
 use async_trait::async_trait;
 use datafusion::{
+    common::TableReference,
     datasource::TableProvider,
     sql::{
-        TableReference,
         sqlparser::{
             dialect::GenericDialect,
             parser::{Parser, ParserError},
@@ -976,16 +976,18 @@ impl SnowflakeTableFactory {
         let schema = Arc::clone(&result.schema);
         let table_reference_for_provider = table_reference.clone();
 
-        let sql_table = Arc::new(
-            SqlTable::new_with_schema(
-                "snowflake",
-                &pool,
-                Arc::clone(&schema),
-                table_reference_for_provider.clone(),
-                None,
-            )
-            .with_dialect(Arc::clone(&dialect)),
-        );
+        #[expect(
+            clippy::disallowed_methods,
+            reason = "routed through `create_spice_federated_table_provider` with the factory's policy below, which both Snowflake connectors set to `deny_spice_specific_functions()`"
+        )]
+        let sql_table = SqlTable::new_with_schema(
+            "snowflake",
+            &pool,
+            Arc::clone(&schema),
+            table_reference_for_provider.clone(),
+            None,
+        )
+        .with_dialect(Arc::clone(&dialect));
 
         let table_provider = Arc::new(federation::create_spice_federated_table_provider(
             sql_table,

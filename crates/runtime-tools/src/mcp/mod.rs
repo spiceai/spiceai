@@ -14,18 +14,27 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
+//! MCP client and server wrappers.
+//!
+//! Spice is dual-era: the server prefers [`rmcp::model::ProtocolVersion::V_2026_07_28`]
+//! (`server/discover`, sessionless Streamable HTTP) and still answers legacy
+//! `initialize` so existing clients keep working until that handshake is dropped.
+
 pub mod catalog;
 pub mod factory;
+mod http_client;
 pub mod server;
 pub mod tool;
 
-use std::{collections::HashMap, str::FromStr};
+pub use catalog::attach_mcp_schema_snapshot;
+
+use std::{collections::HashMap, str::FromStr, time::Duration};
 
 use http::{HeaderName, HeaderValue, header::AUTHORIZATION};
 use rmcp::ErrorData as McpError;
 use secrecy::{ExposeSecret, SecretString};
 use serde::{Deserialize, Serialize};
-use snafu::Snafu;
+use snafu::{ResultExt, Snafu};
 
 #[derive(Debug, Snafu)]
 pub enum Error {
@@ -35,26 +44,92 @@ pub enum Error {
     #[snafu(display("Could not construct tool `{}`. Error: {}", name, e))]
     CouldNotConstructTool { name: String, e: String },
 
-    #[snafu(display("Invalid params 'mcp_args': '{}'.", args_str))]
-    InvalidMcpArgs { args_str: String },
+    #[snafu(display(
+        "Invalid param 'mcp_args': {source}. Quote arguments with spaces, e.g. `--flag \"a b\"`."
+    ))]
+    InvalidMcpArgs { source: shell_words::ParseError },
 
     #[snafu(display(
-        "Error occured in underlying communication to MCP tool. Error: {}",
+        "Error occurred in underlying communication to MCP tool. Error: {}",
         source
     ))]
     UnderlyingTransportError {
         source: Box<dyn std::error::Error + Send + Sync>,
     },
     #[snafu(display(
-        "Error occured in initialization client connection with underlying MCP server. Error: {}",
+        "Error occurred in initialization client connection with underlying MCP server. Error: {}",
         source
     ))]
     UnderlyingInitilizationError { source: McpError },
 }
 
+impl Error {
+    /// Returns `true` when the error is a mistake in the tool's Spicepod configuration, which
+    /// no retry can clear.
+    #[must_use]
+    pub fn is_configuration_error(&self) -> bool {
+        matches!(
+            self,
+            Error::InvalidMCPDirective { .. } | Error::InvalidMcpArgs { .. }
+        )
+    }
+}
+
 pub type Result<T, E = Error> = std::result::Result<T, E>;
 
+/// Prefix every tool-use task name carries.
+///
+/// `spice trace` and the task-history exporter both match on this prefix, but
+/// neither can share this constant — `bin/spice` depends on neither this crate
+/// nor `tools` — so each spells it out itself.
+const TOOL_USE_PREFIX: &str = "tool_use::";
+
+/// `runtime.task_history.task` for a call on the tool exposed as `exposed_name`.
+///
+/// A proxied tool is reachable through two entry points — the `/v1/mcp` gateway
+/// and [`McpToolWrapper::call`](tool::McpToolWrapper::call), which a
+/// `POST /v1/tools/{name}` request or a model-driven call enters directly. Both
+/// label the task through this one function, from the name the tool is exposed
+/// under, so one tool cannot be recorded under two spellings: grouping
+/// `runtime.task_history` by `task` would then split it across two rows, and
+/// `spice trace <task>` would show only the half matching the spelling it was
+/// given.
+pub(crate) fn task_name_for_exposed_tool(exposed_name: &str) -> String {
+    format!("{TOOL_USE_PREFIX}{exposed_name}")
+}
+
+/// Longest wait for an MCP server to finish its handshake. Model loading waits for tools, so a
+/// server that never answers must not hold it forever. A stdio server started through
+/// `npx`/`uvx` may download its package first, so this allows more than a request.
+pub const MCP_HANDSHAKE_TIMEOUT: Duration = Duration::from_mins(2);
+
+/// Longest wait for a `tools/list` or `ping` answer.
+pub const MCP_REQUEST_TIMEOUT: Duration = Duration::from_secs(60);
+
+/// Longest wait for one `tools/call`. Tools do real work, so this is longer than
+/// [`MCP_REQUEST_TIMEOUT`]; it exists so that a stalled server cannot hold a caller forever.
+pub const MCP_CALL_TOOL_TIMEOUT: Duration = Duration::from_mins(10);
+
+/// Largest MCP response, in bytes, Spice accepts from an MCP server over
+/// Streamable HTTP, and the largest serialized tool result it passes on.
+///
+/// A JSON body is capped as a whole. A POST that comes back as SSE is capped
+/// as a whole too: progress notifications and the final result count together,
+/// so that stream is rejected even when every individual event is under the
+/// limit. A GET SSE stream keeps rmcp's per-event cap, set to this same value.
+/// 16 MiB is rmcp's own default event limit, and it is far above real tool
+/// output: a whole 1M-token model context is about 4 MiB of text.
+///
+/// The bound exists because one tool result is copied several times on its
+/// way to the caller (decoded, re-serialized, captured to task history, and
+/// written to the HTTP response or model context), so its size multiplies
+/// into peak memory.
+const MAX_TOOL_RESULT_SIZE: usize = crate::utils::MAX_TOOL_RESULT_BYTES;
+
 const MCP_AUTH_TOKEN_PARAM: &str = "mcp_auth_token";
+/// Custom HTTP headers, formatted `Name: Value` and delimited like the HTTP
+/// connector's `http_headers`. If the value contains `;`, only `;` separates
+/// headers (so values may contain `,`); otherwise `,` separates them.
 const MCP_HEADERS_PARAM: &str = "mcp_headers";
 
 #[derive(Clone, PartialEq, Serialize, Deserialize)]
@@ -96,16 +171,17 @@ impl MCPConfig {
         mcp_type: &MCPType,
         params: &HashMap<String, SecretString>,
         env: &HashMap<String, SecretString>,
-    ) -> Self {
-        match mcp_type.clone() {
+    ) -> Result<Self> {
+        Ok(match mcp_type.clone() {
             MCPType::Stdio(command) => {
-                let args = params
-                    .get("mcp_args")
-                    .map(ExposeSecret::expose_secret)
-                    .unwrap_or_default()
-                    .split_whitespace()
-                    .map(ToString::to_string)
-                    .collect();
+                // Shell-word rules: quotes and backslash escapes group arguments.
+                let args = shell_words::split(
+                    params
+                        .get("mcp_args")
+                        .map(ExposeSecret::expose_secret)
+                        .unwrap_or_default(),
+                )
+                .context(InvalidMcpArgsSnafu)?;
 
                 let env = env
                     .iter()
@@ -128,7 +204,7 @@ impl MCPConfig {
                     headers,
                 }
             }
-        }
+        })
     }
 }
 
@@ -142,7 +218,8 @@ fn parse_custom_headers(
     let param_name = MCP_HEADERS_PARAM;
 
     // Same UX as the HTTP connector's `http_headers` parameter:
-    // `Header1: Value1, Header2: Value2` (or semicolon-delimited).
+    // `Header1: Value1, Header2: Value2` (or semicolon-delimited). Any `;`
+    // makes `;` the only delimiter.
     let headers_str = headers.expose_secret();
     let delimiter = if headers_str.contains(';') { ';' } else { ',' };
     for header in headers_str.split(delimiter) {
@@ -224,7 +301,7 @@ mod tests {
         let mut env = HashMap::new();
         env.insert("FOO".to_string(), SecretString::from("bar"));
 
-        let cfg = MCPConfig::from_type(&mcp_type, &params, &env);
+        let cfg = MCPConfig::from_type(&mcp_type, &params, &env).expect("valid MCP config");
         match cfg {
             MCPConfig::Stdio { command, args, env } => {
                 assert_eq!(command, "docker");
@@ -239,7 +316,8 @@ mod tests {
     fn mcp_config_from_https_preserves_url() {
         let url = url::Url::parse("https://example.com/v1/mcp").expect("valid url");
         let mcp_type = MCPType::StreamableHttp(url.clone());
-        let cfg = MCPConfig::from_type(&mcp_type, &HashMap::new(), &HashMap::new());
+        let cfg = MCPConfig::from_type(&mcp_type, &HashMap::new(), &HashMap::new())
+            .expect("valid MCP config");
         match cfg {
             MCPConfig::StreamableHttp {
                 url: u,
@@ -264,7 +342,8 @@ mod tests {
             SecretString::from("test-api-key"),
         );
 
-        let cfg = MCPConfig::from_type(&mcp_type, &params, &HashMap::new());
+        let cfg =
+            MCPConfig::from_type(&mcp_type, &params, &HashMap::new()).expect("valid MCP config");
         match cfg {
             MCPConfig::StreamableHttp {
                 auth_token,
@@ -291,7 +370,8 @@ mod tests {
             SecretString::from("X-API-Key: test-api-key, X-Tenant: acme"),
         );
 
-        let cfg = MCPConfig::from_type(&mcp_type, &params, &HashMap::new());
+        let cfg =
+            MCPConfig::from_type(&mcp_type, &params, &HashMap::new()).expect("valid MCP config");
         match cfg {
             MCPConfig::StreamableHttp { headers, .. } => {
                 assert_eq!(
@@ -325,7 +405,8 @@ mod tests {
             SecretString::from("Authorization: Basic abc, X-Tenant: acme"),
         );
 
-        let cfg = MCPConfig::from_type(&mcp_type, &params, &HashMap::new());
+        let cfg =
+            MCPConfig::from_type(&mcp_type, &params, &HashMap::new()).expect("valid MCP config");
         match cfg {
             MCPConfig::StreamableHttp { headers, .. } => {
                 assert!(!headers.contains_key(&AUTHORIZATION));

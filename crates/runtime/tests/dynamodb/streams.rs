@@ -46,25 +46,14 @@ use tokio::time::sleep;
 use tracing::instrument;
 
 const DYNAMODB_DOCKER_CONTAINER: &str = "runtime-integration-test-dynamodb";
-const PORT1: u16 = 8001;
-const PORT2: u16 = 8002;
-const PORT3: u16 = 8003;
-const PORT4: u16 = 8004;
-const PORT5: u16 = 8005;
-const PORT6: u16 = 8006;
-const PORT7: u16 = 8007;
-const PORT8: u16 = 8008;
+
 const DYNAMODB_HOST_READY_TIMEOUT: Duration = Duration::from_mins(1);
 
 #[instrument]
-pub async fn start_dynamodb_docker_container(
-    port: u16,
-) -> Result<RunningContainer<'static>, anyhow::Error> {
-    let container_name = format!("{DYNAMODB_DOCKER_CONTAINER}-{port}");
-    let container_name: &'static str = Box::leak(container_name.into_boxed_str());
-    let running_container = ContainerRunnerBuilder::new(container_name)
+pub async fn start_dynamodb_docker_container() -> Result<RunningContainer, anyhow::Error> {
+    let running_container = ContainerRunnerBuilder::new(DYNAMODB_DOCKER_CONTAINER)
         .image("amazon/dynamodb-local:latest".to_string())
-        .add_port_binding(8000, port)
+        .publish_port(8000)
         .healthcheck(HealthConfig {
             test: Some(vec![
                 "CMD-SHELL".to_string(),
@@ -81,7 +70,7 @@ pub async fn start_dynamodb_docker_container(
         .run(None)
         .await?;
 
-    wait_for_dynamodb_host_port(port).await?;
+    wait_for_dynamodb_host_port(running_container.host_port(8000)?).await?;
     Ok(running_container)
 }
 
@@ -291,9 +280,10 @@ async fn dynamodb_streams() -> anyhow::Result<()> {
 
     test_request_context()
         .scope(async {
-            let running_container = start_dynamodb_docker_container(PORT2).await?;
+            let running_container = start_dynamodb_docker_container().await?;
+            let port = running_container.host_port(8000)?;
 
-            let client = get_client(PORT2, access_key, secret_key);
+            let client = get_client(port, access_key, secret_key);
 
             create_table(&client, table_name).await;
             insert_rows(&client, "test_table", 0..5).await;
@@ -301,7 +291,7 @@ async fn dynamodb_streams() -> anyhow::Result<()> {
 
             let app = AppBuilder::new("dynamodb_integration_test")
                 .with_dataset(make_dynamodb_dataset(
-                    table_name, PORT2, access_key, secret_key, true,
+                    table_name, port, access_key, secret_key, true,
                 ))
                 .with_sql_cache(SQLResultsCacheConfig {
                     enabled: false,
@@ -348,10 +338,7 @@ async fn dynamodb_streams() -> anyhow::Result<()> {
             )
             .await?;
 
-            running_container.remove().await.map_err(|e| {
-                tracing::error!("running_container.remove: {e}");
-                anyhow::Error::msg(e.to_string())
-            })?;
+            running_container.cleanup().await;
 
             Ok(())
         })
@@ -370,8 +357,9 @@ async fn dynamodb_streams_delete() -> anyhow::Result<()> {
 
     test_request_context()
         .scope(async {
-            let running_container = start_dynamodb_docker_container(PORT1).await?;
-            let client = get_client(PORT1, access_key, secret_key);
+            let running_container = start_dynamodb_docker_container().await?;
+            let port = running_container.host_port(8000)?;
+            let client = get_client(port, access_key, secret_key);
 
             create_table(&client, table_name).await;
             for i in 0..5 {
@@ -403,7 +391,7 @@ async fn dynamodb_streams_delete() -> anyhow::Result<()> {
 
             let app = AppBuilder::new("dynamodb_batch_delete_test")
                 .with_dataset(make_dynamodb_dataset(
-                    table_name, PORT1, access_key, secret_key, true,
+                    table_name, port, access_key, secret_key, true,
                 ))
                 .with_sql_cache(SQLResultsCacheConfig {
                     enabled: false,
@@ -432,10 +420,7 @@ async fn dynamodb_streams_delete() -> anyhow::Result<()> {
             )
             .await?;
 
-            running_container.remove().await.map_err(|e| {
-                tracing::error!("running_container.remove: {e}");
-                anyhow::Error::msg(e.to_string())
-            })?;
+            running_container.cleanup().await;
 
             Ok(())
         })
@@ -468,7 +453,7 @@ pub fn make_dynamodb_dataset_with_file_accel(
     port: u16,
     access_key: &str,
     secret_key: &str,
-    duckdb_path: &str,
+    cayenne_path: &str,
     lag_exceeds_behavior: Option<&str>,
 ) -> Dataset {
     let mut dataset = Dataset::new(format!("dynamodb:{table_name}"), table_name.to_string());
@@ -499,70 +484,24 @@ pub fn make_dynamodb_dataset_with_file_accel(
         enabled: true,
         mode: Mode::File,
         refresh_mode: Some(RefreshMode::Changes),
-        engine: Some("duckdb".to_string()),
+        engine: Some("cayenne".to_string()),
         params: Some(DatasetParams::from_string_map(HashMap::from([(
-            "duckdb_file".to_string(),
-            duckdb_path.to_string(),
+            "cayenne_file_path".to_string(),
+            cayenne_path.to_string(),
         )]))),
         ..Acceleration::default()
     });
     dataset
 }
 
-/// Creates a mock checkpoint with fake shard IDs from scratch.
-/// Used when no real checkpoint exists yet (e.g., testing fresh checkpoint error propagation).
-fn create_mock_checkpoint(duckdb_path: &str, dataset_name: &str, hours_ago: u64) {
-    use duckdb::Connection;
-    use std::time::{SystemTime, UNIX_EPOCH};
-
-    let conn = Connection::open(duckdb_path).expect("Failed to open DuckDB file");
-
-    // Create table if not exists
-    conn.execute(
-        "CREATE TABLE IF NOT EXISTS spice_sys_dynamodb_streams (
-            dataset_name TEXT PRIMARY KEY,
-            checkpoint_data TEXT,
-            created_at TIMESTAMP,
-            updated_at TIMESTAMP
-        )",
-        [],
-    )
-    .expect("Failed to create checkpoint table");
-
-    // Create a properly formatted checkpoint with non-existent shard ID
-    let checkpoint_updated_at_secs = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .expect("Time went backwards")
-        .as_secs();
-
-    // Build checkpoint JSON with all required fields matching the Checkpoint struct
-    let checkpoint_json = format!(
-        r#"{{"shards":{{"fake-nonexistent-shard-id":{{"sequence_number":"00000000000000000000001","parent_id":null,"updated_at":{{"secs_since_epoch":{checkpoint_updated_at_secs},"nanos_since_epoch":0}},"position":"At"}}}}}}"#
-    );
-
-    // Calculate timestamp hours_ago for the database updated_at column
-    let now = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .expect("Time went backwards");
-    let timestamp_secs = now.as_secs() - (hours_ago * 60 * 60);
-
-    conn.execute(
-        &format!(
-            "INSERT INTO spice_sys_dynamodb_streams (dataset_name, checkpoint_data, created_at, updated_at)
-             VALUES (?, ?, to_timestamp({timestamp_secs}), to_timestamp({timestamp_secs}))"
-        ),
-        [dataset_name, &checkpoint_json],
-    )
-    .expect("Failed to insert mock checkpoint");
-}
-
 /// Corrupts the checkpoint by replacing shard IDs with fake ones and making the timestamp old.
 /// This simulates the scenario where shards have expired (>24h `DynamoDB` retention).
-fn corrupt_checkpoint_for_shard_not_found(duckdb_path: &str, dataset_name: &str, hours_ago: u64) {
-    use duckdb::Connection;
+fn corrupt_checkpoint_for_shard_not_found(cayenne_path: &str, dataset_name: &str, hours_ago: u64) {
+    use rusqlite::Connection;
     use std::time::{SystemTime, UNIX_EPOCH};
 
-    let conn = Connection::open(duckdb_path).expect("Failed to open DuckDB file");
+    let conn = Connection::open(std::path::Path::new(cayenne_path).join("metadata/cayenne.db"))
+        .expect("Failed to open Cayenne metastore");
 
     // Read the existing checkpoint
     let checkpoint_data: String = conn
@@ -602,7 +541,7 @@ fn corrupt_checkpoint_for_shard_not_found(duckdb_path: &str, dataset_name: &str,
     conn.execute(
         &format!(
             "UPDATE spice_sys_dynamodb_streams
-             SET checkpoint_data = ?, updated_at = to_timestamp({timestamp_secs})
+             SET checkpoint_data = ?, updated_at = datetime({timestamp_secs}, 'unixepoch')
              WHERE dataset_name = ?"
         ),
         [&corrupted_checkpoint, dataset_name],
@@ -610,73 +549,66 @@ fn corrupt_checkpoint_for_shard_not_found(duckdb_path: &str, dataset_name: &str,
     .expect("Failed to update checkpoint");
 }
 
-/// Resolves the underlying base table name for an accelerated `DuckDB` table.
-///
-/// After `InsertOp::Overwrite`, the accelerator exposes data through a view over an internal
-/// `__data_<table_name>_<timestamp>` table. Raw `DuckDB` DML must target the latest internal
-/// table; if no internal table exists, the definition name is used directly.
-fn resolve_acceleration_base_table(conn: &duckdb::Connection, table_name: &str) -> String {
-    let prefix = format!("__data_{table_name}_");
-    let Ok(mut stmt) =
-        conn.prepare("SELECT table_name FROM duckdb_tables() WHERE starts_with(table_name, ?)")
-    else {
-        return table_name.to_string();
-    };
-
-    let Ok(rows) = stmt.query_map([&prefix], |row| row.get::<usize, String>(0)) else {
-        return table_name.to_string();
-    };
-
-    let mut latest: Option<(String, u64)> = None;
-    for row in rows.flatten() {
-        let Some(inner) = row.strip_prefix("__data_") else {
-            continue;
-        };
-        let Some((name_part, ts_part)) = inner.rsplit_once('_') else {
-            continue;
-        };
-        if name_part != table_name {
-            continue;
-        }
-        let Ok(ts) = ts_part.parse::<u64>() else {
-            continue;
-        };
-        if latest.as_ref().is_none_or(|(_, prev_ts)| ts > *prev_ts) {
-            latest = Some((row, ts));
-        }
-    }
-
-    latest.map_or_else(|| table_name.to_string(), |(name, _)| name)
+/// Fails when the checkpoint no longer holds the shard IDs that
+/// [`corrupt_checkpoint_for_shard_not_found`] wrote, because something rewrote it before the
+/// next phase started. Every later assertion in these tests depends on that corruption: a
+/// rewritten, valid checkpoint resumes the stream instead of forcing a rebootstrap.
+fn assert_checkpoint_still_corrupted(cayenne_path: &str, dataset_name: &str) {
+    let conn =
+        rusqlite::Connection::open(std::path::Path::new(cayenne_path).join("metadata/cayenne.db"))
+            .expect("Failed to open Cayenne metastore");
+    let (checkpoint_data, updated_at): (String, String) = conn
+        .query_row(
+            "SELECT checkpoint_data, CAST(updated_at AS TEXT) FROM spice_sys_dynamodb_streams WHERE dataset_name = ?",
+            [dataset_name],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .expect("Failed to read checkpoint");
+    assert!(
+        checkpoint_data.contains("fake-nonexistent-shard-"),
+        "The checkpoint was rewritten after the test corrupted it (updated_at {updated_at}), so a runtime from an earlier phase is still streaming: {checkpoint_data}"
+    );
 }
 
 /// Deletes rows from the accelerated table to verify rebootstrap restores them.
-fn delete_rows_from_acceleration(duckdb_path: &str, table_name: &str, ids_to_delete: &[&str]) {
-    use duckdb::Connection;
-
-    let conn = Connection::open(duckdb_path).expect("Failed to open DuckDB file");
-    let base_table = resolve_acceleration_base_table(&conn, table_name);
-
+async fn delete_rows_from_acceleration(
+    cayenne_path: &str,
+    table_name: &str,
+    ids_to_delete: &[&str],
+) {
     for id in ids_to_delete {
-        conn.execute(&format!(r#"DELETE FROM "{base_table}" WHERE id = ?"#), [id])
-            .expect("Failed to delete row");
+        crate::acceleration::query_cayenne_file(
+            std::path::Path::new(cayenne_path),
+            table_name,
+            &format!(
+                "DELETE FROM \"{table_name}\" WHERE id = '{}'",
+                id.replace('\'', "''")
+            ),
+        )
+        .await
+        .expect("delete accelerated row");
     }
 }
 
-/// Gets the row count from the accelerated table.
-fn get_acceleration_row_count(duckdb_path: &str, table_name: &str) -> usize {
-    use duckdb::Connection;
-
-    let conn = Connection::open(duckdb_path).expect("Failed to open DuckDB file");
-    let count: i64 = conn
-        .query_row(&format!("SELECT COUNT(*) FROM {table_name}"), [], |row| {
-            row.get(0)
-        })
-        .unwrap_or(0);
-    usize::try_from(count).unwrap_or(0)
+async fn get_acceleration_row_count(cayenne_path: &str, table_name: &str) -> usize {
+    let batches = crate::acceleration::query_cayenne_file(
+        std::path::Path::new(cayenne_path),
+        table_name,
+        &format!("SELECT COUNT(*) FROM \"{table_name}\""),
+    )
+    .await
+    .expect("count persisted accelerated rows");
+    let count = batches[0]
+        .column(0)
+        .as_any()
+        .downcast_ref::<arrow::array::Int64Array>()
+        .expect("count returns Int64")
+        .value(0);
+    usize::try_from(count).expect("count is nonnegative and fits usize")
 }
 
 async fn wait_for_dataset_error(rt: &Runtime, dataset_name: &str, timeout_secs: u64) -> bool {
-    use datafusion::sql::TableReference;
+    use datafusion::common::TableReference;
 
     let table_ref = TableReference::bare(dataset_name);
     let start = std::time::Instant::now();
@@ -729,22 +661,21 @@ pub(super) async fn wait_for_dataset_rows(
     }
 }
 
-/// Inserts phantom rows directly into the `DuckDB` acceleration table, bypassing `DynamoDB`.
+/// Inserts phantom rows directly into the `Cayenne` acceleration table, bypassing `DynamoDB`.
 ///
 /// These rows have IDs that do not exist in `DynamoDB`, so no CDC stream events will ever
 /// delete them. An `InsertOp::Overwrite` rebootstrap will remove them (the table is
 /// replaced atomically); an `InsertOp::Append` rebootstrap leaves them in place.
-fn add_phantom_rows_to_acceleration(duckdb_path: &str, table_name: &str, count: usize) {
-    use duckdb::Connection;
-    let conn = Connection::open(duckdb_path).expect("Failed to open DuckDB file");
-    let base_table = resolve_acceleration_base_table(&conn, table_name);
+async fn add_phantom_rows_to_acceleration(cayenne_path: &str, table_name: &str, count: usize) {
     for i in 0..count {
         let version = i64::try_from(i).expect("phantom row index fits in i64");
-        conn.execute(
-            &format!(r#"INSERT INTO "{base_table}" (id, name, version) VALUES (?, ?, ?)"#),
-            duckdb::params![format!("phantom-{i}"), format!("Phantom {i}"), version],
+        crate::acceleration::query_cayenne_file(
+            std::path::Path::new(cayenne_path),
+            table_name,
+            &format!("INSERT INTO \"{table_name}\" (id, name, version) VALUES ('phantom-{i}', 'Phantom {i}', {version})"),
         )
-        .expect("Failed to insert phantom row");
+        .await
+        .expect("insert phantom row");
     }
 }
 
@@ -786,9 +717,9 @@ async fn wait_for_exact_row_count(
     }
 }
 
-/// Verifies that rebootstrap removes phantom rows that exist in `DuckDB` but not in `DynamoDB`.
+/// Verifies that rebootstrap removes phantom rows that exist in `Cayenne` but not in `DynamoDB`.
 ///
-/// The test injects rows directly into the `DuckDB` acceleration file with IDs that do not
+/// The test injects rows directly into the `Cayenne` acceleration file with IDs that do not
 /// exist in `DynamoDB`.  No CDC delete events are ever generated for these IDs, so the only
 /// mechanism that can remove them is an atomic table replacement.
 ///
@@ -808,26 +739,27 @@ async fn dynamodb_rebootstrap_removes_rows_deleted_from_source() -> anyhow::Resu
 
     test_request_context()
         .scope(async {
-            let running_container = start_dynamodb_docker_container(PORT7).await?;
-            let client = get_client(PORT7, access_key, secret_key);
+            let running_container = start_dynamodb_docker_container().await?;
+            let port = running_container.host_port(8000)?;
+            let client = get_client(port, access_key, secret_key);
 
             create_table(&client, table_name).await;
             insert_rows(&client, table_name, 0..5).await;
             wait_for_dynamodb_source_rows(&client, table_name, 5, 30).await?;
 
             let temp_dir = tempfile::tempdir()?;
-            let duckdb_path = temp_dir.path().join("test.duckdb");
-            let duckdb_path_str = duckdb_path.to_str().expect("path should be valid UTF-8");
+            let cayenne_path = temp_dir.path().join("acceleration");
+            let cayenne_path_str = cayenne_path.to_str().expect("path should be valid UTF-8");
 
             // Phase 1: Bootstrap normally — acceleration and DynamoDB both have 5 rows.
             {
                 let app = AppBuilder::new("dynamodb_rebootstrap_stale_phase1")
                     .with_dataset(make_dynamodb_dataset_with_file_accel(
                         table_name,
-                        PORT7,
+                        port,
                         access_key,
                         secret_key,
-                        duckdb_path_str,
+                        cayenne_path_str,
                         Some("ready_after_load"),
                     ))
                     .with_sql_cache(SQLResultsCacheConfig {
@@ -850,23 +782,32 @@ async fn dynamodb_rebootstrap_removes_rows_deleted_from_source() -> anyhow::Resu
                 runtime_ready_check(&rt).await;
                 ensure_exact_dataset_rows(&rt, table_name, 5, 30).await?;
 
-                let initial_count = get_acceleration_row_count(duckdb_path_str, table_name);
+                let initial_count = get_acceleration_row_count(cayenne_path_str, table_name).await;
                 assert_eq!(initial_count, 5, "Phase 1: Should have 5 rows after initial load");
+
+                // Dropping the runtime does not stop its DynamoDB stream; shut it down so
+                // nothing rewrites the acceleration or its checkpoint during Phase 2.
+                rt.shutdown().await;
             }
 
-            // Phase 2: While Spice is down, inject 3 phantom rows directly into DuckDB.
+            // Phase 2: While Spice is down, inject 3 phantom rows directly into Cayenne.
             // These IDs do not exist in DynamoDB, so no CDC stream events can remove them.
             // Only an atomic table replacement (InsertOp::Overwrite) can purge them.
-            add_phantom_rows_to_acceleration(duckdb_path_str, table_name, 3);
+            add_phantom_rows_to_acceleration(cayenne_path_str, table_name, 3).await;
 
-            let pre_rebootstrap_count = get_acceleration_row_count(duckdb_path_str, table_name);
+            let pre_rebootstrap_count = get_acceleration_row_count(cayenne_path_str, table_name).await;
             assert_eq!(
                 pre_rebootstrap_count, 8,
                 "Phase 2: Acceleration should have 8 rows (5 original + 3 phantoms)"
             );
 
             // Corrupt checkpoint (20 h ago) to trigger rebootstrap on next startup.
-            corrupt_checkpoint_for_shard_not_found(duckdb_path_str, table_name, 20);
+            corrupt_checkpoint_for_shard_not_found(cayenne_path_str, table_name, 20);
+
+            // Give anything still running from Phase 1 time to write, then check that the
+            // corrupted checkpoint survived.
+            sleep(Duration::from_secs(5)).await;
+            assert_checkpoint_still_corrupted(cayenne_path_str, table_name);
 
             // Phase 3: Restart Spice — rebootstrap must replace the table, not append to it.
             // DynamoDB still has 5 rows; after Overwrite rebootstrap, the 3 phantoms are gone.
@@ -874,10 +815,10 @@ async fn dynamodb_rebootstrap_removes_rows_deleted_from_source() -> anyhow::Resu
                 let app = AppBuilder::new("dynamodb_rebootstrap_stale_phase3")
                     .with_dataset(make_dynamodb_dataset_with_file_accel(
                         table_name,
-                        PORT7,
+                        port,
                         access_key,
                         secret_key,
-                        duckdb_path_str,
+                        cayenne_path_str,
                         Some("ready_after_load"),
                     ))
                     .with_sql_cache(SQLResultsCacheConfig {
@@ -901,23 +842,23 @@ async fn dynamodb_rebootstrap_removes_rows_deleted_from_source() -> anyhow::Resu
                 let has_exact_rows = wait_for_exact_row_count(&rt, table_name, 5, 30).await;
                 assert!(
                     has_exact_rows,
-                    "Rebootstrap must remove phantom rows that exist only in DuckDB. \
+                    "Rebootstrap must remove phantom rows that exist only in the acceleration. \
                      Stale phantom rows survived — InsertOp::Append was used instead of Overwrite"
                 );
 
                 runtime_ready_check(&rt).await;
             }
 
-            running_container.remove().await.map_err(|e| {
-                tracing::error!("running_container.remove: {e}");
-                anyhow::Error::msg(e.to_string())
-            })?;
+            running_container.cleanup().await;
 
             Ok(())
         })
         .await
 }
 
+/// A checkpoint that names shards the stream no longer has, but was written an hour
+/// ago, is too recent for the shards to have expired, so the dataset reports an error
+/// instead of re-bootstrapping, whatever `lag_exceeds_shard_retention_behavior` says.
 #[tokio::test(flavor = "multi_thread")]
 async fn dynamodb_shard_not_found_fresh_checkpoint_propagates_error() -> anyhow::Result<()> {
     let _tracing = init_tracing(Some(
@@ -930,30 +871,62 @@ async fn dynamodb_shard_not_found_fresh_checkpoint_propagates_error() -> anyhow:
 
     test_request_context()
         .scope(async {
-            let running_container = start_dynamodb_docker_container(PORT3).await?;
-            let client = get_client(PORT3, access_key, secret_key);
+            let running_container = start_dynamodb_docker_container().await?;
+            let port = running_container.host_port(8000)?;
+            let client = get_client(port, access_key, secret_key);
 
             create_table(&client, table_name).await;
             insert_rows(&client, table_name, 0..5).await;
             wait_for_dynamodb_source_rows(&client, table_name, 5, 30).await?;
 
-            // Create temp DuckDB file and insert fake checkpoint with FRESH timestamp (1h ago)
             let temp_dir = tempfile::tempdir()?;
-            let duckdb_path = temp_dir.path().join("test.duckdb");
-            let duckdb_path_str = duckdb_path.to_str().expect("path should be valid UTF-8");
+            let cayenne_path = temp_dir.path().join("acceleration");
+            let cayenne_path_str = cayenne_path.to_str().expect("path should be valid UTF-8");
 
-            // Insert fake checkpoint that's only 1h old (< 18h threshold)
-            // This should propagate error regardless of lag_exceeds_behavior setting
-            create_mock_checkpoint(duckdb_path_str, table_name, 1);
+            // Start Spice once so the dataset writes a real checkpoint.
+            {
+                let app = AppBuilder::new("dynamodb_fresh_checkpoint_phase1")
+                    .with_dataset(make_dynamodb_dataset_with_file_accel(
+                        table_name,
+                        port,
+                        access_key,
+                        secret_key,
+                        cayenne_path_str,
+                        Some("ready_after_load"),
+                    ))
+                    .with_sql_cache(SQLResultsCacheConfig {
+                        enabled: false,
+                        ..Default::default()
+                    })
+                    .build();
 
-            let app = AppBuilder::new("dynamodb_fresh_checkpoint_test")
+                configure_test_datafusion();
+                let rt = Runtime::builder().with_app(app).build().await;
+                let cloned_rt = Arc::new(rt.clone());
+
+                tokio::select! {
+                    () = tokio::time::sleep(Duration::from_mins(1)) => {
+                        return Err(anyhow::Error::msg("Phase 1: Timed out waiting for datasets to load"));
+                    }
+                    () = cloned_rt.load_components() => {}
+                }
+
+                runtime_ready_check(&rt).await;
+                ensure_exact_dataset_rows(&rt, table_name, 5, 30).await?;
+            }
+
+            // Point the checkpoint at shards the stream does not have, written an hour
+            // ago: well inside the stream's 24-hour retention.
+            corrupt_checkpoint_for_shard_not_found(cayenne_path_str, table_name, 1);
+
+            let app = AppBuilder::new("dynamodb_fresh_checkpoint_phase2")
                 .with_dataset(make_dynamodb_dataset_with_file_accel(
                     table_name,
-                    PORT3,
+                    port,
                     access_key,
                     secret_key,
-                    duckdb_path_str,
-                    Some("ready_after_load"), // Setting doesn't matter for fresh checkpoint
+                    cayenne_path_str,
+                    Some("ready_after_load"), // A fresh checkpoint fails whatever this says.
                 ))
                 .with_sql_cache(SQLResultsCacheConfig {
                     enabled: false,
@@ -970,17 +943,13 @@ async fn dynamodb_shard_not_found_fresh_checkpoint_propagates_error() -> anyhow:
                 () = cloned_rt.load_components() => {}
             }
 
-            // Fresh checkpoint + ShardNotFound should result in error
             let is_error = wait_for_dataset_error(&rt, table_name, 10).await;
             assert!(
                 is_error,
                 "Dataset should be in error state when fresh checkpoint has ShardNotFound"
             );
 
-            running_container.remove().await.map_err(|e| {
-                tracing::error!("running_container.remove: {e}");
-                anyhow::Error::msg(e.to_string())
-            })?;
+            running_container.cleanup().await;
 
             Ok(())
         })
@@ -999,27 +968,28 @@ async fn dynamodb_shard_not_found_expired_checkpoint_ready_after_load() -> anyho
 
     test_request_context()
         .scope(async {
-            let running_container = start_dynamodb_docker_container(PORT4).await?;
-            let client = get_client(PORT4, access_key, secret_key);
+            let running_container = start_dynamodb_docker_container().await?;
+            let port = running_container.host_port(8000)?;
+            let client = get_client(port, access_key, secret_key);
 
             create_table(&client, table_name).await;
             insert_rows(&client, table_name, 0..5).await;
             wait_for_dynamodb_source_rows(&client, table_name, 5, 30).await?;
 
-            // Create temp DuckDB file for acceleration
+            // Create temp Cayenne file for acceleration
             let temp_dir = tempfile::tempdir()?;
-            let duckdb_path = temp_dir.path().join("test.duckdb");
-            let duckdb_path_str = duckdb_path.to_str().expect("path should be valid UTF-8");
+            let cayenne_path = temp_dir.path().join("acceleration");
+            let cayenne_path_str = cayenne_path.to_str().expect("path should be valid UTF-8");
 
             // === PHASE 1: Start Spice normally to create real checkpoint ===
             {
                 let app = AppBuilder::new("dynamodb_ready_after_load_phase1")
                     .with_dataset(make_dynamodb_dataset_with_file_accel(
                         table_name,
-                        PORT4,
+                        port,
                         access_key,
                         secret_key,
-                        duckdb_path_str,
+                        cayenne_path_str,
                         Some("ready_after_load"),
                     ))
                     .with_sql_cache(SQLResultsCacheConfig {
@@ -1044,34 +1014,41 @@ async fn dynamodb_shard_not_found_expired_checkpoint_ready_after_load() -> anyho
                 ensure_exact_dataset_rows(&rt, table_name, 5, 30).await?;
 
                 // Verify initial data is loaded
-                let initial_count = get_acceleration_row_count(duckdb_path_str, table_name);
+                let initial_count = get_acceleration_row_count(cayenne_path_str, table_name).await;
                 assert_eq!(initial_count, 5, "Phase 1: Should have 5 rows after initial load");
 
-                // Runtime drops here, stopping Spice
+                // Dropping the runtime does not stop its DynamoDB stream; shut it down so
+                // nothing rewrites the acceleration or its checkpoint during Phase 2.
+                rt.shutdown().await;
             }
 
             // === PHASE 2: Corrupt checkpoint, delete some rows, and add new records while Spice is down ===
             // Make checkpoint reference non-existent shards and set timestamp to 20h ago
-            corrupt_checkpoint_for_shard_not_found(duckdb_path_str, table_name, 20);
+            corrupt_checkpoint_for_shard_not_found(cayenne_path_str, table_name, 20);
 
             // Delete some rows from acceleration to verify rebootstrap restores them
-            delete_rows_from_acceleration(duckdb_path_str, table_name, &["id-0", "id-1", "id-2"]);
-            let count_after_delete = get_acceleration_row_count(duckdb_path_str, table_name);
+            delete_rows_from_acceleration(cayenne_path_str, table_name, &["id-0", "id-1", "id-2"]).await;
+            let count_after_delete = get_acceleration_row_count(cayenne_path_str, table_name).await;
             assert_eq!(count_after_delete, 2, "Phase 2: Should have 2 rows after deletion");
 
             // Add new records to DynamoDB while Spice is down
             insert_rows(&client, table_name, 5..8).await;
             wait_for_dynamodb_source_rows(&client, table_name, 8, 30).await?;
 
+            // Give anything still running from Phase 1 time to write, then check that the
+            // corrupted checkpoint survived.
+            sleep(Duration::from_secs(5)).await;
+            assert_checkpoint_still_corrupted(cayenne_path_str, table_name);
+
             // === PHASE 3: Start Spice again - should detect ShardNotFound and rebootstrap ===
             {
                 let app = AppBuilder::new("dynamodb_ready_after_load_phase3")
                     .with_dataset(make_dynamodb_dataset_with_file_accel(
                         table_name,
-                        PORT4,
+                        port,
                         access_key,
                         secret_key,
-                        duckdb_path_str,
+                        cayenne_path_str,
                         Some("ready_after_load"),
                     ))
                     .with_sql_cache(SQLResultsCacheConfig {
@@ -1098,10 +1075,7 @@ async fn dynamodb_shard_not_found_expired_checkpoint_ready_after_load() -> anyho
                 runtime_ready_check(&rt).await;
             }
 
-            running_container.remove().await.map_err(|e| {
-                tracing::error!("running_container.remove: {e}");
-                anyhow::Error::msg(e.to_string())
-            })?;
+            running_container.cleanup().await;
 
             Ok(())
         })
@@ -1120,27 +1094,28 @@ async fn dynamodb_shard_not_found_expired_checkpoint_ready_before_load() -> anyh
 
     test_request_context()
         .scope(async {
-            let running_container = start_dynamodb_docker_container(PORT5).await?;
-            let client = get_client(PORT5, access_key, secret_key);
+            let running_container = start_dynamodb_docker_container().await?;
+            let port = running_container.host_port(8000)?;
+            let client = get_client(port, access_key, secret_key);
 
             create_table(&client, table_name).await;
             insert_rows(&client, table_name, 0..5).await;
             wait_for_dynamodb_source_rows(&client, table_name, 5, 30).await?;
 
-            // Create temp DuckDB file for acceleration
+            // Create temp Cayenne file for acceleration
             let temp_dir = tempfile::tempdir()?;
-            let duckdb_path = temp_dir.path().join("test.duckdb");
-            let duckdb_path_str = duckdb_path.to_str().expect("path should be valid UTF-8");
+            let cayenne_path = temp_dir.path().join("acceleration");
+            let cayenne_path_str = cayenne_path.to_str().expect("path should be valid UTF-8");
 
             // === PHASE 1: Start Spice normally to create real checkpoint ===
             {
                 let app = AppBuilder::new("dynamodb_ready_before_load_phase1")
                     .with_dataset(make_dynamodb_dataset_with_file_accel(
                         table_name,
-                        PORT5,
+                        port,
                         access_key,
                         secret_key,
-                        duckdb_path_str,
+                        cayenne_path_str,
                         Some("ready_before_load"),
                     ))
                     .with_sql_cache(SQLResultsCacheConfig {
@@ -1165,34 +1140,41 @@ async fn dynamodb_shard_not_found_expired_checkpoint_ready_before_load() -> anyh
                 ensure_exact_dataset_rows(&rt, table_name, 5, 30).await?;
 
                 // Verify initial data is loaded
-                let initial_count = get_acceleration_row_count(duckdb_path_str, table_name);
+                let initial_count = get_acceleration_row_count(cayenne_path_str, table_name).await;
                 assert_eq!(initial_count, 5, "Phase 1: Should have 5 rows after initial load");
 
-                // Runtime drops here, stopping Spice
+                // Dropping the runtime does not stop its DynamoDB stream; shut it down so
+                // nothing rewrites the acceleration or its checkpoint during Phase 2.
+                rt.shutdown().await;
             }
 
             // === PHASE 2: Corrupt checkpoint, delete some rows, and add new records while Spice is down ===
             // Make checkpoint reference non-existent shards and set timestamp to 20h ago
-            corrupt_checkpoint_for_shard_not_found(duckdb_path_str, table_name, 20);
+            corrupt_checkpoint_for_shard_not_found(cayenne_path_str, table_name, 20);
 
             // Delete some rows from acceleration to verify rebootstrap restores them
-            delete_rows_from_acceleration(duckdb_path_str, table_name, &["id-0", "id-1", "id-2"]);
-            let count_after_delete = get_acceleration_row_count(duckdb_path_str, table_name);
+            delete_rows_from_acceleration(cayenne_path_str, table_name, &["id-0", "id-1", "id-2"]).await;
+            let count_after_delete = get_acceleration_row_count(cayenne_path_str, table_name).await;
             assert_eq!(count_after_delete, 2, "Phase 2: Should have 2 rows after deletion");
 
             // Add new records to DynamoDB while Spice is down
             insert_rows(&client, table_name, 5..8).await;
             wait_for_dynamodb_source_rows(&client, table_name, 8, 30).await?;
 
+            // Give anything still running from Phase 1 time to write, then check that the
+            // corrupted checkpoint survived.
+            sleep(Duration::from_secs(5)).await;
+            assert_checkpoint_still_corrupted(cayenne_path_str, table_name);
+
             // === PHASE 3: Start Spice again - should detect ShardNotFound and rebootstrap ===
             {
                 let app = AppBuilder::new("dynamodb_ready_before_load_phase3")
                     .with_dataset(make_dynamodb_dataset_with_file_accel(
                         table_name,
-                        PORT5,
+                        port,
                         access_key,
                         secret_key,
-                        duckdb_path_str,
+                        cayenne_path_str,
                         Some("ready_before_load"),
                     ))
                     .with_sql_cache(SQLResultsCacheConfig {
@@ -1222,10 +1204,7 @@ async fn dynamodb_shard_not_found_expired_checkpoint_ready_before_load() -> anyh
                 runtime_ready_check(&rt).await;
             }
 
-            running_container.remove().await.map_err(|e| {
-                tracing::error!("running_container.remove: {e}");
-                anyhow::Error::msg(e.to_string())
-            })?;
+            running_container.cleanup().await;
 
             Ok(())
         })
@@ -1299,8 +1278,9 @@ async fn dynamodb_streams_cayenne_file_acceleration() -> anyhow::Result<()> {
 
     test_request_context()
         .scope(async {
-            let running_container = start_dynamodb_docker_container(PORT6).await?;
-            let client = get_client(PORT6, access_key, secret_key);
+            let running_container = start_dynamodb_docker_container().await?;
+            let port = running_container.host_port(8000)?;
+            let client = get_client(port, access_key, secret_key);
 
             // Create table with just `id` as hash key (created_at is a non-key attribute)
             create_table(&client, table_name).await;
@@ -1320,9 +1300,9 @@ async fn dynamodb_streams_cayenne_file_acceleration() -> anyhow::Result<()> {
 
             wait_for_dynamodb_source_rows(&client, table_name, 1, 30).await?;
 
-            let app = AppBuilder::new("dynamodb_duckdb_file_accel_test")
+            let app = AppBuilder::new("dynamodb_cayenne_file_accel_test")
                 .with_dataset(make_dynamodb_dataset_with_cayenne_acceleration(
-                    table_name, PORT6, access_key, secret_key,
+                    table_name, port, access_key, secret_key,
                 ))
                 .with_sql_cache(SQLResultsCacheConfig {
                     enabled: false,
@@ -1350,10 +1330,7 @@ async fn dynamodb_streams_cayenne_file_acceleration() -> anyhow::Result<()> {
             )
             .await?;
 
-            running_container.remove().await.map_err(|e| {
-                tracing::error!("running_container.remove: {e}");
-                anyhow::Error::msg(e.to_string())
-            })?;
+            running_container.cleanup().await;
 
             Ok(())
         })
@@ -1375,15 +1352,16 @@ async fn dynamodb_streams_declared_schema_empty_table() -> anyhow::Result<()> {
 
     test_request_context()
         .scope(async {
-            let running_container = start_dynamodb_docker_container(PORT8).await?;
-            let client = get_client(PORT8, access_key, secret_key);
+            let running_container = start_dynamodb_docker_container().await?;
+            let port = running_container.host_port(8000)?;
+            let client = get_client(port, access_key, secret_key);
 
             // Create table with streams but do NOT insert any rows yet.
             create_table(&client, table_name).await;
 
             // Build dataset with explicit column type declarations so the runtime
             // can initialize schema without scanning any rows.
-            let mut ds = make_dynamodb_dataset(table_name, PORT8, access_key, secret_key, true);
+            let mut ds = make_dynamodb_dataset(table_name, port, access_key, secret_key, true);
             ds.columns = vec![
                 Column::new("id").with_type("text"),
                 Column::new("name").with_type("text"),
@@ -1433,10 +1411,7 @@ async fn dynamodb_streams_declared_schema_empty_table() -> anyhow::Result<()> {
             )
             .await?;
 
-            running_container.remove().await.map_err(|e| {
-                tracing::error!("running_container.remove: {e}");
-                anyhow::Error::msg(e.to_string())
-            })?;
+            running_container.cleanup().await;
 
             Ok(())
         })

@@ -89,10 +89,64 @@ pub struct FieldMapping {
     pub field_type: Option<String>,
     #[serde(default)]
     pub properties: Option<HashMap<String, FieldMapping>>,
+    /// Multi-fields: the same value indexed a second way under `<field>.<name>`. A string with
+    /// no explicit mapping is dynamically mapped `text` with a `keyword` multi-field, and that
+    /// sub-field is the only exact-match path to it.
+    #[serde(default)]
+    pub fields: Option<HashMap<String, FieldMapping>>,
+    /// Strings longer than this are stored but not indexed, so no exact-match filter reaches
+    /// them. Dynamic mapping sets it to 256 on the `keyword` multi-field it derives for a string.
+    pub ignore_above: Option<i64>,
+    /// Whether the field is searchable at all. Held untyped because Elasticsearch has spelled it
+    /// both as a boolean and as a quoted boolean across versions, and a mapping that fails to
+    /// parse is worse than one whose `index` needs interpreting — see [`FieldMapping::is_indexed`].
+    #[serde(default)]
+    pub index: Option<serde_json::Value>,
+    /// The normalizer applied to a `keyword` field's values, if any. Elasticsearch normalizes a
+    /// `term` query's value with it too, so a normalized field matches every value that
+    /// normalizes the same way — `A` and `a` under `lowercase` — which makes it unusable for
+    /// addressing one row's documents exactly. Captured so a caller resolving a key column to a
+    /// field path can refuse it rather than reach a sibling row.
+    pub normalizer: Option<String>,
     /// For `dense_vector` fields.
     pub dims: Option<i64>,
     /// Similarity metric for `dense_vector` (e.g. `cosine`, `l2_norm`, `dot_product`).
     pub similarity: Option<String>,
+}
+
+/// The field mappings `GET /<index>/_mapping` returned for `index`.
+///
+/// The body is keyed by the *concrete* index name, which is `index` itself unless `index` is an
+/// alias — in which case the single entry it resolved to is the one to read. `None` means the
+/// response named no mapping that can be attributed to `index`, which is not the same as an index
+/// whose mapping is empty.
+#[must_use]
+pub fn index_properties<'a>(
+    response: &'a MappingResponse,
+    index: &str,
+) -> Option<&'a HashMap<String, FieldMapping>> {
+    match response.get(index) {
+        Some(index_mapping) => Some(&index_mapping.mappings.properties),
+        None if response.len() == 1 => response.values().next().map(|m| &m.mappings.properties),
+        None => None,
+    }
+}
+
+impl FieldMapping {
+    /// Whether a query can match on this field. `index: false` stores the value in `_source` and
+    /// indexes nothing, so no filter — however exact — reaches it.
+    ///
+    /// Absent means indexed: that is Elasticsearch's default for every field type.
+    #[must_use]
+    pub fn is_indexed(&self) -> bool {
+        match &self.index {
+            Some(serde_json::Value::Bool(indexed)) => *indexed,
+            Some(serde_json::Value::String(indexed)) => indexed != "false",
+            // An absent `index`, or anything else — which is not a value Elasticsearch produces
+            // here — reads as the default rather than as a guess that the field is unsearchable.
+            None | Some(_) => true,
+        }
+    }
 }
 
 /// A search request body sent to `POST /<index>/_search`.
@@ -125,7 +179,22 @@ pub struct KnnQuery {
 pub struct SearchResponse {
     #[serde(default)]
     pub pit_id: Option<String>,
+    /// Whether the search stopped at its timeout. Elasticsearch still answers with the hits
+    /// it gathered by then, and no error.
+    #[serde(default)]
+    pub timed_out: bool,
+    /// How many shards answered. A search some shards failed still succeeds, with only the
+    /// other shards' hits.
+    #[serde(default, rename = "_shards")]
+    pub shards: Option<ShardsSummary>,
     pub hits: HitsEnvelope,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct ShardsSummary {
+    pub total: u64,
+    #[serde(default)]
+    pub failed: u64,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -150,6 +219,38 @@ pub struct Hit {
     pub sort: Option<Vec<serde_json::Value>>,
     #[serde(default, rename = "_source")]
     pub source: serde_json::Value,
+    /// The document's sequence number, returned when the search asks for
+    /// `seq_no_primary_term`.
+    #[serde(default, rename = "_seq_no")]
+    pub seq_no: Option<i64>,
+    /// The primary term `seq_no` was assigned under, returned alongside it.
+    #[serde(default, rename = "_primary_term")]
+    pub primary_term: Option<i64>,
+    /// The concrete index holding the document. A search through an alias names the index
+    /// behind it.
+    #[serde(default, rename = "_index")]
+    pub index: Option<String>,
+    /// The custom routing the document was written with, if any (for example by a write
+    /// through an alias that sets `routing`). Without it, a request for this `_id` goes to
+    /// the shard the `_id` hashes to, which need not be the one holding the document.
+    #[serde(default, rename = "_routing")]
+    pub routing: Option<String>,
+}
+
+/// A document as one write left it: any later write to the same `_id` assigns a new
+/// `(seq_no, primary_term)`, so a delete conditioned on this pair removes the document only
+/// if nothing has rewritten it since.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DocumentVersion {
+    /// The concrete index the version was read from. `(seq_no, primary_term)` is assigned per
+    /// shard of one index, so it identifies a document only in that index, not in another
+    /// index an alias points to later.
+    pub index: String,
+    pub id: String,
+    /// The document's custom routing, which a request has to repeat to reach its shard.
+    pub routing: Option<String>,
+    pub seq_no: i64,
+    pub primary_term: i64,
 }
 
 #[derive(Debug, Deserialize)]
@@ -537,7 +638,6 @@ impl Client {
         index: &str,
         docs: &[(Option<String>, serde_json::Value)],
     ) -> Result<serde_json::Value> {
-        let url = format!("{}/_bulk", self.base_url);
         let mut ndjson = String::new();
         for (id, doc) in docs {
             let action = if let Some(id) = id {
@@ -550,13 +650,19 @@ impl Client {
             ndjson.push_str(&serde_json::to_string(doc).context(JsonSerializeSnafu)?);
             ndjson.push('\n');
         }
+        self.post_bulk("bulk_index", ndjson).await
+    }
+
+    /// Send an NDJSON `_bulk` body, retrying transient failures.
+    async fn post_bulk(&self, op: &'static str, ndjson: String) -> Result<serde_json::Value> {
+        let url = format!("{}/_bulk", self.base_url);
         let url_ref = &url;
         // Freeze the NDJSON payload into `Bytes` so retries reuse the same
         // underlying buffer (cheap refcount clone) instead of copying the
         // entire payload on every attempt.
         let ndjson_bytes = Bytes::from(ndjson);
         let ndjson_ref = &ndjson_bytes;
-        self.with_retry("bulk_index", |c| async move {
+        self.with_retry(op, |c| async move {
             let resp = c
                 .auth(c.http.post(url_ref))
                 .header(CONTENT_TYPE, "application/x-ndjson")
@@ -568,6 +674,34 @@ impl Client {
             resp.json().await.context(JsonParseSnafu)
         })
         .await
+    }
+
+    /// Delete each document in `docs` via `POST /_bulk`, but only while it is still at the
+    /// given version (`if_seq_no` / `if_primary_term`). A document rewritten since is reported
+    /// with a per-item `409` version conflict and left in place; the bulk response is returned
+    /// for the caller to inspect.
+    pub async fn bulk_delete_if_unchanged(
+        &self,
+        docs: &[DocumentVersion],
+    ) -> Result<serde_json::Value> {
+        let mut ndjson = String::new();
+        for doc in docs {
+            let mut delete = serde_json::json!({
+                "_index": doc.index,
+                "_id": doc.id,
+                "if_seq_no": doc.seq_no,
+                "if_primary_term": doc.primary_term,
+            });
+            if let Some(routing) = &doc.routing {
+                delete["routing"] = serde_json::Value::String(routing.clone());
+            }
+            let action = serde_json::json!({ "delete": delete });
+            ndjson.push_str(&serde_json::to_string(&action).context(JsonSerializeSnafu)?);
+            ndjson.push('\n');
+        }
+        // Safe to retry: a delete that already applied reports `404` on the retry, and one
+        // whose document was rewritten in between reports `409`; neither removes anything new.
+        self.post_bulk("bulk_delete_if_unchanged", ndjson).await
     }
 
     /// Delete every document matching `query` via `POST /<index>/_delete_by_query`.
@@ -754,6 +888,8 @@ pub trait Elasticsearch: std::fmt::Debug + Send + Sync {
         index: &str,
         query: &serde_json::Value,
     ) -> Result<serde_json::Value>;
+    async fn bulk_delete_if_unchanged(&self, docs: &[DocumentVersion])
+    -> Result<serde_json::Value>;
 }
 
 #[async_trait::async_trait]
@@ -845,6 +981,13 @@ impl Elasticsearch for Client {
         query: &serde_json::Value,
     ) -> Result<serde_json::Value> {
         Client::delete_by_query(self, index, query).await
+    }
+
+    async fn bulk_delete_if_unchanged(
+        &self,
+        docs: &[DocumentVersion],
+    ) -> Result<serde_json::Value> {
+        Client::bulk_delete_if_unchanged(self, docs).await
     }
 }
 

@@ -65,6 +65,7 @@ limitations under the License.
 //! documented at length on those methods; between them, a scan in the gap sees
 //! either the complete pre-overwrite table or the complete post-overwrite one.
 
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use datafusion::execution::SendableRecordBatchStream;
@@ -73,11 +74,16 @@ use tokio::sync::{OwnedMutexGuard, OwnedSemaphorePermit};
 
 use super::Result;
 use super::column_stats::ColumnStatsAccumulator;
+use super::delta_encoding::{ShardRouting, WriteClass, WritePolicy};
 use super::mutation_writer::InlineBatchBuffer;
-use super::table::{CayenneTableProvider, InlinedOverwritePublish, serialize_batches_to_ipc};
+use super::overwrite_postpass::CopyOrder;
+use super::table::{
+    CayenneTableProvider, EncodeFanOut, InlinedOverwritePublish, OverwriteRangePlan,
+    OverwriteRouting, RangePartitioning, serialize_batches_to_ipc,
+};
 use crate::CayenneCatalog;
 use crate::catalog::CatalogResult;
-use crate::metadata::InlinedData;
+use crate::metadata::{DeleteFile, InlinedData};
 use crate::metastore::MetastoreTransaction;
 
 /// A prepared overwrite: data has been written to a new snapshot directory
@@ -90,6 +96,9 @@ use crate::metastore::MetastoreTransaction;
 pub struct PreparedOverwrite {
     table: CayenneTableProvider,
     write_guard: Option<OwnedMutexGuard<()>>,
+    /// The table's `mem_checkpoint_lock`, held from `begin_overwrite` until the
+    /// overwrite is finished or rolled back; see `begin_overwrite`.
+    checkpoint_guard: Option<OwnedMutexGuard<()>>,
     new_snapshot_id: String,
     row_count: u64,
     write_stats_acc: Arc<ColumnStatsAccumulator>,
@@ -102,6 +111,12 @@ pub struct PreparedOverwrite {
     /// buffered until it is committed and published — the whole span over which
     /// the buffered batches and the serialized blob are resident.
     _inline_admission: Option<OwnedSemaphorePermit>,
+    /// Position deletion vectors hiding the copies of keys the incoming data
+    /// repeated across record batches, on a table that deletes by position; see
+    /// [`super::overwrite_postpass`].
+    delete_files: Vec<DeleteFile>,
+    /// The file-local positions `delete_files` hide, per data file.
+    position_deletions: HashMap<String, Vec<u32>>,
 }
 
 impl std::fmt::Debug for PreparedOverwrite {
@@ -112,6 +127,7 @@ impl std::fmt::Debug for PreparedOverwrite {
             .field("row_count", &self.row_count)
             .field("has_write_guard", &self.write_guard.is_some())
             .field("inlined", &self.inlined.is_some())
+            .field("position_deleted_files", &self.position_deletions.len())
             .finish_non_exhaustive()
     }
 }
@@ -177,6 +193,7 @@ impl PreparedOverwrite {
                 self.table_id(),
                 &self.new_snapshot_id,
                 self.inlined.as_ref(),
+                &self.delete_files,
             )
             .await
     }
@@ -201,6 +218,7 @@ impl PreparedOverwrite {
                 self.table_id(),
                 &self.new_snapshot_id,
                 self.inlined.as_ref(),
+                &self.delete_files,
             )
             .await
     }
@@ -229,10 +247,50 @@ impl PreparedOverwrite {
     /// will reconstruct the same in-memory state from the catalog (which
     /// already reflects the new snapshot), so durability is preserved.
     ///
+    /// The steps start when `finish` is called and run on their own task, so
+    /// they complete even if the caller stops waiting. The catalog already points
+    /// at the new snapshot: a caller cancelled part-way through would leave the
+    /// in-memory tier's replaced rows readable over it, where the next
+    /// checkpoint makes them durable, and a retention pass the new rows are owed
+    /// unscheduled.
+    ///
     /// # Errors
     ///
     /// Returns an error if swapping the listing table fails. Other steps are best-effort.
-    pub async fn finish(self) -> Result<u64> {
+    pub fn finish(self) -> impl Future<Output = Result<u64>> + Send + 'static {
+        let table = self.table.table_name().to_string();
+        let publish = tokio::spawn(self.publish());
+        async move {
+            publish
+                .await
+                .map_err(|source| super::Error::TaskPanicked { table, source })?
+        }
+    }
+
+    /// Publish every overwrite of one committed multi-table transaction, such as
+    /// a partitioned table's overwrite, and return each one's result with its
+    /// table id, in input order.
+    ///
+    /// Every publish starts before any is awaited. A publish can wait on its
+    /// table's listing fence, on the catalog, or on the source commits its
+    /// discarded in-memory rows release, while the transaction has already
+    /// committed every table: awaited one at a time, each table after a waiting
+    /// one would keep serving the rows the transaction replaced until it
+    /// finished.
+    pub async fn finish_all(prepared: Vec<Self>) -> Vec<(String, Result<u64>)> {
+        let publishes: Vec<_> = prepared
+            .into_iter()
+            .map(|prep| (prep.table_id().to_string(), prep.finish()))
+            .collect();
+        let mut results = Vec::with_capacity(publishes.len());
+        for (table_id, publish) in publishes {
+            results.push((table_id, publish.await));
+        }
+        results
+    }
+
+    /// The steps of [`Self::finish`], run on their own task.
+    async fn publish(self) -> Result<u64> {
         // Publish the new snapshot as a single atomic visibility flip under the listing
         // fence (snapshot id + deletion caches + inline cache + listing swap), so a
         // concurrent scan never observes a torn state. Full rationale on
@@ -242,7 +300,8 @@ impl PreparedOverwrite {
         // catalog clear and insert already committed together, so the in-memory
         // inline counters must go from "old corpus" to "these rows" without a
         // window in which the new snapshot is paired with an empty inline view.
-        self.table
+        let discarded_epoch = self
+            .table
             .publish_overwrite_snapshot(
                 &self.new_snapshot_id,
                 self.inlined
@@ -251,8 +310,45 @@ impl PreparedOverwrite {
                         row_count: inlined.record_count,
                         sequence_number: inlined.sequence_number,
                     }),
+                &self.position_deletions,
             )
             .await?;
+
+        // Arm retention the moment the flip commits, the same way an append does (see
+        // `AppendMutationWriter::write_prepared_stream`). An overwrite reloads every
+        // source row, so a `retention_sql` predicate has to run again over the new
+        // snapshot — otherwise the rows it deletes come straight back on each full
+        // refresh and the acceleration keeps data the user asked to be deleted.
+        // `retention_period` is untouched by this: it is a scan-time keep filter, so a
+        // reloaded expired row is hidden from every read without anything deleting it,
+        // and the gate below (`has_retention_delete_filters`) matches that split.
+        //
+        // Scheduled HERE and not at the end: every step below this awaits, and the task
+        // running them still ends with its runtime, so a request armed later could be lost
+        // after the new rows were already visible, leaving the matching ones queryable
+        // until some later refresh happened to arm a pass. Only the flip has to have
+        // succeeded for the request to be owed. Arming is a synchronous flag plus a debounced task, and that task
+        // takes `write_lock` itself, so it simply waits out the guard still held here.
+        if self.table.has_retention_delete_filters() {
+            // Arming only: the flip re-baselines `num_rows` itself, so this call carries
+            // no live-row delta and the claim it must supply is released rather than
+            // queued. Reserving one anyway is how a caller with nothing to persist
+            // satisfies the gate that stops a real delta being claimed after its publish.
+            self.table.schedule_post_write_maintenance(
+                None,
+                false,
+                true,
+                0,
+                self.table.reserve_live_rows_delta().published(),
+            );
+        }
+
+        // The flip discarded the in-memory tier; release the source commits that
+        // were waiting on its rows, as `TRUNCATE` does. After retention is armed,
+        // because this awaits.
+        if let Some(epoch) = discarded_epoch {
+            self.table.fire_slot_advancer(epoch).await;
+        }
 
         // Drain the metastore WAL on the debounced maintenance tick. An inlined
         // overwrite's whole payload is an Arrow IPC BLOB written straight into
@@ -285,21 +381,32 @@ impl PreparedOverwrite {
             );
         }
 
-        self.table
-            .trigger_old_snapshot_cleanup(&self.new_snapshot_id)
-            .await;
+        self.table.schedule_old_snapshot_cleanup();
 
         // Invalidate the in-memory optimizer cache so a zero-row overwrite
         // leaves the cache empty rather than stale; `persist_table_stats`
         // repopulates it when the accumulator has rows. The catalog row was
         // already cleared atomically with the snapshot pointer flip.
+        // The accumulator counts every written row, including those the position
+        // deletes hide.
+        let hidden: u64 = self
+            .position_deletions
+            .values()
+            .map(|rows| rows.len() as u64)
+            .sum();
+        let live_rows = (hidden > 0).then(|| {
+            u64::try_from(self.write_stats_acc.row_count())
+                .unwrap_or(0)
+                .saturating_sub(hidden)
+        });
         self.table
-            .reset_table_stats_after_overwrite(&self.write_stats_acc)
+            .reset_table_stats_after_overwrite(&self.write_stats_acc, live_rows)
             .await;
 
-        // Drop the write guard last so all visibility-related updates happen
-        // under exclusive table access.
+        // All visibility-related updates above happen under exclusive table access; the
+        // retention pass takes this same lock, so it can only proceed once this drops.
         let _ = self.write_guard;
+
         Ok(self.row_count)
     }
 
@@ -319,26 +426,18 @@ impl PreparedOverwrite {
         // writer can't acquire the lock and start a new commit while the
         // staged snapshot directory is mid-deletion.
         let _write_guard = self.write_guard;
+        let _checkpoint_guard = self.checkpoint_guard;
 
         // Best-effort cleanup of the new snapshot directory. Object stores
         // (S3) don't have a single "remove dir" call; we leave object-store
         // cleanup to `trigger_old_snapshot_cleanup` on a subsequent
         // successful overwrite, which prunes any snapshot dir not referenced
         // by the catalog.
-        let table_path = self.table.table_path();
-        if !table_path.starts_with("s3://") {
-            let new_snapshot_dir = self.table.snapshot_dir_path_for(&self.new_snapshot_id);
-            match tokio::fs::remove_dir_all(&new_snapshot_dir).await {
-                Ok(()) => {}
-                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-                Err(e) => {
-                    tracing::warn!(
-                        "Failed to clean up new snapshot dir {} after overwrite rollback for table {}: {e}",
-                        new_snapshot_dir.display(),
-                        self.table.table_name()
-                    );
-                }
-            }
+        self.table
+            .remove_unpublished_snapshot_dir(&self.new_snapshot_id)
+            .await;
+        if !self.table.table_path().starts_with("s3://") {
+            remove_deletion_vectors(&self.delete_files).await;
         }
         Ok(())
     }
@@ -408,6 +507,14 @@ impl CayenneTableProvider {
             ));
         }
 
+        let collapsed = self.collapse_buffered_write(buffer.batches().to_vec())?;
+        let mut resolved =
+            InlineBatchBuffer::new(stream.schema(), inline_max_rows, inline_max_buffer_bytes);
+        for batch in collapsed {
+            resolved.push(batch);
+        }
+        buffer = resolved;
+
         // A zero-row overwrite takes the normal path: it writes no files anyway,
         // and the commit's clear alone is the correct end state (an empty table).
         // An inline entry with no rows would just be a row to read back and drop.
@@ -431,10 +538,15 @@ impl CayenneTableProvider {
         // stats do not depend on which path a refresh took. NDV is included:
         // unlike a CDC delta, this batch IS the whole table, so its distinct
         // counts are exact and there is no later checkpoint to fold them in.
-        let stats = Arc::new(ColumnStatsAccumulator::new_with_ndv(
-            buffer.schema().as_ref(),
-            true,
-        ));
+        let stats = Arc::new(
+            ColumnStatsAccumulator::new_with_ndv(buffer.schema().as_ref(), true).map_err(|e| {
+                super::Error::Vortex {
+                    operation: "derive the column statistics types from the table schema",
+                    table: self.table_name().to_string(),
+                    source: Box::new(e),
+                }
+            })?,
+        );
         for batch in buffer.batches() {
             stats.update(batch);
         }
@@ -495,7 +607,21 @@ impl CayenneTableProvider {
         data: SendableRecordBatchStream,
         target_partitions: usize,
     ) -> Result<PreparedOverwrite> {
+        // Read the split points off the table being replaced before taking the
+        // write lock, so the sampling scan never holds it. A replace that lands
+        // in the inline tier below ignores the plan.
+        let routing = self.overwrite_range_plan(target_partitions).await;
+
         let write_guard = self.write_lock_arc().lock_owned().await;
+        // Also hold `mem_checkpoint_lock` until the overwrite is published or
+        // rolled back. A checkpoint or seal of the in-memory CDC tier takes only
+        // this lock at one shard, and the rows it would make durable are rows this
+        // overwrite replaces: one committing after the overwrite's catalog
+        // transaction would record them again, where a restart finds them. Waiting
+        // here also lets a checkpoint already in flight finish first, so its
+        // snapshot is one the overwrite's commit supersedes. `write_lock` →
+        // `mem_checkpoint_lock` is the order every other holder of both takes.
+        let checkpoint_guard = self.mem_checkpoint_lock_for_writer().lock_owned().await;
 
         let new_snapshot_id = uuid::Uuid::now_v7().to_string();
         let is_s3 = self.table_path().starts_with("s3://");
@@ -522,11 +648,14 @@ impl CayenneTableProvider {
                 return Ok(PreparedOverwrite {
                     table: self.clone_for_write(),
                     write_guard: Some(write_guard),
+                    checkpoint_guard: Some(checkpoint_guard),
                     new_snapshot_id,
                     row_count: inlined.row_count,
                     write_stats_acc: inlined.stats,
                     inlined: Some(inlined.data),
                     _inline_admission: Some(inlined.admission),
+                    delete_files: Vec::new(),
+                    position_deletions: HashMap::new(),
                 });
             }
             OverwriteAdmission::Fallback(stream) => stream,
@@ -538,27 +667,168 @@ impl CayenneTableProvider {
         // `warm_inlined_cache_for_overwrite`.
         self.warm_inlined_cache_for_overwrite().await;
 
+        // Resolve the keys the incoming data repeats after writing it
+        // (`overwrite_postpass`): each batch resolves its own repeats and stamps
+        // its rows with its arrival sequence, and once the files are written a
+        // query finds every copy of a key but its last.
+        // A writer that supplies row times (a refresh with a `time_column`) orders
+        // the copies by time, then arrival.
+        let mut postpass: Option<(CopyOrder, Vec<String>)> = None;
+        let mut dedup_share: Option<super::overwrite_postpass::DedupShare> = None;
+        let data: SendableRecordBatchStream = match self.key_resolver()? {
+            None => data,
+            Some(resolver) => {
+                let indices = self.primary_key_indices()?.unwrap_or_default();
+                let order = match &self.row_versions {
+                    Some(_) => CopyOrder::Version,
+                    None => CopyOrder::Arrival,
+                };
+                dedup_share = Some(super::overwrite_postpass::DedupShare::claim());
+                postpass = Some((
+                    order,
+                    super::overwrite_postpass::key_column_names(&self.table_schema(), &indices),
+                ));
+                let table_schema = self.table_schema();
+                let arrival = super::overwrite_postpass::ArrivalStream::new(
+                    data,
+                    resolver,
+                    &super::overwrite_postpass::arrival_column(&table_schema),
+                );
+                match &self.row_versions {
+                    Some(versions) => Box::pin(arrival.with_versions(
+                        Arc::clone(versions),
+                        &super::overwrite_postpass::version_column(&table_schema),
+                    )),
+                    None => Box::pin(arrival),
+                }
+            }
+        };
+
+        // Order the replacement before it is written, when the table asks for
+        // one. This is the only write a full-refresh table makes, and it is the
+        // only chance to establish that order — see `sort_overwrite_input`.
+        let (data, target_partitions, write_policy) =
+            self.sort_overwrite_input(data, target_partitions)?;
+
+        // A first load has no rows of its own to cut split points from; it may
+        // take them from the head of its input instead (`input_range_plan`).
+        let (data, range_plan) = match routing {
+            OverwriteRouting::Range(plan) => (data, Some(plan)),
+            OverwriteRouting::NothingToSample => {
+                self.input_range_plan(data, target_partitions).await?
+            }
+            OverwriteRouting::Hash => (data, None),
+        };
+
         let target_size_bytes = self.target_file_size_bytes();
+        // A key-deletion table rewrites files containing superseded copies.
+        // Per-file statistics preserve exact counts for the surviving files.
+        let file_stats = (postpass.is_some() && !self.hides_repeated_keys_with_position_deletes())
+            .then(|| {
+                FileStatsObserver::new(self.table_name(), &self.table_schema(), None).map(Arc::new)
+            })
+            .transpose()?;
         // Overwrite replaces the entire table, and anything that reached here did
         // not fit the inline caps, so it is large by definition; shard across the
         // full write concurrency (no size cap on the fan-out). Deliberately NOT
         // sized from the bytes the probe buffered: that is only a lower bound, and
         // under-sharding a multi-GB refresh to one writer would serialize the encode.
-        let (row_count, _files_written, write_stats_acc) = self
-            .write_to_snapshot(
-                data,
-                target_size_bytes,
-                &new_snapshot_id,
-                target_partitions,
-                None,
-                crate::provider::delta_encoding::WritePolicy::MAINTENANCE,
-            )
-            .await?;
-
-        if !is_s3 {
-            let snapshot_dir = self.snapshot_dir_path_for(&new_snapshot_id);
-            Self::sync_snapshot_dir(&snapshot_dir).await?;
+        //
+        // The shards cover the key ranges `overwrite_range_plan` (or, for a first
+        // load, `input_range_plan`) chose, when it found a key to split; both
+        // decline for the sorted and clustered replaces above, which keep their
+        // single serial writer. Without split points the shards hash the key and
+        // each still sorts its rows by it, so an equality on the key reads about
+        // one zone of every file instead of all of them.
+        let write_schema = match &postpass {
+            Some((order, _)) => {
+                let table_schema = self.table_schema();
+                let arrival = super::overwrite_postpass::arrival_column(&table_schema);
+                if matches!(order, CopyOrder::Version) {
+                    super::overwrite_postpass::with_versions(
+                        &table_schema,
+                        &arrival,
+                        &super::overwrite_postpass::version_column(&table_schema),
+                    )
+                } else {
+                    super::overwrite_postpass::with_arrival(&table_schema, &arrival)
+                }
+            }
+            None => self.table_schema(),
+        };
+        let written: Result<_> = async {
+            let written = self
+                .write_to_snapshot_with_schema(
+                    data,
+                    target_size_bytes,
+                    &new_snapshot_id,
+                    target_partitions,
+                    None,
+                    write_policy,
+                    Some(range_plan.as_ref().map_or_else(
+                        RangePartitioning::hashed_run_sorted,
+                        OverwriteRangePlan::partitioning,
+                    )),
+                    file_stats.as_ref().map(|stats| Arc::clone(stats) as _),
+                    write_schema,
+                )
+                .await?;
+            self.sync_local_snapshot_dir(&new_snapshot_id)
+                .await
+                .map_err(|source| super::Error::Catalog { source })?;
+            Ok(written)
         }
+        .await;
+        let (row_count, _files_written, write_stats_acc) = written?;
+
+        // Hide the copies the refresh repeated before the manifest below, which
+        // must list the final files: a table that deletes by position hides them
+        // with position deletes, one that deletes by key rewrites the files that
+        // hold them without them and so publishes no deletes at all.
+        let (position_deletions, write_stats_acc) = match postpass.take() {
+            None => (HashMap::new(), write_stats_acc),
+            Some((order, key_columns)) => {
+                let resolved: Result<_> = async {
+                    let superseded = self
+                        .find_superseded_by_arrival(
+                            &new_snapshot_id,
+                            order,
+                            &key_columns,
+                            row_count,
+                        )
+                        .await?;
+                    match file_stats.as_deref() {
+                        Some(file_stats) if !superseded.is_empty() => {
+                            let stats = self
+                                .fold_superseded_copies(
+                                    &new_snapshot_id,
+                                    &superseded,
+                                    WriteShape {
+                                        target_size_bytes,
+                                        target_partitions,
+                                        write_policy,
+                                    },
+                                    file_stats,
+                                    &write_stats_acc,
+                                )
+                                .await?;
+                            Ok((HashMap::new(), stats))
+                        }
+                        _ => Ok((superseded, Arc::clone(&write_stats_acc))),
+                    }
+                }
+                .await;
+                match resolved {
+                    Ok(resolved) => resolved,
+                    Err(error) => {
+                        self.abandon_overwrite_snapshot(&new_snapshot_id).await;
+                        return Err(error);
+                    }
+                }
+            }
+        };
+        // The copies are resolved: free this write's share of the duplicate query.
+        drop(dedup_share);
 
         // Manifest snapshot model: reserve ONE sequence `S` for this overwrite
         // and AUTHOR the new snapshot's manifest with `[S, S]` — every file was
@@ -602,16 +872,325 @@ impl CayenneTableProvider {
             }
         }
 
+        // The position deletes, at a sequence above the main snapshot's `S`, like
+        // every delete a later write records against it.
+        let delete_files = if position_deletions.is_empty() {
+            Vec::new()
+        } else {
+            match self
+                .write_position_deletion_vectors(&new_snapshot_id, &position_deletions)
+                .await
+            {
+                Ok(files) => files,
+                Err(error) => {
+                    self.abandon_overwrite_snapshot(&new_snapshot_id).await;
+                    return Err(error);
+                }
+            }
+        };
+
         Ok(PreparedOverwrite {
             table: self.clone_for_write(),
             write_guard: Some(write_guard),
+            checkpoint_guard: Some(checkpoint_guard),
             new_snapshot_id,
             row_count,
             write_stats_acc,
             inlined: None,
             _inline_admission: None,
+            delete_files,
+            position_deletions,
         })
     }
+
+    /// Write position deletion vectors for `position_deletions`, at a fresh
+    /// sequence, into `snapshot_id`, the snapshot the overwrite commits them with:
+    /// the snapshot it replaces is retired, and an overwrite that fails removes
+    /// only its own directory.
+    async fn write_position_deletion_vectors(
+        &self,
+        snapshot_id: &str,
+        position_deletions: &HashMap<String, Vec<u32>>,
+    ) -> Result<Vec<crate::metadata::DeleteFile>> {
+        let sequence = self.reserve_sequences_local(1).await?;
+        let mut metadata = self.metadata().clone();
+        metadata.current_sequence_number = sequence;
+        metadata.current_snapshot_id = snapshot_id.to_string();
+        let specs = position_deletions
+            .iter()
+            .map(|(file, rows)| {
+                super::delete::DeletionVectorWriteSpec::new_position_based_sorted(
+                    file.clone(),
+                    rows.iter().map(|&row| u64::from(row)).collect(),
+                )
+            })
+            .collect();
+        Ok(super::delete::DeletionVectorWriter::new(&metadata)
+            .write(specs)
+            .await?
+            .into_iter()
+            .map(|written| written.delete_file)
+            .collect())
+    }
+
+    /// Remove an unpublished snapshot's local directory, best-effort: a
+    /// directory left behind is pruned by the next snapshot cleanup, and object
+    /// stores are left to it entirely.
+    async fn remove_unpublished_snapshot_dir(&self, snapshot_id: &str) {
+        if self.table_path().starts_with("s3://") {
+            return;
+        }
+        let snapshot_dir = self.snapshot_dir_path_for(snapshot_id);
+        match tokio::fs::remove_dir_all(&snapshot_dir).await {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => {
+                tracing::warn!(
+                    "Failed to clean up unpublished snapshot dir {} for table {}: {e}",
+                    snapshot_dir.display(),
+                    self.table_name()
+                );
+            }
+        }
+    }
+
+    /// Drop an overwrite's unpublished snapshot after a failure before it is
+    /// prepared, which never reaches `rollback`.
+    async fn abandon_overwrite_snapshot(&self, snapshot_id: &str) {
+        self.remove_unpublished_snapshot_dir(snapshot_id).await;
+    }
+
+    /// Rewrite the files of an unpublished snapshot that hold the superseded
+    /// copies at `superseded`, each without them, and return the statistics of
+    /// the snapshot that results: the files left as written, plus the rewritten
+    /// ones.
+    ///
+    /// `written` describes every row written to the snapshot; a rewrite that
+    /// leaves anything but those rows less the superseded copies is an error.
+    pub(crate) async fn fold_superseded_copies(
+        &self,
+        snapshot_id: &str,
+        superseded: &HashMap<String, Vec<u32>>,
+        write: WriteShape,
+        file_stats: &FileStatsObserver,
+        written: &ColumnStatsAccumulator,
+    ) -> Result<Arc<ColumnStatsAccumulator>> {
+        let rewritten_names: std::collections::HashSet<String> = superseded
+            .keys()
+            .filter_map(|location| {
+                object_store::path::Path::from(location.as_str())
+                    .filename()
+                    .map(str::to_string)
+            })
+            .collect();
+        // Each file folds on its own, through one writer, so no two source
+        // files' rows are merged. The writer still rolls to a new file at the
+        // target size, so one source file may fold into several, and its rows
+        // need not keep their order: the scan may split a large file into
+        // ranges. Merging every file's
+        // survivors into one stream would feed the rewrite from a single task,
+        // however many encoders it had. Each write holds one encode permit. A
+        // maintenance fold (a load into an empty table) runs as many files at
+        // once as maintenance may hold, and the maintenance gate bounds that
+        // across every table. A delta fold takes its permits outside that
+        // gate, so it runs no more files at once than the table's own writes
+        // have shards, the permits one sharded write of the survivors would
+        // hold. A coupled writer (a partition child) takes no permits and
+        // keeps to one encode stream, so it folds one file at a time: its
+        // siblings fold alongside.
+        let policy = WritePolicy {
+            class: write.write_policy.class,
+            fan_out: EncodeFanOut::PerCaller,
+            encode_budget: write.write_policy.encode_budget,
+            routing: ShardRouting::Key,
+        };
+        let in_flight = if self.context().is_coupled_writer() {
+            1
+        } else if write.write_policy.class == WriteClass::Maintenance {
+            super::write_budget::encode_budget_snapshot()
+                .and_then(|budget| usize::try_from(budget.total).ok())
+                .map_or(
+                    write.target_partitions,
+                    super::write_budget::maintenance_gate_cap,
+                )
+                .max(1)
+        } else {
+            self.snapshot_write_concurrency(write.target_partitions)
+        };
+        let folds: Vec<FileFold<'_>> = superseded
+            .iter()
+            .map(|(location, positions)| {
+                let file = HashMap::from([(location.clone(), positions.clone())]);
+                let fold: FileFold<'_> = Box::pin(async move {
+                    let survivors = self
+                        .scan_snapshot_files_excluding(snapshot_id, &file)
+                        .await?;
+                    let (rows, _files, stats) = self
+                        .write_to_snapshot_range_partitioned(
+                            survivors,
+                            write.target_size_bytes,
+                            snapshot_id,
+                            1,
+                            None,
+                            policy,
+                            None,
+                        )
+                        .await?;
+                    Ok((rows, stats))
+                });
+                fold
+            })
+            .collect();
+        // Every fold runs to its end before the first error is returned: a
+        // fold dropped mid-write could leave its writer finishing files in the
+        // snapshot while the caller's error path removes it.
+        let outcomes: Vec<Result<(u64, Arc<ColumnStatsAccumulator>)>> =
+            futures::stream::iter(folds)
+                .buffer_unordered(in_flight)
+                .collect()
+                .await;
+        let rewritten = outcomes.into_iter().collect::<Result<Vec<_>>>()?;
+        let rewritten_rows: u64 = rewritten.iter().map(|(rows, _)| rows).sum();
+        self.remove_snapshot_files(
+            snapshot_id,
+            superseded
+                .keys()
+                .map(|location| object_store::path::Path::from(location.as_str()))
+                .collect(),
+        )
+        .await?;
+        self.sync_local_snapshot_dir(snapshot_id)
+            .await
+            .map_err(|source| super::Error::Catalog { source })?;
+
+        let folded = file_stats.empty.empty_like();
+        let mut superseded_file_rows: u64 = 0;
+        for (name, stats) in file_stats.take() {
+            if rewritten_names.contains(&name) {
+                superseded_file_rows = superseded_file_rows
+                    .saturating_add(u64::try_from(stats.row_count()).unwrap_or(0));
+            } else {
+                folded.merge_from(&stats);
+            }
+        }
+        for (_, stats) in &rewritten {
+            folded.merge_from(stats);
+        }
+        // Distinct counts are estimates whichever rows they cover, and the copies
+        // the fold dropped share their keys with copies it kept.
+        folded.merge_ndv_from(written);
+        let dropped: u64 = superseded.values().map(|rows| rows.len() as u64).sum();
+        let live_rows = u64::try_from(written.row_count())
+            .unwrap_or(0)
+            .saturating_sub(dropped);
+        let folded_rows = u64::try_from(folded.row_count()).unwrap_or(0);
+        if rewritten_rows != superseded_file_rows.saturating_sub(dropped)
+            || folded_rows != live_rows
+        {
+            return Err(super::Error::Internal {
+                table: self.table_name().to_string(),
+                message: format!(
+                    "folding the copies a write superseded left {folded_rows} rows where \
+                     {live_rows} were expected (rewrote {rewritten_rows} of {superseded_file_rows} \
+                     rows, dropping {dropped})"
+                ),
+            });
+        }
+        Ok(Arc::new(folded))
+    }
+}
+
+/// One file's fold in `fold_superseded_copies`: the rows it wrote and their
+/// statistics.
+type FileFold<'f> = std::pin::Pin<
+    Box<dyn std::future::Future<Output = Result<(u64, Arc<ColumnStatsAccumulator>)>> + Send + 'f>,
+>;
+
+/// How a write that rewrites files of an unpublished snapshot shapes them.
+#[derive(Clone, Copy)]
+pub(crate) struct WriteShape {
+    pub(crate) target_size_bytes: usize,
+    pub(crate) target_partitions: usize,
+    pub(crate) write_policy: super::delta_encoding::WritePolicy,
+}
+
+/// Records the statistics of each file a write produces, by file name, and
+/// forwards every batch to `inner`.
+#[derive(Debug)]
+pub(crate) struct FileStatsObserver {
+    /// An empty accumulator for the table schema, copied for each new file.
+    empty: ColumnStatsAccumulator,
+    inner: Option<Arc<dyn vortex_datafusion::VortexWriteObserver>>,
+    files: parking_lot::Mutex<HashMap<String, Arc<ColumnStatsAccumulator>>>,
+}
+
+impl FileStatsObserver {
+    /// # Errors
+    ///
+    /// Returns an error for a column whose Arrow type Vortex cannot represent.
+    pub(crate) fn new(
+        table: &str,
+        schema: &arrow_schema::Schema,
+        inner: Option<Arc<dyn vortex_datafusion::VortexWriteObserver>>,
+    ) -> Result<Self> {
+        let empty = ColumnStatsAccumulator::new_with_ndv(schema, false).map_err(|e| {
+            super::Error::Vortex {
+                operation: "derive the column statistics types from the table schema",
+                table: table.to_string(),
+                source: Box::new(e),
+            }
+        })?;
+        Ok(Self {
+            empty,
+            inner,
+            files: parking_lot::Mutex::new(HashMap::new()),
+        })
+    }
+
+    /// Each file's statistics, by file name.
+    fn take(&self) -> HashMap<String, Arc<ColumnStatsAccumulator>> {
+        std::mem::take(&mut *self.files.lock())
+    }
+}
+
+impl vortex_datafusion::VortexWriteObserver for FileStatsObserver {
+    fn batch_written(
+        &self,
+        file_path: &object_store::path::Path,
+        first_row_position: u64,
+        batch: &arrow::array::RecordBatch,
+    ) {
+        if let Some(name) = file_path.filename() {
+            // Each writer appends to its own file, so the map is held only to find
+            // the file's accumulator, not while the batch is measured.
+            let stats = {
+                let mut files = self.files.lock();
+                if let Some(stats) = files.get(name) {
+                    Arc::clone(stats)
+                } else {
+                    let stats = Arc::new(self.empty.empty_like());
+                    files.insert(name.to_string(), Arc::clone(&stats));
+                    stats
+                }
+            };
+            stats.update(batch);
+        }
+        if let Some(inner) = &self.inner {
+            inner.batch_written(file_path, first_row_position, batch);
+        }
+    }
+}
+
+/// Best-effort removal of deletion-vector files that were never committed; a
+/// file left behind is swept as an orphan.
+async fn remove_deletion_vectors<'a>(
+    files: impl IntoIterator<Item = &'a crate::metadata::DeleteFile>,
+) {
+    let paths: Vec<std::path::PathBuf> = files
+        .into_iter()
+        .map(|file| std::path::PathBuf::from(&file.path))
+        .collect();
+    super::delete::cleanup_uncommitted_delete_paths(&paths).await;
 }
 
 #[cfg(test)]
@@ -712,6 +1291,120 @@ mod tests {
             tables.push(provider);
         }
         (temp_dir, catalog, tables)
+    }
+
+    /// A table whose `sort_columns` an operator configured explicitly.
+    async fn setup_sorted(sort_columns: Vec<String>) -> (TempDir, CayenneTableProvider) {
+        let temp_dir = TempDir::new().expect("tempdir");
+        let data_dir = temp_dir.path().join("data");
+        std::fs::create_dir_all(&data_dir).expect("data dir");
+        let connection_string = format!(
+            "sqlite://{}",
+            temp_dir.path().join("cayenne.db").to_string_lossy()
+        );
+        let catalog = Arc::new(CayenneCatalog::new(connection_string).expect("catalog"));
+        catalog.init().await.expect("catalog init");
+        let ctx = SessionContext::new();
+        let provider = CayenneTableProviderBuilder::new(
+            Arc::clone(&catalog) as Arc<dyn MetadataCatalog>,
+            ctx.runtime_env(),
+        )
+        .create(CreateTableOptions {
+            table_name: "sorted_overwrite".to_string(),
+            schema: test_schema(),
+            primary_key: vec![],
+            on_conflict: None,
+            base_path: data_dir.to_string_lossy().to_string(),
+            partition_column: None,
+            vortex_config: VortexConfig {
+                sort_columns,
+                ..VortexConfig::default()
+            },
+        })
+        .await
+        .expect("create table");
+        (temp_dir, provider)
+    }
+
+    /// A sorted whole-table replace must emit ONE sequence of files.
+    ///
+    /// Ordering the stream is not enough by itself: the encode fan-out is
+    /// decided by the write policy, not by the shard count the caller passes.
+    /// Under a `Sized` policy the sorted stream is re-sharded round-robin and
+    /// every output file ends up spanning the whole key range — the layout the
+    /// sort exists to avoid, and one a scan cannot prune.
+    #[tokio::test]
+    async fn sorted_overwrite_writes_one_sequence_of_files() {
+        let (_dir, provider) = setup_sorted(vec!["id".to_string()]).await;
+        let (_stream, shards, policy) = provider
+            .sort_overwrite_input(id_stream(&[3, 1, 2]), 8)
+            .expect("sorted overwrite input");
+        assert_eq!(shards, 1, "a sorted replace must not fan its encode out");
+        assert_eq!(
+            policy.fan_out,
+            crate::provider::table::EncodeFanOut::Serial,
+            "the policy is what the writer honours, not the shard count"
+        );
+    }
+
+    /// A sorted replace arrives as one stream and is dealt over the session's
+    /// partitions to sort in parallel, then merged. Draining what it returns
+    /// must give every input row exactly once, in one ascending order, however
+    /// many batches the source sends.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn sorted_overwrite_input_returns_every_row_in_one_order() {
+        use futures::TryStreamExt;
+        let (_dir, provider) = setup_sorted(vec!["id".to_string()]).await;
+        // 60 batches of scrambled ids: more batches than partitions, so every
+        // partition gets several and the merge sees them all.
+        let n = 60_000_i64;
+        let ids: Vec<i64> = (0..n).map(|i| (i * 7_919) % n).collect();
+        let batches: Vec<Result<RecordBatch, DataFusionError>> = ids
+            .chunks(1_000)
+            .map(|chunk| {
+                Ok(RecordBatch::try_new(
+                    test_schema(),
+                    vec![Arc::new(Int64Array::from(chunk.to_vec()))],
+                )
+                .expect("batch"))
+            })
+            .collect();
+        let input: SendableRecordBatchStream = Box::pin(RecordBatchStreamAdapter::new(
+            test_schema(),
+            futures::stream::iter(batches),
+        ));
+        let (stream, _shards, _policy) = provider
+            .sort_overwrite_input(input, 8)
+            .expect("sorted overwrite input");
+        let out: Vec<RecordBatch> = stream.try_collect().await.expect("drain");
+        let got: Vec<i64> = out
+            .iter()
+            .flat_map(|b| {
+                b.column(0)
+                    .as_any()
+                    .downcast_ref::<Int64Array>()
+                    .expect("int64 ids")
+                    .values()
+                    .to_vec()
+            })
+            .collect();
+        assert!(
+            got == (0..n).collect::<Vec<_>>(),
+            "a sorted replace must return every id once, ascending"
+        );
+    }
+
+    /// An unsorted replace keeps the fan-out it was given: nothing about its
+    /// output order is load-bearing, so serializing it would only cost encode
+    /// throughput.
+    #[tokio::test]
+    async fn unsorted_overwrite_keeps_its_fan_out() {
+        let (_dir, provider) = setup_sorted(vec![]).await;
+        let (_stream, shards, policy) = provider
+            .sort_overwrite_input(id_stream(&[3, 1, 2]), 8)
+            .expect("unsorted overwrite input");
+        assert_eq!(shards, 8);
+        assert_eq!(policy.fan_out, crate::provider::table::EncodeFanOut::Sized);
     }
 
     /// Every id the table currently serves, sorted. Reads through a fresh

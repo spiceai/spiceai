@@ -26,6 +26,7 @@ use std::{
 use async_trait::async_trait;
 use datafusion::{
     arrow::datatypes::{Schema, SchemaRef},
+    catalog::Session,
     common::{
         DFSchemaRef, Statistics,
         tree_node::{Transformed, TreeNode, TreeNodeRecursion},
@@ -33,11 +34,16 @@ use datafusion::{
     config::ConfigOptions,
     datasource::DefaultTableSource,
     error::{DataFusionError, Result},
-    execution::{SendableRecordBatchStream, SessionState, TaskContext},
-    logical_expr::{Extension, LogicalPlan, UserDefinedLogicalNode, UserDefinedLogicalNodeCore},
+    execution::{SendableRecordBatchStream, TaskContext},
+    logical_expr::{
+        Extension, LogicalPlan, UserDefinedLogicalNode, UserDefinedLogicalNodeCore,
+        physical_planning_context::PhysicalPlanningContext,
+    },
     optimizer::{OptimizerConfig, OptimizerRule},
     physical_plan::{
-        DisplayAs, DisplayFormatType, Distribution, ExecutionPlan, PhysicalExpr,
+        ChildStats, DisplayAs, DisplayFormatType, Distribution, ExecutionPlan,
+        InputDistributionRequirements, PhysicalExpr, ReplaceChildrenOptions, StatisticsArgs,
+        StatisticsContext,
         execution_plan::{CardinalityEffect, InvariantLevel, check_default_invariants},
         filter_pushdown::{
             ChildPushdownResult, FilterDescription, FilterPushdownPhase, FilterPushdownPropagation,
@@ -300,7 +306,8 @@ impl ExtensionPlanner for IndexTableScanExtensionPlanner {
         node: &dyn UserDefinedLogicalNode,
         logical_inputs: &[&LogicalPlan],
         physical_inputs: &[Arc<dyn ExecutionPlan>],
-        _session_state: &SessionState,
+        _session_state: &dyn Session,
+        _planning_ctx: &PhysicalPlanningContext,
     ) -> Result<Option<Arc<dyn ExecutionPlan>>> {
         let Some(index_table_scan_node) = node.as_any().downcast_ref::<IndexTableScanNode>() else {
             return Ok(None);
@@ -347,6 +354,28 @@ impl IndexerExec {
     }
 }
 
+impl IndexerExec {
+    fn with_children(
+        self: Arc<Self>,
+        children: Vec<Arc<dyn ExecutionPlan>>,
+    ) -> Result<Arc<dyn ExecutionPlan>> {
+        if children.len() != 1 {
+            return Err(datafusion::error::DataFusionError::Internal(
+                "IndexerExec requires exactly one input".to_string(),
+            ));
+        }
+        let input = children.into_iter().next().ok_or_else(|| {
+            datafusion::error::DataFusionError::Internal(
+                "IndexerExec requires exactly one input".to_string(),
+            )
+        })?;
+        Ok(Arc::new(Self {
+            input_exec: input,
+            indexes: self.indexes.clone(),
+        }))
+    }
+}
+
 impl DisplayAs for IndexerExec {
     fn fmt_as(&self, t: DisplayFormatType, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "IndexerExec")?;
@@ -364,6 +393,15 @@ impl DisplayAs for IndexerExec {
 }
 #[deny(clippy::missing_trait_methods)]
 impl ExecutionPlan for IndexerExec {
+    /// Not serializable. Forwarding to the input would ship a plan without the
+    /// indexing this node adds, so a remote executor would silently skip it.
+    fn try_to_proto(
+        &self,
+        _ctx: &datafusion::physical_plan::proto::ExecutionPlanEncodeCtx<'_>,
+    ) -> datafusion::common::Result<Option<datafusion_proto::protobuf::PhysicalPlanNode>> {
+        Ok(None)
+    }
+
     fn with_preserve_order(&self, _preserve_order: bool) -> Option<Arc<dyn ExecutionPlan>> {
         None
     }
@@ -412,6 +450,22 @@ impl ExecutionPlan for IndexerExec {
         vec![Distribution::SinglePartition]
     }
 
+    /// See [`Self::required_input_distribution`]: the input must be a single partition.
+    fn input_distribution_requirements(&self) -> InputDistributionRequirements {
+        InputDistributionRequirements::new(vec![Distribution::SinglePartition])
+    }
+
+    fn dynamic_expressions_produced(&self) -> Vec<Arc<dyn PhysicalExpr>> {
+        Vec::new()
+    }
+
+    fn apply_expressions(
+        &self,
+        _f: &mut dyn FnMut(&Arc<dyn PhysicalExpr>) -> Result<TreeNodeRecursion>,
+    ) -> Result<TreeNodeRecursion> {
+        Ok(TreeNodeRecursion::Continue)
+    }
+
     fn maintains_input_order(&self) -> Vec<bool> {
         vec![true; self.children().len()]
     }
@@ -431,27 +485,30 @@ impl ExecutionPlan for IndexerExec {
 
     fn reset_state(self: Arc<Self>) -> Result<Arc<dyn ExecutionPlan>> {
         let children = self.children().into_iter().cloned().collect();
-        self.with_new_children(children)
+        self.with_children(children)
+    }
+
+    fn replace_children(
+        self: Arc<Self>,
+        children: Vec<Arc<dyn ExecutionPlan>>,
+        _options: ReplaceChildrenOptions,
+    ) -> Result<Arc<dyn ExecutionPlan>> {
+        // `properties()` is always read from the input, so there is nothing to keep or recompute.
+        self.with_children(children)
     }
 
     fn with_new_children(
         self: Arc<Self>,
         children: Vec<Arc<dyn ExecutionPlan>>,
-    ) -> datafusion::error::Result<Arc<dyn ExecutionPlan>> {
-        if children.len() != 1 {
-            return Err(datafusion::error::DataFusionError::Internal(
-                "IndexerExec requires exactly one input".to_string(),
-            ));
-        }
-        let input = children.into_iter().next().ok_or_else(|| {
-            datafusion::error::DataFusionError::Internal(
-                "IndexerExec requires exactly one input".to_string(),
-            )
-        })?;
-        Ok(Arc::new(Self {
-            input_exec: input,
-            indexes: self.indexes.clone(),
-        }))
+    ) -> Result<Arc<dyn ExecutionPlan>> {
+        self.with_children(children)
+    }
+
+    fn with_new_children_and_same_properties(
+        self: Arc<Self>,
+        children: Vec<Arc<dyn ExecutionPlan>>,
+    ) -> Result<Arc<dyn ExecutionPlan>> {
+        self.with_children(children)
     }
 
     // Allow optimizer to push limits through to inputs
@@ -564,8 +621,27 @@ impl ExecutionPlan for IndexerExec {
     }
 
     fn partition_statistics(&self, partition: Option<usize>) -> Result<Arc<Statistics>> {
-        self.input_exec.partition_statistics(partition)
+        StatisticsContext::new().compute(
+            self.input_exec.as_ref(),
+            &StatisticsArgs::new().with_partition(partition),
+        )
     }
+
+    fn child_stats_requests(&self, partition: Option<usize>) -> Vec<ChildStats> {
+        vec![ChildStats::At(partition)]
+    }
+
+    /// Indexing neither adds nor removes rows, so the input's statistics hold unchanged.
+    fn statistics_from_inputs(
+        &self,
+        input_stats: &[Arc<Statistics>],
+        _args: &StatisticsArgs,
+    ) -> Result<Arc<Statistics>> {
+        input_stats.first().map(Arc::clone).ok_or_else(|| {
+            DataFusionError::Internal("IndexerExec requires exactly one input".to_string())
+        })
+    }
+
     fn with_fetch(&self, limit: Option<usize>) -> Option<Arc<dyn ExecutionPlan>> {
         // Propagate the fetch limit to the child input if it supports it
         if let Some(child_with_fetch) = self.input_exec.with_fetch(limit) {
@@ -647,9 +723,10 @@ mod test {
             array::{ArrayRef, Int64Array, RecordBatch, StringArray},
             datatypes::{DataType, Field, Schema},
         },
+        catalog::Session,
         catalog::{MemTable, TableProvider},
         error::DataFusionError,
-        execution::{SessionState, SessionStateBuilder, context::QueryPlanner},
+        execution::{SessionStateBuilder, context::QueryPlanner},
         logical_expr::LogicalPlan,
         physical_plan::ExecutionPlan,
         physical_planner::{DefaultPhysicalPlanner, PhysicalPlanner},
@@ -674,7 +751,7 @@ mod test {
         async fn create_physical_plan(
             &self,
             logical_plan: &LogicalPlan,
-            session_state: &SessionState,
+            session_state: &dyn Session,
         ) -> datafusion::error::Result<Arc<dyn ExecutionPlan>> {
             let physical_planner = DefaultPhysicalPlanner::with_extension_planners(vec![Arc::new(
                 IndexTableScanExtensionPlanner::new(),

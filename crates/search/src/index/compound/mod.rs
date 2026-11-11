@@ -44,7 +44,7 @@ use datafusion::error::{DataFusionError, Result as DataFusionResult};
 use datafusion::prelude::Expr;
 use itertools::Itertools;
 use snafu::{ResultExt, Snafu, ensure};
-use spice_table::{Index, WriteWindow, resolve_keys_matching_predicate};
+use spice_table::{GroupPruning, Index, WriteWindow, resolve_keys_matching_predicate};
 
 pub use search_index::CompoundSearchIndex;
 pub use vector_index::CompoundVectorIndex;
@@ -235,8 +235,8 @@ async fn compound_write(
             arrays.push(Arc::clone(secondary_out.column(i)));
         }
     }
-    // Preserve the primary output's schema-level metadata — some indexes rely on it
-    // (e.g. `DuckDBVectorIndex` forwards its source schema metadata).
+    // Preserve the primary output's schema-level metadata, which an index may
+    // forward from its source schema.
     RecordBatch::try_new(
         Arc::new(Schema::new_with_metadata(fields, schema.metadata().clone())),
         arrays,
@@ -282,7 +282,9 @@ fn compound_required_columns(
 /// `on_write_failed` restores state set up by a *successful* start, so calling it could "restore"
 /// settings that were never overridden. That ownership is also what lets `on_write_failed` and
 /// `on_write_complete` keep fanning out to both halves after a best-effort start failure — the
-/// half that failed has already closed its own cycle, so its cleanup short-circuits.
+/// half that failed has already closed its own cycle, so restoring its settings short-circuits.
+/// (An Elasticsearch full-refresh snapshot outlives a failed `refresh_interval` override, and
+/// those calls still reconcile or close it, because the write went ahead.)
 async fn compound_on_write_start(
     primary: &dyn SearchIndex,
     secondary: &dyn SearchIndex,
@@ -387,6 +389,64 @@ async fn compound_delete_by_keys(
         secondary.delete_by_keys(keys)
     );
     primary_result.and(secondary_result)
+}
+
+/// Truncate both indexes, like [`compound_delete_by_keys`]: both run to completion and the
+/// primary's error is surfaced first.
+async fn compound_truncate(primary: &dyn Index, secondary: &dyn Index) -> DataFusionResult<()> {
+    let (primary_result, secondary_result) =
+        futures::join!(primary.truncate(), secondary.truncate());
+    primary_result.and(secondary_result)
+}
+
+/// Fan a group-remainder delete out to the halves that can prune, like
+/// [`compound_delete_by_keys`]: both run, and the primary's error is surfaced first. A half that
+/// reports [`GroupPruning::Unsupported`] is not asked, which is the contract
+/// [`Index::group_pruning`] makes with every caller.
+async fn compound_delete_group_remainder(
+    primary: &dyn Index,
+    secondary: &dyn Index,
+    group_columns: &[String],
+    members: RecordBatch,
+) -> DataFusionResult<()> {
+    let asks = |half: &dyn Index| half.group_pruning() != GroupPruning::Unsupported;
+    match (asks(primary), asks(secondary)) {
+        (true, true) => {
+            let (primary_result, secondary_result) = futures::join!(
+                primary.delete_group_remainder(group_columns, members.clone()),
+                secondary.delete_group_remainder(group_columns, members)
+            );
+            primary_result.and(secondary_result)
+        }
+        (true, false) => primary.delete_group_remainder(group_columns, members).await,
+        (false, true) => {
+            secondary
+                .delete_group_remainder(group_columns, members)
+                .await
+        }
+        (false, false) => Ok(()),
+    }
+}
+
+/// The pruning a compound reports: [`GroupPruning::Complete`] only when both halves prune,
+/// [`GroupPruning::Unsupported`] only when neither can, and otherwise
+/// [`GroupPruning::Partial`] naming the half — or the indexes beneath it — that cannot, so the
+/// caller keeps pruning the half that can and says what stays behind.
+///
+/// The intersection that [`Index::deletes_by_partial_key`] takes would be wrong here: the
+/// production warm index pairs the memory index, which prunes, with an S3 Vectors or
+/// Elasticsearch half that does not, and answering "cannot" for the pair would leave the memory
+/// half's superseded chunks in place for no reason.
+fn compound_group_pruning(primary: &dyn Index, secondary: &dyn Index) -> GroupPruning {
+    match (primary.group_pruning(), secondary.group_pruning()) {
+        (GroupPruning::Complete, GroupPruning::Complete) => GroupPruning::Complete,
+        (GroupPruning::Unsupported, GroupPruning::Unsupported) => GroupPruning::Unsupported,
+        (p, s) => {
+            let mut cannot = p.gaps(primary.name());
+            cannot.extend(s.gaps(secondary.name()));
+            GroupPruning::Partial { cannot }
+        }
+    }
 }
 
 /// Resolve the delete keys for a compound index.

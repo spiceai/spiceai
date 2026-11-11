@@ -15,5 +15,8 @@ runtime-api-types = { path = "../runtime-api-types" }
 snafu = { workspace = true }
 telemetry = { path = "../telemetry" }
 
+[dev-dependencies]
+opentelemetry_sdk = { workspace = true }
+
 [lints]
 workspace = true

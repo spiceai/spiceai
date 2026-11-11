@@ -39,18 +39,165 @@ use datafusion::{
 };
 use datafusion_datasource::memory::MemorySourceConfig;
 
+/// Checks the rows an UPDATE will write before it deletes anything; an error fails
+/// the UPDATE with nothing changed.
+#[async_trait::async_trait]
+pub trait UpdateValidator: Send + Sync + std::fmt::Debug {
+    /// Check `rows`, the updated rows in the target table's schema.
+    async fn validate(
+        &self,
+        rows: &[RecordBatch],
+        context: Arc<TaskContext>,
+    ) -> Result<(), DataFusionError>;
+}
+
+/// Plans that can check updated rows before any table is written.
+///
+/// A sink that updates several tables in one statement ([`prepare_update_plan`])
+/// runs this on every plan before executing any, so a collision one table
+/// refuses changes no table.
+#[async_trait::async_trait]
+pub trait PreparableUpdate: Send + Sync {
+    /// Materialize the updated rows and check them, without changing the table.
+    ///
+    /// # Errors
+    ///
+    /// Returns the error reading the rows, or the validator's.
+    async fn prepare(&self, context: Arc<TaskContext>) -> Result<(), DataFusionError>;
+}
+
+/// Check `plan`'s updated rows when it implements [`PreparableUpdate`].
+///
+/// Known concrete types: [`UpdateExec`] and [`PreparableUpdateExec`]. Engine
+/// UPDATE plans that are not [`UpdateExec`] wrap themselves in
+/// [`PreparableUpdateExec`] so a multi-table sink can find them without
+/// depending on the engine crate.
+///
+/// # Errors
+///
+/// Returns the error reading the rows, or the validator's.
+pub async fn prepare_update_plan(
+    plan: &dyn ExecutionPlan,
+    context: Arc<TaskContext>,
+) -> Result<(), DataFusionError> {
+    if let Some(update) = plan.downcast_ref::<UpdateExec>() {
+        return update.prepare(context).await;
+    }
+    if let Some(update) = plan.downcast_ref::<PreparableUpdateExec>() {
+        return update.prepare(context).await;
+    }
+    Ok(())
+}
+
+/// Wraps an engine-specific UPDATE plan so [`prepare_update_plan`] can find it.
+pub struct PreparableUpdateExec {
+    inner: Arc<dyn ExecutionPlan>,
+    prepare: Arc<dyn PreparableUpdate>,
+}
+
+impl PreparableUpdateExec {
+    /// Wrap `plan` so a multi-table sink can [`PreparableUpdate::prepare`] it
+    /// before writing any table.
+    #[must_use]
+    pub fn wrap<T>(plan: Arc<T>) -> Self
+    where
+        T: ExecutionPlan + PreparableUpdate + 'static,
+    {
+        Self {
+            inner: Arc::clone(&plan) as Arc<dyn ExecutionPlan>,
+            prepare: plan,
+        }
+    }
+
+    /// Materialize and check the inner plan's updated rows.
+    ///
+    /// # Errors
+    ///
+    /// Returns the error reading the rows, or the validator's.
+    pub async fn prepare(&self, context: Arc<TaskContext>) -> Result<(), DataFusionError> {
+        self.prepare.prepare(context).await
+    }
+}
+
+impl std::fmt::Debug for PreparableUpdateExec {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PreparableUpdateExec")
+            .field("inner", &self.inner.name())
+            .finish_non_exhaustive()
+    }
+}
+
+impl DisplayAs for PreparableUpdateExec {
+    fn fmt_as(&self, _t: DisplayFormatType, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "PreparableUpdateExec({})", self.inner.name())
+    }
+}
+
+impl ExecutionPlan for PreparableUpdateExec {
+    fn name(&self) -> &str {
+        self.inner.name()
+    }
+
+    fn properties(&self) -> &Arc<PlanProperties> {
+        self.inner.properties()
+    }
+
+    fn apply_expressions(
+        &self,
+        f: &mut dyn FnMut(
+            &Arc<dyn datafusion::physical_plan::PhysicalExpr>,
+        ) -> datafusion::error::Result<
+            datafusion::common::tree_node::TreeNodeRecursion,
+        >,
+    ) -> datafusion::error::Result<datafusion::common::tree_node::TreeNodeRecursion> {
+        self.inner.apply_expressions(f)
+    }
+
+    fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> {
+        vec![]
+    }
+
+    fn with_new_children(
+        self: Arc<Self>,
+        children: Vec<Arc<dyn ExecutionPlan>>,
+    ) -> Result<Arc<dyn ExecutionPlan>, DataFusionError> {
+        if children.is_empty() {
+            return Ok(self);
+        }
+        Err(DataFusionError::Internal(
+            "PreparableUpdateExec does not take plan children".to_string(),
+        ))
+    }
+
+    fn execute(
+        &self,
+        partition: usize,
+        context: Arc<TaskContext>,
+    ) -> Result<SendableRecordBatchStream, DataFusionError> {
+        self.inner.execute(partition, context)
+    }
+}
+
 /// An execution plan that implements UPDATE as delete + insert.
 ///
 /// 1. Materializes the updated rows from the source plan.
 /// 2. Normalizes output to match the target table schema.
-/// 3. Deletes matching rows via `TableProvider::delete_from`.
-/// 4. Inserts updated rows via `TableProvider::insert_into`.
-/// 5. Returns a single-row batch with the count of affected rows.
+/// 3. Checks them with the table's [`UpdateValidator`], if it has one.
+/// 4. Deletes matching rows via `TableProvider::delete_from`.
+/// 5. Inserts updated rows via `TableProvider::insert_into`.
+/// 6. Returns a single-row batch with the count of affected rows.
+///
+/// Steps 1-3 are [`UpdateExec::prepare`], which a caller writing several tables in
+/// one statement runs for every table before executing any.
 pub struct UpdateExec {
     source_plan: Arc<dyn ExecutionPlan>,
     table_provider: Arc<dyn TableProvider>,
     session_state: SessionState,
     filters: Vec<Expr>,
+    validator: Option<Arc<dyn UpdateValidator>>,
+    /// The rows [`UpdateExec::prepare`] materialized and checked, written by the
+    /// next execution, so it writes exactly the rows that were checked.
+    prepared: Arc<tokio::sync::Mutex<Option<Vec<RecordBatch>>>>,
     properties: Arc<PlanProperties>,
 }
 
@@ -75,9 +222,70 @@ impl UpdateExec {
             table_provider,
             session_state,
             filters,
+            validator: None,
+            prepared: Arc::new(tokio::sync::Mutex::new(None)),
             properties,
         }
     }
+
+    /// Check the updated rows with `validator` before deleting anything.
+    #[must_use]
+    pub fn with_validator(mut self, validator: Arc<dyn UpdateValidator>) -> Self {
+        self.validator = Some(validator);
+        self
+    }
+
+    /// Materialize the updated rows and check them, without changing the table. The
+    /// next execution writes these rows.
+    ///
+    /// # Errors
+    ///
+    /// Returns the error reading the rows, or the validator's.
+    pub async fn prepare(&self, context: Arc<TaskContext>) -> Result<(), DataFusionError> {
+        let rows = materialize(
+            &self.source_plan,
+            &self.table_provider,
+            self.validator.as_deref(),
+            context,
+        )
+        .await?;
+        *self.prepared.lock().await = Some(rows);
+        Ok(())
+    }
+}
+
+#[async_trait::async_trait]
+impl PreparableUpdate for UpdateExec {
+    async fn prepare(&self, context: Arc<TaskContext>) -> Result<(), DataFusionError> {
+        UpdateExec::prepare(self, context).await
+    }
+}
+
+/// The updated rows `source_plan` produces, in the schema of `table_provider`, once
+/// `validator` accepts them.
+async fn materialize(
+    source_plan: &Arc<dyn ExecutionPlan>,
+    table_provider: &Arc<dyn TableProvider>,
+    validator: Option<&dyn UpdateValidator>,
+    context: Arc<TaskContext>,
+) -> Result<Vec<RecordBatch>, DataFusionError> {
+    use futures::TryStreamExt;
+
+    let source_stream = execute_stream(Arc::clone(source_plan), Arc::clone(&context))?;
+    let updated_batches: Vec<RecordBatch> = source_stream.try_collect().await?;
+
+    // Normalize update output to match the target table schema (including nullability)
+    // before performing any destructive operation.
+    let target_schema = table_provider.schema();
+    let rows = updated_batches
+        .into_iter()
+        .map(|batch| arrow_tools::record_batch::try_cast_to(batch, Arc::clone(&target_schema)))
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(DataFusionError::from)?;
+    if let Some(validator) = validator {
+        validator.validate(&rows, context).await?;
+    }
+    Ok(rows)
 }
 
 impl std::fmt::Debug for UpdateExec {
@@ -101,6 +309,17 @@ impl ExecutionPlan for UpdateExec {
         &self.properties
     }
 
+    fn apply_expressions(
+        &self,
+        _f: &mut dyn FnMut(
+            &Arc<dyn datafusion::physical_plan::PhysicalExpr>,
+        ) -> datafusion::error::Result<
+            datafusion::common::tree_node::TreeNodeRecursion,
+        >,
+    ) -> datafusion::error::Result<datafusion::common::tree_node::TreeNodeRecursion> {
+        Ok(datafusion::common::tree_node::TreeNodeRecursion::Continue)
+    }
+
     fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> {
         vec![&self.source_plan]
     }
@@ -116,12 +335,14 @@ impl ExecutionPlan for UpdateExec {
             )));
         }
 
-        Ok(Arc::new(Self::new(
+        let mut exec = Self::new(
             Arc::clone(&children[0]),
             Arc::clone(&self.table_provider),
             self.session_state.clone(),
             self.filters.clone(),
-        )))
+        );
+        exec.validator.clone_from(&self.validator);
+        Ok(Arc::new(exec))
     }
 
     fn execute(
@@ -139,6 +360,8 @@ impl ExecutionPlan for UpdateExec {
         let table_provider = Arc::clone(&self.table_provider);
         let session_state = self.session_state.clone();
         let filters = self.filters.clone();
+        let validator = self.validator.clone();
+        let prepared = Arc::clone(&self.prepared);
 
         let schema = Arc::new(arrow::datatypes::Schema::new(vec![
             arrow::datatypes::Field::new("count", arrow::datatypes::DataType::UInt64, false),
@@ -147,19 +370,20 @@ impl ExecutionPlan for UpdateExec {
         let stream = futures::stream::once(async move {
             use futures::TryStreamExt;
 
-            let source_stream = execute_stream(Arc::clone(&source_plan), Arc::clone(&context))?;
-            let updated_batches: Vec<RecordBatch> = source_stream.try_collect().await?;
-
-            // Normalize update output to match the target table schema (including nullability)
-            // before performing any destructive operation.
+            let prepared = prepared.lock().await.take();
+            let normalized_batches = match prepared {
+                Some(rows) => rows,
+                None => {
+                    materialize(
+                        &source_plan,
+                        &table_provider,
+                        validator.as_deref(),
+                        Arc::clone(&context),
+                    )
+                    .await?
+                }
+            };
             let target_schema = table_provider.schema();
-            let normalized_batches = updated_batches
-                .into_iter()
-                .map(|batch| {
-                    arrow_tools::record_batch::try_cast_to(batch, Arc::clone(&target_schema))
-                })
-                .collect::<Result<Vec<_>, _>>()
-                .map_err(DataFusionError::from)?;
 
             let delete_plan = table_provider.delete_from(&session_state, filters).await?;
             let delete_stream = execute_stream(delete_plan, Arc::clone(&context))?;

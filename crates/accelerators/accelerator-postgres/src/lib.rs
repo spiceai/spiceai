@@ -14,12 +14,16 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
+//! The `postgres` data accelerator.
+//!
+//! Deprecated in v2.4 and scheduled for removal in v2.5: migrate accelerations to
+//! Cayenne (`engine: cayenne`).
+
 use async_trait::async_trait;
 use data_components::poly::PolyTableProvider;
 use datafusion::execution::runtime_env::RuntimeEnv;
 use datafusion::{
-    catalog::TableProviderFactory, datasource::TableProvider, execution::context::SessionContext,
-    logical_expr::CreateExternalTable,
+    catalog::TableProviderFactory, datasource::TableProvider, logical_expr::CreateExternalTable,
 };
 use datafusion_table_providers::postgres::{
     PostgresTableProviderFactory, write::PostgresTableWriter,
@@ -29,16 +33,15 @@ use snafu::prelude::*;
 use std::{any::Any, sync::Arc};
 
 use data_accelerator_api::{
-    AccelerationSource, AcceleratorEngineRegistry, DataAccelerator, upsert_dedup,
+    AccelerationSource, DataAccelerator, acceleration_parameters, upsert_dedup,
 };
 use datafusion_table_providers::sql::db_connection_pool::postgrespool::PostgresConnectionPool;
-use datafusion_table_providers::util::secrets::to_secret_map;
 use runtime_acceleration::Engine;
 use runtime_acceleration::sidecar::{AcceleratorSidecar, OpenOption};
 use runtime_checkpoint_api::CheckpointError;
 use runtime_checkpoint_postgres::PostgresSidecar;
 use runtime_datafusion::function_support::deny_spice_functions_for_postgres_table_providers;
-use runtime_parameters::ParameterSpec;
+use runtime_parameters::{Diagnostics, ParameterSpec};
 
 #[derive(Debug, Snafu)]
 pub enum Error {
@@ -134,7 +137,7 @@ impl DataAccelerator for PostgresAccelerator {
             }
         );
 
-        let ctx = SessionContext::new();
+        let ctx = util::session_state::session_context();
 
         // Validate and normalize pool_min and connection_pool_size
         let connection_pool_min_idle = match cmd.options.get("connection_pool_min") {
@@ -188,6 +191,9 @@ impl DataAccelerator for PostgresAccelerator {
             &cmd.options,
             cmd.constraints.clone(),
         );
+        // PostgreSQL evaluates the `UPDATE` and `DELETE` the writer renders.
+        let write_provider =
+            runtime_datafusion::checked_arithmetic::with_plain_arithmetic_writes(write_provider);
 
         let table_provider =
             Arc::new(PolyTableProvider::new(write_provider, read_provider)).into_table();
@@ -198,20 +204,24 @@ impl DataAccelerator for PostgresAccelerator {
     async fn sidecar(
         &self,
         source: &dyn AccelerationSource,
-        _registry: Arc<AcceleratorEngineRegistry>,
         _open_option: OpenOption,
     ) -> Result<Arc<dyn AcceleratorSidecar>, CheckpointError> {
         // Unlike the file engines there is nothing to "open existing": the sidecar
         // tables live in the same PostgreSQL database the acceleration already targets,
-        // so the connection is built from the acceleration parameters either way.
+        // so the connection is built from the acceleration parameters either way —
+        // resolved exactly as the accelerated table resolves them, or a
+        // `${secrets:…}` reference reaches the pool as a literal.
         let acceleration = source
             .acceleration()
             .ok_or_else(|| CheckpointError::Store {
                 source: "Acceleration is not enabled".into(),
             })?;
-        let secret_map = to_secret_map(acceleration.params.clone());
+        let params =
+            acceleration_parameters(self, acceleration, source.secrets(), Diagnostics::Suppress)
+                .await
+                .map_err(|source| CheckpointError::Store { source })?;
 
-        let pool = PostgresConnectionPool::new(secret_map)
+        let pool = PostgresConnectionPool::new(params.to_secret_map())
             .await
             .map_err(|source| CheckpointError::Store {
                 source: Box::new(source),
@@ -221,6 +231,22 @@ impl DataAccelerator for PostgresAccelerator {
             Arc::new(pool),
             source.name().to_string(),
         )))
+    }
+
+    fn rejects_configuration(
+        &self,
+        error: &(dyn std::error::Error + Send + Sync + 'static),
+    ) -> bool {
+        matches!(
+            error.downcast_ref::<Error>(),
+            Some(
+                Error::InvalidConnectionPoolConfiguration { .. }
+                    | Error::InvalidParameterValue { .. }
+            )
+        ) || matches!(
+            error.downcast_ref::<data_accelerator_api::Error>(),
+            Some(data_accelerator_api::Error::InvalidConfiguration { .. })
+        )
     }
 
     fn prefix(&self) -> &'static str {
@@ -233,3 +259,71 @@ impl DataAccelerator for PostgresAccelerator {
 }
 
 data_accelerator_api::register_data_accelerator!(Engine::PostgreSQL, PostgresAccelerator);
+
+#[cfg(test)]
+mod tests {
+    use super::PostgresAccelerator;
+    use async_trait::async_trait;
+    use data_accelerator_api::DataAccelerator;
+    use runtime_acceleration::Engine;
+    use runtime_acceleration::acceleration::Acceleration;
+    use runtime_acceleration::sidecar::OpenOption;
+    use runtime_acceleration::testing::TestAccelerationSource;
+    use runtime_secrets::{AnyErrorResult, SecretStore, Secrets};
+    use secrecy::SecretString;
+    use std::collections::HashMap;
+    use std::sync::Arc;
+
+    const ROOT_CERT: &str = "/nonexistent/spice-13296/root.crt";
+
+    struct OneSecret;
+
+    #[async_trait]
+    impl SecretStore for OneSecret {
+        async fn get_secret(&self, key: &str) -> AnyErrorResult<Option<SecretString>> {
+            Ok((key == "ROOT_CERT").then(|| SecretString::from(ROOT_CERT)))
+        }
+    }
+
+    /// The sidecar opens its own connection from the acceleration parameters, so it must
+    /// resolve `${secrets:…}` references the way the accelerated table does. A missing
+    /// root certificate fails the pool before it opens a connection, and the error names
+    /// the path it was handed — which shows what the sidecar resolved without a database.
+    /// Regression test for <https://github.com/spiceai/spiceai/issues/13296>.
+    #[tokio::test]
+    async fn sidecar_expands_secret_references_in_its_connection_parameters() {
+        let mut secrets = Secrets::new();
+        secrets.register_store("test", Arc::new(OneSecret));
+        let source = TestAccelerationSource::new("pg_sidecar_secrets")
+            .with_secrets(secrets)
+            .with_acceleration(Acceleration {
+                engine: Engine::PostgreSQL,
+                params: HashMap::from([
+                    ("pg_host".to_string(), "localhost".to_string()),
+                    ("pg_sslmode".to_string(), "verify-full".to_string()),
+                    (
+                        "pg_sslrootcert".to_string(),
+                        "${ secrets:ROOT_CERT }".to_string(),
+                    ),
+                ]),
+                ..Default::default()
+            });
+
+        // `Arc<dyn AcceleratorSidecar>` is not `Debug`, so match rather than `expect_err`.
+        let Err(error) = PostgresAccelerator::new()
+            .sidecar(&source, OpenOption::CreateIfNotExists)
+            .await
+        else {
+            panic!("a root certificate that does not exist must fail the sidecar");
+        };
+        let message = error.to_string();
+        assert!(
+            message.contains(ROOT_CERT),
+            "the sidecar must be handed the resolved secret, got: {message}"
+        );
+        assert!(
+            !message.contains("secrets:"),
+            "the sidecar must not see the unexpanded reference, got: {message}"
+        );
+    }
+}

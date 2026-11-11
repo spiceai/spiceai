@@ -943,6 +943,17 @@ impl ClientDriver {
                     reply_with_json(tx, &command_id, result).await;
                 }
             }
+            proto::control_message::Body::GetDatasets(_) => {
+                if self
+                    .supported(tx, &command_id, Capability::GetDatasets, name)
+                    .await
+                {
+                    // The same document the instance serves on
+                    // `GET /v1/datasets?status=true`, unchanged.
+                    let result = self.runtime.datasets_json().await;
+                    reply_with_json(tx, &command_id, result).await;
+                }
+            }
             proto::control_message::Body::GetLogs(cmd) => {
                 if self
                     .supported(tx, &command_id, Capability::GetLogs, name)
@@ -1751,6 +1762,7 @@ fn command_name(body: &proto::control_message::Body) -> &'static str {
         Body::ApplyManifest(_) => "ApplyManifest",
         Body::DeleteManifest(_) => "DeleteManifest",
         Body::GetStatus(_) => "GetStatus",
+        Body::GetDatasets(_) => "GetDatasets",
         Body::Drain(_) => "Drain",
         Body::Pause(_) => "Pause",
         Body::ApplySecrets(_) => "ApplySecrets",

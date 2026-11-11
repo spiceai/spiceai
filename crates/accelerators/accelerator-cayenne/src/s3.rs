@@ -25,8 +25,9 @@ use futures::stream::BoxStream;
 use object_store::{
     ClientOptions, CopyOptions, GetOptions, GetResult, ListResult, MultipartUpload, ObjectMeta,
     ObjectStore, ObjectStoreExt, PutMultipartOptions, PutOptions, PutPayload, PutResult,
-    RetryConfig, aws::AmazonS3Builder, client::SpawnedReqwestConnector, path::Path,
+    RetryConfig, aws::AmazonS3Builder, path::Path,
 };
+use object_store_spawn::SpawnedReqwestConnector;
 use runtime_parameters::ParameterSpec;
 use runtime_secrets::get_params_with_secrets;
 use secrecy::ExposeSecret;

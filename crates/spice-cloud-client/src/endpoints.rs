@@ -16,6 +16,7 @@ limitations under the License.
 
 //! Spice Cloud runtime endpoint helpers.
 
+pub const DEFAULT_REGION: &str = "us-east-1";
 pub const LEGACY_DATA_ENDPOINT: &str = "https://data.spiceai.io";
 pub const LEGACY_FLIGHT_HOST: &str = "flight.spiceai.io";
 pub const DATA_REGION_SUFFIX: &str = "-prod-aws-data";

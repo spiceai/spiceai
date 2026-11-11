@@ -23,9 +23,9 @@ use crate::udtfs::{ListUDFTable, ListUDFTableFunc};
 use arrow_schema::SchemaRef;
 use ballista_core::serde::BallistaLogicalExtensionCodec;
 use datafusion::catalog::TableProvider;
+use datafusion::common::TableReference as SqlTableReference;
 use datafusion::common::{DataFusionError, Result, ScalarValue, TableReference, exec_err};
 use datafusion::execution::TaskContext;
-use datafusion::sql::TableReference as SqlTableReference;
 use datafusion_expr::registry::FunctionRegistry;
 use datafusion_expr::{Extension, LogicalPlan, ScalarUDF};
 use datafusion_proto::logical_plan::LogicalExtensionCodec;
@@ -34,9 +34,9 @@ use runtime_proto::rrf_nested_query::Query;
 use runtime_proto::udtf_args::Args;
 use runtime_search::full_text_udtf::TextSearchTableFunc;
 use runtime_search::rrf::ReciprocalRankFusion;
+use runtime_search::search_engine::ExplicitPrimaryKeys;
 use runtime_search::udtf::{DistanceMetric, TextSearchTableFuncArgs, VectorSearchTableFuncArgs};
 use search::provider::{SearchQueryProvider, UdtfSource};
-use std::collections::HashMap;
 use std::fmt::Debug;
 use std::sync::Arc;
 
@@ -117,7 +117,7 @@ impl SpiceLogicalCodec {
             Args::VectorSearch(vector_args) => {
                 let udtf = VectorSearchTableFunc::new(
                     Arc::downgrade(&runtime.df),
-                    HashMap::new(), // explicit_pks - will be inferred from table
+                    ExplicitPrimaryKeys::default(), // inferred from the table
                 );
                 let exprs = VectorSearchTableFuncArgs {
                     tbl: SqlTableReference::parse_str(&vector_args.table),

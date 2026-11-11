@@ -12,12 +12,14 @@ version.workspace = true
 [dependencies]
 app = { path = "../app" }
 spicepod = { path = "../spicepod" }
+util = { path = "../util" }
 arrow.workspace = true
 arrow_tools = { path = "../arrow_tools" }
 async-trait.workspace = true
 datafusion.workspace = true
 datafusion-table-providers = { workspace = true }
 futures.workspace = true
+hashbrown.workspace = true
 linkme.workspace = true
 paste.workspace = true
 arrow-schema = { workspace = true, features = ["serde"] }
@@ -27,6 +29,7 @@ runtime-component = { path = "../runtime-component" }
 runtime-secrets = { path = "../runtime-secrets", default-features = false }
 runtime-parameters = { path = "../runtime-parameters" }
 runtime-table-partition = { path = "../runtime-table-partition" }
+spice-table = { path = "../spice-table" }
 secrecy.workspace = true
 snafu.workspace = true
 sysinfo.workspace = true

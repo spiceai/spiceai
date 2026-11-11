@@ -24,8 +24,12 @@ concurrency:
 
 jobs:
   crash_report:
+    environment: ci
     name: crash report (${{ matrix.profile }})
     runs-on: spiceai-dev-runners
+    permissions:
+      contents: read
+      id-token: write  # RustFS credentials
     # `release-lto` links the whole graph with fat LTO; it is far slower than release.
     timeout-minutes: 300
     strategy:
@@ -34,7 +38,7 @@ jobs:
         profile: ${{ fromJSON(inputs.profiles) }}
 
     steps:
-      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
           fetch-depth: 1
@@ -62,12 +66,22 @@ jobs:
       - name: Install protoc
         uses: ./.github/actions/install-protoc
 
+      - name: Get RustFS credentials
+        id: rustfs
+        continue-on-error: true
+        uses: ./.github/actions/rustfs-credentials
+        with:
+          endpoint: ${{ vars.TEST_MINIO_ENDPOINT }}
+          duration-seconds: '18000'
+          export-env: 'false'
+
       - name: Set up sccache
         uses: ./.github/actions/setup-sccache
         with:
-          minio_endpoint: ${{ secrets.TEST_MINIO_ENDPOINT }}
-          minio_access_key: ${{ secrets.TEST_MINIO_ACCESS_KEY }}
-          minio_secret_key: ${{ secrets.TEST_MINIO_SECRET_KEY }}
+          minio_endpoint: ${{ vars.TEST_MINIO_ENDPOINT }}
+          minio_access_key: ${{ steps.rustfs.outputs.access-key-id }}
+          minio_secret_key: ${{ steps.rustfs.outputs.secret-access-key }}
+          minio_session_token: ${{ steps.rustfs.outputs.session-token }}
 
       - name: Environment
         run: |
@@ -79,8 +93,9 @@ jobs:
         env:
           CARGO_INCREMENTAL: 0
           PROFILE: ${{ matrix.profile }}
-          AWS_ACCESS_KEY_ID: ${{ secrets.TEST_MINIO_ACCESS_KEY }}
-          AWS_SECRET_ACCESS_KEY: ${{ secrets.TEST_MINIO_SECRET_KEY }}
+          AWS_ACCESS_KEY_ID: ${{ steps.rustfs.outputs.access-key-id }}
+          AWS_SECRET_ACCESS_KEY: ${{ steps.rustfs.outputs.secret-access-key }}
+          AWS_SESSION_TOKEN: ${{ steps.rustfs.outputs.session-token }}
         run: |
           set -euo pipefail
           TEST_BIN=$(cargo test -p spiced --lib --profile "$PROFILE" --no-run \
@@ -188,7 +203,7 @@ jobs:
 
       - name: Upload the report
         if: always()
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
         with:
           name: crash-report-${{ matrix.profile }}
           path: |

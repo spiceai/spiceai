@@ -197,7 +197,7 @@ impl QueryPlanner for PlannerWithIndexExtension {
     async fn create_physical_plan(
         &self,
         logical_plan: &LogicalPlan,
-        session_state: &datafusion::execution::SessionState,
+        session_state: &dyn datafusion::catalog::Session,
     ) -> datafusion::error::Result<Arc<dyn ExecutionPlan>> {
         let physical_planner = DefaultPhysicalPlanner::with_extension_planners(vec![Arc::new(
             IndexTableScanExtensionPlanner::new(),

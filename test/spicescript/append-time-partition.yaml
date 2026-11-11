@@ -1,0 +1,102 @@
+name: append-time-partition
+description: >
+  Append refresh into Cayenne with a time column paired with a day
+  partition column (`time_partition_column`), with a date as the time
+  column, and with epoch milliseconds paired with a day partition. Rows
+  arriving later on the day already loaded, on the next day, and before
+  1970 are each added exactly once, and a refresh with nothing new adds
+  nothing.
+
+sources:
+  src: { kind: postgres }
+
+variants:
+  ts-and-day: {}
+  day-only:
+    datasets:
+      events: { time_column: day, time_format: date, time_partition_column: null, time_partition_format: null }
+      old: { time_column: day, time_format: date, time_partition_column: null, time_partition_format: null }
+  millis-and-day:
+    datasets:
+      events: { time_column: ms, time_format: unix_millis }
+      old: { time_column: ms, time_format: unix_millis }
+
+spicepod:
+  version: v1
+  kind: Spicepod
+  name: append-time-partition
+  datasets:
+    - from: postgres:public.events
+      name: events
+      params: ${sources.src.params}
+      time_column: ts
+      time_format: timestamptz
+      time_partition_column: day
+      time_partition_format: date
+      acceleration: &append { enabled: true, engine: cayenne, mode: file, refresh_mode: append }
+    - from: postgres:public.old
+      name: old
+      params: ${sources.src.params}
+      time_column: ts
+      time_format: timestamptz
+      time_partition_column: day
+      time_partition_format: date
+      acceleration: *append
+
+defaults:
+  cluster-partition-by: { '*': id }
+  expect: { oracle: src }
+
+steps:
+  # Each row's day, epoch milliseconds and day text derive from its UTC
+  # timestamp. Timestamps far from now, so wall-clock time never decides.
+  - source-exec:
+      src: |
+        CREATE TABLE events (id int NOT NULL, ts timestamptz NOT NULL, day date NOT NULL, ms bigint NOT NULL, day_text text NOT NULL);
+        CREATE TABLE old (LIKE events);
+        CREATE FUNCTION add_rows(target text, stamps timestamptz[]) RETURNS void LANGUAGE plpgsql AS $$
+        BEGIN
+          EXECUTE format('INSERT INTO %I SELECT (SELECT coalesce(max(id), 0) FROM %I) + n, ts, (ts AT TIME ZONE ''UTC'')::date,
+            (extract(epoch FROM ts) * 1000)::bigint, to_char((ts AT TIME ZONE ''UTC'')::date, ''YYYY-MM-DD'')
+            FROM unnest($1) WITH ORDINALITY AS u(ts, n)', target, target) USING stamps;
+        END $$;
+        SELECT add_rows('events', ARRAY['2031-05-01 10:00Z', '2031-05-01 11:00Z', '2031-05-01 11:00Z']::timestamptz[]);
+        SELECT add_rows('old', ARRAY['1969-12-30 10:00Z', '1969-12-30 11:00Z']::timestamptz[]);
+  - start: {}
+  - query: SELECT * FROM events
+  - query: SELECT * FROM old
+    only: [ts-and-day, day-only]
+
+  # Later the same day, and the next day.
+  - source-exec: { src: "SELECT add_rows('events', ARRAY['2031-05-01 12:00Z', '2031-05-02 01:00Z']::timestamptz[])" }
+  - refresh: events
+  - query: SELECT * FROM events
+  # Later on the day the stored maximum is on, after it.
+  - source-exec: { src: "SELECT add_rows('events', ARRAY['2031-05-02 02:00Z', '2031-05-02 23:59:59.999Z']::timestamptz[])" }
+  - refresh: events
+  - query: SELECT * FROM events
+  # Nothing new: nothing added.
+  - refresh: events
+  - query: SELECT count(*) AS n, count(DISTINCT id) AS ids FROM events
+  - refresh: events
+  - query: SELECT * FROM events
+
+  # Before 1970: later the same day, across midnight to the last second of
+  # 1969, and into 1970. (Epoch milliseconds before 1970 fail the refresh:
+  # known-failing/append-and-retention/append-negative-epoch.yaml.)
+  - source-exec: { src: "SELECT add_rows('old', ARRAY['1969-12-30 12:00Z', '1969-12-31 23:59:59Z']::timestamptz[])" }
+    only: [ts-and-day, day-only]
+  - refresh: old
+    only: [ts-and-day, day-only]
+  - query: SELECT * FROM old
+    only: [ts-and-day, day-only]
+  - source-exec: { src: "SELECT add_rows('old', ARRAY['1969-12-31 23:59:59.5Z', '1970-01-01 00:00Z', '1970-01-01 00:00:01Z']::timestamptz[])" }
+    only: [ts-and-day, day-only]
+  - refresh: old
+    only: [ts-and-day, day-only]
+  - query: SELECT * FROM old
+    only: [ts-and-day, day-only]
+  - refresh: old
+    only: [ts-and-day, day-only]
+  - query: SELECT count(*) AS n, count(DISTINCT id) AS ids FROM old
+    only: [ts-and-day, day-only]

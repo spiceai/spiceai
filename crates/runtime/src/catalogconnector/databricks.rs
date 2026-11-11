@@ -25,7 +25,7 @@ use crate::dataconnector::http_rate_control;
 use crate::dataconnector::parameters::ConnectorParams;
 use crate::token_providers::databricks::{
     AUTH_MODE_DESCRIPTION, AUTH_MODES, AuthCredentials, build_auth_credentials,
-    get_m2m_token_provider, get_u2m_token_provider,
+    get_m2m_token_provider, get_u2m_token_provider, get_workload_identity_token_provider,
 };
 use async_trait::async_trait;
 use data_components::Read;
@@ -41,7 +41,7 @@ use data_components::unity_catalog::credential_vending::VendedDeltaTableFactory;
 use data_components::unity_catalog::provider::{
     ReadTableProviderFactory, UCTableProviderFactory, UnityCatalogProvider,
 };
-use datafusion::sql::TableReference;
+use datafusion::common::TableReference;
 use runtime_rate_control::RateController;
 use runtime_secrets::get_params_with_secrets;
 use secrecy::{ExposeSecret, SecretString};
@@ -49,6 +49,7 @@ use snafu::ResultExt;
 use std::any::Any;
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::time::Duration;
 use token_provider::StaticTokenProvider;
 use url::Url;
 
@@ -122,6 +123,8 @@ pub const PARAMETERS: &[ParameterSpec] = &[
         .description("Minimum random delay added before Databricks HTTP requests when rate control is active. Overrides runtime.params.http_rate_control_jitter_min when set. Accepts durations such as '5ms' or '0ms'. Defaults to 5ms when a request-rate limit is configured, otherwise 0ms."),
     ParameterSpec::runtime("rate_control_jitter_max")
         .description("Maximum random delay added before Databricks HTTP requests when rate control is active. Overrides runtime.params.http_rate_control_jitter_max when set. Accepts durations such as '10ms' or '0ms'. Defaults to 10ms when a request-rate limit is configured, otherwise 0ms."),
+    ParameterSpec::runtime("rate_control_acquire_timeout")
+        .description("Maximum time a Databricks HTTP request waits for rate-control capacity before it fails. Overrides runtime.params.http_rate_control_acquire_timeout when set. Accepts durations such as '30s' or '500ms'. Defaults to `client_timeout`. Use '0' for no limit."),
 
     // Databricks authentication
     ParameterSpec::component("auth_mode")
@@ -130,8 +133,10 @@ pub const PARAMETERS: &[ParameterSpec] = &[
         .default("auto"),
 
     // Databricks M2M Service Principal credentials
-    ParameterSpec::component("client_id").description("The client ID of the Databricks service principal."),
+    ParameterSpec::component("client_id").secret().description("The client ID of the Databricks service principal. Defaults to `DATABRICKS_CLIENT_ID` for workload identity federation or beside a client secret."),
     ParameterSpec::component("client_secret").secret().description("The client secret of the Databricks service principal."),
+    ParameterSpec::component("oidc_token_filepath").secret().description("A file that holds the workload's identity token, read again for every exchange, such as a Kubernetes projected service account token. With `databricks_client_id`, it authenticates with workload identity federation. Defaults to `DATABRICKS_OIDC_TOKEN_FILEPATH`."),
+    ParameterSpec::component("token_audience").secret().description("The audience of the identity token Spice requests from a GitHub Actions job or the workload's cloud identity, such as the Databricks account ID. With `databricks_client_id`, it authenticates with workload identity federation. Defaults to `DATABRICKS_TOKEN_AUDIENCE`."),
 
     // S3 storage options
     ParameterSpec::component("aws_region")
@@ -209,7 +214,9 @@ async fn shared_databricks_catalog_rate_controller(
         }
     })?;
     let connector_component = ConnectorComponent::from(catalog);
-    let rate_control = http_rate_control::resolve_config_for_component(
+    // The Databricks clients do not yet record per-request outcomes, so the
+    // configured limits apply unchanged.
+    let mut rate_control = http_rate_control::resolve_limits_for_component(
         params,
         Some(&catalog.app.runtime.params),
         &connector_component,
@@ -220,6 +227,7 @@ async fn shared_databricks_catalog_rate_controller(
         connector_component: ConnectorComponent::from(catalog),
         source: source.into(),
     })?;
+    rate_control.apply_default_acquire_timeout(effective_client_timeout(params));
 
     runtime
         .http_rate_control_registry()
@@ -297,6 +305,18 @@ impl CatalogConnector for Databricks {
                         connector_component: ConnectorComponent::from(catalog),
                     })?
             }
+            AuthCredentials::WorkloadIdentity(identity) => get_workload_identity_token_provider(
+                &format!("catalog '{}' (databricks)", catalog.name),
+                endpoint,
+                identity,
+                &runtime.token_provider_registry,
+            )
+            .await
+            .map_err(|source| super::Error::UnableToGetCatalogProvider {
+                connector: "databricks".to_string(),
+                source: source.into(),
+                connector_component: ConnectorComponent::from(catalog),
+            })?,
         };
 
         // Copy the catalog params into the dataset params, and allow user to override
@@ -504,6 +524,10 @@ fn table_reference_creator_spark(uc_table: &UCTable) -> Option<TableReference> {
 }
 
 fn table_reference_creator_delta_lake(uc_table: &UCTable) -> Option<TableReference> {
+    if uc_table.is_catalog_managed() {
+        tracing::warn!("{}", uc_table.catalog_managed_skip_warning());
+        return None;
+    }
     let storage_location = uc_table.storage_location.as_deref()?;
     // Don't append a trailing slash here — `DeltaTable::from` calls
     // `ensure_folder_location` which already adds one when needed.
@@ -554,7 +578,38 @@ async fn create_token_provider_for_catalog(
                     connector_component: ConnectorComponent::from(catalog),
                 })
         }
+        AuthCredentials::WorkloadIdentity(identity) => get_workload_identity_token_provider(
+            &format!("catalog '{}' (databricks)", catalog.name),
+            endpoint,
+            identity,
+            &token_provider_registry,
+        )
+        .await
+        .map_err(|source| super::Error::UnableToGetCatalogProvider {
+            connector: "databricks".to_string(),
+            source: source.into(),
+            connector_component: ConnectorComponent::from(catalog),
+        }),
     }
+}
+
+/// The per-request HTTP timeout a Databricks component actually applies: the
+/// parsed `client_timeout`, or the SQL Warehouse default when the parameter is
+/// unset or unparseable. Rate control derives its acquire bound from this, the
+/// same way the HTTPS connector derives it from its own `client_timeout`.
+///
+/// Silent by design: [`build_sql_warehouse_config`] logs the warning for a bad
+/// value once, where the client config is built. The two must resolve the same
+/// value — `test_effective_client_timeout_matches_sql_warehouse_config` holds
+/// them together.
+#[must_use]
+pub fn effective_client_timeout(params: &Parameters) -> Duration {
+    params
+        .get("client_timeout")
+        .expose()
+        .ok()
+        .and_then(|value| duration_parse::parse_duration(value).ok())
+        .unwrap_or_else(|| SqlWarehouseConfig::default().request_timeout)
 }
 
 pub fn build_sql_warehouse_config(params: &Parameters) -> SqlWarehouseConfig {
@@ -652,6 +707,7 @@ mod tests {
             columns: vec![],
             storage_location: storage_location.map(ToString::to_string),
             table_id: None,
+            properties: std::collections::HashMap::new(),
         }
     }
 
@@ -719,6 +775,15 @@ mod tests {
     }
 
     #[test]
+    fn test_table_reference_creator_delta_lake_skips_catalog_managed() {
+        let mut table = make_uc_table(Some("s3://bucket/tables/t"));
+        table
+            .properties
+            .insert("delta.feature.catalogManaged".into(), "supported".into());
+        assert!(table_reference_creator_delta_lake(&table).is_none());
+    }
+
+    #[test]
     fn test_table_reference_creator_delta_lake_without_storage() {
         let table = make_uc_table(None);
         assert!(
@@ -777,6 +842,7 @@ mod tests {
             columns: vec![],
             storage_location: Some("s3://bucket/orders".to_string()),
             table_id: None,
+            properties: std::collections::HashMap::new(),
         };
         let reference =
             table_reference_creator_spark(&table).expect("spark creator should always return Some");
@@ -892,6 +958,59 @@ mod tests {
             assert!(
                 PARAMETERS.iter().any(|p| p.name == name),
                 "parameter `{name}` is consumed by build_sql_warehouse_config but not declared in PARAMETERS; Parameters::try_new would strip it"
+            );
+        }
+    }
+
+    /// `effective_client_timeout` feeds the rate-control acquire bound while
+    /// [`build_sql_warehouse_config`] feeds the HTTP client. Both read
+    /// `client_timeout` with the same parser and the same fallback, so they must
+    /// never disagree — including for an empty or unparseable value.
+    #[test]
+    fn test_effective_client_timeout_matches_sql_warehouse_config() {
+        for entries in [
+            vec![],
+            vec![("client_timeout", "2m")],
+            vec![("client_timeout", "")],
+            vec![("client_timeout", "not-a-duration")],
+        ] {
+            let params = make_parameters(&entries);
+            assert_eq!(
+                effective_client_timeout(&params),
+                build_sql_warehouse_config(&params).request_timeout,
+                "the acquire bound and the HTTP client must resolve the same client_timeout for {entries:?}"
+            );
+        }
+    }
+
+    /// An unset `client_timeout` resolves to the connector default, so a
+    /// Databricks component gets the same bound as an HTTPS or GraphQL dataset
+    /// that shares its origin.
+    #[test]
+    fn test_unset_client_timeout_is_the_connector_default() {
+        assert_eq!(
+            effective_client_timeout(&make_parameters(&[])),
+            SqlWarehouseConfig::default().request_timeout
+        );
+    }
+
+    /// Regression test: this catalog resolves its rate control with
+    /// `resolve_limits_for_component`, which reads the limit, jitter and
+    /// acquire-timeout parameters of the HTTP rate-control family. An undeclared
+    /// name panics at load, so each one must appear in [`PARAMETERS`].
+    #[test]
+    fn test_http_rate_control_params_are_declared_in_parameters_spec() {
+        for name in [
+            "max_concurrent_requests",
+            "requests_per_second_limit",
+            "requests_per_minute_limit",
+            "rate_control_jitter_min",
+            "rate_control_jitter_max",
+            "rate_control_acquire_timeout",
+        ] {
+            assert!(
+                PARAMETERS.iter().any(|p| p.name == name),
+                "parameter `{name}` is read when resolving rate control but not declared in PARAMETERS; the lookup would panic at load"
             );
         }
     }

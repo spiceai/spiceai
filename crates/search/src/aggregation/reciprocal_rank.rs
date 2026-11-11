@@ -27,6 +27,7 @@ use super::{Error, Result};
 use arrow::datatypes::{DataType, SchemaRef};
 use async_trait::async_trait;
 use datafusion::common::Column;
+use datafusion::common::TableReference;
 use datafusion::datasource::MemTable;
 use datafusion::functions_window::expr_fn::row_number;
 use datafusion::logical_expr::{
@@ -34,7 +35,6 @@ use datafusion::logical_expr::{
 };
 use datafusion::logical_expr::{JoinType, Operator, binary_expr, col, lit};
 use datafusion::prelude::{SessionContext, coalesce};
-use datafusion::sql::TableReference;
 use snafu::ResultExt;
 
 /// Reciprocal Rank Fusion (RRF) is a method for combining multiple ranked sets of search results.
@@ -140,7 +140,7 @@ impl CandidateAggregation for ReciprocalRankFusion {
         let schemas = data.iter().map(|d| d.data.schema()).collect::<Vec<_>>();
         let () = verify_schema_compatibility(schemas.as_slice())?;
 
-        let ctx = SessionContext::new();
+        let ctx = util::session_state::session_context();
         let mut table_names: Vec<TableReference> = Vec::with_capacity(num_inputs);
 
         // Find all additional columns in the schema that are not part of the primary key or the expected

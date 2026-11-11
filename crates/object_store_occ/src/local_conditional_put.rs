@@ -20,92 +20,415 @@ limitations under the License.
 //! which breaks any code relying on optimistic concurrency control (`ETag`s) for
 //! file-based scheduler state.
 //!
-//! This wrapper intercepts `PutMode::Update` requests and implements them by
-//! checking the current `ETag` under a file-backed advisory lock, then writing
-//! with `PutMode::Overwrite` if the `ETag` matches.
+//! This wrapper publishes every put itself, under a file-backed advisory lock:
+//! it checks the mode's precondition against the current file, writes the
+//! payload to a staged file, and renames or links that file into place.
 //!
-//! **Concurrency model**: a lock file under the local state root serializes
-//! conditional writes across [`LocalConditionalPut`] instances and across local
-//! processes that use this wrapper for the same directory.
+//! **`ETag`s never repeat.** [`LocalFileSystem`] derives an `ETag` from the
+//! file's inode, modification time in microseconds, and size. A filesystem that
+//! reuses a replaced file's inode and stamps files from a coarse clock, such as
+//! ext4, gives two same-size versions written within one clock tick the same
+//! `ETag`, and an update built on the older version would replace the newer
+//! one. So each staged version's modification time is moved past every version
+//! its directory has published, recorded as the lock file's own modification
+//! time, before the version is published. On a filesystem that stores coarser
+//! times than a microsecond, the writer waits for the clock to pass that time
+//! instead of stamping the version ahead of the clock, so it publishes at most
+//! one version per directory in each of the filesystem's timestamp ticks.
+//!
+//! Copies, renames, and multipart uploads are delegated and publish without
+//! the lock, so write a key that conditional updates guard through `put_opts`
+//! alone.
+//!
+//! **Concurrency model**: each put takes an advisory lock for the object's
+//! directory. Two clients whose roots and keys name the same file
+//! therefore share one lock, including across processes. A dedicated filesystem
+//! worker retains that lock through publication after caller cancellation or
+//! Tokio shutdown. Accepted writes may finish after their caller stops waiting.
+//! The lock file is not an object and is not removed: unlinking it would let
+//! the next writer lock a different inode.
 //!
 //! [`LocalFileSystem`]: object_store::local::LocalFileSystem
 //! [`Error::NotImplemented`]: object_store::Error::NotImplemented
 
 use std::fmt::{self, Display, Formatter};
-use std::fs::{File, OpenOptions};
-use std::io;
+use std::fs::OpenOptions;
+use std::io::{self, Write};
 use std::ops::Range;
 use std::path::PathBuf;
+use std::sync::Arc;
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use async_trait::async_trait;
 use bytes::Bytes;
 use futures::stream::BoxStream;
+use futures::{StreamExt, TryStreamExt};
 use object_store::local::LocalFileSystem;
 use object_store::path::Path;
 use object_store::{
     CopyOptions, Error as ObjectStoreError, GetOptions, GetResult, ListResult, MultipartUpload,
-    ObjectMeta, ObjectStore, ObjectStoreExt, PutMode, PutMultipartOptions, PutOptions, PutPayload,
-    PutResult, RenameOptions,
+    ObjectMeta, ObjectStore, PutMode, PutMultipartOptions, PutOptions, PutPayload, PutResult,
+    RenameOptions,
 };
 
 /// Wraps a [`LocalFileSystem`] to add `PutMode::Update` support.
 ///
-/// For `PutMode::Update`, it:
-/// 1. Acquires a file-backed advisory lock for the local state root
-/// 2. Reads the current `ETag` of the target file via `head()`
-/// 3. Compares with the expected `ETag` from the [`UpdateVersion`]
-/// 4. Writes with `PutMode::Overwrite` if they match
-/// 5. Releases the advisory lock
+/// For every `put_opts`, it:
+/// 1. Writes the payload to a staged file
+/// 2. Acquires the directory advisory lock
+/// 3. Checks the mode's precondition against the current file: no file for
+///    `PutMode::Create`, the expected `ETag` from the [`UpdateVersion`] for
+///    `PutMode::Update`
+/// 4. Moves the staged file's modification time past every version the
+///    directory has published
+/// 5. Links the staged file into place for `PutMode::Create`, or renames it
+/// 6. Releases the advisory lock
 ///
-/// All other operations are delegated directly to the inner `LocalFileSystem`.
+/// Other operations are delegated. The directory lock path is not an object.
 ///
 /// [`UpdateVersion`]: object_store::UpdateVersion
 pub struct LocalConditionalPut {
-    inner: LocalFileSystem,
+    inner: Arc<LocalFileSystem>,
     root: PathBuf,
-    semaphore: LocalFileSemaphore,
+    writes: tokio::sync::mpsc::Sender<Publication>,
 }
 
-#[derive(Debug, Clone)]
-struct LocalFileSemaphore {
-    lock_path: PathBuf,
+struct Publication {
+    location: Path,
+    path: PathBuf,
+    payload: PutPayload,
+    options: PutOptions,
+    reply: tokio::sync::oneshot::Sender<Result<PutResult, ObjectStoreError>>,
 }
 
-struct LocalFileSemaphoreGuard {
-    _file: File,
+fn worker_error(source: impl std::error::Error + Send + Sync + 'static) -> ObjectStoreError {
+    ObjectStoreError::Generic {
+        store: "LocalConditionalPut",
+        source: Box::new(source),
+    }
 }
 
-impl LocalFileSemaphore {
-    fn new(root: &std::path::Path) -> Self {
-        Self {
-            lock_path: root.join(".spice-object-store-occ.lock"),
+fn is_publication_lock(location: &Path) -> bool {
+    matches!(
+        location.filename(),
+        Some(".spice-occ-lock" | ".spice-object-store-occ.lock")
+    )
+}
+
+fn lock_file(path: &std::path::Path) -> Result<std::fs::File, ObjectStoreError> {
+    let open = || {
+        OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(path)
+    };
+    let file = match open() {
+        Err(source) if source.kind() == io::ErrorKind::NotFound => {
+            if let Some(parent) = path.parent() {
+                std::fs::create_dir_all(parent).map_err(worker_error)?;
+            }
+            open()
+        }
+        opened => opened,
+    }
+    .map_err(worker_error)?;
+    file.lock().map_err(worker_error)?;
+    Ok(file)
+}
+
+fn reserved_lock_error(location: &Path) -> ObjectStoreError {
+    ObjectStoreError::Generic {
+        store: "LocalConditionalPut",
+        source: format!("path {location} is reserved for the conditional-write lock").into(),
+    }
+}
+
+/// One lock file per directory. Equivalent store roots then share it, and
+/// deleting an object does not leave a lock behind for every key.
+fn publication_lock_path(root: &std::path::Path, location: &Path) -> PathBuf {
+    let object_path = root.join(location.as_ref());
+    object_path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or(root)
+        .join(".spice-occ-lock")
+}
+
+/// Runs on its own thread with blocking filesystem calls. The lock and
+/// publication have one owner, even when the caller drops its future or shuts
+/// its runtime down. The bounded queue limits pending payloads; closing all
+/// senders drains accepted writes and exits.
+fn write_worker(root: &std::path::Path, mut receive: tokio::sync::mpsc::Receiver<Publication>) {
+    while let Some(request) = receive.blocking_recv() {
+        let result = publish(
+            root,
+            &request.location,
+            &request.path,
+            &request.payload,
+            &request.options,
+        );
+        // A dropped receiver means an unknown outcome for the caller, not abort.
+        let _ = request.reply.send(result);
+    }
+}
+
+/// How far past the directory's last publication a staged version's
+/// modification time is moved: the `ETag`'s resolution. A filesystem that
+/// cannot store it waits for the clock instead.
+const STAMP_STEP: Duration = Duration::from_micros(1);
+
+/// How long a filesystem with coarse timestamps, such as FAT's two seconds,
+/// may wait for the clock to pass the floor.
+const COARSE_TIMESTAMP_WAIT: Duration = Duration::from_secs(5);
+
+const COARSE_TIMESTAMP_POLL: Duration = Duration::from_millis(1);
+
+/// A file whose modification time can be read and set: the staged file, or a
+/// test double for a filesystem with coarse timestamps.
+trait Timestamped {
+    fn modified(&self) -> io::Result<SystemTime>;
+    fn set_modified(&self, time: SystemTime) -> io::Result<()>;
+}
+
+impl Timestamped for std::fs::File {
+    fn modified(&self) -> io::Result<SystemTime> {
+        self.metadata()?.modified()
+    }
+
+    fn set_modified(&self, time: SystemTime) -> io::Result<()> {
+        std::fs::File::set_modified(self, time)
+    }
+}
+
+/// `LocalFileSystem` reads an unavailable modification time as the epoch.
+fn mtime_or_epoch(metadata: &std::fs::Metadata) -> SystemTime {
+    metadata.modified().unwrap_or(UNIX_EPOCH)
+}
+
+fn micros(time: SystemTime) -> u64 {
+    let micros = time
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_micros();
+    u64::try_from(micros).unwrap_or(u64::MAX)
+}
+
+#[cfg(unix)]
+fn inode(metadata: &std::fs::Metadata) -> u64 {
+    std::os::unix::fs::MetadataExt::ino(metadata)
+}
+
+#[cfg(not(unix))]
+fn inode(_metadata: &std::fs::Metadata) -> u64 {
+    0
+}
+
+/// The `ETag` `LocalFileSystem` reports for a file with this metadata and
+/// modification time. `put_returns_the_etag_head_reports` pins the two
+/// together.
+fn local_etag(metadata: &std::fs::Metadata, modified: SystemTime) -> String {
+    format!(
+        "{:x}-{:x}-{:x}",
+        inode(metadata),
+        micros(modified),
+        metadata.len()
+    )
+}
+
+/// Removes a staged file when dropped, unless a rename moved it into place:
+/// its name is then free for another writer's staged file.
+struct Staging {
+    path: PathBuf,
+    renamed: bool,
+}
+
+impl Drop for Staging {
+    fn drop(&mut self) {
+        if !self.renamed {
+            let _ = std::fs::remove_file(&self.path);
         }
     }
+}
 
-    async fn acquire(&self) -> Result<LocalFileSemaphoreGuard, ObjectStoreError> {
-        let lock_path = self.lock_path.clone();
-        let file = tokio::task::spawn_blocking(move || -> io::Result<File> {
-            let file = OpenOptions::new()
-                .read(true)
-                .write(true)
-                .create(true)
-                .truncate(false)
-                .open(&lock_path)?;
-            file.lock()?;
-            Ok(file)
-        })
-        .await
-        .map_err(|source| ObjectStoreError::Generic {
-            store: "LocalConditionalPut",
-            source: Box::new(source),
-        })?
-        .map_err(|source| ObjectStoreError::Generic {
-            store: "LocalConditionalPut",
-            source: Box::new(source),
-        })?;
+/// Writes the payload to a new `{path}#{n}` file beside the target: the name
+/// `LocalFileSystem` gives its own staged uploads and leaves out of listings.
+fn stage(
+    path: &std::path::Path,
+    payload: &PutPayload,
+) -> Result<(std::fs::File, Staging), ObjectStoreError> {
+    let mut suffix = 1_u64;
+    let mut created_parent = false;
+    let (mut file, staging) = loop {
+        let mut staging = path.as_os_str().to_owned();
+        staging.push(format!("#{suffix}"));
+        let staging = PathBuf::from(staging);
+        match OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create_new(true)
+            .open(&staging)
+        {
+            Ok(file) => {
+                break (
+                    file,
+                    Staging {
+                        path: staging,
+                        renamed: false,
+                    },
+                );
+            }
+            Err(source) if source.kind() == io::ErrorKind::AlreadyExists => suffix += 1,
+            Err(source) if source.kind() == io::ErrorKind::NotFound && !created_parent => {
+                let parent = path.parent().ok_or_else(|| worker_error(source))?;
+                std::fs::create_dir_all(parent).map_err(worker_error)?;
+                created_parent = true;
+            }
+            Err(source) => return Err(worker_error(source)),
+        }
+    };
+    payload
+        .iter()
+        .try_for_each(|chunk| file.write_all(chunk))
+        .map_err(worker_error)?;
+    Ok((file, staging))
+}
 
-        Ok(LocalFileSemaphoreGuard { _file: file })
+/// Moves the staged file's stored modification time, `written`, past `floor`
+/// at the `ETag`'s microsecond resolution, and returns the stored time.
+fn stamp(
+    staged: &impl Timestamped,
+    written: SystemTime,
+    floor: SystemTime,
+) -> io::Result<SystemTime> {
+    let floor_micros = micros(floor);
+    if micros(written) > floor_micros {
+        return Ok(written);
     }
+    staged.set_modified(UNIX_EPOCH + Duration::from_micros(floor_micros) + STAMP_STEP)?;
+    let stored = staged.modified()?;
+    if micros(stored) > floor_micros {
+        return Ok(stored);
+    }
+    // No time just past the floor survives this filesystem's resolution. A
+    // larger step would put the version ahead of the clock, and every write
+    // faster than the resolution would push it further ahead, while heartbeat
+    // and retention checks read the modification time as when it was written.
+    // So wait for the clock to pass the floor. This thread is the dedicated
+    // writer, not a Tokio worker.
+    let deadline = Instant::now() + COARSE_TIMESTAMP_WAIT;
+    loop {
+        staged.set_modified(SystemTime::now())?;
+        let stored = staged.modified()?;
+        if micros(stored) > floor_micros {
+            return Ok(stored);
+        }
+        if Instant::now() >= deadline {
+            return Err(io::Error::other(format!(
+                "the filesystem kept its modification time at or before the directory's last publication for {COARSE_TIMESTAMP_WAIT:?}, so its ETag could repeat an earlier version's; keep this state on a filesystem that stores sub-second timestamps"
+            )));
+        }
+        std::thread::sleep(COARSE_TIMESTAMP_POLL);
+    }
+}
+
+/// Publishes one put the way `LocalFileSystem::put_opts` does, with the
+/// precondition and the modification-time stamp in between under the lock.
+/// Port any change to that function, such as an fsync option, here too.
+fn publish(
+    root: &std::path::Path,
+    location: &Path,
+    path: &std::path::Path,
+    payload: &PutPayload,
+    options: &PutOptions,
+) -> Result<PutResult, ObjectStoreError> {
+    // Every writer in this root shares the legacy lock, so the payload is
+    // written before it is taken.
+    let (staged, mut staging) = stage(path, payload)?;
+    let written = staged.metadata().map_err(worker_error)?;
+    // Take the legacy root lock before the directory lock. An older process
+    // locks only the root file. Reversing this order can deadlock with a writer
+    // that still uses this order.
+    let _legacy_guard = lock_file(&root.join(".spice-object-store-occ.lock"))?;
+    let directory_guard = lock_file(&publication_lock_path(root, location))?;
+    // `LocalFileSystem` reports a directory at an object's path as no object.
+    let current = match std::fs::metadata(path) {
+        Ok(metadata) if metadata.is_dir() => None,
+        Ok(metadata) => Some(metadata),
+        Err(source) if source.kind() == io::ErrorKind::NotFound => None,
+        Err(source) => return Err(worker_error(source)),
+    };
+    match (&options.mode, &current) {
+        (PutMode::Create, Some(_)) => {
+            return Err(ObjectStoreError::AlreadyExists {
+                path: location.to_string(),
+                source: "an object already exists at this path".into(),
+            });
+        }
+        (PutMode::Update(_), None) => {
+            return Err(ObjectStoreError::NotFound {
+                path: location.to_string(),
+                source: "no object exists at this path".into(),
+            });
+        }
+        (PutMode::Update(expected), Some(current)) => {
+            // LocalFileSystem supplies ETags but no object version IDs.
+            let found = local_etag(current, mtime_or_epoch(current));
+            if expected.e_tag.as_deref() != Some(found.as_str()) {
+                return Err(ObjectStoreError::Precondition {
+                    path: location.to_string(),
+                    source: format!(
+                        "ETag mismatch: expected {:?}, found {:?}",
+                        expected.e_tag,
+                        Some(found)
+                    )
+                    .into(),
+                });
+            }
+        }
+        _ => {}
+    }
+    // The lock file's modification time is the latest one this directory has
+    // published. The current file's covers a version a writer without this
+    // floor published.
+    let published = mtime_or_epoch(&directory_guard.metadata().map_err(worker_error)?);
+    let floor = current
+        .as_ref()
+        .map_or(published, |current| mtime_or_epoch(current).max(published));
+    let modified = stamp(&staged, mtime_or_epoch(&written), floor).map_err(|source| {
+        ObjectStoreError::Generic {
+            store: "LocalConditionalPut",
+            source: format!("Failed to write '{location}': {source}").into(),
+        }
+    })?;
+    // Advance the floor before the version becomes visible, so no published
+    // version is ever past it.
+    directory_guard
+        .set_modified(modified)
+        .map_err(worker_error)?;
+    // Some FUSE filesystems, such as Blobfuse, upload a file only once it is
+    // closed.
+    drop(staged);
+    let linked = if matches!(options.mode, PutMode::Create) {
+        std::fs::hard_link(&staging.path, path)
+    } else {
+        std::fs::rename(&staging.path, path).inspect(|()| staging.renamed = true)
+    };
+    linked.map_err(|source| {
+        if source.kind() == io::ErrorKind::AlreadyExists {
+            ObjectStoreError::AlreadyExists {
+                path: location.to_string(),
+                source: Box::new(source),
+            }
+        } else {
+            worker_error(source)
+        }
+    })?;
+    Ok(PutResult {
+        e_tag: Some(local_etag(&written, modified)),
+        version: None,
+    })
 }
 
 impl std::fmt::Debug for LocalConditionalPut {
@@ -128,12 +451,17 @@ impl LocalConditionalPut {
     /// (e.g. `root` does not exist or is not a directory).
     pub fn new(root: impl Into<PathBuf>) -> Result<Self, ObjectStoreError> {
         let root = root.into();
-        let inner = LocalFileSystem::new_with_prefix(&root)?;
-        let semaphore = LocalFileSemaphore::new(&root);
+        let inner = Arc::new(LocalFileSystem::new_with_prefix(&root)?);
+        let (writes, receive) = tokio::sync::mpsc::channel(1);
+        let worker_root = root.clone();
+        std::thread::Builder::new()
+            .name("local-state-writer".to_owned())
+            .spawn(move || write_worker(&worker_root, receive))
+            .map_err(worker_error)?;
         Ok(Self {
             inner,
             root,
-            semaphore,
+            writes,
         })
     }
 }
@@ -153,35 +481,28 @@ impl ObjectStore for LocalConditionalPut {
         payload: PutPayload,
         opts: PutOptions,
     ) -> Result<PutResult, ObjectStoreError> {
-        if let PutMode::Update(expected) = &opts.mode {
-            let expected = expected.clone();
-            let _guard = self.semaphore.acquire().await?;
-
-            // Read current ETag.
-            // Note: only `e_tag` is compared because `LocalFileSystem` does not
-            // support object versioning — `PutResult::version` is always `None`.
-            let current_meta = self.inner.head(location).await?;
-
-            if current_meta.e_tag != expected.e_tag {
-                return Err(ObjectStoreError::Precondition {
-                    path: location.to_string(),
-                    source: format!(
-                        "ETag mismatch: expected {:?}, found {:?}",
-                        expected.e_tag, current_meta.e_tag
-                    )
-                    .into(),
-                });
-            }
-
-            // ETag matches — write with overwrite mode.
-            let overwrite_opts = PutOptions {
-                mode: PutMode::Overwrite,
-                ..opts
-            };
-            self.inner.put_opts(location, payload, overwrite_opts).await
-        } else {
-            self.inner.put_opts(location, payload, opts).await
+        if is_publication_lock(location) {
+            return Err(reserved_lock_error(location));
         }
+        if !opts.attributes.is_empty() {
+            return Err(ObjectStoreError::NotImplemented {
+                operation: "`put_opts` with `opts.attributes` specified".into(),
+                implementer: self.to_string(),
+            });
+        }
+        let path = self.inner.path_to_filesystem(location)?;
+        let (reply, result) = tokio::sync::oneshot::channel();
+        self.writes
+            .send(Publication {
+                location: location.clone(),
+                path,
+                payload,
+                options: opts,
+                reply,
+            })
+            .await
+            .map_err(|_| worker_error(io::Error::other("local state writer stopped")))?;
+        result.await.map_err(worker_error)?
     }
 
     async fn put_multipart_opts(
@@ -189,6 +510,9 @@ impl ObjectStore for LocalConditionalPut {
         location: &Path,
         opts: PutMultipartOptions,
     ) -> Result<Box<dyn MultipartUpload>, ObjectStoreError> {
+        if is_publication_lock(location) {
+            return Err(reserved_lock_error(location));
+        }
         self.inner.put_multipart_opts(location, opts).await
     }
 
@@ -197,6 +521,12 @@ impl ObjectStore for LocalConditionalPut {
         location: &Path,
         options: GetOptions,
     ) -> Result<GetResult, ObjectStoreError> {
+        if is_publication_lock(location) {
+            return Err(ObjectStoreError::NotFound {
+                path: location.to_string(),
+                source: "reserved for the conditional-write lock".into(),
+            });
+        }
         self.inner.get_opts(location, options).await
     }
 
@@ -204,7 +534,10 @@ impl ObjectStore for LocalConditionalPut {
         &self,
         prefix: Option<&Path>,
     ) -> BoxStream<'static, Result<ObjectMeta, ObjectStoreError>> {
-        self.inner.list(prefix)
+        self.inner
+            .list(prefix)
+            .try_filter(|meta| futures::future::ready(!is_publication_lock(&meta.location)))
+            .boxed()
     }
 
     fn list_with_offset(
@@ -212,14 +545,21 @@ impl ObjectStore for LocalConditionalPut {
         prefix: Option<&Path>,
         offset: &Path,
     ) -> BoxStream<'static, Result<ObjectMeta, ObjectStoreError>> {
-        self.inner.list_with_offset(prefix, offset)
+        let offset = offset.clone();
+        self.list(prefix)
+            .try_filter(move |meta| futures::future::ready(meta.location > offset))
+            .boxed()
     }
 
     async fn list_with_delimiter(
         &self,
         prefix: Option<&Path>,
     ) -> Result<ListResult, ObjectStoreError> {
-        self.inner.list_with_delimiter(prefix).await
+        let mut result = self.inner.list_with_delimiter(prefix).await?;
+        result
+            .objects
+            .retain(|meta| !is_publication_lock(&meta.location));
+        Ok(result)
     }
 
     async fn get_ranges(
@@ -234,7 +574,24 @@ impl ObjectStore for LocalConditionalPut {
         &self,
         locations: BoxStream<'static, Result<Path, ObjectStoreError>>,
     ) -> BoxStream<'static, Result<Path, ObjectStoreError>> {
-        self.inner.delete_stream(locations)
+        let inner = Arc::clone(&self.inner);
+        locations
+            .then(move |item| {
+                let inner = Arc::clone(&inner);
+                async move {
+                    let path = item?;
+                    if is_publication_lock(&path) {
+                        return Err(reserved_lock_error(&path));
+                    }
+                    let mut deleted =
+                        inner.delete_stream(futures::stream::once(async move { Ok(path) }).boxed());
+                    match deleted.next().await {
+                        Some(result) => result,
+                        None => Err(worker_error(io::Error::other("delete produced no result"))),
+                    }
+                }
+            })
+            .boxed()
     }
 
     async fn copy_opts(
@@ -243,6 +600,13 @@ impl ObjectStore for LocalConditionalPut {
         to: &Path,
         options: CopyOptions,
     ) -> Result<(), ObjectStoreError> {
+        if is_publication_lock(from) || is_publication_lock(to) {
+            return Err(reserved_lock_error(if is_publication_lock(to) {
+                to
+            } else {
+                from
+            }));
+        }
         self.inner.copy_opts(from, to, options).await
     }
 
@@ -252,13 +616,21 @@ impl ObjectStore for LocalConditionalPut {
         to: &Path,
         options: RenameOptions,
     ) -> Result<(), ObjectStoreError> {
+        if is_publication_lock(from) || is_publication_lock(to) {
+            return Err(reserved_lock_error(if is_publication_lock(to) {
+                to
+            } else {
+                from
+            }));
+        }
         self.inner.rename_opts(from, to, options).await
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use object_store::UpdateVersion;
+    use futures::TryStreamExt;
+    use object_store::{ObjectStoreExt, UpdateVersion};
 
     use super::*;
 
@@ -355,6 +727,83 @@ mod tests {
         let get_result = store.get(&path).await.expect("get should succeed");
         let bytes = get_result.bytes().await.expect("read bytes");
         assert_eq!(bytes.as_ref(), b"v2");
+    }
+
+    #[tokio::test]
+    async fn publication_lock_is_hidden_and_cannot_be_replaced() {
+        let dir = tempfile::tempdir().expect("create temp dir");
+        let store = LocalConditionalPut::new(dir.path()).expect("create store");
+        let path = Path::from("cluster/state.json");
+        let created = store
+            .put_opts(
+                &path,
+                b"v1".as_slice().into(),
+                PutOptions::from(PutMode::Create),
+            )
+            .await
+            .expect("create");
+        store
+            .put_opts(
+                &path,
+                b"v2".as_slice().into(),
+                PutOptions::from(PutMode::Update(UpdateVersion {
+                    e_tag: created.e_tag,
+                    version: None,
+                })),
+            )
+            .await
+            .expect("update");
+
+        let locks = [
+            (
+                Path::from("cluster/.spice-occ-lock"),
+                dir.path().join("cluster/.spice-occ-lock"),
+            ),
+            (
+                Path::from(".spice-object-store-occ.lock"),
+                dir.path().join(".spice-object-store-occ.lock"),
+            ),
+        ];
+        for (_, lock_file) in &locks {
+            assert!(
+                lock_file.is_file(),
+                "conditional update must create {}",
+                lock_file.display()
+            );
+        }
+        let listed = store
+            .list(None)
+            .try_collect::<Vec<_>>()
+            .await
+            .expect("list");
+        assert!(
+            listed
+                .iter()
+                .all(|meta| !is_publication_lock(&meta.location)),
+            "list must hide both locks: {listed:?}"
+        );
+        for (lock, lock_file) in locks {
+            assert!(
+                matches!(
+                    store.get(&lock).await,
+                    Err(ObjectStoreError::NotFound { .. })
+                ),
+                "get must not expose {lock}"
+            );
+            assert!(
+                store.delete(&lock).await.is_err(),
+                "delete must not unlink {lock}"
+            );
+            assert!(
+                store
+                    .put(&lock, b"replaced".as_slice().into())
+                    .await
+                    .is_err(),
+                "put must not replace {lock}"
+            );
+            assert!(lock_file.is_file(), "{} must remain", lock_file.display());
+            assert_eq!(std::fs::read(&lock_file).expect("read lock"), b"");
+        }
     }
 
     #[tokio::test]
@@ -686,6 +1135,205 @@ mod tests {
             matches!(r1, Err(ObjectStoreError::Precondition { .. }))
                 || matches!(r2, Err(ObjectStoreError::Precondition { .. })),
             "exactly one writer should fail with Precondition; r1={r1:?}, r2={r2:?}"
+        );
+    }
+
+    /// Same-size payloads, so only the inode and modification time can tell
+    /// two versions' `ETag`s apart.
+    fn versioned_payload(version: usize) -> PutPayload {
+        PutPayload::from(format!("{version:08}").into_bytes())
+    }
+
+    /// Every version of a path carries an `ETag` no earlier version of it had,
+    /// and an update built on any superseded version is refused. The check
+    /// compares `ETag`s alone, so a repeat would let that update replace newer
+    /// data. On ext4, a staged file reuses the inode the previous replacement
+    /// freed, and versions written within one clock tick share a modification
+    /// time, so without the floor version 2 repeats version 0's `ETag`.
+    #[tokio::test]
+    async fn a_superseded_etag_never_matches_a_later_version() {
+        let dir = tempfile::tempdir().expect("create temp dir");
+        let store = LocalConditionalPut::new(dir.path()).expect("create store");
+        let path = Path::from("test/versions.json");
+        let versions = 1000;
+
+        let mut etags = vec![
+            store
+                .put_opts(
+                    &path,
+                    versioned_payload(0),
+                    PutOptions::from(PutMode::Create),
+                )
+                .await
+                .expect("create version 0")
+                .e_tag
+                .expect("version 0 has an ETag"),
+        ];
+        for version in 1..versions {
+            let mode = match version % 10 {
+                // A key that is deleted and created again.
+                0 => {
+                    store.delete(&path).await.expect("delete");
+                    PutMode::Create
+                }
+                5 => PutMode::Overwrite,
+                _ => PutMode::Update(UpdateVersion {
+                    e_tag: etags.last().cloned(),
+                    version: None,
+                }),
+            };
+            let etag = store
+                .put_opts(&path, versioned_payload(version), PutOptions::from(mode))
+                .await
+                .unwrap_or_else(|error| panic!("write version {version}: {error}"))
+                .e_tag
+                .expect("every version has an ETag");
+            if let Some(earlier) = etags.iter().position(|earlier| *earlier == etag) {
+                panic!("version {version} repeats the ETag {etag} of version {earlier}");
+            }
+            etags.push(etag);
+        }
+
+        for (version, stale) in etags.iter().enumerate().take(versions - 1) {
+            let result = store
+                .put_opts(
+                    &path,
+                    b"stale".as_slice().into(),
+                    PutOptions::from(PutMode::Update(UpdateVersion {
+                        e_tag: Some(stale.clone()),
+                        version: None,
+                    })),
+                )
+                .await;
+            assert!(
+                matches!(result, Err(ObjectStoreError::Precondition { .. })),
+                "an update built on version {version} must be refused, got {result:?}"
+            );
+        }
+        let bytes = store
+            .get(&path)
+            .await
+            .expect("get")
+            .bytes()
+            .await
+            .expect("read bytes");
+        assert_eq!(bytes.as_ref(), format!("{:08}", versions - 1).as_bytes());
+    }
+
+    /// `put_opts` computes the `ETag` itself; it must be the one `head()` and
+    /// `get()` report, or every conditional update after it would be refused.
+    #[tokio::test]
+    async fn put_returns_the_etag_head_reports() {
+        let dir = tempfile::tempdir().expect("create temp dir");
+        let store = LocalConditionalPut::new(dir.path()).expect("create store");
+        let path = Path::from("test/etag.json");
+
+        let created = store
+            .put_opts(
+                &path,
+                versioned_payload(0),
+                PutOptions::from(PutMode::Create),
+            )
+            .await
+            .expect("create");
+        let head = store.head(&path).await.expect("head after create");
+        assert_eq!(created.e_tag, head.e_tag, "create");
+
+        let overwritten = store
+            .put_opts(
+                &path,
+                versioned_payload(1),
+                PutOptions::from(PutMode::Overwrite),
+            )
+            .await
+            .expect("overwrite");
+        let head = store.head(&path).await.expect("head after overwrite");
+        assert_eq!(overwritten.e_tag, head.e_tag, "overwrite");
+
+        let updated = store
+            .put_opts(
+                &path,
+                versioned_payload(2),
+                PutOptions::from(PutMode::Update(UpdateVersion {
+                    e_tag: overwritten.e_tag,
+                    version: None,
+                })),
+            )
+            .await
+            .expect("update");
+        let get = store.get(&path).await.expect("get after update");
+        assert_eq!(updated.e_tag, get.meta.e_tag, "update");
+        assert_eq!(get.bytes().await.expect("read bytes").as_ref(), b"00000002");
+    }
+
+    /// A staged file on a filesystem that stores whole seconds.
+    struct WholeSecondFile(std::cell::Cell<SystemTime>);
+
+    impl Timestamped for WholeSecondFile {
+        fn modified(&self) -> io::Result<SystemTime> {
+            Ok(self.0.get())
+        }
+
+        fn set_modified(&self, time: SystemTime) -> io::Result<()> {
+            let seconds = time
+                .duration_since(UNIX_EPOCH)
+                .map_err(io::Error::other)?
+                .as_secs();
+            self.0.set(UNIX_EPOCH + Duration::from_secs(seconds));
+            Ok(())
+        }
+    }
+
+    /// On a filesystem whose timestamps cannot hold a time just past the
+    /// floor, the version's time still moves past it without running ahead of
+    /// the clock, which heartbeat and retention checks read as when the object
+    /// was written.
+    #[test]
+    fn a_coarse_timestamp_waits_for_the_clock_instead_of_running_ahead() {
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock after the epoch");
+        let floor = UNIX_EPOCH + Duration::from_secs(now.as_secs());
+        let staged = WholeSecondFile(std::cell::Cell::new(floor));
+
+        let stored = stamp(&staged, floor, floor).expect("stamp past the floor");
+
+        assert_eq!(stored, staged.0.get(), "stamp returns the stored time");
+        assert!(stored > floor, "stored {stored:?} is not past {floor:?}");
+        assert!(
+            stored <= SystemTime::now(),
+            "stored {stored:?} is ahead of the clock"
+        );
+    }
+
+    /// A directory at an object's path is no object, as `LocalFileSystem`
+    /// reports it: an update there finds nothing to replace.
+    #[tokio::test]
+    async fn an_update_at_a_directory_path_finds_no_object() {
+        let dir = tempfile::tempdir().expect("create temp dir");
+        let store = LocalConditionalPut::new(dir.path()).expect("create store");
+        store
+            .put_opts(
+                &Path::from("test/parent/child.json"),
+                versioned_payload(0),
+                PutOptions::from(PutMode::Create),
+            )
+            .await
+            .expect("create a child, making test/parent a directory");
+
+        let result = store
+            .put_opts(
+                &Path::from("test/parent"),
+                versioned_payload(1),
+                PutOptions::from(PutMode::Update(UpdateVersion {
+                    e_tag: Some("any".to_string()),
+                    version: None,
+                })),
+            )
+            .await;
+        assert!(
+            matches!(result, Err(ObjectStoreError::NotFound { .. })),
+            "got {result:?}"
         );
     }
 }

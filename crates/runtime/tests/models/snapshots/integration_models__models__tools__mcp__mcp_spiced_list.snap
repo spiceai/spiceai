@@ -211,7 +211,7 @@ expression: tools_list
           ]
         },
         "text": {
-          "description": "The text to search documents for similarity",
+          "description": "The text to search documents for similarity. Must contain at least one non-whitespace character.",
           "type": "string"
         },
         "where": {
@@ -431,7 +431,7 @@ expression: tools_list
           ]
         },
         "text": {
-          "description": "The text to search documents for similarity",
+          "description": "The text to search documents for similarity. Must contain at least one non-whitespace character.",
           "type": "string"
         },
         "where": {

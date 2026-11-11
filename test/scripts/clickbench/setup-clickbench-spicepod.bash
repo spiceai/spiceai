@@ -112,6 +112,7 @@ echo "    params:" >> spicepod.yaml
 echo "      duckdb_open: $dbname" >> spicepod.yaml
 echo "    acceleration:" >> spicepod.yaml
 echo "      enabled: true" >> spicepod.yaml
+echo "      engine: arrow" >> spicepod.yaml
 fi
 
 # Load clickbench data into Postgres Accelerator

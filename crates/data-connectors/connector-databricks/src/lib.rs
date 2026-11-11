@@ -36,14 +36,15 @@ use data_connector_api::{
     DataConnectorResult, NewDataConnectorResult,
 };
 use data_http_rate_control as http_rate_control;
+use datafusion::common::TableReference;
 use datafusion::datasource::TableProvider;
 use datafusion::datasource::listing::ListingTableUrl;
 use datafusion::execution::runtime_env::RuntimeEnv;
-use datafusion::sql::TableReference;
 use opentelemetry::KeyValue;
 use runtime::token_providers::databricks::{
     AUTH_MODE_DESCRIPTION, AUTH_MODES, AuthConfigError, AuthCredentials,
-    DatabricksM2MTokenProvider, DatabricksU2MTokenProvider,
+    DatabricksM2MTokenProvider, DatabricksU2MTokenProvider, Error as DatabricksAuthError,
+    WorkloadIdentity,
 };
 use runtime_api_types::v1::ComponentType;
 use runtime_component::ComponentInitialization;
@@ -166,6 +167,8 @@ pub const PARAMETERS: &[ParameterSpec] = &[
         .description("Minimum random delay added before Databricks HTTP requests when rate control is active. Overrides runtime.params.http_rate_control_jitter_min when set. Accepts durations such as '5ms' or '0ms'. Defaults to 5ms when a request-rate limit is configured, otherwise 0ms."),
     ParameterSpec::runtime("rate_control_jitter_max")
         .description("Maximum random delay added before Databricks HTTP requests when rate control is active. Overrides runtime.params.http_rate_control_jitter_max when set. Accepts durations such as '10ms' or '0ms'. Defaults to 10ms when a request-rate limit is configured, otherwise 0ms."),
+    ParameterSpec::runtime("rate_control_acquire_timeout")
+        .description("Maximum time a Databricks HTTP request waits for rate-control capacity before it fails. Overrides runtime.params.http_rate_control_acquire_timeout when set. Accepts durations such as '30s' or '500ms'. Defaults to `client_timeout`. Use '0' for no limit."),
 
     ParameterSpec::component("token")
         .secret()
@@ -191,8 +194,10 @@ pub const PARAMETERS: &[ParameterSpec] = &[
         .help_link(DATABRICKS_DOCS),
 
     // Databricks M2M Service Principal credentials
-    ParameterSpec::component("client_id").description("The client ID of the Databricks service principal."),
+    ParameterSpec::component("client_id").secret().description("The client ID of the Databricks service principal. Defaults to `DATABRICKS_CLIENT_ID` for workload identity federation or beside a client secret."),
     ParameterSpec::component("client_secret").secret().description("The client secret of the Databricks service principal."),
+    ParameterSpec::component("oidc_token_filepath").secret().description("A file that holds the workload's identity token, read again for every exchange, such as a Kubernetes projected service account token. With `databricks_client_id`, it authenticates with workload identity federation. Defaults to `DATABRICKS_OIDC_TOKEN_FILEPATH`."),
+    ParameterSpec::component("token_audience").secret().description("The audience of the identity token Spice requests from a GitHub Actions job or the workload's cloud identity, such as the Databricks account ID. With `databricks_client_id`, it authenticates with workload identity federation. Defaults to `DATABRICKS_TOKEN_AUDIENCE`."),
 
     // S3 storage options
     ParameterSpec::component("aws_region")
@@ -249,6 +254,9 @@ pub const PARAMETERS: &[ParameterSpec] = &[
 /// Databricks data connector.
 pub struct Databricks {
     read_provider: Arc<dyn Read>,
+    /// SQL warehouse metadata lookup used to reject foreign tables on Classic
+    /// warehouses before schema discovery reports them as queryable.
+    sql_warehouse_type_provider: Option<Arc<dyn SqlWarehouseTypeProvider>>,
     initialization: ComponentInitialization,
     metrics: Option<Arc<DatabricksMetrics>>,
     /// Unity Catalog client for table type detection and permission checking.
@@ -266,6 +274,18 @@ pub struct Databricks {
     storage_params: Option<Parameters>,
 }
 
+#[async_trait]
+trait SqlWarehouseTypeProvider: Send + Sync {
+    async fn is_classic_warehouse(&self) -> Result<bool, sql_warehouse::Error>;
+}
+
+#[async_trait]
+impl SqlWarehouseTypeProvider for DatabricksSqlWarehouse {
+    async fn is_classic_warehouse(&self) -> Result<bool, sql_warehouse::Error> {
+        DatabricksSqlWarehouse::is_classic_warehouse(self).await
+    }
+}
+
 impl std::fmt::Debug for Databricks {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Databricks").finish_non_exhaustive()
@@ -280,6 +300,7 @@ impl Databricks {
     /// Returns an error if required parameters are missing or invalid,
     /// or if the connection to Databricks fails.
     pub async fn new(
+        component: &str,
         params: Parameters,
         io_runtime: Handle,
         token_provider_registry: Arc<TokenProviderRegistry>,
@@ -326,9 +347,13 @@ impl Databricks {
                     .expose()
                     .ok_or_else(|p| MissingParameterSnafu { parameter: p.0 }.build())?;
 
-                let token_provider =
-                    Self::get_token_provider(endpoint, auth_credentials, token_provider_registry)
-                        .await?;
+                let token_provider = Self::get_token_provider(
+                    component,
+                    endpoint,
+                    auth_credentials,
+                    token_provider_registry,
+                )
+                .await?;
 
                 let uc_client = match UnityCatalogClient::new_with_rate_controller(
                     Endpoint(endpoint.to_string()),
@@ -362,7 +387,7 @@ impl Databricks {
                         Arc::new(data_components::schema_discovery::NoPermissionsCheck)
                     };
 
-                let read_provider =
+                let read_provider = Arc::new(
                     DatabricksSqlWarehouse::with_config_semaphore_permissions_and_rate_controller(
                         endpoint,
                         sql_warehouse_id,
@@ -372,11 +397,13 @@ impl Databricks {
                         permissions,
                         rate_controller,
                     )
-                    .context(UnableToConstructDatabricksSqlWarehouseSnafu)?;
+                    .context(UnableToConstructDatabricksSqlWarehouseSnafu)?,
+                );
                 let metrics = Some(Arc::clone(read_provider.metrics()));
 
                 Ok(Self {
-                    read_provider: Arc::new(read_provider),
+                    read_provider: Arc::clone(&read_provider) as Arc<dyn Read>,
+                    sql_warehouse_type_provider: Some(read_provider),
                     initialization,
                     metrics,
                     uc_client,
@@ -403,6 +430,15 @@ impl Databricks {
                     AuthCredentials::U2M(client_id) => {
                         Self::get_u2m_token_provider(endpoint, client_id, &token_provider_registry)
                             .await?
+                    }
+                    AuthCredentials::WorkloadIdentity(identity) => {
+                        Self::get_workload_identity_token_provider(
+                            component,
+                            endpoint,
+                            identity,
+                            &token_provider_registry,
+                        )
+                        .await?
                     }
                 };
 
@@ -442,6 +478,7 @@ impl Databricks {
 
                 Ok(Self {
                     read_provider: Arc::clone(&delta_provider) as Arc<dyn Read>,
+                    sql_warehouse_type_provider: None,
                     initialization,
                     metrics: None,
                     uc_client,
@@ -465,6 +502,7 @@ impl Databricks {
                 };
 
                 Self::build_spark_connect_connector(
+                    component,
                     endpoint,
                     auth_credentials,
                     token_provider_registry,
@@ -491,6 +529,7 @@ impl Databricks {
     ///
     /// Returns an error if token provider creation fails.
     pub async fn get_token_provider(
+        component: &str,
         endpoint: &str,
         auth_credentials: AuthCredentials<'_>,
         token_provider_registry: Arc<TokenProviderRegistry>,
@@ -508,6 +547,15 @@ impl Databricks {
             }
             AuthCredentials::U2M(client_id) => {
                 Self::get_u2m_token_provider(endpoint, client_id, &token_provider_registry).await?
+            }
+            AuthCredentials::WorkloadIdentity(identity) => {
+                Self::get_workload_identity_token_provider(
+                    component,
+                    endpoint,
+                    identity,
+                    &token_provider_registry,
+                )
+                .await?
             }
         })
     }
@@ -535,6 +583,7 @@ impl Databricks {
 
     #[cfg(feature = "spark")]
     async fn build_spark_connect_connector(
+        component: &str,
         endpoint: &str,
         auth_credentials: AuthCredentials<'_>,
         token_provider_registry: Arc<TokenProviderRegistry>,
@@ -594,10 +643,33 @@ impl Databricks {
                     .context(UnableToConstructDatabricksSparkSnafu)?,
                 )
             }
+
+            AuthCredentials::WorkloadIdentity(identity) => {
+                let token_provider = Self::get_workload_identity_token_provider(
+                    component,
+                    endpoint,
+                    identity,
+                    &token_provider_registry,
+                )
+                .await?;
+
+                Arc::new(
+                    DatabricksSparkConnect::from_token_provider_with_rate_controller(
+                        endpoint.to_string(),
+                        cluster_id.expose_secret().to_string(),
+                        databricks_use_ssl,
+                        token_provider,
+                        rate_controller.clone(),
+                    )
+                    .await
+                    .context(UnableToConstructDatabricksSparkSnafu)?,
+                )
+            }
         };
 
         Ok(Self {
             read_provider,
+            sql_warehouse_type_provider: None,
 
             // Databricks spark connect doesn't support U2M, so no deferred loading
             initialization: ComponentInitialization::default(),
@@ -660,6 +732,37 @@ impl Databricks {
             })
     }
 
+    /// Gets the refreshing token provider of a service principal that authenticates with workload
+    /// identity federation.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if there is no identity token to request or the first exchange fails.
+    pub async fn get_workload_identity_token_provider(
+        component: &str,
+        endpoint: &str,
+        identity: WorkloadIdentity<'_>,
+        token_provider_registry: &Arc<TokenProviderRegistry>,
+    ) -> Result<Arc<dyn TokenProvider>> {
+        runtime::token_providers::databricks::get_workload_identity_token_provider(
+            component,
+            endpoint,
+            identity,
+            token_provider_registry,
+        )
+        .await
+        .map_err(|error| match error {
+            // Both read as what to set, and a dataset load is retried after either.
+            DatabricksAuthError::InvalidWorkloadIdentity { message, .. }
+            | DatabricksAuthError::NoIdentityToken { message } => {
+                InvalidConfigurationSnafu { message }.build()
+            }
+            other => Error::UnableToGetToken {
+                source: Box::new(other),
+            },
+        })
+    }
+
     /// Validates that a Unity Catalog table is of a supported type and that
     /// the current principal has read access.
     ///
@@ -686,9 +789,16 @@ impl Databricks {
                         dataconnector: "databricks".to_string(),
                         connector_component: ConnectorComponent::from(dataset),
                         message: format!(
-                            "Unsupported Unity Catalog table type '{}' for table '{}'. Only MANAGED, EXTERNAL, FOREIGN, and MATERIALIZED_VIEW tables can be queried.",
+                            "Unsupported Unity Catalog table type '{}' for table '{}'. Only MANAGED, EXTERNAL, FOREIGN, VIEW, MATERIALIZED_VIEW, and STREAMING_TABLE tables can be queried.",
                             uc_table.table_type, full_name
                         ),
+                    });
+                }
+                if self.delta_provider.is_some() && uc_table.is_catalog_managed() {
+                    return Err(DataConnectorError::InvalidConfigurationNoSource {
+                        dataconnector: "databricks".to_string(),
+                        connector_component: ConnectorComponent::from(dataset),
+                        message: catalog_managed_delta_lake_message(&full_name),
                     });
                 }
                 tracing::debug!(
@@ -696,6 +806,31 @@ impl Databricks {
                     table_type = %uc_table.table_type,
                     "Unity Catalog table type is supported"
                 );
+
+                if uc_table.table_type.eq_ignore_ascii_case("FOREIGN")
+                    && let Some(provider) = &self.sql_warehouse_type_provider
+                {
+                    match provider.is_classic_warehouse().await {
+                        Ok(true) => {
+                            return Err(classify_table_provider_error(
+                                dataset,
+                                Box::new(sql_warehouse::Error::ForeignTableOnClassicWarehouse {
+                                    dataset_name: full_name,
+                                    message: "Unity Catalog reports a FOREIGN table and the configured SQL warehouse is Classic"
+                                        .to_string(),
+                                }),
+                            ));
+                        }
+                        Ok(false) => {}
+                        Err(error) => {
+                            tracing::warn!(
+                                table = %full_name,
+                                %error,
+                                "Failed to determine SQL warehouse type for a foreign table; proceeding with schema discovery"
+                            );
+                        }
+                    }
+                }
 
                 if uc_table.requires_read_permission_validation() {
                     true
@@ -811,12 +946,18 @@ async fn reserve_databricks_rate_controller<S: std::hash::BuildHasher>(
             message: source.to_string(),
         }
     })?;
-    let rate_control = http_rate_control::resolve_config_for_component(
+    // The Databricks clients (Unity Catalog, SQL Warehouse, Spark Connect) do
+    // not yet record per-request outcomes, so the configured limits apply
+    // unchanged.
+    let mut rate_control = http_rate_control::resolve_limits_for_component(
         params,
         runtime_rate_control_params,
         component,
         CONNECTOR_NAME,
     )?;
+    rate_control.apply_default_acquire_timeout(
+        runtime::catalogconnector::databricks::effective_client_timeout(params),
+    );
 
     Arc::clone(&rate_control_registry)
         .reserve_shared_rate_controller_for_component(
@@ -923,7 +1064,16 @@ impl DataConnectorFactory for DatabricksFactory {
                     .as_ref()
                     .and_then(|reservation| reservation.shared().controller.clone());
 
+                let component = match &params.component {
+                    ConnectorComponent::Catalog(catalog) => {
+                        format!("catalog '{}' (databricks)", catalog.name)
+                    }
+                    ConnectorComponent::Dataset(dataset) => {
+                        format!("dataset '{}' (databricks)", dataset.name)
+                    }
+                };
                 let databricks_result = Databricks::new(
+                    &component,
                     params.parameters,
                     params.io_runtime,
                     context.token_provider_registry(),
@@ -1088,6 +1238,13 @@ impl DataConnector for Databricks {
 /// configuration failures (e.g. foreign tables on Classic SQL warehouses)
 /// into permanent, non-retriable errors so the runtime surfaces them
 /// immediately instead of retrying indefinitely.
+/// Error for a catalog-managed Delta table requested in `delta_lake` mode.
+fn catalog_managed_delta_lake_message(full_name: &str) -> String {
+    format!(
+        "Table '{full_name}' is a catalog-managed Delta table, and Databricks does not allow reading it directly from storage. Set `mode` to `sql_warehouse` or `spark_connect`. See: https://spiceai.org/docs/components/data-connectors/databricks#parameters"
+    )
+}
+
 fn classify_table_provider_error(
     dataset: &DatasetSpec,
     source: Box<dyn std::error::Error + Send + Sync>,
@@ -1354,6 +1511,16 @@ pub fn factory() -> Arc<dyn DataConnectorFactory> {
 
 #[cfg(test)]
 mod tests {
+    use super::catalog_managed_delta_lake_message;
+
+    #[test]
+    fn catalog_managed_delta_lake_message_text() {
+        assert_eq!(
+            catalog_managed_delta_lake_message("c.s.t"),
+            "Table 'c.s.t' is a catalog-managed Delta table, and Databricks does not allow reading it directly from storage. Set `mode` to `sql_warehouse` or `spark_connect`. See: https://spiceai.org/docs/components/data-connectors/databricks#parameters"
+        );
+    }
+
     use super::*;
     use app::App;
     use datafusion::{
@@ -1426,6 +1593,7 @@ mod tests {
             "requests_per_minute_limit",
             "rate_control_jitter_min",
             "rate_control_jitter_max",
+            "rate_control_acquire_timeout",
         ] {
             assert!(
                 PARAMETERS
@@ -1454,6 +1622,17 @@ mod tests {
             let table = MemTable::try_new(Arc::clone(&schema), vec![Vec::new()])?;
 
             Ok(Arc::new(table))
+        }
+    }
+
+    struct MockSqlWarehouseTypeProvider {
+        is_classic: bool,
+    }
+
+    #[async_trait]
+    impl SqlWarehouseTypeProvider for MockSqlWarehouseTypeProvider {
+        async fn is_classic_warehouse(&self) -> Result<bool, sql_warehouse::Error> {
+            Ok(self.is_classic)
         }
     }
 
@@ -1594,6 +1773,143 @@ mod tests {
         Some(headers_end.saturating_add(content_length))
     }
 
+    /// Databricks does not declare the adaptive tuning parameters
+    /// (`rate_control_failure_threshold`, `rate_control_window`), so resolving
+    /// its rate control must not look them up: an undeclared lookup panics,
+    /// which would fail every Databricks dataset at load.
+    #[tokio::test]
+    async fn databricks_rate_control_resolves_without_adaptive_parameters() {
+        let parameters = Parameters::try_new(
+            "connector databricks",
+            vec![(
+                "databricks_endpoint".to_string(),
+                secrecy::SecretString::from("dbc-abcd.cloud.databricks.com"),
+            )],
+            "databricks",
+            Arc::new(tokio::sync::RwLock::new(runtime_secrets::Secrets::new())),
+            PARAMETERS,
+        )
+        .await
+        .expect("databricks parameters should be accepted");
+        let dataset = make_dataset("databricks:catalog.schema.table", "no_adaptive").await;
+        let component = ConnectorComponent::from(&dataset);
+
+        reserve_databricks_rate_controller(
+            &parameters,
+            None::<&HashMap<String, String>>,
+            Arc::new(http_rate_control::HttpRateControlRegistry::default()),
+            &component,
+            "spicepod",
+        )
+        .await
+        .expect("a Databricks dataset with no rate-control parameters should resolve");
+    }
+
+    /// Databricks bounds its rate-control wait with its own `client_timeout`,
+    /// the rule the HTTPS and GraphQL connectors follow. Datasets that share an
+    /// origin then resolve the same bound whichever connector reaches it first.
+    #[tokio::test]
+    async fn databricks_rate_control_defaults_the_acquire_timeout_to_client_timeout() {
+        let parameters = Parameters::try_new(
+            "connector databricks",
+            vec![
+                (
+                    "databricks_endpoint".to_string(),
+                    secrecy::SecretString::from("dbc-abcd.cloud.databricks.com"),
+                ),
+                (
+                    "databricks_requests_per_second_limit".to_string(),
+                    secrecy::SecretString::from("10"),
+                ),
+                (
+                    "client_timeout".to_string(),
+                    secrecy::SecretString::from("45s"),
+                ),
+            ],
+            "databricks",
+            Arc::new(tokio::sync::RwLock::new(runtime_secrets::Secrets::new())),
+            PARAMETERS,
+        )
+        .await
+        .expect("databricks parameters should be accepted");
+        let dataset = make_dataset("databricks:catalog.schema.table", "acquire_timeout").await;
+        let component = ConnectorComponent::from(&dataset);
+
+        let reservation = reserve_databricks_rate_controller(
+            &parameters,
+            None::<&HashMap<String, String>>,
+            Arc::new(http_rate_control::HttpRateControlRegistry::default()),
+            &component,
+            "spicepod",
+        )
+        .await
+        .expect("a Databricks dataset with a rate limit should resolve")
+        .expect("a dataset reserves a rate controller");
+
+        assert_eq!(
+            reservation.shared().config.acquire_timeout,
+            Some(std::time::Duration::from_secs(45)),
+            "the acquire bound must come from client_timeout"
+        );
+    }
+
+    /// Databricks does not record request outcomes yet, so its adaptive
+    /// controller stays at full admission and the configured limits apply
+    /// unchanged. The runtime-wide adaptive tuning defaults must not stop a
+    /// Databricks dataset from loading.
+    #[tokio::test]
+    async fn databricks_rate_control_applies_the_configured_limits() {
+        let parameters = Parameters::try_new(
+            "connector databricks",
+            vec![
+                (
+                    "databricks_endpoint".to_string(),
+                    secrecy::SecretString::from("dbc-abcd.cloud.databricks.com"),
+                ),
+                (
+                    "databricks_requests_per_second_limit".to_string(),
+                    secrecy::SecretString::from("10"),
+                ),
+            ],
+            "databricks",
+            Arc::new(tokio::sync::RwLock::new(runtime_secrets::Secrets::new())),
+            PARAMETERS,
+        )
+        .await
+        .expect("databricks parameters should be accepted");
+        let runtime_params = HashMap::from([
+            (
+                "http_rate_control_failure_threshold".to_string(),
+                "25%".to_string(),
+            ),
+            ("http_rate_control_window".to_string(), "30s".to_string()),
+        ]);
+        let dataset = make_dataset("databricks:catalog.schema.table", "adaptive_default").await;
+        let component = ConnectorComponent::from(&dataset);
+
+        let reservation = reserve_databricks_rate_controller(
+            &parameters,
+            Some(&runtime_params),
+            Arc::new(http_rate_control::HttpRateControlRegistry::default()),
+            &component,
+            "spicepod",
+        )
+        .await
+        .expect("the runtime-wide adaptive defaults must not fail a Databricks dataset");
+        let reservation = reservation.expect("a dataset reserves a rate controller");
+        let controller = reservation
+            .shared()
+            .controller
+            .as_ref()
+            .expect("a rate-limited dataset has a controller");
+        assert_eq!(
+            controller.admission_coefficient(),
+            Some(1.0),
+            "with no reported outcomes the configured limits apply unchanged"
+        );
+        reservation.rollback().await;
+    }
+
     async fn make_dataset(from: &str, name: &str) -> Dataset {
         let runtime = Arc::new(Runtime::builder().build().await);
         DatasetBuilder::try_new(from.to_string(), name)
@@ -1608,6 +1924,14 @@ mod tests {
         dataset_from: &str,
         responses: Vec<MockHttpResponse>,
     ) -> (DataConnectorResult<()>, usize, usize, Vec<String>) {
+        run_read_provider_with_uc_responses_and_warehouse_type(dataset_from, responses, None).await
+    }
+
+    async fn run_read_provider_with_uc_responses_and_warehouse_type(
+        dataset_from: &str,
+        responses: Vec<MockHttpResponse>,
+        sql_warehouse_type_provider: Option<Arc<dyn SqlWarehouseTypeProvider>>,
+    ) -> (DataConnectorResult<()>, usize, usize, Vec<String>) {
         let (endpoint, requests, captured_requests) = start_mock_server(responses).await;
 
         let read_call_count = Arc::new(AtomicUsize::new(0));
@@ -1615,6 +1939,7 @@ mod tests {
             read_provider: Arc::new(MockRead {
                 call_count: Arc::clone(&read_call_count),
             }),
+            sql_warehouse_type_provider,
             initialization: ComponentInitialization::default(),
             metrics: None,
             uc_client: Some(Arc::new(
@@ -1757,7 +2082,12 @@ mod tests {
             "Databricks::build_auth_credentials should return an error"
         );
         if let Err(error) = result {
-            assert!(error.to_string().contains("Missing `databricks_token` or `databricks_client_id` and `databricks_client_secret` parameters"));
+            assert!(
+                error
+                    .to_string()
+                    .contains(runtime::token_providers::databricks::NO_CREDENTIAL_MESSAGE),
+                "{error}"
+            );
         }
     }
 
@@ -1767,7 +2097,10 @@ mod tests {
         let params_vec = vec![("client_id".to_string(), SecretString::from(client_id))];
         let parameters = Parameters::new(params_vec, "databricks", PARAMETERS);
 
-        let result = Databricks::build_auth_credentials(&parameters);
+        // Outside a GitHub Actions job, whatever the job running the test: in one, a client ID
+        // alone is workload identity federation.
+        let result =
+            runtime::token_providers::databricks::build_auth_credentials_in(&parameters, false);
 
         assert!(
             result.is_ok(),
@@ -2034,12 +2367,13 @@ mod tests {
     #[tokio::test]
     async fn test_read_provider_skips_effective_permissions_for_foreign_tables() {
         let (result, read_call_count, request_count, captured_requests) =
-            run_read_provider_with_uc_responses(
+            run_read_provider_with_uc_responses_and_warehouse_type(
                 "databricks:workspace.tpch_sf400.part",
                 vec![MockHttpResponse::json(
                     "200 OK",
                     r#"{"name":"part","catalog_name":"workspace","schema_name":"tpch_sf400","table_type":"FOREIGN","data_source_format":"DELTA","columns":[],"storage_location":null}"#,
                 )],
+                Some(Arc::new(MockSqlWarehouseTypeProvider { is_classic: false })),
             )
             .await;
 
@@ -2063,13 +2397,85 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_read_provider_rejects_foreign_table_on_classic_before_schema_discovery() {
+        let (result, read_call_count, request_count, captured_requests) =
+            run_read_provider_with_uc_responses_and_warehouse_type(
+                "databricks:workspace.tpch_sf400.part",
+                vec![MockHttpResponse::json(
+                    "200 OK",
+                    r#"{"name":"part","catalog_name":"workspace","schema_name":"tpch_sf400","table_type":"FOREIGN","data_source_format":"DELTA","columns":[],"storage_location":null}"#,
+                )],
+                Some(Arc::new(MockSqlWarehouseTypeProvider { is_classic: true })),
+            )
+            .await;
+
+        let error = result.expect_err("Classic warehouses cannot query foreign tables");
+        assert!(
+            matches!(error, DataConnectorError::InvalidConfigurationNoSource { ref message, .. } if message.contains("Lakehouse Federation foreign table")),
+            "unexpected error: {error}"
+        );
+        assert_eq!(
+            read_call_count, 0,
+            "schema discovery should not run for a foreign table on Classic"
+        );
+        assert_eq!(request_count, 1, "only the UC table lookup should run");
+        assert_request_seen(&captured_requests, "/api/2.1/unity-catalog/tables/");
+        assert_request_not_seen(
+            &captured_requests,
+            "/api/2.1/unity-catalog/effective-permissions/table/",
+        );
+    }
+
+    /// Streaming tables and views are plain `SELECT` targets on a SQL
+    /// warehouse, so the read must proceed to the permission check and the
+    /// warehouse instead of being rejected up front.
+    #[tokio::test]
+    async fn test_read_provider_accepts_streaming_tables_and_views() {
+        for table_type in ["STREAMING_TABLE", "VIEW"] {
+            let (result, read_call_count, request_count, captured_requests) =
+                run_read_provider_with_uc_responses(
+                    "databricks:workspace.tpch_sf400.part",
+                    vec![
+                        MockHttpResponse::json(
+                            "200 OK",
+                            format!(
+                                r#"{{"name":"part","catalog_name":"workspace","schema_name":"tpch_sf400","table_type":"{table_type}","data_source_format":"DELTA","columns":[],"storage_location":null}}"#
+                            ),
+                        ),
+                        MockHttpResponse::json(
+                            "200 OK",
+                            r#"{"privilege_assignments":[{"principal":"analytics-team","privileges":[{"privilege":"SELECT"}]}]}"#,
+                        ),
+                    ],
+                )
+                .await;
+
+            if let Err(err) = &result {
+                panic!("{table_type} should be queryable through a SQL warehouse: {err}");
+            }
+            assert_eq!(
+                read_call_count, 1,
+                "{table_type}: expected the Databricks read to be attempted"
+            );
+            assert_eq!(
+                request_count, 2,
+                "{table_type}: expected table metadata and permission requests"
+            );
+            assert_request_seen(
+                &captured_requests,
+                "/api/2.1/unity-catalog/effective-permissions/table/",
+            );
+        }
+    }
+
+    #[tokio::test]
     async fn test_read_provider_fails_for_unsupported_uc_table_types() {
         let (result, read_call_count, request_count, captured_requests) =
             run_read_provider_with_uc_responses(
                 "databricks:workspace.tpch_sf400.part",
                 vec![MockHttpResponse::json(
                     "200 OK",
-                    r#"{"name":"part","catalog_name":"workspace","schema_name":"tpch_sf400","table_type":"VIEW","data_source_format":"VIEW","columns":[],"storage_location":null}"#,
+                    r#"{"name":"part","catalog_name":"workspace","schema_name":"tpch_sf400","table_type":"METRIC_VIEW","data_source_format":"VIEW","columns":[],"storage_location":null}"#,
                 )],
             )
             .await;
@@ -2078,7 +2484,7 @@ mod tests {
 
         assert!(
             err.to_string()
-                .contains("Unsupported Unity Catalog table type 'VIEW'"),
+                .contains("Unsupported Unity Catalog table type 'METRIC_VIEW'"),
             "unexpected error: {err}"
         );
         assert_eq!(

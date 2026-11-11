@@ -37,11 +37,11 @@ use test_framework::{
 use tokio::signal;
 use tokio_util::sync::CancellationToken;
 
-#[expect(clippy::too_many_lines)]
 pub(crate) async fn run(args: &LoadTestArgs) -> anyhow::Result<()> {
     // Surface a bad connection-topology combination now, not after the
     // ready-wait.
     args.test_args.validate_fleet()?;
+    super::ensure_layout_applies(&args.test_args)?;
     let concurrency = args.test_args.effective_concurrency();
     if concurrency < 2 {
         return Err(anyhow::anyhow!(

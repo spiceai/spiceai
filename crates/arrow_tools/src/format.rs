@@ -1748,12 +1748,7 @@ Cras venenatis euismod malesuada.",
 
         let mut pretty_output = String::new();
         pretty_print_schema(&schema, &mut pretty_output).expect("write schema");
-        insta::assert_snapshot!(pretty_output, @r"
-        id: int64
-        name: utf8 (nullable)
-        scores: list<item: float32> (nullable)
-        metadata: struct<key utf8, value utf8> (nullable)
-        ");
+        insta::assert_snapshot!("pretty_print_schema", pretty_output);
     }
 
     /// `max_len = 0` is a valid (if unusual) truncation request: every list

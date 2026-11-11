@@ -14,6 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 use ::search::aggregation::reciprocal_rank::{DEFAULT_RRF_K, rrf_candidate_pool_size};
+use ::search::{SEARCH_MATCH_COLUMN_NAME, SEARCH_SCORE_COLUMN_NAME, SEARCH_VALUE_COLUMN_NAME};
 use arrow_schema::{DataType, SchemaRef};
 use async_trait::async_trait;
 use datafusion::catalog::{Session, TableFunctionImpl, TableProvider};
@@ -240,9 +241,11 @@ impl ReciprocalRankFusionSubqueryArgs {
     ) -> Result<(Expr, ReciprocalRankFusionSubqueryArgs)> {
         if let Expr::ScalarFunction(ScalarFunction { args, func }) = expr {
             let mut args = args.clone();
+            // Only `rank_weight` belongs to `rrf`. Other named arguments, such as
+            // `limit`, stay on the nested search call.
             let rrf_args = args
                 .extract_if(.., |arg| {
-                    matches!(arg, Expr::Literal(_, Some(meta)) if meta.inner().contains_key("spice.parameter_name"))
+                    matches!(arg, Expr::Literal(_, Some(meta)) if meta.inner().get("spice.parameter_name").is_some_and(|name| name == "rank_weight"))
                 })
                 .filter_map(|arg| match arg {
                     Expr::Literal(value, Some(meta)) => meta
@@ -987,7 +990,7 @@ impl ReciprocalRankFusion {
 
                 // Propagate the RRF-level `limit` into each subquery as a wider
                 // candidate pool — but only when the subquery itself does not
-                // already specify an explicit `limit` positional argument. We
+                // already specify an explicit `limit` argument. We
                 // must not override a user-provided limit (e.g.
                 // `text_search(..., 1000)` nested inside `rrf(..., limit => 25)`).
                 //
@@ -1117,9 +1120,13 @@ impl ReciprocalRankFusion {
     // are nearly always one of these, and these types serialize compactly
     // compared to list/struct columns.
     //
+    // The search outputs (`_score`, and the chunk text in `_value`/`_match`) and
+    // embeddings are never hashed: the same row has different values in each
+    // subquery.
+    //
     // If a schema has no identity-like columns (rare — e.g. a table of only
-    // list/struct columns), fall back to hashing all non-score, non-embedding
-    // columns so correctness is preserved.
+    // list/struct columns), fall back to hashing all the other columns so
+    // correctness is preserved.
     fn with_rrf_rowid(df: DataFrame) -> Result<DataFrame> {
         let schema = df.schema();
         let is_identity_like = |dt: &DataType| -> bool {
@@ -1160,7 +1167,16 @@ impl ReciprocalRankFusion {
             .fields()
             .iter()
             .map(|f| (f.name().as_str(), f.data_type()))
-            .filter(|(name, _)| *name != "_score" && !name.ends_with("_embedding"))
+            .filter(|(name, _)| {
+                ![
+                    SEARCH_SCORE_COLUMN_NAME,
+                    SEARCH_VALUE_COLUMN_NAME,
+                    SEARCH_MATCH_COLUMN_NAME,
+                ]
+                .iter()
+                .any(|output| output == name)
+                    && !name.ends_with("_embedding")
+            })
             .collect();
 
         let mut selected: Vec<Expr> = candidates
@@ -1170,7 +1186,7 @@ impl ReciprocalRankFusion {
             .map(|(name, _)| ident(*name))
             .collect();
 
-        // Fallback: no scalar identity columns, hash everything (minus embeddings/score).
+        // Fallback: no identity-like columns, so hash all the candidates.
         if selected.is_empty() {
             selected = candidates
                 .iter()
@@ -1370,6 +1386,17 @@ impl TableProvider for ReciprocalRankFusion {
     ) -> Result<Arc<dyn datafusion::physical_plan::ExecutionPlan>> {
         not_impl_err!("ReciprocalRankFusion does not support truncate")
     }
+
+    async fn merge_into(
+        &self,
+        _state: &dyn datafusion::catalog::Session,
+        _source: Arc<dyn datafusion::physical_plan::ExecutionPlan>,
+        _merge_schema: datafusion::common::DFSchemaRef,
+        _on: datafusion::prelude::Expr,
+        _clauses: Vec<datafusion::logical_expr::dml::MergeIntoClause>,
+    ) -> Result<Arc<dyn datafusion::physical_plan::ExecutionPlan>> {
+        not_impl_err!("ReciprocalRankFusion does not support merge_into")
+    }
 }
 
 #[cfg(test)]
@@ -1391,6 +1418,7 @@ mod tests {
     use datafusion::scalar::ScalarValue;
     use datafusion_expr::expr::ScalarFunction;
     use datafusion_expr::{col, lit};
+    use runtime_proto::rrf_nested_query::Query;
     use std::collections::BTreeMap;
     use std::sync::Arc;
 
@@ -1502,7 +1530,8 @@ mod tests {
             spice_named_lit!("join_key", "id"),
         ]);
         let parsed = result.expect("Expected success");
-        assert!(parsed.join_key.is_some());
+        // The argument's value names the column the fused results are joined on.
+        assert_eq!(parsed.join_key, Some(col_expr("id")));
     }
 
     #[test]
@@ -1514,7 +1543,8 @@ mod tests {
         ]);
 
         let parsed = result.expect("Expected success");
-        assert!(parsed.time_column.is_some());
+        // The argument's value names the column recency decay reads.
+        assert_eq!(parsed.time_column, Some(col_expr("created_at")));
     }
 
     #[test]
@@ -1560,6 +1590,55 @@ mod tests {
             parsed.rrf_subquery_arguments[0].rank_weight,
             Some(2.5),
             "rank_weight should be 2.5"
+        );
+    }
+
+    #[test]
+    fn nested_search_keeps_its_named_arguments() {
+        let with_named_args = |expr: Expr, named_args: Vec<Expr>| {
+            let Expr::ScalarFunction(mut search) = expr else {
+                panic!("search stubs are scalar functions");
+            };
+            search.args.extend(named_args);
+            Expr::ScalarFunction(search)
+        };
+
+        let parsed = ReciprocalRankFusionArgs::from_udtf_exprs(&[
+            with_named_args(
+                vector_search_expr("foo", "query"),
+                vec![
+                    named_arg("limit", ScalarValue::Int64(Some(5))),
+                    named_arg("include_score", false),
+                    named_arg("distance_metric", "l2"),
+                    named_arg("rank_weight", 2.5f64),
+                ],
+            ),
+            with_named_args(
+                text_search_expr("foo", "query"),
+                vec![named_arg("limit", ScalarValue::Int64(Some(7)))],
+            ),
+        ])
+        .expect("Expected success");
+        let queries = parsed
+            .to_serializable()
+            .expect("Expected serializable args")
+            .queries;
+
+        let Some(Query::VectorSearch(vector_search)) = &queries[0].query else {
+            panic!("Expected a vector_search query, got {:?}", queries[0]);
+        };
+        let vector_args = vector_search.args.as_ref().expect("vector_search args");
+        assert_eq!(vector_args.limit, Some(5));
+        assert_eq!(vector_args.include_score, Some(false));
+        assert_eq!(vector_args.distance_metric.as_deref(), Some("l2"));
+        assert_eq!(vector_search.rank_weight, Some(2.5));
+
+        let Some(Query::TextSearch(text_search)) = &queries[1].query else {
+            panic!("Expected a text_search query, got {:?}", queries[1]);
+        };
+        assert_eq!(
+            text_search.args.as_ref().and_then(|args| args.limit),
+            Some(7)
         );
     }
 
@@ -1644,6 +1723,46 @@ mod tests {
         let error = ReciprocalRankFusionArgs::from_udtf_exprs(&sources)
             .expect_err("more than RRF_MAX_SOURCES search queries must be rejected");
         assert!(error.to_string().contains("supports at most"));
+    }
+
+    /// Chunked search returns the matching chunk in `_value` (and `text_search` in `_match`),
+    /// which differs between subqueries for the same row.
+    #[tokio::test]
+    async fn the_row_id_ignores_search_output_columns() {
+        let ctx = SessionContext::new();
+        let schema = Arc::new(arrow_schema::Schema::new(vec![
+            arrow_schema::Field::new("id", DataType::Utf8, false),
+            arrow_schema::Field::new("_value", DataType::Utf8, false),
+            arrow_schema::Field::new("_match", DataType::Utf8, false),
+            arrow_schema::Field::new("_score", DataType::Float64, false),
+        ]));
+        let row_id = async |chunk: &str, matched: &str, score: f64| {
+            let batch = RecordBatch::try_new(
+                Arc::clone(&schema),
+                vec![
+                    Arc::new(StringArray::from(vec!["A"])),
+                    Arc::new(StringArray::from(vec![chunk])),
+                    Arc::new(StringArray::from(vec![matched])),
+                    Arc::new(Float64Array::from(vec![score])),
+                ],
+            )
+            .expect("valid batch");
+            let batches =
+                ReciprocalRankFusion::with_rrf_rowid(ctx.read_batch(batch).expect("a dataframe"))
+                    .expect("a row id")
+                    .select_columns(&[super::RRF_ROW_ID_COLUMN_NAME])
+                    .expect("the row id column")
+                    .collect()
+                    .await
+                    .expect("collect the row id");
+            pretty_format_batches(&batches)
+                .expect("format the row id")
+                .to_string()
+        };
+
+        let first = row_id("chunk", "match", 0.9).await;
+        assert_eq!(first, row_id("another chunk", "match", 0.4).await);
+        assert_eq!(first, row_id("chunk", "another match", 0.4).await);
     }
 
     #[tokio::test]

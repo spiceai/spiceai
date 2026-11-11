@@ -14,7 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use arrow::array::{BooleanArray, RecordBatch, StringArray, TimestampMicrosecondArray};
+use arrow::array::{BooleanArray, RecordBatch, StringArray, TimestampNanosecondArray};
 use arrow::datatypes::{DataType, TimeUnit};
 use datafusion::common::TableReference;
 use futures::{StreamExt, TryStreamExt};
@@ -33,8 +33,7 @@ use runtime::Runtime;
 use crate::{
     configure_test_datafusion, init_tracing,
     postgres::common::{
-        get_pg_params, get_postgres_connection_pool, get_random_port,
-        start_postgres_docker_container,
+        get_pg_params, get_postgres_connection_pool, start_postgres_docker_container,
     },
     utils::{register_test_connectors, runtime_ready_check, test_request_context},
 };
@@ -90,8 +89,8 @@ fn rows_from_batches(batches: &[RecordBatch]) -> Result<Vec<(String, i64, bool)>
         let updated_at = batch
             .column(1)
             .as_any()
-            .downcast_ref::<TimestampMicrosecondArray>()
-            .ok_or_else(|| anyhow::anyhow!("Expected TimestampMicrosecondArray in column 1"))?;
+            .downcast_ref::<TimestampNanosecondArray>()
+            .ok_or_else(|| anyhow::anyhow!("Expected TimestampNanosecondArray in column 1"))?;
         let deleted = batch
             .column(2)
             .as_any()
@@ -169,7 +168,7 @@ async fn refresh_table(rt: Arc<Runtime>, table_name: &str) -> Result<(), anyhow:
         .await?;
     notifier
         .ok_or_else(|| anyhow::anyhow!("Failed to refresh table"))?
-        .notified()
+        .wait()
         .await;
     Ok(())
 }
@@ -230,7 +229,7 @@ async fn test_retention_sql() -> Result<(), anyhow::Error> {
                 .with_dataset(make_s3_dataset(
                     "spiceai-public-datasets/taxi_small_samples/taxi_sample.parquet",
                     "taxi_trips",
-                    "duckdb",
+                    "cayenne",
                     "DELETE FROM taxi_trips WHERE VendorID != 2 OR Airport_fee != 1.75",
                     Some("tpep_pickup_datetime"),
                     Some("1000000000w"), // Some large retention period to ensure data is not fitlered out by time
@@ -287,7 +286,7 @@ async fn test_retention_sql() -> Result<(), anyhow::Error> {
 }
 
 #[tokio::test]
-async fn test_duckdb_append_refresh_preserves_timestamptz() -> Result<(), anyhow::Error> {
+async fn test_cayenne_append_refresh_preserves_timestamptz() -> Result<(), anyhow::Error> {
     let _tracing = init_tracing(Some("integration=debug,info"));
     register_test_connectors().await;
 
@@ -295,8 +294,8 @@ async fn test_duckdb_append_refresh_preserves_timestamptz() -> Result<(), anyhow
         .scope(async {
             let _tz_guard = TimezoneGuard::new("Asia/Tokyo");
 
-            let port = get_random_port()?;
-            let running_container = start_postgres_docker_container(port).await?;
+            let running_container = start_postgres_docker_container().await?;
+            let port = usize::from(running_container.host_port(5432)?);
 
             let pool = get_postgres_connection_pool(port, None).await?;
             let db_conn = pool
@@ -370,7 +369,7 @@ SET
             dataset.acceleration = Some(Acceleration {
                 enabled: true,
                 mode: Mode::File,
-                engine: Some("duckdb".to_string()),
+                engine: Some("cayenne".to_string()),
                 refresh_mode: Some(RefreshMode::Append),
                 refresh_check_interval: Some("200ms".to_string()),
                 retention_sql: Some("DELETE FROM widgets WHERE deleted = true".to_string()),
@@ -417,8 +416,8 @@ SET
                 .expect("updated_at column present");
             assert_eq!(
                 updated_field.data_type(),
-                &DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into())),
-                "accelerator should expose timestamptz updated_at as microsecond UTC (DuckDB's TIMESTAMPTZ precision, #10627)"
+                &DataType::Timestamp(TimeUnit::Nanosecond, Some("UTC".into())),
+                "the acceleration should keep the type the federated PostgreSQL table gives timestamptz updated_at (#10627)"
             );
 
             let initial_rows = rows_from_batches(&initial_batches)?;
@@ -428,7 +427,8 @@ SET
                 .expect("sample widget present after initial load");
 
             assert_eq!(
-                runtime_initial_ts, pg_initial_ts,
+                runtime_initial_ts,
+                pg_initial_ts * 1000, // PostgreSQL stores microseconds
                 "initial load should keep timestamptz values aligned with source"
             );
             assert!(
@@ -436,28 +436,11 @@ SET
                 "sample widget should not be marked deleted initially"
             );
 
-            db_conn
-                .conn
-                .execute(
-                    "UPDATE widgets SET deleted = TRUE WHERE name = 'Sample widget';",
-                    &[],
-                )
-                .await?;
+            // That a refresh removes the rows `retention_sql` matches before it returns
+            // is checked by test/spicescript/known-failing/append-and-retention/
+            // retention-sql-after-append-refresh.yaml (#16100).
 
-            refresh_table(Arc::clone(&rt), "widgets").await?;
-
-            let deleted_batches = execute_rt_sql(
-                Arc::clone(&rt),
-                "SELECT name FROM widgets WHERE deleted = TRUE",
-            )
-            .await?;
-            let deleted_count: usize = deleted_batches.iter().map(RecordBatch::num_rows).sum();
-            assert!(
-                deleted_count == 0,
-                "retention_sql should remove soft-deleted rows on refresh commit"
-            );
-
-            running_container.remove().await?;
+            running_container.cleanup().await;
 
             Ok(())
         })

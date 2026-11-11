@@ -71,7 +71,11 @@ limitations under the License.
 //! - [`constants`]: Staging-dir name, WAL filename, and other shared constants.
 //! - [`partitioned_wal`]: Cross-partition WAL for the partitioned-table
 //!   coordinator (feature-gated).
+pub(crate) mod append_commit;
+pub(crate) mod append_stage;
+pub(crate) mod clustering;
 pub(crate) mod cold_partition;
+pub(crate) mod cold_pk_prune;
 pub(crate) mod column_stats;
 pub(crate) mod compaction;
 pub(crate) mod compaction_writer;
@@ -80,27 +84,39 @@ pub(crate) mod context;
 pub(crate) mod delete;
 pub mod deletion_index;
 pub(crate) mod deletion_strategy;
+pub(crate) mod deletion_yield;
 pub(crate) mod delta_encoding;
 pub(crate) mod fadvise_tier;
 pub(crate) mod file_digest;
 pub(crate) mod file_pruning;
+mod first_load_pk;
 pub(crate) mod fsync_tier;
 pub(crate) mod inlined_cache;
+pub(crate) mod key_conflicts;
+pub(crate) mod lookup_index;
 pub(crate) mod maintenance;
+pub(crate) mod maintenance_metrics;
 pub(crate) mod manifest;
 pub(crate) mod mem_tier;
 pub(crate) mod mem_tier_budget;
+pub(crate) mod mem_tier_index;
 pub(crate) mod memory_account;
 pub(crate) mod mutation_writer;
 pub(crate) mod on_conflict;
 pub(crate) mod overwrite;
+pub(crate) mod overwrite_postpass;
 pub mod partitioned_wal;
+pub(crate) mod pk_deletion_mode;
 pub(crate) mod pk_index;
 pub(crate) mod pk_keyset_budget;
+pub(crate) mod pk_validation;
 pub(crate) mod predicate_stats;
+pub(crate) mod protected_merge_claims;
 pub(crate) mod query_admission;
 pub(crate) mod retention;
+pub(crate) mod runtime_restricted_scan;
 pub(crate) mod scan;
+pub(crate) mod scan_file_statistics;
 pub(crate) mod sink;
 pub(crate) mod staged_upsert;
 pub(crate) mod staging_wal;
@@ -109,11 +125,18 @@ pub(crate) mod structural_version;
 pub(crate) mod table;
 pub(crate) mod transaction;
 pub(crate) mod tuning;
+#[cfg(test)]
+mod tuning_sim;
+pub(crate) mod update_exec;
+pub(crate) mod update_keys;
 pub(crate) mod utils;
 pub(crate) mod vortex_format;
 pub(crate) mod wal_checksum;
 pub(crate) mod write_budget;
-pub(crate) mod zorder;
+pub(crate) mod write_lock_held;
+pub(crate) mod write_recovery;
+
+pub use write_recovery::RebuildableWrite;
 
 // Re-export the main type at the module level for convenience
 pub use compaction::{
@@ -132,6 +155,10 @@ pub use mem_tier_budget::{
 pub use on_conflict::PreparedOnConflictDeletionPublish;
 pub use overwrite::PreparedOverwrite;
 pub use partitioned_wal::{PARTITIONED_WAL_DIR, PartitionedWal, PartitionedWalEntry};
+pub use pk_deletion_mode::{
+    AutoKeyDeletesReason, AutoKeyTableKind, DeletionModeChoice, TableStorage,
+    auto_keeps_small_tables_compacted, auto_key_deletes_reason,
+};
 pub use pk_keyset_budget::{
     force_reserve_keyset_bytes, global_pk_keyset_total, global_pk_keyset_used,
     release_keyset_bytes, set_global_pk_keyset_bytes, try_reserve_keyset_bytes,
@@ -139,11 +166,13 @@ pub use pk_keyset_budget::{
 pub use query_admission::set_query_admission_governor;
 pub use retention::TimeRetentionFilterBuilder;
 pub use scan::CayenneAccelerationExec;
+pub use scan_file_statistics::ScanFileStatisticsCounters;
 pub use staged_upsert::{CayenneStagedUpsert, PreparedTxnCommit, TransactionWriteToken};
 pub use staging_wal::{CayenneStagedAppend, PartitionedWalObjectStore, PreparedStagedAppend};
 pub use table::{
-    CayenneCdcWrite, CayenneTableProvider, CayenneTableProviderBuilder, LastSmallFileCompactPath,
-    PreparedAppendSnapshotPublish,
+    CayenneCdcWrite, CayenneTableProvider, CayenneTableProviderBuilder, FileDeletionHold,
+    IndexPersistence, LastSmallFileCompactPath, LookupIndexSnapshotHold,
+    PreparedAppendSnapshotPublish, ScanViewReuse, SnapshotDirPins,
 };
 pub use transaction::{CayenneTransaction, TransactionCommit, TxnTable};
 pub use tuning::{
@@ -204,6 +233,10 @@ pub enum Error {
     #[snafu(display("Data validation failed for table '{table}': {message}"))]
     DataValidation { table: String, message: String },
 
+    /// An accelerator option is incompatible with the table schema.
+    #[snafu(display("Invalid configuration for table '{table}': {message}"))]
+    InvalidConfiguration { table: String, message: String },
+
     /// A `mode: memory` (in-RAM) table reached its configured memory limit. Memory
     /// mode never spills to disk, so the write is rejected rather than silently
     /// dropped or grown unbounded.
@@ -247,10 +280,18 @@ pub enum Error {
     #[snafu(display("Internal error in table '{table}': {message}"))]
     Internal { table: String, message: String },
 
+    /// The process reached its open file limit. Client connections and every other
+    /// open file count against the same limit, so the message names it and keeps
+    /// the operating system's error rather than blaming acceleration files alone.
     #[snafu(display(
-        "Unable to open Cayenne acceleration file ({file_path}). Too many Cayenne acceleration files are open. Try increasing your system's maximum open file count, or increase the size of generated Cayenne files with the parameter \"cayenne_target_file_size_mb\". For more details, visit: https://spiceai.org/docs/components/data-accelerators/cayenne#params"
+        "Failed to open Cayenne acceleration file '{file_path}' because the process reached its open file limit{}, which client connections and all other open files also count against. Raise the limit where spiced is started (`ulimit -n`, or the container's `nofile` limit), or write fewer, larger acceleration files with `cayenne_target_file_size_mb`. See: https://spiceai.org/docs/components/data-accelerators/cayenne#params. Cause: {message}",
+        open_file_limit.map_or_else(String::new, |limit| format!(" of {limit}"))
     ))]
-    TooManyOpenFiles { file_path: String },
+    TooManyOpenFiles {
+        file_path: String,
+        open_file_limit: Option<u64>,
+        message: String,
+    },
 
     /// A previous write was interrupted, leaving the table in a potentially
     /// inconsistent state. The staging WAL file must be resolved before the
@@ -312,7 +353,7 @@ mod tests {
     use crate::catalog::MetadataCatalog;
     use crate::cayenne_catalog::CayenneCatalog;
     use crate::metadata::CreateTableOptions;
-    use arrow::array::{Int32Array, Int64Array, StringArray};
+    use arrow::array::{Decimal128Array, Int32Array, Int64Array, StringArray};
     use arrow::datatypes::{DataType, Field, Schema};
     use arrow::record_batch::RecordBatch;
     use arrow::util::pretty::pretty_format_batches;
@@ -438,16 +479,6 @@ mod tests {
         test_concurrent_reads_impl(&connection_string).await;
     }
 
-    #[cfg(feature = "turso")]
-    #[tokio::test]
-    async fn test_concurrent_reads_turso() {
-        let temp_dir = TempDir::new()
-            .expect("Failed to create temporary directory for concurrent reads test (Turso)");
-        let db_path = temp_dir.path().join("cayenne_concurrent_test.db");
-        let connection_string = format!("libsql://{}", db_path.to_string_lossy());
-        test_concurrent_reads_impl(&connection_string).await;
-    }
-
     /// Core concurrent read test implementation
     async fn test_concurrent_reads_impl(connection_string: &str) {
         let ctx = SessionContext::new();
@@ -534,16 +565,6 @@ mod tests {
         test_concurrent_reads_with_filters_impl(&connection_string).await;
     }
 
-    #[cfg(feature = "turso")]
-    #[tokio::test]
-    async fn test_concurrent_reads_with_filters_turso() {
-        let temp_dir =
-            TempDir::new().expect("Failed to create temporary directory for filter test (Turso)");
-        let db_path = temp_dir.path().join("cayenne_filter_test.db");
-        let connection_string = format!("libsql://{}", db_path.to_string_lossy());
-        test_concurrent_reads_with_filters_impl(&connection_string).await;
-    }
-
     /// Test concurrent reads with various filter conditions
     async fn test_concurrent_reads_with_filters_impl(connection_string: &str) {
         let ctx = SessionContext::new();
@@ -626,16 +647,6 @@ mod tests {
         test_concurrent_reads_with_projections_impl(&connection_string).await;
     }
 
-    #[cfg(feature = "turso")]
-    #[tokio::test]
-    async fn test_concurrent_reads_with_projections_turso() {
-        let temp_dir = TempDir::new()
-            .expect("Failed to create temporary directory for projection test (Turso)");
-        let db_path = temp_dir.path().join("cayenne_projection_test.db");
-        let connection_string = format!("libsql://{}", db_path.to_string_lossy());
-        test_concurrent_reads_with_projections_impl(&connection_string).await;
-    }
-
     /// Test concurrent reads with different column projections
     async fn test_concurrent_reads_with_projections_impl(connection_string: &str) {
         let ctx = SessionContext::new();
@@ -709,17 +720,6 @@ mod tests {
             .expect("Failed to create temporary directory for high concurrency stress test");
         let db_path = temp_dir.path().join("cayenne_stress_test.db");
         let connection_string = format!("sqlite://{}", db_path.to_string_lossy());
-        test_high_concurrency_stress_impl(&connection_string).await;
-    }
-
-    #[cfg(feature = "turso")]
-    #[tokio::test]
-    async fn test_high_concurrency_stress_turso() {
-        let temp_dir = TempDir::new().expect(
-            "Failed to create temporary directory for high concurrency stress test (Turso)",
-        );
-        let db_path = temp_dir.path().join("cayenne_stress_test.db");
-        let connection_string = format!("libsql://{}", db_path.to_string_lossy());
         test_high_concurrency_stress_impl(&connection_string).await;
     }
 
@@ -1803,8 +1803,8 @@ mod tests {
             "PK type widening must classify Incompatible and pin the stored schema"
         );
 
-        // Non-schema config differences must keep today's behavior even when
-        // the schema also widened (schema must be the ONLY difference).
+        // A difference in a setting that defines the stored rows keeps the stored
+        // settings wholesale, schema included, even when the schema also widened.
         let table = "t_mixed_diff";
         catalog
             .create_table(options_for(
@@ -1815,7 +1815,7 @@ mod tests {
             .await
             .expect("create");
         let mut mixed = options_for(table, &widened_schema, SchemaEvolutionMode::Widen);
-        mixed.vortex_config.sort_columns = vec!["id".to_string()];
+        mixed.primary_key = vec!["id".to_string(), "v".to_string()];
         catalog
             .create_table(mixed)
             .await
@@ -1823,7 +1823,336 @@ mod tests {
         assert_eq!(
             catalog.get_table(table).await.expect("get").schema.as_ref(),
             stored_schema.as_ref(),
-            "a non-schema config difference must keep the legacy pin path"
+            "a primary key difference must keep the stored schema pinned"
+        );
+
+        // A layout difference is applied in place and does not stop the widening.
+        let table = "t_layout_diff";
+        catalog
+            .create_table(options_for(
+                table,
+                &stored_schema,
+                SchemaEvolutionMode::Widen,
+            ))
+            .await
+            .expect("create");
+        let mut sorted = options_for(table, &widened_schema, SchemaEvolutionMode::Widen);
+        sorted.vortex_config.sort_columns = vec!["id".to_string()];
+        catalog
+            .create_table(sorted)
+            .await
+            .expect("re-create with a layout change + schema widening");
+        let evolved = catalog.get_table(table).await.expect("get");
+        assert_eq!(
+            evolved.schema.as_ref(),
+            widened_schema.as_ref(),
+            "a layout difference must not stop the widening"
+        );
+        assert_eq!(evolved.vortex_config.sort_columns, vec!["id".to_string()]);
+    }
+
+    /// Repairing the stored declaration rewrites no file, so a table that already holds rows
+    /// ends up with a corpus whose own Arrow IPC schema still declares `entries` nullable while
+    /// the reopened table declares it non-nullable. This pins that the disagreement is readable
+    /// — on both tiers: served from the inline corpus, and again after a checkpoint has flushed
+    /// it to a Vortex file, which has no map dtype and rebuilds one from the table's schema.
+    ///
+    /// Rows are written through the ordinary insert path so the sequence bookkeeping is real,
+    /// then the stored blob is replaced with the same rows re-serialized under the
+    /// pre-conformance declaration — the on-disk state a legacy table is actually in.
+    ///
+    /// Note what this does and does not guard. It is a forward guard against a later change
+    /// making the repair break legacy reads; it is **not** a guard on the repair itself, and it
+    /// cannot be: removing the repair makes the stored declaration agree with the blob again, so
+    /// there is no disagreement left to read. It also records a measured fact — the read path
+    /// tolerates this mismatch, so the unreadable-column shape #13549 describes is not what a
+    /// Cayenne scan does with it. What the repair demonstrably prevents is on the comparison
+    /// side; see `normalize_for_comparison`.
+    #[tokio::test]
+    async fn legacy_inline_map_data_is_readable_once_the_declaration_is_repaired() {
+        use arrow::array::Array;
+
+        let temp_dir = TempDir::new().expect("temp dir");
+        let db_path = temp_dir.path().join("cayenne_legacy_map_data.db");
+        let connection_string = format!("sqlite://{}", db_path.to_string_lossy());
+        let catalog =
+            Arc::new(CayenneCatalog::new(connection_string.as_str()).expect("to create catalog"));
+        catalog.init().await.expect("to init catalog");
+
+        let map_of = |entries_nullable: bool| {
+            DataType::Map(
+                Arc::new(Field::new(
+                    "entries",
+                    DataType::Struct(
+                        vec![
+                            Field::new("keys", DataType::Utf8, false),
+                            Field::new("values", DataType::Utf8, true),
+                        ]
+                        .into(),
+                    ),
+                    entries_nullable,
+                )),
+                false,
+            )
+        };
+        let schema_with = |entries_nullable: bool| {
+            Arc::new(Schema::new(vec![
+                Field::new("id", DataType::Int32, false),
+                Field::new("headers", map_of(entries_nullable), true),
+            ]))
+        };
+        let batch_with = |entries_nullable: bool| {
+            let entries = arrow::array::StructArray::from(vec![
+                (
+                    Arc::new(Field::new("keys", DataType::Utf8, false)),
+                    Arc::new(StringArray::from(vec!["a", "b"])) as arrow::array::ArrayRef,
+                ),
+                (
+                    Arc::new(Field::new("values", DataType::Utf8, true)),
+                    Arc::new(StringArray::from(vec![Some("1"), Some("2")]))
+                        as arrow::array::ArrayRef,
+                ),
+            ]);
+            let offsets = arrow::buffer::OffsetBuffer::new(vec![0i32, 1, 2].into());
+            let builder = arrow::array::ArrayData::builder(map_of(entries_nullable))
+                .len(2)
+                .add_buffer(offsets.into_inner().into_inner())
+                .add_child_data(entries.to_data());
+            // SAFETY: the offsets, buffers and child data are well formed. Only the
+            // `entries` nullability declaration is what `ArrayData::validate` rejects,
+            // and reproducing it is the point of the fixture — legacy inline data on
+            // disk carries exactly this declaration.
+            let map = arrow::array::make_array(unsafe { builder.build_unchecked() });
+            RecordBatch::try_new(
+                schema_with(entries_nullable),
+                vec![Arc::new(Int32Array::from(vec![1, 2])), map],
+            )
+            .expect("batch")
+        };
+
+        let table_name = "legacy_map_data";
+        catalog
+            .create_table(CreateTableOptions {
+                table_name: table_name.to_string(),
+                schema: schema_with(false),
+                primary_key: vec!["id".to_string()],
+                on_conflict: Some(OnConflict::DoNothingAll),
+                base_path: temp_dir.path().to_string_lossy().to_string(),
+                partition_column: None,
+                vortex_config: crate::metadata::VortexConfig::default(),
+            })
+            .await
+            .expect("to create table");
+
+        let ctx = SessionContext::new();
+        let catalog_trait: Arc<dyn MetadataCatalog> =
+            Arc::clone(&catalog) as Arc<dyn MetadataCatalog>;
+        let provider = Arc::new(
+            CayenneTableProvider::new(table_name, Arc::clone(&catalog_trait), ctx.runtime_env())
+                .await
+                .expect("to open provider"),
+        );
+
+        insert_batch(&provider, batch_with(false)).await;
+        let table_id = catalog
+            .get_table(table_name)
+            .await
+            .expect("get table")
+            .table_id;
+        assert!(
+            catalog
+                .get_inlined_data_count(&table_id)
+                .await
+                .expect("inlined count")
+                > 0,
+            "the write must land in the inline corpus, or this test proves nothing about it"
+        );
+
+        // Re-serialize the identical rows under the pre-conformance declaration and put those
+        // bytes back. Only the declaration differs; every key and value is the same.
+        let mut ipc = Vec::new();
+        {
+            let mut writer =
+                arrow::ipc::writer::StreamWriter::try_new(&mut ipc, &schema_with(true))
+                    .expect("ipc writer");
+            writer.write(&batch_with(true)).expect("write");
+            writer.finish().expect("finish");
+        }
+        {
+            let conn = rusqlite::Connection::open(&db_path).expect("open the metastore directly");
+            let swapped = conn
+                .execute(
+                    "UPDATE cayenne_inlined_data SET data_ipc = ?1 WHERE table_id = ?2",
+                    rusqlite::params![ipc, table_id],
+                )
+                .expect("swap in the legacy blob");
+            assert_eq!(
+                swapped, 1,
+                "exactly one inline blob should have been replaced"
+            );
+        }
+
+        // Reopen: `get_table` repairs the stored declaration; the blob keeps the old one.
+        let provider = Arc::new(
+            CayenneTableProvider::new(table_name, catalog_trait, ctx.runtime_env())
+                .await
+                .expect("to reopen provider"),
+        );
+        ctx.register_table(table_name, Arc::<CayenneTableProvider>::clone(&provider))
+            .expect("register");
+
+        let read_back = |ctx: SessionContext| async move {
+            let batches = ctx
+                .sql("SELECT id, headers FROM legacy_map_data ORDER BY id")
+                .await
+                .expect("plan the scan")
+                .collect()
+                .await
+                .expect("a row written under the forbidden declaration must still be readable");
+            pretty_format_batches(&batches).expect("format").to_string()
+        };
+
+        let expected = "\
++----+---------+
+| id | headers |
++----+---------+
+| 1  | {a: 1}  |
+| 2  | {b: 2}  |
++----+---------+";
+        assert_eq!(
+            read_back(ctx.clone()).await,
+            expected,
+            "served from the inline corpus"
+        );
+
+        // Same rows again once they have been flushed to a Vortex file: Vortex has no map dtype
+        // and restores one from the table's schema, so the repaired declaration is what it
+        // rebuilds against.
+        provider
+            .checkpoint_inlined_data()
+            .await
+            .expect("flush the inline corpus to a Vortex file");
+        assert_eq!(
+            catalog
+                .get_inlined_data_count(&table_id)
+                .await
+                .expect("inlined count"),
+            0,
+            "the corpus must actually be flushed, or the second read repeats the first"
+        );
+        assert_eq!(
+            read_back(ctx).await,
+            expected,
+            "served from a Vortex file written out of the legacy blob"
+        );
+    }
+
+    /// A widening plan is built from a source schema, and a source is free to declare a `MAP`'s
+    /// `entries` field nullable — which the Arrow map layout forbids and `MapArray::try_new`
+    /// refuses. Adding such a column under `append_new_columns` must not leave a column no
+    /// kernel can rebuild on a table that was readable a moment earlier.
+    ///
+    /// This is the Cayenne end of the normalization `classify` applies, exercised the way
+    /// production reaches it — the CDC path hands `evolve_schema_live` a plan the classifier
+    /// built. The metastore write and the in-memory swap are asserted separately: they are two
+    /// different stores, and a declaration that reaches only one of them leaves the other
+    /// advertising a type its own catalog disagrees with.
+    #[tokio::test]
+    async fn schema_evolution_live_installs_a_conforming_map_entries_declaration() {
+        let temp_dir = TempDir::new().expect("temp dir");
+        let db_path = temp_dir.path().join("cayenne_evolution_map.db");
+        let connection_string = format!("sqlite://{}", db_path.to_string_lossy());
+        let catalog =
+            Arc::new(CayenneCatalog::new(connection_string.as_str()).expect("to create catalog"));
+        catalog.init().await.expect("to init catalog");
+
+        let stored_schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int32, false),
+            Field::new("v", DataType::Int32, true),
+        ]));
+
+        let map_of = |entries_nullable: bool| {
+            DataType::Map(
+                Arc::new(Field::new(
+                    "entries",
+                    DataType::Struct(
+                        vec![
+                            Field::new("keys", DataType::Utf8, false),
+                            Field::new("values", DataType::Utf8, true),
+                        ]
+                        .into(),
+                    ),
+                    entries_nullable,
+                )),
+                false,
+            )
+        };
+
+        let table_name = "evolution_map_entries";
+        catalog
+            .create_table(CreateTableOptions {
+                table_name: table_name.to_string(),
+                schema: Arc::clone(&stored_schema),
+                primary_key: vec!["id".to_string()],
+                on_conflict: Some(OnConflict::DoNothingAll),
+                base_path: temp_dir.path().to_string_lossy().to_string(),
+                partition_column: None,
+                vortex_config: crate::metadata::VortexConfig::default(),
+            })
+            .await
+            .expect("to create table");
+
+        let ctx = SessionContext::new();
+        let catalog_trait: Arc<dyn MetadataCatalog> =
+            Arc::clone(&catalog) as Arc<dyn MetadataCatalog>;
+        let provider = Arc::new(
+            CayenneTableProvider::new(table_name, catalog_trait, ctx.runtime_env())
+                .await
+                .expect("to open provider"),
+        );
+
+        // The source adds a nullable `headers` MAP whose `entries` it declares nullable.
+        let incoming_schema = Schema::new(vec![
+            Field::new("id", DataType::Int32, false),
+            Field::new("v", DataType::Int32, true),
+            Field::new("headers", map_of(true), true),
+        ]);
+        let plan = widening_plan(&stored_schema, &incoming_schema, &[]);
+        assert_eq!(
+            plan.evolved_schema
+                .field_with_name("headers")
+                .expect("headers")
+                .data_type(),
+            &map_of(false),
+            "the classifier must not hand on a plan carrying the declaration the Arrow map layout forbids"
+        );
+
+        provider
+            .evolve_schema_live(&plan)
+            .await
+            .expect("live schema evolution");
+
+        let expected = map_of(false);
+        assert_eq!(
+            provider
+                .schema()
+                .field_with_name("headers")
+                .expect("headers")
+                .data_type(),
+            &expected,
+            "the live provider must not advertise a column no kernel can rebuild"
+        );
+        assert_eq!(
+            catalog
+                .get_table(table_name)
+                .await
+                .expect("get")
+                .schema
+                .field_with_name("headers")
+                .expect("headers")
+                .data_type(),
+            &expected,
+            "the metastore must hold the conforming declaration too"
         );
     }
 
@@ -1963,5 +2292,1084 @@ mod tests {
             provider.evolve_schema_live(&pk_plan).await.is_err(),
             "widening a PK column must be rejected by the live path"
         );
+    }
+
+    /// Live scale widening must drop persisted min/max so a leftover unscaled
+    /// bound cannot prune the matching row (123.45 at scale 2 becoming 1.2345
+    /// at scale 4).
+    #[tokio::test(flavor = "current_thread")]
+    async fn schema_evolution_live_decimal_scale_change_drops_statistics() {
+        decimal_scale_statistics_publication(false).await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn schema_evolution_live_decimal_scale_change_fences_in_flight_statistics() {
+        decimal_scale_statistics_publication(true).await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn schema_evolution_fences_queued_decimal_file_statistics() {
+        decimal_file_statistics_across_evolution(false).await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn schema_evolution_old_scan_rejects_new_decimal_file_statistics() {
+        decimal_file_statistics_across_evolution(true).await;
+    }
+
+    async fn decimal_file_statistics_across_evolution(new_blob_first: bool) {
+        let temp_dir = TempDir::new().expect("temp dir");
+        let connection = format!(
+            "sqlite://{}",
+            temp_dir.path().join("file_decimal.db").display()
+        );
+        let catalog = Arc::new(CayenneCatalog::new(connection.as_str()).expect("catalog"));
+        catalog.init().await.expect("init catalog");
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("amount", DataType::Decimal128(10, 2), false),
+        ]));
+        let ctx = SessionContext::new();
+        let provider = Arc::new(
+            CayenneTableProvider::create_table(
+                Arc::clone(&catalog) as Arc<dyn MetadataCatalog>,
+                CreateTableOptions {
+                    table_name: "file_decimal".to_string(),
+                    schema: Arc::clone(&schema),
+                    primary_key: vec![],
+                    on_conflict: None,
+                    base_path: temp_dir.path().to_string_lossy().to_string(),
+                    partition_column: None,
+                    vortex_config: crate::metadata::VortexConfig {
+                        inline_max_rows: 0,
+                        inline_max_bytes: 0,
+                        inline_max_buffer_bytes: 0,
+                        ..Default::default()
+                    },
+                },
+                ctx.runtime_env(),
+            )
+            .await
+            .expect("create table"),
+        );
+        let amounts = Decimal128Array::from(vec![12_345_i128, 67_890])
+            .with_precision_and_scale(10, 2)
+            .expect("decimals");
+        let batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![
+                Arc::new(Int64Array::from(vec![1_i64, 2])),
+                Arc::new(amounts),
+            ],
+        )
+        .expect("batch");
+        insert_batch(&provider, batch).await;
+        provider
+            .drain_in_flight_maintenance()
+            .await
+            .expect("drain writes");
+        provider.checkpoint_mem_tier().await.expect("checkpoint");
+        provider
+            .drain_in_flight_maintenance()
+            .await
+            .expect("drain checkpoint");
+        let metadata = catalog.get_table("file_decimal").await.expect("metadata");
+        let (_, files) = provider
+            .snapshot_file_metadata(&ctx.state(), &metadata.current_snapshot_id, &schema)
+            .await
+            .expect("physical file metadata");
+        assert_eq!(files.len(), 1, "one physical Vortex file");
+        let path = files[0].location.to_string();
+        catalog
+            .update_table_schema_dropping_statistics(&metadata.table_id, &schema)
+            .await
+            .expect("cold persisted statistics");
+        provider.clear_scan_file_statistics_cache();
+        let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+        let hook = Box::new(move || {
+            Box::pin(async move {
+                let _ = entered_tx.send(());
+                let _ = release_rx.await;
+            }) as std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>>
+        });
+        if new_blob_first {
+            *provider.test_post_scan_view_selection_hook.lock() = Some(hook);
+        } else {
+            *provider.test_file_statistics_publish_hook.lock() = Some(hook);
+        }
+        let scan_provider = Arc::clone(&provider);
+        let state = ctx.state();
+        let task_ctx = ctx.task_ctx();
+        let old_scan = tokio::spawn(async move {
+            let filters = if new_blob_first {
+                vec![datafusion_expr::col("amount").eq(datafusion_expr::lit(
+                    datafusion_common::ScalarValue::Decimal128(Some(12_345), 10, 2),
+                ))]
+            } else {
+                vec![]
+            };
+            let plan = scan_provider
+                .scan(&state, None, &filters, None)
+                .await
+                .expect("old scan plan");
+            collect(plan, task_ctx).await.expect("old scan rows")
+        });
+        tokio::time::timeout(std::time::Duration::from_secs(30), entered_rx)
+            .await
+            .expect("footer publication reached")
+            .expect("publisher signal");
+        let incoming = Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("amount", DataType::Decimal128(14, 4), false),
+        ]);
+        let plan = widening_plan(&schema, &incoming, &[]);
+        provider
+            .evolve_schema_live(&plan)
+            .await
+            .expect("evolve while footer publisher parked");
+        assert!(
+            catalog
+                .get_snapshot_file_statistics(
+                    &metadata.table_id,
+                    &metadata.current_snapshot_id,
+                    &path
+                )
+                .await
+                .expect("post evolution statistics")
+                .is_none()
+        );
+        if new_blob_first {
+            let plan = provider
+                .scan(&ctx.state(), None, &[], None)
+                .await
+                .expect("new-schema scan");
+            let rows = collect(plan, ctx.task_ctx())
+                .await
+                .expect("warm new-schema statistics");
+            assert_eq!(rows.iter().map(RecordBatch::num_rows).sum::<usize>(), 2);
+        }
+        provider.wait_for_scan_file_statistics_persistence().await;
+        let before_release = catalog
+            .get_snapshot_file_statistics(&metadata.table_id, &metadata.current_snapshot_id, &path)
+            .await
+            .expect("stats before release");
+        assert_eq!(before_release.is_some(), new_blob_first);
+        release_tx.send(()).expect("release footer publisher");
+        let old_rows = old_scan.await.expect("old scan task");
+        let mut old_values = Vec::new();
+        for batch in &old_rows {
+            assert_eq!(batch.column(0).null_count(), 0);
+            assert_eq!(batch.column(1).null_count(), 0);
+            assert_eq!(batch.column(1).data_type(), &DataType::Decimal128(10, 2));
+            let ids = batch
+                .column(0)
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .expect("old ids");
+            let amounts = batch
+                .column(1)
+                .as_any()
+                .downcast_ref::<Decimal128Array>()
+                .expect("old amounts");
+            for row in 0..batch.num_rows() {
+                old_values.push((ids.value(row), amounts.value(row)));
+            }
+        }
+        old_values.sort_unstable();
+        if new_blob_first {
+            // Provider filters may be inexact. The matching row must survive;
+            // accepting the other original row permits exact or inexact pushdown.
+            assert!(old_values.contains(&(1, 12_345_i128)));
+            assert!(
+                old_values
+                    .iter()
+                    .all(|row| { matches!(row, (1, 12_345_i128) | (2, 67_890_i128)) })
+            );
+            let mut unique = old_values.clone();
+            unique.dedup();
+            assert_eq!(unique, old_values, "no duplicate rows");
+        } else {
+            assert_eq!(old_values, vec![(1, 12_345_i128), (2, 67_890_i128)]);
+        }
+        eprintln!("DECIMAL_FILE_OLD_SCAN {old_values:?}");
+        provider.wait_for_scan_file_statistics_persistence().await;
+        let persisted = catalog
+            .get_snapshot_file_statistics(&metadata.table_id, &metadata.current_snapshot_id, &path)
+            .await
+            .expect("post publication statistics");
+        eprintln!("DECIMAL_FILE_RESURRECTED {}", persisted.is_some());
+        if let Some(stats) = &persisted {
+            eprintln!(
+                "DECIMAL_FILE_EVOLVED_STATS {:?}",
+                crate::stats::statistics_from_persisted_blob(
+                    &stats.statistics_blob,
+                    &plan.evolved_schema,
+                    stats.num_rows
+                )
+            );
+        }
+        let fresh_catalog =
+            Arc::new(CayenneCatalog::new(connection.as_str()).expect("fresh catalog"));
+        fresh_catalog.init().await.expect("init fresh catalog");
+        let reopened = Arc::new(
+            CayenneTableProvider::new(
+                "file_decimal",
+                fresh_catalog as Arc<dyn MetadataCatalog>,
+                ctx.runtime_env(),
+            )
+            .await
+            .expect("reopen"),
+        );
+        let fresh_ctx = SessionContext::new();
+        fresh_ctx
+            .register_table("file_decimal", reopened)
+            .expect("register reopened");
+        for sql in [
+            "SELECT id, amount FROM file_decimal ORDER BY id",
+            "SELECT id, amount FROM file_decimal WHERE amount = CAST(123.45 AS DECIMAL(14,4)) ORDER BY id",
+        ] {
+            let physical = fresh_ctx
+                .sql(sql)
+                .await
+                .expect("plan reopened rows")
+                .create_physical_plan()
+                .await
+                .expect("physical reopened plan");
+            eprintln!(
+                "DECIMAL_FILE_PLAN {sql}:\n{}",
+                datafusion_physical_plan::displayable(physical.as_ref()).indent(true)
+            );
+            let rows = collect(physical, fresh_ctx.task_ctx())
+                .await
+                .expect("reopened rows");
+            let mut actual = Vec::new();
+            for b in rows {
+                assert_eq!(b.column(0).null_count(), 0);
+                assert_eq!(b.column(1).null_count(), 0);
+                let ids = b
+                    .column(0)
+                    .as_any()
+                    .downcast_ref::<Int64Array>()
+                    .expect("ids");
+                let values = b
+                    .column(1)
+                    .as_any()
+                    .downcast_ref::<Decimal128Array>()
+                    .expect("amounts");
+                assert_eq!(b.column(1).data_type(), &DataType::Decimal128(14, 4));
+                for i in 0..b.num_rows() {
+                    actual.push((ids.value(i), values.value(i)));
+                }
+            }
+            eprintln!("DECIMAL_FILE_REOPEN {sql}: {actual:?}");
+            let expected = if sql.contains("WHERE") {
+                vec![(1, 1_234_500_i128)]
+            } else {
+                vec![(1, 1_234_500_i128), (2, 6_789_000_i128)]
+            };
+            assert_eq!(actual, expected);
+        }
+        if new_blob_first {
+            assert_eq!(
+                persisted.expect("new blob retained").statistics_blob,
+                before_release.expect("new blob existed").statistics_blob,
+                "old scan must not overwrite the new-schema blob"
+            );
+        } else {
+            assert!(
+                persisted.is_none(),
+                "obsolete footer publisher must not resurrect an old-scale blob"
+            );
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn schema_evolution_cold_decimal_scan_uses_captured_schema() {
+        cold_decimal_statistics_across_evolution(true, false).await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn schema_evolution_cold_decimal_manifest_invalidates_statistics() {
+        cold_decimal_statistics_across_evolution(false, false).await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn schema_evolution_cold_decimal_rejects_stale_manifest_refill() {
+        cold_decimal_statistics_across_evolution(false, true).await;
+    }
+
+    async fn cold_decimal_statistics_across_evolution(park_scan: bool, park_refill: bool) {
+        let temp_dir = TempDir::new().expect("temp dir");
+        let connection = format!(
+            "sqlite://{}",
+            temp_dir.path().join("file_decimal.db").display()
+        );
+        let catalog = Arc::new(CayenneCatalog::new(connection.as_str()).expect("catalog"));
+        catalog.init().await.expect("init catalog");
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("amount", DataType::Decimal128(10, 2), false),
+        ]));
+        let ctx = SessionContext::new();
+        let provider = Arc::new(
+            CayenneTableProvider::create_table(
+                Arc::clone(&catalog) as Arc<dyn MetadataCatalog>,
+                CreateTableOptions {
+                    table_name: "file_decimal".to_string(),
+                    schema: Arc::clone(&schema),
+                    primary_key: vec!["id".to_string()],
+                    on_conflict: None,
+                    base_path: temp_dir.path().to_string_lossy().to_string(),
+                    partition_column: None,
+                    vortex_config: crate::metadata::VortexConfig {
+                        cold_tier_location: Some(format!(
+                            "file://{}",
+                            temp_dir.path().join("cold").display()
+                        )),
+                        cluster_by: vec!["id".to_string()],
+                        cold_tier_warm_max_files: 1,
+                        deletion_mode: crate::metadata::DeletionMode::Key,
+                        inline_max_rows: 0,
+                        inline_max_bytes: 0,
+                        inline_max_buffer_bytes: 0,
+                        ..Default::default()
+                    },
+                },
+                ctx.runtime_env(),
+            )
+            .await
+            .expect("create table"),
+        );
+        let amounts = Decimal128Array::from(vec![12_345_i128, 67_890])
+            .with_precision_and_scale(10, 2)
+            .expect("decimals");
+        let batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![
+                Arc::new(Int64Array::from(vec![1_i64, 2])),
+                Arc::new(amounts),
+            ],
+        )
+        .expect("batch");
+        insert_batch(&provider, batch).await;
+        provider
+            .drain_in_flight_maintenance()
+            .await
+            .expect("drain writes");
+        provider.checkpoint_mem_tier().await.expect("checkpoint");
+        provider
+            .drain_in_flight_maintenance()
+            .await
+            .expect("drain checkpoint");
+        assert!(
+            provider
+                .promote_warm_to_cold()
+                .await
+                .expect("real cold promotion")
+        );
+        let files = catalog
+            .list_cold_tier_files(provider.table_id())
+            .await
+            .expect("cold files");
+        assert!(!files.is_empty());
+        assert!(files.iter().all(|file| !file.statistics_blob.is_empty()));
+        assert_eq!(files.iter().map(|file| file.row_count).sum::<i64>(), 2);
+        let mut parked = None;
+        if park_scan || park_refill {
+            let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+            let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+            let hook = Box::new(move || {
+                Box::pin(async move {
+                    let _ = entered_tx.send(());
+                    let _ = release_rx.await;
+                })
+                    as std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>>
+            });
+            if park_refill {
+                provider.test_clear_cold_manifest_cache();
+                *provider.test_cold_manifest_fetch_hook.lock() = Some(hook);
+            } else {
+                *provider.test_post_scan_view_selection_hook.lock() = Some(hook);
+            }
+            let scan_provider = Arc::clone(&provider);
+            let state = ctx.state();
+            let task_ctx = ctx.task_ctx();
+            let scan = tokio::spawn(async move {
+                let filters = [datafusion_expr::col("amount").eq(datafusion_expr::lit(
+                    datafusion_common::ScalarValue::Decimal128(Some(12_345), 10, 2),
+                ))];
+                let plan = scan_provider
+                    .scan(&state, None, &filters, None)
+                    .await
+                    .expect("old cold plan");
+                collect(plan, task_ctx).await.expect("old cold rows")
+            });
+            tokio::time::timeout(std::time::Duration::from_secs(30), entered_rx)
+                .await
+                .expect("captured cold scan")
+                .expect("capture signal");
+            parked = Some((release_tx, scan));
+        }
+        let incoming = Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("amount", DataType::Decimal128(14, 4), false),
+        ]);
+        let plan = widening_plan(&schema, &incoming, &[]);
+        provider
+            .evolve_schema_live(&plan)
+            .await
+            .expect("evolve cold schema");
+        let cleared = catalog
+            .list_cold_tier_files(provider.table_id())
+            .await
+            .expect("cleared cold blobs");
+        assert_eq!(
+            cleared.len(),
+            files.len(),
+            "statistics invalidation preserves files"
+        );
+        assert!(cleared.iter().all(|file| file.statistics_blob.is_empty()));
+        if let Some((release, scan)) = parked {
+            release.send(()).expect("release captured cold scan");
+            let batches = scan.await.expect("old cold task");
+            let (precision, scale, first, second) = if park_refill {
+                (14, 4, 1_234_500_i128, 6_789_000_i128)
+            } else {
+                (10, 2, 12_345_i128, 67_890_i128)
+            };
+            let mut values = Vec::new();
+            for batch in batches {
+                assert_eq!(batch.column(0).null_count(), 0);
+                assert_eq!(batch.column(1).null_count(), 0);
+                assert_eq!(
+                    batch.column(1).data_type(),
+                    &DataType::Decimal128(precision, scale)
+                );
+                let ids = batch
+                    .column(0)
+                    .as_any()
+                    .downcast_ref::<Int64Array>()
+                    .expect("old ids");
+                let amounts = batch
+                    .column(1)
+                    .as_any()
+                    .downcast_ref::<Decimal128Array>()
+                    .expect("old decimals");
+                for row in 0..batch.num_rows() {
+                    values.push((ids.value(row), amounts.value(row)));
+                }
+            }
+            values.sort_unstable();
+            eprintln!("COLD_DECIMAL_CAPTURED {values:?}");
+            assert!(
+                values.contains(&(1, first)),
+                "matching old row must survive pruning"
+            );
+            assert!(
+                values
+                    .iter()
+                    .all(|row| *row == (1, first) || *row == (2, second))
+            );
+            let mut unique = values.clone();
+            unique.dedup();
+            assert_eq!(unique, values);
+        }
+        let fresh_catalog =
+            Arc::new(CayenneCatalog::new(connection.as_str()).expect("fresh catalog"));
+        fresh_catalog.init().await.expect("fresh catalog init");
+        let reopened = Arc::new(
+            CayenneTableProvider::new(
+                "file_decimal",
+                fresh_catalog as Arc<dyn MetadataCatalog>,
+                ctx.runtime_env(),
+            )
+            .await
+            .expect("reopen cold table"),
+        );
+        for (phase, table) in [("live", provider), ("reopened", reopened)] {
+            let query_ctx = SessionContext::new();
+            query_ctx
+                .register_table("file_decimal", table)
+                .expect("register cold table");
+            for (sql, expected) in [
+                (
+                    "SELECT id, amount FROM file_decimal ORDER BY id",
+                    vec![(1, 1_234_500_i128), (2, 6_789_000_i128)],
+                ),
+                (
+                    "SELECT id, amount FROM file_decimal WHERE amount = CAST(123.45 AS DECIMAL(14,4)) ORDER BY id",
+                    vec![(1, 1_234_500_i128)],
+                ),
+            ] {
+                let physical = query_ctx
+                    .sql(sql)
+                    .await
+                    .expect("cold SQL")
+                    .create_physical_plan()
+                    .await
+                    .expect("cold physical plan");
+                eprintln!(
+                    "COLD_DECIMAL_PLAN {phase} {sql}:\n{}",
+                    datafusion_physical_plan::displayable(physical.as_ref()).indent(true)
+                );
+                let batches = collect(physical, query_ctx.task_ctx())
+                    .await
+                    .expect("cold SQL rows");
+                let mut actual = Vec::new();
+                for batch in batches {
+                    assert_eq!(batch.column(0).null_count(), 0);
+                    assert_eq!(batch.column(1).null_count(), 0);
+                    assert_eq!(batch.column(1).data_type(), &DataType::Decimal128(14, 4));
+                    let ids = batch
+                        .column(0)
+                        .as_any()
+                        .downcast_ref::<Int64Array>()
+                        .expect("ids");
+                    let amounts = batch
+                        .column(1)
+                        .as_any()
+                        .downcast_ref::<Decimal128Array>()
+                        .expect("decimals");
+                    for row in 0..batch.num_rows() {
+                        actual.push((ids.value(row), amounts.value(row)));
+                    }
+                }
+                eprintln!("COLD_DECIMAL_ROWS {phase} {sql}: {actual:?}");
+                assert_eq!(actual, expected);
+            }
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn schema_evolution_queued_integer_statistics_remain_conservative_after_reopen() {
+        let temp_dir = TempDir::new().expect("temp dir");
+        let connection = format!("sqlite://{}", temp_dir.path().join("integer.db").display());
+        let catalog = Arc::new(CayenneCatalog::new(connection.as_str()).expect("catalog"));
+        catalog.init().await.expect("init catalog");
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("value", DataType::Int32, false),
+        ]));
+        let ctx = SessionContext::new();
+        let provider = Arc::new(
+            CayenneTableProvider::create_table(
+                Arc::clone(&catalog) as Arc<dyn MetadataCatalog>,
+                CreateTableOptions {
+                    table_name: "integer_rows".to_string(),
+                    schema: Arc::clone(&schema),
+                    primary_key: vec![],
+                    on_conflict: None,
+                    base_path: temp_dir.path().to_string_lossy().to_string(),
+                    partition_column: None,
+                    vortex_config: crate::metadata::VortexConfig::default(),
+                },
+                ctx.runtime_env(),
+            )
+            .await
+            .expect("create table"),
+        );
+        let batch = |id: i64, value: i32| {
+            RecordBatch::try_new(
+                Arc::clone(&schema),
+                vec![
+                    Arc::new(Int64Array::from(vec![id])),
+                    Arc::new(Int32Array::from(vec![value])),
+                ],
+            )
+            .expect("batch")
+        };
+        insert_batch(&provider, batch(1, 10)).await;
+        provider
+            .drain_in_flight_maintenance()
+            .await
+            .expect("baseline maintenance");
+        provider
+            .checkpoint_inlined_data()
+            .await
+            .expect("baseline checkpoint");
+        provider
+            .drain_in_flight_maintenance()
+            .await
+            .expect("baseline drain");
+        let metadata = catalog.get_table("integer_rows").await.expect("metadata");
+        let baseline = catalog
+            .get_table_statistics(&metadata.table_id)
+            .await
+            .expect("baseline stats")
+            .expect("baseline exists");
+        assert_eq!(baseline.num_rows, 1);
+        assert!(
+            baseline.num_rows_exact,
+            "must start with a real exact aggregate"
+        );
+        let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+        *provider.test_pre_maintenance_statistics_hook.lock() = Some(Box::new(move || {
+            Box::pin(async move {
+                let _ = entered_tx.send(());
+                let _ = release_rx.await;
+            })
+        }));
+        insert_batch(&provider, batch(2, 20)).await;
+        tokio::time::timeout(std::time::Duration::from_secs(30), entered_rx)
+            .await
+            .expect("capture queued delta")
+            .expect("capture signal");
+        let incoming = Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("value", DataType::Int64, false),
+        ]);
+        let plan = widening_plan(&schema, &incoming, &[]);
+        assert!(!plan.changes_decimal_scale());
+        provider
+            .evolve_schema_live(&plan)
+            .await
+            .expect("integer widening");
+        let mut release = Some(release_tx);
+        for phase in ["parked", "drained"] {
+            if phase == "drained" {
+                release
+                    .take()
+                    .expect("release sender")
+                    .send(())
+                    .expect("release old accumulator");
+                provider
+                    .drain_in_flight_maintenance()
+                    .await
+                    .expect("drain rejected accumulator");
+            }
+            let ctx = SessionContext::new();
+            let catalog =
+                Arc::new(CayenneCatalog::new(connection.as_str()).expect("fresh catalog"));
+            catalog.init().await.expect("init fresh catalog");
+            let reopened = Arc::new(
+                CayenneTableProvider::new(
+                    "integer_rows",
+                    Arc::clone(&catalog) as Arc<dyn MetadataCatalog>,
+                    ctx.runtime_env(),
+                )
+                .await
+                .expect("reopen"),
+            );
+            ctx.register_table(
+                "integer_rows",
+                Arc::clone(&reopened) as Arc<dyn datafusion::datasource::TableProvider>,
+            )
+            .expect("register");
+            let rows = ctx
+                .sql("SELECT id, value FROM integer_rows ORDER BY id")
+                .await
+                .expect("plan rows")
+                .collect()
+                .await
+                .expect("rows");
+            let mut actual = Vec::new();
+            for b in rows {
+                assert_eq!(b.column(0).null_count(), 0, "non-NULL id");
+                assert_eq!(b.column(1).null_count(), 0, "non-NULL value");
+                let ids = b
+                    .column(0)
+                    .as_any()
+                    .downcast_ref::<Int64Array>()
+                    .expect("ids");
+                let values = b
+                    .column(1)
+                    .as_any()
+                    .downcast_ref::<Int64Array>()
+                    .expect("widened values");
+                for i in 0..b.num_rows() {
+                    actual.push((ids.value(i), values.value(i)));
+                }
+            }
+            assert_eq!(actual, vec![(1, 10), (2, 20)]);
+            let count = query_count(&ctx, "SELECT COUNT(*) FROM integer_rows").await;
+            let durable = catalog
+                .get_table_statistics(&metadata.table_id)
+                .await
+                .expect("durable stats");
+            let optimizer = reopened.optimizer_table_statistics();
+            eprintln!(
+                "INTEGER_REOPEN {phase} rows={actual:?} sql_count={count} durable={:?} optimizer={:?}",
+                durable.as_ref().map(|s| (s.num_rows, s.num_rows_exact)),
+                optimizer.as_ref().map(|s| s.num_rows)
+            );
+            assert_eq!(
+                count, 2,
+                "metadata COUNT must agree with projected rows after reopening"
+            );
+            if let Some(stats) = durable
+                && stats.num_rows_exact
+            {
+                assert_eq!(stats.num_rows, 2);
+            }
+            if let Some(stats) = optimizer
+                && let datafusion_common::stats::Precision::Exact(n) = stats.num_rows
+            {
+                assert_eq!(n, 2);
+            }
+        }
+    }
+
+    async fn decimal_scale_statistics_publication(in_flight: bool) {
+        async fn assert_decimal_rows(
+            provider: Arc<CayenneTableProvider>,
+            phase: &str,
+            expected: &[(i64, i128)],
+        ) {
+            let ctx = SessionContext::new();
+            ctx.register_table("decimal_rows", provider)
+                .expect("register rows");
+            for (sql, expected) in [
+                ("SELECT id, amount FROM decimal_rows ORDER BY id", expected),
+                (
+                    "SELECT id, amount FROM decimal_rows WHERE amount = CAST(123.45 AS DECIMAL(14,4))",
+                    &[(1_i64, 1_234_500_i128)],
+                ),
+            ] {
+                let batches = ctx
+                    .sql(sql)
+                    .await
+                    .expect("plan decimal rows")
+                    .collect()
+                    .await
+                    .expect("collect decimal rows");
+                let mut actual = Vec::new();
+                for batch in &batches {
+                    assert_eq!(batch.column(0).null_count(), 0, "{phase}: non-NULL key");
+                    assert_eq!(batch.column(1).null_count(), 0, "{phase}: non-NULL amount");
+                    assert_eq!(batch.column(1).data_type(), &DataType::Decimal128(14, 4));
+                    let ids = batch
+                        .column(0)
+                        .as_any()
+                        .downcast_ref::<Int64Array>()
+                        .expect("id array");
+                    let amounts = batch
+                        .column(1)
+                        .as_any()
+                        .downcast_ref::<Decimal128Array>()
+                        .expect("amount array");
+                    for row in 0..batch.num_rows() {
+                        actual.push((ids.value(row), amounts.value(row)));
+                    }
+                }
+                assert_eq!(actual, expected, "{phase}: {sql}");
+                eprintln!("DECIMAL_ROWS {phase} {sql}: {actual:?}");
+            }
+        }
+        async fn assert_truthful_count(
+            provider: &CayenneTableProvider,
+            catalog: &CayenneCatalog,
+            table_id: &str,
+            phase: &str,
+            expected: i64,
+        ) {
+            use datafusion_common::stats::Precision;
+
+            let persisted = catalog
+                .get_table_statistics(table_id)
+                .await
+                .expect("read row-count statistics");
+            if let Some(stats) = &persisted
+                && stats.num_rows_exact
+            {
+                assert_eq!(
+                    stats.num_rows, expected,
+                    "{phase}: persisted exact count must describe every live row"
+                );
+            }
+            let optimizer = provider.optimizer_table_statistics();
+            if let Some(stats) = &optimizer
+                && let Precision::Exact(rows) = stats.num_rows
+            {
+                assert_eq!(
+                    i64::try_from(rows).expect("count fits i64"),
+                    expected,
+                    "{phase}: optimizer exact count must describe every live row"
+                );
+            }
+            eprintln!(
+                "DECIMAL_COUNT {phase} actual={expected} persisted={:?} optimizer={:?}",
+                persisted
+                    .as_ref()
+                    .map(|stats| (stats.num_rows, stats.num_rows_exact)),
+                optimizer.map(|stats| stats.num_rows)
+            );
+        }
+        let temp_dir = TempDir::new().expect("temp dir");
+        let db_path = temp_dir.path().join("cayenne_evolution_decimal_scale.db");
+        let connection_string = format!("sqlite://{}", db_path.to_string_lossy());
+        let catalog =
+            Arc::new(CayenneCatalog::new(connection_string.as_str()).expect("to create catalog"));
+        catalog.init().await.expect("to init catalog");
+
+        let stored_schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("amount", DataType::Decimal128(10, 2), true),
+        ]));
+        let table_name = "evolution_decimal_scale";
+        catalog
+            .create_table(CreateTableOptions {
+                table_name: table_name.to_string(),
+                schema: Arc::clone(&stored_schema),
+                primary_key: vec!["id".to_string()],
+                on_conflict: Some(OnConflict::DoNothingAll),
+                base_path: temp_dir.path().to_string_lossy().to_string(),
+                partition_column: None,
+                vortex_config: crate::metadata::VortexConfig::default(),
+            })
+            .await
+            .expect("to create table");
+        let table_metadata = catalog.get_table(table_name).await.expect("to get table");
+
+        let ctx = SessionContext::new();
+        let catalog_trait: Arc<dyn MetadataCatalog> =
+            Arc::clone(&catalog) as Arc<dyn MetadataCatalog>;
+        let provider = Arc::new(
+            CayenneTableProvider::new(table_name, catalog_trait, ctx.runtime_env())
+                .await
+                .expect("to open provider"),
+        );
+
+        let amount = Decimal128Array::from(vec![12_345_i128])
+            .with_precision_and_scale(10, 2)
+            .expect("decimal array");
+        let batch = RecordBatch::try_new(
+            Arc::clone(&stored_schema),
+            vec![Arc::new(Int64Array::from(vec![1_i64])), Arc::new(amount)],
+        )
+        .expect("to build batch");
+        let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+        *provider.test_pre_maintenance_statistics_hook.lock() = Some(Box::new(move || {
+            Box::pin(async move {
+                let _ = entered_tx.send(());
+                let _ = release_rx.await;
+            })
+        }));
+        insert_batch(&provider, batch).await;
+
+        tokio::time::timeout(std::time::Duration::from_secs(30), entered_rx)
+            .await
+            .expect("maintenance must capture the original write")
+            .expect("maintenance reports capture");
+        catalog
+            .upsert_table_statistics(&crate::metadata::TableStatistics {
+                table_id: table_metadata.table_id.clone(),
+                statistics_blob: vec![1, 2, 3],
+                num_rows: 1,
+                ndv_sketches: None,
+                num_rows_exact: true,
+            })
+            .await
+            .expect("seed table stats");
+        catalog
+            .upsert_snapshot_file_statistics(&crate::metadata::SnapshotFileStatistics {
+                table_id: table_metadata.table_id.clone(),
+                snapshot_id: table_metadata.current_snapshot_id.clone(),
+                file_path: "f.vortex".to_string(),
+                file_size_bytes: 100,
+                num_rows: 1,
+                statistics_blob: vec![4, 5, 6],
+            })
+            .await
+            .expect("seed snapshot file stats");
+
+        let incoming_schema = Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("amount", DataType::Decimal128(14, 4), true),
+        ]);
+        let plan = widening_plan(&stored_schema, &incoming_schema, &["id".to_string()]);
+        assert!(
+            plan.changes_decimal_scale(),
+            "Decimal128(10,2) -> Decimal128(14,4) must be a scale change"
+        );
+
+        if in_flight {
+            // Flush the inline corpus before parking a publisher that owns the
+            // persistence mutex; evolution's checkpoints must be no-ops here.
+            assert_eq!(
+                provider
+                    .checkpoint_inlined_data()
+                    .await
+                    .expect("checkpoint inline"),
+                1
+            );
+            let (publishing_tx, publishing_rx) = tokio::sync::oneshot::channel();
+            let (publish_tx, publish_rx) = tokio::sync::oneshot::channel();
+            *provider.test_statistics_publish_hook.lock() = Some(Box::new(move || {
+                Box::pin(async move {
+                    let _ = publishing_tx.send(());
+                    let _ = publish_rx.await;
+                })
+            }));
+            release_tx.send(()).expect("release queued maintenance");
+            tokio::time::timeout(std::time::Duration::from_secs(30), publishing_rx)
+                .await
+                .expect("publisher must reach persistence")
+                .expect("publisher reports entry");
+            let (evolving_tx, evolving_rx) = tokio::sync::oneshot::channel();
+            let acquired = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            *provider.test_schema_statistics_lock_probe.lock() =
+                Some((evolving_tx, Arc::clone(&acquired)));
+            let evolving_provider = Arc::clone(&provider);
+            let evolving_plan = plan.clone();
+            let evolution =
+                tokio::spawn(
+                    async move { evolving_provider.evolve_schema_live(&evolving_plan).await },
+                );
+            tokio::time::timeout(std::time::Duration::from_secs(30), evolving_rx)
+                .await
+                .expect("evolution must reach statistics fence")
+                .expect("evolution reports entry");
+            // These tests use Tokio's current-thread runtime. Evolution signals
+            // immediately before acquiring the mutex, so it has polled that
+            // acquisition before this task resumes. Removing the mutex would
+            // set this flag in the same poll, rather than waiting on publication.
+            assert!(
+                !acquired.load(std::sync::atomic::Ordering::SeqCst),
+                "schema publication must wait for the in-flight statistics publisher"
+            );
+            publish_tx.send(()).expect("release in-flight publisher");
+            evolution
+                .await
+                .expect("evolution task")
+                .expect("live schema evolution");
+            assert!(
+                acquired.load(std::sync::atomic::Ordering::SeqCst),
+                "evolution acquires the fence after the publisher commits"
+            );
+        } else {
+            provider
+                .evolve_schema_live(&plan)
+                .await
+                .expect("live schema evolution");
+            release_tx.send(()).expect("release old-schema maintenance");
+        }
+        provider
+            .drain_in_flight_maintenance()
+            .await
+            .expect("drain old-schema maintenance");
+        let persisted = catalog
+            .get_table_statistics(&table_metadata.table_id)
+            .await
+            .expect("read stats");
+        if let Some(stats) = &persisted {
+            for schema in [stored_schema.as_ref(), plan.evolved_schema.as_ref()] {
+                let decoded =
+                    crate::stats::deserialize_file_statistics(&stats.statistics_blob, schema);
+                eprintln!(
+                    "DECIMAL_BOUNDS schema={schema:?} decoded={:?}",
+                    decoded.map(|f| crate::stats::file_statistics_to_df(
+                        &f,
+                        schema,
+                        stats.num_rows
+                    ))
+                );
+            }
+        }
+        assert_decimal_rows(Arc::clone(&provider), "live", &[(1, 1_234_500)]).await;
+        let catalog_trait: Arc<dyn MetadataCatalog> =
+            Arc::clone(&catalog) as Arc<dyn MetadataCatalog>;
+        let reopened = Arc::new(
+            CayenneTableProvider::new(table_name, catalog_trait, ctx.runtime_env())
+                .await
+                .expect("reopen decimal table"),
+        );
+        assert_decimal_rows(reopened, "reopened", &[(1, 1_234_500)]).await;
+
+        assert!(
+            persisted.is_none(),
+            "live scale change must drop the table aggregate blob"
+        );
+        assert!(
+            catalog
+                .get_snapshot_file_statistics(
+                    &table_metadata.table_id,
+                    &table_metadata.current_snapshot_id,
+                    "f.vortex"
+                )
+                .await
+                .expect("read snapshot file stats")
+                .is_none(),
+            "live scale change must drop snapshot-file stats"
+        );
+
+        ctx.register_table(table_name, Arc::<CayenneTableProvider>::clone(&provider))
+            .expect("to register table");
+        assert_eq!(
+            query_count(
+                &ctx,
+                "SELECT COUNT(*) FROM evolution_decimal_scale WHERE amount = CAST(123.45 AS DECIMAL(14, 4))"
+            )
+            .await,
+            1,
+            "a matching decimal predicate must not be pruned after the scale change"
+        );
+
+        if !in_flight {
+            // Exercise later incremental updates without requiring them to repair
+            // an abandoned count. An exact count must always match real rows;
+            // conservative statistics and a correct future repair are both valid.
+            let amount = Decimal128Array::from(vec![2_345_600_i128])
+                .with_precision_and_scale(14, 4)
+                .expect("evolved decimal array");
+            let batch = RecordBatch::try_new(
+                Arc::clone(&plan.evolved_schema),
+                vec![Arc::new(Int64Array::from(vec![2_i64])), Arc::new(amount)],
+            )
+            .expect("evolved row batch");
+            insert_batch(&provider, batch).await;
+            provider
+                .drain_in_flight_maintenance()
+                .await
+                .expect("drain next write");
+            assert_decimal_rows(
+                Arc::clone(&provider),
+                "after next write",
+                &[(1, 1_234_500), (2, 2_345_600)],
+            )
+            .await;
+            assert_eq!(
+                query_count(&ctx, "SELECT COUNT(*) FROM evolution_decimal_scale").await,
+                2
+            );
+            assert_truthful_count(
+                &provider,
+                &catalog,
+                &table_metadata.table_id,
+                "after next write",
+                2,
+            )
+            .await;
+
+            let delete = provider
+                .delete_from(
+                    &ctx.state(),
+                    vec![datafusion_expr::col("id").eq(datafusion_expr::lit(2_i64))],
+                )
+                .await
+                .expect("plan filtered delete");
+            collect(delete, ctx.task_ctx())
+                .await
+                .expect("execute filtered delete");
+            provider
+                .drain_in_flight_maintenance()
+                .await
+                .expect("drain delete");
+            assert_decimal_rows(Arc::clone(&provider), "after delete", &[(1, 1_234_500)]).await;
+            assert_eq!(
+                query_count(&ctx, "SELECT COUNT(*) FROM evolution_decimal_scale").await,
+                1
+            );
+            assert_truthful_count(
+                &provider,
+                &catalog,
+                &table_metadata.table_id,
+                "after delete",
+                1,
+            )
+            .await;
+        }
     }
 }

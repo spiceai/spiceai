@@ -49,7 +49,7 @@ use datafusion::{
 use super::sql::SQL_TABLE_ARGS_TABLE_NAME;
 
 /// Returns `true` if `table_name` refers to the `args` table.
-fn is_args_table_ref(table_name: &datafusion::sql::TableReference) -> bool {
+fn is_args_table_ref(table_name: &datafusion::common::TableReference) -> bool {
     table_name
         .table()
         .eq_ignore_ascii_case(SQL_TABLE_ARGS_TABLE_NAME)

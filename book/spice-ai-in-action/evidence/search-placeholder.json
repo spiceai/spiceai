@@ -1,0 +1,10 @@
+{
+  "request": {
+    "sql": "SELECT article_id FROM text_search(articles, $1, body)",
+    "parameters": [
+      "shipping"
+    ]
+  },
+  "status": 400,
+  "response": "Failed to execute query: Error during planning: Second argument must be a query string, but got Some(Placeholder(Placeholder { id: \"$1\", field: None }))."
+}

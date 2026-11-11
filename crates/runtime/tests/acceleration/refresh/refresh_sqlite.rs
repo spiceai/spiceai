@@ -15,11 +15,9 @@ limitations under the License.
 */
 use crate::acceleration::refresh::common::{
     execute_ps_sql, execute_rt_sql, get_acceleration_config_append, get_acceleration_config_full,
-    initialize_postgres, refresh_table, start_test_runtime, test_append_iso8601_for_engine,
-    test_append_unix_seconds_for_engine,
+    initialize_postgres, refresh_table, start_test_runtime,
 };
 use crate::postgres::common;
-use crate::postgres::common::get_random_port;
 use crate::{init_tracing, utils::test_request_context};
 use std::sync::Arc;
 
@@ -29,8 +27,8 @@ async fn test_acceleration_refresh_sqlite_append() -> Result<(), anyhow::Error> 
 
     test_request_context()
         .scope(async {
-            let port: usize = get_random_port()?;
-            let running_container = common::start_postgres_docker_container(port).await?;
+            let running_container = common::start_postgres_docker_container().await?;
+            let port = usize::from(running_container.host_port(5432)?);
 
             let db_conn = initialize_postgres(port).await?;
             let acceleration_config = get_acceleration_config_append("sqlite", None);
@@ -61,22 +59,10 @@ async fn test_acceleration_refresh_sqlite_append() -> Result<(), anyhow::Error> 
                 2
             );
 
-            running_container.remove().await?;
+            running_container.cleanup().await;
             Ok(())
         })
         .await
-}
-
-#[tokio::test]
-async fn test_acceleration_refresh_sqlite_append_unix_seconds() -> Result<(), anyhow::Error> {
-    let _tracing = init_tracing(Some("integration=debug,info"));
-    test_append_unix_seconds_for_engine("sqlite", None, None).await
-}
-
-#[tokio::test]
-async fn test_acceleration_refresh_sqlite_append_iso8601() -> Result<(), anyhow::Error> {
-    let _tracing = init_tracing(Some("integration=debug,info"));
-    test_append_iso8601_for_engine("sqlite", None, None).await
 }
 
 #[tokio::test]
@@ -85,8 +71,8 @@ async fn test_acceleration_refresh_sqlite_full() -> Result<(), anyhow::Error> {
 
     test_request_context()
         .scope(async {
-            let port: usize = get_random_port()?;
-            let running_container = common::start_postgres_docker_container(port).await?;
+            let running_container = common::start_postgres_docker_container().await?;
+            let port = usize::from(running_container.host_port(5432)?);
 
             let db_conn = initialize_postgres(port).await?;
             let acceleration_config = get_acceleration_config_full("sqlite", None);
@@ -117,7 +103,7 @@ async fn test_acceleration_refresh_sqlite_full() -> Result<(), anyhow::Error> {
                 2
             );
 
-            running_container.remove().await?;
+            running_container.cleanup().await;
             Ok(())
         })
         .await

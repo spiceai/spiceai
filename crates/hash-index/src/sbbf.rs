@@ -116,12 +116,16 @@ impl SplitBlockBloomFilter {
 
     /// Selects the block for `hash` via multiply-shift range reduction over
     /// the high 32 bits, leaving the low 32 bits independent for the in-block
-    /// bit positions. The multiply widens to `u128` so block counts beyond
-    /// `2^32` (a >128 GiB filter) cannot overflow the product; the double
-    /// shift keeps the result within block range, so the cast cannot truncate.
+    /// bit positions.
+    ///
+    /// The reduction lives in [`crate::sbbf_layout::block_index`], where the
+    /// in-range result the subscript below depends on is a verified
+    /// postcondition rather than a property the reader has to re-derive.
+    /// [`Self::new`] always allocates at least one block, which is the
+    /// condition that postcondition carries.
     #[inline]
     fn block_index(&self, hash: u64) -> usize {
-        ((u128::from(hash >> 32) * self.blocks.len() as u128) >> 32) as usize
+        crate::sbbf_layout::block_index(self.blocks.len(), hash)
     }
 
     /// Computes the eight per-word bit masks for `hash` from its low 32 bits.
@@ -150,6 +154,42 @@ impl SplitBlockBloomFilter {
         for (word, mask) in block.0.iter().zip(masks) {
             word.fetch_or(mask, Ordering::Relaxed);
         }
+    }
+
+    /// [`Self::insert`], returning whether it set any bit not already set.
+    /// `false` means the filter already held every bit of `hash`, so the
+    /// insert left its false-positive rate unchanged: a key inserted again,
+    /// or (rarely) a new key that collides with bits already set.
+    #[inline]
+    #[must_use = "use `insert` when whether a bit was new does not matter"]
+    pub fn insert_new(&self, hash: u64) -> bool {
+        let block = &self.blocks[self.block_index(hash)];
+        let masks = Self::masks(hash);
+        let mut new = false;
+        for (word, mask) in block.0.iter().zip(masks) {
+            new |= word.fetch_or(mask, Ordering::Relaxed) & mask != mask;
+        }
+        new
+    }
+
+    /// Inserts every hash of `hashes` into a filter no reader can see yet.
+    /// Exclusive access lets it set bits with plain stores rather than the
+    /// atomic read-modify-writes [`Self::insert`] needs. Returns how many of
+    /// the inserts set a bit not already set, as [`Self::insert_new`] counts.
+    pub fn extend(&mut self, hashes: impl IntoIterator<Item = u64>) -> usize {
+        let mut new = 0;
+        for hash in hashes {
+            let index = self.block_index(hash);
+            let masks = Self::masks(hash);
+            let mut fresh = false;
+            for (word, mask) in self.blocks[index].0.iter_mut().zip(masks) {
+                let word = word.get_mut();
+                fresh |= *word & mask != mask;
+                *word |= mask;
+            }
+            new += usize::from(fresh);
+        }
+        new
     }
 
     /// Checks whether a hash might be in the filter.
@@ -192,7 +232,69 @@ impl Clone for SplitBlockBloomFilter {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::hash_key;
+    use crate::{hash_key, hash_key_i64};
+
+    /// `extend` sets the same bits as inserting one hash at a time, and
+    /// counts the inserts that set a new bit as `insert_new` does.
+    #[test]
+    fn extend_matches_inserting_one_at_a_time() {
+        let hashes: Vec<u64> = (0..5_000_i64).map(|k| hash_key_i64(k % 3_000)).collect();
+        let one_at_a_time = SplitBlockBloomFilter::new(3_000);
+        let new = hashes
+            .iter()
+            .filter(|&&hash| one_at_a_time.insert_new(hash))
+            .count();
+        let mut extended = SplitBlockBloomFilter::new(3_000);
+        assert_eq!(extended.extend(hashes.iter().copied()), new);
+        let bits = |filter: &SplitBlockBloomFilter| -> Vec<u32> {
+            filter
+                .blocks
+                .iter()
+                .flat_map(|block| block.0.iter().map(|word| word.load(Ordering::Relaxed)))
+                .collect()
+        };
+        assert_eq!(bits(&extended), bits(&one_at_a_time));
+    }
+
+    #[test]
+    fn insert_new_reports_only_new_bits() {
+        let filter = SplitBlockBloomFilter::new(100);
+        assert!(filter.insert_new(0x1234_5678_9abc_def0));
+        assert!(
+            !filter.insert_new(0x1234_5678_9abc_def0),
+            "the same hash sets no new bit"
+        );
+        assert!(filter.might_contain(0x1234_5678_9abc_def0));
+    }
+
+    /// `block_index` delegates to the verified reduction in
+    /// [`crate::sbbf_layout`]. Verus establishes the in-range postcondition for
+    /// every input; this pins the concrete value against the multiply-shift
+    /// expression, so the delegation cannot quietly relocate a key's block and
+    /// invalidate every filter already written to disk.
+    #[test]
+    fn block_index_matches_the_multiply_shift_reduction() {
+        for expected_items in [0_usize, 1, 100, 10_000] {
+            let filter = SplitBlockBloomFilter::new(expected_items);
+            let len = filter.blocks.len();
+            for hash in [
+                0_u64,
+                1,
+                u64::MAX,
+                u64::from(u32::MAX) << 32,
+                0xffff_ffff,
+                0x1234_5678_9abc_def0,
+            ] {
+                let reduction = ((u128::from(hash >> 32) * len as u128) >> 32) as usize;
+                assert_eq!(
+                    filter.block_index(hash),
+                    reduction,
+                    "block_index drifted from the reduction at len={len} hash={hash:#x}"
+                );
+                assert!(filter.block_index(hash) < len, "out of range at len={len}");
+            }
+        }
+    }
 
     #[test]
     fn insert_then_contains() {

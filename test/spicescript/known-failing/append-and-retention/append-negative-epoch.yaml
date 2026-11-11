@@ -1,0 +1,37 @@
+name: append-negative-epoch
+description: >
+  Known failing (#15542). Append refresh with epoch milliseconds as the time column
+  over rows before 1970: the initial load is right, but the next refresh
+  fails "Integer time column value -133200000 is negative and cannot be
+  used as a timestamp", the dataset goes to Error, and no later row loads.
+  Negative epoch values are ordinary pre-1970 times, and the same rows load
+  with a timestamp time column (append-time-partition.yaml).
+
+sources:
+  src: { kind: postgres }
+
+spicepod:
+  version: v1
+  kind: Spicepod
+  name: append-negative-epoch
+  datasets:
+    - from: postgres:public.old
+      name: old
+      params: ${sources.src.params}
+      time_column: ms
+      time_format: unix_millis
+      acceleration: { enabled: true, engine: cayenne, mode: file, refresh_mode: append }
+
+defaults:
+  expect: { oracle: src }
+
+steps:
+  - source-exec:
+      src: |
+        CREATE TABLE old (id int NOT NULL, ms bigint NOT NULL);
+        INSERT INTO old VALUES (1, -136800000), (2, -133200000);
+  - start: {}
+  - query: SELECT * FROM old
+  - source-exec: { src: "INSERT INTO old VALUES (3, -129600000), (4, 1000)" }
+  - refresh: old
+  - query: SELECT * FROM old

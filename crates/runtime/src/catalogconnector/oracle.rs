@@ -287,31 +287,35 @@ mod tests {
         assert_eq!(conn.connect_string, "//myhost:1521/XEPDB1");
     }
 
+    fn expect_missing_parameter(params: &Parameters, expected: &str) {
+        let err = OracleCatalog::build_connection_params(params)
+            .expect_err("build_connection_params should fail when a required parameter is absent");
+        assert!(
+            matches!(&err, Error::MissingParameter { parameter } if parameter == expected),
+            "expected MissingParameter for '{expected}', got {err:?}"
+        );
+        assert_eq!(
+            err.to_string(),
+            format!("Missing required parameter: '{expected}'. Specify a value.")
+        );
+    }
+
     #[test]
     fn test_build_connection_params_missing_username() {
         let params = make_params(vec![("password", "pass"), ("host", "myhost")]);
-        assert!(
-            OracleCatalog::build_connection_params(&params).is_err(),
-            "should fail without username"
-        );
+        expect_missing_parameter(&params, "oracle_username");
     }
 
     #[test]
     fn test_build_connection_params_missing_password() {
         let params = make_params(vec![("username", "admin"), ("host", "myhost")]);
-        assert!(
-            OracleCatalog::build_connection_params(&params).is_err(),
-            "should fail without password"
-        );
+        expect_missing_parameter(&params, "oracle_password");
     }
 
     #[test]
     fn test_build_connection_params_missing_host() {
         let params = make_params(vec![("username", "admin"), ("password", "pass")]);
-        assert!(
-            OracleCatalog::build_connection_params(&params).is_err(),
-            "should fail without host or connection_string"
-        );
+        expect_missing_parameter(&params, "oracle_host");
     }
 
     #[test]
@@ -322,9 +326,12 @@ mod tests {
             ("host", "myhost"),
             ("port", "not_a_number"),
         ]);
+        let err = OracleCatalog::build_connection_params(&params)
+            .expect_err("should fail with invalid port");
         assert!(
-            OracleCatalog::build_connection_params(&params).is_err(),
-            "should fail with invalid port"
+            matches!(&err, Error::FailedToParsePort { port } if port == "not_a_number"),
+            "expected FailedToParsePort for 'not_a_number', got {err:?}"
         );
+        assert_eq!(err.to_string(), "Invalid port value: not_a_number");
     }
 }

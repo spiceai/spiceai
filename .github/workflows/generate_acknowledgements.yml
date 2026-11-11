@@ -5,18 +5,22 @@ on:
 
 jobs:
   generate:
+    environment: secret-free
     name: Generate Acknowledgements
     runs-on: self-hosted
     permissions:
       pull-requests: write
       contents: write
+      # Approves the PR's held pull_request runs.
+      actions: write
 
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
 
-      - run: rustup toolchain install 1.96.1 --profile minimal
+      - name: Set up Rust
+        uses: ./.github/actions/setup-rust
 
       - name: Set up make
         if: runner.os != 'macOS'
@@ -41,10 +45,21 @@ jobs:
           if [[ $(git diff --exit-code acknowledgements.md) ]]; then
             git add acknowledgements.md
             git commit -m "Update acknowledgements"
-            git push "https://x-access-token:${GH_TOKEN}@github.com/${GITHUB_REPOSITORY}" HEAD:acknowledgements/${GITHUB_RUN_ID}
-            gh pr create --title "Update acknowledgements" --body "Updated OSS acknowledgements" --base trunk --head acknowledgements/${GITHUB_RUN_ID}
+            # Non-interactive: a credential helper on the runner can otherwise intercept
+            # this push and block on a prompt forever. See
+            # scripts/check_ci_git_push_noninteractive.py.
+            git -c credential.helper='' -c credential.interactive=false \
+              push "https://x-access-token:${GH_TOKEN}@github.com/${GITHUB_REPOSITORY}" HEAD:acknowledgements/${GITHUB_RUN_ID}
+            # enforce-pull-with-spice, a required check, fails a PR without both a kind/ and
+            # an area/ label.
+            gh pr create --title "Update acknowledgements" --body "Updated OSS acknowledgements" --base trunk --head acknowledgements/${GITHUB_RUN_ID} --label kind/documentation --label area/docs
+            # Release the pull_request runs GitHub holds on a GITHUB_TOKEN push (see the script).
+            bash .github/scripts/approve_bot_pr_runs.sh "acknowledgements/${GITHUB_RUN_ID}" "$(git rev-parse HEAD)"
           else
             echo "No changes detected"
           fi
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          # Never fall back to an interactive prompt; fail fast if auth is rejected.
+          GIT_TERMINAL_PROMPT: '0'
+          GCM_INTERACTIVE: 'never'

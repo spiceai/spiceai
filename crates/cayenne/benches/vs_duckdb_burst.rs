@@ -6,12 +6,12 @@
 //
 //     https://www.apache.org/licenses/LICENSE-2.0
 
-//! CDC-style append-burst throughput: Cayenne vs DuckDB.
+//! CDC-style append-burst throughput: Cayenne vs `DuckDB`.
 //!
 //! Models the apply-loop pattern from the runtime's CDC pipeline: many small
 //! bursts arriving back-to-back, each going through the engine's full
 //! per-burst commit path (Cayenne: inline + staged-WAL finalize + listing
-//! refresh + stats persist; DuckDB: per-statement WAL append + B-tree update).
+//! refresh + stats persist; `DuckDB`: per-statement WAL append + B-tree update).
 //!
 //! Each iteration writes `burst_count` bursts of `burst_rows` rows each. The
 //! timed region covers all bursts so per-burst fixed cost is amortized into
@@ -19,10 +19,9 @@
 //! denominator, so the result is directly comparable across engines and
 //! lanes.
 //!
-//! Lanes (compile-time gated):
-//! - `cayenne`       — Cayenne with the SQLite metastore (default)
-//! - `cayenne_turso` — Cayenne with the Turso metastore (--features turso)
-//! - `duckdb`        — DuckDB file-mode with `INSERT INTO ... VALUES (...)`
+//! Lanes:
+//! - `cayenne`       — Cayenne with the SQLite metastore
+//! - `duckdb`        — `DuckDB` file-mode with `INSERT INTO ... VALUES (...)`
 
 #![allow(clippy::expect_used)]
 #![allow(clippy::cast_possible_wrap)]

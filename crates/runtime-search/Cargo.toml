@@ -11,6 +11,7 @@ version.workspace = true
 [dependencies]
 cpu-budget = { path = "../cpu-budget" }
 linkme.workspace = true
+model-capabilities = { path = "../model-capabilities" }
 runtime-udfs-api = { path = "../runtime-udfs-api" }
 app = { path = "../app" }
 arrow.workspace = true
@@ -32,6 +33,7 @@ fundu = { workspace = true, optional = true }
 futures.workspace = true
 itertools.workspace = true
 llms = { path = "../llms", default-features = false }
+prost.workspace = true
 runtime-acceleration = { path = "../runtime-acceleration" }
 runtime-datafusion-index = { path = "../runtime-datafusion-index" }
 runtime-datafusion-udfs = { path = "../runtime-datafusion-udfs" }
@@ -59,7 +61,6 @@ tracing.workspace = true
 
 [features]
 default = []
-duckdb = ["search/duckdb"]
 elasticsearch = ["search/elasticsearch", "dep:elasticsearch", "dep:duration-parse"]
 models = ["runtime-datafusion-udfs/models"]
 openapi = ["dep:utoipa"]

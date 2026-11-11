@@ -6,6 +6,7 @@ license-file.workspace = true
 name = "spiced"
 repository.workspace = true
 rust-version.workspace = true
+autotests = false
 version.workspace = true
 
 [dependencies]
@@ -31,6 +32,7 @@ connector-ftp = { path = "../../crates/data-connectors/connector-ftp", optional 
 connector-gcs = { path = "../../crates/data-connectors/connector-gcs" }
 connector-git = { path = "../../crates/data-connectors/connector-git" }
 connector-github = { path = "../../crates/data-connectors/connector-github" }
+connector-huggingface = { path = "../../crates/data-connectors/connector-huggingface" }
 connector-glue = { path = "../../crates/data-connectors/connector-glue" }
 connector-graphql = { path = "../../crates/data-connectors/connector-graphql" }
 connector-imap = { path = "../../crates/data-connectors/connector-imap", optional = true }
@@ -44,8 +46,8 @@ connector-odbc = { path = "../../crates/data-connectors/connector-odbc", optiona
 connector-oracle = { path = "../../crates/data-connectors/connector-oracle", optional = true }
 accelerator-postgres = { path = "../../crates/accelerators/accelerator-postgres", optional = true }
 accelerator-sqlite = { path = "../../crates/accelerators/accelerator-sqlite", optional = true }
-accelerator-turso = { path = "../../crates/accelerators/accelerator-turso", optional = true }
-accelerator-duckdb = { path = "../../crates/accelerators/accelerator-duckdb", optional = true }
+llms-llamacpp = { path = "../../crates/llms-llamacpp", optional = true }
+accelerator-cayenne = { path = "../../crates/accelerators/accelerator-cayenne" }
 connector-postgres = { path = "../../crates/data-connectors/connector-postgres", optional = true }
 connector-scylladb = { path = "../../crates/data-connectors/connector-scylladb", optional = true }
 connector-sharepoint = { path = "../../crates/data-connectors/connector-sharepoint", optional = true }
@@ -60,6 +62,7 @@ podswatcher = { path = "../../crates/podswatcher" }
 repl = { path = "../../crates/repl" }
 runtime-tls = { path = "../../crates/runtime-tls" }
 futures.workspace = true
+jsonwebtoken = { version = "10.3.0", features = ["aws_lc_rs"] }
 libc = "0.2"
 mimalloc = { version = "0.1.48", optional = true }
 opentelemetry.workspace = true
@@ -83,19 +86,18 @@ runtime-secrets = { path = "../../crates/runtime-secrets", default-features = fa
 async-trait = { workspace = true }
 serde_json = { workspace = true }
 rustls.workspace = true
+# Not used directly; sets the version floors declared in the workspace `Cargo.toml`.
+rustls-webpki.workspace = true
+webpki-root-certs.workspace = true
+webpki-roots.workspace = true
 yaml = { path = "../../crates/yaml" }
 snafu.workspace = true
 zeroize = "1.8"
 snmalloc-rs = { version = "0.3.6" }
 spice-cloud = { path = "../../crates/spice_cloud" }
 telemetry = { path = "../../crates/telemetry" }
-# `profiling` builds jemalloc with `--enable-prof`, without which the heap
-# profiler cannot be turned on at all and `MALLOC_CONF=prof:true,prof_prefix=…`
-# is silently ignored. Costs a sample check in the allocator fast path even while
-# prof is inactive, so this opt-in `alloc-jemalloc` build is for heap
-# investigations, not for allocator throughput comparisons against the default
-# snmalloc build.
-tikv-jemallocator = { version = "0.6.0", optional = true, features = ["profiling"] }
+# No `profiling` feature here: `--enable-prof` belongs to `alloc-jemalloc-profiling`.
+tikv-jemallocator = { version = "0.7.0", optional = true }
 tokio.workspace = true
 # `CancellationToken` for the latches the connection report waits on.
 tokio-util.workspace = true
@@ -105,17 +107,16 @@ tracing-log = "0.2.0"
 tracing-opentelemetry.workspace = true
 tracing-subscriber.workspace = true
 util = { path = "../../crates/util"}
-
-# Vortex ships on non-Windows targets only (matching `runtime`'s gate on
-# Cayenne), so the startup parallelism declaration is gated the same way.
-[target.'cfg(not(windows))'.dependencies]
-# The Cayenne engine is not built on Windows, so it is a target dependency rather
-# than an optional one behind a feature.
-accelerator-cayenne = { path = "../../crates/accelerators/accelerator-cayenne" }
 vortex-utils.workspace = true
+
+# Raising the soft open file limit at startup (`open_file_limit.rs`).
+[target.'cfg(unix)'.dependencies]
+nix = { workspace = true, features = ["resource"] }
 
 # Non-default features should be added to `lint-rust` make target.
 [dev-dependencies]
+iceberg.workspace = true
+iceberg-storage-opendal.workspace = true
 # The cloud-connect cache-write seam probes the connect mutation lock directly
 # to prove the guard is still held while the blocking write runs.
 fs4 = { workspace = true }
@@ -124,10 +125,26 @@ rcgen = { version = "0.14", features = ["x509-parser"] }
 # ever sees one through `runtime`.
 runtime-request-context = { path = "../../crates/runtime-request-context" }
 tempfile.workspace = true
+# The OTLP log export tests serve a real OTLP endpoint for `spiced` to send to:
+# the logs and metrics services over gRPC, and `/v1/logs` over HTTP.
+axum.workspace = true
+opentelemetry-proto = { version = "0.32", default-features = false, features = [
+    "gen-tonic",
+    "logs",
+    "metrics",
+] }
+prost.workspace = true
+tokio-stream.workspace = true
+tonic.workspace = true
+# Issues the cluster nodes' mTLS certificates for the executor export test.
+test-framework = { path = "../../crates/test-framework" }
 
 [features]
-adbc = ["dep:connector-adbc", "runtime/adbc"]
+adbc = ["dep:connector-adbc", "dep:connector-duckdb", "runtime/adbc"]
 alloc-jemalloc = ["dep:tikv-jemallocator"]
+# Builds jemalloc with `--enable-prof`, without which `_RJEM_MALLOC_CONF=prof:true`
+# is silently ignored. Reports as `jemalloc-profiling`, not `jemalloc`.
+alloc-jemalloc-profiling = ["alloc-jemalloc", "tikv-jemallocator/profiling"]
 alloc-mimalloc = ["dep:mimalloc"]
 alloc-snmalloc = []
 alloc-system = []
@@ -137,12 +154,13 @@ azure-keyvault = ["runtime/azure-keyvault"]
 hashicorp_vault = ["runtime/hashicorp_vault"]
 clickhouse = ["connector-clickhouse"]
 cosmosdb = ["connector-cosmosdb", "runtime/cosmosdb"]
-cuda = ["runtime/cuda"]
+cuda = ["runtime/cuda", "llms-llamacpp?/cuda"]
+# Serves single-node GGUF models with llama.cpp; ring models and safetensors stay on mistral.rs.
+llamacpp = ["dep:llms-llamacpp"]
 databricks = ["connector-databricks", "runtime/databricks"]
 debezium = ["runtime/debezium"]
 default = [
     "adbc",
-    "duckdb",
     "postgres",
     "sqlite",
     "mysql",
@@ -168,9 +186,7 @@ default = [
     "runtime/s3_vectors",
     "mongodb",
     "iceberg-write",
-    "turso",
     "smb",
-    "scylladb",
     "models",
     "aws-secrets-manager",
     "azure-keyvault",
@@ -180,7 +196,6 @@ delta_lake = ["connector-delta-lake", "runtime/delta_lake"]
 dev = ["runtime/dev"]
 dremio = ["connector-dremio", "runtime/dremio"]
 elasticsearch = ["connector-elasticsearch", "runtime/elasticsearch"]
-duckdb = ["accelerator-duckdb", "connector-duckdb", "runtime/duckdb"]
 dynamodb = ["connector-dynamodb"]
 flightsql = ["connector-flightsql", "runtime/flightsql"]
 ftp = ["connector-ftp", "runtime/ftp"]
@@ -193,9 +208,9 @@ imap = ["connector-imap", "runtime/imap"]
 kafka = ["dep:connector-kafka", "runtime/kafka"]
 keyring-secret-store = ["runtime/keyring-secret-store"]
 mcp = ["runtime/mcp"]
-metal = ["runtime/metal"]
+metal = ["runtime/metal", "llms-llamacpp?/metal"]
 distributed = ["runtime/distributed"]
-models = ["runtime/models"]
+models = ["runtime/models", "llamacpp"]
 mongodb = ["connector-mongodb", "runtime/mongodb"]
 mssql = ["connector-mssql", "runtime/mssql"]
 # Opt-in Kerberos integrated auth (GSSAPI) for MSSQL on Unix; not in `default`.
@@ -210,6 +225,7 @@ postgres = ["connector-postgres", "runtime/postgres"]
 postgres-accel = ["accelerator-postgres", "runtime/postgres-accel"]
 
 release = []
+# Opt-in ScyllaDB connector; not in `default`.
 scylladb = ["connector-scylladb", "runtime/scylladb"]
 sftp = ["connector-sftp", "runtime/sftp"]
 sharepoint = ["connector-sharepoint", "runtime/sharepoint"]
@@ -221,8 +237,18 @@ spark = ["connector-spark", "runtime/spark", "connector-databricks/spark"]
 spicebench = ["runtime/spicebench"]
 sqlite = ["accelerator-sqlite", "runtime/sqlite"]
 tpc-extension = ["dep:tpc-extension"]
-turso = ["accelerator-turso", "runtime/turso"]
 vortex = ["runtime/vortex"]
 
 [lints]
 workspace = true
+
+# Integration tests are modules of `integration` (`tests/integration.rs`).
+[[test]]
+name = "integration"
+path = "tests/integration.rs"
+
+# What exporting the log over OTLP costs each event, at P50/P99/P99.9:
+# `cargo bench -p spiced --no-default-features --bench otel_logs`.
+[[bench]]
+name = "otel_logs"
+harness = false

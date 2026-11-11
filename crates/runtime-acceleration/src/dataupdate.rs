@@ -29,7 +29,7 @@ use futures::TryStreamExt;
 pub use runtime_query_engine::query_engine::{DataUpdate, UpdateType};
 use tokio::sync::{Mutex, RwLock, broadcast};
 
-use datafusion::sql::TableReference;
+use datafusion::common::TableReference;
 
 const DATA_UPDATE_BROADCAST_CAPACITY: usize = 100;
 
@@ -182,12 +182,46 @@ use runtime_datafusion::error::find_datafusion_root;
 pub struct StreamingDataUpdate {
     pub data: SendableRecordBatchStream,
     pub update_type: UpdateType,
+    /// How the accelerator should order the copies of a key this update repeats,
+    /// when it resolves them after writing; see
+    /// [`util::session_state::RowVersions`]. A wrapper that rebuilds the update
+    /// must carry it forward.
+    pub row_versions: Option<Arc<dyn util::session_state::RowVersions>>,
+    /// The rows the refresh already counted as superseded before the write, when it
+    /// selects them itself; the accelerator then counts none of its own.
+    pub superseded: Option<Arc<util::session_state::SupersededRows>>,
 }
 
 impl StreamingDataUpdate {
     #[must_use]
     pub fn new(data: SendableRecordBatchStream, update_type: UpdateType) -> Self {
-        Self { data, update_type }
+        Self {
+            data,
+            update_type,
+            row_versions: None,
+            superseded: None,
+        }
+    }
+
+    /// This update with the rows the refresh counted as superseded before the write,
+    /// so the accelerator does not count them again.
+    #[must_use]
+    pub fn superseded_counted_before_write(
+        mut self,
+        superseded: Arc<util::session_state::SupersededRows>,
+    ) -> Self {
+        self.superseded = Some(superseded);
+        self
+    }
+
+    /// This update with the row versions its writer supplies.
+    #[must_use]
+    pub fn with_row_versions(
+        mut self,
+        row_versions: Option<Arc<dyn util::session_state::RowVersions>>,
+    ) -> Self {
+        self.row_versions = row_versions;
+        self
     }
 
     /// Drains the stream into an in-memory [`DataUpdate`].
@@ -218,10 +252,7 @@ impl TryFrom<DataUpdate> for StreamingDataUpdate {
             MemoryStream::try_new(data_update.data, data_update.schema, None)
                 .map_err(find_datafusion_root)?,
         ) as SendableRecordBatchStream;
-        Ok(Self {
-            data,
-            update_type: data_update.update_type,
-        })
+        Ok(Self::new(data, data_update.update_type))
     }
 }
 
@@ -335,6 +366,17 @@ impl ExecutionPlan for StreamingDataUpdateExecutionPlan {
         &self.properties
     }
 
+    fn apply_expressions(
+        &self,
+        _f: &mut dyn FnMut(
+            &Arc<dyn datafusion::physical_plan::PhysicalExpr>,
+        ) -> datafusion::error::Result<
+            datafusion::common::tree_node::TreeNodeRecursion,
+        >,
+    ) -> datafusion::error::Result<datafusion::common::tree_node::TreeNodeRecursion> {
+        Ok(datafusion::common::tree_node::TreeNodeRecursion::Continue)
+    }
+
     fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> {
         vec![]
     }
@@ -371,9 +413,9 @@ mod tests {
     use arrow::array::Int32Array;
     use arrow::datatypes::{DataType, Field, Schema};
     use arrow::record_batch::RecordBatch;
+    use datafusion::common::TableReference;
     use datafusion::physical_plan::collect;
     use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
-    use datafusion::sql::TableReference;
 
     fn one_column_batch(schema: &SchemaRef, values: Vec<i32>) -> RecordBatch {
         RecordBatch::try_new(Arc::clone(schema), vec![Arc::new(Int32Array::from(values))])
@@ -458,9 +500,20 @@ mod tests {
         let broadcaster = DataUpdateBroadcaster::new();
         let table_reference = TableReference::bare("cdc_table");
         let receiver = broadcaster.subscribe(&table_reference).await;
+
+        // The subscription registered exactly this table's channel, so the
+        // pruning asserted below has a registered channel to remove.
+        {
+            let channels = broadcaster.channels.read().await;
+            assert_eq!(channels.len(), 1);
+            let sender = channels
+                .get(&table_reference)
+                .expect("subscribe registers the table's channel");
+            assert_eq!(sender.receiver_count(), 1);
+        }
         drop(receiver);
 
-        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+        let pruned = tokio::time::timeout(std::time::Duration::from_secs(1), async {
             loop {
                 if broadcaster.channels.read().await.is_empty() {
                     break;
@@ -468,8 +521,14 @@ mod tests {
                 tokio::task::yield_now().await;
             }
         })
-        .await
-        .expect("dropped receiver should prune the channel");
+        .await;
+        let remaining: Vec<TableReference> =
+            broadcaster.channels.read().await.keys().cloned().collect();
+        assert!(
+            remaining.is_empty(),
+            "dropped receiver should prune the channel within 1s; still registered: {remaining:?}"
+        );
+        pruned.expect("the prune poll ends as soon as no channel is registered");
     }
 
     #[tokio::test]

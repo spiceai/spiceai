@@ -48,7 +48,7 @@ pub(crate) mod search {
 
     use anyhow::anyhow;
     use app::AppBuilder;
-    use datafusion::sql::TableReference;
+    use datafusion::common::TableReference;
     use serde_json::json;
     use spicepod::{
         component::{dataset::Dataset, embeddings::EmbeddingChunkConfig},
@@ -782,8 +782,6 @@ pub(crate) mod search {
     async fn s3_vectors_kafka_stream() -> Result<(), anyhow::Error> {
         use crate::utils::test_request_context;
 
-        const KAFKA_PORT: u16 = 19193;
-
         let _tracing: tracing::subscriber::DefaultGuard =
             crate::init_tracing(DEFAULT_TRACING_MODELS);
 
@@ -796,11 +794,9 @@ pub(crate) mod search {
         test_request_context()
             .scope(async {
                 let (running_container, producer) =
-                    crate::kafka::bootstrap::start_kafka_docker_container(
-                        KAFKA_PORT,
-                        &["megascience"],
-                    )
+                    crate::kafka::bootstrap::start_kafka_docker_container(&["megascience"])
                     .await?;
+                let port = running_container.host_port(19092)?;
 
                 tracing::debug!("Container started");
 
@@ -812,7 +808,7 @@ pub(crate) mod search {
                 let mut ds = crate::kafka::bootstrap::make_kafka_dataset(
                     "megascience",
                     "qs",
-                    KAFKA_PORT,
+                    port,
                     None,
                 );
 
@@ -854,11 +850,7 @@ pub(crate) mod search {
                 rt.shutdown().await;
                 drop(rt);
 
-                // Clean up container after test
-                running_container.remove().await.map_err(|e| {
-                    tracing::error!("running_container.remove: {e}");
-                    anyhow::Error::msg(e.to_string())
-                })?;
+                running_container.cleanup().await;
 
                 Ok(())
             })
@@ -927,12 +919,10 @@ pub(crate) mod search {
                 "${env:AWS_S3_VECTORS_SECRET}".to_string(),
             ),
         ];
-        if std::env::var("AWS_SESSION_TOKEN").is_ok() {
-            param_map.push((
-                "s3_vectors_aws_session_token".to_string(),
-                "${env:AWS_SESSION_TOKEN}".to_string(),
-            ));
-        }
+        param_map.extend(crate::utils::aws_session_token_param(
+            "s3_vectors_aws_session_token",
+            "AWS_S3_VECTORS_SESSION_TOKEN",
+        ));
         let params = spicepod::param::Params::from_string_map(param_map.into_iter().collect());
 
         let store = VectorStore {
@@ -1056,7 +1046,7 @@ async fn delete_index(
             std::env::var("AWS_S3_VECTORS_SECRET")
                 .ok()
                 .unwrap_or_default(),
-            std::env::var("AWS_SESSION_TOKEN").ok(),
+            crate::utils::nonempty_env("AWS_S3_VECTORS_SESSION_TOKEN"),
             None,
             "S3Vectors",
         ))

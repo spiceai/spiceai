@@ -20,6 +20,7 @@ use globset::GlobSet;
 use serde_json::Value;
 use snafu::{ResultExt, Snafu};
 
+use crate::identity::{push_identity_columns, push_identity_fields};
 use arrow::{
     array::{ArrayRef, Int64Builder, RecordBatch, StringBuilder, TimestampMillisecondBuilder},
     datatypes::{DataType, Field, Schema, SchemaRef, TimeUnit},
@@ -159,6 +160,8 @@ impl GithubFilesTableProvider {
         if fetch_content {
             fields.push(Field::new("content", DataType::Utf8, true));
         }
+
+        push_identity_fields(&mut fields, true);
 
         let schema = Arc::new(Schema::new(fields));
 
@@ -871,6 +874,8 @@ impl GithubRestClient {
             columns.push(Arc::new(content_builder.finish()));
         }
 
+        push_identity_columns(&mut columns, owner, Some(repo), tree.len());
+
         let record_batch = RecordBatch::try_new(Arc::clone(&schema), columns)
             .context(UnableToConstructRecordBatchSnafu)?;
 
@@ -932,7 +937,7 @@ impl GithubRestClient {
 
         if let Some(response_json) = response_json.as_ref() {
             error_checker(&response_headers, response_json).map_err(|e| {
-                if let graphql::Error::RateLimited { message } = e {
+                if let graphql::Error::RateLimited { message, .. } = e {
                     Error::RateLimited { message }
                 } else {
                     Error::GithubApiError { source: e.into() }
@@ -996,7 +1001,7 @@ impl GithubRestClient {
 
         if let Some(response_json) = response_json.as_ref() {
             error_checker(&response_headers, response_json).map_err(|e| {
-                if let graphql::Error::RateLimited { message } = e {
+                if let graphql::Error::RateLimited { message, .. } = e {
                     Error::RateLimited { message }
                 } else {
                     Error::GithubApiError { source: e.into() }
@@ -1131,7 +1136,7 @@ impl GithubRestClient {
 
         if let Some(response_json) = response_json.as_ref() {
             error_checker(&response_headers, response_json).map_err(|e| {
-                if let graphql::Error::RateLimited { message } = e {
+                if let graphql::Error::RateLimited { message, .. } = e {
                     Error::RateLimited { message }
                 } else {
                     Error::GithubApiError { source: e.into() }
@@ -1203,7 +1208,7 @@ impl GithubRestClient {
 
                 if let Some(response_json) = response_json.as_ref() {
                     error_checker(&response_headers, response_json).map_err(|e| {
-                        if let graphql::Error::RateLimited { message } = e {
+                        if let graphql::Error::RateLimited { message, .. } = e {
                             Error::RateLimited { message }
                         } else {
                             Error::GithubApiError { source: e.into() }
@@ -1298,7 +1303,7 @@ impl GithubRestClient {
 
             if let Some(response_json) = response_json.as_ref() {
                 error_checker(&response_headers, response_json).map_err(|e| {
-                    if let graphql::Error::RateLimited { message } = e {
+                    if let graphql::Error::RateLimited { message, .. } = e {
                         Error::RateLimited { message }
                     } else {
                         Error::GithubApiError { source: e.into() }
@@ -1391,7 +1396,6 @@ impl GithubRestClient {
         }
     }
 
-    #[expect(clippy::too_many_lines)]
     pub async fn fetch_workflow_runs(
         self: Arc<Self>,
         owner: Arc<str>,
@@ -1458,7 +1462,7 @@ impl GithubRestClient {
 
                 if let Some(response_json) = response_json.as_ref() {
                     error_checker(&response_headers, response_json).map_err(|e| {
-                        if let graphql::Error::RateLimited { message } = e {
+                        if let graphql::Error::RateLimited { message, .. } = e {
                             Error::RateLimited { message }
                         } else {
                             Error::GithubApiError { source: e.into() }
@@ -1661,6 +1665,9 @@ impl GithubRestClient {
             columns.push(Arc::new(map_builder.finish()));
         }
 
+        push_identity_fields(&mut fields, true);
+        push_identity_columns(&mut columns, &owner, Some(&*repo), all_runs.len());
+
         let schema = Arc::new(Schema::new(fields));
 
         let record_batch = RecordBatch::try_new(Arc::clone(&schema), columns)
@@ -1751,7 +1758,7 @@ impl GithubRestClient {
             // Extract only .txt files from the root of the ZIP
             for i in 0..zip.len() {
                 let mut file = zip.by_index(i)?;
-                let file_name = file.name().to_string();
+                let file_name = file.name()?.into_owned();
 
                 // Only process .txt files in the root (no directory separator)
                 if std::path::Path::new(&file_name)
@@ -1828,7 +1835,7 @@ impl GithubRestClient {
 
                 if let Some(response_json) = response_json.as_ref() {
                     error_checker(&response_headers, response_json).map_err(|e| {
-                        if let graphql::Error::RateLimited { message } = e {
+                        if let graphql::Error::RateLimited { message, .. } = e {
                             Error::RateLimited { message }
                         } else {
                             Error::GithubApiError { source: e.into() }
@@ -1901,7 +1908,7 @@ impl GithubRestClient {
             badge_url_builder.append_value(&workflow.badge_url);
         }
 
-        let fields = vec![
+        let mut fields = vec![
             Field::new("id", DataType::Int64, false),
             Field::new("name", DataType::Utf8, false),
             Field::new("path", DataType::Utf8, false),
@@ -1919,7 +1926,7 @@ impl GithubRestClient {
             Field::new("badge_url", DataType::Utf8, false),
         ];
 
-        let columns: Vec<ArrayRef> = vec![
+        let mut columns: Vec<ArrayRef> = vec![
             Arc::new(id_builder.finish()),
             Arc::new(name_builder.finish()),
             Arc::new(path_builder.finish()),
@@ -1928,6 +1935,9 @@ impl GithubRestClient {
             Arc::new(updated_at_builder.finish()),
             Arc::new(badge_url_builder.finish()),
         ];
+
+        push_identity_fields(&mut fields, true);
+        push_identity_columns(&mut columns, &owner, Some(&*repo), all_workflows.len());
 
         let schema = Arc::new(Schema::new(fields));
 
@@ -2090,6 +2100,7 @@ pub fn error_checker(
         // A secondary rate limit was exceeded
         return Err(graphql::Error::RateLimited {
             message: "GitHub API rate limit exceeded. Consider reducing dataset 'max_concurrent_requests' or runtime.source_rate_control.github_concurrent_connections_limit in your spicepod to avoid rate limits. See: https://spiceai.org/docs/components/data-connectors/github".to_string(),
+            retry_after: graphql::response::retry_after_from_headers(headers),
         });
     }
 
@@ -2103,6 +2114,7 @@ pub fn error_checker(
         if ratelimit_remaining == 0 {
             return Err(graphql::Error::RateLimited {
                 message: "GitHub API rate limit exceeded. Consider reducing dataset 'max_concurrent_requests' or runtime.source_rate_control.github_concurrent_connections_limit in your spicepod to avoid rate limits. See: https://spiceai.org/docs/components/data-connectors/github".to_string(),
+                retry_after: graphql::response::retry_after_from_headers(headers),
             });
         }
     }
@@ -2189,20 +2201,42 @@ mod tests {
         );
     }
 
+    /// The refusal for any `ref` predicate a single-ref listing cannot answer
+    /// exactly; serving one ref's files for it would return wrong rows.
+    const UNSUPPORTED_REF_FILTER_MESSAGE: &str = "GitHub files only support a single non-empty ref = '<value>' predicate. Queries using ref with OR, IN, inequality, or multiple values are not supported because they can return incorrect results.";
+
+    fn assert_unsupported_ref_filter(filters: &[datafusion::logical_expr::Expr]) {
+        let err = requested_ref_from_filters(filters)
+            .expect_err("an unsupported ref predicate must be rejected");
+        assert!(
+            matches!(
+                &err,
+                datafusion::error::DataFusionError::Execution(message)
+                    if message == UNSUPPORTED_REF_FILTER_MESSAGE
+            ),
+            "expected the unsupported ref filter error for {filters:?}, got: {err:?}"
+        );
+    }
+
     #[test]
     fn test_requested_ref_from_filters_rejects_multiple_ref_values() {
-        let filters = vec![col("ref").eq(lit("trunk")), col("ref").eq(lit("main"))];
-
-        let _ = requested_ref_from_filters(&filters)
-            .expect_err("multiple ref values should be rejected");
+        assert_unsupported_ref_filter(&[col("ref").eq(lit("trunk")), col("ref").eq(lit("main"))]);
+        // The same pair inside one conjunction is rejected the same way.
+        assert_unsupported_ref_filter(&[col("ref")
+            .eq(lit("trunk"))
+            .and(col("ref").eq(lit("main")))]);
     }
 
     #[test]
     fn test_requested_ref_from_filters_rejects_unsupported_ref_or_predicate() {
-        let filters = vec![col("ref").eq(lit("trunk")).or(col("ref").eq(lit("main")))];
-
-        let _ = requested_ref_from_filters(&filters)
-            .expect_err("unsupported ref OR predicates should be rejected");
+        assert_unsupported_ref_filter(&[col("ref")
+            .eq(lit("trunk"))
+            .or(col("ref").eq(lit("main")))]);
+        // An OR that mixes ref with another column cannot be answered from one
+        // ref's listing either.
+        assert_unsupported_ref_filter(&[col("ref")
+            .eq(lit("trunk"))
+            .or(col("path").eq(lit("README.md")))]);
     }
 
     #[test]

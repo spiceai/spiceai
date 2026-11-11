@@ -26,9 +26,7 @@ use vortex_datafusion::{ProjectionPushdown, VortexFormat, VortexTableOptions, Wr
 use vortex_session::VortexSession;
 
 use super::tuning::{self, ActuatorValues, IngestStats, LiveActuators, TuningBounds};
-use crate::metadata::{
-    DeletionMode, DeltaEncoding, PkConflictDetection, StorageClass, VortexConfig,
-};
+use crate::metadata::{DeletionMode, DeltaEncoding, StorageClass, VortexConfig};
 
 /// Shared context for Cayenne table operations.
 ///
@@ -111,6 +109,15 @@ pub struct CayenneContext {
     /// that gate's own fresh-sample test (independent of the controller's
     /// `last_adjust_samples`). `0` until the first check.
     bake_gate_last_samples: std::sync::atomic::AtomicU64,
+    /// Recorded-batch count at the last whole-table deletion-index reclaim
+    /// back-pressure check: that gate's own fresh-sample cursor. An `auto` table on
+    /// key deletes runs the bake's gate and this one in the same pass, and on a
+    /// shared cursor this gate would read the sample the bake just took as stale.
+    /// `0` until the first check.
+    reclaim_gate_last_samples: std::sync::atomic::AtomicU64,
+    /// Rows the deletion index's last reclaim removed per tombstone, which scales
+    /// both deletion-index triggers (see [`super::deletion_yield`]).
+    deletion_index_yield: super::deletion_yield::DeletionIndexYield,
     /// Consecutive eligible control ticks on which a goal stayed violated while the
     /// controller had no move left — no eligible adjustment, whether because every
     /// relevant lever is clamped at its bound OR the helpful lever is blocked by a
@@ -304,7 +311,7 @@ impl CayenneContext {
             vortex_format,
             config: config.clone(),
             dataset: dataset.to_string(),
-            session_config: SessionConfig::default(),
+            session_config: util::session_state::session_config(),
             upload_semaphore: Arc::new(Semaphore::new(config.upload_concurrency.max(1))),
             overwrite_inline_admission: Arc::new(Semaphore::new(1)),
             runtime_env,
@@ -317,6 +324,8 @@ impl CayenneContext {
             last_adjust: parking_lot::Mutex::new(None),
             last_adjust_samples: std::sync::atomic::AtomicU64::new(0),
             bake_gate_last_samples: std::sync::atomic::AtomicU64::new(0),
+            reclaim_gate_last_samples: std::sync::atomic::AtomicU64::new(0),
+            deletion_index_yield: super::deletion_yield::DeletionIndexYield::default(),
             goal_stuck_ticks: std::sync::atomic::AtomicU64::new(0),
             last_write: parking_lot::Mutex::new(None),
             coupled_writer: std::sync::atomic::AtomicBool::new(false),
@@ -397,12 +406,9 @@ impl CayenneContext {
         cold_target_file_size_mb: usize,
         shard: Option<WriteShardConfig>,
     ) -> Arc<VortexFormat> {
-        let mut session = VortexSession::default();
-        if let Some(full_strategy) =
-            super::delta_encoding::full_strategy_builder_for(&self.config.compression_strategy)
-        {
-            session = session.set(full_strategy);
-        }
+        let session = VortexSession::default().set(
+            super::delta_encoding::full_strategy_builder_for(&self.config.compression_strategy),
+        );
         let mut options = Self::vortex_table_options(&self.config);
         options.target_file_size_mb = cold_target_file_size_mb;
         // Write-only format: it never scans, so drop the read-path cache size and
@@ -463,6 +469,18 @@ impl CayenneContext {
         !self.config.sort_columns.is_empty()
     }
 
+    /// Get the explicit multi-dimensional clustering columns.
+    #[must_use]
+    pub fn cluster_by(&self) -> &[String] {
+        &self.config.cluster_by
+    }
+
+    /// Whether the operator configured multi-dimensional clustering.
+    #[must_use]
+    pub fn has_cluster_by(&self) -> bool {
+        !self.config.cluster_by.is_empty()
+    }
+
     /// Whether [`Self::sort_columns`] is an operator statement of intent rather
     /// than a schema-inference guess.
     ///
@@ -474,6 +492,14 @@ impl CayenneContext {
     pub fn sort_columns_are_authoritative(&self) -> bool {
         !self.config.sort_columns.is_empty()
             && self.config.sort_columns_origin == crate::metadata::SortColumnsOrigin::User
+    }
+
+    /// Whether the operator asked for a file layout: explicit `cluster_by`
+    /// columns or a user-configured sort order. An inferred sort order is not a
+    /// request, since observed filter columns outrank it.
+    #[must_use]
+    pub fn has_requested_layout(&self) -> bool {
+        self.has_cluster_by() || self.sort_columns_are_authoritative()
     }
 
     /// Sort columns that schema inference supplied, if any — the lowest-priority
@@ -568,18 +594,20 @@ impl CayenneContext {
         self.live_actuators.inline_flush_max_bytes().max(0)
     }
 
-    /// Primary-key conflict detection behavior for inserts.
-    #[must_use]
-    pub(crate) fn pk_conflict_detection(&self) -> PkConflictDetection {
-        self.config.pk_conflict_detection
-    }
-
-    /// How primary-key deletions are recorded and applied for PK tables.
-    /// The default `auto` resolves to `position` (merge-on-read position-delete
-    /// vectors); `key` is the opt-out that keeps the above-scan key-based filter.
+    /// How primary-key deletions are recorded and applied for PK tables, as
+    /// configured. The default `auto` lets each PK table choose as it grows (see
+    /// `PkDeletionMode`); a PK-less table always uses position deletes; `key` or
+    /// `position` can be pinned explicitly.
     #[must_use]
     pub(crate) fn deletion_mode(&self) -> DeletionMode {
         self.config.deletion_mode
+    }
+
+    /// Whether `auto` keeps key deletes from the start on this runtime (see
+    /// [`VortexConfig::auto_keeps_key_deletes`]).
+    #[must_use]
+    pub(crate) fn auto_keeps_key_deletes(&self) -> bool {
+        self.config.auto_keeps_key_deletes
     }
 
     /// Byte budget for the in-memory PK keyset cache used during upsert conflict
@@ -622,6 +650,48 @@ impl CayenneContext {
         self.live_actuators.bake_deletion_index_trigger()
     }
 
+    /// The CONFIGURED deletion-index trigger — what the spicepod set, or
+    /// [`crate::provider::table::BAKE_DELETION_INDEX_TRIGGER`] — with the adaptive
+    /// actuator's movement deliberately excluded.
+    ///
+    /// The actuator lowers the trigger to bake more often, trading the bake's write
+    /// amplification for a cheaper per-row probe. That trade is only sound where the
+    /// reclaim is the incremental bake, which rewrites the settled protected prefix.
+    /// The `deletion_mode: position` reclaim is a full current-snapshot rewrite
+    /// instead, whose cost curve is nothing like the bake's — an adaptive floor of
+    /// `1_000` tombstones would ask a large table to re-encode itself continuously,
+    /// holding the write lock each time. That path reads the configured value, so an
+    /// operator still sets it, and the controller cannot make it pathological.
+    #[must_use]
+    pub(crate) fn configured_deletion_index_trigger(&self) -> usize {
+        self.config.bake_deletion_index_trigger
+    }
+
+    /// The deletion-index size at which the seq-prefix bake runs:
+    /// [`Self::bake_deletion_index_trigger`], scaled up by how few rows the last
+    /// reclaim found its tombstones hiding (see [`super::deletion_yield`]).
+    #[must_use]
+    pub(crate) fn effective_bake_deletion_index_trigger(&self) -> usize {
+        self.deletion_index_yield
+            .scale_trigger(self.bake_deletion_index_trigger())
+    }
+
+    /// The deletion-index size at which the whole-table reclaim runs:
+    /// [`Self::configured_deletion_index_trigger`], scaled the same way.
+    #[must_use]
+    pub(crate) fn effective_reclaim_deletion_index_trigger(&self) -> usize {
+        self.deletion_index_yield
+            .scale_trigger(self.configured_deletion_index_trigger())
+    }
+
+    /// Record a deletion-index reclaim (a bake or a whole-table rewrite) that
+    /// removed `rows_removed` rows and took `tombstones_reclaimed` tombstones out
+    /// of the index.
+    pub(crate) fn record_deletion_index_yield(&self, rows_removed: u64, tombstones_reclaimed: u64) {
+        self.deletion_index_yield
+            .record(rows_removed, tombstones_reclaimed);
+    }
+
     /// Apply-back-pressure gate for the seq-prefix bake: `true` when the CDC
     /// apply is at or over capacity, so the background bake — whose merge
     /// (re-encode survivors + publish) competes with the apply for the shared
@@ -635,11 +705,23 @@ impl CayenneContext {
     /// baking is free.
     #[must_use]
     pub(crate) fn bake_should_defer_for_apply(&self) -> bool {
+        self.should_defer_for_apply(&self.bake_gate_last_samples)
+    }
+
+    /// [`Self::bake_should_defer_for_apply`] for the whole-table deletion-index
+    /// reclaim, read through its own fresh-sample cursor. The reclaim re-encodes the
+    /// whole current snapshot, so it competes with the apply harder than the bake
+    /// and defers whenever the bake would — including in a pass whose bake read the
+    /// same sample first.
+    #[must_use]
+    pub(crate) fn whole_table_reclaim_should_defer_for_apply(&self) -> bool {
+        self.should_defer_for_apply(&self.reclaim_gate_last_samples)
+    }
+
+    fn should_defer_for_apply(&self, last_samples: &std::sync::atomic::AtomicU64) -> bool {
         use std::sync::atomic::Ordering;
         let snapshot = self.ingest_snapshot();
-        let last = self
-            .bake_gate_last_samples
-            .swap(snapshot.samples, Ordering::Relaxed);
+        let last = last_samples.swap(snapshot.samples, Ordering::Relaxed);
         let ingest_fresh = snapshot.samples > last;
         ingest_fresh
             && snapshot.samples >= tuning::WARMUP_BATCHES
@@ -833,13 +915,22 @@ impl CayenneContext {
     /// phase) into the tuner's rolling EWMA. Called from the write path with the
     /// duration it already measured for telemetry.
     pub(crate) fn record_io_latency(&self, d: std::time::Duration) {
-        self.ingest_stats.record_io_latency(d);
+        self.ingest_stats
+            .record_io_latency(d, chrono::Utc::now().timestamp_millis());
     }
 
     /// Fold one CDC batch's metastore publish latency (the `publish` phase — the
     /// single-writer commit) into the tuner's rolling EWMA.
     pub(crate) fn record_publish_latency(&self, d: std::time::Duration) {
-        self.ingest_stats.record_publish_latency(d);
+        self.ingest_stats
+            .record_publish_latency(d, chrono::Utc::now().timestamp_millis());
+    }
+
+    /// Record the live deletion-index size a committed seq-prefix bake left
+    /// behind, for the adaptive controller's futile-bake backoff.
+    pub(crate) fn record_bake_residual(&self, deletion_index_len: usize) {
+        self.ingest_stats
+            .record_bake(deletion_index_len, chrono::Utc::now().timestamp_millis());
     }
 
     /// Current memory pressure (`used / budget`), or `None` when unsampled. A
@@ -902,6 +993,7 @@ impl CayenneContext {
         snap.metastore_storage = self.config.metastore_storage_class;
         snap.data_write_mbps = self.config.data_storage_write_mbps;
         snap.metastore_write_mbps = self.config.metastore_storage_write_mbps;
+        self.ingest_stats.expire_stale_latencies(&mut snap, now_ms);
         snap
     }
 
@@ -912,7 +1004,7 @@ impl CayenneContext {
     }
 
     /// Whether closed-loop dynamic tuning is active for this table
-    /// (`cayenne_tuning: adaptive`; a `cayenne_goal_*` setpoint alone does not
+    /// (`runtime.adaptive_tuning: enabled`; a `runtime.params.target_*` setpoint alone does not
     /// enable it). Gates the per-tick query-admission reserve report so it is a
     /// strict no-op for non-adaptive tables.
     #[must_use]
@@ -1064,17 +1156,14 @@ impl CayenneContext {
         // Create a Vortex session with default encodings. The session's write
         // strategy is the table's FULL encoding tier: the BtrBlocks cascade by
         // default, optionally extended with the Zstd string scheme when
-        // `cayenne_compression_strategy=zstd` (this wiring is what makes that
-        // param real — see `delta_encoding::full_strategy_builder_for`).
+        // `cayenne_compression_strategy=zstd`, with string and binary data blocks
+        // capped (see `delta_encoding::full_strategy_builder_for`).
         // Maintenance writes and full-level delta writes inherit it; light
         // delta-encoding levels override it per write via
         // `write_format_with_strategy` (see `provider::delta_encoding`).
-        let mut vortex_session = VortexSession::default();
-        if let Some(full_strategy) =
-            super::delta_encoding::full_strategy_builder_for(&config.compression_strategy)
-        {
-            vortex_session = vortex_session.set(full_strategy);
-        }
+        let vortex_session = VortexSession::default().set(
+            super::delta_encoding::full_strategy_builder_for(&config.compression_strategy),
+        );
 
         // Cayenne opts into the shared cache: its data files carry a uuid7 write
         // id beneath a uuid7 snapshot directory, so a path is written once and

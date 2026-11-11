@@ -34,10 +34,9 @@ use datafusion::arrow::{
 };
 use datafusion::{
     DATAFUSION_VERSION,
+    common::TableReference,
     common::{Constraint, Constraints, DataFusionError, utils::quote_identifier},
-    sql::TableReference,
 };
-use datafusion_table_providers::util::column_reference::ColumnReference;
 use futures::{StreamExt, TryStreamExt};
 use itertools::Itertools;
 #[cfg(test)]
@@ -507,10 +506,7 @@ fn nsql_sql_context() -> NsqlSqlContext {
 }
 
 fn column_reference_columns(reference: &str) -> Vec<String> {
-    ColumnReference::try_from(reference).map_or_else(
-        |_| vec![reference.to_string()],
-        |columns| columns.iter().map(ToString::to_string).collect(),
-    )
+    util::column_reference::parse(reference).unwrap_or_else(|_| vec![reference.to_string()])
 }
 
 fn configured_acceleration_indexes(
@@ -704,7 +700,6 @@ fn is_vector_search_index(kind: &str) -> bool {
     matches!(
         kind,
         "NativeVectorIndex"
-            | "duckdb_vector_index"
             | "elasticsearch_index"
             | "s3_vector_index"
             | "memory_vector_index"
@@ -1638,8 +1633,7 @@ fn is_json_context_function(name: &str) -> bool {
 }
 
 fn spark_function_names(inventory: &FunctionInventory) -> BTreeSet<String> {
-    datafusion_spark::all_default_scalar_functions()
-        .into_iter()
+    crate::datafusion::builder::registered_spark_scalar_functions()
         .map(|function| function.name().to_ascii_lowercase())
         .filter(|name| inventory.names.contains(name))
         .collect()
@@ -1738,8 +1732,7 @@ pub(crate) fn all_context_function_names_for_test() -> HashSet<String> {
     }
 
     names.extend(
-        datafusion_spark::all_default_scalar_functions()
-            .into_iter()
+        crate::datafusion::builder::registered_spark_scalar_functions()
             .map(|function| function.name().to_ascii_lowercase()),
     );
     names
@@ -2813,7 +2806,7 @@ mod tests {
             function: VECTOR_SEARCH_UDTF_NAME.to_string(),
             syntax: format!("{VECTOR_SEARCH_UDTF_NAME}(docs, 'query text', {column})"),
             model: "embed_model".to_string(),
-            engine: Some("duckdb_vector_index".to_string()),
+            engine: Some("s3_vectors".to_string()),
             row_id_columns: vec!["id".to_string()],
             vector_size: Some(384),
             chunked: false,
@@ -3107,8 +3100,7 @@ mod tests {
             );
         }
 
-        let expected_spark_names = datafusion_spark::all_default_scalar_functions()
-            .into_iter()
+        let expected_spark_names = crate::datafusion::builder::registered_spark_scalar_functions()
             .map(|function| function.name().to_ascii_lowercase())
             .collect::<BTreeSet<_>>();
         let actual_spark_names = context

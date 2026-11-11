@@ -1,0 +1,18 @@
+---
+source: crates/test-framework/src/spicetest/datasets/worker.rs
+description: "Query: tpcds_q6"
+---
++-------+-----+
+| state | cnt |
++-------+-----+
+| NV    | 11  |
+| VT    | 12  |
+| MD    | 14  |
+| ME    | 21  |
+| NJ    | 21  |
+| WY    | 21  |
+| OR    | 22  |
+| ID    | 29  |
+| UT    | 31  |
+| NM    | 33  |
++-------+-----+

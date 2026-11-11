@@ -7,6 +7,9 @@
 # the exit status, or the signal that ended it — rather than as a step that passed
 # or as expect's "spawn id expN not open".
 #
+# And a response that is still arriving must not be reported as a failure at all:
+# the waits are bounded on silence, not on how long a model takes to finish.
+#
 # Drives stand-in processes instead of the real `spice` binary, so it needs only
 # `expect`: no Spice runtime, no model provider, no network.
 #
@@ -169,6 +172,38 @@ assert_reports 'Sending "how many issues?"'
 assert_reports 'exited with status 3'
 assert_silent_about 'REACHED THE END'
 
+# SPICE_REPL_IDLE_TIMEOUT overrides the built-in bound when it is a positive
+# integer, and is rejected when it is not.
+helper_case 'SPICE_REPL_IDLE_TIMEOUT overrides the default' '
+set ::env(SPICE_REPL_IDLE_TIMEOUT) 7
+set t [repl_idle_timeout]
+if {$t != 7} { send_user "got $t\n"; exit 1 }
+send_user "OVERRIDE_OK\n"
+exit 0
+'
+assert_status 0
+assert_reports 'OVERRIDE_OK'
+
+helper_case 'absent SPICE_REPL_IDLE_TIMEOUT keeps the default' '
+unset -nocomplain ::env(SPICE_REPL_IDLE_TIMEOUT)
+set t [repl_idle_timeout]
+if {$t != 90} { send_user "got $t\n"; exit 1 }
+send_user "DEFAULT_OK\n"
+exit 0
+'
+assert_status 0
+assert_reports 'DEFAULT_OK'
+
+helper_case 'rejects a non-integer SPICE_REPL_IDLE_TIMEOUT' '
+set ::env(SPICE_REPL_IDLE_TIMEOUT) not-a-number
+repl_idle_timeout
+send_user "REACHED THE END\n"
+exit 0
+'
+assert_status 1
+assert_reports 'SPICE_REPL_IDLE_TIMEOUT must be a positive whole number of seconds'
+assert_silent_about 'REACHED THE END'
+
 # A healthy exchange still runs to completion: the helpers must not turn a
 # working interaction into a failure.
 helper_case 'healthy exchange' '
@@ -211,14 +246,68 @@ assert_silent_about 'no longer running'
 
 # A stand-in for the `spice` CLI that emulates just enough of the `chat` and
 # `search` REPLs for the scripts to run, and that can be told to exit part-way
-# through so the crash paths are exercised.
-mkdir -p "$work_dir/bin"
-cat >"$work_dir/bin/spice" <<'STAND_IN'
-#!/usr/bin/env bash
+# through so the crash paths are exercised. It is input to the installed shell,
+# not an executable: first exec of a freshly written script can stall before
+# its interpreter starts on macOS (#13761).
+cat >"$work_dir/spice.sh" <<'STAND_IN'
 set -u
 mode=$1
 exit_before=${SPICE_FAKE_EXIT_BEFORE_TURN:-0}
 exit_after=${SPICE_FAKE_EXIT_AFTER_TURN:-0}
+# Silence: how long the stand-in waits before answering a turn, or before its
+# first prompt. A model that has stalled and a search that is still running
+# both look like this to the script.
+sleep_secs=${SPICE_FAKE_SLEEP_SECONDS:-0}
+initial_sleep_secs=${SPICE_FAKE_INITIAL_SLEEP_SECONDS:-0}
+# A response that arrives in pieces, the way a streaming model answers: a few
+# filler lines spaced apart before the line the script is looking for.
+stream_lines=${SPICE_FAKE_STREAM_LINES:-0}
+stream_delay=${SPICE_FAKE_STREAM_DELAY_SECONDS:-0}
+# Goes quiet after answering, without exiting — a runtime that has stopped
+# producing output but is still alive, which no eof branch can catch.
+stall_after=${SPICE_FAKE_STALL_AFTER_TURN:-0}
+# Writes the prompt in two pieces so it lands across two reads. A wait that
+# consumes the stream with a greedy catch-all eats the first piece and then
+# waits forever for a prompt that has already gone by.
+split_prompt=${SPICE_FAKE_SPLIT_PROMPT:-0}
+# Fails this turn the way both REPLs report a failed request: a red `Error`
+# line, then straight back to the prompt.
+error_turn=${SPICE_FAKE_ERROR_TURN:-0}
+# Answers with text that mentions an error without being one: a model talking
+# about an error, or a search result whose content contains the word.
+mention_error=${SPICE_FAKE_ANSWER_MENTIONS_ERROR:-0}
+# Fails mid-answer with the error line split across two reads, the way a
+# request that dies while streaming can reach the script.
+split_error=${SPICE_FAKE_SPLIT_ERROR:-0}
+# The REPL's spinner, drawn the way `repl::util::Spinner` draws it: a frame
+# after a bare carriage return every 80ms, then `\r  \r` to clear it. It runs
+# from the request until the first token, and writes no newline.
+spinner_secs=${SPICE_FAKE_SPINNER_SECONDS:-0}
+# Answer tokens printed one at a time with no newline between them, the way
+# `spice chat` streams a one-sentence answer, before the rest of the answer.
+stream_tokens=${SPICE_FAKE_STREAM_TOKENS:-0}
+token_delay=${SPICE_FAKE_TOKEN_DELAY_SECONDS:-0}
+
+draw_spinner() {
+  spinner_end=$(($(date +%s) + spinner_secs))
+  while [ "$(date +%s)" -lt "$spinner_end" ]; do
+    printf '\r\342\240\213 '
+    sleep 0.08
+    printf '\r\342\240\231 '
+    sleep 0.08
+  done
+  printf '\r  \r'
+}
+
+write_prompt() {
+  if [ "$split_prompt" -ne 0 ]; then
+    printf '%s' "${prompt%"> "}"
+    sleep 0.3
+    printf '> '
+  else
+    printf '%s' "$prompt"
+  fi
+}
 
 # Records how the script invoked us, so a test can check that the runtime
 # endpoint was passed through rather than left at the CLI default.
@@ -232,13 +321,64 @@ if [ "$mode" = 'search' ]; then
 fi
 
 turn=0
-printf '%s' "$prompt"
+if [ "$initial_sleep_secs" -gt 0 ]; then
+  sleep "$initial_sleep_secs"
+fi
+write_prompt
 
 while IFS= read -r line; do
   turn=$((turn + 1))
 
   if [ "$exit_before" -ne 0 ] && [ "$turn" -ge "$exit_before" ]; then
     exit 44
+  fi
+
+  if [ "$sleep_secs" -gt 0 ]; then
+    sleep "$sleep_secs"
+  fi
+
+  emitted=0
+  while [ "$emitted" -lt "$stream_lines" ]; do
+    sleep "$stream_delay"
+    printf 'still thinking about it, line %s\r\n' "$((emitted + 1))"
+    emitted=$((emitted + 1))
+  done
+
+  if [ "$spinner_secs" -gt 0 ]; then
+    draw_spinner
+  fi
+
+  emitted=0
+  while [ "$emitted" -lt "$stream_tokens" ]; do
+    sleep "$token_delay"
+    printf 'token%s ' "$((emitted + 1))"
+    emitted=$((emitted + 1))
+  done
+
+  if [ "$split_error" -ne 0 ]; then
+    printf '\033[31mEr'
+    sleep 0.5
+    printf 'ror\033[0m Failed to read the response stream\r\n'
+    write_prompt
+    continue
+  fi
+
+  if [ "$stall_after" -ne 0 ] && [ "$turn" -ge "$stall_after" ]; then
+    # No answer, no prompt, no exit: the script has to notice the silence. The
+    # sleep only has to outlast the bound under test, and is kept short so a
+    # stand-in that outlives its pty does not sit on the runner.
+    sleep 30
+    exit 45
+  fi
+
+  if [ "$error_turn" -ne 0 ] && [ "$turn" -eq "$error_turn" ]; then
+    printf '\033[31mError\033[0m Failed to send the request: connection refused\r\n'
+    write_prompt
+    continue
+  fi
+
+  if [ "$mention_error" -ne 0 ]; then
+    printf 'An ERROR line in a log, or an Error: message, is not a failed request.\r\n'
   fi
 
   if [ "$mode" = 'search' ]; then
@@ -253,7 +393,7 @@ while IFS= read -r line; do
     esac
   fi
 
-  printf '%s' "$prompt"
+  write_prompt
 
   # Leaving after the prompt is written is how a REPL that dies while sitting
   # idle looks to the script driving it.
@@ -262,7 +402,19 @@ while IFS= read -r line; do
   fi
 done
 STAND_IN
-chmod +x "$work_dir/bin/spice"
+
+# Source the real E2E script and adapt only its spawn command. Keep spawn_id in
+# the caller's scope so all prompt, crash and timeout checks use the real pty.
+cat >"$work_dir/script_case.exp" <<'DRIVER'
+rename spawn stand_in_spawn
+proc spawn {command args} {
+    if {$command ne "spice"} {
+        error "Expected the E2E script to spawn spice, got $command"
+    }
+    uplevel 1 [list stand_in_spawn /bin/sh $::env(SPICE_FAKE_SCRIPT) {*}$args]
+}
+source $::env(SPICE_EXPECT_SCRIPT)
+DRIVER
 
 # script_case <name> <script> [env assignments...] — runs one of the E2E scripts
 # against the stand-in `spice`.
@@ -272,7 +424,10 @@ script_case() {
   shift 2
 
   printf 'case: %s\n' "$name"
-  case_output=$(PATH="$work_dir/bin:$PATH" env "$@" "$script_dir/$script" 2>&1)
+  case_output=$(env "$@" \
+    SPICE_FAKE_SCRIPT="$work_dir/spice.sh" \
+    SPICE_EXPECT_SCRIPT="$script_dir/$script" \
+    /usr/bin/expect -f "$work_dir/script_case.exp" 2>&1)
   case_status=$?
 }
 
@@ -280,7 +435,7 @@ for script in chat_01.exp chat_01_simple.exp search_01.exp; do
   script_case "$script against a healthy REPL" "$script"
   assert_status 0
   assert_silent_about 'no longer running'
-  assert_silent_about 'Timeout waiting'
+  assert_silent_about 'no output from the REPL'
 done
 
 script_case 'chat_01.exp when the REPL exits before answering' chat_01.exp \
@@ -309,6 +464,195 @@ script_case 'chat_01.exp when the REPL exits while idle' chat_01.exp \
 assert_status 1
 assert_reports 'Checking the chat REPL is still running'
 assert_reports 'exited with status 44'
+
+# ---------------------------------------------------------------------------
+# A request the REPL reports as failed
+# ---------------------------------------------------------------------------
+#
+# Both REPLs print a failed request as a red `Error` line and return to the
+# prompt. The prompt alone cannot tell that turn from an answer, so each script
+# has to recognise the line itself; it used to wait for " ERROR ", which the CLI
+# never prints, and passed every turn that failed.
+
+for script in chat_01.exp chat_01_simple.exp search_01.exp; do
+  script_case "$script when the REPL reports a failed request" "$script" \
+    SPICE_FAKE_ERROR_TURN=1
+  assert_status 1
+  assert_reports 'the REPL reported a failed request'
+  assert_reports 'connection refused'
+  assert_silent_about 'returned expected'
+  assert_silent_about 'Model confirmed access'
+
+  # The word on its own is not the marker: an answer about an error, or a search
+  # result that contains one, is still an answer.
+  script_case "$script when an answer mentions an error" "$script" \
+    SPICE_FAKE_ANSWER_MENTIONS_ERROR=1
+  assert_status 0
+  assert_silent_about 'the REPL reported a failed request'
+  assert_silent_about 'Error detected'
+done
+
+# A failed request on a later turn is caught there, not only on the first.
+script_case 'chat_01.exp when the REPL reports a failed request on the second turn' chat_01.exp \
+  SPICE_FAKE_ERROR_TURN=2
+assert_status 1
+assert_reports 'Waiting for the issue count: the REPL reported a failed request'
+
+# ---------------------------------------------------------------------------
+# What the wait on a REPL response is bounded by
+# ---------------------------------------------------------------------------
+#
+# A bound on a whole response is a bound on answer length and runner speed: a
+# model that is still streaming, or a search that is still running, fails it and
+# ejects unrelated PRs from the merge queue (#13711). The bound is on silence: a
+# response that keeps arriving is allowed to take as long as it takes, and only
+# a runtime that has stopped emitting trips it.
+#
+# Each case sets SPICE_REPL_IDLE_TIMEOUT so the stall path can be reached in
+# seconds. The streaming cases take longer in total than that bound while never
+# pausing for as long as it: the shape a bound on total response time fails and
+# a bound on silence passes. The stand-in's longest pause is half the bound, so
+# a scheduling hiccup on a contended runner does not read as a stall.
+
+for script in chat_01.exp chat_01_simple.exp; do
+  script_case "$script when the response streams for longer than the bound" "$script" \
+    SPICE_REPL_IDLE_TIMEOUT=4 \
+    SPICE_FAKE_STREAM_LINES=3 \
+    SPICE_FAKE_STREAM_DELAY_SECONDS=2
+  assert_status 0
+  assert_silent_about 'no output from the REPL'
+
+  script_case "$script when the prompt arrives split across two reads" "$script" \
+    SPICE_REPL_IDLE_TIMEOUT=5 \
+    SPICE_FAKE_SPLIT_PROMPT=1
+  assert_status 0
+  assert_silent_about 'no output from the REPL'
+done
+
+# A search answers in one piece once the embedding model has run, so "slow" and
+# "streaming" are the same thing to the script: nothing arrives until the
+# result. A fixed 5s budget fails a search that is still running, as job
+# 112954591167 shows.
+script_case 'search_01.exp when the search takes 6s to answer' search_01.exp \
+  SPICE_REPL_IDLE_TIMEOUT=10 \
+  SPICE_FAKE_SLEEP_SECONDS=6
+assert_status 0
+assert_reports 'Search returned expected result'
+assert_silent_about 'no output from the REPL'
+
+script_case 'search_01.exp when the search produces nothing for longer than the bound' search_01.exp \
+  SPICE_REPL_IDLE_TIMEOUT=2 \
+  SPICE_FAKE_SLEEP_SECONDS=4
+assert_status 1
+assert_reports 'no output from the REPL for 2s'
+assert_reports 'Searching for "Spice runtime error"'
+assert_silent_about 'Search returned expected result'
+
+# A stand-in that starts but never reaches its prompt must still time out.
+script_case 'chat_01_simple.exp when nothing arrives before the initial prompt' chat_01_simple.exp \
+  SPICE_REPL_IDLE_TIMEOUT=1 \
+  SPICE_FAKE_INITIAL_SLEEP_SECONDS=3
+assert_status 1
+assert_reports 'no output from the REPL for 1s'
+assert_reports 'Waiting for the initial chat prompt'
+assert_silent_about 'Model returned expected response'
+
+# A model that pauses for longer than the bound before answering is a stall,
+# however short the answer that would have followed. The stand-in sleeps 3s;
+# a 1s bound is enough to trip.
+script_case 'chat_01_simple.exp when the model pauses for longer than the bound' chat_01_simple.exp \
+  SPICE_REPL_IDLE_TIMEOUT=1 \
+  SPICE_FAKE_SLEEP_SECONDS=3
+assert_status 1
+assert_reports 'no output from the REPL for 1s'
+assert_reports 'Waiting for the response to'
+assert_silent_about 'Model returned expected response'
+
+# Output that then stops is still a stall: the per-line reset must not make the
+# bound unreachable once the answer has started arriving.
+script_case 'chat_01_simple.exp when the REPL streams part of an answer and then goes silent' chat_01_simple.exp \
+  SPICE_REPL_IDLE_TIMEOUT=3 \
+  SPICE_FAKE_STREAM_LINES=2 \
+  SPICE_FAKE_STALL_AFTER_TURN=1
+assert_status 1
+assert_reports 'no output from the REPL for 3s'
+assert_reports 'Waiting for the response to'
+assert_silent_about 'Model returned expected response'
+
+# chat_01_simple.exp asks for one sentence, which `spice chat` prints token by
+# token with no newline until the answer is complete (#14967). Tokens arriving
+# for longer than the bound, behind the real spinner, are progress: each one
+# restarts the wait.
+#
+# The spinner does not restart the wait, so the first token's wait is the
+# spinner (up to about 1.2s, since it ends on a whole-second `date` tick) plus
+# one token delay. The bound leaves about 2.8s over that, not 0.8s: with a 4s
+# bound, a slow shared macOS runner failed this case in the merge queue,
+# reporting a stall before the first token. The six tokens still stream for
+# 12s, twice the bound.
+script_case 'chat_01_simple.exp when a one-line answer streams for longer than the bound' chat_01_simple.exp \
+  SPICE_REPL_IDLE_TIMEOUT=6 \
+  SPICE_FAKE_SPINNER_SECONDS=1 \
+  SPICE_FAKE_STREAM_TOKENS=6 \
+  SPICE_FAKE_TOKEN_DELAY_SECONDS=2
+assert_status 0
+assert_silent_about 'no output from the REPL'
+
+# Same answer, with the prompt that ends it split across two reads: consuming
+# the streamed text must leave enough of it for the prompt branch.
+script_case 'chat_01_simple.exp when a one-line answer streams and the prompt arrives split' chat_01_simple.exp \
+  SPICE_REPL_IDLE_TIMEOUT=4 \
+  SPICE_FAKE_STREAM_TOKENS=3 \
+  SPICE_FAKE_TOKEN_DELAY_SECONDS=1 \
+  SPICE_FAKE_SPLIT_PROMPT=1
+assert_status 0
+assert_silent_about 'no output from the REPL'
+
+# Consuming streamed text must not consume part of the error line: a request
+# that fails mid-answer, with its error line split across two reads, still
+# fails the turn.
+script_case 'chat_01_simple.exp when a streamed answer ends in an error line split across two reads' chat_01_simple.exp \
+  SPICE_REPL_IDLE_TIMEOUT=4 \
+  SPICE_FAKE_STREAM_TOKENS=3 \
+  SPICE_FAKE_TOKEN_DELAY_SECONDS=1 \
+  SPICE_FAKE_SPLIT_ERROR=1
+assert_status 1
+assert_reports 'the REPL reported a failed request'
+assert_reports 'Failed to read the response stream'
+assert_silent_about 'Model returned expected response'
+
+# The spinner is not progress. A request that never gets a first token keeps
+# redrawing it, and that has to trip the bound like silence does.
+script_case 'chat_01_simple.exp when the request sits behind the spinner for longer than the bound' chat_01_simple.exp \
+  SPICE_REPL_IDLE_TIMEOUT=3 \
+  SPICE_FAKE_SPINNER_SECONDS=6
+assert_status 1
+assert_reports 'no output from the REPL for 3s'
+assert_reports 'Waiting for the response to'
+assert_silent_about 'Model returned expected response'
+
+# chat_01.exp reads the same bound: a pause longer than it is reported from the
+# turn that was waiting.
+script_case 'chat_01.exp when the model pauses for longer than the bound' chat_01.exp \
+  SPICE_REPL_IDLE_TIMEOUT=1 \
+  SPICE_FAKE_SLEEP_SECONDS=3
+assert_status 1
+assert_reports 'no output from the REPL for 1s'
+assert_reports 'Waiting for the list of datasets'
+assert_silent_about 'Model confirmed access to all datasets'
+
+script_case 'chat_01_simple.exp when the idle bound is not a positive number' chat_01_simple.exp \
+  SPICE_REPL_IDLE_TIMEOUT=soon
+assert_status 1
+assert_reports 'SPICE_REPL_IDLE_TIMEOUT must be a positive whole number of seconds'
+
+# An unset override interpolates to an empty string, which is what a caller that
+# does not set the bound looks like from inside the script. That has to mean the
+# built-in default, not a rejected value.
+script_case 'chat_01_simple.exp when the idle bound is left empty' chat_01_simple.exp \
+  SPICE_REPL_IDLE_TIMEOUT=''
+assert_status 0
+assert_silent_about 'must be a positive whole number'
 
 # ---------------------------------------------------------------------------
 # The runtime endpoint the REPL is pointed at

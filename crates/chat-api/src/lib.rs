@@ -45,7 +45,9 @@ use tracing_futures::Instrument;
 
 use crate::streaming_utils::generate_stream_id;
 
+pub mod model_info;
 pub mod streaming_utils;
+pub mod wire;
 
 #[derive(Debug, Snafu)]
 // Selectors are `pub`: provider crates construct e.g. `FailedToRunModelSnafu` across the
@@ -88,12 +90,34 @@ pub enum Error {
         source: Box<dyn std::error::Error + Send + Sync>,
     },
 
+    /// The model's provider refused, or could not be reached for, the exchange that gives the
+    /// model its access token. The source names the provider, its reason and where to look, so it
+    /// is the whole message.
+    #[snafu(display("{source}"))]
+    FailedToAuthenticate {
+        source: Box<dyn std::error::Error + Send + Sync>,
+    },
+
+    /// Downloading the model's files failed. The source names the file, the repository, the
+    /// cause and the fix, so it is the whole message.
+    #[snafu(display("{source}"))]
+    FailedToDownloadModel {
+        source: Box<dyn std::error::Error + Send + Sync>,
+        /// Whether only a Spicepod change clears it (see [`Error::is_configuration_error`]).
+        configuration: bool,
+    },
+
     #[snafu(display(
         "Unsupported value for `model_type` parameter. {source}  Verify the `model_type` parameter, and try again"
     ))]
     UnsupportedModelType {
         source: Box<dyn std::error::Error + Send + Sync>,
     },
+
+    #[snafu(display(
+        "Architecture '{architecture}' in {file} is not supported by this Spice release. Upgrade Spice, or use a GGUF of a supported architecture: https://spiceai.org/docs/components/models#gguf-architectures"
+    ))]
+    UnsupportedArchitecture { architecture: String, file: String },
 
     #[snafu(display(
         "The specified model identifier '{model}' is not valid for the source '{model_source}'. Verify the model exists, and try again."
@@ -121,6 +145,11 @@ pub enum Error {
         "The specified model, '{from}', does not support executing the task '{task}'. Select a different model or task, and try again."
     ))]
     UnsupportedTaskForModel { from: String, task: String },
+
+    #[snafu(display(
+        "Model '{model}' is a decision model and does not support chat completions. Use POST /v1/decisions, or the SQL decision functions such as ai_if, instead. See: https://spiceai.org/docs/components/models"
+    ))]
+    EvaluateOnlyModel { model: String },
 
     #[snafu(display("Invalid value for parameter {param}. {message}"))]
     InvalidParamValueError { param: String, message: String },
@@ -163,9 +192,110 @@ pub enum Error {
         "The tool '{tool}' was not found. Verify the Spicepod configuration, and view the tools documentation at https://spiceai.org/docs/components/tools"
     ))]
     ToolNotFound { tool: String },
+
+    #[snafu(display(
+        "Model '{model}' is split across nodes over connections that are neither authenticated nor encrypted, so it loads only when spiced runs with `--allow-insecure-connections`. Start spiced with `--allow-insecure-connections` on every node in `nodes`, and only on a trusted private network: any host that reaches a node's GPU server can use that GPU."
+    ))]
+    InsecureConnectionsNotAllowed { model: String },
 }
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
+
+impl Error {
+    /// Whether the error is a mistake in the model's Spicepod configuration, or in how spiced
+    /// was started, which only a change to either can clear. A refusal from the provider is not
+    /// one: a missing model, a bad key or an exhausted quota can be fixed on the provider's side.
+    #[must_use]
+    pub fn is_configuration_error(&self) -> bool {
+        match self {
+            Self::LocalModelNotFound { .. }
+            | Self::LocalModelConfigNotFound { .. }
+            | Self::LocalTokenizerNotFound { .. }
+            | Self::UnsupportedModelType { .. }
+            | Self::UnsupportedArchitecture { .. }
+            | Self::ModelNotProvided { .. }
+            | Self::UnknownModelSource { .. }
+            | Self::UnsupportedTaskForModel { .. }
+            | Self::EvaluateOnlyModel { .. }
+            | Self::InvalidParamValueError { .. }
+            | Self::MissingParamError { .. }
+            | Self::ModelMissingWeights { .. }
+            | Self::UnsafePickleWeight { .. }
+            | Self::ModelParameterFailed { .. }
+            | Self::ResponsesNotSupported { .. }
+            // Only restarting spiced with `--allow-insecure-connections` clears it.
+            | Self::InsecureConnectionsNotAllowed { .. } => true,
+            Self::FailedToDownloadModel { configuration, .. } => *configuration,
+            // A loader can wrap a configuration error, such as rejected pickle weights.
+            Self::FailedToLoadModel { source } => source
+                .downcast_ref::<Self>()
+                .is_some_and(Self::is_configuration_error),
+            Self::HealthCheckError { .. }
+            | Self::FailedToRunModel { .. }
+            | Self::ModelNotFound { .. }
+            | Self::FailedToLoadTokenizer { .. }
+            | Self::ModelFileMissing { .. }
+            | Self::FailedToAuthenticate { .. }
+            | Self::ToolNotFound { .. } => false,
+        }
+    }
+}
+
+/// The kind of failure a provider's [`ApiError`] reports.
+///
+/// Providers put the kind in either field: `OpenAI` sends `type: invalid_request_error`
+/// with a more specific `code` such as `missing_required_parameter` or `invalid_api_key`,
+/// and Anthropic sends a `type` alone. `code` is the more specific of the two, so it is
+/// read first, and `type` only when `code` names no kind.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ApiErrorKind {
+    /// The request was refused as invalid.
+    InvalidRequest,
+    /// The provider did not accept the model's credentials.
+    Authentication,
+    /// The credentials were accepted but may not do what was asked.
+    PermissionDenied,
+    /// The requested resource, for example a model or a stored response, does not exist.
+    NotFound,
+    /// The provider is throttling requests.
+    RateLimited,
+    /// The account has no quota left.
+    InsufficientQuota,
+}
+
+impl ApiErrorKind {
+    /// The kind `error` reports, or `None` when neither its `code` nor its `type` names one.
+    #[must_use]
+    pub fn of(error: &ApiError) -> Option<Self> {
+        Self::named(error.code.as_deref()).or_else(|| Self::named(error.r#type.as_deref()))
+    }
+
+    /// The error `type` that [`Self::of`] reads back as `self`, for a provider whose own
+    /// errors do not have the `OpenAI` shape.
+    #[must_use]
+    pub fn error_type(self) -> &'static str {
+        match self {
+            Self::InvalidRequest => "invalid_request_error",
+            Self::Authentication => "authentication_error",
+            Self::PermissionDenied => "permission_error",
+            Self::NotFound => "not_found_error",
+            Self::RateLimited => "rate_limit_error",
+            Self::InsufficientQuota => "insufficient_quota",
+        }
+    }
+
+    fn named(name: Option<&str>) -> Option<Self> {
+        match name? {
+            "invalid_request_error" => Some(Self::InvalidRequest),
+            "invalid_api_key" | "authentication_error" => Some(Self::Authentication),
+            "permission_error" => Some(Self::PermissionDenied),
+            "not_found_error" => Some(Self::NotFound),
+            "rate_limit_exceeded" | "rate_limit_error" => Some(Self::RateLimited),
+            "insufficient_quota" => Some(Self::InsufficientQuota),
+            _ => None,
+        }
+    }
+}
 
 #[derive(Default)]
 pub struct QueryGenerationContext {
@@ -299,7 +429,14 @@ pub fn message_to_content(message: &ChatCompletionRequestMessage) -> String {
                         .collect();
                 x.join("\n")
             }
-            None => unimplemented!("Assistant message with no content is not supported"),
+            // An assistant turn with no textual content is protocol-valid: it is how a
+            // client replays a tool call in conversation history, carrying `tool_calls`
+            // and no prose. It therefore arrives from request input, and aborting the
+            // task on it takes down a request a caller is entitled to make. Empty text
+            // is what this conversion means for such a turn — it is lossy by contract
+            // and discards the tool metadata of every other arm too — and it is what
+            // the `Function` arm below already answers for a missing body.
+            None => String::new(),
         },
         ChatCompletionRequestMessage::Function(ChatCompletionRequestFunctionMessage {
             content,
@@ -476,5 +613,196 @@ pub trait Chat: Sync + Send {
             usage: None,
             service_tier: None,
         })
+    }
+
+    /// The model's token limits, as far as it reports them: a local model's context size,
+    /// or what a hosted model's provider reports in its model metadata. Each limit is `None`
+    /// when it is not known — never an estimate, since a client sizes its context management
+    /// and its answers by them.
+    ///
+    /// Asked when the model loads and each time `/v1/models` lists it. A hosted model reads
+    /// its provider's model metadata once per endpoint and keeps it, so only the first call
+    /// may wait on the provider.
+    ///
+    /// A type that wraps another `Chat` must forward this to the model it wraps: the default
+    /// answers no limits, which would hide the inner model's.
+    async fn token_limits(&self) -> TokenLimits {
+        TokenLimits::default()
+    }
+}
+
+/// A model's token limits. Each is `None` when the model or its provider does not report it.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct TokenLimits {
+    /// The most tokens one request can hold, prompt and answer together.
+    pub context_window: Option<u64>,
+    /// The most tokens one answer can hold, where the provider or engine enforces such a
+    /// cap. Never derived from the context window.
+    pub max_output_tokens: Option<u64>,
+}
+
+#[cfg(test)]
+mod tests {
+    use async_openai::types::chat::{
+        ChatCompletionMessageToolCall, ChatCompletionMessageToolCalls,
+        ChatCompletionRequestAssistantMessage, ChatCompletionRequestAssistantMessageContent,
+        ChatCompletionRequestMessage, ChatCompletionRequestUserMessage,
+        ChatCompletionRequestUserMessageContent, CreateChatCompletionRequest, FunctionCall,
+    };
+
+    use super::{ApiErrorKind, Chat, Error, Result, SqlGeneration, message_to_content};
+    use async_openai::error::ApiError;
+
+    #[test]
+    fn each_error_type_reads_back_as_its_kind() {
+        for kind in [
+            ApiErrorKind::InvalidRequest,
+            ApiErrorKind::Authentication,
+            ApiErrorKind::PermissionDenied,
+            ApiErrorKind::NotFound,
+            ApiErrorKind::RateLimited,
+            ApiErrorKind::InsufficientQuota,
+        ] {
+            let error = ApiError {
+                message: String::new(),
+                r#type: Some(kind.error_type().to_string()),
+                param: None,
+                code: None,
+            };
+            assert_eq!(ApiErrorKind::of(&error), Some(kind));
+        }
+    }
+
+    /// A tool-call-only assistant turn, in the shape a client replays one.
+    #[expect(deprecated)]
+    fn assistant_tool_call_turn() -> ChatCompletionRequestMessage {
+        ChatCompletionRequestMessage::Assistant(ChatCompletionRequestAssistantMessage {
+            content: None,
+            refusal: None,
+            name: None,
+            audio: None,
+            tool_calls: Some(vec![ChatCompletionMessageToolCalls::Function(
+                ChatCompletionMessageToolCall {
+                    id: "call_123".to_string(),
+                    function: FunctionCall {
+                        name: "lookup".to_string(),
+                        arguments: r#"{"q":"spice"}"#.to_string(),
+                    },
+                },
+            )]),
+            function_call: None,
+        })
+    }
+
+    fn user_turn(text: &str) -> ChatCompletionRequestMessage {
+        ChatCompletionRequestMessage::User(ChatCompletionRequestUserMessage {
+            name: None,
+            content: ChatCompletionRequestUserMessageContent::Text(text.to_string()),
+        })
+    }
+
+    /// Regression test for #13207.
+    #[test]
+    fn an_assistant_turn_carrying_only_tool_calls_flattens_to_empty_text() {
+        assert_eq!(
+            message_to_content(&assistant_tool_call_turn()),
+            "",
+            "a tool-call-only assistant turn has no textual content to contribute"
+        );
+    }
+
+    /// The assistant arms that carry text answer with it, so the content-less
+    /// case above is the only assistant turn that flattens to nothing - the
+    /// `Function` arm separately defaults a missing body to empty text.
+    #[test]
+    #[expect(deprecated)]
+    fn an_assistant_turn_that_carries_text_still_answers_with_it() {
+        let spoken =
+            ChatCompletionRequestMessage::Assistant(ChatCompletionRequestAssistantMessage {
+                content: Some(ChatCompletionRequestAssistantMessageContent::Text(
+                    "the answer is 4".to_string(),
+                )),
+                refusal: None,
+                name: None,
+                audio: None,
+                tool_calls: None,
+                function_call: None,
+            });
+        assert_eq!(message_to_content(&spoken), "the answer is 4");
+    }
+
+    /// Captures the prompt the default `chat_request` body flattens: it maps every
+    /// message through `message_to_content` before a provider sees one.
+    #[derive(Default)]
+    struct PromptCapturingChat {
+        seen: std::sync::Mutex<Vec<String>>,
+    }
+
+    #[async_trait::async_trait]
+    impl Chat for PromptCapturingChat {
+        fn as_sql(&self) -> Option<&dyn SqlGeneration> {
+            None
+        }
+
+        async fn run(&self, prompt: String) -> Result<Option<String>> {
+            self.seen
+                .lock()
+                .expect("prompt capture was poisoned")
+                .push(prompt.clone());
+            Ok(Some(prompt))
+        }
+    }
+
+    /// Regression test for #13207, through the production path: `chat_request`
+    /// flattens every message before a provider sees one, so asserting on the
+    /// flattened prompt covers the converter *and* its caller.
+    #[tokio::test]
+    async fn a_request_replaying_a_tool_call_completes_instead_of_panicking() {
+        let chat = PromptCapturingChat::default();
+        let response = chat
+            .chat_request(CreateChatCompletionRequest {
+                messages: vec![
+                    user_turn("what is 2 + 2"),
+                    assistant_tool_call_turn(),
+                    user_turn("thanks"),
+                ],
+                ..Default::default()
+            })
+            .await
+            .expect("a replayed tool call is protocol-valid and must not fail the request");
+
+        // The tool-call turn contributes an empty line between the two it sits between.
+        let flattened = "what is 2 + 2\n\nthanks";
+
+        let seen = chat.seen.lock().expect("prompt capture was poisoned");
+        assert_eq!(
+            seen.as_slice(),
+            [flattened],
+            "every message reaches the provider as one flattened prompt"
+        );
+        assert_eq!(
+            response
+                .choices
+                .first()
+                .and_then(|choice| choice.message.content.as_deref()),
+            Some(flattened),
+        );
+    }
+
+    /// The only place this wording lives; `/v1/chat/completions` renders this variant
+    /// rather than composing its own sentence.
+    #[test]
+    fn evaluate_only_model_names_the_endpoint_to_use() {
+        let message = Error::EvaluateOnlyModel {
+            model: "jev".to_string(),
+        }
+        .to_string();
+        assert!(message.contains("'jev'"), "{message}");
+        assert!(message.contains("POST /v1/decisions"), "{message}");
+        assert!(
+            message.contains("does not support chat completions"),
+            "{message}"
+        );
+        assert!(message.contains("https://spiceai.org/docs"), "{message}");
     }
 }

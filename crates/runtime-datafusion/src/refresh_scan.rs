@@ -25,27 +25,39 @@ use std::sync::Arc;
 
 use arrow_schema::SchemaRef;
 use arrow_tools::schema::schema_meta_get_computed_columns;
+use datafusion::common::TableReference;
 use datafusion::common::tree_node::{Transformed, TreeNode};
 use datafusion::common::{Column, DataFusionError};
 use datafusion::dataframe::DataFrame;
 use datafusion::datasource::{DefaultTableSource, TableProvider};
 use datafusion::error::Result as DataFusionResult;
-use datafusion::execution::SendableRecordBatchStream;
 use datafusion::execution::context::SessionContext;
+use datafusion::execution::{SendableRecordBatchStream, TaskContext};
 use datafusion::logical_expr::{Expr, LogicalPlan, LogicalPlanBuilder, ident};
-use datafusion::sql::TableReference;
+use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
+use datafusion::physical_plan::{ExecutionPlan, execute_stream};
 use datafusion::sql::unparser::Unparser;
+use datafusion_table_providers::util::retriable_error::check_and_mark_retriable_error;
+use futures::TryStreamExt;
 use tracing::Level;
 
+use crate::analyzer_rule::exact_float_decimal_cast::FloatLiteralSpellings;
 use crate::error::find_datafusion_root;
 
 /// Gets data from a table provider and returns it as a stream of `RecordBatch`es.
+///
+/// The scan is planned here, but the plan is executed only when the stream is first polled.
+/// The scan computes the dataset's indexes as it reads (`IndexerExec`), and executing a
+/// multi-partition plan starts reading its partitions at once, so executing it eagerly would
+/// index rows before the sink has opened the index write window — rows that window's
+/// replace-all clear then deletes (#14619).
 ///
 /// # Errors
 ///
 /// Returns a `DataFusionError` if the scan cannot be planned — an invalid
 /// refresh `sql`, a projection the source schema cannot satisfy, an
-/// unrepresentable filter — or if executing the resulting plan fails.
+/// unrepresentable filter. A failure to execute the plan is the stream's first item, marked
+/// retriable as the refresh marks a failure to read its source.
 pub async fn get_data(
     ctx: &mut SessionContext,
     table_name: TableReference,
@@ -73,9 +85,21 @@ pub async fn get_data(
         }
         Some(sql) => {
             let session = ctx.state();
-            let mut plan = session
-                .create_logical_plan(&sql)
-                .await
+            // Keep the spellings of float tokens the planned `f64` literals lose,
+            // as the query planner does, so a refresh filtering a decimal column
+            // on such a literal loads the rows its SQL says (#14970).
+            let dialect = session.config().options().sql_parser.dialect;
+            let statement = session
+                .sql_to_statement(&sql, &dialect)
+                .map_err(find_datafusion_root)?;
+            let spellings = FloatLiteralSpellings::collect(&statement);
+            let mut plan = spellings
+                .retain(
+                    session
+                        .statement_to_plan(statement)
+                        .await
+                        .map_err(find_datafusion_root)?,
+                )
                 .map_err(find_datafusion_root)?;
 
             // If the refresh SQL defines a subset of columns to fetch, computed columns such as embeddings
@@ -102,8 +126,26 @@ pub async fn get_data(
         .map_err(find_datafusion_root)?;
     tracing::info!(target: "task_history", sql = %sql, "labels");
 
-    let record_batch_stream = df.execute_stream().await.map_err(find_datafusion_root)?;
-    Ok(record_batch_stream)
+    let task_ctx = Arc::new(df.task_ctx());
+    let plan = df
+        .create_physical_plan()
+        .await
+        .map_err(find_datafusion_root)?;
+    Ok(execute_on_first_poll(plan, task_ctx))
+}
+
+/// Returns a stream over `plan`'s output that calls [`execute_stream`] only when first polled.
+fn execute_on_first_poll(
+    plan: Arc<dyn ExecutionPlan>,
+    task_ctx: Arc<TaskContext>,
+) -> SendableRecordBatchStream {
+    let schema = plan.schema();
+    let stream = futures::stream::once(async move {
+        execute_stream(plan, task_ctx)
+            .map_err(|e| check_and_mark_retriable_error(find_datafusion_root(e)))
+    })
+    .try_flatten();
+    Box::pin(RecordBatchStreamAdapter::new(schema, stream))
 }
 
 /// Ensures that the associated computed columns (e.g., embeddings) are included
@@ -144,4 +186,168 @@ fn include_computed_columns(
         .data;
 
     Ok(plan)
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    use arrow::array::{Decimal128Array, Int64Array, RecordBatch};
+    use arrow_schema::{DataType, Field, Schema};
+    use datafusion::catalog::streaming::StreamingTable;
+    use datafusion::datasource::MemTable;
+    use datafusion::execution::SessionStateBuilder;
+    use datafusion::physical_plan::memory::MemoryStream;
+    use datafusion::physical_plan::streaming::PartitionStream;
+
+    use super::*;
+    use crate::analyzer_rule::AnalyzerRulesBuilder;
+
+    const PARTITIONS: usize = 2;
+
+    /// One partition of a source scan, counting how many partitions have been executed.
+    #[derive(Debug)]
+    struct CountingPartition {
+        schema: SchemaRef,
+        id: i64,
+        executed: Arc<AtomicUsize>,
+    }
+
+    impl PartitionStream for CountingPartition {
+        fn schema(&self) -> &SchemaRef {
+            &self.schema
+        }
+
+        fn execute(&self, _ctx: Arc<TaskContext>) -> SendableRecordBatchStream {
+            self.executed.fetch_add(1, Ordering::SeqCst);
+            let batch = RecordBatch::try_new(
+                Arc::clone(&self.schema),
+                vec![Arc::new(Int64Array::from(vec![self.id]))],
+            )
+            .expect("build the partition's batch");
+            Box::pin(
+                MemoryStream::try_new(vec![batch], Arc::clone(&self.schema), None)
+                    .expect("build the partition's stream"),
+            )
+        }
+    }
+
+    /// Executing a multi-partition plan starts reading every partition at once, and a refresh
+    /// scan computes the dataset's indexes as it reads. So `get_data` must hand back a stream
+    /// that has not executed anything: the sink opens the index write window before its first
+    /// poll, and rows indexed earlier would be deleted by that window's replace-all clear.
+    ///
+    /// Regression test for #14619.
+    #[tokio::test]
+    async fn get_data_executes_the_source_scan_only_when_first_polled() {
+        let schema: SchemaRef =
+            Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)]));
+        let executed = Arc::new(AtomicUsize::new(0));
+        let partitions = (0..PARTITIONS)
+            .map(|id| {
+                Arc::new(CountingPartition {
+                    schema: Arc::clone(&schema),
+                    id: i64::try_from(id).expect("partition id fits in i64"),
+                    executed: Arc::clone(&executed),
+                }) as Arc<dyn PartitionStream>
+            })
+            .collect();
+        let table: Arc<dyn TableProvider> = Arc::new(
+            StreamingTable::try_new(Arc::clone(&schema), partitions).expect("build the source"),
+        );
+        let mut ctx = SessionContext::new();
+
+        let stream = get_data(&mut ctx, TableReference::bare("docs"), table, None, vec![])
+            .await
+            .expect("plan the refresh scan");
+        // Executing a multi-partition plan spawns one task per partition. On this
+        // single-threaded test runtime they run only once the test yields, so yield before
+        // looking: an eagerly executed scan has executed its partitions by then.
+        for _ in 0..16 {
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(
+            executed.load(Ordering::SeqCst),
+            0,
+            "the source scan started before the stream was polled"
+        );
+
+        let batches: Vec<RecordBatch> = stream.try_collect().await.expect("read the scan");
+        let rows: usize = batches.iter().map(RecordBatch::num_rows).sum();
+        assert_eq!(rows, PARTITIONS, "every partition's row is read");
+        assert_eq!(executed.load(Ordering::SeqCst), PARTITIONS);
+    }
+
+    /// A refresh SQL filtering a decimal column on a float literal loads the
+    /// rows its SQL spells, as a query does (#14970): `4.0700000000000003`
+    /// reads as the same `f64` as `4.07`, so only its retained token spelling
+    /// selects id 2, and `173665.47` selects id 3 only through its decimal
+    /// spelling.
+    #[tokio::test]
+    async fn refresh_sql_float_literals_load_the_decimals_they_spell() {
+        let schema: SchemaRef = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("amount", DataType::Decimal128(38, 17), false),
+        ]));
+        let amounts = Decimal128Array::from(vec![
+            407_000_000_000_000_000_i128,
+            407_000_000_000_000_030,
+            17_366_547_000_000_000_000_000,
+        ])
+        .with_precision_and_scale(38, 17)
+        .expect("valid decimal");
+        let batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![Arc::new(Int64Array::from(vec![1, 2, 3])), Arc::new(amounts)],
+        )
+        .expect("build the source batch");
+        let table: Arc<dyn TableProvider> = Arc::new(
+            MemTable::try_new(Arc::clone(&schema), vec![vec![batch]]).expect("build the source"),
+        );
+
+        for (sql, expected) in [
+            ("SELECT id FROM t WHERE amount = 4.07", vec![1]),
+            (
+                "SELECT id FROM t WHERE amount = 4.0700000000000003",
+                vec![2],
+            ),
+            ("SELECT id FROM t WHERE amount = 173665.47", vec![3]),
+        ] {
+            // The analyzer rules the refresh task's session runs.
+            let state = SessionStateBuilder::new()
+                .with_default_features()
+                .with_analyzer_rules(
+                    AnalyzerRulesBuilder::default()
+                        .include_federation(false)
+                        .build(),
+                )
+                .build();
+            let mut ctx = SessionContext::new_with_state(state);
+            ctx.register_table("t", Arc::clone(&table))
+                .expect("register the source");
+            let stream = get_data(
+                &mut ctx,
+                TableReference::bare("t"),
+                Arc::clone(&table),
+                Some(sql.to_string()),
+                vec![],
+            )
+            .await
+            .expect("plan the refresh scan");
+            let batches: Vec<RecordBatch> = stream.try_collect().await.expect("read the scan");
+            let ids: Vec<i64> = batches
+                .iter()
+                .flat_map(|batch| {
+                    batch
+                        .column(0)
+                        .as_any()
+                        .downcast_ref::<Int64Array>()
+                        .expect("ids")
+                        .values()
+                        .to_vec()
+                })
+                .collect();
+            assert_eq!(ids, expected, "{sql}");
+        }
+    }
 }

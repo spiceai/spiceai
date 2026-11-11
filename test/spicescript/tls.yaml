@@ -1,0 +1,44 @@
+name: tls
+description: >
+  With TLS enabled, HTTP, Flight and the metrics endpoint serve TLS with the
+  configured certificate: queries, readiness, refreshes and metrics all work
+  over it.
+
+sources:
+  src: { kind: postgres }
+
+spicepod:
+  version: v1
+  kind: Spicepod
+  name: tls
+  runtime:
+    tls:
+      enabled: true
+      certificate_file: ${script.dir}/../tls/spiced_cert.pem
+      key_file: ${script.dir}/../tls/spiced_key.pem
+  datasets:
+    - from: postgres:public.t
+      name: t
+      params: ${sources.src.params}
+      acceleration: { enabled: true, refresh_mode: full }
+
+defaults:
+  tls: { ca: ../tls/spiced_root_cert.pem }
+
+steps:
+  - source-exec:
+      src: CREATE TABLE t (id int PRIMARY KEY, v text); INSERT INTO t SELECT i, 'v' || i FROM generate_series(1, 50) i;
+  - start: {}
+  - query: SELECT count(*) AS n, max(v) AS top FROM t
+    expect: { rows: [['50', 'v9']] }
+  - http: { path: /health }
+    expect: { status: 200 }
+  - http: { method: POST, path: /v1/sql, headers: { content-type: text/plain }, body: SELECT count(*) AS n FROM t }
+    expect: { status: 200, body-contains: '50' }
+  - source-exec: { src: "INSERT INTO t VALUES (51, 'v51')" }
+  - refresh: t
+  - query: SELECT count(*) AS n FROM t
+    expect: { rows: [['51']] }
+    eventually: 30s
+  - wait-metric: { name: dataset_acceleration_refresh_duration_ms_count, labels: { dataset: t }, above: 1, timeout: 30s }
+  - assert-log: { lacks: ['(?i)tls.*error', 'handshake'] }

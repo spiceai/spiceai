@@ -46,10 +46,11 @@ use cache::result::CacheStatus;
 use cayenne::{CayenneTableProvider, CayenneTransaction};
 use datafusion::common::tree_node::TreeNodeRecursion;
 use datafusion::common::{DataFusionError, ParamValues, TableReference};
+use datafusion::execution::memory_pool::{MemoryConsumer, MemoryReservation};
 use datafusion::logical_expr::LogicalPlan;
 use datafusion::sql::parser::{DFParser, Statement as DFStatement};
 use datafusion::sql::sqlparser::{ast::Statement as SqlStatement, dialect::PostgreSqlDialect};
-use futures::TryStreamExt;
+use runtime_datafusion::table_function_params::bind_table_function_args;
 use runtime_request_context::{AsyncMarker, RequestContext};
 
 use super::{Error as QueryError, QueryBuilder, ResultsCacheMode};
@@ -58,11 +59,14 @@ use crate::accelerated::{
     write::{CayenneWriteTarget, dual_write::extract_cayenne_write_target},
 };
 use crate::datafusion::DataFusion;
+use crate::egress::collect_reserved;
 
 /// The result of a committed transaction: the final statement's batches and
 /// cache status, or `None` for a body that produced no result (bare COMMIT).
 pub struct TransactionOutcome {
     pub result: Option<(Vec<RecordBatch>, CacheStatus)>,
+    /// The query memory pool's reservation for `result`'s batches.
+    pub reservation: MemoryReservation,
 }
 
 /// A transaction failure, carrying enough to let each transport pick its own
@@ -85,12 +89,55 @@ pub enum TransactionError {
     Publish(String),
 }
 
+/// Whether `sql` can be a `BEGIN … COMMIT` body, judged from its first word.
+///
+/// Every such body opens with `BEGIN` or `START TRANSACTION`, so text opening
+/// with any other word is not one, and saying so needs no parse. Every
+/// `/v1/sql` request and every Flight SQL statement asks, so parsing each one in
+/// full only to learn it is an ordinary query is paid on every query, results
+/// cache hits included.
+///
+/// Only a leading ASCII word is judged. Anything else the tokenizer might skip
+/// or read differently — a comment, a semicolon, a quote, a bracket — answers
+/// `true`, leaving the decision to the parser.
+fn may_open_transaction(sql: &str) -> bool {
+    let sql = sql.trim_start();
+    let Some(first) = sql.bytes().next() else {
+        // No statements at all, so no transaction.
+        return false;
+    };
+    if !first.is_ascii_alphabetic() {
+        return true;
+    }
+    let word_len = sql
+        .bytes()
+        .take_while(|b| b.is_ascii_alphanumeric() || *b == b'_')
+        .count();
+    sql.get(..word_len).is_some_and(|word| {
+        word.eq_ignore_ascii_case("begin") || word.eq_ignore_ascii_case("start")
+    })
+}
+
 /// Returns the statements inside a well-formed `BEGIN … COMMIT` transaction.
 /// Transaction-control statements are stripped. A single statement or a
 /// multi-statement string not wrapped in `BEGIN … COMMIT` returns `None` and is
 /// handled by the ordinary query path.
 #[must_use]
 pub fn transaction_statements(sql: &str) -> Option<Vec<String>> {
+    if !may_open_transaction(sql) {
+        return None;
+    }
+    parse_transaction_statements(sql)
+}
+
+/// [`transaction_statements`] without the leading-word check: parses `sql` in
+/// full to find out.
+fn parse_transaction_statements(sql: &str) -> Option<Vec<String>> {
+    crate::datafusion::sql_depth_guard::ensure_data_types_within_depth_limit(
+        sql,
+        &PostgreSqlDialect {},
+    )
+    .ok()?;
     let statements: Vec<DFStatement> = DFParser::parse_sql_with_dialect(sql, &PostgreSqlDialect {})
         .ok()?
         .into_iter()
@@ -142,22 +189,27 @@ pub fn schema_statement(sql: &str) -> String {
 /// # Errors
 ///
 /// Returns a [`TransactionError`] if the body is not a valid v1 transaction, a
-/// statement fails to plan or execute, the optimistic-concurrency re-check
-/// loses (retryable [`TransactionError::Conflict`]), or the staged writes fail
-/// to publish.
+/// statement fails to plan or execute, the final result (plus the
+/// `render_bytes` the caller needs to encode it) cannot be reserved from the
+/// query memory pool, the optimistic-concurrency re-check loses (retryable
+/// [`TransactionError::Conflict`]), or the staged writes fail to publish. Every
+/// one of these is raised before anything is published.
 pub async fn run_transaction(
     df: &Arc<DataFusion>,
     statements: &[String],
     parameters: Option<ParamValues>,
     read_only: bool,
+    render_bytes: impl Fn(&[RecordBatch]) -> usize + Send,
 ) -> Result<TransactionOutcome, TransactionError> {
     // Prepare the transaction: identify every participant table, validate the
     // write targets, capture their begin tokens, and install the transaction on
     // the request context. A body with no write is a plain read-only transaction.
-    let handle = prepare_transaction(df, statements).await?;
-
     let parameters = normalize_transaction_parameters(parameters);
+    let handle = prepare_transaction(df, statements, parameters.as_ref()).await?;
+
     let mut last: Option<(Vec<RecordBatch>, CacheStatus)> = None;
+    let reservation =
+        MemoryConsumer::new("transaction_result").register(&df.ctx.runtime_env().memory_pool);
     let statement_count = statements.len();
     for (index, statement) in statements.iter().enumerate() {
         let query_res =
@@ -170,33 +222,26 @@ pub async fn run_transaction(
             };
 
         let cache_status = query_res.cache_status;
-        let mut data = query_res.data;
         // Every statement must run to completion so its writes stage and any error
         // (including a gate abort) surfaces before the next statement — and before
         // COMMIT. Only the FINAL statement's batches are kept: its result can be
         // emitted to the caller only once the commit is confirmed (a conflict must
         // surface as an error, never as a truncated result), so it is materialized
         // here and returned after commit. Intermediate statements (the gate,
-        // earlier writes) are drained without materializing their batches.
-        if index + 1 == statement_count {
-            match data.try_collect::<Vec<RecordBatch>>().await {
-                Ok(batches) => last = Some((batches, cache_status)),
-                Err(e) => {
-                    abort_transaction(handle.as_ref()).await;
-                    return Err(TransactionError::Stream(e));
-                }
+        // earlier writes) are drained without keeping their batches.
+        let consume = if index + 1 == statement_count {
+            match collect_reserved(query_res.into_record_batch_stream(), &reservation).await {
+                Ok(batches) => reservation
+                    .try_grow(render_bytes(&batches))
+                    .map(|()| last = Some((batches, cache_status))),
+                Err(e) => Err(e),
             }
         } else {
-            loop {
-                match data.try_next().await {
-                    Ok(Some(_)) => {}
-                    Ok(None) => break,
-                    Err(e) => {
-                        abort_transaction(handle.as_ref()).await;
-                        return Err(TransactionError::Stream(e));
-                    }
-                }
-            }
+            query_res.drain().await
+        };
+        if let Err(e) = consume {
+            abort_transaction(handle.as_ref()).await;
+            return Err(TransactionError::Stream(e));
         }
     }
 
@@ -224,7 +269,10 @@ pub async fn run_transaction(
         }
     }
 
-    Ok(TransactionOutcome { result: last })
+    Ok(TransactionOutcome {
+        result: last,
+        reservation,
+    })
 }
 
 /// Makes positional parameters reusable across transaction statements.
@@ -283,13 +331,23 @@ struct TransactionHandle {
 async fn prepare_transaction(
     df: &Arc<DataFusion>,
     inner_sqls: &[String],
+    parameters: Option<&ParamValues>,
 ) -> Result<Option<TransactionHandle>, TransactionError> {
     let session = df.ctx.state();
     let mut write_refs: Vec<TableReference> = Vec::new();
     let mut read_refs: Vec<TableReference> = Vec::new();
+    let dialect = session.config().options().sql_parser.dialect;
     for stmt_sql in inner_sqls {
+        // Table functions run during planning, so substitute their parameters first.
+        let mut statement = session
+            .sql_to_statement(stmt_sql, &dialect)
+            .map_err(TransactionError::Plan)?;
+        crate::datafusion::sql_depth_guard::ensure_statement_within_depth_limits(&statement)
+            .map_err(TransactionError::Plan)?;
+        let _ =
+            bind_table_function_args(&mut statement, parameters).map_err(TransactionError::Plan)?;
         let plan = session
-            .create_logical_plan(stmt_sql)
+            .statement_to_plan(statement)
             .await
             .map_err(TransactionError::Plan)?;
         // A read-only body (`None`) contributes no write ref; a write target
@@ -332,7 +390,7 @@ async fn prepare_transaction(
         let table_name = table_ref.table();
         let Some(provider) = resolve_cayenne_staged(df, table_name).await else {
             return Err(TransactionError::Rejected(format!(
-                "transaction target '{table_name}' must be an accelerator-only, non-partitioned Cayenne dataset (configure on_conflict without CDC); other modes route writes to the federated source"
+                "transaction target '{table_name}' must be a non-partitioned Cayenne dataset with 'acceleration.write_mode: acceleration', or 'write_mode: write_back' with 'refresh_mode: changes'; other modes route writes to the federated source"
             )));
         };
         let token = provider.transaction_write_token().await;
@@ -394,7 +452,9 @@ fn classify_transaction_write(plan: &LogicalPlan) -> Option<Result<TableReferenc
         LogicalPlan::Dml(dml) => Some(match &dml.op {
             WriteOp::Insert(_) | WriteOp::Update => Ok(dml.table_name.clone()),
             WriteOp::Delete => Err("DELETE"),
-            WriteOp::Ctas | WriteOp::Truncate => Err("this operation"),
+            // `WriteOp` is non-exhaustive (DataFusion 55 added MERGE INTO): any
+            // other write cannot be staged atomically, so it aborts the transaction.
+            _ => Err("this operation"),
         }),
         LogicalPlan::Extension(ext) => {
             let dml = ext
@@ -417,5 +477,92 @@ fn classify_transaction_write(plan: &LogicalPlan) -> Option<Result<TableReferenc
 async fn abort_transaction(handle: Option<&TransactionHandle>) {
     if let Some(handle) = handle {
         handle.txn.abort().await;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{may_open_transaction, parse_transaction_statements, transaction_statements};
+
+    /// Judging the leading word may only ever spare a parse, never change the
+    /// answer: each body gets the same result through the check as through the
+    /// full parse, including the bodies the check hands on to the parser.
+    #[test]
+    fn the_leading_word_check_never_changes_the_answer() {
+        let bodies = [
+            "",
+            "   ",
+            "SELECT 1",
+            "select * from t where id = 1",
+            "  \n\tSELECT 1; COMMIT",
+            "WITH x AS (SELECT 1) SELECT * FROM x",
+            "INSERT INTO t VALUES (1)",
+            "BEGIN; SELECT 1; COMMIT;",
+            "begin; insert into t values (1); commit",
+            "BEGIN TRANSACTION; UPDATE t SET a = 1; COMMIT",
+            "START TRANSACTION; DELETE FROM t; COMMIT;",
+            "start transaction; select 1; commit",
+            "Begin; SELECT 1; Commit;",
+            "  BEGIN;SELECT 1;COMMIT",
+            "-- leading comment\nBEGIN; SELECT 1; COMMIT;",
+            "/* block */ BEGIN; SELECT 1; COMMIT;",
+            ";BEGIN; SELECT 1; COMMIT;",
+            "\u{00A0}BEGIN; SELECT 1; COMMIT;",
+            "\u{2003}BEGIN; SELECT 1; COMMIT;",
+            "BEGINNING; SELECT 1; COMMIT;",
+            "_begin; SELECT 1; COMMIT;",
+            "\"begin\"; SELECT 1; COMMIT;",
+            "(SELECT 1)",
+            "1; BEGIN; SELECT 1; COMMIT;",
+            "BEGIN; COMMIT;",
+            "BEGIN; SELECT 1;",
+            "SELECT 1; BEGIN; SELECT 2; COMMIT;",
+            "EXPLAIN SELECT 1",
+        ];
+
+        for body in bodies {
+            assert_eq!(
+                transaction_statements(body),
+                parse_transaction_statements(body),
+                "the leading-word check changed the answer for {body:?}"
+            );
+        }
+    }
+
+    /// What the check exists to spare: an ordinary query never reaches the
+    /// parser, while a body that could open a transaction always does — and
+    /// still parses as one.
+    #[test]
+    fn only_a_body_that_could_open_a_transaction_is_parsed() {
+        for ordinary in [
+            "",
+            "SELECT 1",
+            "  with x as (select 1) select * from x",
+            "INSERT INTO t VALUES (1)",
+        ] {
+            assert!(
+                !may_open_transaction(ordinary),
+                "{ordinary:?} cannot open a transaction, so it must not be parsed"
+            );
+        }
+
+        for undecided in [
+            "BEGIN; SELECT 1; COMMIT",
+            "start transaction; select 1; commit",
+            "-- comment\nBEGIN; SELECT 1; COMMIT",
+            ";BEGIN; SELECT 1; COMMIT",
+            "\"begin\"; SELECT 1; COMMIT",
+        ] {
+            assert!(
+                may_open_transaction(undecided),
+                "{undecided:?} must be left to the parser"
+            );
+        }
+
+        assert_eq!(
+            transaction_statements("BEGIN; SELECT 1; COMMIT;"),
+            Some(vec!["SELECT 1".to_string()]),
+            "a transaction body must still be recognized"
+        );
     }
 }

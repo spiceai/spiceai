@@ -26,14 +26,15 @@ use util::{RetryError, fibonacci_backoff::FibonacciBackoffBuilder, retry};
 use crate::init_tracing;
 use crate::utils::{register_test_connectors, runtime_ready_check, test_request_context};
 
-#[cfg(feature = "duckdb")]
 mod comments;
 pub mod common;
 mod federation;
+mod pool;
 pub mod replication;
-#[cfg(feature = "duckdb")]
 pub mod replication_e2e;
 pub mod replication_shared;
+pub mod replication_type_change;
+mod retype_domain;
 mod schema_inference;
 
 use super::*;
@@ -41,11 +42,6 @@ use app::AppBuilder;
 use mysql_async::{Params, Row};
 use runtime::Runtime;
 use tracing::instrument;
-
-const MYSQL_PORT1: u16 = 13316;
-const MYSQL_PORT2: u16 = 13317;
-const MYSQL_PORT3: u16 = 13318;
-const MYSQL_PORT4: u16 = 13319;
 
 #[instrument]
 async fn init_mysql_db(port: u16) -> Result<(), anyhow::Error> {
@@ -232,19 +228,17 @@ async fn mysql_integration_test() -> Result<(), String> {
 
     test_request_context()
         .scope(async {
-            let running_container =
-                start_mysql_docker_container(MYSQL_PORT1)
-                    .await
-                    .map_err(|e| {
-                        tracing::error!("start_mysql_docker_container: {e}");
-                        e.to_string()
-                    })?;
+            let running_container = start_mysql_docker_container().await.map_err(|e| {
+                tracing::error!("start_mysql_docker_container: {e}");
+                e.to_string()
+            })?;
+            let port = running_container
+                .host_port(3306)
+                .map_err(|e| e.to_string())?;
             tracing::debug!("Container started");
             let retry_strategy = FibonacciBackoffBuilder::new().max_retries(Some(10)).build();
             retry(retry_strategy, || async {
-                init_mysql_db(MYSQL_PORT1)
-                    .await
-                    .map_err(RetryError::transient)
+                init_mysql_db(port).await.map_err(RetryError::transient)
             })
             .await
             .map_err(|e| {
@@ -252,7 +246,7 @@ async fn mysql_integration_test() -> Result<(), String> {
                 e.to_string()
             })?;
             let app = AppBuilder::new("mysql_integration_test")
-                .with_dataset(make_mysql_dataset("test", "test", MYSQL_PORT1, false))
+                .with_dataset(make_mysql_dataset("test", "test", port, false))
                 .build();
 
             configure_test_datafusion();
@@ -281,11 +275,11 @@ async fn mysql_integration_test() -> Result<(), String> {
                     let results = arrow::util::pretty::pretty_format_batches(&result_batches)
                         .expect("should pretty print result batch");
                     insta::with_settings!({
-                        description => format!("MySQL Integration Test Results"),
+                        description => "MySQL Integration Test Results",
                         omit_expression => true,
                         snapshot_path => "../snapshots"
                     }, {
-                        insta::assert_snapshot!(format!("mysql_integration_test_select"), results);
+                        insta::assert_snapshot!("mysql_integration_test_select", results);
                     });
                 })),
             )];
@@ -301,10 +295,7 @@ async fn mysql_integration_test() -> Result<(), String> {
                 .await?;
             }
 
-            running_container.remove().await.map_err(|e| {
-                tracing::error!("running_container.remove: {e}");
-                e.to_string()
-            })?;
+            running_container.cleanup().await;
 
             Ok(())
         })
@@ -319,17 +310,17 @@ async fn mysql_character_set_results_test() -> Result<(), String> {
 
     test_request_context()
         .scope(async {
-            let running_container =
-                start_mysql_docker_container(MYSQL_PORT2)
-                    .await
-                    .map_err(|e| {
-                        tracing::error!("start_mysql_docker_container: {e}");
-                        e.to_string()
-                    })?;
+            let running_container = start_mysql_docker_container().await.map_err(|e| {
+                tracing::error!("start_mysql_docker_container: {e}");
+                e.to_string()
+            })?;
+            let port = running_container
+                .host_port(3306)
+                .map_err(|e| e.to_string())?;
             tracing::debug!("Container started");
             let retry_strategy = FibonacciBackoffBuilder::new().max_retries(Some(10)).build();
             retry(retry_strategy, || async {
-                init_mysql_utf8mb4_db(MYSQL_PORT2)
+                init_mysql_utf8mb4_db(port)
                     .await
                     .map_err(RetryError::transient)
             })
@@ -343,7 +334,7 @@ async fn mysql_character_set_results_test() -> Result<(), String> {
                 .with_dataset(make_mysql_dataset(
                     "test_utf8mb4",
                     "test_default",
-                    MYSQL_PORT2,
+                    port,
                     false,
                 ))
                 .build();
@@ -372,11 +363,11 @@ async fn mysql_character_set_results_test() -> Result<(), String> {
                         .expect("should pretty print result batch");
 
                     insta::with_settings!({
-                        description => format!("MySQL Integration Test Results"),
+                        description => "MySQL Integration Test Results",
                         omit_expression => true,
                         snapshot_path => "../snapshots"
                     }, {
-                        insta::assert_snapshot!(format!("character_set_results_default"), results);
+                        insta::assert_snapshot!("character_set_results_default", results);
                     });
                 })),
             )];
@@ -392,10 +383,7 @@ async fn mysql_character_set_results_test() -> Result<(), String> {
                 .await?;
             }
 
-            running_container.remove().await.map_err(|e| {
-                tracing::error!("running_container.remove: {e}");
-                e.to_string()
-            })?;
+            running_container.cleanup().await;
 
             Ok(())
         })
@@ -409,18 +397,18 @@ async fn mysql_timezone_test() -> Result<(), String> {
 
     test_request_context()
         .scope(async {
-            let running_container =
-                start_mysql_docker_container(MYSQL_PORT3)
-                    .await
-                    .map_err(|e| {
-                        tracing::error!("start_mysql_docker_container: {e}");
-                        e.to_string()
-                    })?;
+            let running_container = start_mysql_docker_container().await.map_err(|e| {
+                tracing::error!("start_mysql_docker_container: {e}");
+                e.to_string()
+            })?;
+            let port = running_container
+                .host_port(3306)
+                .map_err(|e| e.to_string())?;
             tracing::debug!("Container started");
 
             let retry_strategy = FibonacciBackoffBuilder::new().max_retries(Some(10)).build();
             retry(retry_strategy, || async {
-                init_mysql_tz_test_db(MYSQL_PORT3)
+                init_mysql_tz_test_db(port)
                     .await
                     .map_err(RetryError::transient)
             })
@@ -430,10 +418,10 @@ async fn mysql_timezone_test() -> Result<(), String> {
                 e.to_string()
             })?;
 
-            let mut ds_system = make_mysql_dataset("tz_test", "tz_system_tbl", MYSQL_PORT3, false);
+            let mut ds_system = make_mysql_dataset("tz_test", "tz_system_tbl", port, false);
             set_dataset_time_zone(&mut ds_system, "system")?;
 
-            let mut ds_custom = make_mysql_dataset("tz_test", "tz_custom_tbl", MYSQL_PORT3, false);
+            let mut ds_custom = make_mysql_dataset("tz_test", "tz_custom_tbl", port, false);
             set_dataset_time_zone(&mut ds_custom, "+02:00")?;
 
             let app = AppBuilder::new("mysql_timezone_test")
@@ -487,10 +475,7 @@ async fn mysql_timezone_test() -> Result<(), String> {
             )
             .await?;
 
-            running_container.remove().await.map_err(|e| {
-                tracing::error!("running_container.remove: {e}");
-                e.to_string()
-            })?;
+            running_container.cleanup().await;
 
             Ok(())
         })
@@ -617,18 +602,18 @@ async fn mysql_zero_date_test() -> Result<(), String> {
 
     test_request_context()
         .scope(async {
-            let running_container =
-                start_mysql_docker_container(MYSQL_PORT4)
-                    .await
-                    .map_err(|e| {
-                        tracing::error!("start_mysql_docker_container: {e}");
-                        e.to_string()
-                    })?;
+            let running_container = start_mysql_docker_container().await.map_err(|e| {
+                tracing::error!("start_mysql_docker_container: {e}");
+                e.to_string()
+            })?;
+            let port = running_container
+                .host_port(3306)
+                .map_err(|e| e.to_string())?;
             tracing::debug!("Container started");
 
             let retry_strategy = FibonacciBackoffBuilder::new().max_retries(Some(10)).build();
             retry(retry_strategy, || async {
-                init_mysql_zero_date_db(MYSQL_PORT4)
+                init_mysql_zero_date_db(port)
                     .await
                     .map_err(RetryError::transient)
             })
@@ -641,9 +626,9 @@ async fn mysql_zero_date_test() -> Result<(), String> {
             // Two datasets pointed at the same underlying MySQL table, distinguished only
             // by the `mysql_zero_date_behavior` param. We reuse the same source table to
             // guarantee both modes see byte-identical row data.
-            let ds_null = make_mysql_dataset("zero_date_test", "zd_null", MYSQL_PORT4, false);
+            let ds_null = make_mysql_dataset("zero_date_test", "zd_null", port, false);
 
-            let mut ds_error = make_mysql_dataset("zero_date_test", "zd_error", MYSQL_PORT4, false);
+            let mut ds_error = make_mysql_dataset("zero_date_test", "zd_error", port, false);
             set_dataset_zero_date_behavior(&mut ds_error, "error")?;
 
             let app = AppBuilder::new("mysql_zero_date_test")
@@ -807,10 +792,7 @@ async fn mysql_zero_date_test() -> Result<(), String> {
             )
             .await?;
 
-            running_container.remove().await.map_err(|e| {
-                tracing::error!("running_container.remove: {e}");
-                e.to_string()
-            })?;
+            running_container.cleanup().await;
 
             Ok(())
         })

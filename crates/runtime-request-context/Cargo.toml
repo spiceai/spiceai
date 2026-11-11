@@ -12,11 +12,11 @@ version.workspace = true
 app = { path = "../app" }
 async-trait.workspace = true
 axum.workspace = true
+datafusion = { workspace = true, optional = true }
 futures.workspace = true
 headers = "0.4"
 http.workspace = true
 opentelemetry.workspace = true
-percent-encoding.workspace = true
 regex.workspace = true
 runtime-auth = { path = "../runtime-auth" }
 sha2.workspace = true
@@ -25,8 +25,8 @@ tokio.workspace = true
 tokio-util.workspace = true
 tracing.workspace = true
 
-[target.'cfg(windows)'.dependencies]
-winver = "1.0.0"
+[features]
+datafusion = ["dep:datafusion"]
 
 [lints]
 workspace = true

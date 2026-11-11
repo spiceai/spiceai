@@ -26,6 +26,7 @@ pub mod google;
 pub mod huggingface;
 pub mod model2vec;
 pub mod openai;
+pub mod spiceai;
 
 use std::str::FromStr;
 
@@ -58,7 +59,7 @@ impl FromStr for Pooling {
             "cls" => Ok(Pooling::Cls),
             "mean" => Ok(Pooling::Mean),
             "splade" => Ok(Pooling::Splade),
-            other => Err(format!("must be one of: cls, mean, splade. Found {other}")),
+            _ => Err("must be one of: cls, mean, splade".to_string()),
         }
     }
 }
@@ -110,7 +111,7 @@ impl FromStr for Truncation {
             "NONE" => Ok(Truncation::None),
             "END" => Ok(Truncation::End),
             "START" => Ok(Truncation::Start),
-            other => Err(format!("must be one of: NONE, END, START. Found {other}")),
+            _ => Err("must be one of: NONE, END, START".to_string()),
         }
     }
 }
@@ -177,28 +178,26 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn google_params_require_api_key() {
-        let Err(err) = google::GoogleEmbeddingParams::try_from_params(
+    async fn google_params_allow_missing_project_at_parse_time() {
+        // `project`/`location`/auth-method fields are all optional at the parse level; the
+        // "required" checks happen in `llms::google::auth::build_client`, not here — see its
+        // `vertex_requires_project_and_location` / `vertex_requires_exactly_one_auth_method`
+        // tests.
+        let typed = google::GoogleEmbeddingParams::try_from_params(
             "embedding test",
             params(&[]),
             &empty_secrets(),
         )
         .await
-        else {
-            panic!("google api_key is required")
-        };
-        assert!(
-            err.to_string()
-                .contains("Missing required parameter: google_api_key"),
-            "unexpected message: {err}"
-        );
+        .expect("google params should parse with nothing set");
+        assert!(typed.project.is_none());
     }
 
     #[tokio::test]
     async fn google_params_accept_runtime_dimensions() {
         let typed = google::GoogleEmbeddingParams::try_from_params(
             "embedding test",
-            params(&[("google_api_key", "key"), ("dimensions", "768")]),
+            params(&[("dimensions", "768")]),
             &empty_secrets(),
         )
         .await

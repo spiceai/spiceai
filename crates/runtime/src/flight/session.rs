@@ -56,9 +56,9 @@ use http::HeaderMap;
 use moka::sync::Cache;
 use runtime_auth::AuthPrincipal;
 use spicepod::component::runtime::ApiKey;
+use std::borrow::Cow;
 use std::sync::Arc;
 use std::time::Duration;
-use tonic::metadata::MetadataMap;
 use util::session_state::builder_from_existing;
 use uuid::Uuid;
 
@@ -78,9 +78,7 @@ const MAX_SESSIONS: u64 = 10_000;
 /// This allows validating session IDs in the auth layer.
 #[derive(Clone)]
 pub struct SessionStore {
-    sessions: Cache<String, Arc<SessionContext>>,
-    /// Maps session IDs to the API key that created them (for auth validation)
-    session_principals: Cache<String, String>,
+    sessions: Cache<String, FlightSession>,
 }
 
 impl std::fmt::Debug for SessionStore {
@@ -88,6 +86,38 @@ impl std::fmt::Debug for SessionStore {
         f.debug_struct("SessionStore")
             .field("session_count", &self.sessions.entry_count())
             .finish_non_exhaustive()
+    }
+}
+
+/// A Flight SQL session and the principal it belongs to.
+///
+/// The owner and the Handshake API key are stored in the same cache entry as
+/// the context, so a session cannot lose either while it still exists.
+#[derive(Clone)]
+pub struct FlightSession {
+    pub context: Arc<SessionContext>,
+    /// Stable id of the principal that created the session, or `None` when it
+    /// was created without an authenticated principal.
+    pub owner_stable_id: Option<String>,
+    /// The API key a Handshake authenticated with, which makes the session id
+    /// usable as a Bearer token.
+    api_key: Option<String>,
+}
+
+impl FlightSession {
+    fn new(base_ctx: &SessionContext, session_id: &str, owner_stable_id: Option<String>) -> Self {
+        // Each session needs its own `session_id` so that prepared statements
+        // stored in `SessionState.prepared_plans` are isolated. Cloning the
+        // existing state keeps catalog/function registrations and the custom
+        // analyzer/optimizer rules.
+        let state = builder_from_existing(&base_ctx.state())
+            .with_session_id(session_id.to_string())
+            .build();
+        Self {
+            context: Arc::new(SessionContext::new_with_state(state)),
+            owner_stable_id,
+            api_key: None,
+        }
     }
 }
 
@@ -100,10 +130,6 @@ impl SessionStore {
                 .max_capacity(MAX_SESSIONS)
                 .time_to_idle(Duration::from_secs(SESSION_TTL_SECS))
                 .build(),
-            session_principals: Cache::builder()
-                .max_capacity(MAX_SESSIONS)
-                .time_to_idle(Duration::from_secs(SESSION_TTL_SECS))
-                .build(),
         }
     }
 
@@ -111,6 +137,7 @@ impl SessionStore {
     ///
     /// The session context is created from the provided base context's state.
     /// If an `api_key` is provided, it's associated with this session for auth validation.
+    /// `owner_stable_id` is the principal the session belongs to.
     ///
     /// # Important: Session State Snapshot
     ///
@@ -127,34 +154,20 @@ impl SessionStore {
         &self,
         base_ctx: &SessionContext,
         api_key: Option<&str>,
+        owner_stable_id: Option<String>,
     ) -> (String, Arc<SessionContext>) {
         // Use a CSPRNG-backed UUIDv4 rather than the time-ordered UUIDv7: this id
         // is returned to the client and accepted as a bearer session token, so it
         // must be unpredictable and must not leak its creation time.
         let session_id = Uuid::new_v4().hyphenated().to_string();
 
-        // Create a new SessionState with a unique session_id using SessionStateBuilder.
-        // This is critical for session isolation - each session needs its own session_id
-        // so that prepared statements stored in SessionState.prepared_plans are isolated.
-        //
-        // Note: We clone the existing state into a new builder so catalog/function
-        // registrations and custom analyzer/optimizer rules are preserved, while
-        // `session_id` remains unset until we assign a unique one below.
-        let new_state = builder_from_existing(&base_ctx.state())
-            .with_session_id(session_id.clone())
-            .build();
-        let session_ctx = Arc::new(SessionContext::new_with_state(new_state));
-        self.sessions
-            .insert(session_id.clone(), Arc::clone(&session_ctx));
-
-        // Track the API key associated with this session for auth validation
-        if let Some(key) = api_key {
-            self.session_principals
-                .insert(session_id.clone(), key.to_string());
-        }
-
+        let session = FlightSession {
+            api_key: api_key.map(str::to_string),
+            ..FlightSession::new(base_ctx, &session_id, owner_stable_id)
+        };
+        let session_ctx = Arc::clone(&session.context);
+        self.sessions.insert(session_id.clone(), session);
         self.sessions.run_pending_tasks();
-        self.session_principals.run_pending_tasks();
         (session_id, session_ctx)
     }
 
@@ -164,12 +177,7 @@ impl SessionStore {
     /// Returns `None` if the session doesn't exist or wasn't created with an API key.
     #[must_use]
     pub fn validate_session(&self, session_id: &str) -> Option<String> {
-        // Only return the principal if the session also exists
-        if self.sessions.get(session_id).is_some() {
-            self.session_principals.get(session_id)
-        } else {
-            None
-        }
+        self.sessions.get(session_id)?.api_key
     }
 
     /// Gets an existing session context by ID.
@@ -178,103 +186,48 @@ impl SessionStore {
     /// Accessing a session refreshes its TTL.
     #[must_use]
     pub fn get_session(&self, session_id: &str) -> Option<Arc<SessionContext>> {
-        self.sessions.get(session_id)
+        self.sessions.get(session_id).map(|session| session.context)
     }
 
-    /// Returns the stable principal id of the session's owner if the request
-    /// names an existing, owned session.
+    /// The stable id of the principal an API key authenticates as.
     ///
-    /// The session id is read from the same `x-session-id` / Authorization
-    /// headers used to select the session. The returned id matches the
-    /// `stable_id()` of the `ApiKey` principal that created the session at
-    /// handshake, so callers can compare it against the authenticated principal
-    /// to confirm the session belongs to them. Returns `None` for unknown or
-    /// unowned sessions (the latter preserving behavior for unauthenticated
-    /// setups).
+    /// `ApiKey::stable_id` hashes only the key bytes (group-independent), so
+    /// reconstructing the key yields the same id the authenticated principal
+    /// exposes.
     #[must_use]
-    pub fn owner_stable_id_from_http(&self, headers: &HeaderMap) -> Option<String> {
-        let session_id = extract_session_id_from_headers(headers)?;
-        let owner_api_key = self.validate_session(&session_id)?;
-        // `ApiKey::stable_id` hashes only the key bytes (group-independent), so
-        // reconstructing the key here yields the same id the owning principal
-        // exposes. Kept consistent with `runtime_auth`'s `AuthPrincipal` impl.
-        ApiKey::parse_str(&owner_api_key)
-            .stable_id()
-            .map(std::borrow::Cow::into_owned)
+    pub fn api_key_stable_id(api_key: &str) -> Option<String> {
+        ApiKey::parse_str(api_key).stable_id().map(Cow::into_owned)
     }
 
-    /// Gets or creates a session from the request metadata.
+    /// Gets or creates the session named by HTTP headers.
     ///
-    /// Extracts the session ID from the "authorization" Bearer token in the metadata.
-    /// If a session exists for that ID, returns it. Otherwise, creates a new session
-    /// using the provided base context.
+    /// The session id is the `x-session-id` header, or else the Bearer token.
+    /// An existing session is returned with the owner it was created with; a
+    /// missing one is created and owned by `owner_stable_id`.
     ///
-    /// Returns `None` if no authorization header is present.
-    #[must_use]
-    pub fn get_or_create_session(
-        &self,
-        metadata: &MetadataMap,
-        base_ctx: &SessionContext,
-    ) -> Option<Arc<SessionContext>> {
-        let session_id = extract_session_id(metadata)?;
-
-        // Try to get existing session, or create a new one
-        if let Some(session) = self.get_session(&session_id) {
-            Some(session)
-        } else {
-            // Create new session with the provided ID (from auth token)
-            // Use SessionStateBuilder to ensure the session has its own unique session_id
-            // for proper prepared statement isolation
-            let new_state = builder_from_existing(&base_ctx.state())
-                .with_session_id(session_id.clone())
-                .build();
-            let session_ctx = Arc::new(SessionContext::new_with_state(new_state));
-            self.sessions.insert(session_id, Arc::clone(&session_ctx));
-            self.sessions.run_pending_tasks();
-            Some(session_ctx)
-        }
-    }
-
-    /// Gets or creates a session from HTTP headers.
-    ///
-    /// Extracts the session ID from the "authorization" Bearer token in the headers.
-    /// If a session exists for that ID, returns it. Otherwise, creates a new session
-    /// using the provided base context.
-    ///
-    /// Returns `None` if no authorization header is present.
+    /// Returns `None` if neither header is present.
     pub fn get_or_create_session_from_http(
         &self,
         headers: &http::HeaderMap,
         base_ctx: &SessionContext,
-    ) -> Option<Arc<SessionContext>> {
+        owner_stable_id: Option<&str>,
+    ) -> Option<FlightSession> {
         let session_id = extract_session_id_from_headers(headers)?;
 
+        // The session id can be a Bearer credential, so it is never logged.
         tracing::debug!(
-            "Flight SQL session lookup: ID={}, existing_sessions={}",
-            session_id,
-            self.session_count()
+            existing_sessions = self.session_count(),
+            "Flight SQL session lookup"
         );
 
-        // Try to get existing session, or create a new one
-        if let Some(session) = self.get_session(&session_id) {
-            tracing::debug!("Using existing Flight SQL session: {}", session_id);
-            Some(session)
-        } else {
-            tracing::debug!(
-                "Creating NEW Flight SQL session from request: {}",
-                session_id
-            );
-            // Create new session with the provided ID (from auth token)
-            // Use SessionStateBuilder to ensure the session has its own unique session_id
-            // for proper prepared statement isolation
-            let new_state = builder_from_existing(&base_ctx.state())
-                .with_session_id(session_id.clone())
-                .build();
-            let session_ctx = Arc::new(SessionContext::new_with_state(new_state));
-            self.sessions.insert(session_id, Arc::clone(&session_ctx));
+        let entry = self.sessions.entry_by_ref(&session_id).or_insert_with(|| {
+            FlightSession::new(base_ctx, &session_id, owner_stable_id.map(str::to_string))
+        });
+        if entry.is_fresh() {
+            tracing::debug!("Created Flight SQL session from request");
             self.sessions.run_pending_tasks();
-            Some(session_ctx)
         }
+        Some(entry.into_value())
     }
 
     /// Removes a session from the store.
@@ -308,38 +261,6 @@ impl Default for SessionStore {
     fn default() -> Self {
         Self::new()
     }
-}
-
-/// Extracts the session ID from metadata headers.
-///
-/// Tries to extract session ID in the following priority order:
-/// 1. "x-session-id" header (standard session tracking header)
-/// 2. Authorization header Bearer token (fallback for compatibility)
-///
-/// Returns None if neither header is present.
-fn extract_session_id(metadata: &MetadataMap) -> Option<String> {
-    // Try x-session-id header (standard approach)
-    if let Some(session_header) = metadata.get("x-session-id")
-        && let Ok(session_id) = session_header.to_str()
-    {
-        return Some(session_id.to_string());
-    }
-
-    // Fallback to Authorization Bearer token for compatibility
-    // This allows clients that use handshake() to have session persistence
-    // even if they don't explicitly set x-session-id headers
-    if let Some(auth_header) = metadata.get("authorization")
-        && let Ok(auth_str) = auth_header.to_str()
-    {
-        if let Some(token) = auth_str.strip_prefix("Bearer ") {
-            return Some(token.to_string());
-        }
-        if let Some(token) = auth_str.strip_prefix("bearer ") {
-            return Some(token.to_string());
-        }
-    }
-
-    None
 }
 
 /// Extracts the session ID from HTTP headers.
@@ -381,7 +302,7 @@ mod tests {
         let store = SessionStore::new();
         let base_ctx = SessionContext::new();
 
-        let (session_id, ctx1) = store.create_session(&base_ctx, Some("test-api-key"));
+        let (session_id, ctx1) = store.create_session(&base_ctx, Some("test-api-key"), None);
         assert!(store.get_session(&session_id).is_some());
 
         let ctx2 = store
@@ -401,7 +322,7 @@ mod tests {
         let store = SessionStore::new();
         let base_ctx = SessionContext::new();
 
-        let (session_id, _) = store.create_session(&base_ctx, None);
+        let (session_id, _) = store.create_session(&base_ctx, None, None);
         assert!(store.get_session(&session_id).is_some());
 
         // Validate session returns None when no API key was provided
@@ -413,7 +334,7 @@ mod tests {
         let store = SessionStore::new();
         let base_ctx = SessionContext::new();
 
-        let (session_id, _) = store.create_session(&base_ctx, Some("key"));
+        let (session_id, _) = store.create_session(&base_ctx, Some("key"), None);
         assert_eq!(store.session_count(), 1);
 
         assert!(store.remove_session(&session_id));
@@ -426,8 +347,8 @@ mod tests {
         let store = SessionStore::new();
         let base_ctx = SessionContext::new();
 
-        let (id1, _) = store.create_session(&base_ctx, Some("key1"));
-        let (id2, _) = store.create_session(&base_ctx, Some("key2"));
+        let (id1, _) = store.create_session(&base_ctx, Some("key1"), None);
+        let (id2, _) = store.create_session(&base_ctx, Some("key2"), None);
 
         assert_ne!(id1, id2);
         assert_eq!(store.session_count(), 2);
@@ -441,55 +362,65 @@ mod tests {
     }
 
     #[test]
-    fn test_extract_session_id() {
-        let mut metadata = MetadataMap::new();
+    fn test_extract_session_id_from_headers() {
+        let mut headers = HeaderMap::new();
 
         // No authorization header
-        assert!(extract_session_id(&metadata).is_none());
+        assert!(extract_session_id_from_headers(&headers).is_none());
 
         // With Bearer prefix
-        metadata.insert(
+        headers.insert(
             "authorization",
             "Bearer test-session-id".parse().expect("Valid header"),
         );
         assert_eq!(
-            extract_session_id(&metadata),
+            extract_session_id_from_headers(&headers),
             Some("test-session-id".to_string())
         );
 
         // Without Bearer prefix - should return None since we require "Bearer " prefix
-        metadata.insert(
+        headers.insert(
             "authorization",
             "test-session-id-2".parse().expect("Valid header"),
         );
         assert!(
-            extract_session_id(&metadata).is_none(),
+            extract_session_id_from_headers(&headers).is_none(),
             "Authorization header without 'Bearer ' prefix should return None"
+        );
+
+        // `x-session-id` takes precedence over the Bearer token.
+        headers.insert(
+            "authorization",
+            "Bearer test-session-id".parse().expect("Valid header"),
+        );
+        headers.insert("x-session-id", "chosen".parse().expect("Valid header"));
+        assert_eq!(
+            extract_session_id_from_headers(&headers),
+            Some("chosen".to_string())
         );
     }
 
     #[test]
-    fn test_get_or_create_session() {
+    fn test_get_or_create_session_from_http() {
         let store = SessionStore::new();
         let base_ctx = SessionContext::new();
-        let mut metadata = MetadataMap::new();
-
-        metadata.insert(
+        let mut headers = HeaderMap::new();
+        headers.insert(
             "authorization",
             "Bearer new-session".parse().expect("Valid header"),
         );
 
         // First call creates a new session
-        let ctx1 = store
-            .get_or_create_session(&metadata, &base_ctx)
+        let first = store
+            .get_or_create_session_from_http(&headers, &base_ctx, Some("apikey:creator"))
             .expect("Should create session");
         assert_eq!(store.session_count(), 1);
 
         // Second call returns the same session
-        let ctx2 = store
-            .get_or_create_session(&metadata, &base_ctx)
+        let second = store
+            .get_or_create_session_from_http(&headers, &base_ctx, Some("apikey:creator"))
             .expect("Should return existing session");
-        assert!(Arc::ptr_eq(&ctx1, &ctx2));
+        assert!(Arc::ptr_eq(&first.context, &second.context));
         assert_eq!(store.session_count(), 1);
     }
 
@@ -500,7 +431,7 @@ mod tests {
         // time-ordered/partly-predictable UUIDv7.
         let store = SessionStore::new();
         let base_ctx = SessionContext::new();
-        let (session_id, _) = store.create_session(&base_ctx, Some("k"));
+        let (session_id, _) = store.create_session(&base_ctx, Some("k"), None);
 
         let uuid = Uuid::parse_str(&session_id).expect("session id should be a valid UUID");
         assert_eq!(
@@ -511,37 +442,43 @@ mod tests {
     }
 
     #[test]
-    fn test_owner_stable_id_from_http_binds_session_to_owner() {
+    fn a_session_keeps_the_owner_it_was_created_with() {
         let store = SessionStore::new();
         let base_ctx = SessionContext::new();
+        let header = |session_id: &str| {
+            let mut headers = HeaderMap::new();
+            headers.insert(
+                "x-session-id",
+                session_id.parse().expect("valid header value"),
+            );
+            headers
+        };
 
-        // An owned session resolves to its owner's stable id.
-        let (session_id, _) = store.create_session(&base_ctx, Some("owner-key"));
-        let mut headers = http::HeaderMap::new();
-        headers.insert(
-            "x-session-id",
-            session_id.parse().expect("valid header value"),
-        );
-        let expected = ApiKey::parse_str("owner-key")
-            .stable_id()
-            .map(std::borrow::Cow::into_owned);
-        assert!(expected.is_some());
-        assert_eq!(store.owner_stable_id_from_http(&headers), expected);
+        // A Handshake session is owned by the principal of the key that created it.
+        let owner = SessionStore::api_key_stable_id("owner-key");
+        assert!(owner.is_some());
+        let (session_id, _) = store.create_session(&base_ctx, Some("owner-key"), owner.clone());
+        let named_by_another = store
+            .get_or_create_session_from_http(&header(&session_id), &base_ctx, Some("apikey:other"))
+            .expect("the session exists");
+        assert_eq!(named_by_another.owner_stable_id, owner);
 
-        // A session created without an api key is unowned (None).
-        let (anon_id, _) = store.create_session(&base_ctx, None);
-        let mut anon_headers = http::HeaderMap::new();
-        anon_headers.insert("x-session-id", anon_id.parse().expect("valid header value"));
-        assert_eq!(store.owner_stable_id_from_http(&anon_headers), None);
+        // A session a principal creates by naming a new id is owned by that principal,
+        // and naming it again as another principal does not change the owner.
+        let created = store
+            .get_or_create_session_from_http(&header("shared-label"), &base_ctx, Some("apikey:a"))
+            .expect("creates the session");
+        assert_eq!(created.owner_stable_id.as_deref(), Some("apikey:a"));
+        let named_by_b = store
+            .get_or_create_session_from_http(&header("shared-label"), &base_ctx, Some("apikey:b"))
+            .expect("the session exists");
+        assert!(Arc::ptr_eq(&created.context, &named_by_b.context));
+        assert_eq!(named_by_b.owner_stable_id.as_deref(), Some("apikey:a"));
 
-        // An unknown session id yields no owner.
-        let mut unknown = http::HeaderMap::new();
-        unknown.insert(
-            "x-session-id",
-            "00000000-0000-4000-8000-000000000000"
-                .parse()
-                .expect("valid header value"),
-        );
-        assert_eq!(store.owner_stable_id_from_http(&unknown), None);
+        // Without an authenticated principal, a session has no owner.
+        let anonymous = store
+            .get_or_create_session_from_http(&header("anonymous-label"), &base_ctx, None)
+            .expect("creates the session");
+        assert_eq!(anonymous.owner_stable_id, None);
     }
 }

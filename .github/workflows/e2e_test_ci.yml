@@ -40,11 +40,21 @@ on:
       - feature-*
 
   workflow_dispatch:
+    inputs:
+      run_all_tests:
+        description: 'Run all tests, including credentialed BigQuery regression tests'
+        type: boolean
+        required: false
+        default: false
 
 concurrency:
-  # Allow only one workflow per any non-trunk branch.
-  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref_name }}-${{ github.ref_name == 'trunk' && github.sha || 'any-sha' }}
-  cancel-in-progress: true
+  # A newer run cancels the one in progress for the same pull request, merge group, non-trunk
+  # branch or manually dispatched trunk commit. Trunk pushes share one group and never cancel
+  # the running build on `spiceai-macos-large`: a newer push replaces only the run still waiting.
+  # The trunk commit is the merge-group commit that already passed this workflow;
+  # the jobs that run only on push cover the first and latest commit of a burst of merges.
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref_name }}-${{ (github.ref_name == 'trunk' && github.event_name != 'push') && github.sha || 'any-sha' }}
+  cancel-in-progress: ${{ github.ref_name != 'trunk' || github.event_name != 'push' }}
 
 env:
   # CI performance optimizations
@@ -59,6 +69,7 @@ jobs:
   # etc.). `build` — which every test job depends on — is gated on this, so the
   # whole matrix cascades to "skipped" while the E2E Test CI gate still reports.
   check_changes:
+    environment: secret-free
     if: ${{ github.event_name != 'pull_request' }}
     runs-on: spiceai-dev-runners
     # Every job here is bounded, because on a `merge_group` run an unbounded one does not
@@ -78,6 +89,7 @@ jobs:
         uses: ./.github/actions/check-code-changes
 
   setup-matrix:
+    environment: secret-free
     name: Setup strategy matrix
     if: ${{ github.event_name != 'pull_request' }}
     runs-on: spiceai-dev-runners
@@ -102,7 +114,11 @@ jobs:
                 target_arch: "x86_64"
               }, {
                 name: "macOS aarch64 (Apple Silicon)",
-                builder: "spiceai-macos",
+                // `spiceai-macos-large` on every event, trunk pushes included. A three-hour
+                // build on a `spiceai-macos` mini runs past its 180-minute step bound where
+                // the host is shared (#14557), and starves the short macOS test jobs below
+                // that sit on that pool to avoid exactly this neighbour (#13761).
+                builder: "spiceai-macos-large",
                 runner: "macos-15",
                 target_os: "darwin",
                 target_arch: "aarch64"
@@ -115,6 +131,7 @@ jobs:
   build:
     name: Build ${{ matrix.target.name }} binaries
     runs-on: ${{ matrix.target.builder }}
+    environment: ci-build
     needs: [setup-matrix, check_changes]
     if: ${{ needs.check_changes.outputs.relevant_changes == 'true' }}
     # A backstop above the longest step bound below, leaving room for the artifact upload
@@ -123,7 +140,7 @@ jobs:
     # compile is exactly when the sccache stats are worth having.
     timeout-minutes: 200
     env:
-      HAS_SPICEIO_SECRET: ${{ secrets.UNAS_SMB_PASS != '' }}
+      HAS_SPICEIO_SECRET: ${{ secrets.SMB_PASSWORD != '' }}
 
     strategy:
       matrix:
@@ -135,21 +152,23 @@ jobs:
           ref: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || github.sha }}
           fetch-depth: 1 # Shallow clone for faster checkout
 
-      - name: Configure Cargo directories (self-hosted macOS)
-        if: matrix.target.builder == 'spiceai-macos'
-        run: |
-          set -euo pipefail
-          cargo_home="${{ runner.temp }}/cargo-${{ github.run_id }}-${{ github.job }}"
-          mkdir -p "$cargo_home/bin"
-          echo "CARGO_HOME=$cargo_home" >> "$GITHUB_ENV"
-
       - name: Set REL_VERSION from version.txt
         run: python3 ./.github/scripts/get_release_version.py
 
       - name: Set up Rust
         uses: ./.github/actions/setup-rust
 
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+      # Not on the macOS leg. Its self-hosted runner instances share one user, so one
+      # `~/.cargo`, and rust-cache's save step deletes every file it found in
+      # `~/.cargo/bin` when it restored — the rustup proxies (`cargo`, `rustc`,
+      # `rustup`) included. A trunk push saving the cache therefore pulls `cargo` out
+      # from under whatever job a sibling instance on the same Mac is running, which
+      # then fails `cargo: command not found` (exit 127) mid-build. Nothing is lost by
+      # skipping it there: `~/.cargo` and `target/` persist on those hosts and sccache
+      # serves the compile, while the restore of this multi-GB cache spends up to ten
+      # minutes before it lands or gives up.
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
+        if: matrix.target.target_os != 'darwin'
         with:
           save-if: ${{ github.ref == 'refs/heads/trunk' }}
 
@@ -165,30 +184,54 @@ jobs:
         uses: ./.github/actions/install-protoc
 
       - name: Set up spiceio
-        if: matrix.target.builder == 'spiceai-macos' && env.HAS_SPICEIO_SECRET == 'true'
+        if: matrix.target.target_os == 'darwin' && env.HAS_SPICEIO_SECRET == 'true'
         id: setup-spiceio
-        uses: spiceai/spiceio/.github/actions/setup@2ad4a874ff4813f8190117bc645af0dbb90b708c # v0.8.0
+        uses: spiceai/spiceio/.github/actions/setup@dd13a600d4af72fb179563000674f76812208534 # v0.11.0 assets; no gh; strips Authorization on cross-host redirect
         with:
           smb-url: smb://runner@192.168.3.148/ai_platform_dev
-          smb-pass: ${{ secrets.UNAS_SMB_PASS }}
+          smb-pass: ${{ secrets.SMB_PASSWORD }}
           token: ${{ github.token }}
           bucket: sccache
           region: us-west-1
           immutable-objects: "true"
+          otel-endpoint: spicehq/spiceio
+          otel-api-key: ${{ secrets.SCP_SPICEHQ_SPICEIO_API_KEY }}
+          otel-region: us-west-2
+          instance-id: ci-${{ github.run_id }}-${{ github.job }}-${{ strategy.job-index }}
+          machine: ${{ runner.name }}
 
       - name: Build spiced and spice CLI
         if: matrix.target.target_os != 'darwin'
-        # 65 minutes is the slowest this leg has taken across the last ten successful
-        # `merge_group` runs (44-65), so this is that worst case with room to spare. The
-        # spread is wide on a contended pool, and a bound tight enough to fail a
-        # legitimate build would be worse than the slow build it replaced.
-        timeout-minutes: 90
+        # 65 minutes was the slowest this leg had taken across ten successful `merge_group`
+        # runs when the bound was set; on 2026-08-28 that worst case moved. Four consecutive
+        # `merge_group` runs hit 90 minutes with only the last few crates left, on four
+        # different runners, each restoring the same rust-cache entry (full match) with the
+        # disk preflight reporting 40 TiB free and no compile error anywhere in the log.
+        # The same PR had built in 39 minutes ninety minutes earlier, on a batch carrying
+        # strictly more code, so the slowdown is not the diff: measured phase by phase the
+        # work ran ~2.5x slower throughout (cache restore 3m14s -> 5m19s, the `runtime`
+        # crate ~21m -> ~48m), which is what a contended pool looks like.
+        #
+        # A legitimate contended build therefore needs ~100 minutes, and firing at 90 costs
+        # the queue more than waiting does: it discards a nearly finished compile, dequeues
+        # the PR, and makes the queue re-run the whole batch chain, adding load to the pool
+        # that caused the slowdown in the first place. 150 keeps roughly the margin over
+        # worst-observed that the macOS leg below uses, and stays clear of the job's 200 so
+        # that a wedge here is cut by *this step* — which attributes the failure to the
+        # compile — rather than by the job bound, which GitHub renders as the whole job
+        # being cancelled. It buys no diagnostics on this leg: the `always()` steps below
+        # are all gated to macOS, so a Linux build has none to run.
+        timeout-minutes: 150
         uses: ./.github/actions/build-spiced
         with:
           features: 'tpc-extension,models,postgres-accel'
           build_cli: 'true'
           upload_artifact: 'true'
           artifact_name: build_${{ matrix.target.target_os }}_${{ matrix.target.target_arch }}
+          # The binaries only hand off to this run's test jobs, so they need not
+          # outlive it; at the repository's 30-day default each run kept its
+          # two builds (~600 MiB) stored for a month.
+          artifact_retention_days: '1'
 
       - name: Build spiced and spice CLI (macOS)
         if: matrix.target.target_os == 'darwin'
@@ -204,10 +247,11 @@ jobs:
           build_cli: 'true'
           upload_artifact: 'true'
           artifact_name: build_${{ matrix.target.target_os }}_${{ matrix.target.target_arch }}
+          artifact_retention_days: '1'
           spiceio_endpoint: ${{ steps.setup-spiceio.outputs.endpoint }}
 
       - name: Show sccache stats
-        if: always() && matrix.target.builder == 'spiceai-macos' && env.SCCACHE_SETUP == 'true'
+        if: always() && matrix.target.target_os == 'darwin' && env.SCCACHE_SETUP == 'true'
         # `always()`: this is the one step that reports cache health, and without it
         # it is skipped on exactly the failures it would explain (#12420). The `||`
         # keeps a diagnostic from ever deciding a verdict — when the cache backend is
@@ -216,18 +260,119 @@ jobs:
           sccache --show-stats || echo "::warning::sccache --show-stats failed, so the cache server is not answering either. Read a build failure in this job as a possible cache-backend outage rather than a code failure."
 
       - name: Kill spiceio
-        if: always() && matrix.target.builder == 'spiceai-macos' && steps.setup-spiceio.outputs.pid != ''
+        if: always() && matrix.target.target_os == 'darwin' && steps.setup-spiceio.outputs.pid != ''
         run: kill ${{ steps.setup-spiceio.outputs.pid }} || true
 
+      # Pull request and merge-queue checks keep no diagnostic artifacts.
       - name: Upload spiceio logs
-        if: always() && matrix.target.builder == 'spiceai-macos'
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        if: always() && matrix.target.target_os == 'darwin' && github.event_name != 'pull_request' && github.event_name != 'merge_group'
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
         with:
           name: spiceio-e2e-build-logs
           path: ${{ runner.temp }}/spiceio.log
           if-no-files-found: ignore
 
+  test-bigquery:
+    # Holds the BigQuery workload identity federation settings (`BIGQUERY_*` secrets).
+    environment: ci
+    name: BigQuery Regression Tests
+    needs: build
+    if: ${{ inputs.run_all_tests }}
+    runs-on: spiceai-dev-runners
+    timeout-minutes: 90
+    permissions:
+      contents: read
+      # Exchanged for Google Cloud access tokens for the BigQuery tests: workload identity federation.
+      id-token: write
+    env:
+      SPICED_BIN: ${{ github.workspace }}/build/spiced
+      ADBC_BIGQUERY_DRIVER_PATH: /etc/adbc/drivers/libadbc_driver_bigquery.so
+      # The workload identity federation credential names no project.
+      BIGQUERY_PROJECT_ID: spiceai-testing
+      BIGQUERY_TEST_CLEANUP: always
+      BIGQUERY_EXPECT: single
+    steps:
+      - name: Set test output paths
+        id: test_env
+        shell: bash
+        run: |
+          set -euo pipefail
+          printf 'BIGQUERY_GATE_OUTPUT=%s/bigquery-regression-%s-%s\n' \
+            "$RUNNER_TEMP" "$GITHUB_RUN_ID" "$GITHUB_RUN_ATTEMPT" >> "$GITHUB_ENV"
+          printf 'BIGQUERY_GATE_VENV=%s/bigquery-regression-venv-%s-%s\n' \
+            "$RUNNER_TEMP" "$GITHUB_RUN_ID" "$GITHUB_RUN_ATTEMPT" >> "$GITHUB_ENV"
+
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          fetch-depth: 1
+
+      - name: Set up BigQuery credentials (workload identity federation)
+        uses: ./.github/actions/bigquery-credentials
+        with:
+          workload-identity-provider: ${{ secrets.BIGQUERY_WIF_PROVIDER }}
+          service-account: ${{ secrets.BIGQUERY_SERVICE_ACCOUNT }}
+
+      - name: Download Linux runtime artifact
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
+        with:
+          name: build_linux_x86_64
+          path: ./build
+
+      - name: Prepare runtime artifact
+        run: |
+          chmod +x "$SPICED_BIN"
+          "$SPICED_BIN" --version
+
+      - name: Set up ADBC BigQuery driver
+        uses: ./.github/actions/setup-adbc-bigquery
+
+      - name: Set up Python
+        uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: '3.12'
+
+      - name: Install BigQuery test dependencies
+        shell: bash
+        run: |
+          set -euo pipefail
+          python -m venv "$BIGQUERY_GATE_VENV"
+          "$BIGQUERY_GATE_VENV/bin/python" -m pip install google-cloud-bigquery==3.38.0
+
+      - name: Validate the BigQuery corpus harness
+        run: '"$BIGQUERY_GATE_VENV/bin/python" test/scripts/bigquery_corpus.py --self-test'
+
+      - name: Run BigQuery regression tests
+        timeout-minutes: 60
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p "$BIGQUERY_GATE_OUTPUT"
+          failed=0
+          for suite in corpus federation pushdown json_pushdown; do
+            if ! BIGQUERY_TEST_OUTPUT="$BIGQUERY_GATE_OUTPUT/$suite" \
+              "$BIGQUERY_GATE_VENV/bin/python" "test/scripts/bigquery_${suite}.py"; then
+              failed=1
+            fi
+          done
+          exit "$failed"
+
+      - name: Upload BigQuery test evidence
+        if: ${{ always() && steps.test_env.outcome == 'success' }}
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
+        with:
+          name: bigquery-regression-evidence
+          path: ${{ env.BIGQUERY_GATE_OUTPUT }}
+          if-no-files-found: ignore
+          retention-days: 7
+
+      - name: Remove the test Python environment
+        if: ${{ always() && steps.test_env.outcome == 'success' }}
+        shell: bash
+        run: rm -rf -- "$BIGQUERY_GATE_VENV"
+
   setup-model-matrix:
+    environment: secret-free
     name: Setup model strategy matrix
     if: ${{ github.event_name != 'pull_request' }}
     runs-on: ubuntu-24.04
@@ -249,7 +394,14 @@ jobs:
               },
               {
                 name: "macOS aarch64 (Apple Silicon)",
-                runner: "spiceai-macos",
+                // `spiceai-macos-large`, like `test_hf_model`: both gate the
+                // merge queue through `E2E Test CI`, and on the `spiceai-macos`
+                // minis this 2.4-minute leg queued 83 min at p90 for a runner
+                // (merge_group, 2026-09-29..10-06). Every wait inside it is
+                // bounded (60s readiness, then 30s/30s/60s in the expect
+                // scripts), so a host starved by a neighbouring build fails it
+                // rather than slowing it (#13761).
+                runner: "spiceai-macos-large",
                 target_os: "darwin",
                 target_arch: "aarch64"
               }
@@ -270,6 +422,21 @@ jobs:
       - build
       - setup-model-matrix
     if: ${{ needs.setup-model-matrix.outputs.matrix != '[]' }}
+    # Holds the OpenAI workload identity federation IDs (`OPENAI_*` secrets).
+    environment: ci
+    permissions:
+      contents: read
+      actions: read
+      # The Spicepod's `github:` dataset reads this repository's issues with `GITHUB_TOKEN`.
+      issues: read
+      pull-requests: read
+      # Exchanged for OpenAI access tokens: workload identity federation.
+      id-token: write
+    env:
+      # Workload identity federation: spiced and the tests exchange this job's GitHub OIDC token
+      # for provider access tokens with these IDs, and exchange again before each expires.
+      OPENAI_IDENTITY_PROVIDER_ID: ${{ secrets.OPENAI_IDENTITY_PROVIDER_ID }}
+      OPENAI_SERVICE_ACCOUNT_ID: ${{ secrets.OPENAI_SERVICE_ACCOUNT_ID }}
     strategy:
       fail-fast: false
       matrix:
@@ -281,7 +448,7 @@ jobs:
           fetch-depth: 1
 
       - name: download artifacts - build_${{ matrix.target.target_os }}_${{ matrix.target.target_arch }}
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
         with:
           name: build_${{ matrix.target.target_os }}_${{ matrix.target.target_arch }}
           path: ./build
@@ -305,7 +472,6 @@ jobs:
       - name: Start spice runtime
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          SPICE_OPENAI_API_KEY: ${{ secrets.SPICE_SECRET_OPENAI_API_KEY }}
         run: |
           spice run --http-endpoint "${SPICE_HTTP_ENDPOINT}" --flight-endpoint "${SPICE_FLIGHT_ENDPOINT}" &> spice.log &
 
@@ -315,6 +481,10 @@ jobs:
           url: ${{ env.SPICE_HTTP_ENDPOINT }}/v1/ready
           timeout: '60'
 
+      - name: Configure apt mirrors (Linux)
+        if: matrix.target.target_os == 'linux'
+        uses: ./.github/actions/configure-apt
+
       - name: Install expect (linux)
         if: matrix.target.target_os == 'linux'
         run: |
@@ -322,7 +492,7 @@ jobs:
           sudo apt-get install -y expect
 
       - name: Install expect (macOS)
-        if: matrix.target.target_os == 'darwin' && matrix.target.runner != 'spiceai-macos'
+        if: matrix.target.target_os == 'darwin' && !startsWith(matrix.target.runner, 'spiceai-macos')
         run: |
           if command -v expect >/dev/null 2>&1; then
             expect -v
@@ -347,6 +517,7 @@ jobs:
         uses: ./.github/actions/stop-spice
 
   test_hf_model:
+    environment: ci
     name: 'huggingface model (${{ matrix.target.target_os }}-${{ matrix.target.target_arch }})'
     timeout-minutes: 10
     runs-on: ${{ matrix.target.runner }}
@@ -358,8 +529,12 @@ jobs:
       fail-fast: false
       matrix:
         target:
+          # A self-hosted Mac for Metal and for the Hugging Face cache in $HOME
+          # (see below); the large pool because this leg gates the merge queue,
+          # and on the `spiceai-macos` minis it queued 88 min at p90 for a runner
+          # (merge_group, 2026-09-29..10-06).
           - name: 'macOS aarch64 (Apple Silicon)'
-            runner: 'spiceai-macos'
+            runner: 'spiceai-macos-large'
             target_os: 'darwin'
             target_arch: 'aarch64'
     steps:
@@ -369,7 +544,7 @@ jobs:
           fetch-depth: 1
 
       - name: download artifacts - build_${{ matrix.target.target_os }}_${{ matrix.target.target_arch }}
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
         with:
           name: build_${{ matrix.target.target_os }}_${{ matrix.target.target_arch }}
           path: ./build
@@ -384,42 +559,10 @@ jobs:
           cp ./test/models/spicepod_hf.yml ./spicepod.yaml
           cat ./spicepod.yaml
 
-      # The Hub credential lives where hf-hub looks for it, rather than being threaded
-      # through the spicepod as an `hf_token` param. Two reasons: it authenticates the
-      # chat model and the embedding model with one mechanism, and an unset secret
-      # leaves no file behind instead of setting an empty token, which the Hub answers
-      # with 401 — worse than no token at all.
       - name: Authenticate the Hugging Face cache
-        env:
-          SPICE_HF_TOKEN: ${{ secrets.SPICE_SECRET_HF_TOKEN }}
-        run: |
-          set -uo pipefail
-          umask 077
-
-          # hf-hub caches artifacts under $HOME/.cache/huggingface/hub and reads its
-          # credential from the sibling `token` file. $HOME persists between jobs on
-          # these self-hosted runners while the _work tree does not, so once the ~3B
-          # chat model and the embedding model are on disk, later runs need no Hub
-          # round-trip at all.
-          mkdir -p "${HOME}/.cache/huggingface/hub"
-          token_file="${HOME}/.cache/huggingface/token"
-
-          # $HOME is shared by every job that lands on this host, and it outlives this
-          # one. So a token we write here must not be left behind for an unrelated job
-          # to read, and a token the host already owns must not be clobbered:
-          #   - file already present -> use it, touch nothing.
-          #   - absent + secret set  -> write it, and mark it for removal in cleanup.
-          #   - absent + no secret   -> warn; downloads are anonymous.
-          if [ -s "${token_file}" ]; then
-            echo "Using the Hugging Face token already present on this runner."
-          elif [ -n "${SPICE_HF_TOKEN:-}" ]; then
-            printf '%s' "${SPICE_HF_TOKEN}" > "${token_file}"
-            chmod 600 "${token_file}"
-            echo "SPICE_REMOVE_HF_TOKEN=${token_file}" >> "$GITHUB_ENV"
-            echo "Wrote a job-scoped Hugging Face token for hf-hub to pick up."
-          else
-            echo "::warning::No Hugging Face token available. Downloads will be anonymous, and anonymous requests share a per-IP quota across this whole runner pool — exhausting it surfaces as HTTP 401 on model config files."
-          fi
+        uses: ./.github/actions/hf-cache-auth
+        with:
+          token: ${{ secrets.SPICE_SECRET_HF_TOKEN }}
 
       # Fail here, in seconds and by name, rather than as an unexplained five-minute
       # readiness timeout. The retries ride out the transient per-IP 401/429 responses
@@ -435,15 +578,20 @@ jobs:
             exit 0
           fi
 
+          # The same token spiced will use: `HF_TOKEN`, else the runner's token file.
+          token="${HF_TOKEN:-}"
           token_file="${HOME}/.cache/huggingface/token"
+          if [ -z "${token}" ] && [ -s "${token_file}" ]; then
+            token="$(cat "${token_file}")"
+          fi
 
           # The token goes to curl through a config on stdin rather than an -H argument,
           # so it never appears in this process's argv. `printf` is a shell builtin, so
           # it spawns nothing that could carry it either. curl drops the header on a
           # cross-host redirect by default, which is what keeps `-L` safe here.
           probe() {
-            if [ -s "${token_file}" ]; then
-              printf 'header = "Authorization: Bearer %s"\n' "$(cat "${token_file}")" |
+            if [ -n "${token}" ]; then
+              printf 'header = "Authorization: Bearer %s"\n' "${token}" |
                 curl -K - -sSL -o /dev/null -w '%{http_code}' --max-time 30 "$1" 2>/dev/null
             else
               curl -sSL -o /dev/null -w '%{http_code}' --max-time 30 "$1" 2>/dev/null
@@ -506,7 +654,6 @@ jobs:
       - name: Start spice runtime
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          SPICE_OPENAI_API_KEY: ${{ secrets.SPICE_SECRET_OPENAI_API_KEY }}
         run: |
           spice run --http-endpoint "${SPICE_HTTP_ENDPOINT}" --flight-endpoint "${SPICE_FLIGHT_ENDPOINT}" &> spice.log &
 
@@ -516,6 +663,10 @@ jobs:
           url: ${{ env.SPICE_HTTP_ENDPOINT }}/v1/ready
           timeout: '300'
 
+      - name: Configure apt mirrors (Linux)
+        if: matrix.target.target_os == 'linux'
+        uses: ./.github/actions/configure-apt
+
       - name: Install expect (linux)
         if: matrix.target.target_os == 'linux'
         run: |
@@ -523,7 +674,7 @@ jobs:
           sudo apt-get install -y expect
 
       - name: Install expect (macOS)
-        if: matrix.target.target_os == 'darwin' && matrix.target.runner != 'spiceai-macos'
+        if: matrix.target.target_os == 'darwin' && !startsWith(matrix.target.runner, 'spiceai-macos')
         run: |
           if command -v expect >/dev/null 2>&1; then
             expect -v
@@ -539,6 +690,12 @@ jobs:
         run: |
           ./test/models/search_01.exp
 
+      # No step retry: in merge-queue job 103597842965 a fixed 30s budget ran out
+      # while Qwen2.5-3B was still streaming a long answer on Metal, not on a
+      # Hub download (config probe HTTP 200; `search_01.exp` had already
+      # passed). The REPL scripts bound silence rather than total response
+      # time (90s, override with SPICE_REPL_IDLE_TIMEOUT) and spicepod_hf.yml
+      # caps hf_max_completion_tokens at 64. A stall after that is a hang.
       - name: Test chat
         run: |
           ./test/models/chat_01_simple.exp
@@ -547,16 +704,8 @@ jobs:
         if: always()
         uses: ./.github/actions/stop-spice
 
-      # Only fires when the step above wrote the token itself; a credential the runner
-      # already owned is left alone. Without this, a secret would outlive the job in a
-      # $HOME that every later job on this host can read.
-      - name: Remove the job-scoped Hugging Face token
-        if: always() && env.SPICE_REMOVE_HF_TOKEN != ''
-        run: |
-          rm -f "${SPICE_REMOVE_HF_TOKEN}"
-          echo "Removed the job-scoped Hugging Face token."
-
   test_quickstart_dremio:
+    environment: secret-free
     name: 'Test Dremio quickstart (${{ matrix.target.target_os }}-${{ matrix.target.target_arch }})'
     runs-on: ${{ matrix.target.runner }}
     # run quickstart with external service dependency only on manual trigger
@@ -574,7 +723,7 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: download artifacts - build_${{ matrix.target.target_os }}_${{ matrix.target.target_arch }}
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
         with:
           name: build_${{ matrix.target.target_os }}_${{ matrix.target.target_arch }}
           path: ./build
@@ -619,6 +768,7 @@ jobs:
         with:
           working-directory: test_app
           timeout: '60'
+          datasets: taxi_trips
 
       - name: Verify dataset
         uses: ./.github/actions/verify-dataset
@@ -634,6 +784,7 @@ jobs:
   test_quickstart_spiceai:
     name: 'Test Spice.ai quickstart (${{ matrix.target.target_os }}-${{ matrix.target.target_arch }})'
     runs-on: ${{ matrix.target.runner }}
+    environment: ci
     # run quickstart with external service dependency only on manual trigger
     if: github.event_name == 'workflow_dispatch' || github.event_name == 'push'
     needs:
@@ -649,7 +800,7 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: download artifacts - build_${{ matrix.target.target_os }}_${{ matrix.target.target_arch }}
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
         with:
           name: build_${{ matrix.target.target_os }}_${{ matrix.target.target_arch }}
           path: ./build
@@ -699,6 +850,7 @@ jobs:
   test_quickstart_s3:
     name: 'Test S3 quickstart (${{ matrix.target.target_os }}-${{ matrix.target.target_arch }}; acceleration: ${{ matrix.acceleration.engine }})'
     runs-on: ${{ matrix.target.runner }}
+    environment: ci
     # run quickstart with external service dependency only on manual trigger
     if: github.event_name == 'workflow_dispatch' || github.event_name == 'push'
     needs:
@@ -716,7 +868,7 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: download artifacts - build_${{ matrix.target.target_os }}_${{ matrix.target.target_arch }}
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
         with:
           name: build_${{ matrix.target.target_os }}_${{ matrix.target.target_arch }}
           path: ./build
@@ -790,7 +942,94 @@ jobs:
         with:
           working-directory: test_app
 
+  test_cold_start_unkeyed_append:
+    environment: ci
+    name: 'Cold start: unkeyed Cayenne append loads without rewriting itself'
+    # The nightly `testoperator run cold-start` workflow times every acceleration shape
+    # against the previous release; this is its timing-free bound, cheap enough for the
+    # merge queue. A load into an empty table must not trigger a full compaction.
+    if: github.event_name == 'merge_group' || github.event_name == 'workflow_dispatch'
+    runs-on: spiceai-dev-runners
+    permissions:
+      contents: read
+      id-token: write  # RustFS credentials
+    needs:
+      - build
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: download artifacts - build_linux_x86_64
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
+        with:
+          name: build_linux_x86_64
+          path: ./build
+
+      - name: Install spice
+        uses: ./.github/actions/install-spice
+        with:
+          build-path: ./build
+
+      - name: Get RustFS credentials
+        id: rustfs
+        uses: ./.github/actions/rustfs-credentials
+        with:
+          endpoint: ${{ vars.TEST_MINIO_ENDPOINT }}
+          duration-seconds: '1200'
+          export-env: 'false'
+
+      - name: Install MinIO
+        uses: ./.github/actions/setup-minio
+        with:
+          minio_endpoint: ${{ vars.TEST_MINIO_ENDPOINT }}
+          minio_access_key: ${{ steps.rustfs.outputs.access-key-id }}
+          minio_secret_key: ${{ steps.rustfs.outputs.secret-access-key }}
+          minio_session_token: ${{ steps.rustfs.outputs.session-token }}
+
+      - name: Check for the fixture
+        run: |
+          if ! mc stat spice-minio/benchmarks/cold_start/audit_events_3m/_SEEDED >/dev/null 2>&1; then
+            echo "The cold-start fixture is missing from MinIO; run the 'testoperator run cold-start' workflow once to seed it."
+            exit 1
+          fi
+
+      - name: Start spiced
+        run: |
+          mkdir -p cold_start_app
+          cp 'test/spicepods/cold_start/delta_lake-cayenne[file]-append_unkeyed_sorted.yaml' cold_start_app/spicepod.yaml
+          cd cold_start_app
+          spiced --cpu-cores 2 --metrics 127.0.0.1:9095 &> spice.log &
+        env:
+          S3_ENDPOINT: ${{ vars.TEST_MINIO_ENDPOINT }}
+          S3_KEY: ${{ steps.rustfs.outputs.access-key-id }}
+          S3_SECRET: ${{ steps.rustfs.outputs.secret-access-key }}
+          S3_SESSION_TOKEN: ${{ steps.rustfs.outputs.session-token }}
+
+      - name: Wait for the dataset to be ready
+        uses: ./.github/actions/wait-for-spice-ready
+        with:
+          working-directory: cold_start_app
+          timeout: '600'
+
+      - name: Check the load committed no full compaction and holds every row
+        run: |
+          set -o pipefail
+          full=$(curl -sf http://127.0.0.1:9095/metrics \
+            | awk '/^cayenne_compaction_outcome_total\{/ && /kind="full"/ && /outcome="committed"/ && /table="audit_events"/ {sum += $NF} END {print sum + 0}')
+          rows=$(curl -sf -X POST -H 'Content-Type: text/plain' --data 'SELECT COUNT(*) AS n FROM audit_events' \
+            http://127.0.0.1:8090/v1/sql | tr -dc '0-9')
+          echo "full compactions before ready: ${full}; rows: ${rows}"
+          test "${full}" = 0
+          test "${rows}" = 2940086
+
+      - name: Stop spice and check logs
+        if: always()
+        uses: ./.github/actions/stop-spice
+        with:
+          working-directory: cold_start_app
+
   test_quickstart_data_postgres:
+    environment: secret-free
     name: 'Test PostgreSQL quickstart (${{ matrix.target.target_os }}-${{ matrix.target.target_arch }}; acceleration: ${{ matrix.acceleration.engine }})'
     runs-on: ${{ matrix.target.runner }}
     needs:
@@ -805,21 +1044,8 @@ jobs:
           [
             {},
             { engine: arrow, mode: memory },
-            { engine: duckdb, mode: file },
             { engine: sqlite, mode: file },
             { engine: cayenne, mode: file },
-            {
-              engine: postgres,
-              params:
-                {
-                  pg_host: localhost,
-                  pg_port: 5432,
-                  pg_db: testdb_acc,
-                  pg_user: postgres,
-                  pg_pass: postgres,
-                  pg_sslmode: disable,
-                },
-            },
           ]
         target: ${{ fromJson(needs.setup-matrix.outputs.matrix) }}
 
@@ -838,15 +1064,8 @@ jobs:
           psql -h localhost -U postgres -d testdb < test/scripts/setup-data-postgresql.sql
           psql -h localhost -U postgres -d testdb -c 'SELECT * FROM test_postgresql_table;'
 
-      - name: Create Postgres Accelerator Test Database
-        if: matrix.acceleration.engine == 'postgres'
-        env:
-          PGPASSWORD: postgres
-        run: |
-          createdb -h localhost -U postgres testdb_acc
-
       - name: download artifacts - build_${{ matrix.target.target_os }}_${{ matrix.target.target_arch }}
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
         with:
           name: build_${{ matrix.target.target_os }}_${{ matrix.target.target_arch }}
           path: ./build
@@ -971,6 +1190,7 @@ jobs:
           working-directory: test_app
 
   test_quickstart_data_mysql:
+    environment: secret-free
     name: 'Test MySQL quickstart (${{ matrix.target.target_os }}-${{ matrix.target.target_arch }}; acceleration: ${{ matrix.acceleration.engine }})'
     runs-on: ${{ matrix.target.runner }}
     needs:
@@ -985,32 +1205,17 @@ jobs:
           [
             {},
             { engine: arrow, mode: memory },
-            { engine: duckdb, mode: file },
             { engine: sqlite, mode: file },
             { engine: cayenne, mode: file },
-            {
-              engine: postgres,
-              params:
-                {
-                  pg_host: localhost,
-                  pg_port: 5432,
-                  pg_db: testdb,
-                  pg_user: postgres,
-                  pg_pass: postgres,
-                  pg_sslmode: disable,
-                },
-            },
           ]
         target: ${{ fromJson(needs.setup-matrix.outputs.matrix) }}
 
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
-      - name: Install PostgreSQL
-        if: matrix.acceleration.engine == 'postgres'
-        uses: ./.github/actions/install-postgres
-        with:
-          pg-db: testdb
+      - name: Configure apt mirrors (Linux)
+        if: matrix.target.target_os == 'linux'
+        uses: ./.github/actions/configure-apt
 
       - name: Install MySQL (Linux)
         if: matrix.target.target_os == 'linux'
@@ -1026,18 +1231,46 @@ jobs:
       - name: Install MySQL (MacOS)
         if: matrix.target.target_os == 'darwin'
         run: |
+          # Homebrew's API and bottle hosts fail transiently; retry each network step.
+          retry() {
+            for attempt in 1 2 3; do
+              "$@" && return 0
+              echo "::warning::'$*' failed (attempt ${attempt}/3)"
+              sleep $((attempt * 15))
+            done
+            return 1
+          }
           # macos-15 runner bug requires 'brew update': https://github.com/actions/runner-images/issues/11855#issuecomment-2754201066
-          brew update
-          brew install mysql@8.4
+          # A stale index only matters if the install below fails, so don't fail on it here.
+          retry brew update || echo "::warning::brew update failed; installing with the image's formula index"
+          # The macos-15 image points bin/openssl at the deprecated openssl@1.1 with a plain
+          # symlink that Homebrew does not own, so `brew unlink openssl@1.1` leaves it in
+          # place. When a mysql@8.4 bottle needs a newer openssl@3, brew upgrades it but
+          # cannot link bin/openssl over that symlink, and `brew install` exits 1 even
+          # though MySQL installed. Removing the symlink first lets the upgrade link.
+          openssl_link="$(brew --prefix)/bin/openssl"
+          if [[ "$(readlink "$openssl_link")" == */openssl@1.1/* ]]; then
+            rm "$openssl_link"
+          fi
+          retry brew install mysql@8.4
           brew link mysql@8.4 --force --overwrite
           brew services start mysql@8.4
-          sleep 5
+          for attempt in {1..30}; do
+            mysqladmin ping --silent && break
+            sleep 1
+          done
           mysql -e "CREATE USER test_user@localhost IDENTIFIED BY 'password';"
           mysql -e "GRANT ALL PRIVILEGES ON testdb.* TO 'test_user'@'localhost'; FLUSH PRIVILEGES;"
           mysql -e "CREATE DATABASE IF NOT EXISTS testdb;" -utest_user -ppassword
 
       - name: Wait for MySQL to start
-        run: sleep 10
+        run: |
+          for attempt in {1..30}; do
+            mysqladmin ping -h localhost --silent && exit 0
+            sleep 1
+          done
+          echo "::error::MySQL is not accepting connections on localhost after 30s"
+          exit 1
 
       - name: Check MySQL
         run: echo 'SELECT VERSION();' | mysql -h localhost -utest_user -ppassword
@@ -1049,7 +1282,7 @@ jobs:
           mysql -h localhost -utest_user -ppassword testdb -e "SELECT * FROM test_mysql_table;"
 
       - name: download artifacts - build_${{ matrix.target.target_os }}_${{ matrix.target.target_arch }}
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
         with:
           name: build_${{ matrix.target.target_os }}_${{ matrix.target.target_arch }}
           path: ./build
@@ -1180,6 +1413,7 @@ jobs:
           working-directory: test_app
 
   test_quickstart_clickhouse:
+    environment: secret-free
     name: 'Test Clickhouse quickstart (${{ matrix.target.target_os }}-${{ matrix.target.target_arch }})'
     runs-on: ${{ matrix.target.runner }}
     needs:
@@ -1194,6 +1428,10 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
+      - name: Configure apt mirrors (Linux)
+        if: matrix.target.target_os == 'linux'
+        uses: ./.github/actions/configure-apt
+
       - name: Install Clickhouse
         if: matrix.target.target_os == 'linux'
         run: |
@@ -1203,7 +1441,10 @@ jobs:
           sudo apt-get update
           sudo DEBIAN_FRONTEND=noninteractive apt-get install -y clickhouse-common-static=${CLICKHOUSE_VERSION} clickhouse-server=${CLICKHOUSE_VERSION} clickhouse-client=${CLICKHOUSE_VERSION}
           sudo -u clickhouse /usr/bin/clickhouse-server --config=/etc/clickhouse-server/config.xml --daemon  -- --tcp_port=9001
-          sleep 5
+          for attempt in {1..30}; do
+            clickhouse client --port 9001 --query="SELECT 1" >/dev/null 2>&1 && break
+            sleep 1
+          done
           clickhouse client --port 9001 -udefault --query="CREATE USER test_user IDENTIFIED BY 'password';"
           clickhouse client --port 9001 -udefault --query="GRANT ALL PRIVILEGES ON testdb.* TO 'test_user';"
           clickhouse client --port 9001 -utest_user --password password --query="CREATE DATABASE IF NOT EXISTS testdb;"
@@ -1213,18 +1454,27 @@ jobs:
         run: |
           CLICKHOUSE_VERSION="26.3.9.8-lts"
           BASE_URL="https://github.com/ClickHouse/ClickHouse/releases/download/v${CLICKHOUSE_VERSION}"
-          curl -fsSL "${BASE_URL}/clickhouse-macos-aarch64" -o clickhouse-macos-aarch64
+          curl -fsSL --retry 8 --retry-all-errors --retry-max-time 300 "${BASE_URL}/clickhouse-macos-aarch64" -o clickhouse-macos-aarch64
           mv clickhouse-macos-aarch64 clickhouse
           chmod +x clickhouse
           sudo ./clickhouse install --noninteractive
           sudo clickhouse server --config=/etc/clickhouse-server/config.xml --daemon  -- --tcp_port=9001
-          sleep 5
+          for attempt in {1..30}; do
+            clickhouse client --port 9001 --query="SELECT 1" >/dev/null 2>&1 && break
+            sleep 1
+          done
           clickhouse client --port 9001 -udefault --query="CREATE USER test_user IDENTIFIED BY 'password';"
           clickhouse client --port 9001 -udefault --query="GRANT ALL PRIVILEGES ON testdb.* TO 'test_user';"
           clickhouse client --port 9001 -utest_user --password password --query="CREATE DATABASE IF NOT EXISTS testdb;"
 
       - name: Wait for Clickhouse to start
-        run: sleep 10
+        run: |
+          for attempt in {1..30}; do
+            clickhouse client --port 9001 --query="SELECT 1" >/dev/null 2>&1 && exit 0
+            sleep 1
+          done
+          echo "::error::ClickHouse is not accepting connections on port 9001 after 30s"
+          exit 1
 
       - name: Check Clickhouse
         run: clickhouse client --port 9001 -utest_user --password password --query="SELECT version();"
@@ -1235,7 +1485,7 @@ jobs:
           clickhouse client --port 9001 -utest_user --password password --database=testdb --query="SELECT * FROM test_clickhouse_table;"
 
       - name: download artifacts - build_${{ matrix.target.target_os }}_${{ matrix.target.target_arch }}
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
         with:
           name: build_${{ matrix.target.target_os }}_${{ matrix.target.target_arch }}
           path: ./build
@@ -1286,6 +1536,7 @@ jobs:
           working-directory: test_app
 
   test_quickstart_duckdb:
+    environment: secret-free
     env:
       duckdb_version: v0.10.2
     name: 'Test DuckDB quickstart (${{ matrix.target.target_os }}-${{ matrix.target.target_arch }})'
@@ -1305,14 +1556,14 @@ jobs:
       - name: Install DuckDB
         if: matrix.target.target_os == 'linux'
         run: |
-          wget https://github.com/duckdb/duckdb/releases/download/${{ env.duckdb_version }}/duckdb_cli-linux-amd64.zip
+          curl -fsSL --retry 8 --retry-all-errors --retry-max-time 300 -O https://github.com/duckdb/duckdb/releases/download/${{ env.duckdb_version }}/duckdb_cli-linux-amd64.zip
           unzip duckdb_cli-linux-amd64.zip
           chmod +x ./duckdb
 
       - name: Install DuckDB
         if: matrix.target.target_os == 'darwin'
         run: |
-          wget https://github.com/duckdb/duckdb/releases/download/${{ env.duckdb_version }}/duckdb_cli-osx-universal.zip
+          curl -fsSL --retry 8 --retry-all-errors --retry-max-time 300 -O https://github.com/duckdb/duckdb/releases/download/${{ env.duckdb_version }}/duckdb_cli-osx-universal.zip
           unzip duckdb_cli-osx-universal.zip
           chmod +x ./duckdb
 
@@ -1321,10 +1572,14 @@ jobs:
           ./duckdb -s "INSTALL tpch;LOAD tpch;CALL dbgen(sf = 1);" ./tpch.db
 
       - name: download artifacts - build_${{ matrix.target.target_os }}_${{ matrix.target.target_arch }}
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
         with:
           name: build_${{ matrix.target.target_os }}_${{ matrix.target.target_arch }}
           path: ./build
+
+      # duckdb: datasets load the DuckDB library installed on the host.
+      - name: Set up libduckdb
+        uses: ./.github/actions/setup-libduckdb
 
       - name: Install Spice
         uses: ./.github/actions/install-spice
@@ -1370,6 +1625,7 @@ jobs:
           working-directory: duckdb-app
 
   test_local_acceleration:
+    environment: secret-free
     name: 'Test acceleration on ${{ matrix.target.name }} using ${{ matrix.acceleration.engine }} (${{ matrix.acceleration.mode }})'
     runs-on: ${{ matrix.target.runner }}
     needs:
@@ -1382,15 +1638,10 @@ jobs:
       matrix:
         acceleration: [
             { engine: arrow, mode: memory },
+            { engine: cayenne, mode: memory },
             { engine: cayenne, mode: file },
-            { engine: duckdb, mode: memory },
-            { engine: duckdb, mode: file },
             { engine: sqlite, mode: memory },
             { engine: sqlite, mode: file },
-            { engine: cayenne, mode: file },
-            { engine: turso, mode: memory },
-            { engine: turso, mode: file },
-            # { engine: postgres},
           ]
         target: ${{ fromJson(needs.setup-matrix.outputs.matrix) }}
 
@@ -1419,7 +1670,7 @@ jobs:
           psql -h localhost -U postgres -d testdb -c 'SELECT * FROM eth.recent_blocks;'
 
       - name: download artifacts - build_${{ matrix.target.target_os }}_${{ matrix.target.target_arch }}
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
         with:
           name: build_${{ matrix.target.target_os }}_${{ matrix.target.target_arch }}
           path: ./build
@@ -1518,6 +1769,7 @@ jobs:
           working-directory: test_app
 
   test_results_caching:
+    environment: secret-free
     name: 'Test results caching on ${{ matrix.target.name }}'
     runs-on: ${{ matrix.target.runner }}
     needs:
@@ -1533,7 +1785,7 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: download artifacts - build_${{ matrix.target.target_os }}_${{ matrix.target.target_arch }}
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
         with:
           name: build_${{ matrix.target.target_os }}_${{ matrix.target.target_arch }}
           path: ./build
@@ -1556,7 +1808,7 @@ jobs:
           echo "      enabled: true" >> spicepod.yaml
           echo "      caching_policy: lru" >> spicepod.yaml
           echo "      max_size: 128MiB" >> spicepod.yaml
-          echo "      item_ttl: 300s" >> spicepod.yaml
+          echo "      item_ttl: 60s" >> spicepod.yaml
           echo "datasets:" >> spicepod.yaml
           echo "  - from: s3://spiceai-demo-datasets/tpch/customer/" >> spicepod.yaml
           echo "    name: customer" >> spicepod.yaml
@@ -1585,6 +1837,8 @@ jobs:
       - name: Run SQL query and check Miss cache header
         working-directory: test_app
         run: |
+          # The entry's age counts from this query's start; the expiry check below uses it.
+          echo "CACHED_AT=$(date +%s)" >> "$GITHUB_ENV"
           response=$(curl -i -XPOST "127.0.0.1:8090/v1/sql" --data "SELECT c_name FROM (SELECT * FROM customer)")
           echo "$response"
           if echo "$response" | grep -q "results-cache-status: MISS"; then
@@ -1611,25 +1865,66 @@ jobs:
         run: |
           output=$(spice refresh customer 2>&1)
           echo "$output"
-          if [[ $output == *"Dataset refresh triggered"* ]]; then
-            # time to refresh dataset
-            sleep 3
-          else
+          if [[ $output != *"Dataset refresh triggered"* ]]; then
             echo "Failed to trigger dataset refresh."
             exit 1
           fi
 
-      - name: Run SQL query and check Miss cache header
+      - name: Wait for the refresh to complete
         working-directory: test_app
         run: |
-          response=$(curl -i -XPOST "127.0.0.1:8090/v1/sql" --data "SELECT c_name FROM (SELECT * FROM customer)")
+          # `spice refresh` only triggers the refresh. The initial load and this refresh each
+          # log one "Loaded ... for dataset customer" line; poll for the second.
+          deadline=$((SECONDS + 30))
+          until (( $(grep -c "Loaded .* for dataset customer" spice.log) >= 2 )); do
+            if (( SECONDS >= deadline )); then
+              grep -E "for dataset customer" spice.log || true
+              echo "::error::The refresh of customer did not complete within 30s of 'spice refresh customer'."
+              exit 1
+            fi
+            sleep 1
+          done
+          grep -E "for dataset customer" spice.log
+
+      - name: Run SQL query and check the refresh left the cached result
+        working-directory: test_app
+        run: |
+          # A refresh does not invalidate SQL results: they expire by item_ttl, counted from
+          # the query that produced them.
+          response=$(curl -sS -i --max-time 5 -XPOST "127.0.0.1:8090/v1/sql" --data "SELECT c_name FROM (SELECT * FROM customer)")
           echo "$response"
-          if echo "$response" | grep -q "results-cache-status: MISS"; then
-            echo "Cache miss detected as expected"
+          if echo "$response" | grep -q "results-cache-status: HIT"; then
+            echo "Cache hit after refresh detected as expected"
           else
-            echo "Cache miss not detected" >&2
+            echo "::error::The cached result for customer was not served after the refresh completed; a refresh must not invalidate SQL results." >&2
             exit 1
           fi
+
+      - name: Run SQL query and check Miss cache header after item_ttl
+        working-directory: test_app
+        run: |
+          # item_ttl is 60s and no stale_while_revalidate_ttl is set, so the entry stored by the
+          # first query becomes a miss 60s after that query started, and not before.
+          deadline=$((CACHED_AT + 90))
+          while :; do
+            response=$(curl -sS -i --max-time 5 -XPOST "127.0.0.1:8090/v1/sql" --data "SELECT c_name FROM (SELECT * FROM customer)")
+            age=$(( $(date +%s) - CACHED_AT ))
+            if echo "$response" | grep -q "results-cache-status: MISS"; then
+              echo "$response"
+              if (( age < 59 )); then
+                echo "::error::The cached result for customer became a miss ${age}s after it was stored, before item_ttl (60s)."
+                exit 1
+              fi
+              echo "Cache miss detected ${age}s after the result was stored, as expected"
+              break
+            fi
+            if (( $(date +%s) >= deadline )); then
+              echo "$response"
+              echo "::error::The cached result for customer was still served ${age}s after it was stored; item_ttl is 60s."
+              exit 1
+            fi
+            sleep 1
+          done
 
       - name: Run SQL query with custom cache key and check for miss header
         working-directory: test_app
@@ -1667,29 +1962,23 @@ jobs:
         with:
           working-directory: test_app
 
-  gh_connector_quickstart:
-    name: 'Test GitHub connector on ${{ matrix.target.name }}'
-    runs-on: ${{ matrix.target.runner }}
+  test_results_caching_source_down:
+    environment: secret-free
+    name: 'Test results caching with the source down'
+    # Linux only: what it checks, that a cache miss reads the acceleration while the
+    # source is unreadable, does not depend on the platform.
+    runs-on: spiceai-dev-runners
     needs:
       - build
-      - setup-matrix
     timeout-minutes: 5
-
-    strategy:
-      matrix:
-        target: ${{ fromJson(needs.setup-matrix.outputs.matrix) }}
-        # run only on "Linux x64"
-        exclude:
-          - target:
-              target_os: 'darwin'
 
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
-      - name: download artifacts - build_${{ matrix.target.target_os }}_${{ matrix.target.target_arch }}
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+      - name: download artifacts - build_linux_x86_64
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
         with:
-          name: build_${{ matrix.target.target_os }}_${{ matrix.target.target_arch }}
+          name: build_linux_x86_64
           path: ./build
 
       - name: Install spice
@@ -1704,59 +1993,25 @@ jobs:
       - name: Spice configure
         working-directory: test_app
         run: |
-
+          printf 'id,v\n1,1\n2,1\n3,1\n' > orders.csv
+          echo "runtime:" >> spicepod.yaml
+          echo "  caching:" >> spicepod.yaml
+          echo "    sql_results:" >> spicepod.yaml
+          echo "      enabled: true" >> spicepod.yaml
+          echo "      item_ttl: 5s" >> spicepod.yaml
           echo "datasets:" >> spicepod.yaml
-          echo "  - from: github:github.com/spiceai/spiceai/files/trunk" >> spicepod.yaml
-          echo "    name: spiceai.files" >> spicepod.yaml
+          echo "  - from: file:./orders.csv" >> spicepod.yaml
+          echo "    name: orders" >> spicepod.yaml
           echo "    params:" >> spicepod.yaml
-          echo "      github_token: \${secrets:GITHUB_TOKEN}" >> spicepod.yaml
-          echo "      include: \"**/*.md\"" >> spicepod.yaml
+          echo "      file_format: csv" >> spicepod.yaml
           echo "    acceleration:" >> spicepod.yaml
           echo "      enabled: true" >> spicepod.yaml
-          echo "      refresh_sql: 'SELECT * FROM spiceai.files LIMIT 20'" >> spicepod.yaml
-
-          echo "  - from: github:github.com/spiceai/spiceai/issues" >> spicepod.yaml
-          echo "    name: spiceai.issues" >> spicepod.yaml
-          echo "    params:" >> spicepod.yaml
-          echo "      github_token: \${secrets:GITHUB_TOKEN}" >> spicepod.yaml
-          echo "    acceleration:" >> spicepod.yaml
-          echo "      enabled: true" >> spicepod.yaml
-          echo "      refresh_sql: 'SELECT * FROM spiceai.issues LIMIT 20'" >> spicepod.yaml
-
-          echo "  - from: github:github.com/spiceai/spiceai/pulls" >> spicepod.yaml
-          echo "    name: spiceai.pulls" >> spicepod.yaml
-          echo "    params:" >> spicepod.yaml
-          echo "      github_token: \${secrets:GITHUB_TOKEN}" >> spicepod.yaml
-          echo "    acceleration:" >> spicepod.yaml
-          echo "      enabled: true" >> spicepod.yaml
-          echo "      refresh_sql: 'SELECT * FROM spiceai.pulls LIMIT 20'" >> spicepod.yaml
-
-          echo "  - from: github:github.com/spiceai/spiceai/commits" >> spicepod.yaml
-          echo "    name: spiceai.commits" >> spicepod.yaml
-          echo "    params:" >> spicepod.yaml
-          echo "      github_token: \${secrets:GITHUB_TOKEN}" >> spicepod.yaml
-          echo "    acceleration:" >> spicepod.yaml
-          echo "      enabled: true" >> spicepod.yaml
-          echo "      refresh_sql: 'SELECT * FROM spiceai.commits LIMIT 20'" >> spicepod.yaml
-
-          echo "  - from: github:github.com/spiceai/spiceai/stargazers" >> spicepod.yaml
-          echo "    name: spiceai.stargazers" >> spicepod.yaml
-          echo "    params:" >> spicepod.yaml
-          echo "      github_token: \${secrets:GITHUB_TOKEN}" >> spicepod.yaml
-          echo "    acceleration:" >> spicepod.yaml
-          echo "      enabled: true" >> spicepod.yaml
-          echo "      refresh_sql: 'SELECT * FROM spiceai.stargazers LIMIT 20'" >> spicepod.yaml
-
           cat spicepod.yaml
 
       - name: Start spice runtime
         working-directory: test_app
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           spice run &> spice.log &
-          # time to accelerate added datasets
-          sleep 20
 
       - name: Wait for dataset to be ready
         uses: ./.github/actions/wait-for-spice-ready
@@ -1764,45 +2019,105 @@ jobs:
           working-directory: test_app
           timeout: '60'
 
-      - name: Run test query (issues)
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        uses: ./.github/actions/run-query
-        with:
-          fail-on-error: true
-          query: 'select number, title, state, labels, updated_at from spiceai.issues order by updated_at desc limit 10;'
+      - name: Cache the result while the source is reachable
+        working-directory: test_app
+        run: |
+          sql="SELECT CAST(SUM(v) AS BIGINT) AS s, COUNT(*) AS n FROM orders"
+          for expected in MISS HIT; do
+            response=$(curl -sS -i --max-time 5 -XPOST "127.0.0.1:8090/v1/sql" --data "$sql")
+            echo "$response"
+            if ! echo "$response" | grep -q "results-cache-status: $expected"; then
+              echo "::error::Expected results-cache-status $expected while the source is reachable." >&2
+              exit 1
+            fi
+            if ! echo "$response" | grep -q '"s":3,"n":3'; then
+              echo "::error::Expected the three source rows, SUM(v) = 3." >&2
+              exit 1
+            fi
+          done
 
-      - name: Run test query (pulls)
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        uses: ./.github/actions/run-query
-        with:
-          fail-on-error: true
-          query: "select number, title, state, merged_at from spiceai.pulls where state = 'MERGED' order by merged_at desc limit 10;"
+      - name: Make the source unreadable and wait for the refresh to fail
+        working-directory: test_app
+        run: |
+          # An unreadable file makes the refresh fail. A missing one does not: the file
+          # connector reads it as an empty source.
+          chmod 000 orders.csv
+          if [ -r orders.csv ]; then
+            echo "::error::orders.csv is still readable after chmod 000 (is the job running as root?), so the source cannot be taken down." >&2
+            exit 1
+          fi
+          output=$(spice refresh orders 2>&1)
+          echo "$output"
+          deadline=$((SECONDS + 30))
+          until curl -sS "127.0.0.1:8090/v1/datasets?status=true" | grep -q '"status":"Error"'; do
+            if (( SECONDS >= deadline )); then
+              curl -sS "127.0.0.1:8090/v1/datasets?status=true"
+              grep -E "dataset orders" spice.log || true
+              echo "::error::Dataset orders did not report an error within 30s of its source becoming unreadable." >&2
+              exit 1
+            fi
+            sleep 1
+          done
+          curl -sS "127.0.0.1:8090/v1/datasets?status=true"
 
-      - name: Run test query (commits)
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        uses: ./.github/actions/run-query
-        with:
-          fail-on-error: true
-          query: 'select message_head_line, author_name, sha from spiceai.commits order by committed_date desc limit 10;'
+      - name: Run SQL query and check misses are answered from the acceleration
+        working-directory: test_app
+        run: |
+          # item_ttl is 5s, so the entry cached above expires while the source is down.
+          # The miss that follows must be answered from the acceleration, then cached.
+          sql="SELECT CAST(SUM(v) AS BIGINT) AS s, COUNT(*) AS n FROM orders"
+          deadline=$((SECONDS + 30))
+          while :; do
+            response=$(curl -sS -i --max-time 5 -XPOST "127.0.0.1:8090/v1/sql" --data "$sql")
+            if ! echo "$response" | head -1 | grep -qE '^HTTP/[0-9.]+ 200'; then
+              echo "$response"
+              echo "::error::A query on orders failed while its source was down; a cache miss must be answered from the acceleration." >&2
+              exit 1
+            fi
+            if echo "$response" | grep -q "results-cache-status: MISS"; then
+              break
+            fi
+            if (( SECONDS >= deadline )); then
+              echo "$response"
+              echo "::error::The cached result for orders was still served 30s after the source went down; item_ttl is 5s." >&2
+              exit 1
+            fi
+            sleep 1
+          done
+          echo "$response"
+          if ! echo "$response" | grep -q '"s":3,"n":3'; then
+            echo "::error::A cache miss with the source down must be answered from the acceleration (SUM(v) = 3, 3 rows)." >&2
+            exit 1
+          fi
+          response=$(curl -sS -i --max-time 5 -XPOST "127.0.0.1:8090/v1/sql" --data "$sql")
+          echo "$response"
+          if ! echo "$response" | grep -q "results-cache-status: HIT" || ! echo "$response" | grep -q '"s":3,"n":3'; then
+            echo "::error::The result answered from the acceleration must be cached." >&2
+            exit 1
+          fi
 
-      - name: Run test query (files)
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        uses: ./.github/actions/run-query
-        with:
-          fail-on-error: true
-          query: 'select name, path, download_url, content from spiceai.files limit 1;'
-
-      - name: Run test query (stargazers)
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        uses: ./.github/actions/run-query
-        with:
-          fail-on-error: true
-          query: 'select * from spiceai.stargazers limit 10;'
+      - name: Restore the source with new rows and check the results catch up
+        working-directory: test_app
+        run: |
+          printf 'id,v\n1,2\n2,2\n3,2\n' > orders.csv.new
+          mv orders.csv.new orders.csv
+          chmod 644 orders.csv
+          output=$(spice refresh orders 2>&1)
+          echo "$output"
+          # The refresh replaces the acceleration; cached results reflect it once they
+          # age past item_ttl (5s).
+          sql="SELECT CAST(SUM(v) AS BIGINT) AS s, COUNT(*) AS n FROM orders"
+          deadline=$((SECONDS + 45))
+          until response=$(curl -sS -i --max-time 5 -XPOST "127.0.0.1:8090/v1/sql" --data "$sql") && echo "$response" | grep -q '"s":6,"n":3'; do
+            if (( SECONDS >= deadline )); then
+              echo "$response"
+              grep -E "dataset orders" spice.log || true
+              echo "::error::Results for orders did not reflect the restored source within 45s." >&2
+              exit 1
+            fi
+            sleep 1
+          done
+          echo "$response"
 
       - name: Stop spice and check logs
         if: always()
@@ -1810,9 +2125,154 @@ jobs:
         with:
           working-directory: test_app
 
-  mssql_connector_quickstart:
-    name: 'Test MS SQL connector on ${{ matrix.target.name }}'
+  gh_connector_quickstart:
+    environment: secret-free
+    name: 'Test GitHub connector on ${{ matrix.target.name }}'
     runs-on: ${{ matrix.target.runner }}
+    needs:
+      - build
+      - setup-matrix
+    timeout-minutes: 15
+    permissions:
+      # Required by GitHub's GraphQL stargazers read query; match integration.
+      # Reproduction: https://github.com/spiceai/spiceai/actions/runs/34186688336
+      contents: write
+    concurrency:
+      group: github-connector-live-api
+      queue: max
+
+    strategy:
+      matrix:
+        target: ${{ fromJson(needs.setup-matrix.outputs.matrix) }}
+        # run only on "Linux x64"
+        exclude:
+          - target:
+              target_os: 'darwin'
+
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Verify GitHub API permissions
+        timeout-minutes: 2
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: python3 test/github/check_permissions.py --artifacts github-api-results
+
+      - name: download artifacts - build_${{ matrix.target.target_os }}_${{ matrix.target.target_arch }}
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
+        with:
+          name: build_${{ matrix.target.target_os }}_${{ matrix.target.target_arch }}
+          path: ./build
+
+      - name: Install spice
+        uses: ./.github/actions/install-spice
+        with:
+          build-path: ./build
+
+      - name: Test GitHub against a local API fixture
+        run: |
+          python3 test/github/test_connector.py --spiced "$(command -v spiced)" \
+            --artifacts github-fixture-results --repeat 3
+
+      - name: Configure live GitHub smoke test
+        run: |
+          mkdir -p test_app
+          cp test/github/github-arrow-smoke.yaml test_app/spicepod.yaml
+
+      - name: Allocate runtime ports
+        uses: ./.github/actions/allocate-spice-ports
+
+      - name: Start spice runtime
+        working-directory: test_app
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          spice run --http-endpoint "${SPICE_HTTP_ENDPOINT}" --flight-endpoint "${SPICE_FLIGHT_ENDPOINT}" &> spice.log &
+
+      - name: Wait for all accelerated datasets
+        uses: ./.github/actions/wait-for-spice-ready
+        with:
+          working-directory: test_app
+          url: ${{ env.SPICE_HTTP_ENDPOINT }}/v1/ready
+          timeout: '240'
+
+      - name: Verify live GitHub rows and file content
+        run: |
+          python3 test/github/check_live.py --endpoint "${SPICE_HTTP_ENDPOINT}" \
+            --artifacts github-live-results
+
+      # Pull request and merge-queue checks keep no diagnostic artifacts.
+      - name: Upload GitHub test evidence
+        if: always() && github.event_name != 'pull_request' && github.event_name != 'merge_group'
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
+        with:
+          name: github-connector-results-${{ matrix.target.target_os }}-${{ matrix.target.target_arch }}
+          path: |
+            github-api-results/
+            github-fixture-results/
+            github-live-results/
+            test_app/spice.log
+
+      - name: Stop spice and check logs
+        if: always()
+        uses: ./.github/actions/stop-spice
+        with:
+          working-directory: test_app
+
+  hf_connector_live:
+    environment: ci
+    name: 'Test Hugging Face connector against the live Hub'
+    # Reads pinned commits of public datasets through the Hub and compares every answer
+    # with one recorded from DuckDB's own `hf://` reader (test/huggingface/check_live.py).
+    if: github.event_name == 'merge_group' || github.event_name == 'workflow_dispatch'
+    runs-on: spiceai-dev-runners
+    needs:
+      - build
+    timeout-minutes: 20
+    concurrency:
+      group: huggingface-connector-live-hub
+      queue: max
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: download artifacts - build_linux_x86_64
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
+        with:
+          name: build_linux_x86_64
+          path: ./build
+
+      - name: Install spice
+        uses: ./.github/actions/install-spice
+        with:
+          build-path: ./build
+
+      # Anonymous Hub requests share a per-IP quota across the runner pool; the token,
+      # when the secret is available, gives this job its own.
+      - name: Query live Hugging Face datasets and compare the answers
+        env:
+          HF_TOKEN: ${{ secrets.SPICE_SECRET_HF_TOKEN }}
+        run: |
+          python3 test/huggingface/check_live.py --spiced "$(command -v spiced)" \
+            --artifacts hf-live-results
+
+      # Pull request and merge-queue checks keep no diagnostic artifacts.
+      - name: Upload Hugging Face test evidence
+        if: always() && github.event_name != 'pull_request' && github.event_name != 'merge_group'
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
+        with:
+          name: huggingface-connector-results
+          path: hf-live-results/
+
+  mssql_connector_quickstart:
+    environment: secret-free
+    name: 'Test MS SQL connector on ${{ matrix.target.name }}'
+    # The Microsoft apt list below is the Ubuntu 24.04 repository. ubuntu-latest
+    # moves on its own, so this Linux-only job stays on ubuntu-24.04.
+    runs-on: ubuntu-24.04
     needs:
       - build
       - setup-matrix
@@ -1838,12 +2298,17 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
+      - name: Configure apt mirrors
+        uses: ./.github/actions/configure-apt
+
       - name: Install mssql-tools
         run: |
-          curl https://packages.microsoft.com/keys/microsoft.asc | sudo tee /etc/apt/trusted.gpg.d/microsoft.asc
-          curl https://packages.microsoft.com/config/ubuntu/22.04/prod.list | sudo tee /etc/apt/sources.list.d/mssql-release.list
+          # Ubuntu 24.04 prod.list pins signed-by to this keyring path.
+          curl -fsSL https://packages.microsoft.com/keys/microsoft.asc | gpg --dearmor | sudo tee /usr/share/keyrings/microsoft-prod.gpg >/dev/null
+          sudo chmod 644 /usr/share/keyrings/microsoft-prod.gpg
+          curl -fsSL https://packages.microsoft.com/config/ubuntu/24.04/prod.list | sudo tee /etc/apt/sources.list.d/mssql-release.list
           sudo apt-get update
-          sudo apt-get install -y mssql-tools18 unixodbc-dev
+          sudo ACCEPT_EULA=Y apt-get install -y mssql-tools18 unixodbc-dev
           # echo 'export PATH="$PATH:/opt/mssql-tools18/bin"' >> ~/.bashrc
           # source ~/.bashrc
 
@@ -1852,7 +2317,7 @@ jobs:
           /opt/mssql-tools18/bin/sqlcmd -S localhost -U sa -P 1StrongPwd!! -C -i ./test/scripts/setup-data-mssql.sql
 
       - name: download artifacts - build_${{ matrix.target.target_os }}_${{ matrix.target.target_arch }}
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
         with:
           name: build_${{ matrix.target.target_os }}_${{ matrix.target.target_arch }}
           path: ./build
@@ -1928,6 +2393,10 @@ jobs:
       - build
       - setup-matrix
     timeout-minutes: 5
+    environment: ci
+    permissions:
+      contents: read
+      id-token: write
 
     strategy:
       matrix:
@@ -1937,7 +2406,7 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: download artifacts - build_${{ matrix.target.target_os }}_${{ matrix.target.target_arch }}
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
         with:
           name: build_${{ matrix.target.target_os }}_${{ matrix.target.target_arch }}
           path: ./build
@@ -1965,19 +2434,34 @@ jobs:
           echo "      mode: delta_lake" >> spicepod.yaml
           echo "      databricks_aws_access_key_id: \${ secrets:AWS_DATABRICKS_DELTA_ACCESS_KEY_ID }" >> spicepod.yaml
           echo "      databricks_aws_secret_access_key: \${ secrets:AWS_DATABRICKS_DELTA_SECRET_ACCESS_KEY }" >> spicepod.yaml
+          echo "      databricks_aws_session_token: \${ secrets:AWS_DATABRICKS_DELTA_SESSION_TOKEN }" >> spicepod.yaml
+          echo "      databricks_aws_region: us-west-2" >> spicepod.yaml
           echo "      databricks_endpoint: \${ secrets:DATABRICKS_ENDPOINT }" >> spicepod.yaml
-          echo "      databricks_token: \${ secrets:DATABRICKS_TOKEN }" >> spicepod.yaml
+          echo "      databricks_client_id: \${ secrets:DATABRICKS_OIDC_CLIENT_ID }" >> spicepod.yaml
+          echo "      databricks_token_audience: \${ secrets:DATABRICKS_OIDC_AUDIENCE }" >> spicepod.yaml
 
           cat spicepod.yaml
+
+      - name: Assume the Databricks Delta role
+        id: aws-databricks-delta-new
+        uses: aws-actions/configure-aws-credentials@e1253824e5c10ff9df46874f81ed3ec929e19cfd # v6.3.0
+        with:
+          role-to-assume: ${{ secrets.NEW_AWS_DATABRICKS_DELTA_ROLE_ARN }}
+          role-session-name: gha-databricks-delta-${{ github.run_id }}
+          aws-region: us-east-1
+          output-env-credentials: false
+          output-credentials: true
 
       - name: Start spice runtime
         working-directory: test_app
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          AWS_DATABRICKS_DELTA_ACCESS_KEY_ID: ${{ secrets.AWS_DATABRICKS_DELTA_ACCESS_KEY_ID }}
-          AWS_DATABRICKS_DELTA_SECRET_ACCESS_KEY: ${{ secrets.AWS_DATABRICKS_DELTA_SECRET_ACCESS_KEY }}
-          DATABRICKS_ENDPOINT: ${{ vars.DATABRICKS_ENDPOINT }}
-          DATABRICKS_TOKEN: ${{ secrets.DATABRICKS_TOKEN }}
+          AWS_DATABRICKS_DELTA_ACCESS_KEY_ID: ${{ steps.aws-databricks-delta-new.outputs.aws-access-key-id }}
+          AWS_DATABRICKS_DELTA_SECRET_ACCESS_KEY: ${{ steps.aws-databricks-delta-new.outputs.aws-secret-access-key }}
+          AWS_DATABRICKS_DELTA_SESSION_TOKEN: ${{ steps.aws-databricks-delta-new.outputs.aws-session-token }}
+          DATABRICKS_ENDPOINT: ${{ vars.NEW_DATABRICKS_HOST }}
+          DATABRICKS_OIDC_CLIENT_ID: ${{ vars.DATABRICKS_OIDC_CLIENT_ID }}
+          DATABRICKS_OIDC_AUDIENCE: ${{ vars.DATABRICKS_OIDC_AUDIENCE }}
         run: |
           spice run &> spice.log &
           # time to initialize added datasets
@@ -2012,6 +2496,7 @@ jobs:
           working-directory: test_app
 
   graceful_shutdown_test_append:
+    environment: secret-free
     name: '${{ matrix.spicepod }} acceleration and graceful shutdown on ${{ matrix.target.name }}'
     runs-on: ${{ matrix.target.runner }}
     needs:
@@ -2022,17 +2507,19 @@ jobs:
     # `simulate_append_data.sh` rewrites `.spice/service_data.parquet` every 3s; a
     # refresh tick that races the rename observes a half-published file and the
     # runtime logs a WARN before retrying on the next tick. DuckDB surfaces the
-    # truncated read as one of two errors depending on which part of the file it
-    # reaches first: "TProtocolException: Invalid data" (corrupt Thrift footer) or
-    # "don't know what type: <token>", where the token is whatever bytes happen to
-    # sit where the schema element's type has not been written yet — empty, or an
-    # arbitrary byte such as 0x0e (see run 30534651210). Both log checks in this job
-    # tolerate both variants of that specific transient.
+    # truncated read as one of three errors depending on which part of the file it
+    # reaches first: "TProtocolException: Invalid data" (corrupt Thrift footer), or
+    # "don't know what type: <token>" / "invalid TType", where the deserializer
+    # reads whatever bytes happen to sit where the schema element's type has not
+    # been written yet — empty, an arbitrary byte such as 0x0e (see run
+    # 30534651210), or a byte that is no TType at all (see run 36496497190). Both
+    # log checks in this job tolerate all three variants of that specific transient.
     env:
       PARQUET_RENAME_RACE_ALLOW: |
-        WARN +runtime::accelerated_table::refresh_task: Failed to load data for dataset
+        WARN +runtime_table::accelerated::refresh_task: Failed to load data for dataset
         ^Invalid Error: TProtocolException: Invalid data$
         ^Invalid Error: don't know what type:
+        ^Invalid Error: invalid TType$
 
     strategy:
       fail-fast: false
@@ -2040,9 +2527,9 @@ jobs:
         target: ${{ fromJson(needs.setup-matrix.outputs.matrix) }}
         spicepod:
           [
-            duckdb_append_with_pk_and_indexes.yaml,
-            duckdb_append_with_pk.yaml,
-            duckdb_append_with_indexes.yaml,
+            cayenne_append_with_pk_and_indexes.yaml,
+            cayenne_append_with_pk.yaml,
+            cayenne_append_with_indexes.yaml,
           ]
         # run only on "Linux x64"
         exclude:
@@ -2053,10 +2540,14 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: download artifacts - build_${{ matrix.target.target_os }}_${{ matrix.target.target_arch }}
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
         with:
           name: build_${{ matrix.target.target_os }}_${{ matrix.target.target_arch }}
           path: ./build
+
+      # duckdb: datasets load the DuckDB library installed on the host.
+      - name: Set up libduckdb
+        uses: ./.github/actions/setup-libduckdb
 
       - name: Install spice
         uses: ./.github/actions/install-spice
@@ -2069,7 +2560,12 @@ jobs:
 
       - name: Install DuckDB CLI
         run: |
-          curl -fsSL "https://github.com/duckdb/duckdb/releases/download/v0.10.2/duckdb_cli-linux-amd64.zip" -o duckdb_cli.zip
+          # GitHub release downloads answer 504 in bursts longer than a fixed 5s x 5
+          # retry outlasts. With no --retry-delay, curl waits 1s and doubles each time,
+          # so 8 retries span about 4 minutes; --retry-max-time 300 bounds that.
+          # Every GitHub release download in this file's own steps uses these flags;
+          # composite actions such as install-protoc keep their own.
+          curl -fsSL --retry 8 --retry-all-errors --retry-max-time 300 "https://github.com/duckdb/duckdb/releases/download/v0.10.2/duckdb_cli-linux-amd64.zip" -o duckdb_cli.zip
           echo "b5bad3ec8bf689885f8270ebd8e0f507e4f671f37dabf6127c09b19960389f96  duckdb_cli.zip" | sha256sum -c
           unzip duckdb_cli.zip
           chmod +x ./duckdb
@@ -2084,7 +2580,11 @@ jobs:
         if: matrix.target.target_os == 'linux'
         working-directory: ./test/spicepods/tpch/sf1/accelerated/constraints
         run: |
-          wget -O oha https://github.com/hatoo/oha/releases/latest/download/oha-linux-amd64
+          # Pinned and checksummed like the DuckDB CLI above; the retry covers only the
+          # download, so a transient release-CDN 5xx or TLS error cannot fail the job.
+          curl --fail --silent --show-error --location --retry 8 --retry-all-errors --retry-max-time 300 \
+            -o oha "https://github.com/hatoo/oha/releases/download/v1.16.0/oha-linux-amd64"
+          echo "620bb9e16fb53eabc9a3fc45f88bdb41fefa3fee5c05e75892011ce320391716  oha" | sha256sum -c
           chmod +x ./oha
           ./oha --version
 
@@ -2180,25 +2680,34 @@ jobs:
           # Allow filesystem to sync after process exits
           sleep 2
 
-      - name: Verify local DuckDB database
+      - name: Verify the Cayenne acceleration was persisted
         working-directory: ./test/spicepods/tpch/sf1/accelerated/constraints
         run: |
-          ls -la .spice/data
+          ls -laR .spice/data
 
-          if [ -f .spice/data/accelerated_duckdb.db ]; then
-            echo "Verification successful: accelerated_duckdb.db exists."
+          # A file-mode Cayenne acceleration keeps its metastore in
+          # .spice/data/metadata/cayenne.db and a directory per dataset. Small
+          # tables can live entirely in the metastore, so the dataset directories
+          # may hold no data files. A SQLite -wal file left beside the metastore is
+          # replayed when it is next opened, so it is not checked here; the restart
+          # below checks that every dataset loads again.
+          if [ -f .spice/data/metadata/cayenne.db ]; then
+            echo "Verification successful: the Cayenne metastore exists."
           else
-            echo "Verification failed: accelerated_duckdb.db does not exist."
+            echo "Verification failed: .spice/data/metadata/cayenne.db does not exist."
             exit 1
           fi
 
-          if [ ! -f .spice/data/accelerated_duckdb.db.wal ]; then
-            echo "Verification successful: accelerated_duckdb.db.wal does not exist."
-          else
-            echo "Verification failed: accelerated_duckdb.db.wal exists."
-            ls -la .spice/data/accelerated_duckdb.db.wal
-            exit 1
-          fi
+          missing=0
+          for dataset in $(grep -E '^    name:' spicepod.yaml | awk '{print $2}'); do
+            if [ -d ".spice/data/$dataset" ]; then
+              echo "Verification successful: .spice/data/$dataset exists."
+            else
+              echo "Verification failed: .spice/data/$dataset does not exist."
+              missing=1
+            fi
+          done
+          exit "$missing"
 
       - name: Stop the append simulator
         if: always()
@@ -2242,6 +2751,7 @@ jobs:
           allow: ${{ env.PARQUET_RENAME_RACE_ALLOW }}
 
   graceful_shutdown_test_full:
+    environment: secret-free
     name: '${{ matrix.spicepod }} acceleration and graceful shutdown on ${{ matrix.target.name }}'
     runs-on: ${{ matrix.target.runner }}
     needs:
@@ -2255,9 +2765,9 @@ jobs:
         target: ${{ fromJson(needs.setup-matrix.outputs.matrix) }}
         spicepod:
           [
-            duckdb_full_with_pk_and_indexes.yaml,
-            duckdb_full_with_pk.yaml,
-            duckdb_full_with_indexes.yaml,
+            cayenne_full_with_pk_and_indexes.yaml,
+            cayenne_full_with_pk.yaml,
+            cayenne_full_with_indexes.yaml,
           ]
         # run only on "Linux x64"
         exclude:
@@ -2268,10 +2778,14 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: download artifacts - build_${{ matrix.target.target_os }}_${{ matrix.target.target_arch }}
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
         with:
           name: build_${{ matrix.target.target_os }}_${{ matrix.target.target_arch }}
           path: ./build
+
+      # duckdb: datasets load the DuckDB library installed on the host.
+      - name: Set up libduckdb
+        uses: ./.github/actions/setup-libduckdb
 
       - name: Install spice
         uses: ./.github/actions/install-spice
@@ -2291,7 +2805,11 @@ jobs:
         if: matrix.target.target_os == 'linux'
         working-directory: ./test/spicepods/tpch/sf1/accelerated/constraints
         run: |
-          wget -O oha https://github.com/hatoo/oha/releases/latest/download/oha-linux-amd64
+          # Pinned and checksummed like the DuckDB CLI above; the retry covers only the
+          # download, so a transient release-CDN 5xx or TLS error cannot fail the job.
+          curl --fail --silent --show-error --location --retry 8 --retry-all-errors --retry-max-time 300 \
+            -o oha "https://github.com/hatoo/oha/releases/download/v1.16.0/oha-linux-amd64"
+          echo "620bb9e16fb53eabc9a3fc45f88bdb41fefa3fee5c05e75892011ce320391716  oha" | sha256sum -c
           chmod +x ./oha
           ./oha --version
 
@@ -2337,25 +2855,34 @@ jobs:
           SPICE_STOP_GRACE=600 bash "$GITHUB_WORKSPACE/.github/actions/stop-spice/stop_spice.sh"
           sleep 2
 
-      - name: Verify local DuckDB database
+      - name: Verify the Cayenne acceleration was persisted
         working-directory: ./test/spicepods/tpch/sf1/accelerated/constraints
         run: |
-          ls -la .spice/data
+          ls -laR .spice/data
 
-          if [ -f .spice/data/accelerated_duckdb.db ]; then
-            echo "Verification successful: accelerated_duckdb.db exists."
+          # A file-mode Cayenne acceleration keeps its metastore in
+          # .spice/data/metadata/cayenne.db and a directory per dataset. Small
+          # tables can live entirely in the metastore, so the dataset directories
+          # may hold no data files. A SQLite -wal file left beside the metastore is
+          # replayed when it is next opened, so it is not checked here; the restart
+          # below checks that every dataset loads again.
+          if [ -f .spice/data/metadata/cayenne.db ]; then
+            echo "Verification successful: the Cayenne metastore exists."
           else
-            echo "Verification failed: accelerated_duckdb.db does not exist."
+            echo "Verification failed: .spice/data/metadata/cayenne.db does not exist."
             exit 1
           fi
 
-          if [ ! -f .spice/data/accelerated_duckdb.db.wal ]; then
-            echo "Verification successful: accelerated_duckdb.db.wal does not exist."
-          else
-            echo "Verification failed: accelerated_duckdb.db.wal exists."
-            ls -la .spice/data/accelerated_duckdb.db.wal
-            exit 1
-          fi
+          missing=0
+          for dataset in $(grep -E '^    name:' spicepod.yaml | awk '{print $2}'); do
+            if [ -d ".spice/data/$dataset" ]; then
+              echo "Verification successful: .spice/data/$dataset exists."
+            else
+              echo "Verification failed: .spice/data/$dataset does not exist."
+              missing=1
+            fi
+          done
+          exit "$missing"
 
       - name: Check logs
         if: always()
@@ -2388,15 +2915,296 @@ jobs:
         with:
           working-directory: ./test/spicepods/tpch/sf1/accelerated/constraints
 
-  # Stable, matrix-proof summary check. On pull requests, the upstream jobs are
-  # skipped and this lightweight gate reports the required context. In the merge
-  # queue it succeeds only if every E2E job above succeeded (or was skipped), so
-  # the whole matrix is gated by one ruleset entry rather than dozens of shifting
-  # matrix names.
+  # The runner for the scenario scripts in test/spicescript. Built beside spiced
+  # rather than after it, so it adds nothing to the run's critical path.
+  build_spicescript:
+    environment: ci
+    name: Build spicescript
+    needs: check_changes
+    if: ${{ needs.check_changes.outputs.relevant_changes == 'true' }}
+    runs-on: spiceai-dev-runners
+    permissions:
+      contents: read
+      id-token: write  # RustFS credentials
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Get RustFS credentials
+        id: rustfs
+        uses: ./.github/actions/rustfs-credentials
+        with:
+          endpoint: ${{ vars.TEST_MINIO_ENDPOINT }}
+          duration-seconds: '1800'
+          export-env: 'false'
+
+      - name: Install MinIO
+        uses: ./.github/actions/setup-minio
+        with:
+          minio_endpoint: ${{ vars.TEST_MINIO_ENDPOINT }}
+          minio_access_key: ${{ steps.rustfs.outputs.access-key-id }}
+          minio_secret_key: ${{ steps.rustfs.outputs.secret-access-key }}
+          minio_session_token: ${{ steps.rustfs.outputs.session-token }}
+
+      - name: Check documented SQL cases
+        run: |
+          python3 -m unittest discover -s test/spicescript/corpus -p test_sql_surface.py
+          python3 test/spicescript/corpus/sql_surface.py --check
+
+      - name: Build spicescript
+        uses: ./.github/actions/build-tool
+        with:
+          package: spicescript
+
+  # Runs the scenario scripts against this run's spiced and spice CLI.
+  test_spicescript:
+    name: ${{ matrix.name }}
+    needs: [build, build_spicescript]
+    runs-on: spiceai-dev-runners
+    environment: ci
+    permissions:
+      contents: read
+      id-token: write  # RustFS credentials, and the tokens of the live scripts
+    timeout-minutes: 60
+    env:
+      HAS_OPENAI_WIF: ${{ secrets.OPENAI_IDENTITY_PROVIDER_ID != '' }}
+      HAS_ANTHROPIC_WIF: ${{ secrets.ANTHROPIC_FEDERATION_RULE_ID != '' }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # Scripts that pass: any failure fails the job. Each shard runs
+          # its share of the scripts (--partition), balanced by their
+          # recorded durations.
+          - { name: 'spicescript: scripts (1/4)', partition: 1/4, args: test/spicescript }
+          - { name: 'spicescript: scripts (2/4)', partition: 2/4, args: test/spicescript }
+          - { name: 'spicescript: scripts (3/4)', partition: 3/4, args: test/spicescript }
+          - { name: 'spicescript: scripts (4/4)', partition: 4/4, args: test/spicescript }
+          # Scripts that reproduce open bugs: each must fail exactly as its
+          # group's recordings/expected-failures.json says, so a fix or a
+          # change in how a bug shows also fails the job.
+          - { name: 'spicescript: known failing (1/2)', partition: 1/2, args: --max-wait 30s test/spicescript/known-failing }
+          - { name: 'spicescript: known failing (2/2)', partition: 2/2, args: --max-wait 30s test/spicescript/known-failing }
+          # The shards above read DuckDB and DuckLake sources with the newest
+          # release test/duckdb_versions.json lists; this one runs the scripts
+          # with DuckDB sources again on each older listed release.
+          - { name: 'spicescript: older DuckDB releases', partition: 1/1, older_duckdb: true }
+          # test/spicescript/live: real providers through static credential params, with
+          # tokens minted from this job's GitHub OIDC token just before the run.
+          - { name: 'spicescript: live', live: true }
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: download artifacts - build_linux_x86_64
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
+        with:
+          name: build_linux_x86_64
+          path: ./build
+
+      - name: Install spice
+        uses: ./.github/actions/install-spice
+        with:
+          build-path: ./build
+
+      - name: Get RustFS credentials
+        id: rustfs
+        uses: ./.github/actions/rustfs-credentials
+        with:
+          endpoint: ${{ vars.TEST_MINIO_ENDPOINT }}
+          duration-seconds: '3600'
+          export-env: 'false'
+
+      - name: Install MinIO
+        uses: ./.github/actions/setup-minio
+        with:
+          minio_endpoint: ${{ vars.TEST_MINIO_ENDPOINT }}
+          minio_access_key: ${{ steps.rustfs.outputs.access-key-id }}
+          minio_secret_key: ${{ steps.rustfs.outputs.secret-access-key }}
+          minio_session_token: ${{ steps.rustfs.outputs.session-token }}
+
+      - name: Download spicescript
+        id: spicescript
+        uses: ./.github/actions/build-tool
+        with:
+          package: spicescript
+
+      # Sources run in containers; log in so image pulls are not rate limited. Scripts pull
+      # images as they start, so the login has to last the whole job.
+      - name: Login to DockerHub
+        if: github.repository == 'spiceai/spiceai'
+        uses: docker/login-action@8aa5831fb8d48d8f76594c7ddde61ae58019f550 # v4.8.0
+        env:
+          DOCKERHUB_OIDC_CONNECTIONID: ${{ vars.DOCKERHUB_OIDC_CONNECTIONID }}
+          DOCKERHUB_OIDC_EXPIREIN: '21600'
+        with:
+          username: ${{ vars.DOCKERHUB_ORGANIZATION }}
+
+      # Object-store sources (rustfs) are managed with the aws CLI.
+      - name: Install the AWS CLI
+        run: |
+          command -v unzip >/dev/null || { sudo apt-get update && sudo apt-get install -y unzip; }
+          if ! command -v aws >/dev/null; then
+            curl -fsSL -o "$RUNNER_TEMP/awscliv2.zip" https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip
+            unzip -q "$RUNNER_TEMP/awscliv2.zip" -d "$RUNNER_TEMP"
+            sudo "$RUNNER_TEMP/aws/install"
+          fi
+
+      # Iceberg sources and dbgen write and read through the DuckDB CLI. The
+      # DuckLake source fetches the release matching spiced's embedded DuckDB.
+      - name: Install DuckDB CLI
+        run: |
+          curl -fsSL --retry 8 --retry-all-errors --retry-max-time 300 -o "$RUNNER_TEMP/duckdb.zip" \
+            https://github.com/duckdb/duckdb/releases/download/v1.5.5/duckdb_cli-linux-amd64.zip
+          unzip -o "$RUNNER_TEMP/duckdb.zip" -d "$RUNNER_TEMP/duckdb"
+          echo "$RUNNER_TEMP/duckdb" >> "$GITHUB_PATH"
+
+      # The search and embedding scripts download a Hub model at startup. Without
+      # a token they share the pool's anonymous per-IP quota, and a rate limit fails
+      # every one of them at once as "model 'potion' … failed to load".
+      - name: Authenticate the Hugging Face cache
+        uses: ./.github/actions/hf-cache-auth
+        with:
+          token: ${{ secrets.SPICE_SECRET_HF_TOKEN }}
+
+      - name: Check harness rejects incorrect answers
+        if: ${{ matrix.partition == '1/4' }}
+        run: |
+          python3 test/spicescript/check_harness.py \
+            --runner "${{ steps.spicescript.outputs.path }}" \
+            --spiced "$(command -v spiced)" \
+            --work-dir "$RUNNER_TEMP/spicescript/harness-checks"
+
+      # Upgrade scripts start on the release their `from:` names and upgrade
+      # to this build: spicescript resolves `X.Y.x` against the GitHub releases
+      # and downloads each release it needs into ~/.cache/spicescript, so no
+      # `--from` is passed here. The token is for the releases API's rate limit.
+      - name: Run scenario scripts
+        if: ${{ !matrix.older_duckdb && !matrix.live }}
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          "${{ steps.spicescript.outputs.path }}" --jobs 4 \
+            --partition ${{ matrix.partition }} \
+            --spiced "$(command -v spiced)" \
+            --spice-cli "$(command -v spice)" \
+            --work-dir "$RUNNER_TEMP/spicescript" \
+            --results "$RUNNER_TEMP/spicescript-results.json" \
+            --log-capture "$RUNNER_TEMP/spicescript-logs" \
+            ${{ matrix.args }}
+
+      # Each minted token expires about 5 minutes later, so all are minted right before the
+      # one run, which runs the scripts side by side.
+      - name: Mint an OpenAI access token
+        if: ${{ matrix.live && env.HAS_OPENAI_WIF == 'true' }}
+        uses: ./.github/actions/openai-token
+        with:
+          identity-provider-id: ${{ secrets.OPENAI_IDENTITY_PROVIDER_ID }}
+          service-account-id: ${{ secrets.OPENAI_SERVICE_ACCOUNT_ID }}
+          audience: ${{ secrets.OPENAI_WIF_AUDIENCE }}
+
+      - name: Mint an Anthropic access token
+        if: ${{ matrix.live && env.HAS_ANTHROPIC_WIF == 'true' }}
+        uses: ./.github/actions/anthropic-token
+        with:
+          federation-rule-id: ${{ secrets.ANTHROPIC_FEDERATION_RULE_ID }}
+          organization-id: ${{ secrets.ANTHROPIC_ORGANIZATION_ID }}
+          service-account-id: ${{ secrets.ANTHROPIC_SERVICE_ACCOUNT_ID }}
+          workspace-id: ${{ secrets.ANTHROPIC_WORKSPACE_ID }}
+
+      - name: Assume the Databricks Delta role
+        id: aws-databricks-delta
+        if: ${{ matrix.live }}
+        uses: aws-actions/configure-aws-credentials@e1253824e5c10ff9df46874f81ed3ec929e19cfd # v6.3.0
+        with:
+          role-to-assume: ${{ secrets.NEW_AWS_DATABRICKS_DELTA_ROLE_ARN }}
+          role-session-name: gha-databricks-delta-${{ github.run_id }}
+          aws-region: us-east-1
+          output-env-credentials: false
+          output-credentials: true
+
+      - name: Run live scripts
+        if: ${{ !cancelled() && matrix.live }}
+        env:
+          DATABRICKS_HOST: ${{ vars.NEW_DATABRICKS_HOST }}
+          DATABRICKS_OIDC_CLIENT_ID: ${{ vars.DATABRICKS_OIDC_CLIENT_ID }}
+          DATABRICKS_OIDC_AUDIENCE: ${{ vars.DATABRICKS_OIDC_AUDIENCE }}
+          AWS_DATABRICKS_DELTA_ACCESS_KEY_ID: ${{ steps.aws-databricks-delta.outputs.aws-access-key-id }}
+          AWS_DATABRICKS_DELTA_SECRET_ACCESS_KEY: ${{ steps.aws-databricks-delta.outputs.aws-secret-access-key }}
+          AWS_DATABRICKS_DELTA_SESSION_TOKEN: ${{ steps.aws-databricks-delta.outputs.aws-session-token }}
+        run: |
+          DATABRICKS_TOKEN="$(bash .github/scripts/databricks_oidc_token.sh)"
+          export DATABRICKS_TOKEN
+          "${{ steps.spicescript.outputs.path }}" --jobs 3 \
+            --spiced "$(command -v spiced)" \
+            --work-dir "$RUNNER_TEMP/spicescript" \
+            --results "$RUNNER_TEMP/spicescript-results.json" \
+            --log-capture "$RUNNER_TEMP/spicescript-logs" \
+            test/spicescript/live
+
+      # The combinations whose source is DuckDB or DuckLake (matrix keys
+      # backend, src and source), then the DuckDB and DuckLake scripts without
+      # such a key, on each older listed release.
+      - name: Run DuckDB scripts on older DuckDB releases
+        if: ${{ matrix.older_duckdb }}
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          status=0
+          for version in $(jq -r '.versions[:-1][].version' test/duckdb_versions.json); do
+            for args in "--matrix backend=duckdb test/spicescript" \
+              "--matrix src=duckdb test/spicescript" \
+              "--matrix source=duckdb test/spicescript" \
+              "--matrix backend=ducklake test/spicescript" \
+              "--matrix src=ducklake test/spicescript" \
+              "--matrix source=ducklake test/spicescript" \
+              "test/spicescript/adbc-duckdb-catalog.yaml test/spicescript/ducklake-coverage.yaml test/spicescript/ducklake-refresh.yaml"; do
+              # shellcheck disable=SC2086 # args holds several words
+              "${{ steps.spicescript.outputs.path }}" --jobs 4 \
+                --duckdb-version "$version" \
+                --spiced "$(command -v spiced)" \
+                --spice-cli "$(command -v spice)" \
+                --work-dir "$RUNNER_TEMP/spicescript" \
+                --results "$RUNNER_TEMP/spicescript-results-duckdb-$version-$((++run)).json" \
+                --log-capture "$RUNNER_TEMP/spicescript-logs" \
+                $args || status=1
+            done
+          done
+          exit $status
+
+      # Every script's outcome, passes included, from every run: a script's
+      # failure rate across runs is read off these rather than off job logs.
+      - name: Upload script results
+        if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
+        with:
+          name: spicescript-results-${{ strategy.job-index }}
+          path: ${{ runner.temp }}/spicescript-results*.json
+          if-no-files-found: warn
+          retention-days: 30
+
+      # A directory per script with a failure: the script, what the run
+      # printed for it, its source containers' output and its instances' logs.
+      - name: Upload captured logs
+        if: failure()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
+        with:
+          name: spicescript-logs-${{ strategy.job-index }}
+          path: |
+            ${{ runner.temp }}/spicescript-logs
+            ${{ runner.temp }}/spicescript/harness-checks/*.log
+          if-no-files-found: warn
+          retention-days: 7
+
+  # Stable, matrix-proof summary check. It succeeds only if every E2E job above
+  # succeeded (or was skipped), so the whole matrix is gated by one ruleset entry
+  # rather than dozens of shifting matrix names. On a pull request it is skipped
+  # along with every job it summarises, so the required check reads `skipped`,
+  # not a `success` nothing ran for (#13841).
   e2e-gate:
+    environment: secret-free
     name: E2E Test CI
     runs-on: ubuntu-latest
-    if: ${{ !cancelled() }}
+    if: ${{ !cancelled() && github.event_name != 'pull_request' }}
     # The gate only reads the results it already has. Bounding it matters because it is
     # the required check: a stuck gate blocks the queue even when every job it summarises
     # has finished.
@@ -2406,6 +3214,7 @@ jobs:
       - setup-matrix
       - build
       - setup-model-matrix
+      - test-bigquery
       - test_openai_model
       - test_hf_model
       - test_quickstart_dremio
@@ -2417,11 +3226,18 @@ jobs:
       - test_quickstart_duckdb
       - test_local_acceleration
       - test_results_caching
+      - test_results_caching_source_down
       - gh_connector_quickstart
+      - hf_connector_live
       - mssql_connector_quickstart
       - databricks_delta_catalog_connector_quickstart
       - graceful_shutdown_test_append
       - graceful_shutdown_test_full
+      - test_cold_start_unkeyed_append
+      - build_spicescript
+      # test_spicescript reports but does not gate merges while the scenario
+      # scripts settle on the CI runners: a run that fails there names the
+      # failing scripts in its own job.
     steps:
       - name: Verify all E2E jobs succeeded
         # Named rather than left to the runner default: this gate is the required

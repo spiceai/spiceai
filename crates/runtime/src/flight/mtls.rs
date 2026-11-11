@@ -49,7 +49,6 @@ limitations under the License.
 
 use std::{
     future::Future,
-    net::SocketAddr,
     pin::Pin,
     sync::Arc,
     task::{Context, Poll},
@@ -59,7 +58,7 @@ use runtime_auth::{
     AuthRequestContext, IdentitySource,
     mtls::{channel_identity_from_cert, principal_from_cert},
 };
-use tonic::transport::server::TlsConnectInfo;
+use tonic::transport::server::{TcpConnectInfo, TlsConnectInfo};
 use tower::{Layer, Service};
 
 #[derive(Clone)]
@@ -112,15 +111,16 @@ where
 
         // Pull the verified peer cert chain out of the per-connection
         // `TlsConnectInfo` extension that `tonic` populates when the
-        // `tls-connect-info` feature is enabled. `Option<SocketAddr>`
-        // is the inner connect-info shape for our `tls::incoming`
-        // adaptor (TcpStream-backed). The returned `Arc<Vec<...>>` is
-        // the per-connection chain that tonic re-clones into every
-        // request, so cloning it is a refcount bump — but parsing the
-        // leaf still happens per-request (see module docs).
+        // `tls-connect-info` feature is enabled. The type parameter must be
+        // the connect info of the stream `runtime_tls::flight_incoming`
+        // yields — `TlsStream<TcpStream>`, so `TcpConnectInfo` — or the
+        // lookup finds nothing and no certificate identity is applied. The
+        // returned `Arc<Vec<...>>` is the per-connection chain that tonic
+        // re-clones into every request, so cloning it is a refcount bump —
+        // but parsing the leaf still happens per-request (see module docs).
         let chain_arc = req
             .extensions()
-            .get::<TlsConnectInfo<SocketAddr>>()
+            .get::<TlsConnectInfo<TcpConnectInfo>>()
             .and_then(TlsConnectInfo::peer_certs);
 
         if let Some(chain) = chain_arc.as_deref()

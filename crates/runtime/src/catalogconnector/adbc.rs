@@ -19,6 +19,7 @@ limitations under the License.
 //! Connects to a database via ADBC (Arrow Database Connectivity)
 //! and provides schema/table discovery using the ADBC metadata API.
 
+use super::federation::{QUERY_FEDERATION_PARAMETER, is_query_federation_enabled};
 use super::{CatalogConnector, ConnectorComponent, ParameterSpec};
 use crate::{
     Runtime,
@@ -31,18 +32,25 @@ use adbc_driver_manager::{ManagedDatabase, ManagedDriver};
 use async_trait::async_trait;
 use data_components::RefreshableCatalogProvider;
 use data_components::adbc_helpers::{
-    build_db_options, dialect_for_driver, enrich_with_bigquery_metadata,
+    DUCKDB_DRIVER, build_db_options, connection_secrets, dialect_for_driver, driver_entrypoint,
+    enrich_with_bigquery_metadata, scrub_connection_secrets,
 };
 use data_components::catalog_filter::TableSelector;
 use datafusion::catalog::{CatalogProvider, SchemaProvider};
+use datafusion::common::TableReference;
 use datafusion::datasource::TableProvider;
 use datafusion::error::Result as DFResult;
-use datafusion::sql::TableReference;
+use datafusion::sql::unparser::dialect::Dialect;
 use datafusion_table_providers::adbc::AdbcTableFactory;
 use datafusion_table_providers::sql::db_connection_pool::adbcpool::{
     ADBCPool, AdbcConnectionPoolBuilder,
 };
 use futures::stream::{self, StreamExt};
+use runtime_datafusion::dialect::new_duckdb_dialect;
+use runtime_datafusion::function_support::{
+    deny_spice_functions_for_duckdb_table_providers, expression_support_for_engine,
+};
+use runtime_udfs_api::deny_spice_functions_for_table_providers;
 use snafu::prelude::*;
 use std::any::Any;
 use std::collections::HashMap;
@@ -74,6 +82,7 @@ pub const PARAMETERS: &[ParameterSpec] = &[
     ParameterSpec::runtime("connection_pool_min_idle")
         .description("The minimum number of idle connections to keep open in the pool.")
         .default("1"),
+    QUERY_FEDERATION_PARAMETER,
 ];
 
 #[derive(Debug, Snafu)]
@@ -95,22 +104,21 @@ pub enum Error {
         source: adbc_core::error::Error,
     },
 
-    #[snafu(display(
-        "Failed to create ADBC database (driver='{driver_location}', uri='{uri}'): {source}"
-    ))]
+    /// `message` is the driver's error with the connection's credentials
+    /// scrubbed; the raw error is not kept because drivers echo the URI.
+    #[snafu(display("Failed to create ADBC database (driver='{driver_location}'): {message}"))]
     UnableToCreateDatabase {
         driver_location: String,
-        uri: String,
-        source: adbc_core::error::Error,
+        message: String,
     },
 
+    /// `message` is the pool error with the connection's credentials scrubbed.
     #[snafu(display(
-        "Failed to create ADBC connection pool (driver='{driver_location}', uri='{uri}'): {source}"
+        "Failed to create ADBC connection pool (driver='{driver_location}'): {message}"
     ))]
     UnableToCreateConnectionPool {
         driver_location: String,
-        uri: String,
-        source: datafusion_table_providers::sql::db_connection_pool::Error,
+        message: String,
     },
 
     #[snafu(display(
@@ -164,6 +172,20 @@ impl CatalogConnector for AdbcCatalog {
     ) -> super::Result<Arc<dyn RefreshableCatalogProvider>> {
         let connector_component = ConnectorComponent::from(catalog);
 
+        // Validated before the driver is loaded, as the ADBC dataset connector
+        // does: an invalid value is a configuration error no retry fixes, and
+        // checking it after `create_pool` let an unloadable driver or an
+        // unreachable database report itself instead — a retryable error that
+        // hid the parameter the user has to change.
+        let federation_enabled =
+            is_query_federation_enabled(&self.params.parameters).map_err(|e| {
+                super::Error::InvalidConfigurationNoSource {
+                    connector: PREFIX.to_string(),
+                    connector_component: connector_component.clone(),
+                    message: e.to_string(),
+                }
+            })?;
+
         let (driver_name, pool) = create_pool(&self.params).await.map_err(|e| {
             super::Error::UnableToGetCatalogProvider {
                 connector: PREFIX.to_string(),
@@ -172,7 +194,8 @@ impl CatalogConnector for AdbcCatalog {
             }
         })?;
 
-        let table_factory = AdbcTableFactory::new(Arc::clone(&pool));
+        let table_factory =
+            build_table_factory(Arc::clone(&pool), federation_enabled, &driver_name);
 
         let provider = Arc::new(AdbcCatalogProvider::new(
             pool,
@@ -191,6 +214,76 @@ impl CatalogConnector for AdbcCatalog {
             })?;
 
         Ok(provider as Arc<dyn RefreshableCatalogProvider>)
+    }
+}
+
+/// Builds the [`AdbcTableFactory`] for a catalog, with the Spice function
+/// deny-list, driver-specific expression restrictions, and the
+/// `query_federation` setting applied.
+///
+/// A bare `AdbcTableFactory::new(pool)` federates unconditionally and installs
+/// no deny-list, so every Spice-only UDF — `json_get_str` and the rest of the
+/// JSON set, the embedding/distance UDFs, every user-registered function — is
+/// unparsed verbatim into the SQL sent to the remote database, which has no
+/// such function and answers with an unknown-function error. Installing the
+/// deny-list makes the table's `can_execute_plan` refuse those plans so
+/// `DataFusion` evaluates the affected expressions locally instead. The exact
+/// lowercase `bigquery` driver also rejects case-insensitive `LIKE`, which
+/// `GoogleSQL` cannot evaluate.
+///
+/// This mirrors the ADBC *dataset* connector's `build_table_factory`; see
+/// issues #10703 and #13664.
+///
+/// Public so `connector-adbc`'s regression tests can drive it: the in-process
+/// stub ADBC driver they need already lives there, and duplicating it here would
+/// cost more than the visibility does.
+///
+/// The `CancellableStatement` bound is what `ADBCPool` and `AdbcTableFactory`
+/// themselves require: an abandoned query is cancelled through the statement, so
+/// a driver whose statements cannot be cancelled cannot back either type.
+#[must_use]
+#[expect(
+    clippy::disallowed_methods,
+    reason = "installs `deny_spice_functions_for_table_providers()`, plus the engine's expression gate, with `with_function_support`"
+)]
+pub fn build_table_factory<D>(
+    pool: Arc<ADBCPool<D>>,
+    federation_enabled: bool,
+    driver_name: &str,
+) -> AdbcTableFactory<D>
+where
+    D: adbc_core::Database + Send + 'static,
+    D::ConnectionType: adbc_core::Connection + Send + Sync,
+    <D::ConnectionType as adbc_core::Connection>::StatementType:
+        datafusion_table_providers::sql::db_connection_pool::dbconnection::adbcconn::CancellableStatement,
+{
+    // The DuckDB dialect and policy must stay paired with
+    // `catalog_dialect_for_driver`, including its decimal avg gate (#14492).
+    let function_support = if driver_name == DUCKDB_DRIVER {
+        deny_spice_functions_for_duckdb_table_providers()
+    } else {
+        // Keep casts the engine evaluates differently from DataFusion local (#14482).
+        let support = deny_spice_functions_for_table_providers();
+        match expression_support_for_engine(driver_name) {
+            Some(gate) => runtime_udfs_api::and_expression_support(support, gate),
+            None => support,
+        }
+    };
+    AdbcTableFactory::new(pool)
+        .with_federation_enabled(federation_enabled)
+        .with_function_support(function_support)
+}
+
+/// Returns the dialect used for tables discovered through an ADBC catalog.
+///
+/// The `DuckDB` dialect and the policy in [`build_table_factory`] must stay paired.
+/// Other drivers retain the stock dialects from the shared ADBC helpers.
+#[must_use]
+pub fn catalog_dialect_for_driver(driver_name: &str) -> Option<Arc<dyn Dialect + Send + Sync>> {
+    if driver_name == DUCKDB_DRIVER {
+        Some(new_duckdb_dialect())
+    } else {
+        dialect_for_driver(driver_name)
     }
 }
 
@@ -221,7 +314,8 @@ async fn create_pool(params: &ConnectorParams) -> Result<(String, Arc<ADBCPool<M
     let username = params.parameters.get("username").expose().ok();
     let password = params.parameters.get("password").expose().ok();
     let driver_options = params.parameters.get("driver_options").expose().ok();
-    let db_options = build_db_options(&uri_str, username, password, driver_options);
+    let db_options = build_db_options(driver_name, &uri_str, username, password, driver_options);
+    let secrets = connection_secrets(driver_name, &uri_str, password, driver_options);
 
     let parse_pool_param = |name: &str| -> Result<Option<u32>> {
         match params.parameters.get(name).expose().ok() {
@@ -255,7 +349,7 @@ async fn create_pool(params: &ConnectorParams) -> Result<(String, Arc<ADBCPool<M
     tokio::task::spawn_blocking(move || -> Result<(String, Arc<ADBCPool<_>>)> {
         let mut driver = ManagedDriver::load_from_name(
             &driver_location,
-            None,
+            driver_entrypoint(&driver_name),
             AdbcVersion::V110,
             LOAD_FLAG_DEFAULT,
             None,
@@ -264,21 +358,24 @@ async fn create_pool(params: &ConnectorParams) -> Result<(String, Arc<ADBCPool<M
             driver_location: driver_location.clone(),
         })?;
 
-        let db =
-            driver
-                .new_database_with_opts(db_options)
-                .context(UnableToCreateDatabaseSnafu {
-                    driver_location: driver_location.clone(),
-                    uri: uri_str.clone(),
-                })?;
+        let db = driver.new_database_with_opts(db_options).map_err(|e| {
+            UnableToCreateDatabaseSnafu {
+                driver_location: driver_location.clone(),
+                message: scrub_connection_secrets(&e.to_string(), &secrets),
+            }
+            .build()
+        })?;
 
         let pool = AdbcConnectionPoolBuilder::new(db)
             .with_max_size(pool_size)
             .with_min_idle(pool_min_idle)
             .build()
-            .context(UnableToCreateConnectionPoolSnafu {
-                driver_location,
-                uri: uri_str,
+            .map_err(|e| {
+                UnableToCreateConnectionPoolSnafu {
+                    driver_location,
+                    message: scrub_connection_secrets(&e.to_string(), &secrets),
+                }
+                .build()
             })?;
 
         Ok((driver_name, Arc::new(pool)))
@@ -413,7 +510,7 @@ impl AdbcCatalogProvider {
             std::result::Result<Arc<dyn TableProvider>, Box<dyn std::error::Error + Send + Sync>>;
 
         let start = Instant::now();
-        let dialect = dialect_for_driver(&self.driver_name);
+        let dialect = catalog_dialect_for_driver(&self.driver_name);
         let selector = self.selector.clone();
         let schema_name_owned = schema_name.to_owned();
 
@@ -561,6 +658,9 @@ mod tests {
         assert!(param_names.contains(&"driver_options"));
         assert!(param_names.contains(&"connection_pool_size"));
         assert!(param_names.contains(&"connection_pool_min_idle"));
+        // The escape hatch: without it a user whose catalog hits an
+        // untranslatable pushdown has no configuration that avoids it.
+        assert!(param_names.contains(&"query_federation"));
     }
 
     #[test]
@@ -570,5 +670,62 @@ mod tests {
 
         let err = Error::MissingUri;
         assert_eq!(err.to_string(), "Missing required parameter: uri");
+    }
+
+    /// An invalid `query_federation` is reported as the configuration error that
+    /// names the parameter, before any driver is loaded — not hidden behind
+    /// whatever the driver or the database says first. The driver named here
+    /// does not exist, so if the value were checked after `create_pool` the
+    /// catalog would fail with a retryable driver-load error instead.
+    #[tokio::test]
+    async fn an_invalid_query_federation_is_reported_before_the_driver_is_loaded() {
+        use crate::builder::RuntimeBuilder;
+        use crate::component::catalog::CatalogBuilder;
+        use app::AppBuilder;
+        use datafusion_table_providers::util::secrets::to_secret_map;
+        use tokio::runtime::Handle;
+
+        let runtime = Arc::new(RuntimeBuilder::new().build().await);
+        let catalog = CatalogBuilder::try_new("adbc".to_string(), "adbc_cat")
+            .expect("valid catalog builder")
+            .with_app(Arc::new(AppBuilder::new("test").build()))
+            .with_runtime(Arc::clone(&runtime))
+            .build()
+            .expect("valid catalog");
+
+        let params = HashMap::from([
+            (
+                "driver".to_string(),
+                "spice_test_no_such_adbc_driver".to_string(),
+            ),
+            ("uri".to_string(), "grpc://127.0.0.1:1".to_string()),
+            ("query_federation".to_string(), "off".to_string()),
+        ]);
+        let connector = AdbcCatalog::new_connector(ConnectorParams {
+            parameters: crate::parameters::Parameters::new(
+                to_secret_map(params).into_iter().collect(),
+                PREFIX,
+                PARAMETERS,
+            ),
+            unsupported_type_action: None,
+            component: ConnectorComponent::from(&catalog),
+            io_runtime: Handle::current(),
+        });
+
+        let Err(err) = connector
+            .refreshable_catalog_provider(runtime, &catalog)
+            .await
+        else {
+            panic!("an invalid `query_federation` must fail catalog setup");
+        };
+        assert!(
+            err.is_configuration_error(),
+            "expected the non-retryable configuration error, got: {err}"
+        );
+        assert_eq!(
+            err.to_string(),
+            "Cannot setup the catalog adbc_cat (adbc) with an invalid configuration. \
+             Invalid `query_federation` value 'off'. Expected 'enabled' or 'disabled'."
+        );
     }
 }

@@ -27,8 +27,6 @@ use spice_table::Index;
 
 pub mod chunking;
 pub mod compound;
-#[cfg(feature = "duckdb")]
-pub mod duckdb;
 #[cfg(feature = "elasticsearch")]
 pub mod elasticsearch;
 #[cfg(feature = "llms")]
@@ -47,6 +45,10 @@ pub(crate) mod write_util;
 /// `compute_index` call. Each batch may issue an embedding request and a remote
 /// bulk upload, so an unbounded fan-out over a large refresh could spawn a huge
 /// number of concurrent embedding/HTTP calls.
+///
+/// Gated on the two remote indexes that bound their uploads with it, so a build
+/// linking neither does not carry it as dead code.
+#[cfg(any(feature = "elasticsearch", feature = "s3_vectors"))]
 pub(crate) const MAX_CONCURRENT_INDEX_WRITES: usize = 8;
 
 #[cfg(feature = "llms")]
@@ -56,8 +58,6 @@ pub use vector_table::VectorScanTableProvider;
 
 #[cfg(feature = "text_search")]
 use crate::generation::text_search::index::FullTextDatabaseIndex;
-#[cfg(feature = "duckdb")]
-use crate::index::duckdb::DuckDBVectorIndex;
 #[cfg(feature = "elasticsearch")]
 use crate::index::elasticsearch::{ElasticsearchIndex, ElasticsearchTextIndex};
 #[cfg(feature = "s3_vectors")]
@@ -104,10 +104,6 @@ pub fn derived_columns_from_vector_index(
 ) -> Option<Vec<String>> {
     #[cfg(feature = "elasticsearch")]
     if let Some(vec) = index.as_any().downcast_ref::<ElasticsearchIndex>() {
-        return Some(vec.derived_columns());
-    }
-    #[cfg(feature = "duckdb")]
-    if let Some(vec) = index.as_any().downcast_ref::<DuckDBVectorIndex>() {
         return Some(vec.derived_columns());
     }
     #[cfg(feature = "s3_vectors")]
@@ -159,10 +155,6 @@ pub fn as_search_index(index: &Arc<dyn Index + Send + Sync>) -> Option<&dyn Sear
     if let Some(idx) = index.as_any().downcast_ref::<FullTextDatabaseIndex>() {
         return Some(idx as &dyn SearchIndex);
     }
-    #[cfg(feature = "duckdb")]
-    if let Some(idx) = index.as_any().downcast_ref::<DuckDBVectorIndex>() {
-        return Some(idx as &dyn SearchIndex);
-    }
     #[cfg(feature = "s3_vectors")]
     if let Some(idx) = index.as_any().downcast_ref::<S3Vector>() {
         return Some(idx as &dyn SearchIndex);
@@ -203,7 +195,7 @@ pub fn as_search_index(index: &Arc<dyn Index + Send + Sync>) -> Option<&dyn Sear
 /// through [`SearchIndex::query_table_provider`], which may build a transient index
 /// structure (e.g. HNSW) over the stored embeddings.
 ///
-/// Implementations: [`NativeVectorIndex`], [`crate::index::duckdb::DuckDBVectorIndex`]
+/// Implementations: [`NativeVectorIndex`]
 pub trait VectorIndex: SearchIndex {
     /// A [`LogicalPlan`] enumerating the contents of the index (primary keys + embedding
     /// vectors). Required only for the **external-store model** — implementations that
@@ -273,17 +265,55 @@ mod tests {
 
     #[test]
     fn as_search_index_recognizes_a_known_concrete_type() {
-        let idx: Arc<dyn Index + Send + Sync> = Arc::new(NativeVectorIndex::new(
-            datafusion::sql::TableReference::bare("t"),
-            "embedding".to_string(),
-            vec![Field::new("id", arrow_schema::DataType::Int64, false)],
-            4,
-        ));
+        use crate::index::compound::CompoundReadMode;
 
-        assert!(
-            as_search_index(&idx).is_some(),
-            "NativeVectorIndex is in the known-types list and must be recognized"
-        );
+        let native = || {
+            Arc::new(NativeVectorIndex::new(
+                datafusion::common::TableReference::bare("t"),
+                "embedding".to_string(),
+                vec![Field::new("id", arrow_schema::DataType::Int64, false)],
+                4,
+            ))
+        };
+        let chunker = Arc::new(crate::index::chunking::DelimChunker { delim: ' ' });
+
+        // Each type in the known-types list that builds without external services.
+        let known: Vec<(&str, Arc<dyn Index + Send + Sync>)> = vec![
+            (
+                "NativeVectorIndex",
+                native() as Arc<dyn Index + Send + Sync>,
+            ),
+            (
+                "ChunkedSearchIndex",
+                Arc::new(ChunkedSearchIndex::new(native(), chunker))
+                    as Arc<dyn Index + Send + Sync>,
+            ),
+            (
+                "CompoundSearchIndex",
+                Arc::new(
+                    CompoundSearchIndex::try_new(native(), native(), CompoundReadMode::PrimaryOnly)
+                        .expect("compatible indexes"),
+                ) as Arc<dyn Index + Send + Sync>,
+            ),
+            (
+                "CompoundVectorIndex",
+                Arc::new(
+                    CompoundVectorIndex::try_new(native(), native(), CompoundReadMode::PrimaryOnly)
+                        .expect("compatible indexes"),
+                ) as Arc<dyn Index + Send + Sync>,
+            ),
+        ];
+        for (type_name, idx) in &known {
+            let view = as_search_index(idx).unwrap_or_else(|| {
+                panic!("{type_name} is in the known-types list and must be recognized")
+            });
+            // The borrowed view is that index itself, not some other object.
+            assert!(
+                std::ptr::addr_eq(std::ptr::from_ref(view), Arc::as_ptr(idx)),
+                "{type_name}"
+            );
+            assert_eq!(view.search_column(), "embedding", "{type_name}");
+        }
     }
 
     /// `as_search_index` works by downcasting to a fixed list of known concrete types (mirroring
