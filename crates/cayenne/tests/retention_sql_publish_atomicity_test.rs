@@ -62,6 +62,8 @@ test_with_backends!(partitioned_upsert_hides_matching_rows_at_publish_impl);
 test_with_backends!(durable_retention_reaches_a_preexisting_inline_corpus_impl);
 test_with_backends!(failing_retention_over_a_preexisting_inline_corpus_publishes_nothing_impl);
 test_with_backends!(unkeyed_retention_append_carries_a_preexisting_inline_corpus_impl);
+test_with_backends!(unkeyed_retention_append_keeps_committed_transaction_rows_impl);
+test_with_backends!(transaction_staged_across_a_retention_append_commits_or_aborts_cleanly_impl);
 
 fn schema() -> SchemaRef {
     Arc::new(Schema::new(vec![
@@ -3120,5 +3122,201 @@ async fn unkeyed_retention_append_carries_a_preexisting_inline_corpus_impl(
         vec![2, 3],
         "durable"
     );
+    Ok(())
+}
+
+async fn commit_in_txn(
+    t: &Arc<CayenneTableProvider>,
+    batch: RecordBatch,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let txn = cayenne::CayenneTransaction::new();
+    let token = t.transaction_write_token().await;
+    txn.register(
+        t.table_id().to_string(),
+        token,
+        t.clone_for_write_operations(),
+    );
+    let staged = t
+        .begin_staged_upsert_occ(token, common::single_batch_stream(batch), 1)
+        .await?;
+    txn.set_staged(t.table_id(), staged);
+    txn.commit().await?;
+    Ok(())
+}
+
+async fn collect_ids(
+    plan: Arc<dyn datafusion::physical_plan::ExecutionPlan>,
+    ctx: &SessionContext,
+) -> Result<Vec<i64>, Box<dyn std::error::Error>> {
+    let batches = datafusion::physical_plan::collect(plan, ctx.task_ctx()).await?;
+    let mut out: Vec<i64> = batches
+        .iter()
+        .flat_map(|b| {
+            b.column(0)
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .expect("int64")
+                .values()
+                .to_vec()
+        })
+        .collect();
+    out.sort_unstable();
+    Ok(out)
+}
+
+/// A table without a primary key holds a committed transactional write (a
+/// staged upsert publishes it as its own protected snapshot, beside the
+/// current snapshot). A later `retention_sql` append publishes a generation
+/// whose logical view is every published resident row, from both runs, minus
+/// the predicate's matches (here a transaction row that newly matches), plus the
+/// appended rows. A reader planned before the append keeps the old rows through
+/// the append and the cleanup; a reopen sees the new view (Codex adversarial
+/// review F2: the carried generation linked only the current snapshot and the
+/// flip cleared the protected run's catalog entry).
+async fn unkeyed_retention_append_keeps_committed_transaction_rows_impl(
+    fixture: common::TestFixture,
+) -> Result<(), Box<dyn std::error::Error>> {
+    use datafusion::logical_expr::{ColumnarValue, Volatility, create_udf};
+    let name = "rsql_pub_unkeyed_txn_run";
+    let on = Arc::new(AtomicBool::new(false));
+    let flag = Arc::clone(&on);
+    let udf = create_udf(
+        "gone_txn",
+        vec![DataType::Int64],
+        DataType::Boolean,
+        Volatility::Volatile,
+        Arc::new(move |args: &[ColumnarValue]| {
+            let array = args[0].clone().into_array(1)?;
+            let ids = array.as_any().downcast_ref::<Int64Array>().expect("int64");
+            let on = flag.load(Ordering::SeqCst);
+            Ok(ColumnarValue::Array(Arc::new(
+                arrow::array::BooleanArray::from_iter(
+                    ids.iter().map(|id| Some(on && id == Some(10))),
+                ),
+            )))
+        }),
+    );
+    let t = table(&fixture, name, false, udf.call(vec![col("id")])).await?;
+    common::insert_batch(
+        t.as_ref(),
+        rows(&[(1, Some("active")), (2, Some("active"))]),
+    )
+    .await?;
+    commit_in_txn(&t, rows(&[(10, Some("active")), (11, Some("active"))])).await?;
+    assert_eq!(
+        ids(&t).await?,
+        vec![1, 2, 10, 11],
+        "precondition: transaction rows visible"
+    );
+
+    let ctx = SessionContext::new();
+    ctx.register_table("t", Arc::clone(&t) as Arc<dyn TableProvider>)?;
+    let old_plan = ctx
+        .sql("SELECT id FROM t ORDER BY id")
+        .await?
+        .create_physical_plan()
+        .await?;
+
+    on.store(true, Ordering::SeqCst);
+    common::insert_batch(t.as_ref(), rows(&[(3, Some("active"))])).await?;
+    assert_eq!(
+        ids(&t).await?,
+        vec![1, 2, 3, 11],
+        "the append keeps every resident run and retires the matching transaction row with it"
+    );
+    t.retire_unreferenced_snapshot_dirs().await?;
+    assert_eq!(
+        collect_ids(old_plan, &ctx).await?,
+        vec![1, 2, 10, 11],
+        "a reader planned before the append keeps the old generation through cleanup"
+    );
+    assert_eq!(ids(&t).await?, vec![1, 2, 3, 11], "after cleanup");
+    common::insert_batch(t.as_ref(), rows(&[(4, Some("active"))])).await?;
+    assert_eq!(ids(&t).await?, vec![1, 2, 3, 4, 11], "a further append");
+    drop(t);
+    assert_eq!(
+        ids(&reopen_plain(&fixture, name).await?).await?,
+        vec![1, 2, 3, 4, 11],
+        "durable"
+    );
+    Ok(())
+}
+
+/// A transaction staged (not committed) on a table without a primary key while
+/// a `retention_sql` append publishes: its rows are never visible before it
+/// commits, and the append neither exposes nor carries them. Afterwards an
+/// abort leaves exactly the published rows; a commit either publishes the
+/// transaction's rows once or fails without publishing any (the existing
+/// optimistic check decides). A reopen agrees with the live view.
+async fn transaction_staged_across_a_retention_append_commits_or_aborts_cleanly_impl(
+    fixture: common::TestFixture,
+) -> Result<(), Box<dyn std::error::Error>> {
+    for abort in [true, false] {
+        let name = if abort {
+            "rsql_pub_unkeyed_txn_abort"
+        } else {
+            "rsql_pub_unkeyed_txn_commit"
+        };
+        let t = table(&fixture, name, false, archived()).await?;
+        common::insert_batch(t.as_ref(), rows(&[(1, Some("active"))])).await?;
+        let txn = cayenne::CayenneTransaction::new();
+        let token = t.transaction_write_token().await;
+        txn.register(
+            t.table_id().to_string(),
+            token,
+            t.clone_for_write_operations(),
+        );
+        let staged = t
+            .begin_staged_upsert_occ(
+                token,
+                common::single_batch_stream(rows(&[(10, Some("active"))])),
+                1,
+            )
+            .await?;
+        txn.set_staged(t.table_id(), staged);
+        assert_eq!(
+            ids(&t).await?,
+            vec![1],
+            "{name}: staged rows are not visible"
+        );
+        common::insert_batch(
+            t.as_ref(),
+            rows(&[(2, Some("active")), (3, Some("archived"))]),
+        )
+        .await?;
+        assert_eq!(
+            ids(&t).await?,
+            vec![1, 2],
+            "{name}: the append exposes no staged row"
+        );
+        let expected = if abort {
+            txn.abort().await;
+            vec![1, 2]
+        } else {
+            match txn.commit().await {
+                Ok(_) => vec![1, 2, 10],
+                Err(error) => {
+                    eprintln!("{name}: commit after the append failed: {error}");
+                    vec![1, 2]
+                }
+            }
+        };
+        assert_eq!(
+            ids(&t).await?,
+            expected,
+            "{name}: after the transaction ends"
+        );
+        common::insert_batch(t.as_ref(), rows(&[(4, Some("active"))])).await?;
+        let mut after = expected.clone();
+        after.push(4);
+        after.sort_unstable();
+        assert_eq!(ids(&t).await?, after, "{name}: a further append");
+        drop(t);
+        assert_eq!(
+            ids(&reopen_plain(&fixture, name).await?).await?,
+            after,
+            "{name}: durable"
+        );
+    }
     Ok(())
 }
