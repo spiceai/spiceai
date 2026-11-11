@@ -26,6 +26,7 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use datafusion::logical_expr::Expr;
+use datafusion::physical_plan::ExecutionPlan;
 use datafusion::{
     catalog::{ScanArgs, ScanResult, Session},
     datasource::{TableProvider, listing::ListingTableUrl},
@@ -35,6 +36,8 @@ use datafusion::{
 use futures::TryStreamExt;
 use object_store::ObjectMeta;
 use spice_table::{LayerWalk, SpiceTable, TableLayer};
+
+use crate::file_schema_drift::scanned_files;
 
 /// Whether a listed object should count as a data file for this dataset.
 pub type IsListedDataFile = Arc<dyn Fn(&ObjectMeta) -> bool + Send + Sync>;
@@ -51,6 +54,11 @@ pub type ScanSkipsListing = Arc<dyn Fn(&[Expr]) -> bool + Send + Sync>;
 /// When constructed with [`Self::over_rejecting_empty`], a scan whose listing has no data
 /// file is an error instead of an empty table. A file that exists and matches the
 /// listing (header-only CSV, zero-row Parquet) still scans as zero rows.
+///
+/// The check reads the files the scan beneath already listed, so a scan that reads a
+/// data file costs no object-store request beyond the scan's own. Only a scan that
+/// reads no data file (the source is gone, or its filters pruned every file) lists the
+/// paths again, to tell the two apart.
 pub struct FreshFileListingLayer {
     table_paths: Vec<ListingTableUrl>,
     dataset_name: String,
@@ -177,6 +185,15 @@ impl FreshFileListingLayer {
         }
         Ok(false)
     }
+
+    /// Whether `plan` scans at least one data file, read from the files the scan beneath
+    /// listed. `true` when this layer does not reject empty listings.
+    fn plan_reads_data_file(&self, plan: &Arc<dyn ExecutionPlan>) -> bool {
+        let Some(is_data_file) = &self.is_data_file else {
+            return true;
+        };
+        scanned_files(plan).is_some_and(|(_, files)| files.iter().any(&**is_data_file))
+    }
 }
 
 fn redacted_listing_url(path: &ListingTableUrl) -> url::Url {
@@ -218,10 +235,11 @@ impl TableLayer for FreshFileListingLayer {
             .scan_skips_listing
             .as_ref()
             .is_some_and(|skips| skips(args.filters().unwrap_or_default()));
-        if !skips_listing {
+        let result = below.scan_with_args(state, args).await?;
+        if !skips_listing && !self.plan_reads_data_file(result.plan()) {
             self.ensure_data_files(state).await?;
         }
-        below.scan_with_args(state, args).await
+        Ok(result)
     }
 }
 
@@ -232,9 +250,19 @@ mod tests {
     use arrow_schema::{DataType, Field, Schema};
     use datafusion::datasource::file_format::parquet::ParquetFormat;
     use datafusion::datasource::listing::{ListingOptions, ListingTable, ListingTableConfig};
-    use datafusion::prelude::SessionContext;
+    use datafusion::execution::cache::cache_manager::CacheManagerConfig;
+    use datafusion::execution::runtime_env::RuntimeEnvBuilder;
+    use datafusion::prelude::{SessionConfig, SessionContext};
+    use futures::stream::BoxStream;
+    use object_store::memory::InMemory;
+    use object_store::path::Path as ObjectPath;
+    use object_store::{
+        CopyOptions, GetOptions, GetResult, ListResult, MultipartUpload, ObjectStore,
+        ObjectStoreExt, PutMultipartOptions, PutOptions, PutPayload, PutResult,
+    };
     use parquet::arrow::ArrowWriter;
     use std::path::Path;
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
     fn write_ids(path: &Path, ids: impl IntoIterator<Item = i64>) {
         let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)]));
@@ -388,5 +416,311 @@ mod tests {
                 .is_some(),
             "storage URL must keep its fragment"
         );
+    }
+
+    async fn count(ctx: &SessionContext, sql: &str) -> i64 {
+        let batches = ctx
+            .sql(sql)
+            .await
+            .expect("plan")
+            .collect()
+            .await
+            .expect("execute");
+        batches[0]
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .expect("Int64 count")
+            .value(0)
+    }
+
+    /// The error `sql` fails with, or an empty string when it succeeds.
+    async fn sql_err(ctx: &SessionContext, sql: &str) -> String {
+        match ctx.sql(sql).await {
+            Err(e) => e.to_string(),
+            Ok(df) => match df.collect().await {
+                Err(e) => e.to_string(),
+                Ok(_) => String::new(),
+            },
+        }
+    }
+
+    /// A partitioned scan whose filter prunes every file reads no data file while its
+    /// source still has one, so it answers zero rows. Once the source is gone, the same
+    /// query fails: the check lists again when the scan read nothing.
+    #[tokio::test]
+    async fn a_scan_whose_filter_prunes_every_file_answers_zero_rows() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let partition = dir.path().join("year=2024");
+        std::fs::create_dir(&partition).expect("create partition directory");
+        let part0 = partition.join("part-0.parquet");
+        write_ids(&part0, 1..=100);
+
+        let ctx = SessionContext::new();
+        let url = ListingTableUrl::parse(format!("file://{}/", dir.path().display())).expect("url");
+        let options = ListingOptions::new(Arc::new(ParquetFormat::default()))
+            .with_file_extension(".parquet")
+            .with_table_partition_cols(vec![("year".to_string(), DataType::Utf8)]);
+        let config = ListingTableConfig::new(url.clone())
+            .with_listing_options(options)
+            .infer_schema(&ctx.state())
+            .await
+            .expect("infer schema");
+        let table: Arc<dyn TableProvider> =
+            Arc::new(ListingTable::try_new(config).expect("listing table"));
+        ctx.register_table(
+            "t",
+            FreshFileListingLayer::over_rejecting_empty(
+                table,
+                vec![url],
+                "t",
+                parquet_is_data_file,
+            ),
+        )
+        .expect("register");
+
+        let pruned = "SELECT count(*) FROM t WHERE year = '2025'";
+        assert_eq!(count(&ctx, pruned).await, 0);
+        assert_eq!(
+            count(&ctx, "SELECT count(*) FROM t WHERE year = '2024'").await,
+            100
+        );
+
+        std::fs::remove_file(&part0).expect("remove listed file");
+        let err = sql_err(&ctx, pruned).await;
+        assert!(
+            err.contains("No data files are yet available for dataset t"),
+            "expected missing-source error, got {err:?}"
+        );
+    }
+
+    /// Object-store LIST and HEAD requests, counted.
+    #[derive(Debug, Default)]
+    struct RequestCounts {
+        list: AtomicUsize,
+        head: AtomicUsize,
+    }
+
+    impl RequestCounts {
+        fn read(&self) -> (usize, usize) {
+            (
+                self.list.load(Ordering::SeqCst),
+                self.head.load(Ordering::SeqCst),
+            )
+        }
+    }
+
+    #[derive(Debug)]
+    struct CountingStore {
+        inner: InMemory,
+        counts: RequestCounts,
+    }
+
+    impl std::fmt::Display for CountingStore {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            write!(f, "CountingStore")
+        }
+    }
+
+    #[async_trait]
+    impl ObjectStore for CountingStore {
+        fn list(
+            &self,
+            prefix: Option<&ObjectPath>,
+        ) -> BoxStream<'static, object_store::Result<ObjectMeta>> {
+            self.counts.list.fetch_add(1, Ordering::SeqCst);
+            self.inner.list(prefix)
+        }
+
+        async fn list_with_delimiter(
+            &self,
+            prefix: Option<&ObjectPath>,
+        ) -> object_store::Result<ListResult> {
+            self.counts.list.fetch_add(1, Ordering::SeqCst);
+            self.inner.list_with_delimiter(prefix).await
+        }
+
+        async fn get_opts(
+            &self,
+            location: &ObjectPath,
+            options: GetOptions,
+        ) -> object_store::Result<GetResult> {
+            if options.head {
+                self.counts.head.fetch_add(1, Ordering::SeqCst);
+            }
+            self.inner.get_opts(location, options).await
+        }
+
+        async fn put_opts(
+            &self,
+            location: &ObjectPath,
+            payload: PutPayload,
+            opts: PutOptions,
+        ) -> object_store::Result<PutResult> {
+            self.inner.put_opts(location, payload, opts).await
+        }
+
+        async fn put_multipart_opts(
+            &self,
+            location: &ObjectPath,
+            opts: PutMultipartOptions,
+        ) -> object_store::Result<Box<dyn MultipartUpload>> {
+            self.inner.put_multipart_opts(location, opts).await
+        }
+
+        fn delete_stream(
+            &self,
+            locations: BoxStream<'static, object_store::Result<ObjectPath>>,
+        ) -> BoxStream<'static, object_store::Result<ObjectPath>> {
+            self.inner.delete_stream(locations)
+        }
+
+        async fn copy_opts(
+            &self,
+            from: &ObjectPath,
+            to: &ObjectPath,
+            options: CopyOptions,
+        ) -> object_store::Result<()> {
+            self.inner.copy_opts(from, to, options).await
+        }
+    }
+
+    fn parquet_payload(ids: std::ops::RangeInclusive<i64>) -> PutPayload {
+        let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)]));
+        let batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![Arc::new(Int64Array::from_iter_values(ids))],
+        )
+        .expect("batch");
+        let mut buffer = Vec::new();
+        let mut writer = ArrowWriter::try_new(&mut buffer, schema, None).expect("parquet writer");
+        writer.write(&batch).expect("write batch");
+        writer.close().expect("close parquet writer");
+        PutPayload::from(buffer)
+    }
+
+    /// The `ListingTable` over `url` the way a file dataset builds it, with the empty-listing
+    /// check (`guarded`) or without it.
+    fn listing_over(url: &str, guarded: bool) -> Arc<dyn TableProvider> {
+        let url = ListingTableUrl::parse(url).expect("listing url");
+        let config = ListingTableConfig::new(url.clone())
+            .with_listing_options(
+                ListingOptions::new(Arc::new(ParquetFormat::default()))
+                    .with_file_extension(".parquet"),
+            )
+            .with_schema(Arc::new(Schema::new(vec![Field::new(
+                "id",
+                DataType::Int64,
+                false,
+            )])));
+        let table: Arc<dyn TableProvider> =
+            Arc::new(ListingTable::try_new(config).expect("listing table"));
+        if guarded {
+            FreshFileListingLayer::over_rejecting_empty(
+                table,
+                vec![url],
+                "facts",
+                parquet_is_data_file,
+            )
+        } else {
+            FreshFileListingLayer::over(table, vec![url])
+        }
+    }
+
+    /// The LIST and HEAD requests one `SELECT count(*)` of `table` sends, checking it
+    /// answers `rows`.
+    async fn requests_per_scan(
+        ctx: &SessionContext,
+        store: &CountingStore,
+        table: &str,
+        rows: i64,
+    ) -> (usize, usize) {
+        let (list, head) = store.counts.read();
+        assert_eq!(
+            count(ctx, &format!("SELECT count(*) FROM {table}")).await,
+            rows
+        );
+        let (list_after, head_after) = store.counts.read();
+        (list_after - list, head_after - head)
+    }
+
+    /// The empty-listing check reads the files the scan listed, so a scan that reads a
+    /// data file sends exactly the requests the same scan sends without the check: one
+    /// LIST for a folder, whether or not the session caches listings, and one HEAD for a
+    /// single object. The check is live on the same table: deleting the source fails it.
+    #[tokio::test]
+    async fn rejecting_empty_listings_adds_no_object_store_request() {
+        let cases = [
+            ("memory://probe/facts/", true, 20, (1, 0)),
+            ("memory://probe/facts/", false, 20, (1, 0)),
+            ("memory://probe/facts/part-0.parquet", true, 10, (0, 1)),
+            ("memory://probe/facts/part-0.parquet", false, 10, (0, 1)),
+        ];
+        for (url, list_files_cache, rows, expected) in cases {
+            let cache = if list_files_cache {
+                CacheManagerConfig::default()
+            } else {
+                CacheManagerConfig::default().with_list_files_cache_limit(0)
+            };
+            let runtime = RuntimeEnvBuilder::new()
+                .with_cache_manager(cache)
+                .build_arc()
+                .expect("runtime");
+            let ctx = SessionContext::new_with_config_rt(SessionConfig::new(), runtime);
+            assert_eq!(
+                ctx.runtime_env()
+                    .cache_manager
+                    .get_list_files_cache()
+                    .is_some(),
+                list_files_cache
+            );
+            let store = Arc::new(CountingStore {
+                inner: InMemory::new(),
+                counts: RequestCounts::default(),
+            });
+            let parts = [
+                ObjectPath::from("facts/part-0.parquet"),
+                ObjectPath::from("facts/part-1.parquet"),
+            ];
+            store
+                .inner
+                .put(&parts[0], parquet_payload(1..=10))
+                .await
+                .expect("put part-0");
+            store
+                .inner
+                .put(&parts[1], parquet_payload(11..=20))
+                .await
+                .expect("put part-1");
+            ctx.runtime_env().register_object_store(
+                &url::Url::parse("memory://probe").expect("store url"),
+                Arc::clone(&store) as Arc<dyn ObjectStore>,
+            );
+            ctx.register_table("plain", listing_over(url, false))
+                .expect("register plain");
+            ctx.register_table("guarded", listing_over(url, true))
+                .expect("register guarded");
+
+            let label = format!("{url} with list-files cache {list_files_cache}");
+            assert_eq!(
+                requests_per_scan(&ctx, &store, "plain", rows).await,
+                expected,
+                "{label}: without the check"
+            );
+            assert_eq!(
+                requests_per_scan(&ctx, &store, "guarded", rows).await,
+                expected,
+                "{label}: with the check"
+            );
+
+            for part in &parts {
+                store.inner.delete(part).await.expect("delete part");
+            }
+            let err = sql_err(&ctx, "SELECT count(*) FROM guarded").await;
+            assert!(
+                err.contains("No data files are yet available for dataset facts"),
+                "{label}: expected missing-source error, got {err:?}"
+            );
+        }
     }
 }
