@@ -2289,7 +2289,7 @@ impl CayenneTableProvider {
                 };
 
                 let Some(target_prefix) = self
-                    .snapshot_object_store_prefix(&wal.target_snapshot)
+                    .data_files_prefix(&wal.target_snapshot)
                     .map_err(|error| Error::IncompleteWrite {
                         table: table_name.clone(),
                         message: format!(
@@ -2337,6 +2337,37 @@ impl CayenneTableProvider {
                     }
                 }
 
+                // A table in the object-native location never lists where its
+                // files live: each file still missing is looked up by name.
+                if reachable.len() != expected.len() && self.data_in_object_native_location() {
+                    let missing: Vec<String> = expected
+                        .iter()
+                        .filter(|name| !reachable.contains(**name))
+                        .map(|name| (*name).to_string())
+                        .collect();
+                    for name in missing {
+                        match config
+                            .store
+                            .head(&crate::object_child(&target_prefix, &name))
+                            .await
+                        {
+                            Ok(_) => {
+                                reachable.insert(name);
+                            }
+                            Err(object_store::Error::NotFound { .. }) => {}
+                            Err(error) => {
+                                return Err(Error::IncompleteWrite {
+                                    table: table_name.clone(),
+                                    message: format!(
+                                        "A previous write was interrupted while moving {} file(s) to '{}'. Failed to look up a moved file during the pre-recovery audit ({error}); refusing automated recovery because file reachability is unknown. Manual resolution is required. The WAL file is located at '{wal_location}'.{extra}",
+                                        wal.staged_files.len(),
+                                        wal.target_snapshot
+                                    ),
+                                });
+                            }
+                        }
+                    }
+                }
                 if reachable.len() != expected.len() {
                     let mut target_objects = config.store.list(Some(&target_prefix));
                     while let Some(meta) = target_objects.next().await {

@@ -978,6 +978,17 @@ impl CayenneTableProvider {
     async fn remove_unpublished_snapshot_objects(&self, snapshot_id: &str) {
         let table_name = self.table_name().to_string();
         let removed: Result<()> = async {
+            // A table in the object-native location deletes by name the files
+            // its writer recorded, never the snapshot's prefix: anything else is
+            // the orphan sweep's.
+            if self.data_in_object_native_location() {
+                self.discard_uncommitted_snapshot(snapshot_id).await?;
+                return self
+                    .catalog()
+                    .clear_snapshot_cached_metadata(self.table_id(), snapshot_id)
+                    .await
+                    .map_err(|source| super::Error::Catalog { source });
+            }
             let Some(prefix) = self.snapshot_object_store_prefix(snapshot_id)? else {
                 return Ok(());
             };

@@ -9541,19 +9541,60 @@ impl CayenneTableProvider {
             })
     }
 
+    /// The object prefix of `snapshot_id`'s directory, to list or delete as a
+    /// whole. A table whose data is in the object-native location deletes data
+    /// files only by name ([`Self::delete_uncommitted_uploads`] and the
+    /// retirement sweep), so for it this returns an error for any id but a
+    /// staging write's own directory: no caller can turn a snapshot into a
+    /// prefix that reaches the table's files. To name one file, use
+    /// [`Self::data_files_prefix`].
     pub(super) fn snapshot_object_store_prefix(
         &self,
         snapshot_id: &str,
     ) -> Result<Option<ObjectStorePath>> {
+        ensure!(
+            !self.data_in_object_native_location() || Self::is_staging_snapshot_id(snapshot_id),
+            InternalSnafu {
+                table: self.table_metadata.table_name.clone(),
+                message: format!(
+                    "refusing to address snapshot '{snapshot_id}' as an object prefix: the table's data files are deleted by name"
+                ),
+            }
+        );
+        self.data_files_prefix(snapshot_id)
+    }
+
+    /// The object path of the directory that holds `snapshot_id`'s data files,
+    /// to join a file name onto. Never listed or deleted as a prefix for a table
+    /// whose data is in the object-native location (see
+    /// [`Self::snapshot_object_store_prefix`]).
+    pub(super) fn data_files_prefix(&self, snapshot_id: &str) -> Result<Option<ObjectStorePath>> {
         if !self.data_in_store() {
             return Ok(None);
         }
-
         let snapshot_url =
             Self::snapshot_dir_url(self.data_root(), &self.table_metadata.table_id, snapshot_id);
+        self.object_path_of_url(&snapshot_url).map(Some)
+    }
 
-        let url = url::Url::parse(&snapshot_url).map_err(|source| Error::UrlParse {
-            url: snapshot_url.clone(),
+    /// The object path of the table's own directory, `<data path>/<table id>`.
+    pub(super) fn table_object_store_prefix(&self) -> Result<Option<ObjectStorePath>> {
+        if !self.data_in_store() {
+            return Ok(None);
+        }
+        let table_url = format!(
+            "{}/{}/",
+            self.data_root().trim_end_matches('/'),
+            self.table_metadata.table_id
+        );
+        self.object_path_of_url(&table_url).map(Some)
+    }
+
+    /// The object path `snapshot_url`, a directory URL under this table's data
+    /// root, names in the table's store.
+    fn object_path_of_url(&self, snapshot_url: &str) -> Result<ObjectStorePath> {
+        let url = url::Url::parse(snapshot_url).map_err(|source| Error::UrlParse {
+            url: snapshot_url.to_string(),
             source,
         })?;
 
@@ -9571,7 +9612,7 @@ impl CayenneTableProvider {
         }
 
         let path = url.path().trim_start_matches('/');
-        Ok(Some(ObjectStorePath::from(path)))
+        Ok(ObjectStorePath::from(path))
     }
 
     /// Releases everything the Vortex caches still hold for files this table has
@@ -9688,24 +9729,100 @@ impl CayenneTableProvider {
             .await
     }
 
-    /// Delete the named `(file name, size)` objects under the snapshot prefix
-    /// `prefix`, in batched requests and without listing it.
-    async fn delete_written_snapshot_files(
+    /// The key of data file `name` of `snapshot_id`: its path relative to the
+    /// table, as the committed state keys it
+    /// (`cayenne_metastore_actions::state::TableState::file_key`).
+    fn data_file_key(snapshot_id: &str, name: &str) -> String {
+        Self::manifest_file_relative_path(snapshot_id, name)
+    }
+
+    /// The keys of every data file and deletion vector the committed state
+    /// names as live or retired; `None` while the retirement record is not
+    /// settled.
+    async fn committed_data_file_keys(&self) -> Result<Option<HashSet<String>>> {
+        let Some(mut keys) = self.durably_retired_files().await? else {
+            return Ok(None);
+        };
+        let live = self.live_snapshot_ids_for_sweep().await?;
+        let table_id = self.table_metadata.table_id.as_str();
+        for row in self.catalog.get_all_snapshot_files(table_id).await? {
+            if live.contains(&row.snapshot_id) {
+                keys.insert(Self::data_file_key(&row.snapshot_id, &row.file_path));
+            }
+        }
+        let table_path = self.table_metadata.path.trim_end_matches('/');
+        for dv in self.catalog.get_table_delete_files(table_id).await? {
+            let key = dv
+                .path
+                .strip_prefix(table_path)
+                .and_then(|rest| rest.strip_prefix('/'))
+                .map_or_else(|| dv.path.clone(), str::to_string);
+            keys.insert(key);
+        }
+        Ok(Some(keys))
+    }
+
+    /// Deletes by name `files` (`(name, size)`): uploads this process made for
+    /// `snapshot_id` that no commit names, of a table whose data is in the
+    /// object-native location. This is the one path a write, a rollback or a
+    /// cleanup deletes its own data files by; it never lists and never deletes
+    /// a prefix. A file the committed state names, live or retired, is kept,
+    /// and so is every file while an earlier commit's outcome is unknown or the
+    /// retirement record is not settled: a file left behind is the orphan
+    /// sweep's.
+    async fn delete_uncommitted_uploads(
         &self,
-        prefix: &ObjectStorePath,
+        snapshot_id: &str,
         files: Vec<(String, u64)>,
     ) -> Result<()> {
-        if files.is_empty() {
+        if files.is_empty() || self.publication_outcome_unknown.load(Ordering::Acquire) {
+            return Ok(());
+        }
+        let Some(prefix) = self.data_files_prefix(snapshot_id)? else {
+            return Ok(());
+        };
+        // A staging directory is no snapshot's: no commit names a file in it.
+        let named = if Self::is_staging_snapshot_id(snapshot_id) {
+            HashSet::new()
+        } else {
+            match self.committed_data_file_keys().await? {
+                Some(keys) => keys,
+                None => return Ok(()),
+            }
+        };
+        let objects: Vec<(ObjectStorePath, u64)> = files
+            .into_iter()
+            .filter(|(name, _)| {
+                let key = Self::data_file_key(snapshot_id, name);
+                let keep = named.contains(&key);
+                if keep {
+                    tracing::debug!(
+                        table = self.table_name(),
+                        key,
+                        "Keeping an upload the committed state names"
+                    );
+                }
+                !keep
+            })
+            .map(|(name, size)| (crate::object_child(&prefix, &name), size))
+            .collect();
+        if objects.is_empty() {
             return Ok(());
         }
         let store = Arc::clone(&self.require_object_store()?.store);
-        let objects = files
-            .into_iter()
-            .map(|(name, size)| (crate::object_child(prefix, &name), size))
-            .collect();
         self.delete_sized_counted(&store, objects, "delete object from snapshot cleanup")
             .await
             .1
+    }
+
+    /// Discards `snapshot_id`, a snapshot this process wrote and no commit made
+    /// live, of a table whose data is in the object-native location: deletes the
+    /// files its writer's record holds by name
+    /// ([`Self::delete_uncommitted_uploads`]) and stops holding them.
+    pub(crate) async fn discard_uncommitted_snapshot(&self, snapshot_id: &str) -> Result<()> {
+        let written = self.uncommitted_files.files(snapshot_id);
+        self.uncommitted_files.forget(snapshot_id);
+        self.delete_uncommitted_uploads(snapshot_id, written).await
     }
 
     async fn cleanup_old_snapshots_s3(&self, pins: &SnapshotSweepPins) -> Result<bool> {
@@ -10534,9 +10651,16 @@ impl CayenneTableProvider {
     /// leftovers) belong to no append and are always removed.
     ///
     /// On S3 the staging prefix is cleared as a whole (no per-entry listing) —
-    /// the lock exclusion in `ensure_no_incomplete_write` is the guard there.
+    /// the lock exclusion in `ensure_no_incomplete_write` is the guard there. A
+    /// table whose data is in the object-native location deletes nothing by
+    /// prefix: what an earlier process staged is the orphan sweep's.
     pub(crate) async fn clear_orphan_staging_dirs(&self) -> Result<()> {
         if self.data_in_store() {
+            if self.data_in_object_native_location() {
+                self.staging_may_have_files()
+                    .store(false, Ordering::Release);
+                return Ok(());
+            }
             if let Some(prefix) = self.snapshot_object_store_prefix(STAGING_DIR_NAME)? {
                 self.delete_prefix_with_object_store(&prefix).await?;
             }
@@ -10619,6 +10743,20 @@ impl CayenneTableProvider {
                     .delete_uncommitted_final_key_files(&directory, &files)
                     .await;
             }
+        }
+        if self.data_in_object_native_location() {
+            // By name: the files its writer staged, and its staging WAL. What
+            // an earlier process staged is the orphan sweep's.
+            let mut staged = self.uncommitted_files.files(staging_snapshot_id);
+            self.uncommitted_files.forget(staging_snapshot_id);
+            staged.extend(
+                [STAGING_WAL_FILENAME, STAGING_WAL_TMP_FILENAME]
+                    .into_iter()
+                    .map(|name| (name.to_string(), 0)),
+            );
+            return self
+                .delete_uncommitted_uploads(staging_snapshot_id, staged)
+                .await;
         }
         self.uncommitted_files.forget(staging_snapshot_id);
         if self.data_in_store() {
@@ -10737,29 +10875,11 @@ impl CayenneTableProvider {
         directory: &str,
         files: &[String],
     ) -> Result<()> {
-        if files.is_empty() {
-            return Ok(());
-        }
-        let config = self.require_object_store()?;
-        let Some(prefix) = self.snapshot_object_store_prefix(directory)? else {
-            return Ok(());
-        };
-        let outcome = crate::dataset_storage::delete_in_batches(
-            &config.store,
-            files
-                .iter()
-                .map(|name| crate::object_child(&prefix, name))
-                .collect(),
+        self.delete_uncommitted_uploads(
+            directory,
+            files.iter().map(|name| (name.clone(), 0)).collect(),
         )
-        .await;
-        if let Some(source) = outcome.first_error {
-            return Err(Error::ObjectStore {
-                operation: "delete the data files of an append that did not commit",
-                table: self.table_metadata.table_name.clone(),
-                source,
-            });
-        }
-        Ok(())
+        .await
     }
 
     /// Move write-time footer-cache entries along with staged files.
@@ -10999,7 +11119,7 @@ impl CayenneTableProvider {
         let Some(staging_prefix) = self.snapshot_object_store_prefix(staging_snapshot_id)? else {
             return Ok(());
         };
-        let Some(target_prefix) = self.snapshot_object_store_prefix(current_snapshot)? else {
+        let Some(target_prefix) = self.data_files_prefix(current_snapshot)? else {
             return Err(Error::Internal {
                 table: self.table_metadata.table_name.clone(),
                 message: format!("Cannot compute S3 prefix for snapshot '{current_snapshot}'"),
@@ -11295,13 +11415,13 @@ impl CayenneTableProvider {
         if self.data_in_store() {
             let config = self.require_object_store()?;
             let source_prefix = self
-                .snapshot_object_store_prefix(source_snapshot_id)?
+                .data_files_prefix(source_snapshot_id)?
                 .ok_or_else(|| Error::Internal {
                     table: self.table_name().to_string(),
                     message: "Missing source snapshot object-store prefix".to_string(),
                 })?;
             let target_prefix = self
-                .snapshot_object_store_prefix(target_snapshot_id)?
+                .data_files_prefix(target_snapshot_id)?
                 .ok_or_else(|| Error::Internal {
                     table: self.table_name().to_string(),
                     message: "Missing target snapshot object-store prefix".to_string(),
@@ -11408,7 +11528,15 @@ impl CayenneTableProvider {
         Ok(())
     }
 
+    /// Deletes the files of `snapshot_id`, a snapshot no commit made live. A
+    /// table whose data is in the object-native location deletes by name only
+    /// the files this process's writer recorded there
+    /// ([`Self::discard_uncommitted_snapshot`]); anything else is the orphan
+    /// sweep's.
     pub(crate) async fn clear_snapshot_dir(&self, snapshot_id: &str) -> Result<()> {
+        if self.data_in_object_native_location() {
+            return self.discard_uncommitted_snapshot(snapshot_id).await;
+        }
         self.uncommitted_files.forget(snapshot_id);
         if self.data_in_store() {
             if let Some(prefix) = self.snapshot_object_store_prefix(snapshot_id)? {
@@ -23025,7 +23153,16 @@ impl CayenneTableProvider {
         let is_s3 = self.data_in_store();
 
         let cleanup_failed_snapshot = async {
-            if is_s3 {
+            if self.data_in_object_native_location() {
+                // By name, never the snapshot's prefix.
+                if let Err(e) = self.discard_uncommitted_snapshot(&new_snapshot_id).await {
+                    tracing::warn!(
+                        "Failed to clean up failed sort-rewrite snapshot {} for table {}: {e}",
+                        new_snapshot_id,
+                        self.table_metadata.table_name
+                    );
+                }
+            } else if is_s3 {
                 let snapshot_url = Self::snapshot_dir_url(
                     self.data_root(),
                     &self.table_metadata.table_id,
@@ -24579,13 +24716,13 @@ impl CayenneTableProvider {
         if self.data_in_store() {
             let config = self.require_object_store()?;
             let source_prefix = self
-                .snapshot_object_store_prefix(source_snapshot_id)?
+                .data_files_prefix(source_snapshot_id)?
                 .ok_or_else(|| Error::Internal {
                     table: self.table_name().to_string(),
                     message: "Missing source snapshot object-store prefix".to_string(),
                 })?;
             let target_prefix = self
-                .snapshot_object_store_prefix(target_snapshot_id)?
+                .data_files_prefix(target_snapshot_id)?
                 .ok_or_else(|| Error::Internal {
                     table: self.table_name().to_string(),
                     message: "Missing target snapshot object-store prefix".to_string(),
@@ -24958,17 +25095,13 @@ impl CayenneTableProvider {
         *self.last_orphan_sweep.lock() = Instant::now();
         let config = self.require_object_store()?;
         let store = Arc::clone(&config.store);
-        let clock = self
-            .snapshot_object_store_prefix(STORE_CLOCK_OBJECT)?
+        let table_prefix = self
+            .table_object_store_prefix()?
             .ok_or_else(|| Error::Internal {
                 table: self.table_name().to_string(),
                 message: "Missing the table's object-store prefix".to_string(),
             })?;
-        let table_prefix: ObjectStorePath = {
-            let mut parts: Vec<_> = clock.parts().collect();
-            parts.pop();
-            parts.into_iter().collect()
-        };
+        let clock = crate::object_child(&table_prefix, STORE_CLOCK_OBJECT);
         // The dataset's data path: the table's prefix, and the deletion vectors
         // beside it (`<snapshot>/deletions/<file>.arrow`).
         let data_prefix: ObjectStorePath = {
@@ -27435,7 +27568,7 @@ impl CayenneTableProvider {
     /// it runs only when `integrity_checksums` is enabled.
     async fn read_data_file_bytes(&self, snapshot_id: &str, file_name: &str) -> Result<Vec<u8>> {
         if self.data_in_store() {
-            let Some(prefix) = self.snapshot_object_store_prefix(snapshot_id)? else {
+            let Some(prefix) = self.data_files_prefix(snapshot_id)? else {
                 return Err(Error::Internal {
                     table: self.table_metadata.table_name.clone(),
                     message: format!(
@@ -32452,20 +32585,24 @@ impl CayenneTableProvider {
     }
 
     async fn cleanup_failed_compaction_snapshot(&self, new_snapshot_id: &str, is_s3: bool) {
-        let written = self.uncommitted_files.files(new_snapshot_id);
+        if self.data_in_object_native_location() {
+            // By name: the files this process wrote there. Anything else, such
+            // as an upload that failed part way, is a file no commit names: the
+            // orphan sweep's.
+            if let Err(e) = self.discard_uncommitted_snapshot(new_snapshot_id).await {
+                tracing::warn!(
+                    "Failed to clean up failed compaction snapshot prefix {} for table {}: {e}",
+                    new_snapshot_id,
+                    self.table_metadata.table_name
+                );
+            }
+            return;
+        }
         self.uncommitted_files.forget(new_snapshot_id);
         if is_s3 {
             match self.snapshot_object_store_prefix(new_snapshot_id) {
                 Ok(Some(prefix)) => {
-                    let deleted = if self.data_in_object_native_location() {
-                        // A table in the object-native location deletes by name the
-                        // files this process wrote or copied there. Anything else
-                        // under the prefix, such as an upload that failed part way,
-                        // is a file no commit names: the orphan sweep's.
-                        self.delete_written_snapshot_files(&prefix, written).await
-                    } else {
-                        self.delete_prefix_with_object_store(&prefix).await
-                    };
+                    let deleted = self.delete_prefix_with_object_store(&prefix).await;
                     if let Err(e) = deleted {
                         tracing::warn!(
                             "Failed to clean up failed compaction snapshot prefix {} for table {}: {e}",
